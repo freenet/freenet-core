@@ -79,6 +79,23 @@ impl<T: TimeSource> ReceivedPacketTracker<T> {
         }
     }
 
+    /// Queue a receipt again for a packet already reported, because the
+    /// sender retransmitted it (so our previous receipt was lost).
+    ///
+    /// Does not touch the dedup window. A receipt already pending is not
+    /// queued twice. Returns `QueueFull` when the caller must flush now, `Ok`
+    /// otherwise (including the not-queued-twice case).
+    pub(super) fn requeue_receipt(&mut self, packet_id: PacketId) -> ReportResult {
+        if !self.pending_receipts.contains(&packet_id) {
+            self.pending_receipts.push(packet_id);
+        }
+        if self.pending_receipts.len() < MAX_PENDING_RECEIPTS {
+            ReportResult::Ok
+        } else {
+            ReportResult::QueueFull
+        }
+    }
+
     /// Returns a list of packets that have been received since the last call to this function.
     /// This should be called every time a packet is sent to ensure that receipts are sent
     /// promptly. Every `MAX_CONFIRMATION_DELAY` (100ms) this should be called and if the returned
@@ -223,6 +240,38 @@ pub(in crate::transport) mod tests {
         tracker.cleanup();
         assert_eq!(tracker.time_by_packet_id.len(), 0);
         assert_eq!(tracker.packet_id_time.len(), 0);
+    }
+
+    /// A retransmitted packet's receipt is queued again after the original
+    /// receipt was sent (#5795), once per flush, and still forces a flush at
+    /// capacity.
+    #[test]
+    fn requeue_receipt_queues_once_and_respects_capacity() {
+        let mut tracker = mock_received_packet_tracker();
+        assert_eq!(tracker.report_received_packet(1), ReportResult::Ok);
+        assert_eq!(tracker.get_receipts(), vec![1], "original receipt sent");
+        assert_eq!(
+            tracker.report_received_packet(1),
+            ReportResult::AlreadyReceived
+        );
+        assert!(
+            tracker.pending_receipts.is_empty(),
+            "dedup alone queues nothing"
+        );
+        assert_eq!(tracker.requeue_receipt(1), ReportResult::Ok);
+        assert_eq!(tracker.requeue_receipt(1), ReportResult::Ok);
+        assert_eq!(tracker.get_receipts(), vec![1], "re-queued once, not twice");
+        assert_eq!(tracker.time_by_packet_id.len(), 1, "dedup window untouched");
+
+        for id in 100..(100 + MAX_PENDING_RECEIPTS as PacketId - 1) {
+            assert_eq!(tracker.requeue_receipt(id), ReportResult::Ok);
+        }
+        assert_eq!(
+            tracker.requeue_receipt(1),
+            ReportResult::QueueFull,
+            "reaching MAX_PENDING_RECEIPTS must force a flush"
+        );
+        assert_eq!(tracker.get_receipts().len(), MAX_PENDING_RECEIPTS);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -2,8 +2,10 @@ use anyhow::{Context, Result};
 use std::path::Path;
 
 #[cfg(target_os = "macos")]
-use super::launch_at_login::macos_launch_at_login_startup;
+use super::cli_symlinks::macos_ensure_cli_symlinks;
 #[cfg(target_os = "macos")]
+use super::launch_at_login::macos_launch_at_login_startup;
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 use super::single_instance::{AcquireWrapperLockOutcome, acquire_wrapper_single_instance_lock};
 
 #[cfg(any(target_os = "windows", target_os = "macos"))]
@@ -18,7 +20,7 @@ use super::open_url_in_browser;
 use super::{
     SENTINEL_RESTART, SENTINEL_STOP, WRAPPER_EXIT_ALREADY_RUNNING, WRAPPER_EXIT_UPDATE_NEEDED,
     WRAPPER_INITIAL_BACKOFF_SECS, WRAPPER_MAX_BACKOFF_SECS, WRAPPER_MAX_CONSECUTIVE_FAILURES,
-    WRAPPER_MAX_PORT_CONFLICT_KILLS,
+    WRAPPER_MAX_PORT_CONFLICT_KILLS, WRAPPER_MIN_HEALTHY_RUNTIME_SECS,
 };
 #[cfg(any(target_os = "windows", target_os = "macos"))]
 use super::{
@@ -219,6 +221,29 @@ pub(super) enum WrapperAction {
     KillAndRetry,
     /// Wait (with jitter) then relaunch.
     BackoffAndRelaunch { secs: u64 },
+}
+
+/// When the child that just exited ran long enough to have been healthy, clear
+/// the failure count toward `WRAPPER_MAX_CONSECUTIVE_FAILURES` (as the macOS
+/// launchd script does) and the backoff. Without it the count only reset on a
+/// successful update, so a node that runs for days and fails one update a day
+/// (a #3934 lockout retry, or an AV-locked binary) walked to the limit and the
+/// wrapper gave up for good.
+///
+/// The identical-failure streak is deliberately LEFT ALONE: the same failure
+/// after every healthy run (a version that dies after ten minutes, the same
+/// install failing day after day) is exactly the "stuck" condition that
+/// streak exists to report, and hiding it would hide a node stuck on an old
+/// version.
+///
+/// `runtime_secs` must be the child's own runtime, measured when it exited,
+/// not including the post-exit update: a quick crash followed by a slow failed
+/// update is not a healthy run.
+pub(super) fn note_child_runtime(state: &mut WrapperState, runtime_secs: u64) {
+    if runtime_secs >= WRAPPER_MIN_HEALTHY_RUNTIME_SECS {
+        state.consecutive_failures = 0;
+        state.backoff_secs = WRAPPER_INITIAL_BACKOFF_SECS;
+    }
 }
 
 /// Pure function: given current state and exit info, determine the next action
@@ -461,50 +486,101 @@ pub(super) fn run_wrapper(version: &str) -> Result<()> {
     std::fs::create_dir_all(&log_dir)
         .with_context(|| format!("Failed to create log directory: {}", log_dir.display()))?;
 
-    // macOS wrapper single-instance guard. MUST run before
+    // Wrapper single-instance guard (macOS + Windows). MUST run before
     // `kill_stale_freenet_processes` and before anything user-visible.
-    // The kill helper uses `pkill -f "freenet network"` which matches
-    // the CURRENTLY-RUNNING backend child of a live wrapper, not just
-    // stale orphans; if we were to kill_stale before the single-
-    // instance check, a second wrapper would happily murder the first
-    // wrapper's backend, then see a free port, then proceed to build a
-    // duplicate tray. The flock-based guard is immune to that race
-    // because it inspects wrapper-level state (the lockfile held by
-    // the first wrapper process) not backend state.
+    // The kill helper matches the CURRENTLY-RUNNING backend child of a
+    // live wrapper, not just stale orphans; if we were to kill_stale
+    // before the single-instance check, a second wrapper would happily
+    // murder the first wrapper's backend, then see a free port/process
+    // slot, then proceed to build a duplicate tray — or, on Windows,
+    // race a freshly spawned `freenet network` against the first
+    // wrapper's own respawn of its just-killed child, both reading and
+    // (pre-#5132-fix) non-atomically rewriting config.toml. The guard is
+    // immune to that race because it inspects wrapper-level state (a
+    // lockfile on macOS, a named kernel mutex on Windows, held by the
+    // first wrapper process) rather than backend state.
     //
-    // Phase-1 smoke test on 2026-04-22 reproduced the duplicate tray
-    // whenever launchd's RunAtLoad fired while the user's open-
-    // launched wrapper was still alive; this guard prevents that
+    // macOS: phase-1 smoke test on 2026-04-22 reproduced a duplicate
+    // tray whenever launchd's RunAtLoad fired while the user's open-
+    // launched wrapper was still alive; the flock guard prevents that
     // overlap without changing the LAL agent's `RunAtLoad=true`
     // semantics (login-time auto-start still works; only the in-
     // session overlap is suppressed).
     //
-    // Linux has no tray and Windows has install-time guards; the
-    // overlap race only manifests on macOS where launchd can spawn a
-    // concurrent wrapper via RunAtLoad.
-    #[cfg(target_os = "macos")]
-    let _wrapper_lock = match acquire_wrapper_single_instance_lock() {
+    // Windows: #5132 — every relaunch (the downloaded exe, or the
+    // installed `%localappdata%\Freenet\bin\freenet.exe`) fell straight
+    // through to `kill_stale_freenet_processes` with no guard at all,
+    // so relaunching while Freenet was already running (e.g. via
+    // autostart) killed the running node and started a new one on every
+    // single launch. The mutex guard closes that gap the same way the
+    // macOS flock does.
+    //
+    // Linux has no tray and no autostart mechanism that can spawn a
+    // concurrent wrapper, so the overlap race does not apply there.
+    //
+    // A deliberate self-relaunch (auto-update, crash-loop rollback — see
+    // spawn_new_wrapper's call sites below) spawns the new wrapper process
+    // BEFORE the old one releases this lock: the old process's shutdown
+    // sequencing runs on the tray's ~100ms status-poll loop and, on the
+    // "UpdatedRestarting" terminal status, sleeps a further hard-coded 1s
+    // before quitting (see tray.rs) so the "Updated! Restarting..." status
+    // is visible — reliably longer than how fast the freshly-spawned new
+    // process reaches this same acquire call. A single-shot acquire would
+    // almost always lose that handoff, so self-relaunch would silently
+    // fail to start a replacement wrapper every time. Retry for a few
+    // seconds to ride out the old process's own bounded shutdown window
+    // before concluding a second, genuinely unrelated wrapper is running
+    // (in which case the extra few seconds before exiting are invisible —
+    // the user is looking at the ALREADY-running instance either way).
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    let lock_outcome = {
+        const RETRY_ATTEMPTS: u32 = 20;
+        const RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
+        let mut outcome = acquire_wrapper_single_instance_lock();
+        for _ in 1..RETRY_ATTEMPTS {
+            if !matches!(outcome, AcquireWrapperLockOutcome::AnotherWrapperRunning) {
+                break;
+            }
+            std::thread::sleep(RETRY_INTERVAL);
+            outcome = acquire_wrapper_single_instance_lock();
+        }
+        outcome
+    };
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    let _wrapper_lock = match lock_outcome {
         AcquireWrapperLockOutcome::Acquired(guard) => Some(guard),
         AcquireWrapperLockOutcome::AnotherWrapperRunning => {
+            #[cfg(target_os = "macos")]
+            let holder_detail = "lockfile at ~/Library/Caches/Freenet/wrapper.lock is held; \
+                 try `lsof ~/Library/Caches/Freenet/wrapper.lock` to find the holder";
+            #[cfg(target_os = "windows")]
+            let holder_detail = format!(
+                "named mutex \"{}\" is held by another process",
+                super::single_instance::WRAPPER_MUTEX_NAME
+            );
             log_wrapper_event(
                 &log_dir,
                 &format!(
                     "Wrapper pid={} exiting: another Freenet wrapper is already \
-                     running (lockfile at ~/Library/Caches/Freenet/wrapper.lock is \
-                     held). Expected if launchd fired RunAtLoad while an existing \
-                     wrapper is alive, or if Freenet.app was double-launched. \
-                     If Freenet's menu bar icon is not visible, another process may \
-                     be holding the lock; try `lsof ~/Library/Caches/Freenet/wrapper.lock`.",
+                     running ({holder_detail}). Expected if Freenet was launched \
+                     while already running (e.g. via autostart), or double-launched. \
+                     If Freenet's tray icon is not visible, another process may be \
+                     holding the lock.",
                     std::process::id()
                 ),
             );
+            // LaunchServices may have launched this copy to deliver a
+            // freenet:// link; open it rather than drop it (#5726).
+            #[cfg(target_os = "macos")]
+            super::super::tray::handle_links_sent_to_duplicate(std::time::Duration::from_secs(3));
+            #[cfg(not(target_os = "macos"))]
             return Ok(());
         }
         AcquireWrapperLockOutcome::UnavailableSoProceed => {
             log_wrapper_event(
                 &log_dir,
                 "Wrapper single-instance lock unavailable; proceeding without guard. \
-                 Dup-tray risk if RunAtLoad fires while another wrapper is alive.",
+                 Dup-launch risk if another wrapper is started concurrently.",
             );
             None
         }
@@ -541,6 +617,19 @@ pub(super) fn run_wrapper(version: &str) -> Result<()> {
         // launchd agent is still present.
         #[cfg(target_os = "macos")]
         macos_launch_at_login_startup(&log_dir);
+
+        // macOS: one-shot CLI symlink setup (`freenet`/`fdev` on PATH via
+        // /usr/local/bin). Runs on its OWN background thread, not inline
+        // here: unlike Launch at Login above, this can pop a blocking
+        // administrator-privileges password dialog (see cli_symlinks.rs),
+        // and that must never delay the tray icon from appearing.
+        #[cfg(target_os = "macos")]
+        {
+            let log_dir_for_cli_symlinks = log_dir.clone();
+            std::thread::spawn(move || {
+                macos_ensure_cli_symlinks(&log_dir_for_cli_symlinks);
+            });
+        }
 
         // Wrapper loop runs on a background thread
         let loop_handle = std::thread::spawn(move || {
@@ -584,8 +673,19 @@ pub(super) fn run_wrapper(version: &str) -> Result<()> {
 /// update subprocess silently fails to start and the wrapper falls into
 /// the exit-42 / update-failed / backoff-relaunch loop documented in
 /// #3934 (which was also the root cause of "Check for Updates" being
-/// broken in #3933). Null stdio is harmless on macOS/Linux because
-/// `--quiet` already suppresses all output.
+/// broken in #3933).
+///
+/// KNOWN GAP (#5244): nulling stderr also discards everything `freenet update`
+/// now reports about brick-safety — the WARN subscriber installed for the
+/// subcommand, and the two unconditional messages saying crash-loop rollback
+/// failed to arm. Under systemd those reach the journal; under this wrapper
+/// (Windows, and the macOS tray path) they go nowhere. `--quiet` no longer
+/// suppresses them, so the previous claim that nulling was harmless because
+/// "--quiet already suppresses all output" is no longer true. Fixing it means
+/// pointing stderr at the wrapper log (`log_wrapper_event`'s file) rather than
+/// at null — the Windows constraint above is about INHERITED invalid handles,
+/// not about needing null specifically — and threading a log dir through all
+/// five call sites.
 ///
 /// `post_stop_exit_code` is `Some(code)` ONLY when this update runs as part of
 /// the node's restart cycle (the node exited `code` and the wrapper is applying
@@ -849,6 +949,12 @@ fn run_wrapper_loop(
             cmd.stderr(std::process::Stdio::null());
         }
 
+        // Wall-clock time is right here: this measures how long a real child
+        // process ran, in bin-side supervisor code no simulation reaches.
+        let child_started = {
+            use std::time::Instant;
+            Instant::now()
+        };
         // Use spawn + polling so we can handle tray actions while child runs
         let mut child = match cmd.spawn() {
             Ok(c) => c,
@@ -968,6 +1074,13 @@ fn run_wrapper_loop(
             // Sleep briefly before polling again
             std::thread::sleep(std::time::Duration::from_millis(250));
         };
+
+        // The child's own runtime, taken as it exits and before any update
+        // runs, so the updater's time is never counted as a healthy run.
+        // Applied here, before the tray Restart/Stop sentinels `continue`, so
+        // a healthy run ended from the tray also starts a fresh count.
+        let child_runtime_secs = child_started.elapsed().as_secs();
+        note_child_runtime(&mut state, child_runtime_secs);
 
         // Restart sentinel from tray Restart action — skip exit code handling
         if exit_code == SENTINEL_RESTART {

@@ -97,6 +97,20 @@ pub struct TopologySnapshot {
     /// one handshake and can originate operations. See
     /// `SimNetwork::wait_for_join_convergence_before_ops`.
     pub connection_count: usize,
+    /// Contracts this peer keeps neighbour interest records for although it
+    /// neither hosts nor uses them and has no local interest in them (#5780).
+    /// Stamped by the registration sites; `None` when the `OpManager` was not
+    /// attached at snapshot time. See `Ring::orphan_interest_contract_count`.
+    pub orphan_interest_contracts: Option<usize>,
+    /// Contracts whose neighbour records this peer's interest reconciliation
+    /// has dropped since startup (#5780). `None` when the `OpManager` was not
+    /// attached at snapshot time.
+    pub reconcile_contracts_dropped: Option<u64>,
+    /// Contracts this peer still advertises to co-hosts although it neither
+    /// hosts nor uses them and holds no live lease toward them (#5782). `None`
+    /// when the `OpManager` was not attached at snapshot time. See
+    /// `Ring::stale_advertisement_count`.
+    pub stale_advertisements: Option<usize>,
 }
 
 impl TopologySnapshot {
@@ -109,6 +123,9 @@ impl TopologySnapshot {
             active_subscription_keys: HashSet::new(),
             timestamp_nanos: 0,
             connection_count: 0,
+            orphan_interest_contracts: None,
+            reconcile_contracts_dropped: None,
+            stale_advertisements: None,
         }
     }
 
@@ -384,6 +401,64 @@ pub fn get_all_summarize_wasm_calls(network_name: &str) -> HashMap<SocketAddr, u
 /// Clear WASM-summarize counts for a network (for test cleanup).
 pub fn clear_summarize_metrics(network_name: &str) {
     SUMMARIZE_METRICS_REGISTRY.retain(|key, _| key.0 != network_name);
+}
+
+/// What one node's zombie-transport sweep concluded about one remote transport
+/// over a simulation run (#5654). Only transports that were zombies by AGE are
+/// recorded: those are the ones whose fate depends on recent requests.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ZombieSweepObservation {
+    /// Sweeps that found this transport never promoted and old enough to be a
+    /// zombie by age.
+    pub past_age_threshold: u64,
+    /// Of those, sweeps that kept it because its remote sent a request recently
+    /// and it was within the link-use caps.
+    pub kept_for_link_use: u64,
+}
+
+/// Key: (network_name, sweeping node address, remote transport address).
+static ZOMBIE_SWEEP_REGISTRY: LazyLock<
+    DashMap<(String, SocketAddr, SocketAddr), ZombieSweepObservation>,
+> = LazyLock::new(DashMap::new);
+
+/// Record one sweep's verdicts for transports that were zombies by age, as
+/// `(remote, kept_for_link_use)` pairs. The network name is read once, and on a
+/// production node (no current network name) `verdicts` is never iterated, so
+/// nothing the caller computes lazily inside it runs.
+pub fn record_zombie_sweep_verdicts(
+    sweeper: SocketAddr,
+    verdicts: impl IntoIterator<Item = (SocketAddr, bool)>,
+) {
+    let Some(network_name) = get_current_network_name() else {
+        return;
+    };
+    for (remote, kept_for_link_use) in verdicts {
+        let mut entry = ZOMBIE_SWEEP_REGISTRY
+            .entry((network_name.clone(), sweeper, remote))
+            .or_default();
+        entry.past_age_threshold += 1;
+        if kept_for_link_use {
+            entry.kept_for_link_use += 1;
+        }
+    }
+}
+
+/// Snapshot all zombie-sweep observations for a network, keyed by
+/// (sweeping node address, remote transport address).
+#[cfg(any(test, feature = "testing"))]
+pub fn get_all_zombie_sweep_observations(
+    network_name: &str,
+) -> HashMap<(SocketAddr, SocketAddr), ZombieSweepObservation> {
+    ZOMBIE_SWEEP_REGISTRY
+        .iter()
+        .filter(|entry| entry.key().0 == network_name)
+        .map(|entry| ((entry.key().1, entry.key().2), *entry.value()))
+        .collect()
+}
+
+/// Clear zombie-sweep observations for a network (for test cleanup).
+pub fn clear_zombie_sweep_observations(network_name: &str) {
+    ZOMBIE_SWEEP_REGISTRY.retain(|key, _| key.0 != network_name);
 }
 
 /// Result of topology validation.

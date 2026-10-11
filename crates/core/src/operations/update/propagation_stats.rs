@@ -81,7 +81,18 @@ struct ContractCounters {
     targets_total: u64,
     /// Number of attempts that resolved zero targets (the NO_TARGETS branch:
     /// the update did not propagate further from this node).
+    ///
+    /// A fully-covered fan-out (#5147) also resolves zero targets but is a
+    /// SUCCESS, and is counted in [`Self::fully_covered`] instead. Keeping the
+    /// two apart is load-bearing: in the clique regime #5147 targets, a
+    /// fully-covered fan-out is the *expected* outcome, so folding it in here
+    /// would report a propagation failure to operators in direct proportion to
+    /// how well the feature works.
     no_targets: u64,
+    /// Number of attempts that sent nothing because every eligible peer had
+    /// already been served by the originator (#5147). Zero targets, but a
+    /// completed fan-out rather than a failure.
+    fully_covered: u64,
     /// Sum of interest-manager peers that failed to resolve to a live
     /// connection across the window (the `interest_resolve_failed` counter
     /// from `BroadcastTargetResult`). A persistently non-zero value points at
@@ -95,6 +106,7 @@ impl ContractCounters {
         self.updates == 0
             && self.targets_total == 0
             && self.no_targets == 0
+            && self.fully_covered == 0
             && self.interest_resolve_failed == 0
     }
 }
@@ -108,6 +120,10 @@ pub(crate) struct ContractSummary {
     pub(crate) updates: u64,
     pub(crate) targets_total: u64,
     pub(crate) no_targets: u64,
+    /// Attempts that sent nothing because the originator had already served
+    /// every eligible peer (#5147). A success, deliberately NOT folded into
+    /// `no_targets`.
+    pub(crate) fully_covered: u64,
     pub(crate) interest_resolve_failed: u64,
 }
 
@@ -136,6 +152,9 @@ pub(crate) struct WindowSummary {
     pub(crate) targets_total: u64,
     /// Total attempts that resolved zero targets this window.
     pub(crate) no_targets: u64,
+    /// Total fully-covered fan-outs this window (#5147): zero targets because
+    /// the originator already served everyone, which is a success.
+    pub(crate) fully_covered: u64,
     /// Total interest-resolve failures across all contracts this window.
     pub(crate) interest_resolve_failed: u64,
     /// The top-K contracts by update activity (descending), for per-contract
@@ -178,6 +197,7 @@ pub(crate) fn aggregate_window(
     let updates: u64 = summaries.iter().map(|s| s.updates).sum();
     let targets_total: u64 = summaries.iter().map(|s| s.targets_total).sum();
     let no_targets: u64 = summaries.iter().map(|s| s.no_targets).sum();
+    let fully_covered: u64 = summaries.iter().map(|s| s.fully_covered).sum();
     let interest_resolve_failed: u64 = summaries.iter().map(|s| s.interest_resolve_failed).sum();
 
     // Most active first; deterministic tie-break on the contract's raw bytes
@@ -199,6 +219,7 @@ pub(crate) fn aggregate_window(
         updates,
         targets_total,
         no_targets,
+        fully_covered,
         interest_resolve_failed,
         top: summaries,
         others,
@@ -259,6 +280,38 @@ impl UpdatePropagationStats {
         entry.interest_resolve_failed += interest_resolve_failed as u64;
     }
 
+    /// Record a fan-out that sent nothing because the originator had already
+    /// served every eligible peer (#5147).
+    ///
+    /// Deliberately a SEPARATE entry point from [`Self::record_broadcast`]
+    /// rather than a `targets == 0` call into it. That call would land in the
+    /// `no_targets` bucket, which is the operator-facing propagation-FAILURE
+    /// counter — and in the clique regime #5147 targets, a fully-covered
+    /// fan-out is the expected outcome, so the summary would report a failure
+    /// in direct proportion to how well the feature works. Counting it here
+    /// keeps the outcome attributed by the code that decided it, per the
+    /// "metric describing a filtering decision" rule in
+    /// `.claude/rules/bug-prevention-patterns.md`.
+    ///
+    /// `updates` is still incremented so the #4281 liveness summary sees one
+    /// broadcast per apply, and `targets_total` is not, so `targets_avg`
+    /// honestly reflects that no peer was sent to.
+    pub(crate) fn record_fully_covered_broadcast(
+        &self,
+        contract: ContractInstanceId,
+        interest_resolve_failed: usize,
+    ) {
+        if !self.contracts.contains_key(&contract) && self.contracts.len() >= MAX_TRACKED_CONTRACTS
+        {
+            return;
+        }
+
+        let mut entry = self.contracts.entry(contract).or_default();
+        entry.updates += 1;
+        entry.fully_covered += 1;
+        entry.interest_resolve_failed += interest_resolve_failed as u64;
+    }
+
     /// Snapshot every tracked contract's counters into per-contract window
     /// summaries, then clear the map.
     ///
@@ -283,6 +336,7 @@ impl UpdatePropagationStats {
                     updates: counters.updates,
                     targets_total: counters.targets_total,
                     no_targets: counters.no_targets,
+                    fully_covered: counters.fully_covered,
                     interest_resolve_failed: counters.interest_resolve_failed,
                 });
             }
@@ -306,6 +360,7 @@ impl UpdatePropagationStats {
             updates = summary.updates,
             targets_avg = summary.targets_avg(),
             no_targets = summary.no_targets,
+            fully_covered = summary.fully_covered,
             interest_resolve_failed = summary.interest_resolve_failed,
             window_s = SUMMARY_WINDOW.as_secs(),
             phase = "summary",
@@ -318,6 +373,7 @@ impl UpdatePropagationStats {
                 updates = c.updates,
                 targets_avg = c.targets_avg(),
                 no_targets = c.no_targets,
+                fully_covered = c.fully_covered,
                 interest_resolve_failed = c.interest_resolve_failed,
                 phase = "summary_contract",
                 "update_propagation_summary contract detail"
@@ -389,6 +445,7 @@ mod tests {
             updates: 0,
             targets_total: 0,
             no_targets: 0,
+            fully_covered: 0,
             interest_resolve_failed: 5,
         }];
         assert!(aggregate_window(summaries, TOP_K).is_none());
@@ -402,6 +459,7 @@ mod tests {
                 updates: 2,
                 targets_total: 10, // avg 5
                 no_targets: 0,
+                fully_covered: 0,
                 interest_resolve_failed: 1,
             },
             ContractSummary {
@@ -409,6 +467,7 @@ mod tests {
                 updates: 3,
                 targets_total: 0, // all no-target attempts
                 no_targets: 3,
+                fully_covered: 0,
                 interest_resolve_failed: 4,
             },
         ];
@@ -437,6 +496,7 @@ mod tests {
                 updates: u64::from(i) + 1, // 1,2,3,4,5
                 targets_total: 0,
                 no_targets: 0,
+                fully_covered: 0,
                 interest_resolve_failed: 0,
             })
             .collect();
@@ -459,6 +519,7 @@ mod tests {
                 updates: 1,
                 targets_total: 0,
                 no_targets: 0,
+                fully_covered: 0,
                 interest_resolve_failed: 0,
             },
             ContractSummary {
@@ -466,6 +527,7 @@ mod tests {
                 updates: 1,
                 targets_total: 0,
                 no_targets: 0,
+                fully_covered: 0,
                 interest_resolve_failed: 0,
             },
         ];
@@ -721,6 +783,68 @@ mod tests {
         );
     }
 
+    /// A fully-covered fan-out (#5147) must NOT read as a propagation failure.
+    ///
+    /// Regression test for the shipped-comment-vs-code split described on
+    /// `broadcast_path_feeds_propagation_stats_pin_test`: the fully-covered arm
+    /// originally called `record_broadcast(key, 0, …)` beneath a comment saying
+    /// it avoided the `no_targets` counter, while `record_broadcast`
+    /// unconditionally increments `no_targets` whenever `targets == 0`.
+    ///
+    /// The mutation that must make this red is exactly that regression —
+    /// replace the `record_fully_covered_broadcast` call with
+    /// `record_broadcast(c, 0, 0)` and `no_targets` becomes 1.
+    ///
+    /// `updates` is still asserted, because the opposite over-correction (not
+    /// recording the outcome at all) would silently lose the #4281 liveness
+    /// signal for every fan-out the feature suppresses — which, in the regime
+    /// this design targets, is most of them.
+    #[test]
+    fn a_fully_covered_fanout_is_not_counted_as_a_propagation_failure() {
+        let stats = UpdatePropagationStats::new();
+        let c = cid(7);
+
+        stats.record_fully_covered_broadcast(c, 0);
+
+        let summaries = stats.drain_window();
+        assert_eq!(summaries.len(), 1, "the outcome must be recorded at all");
+        let s = &summaries[0];
+
+        assert_eq!(
+            s.no_targets, 0,
+            "a fully-covered fan-out is a SUCCESS and must never land in \
+             `no_targets`, the operator-facing propagation-failure counter — \
+             otherwise the summary reports a failure in direct proportion to \
+             how well #5147 is working"
+        );
+        assert_eq!(
+            s.fully_covered, 1,
+            "the outcome must be attributed to the counter that names it"
+        );
+        assert_eq!(
+            s.updates, 1,
+            "the #4281 liveness summary must still see one broadcast per apply"
+        );
+        assert_eq!(
+            s.targets_total, 0,
+            "no peer was sent to, so `targets_avg` must reflect zero rather \
+             than inflating the mean"
+        );
+
+        // The counterfactual, asserted rather than described: the call the bug
+        // used produces the false alarm. If a future edit makes
+        // `record_broadcast(c, 0, _)` stop counting `no_targets`, this arm goes
+        // red and the two entry points need re-examining.
+        let regressed = UpdatePropagationStats::new();
+        regressed.record_broadcast(c, 0, 0);
+        let regressed_summaries = regressed.drain_window();
+        assert_eq!(
+            regressed_summaries[0].no_targets, 1,
+            "`record_broadcast` with zero targets is the propagation-FAILURE \
+             path — that is precisely why the fully-covered arm must not use it"
+        );
+    }
+
     /// Source-scrape pin for the broadcast-path wiring. The counters are only
     /// useful if the fan-out handler actually feeds them; a future task-per-tx
     /// migration or refactor of `handle_broadcast_state_change` could silently
@@ -729,12 +853,35 @@ mod tests {
     /// `.claude/rules/bug-prevention-patterns.md`).
     ///
     /// The handler records each fresh logical broadcast's outcome exactly
-    /// once: a NO_TARGETS record on the fresh-broadcast path (gated on
-    /// `!is_retry && !is_reemit`, so neither retry re-emissions nor #4359
-    /// deferred-broadcast re-emissions record a miss), and a success record on
-    /// the targets-found path. That's two call sites; this pins both so neither
-    /// outcome arm is dropped, and pins the gate so a refactor can't start
-    /// counting retry / deferred re-emissions as fresh misses.
+    /// once, and there are now THREE terminal outcomes:
+    ///
+    /// 1. NO_TARGETS on the fresh-broadcast path (gated on `!is_retry &&
+    ///    !is_reemit`, so neither retry re-emissions nor #4359
+    ///    deferred-broadcast re-emissions record a miss);
+    /// 2. success on the targets-found path;
+    /// 3. success with a ZERO target count on the #5147 fully-covered path —
+    ///    every eligible peer was already named by the originator (or is the
+    ///    sender), so the fan-out is complete with nothing to send.
+    ///
+    /// The third was added with #5147 and goes through its OWN entry point,
+    /// [`UpdatePropagationStats::record_fully_covered_broadcast`], precisely so
+    /// it cannot land in the `no_targets` bucket. Counting it there would make
+    /// the operator-facing propagation summary report a propagation failure
+    /// every time the feature works perfectly — the loudest possible false
+    /// alarm, on the path the design expects to be common in the clique regime.
+    ///
+    /// The first version of #5147 got this wrong in the most instructive way:
+    /// it called `record_broadcast(key, 0, …)` under a comment asserting that
+    /// it did NOT go through `no_targets`, while `record_broadcast`
+    /// unconditionally does `if targets == 0 { no_targets += 1 }`. The comment
+    /// and the code disagreed, and this pin — asserting only a CALL COUNT —
+    /// passed either way. Hence the separate-entry-point assertion below and
+    /// the behavioural test
+    /// `a_fully_covered_fanout_is_not_counted_as_a_propagation_failure`.
+    ///
+    /// This pins all three so no outcome arm is dropped, and pins the gate so a
+    /// refactor can't start counting retry / deferred re-emissions as fresh
+    /// misses.
     #[test]
     fn broadcast_path_feeds_propagation_stats_pin_test() {
         // `handle_broadcast_state_change` lives in the `broadcast` submodule
@@ -750,10 +897,48 @@ mod tests {
         assert_eq!(
             call_count, 2,
             "handle_broadcast_state_change must call \
-             `update_propagation_stats.record_broadcast(...)` exactly twice — once \
-             on the fresh no-target path and once on the targets-found success \
-             path. Found {call_count}. A different count means an outcome arm was \
+             `update_propagation_stats.record_broadcast(...)` exactly twice \
+             — the fresh no-target path and the targets-found success path. \
+             Found {call_count}. A different count means an outcome arm was \
              dropped (silent telemetry rot) or recording leaked elsewhere."
+        );
+
+        // The #5147 fully-covered arm must use its OWN entry point. Routing it
+        // back through `record_broadcast(..., 0, ...)` would silently restore
+        // the false-alarm bug: that call increments `no_targets`, the
+        // operator-facing propagation-FAILURE counter, on the outcome that
+        // means the feature is working.
+        let fully_covered_calls = source.matches(".record_fully_covered_broadcast(").count();
+        assert_eq!(
+            fully_covered_calls, 1,
+            "the #5147 fully-covered fan-out must be recorded exactly once, via \
+             `record_fully_covered_broadcast(...)`. Found {fully_covered_calls}. \
+             If this dropped to 0 the arm was re-routed through \
+             `record_broadcast`, which counts a zero-target fan-out as a \
+             propagation failure."
+        );
+
+        // The fully-covered branch must NOT drop the #4359 stash: it sends
+        // nothing, so a stashed state that reached nobody is not superseded by
+        // it. Only the targets-found path, which does send, may drop it.
+        let covered_pos = source
+            .find("let fully_covered =")
+            .expect("the #5147 fully-covered branch is missing");
+        let retry_pos = source
+            .find("self.broadcast_retries.entry(key)")
+            .expect("the no-target retry branch is missing");
+        let covered_branch = &source[covered_pos..retry_pos];
+        assert!(
+            !covered_branch.contains("pending_broadcasts.take(")
+                || covered_branch.contains(".stash("),
+            "the fully-covered branch must not DISCARD the #4359 \
+             pending-broadcast stash. It sends zero bytes, so the stashed state \
+             — which by definition reached nobody — is not superseded by it, \
+             and the peers it suppressed hold the ORIGINATOR's payload, which \
+             does not contain that state. Taking the stash without putting the \
+             current state back deletes the only non-heartbeat recovery path \
+             for content that has never propagated. Refreshing it is correct; \
+             discarding it is not."
         );
 
         // The no-target record must be gated on `!is_retry && !is_reemit` so

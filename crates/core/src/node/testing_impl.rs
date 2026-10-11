@@ -434,7 +434,7 @@ impl ScheduledOperation {
 }
 
 /// Packet-delivery decision consulted by every `SimulationSocket` (via the
-/// global delivery callback installed by `run_controlled_simulation` and
+/// per-network delivery callback installed by `run_controlled_simulation` and
 /// `run_simulation_direct`) so an injected node crash or partition actually
 /// drops packets instead of being a silent no-op.
 ///
@@ -525,6 +525,13 @@ pub struct ControlledSimulationResult {
     /// `crate::ring::topology_registry::record_summarize_wasm_call` (#4440, spec
     /// step 8).
     pub summarize_wasm_calls: HashMap<std::net::SocketAddr, u64>,
+    /// Zombie-transport sweep observations, keyed by (sweeping node address,
+    /// remote transport address), captured before the registry is cleared.
+    /// See `crate::ring::topology_registry::ZombieSweepObservation` (#5654).
+    pub zombie_sweep_observations: HashMap<
+        (std::net::SocketAddr, std::net::SocketAddr),
+        crate::ring::topology_registry::ZombieSweepObservation,
+    >,
 }
 
 #[cfg(any(test, feature = "testing"))]
@@ -541,6 +548,71 @@ impl ControlledSimulationResult {
         self.node_rings
             .get(label)
             .is_some_and(|ring| ring.is_hosting_contract(key))
+    }
+
+    /// `(failures, successes)` route events ingested by `label`'s router over
+    /// the whole run, or `None` if the node never published its Ring (#5657).
+    /// Cumulative, unlike the router's 500-event estimator windows.
+    pub fn node_route_outcome_totals(&self, label: &NodeLabel) -> Option<(u64, u64)> {
+        self.node_rings.get(label).map(|ring| {
+            let totals = ring.router.read().outcome_totals();
+            (totals.failures, totals.successes)
+        })
+    }
+
+    /// `(not_found, timeout, send_failure)` route failure labels `label`'s
+    /// node fed its router, by cause, or `None` if the node never published
+    /// its Ring (#5657).
+    pub fn node_route_failure_causes(&self, label: &NodeLabel) -> Option<(u64, u64, u64)> {
+        self.node_rings
+            .get(label)
+            .map(|ring| ring.route_failure_cause_counts())
+    }
+
+    /// Ambiguous NotFounds `label`'s node dropped untrained, or `None` if the
+    /// node never published its Ring (#5657).
+    pub fn node_untrained_not_founds(&self, label: &NodeLabel) -> Option<u64> {
+        self.node_rings
+            .get(label)
+            .map(|ring| ring.untrained_not_found_count())
+    }
+
+    /// `(failures, successes)` route events summed over every node's router
+    /// (#5657). See [`Self::node_route_outcome_totals`].
+    pub fn aggregate_route_outcome_totals(&self) -> (u64, u64) {
+        self.node_rings
+            .values()
+            .map(|ring| ring.router.read().outcome_totals())
+            .fold((0, 0), |(f, s), t| (f + t.failures, s + t.successes))
+    }
+
+    /// The protocol version `label`'s node had recorded for the peer at `addr`
+    /// at the end of the run, or `None` if it never learned one (#5161).
+    ///
+    /// Reads the same `ConnectionManager` mirror the production emission gates
+    /// read, so it answers the question those gates ask rather than a proxy for
+    /// it. `None` when the node never published its Ring.
+    pub fn node_recorded_remote_version(
+        &self,
+        label: &NodeLabel,
+        addr: SocketAddr,
+    ) -> Option<(u8, u8, u16)> {
+        self.node_rings
+            .get(label)
+            .and_then(|ring| ring.connection_manager.remote_version(addr))
+    }
+
+    /// Whether `label`'s node would emit the hash-first summary encoding to the
+    /// peer at `addr` — i.e. whether that link passes the version gate (#4965).
+    ///
+    /// The end-to-end consequence of #5161 on a node->gateway link: before the
+    /// version-carrying ack this could never be true from the node's side, so
+    /// the node answered every anti-entropy exchange with full summary bytes.
+    /// `false` when the node never published its Ring.
+    pub fn node_supports_hash_first_summaries(&self, label: &NodeLabel, addr: SocketAddr) -> bool {
+        self.node_rings
+            .get(label)
+            .is_some_and(|ring| ring.connection_manager.supports_hash_first_summaries(addr))
     }
 
     /// Number of contracts `label`'s node held in its hosting cache at the end
@@ -633,6 +705,33 @@ impl ControlledSimulationResult {
             .unwrap_or_default()
     }
 
+    /// Whether `label`'s node held a ring connection to `other`'s address at
+    /// the end of the run. `false` if either node is unknown or never
+    /// published its Ring.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn node_is_connected_to(&self, label: &NodeLabel, other: &NodeLabel) -> bool {
+        let Some(addr) = self
+            .node_rings
+            .get(other)
+            .and_then(|ring| ring.connection_manager.get_own_addr())
+        else {
+            return false;
+        };
+        self.node_rings
+            .get(label)
+            .is_some_and(|ring| ring.connection_manager.get_peer_by_addr(addr).is_some())
+    }
+
+    /// Timeout route-failure labels `label`'s node recorded as the originator
+    /// of an operation, excluding those it recorded while relaying other
+    /// nodes' operations. `None` if the node never published its Ring (#5660).
+    #[cfg(any(test, feature = "testing"))]
+    pub fn node_originator_route_timeouts(&self, label: &NodeLabel) -> Option<u64> {
+        self.node_rings
+            .get(label)
+            .map(|ring| ring.originator_route_timeout_count())
+    }
+
     /// Whether `label`'s node was actively receiving updates for `key` (has a
     /// live network/client subscription keeping the copy fresh) at the end of the
     /// run. Returns `false` if the node never published its Ring. The serve-DURING
@@ -713,6 +812,21 @@ impl ControlledSimulationResult {
     /// every-hop load and the #4440 storm has re-armed.
     pub fn total_summarize_wasm_calls(&self) -> u64 {
         self.summarize_wasm_calls.values().copied().sum()
+    }
+
+    /// How many times `sweeper`'s zombie sweep found the transport from `remote`
+    /// never promoted to its ring and old enough to be a zombie by age, and how
+    /// many of those times it kept the transport because `remote` had sent a
+    /// request recently. `(0, 0)` if never. See #5654.
+    pub fn zombie_sweep_counts(
+        &self,
+        sweeper: std::net::SocketAddr,
+        remote: std::net::SocketAddr,
+    ) -> (u64, u64) {
+        self.zombie_sweep_observations
+            .get(&(sweeper, remote))
+            .map(|o| (o.past_age_threshold, o.kept_for_link_use))
+            .unwrap_or((0, 0))
     }
 
     /// The single peer's peak WASM-summarize count — the worst per-node
@@ -1303,6 +1417,10 @@ pub struct SimNetwork {
     running_nodes: HashMap<NodeLabel, RunningNode>,
     /// Map from label to socket address for quick lookup
     node_addresses: HashMap<NodeLabel, SocketAddr>,
+    /// Each node's state store, registered by [`Self::run_simulation`] so a
+    /// convergence check can read what every node ACTUALLY holds at the end
+    /// of the run. See [`FinalStateHandle`].
+    final_states: FinalStateHandle,
     /// Saved configurations for node restart (preserved after crash)
     restartable_configs: HashMap<NodeLabel, RestartableNodeConfig>,
     /// All gateway configs (needed for restarting non-gateway nodes)
@@ -1392,6 +1510,49 @@ pub struct SimNetwork {
     /// untouched: `NodeConfig::new` sets this to `None`, which resolves to
     /// the real `SUMMARY_FIRST_PUT_MIN_VERSION`.
     summary_first_put_floor_override: Option<(u8, u8, u16)>,
+    /// Per-node hash-first summary version-floor override (#4965, see
+    /// [`SimNetwork::enable_hash_first_summaries`]).
+    ///
+    /// **Defaults to `Some(SIM_MIGRATION_ENABLED_FLOOR)` — ON — which is the
+    /// OPPOSITE of the two overrides above.** They gate behavioural cascades
+    /// that pile load onto unrelated sims, so they fail closed. Hash-first
+    /// only changes the ENCODING of the `Summaries` exchange that already
+    /// runs in every sim, with identical convergence semantics, so ON by
+    /// default costs unrelated sims nothing — and it is the only way the
+    /// suite exercises the new wire path before the release that lifts the
+    /// crate version over the production floor. Without it the first
+    /// integration-level run of a Full-tier protocol change would be the
+    /// release PR, where a red sim could not be attributed between the
+    /// feature and the version bump.
+    hash_first_summaries_floor_override: Option<(u8, u8, u16)>,
+    /// Per-node version-carrying-ack version-floor override (#5161, see
+    /// [`SimNetwork::enable_gateway_ack_version`]).
+    ///
+    /// **Defaults to `Some(SIM_MIGRATION_DISABLED_FLOOR)` — OFF**, like the two
+    /// cascade gates and unlike `hash_first_summaries_floor_override`. The gate
+    /// is encoding-only where it fires, but the version it teaches is the INPUT
+    /// to every other `version_supports_*` gate, so enabling it network-wide
+    /// makes node->gateway links newly eligible for those features. Measured,
+    /// not assumed: defaulting it ON changed the outcome of unrelated sims.
+    ///
+    /// The cost of OFF, stated plainly: sims keep the pre-0.2.120 topology
+    /// asymmetry (a regular node never learns its gateway's version) even after
+    /// production stops having it. `enable_gateway_ack_version` is how a test
+    /// that cares opts in.
+    ack_version_floor_override: Option<(u8, u8, u16)>,
+    /// Per-node override for the originator-target-list version floor (#5147).
+    ///
+    /// Defaults to `SIM_MIGRATION_DISABLED_FLOOR` — OFF — grouping with
+    /// `subscribe_hint_floor_override` and `summary_first_put_floor_override`
+    /// rather than with `hash_first_summaries_floor_override`. Hash-first is ON
+    /// by default because it changes only the ENCODING of an exchange with
+    /// identical semantics. This one changes fan-out BEHAVIOUR: it removes
+    /// peers from a broadcast. Defaulting it ON would silently alter the
+    /// delivery graph under every sim that asserts on convergence or delivery
+    /// counts, and a failure could not be attributed between that sim's own
+    /// subject and this suppression. Tests that want it call
+    /// [`enable_broadcast_target_list`](Self::enable_broadcast_target_list).
+    broadcast_target_list_floor_override: Option<(u8, u8, u16)>,
     /// Optional controllable hosting clock injected into every node's
     /// `HostingManager` (via `NodeConfig::hosting_time_source_override`). When
     /// set, hosting-cache TTL and subscription-lease eviction advance ONLY when
@@ -1561,6 +1722,7 @@ impl SimNetwork {
             virtual_time,
             running_nodes: HashMap::new(),
             node_addresses: HashMap::new(),
+            final_states: FinalStateHandle::default(),
             restartable_configs: HashMap::new(),
             all_gateway_configs: Vec::new(),
             streaming_threshold: None,
@@ -1585,6 +1747,21 @@ impl SimNetwork {
             // `subscribe_hint_floor_override` above: summary-first PUT is
             // genuinely opt-in per sim via `enable_summary_first_put`.
             summary_first_put_floor_override: Some(Self::SIM_MIGRATION_DISABLED_FLOOR),
+            // Fail-OPEN by default, deliberately unlike the two above (#4965).
+            // See the field's rustdoc: hash-first is an encoding change, not a
+            // load-bearing cascade, and defaulting it ON is what gives a
+            // version-gated wire change simulation coverage BEFORE the release
+            // that lifts the crate version past its floor.
+            hash_first_summaries_floor_override: Some(Self::SIM_MIGRATION_ENABLED_FLOOR),
+            // Fail-CLOSED by default, like the two cascade gates and unlike
+            // hash-first. This gate is encoding-only where it fires, but what
+            // it teaches — the remote's version — is the INPUT to every other
+            // `version_supports_*` gate, so switching it on network-wide is a
+            // cascade in effect. Opt in per sim via `enable_gateway_ack_version`.
+            ack_version_floor_override: Some(Self::SIM_MIGRATION_DISABLED_FLOOR),
+            // Fail-CLOSED by default, like the two behavioural gates above and
+            // unlike hash-first (#5147). See the field's rustdoc.
+            broadcast_target_list_floor_override: Some(Self::SIM_MIGRATION_DISABLED_FLOOR),
             hosting_clock: None,
             hosting_budget_override: None,
             shared_rings: HashMap::new(),
@@ -1671,6 +1848,24 @@ impl SimNetwork {
         seed = seed.wrapping_mul(0xc4ceb9fe1a85ec53);
         seed ^= seed >> 33;
         seed
+    }
+
+    /// Makes this network's injected crashes and partitions REAL packet
+    /// drops: installs the fault-injection delivery callback for this network
+    /// only, and opts its fault injector in via `enforce_fault_drops`.
+    ///
+    /// The callback is keyed by this network's name and removed by
+    /// `SimNetwork::Drop`, so another simulation in the same process can
+    /// neither replace it nor clear it (#5673).
+    #[cfg(any(test, feature = "testing"))]
+    fn enable_fault_drop_enforcement(&self) {
+        crate::transport::in_memory_socket::set_packet_delivery_callback(
+            &self.name,
+            Some(Arc::new(fault_injection_delivery_decision)),
+        );
+        if let Some(injector) = crate::node::network_bridge::get_fault_injector(&self.name) {
+            injector.lock().unwrap().enforce_fault_drops = true;
+        }
     }
 }
 
@@ -1914,6 +2109,137 @@ impl SimNetwork {
         }
         for (builder, _) in self.nodes.iter_mut() {
             builder.config.summary_first_put_floor_override = floor;
+        }
+        self
+    }
+
+    /// State explicitly that this simulation exercises the hash-first summary
+    /// exchange (#4965) by pinning the per-node floor to the always-passing
+    /// [`Self::SIM_MIGRATION_ENABLED_FLOOR`].
+    ///
+    /// This is ALREADY the default for every `SimNetwork` (see `new_inner`),
+    /// so calling it changes nothing — it exists so a test whose premise
+    /// depends on hash-first being on says so at the call site instead of
+    /// relying on a default that a future edit could flip out from under it.
+    /// Mirrors [`disable_summary_first_put`](Self::disable_summary_first_put)'s
+    /// belt-and-suspenders rationale, in the opposite direction.
+    #[allow(dead_code)]
+    pub fn enable_hash_first_summaries(&mut self) -> &mut Self {
+        let floor = Some(Self::SIM_MIGRATION_ENABLED_FLOOR);
+        self.hash_first_summaries_floor_override = floor;
+        for (builder, _) in self.gateways.iter_mut() {
+            builder.config.hash_first_summaries_floor_override = floor;
+        }
+        for (builder, _) in self.nodes.iter_mut() {
+            builder.config.hash_first_summaries_floor_override = floor;
+        }
+        self
+    }
+
+    /// Opt this simulation into the version-carrying connection ack (#5161) by
+    /// pinning the per-node floor to the always-passing
+    /// [`Self::SIM_MIGRATION_ENABLED_FLOOR`], so a joiner learns the version of
+    /// the gateway (or ack-racing peer) it connects to.
+    ///
+    /// Genuinely opt-in, unlike
+    /// [`enable_hash_first_summaries`](Self::enable_hash_first_summaries) which
+    /// only restates a default. The reasoning is the fail-closed criterion this
+    /// codebase already applies: hash-first is opt-OUT because it changes only
+    /// the ENCODING of an exchange every sim already runs. This gate looks like
+    /// that from the inside — it changes only how one ack is encoded — but its
+    /// EFFECT is a cascade, because the version it teaches is the input to
+    /// every other `version_supports_*` gate. Turning it on network-wide makes
+    /// node->gateway links newly eligible for summary-first PUT probes and
+    /// hash-first digests in whatever sims have those enabled, which is exactly
+    /// the "piles load onto unrelated simulations" shape that
+    /// `subscribe_hint_floor_override` and `summary_first_put_floor_override`
+    /// default OFF to avoid. Measured, not assumed: defaulting it ON changed
+    /// the outcome of several unrelated sims.
+    ///
+    /// Note this leaves the sim suite pinned OFF even after the production
+    /// floor is reached, so sims and production diverge on this from 0.2.120
+    /// onwards. That is the deliberate trade — the alternative is every sim
+    /// silently changing behaviour at a release — and the coverage it costs is
+    /// bought back by `test_joiner_records_gateway_version_through_sim_handshake`
+    /// plus the transport-level tests in `connection_handler`.
+    #[allow(dead_code)]
+    pub fn enable_gateway_ack_version(&mut self) -> &mut Self {
+        let floor = Some(Self::SIM_MIGRATION_ENABLED_FLOOR);
+        self.ack_version_floor_override = floor;
+        for (builder, _) in self.gateways.iter_mut() {
+            builder.config.ack_version_floor_override = floor;
+        }
+        for (builder, _) in self.nodes.iter_mut() {
+            builder.config.ack_version_floor_override = floor;
+        }
+        self
+    }
+
+    /// Turn the originator target list (#5147) ON for this simulation by
+    /// pinning the per-node version floor to the always-passing
+    /// [`Self::SIM_MIGRATION_ENABLED_FLOOR`].
+    ///
+    /// Unlike [`enable_hash_first_summaries`](Self::enable_hash_first_summaries),
+    /// this is NOT the default and the call is load-bearing: without it every
+    /// peer falls back to the legacy `BroadcastTo` and the sim measures
+    /// today's unsuppressed fan-out. That is exactly what the control arm of a
+    /// suppression measurement wants, so the two arms differ by this one call.
+    #[allow(dead_code)]
+    pub fn enable_broadcast_target_list(&mut self) -> &mut Self {
+        let floor = Some(Self::SIM_MIGRATION_ENABLED_FLOOR);
+        self.broadcast_target_list_floor_override = floor;
+        for (builder, _) in self.gateways.iter_mut() {
+            builder.config.broadcast_target_list_floor_override = floor;
+        }
+        for (builder, _) in self.nodes.iter_mut() {
+            builder.config.broadcast_target_list_floor_override = floor;
+        }
+        self
+    }
+
+    /// Force the originator target list OFF for this simulation.
+    ///
+    /// Already the default (see `new_inner`); exists so the CONTROL arm of a
+    /// suppression measurement states its premise at the call site rather than
+    /// depending on a default a future edit could flip.
+    #[allow(dead_code)]
+    pub fn disable_broadcast_target_list(&mut self) -> &mut Self {
+        let floor = Some(Self::SIM_MIGRATION_DISABLED_FLOOR);
+        self.broadcast_target_list_floor_override = floor;
+        for (builder, _) in self.gateways.iter_mut() {
+            builder.config.broadcast_target_list_floor_override = floor;
+        }
+        for (builder, _) in self.nodes.iter_mut() {
+            builder.config.broadcast_target_list_floor_override = floor;
+        }
+        self
+    }
+
+    /// Force the hash-first summary exchange OFF for this simulation by
+    /// pinning the per-node floor to the unreachable
+    /// [`Self::SIM_MIGRATION_DISABLED_FLOOR`], so every peer falls back to the
+    /// full-bytes `InterestMessage::Summaries`.
+    ///
+    /// This is the PRE-0.2.116 fleet: it reproduces what an un-upgraded peer
+    /// does.
+    ///
+    /// Note the override is per-node (`builder.config`), so a genuinely MIXED
+    /// simulation — one peer at the floor, one below — is constructible by
+    /// setting the two builders differently rather than using this helper,
+    /// which sets every node uniformly. No such test exists yet; the mixed
+    /// case that IS covered today is incidental rather than constructed: unless
+    /// a sim calls [`enable_gateway_ack_version`](Self::enable_gateway_ack_version),
+    /// a regular node never learns its gateway's version, so every gateway link
+    /// already runs digests one way and full bytes the other.
+    #[allow(dead_code)]
+    pub fn disable_hash_first_summaries(&mut self) -> &mut Self {
+        let floor = Some(Self::SIM_MIGRATION_DISABLED_FLOOR);
+        self.hash_first_summaries_floor_override = floor;
+        for (builder, _) in self.gateways.iter_mut() {
+            builder.config.hash_first_summaries_floor_override = floor;
+        }
+        for (builder, _) in self.nodes.iter_mut() {
+            builder.config.hash_first_summaries_floor_override = floor;
         }
         self
     }
@@ -2570,6 +2896,9 @@ impl SimNetwork {
             config.governance_config_override = self.governance_config_override.clone();
             config.subscribe_hint_floor_override = self.subscribe_hint_floor_override;
             config.summary_first_put_floor_override = self.summary_first_put_floor_override;
+            config.hash_first_summaries_floor_override = self.hash_first_summaries_floor_override;
+            config.ack_version_floor_override = self.ack_version_floor_override;
+            config.broadcast_target_list_floor_override = self.broadcast_target_list_floor_override;
             config.hosting_time_source_override = self
                 .hosting_clock
                 .clone()
@@ -2670,6 +2999,9 @@ impl SimNetwork {
             config.governance_config_override = self.governance_config_override.clone();
             config.subscribe_hint_floor_override = self.subscribe_hint_floor_override;
             config.summary_first_put_floor_override = self.summary_first_put_floor_override;
+            config.hash_first_summaries_floor_override = self.hash_first_summaries_floor_override;
+            config.ack_version_floor_override = self.ack_version_floor_override;
+            config.broadcast_target_list_floor_override = self.broadcast_target_list_floor_override;
             config.hosting_time_source_override = self
                 .hosting_clock
                 .clone()
@@ -3533,6 +3865,13 @@ impl SimNetwork {
         self.event_listener.logs.clone()
     }
 
+    /// Handle to every node's state store, populated by
+    /// [`Self::run_simulation`]. Take it before the run (the run consumes the
+    /// network) and pass it to [`check_convergence_from_logs_and_state`].
+    pub fn final_state_handle(&self) -> FinalStateHandle {
+        self.final_states.clone()
+    }
+
     /// Recommended to calling after `check_connectivity` to ensure enough time
     /// elapsed for all peers to become connected.
     ///
@@ -4267,6 +4606,8 @@ impl SimNetwork {
 
             // Create shared in-memory storage for this node
             let shared_storage = crate::wasm_runtime::MockStateStorage::new();
+            self.final_states
+                .register(self.node_addresses.get(&label), &shared_storage);
 
             let mut user_events = MemoryEventsGen::<R>::new_with_seed(
                 receiver_ch,
@@ -4333,6 +4674,8 @@ impl SimNetwork {
 
             // Create shared in-memory storage for this node
             let shared_storage = crate::wasm_runtime::MockStateStorage::new();
+            self.final_states
+                .register(self.node_addresses.get(&label), &shared_storage);
 
             let mut user_events = MemoryEventsGen::<R>::new_with_seed(
                 receiver_ch,
@@ -4500,21 +4843,11 @@ impl SimNetwork {
         // Save network name for topology retrieval after simulation
         let network_name = self.name.clone();
 
-        // Make `SimOperation::CrashNode` a REAL crash: install the global
-        // packet-delivery callback that consults each network's fault injector
-        // and DROPS every packet to/from a crashed node, then opt THIS network
-        // in via `enforce_fault_drops`. The callback is per-network aware (keyed
-        // on the network name it is handed) and inert for any network that did
-        // not opt in, so the direct-runner churn driver's crash semantics stay
-        // unchanged. `SimNetwork::Drop` clears the callback. Without this, a
-        // "crashed" node kept exchanging packets and piece-F crash tests were
+        // Make `SimOperation::CrashNode` a REAL crash: DROP every packet
+        // to/from a crashed node of this network. Without this, a "crashed"
+        // node kept exchanging packets and piece-F crash tests were
         // false-green (#4642 piece F).
-        crate::transport::in_memory_socket::set_packet_delivery_callback(Some(
-            std::sync::Arc::new(fault_injection_delivery_decision),
-        ));
-        if let Some(injector) = crate::node::network_bridge::get_fault_injector(&network_name) {
-            injector.lock().unwrap().enforce_fault_drops = true;
-        }
+        self.enable_fault_drop_enforcement();
 
         // Build Turmoil simulation with seeded RNG for deterministic execution
         let mut sim = turmoil::Builder::new()
@@ -5149,6 +5482,8 @@ impl SimNetwork {
         // every-hop summarize-storm falsifier reads these after the run returns.
         let summarize_wasm_calls =
             crate::ring::topology_registry::get_all_summarize_wasm_calls(&network_name);
+        let zombie_sweep_observations =
+            crate::ring::topology_registry::get_all_zombie_sweep_observations(&network_name);
 
         // Capture the crash-drop count BEFORE self drops (Drop clears the fault
         // injector via `set_fault_injector(None)`). `> 0` proves a scripted
@@ -5173,6 +5508,7 @@ impl SimNetwork {
             renewal_metrics,
             crash_packets_dropped,
             summarize_wasm_calls,
+            zombie_sweep_observations,
         }
     }
 
@@ -5467,8 +5803,8 @@ impl SimNetwork {
         // Make direct-runner ChurnConfig crashes REAL packet drops (#4694).
         //
         // The chaos driver below marks nodes crashed in this network's fault
-        // injector, but a crash only drops packets if the global packet-delivery
-        // callback is installed AND this network opted in via
+        // injector, but a crash only drops packets if this network's
+        // packet-delivery callback is installed AND it opted in via
         // `enforce_fault_drops`. Neither happened on the direct runner, so churn
         // faults were inert: a "crashed" node kept exchanging packets and every
         // near-K churn / partition validation on this runner was false-green
@@ -5478,14 +5814,8 @@ impl SimNetwork {
         // byte-for-byte unchanged (the callback is inert unless a node is
         // actually crashed/partitioned, but gating keeps the change surgical and
         // makes the wiring impossible to miss when churn IS configured).
-        // `SimNetwork::Drop` clears the global callback.
         if self.churn_config.is_some() {
-            crate::transport::in_memory_socket::set_packet_delivery_callback(Some(
-                std::sync::Arc::new(fault_injection_delivery_decision),
-            ));
-            if let Some(injector) = crate::node::network_bridge::get_fault_injector(&self.name) {
-                injector.lock().unwrap().enforce_fault_drops = true;
-            }
+            self.enable_fault_drop_enforcement();
         }
 
         // Single-threaded runtime with paused time for deterministic execution
@@ -6254,7 +6584,7 @@ impl Drop for SimNetwork {
         use crate::node::network_bridge::set_fault_injector;
         use crate::ring::topology_registry::{
             clear_current_network_name, clear_renewal_metrics, clear_summarize_metrics,
-            clear_topology_snapshots,
+            clear_topology_snapshots, clear_zombie_sweep_observations,
         };
         use crate::transport::in_memory_socket::{
             clear_network_address_mappings, remove_network_socket_registry,
@@ -6267,13 +6597,15 @@ impl Drop for SimNetwork {
         clear_topology_snapshots(&self.name);
         clear_renewal_metrics(&self.name);
         clear_summarize_metrics(&self.name);
+        clear_zombie_sweep_observations(&self.name);
         remove_network_socket_registry(&self.name);
         clear_network_address_mappings(&self.name);
 
-        // Clear global callbacks to prevent stale references between
-        // sequential simulation runs (e.g., determinism tests).
-        set_packet_delivery_callback(None);
-        set_queue_packet_callback(None);
+        // Remove only THIS network's callbacks. Clearing a process-global slot
+        // here turned off crash enforcement for every other simulation still
+        // running in the same process (#5673).
+        set_packet_delivery_callback(&self.name, None);
+        set_queue_packet_callback(&self.name, None);
 
         // Thread-local cleanup
         clear_current_network_name();
@@ -6504,11 +6836,270 @@ pub async fn check_convergence_from_logs(
     }
 }
 
+/// Every node's state store from a [`SimNetwork::run_simulation`] run, keyed
+/// by the node's address (the same address its event-log entries carry).
+///
+/// Exists because the log alone cannot say what a node holds at the end. A
+/// node that originates a client PUT or UPDATE commits the new state locally
+/// and fans it out, but logs no stored-state hash for its own commit (its
+/// `PutSuccess` carries none, and a client-local UPDATE emits no
+/// `UpdateSuccess`). Its last logged hash is the one BEFORE its own write,
+/// while every peer that applied the fan-out logs the new one. When that write
+/// is the last one to a contract in the run, [`check_convergence_from_logs`]
+/// reports a divergence that does not exist (#5172).
+#[derive(Clone, Default)]
+pub struct FinalStateHandle(
+    Arc<std::sync::Mutex<BTreeMap<SocketAddr, crate::wasm_runtime::MockStateStorage>>>,
+);
+
+impl FinalStateHandle {
+    fn register(&self, addr: Option<&SocketAddr>, storage: &crate::wasm_runtime::MockStateStorage) {
+        if let Some(addr) = addr {
+            self.0
+                .lock()
+                .expect("final-state map poisoned")
+                .insert(*addr, storage.clone());
+        }
+    }
+
+    fn final_hash(&self, addr: &SocketAddr, key: &ContractKey) -> Option<String> {
+        let map = self.0.lock().expect("final-state map poisoned");
+        map.get(addr)
+            .and_then(|storage| storage.get_stored_state(key))
+            .map(|state| crate::tracing::state_hash_full(&state))
+    }
+}
+
+/// [`check_convergence_from_logs`], but each peer's state is read from its
+/// store at the end of the run instead of from its last logged hash.
+///
+/// The PEER SET is unchanged: a peer is checked for a contract iff it logged a
+/// stored-state hash for it, exactly as before, so this cannot pull in copies
+/// the old check never compared. Only the value moves from "the last hash it
+/// logged" to "the state it actually holds". A peer whose store no longer has
+/// the contract (evicted) keeps its last logged hash, the old behaviour.
+pub async fn check_convergence_from_logs_and_state(
+    logs: &Arc<tokio::sync::Mutex<Vec<crate::tracing::NetLogMessage>>>,
+    final_states: &FinalStateHandle,
+) -> ConvergenceResult {
+    let logs = logs.lock().await;
+
+    // contract -> (key, peer -> hash). BTreeMap for deterministic order.
+    let mut contract_states: BTreeMap<String, (ContractKey, BTreeMap<SocketAddr, String>)> =
+        BTreeMap::new();
+    for log in logs.iter() {
+        if let (Some(key), Some(hash)) = (log.kind.contract_key(), log.kind.stored_state_hash()) {
+            contract_states
+                .entry(format!("{key:?}"))
+                .or_insert_with(|| (key, BTreeMap::new()))
+                .1
+                .insert(log.peer_id.socket_addr(), hash.to_string());
+        }
+    }
+    drop(logs);
+
+    let mut converged = Vec::new();
+    let mut diverged = Vec::new();
+    for (contract_key, (key, mut peer_states)) in contract_states {
+        if peer_states.len() < 2 {
+            continue;
+        }
+        for (addr, hash) in peer_states.iter_mut() {
+            if let Some(actual) = final_states.final_hash(addr, &key) {
+                *hash = actual;
+            }
+        }
+        let unique_states: HashSet<&String> = peer_states.values().collect();
+        if unique_states.len() == 1 {
+            let state = unique_states.into_iter().next().unwrap().clone();
+            converged.push(ConvergedContract {
+                contract_key,
+                state_hash: state,
+                replica_count: peer_states.len(),
+            });
+        } else {
+            diverged.push(DivergedContract {
+                contract_key,
+                peer_states: peer_states.into_iter().collect(),
+            });
+        }
+    }
+
+    ConvergenceResult {
+        converged,
+        diverged,
+    }
+}
+
 use crate::contract::OperationMode;
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #5172: the log-only check reads a peer's LAST LOGGED hash, which goes
+    /// stale when the peer's own client write commits without logging one.
+    /// `check_convergence_from_logs_and_state` must read the peer's store
+    /// instead, and must still report a store that really differs.
+    #[tokio::test]
+    async fn convergence_from_state_reads_the_store_not_the_last_logged_hash() {
+        use crate::message::Transaction;
+        use crate::tracing::{EventKind, NetLogMessage, event_kind::UpdateEvent};
+
+        let contract = SimOperation::create_test_contract(7);
+        let key = contract.key();
+        let old_state = WrappedState::new(vec![1, 1, 1]);
+        let new_state = WrappedState::new(vec![2, 2, 2]);
+        let old_hash = crate::tracing::state_hash_full(&old_state);
+        let new_hash = crate::tracing::state_hash_full(&new_state);
+
+        let peer = |port: u16| {
+            let addr: SocketAddr = (Ipv6Addr::LOCALHOST, port).into();
+            let pkl = PeerKeyLocation::new(TransportKeypair::new().public().clone(), addr);
+            (addr, pkl)
+        };
+        let (writer_addr, writer) = peer(41_001);
+        let (reader_addr, reader) = peer(41_002);
+        let applied = |pkl: &PeerKeyLocation, hash: &str| NetLogMessage {
+            tx: *Transaction::NULL,
+            datetime: chrono::Utc::now(),
+            peer_id: crate::node::PeerId::new(pkl.pub_key().clone(), pkl.socket_addr().unwrap()),
+            kind: EventKind::Update(UpdateEvent::UpdateSuccess {
+                id: *Transaction::NULL,
+                requester: pkl.clone(),
+                target: pkl.clone(),
+                key,
+                timestamp: 0,
+                state_hash_before: None,
+                state_hash_after: Some(hash.to_string()),
+                state_size: None,
+            }),
+        };
+        // The writer last LOGGED the old state; the reader logged the new one,
+        // which it got from the writer's fan-out.
+        let logs = Arc::new(tokio::sync::Mutex::new(vec![
+            applied(&writer, &old_hash),
+            applied(&reader, &new_hash),
+        ]));
+
+        let writer_store = crate::wasm_runtime::MockStateStorage::new();
+        let reader_store = crate::wasm_runtime::MockStateStorage::new();
+        reader_store.seed_state(key, new_state.clone());
+        let finals = FinalStateHandle::default();
+        finals.register(Some(&writer_addr), &writer_store);
+        finals.register(Some(&reader_addr), &reader_store);
+
+        assert_eq!(
+            check_convergence_from_logs(&logs).await.diverged.len(),
+            1,
+            "precondition: the log-only check reports the phantom divergence"
+        );
+
+        // The writer actually holds the state it wrote: converged.
+        writer_store.seed_state(key, new_state);
+        let result = check_convergence_from_logs_and_state(&logs, &finals).await;
+        assert_eq!(
+            (result.converged.len(), result.diverged.len()),
+            (1, 0),
+            "the writer's store holds the new state, so the contract converged"
+        );
+
+        // A store that really differs is still a divergence.
+        writer_store.seed_state(key, WrappedState::new(vec![9, 9, 9]));
+        let result = check_convergence_from_logs_and_state(&logs, &finals).await;
+        assert_eq!(
+            (result.converged.len(), result.diverged.len()),
+            (0, 1),
+            "a peer whose store disagrees must be reported as diverged"
+        );
+    }
+
+    /// Regression for #5673: one simulation finishing (dropping its
+    /// `SimNetwork`) must not switch off crash enforcement for another
+    /// simulation still running in the same process.
+    ///
+    /// Network B stays alive on this thread with a crashed node. Network A is
+    /// built, enabled and dropped on a second thread, which is what happens
+    /// when plain `cargo test` runs two simulations as threads of one process
+    /// and A finishes first. B's crashed node must still drop packets
+    /// afterwards. Before the fix the callback was one process-global slot, so
+    /// A's `Drop` cleared it and B's "crashed" node was delivered to again.
+    ///
+    /// Scope: this checks the per-network callback map, calling
+    /// `check_packet_delivery` with B's name exactly as B's sockets do. It does
+    /// not cover how a socket learns its network name from its address at bind
+    /// time (`ADDRESS_NETWORKS`), which has its own cross-network hazard: #5676.
+    #[test]
+    fn dropping_one_network_keeps_crash_enforcement_of_another() {
+        use crate::node::network_bridge::get_fault_injector;
+        use crate::transport::in_memory_socket::{
+            PacketDeliveryDecision, check_packet_delivery, has_packet_delivery_callback,
+        };
+
+        const NET_A: &str = "crash-enforcement-finishes-first-5673";
+        const NET_B: &str = "crash-enforcement-still-running-5673";
+
+        let build = move |name: &'static str, seed: u64| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(SimNetwork::new(name, 1, 2, 7, 3, 6, 2, seed))
+        };
+        let is_drop = |d: PacketDeliveryDecision| matches!(d, PacketDeliveryDecision::Drop);
+
+        let b = build(NET_B, 0x5673_000B);
+        b.enable_fault_drop_enforcement();
+        let mut addrs: Vec<SocketAddr> = b.all_node_addresses().values().copied().collect();
+        addrs.sort();
+        let (crashed, live_x, live_y) = (addrs[0], addrs[1], addrs[2]);
+        get_fault_injector(NET_B)
+            .expect("SimNetwork::new registers a fault injector")
+            .lock()
+            .unwrap()
+            .config
+            .crash_node(crashed);
+        assert!(
+            is_drop(check_packet_delivery(NET_B, live_x, crashed)),
+            "precondition: B's crashed node drops packets before A exists"
+        );
+
+        std::thread::spawn(move || {
+            let a = build(NET_A, 0x5673_000A);
+            a.enable_fault_drop_enforcement();
+            assert!(has_packet_delivery_callback(NET_A));
+            drop(a);
+        })
+        .join()
+        .expect("network A's thread panicked");
+
+        assert!(
+            !has_packet_delivery_callback(NET_A),
+            "dropping A must remove A's own callback"
+        );
+        assert!(
+            has_packet_delivery_callback(NET_B),
+            "dropping A must not remove B's callback"
+        );
+        assert!(
+            is_drop(check_packet_delivery(NET_B, live_x, crashed)),
+            "after A dropped, packets TO B's crashed node must still be dropped"
+        );
+        assert!(
+            is_drop(check_packet_delivery(NET_B, crashed, live_x)),
+            "after A dropped, packets FROM B's crashed node must still be dropped"
+        );
+        assert!(
+            !is_drop(check_packet_delivery(NET_B, live_x, live_y)),
+            "B's healthy nodes must still reach each other"
+        );
+
+        drop(b);
+        assert!(
+            !has_packet_delivery_callback(NET_B),
+            "dropping B must remove B's own callback"
+        );
+    }
 
     /// Unit test for the fault-injection delivery decision (#4694 / #4642 piece F).
     ///

@@ -23,15 +23,51 @@
 <h1 id="title">Freenet shell fixture</h1>
 
 <!--
-  Cross-origin link. The navigation interceptor must intercept clicks on this
-  (left, middle, and shift) and forward them to the shell as an `open_url`
-  postMessage rather than letting the sandboxed iframe open a null-origin
-  popup (freenet/freenet-core#3852, #3854). example.com is a reserved
-  documentation domain (RFC 2606) that is never actually navigated to in the
-  tests — the click is intercepted before any network request.
+  Cross-origin link WITH an explicit new-window target. The interceptor must
+  leave this to the browser: the shell iframe carries
+  `allow-popups-to-escape-sandbox`, so the native popup is a real top-level
+  document with a proper Origin (freenet/river#208's null-origin CORS breakage
+  came from the popup INHERITING the sandbox, which no longer happens). Routing
+  it through the shell instead is what broke Firefox, whose popup blocker
+  refuses `window.open` from a `message` handler.
+
+  example.com is a reserved documentation domain (RFC 2606); the tests stub the
+  route so no real network request is made.
 -->
 <a id="cross-origin-link" href="https://example.com/external" target="_blank" rel="noopener">
   External cross-origin link
+</a>
+
+<!--
+  Cross-origin link with NO target. Left native it would navigate the app frame
+  itself to a foreign origin, which the shell's `frame-src 'self'` refuses — the
+  click would silently do nothing. The interceptor must open a tab for it, from
+  inside the click handler where the user gesture is live.
+-->
+<a id="cross-origin-untargeted-link" href="https://example.com/plain">
+  External cross-origin link, no target
+</a>
+
+<!--
+  Cross-origin link with `target="_top"`. `_top` names an ANCESTOR context, not
+  a new one, and the sandbox forbids navigating it — so "any non-`_self` target
+  is a new-window activation, hand it to the browser" makes this a silently dead
+  click. It must be classified like an untargeted cross-origin link and opened
+  in a tab.
+-->
+<a id="cross-origin-top-link" href="https://example.com/top" target="_top">
+  External cross-origin link, target=_top
+</a>
+
+<!--
+  Same-origin link with an explicit new-window target. This is the #5087 case:
+  every cross-CONTRACT link is same-ORIGIN, so this is what a thumbnail or
+  cross-app link looks like. It must open natively as a real top-level tab that
+  loads the shell (previously it either produced a blank sandbox-inheriting tab,
+  or — once routed through `open_url` — nothing at all in Firefox).
+-->
+<a id="same-origin-blank-link" href="page2.html" target="_blank">
+  In-contract page 2, new tab
 </a>
 
 <!--
@@ -41,6 +77,15 @@
   web prefix regardless of the contract key.
 -->
 <a id="same-origin-link" href="page2.html">In-contract page 2</a>
+
+<!--
+  Same-origin link to a page with NO <title> element at all
+  (fixture-webapp/no-title.html). Locks in title_sync.js's documented choice
+  to leave the tab on the PREVIOUS page's title rather than resetting it —
+  see the comment on that fixture and on the `if (!title || ...)` guard in
+  path_handlers/assets/title_sync.js.
+-->
+<a id="no-title-link" href="no-title.html">In-contract page with no title</a>
 
 <!--
   Download link. The interceptor must NOT intercept links carrying a
@@ -59,6 +104,24 @@
 -->
 <a id="download-link" href="page2.html" download="hello.txt">Download</a>
 
+<!--
+  Programmatic open. A contract calling window.open() from its own JS never
+  touches the anchor interceptor, so it is the path that relies purely on
+  `allow-popups-to-escape-sandbox` to produce a real top-level tab. Before
+  #5100 an override forwarded it to the shell (#4645); now it is native.
+-->
+<button id="programmatic-open">window.open()</button>
+
+<!--
+  The #3818 escape, played out by a hostile contract. `allow-popups-to-escape-sandbox`
+  means a popup this frame opens is top-level with NO sandboxing flags, and an
+  `about:blank` popup inherits this frame's origin — so the contract can script
+  it and, from there, re-embed its own bytes in a nested frame that inherits no
+  sandboxing either. If the server does not sandbox contract content itself,
+  that frame runs at the node's real origin.
+-->
+<button id="escape-sandbox">escape</button>
+
 <!-- Result sink the Playwright tests read via page.evaluate. -->
 <pre id="poll-result">pending</pre>
 
@@ -72,6 +135,45 @@
   // We surface the outcome in #poll-result so the test can also confirm the
   // fetch actually ran (a CSP block rejects the promise rather than returning
   // a response).
+
+  // Programmatic new-window open, invoked from a real click so the gesture is
+  // live (the same condition a contract app's own button would have).
+  document.getElementById('programmatic-open').addEventListener('click', function () {
+    window.open('https://example.com/programmatic', '_blank');
+  });
+
+  // Attempt the escape described above. Each step records what it managed to
+  // do, so the test can tell "blocked" apart from "never ran".
+  document.getElementById('escape-sandbox').addEventListener('click', function () {
+    var w = window.open('about:blank', 'escape-probe');
+    window.__escapeOpened = !!w;
+    if (!w) return;
+    try {
+      // Probe BOTH routes that serve contract bytes, because they are guarded
+      // in different places:
+      //   - `page2.html` resolved against the base drops `?__sandbox=1`, so it
+      //     lands on the plain asset route (`variable_content`) — as
+      //     `Sec-Fetch-Dest: iframe`, the destination a `document`-only guard
+      //     does not see.
+      //   - `index.html?__sandbox=1` is the sandbox-content route
+      //     (`serve_sandbox_response`), which blocks TOP-LEVEL loads but not
+      //     nested ones, and which relied entirely on the iframe attribute for
+      //     its opaque origin. This is the sharper attack: no scriptable SVG or
+      //     other exotic type needed, just the contract's own page.
+      var asset = new URL('page2.html', document.baseURI).href;
+      var app = new URL('index.html?__sandbox=1', document.baseURI).href;
+      w.document.write(
+        '<!doctype html><title>escape</title>' +
+        '<iframe id="probe-asset" src="' + asset + '"></iframe>' +
+        '<iframe id="probe-app" src="' + app + '"></iframe>'
+      );
+      w.document.close();
+      window.__escapeWrote = true;
+    } catch (err) {
+      window.__escapeWriteError = String((err && err.name) || err);
+    }
+  });
+
   (function () {
     var sink = document.getElementById('poll-result');
     fetch('/permission/pending', { headers: { 'accept': 'application/json' } })

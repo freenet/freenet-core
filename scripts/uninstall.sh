@@ -220,6 +220,69 @@ elif [ "$OS" = "macos" ]; then
     done
 fi
 
+# --- Step 1b: remove the freenet:// link handler (Linux) -------------------
+#
+# `freenet service install` registers a desktop entry for freenet:// links
+# (crates/core/src/bin/commands/url_handler.rs). Remove it only if it carries
+# Freenet's marker line, and remove only Freenet's own association line from
+# mimeapps.list, leaving every other entry in that file untouched.
+
+removed_handler="0"
+if [ "$OS" = "linux" ]; then
+    # Relative XDG_* values are invalid per the spec and ignored, as the Rust
+    # side ignores them.
+    case "${XDG_DATA_HOME:-}" in /*) data_home="$XDG_DATA_HOME" ;; *) data_home="${HOME}/.local/share" ;; esac
+    case "${XDG_CONFIG_HOME:-}" in /*) config_home="$XDG_CONFIG_HOME" ;; *) config_home="${HOME}/.config" ;; esac
+    APPS_DIR="${data_home}/applications"
+    DESKTOP_ENTRY="${APPS_DIR}/freenet-url-handler.desktop"
+    handler_is_ours="1"
+    if [ -f "$DESKTOP_ENTRY" ]; then
+        if grep -qx 'X-Freenet-Managed=true' "$DESKTOP_ENTRY"; then
+            rm -f "$DESKTOP_ENTRY"
+            info "Removed ${DESKTOP_ENTRY}"
+            removed_handler="1"
+            if has_cmd update-desktop-database; then
+                update-desktop-database -q "$APPS_DIR" >/dev/null 2>&1 || true
+            fi
+        else
+            # Someone else's file at our path: it, and the association
+            # naming it, are not ours to remove.
+            handler_is_ours="0"
+        fi
+    fi
+    # Surrounding whitespace and a CR are tolerated, as in the Rust copy.
+    HANDLER_LINE='^[[:space:]]*x-scheme-handler/freenet=freenet-url-handler\.desktop;\{0,1\}[[:space:]]*$'
+    # The current XDG location, and the one older xdg-utils wrote to.
+    for MIMEAPPS in "${config_home}/mimeapps.list" "${APPS_DIR}/mimeapps.list"; do
+        if [ "$handler_is_ours" = "1" ] && [ -f "$MIMEAPPS" ] && grep -q "$HANDLER_LINE" "$MIMEAPPS"; then
+            # Rewrite the real file (following a dotfile-manager symlink)
+            # through a temp file in ITS directory, then rename it into place:
+            # atomic, so a failure never leaves a truncated list, and the
+            # symlink itself is untouched.
+            target="$(readlink -f "$MIMEAPPS" 2>/dev/null || echo "$MIMEAPPS")"
+            if ! tmp_list="$(mktemp "${target}.freenet-XXXXXX" 2>/dev/null)"; then
+                warn "Could not create a temp file; left the freenet:// line in ${MIMEAPPS}"
+                continue
+            fi
+            # grep -v exits 1 when it prints nothing (the file held only our
+            # line); that is still success. Exit 2 is a read error: keep the
+            # user's file.
+            grep_status=0
+            grep -v "$HANDLER_LINE" "$MIMEAPPS" > "$tmp_list" || grep_status=$?
+            # Keep the file's mode (best effort: busybox chmod has no
+            # --reference, and then the list simply becomes 0600).
+            chmod --reference="$target" "$tmp_list" 2>/dev/null || true
+            if [ "$grep_status" -le 1 ] && mv -f "$tmp_list" "$target"; then
+                info "Removed the freenet:// association from ${MIMEAPPS}"
+                removed_handler="1"
+            else
+                warn "Could not rewrite ${MIMEAPPS}; left it unchanged"
+            fi
+            rm -f "$tmp_list"
+        fi
+    done
+fi
+
 # --- Step 2: remove binaries from every known install location ------------
 
 removed_binaries="0"
@@ -304,7 +367,7 @@ fi
 
 # --- Summary --------------------------------------------------------------
 
-if [ -z "$removed_service" ] && [ "$removed_binaries" = "0" ]; then
+if [ -z "$removed_service" ] && [ "$removed_binaries" = "0" ] && [ "$removed_handler" = "0" ]; then
     info "Nothing to uninstall - Freenet does not appear to be installed for this user."
 else
     success "Freenet uninstalled."

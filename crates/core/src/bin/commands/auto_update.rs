@@ -17,7 +17,7 @@ use anyhow::Result;
 use semver::Version;
 use std::fs;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, SystemTime};
 
 pub use freenet::transport::{
@@ -117,11 +117,152 @@ const INITIAL_BACKOFF: Duration = Duration::from_secs(60);
 /// Maximum backoff interval for update checks (1 hour).
 const MAX_BACKOFF: Duration = Duration::from_secs(3600);
 
-/// Maximum consecutive update failures before disabling auto-update.
+/// Consecutive update failures after which auto-update is locked out: paused
+/// to at most one retry per [`UPDATE_LOCKOUT_COOLDOWN`].
 const MAX_UPDATE_FAILURES: u32 = 3;
 
-/// GitHub API URL for latest release.
-const GITHUB_API_URL: &str = "https://api.github.com/repos/freenet/freenet-core/releases/latest";
+/// The minimum spacing of a locked-out node's retries. A permanent lockout
+/// stranded any peer that runs stably and never restarts, since it then never
+/// asked again; a lockout that reopens lets such a peer recover once whatever
+/// broke its installs is fixed. See [`claim_update_attempt`] for what keeps a
+/// peer whose installs ALWAYS fail at one attempt per cooldown.
+const UPDATE_LOCKOUT_COOLDOWN: Duration = Duration::from_secs(24 * 3600);
+
+/// When a locked-out node last spent its retry, as Unix seconds. Written by the
+/// NODE, before it asks GitHub, so the spacing does not depend on the updater
+/// managing to record its failure. Older binaries ignore it.
+const LOCKOUT_RETRY_FILE: &str = "update_lockout_retry";
+
+/// Non-API "latest release" URL (#5102).
+///
+/// This is deliberately **not** `api.github.com`. GitHub's REST API allows only
+/// **60 unauthenticated requests per hour per source IP**, and that budget is
+/// *collective*: every Freenet node behind the same NAT/CGNAT/VPN egress — plus
+/// every unrelated tool on that IP — draws from the same 60. A single node could
+/// previously consume up to ~12 of those 60 per hour (see the token-bucket
+/// section below), so a handful of peers sharing an apparent IP exhausted it and
+/// auto-update started failing with `403`/`429`.
+///
+/// `https://github.com/{repo}/releases/latest` answers with a `302` whose
+/// `Location` header carries the tag (`.../releases/tag/v0.2.118`). It is served
+/// by the web front end, carries **no `x-ratelimit-*` headers at all**, and does
+/// not draw on the REST budget — so version *detection*, which is the part that
+/// runs on a timer, now costs nothing that can be exhausted.
+///
+/// Do NOT "simplify" this back to `api.github.com`: the JSON body is not needed
+/// to learn the tag, and paying REST quota for it is precisely the bug.
+const GITHUB_LATEST_REDIRECT_URL: &str = "https://github.com/freenet/freenet-core/releases/latest";
+
+/// Marker inside the redirect `Location` that precedes the release tag.
+const RELEASE_TAG_PATH_MARKER: &str = "/releases/tag/";
+
+/// User-Agent sent on every GitHub request. GitHub rejects unidentified clients,
+/// and a stable, identifiable agent is what lets them tell us apart from a
+/// runaway crawler if our aggregate load ever does become a problem.
+pub(crate) const GITHUB_USER_AGENT: &str = "freenet-updater";
+
+/// Extract the release tag from a `releases/latest` redirect `Location`.
+///
+/// Accepts absolute (`https://github.com/o/r/releases/tag/v1.2.3`) and relative
+/// (`/o/r/releases/tag/v1.2.3`) forms, tolerates a trailing slash, and strips
+/// any `?`/`#` suffix.
+///
+/// Returns the tag **verbatim** (`v1.2.3`, not `1.2.3`). Callers wanting a
+/// semver string use [`version_from_tag`]; callers addressing the release over
+/// the API use the tag as-is. Keeping the raw form removes a strip-then-re-add
+/// round trip: an earlier version stripped here and rebuilt the URL with
+/// `format!("v{tag}")`, which silently 404s for any tag the round trip does not
+/// reproduce exactly — a bare `1.2.3`, or `vv1.2.3` under the greedy
+/// `trim_start_matches` it used.
+///
+/// Returns `None` when the header is not a release-tag redirect, or when the tag
+/// carries no version at all (`.../releases/tag/v`) — never a bogus version,
+/// since one parsing as newer would drive a pointless exit-42 update cycle.
+///
+/// Pure so the parsing contract is unit-testable without touching the network.
+pub(crate) fn parse_tag_from_release_location(location: &str) -> Option<String> {
+    let after = location.split_once(RELEASE_TAG_PATH_MARKER)?.1;
+    let tag = after
+        .split(['?', '#'])
+        .next()
+        .unwrap_or(after)
+        .trim_end_matches('/')
+        .trim();
+    if tag.is_empty() || version_from_tag(tag).is_empty() {
+        return None;
+    }
+    Some(tag.to_string())
+}
+
+/// The semver-comparable part of a release tag: `v1.2.3` -> `1.2.3`.
+///
+/// Uses `strip_prefix`, which removes **at most one** leading `v` — unlike
+/// `trim_start_matches`, which is greedy and would turn `vv1.2.3` into `1.2.3`,
+/// losing what is needed to address the release again. `update.rs` already
+/// documents this exact hazard on `macos_dmg_asset_name`.
+pub(crate) fn version_from_tag(tag: &str) -> &str {
+    tag.strip_prefix('v').unwrap_or(tag)
+}
+
+/// Whether a status means "GitHub is rate-limiting this IP".
+///
+/// GitHub signals the primary (per-hour) limit with **`403`** and secondary /
+/// abuse limits with **`429`**; both mean "stop asking". We deliberately do not
+/// try to distinguish a rate-limit `403` from an authorization `403` here: we
+/// send no credentials, so an authorization `403` on a public release redirect is
+/// not a case that arises, and treating an ambiguous `403` as "back off" is the
+/// safe direction — the cost is a delayed update, the cost of guessing the other
+/// way is escalating toward an IP block.
+pub(crate) fn is_rate_limited_status(status: reqwest::StatusCode) -> bool {
+    status == reqwest::StatusCode::FORBIDDEN || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+}
+
+/// Longest cooldown we will honour from a server header.
+///
+/// GitHub's core window is one hour, so anything past this is either a secondary
+/// limit with a long fuse or a bad header; clamping keeps a hostile or buggy
+/// value from silently disabling auto-update for days.
+const MAX_GITHUB_COOLDOWN: Duration = Duration::from_secs(6 * 3600);
+
+/// Shortest cooldown worth persisting — below this the normal backoff already
+/// spaces polls out further than the header asks for.
+const MIN_GITHUB_COOLDOWN: Duration = Duration::from_secs(60);
+
+/// Derive how long to stay quiet from a rate-limited response's headers.
+///
+/// Prefers `Retry-After` (whole seconds; GitHub sends the delta form) and falls
+/// back to `x-ratelimit-reset` (absolute Unix seconds). Returns `None` when
+/// neither is present or parseable, so the caller can apply its own default
+/// rather than inventing a number here.
+///
+/// `header` is a lookup closure rather than a `HeaderMap` so this stays pure and
+/// directly unit-testable.
+pub(crate) fn parse_retry_after_at<F>(header: F, now_unix: u64) -> Option<Duration>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    let from_retry_after = header("retry-after")
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .map(Duration::from_secs);
+
+    let from_reset = header("x-ratelimit-reset")
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        // Absolute instant → delta. `saturating_sub` covers a reset already in
+        // the past (clock skew), which yields a zero delta and is then clamped up
+        // to MIN_GITHUB_COOLDOWN below.
+        .map(|reset| Duration::from_secs(reset.saturating_sub(now_unix)));
+
+    let raw = from_retry_after.or(from_reset)?;
+    Some(raw.clamp(MIN_GITHUB_COOLDOWN, MAX_GITHUB_COOLDOWN))
+}
+
+/// [`parse_retry_after_at`] against the live wall clock.
+pub(crate) fn parse_retry_after<F>(header: F) -> Option<Duration>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    parse_retry_after_at(header, now_unix())
+}
 
 /// Error returned when an update is needed.
 /// The main function catches this and exits with EXIT_CODE_UPDATE_NEEDED.
@@ -158,6 +299,58 @@ impl std::fmt::Display for RateLimitedError {
 }
 
 impl std::error::Error for RateLimitedError {}
+
+/// Error returned when **GitHub itself** rate-limited us (`403`/`429`), or when
+/// we are still inside a cooldown GitHub asked for earlier (#5102).
+///
+/// Distinct from [`RateLimitedError`] (our own local token bucket) because the
+/// two say different things to an operator: the local bucket is self-imposed and
+/// clears on a fixed refill schedule, whereas this one means the machine's *IP*
+/// has exhausted a budget shared with every other client on it. Both, however,
+/// mean "we did not learn whether an update exists", so both must map to
+/// [`UpdateCheckResult::RateLimited`] and must never be mistaken for "no update".
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct GithubRateLimitedError {
+    /// How long GitHub asked us to wait, when it said.
+    pub(crate) retry_after: Option<Duration>,
+}
+
+impl GithubRateLimitedError {
+    /// Operator-facing explanation. The bare `429 Too Many Requests` this
+    /// replaces told users nothing about the cause (a *shared* IP budget) or the
+    /// remedy, so they read it as "Freenet is broken" and reinstalled by hand.
+    pub(crate) fn user_message(&self) -> String {
+        let when = match self.retry_after {
+            Some(d) if d.as_secs() >= 120 => format!("in about {} minutes", d.as_secs() / 60),
+            Some(d) => format!("in about {} seconds", d.as_secs().max(1)),
+            None => "within the hour".to_string(),
+        };
+        format!(
+            "GitHub is rate-limiting release checks from this network address, so Freenet could \
+             not confirm the latest version. This is a per-IP limit shared by everything on your \
+             connection (and by every other machine behind the same NAT/CGNAT or VPN exit), not a \
+             limit on your node specifically. Nothing is broken and no action is needed: the node \
+             keeps running on its current version and will retry automatically {when}. To update \
+             immediately anyway, download a release directly from \
+             https://github.com/freenet/freenet-core/releases/latest"
+        )
+    }
+}
+
+impl std::fmt::Display for GithubRateLimitedError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.retry_after {
+            Some(d) => write!(
+                f,
+                "GitHub rate-limited this IP; retrying in {}s",
+                d.as_secs()
+            ),
+            None => write!(f, "GitHub rate-limited this IP"),
+        }
+    }
+}
+
+impl std::error::Error for GithubRateLimitedError {}
 
 /// Result of an update check attempt.
 #[derive(Debug, PartialEq)]
@@ -204,37 +397,39 @@ pub enum UpdateCheckResult {
 ///
 /// Security: This function verifies against GitHub, so a malicious peer
 /// claiming a fake version won't trigger an exit.
-/// Set the first time this process logs the auto-update lockout at warn! level,
-/// so the permanent locked-out state is surfaced loudly once rather than on
-/// every 60s update-loop tick (it can be hit from multiple triggers per tick).
-static LOCKOUT_WARNED: AtomicBool = AtomicBool::new(false);
+/// The failure count this process last warned about (`u32::MAX` = none yet, so
+/// even a count of 0, which is what a node with no state dir reports, warns
+/// once). The lockout is
+/// surfaced loudly once per EPISODE rather than on every 60s update-loop tick:
+/// a failed retry after the cooldown raises the count, which warns again, so a
+/// long-running peer whose retries keep failing is not silent after the first.
+static LOCKOUT_WARNED_AT: AtomicU32 = AtomicU32::new(u32::MAX);
 
 pub async fn check_if_update_available(current_version: &str) -> UpdateCheckResult {
     // Don't check if we've failed too many times
     if !should_attempt_update() {
-        // Loud, operator-visible (issue #4580): a persistent lockout means this
-        // peer has stopped trying to auto-update entirely and will silently stay
-        // behind. A common cause is a non-writable binary path (e.g. a
-        // hand-installed binary the service account can't replace), which is a
-        // *permanent* lockout until an operator intervenes. Warn LOUDLY the first
-        // time we observe it this process, then drop to debug! so the permanent
-        // state does not spam the log every minute.
+        // Loud, operator-visible (issue #4580): a lockout means this peer has
+        // stopped trying to auto-update until the cooldown passes, and a common
+        // cause is a non-writable binary path (e.g. a hand-installed binary the
+        // service account can't replace), which will keep failing until an
+        // operator intervenes. Warn LOUDLY once per lockout episode, then drop
+        // to debug! so the state does not spam the log every minute.
         let failures = get_update_failure_count();
-        if !LOCKOUT_WARNED.swap(true, Ordering::Relaxed) {
+        if LOCKOUT_WARNED_AT.swap(failures, Ordering::Relaxed) != failures {
             tracing::warn!(
                 failures,
                 max = MAX_UPDATE_FAILURES,
+                state_dir = ?state_dir(),
                 "Auto-update is LOCKED OUT after {MAX_UPDATE_FAILURES} consecutive failed update \
-                 attempts and will NOT retry. This peer will stay on the current version until an \
-                 operator intervenes. Run `freenet update` manually to update and reset the \
-                 lockout; if updates keep failing, the binary path is likely not writable by this \
-                 account.",
+                 attempts. It retries at most once a day. Run `freenet \
+                 update` manually to update now and reset the lockout; if updates keep failing, \
+                 the binary path is likely not writable by this account.",
             );
         } else {
             tracing::debug!(
                 failures,
                 max = MAX_UPDATE_FAILURES,
-                "Skipping update check - auto-update locked out (already warned this process)"
+                "Skipping update check - auto-update locked out (already warned this episode)"
             );
         }
         return UpdateCheckResult::Skipped;
@@ -249,6 +444,13 @@ pub async fn check_if_update_available(current_version: &str) -> UpdateCheckResu
         );
         return UpdateCheckResult::Skipped;
     }
+
+    // A locked-out node whose cooldown has passed records that it is spending
+    // its retry BEFORE asking GitHub, after the backoff gate so a backoff skip
+    // does not use it up. No-op for a node that is not locked out.
+    let Ok(_attempt) = claim_update_attempt() else {
+        return UpdateCheckResult::Skipped;
+    };
 
     // NOTE: the last-check timestamp is recorded only when a GitHub poll is
     // actually attempted (see the arms below), NOT here. A token-denied
@@ -345,6 +547,25 @@ pub async fn check_if_update_available(current_version: &str) -> UpdateCheckResu
                 UpdateCheckResult::Skipped
             }
         }
+        Err(e) if e.downcast_ref::<GithubRateLimitedError>().is_some() => {
+            // GitHub itself refused (403/429), or we are inside the cooldown it
+            // asked for (#5102). Same handling as our own bucket denial — no
+            // check time recorded, no backoff growth, and crucially NOT a
+            // `Skipped`, so this can never reach the "max backoff + 0
+            // connections -> trust the gateway, exit 42" fallback. Exiting 42
+            // here would hand off to a `freenet update` that shares this very
+            // cooldown and would immediately no-op, i.e. a restart loop driven
+            // by an external rate limit.
+            //
+            // Logged at warn! (not debug!) precisely once per occurrence because
+            // this is the state the user reported as an inscrutable "too many
+            // requests": an operator reading the log should learn that their IP
+            // is limited, that it is shared, and that nothing needs fixing.
+            if let Some(rate_limited) = e.downcast_ref::<GithubRateLimitedError>() {
+                tracing::warn!("Update check deferred: {}", rate_limited.user_message());
+            }
+            UpdateCheckResult::RateLimited
+        }
         Err(e) if e.downcast_ref::<RateLimitedError>().is_some() => {
             // Our OWN rate limiter denied the poll — NOT a GitHub failure, and no
             // network call was made. Deliberately do NOT record a check time or
@@ -373,37 +594,408 @@ pub async fn check_if_update_available(current_version: &str) -> UpdateCheckResu
     }
 }
 
-/// Fetch the latest version string from GitHub releases API.
+/// Fetch the latest release tag from GitHub **without spending REST API quota**
+/// (#5102).
+///
+/// Issues a non-following `GET` to [`GITHUB_LATEST_REDIRECT_URL`] and reads the
+/// tag out of the `302`'s `Location` header. See that constant for why this is
+/// not `api.github.com`.
+///
+/// Shared by the node's detection path ([`get_latest_version`]) and the
+/// supervisor-side installer (`commands::update::get_latest_release`), so both
+/// observe the same server-signalled cooldown.
+///
+/// Returns the version string with any leading `v` stripped.
+///
+/// # Errors
+///
+/// * [`GithubRateLimitedError`] when we are inside a cooldown GitHub previously
+///   asked for, or when this response is itself a `403`/`429`. Callers must
+///   treat this as "we did not learn anything", never as "no update exists".
+/// * Any transport / parse failure otherwise.
+pub(crate) async fn fetch_latest_release_tag(bypass_cached_cooldown: bool) -> Result<String> {
+    // Honour a cooldown GitHub asked for earlier (possibly in a previous
+    // process). Checked BEFORE the request so a limited IP goes quiet instead of
+    // continuing to knock — continuing to knock while limited is what escalates a
+    // soft per-hour limit into a longer secondary block.
+    //
+    // `bypass_cached_cooldown` is for `freenet update --force` ONLY. The stored
+    // deadline is our *cached belief* about GitHub, and it can be stale — GitHub
+    // may have reset early, or the limit may have been another client's doing.
+    // `--force` is the documented operator escape hatch (both the token-bucket
+    // message and the crash-loop rollback advice tell users to run it), so it
+    // must not be blocked by our own cache. It does NOT bypass a LIVE 403/429:
+    // the request below still runs, and a real refusal is still honoured and
+    // still re-records the cooldown.
+    if !bypass_cached_cooldown {
+        if let Some(remaining) = github_cooldown_remaining() {
+            return Err(GithubRateLimitedError {
+                retry_after: Some(remaining),
+            }
+            .into());
+        }
+    }
+
+    match probe_release_tag_at(GITHUB_LATEST_REDIRECT_URL).await? {
+        ProbeResult::Tag(tag) => Ok(tag),
+        ProbeResult::RateLimited { retry_after } => {
+            // GitHub told us to stop. Persist the reset instant it handed back so
+            // every poll path on this machine — including the short-lived
+            // `freenet update` processes the supervisor spawns — stays quiet
+            // until then.
+            record_github_cooldown(retry_after);
+            Err(GithubRateLimitedError { retry_after }.into())
+        }
+        // Distinguish the causes: an operator debugging a detection outage should
+        // not have to guess whether the Location was malformed, refused for
+        // leaving the origin, or never arrived. Previously all three read as
+        // "no parseable release tag", which points at the wrong thing.
+        ProbeResult::Aborted { reason } => anyhow::bail!("release probe aborted: {reason}"),
+        ProbeResult::Unusable { status, location } => match location.as_deref() {
+            None => anyhow::bail!("GitHub returned {status} with no Location header"),
+            Some(loc) if parse_tag_from_release_location(loc).is_some() => anyhow::bail!(
+                "GitHub returned {status} with a release tag in a Location that leaves the \
+                 expected origin, so it was refused: {loc}"
+            ),
+            Some(loc) => anyhow::bail!(
+                "GitHub returned {status} with no parseable release tag in Location ({loc})"
+            ),
+        },
+    }
+}
+
+/// Outcome of one release-tag probe, including the data needed to act on it.
+///
+/// Deliberately carries no side effects: [`probe_release_tag_at`] performs the
+/// HTTP request and nothing else, so the whole network layer can be exercised
+/// against a local server without touching `state_dir()` or any real cooldown.
+#[derive(Debug, PartialEq)]
+pub(crate) enum ProbeResult {
+    Tag(String),
+    RateLimited {
+        retry_after: Option<Duration>,
+    },
+    Unusable {
+        status: u16,
+        location: Option<String>,
+    },
+    /// The probe never reached a conclusion — it hit its own limit rather than
+    /// receiving an unusable answer.
+    ///
+    /// Separate from [`ProbeResult::Unusable`] because these causes are not
+    /// HTTP-shaped. Reporting them with a synthetic `status: 0` and the reason
+    /// stuffed into `location` produced operator-facing text like "GitHub
+    /// returned 0 with no parseable release tag in Location (probe exceeded its
+    /// chain deadline)" — a status GitHub never returned, and a cause that is not
+    /// why it failed. That is the conflation the caller's three-way match was
+    /// written to end, reintroduced one function away.
+    Aborted {
+        reason: String,
+    },
+}
+
+/// Perform a release-tag probe against `url`. Pure I/O — no disk, no state.
+///
+/// Split out from [`fetch_latest_release_tag`] so tests can drive the real
+/// `reqwest` client (including its `Policy::none()` redirect behaviour, which
+/// the entire #5102 change depends on) against a local HTTP server. That
+/// behaviour is an assumption about a third-party crate, and an untested
+/// assumption about how we read a redirect is exactly the kind that breaks
+/// silently and takes fleet-wide auto-update with it.
+pub(crate) async fn probe_release_tag_at(url: &str) -> Result<ProbeResult> {
+    // Bound the whole CHAIN, not just each hop.
+    //
+    // `reqwest`'s builder timeout is per REQUEST ("from when the request starts
+    // connecting until the response body has finished"), and `Policy::none()`
+    // makes every followed hop a separate request — so the redirect-follow added
+    // in #5102 silently turned a 10s worst case into 4 x 10s = 40s.
+    //
+    // That matters because of where this runs. `freenet update` is invoked from
+    // systemd's `ExecStopPost` on every non-0/43 exit, and that phase gets its
+    // own `TimeoutStopSec=45` timer (on an exit 42 the node's drain has already
+    // happened, before the process exited). The probe shares it with the asset
+    // list, the cache re-check and the install itself; since #5790 the archives
+    // normally come from the node's staged download, but when that failed they
+    // are still fetched here. A 40s probe would leave ~5s for all of it, moving
+    // the SIGKILL from mid-PROBE (harmless) to mid-INSTALL (the brick-adjacent
+    // window #3934/#4073 exist to protect). The sibling 10s timeout in `update.rs` was
+    // chosen against this same number, back when the probe was one request;
+    // nothing re-derived it at 4x.
+    //
+    // The deadline is therefore the SAME 10s the single request used to get, with
+    // hops sharing it rather than each getting their own. The follow must not
+    // expand this function's stop-phase footprint at all. A rename hop is cheap
+    // (GitHub's 302 is `content-length: 0`), so the realistic case fits easily; a
+    // chain too slow to fit fails to `Unusable`, which backs off and retries, and
+    // is not a brick.
+    probe_release_tag_within(url, PROBE_CHAIN_TIMEOUT).await
+}
+
+/// [`probe_release_tag_at`] with an explicit chain deadline.
+///
+/// The deadline is a parameter purely so a test can drive it at millisecond
+/// scale: verifying it with the production 10s value would need a test that
+/// actually takes 10s, and a bound nobody has watched fire is not known to work.
+async fn probe_release_tag_within(url: &str, chain_timeout: Duration) -> Result<ProbeResult> {
+    match tokio::time::timeout(chain_timeout, probe_release_tag_chain(url)).await {
+        Ok(result) => result,
+        Err(_elapsed) => Ok(ProbeResult::Aborted {
+            reason: format!(
+                "probe exceeded its {}ms chain deadline",
+                chain_timeout.as_millis()
+            ),
+        }),
+    }
+}
+
+/// Wall-clock bound on an entire probe, including every followed redirect.
+///
+/// Deliberately equal to the per-request timeout below: the redirect-follow must
+/// not widen the worst case that `ExecStopPost`'s `TimeoutStopSec=45` budget was
+/// sized against. See [`probe_release_tag_at`].
+const PROBE_CHAIN_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Per-request timeout inside a probe. A named constant so the test asserting
+/// "the chain costs no more than one request" actually READS it — comparing
+/// against a duplicated literal, as an earlier version did, means the invariant
+/// can be falsified without failing the test that names it.
+const PROBE_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+
+async fn probe_release_tag_chain(url: &str) -> Result<ProbeResult> {
+    let client = reqwest::Client::builder()
+        .user_agent(GITHUB_USER_AGENT)
+        // We want the `Location` header, not the page it points at: following
+        // blindly would download the whole HTML release page for a value already
+        // in the header. Hops are instead followed SELECTIVELY below, only when
+        // a redirect does not carry a tag.
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(PROBE_REQUEST_TIMEOUT)
+        .build()?;
+
+    let mut current = url.to_string();
+
+    for _ in 0..=MAX_PROBE_REDIRECTS {
+        let response = client.get(&current).send().await?;
+        let status = response.status();
+        let header = |name: &str| {
+            response
+                .headers()
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned)
+        };
+        let location = header("location");
+        // Resolve (and origin-check) the Location ONCE, and use the result both
+        // as the tag source and as the follow target.
+        //
+        // Doing it before classification is what closes the second half of the
+        // gap: `parse_tag_from_release_location` only looks for a
+        // `/releases/tag/` segment, so an off-origin Location carrying a
+        // plausible-looking tag would otherwise be believed as a version without
+        // any request being made to it. A version we accept drives exit-42, so it
+        // should come from the host we were pointed at, not from wherever a
+        // response says.
+        let resolved = location
+            .as_deref()
+            .and_then(|loc| resolve_redirect_target(&current, loc));
+
+        match classify_probe_response(status, resolved.as_deref()) {
+            ProbeOutcome::Tag(tag) => return Ok(ProbeResult::Tag(tag)),
+            ProbeOutcome::RateLimited => {
+                return Ok(ProbeResult::RateLimited {
+                    retry_after: parse_retry_after(header),
+                });
+            }
+            ProbeOutcome::Unusable => {
+                // A redirect whose Location carries NO tag is the repository
+                // RENAME case — and it is not hypothetical for this project:
+                // `github.com/freenet/locutus/releases/latest` still answers 301
+                // to `.../freenet-core/releases/latest` today. Refusing to follow
+                // it would mean that the day this repo is renamed or transferred,
+                // detection dies on every deployed node at once, and the only
+                // mechanism that could ship the fix is the one that broke.
+                //
+                // The REST endpoint this replaced survived a rename for free,
+                // because reqwest follows redirects by default; `Policy::none()`
+                // is what took that away, so it has to be given back — bounded,
+                // so a redirect loop cannot hang the probe.
+                match resolved {
+                    Some(next) if status.is_redirection() => {
+                        tracing::debug!(from = %current, to = %next, "following release redirect");
+                        current = next;
+                    }
+                    _ => {
+                        return Ok(ProbeResult::Unusable {
+                            status: status.as_u16(),
+                            location,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(ProbeResult::Aborted {
+        reason: format!("redirect limit ({MAX_PROBE_REDIRECTS}) exceeded"),
+    })
+}
+
+/// Hops followed when a redirect carries no release tag (the rename case in
+/// [`probe_release_tag_at`]). Small: GitHub needs one for a rename, and an
+/// unbounded chain is a hang.
+const MAX_PROBE_REDIRECTS: usize = 3;
+
+/// Resolve a `Location` against the URL it came from, so relative headers work.
+///
+/// Refuses anything that leaves the **origin** — scheme, host and port must all
+/// match the URL the redirect came from. Two things this stops:
+///
+/// * **A downgrade to plaintext.** Permitting `http` would let a redirect move
+///   the probe onto a channel a network attacker can actually rewrite — which is
+///   the difference between "needs to compromise GitHub" and "needs to be on the
+///   path". The initial URL is `https`, so there is never a legitimate reason to
+///   leave it.
+/// * **A redirect off to an arbitrary host.** This runs unattended in a
+///   supervised service, so a `Location` we follow anywhere is a request the
+///   operator never asked for, pointed wherever the response says.
+///
+/// **Same-origin IS an `https` + `github.com` allow-list in production** — that
+/// is the security argument, not merely a convenience. There is exactly one
+/// production caller, and it passes the [`GITHUB_LATEST_REDIRECT_URL`] constant;
+/// every other caller is a test. So the rule delivers precisely the guarantee a
+/// hard-coded allow-list would, while letting the local test server exercise the
+/// real follow path instead of forcing a `#[cfg(test)]` special case into
+/// production code. Do NOT "tighten" this into a literal `github.com` check: it
+/// would gain nothing and would silently stop the follow tests from testing the
+/// follow.
+///
+/// **The path is deliberately NOT constrained.** A redirect to
+/// `https://github.com/other/repo/releases/tag/v1.2.3` resolves, and a unit test
+/// asserts it. That is required by the case this exists for — a repository
+/// rename moves the path — and it adds no exposure under the threat model above:
+/// anyone able to control a GitHub response could serve the tag directly rather
+/// than redirect to it.
+///
+/// Defence in depth, not a fix for a live hole: reaching this requires control of
+/// a TLS-protected GitHub response, and even then a bogus tag only yields a
+/// version string whose assets are fetched from GitHub and checksum/signature
+/// verified. Cheap enough to be worth having anyway.
+fn resolve_redirect_target(current: &str, location: &str) -> Option<String> {
+    let base = reqwest::Url::parse(current).ok()?;
+    let next = base.join(location).ok()?;
+    let same_origin = next.scheme() == base.scheme()
+        && next.host_str() == base.host_str()
+        && next.port_or_known_default() == base.port_or_known_default();
+
+    if !matches!(next.scheme(), "http" | "https") || !same_origin {
+        // warn!, not debug!: if this ever fires in production it means either
+        // GitHub changed its redirect topology — in which case detection is dying
+        // fleet-wide — or something is tampering with the response. Neither is
+        // something an operator should have to enable debug logging to discover.
+        // Same reasoning that raised the rate-limit path to warn! above.
+        tracing::warn!(
+            from = %current,
+            to = %next,
+            "refusing to follow a release redirect that leaves the origin"
+        );
+        return None;
+    }
+    Some(next.into())
+}
+
+/// What a release-probe response means.
+#[derive(Debug, PartialEq)]
+pub(crate) enum ProbeOutcome {
+    /// A usable release tag (leading `v` already stripped).
+    Tag(String),
+    /// GitHub is rate-limiting us; the caller records the cooldown.
+    RateLimited,
+    /// Anything else — no usable tag. Deliberately NOT a version, so a captive
+    /// portal, proxy interstitial, or an unexpected GitHub response can never be
+    /// mistaken for a release and trigger a pointless exit-42 update cycle.
+    Unusable,
+}
+
+/// Classify a `releases/latest` probe response from its status and `Location`.
+///
+/// Pure, so the whole decision is unit-testable without a network round trip —
+/// the status/redirect handling is the part most likely to break silently if
+/// GitHub's response shape ever shifts.
+///
+/// The tag is read from `Location` for ANY non-rate-limited status that supplies
+/// a parseable one, rather than only for `302`. GitHub sends `302` today, but
+/// `301`/`303`/`307`/`308` are all legitimate redirect responses and all carry
+/// the same header; pinning to one code would turn a harmless server-side change
+/// into a fleet-wide update outage.
+pub(crate) fn classify_probe_response(
+    status: reqwest::StatusCode,
+    location: Option<&str>,
+) -> ProbeOutcome {
+    if is_rate_limited_status(status) {
+        return ProbeOutcome::RateLimited;
+    }
+    // A tag is believed only from a redirect or a success. An error response
+    // that happens to carry a `/releases/tag/` Location is not a release
+    // announcement, and treating it as one would let a broken or hostile
+    // intermediary hand us a version.
+    if !(status.is_redirection() || status.is_success()) {
+        return ProbeOutcome::Unusable;
+    }
+    match location.and_then(parse_tag_from_release_location) {
+        Some(tag) => ProbeOutcome::Tag(tag),
+        None => ProbeOutcome::Unusable,
+    }
+}
+
+/// Fetch the latest version string for the node's own detection path.
 async fn get_latest_version() -> Result<String> {
-    // Global persistent rate limit (#4073): refuse to hit GitHub when the shared
-    // token bucket is empty. This is the in-node choke point (the node's startup
-    // check, the #4589 re-poll, and the peer-signal loop all reach GitHub through
-    // here); the supervisor-side `freenet update` is bounded by the same bucket
-    // at `get_latest_release`. A denied poll returns Err so the caller
-    // (`check_if_update_available`) treats it as `Skipped` and retries later —
-    // the node keeps running, it just does not poll GitHub this tick.
+    // Local aggregate-load bound (#4073), kept as defence in depth on top of the
+    // #5102 endpoint switch: refuse to hit GitHub when this node's token bucket
+    // is empty. This is the in-node choke point (the node's startup check, the
+    // #4589 re-poll, and the peer-signal loop all reach GitHub through here); the
+    // supervisor-side `freenet update` is bounded by its own bucket at
+    // `get_latest_release`. A denied poll returns Err so the caller
+    // (`check_if_update_available`) treats it as `RateLimited` and retries later
+    // — the node keeps running, it just does not poll GitHub this tick.
+    // Cooldown FIRST, token second. The reverse order wastes a token on every
+    // 60s tick of a cooldown we were never going to act on: the
+    // GithubRateLimitedError arm deliberately records no check time and grows no
+    // backoff, so the loop re-enters every tick, drains the 8-token bucket in
+    // ~8 minutes, and then keeps detection throttled for ~10 more minutes per
+    // token after GitHub would already have accepted a free request.
+    if let Some(remaining) = github_cooldown_remaining() {
+        return Err(GithubRateLimitedError {
+            retry_after: Some(remaining),
+        }
+        .into());
+    }
+
     if !try_consume_node_poll() {
         return Err(RateLimitedError.into());
     }
 
-    let client = reqwest::Client::builder()
-        .user_agent("freenet-updater")
-        .timeout(Duration::from_secs(10))
-        .build()?;
-
-    let response = client.get(GITHUB_API_URL).send().await?;
-
-    if !response.status().is_success() {
-        anyhow::bail!("GitHub API returned {}", response.status());
-    }
-
-    #[derive(serde::Deserialize)]
-    struct Release {
-        tag_name: String,
-    }
-
-    let release: Release = response.json().await?;
-    Ok(release.tag_name.trim_start_matches('v').to_string())
+    // Never bypasses the cooldown: this is the automated path, and the whole
+    // point of the cooldown is to keep it quiet while the IP is limited. (The
+    // check above already returned; the flag covers the re-check inside.)
+    //
+    // Normalise HERE, at the producer, not at the call sites. This function is
+    // the node's DETECTION path (see the rustdoc above): every consumer of it
+    // wants a comparable version, never a string that addresses the release.
+    // `fetch_latest_release_tag` returns the tag VERBATIM (`v0.2.121`) since
+    // #5104, which is correct for the INSTALLER — `update.rs` builds asset URLs
+    // from it — but every consumer on this path either parses it as semver or
+    // compares it against a stored version, and both reject the leading `v`.
+    //
+    // #5104 stripped at one consumer (`update.rs:389`) and left this path raw,
+    // which silently broke auto-update fleet-wide for v0.2.120 and v0.2.121:
+    // `semver::Version::parse("v0.2.121")` fails, the update is dropped with a
+    // `warn!`, and nothing else notices. Stripping per-call-site would fix the
+    // parses and leave the #4073 gates below (`is_version_pinned_bad`,
+    // `is_version_install_gated`) comparing a `v`-prefixed string against the
+    // stripped values their writers store — silently disabling the
+    // crash-loop-rollback pin. One normalisation at the boundary fixes both.
+    let tag = fetch_latest_release_tag(false).await?;
+    Ok(version_from_tag(&tag).to_string())
 }
 
 /// Get the state directory for update tracking files.
@@ -412,8 +1004,106 @@ async fn get_latest_version() -> Result<String> {
 /// persists its probation / known-bad markers in the SAME directory as the
 /// auto-update failure counter and backoff state, ensuring both the node and
 /// the supervisor-invoked `freenet update` agree on a single state location.
+///
+/// Normally `$HOME/.local/state/freenet`. When that directory cannot be
+/// created or written — a system service user whose home is `/var/empty` (the
+/// NixOS default for a user declared without `home`), a home that does not
+/// exist, or a state directory left owned by another user — it falls back to
+/// the first entry of systemd's `$STATE_DIRECTORY`. Without the fallback every
+/// write here fails, so the crash-probation marker, the known-good rollback
+/// snapshot and the known-bad pin are never persisted and #4073 crash-loop
+/// rollback is silently OFF on that peer.
+///
+/// Home stays first on purpose: an install whose home is usable keeps its
+/// existing state exactly where it was, so nothing has to migrate, and the
+/// fallback only ever applies where no state could have been saved before.
+/// `nix/freenet-node.sh` already consults `$STATE_DIRECTORY` for the known-bad
+/// pin.
+///
+/// Resolved ONCE per process and cached. Every reader and writer of this
+/// state must agree on one directory; re-probing on each call would let a
+/// process whose home changed writability mid-run (a late network mount, a
+/// remount) split its failure counter, probation marker and pins across two
+/// places. The node and the supervisor-invoked `freenet update` run in the
+/// same unit, as the same user, with the same environment, so they resolve the
+/// same directory as long as HOME's usability does not change between their
+/// starts. A `freenet update` run by hand OUTSIDE that unit has no
+/// `$STATE_DIRECTORY`; docs/nix.md says how to run one inside it.
+///
+/// Resolving is not read-only: it creates the chosen directory.
+///
+/// A home state directory that already holds state and then becomes
+/// unwritable is abandoned for `$STATE_DIRECTORY` without copying that state
+/// (a known-bad pin, an in-flight probation marker). Staying on it would fail
+/// every write, which is rollback off for good; switching loses that stale
+/// state once and has working rollback from the next update on.
 pub(crate) fn state_dir() -> Option<PathBuf> {
-    dirs::home_dir().map(|h| h.join(".local/state/freenet"))
+    static RESOLVED: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+    RESOLVED
+        .get_or_init(|| {
+            resolve_state_dir(
+                dirs::home_dir(),
+                std::env::var_os("STATE_DIRECTORY").as_deref(),
+            )
+        })
+        .clone()
+}
+
+/// Testable core of [`state_dir`]: `home` is the user's home directory and
+/// `systemd_state` the raw value of `$STATE_DIRECTORY`, which systemd passes
+/// as a colon-separated list when a unit names several.
+///
+/// If neither candidate is usable the home path is returned anyway, preserving
+/// the historical result (and its failure) rather than inventing a third
+/// location.
+fn resolve_state_dir(
+    home: Option<PathBuf>,
+    systemd_state: Option<&std::ffi::OsStr>,
+) -> Option<PathBuf> {
+    let home_state = home.map(|h| h.join(".local/state/freenet"));
+    if let Some(dir) = &home_state {
+        if is_usable_state_dir(dir) {
+            return home_state;
+        }
+    }
+    let systemd_dir = systemd_state
+        .and_then(|v| std::env::split_paths(v).next())
+        // systemd always passes absolute paths; a relative one would resolve
+        // against whatever the working directory happens to be.
+        .filter(|first| first.is_absolute());
+    if let Some(dir) = systemd_dir {
+        if is_usable_state_dir(&dir) {
+            return Some(dir);
+        }
+    }
+    home_state
+}
+
+/// Whether `dir` exists (creating it if needed) and this process may create
+/// files in it. `create_dir_all` alone is not enough: it succeeds on an
+/// existing directory whatever its permissions, so a state directory left
+/// owned by root would be selected and every write into it would fail.
+/// `access(2)` answers the permission and read-only-mount questions without
+/// creating anything, so a full disk cannot misclassify a directory that
+/// already holds state.
+fn is_usable_state_dir(dir: &std::path::Path) -> bool {
+    if fs::create_dir_all(dir).is_err() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let Ok(c_path) = std::ffi::CString::new(dir.as_os_str().as_bytes()) else {
+            return false;
+        };
+        // SAFETY: `c_path` is a valid NUL-terminated string that outlives the
+        // call, and `access` only reads it.
+        unsafe { libc::access(c_path.as_ptr(), libc::W_OK | libc::X_OK) == 0 }
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
 }
 
 /// Get the last time we checked for updates.
@@ -468,7 +1158,7 @@ fn should_check_for_update(backoff: Duration) -> bool {
 }
 
 /// Get the number of consecutive update failures.
-fn get_update_failure_count() -> u32 {
+pub(crate) fn get_update_failure_count() -> u32 {
     state_dir()
         .map(|d| get_update_failure_count_at(&d))
         .unwrap_or(0)
@@ -478,15 +1168,57 @@ fn get_update_failure_count() -> u32 {
 /// directory.
 ///
 /// * Missing file → `0` (legitimate "no failures yet").
-/// * Present but unparseable → `MAX_UPDATE_FAILURES` (defensive: if the
-///   counter file has been truncated or corrupted we must NOT silently
-///   reset the lockout — that would be an amplification vector for any
-///   process that can partially overwrite the file, defeating the
-///   #3934 fix. Users can recover by explicitly deleting the file).
+/// * Present but unparseable, OR unreadable for any reason other than being
+///   absent → `MAX_UPDATE_FAILURES` (defensive: a truncated, corrupted or
+///   unreadable counter must not READ as zero, because that would silently
+///   reset the #3934 lockout on the strength of damage to the file).
+///
+/// Note the asymmetry with [`next_failure_count`], which is deliberate and was
+/// easy to mistake for an inconsistency, so it is written down here too: this
+/// function makes an unparseable counter read as fully-failed, while recording
+/// the next failure REWRITES an unparseable counter as `1` rather than as
+/// `MAX + 1`.
+///
+/// Both directions are the safe one for their own side:
+///
+/// * Reading MAX keeps the gate shut while the file is damaged, and heals by
+///   itself because the gate re-reads every time.
+/// * Writing `1` bounds the damage. `fs::write` is not atomic, so a power cut
+///   during [`record_update_failure_at`] can leave a truncated — hence
+///   unparseable — counter. Persisting `MAX + 1` for that would turn one
+///   ill-timed crash into a PERMANENT auto-update lockout needing manual file
+///   deletion, which is the failure this whole subsystem exists to avoid.
+///   Rewriting it as `1` costs at most two extra attempts before the gate
+///   closes again.
+///
+/// This is not an amplification vector, which is the objection it invites. To
+/// reach the rewrite at all something must record a failure, and that requires
+/// an update attempt; while the counter is unparseable the gate is shut, so no
+/// automatic attempt happens. And a process that can choose the file's contents
+/// does not need any of this — it writes `0`. Corruption alone only ever shuts
+/// the gate.
 pub(crate) fn get_update_failure_count_at(dir: &std::path::Path) -> u32 {
     match fs::read_to_string(dir.join("update_failures")) {
         Ok(s) => s.trim().parse().unwrap_or(MAX_UPDATE_FAILURES),
-        Err(_) => 0,
+        // Genuinely absent: no failures yet.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
+        // Present but unreadable (EACCES, EIO, a directory in its place) is the
+        // same situation as unparseable, and gets the same defensive answer.
+        // Reading it as zero would silently RESET the lockout — a fail-OPEN on
+        // the mechanism that bounds the #3934 restart loop, and an easier way to
+        // defeat it than the partial-overwrite this function's doc already
+        // guards against.
+        //
+        // Note this is NOT the read-only/full state dir case: EROFS and ENOSPC
+        // break writes, while reads still succeed or report NotFound, which is
+        // handled above. The states that land here are anomalous ones — a
+        // chmod'd or wrong-owner file, a directory in its place, a failing mount
+        // — and treating them as fully-failed is self-healing, because the gate
+        // re-reads every time and recovers the moment the file is readable again.
+        //
+        // `read_github_poll_bucket_at` in this file makes the same distinction
+        // for the same reason.
+        Err(_) => MAX_UPDATE_FAILURES,
     }
 }
 
@@ -505,10 +1237,38 @@ pub fn record_update_failure() {
 
 /// Testable variant of [`record_update_failure`] that writes into an
 /// explicit directory. Missing directories are created on demand.
+/// What to persist after an install failure, given the raw read of the existing
+/// counter — or `None` to write nothing at all.
+///
+/// Split out from [`record_update_failure_at`] so the decision is testable
+/// without contriving a filesystem that reads one way and writes another.
+///
+/// The subtle case is the unreadable one. [`get_update_failure_count_at`]
+/// deliberately reports an unreadable counter as [`MAX_UPDATE_FAILURES`] so the
+/// GATE stays closed while the file cannot be read — that is transient and
+/// self-healing, because the gate re-reads every time. Feeding that defensive
+/// answer back into the file would be neither: it would bake `MAX + 1` into
+/// disk and lock the node out of auto-update PERMANENTLY on one transient read
+/// error (a flaky network mount, an EIO). That is a worse failure than the
+/// fail-open it replaced, so an unreadable counter writes nothing.
+///
+/// The unparseable-but-readable case is different and is answered differently:
+/// it restarts the count at `1`. See [`get_update_failure_count_at`] for why
+/// the two functions disagree about the same damaged file on purpose.
+fn next_failure_count(existing: std::io::Result<String>) -> Option<u32> {
+    match existing {
+        Ok(s) => Some(s.trim().parse::<u32>().unwrap_or(0).saturating_add(1)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(1),
+        Err(_) => None,
+    }
+}
+
 pub(crate) fn record_update_failure_at(dir: &std::path::Path) {
     let _mkdir = fs::create_dir_all(dir);
-    let count = get_update_failure_count_at(dir) + 1;
-    let _write = fs::write(dir.join("update_failures"), count.to_string());
+    let path = dir.join("update_failures");
+    if let Some(count) = next_failure_count(fs::read_to_string(&path)) {
+        let _write = fs::write(&path, count.to_string());
+    }
 }
 
 /// Clear the update failure count. Called from the update command after a
@@ -525,6 +1285,7 @@ pub fn clear_update_failures() {
 /// explicit directory.
 pub(crate) fn clear_update_failures_at(dir: &std::path::Path) {
     let _rm = fs::remove_file(dir.join("update_failures"));
+    let _rm = fs::remove_file(dir.join(LOCKOUT_RETRY_FILE));
 }
 
 // ── Persistent GitHub-poll rate limit (token buckets) ──────────────────────
@@ -749,6 +1510,135 @@ pub(crate) fn try_consume_install_poll() -> bool {
     try_consume_poll_bucket(INSTALL_POLL_BUCKET_FILE)
 }
 
+// ── Server-signalled GitHub cooldown (#5102) ───────────────────────────────
+//
+// The token buckets above bound what THIS node does. This cooldown records what
+// GITHUB told us to do, and is deliberately **shared** by every poll path on the
+// machine — unlike the two buckets, which are separate on purpose.
+//
+// The asymmetry is the point. The buckets are separate so the node cannot starve
+// the installer of its own self-imposed allowance. But a `403`/`429` is not a
+// property of a code path, it is a property of the IP: if GitHub is refusing the
+// node's detection poll, it will equally refuse the installer's, and letting the
+// installer knock anyway is exactly the behaviour that turns a one-hour primary
+// limit into a longer secondary block. One file, honoured by both.
+
+/// On-disk marker holding the Unix second before which no path may poll GitHub.
+const GITHUB_COOLDOWN_FILE: &str = "github_ratelimit_cooldown";
+
+/// Cooldown applied when GitHub rate-limits us without a usable `Retry-After` /
+/// `x-ratelimit-reset` header. Short enough that a transient limit does not
+/// noticeably delay updates, long enough to stop a restart loop from knocking.
+const DEFAULT_GITHUB_COOLDOWN: Duration = Duration::from_secs(900);
+
+/// Remaining cooldown at `now_unix`, if any. Pure over an explicit directory and
+/// clock so the expiry arithmetic is unit-testable.
+///
+/// A stored instant further out than [`MAX_GITHUB_COOLDOWN`] is treated as
+/// **corrupt and ignored**, not clamped.
+///
+/// The distinction is load-bearing and was originally got wrong, in a way two
+/// independent reviewers caught only after it had shipped. Clamping the
+/// *returned* value (`Some(remaining.min(MAX))`) leaves the *stored* deadline
+/// untouched, so a far-future `until` reports "6 hours left" at every future
+/// instant — forever. It never expires, nothing else rewrites the file, and the
+/// automated path never bypasses it, so auto-update on that node is dead
+/// permanently and silently. A dead RTC, a BIOS reset, or a restored VM snapshot
+/// is enough to write such a deadline.
+///
+/// Ignoring it makes the bound real: a nonsensical deadline behaves as no
+/// deadline, and the worst case is one extra poll rather than a node that can
+/// never update again. This is the AGENTS.md "cleanup exemptions MUST be
+/// time-bounded" rule — the bound has to apply to the persisted marker, not just
+/// to whatever the getter happens to return.
+pub(crate) fn github_cooldown_remaining_at(
+    dir: &std::path::Path,
+    now_unix: u64,
+) -> Option<Duration> {
+    let until = fs::read_to_string(dir.join(GITHUB_COOLDOWN_FILE))
+        .ok()?
+        .trim()
+        .parse::<u64>()
+        .ok()?;
+    let remaining = until.checked_sub(now_unix)?;
+    if remaining == 0 || remaining > MAX_GITHUB_COOLDOWN.as_secs() {
+        // Expired, or further out than any cooldown we would ever legitimately
+        // write. Both mean: not cooling down.
+        return None;
+    }
+    Some(Duration::from_secs(remaining))
+}
+
+/// Public wrapper so the installer path can consult the cooldown before it
+/// spends an install token (see `update::probe_latest_tag`).
+pub(crate) fn github_cooldown_remaining_public() -> Option<Duration> {
+    github_cooldown_remaining()
+}
+
+/// Live-clock, live-state-dir variant of [`github_cooldown_remaining_at`].
+///
+/// Fails **open** (returns `None`, i.e. "not cooling down") when there is no
+/// resolvable state dir: the cooldown is an optimisation to be polite to GitHub,
+/// and an unresolvable state dir already denies every poll via the token buckets,
+/// which fail closed. Failing closed here too would permanently disable update
+/// detection on such a machine.
+fn github_cooldown_remaining() -> Option<Duration> {
+    github_cooldown_remaining_at(&state_dir()?, now_unix())
+}
+
+/// Persist "do not poll GitHub until `now + retry_after`".
+///
+/// Never shortens an existing cooldown — concurrent processes (the node and a
+/// supervisor-spawned `freenet update`) can both observe a limit, and the later
+/// writer must not walk back the more conservative deadline.
+pub(crate) fn record_github_cooldown_at(
+    dir: &std::path::Path,
+    retry_after: Option<Duration>,
+    now_unix: u64,
+) {
+    let wait = retry_after
+        .unwrap_or(DEFAULT_GITHUB_COOLDOWN)
+        .clamp(MIN_GITHUB_COOLDOWN, MAX_GITHUB_COOLDOWN);
+    let candidate = now_unix.saturating_add(wait.as_secs());
+    let existing = github_cooldown_remaining_at(dir, now_unix)
+        .map(|d| now_unix.saturating_add(d.as_secs()))
+        .unwrap_or(0);
+    let until = candidate.max(existing);
+
+    if fs::create_dir_all(dir)
+        .and_then(|()| fs::write(dir.join(GITHUB_COOLDOWN_FILE), until.to_string()))
+        .is_err()
+    {
+        // Best-effort: the token buckets still bound us if this cannot persist.
+        tracing::debug!("Could not persist GitHub rate-limit cooldown");
+    }
+}
+
+/// Live-clock, live-state-dir variant of [`record_github_cooldown_at`].
+pub(crate) fn record_github_cooldown(retry_after: Option<Duration>) {
+    if let Some(dir) = state_dir() {
+        record_github_cooldown_at(&dir, retry_after, now_unix());
+    }
+}
+
+/// Record the cooldown implied by a rate-limited response's headers and build
+/// the corresponding error.
+///
+/// Exposed so the installer's `api.github.com` asset fetch funnels its `403`/
+/// `429` handling through the same place as the redirect probe — a second,
+/// hand-rolled copy of "parse the header, persist the deadline" is exactly how
+/// one of the two paths ends up quietly not backing off.
+///
+/// `header` is a name → value lookup over the response headers.
+pub(crate) fn note_rate_limited_response<F>(header: F) -> GithubRateLimitedError
+where
+    F: Fn(&str) -> Option<String>,
+{
+    let retry_after = parse_retry_after(header);
+    record_github_cooldown(retry_after);
+    GithubRateLimitedError { retry_after }
+}
+
 /// Check if we should attempt an update based on failure history.
 ///
 /// If the state directory cannot be resolved (e.g. Windows service
@@ -768,7 +1658,172 @@ pub fn should_attempt_update() -> bool {
 /// Testable variant of [`should_attempt_update`] that reads from an explicit
 /// directory. Used by the regression tests for the #3934 lockout invariant.
 pub(crate) fn should_attempt_update_at(dir: &std::path::Path) -> bool {
-    get_update_failure_count_at(dir) < MAX_UPDATE_FAILURES
+    should_attempt_update_at_time(dir, SystemTime::now())
+}
+
+/// [`should_attempt_update_at`] with an explicit clock, so the cooldown can be
+/// tested without waiting a day. READ-ONLY: it never writes, so callers may use
+/// it for decisions and logging freely. Spending a retry is
+/// [`claim_update_attempt`]'s job.
+///
+/// Below [`MAX_UPDATE_FAILURES`] the answer is yes. At or above it the gate
+/// reopens once [`UPDATE_LOCKOUT_COOLDOWN`] has passed since the later of the
+/// last recorded failure (the counter's mtime) and the last retry this node
+/// claimed. An unreadable counter reads as fully failed (see
+/// [`get_update_failure_count_at`]) and its timestamps cannot be trusted, so it
+/// stays shut. A readable but unparseable one (a torn write) also reads as
+/// fully failed, but its mtime is a real timestamp, so it does expire; that is
+/// deliberate and bounded, because the next failure rewrites it as 1.
+fn should_attempt_update_at_time(dir: &std::path::Path, now: SystemTime) -> bool {
+    if get_update_failure_count_at(dir) < MAX_UPDATE_FAILURES {
+        return true;
+    }
+    lockout_expired(&lockout_events(dir), now)
+}
+
+/// When the lockout was last touched: the counter's mtime (the last recorded
+/// failure) and the last claimed retry, whichever exist.
+fn lockout_events(dir: &std::path::Path) -> Vec<SystemTime> {
+    let counter = dir.join("update_failures");
+    let mut events = Vec::new();
+    if fs::read_to_string(&counter).is_ok() {
+        if let Ok(mtime) = fs::metadata(&counter).and_then(|m| m.modified()) {
+            events.push(mtime);
+        }
+    }
+    if let Some(secs) = fs::read_to_string(dir.join(LOCKOUT_RETRY_FILE))
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+    {
+        // `checked_add`: a corrupt or hand-edited value too large for
+        // SystemTime must be ignored, not panic the update-check task on
+        // every tick.
+        if let Some(stamp) = SystemTime::UNIX_EPOCH.checked_add(Duration::from_secs(secs)) {
+            events.push(stamp);
+        }
+    }
+    events
+}
+
+/// The pure decision behind [`should_attempt_update_at_time`]'s lockout arm.
+///
+/// * No usable timestamp at all: stay shut. Without one there is no way to
+///   space retries, which is how the #3934 loop comes back.
+/// * A timestamp slightly in the FUTURE (coarse mtime granularity, a network
+///   filesystem whose clock runs ahead, a clock stepped back): not expired. The
+///   cooldown then runs from that stamp, at worst a little longer than a day.
+/// * A timestamp more than a whole cooldown ahead is not a clock that is a bit
+///   off, it is a bogus one, and waiting it out could take years. It is
+///   ignored; if every timestamp is bogus the lockout counts as expired, and
+///   the retry claimed next writes a sane one.
+fn lockout_expired(events: &[SystemTime], now: SystemTime) -> bool {
+    if events.is_empty() {
+        return false;
+    }
+    let plausible = events
+        .iter()
+        .filter(|stamp| match stamp.duration_since(now) {
+            Ok(ahead) => ahead <= UPDATE_LOCKOUT_COOLDOWN,
+            Err(_) => true,
+        })
+        .max();
+    match plausible {
+        None => true,
+        Some(latest) => now
+            .duration_since(*latest)
+            .is_ok_and(|age| age >= UPDATE_LOCKOUT_COOLDOWN),
+    }
+}
+
+/// Proof that [`claim_update_attempt`] allowed a self-initiated update check.
+/// Only this module can make one, and the GitHub release checks the node runs
+/// on its own ([`startup_update_check`]) take it BY VALUE, so a check that
+/// skips the claim, ignores its answer, or reuses an earlier one does not
+/// compile.
+#[derive(Debug)]
+pub struct UpdateAttempt(());
+
+/// Why [`claim_update_attempt`] refused. Distinct because the remedies differ.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClaimRefused {
+    /// No state directory could be resolved, so nothing can space retries.
+    NoStateDir,
+    /// The failure counter exists but cannot be read.
+    CounterUnreadable,
+    /// Locked out (#3934) and this cooldown's retry is already spent.
+    CoolingDown,
+    /// Locked out, cooldown passed, but the retry could not be recorded.
+    NotRecordable,
+}
+
+impl std::fmt::Display for ClaimRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::NoStateDir => "no Freenet state directory could be resolved",
+            Self::CounterUnreadable => "the update-failure counter cannot be read",
+            Self::CoolingDown => {
+                "auto-update is locked out after repeated failed installs (#3934) and \
+                 retries at most once a day"
+            }
+            Self::NotRecordable => {
+                "auto-update is locked out and its once-a-day retry could not be recorded \
+                 in the state directory"
+            }
+        })
+    }
+}
+
+/// Call immediately before spending an update check; go ahead only on `Ok`.
+///
+/// A node that is not locked out always may, and nothing is written. A
+/// locked-out node may only once its cooldown has passed, and only after it
+/// has durably recorded that it is spending its retry now: if that write
+/// fails, the answer is no. This is what bounds a peer whose installs ALWAYS
+/// fail to one attempt per [`UPDATE_LOCKOUT_COOLDOWN`] without relying on the
+/// updater. Whether or not the failed install gets recorded, and whichever
+/// path spends the retry, every later claim sees it and refuses, so the
+/// restart that follows a failed attempt does not start another.
+pub fn claim_update_attempt() -> Result<UpdateAttempt, ClaimRefused> {
+    match state_dir() {
+        Some(dir) => claim_update_attempt_at(&dir, SystemTime::now()),
+        None => Err(ClaimRefused::NoStateDir),
+    }
+}
+
+pub(crate) fn claim_update_attempt_at(
+    dir: &std::path::Path,
+    now: SystemTime,
+) -> Result<UpdateAttempt, ClaimRefused> {
+    match fs::read_to_string(dir.join("update_failures")) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+            return Err(ClaimRefused::CounterUnreadable);
+        }
+        _ => {}
+    }
+    if get_update_failure_count_at(dir) < MAX_UPDATE_FAILURES {
+        return Ok(UpdateAttempt(()));
+    }
+    if !should_attempt_update_at_time(dir, now) {
+        return Err(ClaimRefused::CoolingDown);
+    }
+    let Ok(since_epoch) = now.duration_since(SystemTime::UNIX_EPOCH) else {
+        return Err(ClaimRefused::NotRecordable);
+    };
+    if fs::write(
+        dir.join(LOCKOUT_RETRY_FILE),
+        since_epoch.as_secs().to_string(),
+    )
+    .is_err()
+    {
+        return Err(ClaimRefused::NotRecordable);
+    }
+    tracing::warn!(
+        failures = get_update_failure_count_at(dir),
+        "Auto-update lockout cooldown has passed: spending this node's retry now. \
+         If it fails, the next one is in {} hours.",
+        UPDATE_LOCKOUT_COOLDOWN.as_secs() / 3600
+    );
+    Ok(UpdateAttempt(()))
 }
 
 /// Returns true if the update check backoff has reached the maximum (1 hour).
@@ -796,7 +1851,10 @@ pub fn has_reached_max_backoff() -> bool {
 ///
 /// Returns `Some(latest_version_string)` only when GitHub confirms a strictly
 /// newer release than `current_version`. Never returns a downgrade.
-pub async fn startup_update_check(current_version: &str) -> Option<String> {
+pub async fn startup_update_check(
+    _attempt: UpdateAttempt,
+    current_version: &str,
+) -> Option<String> {
     startup_update_check_with_fetcher(current_version, get_latest_version).await
 }
 
@@ -822,6 +1880,29 @@ where
             return None;
         }
     };
+    // The OBSERVED half of the check, as distinct from the DECISION.
+    //
+    // Every other line on this path reports what the node decided; none reports
+    // what it was deciding ABOUT. That left the release canary (#5236) able to
+    // assert only the ABSENCE of an error, and absence is satisfied by a
+    // comparator that is silently wrong rather than loudly broken: a
+    // `version_from_tag` that regressed to a constant, or a normaliser that
+    // truncated `0.2.121` to `0.2.12`, still parses, still compares, still
+    // declines to update, and still logs a clean completion. The log was
+    // byte-identical to a healthy one, so Gate A could not tell them apart.
+    //
+    // Emitting the value makes the gate's assertion POSITIVE: the canary
+    // compares this against the tag GitHub actually published and fails on a
+    // mismatch. INFO, not `debug!` -- release builds set
+    // `release_max_level_info`, so a `debug!` here would not exist in the
+    // binary the gate inspects (the mistake that made the completion marker
+    // unobservable in the first place). `scripts/auto-update-canary.sh` greps
+    // for this text and `scripts/auto-update-canary_test.sh` pins it against
+    // this call, so do not reword it without updating both.
+    tracing::info!(
+        latest = %latest,
+        "Startup update check: GitHub reports latest release"
+    );
     compare_versions_for_startup(current_version, &latest)
 }
 
@@ -912,6 +1993,136 @@ pub fn jittered_repoll_interval(base: Duration, jitter_fraction: f64, rand_unit:
 
 #[cfg(test)]
 mod tests {
+    /// A transient read error must not be persisted as a permanent lockout.
+    ///
+    /// `get_update_failure_count_at` answers MAX_UPDATE_FAILURES when the
+    /// counter cannot be read, which keeps the GATE closed while the condition
+    /// lasts and heals by itself. Recording a failure used to feed that answer
+    /// straight back through `+ 1`, so one transient EIO would write 4 to disk
+    /// and lock auto-update off forever — turning the fail-CLOSED read into a
+    /// permanent brick, which is worse than the fail-open it replaced (#5244).
+    #[test]
+    fn an_unreadable_counter_is_never_persisted_as_a_count() {
+        use std::io::{Error, ErrorKind};
+
+        assert_eq!(
+            super::next_failure_count(Err(Error::from(ErrorKind::PermissionDenied))),
+            None,
+            "an unreadable counter must write NOTHING: we cannot know the real count, and \
+             inventing MAX+1 makes a transient error permanent"
+        );
+        assert_eq!(
+            super::next_failure_count(Err(Error::from(ErrorKind::NotFound))),
+            Some(1),
+            "a genuinely absent counter is the first failure"
+        );
+        assert_eq!(
+            super::next_failure_count(Ok("2".to_string())),
+            Some(3),
+            "the ordinary case still increments"
+        );
+        assert_eq!(
+            super::next_failure_count(Ok("garbage".to_string())),
+            Some(1),
+            "an unparseable counter restarts the count rather than inventing a lockout"
+        );
+    }
+
+    /// An unreadable counter file must NOT read as "no failures".
+    ///
+    /// `Err(_) => 0` caught every read error, not just `NotFound`, so a counter
+    /// made unreadable (EACCES, EIO, a directory in its place) silently reset
+    /// the #3934 lockout — a fail-OPEN on the mechanism that bounds the
+    /// exit-42 → failed-install → restart loop. The doc comment above the
+    /// function promised the opposite and named the threat; only the parse path
+    /// was actually defended. See #5244.
+    ///
+    /// A directory is used rather than a chmod because it fails for root too,
+    /// so this cannot quietly degrade into a no-op in a container.
+    #[test]
+    fn an_unreadable_failure_counter_does_not_reset_the_lockout() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("update_failures")).unwrap();
+
+        assert_eq!(
+            super::get_update_failure_count_at(dir.path()),
+            super::MAX_UPDATE_FAILURES,
+            "an unreadable counter must be treated as fully-failed, not as zero: reading it as \
+             zero re-enables the update loop the counter exists to stop"
+        );
+        assert!(
+            !super::should_attempt_update_at(dir.path()),
+            "and the lockout it feeds must stay engaged"
+        );
+    }
+
+    /// The legitimate case still reads as zero, so a fresh node is not born
+    /// locked out.
+    #[test]
+    fn an_absent_failure_counter_reads_as_no_failures() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(super::get_update_failure_count_at(dir.path()), 0);
+        assert!(super::should_attempt_update_at(dir.path()));
+    }
+
+    /// Pins the deliberate asymmetry between READING and REWRITING a damaged
+    /// counter, end to end, because it reads as a bug and was filed as one:
+    /// the read reports `MAX_UPDATE_FAILURES` (gate shut) while recording the
+    /// next failure rewrites the file as `1` (gate open again).
+    ///
+    /// The property that makes the rewrite safe is not that the gate stays
+    /// shut — it does not — but that reopening it is BOUNDED. So this asserts
+    /// the bound, not the reopening: after the rewrite, `MAX` further failures
+    /// put the lockout back. Without that, "resets to 1" really would be a way
+    /// to get unlimited attempts out of a corrupted file.
+    ///
+    /// `fs::write` is not atomic, so the truncated counter this covers is
+    /// reachable from an ordinary power cut mid-write, not only from tampering
+    /// — which is why persisting `MAX + 1` here would be the worse choice: it
+    /// would turn one ill-timed crash into a permanent lockout.
+    #[test]
+    fn a_corrupt_counter_shuts_the_gate_and_reopens_it_only_boundedly() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("update_failures");
+
+        // A truncated write is the realistic corruption; an empty file does
+        // not parse as a u32.
+        std::fs::write(&path, "").unwrap();
+        assert_eq!(
+            super::get_update_failure_count_at(dir.path()),
+            super::MAX_UPDATE_FAILURES,
+            "a damaged counter must read as fully-failed, never as zero"
+        );
+        assert!(
+            !super::should_attempt_update_at(dir.path()),
+            "so the gate is shut while the file is damaged"
+        );
+
+        super::record_update_failure_at(dir.path());
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap().trim(),
+            "1",
+            "an unparseable counter restarts the count; persisting MAX + 1 would make a \
+             truncated write a permanent lockout that only manual deletion clears"
+        );
+        assert_eq!(super::get_update_failure_count_at(dir.path()), 1);
+        assert!(super::should_attempt_update_at(dir.path()));
+
+        // ...and the reopening is bounded: the lockout re-engages on schedule.
+        for _ in 1..super::MAX_UPDATE_FAILURES {
+            super::record_update_failure_at(dir.path());
+        }
+        assert_eq!(
+            super::get_update_failure_count_at(dir.path()),
+            super::MAX_UPDATE_FAILURES
+        );
+        assert!(
+            !super::should_attempt_update_at(dir.path()),
+            "corruption must not buy unlimited attempts — the gate closes again \
+             after MAX_UPDATE_FAILURES"
+        );
+    }
+
     use super::*;
     use freenet::transport::{
         set_open_connection_count, signal_version_mismatch, version_mismatch_generation,
@@ -1017,6 +2228,62 @@ mod tests {
         assert_eq!(compare_versions_for_startup("0.1.75", "0.1.75-alpha"), None);
     }
 
+    /// #5221: the node's detection path MUST normalise the release tag.
+    ///
+    /// `fetch_latest_release_tag` returns the tag VERBATIM (`v0.2.121`) since
+    /// #5104 — correct for the installer, which builds asset URLs from it. But
+    /// every consumer of `get_latest_version` either parses it as semver or
+    /// compares it against a stored version, and both reject the leading `v`.
+    /// #5104 stripped at `update.rs` only and left this path raw, so auto-update
+    /// was silently dead fleet-wide for v0.2.120 and v0.2.121.
+    ///
+    /// A source pin rather than a behavioural test because `get_latest_version`
+    /// does network I/O with no injection seam. Bounded to that function so it
+    /// cannot match a later occurrence (AGENTS.md, "WHEN writing a source-scrape
+    /// pin test").
+    #[test]
+    fn get_latest_version_normalises_the_tag() {
+        let src = include_str!("auto_update.rs");
+        let (_, after) = src
+            .split_once("async fn get_latest_version() -> Result<String> {")
+            .expect("get_latest_version definition not found");
+        let (body, _) = after
+            .split_once("/// Get the state directory")
+            .expect("could not bound get_latest_version");
+        let stripped: String = body.chars().filter(|c| !c.is_whitespace()).collect();
+
+        assert!(
+            stripped.contains("version_from_tag("),
+            "get_latest_version must normalise through version_from_tag before \
+             returning. Without it the raw tag reaches semver::Version::parse \
+             (which rejects a leading 'v') AND the #4073 gates \
+             is_version_pinned_bad / is_version_install_gated, whose writers \
+             store STRIPPED values -- so those gates silently never match and \
+             the crash-loop-rollback pin is disabled."
+        );
+    }
+
+    /// Why the normalisation has to happen upstream: the consumers genuinely
+    /// cannot cope with a raw tag. Documents the exact #5221 production failure.
+    #[test]
+    fn raw_tag_is_rejected_by_the_consumers() {
+        // Production log was:
+        //   WARN failed to parse latest version 'v0.2.121':
+        //        unexpected character 'v' while parsing major version number
+        assert_eq!(
+            compare_versions_for_startup("0.2.120", "v0.2.121"),
+            None,
+            "a v-prefixed tag must NOT be treated as an available update -- it \
+             fails to parse and the update is dropped silently"
+        );
+        // Normalised, the very same tag is correctly seen as newer.
+        assert_eq!(
+            compare_versions_for_startup("0.2.120", version_from_tag("v0.2.121")),
+            Some("0.2.121".to_string()),
+            "once normalised the update must be detected"
+        );
+    }
+
     #[tokio::test]
     async fn test_startup_check_fetcher_error_returns_none() {
         // Fetcher failure must not propagate — startup check is fail-open so
@@ -1077,6 +2344,377 @@ mod tests {
         // Clearing an already-clear counter is idempotent.
         clear_update_failures_at(dir);
         assert_eq!(get_update_failure_count_at(dir), 0);
+    }
+
+    /// A "home" that cannot hold `.local/state/freenet`. A regular file in
+    /// place of the directory makes `create_dir_all` fail with ENOTDIR even
+    /// when the tests run as root, which a read-only directory would not.
+    fn unusable_home(tmp: &std::path::Path) -> PathBuf {
+        let home = tmp.join("not-a-directory");
+        std::fs::write(&home, b"").unwrap();
+        home
+    }
+
+    #[test]
+    fn state_dir_falls_back_to_state_directory_when_home_is_unusable() {
+        // The NixOS shape: a system user declared without `home` gets
+        // `/var/empty`, so nothing under HOME can be created. Before the
+        // fallback, state_dir() returned that unusable path, every
+        // probation/known-good/known-bad write failed, and crash-loop
+        // rollback was silently off.
+        let tmp = tempfile::tempdir().unwrap();
+        let home = unusable_home(tmp.path());
+        let systemd = tmp.path().join("var-lib-freenet");
+        let resolved = resolve_state_dir(Some(home), Some(systemd.as_os_str()));
+        assert_eq!(resolved.as_deref(), Some(systemd.as_path()));
+        assert!(systemd.is_dir(), "the fallback directory must be created");
+    }
+
+    #[test]
+    fn state_dir_prefers_a_usable_home_even_when_state_directory_is_set() {
+        // An existing install keeps its state where it always was, so a
+        // unit that happens to set StateDirectory= does not strand its
+        // probation marker or known-bad pin by moving directories.
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let systemd = tmp.path().join("var-lib-freenet");
+        let resolved = resolve_state_dir(Some(home.clone()), Some(systemd.as_os_str()));
+        assert_eq!(resolved, Some(home.join(".local/state/freenet")));
+        assert!(!systemd.exists(), "the fallback must not be touched");
+    }
+
+    #[test]
+    fn state_dir_uses_the_first_entry_of_a_state_directory_list() {
+        // systemd passes several StateDirectory= entries colon-separated.
+        let tmp = tempfile::tempdir().unwrap();
+        let home = unusable_home(tmp.path());
+        let first = tmp.path().join("first");
+        let second = tmp.path().join("second");
+        let list = std::env::join_paths([&first, &second]).unwrap();
+        let resolved = resolve_state_dir(Some(home), Some(list.as_os_str()));
+        assert_eq!(resolved, Some(first));
+        assert!(!second.exists());
+    }
+
+    #[test]
+    fn state_dir_keeps_the_home_path_when_there_is_nothing_to_fall_back_to() {
+        // No STATE_DIRECTORY, or an empty one: the historical result stands
+        // rather than a guessed third location.
+        let tmp = tempfile::tempdir().unwrap();
+        let home = unusable_home(tmp.path());
+        let expected = Some(home.join(".local/state/freenet"));
+        assert_eq!(resolve_state_dir(Some(home.clone()), None), expected);
+        assert_eq!(
+            resolve_state_dir(Some(home), Some(std::ffi::OsStr::new(""))),
+            expected
+        );
+    }
+
+    #[test]
+    fn state_dir_uses_state_directory_when_there_is_no_home_at_all() {
+        let tmp = tempfile::tempdir().unwrap();
+        let systemd = tmp.path().join("var-lib-freenet");
+        assert_eq!(
+            resolve_state_dir(None, Some(systemd.as_os_str())),
+            Some(systemd)
+        );
+        assert_eq!(resolve_state_dir(None, None), None);
+    }
+
+    #[test]
+    fn state_dir_keeps_the_home_path_when_neither_candidate_is_usable() {
+        // Both unusable: the historical result, not a guessed third location.
+        let tmp = tempfile::tempdir().unwrap();
+        let home = unusable_home(tmp.path());
+        let blocked = tmp.path().join("also-not-a-directory");
+        std::fs::write(&blocked, b"").unwrap();
+        let systemd = blocked.join("state");
+        assert_eq!(
+            resolve_state_dir(Some(home.clone()), Some(systemd.as_os_str())),
+            Some(home.join(".local/state/freenet"))
+        );
+    }
+
+    #[test]
+    fn state_dir_ignores_a_relative_state_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = unusable_home(tmp.path());
+        assert_eq!(
+            resolve_state_dir(
+                Some(home.clone()),
+                Some(std::ffi::OsStr::new("relative/dir"))
+            ),
+            Some(home.join(".local/state/freenet"))
+        );
+    }
+
+    /// `create_dir_all` succeeds on an EXISTING directory whatever its
+    /// permissions, so a home state directory left read-only (owned by root, or
+    /// under systemd `ProtectHome=read-only`) used to be selected, and every
+    /// write into it failed. It must fall back instead.
+    #[test]
+    #[cfg(unix)]
+    fn state_dir_falls_back_when_the_existing_home_state_dir_is_read_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // SAFETY: `geteuid` reads the calling process's effective uid. It takes
+        // no arguments, touches no memory, and cannot fail.
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("skipping: running as root, which bypasses directory write permissions");
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let home_state = home.join(".local/state/freenet");
+        std::fs::create_dir_all(&home_state).unwrap();
+        std::fs::set_permissions(&home_state, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let systemd = tmp.path().join("var-lib-freenet");
+        let resolved = resolve_state_dir(Some(home), Some(systemd.as_os_str()));
+        // Restore before asserting so tempdir cleanup cannot fail.
+        std::fs::set_permissions(&home_state, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(resolved, Some(systemd));
+    }
+
+    /// The pure tests above inject HOME and STATE_DIRECTORY. This one runs the
+    /// REAL `state_dir()` (the env lookup and the per-process cache) and the
+    /// rollback entry points that depend on it, in a child process whose
+    /// environment has an unusable HOME and a usable STATE_DIRECTORY: the
+    /// NixOS `/var/empty` shape. A child process, because both variables are
+    /// process-global and `state_dir()` caches its first answer.
+    #[test]
+    #[cfg(unix)] // `dirs::home_dir()` ignores $HOME on Windows
+    fn real_state_dir_and_rollback_use_state_directory_when_home_is_unusable() {
+        const CHILD_ENV: &str = "FREENET_STATE_DIR_FALLBACK_CHILD";
+        const CHILD_TEST: &str = "commands::auto_update::tests::\
+            real_state_dir_and_rollback_use_state_directory_when_home_is_unusable";
+
+        if let Some(expected) = std::env::var_os(CHILD_ENV) {
+            let expected = PathBuf::from(expected);
+            assert_eq!(state_dir(), Some(expected.clone()));
+            // Cached: a second call agrees even if nothing changed.
+            assert_eq!(state_dir(), Some(expected.clone()));
+
+            // Round-trip the crash-loop rollback state through the public,
+            // state_dir()-based entry points, not the `_at` variants.
+            let target = expected.join("freenet-under-test");
+            std::fs::write(&target, b"binary").unwrap();
+            let meta = crate::commands::rollback::KnownGoodMeta {
+                size: 6,
+                sha256: "0".repeat(64),
+            };
+            crate::commands::rollback::begin_probation("0.2.200", "0.2.199", &target, &meta)
+                .expect("probation marker must persist under STATE_DIRECTORY");
+            let probation = crate::commands::rollback::read_probation()
+                .expect("probation marker must read back through state_dir()");
+            assert_eq!(probation.new_version, "0.2.200");
+            record_update_failure();
+            assert_eq!(get_update_failure_count(), 1);
+            assert!(expected.join("update_failures").is_file());
+            return;
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let home = unusable_home(tmp.path());
+        let systemd = tmp.path().join("var-lib-freenet");
+        let exe = std::env::current_exe().expect("test binary path");
+        let output = std::process::Command::new(exe)
+            .args(["--exact", "--test-threads=1", "--nocapture", CHILD_TEST])
+            .env("HOME", &home)
+            .env("STATE_DIRECTORY", &systemd)
+            .env(CHILD_ENV, &systemd)
+            .output()
+            .expect("re-exec the test binary");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "child run failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        // Fail CLOSED on a rename: libtest exits 0 when its filter matches
+        // nothing, which would make this whole check vacuous.
+        assert!(
+            stdout.contains("1 passed"),
+            "the child must actually have run {CHILD_TEST}.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        assert!(systemd.join("update_failures").is_file());
+    }
+
+    /// Lock `dir` out and return the counter file's own mtime, the instant the
+    /// cooldown is measured from.
+    fn lock_out(dir: &std::path::Path) -> SystemTime {
+        for _ in 0..MAX_UPDATE_FAILURES {
+            record_update_failure_at(dir);
+        }
+        std::fs::metadata(dir.join("update_failures"))
+            .unwrap()
+            .modified()
+            .unwrap()
+    }
+
+    #[test]
+    fn update_lockout_holds_for_the_cooldown() {
+        let tmp = tempfile::tempdir().unwrap();
+        let stamp = lock_out(tmp.path());
+        assert!(!should_attempt_update_at_time(tmp.path(), stamp));
+        let just_short = stamp + UPDATE_LOCKOUT_COOLDOWN - Duration::from_secs(1);
+        assert!(!should_attempt_update_at_time(tmp.path(), just_short));
+        assert_eq!(
+            claim_update_attempt_at(tmp.path(), just_short).unwrap_err(),
+            ClaimRefused::CoolingDown
+        );
+        assert!(!tmp.path().join(LOCKOUT_RETRY_FILE).exists());
+    }
+
+    #[test]
+    fn update_lockout_expires_after_the_cooldown() {
+        // The stranded-peer bug: a node that runs stably never restarts, and a
+        // permanent lockout meant it never asked again.
+        let tmp = tempfile::tempdir().unwrap();
+        let stamp = lock_out(tmp.path());
+        assert!(should_attempt_update_at_time(
+            tmp.path(),
+            stamp + UPDATE_LOCKOUT_COOLDOWN
+        ));
+    }
+
+    #[test]
+    fn a_claimed_retry_closes_the_lockout_for_a_cooldown_even_if_the_failure_is_never_recorded() {
+        // The restart burst: after the retry is spent, the node restarts and
+        // its startup check must NOT ask again, even when the updater's
+        // failure did not get recorded (network error, rate limit, or no
+        // failure recording on that path at all). The claim alone closes it.
+        let tmp = tempfile::tempdir().unwrap();
+        let stamp = lock_out(tmp.path());
+        let expiry = stamp + UPDATE_LOCKOUT_COOLDOWN;
+        assert!(claim_update_attempt_at(tmp.path(), expiry).is_ok());
+        assert_eq!(
+            claim_update_attempt_at(tmp.path(), expiry).unwrap_err(),
+            ClaimRefused::CoolingDown
+        );
+        assert!(!should_attempt_update_at_time(
+            tmp.path(),
+            expiry + UPDATE_LOCKOUT_COOLDOWN - Duration::from_secs(1)
+        ));
+        assert!(should_attempt_update_at_time(
+            tmp.path(),
+            expiry + UPDATE_LOCKOUT_COOLDOWN
+        ));
+    }
+
+    #[test]
+    fn a_retry_that_cannot_be_recorded_is_not_spent() {
+        // If the claim cannot be written, the node must not ask: that is what
+        // keeps retries spaced without any probe of the counter's writability.
+        // A directory in place of the stamp file fails the write even as root.
+        let tmp = tempfile::tempdir().unwrap();
+        let stamp = lock_out(tmp.path());
+        std::fs::create_dir(tmp.path().join(LOCKOUT_RETRY_FILE)).unwrap();
+        assert_eq!(
+            claim_update_attempt_at(tmp.path(), stamp + UPDATE_LOCKOUT_COOLDOWN).unwrap_err(),
+            ClaimRefused::NotRecordable
+        );
+    }
+
+    #[test]
+    fn claiming_writes_nothing_for_a_node_that_is_not_locked_out() {
+        let tmp = tempfile::tempdir().unwrap();
+        record_update_failure_at(tmp.path());
+        assert!(claim_update_attempt_at(tmp.path(), SystemTime::now()).is_ok());
+        assert!(!tmp.path().join(LOCKOUT_RETRY_FILE).exists());
+    }
+
+    #[test]
+    fn a_successful_update_clears_the_claimed_retry_too() {
+        let tmp = tempfile::tempdir().unwrap();
+        let stamp = lock_out(tmp.path());
+        assert!(claim_update_attempt_at(tmp.path(), stamp + UPDATE_LOCKOUT_COOLDOWN).is_ok());
+        clear_update_failures_at(tmp.path());
+        assert!(!tmp.path().join("update_failures").exists());
+        assert!(!tmp.path().join(LOCKOUT_RETRY_FILE).exists());
+    }
+
+    #[test]
+    fn an_unreadable_update_counter_never_expires() {
+        // A directory in place of the counter reads as fully failed, and its
+        // timestamps are not evidence of anything.
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join("update_failures")).unwrap();
+        let far_future = SystemTime::now() + UPDATE_LOCKOUT_COOLDOWN * 30;
+        assert!(!should_attempt_update_at_time(tmp.path(), far_future));
+        assert_eq!(
+            claim_update_attempt_at(tmp.path(), far_future).unwrap_err(),
+            ClaimRefused::CounterUnreadable
+        );
+    }
+
+    /// The peer-signal path spends the lockout claim before it asks GitHub, as a
+    /// `let ... else` that returns on refusal (so the result cannot be ignored),
+    /// at statement position (so commenting it out fails), inside
+    /// `check_if_update_available`, and before the fetch. Without it an expired
+    /// node reaching GitHub through a peer signal writes no claim, and a
+    /// transient failure there lets the startup check on restart retry again
+    /// the same day.
+    #[test]
+    fn peer_signal_check_spends_the_lockout_claim_before_asking_github() {
+        let src = include_str!("auto_update.rs");
+        let body = fn_body(src, "pub async fn check_if_update_available(");
+        let claim = "let Ok(_attempt) = claim_update_attempt() else {";
+        let fetch = "match get_latest_version().await {";
+        let at_statement = |needle: &str| {
+            body.match_indices(needle)
+                .find(|(i, _)| {
+                    let line_start = body[..*i].rfind('\n').map_or(0, |n| n + 1);
+                    body[line_start..*i].trim().is_empty()
+                })
+                .map(|(i, _)| i)
+                .unwrap_or_else(|| panic!("`{needle}` is not at statement position"))
+        };
+        assert!(
+            at_statement(claim) < at_statement(fetch),
+            "check_if_update_available must spend the lockout claim before asking GitHub (#3934)"
+        );
+    }
+
+    #[test]
+    fn an_overflowing_retry_stamp_is_ignored_not_a_panic() {
+        // A corrupt or hand-edited stamp too large for SystemTime used to
+        // panic in `UNIX_EPOCH + secs` on every update-check tick.
+        let tmp = tempfile::tempdir().unwrap();
+        let stamp = lock_out(tmp.path());
+        std::fs::write(tmp.path().join(LOCKOUT_RETRY_FILE), u64::MAX.to_string()).unwrap();
+        // Ignored, so the counter's own mtime governs.
+        assert!(!should_attempt_update_at_time(tmp.path(), stamp));
+        assert!(should_attempt_update_at_time(
+            tmp.path(),
+            stamp + UPDATE_LOCKOUT_COOLDOWN
+        ));
+        assert!(claim_update_attempt_at(tmp.path(), stamp + UPDATE_LOCKOUT_COOLDOWN).is_ok());
+    }
+
+    #[test]
+    fn lockout_expiry_decision_edges() {
+        let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let later = t0 + UPDATE_LOCKOUT_COOLDOWN;
+        // No usable timestamp: stay shut.
+        assert!(!lockout_expired(&[], later));
+        // Exactly at the boundary it expires; one second short it does not.
+        assert!(lockout_expired(&[t0], later));
+        assert!(!lockout_expired(&[t0], later - Duration::from_secs(1)));
+        // The LATER of the failure and the claimed retry counts.
+        assert!(!lockout_expired(
+            &[t0, t0 + Duration::from_secs(3600)],
+            later
+        ));
+        // Slightly in the future (coarse mtime, a clock running ahead): NOT
+        // expired. Treating it as expired reopened the gate at once.
+        assert!(!lockout_expired(&[t0 + Duration::from_secs(2)], t0));
+        assert!(!lockout_expired(&[later], t0));
+        // More than a whole cooldown ahead is a bogus clock: ignored, and if
+        // nothing plausible remains the lockout counts as expired...
+        let bogus = later + Duration::from_secs(1);
+        assert!(lockout_expired(&[bogus], t0));
+        // ...but a plausible timestamp alongside it still governs.
+        assert!(!lockout_expired(&[bogus, t0], t0 + Duration::from_secs(60)));
     }
 
     #[test]
@@ -1310,8 +2948,8 @@ mod tests {
     fn test_locked_out_update_check_is_loud() {
         // Source-scrape pin for #4580: when the failure lockout disables
         // auto-update, the skip MUST be operator-visible (warn!), not a silent
-        // debug! line. A regression to debug! would re-hide the permanent
-        // lockout (e.g. non-writable binary path) the issue calls out.
+        // debug! line. A regression to debug! would re-hide the lockout (e.g.
+        // a non-writable binary path) the issue calls out.
         let src = include_str!("auto_update.rs");
         let (_, after_fn_start) = src
             .split_once("pub async fn check_if_update_available(")
@@ -1629,17 +3267,117 @@ mod tests {
         );
     }
 
+    /// Slice out a function body: from `signature` to the function's closing
+    /// brace (the next `\n}\n`, i.e. a `}` at column 0).
+    ///
+    /// **Why this exists.** A source-scrape pin that scopes itself with a bare
+    /// `split_once(anchor)` is only scoped by luck. If the anchor later moves
+    /// out of the function, `split_once` does not fail — it silently matches a
+    /// LATER occurrence, very often the pin's own string literal down in the
+    /// test module. The "scoped" region then balloons to the rest of the file
+    /// and the assertion passes vacuously, because somewhere in those thousands
+    /// of lines the searched-for symbol certainly appears.
+    ///
+    /// That is not hypothetical. #5102 moved `reqwest::Client::builder()` out of
+    /// `get_latest_version` into `fetch_latest_release_tag`, and
+    /// `test_get_latest_version_consults_rate_limit_bucket` — which anchored on
+    /// exactly that string — silently became vacuous: deleting the
+    /// `try_consume_node_poll()` guard entirely still passed. The #4073 bound
+    /// was left with no regression protection at all, and it shipped that way.
+    ///
+    /// Bounding to the function body converts that silent pass into a LOUD
+    /// failure: a moved anchor is no longer inside the body, so the caller's
+    /// `.expect()` panics.
+    ///
+    /// **Only valid for free functions at column 0.** The end anchor is the first
+    /// `\n}\n`, which for a method inside an `impl` is the *impl block's* closing
+    /// brace — silently returning every sibling method (measured: `run_async` and
+    /// `download_and_install` in `update.rs` each balloon to the whole ~650-line
+    /// `impl UpdateCommand`). The assertion below rejects that outright rather
+    /// than returning a wrong answer.
+    ///
+    /// **Prefer a cross-file scrape where possible.** A pin living in
+    /// `auto_update.rs` that scrapes `update.rs` cannot be satisfied by its own
+    /// assertion literal at all — a structural guarantee rather than a check
+    /// somebody has to remember.
+    fn fn_body<'a>(src: &'a str, signature: &str) -> &'a str {
+        let at = src
+            .find(signature)
+            .unwrap_or_else(|| panic!("definition not found: {signature}"));
+        // Only valid for FREE functions at column 0. A method's closing brace is
+        // indented, so the first `\n}\n` after it is the enclosing `impl`'s —
+        // which silently balloons the region across every sibling method (all six
+        // methods of `impl UpdateCommand` slice to the same ~650-line block) and
+        // is invisible to the `#[cfg(test)]` detector below. Refuse rather than
+        // return a wrong answer.
+        // The failure that caused #5103 was the ANCHOR falling through into the
+        // test module and matching the pin's own string literal. The
+        // `#[cfg(test)]` check below cannot see that case — by then the region
+        // starts *after* the attribute, so it is never inside it. Catch it here
+        // instead, by position.
+        // Matched at COLUMN 0 and followed by `mod `, i.e. the real test-module
+        // attribute — not any mention of it. Searching for the bare string found
+        // a DOC COMMENT in production code that discusses `#[cfg(test)]`, placing
+        // the "test module" hundreds of lines before the function being scraped
+        // and failing every pin in this file. That is the same naive-substring
+        // mistake this whole helper exists to catch, committed inside the check
+        // itself; it stayed hidden until a later PR happened to write that phrase
+        // into a doc comment.
+        // `.expect`, not `if let`: a pattern that stops matching (a one-line
+        // `#[cfg(test)] mod tests {`, an intervening attribute, `pub mod tests`,
+        // CRLF) would otherwise skip the check entirely and leave every pin
+        // silently unguarded — a fail-OPEN inside the guard whose whole purpose
+        // is to stop things failing open. Refuse rather than verify nothing.
+        let tests_at = src
+            .find("\n#[cfg(test)]\nmod ")
+            .map(|i| i + 1)
+            .expect("test module not located — this guard cannot verify anything");
+        assert!(
+            at < tests_at,
+            "`{signature}` matched inside the test module — this pin is \
+             scraping its own source and would pass vacuously"
+        );
+        assert!(
+            at == 0 || src.as_bytes()[at - 1] == b'\n',
+            "fn_body only supports column-0 free functions; `{signature}` is \
+             indented (a method?), where the `\\n}}\\n` end-anchor would slice to \
+             the end of the enclosing impl instead"
+        );
+        let after = &src[at + signature.len()..];
+        let (body, _) = after
+            .split_once("\n}\n")
+            .unwrap_or_else(|| panic!("could not locate end of: {signature}"));
+        // Vacuity detector: a correctly-bounded function body can never contain
+        // the test-module attribute. If it does, the `\n}\n` search ran past the
+        // function and this pin is measuring the whole file.
+        assert!(
+            // Anchored like the check above. A bare `contains` would false-panic
+            // on a doc comment inside the scraped body that merely mentions
+            // `#[cfg(test)]` — the same naive-substring mistake, from the other
+            // direction, and the one that actually bit this file.
+            !body.contains("\n#[cfg(test)]\nmod "),
+            "scoped region for `{signature}` escaped into the test module — this \
+             pin would pass vacuously"
+        );
+        body
+    }
+
     #[test]
     fn test_get_latest_version_consults_rate_limit_bucket() {
         // Source pin: the in-node GitHub fetch MUST gate on the persistent token
         // bucket at its top, or the loop's GitHub spam is unbounded again (#4073).
-        let src = include_str!("auto_update.rs");
-        let (_, body) = src
-            .split_once("async fn get_latest_version() -> Result<String> {")
-            .expect("get_latest_version definition not found");
+        //
+        // Anchored on `fetch_latest_release_tag(` — the call that actually
+        // reaches GitHub since #5102 — and scoped with `fn_body` so that a future
+        // move of that call out of this function fails loudly instead of
+        // silently voiding the pin (see `fn_body`, and the incident it records).
+        let body = fn_body(
+            include_str!("auto_update.rs"),
+            "async fn get_latest_version() -> Result<String> {",
+        );
         let (head, _) = body
-            .split_once("reqwest::Client::builder()")
-            .expect("client builder not found");
+            .split_once("fetch_latest_release_tag(")
+            .expect("get_latest_version must reach GitHub via fetch_latest_release_tag");
         assert!(
             head.contains("try_consume_node_poll()"),
             "get_latest_version must consume a rate-limit token before hitting GitHub"
@@ -1676,20 +3414,24 @@ mod tests {
     }
 
     #[test]
-    fn test_get_latest_release_consults_install_bucket() {
+    fn test_installer_probe_consults_install_bucket() {
         // Source pin: the supervisor-side installer fetch must gate on the
         // SEPARATE install bucket (not the node bucket), so the node cannot
         // starve it (#4073 Codex P1).
-        let src = include_str!("update.rs");
-        let (_, body) = src
-            .split_once("async fn get_latest_release(")
-            .expect("get_latest_release definition not found");
+        //
+        // Renamed with the #5102 split of `get_latest_release` into
+        // `probe_latest_tag` (quota-free tag probe, runs every invocation) and
+        // `fetch_release_assets` (REST, runs only on a real install). The token
+        // must be spent on the PROBE: that is the call every invocation makes, so
+        // it is the one that bounds a restart loop. Gating only the asset fetch
+        // would leave the crash-loop path unbounded.
+        let body = fn_body(include_str!("update.rs"), "async fn probe_latest_tag(");
         let (head, _) = body
-            .split_once("reqwest::Client::builder()")
-            .expect("client builder not found");
+            .split_once("fetch_latest_release_tag(")
+            .expect("probe_latest_tag must reach GitHub via fetch_latest_release_tag");
         assert!(
             head.contains("try_consume_install_poll()"),
-            "get_latest_release must consume an INSTALL-bucket token before hitting GitHub"
+            "probe_latest_tag must consume an INSTALL-bucket token before hitting GitHub"
         );
     }
 
@@ -1779,17 +3521,956 @@ mod tests {
 
     #[test]
     fn test_repoll_interval_is_under_github_rate_limit() {
-        // GitHub's unauthenticated REST limit is 60 requests/hour/IP. Even at
-        // the jittered minimum, the periodic re-poll alone must stay far under
-        // that (the bursty peer-signal checks share the same IP budget). We
-        // assert the minimum interval is >= 1 hour, i.e. <= 1 periodic request
-        // per hour — a >=60x safety margin.
+        // Keeps the periodic re-poll infrequent in absolute terms.
+        //
+        // NOTE (#5102): the "60x safety margin" this test originally claimed was
+        // measured against the WRONG denominator. GitHub's 60 req/hr limit is
+        // per SOURCE IP and *collective* — every node behind the same NAT/CGNAT
+        // or VPN exit, plus every unrelated tool on that IP, draws from one
+        // shared 60. A per-node margin says nothing about a shared budget, which
+        // is how a "far under the limit" updater still got users 403/429'd. The
+        // real fix was to stop spending REST quota for detection at all (see
+        // `GITHUB_LATEST_REDIRECT_URL`); this bound remains as ordinary
+        // politeness, not as the rate-limit defence it was once mistaken for.
         let min =
             jittered_repoll_interval(UPDATE_REPOLL_INTERVAL, UPDATE_REPOLL_JITTER_FRACTION, 0.0);
         assert!(
             min >= Duration::from_secs(3600),
-            "minimum re-poll interval {min:?} must be >= 1h to stay well under \
-             GitHub's 60 req/hr unauthenticated limit"
+            "minimum re-poll interval {min:?} must be >= 1h"
         );
+    }
+
+    // ── #5102: quota-free version detection ────────────────────────────────
+
+    #[test]
+    fn detection_endpoint_does_not_use_the_rest_api() {
+        // The regression this guards: the detection path polls on a timer, so
+        // pointing it at api.github.com spends a budget shared with every other
+        // client on the IP. The redirect endpoint costs none of it. Verified
+        // empirically against live GitHub when this landed: the api.github.com
+        // form increments `core.used`, this one does not.
+        assert!(
+            !GITHUB_LATEST_REDIRECT_URL.contains("api.github.com"),
+            "version detection must not use the rate-limited REST API, got \
+             {GITHUB_LATEST_REDIRECT_URL}"
+        );
+        assert!(
+            GITHUB_LATEST_REDIRECT_URL.starts_with("https://github.com/"),
+            "detection must use the web redirect endpoint, got {GITHUB_LATEST_REDIRECT_URL}"
+        );
+    }
+
+    #[test]
+    fn parse_tag_from_location_handles_the_shapes_github_sends() {
+        // Absolute form — what GitHub actually returns today.
+        assert_eq!(
+            parse_tag_from_release_location(
+                "https://github.com/freenet/freenet-core/releases/tag/v0.2.118"
+            )
+            .as_deref(),
+            Some("v0.2.118"),
+            "the tag is returned VERBATIM; `version_from_tag` does the stripping"
+        );
+        // Relative form — permitted by RFC 7231 even though GitHub sends absolute.
+        assert_eq!(
+            parse_tag_from_release_location("/freenet/freenet-core/releases/tag/v1.2.3").as_deref(),
+            Some("v1.2.3")
+        );
+        // A tag without the conventional 'v' must survive intact.
+        assert_eq!(
+            parse_tag_from_release_location("https://github.com/o/r/releases/tag/1.2.3").as_deref(),
+            Some("1.2.3")
+        );
+        // Trailing slash and query/fragment noise must not end up in the version,
+        // or the semver parse downstream fails and the update is silently skipped.
+        assert_eq!(
+            parse_tag_from_release_location("https://github.com/o/r/releases/tag/v1.2.3/")
+                .as_deref(),
+            Some("v1.2.3")
+        );
+        assert_eq!(
+            parse_tag_from_release_location("https://github.com/o/r/releases/tag/v1.2.3?x=1")
+                .as_deref(),
+            Some("v1.2.3")
+        );
+    }
+
+    #[test]
+    fn parse_tag_from_location_rejects_non_release_redirects() {
+        // Anything that is not a release-tag redirect must be None, NOT a bogus
+        // version string: a bogus version compares as "newer" and would trigger
+        // a pointless exit-42 update cycle.
+        assert_eq!(parse_tag_from_release_location(""), None);
+        assert_eq!(
+            parse_tag_from_release_location("https://github.com/login?return_to=%2Ffreenet"),
+            None
+        );
+        assert_eq!(
+            parse_tag_from_release_location("https://github.com/o/r/releases/tag/"),
+            None,
+            "an empty tag must not parse as a version"
+        );
+        // The exact case `version_from_tag(tag).is_empty()` exists for: a tag
+        // that is nothing but the `v` prefix. Before that guard this returned
+        // `Some("")` (emptiness was checked BEFORE the prefix was considered),
+        // which is a "version" that fails semver parsing downstream — safe by
+        // luck, not by contract.
+        assert_eq!(
+            parse_tag_from_release_location("https://github.com/o/r/releases/tag/v"),
+            None,
+            "a bare `v` carries no version and must not parse"
+        );
+        assert_eq!(
+            parse_tag_from_release_location("https://github.com/o/r/releases/tag/v/"),
+            None,
+            "...including with a trailing slash"
+        );
+        // A tag that merely STARTS with v is fine and must survive verbatim.
+        assert_eq!(
+            parse_tag_from_release_location("https://github.com/o/r/releases/tag/version-2")
+                .as_deref(),
+            Some("version-2"),
+            "only a lone `v` is empty; `version-2` is a real tag"
+        );
+        assert_eq!(
+            parse_tag_from_release_location("https://github.com/o/r/releases/latest"),
+            None
+        );
+    }
+
+    #[test]
+    fn rate_limited_statuses_cover_both_github_signals() {
+        // GitHub uses 403 for the primary per-hour limit and 429 for secondary /
+        // abuse limits. Missing either one means we keep knocking while limited,
+        // which is what escalates toward a longer block.
+        assert!(is_rate_limited_status(reqwest::StatusCode::FORBIDDEN));
+        assert!(is_rate_limited_status(
+            reqwest::StatusCode::TOO_MANY_REQUESTS
+        ));
+        // Everything else must stay an ordinary error, not a silent cooldown.
+        assert!(!is_rate_limited_status(reqwest::StatusCode::OK));
+        assert!(!is_rate_limited_status(reqwest::StatusCode::FOUND));
+        assert!(!is_rate_limited_status(reqwest::StatusCode::NOT_FOUND));
+        assert!(!is_rate_limited_status(
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR
+        ));
+    }
+
+    #[test]
+    fn retry_after_header_is_preferred_over_ratelimit_reset() {
+        let headers = |name: &str| match name {
+            "retry-after" => Some("300".to_string()),
+            "x-ratelimit-reset" => Some("9999999999".to_string()),
+            _ => None,
+        };
+        assert_eq!(
+            parse_retry_after_at(headers, 1_000),
+            Some(Duration::from_secs(300)),
+            "Retry-After is the more specific instruction and must win"
+        );
+    }
+
+    #[test]
+    fn ratelimit_reset_is_converted_from_absolute_to_delta() {
+        // x-ratelimit-reset is an ABSOLUTE Unix second. Treating it as a delta
+        // (the easy mistake) would produce a ~56-year cooldown and silently
+        // disable auto-update forever.
+        let now = 1_785_700_000;
+        let headers = |name: &str| match name {
+            "x-ratelimit-reset" => Some((now + 1_800).to_string()),
+            _ => None,
+        };
+        assert_eq!(
+            parse_retry_after_at(headers, now),
+            Some(Duration::from_secs(1_800))
+        );
+    }
+
+    #[test]
+    fn rate_limit_wait_is_clamped_at_both_ends() {
+        let now = 1_785_700_000;
+        // A reset already in the past (clock skew) must not yield a zero wait
+        // that lets us knock again immediately.
+        let past = |name: &str| match name {
+            "x-ratelimit-reset" => Some((now - 500).to_string()),
+            _ => None,
+        };
+        assert_eq!(parse_retry_after_at(past, now), Some(MIN_GITHUB_COOLDOWN));
+
+        // An absurd value must not disable updates for days.
+        let absurd = |name: &str| match name {
+            "retry-after" => Some("99999999".to_string()),
+            _ => None,
+        };
+        assert_eq!(parse_retry_after_at(absurd, now), Some(MAX_GITHUB_COOLDOWN));
+
+        // Nothing parseable → None, so the caller applies its own default rather
+        // than this function inventing one.
+        assert_eq!(parse_retry_after_at(|_| None, now), None);
+        assert_eq!(
+            parse_retry_after_at(
+                |n: &str| (n == "retry-after").then(|| "soon".to_string()),
+                now
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn cooldown_blocks_until_it_expires() {
+        let tmp = tempfile::tempdir().unwrap();
+        let now = 1_785_700_000;
+        assert_eq!(
+            github_cooldown_remaining_at(tmp.path(), now),
+            None,
+            "no marker means no cooldown"
+        );
+
+        record_github_cooldown_at(tmp.path(), Some(Duration::from_secs(600)), now);
+        assert_eq!(
+            github_cooldown_remaining_at(tmp.path(), now),
+            Some(Duration::from_secs(600))
+        );
+        // Still blocking one second before expiry...
+        assert_eq!(
+            github_cooldown_remaining_at(tmp.path(), now + 599),
+            Some(Duration::from_secs(1))
+        );
+        // ...and released exactly at expiry, so a limited node does recover on
+        // its own without operator intervention.
+        assert_eq!(github_cooldown_remaining_at(tmp.path(), now + 600), None);
+        assert_eq!(github_cooldown_remaining_at(tmp.path(), now + 9_999), None);
+    }
+
+    #[test]
+    fn cooldown_is_never_shortened_by_a_later_writer() {
+        // The node and a supervisor-spawned `freenet update` can both hit the
+        // limit. If the second writer overwrote the deadline with its own
+        // shorter wait, the pair would ratchet the cooldown DOWN and keep
+        // knocking — the exact failure the shared marker exists to prevent.
+        let tmp = tempfile::tempdir().unwrap();
+        let now = 1_785_700_000;
+
+        record_github_cooldown_at(tmp.path(), Some(Duration::from_secs(3_000)), now);
+        record_github_cooldown_at(tmp.path(), Some(Duration::from_secs(120)), now);
+
+        assert_eq!(
+            github_cooldown_remaining_at(tmp.path(), now),
+            Some(Duration::from_secs(3_000)),
+            "a shorter later cooldown must not walk back the longer one"
+        );
+    }
+
+    #[test]
+    fn cooldown_without_a_header_uses_the_bounded_default() {
+        let tmp = tempfile::tempdir().unwrap();
+        let now = 1_785_700_000;
+        record_github_cooldown_at(tmp.path(), None, now);
+        assert_eq!(
+            github_cooldown_remaining_at(tmp.path(), now),
+            Some(DEFAULT_GITHUB_COOLDOWN),
+            "a 403/429 with no usable header must still produce a real cooldown"
+        );
+    }
+
+    #[test]
+    fn corrupt_or_skewed_cooldown_cannot_disable_updates_forever() {
+        let tmp = tempfile::tempdir().unwrap();
+        let now = 1_785_700_000;
+
+        // A far-future deadline (dead RTC, BIOS reset, restored VM snapshot,
+        // torn write) must be IGNORED, not clamped.
+        //
+        // The original version of this assertion expected `Some(MAX_GITHUB_COOLDOWN)`
+        // under a test named "cannot disable updates forever" — but that value is
+        // precisely what the buggy code returned at EVERY future instant, so it
+        // pinned the defect rather than its absence, while its name told the next
+        // maintainer the case was handled. Two independent reviewers found the
+        // real bug only after it shipped. The rewrite below proves expiry the
+        // only way that actually works: by ADVANCING THE CLOCK and requiring None.
+        fs::write(tmp.path().join(GITHUB_COOLDOWN_FILE), u64::MAX.to_string()).unwrap();
+        assert_eq!(
+            github_cooldown_remaining_at(tmp.path(), now),
+            None,
+            "a nonsensical far-future deadline must read as 'not cooling down'"
+        );
+
+        // A deadline just past the maximum is equally untrustworthy...
+        let over = now + MAX_GITHUB_COOLDOWN.as_secs() + 1;
+        fs::write(tmp.path().join(GITHUB_COOLDOWN_FILE), over.to_string()).unwrap();
+        assert_eq!(github_cooldown_remaining_at(tmp.path(), now), None);
+
+        // ...while one exactly at the maximum is legitimate (it is what
+        // `record_github_cooldown_at` writes at its own clamp) and is honoured.
+        let at_max = now + MAX_GITHUB_COOLDOWN.as_secs();
+        fs::write(tmp.path().join(GITHUB_COOLDOWN_FILE), at_max.to_string()).unwrap();
+        assert_eq!(
+            github_cooldown_remaining_at(tmp.path(), now),
+            Some(MAX_GITHUB_COOLDOWN)
+        );
+        // And it genuinely EXPIRES as the clock advances — the property the old
+        // assertion never checked, and the one whose absence was the bug.
+        assert_eq!(github_cooldown_remaining_at(tmp.path(), at_max), None);
+        assert_eq!(
+            github_cooldown_remaining_at(tmp.path(), at_max + 10_000),
+            None
+        );
+
+        // Unparseable content fails OPEN (no cooldown): the token buckets still
+        // bound us, and failing closed here would wedge detection permanently.
+        fs::write(tmp.path().join(GITHUB_COOLDOWN_FILE), "not-a-number").unwrap();
+        assert_eq!(github_cooldown_remaining_at(tmp.path(), now), None);
+    }
+
+    #[test]
+    fn probe_response_yields_a_tag_for_any_redirect_status() {
+        // GitHub sends 302 today, but every redirect status carries the same
+        // Location. Pinning to one code would turn a harmless server-side change
+        // into a fleet-wide update outage, so the tag is read from the header
+        // regardless of which redirect status arrived.
+        let loc = Some("https://github.com/freenet/freenet-core/releases/tag/v0.2.118");
+        for code in [301u16, 302, 303, 307, 308] {
+            let status = reqwest::StatusCode::from_u16(code).unwrap();
+            assert_eq!(
+                classify_probe_response(status, loc),
+                ProbeOutcome::Tag("v0.2.118".to_string()),
+                "status {code} carrying a valid Location must yield the tag"
+            );
+        }
+    }
+
+    #[test]
+    fn probe_response_never_invents_a_version() {
+        // The dangerous failure is a bogus "version": it would compare as newer
+        // and drive a pointless exit-42 update cycle against a release that does
+        // not exist. Every shape that is not a real release redirect must be
+        // Unusable, which the caller surfaces as an error (retry under backoff).
+        let ok = reqwest::StatusCode::OK;
+        // A captive portal / proxy answering 200 with a page instead of a redirect.
+        assert_eq!(classify_probe_response(ok, None), ProbeOutcome::Unusable);
+        // A redirect to somewhere that is not a release tag (e.g. a login wall).
+        assert_eq!(
+            classify_probe_response(
+                reqwest::StatusCode::FOUND,
+                Some("https://github.com/login?return_to=%2Ffreenet")
+            ),
+            ProbeOutcome::Unusable
+        );
+        // Server errors carry no tag either.
+        assert_eq!(
+            classify_probe_response(reqwest::StatusCode::INTERNAL_SERVER_ERROR, None),
+            ProbeOutcome::Unusable
+        );
+        assert_eq!(
+            classify_probe_response(reqwest::StatusCode::NOT_FOUND, None),
+            ProbeOutcome::Unusable
+        );
+    }
+
+    #[test]
+    fn probe_response_reports_rate_limiting_before_reading_location() {
+        // A 403/429 must classify as RateLimited even if a Location is somehow
+        // present, so the cooldown is recorded rather than the response being
+        // silently treated as a successful check.
+        for code in [403u16, 429] {
+            let status = reqwest::StatusCode::from_u16(code).unwrap();
+            assert_eq!(
+                classify_probe_response(
+                    status,
+                    Some("https://github.com/freenet/freenet-core/releases/tag/v9.9.9")
+                ),
+                ProbeOutcome::RateLimited,
+                "status {code} must be treated as rate-limited"
+            );
+        }
+    }
+
+    #[test]
+    fn force_waives_the_cached_cooldown_but_the_automated_path_honours_it() {
+        // Regression guard for the `--force` escape hatch. The stored deadline is
+        // only our CACHED belief about GitHub and can be stale for up to
+        // MAX_GITHUB_COOLDOWN. Two separate operator-facing messages tell users
+        // to run `freenet update --force` to override — if our own marker
+        // silently refused it and reported "already up to date", that advice
+        // would be wrong and an operator could not apply an urgent fix.
+        //
+        // Source pin, because the gate itself lives on the network path: the
+        // bypass flag must be threaded from `force`, and the automated node poll
+        // must pass `false`.
+        let update_src = include_str!("update.rs");
+        assert!(
+            update_src.contains("fetch_latest_release_tag(force)"),
+            "`freenet update --force` must waive the cached cooldown"
+        );
+
+        // Scoped with `fn_body`. The first version of THIS test used a bare
+        // `split_once("async fn get_latest_version()")`, which left an 86k-char
+        // region running to EOF — so the only surviving match under the very
+        // mutation it names (`fetch_latest_release_tag(true)`) was the assertion
+        // string on the next line, and it passed. That is the identical
+        // self-satisfying-literal shape this PR exists to remove, written into
+        // the PR that removes it; caught by review, not by me.
+        let body = fn_body(
+            include_str!("auto_update.rs"),
+            "async fn get_latest_version() -> Result<String> {",
+        );
+        assert!(
+            body.contains("fetch_latest_release_tag(false)"),
+            "the automated node poll must NOT waive the cooldown — staying quiet \
+             while the IP is limited is the entire point of it"
+        );
+    }
+
+    // ── Real HTTP-level tests for the probe (#5102 follow-up) ──────────────
+    //
+    // The change rests on an assumption about a third-party crate: that a
+    // `reqwest` client built with `Policy::none()` surfaces the 302 itself,
+    // with a readable `Location`, rather than following or erroring. Every
+    // other test here is a pure-function or source-scrape test and would keep
+    // passing if that assumption broke. These drive the real client against a
+    // local server so the assumption is actually verified.
+    //
+    // `probe_release_tag_at` does no disk I/O, so these never touch the real
+    // `state_dir()` or write a cooldown.
+
+    #[tokio::test]
+    async fn probe_reads_the_tag_from_a_real_302_without_following_it() {
+        use httptest::{Expectation, Server, matchers::*, responders::*};
+        let server = Server::run();
+        server.expect(
+            Expectation::matching(request::method_path("GET", "/releases/latest"))
+                // Exactly one request: if the client followed the redirect it
+                // would issue a second one and this expectation would fail.
+                //
+                // The Location is RELATIVE on purpose. With an absolute
+                // github.com URL a client that *did* follow would leave for the
+                // real internet and never return here, so `.times(1)` would still
+                // be satisfied and would prove nothing — and the test would make
+                // a live outbound request, failing misleadingly on an offline
+                // runner. Relative keeps a followed redirect pointed at this
+                // server, where the second request breaks `.times(1)`.
+                .times(1)
+                .respond_with(
+                    status_code(302)
+                        .append_header("location", "/freenet/freenet-core/releases/tag/v0.2.118"),
+                ),
+        );
+
+        let got = probe_release_tag_at(&server.url_str("/releases/latest"))
+            .await
+            .expect("probe must succeed on a 302 carrying a release Location");
+        assert_eq!(got, ProbeResult::Tag("v0.2.118".to_string()));
+    }
+
+    #[tokio::test]
+    async fn probe_reports_rate_limiting_with_the_retry_after_it_was_given() {
+        use httptest::{Expectation, Server, matchers::*, responders::*};
+        let server = Server::run();
+        server.expect(
+            Expectation::matching(request::method_path("GET", "/releases/latest")).respond_with(
+                status_code(429)
+                    .append_header("retry-after", "600")
+                    .body("rate limited"),
+            ),
+        );
+
+        let got = probe_release_tag_at(&server.url_str("/releases/latest"))
+            .await
+            .expect("a 429 is a normal outcome, not a transport error");
+        assert_eq!(
+            got,
+            ProbeResult::RateLimited {
+                retry_after: Some(Duration::from_secs(600)),
+            },
+            "the Retry-After GitHub sends must survive all the way out of the probe"
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_falls_back_to_ratelimit_reset_on_a_403() {
+        use httptest::{Expectation, Server, matchers::*, responders::*};
+        // GitHub signals the PRIMARY hourly limit with 403 + x-ratelimit-reset
+        // (an absolute Unix second) and no Retry-After. This is the exact shape
+        // the reported incident would have produced.
+        let reset = now_unix() + 1_500;
+        let server = Server::run();
+        server.expect(
+            Expectation::matching(request::method_path("GET", "/releases/latest")).respond_with(
+                status_code(403)
+                    .append_header("x-ratelimit-remaining", "0")
+                    .append_header("x-ratelimit-reset", reset.to_string()),
+            ),
+        );
+
+        let got = probe_release_tag_at(&server.url_str("/releases/latest"))
+            .await
+            .expect("a 403 is a normal outcome, not a transport error");
+        let ProbeResult::RateLimited { retry_after } = &got else {
+            panic!("403 must classify as rate-limited, got {got:?}");
+        };
+        let secs = retry_after
+            .expect("reset header must yield a wait")
+            .as_secs();
+        // Converted from absolute to delta; allow a second of clock drift
+        // between the header being built and being parsed.
+        assert!(
+            (1_499..=1_500).contains(&secs),
+            "expected ~1500s derived from x-ratelimit-reset, got {secs}"
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_follows_a_repo_rename_redirect() {
+        use httptest::{Expectation, Server, matchers::*, responders::*};
+        // The repository-rename case, and it is real for this project:
+        // github.com/freenet/locutus/releases/latest still answers 301 to
+        // .../freenet-core/releases/latest today. The first hop carries NO tag,
+        // so without following it every deployed node's detection would die the
+        // day the repo is renamed — and the only mechanism that could ship the
+        // fix is the one that broke. The REST endpoint this replaced survived a
+        // rename for free (reqwest follows by default); Policy::none() took that
+        // away, so the probe gives it back, bounded.
+        let server = Server::run();
+        server.expect(
+            Expectation::matching(request::method_path("GET", "/old/releases/latest"))
+                .times(1)
+                .respond_with(status_code(301).append_header("location", "/new/releases/latest")),
+        );
+        server.expect(
+            Expectation::matching(request::method_path("GET", "/new/releases/latest"))
+                .times(1)
+                .respond_with(
+                    status_code(302).append_header("location", "/new/releases/tag/v0.2.118"),
+                ),
+        );
+
+        assert_eq!(
+            probe_release_tag_at(&server.url_str("/old/releases/latest"))
+                .await
+                .expect("a rename redirect must resolve, not error"),
+            ProbeResult::Tag("v0.2.118".to_string()),
+            "a redirect whose Location carries no tag must be followed"
+        );
+    }
+
+    #[test]
+    fn redirect_follow_refuses_downgrade_and_off_host() {
+        let base = "https://github.com/freenet/freenet-core/releases/latest";
+
+        // Relative and same-host absolute both resolve.
+        assert_eq!(
+            resolve_redirect_target(base, "/freenet/freenet-core/releases/latest").as_deref(),
+            Some("https://github.com/freenet/freenet-core/releases/latest")
+        );
+        assert_eq!(
+            resolve_redirect_target(base, "https://github.com/other/repo/releases/latest")
+                .as_deref(),
+            Some("https://github.com/other/repo/releases/latest")
+        );
+
+        // A downgrade to plaintext is refused: it would move the probe onto a
+        // channel a network attacker can rewrite.
+        assert_eq!(
+            resolve_redirect_target(
+                base,
+                "http://github.com/freenet/freenet-core/releases/latest"
+            ),
+            None,
+            "must not follow https -> http"
+        );
+
+        // A different port on the same host is a different origin.
+        assert_eq!(
+            resolve_redirect_target(
+                base,
+                "https://github.com:8443/freenet/freenet-core/releases/latest"
+            ),
+            None,
+            "must not follow to a different port"
+        );
+
+        // The rule is same-ORIGIN, not hard-coded https: a probe that began on
+        // plain http (only the local test server does) may follow within it.
+        // This is what lets the follow tests below exercise the real path.
+        assert_eq!(
+            resolve_redirect_target("http://127.0.0.1:9/releases/latest", "/new/releases/latest")
+                .as_deref(),
+            Some("http://127.0.0.1:9/new/releases/latest")
+        );
+
+        // Another host is refused, however plausible it looks. This runs
+        // unattended in a supervised service.
+        for off_host in [
+            "https://evil.example.com/freenet/freenet-core/releases/latest",
+            "https://github.com.evil.example.com/a/b/releases/latest",
+            "https://raw.githubusercontent.com/freenet/freenet-core/releases/latest",
+            "https://127.0.0.1/releases/latest",
+            "https://[::1]:8080/releases/latest",
+        ] {
+            assert_eq!(
+                resolve_redirect_target(base, off_host),
+                None,
+                "must not follow off-host redirect to {off_host}"
+            );
+        }
+
+        // Non-HTTP schemes stay refused.
+        assert_eq!(resolve_redirect_target(base, "file:///etc/passwd"), None);
+        assert_eq!(resolve_redirect_target(base, "ftp://github.com/x"), None);
+    }
+
+    #[tokio::test]
+    async fn probe_does_not_trust_or_follow_an_off_origin_redirect() {
+        use httptest::{Expectation, Server, matchers::*, responders::*};
+        // End-to-end, covering BOTH halves of the off-origin gap. The Location
+        // here deliberately carries a plausible `/releases/tag/v9.9.9`, so:
+        //   * it must not be believed as a version (it would compare as newer
+        //     than anything and drive a pointless exit-42 cycle), and
+        //   * it must not be followed (an unattended supervised service must not
+        //     issue requests aimed wherever a response points it).
+        // `.times(1)` covers the second: a follow would be a second request.
+        let server = Server::run();
+        server.expect(
+            Expectation::matching(request::method_path("GET", "/releases/latest"))
+                .times(1)
+                .respond_with(status_code(301).append_header(
+                    "location",
+                    "https://evil.example.com/freenet/freenet-core/releases/tag/v9.9.9",
+                )),
+        );
+
+        let got = probe_release_tag_at(&server.url_str("/releases/latest"))
+            .await
+            .expect("an off-host redirect must resolve to Unusable, not error");
+        let ProbeResult::Unusable { status, .. } = &got else {
+            panic!("off-host redirect must not be followed, got {got:?}");
+        };
+        assert_eq!(*status, 301);
+    }
+
+    #[test]
+    fn an_aborted_probe_is_not_reported_as_an_http_failure() {
+        // The review finding this closes was operator-facing text, so the test is
+        // about text. Both non-HTTP aborts used to travel as
+        // `Unusable { status: 0, location: Some(<prose>) }` and rendered as
+        //   "GitHub returned 0 with no parseable release tag in Location
+        //    (probe exceeded its 10000ms chain deadline)"
+        // — a status GitHub never returned, and a cause that is not why it
+        // failed. Someone debugging a detection outage chases the redirect.
+        //
+        // Scoped with fn_body so a future edit that folds these back into
+        // `Unusable` fails here rather than silently restoring the conflation.
+        let this_src = include_str!("auto_update.rs");
+
+        for (func, what) in [
+            (
+                "async fn probe_release_tag_within(",
+                "the chain-deadline exit",
+            ),
+            (
+                "async fn probe_release_tag_chain(",
+                "the redirect-limit exit",
+            ),
+        ] {
+            let body = fn_body(this_src, func);
+            assert!(
+                body.contains("ProbeResult::Aborted"),
+                "{what} must report Aborted, not an HTTP-shaped Unusable"
+            );
+            assert!(
+                !body.contains("status: 0"),
+                "{what} must not invent a status GitHub never returned"
+            );
+        }
+
+        // And the caller must render it as its own thing.
+        let caller = fn_body(this_src, "pub(crate) async fn fetch_latest_release_tag(");
+        assert!(
+            caller.contains("ProbeResult::Aborted { reason }"),
+            "the caller must handle Aborted explicitly"
+        );
+        let (aborted_arm, _) = caller
+            .split_once("ProbeResult::Unusable")
+            .expect("the Unusable arm should follow the Aborted arm");
+        let (_, aborted_arm) = aborted_arm
+            .split_once("ProbeResult::Aborted { reason }")
+            .expect("Aborted arm not found");
+        assert!(
+            !aborted_arm.contains("GitHub returned")
+                && !aborted_arm.contains("no parseable release tag"),
+            "an aborted probe must not borrow the HTTP failure's wording — that \
+             is the conflation this exists to prevent, got: {aborted_arm}"
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_chain_is_bounded_in_wall_clock_not_just_hops() {
+        use httptest::{Expectation, Server, matchers::*, responders::*};
+        // The hop cap alone does not bound TIME: `probe_gives_up_on_a_redirect_loop`
+        // uses a server that answers instantly, so it pins the COUNT only. With a
+        // per-REQUEST timeout, N slow hops cost N x 10s — which is how the
+        // redirect-follow turned a 10s worst case into 40s and began eating the
+        // ExecStopPost budget `TimeoutStopSec=45` allocates.
+        //
+        // Each hop here is individually fast (200ms, far inside the 10s
+        // per-request timeout) but the chain never resolves, so only the SUM
+        // breaks the budget. That is precisely the shape a per-request bound
+        // cannot see. Driven at ms scale via the injectable deadline so the test
+        // is fast and uses real time (httptest's server runs on its own runtime,
+        // so a paused clock would just fire the client timeout immediately).
+        let server = Server::run();
+        server.expect(
+            Expectation::matching(request::method_path("GET", "/slow"))
+                .times(..)
+                .respond_with(delay_and_then(
+                    Duration::from_millis(200),
+                    status_code(302).append_header("location", "/slow"),
+                )),
+        );
+
+        let deadline = Duration::from_millis(300);
+        let started = std::time::Instant::now();
+        let got = probe_release_tag_within(&server.url_str("/slow"), deadline)
+            .await
+            .expect("exceeding the deadline is a normal outcome, not an error");
+        let elapsed = started.elapsed();
+
+        let ProbeResult::Aborted { reason } = &got else {
+            panic!("a chain that never resolves must end Unusable, got {got:?}");
+        };
+        assert!(
+            reason.contains("chain deadline"),
+            "hitting the deadline must say so, so an operator can tell it from \
+             a malformed redirect"
+        );
+        // Generous upper bound: the point is that it stops near the deadline
+        // rather than running all 4 hops (800ms+), not that it is precise.
+        assert!(
+            elapsed < Duration::from_millis(700),
+            "the whole chain must finish near its {deadline:?} deadline, took {elapsed:?} \
+             — a per-hop bound would have let all {} hops run",
+            MAX_PROBE_REDIRECTS + 1
+        );
+    }
+
+    #[test]
+    fn probe_chain_deadline_does_not_widen_the_stop_phase_budget() {
+        // The follow must not make the probe's worst case any longer than the
+        // single request it replaced. `freenet update` runs from ExecStopPost
+        // inside its own TimeoutStopSec=45, which the probe shares with the
+        // rest of the install; a probe that grew to 4x would push the SIGKILL
+        // from mid-probe into mid-install.
+        assert_eq!(
+            PROBE_CHAIN_TIMEOUT, PROBE_REQUEST_TIMEOUT,
+            "the chain deadline must equal the per-request timeout, so following \
+             redirects costs no additional wall clock"
+        );
+
+        // The previous version of this test asserted
+        // `PROBE_CHAIN_TIMEOUT * 2 < 45` under the message "probe + asset fetch
+        // must both fit well inside TimeoutStopSec=45". True, but it OVERSTATED
+        // what was guaranteed: the legs AFTER the asset fetch — the manifest, the
+        // signature and the release archive — had no timeout at all, so the
+        // stop-phase footprint was in fact unbounded. A green assertion naming
+        // the whole budget is worse than no assertion, because it terminates the
+        // investigation (the "overstated saving" row in
+        // `.claude/rules/bug-prevention-patterns.md`).
+        //
+        // A large download legitimately cannot carry a total deadline, so no test
+        // can honestly claim a whole-update wall-clock bound. What IS checkable,
+        // and what actually matters, is that every HTTP client on this path is
+        // bounded by SOMETHING — so a stalled connection can never hang until
+        // systemd SIGKILLs the updater mid-install.
+        // `update/staged.rs` too (#5790): the installer reads its cache, and its
+        // downloader shares the update path's clients' obligations.
+        let update_src = concat!(include_str!("update.rs"), include_str!("update/staged.rs"));
+        let clients = update_src.matches("reqwest::Client::builder()").count();
+        let bounded =
+            update_src.matches(".timeout(").count() + update_src.matches(".read_timeout(").count();
+        assert_eq!(
+            clients, bounded,
+            "every reqwest client in the update path must set a timeout or a \
+             read_timeout: found {clients} client(s) and {bounded} bound(s). An \
+             unbounded client on the ExecStopPost path hangs until SIGKILL, and \
+             that SIGKILL lands mid-install."
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_gives_up_on_a_redirect_loop() {
+        use httptest::{Expectation, Server, matchers::*, responders::*};
+        // Following tagless redirects must stay bounded, or a misconfigured or
+        // hostile server hangs the probe (and with it the node's update loop).
+        let server = Server::run();
+        server.expect(
+            Expectation::matching(request::method_path("GET", "/loop"))
+                .times(..)
+                .respond_with(status_code(302).append_header("location", "/loop")),
+        );
+
+        let got = probe_release_tag_at(&server.url_str("/loop"))
+            .await
+            .expect("a redirect loop must terminate, not error out");
+        let ProbeResult::Aborted { reason } = &got else {
+            panic!("a redirect loop must end Unusable, got {got:?}");
+        };
+        assert!(
+            reason.contains("redirect limit"),
+            "giving up on a loop should say so"
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_refuses_to_invent_a_version_from_a_non_redirect() {
+        use httptest::{Expectation, Server, matchers::*, responders::*};
+        // The captive-portal / proxy-interstitial case: a 200 with an HTML body
+        // and no Location. Must be Unusable, never a version — a bogus version
+        // compares as newer and drives a pointless exit-42 update cycle.
+        let server = Server::run();
+        server.expect(
+            Expectation::matching(request::method_path("GET", "/releases/latest"))
+                .respond_with(status_code(200).body("<html>sign in to your wifi</html>")),
+        );
+
+        let got = probe_release_tag_at(&server.url_str("/releases/latest"))
+            .await
+            .expect("a 200 is a normal outcome, not a transport error");
+        assert_eq!(
+            got,
+            ProbeResult::Unusable {
+                status: 200,
+                location: None,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_accepts_a_permanent_redirect_too() {
+        use httptest::{Expectation, Server, matchers::*, responders::*};
+        // GitHub sends 302 today; 301 carries the same header and must work, so
+        // a server-side change to the redirect code cannot black out updates.
+        let server = Server::run();
+        server.expect(
+            Expectation::matching(request::method_path("GET", "/releases/latest")).respond_with(
+                status_code(301)
+                    .append_header("location", "/freenet/freenet-core/releases/tag/v1.2.3"),
+            ),
+        );
+
+        assert_eq!(
+            probe_release_tag_at(&server.url_str("/releases/latest"))
+                .await
+                .expect("301 must be handled"),
+            ProbeResult::Tag("v1.2.3".to_string())
+        );
+    }
+
+    #[test]
+    fn cooldown_is_consulted_before_a_local_token_is_spent() {
+        // Ordering is the whole point of this fix, on BOTH paths. Spending a
+        // token first and only then discovering the cooldown burns one per 60s
+        // tick — the GithubRateLimitedError arm deliberately records no check
+        // time and grows no backoff, so the loop re-enters every tick, drains the
+        // 8-token bucket in ~8 minutes, and then throttles recovery for a further
+        // ~10 minutes per token AFTER GitHub would already have accepted a free
+        // request. Nothing else would catch a reordering: both orders compile,
+        // both behave identically until an IP is actually rate-limited.
+        let node = fn_body(
+            include_str!("auto_update.rs"),
+            "async fn get_latest_version() -> Result<String> {",
+        );
+        let cooldown_at = node
+            .find("github_cooldown_remaining()")
+            .expect("get_latest_version must consult the cooldown");
+        let token_at = node
+            .find("try_consume_node_poll()")
+            .expect("get_latest_version must consume a node token");
+        assert!(
+            cooldown_at < token_at,
+            "the cooldown must be checked BEFORE a node token is spent, or a \
+             rate-limited node drains its own bucket and delays its recovery"
+        );
+
+        let install = fn_body(include_str!("update.rs"), "async fn probe_latest_tag(");
+        let cooldown_at = install
+            .find("github_cooldown_remaining_public()")
+            .expect("probe_latest_tag must consult the cooldown");
+        let token_at = install
+            .find("try_consume_install_poll()")
+            .expect("probe_latest_tag must consume an install token");
+        assert!(
+            cooldown_at < token_at,
+            "the cooldown must be checked BEFORE an install token is spent"
+        );
+    }
+
+    #[test]
+    fn rate_limited_paths_persist_the_cooldown_and_exit_without_failing() {
+        // #5102/#5104 split the previously-atomic `note_rate_limited_response`
+        // (parse header + persist deadline + build error) into two call sites.
+        // Its own rustdoc warns that a second hand-rolled copy of "parse the
+        // header, persist the deadline" is exactly how one of the two paths
+        // quietly stops backing off — and the split shipped without a test. Pin
+        // all three obligations.
+        let probe_body = fn_body(
+            include_str!("auto_update.rs"),
+            "pub(crate) async fn fetch_latest_release_tag(",
+        );
+        assert!(
+            probe_body.contains("record_github_cooldown(retry_after)"),
+            "the probe path must PERSIST the cooldown, not merely report it — \
+             otherwise the node keeps knocking while GitHub is refusing it"
+        );
+
+        // Both installer paths must exit ALREADY_UP_TO_DATE on a rate limit
+        // rather than returning an error. A non-zero updater exit is counted by
+        // the macOS launchd wrapper's give_up_if_failing, which past its
+        // threshold stops the node PERMANENTLY — so a rate limit caused by
+        // another client sharing the IP could take a healthy node offline for
+        // good. Exit code 2 is explicitly exempt there.
+        let update_src = include_str!("update.rs");
+        let probe = fn_body(update_src, "async fn probe_latest_tag(");
+        assert!(
+            probe.contains("EXIT_CODE_ALREADY_UP_TO_DATE"),
+            "probe_latest_tag must exit ALREADY_UP_TO_DATE when GitHub rate-limits"
+        );
+        let assets = fn_body(update_src, "async fn fetch_release_assets(");
+        assert!(
+            assets.contains("EXIT_CODE_ALREADY_UP_TO_DATE"),
+            "fetch_release_assets must exit ALREADY_UP_TO_DATE when GitHub \
+             rate-limits rather than bail — see the macOS give_up_if_failing path"
+        );
+        assert!(
+            assets.contains("note_rate_limited_response"),
+            "the asset-fetch path must persist the cooldown too"
+        );
+    }
+
+    #[test]
+    fn rate_limit_message_explains_cause_and_remedy() {
+        // The reported symptom was a bare "too many requests", which users read
+        // as "Freenet is broken" and responded to by reinstalling by hand. The
+        // replacement must name the shared-IP cause, say it is not fatal, and
+        // give a manual route.
+        let msg = GithubRateLimitedError {
+            retry_after: Some(Duration::from_secs(1_800)),
+        }
+        .user_message();
+        assert!(
+            msg.contains("30 minutes"),
+            "must say when it retries: {msg}"
+        );
+        assert!(
+            msg.contains("shared") || msg.contains("NAT"),
+            "must explain the per-IP/shared cause: {msg}"
+        );
+        assert!(
+            msg.contains("https://github.com/freenet/freenet-core/releases/latest"),
+            "must offer the manual download route: {msg}"
+        );
+
+        // With no header we still promise a retry rather than leaving it open.
+        let vague = GithubRateLimitedError { retry_after: None }.user_message();
+        assert!(vague.contains("within the hour"), "{vague}");
     }
 }

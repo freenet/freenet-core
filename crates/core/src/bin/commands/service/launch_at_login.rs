@@ -85,9 +85,17 @@ pub(crate) fn macos_app_bundle_path(exe: &Path) -> Option<PathBuf> {
 /// packaging convention. See `scripts/package-macos.sh` for how this
 /// wrapper is produced: it execs the inner `freenet-bin` with the
 /// `service run-wrapper` subcommand.
+///
+/// Builds the path with an explicit `/` join rather than `Path::join`:
+/// this always describes a macOS bundle layout (always `/`-separated,
+/// regardless of what OS actually executes this code — e.g. this pure
+/// function is exercised on Windows too, in `windows_unit` CI). `Path`
+/// inserts the HOST OS's separator for newly-appended components, which
+/// is `\` on Windows and would silently mix separators into a path that
+/// must always be macOS-shaped.
 #[allow(dead_code)]
-fn macos_app_bundle_wrapper(bundle: &Path) -> PathBuf {
-    bundle.join("Contents").join("MacOS").join("Freenet")
+fn macos_app_bundle_wrapper(bundle: &Path) -> String {
+    format!("{}/Contents/MacOS/Freenet", bundle.to_string_lossy())
 }
 
 /// Compute the ProgramArguments array for the user LaunchAgent. If we're
@@ -100,11 +108,7 @@ fn macos_app_bundle_wrapper(bundle: &Path) -> PathBuf {
 #[allow(dead_code)]
 pub(super) fn launch_agent_program_arguments(exe: &Path) -> Vec<String> {
     match macos_app_bundle_path(exe) {
-        Some(bundle) => vec![
-            macos_app_bundle_wrapper(&bundle)
-                .to_string_lossy()
-                .into_owned(),
-        ],
+        Some(bundle) => vec![macos_app_bundle_wrapper(&bundle)],
         None => vec![
             exe.to_string_lossy().into_owned(),
             "service".to_string(),

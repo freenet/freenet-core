@@ -152,6 +152,7 @@ pub async fn create_connection_handler<S: Socket>(
     global_bandwidth: Option<Arc<GlobalBandwidthManager>>,
     ledbat_min_ssthresh: Option<usize>,
     congestion_config: Option<CongestionControlConfig>,
+    ack_version_floor_override: Option<(u8, u8, u16)>,
 ) -> Result<
     (
         OutboundConnectionHandler<S>,
@@ -186,6 +187,7 @@ pub async fn create_connection_handler<S: Socket>(
         global_bandwidth,
         ledbat_min_ssthresh,
         congestion_config,
+        ack_version_floor_override,
     )?;
     Ok((
         och,
@@ -277,6 +279,7 @@ impl<S: Socket> OutboundConnectionHandler<S> {
         global_bandwidth: Option<Arc<GlobalBandwidthManager>>,
         ledbat_min_ssthresh: Option<usize>,
         congestion_config: Option<CongestionControlConfig>,
+        ack_version_floor_override: Option<(u8, u8, u16)>,
     ) -> Result<ListenerSetup<S>, TransportError> {
         let (conn_handler_sender, conn_handler_receiver) = mpsc::channel(100);
         let (new_connection_sender, new_connection_notifier) = mpsc::channel(10);
@@ -309,6 +312,7 @@ impl<S: Socket> OutboundConnectionHandler<S> {
             ),
             time_source,
             congestion_config: Some(congestion_config.unwrap_or_default()),
+            ack_version_floor_override,
         };
         let connection_handler = OutboundConnectionHandler {
             send_queue: conn_handler_sender,
@@ -338,26 +342,30 @@ impl<S: Socket> OutboundConnectionHandler<S> {
         keypair: TransportKeypair,
         is_gateway: bool,
     ) -> Result<(Self, mpsc::Receiver<PeerConnection<S>>), TransportError> {
-        let (handler, receiver, _listen_handle) = Self::config_listener(
-            socket,
-            keypair,
-            is_gateway,
-            socket_addr,
-            None,
-            None,
-            None,
-            None,
-        )?;
-        Ok((handler, receiver))
+        Self::new_test_with_options(socket_addr, socket, keypair, is_gateway, None, None)
     }
 
+    /// [`Self::new_test`] with every knob a mock peer can set, so no two of them
+    /// are mutually exclusive.
+    ///
+    /// `ack_version_floor_override` is the #5161 gate: `Some(floor)` lets a test
+    /// exercise `AckConnectionV2` before the crate version reaches
+    /// `GATEWAY_ACK_VERSION_MIN_VERSION`, `None` is production behaviour.
+    ///
+    /// It takes `bandwidth_limit` too rather than hardcoding `None`. An earlier
+    /// shape had the caller branch between this and a bandwidth-only
+    /// constructor, which meant passing a floor override silently discarded any
+    /// bandwidth limit — a trap that would have surfaced as a throughput test
+    /// which mysteriously failed to throttle. That second constructor is gone;
+    /// this is the one knob-bearing test constructor.
     #[cfg(any(test, feature = "bench"))]
-    pub(crate) fn new_test_with_bandwidth(
+    pub(crate) fn new_test_with_options(
         socket_addr: SocketAddr,
         socket: Arc<S>,
         keypair: TransportKeypair,
         is_gateway: bool,
         bandwidth_limit: Option<usize>,
+        ack_version_floor_override: Option<(u8, u8, u16)>,
     ) -> Result<(Self, mpsc::Receiver<PeerConnection<S>>), TransportError> {
         let (handler, receiver, _listen_handle) = Self::config_listener(
             socket,
@@ -368,6 +376,7 @@ impl<S: Socket> OutboundConnectionHandler<S> {
             None,
             None,
             None,
+            ack_version_floor_override,
         )?;
         Ok((handler, receiver))
     }
@@ -510,6 +519,9 @@ impl<S: Socket> OutboundConnectionHandler<S, crate::simulation::VirtualTime> {
             gw_rate_limiter: GatewayConnectionRateLimiter::new(time_source.clone(), None),
             time_source,
             congestion_config,
+            // Benchmarks measure throughput, not handshake encoding; the real
+            // floor applies here exactly as in production.
+            ack_version_floor_override: None,
         };
         let connection_handler = OutboundConnectionHandler {
             send_queue: conn_handler_sender,
@@ -666,6 +678,17 @@ struct UdpPacketsListener<S = UdpSocket, T: TimeSource = RealTime> {
     /// Ramps up connection acceptance rate to prevent thundering herd.
     /// Only active when `is_gateway` is true.
     gw_rate_limiter: GatewayConnectionRateLimiter<T>,
+    /// Test-only override for [`version_cmp::GATEWAY_ACK_VERSION_MIN_VERSION`]
+    /// (#5161). `None` in production, where the real floor applies.
+    ///
+    /// Load-bearing rather than decorative, for the same reason
+    /// `NodeConfig::hash_first_summaries_floor_override` is: simulations run
+    /// the real transport handshake with the real crate version, which is
+    /// BELOW the floor until the release that lifts it. Without an override
+    /// the first integration-level run of this path would be the release PR
+    /// itself, where a red sim could not be attributed between the feature and
+    /// the version bump.
+    ack_version_floor_override: Option<(u8, u8, u16)>,
 }
 
 type OngoingConnectionResult<S, T> = Option<
@@ -1769,6 +1792,13 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
         }
     }
 
+    /// Effective floor for emitting the version-carrying ack (#5161): the
+    /// test-only override when set, otherwise the production constant.
+    fn ack_version_floor(&self) -> (u8, u8, u16) {
+        self.ack_version_floor_override
+            .unwrap_or(version_cmp::GATEWAY_ACK_VERSION_MIN_VERSION)
+    }
+
     #[allow(clippy::type_complexity)]
     fn gateway_connection(
         &mut self,
@@ -1786,6 +1816,7 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
         let socket = self.socket_listener.clone();
         let time_source = self.time_source.clone();
         let congestion_config = self.congestion_config.clone();
+        let ack_version_floor = self.ack_version_floor();
 
         let (inbound_from_remote, mut next_inbound) =
             mpsc::channel::<PacketData<UnknownEncryption>>(100);
@@ -1857,8 +1888,13 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                 };
 
             let inbound_key = Aes128Gcm::new(&inbound_key_bytes.into());
-            let outbound_ack_packet =
-                SymmetricMessage::ack_ok(&outbound_key, inbound_key_bytes, remote_addr)?;
+            let outbound_ack_packet = build_success_ack(
+                &outbound_key,
+                inbound_key_bytes,
+                remote_addr,
+                remote_protoc_version,
+                ack_version_floor,
+            )?;
 
             tracing::trace!(
                 peer_addr = %remote_addr,
@@ -2103,6 +2139,7 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
         let (inbound_from_remote, mut next_inbound) =
             mpsc::channel::<PacketData<UnknownEncryption>>(100);
         let this_addr = self.this_addr;
+        let ack_version_floor = self.ack_version_floor();
         let f = async move {
             tracing::info!(
                 peer_addr = %remote_addr,
@@ -2160,10 +2197,18 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                                 direction = "outbound",
                                 "Sending back protocol version and inbound key to remote"
                             );
-                            let our_inbound = SymmetricMessage::ack_ok(
+                            // Load-bearing for peer-to-peer, not just the
+                            // gateway path: if the remote races ahead to its own
+                            // `AckConnection` arm before parsing OUR intro, this
+                            // ack is the only place it can learn our version.
+                            // We reached `RemoteInbound` by parsing the remote's
+                            // intro, so its version is known here (#5161).
+                            let our_inbound = build_success_ack(
                                 outbound_sym_key.as_ref().expect("should be set"),
                                 inbound_sym_key_bytes,
                                 remote_addr,
+                                remote_protoc_version,
+                                ack_version_floor,
                             )?;
                             socket
                                 .send_to(our_inbound.data(), remote_addr)
@@ -2228,20 +2273,56 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                                         );
                                     }
 
-                                    match symmetric_message.payload {
-                                        SymmetricMessagePayload::AckConnection {
-                                            result:
-                                                Ok(OutboundConnection {
-                                                    key,
-                                                    remote_addr: my_address,
-                                                }),
-                                        } => {
+                                    // #5161: the acceptor's ack comes in two
+                                    // encodings — the legacy `AckConnection`
+                                    // and the version-carrying
+                                    // `AckConnectionV2` — that differ only in
+                                    // whether the acceptor told us its
+                                    // version. Normalize first so the
+                                    // connection-construction body below stays
+                                    // single-copy; duplicating it per arm is
+                                    // how the two encodings would drift.
+                                    if let Some((key, my_address, acceptor_version_bytes)) =
+                                        ack_ok_parts(&symmetric_message.payload)
+                                    {
+                                        {
                                             let outbound_sym_key = Aes128Gcm::new_from_slice(&key)
                                                 .map_err(|_| {
                                                     TransportError::ConnectionEstablishmentFailure {
                                                         cause: "invalid symmetric key".into(),
                                                     }
                                                 })?;
+                                            // Only V2 carries a version. When
+                                            // it does, this is the ONLY point
+                                            // on this path where the acceptor's
+                                            // version can be learned: we never
+                                            // parse an intro packet from it.
+                                            // Report it so version discovery
+                                            // (`gateway_version_probe`, the
+                                            // auto-update signal) sees gateways
+                                            // at all, not only peers that
+                                            // hole-punched back to us (#5166).
+                                            //
+                                            // Deliberately NOT run through
+                                            // `is_compatible` /
+                                            // `remote_requires_newer_than_us`
+                                            // the way the four intro-parsing
+                                            // report sites are, and the
+                                            // asymmetry is not an oversight:
+                                            // the acceptor already ran the
+                                            // BIDIRECTIONAL compatibility check
+                                            // against our intro before choosing
+                                            // to send this, and would have
+                                            // replied `ack_error` instead had
+                                            // it required a newer version than
+                                            // ours. So the "we must update to
+                                            // talk to this peer" branch is
+                                            // unreachable here by construction.
+                                            if let Some(bytes) = acceptor_version_bytes {
+                                                let info = version_cmp::parse_version_bytes(&bytes);
+                                                crate::transport::report_peer_version(info.version);
+                                                remote_protoc_version = Some(info.version);
+                                            }
                                             tracing::trace!(
                                                 peer_addr = %remote_addr,
                                                 direction = "outbound",
@@ -2309,9 +2390,13 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                                                     inbound_symmetric_key_bytes:
                                                         inbound_sym_key_bytes,
                                                     my_address: Some(my_address),
-                                                    // AckConnection (joiner->gateway) payload
-                                                    // carries no protocol version.
-                                                    remote_protoc_version: None,
+                                                    // Set above iff the ack was
+                                                    // `AckConnectionV2`; `None`
+                                                    // means the acceptor is
+                                                    // pre-`GATEWAY_ACK_VERSION_MIN_VERSION`
+                                                    // and genuinely told us
+                                                    // nothing (#5161).
+                                                    remote_protoc_version,
                                                     transport_secret_key: transport_secret_key
                                                         .clone(),
                                                     congestion_controller,
@@ -2326,10 +2411,39 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                                                 },
                                             ));
                                         }
+                                    }
+                                    match symmetric_message.payload {
                                         SymmetricMessagePayload::AckConnection {
                                             result: Err(err),
                                         } => {
                                             return Err(handle_ack_connection_error(err));
+                                        }
+                                        // Unreachable: `ack_ok_parts` consumed
+                                        // both success encodings above and its
+                                        // body always returns. Kept as its OWN
+                                        // arm rather than folded into the
+                                        // "unexpected packet" list below, and
+                                        // logged at ERROR, because reaching it
+                                        // means a success encoding exists that
+                                        // `ack_ok_parts` does not destructure —
+                                        // e.g. a future `AckConnectionV3` added
+                                        // to the enum and to the list below but
+                                        // forgotten there. That compiles, keeps
+                                        // the match exhaustive, and would
+                                        // otherwise present as a handshake that
+                                        // silently never completes.
+                                        SymmetricMessagePayload::AckConnection {
+                                            result: Ok(_),
+                                        }
+                                        | SymmetricMessagePayload::AckConnectionV2 { .. } => {
+                                            tracing::error!(
+                                                peer_addr = %remote_addr,
+                                                direction = "outbound",
+                                                "Success ack not destructured by ack_ok_parts — a \
+                                                 success encoding was added to the payload enum \
+                                                 without teaching ack_ok_parts about it"
+                                            );
+                                            continue;
                                         }
                                         SymmetricMessagePayload::ShortMessage { .. }
                                         | SymmetricMessagePayload::StreamFragment { .. }
@@ -2483,6 +2597,80 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
             })
         };
         (f.boxed(), inbound_from_remote)
+    }
+}
+
+/// Build the success ack for a peer whose protocol version we have just parsed
+/// from its intro packet, choosing the encoding by version (#5161).
+///
+/// Both acceptors — the gateway path and the peer-to-peer `RemoteInbound` path —
+/// go through here so the gate cannot drift between them, and so the reasoning
+/// below lives in one place.
+///
+/// The decision reads ONLY the version parsed during THIS handshake, never a
+/// cached one, which is what makes it impossible for the gate to go stale
+/// against a peer that restarted on an older build at a reused address.
+///
+/// `None` (or below the floor) yields the unmodified `ack_ok`, so a pre-floor
+/// peer receives byte-identical traffic to today. That matters more here than on
+/// the other version-gated surfaces: a peer that cannot decode this particular
+/// message does not merely drop a connection, it fails to complete the handshake
+/// at all, so it could not connect to an upgraded gateway.
+fn build_success_ack(
+    outbound_sym_key: &Aes128Gcm,
+    our_inbound_key: [u8; 16],
+    remote_addr: SocketAddr,
+    remote_protoc_version: Option<(u8, u8, u16)>,
+    ack_version_floor: (u8, u8, u16),
+) -> Result<PacketData<SymmetricAES>, bincode::Error> {
+    if version_cmp::version_supports_ack_version(remote_protoc_version, ack_version_floor) {
+        SymmetricMessage::ack_ok_with_version(
+            outbound_sym_key,
+            our_inbound_key,
+            remote_addr,
+            PROTOC_VERSION,
+        )
+    } else {
+        SymmetricMessage::ack_ok(outbound_sym_key, our_inbound_key, remote_addr)
+    }
+}
+
+/// Destructure a successful connection ack, whichever encoding it arrived in
+/// (#5161), into `(symmetric key, our observed address, acceptor's version
+/// bytes)`.
+///
+/// `None` for anything that is not a success ack — including the failure ack,
+/// which the caller must still handle separately.
+///
+/// The version is `None` for the legacy [`SymmetricMessagePayload::AckConnection`]
+/// and `Some` for [`SymmetricMessagePayload::AckConnectionV2`]. That difference
+/// is the entire point of the variant, and it is deliberately reported as an
+/// `Option` rather than defaulted: "the acceptor is below the floor" and "the
+/// acceptor is version X" are different facts, and every `version_supports_*`
+/// gate fails closed on the former.
+#[allow(clippy::type_complexity)]
+fn ack_ok_parts(
+    payload: &SymmetricMessagePayload,
+) -> Option<([u8; 16], SocketAddr, Option<[u8; 8]>)> {
+    match payload {
+        SymmetricMessagePayload::AckConnection {
+            result:
+                Ok(OutboundConnection {
+                    key,
+                    remote_addr: my_address,
+                }),
+        } => Some((*key, *my_address, None)),
+        SymmetricMessagePayload::AckConnectionV2 { connection } => Some((
+            connection.key,
+            connection.remote_addr,
+            Some(connection.protoc_version),
+        )),
+        SymmetricMessagePayload::AckConnection { result: Err(_) }
+        | SymmetricMessagePayload::ShortMessage { .. }
+        | SymmetricMessagePayload::StreamFragment { .. }
+        | SymmetricMessagePayload::NoOp
+        | SymmetricMessagePayload::Ping { .. }
+        | SymmetricMessagePayload::Pong { .. } => None,
     }
 }
 
@@ -2897,6 +3085,7 @@ pub mod mock_transport {
             false,
             channels,
             None,
+            None,
         )
         .await
         .map(|(pk, (o, _), s)| (pk, o, s))
@@ -2919,6 +3108,7 @@ pub mod mock_transport {
             packet_delay_policy,
             false,
             channels,
+            None,
             None,
         )
         .await
@@ -2944,6 +3134,7 @@ pub mod mock_transport {
             false,
             channels,
             bandwidth_limit,
+            None,
         )
         .await
         .map(|(pk, (o, _), s)| (pk, o, s))
@@ -3002,16 +3193,75 @@ pub mod mock_transport {
             true,
             channels,
             None,
+            None,
         )
         .await
     }
 
+    /// Create a mock (non-gateway) peer whose version-carrying-ack floor (#5161)
+    /// is overridden, with a caller-chosen packet-drop policy.
+    ///
+    /// Both parameters are needed together for the peer-to-peer arm:
+    /// `create_mock_gateway_with_ack_floor` hardcodes `gateway = true`, so
+    /// without this no NAT-traversal pair could carry a floor override — and the
+    /// drop policy is what forces the intro/ack RACE that arm exists to handle.
+    pub async fn create_mock_peer_with_ack_floor(
+        packet_drop_policy: PacketDropPolicy,
+        channels: Channels,
+        ack_version_floor_override: Option<(u8, u8, u16)>,
+    ) -> anyhow::Result<(
+        TransportPublicKey,
+        OutboundConnectionHandler<MockSocket>,
+        SocketAddr,
+    )> {
+        create_mock_peer_internal(
+            packet_drop_policy,
+            PacketDelayPolicy::NoDelay,
+            false,
+            channels,
+            None,
+            ack_version_floor_override,
+        )
+        .await
+        .map(|(pk, (o, _), s)| (pk, o, s))
+    }
+
+    /// Create a mock gateway whose version-carrying-ack floor (#5161) is
+    /// overridden, so a test can exercise BOTH sides of the gate without
+    /// depending on the crate's current version.
+    pub async fn create_mock_gateway_with_ack_floor(
+        channels: Channels,
+        ack_version_floor_override: Option<(u8, u8, u16)>,
+    ) -> Result<
+        (
+            TransportPublicKey,
+            (
+                OutboundConnectionHandler<MockSocket>,
+                mpsc::Receiver<PeerConnection<MockSocket>>,
+            ),
+            SocketAddr,
+        ),
+        anyhow::Error,
+    > {
+        create_mock_peer_internal(
+            PacketDropPolicy::ReceiveAll,
+            PacketDelayPolicy::NoDelay,
+            true,
+            channels,
+            None,
+            ack_version_floor_override,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
     async fn create_mock_peer_internal(
         packet_drop_policy: PacketDropPolicy,
         packet_delay_policy: PacketDelayPolicy,
         gateway: bool,
         channels: Channels,
         bandwidth_limit: Option<usize>,
+        ack_version_floor_override: Option<(u8, u8, u16)>,
     ) -> Result<
         (
             TransportPublicKey,
@@ -3037,12 +3287,13 @@ pub mod mock_transport {
             )
             .await,
         );
-        let (peer_conn, inbound_conn) = OutboundConnectionHandler::new_test_with_bandwidth(
+        let (peer_conn, inbound_conn) = OutboundConnectionHandler::new_test_with_options(
             (Ipv4Addr::LOCALHOST, port).into(),
             socket,
             peer_keypair,
             gateway,
             bandwidth_limit,
+            ack_version_floor_override,
         )
         .expect("failed to create peer");
         Ok((
@@ -3347,8 +3598,12 @@ pub mod mock_transport {
         // This is a symmetric peer-to-peer hole-punch (no gateway), so each side
         // captures the remote version while parsing the other's intro packet on
         // the RemoteInbound path. Whichever side races ahead to the AckConnection
-        // path instead would report None (that payload carries no version), so we
-        // require any captured version to match and at least one side to capture it.
+        // path instead reports None here, because both mock peers run this build
+        // and this build is below `GATEWAY_ACK_VERSION_MIN_VERSION` — so we
+        // require any captured version to match and at least one side to capture
+        // it. `nat_traversal_ack_racer_learns_version_from_the_ack` is the test
+        // that forces that race deliberately, with the floor overridden, and
+        // shows the ack now carries a version for the racing side (#5161).
         for v in [a_version, b_version].into_iter().flatten() {
             assert_eq!(v, expected_version);
         }
@@ -3547,7 +3802,10 @@ pub mod mock_transport {
         let peer_a = GlobalExecutor::spawn(async move {
             let peer_b_conn = peer_a.connect(gw_pub, gw_addr).await;
             let conn = tokio::time::timeout(Duration::from_secs(60), peer_b_conn).await??;
-            // Joiner->gateway side: the gateway's AckConnection payload carries no version.
+            // Joiner->gateway side: the gateway now tells us its version in the
+            // ack (#5161), gated on ours. Same build here, and the sim/test
+            // default floor is unreachable-high only when explicitly set — this
+            // constructor leaves the production floor in place.
             Ok::<_, anyhow::Error>(conn.remote_version())
         });
 
@@ -3557,9 +3815,202 @@ pub mod mock_transport {
             Some(expected_version),
             "gateway should capture the joiner's protocol version"
         );
+        // Both mock peers run this build, so whether the joiner learns the
+        // gateway's version here depends purely on whether this build is at or
+        // above the production floor. Asserting a bare `None` would make this
+        // test flip at the 0.2.120 release.
+        //
+        // The expectation is derived by comparing the crate version against the
+        // floor DIRECTLY, not via `version_supports_ack_version` — that is the
+        // predicate under test, and computing the expectation with it makes the
+        // assertion tautological. It was written that way first, and a
+        // reviewer's mutation showed that the catastrophic regression (a gateway
+        // emitting V2 to EVERY peer regardless of version, breaking every
+        // pre-0.2.120 joiner's handshake) left the test green.
+        let joiner_view = joiner_view?;
+        let crate_at_or_above_floor =
+            expected_version >= version_cmp::GATEWAY_ACK_VERSION_MIN_VERSION;
         assert_eq!(
-            joiner_view?, None,
-            "joiner->gateway connection has no remote version (AckConnection carries none)"
+            joiner_view.is_some(),
+            crate_at_or_above_floor,
+            "joiner's view of the gateway version must follow the production floor exactly"
+        );
+        Ok(())
+    }
+
+    /// **The peer-to-peer half of #5161.** The version-carrying ack is not only
+    /// a gateway mechanism: `traverse_nat`'s `RemoteInbound` arm sends an ack
+    /// too, and the peer receiving it may have raced ahead to its own
+    /// `AckConnection` arm without ever parsing our intro. On that link the ack
+    /// is the ONLY channel through which a version can travel.
+    ///
+    /// Forcing the race is the whole difficulty, and is why this drops peer B's
+    /// first packet. Without the drop both peers parse each other's intro on the
+    /// `StartOutbound` path and learn versions the old way, so the assertion
+    /// holds with or without the fix — the first version of this test did
+    /// exactly that and a mutation confirmed it was vacuous. With B's intro
+    /// dropped, A never parses one, stays in `StartOutbound`, and receives B's
+    /// ack instead: precisely the arm that used to yield `None`.
+    ///
+    /// The pre-existing `simulate_nat_traversal` cannot cover this either — it
+    /// requires only that AT LEAST ONE side captured a version, precisely
+    /// because the loser of the race captured nothing.
+    #[tokio::test]
+    async fn nat_traversal_ack_racer_learns_version_from_the_ack() -> anyhow::Result<()> {
+        // A floor every build clears, so this does not move with the crate
+        // version.
+        const REACHABLE_FLOOR: (u8, u8, u16) = (0, 0, 0);
+
+        let channels = Arc::new(DashMap::new());
+        let (peer_a_pub, mut peer_a, peer_a_addr) = create_mock_peer_with_ack_floor(
+            PacketDropPolicy::ReceiveAll,
+            channels.clone(),
+            Some(REACHABLE_FLOOR),
+        )
+        .await?;
+        // Drop B's first outbound packet — its intro — so A cannot learn B's
+        // version by parsing one.
+        let (peer_b_pub, mut peer_b, peer_b_addr) = create_mock_peer_with_ack_floor(
+            PacketDropPolicy::Ranges(vec![0..1]),
+            channels,
+            Some(REACHABLE_FLOOR),
+        )
+        .await?;
+
+        let expected_version = version_cmp::parse_version_bytes(&PROTOC_VERSION).version;
+
+        let peer_b = GlobalExecutor::spawn(async move {
+            let conn = tokio::time::timeout(
+                Duration::from_secs(500),
+                peer_b.connect(peer_a_pub, peer_a_addr).await,
+            )
+            .await??;
+            Ok::<_, anyhow::Error>(conn.remote_version())
+        });
+
+        let peer_a = GlobalExecutor::spawn(async move {
+            let conn = tokio::time::timeout(
+                Duration::from_secs(500),
+                peer_a.connect(peer_b_pub, peer_b_addr).await,
+            )
+            .await??;
+            Ok::<_, anyhow::Error>(conn.remote_version())
+        });
+
+        let (a_version, b_version) = tokio::try_join!(peer_a, peer_b)?;
+        assert_eq!(
+            a_version?,
+            Some(expected_version),
+            "peer A never saw peer B's intro, so B's ack is the only place A \
+             could have learned B's version — before #5161 this was None"
+        );
+        assert_eq!(
+            b_version?,
+            Some(expected_version),
+            "peer B parsed A's intro and should be unaffected"
+        );
+        Ok(())
+    }
+
+    /// **#5161, the fix.** A joiner at or above the floor learns the gateway's
+    /// protocol version from the ack — the whole point of the issue, since the
+    /// joiner never parses an intro packet from a gateway and previously had no
+    /// other channel for it.
+    #[tokio::test]
+    async fn joiner_learns_gateway_version_when_at_or_above_the_floor() -> anyhow::Result<()> {
+        // A floor every build clears, so the assertion does not move with the
+        // crate version.
+        const REACHABLE_FLOOR: (u8, u8, u16) = (0, 0, 0);
+
+        let channels = Arc::new(DashMap::new());
+        let (_peer_a_pub, mut peer_a, _peer_a_addr) =
+            create_mock_peer(Default::default(), channels.clone()).await?;
+        let (gw_pub, (_oc, mut gw_conn), gw_addr) =
+            create_mock_gateway_with_ack_floor(channels, Some(REACHABLE_FLOOR)).await?;
+
+        let expected_version = version_cmp::parse_version_bytes(&PROTOC_VERSION).version;
+
+        let gw = GlobalExecutor::spawn(async move {
+            let gw = tokio::time::timeout(Duration::from_secs(10), gw_conn.recv())
+                .await?
+                .ok_or(anyhow::anyhow!("no connection"))?;
+            Ok::<_, anyhow::Error>(gw.remote_version())
+        });
+
+        let peer_a = GlobalExecutor::spawn(async move {
+            let conn = tokio::time::timeout(
+                Duration::from_secs(60),
+                peer_a.connect(gw_pub, gw_addr).await,
+            )
+            .await??;
+            Ok::<_, anyhow::Error>(conn.remote_version())
+        });
+
+        let (joiner_view, gw_view) = tokio::try_join!(peer_a, gw)?;
+        assert_eq!(
+            joiner_view?,
+            Some(expected_version),
+            "the joiner MUST record the gateway's version from AckConnectionV2 — \
+             without it every version-gated wire feature fails closed on gateway links"
+        );
+        assert_eq!(
+            gw_view?,
+            Some(expected_version),
+            "the gateway still learns the joiner's version from its intro packet"
+        );
+        Ok(())
+    }
+
+    /// **#5161, the compatibility guarantee.** A gateway must NOT emit
+    /// `AckConnectionV2` to a joiner below the floor: such a peer does not carry
+    /// the variant index, cannot deserialize the ack, and would fail to complete
+    /// the handshake at all.
+    ///
+    /// Simulated by raising the gateway's floor out of reach, which puts the
+    /// same-build joiner below it. The joiner still connects (proving the legacy
+    /// path is intact end to end) and learns nothing — exactly today's
+    /// behaviour. The byte-level half of this guarantee is
+    /// `symmetric_message::test::ack_ok_produces_identical_bytes_to_pre_5161_encoding`.
+    #[tokio::test]
+    async fn pre_floor_joiner_gets_the_legacy_ack_and_still_connects() -> anyhow::Result<()> {
+        // Unreachable by any real build, so the same-build joiner is "pre-floor".
+        const UNREACHABLE_FLOOR: (u8, u8, u16) = (255, 255, 65535);
+
+        let channels = Arc::new(DashMap::new());
+        let (_peer_a_pub, mut peer_a, _peer_a_addr) =
+            create_mock_peer(Default::default(), channels.clone()).await?;
+        let (gw_pub, (_oc, mut gw_conn), gw_addr) =
+            create_mock_gateway_with_ack_floor(channels, Some(UNREACHABLE_FLOOR)).await?;
+
+        let gw = GlobalExecutor::spawn(async move {
+            let gw = tokio::time::timeout(Duration::from_secs(10), gw_conn.recv())
+                .await?
+                .ok_or(anyhow::anyhow!("no connection"))?;
+            Ok::<_, anyhow::Error>(gw.remote_version())
+        });
+
+        let peer_a = GlobalExecutor::spawn(async move {
+            let conn = tokio::time::timeout(
+                Duration::from_secs(60),
+                peer_a.connect(gw_pub, gw_addr).await,
+            )
+            .await??;
+            Ok::<_, anyhow::Error>((conn.remote_version(), conn.remote_addr()))
+        });
+
+        let (joiner_view, gw_view) = tokio::try_join!(peer_a, gw)?;
+        let (joiner_remote_version, joiner_remote_addr) = joiner_view?;
+        assert_eq!(
+            joiner_remote_addr, gw_addr,
+            "the pre-floor handshake must still COMPLETE — the legacy ack path is intact"
+        );
+        assert_eq!(
+            joiner_remote_version, None,
+            "a pre-floor joiner must be told nothing: it cannot decode AckConnectionV2"
+        );
+        assert!(
+            gw_view?.is_some(),
+            "the gateway's own view is unaffected by the gate"
         );
         Ok(())
     }

@@ -99,6 +99,26 @@ impl TransportKeypair {
     }
 }
 
+impl TransportKeypair {
+    /// XEdDSA signer for authenticating this node out-of-band (the OTel
+    /// collector bearer token — `tracing::otel::bearer_token`).
+    ///
+    /// XEdDSA (Signal's construction) signs with the x25519 transport secret
+    /// itself, so signatures verify against the SAME public key peers and
+    /// UIs already know: the verifier converts the Montgomery public key to
+    /// Edwards (sign bit 0) and runs stock Ed25519 verification. No second
+    /// identity, nothing to cross-certify.
+    pub(crate) fn auth_token_signer(&self) -> xeddsa::xed25519::PrivateKey {
+        xeddsa::xed25519::PrivateKey::from(self.secret.0.as_bytes())
+    }
+
+    /// The full 32-byte public key, e.g. for the base58 identity the OTel
+    /// exporter publishes (`Display` is a truncated fingerprint).
+    pub(crate) fn public_key_bytes(&self) -> [u8; 32] {
+        *self.public.0.as_bytes()
+    }
+}
+
 impl Default for TransportKeypair {
     fn default() -> Self {
         Self::new()

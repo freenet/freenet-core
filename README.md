@@ -7,8 +7,8 @@
     <img src="https://img.shields.io/crates/v/freenet.svg?style=flat-square"
     alt="Crates.io version" />
   </a>
-  <a href="https://matrix.to/#/#freenet:matrix.org">
-    <img src="https://img.shields.io/matrix/freenet:matrix.org?label=matrix&logo=matrix&style=flat-square" alt="matrix" />
+  <a href="https://matrix.to/#/#freenet-locutus:matrix.org">
+    <img src="https://img.shields.io/matrix/freenet-locutus:matrix.org?label=matrix&logo=matrix&style=flat-square" alt="matrix" />
   </a>
   <a href="https://docs.rs/freenet">
     <img src="https://img.shields.io/badge/docs-latest-blue.svg?style=flat-square&label=api%20docs"
@@ -41,13 +41,6 @@ routing, and the delegate model for private state — see the
 Source: [github.com/freenet/paper-1](https://github.com/freenet/paper-1).
 
 ## Build Instructions
-
-Before installing anything you need to run the following in the repository,
-or the commands will fail:
-
-```bash
-$ git submodule update --init --recursive
-```
 
 To install the Freenet core:
 

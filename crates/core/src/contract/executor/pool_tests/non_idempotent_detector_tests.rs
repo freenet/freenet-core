@@ -53,6 +53,14 @@ fn make_mock_runtime(override_: UpdateOverride) -> MockWasmRuntime {
         contract_store: InMemoryContractStore::default(),
         validate_overrides: HashMap::new(),
         update_overrides: overrides,
+        delegate_script: Default::default(),
+        delegate_calls: Default::default(),
+        delegate_contexts: Default::default(),
+        delegate_observations: Default::default(),
+        capabilities: None,
+        delegate_codes: Default::default(),
+        unregistered_delegates: Default::default(),
+        delegate_wrong_variant: Default::default(),
     }
 }
 
@@ -213,8 +221,10 @@ fn egress_paths_gated_on_is_contract_broken() {
     let heal_gate = body
         .find("is_contract_broken")
         .expect("handle_sync_state_to_peer must gate on is_contract_broken");
+    // Anchor on the method, not `broadcast_queue.enqueue`: rustfmt breaks the
+    // receiver onto its own line once the argument list grows.
     let heal_send = body
-        .find("broadcast_queue.enqueue")
+        .find(".enqueue(")
         .expect("handle_sync_state_to_peer must still enqueue the heal send");
     assert!(
         heal_gate < heal_send,
@@ -234,6 +244,14 @@ fn healthy_mock_is_idempotent_on_reapply() {
         contract_store: InMemoryContractStore::default(),
         validate_overrides: HashMap::new(),
         update_overrides: HashMap::new(),
+        delegate_script: Default::default(),
+        delegate_calls: Default::default(),
+        delegate_contexts: Default::default(),
+        delegate_observations: Default::default(),
+        capabilities: None,
+        delegate_codes: Default::default(),
+        unregistered_delegates: Default::default(),
+        delegate_wrong_variant: Default::default(),
     };
     let key = fake_key();
     let params = Parameters::from(vec![]);

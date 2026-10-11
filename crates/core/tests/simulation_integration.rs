@@ -23,8 +23,8 @@ use freenet::dev_tool::{
 };
 use freenet::simulation::TimeSource;
 use freenet::transport::in_memory_socket::{
-    SimulationSocket, clear_all_socket_registries, register_address_network,
-    register_network_time_source,
+    SimulationSocket, register_address_network, register_network_time_source,
+    remove_network_socket_registry,
 };
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
@@ -313,8 +313,10 @@ impl TestConfig {
             }
 
             let logs_handle = sim.event_logs_handle();
-            (sim, logs_handle)
+            let final_states = sim.final_state_handle();
+            (sim, (logs_handle, final_states))
         });
+        let (logs_handle, final_states) = logs_handle;
 
         let sleep_duration = self.sleep_after_events;
         let event_wait = self.event_wait;
@@ -330,7 +332,14 @@ impl TestConfig {
             },
         );
 
-        let convergence = rt.block_on(async { check_convergence_from_logs(&logs_handle).await });
+        // Read each peer's state from its store at the end of the run, not from
+        // its last logged hash: a peer that originated the run's last write to
+        // a contract never logs a hash for its own commit, so the log-only
+        // check reported phantom divergences on ~1 seed in 8 (#5172).
+        let convergence = rt.block_on(async {
+            freenet::dev_tool::check_convergence_from_logs_and_state(&logs_handle, &final_states)
+                .await
+        });
         let event_count = rt.block_on(async { logs_handle.lock().await.len() });
 
         TestResult {
@@ -1269,6 +1278,100 @@ fn ci_quick_simulation() {
         .verify_state_report();
 }
 
+/// Forces the #5795 receive-side NoOp gate on for connections created on this
+/// thread while alive (simulated peers all report the pre-floor crate version,
+/// so without this every sim runs with the gate OFF).
+struct ForceNoopGate {
+    connections_before: u64,
+}
+
+impl ForceNoopGate {
+    fn on() -> Self {
+        freenet::config::SimulationForceNoopGate::enable();
+        Self {
+            connections_before: freenet::config::SimulationForceNoopGate::forced_connection_count(),
+        }
+    }
+
+    /// Fail if no connection was actually created with the gate forced.
+    fn assert_applied(&self) {
+        let now = freenet::config::SimulationForceNoopGate::forced_connection_count();
+        assert!(
+            now > self.connections_before,
+            "the forced NoOp gate never reached a PeerConnection; the test would be vacuous"
+        );
+    }
+}
+
+impl Drop for ForceNoopGate {
+    fn drop(&mut self) {
+        freenet::config::SimulationForceNoopGate::disable();
+    }
+}
+
+/// `ci_quick_simulation` with the #5795 NoOp gate ON (every peer treated as
+/// >= 0.2.142): operations complete and contracts converge.
+#[test_log::test]
+fn test_noop_gate_on_quick_simulation_converges() {
+    let gate = ForceNoopGate::on();
+    TestConfig::small("noop-gate-quick", 0xC1F1_ED5E_ED00)
+        .with_nodes(4)
+        .with_max_contracts(5)
+        .with_iterations(50)
+        .with_duration(Duration::from_secs(45))
+        .with_sleep(Duration::from_secs(2))
+        .run()
+        .assert_ok()
+        .verify_operation_coverage()
+        .check_convergence()
+        .verify_state_report();
+    gate.assert_applied();
+}
+
+/// `ci_medium_simulation` with the #5795 NoOp gate ON.
+#[test_log::test]
+fn test_noop_gate_on_medium_simulation_converges() {
+    let gate = ForceNoopGate::on();
+    TestConfig::medium("noop-gate-medium", 0xC1F1_ED7E_ED01)
+        .run()
+        .assert_ok()
+        .verify_operation_coverage()
+        .check_convergence()
+        .verify_state_report();
+    gate.assert_applied();
+}
+
+/// Gate ON under 15% simulated packet loss: the simulation completes and
+/// operations still route (no connection teardown storm from lost acks).
+#[test_log::test]
+fn test_noop_gate_on_lossy_simulation_completes() {
+    let gate = ForceNoopGate::on();
+    let result = TestConfig::small("noop-gate-lossy", 0xFA17_0055_0001)
+        .with_nodes(4)
+        .with_max_contracts(5)
+        .with_iterations(60)
+        .with_duration(Duration::from_secs(60))
+        .with_sleep(Duration::from_secs(2))
+        .with_message_loss(0.15)
+        .run()
+        .assert_ok();
+    gate.assert_applied();
+    let rt = create_runtime();
+    let routes = rt.block_on(async {
+        result
+            .logs_handle
+            .lock()
+            .await
+            .iter()
+            .filter(|log| log.kind.variant_name() == "Route")
+            .count()
+    });
+    assert!(
+        routes > 0,
+        "operations must still route with the gate on under loss"
+    );
+}
+
 /// CI simulation test - medium network with more operations.
 #[test_log::test]
 fn ci_medium_simulation() {
@@ -1587,10 +1690,12 @@ fn test_high_latency_timeout_regression() {
 /// This verifies that the real in-memory socket works with Turmoil's deterministic scheduler.
 #[test]
 fn test_turmoil_with_real_simulation_socket() -> turmoil::Result {
-    // Clean up any previous socket state
-    clear_all_socket_registries();
-
     let network_name = "turmoil-test";
+
+    // Clean up any previous socket state for THIS network only. Clearing every
+    // registry would wipe the sockets of simulations running concurrently in
+    // the same process under plain `cargo test` (#5673).
+    remove_network_socket_registry(network_name);
     let virtual_time = VirtualTime::new();
 
     // Register the network's time source
@@ -2179,29 +2284,45 @@ fn test_full_state_send_no_incorrect_caching() {
         convergence.diverged.len()
     );
 
-    // SECONDARY ASSERTION: No ResyncRequests should be needed
-    // With correct summary caching (PR #2763), deltas should work correctly
-    // Without the fix, peers would fail to apply deltas and send ResyncRequests
+    // SECONDARY ASSERTION: no delta may FAIL TO APPLY.
+    // With correct summary caching (PR #2763), deltas apply cleanly; without
+    // it, peers fail to apply them and send ResyncRequests.
+    //
+    // #5510 made this assertion specific rather than total. It used to assert
+    // `resync_requests() == 0`, using "no resyncs at all" as a proxy for "no
+    // delta failed". That proxy held only while a delta failure was the ONLY
+    // thing that emitted a ResyncRequest. It no longer is: a queue-full drop
+    // and a rate-limited broadcast drop both emit one too (and #5525 adds a
+    // third, the trailing coalesced repair), all of them healthy behaviour.
+    // This test began failing on
+    // exactly that — `delta_sends: 0, full_state_sends: 11, resync_requests: 1`
+    // with everything converged — where the single resync was a broadcast
+    // repair and no delta had failed at all.
+    //
+    // `delta_failure_resyncs()` is counted at the branch that makes the
+    // decision (the `is_delta && !queue_full` arm of the broadcast driver),
+    // not derived by subtracting other causes from the total, so it cannot
+    // silently absorb a future cause the way the old proxy did.
     let resync_count = GlobalTestMetrics::resync_requests();
+    let delta_failure_resyncs = GlobalTestMetrics::delta_failure_resyncs();
     let delta_sends = GlobalTestMetrics::delta_sends();
     let full_state_sends = GlobalTestMetrics::full_state_sends();
 
     tracing::info!(
-        "Broadcast stats - delta_sends: {}, full_state_sends: {}, resync_requests: {}",
+        "Broadcast stats - delta_sends: {}, full_state_sends: {}, \
+         resync_requests: {} (of which delta-failure: {})",
         delta_sends,
         full_state_sends,
-        resync_count
+        resync_count,
+        delta_failure_resyncs
     );
 
-    // Note: Some resyncs may occur during normal operation (e.g., initial state sync),
-    // but excessive resyncs indicate the caching bug. We check for zero resyncs in this
-    // controlled scenario where all peers start fresh and updates flow correctly.
     assert_eq!(
-        resync_count, 0,
-        "PR #2763 REGRESSION: {} ResyncRequests detected! \
-         This indicates deltas are failing due to incorrect summary caching. \
-         With the fix, no resyncs should be needed in this scenario.",
-        resync_count
+        delta_failure_resyncs, 0,
+        "PR #2763 REGRESSION: {delta_failure_resyncs} ResyncRequest(s) were \
+         emitted because a DELTA FAILED TO APPLY, which is what incorrect \
+         summary caching looks like. ({resync_count} resyncs in total; the \
+         others, if any, are broadcast-drop repairs and are not this bug.)"
     );
 
     // TERTIARY ASSERTION: Verify broadcast activity
@@ -3389,6 +3510,231 @@ fn test_sustained_update_fanout_no_full_state_storm() {
          delta_sends={} > full_state_sends={}, converged, no stale peers",
         delta_sends,
         full_state_sends,
+    );
+}
+
+/// #4965 sibling of the star test above, on a topology where the co-host
+/// exclusion is not a no-op.
+///
+/// ## Why the star test cannot catch a regression here
+///
+/// `test_sustained_update_fanout_no_full_state_storm` is 1 gateway + 2 DIRECT
+/// subscribers. Each subscriber's only advertised co-host is the gateway — and
+/// the gateway is the update's sender, so it was ALREADY excluded from the
+/// proactive summary notification long before #4965. In that topology the new
+/// exclusion removes nobody. Any regression in it is structurally invisible
+/// there, no matter how many updates the test drives.
+///
+/// ## The topology this needs
+///
+/// 1 gateway + 3 peers, ALL subscribed, with `max_connections` wide enough for
+/// the peers to connect to each other as well as to the gateway. Every peer
+/// then hosts the contract and announces it (`HostingAnnounce`), so each peer's
+/// advertised co-host set contains the OTHER PEERS, not just the sender. When
+/// a peer applies a relayed broadcast and fires its proactive notification, the
+/// #4965 exclusion now drops real recipients — which is exactly the thing under
+/// test.
+///
+/// ## The general rule this test exists to illustrate
+///
+/// **`delta_sends`/`full_state_sends` cannot see a redundancy being removed —
+/// only a redundancy being removed *badly*.**
+///
+/// That generalises, and it is worth recognising BEFORE writing the test rather
+/// than after: **when a change removes redundancy, every downstream health
+/// metric is invariant by design.** That invariance IS the change's thesis. So
+/// health metrics can never discriminate such a change; only a counter of the
+/// removed thing can.
+///
+/// This is unusually easy to miss, because measuring a redundancy-removal with
+/// downstream health metrics yields a vacuous test AND a confirmation that the
+/// change was correct, simultaneously — the green run looks like evidence for
+/// the change when it is evidence of nothing. Anyone facing this shape should
+/// reach for a counter of the removed thing first.
+///
+/// ## The two assertions do DIFFERENT jobs — measured, not assumed
+///
+/// **`notification_cohosts_skipped > 0` is the sensitivity assertion.** It is
+/// the only signal here that responds to the change at all.
+///
+/// **`delta_sends > full_state_sends` is a safety assertion, NOT a
+/// discriminator, and the numbers say so.** A peer's broadcast to a neighbor is
+/// a delta only while it holds a cached summary for that neighbor; the
+/// standalone `Summaries` notification and the broadcast's own
+/// `sender_summary_bytes` both seed that cache, and #4965 removes the first for
+/// co-hosts on the claim that the second already covers them. The claim holds,
+/// so removing the redundant path changes nothing downstream: reverting the
+/// exclusion on this exact scenario produced **bit-identical** `delta_sends=140
+/// / full_state_sends=6`. That is the change being harmless, which is worth
+/// pinning — but a test resting on it alone would pass whether or not the
+/// feature existed.
+///
+/// So the delta-dominance assertion stays (it catches an over-exclusion that
+/// DID strand peers, which would show up as full-state fallback), and the
+/// skipped-count assertion is what makes the test fail when the exclusion is
+/// removed.
+///
+/// ## Premise checks (without these both assertions are vacuous)
+///
+/// - `neighbor_hosting_updates() > 0`: the peers really exchanged hosting
+///   advertisements. If they never did, no peer has any advertised co-host,
+///   the exclusion removes nobody, and the test degenerates into the star case
+///   it exists to improve on.
+/// - `delta_sends + full_state_sends > 0`: broadcasts actually happened.
+#[test_log::test]
+fn test_cohost_mesh_update_fanout_stays_delta_dominated() {
+    use freenet::dev_tool::{NodeLabel, ScheduledOperation, SimOperation, register_crdt_contract};
+
+    const SEED: u64 = 0x4965_0001_0001;
+    const NETWORK_NAME: &str = "i4965-cohost-mesh";
+    // Three peers so each has TWO non-sender co-hosts; with two, a peer's only
+    // co-host besides the sender is the single other peer, which makes the
+    // exclusion much thinner.
+    const PEERS: usize = 3;
+    const SUSTAINED_UPDATES: usize = 20;
+
+    GlobalTestMetrics::reset();
+    setup_deterministic_state(SEED);
+    let rt = create_runtime();
+
+    let (sim, logs_handle) = rt.block_on(async {
+        let sim = SimNetwork::new(
+            NETWORK_NAME,
+            1,     // 1 gateway (the update source)
+            PEERS, // peers that all subscribe AND co-host
+            7,     // max_htl
+            3,     // rnd_if_htl_above
+            // Wide enough that the peers connect to EACH OTHER, not just to the
+            // gateway. This is the whole point: at a narrower cap a pure star
+            // forms and every peer's only co-host is the sender, reproducing the
+            // blind spot this test exists to cover.
+            10, // max_connections
+            2,  // min_connections
+            SEED,
+        )
+        .await;
+        let logs_handle = sim.event_logs_handle();
+        (sim, logs_handle)
+    });
+
+    // CRDT contract so post-bootstrap broadcasts compute real version-aware
+    // deltas — a plain hash contract's "delta" is full state, which would make
+    // the delta/full crossover meaningless.
+    let contract = SimOperation::create_test_contract(0x49);
+    let contract_id = *contract.key().id();
+    let contract_key = contract.key();
+    register_crdt_contract(contract_id);
+
+    let initial_state = SimOperation::create_crdt_state(1, 0x10);
+    let mut operations = Vec::new();
+
+    operations.push(ScheduledOperation::new(
+        NodeLabel::gateway(NETWORK_NAME, 0),
+        SimOperation::Put {
+            contract: contract.clone(),
+            state: initial_state,
+            subscribe: true,
+        },
+    ));
+    for node_idx in 1..=PEERS {
+        operations.push(ScheduledOperation::new(
+            NodeLabel::node(NETWORK_NAME, node_idx),
+            SimOperation::Subscribe { contract_id },
+        ));
+    }
+
+    for v in 0..SUSTAINED_UPDATES {
+        let version = (v as u64) + 2;
+        operations.push(ScheduledOperation::new(
+            NodeLabel::gateway(NETWORK_NAME, 0),
+            SimOperation::Update {
+                key: contract_key,
+                data: SimOperation::create_crdt_state(version, 0x20 + v as u8),
+            },
+        ));
+    }
+
+    let result = sim.run_controlled_simulation(
+        SEED,
+        operations,
+        Duration::from_secs(240),
+        Duration::from_secs(90),
+    );
+    assert!(
+        result.turmoil_result.is_ok(),
+        "Simulation should complete: {:?}",
+        result.turmoil_result.err()
+    );
+
+    let convergence =
+        rt.block_on(async { freenet::dev_tool::check_convergence_from_logs(&logs_handle).await });
+    let delta_sends = GlobalTestMetrics::delta_sends();
+    let full_state_sends = GlobalTestMetrics::full_state_sends();
+    let hosting_updates = GlobalTestMetrics::neighbor_hosting_updates();
+    let cohosts_skipped = GlobalTestMetrics::notification_cohosts_skipped();
+
+    tracing::info!(
+        "i4965 cohost mesh: delta_sends={}, full_state_sends={}, \
+         neighbor_hosting_updates={}, cohosts_skipped={}, converged={}/{}",
+        delta_sends,
+        full_state_sends,
+        hosting_updates,
+        cohosts_skipped,
+        convergence.converged.len(),
+        convergence.total_contracts(),
+    );
+
+    // PREMISE 1: the peers really registered as each other's co-hosts. Without
+    // this the #4965 exclusion drops nobody and the assertion below is vacuous
+    // — the exact defect that makes the star test unable to guard this change.
+    assert!(
+        hosting_updates > 0,
+        "premise: no hosting advertisements were exchanged, so no peer has an \
+         advertised co-host and the #4965 exclusion is a no-op here. This test \
+         would then prove nothing about the change it guards."
+    );
+
+    // PREMISE 2: broadcasts actually happened.
+    assert!(
+        delta_sends + full_state_sends > 0,
+        "premise: no broadcasts were recorded — the fan-out scenario did not run"
+    );
+
+    // THE DISCRIMINATOR — the assertion that fails when #4965 is reverted.
+    //
+    // Verified by mutation, not assumed: with the co-host filter removed from
+    // `proactive_summary_targets`, this drops to 0 while delta_sends and
+    // full_state_sends stay bit-identical at 140/6. It is the ONLY metric here
+    // that responds to the change.
+    assert!(
+        cohosts_skipped > 0,
+        "#4965 is not doing anything on a topology built specifically to \
+         exercise it: {hosting_updates} hosting advertisements were exchanged, \
+         so peers ARE advertised co-hosts of each other, yet zero recipients \
+         were skipped. Either the exclusion was removed, or it is reading a \
+         co-host set that never matches the notification's recipients."
+    );
+
+    // SAFETY, not a discriminator (see this test's docs): reverting the
+    // exclusion leaves these two numbers unchanged, so this assertion cannot
+    // tell the change apart. It is here to catch the DAMAGING failure — an
+    // over-exclusion that strands peers, which surfaces as full-state fallback.
+    assert!(
+        delta_sends > full_state_sends,
+        "#4965 REGRESSION: co-hosting peers stopped seeding each other's \
+         summaries, so broadcasts fell back to full state: \
+         delta_sends={delta_sends} <= full_state_sends={full_state_sends}. \
+         Either the notification exclusion drops peers the broadcast does NOT \
+         cover, or the broadcast that was supposed to carry \
+         `sender_summary_bytes` never ran for them."
+    );
+
+    assert!(
+        convergence.is_converged(),
+        "#4965: peers failed to converge under sustained fan-out. \
+         {} converged, {} diverged",
+        convergence.converged.len(),
+        convergence.diverged.len(),
     );
 }
 
@@ -6972,32 +7318,72 @@ fn test_interest_renewal() {
 ///
 /// ## Test Design
 ///
-/// Uses a minimal network (1 gateway + 2 nodes) with few contracts to
-/// isolate the TTL refresh mechanism. Virtual time spans ~1.5x INTEREST_TTL
-/// (1800s) so that without the broadcast-send TTL refresh, interest entries
-/// would expire and late-phase broadcasts would stop arriving.
+/// Asserts that a quiet fan-out is quiet because peers are CONVERGED, not
+/// because their subscriptions silently died.
 ///
-/// The test splits broadcast-received events into three phases:
-/// - **Early** (first third): baseline broadcast delivery
-/// - **Mid** (second third): crosses the TTL boundary (~1200s)
-/// - **Late** (final third): must still receive broadcasts if TTL was refreshed
+/// ## Why this does NOT count broadcasts
 ///
-/// ## What This Catches
+/// It used to assert `late_broadcasts > 0`, using broadcast VOLUME as a proxy
+/// for interest liveness. That proxy is invalid: suppressing redundant sends to
+/// converged peers is the intended bandwidth win, so volume moves in the SAME
+/// direction as the improvement and cannot discriminate "interest expired"
+/// (the bug) from "peers converged, nothing to send" (the fix working). Once
+/// subscribe renewals stopped wiping the cached delta-sync summary, the
+/// converged-skip became reachable and late-phase volume legitimately went to
+/// zero — the assertion failed on a healthy network.
 ///
-/// - Missing `refresh_peer_interest()` call in broadcast send path (p2p_protoc.rs)
-/// - TTL expiration causing silent subscriber loss
-/// - Regression of the #3093 fix
+/// It therefore asserts the property directly, via the #3046
+/// `BroadcastDeliverySummary` counters, which separate the three reasons a peer
+/// receives nothing: skipped as converged, unresolvable interest, or failed
+/// send. `send_failed == 0` and `interest_resolve_failed == 0` say nothing was
+/// lost; `skipped_summary_match > 0` says peers still held matching cached
+/// summaries; ground-truth convergence with zero diverged contracts says the
+/// skips were correct.
+///
+/// ## What this does NOT cover: #3093
+///
+/// This test cannot detect a missing broadcast-path TTL refresh, and no
+/// assertion here could. `INTEREST_TTL` is DEFINED as four heartbeats
+/// (`ring/interest.rs`: `INTEREST_TTL = INTEREST_HEARTBEAT_INTERVAL * 4`), so
+/// wherever the ~5-minute InterestSync exchange covers a (contract, peer) pair
+/// it refreshes that entry four times per TTL window and the broadcast-path
+/// refresh is not what keeps it alive. Reverting BOTH refreshes (production
+/// `broadcast_queue.rs` and the sim-only `p2p_protoc/broadcast.rs`) leaves every
+/// counter in this scenario byte-identical.
+///
+/// #3093 is carried instead by:
+/// - `broadcast_to_single_peer_refreshes_interest_on_every_skip_pin`
+///   (`broadcast_queue.rs`) and
+///   `broadcast_state_to_peers_uses_semantic_delta_skip` (`p2p_protoc.rs`),
+///   which fail immediately on either revert; and
+/// - the `InterestManager` TTL unit tests in `ring/interest.rs`, which drive
+///   expiry directly against a mock `TimeSource`.
+///
+/// ## Scope: this is a correctness check, not a regression gate
+///
+/// Measured, not assumed: reverting the #5055 renewal guards moves the numbers
+/// (sent 60 -> 108, received 127 -> 218) but does NOT trip any assertion here —
+/// `skipped_summary_match` only falls 256 -> 208, so it stays positive. Every
+/// assertion below states a property that must hold on a healthy network
+/// (nothing lost, interests resolvable, replicas agreed, skip reachable); none
+/// is a tripwire for a specific regression, and a threshold tuned to make one
+/// would be a magic number that flakes with scenario drift.
+///
+/// The regressions are gated by mutation-proven source pins instead:
+/// `subscribe_finalizers_do_not_clobber_cached_summaries` and
+/// `get_interest_registration_does_not_clobber_or_downgrade` (`ring/interest.rs`)
+/// for the renewal clobber, and the two broadcast pins above for #3093.
+///
+/// Do not "restore" a broadcast-count assertion here: it would fail on a
+/// healthy converged network and still not detect an expired interest.
 ///
 /// ## Related
 ///
-/// - Issue #3093: Interest TTL not refreshed on full-state broadcast
-/// - Issue #3107: Add isolated integration test (this test)
-/// - Issue #3141: CI & Testing Redesign
-/// - `test_interest_renewal`: Scale test covering the same mechanism
+/// - #3093 / #3107: the original TTL-refresh regression and this test
+/// - #5055: the renewal clobber, and why the volume proxy stopped working
 ///
-/// Uses `run_direct()` (paused-time single-thread runtime) for efficiency.
-/// Virtual time: 300 iterations × 6s = 1800s (~1.5× INTEREST_TTL).
-/// Wall clock: typically < 15s.
+/// Uses `run_direct()` (paused-time single-thread runtime). Virtual time:
+/// 300 iterations x 6s = 1800s (~1.5x INTEREST_TTL). Wall clock: < 15s.
 #[test_log::test]
 fn test_interest_ttl_refresh_on_broadcast() {
     const SEED: u64 = 0x3107_0BCA_0001;
@@ -7015,93 +7401,105 @@ fn test_interest_ttl_refresh_on_broadcast() {
         .run_direct()
         .assert_ok();
 
-    // Analyze broadcast-received events across three phases of virtual time.
-    // The TTL boundary is at ~1200s (INTEREST_TTL). If refresh is working,
-    // broadcasts should continue in the late phase (1200s-1800s).
-    let rt = create_runtime();
-    let (early_broadcasts, mid_broadcasts, late_broadcasts) = rt.block_on(async {
-        let logs = result.logs_handle.lock().await;
-        let log_count = logs.len();
-        let third = log_count / 3;
+    // Ground truth first: every replica agreed at the end of the run. This is
+    // what makes a quiet fan-out attributable to convergence rather than to
+    // lost delivery — "no broadcasts" plus "states agree" is the bandwidth win;
+    // "no broadcasts" plus divergence would be the bug.
+    assert!(
+        result.convergence.diverged.is_empty(),
+        "contracts diverged, so a quiet fan-out cannot be attributed to \
+         convergence: {:?}. Seed: 0x{:X}",
+        result.convergence.diverged,
+        SEED
+    );
 
-        let mut early = 0usize;
-        let mut mid = 0usize;
-        let mut late = 0usize;
-        for (i, log) in logs.iter().enumerate() {
+    // Read the #3046 delivery breakdown, which distinguishes the three reasons
+    // a peer got nothing: we skipped it (converged), we never resolved it
+    // (interest gone), or the send failed. Broadcast COUNTS cannot tell those
+    // apart; these counters are the whole point of the event.
+    fn field(dbg: &str, name: &str) -> Option<usize> {
+        let pat = format!("{name}: ");
+        let i = dbg.find(&pat)? + pat.len();
+        let rest = &dbg[i..];
+        let end = rest
+            .find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(rest.len());
+        rest[..end].parse().ok()
+    }
+
+    let rt = create_runtime();
+    let (received, summaries, sent, skipped, send_failed, interest_failed) = rt.block_on(async {
+        let logs = result.logs_handle.lock().await;
+        let (mut recv, mut n, mut sent, mut skip, mut failed, mut ifailed) =
+            (0usize, 0usize, 0usize, 0usize, 0usize, 0usize);
+        for log in logs.iter() {
             if log.kind.is_update_broadcast_received() {
-                if i < third {
-                    early += 1;
-                } else if i < third * 2 {
-                    mid += 1;
-                } else {
-                    late += 1;
-                }
+                recv += 1;
+            }
+            let dbg = format!("{:?}", log.kind);
+            if dbg.contains("BroadcastDeliverySummary") {
+                n += 1;
+                sent += field(&dbg, "targets_sent").unwrap_or(0);
+                skip += field(&dbg, "skipped_summary_match").unwrap_or(0);
+                failed += field(&dbg, "send_failed").unwrap_or(0);
+                ifailed += field(&dbg, "interest_resolve_failed").unwrap_or(0);
             }
         }
-        (early, mid, late)
+        (recv, n, sent, skip, failed, ifailed)
     });
 
-    let total = early_broadcasts + mid_broadcasts + late_broadcasts;
     tracing::info!(
-        "Broadcast received events: {} total (early: {}, mid: {}, late: {})",
-        total,
-        early_broadcasts,
-        mid_broadcasts,
-        late_broadcasts
+        "fan-out over the run: {} delivery summaries, {} targets sent, {} skipped \
+         (summary match), {} send failures, {} interest-resolve failures, {} broadcasts received",
+        summaries,
+        sent,
+        skipped,
+        send_failed,
+        interest_failed,
+        received
     );
 
-    // Must have some broadcasts overall — otherwise the simulation didn't
-    // generate enough update activity to be meaningful.
+    // The simulation must actually have exercised the fan-out; otherwise every
+    // assertion below is vacuous.
     assert!(
-        total > 0,
-        "No BroadcastReceived events found in {} logged events — \
-         simulation may not be generating updates. Seed: 0x{:X}",
-        result.event_count,
-        SEED
+        summaries > 0 && received > 0,
+        "no fan-out activity ({summaries} delivery summaries, {received} broadcasts \
+         received) — the scenario stopped generating updates, so this test proves \
+         nothing. Seed: 0x{SEED:X}"
     );
 
-    // CRITICAL: Late-phase broadcasts must exist. If the TTL refresh on
-    // broadcast send is missing (regression of #3093), interest entries
-    // expire at ~1200s and no broadcasts are delivered after that point.
+    // Nothing was LOST. A converged peer receiving nothing is correct; a send
+    // that was attempted and failed is not, and the two are indistinguishable
+    // in a broadcast count.
+    assert_eq!(
+        send_failed, 0,
+        "{send_failed} broadcast sends FAILED — peers were meant to receive \
+         these and did not. Seed: 0x{SEED:X}"
+    );
+    assert_eq!(
+        interest_failed, 0,
+        "{interest_failed} fan-out targets could not be resolved to an interest \
+         entry. Seed: 0x{SEED:X}"
+    );
+
+    // The converged-skip demonstrably fired: peers still had CACHED SUMMARIES
+    // that matched ours. That is the positive evidence that quiet means
+    // converged. It also guards this PR's own change — if a subscribe renewal
+    // wiped the cached summary again, `theirs` would be absent, the skip could
+    // not fire, and this count would collapse toward zero.
     assert!(
-        late_broadcasts > 0,
-        "No BroadcastReceived events in the final third of simulation \
-         (after INTEREST_TTL boundary). Interest TTL is NOT being refreshed \
-         on broadcast send — subscriptions have silently expired. \
-         See #3093, #3107. Seed: 0x{:X}",
-        SEED
-    );
-
-    // The late/early ratio should be meaningful — at least 10% of early
-    // traffic. A drastic drop indicates partial TTL refresh failure.
-    let late_ratio = late_broadcasts as f64 / early_broadcasts.max(1) as f64;
-    tracing::info!(
-        "Late/early broadcast ratio: {:.2} ({}/{})",
-        late_ratio,
-        late_broadcasts,
-        early_broadcasts
-    );
-
-    assert!(
-        late_ratio > 0.1,
-        "Late broadcast ratio ({:.2}) dropped below 0.1 — \
-         interest TTL refresh may be partially broken. \
-         Early: {}, Mid: {}, Late: {}. See #3093, #3107. Seed: 0x{:X}",
-        late_ratio,
-        early_broadcasts,
-        mid_broadcasts,
-        late_broadcasts,
-        SEED
+        skipped > 0,
+        "the converged-skip never fired ({skipped} skips over {summaries} \
+         fan-outs). Either no peer had a cached summary — the renewal clobber \
+         this PR fixes — or the skip is not reachable. Seed: 0x{SEED:X}"
     );
 
     tracing::info!(
-        "test_interest_ttl_refresh_on_broadcast PASSED: late/early ratio {:.2}, \
-         total broadcasts: {} (early: {}, mid: {}, late: {})",
-        late_ratio,
-        total,
-        early_broadcasts,
-        mid_broadcasts,
-        late_broadcasts
+        "test_interest_ttl_refresh_on_broadcast PASSED: {} sent, {} skipped as \
+         converged, 0 failed, {} contracts converged with 0 diverged",
+        sent,
+        skipped,
+        result.convergence.converged.len()
     );
 }
 
@@ -7476,7 +7874,7 @@ fn test_direct_runner_churn() {
 /// Regression test for #4694: direct-runner `ChurnConfig` crashes must actually
 /// DROP packets, not merely set fault config.
 ///
-/// Before the fix, `run_simulation_direct` never installed the global
+/// Before the fix, `run_simulation_direct` never installed the
 /// packet-delivery callback and never set `enforce_fault_drops`, so the chaos
 /// driver's `crash_node()` calls were inert: a "crashed" node kept exchanging
 /// packets. Any near-K churn / partition validation on the direct runner was
@@ -8017,6 +8415,170 @@ fn test_connect_despite_nat_partition() {
     // without ConnectFailed + jitter, partitioned joiners would retry the same
     // unreachable acceptor forever, eventually causing the simulation to hang
     // or timeout.
+}
+
+// =============================================================================
+// Gateway Zombie Sweep vs. an Unjoined Peer's Live Link (#5654)
+// =============================================================================
+
+/// Regression test for #5654: the gateway's zombie-transport sweep must not
+/// collect a link that a peer which cannot join the ring is still using.
+///
+/// **The bug.** With this seed, one node's every CONNECT is rejected (a
+/// saturated neighbourhood), so its gateway transport is its only route and is
+/// never in the gateway's ring. The gateway's zombie sweep judged that
+/// transport purely by AGE (`> 3 × transient_ttl`, 90s by default) and dropped
+/// it. The transport has no close message, so the peer was never told; it
+/// exempts its own gateway links from zombie cleanup and only notices a dead
+/// link after its 120s idle timeout. GETs it sent into the dead link timed out
+/// and reported NotFound for a contract that exists.
+///
+/// **The scenario.** 1 gateway + 12 nodes. Every node GETs a contract that has
+/// not been PUT yet, the gateway PUTs it, then every node GETs it again, with
+/// operations 5s apart. The second round is what is checked: every node must
+/// end up holding the state. At 5s spacing the last node's second-round GET
+/// lands inside the dead-link window on the unfixed base (the sweep dropping
+/// the link was confirmed as the cause by disabling the sweep, which made this
+/// pass). At 15s spacing a first-round GET lands there instead, which this
+/// assertion cannot see, so the spacing is load-bearing.
+///
+/// **Coupling.** Which node lands in the dead-link window depends on:
+/// `transient_ttl` (default 30s, so a transport is a zombie by age after 90s),
+/// the sweep interval (`STATS_LOG_INTERVAL`, 30s, in `p2p_protoc.rs`), the op
+/// spacing (5s, below), the seed, and the network shape. Changing any of them
+/// can move the window off every checked GET and make the outcome assertion
+/// pass for the wrong reason. The precondition assertions below catch that:
+/// they require that node 12 never joined the ring and that the gateway's sweep
+/// did evaluate its transport as a zombie by age.
+#[test_log::test]
+fn test_gateway_zombie_sweep_keeps_unjoined_peers_live_link() {
+    use freenet::dev_tool::{NodeLabel, ScheduledOperation, SimOperation, register_crdt_contract};
+
+    const SEED: u64 = 0x4485_0000_0001;
+    const NETWORK_NAME: &str = "gw-zombie-live-link";
+    let num_nodes = 12;
+
+    setup_deterministic_state(SEED);
+    let rt = create_runtime();
+    let mut sim = rt.block_on(async {
+        SimNetwork::new(
+            NETWORK_NAME,
+            1,         // gateways
+            num_nodes, // nodes
+            4,         // ring_max_htl
+            2,         // rnd_if_htl_above
+            5,         // max_connections
+            3,         // min_connections
+            SEED,
+        )
+        .await
+    });
+    sim.with_controlled_op_interval(Duration::from_secs(5));
+    // The unjoined node for this seed. See "Coupling" above.
+    const UNJOINED_NODE: usize = 12;
+    let gateway_addr = sim
+        .node_address(&NodeLabel::gateway(NETWORK_NAME, 0))
+        .expect("gateway address");
+    let unjoined_addr = sim
+        .node_address(&NodeLabel::node(NETWORK_NAME, UNJOINED_NODE))
+        .expect("unjoined node address");
+
+    let contract = SimOperation::create_test_contract(0x85);
+    let contract_id = *contract.key().id();
+    register_crdt_contract(contract_id);
+
+    let get_round = |ops: &mut Vec<ScheduledOperation>| {
+        for i in 1..=num_nodes {
+            ops.push(ScheduledOperation::new(
+                NodeLabel::node(NETWORK_NAME, i),
+                SimOperation::Get {
+                    contract_id,
+                    return_contract_code: true,
+                    subscribe: false,
+                },
+            ));
+        }
+    };
+    let mut operations = Vec::new();
+    get_round(&mut operations);
+    operations.push(ScheduledOperation::new(
+        NodeLabel::gateway(NETWORK_NAME, 0),
+        SimOperation::Put {
+            contract: contract.clone(),
+            state: SimOperation::create_crdt_state(1, 0x85),
+            subscribe: true,
+        },
+    ));
+    get_round(&mut operations);
+
+    let result = sim.run_controlled_simulation(
+        SEED,
+        operations,
+        Duration::from_secs(900),
+        Duration::from_secs(180),
+    );
+    assert!(
+        result.turmoil_result.is_ok(),
+        "simulation failed: {:?}",
+        result.turmoil_result.err()
+    );
+
+    // Preconditions: without these the outcome below could pass for a reason
+    // that has nothing to do with the sweep.
+    let unjoined_ring_connections = result
+        .topology_snapshots
+        .iter()
+        .find(|snap| snap.peer_addr == unjoined_addr)
+        .map(|snap| snap.connection_count);
+    assert_eq!(
+        unjoined_ring_connections,
+        Some(0),
+        "precondition: node {UNJOINED_NODE} must end the run unjoined, so its \
+         gateway transport is its only route"
+    );
+    // `connection_count` reads 0 when unstamped, so require that the snapshot
+    // mechanism stamped other nodes, or the check above would be vacuous.
+    assert!(
+        result
+            .topology_snapshots
+            .iter()
+            .any(|snap| snap.peer_addr != unjoined_addr && snap.connection_count > 0),
+        "precondition check is vacuous: no node's snapshot carries a connection count"
+    );
+    let (past_age_threshold, kept_for_link_use) =
+        result.zombie_sweep_counts(gateway_addr, unjoined_addr);
+    assert!(
+        past_age_threshold > 0,
+        "precondition: the gateway's zombie sweep must have evaluated node \
+         {UNJOINED_NODE}'s transport as a zombie by age at least once"
+    );
+    tracing::info!(
+        past_age_threshold,
+        kept_for_link_use,
+        "gateway zombie sweep verdicts for the unjoined node's transport"
+    );
+
+    let key = contract.key();
+    let nodes_without_state: Vec<usize> = (1..=num_nodes)
+        .filter(|i| {
+            result
+                .node_storages
+                .get(&NodeLabel::node(NETWORK_NAME, *i))
+                .is_none_or(|s| s.get_stored_state(&key).is_none())
+        })
+        .collect();
+    assert!(
+        nodes_without_state.is_empty(),
+        "every second-round GET for a PUT contract must deliver state; nodes \
+         without state: {nodes_without_state:?} (#5654: the gateway's zombie \
+         sweep dropped an unjoined peer's only, still-used link)"
+    );
+    // Mechanism: the transport survived because its recent requests exempted it.
+    assert!(
+        kept_for_link_use > 0,
+        "the gateway's sweep must have kept node {UNJOINED_NODE}'s transport for \
+         recent requests (past_age_threshold={past_age_threshold})"
+    );
 }
 
 // =============================================================================
@@ -8732,6 +9294,276 @@ fn test_relay_route_events_multihop() {
         "RELAY_PUT_ROUTE_EVENT_COUNT did not advance — the gateway PUT at HTL=3 in a \
          sparse {num_nodes}-node mesh must forward through at least one relay. \
          Baseline: {put_route_baseline}, after: {put_route_after}."
+    );
+}
+
+/// #5657: route attempts feed the router the right labels, per node.
+///
+/// Before the fix a relay recorded a downstream `NotFound` as a SUCCESS and
+/// originators recorded only their final success, so a production gateway saw
+/// 2 failures in 361 route events. Now timeouts and dropped connections are
+/// failures, a `NotFound` is a failure only when this node stored state from
+/// a later reply in the SAME operation, and ambiguous `NotFound`s are not
+/// trained.
+///
+/// Two runs on the same 13-node topology and seed:
+///
+/// * **absent** — every node GETs a contract that is never PUT. Every search
+///   dead-ends, nothing can prove the contract exists, so NO node may feed its
+///   router a single `NotFound` failure label.
+/// * **evidence** — every node GETs a contract before it is PUT (correct
+///   `NotFound`s that must not be trained later), the gateway PUTs it, every
+///   node GETs it again (GET health: all must resolve), then the gateway PUTs
+///   a second contract, three nodes are crashed, and the remaining nodes GET
+///   the second contract. Attempts forwarded into a crashed (or otherwise
+///   silent) peer time out, and those timeouts must reach the routers as
+///   failures. Observed at this seed: timeouts at several nodes, and one
+///   NotFound label (node 9) from an operation that later found the contract.
+///
+/// Labels are read per node from each Ring's per-cause failure counters and
+/// Router totals, not from a proxy.
+#[test_log::test]
+fn test_router_receives_failures_for_dead_end_gets() {
+    use freenet::dev_tool::{NodeLabel, ScheduledOperation, SimOperation, register_crdt_contract};
+
+    const SEED: u64 = 0x4485_0000_0001;
+    let num_nodes = 12;
+    let crashed = 1..=3;
+
+    let run = |network_name: &'static str, operations: &dyn Fn(&mut Vec<ScheduledOperation>)| {
+        setup_deterministic_state(SEED);
+        let rt = create_runtime();
+        let mut sim = rt.block_on(async {
+            SimNetwork::new(
+                network_name,
+                1,         // gateways
+                num_nodes, // nodes
+                4,         // ring_max_htl
+                2,         // rnd_if_htl_above
+                5,         // max_connections
+                3,         // min_connections
+                SEED,
+            )
+            .await
+        });
+        // 15 s between operations. With 5 s the last node's second-round GET
+        // fails to store the state, which is NOT this change and not GET
+        // overlap: that node never joins the ring (every CONNECT is rejected),
+        // the gateway's zombie sweep silently drops its only connection after
+        // 90 s with no close message, and the node keeps sending GETs into the
+        // dead link until its 120 s idle timeout (#5654). The spacing only
+        // decides which of its GETs lands in that dead window; at 15 s it is a
+        // first-round GET, which this test does not require to resolve. Its
+        // first-round timeouts are genuine routing failures caused by that bug,
+        // so the timeout assertion below excludes the node. The #5654 fix
+        // (PR #5656) may remove that failure mode; revisit this exclusion
+        // and the spacing when it lands.
+        sim.with_controlled_op_interval(Duration::from_secs(15));
+        let mut ops = Vec::new();
+        operations(&mut ops);
+        let result = sim.run_controlled_simulation(
+            SEED,
+            ops,
+            Duration::from_secs(1200),
+            Duration::from_secs(180),
+        );
+        assert!(
+            result.turmoil_result.is_ok(),
+            "{network_name}: simulation failed: {:?}",
+            result.turmoil_result.err()
+        );
+        result
+    };
+
+    let first = SimOperation::create_test_contract(0x85);
+    let first_id = *first.key().id();
+    register_crdt_contract(first_id);
+    let second = SimOperation::create_test_contract(0x86);
+    let second_id = *second.key().id();
+    register_crdt_contract(second_id);
+
+    let get_round = |ops: &mut Vec<ScheduledOperation>,
+                     network: &'static str,
+                     contract_id,
+                     nodes: &mut dyn Iterator<Item = usize>| {
+        for i in nodes {
+            ops.push(ScheduledOperation::new(
+                NodeLabel::node(network, i),
+                SimOperation::Get {
+                    contract_id,
+                    return_contract_code: true,
+                    subscribe: false,
+                },
+            ));
+        }
+    };
+
+    // ── absent ──────────────────────────────────────────────────────────────
+    const ABSENT: &str = "route-failures-absent";
+    let absent = run(ABSENT, &|ops| {
+        get_round(ops, ABSENT, first_id, &mut (1..=num_nodes))
+    });
+    let absent_labels: Vec<(usize, (u64, u64, u64))> = (0..=num_nodes)
+        .map(|i| {
+            let label = if i == 0 {
+                NodeLabel::gateway(ABSENT, 0)
+            } else {
+                NodeLabel::node(ABSENT, i)
+            };
+            (
+                i,
+                absent.node_route_failure_causes(&label).unwrap_or_default(),
+            )
+        })
+        .collect();
+    tracing::info!(
+        ?absent_labels,
+        "absent run: (not_found, timeout, send_failure) per node"
+    );
+    let trained_not_found: Vec<_> = absent_labels
+        .iter()
+        .filter(|(_, (not_found, _, _))| *not_found > 0)
+        .collect();
+    assert!(
+        trained_not_found.is_empty(),
+        "a contract that never exists proves nothing about any peer: no node may \
+         train a NotFound failure. Offending nodes (index, causes): {trained_not_found:?}"
+    );
+    // Non-vacuous: the GETs must actually have met NotFounds (dropped
+    // untrained), or the assertion above proves nothing.
+    let untrained_per_node: Vec<(usize, Option<u64>)> = (0..=num_nodes)
+        .map(|i| {
+            let label = if i == 0 {
+                NodeLabel::gateway(ABSENT, 0)
+            } else {
+                NodeLabel::node(ABSENT, i)
+            };
+            (i, absent.node_untrained_not_founds(&label))
+        })
+        .collect();
+    let unpublished: Vec<usize> = untrained_per_node
+        .iter()
+        .filter(|(_, count)| count.is_none())
+        .map(|(i, _)| *i)
+        .collect();
+    assert!(
+        unpublished.is_empty(),
+        "every node must publish its Ring's untrained-NotFound count; \
+         missing for node indices {unpublished:?}"
+    );
+    let untrained_not_founds: u64 = untrained_per_node
+        .iter()
+        .filter_map(|(_, count)| *count)
+        .sum();
+    assert!(
+        untrained_not_founds > 0,
+        "the absent-contract GETs must meet NotFounds for the assertion above to \
+         mean anything; none were observed"
+    );
+
+    // ── evidence ────────────────────────────────────────────────────────────
+    const EVIDENCE: &str = "route-failures-evidence";
+    let evidence = run(EVIDENCE, &|ops| {
+        get_round(ops, EVIDENCE, first_id, &mut (1..=num_nodes));
+        ops.push(ScheduledOperation::new(
+            NodeLabel::gateway(EVIDENCE, 0),
+            SimOperation::Put {
+                contract: first.clone(),
+                state: SimOperation::create_crdt_state(1, 0x85),
+                subscribe: true,
+            },
+        ));
+        get_round(ops, EVIDENCE, first_id, &mut (1..=num_nodes));
+        ops.push(ScheduledOperation::new(
+            NodeLabel::gateway(EVIDENCE, 0),
+            SimOperation::Put {
+                contract: second.clone(),
+                state: SimOperation::create_crdt_state(1, 0x86),
+                subscribe: true,
+            },
+        ));
+        for i in crashed.clone() {
+            ops.push(ScheduledOperation::new(
+                NodeLabel::node(EVIDENCE, i),
+                SimOperation::CrashNode,
+            ));
+        }
+        get_round(
+            ops,
+            EVIDENCE,
+            second_id,
+            &mut ((crashed.end() + 1)..=num_nodes),
+        );
+    });
+
+    let first_key = first.key();
+    let nodes_without_state: Vec<usize> = (1..=num_nodes)
+        .filter(|i| {
+            evidence
+                .node_storages
+                .get(&NodeLabel::node(EVIDENCE, *i))
+                .is_none_or(|s| s.get_stored_state(&first_key).is_none())
+        })
+        .collect();
+    assert!(
+        nodes_without_state.is_empty(),
+        "every second-round GET for a PUT contract must resolve (GET success \
+         rate must not regress); nodes without state: {nodes_without_state:?}"
+    );
+
+    /// `(node, (not_found, timeout, send_failure), (failures, successes))`.
+    type NodeLabels = (usize, (u64, u64, u64), (u64, u64));
+    let per_node: Vec<NodeLabels> = (1..=num_nodes)
+        .map(|i| {
+            let label = NodeLabel::node(EVIDENCE, i);
+            (
+                i,
+                evidence
+                    .node_route_failure_causes(&label)
+                    .unwrap_or_default(),
+                evidence
+                    .node_route_outcome_totals(&label)
+                    .unwrap_or_default(),
+            )
+        })
+        .collect();
+    tracing::info!(
+        ?per_node,
+        "evidence run: (node, (not_found, timeout, send_failure), (failures, successes))"
+    );
+    let (all_failures, all_successes) = evidence.aggregate_route_outcome_totals();
+    assert!(all_successes > 0, "routers must receive success labels");
+    // A NotFound is labelled only with existence proof: this node stored a
+    // later reply's state in the same GET. The GETs after the PUT must
+    // produce some.
+    let not_found_labels: u64 = per_node
+        .iter()
+        .map(|(_, (not_found, _, _), _)| not_found)
+        .sum();
+    assert!(
+        not_found_labels > 0,
+        "some GET must label a NotFound hop a failure once this node stored a \
+         later reply's state; per node={per_node:?}"
+    );
+    // Per node: of the nodes that were neither crashed nor #5654's node (see
+    // the spacing comment), at least MIN_NODES_WITH_TIMEOUT_LABELS must have
+    // fed their OWN router a timeout or send-failure label.
+    const MIN_NODES_WITH_TIMEOUT_LABELS: usize = 2;
+    let eligible: Vec<_> = per_node
+        .iter()
+        .filter(|(i, _, _)| !crashed.contains(i) && *i != num_nodes)
+        .collect();
+    let labelled: Vec<usize> = eligible
+        .iter()
+        .filter(|(_, (_, timeout, send_failure), _)| timeout + send_failure > 0)
+        .map(|(i, _, _)| *i)
+        .collect();
+    assert!(
+        labelled.len() >= MIN_NODES_WITH_TIMEOUT_LABELS,
+        "at least {MIN_NODES_WITH_TIMEOUT_LABELS} of the {} eligible nodes must \
+         label a timeout or send failure after the crash; labelled: {labelled:?} \
+         (failures={all_failures}, per node={per_node:?})",
+        eligible.len()
     );
 }
 
@@ -9933,14 +10765,14 @@ fn test_get_reliability_diagnostic() {
         success_rate * 100.0
     );
     // Network-traversal floor (#4361): before this assertion existed, every
-    // "success" in the failing runs was a local cache hit (attempts == 0)
-    // on a node that already held the contract — multi-hop GET was never
-    // exercised at all. This also guards the one gap in the retrievability
-    // metric above: `nodes_with_state` counts a node whether it obtained the
+    // "success" in the failing runs was a local cache hit on a node that
+    // already held the contract — multi-hop GET was never exercised at all.
+    // This also guards the one gap in the retrievability metric above:
+    // `nodes_with_state` counts a node whether it obtained the
     // contract over the network OR via relay-path caching, so on its own a high
     // count could in principle be reached with few client GETs actually
     // completing. Requiring a number of client GET operations that actually
-    // routed (`attempts >= 1`) closes that: broad routing must have happened,
+    // routed (`hop_count >= 1`) closes that: broad routing must have happened,
     // not just storage population. This now gates on the CLIENT-visible
     // network-success count (per client op) rather than the per-tx count. The
     // lattice run measured 73/100 client GETs routing over the network (27 were
@@ -9949,7 +10781,7 @@ fn test_get_reliability_diagnostic() {
     // routing happened, not just storage population (#4852/#4361).
     assert!(
         client_network_successes >= 30,
-        "Only {} client GET operations traversed the network (attempts >= 1) \
+        "Only {} client GET operations traversed the network (hop_count >= 1) \
          — too few client GETs actually routed; the success/retrievability \
          metrics may be measuring local availability, not routing (#4852/#4361)",
         client_network_successes
@@ -11234,175 +12066,51 @@ fn test_hop_count_populated_on_terminal_get_events() {
 
 /// Verifies the contract-placement migration (#4404): a contract held only by a
 /// peer FAR from its key migrates onto the cluster of peers CLOSEST to the key,
-/// resolving the GET dead-end.
+/// which is what resolves the GET dead-end.
 ///
-/// Setup (peer ring locations controlled via `new_with_node_locations`):
-///   - a dense cluster of peers sits right on the contract's key location;
-///   - exactly one peer, far from the key, initially hosts the contract (seeded
-///     into its store AND Ring hosting manager, with no network propagation);
-///   - a requester, also far from the key, issues a GET.
+/// Setup (`run_close_cluster_placement`): a dense cluster of peers sits right
+/// on the contract's key location, and exactly one peer, far from the key,
+/// hosts the contract (seeded into its store AND Ring hosting manager, with no
+/// network propagation). GET is single-path greedy (k=1), so a key-routed GET
+/// lands on the cluster; without migration the cluster lacks the state and that
+/// attempt dead-ends with NotFound, the placement gap #4404 describes. The
+/// migration nudges the contract toward the key: each hosting peer, on gaining
+/// a connected neighbor strictly closer to the key, sends a `SubscribeHint` so
+/// that neighbor directed-subscribes through the holder and begins hosting.
 ///
-/// GET is single-path greedy (k=1), so it routes toward the key and reaches the
-/// close cluster. WITHOUT the migration that cluster lacks the state, so the GET
-/// dead-ends with NotFound (the far host is never on the greedy path toward the
-/// key) — that is the placement gap #4404 describes. The migration nudges the
-/// contract from the far host toward the key: each hosting peer, on gaining a
-/// connected neighbor strictly closer to the key, sends a `SubscribeHint` so
-/// that neighbor directed-subscribes through the holder and begins hosting. The
-/// contract therefore climbs onto the close cluster, and a key-routed GET now
-/// lands on a host. (The dead-end itself is not asserted separately here; the
-/// migration trigger is always-on, so this test pins the resolved state.)
-///
-/// Asserts the migration outcome directly via each node's live Ring: the far
-/// host still hosts the contract, and at least one close-cluster peer (the peers
-/// a key-routed GET actually reaches) ends up hosting it via migration.
+/// No client GET is issued. Since #5660 a GET's retries skip the peers that
+/// answered NotFound and reach the far host, and the return path caches the
+/// contract at the cluster peers it crosses, so a GET in this run could put the
+/// contract on the cluster with no migration at all and the assertion would not
+/// isolate the cascade. The paired control,
+/// `test_contract_stays_off_close_cluster_without_migration`, runs the same
+/// helper, seed and topology with ONLY the migration flag flipped.
 #[test_log::test]
-fn test_contract_migrates_to_close_cluster_resolving_get_dead_end() {
-    use freenet::dev_tool::{Location, NodeLabel, ScheduledOperation, SimNetwork, SimOperation};
-
-    const SEED: u64 = 0xDEAD_F00D_0001;
+fn test_contract_migrates_to_close_cluster_without_any_get() {
     const NETWORK_NAME: &str = "get-placement-deadend";
-    setup_deterministic_state(SEED);
-
-    // Pick a contract and read its ring location; place peers relative to it.
-    let contract = SimOperation::create_test_contract(0xBE);
-    let contract_id = *contract.key().id();
-    let contract_key = contract.key();
-    let key_loc = Location::from(&contract_key).as_f64();
-
-    // Six peers clustered tightly around the key (none will host it), then one
-    // far host (seeded) and one far requester. `rem_euclid` wraps onto the ring.
-    let wrap = |x: f64| x.rem_euclid(1.0);
-    let cluster: Vec<f64> = [-0.010, -0.006, -0.003, 0.003, 0.006, 0.010]
-        .iter()
-        .map(|o| wrap(key_loc + o))
-        .collect();
-    let host_loc = wrap(key_loc + 0.40); // far from the key
-    let requester_loc = wrap(key_loc + 0.70); // far from the key, other side
-    let mut node_locations = cluster.clone();
-    node_locations.push(host_loc); // regular-node order 6 -> node_no 7
-    node_locations.push(requester_loc); // regular-node order 7 -> node_no 8
-    let num_nodes = node_locations.len(); // 8
-
-    let rt = create_runtime();
-    let mut sim = rt.block_on(async {
-        SimNetwork::new_with_node_locations(
-            NETWORK_NAME,
-            1,         // 1 gateway
-            num_nodes, // 8 regular nodes
-            10,        // ring_max_htl
-            7,         // rnd_if_htl_above
-            8,         // max_connections
-            3,         // min_connections
-            SEED,
-            &node_locations,
-        )
-        .await
-    });
-    // Opt this simulation into the placement-migration cascade (off by default in
-    // sim so it can't perturb unrelated tests, e.g. the streaming assembly-retry
-    // test). This lowers the per-node SubscribeHint version floor to (0,0,0).
-    sim.enable_placement_migration();
-
-    // Regular nodes are node_no = 1..=8 (gateway is node 0); node_locations[i]
-    // maps to node_no i+1.
-    let host_label = NodeLabel::node(NETWORK_NAME, 7); // host_loc
-    let requester_label = NodeLabel::node(NETWORK_NAME, 8); // requester_loc
-
-    // Setup sanity: a cluster node must be strictly closer to the key than the
-    // host, so a key-routed GET genuinely lands in the (non-hosting) cluster
-    // rather than near the holder. get_peer_locations() is [gateway, node1..8].
-    let locs = sim.get_peer_locations();
-    let ring_dist = |a: f64, b: f64| {
-        let d = (a - b).abs();
-        d.min(1.0 - d)
-    };
-    let host_dist = ring_dist(locs[7], key_loc);
-    let cluster_min = (1..=6)
-        .map(|i| ring_dist(locs[i], key_loc))
-        .fold(f64::INFINITY, f64::min);
-    assert!(
-        cluster_min < host_dist,
-        "scenario setup wrong: a cluster node must be closer to the key than the host \
-         (cluster_min={cluster_min}, host_dist={host_dist})"
-    );
-
-    let operations = vec![
-        // Only the far host holds the contract initially — seeded into both its
-        // store and Ring hosting manager (no network propagation), so it is a
-        // genuine migration source (`ring.is_hosting_contract` is true).
-        ScheduledOperation::new(
-            host_label.clone(),
-            SimOperation::SeedHostedContract {
-                contract: contract.clone(),
-                state: vec![10, 20, 30, 40],
-            },
-        ),
-        // The far requester asks for it (greedy GET toward the key).
-        ScheduledOperation::new(
-            requester_label.clone(),
-            SimOperation::Get {
-                contract_id,
-                return_contract_code: true,
-                subscribe: false,
-            },
-        ),
-    ];
-
-    let result = sim.run_controlled_simulation(
-        SEED,
-        operations,
-        Duration::from_secs(180),
-        Duration::from_secs(60),
-    );
-    assert!(
-        result.turmoil_result.is_ok(),
-        "simulation failed: {:?}",
-        result.turmoil_result.err()
-    );
+    let (result, contract_key) = run_close_cluster_placement(NETWORK_NAME, true, false);
 
     // The far host still hosts the seeded contract (it remains a source).
     assert!(
-        result.is_node_hosting(&host_label, &contract_key),
+        result.is_node_hosting(
+            &freenet::dev_tool::NodeLabel::node(NETWORK_NAME, 7),
+            &contract_key
+        ),
         "host should still host the seeded contract after the simulation"
     );
 
-    // CORE OF THE FIX: the contract migrated onto the close cluster. At least
-    // one of the peers a key-routed GET actually reaches (node_no 1..=6) now
-    // hosts it. Before the migration NONE of them did — this test previously
-    // asserted exactly that dead-end (see git history). With the contract now
-    // present on a peer the greedy path lands on, the dead-end is resolved.
-    let migrated: Vec<usize> = (1..=6usize)
-        .filter(|n| result.is_node_hosting(&NodeLabel::node(NETWORK_NAME, *n), &contract_key))
-        .collect();
-    let requester_has_state = result
-        .node_storages
-        .get(&requester_label)
-        .is_some_and(|s| s.get_stored_state(&contract_key).is_some());
+    // CORE OF THE FIX: with nobody asking for it, the contract still reached
+    // the peers a key-routed GET actually lands on (node_no 1..=6).
+    let migrated = close_cluster_hosts(&result, NETWORK_NAME, &contract_key);
     assert!(
         !migrated.is_empty(),
         "placement migration FAILED: no close-cluster peer (node_no 1..=6) hosts the \
          contract after the simulation. The contract never migrated from the far host \
-         toward the key, so a key-routed GET would still dead-end. \
-         host_hosting={}, requester_has_state={requester_has_state}",
-        result.is_node_hosting(&host_label, &contract_key),
-    );
-
-    // End-to-end payoff: with the contract migrated onto the close cluster, the
-    // requester's greedy GET toward the key now lands on a host instead of
-    // dead-ending, so it obtains the state. This is the user-visible symptom
-    // from the original telemetry (a web GET that needed several retries before
-    // the contract had migrated onto the key-close peers).
-    assert!(
-        requester_has_state,
-        "requester GET should now succeed: with the contract migrated onto the close \
-         cluster, the greedy GET toward the key lands on a host instead of dead-ending \
-         (migrated cluster nodes: {migrated:?})"
+         toward the key, so a key-routed GET's first attempt would still dead-end."
     );
 
     tracing::info!(
         migrated_cluster_nodes = ?migrated,
-        requester_has_state,
         "placement migration converged onto the close cluster"
     );
 }
@@ -11543,20 +12251,192 @@ fn test_serve_during_demandless_copy_served_locally_never_dark() {
     );
 }
 
-/// Negative control for `test_contract_migrates_to_close_cluster_resolving_get_dead_end`.
+/// Retry diversity must not cost a single-host contract its only host.
 ///
-/// IDENTICAL scenario, but WITHOUT `enable_placement_migration()` — so the
-/// SubscribeHint cascade stays off (sim peers report a build version below the
-/// production floor). This reproduces the #4404 dead-end and, paired with the
-/// positive test, proves that the migration cascade (not some incidental GET
-/// caching path) is what makes the close cluster host the contract: same seed,
-/// same topology, the ONLY difference is whether migration is enabled.
+/// The one host of a contract sits at the key and is the requester's first
+/// hop. It is crashed (messages silently dropped) when the GET starts and
+/// recovered moments later, so the GET's first attempt times out, and the
+/// retry must still reach the recovered host. The preconditions pin that the
+/// scenario really happened: the requester is connected to the host, and its
+/// own GET recorded a timeout.
+///
+/// What this sim does NOT discriminate is whether a timed-out hop is wrongly
+/// excluded from later first-hop picks: with exclusions scoped to the first
+/// hop, a retry that skipped the host would start from another peer, which
+/// forwards to the host (the node closest to the key) anyway. Unit tests pin
+/// that property: `a_timed_out_hop_is_retried_not_excluded` on a ring large
+/// enough that the driver's guesses never run out, and
+/// `a_holder_that_timed_out_once_keeps_its_second_chance_over_an_unasked_peer`
+/// on a small ring where they do.
+///
+/// Plain `cargo test` runs the sims in one process. The process-global crash
+/// callback that used to make this fail its precondition there (#5673) is
+/// fixed by #5677, but simulated networks that share node addresses still
+/// collide in multi-threaded runs (#5676), so only single-threaded or nextest
+/// results count as evidence.
 #[test_log::test]
-fn test_get_dead_ends_at_close_cluster_without_migration() {
+fn test_get_retry_reaches_single_host_after_one_timeout() {
+    use freenet::dev_tool::{Location, NodeLabel, ScheduledOperation, SimNetwork, SimOperation};
+
+    const SEED: u64 = 0x5657_0002_0001;
+    const NETWORK_NAME: &str = "get-retry-single-host-timeout";
+    setup_deterministic_state(SEED);
+
+    let contract = SimOperation::create_test_contract(0x57);
+    let contract_id = *contract.key().id();
+    let contract_key = contract.key();
+    let key_loc = Location::from(&contract_key).as_f64();
+    let wrap = |x: f64| x.rem_euclid(1.0);
+    // Node 1 is the single host, AT the key; the others are spread out so the
+    // host is every node's closest candidate for the key.
+    let node_locations: Vec<f64> = [0.0, 0.30, 0.45, 0.60, 0.75]
+        .iter()
+        .map(|o| wrap(key_loc + o))
+        .collect();
+    let num_nodes = node_locations.len();
+
+    let rt = create_runtime();
+    let mut sim = rt.block_on(async {
+        SimNetwork::new_with_node_locations(
+            NETWORK_NAME,
+            1,
+            num_nodes,
+            6,
+            4,
+            8,
+            5,
+            SEED,
+            &node_locations,
+        )
+        .await
+    });
+    sim.disable_placement_migration();
+    sim.wait_for_join_convergence_before_ops(1.0, Duration::from_secs(120));
+    sim.with_controlled_op_interval(Duration::from_secs(5));
+
+    let host = NodeLabel::node(NETWORK_NAME, 1);
+    let requester = NodeLabel::node(NETWORK_NAME, 3);
+    let mut operations = vec![ScheduledOperation::new(
+        host.clone(),
+        SimOperation::SeedHostedContract {
+            contract: contract.clone(),
+            state: vec![5, 6, 5, 7],
+        },
+    )];
+    // Let the small ring fill in (about 2 virtual minutes) so the requester
+    // is connected to the host, using GETs for a contract nobody has.
+    let filler = *SimOperation::create_test_contract(0x58).key().id();
+    for _ in 0..24 {
+        operations.push(ScheduledOperation::new(
+            NodeLabel::gateway(NETWORK_NAME, 0),
+            SimOperation::Get {
+                contract_id: filler,
+                return_contract_code: false,
+                subscribe: false,
+            },
+        ));
+    }
+    operations.extend([
+        ScheduledOperation::new(host.clone(), SimOperation::CrashNode),
+        ScheduledOperation::new(
+            requester.clone(),
+            SimOperation::Get {
+                contract_id,
+                return_contract_code: true,
+                subscribe: false,
+            },
+        ),
+        // Stay crashed for ~75 virtual seconds (15 fillers at 5 s): past the
+        // first attempt's 60 s deadline, so that attempt TIMES OUT (the
+        // transport keeps retransmitting into the silent host), but inside
+        // the 120 s connection idle timeout, so the host is still a routing
+        // candidate when the retry is sent. The retry reaches it once it
+        // recovers.
+    ]);
+    for _ in 0..15 {
+        operations.push(ScheduledOperation::new(
+            NodeLabel::gateway(NETWORK_NAME, 0),
+            SimOperation::Get {
+                contract_id: filler,
+                return_contract_code: false,
+                subscribe: false,
+            },
+        ));
+    }
+    operations.push(ScheduledOperation::new(
+        host.clone(),
+        SimOperation::RecoverNode,
+    ));
+
+    let result = sim.run_controlled_simulation(
+        SEED,
+        operations,
+        Duration::from_secs(600),
+        Duration::from_secs(240),
+    );
+    assert!(
+        result.turmoil_result.is_ok(),
+        "simulation failed: {:?}",
+        result.turmoil_result.err()
+    );
+    assert!(
+        result.is_node_hosting(&host, &contract_key),
+        "the host still holds the seeded contract"
+    );
+
+    // Preconditions. Without them the outcome below says nothing about a
+    // timed-out hop: this test once passed because the first attempt never
+    // timed out at all. The requester is connected to the host itself, checked
+    // by address because the gateway's location is not controlled, and the
+    // host sits at the key, so it is the requester's closest candidate and
+    // first hop. And the requester recorded a timeout as an ORIGINATOR, which
+    // can only be its own GET: labels it recorded while relaying the gateway's
+    // filler GETs do not count. The connection is read at the end of the run,
+    // so on its own it would also accept a host that connected only after the
+    // GET; the timeout check is what shows the requester's own GET met the
+    // stall.
+    assert!(
+        result.node_is_connected_to(&requester, &host),
+        "precondition: the requester must be connected to the host"
+    );
+    let own_timeouts = result
+        .node_originator_route_timeouts(&requester)
+        .expect("the requester published its ring");
+    assert!(
+        own_timeouts >= 1,
+        "precondition: the requester's own GET must have timed out against its first hop \
+         (originator timeout labels: {own_timeouts})"
+    );
+
+    let requester_has_state = result
+        .node_storages
+        .get(&requester)
+        .is_some_and(|s| s.get_stored_state(&contract_key).is_some());
+    assert!(
+        requester_has_state,
+        "after one timeout the GET's retry must reach the recovered single host"
+    );
+}
+
+/// A finished close-cluster run and the contract it placed.
+type CloseClusterRun = (
+    freenet::dev_tool::ControlledSimulationResult,
+    freenet_stdlib::prelude::ContractKey,
+);
+
+/// Close-cluster placement scenario shared by the migration and retry tests:
+/// six peers tightly around the contract's key, one far host (node 7, seeded)
+/// and one far requester (node 8), which GETs the contract when `client_get`.
+/// Same seed and topology in every caller, so callers differ only in the two
+/// flags.
+fn run_close_cluster_placement(
+    network_name: &'static str,
+    migration: bool,
+    client_get: bool,
+) -> CloseClusterRun {
     use freenet::dev_tool::{Location, NodeLabel, ScheduledOperation, SimNetwork, SimOperation};
 
     const SEED: u64 = 0xDEAD_F00D_0001;
-    const NETWORK_NAME: &str = "get-placement-deadend-control";
     setup_deterministic_state(SEED);
 
     let contract = SimOperation::create_test_contract(0xBE);
@@ -11579,7 +12459,7 @@ fn test_get_dead_ends_at_close_cluster_without_migration() {
     let rt = create_runtime();
     let mut sim = rt.block_on(async {
         SimNetwork::new_with_node_locations(
-            NETWORK_NAME,
+            network_name,
             1,
             num_nodes,
             10,
@@ -11591,35 +12471,52 @@ fn test_get_dead_ends_at_close_cluster_without_migration() {
         )
         .await
     });
-    // This control asserts the GET dead-ends *because migration is off* — it
-    // deliberately does NOT call `enable_placement_migration()`. But "off by
-    // default" only holds on a build below the production
-    // SUBSCRIBE_HINT_MIN_VERSION floor; on the v0.2.73 release branch (#4404
-    // ships active) the default flips to ON and this control would falsely
-    // fail. Pin migration OFF explicitly so the control's premise holds at any
-    // build version — do not rely on build-version gating.
-    sim.disable_placement_migration();
 
-    let host_label = NodeLabel::node(NETWORK_NAME, 7);
-    let requester_label = NodeLabel::node(NETWORK_NAME, 8);
+    // Setup sanity: a cluster node must be strictly closer to the key than the
+    // host, so a key-routed GET genuinely lands in the (non-hosting) cluster
+    // rather than near the holder. get_peer_locations() is [gateway, node1..8].
+    let locs = sim.get_peer_locations();
+    let ring_dist = |a: f64, b: f64| {
+        let d = (a - b).abs();
+        d.min(1.0 - d)
+    };
+    let host_dist = ring_dist(locs[7], key_loc);
+    let cluster_min = (1..=6)
+        .map(|i| ring_dist(locs[i], key_loc))
+        .fold(f64::INFINITY, f64::min);
+    assert!(
+        cluster_min < host_dist,
+        "scenario setup wrong: a cluster node must be closer to the key than the host \
+         (cluster_min={cluster_min}, host_dist={host_dist})"
+    );
 
-    let operations = vec![
-        ScheduledOperation::new(
-            host_label.clone(),
-            SimOperation::SeedHostedContract {
-                contract: contract.clone(),
-                state: vec![10, 20, 30, 40],
-            },
-        ),
-        ScheduledOperation::new(
-            requester_label.clone(),
+    // Pin migration explicitly either way: "off by default" only holds on a
+    // build below the production SUBSCRIBE_HINT_MIN_VERSION floor.
+    if migration {
+        sim.enable_placement_migration();
+    } else {
+        sim.disable_placement_migration();
+    }
+
+    let host_label = NodeLabel::node(network_name, 7);
+    let requester_label = NodeLabel::node(network_name, 8);
+    let mut operations = vec![ScheduledOperation::new(
+        host_label,
+        SimOperation::SeedHostedContract {
+            contract: contract.clone(),
+            state: vec![10, 20, 30, 40],
+        },
+    )];
+    if client_get {
+        operations.push(ScheduledOperation::new(
+            requester_label,
             SimOperation::Get {
                 contract_id,
                 return_contract_code: true,
                 subscribe: false,
             },
-        ),
-    ];
+        ));
+    }
 
     let result = sim.run_controlled_simulation(
         SEED,
@@ -11632,31 +12529,99 @@ fn test_get_dead_ends_at_close_cluster_without_migration() {
         "simulation failed: {:?}",
         result.turmoil_result.err()
     );
+    (result, contract_key)
+}
 
-    // The far host still hosts the seeded contract.
+/// Close-cluster peers (node 1..=6) hosting the contract at the end of a run.
+fn close_cluster_hosts(
+    result: &freenet::dev_tool::ControlledSimulationResult,
+    network_name: &str,
+    contract_key: &freenet_stdlib::prelude::ContractKey,
+) -> Vec<usize> {
+    (1..=6usize)
+        .filter(|n| {
+            result.is_node_hosting(
+                &freenet::dev_tool::NodeLabel::node(network_name, *n),
+                contract_key,
+            )
+        })
+        .collect()
+}
+
+/// Negative control for `test_contract_migrates_to_close_cluster_without_any_get`.
+///
+/// The same `run_close_cluster_placement` call as the positive test, same seed
+/// and topology, no client GET in either, and ONLY the migration flag flipped.
+/// The positive test asserts that run places the contract on the close
+/// cluster; this one asserts it does not without migration, so the pair shows
+/// migration is what places it, and this assertion is not vacuous.
+///
+/// Why there is no client GET (#5660): this control used to issue the
+/// requester's GET and assert it dead-ends at the non-hosting cluster, a
+/// premise that held only while every retry re-asked the same first hop. With
+/// retry diversity the GET resolves without migration, so that scenario now
+/// lives, under its original network name, in
+/// `test_get_retries_resolve_close_cluster_dead_end_without_migration`.
+#[test_log::test]
+fn test_contract_stays_off_close_cluster_without_migration() {
+    const NETWORK_NAME: &str = "get-placement-migration-control";
+    let (result, contract_key) = run_close_cluster_placement(NETWORK_NAME, false, false);
+
     assert!(
-        result.is_node_hosting(&host_label, &contract_key),
+        result.is_node_hosting(
+            &freenet::dev_tool::NodeLabel::node(NETWORK_NAME, 7),
+            &contract_key
+        ),
         "host should hold the seeded contract"
     );
-
-    // DEAD-END (expected without migration): no close-cluster peer hosts the
-    // contract, so a key-routed GET dead-ends and the requester gets nothing.
-    let migrated: Vec<usize> = (1..=6usize)
-        .filter(|n| result.is_node_hosting(&NodeLabel::node(NETWORK_NAME, *n), &contract_key))
-        .collect();
+    let placed = close_cluster_hosts(&result, NETWORK_NAME, &contract_key);
     assert!(
-        migrated.is_empty(),
-        "without migration, no close-cluster peer should host the contract, but these do: \
-         {migrated:?} (cascade leaked into a migration-disabled sim?)"
+        placed.is_empty(),
+        "without migration and without any GET, no close-cluster peer may host the \
+         contract, but these do: {placed:?} (cascade leaked into a migration-disabled sim?)"
     );
+}
+
+/// Retry diversity (#5660) resolves the close-cluster dead-end on its own.
+///
+/// The original negative-control scenario, run under its original network
+/// name, so main's history of this exact run dead-ending is evidence that the
+/// fix changes the outcome. Migration is pinned OFF: a far requester GETs a
+/// contract held only by a far host (node 7), and the peers closest to the key
+/// do not hold it. Before retry diversity every retry re-picked the same first
+/// hop and the GET dead-ended at the cluster. Now each retry starts from a
+/// first hop that has not answered NotFound, and the requester gets the state.
+///
+/// Mechanism: the requester's router labels each peer that answered NotFound at
+/// most once per operation, so two or more NotFound labels means two or more
+/// distinct first hops. That assertion is what pins the fix: the outcome has
+/// no margin, since the GET resolves on its fourth and last attempt, so one
+/// more NotFound first hop in this topology would turn it red with no
+/// regression in retry diversity.
+#[test_log::test]
+fn test_get_retries_resolve_close_cluster_dead_end_without_migration() {
+    const NETWORK_NAME: &str = "get-placement-deadend-control";
+    let (result, contract_key) = run_close_cluster_placement(NETWORK_NAME, false, true);
+    let requester = freenet::dev_tool::NodeLabel::node(NETWORK_NAME, 8);
+
     let requester_has_state = result
         .node_storages
-        .get(&requester_label)
+        .get(&requester)
         .is_some_and(|s| s.get_stored_state(&contract_key).is_some());
     assert!(
-        !requester_has_state,
-        "without migration the requester GET must dead-end at the close non-hosting cluster \
-         and obtain NO state (the far host is off the greedy path toward the key)"
+        requester_has_state,
+        "with retry diversity the requester GET must resolve without migration. This run \
+         has no margin (it resolves on the last attempt), so red here can also mean one \
+         more NotFound first hop in this topology rather than a retry-diversity \
+         regression: check the mechanism assertion below first"
+    );
+    let (not_found, _, _) = result
+        .node_route_failure_causes(&requester)
+        .expect("the requester published its ring");
+    assert!(
+        not_found >= 2,
+        "mechanism: the GET's retries must have started from distinct first hops, so at \
+         least two different peers answered NotFound (NotFound labels: {not_found})"
     );
 }
 
@@ -11673,29 +12638,37 @@ fn test_get_dead_ends_at_close_cluster_without_migration() {
 ///     advertise its hosting to it;
 ///   - a far requester issues a GET.
 ///
-/// Placement migration is disabled, so the ONLY mechanism that can carry the
-/// state to the requester is the terminal consult. GET is single-path greedy
+/// Placement migration is disabled. GET is single-path greedy
 /// (relay `MAX_RELAY_RETRIES = 1`): a relay forwards to its single closest
 /// neighbor toward the key and bubbles NotFound without trying its other
 /// neighbors — so the advertised host, being a non-closest neighbor of the
 /// terminus, is exactly the "one hop off the routing path" case. WITHOUT the
-/// consult this dead-ends (proven by
-/// `test_get_dead_ends_at_close_cluster_without_migration`, whose host is too
-/// far to be a terminus neighbor); WITH it, the terminus consults the host
-/// advertisement it received and forwards there, closing the dead-end.
+/// consult a single attempt dead-ends here; WITH it, the terminus consults the
+/// host advertisement it received and forwards there, closing the dead-end.
+/// Since #5660 a GET's retries can also resolve such a dead-end by starting
+/// from a different first hop, so the requester's state alone would not prove
+/// the consult worked.
 ///
 /// The proof is the consult telemetry: `terminal_consult_resolved_found() > 0`
 /// is recorded ONLY when a consulted advertised host returns Found, so with
 /// migration off it is unambiguous that the consult (not routing or migration)
 /// delivered the state.
+///
+/// **HTL 3 is load-bearing** (#5172). The dead-end is HTL exhaustion inside
+/// the cluster: the HTL-0 peer answers NotFound and a relay above it, which
+/// forwarded and got that NotFound back, consults. Raise the HTL and the walk
+/// can reach the host by routing (no consult at all) or dead-end at a peer
+/// holding no advertisement, depending on the seed's topology. Coverage given
+/// up by this: the downstream NotFound no longer comes from a peer with no
+/// closer unvisited candidate (the deepest greedy terminus). The consult runs
+/// on the same "forwarded, got a clean NotFound" path either way, but a
+/// consult that follows a no-candidate NotFound is no longer exercised here.
 #[test_log::test]
 fn test_terminal_advertisement_consult_closes_get_dead_end() {
     use freenet::config::GlobalTestMetrics;
     use freenet::dev_tool::{Location, NodeLabel, ScheduledOperation, SimNetwork, SimOperation};
 
-    // Seed + host offset chosen so the host lands as a non-closest neighbor of
-    // an outer cluster peer (advertises to it, but greedy routing never selects
-    // it). Deterministic under the direct/turmoil runner for this seed.
+    // The dead-end is made STRUCTURAL by the HTL below, not found by the seed.
     const SEED: u64 = 0xC0FF_EEC0_0004;
     const NETWORK_NAME: &str = "terminal-consult-deadend";
     setup_deterministic_state(SEED);
@@ -11730,10 +12703,18 @@ fn test_terminal_advertisement_consult_closes_get_dead_end() {
             NETWORK_NAME,
             1,         // 1 gateway
             num_nodes, // 8 regular nodes
-            10,        // ring_max_htl
-            7,         // rnd_if_htl_above
-            8,         // max_connections
-            3,         // min_connections
+            // HTL 3 with no random hops, so the GET dead-ends by HTL
+            // exhaustion inside the non-hosting cluster instead of wherever
+            // the seed's topology happens to put a dead-end (#5172). See the
+            // SUBSCRIBE counterpart below for the full account; for this
+            // test, with one extra `GlobalRng` draw per transport noop (0..11
+            // draws), 9 of 12 trajectories failed at HTL 10: either routing
+            // walked onto the host (attempts=0) or the dead-end formed at a
+            // peer holding no advertisement from it (attempts=1, hits=0).
+            3, // ring_max_htl
+            3, // rnd_if_htl_above
+            8, // max_connections
+            3, // min_connections
             SEED,
             &node_locations,
         )
@@ -11862,14 +12843,19 @@ fn test_terminal_advertisement_consult_closes_get_dead_end() {
 /// Proof is `terminal_consult_resolved_found() > 0` (recorded ONLY when a
 /// consulted host returns Subscribed); with migration off it is unambiguous
 /// that the consult (not routing or migration) closed the subscribe dead-end.
+///
+/// **HTL 3 is load-bearing** (#5172); see the comment at the
+/// `new_with_node_locations` call. Coverage given up, as in the GET test: the
+/// downstream NotFound now comes from HTL exhaustion, not from a peer with no
+/// closer unvisited candidate (which reports NotFound without consulting, see
+/// `drive_relay_subscribe`), so a consult that follows that kind of NotFound
+/// is no longer exercised here.
 #[test_log::test]
 fn test_terminal_advertisement_consult_closes_subscribe_dead_end() {
     use freenet::config::GlobalTestMetrics;
     use freenet::dev_tool::{Location, NodeLabel, ScheduledOperation, SimNetwork, SimOperation};
 
-    // Seed + placement chosen so the requester's upstream SUBSCRIBE routes into
-    // the non-hosting cluster and dead-ends at a relay whose off-path neighbor
-    // is the advertised host. Deterministic under the turmoil runner.
+    // The dead-end is made STRUCTURAL by the HTL below, not found by the seed.
     const SEED: u64 = 0xC0FF_EEC0_0008;
     const NETWORK_NAME: &str = "terminal-consult-subscribe-deadend";
     setup_deterministic_state(SEED);
@@ -11894,12 +12880,33 @@ fn test_terminal_advertisement_consult_closes_subscribe_dead_end() {
 
     let rt = create_runtime();
     let mut sim = rt.block_on(async {
+        // HTL 3, and no random hops (`rnd_if_htl_above` = max HTL), so the
+        // SUBSCRIBE dead-ends by HTL exhaustion INSIDE the non-hosting cluster
+        // (#5172).
+        //
+        // It used to run at HTL 10 and rely on the seed for the dead-end. A
+        // relay forwards to its closest UNVISITED neighbour, not only to a
+        // strictly closer one, so a long walk visits the whole six-peer
+        // cluster and then takes the host as the next-closest candidate:
+        // routing reaches it, the subscribe succeeds, and the consult never
+        // runs (attempts=0). Whether the walk got that far before dead-ending
+        // at a peer with no unvisited neighbours depended on which cluster
+        // peer happened to hold a connection to the host, which the RNG
+        // trajectory decides. With one extra `GlobalRng` draw per transport
+        // noop (0..11 draws, nothing else changed), 10 of 12 trajectories
+        // never formed the dead-end.
+        //
+        // At HTL 3 the walk is requester -> three cluster relays -> one more
+        // cluster peer that answers NotFound on HTL=0. Every relay on it has
+        // an unvisited cluster neighbour closer to the key than the host
+        // (cluster +-0.01, host +0.05), so routing does not pick the host, and
+        // each relay on the way back consults the host advertisements.
         SimNetwork::new_with_node_locations(
             NETWORK_NAME,
             1,
             num_nodes,
-            10,
-            7,
+            3,
+            3,
             8,
             3,
             SEED,
@@ -12619,12 +13626,12 @@ fn test_placement_migration_at_scale_renewal_load_stays_bounded() {
         // test could pass with migration silently inert (which would defeat its
         // purpose as migration's scale home).
         let mut migrated: Vec<(usize, usize)> = Vec::new();
-        for ci in 0..NUM_CONTRACTS {
+        for (ci, key) in contract_keys.iter().enumerate() {
             // Non-loaded regular nodes are node_no 2..=num_nodes (node 1 is the
             // loaded host; the loaded node hosting its own seeded contract is not
             // a migration).
             for n in 2..=num_nodes {
-                if result.is_node_hosting(&NodeLabel::node(network_name, n), &contract_keys[ci]) {
+                if result.is_node_hosting(&NodeLabel::node(network_name, n), key) {
                     migrated.push((ci, n));
                 }
             }
@@ -13286,6 +14293,47 @@ fn test_subscription_count_tracks_demand_not_cache() {
                 duration: Duration::from_secs(20 * 60),
             },
         ));
+        // Then let every operation that was in flight across that jump finish,
+        // and jump again past a full lease (#5172).
+        //
+        // The hosting clock is frozen between jumps, so a 20-minute jump lands
+        // INSTANTLY in the middle of whatever is on the wire. A §3 renewal the
+        // hub legitimately dispatched just BEFORE the jump (the GETs were
+        // seconds old, so the cache contracts were rightly eligible) completes
+        // just AFTER it, and the hub and its upstream stamp the lease
+        // `now + SUBSCRIPTION_LEASE_DURATION` against the post-jump clock. The
+        // lease is then fresh at the snapshot, although nothing renewed it
+        // after demand faded: the renewal cycles after the jump select only
+        // the two demand contracts. Whether a renewal cycle happens to fire in
+        // the few virtual seconds before the jump is decided by the RNG
+        // trajectory, so a single unrelated extra `GlobalRng` draw anywhere
+        // flipped this test into reporting a #3763 storm that was not there.
+        // No real operation spans 20 minutes (`OPERATION_TTL` is 60s), so the
+        // single-jump straddle is a harness artifact, not product behaviour.
+        //
+        // Each in-order special event settles for 3s of virtual time, so 22
+        // no-op advances give 66s, which outlasts `OPERATION_TTL`: every
+        // renewal spawned before the first jump has resolved before the
+        // second. The second jump (> SUBSCRIPTION_LEASE_DURATION) lapses any
+        // lease such a straddling renewal installed. The property is
+        // unchanged and no weaker: zero cache-only leases anywhere after
+        // demand fades. The demand contracts re-acquire their leases through
+        // the §2 client-subscription path within one 30s renewal cycle of the
+        // second jump, well inside the 120s post-operation wait.
+        for _ in 0..22 {
+            ops.push(ScheduledOperation::new(
+                hub.clone(),
+                SimOperation::AdvanceHostingClock {
+                    duration: Duration::ZERO,
+                },
+            ));
+        }
+        ops.push(ScheduledOperation::new(
+            hub.clone(),
+            SimOperation::AdvanceHostingClock {
+                duration: Duration::from_secs(20 * 60),
+            },
+        ));
 
         let result = sim.run_controlled_simulation(
             seed,
@@ -13661,12 +14709,6 @@ fn test_subscription_chain_collapses_on_client_leave() {
 struct PieceEGateMetrics {
     // ---- Findability (wire per-tx, the codebase's own GET-reliability metric) ----
     get_attempts: u64,
-    get_successes: u64,
-    get_not_found: u64,
-    get_failures: u64,
-    get_timeouts: u64,
-    /// Successes whose GET traversed the network (hop_count >= 1).
-    network_successes: u64,
     /// wire successes / attempts, in [0, 1].
     findability_rate: f64,
     // ---- Findability (client-visible: requester ended up holding the state) ----
@@ -13693,9 +14735,6 @@ struct PieceEGateMetrics {
     /// Requesters that ended holding a NON-current state (SERVED STALE) — the
     /// direct #4709 signal.
     requesters_stale: usize,
-    /// requesters_stale / (requesters_fresh + requesters_stale), in [0, 1].
-    /// PRIMARY stale-serve number. `None` if no requester obtained any state.
-    stale_serve_rate: Option<f64>,
     /// Mesh subscribers, and how many ended fresh (invariant-1 positive control).
     subscribers_total: usize,
     subscribers_fresh: usize,
@@ -13761,12 +14800,6 @@ fn compute_piece_e_metrics(
     } else {
         requesters_with_state as f64 / requesters_total as f64
     };
-    let served = requesters_fresh + requesters_stale;
-    let stale_serve_rate = if served == 0 {
-        None
-    } else {
-        Some(requesters_stale as f64 / served as f64)
-    };
 
     // --- Subscription-tree formation ---
     let hosting_nodes = result
@@ -13799,11 +14832,6 @@ fn compute_piece_e_metrics(
 
     PieceEGateMetrics {
         get_attempts,
-        get_successes: summary.successes,
-        get_not_found: summary.not_found,
-        get_failures: summary.failures,
-        get_timeouts: summary.timeouts,
-        network_successes: summary.network_successes,
         findability_rate,
         requesters_total,
         requesters_with_state,
@@ -13815,7 +14843,6 @@ fn compute_piece_e_metrics(
         stale_holders,
         requesters_fresh,
         requesters_stale,
-        stale_serve_rate,
         subscribers_total,
         subscribers_fresh,
     }
@@ -14823,19 +15850,23 @@ fn test_step9_source2_removal_subscriber_heals_via_anti_entropy() {
 /// without CRDT emulation. See `mock_runtime.rs::get_contract_state_delta`.
 ///
 /// **Role choice is load-bearing, not arbitrary:** the second (probing) PUT
-/// MUST originate from the GATEWAY, not the regular node. `RemoteConnection::
-/// remote_protoc_version` is `None` on the joiner->gateway path ("the
-/// gateway's AckConnection payload carries no version" — see
-/// `transport/peer_connection.rs`), so a regular node's `ConnectionManager`
-/// never records its gateway's negotiated version and `supports_summary_first_put`
-/// fails closed for EVERY PUT a regular node routes through its gateway link —
-/// in production as much as in sim, this is not a simulation-harness gap.
-/// Only the gateway's connection TO the node carries the node's version, so
-/// only a gateway-originated PUT can pass the emission gate in a
-/// gateway/regular-node topology. (Confirmed empirically: with the roles
-/// reversed, the regular node's PUT never even logs a
+/// MUST originate from the GATEWAY, not the regular node. A regular node's
+/// `ConnectionManager` does not record its gateway's negotiated version here,
+/// so `supports_summary_first_put` fails closed for EVERY PUT a regular node
+/// routes through its gateway link. Only the gateway's connection TO the node
+/// carries the node's version, so only a gateway-originated PUT can pass the
+/// emission gate in a gateway/regular-node topology. (Confirmed empirically:
+/// with the roles reversed, the regular node's PUT never even logs a
 /// `PUT summary-first: ...` line — the whole block is skipped, not merely
 /// falling through inside it.)
+///
+/// That asymmetry USED to be production behaviour too — the gateway's
+/// `AckConnection` carried no version, so a joiner could never learn it — but
+/// #5161 fixed that, and it now survives here only because
+/// `ack_version_floor_override` defaults the version-carrying ack OFF in
+/// simulations (see `SimNetwork::enable_gateway_ack_version` for why). If this
+/// test is ever switched to `enable_gateway_ack_version`, node1's own PUT
+/// starts passing the gate too and the counter assertions below change.
 #[test_log::test]
 fn test_summary_first_put_holder_found_ships_delta() {
     use freenet::dev_tool::{NodeLabel, ScheduledOperation, SimOperation, register_crdt_contract};
@@ -14878,8 +15909,9 @@ fn test_summary_first_put_holder_found_ships_delta() {
         // node1 PUTs + subscribes: becomes a fresh holder
         // (`Ring::is_receiving_updates` true via its own client subscription).
         // Its own PUT never touches the probe counters (see rustdoc above:
-        // its connection to the gateway can't carry the gateway's version),
-        // so this is a clean, counter-neutral way to seed the holder.
+        // with the version-carrying ack off — the sim default, #5161 — its
+        // connection to the gateway carries no gateway version), so this is a
+        // clean, counter-neutral way to seed the holder.
         ScheduledOperation::new(
             node1.clone(),
             SimOperation::Put {
@@ -14927,11 +15959,11 @@ fn test_summary_first_put_holder_found_ships_delta() {
         "summary-first PUT delta test: probe outcome counters"
     );
 
-    // node1's own PUT never touches these counters: its connection to the
-    // gateway never carries the gateway's negotiated version (see rustdoc
-    // above), so `supports_summary_first_put` fails closed and the whole
-    // summary-first block is skipped for node1's PUT — only the gateway's
-    // PUT can move them.
+    // node1's own PUT never touches these counters: with the version-carrying
+    // ack off (the sim default, #5161 — see rustdoc above) its connection to the
+    // gateway carries no gateway version, so `supports_summary_first_put` fails
+    // closed and the whole summary-first block is skipped for node1's PUT —
+    // only the gateway's PUT can move them.
     assert_eq!(
         new_contract_sends, 0,
         "no-holder path must NOT fire: the gateway's PUT found a fresh \
@@ -15002,10 +16034,9 @@ fn test_summary_first_put_holder_found_ships_delta() {
 /// hosting behavior rather than silently doing nothing.
 ///
 /// The PUT originates from the GATEWAY, not a regular node — see the rustdoc
-/// on `test_summary_first_put_holder_found_ships_delta` for why: a regular
-/// node's connection to its gateway never carries the gateway's negotiated
-/// version (`RemoteConnection::remote_protoc_version` is `None` on the
-/// joiner->gateway path in both production and sim), so `supports_summary_first_put`
+/// on `test_summary_first_put_holder_found_ships_delta` for why: with the
+/// version-carrying ack off (the simulation default, #5161) a regular node's
+/// connection to its gateway carries no version, so `supports_summary_first_put`
 /// fails closed and a regular-node-originated PUT here would skip the
 /// summary-first block entirely rather than exercising the no-holder branch.
 #[test_log::test]
@@ -15157,7 +16188,8 @@ fn test_summary_first_put_reverse_delta_converges_originator() {
     let operations = vec![
         // node1 PUTs v2 + subscribes: becomes a fresh holder AHEAD of the
         // originator. (Its own PUT never touches the probe counters — its
-        // link to the gateway carries no gateway version, see Test A.)
+        // link to the gateway carries no gateway version with the ack gate off,
+        // see Test A.)
         ScheduledOperation::new(
             node1.clone(),
             SimOperation::Put {
@@ -15255,6 +16287,363 @@ fn test_summary_first_put_reverse_delta_converges_originator() {
     // Avoid leaking the CRDT registration into other tests sharing this process.
     freenet::dev_tool::clear_crdt_contracts();
 }
+
+// =============================================================================
+// Hash-first summary exchange (#4965) — behavioral simulation A/B
+// =============================================================================
+//
+// Hash-first is ON by default in every simulation
+// (`SimNetwork::SIM_MIGRATION_ENABLED_FLOOR`): it changes only the ENCODING of
+// an exchange every sim already runs, with identical convergence semantics, so
+// defaulting it on costs unrelated sims nothing and gives a version-gated wire
+// change integration coverage BEFORE the release that lifts the crate version
+// past its production floor. These tests state that premise explicitly at the
+// call site anyway, so a future edit to the default cannot silently make them
+// vacuous.
+//
+// NOTE ON WHICH LEG IS EXERCISED: after the #4965 review, digest-first ships on
+// the two REPLY legs only (`InterestsReply`, `ChangeInterestsReply`) —
+// `Notification` and `Rejection` stay full-bytes. Only `InterestsReply` is
+// genuinely multi-entry; this comment said "the two MULTI-ENTRY reply legs"
+// until 2026-08-12, corrected per #5153 review F1, because
+// `ChangeInterestsReply` is single-entry 100% of the time (one contract per
+// `broadcast_change_interests` gossip; measured mean 1.000, `max_entries` 1,
+// over 418,476 messages on 1,284 peers). So the digests observed here
+// necessarily come from the connection-time `Interests` -> reply exchange, which
+// is the leg that matters, and NOT from the per-state-change notification.
+// `summaries_reply_for_peer` is the only path that can emit a digest, and only
+// those two legs call it.
+
+/// Shared A/B machinery: run one scenario under one encoding and report the
+/// summary-exchange counters plus what converged.
+struct HashFirstRun {
+    digest_msgs: u64,
+    full_msgs: u64,
+    full_bytes: u64,
+    byte_requests: u64,
+    agree_single: u64,
+    agree_multi: u64,
+    mismatch_single: u64,
+    mismatch_multi: u64,
+    hosting: Vec<String>,
+}
+
+impl HashFirstRun {
+    /// Every message the summary exchange put on the wire, both encodings.
+    fn exchange_msgs(&self) -> u64 {
+        self.digest_msgs + self.full_msgs + self.byte_requests
+    }
+    fn agreements(&self) -> u64 {
+        self.agree_single + self.agree_multi
+    }
+    fn mismatches(&self) -> u64 {
+        self.mismatch_single + self.mismatch_multi
+    }
+}
+
+/// `divergent = false`: both peers converge on one state, so digests agree.
+/// `divergent = true`: the two peers are SEEDED with different states for the
+/// same contract, so their summaries genuinely differ and the digest exchange
+/// must take the mismatch path.
+fn run_hash_first_ab(name: &str, seed: u64, hash_first: bool, divergent: bool) -> HashFirstRun {
+    use freenet::dev_tool::{NodeLabel, ScheduledOperation, SimOperation};
+
+    // Seeds GlobalRng/GlobalSimulationTime and resets GlobalTestMetrics. The
+    // handler's over-cap rotation draws from GlobalRng, so an unseeded run
+    // would be nondeterministic here.
+    setup_deterministic_state(seed);
+    let rt = create_runtime();
+
+    let gateway = NodeLabel::gateway(name, 0);
+    let node1 = NodeLabel::node(name, 1);
+
+    let contract = SimOperation::create_test_contract(0x49);
+    let contract_key = contract.key();
+
+    let mut sim = rt.block_on(async { SimNetwork::new(name, 1, 1, 7, 3, 10, 2, seed).await });
+    if hash_first {
+        sim.enable_hash_first_summaries();
+    } else {
+        sim.disable_hash_first_summaries();
+    }
+
+    let operations = if divergent {
+        // Both peers genuinely HOST the same contract with DIFFERENT states,
+        // seeded locally so no network propagation reconciles them. Their
+        // summaries therefore differ when the connection-time interest
+        // exchange runs, which is what forces the digest mismatch path.
+        // Seeding alone produces NO summary exchange: with no network
+        // activity the peers never run an interest exchange inside the driven
+        // window (verified — every counter came back zero). So a SECOND
+        // contract is PUT and subscribed to drive connections and the
+        // interest exchange, while the first stays divergent by construction:
+        // it is only ever seeded locally, never PUT, so nothing reconciles it.
+        let driver = SimOperation::create_test_contract(0x5B);
+        let driver_key = driver.key();
+        vec![
+            ScheduledOperation::new(
+                gateway.clone(),
+                SimOperation::SeedHostedContract {
+                    contract: contract.clone(),
+                    state: SimOperation::create_test_state(0x49),
+                },
+            ),
+            ScheduledOperation::new(
+                node1.clone(),
+                SimOperation::SeedHostedContract {
+                    contract: contract.clone(),
+                    state: SimOperation::create_test_state(0xA7),
+                },
+            ),
+            ScheduledOperation::new(
+                gateway.clone(),
+                SimOperation::Put {
+                    contract: driver.clone(),
+                    state: SimOperation::create_test_state(0x5B),
+                    subscribe: true,
+                },
+            ),
+            ScheduledOperation::new(
+                node1.clone(),
+                SimOperation::Subscribe {
+                    contract_id: *driver_key.id(),
+                },
+            ),
+        ]
+    } else {
+        vec![
+            ScheduledOperation::new(
+                gateway.clone(),
+                SimOperation::Put {
+                    contract: contract.clone(),
+                    state: SimOperation::create_test_state(0x49),
+                    subscribe: true,
+                },
+            ),
+            ScheduledOperation::new(
+                node1.clone(),
+                SimOperation::Subscribe {
+                    contract_id: *contract_key.id(),
+                },
+            ),
+            ScheduledOperation::new(
+                gateway.clone(),
+                SimOperation::Update {
+                    key: contract_key,
+                    data: SimOperation::create_test_state(0x4A),
+                },
+            ),
+        ]
+    };
+
+    // 400s > the 300s INTEREST_HEARTBEAT_INTERVAL, so the PERIODIC
+    // Interests -> reply exchange fires inside the window, not just the
+    // connection-time one. Virtual time, so the extra 280s is nearly free.
+    let result = sim.run_controlled_simulation(
+        seed,
+        operations,
+        Duration::from_secs(400),
+        Duration::from_secs(30),
+    );
+    assert!(
+        result.turmoil_result.is_ok(),
+        "hash-first sim ({name}) failed: {:?}",
+        result.turmoil_result.err()
+    );
+
+    // Strip the per-run network-name prefix. `NodeLabel` renders as
+    // `<network>-gateway-0`, and the two runs necessarily use DIFFERENT network
+    // names (turmoil keys its DNS on them), so comparing raw labels compares the
+    // run names and can never match. What is compared is which ROLES converged.
+    let prefix = format!("{name}-");
+    let mut hosting: Vec<String> = result
+        .node_storages
+        .iter()
+        .filter(|(_, s)| s.get_stored_state(&contract_key).is_some())
+        .map(|(label, _)| {
+            let full = label.to_string();
+            full.strip_prefix(&prefix).unwrap_or(&full).to_string()
+        })
+        .collect();
+    hosting.sort();
+
+    HashFirstRun {
+        digest_msgs: GlobalTestMetrics::summary_digest_msgs(),
+        full_msgs: GlobalTestMetrics::summary_full_msgs(),
+        full_bytes: GlobalTestMetrics::summary_full_bytes(),
+        byte_requests: GlobalTestMetrics::summary_byte_requests(),
+        agree_single: GlobalTestMetrics::summary_digest_agreements_single(),
+        agree_multi: GlobalTestMetrics::summary_digest_agreements_multi(),
+        mismatch_single: GlobalTestMetrics::summary_digest_mismatches_single(),
+        mismatch_multi: GlobalTestMetrics::summary_digest_mismatches_multi(),
+        hosting,
+    }
+}
+
+/// **A/B falsifier, AGREE arm: hash-first must ship strictly fewer summary
+/// bytes without costing more messages, and without changing convergence.**
+///
+/// # Why this test exists
+///
+/// Everything else in this PR proves hash-first BREAKS nothing. Nothing else
+/// proves it HELPS. The change is justified entirely by a bandwidth saving, and
+/// until something measures that saving end to end it is a hypothesis.
+///
+/// # Why bytes alone would be the wrong assertion
+///
+/// Hash-first trades bytes for messages on the mismatch path: one `Summaries`
+/// becomes `SummaryDigests` -> `SummaryRequest` -> `Summaries`. #4861
+/// established per-peer broadcast MESSAGES/s — not bytes — as the load-bearing
+/// storm signal, so a version that halved bytes while multiplying messages
+/// would regress the exact axis that caused the storm.
+///
+/// In THIS arm every comparison agrees, so the mismatch multiplier is zero and
+/// the message count must not rise at all — which is asserted, with
+/// `mismatches() == 0` pinned as an explicit PREMISE so the reader knows the
+/// no-multiplier case is what is being tested.
+///
+/// **Stated limit:** this arm therefore cannot catch a message-multiplication
+/// bug, because its fixture has no mismatches to multiply. The multiplication
+/// itself is covered at handler level by
+/// `node.rs::hash_first_summaries::mismatching_digest_requests_bytes_and_the_heal_still_fires`.
+/// See the note below this test for the three sim fixtures that failed to
+/// produce a mismatch and why no sim-level divergent arm is shipped.
+#[test_log::test]
+fn test_hash_first_summaries_ships_fewer_bytes_and_still_converges() {
+    const SEED: u64 = 0x4965_5F01_CAFE;
+
+    let on = run_hash_first_ab("hash-first-on", SEED, true, false);
+    let off = run_hash_first_ab("hash-first-off", SEED, false, false);
+
+    tracing::info!(
+        on_digest_msgs = on.digest_msgs,
+        on_full_msgs = on.full_msgs,
+        on_full_bytes = on.full_bytes,
+        on_byte_requests = on.byte_requests,
+        on_exchange_msgs = on.exchange_msgs(),
+        on_agreements = on.agreements(),
+        on_mismatches = on.mismatches(),
+        off_full_msgs = off.full_msgs,
+        off_full_bytes = off.full_bytes,
+        off_exchange_msgs = off.exchange_msgs(),
+        "hash-first A/B (agree arm)"
+    );
+
+    // ---- PREMISES, before any conclusion is drawn ----
+    //
+    // Without these, two runs that both did the same thing produce an
+    // equal-bytes result that reads as "no regression" rather than "the test
+    // never exercised the feature".
+    assert_eq!(
+        off.digest_msgs, 0,
+        "premise: the pinned-fallback run must emit NO SummaryDigests. If it \
+         does, disable_hash_first_summaries is not taking effect and every \
+         comparison below is meaningless"
+    );
+    assert!(
+        on.digest_msgs > 0,
+        "premise: the enabled run must emit SummaryDigests. Zero means the \
+         hash-first path never ran — the exact way this test would go quiet if \
+         the sim default, the version gate, or the leg restriction changed \
+         underneath it"
+    );
+    assert!(
+        off.full_bytes > 0,
+        "premise: the fallback run must actually ship summary bytes, or there \
+         is no baseline to improve on"
+    );
+    assert_eq!(
+        on.mismatches(),
+        0,
+        "premise for THIS arm: every comparison must agree, so the message \
+         assertion below is testing the no-multiplier case. Non-zero means the \
+         fixture drifted and the divergent twin is the test that applies"
+    );
+
+    // ---- THE CLAIM ----
+    assert!(
+        on.full_bytes < off.full_bytes,
+        "hash-first must ship strictly FEWER summary bytes for identical work \
+         ({} enabled vs {} fallback). This is the entire justification for the \
+         wire change.",
+        on.full_bytes,
+        off.full_bytes
+    );
+
+    // ---- ...WITHOUT PAYING FOR IT IN MESSAGES (#4861) ----
+    assert!(
+        on.exchange_msgs() <= off.exchange_msgs(),
+        "with zero mismatches hash-first must not cost MORE summary-exchange \
+         messages than the fallback ({} vs {})",
+        on.exchange_msgs(),
+        off.exchange_msgs()
+    );
+
+    // ---- WHERE THE SAVING COMES FROM ----
+    assert!(
+        on.agreements() > 0,
+        "the enabled run must settle at least one contract by digest agreement \
+         — that is the mechanism; a run that saved bytes with zero agreements \
+         saved them for some other reason"
+    );
+    assert_eq!(
+        off.agreements(),
+        0,
+        "the fallback run cannot agree by digest — it never sends one"
+    );
+
+    // ---- CONVERGENCE IS UNAFFECTED ----
+    //
+    // Guard the normalisation itself: if `NodeLabel`'s rendering changes so the
+    // prefix no longer strips, both sides stay run-scoped and the equality below
+    // fails loudly. The dangerous direction is the other one — both sides
+    // normalising to the same constant would pass vacuously. Requiring a
+    // recognisable role name rules that out.
+    assert!(
+        on.hosting.iter().any(|l| l.contains("gateway")),
+        "convergence labels should be role-scoped after stripping the run \
+         prefix, got {:?} — the normalisation is not doing what it claims",
+        on.hosting
+    );
+    assert_eq!(
+        on.hosting, off.hosting,
+        "the same peers must end up hosting the contract under both encodings \
+         — hash-first changes how summaries are ADVERTISED, never what the \
+         network converges to"
+    );
+}
+
+// NOT PRESENT: a sim-level DIVERGENT arm.
+//
+// The review asked for a second arm that forces digest MISMATCHES, so the
+// message-multiplication bound (`on <= off + 2*mismatches`) would have a
+// non-empty population to apply to. Three fixtures were tried and none
+// produced a single mismatch, so no such test is shipped rather than one whose
+// premise it cannot meet:
+//
+//   1. `SeedHostedContract` with different states on both peers, 120s window —
+//      every counter zero; with no network activity the peers never run an
+//      interest exchange inside the driven window at all.
+//   2. Same, 400s window (past the 300s `INTEREST_HEARTBEAT_INTERVAL`) —
+//      still all zero; the run ends when the scheduled operations drain, so
+//      the longer virtual window never elapses.
+//   3. Same, plus a second contract PUT+subscribed to drive connections — an
+//      exchange DOES occur (1 digest, 1 agreement) but it covers only the
+//      driver contract; the locally-seeded divergent contract never enters
+//      `get_matching_contracts`, because the interest exchange has already run
+//      by the time the seeds land.
+//
+// The mismatch path is NOT untested: `node.rs::hash_first_summaries::
+// mismatching_digest_requests_bytes_and_the_heal_still_fires` drives the full
+// chain at handler level (digest mismatch -> `SummaryRequest` -> full
+// `Summaries` -> targeted `SyncStateToPeer` heal) with real state, and is
+// mutation-verified. What is missing is only the SIM-level confirmation that
+// the message arithmetic holds end to end under real scheduling.
+//
+// Tracked as a follow-up rather than blocking: the arithmetic is analytic
+// (1 message per agreement, 3 per mismatch), the failure mode is fail-safe
+// (fall back to bytes), and the leg restriction bounds the exposure to one
+// exchange per pair per heartbeat.
 
 // =============================================================================
 // NEAREST-NEIGHBOR RING LATTICE — validation + regression (feat(topology)).
@@ -15699,14 +17088,14 @@ fn nn_run_put_reach(
     for (label, storage) in result.node_storages.iter() {
         if storage.get_stored_state(&contract_key).is_some() {
             total_holders += 1;
-            for idx in 0..locs.len() {
+            for (idx, &loc) in locs.iter().enumerate() {
                 let matches_label = if idx == 0 {
                     *label == NodeLabel::gateway(&network, 0)
                 } else {
                     *label == NodeLabel::node(&network, idx)
                 };
                 if matches_label {
-                    landing_loc = Some(locs[idx]);
+                    landing_loc = Some(loc);
                 }
             }
         }
@@ -16407,5 +17796,1678 @@ fn test_every_hop_summarize_calls_flat_vs_fanout() {
          max_per_peer={max_summarize} <= {per_peer_bound} (≈K={K}); \
          total_summarize={total_summarize} << per_target_broadcasts={update_broadcast_targets} \
          (>= vacuity_floor={vacuity_floor})"
+    );
+}
+
+/// **#5161 end to end, through the real handshake, with its own controls.**
+///
+/// A regular node connects to a gateway. Before this fix, its side of that link
+/// carried no version at all: the version rides in the asymmetrically-encrypted
+/// intro packet, only the RECEIVING side of an intro learns it, and a gateway
+/// never sends one back — it replies with an `AckConnection` that has no version
+/// field. So `remote_version` was `None` for every gateway link a node held, and
+/// every `version_supports_*` gate fell back to the legacy wire format on
+/// exactly the highest-degree, highest-traffic links on the network.
+///
+/// Three simulations, run in one test so the claims are measured differences
+/// rather than assertions against a remembered baseline a later edit could
+/// quietly invalidate. They differ only in their two floor overrides (and in
+/// network name, which the harness requires to be unique):
+///
+/// - **control** — gate off. Reproduces the pre-fix behaviour exactly. Without
+///   this arm the enabled arm could pass on a harness that populated versions
+///   by some other route, and would never have failed against the bug.
+/// - **enabled** — gate on. The node records the gateway's *exact* version, and
+///   `supports_hash_first_summaries` is true for that link.
+/// - **enabled, hash-first floor unreachable** — the arm that stops the
+///   hash-first assertion from being a restatement. With the sim's default
+///   hash-first floor of `(0,0,0)`, `supports_hash_first_summaries` reduces
+///   algebraically to `remote_version.is_some()`, so asserting it alongside
+///   `is_some()` carries no independent information (a reviewer caught this).
+///   Pinning that floor out of reach makes the two disagree: the version is
+///   known and the gate is still false, which is what proves the gate composes
+///   version AND floor rather than merely echoing the version.
+///
+/// The ack gate is opt-in per simulation rather than a suite-wide default; see
+/// `SimNetwork::enable_gateway_ack_version` for why, and for what that costs.
+#[test_log::test]
+fn test_joiner_records_gateway_version_through_sim_handshake() {
+    use freenet::dev_tool::NodeLabel;
+
+    const SEED: u64 = 0x5161_ACC0_CAFE;
+
+    struct Arm {
+        version: Option<(u8, u8, u16)>,
+        hash_first: bool,
+    }
+
+    fn run(network_name: &str, enable_ack_version: bool, enable_hash_first: bool) -> Arm {
+        setup_deterministic_state(SEED);
+        let rt = create_runtime();
+
+        let gateway = NodeLabel::gateway(network_name, 0);
+        let node1 = NodeLabel::node(network_name, 1);
+
+        let mut sim =
+            rt.block_on(async { SimNetwork::new(network_name, 1, 1, 7, 3, 10, 2, SEED).await });
+        if enable_ack_version {
+            sim.enable_gateway_ack_version();
+        }
+        if enable_hash_first {
+            sim.enable_hash_first_summaries();
+        } else {
+            sim.disable_hash_first_summaries();
+        }
+
+        let gateway_addr = *sim
+            .all_node_addresses()
+            .get(&gateway)
+            .expect("gateway must have an address");
+
+        let result = sim.run_controlled_simulation(
+            SEED,
+            Vec::new(),
+            Duration::from_secs(60),
+            Duration::from_secs(10),
+        );
+        assert!(
+            result.turmoil_result.is_ok(),
+            "gateway-ack-version sim failed: {:?}",
+            result.turmoil_result.err()
+        );
+
+        Arm {
+            version: result.node_recorded_remote_version(&node1, gateway_addr),
+            hash_first: result.node_supports_hash_first_summaries(&node1, gateway_addr),
+        }
+    }
+
+    let control = run("gateway-ack-version-control", false, true);
+    let enabled = run("gateway-ack-version-enabled", true, true);
+    let enabled_no_hash_first = run("gateway-ack-version-floored", true, false);
+
+    // The version every node in these sims runs. Asserted as an exact value,
+    // not merely `is_some`: a regression that recorded the WRONG version — the
+    // joiner echoing its own `PROTOC_VERSION`, or misreading the field — would
+    // satisfy `is_some`.
+    //
+    // Parsed here from `CARGO_PKG_VERSION` rather than read back out of the
+    // transport's own `parse_version_bytes`, so the expectation does not come
+    // from the encoder under test. This test crate is part of the `freenet`
+    // package, so the env var is freenet's version.
+    let expected = {
+        let mut parts = env!("CARGO_PKG_VERSION")
+            .split(['.', '-'])
+            .filter_map(|p| p.parse::<u16>().ok());
+        (
+            parts.next().expect("major") as u8,
+            parts.next().expect("minor") as u8,
+            parts.next().expect("patch"),
+        )
+    };
+
+    tracing::info!(
+        control_version = ?control.version,
+        control_hash_first = control.hash_first,
+        enabled_version = ?enabled.version,
+        enabled_hash_first = enabled.hash_first,
+        floored_version = ?enabled_no_hash_first.version,
+        floored_hash_first = enabled_no_hash_first.hash_first,
+        "gateway ack version: arm outcomes"
+    );
+
+    // Control: the bug, reproduced. If this ever starts passing, the enabled
+    // arm has stopped proving anything.
+    assert_eq!(
+        control.version, None,
+        "control arm must reproduce the pre-#5161 behaviour — a node learns \
+         NOTHING about its gateway's version when the version-carrying ack is off"
+    );
+    assert!(
+        !control.hash_first,
+        "control arm: an unknown gateway version must fail the hash-first gate closed"
+    );
+
+    // Enabled: the fix.
+    assert_eq!(
+        enabled.version,
+        Some(expected),
+        "the node MUST record its gateway's exact protocol version once the \
+         gateway answers with AckConnectionV2 — this is the whole of #5161"
+    );
+    assert!(
+        enabled.hash_first,
+        "with the gateway's version known, the node->gateway link must pass the \
+         hash-first gate: that is the user-visible consequence, since the \
+         fallback ships one full summary per shared contract"
+    );
+
+    // Enabled but floored out: version known, gate still closed. This is what
+    // makes the two assertions above independent of each other.
+    assert_eq!(
+        enabled_no_hash_first.version,
+        Some(expected),
+        "the ack gate and the hash-first floor are independent — raising the \
+         latter must not stop the node learning the version"
+    );
+    assert!(
+        !enabled_no_hash_first.hash_first,
+        "a KNOWN version below the hash-first floor must still fail closed; \
+         without this arm the hash-first assertions above are algebraically \
+         identical to the version assertions and cannot fail separately"
+    );
+}
+
+/// **The cascade #5161 unlocks, exercised where the suite otherwise cannot see
+/// it.** This is the mirror image of `test_summary_first_put_holder_found_ships_delta`:
+/// there the probing PUT MUST originate from the gateway, because a regular
+/// node could never learn its gateway's version and so failed
+/// `supports_summary_first_put` closed on every PUT it routed through that
+/// link. Here the roles are reversed and the regular node's PUT is the probing
+/// one — which works only because the version-carrying ack is enabled.
+///
+/// It exists because the ack gate is OFF by default in simulations (see
+/// `SimNetwork::enable_gateway_ack_version`). That default is deliberate, but
+/// it means no other sim covers what actually happens in production from
+/// 0.2.120: node->gateway links become eligible for every other
+/// `version_supports_*` feature at once, on the highest-degree nodes on the
+/// network. Without this test that transition would first be exercised by the
+/// fleet.
+///
+/// The discriminating assertion is `delta_sends == 1`. With the ack gate off it
+/// is 0 — the whole summary-first block is skipped, not merely fallen through —
+/// which is precisely what the reversed-roles note on Test A records having
+/// observed.
+#[test_log::test]
+fn test_gateway_ack_version_unlocks_node_originated_summary_first_put() {
+    use freenet::dev_tool::{NodeLabel, ScheduledOperation, SimOperation, register_crdt_contract};
+
+    const SEED: u64 = 0x5161_CA5C_ADE1;
+    const NETWORK_NAME: &str = "ack-version-cascade";
+
+    setup_deterministic_state(SEED);
+    let rt = create_runtime();
+
+    let gateway = NodeLabel::gateway(NETWORK_NAME, 0);
+    let node1 = NodeLabel::node(NETWORK_NAME, 1);
+
+    let contract = SimOperation::create_test_contract(0x5F);
+    let contract_id = *contract.key().id();
+    register_crdt_contract(contract_id);
+
+    let state_v1 = SimOperation::create_crdt_state(1, 0x11);
+    let state_v2 = SimOperation::create_crdt_state(2, 0x22);
+
+    let mut sim =
+        rt.block_on(async { SimNetwork::new(NETWORK_NAME, 1, 1, 7, 3, 10, 2, SEED).await });
+    sim.enable_summary_first_put();
+    // The point of the test: without this the node's PUT cannot pass the
+    // emission gate, and `delta_sends` below is 0.
+    sim.enable_gateway_ack_version();
+
+    let operations = vec![
+        // The GATEWAY seeds the holder this time (Test A has the node do it).
+        ScheduledOperation::new(
+            gateway.clone(),
+            SimOperation::Put {
+                contract: contract.clone(),
+                state: state_v1.clone(),
+                subscribe: true,
+            },
+        ),
+        // The regular NODE probes. Its only known peer is the gateway, so the
+        // probe necessarily travels the node->gateway link — the exact link
+        // that carried no version before #5161.
+        ScheduledOperation::new(
+            node1.clone(),
+            SimOperation::Put {
+                contract: contract.clone(),
+                state: state_v2.clone(),
+                subscribe: false,
+            },
+        ),
+    ];
+
+    let result = sim.run_controlled_simulation(
+        SEED,
+        operations,
+        Duration::from_secs(120),
+        Duration::from_secs(30),
+    );
+    assert!(
+        result.turmoil_result.is_ok(),
+        "ack-version cascade sim failed: {:?}",
+        result.turmoil_result.err()
+    );
+
+    let delta_sends = GlobalTestMetrics::put_probe_existing_mesh_delta_sends();
+    let delta_bytes = GlobalTestMetrics::put_probe_existing_mesh_delta_bytes();
+    tracing::info!(
+        delta_sends,
+        delta_bytes,
+        "ack-version cascade: node-originated summary-first PUT counters"
+    );
+
+    assert_eq!(
+        delta_sends, 1,
+        "the NODE's PUT must reach the holder-found branch through its gateway \
+         link. This is 0 without the version-carrying ack — the emission gate \
+         fails closed on an unknown remote version and the summary-first block \
+         is skipped entirely"
+    );
+    assert!(
+        delta_bytes > 0,
+        "the probe must have shipped a real delta, not an empty one"
+    );
+
+    freenet::dev_tool::clear_crdt_contracts();
+}
+
+/// One arm of the #5147 suppression measurement: run an update workload over a
+/// co-host mesh and report what the fleet received.
+#[cfg(test)]
+struct SuppressionArm {
+    /// Inbound broadcast payloads that reached a terminal outcome.
+    deliveries: u64,
+    /// Those that changed nothing — the waste #5147 removes.
+    redundant: u64,
+    /// Outbound broadcast legs actually put on the wire.
+    sends: u64,
+    delta_sends: u64,
+    full_state_sends: u64,
+    /// Payload bytes of `delta_sends` / `full_state_sends`. The piggybacked
+    /// `sender_summary_bytes` are NOT included; every leg carries one, so
+    /// leaving them out understates the arm that sends more legs (control).
+    delta_bytes: u64,
+    full_state_bytes: u64,
+    resync_suppressed: u64,
+    summary_skips: u64,
+    /// Contracts that converged, and how many there were.
+    converged: (usize, usize),
+    /// Peers that actually agreed on the converged state.
+    ///
+    /// `converged` counts CONTRACTS, and this simulation has one, so on its own
+    /// it reduces to `1 >= 1`. `check_convergence_from_logs` also skips any
+    /// contract with fewer than two reporting peers and counts only peers that
+    /// logged a state hash — so a peer that stops RECEIVING stops logging and
+    /// leaves the denominator rather than being counted as diverged. The
+    /// replica count is what notices that.
+    replicas: usize,
+    /// Contracts whose replicas disagreed outright.
+    diverged: usize,
+    /// Peers that were suppressed because the originator named them.
+    suppressed: u64,
+    /// Legs dropped because the target was the peer that delivered the update.
+    ///
+    /// The FOURTH terminal outcome. It is gated with the feature, so it is
+    /// zero in the control arm and non-zero in the treatment arm — which means
+    /// leaving it out of the accounting identity below made the arms look
+    /// unequal by exactly this count.
+    sender_skips: u64,
+    /// Hosting advertisements exchanged. The premise check: without these no
+    /// peer has an advertised co-host, so there is no mesh and nothing to
+    /// suppress.
+    hosting_updates: u64,
+    /// Standalone `Summaries` notifications ATTEMPTED (resolved recipients,
+    /// counted before the per-peer enqueue can fail).
+    ///
+    /// The cost axis. Every other counter here measures traffic this feature
+    /// REMOVES; without this one the rig can only ever report good news.
+    ///
+    /// A candidate #5190 fix (since withdrawn) restored a notification to each
+    /// suppressed peer. Its cost was invisible in `sends`, `delta_sends`,
+    /// `full_state_sends` and `summary_skips` — it lands here and nowhere else.
+    /// Zero in both arms today; the assertions below pin that, so the day a
+    /// change starts sending notifications the test fails and someone has to
+    /// look at the number rather than inferring it costs nothing.
+    notification_targets: u64,
+}
+
+#[cfg(test)]
+fn run_5147_suppression_arm(network_name: &str, target_list_enabled: bool) -> SuppressionArm {
+    run_5147_arm_with(
+        network_name,
+        target_list_enabled,
+        false,
+        ArmTopology {
+            gateway_ack_version: true,
+            ..ArmTopology::dense()
+        },
+    )
+}
+
+/// Same arm, but every update originates from a DIFFERENT peer in turn.
+///
+/// This is the workload that exercises the design's sharpest open question.
+/// The target list attests DELIVERY of the originator's payload — "A sent this
+/// to C" — but a relayer re-broadcasts its own POST-MERGE state, which under
+/// concurrent writers can be strictly newer than the payload it received. If B
+/// suppresses C on A's say-so while holding state C lacks, C does not learn it
+/// until the ~5-minute anti-entropy heartbeat.
+///
+/// The single-writer arm cannot see this: with one writer every peer merges the
+/// same payload into the same prior state, so the relayer's state and the
+/// originator's payload agree and suppression is exactly right. Rotating the
+/// writer is what makes relayer-ahead-of-recipient reachable.
+fn run_5147_multi_writer_arm(network_name: &str, target_list_enabled: bool) -> SuppressionArm {
+    run_5147_arm_inner(network_name, target_list_enabled, true)
+}
+
+/// Topology and workload knobs for one #5147 arm.
+///
+/// These were `const`s inside the arm, which fixed the measurement to ONE
+/// regime: a full clique (`max_connections` 12 across 7 nodes) short enough
+/// (240s) to finish inside a single 300s InterestSync heartbeat. That regime
+/// cannot express the case where originators have DIFFERENT neighbourhoods, so
+/// every reading it produced had `full_state_sends=16` whether the feature was
+/// on or off. A knob per dimension is what lets a second arm probe the regime
+/// the first one is blind to.
+#[cfg(test)]
+#[derive(Clone, Copy)]
+struct ArmTopology {
+    peers: usize,
+    max_connections: usize,
+    min_connections: usize,
+    sustained_updates: usize,
+    /// Wall of simulated time the workload is given.
+    sim_duration: Duration,
+    /// Gap between scheduled operations.
+    op_interval: Duration,
+    /// How many peers subscribe only AFTER the update workload has begun.
+    ///
+    /// With every peer subscribed at bootstrap, the PUT and the first updates
+    /// deliver to every pair, so every pair is tracked before the measurement
+    /// starts and NOTHING can later need a summary it lacks. That is why the
+    /// dense and sparse arms both report a `full_state_sends` count that is
+    /// simply the bootstrap seeding, identical in both arms.
+    ///
+    /// A peer that subscribes late becomes an advertised co-host of relayers
+    /// that have never delivered to it — which is the population the fleet
+    /// counter `untracked_first_observed` measures, and the one that grew by
+    /// 11.2 GB / 3.2h under 0.2.120.
+    late_subscribers: usize,
+    /// Whether joiners learn the gateway's version from the connection ack
+    /// (#5161, `SimNetwork::enable_gateway_ack_version`).
+    ///
+    /// The sender exclusion is gated on the SENDER's recorded version (see
+    /// `resolve_covered_peers`). With the ack gate off, the sim default, no
+    /// peer ever learns the gateway's version, so on every gateway-delivered
+    /// update the exclusion fails closed and the relayer echoes the update
+    /// back to the gateway. In a single-writer arm the gateway delivers
+    /// nearly every update, so whether the treatment arm excludes a sender at
+    /// all came down to whether the RNG trajectory produced a rare
+    /// peer-to-peer relay (#5172). Production learns gateway versions since
+    /// 0.2.120, so ON is the regime the feature actually runs in.
+    gateway_ack_version: bool,
+}
+
+#[cfg(test)]
+impl ArmTopology {
+    /// The regime the original #5147 measurement ran in. Every field is stated
+    /// so a future default change cannot silently move the baseline.
+    fn dense() -> Self {
+        Self {
+            // Enough peers that each has SEVERAL non-sender co-hosts. With two,
+            // a peer's only other co-host is the sender, the originator's list
+            // is empty after excluding the recipient, and the measurement is
+            // vacuous.
+            peers: 6,
+            // Wide enough that the peers connect to EACH OTHER. At a narrower
+            // cap a star forms, every peer's only co-host is the sender, and
+            // the target list has nobody to name — the same blind spot the
+            // #4965 co-host test documents.
+            max_connections: 12,
+            min_connections: 4,
+            sustained_updates: 20,
+            sim_duration: Duration::from_secs(240),
+            op_interval: Duration::from_secs(3),
+            late_subscribers: 0,
+            gateway_ack_version: false,
+        }
+    }
+
+    /// The regime `dense()` cannot express: peers with DIFFERENT co-host sets.
+    ///
+    /// In a clique every originator covers every peer, so a relayer either
+    /// suppresses its whole fan-out or has nothing left to send, and no pair is
+    /// ever left untracked-but-needed. Production is not a clique: coverage
+    /// varies per originator, so a pair suppressed under originator A is one a
+    /// relayer must still serve under originator B — with no cached summary,
+    /// hence full state.
+    fn sparse(
+        peers: usize,
+        max_connections: usize,
+        min_connections: usize,
+        late_subscribers: usize,
+    ) -> Self {
+        Self {
+            peers,
+            max_connections,
+            min_connections,
+            sustained_updates: 30,
+            sim_duration: Duration::from_secs(480),
+            op_interval: Duration::from_secs(3),
+            late_subscribers,
+            gateway_ack_version: false,
+        }
+    }
+}
+
+fn run_5147_arm_inner(
+    network_name: &str,
+    target_list_enabled: bool,
+    multi_writer: bool,
+) -> SuppressionArm {
+    run_5147_arm_with(
+        network_name,
+        target_list_enabled,
+        multi_writer,
+        ArmTopology::dense(),
+    )
+}
+
+fn run_5147_arm_with(
+    network_name: &str,
+    target_list_enabled: bool,
+    multi_writer: bool,
+    topology: ArmTopology,
+) -> SuppressionArm {
+    use freenet::dev_tool::{NodeLabel, ScheduledOperation, SimOperation, register_crdt_contract};
+
+    const SEED: u64 = 0x5147_0001_0001;
+    let ArmTopology {
+        peers,
+        max_connections,
+        min_connections,
+        sustained_updates,
+        sim_duration,
+        op_interval,
+        late_subscribers,
+        gateway_ack_version,
+    } = topology;
+
+    GlobalTestMetrics::reset();
+    setup_deterministic_state(SEED);
+    let rt = create_runtime();
+
+    let (sim, logs_handle) = rt.block_on(async {
+        let mut sim = SimNetwork::new(
+            network_name,
+            1, // 1 gateway (the update source)
+            peers,
+            7, // max_htl
+            3, // rnd_if_htl_above
+            max_connections,
+            min_connections,
+            SEED,
+        )
+        .await;
+        // The ONLY difference between the two arms. Stated explicitly on both
+        // sides rather than relying on the default, so a future edit that flips
+        // the default cannot silently turn the control arm into a second
+        // treatment arm and make the comparison read as "no effect".
+        if target_list_enabled {
+            sim.enable_broadcast_target_list();
+        } else {
+            sim.disable_broadcast_target_list();
+        }
+        // Applied to BOTH arms when set, so it is not a difference between
+        // them: the control arm's sender exclusion stays off regardless,
+        // because it is gated with the target list.
+        if gateway_ack_version {
+            sim.enable_gateway_ack_version();
+        }
+        // Space the updates across the ~5-minute InterestSync heartbeat
+        // (`INTEREST_HEARTBEAT_INTERVAL`, 300s). At the 3s default the whole
+        // update burst finishes inside one heartbeat window, so the ONLY thing
+        // keeping peer-summary caches fresh is the `sender_summary_bytes`
+        // riding on the broadcasts themselves — precisely what this feature
+        // removes. That regime makes the measurement a study of the sim's
+        // pacing rather than of production, where a River-style update cadence
+        // is minutes apart with heartbeats in between.
+        sim.with_controlled_op_interval(op_interval);
+        let logs_handle = sim.event_logs_handle();
+        (sim, logs_handle)
+    });
+
+    // CRDT contract so post-bootstrap broadcasts compute real version-aware
+    // deltas; a hash contract's "delta" is full state.
+    let contract = SimOperation::create_test_contract(0x51);
+    let contract_id = *contract.key().id();
+    let contract_key = contract.key();
+    register_crdt_contract(contract_id);
+
+    let mut operations = vec![ScheduledOperation::new(
+        NodeLabel::gateway(network_name, 0),
+        SimOperation::Put {
+            contract: contract.clone(),
+            state: SimOperation::create_crdt_state(1, 0x10),
+            subscribe: true,
+        },
+    )];
+    // The last `late_subscribers` peers are held back and injected partway
+    // through the update stream (below), so relayers acquire co-hosts they have
+    // never delivered to.
+    let early_subscribers = peers.saturating_sub(late_subscribers);
+    for node_idx in 1..=early_subscribers {
+        operations.push(ScheduledOperation::new(
+            NodeLabel::node(network_name, node_idx),
+            SimOperation::Subscribe { contract_id },
+        ));
+    }
+    // Inject the held-back subscribers a third of the way in, so there is a
+    // populated mesh before they arrive and a long tail of updates after.
+    let late_join_at = sustained_updates / 3;
+    for v in 0..sustained_updates {
+        if v == late_join_at {
+            for node_idx in early_subscribers + 1..=peers {
+                operations.push(ScheduledOperation::new(
+                    NodeLabel::node(network_name, node_idx),
+                    SimOperation::Subscribe { contract_id },
+                ));
+            }
+        }
+        // Single-writer: always the gateway, so every peer merges the same
+        // payload into the same prior state. Multi-writer: rotate across the
+        // subscribing peers, so a relayer can hold state its recipient lacks.
+        // Rotation covers only the EARLY subscribers: a late peer that wrote
+        // before subscribing would be originating updates for a contract it
+        // does not yet host.
+        let writer = if multi_writer {
+            NodeLabel::node(network_name, (v % early_subscribers.max(1)) + 1)
+        } else {
+            NodeLabel::gateway(network_name, 0)
+        };
+        operations.push(ScheduledOperation::new(
+            writer,
+            SimOperation::Update {
+                key: contract_key,
+                data: SimOperation::create_crdt_state((v as u64) + 2, 0x20 + v as u8),
+            },
+        ));
+    }
+
+    let result =
+        sim.run_controlled_simulation(SEED, operations, sim_duration, Duration::from_secs(90));
+    assert!(
+        result.turmoil_result.is_ok(),
+        "{network_name}: simulation should complete: {:?}",
+        result.turmoil_result.err()
+    );
+
+    let convergence =
+        rt.block_on(async { freenet::dev_tool::check_convergence_from_logs(&logs_handle).await });
+
+    SuppressionArm {
+        deliveries: GlobalTestMetrics::broadcast_deliveries(),
+        redundant: GlobalTestMetrics::redundant_broadcast_deliveries(),
+        sends: GlobalTestMetrics::delta_sends() + GlobalTestMetrics::full_state_sends(),
+        delta_sends: GlobalTestMetrics::delta_sends(),
+        full_state_sends: GlobalTestMetrics::full_state_sends(),
+        delta_bytes: GlobalTestMetrics::delta_send_bytes(),
+        full_state_bytes: GlobalTestMetrics::full_state_send_bytes(),
+        resync_suppressed: GlobalTestMetrics::resync_requests_suppressed(),
+        summary_skips: GlobalTestMetrics::fanout_summary_skips(),
+        converged: (convergence.converged.len(), convergence.total_contracts()),
+        replicas: convergence
+            .converged
+            .iter()
+            .map(|c| c.replica_count)
+            .sum::<usize>(),
+        diverged: convergence.diverged.len(),
+        suppressed: GlobalTestMetrics::broadcast_targets_suppressed(),
+        sender_skips: GlobalTestMetrics::broadcast_sender_skips(),
+        hosting_updates: GlobalTestMetrics::neighbor_hosting_updates(),
+        notification_targets: GlobalTestMetrics::notification_targets(),
+    }
+}
+
+/// End-to-end measurement of #5147 on a co-host mesh, with a control arm.
+///
+/// ## Measured (7 nodes, 20 CRDT updates, identical seed and topology)
+///
+/// ```text
+/// control:   sends=460 summary_skips=417 suppressed=0   redundant=321 replicas=7 diverged=0
+/// treatment: sends=288 summary_skips=146 suppressed=428 redundant=160 replicas=7 diverged=0
+/// ```
+///
+/// 37% fewer broadcast legs on the wire and 50% fewer redundant deliveries,
+/// with convergence unchanged and every replica retained.
+///
+/// These numbers superseded an earlier `460 -> 256` reading, and the reason is
+/// worth keeping: back then the sender exclusion shipped UNGATED, so it was
+/// live in BOTH arms and the control arm was not main's behaviour. Gating it
+/// made the comparison apples-to-apples and moved the measured saving down.
+///
+/// An earlier version of this doc also claimed
+/// `sends + summary_skips + suppressed` was **identical in both arms** and
+/// called that a conservation law. It is not one, and the assertion below is a
+/// 5% bound rather than an equality — see the comment at that assertion for the
+/// buckets an offered leg can exit through uncounted.
+///
+/// The overlap with the pre-existing summary-match gate is large here — many of
+/// the suppressions are legs that gate would have skipped for free — which is
+/// why the send reduction is smaller than the suppression count suggests. On
+/// the fleet that overlap is much smaller: the measured
+/// dedup ratio there is 18.6 against this simulation's 3.7, i.e. the
+/// summary-match gate is suppressing far less in production than it does here,
+/// so the target list's marginal value is larger, not smaller.
+///
+/// ## This test earned its keep once already
+///
+/// Written before the code was believed correct, it FAILED on the first run —
+/// treatment sends 528 vs control 460, redundant 400 vs 321 — i.e. the feature
+/// made traffic worse. A control-vs-control run (byte-identical numbers)
+/// cleared the rig, so the regression was real. Cause: a fully-suppressed
+/// fan-out has an empty target set, and `handle_broadcast_state_change` treated
+/// empty as the no-subscriber FAILURE case — three retries with backoff, then a
+/// stash. Each retry re-resolved targets after the coverage claim had already
+/// been consumed, so it suppressed nothing and re-broadcast the whole co-host
+/// set one backoff later. The mechanism defeated itself and would have shipped
+/// looking plausible: every unit test passed, and the only visible symptom was
+/// a bandwidth number nobody had a baseline for. The `fully_covered` branch in
+/// `broadcast.rs` is the fix, and this test is its regression test.
+///
+/// ## Why a control arm and not a threshold
+///
+/// A single-arm test asserting "redundant deliveries are below N" pins the
+/// simulation's own convergence behaviour as much as the feature: change the
+/// topology, the update count, or the CONNECT timing and N moves for reasons
+/// that have nothing to do with the target list. Two arms differing by exactly
+/// one `enable_broadcast_target_list()` call measure the FEATURE, and the
+/// control arm doubles as the "this is what today looks like" baseline.
+///
+/// ## What is asserted, and what deliberately is not
+///
+/// The discriminator is that the treatment arm suppresses fan-out targets AND
+/// receives strictly fewer redundant deliveries than the control. Both halves
+/// are needed: the suppression counter alone would pass if the mechanism fired
+/// but the duplicates arrived by some other route, and the delivery drop alone
+/// could come from a topology difference between the two runs.
+///
+/// A specific suppression FRACTION is NOT asserted. The measured fleet figures
+/// (0.647 at degree 5, rising to 0.924 at 17) are degree-dependent, and this
+/// simulation's achieved degree is far below the fleet's — the topology it
+/// builds is the regime with the LEAST overlap to exploit, so a fleet-derived
+/// threshold here would be measuring the wrong graph. The achieved numbers are
+/// logged so a reader can see the regime rather than infer it.
+///
+/// ## Safety half
+///
+/// Convergence must be no worse in the treatment arm. This is the assertion
+/// that fails if suppression over-reaches: a peer wrongly excluded from a
+/// fan-out does not converge, and no bandwidth saving justifies that.
+/// EXPLORATORY: does crossing `INTEREST_TTL` make `full_state_sends` sensitive
+/// to the #5147 flag?
+///
+/// `record_delivery_to_interest` is the only caller of `refresh_peer_interest`,
+/// and #5147 suppresses the delivery, so a suppressed pair stops being
+/// refreshed and should be reaped at `INTEREST_TTL` (20 min = 4x the 300s
+/// heartbeat, ring/interest.rs:75). Every other arm runs 240-480s of virtual
+/// time, far inside one TTL, so this decay path is unreachable there.
+///
+/// Updates are spaced a minute apart so the workload SPANS the TTL rather than
+/// finishing inside it.
+// Ignored: a manual PROBE, not an assertion — it prints a regime and
+// asserts nothing, and each run costs ~6 min of CI for no signal.
+// Kept because it is the evidence that the #5147 rig is blind to
+// full-state composition; see #5153.
+#[ignore]
+#[test_log::test]
+fn explore_5147_ttl_horizon() {
+    let topo = ArmTopology {
+        peers: 12,
+        max_connections: 6,
+        min_connections: 4,
+        sustained_updates: 30,
+        sim_duration: Duration::from_secs(2400),
+        op_interval: Duration::from_secs(60),
+        late_subscribers: 0,
+        gateway_ack_version: false,
+    };
+    let control = run_5147_arm_with("i5147-ttl-c", false, true, topo);
+    let treatment = run_5147_arm_with("i5147-ttl-t", true, true, topo);
+
+    for (label, arm) in [("control", &control), ("treatment", &treatment)] {
+        tracing::info!(
+            "TTL-HORIZON {label}: sends={} (delta={} full={}) deliveries={} redundant={} \
+             suppressed={} sender_skips={} summary_skips={} hosting_updates={} \
+             converged={:?} replicas={} diverged={}",
+            arm.sends,
+            arm.delta_sends,
+            arm.full_state_sends,
+            arm.deliveries,
+            arm.redundant,
+            arm.suppressed,
+            arm.sender_skips,
+            arm.summary_skips,
+            arm.hosting_updates,
+            arm.converged,
+            arm.replicas,
+            arm.diverged,
+        );
+    }
+}
+
+/// EXPLORATORY: does a sparse graph make `full_state_sends` sensitive to the
+/// #5147 flag at all?
+///
+/// The dense arms report `full=16` in every reading regardless of the flag,
+/// which is the axis the 0.2.120 fleet regression moved (full-state share of
+/// broadcast bytes 22-24% -> 29%). A rig that cannot move the number cannot
+/// validate a fix for it. This prints rather than asserts: its job is to find
+/// out whether the regime is reachable in simulation before anything is
+/// asserted about it.
+// Ignored: a manual PROBE, not an assertion — it prints a regime and
+// asserts nothing, and each run costs ~6 min of CI for no signal.
+// Kept because it is the evidence that the #5147 rig is blind to
+// full-state composition; see #5153.
+//
+// Replicated on clean main (no #5190 partition in tree): full-state count
+// identical again at 9/9, 9/9, 14/14, so the null is not an artifact of
+// other in-flight fixes.
+#[ignore]
+#[test_log::test]
+fn explore_5147_sparse_full_state_sensitivity() {
+    // Probe a BAND of topologies. A single point cannot distinguish "the regime
+    // is unreachable" from "this one config was degenerate": the first probe
+    // (10 peers, max 3) produced 3 replicas and suppressed=0, i.e. the mesh
+    // never formed and the feature never fired, which says nothing about the
+    // feature.
+    let mut arms = Vec::new();
+    for (peers, max_conn, min_conn, late) in [(12, 6, 4, 0), (12, 6, 4, 5), (12, 8, 4, 5)] {
+        let topo = ArmTopology::sparse(peers, max_conn, min_conn, late);
+        let tag = format!("p{peers}-max{max_conn}-late{late}");
+        arms.push((
+            format!("{tag} control"),
+            run_5147_arm_with(&format!("i5147-{tag}-c"), false, true, topo),
+        ));
+        arms.push((
+            format!("{tag} treatment"),
+            run_5147_arm_with(&format!("i5147-{tag}-t"), true, true, topo),
+        ));
+    }
+
+    for (label, arm) in arms.iter().map(|(l, a)| (l.as_str(), a)) {
+        tracing::info!(
+            "SPARSE {label}: sends={} (delta={} full={}) deliveries={} redundant={} \
+             suppressed={} sender_skips={} summary_skips={} hosting_updates={} \
+             converged={:?} replicas={} diverged={}",
+            arm.sends,
+            arm.delta_sends,
+            arm.full_state_sends,
+            arm.deliveries,
+            arm.redundant,
+            arm.suppressed,
+            arm.sender_skips,
+            arm.summary_skips,
+            arm.hosting_updates,
+            arm.converged,
+            arm.replicas,
+            arm.diverged,
+        );
+    }
+}
+
+#[test_log::test]
+fn test_5147_originator_target_list_cuts_duplicate_deliveries() {
+    let control = run_5147_suppression_arm("i5147-control", false);
+    let treatment = run_5147_suppression_arm("i5147-treatment", true);
+
+    tracing::info!(
+        "#5147 control:   deliveries={} redundant={} sends={} (delta={} full={}) \
+         bytes(delta={} full={}) suppressed={} summary_skips={} notif_sent={} resync_suppressed={} converged={:?} replicas={} diverged={}",
+        control.deliveries,
+        control.redundant,
+        control.sends,
+        control.delta_sends,
+        control.full_state_sends,
+        control.delta_bytes,
+        control.full_state_bytes,
+        control.suppressed,
+        control.summary_skips,
+        control.notification_targets,
+        control.resync_suppressed,
+        control.converged,
+        control.replicas,
+        control.diverged,
+    );
+    tracing::info!(
+        "#5147 treatment: deliveries={} redundant={} sends={} (delta={} full={}) \
+         bytes(delta={} full={}) suppressed={} summary_skips={} notif_sent={} resync_suppressed={} converged={:?} replicas={} diverged={}",
+        treatment.deliveries,
+        treatment.redundant,
+        treatment.sends,
+        treatment.delta_sends,
+        treatment.full_state_sends,
+        treatment.delta_bytes,
+        treatment.full_state_bytes,
+        treatment.suppressed,
+        treatment.summary_skips,
+        treatment.notification_targets,
+        treatment.resync_suppressed,
+        treatment.converged,
+        treatment.replicas,
+        treatment.diverged,
+    );
+
+    // BEFORE-READING: the standalone-notification path currently sends nothing
+    // in this scenario, in either arm. Pinned rather than merely logged.
+    //
+    // A counter that is only printed is an unfailable check: delete the
+    // recorder and the suite stays green while `notif_sent=0` is printed
+    // forever, which reads as "this mechanism costs nothing" — the exact
+    // false-good-news failure this counter was added to prevent. Asserting the
+    // zero means the day a change starts sending notifications, this fails and
+    // someone has to look at the number. If you are that person: the number is
+    // the cost of your change on the messages/s axis. Update the assertion with
+    // it, and state it in your PR.
+    assert_eq!(
+        (control.notification_targets, treatment.notification_targets),
+        (0, 0),
+        "proactive summary notifications were sent where the before-reading is \
+         zero. That is not necessarily wrong, but it is a message-axis cost \
+         that no other counter in this struct can see — measure it and say so"
+    );
+
+    // PREMISE 1: the peers really became each other's advertised co-hosts. If
+    // they did not, no peer has a co-host to name, the list is empty
+    // everywhere, and every assertion below is vacuous.
+    assert!(
+        control.hosting_updates > 0 && treatment.hosting_updates > 0,
+        "premise: no hosting advertisements were exchanged, so there is no \
+         co-host mesh and #5147 has nothing to suppress. control={} \
+         treatment={}",
+        control.hosting_updates,
+        treatment.hosting_updates,
+    );
+
+    // PREMISE 2: the control arm actually exhibits the waste being removed.
+    assert!(
+        control.redundant > 0,
+        "premise: the control arm received ZERO redundant deliveries, so this \
+         topology does not reproduce the duplicate fan-out at all and the \
+         comparison below measures nothing"
+    );
+
+    // PREMISE 2-bis: the sender exclusion is gated WITH the feature, so it must
+    // be absent from the control arm and present in the treatment arm.
+    //
+    // The field's own doc asserts exactly this, and nothing checked it. That
+    // matters because `sender_skips` was added to explain a gap in the leg
+    // accounting: if it were zero in BOTH arms, adding the bucket changed
+    // nothing, the gap has some other cause, and the stated explanation would
+    // be unverified while looking settled.
+    //
+    // The treatment half holds by construction only because this arm runs with
+    // `gateway_ack_version` (see that `ArmTopology` field). Without it no peer
+    // knows the gateway's version, the exclusion fails closed on every
+    // gateway-delivered update, and 16 of 18 perturbed RNG trajectories
+    // excluded no sender at all (#5172).
+    assert_eq!(
+        control.sender_skips, 0,
+        "premise: the control arm excluded the sender {} times, so the sender \
+         exclusion is not gated with the feature and the arms differ by more \
+         than one flag",
+        control.sender_skips,
+    );
+    assert!(
+        treatment.sender_skips > 0,
+        "premise: the treatment arm never excluded a delivering sender, so \
+         `sender_skips` explains none of the leg-accounting gap it was added \
+         to explain"
+    );
+
+    // PREMISE 3: the control arm is genuinely unsuppressed. Without this a
+    // default flip would make both arms treatment arms and the test would read
+    // "no effect" as success.
+    assert_eq!(
+        control.suppressed, 0,
+        "the control arm must be running today's behaviour; a non-zero \
+         suppression count means the version gate opened when it should have \
+         stayed shut, and the comparison has no baseline"
+    );
+
+    // DISCRIMINATOR A: the mechanism fired.
+    assert!(
+        treatment.suppressed > 0,
+        "#5147 suppressed nothing on a topology built to exercise it: \
+         {} hosting advertisements were exchanged, so peers ARE advertised \
+         co-hosts of each other, yet no fan-out target was ever dropped. \
+         Either the version gate never opened, or the coverage never reached \
+         the fan-out decision.",
+        treatment.hosting_updates,
+    );
+
+    // The two arms must have done comparable amounts of fan-out WORK, so the
+    // reduction below cannot be a topology difference between the runs.
+    //
+    // This was originally an exact equality on sends + summary_skips +
+    // suppressed, justified as a conservation law: "every offered leg ends in
+    // exactly one of three places". It is not one, and a reviewer said so
+    // before the numbers did. Two independent leaks showed up:
+    //
+    //  * the sender exclusion is a FOURTH terminal outcome, counted nowhere
+    //    (now `sender_skips`, recorded at the decision site);
+    //  * legs still exit through paths no counter observes — a failed send
+    //    (`sends` counts only successful ones), the `compute_delta` empty-delta
+    //    return, `should_broadcast_contract`, and queue eviction.
+    //
+    // With all four buckets the arms landed at 877 vs 869, under 1% (measured
+    // before this arm ran with `gateway_ack_version`; the 5% bound below held
+    // in all 30 perturbed RNG trajectories after that change). So the
+    // assertion is a bound, not an identity. It is still a real discriminator —
+    // a genuine topology difference between the arms moves this by far more
+    // than a few unbucketed legs — while no longer being a tripwire that fires
+    // on a single extra send failure, which under this repo's
+    // flaky-tests-are-blockers rule would make it a merge blocker of its own.
+    let control_legs =
+        control.sends + control.summary_skips + control.suppressed + control.sender_skips;
+    let treatment_legs =
+        treatment.sends + treatment.summary_skips + treatment.suppressed + treatment.sender_skips;
+    assert!(
+        control_legs > 0,
+        "premise: the control arm accounted for ZERO fan-out legs, so the \
+         tolerance below is 0 and the comparison passes vacuously"
+    );
+    let leg_gap = control_legs.abs_diff(treatment_legs);
+    let leg_tolerance = control_legs / 20; // 5%
+    assert!(
+        leg_gap <= leg_tolerance,
+        "the arms accounted for very different amounts of fan-out work \
+         ({control_legs} vs {treatment_legs}, gap {leg_gap} > tolerance \
+         {leg_tolerance}). A few unbucketed legs are expected — a failed send, \
+         an empty-delta skip, a should_broadcast_contract early return, a queue \
+         eviction — but a gap this size means the two runs did genuinely \
+         different work, so the reduction below is not attributable to #5147."
+    );
+
+    // DISCRIMINATOR B: it removed real traffic, not just incremented a counter.
+    assert!(
+        treatment.redundant < control.redundant,
+        "#5147 suppressed {} fan-out targets yet the fleet still received as \
+         many redundant deliveries ({} vs control {}). A suppression that does \
+         not show up as fewer received duplicates is suppressing the wrong \
+         thing.",
+        treatment.suppressed,
+        treatment.redundant,
+        control.redundant,
+    );
+
+    // DISCRIMINATOR C: fewer legs actually on the wire. Distinct from B —
+    // B says the fleet RECEIVES fewer duplicates, this says the fleet SENDS
+    // less. The retry bug in this test's history passed neither, but a future
+    // regression that merely delays the suppressed traffic would pass B while
+    // failing here.
+    assert!(
+        treatment.sends < control.sends,
+        "#5147 suppressed {} targets yet the fleet sent as many broadcast legs \
+         ({} vs control {}). Suppressed traffic that reappears later — via the \
+         no-target retry, an anti-entropy heal, or a stash re-emission — is not \
+         suppressed, it is deferred.",
+        treatment.suppressed,
+        treatment.sends,
+        control.sends,
+    );
+
+    // DISCRIMINATOR D: the duplicate FRACTION fell, not just the numerator.
+    //
+    // B alone is satisfiable the wrong way: an arm that halves total deliveries
+    // halves redundant deliveries with it and passes, having suppressed real
+    // traffic rather than duplicate traffic. `deliveries` exists as the
+    // denominator for exactly this ratio (see its rustdoc) and was previously
+    // gathered and never used. Cross-multiplied to stay in integers:
+    //   treatment.redundant / treatment.deliveries < control.redundant / control.deliveries
+    // Measured with `gateway_ack_version`, across 18 perturbed RNG
+    // trajectories: control 73-75% (e.g. 340/452), treatment 61-66% (e.g.
+    // 185/285).
+    assert!(
+        treatment.redundant * control.deliveries < control.redundant * treatment.deliveries,
+        "#5147 reduced redundant deliveries ({} vs control {}) only in step with \
+         total deliveries ({} vs control {}), so the duplicate FRACTION did not \
+         improve. That is what suppressing genuine traffic looks like, and \
+         discriminator B alone cannot tell the two apart.",
+        treatment.redundant,
+        control.redundant,
+        treatment.deliveries,
+        control.deliveries,
+    );
+
+    // DISCRIMINATOR E: the saving is not undone by a shift onto the
+    // full-state path (a production BYTES concern, measured here by count).
+    //
+    // Every assertion above counts legs. This design has a specific, known way
+    // to cut legs while RAISING bytes: suppressing a leg also suppresses the
+    // `sender_summary_bytes` piggyback that keeps peer-summary caches warm, and
+    // a peer whose cached summary we lack receives FULL STATE
+    // (`FullNoTheirSummaryTracked`) instead of a delta — 26.9% of broadcast
+    // bytes at a 357 KB mean in the 0.2.109 fleet profile, against a few KB for
+    // a delta. At production sizes a handful of extra full states could erase
+    // the whole delta saving while `sends`, `redundant` and `suppressed` all
+    // still moved the right way. (An earlier version said "roughly a dozen";
+    // that figure was never derived for any measured delta size.)
+    //
+    // `full_state_sends` was captured and logged but never asserted, which left
+    // the one number that reveals the inversion outside the test's reach.
+    //
+    // Why this counts full-state SENDS rather than bytes: in this sim the
+    // CRDT state is tiny, so a full state (136 B payload) is no larger than a
+    // delta (144 B). Bytes here cannot show the production inversion at all,
+    // so the byte assertion below guards a different thing and the count is
+    // the only proxy for "peers pushed onto the full-state path".
+    //
+    // Why the count gets a tolerance: the two arms share a seed but diverge
+    // the moment the flag changes behaviour, so each is one sample of a count
+    // that moves with the RNG trajectory alone (#5172). Measured by perturbing
+    // the trajectory (one extra `GlobalRng` draw per transport noop, 0..17
+    // draws, nothing else changed), the CONTROL arm, whose code is identical
+    // in every run, reported anywhere from 16 to 20 full states; the treatment
+    // arm 16 to 19. An exact `<=` failed 2 of 18 trajectories with no product
+    // change, by 1 and 2. The bound is the control arm's own observed spread.
+    //
+    // What the bound does and does not establish. In-sim, it catches the
+    // mechanism named above: removing the `sender_summary_bytes` piggyback
+    // from the treatment arm's broadcasts (the cache-seeding this design
+    // suppresses) took it from 18 to 31 full states against control's 20,
+    // and this assertion failed. It is NOT a production-scale safety margin:
+    // at the 0.2.109 fleet profile's 357 KB per full state, 4 extra full
+    // states may well outweigh the delta saving. Treat it as "no detectable
+    // shift onto the full-state path", and judge production bytes from
+    // telemetry (#5153), not from this sim.
+    //
+    // If this reddens, the first hypothesis is that suppression grew; check
+    // `suppressed` against the numbers above before calling it noise.
+    const FULL_STATE_TRAJECTORY_SPREAD: u64 = 4;
+    assert!(
+        treatment.full_state_sends <= control.full_state_sends + FULL_STATE_TRAJECTORY_SPREAD,
+        "#5147 cut broadcast legs ({} vs control {}) but pushed peers onto the \
+         FULL-STATE path ({} vs control {}, beyond the control arm's own \
+         trajectory spread of {FULL_STATE_TRAJECTORY_SPREAD}). A full state is \
+         ~357 KB against a few-KB delta, so this is a bandwidth INCREASE wearing \
+         the costume of a bandwidth saving — the second-order failure this \
+         design's summary-seeding interaction makes possible.",
+        treatment.sends,
+        control.sends,
+        treatment.full_state_sends,
+        control.full_state_sends,
+    );
+
+    // DISCRIMINATOR F: fewer broadcast payload BYTES on the wire, not just
+    // fewer legs. At this sim's state sizes (see E) this is close to C in
+    // bytes, but it is the only assertion that sums what was actually sent:
+    // a change that cut legs while making each remaining payload larger
+    // passes A-E and fails here. Payload only; the per-leg summary piggyback
+    // is left out, which understates the control arm (more legs), so this is
+    // the conservative direction. Measured: control 65-67 KB, treatment
+    // 36-43 KB across 18 trajectories.
+    let control_bytes = control.delta_bytes + control.full_state_bytes;
+    let treatment_bytes = treatment.delta_bytes + treatment.full_state_bytes;
+    assert!(
+        control_bytes > 0,
+        "premise: the control arm sent ZERO broadcast payload bytes, so the byte \
+         comparison below passes vacuously"
+    );
+    assert!(
+        treatment_bytes < control_bytes,
+        "#5147 cut broadcast legs ({} vs control {}) but not broadcast payload \
+         bytes ({treatment_bytes} vs control {control_bytes})",
+        treatment.sends,
+        control.sends,
+    );
+
+    // SAFETY: no bandwidth saving justifies a peer not converging. This is the
+    // assertion that fails on over-suppression.
+    // PREMISE 4: the control arm converged at all. Without this the assertion
+    // below is satisfied by `0 >= 0` if a future change breaks BOTH arms.
+    assert!(
+        control.converged.0 > 0 && control.diverged == 0,
+        "premise: the control arm did not converge ({} converged, {} diverged), \
+         so the treatment-vs-control safety comparison below means nothing",
+        control.converged.0,
+        control.diverged,
+    );
+
+    // SAFETY (a): nobody diverged outright.
+    assert_eq!(
+        treatment.diverged, 0,
+        "#5147 left {} contract(s) with replicas holding different state; a \
+         peer wrongly excluded from a fan-out does not learn of the update \
+         until the ~5-minute interest heartbeat",
+        treatment.diverged,
+    );
+
+    // SAFETY (b): no peer silently dropped OUT of the comparison.
+    //
+    // Divergence alone cannot see the failure this design is most likely to
+    // cause. Over-suppression does not give a peer WRONG state, it gives it NO
+    // state — and a peer that never receives never logs a state hash, so it
+    // leaves the denominator instead of being counted as diverged. Comparing
+    // replica counts across arms is what catches that.
+    assert!(
+        treatment.replicas >= control.replicas,
+        "#5147 cut the number of peers holding the converged state ({} vs \
+         control {}). Suppressing a peer that needed the update does not show \
+         up as divergence — the peer simply stops reporting — so this is the \
+         assertion that sees it.",
+        treatment.replicas,
+        control.replicas,
+    );
+
+    assert!(
+        treatment.converged.0 >= control.converged.0,
+        "#5147 cost convergence: control converged {:?}, treatment {:?}. A \
+         peer wrongly excluded from a fan-out does not learn of the update \
+         until the ~5-minute interest heartbeat, which is exactly the failure \
+         this design refuses.",
+        control.converged,
+        treatment.converged,
+    );
+}
+
+/// **What suppression does under CONCURRENT WRITERS.**
+///
+/// Renamed and rescoped after a reviewer showed the safety claim it originally
+/// made was one it could not support. Read the limits before quoting it.
+///
+/// ## What this DOES establish
+///
+/// The feature engages under a rotating-writer workload, and its benefit is
+/// strongly regime-dependent:
+///
+/// ```text
+/// control:   sends=459 redundant=319 suppressed=0
+/// treatment: sends=420 redundant=288 suppressed=229
+/// ```
+///
+/// About -8.5% sends here against -37% in the single-writer test on the same
+/// topology. That gap is the point: every update in the headline measurement
+/// originates at the GATEWAY, and quoting its number as the expected fleet
+/// saving would overstate it, since real River traffic is multi-writer.
+///
+/// ## What this does NOT establish, despite an earlier version claiming it
+///
+/// It does **not** show that suppression is safe against the design's sharpest
+/// hazard — that a relayer's post-merge state can be newer than the payload it
+/// received, so suppressing on DELIVERY can skip a leg carrying state the
+/// recipient lacks.
+///
+/// Demonstrated, not suspected: making suppression UNCONDITIONAL (drop every
+/// advertised co-host on any relayed fan-out — 480 suppressions, sends
+/// 459 -> 317) leaves this test GREEN, `diverged=0` and `replicas=7`. So its
+/// convergence assertions cannot detect over-suppression here, and three
+/// independent properties of the setup explain why:
+///
+/// * **Topology.** 7 peers at `max_connections: 12` is near-clique, so no peer
+///   depends on a relayer for any update; over-suppressing relay legs costs
+///   nobody state.
+/// * **Merge semantics.** The CRDT fixture is an LWW register with strictly
+///   increasing versions, so missing an OLDER update is harmless by
+///   construction — and `apply_crdt_full_state` returning `CurrentWon`
+///   re-broadcasts, which actively heals the case being probed.
+/// * **Settle window.** Convergence is checked after 90 simulated seconds of
+///   quiet, long enough for that healing to finish.
+///
+/// Closing it needs a workload where a recipient's ONLY path to newer state
+/// runs through the suppressing relayer — a sparser graph, equal-version
+/// writes that fork, or a settle window shorter than the heal — plus a counter
+/// asserting the relayer-ahead condition actually occurred rather than merely
+/// being reachable. Tracked rather than bodged in at the end of a long session.
+///
+/// The convergence assertions are kept because they are cheap and would catch a
+/// gross regression, but they are NOT evidence on the hazard above and must not
+/// be cited as such.
+#[test_log::test]
+fn test_5147_multi_writer_suppression_is_regime_dependent() {
+    let control = run_5147_multi_writer_arm("5147-mw-control", false);
+    let treatment = run_5147_multi_writer_arm("5147-mw-treatment", true);
+
+    tracing::info!(
+        "#5147 multi-writer control:   deliveries={} redundant={} sends={} \
+         (delta={} full={}) suppressed={} summary_skips={} notif_sent={} resync_suppressed={} \
+         converged={:?} replicas={} diverged={}",
+        control.deliveries,
+        control.redundant,
+        control.sends,
+        control.delta_sends,
+        control.full_state_sends,
+        control.suppressed,
+        control.summary_skips,
+        control.notification_targets,
+        control.resync_suppressed,
+        control.converged,
+        control.replicas,
+        control.diverged,
+    );
+    tracing::info!(
+        "#5147 multi-writer treatment: deliveries={} redundant={} sends={} \
+         (delta={} full={}) suppressed={} summary_skips={} notif_sent={} resync_suppressed={} \
+         converged={:?} replicas={} diverged={}",
+        treatment.deliveries,
+        treatment.redundant,
+        treatment.sends,
+        treatment.delta_sends,
+        treatment.full_state_sends,
+        treatment.suppressed,
+        treatment.summary_skips,
+        treatment.notification_targets,
+        treatment.resync_suppressed,
+        treatment.converged,
+        treatment.replicas,
+        treatment.diverged,
+    );
+
+    // PREMISE 1: the control arm converged, so the comparison means something.
+    assert!(
+        control.converged.0 > 0 && control.diverged == 0,
+        "premise: the multi-writer control arm did not converge ({} converged, \
+         {} diverged), so nothing below is a statement about #5147",
+        control.converged.0,
+        control.diverged,
+    );
+
+    // PREMISE 2: the feature actually engaged on this workload. Without this the
+    // safety assertions pass trivially against a treatment arm that suppressed
+    // nothing, which is exactly what a broken gate would produce.
+    assert!(
+        treatment.suppressed > 0,
+        "premise: the treatment arm suppressed nothing under the multi-writer \
+         workload, so this test is not exercising the mechanism it exists for"
+    );
+    assert_eq!(
+        control.suppressed, 0,
+        "premise: the control arm suppressed {} targets, so the arms do not \
+         differ by the feature alone",
+        control.suppressed,
+    );
+
+    // SAFETY: concurrent writers must not diverge under suppression.
+    assert_eq!(
+        treatment.diverged, 0,
+        "#5147 left {} contract(s) diverged under concurrent writers. A gross \
+         regression check only — see this test's rustdoc for why it cannot \
+         detect targeted over-suppression in this topology.",
+        treatment.diverged,
+    );
+
+    assert!(
+        treatment.replicas >= control.replicas,
+        "#5147 cut the number of peers holding the converged state under \
+         concurrent writers ({} vs control {}). A peer suppressed while the \
+         relayer held state it lacked stops reporting rather than reporting a \
+         conflict, so this — not divergence — is what that failure looks like.",
+        treatment.replicas,
+        control.replicas,
+    );
+}
+
+/// #5780 regression: a node kept neighbour interest records for contracts it
+/// had evicted. The records kept each contract indexed, so the node's interest
+/// heartbeat kept advertising it and neighbours kept refreshing the records;
+/// nothing ever removed them, and their summaries held memory indefinitely.
+///
+/// A hub GETs many contracts one at a time under a hosting budget that holds
+/// only a few, pausing between GETs so interest records form for each contract
+/// while it is hosted, and the later GETs evict the earlier ones. The run then
+/// continues on virtual time well past `RECONCILE_MIN_UNUSED_AGE` plus several
+/// hosting sweeps and an interest heartbeat. (The injectable hosting clock is
+/// not used: it is frozen between explicit advances, so a contract first seen
+/// after the last advance would never age.) Every node must end with no records for a
+/// contract it neither hosts nor uses nor has local interest in.
+#[test]
+fn test_evicted_contracts_keep_no_interest_records() {
+    use freenet::dev_tool::{NodeLabel, ScheduledOperation, SimOperation};
+
+    const NETWORK: &str = "evicted-interest-records";
+    const SEED: u64 = 0x5780_0001_CAFE;
+    const CONTRACTS: u8 = 10;
+
+    setup_deterministic_state(SEED);
+    let rt = create_runtime();
+
+    let gateway = NodeLabel::gateway(NETWORK, 0);
+    let hub = NodeLabel::node(NETWORK, 1);
+    let contracts: Vec<_> = (0..CONTRACTS)
+        .map(|i| SimOperation::create_test_contract(80 + i))
+        .collect();
+
+    let sim = rt.block_on(async {
+        let mut sim = SimNetwork::new(NETWORK, 1, 3, 7, 3, 10, 2, SEED).await;
+        // Holds a few 64-byte test states, so the hub's later GETs evict its
+        // earlier ones.
+        sim.with_hosting_budget(256);
+        // Hold each contract across interest exchanges before the next GET.
+        sim.with_controlled_op_interval(Duration::from_secs(45));
+        sim
+    });
+    let hub_addr = sim.node_address(&hub).expect("hub address");
+
+    let mut ops = Vec::new();
+    for (i, c) in contracts.iter().enumerate() {
+        ops.push(ScheduledOperation::new(
+            gateway.clone(),
+            SimOperation::Put {
+                contract: c.clone(),
+                state: SimOperation::create_test_state(80 + i as u8),
+                subscribe: false,
+            },
+        ));
+    }
+    for c in &contracts {
+        ops.push(ScheduledOperation::new(
+            hub.clone(),
+            SimOperation::Get {
+                contract_id: *c.key().id(),
+                return_contract_code: true,
+                subscribe: false,
+            },
+        ));
+    }
+    let result = sim.run_controlled_simulation(
+        SEED,
+        ops,
+        Duration::from_secs(3600),
+        // Quiet period before measuring. A contract can legitimately stay in
+        // use for up to one 8-minute subscription lease after the last access,
+        // and a neighbour may refresh a record until our next interest
+        // heartbeat (5 min) tells it we are no longer interested; the record
+        // is then dropped after the 120s wait plus up to one 60s sweep.
+        Duration::from_secs(1500),
+    );
+    assert!(
+        result.turmoil_result.is_ok(),
+        "sim failed: {:?}",
+        result.turmoil_result.err()
+    );
+
+    let hub_hosting = result.node_hosting_count(&hub);
+    // Scenario sanity: the hub's GETs landed (it hosts some contracts) and
+    // the budget forced eviction (it does not host them all), so the
+    // assertions below are about evicted contracts.
+    assert!(
+        (2..CONTRACTS as usize).contains(&hub_hosting),
+        "hub hosts {hub_hosting} of {CONTRACTS} contracts; expected the GETs to land and \
+         the budget to force eviction"
+    );
+
+    // Each peer's latest topology snapshot (taken every virtual second while
+    // its `OpManager` was attached) carries its orphan-record count; the live
+    // `OpManager` is gone by the time the run returns. Every peer must have
+    // been measured, at the end of the run, so a peer whose snapshots stopped
+    // early cannot pass on a stale reading.
+    let snaps = &result.topology_snapshots;
+    assert_eq!(snaps.len(), 4, "expected a snapshot from every peer");
+    assert!(
+        snaps.iter().any(|snap| snap.peer_addr == hub_addr),
+        "the hub was not measured"
+    );
+    let latest = snaps
+        .iter()
+        .map(|snap| snap.timestamp_nanos)
+        .max()
+        .expect("snapshots");
+    let mut dropped_total = 0;
+    for snap in snaps {
+        let orphans = snap
+            .orphan_interest_contracts
+            .unwrap_or_else(|| panic!("peer {} was not measurable", snap.peer_addr));
+        let dropped = snap
+            .reconcile_contracts_dropped
+            .unwrap_or_else(|| panic!("peer {} was not measurable", snap.peer_addr));
+        let stale_ads = snap
+            .stale_advertisements
+            .unwrap_or_else(|| panic!("peer {} was not measurable", snap.peer_addr));
+        dropped_total += dropped;
+        eprintln!(
+            "[#5780] peer={} hosting={} orphan_interest_contracts={orphans} \
+             reconcile_contracts_dropped={dropped} stale_advertisements={stale_ads}",
+            snap.peer_addr,
+            snap.contracts.len(),
+        );
+        assert!(
+            latest - snap.timestamp_nanos <= Duration::from_secs(5).as_nanos() as u64,
+            "peer {}'s last snapshot is stale",
+            snap.peer_addr
+        );
+        assert_eq!(
+            orphans, 0,
+            "peer {} keeps interest records for {orphans} contract(s) it neither hosts nor \
+             uses; they stay advertised and their summaries are never freed (#5780)",
+            snap.peer_addr
+        );
+        assert_eq!(
+            stale_ads, 0,
+            "peer {} still advertises {stale_ads} contract(s) it neither hosts nor uses and \
+             holds no lease toward; co-hosts keep sending it updates (#5782)",
+            snap.peer_addr
+        );
+    }
+    // Premise: records for evicted contracts did form and were dropped. A run
+    // in which none formed would pass the orphan check without testing it.
+    assert!(
+        dropped_total > 0,
+        "reconciliation dropped no records anywhere; the scenario did not exercise it"
+    );
+}
+
+// =============================================================================
+// #5842: UPDATE from a peer that has just started hosting a contract
+// =============================================================================
+
+/// Drives one #5842 scenario and returns, per node holding the contract at the
+/// end of the run, the CRDT version of its copy.
+///
+/// Established hosts (nodes 1-5) PUT/subscribe first. Then `updater` GETs the
+/// contract with `subscribe: true` and, `gap` later, sends a client UPDATE with
+/// version 42. The post-operation wait is far below the ~5 min InterestSync
+/// heartbeat, so only live fan-out can deliver the update.
+fn run_5842_scenario(
+    name: &'static str,
+    seed: u64,
+    updater: usize,
+    updater_gets_first: bool,
+    gap: Duration,
+    prior_update_from: Option<usize>,
+) -> BTreeMap<String, u64> {
+    use freenet::dev_tool::{NodeLabel, ScheduledOperation, SimOperation, register_crdt_contract};
+
+    const NODES: usize = 10;
+    GlobalTestMetrics::reset();
+    setup_deterministic_state(seed);
+    let rt = create_runtime();
+
+    let (mut sim, _logs_handle) = rt.block_on(async {
+        let sim = SimNetwork::new(name, 1, NODES, 7, 3, 10, 4, seed).await;
+        let logs_handle = sim.event_logs_handle();
+        (sim, logs_handle)
+    });
+    sim.with_controlled_op_interval(gap);
+    sim.wait_for_join_convergence_before_ops(1.0, Duration::from_secs(120));
+
+    let contract = SimOperation::create_test_contract(0x58);
+    let contract_id = *contract.key().id();
+    let contract_key = contract.key();
+    register_crdt_contract(contract_id);
+
+    // `AdvanceHostingClock` with no controllable clock is a no-op that the
+    // client follows with a fixed 3s settle, so it doubles as a spacer that is
+    // independent of `gap`.
+    let spacer = |n: usize| {
+        (0..n).map(|_| {
+            ScheduledOperation::new(
+                NodeLabel::gateway(name, 0),
+                SimOperation::AdvanceHostingClock {
+                    duration: Duration::ZERO,
+                },
+            )
+        })
+    };
+
+    let mut operations = vec![ScheduledOperation::new(
+        NodeLabel::node(name, 1),
+        SimOperation::Put {
+            contract: contract.clone(),
+            state: SimOperation::create_crdt_state(1, 0x58),
+            subscribe: true,
+        },
+    )];
+    operations.extend(spacer(3));
+    for i in 2..=5 {
+        operations.push(ScheduledOperation::new(
+            NodeLabel::node(name, i),
+            SimOperation::Get {
+                contract_id,
+                return_contract_code: true,
+                subscribe: true,
+            },
+        ));
+        operations.extend(spacer(1));
+    }
+    // Let subscriptions, hosting advertisements and summaries settle.
+    operations.extend(spacer(10));
+    if updater_gets_first {
+        operations.push(ScheduledOperation::new(
+            NodeLabel::node(name, updater),
+            SimOperation::Get {
+                contract_id,
+                return_contract_code: true,
+                subscribe: true,
+            },
+        ));
+    }
+    if let Some(prior) = prior_update_from {
+        operations.push(ScheduledOperation::new(
+            NodeLabel::node(name, prior),
+            SimOperation::Update {
+                key: contract_key,
+                data: SimOperation::create_crdt_state(10, 0x58),
+            },
+        ));
+    }
+    operations.push(ScheduledOperation::new(
+        NodeLabel::node(name, updater),
+        SimOperation::Update {
+            key: contract_key,
+            data: SimOperation::create_crdt_state(42, 0x58),
+        },
+    ));
+
+    let result = sim.run_controlled_simulation(
+        seed,
+        operations,
+        Duration::from_secs(240),
+        Duration::from_secs(45),
+    );
+    assert!(
+        result.turmoil_result.is_ok(),
+        "[{name}] simulation failed: {:?}",
+        result.turmoil_result.err()
+    );
+
+    let mut versions = BTreeMap::new();
+    for (label, storage) in &result.node_storages {
+        if let Some(state) = storage.get_stored_state(&contract_key) {
+            let bytes = state.as_ref();
+            let version = u64::from_le_bytes(bytes[..8].try_into().unwrap());
+            versions.insert(label.to_string(), version);
+        }
+    }
+    versions
+}
+
+fn assert_5842_converged(name: &str, versions: &BTreeMap<String, u64>) {
+    tracing::info!(?versions, "[{name}] final versions");
+    let stale: Vec<_> = versions.iter().filter(|(_, v)| **v != 42).collect();
+    assert!(
+        versions.contains_key(&format!("{name}-node-1")) && versions.len() >= 6,
+        "[{name}] expected the five established hosts plus the updater to hold \
+         the contract, got {versions:?}"
+    );
+    assert!(
+        stale.is_empty(),
+        "[{name}] #5842: hosts still on an old version 45s after the update, with \
+         no anti-entropy round in the window: {stale:?} (all: {versions:?})"
+    );
+}
+
+// The next three are characterization tests: they pass on main as well. They
+// record what #5842 ruled out (a peer that has just started hosting loses its
+// first UPDATE) and are not regression guards for the fix; that is
+// `test_5842_update_right_after_relaying_another_converges` below.
+#[test_log::test]
+fn test_5842_update_from_fresh_host_reaches_established_hosts() {
+    let versions = run_5842_scenario(
+        "u5842-fresh",
+        0x5842_0000_0001,
+        9,
+        true,
+        Duration::from_secs(1),
+        None,
+    );
+    assert_5842_converged("u5842-fresh", &versions);
+}
+
+#[test_log::test]
+fn test_5842_update_from_fresh_host_before_subscribe_completes() {
+    let versions = run_5842_scenario(
+        "u5842-fast",
+        0x5842_0000_0002,
+        9,
+        true,
+        Duration::from_millis(100),
+        None,
+    );
+    assert_5842_converged("u5842-fast", &versions);
+}
+
+#[test_log::test]
+fn test_5842_update_from_established_host_control() {
+    let versions = run_5842_scenario(
+        "u5842-ctl",
+        0x5842_0000_0003,
+        3,
+        false,
+        Duration::from_secs(1),
+        None,
+    );
+    assert_5842_converged("u5842-ctl", &versions);
+}
+
+/// #5842 regression: a host commits a client UPDATE 5 ms after it relayed an
+/// update it received, so it sends two broadcasts of one contract to the same
+/// co-hosts back to back.
+///
+/// Before the fix every receiver's per-(sender, contract) broadcast rate limit
+/// (20 ms) dropped the second one, and dropped every other host's relay of it
+/// too, since each had just relayed the first. The `ResyncRequest` repair was
+/// then cut off by its per-contract caps, and in this seed gateway-0 and node-9
+/// were still on v10 45 s later. With per-(contract, peer) send spacing at the
+/// sender, every holder converges on v42 without an anti-entropy round (the
+/// heartbeat is ~5 min; the window here is 45 s).
+#[test_log::test]
+fn test_5842_update_right_after_relaying_another_converges() {
+    const NAME: &str = "u5842-race-5";
+    let versions = run_5842_scenario(
+        NAME,
+        0x5842_0000_0011,
+        3,
+        false,
+        Duration::from_millis(5),
+        Some(1),
+    );
+    // Non-vacuity: the update under test must actually have been applied by
+    // the host that sent it, or "everyone converged" proves nothing.
+    assert_eq!(
+        versions.get(&format!("{NAME}-node-3")),
+        Some(&42),
+        "the updater must hold its own update: {versions:?}"
+    );
+    assert_5842_converged(NAME, &versions);
+    // ...and the race must actually have happened in this seed: some leg was
+    // held back for spacing. If an unrelated change moves the seed off the
+    // race, this fails instead of the test passing for nothing.
+    assert!(
+        GlobalTestMetrics::broadcast_legs_spaced() > 0,
+        "no fan-out leg was spaced, so this seed no longer reproduces two \
+         back-to-back broadcasts of one contract to one peer"
     );
 }

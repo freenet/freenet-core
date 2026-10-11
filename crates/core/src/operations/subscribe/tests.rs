@@ -91,7 +91,8 @@ fn handle_unsubscribe_inbound_preserves_legacy_branches() {
          to remove the sender from the per-contract downstream list"
     );
     assert!(
-        body.contains("remove_peer_interest(&key, peer)"),
+        body.contains("remove_peer_interest_for(")
+            && body.contains("InterestRemovalCause::Unsubscribe"),
         "handle_unsubscribe_inbound must call `interest_manager.remove_peer_interest` \
          to drop the sender from the per-peer interest registry"
     );
@@ -647,7 +648,7 @@ fn finalize_host_subscribe_fetches_before_register() {
     // from the captured directed holder (`upstream_peer`), NOT the downstream
     // requester, and a newly-viable upstream flushes deferred broadcasts (#4359).
     let upstream_reg = body
-        .find("register_peer_interest(")
+        .find("register_peer_interest_from(")
         .expect("finalize_host_subscribe must register the responder as upstream interest (Fix D)");
     let upstream_call_end = body[upstream_reg..]
         .find(')')

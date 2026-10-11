@@ -12,11 +12,20 @@ Each `put-get` run:
 2. Boots an **ephemeral peer** (`freenet network` child process with an
    empty data dir) that joins the network **through a different gateway**.
    Having no replicas of its own, it cannot answer any of its own GETs.
-3. GETs this run's contracts through that peer and verifies byte-identity.
-4. Re-GETs contracts published by previous runs (24 h / 48 h / 7 d windows,
-   tracked in a persistent JSON manifest) and verifies their blake3 state
-   hashes.
-5. Prints one JSON line per operation on stdout and exits non-zero if
+3. GETs this run's contracts through that peer (verifying byte-identity)
+   together with contracts published by previous runs (24 h / 48 h / 7 d
+   windows, tracked in a persistent JSON manifest, verified against their
+   blake3 state hashes). The two are issued as **one interleaved
+   sequence**: with a fixed 0 h → 24 h → 48 h → 7 d order, "how old the
+   contract is" and "how late in the run the GET was issued" were the same
+   variable, so an age effect could not be told apart from a
+   within-run session effect. The order is shuffled from a seed derived
+   from the run id, and that seed is logged next to the order it produced,
+   so a run's order can be read back from its own report. (The seed alone
+   does not regenerate it: the permutation also depends on how many ops
+   the run had, which varies with which retention windows the manifest
+   had populated.)
+4. Prints one JSON line per operation on stdout and exits non-zero if
    anything failed. No retries by design: an operation that only succeeds
    on retry is the regression netcheck exists to surface.
 
@@ -64,76 +73,71 @@ One `"event":"run"` line with the conditions of the run, then one
  "freenet_version":"Freenet version: 0.2.106 (c707af0f786e)",
  "pinned_gateways":["100.27.151.80:31337,c28123df…"],
  "ephemeral_peers":["100.27.151.80:31337"]}
-{"event":"op","op":"get","age":"24h","label":"20260725-030000/small-0",…,"ok":true,"latency_ms":412}
+{"event":"op","seq":7,"op":"get","age":"24h","label":"20260725-030000/small-0",…,"ok":true,"latency_ms":412,"errors_ignored":0}
 ```
 
 `freenet_version` is what separates "the network broke" from "the release
 that landed last night broke". Without it a failure cannot be attributed
 after the fact.
 
+`latency_ms` is a measurement on **both** arms. A failed op reports how
+long it actually took, not the configured `--op-timeout-secs`: reporting
+the deadline for every failure hid the difference between a fast terminal
+error from the node and the client giving up waiting, which is the
+distinction the field exists to draw.
+
+`seq` is the operation's 0-based position in the order the run actually
+executed. It has to be recorded because nothing else preserves it: every
+record of a run is published with the same timestamp, and line order is
+lost once the report is parsed. Before the GET order was shuffled,
+position could be recovered from `age`; now it cannot, so without `seq`
+the shuffle would destroy the very information it was introduced to
+disentangle.
+
+`errors_ignored` counts incoming errors this operation attributed to
+another contract and skipped. A server-side error for an op that already
+hit its own deadline arrives during the *next* op's wait window; charging
+it to that op stamps the wrong contract's key into the reported error.
+Zero is emitted too, because an absent field would be indistinguishable
+from a run that never counted. Read it precisely: it counts errors the
+key filter skipped inside an op'''s own wait window. Errors arriving in the
+gap *between* ops are discarded by the pre-op drain, unfiltered and
+uncounted, so a zero means "the filter did not fire during this op", not
+"no stale error existed anywhere near it". Errors that name no contract
+stay unattributable and still fail whichever op is waiting, so this can
+never swallow a real failure silently.
+
+Both fields reach the jsonl report. Neither reaches the telemetry
+dashboard yet: `insert_check_op` writes a fixed column list that has no
+`seq` or `errors_ignored` column, so `netcheck emit` publishes them and
+the ingest drops them without erroring. Read run order and skipped-error
+counts from the jsonl artifact until that table gains the columns
+(freenet/freenet-telemetry-dashboard#21).
+
 ## Production use (nova)
 
-nova runs the primary gateway; the ephemeral peer is pinned to vega (the
-secondary) so the GETs are routed. Resolve the address and key from the
-public index rather than hardcoding them, since the IP and the key can rotate:
+nova runs BOTH gateways: `freenet-gateway` on network port **31337** and
+`freenet-gateway-2` on **31338**. The AWS gateway that used to be the second
+host was retired in September 2026.
+
+The ephemeral peer must be pinned to a gateway OTHER than the one the PUTs go
+through, or a GET can be answered by the node that just stored the data — which
+proves transfer, not findability. `scripts/netcheck-nightly.sh` PUTs through
+`ws://127.0.0.1:7509` (gw1) and therefore pins the getter to **gw2**:
 
 ```bash
-VEGA_IP=$(getent hosts vega.locut.us | awk '{print $1}')
-VEGA_KEY=$(curl -fsS https://freenet.org/keys/public.vega.gw.pem)
-
-netcheck put-get \
-  --gateway-ws ws://127.0.0.1:7509 \
-  --gateway-spec "${VEGA_IP}:31337,${VEGA_KEY}" \
-  --freenet-bin /usr/local/bin/freenet \
-  --manifest    /home/runner/netcheck/manifest.json \
-  --ephemeral-dir /home/runner/netcheck/run \
-  --ephemeral-network-port 32177   # UDP port opened for netcheck on nova
+GW2_IP=$(getent hosts gw2.freenet.org | awk '{print $1}' | head -1)
+GW2_KEY=$(curl -fsS https://freenet.org/keys/public.gw2.pem)
+netcheck --gateway-ws ws://127.0.0.1:7509 \
+         --gateway-spec "${GW2_IP}:31338,${GW2_KEY}"
 ```
 
-`--freenet-bin` points at the **installed release** binary on purpose: the
-ephemeral peer is the measuring instrument, so it should be the same
-binary real users run. A peer built from an unreleased `main` would make
-every failure ambiguous.
+Note this is weaker than the previous arrangement: gw1 and gw2 are separate
+processes but the SAME host, where the retired gateway was a separate machine
+on a different network. The invariant still holds — the GET is answered by a
+different node than the PUT — but it no longer crosses a host or a link. If an
+off-host gateway exists again, prefer it here.
 
-### Running alongside a real node
-
-netcheck is designed to be safe on a host that also runs a production
-gateway, and the guarantees are structural rather than conventional:
-
-- The ephemeral node gets its own `--config-dir`/`--data-dir` and its own
-  ports; it never reads or writes the real node's state.
-- Child processes are killed **by process handle**, never by name: there
-  is no `pkill` anywhere in this crate.
-- The node's own single-instance check is read-only and scoped to its
-  configured WS port: if the port is busy it logs and exits, it never
-  signals the other process. Keep `--ephemeral-ws-port` (default 7519)
-  away from the real node's port.
-- `--disable-auto-update` is passed to the ephemeral node: it lives for
-  minutes, and detecting a new release mid-run would make it exit 42 and
-  fail the check for a reason unrelated to the network.
-
-Two things the caller is responsible for:
-
-- **`--ephemeral-dir`.** Left unset, the node works in an anonymous temp
-  dir that is only cleaned up on a normal exit; a killed run (a cancelled
-  CI job) leaks it. The node's hosting cache is budgeted at `RAM/8` capped
-  at 1 GiB, so on a large host a leak is not small. Point it at a known
-  path and clear that path before each run.
-- **Disk headroom.** Check free space before running on a shared host and
-  skip the run rather than filling the disk out from under the real node.
-
-### Nightly
-
-`scripts/netcheck-nightly.sh` is the production recipe above with both of
-those responsibilities handled, and it publishes the report through
-`netcheck emit`. `.github/workflows/netcheck-nightly.yml` runs it at 04:00
-UTC on the self-hosted runner and does nothing else: the logic lives in the
-script so it can be run by hand over ssh, which a workflow file cannot be
-until it reaches the default branch.
-
-Every path and port is overridable by environment variable
-(`NETCHECK_GATEWAY_WS`, `NETCHECK_STATE_DIR`, `NETCHECK_OTLP_ENDPOINT`, ...),
-so a second vantage point needs no edit to the script.
 
 ## Local testing, fully isolated
 

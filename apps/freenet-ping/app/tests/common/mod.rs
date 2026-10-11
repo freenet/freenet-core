@@ -798,7 +798,8 @@ pub const TEST_DELEGATE_CIPHER: [u8; 32] = [
     0x07, 0x6b, 0x55, 0xd2, 0x3e, 0xfb, 0x80, 0x29, 0x1c, 0xa5, 0xee, 0x44, 0x6f, 0x32, 0x18, 0xbd,
 ];
 
-/// 24-byte registration nonce. Per-write nonces (PR #4143) mean the
-/// server ignores this field for encryption; only legacy-decrypt of
-/// pre-0.2.59 on-disk files consults it. Any constant works.
+/// 24-byte nonce field. The server ignores it entirely: per-write nonces
+/// landed in #4143, and since #4146 `register_delegate` discards the
+/// client-supplied cipher/nonce outright, so this value never reaches any
+/// encrypt or decrypt path. Any constant works.
 pub const TEST_DELEGATE_NONCE: [u8; 24] = [0u8; 24];

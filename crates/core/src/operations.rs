@@ -23,6 +23,7 @@ pub(crate) mod get;
 pub(crate) mod op_ctx;
 pub(crate) mod orphan_streams;
 pub(crate) mod put;
+pub(crate) mod route_attempt;
 pub(crate) mod stream_progress;
 pub(crate) mod subscribe;
 #[cfg(test)]
@@ -273,6 +274,71 @@ pub(crate) fn reject_if_contract_banned_on(
     Ok(())
 }
 
+/// Side effects of a contract becoming hosted with its state held locally
+/// (#5780): advertise it to neighbours (so it receives live UPDATE fan-out),
+/// nudge placement, register local hosting (so it joins anti-entropy,
+/// hosting-invariants invariant 1), and send one interest change carrying it
+/// together with any `removed` contracts from the same event.
+///
+/// One helper so every path that forms a host runs the whole sequence: the GET
+/// cache path and the PUT relay store both call it. A path that registered
+/// without announcing left a re-hosted copy unadvertised after its eviction had
+/// retracted the advertisement; one that announced without checking the
+/// contract was still hosted left an advertisement and a hosting flag for a
+/// contract it no longer held.
+///
+/// Callers check `is_hosting_contract` first, and the helper checks again after
+/// the announce, which can wait up to 30s: if the contract was evicted in that
+/// window nothing is registered, so no local-hosting flag or `added` interest
+/// outlives the eviction. The retraction issued then is often a no-op, since
+/// the eviction already removed the advertisement entry; like every hosting
+/// retraction it is best-effort, and a dropped one is healed when a co-host
+/// re-requests our hosted set on the interest heartbeat (~5 min). Neither check
+/// is atomic with eviction: a flag set just before an eviction is cleared and
+/// retracted by the hosting sweep's reconciliation, within
+/// `RECONCILE_MIN_UNUSED_AGE` plus one sweep interval.
+pub(crate) async fn complete_host_formation(
+    op_manager: &OpManager,
+    key: ContractKey,
+    removed: Vec<ContractKey>,
+) {
+    announce_contract_hosted(op_manager, &key).await;
+    // The announce can wait up to 30s; an evicted contract re-hosted or
+    // re-subscribed meanwhile must not be sent as removed after its own
+    // addition went out.
+    let removed: Vec<ContractKey> = removed
+        .into_iter()
+        .filter(|k| {
+            !op_manager.ring.is_hosting_contract(k)
+                && !op_manager.interest_manager.has_local_interest(k)
+        })
+        .collect();
+    if !op_manager.ring.is_hosting_contract(&key) {
+        retract_advertisement_for_evicted_contract(op_manager, &key);
+        if !removed.is_empty() {
+            broadcast_change_interests(op_manager, Vec::new(), removed).await;
+        }
+        return;
+    }
+    // Directed-subscribe placement (#4404): best-effort nudge the node to
+    // consider migrating this freshly-hosted contract toward a closer
+    // neighbor. Dropped silently if the event channel is full; the next
+    // hosting/peer event re-triggers consideration.
+    if let Err(err) = op_manager
+        .try_notify_node_event(crate::message::NodeEvent::ConsiderContractMigration { key })
+    {
+        tracing::debug!(%key, %err, "ConsiderContractMigration emit dropped");
+    }
+    let added = if op_manager.interest_manager.register_local_hosting(&key) {
+        vec![key]
+    } else {
+        Vec::new()
+    };
+    if !added.is_empty() || !removed.is_empty() {
+        broadcast_change_interests(op_manager, added, removed).await;
+    }
+}
+
 /// Announces to neighbors that we're hosting a contract.
 /// This broadcasts to all connected peers so they know to forward UPDATEs to us.
 pub(crate) async fn announce_contract_hosted(op_manager: &OpManager, key: &ContractKey) {
@@ -325,39 +391,151 @@ pub(crate) async fn announce_contract_hosted(op_manager: &OpManager, key: &Contr
 /// actually gone — the confirmed-`ReclaimOutcome::Full | Partial` delete path (a
 /// `Partial` half-delete can no longer be served, so it retracts too; `Err`, with
 /// nothing deleted, does not) — i.e. AFTER the re-host / re-subscribe /
-/// newer-generation guards that would otherwise keep the contract. Wiring it there
-/// (not at the eviction *decision* in [`reclaim_evicted_contract`]) is what keeps
-/// a contract kept alive by that race both fresh AND advertised.
+/// newer-generation guards that would otherwise keep the contract.
 ///
-/// Best-effort and non-blocking (`try_notify_node_event`): unlike
-/// [`announce_contract_hosted`] (a one-shot hosting announce that MUST be
-/// delivered, hence its blocking await), a dropped retraction self-heals within
-/// one interest-heartbeat interval (~5 min) when a co-host re-requests our full
-/// hosted set and full-replaces its view of us (the piggybacked hosting
-/// re-request in `interest_heartbeat`). `on_contract_unhosted` is idempotent, so
-/// a pending-reclamation retry that reaches this after the state is already gone
-/// is a harmless no-op.
+/// This is the RECLAMATION-side retraction and it is now a backstop, not the
+/// primary one: eviction retracts at the eviction decision via
+/// [`retract_advertisement_for_evicted_contract`], because gating the
+/// advertisement on the delete succeeding let an evicted contract keep receiving
+/// and applying updates indefinitely (#5059 — read that function's doc for the
+/// loop). This path still covers a delete that reaches reclamation from anywhere
+/// the eviction funnel did not, and `on_contract_unhosted` is idempotent, so
+/// re-entering it after the advertisement is already gone is a harmless no-op.
+///
+/// Best-effort and non-blocking — see [`emit_hosting_retraction`].
 pub(crate) fn announce_contract_unhosted(op_manager: &OpManager, key: &ContractKey) {
     if let Some(retraction) = op_manager.neighbor_hosting.on_contract_unhosted(key) {
         tracing::debug!(
             %key,
             "NEIGHBOR_HOSTING: Retracting hosting advertisement to neighbors"
         );
-        if let Err(err) =
-            op_manager.try_notify_node_event(crate::message::NodeEvent::BroadcastHostingUpdate {
-                message: retraction,
-            })
-        {
-            // Best-effort by design — the periodic full-set re-request
-            // (piggybacked on `interest_heartbeat`) is the convergence backstop for
-            // a dropped retraction. Debug, not warn: benign back-pressure under load.
-            tracing::debug!(
-                contract = %key,
-                error = %err,
-                "NEIGHBOR_HOSTING: retraction broadcast dropped (best-effort; \
-                 healed by periodic full-set re-request)"
-            );
-        }
+        emit_hosting_retraction(op_manager, key, retraction);
+    }
+}
+
+/// Retract the co-host advertisement for a contract the hosting cache has just
+/// EVICTED, unless it has already been re-hosted or is back in use.
+///
+/// This is the advertisement half of eviction, and it is deliberately NOT gated on
+/// the on-disk delete succeeding. [`announce_contract_unhosted`] fires from
+/// `RuntimePool::remove_contract` on a confirmed delete, behind three guards; the
+/// third of those — "the state generation advanced since eviction" — is a guard on
+/// deleting BYTES, and using it to gate the advertisement created a self-sustaining
+/// loop (#5059):
+///
+/// 1. cost-pressure eviction sheds a zero-demand storm contract, but the
+///    advertisement stays, and co-host fan-out targets come from the advertisement
+///    (`neighbor_hosting`) with no interest check;
+/// 2. so inbound updates keep arriving and keep being applied — which is where the
+///    WASM CPU the eviction was supposed to reclaim actually goes;
+/// 3. every applied update bumps the state generation, so the deferred
+///    `EvictContract` always bails at guard 3, never reaches the retraction, and
+///    re-queues itself for a retry that bails the same way;
+/// 4. and the ~5-min full-set re-request replays `my_contracts`, actively
+///    RE-ASSERTING the phantom advertisement to every co-host.
+///
+/// Field evidence (#5040): a contract's `send_update_notification` warn ran at
+/// ~10-11/s continuously THROUGH three separate cost evictions of that contract,
+/// with no gap at any eviction timestamp.
+///
+/// Retracting here instead is what invariant 1 asks for — advertise iff a fresh
+/// in-mesh host — because eviction is exactly the moment the contract stops being
+/// one. Holding bytes on disk that no longer belong to any hosted contract is a
+/// reclamation concern, and reclamation keeps its own retries.
+///
+/// Three conditions mean "still a host", and any of them keeps the
+/// advertisement:
+///
+/// - `is_hosting_contract` — a GET/PUT re-hosted it into the hosting cache.
+/// - `contract_in_use` — a client or downstream subscriber re-registered.
+///   (These two match guards 1 and 2 in `RuntimePool::remove_contract`.)
+/// - `is_subscribed` — we hold a live upstream subscription lease. A lease is
+///   not demand (it follows hosting); it is checked here because a SUBSCRIBE
+///   installs it before the body fetch and the announce, so a live lease may
+///   mean a host is forming. A lease left on a contract with no host and no
+///   demand is not renewed, so it lapses within one lease period (#5782). The
+///   hosting sweep's reconciliation calls this retraction every pass for each
+///   advertised or tracked contract that has been unhosted and unused for
+///   `RECONCILE_MIN_UNUSED_AGE` and is lease-free, so the advertisement goes
+///   on the first such pass after the lease ends, however it ended.
+///
+/// The lease check is what makes the ordering guarantee below hold for the
+/// SUBSCRIBE path, whose announce is gated on the body being present ON DISK
+/// (`finalize_originator_subscribe` → `fetch_contract_if_missing` →
+/// `has_contract`), not on a hosting-cache insert. `ring.subscribe` installs the
+/// lease before both that fetch and that announce, so the lease is the signal
+/// that is reliably set first there. Without it, a contract evicted with its
+/// state still on disk and awaiting reclamation could be re-subscribed, announce,
+/// and then have the pending-reclamation retry retract it right back out — leaving
+/// the node subscribed, holding the body, and unadvertised.
+///
+/// This does not weaken the eviction retraction, because the sweep drops the lease
+/// (`ring.unsubscribe`) before calling into here. It only makes the GET/PUT
+/// insert-eviction funnels defer a lease-holding victim's retraction to the
+/// reclamation-side path, which is where it happened before this fix anyway.
+///
+/// The check runs AFTER the removal — see
+/// `NeighborHostingManager::on_contract_unhosted_unless_rehosted` for why that
+/// ordering is the race-free one.
+///
+/// Idempotent: a pending-reclamation retry re-entering this is a no-op once the
+/// advertisement is gone. Best-effort emission, like its siblings.
+pub(crate) fn retract_advertisement_for_evicted_contract(
+    op_manager: &OpManager,
+    key: &ContractKey,
+) {
+    let retraction = op_manager
+        .neighbor_hosting
+        .on_contract_unhosted_unless_rehosted(key, || {
+            op_manager.ring.is_hosting_contract(key)
+                || op_manager.ring.contract_in_use(key)
+                || op_manager.ring.is_subscribed(key)
+        });
+    if let Some(retraction) = retraction {
+        tracing::debug!(
+            %key,
+            "NEIGHBOR_HOSTING: Retracting hosting advertisement for an evicted contract"
+        );
+        emit_hosting_retraction(op_manager, key, retraction);
+    }
+}
+
+/// Put a prepared `HostingAnnounce{removed}` on the wire.
+///
+/// Best-effort and non-blocking (`try_notify_node_event`): unlike
+/// [`announce_contract_hosted`] (a one-shot hosting announce that MUST be
+/// delivered, hence its blocking await), a dropped retraction self-heals within
+/// one interest-heartbeat interval (~5 min) when a co-host re-requests our full
+/// hosted set and full-replaces its view of us (the piggybacked hosting
+/// re-request in `interest_heartbeat`) — that replay is only a backstop for a
+/// dropped MESSAGE, never for a `my_contracts` entry that should not be there.
+fn emit_hosting_retraction(
+    op_manager: &OpManager,
+    key: &ContractKey,
+    retraction: crate::message::NeighborHostingMessage,
+) {
+    if let Err(err) =
+        op_manager.try_notify_node_event(crate::message::NodeEvent::BroadcastHostingUpdate {
+            message: retraction,
+        })
+    {
+        // Best-effort by design — the periodic full-set re-request
+        // (piggybacked on `interest_heartbeat`) is the convergence backstop for
+        // a dropped retraction. Debug, not warn: benign back-pressure under load.
+        //
+        // The counter, not this log, is the field signal: `debug!` compiles out
+        // in release, and a node under the #5059 broadcast storm is exactly when
+        // this cap-2048 channel is most likely to be full — so without it a slow
+        // heal and a failed fix look identical in production.
+        crate::node::network_status::record_hosting_retraction_dropped();
+        tracing::debug!(
+            contract = %key,
+            error = %err,
+            "NEIGHBOR_HOSTING: retraction broadcast dropped (best-effort; \
+             healed by periodic full-set re-request)"
+        );
+    } else {
+        crate::node::network_status::record_hosting_retraction_emitted();
     }
 }
 
@@ -522,22 +700,24 @@ pub(crate) fn reclaim_evicted_contract(
             .pending_reclamation_add(key, expected_generation);
         return;
     }
-    // NOTE (Fix 1 retraction, #4642 spec step 1): the hosting-advertisement
-    // retraction is NOT emitted here at the eviction DECISION. `EvictContract` is
-    // fire-and-forget and the deletion-time guards in `RuntimePool::remove_contract`
-    // DELIBERATELY skip the delete if the contract was re-hosted / re-subscribed /
-    // written to a newer generation in the eviction→reclaim window. Retracting
-    // here would then leave the node holding fresh state it no longer advertises
-    // (an under-advertisement the periodic heartbeat cannot heal). Instead the
-    // retraction is wired on the confirmed-delete path (`ReclaimOutcome::Full |
-    // Partial`) in `RuntimePool::remove_contract`, so it fires exactly when a
-    // required on-disk half is truly gone. That single point covers every eviction
-    // funnel (GET/PUT insert
-    // eviction, the periodic sweep, and — once built — evict-to-admit). (Interest-
+    // Retract the co-host advertisement NOW, at the eviction decision — the node
+    // has stopped hosting `key`, so under invariant 1 it must stop advertising it,
+    // whether or not the bytes come off disk. Deferring this to the confirmed-delete
+    // path in `RuntimePool::remove_contract` was #5059: that path's third guard
+    // ("written since eviction") guards deleting BYTES, and a contract that keeps
+    // receiving updates BECAUSE it is still advertised keeps tripping it, so the
+    // retraction never ran and the fan-out never stopped. The two guards that
+    // genuinely mean "still a host" — re-hosted, or back in use — are re-checked
+    // inside the helper, so a contract kept alive by that race stays advertised.
+    // This covers every eviction funnel (GET/PUT insert eviction, the periodic byte
+    // and cost sweeps, and — once built — evict-to-admit); the reclamation-side
+    // `announce_contract_unhosted` remains as an idempotent backstop.
+    // (Interest-
     // gated COLLAPSE does not stop hosting on current `main`: `send_unsubscribe_
     // upstream` drops only the lease, leaving a still-fresh cached copy that must
     // keep advertising; when the reconcile-core flip makes demand-loss stop
     // hosting, that collapse-then-evict flows through this very funnel too.)
+    retract_advertisement_for_evicted_contract(op_manager, &key);
 
     // Disk reclamation after hosting-cache eviction is best-effort GC —
     // background-tier so it yields the contract loop to client/relay work (#4534).
@@ -680,6 +860,8 @@ pub(crate) async fn has_contract(
         | crate::contract::ContractHandlerEvent::GetSummaryResponse { .. }
         | crate::contract::ContractHandlerEvent::GetDeltaQuery { .. }
         | crate::contract::ContractHandlerEvent::GetDeltaResponse { .. }
+        | crate::contract::ContractHandlerEvent::GetStateAndSummaryQuery { .. }
+        | crate::contract::ContractHandlerEvent::GetStateAndSummaryResponse { .. }
         | crate::contract::ContractHandlerEvent::ClientDisconnect { .. }
         | crate::contract::ContractHandlerEvent::EvictContract { .. } => Ok(None),
     }
@@ -764,40 +946,36 @@ pub(crate) fn streaming_aware_attempt_timeout(
 
 /// Records a routing event observed by a relay/forwarding hop.
 ///
-/// Without this hook, only the operation's originator feeds events into the
-/// router. `OpOutcome::ContractOp*` is only produced for ops where
-/// `upstream_addr.is_none()`, and relay hops return `SendAndComplete` without
-/// going through `outcome()`. On a relay-heavy node the router would see
-/// almost no per-peer data, leaving the failure-probability model untrained
-/// and the per-peer dashboard panels empty even when MB of traffic flowed
-/// through each connection.
+/// Without this hook only the operation's originator would feed events into
+/// the router, and on a relay-heavy node the failure-probability model would
+/// stay untrained and the per-peer dashboard panels empty even when MB of
+/// traffic flowed through each connection.
 ///
-/// Call this at the relay-side response sites in each operation when the
-/// downstream peer the relay chose returns success or failure. Timeout and
-/// disconnect paths are already covered by `report_timeout_failure` in
-/// `node/op_state_manager.rs` via `failure_routing_info`.
+/// Call this at the relay-side SUCCESS sites of each operation, when the
+/// downstream peer the relay chose delivered. Non-success outcomes (timeouts,
+/// send failures, `NotFound`) go through
+/// [`route_attempt::RouteAttemptRecorder`], which owns the labelling rules for
+/// them, including when a downstream `NotFound` becomes a `Failure`. (Earlier
+/// revisions of this comment said timeouts were "already covered by
+/// `report_timeout_failure` in `node/op_state_manager.rs` via
+/// `failure_routing_info`". Both were deleted by the task-per-tx migration,
+/// #4053/#4065/#4076/#4087, and nothing replaced them until #5657.)
 ///
 /// # Outcome attribution
 ///
-/// The `outcome` argument matches the legacy originator-side semantics
-/// (see `OpOutcome::Contract*` and the per-op `outcome()` methods). In
-/// particular, **prompt `NotFound` from a downstream peer is recorded
-/// as `RouteOutcome::Failure`**, not Success. A peer that promptly
-/// answers "I don't host this contract" behaved correctly at the
-/// transport level, but the failure-probability model is asking "will
-/// this peer deliver the contract at this location?" and a `NotFound`
-/// reply means it won't — so for routing-decision purposes it's a
-/// negative signal for *that contract location*. The relay sites
-/// follow the same convention used by the originator's stalled-peer
-/// retry path (`get.rs:2686` and `report_timeout_failure` in
-/// `op_state_manager.rs`). Splitting transport-success from
-/// content-availability would require a new `RouteOutcome::NotHosted`
-/// variant and is out of scope here.
+/// A downstream `NotFound` is a `RouteOutcome::Failure` for routing purposes
+/// only when the same search then proves the contract exists (a later Found):
+/// the model asks "will routing via this peer deliver this contract?", and
+/// only then do we know it would have been deliverable. A `NotFound` from a
+/// search that never proves existence is ambiguous (the contract may not
+/// exist, or not yet) and is handled by
+/// [`route_attempt::ambiguous_not_found_policy`], which does not train it.
+/// Neither is ever a peer-health signal, which is why relay events (like every
+/// recorder event) feed the router only.
 ///
-/// `LocalCompletion` and unexpected-reply variants are also recorded as
-/// `Failure` against the downstream peer; these are "shouldn't happen"
-/// paths and recording them as failures matches the relay's decision to
-/// abandon that peer and try another.
+/// `LocalCompletion` and unexpected-reply variants are NOT recorded: whether
+/// they indicate a local bug or peer misbehaviour is unknown, and the invariant
+/// is one event per unambiguously attributable observation.
 ///
 /// # UPDATE exclusion
 ///
@@ -807,10 +985,8 @@ pub(crate) fn streaming_aware_attempt_timeout(
 /// streaming variants), so the relay never observes whether the downstream
 /// peer succeeded or failed. Recording only the local send-error path
 /// would bias the per-peer UPDATE failure rate to 100% by construction.
-/// `report_timeout_failure` in `op_state_manager.rs` still records UPDATE
-/// timeouts via `failure_routing_info` on the originator side; this is
-/// the same signal as for the other ops, just not augmented by relay
-/// observations.
+/// The UPDATE originator is fire-and-forget as well, so UPDATE feeds the
+/// router nothing, on either side.
 pub(crate) fn record_relay_route_event(
     op_manager: &OpManager,
     next_hop: PeerKeyLocation,
@@ -818,6 +994,27 @@ pub(crate) fn record_relay_route_event(
     outcome: crate::router::RouteOutcome,
     op_type: crate::node::network_status::OpType,
 ) {
+    count_relay_route_event(op_type);
+    // Feed only the routing model, NOT peer_health or topology_manager. See
+    // `Ring::record_route_event_router_only` for why. Tagged `Relay` for the
+    // routing dataset (#5648).
+    op_manager.ring.record_route_event_router_only(
+        crate::router::RouteEvent {
+            peer: next_hop,
+            contract_location,
+            outcome,
+            op_type: Some(op_type),
+        },
+        crate::router::dataset::RouteSource::Relay,
+    );
+}
+
+/// Advance the per-op-type `RELAY_*_ROUTE_EVENT_COUNT` test hook. A no-op in
+/// production builds. Shared by [`record_relay_route_event`] and the relay-side
+/// [`route_attempt::RouteAttemptRecorder`], so relay successes and relay
+/// failures both count.
+#[cfg_attr(not(any(test, feature = "testing")), allow(unused_variables))]
+pub(crate) fn count_relay_route_event(op_type: crate::node::network_status::OpType) {
     #[cfg(any(test, feature = "testing"))]
     {
         use std::sync::atomic::Ordering;
@@ -829,37 +1026,6 @@ pub(crate) fn record_relay_route_event(
         };
         counter.fetch_add(1, Ordering::Relaxed);
     }
-    // Feed only the routing model — NOT peer_health or topology_manager.
-    //
-    // `Ring::routing_finished` also updates `peer_health` (which uses
-    // `std::time::Instant::now()` in `connection_manager.rs::PeerHealthTracker`
-    // around lines 182-203, a pre-existing TimeSource rule violation)
-    // and the topology_manager's `request_density_tracker`. An earlier
-    // iteration of this branch routed relay events through
-    // `routing_finished` and broke three strict-determinism tests
-    // (`test_strict_determinism_*` / `test_direct_runner_determinism` /
-    // `test_thundering_herd_connect_storm`). Bypassing those side
-    // effects fixed all three.
-    //
-    // CAVEAT: `Router::add_event` itself transitively calls
-    // `RoutingPredictor::record` → `wall_clock_hours()` → `SystemTime::now()`
-    // (see `router/routing_predictor.rs:608-614`). So the router path is
-    // not strictly TimeSource-clean either; the determinism tests pass
-    // because the wall-clock variance there is well below the events
-    // each test counts. Migrating both `peer_health` and
-    // `routing_predictor` to `TimeSource` would let
-    // `record_relay_route_event` go back to calling `routing_finished`
-    // straightforwardly. Tracked as a follow-up.
-    op_manager
-        .ring
-        .router
-        .write()
-        .add_event(crate::router::RouteEvent {
-            peer: next_hop,
-            contract_location,
-            outcome,
-            op_type: Some(op_type),
-        });
 }
 
 /// Test hook: counter incremented every time `record_relay_route_event`
@@ -1239,20 +1405,96 @@ mod sub_op_subscribe_pin_tests {
     }
 }
 
+/// Behaviour of `retract_advertisement_for_evicted_contract` against a real
+/// `OpManager` (#5782): the hosting sweep calls it every pass for unhosted,
+/// unused contracts, and it must leave the advertisement while this node's own
+/// lease is live and retract it once the lease has ended.
+#[cfg(test)]
+mod retraction_lease_tests {
+    use std::sync::Arc;
+
+    use freenet_stdlib::prelude::{CodeHash, ContractInstanceId, ContractKey};
+
+    async fn op_manager(id: &str) -> Arc<crate::node::OpManager> {
+        let config_args = crate::config::ConfigArgs {
+            id: Some(id.to_string()),
+            mode: Some(crate::contract::OperationMode::Local),
+            ..Default::default()
+        };
+        let node_config =
+            crate::node::NodeConfig::new(config_args.build().await.expect("build Config"))
+                .await
+                .expect("build NodeConfig");
+        let (_notification_rx, notification_tx) = crate::node::event_loop_notification_channel();
+        let (ops_ch_channel, _ch_channel, _wait_for_event) =
+            crate::contract::contract_handler_channel();
+        let connection_manager = crate::ring::ConnectionManager::new(&node_config);
+        let (result_router_tx, _result_router_rx) = tokio::sync::mpsc::channel(100);
+        let task_monitor = crate::node::background_task_monitor::BackgroundTaskMonitor::new();
+        let op_manager = Arc::new(
+            crate::node::OpManager::new(
+                notification_tx,
+                ops_ch_channel,
+                &node_config,
+                crate::tracing::DynamicRegister::new(vec![]),
+                connection_manager,
+                result_router_tx,
+                &task_monitor,
+            )
+            .expect("build OpManager"),
+        );
+        op_manager.ring.attach_op_manager(&op_manager);
+        op_manager
+    }
+
+    #[tokio::test]
+    async fn retraction_waits_for_an_own_lease_to_end() {
+        let op_manager = op_manager("retraction-lease-5782").await;
+        let key = ContractKey::from_id_and_code(
+            ContractInstanceId::new([11u8; 32]),
+            CodeHash::new([12u8; 32]),
+        );
+        op_manager.neighbor_hosting.on_contract_hosted(&key);
+        op_manager.ring.subscribe(key);
+
+        super::retract_advertisement_for_evicted_contract(&op_manager, &key);
+        assert!(
+            op_manager.neighbor_hosting.is_hosted_locally(&key),
+            "a live lease keeps the advertisement"
+        );
+
+        op_manager.ring.unsubscribe(&key);
+        super::retract_advertisement_for_evicted_contract(&op_manager, &key);
+        assert!(
+            !op_manager.neighbor_hosting.is_hosted_locally(&key),
+            "once the lease has ended the advertisement is retracted"
+        );
+    }
+}
+
 #[cfg(test)]
 mod reclaim_retraction_pin_tests {
-    //! Pin tests for the Fix 1 retraction wiring (#4642 spec step 1). The
-    //! hosting-advertisement retraction must fire on the CONFIRMED-delete path
-    //! (`RuntimePool::remove_contract`, gated `ReclaimOutcome::Full | Partial`),
-    //! NOT at the eviction DECISION in `reclaim_evicted_contract`: the deletion-time
-    //! guards
-    //! (re-host / re-subscribe / newer-generation) may skip the delete, and a
-    //! retraction at the decision site would then leave the node holding fresh
-    //! state it no longer advertises. A future refactor — including the
-    //! reconcile-core `Retract` flip — must neither move it back to the decision
-    //! site nor drop it. (Every eviction funnels through `remove_contract`:
-    //! GET/PUT insert eviction, the periodic sweep, and — once built —
-    //! evict-to-admit.)
+    //! Pin tests for the hosting-advertisement retraction wiring (#4642 spec
+    //! step 1, #5059).
+    //!
+    //! Two retraction sites, each with its own gate, and neither may absorb the
+    //! other:
+    //!
+    //! - **Eviction decision** (`reclaim_evicted_contract`) — the PRIMARY one.
+    //!   It must retract, and it must do so through
+    //!   `retract_advertisement_for_evicted_contract`, whose gate is
+    //!   re-hosted-or-in-use. Calling the bare `announce_contract_unhosted` here
+    //!   instead would retract unconditionally and strand a contract that the
+    //!   re-host race kept alive.
+    //! - **Confirmed delete** (`RuntimePool::remove_contract`, gated
+    //!   `ReclaimOutcome::Full | Partial`) — the reclamation-side backstop.
+    //!
+    //! What must never come back is the OLD arrangement, where the delete-side
+    //! gate was the ONLY gate: its third guard ("written since eviction") guards
+    //! deleting bytes, and an evicted-but-still-advertised contract keeps
+    //! receiving updates, keeps bumping the generation, and so keeps that guard
+    //! tripped forever — the #5059 loop. A future refactor, including the
+    //! reconcile-core `Retract` flip, must keep the eviction-decision retraction.
 
     fn extract_fn_body(src: &'static str, needle: &str) -> &'static str {
         let start = src
@@ -1284,18 +1526,117 @@ mod reclaim_retraction_pin_tests {
         &src[start..end]
     }
 
+    /// `extract_fn_body` with `//` comments stripped, so a pin asserting the
+    /// ABSENCE of a call cannot be satisfied — or spuriously broken — by prose.
+    /// Both of the absence pins below name their forbidden call in the very
+    /// comment that explains why it is forbidden.
+    fn extract_fn_code(src: &'static str, needle: &str) -> String {
+        extract_fn_body(src, needle)
+            .lines()
+            .map(|line| match line.find("//") {
+                Some(idx) => &line[..idx],
+                None => line,
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     #[test]
-    fn reclaim_evicted_contract_does_not_retract_at_the_decision_site() {
+    fn reclaim_evicted_contract_retracts_through_the_guarded_helper() {
         let src = include_str!("operations.rs");
-        // Runtime-compose the needle so this pin does not match itself.
+        // Runtime-compose the needles so these pins do not match themselves.
         let needle = ["fn ", "reclaim_evicted_contract("].concat();
-        let body = extract_fn_body(src, &needle);
+        let code = extract_fn_code(src, &needle);
         assert!(
-            !body.contains("announce_contract_unhosted("),
-            "`reclaim_evicted_contract` must NOT retract at the eviction decision — \
-             the deletion-time guards may skip the delete, which would leave the \
-             node holding fresh state it no longer advertises. The retraction is \
-             wired on the confirmed-delete path in `RuntimePool::remove_contract`."
+            code.contains(&["retract_advertisement_for_evicted", "_contract(op_manager"].concat()),
+            "`reclaim_evicted_contract` MUST retract the co-host advertisement at the \
+             eviction decision (#5059). Leaving it to the confirmed-delete path in \
+             `RuntimePool::remove_contract` means an evicted contract that keeps \
+             receiving updates keeps tripping that path's newer-generation guard, so \
+             the retraction never fires and the fan-out never stops."
+        );
+        assert!(
+            !code.contains(&["announce_contract_", "unhosted(op_manager"].concat()),
+            "the eviction-decision retraction must go through \
+             `retract_advertisement_for_evicted_contract` (gated on re-hosted / \
+             in-use / subscribed), NOT the bare `announce_contract_unhosted`, which \
+             retracts unconditionally and would strand a contract that a re-host or \
+             a re-subscribe kept alive."
+        );
+    }
+
+    /// The emission must stay INSIDE the guard. The helper's protection is the
+    /// `on_contract_unhosted_unless_rehosted` return value; a refactor that
+    /// inlined `try_notify_node_event` at the call site — or emitted a retraction
+    /// the primitive declined to produce — would send a retraction for a contract
+    /// that is still hosted, which nothing else in this file would catch.
+    #[test]
+    fn eviction_retraction_emits_only_what_the_guard_returned() {
+        let src = include_str!("operations.rs");
+        let needle = ["fn ", "retract_advertisement_for_evicted_contract("].concat();
+        let code = extract_fn_code(src, &needle);
+        assert!(
+            code.contains(&["emit_hosting_", "retraction("].concat()),
+            "the helper must emit through `emit_hosting_retraction`"
+        );
+        assert!(
+            !code.contains("try_notify_node_event"),
+            "the helper must NOT emit the node event directly — that bypasses \
+             `emit_hosting_retraction` and invites emitting outside the guard"
+        );
+        // The emission must be reached only through the `Some(..)` arm of the
+        // guard's return, never unconditionally.
+        let guard_idx = code
+            .find(&["on_contract_unhosted_unless", "_rehosted("].concat())
+            .expect("the guard call must exist");
+        let emit_idx = code
+            .find(&["emit_hosting_", "retraction("].concat())
+            .expect("the emission must exist");
+        assert!(
+            emit_idx > guard_idx,
+            "the emission must come after the guard, not before it"
+        );
+        assert!(
+            code[guard_idx..emit_idx].contains("if let Some("),
+            "the emission must be inside the guard's `Some(..)` arm, so a declined \
+             retraction emits nothing"
+        );
+    }
+
+    /// The helper's gate must be exactly the three conditions that mean "still a
+    /// host" — in the hosting cache, in use, or holding a live upstream lease —
+    /// and NOT the state-generation guard, which is what made the delete-side gate
+    /// unusable for the advertisement (#5059). A generation check creeping in here
+    /// would restore the loop; dropping the lease check would reopen the
+    /// SUBSCRIBE-path window (that path's announce is gated on disk presence, so
+    /// the lease is the only one of the three reliably set before it).
+    #[test]
+    fn eviction_retraction_helper_gates_on_rehost_and_in_use_only() {
+        let src = include_str!("operations.rs");
+        let needle = ["fn ", "retract_advertisement_for_evicted_contract("].concat();
+        let code = extract_fn_code(src, &needle);
+        for required in ["is_hosting_contract(", "contract_in_use(", "is_subscribed("] {
+            assert!(
+                code.contains(required),
+                "`retract_advertisement_for_evicted_contract` must re-check `{required}` \
+                 so a contract re-hosted, re-subscribed, or holding a live upstream \
+                 lease since the eviction decision keeps its advertisement"
+            );
+        }
+        assert!(
+            !code.contains("state_generation("),
+            "the eviction retraction must NOT be gated on the state generation — a \
+             contract that keeps receiving updates because it is still advertised \
+             advances its generation forever, which is exactly the #5059 loop"
+        );
+        // The re-host check must run through the remove-then-check primitive, not
+        // as a plain `if` before an unconditional removal — see
+        // `NeighborHostingManager::on_contract_unhosted_unless_rehosted` for why
+        // check-then-remove loses the race against a concurrent re-host announce.
+        assert!(
+            code.contains(&["on_contract_unhosted_unless", "_rehosted("].concat()),
+            "the retraction must go through `on_contract_unhosted_unless_rehosted`, \
+             which applies the re-host check AFTER removing from `my_contracts`"
         );
     }
 
@@ -1559,5 +1900,542 @@ mod terminal_consult_tests {
         assert_eq!(GlobalTestMetrics::terminal_consult_resolved_found(), 1);
         assert_eq!(GlobalTestMetrics::terminal_consult_still_not_found(), 1);
         GlobalTestMetrics::reset();
+    }
+}
+
+/// Source pins for the routing dataset's call-site classification (#4485).
+///
+/// Which ring selections are routing decisions (`DecisionLog::Joinable`), which
+/// are not (`Unlogged`), and which routes bypass ring selection
+/// (`record_bypass`) decide whether a replay can join an outcome to the decision
+/// that produced it. A wrong classification fails nothing at runtime: outcomes
+/// silently join the wrong decision, and `Unlogged` is not a safe default (a
+/// routing decision wrongly left unlogged lets its outcome join an older
+/// capture). The GET sites also have a behavioural test
+/// (`get::op_ctx_task::candidate_log_call_site_tests`).
+///
+/// The pins read code only: comments, string and char literal contents, and
+/// `#[cfg(test)]` modules are removed first, and identifiers are matched by
+/// suffix so an imported short path counts the same as a full one. Every
+/// selection call in a file must be in the table, with its log argument
+/// classified.
+#[cfg(test)]
+mod routing_dataset_call_site_pins {
+    const GET: &str = include_str!("operations/get/op_ctx_task.rs");
+    const PUT: &str = include_str!("operations/put/op_ctx_task.rs");
+    const SUBSCRIBE_DRIVER: &str = include_str!("operations/subscribe/op_ctx_task.rs");
+    const SUBSCRIBE: &str = include_str!("operations/subscribe.rs");
+    const UPDATE: &str = include_str!("operations/update/op_ctx_task.rs");
+
+    const SELECTION: &str = "closest_potentially_hosting(";
+    const JOINABLE: &str = "DecisionLog::Joinable(";
+    const UNLOGGED: &str = "DecisionLog::Unlogged";
+    const BYPASS: &str = "record_bypass(";
+
+    /// Code with comments removed and string / char literal contents emptied,
+    /// newlines kept. Raw strings (with or without a `b`/`c` prefix), escapes
+    /// including `'\''`, non-ASCII char literals, nested block comments and
+    /// lifetimes are handled. Fails CLOSED: an unterminated comment or literal
+    /// panics rather than silently masking the rest of the file.
+    fn mask(src: &str) -> String {
+        let b = src.as_bytes();
+        let ident = |at: usize| at > 0 && (b[at - 1].is_ascii_alphanumeric() || b[at - 1] == b'_');
+        let mut out = String::with_capacity(src.len());
+        let mut i = 0;
+        while i < b.len() {
+            let c = b[i];
+            if c == b'/' && b.get(i + 1) == Some(&b'/') {
+                while i < b.len() && b[i] != b'\n' {
+                    i += 1;
+                }
+            } else if c == b'/' && b.get(i + 1) == Some(&b'*') {
+                let mut depth = 0;
+                loop {
+                    assert!(i < b.len(), "pin lexer: unterminated block comment");
+                    if b[i] == b'/' && b.get(i + 1) == Some(&b'*') {
+                        depth += 1;
+                        i += 2;
+                    } else if b[i] == b'*' && b.get(i + 1) == Some(&b'/') {
+                        depth -= 1;
+                        i += 2;
+                        if depth == 0 {
+                            break;
+                        }
+                    } else {
+                        if b[i] == b'\n' {
+                            out.push('\n');
+                        }
+                        i += 1;
+                    }
+                }
+            } else if !ident(i)
+                && (c == b'r' || ((c == b'b' || c == b'c') && b.get(i + 1) == Some(&b'r')))
+                && {
+                    let r = if c == b'r' { i } else { i + 1 };
+                    let mut j = r + 1;
+                    while b.get(j) == Some(&b'#') {
+                        j += 1;
+                    }
+                    b.get(j) == Some(&b'"')
+                }
+            {
+                let r = if c == b'r' { i } else { i + 1 };
+                let mut j = r + 1;
+                let mut hashes = 0;
+                while b.get(j) == Some(&b'#') {
+                    hashes += 1;
+                    j += 1;
+                }
+                j += 1;
+                loop {
+                    assert!(j < b.len(), "pin lexer: unterminated raw string");
+                    if b[j] == b'"'
+                        && b[j + 1..]
+                            .iter()
+                            .take(hashes)
+                            .filter(|x| **x == b'#')
+                            .count()
+                            == hashes
+                    {
+                        j += 1 + hashes;
+                        break;
+                    }
+                    j += 1;
+                }
+                out.push_str("\"\"");
+                i = j;
+            } else if c == b'"' {
+                let mut j = i + 1;
+                loop {
+                    assert!(j < b.len(), "pin lexer: unterminated string");
+                    if b[j] == b'\\' {
+                        j += 2;
+                    } else if b[j] == b'"' {
+                        break;
+                    } else {
+                        j += 1;
+                    }
+                }
+                out.push_str("\"\"");
+                i = j + 1;
+            } else if c == b'\'' {
+                if b.get(i + 1) == Some(&b'\\') {
+                    // An escape: skip the escaped byte (which may itself be a
+                    // quote), then up to the closing quote (for `\u{..}`).
+                    let mut j = i + 3;
+                    while j < b.len() && b[j] != b'\'' {
+                        j += 1;
+                    }
+                    assert!(j < b.len(), "pin lexer: unterminated char literal");
+                    out.push_str("' '");
+                    i = j + 1;
+                } else {
+                    // One (possibly multi-byte) char then a quote is a char
+                    // literal; anything else is a lifetime.
+                    let width = match b.get(i + 1) {
+                        Some(lead) if *lead >= 0xF0 => 4,
+                        Some(lead) if *lead >= 0xE0 => 3,
+                        Some(lead) if *lead >= 0xC0 => 2,
+                        _ => 1,
+                    };
+                    if b.get(i + 1 + width) == Some(&b'\'') {
+                        out.push_str("' '");
+                        i += 2 + width;
+                    } else {
+                        out.push('\'');
+                        i += 1;
+                    }
+                }
+            } else {
+                // Copy whole UTF-8 characters.
+                let ch = src[i..].chars().next().unwrap();
+                out.push(ch);
+                i += ch.len_utf8();
+            }
+        }
+        out
+    }
+
+    /// The index of the brace closing the one opened at `open`.
+    fn matching_brace(code: &str, open: usize) -> usize {
+        let mut depth = 0;
+        for (i, c) in code[open..].char_indices() {
+            match c {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return open + i;
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("unbalanced braces");
+    }
+
+    /// Masked production code: `#[cfg(test)] mod name;` and
+    /// `#[cfg(test)] mod name { .. }` removed wherever they appear. Other
+    /// `#[cfg(test)]` forms (a test-only `fn`, `#[cfg(any(test, ..))]`, an
+    /// attribute between `#[cfg(test)]` and `mod`) stay counted as production:
+    /// a site there makes a pin fail by over-counting, never pass vacuously.
+    /// Unbalanced braces panic, so a lexer gap fails closed.
+    fn production(src: &str) -> String {
+        let mut code = mask(src);
+        assert_eq!(
+            code.matches('{').count(),
+            code.matches('}').count(),
+            "pin lexer: unbalanced braces after masking"
+        );
+        while let Some(at) = code.find("#[cfg(test)]") {
+            let rest = &code[at..];
+            let item = rest["#[cfg(test)]".len()..].trim_start();
+            let item_at = code.len() - item.len();
+            let end = if item.starts_with("mod ") || item.starts_with("pub(crate) mod ") {
+                let semi = item.find(';');
+                let brace = item.find('{');
+                match (semi, brace) {
+                    (Some(semi), Some(brace)) if semi < brace => item_at + semi + 1,
+                    (Some(semi), None) => item_at + semi + 1,
+                    (_, Some(brace)) => matching_brace(&code, item_at + brace) + 1,
+                    (None, None) => panic!("malformed test module"),
+                }
+            } else {
+                // Some other test-only item: remove just the attribute.
+                at + "#[cfg(test)]".len()
+            };
+            code.replace_range(at..end, "");
+        }
+        code
+    }
+
+    /// Whitespace removed, rustfmt's trailing commas dropped, and a turbofish
+    /// on a selection call removed, so `k_closest_potentially_hosting::<K>(`
+    /// counts like any other call.
+    fn squash(code: &str) -> String {
+        let mut code = code
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect::<String>()
+            .replace(",)", ")");
+        let turbofish = "closest_potentially_hosting::<";
+        while let Some(at) = code.find(turbofish) {
+            let open = at + turbofish.len() - 1;
+            let mut depth = 0;
+            let close = code[open..]
+                .char_indices()
+                .find_map(|(i, c)| {
+                    match c {
+                        '<' => depth += 1,
+                        '>' => depth -= 1,
+                        _ => {}
+                    }
+                    (depth == 0).then_some(open + i)
+                })
+                .expect("pin lexer: unterminated turbofish");
+            code.replace_range(open - 2..=close, "");
+        }
+        code
+    }
+
+    /// The body of the one production function called `name`.
+    fn fn_body(production: &str, name: &str) -> String {
+        let signatures: Vec<usize> = production
+            .match_indices(&format!("fn {name}"))
+            .map(|(at, _)| at)
+            .filter(|&at| {
+                let before_ok = at == 0 || !production.as_bytes()[at - 1].is_ascii_alphanumeric();
+                let next = production[at + 3 + name.len()..].chars().next();
+                before_ok && matches!(next, Some('(') | Some('<'))
+            })
+            .collect();
+        assert_eq!(signatures.len(), 1, "exactly one production `fn {name}`");
+        let open = signatures[0] + production[signatures[0]..].find('{').unwrap();
+        squash(&production[open..=matching_brace(production, open)])
+    }
+
+    /// `Joinable(..)` arguments naming `op`.
+    fn joinable_for(code: &str, op: &str) -> usize {
+        code.match_indices(JOINABLE)
+            .filter(|(at, _)| {
+                let argument = &code[at + JOINABLE.len()..];
+                let argument = &argument[..argument.find(')').unwrap_or(argument.len())];
+                argument.ends_with(&format!("OpType::{op}"))
+            })
+            .count()
+    }
+
+    struct Site {
+        name: &'static str,
+        selections: usize,
+        joinable: usize,
+        unlogged: usize,
+        bypasses: &'static [&'static str],
+    }
+
+    const fn site(
+        name: &'static str,
+        selections: usize,
+        joinable: usize,
+        unlogged: usize,
+        bypasses: &'static [&'static str],
+    ) -> Site {
+        Site {
+            name,
+            selections,
+            joinable,
+            unlogged,
+            bypasses,
+        }
+    }
+
+    fn check(file: &str, src: &str, op: &str, sites: &[Site]) {
+        let production = production(src);
+        for site in sites {
+            let body = fn_body(&production, site.name);
+            let context = format!("{file}::{}", site.name);
+            assert_eq!(
+                body.matches(SELECTION).count(),
+                site.selections,
+                "{context}: selections"
+            );
+            assert_eq!(
+                joinable_for(&body, op),
+                site.joinable,
+                "{context}: Joinable({op})"
+            );
+            assert_eq!(
+                body.matches(JOINABLE).count(),
+                site.joinable,
+                "{context}: Joinable of another op"
+            );
+            assert_eq!(
+                body.matches(UNLOGGED).count(),
+                site.unlogged,
+                "{context}: Unlogged"
+            );
+            assert_eq!(
+                body.matches(BYPASS).count(),
+                site.bypasses.len(),
+                "{context}: bypass lines"
+            );
+            for reason in site.bypasses {
+                assert!(
+                    body.contains(&format!("UncapturedReason::{reason})")),
+                    "{context}: bypass reason {reason}"
+                );
+            }
+        }
+        let whole = squash(&production);
+        let total = |f: fn(&Site) -> usize| sites.iter().map(f).sum::<usize>();
+        assert_eq!(
+            whole.matches(SELECTION).count(),
+            total(|s| s.selections),
+            "{file}: a selection call outside the table"
+        );
+        assert_eq!(
+            whole.matches(JOINABLE).count(),
+            total(|s| s.joinable),
+            "{file}: a Joinable outside the table"
+        );
+        assert_eq!(
+            whole.matches(UNLOGGED).count(),
+            total(|s| s.unlogged),
+            "{file}: an Unlogged outside the table"
+        );
+        assert_eq!(
+            whole.matches(BYPASS).count(),
+            total(|s| s.bypasses.len()),
+            "{file}: a bypass outside the table"
+        );
+        // Every selection call states how it logs, as its first argument.
+        for (at, _) in whole.match_indices(SELECTION) {
+            let argument = &whole[at + SELECTION.len()..];
+            let argument = &argument[..argument.find(',').unwrap_or(argument.len())];
+            assert!(
+                argument.contains(JOINABLE) || argument.ends_with(UNLOGGED) || argument == "log_as",
+                "{file}: selection with unclassified log argument `{argument}`"
+            );
+        }
+    }
+
+    #[test]
+    fn get_sites_are_classified() {
+        check(
+            "get",
+            GET,
+            "Get",
+            &[
+                site("drive_client_get_inner", 1, 0, 1, &[]),
+                site("fallback_target", 1, 0, 1, &[]),
+                site("advance_to_next_peer", 1, 0, 1, &[]),
+                site("drive_sub_op_get", 1, 0, 1, &[]),
+                site("first_hop_candidate", 1, 0, 1, &[]),
+                site(
+                    "relay_advance_to_next_peer",
+                    1,
+                    1,
+                    0,
+                    &["PinnedFirstHop", "BootstrapGateway"],
+                ),
+                site("drive_relay_get_inner", 0, 0, 0, &["TerminalConsult"]),
+            ],
+        );
+    }
+
+    #[test]
+    fn put_sites_are_classified() {
+        check(
+            "put",
+            PUT,
+            "Put",
+            &[
+                site("drive_client_put_inner", 1, 0, 1, &[]),
+                site("advance_to_next_peer", 1, 0, 1, &[]),
+                site("drive_relay_put", 1, 1, 0, &["BootstrapGateway"]),
+                site("drive_relay_put_streaming", 1, 1, 0, &["BootstrapGateway"]),
+                site("drive_relay_probe", 1, 0, 1, &[]),
+                site("drive_relay_probe_reconcile", 1, 0, 1, &[]),
+            ],
+        );
+    }
+
+    #[test]
+    fn subscribe_sites_are_classified() {
+        check(
+            "subscribe driver",
+            SUBSCRIBE_DRIVER,
+            "Subscribe",
+            &[
+                // The pre-check's `Unlogged` is its argument to
+                // `prepare_initial_request`.
+                site("run_executor_subscribe", 0, 0, 1, &[]),
+                site("drive_client_subscribe_inner", 0, 1, 0, &[]),
+                site("advance_to_next_peer", 1, 1, 0, &[]),
+                site("drive_relay_subscribe", 1, 1, 0, &["TerminalConsult"]),
+            ],
+        );
+        check(
+            "subscribe",
+            SUBSCRIBE,
+            "Subscribe",
+            &[site(
+                "prepare_initial_request",
+                1,
+                0,
+                // The three bypass guards compare against `Unlogged`.
+                3,
+                &[
+                    "DirectedFirstHop",
+                    "AnyConnectionFallback",
+                    "BootstrapGateway",
+                ],
+            )],
+        );
+        let body = fn_body(&production(SUBSCRIBE), "prepare_initial_request");
+        assert!(body.contains(&format!("{SELECTION}log_as,")));
+        assert_eq!(
+            body.matches(&format!(
+                "iflog_as!=crate::router::dataset::{UNLOGGED}{{crate::router::dataset::{BYPASS}"
+            ))
+            .count(),
+            3,
+            "every bypass is skipped for a pre-check"
+        );
+    }
+
+    #[test]
+    fn update_sites_are_never_logged() {
+        check(
+            "update",
+            UPDATE,
+            "Update",
+            &[
+                site("drive_client_update", 1, 0, 1, &[]),
+                site("drive_relay_request_update", 2, 0, 2, &[]),
+            ],
+        );
+    }
+
+    /// The masking the pins rely on: comments, literals and test modules do
+    /// not count, and production code after a `mod tests;` does.
+    #[test]
+    fn the_pins_read_code_only() {
+        let src = r#"
+fn a() {
+    // x.closest_potentially_hosting(DecisionLog::Unlogged, k)
+    /* x.closest_potentially_hosting(DecisionLog::Unlogged, k) /* nested */ */
+    let s = "closest_potentially_hosting(";
+    let c = '{';
+    y.closest_potentially_hosting(DecisionLog::Joinable(OpType::Get), k); // record_bypass(
+}
+#[cfg(test)]
+mod tests;
+#[cfg(test)]
+mod more {
+    fn b() { z.closest_potentially_hosting(DecisionLog::Unlogged, k); }
+}
+fn c<'a>(x: &'a str) { record_bypass(o, l, p, UncapturedReason::TerminalConsult); }
+"#;
+        let code = squash(&production(src));
+        assert_eq!(code.matches(SELECTION).count(), 1);
+        assert_eq!(code.matches(UNLOGGED).count(), 0);
+        assert_eq!(joinable_for(&code, "Get"), 1);
+        assert_eq!(
+            code.matches(BYPASS).count(),
+            1,
+            "code after `mod tests;` is production"
+        );
+        assert_eq!(fn_body(&production(src), "c").matches(BYPASS).count(), 1);
+    }
+
+    /// Literals that once mis-lexed, each followed by a brace and a site that
+    /// must still count; and a turbofish call.
+    #[test]
+    fn the_pin_lexer_handles_awkward_literals_and_turbofish() {
+        let src = r##"
+fn a() {
+    let q = ['\'','{'];
+    let arrow = ['→','{'];
+    let esc = '\u{7d}';
+    let raw = br"\";
+    let craw = cr#"\"#;
+    let brace = "}";
+    x.k_closest_potentially_hosting::<ContractInstanceId>(DecisionLog::Unlogged, k, s, 1);
+}
+"##;
+        let code = production(src);
+        assert_eq!(fn_body(&code, "a").matches(SELECTION).count(), 1);
+        assert_eq!(squash(&code).matches(UNLOGGED).count(), 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "pin lexer: unterminated string")]
+    fn the_pin_lexer_fails_closed_on_an_unterminated_string() {
+        let _ = mask("fn a() { let s = \"never closed; }");
+    }
+
+    #[test]
+    #[should_panic(expected = "pin lexer: unterminated raw string")]
+    fn the_pin_lexer_fails_closed_on_an_unterminated_raw_string() {
+        let _ = mask("fn a() { let s = br#\"never closed; }");
+    }
+
+    #[test]
+    #[should_panic(expected = "pin lexer: unterminated block comment")]
+    fn the_pin_lexer_fails_closed_on_an_unterminated_block_comment() {
+        let _ = mask("fn a() { /* never closed /* nested */ }");
+    }
+
+    #[test]
+    #[should_panic(expected = "pin lexer: unterminated char literal")]
+    fn the_pin_lexer_fails_closed_on_an_unterminated_char_literal() {
+        let _ = mask("fn a() { let c = '\\n; }");
+    }
+
+    #[test]
+    #[should_panic(expected = "pin lexer: unbalanced braces")]
+    fn the_pin_lexer_fails_closed_on_unbalanced_braces() {
+        let _ = production("fn a() { if x { }");
     }
 }

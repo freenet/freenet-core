@@ -1,5 +1,25 @@
 use super::*;
 
+/// What [`Executor::commit_state_update`] actually did.
+///
+/// It used to return `Result<(), _>`, which made "stored the state and ran the
+/// full fan-out" and "suppressed the whole thing because the contract is
+/// flagged as violating a CRDT invariant" indistinguishable at every call
+/// site. A caller that reads a bare `Ok` as "committed" then acts on a state
+/// that was never written — and the initial-install branch's replay loop did
+/// exactly that, concluding a replay had fanned out and skipping its own
+/// fan-out, so the state it HAD stored reached nobody. That is #5481 again,
+/// relocated to the install-plus-flagged-contract corner. The outcome is
+/// explicit so the compiler makes the next caller choose.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::contract::executor) enum StateCommitOutcome {
+    /// The state was stored and `finalize_state_commit` ran.
+    Committed,
+    /// Nothing was stored and nothing was fanned out: the contract is flagged
+    /// in `ring::broken_invariants` (#4279).
+    SuppressedBrokenContract,
+}
+
 // ============================================================================
 // Single Executor Implementation
 // ============================================================================
@@ -15,6 +35,23 @@ where
     S: crate::wasm_runtime::StateStorage + Send + Sync + 'static,
     <S as crate::wasm_runtime::StateStorage>::Error: Into<anyhow::Error>,
 {
+    /// This node's contract-exec WASM counters, or `None` for an executor with
+    /// no `OpManager` (unit-test and local-only executors have no `Ring` to
+    /// attribute the work to, and nothing reads the counters there).
+    ///
+    /// Returns a borrow rather than an `Arc` clone so a counter bump on the
+    /// contract-handling loop costs one `Relaxed` `fetch_add` and nothing else —
+    /// see `ring::contract_exec_metrics` for the cost note and for why an
+    /// undifferentiated handler-entry span could not answer the storm question.
+    #[inline]
+    pub(super) fn contract_exec_metrics(
+        &self,
+    ) -> Option<&crate::ring::contract_exec_metrics::ContractExecMetrics> {
+        self.op_manager
+            .as_ref()
+            .map(|om| om.ring.contract_exec_metrics())
+    }
+
     /// Grow the summary/delta caches' COUNT target to cover the node's live
     /// hosted-contract count before a summarize/delta computation, so the
     /// interest-heartbeat's hosted working set stays cached across cycles (no
@@ -42,13 +79,18 @@ where
         let hosted = om.ring.hosting_contracts_count();
         let needed = crate::contract::executor::summary_cache_count_target(hosted);
         // needed >= SUMMARY_CACHE_COUNT_MIN > 0 by construction (summary_cache_count_target clamps); unwrap_or is just panic-proofing.
-        if needed > self.summary_cache.cap().get() {
-            self.summary_cache
-                .grow(NonZeroUsize::new(needed).unwrap_or(NonZeroUsize::MIN));
+        // Each lock is held for one compare-and-grow only (see
+        // `SharedSummaryCache`'s locking rule).
+        use crate::contract::executor::lock_fast_path_cache;
+        {
+            let mut summary_cache = lock_fast_path_cache(&self.summary_cache);
+            if needed > summary_cache.cap().get() {
+                summary_cache.grow(NonZeroUsize::new(needed).unwrap_or(NonZeroUsize::MIN));
+            }
         }
-        if needed > self.delta_cache.cap().get() {
-            self.delta_cache
-                .grow(NonZeroUsize::new(needed).unwrap_or(NonZeroUsize::MIN));
+        let mut delta_cache = lock_fast_path_cache(&self.delta_cache);
+        if needed > delta_cache.cap().get() {
+            delta_cache.grow(NonZeroUsize::new(needed).unwrap_or(NonZeroUsize::MIN));
         }
     }
 
@@ -58,6 +100,73 @@ where
     ) -> Option<ContractKey> {
         let code_hash = self.runtime.code_hash_from_id(instance_id)?;
         Some(ContractKey::from_id_and_code(*instance_id, code_hash))
+    }
+
+    /// The stored parameters for `key`, but only if they are the parameters its
+    /// instance id was derived from.
+    ///
+    /// The params row is keyed by instance id alone, and every operation that
+    /// arrives without code runs the contract with what it finds there. A row
+    /// whose parameters do not derive the instance id, under the code hash the
+    /// instance->code index holds for it, is treated as absent rather than
+    /// used. The next verified container for the instance rewrites it.
+    ///
+    /// With no index row there is no code hash to check against and nothing to
+    /// protect: every path that runs or serves a contract resolves its code
+    /// through that index, so such a contract cannot be run either way. The
+    /// params are returned unchecked, which keeps that case's existing errors.
+    /// That relies on one contract's operations being serialized node-wide (the
+    /// contract-handling loop runs them one at a time), so the instance cannot
+    /// gain an index row part-way through an operation that read its parameters
+    /// here, such as the initial-state install that writes them back.
+    pub(in crate::contract::executor) async fn verified_stored_params(
+        &self,
+        key: &ContractKey,
+    ) -> Result<Option<Parameters<'static>>, ExecutorError> {
+        let Some(params) = self
+            .state_store
+            .get_params(key)
+            .await
+            .map_err(ExecutorError::other)?
+        else {
+            return Ok(None);
+        };
+        let Some(code_hash) = self.runtime.code_hash_from_id(key.id()) else {
+            return Ok(Some(params));
+        };
+        let encoded_code_hash =
+            ContractKey::from_id_and_code(*key.id(), code_hash).encoded_code_hash();
+        match ContractKey::from_params(encoded_code_hash.clone(), params.clone()) {
+            Ok(derived) if derived.id() == key.id() => Ok(Some(params)),
+            _ => {
+                // WARN, not debug: a row that fails this check means the node was
+                // holding parameters it cannot vouch for, which an operator should
+                // be able to see in a release build. Once per contract per process,
+                // because the refusal repeats on every read (summaries run on each
+                // interest heartbeat). Bounded; past the bound it keeps warning
+                // rather than going quiet.
+                const REPORTED_CAP: usize = 4096;
+                static REPORTED: std::sync::LazyLock<dashmap::DashSet<ContractInstanceId>> =
+                    std::sync::LazyLock::new(dashmap::DashSet::new);
+                let first_report = REPORTED.len() >= REPORTED_CAP || REPORTED.insert(*key.id());
+                if first_report {
+                    tracing::warn!(
+                        contract = %key,
+                        code_hash = %encoded_code_hash,
+                        params_len = params.as_ref().len(),
+                        "Stored parameters for this contract do not derive its instance id, \
+                         so this node will not run or serve it. Re-PUT the contract (for \
+                         example `fdev publish` of the same contract) to repair them"
+                    );
+                } else {
+                    tracing::debug!(
+                        contract = %key,
+                        "Stored contract parameters still do not derive the instance id"
+                    );
+                }
+                Ok(None)
+            }
+        }
     }
 
     pub(in crate::contract::executor) async fn bridged_fetch_contract(
@@ -133,7 +242,55 @@ where
             }
             container_key
         } else {
-            key
+            // #4978: with no container in hand the caller's code hash is all we
+            // have, and UPDATE is the one verb whose wire type carries a full
+            // `ContractKey` — so a client that can only supply an instance id
+            // hands us a code hash that names no blob, and the
+            // `code_blob_stored(key.code_hash())` gate below rejects the UPDATE
+            // with `MissingContract` even though this node holds the contract.
+            // GET and SUBSCRIBE never hit this because they carry only an
+            // instance id and are resolved by `lookup_key`.
+            //
+            // Concretely that is `fdev update`, which fills in an all-zero
+            // `CodeHash` placeholder, and any other client that sends a
+            // well-formed but wrong 32-byte hash. It is NOT yet the TypeScript
+            // SDK's `fromInstanceId()`: that emits a present-but-EMPTY code
+            // vector, which stdlib 0.8.5's `ContractKey::try_decode_fbs`
+            // refuses at the wire boundary, so it never reaches this function.
+            // Relaxing that decode to `Option<CodeHash>` is the stdlib half,
+            // deliberately sequenced after this one — this is the core-side
+            // resolution that makes a `None` answerable.
+            //
+            // Resolve the same way the rest of the store already does
+            // (`ContractStore::fetch_contract`, `prepare_contract_call_inner`):
+            // the instance id is derived from the code hash and the parameters,
+            // so the store's instance->code row is the authoritative answer and
+            // a correct caller-supplied hash resolves to itself. This is also
+            // what keeps a placeholder hash out of the DURABLE hosting-metadata
+            // row, which `storages/redb.rs` and `storages/sqlite.rs` write from
+            // `key.code_hash()` and read back to rebuild the key on restart.
+            //
+            // When this node has no row for the instance (it does not hold the
+            // contract) the caller's key is kept unchanged, so the existing
+            // `MissingContract` / auto-fetch behaviour is untouched.
+            match self.bridged_lookup_key(key.id()) {
+                Some(resolved) => resolved,
+                None => {
+                    // Worth a line: after this change an unresolvable instance
+                    // is the ONLY way to reach the `MissingContract` below with
+                    // a caller-supplied hash, and `ContractKey`'s `Display` is
+                    // instance-only, so nothing else in the log distinguishes
+                    // "no index row for this instance" from "this hash names no
+                    // blob".
+                    tracing::debug!(
+                        contract = %key,
+                        caller_code_hash = ?key.code_hash(),
+                        "update: no instance->code row for this contract; keeping \
+                         the caller's code hash (this node does not hold it)"
+                    );
+                    key
+                }
+            }
         };
 
         // Opportunistically clean up any stale initializations to prevent resource leaks
@@ -202,37 +359,22 @@ where
                 "Upserting contract state"
             );
         }
+        // A container's params are persisted further down, once `store_contract`
+        // has verified the container; see the `ensure_params` call there.
         let params = if let Some(code) = &code {
-            let p = code.params();
-            // Ensure params are persisted to state_store so they survive restarts.
-            // The code path (PUT via GET) always provides params in the container,
-            // but state_store.store() is only called for new contracts. If the contract
-            // already exists (merge path), commit_state_update() calls state_store.update()
-            // which doesn't write params. Persisting here covers all cases.
-            if let Err(e) = self.state_store.ensure_params(key, p.clone()).await {
+            code.params()
+        } else {
+            self.verified_stored_params(&key).await?.ok_or_else(|| {
                 tracing::warn!(
                     contract = %key,
-                    error = %e,
-                    "Failed to persist contract parameters to state_store"
+                    is_delta = matches!(update, Either::Right(_)),
+                    "Contract parameters not found in state_store"
                 );
-            }
-            p
-        } else {
-            self.state_store
-                .get_params(&key)
-                .await
-                .map_err(ExecutorError::other)?
-                .ok_or_else(|| {
-                    tracing::warn!(
-                        contract = %key,
-                        is_delta = matches!(update, Either::Right(_)),
-                        "Contract parameters not found in state_store"
-                    );
-                    ExecutorError::request(StdContractError::Put {
-                        key,
-                        cause: "missing contract parameters".into(),
-                    })
-                })?
+                ExecutorError::request(StdContractError::Put {
+                    key,
+                    cause: "missing contract parameters".into(),
+                })
+            })?
         };
 
         // Track if we stored a new contract. `charged_wasm` carries the blob
@@ -310,22 +452,63 @@ where
                         key: key.into(),
                     }));
                 }
-            } else {
-                // Contract already in store. ensure_key_indexed handles the case of contracts
-                // that reuse the same WASM code with different parameters (e.g., different
-                // River rooms). Without this, lookup_key() fails for the new instance_id.
-                // See issue #2380.
+            } else if let Some(ref contract_code) = code {
+                // Contract code already on disk, but this may be a NEW instance of
+                // it: instances that reuse the same WASM with different parameters
+                // (e.g. different River rooms) each need their own
+                // instance→code row, or `lookup_key()` fails for the new
+                // instance id. See issue #2380.
                 //
-                // We only index when code was provided in this request (code.is_some()).
-                // When code is None, this is a state-only update to an existing contract
-                // that should already be indexed.
-                if code.is_some() {
-                    self.runtime
-                        .ensure_key_indexed(&key)
-                        .map_err(ExecutorError::other)?;
-                }
-                (false, code.is_some(), None)
+                // This goes through `store_contract`, NOT through a bare
+                // index-write helper, and that is the point. `store_contract` is
+                // the store's ONE guarded ingress: it verifies that the key is
+                // derived from the code and parameters in hand (see
+                // `ContractStore::verify_contract_identity`) before it writes
+                // anything, and its own fast paths then do exactly the
+                // "just index this instance" work this branch needs — the blob is
+                // already on disk, so no blob is rewritten and no byte is
+                // re-charged against the disk budget.
+                //
+                // It used to call `ContractStore::ensure_key_indexed` directly,
+                // which wrote the durable instance→code row with no derivation
+                // check at all. That made this — the COMMON path, since any
+                // contract reusing an already-stored binary lands here — an
+                // unverified second ingress to the same index that
+                // `store_contract` guards. Two writers of one durable row, one
+                // guarded and one not, is the structure to avoid; do NOT
+                // reintroduce a direct index write here.
+                //
+                // Only reached when code was provided in this request. With no
+                // code this is a state-only update to a contract that is already
+                // indexed, and there is nothing to verify against.
+                self.runtime
+                    .store_contract(contract_code.clone())
+                    .map_err(ExecutorError::other)?;
+                (false, true, None)
+            } else {
+                (false, false, None)
             };
+
+        // Persist the container's params so they survive restarts. The code path
+        // (PUT via GET) always provides params in the container, but
+        // state_store.store() is only called for new contracts; if the contract
+        // already exists (merge path), commit_state_update() calls
+        // state_store.update(), which doesn't write params.
+        //
+        // This must follow verification. Every branch above that had a container
+        // passed it through `store_contract`, which returns an error (propagated
+        // by `?`) unless the key is derived from the container's code and params,
+        // and the params row is keyed by instance id alone. So only params that
+        // verification has bound to this instance id may be written to it.
+        if code.is_some() {
+            if let Err(e) = self.state_store.ensure_params(key, params.clone()).await {
+                tracing::warn!(
+                    contract = %key,
+                    error = %e,
+                    "Failed to persist contract parameters to state_store"
+                );
+            }
+        }
 
         let is_new_contract = self.state_store.get(&key).await.is_err();
 
@@ -375,6 +558,10 @@ where
                 // happen at the node level before any WASM execution.
                 let incoming_size = incoming_state.as_ref().len();
                 if incoming_size > MAX_STATE_SIZE {
+                    crate::contract::record_state_size_rejection(
+                        crate::contract::StateSizeRejectionStage::PreWasmFullState,
+                        incoming_size,
+                    );
                     tracing::warn!(
                         contract = %key,
                         size_bytes = incoming_size,
@@ -509,6 +696,26 @@ where
                             }
 
                             let completion_now = now_nanos();
+                            // The state this node ends up holding. Starts as
+                            // the incoming state and advances as queued
+                            // operations replay onto it below, so the fan-out
+                            // at the end of this branch reports what was
+                            // actually installed. Before this was hoisted, the
+                            // branch fanned out the PRE-replay state AFTER each
+                            // replay had already fanned out a newer one, so the
+                            // last thing a subscriber saw was the oldest state
+                            // (harmless for peers, which CRDT-merge, but not
+                            // for a delegate handed a full state).
+                            let mut installed_state = incoming_state.clone();
+                            // Set when a queued-operation replay commits. Each
+                            // replay goes through `commit_state_update`, which
+                            // runs the full fan-out itself, so the finalize at
+                            // the end of this branch would emit `installed_state`
+                            // a SECOND time — re-running every subscribed
+                            // delegate on a state that did not change, and
+                            // duplicating the WS and network notifications
+                            // (found by the external review pass).
+                            let mut replay_committed = false;
                             if let Some(completion_info) = self
                                 .init_tracker
                                 .complete_initialization(&key, completion_now)
@@ -535,7 +742,6 @@ where
                                 // These were UPDATE operations that couldn't proceed while the
                                 // contract was being initialized. Now that initialization is
                                 // complete, we apply them in order to the stored state.
-                                let mut current = incoming_state.clone();
                                 for op in completion_info.queued_ops {
                                     let queue_time = ContractInitTracker::queue_wait_duration(
                                         &op,
@@ -561,7 +767,7 @@ where
                                     match self
                                         .attempt_state_update(
                                             &params,
-                                            &current,
+                                            &installed_state,
                                             &key,
                                             &replay_updates,
                                         )
@@ -580,18 +786,41 @@ where
                                                 .map(|r| r == ValidateResult::Valid)
                                                 .unwrap_or(false);
 
-                                            if valid && new_state.as_ref() != current.as_ref() {
-                                                if let Err(e) = self
+                                            if valid
+                                                && new_state.as_ref() != installed_state.as_ref()
+                                            {
+                                                match self
                                                     .commit_state_update(&key, &params, &new_state)
                                                     .await
                                                 {
-                                                    tracing::warn!(
-                                                        contract = %key,
-                                                        error = %e,
-                                                        "Failed to commit replayed queued operation"
-                                                    );
-                                                } else {
-                                                    current = new_state;
+                                                    Ok(StateCommitOutcome::Committed) => {
+                                                        installed_state = new_state;
+                                                        replay_committed = true;
+                                                    }
+                                                    Ok(
+                                                        StateCommitOutcome::SuppressedBrokenContract,
+                                                    ) => {
+                                                        // Nothing stored, nothing fanned out. The
+                                                        // state must NOT advance and the trailing
+                                                        // fan-out must NOT be skipped — treating
+                                                        // this as a commit would leave the state
+                                                        // this branch DID store reaching nobody,
+                                                        // which is #5481 again at the
+                                                        // install-plus-flagged-contract corner.
+                                                        tracing::debug!(
+                                                            contract = %key,
+                                                            "Replayed operation suppressed \
+                                                             (contract flagged broken); \
+                                                             install fan-out still owed"
+                                                        );
+                                                    }
+                                                    Err(e) => {
+                                                        tracing::warn!(
+                                                            contract = %key,
+                                                            error = %e,
+                                                            "Failed to commit replayed queued operation"
+                                                        );
+                                                    }
                                                 }
                                             } else if !valid {
                                                 tracing::warn!(
@@ -617,45 +846,48 @@ where
                                 }
                             }
 
-                            self.broadcast_state_change(key, incoming_state.clone())
-                                .await;
-
-                            // Notify locally-subscribed WS clients of the
-                            // new state. Without this, the very first state
-                            // install for a contract on this node never
-                            // reaches `register_contract_notifier` consumers
-                            // — only the merge path at the end of this
-                            // function calls `commit_state_update`, which
-                            // is the only other site that fans out to the
-                            // local notifier map. ResyncResponse-driven
-                            // applies hit this branch when the state_store
-                            // entry is missing, so subscribers would miss
-                            // every cross-node delivery that recovers via
-                            // resync.
                             tracing::info!(
                                 contract = %key,
-                                new_size_bytes = incoming_state.as_ref().len(),
+                                new_size_bytes = installed_state.as_ref().len(),
                                 phase = "update_complete",
                                 event = "initial_state_installed",
                                 "Contract initial state installed"
                             );
-                            // Dashboard "last updated" telemetry; no-op if
-                            // we're not subscribed to this contract.
-                            if let Some(op_manager) = &self.op_manager {
-                                op_manager.ring.record_contract_update(&key);
-                            }
-                            if let Err(err) = self
-                                .send_update_notification(&key, &params, &incoming_state)
-                                .await
-                            {
-                                tracing::error!(
+                            // The very first state install for a contract on
+                            // this node owes the SAME post-store fan-out the
+                            // merge path performs, and this branch is the one
+                            // a ResyncResponse-driven apply takes whenever the
+                            // `state_store` entry is missing — so a consumer
+                            // dropped here misses every cross-node delivery
+                            // that recovers via resync. Hand-inlining a subset
+                            // is how #5481 happened (delegates were the
+                            // dropped leg, after WS clients had already been
+                            // the dropped leg once before). Call the helper;
+                            // do not re-inline.
+                            if replay_committed {
+                                // The last successful replay already ran the
+                                // full fan-out with exactly this state via
+                                // `commit_state_update`. Emitting it again
+                                // would run every subscribed delegate twice on
+                                // an unchanged state.
+                                tracing::debug!(
                                     contract = %key,
-                                    error = %err,
-                                    phase = "notification_failed",
-                                    "Failed to send initial-state notification"
+                                    event = "install_fan_out_skipped_after_replay",
+                                    "Queued-operation replay already fanned out the \
+                                     installed state; not emitting it twice"
                                 );
+                            } else {
+                                self.finalize_state_commit(&key, &params, &installed_state)
+                                    .await;
                             }
 
+                            // NOTE: the RETURN value stays `incoming_state`
+                            // rather than `installed_state` — that is
+                            // pre-existing behaviour with its own callers
+                            // (PUT-response summary), and changing it is a
+                            // separate, client-visible decision. The fan-out
+                            // above is what subscribers observe, and that is
+                            // now the state this node actually holds.
                             return Ok(UpsertResult::Updated(incoming_state));
                         }
                     }
@@ -1098,7 +1330,11 @@ where
                 return Ok(UpsertResult::NoChange);
             }
 
-            self.commit_state_update(&key, &params, &updated_state)
+            // Outcome discarded deliberately: a broken-contract suppression
+            // here is already reported to the caller as the `NoChange` above,
+            // and this path has no trailing fan-out to gate on it.
+            let _ = self
+                .commit_state_update(&key, &params, &updated_state)
                 .await?;
             Ok(UpsertResult::Updated(updated_state))
         }
@@ -1131,6 +1367,14 @@ where
                 );
                 // Safety: `already_registered` was derived from `self.update_notifications.get(&instance_id)`
                 // succeeding, so the entry is guaranteed to exist.
+                //
+                // This keeps the read-index / re-acquire / write shape that the
+                // `RuntimePool` twin deliberately collapsed (#5040). It is
+                // exempt, not overlooked: this map is a plain `HashMap` behind
+                // `&mut self` with no `.await` between the two lookups, so no
+                // other code can run in the window and the entry cannot vanish.
+                // The pool twin works through `Arc<DashMap>`, where that
+                // guarantee does not hold. Do NOT copy this shape there.
                 if let Some(channels) = self.update_notifications.get_mut(&instance_id) {
                     channels[idx] = (cli_id, notification_ch);
                 }
@@ -1148,8 +1392,11 @@ where
                     limit = super::MAX_SUBSCRIBERS_PER_CONTRACT,
                     "Subscriber limit reached for contract, rejecting registration"
                 );
+                let key = self
+                    .bridged_lookup_key(&instance_id)
+                    .unwrap_or_else(|| synthetic_key(instance_id));
                 return Err(subscriber_limit_error(
-                    instance_id,
+                    key,
                     &format!(
                         "subscriber limit ({}) reached for contract",
                         super::MAX_SUBSCRIBERS_PER_CONTRACT
@@ -1171,8 +1418,11 @@ where
                     current = client_sub_count,
                     "Per-client subscription limit reached, rejecting registration"
                 );
+                let key = self
+                    .bridged_lookup_key(&instance_id)
+                    .unwrap_or_else(|| synthetic_key(instance_id));
                 return Err(subscriber_limit_error(
-                    instance_id,
+                    key,
                     &format!(
                         "per-client subscription limit ({}) reached",
                         super::MAX_SUBSCRIPTIONS_PER_CLIENT
@@ -1230,10 +1480,22 @@ where
         // secret export) MUST stay read-only w.r.t. contract state, or it could
         // populate the detector against a state a concurrent write has changed.
         if let Some(detector_hash) = self.state_store.cached_state_hash(&key) {
-            if let Some((cached_hash, cached_summary)) = self.summary_cache.get(&key) {
-                if *cached_hash == detector_hash {
-                    return Ok(cached_summary.clone());
+            // Resolve the hit to an owned value inside one statement, so the
+            // shared-cache lock (a temporary guard) is released before anything
+            // else runs — never held across WASM or an `.await`.
+            let hit = crate::contract::executor::lock_fast_path_cache(&self.summary_cache)
+                .get(&key)
+                .and_then(|(hash, summary)| (*hash == detector_hash).then(|| summary.clone()));
+            if let Some(cached_summary) = hit {
+                // Field-visible cache-HIT count. Without this, the only
+                // production signal for this function was a handler-entry span
+                // that fires identically here and on the WASM path below, so
+                // every storm rate ever quoted conflated the two. See
+                // `ring::contract_exec_metrics`.
+                if let Some(m) = self.contract_exec_metrics() {
+                    m.record_summarize_fast_hit();
                 }
+                return Ok(cached_summary);
             }
         }
 
@@ -1257,25 +1519,27 @@ where
         self.state_store.cache_state_hash(key, state_hash);
 
         // The summary may already be cached under this exact hash even when the
-        // detector was cold (the summary cache is per-executor; the detector is
-        // shared). Reuse it to skip the WASM call.
-        if let Some((cached_hash, cached_summary)) = self.summary_cache.get(&key) {
-            if *cached_hash == state_hash {
-                return Ok(cached_summary.clone());
+        // detector was cold (the detector is a bounded moka cache that can evict
+        // independently, and is reset on restart). Reuse it to skip the WASM call.
+        let reload_hit = crate::contract::executor::lock_fast_path_cache(&self.summary_cache)
+            .get(&key)
+            .and_then(|(hash, summary)| (*hash == state_hash).then(|| summary.clone()));
+        if let Some(cached_summary) = reload_hit {
+            // Reached the slow path (loaded + hashed the state) but still elided
+            // the WASM call. Counted separately from the fast hit so a cold
+            // detector is distinguishable from a cold cache.
+            if let Some(m) = self.contract_exec_metrics() {
+                m.record_summarize_reload_hit();
             }
+            return Ok(cached_summary);
         }
 
-        let params = self
-            .state_store
-            .get_params(&key)
-            .await
-            .map_err(ExecutorError::other)?
-            .ok_or_else(|| {
-                ExecutorError::request(StdContractError::Get {
-                    key,
-                    cause: "contract parameters not found".into(),
-                })
-            })?;
+        let params = self.verified_stored_params(&key).await?.ok_or_else(|| {
+            ExecutorError::request(StdContractError::Get {
+                key,
+                cause: "contract parameters not found".into(),
+            })
+        })?;
 
         // Summarize-storm falsifier (spec step 8 / #4440): count the actual WASM
         // `summarize_state` invocation — the SLOW-path miss the state-hash cache
@@ -1284,11 +1548,26 @@ where
         // work whose per-heartbeat × per-neighbor multiplication was the storm.
         // Under the working cache it scales with the STATE-CHANGE rate, not with
         // hosted-set size or neighbor overlap — every-hop placement's "summarize
-        // load stays flat vs hosted-set size" invariant. No-op outside a sim (the
-        // record fn reads the sim-only network-name thread-local). This runs on
-        // the contract-handling loop thread, not a spawn_blocking closure, so the
-        // thread-local is set.
+        // load stays flat vs hosted-set size" invariant.
+        //
+        // TWO sinks, deliberately, because they answer to different readers and
+        // neither can serve the other:
+        //   * `ring.contract_exec_metrics()` is the PRODUCTION counter, read on
+        //     the `router_snapshot` cadence. Always live.
+        //   * `topology_registry` is the SIMULATION counter, keyed by peer
+        //     address so `SimNetwork` can aggregate across nodes; it is a no-op
+        //     outside a sim (the record fn reads the sim-only network-name
+        //     thread-local) and its `get_own_addr()` lookup is deliberately kept
+        //     off the hot path by living here on the WASM slow path. This runs on
+        //     the contract-handling loop thread, not a `spawn_blocking` closure,
+        //     so the thread-local is set.
+        // `summarize_wasm_call_records_both_sinks` pins that they cannot drift
+        // apart.
         if let Some(op_manager) = &self.op_manager {
+            op_manager
+                .ring
+                .contract_exec_metrics()
+                .record_summarize_wasm_call();
             if let Some(own_addr) = op_manager.ring.connection_manager.get_own_addr() {
                 crate::ring::topology_registry::record_summarize_wasm_call(own_addr);
             }
@@ -1299,7 +1578,8 @@ where
             .summarize_state(&key, &params, &state)
             .map_err(|e| ExecutorError::execution(e, None))?;
 
-        self.summary_cache.put(key, (state_hash, summary.clone()));
+        crate::contract::executor::lock_fast_path_cache(&self.summary_cache)
+            .put(key, (state_hash, summary.clone()));
         Ok(summary)
     }
 
@@ -1339,8 +1619,19 @@ where
         // contract state.
         if let Some(detector_hash) = self.state_store.cached_state_hash(&key) {
             let cache_key = (key, detector_hash, summary_hash);
-            if let Some(cached_delta) = self.delta_cache.get(&cache_key) {
-                return Ok(cached_delta.clone());
+            // Owned within one statement so the shared-cache lock is released
+            // immediately (see the summarize twin above).
+            let hit = crate::contract::executor::lock_fast_path_cache(&self.delta_cache)
+                .get(&cache_key)
+                .cloned();
+            if let Some(cached_delta) = hit {
+                // Field-visible cache-HIT count; see the summarize twin above
+                // and `ring::contract_exec_metrics`. This arm runs per-SUBSCRIBER
+                // during broadcast fan-out, so it is the hotter of the two.
+                if let Some(m) = self.contract_exec_metrics() {
+                    m.record_delta_fast_hit();
+                }
+                return Ok(cached_delta);
             }
         }
 
@@ -1363,28 +1654,39 @@ where
         self.state_store.cache_state_hash(key, state_hash);
 
         let cache_key = (key, state_hash, summary_hash);
-        if let Some(cached_delta) = self.delta_cache.get(&cache_key) {
-            return Ok(cached_delta.clone());
+        let reload_hit = crate::contract::executor::lock_fast_path_cache(&self.delta_cache)
+            .get(&cache_key)
+            .cloned();
+        if let Some(cached_delta) = reload_hit {
+            // Slow path reached (state loaded + hashed) but the WASM call was
+            // still elided; see the summarize twin above.
+            if let Some(m) = self.contract_exec_metrics() {
+                m.record_delta_reload_hit();
+            }
+            return Ok(cached_delta);
         }
 
-        let params = self
-            .state_store
-            .get_params(&key)
-            .await
-            .map_err(ExecutorError::other)?
-            .ok_or_else(|| {
-                ExecutorError::request(StdContractError::Get {
-                    key,
-                    cause: "contract parameters not found".into(),
-                })
-            })?;
+        let params = self.verified_stored_params(&key).await?.ok_or_else(|| {
+            ExecutorError::request(StdContractError::Get {
+                key,
+                cause: "contract parameters not found".into(),
+            })
+        })?;
+
+        // The delta twin of the summarize slow-path counter: a true cache miss
+        // that actually runs the contract's WASM `get_state_delta`. Recorded at
+        // the decision, immediately before the call it describes.
+        if let Some(m) = self.contract_exec_metrics() {
+            m.record_delta_wasm_call();
+        }
 
         let delta = self
             .runtime
             .get_state_delta(&key, &params, &state, &their_summary)
             .map_err(|e| ExecutorError::execution(e, None))?;
 
-        self.delta_cache.put(cache_key, delta.clone());
+        crate::contract::executor::lock_fast_path_cache(&self.delta_cache)
+            .put(cache_key, delta.clone());
         Ok(delta)
     }
 
@@ -1437,15 +1739,10 @@ where
         &self,
         key: &ContractKey,
     ) -> Result<Option<ContractContainer>, ExecutorError> {
-        let Some(parameters) = self
-            .state_store
-            .get_params(key)
-            .await
-            .map_err(ExecutorError::other)?
-        else {
+        let Some(parameters) = self.verified_stored_params(key).await? else {
             tracing::debug!(
                 contract = %key,
-                "Contract parameters not in state_store, cannot fetch contract"
+                "No usable contract parameters in state_store, cannot fetch contract"
             );
             return Ok(None);
         };
@@ -1516,6 +1813,107 @@ where
             }
         };
         let new_state = WrappedState::new(new_state.into_bytes());
+
+        // Conformance capture (RFC #5320), off unless an operator sets
+        // FREENET_CONFORMANCE_CAPTURE_DIR. This is the seam where the base state,
+        // the update that was applied and the resulting state are all in hand,
+        // which is exactly the transition an offline replay needs.
+        //
+        // Cost when disabled is one atomic load. When enabled it is a `try_send` on
+        // a bounded channel that drops rather than waits, so a slow writer can never
+        // stall a merge — capture losing observations is always preferable to
+        // synchronization queueing behind it.
+        if let Some(capture) = crate::conformance::capture::global() {
+            // Measure first, copy later.
+            //
+            // Everything below this point that costs an allocation happens inside the
+            // `observe_with` closure, which runs only after a queue slot and byte
+            // budget are secured. An earlier version computed the incoming state,
+            // delta and related payloads BEFORE the budget check and then claimed in
+            // a comment that no byte was copied before it — which was false for
+            // exactly the three largest fields, and worst for related state, since
+            // that carries another contract's whole state. Under sustained load with
+            // a full queue, that made the drop path pay full allocate-and-copy on the
+            // merge path, which is the cost this ordering exists to avoid.
+            let mut incoming_len = 0usize;
+            let mut delta_len = 0usize;
+            let mut related_len = 0usize;
+            for update in updates {
+                match update {
+                    UpdateData::State(state) => incoming_len = state.as_ref().len(),
+                    UpdateData::Delta(delta) => delta_len = delta.as_ref().len(),
+                    UpdateData::StateAndDelta { state, delta } => {
+                        incoming_len = state.as_ref().len();
+                        delta_len = delta.as_ref().len();
+                    }
+                    UpdateData::RelatedState { state, .. }
+                    | UpdateData::RelatedStateAndDelta { state, .. } => {
+                        related_len += state.as_ref().len();
+                    }
+                    UpdateData::RelatedDelta { .. } => {}
+                    // `UpdateData` is `#[non_exhaustive]`. A future variant carrying
+                    // related state would be missed here and in the closure below;
+                    // both sites are marked so the pair is updated together.
+                    // AUDIT: new Related* variant -> update both match sites.
+                    _ => {}
+                }
+            }
+
+            let size_hint = parameters.as_ref().len()
+                + current_state.as_ref().len()
+                + new_state.as_ref().len()
+                + incoming_len
+                + delta_len
+                + related_len;
+
+            capture.observe_with(size_hint, || {
+                let (incoming_state, delta) = updates.iter().fold((None, None), |acc, update| {
+                    match update {
+                        UpdateData::State(state) => (Some(state.as_ref().to_vec()), acc.1),
+                        UpdateData::Delta(delta) => (acc.0, Some(delta.as_ref().to_vec())),
+                        UpdateData::StateAndDelta { state, delta } => {
+                            (Some(state.as_ref().to_vec()), Some(delta.as_ref().to_vec()))
+                        }
+                        // Related payloads are not part of THIS transition; they are
+                        // collected separately below as the context the contract needs
+                        // to execute at all.
+                        UpdateData::RelatedState { .. }
+                        | UpdateData::RelatedDelta { .. }
+                        | UpdateData::RelatedStateAndDelta { .. }
+                        | _ => acc,
+                    }
+                });
+
+                // Only full states: a related DELTA cannot be applied without the
+                // state it is relative to, which this peer may not hold.
+                // AUDIT: new Related* variant -> update both match sites.
+                let related: Vec<(ContractInstanceId, Vec<u8>)> = updates
+                    .iter()
+                    .filter_map(|update| match update {
+                        UpdateData::RelatedState { related_to, state }
+                        | UpdateData::RelatedStateAndDelta {
+                            related_to, state, ..
+                        } => Some((*related_to, state.as_ref().to_vec())),
+                        UpdateData::State(_)
+                        | UpdateData::Delta(_)
+                        | UpdateData::StateAndDelta { .. }
+                        | UpdateData::RelatedDelta { .. }
+                        | _ => None,
+                    })
+                    .collect();
+
+                crate::conformance::capture::Observation {
+                    contract: *key.id(),
+                    code_hash: crate::conformance::capture::code_hash_of(key),
+                    parameters: parameters.as_ref().to_vec(),
+                    base_state: current_state.as_ref().to_vec(),
+                    incoming_state,
+                    delta,
+                    result_state: new_state.as_ref().to_vec(),
+                    related,
+                }
+            });
+        }
 
         if new_state.as_ref() == current_state.as_ref() {
             tracing::debug!(
@@ -1859,7 +2257,7 @@ where
         key: &ContractKey,
         parameters: &Parameters<'_>,
         new_state: &WrappedState,
-    ) -> Result<(), ExecutorError> {
+    ) -> Result<StateCommitOutcome, ExecutorError> {
         // Blanket gate: a contract flagged as violating a CRDT invariant
         // (e.g. non-idempotent merge) must not have its state extended
         // OR broadcast from this node. The merge in
@@ -1877,12 +2275,21 @@ where
                     event = "commit_suppressed_broken_contract",
                     "Skipping commit_state_update for contract flagged as broken"
                 );
-                return Ok(());
+                // NOT `Ok(())`. This path stores nothing and fans out
+                // nothing, and a caller that reads a bare `Ok` as "committed"
+                // will act on a state that was never written — which is
+                // exactly what happened to the initial-install branch's
+                // replay loop before the outcome was made explicit.
+                return Ok(StateCommitOutcome::SuppressedBrokenContract);
             }
         }
 
         let state_size = new_state.as_ref().len();
         if state_size > MAX_STATE_SIZE {
+            crate::contract::record_state_size_rejection(
+                crate::contract::StateSizeRejectionStage::PostMergeCommit,
+                state_size,
+            );
             tracing::warn!(
                 contract = %key,
                 size_bytes = state_size,
@@ -1942,13 +2349,80 @@ where
             "Contract state updated"
         );
 
-        // Record update timestamp for dashboard display. No-op if we're
-        // not subscribed (e.g., a relay forwarding an UPDATE for a
-        // contract this peer doesn't track).
+        self.finalize_state_commit(key, parameters, new_state).await;
+
+        Ok(StateCommitOutcome::Committed)
+    }
+
+    /// The complete post-store fan-out for a contract state this node has
+    /// just committed. **Every storing path in `runtime/executor_impl.rs` and
+    /// `runtime/contract_ops.rs` MUST call this** rather than hand-inlining a
+    /// subset of its legs.
+    ///
+    /// Those two files are the scope, not the whole crate.
+    /// `executor/mock_runtime.rs` stores and broadcasts directly, on a
+    /// different type, and is compiled unconditionally — so the audit grep in
+    /// `.claude/rules/bug-prevention-patterns.md` returns hits from it that are
+    /// NOT violations. Stated here so the first person to run that grep does
+    /// not have to rediscover it.
+    ///
+    /// One storing path in `contract_ops.rs` deliberately does NOT call this:
+    /// the related-contract install in `get_updated_state`, which writes back a
+    /// value it read from the local store moments earlier and so announces no
+    /// transition. Its justification is at the site, and a behavioural test
+    /// (`related_contract_install_does_not_fan_out_the_get_path_already_did`)
+    /// goes red if a call is added there.
+    ///
+    /// The four legs, in order:
+    ///
+    /// 1. `Ring::record_contract_update` — dashboard "last updated"
+    ///    telemetry. No-op when this peer does not track the contract
+    ///    (e.g. a relay forwarding an UPDATE).
+    /// 2. `send_update_notification` — locally-subscribed WebSocket
+    ///    clients.
+    /// 3. `send_delegate_contract_notifications` — locally-subscribed
+    ///    delegates. Best-effort and lossy by design (`try_send`); see
+    ///    that method.
+    /// 4. `broadcast_state_change` — the network. Suppressed for a
+    ///    contract flagged as violating a CRDT invariant, and emitted
+    ///    non-blocking (#4145).
+    ///
+    /// This exists because the legs kept getting dropped one at a time.
+    /// All FOUR storing paths — the initial-state install in
+    /// `bridged_upsert_contract_state_inner`, `commit_state_update` (the
+    /// merge path), and both branches of `contract_ops::perform_contract_put`
+    /// (the local re-PUT merge and the fresh store) — re-inlined their own
+    /// subset. The initial-install branch omitted the WS-client leg once, then
+    /// the delegate leg (#5481); both `perform_contract_put` branches omitted
+    /// the telemetry AND delegate legs. Each time silently: the subscription
+    /// is still registered, the delegate is still healthy, and no error is
+    /// produced anywhere. That is the "manually-inlined originator side
+    /// effects" row in `.claude/rules/bug-prevention-patterns.md`. The
+    /// source-scrape pin
+    /// `pool_tests::delegate_notification_tests::finalize_state_commit_is_the_only_post_store_fan_out_site`
+    /// scrapes BOTH files and fails if a leg leaves this helper or a second
+    /// site starts calling one directly.
+    ///
+    /// Every leg is best-effort: none of them can fail the commit, which
+    /// has already landed on disk by the time this runs. Note this is a
+    /// deliberate change for `perform_contract_put`, which previously
+    /// propagated a `send_update_notification` error as a `Put` failure —
+    /// i.e. reported a PUT as failed after its state had already been stored
+    /// and metered, over a WASM `get_state_delta` trap for some OTHER
+    /// client's subscription. The merge path has always logged and continued
+    /// in exactly that situation; this makes the two agree.
+    pub(super) async fn finalize_state_commit(
+        &mut self,
+        key: &ContractKey,
+        parameters: &Parameters<'_>,
+        new_state: &WrappedState,
+    ) {
+        // 1. Dashboard "last updated" telemetry.
         if let Some(op_manager) = &self.op_manager {
             op_manager.ring.record_contract_update(key);
         }
 
+        // 2. Locally-subscribed WebSocket clients.
         if let Err(err) = self
             .send_update_notification(key, parameters, new_state)
             .await
@@ -1961,61 +2435,16 @@ where
             );
         }
 
-        // Notify subscribed delegates about the state change
+        // 3. Locally-subscribed delegates.
         self.send_delegate_contract_notifications(key, new_state);
 
-        if let Some(op_manager) = &self.op_manager {
-            // Skip the broadcast entirely if this contract has been flagged
-            // as violating a CRDT invariant (e.g. non-idempotent
-            // `update_state`). The idempotency probe in
-            // `bridged_upsert_contract_state` sets this flag when it
-            // catches `update_state(update_state(S, U), U) != update_state(S, U)`.
-            // Once flagged, propagating this contract's state changes
-            // re-engages the broadcast storm we are trying to suppress.
-            // See `crate::ring::broken_invariants`.
-            if op_manager.ring.is_contract_broken(key) {
-                tracing::debug!(
-                    contract = %key,
-                    event = "broadcast_suppressed_broken_contract",
-                    "Skipping BroadcastStateChange for contract flagged as broken"
-                );
-            } else if let Err(err) =
-                op_manager.try_notify_node_event(crate::message::NodeEvent::BroadcastStateChange {
-                    key: *key,
-                    new_state: new_state.clone(),
-                    is_retry: false,
-                    is_reemit: false,
-                })
-            {
-                // Non-blocking emit: a 30-second `notify_node_event(...).await`
-                // on this commit path was the primary back-pressure source
-                // that wedged both gateways on 2026-05-24 (#4145). Missed
-                // broadcasts heal via the next UPDATE or via summary-mismatch
-                // SyncStateToPeer rounds — the executor must not stall here.
-                //
-                // Best-effort by design (see comment block above and
-                // #4145): a missed broadcast heals via the next UPDATE
-                // or summary-mismatch SyncStateToPeer round. Per-
-                // occurrence WARN here flooded gateways under fan-out
-                // at the same rate as the helper-internal log it
-                // mirrored (#4238). The rate-limited `notify_node_event:
-                // Notification channel full for too long` ERROR in
-                // op_state_manager.rs is the sustained-back-pressure
-                // alert operators should grep for.
-                tracing::debug!(
-                    contract = %key,
-                    error = %err,
-                    "Failed to broadcast state change to network peers (best-effort)"
-                );
-            }
-        }
-
-        Ok(())
+        // 4. The network.
+        self.broadcast_state_change(*key, new_state.clone()).await;
     }
 
     /// Send notifications to delegates subscribed to a contract's state changes.
     ///
-    /// Checks the global `DELEGATE_SUBSCRIPTIONS` registry and sends a
+    /// Checks the global `delegate_subscriptions` registry and sends a
     /// `DelegateNotification` for each subscribed delegate through the channel.
     ///
     /// This is a **best-effort, lossy** notification path: if the bounded channel
@@ -2029,14 +2458,12 @@ where
         };
 
         let instance_id = *key.id();
-        // Snapshot subscribers and release the DashMap read-lock before sending
-        let subscribers: Vec<DelegateKey> = {
-            let entry = crate::wasm_runtime::DELEGATE_SUBSCRIPTIONS.get(&instance_id);
-            match entry {
-                Some(ref s) if !s.is_empty() => s.iter().cloned().collect(),
-                _ => return,
-            }
-        };
+        // Snapshot subscribers; the registry returns an owned Vec so no shard
+        // lock is held across the sends below.
+        let subscribers = crate::wasm_runtime::delegate_subscriptions::subscribers_of(&instance_id);
+        if subscribers.is_empty() {
+            return;
+        }
 
         tracing::debug!(
             contract = %key,
@@ -2053,7 +2480,18 @@ where
                 contract_id: instance_id,
                 new_state: Arc::clone(&shared_state),
             }) {
-                Ok(()) => {}
+                Ok(()) => {
+                    // Ordinary use, which is what orders cap eviction: a
+                    // subscription that is actually delivering stays warm, so
+                    // the one dropped under pressure is whichever this delegate
+                    // has heard about least recently. Stamped on successful
+                    // enqueue only — a notification dropped by a full channel is
+                    // not evidence the delegate is using the subscription.
+                    crate::wasm_runtime::delegate_subscriptions::note_notified(
+                        &instance_id,
+                        &delegate_key,
+                    );
+                }
                 Err(mpsc::error::TrySendError::Full(_)) => {
                     static DROPPED: AtomicUsize = AtomicUsize::new(0);
                     let total = DROPPED.fetch_add(1, Ordering::Relaxed) + 1;
@@ -2070,8 +2508,18 @@ where
                         "Delegate notification channel closed — removing stale subscriptions"
                     );
                     // Receiver is gone; clean up all subscriptions for this contract
-                    // to prevent repeated failed sends on future state updates.
-                    crate::wasm_runtime::DELEGATE_SUBSCRIPTIONS.remove(&instance_id);
+                    // to prevent repeated failed sends on future state updates,
+                    // and release the interest they took (#5542).
+                    //
+                    // IN MEMORY ONLY. This channel closes when the node shuts
+                    // down, and the persisted subscriptions must survive
+                    // exactly that (#5493): erasing them here would erase every
+                    // delegate's subscriptions on every clean shutdown.
+                    crate::wasm_runtime::delegate_subscriptions::remove_contract(
+                        &instance_id,
+                        crate::wasm_runtime::delegate_subscriptions::Durability::InMemoryOnly,
+                    );
+                    crate::wasm_runtime::delegate_interest::release_contract(&instance_id);
                     return;
                 }
             }
@@ -2301,6 +2749,46 @@ where
                     .or_insert_with(|| Some(s.clone().into_owned()));
             }
         }
+        // Conformance capture (#5376), production path.
+        //
+        // Related state reaches this executor by two routes and capture used to see
+        // only one. When `update_state` returns `RequestRelated`, the retry loop
+        // resolves each contract and pushes it into `updates` as
+        // `UpdateData::RelatedState`, so it travels inside the transition and the
+        // observation in `attempt_state_update` records it. When `validate_state`
+        // asks, it is answered HERE instead, used for the retry validation below, and
+        // dropped — and the transition for this same operation has already been
+        // observed by the time we get here, so it could not carry this.
+        //
+        // Missing it left contracts whose VALIDITY depends on another contract
+        // unjudgeable: every replayed case dead-ends at
+        // `Inconclusive::RelatedRequired`, which reads exactly like a clean result.
+        //
+        // There is a SECOND implementation of this same resolution,
+        // `fetch_related_for_validation_network` in `contract_ops.rs`, reached only
+        // from `run_local_node` — i.e. `OperationMode::Local`, which never joins the
+        // ring. It carries the same call for local-mode and `fdev` runs. Both are
+        // instrumented on purpose; THIS one is the path a network peer takes, and an
+        // earlier version of this fix patched only the other one, which would have
+        // changed nothing for any real capture.
+        //
+        // Costs no fetch: these states were resolved for this node's own validation,
+        // local-store-first, and are already in hand. Byte-budgeted and dropped rather
+        // than blocking, like every other capture path.
+        if let Some(capture) = crate::conformance::capture::global() {
+            let size_hint: usize = related_map
+                .values()
+                .flatten()
+                .map(|state| state.as_ref().len())
+                .sum();
+            capture.observe_related_with(*key.id(), size_hint, || {
+                related_map
+                    .iter()
+                    .filter_map(|(id, state)| state.as_ref().map(|s| (*id, s.as_ref().to_vec())))
+                    .collect()
+            });
+        }
+
         let populated_related = RelatedContracts::from(related_map);
         let retry_result = self
             .runtime
@@ -2386,9 +2874,14 @@ where
 
     pub(super) async fn broadcast_state_change(&self, key: ContractKey, new_state: WrappedState) {
         if let Some(op_manager) = &self.op_manager {
-            // Mirror the broken-invariant gate in `commit_state_update`
-            // above. Same rationale: a contract flagged as non-idempotent
-            // must not be propagated.
+            // Skip the broadcast entirely if this contract has been flagged
+            // as violating a CRDT invariant (e.g. non-idempotent
+            // `update_state`). The idempotency probe in
+            // `bridged_upsert_contract_state` sets this flag when it
+            // catches `update_state(update_state(S, U), U) != update_state(S, U)`.
+            // Once flagged, propagating this contract's state changes
+            // re-engages the broadcast storm we are trying to suppress.
+            // See `crate::ring::broken_invariants`.
             if op_manager.ring.is_contract_broken(&key) {
                 tracing::debug!(
                     contract = %key,
@@ -2397,8 +2890,11 @@ where
                 );
                 return;
             }
-            // Non-blocking emit — see comment in the update path above
-            // and #4145 for the wedge this prevents.
+            // Non-blocking emit: a 30-second `notify_node_event(...).await`
+            // on the commit path was the primary back-pressure source that
+            // wedged both gateways on 2026-05-24 (#4145). Missed broadcasts
+            // heal via the next UPDATE or via summary-mismatch
+            // SyncStateToPeer rounds — the executor must not stall here.
             if let Err(err) =
                 op_manager.try_notify_node_event(crate::message::NodeEvent::BroadcastStateChange {
                     key,
@@ -2407,10 +2903,14 @@ where
                     is_reemit: false,
                 })
             {
-                // Best-effort by design — see #4145 and the sibling
-                // commit path above. Per-occurrence WARN here re-
-                // introduced the #4238 spam at the caller layer even
-                // after the helper-internal downgrade.
+                // Best-effort by design (see #4145): a missed broadcast
+                // heals via the next UPDATE or summary-mismatch
+                // SyncStateToPeer round. Per-occurrence WARN here flooded
+                // gateways under fan-out at the same rate as the
+                // helper-internal log it mirrored (#4238). The
+                // rate-limited `notify_node_event: Notification channel
+                // full for too long` ERROR in op_state_manager.rs is the
+                // sustained-back-pressure alert operators should grep for.
                 tracing::debug!(
                     contract = %key,
                     error = %err,
@@ -2430,34 +2930,156 @@ where
         let key = *key;
         let instance_id = *key.id();
 
+        // Set by the LOCAL fan-out arm when its channel-closed cleanup empties
+        // the subscriber vec. The removal itself has to happen after the
+        // if/else chain, because that arm holds `&mut` borrows of both maps for
+        // its whole body. The shared arm does the equivalent inline (it works
+        // through `Arc<DashMap>`, not `&mut self`), and leaves this false.
+        let mut local_entry_became_empty = false;
+
+        // Resolved before either fan-out arm takes its `&mut` borrows: both arms
+        // hold two executor maps mutably for the whole loop, so the
+        // `self.contract_exec_metrics()` accessor (which borrows ALL of `self`)
+        // is unusable inside them.
+        //
+        // Deliberately the FIELD, not that accessor and not an `Arc` clone: this
+        // borrows only `self.op_manager`, which is disjoint from
+        // `self.update_notifications`, `self.subscriber_summaries` and
+        // `self.runtime`, so the borrow checker allows it and the cost is a
+        // pointer. An `Arc` clone here would instead charge two atomic RMWs to
+        // every committed update on the zero-local-subscriber path — the
+        // overwhelmingly common one for a contract this node hosts for the
+        // network, which returns below without recording anything.
+        //
+        // Neither delta below has a cache in front of it, so they land on the
+        // `uncached` arm — see `ring::contract_exec_metrics` for why the cached
+        // and uncached WASM totals are separate counters.
+        let exec_metrics = self
+            .op_manager
+            .as_ref()
+            .map(|om| om.ring.contract_exec_metrics());
+
         if let (Some(shared_notifications), Some(shared_summaries)) = (
             self.shared_notifications.as_ref(),
             self.shared_summaries.as_ref(),
         ) {
-            // Snapshot subscribers and release the DashMap read-lock before sending
-            let notifiers_snapshot: Vec<(ClientId, mpsc::Sender<HostResult>)> =
+            // Snapshot subscribers and release the DashMap read-lock before sending.
+            // Kept as `Option` rather than collapsed to an empty Vec: ABSENT and
+            // PRESENT-but-EMPTY need different handling below, and distinguishing
+            // them here keeps the ABSENT path — the overwhelmingly common one —
+            // a pure READ. Collapsing first and re-deriving the distinction from
+            // a `remove_if` would take a shard WRITE lock on every committed
+            // update for every contract with no local subscriber.
+            let notifiers_snapshot: Option<Vec<(ClientId, mpsc::Sender<HostResult>)>> =
                 shared_notifications
                     .get(&instance_id)
-                    .map_or_else(Vec::new, |notifiers| notifiers.value().clone());
+                    .map(|notifiers| notifiers.value().clone());
 
-            // #4681: a committed update found no LIVE subscriber for this
-            // contract — either no map entry at all, OR an empty subscriber vec
-            // left behind by the channel-closed cleanup below (`retain` removes
-            // the last dead subscriber but leaves the emptied entry in the map,
-            // so the next committed update snapshots `Some([])`). Both cases are
-            // fully silent drops for a contract that may have had a registered
-            // subscriber, so surface them with a WARN (instance + total
-            // registered-contract count) instead of returning silently — a
-            // notification dropped for a registered subscriber is never invisible.
-            if notifiers_snapshot.is_empty() {
-                tracing::warn!(
-                    %instance_id,
-                    registered_contracts = shared_notifications.len(),
-                    "send_update_notification: no subscriber snapshot for contract \
-                     (shared storage); update notification not delivered"
-                );
-                return Ok(());
-            }
+            // #4681, re-scoped by #5040: an empty snapshot is TWO distinct
+            // states, and only one of them is an anomaly.
+            //
+            // * ABSENT entry — no local client is subscribed: either none ever
+            //   was, or the last one disconnected cleanly (`RuntimePool::
+            //   remove_client` drops the entry outright). This is the NORMAL
+            //   steady state for a contract this node hosts for the NETWORK:
+            //   the network mesh is fed by `broadcast_state_change`, not by
+            //   this local fan-out, so nothing is undelivered and nothing is
+            //   lost. Warning per occurrence made a routine fact read as a
+            //   dropped notification and buried the real signal below — one
+            //   production node logged 22,413 of these in a single day, 96.6%
+            //   of them for one zero-subscriber contract (#5040). PR #4773's
+            //   own reviewer note predicted exactly this ("fires on the commit
+            //   path for contracts with zero local subscribers (common on
+            //   relays/gateways) ... a follow-up could rate-limit it if it
+            //   proves noisy").
+            //
+            // * PRESENT but EMPTY — a subscriber's channel closed without a
+            //   Disconnect reaching the handler, so the failure `retain` below
+            //   emptied the vec in place. That loss is already reported at the
+            //   point of loss (one ERROR per closed channel, naming the client),
+            //   so this is a backstop: it is reported ONCE and the stale entry
+            //   (with its already-emptied summaries sibling) is dropped, rather
+            //   than re-warning on every committed update forever. The `retain`
+            //   below now also removes the entry as it empties, which is the
+            //   real source fix; this arm catches anything that still slips
+            //   through. Both adopt the "drop the entry when it goes empty"
+            //   convention the interest/subscriber maps already use
+            //   (`interest.rs`, `hosting.rs`: `remove_if(.., |_, v| v.is_empty())`).
+            //
+            // NOTE ON VISIBILITY: `debug!` is compiled OUT of release builds by
+            // `release_max_level_info` (see crates/core/Cargo.toml), so the
+            // ABSENT case below is deliberately INVISIBLE in production, not
+            // merely quieter. That is intended — it is the steady state and
+            // carries no operator action — but it does mean a log grep can no
+            // longer distinguish "no subscriber registered" from "never
+            // reached", which #4681 had relied on. See #5040.
+            let notifiers_snapshot = match notifiers_snapshot {
+                None => {
+                    if let Some(op_manager) = self.op_manager.as_ref() {
+                        op_manager.ring.record_notification_no_local_subscriber();
+                    }
+                    tracing::debug!(
+                        %instance_id,
+                        registered_contracts = shared_notifications.len(),
+                        "send_update_notification: no local subscriber for contract \
+                         (shared storage); nothing to deliver locally"
+                    );
+                    return Ok(());
+                }
+                Some(notifiers) if notifiers.is_empty() => {
+                    // Captured BEFORE the removal below, so the count describes
+                    // the moment of observation rather than the moment after
+                    // cleanup (which would undercount by exactly this entry).
+                    let registered_contracts = shared_notifications.len();
+                    // Gate the summaries removal on the notifications removal
+                    // actually happening: `remove_if` re-checks emptiness under
+                    // the shard lock, so if a client registered between the
+                    // snapshot above and here the entry is no longer empty, the
+                    // removal declines — and we must NOT then drop that new
+                    // client's summary. The next committed update serves them.
+                    if shared_notifications
+                        .remove_if(&instance_id, |_, notifiers| notifiers.is_empty())
+                        .is_some()
+                    {
+                        // Unconditional, NOT `remove_if(.., is_empty)`: with no
+                        // channels left under this key, every summary beneath it
+                        // belongs to a client that can no longer be notified. A
+                        // conditional removal would orphan exactly the realistic
+                        // case, because a summaries sibling is typically still
+                        // NON-empty at this point.
+                        shared_summaries.remove(&instance_id);
+                        tracing::warn!(
+                            %instance_id,
+                            registered_contracts,
+                            "send_update_notification: no subscriber snapshot for contract \
+                             (shared storage); stale entry dropped — the subscriber was \
+                             lost on an earlier update (see the prior channel-closed ERROR)"
+                        );
+                    } else {
+                        // The removal DECLINED: a client registered between the
+                        // snapshot above and this call, so the entry is no
+                        // longer empty. This update is not delivered to them
+                        // (the snapshot predates their arrival); the next
+                        // committed update is.
+                        //
+                        // Logged rather than left silent, though note this is a
+                        // DEBUG-BUILD aid only: `release_max_level_info`
+                        // compiles it out, so in production this path is as
+                        // silent as it was. It is recorded because a registered
+                        // subscriber, a committed update, and zero evidence is
+                        // the #4681 shape, and a debug-build trace is better
+                        // than nothing while the window stays unreachable.
+                        tracing::debug!(
+                            %instance_id,
+                            "send_update_notification: subscriber registered concurrently with \
+                             the stale-entry cleanup; this update was not delivered to it, the \
+                             next one will be"
+                        );
+                    }
+                    return Ok(());
+                }
+                Some(notifiers) => notifiers,
+            };
 
             let summaries_snapshot: HashMap<ClientId, Option<StateSummary<'static>>> =
                 shared_summaries
@@ -2473,6 +3095,10 @@ where
             }
 
             let mut failures = Vec::with_capacity(32);
+            // Clients whose notification was dropped because their channel was
+            // full. Their cached summary is invalidated below so the NEXT
+            // notification is sent as full state — see the `Full` arm (#4681).
+            let mut resync_clients: Vec<ClientId> = Vec::new();
             let mut delta_computations = 0usize;
             // Pre-allocate full state once for subscribers that don't get deltas
             let full_state = State::from(new_state.as_ref()).into_owned();
@@ -2485,6 +3111,9 @@ where
                         if delta_computations < super::MAX_DELTA_COMPUTATIONS_PER_FANOUT =>
                     {
                         delta_computations += 1;
+                        if let Some(m) = exec_metrics {
+                            m.record_delta_wasm_uncached();
+                        }
                         self.runtime
                             .get_state_delta(&key, params, new_state, summary)
                             .map_err(|err| {
@@ -2519,14 +3148,38 @@ where
                         );
                     }
                     Err(mpsc::error::TrySendError::Full(_)) => {
+                        // #4681 mechanism 2. Dropping this notification is
+                        // recoverable ONLY if the client is later resent the
+                        // whole state. If what we just dropped was a DELTA, the
+                        // client has permanently diverged: deltas are
+                        // incremental, so a missed one is never made up by
+                        // subsequent deltas, and the subscriber stays silently
+                        // wrong rather than merely stale.
+                        //
+                        // So invalidate its cached summary below. An absent or
+                        // `None` summary makes the next notification full state
+                        // (see the `peer_summary` match above), which resyncs
+                        // the client. Deliberately NOT a blocking `send`/
+                        // `send_timeout`: this runs on the serial
+                        // contract-handling loop, and blocking here is the
+                        // #4145 class of wedge that channel-safety.md forbids.
+                        resync_clients.push(*peer_key);
+                        if let Some(op_manager) = self.op_manager.as_ref() {
+                            op_manager.ring.record_notification_dropped_channel_full();
+                        }
                         tracing::warn!(
                             client = %peer_key,
                             contract = %key,
-                            "Subscriber notification channel full — notification dropped"
+                            "Subscriber notification channel full — notification dropped; \
+                             invalidating cached summary so the next update resyncs this \
+                             client with full state"
                         );
                     }
                     Err(mpsc::error::TrySendError::Closed(_)) => {
                         failures.push(*peer_key);
+                        if let Some(op_manager) = self.op_manager.as_ref() {
+                            op_manager.ring.record_notification_dropped_channel_closed();
+                        }
                         tracing::error!(
                             client = %peer_key,
                             contract = %key,
@@ -2537,15 +3190,57 @@ where
                 }
             }
 
+            // Force a full-state resync for every client whose notification was
+            // dropped by a full channel (#4681). The summary is set to `None`
+            // rather than removed so the client stays registered; the
+            // delta/full-state match above reads `None` as "send full state".
+            if !resync_clients.is_empty() {
+                if let Some(mut contract_summaries) = shared_summaries.get_mut(&instance_id) {
+                    for client in &resync_clients {
+                        if let Some(summary) = contract_summaries.get_mut(client) {
+                            *summary = None;
+                        }
+                    }
+                }
+            }
+
             if !failures.is_empty() {
                 if let Some(mut notifiers) = shared_notifications.get_mut(&instance_id) {
                     notifiers.retain(|(c, _)| !failures.contains(c));
                 }
-
                 if let Some(mut contract_summaries) = shared_summaries.get_mut(&instance_id) {
                     for failed_client in &failures {
                         contract_summaries.remove(failed_client);
                     }
+                }
+                // Drop the entry AS it empties rather than leaving `Some([])`
+                // behind (#5040). The stale empty entry was otherwise pruned
+                // only opportunistically (by the next `RuntimePool::
+                // remove_client` from any client), so until then every
+                // committed update re-warned on it and it inflated the
+                // `registered_contracts` count in that warning. The loss
+                // itself is already reported above, one ERROR per closed
+                // channel. Separate statement so the `get_mut` guards above are
+                // released before `remove_if` takes the same shard lock.
+                //
+                // Same gating as the check-site arm: the summaries sibling is
+                // dropped only when the notifications removal actually happened,
+                // and then unconditionally (any summary under a channel-less key
+                // is dead).
+                //
+                // The gate covers a registration whose notifications-insert
+                // lands BEFORE the `remove_if`. It does NOT cover one landing
+                // entirely between the successful `remove_if` and the
+                // `shared_summaries.remove` below — registration writes the two
+                // maps in that order, so such a client ends up with a live
+                // channel and no summary. That degrades to a full-state send
+                // instead of a delta, never a fault, and it is unreachable
+                // while both paths run on the serial contract loop.
+                if shared_notifications
+                    .remove_if(&instance_id, |_, notifiers| notifiers.is_empty())
+                    .is_some()
+                {
+                    shared_summaries.remove(&instance_id);
                 }
 
                 // Decrement per-client subscription counters for failed clients
@@ -2583,6 +3278,10 @@ where
             }
 
             let mut failures = Vec::with_capacity(32);
+            // See the shared arm: clients whose notification a full channel
+            // dropped, whose cached summary is invalidated so the next update
+            // resyncs them with full state (#4681).
+            let mut resync_clients: Vec<ClientId> = Vec::new();
             let mut delta_computations = 0usize;
             // Pre-allocate full state once for subscribers that don't get deltas
             let full_state = State::from(new_state.as_ref()).into_owned();
@@ -2594,6 +3293,9 @@ where
                         if delta_computations < super::MAX_DELTA_COMPUTATIONS_PER_FANOUT =>
                     {
                         delta_computations += 1;
+                        if let Some(m) = exec_metrics {
+                            m.record_delta_wasm_uncached();
+                        }
                         self.runtime
                             .get_state_delta(&key, params, new_state, &*summary)
                             .map_err(|err| {
@@ -2626,14 +3328,27 @@ where
                         );
                     }
                     Err(mpsc::error::TrySendError::Full(_)) => {
+                        // #4681 mechanism 2 — see the shared arm for the full
+                        // rationale. A dropped DELTA diverges the client
+                        // permanently, so invalidate its summary and resync
+                        // with full state on the next update.
+                        resync_clients.push(*peer_key);
+                        if let Some(op_manager) = self.op_manager.as_ref() {
+                            op_manager.ring.record_notification_dropped_channel_full();
+                        }
                         tracing::warn!(
                             client = %peer_key,
                             contract = %key,
-                            "Subscriber notification channel full — notification dropped"
+                            "Subscriber notification channel full — notification dropped; \
+                             invalidating cached summary so the next update resyncs this \
+                             client with full state"
                         );
                     }
                     Err(mpsc::error::TrySendError::Closed(_)) => {
                         failures.push(*peer_key);
+                        if let Some(op_manager) = self.op_manager.as_ref() {
+                            op_manager.ring.record_notification_dropped_channel_closed();
+                        }
                         tracing::error!(
                             client = %peer_key,
                             contract = %key,
@@ -2644,8 +3359,26 @@ where
                 }
             }
 
+            // Full-channel resync, local twin of the shared arm (#4681).
+            for client in &resync_clients {
+                if let Some(summary) = summaries.get_mut(client) {
+                    *summary = None;
+                }
+            }
+
             if !failures.is_empty() {
                 notifiers.retain(|(c, _)| !failures.contains(c));
+                // Prune the dead clients' summaries too, mirroring the shared
+                // arm. Without this the local path leaked one summary per lost
+                // subscriber until that client's `remove_client` ran (#5040
+                // review): the shared arm did it, the local arm did not, while
+                // the comments claimed the two mirrored each other.
+                for failed_client in &failures {
+                    summaries.remove(failed_client);
+                }
+                // Defer the map-level removal: `notifiers` and `summaries` are
+                // live `&mut` borrows here. See the flag's declaration.
+                local_entry_became_empty = notifiers.is_empty();
                 // Decrement per-client subscription counters for failed clients
                 for failed_client in &failures {
                     if let Some(count) = self.client_subscription_counts.get_mut(failed_client) {
@@ -2657,17 +3390,57 @@ where
                 }
             }
         } else {
-            // #4681: mirror the shared-storage observability for the local
-            // (non-pool) executor — a committed update with no LIVE subscriber
-            // for this contract (no map entry at all, OR an empty subscriber vec
-            // left behind by the channel-closed cleanup above) must not vanish
-            // silently.
-            tracing::warn!(
-                %instance_id,
-                registered_contracts = self.update_notifications.len(),
-                "send_update_notification: no subscriber snapshot for contract \
-                 (local storage); update notification not delivered"
-            );
+            // #4681, re-scoped by #5040: mirror the shared-storage branch's
+            // absent-vs-empty split (see the rationale there). Reached when the
+            // entry is absent (no local subscriber — the ordinary case, and not
+            // a drop) OR present-but-empty (a subscriber was lost, already
+            // reported per-client as an ERROR above). The emptied entry and its
+            // summaries sibling are removed together — the fan-out arm above
+            // indexes `subscriber_summaries` on the strength of
+            // `update_notifications` having an entry, so the two must stay
+            // paired.
+            let lost_subscriber_entry = self
+                .update_notifications
+                .get(&instance_id)
+                .is_some_and(|notifiers| notifiers.is_empty());
+            if lost_subscriber_entry {
+                // Captured BEFORE the removal, matching the shared arm — both
+                // branches must report the same thing under the same field name
+                // (the count at the moment of observation, INCLUDING the entry
+                // being dropped).
+                let registered_contracts = self.update_notifications.len();
+                self.update_notifications.remove(&instance_id);
+                self.subscriber_summaries.remove(&instance_id);
+                tracing::warn!(
+                    %instance_id,
+                    registered_contracts,
+                    "send_update_notification: no subscriber snapshot for contract \
+                     (local storage); update notification not delivered"
+                );
+            } else {
+                if let Some(op_manager) = self.op_manager.as_ref() {
+                    op_manager.ring.record_notification_no_local_subscriber();
+                }
+                tracing::debug!(
+                    %instance_id,
+                    registered_contracts = self.update_notifications.len(),
+                    "send_update_notification: no local subscriber for contract \
+                     (local storage); nothing to deliver locally"
+                );
+            }
+        }
+
+        // Deferred local-arm cleanup (see the flag's declaration): drop the
+        // entry AS it empties, so no later update finds a stale empty vec to
+        // warn about. This is the local counterpart of the shared arm's
+        // in-place removal; without it the local path relied entirely on the
+        // check-site backstop and warned once more than the shared path for the
+        // identical sequence (#5040 review). Both maps go together — the local
+        // fan-out arm indexes `subscriber_summaries` on the strength of
+        // `update_notifications` having an entry.
+        if local_entry_became_empty {
+            self.update_notifications.remove(&instance_id);
+            self.subscriber_summaries.remove(&instance_id);
         }
         Ok(())
     }
@@ -2700,6 +3473,28 @@ mod full_state_version_gate_pins {
             .find("pub(in crate::contract::executor) async fn bridged_summarize_contract_state(")
             .expect("next method after bridged_upsert_contract_state_inner not found");
         &after[..end]
+    }
+
+    /// `upsert_body` with `//` comment lines removed, so a pin can assert that a
+    /// name does not appear in the CODE without tripping over prose that
+    /// deliberately names it (the removed index writer is discussed in a comment
+    /// right where it used to be called).
+    ///
+    /// This strips whole-line `//` comments only — not block comments, not trailing
+    /// comments, not `//` inside a string literal. That narrowness is deliberate
+    /// rather than an oversight: every gap in it produces a false FAILURE, never a
+    /// false pass, because a real call's identifier can never sit on a line whose
+    /// `trim_start()` begins with `//`. So the filter is sound in the direction that
+    /// matters and does not need to become a lexer. There are no block or trailing
+    /// comments in the scraped region today; if someone adds one naming a forbidden
+    /// symbol, the pin fails with a confusing message, which is why the assertion
+    /// text says how to word it.
+    fn upsert_code_only() -> String {
+        upsert_body()
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     /// A full state over EXISTING state must reach the contract's
@@ -2747,6 +3542,69 @@ mod full_state_version_gate_pins {
         );
     }
 
+    /// The "code already stored" branch must route through `store_contract`,
+    /// the store's one guarded ingress, and must not write the durable
+    /// instance→code index by any other means.
+    ///
+    /// This branch is the COMMON path, not an edge case: any contract reusing an
+    /// already-stored binary lands here, which is every River room after the
+    /// first. It used to call `ContractStore::ensure_key_indexed`, which wrote
+    /// that durable row from a bare `&ContractKey` — no code, no parameters — so
+    /// it could verify neither the identity it was filing nor that the blob it
+    /// pointed at existed. Both gaps were found the same day
+    /// (`verify_contract_identity` for the first, #5280 for the second), which is
+    /// what makes this structural rather than two coincidences.
+    ///
+    /// Reverting the call site alone no longer compiles, since
+    /// `ContractStoreBridge` has no index-writing method any more — this pin
+    /// covers the case where someone restores the trait method too.
+    #[test]
+    fn already_stored_branch_routes_through_the_guarded_store_ingress() {
+        let body = upsert_code_only();
+
+        assert!(
+            !body.contains("ensure_key_indexed"),
+            "the upsert path must not write the instance→code index directly; \
+             route through store_contract, which verifies the key against the \
+             code and parameters first (see ContractStore::verify_contract_identity). \
+             If you are seeing this because you MENTIONED the old helper in prose \
+             rather than called it: use a `//` line — only whole-line `//` comments \
+             are stripped, so block comments and string literals still match."
+        );
+
+        // Slice the branch's OWN region — anchor to its `else if`, and stop at the
+        // `} else {` that closes it. Searching from the anchor to the end of the
+        // function would only prove "a store_contract call exists somewhere at or
+        // after this branch", which an unconditional call hoisted out of the
+        // branch satisfies just as well. That is not the property being pinned.
+        const ANCHOR: &str = "} else if let Some(ref contract_code) = code {";
+        let branch_start = body
+            .find(ANCHOR)
+            .expect("the 'code already stored' branch is not where this pin expects it");
+        let after_anchor = branch_start + ANCHOR.len();
+        let branch_end = body[after_anchor..]
+            .find("} else {")
+            .map(|offset| after_anchor + offset)
+            .expect("the already-stored branch must be closed by an else arm");
+        let branch = &body[branch_start..branch_end];
+
+        assert!(
+            branch.contains(".store_contract(contract_code.clone())"),
+            "the already-stored branch must index the new instance by calling \
+             store_contract INSIDE the branch — its fast paths do exactly that \
+             work once the identity is verified"
+        );
+        // Both `store_contract` calls in this body are legitimate: the new-code
+        // branch and this one. A third needs thought, and a call hoisted out of
+        // the branch would push this to three.
+        assert_eq!(
+            body.matches(".store_contract(").count(),
+            2,
+            "expected exactly two store_contract calls in the upsert path: the \
+             new-code branch and the already-stored branch"
+        );
+    }
+
     /// The corrupted-state recovery path (the ONE branch that replaces
     /// existing state without a successful WASM merge) must stay gated on the
     /// LOCAL state failing `validate_state` (#3109). Without that gate, a
@@ -2772,5 +3630,346 @@ mod full_state_version_gate_pins {
              keep-local-when-valid ({keep_local_pos}) < recovery ({recovery_pos}) — \
              recovery may only replace state the contract itself calls invalid"
         );
+    }
+}
+
+/// Source-scrape pins for the conformance capture hook (RFC #5320).
+///
+/// Capture sits on the merge path, which is the hottest path a contract touches.
+/// Two properties keep it safe to run on a live node, and neither is visible from
+/// the capture module's own tests, because both are facts about the CALL SITE:
+///
+/// 1. it observes where the transition actually is, inside `attempt_state_update`;
+/// 2. it never blocks the executor.
+///
+/// A refactor that "tidied" the `observe` call into an `await`, or moved it to a
+/// path that cannot see the base state, would leave every capture-module test green
+/// while making the node liable to stall behind a diagnostic writer. That is the
+/// #4145 / #4466 shape, and `.claude/rules/channel-safety.md` exists because it has
+/// happened repeatedly.
+#[cfg(test)]
+mod conformance_capture_pins {
+    /// Slice `attempt_state_update`'s body, from its signature to the next
+    /// function's. A missing anchor panics rather than silently widening the region
+    /// to the rest of the file, which is how a source pin quietly stops testing
+    /// anything (see the `include_str!` note in
+    /// `.claude/rules/bug-prevention-patterns.md`).
+    fn attempt_state_update_body() -> &'static str {
+        let src = include_str!("executor_impl.rs");
+        let start = src
+            .find("    pub(super) async fn attempt_state_update(")
+            .expect("attempt_state_update not found");
+        let after = &src[start..];
+        let end = after
+            .find("    async fn maybe_probe_idempotency(")
+            .expect("maybe_probe_idempotency no longer follows attempt_state_update");
+        &after[..end]
+    }
+
+    /// Capture must read the transition from the merge path itself. Recording it
+    /// anywhere else means recording something other than what the contract did.
+    #[test]
+    fn capture_observes_from_the_merge_path() {
+        let body = attempt_state_update_body();
+        assert!(
+            body.contains("capture.observe_with("),
+            "conformance capture is no longer invoked from attempt_state_update, so \
+             captured corpora would no longer reflect the merges the node performs"
+        );
+
+        // Bound the field check to the `Observation` literal itself.
+        //
+        // Searching the whole function body was vacuous for `incoming_state`: the
+        // name also appears in the `let (incoming_state, delta) = ...` binding that
+        // computes it, so deleting the FIELD left the assertion green while the
+        // bundle silently lost half the transition. This is the failure mode
+        // `AGENTS.md` warns about for source-scrape pins, and it is why the region
+        // has to be bounded to the thing being pinned rather than to its file.
+        let literal = body
+            .split_once("Observation {")
+            .expect("the capture hook no longer constructs an Observation literal")
+            .1;
+        let literal = literal
+            .split_once("});")
+            .expect("could not find the end of the Observation literal")
+            .0;
+
+        // `related,` included deliberately: without it, a refactor that drops the
+        // field or hardcodes an empty vec reverts related-contract capture entirely
+        // while every pin stays green — the same failure this pin's own history
+        // records for `incoming_state`.
+        for field in [
+            "base_state:",
+            "result_state:",
+            "incoming_state,",
+            "delta,",
+            "related,",
+        ] {
+            assert!(
+                literal.contains(field),
+                "capture no longer records `{field}` from the merge path; a replay \
+                 bundle missing part of the transition cannot reproduce it"
+            );
+        }
+    }
+
+    /// Nothing may be copied before the byte budget is checked.
+    ///
+    /// The sampler side of this is already pinned: `observe_with` provably does not
+    /// invoke its builder once the queue or byte budget is exhausted
+    /// (`a_full_queue_skips_building_the_observation_entirely`). What that test cannot
+    /// see is the CALL SITE. An earlier version of this hook computed the incoming
+    /// state, delta and related payloads BEFORE calling `observe_with`, so the copies
+    /// happened unconditionally whenever capture was enabled — queue full or not —
+    /// while the comment above them claimed the opposite. Moving them back would
+    /// restore that bug with every existing test green, including both pins in this
+    /// module, because the `Observation` literal would be unchanged and the hook would
+    /// still not await.
+    ///
+    /// Related state is the reason this matters more since related-contract capture:
+    /// it can carry another contract's entire state, so the drop path would pay the
+    /// largest copy of the three, on the merge path, under exactly the load that
+    /// causes drops.
+    #[test]
+    fn nothing_is_copied_before_the_budget_check() {
+        let body = attempt_state_update_body();
+        let hook_start = body
+            .find("if let Some(capture) =")
+            .expect("capture hook not found in attempt_state_update");
+        let hook = &body[hook_start..];
+        let (before_budget, inside_closure) = hook
+            .split_once("capture.observe_with(")
+            .expect("the capture hook no longer routes through observe_with");
+
+        for alloc in [".to_vec()", ".to_owned()", ".clone()"] {
+            assert!(
+                !before_budget.contains(alloc),
+                "the capture hook calls `{alloc}` before `observe_with`, so the copy \
+                 happens whether or not a queue slot and byte budget are secured. \
+                 Measure lengths from the slices already held, and do every \
+                 allocation inside the `observe_with` closure, which runs only after \
+                 the budget check"
+            );
+        }
+
+        // Guard against passing vacuously: if the copies were deleted outright rather
+        // than moved, the loop above would also be satisfied. Both spellings count,
+        // so a refactor from one to the other does not fail here claiming the copies
+        // are gone — which is what the first version of this guard did.
+        assert!(
+            inside_closure.contains(".to_vec()") || inside_closure.contains(".to_owned()"),
+            "no copies remain inside the `observe_with` closure, so this pin would \
+             pass for a hook that records nothing at all"
+        );
+    }
+
+    /// The executor must never wait on capture. A slow or stuck writer would
+    /// otherwise stall contract synchronization, which is the one thing this path
+    /// is required never to do.
+    #[test]
+    fn capture_never_awaits_on_the_merge_path() {
+        let body = attempt_state_update_body();
+        let hook_start = body
+            .find("if let Some(capture) =")
+            .expect("capture hook not found in attempt_state_update");
+        let rest = &body[hook_start..];
+        let hook_end = rest
+            .find("\n        }")
+            .expect("capture hook block not delimited as expected");
+        let hook = &rest[..hook_end];
+        assert!(
+            !hook.contains(".await"),
+            "the conformance capture hook awaits on the merge path. It must not: a \
+             slow or stuck writer would then stall contract synchronization. Use \
+             `try_send` and drop on full, per .claude/rules/channel-safety.md"
+        );
+    }
+}
+
+/// Source-scrape pin for the contract-exec WASM counters' PRODUCTION liveness.
+///
+/// The failure this guards against already happened once, and is the whole
+/// reason this instrumentation exists: a counter sat on exactly the right line
+/// for a year and was a no-op in the field, because the only sink it wrote to
+/// (`topology_registry`) keys on a thread-local that `SimNetwork` sets and a
+/// production node never does. The simulation asserted the invariant held, the
+/// field suggested it did not, and the counter that would have adjudicated was
+/// switched off precisely where it mattered.
+///
+/// Two sinks now share the site. A runtime test cannot cover both — the unit
+/// fixtures have no bound listener, so `get_own_addr()` returns `None` and the
+/// simulation sink never fires there — so the ordering invariant is pinned from
+/// source instead: the PRODUCTION record must not be nested inside the
+/// `get_own_addr()` guard, which is exactly the shape that would re-create the
+/// original bug.
+#[cfg(test)]
+mod contract_exec_counter_pins {
+    /// Slice `bridged_summarize_contract_state`'s CODE (its signature to the
+    /// next method's signature), with comment lines removed.
+    ///
+    /// Both bounds matter. The slice stops a needle matching a later occurrence
+    /// elsewhere in the file — including this test module's own assertion
+    /// strings, which `include_str!` also pulls in. Dropping comment lines stops
+    /// a needle matching the PROSE that describes the code: the first draft of
+    /// `summarize_wasm_call_records_both_sinks` failed because `get_own_addr()`
+    /// appears in the block comment above the call as well as in the call, and
+    /// the comment came first. A pin that matches its own explanation is not
+    /// pinning anything.
+    fn summarize_body() -> String {
+        // Cut the test modules off FIRST. Both bounds below are searched for as
+        // literal signatures, and both literals also occur in this helper's own
+        // source, which `include_str!` pulls in. Without this truncation a
+        // rename of the delta method would not panic: `find` would fall through
+        // to the copy of the string on the line just below, silently widening
+        // the region from ~135 lines to everything up to this module — which is
+        // the "expect that can never fire" shape the module doc claims to have
+        // closed, and which `contract_ops.rs::production_source` avoids the
+        // same way.
+        let full = include_str!("executor_impl.rs");
+        let cutoff = full
+            .find("\n#[cfg(test)]\nmod ")
+            .expect("executor_impl.rs must have a top-level #[cfg(test)] mod section");
+        let src = &full[..cutoff];
+        let start = src
+            .find("pub(in crate::contract::executor) async fn bridged_summarize_contract_state(")
+            .expect("bridged_summarize_contract_state not found");
+        let after = &src[start..];
+        let end = after
+            .find("pub(in crate::contract::executor) async fn bridged_get_contract_state_delta(")
+            .expect("next method after bridged_summarize_contract_state not found");
+        after[..end]
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn summarize_wasm_call_records_both_sinks() {
+        let body = summarize_body();
+
+        let production_pos = body
+            .find(".record_summarize_wasm_call();")
+            .expect("the production ContractExecMetrics counter must be recorded here");
+        let own_addr_pos = body
+            .find("if let Some(own_addr) = op_manager.ring.connection_manager.get_own_addr()")
+            .expect("the simulation sink's own-address guard must still be here");
+        let sim_pos = body
+            .find("topology_registry::record_summarize_wasm_call(own_addr)")
+            .expect("the simulation topology_registry sink must still be recorded here");
+
+        assert!(
+            production_pos < own_addr_pos,
+            "the PRODUCTION counter ({production_pos}) must be recorded BEFORE the \
+             get_own_addr() lookup ({own_addr_pos}), i.e. outside its `if let Some` \
+             guard. Nesting it inside would make the production counter conditional \
+             on a lookup that returns None on a node with no bound listener, \
+             recreating the sim-only-counter bug this instrumentation exists to fix."
+        );
+        assert!(
+            own_addr_pos < sim_pos,
+            "the simulation sink ({sim_pos}) still takes its peer address from the \
+             get_own_addr() guard ({own_addr_pos})"
+        );
+    }
+
+    /// The counter must sit on the WASM SLOW path: after both cache-hit early
+    /// returns, and immediately before the `summarize_state` call it describes.
+    /// A counter that drifted above the cache checks would count cache hits as
+    /// WASM work — the exact conflation the handler-entry span already makes,
+    /// and the reason its numbers could not be acted on.
+    #[test]
+    fn summarize_wasm_counter_sits_after_both_cache_hit_returns() {
+        let body = summarize_body();
+
+        let fast_hit_pos = body
+            .find(".record_summarize_fast_hit();")
+            .expect("fast-path cache-hit counter not found");
+        let reload_hit_pos = body
+            .find(".record_summarize_reload_hit();")
+            .expect("reload-path cache-hit counter not found");
+        let wasm_pos = body
+            .find(".record_summarize_wasm_call();")
+            .expect("WASM-call counter not found");
+        let summarize_state_pos = body
+            .find(".summarize_state(&key, &params, &state)")
+            .expect("the WASM summarize_state call not found");
+
+        assert!(
+            fast_hit_pos < reload_hit_pos && reload_hit_pos < wasm_pos,
+            "counter order must follow the path order: fast hit ({fast_hit_pos}) < \
+             reload hit ({reload_hit_pos}) < WASM call ({wasm_pos})"
+        );
+        assert!(
+            wasm_pos < summarize_state_pos,
+            "the WASM counter ({wasm_pos}) must be recorded at the decision, \
+             immediately before the summarize_state call it describes \
+             ({summarize_state_pos})"
+        );
+    }
+
+    /// Production source with the test modules cut off, so no needle below can
+    /// match this module's own assertion strings via `include_str!`.
+    fn production_source() -> String {
+        let src = include_str!("executor_impl.rs");
+        let cutoff = src
+            .find("\n#[cfg(test)]\nmod ")
+            .expect("executor_impl.rs must have a top-level #[cfg(test)] mod section");
+        src[..cutoff]
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Pin: BOTH client-notification fan-out arms must count their uncached
+    /// delta.
+    ///
+    /// The fan-out has two mutually exclusive arms — one for the shared
+    /// notification/summary maps, one for the `else` — and each runs its own
+    /// WASM `get_state_delta`. Only one of them is reachable from any single
+    /// test fixture, so the behavioral test
+    /// `client_notification_fanout_delta_counts_as_uncached` covers exactly one
+    /// and leaves the other free to lose its counter with CI still green.
+    ///
+    /// That is precisely the failure this whole module exists to remove: a
+    /// counter that is a no-op on the path that actually matters, with a
+    /// passing test standing over it. Counting the sites from source covers
+    /// both arms without needing a fixture that can reach each one.
+    #[test]
+    fn both_fanout_delta_arms_count_an_uncached_delta() {
+        let src = production_source();
+        let norm = src.split_whitespace().collect::<Vec<_>>().join(" ");
+
+        let recorders = norm.matches("m.record_delta_wasm_uncached();").count();
+        assert_eq!(
+            recorders, 2,
+            "expected exactly 2 uncached-delta recorders (one per fan-out arm), \
+             found {recorders} — a new arm needs its own recorder, and a removed \
+             one means an arm now runs WASM uncounted"
+        );
+
+        // Each recorder must be the thing immediately before a `get_state_delta`
+        // call, not merely present somewhere in the file. Anchored on the call's
+        // API surface rather than on local variable names, which drift.
+        for (i, tail) in norm
+            .match_indices("m.record_delta_wasm_uncached();")
+            .map(|(pos, _)| &norm[pos..])
+            .enumerate()
+        {
+            let next_delta = tail.find(".get_state_delta(").unwrap_or_else(|| {
+                panic!("recorder {i} is not followed by a get_state_delta call")
+            });
+            let next_recorder = tail[1..]
+                .find("m.record_delta_wasm_uncached();")
+                .map(|p| p + 1)
+                .unwrap_or(usize::MAX);
+            assert!(
+                next_delta < next_recorder,
+                "recorder {i} must bind to its OWN get_state_delta call — another \
+                 recorder ({next_recorder}) intervenes before the next call \
+                 ({next_delta}), so one arm is counting the other arm's work"
+            );
+        }
     }
 }

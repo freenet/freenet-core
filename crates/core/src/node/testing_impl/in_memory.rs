@@ -503,9 +503,13 @@ async fn append_contracts(
         );
         match mode {
             super::SeedMode::Subscribed => {
-                op_manager
-                    .ring
-                    .host_contract(key, state_size, crate::ring::AccessType::Put);
+                op_manager.ring.host_contract(
+                    key,
+                    state_size,
+                    crate::ring::AccessType::Put,
+                    // Harness seed: models the state a relay PUT hop leaves.
+                    crate::ring::HostingCause::TransitPut,
+                );
                 // In the new lease-based model, register an active subscription
                 op_manager.ring.subscribe(key);
                 // OPT-IN (default off): register the contract in the
@@ -543,9 +547,14 @@ async fn append_contracts(
                 // originator gate would NOT serve (its third term was
                 // `is_hosting && has_local_client_access`), forcing a whole GET
                 // through the network for a copy the node already held fresh.
-                op_manager
-                    .ring
-                    .host_contract(key, state_size, crate::ring::AccessType::Get);
+                op_manager.ring.host_contract(
+                    key,
+                    state_size,
+                    crate::ring::AccessType::Get,
+                    // Harness seed: models the every-hop store a RELAY hop
+                    // leaves on a GET return path, matching the AccessType.
+                    crate::ring::HostingCause::TransitGet,
+                );
                 let _ = op_manager.interest_manager.register_local_hosting(&key);
                 // Advertisement is a separate concern from the local serve gate
                 // (which keys on `has_local_interest`, a purely local signal), so

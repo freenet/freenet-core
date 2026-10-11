@@ -46,11 +46,13 @@
 //!
 //! `keep_score`, `eviction_floor`, `predicted_demand` and `record_abandonment`
 //! (the Greedy-Dual + proximity-prior demand estimator, pieces A3/#4650/#4688)
-//! are **retained but no longer drive eviction** — they are kept as the
-//! dashboard/telemetry surface (`predicted_demand` is still trained and
-//! displayed) for telemetry continuity this release, and are scheduled for
-//! deletion in a follow-up once the subscriber-primary policy is field-
-//! validated. Eviction reads NONE of them; it orders by subscriber count and
+//! are **retained but no longer drive eviction**. `predicted_demand` is still
+//! TRAINED, but as of #4830 it is no longer DISPLAYED: the dashboard rendered
+//! it as an eviction ranking it never governed, so it and `keep_score` were
+//! dropped from the dashboard-facing projections. They survive on
+//! `HostedContract` only, driving the `eviction_floor` ratchet, and are
+//! scheduled for deletion in a follow-up once the subscriber-primary policy is
+//! field-validated. Eviction reads NONE of them; it orders by subscriber count and
 //! real GET/PUT recency (see principle 2). `predicted_demand` is still supplied by
 //! the caller (`HostingManager`, which owns the proximity-prior estimator and
 //! the peer's own ring location — see [`super::demand`]) purely so the
@@ -72,6 +74,7 @@ use tokio::time::Instant;
 
 use super::demand::NEUTRAL_DEMAND;
 use crate::ring::interest::PeerKey;
+use crate::tracing::event_kind::{STATE_SIZE_BUCKET_COUNT, state_size_bucket};
 use crate::util::time_source::TimeSource;
 use crate::wasm_runtime::read_total_ram_bytes;
 
@@ -165,6 +168,127 @@ pub(crate) fn budget_for_ram(total_ram: u64) -> u64 {
         MAX_DEFAULT_HOSTING_BUDGET_BYTES,
     )
 }
+
+/// Reports the bytes held for one hosted contract outside the hosting cache
+/// itself (neighbour summaries); see `HostingCache::interest_bytes_provider`.
+pub(crate) type InterestBytesProvider = std::sync::Arc<dyn Fn(&ContractKey) -> u64 + Send + Sync>;
+
+// =============================================================================
+// Resident-overhead budget: the memory a hosted contract holds (#5325, #5647)
+// =============================================================================
+//
+// `budget_bytes` above bounds hosted contract STATE bytes, which live on disk.
+// This second axis bounds the memory hosting holds per contract in RAM, so the
+// hosted set is one memory consumer with its own byte limit, like every other
+// cache (`contract::executor::declared_cache_ceiling`).
+//
+// The figure is COUNTED, not estimated (#5647). It is the bytes the node
+// actually holds to keep each hosted contract current: every neighbour summary
+// the interest manager stores for it (`InterestManager::resident_bytes_for`,
+// read through the provider installed by `HostingManager`) plus a fixed,
+// measured charge per hosted entry ([`HOSTED_ENTRY_BYTES`]). A neighbour's
+// summary is part of the cost of hosting: a host needs it to send that
+// neighbour the right update, so when these bytes exceed the budget the
+// response is to stop hosting whole contracts, never to trim a hosted
+// contract's summaries (hosting-invariants invariant 1).
+//
+// The #5325 design multiplied the contract count by a flat 1 MiB and compared
+// that against a budget derived by subtracting the estimate from measured RSS.
+// Fleet telemetry (#5647, 2026-10-01) showed no stable per-contract cost
+// (within one peer it ranged from -0.5 to +2.8 MiB per contract), and whenever
+// the estimate exceeded the whole process the subtraction removed the node's
+// real usage from the budget. 73% of peers were evicting on that axis at a
+// median 20% of their memory limit.
+//
+// This is composed into the SAME `evict_over_budget` decision as the
+// state-byte budget: not an admission gate, not an OOM valve, not a pin
+// (`.claude/rules/hosting-invariants.md` invariant 3: eviction is ONE
+// demand-ordered decision). The same `victim_order` (subscriber-primary, then
+// GET/PUT recency) picks the victim whichever axis triggered the sweep.
+
+/// Fixed bytes charged per hosted contract, on top of the summary bytes the
+/// interest manager reports for it: 8 KiB, measured.
+///
+/// A hosted contract holds fixed-size entries in about a dozen per-contract
+/// maps besides this cache's own (interest bookkeeping, governance scores,
+/// disk-usage tracking, state generation, propagation stats, delta
+/// compatibility, neighbour hosting). A jemalloc heap profile of a user peer
+/// hosting 508 contracts (#5647, 2026-10-01) put the heap that grows with the
+/// hosted count at about 10 KB per contract, of which about 4 KB was neighbour
+/// summaries (charged separately) and about 6 KB everything else. The same
+/// profile showed jemalloc resident at 1.22 times allocated bytes, so the
+/// fixed part is about 7.3 KB resident, rounded up to 8 KiB.
+///
+/// This charge is what bounds the number of hosted contracts whose state and
+/// summaries are tiny: at the default share of a 2 GiB limit (256 MiB) it
+/// allows 32,768 such contracts, where the pre-#5647 flat 1 MiB estimate
+/// allowed 508.
+pub(crate) const HOSTED_ENTRY_BYTES: u64 = 8 * 1024;
+
+/// Lower clamp for the resident-overhead budget (64 MiB), equal to the
+/// contract module cache's floor (`wasm_runtime::MIN_DEFAULT_MODULE_CACHE_BUDGET_BYTES`)
+/// so the smallest node gets the same minimum for both. A minimum-viability
+/// guarantee, not a resource cap.
+pub const MIN_RESIDENT_OVERHEAD_BUDGET_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Default share of the node's memory (`read_total_ram_bytes`, which honours a
+/// cgroup or systemd `MemoryMax` limit) that hosted contracts may hold in RAM:
+/// 1/8, the same divisor the module cache, the state-byte hosting budget and
+/// the wasmtime compile cache use. Operator-overridable with
+/// `--hosting-mem-share`.
+pub const DEFAULT_RESIDENT_OVERHEAD_MEM_SHARE: f64 = 0.125;
+
+/// Default resident-overhead budget for this host: [`resident_overhead_budget_for`]
+/// applied to the live memory limit and the default share. Construction-time
+/// value only; `super::HostingManager::recompute_resident_overhead_budget`
+/// installs the configured share on the periodic sweep.
+pub fn default_resident_overhead_budget_bytes() -> u64 {
+    resident_overhead_budget_for(
+        total_ram_or_fallback(read_total_ram_bytes()),
+        DEFAULT_RESIDENT_OVERHEAD_MEM_SHARE,
+    )
+}
+
+/// The memory limit the resident budget is sized from: what
+/// `read_total_ram_bytes` reported, or [`FALLBACK_TOTAL_RAM_BYTES`] (1 GiB)
+/// if it could not read anything.
+pub(crate) fn total_ram_or_fallback(read: Option<usize>) -> u64 {
+    read.map(|v| v as u64).unwrap_or(FALLBACK_TOTAL_RAM_BYTES)
+}
+
+/// Resident-overhead budget for a node whose memory limit is `total_ram`:
+/// `mem_share` of it, at least [`MIN_RESIDENT_OVERHEAD_BUDGET_BYTES`].
+///
+/// Sized from the limit alone, like every other RAM-scaled budget, so it does
+/// not move with transient memory pressure (the moving-target concern in #5334
+/// no longer applies). A non-finite or negative share collapses to 0 and the
+/// floor applies; a share above 1 is clamped to 1.
+pub(crate) fn resident_overhead_budget_for(total_ram: u64, mem_share: f64) -> u64 {
+    let mem_share = if mem_share.is_finite() {
+        mem_share.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    ((total_ram as f64 * mem_share) as u64).max(MIN_RESIDENT_OVERHEAD_BUDGET_BYTES)
+}
+
+/// Minimum CONTINUOUS breach duration required before resident-overhead
+/// pressure contributes to the eviction decision (#5325 PR review, Must-Fix
+/// #1): the raw over-budget reading must persist for at least half of this
+/// window (see [`HostingCache::resident_overhead_over_budget`]) — i.e. 150s
+/// at the current value — before eviction acts on it.
+///
+/// Set equal to [`COST_RATE_MIN_WINDOW`] (the #4861 cost-pressure precedent
+/// this mirrors) for a first cut, but declared as its OWN constant rather
+/// than a reference to that one: the two gate different quantities (a
+/// per-contract rate vs. a per-node byte total) and tuning one should not
+/// silently retune the other. The byte total is re-read from the interest
+/// manager on every 60s hosting sweep (see
+/// [`HostingCache::refresh_interest_bytes`]), so a breach must be seen on at
+/// least three consecutive sweeps before it arms: a burst of incoming
+/// summaries that is gone by the next sweep cannot trigger eviction, and a
+/// persistent overage is still addressed within a few minutes.
+pub(crate) const RESIDENT_OVERHEAD_SUSTAINED_WINDOW: Duration = Duration::from_secs(300);
 
 /// Default fraction of the disk capacity *available to Freenet* used to size the
 /// aggregate disk budget (#4683): 50%. Sized against `used + free` (capacity the
@@ -334,32 +458,97 @@ pub(crate) struct HostingCacheStats {
     /// means the floors / share threshold are miscalibrated and churning cheap
     /// contracts.
     pub cost_evictions_total: u64,
+    /// Resident-overhead budget (bytes, #5325/#5647): the memory hosted
+    /// contracts may hold in RAM, `--hosting-mem-share` of the node's memory
+    /// limit. Compare against [`Self::resident_overhead_bytes`] the same way
+    /// [`Self::budget_bytes`] is compared against [`Self::current_bytes`].
+    pub resident_overhead_budget_bytes: u64,
+    /// Bytes hosted contracts currently hold in RAM (#5647): neighbour
+    /// summaries plus a fixed per-entry charge, counted from what is stored,
+    /// as of the last sweep. See [`HostingCache::resident_overhead_bytes`].
+    pub resident_overhead_bytes: u64,
+    /// Monotonic count of evictions where resident-overhead pressure was
+    /// active at decision time (#5325). See
+    /// [`HostingCache::resident_overhead_evictions_total`] for the exact
+    /// semantics (may overlap with [`Self::budget_evictions_total`]).
+    pub resident_overhead_evictions_total: u64,
+    /// Monotonic sum of the resident bytes CHARGED to contracts at the moment
+    /// resident-overhead pressure evicted them (#5647): what the accounting
+    /// stopped counting, not a measurement of memory released. The
+    /// neighbour-record part is freed later, when #5782's reconciliation drops
+    /// the records of a contract that is neither hosted nor in use, and bytes
+    /// that arrived since the last sweep were never charged.
+    pub resident_overhead_evicted_charged_bytes_total: u64,
+    /// Monotonic eviction victims by reason × state-size bucket. Reason order:
+    /// byte-budget zero-demand, byte-budget in-use, cost pressure.
+    pub eviction_victim_counts: [[u64; STATE_SIZE_BUCKET_COUNT]; 3],
+    pub eviction_victim_bytes: [[u64; STATE_SIZE_BUCKET_COUNT]; 3],
+    /// Monotonic count of times this peer BEGAN hosting a contract, attributed
+    /// by [`HostingCause`] (array order is [`HostingCause::ALL`]). Only a
+    /// transition into hosting is counted — a refresh of an already-hosted
+    /// contract is not — because the question these answer is "why is this peer
+    /// hosting this contract", which a refresh does not re-decide. Incremented
+    /// at the two branches that actually insert (see [`HostingCause`]), never
+    /// re-derived from cache sizes. Aggregate, fixed-cardinality: no
+    /// per-contract or per-peer labels.
+    pub hosting_begins: [u64; HostingCause::COUNT],
+    /// Point-in-time distribution of `read_count` across the CURRENTLY hosted
+    /// set (buckets: 0, 1, 2-3, 4-9, 10-99, >=100 — see
+    /// [`READ_COUNT_HIST_UPPER_BOUNDS`]). `read_count` is half the demand signal
+    /// the subscriber-primary eviction ranking is built on, and until now it
+    /// reached only this node's own local HTML dashboard: no `send_event` call
+    /// site touched it, so the fleet-wide shape of the signal the policy depends
+    /// on was unobservable. A gauge, not a counter — do NOT difference it.
+    pub read_count_hist: [u64; READ_COUNT_HIST_BUCKETS],
+    /// Point-in-time distribution of `last_genuine_access` AGE across the
+    /// currently hosted set. Bucket 0 is "within [`COST_RATE_MIN_WINDOW`]" — the
+    /// share of the hosted set that cost-pressure eviction currently treats as
+    /// recently-accessed — then <20 min, <2 h, older, and finally "never
+    /// genuinely accessed" (`None`). The other half of the demand signal, same
+    /// invisibility as [`Self::read_count_hist`]. A gauge, not a counter.
+    pub genuine_access_recency: [u64; GENUINE_ACCESS_RECENCY_BUCKETS],
 }
 
 /// Per-contract Greedy-Dual priority row for the local-peer dashboard.
 ///
-/// This is what actually governs retention today (piece A of the
-/// demand-driven hosting redesign, #4642): the over-budget walk evicts the
-/// lowest `keep_score` first. Surfaced on the dashboard so an operator can
-/// see the live demand-ordered eviction policy — the mechanism that
-/// replaced the dormant MAD governance detector (#4296). Collected under a
+/// A dashboard/telemetry row for one hosted contract. Collected under a
 /// single cache read lock by [`HostingCache::eviction_ordered_scores`].
+///
+/// **`keep_score` and `predicted_demand` do NOT govern retention.** They are
+/// the demoted, telemetry-only Greedy-Dual estimator (see the "Demoted
+/// (telemetry-only) demand machinery" section in this module's docs); eviction
+/// reads neither. Real eviction ordering is [`victim_order`], ascending
+/// `(local_subscription_count, downstream_subscriber_count, recency_seq,
+/// key_bytes)` — of which only `recency_seq` is carried here, because the
+/// subscriber counts are computed transiently during the sweep and the cache
+/// cannot see them. Present the row accordingly: `recency_seq` is the field
+/// that actually explains this row's position.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct HostingContractScore {
     pub key: ContractKey,
-    /// Greedy-Dual priority = `eviction_floor + predicted_demand` at the last
-    /// refresh. Lowest evicts first.
-    pub keep_score: f64,
-    /// Stored per-contract read-demand estimate (reads/second).
-    pub predicted_demand: f64,
+    //
+    // `keep_score` / `predicted_demand` deliberately absent from this
+    // projection. `HostedContract` still carries them — they drive the
+    // Greedy-Dual `eviction_floor` ratchet — but nothing consumed the copies
+    // on this row once the dashboard stopped rendering them as an eviction
+    // ranking they never governed (#4830). Re-add only alongside a consumer
+    // that presents them as telemetry.
+    //
     /// Per-contract memory cost (state bytes).
     pub size_bytes: u64,
     /// Read accesses (GET/SUBSCRIBE) observed over this entry's residency.
     pub read_count: u32,
-    /// Monotonic access sequence at the entry's most recent real GET or PUT
-    /// (genuine client access) — the eviction recency tiebreak (subscriber-
-    /// primary rework, #4642). The cache orders zero-subscriber eviction
-    /// candidates ascending by this. SUBSCRIBE / renewal traffic does NOT bump it.
+    /// The entry's eviction recency clock — a per-run monotonic sequence, and
+    /// the eviction recency tiebreak (subscriber-primary rework, #4642). The
+    /// cache orders zero-subscriber eviction candidates ascending by this.
+    ///
+    /// Set by a real GET or PUT (genuine client access), and ALSO by
+    /// [`HostingCache::record_abandonment`] when the contract loses its last
+    /// subscriber — a deliberate grace period, so a formerly-subscribed
+    /// contract is not evicted on a stale read accrued while it sat in the
+    /// subscription tier. It is therefore NOT a pure last-access time, and the
+    /// dashboard must not label it as one. SUBSCRIBE / renewal traffic does
+    /// NOT bump it.
     pub recency_seq: u64,
 }
 
@@ -379,6 +568,157 @@ pub enum AccessType {
     /// Used in tests and reserved for future use when explicit SUBSCRIBE triggers hosting
     #[cfg_attr(not(test), allow(dead_code))]
     Subscribe,
+}
+
+/// One hosted row, reduced to what the hosting-REASON classifier needs (see
+/// [`HostingCache::for_each_reason_row`] and `HostingManager::hosted_by_reason`).
+///
+/// A struct rather than `&HostedContract` so the age-gated signals are derived
+/// against the cache's own time source, and so the classifier cannot reach a
+/// field it has no business classifying on.
+pub(crate) struct ReasonRow<'a> {
+    pub key: &'a ContractKey,
+    pub size_bytes: u64,
+    /// A local client GET/PUT within `SUBSCRIPTION_LEASE_DURATION` — the same
+    /// age-gated signal the hosting policy consults
+    /// (`has_recent_local_client_access`), NOT the sticky `local_client_access`
+    /// flag, which is set once and never cleared.
+    pub recent_local_client_access: bool,
+    pub abandoned: bool,
+    /// False for an entry reloaded from persisted metadata at startup, i.e.
+    /// exactly the [`HostingCause::StartupRestore`] cohort.
+    pub seeded_this_run: bool,
+    /// Reads observed THIS run. Reset to 0 by a reload, so paired with
+    /// `seeded_this_run` it distinguishes a restored entry nothing has asked
+    /// for yet from one that has since served routed traffic.
+    pub read_count: u32,
+}
+
+/// WHY this peer began hosting a contract — the attribution that
+/// [`AccessType`] is structurally unable to carry.
+///
+/// Answers a DIFFERENT question from `HostingReason` (`ring/hosting.rs`), and
+/// the two are easy to conflate: this one is provenance AT ADMISSION, counted
+/// once at the branch that begins hosting and never revised (exported as
+/// `host_begin`, `router.rs`); `HostingReason` is CURRENT demand, re-derived
+/// from live subscription state on every metrics collection (exported as
+/// `freenet.node.contracts.hosted`). A contract admitted here as `TransitGet`
+/// becomes `HostingReason::LocalClient` the moment a local client subscribes,
+/// while its cause stays `TransitGet` forever.
+///
+/// `AccessType` says only GET-vs-PUT, which cannot separate a contract this
+/// node's OWN client asked for from one that merely transited it on a routed
+/// GET/PUT return path. That distinction is the entire question every hosting
+/// policy decision rests on ("why is this peer hosting this contract"), and
+/// before this enum nothing recorded it: `EventKind` had no hosting variant and
+/// `network_status` had only a `hosted_contracts` gauge.
+///
+/// Counted ONLY at the branch that actually begins hosting — the insert arm of
+/// [`HostingCache::record_access_with_demand`] and the insert in
+/// [`HostingCache::load_persisted_entry_with_demand`] — never re-derived by a
+/// caller from `is_new` or from cache-size arithmetic (the
+/// `.claude/rules/bug-prevention-patterns.md` "metric describing a decision"
+/// rule; three wrong counts in a row came from re-derivation).
+///
+/// Fixed cardinality, no per-contract or per-peer labels: the whole array is
+/// [`COUNT`](Self::COUNT) counters wide, exported as one aggregate row.
+///
+/// NAMING: the two forwarding variants are `Transit*`, NOT `Relay*`.
+/// `.claude/rules/hosting-invariants.md` records that "relay" is a fossil of the
+/// hollow-relay firefight against #3763 and says outright: do not name new code
+/// `relay`. Forwarding a request toward its key is ROUTING, not a persistent
+/// role — which is exactly what these two variants mean.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HostingCause {
+    /// A GET this node itself originated: either its own client's GET
+    /// (`is_client_requester`, stored on the client driver's return path) or a
+    /// node-internal loopback GET, which dispatch routes through the SAME
+    /// forwarding driver with `upstream_addr = own_addr` (see
+    /// `get/op_ctx_task.rs::relay_get_hosting_cause`). Both are this node's own
+    /// demand; neither is transit.
+    ClientGet = 0,
+    /// The GET return-path store on a node that was merely FORWARDING someone
+    /// else's GET — transit, not local demand.
+    TransitGet = 1,
+    /// A sub-operation GET: subscribe-fetch (`operations/subscribe.rs` spawns a
+    /// sub-op GET when it must fetch state before subscribing), related-contract
+    /// auto-fetch, phantom repair. Structurally indistinguishable from a plain
+    /// GET without this attribution, because it travels the same driver.
+    SubOpGet = 2,
+    /// A PUT this node's own client originated (originator loopback).
+    ClientPut = 3,
+    /// The every-hop PUT store on a node forwarding someone else's PUT.
+    TransitPut = 4,
+    /// Restored from the persisted hosting metadata at startup — NOT a fresh
+    /// hosting decision at all. Kept separate so a restart's bulk reload cannot
+    /// masquerade as live demand (the same confound `seeded_this_run` exists to
+    /// keep out of the unread-seed falsifier).
+    StartupRestore = 5,
+    /// No cause was supplied. Reached only by the neutral-demand test wrapper
+    /// [`HostingCache::record_access`]; every production hosting path passes a
+    /// real cause. A NONZERO value in the field therefore means a production
+    /// path began hosting without attribution — read it as a leak detector for
+    /// this enum, not as a real category.
+    Other = 6,
+}
+
+impl HostingCause {
+    /// Every variant, in discriminant order. This is the exported array order
+    /// for `NetworkEfficiencyV1::host_begin`; appending is safe, reordering is
+    /// not (it silently relabels historical series). RENAMING a variant is also
+    /// safe — the wire carries positions, not names. Pinned by
+    /// `hosting_cause_all_is_in_discriminant_order`.
+    pub(crate) const ALL: [HostingCause; 7] = [
+        HostingCause::ClientGet,
+        HostingCause::TransitGet,
+        HostingCause::SubOpGet,
+        HostingCause::ClientPut,
+        HostingCause::TransitPut,
+        HostingCause::StartupRestore,
+        HostingCause::Other,
+    ];
+
+    pub(crate) const COUNT: usize = Self::ALL.len();
+
+    #[inline]
+    pub(crate) const fn index(self) -> usize {
+        self as usize
+    }
+}
+
+/// Upper bounds (inclusive) of the first `READ_COUNT_HIST_BUCKETS - 1` buckets
+/// of the hosted-set `read_count` histogram; the final bucket is the overflow
+/// bin. Log-ish spacing: 0 (never read), 1, 2-3, 4-9, 10-99, >=100.
+pub(crate) const READ_COUNT_HIST_UPPER_BOUNDS: [u32; 5] = [0, 1, 3, 9, 99];
+
+/// Width of the hosted-set `read_count` histogram
+/// (`READ_COUNT_HIST_UPPER_BOUNDS` plus the overflow bin).
+pub(crate) const READ_COUNT_HIST_BUCKETS: usize = READ_COUNT_HIST_UPPER_BOUNDS.len() + 1;
+
+/// Width of the hosted-set `last_genuine_access` recency histogram. Buckets, in
+/// order: within [`COST_RATE_MIN_WINDOW`] (the cost window), <20 min, <2 h,
+/// older, and finally "never genuinely accessed since it was hosted/reloaded"
+/// (`last_genuine_access == None`).
+pub(crate) const GENUINE_ACCESS_RECENCY_BUCKETS: usize = 5;
+
+/// Bucket index for a hosted contract's `read_count`.
+fn read_count_bucket(read_count: u32) -> usize {
+    READ_COUNT_HIST_UPPER_BOUNDS
+        .iter()
+        .position(|bound| read_count <= *bound)
+        .unwrap_or(READ_COUNT_HIST_BUCKETS - 1)
+}
+
+/// Bucket index for a hosted contract's `last_genuine_access` age. `None` (never
+/// genuinely accessed) lands in the final bucket.
+fn genuine_access_recency_bucket(age: Option<Duration>) -> usize {
+    match age {
+        None => GENUINE_ACCESS_RECENCY_BUCKETS - 1,
+        Some(age) if age < COST_RATE_MIN_WINDOW => 0,
+        Some(age) if age < Duration::from_secs(20 * 60) => 1,
+        Some(age) if age < Duration::from_secs(2 * 60 * 60) => 2,
+        Some(_) => 3,
+    }
 }
 
 /// Coarse memory-pressure state handed to the over-budget eviction sweep, which
@@ -534,6 +874,11 @@ pub(crate) struct EvictedContract {
 pub struct HostedContract {
     /// Size of the contract state in bytes
     pub size_bytes: u64,
+    /// Interest bytes (neighbour summaries) charged to this entry at the last
+    /// [`HostingCache::refresh_interest_bytes`], 0 until the first refresh
+    /// after it was hosted (#5647). Evicting the entry subtracts exactly this
+    /// from the cached total, so the total never drifts from what was charged.
+    pub interest_bytes: u64,
     /// Last time this contract was accessed (via GET/PUT/SUBSCRIBE). Used as the
     /// restart-reload recency tiebreak (`finalize_loading`) and to age-gate local-
     /// client renewal; it no longer gates eviction eligibility (the `min_ttl` floor
@@ -733,10 +1078,21 @@ pub struct HostingCache<T: TimeSource> {
     /// that separates still-wanted contracts from stale ones. Measured in
     /// cache-contention units, not wall-clock.
     eviction_floor: f64,
-    /// Monotonic count of contracts evicted because the cache was over budget.
-    /// Only `evict_over_budget` increments it, so it counts budget-triggered
-    /// evictions specifically (not TTL sweeps that found nothing over budget).
-    /// Exposed via [`HostingCache::stats`] for per-node telemetry.
+    /// Monotonic count of contracts evicted because the cache was over
+    /// budget on EITHER axis: the state-byte budget (`current_bytes >
+    /// budget_bytes`) or, since #5325, the counted resident-overhead bytes
+    /// (sustained over `resident_overhead_budget_bytes` — see
+    /// [`HostingCache::resident_overhead_over_budget`]). Only
+    /// `evict_over_budget` increments it, so it counts over-budget-triggered
+    /// evictions specifically (not TTL sweeps that found nothing over
+    /// budget, and not [`Self::evict_cost_pressure`]'s zero-demand cost
+    /// evictions, tracked separately by
+    /// [`Self::cost_evictions_total`]). To isolate the resident-overhead-
+    /// driven subset specifically, see
+    /// [`Self::resident_overhead_evictions_total`] (a subset, not disjoint —
+    /// a single eviction can be counted by both when both axes are over
+    /// budget at once). Exposed via [`HostingCache::stats`] for per-node
+    /// telemetry.
     budget_evictions_total: u64,
     /// Monotonic count of over-budget evictions whose victim had `read_count >= 2`
     /// (genuine repeat demand). The #4338 miscalibration signal — see
@@ -771,6 +1127,54 @@ pub struct HostingCache<T: TimeSource> {
     /// #4861). Only [`Self::evict_cost_pressure`] increments it. See
     /// [`HostingCacheStats::cost_evictions_total`].
     cost_evictions_total: u64,
+    /// Memory budget for what hosted contracts hold in RAM (#5325, #5647):
+    /// the resident-overhead pressure axis, composed into the same
+    /// over-budget decision as `budget_bytes`. Defaults to
+    /// [`default_resident_overhead_budget_bytes`] at construction;
+    /// test-settable via [`Self::set_resident_overhead_budget_bytes`].
+    resident_overhead_budget_bytes: u64,
+    /// Sum of [`Self::interest_bytes_provider`] over the hosted set, as of the
+    /// last [`Self::refresh_interest_bytes`] (each sweep), minus the bytes of
+    /// any contract evicted since. Cached because summing it walks the whole
+    /// hosted set, which is too much for the per-access path.
+    interest_bytes_total: u64,
+    /// Bytes the interest manager holds for one contract (its neighbours'
+    /// summaries plus their entries): `InterestManager::resident_bytes_for`,
+    /// installed by `HostingManager`. `None` until installed (and in unit
+    /// tests that do not install one), which counts as 0.
+    interest_bytes_provider: Option<InterestBytesProvider>,
+    /// Monotonic count of evictions where resident-overhead pressure
+    /// (`resident_overhead_bytes() > resident_overhead_budget_bytes`)
+    /// was active at decision time (#5325). May overlap with
+    /// [`Self::budget_evictions_total`] when both axes are simultaneously over
+    /// budget — this is a diagnostic overlay, not a disjoint reason code. The
+    /// field falsifier for this axis: nonzero on a peer means the memory
+    /// hosted contracts hold, not just state bytes, is shaping retention. See
+    /// [`HostingCacheStats::resident_overhead_evictions_total`].
+    resident_overhead_evictions_total: u64,
+    /// Monotonic sum of the resident bytes charged to contracts evicted while
+    /// resident-overhead pressure was active (#5647): [`HOSTED_ENTRY_BYTES`]
+    /// plus the entry's charged interest bytes, per victim. See
+    /// [`HostingCacheStats::resident_overhead_evicted_charged_bytes_total`].
+    resident_overhead_evicted_charged_bytes_total: u64,
+    /// Wall-clock timestamp of when the resident-overhead bytes FIRST
+    /// crossed [`Self::resident_overhead_budget_bytes`], continuously (#5325
+    /// PR review, Must-Fix #1). `None` whenever the raw reading is at or
+    /// under budget. This is what makes resident-overhead pressure a
+    /// SUSTAINED trigger — mirroring the #4861 cost-pressure precedent
+    /// (`.claude/rules/hosting-invariants.md` invariant 3: "a single burst
+    /// never triggers... sustained across at least half the cost window") —
+    /// rather than a bare instantaneous comparison, so a burst of incoming
+    /// summaries does not shed contracts on the first sweep that sees it. See [`Self::resident_overhead_over_budget`].
+    resident_overhead_breach_since: Option<Instant>,
+    eviction_victim_counts: [[u64; STATE_SIZE_BUCKET_COUNT]; 3],
+    eviction_victim_bytes: [[u64; STATE_SIZE_BUCKET_COUNT]; 3],
+    /// Monotonic hosting-BEGIN counts by [`HostingCause`]. Incremented ONLY by
+    /// the two insert branches (`record_access_with_demand`'s not-cached arm and
+    /// `load_persisted_entry_with_demand`'s insert), so it counts transitions
+    /// into hosting and nothing else. See
+    /// [`HostingCacheStats::hosting_begins`].
+    hosting_begins: [u64; HostingCause::COUNT],
     /// Time source for testability
     time_source: T,
 }
@@ -786,14 +1190,16 @@ pub struct HostingCache<T: TimeSource> {
 /// 1. fewest **local client subscriptions** first — a contract THIS node's own
 ///    client is subscribed to is evicted LAST (Ian's confirmed ordering, #4642);
 /// 2. then fewest **downstream subscribers** (forwarded demand);
-/// 3. then least-recent real **GET** (`recency_seq`, a recency tiebreak — NOT a
-///    primary key; subscription-renewal traffic must not refresh it);
+/// 3. then lowest **eviction recency** (`recency_seq`, a tiebreak — NOT a
+///    primary key). That clock is set by a real GET or PUT, and also by
+///    [`HostingCache::record_abandonment`] at subscription termination;
+///    subscription-renewal traffic must not refresh it;
 /// 4. then contract-key bytes as a final deterministic tiebreak.
 ///
 /// The candidate that sorts FIRST under this order is the one evicted first. A
 /// locally-subscribed contract is ordered LAST but NOT absolutely pinned: in the
 /// extreme where every eligible contract carries a local subscription and the
-/// peer is still over budget, the least-recently-read local one IS the victim
+/// peer is still over budget, the lowest-recency local one IS the victim
 /// (accepted last resort — see [`HostingCache::evict_over_budget`] and
 /// hosting-invariants invariant 3).
 ///
@@ -999,6 +1405,18 @@ pub(crate) fn cost_eviction_candidate(
 
 impl<T: TimeSource> HostingCache<T> {
     /// Create a new hosting cache with the given byte budget.
+    ///
+    /// The resident-overhead budget (#5325) is NOT threaded through this
+    /// constructor's signature — deliberately, to avoid churning every one of
+    /// this type's call sites for a first cut. It is resolved internally from
+    /// live RAM via [`default_resident_overhead_budget_bytes`], the same
+    /// `min(host RAM, cgroup limit)` basis `budget_bytes`'s caller uses for
+    /// the state-byte default. Tests that need a specific (typically tiny)
+    /// resident-overhead budget call [`Self::set_resident_overhead_budget_bytes`]
+    /// after construction, mirroring [`Self::set_budget_for_test`]. An
+    /// operator override (e.g. a future `--max-hosting-resident-overhead`)
+    /// would thread through the same way `--max-hosting-storage` does today —
+    /// left as a follow-up unless field data shows the default needs tuning.
     pub fn new(budget_bytes: u64, time_source: T) -> Self {
         Self {
             budget_bytes,
@@ -1013,8 +1431,30 @@ impl<T: TimeSource> HostingCache<T> {
             oom_valve_evictions_total: 0,
             subscribed_evictions_total: 0,
             cost_evictions_total: 0,
+            resident_overhead_budget_bytes: default_resident_overhead_budget_bytes(),
+            interest_bytes_total: 0,
+            interest_bytes_provider: None,
+            resident_overhead_evictions_total: 0,
+            resident_overhead_evicted_charged_bytes_total: 0,
+            resident_overhead_breach_since: None,
+            eviction_victim_counts: [[0; STATE_SIZE_BUCKET_COUNT]; 3],
+            eviction_victim_bytes: [[0; STATE_SIZE_BUCKET_COUNT]; 3],
+            hosting_begins: [0; HostingCause::COUNT],
             time_source,
         }
+    }
+
+    /// Record that this peer BEGAN hosting a contract, attributed to `cause`.
+    ///
+    /// Deliberately private and deliberately tiny: the only callers are the two
+    /// branches that actually insert into `contracts`. Keeping the increment
+    /// adjacent to the insert (rather than at a caller that inspects
+    /// `is_new`, or that diffs `len()` before/after) is what stops the counter
+    /// from silently absorbing refreshes — the failure mode
+    /// `.claude/rules/bug-prevention-patterns.md` records for decision metrics.
+    #[inline]
+    fn note_hosting_begin(&mut self, cause: HostingCause) {
+        self.hosting_begins[cause.index()] = self.hosting_begins[cause.index()].saturating_add(1);
     }
 
     /// Next monotonic access sequence number, stamped onto an entry on every
@@ -1022,6 +1462,14 @@ impl<T: TimeSource> HostingCache<T> {
     fn next_seq(&mut self) -> u64 {
         self.access_seq = self.access_seq.saturating_add(1);
         self.access_seq
+    }
+
+    fn record_eviction_victim(&mut self, reason: usize, size_bytes: u64) {
+        let bucket = state_size_bucket(size_bytes);
+        self.eviction_victim_counts[reason][bucket] =
+            self.eviction_victim_counts[reason][bucket].saturating_add(1);
+        self.eviction_victim_bytes[reason][bucket] =
+            self.eviction_victim_bytes[reason][bucket].saturating_add(size_bytes);
     }
 
     /// Evict contracts while the cache is over budget, choosing victims
@@ -1085,9 +1533,42 @@ impl<T: TimeSource> HostingCache<T> {
     where
         G: Fn(&ContractKey) -> (usize, usize),
     {
-        if self.current_bytes <= self.budget_bytes {
+        // "Over budget" is true if EITHER the state-byte budget OR the
+        // counted resident-overhead bytes (#5325, #5647) are exceeded — two
+        // independent axes feeding the SAME eviction decision, not two
+        // separate mechanisms. `resident_overhead_over_budget()` is O(1)
+        // (the cached byte total against a stored budget), so this early
+        // return stays cheap on the common in-budget path.
+        if self.current_bytes <= self.budget_bytes && !self.resident_overhead_over_budget() {
             return Vec::new();
         }
+
+        // Visibility for the axis this run actually triggered on (#5325):
+        // the hosting cache previously logged neither its budget nor its
+        // current usage at any level, so an OOM investigation had no signal
+        // to start from short of ad hoc field measurement. Only logged when
+        // eviction actually runs (not on every no-op periodic sweep), so this
+        // does not spam logs during normal in-budget operation.
+        //
+        // `info!`, NOT `debug!` (PR review Must-Fix #2): this crate builds
+        // with `release_max_level_info` (`crates/core/Cargo.toml`), which
+        // statically strips `debug!`/`trace!` out of release binaries
+        // entirely — a `debug!` here would never appear on a deployed node,
+        // silently reopening the exact observability gap #5325 complained
+        // about. Existing precedent for a real, deployed-visible eviction
+        // signal in this file is `warn!` (e.g. the cost-pressure eviction
+        // line below); `info!` is the right level here since this fires once
+        // per SWEEP (not once per evicted contract), so a chronically
+        // over-budget node logs at most once per periodic-sweep cadence
+        // (`CLEANUP_INTERVAL`, currently 5s), not a line per contract.
+        tracing::info!(
+            current_bytes = self.current_bytes,
+            budget_bytes = self.budget_bytes,
+            contract_count = self.contracts.len(),
+            resident_overhead_bytes = self.resident_overhead_bytes(),
+            resident_overhead_budget_bytes = self.resident_overhead_budget_bytes,
+            "hosting cache over budget; running eviction sweep"
+        );
 
         // Collect eviction-eligible entries with their ordering keys, then evict
         // lowest-priority first until back under budget. O(n log n) per
@@ -1150,13 +1631,65 @@ impl<T: TimeSource> HostingCache<T> {
         let now = self.time_source.now();
         let mut evicted = Vec::new();
         for (key, local, downstream, _seq) in candidates {
-            if self.current_bytes <= self.budget_bytes {
-                break; // back under budget, stop evicting
+            // Stop as soon as BOTH axes clear (#5325): a resident-overhead-only
+            // sweep must keep evicting past the point where state bytes alone
+            // would already look fine, and vice versa.
+            if self.current_bytes <= self.budget_bytes && !self.resident_overhead_over_budget() {
+                break; // back under budget on both axes, stop evicting
             }
+            // Captured BEFORE removal: the resident-overhead bytes drop once
+            // this victim is removed, so whether resident pressure was the
+            // reason THIS victim was shed must be read against the
+            // pre-removal total. Same reasoning for the state-byte axis,
+            // captured alongside for the per-victim log line below.
+            let resident_pressure_active = self.resident_overhead_over_budget();
+            let state_byte_pressure_active = self.current_bytes > self.budget_bytes;
             if let Some(entry) = self.contracts.remove(&key) {
                 let was_in_use = local + downstream > 0;
                 self.current_bytes = self.current_bytes.saturating_sub(entry.size_bytes);
+                self.interest_bytes_total = self
+                    .interest_bytes_total
+                    .saturating_sub(entry.interest_bytes);
                 self.budget_evictions_total = self.budget_evictions_total.saturating_add(1);
+                if resident_pressure_active {
+                    self.resident_overhead_evictions_total =
+                        self.resident_overhead_evictions_total.saturating_add(1);
+                    self.resident_overhead_evicted_charged_bytes_total = self
+                        .resident_overhead_evicted_charged_bytes_total
+                        .saturating_add(HOSTED_ENTRY_BYTES.saturating_add(entry.interest_bytes));
+                    // Per-eviction observability for the resident-overhead axis
+                    // specifically (#5325 PR review — Ian's soak-test concern):
+                    // Must-Fix #1 controls HOW FAST evictions happen; this line
+                    // is what lets a human watching the upcoming soak tests
+                    // (nova try.freenet.org + framework) judge WHETHER they were
+                    // the right contracts — spot-check that this axis is
+                    // shedding zero/low-demand contracts, not ones other peers
+                    // or users still depend on. The existing subscriber-primary
+                    // `victim_order` is what actually protects demanded
+                    // contracts; this line is purely so that protection is
+                    // externally verifiable, not just trusted. `info!`, not
+                    // `debug!` — same `release_max_level_info` release-strip
+                    // trap as Must-Fix #2 (see the sweep-entry log above).
+                    let last_genuine_access_secs_ago = entry
+                        .last_genuine_access
+                        .map(|at| now.saturating_duration_since(at).as_secs());
+                    tracing::info!(
+                        contract = %key,
+                        local_subscriptions = local,
+                        downstream_subscribers = downstream,
+                        read_count = entry.read_count,
+                        last_genuine_access_secs_ago,
+                        state_bytes = entry.size_bytes,
+                        interest_bytes = entry.interest_bytes,
+                        state_byte_pressure_also_active = state_byte_pressure_active,
+                        "resident-overhead pressure evicted a contract (#5325) — \
+                         local_subscriptions/downstream_subscribers should be 0 \
+                         and last_genuine_access_secs_ago should be large (or \
+                         absent = never accessed this run) for this to be a \
+                         correct, low-demand victim"
+                    );
+                }
+                self.record_eviction_victim(usize::from(was_in_use), entry.size_bytes);
                 // Field falsifier for the single riskiest new behavior: shedding a
                 // subscribed contract. Counted by the captured subscriber split
                 // (not by pressure), so it covers the normal AtCapacity last-resort
@@ -1224,7 +1757,7 @@ impl<T: TimeSource> HostingCache<T> {
         // backstop. Not a `debug_assert!`: the "contract larger than budget" corner
         // is legitimate (the old `min_ttl` age-0 gate left the same state silently),
         // so we surface it as a warning rather than panicking debug builds.
-        if self.current_bytes > self.budget_bytes {
+        if self.current_bytes > self.budget_bytes || self.resident_overhead_over_budget() {
             if let Some(protected_key) = protected {
                 if matches!(pressure, MemoryPressure::AtCapacity)
                     && self.contracts.contains_key(protected_key)
@@ -1233,7 +1766,9 @@ impl<T: TimeSource> HostingCache<T> {
                         contract = %protected_key,
                         current_bytes = self.current_bytes,
                         budget_bytes = self.budget_bytes,
-                        over_by = self.current_bytes - self.budget_bytes,
+                        resident_overhead_bytes = self.resident_overhead_bytes(),
+                        resident_overhead_budget_bytes = self.resident_overhead_budget_bytes,
+                        over_by = self.current_bytes.saturating_sub(self.budget_bytes),
                         "op-scoped backstop kept an in-flight contract while still over \
                          budget (pathological — a genuine RAM-overflow signal would pierce \
                          this via Overflow)",
@@ -1283,8 +1818,11 @@ impl<T: TimeSource> HostingCache<T> {
     /// then-current generation at deletion time.
     // Neutral-demand convenience wrapper. Production always goes through
     // `record_access_with_demand` (the `HostingManager` supplies the
-    // proximity-prior estimate), so in a non-test build this wrapper is unused;
-    // it is retained for callers/tests that have no demand estimate.
+    // proximity-prior estimate AND the real `HostingCause`), so in a non-test
+    // build this wrapper is unused; it is retained for callers/tests that have
+    // no demand estimate. Hosting begins through it are attributed
+    // `HostingCause::Other` — see that variant's doc: a nonzero `Other` in the
+    // field means a production path lost its attribution.
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn record_access<G>(
         &mut self,
@@ -1308,6 +1846,7 @@ impl<T: TimeSource> HostingCache<T> {
             access_type,
             write_generation,
             NEUTRAL_DEMAND,
+            HostingCause::Other,
             subscriber_counts,
         )
     }
@@ -1332,6 +1871,17 @@ impl<T: TimeSource> HostingCache<T> {
     ///   generation, the stored `predicted_demand`, AND `recency_seq` (a PUT is
     ///   genuine client access — invariant 3, decision 2026-07-08), but no read
     ///   count and no `keep_score` refresh (a PUT is a write, not a read).
+    ///
+    /// `cause` is the hosting ATTRIBUTION (see [`HostingCause`]) and is consumed
+    /// on the not-cached branch only, where it counts a hosting BEGIN. It has no
+    /// effect on eviction, retention, or any returned value: this is
+    /// observability, never policy.
+    // 8 parameters: this is the single hosting-record chokepoint, and each
+    // argument is an independent input the cache cannot derive (identity, size,
+    // access kind, write generation, demand prior, attribution, subscriber
+    // lookup). Bundling them into a struct would only move the same fields
+    // behind one more name at every call site.
+    #[allow(clippy::too_many_arguments)]
     pub fn record_access_with_demand<G>(
         &mut self,
         key: ContractKey,
@@ -1339,6 +1889,7 @@ impl<T: TimeSource> HostingCache<T> {
         access_type: AccessType,
         write_generation: u64,
         predicted_demand: f64,
+        cause: HostingCause,
         subscriber_counts: G,
     ) -> RecordAccessResult
     where
@@ -1413,6 +1964,7 @@ impl<T: TimeSource> HostingCache<T> {
             // that replaces the old `min_ttl` age-0 guarantee.
             let contract = HostedContract {
                 size_bytes,
+                interest_bytes: 0,
                 last_accessed: now,
                 last_access_seq: seq,
                 // A real GET or PUT (genuine client access) seeds the eviction
@@ -1436,6 +1988,12 @@ impl<T: TimeSource> HostingCache<T> {
             };
             self.contracts.insert(key, contract);
             self.current_bytes = self.current_bytes.saturating_add(size_bytes);
+            // THIS is the branch that begins hosting — the same branch that sets
+            // `is_new = true` below. Counting here rather than at a caller is the
+            // point: a caller-side increment would have to re-test `is_new`, and
+            // the recurring regression is exactly that the re-test drifts (or is
+            // dropped) and the counter starts including refreshes.
+            self.note_hosting_begin(cause);
 
             // A fresh insert always evicts under AtCapacity: an insert never
             // constitutes genuine RAM overflow, so it must not pierce the op-scoped
@@ -1658,8 +2216,8 @@ impl<T: TimeSource> HostingCache<T> {
     /// Update the cached `write_generation` snapshot for `key` to `new_gen`.
     ///
     /// Called paired with `HostingManager::bump_state_generation` from
-    /// every state-write chokepoint (executor PUT/UPDATE and V2 delegate
-    /// PUT/UPDATE). Without this refresh, an UPDATE (or re-PUT) to an
+    /// every state-write chokepoint (the executor's PUT/UPDATE paths).
+    /// Without this refresh, an UPDATE (or re-PUT) to an
     /// already-hosted contract would leave the cached snapshot stuck at
     /// its `record_access`-time value while the `state_generation` counter
     /// kept advancing; a later eviction would carry the stale snapshot,
@@ -1736,40 +2294,221 @@ impl<T: TimeSource> HostingCache<T> {
         self.budget_bytes = budget_bytes;
     }
 
+    /// Get the resident-overhead budget in bytes (#5325).
+    #[allow(dead_code)] // Public API for introspection
+    pub fn resident_overhead_budget_bytes(&self) -> u64 {
+        self.resident_overhead_budget_bytes
+    }
+
+    /// Overwrite the resident-overhead budget (#5325). Mirrors
+    /// [`Self::set_budget_bytes`]: O(1), does not itself evict — the next
+    /// `evict_over_budget` (on sweep or cache insert) enforces the new value.
+    /// The production default (installed at construction) is
+    /// [`default_resident_overhead_budget_bytes`]; this setter exists for
+    /// tests that need a small, deterministic value instead of whatever the
+    /// test host's live RAM resolves to, and for a future operator override.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn set_resident_overhead_budget_bytes(&mut self, budget_bytes: u64) {
+        self.resident_overhead_budget_bytes = budget_bytes;
+    }
+
+    /// Bytes hosted contracts hold in RAM (#5647): a fixed
+    /// [`HOSTED_ENTRY_BYTES`] per hosted entry plus the neighbour-summary bytes
+    /// the interest manager reports for them, as of the last
+    /// [`Self::refresh_interest_bytes`]. Counted from what is stored, not
+    /// estimated; see the section comment above [`HOSTED_ENTRY_BYTES`].
+    pub(crate) fn resident_overhead_bytes(&self) -> u64 {
+        (self.contracts.len() as u64)
+            .saturating_mul(HOSTED_ENTRY_BYTES)
+            .saturating_add(self.interest_bytes_total)
+    }
+
+    /// Install the per-contract interest-bytes reader (#5647). Called once by
+    /// `HostingManager` when the interest manager becomes reachable.
+    pub(crate) fn set_interest_bytes_provider(&mut self, provider: InterestBytesProvider) {
+        self.interest_bytes_provider = Some(provider);
+    }
+
+    /// Re-read every hosted entry's interest bytes from the provider and
+    /// re-sum [`Self::interest_bytes_total`] (#5647). Run at the start of every
+    /// hosting sweep (60s), so summaries that arrive between sweeps are charged
+    /// within one interval, and a newly hosted contract counts only its
+    /// [`HOSTED_ENTRY_BYTES`] until then. O(hosted contracts x their neighbour
+    /// records) map reads under the hosting-cache write lock: about 1 to 5 ms
+    /// at 5k contracts, acceptable once a minute, too much for the access path.
+    ///
+    /// Lock order: the provider takes `InterestManager::interested_peers` read
+    /// guards while this cache's write lock is held. That is safe because the
+    /// interest manager never calls into the hosting manager, so no path takes
+    /// the two in the opposite order. A provider that did call back into
+    /// hosting would deadlock here.
+    pub(crate) fn refresh_interest_bytes(&mut self) {
+        let mut total = 0u64;
+        for (key, entry) in self.contracts.iter_mut() {
+            entry.interest_bytes = self.interest_bytes_provider.as_ref().map_or(0, |f| f(key));
+            total = total.saturating_add(entry.interest_bytes);
+        }
+        self.interest_bytes_total = total;
+    }
+
+    /// Raw, instantaneous "are the resident-overhead bytes over their budget
+    /// right now" reading (#5325) — no debounce. Used only to drive the
+    /// SUSTAINED gate below and to report point-in-time state (the dashboard
+    /// tile, tripwire logging); never used directly to decide whether to
+    /// evict — see [`Self::resident_overhead_over_budget`].
+    fn resident_overhead_raw_over_budget(&self) -> bool {
+        self.resident_overhead_bytes() > self.resident_overhead_budget_bytes
+    }
+
+    /// Whether resident-overhead pressure is SUSTAINED enough to act as an
+    /// eviction trigger (#5325 PR review, Must-Fix #1) — the second half of
+    /// `evict_over_budget`'s "am I over budget" predicate, alongside
+    /// `current_bytes > budget_bytes`.
+    ///
+    /// Mirrors the #4861 cost-pressure precedent
+    /// (`.claude/rules/hosting-invariants.md` invariant 3: "SUSTAINED
+    /// pressure... a single burst never triggers... continuously for at
+    /// least half the cost window") applied to a per-NODE scalar (the
+    /// resident-overhead bytes) rather than a per-contract rate: the raw
+    /// reading must stay continuously over budget for at least
+    /// [`RESIDENT_OVERHEAD_SUSTAINED_WINDOW`]`/2` before this axis
+    /// contributes eviction pressure. `resident_overhead_breach_since`
+    /// records when the CURRENT continuous breach started; it resets to
+    /// `None` the instant the raw reading dips back to or under budget
+    /// (an eviction bringing the bytes back down "cures" the breach, exactly
+    /// like the raw check would).
+    ///
+    /// This is a per-node scalar debounce, not a per-contract rate sample
+    /// like the cost axes'. The byte total is sampled: it is re-read from the
+    /// interest manager once per sweep, and neighbours' summaries can arrive
+    /// in bursts (a reconnect, an InterestSync round). The debounce stops one
+    /// such burst from shedding contracts, and gives a peer upgrading into a
+    /// large hosted set a grace window before this axis evicts anything.
+    ///
+    /// `&mut self`: every call site is already inside `evict_over_budget`
+    /// (`&mut self`), so recording the breach timer here — rather than as a
+    /// separate "observe" step some caller could forget — keeps the state
+    /// machine's only writer next to its only reader.
+    fn resident_overhead_over_budget(&mut self) -> bool {
+        let raw = self.resident_overhead_raw_over_budget();
+        if !raw {
+            self.resident_overhead_breach_since = None;
+            return false;
+        }
+        let now = self.time_source.now();
+        let since = *self.resident_overhead_breach_since.get_or_insert(now);
+        now.saturating_duration_since(since) >= RESIDENT_OVERHEAD_SUSTAINED_WINDOW / 2
+    }
+
     /// Snapshot the cache's aggregate resource gauges under a single read for
     /// per-node telemetry. See [`HostingCacheStats`].
     pub fn stats(&self) -> HostingCacheStats {
+        // Demand-signal gauges (`read_count` / `last_genuine_access`): bucketed
+        // here, under the same read that produces the resource gauges, so the
+        // exported shape can never disagree with the hosted set it describes.
+        // Aggregate only — the per-contract identities never leave this loop.
+        let now = self.time_source.now();
+        let mut read_count_hist = [0_u64; READ_COUNT_HIST_BUCKETS];
+        let mut genuine_access_recency = [0_u64; GENUINE_ACCESS_RECENCY_BUCKETS];
+        for entry in self.contracts.values() {
+            let read_bucket = read_count_bucket(entry.read_count);
+            read_count_hist[read_bucket] = read_count_hist[read_bucket].saturating_add(1);
+            let recency_bucket = genuine_access_recency_bucket(
+                entry
+                    .last_genuine_access
+                    .map(|at| now.saturating_duration_since(at)),
+            );
+            genuine_access_recency[recency_bucket] =
+                genuine_access_recency[recency_bucket].saturating_add(1);
+        }
         HostingCacheStats {
+            hosting_begins: self.hosting_begins,
+            read_count_hist,
+            genuine_access_recency,
             budget_bytes: self.budget_bytes,
             current_bytes: self.current_bytes,
             contract_count: self.contracts.len() as u64,
             budget_evictions_total: self.budget_evictions_total,
             subscribed_evictions_total: self.subscribed_evictions_total,
             cost_evictions_total: self.cost_evictions_total,
+            eviction_victim_counts: self.eviction_victim_counts,
+            eviction_victim_bytes: self.eviction_victim_bytes,
             evictions_of_recently_read_total: self.evictions_of_recently_read_total,
             evicted_unread_total: self.evicted_unread_total,
             evicted_unread_age_secs_sum: self.evicted_unread_age_secs_sum,
             oom_valve_evictions_total: self.oom_valve_evictions_total,
+            resident_overhead_budget_bytes: self.resident_overhead_budget_bytes,
+            resident_overhead_bytes: self.resident_overhead_bytes(),
+            resident_overhead_evictions_total: self.resident_overhead_evictions_total,
+            resident_overhead_evicted_charged_bytes_total: self
+                .resident_overhead_evicted_charged_bytes_total,
+        }
+    }
+
+    /// Current hosted rows for fixed-cardinality cost-eviction eligibility
+    /// telemetry. Contract identities stay local and are aggregated by the
+    /// hosting manager before export.
+    pub(crate) fn for_each_cost_eligibility_row(
+        &self,
+        mut visit: impl FnMut(&ContractKey, u64, bool),
+    ) {
+        let now = self.time_source.now();
+        for (key, entry) in &self.contracts {
+            let recently_accessed = entry
+                .last_genuine_access
+                .is_some_and(|at| now.saturating_duration_since(at) < COST_RATE_MIN_WINDOW)
+                || entry.local_client_last_access.is_some_and(|at| {
+                    now.saturating_duration_since(at) < super::SUBSCRIPTION_LEASE_DURATION
+                });
+            visit(key, entry.size_bytes, recently_accessed);
+        }
+    }
+
+    /// Current hosted rows for the fixed-cardinality hosting-REASON telemetry
+    /// (`HostingManager::hosted_by_reason`). Same contract-identity discipline
+    /// as [`Self::for_each_cost_eligibility_row`]: keys are visible to the
+    /// manager's classifier (which needs them to look up subscription state)
+    /// but are aggregated away before anything is exported.
+    ///
+    /// The age gate on local client access is applied HERE rather than in the
+    /// classifier, for the same reason `for_each_cost_eligibility_row` derives
+    /// `recently_accessed` here: the time source lives on the cache, and a
+    /// classifier reading the raw sticky flag would disagree with the hosting
+    /// policy (see [`ReasonRow::recent_local_client_access`]).
+    pub(crate) fn for_each_reason_row(&self, mut visit: impl FnMut(ReasonRow<'_>)) {
+        let now = self.time_source.now();
+        for (key, entry) in &self.contracts {
+            visit(ReasonRow {
+                key,
+                size_bytes: entry.size_bytes,
+                recent_local_client_access: entry.local_client_last_access.is_some_and(|at| {
+                    now.saturating_duration_since(at) < super::SUBSCRIPTION_LEASE_DURATION
+                }),
+                abandoned: entry.abandoned_at.is_some(),
+                seeded_this_run: entry.seeded_this_run,
+                read_count: entry.read_count,
+            });
         }
     }
 
     /// Per-contract rows for the local dashboard, in the cache-side EVICTION
-    /// order: ascending `(recency_seq, key)` — least-recent real GET/PUT first, the
-    /// same order [`Self::keys_eviction_order`] uses. This reflects the order
+    /// order: ascending `(recency_seq, key)` — least-recent eviction-recency
+    /// first, the same order [`Self::keys_eviction_order`] uses. (That clock is
+    /// set by a real GET/PUT *and* by subscription termination, so it is not a
+    /// pure last-read time — see [`HostingContractScore::recency_seq`].) This reflects the order
     /// among the ZERO-subscriber candidate set the over-budget sweep would evict
     /// under `AtCapacity` (the production pressure); the subscriber-count pin is
     /// applied by the manager via `is_eviction_eligible`, so the front of the
-    /// vec is the next zero-subscriber victim under budget pressure. The rows
-    /// still carry the demoted telemetry score fields (`keep_score`,
-    /// `predicted_demand`) the dashboard renders.
+    /// vec is the next zero-subscriber victim under budget pressure.
+    ///
+    /// Rows carry `size_bytes`, `read_count` and `recency_seq` only — the
+    /// demoted telemetry scores are deliberately not projected here.
     pub(crate) fn eviction_ordered_scores(&self) -> Vec<HostingContractScore> {
         let mut rows: Vec<HostingContractScore> = self
             .contracts
             .iter()
             .map(|(k, v)| HostingContractScore {
                 key: *k,
-                keep_score: v.keep_score,
-                predicted_demand: v.predicted_demand,
                 size_bytes: v.size_bytes,
                 read_count: v.read_count,
                 recency_seq: v.recency_seq,
@@ -1817,8 +2556,11 @@ impl<T: TimeSource> HostingCache<T> {
     /// Sweep for evictable contracts when the cache is over budget, at a given
     /// [`MemoryPressure`].
     ///
-    /// Only evicts when `current_bytes > budget_bytes`. Victims are chosen
-    /// subscriber-primary — ascending
+    /// Only evicts when `current_bytes > budget_bytes` OR the counted
+    /// resident-overhead bytes have been SUSTAINED over their own budget
+    /// (#5325 — see [`HostingCache::resident_overhead_over_budget`]); the two
+    /// axes feed the SAME decision, not two separate mechanisms. Victims are
+    /// chosen subscriber-primary — ascending
     /// `(local_subscription_count, downstream_subscriber_count, recency_seq, key)` —
     /// with eligibility governed by `pressure`:
     /// - [`MemoryPressure::AtCapacity`] (production): every entry is eligible (no
@@ -1852,6 +2594,9 @@ impl<T: TimeSource> HostingCache<T> {
         // `evict_over_budget`: it returns early when under budget, then evicts
         // subscriber-primary (fewest local, then fewest downstream, then
         // least-recent real GET/PUT). No `protected` key on the periodic sweep.
+        // Re-sum the interest bytes first so summaries that arrived since the
+        // last sweep are charged (#5647).
+        self.refresh_interest_bytes();
         self.evict_over_budget(&subscriber_counts, pressure, None)
     }
 
@@ -1968,7 +2713,11 @@ impl<T: TimeSource> HostingCache<T> {
             for (key, rate) in offenders {
                 if let Some(entry) = self.contracts.remove(&key) {
                     self.current_bytes = self.current_bytes.saturating_sub(entry.size_bytes);
+                    self.interest_bytes_total = self
+                        .interest_bytes_total
+                        .saturating_sub(entry.interest_bytes);
                     self.cost_evictions_total = self.cost_evictions_total.saturating_add(1);
+                    self.record_eviction_victim(2, entry.size_bytes);
                     // Operator-facing: this is the storm diagnosis surfacing in
                     // the field. read_count is logged (not gated on) so the
                     // field can tell whether cost eviction is hitting contracts
@@ -2046,6 +2795,7 @@ impl<T: TimeSource> HostingCache<T> {
 
         let contract = HostedContract {
             size_bytes,
+            interest_bytes: 0,
             last_accessed,
             // Assigned a proper order by `finalize_loading` once all entries are
             // loaded (sorted by persisted recency). Temporary 0 until then.
@@ -2120,6 +2870,12 @@ impl<T: TimeSource> HostingCache<T> {
 
         self.contracts.insert(key, contract);
         self.current_bytes = self.current_bytes.saturating_add(size_bytes);
+        // Counted HERE, past the `contains_key` early-return above, so a
+        // duplicate load is not counted as a second begin. The four
+        // `HostingManager` call sites cannot make that distinction — the
+        // early-return is invisible to them — which is precisely why the
+        // increment does not live there.
+        self.note_hosting_begin(HostingCause::StartupRestore);
     }
 
     /// Neutral-demand convenience wrapper over
@@ -2197,6 +2953,346 @@ mod tests {
         let time_source = SharedMockTimeSource::new();
         let cache = HostingCache::new(budget, time_source.clone());
         (cache, time_source)
+    }
+
+    /// Hosting-begin count for one cause, read through the exported stats.
+    fn begins(cache: &HostingCache<SharedMockTimeSource>, cause: HostingCause) -> u64 {
+        cache.stats().hosting_begins[cause.index()]
+    }
+
+    /// This file's source with the test module cut off, so a source pin cannot
+    /// match its own needle in a test's string literal.
+    fn production_source() -> &'static str {
+        const FULL: &str = include_str!("cache.rs");
+        // Anchor on the module header, NOT a bare `#[cfg(test)]`: several
+        // test-only methods inside the production `impl` carry that attribute,
+        // and cutting at the first one would hide most of the file from every
+        // pin below (silently, while still passing).
+        let cutoff = FULL
+            .find("\n#[cfg(test)]\nmod tests {")
+            .expect("file must end with a `#[cfg(test)] mod tests` block");
+        &FULL[..cutoff]
+    }
+
+    /// `HostingCause::ALL` is the EXPORT ORDER of `NetworkEfficiencyV1::host_begin`
+    /// and `index()` is the discriminant used to address the counter array. If
+    /// they ever disagree, every historical series is silently relabelled: the
+    /// dashboards keep drawing, the numbers stay plausible, and "client GET" now
+    /// means something else.
+    ///
+    /// Nothing else checks this — `ALL` is hand-written next to the discriminants,
+    /// which is exactly the kind of hand-maintained parallel list that drifts when
+    /// a variant is inserted rather than appended.
+    #[test]
+    fn hosting_cause_all_is_in_discriminant_order() {
+        for (i, cause) in HostingCause::ALL.iter().enumerate() {
+            assert_eq!(
+                cause.index(),
+                i,
+                "HostingCause::ALL[{i}] is {cause:?}, whose discriminant is {}. \
+                 ALL must stay in discriminant order: it is the exported row \
+                 order, so a mismatch relabels historical telemetry series \
+                 rather than failing loudly.",
+                cause.index(),
+            );
+        }
+        assert_eq!(
+            HostingCause::COUNT,
+            HostingCause::ALL.len(),
+            "COUNT is the counter-array width and must equal ALL's length"
+        );
+    }
+
+    /// Exactly two branches insert into `contracts`, and each one attributes the
+    /// hosting begin it just made.
+    ///
+    /// The counter's whole design is that it is incremented AT the branch that
+    /// decides, never re-derived by a caller (`.claude/rules/bug-prevention-patterns.md`).
+    /// That only holds while the set of deciding branches is the set that counts:
+    /// a third insert added later would begin hosting without attribution, and the
+    /// symptom is a counter that is quietly LOW while still rising — the failure
+    /// mode that terminates investigation rather than starting one.
+    #[test]
+    fn every_hosting_insert_site_records_its_cause() {
+        let src = production_source();
+        let sites: Vec<usize> = src
+            .match_indices("self.contracts.insert(")
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(
+            sites.len(),
+            2,
+            "expected exactly two `self.contracts.insert(` sites (the \
+             record_access_with_demand insert arm and the \
+             load_persisted_entry_with_demand insert); found {}. A new insert \
+             begins hosting, so it must also call note_hosting_begin — update \
+             this pin deliberately once it does.",
+            sites.len(),
+        );
+        for (idx, site) in sites.into_iter().enumerate() {
+            let window = &src[site..(site + 900).min(src.len())];
+            assert!(
+                window.contains("self.note_hosting_begin("),
+                "insert site #{idx} must be followed by a \
+                 `self.note_hosting_begin(..)` call attributing the hosting \
+                 begin it just made. Window: {window}"
+            );
+        }
+    }
+
+    /// The counter must fire ONLY on the transition into hosting, and must land
+    /// in the row the caller named.
+    ///
+    /// # Why the refresh half is the load-bearing half
+    ///
+    /// The regression this guards is not "the counter is missing" (loud, and any
+    /// smoke test finds it) but "the counter is wired to a site that also fires
+    /// on refresh" — which yields a plausible, monotonically-rising, WRONG
+    /// number. A hot contract re-PUT every few seconds would dominate
+    /// `hosting_begins` while beginning hosting exactly once, and the answer to
+    /// "why is this peer hosting this contract" would silently become "how often
+    /// is it written". So the second access below is not a nicety: an assertion
+    /// that only checks the first access passes under precisely the mutation
+    /// that matters.
+    ///
+    /// Mutations verified to FAIL this test:
+    /// 1. delete the `note_hosting_begin(cause)` call in the insert branch;
+    /// 2. move it above the `if let Some(existing)` so it also counts refreshes
+    ///    (caught by the `== 1` after the repeat access, not by the first);
+    /// 3. attribute a constant cause instead of the caller's.
+    #[test]
+    fn hosting_begin_counts_the_insert_only_and_by_cause() {
+        let (mut cache, _) = make_cache(10_000);
+        let relayed = make_key(1);
+        let client = make_key(2);
+
+        cache.record_access_with_demand(
+            relayed,
+            100,
+            AccessType::Put,
+            0,
+            NEUTRAL_DEMAND,
+            HostingCause::TransitPut,
+            |_| (0, 0),
+        );
+        assert_eq!(begins(&cache, HostingCause::TransitPut), 1);
+
+        // Same contract again: a REFRESH, not a new hosting decision. The whole
+        // point of the counter is that this does not move it.
+        cache.record_access_with_demand(
+            relayed,
+            100,
+            AccessType::Put,
+            0,
+            NEUTRAL_DEMAND,
+            HostingCause::TransitPut,
+            |_| (0, 0),
+        );
+        // ... and again through a DIFFERENT cause, which must not open a second
+        // row for a contract that is already hosted.
+        cache.record_access_with_demand(
+            relayed,
+            100,
+            AccessType::Get,
+            0,
+            NEUTRAL_DEMAND,
+            HostingCause::ClientGet,
+            |_| (0, 0),
+        );
+        assert_eq!(
+            begins(&cache, HostingCause::TransitPut),
+            1,
+            "a refresh of an already-hosted contract is not a hosting BEGIN — if \
+             this reads 2, the increment fires on the refresh path too and the \
+             counter is measuring write frequency, not hosting decisions"
+        );
+        assert_eq!(
+            begins(&cache, HostingCause::ClientGet),
+            0,
+            "a refresh must not open a row for its cause either"
+        );
+
+        // A genuinely new contract, attributed to the cause its caller named.
+        cache.record_access_with_demand(
+            client,
+            100,
+            AccessType::Get,
+            0,
+            NEUTRAL_DEMAND,
+            HostingCause::ClientGet,
+            |_| (0, 0),
+        );
+        assert_eq!(begins(&cache, HostingCause::ClientGet), 1);
+        assert_eq!(begins(&cache, HostingCause::TransitPut), 1);
+
+        // Nothing leaked into the rows nobody named.
+        for cause in [
+            HostingCause::TransitGet,
+            HostingCause::SubOpGet,
+            HostingCause::ClientPut,
+            HostingCause::StartupRestore,
+            HostingCause::Other,
+        ] {
+            assert_eq!(begins(&cache, cause), 0, "unexpected count in {cause:?}");
+        }
+    }
+
+    /// A restart's bulk reload is counted, counted ONCE per contract, and never
+    /// as live demand. The duplicate load is the reason the increment lives past
+    /// `load_persisted_entry_with_demand`'s `contains_key` early-return rather
+    /// than at the four `HostingManager` call sites, which cannot see it.
+    #[test]
+    fn startup_restore_counted_once_per_contract_and_never_as_live_demand() {
+        let (mut cache, _) = make_cache(10_000);
+        let key = make_key(7);
+
+        cache.load_persisted_entry(key, 100, AccessType::Get, Duration::from_secs(30), false);
+        cache.load_persisted_entry(key, 100, AccessType::Get, Duration::from_secs(30), false);
+
+        assert_eq!(
+            begins(&cache, HostingCause::StartupRestore),
+            1,
+            "a duplicate load short-circuits and must not count a second begin"
+        );
+        for cause in [
+            HostingCause::ClientGet,
+            HostingCause::TransitGet,
+            HostingCause::SubOpGet,
+            HostingCause::ClientPut,
+            HostingCause::TransitPut,
+            HostingCause::Other,
+        ] {
+            assert_eq!(
+                begins(&cache, cause),
+                0,
+                "a reload is not live demand; {cause:?} must stay 0"
+            );
+        }
+    }
+
+    /// The two demand-signal gauges describe the CURRENTLY hosted set: reads
+    /// bucketed by `read_count`, recency bucketed by `last_genuine_access` age.
+    #[test]
+    fn demand_signal_gauges_bucket_the_hosted_set() {
+        let (mut cache, time) = make_cache(10_000);
+
+        // never read, and (after the advance below) genuinely accessed long ago
+        let seeded = make_key(1);
+        cache.record_access_with_demand(
+            seeded,
+            100,
+            AccessType::Put,
+            0,
+            NEUTRAL_DEMAND,
+            HostingCause::TransitPut,
+            |_| (0, 0),
+        );
+        // A SUBSCRIBE-only entry never stamps `last_genuine_access` at all.
+        let subscribed_only = make_key(2);
+        cache.record_access_with_demand(
+            subscribed_only,
+            100,
+            AccessType::Subscribe,
+            0,
+            NEUTRAL_DEMAND,
+            HostingCause::SubOpGet,
+            |_| (0, 0),
+        );
+
+        time.advance_time(COST_RATE_MIN_WINDOW + Duration::from_secs(1));
+
+        // read four times => read_count 4 (bucket 3: 4-9) and genuinely accessed
+        // inside the cost window (bucket 0).
+        let hot = make_key(3);
+        for _ in 0..4 {
+            cache.record_access_with_demand(
+                hot,
+                100,
+                AccessType::Get,
+                0,
+                NEUTRAL_DEMAND,
+                HostingCause::ClientGet,
+                |_| (0, 0),
+            );
+        }
+
+        let stats = cache.stats();
+        assert_eq!(
+            stats.read_count_hist,
+            // 0 reads: seeded; 1 read: subscribed_only (SUBSCRIBE counts as a
+            // read for read_count); 4-9 reads: hot.
+            [1, 1, 0, 1, 0, 0],
+            "read_count histogram must describe the hosted set"
+        );
+        assert_eq!(
+            stats.genuine_access_recency,
+            // within the cost window: hot; >= cost window but < 20 min: seeded
+            // (a PUT stamps genuine access); never: subscribed_only.
+            [1, 1, 0, 0, 1],
+            "genuine-access recency histogram must describe the hosted set"
+        );
+        assert_eq!(
+            stats.read_count_hist.iter().sum::<u64>(),
+            stats.contract_count,
+            "every hosted contract lands in exactly one read bucket"
+        );
+        assert_eq!(
+            stats.genuine_access_recency.iter().sum::<u64>(),
+            stats.contract_count,
+            "every hosted contract lands in exactly one recency bucket"
+        );
+    }
+
+    /// The exported gauges are a snapshot of the CURRENT hosted set, so an
+    /// evicted contract leaves them — while the monotonic begin counter keeps
+    /// its record of the decision that hosted it. Guards against someone
+    /// "simplifying" the histograms into monotonic counters, which would make
+    /// them un-interpretable as a distribution.
+    #[test]
+    fn demand_signal_gauges_follow_eviction_but_begins_do_not() {
+        let (mut cache, _) = make_cache(100);
+        let first = make_key(1);
+        let second = make_key(2);
+
+        cache.record_access_with_demand(
+            first,
+            100,
+            AccessType::Get,
+            0,
+            NEUTRAL_DEMAND,
+            HostingCause::ClientGet,
+            |_| (0, 0),
+        );
+        // Budget is exactly one contract wide, so this insert sheds `first`.
+        let result = cache.record_access_with_demand(
+            second,
+            100,
+            AccessType::Get,
+            0,
+            NEUTRAL_DEMAND,
+            HostingCause::TransitGet,
+            |_| (0, 0),
+        );
+        assert_eq!(
+            result.evicted,
+            vec![(first, 0)],
+            "premise: `first` was shed"
+        );
+
+        let stats = cache.stats();
+        assert_eq!(stats.contract_count, 1);
+        assert_eq!(
+            stats.read_count_hist.iter().sum::<u64>(),
+            1,
+            "the gauge tracks the live hosted set, not everything ever hosted"
+        );
+        assert_eq!(
+            stats.hosting_begins[HostingCause::ClientGet.index()],
+            1,
+            "the begin counter is monotonic: eviction does not un-decide the \
+             hosting that happened"
+        );
+        assert_eq!(stats.hosting_begins[HostingCause::TransitGet.index()], 1);
     }
 
     /// Project the `(key, write_generation)` reclaim pairs out of a
@@ -2350,6 +3446,8 @@ mod tests {
         assert!(cache.get(&junk).is_none());
         let stats = cache.stats();
         assert_eq!(stats.cost_evictions_total, 1);
+        assert_eq!(stats.eviction_victim_counts[2][state_size_bucket(121)], 1);
+        assert_eq!(stats.eviction_victim_bytes[2][state_size_bucket(121)], 121);
         assert_eq!(
             stats.budget_evictions_total, 0,
             "cost evictions must not masquerade as byte-budget evictions"
@@ -3261,10 +4359,8 @@ mod tests {
         );
         for s in &scores {
             let entry = cache.get(&s.key).expect("scored key is in the cache");
-            assert_eq!(s.keep_score, entry.keep_score);
             assert_eq!(s.size_bytes, entry.size_bytes);
             assert_eq!(s.read_count, entry.read_count);
-            assert_eq!(s.predicted_demand, entry.predicted_demand);
             assert_eq!(s.recency_seq, entry.recency_seq);
         }
     }
@@ -3529,6 +4625,568 @@ mod tests {
         assert_ne!(budget_for_ram(3 * GIB), budget_for_ram(4 * GIB));
     }
 
+    // --- Resident-overhead budget (#5325, counted since #5647) ---
+
+    /// The budget is the configured share of the memory limit: 1/8 of the
+    /// shipped 2 GiB `MemoryMax` is 256 MiB, and of nova's 125 GiB is 15.6 GiB.
+    #[test]
+    fn resident_overhead_budget_is_the_configured_share_of_the_limit() {
+        assert_eq!(
+            resident_overhead_budget_for(2 * GIB, DEFAULT_RESIDENT_OVERHEAD_MEM_SHARE),
+            256 * 1024 * 1024
+        );
+        assert_eq!(
+            resident_overhead_budget_for(125 * GIB, DEFAULT_RESIDENT_OVERHEAD_MEM_SHARE),
+            125 * GIB / 8
+        );
+        assert_eq!(resident_overhead_budget_for(2 * GIB, 0.5), GIB);
+    }
+
+    /// A tiny host still gets the floor: 1/8 of 256 MiB is 32 MiB.
+    #[test]
+    fn resident_overhead_budget_floors_on_tiny_hosts() {
+        assert_eq!(
+            resident_overhead_budget_for(256 * 1024 * 1024, DEFAULT_RESIDENT_OVERHEAD_MEM_SHARE),
+            MIN_RESIDENT_OVERHEAD_BUDGET_BYTES
+        );
+        assert_eq!(
+            resident_overhead_budget_for(0, DEFAULT_RESIDENT_OVERHEAD_MEM_SHARE),
+            MIN_RESIDENT_OVERHEAD_BUDGET_BYTES
+        );
+    }
+
+    /// A non-finite (including +inf) or negative share collapses to the floor;
+    /// a finite share above 1 is clamped to the whole limit. Never
+    /// NaN-propagates into the budget.
+    #[test]
+    fn resident_overhead_budget_sanitizes_out_of_range_mem_share() {
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -1.0, 0.0] {
+            assert_eq!(
+                resident_overhead_budget_for(2 * GIB, bad),
+                MIN_RESIDENT_OVERHEAD_BUDGET_BYTES,
+                "share {bad} must collapse to the floor"
+            );
+        }
+        assert_eq!(resident_overhead_budget_for(2 * GIB, 7.0), 2 * GIB);
+    }
+
+    /// Whole-node composition at the shipped shapes: every declared cache
+    /// ceiling plus the hosting budget must leave at least a quarter of the
+    /// memory limit for the fixed runtime (binary, thread stacks, allocator
+    /// overhead). Profiled on a 2 GiB peer on 2026-10-01 (#5647), that fixed
+    /// part was ~200 MiB, about 10% of the limit.
+    #[test]
+    fn declared_caches_plus_hosting_budget_leave_room_for_the_runtime() {
+        const MAX_POOL_SIZE: usize = 16;
+        for (label, limit) in [
+            ("1 GiB VPS", GIB),
+            ("2 GiB peer", 2 * GIB),
+            ("gateway", 7_600 * 1024 * 1024),
+        ] {
+            for pool_size in [1, 4, MAX_POOL_SIZE] {
+                let caches =
+                    crate::contract::declared_cache_ceiling(limit as usize, pool_size) as u64;
+                let hosting =
+                    resident_overhead_budget_for(limit, DEFAULT_RESIDENT_OVERHEAD_MEM_SHARE);
+                assert!(
+                    caches + hosting <= limit / 4 * 3,
+                    "{label} with {pool_size} workers: caches {caches} + hosting {hosting} \
+                     must stay within 75% of {limit}"
+                );
+            }
+        }
+    }
+
+    /// #5647 regression, in onlyabrak's production shape: 1,627 hosted
+    /// contracts that share one module and whose summaries are small, with a
+    /// ~1.66 GB resident budget. The old count axis charged 1 MiB each
+    /// (1,706 MB) while the whole process used 577 MB, and evicted thousands of
+    /// contracts. Counted, the same set holds a few hundred KB plus its
+    /// summaries and must not be evicted.
+    #[test]
+    fn many_contracts_with_small_summaries_are_not_evicted() {
+        let (mut cache, clock) = make_cache(GIB);
+        cache.set_resident_overhead_budget_bytes(1_659_983_872);
+        let summary_bytes = 4 * 1024; // a few neighbours' small summaries
+        cache.set_interest_bytes_provider(std::sync::Arc::new(move |_| summary_bytes));
+        for i in 0..1627u32 {
+            cache.record_access(make_key_u32(i), 16 * 1024, AccessType::Put, 1, |_| (0, 0));
+        }
+        clock.advance_time(RESIDENT_OVERHEAD_SUSTAINED_WINDOW);
+        let evicted = cache.sweep_expired(|_: &ContractKey| (0, 0), MemoryPressure::AtCapacity);
+        assert!(
+            evicted.is_empty(),
+            "nothing is over budget, nothing may be evicted"
+        );
+        let stats = cache.stats();
+        assert_eq!(stats.contract_count, 1627);
+        assert_eq!(stats.resident_overhead_evictions_total, 0);
+        assert_eq!(
+            stats.resident_overhead_bytes,
+            1627 * (HOSTED_ENTRY_BYTES + summary_bytes)
+        );
+    }
+
+    /// The counted bytes, not the contract count, decide: contracts whose
+    /// neighbours hold large summaries are what push the node over, and the
+    /// sweep stops as soon as the evicted contracts' bytes bring it back under.
+    #[test]
+    fn interest_bytes_drive_resident_eviction_and_stop_at_budget() {
+        let (mut cache, clock) = make_cache(GIB);
+        let heavy = 1024 * 1024; // 1 MiB of neighbour summaries
+        // Keys 0..4 are heavy, 4..20 are light; budget fits 2 heavy + all light.
+        let budget = 2 * heavy + 20 * (HOSTED_ENTRY_BYTES + 10);
+        cache.set_resident_overhead_budget_bytes(budget);
+        cache.set_interest_bytes_provider(std::sync::Arc::new(move |key: &ContractKey| {
+            let seed = u32::from_le_bytes(key.id().as_bytes()[..4].try_into().unwrap());
+            if seed < 4 { heavy } else { 10 }
+        }));
+        for i in 0..20u32 {
+            cache.record_access(make_key_u32(i), 10, AccessType::Put, 1, |_| (0, 0));
+        }
+        // The provider's bytes are charged at the next sweep, then the breach
+        // has to be sustained before it evicts.
+        let first = cache.sweep_expired(|_: &ContractKey| (0, 0), MemoryPressure::AtCapacity);
+        assert!(first.is_empty(), "an instantaneous breach must not evict");
+        assert!(cache.stats().resident_overhead_bytes > budget);
+        clock.advance_time(RESIDENT_OVERHEAD_SUSTAINED_WINDOW / 2 + Duration::from_secs(1));
+        let evicted = cache.sweep_expired(|_: &ContractKey| (0, 0), MemoryPressure::AtCapacity);
+        let stats = cache.stats();
+        assert!(
+            stats.resident_overhead_bytes <= budget,
+            "the sweep must bring counted bytes back under budget"
+        );
+        // Victim order is recency (all zero-demand): keys 0..=k go first. The
+        // first two evictions are heavy and already bring it under, so exactly
+        // two go, not every contract.
+        assert_eq!(
+            evicted.len(),
+            2,
+            "eviction must stop once back under budget"
+        );
+        assert_eq!(stats.contract_count, 18);
+    }
+
+    /// Review finding (#5779): between sweeps the provider's live value can fall
+    /// (a neighbour disconnects). Eviction must subtract what was CHARGED at the
+    /// last refresh, or a stale-high total makes one run shed far more contracts
+    /// than the overage it was trying to clear.
+    #[test]
+    fn eviction_subtracts_charged_bytes_not_the_current_provider_value() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let (mut cache, clock) = make_cache(GIB);
+        let per_contract = Arc::new(AtomicU64::new(1024 * 1024));
+        let reader = per_contract.clone();
+        cache.set_interest_bytes_provider(Arc::new(move |_| reader.load(Ordering::Relaxed)));
+        // Budget fits 18 of 20 contracts at 1 MiB each.
+        cache.set_resident_overhead_budget_bytes(18 * (1024 * 1024 + HOSTED_ENTRY_BYTES));
+        for i in 0..20u32 {
+            cache.record_access(make_key_u32(i), 10, AccessType::Put, 1, |_| (0, 0));
+        }
+        assert!(
+            cache
+                .sweep_expired(|_: &ContractKey| (0, 0), MemoryPressure::AtCapacity)
+                .is_empty()
+        );
+        // The live value collapses before the sustained breach is acted on.
+        per_contract.store(0, Ordering::Relaxed);
+        clock.advance_time(RESIDENT_OVERHEAD_SUSTAINED_WINDOW / 2 + Duration::from_secs(1));
+        // An access-triggered eviction (no refresh) must shed exactly what the
+        // charged total is over by. The newcomer adds its entry charge, so the
+        // cache holds 20 charged contracts plus one entry against a budget of
+        // 18: two evictions leave it one entry charge over, and a third clears
+        // it, leaving 17 old contracts and the protected newcomer.
+        cache.record_access(make_key_u32(1000), 10, AccessType::Put, 1, |_| (0, 0));
+        let stats = cache.stats();
+        assert_eq!(
+            stats.contract_count, 18,
+            "subtracting the live value (0) instead of the charged 1 MiB would \
+             have shed nearly every contract"
+        );
+        assert_eq!(stats.budget_evictions_total, 3);
+        assert_eq!(stats.resident_overhead_evictions_total, 3);
+        assert_eq!(
+            stats.resident_overhead_evicted_charged_bytes_total,
+            3 * (1024 * 1024 + HOSTED_ENTRY_BYTES),
+            "the freed-bytes counter records what was charged to each victim"
+        );
+        assert_eq!(
+            stats.resident_overhead_bytes,
+            17 * (1024 * 1024 + HOSTED_ENTRY_BYTES) + HOSTED_ENTRY_BYTES
+        );
+    }
+
+    /// Cost-pressure eviction removes the victim's charged interest bytes from
+    /// the resident total, like the over-budget path (#5647).
+    #[test]
+    fn cost_eviction_subtracts_charged_interest_bytes() {
+        let (mut cache, clock) = make_cache(GIB);
+        let per_contract = 1024 * 1024;
+        cache.set_interest_bytes_provider(std::sync::Arc::new(move |_| per_contract));
+        let junk = make_key(1);
+        let quiet = make_key(2);
+        cache.record_access(junk, 10, AccessType::Put, 1, |_| (0, 0));
+        cache.record_access(quiet, 10, AccessType::Put, 1, |_| (0, 0));
+        cache.refresh_interest_bytes();
+        assert_eq!(
+            cache.stats().resident_overhead_bytes,
+            2 * (HOSTED_ENTRY_BYTES + per_contract)
+        );
+        clock.advance_time(COST_RATE_MIN_WINDOW + Duration::from_secs(1));
+        let axes = [cost_axis(100_000.0, 50_000.0, &[(&junk, 90_000.0)])];
+        let evicted = cache.evict_cost_pressure(&|_: &ContractKey| (0, 0), &axes);
+        assert_eq!(evicted.len(), 1);
+        let stats = cache.stats();
+        assert_eq!(
+            stats.resident_overhead_bytes,
+            HOSTED_ENTRY_BYTES + per_contract
+        );
+        assert_eq!(
+            stats.resident_overhead_evicted_charged_bytes_total, 0,
+            "a cost eviction is not a resident-overhead eviction"
+        );
+    }
+
+    /// A contract hosted and evicted between two sweeps was never refreshed,
+    /// so it was charged only its entry. Evicting it must subtract that and
+    /// nothing more, leaving the other contracts' charges intact, and the next
+    /// refresh must re-sum to exactly what the provider reports (#5647).
+    #[test]
+    fn contract_hosted_and_evicted_between_sweeps_keeps_the_total_exact() {
+        let (mut cache, _clock) = make_cache(100);
+        let per_contract = 1024 * 1024;
+        cache.set_interest_bytes_provider(std::sync::Arc::new(move |_| per_contract));
+        let a = make_key(1);
+        let b = make_key(2);
+        let x = make_key(3);
+        let y = make_key(4);
+        cache.record_access(a, 10, AccessType::Put, 1, |_| (0, 0));
+        cache.record_access(b, 10, AccessType::Put, 1, |_| (0, 0));
+        cache.refresh_interest_bytes();
+        // X arrives after the refresh, so it is charged its entry only.
+        cache.record_access(x, 10, AccessType::Put, 1, |_| (0, 0));
+        assert_eq!(
+            cache.stats().resident_overhead_bytes,
+            2 * (HOSTED_ENTRY_BYTES + per_contract) + HOSTED_ENTRY_BYTES
+        );
+        // Y pushes state bytes over the 100-byte budget. A and B have a
+        // downstream subscriber, so X is the zero-demand victim.
+        let counts = |key: &ContractKey| {
+            if *key == a || *key == b {
+                (0, 1)
+            } else {
+                (0, 0)
+            }
+        };
+        let evicted = cache
+            .record_access(y, 75, AccessType::Put, 1, counts)
+            .evicted;
+        assert_eq!(evicted.iter().map(|(k, _)| *k).collect::<Vec<_>>(), vec![x]);
+        assert_eq!(
+            cache.stats().resident_overhead_bytes,
+            2 * (HOSTED_ENTRY_BYTES + per_contract) + HOSTED_ENTRY_BYTES,
+            "X's eviction subtracts its entry charge only; Y adds its entry"
+        );
+        cache.refresh_interest_bytes();
+        assert_eq!(
+            cache.stats().resident_overhead_bytes,
+            3 * (HOSTED_ENTRY_BYTES + per_contract)
+        );
+    }
+
+    /// Without a provider (unit tests, or before the op manager attaches) the
+    /// interest bytes are zero, so only the fixed per-entry charge counts.
+    #[test]
+    fn resident_overhead_without_provider_counts_entries_only() {
+        let (mut cache, _clock) = make_cache(GIB);
+        for i in 0..3u32 {
+            cache.record_access(make_key_u32(i), 10, AccessType::Put, 1, |_| (0, 0));
+        }
+        cache.refresh_interest_bytes();
+        assert_eq!(
+            cache.stats().resident_overhead_bytes,
+            3 * HOSTED_ENTRY_BYTES
+        );
+    }
+
+    /// A key-maker with a wider seed space than [`make_key`] (`u8`, 256 max):
+    /// the resident-overhead tests below need well over 256 distinct
+    /// contracts to exceed a small resident budget.
+    fn make_key_u32(seed: u32) -> ContractKey {
+        let mut id_bytes = [0u8; 32];
+        id_bytes[..4].copy_from_slice(&seed.to_le_bytes());
+        let mut code_bytes = [0u8; 32];
+        code_bytes[..4].copy_from_slice(&seed.wrapping_add(1).to_le_bytes());
+        ContractKey::from_id_and_code(ContractInstanceId::new(id_bytes), CodeHash::new(code_bytes))
+    }
+
+    /// The core #5325 regression test: a peer hosting many contracts with
+    /// NEGLIGIBLE state bytes each must still come under eviction pressure
+    /// once `hosted_contract_count * HOSTED_ENTRY_BYTES`
+    /// exceeds the resident-overhead budget — even though the state-byte
+    /// budget alone is nowhere close to binding. This is exactly the
+    /// framework-peer shape from the issue: 1,057 contracts, negligible state
+    /// bytes each, ~1 GB of resident overhead no budget accounted for.
+    #[test]
+    fn resident_overhead_pressure_evicts_even_when_state_bytes_are_negligible() {
+        // A generous 1 GiB state-byte budget: with 10-byte contracts this
+        // axis could hold over 100 million entries and will never bind.
+        let (mut cache, clock) = make_cache(GIB);
+        cache.set_resident_overhead_budget_bytes(10 * HOSTED_ENTRY_BYTES);
+
+        for i in 0..15u32 {
+            let key = make_key_u32(i);
+            cache.record_access(key, 10, AccessType::Put, 1, |_| (0, 0));
+        }
+        assert_eq!(
+            cache.stats().contract_count,
+            15,
+            "the sustained gate (#5325 Must-Fix #1) must not act on an \
+             instantaneous breach — nothing evicts yet"
+        );
+
+        // Advance past the sustained-breach requirement and re-trigger via the
+        // PERIODIC sweep (not another insert) — the real post-deploy path.
+        clock.advance_time(RESIDENT_OVERHEAD_SUSTAINED_WINDOW / 2 + Duration::from_secs(1));
+        let evicted = cache.sweep_expired(|_: &ContractKey| (0, 0), MemoryPressure::AtCapacity);
+        assert!(
+            !evicted.is_empty(),
+            "once sustained past the window, the periodic sweep must evict"
+        );
+
+        let stats = cache.stats();
+        assert_eq!(
+            stats.contract_count, 10,
+            "resident-overhead pressure must cap the hosted set at the budget's \
+             contract-count equivalent even though state bytes are negligible"
+        );
+        assert!(
+            stats.current_bytes < stats.budget_bytes,
+            "the state-byte budget alone would say this cache is nowhere near \
+             over budget (current={}, budget={})",
+            stats.current_bytes,
+            stats.budget_bytes
+        );
+        assert!(
+            stats.resident_overhead_evictions_total > 0,
+            "eviction must be attributable to resident-overhead pressure"
+        );
+        assert_eq!(
+            stats.resident_overhead_evictions_total, stats.budget_evictions_total,
+            "every eviction in this scenario was resident-pressure-driven \
+             (the byte budget never bound)"
+        );
+        assert_eq!(stats.resident_overhead_bytes, 10 * HOSTED_ENTRY_BYTES);
+    }
+
+    /// Negative/boundary counterpart: resident overhead sitting exactly AT
+    /// the budget must not evict (mirrors
+    /// `evict_cost_pressure_exact_share_boundary_not_shed`'s boundary
+    /// discipline for the cost axes).
+    #[test]
+    fn resident_overhead_at_budget_does_not_evict() {
+        let (mut cache, _clock) = make_cache(GIB);
+        cache.set_resident_overhead_budget_bytes(5 * HOSTED_ENTRY_BYTES);
+
+        for i in 0..5u32 {
+            let key = make_key_u32(i);
+            cache.record_access(key, 10, AccessType::Put, 1, |_| (0, 0));
+        }
+
+        let stats = cache.stats();
+        assert_eq!(
+            stats.contract_count, 5,
+            "exactly at budget: nothing evicted"
+        );
+        assert_eq!(stats.resident_overhead_evictions_total, 0);
+        assert_eq!(stats.resident_overhead_bytes, 5 * HOSTED_ENTRY_BYTES);
+    }
+
+    /// Resident-overhead pressure must respect the SAME subscriber-primary
+    /// victim ordering as byte-budget eviction (hosting-invariants invariant
+    /// 3) — a locally-subscribed contract survives while zero-subscriber
+    /// contracts are still eligible, even though it is numerically the
+    /// oldest (would be first evicted under plain LRU/insertion order).
+    #[test]
+    fn resident_overhead_pressure_respects_subscriber_primary_ordering() {
+        let (mut cache, clock) = make_cache(GIB);
+        cache.set_resident_overhead_budget_bytes(3 * HOSTED_ENTRY_BYTES);
+
+        let subscribed = make_key_u32(999);
+        let counts = move |k: &ContractKey| if *k == subscribed { (1, 0) } else { (0, 0) };
+
+        // Insert the locally-subscribed contract FIRST (oldest recency) so a
+        // plain recency/LRU policy would evict it before anything else.
+        cache.record_access(subscribed, 10, AccessType::Put, 1, counts);
+        for i in 0..8u32 {
+            let key = make_key_u32(i);
+            cache.record_access(key, 10, AccessType::Put, 1, counts);
+        }
+
+        // Sustained gate (#5325 Must-Fix #1): nothing evicts on the
+        // instantaneous breach; advance past the window and re-sweep.
+        clock.advance_time(RESIDENT_OVERHEAD_SUSTAINED_WINDOW / 2 + Duration::from_secs(1));
+        cache.sweep_expired(counts, MemoryPressure::AtCapacity);
+
+        assert!(
+            cache.get(&subscribed).is_some(),
+            "a locally-subscribed contract must survive resident-overhead \
+             pressure while zero-subscriber contracts are still eligible \
+             (same victim_order as byte-budget eviction)"
+        );
+        assert_eq!(cache.stats().contract_count, 3);
+    }
+
+    /// Resident-overhead pressure must also be enforced by the PERIODIC sweep,
+    /// not only at insertion time — this is the real-world path #5325
+    /// describes: `load_persisted_entry` (bulk startup reload) deliberately
+    /// does NOT evict ("we may be over budget after loading" — see its doc),
+    /// so a peer restarting with more hosted contracts than its
+    /// resident-overhead budget allows sits over budget until the next
+    /// `sweep_expired`.
+    #[test]
+    fn resident_overhead_pressure_is_enforced_by_periodic_sweep_after_bulk_load() {
+        let (mut cache, clock) = make_cache(GIB);
+        for i in 0..20u32 {
+            let key = make_key_u32(i);
+            cache.load_persisted_entry(key, 10, AccessType::Get, Duration::from_secs(0), false);
+        }
+        cache.finalize_loading();
+        assert_eq!(
+            cache.stats().contract_count,
+            20,
+            "bulk load does not evict, by design"
+        );
+
+        cache.set_resident_overhead_budget_bytes(5 * HOSTED_ENTRY_BYTES);
+
+        // First sweep after restart: observes the breach (starts the
+        // sustained-breach timer) but must NOT evict yet (#5325 Must-Fix #1)
+        // — this is the exact post-upgrade instant the review flagged as
+        // dangerous without a sustained gate.
+        let first_sweep = cache.sweep_expired(|_: &ContractKey| (0, 0), MemoryPressure::AtCapacity);
+        assert!(
+            first_sweep.is_empty(),
+            "a freshly-observed breach must not evict on the very first \
+             post-restart sweep"
+        );
+        assert_eq!(cache.stats().contract_count, 20);
+
+        // Advance past the sustained window; the NEXT periodic sweep (5s
+        // cadence in production — see CLEANUP_INTERVAL) now acts.
+        clock.advance_time(RESIDENT_OVERHEAD_SUSTAINED_WINDOW / 2 + Duration::from_secs(1));
+        let evicted = cache.sweep_expired(|_: &ContractKey| (0, 0), MemoryPressure::AtCapacity);
+
+        assert!(
+            !evicted.is_empty(),
+            "the periodic sweep must shed down to the resident-overhead budget \
+             once the breach has been sustained"
+        );
+        assert_eq!(cache.stats().contract_count, 5);
+    }
+
+    /// Dedicated regression test for the review's own concrete numbers
+    /// (256 MiB resident budget; framework hosts 1,057 contracts, ~1 GiB
+    /// attributed overhead): without the sustained gate, the very first
+    /// sweep post-deploy would shed ~76% of the hosted set in one pass.
+    /// Confirms that specific, previously-verified-dangerous scenario is now
+    /// throttled. The 256 MiB figure is a direct fixture value (the field
+    /// scenario this test pins), not derived from
+    /// [`resident_overhead_budget_for`] — that function's own composition is
+    /// covered by its dedicated tests below (#5333).
+    #[test]
+    fn resident_overhead_pressure_does_not_mass_evict_on_first_sweep_at_framework_scale() {
+        let (mut cache, clock) = make_cache(GIB);
+        // 256 hosted entries' worth, with no summaries (no provider).
+        cache.set_resident_overhead_budget_bytes(256 * HOSTED_ENTRY_BYTES);
+
+        for i in 0..1057u32 {
+            let key = make_key_u32(i);
+            cache.load_persisted_entry(key, 10, AccessType::Get, Duration::from_secs(0), false);
+        }
+        cache.finalize_loading();
+        assert_eq!(cache.stats().contract_count, 1057);
+
+        // The dangerous instant: the very first sweep immediately after
+        // restart/deploy, with zero elapsed sustained time.
+        let first_sweep = cache.sweep_expired(|_: &ContractKey| (0, 0), MemoryPressure::AtCapacity);
+        assert!(
+            first_sweep.is_empty(),
+            "must NOT mass-evict ~76% of the hosted set on the very first \
+             post-deploy sweep — this is exactly what the sustained gate exists \
+             to prevent"
+        );
+        assert_eq!(cache.stats().contract_count, 1057);
+
+        // Confirm the axis is not simply inert: given enough sustained time,
+        // it does eventually shed down to the budget (256 entries).
+        clock.advance_time(RESIDENT_OVERHEAD_SUSTAINED_WINDOW / 2 + Duration::from_secs(1));
+        cache.sweep_expired(|_: &ContractKey| (0, 0), MemoryPressure::AtCapacity);
+        assert_eq!(cache.stats().contract_count, 256);
+    }
+
+    /// PR review Should-Fix #5: both budget axes bound AT ONCE, at DIFFERENT
+    /// contract-count targets (byte budget looser at 6 contracts, resident-
+    /// overhead budget stricter at 5) — proves the compound `&&` stop
+    /// condition, not an early exit once either axis alone clears, AND that
+    /// the SUSTAINED gate applies independently per axis: an unsustained
+    /// resident breach must not block byte-driven eviction (which has no
+    /// sustained gate), and once sustained it must drive ADDITIONAL eviction
+    /// beyond what byte pressure alone already achieved.
+    #[test]
+    fn both_budget_axes_bind_simultaneously() {
+        let (mut cache, clock) = make_cache(60); // byte budget: 6 contracts @ 10 bytes
+        cache.set_resident_overhead_budget_bytes(5 * HOSTED_ENTRY_BYTES);
+
+        for i in 0..8u32 {
+            let key = make_key_u32(i);
+            cache.load_persisted_entry(key, 10, AccessType::Get, Duration::from_secs(0), false);
+        }
+        cache.finalize_loading();
+        assert_eq!(cache.stats().contract_count, 8);
+
+        // Sweep 1: byte pressure has NO sustained gate, so it acts
+        // immediately; resident pressure is freshly observed this call (not
+        // yet sustained) and must contribute nothing.
+        let sweep1 = cache.sweep_expired(|_: &ContractKey| (0, 0), MemoryPressure::AtCapacity);
+        assert_eq!(sweep1.len(), 2);
+        assert_eq!(
+            cache.stats().contract_count,
+            6,
+            "byte pressure alone (no sustain gate) evicts down to its own \
+             6-contract target"
+        );
+        assert_eq!(
+            cache.stats().resident_overhead_evictions_total,
+            0,
+            "none of sweep 1's evictions were resident-sustained yet"
+        );
+
+        // Sweep 2, after the resident breach has been sustained: byte
+        // pressure is ALREADY satisfied (6 contracts = 60 bytes = budget),
+        // but resident pressure (still over its own 5-contract budget) must
+        // drive exactly ONE more eviction.
+        clock.advance_time(RESIDENT_OVERHEAD_SUSTAINED_WINDOW / 2 + Duration::from_secs(1));
+        let sweep2 = cache.sweep_expired(|_: &ContractKey| (0, 0), MemoryPressure::AtCapacity);
+        assert_eq!(
+            sweep2.len(),
+            1,
+            "exactly one more eviction, driven by the now-sustained resident axis"
+        );
+
+        let stats = cache.stats();
+        assert_eq!(stats.contract_count, 5);
+        assert_eq!(
+            stats.resident_overhead_evictions_total, 1,
+            "exactly the sweep-2 eviction is attributed to sustained resident pressure"
+        );
+        assert_eq!(
+            stats.budget_evictions_total, 3,
+            "3 total evictions across both sweeps (2 byte-driven + 1 resident-driven)"
+        );
+    }
+
     // --- Aggregate disk budget sizing (#4683) ---
 
     /// `disk_budget_for` clamps at both ends and scales linearly in between.
@@ -3680,6 +5338,8 @@ mod tests {
         assert_eq!(result.evicted, vec![(key2, 0)]);
         let stats = cache.stats();
         assert_eq!(stats.budget_evictions_total, 2);
+        assert_eq!(stats.eviction_victim_counts[0][state_size_bucket(100)], 2);
+        assert_eq!(stats.eviction_victim_bytes[0][state_size_bucket(100)], 200);
         assert_eq!(stats.current_bytes, 200);
         assert_eq!(stats.contract_count, 2);
         assert_eq!(stats.budget_bytes, 200);
@@ -3852,13 +5512,29 @@ mod tests {
         let key = make_key(1);
 
         // Insert at floor 0 with demand 3.0 -> keep_score 3.0.
-        cache.record_access_with_demand(key, 100, AccessType::Get, 0, 3.0, |_| (0, 0));
+        cache.record_access_with_demand(
+            key,
+            100,
+            AccessType::Get,
+            0,
+            3.0,
+            HostingCause::Other,
+            |_| (0, 0),
+        );
         assert_eq!(cache.get(&key).unwrap().keep_score, 3.0);
         assert_eq!(cache.get(&key).unwrap().predicted_demand, 3.0);
         assert_eq!(cache.get(&key).unwrap().read_count, 1);
 
         // A read with a new demand estimate refreshes keep_score = floor + demand.
-        cache.record_access_with_demand(key, 100, AccessType::Get, 0, 5.0, |_| (0, 0));
+        cache.record_access_with_demand(
+            key,
+            100,
+            AccessType::Get,
+            0,
+            5.0,
+            HostingCause::Other,
+            |_| (0, 0),
+        );
         assert_eq!(cache.get(&key).unwrap().keep_score, 5.0);
         assert_eq!(cache.get(&key).unwrap().read_count, 2);
     }
@@ -3879,16 +5555,39 @@ mod tests {
 
         // `high` inserted first (older) with strong demand; `low` inserted after
         // with weak demand. A recency-only (LRU) policy would evict `high`.
-        cache.record_access_with_demand(high, 100, AccessType::Get, 0, 10.0, |_| (0, 0));
-        cache.record_access_with_demand(low, 100, AccessType::Get, 0, 1.0, |_| (0, 0));
+        cache.record_access_with_demand(
+            high,
+            100,
+            AccessType::Get,
+            0,
+            10.0,
+            HostingCause::Other,
+            |_| (0, 0),
+        );
+        cache.record_access_with_demand(
+            low,
+            100,
+            AccessType::Get,
+            0,
+            1.0,
+            HostingCause::Other,
+            |_| (0, 0),
+        );
         assert_eq!(cache.current_bytes(), 200);
 
         time.advance_time(Duration::from_secs(61));
 
         // Over-budget insert must evict the LOWEST keep_score (`low`), not the
         // oldest (`high`).
-        let result =
-            cache.record_access_with_demand(trigger, 100, AccessType::Get, 0, 1.0, |_| (0, 0));
+        let result = cache.record_access_with_demand(
+            trigger,
+            100,
+            AccessType::Get,
+            0,
+            1.0,
+            HostingCause::Other,
+            |_| (0, 0),
+        );
         assert_eq!(
             result.evicted,
             vec![(low, 0)],
@@ -3933,8 +5632,24 @@ mod tests {
         let trigger = make_key(3);
 
         // Insert both cold (zero samples), scored only by the distance prior.
-        cache.record_access_with_demand(near, 100, AccessType::Get, 0, near_demand, |_| (0, 0));
-        cache.record_access_with_demand(far, 100, AccessType::Get, 0, far_demand, |_| (0, 0));
+        cache.record_access_with_demand(
+            near,
+            100,
+            AccessType::Get,
+            0,
+            near_demand,
+            HostingCause::Other,
+            |_| (0, 0),
+        );
+        cache.record_access_with_demand(
+            far,
+            100,
+            AccessType::Get,
+            0,
+            far_demand,
+            HostingCause::Other,
+            |_| (0, 0),
+        );
         assert_eq!(cache.current_bytes(), 200);
         assert!(
             cache.get(&near).unwrap().keep_score > cache.get(&far).unwrap().keep_score,
@@ -3951,6 +5666,7 @@ mod tests {
             AccessType::Get,
             0,
             NEUTRAL_DEMAND,
+            HostingCause::Other,
             |_| (0, 0),
         );
         assert_eq!(
@@ -4003,7 +5719,15 @@ mod tests {
 
         // Seed the room with strong demand, then read it repeatedly (simulating
         // recurring GETs). These reads are the room's LAST accesses.
-        cache.record_access_with_demand(room, 100, AccessType::Get, 0, 10.0, |_| (0, 0));
+        cache.record_access_with_demand(
+            room,
+            100,
+            AccessType::Get,
+            0,
+            10.0,
+            HostingCause::Other,
+            |_| (0, 0),
+        );
         for _ in 0..3 {
             time.advance_time(Duration::from_secs(5));
             cache.touch(&room);
@@ -4012,7 +5736,15 @@ mod tests {
         // Junk arrives AFTER the room's last read, so junk is the more-recently-
         // accessed entry — and carries weak demand.
         time.advance_time(Duration::from_secs(5));
-        cache.record_access_with_demand(junk, 100, AccessType::Get, 0, 1.0, |_| (0, 0));
+        cache.record_access_with_demand(
+            junk,
+            100,
+            AccessType::Get,
+            0,
+            1.0,
+            HostingCause::Other,
+            |_| (0, 0),
+        );
 
         // Advance so BOTH are past TTL and eviction-eligible; the room, last read
         // 5s before junk, is the least-recently-accessed of the two.
@@ -4037,8 +5769,15 @@ mod tests {
         // Over-budget insert: the fuel gauge evicts the lowest keep_score (junk).
         // Byte-LRU-with-TTL would instead evict the room (the oldest past-TTL
         // entry) — so this assertion is what fails under a recency-only policy.
-        let result =
-            cache.record_access_with_demand(trigger, 100, AccessType::Get, 0, 1.0, |_| (0, 0));
+        let result = cache.record_access_with_demand(
+            trigger,
+            100,
+            AccessType::Get,
+            0,
+            1.0,
+            HostingCause::Other,
+            |_| (0, 0),
+        );
         assert_eq!(
             result.evicted,
             vec![(junk, 0)],
@@ -4069,10 +5808,26 @@ mod tests {
         // Insert a demand-7 contract, let it age, then evict it via an
         // over-budget insert; the floor must climb to 7.
         let a = make_key(1);
-        cache.record_access_with_demand(a, 100, AccessType::Get, 0, 7.0, |_| (0, 0));
+        cache.record_access_with_demand(
+            a,
+            100,
+            AccessType::Get,
+            0,
+            7.0,
+            HostingCause::Other,
+            |_| (0, 0),
+        );
         time.advance_time(Duration::from_secs(61));
         let b = make_key(2);
-        let r = cache.record_access_with_demand(b, 100, AccessType::Get, 0, 2.0, |_| (0, 0));
+        let r = cache.record_access_with_demand(
+            b,
+            100,
+            AccessType::Get,
+            0,
+            2.0,
+            HostingCause::Other,
+            |_| (0, 0),
+        );
         assert_eq!(r.evicted, vec![(a, 0)]);
         assert_eq!(
             cache.eviction_floor(),
@@ -4084,7 +5839,15 @@ mod tests {
         // lower-scored victim must not drop the floor below 7.
         time.advance_time(Duration::from_secs(61));
         let c = make_key(3);
-        let r = cache.record_access_with_demand(c, 100, AccessType::Get, 0, 1.0, |_| (0, 0));
+        let r = cache.record_access_with_demand(
+            c,
+            100,
+            AccessType::Get,
+            0,
+            1.0,
+            HostingCause::Other,
+            |_| (0, 0),
+        );
         assert_eq!(r.evicted, vec![(b, 0)], "b (keep_score 2) evicts");
         assert_eq!(
             cache.eviction_floor(),
@@ -4102,14 +5865,30 @@ mod tests {
         let key = make_key(1);
 
         // Seed via PUT: keep_score = floor(0) + demand, read_count 0.
-        cache.record_access_with_demand(key, 100, AccessType::Put, 0, 2.0, |_| (0, 0));
+        cache.record_access_with_demand(
+            key,
+            100,
+            AccessType::Put,
+            0,
+            2.0,
+            HostingCause::Other,
+            |_| (0, 0),
+        );
         assert_eq!(cache.get(&key).unwrap().read_count, 0, "PUT is not a read");
         let seed_score = cache.get(&key).unwrap().keep_score;
         assert_eq!(seed_score, 2.0);
 
         // Manually raise the floor by evicting something else would be indirect;
         // instead assert that a re-PUT does NOT refresh keep_score or read_count.
-        cache.record_access_with_demand(key, 100, AccessType::Put, 0, 9.0, |_| (0, 0));
+        cache.record_access_with_demand(
+            key,
+            100,
+            AccessType::Put,
+            0,
+            9.0,
+            HostingCause::Other,
+            |_| (0, 0),
+        );
         assert_eq!(
             cache.get(&key).unwrap().read_count,
             0,
@@ -4122,7 +5901,15 @@ mod tests {
         );
 
         // A GET, by contrast, IS read-demand and refreshes both.
-        cache.record_access_with_demand(key, 100, AccessType::Get, 0, 9.0, |_| (0, 0));
+        cache.record_access_with_demand(
+            key,
+            100,
+            AccessType::Get,
+            0,
+            9.0,
+            HostingCause::Other,
+            |_| (0, 0),
+        );
         assert_eq!(cache.get(&key).unwrap().read_count, 1);
         assert_eq!(cache.get(&key).unwrap().keep_score, 9.0);
     }
@@ -4140,7 +5927,15 @@ mod tests {
         time.advance_time(Duration::from_secs(61));
         // Evict it by inserting a higher-demand junk (so read_twice is the victim).
         let junk = make_key(2);
-        let r = cache.record_access_with_demand(junk, 100, AccessType::Get, 0, 5.0, |_| (0, 0));
+        let r = cache.record_access_with_demand(
+            junk,
+            100,
+            AccessType::Get,
+            0,
+            5.0,
+            HostingCause::Other,
+            |_| (0, 0),
+        );
         assert_eq!(r.evicted, vec![(read_twice, 0)]);
         assert_eq!(
             cache.stats().evictions_of_recently_read_total,
@@ -4152,7 +5947,15 @@ mod tests {
         time.advance_time(Duration::from_secs(61));
         let seed = make_key(3);
         // junk currently has demand 5 (>seed's), so make the new one higher.
-        let r = cache.record_access_with_demand(seed, 100, AccessType::Get, 0, 9.0, |_| (0, 0));
+        let r = cache.record_access_with_demand(
+            seed,
+            100,
+            AccessType::Get,
+            0,
+            9.0,
+            HostingCause::Other,
+            |_| (0, 0),
+        );
         assert_eq!(r.evicted, vec![(junk, 0)], "junk (read once) evicts");
         assert_eq!(
             cache.stats().evictions_of_recently_read_total,
@@ -4174,16 +5977,38 @@ mod tests {
         let other = make_key(2);
         let trigger = make_key(3);
 
-        cache.record_access_with_demand(subscribed, 100, AccessType::Get, 0, 0.1, |_| (0, 0));
-        cache.record_access_with_demand(other, 100, AccessType::Get, 0, 5.0, |_| (0, 0));
+        cache.record_access_with_demand(
+            subscribed,
+            100,
+            AccessType::Get,
+            0,
+            0.1,
+            HostingCause::Other,
+            |_| (0, 0),
+        );
+        cache.record_access_with_demand(
+            other,
+            100,
+            AccessType::Get,
+            0,
+            5.0,
+            HostingCause::Other,
+            |_| (0, 0),
+        );
         time.advance_time(Duration::from_secs(61));
 
         // Over budget by one entry: `subscribed` has the lowest keep_score and a
         // naive demand order would evict it first, but it is downstream-subscribed
         // so it sorts LAST — the zero-subscriber `other` is shed instead.
-        let result = cache.record_access_with_demand(trigger, 100, AccessType::Get, 0, 5.0, |k| {
-            (0, (*k == subscribed) as usize)
-        });
+        let result = cache.record_access_with_demand(
+            trigger,
+            100,
+            AccessType::Get,
+            0,
+            5.0,
+            HostingCause::Other,
+            |k| (0, (*k == subscribed) as usize),
+        );
         assert_eq!(
             result.evicted,
             vec![(other, 0)],

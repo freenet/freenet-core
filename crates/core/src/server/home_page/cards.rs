@@ -1,5 +1,112 @@
 use super::*;
 
+/// Format a success share so the ROUNDING never asserts something false.
+///
+/// `{:.0}` alone renders 199/200 as "100%" and 1/200 as "0%". Both are lies of
+/// exactly the kind this panel exists to remove: "100% answered" when a
+/// request failed is the same shape of absolute, unearned claim as "Node is
+/// healthy" was. An operator reading 100% will stop looking.
+///
+/// So the two absolute values are reserved for the cases that genuinely earn
+/// them, and the bands next to them say which side of the boundary they are
+/// on rather than rounding across it.
+fn answered_share(ok: u32, total: u32) -> String {
+    // Defence in depth. The only caller gates on `total >= MIN_SAMPLE`, so
+    // zero cannot reach here today — but without this the `ok == total` arm
+    // below would answer "100%" for nothing at all, which is the worst
+    // possible wrong answer from a panel whose entire purpose is not
+    // overstating success. A future caller that forgets the guard should get
+    // an honest dash, not a perfect score.
+    if total == 0 {
+        return "—".to_string();
+    }
+    if ok == total {
+        return "100%".to_string();
+    }
+    if ok == 0 {
+        return "0%".to_string();
+    }
+    // Inspect what would ACTUALLY be displayed rather than reasoning about
+    // where the boundary falls. Comparing against 99.5 / 0.5 by hand gets the
+    // exact-half case wrong — 1 of 200 is precisely 0.5%, and Rust's `{:.0}`
+    // rounds half to even, so it renders "0" while a hand-written `pct < 0.5`
+    // does not catch it. Formatting first removes the second guess.
+    let pct = (ok as f64 / total as f64) * 100.0;
+    let rendered = format!("{pct:.0}");
+    match rendered.as_str() {
+        // Would display as an absolute, but the counts say otherwise.
+        "100" => ">99%".to_string(),
+        "0" => "<1%".to_string(),
+        other => format!("{other}%"),
+    }
+}
+
+/// Contracts read successfully, as a measured rate rather than a verdict.
+///
+/// Deliberately reports the LIFETIME rate with the period it covers, not a
+/// recent window, and that is a data constraint rather than a shortcut.
+/// Measured on three live nodes: a hosted-mode peer did 101 GETs in 17h55m
+/// (~5.6/hour), a gateway 7 in 28m (~15/hour), and a third none at all. A
+/// fifteen-minute window would hold one to four requests, and even an hour
+/// holds about six, where a single failure moves the number seventeen points.
+/// A window short enough to mean "now" is empty almost all the time, so it
+/// would report nothing far more often than it reported anything.
+///
+/// The cost of using lifetime is real and worth naming: a node broken early
+/// and fine since shows a blended figure. The uptime is printed alongside so
+/// the reader can see what the number covers, and `record_op_result` keeps no
+/// history that would allow better.
+fn build_get_success_line(snap: &network_status::NetworkStatusSnapshot) -> String {
+    let (ok, failed) = snap.op_stats.gets;
+    let total = ok.saturating_add(failed);
+    let period = format_duration(snap.elapsed_secs);
+
+    // Below this, a percentage is theatre: at one or two requests it swings by
+    // fifty points per outcome. Show the counts and say why there is no rate,
+    // rather than printing a number that looks like a measurement.
+    const MIN_SAMPLE: u32 = 20;
+
+    let body = if total == 0 {
+        "<span class=\"gsr-none\">none yet</span>".to_string()
+    } else if total < MIN_SAMPLE {
+        format!(
+            r#"<span class="gsr-none">too few to rate</span> <span class="gsr-detail">{ok} of {total} answered in {period}</span>"#
+        )
+    } else {
+        format!(
+            r#"<span class="gsr-value">{share} answered</span> <span class="gsr-detail">{ok} of {total} &middot; since start {period}</span>"#,
+            share = answered_share(ok, total),
+        )
+    };
+
+    // A caveat that is always shown, never conditional on the number being
+    // low. Two reasons it has to be visible rather than a tooltip.
+    //
+    // First, an unanswered GET is frequently the NETWORK failing to route,
+    // not this node failing to serve — dead-ends dominate the not-found mode
+    // today. A bare "GET success 1%" invites the operator to conclude their
+    // own node is broken and report it, which is a support burden built out
+    // of our own phrasing.
+    //
+    // Second, showing the caveat only when the figure looks bad would be a
+    // threshold in disguise, and choosing that threshold is exactly the
+    // judgement this panel exists to avoid making. So it is unconditional,
+    // and it says "not by itself" rather than "not your fault", because on a
+    // node with no connections it genuinely is this node.
+    // Plain text, not a <span>. An earlier draft wrapped this in
+    // `class="gsr-caveat"`, which no stylesheet rule ever matched — a dead
+    // class name reads as if it carries styling and invites someone to
+    // "restore" formatting that never existed. The wrapping <p> is styled.
+    let caveat = "Unanswered includes requests the network could not route, so a low share does not by itself mean this node is faulty.";
+
+    format!(
+        r#"<p class="get-success-rate" title="Of the GET requests this node has issued, the share that came back with contract state, over the whole time it has been running. Not a recent window: peers issue only a handful of GETs an hour, so a short window would nearly always be empty. A request that dead-ends in the network counts as unanswered.">
+            <span class="gsr-label">GET requests</span> {body}
+        </p>
+        <p class="get-success-caveat">{caveat}</p>"#
+    )
+}
+
 pub fn build_status_card(snap: &Option<network_status::NetworkStatusSnapshot>) -> String {
     let Some(snap) = snap else {
         return r#"<div class="card">
@@ -13,17 +120,27 @@ pub fn build_status_card(snap: &Option<network_status::NetworkStatusSnapshot>) -
     // Health banner — the primary "everything looks good" indicator
     let health_banner = match snap.health {
         network_status::HealthLevel::Healthy => {
+            // Deliberately NOT a verdict. This used to read "Node is healthy",
+            // with a tick, on the strength of four connectivity inputs that
+            // say nothing about whether the node can actually serve reads —
+            // four live v0.2.128 peers displayed it while answering between
+            // 1.3% and 89% of their GETs (#5370).
+            //
+            // A verdict is an assertion, and asserting things that are not
+            // true is this page's recurring failure. State the connection
+            // count, which is a fact, and let the measured GET rate below
+            // speak for whether the node is working.
             let n = snap.open_connections;
             let label = if n == 1 { "peer" } else { "peers" };
             format!(
                 r#"<div class="health-banner health-good">
-                    <span class="health-icon">&#x2714;</span>
-                    <span>Node is healthy — connected to {n} {label}</span>
+                    <span class="health-icon">&#x25CF;</span>
+                    <span>Connected to {n} {label}</span>
                 </div>"#,
             )
         }
         network_status::HealthLevel::Degraded => {
-            let detail = if snap.gateway_only {
+            let detail = if snap.gateway_only_persisting {
                 "Only connected to gateways — no peer-to-peer connections yet"
             } else {
                 "Connected but NAT traversal is failing"
@@ -58,6 +175,8 @@ pub fn build_status_card(snap: &Option<network_status::NetworkStatusSnapshot>) -
             )
         }
     };
+
+    let get_success = build_get_success_line(snap);
 
     // External address info (shown once discovered via NAT traversal)
     let external_addr_html = if let Some(addr) = snap.external_address {
@@ -100,6 +219,9 @@ pub fn build_status_card(snap: &Option<network_status::NetworkStatusSnapshot>) -
     let rate_limit_html = if snap.ring_stats.updates_accepted > 0
         || snap.ring_stats.updates_rate_limited > 0
         || snap.ring_stats.updates_capacity_dropped > 0
+        || snap.ring_stats.updates_capacity_evicted > 0
+        || snap.ring_stats.updates_sender_budget_dropped > 0
+        || snap.ring_stats.updates_sender_budget_unmetered > 0
     {
         format!(
             r#"<div class="metrics-row">
@@ -115,10 +237,25 @@ pub fn build_status_card(snap: &Option<network_status::NetworkStatusSnapshot>) -
                 <span class="metric-value">{capacity_dropped}</span>
                 <span class="metric-label">Capacity-dropped</span>
             </div>
+            <div class="metric-tile">
+                <span class="metric-value">{capacity_evicted}</span>
+                <span class="metric-label">Capacity-evicted</span>
+            </div>
+            <div class="metric-tile">
+                <span class="metric-value">{sender_budget_dropped}</span>
+                <span class="metric-label">Fresh-id-dropped</span>
+            </div>
+            <div class="metric-tile">
+                <span class="metric-value">{sender_budget_unmetered}</span>
+                <span class="metric-label">Fresh-id-unmetered</span>
+            </div>
         </div>"#,
             accepted = snap.ring_stats.updates_accepted,
             rate_limited = snap.ring_stats.updates_rate_limited,
             capacity_dropped = snap.ring_stats.updates_capacity_dropped,
+            capacity_evicted = snap.ring_stats.updates_capacity_evicted,
+            sender_budget_dropped = snap.ring_stats.updates_sender_budget_dropped,
+            sender_budget_unmetered = snap.ring_stats.updates_sender_budget_unmetered,
         )
     } else {
         String::new()
@@ -225,8 +362,11 @@ pub fn build_status_card(snap: &Option<network_status::NetworkStatusSnapshot>) -
         ""
     };
 
-    // Gateway-only warning (only when not connected to any peers)
-    let gateway_warning = if snap.gateway_only {
+    // Gateway-only warning (only when not connected to any peers). Gated on
+    // the state having PERSISTED: every node is gateway-only for a while after
+    // it joins, and diagnosing a firewall fault on a node that simply has not
+    // finished connecting is a false alarm shown to every new user.
+    let gateway_warning = if snap.gateway_only_persisting {
         format!(
             r#"<div class="warning">
                 <strong>Firewall likely blocking incoming connections</strong> on UDP port <code>{port}</code>.
@@ -243,9 +383,11 @@ pub fn build_status_card(snap: &Option<network_status::NetworkStatusSnapshot>) -
 
     // NAT stats with rolling trend
     let nat_html = if snap.nat_stats.attempts > 0 {
-        let all_failed = snap.nat_stats.successes == 0;
+        // `looks_blocked`, not "no successes yet": single attempts fail
+        // routinely, so one or two failures are not a verdict on the port.
+        let all_failed = snap.nat_stats.looks_blocked();
         let class = if all_failed { " nat-fail" } else { "" };
-        let extra = if all_failed && !snap.gateway_only {
+        let extra = if all_failed && !snap.gateway_only_persisting {
             format!(
                 r#"<p class="nat-advice">All NAT traversal attempts have failed. Try forwarding UDP port <code>{}</code> on your router.</p>"#,
                 snap.listening_port
@@ -258,7 +400,7 @@ pub fn build_status_card(snap: &Option<network_status::NetworkStatusSnapshot>) -
         let (recent, verdict) = if snap.nat_stats.recent_attempts > 0 {
             let rs = snap.nat_stats.recent_successes;
             let ra = snap.nat_stats.recent_attempts;
-            let verdict = if rs == 0 && snap.nat_stats.successes == 0 {
+            let verdict = if rs == 0 && all_failed {
                 r#" <span class="nat-verdict nat-verdict-bad">Port may be blocked</span>"#
                     .to_string()
             } else {
@@ -297,9 +439,10 @@ pub fn build_status_card(snap: &Option<network_status::NetworkStatusSnapshot>) -
             ));
         }
         if snap.open_connections > 0 {
-            // Demoted: muted style when node is otherwise connected
+            // Demoted: muted style when node is otherwise connected. The id
+            // lets dashboard.js keep it open across the 5 s refresh.
             format!(
-                r#"<details class="diagnostics-muted">
+                r#"<details class="diagnostics-muted" id="connection-failures">
                     <summary>{n} recent connection attempt(s) failed <span class="muted-hint">(normal)</span></summary>
                     <ul>{items}</ul>
                 </details>"#,
@@ -331,8 +474,9 @@ pub fn build_status_card(snap: &Option<network_status::NetworkStatusSnapshot>) -
 
     format!(
         r#"<div class="card">
-            <h2>Connection Status</h2>
+            <div class="card-header"><h2>Connection Status</h2><a class="card-link" href="/routing">Routing model &rarr;</a></div>
             {health_banner}
+            {get_success}
             {ring_stats_html}
             {lattice_html}
             {rate_limit_html}
@@ -344,6 +488,7 @@ pub fn build_status_card(snap: &Option<network_status::NetworkStatusSnapshot>) -
             {failures_html}
         </div>"#,
         health_banner = health_banner,
+        get_success = get_success,
         ring_stats_html = ring_stats_html,
         lattice_html = lattice_html,
         rate_limit_html = rate_limit_html,
@@ -559,6 +704,7 @@ pub fn build_peers_card(snap: &Option<network_status::NetworkStatusSnapshot>) ->
         r#"<div class="card">
             <div class="card-header"><h2>Network Peers</h2>{own_loc}</div>
             {ring_svg}
+            {filter_controls}
             <div class="table-wrap">
                 <table class="sortable" data-table-id="peers">
                     <thead><tr><th data-sort-type="text">Address</th><th data-sort-type="num">Location</th><th data-sort-type="text">Type</th><th data-sort-type="num">Sent</th><th data-sort-type="num">Recv</th><th data-sort-type="num">Connected</th></tr></thead>
@@ -568,7 +714,32 @@ pub fn build_peers_card(snap: &Option<network_status::NetworkStatusSnapshot>) ->
         </div>"#,
         own_loc = own_loc,
         ring_svg = ring_svg,
+        filter_controls = table_filter_controls("peers", "peers"),
         rows = rows,
+    )
+}
+
+/// Filter + collapse controls for a long table.
+///
+/// The peers and subscribed-contracts tables are unbounded — a production
+/// gateway rendered 210 peer rows, 70% of an 11,780px page, with no way to
+/// locate one row. The rows are still all rendered (truncating server-side
+/// would make the filter lie about what it searched); `dashboard.js`
+/// collapses the table to a readable default and expands it while a query is
+/// active.
+///
+/// Rendered unconditionally rather than only past a threshold, so the control
+/// does not appear and disappear as a node's peer count crosses a boundary.
+/// The JS hides the toggle itself when there is nothing to collapse.
+fn table_filter_controls(table_id: &str, label: &str) -> String {
+    format!(
+        r#"<div class="table-filter" data-filter-for="{id}">
+            <input type="search" class="tf-input" placeholder="Filter {label}…" aria-label="Filter {label}" autocomplete="off" spellcheck="false">
+            <span class="tf-status" role="status" aria-live="polite"></span>
+            <button type="button" class="tf-toggle" hidden aria-expanded="false"></button>
+        </div>"#,
+        id = html_escape(table_id),
+        label = html_escape(label),
     )
 }
 
@@ -1227,13 +1398,173 @@ pub fn build_governance_card(snap: &Option<network_status::NetworkStatusSnapshot
     )
 }
 
-/// Build the demand-driven eviction card (piece A, #4642). Surfaces the
-/// capability-relative RAM budget and the per-contract Greedy-Dual
-/// `keep_score` that ACTUALLY governs retention today — the mechanism that
-/// replaced the dormant MAD `GovernanceManager` (#4296), whose dashboard card
-/// is now hidden on default nodes. Every value comes from
+/// What reaching a ceiling on the hosting card MEANS, which decides whether a
+/// full bar is worth an operator's attention.
+///
+/// The "Closest limit" strip used to colour every axis from utilisation alone
+/// (amber from 75%, red from 90%). That is right for a limit you are supposed
+/// to stay under and wrong for a cache, which is supposed to be full. So the
+/// strip was permanently red on exactly the peers doing the most useful work,
+/// and red reads as "broken".
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CeilingKind {
+    /// A cache ceiling (contract state bytes, contract memory). Never coloured,
+    /// at any utilisation, because both "full" and "a little over" are how a
+    /// busy node normally runs:
+    ///
+    /// - contract state is trimmed back under its budget on every insert, so
+    ///   it rests just below 100%;
+    /// - contract memory is trimmed only after the ceiling has been exceeded
+    ///   for ~2.5 minutes, so a node with summaries still arriving sits a
+    ///   little over, trims back under, and goes over again.
+    ///
+    /// Being over is the eviction sweep's trigger, not a fault, and a
+    /// subscribed contract is shed as a last resort, so the sweep is not
+    /// blocked by everything being in use. (One corner does stay over for a
+    /// while: a just-inserted contract larger than the whole budget is
+    /// protected from the insert-time sweep and goes at the next periodic one.
+    /// That is logged as a warning; it is not a reason to colour this axis for
+    /// every busy node.) The strip says what is happening in words instead.
+    Cache,
+    /// An admission limit (disk). Reaching it refuses new writes, so
+    /// approaching it is a real warning.
+    Admission,
+}
+
+/// How the strip's bar is coloured.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LimitTone {
+    Neutral,
+    Warn,
+    Danger,
+}
+
+impl LimitTone {
+    fn css_colour(self) -> &'static str {
+        match self {
+            LimitTone::Neutral => "var(--text-muted, #888)",
+            LimitTone::Warn => "var(--warn, #b8860b)",
+            LimitTone::Danger => "var(--danger, #c0392b)",
+        }
+    }
+}
+
+/// Displayed percentage from which a [`CeilingKind::Admission`] axis turns amber.
+const LIMIT_WARN_PCT: f64 = 75.0;
+/// Displayed percentage from which a [`CeilingKind::Admission`] axis turns red.
+const LIMIT_DANGER_PCT: f64 = 90.0;
+/// A ceiling is met at this displayed percentage.
+const LIMIT_FULL_PCT: f64 = 100.0;
+
+/// One of the hosting card's independent ceilings, as ranked and rendered by
+/// the "Closest limit" strip.
+struct LimitAxis {
+    name: &'static str,
+    kind: CeilingKind,
+    /// `used / budget`, unclamped.
+    utilisation: f64,
+    /// The axis in its own units, e.g. "508 of 508".
+    detail: String,
+    /// Hover text: what crossing this ceiling does.
+    tooltip: &'static str,
+    /// Visible text shown when the axis is over its limit.
+    over_note: &'static str,
+}
+
+impl LimitAxis {
+    /// The percentage as PRINTED. Colour thresholds are taken on this, not on
+    /// the raw ratio: colouring from the raw value while printing a rounded
+    /// one makes the two disagree at a boundary (89.6% prints as "90%" but
+    /// would colour as 89), and an operator cannot tell a red 90% from an
+    /// amber 90%.
+    ///
+    /// Not clamped. Over budget is a real, reachable state, and clamping
+    /// rendered it as "150 of 100 (100%)", which contradicts itself and hides
+    /// how far over the node is.
+    fn shown_pct(&self) -> f64 {
+        (self.utilisation * 100.0).round()
+    }
+
+    /// Strictly over the limit, judged on the raw ratio so it always agrees
+    /// with the detail text: "509 of 508" is over even though it prints as
+    /// "(100%)".
+    fn is_over(&self) -> bool {
+        self.utilisation > 1.0
+    }
+
+    fn tone(&self) -> LimitTone {
+        match self.kind {
+            CeilingKind::Cache => LimitTone::Neutral,
+            CeilingKind::Admission => {
+                let shown = self.shown_pct();
+                if shown >= LIMIT_DANGER_PCT {
+                    LimitTone::Danger
+                } else if shown >= LIMIT_WARN_PCT {
+                    LimitTone::Warn
+                } else {
+                    LimitTone::Neutral
+                }
+            }
+        }
+    }
+
+    /// The sentence shown under the bar, if the axis is in a state a reader
+    /// would otherwise have to interpret for themselves.
+    fn note(&self) -> Option<&'static str> {
+        // An admission limit already refuses growth AT its limit, not only
+        // past it, so exactly-full gets the same sentence as over.
+        let refusing = self.kind == CeilingKind::Admission && self.utilisation >= 1.0;
+        if self.is_over() || refusing {
+            return Some(self.over_note);
+        }
+        let shown = self.shown_pct();
+        match self.kind {
+            // Say it in words as well as by the absence of colour: a full bar
+            // under the heading "Closest limit" still looks like a problem.
+            // Only when it actually prints as full, so the sentence is never
+            // attached to a bar that visibly has room.
+            CeilingKind::Cache if shown >= LIMIT_FULL_PCT => Some(
+                "Full is normal here: the node keeps as many contracts as fit and \
+                 evicts the least-demanded to make room.",
+            ),
+            CeilingKind::Admission if shown >= LIMIT_DANGER_PCT => {
+                Some("New writes are refused once this is full.")
+            }
+            CeilingKind::Cache | CeilingKind::Admission => None,
+        }
+    }
+
+    fn render_strip(&self, lead: &str) -> String {
+        let shown = self.shown_pct();
+        // Only the bar WIDTH is capped: a fill cannot overflow its track.
+        let bar_pct = (self.utilisation * 100.0).min(LIMIT_FULL_PCT);
+        let note = self
+            .note()
+            .map(|n| format!(r#"<div class="hz-binding-note">{}</div>"#, html_escape(n)))
+            .unwrap_or_default();
+        format!(
+            r#"<div class="hz-binding" title="{tooltip}"><div class="hz-binding-head">{lead}: <strong>{name}</strong> — {detail} ({shown:.0}%)</div><div class="hz-bar" role="img" aria-label="{name} at {shown:.0} percent of its limit"><span class="hz-bar-fill" style="width: {bar_pct:.1}%; background: {tone};"></span></div>{note}</div>"#,
+            lead = html_escape(lead),
+            name = html_escape(self.name),
+            detail = html_escape(&self.detail),
+            tooltip = html_escape(self.tooltip),
+            tone = self.tone().css_colour(),
+        )
+    }
+}
+
+/// Build the demand-driven eviction card (#4642). Surfaces the
+/// capability-relative budgets and the per-contract rows that the
+/// subscriber-primary eviction sweep orders. Every value comes from
 /// `Ring::dashboard_hosting_snapshot` reading the canonical hosting cache;
 /// nothing is invented at render time. See `.claude/rules/hosting-invariants.md`.
+///
+/// The per-contract table shows `recency_seq`, NOT `keep_score` /
+/// `predicted_demand`. The latter two are the demoted telemetry-only
+/// Greedy-Dual estimator, which eviction does not read; presenting them as the
+/// eviction score described a mechanism retired by the subscriber-primary
+/// rework, and left the table sorted by a column it did not display (#4830).
+/// `recency_seq` is the ordering input the cache actually sorts these rows by.
 ///
 /// Hidden when the node hosts nothing (a fresh/idle node) — the budget still
 /// exists but there's nothing to retain, so the panel would just be noise.
@@ -1247,48 +1578,209 @@ pub fn build_hosting_card(snap: &Option<network_status::NetworkStatusSnapshot>) 
     }
 
     let budget = h.budget_bytes.max(1);
-    let used_pct = (h.used_bytes as f64 / budget as f64 * 100.0).min(100.0);
+    // NOT clamped to 100%. Over budget is the eviction trigger itself, so it
+    // is a state the operator most needs to see accurately; clamping rendered
+    // "150 B / 100 B (100%)", which contradicts its own numerator and hides
+    // how far over the node is. (Found when the binding strip below started
+    // reporting the true figure and the two disagreed — the clamp here
+    // predates this change.)
+    let used_pct = h.used_bytes as f64 / budget as f64 * 100.0;
     let headroom = h.budget_bytes.saturating_sub(h.used_bytes);
 
-    // Recently-read evictions are the miscalibration alarm (#4338): evicting a
-    // repeatedly-requested contract means the demand estimate is mis-ordering
-    // the working set. Color it when non-zero so an operator notices.
-    let recently_read_value = if h.evictions_of_recently_read_total > 0 {
-        format!(
-            r#"<span style="color: var(--danger, #c0392b);">{}</span>"#,
-            h.evictions_of_recently_read_total
-        )
-    } else {
-        "0".to_string()
-    };
-
-    // Per-contract table, bounded. Rows arrive in EVICTION order (lowest
-    // keep-score first); show at most MAX_ROWS. The tile carries the full count.
+    // Which limit is actually closest? The card shows three ceilings, and
+    // before this they were three flat rows of identical tiles with nothing
+    // saying which one binds. On a real low-RAM peer that is not academic: a
+    // measured framework node sat at 34% of its state-byte budget, 1% of its
+    // disk budget, and 99.2% of its then contract-slot ceiling (since #5647 the
+    // contract-memory ceiling) — the one number
+    // that mattered, rendered in the same muted grey as the two that had room
+    // to spare.
     //
-    // The "next to evict" badge marks the first EVICTION-ELIGIBLE row, not
-    // simply the lowest keep-score row. A contract still in use (a local client /
-    // downstream subscriber) is ordered LAST by the subscriber-primary sweep —
-    // shed only as a last resort when nothing with fewer subscribers is eligible —
-    // so it is not the common-case next victim. `is_eviction_eligible` reflects
-    // that (not in use; there is no longer a `min_ttl` age gate), so the badge
-    // never mislabels a contract the sweep would ordinarily keep. When nothing is
-    // currently eligible (every hosted contract is in use), no row is badged.
+    // Utilisation is computed per axis and the highest wins. A budget of 0 is
+    // "not configured / not yet measured", not "completely full", so those
+    // axes are skipped rather than reported as 100%. The disk budget is the
+    // real case: it is an `Option` because the tracker is unseeded early in a
+    // node's life, and ranking an absent denominator as full would report a
+    // phantom emergency on every fresh start.
+    //
+    // For the contract-memory axis this is defensive: its budget ends in
+    // `.max(MIN_RESIDENT_OVERHEAD_BUDGET_BYTES)` (64 MiB) in
+    // `resident_overhead_budget_for`, the only production source. The setter
+    // does not clamp, so 0 is unreachable by call-site convention, not by
+    // construction.
+    let axis_utilisation = |used: u64, budget: u64| -> Option<f64> {
+        (budget > 0).then(|| used as f64 / budget as f64)
+    };
+    // Each axis carries a note saying what CROSSING it actually does, because
+    // the three are not the same kind of ceiling and "closest limit" alone
+    // would imply they are:
+    //
+    //   - contract state: the sweep's own condition (`current_bytes >
+    //     budget_bytes`), so crossing fires it directly.
+    //   - contract memory: also a sweep condition, but only once the breach has
+    //     been SUSTAINED (`resident_overhead_over_budget` requires half of
+    //     RESIDENT_OVERHEAD_SUSTAINED_WINDOW, ~2.5 min). A transient spike to
+    //     99% here self-resolves without evicting anything, so the strip must
+    //     not read as though eviction is imminent.
+    //   - disk: not a sweep condition at all. Its direct consequence is
+    //     ADMISSION: `admit_state_write` / `admit_state_update` /
+    //     `admit_wasm_write` (disk_usage.rs) reject new growth once the
+    //     projected total exceeds the budget. It can additionally tighten the
+    //     contract-state limit via `effective = ram.min(disk_budget)`, but
+    //     only when the disk budget is the SMALLER of the two — on a typical
+    //     node it is not (measured: 1.0 GB RAM budget against 32.0 GB disk),
+    //     so saying "filling disk tightens the state limit" would be wrong in
+    //     the ordinary case and wrong precisely when writes start failing.
+    let mut axes: Vec<LimitAxis> = Vec::new();
+    if let Some(u) = axis_utilisation(h.used_bytes, h.budget_bytes) {
+        axes.push(LimitAxis {
+            name: "contract state",
+            kind: CeilingKind::Cache,
+            utilisation: u,
+            detail: format!(
+                "{} of {}",
+                format_bytes(h.used_bytes),
+                format_bytes(h.budget_bytes)
+            ),
+            tooltip: "Crossing this triggers an eviction sweep.",
+            over_note: "Over the limit, which is how eviction is triggered: the node is \
+             shedding its least-demanded contracts to get back under.",
+        });
+    }
+    if let (Some(used), Some(disk_budget)) = (h.disk_total_bytes, h.disk_budget_bytes) {
+        if let Some(u) = axis_utilisation(used, disk_budget) {
+            axes.push(LimitAxis {
+                name: "disk",
+                kind: CeilingKind::Admission,
+                utilisation: u,
+                detail: format!("{} of {}", format_bytes(used), format_bytes(disk_budget)),
+                tooltip: "Filling this rejects new writes — the disk admission gates refuse \
+                 state and WASM growth once the projected total would exceed the \
+                 budget. It does not by itself trigger an eviction sweep. It can \
+                 also tighten the contract-state limit, but only when the disk \
+                 budget is the smaller of the two, since that limit is \
+                 min(RAM budget, disk budget).",
+                over_note: "At its limit, so new writes are being refused.",
+            });
+        }
+    }
+    if let Some(u) = axis_utilisation(h.resident_overhead_bytes, h.resident_overhead_budget_bytes) {
+        axes.push(LimitAxis {
+            name: "contract memory",
+            kind: CeilingKind::Cache,
+            utilisation: u,
+            detail: format!(
+                "{} of {}",
+                format_bytes(h.resident_overhead_bytes),
+                format_bytes(h.resident_overhead_budget_bytes)
+            ),
+            tooltip: "Memory hosted contracts hold to stay up to date (neighbours' \
+             summaries). Crossing this triggers a sweep only if it stays over for a \
+             few minutes, so a brief spike here resolves on its own.",
+            over_note: "A little over is normal while summaries arrive. If it stays \
+             over for a few minutes the node evicts its least-demanded contracts.",
+        });
+    }
+    // Cost pressure (#4861) is deliberately absent: it is a sustained-rate
+    // condition on a single offending contract, not a utilisation ratio, so it
+    // has no comparable denominator to rank against these three.
+    //
+    // The closest axis is always shown. Any OTHER axis that is in a warning
+    // state is shown as well: a cache axis renders neutral however full it is,
+    // so a full contract-memory ceiling would otherwise outrank — and hide — a disk at
+    // 95%, which is the one axis here where nearly-full is a real problem.
+    axes.sort_by(|a, b| b.utilisation.total_cmp(&a.utilisation));
+    let binding: String = axes
+        .iter()
+        .enumerate()
+        .filter(|(i, axis)| *i == 0 || axis.tone() != LimitTone::Neutral)
+        .map(|(i, axis)| {
+            let lead = if i == 0 {
+                "Closest limit"
+            } else if axis.is_over() {
+                "Also over its limit"
+            } else {
+                "Also near its limit"
+            };
+            axis.render_strip(lead)
+        })
+        .collect();
+
+    // Deliberately NOT coloured. This used to go red whenever it was non-zero,
+    // as "the miscalibration alarm (#4338)". But it is a lifetime counter that
+    // increments for any evicted contract read twice or more over its whole
+    // residency, however long ago — so on a node running at its ceiling it is
+    // non-zero after a while and stays that way, which made the tile
+    // permanently red on a healthy peer. The signal `HostingCacheStats`
+    // documents is a rising RATE against budget evictions, and a bare count
+    // cannot show a rate; the tile beside it gives the denominator.
+    let recently_read_value = h.evictions_of_recently_read_total.to_string();
+
+    // Per-contract table, bounded. Rows arrive from the cache already sorted
+    // ascending by `(recency_seq, key)` — so `recency_seq` is the column that
+    // explains each row's position, and it is the one shown. `keep_score` and
+    // `predicted_demand` are the DEMOTED telemetry-only estimator: eviction
+    // reads neither, so rendering them here as though they ranked anything
+    // described a mechanism that was retired by the subscriber-primary rework
+    // (#4830). They are gone from this projection entirely — they survive only
+    // on the cache-side `HostedContract`, where they still drive the
+    // Greedy-Dual `eviction_floor` ratchet.
+    //
+    // Caveat the footer states rather than hides: the cache-side sort is only
+    // the ordering WITHIN the zero-subscriber tier. `victim_order` ranks
+    // local-subscription count and downstream-subscriber count above recency,
+    // and those counts are computed transiently during the sweep — the cache
+    // cannot see them, so they are not available to render.
+    //
+    // The "next to evict" badge marks the first EVICTION-ELIGIBLE row. A
+    // contract still in use (a local client / downstream subscriber) is ordered
+    // LAST by the sweep — shed only as a last resort when nothing with fewer
+    // subscribers is eligible — so it is not the common-case next victim.
+    // `is_eviction_eligible` reflects that (not in use; there is no longer a
+    // `min_ttl` age gate). When nothing is currently eligible (every hosted
+    // contract is in use), no row is badged.
     const MAX_ROWS: usize = 20;
     let next_victim_idx = h.contracts.iter().position(|c| c.eviction_eligible);
     let mut rows = String::new();
     for (i, c) in h.contracts.iter().take(MAX_ROWS).enumerate() {
         let next_badge = if Some(i) == next_victim_idx {
-            r#" <span class="hz-badge hz-next" title="Lowest keep-score among eviction-eligible contracts (not in use) — the over-budget sweep would evict this one first.">next to evict</span>"#
+            r#" <span class="hz-badge hz-next" title="First eviction-eligible contract (not pinned by a local client or downstream subscriber) in the sweep's order — the over-budget sweep would evict this one first.">next to evict</span>"#
         } else {
             ""
         };
+        // `recency_seq` is a per-run monotonic sequence, not a timestamp, and
+        // it is the EVICTION recency clock rather than a pure last-read time:
+        // `record_abandonment` also stamps a fresh seq when a contract loses
+        // its last subscriber, deliberately granting a grace period so a
+        // just-unsubscribed contract is not evicted on a stale read accrued
+        // while it sat in the subscription tier. Labelling this column "last
+        // access" would therefore be wrong. 0 means the clock has not been set
+        // since this process started (including every entry reloaded from disk
+        // at startup), which is why so many rows read "never" after a restart.
+        let recency = if c.recency_seq == 0 {
+            r#"<span style="color: var(--text-muted, #888);">never</span>"#.to_string()
+        } else {
+            c.recency_seq.to_string()
+        };
+        // A contract pinned by a local client or downstream subscriber is
+        // ordered LAST by the real sweep, but the cache-side sort this table
+        // shows cannot see subscriber counts — so a pinned, never-read contract
+        // lands at the top reading "never", looking exactly like the most
+        // evictable row. Mark it, or the ordering caveat in the footer is the
+        // only thing standing between the operator and the wrong conclusion.
+        let pin_badge = if c.eviction_eligible {
+            ""
+        } else {
+            r#" <span class="fresh-pill use-active" title="Pinned by a local client or downstream subscriber. The sweep evicts these last, regardless of this row's position.">in use</span>"#
+        };
         rows.push_str(&format!(
-            r#"<tr><td title="{full}" data-sort="{full}"><code>{short}</code><button type="button" class="copy-key" data-copy="{full}" title="Copy contract key" aria-label="Copy contract key">⧉</button>{next}</td><td class="right" data-sort="{keep:.6}">{keep:.3}</td><td class="right" data-sort="{demand:.6}">{demand:.3}</td><td class="right" data-sort="{size}">{size_fmt}</td><td class="right" data-sort="{reads}">{reads}</td></tr>"#,
+            r#"<tr><td title="{full}" data-sort="{full}"><a href="/contract/{full}" class="key-link"><code>{short}</code></a><button type="button" class="copy-key" data-copy="{full}" title="Copy contract key" aria-label="Copy contract key">⧉</button>{next}{pin}</td><td class="right" data-sort="{seq}">{recency}</td><td class="right" data-sort="{size}">{size_fmt}</td><td class="right" data-sort="{reads}">{reads}</td></tr>"#,
             full = html_escape(&c.key_full),
             short = html_escape(&c.key_short),
             next = next_badge,
-            keep = c.keep_score,
-            demand = c.predicted_demand,
+            pin = pin_badge,
+            seq = c.recency_seq,
+            recency = recency,
             size = c.size_bytes,
             size_fmt = format_bytes(c.size_bytes),
             reads = c.read_count,
@@ -1297,7 +1789,7 @@ pub fn build_hosting_card(snap: &Option<network_status::NetworkStatusSnapshot>) 
     let shown = (h.contracts.len()).min(MAX_ROWS);
     let footer = if (h.contract_count as usize) > shown {
         format!(
-            r#"<p class="empty" style="margin: 0.4rem 0.9rem 0.6rem; font-size: 0.78rem; color: var(--text-muted, #888);">Showing the {shown} most-evictable of {total} hosted contracts (lowest keep-score first).</p>"#,
+            r#"<p class="empty" style="margin: 0.4rem 0.9rem 0.6rem; font-size: 0.78rem; color: var(--text-muted, #888);">Showing {shown} of {total} hosted contracts, lowest eviction-recency first. That clock is set by a real GET or PUT and also when a contract loses its last subscriber, so it is not purely a last-read time. Contracts with a local client or downstream subscriber outrank recency and are evicted last, but those counts aren't available here — so this is the eviction order only among contracts with no subscribers.</p>"#,
             shown = shown,
             total = h.contract_count,
         )
@@ -1356,17 +1848,65 @@ pub fn build_hosting_card(snap: &Option<network_status::NetworkStatusSnapshot>) 
         _ => MEASURING.to_string(),
     };
 
+    // The state-byte tile was labelled "RAM used" until 2026-09. It is not RAM:
+    // `used_bytes` is `HostingCacheStats::current_bytes`, the tracked contract
+    // STATE bytes, and `budget_bytes` is a ceiling on that STATE — most of which
+    // lives on disk. Reading it as resident memory produced a real support
+    // thread: an operator saw a 4 GB node "near full" while the process used
+    // well under 1 GB, and the node's home page was the reason. The node's
+    // actual RSS is the `memory_rss_bytes` / `memory_limit_bytes` pair from
+    // `node::resource_metrics`, which is exported to telemetry and is NOT
+    // rendered anywhere on this page — so the tooltip must not send an operator
+    // looking for it here. Do NOT re-label this as memory: it is on-disk state.
+    // (The contract-memory tile below IS memory, and says so, because since
+    // #5647 its figure is counted bytes held in RAM.)
+    //
+    // The ceiling is NOT simply "RAM/8". `budget_bytes` is documented as "the
+    // RAM-scaled default, OR THE OPERATOR OVERRIDE" (`HostingCacheStats`), and
+    // `HostingManager::recompute_effective_budget` installs `ram.min(disk_budget)`
+    // on every 60s recompute. Stating the default as though it were the only path
+    // contradicts the disk tooltip on this very card, which already says
+    // `min(RAM budget, disk budget)` — and a confidently wrong explanation inside
+    // the fix for a wrong label is the same defect one layer out.
+    let state_tooltip = format!(
+        "Contract STATE bytes, not the node's resident memory. The node tracks \
+         {used} of stored contract state against a {budget} ceiling. That ceiling is \
+         whatever max-hosting-storage is set to, or by default one eighth of system \
+         RAM (clamped between 128 MB and 1 GB), tightened to the disk budget when \
+         that is smaller. Either way what it bounds is stored state, most of which \
+         lives on disk, so this filling up does not mean the process is using that \
+         much memory. The node's own resident memory is a separate measurement and \
+         is not shown on this page.",
+        used = format_bytes(h.used_bytes),
+        budget = format_bytes(h.budget_bytes),
+    );
+
+    // Contract-memory tiles (#5325, #5647): the state-byte budget above bounds
+    // contract STATE bytes, which live on disk. This axis bounds the memory
+    // hosted contracts hold in RAM, mostly neighbours' summaries, counted from
+    // what is stored rather than estimated per contract, so printing it in
+    // bytes is accurate.
+    let memory_tooltip = format!(
+        "Memory hosted contracts hold to stay up to date: each neighbour's summary of \
+         its copy, plus a small fixed amount per contract. Counted from what is \
+         stored. The budget is the --hosting-mem-share of this node's memory limit. \
+         Currently {used} of {budget}.",
+        used = format_bytes(h.resident_overhead_bytes),
+        budget = format_bytes(h.resident_overhead_budget_bytes),
+    );
+
     format!(
         r##"<div class="card">
-            <div class="card-header"><h2>Demand-driven eviction</h2><span class="g-mode g-mode-enforce">piece A</span></div>
-            <p class="empty" style="margin: 0.2rem 0.9rem 0.4rem; font-size: 0.82rem; color: var(--text-muted, #888);">Retention is demand-driven: contracts with the lowest predicted read-demand (keep-score) are evicted first when over budget. Since #4702 the eviction floor is min(RAM budget, disk budget) — either resource running low can trigger eviction.</p>
+            <div class="card-header"><h2>Demand-driven eviction</h2></div>
+            <p class="empty" style="margin: 0.2rem 0.9rem 0.4rem; font-size: 0.82rem; color: var(--text-muted, #888);">Retention is demand-driven. When over budget the node sheds contracts with the fewest subscribers first — a local client subscription outranks a downstream one, and among contracts with neither, the one with the lowest eviction-recency goes first. A sweep can be triggered by any of several independent pressures: contract state bytes, disk usage, the memory hosted contracts hold to stay up to date (#5325, #5647), or a single zero-demand contract taking a sustained share of the node's update work (#4861).</p>
+            {binding}
             <div class="g-verdict-row">
                 <div class="g-norms">
-                    <div class="g-norm"><div class="g-norm-label">RAM used</div><div class="g-norm-value">{used} / {budget} ({pct:.0}%)</div></div>
+                    <div class="g-norm" title="{state_tooltip}"><div class="g-norm-label">Contract state</div><div class="g-norm-value">{used} / {budget} ({pct:.0}%)</div></div>
                     <div class="g-norm"><div class="g-norm-label">Headroom</div><div class="g-norm-value">{headroom}</div></div>
                     <div class="g-norm"><div class="g-norm-label">Hosted</div><div class="g-norm-value">{count}</div></div>
                     <div class="g-norm"><div class="g-norm-label">Budget evictions</div><div class="g-norm-value">{budget_evictions}</div></div>
-                    <div class="g-norm"><div class="g-norm-label">Evicted w/ demand</div><div class="g-norm-value">{recently_read}</div></div>
+                    <div class="g-norm" title="Evictions of a contract that had been read at least twice while this node held it. A lifetime count since the node started, so it grows on any node running at its ceiling. It is only a concern if it is a large and rising share of budget evictions."><div class="g-norm-label">Evicted w/ demand</div><div class="g-norm-value">{recently_read}</div></div>
                 </div>
             </div>
             <div class="g-verdict-row">
@@ -1376,14 +1916,23 @@ pub fn build_hosting_card(snap: &Option<network_status::NetworkStatusSnapshot>) 
                     <div class="g-norm"><div class="g-norm-label">Disk headroom</div><div class="g-norm-value">{disk_headroom}</div></div>
                 </div>
             </div>
+            <div class="g-verdict-row">
+                <div class="g-norms">
+                    <div class="g-norm" title="{memory_tooltip}"><div class="g-norm-label">Contract memory</div><div class="g-norm-value">{memory_used} / {memory_budget}</div></div>
+                    <div class="g-norm"><div class="g-norm-label">Memory headroom</div><div class="g-norm-value">{memory_headroom}</div></div>
+                    <div class="g-norm" title="Evictions where contract memory was the active pressure (#5325). May overlap with budget evictions."><div class="g-norm-label">Memory-pressure evictions</div><div class="g-norm-value">{resident_overhead_evictions}</div></div>
+                </div>
+            </div>
             <div class="table-wrap">
                 <table class="sortable" data-table-id="hosting">
-                    <thead><tr><th data-sort-type="text">Contract</th><th class="right" data-sort-type="num">Keep-score</th><th class="right" data-sort-type="num">Demand</th><th class="right" data-sort-type="num">Size</th><th class="right" data-sort-type="num">Reads</th></tr></thead>
+                    <thead><tr><th data-sort-type="text">Contract</th><th class="right" data-sort-type="num" title="The eviction recency clock: a per-run sequence, higher is more recent. Reset by a real GET or PUT, and also when a contract loses its last subscriber — the sweep deliberately gives a just-unsubscribed contract a grace period, so this is NOT purely a last-read time. &quot;never&quot; means the clock has not been set since this node started, which includes everything reloaded from disk at startup. This is the column the eviction sweep orders by among contracts with no subscribers.">Recency</th><th class="right" data-sort-type="num">Size</th><th class="right" data-sort-type="num">Reads</th></tr></thead>
                     <tbody>{rows}</tbody>
                 </table>
             </div>
             {footer}
         </div>"##,
+        binding = binding,
+        state_tooltip = html_escape(&state_tooltip),
         used = format_bytes(h.used_bytes),
         budget = format_bytes(h.budget_bytes),
         pct = used_pct,
@@ -1395,6 +1944,14 @@ pub fn build_hosting_card(snap: &Option<network_status::NetworkStatusSnapshot>) 
         disk_used = disk_used_value,
         disk_budget = disk_budget_value,
         disk_headroom = disk_headroom_value,
+        memory_tooltip = html_escape(&memory_tooltip),
+        memory_used = format_bytes(h.resident_overhead_bytes),
+        memory_budget = format_bytes(h.resident_overhead_budget_bytes),
+        memory_headroom = format_bytes(
+            h.resident_overhead_budget_bytes
+                .saturating_sub(h.resident_overhead_bytes)
+        ),
+        resident_overhead_evictions = h.resident_overhead_evictions_total,
         rows = rows,
         footer = footer,
     )
@@ -1537,7 +2094,7 @@ pub fn build_contracts_card(snap: &Option<network_status::NetworkStatusSnapshot>
         // Sort healthiest-first: freshness weighs more than in-use demand.
         let fresh_sort = (c.is_receiving_updates as u8) * 2 + (c.in_use as u8);
         rows.push_str(&format!(
-            r#"<tr><td title="{full}" data-sort="{full}"><code>{short}</code><button type="button" class="copy-key" data-copy="{full}" title="Copy contract key" aria-label="Copy contract key">⧉</button></td><td data-sort="{fresh_sort}"><span class="fresh-pill {fresh_class}">{fresh_label}</span> <span class="fresh-pill {use_class}">{use_label}</span></td><td data-sort="{sub_secs}">{subscribed}</td><td data-sort="{last_sort}">{last_update}</td></tr>"#,
+            r#"<tr><td title="{full}" data-sort="{full}"><a href="/contract/{full}" class="key-link"><code>{short}</code></a><button type="button" class="copy-key" data-copy="{full}" title="Copy contract key" aria-label="Copy contract key">⧉</button></td><td data-sort="{fresh_sort}"><span class="fresh-pill {fresh_class}">{fresh_label}</span> <span class="fresh-pill {use_class}">{use_label}</span></td><td data-sort="{sub_secs}">{subscribed}</td><td data-sort="{last_sort}">{last_update}</td></tr>"#,
             full = html_escape(&c.key_full),
             short = html_escape(&c.key_short),
             fresh_sort = fresh_sort,
@@ -1555,6 +2112,7 @@ pub fn build_contracts_card(snap: &Option<network_status::NetworkStatusSnapshot>
     format!(
         r#"<div class="card">
             <h2>Subscribed Contracts</h2>
+            {filter_controls}
             <div class="table-wrap">
                 <table class="sortable" data-table-id="contracts">
                     <thead><tr><th data-sort-type="text">Contract</th><th data-sort-type="num">Freshness</th><th data-sort-type="num">Subscribed</th><th data-sort-type="num">Last Update</th></tr></thead>
@@ -1562,6 +2120,7 @@ pub fn build_contracts_card(snap: &Option<network_status::NetworkStatusSnapshot>
                 </table>
             </div>
         </div>"#,
+        filter_controls = table_filter_controls("contracts", "contracts"),
         rows = rows,
     )
 }

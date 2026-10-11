@@ -1196,3 +1196,153 @@ async fn deferrable_supplied_related_never_inline_fetches() {
         }
     }
 }
+
+// =========================================================================
+// End-to-end: does the validation-resolved related state actually reach a bundle?
+// =========================================================================
+
+/// The one test that exercises the whole chain rather than its links.
+///
+/// Every other guard on this path is a source pin: it proves the call is written, not
+/// that it fires, not that it fires with the right contract, and not that what it sends
+/// survives into a bundle a replay can read. That gap is not hypothetical — #5376
+/// shipped with a GREEN pin because the pin guarded a function production never runs.
+///
+/// So this drives a real `RequestRelated` through `upsert_contract_state`, which is the
+/// path a network peer takes (`bridged_upsert_contract_state_inner` ->
+/// `fetch_related_for_validation`), with capture switched on, and asserts the related
+/// state is in the written bundle.
+///
+/// # Why a child process
+///
+/// `conformance::capture::global()` resolves its directory from the environment ONCE
+/// per process and caches it in a `OnceLock`. A test that set the variable in-process
+/// would either lose the race with any earlier `global()` call or poison every other
+/// test in the binary. Re-exec is the repo's documented answer for exactly this shape
+/// (see `util::test_log_capture`), and unlike relying on `cargo nextest`'s
+/// per-process isolation it holds under plain `cargo test` too.
+#[cfg(test)]
+mod capture_e2e {
+    use super::*;
+
+    const CHILD_ENV: &str = "FREENET_TEST_CAPTURE_E2E_CHILD";
+    const CHILD_TEST: &str = "contract::executor::pool_tests::related_contract_tests::capture_e2e::\
+         validation_related_state_reaches_the_bundle";
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn validation_related_state_reaches_the_bundle() {
+        if std::env::var(CHILD_ENV).is_err() {
+            // Parent: re-exec ourselves with capture pointed at a scratch directory.
+            let dir = tempfile::TempDir::new().expect("tempdir");
+            let exe = std::env::current_exe().expect("test binary path");
+            let output = std::process::Command::new(exe)
+                .args(["--exact", "--test-threads=1", "--nocapture", CHILD_TEST])
+                .env(CHILD_ENV, "1")
+                .env("FREENET_CONFORMANCE_CAPTURE_DIR", dir.path())
+                .env("FREENET_CONFORMANCE_CAPTURE_WIDE", "1")
+                .output()
+                .expect("re-exec the test binary");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                output.status.success(),
+                "child run failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+            );
+            // Fail CLOSED on a rename: libtest exits 0 when its filter matches nothing,
+            // so without this the whole check goes vacuous the moment this function is
+            // renamed.
+            assert!(
+                stdout.contains("1 passed"),
+                "the child did not run {CHILD_TEST} — if this was renamed, update \
+                 CHILD_TEST.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+            );
+            return;
+        }
+
+        // ---- child ----
+        let capture_dir = std::path::PathBuf::from(
+            std::env::var("FREENET_CONFORMANCE_CAPTURE_DIR").expect("capture dir"),
+        );
+        assert!(
+            crate::conformance::capture::global().is_some(),
+            "capture did not start, so this test cannot observe anything"
+        );
+
+        let mut executor = create_executor().await;
+
+        // The contract whose state the gated one needs in order to validate.
+        let gate = make_contract(b"e2e_gate_code");
+        let gate_key = gate.key();
+        executor
+            .upsert_contract_state(
+                gate_key,
+                Either::Left(WrappedState::new(br#"{"open": true}"#.to_vec())),
+                RelatedContracts::default(),
+                Some(gate),
+            )
+            .await
+            .expect("gate PUT");
+
+        // The gated contract: give it a transition FIRST, so it is tracked. Related
+        // state is merged into an existing entry and never creates one — a contract
+        // with no samples cannot produce a case, so there would be nothing to attach to.
+        let gated = make_contract(b"e2e_gated_code");
+        let gated_key = gated.key();
+        executor
+            .upsert_contract_state(
+                gated_key,
+                Either::Left(WrappedState::new(br#"{"count": 0}"#.to_vec())),
+                RelatedContracts::default(),
+                Some(gated.clone()),
+            )
+            .await
+            .expect("gated PUT");
+
+        // Now make validation demand the gate's state, and update again.
+        executor.runtime.validate_overrides.insert(
+            *gated_key.id(),
+            ValidateOverride::RequestRelated(vec![*gate_key.id()]),
+        );
+        executor
+            .upsert_contract_state(
+                gated_key,
+                Either::Left(WrappedState::new(br#"{"count": 1}"#.to_vec())),
+                RelatedContracts::default(),
+                Some(gated),
+            )
+            .await
+            .expect("gated UPDATE requesting related");
+
+        // The writer flushes on an interval, so wait for the bundle rather than
+        // assuming it is already there.
+        let path = capture_dir.join(format!("{}.bundle", gated_key.id()));
+        let mut bundle = None;
+        for _ in 0..100 {
+            if path.exists() {
+                if let Ok(b) = crate::conformance::bundle::ReplayBundle::read_from(&path) {
+                    if !b.related.is_empty() {
+                        bundle = Some(b);
+                        break;
+                    }
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+
+        let bundle = bundle.unwrap_or_else(|| {
+            panic!(
+                "no bundle at {} carried related state within 10s. The executor \
+                 resolved the gate's state to validate, and capture was supposed to \
+                 record it — if this fails, validation-resolved related state is not \
+                 reaching the corpus and contracts that depend on it stay unjudgeable.",
+                path.display()
+            )
+        });
+
+        assert!(
+            bundle.related.iter().any(|(id, _)| *id == *gate_key.id()),
+            "the bundle carries related state, but not the gate's: {:?}",
+            bundle.related.iter().map(|(id, _)| *id).collect::<Vec<_>>()
+        );
+    }
+}

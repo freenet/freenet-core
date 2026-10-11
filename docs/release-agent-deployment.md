@@ -1,5 +1,14 @@
 # Release-agent deployment
 
+> **nova runs TWO gateway processes**, `freenet-gateway` (:31337) and
+> `freenet-gateway-2` (:31338). Only the first has a release-agent. The second
+> carries `WantedBy=freenet-gateway.service`, so the same stop/start cycle brings
+> it up, and `gateway-auto-update.sh` verifies companion units found in the
+> primary's `.wants` directories — a companion that fails to start now fails the
+> update rather than being reported as a success. Do NOT install a second
+> release-agent for it.
+
+
 Per-gateway install steps for `freenet-release-agent`. Tracked in
 [#4073](https://github.com/freenet/freenet-core/issues/4073).
 Companion files live in [`scripts/release-agent/`](../scripts/release-agent/).
@@ -79,7 +88,6 @@ The end-to-end pipeline needs these repository secrets (set with
 | Secret | Used by | Source |
 |---|---|---|
 | `RELEASE_AGENT_HMAC_NOVA` | `gateway-update.yml` + `release-announce.yml` | nova's `/etc/freenet-release-agent/hmac.key` (echoed once by `install.sh`) |
-| `RELEASE_AGENT_HMAC_VEGA` | `gateway-update.yml` | vega's `/etc/freenet-release-agent/hmac.key` |
 | `MATRIX_HOMESERVER_URL` | `release-announce.yml` | e.g. `https://matrix.org` |
 | `MATRIX_ACCESS_TOKEN` | `release-announce.yml` | Matrix bot user's access token (from `Settings → Help & About → Advanced → Access Token`) |
 
@@ -114,7 +122,7 @@ scp target/release/freenet-release-agent <gateway>:/tmp/
 #    vhost: nova → update.nova.locut.us).
 cd /path/to/freenet-core/scripts/release-agent/
 cp /tmp/freenet-release-agent ./freenet-release-agent
-sudo bash install.sh nova           # or vega, etc.
+sudo bash install.sh nova           # one agent per HOST, not per gateway process
 ```
 
 `install.sh` is idempotent — re-running won't overwrite an existing
@@ -182,7 +190,13 @@ No cloud SG to deal with. Recommended source restriction:
 (~3000 CIDRs from `https://api.github.com/meta`) and rotate weekly, so
 narrowing the SG creates more breakage than it prevents.
 
-### vega (AWS EC2)
+### vega (AWS EC2) — RETIRED September 2026
+
+> Retired. Kept because it documents the only deployment where ghostkey-api
+> owned :80/:443 and forced the agent onto :8443 — useful precedent if another
+> host ever needs that shape. No longer a rollout target: out of the release
+> matrix, out of `release.sh`, and `RELEASE_AGENT_HMAC_VEGA` is unused.
+
 
 Vega differs from nova: `ghostkey-api` (gkapi.freenet.org) already owns
 :80 and :443 on this host, so the release-agent uses a **non-standard

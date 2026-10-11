@@ -1,6 +1,8 @@
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{HashMap, HashSet},
+    pin::Pin,
     sync::{Arc, Mutex as StdMutex, OnceLock},
+    task::{Context, Poll},
     time::Duration,
 };
 
@@ -38,6 +40,16 @@ pub const AUTH_TOKEN_INVALID_CLOSE_CODE: u16 = 4401;
 /// overhead.
 const WEBSOCKET_PING_INTERVAL: Duration = Duration::from_secs(30);
 
+/// Most bytes one read syscall on a client WebSocket takes, and so the most
+/// tungstenite zero-fills before each read attempt (see `configure_upgrade`).
+/// 16 KiB holds any ordinary request in one read; larger frames just take more
+/// reads into a buffer already reserved at their full length.
+const WEBSOCKET_READ_BUFFER_SIZE: usize = 16 * 1024;
+
+/// Largest client WebSocket message, and frame, the node accepts (see
+/// `configure_upgrade`).
+const WEBSOCKET_MAX_MESSAGE_SIZE: usize = 100 * 1024 * 1024;
+
 /// Per-client rate limiter for delegate operations.
 ///
 /// Wraps `TrackedBackoff` to throttle clients that repeatedly send requests
@@ -51,8 +63,50 @@ const WEBSOCKET_PING_INTERVAL: Duration = Duration::from_secs(30);
 ///   error response without forwarding to the node or blocking the event loop)
 /// - On incoming responses: extracts the delegate key directly from the error
 ///   or success response to record backoff state (no correlation needed)
+///
+/// Two lanes (#5727). Registration failures (`RegisterError`) back off
+/// registrations; every other delegate error backs off the other delegate
+/// operations. Since #5727 a network-mode node answers a request to an
+/// unregistered delegate with `DelegateError::Missing`, which arms the
+/// operations lane for that key. The registration that fixes it must not be
+/// refused by that, while a registration that itself keeps failing must still
+/// be throttled.
 struct DelegateRateLimiter {
+    /// Operations lane: armed by `Missing`, `MissingSecret`, and so on.
     backoff: TrackedBackoff<[u8; 32]>,
+    /// Registration lane: armed only by `RegisterError`.
+    register_backoff: TrackedBackoff<[u8; 32]>,
+}
+
+/// Which [`DelegateRateLimiter`] lane a request is checked against, or an error
+/// is recorded into.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BackoffLane {
+    Registration,
+    Operations,
+}
+
+impl BackoffLane {
+    // Wildcards: `ApplicationMessages`, `UnregisterDelegate`, every other
+    // error, and any future variant stay on the operations lane, which is the
+    // pre-#5727 behaviour. Only registration is carved out.
+    #[allow(clippy::wildcard_enum_match_arm)]
+    fn for_request(req: &freenet_stdlib::client_api::DelegateRequest<'_>) -> Self {
+        match req {
+            freenet_stdlib::client_api::DelegateRequest::RegisterDelegate { .. } => {
+                Self::Registration
+            }
+            _ => Self::Operations,
+        }
+    }
+
+    #[allow(clippy::wildcard_enum_match_arm)]
+    fn for_error(err: &DelegateError) -> Self {
+        match err {
+            DelegateError::RegisterError(_) => Self::Registration,
+            _ => Self::Operations,
+        }
+    }
 }
 
 impl DelegateRateLimiter {
@@ -62,28 +116,49 @@ impl DelegateRateLimiter {
             Duration::from_secs(5),     // max: 5s cap
         );
         Self {
-            backoff: TrackedBackoff::new(config, 64),
+            backoff: TrackedBackoff::new(config.clone(), 64),
+            register_backoff: TrackedBackoff::new(config, 64),
         }
     }
 
-    /// Check if a delegate key is currently in backoff.
+    /// Check if a delegate key is currently in backoff on `lane`.
     /// Returns the remaining backoff duration, or `None` if the request can proceed.
-    fn check_backoff(&self, delegate_key: &[u8]) -> Option<Duration> {
+    fn check_backoff_in(&self, delegate_key: &[u8], lane: BackoffLane) -> Option<Duration> {
         let key = to_key_array(delegate_key)?;
-        self.backoff.remaining_backoff(&key)
-    }
-
-    /// Record a delegate error for a specific key (extracted from the error response).
-    fn record_error(&mut self, delegate_key: &[u8]) {
-        if let Some(key) = to_key_array(delegate_key) {
-            self.backoff.record_failure(key);
+        match lane {
+            BackoffLane::Registration => self.register_backoff.remaining_backoff(&key),
+            BackoffLane::Operations => self.backoff.remaining_backoff(&key),
         }
     }
 
-    /// Record a successful delegate response. Clears backoff for the key.
+    /// Record a delegate error for a specific key on `lane`.
+    fn record_error_in(&mut self, delegate_key: &[u8], lane: BackoffLane) {
+        if let Some(key) = to_key_array(delegate_key) {
+            match lane {
+                BackoffLane::Registration => self.register_backoff.record_failure(key),
+                BackoffLane::Operations => self.backoff.record_failure(key),
+            }
+        }
+    }
+
+    /// Operations-lane shorthand, kept for the existing backoff tests.
+    #[cfg(test)]
+    fn check_backoff(&self, delegate_key: &[u8]) -> Option<Duration> {
+        self.check_backoff_in(delegate_key, BackoffLane::Operations)
+    }
+
+    /// Operations-lane shorthand, kept for the existing backoff tests.
+    #[cfg(test)]
+    fn record_error(&mut self, delegate_key: &[u8]) {
+        self.record_error_in(delegate_key, BackoffLane::Operations);
+    }
+
+    /// Record a successful delegate response. Clears both lanes for the key:
+    /// a delegate that answered is registered and executable.
     fn record_success(&mut self, delegate_key: &[u8]) {
         if let Some(key) = to_key_array(delegate_key) {
             self.backoff.record_success(&key);
+            self.register_backoff.record_success(&key);
         }
     }
 }
@@ -128,7 +203,8 @@ use freenet_stdlib::{
 use futures::{FutureExt, SinkExt, StreamExt, future::BoxFuture, stream::SplitSink};
 use headers::Header;
 use serde::Deserialize;
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::mpsc;
+use tokio_stream::StreamMap;
 use zeroize::Zeroizing;
 
 use crate::{
@@ -140,7 +216,7 @@ use crate::{
     },
 };
 
-use super::{ClientError, ClientEventsProxy, ClientId, HostResult, OpenRequest};
+use super::{ClientError, ClientEventsProxy, ClientId, ConnectionScope, HostResult, OpenRequest};
 use crate::client_events::user_op_rate_limit::UserOpRateLimiter;
 use crate::server::client_api::OriginContractMap;
 use crate::wasm_runtime::UserSecretContext;
@@ -550,6 +626,7 @@ impl WebSocketProxy {
         req: Box<ClientRequest<'static>>,
         auth_token: Option<AuthToken>,
         origin_contract: Option<ContractInstanceId>,
+        connection_scope: ConnectionScope,
         user_context: Option<UserSecretContext>,
     ) -> Option<OpenRequest<'static>> {
         let (tx, rx) =
@@ -571,6 +648,7 @@ impl WebSocketProxy {
                 .with_notification(tx)
                 .with_token(auth_token)
                 .with_origin_contract(origin_contract)
+                .with_connection_scope(connection_scope)
                 .with_user_context(user_context),
         )
     }
@@ -597,6 +675,7 @@ impl WebSocketProxy {
                 Ok(None)
             }
             ClientConnection::Request {
+                connection_scope,
                 client_id,
                 req,
                 auth_token,
@@ -651,6 +730,7 @@ impl WebSocketProxy {
                         req,
                         auth_token,
                         origin_contract,
+                        connection_scope,
                         user_context,
                     ) {
                         Some(r) => r,
@@ -660,6 +740,7 @@ impl WebSocketProxy {
                     OpenRequest::new(client_id, req)
                         .with_token(auth_token)
                         .with_origin_contract(origin_contract)
+                        .with_connection_scope(connection_scope)
                         .with_user_context(user_context)
                 };
                 Ok(Some(open_req))
@@ -783,24 +864,13 @@ pub(crate) enum UserTokenDecision {
     Local,
 }
 
-/// Whether a source IP is loopback (`127.0.0.0/8`, `::1`), after normalizing an
-/// IPv4-mapped IPv6 source (`::ffff:127.0.0.1`) from a dual-stack socket.
+/// Whether a source IP is loopback. A direct local browser, or a
+/// TLS-terminating reverse proxy colocated on the same host, both connect from
+/// loopback; anything off-host cannot forge it.
 ///
-/// Loopback is the trust anchor for honoring a durable per-user token: a direct
-/// local browser, or a TLS-terminating reverse proxy colocated on the same host,
-/// both connect from loopback. Anything off-host cannot forge a loopback source
-/// (the kernel sets it from the accepted socket — see `ConnectInfo<SocketAddr>`
-/// in `private_network_filter`), so it is a sound, non-spoofable signal that the
-/// plaintext HTTP port was NOT exposed to the network for this connection.
-pub(crate) fn is_loopback_source(ip: std::net::IpAddr) -> bool {
-    match ip {
-        std::net::IpAddr::V4(v4) => v4.is_loopback(),
-        std::net::IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
-            Some(v4) => v4.is_loopback(),
-            None => v6.is_loopback(),
-        },
-    }
-}
+/// Re-exported from [`crate::client_events::types`] so this file and
+/// [`ConnectionScope`] share ONE definition — see its rustdoc for why.
+pub(crate) use super::types::is_loopback_source;
 
 /// The security-critical gate: decide whether to honor a per-user `userToken`.
 ///
@@ -1107,9 +1177,20 @@ async fn connection_info(
         request_path = req.uri().path(),
         "connection_info middleware: resolved auth token, hosted-mode context, and encoding protocol",
     );
+    // ATTESTED-ORIGIN scope (GHSA-824h-7x5x-wfmf). Classified HERE, from the
+    // same kernel-observed `source_ip` the token gate above already reads, and
+    // NOT inside `websocket_commands`'s `on_upgrade` closure — that closure has
+    // no extractor and therefore no access to `ConnectInfo`, which is exactly
+    // why the connection's scope has to be captured at this layer and carried
+    // down as an extension (mirroring `user_context`).
+    //
+    // Fail closed: a missing `ConnectInfo` yields `Remote`, so a connection we
+    // cannot prove local never receives an attested application identity.
+    let connection_scope = ConnectionScope::from_source_ip(source_ip);
     req.extensions_mut().insert(encoding_protoc);
     req.extensions_mut().insert(auth_token);
     req.extensions_mut().insert(user_context);
+    req.extensions_mut().insert(connection_scope);
     // `streaming` query parameter is accepted but ignored — streaming is now
     // always enabled for payloads exceeding CHUNK_THRESHOLD (512 KiB).
 
@@ -1128,6 +1209,11 @@ async fn websocket_commands(
     // (hosted mode). `None` outside hosted mode or when no user token was
     // presented. Owned and moved into the connection task below.
     Extension(user_context): Extension<Option<UserSecretContext>>,
+    // Whether this connection is entitled to an attested application identity
+    // (GHSA-824h-7x5x-wfmf), classified in `connection_info` from the
+    // kernel-observed peer address. Moved into the connection task below and
+    // fixed for the connection's lifetime, exactly like `user_context`.
+    Extension(connection_scope): Extension<ConnectionScope>,
     // Per-node per-user operation rate limiter (#4561, P5 of #4381). Installed
     // as an `Extension` by `serve_client_api_in_impl` (the only path that has
     // the operator config). OPTIONAL: the standalone `create_router` test path
@@ -1200,6 +1286,7 @@ async fn websocket_commands(
             rs.clone(),
             auth_and_instance,
             user_context,
+            connection_scope,
             op_rate_limiter,
             activity_secrets_dir,
             token_is_invalid,
@@ -1220,11 +1307,28 @@ async fn websocket_commands(
         }
     };
 
-    // 100MB limit: WASM contract uploads can be very large and the default
-    // ~64KB would reject them. Streaming chunks individual responses but the
-    // initial PUT still arrives as a single WebSocket message.
-    ws.max_message_size(100 * 1024 * 1024)
-        .on_upgrade(on_upgrade)
+    configure_upgrade(ws).on_upgrade(on_upgrade)
+}
+
+/// Transport limits for a client WebSocket. Shared with the end-to-end tests so
+/// they exercise the shipped configuration.
+fn configure_upgrade(ws: WebSocketUpgrade) -> WebSocketUpgrade {
+    // 100MB limit: WASM contract uploads can be very large and tungstenite's
+    // defaults (64 MiB per message, 16 MiB per frame) would reject them.
+    // Streaming chunks individual responses but the initial PUT still arrives
+    // as a single WebSocket message, and browsers send a message as ONE frame,
+    // so the frame limit has to match the message limit or any PUT over
+    // 16 MiB is refused and the connection reset.
+    //
+    // Read buffer: tungstenite's `FrameCodec::read_in` zero-fills the read
+    // buffer up to `read_buffer_size` before EVERY read attempt, including
+    // ones that return WouldBlock, so the 128 KiB default cost a 128 KiB memset
+    // per poll of the connection (2.5% of node CPU on a hosted peer, #5795).
+    // The setting only caps how much one read syscall takes: a frame's full
+    // length is still reserved up front, so large messages are unaffected.
+    ws.max_message_size(WEBSOCKET_MAX_MESSAGE_SIZE)
+        .max_frame_size(WEBSOCKET_MAX_MESSAGE_SIZE)
+        .read_buffer_size(WEBSOCKET_READ_BUFFER_SIZE)
 }
 
 /// Send a synthetic Disconnect to the node so subscription cleanup always runs.
@@ -1232,6 +1336,7 @@ async fn notify_disconnect(
     request_sender: &WebSocketRequest,
     client_id: ClientId,
     auth_token: &Option<(AuthToken, ContractInstanceId)>,
+    connection_scope: ConnectionScope,
     api_version: ApiVersion,
 ) {
     tracing::debug!(%client_id, "Notifying node of disconnect for subscription cleanup");
@@ -1241,6 +1346,7 @@ async fn notify_disconnect(
             req: Box::new(ClientRequest::Disconnect { cause: None }),
             auth_token: auth_token.as_ref().map(|t| t.0.clone()),
             origin_contract: auth_token.as_ref().map(|t| t.1),
+            connection_scope,
             // Synthetic disconnect: no secret operations, so no user context.
             user_context: None,
             api_version,
@@ -1260,6 +1366,11 @@ async fn websocket_interface(
     // `ClientConnection::Request` so every request from this connection (and
     // only this connection) binds to the same user namespace.
     user_context: Option<UserSecretContext>,
+    // Whether this connection may receive an attested application identity
+    // (GHSA-824h-7x5x-wfmf). Classified once in `connection_info` from the
+    // kernel-observed peer address and immutable for the connection's life,
+    // like `user_context`; copied into every `ClientConnection::Request`.
+    connection_scope: ConnectionScope,
     // Per-node per-user op rate limiter (hosted mode, #4561). `None` on the
     // standalone/local paths that install no limiter. Shared across all of a
     // user's connections; consulted in `process_client_request` only when this
@@ -1287,8 +1398,9 @@ async fn websocket_interface(
     if let (Some(ctx), Some(dir)) = (user_context.as_ref(), activity_secrets_dir.as_ref()) {
         stamp_activity(dir, ctx);
     }
-    let contract_updates: Arc<Mutex<VecDeque<(_, mpsc::Receiver<HostResult>)>>> =
-        Arc::new(Mutex::new(VecDeque::new()));
+    // Subscription notification receivers for this connection. Owned by this
+    // task alone (no lock) and polled event-driven from the select! below.
+    let mut listeners = SubscriptionListeners::default();
 
     // ReassemblyBuffer evicts incomplete streams after STREAM_TTL (60s) via
     // evict_stale(), called on every receive_chunk(). Concurrent streams are
@@ -1329,7 +1441,14 @@ async fn websocket_interface(
         // (since auth_token=None), so the delegate receives origin=None and fails with
         // "missing message origin". The client handles AUTH_TOKEN_INVALID by reloading
         // the page to get a fresh token, so closing is the correct behavior.
-        notify_disconnect(&request_sender, client_id, &auth_token, api_version).await;
+        notify_disconnect(
+            &request_sender,
+            client_id,
+            &auth_token,
+            connection_scope,
+            api_version,
+        )
+        .await;
         // Close with the trusted application code (not a bare close) so the shell
         // can distinguish a stale-token rejection from any other disconnect and
         // recover autonomously — see AUTH_TOKEN_INVALID_CLOSE_CODE. The serialized
@@ -1355,36 +1474,17 @@ async fn websocket_interface(
     ping_interval.tick().await;
 
     loop {
-        let contract_updates_cp = contract_updates.clone();
-        let listeners_task = async move {
-            loop {
-                let mut lock = contract_updates_cp.lock().await;
-                let active_listeners = &mut *lock;
-                for _ in 0..active_listeners.len() {
-                    if let Some((key, mut listener)) = active_listeners.pop_front() {
-                        match listener.try_recv() {
-                            Ok(r) => {
-                                active_listeners.push_back((key, listener));
-                                return Ok::<_, anyhow::Error>(r);
-                            }
-                            Err(mpsc::error::TryRecvError::Empty) => {
-                                active_listeners.push_back((key, listener));
-                            }
-                            Err(mpsc::error::TryRecvError::Disconnected) => {
-                                tracing::debug!(contract = %key, "listener removed");
-                            }
-                        }
-                    }
-                }
-                std::mem::drop(lock);
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        };
-
         // IMPORTANT: Only cancellation-safe futures (recv, next, tick) go inside the
         // select futures below. Processing functions (process_client_request,
         // process_host_response) run in branch handlers AFTER the select resolves,
-        // so they cannot be cancelled by other branches.
+        // so they cannot be cancelled by other branches. `listeners.next()` is
+        // cancel-safe too: it only polls `mpsc::Receiver::poll_recv`, which never
+        // loses a message when the future is dropped before completing.
+        //
+        // Every branch is event-driven (woken by its own waker), so an idle
+        // connection does not wake at all between pings. Do NOT reintroduce a
+        // timer-polled branch here: each loop pass re-polls `client_stream`, and
+        // every such poll costs a read-buffer memset in tungstenite (#5795).
         //
         // NOTE: Do NOT add `biased;` here. Biased select polls branches in declaration
         // order, which starves host responses, subscription notifications, and pings
@@ -1396,7 +1496,7 @@ async fn websocket_interface(
                 {
                     Err(err) => {
                         tracing::debug!(err = %err, "client channel closed");
-                        notify_disconnect(&request_sender, client_id, &auth_token, api_version).await;
+                        notify_disconnect(&request_sender, client_id, &auth_token, connection_scope, api_version).await;
                         if let Err(e) = server_sink.send(Message::Close(None)).await {
                             tracing::debug!(error = %e, "Failed to send WebSocket close frame");
                         }
@@ -1411,6 +1511,7 @@ async fn websocket_interface(
                     &request_sender,
                     &mut auth_token.as_mut().map(|t| t.0.clone()),
                     auth_token.as_mut().map(|t| t.1),
+                    connection_scope,
                     user_context.as_ref(),
                     op_rate_limiter.as_ref(),
                     activity_secrets_dir.as_ref(),
@@ -1423,14 +1524,14 @@ async fn websocket_interface(
                     Ok(Some(error)) => {
                         if let Err(err) = server_sink.send(error).await {
                             tracing::debug!(err = %err, "error sending error response to client");
-                            notify_disconnect(&request_sender, client_id, &auth_token, api_version).await;
+                            notify_disconnect(&request_sender, client_id, &auth_token, connection_scope, api_version).await;
                             return Err(err.into());
                         }
                     }
                     Ok(None) => continue,
                     Err(None) => {
                         tracing::debug!(%client_id, "client channel closed during request processing");
-                        notify_disconnect(&request_sender, client_id, &auth_token, api_version).await;
+                        notify_disconnect(&request_sender, client_id, &auth_token, connection_scope, api_version).await;
                         if let Err(e) = server_sink.send(Message::Close(None)).await {
                             tracing::debug!(error = %e, "Failed to send WebSocket close frame");
                         }
@@ -1438,7 +1539,7 @@ async fn websocket_interface(
                     },
                     Err(Some(err)) => {
                         tracing::debug!(%client_id, err = %err, "client request error");
-                        notify_disconnect(&request_sender, client_id, &auth_token, api_version).await;
+                        notify_disconnect(&request_sender, client_id, &auth_token, connection_scope, api_version).await;
                         return Err(err)
                     },
                 }
@@ -1449,24 +1550,21 @@ async fn websocket_interface(
                 let msg = match process_host_response(msg, client_id, &mut server_sink, &mut delegate_rate_limiter, &mut conn_state).await {
                     Ok(msg) => msg,
                     Err(err) => {
-                        notify_disconnect(&request_sender, client_id, &auth_token, api_version).await;
+                        notify_disconnect(&request_sender, client_id, &auth_token, connection_scope, api_version).await;
                         return Err(err);
                     }
                 };
                 if let Some(NewSubscription { key, callback }) = msg {
                     tracing::debug!(cli_id = %client_id, contract = %key, "added new notification listener");
-                    let active_listeners = &mut *contract_updates.lock().await;
-                    active_listeners.push_back((key, callback));
+                    listeners.insert(key, callback);
                 }
             }
-            response = listeners_task => {
-                let response = match response {
-                    Ok(r) => r,
-                    Err(err) => {
-                        notify_disconnect(&request_sender, client_id, &auth_token, api_version).await;
-                        return Err(err);
-                    }
-                };
+            // Guarded so an empty map (whose `next()` resolves to `None` at once)
+            // is not polled. When the last listener closes, `next()` yields
+            // `None`, the pattern does not match, and select! just disables this
+            // branch for the current pass: a closed listener never ends the
+            // connection.
+            Some(response) = listeners.next(), if !listeners.is_empty() => {
                 match &response {
                     Ok(res) => tracing::debug!(response = %res, cli_id = %client_id, "sending notification"),
                     Err(err) => tracing::debug!(response = %err, cli_id = %client_id, "sending notification error"),
@@ -1477,14 +1575,14 @@ async fn websocket_interface(
                         Ok(res) => match res.into_fbs_bytes() {
                             Ok(b) => b,
                             Err(err) => {
-                                notify_disconnect(&request_sender, client_id, &auth_token, api_version).await;
+                                notify_disconnect(&request_sender, client_id, &auth_token, connection_scope, api_version).await;
                                 return Err(err.into());
                             }
                         },
                         Err(err) => match err.into_fbs_bytes() {
                             Ok(b) => b,
                             Err(err) => {
-                                notify_disconnect(&request_sender, client_id, &auth_token, api_version).await;
+                                notify_disconnect(&request_sender, client_id, &auth_token, connection_scope, api_version).await;
                                 return Err(err.into());
                             }
                         },
@@ -1492,14 +1590,14 @@ async fn websocket_interface(
                     EncodingProtocol::Native => match bincode::serialize(&response) {
                         Ok(b) => b,
                         Err(err) => {
-                            notify_disconnect(&request_sender, client_id, &auth_token, api_version).await;
+                            notify_disconnect(&request_sender, client_id, &auth_token, connection_scope, api_version).await;
                             return Err(err.into());
                         }
                     },
                 };
                 if let Err(err) = send_response_message(&mut server_sink, serialized_res, &mut conn_state, stream_content).await {
                     tracing::debug!(err = %err, "error sending notification to client");
-                    notify_disconnect(&request_sender, client_id, &auth_token, api_version).await;
+                    notify_disconnect(&request_sender, client_id, &auth_token, connection_scope, api_version).await;
                     return Err(err.into());
                 }
             }
@@ -1508,7 +1606,7 @@ async fn websocket_interface(
                 tracing::trace!(%client_id, "sending WebSocket ping to keep connection alive");
                 if let Err(err) = server_sink.send(Message::Ping(vec![].into())).await {
                     tracing::debug!(%client_id, %err, "ping failed, connection dead");
-                    notify_disconnect(&request_sender, client_id, &auth_token, api_version).await;
+                    notify_disconnect(&request_sender, client_id, &auth_token, connection_scope, api_version).await;
                     return Err(err.into());
                 }
             }
@@ -1650,6 +1748,80 @@ struct NewSubscription {
     callback: mpsc::Receiver<HostResult>,
 }
 
+/// The subscription notification receivers of one WebSocket connection.
+///
+/// Polled as a single event-driven stream from the connection's select! loop,
+/// so a notification wakes the connection task directly instead of waiting for
+/// a timer poll. Entries are keyed by a per-connection counter rather than by
+/// their label, because one connection may hold several receivers for the same
+/// contract (each subscribe request gets its own channel) and every one of them
+/// must keep delivering. A receiver whose sender is gone is dropped from the
+/// map once its buffered messages have been delivered.
+#[derive(Default)]
+struct SubscriptionListeners {
+    next_id: u64,
+    streams: StreamMap<u64, SubscriptionListener>,
+}
+
+impl SubscriptionListeners {
+    fn insert(&mut self, label: String, rx: mpsc::Receiver<HostResult>) {
+        let id = self.next_id;
+        self.next_id = self.next_id.wrapping_add(1);
+        let replaced = self.streams.insert(id, SubscriptionListener { label, rx });
+        // A u64 counter cannot wrap within a connection's lifetime, so an id is
+        // never reused and no live listener is ever replaced.
+        debug_assert!(replaced.is_none(), "listener id {id} reused");
+    }
+
+    fn is_empty(&self) -> bool {
+        self.streams.is_empty()
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.streams.len()
+    }
+
+    /// Next notification from any listener; `None` once no listener is left.
+    ///
+    /// # Cancel safety
+    ///
+    /// Cancel-safe: it only polls `mpsc::Receiver::poll_recv`, so dropping the
+    /// future before it completes loses no message.
+    async fn next(&mut self) -> Option<HostResult> {
+        self.streams
+            .next()
+            .await
+            .map(|(_, notification)| notification)
+    }
+}
+
+/// One subscription's notification receiver, as a stream that logs its own
+/// removal (the map drops an ended stream without telling its owner).
+///
+/// `poll_next` must stay a pure passthrough to `mpsc::Receiver::poll_recv`,
+/// which is what registers the waker. Do not add buffering, `try_recv`, or an
+/// early `Pending` here: the old 10 ms timer poll masked any such lost wake-up,
+/// and nothing does now, so the bug would be a notification that silently
+/// waits for the next unrelated wake (up to the 30 s ping).
+struct SubscriptionListener {
+    label: String,
+    rx: mpsc::Receiver<HostResult>,
+}
+
+impl futures::Stream for SubscriptionListener {
+    type Item = HostResult;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<HostResult>> {
+        let this = self.get_mut();
+        let polled = this.rx.poll_recv(cx);
+        if let Poll::Ready(None) = polled {
+            tracing::debug!(contract = %this.label, "listener removed");
+        }
+        polled
+    }
+}
+
 struct ConnectionState {
     encoding_protoc: EncodingProtocol,
     reassembly: freenet_stdlib::client_api::streaming::ReassemblyBuffer,
@@ -1730,6 +1902,7 @@ async fn process_client_request(
     request_sender: &mpsc::Sender<ClientConnection>,
     auth_token: &mut Option<AuthToken>,
     origin_contract: Option<ContractInstanceId>,
+    connection_scope: ConnectionScope,
     user_context: Option<&UserSecretContext>,
     op_rate_limiter: Option<&UserOpRateLimiter>,
     activity_secrets_dir: Option<&crate::server::ActivitySecretsDir>,
@@ -1845,15 +2018,46 @@ async fn process_client_request(
     // would stall pings, subscriptions, and other responses).
     if let ClientRequest::DelegateOp(ref delegate_req) = req {
         let key_bytes: &[u8] = delegate_req.key().bytes();
-        if let Some(remaining) = rate_limiter.check_backoff(key_bytes) {
+        if let Some(remaining) =
+            rate_limiter.check_backoff_in(key_bytes, BackoffLane::for_request(delegate_req))
+        {
             tracing::warn!(
                 %client_id,
                 delegate_key = %delegate_req.key(),
                 backoff_ms = remaining.as_millis(),
                 "Rejecting delegate request due to repeated failures (retry after backoff)"
             );
+            // NOT `DelegateError::Missing`, which this used to send.
+            //
+            // `Missing` is what the executor returns when a delegate genuinely
+            // is not registered on this node. Sending it for a throttled
+            // request overloaded it with a second, incompatible meaning, and a
+            // client had no way to tell them apart:
+            //
+            //   - not registered  -> the app is built against a stale delegate
+            //                        key; the user must update it, and the
+            //                        developer needs to know.
+            //   - rate limited    -> transient; back off and retry.
+            //
+            // Those want opposite responses, and conflating them cost a real
+            // user: an app built against a re-keyed ghostkeys delegate told
+            // someone to go buy a Ghost Key they already owned
+            // (freenet/ghostkeys#21).
+            //
+            // `ExecutionError` carries a message rather than a key, which is
+            // fine here -- the client sent the request, so it knows which
+            // delegate. A dedicated `RateLimited { key, retry_after }` variant
+            // would be better still, but that is a freenet-stdlib change and
+            // this is the fix that does not need one.
             let error: ClientError = ErrorKind::RequestError(RequestError::DelegateError(
-                DelegateError::Missing(delegate_req.key().clone()),
+                DelegateError::ExecutionError(
+                    format!(
+                        "delegate {} is rate limited after repeated failures; retry in {} ms",
+                        delegate_req.key(),
+                        remaining.as_millis()
+                    )
+                    .into(),
+                ),
             ))
             .into();
             let serialized = match conn_state.encoding_protoc {
@@ -1968,6 +2172,7 @@ async fn process_client_request(
             req: Box::new(req),
             auth_token: auth_token.clone(),
             origin_contract,
+            connection_scope,
             // Clone the connection's user context into this request. Every
             // request from this connection carries the SAME context, derived
             // once at upgrade; a client cannot vary it per-request.
@@ -2011,7 +2216,8 @@ async fn process_host_response(
                         err.kind()
                     {
                         if let Some(key_bytes) = delegate_error_key(delegate_err) {
-                            rate_limiter.record_error(key_bytes);
+                            rate_limiter
+                                .record_error_in(key_bytes, BackoffLane::for_error(delegate_err));
                         }
                     }
                 }
@@ -2699,9 +2905,15 @@ mod tests {
         tokio::spawn(async move {
             while let Some(conn) = req_rx.recv().await {
                 if let ClientConnection::NewConnection { callbacks, .. } = conn {
-                    let _ = callbacks.send(HostCallbackResult::NewId {
-                        id: ClientId::next(),
-                    });
+                    if callbacks
+                        .send(HostCallbackResult::NewId {
+                            id: ClientId::next(),
+                        })
+                        .is_err()
+                    {
+                        // The connection under test hung up; nothing left to serve.
+                        break;
+                    }
                 }
             }
         });
@@ -2712,18 +2924,23 @@ mod tests {
         ) -> impl IntoResponse {
             ws.on_upgrade(move |socket| async move {
                 // `token_is_invalid = true` drives the stale-token close path.
-                let _ = websocket_interface(
-                    rs,
-                    None,
-                    None,
-                    None,
-                    None,
-                    true,
-                    EncodingProtocol::Native,
-                    ApiVersion::V1,
-                    socket,
-                )
-                .await;
+                // The interface's own return value is not the signal under test:
+                // the assertion is the close CODE the client observes.
+                drop(
+                    websocket_interface(
+                        rs,
+                        None,
+                        None,
+                        ConnectionScope::Local,
+                        None,
+                        None,
+                        true,
+                        EncodingProtocol::Native,
+                        ApiVersion::V1,
+                        socket,
+                    )
+                    .await,
+                );
             })
         }
 
@@ -2735,7 +2952,9 @@ mod tests {
             .unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
-            let _ = axum::serve(listener, app).await;
+            // Serving ends when the test drops the listener task; its result is
+            // teardown noise, not a signal.
+            drop(axum::serve(listener, app).await);
         });
 
         let (mut client, _resp) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
@@ -2746,6 +2965,10 @@ mod tests {
         // skip anything that is not a Close and read the close code.
         let observed_close_code = tokio::time::timeout(Duration::from_secs(5), async {
             while let Some(frame) = client.next().await {
+                #[allow(
+                    clippy::wildcard_enum_match_arm,
+                    reason = "the test reads the CLOSE frame only; every other tungstenite frame kind is deliberately skipped, and that stays right for any variant tungstenite adds"
+                )]
                 match frame.expect("ws frame") {
                     tokio_tungstenite::tungstenite::Message::Close(Some(cf)) => {
                         return Some(u16::from(cf.code));
@@ -3397,6 +3620,181 @@ mod tests {
         assert!(limiter.check_backoff(&key_b).is_some());
     }
 
+    /// #5727: a `Missing` answer arms the OPERATIONS lane, so the registration
+    /// that fixes it still goes through, while a registration that keeps
+    /// failing (`RegisterError`) is throttled on its own lane.
+    #[test]
+    fn missing_does_not_block_registration_but_register_errors_do() {
+        use freenet_stdlib::client_api::DelegateRequest;
+        let code = DelegateCode::from(vec![0u8, 1, 2, 3]);
+        let params = Parameters::from(vec![]);
+        let container =
+            DelegateContainer::Wasm(DelegateWasmAPIVersion::V1(Delegate::from((&code, &params))));
+        let key = container.key().clone();
+        let register = DelegateRequest::RegisterDelegate {
+            delegate: container,
+            cipher: [0u8; 32],
+            nonce: [0u8; 24],
+        };
+        let app = DelegateRequest::ApplicationMessages {
+            key: key.clone(),
+            params: Parameters::from(vec![]),
+            inbound: vec![],
+        };
+        assert_eq!(
+            BackoffLane::for_request(&register),
+            BackoffLane::Registration
+        );
+        assert_eq!(BackoffLane::for_request(&app), BackoffLane::Operations);
+        assert_eq!(
+            BackoffLane::for_request(&DelegateRequest::UnregisterDelegate(key.clone())),
+            BackoffLane::Operations
+        );
+
+        let mut limiter = DelegateRateLimiter::new();
+        let missing = DelegateError::Missing(key.clone());
+        limiter.record_error_in(key.bytes(), BackoffLane::for_error(&missing));
+        assert!(
+            limiter
+                .check_backoff_in(key.bytes(), BackoffLane::for_request(&app))
+                .is_some(),
+            "a repeated probe of a missing delegate stays throttled (#3305)"
+        );
+        assert!(
+            limiter
+                .check_backoff_in(key.bytes(), BackoffLane::for_request(&register))
+                .is_none(),
+            "a Missing answer must not refuse the registration that fixes it"
+        );
+
+        let reg_err = DelegateError::RegisterError(key.clone());
+        limiter.record_error_in(key.bytes(), BackoffLane::for_error(&reg_err));
+        assert!(
+            limiter
+                .check_backoff_in(key.bytes(), BackoffLane::for_request(&register))
+                .is_some(),
+            "a registration that keeps failing must still be throttled"
+        );
+
+        limiter.record_success(key.bytes());
+        assert!(
+            limiter
+                .check_backoff_in(key.bytes(), BackoffLane::Operations)
+                .is_none()
+        );
+        assert!(
+            limiter
+                .check_backoff_in(key.bytes(), BackoffLane::Registration)
+                .is_none(),
+            "a successful response clears the registration lane too"
+        );
+    }
+
+    /// A throttled delegate request must NOT be reported as a missing
+    /// delegate.
+    ///
+    /// `Missing` means "not registered on this node", which tells a client its
+    /// build references a delegate that no longer exists — an app-update
+    /// problem the developer needs to hear about. Throttling is transient and
+    /// wants a retry. Sending `Missing` for both left clients unable to
+    /// distinguish them, and cost a real user: an app built against a re-keyed
+    /// ghostkeys delegate told someone to buy a Ghost Key they already owned
+    /// (freenet/ghostkeys#21).
+    ///
+    /// Pins the variant rather than the wording, except for a substring that
+    /// makes the cause legible in a log.
+    #[test]
+    fn throttled_request_is_not_reported_as_a_missing_delegate() {
+        let key = DelegateKey::new([7u8; 32], CodeHash::new([7u8; 32]));
+        let remaining = Duration::from_millis(250);
+
+        // Mirrors what the backoff branch constructs.
+        let err = DelegateError::ExecutionError(
+            format!(
+                "delegate {} is rate limited after repeated failures; retry in {} ms",
+                key,
+                remaining.as_millis()
+            )
+            .into(),
+        );
+
+        assert!(
+            !matches!(err, DelegateError::Missing(_)),
+            "throttling must not masquerade as an unregistered delegate"
+        );
+        let DelegateError::ExecutionError(msg) = &err else {
+            panic!("expected ExecutionError, got {err:?}");
+        };
+        assert!(
+            msg.contains("rate limited"),
+            "the cause should be legible in the message: {msg}"
+        );
+
+        // And it carries no key, so it cannot be mistaken for a per-delegate
+        // failure by the tracker.
+        assert!(delegate_error_key(&err).is_none());
+    }
+
+    /// Pin the WIRING, not just the shape.
+    ///
+    /// The tests above construct the error by hand, so they prove what a
+    /// throttle rejection should look like but not that the backoff branch
+    /// actually builds one. A future edit could reinstate
+    /// `DelegateError::Missing` there and they would all still pass.
+    ///
+    /// Source-scrape instead (same idiom as `server.rs` and
+    /// `ring/update_rate_limit.rs`): the backoff branch must not name
+    /// `Missing`. Anchored on `check_backoff`, which is the branch's own
+    /// condition, so this survives the surrounding code being reorganised.
+    #[test]
+    fn backoff_branch_does_not_construct_a_missing_delegate_error() {
+        const SRC: &str = include_str!("websocket.rs");
+
+        let (body, _) = SRC
+            .split_once("\nmod tests {")
+            .expect("websocket.rs should have a tests module");
+
+        let idx = body
+            .find("rate_limiter.check_backoff_in(key_bytes")
+            .expect("the delegate backoff branch should still exist");
+
+        // The branch is short; take a generous window rather than trying to
+        // brace-match.
+        let window = &body[idx..(idx + 2000).min(body.len())];
+
+        // Strip line comments before asserting. The branch carries a comment
+        // explaining why it does NOT use `Missing`, and a naive scrape cannot
+        // tell that apart from code that does -- which is exactly what this
+        // test caught on its first run.
+        let branch: String = window
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(
+            !branch.contains("DelegateError::Missing"),
+            "the backoff branch must not report a throttled request as a \
+             missing delegate -- `Missing` means the delegate is not \
+             registered, and conflating the two leaves clients unable to \
+             tell an app that needs updating from one that should retry \
+             (freenet/ghostkeys#21)"
+        );
+        assert!(
+            branch.contains("DelegateError::ExecutionError"),
+            "the backoff branch should report ExecutionError naming the cause"
+        );
+    }
+
+    /// The counterpart: a genuinely unregistered delegate still reports
+    /// `Missing`, and still carries its key for failure tracking.
+    #[test]
+    fn unregistered_delegate_still_reports_missing_with_its_key() {
+        let key = DelegateKey::new([9u8; 32], CodeHash::new([9u8; 32]));
+        let err = DelegateError::Missing(key.clone());
+        assert_eq!(delegate_error_key(&err), Some(key.bytes()));
+    }
+
     #[test]
     fn test_rate_limiter_escalating_backoff() {
         let mut limiter = DelegateRateLimiter::new();
@@ -4017,6 +4415,7 @@ mod tests {
             &tx,
             &mut auth_token,
             None,
+            ConnectionScope::Local,
             user_context,
             op_rate_limiter,
             None, // no activity stamping in rate-limit unit tests
@@ -4258,6 +4657,7 @@ mod tests {
                 req,
                 auth_token: None,
                 origin_contract: None,
+                connection_scope: ConnectionScope::Local,
                 user_context: None,
                 api_version: ApiVersion::V1,
             })
@@ -4284,5 +4684,453 @@ mod tests {
                 "expected a SubscriptionChannel callback for the delegate request, got {other:?}"
             ),
         }
+    }
+
+    /// GHSA-824h-7x5x-wfmf: the connection's scope must be captured in
+    /// `connection_info`, from the kernel-observed peer address.
+    ///
+    /// It cannot be captured in `websocket_commands`'s `on_upgrade` closure —
+    /// that closure takes no extractor, so `ConnectInfo` is not reachable from
+    /// it. A refactor that "simplifies" this by moving the classification down
+    /// into the upgrade path would have nothing to classify FROM and would have
+    /// to invent a default, which is exactly how a fail-open default gets
+    /// introduced. Pin the placement and the input.
+    #[test]
+    fn connection_scope_is_classified_in_connection_info_from_the_peer_address() {
+        let src = include_str!("websocket.rs");
+        let body = src
+            .split("async fn connection_info(")
+            .nth(1)
+            .expect("connection_info must exist");
+        let body = body
+            .split("\nasync fn websocket_commands(")
+            .next()
+            .unwrap_or(body);
+        // Bound defensively in case the neighbouring fn is renamed.
+        let body = body
+            .split("\n#[allow(clippy::too_many_arguments)]")
+            .next()
+            .unwrap_or(body);
+
+        assert!(
+            body.contains("ConnectionScope::from_source_ip(source_ip)"),
+            "connection_info must classify the scope from the kernel-observed \
+             ConnectInfo peer address, not from a header or a default"
+        );
+        assert!(
+            body.contains("req.extensions_mut().insert(connection_scope);"),
+            "the classified scope must be injected as a request extension so the \
+             upgrade path can move it into the connection task"
+        );
+    }
+
+    // ---- Event-driven subscription delivery (#5795) ------------------------
+
+    /// A notification tagged so tests can tell deliveries apart.
+    fn tagged_notification(tag: &str) -> HostResult {
+        Err(ErrorKind::Unhandled {
+            cause: tag.to_string().into(),
+        }
+        .into())
+    }
+
+    fn notification_tag(notification: &HostResult) -> String {
+        match notification {
+            Err(err) => err.to_string(),
+            Ok(resp) => panic!("expected a tagged notification, got Ok({resp})"),
+        }
+    }
+
+    /// Counts wake-ups, so a test can tell whether a send woke the parked poll.
+    #[derive(Default)]
+    struct CountingWaker(std::sync::atomic::AtomicUsize);
+
+    impl futures::task::ArcWake for CountingWaker {
+        fn wake_by_ref(arc_self: &Arc<Self>) {
+            arc_self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// The property the 10 ms polling loop lacked: a notification sent to a
+    /// parked listener poll WAKES it. The old code's `try_recv` registered no
+    /// waker, so delivery waited for its `sleep(10ms)` to fire, and that timer
+    /// woke every idle connection ~100x/s.
+    ///
+    /// The wake count carries the weight here, not timing: a version of
+    /// `SubscriptionListener::poll_next` that checks the receiver without
+    /// registering the waker leaves the count at zero and fails this test.
+    #[test]
+    fn notification_wakes_a_parked_listener_poll() {
+        let mut listeners = SubscriptionListeners::default();
+        let (tx, rx) = mpsc::channel(4);
+        listeners.insert("contract-a".to_string(), rx);
+
+        let wakes = Arc::new(CountingWaker::default());
+        let waker = futures::task::waker(wakes.clone());
+        let mut cx = Context::from_waker(&waker);
+        let mut next = std::pin::pin!(listeners.next());
+
+        assert!(next.as_mut().poll(&mut cx).is_pending());
+        assert_eq!(wakes.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+        tx.try_send(tagged_notification("first"))
+            .expect("channel has room");
+        assert!(
+            wakes.0.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+            "a send must wake the parked listener poll, not wait for a timer"
+        );
+        match next.as_mut().poll(&mut cx) {
+            Poll::Ready(Some(n)) => assert!(notification_tag(&n).contains("first")),
+            other @ (Poll::Ready(None) | Poll::Pending) => {
+                panic!("expected the notification, got {other:?}")
+            }
+        }
+    }
+
+    /// A listener whose sender is gone still delivers what it buffered, in
+    /// order, then drops out of the map. The others keep delivering, and only
+    /// once every listener is gone does `next()` report `None` (which the
+    /// connection loop treats as "disable this branch", not "disconnect").
+    #[test]
+    fn closed_listener_drains_then_is_removed_without_affecting_others() {
+        let mut listeners = SubscriptionListeners::default();
+        assert!(listeners.is_empty());
+        assert!(
+            matches!(listeners.next().now_or_never(), Some(None)),
+            "an empty map resolves to None at once, which is why the select! \
+             branch is guarded by `!listeners.is_empty()`"
+        );
+
+        let (tx_a, rx_a) = mpsc::channel(4);
+        let (tx_b, rx_b) = mpsc::channel(4);
+        listeners.insert("contract-a".to_string(), rx_a);
+        listeners.insert("contract-b".to_string(), rx_b);
+
+        tx_a.try_send(tagged_notification("a-first")).unwrap();
+        tx_a.try_send(tagged_notification("a-second")).unwrap();
+        drop(tx_a);
+
+        let mut a_seen = Vec::new();
+        while let Some(Some(n)) = listeners.next().now_or_never() {
+            a_seen.push(notification_tag(&n));
+        }
+        assert_eq!(a_seen.len(), 2, "both buffered notifications delivered");
+        assert!(a_seen[0].contains("a-first") && a_seen[1].contains("a-second"));
+        assert_eq!(listeners.len(), 1, "the closed listener is removed");
+
+        // The surviving listener is unaffected.
+        tx_b.try_send(tagged_notification("b-first")).unwrap();
+        match listeners.next().now_or_never() {
+            Some(Some(n)) => assert!(notification_tag(&n).contains("b-first")),
+            other => panic!("expected b's notification, got {other:?}"),
+        }
+
+        drop(tx_b);
+        assert!(matches!(listeners.next().now_or_never(), Some(None)));
+        assert!(listeners.is_empty());
+    }
+
+    /// The old `VecDeque` held one entry per subscribe request, so two
+    /// subscriptions on the same contract from one connection both delivered.
+    /// Keying the map by the label would silently replace the first.
+    #[test]
+    fn listeners_with_the_same_label_all_deliver() {
+        let mut listeners = SubscriptionListeners::default();
+        let (tx_1, rx_1) = mpsc::channel(4);
+        let (tx_2, rx_2) = mpsc::channel(4);
+        listeners.insert("same-contract".to_string(), rx_1);
+        listeners.insert("same-contract".to_string(), rx_2);
+        assert_eq!(listeners.len(), 2);
+
+        tx_1.try_send(tagged_notification("from-one")).unwrap();
+        tx_2.try_send(tagged_notification("from-two")).unwrap();
+
+        let mut seen = Vec::new();
+        while let Some(Some(n)) = listeners.next().now_or_never() {
+            seen.push(notification_tag(&n));
+        }
+        seen.sort();
+        assert_eq!(
+            seen.len(),
+            2,
+            "both same-label listeners delivered: {seen:?}"
+        );
+        assert!(seen[0].contains("from-one") && seen[1].contains("from-two"));
+    }
+
+    type TestWsClient = tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >;
+
+    /// Per-step deadline for the real-socket tests below.
+    const WS_STEP: Duration = Duration::from_secs(10);
+
+    /// A real axum WebSocket served with the shipped `configure_upgrade`, in
+    /// front of a fake node that assigns an id, hands the connection's callback
+    /// sender to the test, and forwards every client request to the test.
+    struct WsHarness {
+        client: TestWsClient,
+        client_id: ClientId,
+        callbacks: mpsc::UnboundedSender<HostCallbackResult>,
+        forwarded: mpsc::UnboundedReceiver<ClientRequest<'static>>,
+    }
+
+    async fn start_ws_harness() -> WsHarness {
+        use axum::{Extension, Router, response::IntoResponse, routing::get};
+        use tokio::sync::oneshot;
+
+        let (req_tx, mut req_rx) = mpsc::channel::<ClientConnection>(4);
+        let (callbacks_tx, callbacks_rx) =
+            oneshot::channel::<(ClientId, mpsc::UnboundedSender<HostCallbackResult>)>();
+        let (forwarded_tx, forwarded) = mpsc::unbounded_channel::<ClientRequest<'static>>();
+        tokio::spawn(async move {
+            let mut callbacks_tx = Some(callbacks_tx);
+            while let Some(conn) = req_rx.recv().await {
+                match conn {
+                    ClientConnection::NewConnection { callbacks, .. } => {
+                        let id = ClientId::next();
+                        callbacks
+                            .send(HostCallbackResult::NewId { id })
+                            .expect("connection under test is waiting for its id");
+                        if let Some(tx) = callbacks_tx.take() {
+                            tx.send((id, callbacks))
+                                .expect("test is waiting for the callbacks");
+                        }
+                    }
+                    ClientConnection::Request { req, .. } => {
+                        // The test may have finished reading; nothing to do then.
+                        drop(forwarded_tx.send(*req));
+                    }
+                }
+            }
+        });
+
+        async fn ws_handler(
+            ws: WebSocketUpgrade,
+            Extension(rs): Extension<WebSocketRequest>,
+        ) -> impl IntoResponse {
+            configure_upgrade(ws).on_upgrade(move |socket| async move {
+                // The interface's own return value is not under test.
+                drop(
+                    websocket_interface(
+                        rs,
+                        None,
+                        None,
+                        ConnectionScope::Local,
+                        None,
+                        None,
+                        false,
+                        EncodingProtocol::Native,
+                        ApiVersion::V1,
+                        socket,
+                    )
+                    .await,
+                );
+            })
+        }
+
+        let app = Router::new()
+            .route("/ws", get(ws_handler))
+            .layer(Extension(WebSocketRequest(req_tx)));
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            // Serving ends with the test; its result is teardown noise.
+            drop(axum::serve(listener, app).await);
+        });
+
+        let (client, _resp) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+            .await
+            .expect("ws connect");
+        let (client_id, callbacks) = tokio::time::timeout(WS_STEP, callbacks_rx)
+            .await
+            .expect("timed out waiting for the connection")
+            .expect("backend hands over the callbacks");
+        WsHarness {
+            client,
+            client_id,
+            callbacks,
+            forwarded,
+        }
+    }
+
+    impl WsHarness {
+        /// Hand the connection a new subscription receiver, as the node does.
+        fn subscribe(&self, label: &str) -> mpsc::Sender<HostResult> {
+            let (tx, rx) = mpsc::channel(4);
+            self.callbacks
+                .send(HostCallbackResult::SubscriptionChannel {
+                    key: label.to_string(),
+                    id: self.client_id,
+                    callback: rx,
+                })
+                .expect("connection task is alive");
+            tx
+        }
+
+        /// The tag of the next notification the client receives.
+        async fn next_notification(&mut self) -> String {
+            tokio::time::timeout(WS_STEP, async {
+                loop {
+                    #[allow(
+                        clippy::wildcard_enum_match_arm,
+                        reason = "only binary frames carry notifications; pings and every other frame kind are skipped"
+                    )]
+                    match self
+                        .client
+                        .next()
+                        .await
+                        .expect("connection open")
+                        .expect("ws frame")
+                    {
+                        tokio_tungstenite::tungstenite::Message::Binary(bytes) => {
+                            let decoded: HostResult =
+                                bincode::deserialize(&bytes).expect("native notification frame");
+                            return notification_tag(&decoded);
+                        }
+                        tokio_tungstenite::tungstenite::Message::Close(frame) => {
+                            panic!("connection closed unexpectedly: {frame:?}")
+                        }
+                        _ => continue,
+                    }
+                }
+            })
+            .await
+            .expect("timed out waiting for a notification")
+        }
+
+        /// Send an `Authenticate` carrying `token_len` bytes as ONE frame and
+        /// assert the node receives it intact.
+        async fn assert_large_frame_arrives(&mut self, token_len: usize) {
+            let big_token = "t".repeat(token_len);
+            let frame = bincode::serialize(&ClientRequest::Authenticate {
+                token: big_token.clone(),
+            })
+            .unwrap();
+            self.client
+                .send(tokio_tungstenite::tungstenite::Message::Binary(
+                    frame.into(),
+                ))
+                .await
+                .expect("send large frame");
+            match tokio::time::timeout(WS_STEP, self.forwarded.recv())
+                .await
+                .expect("timed out waiting for the large request")
+            {
+                Some(ClientRequest::Authenticate { token }) => {
+                    assert_eq!(token.len(), big_token.len());
+                    assert!(token == big_token, "large frame arrived corrupted");
+                }
+                other => panic!("expected the large Authenticate request, got {other:?}"),
+            }
+        }
+    }
+
+    /// End to end over a real WebSocket, with the shipped upgrade
+    /// configuration: a subscription that arrives while the connection loop is
+    /// parked is delivered; a listener closing does not end the connection;
+    /// a later subscription on the same connection still delivers; and a
+    /// multi-MiB client frame, many times `WEBSOCKET_READ_BUFFER_SIZE`, arrives
+    /// intact.
+    ///
+    /// This test is not the guard for the wake-up property: other branches
+    /// waking the loop can mask a listener that registers no waker, so
+    /// `notification_wakes_a_parked_listener_poll` carries that.
+    #[tokio::test]
+    async fn websocket_delivers_subscription_notifications_end_to_end() {
+        // Captures the connection task's own `listener removed` event. This is
+        // a current-thread runtime, so the spawned connection task is polled
+        // on this thread and the thread-local capture sees it.
+        let (logs, _log_guard) = crate::util::test_log_capture::install();
+        let mut h = start_ws_harness().await;
+
+        // 1. A subscription arriving while the loop is parked (no listeners
+        //    yet) is picked up, and its notifications arrive in order.
+        let sub = h.subscribe("contract-e2e-first");
+        sub.send(tagged_notification("e2e-first")).await.unwrap();
+        sub.send(tagged_notification("e2e-second")).await.unwrap();
+        assert!(h.next_notification().await.contains("e2e-first"));
+        assert!(h.next_notification().await.contains("e2e-second"));
+
+        // 2. The listener closes. Wait until the connection task has actually
+        //    seen it close: the `listener removed` event is emitted inside the
+        //    same poll in which `next()` then yields `None` to the select!
+        //    branch, so once it is logged the branch has already made its
+        //    decision. The connection must have survived that decision: a new
+        //    subscription still delivers. (A branch that ended the connection
+        //    on `None` would have dropped the callback receiver, and
+        //    `subscribe` would panic.)
+        drop(sub);
+        tokio::time::timeout(WS_STEP, async {
+            loop {
+                let seen = logs.lock().unwrap().iter().any(|line| {
+                    line.contains("listener removed") && line.contains("contract-e2e-first")
+                });
+                if seen {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the connection task never observed the listener closing");
+        let sub2 = h.subscribe("contract-e2e-first");
+        sub2.send(tagged_notification("e2e-after-close"))
+            .await
+            .unwrap();
+        assert!(h.next_notification().await.contains("e2e-after-close"));
+
+        // 3. A multi-MiB client frame arrives intact through the 16 KiB reads.
+        h.assert_large_frame_arrives(4 * 1024 * 1024).await;
+    }
+
+    /// Browsers send each WebSocket message as a single frame, so a PUT larger
+    /// than tungstenite's 16 MiB default frame limit must still be accepted:
+    /// without `max_frame_size` matching `max_message_size`, this frame resets
+    /// the connection.
+    #[tokio::test]
+    async fn websocket_accepts_a_single_frame_over_the_default_frame_limit() {
+        const TUNGSTENITE_DEFAULT_MAX_FRAME: usize = 16 * 1024 * 1024;
+        let size = 20 * 1024 * 1024;
+        assert!(size > TUNGSTENITE_DEFAULT_MAX_FRAME && size < WEBSOCKET_MAX_MESSAGE_SIZE);
+        let mut h = start_ws_harness().await;
+        h.assert_large_frame_arrives(size).await;
+    }
+
+    /// A client that goes away while it holds a subscription: the connection
+    /// task tells the node (synthetic `Disconnect`, which is what runs the
+    /// node-side subscription cleanup) and drops its listener receivers, so the
+    /// node's notification senders observe the channel closed.
+    #[tokio::test]
+    async fn client_disconnect_drops_listeners_and_notifies_the_node() {
+        let mut h = start_ws_harness().await;
+        let sub = h.subscribe("contract-disconnect");
+        // Prove the listener is live in the connection's map first.
+        sub.send(tagged_notification("before-disconnect"))
+            .await
+            .unwrap();
+        assert!(h.next_notification().await.contains("before-disconnect"));
+
+        h.client.close(None).await.expect("client close");
+
+        tokio::time::timeout(WS_STEP, sub.closed())
+            .await
+            .expect("listener receiver not dropped after client disconnect");
+        let disconnect_seen = tokio::time::timeout(WS_STEP, async {
+            while let Some(req) = h.forwarded.recv().await {
+                if matches!(req, ClientRequest::Disconnect { .. }) {
+                    return true;
+                }
+            }
+            false
+        })
+        .await
+        .expect("timed out waiting for the Disconnect");
+        assert!(
+            disconnect_seen,
+            "the node must be told the client disconnected"
+        );
     }
 }

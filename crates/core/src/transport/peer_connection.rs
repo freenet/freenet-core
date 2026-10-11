@@ -21,12 +21,15 @@ use futures::stream::FuturesUnordered;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
-use tracing::{Instrument, instrument, span};
+use tracing::{Instrument, span};
 
 mod inbound_stream;
 mod outbound_stream;
 pub(crate) mod piped_stream;
 pub(crate) mod streaming;
+
+#[cfg(test)]
+mod ack_policy_tests;
 
 /// Lock-free streaming buffer implementation.
 /// Public when bench feature is enabled for benchmarking.
@@ -106,8 +109,13 @@ pub(crate) struct RemoteConnection<S = super::UdpSocket, T: TimeSource = RealTim
     #[allow(dead_code)]
     pub(super) my_address: Option<SocketAddr>,
     /// Remote peer's negotiated protocol version, captured during the handshake.
-    /// `None` on the joiner->gateway path (the gateway's AckConnection payload
-    /// carries no version) — see connection_handler.rs traverse_nat AckConnection arm.
+    ///
+    /// Learned from the remote's intro packet where we parse one, and otherwise
+    /// from the acceptor's `AckConnectionV2` (#5161). `None` means the remote is
+    /// below `GATEWAY_ACK_VERSION_MIN_VERSION`, which is a fact about the peer —
+    /// not a gap in what this path can observe. Before #5161 the joiner->gateway
+    /// path was ALWAYS `None`, because the gateway's `AckConnection` carried no
+    /// version and the joiner never parses an intro packet from it.
     pub(super) remote_protoc_version: Option<(u8, u8, u16)>,
     pub(super) transport_secret_key: TransportSecretKey,
     /// Congestion controller (BBR by default) - adapts to network conditions
@@ -260,6 +268,33 @@ pub struct PeerConnection<S = super::UdpSocket, T: TimeSource = RealTime> {
     /// when there is outbound traffic (see #3369).
     last_received_nanos: u64,
     keep_alive_handle: Option<JoinHandle<()>>,
+    /// Time of the last authenticated inbound packet, shared with the
+    /// keepalive task (resets its backoff).
+    last_inbound_nanos: Arc<std::sync::atomic::AtomicU64>,
+    /// Whether the remote still tracks its ack-only NoOps, so we must ack them
+    /// (true for a remote below [`UNTRACKED_ACK_NOOP_MIN_VERSION`] or of
+    /// unknown version). Fixed at construction from the negotiated version.
+    ack_remote_noops: bool,
+    /// `recv()` timers, persisted across `recv()` cancellation.
+    recv_timers: RecvTimers<T>,
+    /// Raised by the sent tracker when a packet enters an empty flight, so the
+    /// resend check is re-evaluated instead of waiting out an idle RTO.
+    new_flight: Arc<super::sent_packet_tracker::NewFlightSignal>,
+    /// Test-only stand-in for a pre-#5795 peer: tracked ack-only NoOps and a
+    /// receipt for every packet, no duplicate re-ack.
+    #[cfg(test)]
+    legacy_wire_behaviour: bool,
+    /// A legacy stream fragment accepted (and recorded for dedup) but not yet
+    /// handed to its `recv_stream` task; see `deliver_stalled_fragment`.
+    stalled_fragment: Option<(StreamId, u32, bytes::Bytes)>,
+    /// Whether we already answered a connection ack on this established
+    /// connection (see `process_inbound`).
+    answered_connection_ack: bool,
+    /// Receipts must be flushed at the next loop iteration (QueueFull or the
+    /// receipt deadline); see the cancellation note in `recv`.
+    receipts_flush_due: bool,
+    /// Number of timeout-check ticks handled (observability for tests).
+    timeout_checks_run: u64,
     /// Tracks pending ping probes awaiting pong responses.
     /// Maps ping sequence number -> send timestamp (nanoseconds since time_source epoch).
     /// Used for bidirectional liveness detection.
@@ -336,12 +371,20 @@ impl<S, T: TimeSource> Drop for PeerConnection<S, T> {
 const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Maximum keepalive interval after backoff (caps the exponential growth).
-const MAX_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(60);
+///
+/// This is the NAT-keepalive guarantee: while a connection is established we
+/// send a Ping at least this often even if every Pong is lost. 15 s keeps the
+/// mapping refreshed comfortably under common UDP NAT idle timeouts (often
+/// 30 s). It was 60 s until #5795; the ack-only NoOp chatter that #5795
+/// removed used to mask that, so it must not be raised again.
+const MAX_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
 
-/// Returns the keepalive interval for the given number of pending (unanswered) pings.
+/// Returns the keepalive interval for the given number of unanswered pings.
 ///
 /// At or below `MAX_UNANSWERED_PINGS`: returns `KEEP_ALIVE_INTERVAL` (5s).
-/// Above that threshold: doubles per additional unanswered ping, capped at 60s.
+/// Above that threshold: doubles per additional unanswered ping, capped at
+/// [`MAX_KEEPALIVE_INTERVAL`]. The caller counts only pings sent since the last
+/// authenticated inbound packet, so any traffic from the peer resets it.
 fn keepalive_interval_for_pending(pending_count: usize) -> Duration {
     if pending_count > MAX_UNANSWERED_PINGS {
         let extra = (pending_count - MAX_UNANSWERED_PINGS).min(4) as u32;
@@ -350,6 +393,244 @@ fn keepalive_interval_for_pending(pending_count: usize) -> Duration {
             .min(MAX_KEEPALIVE_INTERVAL)
     } else {
         KEEP_ALIVE_INTERVAL
+    }
+}
+
+/// First release whose peers send ack-only `NoOp`s fire-and-forget (untracked)
+/// and re-ack duplicates, so their NoOps need no receipt (#5795).
+///
+/// # Why a floor
+///
+/// Releases before this one register every ack-only NoOp in their
+/// `SentPacketTracker`. If we stopped acking such a peer's NoOps it would TLP
+/// and RTO each one (12 retransmits with backoff, `on_timeout` on every RTO)
+/// before abandoning it. So we keep acking NoOps from any peer below the floor
+/// — byte-identical to the old behaviour — and only stop for peers known to be
+/// at or above it.
+///
+/// # Failure mode if this is wrong
+///
+/// Bias HIGH. A floor at or below a release that does NOT carry the change
+/// makes us ignore NoOps that peer still tracks: a bounded retransmit storm of
+/// tiny packets per data ack, not a broken connection, but real waste. A floor
+/// too high only delays the saving. Fail-closed on an unknown version.
+///
+/// # Release-time check
+///
+/// Per the wire-gated-floor rule in `docs/RELEASING.md`, this MUST equal the
+/// release that first ships it, then be frozen. Guarded by
+/// `untracked_noop_floor_tracks_the_shipping_release` via
+/// [`UNTRACKED_ACK_NOOP_SHIPPED_IN`].
+pub(super) const UNTRACKED_ACK_NOOP_MIN_VERSION: (u8, u8, u16) = (0, 2, 142);
+
+/// Has the untracked ack-only NoOp change shipped, and in which release?
+///
+/// `Some(v)` — this code ships in `v`, which must EQUAL the floor. Set to
+/// `Some((0, 2, 142))` ahead of the 0.2.142 release so the release bump PR
+/// (which lifts `Cargo.toml` to 0.2.142) stays green. That is only correct if
+/// this code is in the 0.2.142 tag: **if it misses 0.2.142, raise BOTH this
+/// and the floor to the release that does carry it before merging.** No test
+/// can detect that slip once the marker says `Some`.
+///
+/// `None` — not yet scheduled: the floor is a PREDICTION and must stay
+/// strictly ABOVE the crate version, so a release bump reaching the floor
+/// turns `untracked_noop_floor_tracks_the_shipping_release` red.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(super) const UNTRACKED_ACK_NOOP_SHIPPED_IN: Option<(u8, u8, u16)> = Some((0, 2, 142));
+
+/// Whether the #5795 receive-side gate is forced on for tests; see
+/// [`crate::config::SimulationForceNoopGate`]. Always `false` in release builds.
+#[cfg(any(test, feature = "testing"))]
+fn force_untracked_noop_gate() -> bool {
+    let forced = crate::config::SimulationForceNoopGate::is_enabled();
+    if forced {
+        crate::config::SimulationForceNoopGate::record_forced_connection();
+    }
+    forced
+}
+
+#[cfg(not(any(test, feature = "testing")))]
+fn force_untracked_noop_gate() -> bool {
+    false
+}
+
+/// Does a remote at `remote` still track (and so need receipts for) its
+/// ack-only NoOps? Fail-closed: an unknown version is treated as old.
+fn remote_tracks_ack_noops(remote: Option<(u8, u8, u16)>, floor: (u8, u8, u16)) -> bool {
+    remote.is_none_or(|v| v < floor)
+}
+
+/// Whether an inbound packet earns a receipt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReceiptPolicy {
+    /// The sender does not track this packet; a receipt would be wasted (and
+    /// was the seed of the #5795 ack-of-ack ping-pong).
+    Skip,
+    /// Record it for dedup and ack it. `reack_duplicate`: a duplicate of it is
+    /// a retransmission, i.e. our receipt was lost, so ack it again.
+    Ack { reack_duplicate: bool },
+    /// Ack it (every time it arrives) but do NOT record its id for dedup.
+    /// For connection acks, whose id 0 is shared with the remote's first data
+    /// packet.
+    AckWithoutDedup,
+}
+
+/// Which inbound packets get a receipt (#5795).
+///
+/// - `Ping` / `Pong`: never. Every release sends them straight to the socket,
+///   untracked (since #2404), so a receipt for one is pure overhead.
+/// - `NoOp`: only when `ack_remote_noops` (a peer below
+///   [`UNTRACKED_ACK_NOOP_MIN_VERSION`], which tracks its ack-only NoOps).
+///   From a peer at or above the floor a NoOp is fire-and-forget and is NOT
+///   acked — this is what ends the ack-of-ack ping-pong. Note a NoOp can also
+///   be the trailing receipt carrier of a multi-packet message, sharing the
+///   payload packet's id; the payload packet itself earns the receipt.
+/// - `ShortMessage` / `StreamFragment`: always, and re-acked on duplicate.
+/// - `AckConnection*`: acked WITHOUT dedup recording. The handshake's
+///   completion ack is TRACKED by its sender (`report_sent_packet` at
+///   `FIRST_PACKET_ID` in `connection_handler.rs`) and retransmitted until a
+///   receipt for id 0 arrives, so it must be acked. But id 0 is also the id of
+///   the remote's first data packet, so recording it for dedup would make that
+///   packet look like a duplicate and drop it. Replying to a connection ack is
+///   separately limited to once per connection (`answered_connection_ack`).
+fn receipt_policy(payload: &SymmetricMessagePayload, ack_remote_noops: bool) -> ReceiptPolicy {
+    match payload {
+        SymmetricMessagePayload::Ping { .. } | SymmetricMessagePayload::Pong { .. } => {
+            ReceiptPolicy::Skip
+        }
+        SymmetricMessagePayload::NoOp => {
+            if ack_remote_noops {
+                ReceiptPolicy::Ack {
+                    reack_duplicate: true,
+                }
+            } else {
+                ReceiptPolicy::Skip
+            }
+        }
+        SymmetricMessagePayload::ShortMessage { .. }
+        | SymmetricMessagePayload::StreamFragment { .. } => ReceiptPolicy::Ack {
+            reack_duplicate: true,
+        },
+        SymmetricMessagePayload::AckConnection { .. }
+        | SymmetricMessagePayload::AckConnectionV2 { .. } => ReceiptPolicy::AckWithoutDedup,
+    }
+}
+
+/// A one-shot sleep toward a deadline that survives `recv()` cancellation.
+///
+/// Re-arming to the same deadline reuses the existing sleep, so the hot path
+/// does not allocate a boxed sleep per poll (#5795).
+struct DeadlineSleep<T: TimeSource> {
+    time_source: T,
+    armed: Option<(u64, crate::simulation::BoxedSleep)>,
+}
+
+impl<T: TimeSource> DeadlineSleep<T> {
+    fn new(time_source: T) -> Self {
+        Self {
+            time_source,
+            armed: None,
+        }
+    }
+
+    fn is_armed(&self) -> bool {
+        self.armed.is_some()
+    }
+
+    /// Arm for `deadline_nanos`, replacing any other deadline.
+    fn arm_at(&mut self, deadline_nanos: u64) {
+        if !matches!(&self.armed, Some((d, _)) if *d == deadline_nanos) {
+            self.armed = Some((deadline_nanos, self.time_source.sleep_until(deadline_nanos)));
+        }
+    }
+
+    /// Arm for `deadline_nanos` unless already armed for an earlier one.
+    fn arm_no_later_than(&mut self, deadline_nanos: u64) {
+        if self.armed.as_ref().is_none_or(|(d, _)| *d > deadline_nanos) {
+            self.arm_at(deadline_nanos);
+        }
+    }
+
+    /// Ready once the armed deadline passes; disarms itself when it fires.
+    /// Never ready while unarmed.
+    fn poll_fire(&mut self, cx: &mut std::task::Context<'_>) -> std::task::Poll<()> {
+        let Some((_, sleep)) = self.armed.as_mut() else {
+            return std::task::Poll::Pending;
+        };
+        match sleep.as_mut().poll(cx) {
+            std::task::Poll::Ready(()) => {
+                self.armed = None;
+                std::task::Poll::Ready(())
+            }
+            std::task::Poll::Pending => std::task::Poll::Pending,
+        }
+    }
+}
+
+/// Timers driving `recv()`, kept on the connection so they survive the
+/// cancellation of `recv()` by `peer_connection_listener`'s outer select,
+/// which happens on every outbound message and every returned inbound one
+/// (#5795). Before, each `recv()` call rebuilt all of them, which (a) cost
+/// several boxed sleeps per call and per inner iteration, (b) ran the 5 s
+/// timeout sweep immediately on EVERY call (its first tick was immediate),
+/// and (c) restarted the 100 ms ack timer and the resend check on every call,
+/// so steady traffic could keep either from ever firing.
+struct RecvTimers<T: TimeSource> {
+    /// Idle-timeout check, stale-ping cleanup and streaming-handle sweep.
+    timeout_check: TimeSourceInterval<T>,
+    /// Flushes pending receipts.
+    ack_check: TimeSourceInterval<T>,
+    /// Updates the token bucket rate from the congestion controller.
+    rate_update_check: TimeSourceInterval<T>,
+    /// Next resend / TLP check.
+    resend: DeadlineSleep<T>,
+    /// Upper bound on the wait for a resend check after `recv()` is entered,
+    /// so a packet sent between calls has its TLP/RTO checked promptly.
+    resend_initial: Duration,
+    /// Short re-check delay after a capped burst of resends.
+    resend_yield: Duration,
+}
+
+impl<T: TimeSource> RecvTimers<T> {
+    /// Interval for the timeout check / sweep.
+    const TIMEOUT_CHECK_INTERVAL: Duration = Duration::from_secs(5);
+
+    fn new(time_source: &T) -> Self {
+        // When SimulationTransportOpt is enabled, use relaxed timer intervals to reduce
+        // scheduling overhead from ~900K to ~180K timer firings/sec across all connections.
+        let in_simulation = crate::config::SimulationTransportOpt::is_enabled();
+        let ack_interval = if in_simulation {
+            SIMULATION_ACK_CHECK_INTERVAL
+        } else {
+            ACK_CHECK_INTERVAL
+        };
+        let now = time_source.now_nanos();
+        let first_ack = now + ack_interval.as_nanos() as u64;
+        Self {
+            // First check one period from now, not immediately.
+            timeout_check: TimeSourceInterval::new_at(
+                time_source.clone(),
+                now + Self::TIMEOUT_CHECK_INTERVAL.as_nanos() as u64,
+                Self::TIMEOUT_CHECK_INTERVAL,
+            ),
+            ack_check: TimeSourceInterval::new_at(time_source.clone(), first_ack, ack_interval),
+            rate_update_check: TimeSourceInterval::new_at(
+                time_source.clone(),
+                first_ack,
+                ack_interval,
+            ),
+            resend: DeadlineSleep::new(time_source.clone()),
+            resend_initial: if in_simulation {
+                SIMULATION_RESEND_CHECK_INTERVAL
+            } else {
+                Duration::from_millis(10)
+            },
+            resend_yield: if in_simulation {
+                SIMULATION_RESEND_YIELD_DELAY
+            } else {
+                Duration::from_millis(2)
+            },
+        }
     }
 }
 
@@ -498,6 +779,11 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
         // Uses u64 nanoseconds for deterministic simulation support
         let pending_pings: Arc<RwLock<BTreeMap<u64, u64>>> = Arc::new(RwLock::new(BTreeMap::new()));
         let pending_pings_for_task = pending_pings.clone();
+        // Time of the last authenticated inbound packet, shared with the
+        // keepalive task so any traffic from the peer resets its backoff.
+        let last_inbound_nanos =
+            Arc::new(std::sync::atomic::AtomicU64::new(time_source.now_nanos()));
+        let last_inbound_for_task = last_inbound_nanos.clone();
 
         let task_time_source = time_source.clone();
         let keepalive_enabled = time_source.supports_keepalive();
@@ -522,11 +808,20 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
 
             let mut tick_count = 0u64;
             let mut ping_seq = 0u64;
+            let mut consecutive_send_errors = 0u32;
             let task_start_nanos = task_time_source.now_nanos();
 
             loop {
                 // Back off keepalive interval when pings go unanswered (#3252).
-                let pending_count = pending_pings_for_task.read().len();
+                // Back off only on pings unanswered since the peer last sent
+                // us ANYTHING: a lost Pong on a live link must not stretch the
+                // interval (and so the NAT refresh) — #5795 review.
+                let since = last_inbound_for_task.load(std::sync::atomic::Ordering::Acquire);
+                let pending_count = pending_pings_for_task
+                    .read()
+                    .values()
+                    .filter(|sent_at| **sent_at >= since)
+                    .count();
                 let wait_duration = keepalive_interval_for_pending(pending_count);
                 task_time_source.sleep(wait_duration).await;
                 tick_count += 1;
@@ -583,6 +878,15 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
 
                 match socket.send_to(&ping_packet, remote_addr).await {
                     Ok(_) => {
+                        if consecutive_send_errors > 0 {
+                            tracing::info!(
+                                target: "freenet_core::transport::keepalive_lifecycle",
+                                remote = ?remote_addr,
+                                failed_pings = consecutive_send_errors,
+                                "Keep-alive Ping send recovered"
+                            );
+                            consecutive_send_errors = 0;
+                        }
                         // Phase 1.6 (#4074): keep-alive Ping bypasses
                         // `packet_sending`; count it as must-flow here.
                         // Observation only.
@@ -599,20 +903,33 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                         );
                     }
                     Err(e) => {
-                        let elapsed = Duration::from_nanos(
-                            task_time_source
-                                .now_nanos()
-                                .saturating_sub(task_start_nanos),
-                        );
-                        tracing::warn!(
-                            target: "freenet_core::transport::keepalive_lifecycle",
-                            remote = ?remote_addr,
-                            error = ?e,
-                            elapsed_since_start_secs = elapsed.as_secs_f64(),
-                            total_ticks = tick_count,
-                            "Keep-alive task STOPPING - socket error"
-                        );
-                        break;
+                        // Keep going (#5795 review). A send error here is
+                        // usually transient (network switch, ENETUNREACH,
+                        // ENOBUFS). Exiting would leave the connection with no
+                        // outbound keepalive at all, relying on our Pong
+                        // replies to hold the NAT mapping. The failed ping
+                        // stays in `pending_pings`, so the interval backs off
+                        // to at most MAX_KEEPALIVE_INTERVAL (15 s). The task
+                        // ends when the connection is dropped (aborted in
+                        // `Drop`) or the idle timeout closes it.
+                        consecutive_send_errors += 1;
+                        if consecutive_send_errors == 1 {
+                            tracing::warn!(
+                                target: "freenet_core::transport::keepalive_lifecycle",
+                                remote = ?remote_addr,
+                                error = ?e,
+                                total_ticks = tick_count,
+                                "Keep-alive Ping send failed; will keep retrying"
+                            );
+                        } else {
+                            tracing::debug!(
+                                target: "freenet_core::transport::keepalive_lifecycle",
+                                remote = ?remote_addr,
+                                error = ?e,
+                                consecutive_send_errors,
+                                "Keep-alive Ping send failed again"
+                            );
+                        }
                     }
                 }
             }
@@ -637,7 +954,24 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
         );
 
         let now_nanos = time_source.now_nanos();
+        let ack_remote_noops = !force_untracked_noop_gate()
+            && remote_tracks_ack_noops(
+                remote_conn.remote_protoc_version,
+                UNTRACKED_ACK_NOOP_MIN_VERSION,
+            );
+        let recv_timers = RecvTimers::new(&time_source);
+        let new_flight = remote_conn.sent_tracker.lock().new_flight_signal();
         Self {
+            last_inbound_nanos,
+            new_flight,
+            ack_remote_noops,
+            recv_timers,
+            timeout_checks_run: 0,
+            receipts_flush_due: false,
+            answered_connection_ack: false,
+            stalled_fragment: None,
+            #[cfg(test)]
+            legacy_wire_behaviour: false,
             remote_conn,
             received_tracker: ReceivedPacketTracker::new(),
             inbound_streams: HashMap::new(),
@@ -708,7 +1042,6 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
         );
     }
 
-    #[instrument(name = "peer_connection", skip_all)]
     /// Serialize `data` and hand it to the transport.
     ///
     /// Returns the SERIALIZED byte length, so callers that already know the
@@ -733,7 +1066,7 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
             );
             let len = data.len();
             self.outbound_stream(data).await;
-            return Ok(len);
+            Ok(len)
         } else {
             tracing::trace!(
                 peer_addr = %self.remote_conn.remote_addr,
@@ -741,67 +1074,47 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
             );
             let len = data.len();
             self.outbound_short_message(data).await?;
-            return Ok(len);
+            Ok(len)
         }
     }
 
-    #[instrument(name = "peer_connection", skip(self))]
+    /// Receive the next complete inbound message.
+    ///
+    /// Deliberately not `#[instrument]`ed, and neither is `send`: the span was
+    /// entered and exited on every poll of these per-connection hot paths
+    /// (~1.5% of node CPU on a production peer, #5795) while carrying no
+    /// fields. Log lines here already carry `peer_addr`.
     pub async fn recv(&mut self) -> Result<Vec<u8>> {
-        // When SimulationTransportOpt is enabled, use relaxed timer intervals to reduce
-        // scheduling overhead from ~900K to ~180K timer firings/sec across all connections.
-        let in_simulation = crate::config::SimulationTransportOpt::is_enabled();
-        let ack_interval = if in_simulation {
-            SIMULATION_ACK_CHECK_INTERVAL
-        } else {
-            ACK_CHECK_INTERVAL
-        };
-        let resend_initial = if in_simulation {
-            SIMULATION_RESEND_CHECK_INTERVAL
-        } else {
-            Duration::from_millis(10)
-        };
-        let resend_yield = if in_simulation {
-            SIMULATION_RESEND_YIELD_DELAY
-        } else {
-            Duration::from_millis(2)
-        };
-
-        // listen for incoming messages or receipts or wait until is time to do anything else again
-        let mut resend_check_sleep: Option<
-            std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>,
-        > = Some(self.time_source.sleep(resend_initial));
+        // The timers live on `self` (see `RecvTimers`); only bound the wait for
+        // the next resend check, so packets sent since the last call get their
+        // TLP/RTO checked promptly. This never pushes an earlier check later.
+        let resend_initial = self.recv_timers.resend_initial;
+        let resend_yield = self.recv_timers.resend_yield;
+        self.recv_timers
+            .resend
+            .arm_no_later_than(self.time_source.now_nanos() + resend_initial.as_nanos() as u64);
 
         let kill_connection_after = self.time_source.connection_idle_timeout();
         let kill_connection_after_nanos = kill_connection_after.as_nanos() as u64;
 
-        // Check for timeout periodically
-        let mut timeout_check =
-            TimeSourceInterval::new(self.time_source.clone(), Duration::from_secs(5));
-
-        // Background ACK timer - sends pending ACKs proactively
-        // This prevents delays when there's no outgoing traffic to piggyback ACKs on
-        // Use interval_at to delay the first tick - unlike the keep-alive task which can
-        // block to skip its first tick, we're inside a select! loop so we delay instead
-        let ack_start_nanos = self.time_source.now_nanos() + ack_interval.as_nanos() as u64;
-        let mut ack_check =
-            TimeSourceInterval::new_at(self.time_source.clone(), ack_start_nanos, ack_interval);
-
-        // Rate update timer - updates TokenBucket rate based on BBR cwnd
-        // This allows the token bucket to adapt to network conditions dynamically
-        let rate_start_nanos = self.time_source.now_nanos() + ack_interval.as_nanos() as u64;
-        let mut rate_update_check =
-            TimeSourceInterval::new_at(self.time_source.clone(), rate_start_nanos, ack_interval);
-
         const FAILURE_TIME_WINDOW: Duration = Duration::from_secs(30);
         const FAILURE_TIME_WINDOW_NANOS: u64 = FAILURE_TIME_WINDOW.as_nanos() as u64;
         loop {
-            // If resend_check_sleep was consumed by a previous select iteration
-            // (via .take()) but the resend branch didn't win, refill with a short
-            // delay. This prevents the resend branch from being immediately Ready
-            // on every iteration during retransmission storms, which would starve
-            // inbound packet processing and create an ACK-drop feedback loop.
-            if resend_check_sleep.is_none() {
-                resend_check_sleep = Some(self.time_source.sleep(resend_yield));
+            if self.stalled_fragment.is_some() {
+                self.deliver_stalled_fragment().await?;
+            }
+            if self.receipts_flush_due {
+                self.receipts_flush_due = false;
+                self.flush_receipts_now().await?;
+            }
+            // The resend timer disarms when it fires; if the resend branch left it
+            // unarmed (send error path), re-arm with a short delay rather than
+            // leaving it immediately Ready, which during retransmission storms
+            // would starve inbound packet processing (#3215).
+            if !self.recv_timers.resend.is_armed() {
+                self.recv_timers
+                    .resend
+                    .arm_at(self.time_source.now_nanos() + resend_yield.as_nanos() as u64);
             }
 
             // tracing::trace!(remote = ?self.remote_conn.remote_addr, "waiting for inbound messages");
@@ -938,6 +1251,8 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                         self.remote_conn.remote_addr,
                         packet_data.data().len() as u64,
                     );
+                    self.last_inbound_nanos
+                        .store(self.last_received_nanos, std::sync::atomic::Ordering::Release);
                     let msg = SymmetricMessage::deser(decrypted.data()).unwrap();
                     let SymmetricMessage {
                         packet_id,
@@ -1032,7 +1347,7 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                                 }
                             }
                         }
-                        SymmetricMessagePayload::AckConnection { .. } | SymmetricMessagePayload::ShortMessage { .. } | SymmetricMessagePayload::StreamFragment { .. } => {}
+                        SymmetricMessagePayload::AckConnection { .. } | SymmetricMessagePayload::AckConnectionV2 { .. } | SymmetricMessagePayload::ShortMessage { .. } | SymmetricMessagePayload::StreamFragment { .. } => {}
                     }
 
                     {
@@ -1093,32 +1408,67 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                         }
                     }
 
-                    let report_result = self.received_tracker.report_received_packet(packet_id);
-                    match (report_result, should_send_receipts) {
-                        (ReportResult::QueueFull, _) | (_, true) => {
-                            let receipts = self.received_tracker.get_receipts();
-                            if !receipts.is_empty() {
-                                if let Err(e) = self.noop(receipts).await {
-                                    if e.is_transient_send_failure() {
-                                        tracing::warn!(
-                                            peer_addr = %self.remote_conn.remote_addr,
-                                            "ACK noop send failed, will retry"
-                                        );
-                                    } else {
-                                        return Err(e);
-                                    }
-                                }
-                            }
-                        },
-                        (ReportResult::Ok, _) => {}
-                        (ReportResult::AlreadyReceived, _) => {
+                    // Decide whether this packet earns a receipt (#5795). A
+                    // receipt is only useful for a packet the SENDER tracks
+                    // for retransmission; acking anything else costs a
+                    // packet and, before #5795, seeded an endless
+                    // ack-of-ack ping-pong. See `receipt_policy`.
+                    let policy = receipt_policy(&payload, self.ack_remote_noops);
+                    #[cfg(test)]
+                    let policy = if self.legacy_wire_behaviour {
+                        ReceiptPolicy::Ack { reack_duplicate: false }
+                    } else {
+                        policy
+                    };
+                    let report_result = match policy {
+                        ReceiptPolicy::Skip => ReportResult::Ok,
+                        ReceiptPolicy::AckWithoutDedup => {
+                            self.received_tracker.requeue_receipt(packet_id)
+                        }
+                        ReceiptPolicy::Ack { .. } => {
+                            self.received_tracker.report_received_packet(packet_id)
+                        }
+                    };
+                    let flush_receipts = match report_result {
+                        ReportResult::AlreadyReceived => {
                             tracing::trace!(
                                 peer_addr = %self.remote_conn.remote_addr,
                                 packet_id,
                                 "Already received packet"
                             );
+                            // The sender retransmitted a packet we already
+                            // have, so our receipt for it never arrived.
+                            // Re-ack it: our ack-only NoOps are
+                            // fire-and-forget, so this is how a lost receipt
+                            // is recovered, exactly as TCP re-acks a
+                            // duplicate segment. Without it the sender would
+                            // retransmit until MAX_PACKET_RETRANSMITS and
+                            // then abandon a packet we actually delivered.
+                            let queue_full = matches!(
+                                policy,
+                                ReceiptPolicy::Ack { reack_duplicate: true }
+                            ) && self.received_tracker.requeue_receipt(packet_id)
+                                == ReportResult::QueueFull;
+                            if queue_full {
+                                self.receipts_flush_due = true;
+                            }
+                            // A duplicate is never delivered again. (Before
+                            // #5795 a duplicate arriving while the 600 ms
+                            // receipt deadline had lapsed fell through to
+                            // `process_inbound` and was delivered twice.)
                             continue;
                         }
+                        ReportResult::QueueFull => true,
+                        ReportResult::Ok => should_send_receipts,
+                    };
+                    // Deferred to the top of the loop rather than awaited here:
+                    // this packet is already recorded in the dedup window, so if
+                    // `recv()` were cancelled mid-flush before `process_inbound`
+                    // the packet would be lost (its retransmission would be
+                    // dropped as a duplicate). Cancelling the deferred flush
+                    // loses only receipts, which the duplicate re-ack recovers.
+                    if flush_receipts {
+                        self.receipts_flush_due = true;
                     }
                     if let Some(msg) = self.process_inbound(payload).await.map_err(|error| {
                         tracing::error!(
@@ -1245,7 +1595,8 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                         }
                     }
                 },
-                _ = timeout_check.tick() => {
+                _ = self.recv_timers.timeout_check.tick() => {
+                    self.timeout_checks_run += 1;
                     let now_nanos = self.time_source.now_nanos();
                     let elapsed_nanos = now_nanos.saturating_sub(self.last_received_nanos);
                     let elapsed = Duration::from_nanos(elapsed_nanos);
@@ -1328,10 +1679,17 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                     // fragments are coming.
                     self.sweep_idle_streaming_handles();
                 },
-                // The .take() consumes the sleep future; the unwrap_or(ready()) fallback
-                // should be unreachable since the top-of-loop guard always refills it,
-                // but is kept as a defensive measure.
-                _ = async { resend_check_sleep.take().unwrap_or_else(|| Box::pin(std::future::ready(()))).await } => {
+                // Fires once the armed resend deadline passes (and disarms; the
+                // top-of-loop guard re-arms it). Not consumed when another branch
+                // wins, so it cannot fall back to "always ready" (#3215).
+                _ = std::future::poll_fn(|cx| {
+                    // A packet entered an empty flight: re-evaluate now rather
+                    // than at the idle RTO the timer was parked at.
+                    if self.new_flight.poll_take(cx).is_ready() {
+                        return std::task::Poll::Ready(());
+                    }
+                    self.recv_timers.resend.poll_fire(cx)
+                }) => {
                     // Bound retransmissions per iteration to prevent monopolizing the
                     // select loop. Remaining resends are deferred by a short sleep
                     // (see top of loop) so inbound branches can interleave.
@@ -1352,7 +1710,7 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                         // re-sends nor re-registers). See #4345.
                         let (idx, packet) = match maybe_resend {
                             ResendAction::WaitUntil(deadline_nanos) => {
-                                resend_check_sleep = Some(self.time_source.sleep_until(deadline_nanos));
+                                self.recv_timers.resend.arm_at(deadline_nanos);
                                 break;
                             }
                             ResendAction::Abandon { packet_id, payload_len } => {
@@ -1373,7 +1731,7 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                                 );
                                 resend_count += 1;
                                 if resend_count >= MAX_RESENDS_PER_ITERATION {
-                                    resend_check_sleep = Some(self.time_source.sleep(resend_yield));
+                                    self.recv_timers.resend.arm_at(self.time_source.now_nanos() + resend_yield.as_nanos() as u64);
                                     break;
                                 }
                                 continue;
@@ -1461,36 +1819,19 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                         }
                         resend_count += 1;
                         if resend_count >= MAX_RESENDS_PER_ITERATION {
-                            resend_check_sleep = Some(self.time_source.sleep(resend_yield));
+                            self.recv_timers.resend.arm_at(self.time_source.now_nanos() + resend_yield.as_nanos() as u64);
                             break;
                         }
                     }
                 },
                 // Background ACK timer - proactively send pending ACKs
                 // This prevents ACK delays when there's no outgoing traffic to piggyback on
-                _ = ack_check.tick() => {
-                    let receipts = self.received_tracker.get_receipts();
-                    if !receipts.is_empty() {
-                        tracing::trace!(
-                            peer_addr = %self.remote_conn.remote_addr,
-                            receipt_count = receipts.len(),
-                            "Background ACK timer: sending pending receipts"
-                        );
-                        if let Err(e) = self.noop(receipts).await {
-                            if e.is_transient_send_failure() {
-                                tracing::warn!(
-                                    peer_addr = %self.remote_conn.remote_addr,
-                                    "Background ACK send failed, will retry next tick"
-                                );
-                            } else {
-                                return Err(e);
-                            }
-                        }
-                    }
+                _ = self.recv_timers.ack_check.tick() => {
+                    self.flush_receipts_now().await?;
                 },
                 // Rate update timer - update TokenBucket rate based on BBR cwnd
                 // RTT-adaptive: only update if at least one RTT has elapsed since last update
-                _ = rate_update_check.tick() => {
+                _ = self.recv_timers.rate_update_check.tick() => {
                     let now_nanos = self.time_source.now_nanos();
 
                     // Use congestion controller's base delay for rate calculation
@@ -1597,11 +1938,26 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
     /// ```ignore
     /// if let Some(handle) = peer_conn.recv_stream_handle(stream_id) {
     ///     let mut stream = handle.stream();
-    ///     while let Some(chunk) = stream.next().await {
+    ///     loop {
+    ///         // Bound the wait. See the note below on why `stream.next()`
+    ///         // must never be awaited unbounded.
+    ///         let next = tokio::select! {
+    ///             r = stream.next() => r,
+    ///             _ = time_source.sleep(STREAM_INACTIVITY_TIMEOUT) => break,
+    ///         };
+    ///         let Some(chunk) = next else { break };
     ///         process_chunk(chunk?);
     ///     }
     /// }
     /// ```
+    ///
+    /// **Always bound the wait.** `StreamingInboundStream::poll_next` yields
+    /// `Pending` until every advertised byte has been delivered, so a peer that
+    /// advertises a `total_length_bytes` it never sends, or a lost final
+    /// fragment, leaves an unbounded `stream.next().await` hanging forever. The
+    /// one production consumer, `pipe_stream`, wraps it in exactly this
+    /// `select!` against `STREAM_INACTIVITY_TIMEOUT` and reports a diagnostic
+    /// failure; anything new must do the same.
     #[allow(dead_code)]
     pub(crate) fn recv_stream_handle(
         &self,
@@ -1640,7 +1996,25 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
             AckConnection { result: Err(cause) } => {
                 Err(TransportError::ConnectionEstablishmentFailure { cause })
             }
-            AckConnection { result: Ok(_) } => {
+            // A duplicate success ack on an ESTABLISHED connection, in either
+            // encoding (#5161): the remote did not see our completion ack, so
+            // re-send it. The reply is deliberately the legacy `ack_ok` in both
+            // cases — this side is the joiner, the remote already learned our
+            // version from our intro packet, and answering a V2 ack with a V2
+            // ack would tell it nothing it does not have.
+            AckConnection { result: Ok(_) } | AckConnectionV2 { .. } => {
+                // Answer at most ONCE per connection (#5795 review). Our reply
+                // is itself an `AckConnection { Ok }`, so two peers that both
+                // answered every one would bounce acks forever. Before #5795
+                // the dedup window stopped that by accident (every connection
+                // ack has id 0, so the second one was dropped as a duplicate);
+                // connection acks are no longer recorded for dedup, so the
+                // limit is explicit. The remote's tracked handshake ack is
+                // still acked by receipt on every arrival (`receipt_policy`).
+                if self.answered_connection_ack {
+                    return Ok(None);
+                }
+                self.answered_connection_ack = true;
                 let packet = SymmetricMessage::ack_ok(
                     &self.remote_conn.outbound_symmetric_key,
                     self.remote_conn.inbound_symmetric_key_bytes,
@@ -1848,11 +2222,22 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                 // transient executor pressure into `ConnectionClosed` would
                 // abort otherwise-healthy large transfers whenever more than
                 // 64 fragments back up before `recv_stream` is scheduled.
-                if let Some(sender) = self.inbound_streams.get(&stream_id) {
-                    sender
-                        .send((fragment_number, payload))
-                        .await
-                        .map_err(|_| TransportError::ConnectionClosed(self.remote_addr()))?;
+                if self.inbound_streams.contains_key(&stream_id) {
+                    // Cancel-safe hand-off (#5803 review). This packet is
+                    // already in the dedup window, so if `recv()` were
+                    // cancelled while this send waits for channel space the
+                    // fragment would be lost for good (its retransmission is
+                    // dropped as a duplicate). Park it on `self` first; a
+                    // cancelled send leaves it parked and the next `recv()`
+                    // iteration finishes delivering it.
+                    // One slot: the top of the recv loop always finishes a
+                    // parked fragment before another packet is processed.
+                    debug_assert!(
+                        self.stalled_fragment.is_none(),
+                        "a parked fragment must be delivered before the next one"
+                    );
+                    self.stalled_fragment = Some((stream_id, fragment_number, payload));
+                    self.deliver_stalled_fragment().await?;
                     tracing::trace!(
                         peer_addr = %self.remote_conn.remote_addr,
                         stream_id = %stream_id,
@@ -1894,27 +2279,99 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
         }
     }
 
-    #[inline]
+    /// Deliver the legacy stream fragment parked in `stalled_fragment`, if
+    /// any. Cancel-safe: the fragment stays parked until the send completes.
+    async fn deliver_stalled_fragment(&mut self) -> Result<()> {
+        let Some((stream_id, fragment_number, payload)) = self.stalled_fragment.as_ref() else {
+            return Ok(());
+        };
+        let Some(sender) = self.inbound_streams.get(stream_id) else {
+            // The stream finished or was dropped meanwhile; nothing to feed.
+            self.stalled_fragment = None;
+            return Ok(());
+        };
+        sender
+            .send((*fragment_number, payload.clone()))
+            .await
+            .map_err(|_| TransportError::ConnectionClosed(self.remote_conn.remote_addr))?;
+        self.stalled_fragment = None;
+        Ok(())
+    }
+
+    /// Drain every pending receipt into ack-only NoOps right now.
+    ///
+    /// A transient send failure is logged and swallowed (the drained receipts
+    /// are recovered by the remote's retransmission and our duplicate re-ack,
+    /// see `noop`); any other error is returned so `recv` tears down.
+    async fn flush_receipts_now(&mut self) -> Result<()> {
+        let receipts = self.received_tracker.get_receipts();
+        if receipts.is_empty() {
+            return Ok(());
+        }
+        match self.noop(receipts).await {
+            Ok(()) => Ok(()),
+            Err(e) if e.is_transient_send_failure() => {
+                tracing::warn!(
+                    peer_addr = %self.remote_conn.remote_addr,
+                    "ACK noop send failed; the remote's retransmission will be re-acked"
+                );
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Send an ack-only `NoOp` carrying `receipts`, fire-and-forget.
+    ///
+    /// The packet is deliberately NOT registered with the `SentPacketTracker`
+    /// and does NOT touch congestion-control flight size (#5795). Before this,
+    /// every ack-only NoOp was tracked, so the remote had to ack it, which it
+    /// did with another tracked NoOp, which we then had to ack — an endless
+    /// ack-of-ack ping-pong at ~5 pps per direction on every connection, even
+    /// fully idle ones.
+    ///
+    /// Reliability of the receipts we carry does not depend on tracking this
+    /// packet: if it is lost, the remote's own TLP/RTO retransmits the
+    /// original packet, and `recv` re-acks a duplicate of any packet type the
+    /// sender tracks (see `reack_duplicate`). A receipt is therefore never
+    /// lost for good, it just arrives one retransmission later — the same
+    /// recovery TCP uses for a lost pure ACK.
+    ///
+    /// Wire-compatible in both directions: the bytes are an ordinary
+    /// `NoOp { confirm_receipt }`. An old remote acks it as before (we ignore
+    /// a receipt for an untracked packet); whether WE ack the remote's NoOps
+    /// is decided separately, by `ack_remote_noops`.
     async fn noop(&mut self, receipts: Vec<u32>) -> Result<()> {
-        // Get token before sending (captures send-time state for BBR)
-        // Estimate noop packet size (~50 bytes typically)
-        let token = self
-            .remote_conn
-            .congestion_controller
-            .on_send_with_token(50);
-        packet_sending(
+        #[cfg(test)]
+        if self.legacy_wire_behaviour {
+            // Pre-#5795: the ack-only NoOp is tracked for retransmission.
+            let token = self
+                .remote_conn
+                .congestion_controller
+                .on_send_with_token(50);
+            return packet_sending(
+                self.remote_conn.remote_addr,
+                &self.remote_conn.socket,
+                self.remote_conn
+                    .last_packet_id
+                    .fetch_add(1, std::sync::atomic::Ordering::Release),
+                &self.remote_conn.outbound_symmetric_key,
+                receipts,
+                (),
+                &self.remote_conn.sent_tracker,
+                50,
+                token,
+                PacketStream::Control,
+                &self.remote_conn.last_packet_id,
+            )
+            .await;
+        }
+        send_untracked_receipts(
             self.remote_conn.remote_addr,
             &self.remote_conn.socket,
-            self.remote_conn
-                .last_packet_id
-                .fetch_add(1, std::sync::atomic::Ordering::Release),
             &self.remote_conn.outbound_symmetric_key,
-            receipts,
-            (),
-            &self.remote_conn.sent_tracker,
-            50,
-            token,
-            PacketStream::Control,
+            &receipts,
+            &self.remote_conn.last_packet_id,
         )
         .await
     }
@@ -1993,6 +2450,7 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
             packet_size,
             token,
             PacketStream::Control,
+            &self.remote_conn.last_packet_id,
         )
         .await?;
         Ok(())
@@ -2178,6 +2636,7 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
             packet_size,
             token,
             PacketStream::Stream(fragment.stream_id),
+            &self.remote_conn.last_packet_id,
         )
         .await?;
 
@@ -2245,6 +2704,9 @@ async fn packet_sending<S: super::Socket, T: crate::simulation::TimeSource>(
     // atomically via `SentPacketTracker::drop_stream`; `Control` for everything
     // else (handshake, NoOp, short message).
     stream: PacketStream,
+    // Source of fresh packet ids for receipts that do not fit alongside the
+    // payload (the connection's `last_packet_id`).
+    next_packet_id: &AtomicU32,
 ) -> Result<()> {
     let start_time = tokio::time::Instant::now();
     tracing::trace!(
@@ -2312,99 +2774,85 @@ async fn packet_sending<S: super::Socket, T: crate::simulation::TimeSource>(
                 }
             }
         }
-        either::Either::Right((payload, mut confirm_receipt)) => {
+        either::Either::Right((payload, confirm_receipt)) => {
             tracing::trace!(
                 peer_addr = %remote_addr,
                 packet_id,
-                "Sending multi-packet message"
+                receipts = confirm_receipt.len(),
+                "Payload and receipts do not fit one packet; sending receipts separately"
             );
-            // Accumulate on-wire bytes across all packets of this multi-part
-            // message so the Phase 1.6 class counters see the full cost,
-            // attributed to the primary payload's class. Two accepted
-            // accounting nits (observation-only, see shadow_demand.rs): the
-            // trailing NoOp confirm-receipt packets are counted under the
-            // primary class rather than as must-flow, and on a mid-burst
-            // `send_to` failure the `?` below returns before the
-            // `record_outbound` call, so the class split can undercount the
-            // already-sent bytes relative to `cumulative_bytes_sent` (which
-            // is incremented per packet at the socket layer). Both are tiny
-            // and only affect the rarely-hit multi-packet path.
-            let mut sent_on_wire = 0usize;
-            macro_rules! send {
-                ($packets:ident) => {{
-                    for packet in $packets {
-                        let packet_data = packet.prepared_send();
-                        socket
-                            .send_to(&packet_data, remote_addr)
-                            .await
-                            .map_err(|e| TransportError::SendFailed(remote_addr, e.kind()))?;
-                        sent_on_wire += packet_data.len();
-                        report_sent_tagged(
-                            &mut sent_tracker.lock(),
-                            packet_id,
-                            packet_data,
-                            packet_size,
-                            delivery_token,
-                            stream,
-                        );
-                    }
-                }};
-            }
-
-            let max_num = SymmetricMessage::max_num_of_confirm_receipts_of_noop_message();
+            // The payload goes alone under `packet_id` and is the ONLY packet
+            // tracked for it. The receipts that did not fit go in separate,
+            // untracked NoOps with FRESH ids (#5795 review). Before, those
+            // NoOps reused `packet_id` and were each registered with the
+            // tracker, so the last one overwrote the payload's stored bytes:
+            // a lost ack then made us retransmit a NoOp instead of the
+            // message, which a capable receiver never acks, so the message
+            // was retried 12 times and abandoned although it was delivered.
+            // Fresh ids also stop an old receiver from deduplicating the
+            // payload against a NoOp that arrived first.
             let packet = SymmetricMessage::serialize_msg_to_packet_data(
                 packet_id,
                 payload,
                 outbound_sym_key,
                 vec![],
-            )?;
-
-            if max_num > confirm_receipt.len() {
-                let packets = [
-                    packet,
-                    SymmetricMessage::serialize_msg_to_packet_data(
-                        packet_id,
-                        SymmetricMessagePayload::NoOp,
-                        outbound_sym_key,
-                        confirm_receipt,
-                    )?,
-                ];
-
-                send!(packets);
-                super::shadow_demand::record_outbound(outbound_class, sent_on_wire);
-                return Ok(());
-            }
-
-            let mut packets = Vec::with_capacity(8);
-            packets.push(packet);
-
-            while !confirm_receipt.is_empty() {
-                let len = confirm_receipt.len();
-
-                if len <= max_num {
-                    packets.push(SymmetricMessage::serialize_msg_to_packet_data(
-                        packet_id,
-                        SymmetricMessagePayload::NoOp,
-                        outbound_sym_key,
-                        confirm_receipt,
-                    )?);
-                    break;
-                }
-
-                let receipts = confirm_receipt.split_off(max_num);
-                packets.push(SymmetricMessage::serialize_msg_to_packet_data(
-                    packet_id,
-                    SymmetricMessagePayload::NoOp,
-                    outbound_sym_key,
-                    receipts,
-                )?);
-            }
-
-            send!(packets);
-            super::shadow_demand::record_outbound(outbound_class, sent_on_wire);
-            Ok(())
+            )?
+            .prepared_send();
+            socket
+                .send_to(&packet, remote_addr)
+                .await
+                .map_err(|e| TransportError::SendFailed(remote_addr, e.kind()))?;
+            super::shadow_demand::record_outbound(outbound_class, packet.len());
+            report_sent_tagged(
+                &mut sent_tracker.lock(),
+                packet_id,
+                packet,
+                packet_size,
+                delivery_token,
+                stream,
+            );
+            send_untracked_receipts(
+                remote_addr,
+                socket,
+                outbound_sym_key,
+                &confirm_receipt,
+                next_packet_id,
+            )
+            .await
         }
     }
+}
+
+/// Send `receipts` in as many ack-only `NoOp`s as needed, each with a fresh
+/// packet id, none tracked for retransmission (see `PeerConnection::noop`).
+async fn send_untracked_receipts<S: super::Socket>(
+    remote_addr: SocketAddr,
+    socket: &Arc<S>,
+    outbound_sym_key: &Aes128Gcm,
+    receipts: &[u32],
+    next_packet_id: &AtomicU32,
+) -> Result<()> {
+    let max_per_packet = SymmetricMessage::max_num_of_confirm_receipts_of_noop_message().max(1);
+    for chunk in receipts.chunks(max_per_packet) {
+        let packet_id = next_packet_id.fetch_add(1, std::sync::atomic::Ordering::Release);
+        let packet = SymmetricMessage::serialize_msg_to_packet_data(
+            packet_id,
+            SymmetricMessagePayload::NoOp,
+            outbound_sym_key,
+            chunk.to_vec(),
+        )?
+        .prepared_send();
+        socket
+            .send_to(&packet, remote_addr)
+            .await
+            .map_err(|e| TransportError::SendFailed(remote_addr, e.kind()))?;
+        // Phase 1.6 (#4074): ack-only NoOps are must-flow.
+        super::shadow_demand::record_outbound(
+            super::shadow_demand::OutboundClass::MustFlow,
+            packet.len(),
+        );
+    }
+    Ok(())
 }
 
 // =============================================================================
@@ -2612,6 +3060,7 @@ mod tests {
                 50,
                 None,
                 PacketStream::Control,
+                &AtomicU32::new(1_000_000),
             )
             .await;
 
@@ -2679,6 +3128,7 @@ mod tests {
                 50,
                 None,
                 PacketStream::Control,
+                &AtomicU32::new(1_000_000),
             )
             .await
             .expect_err("send during blip should fail");
@@ -2704,6 +3154,7 @@ mod tests {
                 50,
                 None,
                 PacketStream::Control,
+                &AtomicU32::new(1_000_000),
             )
             .await
             .expect("send after the blip clears must succeed on the same connection");
@@ -2799,6 +3250,7 @@ mod tests {
                 packet_size,
                 None,
                 PacketStream::Stream(stream_id),
+                &AtomicU32::new(1_000_000),
             )
             .await
             .expect("metadata-bearing stream fragment send should succeed");
@@ -2858,6 +3310,7 @@ mod tests {
                 240,
                 None,
                 PacketStream::Control,
+                &AtomicU32::new(1_000_000),
             )
             .await
             .expect("short send should succeed");
@@ -2887,6 +3340,7 @@ mod tests {
                 300,
                 None,
                 PacketStream::Stream(frag_stream_id),
+                &AtomicU32::new(1_000_000),
             )
             .await
             .expect("stream fragment send should succeed");
@@ -2915,6 +3369,7 @@ mod tests {
                 640,
                 None,
                 PacketStream::Control,
+                &AtomicU32::new(1_000_000),
             )
             .await;
             assert!(res.is_err(), "failing socket must return Err");
@@ -3059,6 +3514,695 @@ mod tests {
         out_res?;
         assert_eq!(message, inbound_msg);
         Ok(())
+    }
+
+    // ------------------------------------------------------------------
+    // Multi-fragment byte-identity roundtrip coverage (#5256)
+    // ------------------------------------------------------------------
+    //
+    // `test_inbound_outbound_interaction` above sends 1000 bytes, which is a
+    // SINGLE fragment, so nothing in the transport crate exercised
+    // fragmentation plus reassembly end to end. That is the path every large
+    // contract state travels.
+    //
+    // The tests below drive the real `send_stream` fragmentation, capture the
+    // fragments off the simulated wire, and reassemble them through the real
+    // `recv_stream`/`InboundStream`, asserting the received bytes are
+    // BYTE-IDENTICAL to what was sent.
+    //
+    // Byte identity, not length, is the assertion that matters here.
+    // Reassembly already completes only on an exact byte count, so a length
+    // check proves nothing about a length-preserving mid-payload corruption -
+    // which is exactly the failure mode observed on the live network (16
+    // contiguous bytes zeroed inside an otherwise byte-identical contract
+    // state).
+    //
+    // SCOPE: `InboundStream` carries large NetMessage sends. It is NOT the
+    // reassembler a contract state travels through - operations-level streams
+    // bypass it entirely (see `process_inbound`'s
+    // `if stream_id.is_operations_stream() { return Ok(None) }`) in favour of
+    // `LockFreeStreamBuffer`. The equivalent coverage for that buffer is the
+    // `streaming_buffer_*` block further down; neither block's result carries
+    // over to the other.
+
+    /// Fragment payload capacities, stated as literals rather than re-derived
+    /// from the sender's own `MAX_DATA_SIZE - (1 + 8 + meta.len())`. An
+    /// expectation computed by the expression under test agrees with that
+    /// expression even when it is wrong, so it cannot fail;
+    /// `fragment_count_literals_are_computed_for_this_max_data_size` is what
+    /// ties these literals to the constants they were computed for.
+    const FULL_FRAGMENT_PAYLOAD: usize = 1130;
+    /// The metadata length every metadata-carrying test below uses.
+    const ROUNDTRIP_METADATA_LEN: usize = 256;
+    /// Fragment #1's payload capacity once `ROUNDTRIP_METADATA_LEN` bytes of
+    /// metadata, a 1-byte `Option` discriminant and an 8-byte length prefix
+    /// have taken their share of `FULL_FRAGMENT_PAYLOAD`.
+    const FIRST_FRAGMENT_PAYLOAD_WITH_METADATA: usize = 865;
+
+    /// A multi-fragment stream captured off the simulated wire.
+    struct CapturedStream {
+        /// `(fragment_number, payload)` in the order the sender emitted them.
+        fragments: Vec<(u32, bytes::Bytes)>,
+        /// Metadata the sender embedded in fragment #1, if any.
+        embedded_metadata: Option<bytes::Bytes>,
+        /// `total_length_bytes` as advertised on the wire.
+        total_length_bytes: u64,
+    }
+
+    /// Runs `payload` through the real outbound fragmentation path and returns
+    /// every fragment the sender put on the wire, decrypted and deserialized.
+    ///
+    /// Uses the in-test `TestSocket` (a channel-backed `Socket` impl) rather
+    /// than a real UDP socket, and `VirtualTime` rather than the wall clock.
+    async fn capture_stream_fragments(
+        payload: &[u8],
+        metadata: Option<bytes::Bytes>,
+    ) -> CapturedStream {
+        let (sender, mut receiver) = mpsc::channel(8);
+        let remote_addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 8080);
+        let mut key = [0u8; 16];
+        crate::config::GlobalRng::fill_bytes(&mut key);
+        let cipher = Aes128Gcm::new(&key.into());
+
+        let time_source = crate::simulation::VirtualTime::new();
+        let sent_tracker = Arc::new(parking_lot::Mutex::new(
+            SentPacketTracker::new_with_time_source(time_source.clone()),
+        ));
+
+        // Nothing ACKs in this harness, so flightsize only ever grows, and
+        // `VirtualTime` does not advance on its own - a token-bucket wait would
+        // deadlock the test rather than merely slow it down. Budget the
+        // congestion window and the token bucket above the whole transfer so
+        // neither can gate a fragment.
+        //
+        // This budget is a belt, not a guarantee: today's default congestion
+        // algorithm is `FixedRate`, whose `current_cwnd()` returns
+        // `usize::MAX / 2`, so the cwnd gate is a no-op and liveness here is
+        // partly accidental. Should the default become BBR or LEDBAT, a
+        // shortfall would park the sender forever on a clock that never
+        // advances. `CAPTURE_TIMEOUT` below turns that into a named failure
+        // instead of a CI run that hangs with no diagnostic.
+        let budget = payload.len() + metadata.as_ref().map_or(0, |m| m.len()) + 64 * 1024;
+        let congestion_controller =
+            crate::transport::congestion_control::CongestionControlConfig::default()
+                .with_initial_cwnd(budget)
+                .with_min_cwnd(budget)
+                .with_max_cwnd(budget)
+                .build_arc_with_time_source(time_source.clone());
+        let token_bucket = Arc::new(TokenBucket::new_with_time_source(
+            budget,
+            budget,
+            time_source.clone(),
+        ));
+
+        let stream_id = StreamId::next();
+        let outbound = GlobalExecutor::spawn(send_stream(
+            stream_id,
+            Arc::new(AtomicU32::new(0)),
+            Arc::new(TestSocket::new(sender)),
+            remote_addr,
+            bytes::Bytes::copy_from_slice(payload),
+            cipher.clone(),
+            sent_tracker,
+            token_bucket,
+            congestion_controller,
+            time_source,
+            metadata,
+            None,
+            None,
+        ));
+
+        let collect = async {
+            let mut fragments = Vec::new();
+            let mut embedded_metadata: Option<bytes::Bytes> = None;
+            let mut total_length_bytes: Option<u64> = None;
+            while let Some((_, network_packet)) = receiver.recv().await {
+                let decrypted = PacketData::<_, MAX_PACKET_SIZE>::from_buf(&network_packet)
+                    .try_decrypt_sym(&cipher)
+                    .expect("every emitted fragment must decrypt");
+                let SymmetricMessage {
+                    payload:
+                        SymmetricMessagePayload::StreamFragment {
+                            fragment_number,
+                            payload,
+                            metadata_bytes,
+                            total_length_bytes: advertised,
+                            ..
+                        },
+                    ..
+                } = SymmetricMessage::deser(decrypted.data()).expect("symmetric message")
+                else {
+                    panic!("send_stream must only emit StreamFragment packets");
+                };
+                if let Some(previous) = total_length_bytes {
+                    assert_eq!(
+                        previous, advertised,
+                        "every fragment must advertise the same total_length_bytes"
+                    );
+                }
+                total_length_bytes = Some(advertised);
+                if let Some(meta) = metadata_bytes {
+                    assert_eq!(fragment_number, 1, "metadata may only ride on fragment #1");
+                    assert!(
+                        embedded_metadata.replace(meta).is_none(),
+                        "metadata must be embedded exactly once"
+                    );
+                }
+                fragments.push((fragment_number, payload));
+            }
+            CapturedStream {
+                fragments,
+                embedded_metadata,
+                total_length_bytes: total_length_bytes
+                    .expect("send_stream must emit at least one fragment"),
+            }
+        };
+
+        // Wall-clock bound on a virtual-time transfer: reaching it means the
+        // sender stopped making progress, not that the machine is slow. Every
+        // capture in this module completes in well under a second.
+        const CAPTURE_TIMEOUT: Duration = Duration::from_secs(60);
+        let (send_result, captured) =
+            tokio::time::timeout(CAPTURE_TIMEOUT, async { tokio::join!(outbound, collect) })
+                .await
+                .expect(
+                    "send_stream stalled: it is gated on a cwnd or token-bucket wait that \
+                     VirtualTime will never satisfy, so the budget above no longer covers \
+                     the transfer",
+                );
+        send_result
+            .expect("send_stream task panicked")
+            .expect("send_stream failed");
+        captured
+    }
+
+    /// Feeds `delivery` through the real `recv_stream`/`InboundStream` path.
+    ///
+    /// Returns the reassembled payload, or `Err(stream_id)` if reassembly never
+    /// completed after every fragment in `delivery` had been offered.
+    async fn reassemble(
+        total_length_bytes: u64,
+        delivery: Vec<(u32, bytes::Bytes)>,
+    ) -> std::result::Result<Vec<u8>, StreamId> {
+        let (tx, rx) = mpsc::channel(delivery.len().max(1));
+        for fragment in delivery {
+            tx.send(fragment).await.expect("receiver is alive");
+        }
+        drop(tx);
+        recv_stream(StreamId::next(), rx, InboundStream::new(total_length_bytes))
+            .await
+            .map(|(_, msg)| msg)
+    }
+
+    /// Strict reverse arrival: fragment #1, the one that may carry metadata and
+    /// is the only one that can start the contiguous run, lands last.
+    fn deliver_reversed(captured: &CapturedStream) -> Vec<(u32, bytes::Bytes)> {
+        let mut delivery = captured.fragments.clone();
+        delivery.reverse();
+        delivery
+    }
+
+    /// Every even-numbered fragment, then every odd-numbered one: a maximally
+    /// interleaved arrival that keeps a gap open until the final fragment.
+    fn deliver_interleaved(captured: &CapturedStream) -> Vec<(u32, bytes::Bytes)> {
+        let (odd, even): (Vec<_>, Vec<_>) = captured
+            .fragments
+            .iter()
+            .cloned()
+            .partition(|(number, _)| number % 2 == 1);
+        even.into_iter().chain(odd).collect()
+    }
+
+    /// Every fragment delivered twice, back to back, in send order.
+    fn deliver_duplicated(captured: &CapturedStream) -> Vec<(u32, bytes::Bytes)> {
+        captured
+            .fragments
+            .iter()
+            .flat_map(|fragment| [fragment.clone(), fragment.clone()])
+            .collect()
+    }
+
+    /// The adversarial replay pattern: deliver a prefix in order, replay a
+    /// fragment the reassembler has ALREADY consumed, then deliver the rest out
+    /// of order.
+    ///
+    /// A reassembler that buffers the replay rather than dropping it wedges its
+    /// own drain loop: the stale key sits at the front of the pending map
+    /// forever, so no later fragment can drain and the stream never completes.
+    fn deliver_replay_then_gap(captured: &CapturedStream) -> Vec<(u32, bytes::Bytes)> {
+        assert!(
+            captured.fragments.len() >= 4,
+            "replay-then-gap needs at least 4 fragments to open a gap behind the replay"
+        );
+        let mut delivery = captured.fragments[..2].to_vec();
+        delivery.push(captured.fragments[0].clone());
+        delivery.extend(captured.fragments[2..].iter().rev().cloned());
+        delivery
+    }
+
+    /// Byte-identity assertion with a compact failure message. A bare
+    /// `assert_eq!` on a megabyte payload would dump both copies.
+    fn assert_bytes_identical(received: &[u8], sent: &[u8], context: &str) {
+        assert_eq!(
+            received.len(),
+            sent.len(),
+            "{context}: reassembled length differs from what was sent"
+        );
+        if let Some(offset) = received.iter().zip(sent).position(|(a, b)| a != b) {
+            let differing = received.iter().zip(sent).filter(|(a, b)| a != b).count();
+            panic!(
+                "{context}: payload CORRUPTED in transit - first differing byte at offset \
+                 {offset} of {}: sent {:#04x}, received {:#04x}; {differing} bytes differ in total",
+                sent.len(),
+                sent[offset],
+                received[offset],
+            );
+        }
+    }
+
+    /// Asserts a `payload_len`-byte payload survives fragmentation and
+    /// reassembly byte-identically under every delivery order.
+    ///
+    /// `expected_fragments` is stated explicitly rather than recomputed from
+    /// the sender's own formula: re-deriving it here would make the assertion
+    /// self-checking and blind to an off-by-one in that formula.
+    /// `fragment_count_literals_are_computed_for_this_max_data_size` pins the
+    /// constant these literals were computed against.
+    async fn assert_multi_fragment_roundtrip(
+        payload_len: usize,
+        metadata: Option<bytes::Bytes>,
+        expected_fragments: usize,
+    ) {
+        assert!(
+            expected_fragments >= 2,
+            "this helper exists to cover MULTI-fragment payloads"
+        );
+
+        let mut payload = vec![0u8; payload_len];
+        crate::config::GlobalRng::fill_bytes(&mut payload);
+
+        let captured = capture_stream_fragments(&payload, metadata.clone()).await;
+        let described = format!(
+            "{payload_len} bytes, metadata={}",
+            metadata.as_ref().map_or(0, |m| m.len())
+        );
+
+        assert_eq!(
+            captured.fragments.len(),
+            expected_fragments,
+            "{described}: unexpected fragment count"
+        );
+        assert_eq!(
+            captured.total_length_bytes, payload_len as u64,
+            "{described}: advertised total_length_bytes must match the payload"
+        );
+        assert_eq!(
+            captured.embedded_metadata, metadata,
+            "{described}: embedded metadata must round-trip byte-identically"
+        );
+
+        // Fragment numbers are 1-indexed, contiguous, and emitted in order.
+        assert_eq!(
+            captured
+                .fragments
+                .iter()
+                .map(|(number, _)| *number)
+                .collect::<Vec<_>>(),
+            (1..=expected_fragments as u32).collect::<Vec<_>>(),
+            "{described}: fragment numbering must be 1-indexed and contiguous"
+        );
+
+        // The sender's own fragmentation must be lossless before reassembly is
+        // even in the picture.
+        let concatenated: Vec<u8> = captured
+            .fragments
+            .iter()
+            .flat_map(|(_, fragment)| fragment.iter().copied())
+            .collect();
+        assert_bytes_identical(
+            &concatenated,
+            &payload,
+            &format!("{described}: fragmentation"),
+        );
+
+        // Fragment #1 is the asymmetric one: embedded metadata steals room from
+        // its payload. Pin that capacity explicitly - an off-by-one in the
+        // metadata overhead is invisible to a whole-payload check because the
+        // sender's total_packets calculation compensates for it.
+        let first_fragment_capacity = match &metadata {
+            Some(meta) => {
+                assert_eq!(
+                    meta.len(),
+                    ROUNDTRIP_METADATA_LEN,
+                    "FIRST_FRAGMENT_PAYLOAD_WITH_METADATA was computed for this metadata length"
+                );
+                FIRST_FRAGMENT_PAYLOAD_WITH_METADATA
+            }
+            None => FULL_FRAGMENT_PAYLOAD,
+        };
+        assert_eq!(
+            captured.fragments[0].1.len(),
+            first_fragment_capacity,
+            "{described}: fragment #1 must be filled to its metadata-reduced capacity"
+        );
+        for (number, fragment) in &captured.fragments[1..expected_fragments - 1] {
+            assert_eq!(
+                fragment.len(),
+                FULL_FRAGMENT_PAYLOAD,
+                "{described}: interior fragment #{number} must be full"
+            );
+        }
+
+        let mut orders: Vec<(&str, Vec<(u32, bytes::Bytes)>)> = vec![
+            ("in order", captured.fragments.clone()),
+            ("reversed", deliver_reversed(&captured)),
+            ("interleaved", deliver_interleaved(&captured)),
+            ("duplicated", deliver_duplicated(&captured)),
+        ];
+        if captured.fragments.len() >= 4 {
+            orders.push(("replay then gap", deliver_replay_then_gap(&captured)));
+        }
+
+        for (order, delivery) in orders {
+            let context = format!("{described}, delivered {order}");
+            let received = reassemble(captured.total_length_bytes, delivery)
+                .await
+                .unwrap_or_else(|_| {
+                    panic!("{context}: reassembly never completed despite every byte arriving")
+                });
+            assert_bytes_identical(&received, &payload, &context);
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // The reassembler contract state ACTUALLY uses: LockFreeStreamBuffer
+    // ------------------------------------------------------------------
+    //
+    // `assert_multi_fragment_roundtrip` above exercises `InboundStream`, which
+    // is NOT the reassembler a contract state travels through. Operations-level
+    // streams (`StreamId::next_operations()` - every GET/PUT/broadcast payload)
+    // return from `PeerConnection::process_inbound` BEFORE the legacy
+    // `InboundStream` path is reached, and are reassembled instead by
+    // `LockFreeStreamBuffer` behind `streaming::StreamHandle`, which
+    // `operations/{get,put,update}/op_ctx_task.rs` drain via
+    // `StreamHandle::assemble()`.
+    //
+    // That buffer is a materially different structure - an `AtomicPtr` slot
+    // array with CAS insertion, a contiguous frontier, and a separate consumed
+    // frontier - so a byte-identity result for one says nothing about the
+    // other. These tests run the SAME captured fragments and the SAME delivery
+    // orders through it.
+
+    /// Reassembles `delivery` through the operations-stream path:
+    /// `StreamHandle::push_fragment` into a `LockFreeStreamBuffer`, drained by
+    /// `StreamHandle::assemble()`.
+    ///
+    /// A rejected fragment is surfaced rather than swallowed: the buffer sizes
+    /// its slot array from `total_length_bytes` alone, so a sender that emits
+    /// more fragments than the buffer allocated shows up here as
+    /// `InvalidFragment` instead of as a silently short assembly.
+    async fn reassemble_via_streaming_buffer(
+        total_length_bytes: u64,
+        delivery: Vec<(u32, bytes::Bytes)>,
+    ) -> std::result::Result<Vec<u8>, streaming::StreamError> {
+        let handle = streaming::StreamHandle::new(StreamId::next_operations(), total_length_bytes);
+        for (number, fragment) in delivery {
+            handle.push_fragment(number, fragment)?;
+        }
+        handle.assemble().await
+    }
+
+    /// Asserts a `payload_len`-byte payload survives the real sender's
+    /// fragmentation and `LockFreeStreamBuffer` reassembly byte-identically
+    /// under every delivery order.
+    ///
+    /// Deliberately reuses `capture_stream_fragments`, so the bytes offered to
+    /// the buffer are the same bytes the sender put on the wire, not a
+    /// hand-rolled approximation of them.
+    async fn assert_streaming_buffer_roundtrip(
+        payload_len: usize,
+        metadata: Option<bytes::Bytes>,
+        expected_fragments: usize,
+    ) {
+        assert!(
+            expected_fragments >= 2,
+            "this helper exists to cover MULTI-fragment payloads"
+        );
+
+        let mut payload = vec![0u8; payload_len];
+        crate::config::GlobalRng::fill_bytes(&mut payload);
+
+        let captured = capture_stream_fragments(&payload, metadata.clone()).await;
+        let described = format!(
+            "{payload_len} bytes, metadata={}",
+            metadata.as_ref().map_or(0, |m| m.len())
+        );
+        assert_eq!(
+            captured.fragments.len(),
+            expected_fragments,
+            "{described}: unexpected fragment count"
+        );
+
+        let mut orders: Vec<(&str, Vec<(u32, bytes::Bytes)>)> = vec![
+            ("in order", captured.fragments.clone()),
+            ("reversed", deliver_reversed(&captured)),
+            ("interleaved", deliver_interleaved(&captured)),
+            ("duplicated", deliver_duplicated(&captured)),
+        ];
+        if captured.fragments.len() >= 4 {
+            orders.push(("replay then gap", deliver_replay_then_gap(&captured)));
+        }
+
+        for (order, delivery) in orders {
+            let context = format!("{described}, delivered {order}");
+            let received = reassemble_via_streaming_buffer(captured.total_length_bytes, delivery)
+                .await
+                .unwrap_or_else(|e| {
+                    panic!("{context}: LockFreeStreamBuffer reassembly failed: {e}")
+                });
+            assert_bytes_identical(&received, &payload, &context);
+        }
+    }
+
+    /// The 24,832-byte case against the reassembler contract state really uses.
+    #[tokio::test]
+    async fn streaming_buffer_roundtrip_is_byte_identical() {
+        assert_streaming_buffer_roundtrip(24_832, None, 22).await;
+    }
+
+    /// With metadata embedded in fragment #1, the buffer's `+1` overflow slot
+    /// and its `min_complete_fragments` split are both load-bearing: the sender
+    /// emits one more fragment than `ceil(total / MAX_DATA_SIZE)`, and
+    /// `is_complete()` fires one fragment before assembly can succeed.
+    #[tokio::test]
+    async fn streaming_buffer_roundtrip_with_metadata_is_byte_identical() {
+        let mut metadata = vec![0u8; ROUNDTRIP_METADATA_LEN];
+        crate::config::GlobalRng::fill_bytes(&mut metadata);
+        assert_streaming_buffer_roundtrip(24_832, Some(bytes::Bytes::from(metadata)), 23).await;
+    }
+
+    /// 1 MiB over 928 fragments through the CAS slot array.
+    #[tokio::test]
+    async fn large_streaming_buffer_roundtrip_is_byte_identical() {
+        assert_streaming_buffer_roundtrip(1_048_576, None, 928).await;
+    }
+
+    /// Fragment-multiple boundaries, with and without metadata. The
+    /// with-metadata triple is where the buffer's slot allocation
+    /// (`ceil(total / MAX_DATA_SIZE) + 1`) is exactly consumed, so an
+    /// off-by-one there rejects the sender's genuine final fragment.
+    #[tokio::test]
+    async fn streaming_buffer_size_boundaries_are_byte_identical() {
+        assert_streaming_buffer_roundtrip(FULL_FRAGMENT_PAYLOAD * 8, None, 8).await;
+        assert_streaming_buffer_roundtrip(FULL_FRAGMENT_PAYLOAD * 8 - 1, None, 8).await;
+        assert_streaming_buffer_roundtrip(FULL_FRAGMENT_PAYLOAD * 8 + 1, None, 9).await;
+
+        let mut metadata = vec![0u8; ROUNDTRIP_METADATA_LEN];
+        crate::config::GlobalRng::fill_bytes(&mut metadata);
+        let metadata = bytes::Bytes::from(metadata);
+        let exact = FIRST_FRAGMENT_PAYLOAD_WITH_METADATA + FULL_FRAGMENT_PAYLOAD * 7;
+
+        assert_streaming_buffer_roundtrip(exact, Some(metadata.clone()), 8).await;
+        assert_streaming_buffer_roundtrip(exact - 1, Some(metadata.clone()), 8).await;
+        assert_streaming_buffer_roundtrip(exact + 1, Some(metadata), 9).await;
+    }
+
+    /// The incremental consumer (`stream_with_reclaim`, used by piped-stream
+    /// forwarding) reads through `take()`, which empties the slot. Reading and
+    /// inserting interleaved is an ordering `assemble()` never sees, so it gets
+    /// its own byte-identity assertion.
+    #[tokio::test]
+    async fn streaming_buffer_reclaim_consumer_is_byte_identical() {
+        let mut payload = vec![0u8; 24_832];
+        crate::config::GlobalRng::fill_bytes(&mut payload);
+        let captured = capture_stream_fragments(&payload, None).await;
+
+        let handle = streaming::StreamHandle::new(StreamId::next_operations(), 24_832);
+        let mut consumer = handle.stream_with_reclaim();
+        let mut received = Vec::with_capacity(payload.len());
+
+        // Push one fragment, read one fragment, all the way through: the
+        // consumer is always reading a slot the writer touched moments ago.
+        for (number, fragment) in &captured.fragments {
+            handle
+                .push_fragment(*number, fragment.clone())
+                .expect("fragment must be accepted");
+            let chunk = consumer
+                .next()
+                .await
+                .expect("a fragment was just pushed")
+                .expect("stream must not be cancelled");
+            received.extend_from_slice(&chunk);
+        }
+
+        assert_bytes_identical(&received, &payload, "reclaiming consumer");
+    }
+
+    /// `LockFreeStreamBuffer::take()` does not advance `consumed_frontier`, so
+    /// `insert()` still accepts a retransmission of a fragment a reclaiming
+    /// consumer has already read, and refills the emptied slot.
+    ///
+    /// This test pins the CONSEQUENCE, which is the question that matters for
+    /// the #5256 corruption hunt: the refill is a bookkeeping defect (a slot
+    /// that was reclaimed becomes occupied again, and its memory is held until
+    /// the buffer drops), NOT a data defect. The consumer has already advanced
+    /// past that fragment and never re-reads it, and `assemble()` concatenates
+    /// slots strictly in order and stops at the first empty one, so it can
+    /// return `None` but cannot return mis-ordered or holed bytes.
+    ///
+    /// If a future change makes the refilled slot observable in the assembled
+    /// output, this test fails - which is the alarm worth having.
+    #[tokio::test]
+    async fn streaming_buffer_replay_after_reclaim_does_not_corrupt_bytes() {
+        let mut payload = vec![0u8; FULL_FRAGMENT_PAYLOAD * 4];
+        crate::config::GlobalRng::fill_bytes(&mut payload);
+        let captured = capture_stream_fragments(&payload, None).await;
+        assert_eq!(captured.fragments.len(), 4);
+
+        let handle =
+            streaming::StreamHandle::new(StreamId::next_operations(), payload.len() as u64);
+        for (number, fragment) in &captured.fragments {
+            handle.push_fragment(*number, fragment.clone()).unwrap();
+        }
+
+        // A reclaiming consumer takes fragment #1, emptying its slot.
+        let mut consumer = handle.stream_with_reclaim();
+        let first = consumer.next().await.unwrap().unwrap();
+        assert_eq!(first, captured.fragments[0].1);
+
+        // A retransmission of that same fragment arrives afterwards. `take()`
+        // left `consumed_frontier` at 0, so `insert()` treats the emptied slot
+        // as vacant and accepts it.
+        let refilled = handle
+            .push_fragment(1, captured.fragments[0].1.clone())
+            .expect("replay after take is accepted, not rejected as consumed");
+        assert!(
+            refilled,
+            "replay refills the slot a reclaiming consumer already emptied \
+             (see streaming_buffer.rs take(): it does not advance consumed_frontier)"
+        );
+
+        // The consumer never re-reads it: the remaining fragments come back in
+        // order and the concatenation is byte-identical.
+        let mut received = first.to_vec();
+        for _ in 1..captured.fragments.len() {
+            let chunk = consumer.next().await.unwrap().unwrap();
+            received.extend_from_slice(&chunk);
+        }
+        assert_bytes_identical(&received, &payload, "replay after reclaim");
+
+        // And a second consumer assembling the same buffer either sees the
+        // whole payload or nothing - never a corrupted middle.
+        match handle.try_assemble() {
+            Some(assembled) => {
+                assert_bytes_identical(&assembled, &payload, "assemble after reclaim + replay")
+            }
+            None => { /* slots emptied by the consumer: a short read, not a wrong one */ }
+        }
+    }
+
+    /// The `expected_fragments` literals in the tests below were computed for
+    /// this fragment payload size. Pin it so a change to the fragment overhead
+    /// fails loudly here instead of silently re-scoping that coverage.
+    #[test]
+    fn fragment_count_literals_are_computed_for_this_max_data_size() {
+        assert_eq!(
+            MAX_DATA_SIZE, FULL_FRAGMENT_PAYLOAD,
+            "MAX_DATA_SIZE changed - recompute the expected fragment counts in the \
+             multi-fragment roundtrip tests"
+        );
+        // Literal-only arithmetic: the metadata overhead is 1 byte of `Option`
+        // discriminant plus an 8-byte length prefix. Written out here so the
+        // capacity expectations above never have to call the sender's own
+        // expression to know what they expect.
+        assert_eq!(
+            FIRST_FRAGMENT_PAYLOAD_WITH_METADATA + 1 + 8 + ROUNDTRIP_METADATA_LEN,
+            FULL_FRAGMENT_PAYLOAD,
+            "the metadata-reduced first-fragment capacity literal no longer adds up"
+        );
+    }
+
+    /// 24,832 bytes is the size of the corrupt contract state observed on the
+    /// live network (16 contiguous bytes zeroed inside an otherwise
+    /// byte-identical copy). It spans 22 fragments.
+    ///
+    /// What this rules out is `InboundStream`: sender-side fragmentation,
+    /// AES-128-GCM sealing, and ordered `InboundStream` reassembly do not
+    /// perforate a payload at this size under any delivery order tested. It
+    /// does NOT clear the path that contract state actually takes - operations
+    /// streams never reach `InboundStream` - so it is not on its own an answer
+    /// to where the observed corruption came from. See
+    /// `streaming_buffer_roundtrip_is_byte_identical` for the same payload
+    /// through the reassembler contract state does use.
+    #[tokio::test]
+    async fn multi_fragment_roundtrip_is_byte_identical() {
+        assert_multi_fragment_roundtrip(24_832, None, 22).await;
+    }
+
+    /// Same payload, but with metadata embedded in fragment #1 (fix #2757).
+    /// The first fragment then carries less payload than every other fragment,
+    /// and that asymmetry is exactly where an off-by-one would live.
+    #[tokio::test]
+    async fn multi_fragment_roundtrip_with_metadata_is_byte_identical() {
+        let mut metadata = vec![0u8; 256];
+        crate::config::GlobalRng::fill_bytes(&mut metadata);
+        assert_multi_fragment_roundtrip(24_832, Some(bytes::Bytes::from(metadata)), 23).await;
+    }
+
+    /// A payload far larger than any single-fragment case: 1 MiB over 928
+    /// fragments. Corruption that only shows up deep into a long stream (a
+    /// wrapped counter, an exhausted window, a reused buffer) needs a stream
+    /// long enough to reach it.
+    #[tokio::test]
+    async fn large_multi_fragment_roundtrip_is_byte_identical() {
+        assert_multi_fragment_roundtrip(1_048_576, None, 928).await;
+    }
+
+    /// Boundary triple with no metadata: exactly N full fragments, one byte
+    /// under (still N, last one short), and one byte over (N+1, last one a
+    /// single byte).
+    #[tokio::test]
+    async fn fragment_size_boundaries_are_byte_identical() {
+        assert_multi_fragment_roundtrip(FULL_FRAGMENT_PAYLOAD * 8, None, 8).await;
+        assert_multi_fragment_roundtrip(FULL_FRAGMENT_PAYLOAD * 8 - 1, None, 8).await;
+        assert_multi_fragment_roundtrip(FULL_FRAGMENT_PAYLOAD * 8 + 1, None, 9).await;
+    }
+
+    /// The same boundary triple with metadata embedded, where the exact
+    /// multiple is `first_fragment_capacity + 7 * MAX_DATA_SIZE` rather than a
+    /// multiple of `MAX_DATA_SIZE`. This is the boundary the sender's
+    /// `total_packets` calculation gets wrong if the metadata overhead is
+    /// mis-stated.
+    #[tokio::test]
+    async fn metadata_fragment_size_boundaries_are_byte_identical() {
+        let mut metadata = vec![0u8; ROUNDTRIP_METADATA_LEN];
+        crate::config::GlobalRng::fill_bytes(&mut metadata);
+        let metadata = bytes::Bytes::from(metadata);
+        let exact = FIRST_FRAGMENT_PAYLOAD_WITH_METADATA + FULL_FRAGMENT_PAYLOAD * 7;
+
+        assert_multi_fragment_roundtrip(exact, Some(metadata.clone()), 8).await;
+        assert_multi_fragment_roundtrip(exact - 1, Some(metadata.clone()), 8).await;
+        assert_multi_fragment_roundtrip(exact + 1, Some(metadata), 9).await;
     }
 
     /// Verify that bincode serialization is fast enough to run on async runtime.
@@ -3381,6 +4525,9 @@ mod tests {
             keepalive_interval_for_pending,
         };
 
+        // NAT-keepalive guarantee (#5795): never longer than 15 s.
+        assert!(MAX_KEEPALIVE_INTERVAL <= Duration::from_secs(15));
+
         // At or below threshold: base interval (5s)
         for count in 0..=MAX_UNANSWERED_PINGS {
             assert_eq!(
@@ -3393,9 +4540,8 @@ mod tests {
         // Above threshold: exponential backoff, capped at MAX_KEEPALIVE_INTERVAL
         let expected = [
             (1, Duration::from_secs(10)),  // 5s * 2^1
-            (2, Duration::from_secs(20)),  // 5s * 2^2
-            (3, Duration::from_secs(40)),  // 5s * 2^3
-            (4, MAX_KEEPALIVE_INTERVAL),   // 5s * 2^4 = 80s, capped at 60s
+            (2, MAX_KEEPALIVE_INTERVAL),   // 5s * 2^2 = 20s, capped at 15s
+            (3, MAX_KEEPALIVE_INTERVAL),   // capped
             (100, MAX_KEEPALIVE_INTERVAL), // far beyond threshold, still capped
         ];
         for (above, interval) in expected {
@@ -3485,6 +4631,136 @@ mod tests {
         assert!(
             !cache.contains(&msg_hash(b"msg-1")),
             "msg-1 should be evicted"
+        );
+    }
+
+    /// A duplicate `AckConnectionV2` on an ESTABLISHED connection is answered
+    /// with the LEGACY `ack_ok`, and does not disturb the connection (#5161).
+    ///
+    /// The arm handling it is shared with the legacy duplicate ack, and the
+    /// choice to reply in the old encoding is deliberate rather than an
+    /// oversight: this side is the joiner, so the remote already learned our
+    /// version from our intro packet, and answering V2 with V2 would tell it
+    /// nothing it does not have. That reasoning was load-bearing and unpinned
+    /// until this test — a reviewer flagged that nothing drove `process_inbound`
+    /// with either success ack.
+    ///
+    /// Sends a `ShortMessage` behind the ack so `recv()` has something to
+    /// return: the ack arm yields `Ok(None)` and loops, so a test that sent only
+    /// the ack would hang rather than assert.
+    #[tokio::test]
+    async fn duplicate_v2_ack_on_established_connection_is_answered_with_legacy_ack() {
+        use crate::transport::crypto::TransportKeypair;
+        use crate::transport::packet_data::PacketData;
+        use crate::transport::symmetric_message::SymmetricMessagePayload;
+        use crate::util::time_source::SharedMockTimeSource;
+        use bytes::Bytes;
+
+        let time_source = SharedMockTimeSource::new();
+        let (inbound_tx, inbound_rx) = mpsc::channel(16);
+        let remote_addr = SocketAddr::new(Ipv4Addr::new(10, 99, 99, 2).into(), 50002);
+
+        let mut key = [0u8; 16];
+        crate::config::GlobalRng::fill_bytes(&mut key);
+        let cipher = Aes128Gcm::new(&key.into());
+        let keypair = TransportKeypair::new();
+
+        let sent_tracker = Arc::new(parking_lot::Mutex::new(
+            SentPacketTracker::new_with_time_source(time_source.clone()),
+        ));
+        let congestion_controller =
+            crate::transport::congestion_control::CongestionControlConfig::default()
+                .build_arc_with_time_source(time_source.clone());
+        let token_bucket = Arc::new(TokenBucket::new_with_time_source(
+            10_000,
+            10_000_000,
+            time_source.clone(),
+        ));
+        let (sock_tx, mut sock_rx) = mpsc::channel::<(SocketAddr, Arc<[u8]>)>(16);
+        let socket = Arc::new(TestSocket::new(sock_tx));
+
+        let rolling_rtt_stats = crate::transport::rolling_rtt_stats::RollingRttStatsHandle::new(
+            remote_addr,
+            time_source.clone(),
+        );
+        let remote_conn = RemoteConnection {
+            outbound_symmetric_key: cipher.clone(),
+            remote_addr,
+            sent_tracker,
+            last_packet_id: Arc::new(AtomicU32::new(0)),
+            inbound_packet_recv: inbound_rx,
+            inbound_symmetric_key: cipher.clone(),
+            inbound_symmetric_key_bytes: key,
+            my_address: None,
+            remote_protoc_version: Some((0, 2, 120)),
+            transport_secret_key: keypair.secret,
+            congestion_controller,
+            token_bucket,
+            socket,
+            global_bandwidth: None,
+            rolling_rtt_stats,
+            time_source,
+        };
+
+        // A retransmitted V2 success ack, as an upgraded acceptor would resend
+        // if it never saw our completion ack.
+        let v2 = SymmetricMessage::ack_ok_with_version(
+            &cipher,
+            key,
+            remote_addr,
+            [0xFF, 0, 2, 0, 120, 0, 80, 1],
+        )
+        .expect("encode v2 ack");
+        inbound_tx
+            .send(
+                PacketData::<crate::transport::packet_data::UnknownEncryption>::from_buf(v2.data()),
+            )
+            .await
+            .expect("send v2 ack");
+
+        // Something for `recv()` to actually return.
+        let follow_up = SymmetricMessage::serialize_msg_to_packet_data(
+            7,
+            SymmetricMessagePayload::ShortMessage {
+                payload: Bytes::from_static(b"after-the-ack"),
+            },
+            &cipher,
+            vec![],
+        )
+        .expect("encode short message");
+        inbound_tx
+            .send(
+                PacketData::<crate::transport::packet_data::UnknownEncryption>::from_buf(
+                    follow_up.data(),
+                ),
+            )
+            .await
+            .expect("send short message");
+
+        let mut conn = PeerConnection::new(remote_conn);
+        let msg = conn.recv().await.expect("recv");
+        assert_eq!(
+            msg.as_slice(),
+            b"after-the-ack".as_slice(),
+            "the V2 ack must be consumed and the connection carry on"
+        );
+
+        let (target, sent) = sock_rx.try_recv().expect("a reply must have been sent");
+        assert_eq!(target, remote_addr);
+        let decrypted =
+            PacketData::<crate::transport::packet_data::UnknownEncryption>::from_buf(&sent)
+                .try_decrypt_sym(&cipher)
+                .expect("reply is encrypted under the shared key");
+        let reply = SymmetricMessage::deser(decrypted.data()).expect("reply decodes");
+        assert!(
+            matches!(
+                reply.payload,
+                SymmetricMessagePayload::AckConnection { result: Ok(_) }
+            ),
+            "the reply must be the LEGACY ack — replying V2 here would tell the \
+             acceptor nothing it did not already learn from our intro packet, \
+             and would be an ungated send of the new encoding. Got: {:?}",
+            reply.payload
         );
     }
 
@@ -3819,6 +5095,13 @@ mod tests {
         };
 
         let mut conn = PeerConnection::new(remote_conn);
+        // This test is about the send path. Stop the keepalive task: with this
+        // module's no-op mock sleep it would emit Pings back to back once the
+        // socket recovers (since #5795 it no longer exits on a send error) and
+        // race the `sock_rx` assertions below.
+        if let Some(handle) = conn.keep_alive_handle.take() {
+            handle.abort();
+        }
 
         // Burst phase: several consecutive io::Errors hit the same live
         // connection. Each must surface as a transient error and must NOT
@@ -3851,17 +5134,8 @@ mod tests {
         // connection object. Success + an actual packet on the rx side proves
         // the outbound path recovered on the same `&mut conn`.
         //
-        // Determinism note (keepalive task): `SharedMockTimeSource` inherits
-        // the default `supports_keepalive() == true`, so `PeerConnection::new`
-        // spawned a live keepalive task. Because that time source's `sleep` is
-        // a no-op, the task immediately attempted a Ping `socket.send_to`,
-        // which failed (the fail flag was still `true` at construction) and
-        // made the task `break` out and self-terminate on its first send error
-        // — BEFORE this recovery phase runs. That is why the keepalive task
-        // cannot race the `sock_rx` assertions below (it can never emit a Ping
-        // into the now-succeeding socket). If a future keepalive change makes
-        // the task survive a transient send error, this test would need an
-        // explicit drain/filter on `sock_rx` to stay deterministic.
+        // The keepalive task was aborted above, so it cannot emit a Ping into
+        // the now-succeeding socket.
         fail_sends.store(false, std::sync::atomic::Ordering::Relaxed);
         conn.send(b"payload".to_vec())
             .await

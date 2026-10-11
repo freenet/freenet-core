@@ -16,10 +16,21 @@
 #     ASC_API_ISSUER_ID   Issuer UUID from App Store Connect
 #
 #   Other optional:
+#     FREENET_ARM64_FDEV_BIN  Path to aarch64-apple-darwin fdev binary.
+#     FREENET_X86_FDEV_BIN    Path to x86_64-apple-darwin fdev binary.
+#                             When BOTH are set, fdev is bundled alongside
+#                             freenet (Contents/MacOS/fdev) so the wrapper's
+#                             first-launch CLI symlink setup (service/
+#                             cli_symlinks.rs) can put both `freenet` and
+#                             `fdev` on PATH. When unset, the bundle ships
+#                             without fdev (fine for a local .app smoke-test).
 #     OUTPUT_DIR          Where to place artifacts (default: dist/macos)
 #     ICON_ICNS           Path to a .icns file (default: generic app icon)
 #     CREATE_DMG          "true" to produce a .dmg; "false" to stop at .app
 #                         (default: true)
+#     FREENET_SINGLE_ARCH_BUNDLE  "1" to bundle FREENET_ARM64_BIN alone, for an
+#                         unsigned local/CI smoke-test .app (refused when
+#                         signing is enabled)
 #
 # Produces:
 #   $OUTPUT_DIR/Freenet.app        (signed + notarized if credentials set)
@@ -79,10 +90,34 @@ APP_DIR="$OUTPUT_DIR/Freenet.app"
 rm -rf "$APP_DIR"
 mkdir -p "$APP_DIR/Contents/MacOS" "$APP_DIR/Contents/Resources"
 
-echo ">> Building universal binary"
-lipo -create -output "$APP_DIR/Contents/MacOS/freenet-bin" \
-    "$FREENET_ARM64_BIN" "$FREENET_X86_BIN"
+if [[ "${FREENET_SINGLE_ARCH_BUNDLE:-}" == "1" ]]; then
+    # A single-architecture local/CI smoke-test bundle from FREENET_ARM64_BIN
+    # alone (lipo refuses two inputs of one architecture). Opt-in only, and
+    # refused when signing, so a release can never ship one by accident.
+    if [[ "$SIGNING_ENABLED" == "true" ]]; then
+        echo "package-macos.sh: FREENET_SINGLE_ARCH_BUNDLE=1 is for unsigned test bundles only" >&2
+        exit 1
+    fi
+    echo ">> Single-architecture test bundle (FREENET_SINGLE_ARCH_BUNDLE=1)"
+    cp "$FREENET_ARM64_BIN" "$APP_DIR/Contents/MacOS/freenet-bin"
+else
+    echo ">> Building universal binary"
+    lipo -create -output "$APP_DIR/Contents/MacOS/freenet-bin" \
+        "$FREENET_ARM64_BIN" "$FREENET_X86_BIN"
+fi
 chmod +x "$APP_DIR/Contents/MacOS/freenet-bin"
+
+if [[ -n "${FREENET_ARM64_FDEV_BIN:-}" && -n "${FREENET_X86_FDEV_BIN:-}" ]]; then
+    echo ">> Building universal fdev binary"
+    lipo -create -output "$APP_DIR/Contents/MacOS/fdev" \
+        "$FREENET_ARM64_FDEV_BIN" "$FREENET_X86_FDEV_BIN"
+    chmod +x "$APP_DIR/Contents/MacOS/fdev"
+elif [[ -n "${FREENET_ARM64_FDEV_BIN:-}" || -n "${FREENET_X86_FDEV_BIN:-}" ]]; then
+    echo "package-macos.sh: FREENET_ARM64_FDEV_BIN and FREENET_X86_FDEV_BIN must both be set (or both unset)" >&2
+    exit 1
+else
+    echo ">> Skipping fdev (FREENET_ARM64_FDEV_BIN/FREENET_X86_FDEV_BIN not set)"
+fi
 
 echo ">> Writing shell wrapper as CFBundleExecutable"
 # When the user opens Freenet.app, macOS runs Contents/MacOS/Freenet (the
@@ -113,6 +148,14 @@ cat > "$APP_DIR/Contents/Info.plist" <<PLIST
     <key>LSMinimumSystemVersion</key><string>11.0</string>
     <key>NSPrincipalClass</key><string>NSApplication</string>
     <key>NSHighResolutionCapable</key><true/>
+    <key>CFBundleURLTypes</key>
+    <array>
+        <dict>
+            <key>CFBundleURLName</key><string>org.freenet.Freenet.link</string>
+            <key>CFBundleURLSchemes</key>
+            <array><string>freenet</string></array>
+        </dict>
+    </array>
 $(if [[ -n "$ICON_ICNS" ]]; then echo "    <key>CFBundleIconFile</key><string>Freenet</string>"; fi)
 </dict>
 </plist>

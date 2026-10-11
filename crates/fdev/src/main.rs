@@ -6,6 +6,7 @@ use freenet_stdlib::client_api::ClientRequest;
 mod build;
 mod commands;
 mod config;
+mod conformance;
 mod diagnostics;
 mod inspect;
 pub(crate) mod network_metrics_server;
@@ -50,21 +51,74 @@ enum Error {
 /// prevent. `3` is the first free code above clap's reserved range.
 const EXIT_RESPONSE_TIMEOUT: i32 = 3;
 
+/// A contract broke a merge law. Distinct from 1 (harness failure) so automation
+/// does not read "could not run the check" as "the contract is unsound".
+const EXIT_CONFORMANCE_VIOLATION: i32 = 4;
+
 /// Map a top-level error to the process exit code. A [`commands::ResponseTimeout`]
-/// (possibly wrapped by `anyhow`) maps to [`EXIT_RESPONSE_TIMEOUT`]; everything
-/// else maps to the generic failure code `1`.
+/// (possibly wrapped by `anyhow`) maps to [`EXIT_RESPONSE_TIMEOUT`]; a conformance
+/// violation maps to [`EXIT_CONFORMANCE_VIOLATION`]; everything else maps to the
+/// generic failure code `1`.
 fn exit_code_for_error(err: &anyhow::Error) -> i32 {
     if err.downcast_ref::<commands::ResponseTimeout>().is_some() {
         EXIT_RESPONSE_TIMEOUT
+    } else if err
+        .downcast_ref::<conformance::ConformanceViolations>()
+        .is_some()
+    {
+        // A contract that breaks a merge law is a different outcome from a harness
+        // that could not run, and CI needs to tell them apart: the first is a real
+        // result about the contract, the second says nothing about it at all.
+        EXIT_CONFORMANCE_VIOLATION
     } else {
         1
+    }
+}
+
+/// Default logging level for `fdev`'s subcommands, gated per-subcommand.
+///
+/// `fdev` is normally a debug build, and `init_tracer`'s default filter is
+/// `DEBUG` in that case (see `crates/core/src/tracing/tracer.rs`). `fdev
+/// conformance` makes one WASM call per case — hundreds on a real corpus —
+/// so the runtime's own per-call `DEBUG` logging (e.g. "Module cache hit")
+/// drowns the report under that default. Quiet it to `INFO` by default.
+/// `RUST_LOG`, when the user set one, always wins over the level passed
+/// here: `EnvFilter::from_env_lossy()` inside `init_tracer` reads the env
+/// var first and ignores the default entirely when it is present, so this
+/// only takes effect when nothing was set. Every other subcommand is
+/// unaffected (`None`, i.e. `init_tracer`'s own default).
+fn conformance_log_level(
+    sub_command: &SubCommand,
+    rust_log_is_set: bool,
+) -> Option<tracing::level_filters::LevelFilter> {
+    let SubCommand::VerifyMerge(config) = sub_command else {
+        return None;
+    };
+    if rust_log_is_set {
+        return None;
+    }
+    if config.json {
+        // `--json` writes the report to stdout, and so does the logger. Anything
+        // the logger emits therefore lands in the middle of the document and the
+        // output stops being parseable, which is the entire point of the flag.
+        // Silence is right rather than merely quieter: one WARN corrupts the
+        // document as thoroughly as a hundred, and the node emits several routine
+        // ones while building its scratch runtime.
+        //
+        // Nothing that matters is lost: a genuine failure returns an error, which
+        // goes to stderr and is carried by the exit code.
+        Some(tracing::level_filters::LevelFilter::OFF)
+    } else {
+        Some(tracing::level_filters::LevelFilter::INFO)
     }
 }
 
 fn main() -> anyhow::Result<()> {
     let config = Config::parse();
     if !config.sub_command.is_child() {
-        freenet::config::set_logger(None, None, config.additional.paths.log_dir.as_deref());
+        let log_level =
+            conformance_log_level(&config.sub_command, std::env::var("RUST_LOG").is_ok());
+        freenet::config::set_logger(log_level, None, config.additional.paths.log_dir.as_deref());
     }
 
     // Test subcommand uses Turmoil which requires running outside of any tokio runtime
@@ -125,6 +179,9 @@ fn main() -> anyhow::Result<()> {
             SubCommand::VerifyState(verify_config) => {
                 verify_state::verify_state(verify_config).await
             }
+            SubCommand::VerifyMerge(conformance_config) => {
+                conformance::conformance(conformance_config).await
+            }
             SubCommand::Website { command } => match command {
                 website::WebsiteCommand::Init { name } => website::init(name),
                 website::WebsiteCommand::Publish {
@@ -173,6 +230,37 @@ fn main() -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
+
+    /// Both spellings parse, and both reach the same subcommand.
+    ///
+    /// `fdev conformance` shipped in v0.2.129 and anything scripted against it must
+    /// keep working — a rename that silently breaks a released command is worse than
+    /// the naming it fixes. `verify-merge` is the name going forward because
+    /// "conformance" never said what was being checked: it is the merge laws, and a
+    /// contract that breaks them usually cannot converge.
+    #[test]
+    fn both_the_new_and_released_subcommand_names_parse() {
+        use clap::Parser;
+
+        for name in ["verify-merge", "conformance"] {
+            let parsed = super::config::Config::try_parse_from([
+                "fdev",
+                name,
+                "--wasm",
+                "/nonexistent.wasm",
+                "--state",
+                "/nonexistent.state",
+            ])
+            .unwrap_or_else(|e| panic!("`fdev {name}` no longer parses: {e}"));
+            assert!(
+                matches!(
+                    parsed.sub_command,
+                    super::config::SubCommand::VerifyMerge(_)
+                ),
+                "`fdev {name}` parsed to the wrong subcommand"
+            );
+        }
+    }
     use super::{EXIT_RESPONSE_TIMEOUT, exit_code_for_error};
     use crate::commands::ResponseTimeout;
     use std::time::Duration;
@@ -208,5 +296,68 @@ mod tests {
     fn other_errors_map_to_generic_failure_code() {
         let err = anyhow::anyhow!("boom");
         assert_eq!(exit_code_for_error(&err), 1);
+    }
+
+    fn empty_conformance_config() -> crate::conformance::ConformanceConfig {
+        crate::conformance::ConformanceConfig {
+            wasm: None,
+            params: None,
+            states: Vec::new(),
+            transitions: Vec::new(),
+            bundle: None,
+            contract_store: None,
+            max_cases: None,
+            properties: Vec::new(),
+            json: false,
+            evidence_out: None,
+            evidence_in: None,
+            bundle_out: None,
+        }
+    }
+
+    /// The bug this guards: without a quieter default, a debug build's
+    /// `DEBUG` filter drowns every conformance report in per-call WASM
+    /// runtime logging.
+    #[test]
+    fn conformance_quiets_default_log_level_when_rust_log_unset() {
+        let sub = super::SubCommand::VerifyMerge(empty_conformance_config());
+        assert_eq!(
+            super::conformance_log_level(&sub, false),
+            Some(tracing::level_filters::LevelFilter::INFO)
+        );
+    }
+
+    /// `--json` must produce a parseable document, and the logger writes to the
+    /// same stdout the report does.
+    ///
+    /// Found the hard way: piping a real `--json` run into `jq` failed with
+    /// "Invalid numeric literal at line 1, column 4", because the node's INFO
+    /// lines had landed on top of the document. The earlier INFO default fixed
+    /// readability for a human and left the machine-readable mode broken.
+    #[test]
+    fn conformance_silences_logging_entirely_for_json_output() {
+        let mut config = empty_conformance_config();
+        config.json = true;
+        let sub = super::SubCommand::VerifyMerge(config);
+        assert_eq!(
+            super::conformance_log_level(&sub, false),
+            Some(tracing::level_filters::LevelFilter::OFF),
+            "any log line at all would corrupt the JSON document"
+        );
+    }
+
+    /// An explicit `RUST_LOG` from the user must always win.
+    #[test]
+    fn conformance_defers_to_explicit_rust_log() {
+        let sub = super::SubCommand::VerifyMerge(empty_conformance_config());
+        assert_eq!(super::conformance_log_level(&sub, true), None);
+    }
+
+    /// This is `conformance`-specific quieting, not a change to fdev's
+    /// global logging default: every other subcommand is unaffected.
+    #[test]
+    fn other_subcommands_keep_the_default_log_level() {
+        let sub = super::SubCommand::Query {};
+        assert_eq!(super::conformance_log_level(&sub, false), None);
     }
 }

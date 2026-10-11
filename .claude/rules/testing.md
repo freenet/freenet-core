@@ -67,6 +67,65 @@ WHEN writing tests for any behavioral change:
     fn test_send_packet_after_recovery() { ... }
 ```
 
+### A "does not block" test is only as good as whether the counterfactual actually blocks
+
+```
+WHEN writing a test that asserts work X proceeds while slow work Y is in flight
+  ("does not block", "runs promptly", "no head-of-line blocking"):
+
+  → The assertion is meaningless unless Y REALLY HANGS in that harness
+  → RUN THE FALSIFICATION: disable the fix, re-run, confirm the test FAILS
+  → If it still passes, the test is vacuous — it is passing for a reason
+    unrelated to the fix, and it will not notice the regression it names
+```
+
+The trap is that these tests look strong. They drive the real loop, they use a
+gate, they assert a tight timeout — and they can still be measuring nothing,
+because the mock the test builds cannot perform the slow operation at all.
+
+**Worked example (#5544).** `deferred_delegate_upsert_does_not_block_the_loop`
+gated the OFF-LOOP related-contract fetch and asserted an unrelated local GET
+stayed prompt. It passed with the deferral disabled. `build_handler` constructs
+its executor with **no `op_manager`**, so the INLINE fetch fails immediately
+instead of hanging — the GET was prompt either way. The assertion held for a
+reason that had nothing to do with the change.
+
+Contrast the sibling test in the same commit,
+`parked_delegate_prompt_does_not_block_the_loop`, which IS decisive: it gates
+`prompter.prompt()`, which is pure async and genuinely hangs inline, so removing
+the fix really does stall the loop and really does fail the test.
+
+The distinction is not "integration vs unit" or "real loop vs mock". It is
+whether the specific slow operation you gated can block in the harness you built.
+
+Fix for a vacuous one: assert the MECHANISM alongside the emergent property —
+that the off-loop path was actually taken (a call counter on the stub), and that
+the operation is genuinely suspended (`!task.is_finished()` while gated). Both
+fail when the fix is removed; the timing assertion stays as corroboration.
+
+```
+WHEN a timing assertion cannot be made decisive in your harness:
+  → SAY SO IN A COMMENT ON THE TEST, naming what does carry the weight
+  → Do not leave a reader to assume the timeout is the guard
+```
+
+Running the falsification is itself governed by "Deliberately breaking code to
+verify a test: mark it `MUTATION_APPLIED`" above — commit before you mutate,
+mark the broken line with that exact token, and grep it clean before you
+commit. This section says a "does not block" test MUST be falsified; that one
+says how to falsify without leaving the break behind.
+
+**Known-vacuous, do not trust (audited 2026-09-04):** `#4391`'s
+`deferred_related_fetch_does_not_block_local_get` and
+`same_key_get_during_deferred_put_runs_promptly` both PASS with the deferral
+removed, for exactly this reason. #4391's deferral IS covered — three tests
+(`deferred_related_fetch_success_resumes_and_completes`,
+`second_related_request_after_resume_does_not_defer_again`,
+`update_path_deferral_resumes_and_applies`) do fail when it is removed — but they
+cover that the deferral EXISTS, not the head-of-line-blocking property it exists
+to provide. A regression where the deferral still happens but blocks anyway would
+be caught by nothing.
+
 ## Trigger-Action Rules
 
 ### When writing new code in `crates/core/`
@@ -117,6 +176,116 @@ Running all tests?
 Running specific integration test?
   → Use: cargo test -p freenet --test simulation_integration
 ```
+
+### Cross-test interference is invisible to CI — only plain `cargo test` can see it
+
+Every CI job runs `cargo nextest`, which executes each test in its own
+process. That is deliberate and mostly good (see "Running determinism tests"
+below), but it means **no CI job can observe a bug in which one test
+interferes with another through process-global state** — there is no shared
+process for the interference to happen in. `ci.yml` says "process isolation
+handles it (#3051)", which is true of the symptom and false of the coverage:
+it is blindness, not a guard. `AGENTS.md` tells you to run `cargo test` before
+committing, and that is the only runner that can expose this class.
+
+The mechanism generalises past any one library: **any process-global cache
+whose value is decided by whichever thread arrives first** is order-dependent,
+and per-process isolation hides it completely. The instance that motivated
+this entry (#4927, fixed in #5314): `tracing` caches each callsite's
+`Interest` process-globally on first touch, and resolves it against the
+*registering* thread's subscriber, so a test with no subscriber could pin a
+callsite to `never` and blind another test's thread-local log capture to that
+one callsite. Measured: 29 failures in 1000 `cargo test -p freenet --lib
+subscriber_limit_tests` runs across three tests, 0 in 2000 runs after the fix
+— and **unreachable under `cargo nextest` at any repeat count**.
+
+`[profile.ci] retries = 2` in `.config/nextest.toml` is the *smaller* half of
+this gap: it can only launder a failure CI was otherwise able to see.
+
+```
+WHEN adding or changing a test:
+  Ask: could this interact with other tests through process-global state?
+       (a global/static cache, a `set_global_default`, an env var, a
+        singleton registry, an ambient `tracing`/`log` subscriber, a shared
+        temp path)
+
+  → YES: run plain `cargo test` locally at scale (hundreds of runs of a
+         filter that includes the plausible competitors) and say so in the PR.
+         A green nextest CI run has NOT examined it.
+  → Regression test for such a bug: it must control the interfering
+    population, which usually means a child process (re-exec of the test
+    binary filtered to that one test) — in-process, whether the bug can
+    occur at all depends on what else happens to be running. See
+    `crate::util::test_log_capture` for a worked example, including asserting
+    the child actually ran a test so a rename fails closed.
+  → Alternative when the test can build every competitor itself: run them on
+    two threads inside ONE test. The interfering population is then fixed by
+    the test rather than by what else is running, so it fails under nextest
+    too. Worked example (#5673): `node::testing_impl::tests::
+    dropping_one_network_keeps_crash_enforcement_of_another`.
+```
+
+A second instance, with the opposite trigger: #5673's packet-delivery
+callback (what makes `SimOperation::CrashNode` drop packets) was one
+process-global slot that every `SimNetwork::Drop` cleared. So under plain
+`cargo test` the first simulation to *finish* disabled crashes for every
+other one. Harness state belongs in a registry keyed by the network that
+owns it, and teardown removes only its own entry.
+
+The fix shape for the `tracing` instance is non-obvious enough to record:
+keep **two** permanently-registered dispatchers alive (`tracing_core`'s
+`has_just_one` fast path triggers at `live <= 1`, so one is not enough),
+report `Interest::sometimes()` rather than `always()` so other subscribers'
+per-event filtering is preserved, and do **not** install as the global
+default — that slot belongs to `test_log`, and taking it silently stops
+`RUST_LOG=… cargo test` printing anything.
+
+## Deliberately breaking code to verify a test: mark it `MUTATION_APPLIED`
+
+A test or a source-scrape pin is not verified until you have watched it go RED
+under a deliberate break and GREEN again when the break is reverted. Inspection
+is not verification — see the vacuous-pin row in
+`.claude/rules/bug-prevention-patterns.md`. So mutating code is a normal,
+encouraged part of writing one. These rules are about not leaving the mutation
+behind.
+
+### One fixed token
+
+Mark every deliberately-broken line with the exact string `MUTATION_APPLIED` —
+not `MUTANT`, not `MUTATION:`, not a comment that merely reads "temporary".
+One token, so that `grep -rn MUTATION_APPLIED` is a complete answer.
+
+**The point is not tidiness, it is that the person who greps is usually not the
+person who mutated.** On 2026-09-04 four agents hit an account session limit
+simultaneously, mid-mutation. The cleanup grepped `MUTANT|MUTATION_APPLIED` and
+missed a stranded break in another PR, because that agent had written
+`MUTATION:`. Nothing shipped, but only because a human looked twice.
+
+That is the same failure shape as the bug being fixed in the PR that prompted
+this rule: a source scanner whose docstring said it skipped "comments" and which
+skipped one kind of them. **Searching for one variant of the thing you are
+looking for is not searching for the thing.** A convention with variants is a
+search with a blind spot; a fixed token is not.
+
+### The rules
+
+1. **Commit or stash BEFORE mutating.** Restoring is then `git checkout --`,
+   never retyping from memory. This matters more than the marker: a session can
+   die between the break and the restore, and it did.
+2. **Mark every broken line** with `MUTATION_APPLIED`.
+3. **Before committing, `grep -rn MUTATION_APPLIED` and confirm it is empty.**
+   Better, where you have a pre-mutation commit: confirm `git diff` against it
+   shows only the change you intend.
+4. **When cleaning up after someone else's dead session, do not rely on the
+   marker.** Grep for it, AND diff every dirty worktree against its HEAD. A
+   mutation applied by editing an existing line leaves no marker at all if its
+   author forgot one, and only the diff catches that.
+5. **Say which mutation in the commit message**, and say what went red. "Verified
+   by inspection" is not verification. Both directions are worth stating when the
+   fix is to a shared helper: that the bug turns the guard red, and that reverting
+   only the fix — with the bug still in place — turns it green again, is what
+   distinguishes a guard that works from one that happens to be passing.
+
 
 ## Reference Patterns
 

@@ -24,7 +24,11 @@
 
 mod quota;
 mod store;
-mod sweep;
+// `pub(crate)` for `sweep::create_owner_only`, which is the project's one correct way
+// to create a secret file (owner-only at creation, not chmod-ed afterwards). The
+// conformance focus salt needs it too, and a second implementation would be a second
+// chance to get the window wrong.
+pub(crate) mod sweep;
 mod user;
 
 // ── Public re-exports ─────────────────────────────────────────────────────────

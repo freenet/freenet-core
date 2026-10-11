@@ -49,7 +49,35 @@ use tracing_subscriber::{Layer, Registry};
 /// on the background prune loop spawned by `init_tracer` (issue #4699),
 /// so a long-uptime node under sustained runaway logging is bounded
 /// without needing a restart.
+///
+/// **This default is overridable at runtime via `FREENET_LOG_DIR_MAX_BYTES`**
+/// (issue #5021), because one compiled-in value has to serve both the
+/// gateway shape this default is sized for and a quiet background peer
+/// that may want to hand back disk, or widen the budget while chasing an
+/// intermittent fault, without rebuilding. See [`parse_log_dir_max_bytes`]
+/// for the fallback behaviour on a missing or unusable override, and
+/// [`MIN_LOG_DIR_MAX_BYTES`] for why an override cannot go arbitrarily low.
 const LOG_DIR_MAX_BYTES: u64 = 512 * 1024 * 1024; // 512 MiB
+
+/// The smallest `FREENET_LOG_DIR_MAX_BYTES` override [`parse_log_dir_max_bytes`]
+/// will honour; anything below this falls back to [`LOG_DIR_MAX_BYTES`].
+///
+/// Exists for the same reason the compiled-in default cannot go arbitrarily
+/// low (see its doc): the size pass never deletes a file an appender has
+/// open, so a budget the two current-hour files (main + error) can fill on
+/// their own leaves *only* those files, discarding exactly the onset of
+/// whatever incident prompted the investigation (issue #5019, item 3).
+///
+/// Sized well above every observed hourly rate rather than just above it:
+/// the busiest measured gateway ran at ~20.95 MB/hour pre-#5015 and ~10.8
+/// MB/hour after (see `default_budget_holds_a_day_of_a_busy_gateways_logs`
+/// below for the measurement), combined across both families. 64 MiB is
+/// roughly 3x the worse of those two rates, so even a node logging far
+/// above anything measured so far keeps more than an hour of history
+/// before this floor would start discarding the incident onset — while
+/// still letting an operator shrink the 512 MiB default meaningfully for
+/// a quiet peer that never approaches it.
+const MIN_LOG_DIR_MAX_BYTES: u64 = 64 * 1024 * 1024; // 64 MiB
 
 /// Absolute age after which a rotated log file is deleted regardless of
 /// how little disk it occupies.
@@ -167,6 +195,61 @@ struct LogFile {
     family: LogFamily,
 }
 
+/// `FREENET_LOG_DIR_MAX_BYTES`'s raw value, or `None` if unset.
+///
+/// Split from [`parse_log_dir_max_bytes`] for the same reason as
+/// [`error_log_directives`]: keeps the parsing logic a pure function of
+/// its input, so it can be unit-tested without mutating process-global
+/// environment state (see the "Cross-test interference" entry in
+/// `.claude/rules/testing.md` — env vars are exactly that kind of state).
+fn log_dir_max_bytes_env() -> Option<String> {
+    std::env::var("FREENET_LOG_DIR_MAX_BYTES").ok()
+}
+
+/// Resolve the log directory's byte budget from `FREENET_LOG_DIR_MAX_BYTES`'s
+/// raw value, falling back to [`LOG_DIR_MAX_BYTES`] whenever the override
+/// isn't a usable one (issue #5021).
+///
+/// Degrade-safe by construction, never panics and never refuses to prune:
+/// - absent or empty → default, silently (nothing was configured)
+/// - unparseable → default, with a warning (something was configured wrong)
+/// - below [`MIN_LOG_DIR_MAX_BYTES`] (including `0`) → default, with a
+///   warning — see that constant's doc for why a tiny budget is as
+///   destructive as refusing to boot: a value of `0` would mean "delete
+///   everything the size pass may delete", and small-but-nonzero values are
+///   barely better.
+///
+/// A misconfigured value must never stop the node from starting or from
+/// pruning at all — a node that refuses to boot over a typo'd env var is
+/// worse than one that ignores it, which is why this warns and falls back
+/// rather than propagating an error.
+fn parse_log_dir_max_bytes(raw: Option<&str>) -> u64 {
+    match raw {
+        None => LOG_DIR_MAX_BYTES,
+        Some("") => LOG_DIR_MAX_BYTES,
+        Some(raw) => match raw.parse::<u64>() {
+            Ok(bytes) if bytes >= MIN_LOG_DIR_MAX_BYTES => bytes,
+            Ok(bytes) => {
+                eprintln!(
+                    "Warning: FREENET_LOG_DIR_MAX_BYTES={bytes} is below the minimum of \
+                     {MIN_LOG_DIR_MAX_BYTES} bytes; using the default of {LOG_DIR_MAX_BYTES} \
+                     bytes instead. A budget this small can be filled entirely by the current \
+                     hour's open log files, which are never pruned, discarding exactly the \
+                     incident history logging exists to keep."
+                );
+                LOG_DIR_MAX_BYTES
+            }
+            Err(_) => {
+                eprintln!(
+                    "Warning: FREENET_LOG_DIR_MAX_BYTES={raw:?} is not a valid byte count; \
+                     using the default of {LOG_DIR_MAX_BYTES} bytes instead."
+                );
+                LOG_DIR_MAX_BYTES
+            }
+        },
+    }
+}
+
 /// Prune the log directory. The single pruning authority for the two
 /// rolling appenders (see the `max_log_files` note in `init_tracer`).
 ///
@@ -177,6 +260,7 @@ fn cleanup_old_logs(log_dir: &std::path::Path) {
 
     let retention = Duration::from_secs(LOG_RETENTION_HOURS * 3600);
     let cutoff = SystemTime::now() - retention;
+    let max_bytes = parse_log_dir_max_bytes(log_dir_max_bytes_env().as_deref());
 
     let Ok(entries) = std::fs::read_dir(log_dir) else {
         return;
@@ -208,7 +292,7 @@ fn cleanup_old_logs(log_dir: &std::path::Path) {
         });
     }
 
-    prune_log_files(files, cutoff, LOG_DIR_MAX_BYTES);
+    prune_log_files(files, cutoff, max_bytes);
 }
 
 /// The indices, in a `files` sorted ascending by `(modified, path)`, of
@@ -399,6 +483,35 @@ async fn periodic_log_prune(log_dir: PathBuf) {
     }
 }
 
+/// Environment variable that forces the console log layer on even when stdout
+/// is not a terminal.
+///
+/// Named and read like the neighbouring `FREENET_LOG_TO_STDERR`: presence is
+/// what counts, so any value (including `0`) enables it.
+pub(crate) const LOG_TO_CONSOLE_ENV_VAR: &str = "FREENET_LOG_TO_CONSOLE";
+
+/// Whether to attach the console layer, given whether stdout is a terminal and
+/// whether [`LOG_TO_CONSOLE_ENV_VAR`] is set.
+///
+/// The `is_terminal` probe alone is a proxy for "a human is watching", and it
+/// gets containers exactly backwards. A container's stdout is a pipe, so the
+/// probe reports "not interactive" for the one deployment where stdout is the
+/// ONLY log interface the operator has: `docker logs` shows nothing but the
+/// entrypoint banner, and the node looks wedged when it is running fine.
+///
+/// The obvious workaround, `FREENET_LOG_TO_STDERR`, is wrong here because it
+/// turns file logging OFF (see `use_file_logging`), and the log files are what
+/// `freenet service report` collects. That would make containerized nodes
+/// unsupportable in exchange for being readable. This flag is additive instead:
+/// console AND files.
+///
+/// Split out as a pure function for the same reason as [`error_log_directives`]
+/// — it can be tested without mutating process-global environment state, which
+/// would race across the test binary's threads.
+fn console_logging_enabled(stdout_is_terminal: bool, env_var_set: bool) -> bool {
+    stdout_is_terminal || env_var_set
+}
+
 /// The `RUST_LOG` directive string exactly as `EnvFilter` itself would
 /// read it: the variable's value, or the empty string when unset.
 ///
@@ -534,9 +647,15 @@ pub fn init_tracer(
 
     let filter_layer = build_filter(default_filter);
 
-    // Also output to console when running interactively (stdout is a terminal)
-    // This restores the expected console output while keeping file logging for diagnostic reports
-    let also_log_to_console = std::io::stdout().is_terminal();
+    // Also output to console when running interactively (stdout is a terminal),
+    // or when FREENET_LOG_TO_CONSOLE forces it for a container, where stdout is
+    // a pipe but is still the operator's only view of the logs. Either way file
+    // logging is unaffected, so diagnostic reports keep working. See
+    // `console_logging_enabled`.
+    let also_log_to_console = console_logging_enabled(
+        std::io::stdout().is_terminal(),
+        std::env::var(LOG_TO_CONSOLE_ENV_VAR).is_ok(),
+    );
 
     // Get rate limit from environment or use default (1000 events/sec)
     let rate_limit: u64 = std::env::var("FREENET_LOG_RATE_LIMIT")
@@ -744,6 +863,89 @@ pub fn init_tracer(
     )
 }
 
+/// Install a stderr-only subscriber for a short-lived CLI subcommand.
+///
+/// ## Why this exists (#5244)
+///
+/// `freenet update` ran with **no subscriber at all**: `set_logger` is called
+/// only on the node path (`run_node`), so every `tracing::warn!` / `error!` in
+/// the installer was a no-op. Combined with the supervisor invoking it as
+/// `freenet update --quiet`, sites whose only output was a `warn!` plus a
+/// `!quiet`-gated `eprintln!` were completely silent in production — including
+/// "installed the update but could not arm crash-loop rollback".
+///
+/// ## Why not just call [`set_logger`] here
+///
+/// Two traps, both of which produce a fix that looks done and changes nothing:
+///
+/// 1. Passing a `log_dir` (the natural copy-paste from `run_node`) sets
+///    `use_file_logging`, which routes everything into the rolling log files.
+///    systemd captures stdout/stderr, NOT those files — that asymmetry is the
+///    whole of #5232. Every `warn!` would start "working" and the journal would
+///    stay exactly as blind.
+/// 2. With no log dir, [`init_tracer`] still falls through to stdout unless the
+///    `FREENET_LOG_TO_STDERR` env var happens to be set.
+///
+/// So this is explicit rather than configuration-dependent: **stderr, always**.
+/// Diagnostics belong there, it leaves the command's human-facing `println!`
+/// output on stdout, and systemd records both.
+///
+/// Deliberately minimal: no file appenders, no rate limiters. This is a
+/// process that runs for seconds and exits, and the output it must not lose is
+/// the handful of lines saying a safety mechanism did not engage.
+///
+/// `FREENET_DISABLE_LOGS` is still honoured, and `RUST_LOG` still overrides
+/// `level` via `from_env_lossy`.
+pub fn init_cli_stderr_tracer(level: LevelFilter) -> anyhow::Result<()> {
+    if std::env::var("FREENET_DISABLE_LOGS").is_ok() {
+        return Ok(());
+    }
+    let use_json = std::env::var("FREENET_LOG_FORMAT")
+        .map(|v| v.eq_ignore_ascii_case("json"))
+        .unwrap_or(false);
+    let filter_layer = tracing_subscriber::EnvFilter::builder()
+        .with_default_directive(level.into())
+        .from_env_lossy()
+        .add_directive("moka=off".parse().expect("infallible"))
+        .add_directive("sqlx=error".parse().expect("infallible"));
+
+    // ANSI only for a human at a terminal. journald stores what it is given
+    // byte for byte, so colouring unconditionally would write escape sequences
+    // into the journal — which is the destination this whole function exists to
+    // reach. The file layers in `init_tracer` set `.with_ansi(false)` for the
+    // same reason.
+    let ansi = std::io::stderr().is_terminal();
+
+    use tracing_subscriber::layer::SubscriberExt;
+    let registry = Registry::default().with(filter_layer);
+    // `compact` rather than the `pretty` multi-line format `init_stdout_tracer`
+    // uses: one journal entry per event is far easier to read (and to grep)
+    // than an event split across several.
+    let result = if use_json {
+        tracing::subscriber::set_global_default(
+            registry.with(
+                tracing_subscriber::fmt::layer()
+                    .json()
+                    .with_ansi(false)
+                    .with_writer(std::io::stderr),
+            ),
+        )
+    } else {
+        tracing::subscriber::set_global_default(
+            registry.with(
+                tracing_subscriber::fmt::layer()
+                    .compact()
+                    .with_ansi(ansi)
+                    .with_writer(std::io::stderr),
+            ),
+        )
+    };
+    // Returned, not `expect`ed. `init_stdout_tracer` panics here, which for a
+    // CLI would turn "a subscriber was already installed" into a failed update
+    // — trading a diagnostics problem for an outage.
+    result.map_err(|e| anyhow::anyhow!("could not install the CLI subscriber: {e}"))
+}
+
 fn init_stdout_tracer(
     _default_filter: LevelFilter,
     to_stderr: bool,
@@ -816,6 +1018,64 @@ fn init_stdout_tracer(
         tracing::subscriber::set_global_default(subscriber).expect("Error setting subscriber");
     }
     Ok(())
+}
+
+/// Coverage for the console-layer decision, which is what makes a
+/// containerized node's logs visible to `docker logs` at all.
+#[cfg(test)]
+mod console_logging_tests {
+    use super::{LOG_TO_CONSOLE_ENV_VAR, console_logging_enabled};
+
+    #[test]
+    fn interactive_stdout_still_logs_to_console() {
+        assert!(
+            console_logging_enabled(true, false),
+            "a terminal must keep its console output with no env var set"
+        );
+    }
+
+    /// The container case, and the reason this flag exists. Without it a
+    /// containerized node writes nothing to `docker logs` beyond its
+    /// entrypoint banner and looks wedged while running perfectly.
+    #[test]
+    fn piped_stdout_logs_to_console_when_forced() {
+        assert!(
+            console_logging_enabled(false, true),
+            "FREENET_LOG_TO_CONSOLE must enable console output when stdout is a pipe"
+        );
+    }
+
+    #[test]
+    fn a_terminal_with_the_flag_set_also_logs_to_console() {
+        assert!(
+            console_logging_enabled(true, true),
+            "setting the flag on an interactive terminal must not turn console output off"
+        );
+    }
+
+    /// The default must not change: a piped stdout with no opt-in stays quiet,
+    /// so nothing starts double-logging into a pipeline that did not ask for it.
+    #[test]
+    fn piped_stdout_stays_quiet_by_default() {
+        assert!(
+            !console_logging_enabled(false, false),
+            "a pipe with no opt-in must not gain console output"
+        );
+    }
+
+    /// Pinned so the container image and the code cannot drift apart: the
+    /// Dockerfile sets this exact name.
+    #[test]
+    fn env_var_name_is_the_one_the_container_image_sets() {
+        assert_eq!(LOG_TO_CONSOLE_ENV_VAR, "FREENET_LOG_TO_CONSOLE");
+
+        let dockerfile = include_str!("../../../../docker/freenet-node/Dockerfile");
+        assert!(
+            dockerfile.contains(LOG_TO_CONSOLE_ENV_VAR),
+            "docker/freenet-node/Dockerfile must set {LOG_TO_CONSOLE_ENV_VAR}, or a \
+             containerized node logs nothing to `docker logs`"
+        );
+    }
 }
 
 /// Regression coverage for issue #5015: `freenet.error.*` was a
@@ -1158,14 +1418,89 @@ mod error_filter_tests {
             "the WARN floor must live in build_error_filter and nowhere else"
         );
 
-        // `build_filter` (main + console) is the only remaining
-        // `from_env_lossy` caller. A second one means an error layer
-        // regressed to the unfloored inline shape this fix removed.
+        // `from_env_lossy` belongs to CONSOLE filters only, because RUST_LOG is
+        // the operator's console knob. An error layer using it would inherit
+        // RUST_LOG's level and lose the WARN floor again (#5015).
+        //
+        // There are exactly two console filters: `build_filter` (the node's
+        // main + console layers) and `init_cli_stderr_tracer` (the CLI's own
+        // stderr layer, added for #5244 so `freenet update` is not mute).
+        //
+        // Counting is not enough on its own — two callers could be the wrong
+        // two — so each is pinned to its own function body below, and the total
+        // is then pinned so a THIRD caller anywhere fails here rather than
+        // sliding in unnoticed.
+        // Brace-matched, NOT "until the next `fn`". The file's own `fn_body`
+        // helper refuses indented definitions on purpose, and `build_filter`
+        // is a nested fn inside `init_tracer`, so it cannot be reused here.
+        // An unbounded slice is the failure AGENTS.md calls out: ending at the
+        // next `fn` would swallow the remaining ~250 lines of `init_tracer`,
+        // making the assertion "somewhere in that range there is one call",
+        // which passes vacuously once an unrelated edit lands in the range.
+        let body_of = |sig: &str| -> String {
+            let at = source
+                .find(sig)
+                .unwrap_or_else(|| panic!("definition not found: {sig}"));
+            assert!(
+                at < cut,
+                "`{sig}` matched inside the test module — this pin would be \
+                 scraping its own source and would pass vacuously"
+            );
+            let after = &source[at + sig.len()..];
+            let open = after
+                .find('{')
+                .unwrap_or_else(|| panic!("no opening brace after: {sig}"));
+            let mut depth = 0usize;
+            let mut end = None;
+            for (i, c) in after[open..].char_indices() {
+                match c {
+                    '{' => depth += 1,
+                    '}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            end = Some(open + i);
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let end = end.unwrap_or_else(|| panic!("unbalanced braces in: {sig}"));
+            let body = &after[open..=end];
+            // Over-swallow detectors: a correctly bounded body cannot contain
+            // the test-module attribute or a following top-level definition.
+            assert!(
+                !body.contains("\n#[cfg(test)]\nmod "),
+                "`{sig}` body ran past the function into the test module"
+            );
+            assert!(
+                !body.contains("\npub fn "),
+                "`{sig}` body swallowed a following `pub fn` — the brace match \
+                 is wrong and this pin would measure more than one function"
+            );
+            body.to_string()
+        };
+
+        assert_eq!(
+            body_of("fn build_filter(")
+                .matches(".from_env_lossy()")
+                .count(),
+            1,
+            "build_filter is the node's console filter and must read RUST_LOG"
+        );
+        assert_eq!(
+            body_of("pub fn init_cli_stderr_tracer(")
+                .matches(".from_env_lossy()")
+                .count(),
+            1,
+            "init_cli_stderr_tracer is the CLI's console filter and must read RUST_LOG \
+             (#5244)"
+        );
         assert_eq!(
             count(".from_env_lossy()"),
-            1,
-            "only the main/console filter may use from_env_lossy(); an error layer \
-             using it would inherit RUST_LOG's level again (#5015)"
+            2,
+            "only the two console filters may use from_env_lossy(); a third caller is \
+             an error layer inheriting RUST_LOG's level again (#5015)"
         );
     }
 }
@@ -1173,8 +1508,9 @@ mod error_filter_tests {
 #[cfg(test)]
 mod cleanup_tests {
     use super::{
-        LOG_DIR_MAX_BYTES, LogFamily, LogFile, cleanup_old_logs, live_file_indices,
-        periodic_log_prune, prune_log_files, rotating_log_family,
+        LOG_DIR_MAX_BYTES, LogFamily, LogFile, MIN_LOG_DIR_MAX_BYTES, cleanup_old_logs,
+        live_file_indices, parse_log_dir_max_bytes, periodic_log_prune, prune_log_files,
+        rotating_log_family,
     };
     use std::fs;
     use std::time::{Duration, SystemTime};
@@ -1408,6 +1744,167 @@ mod cleanup_tests {
              {hours_retained}h at the measured gateway rate of \
              {GATEWAY_BYTES_PER_HOUR} B/h; an overnight incident must still \
              be on disk in the morning"
+        );
+    }
+
+    /// No override configured → the compiled-in default, unchanged.
+    #[test]
+    fn log_dir_max_bytes_default_when_env_absent() {
+        assert_eq!(parse_log_dir_max_bytes(None), LOG_DIR_MAX_BYTES);
+    }
+
+    /// An explicitly-empty value is treated the same as absent, not as
+    /// garbage — some deploy tooling sets `VAR=` to mean "unset" rather
+    /// than omitting the variable.
+    #[test]
+    fn log_dir_max_bytes_default_when_env_empty() {
+        assert_eq!(parse_log_dir_max_bytes(Some("")), LOG_DIR_MAX_BYTES);
+    }
+
+    /// A valid override at or above the floor is honoured exactly,
+    /// whether it narrows the default (small background peer) or widens
+    /// it (chasing an intermittent fault on a busy node).
+    #[test]
+    fn log_dir_max_bytes_honours_a_valid_override() {
+        assert_eq!(
+            parse_log_dir_max_bytes(Some(&MIN_LOG_DIR_MAX_BYTES.to_string())),
+            MIN_LOG_DIR_MAX_BYTES,
+            "the floor itself must be accepted, not rejected as \"below\" it"
+        );
+        assert_eq!(
+            parse_log_dir_max_bytes(Some("1073741824")), // 1 GiB, above the default
+            1_073_741_824,
+        );
+    }
+
+    /// Unparseable garbage falls back to the default rather than
+    /// panicking or propagating an error — a typo in the env var must
+    /// not stop the node from booting or from pruning.
+    #[test]
+    fn log_dir_max_bytes_default_when_env_garbage() {
+        for garbage in ["not-a-number", "512MiB", "-1", "1.5", "0x200"] {
+            assert_eq!(
+                parse_log_dir_max_bytes(Some(garbage)),
+                LOG_DIR_MAX_BYTES,
+                "garbage value {garbage:?} must fall back to the default"
+            );
+        }
+    }
+
+    /// `0` is the sharpest form of the footgun `MIN_LOG_DIR_MAX_BYTES`
+    /// guards against — it would mean "delete everything the size pass
+    /// may delete" — and must fall back to the default, not be honoured
+    /// literally.
+    #[test]
+    fn log_dir_max_bytes_default_when_env_zero() {
+        assert_eq!(parse_log_dir_max_bytes(Some("0")), LOG_DIR_MAX_BYTES);
+    }
+
+    /// A small-but-nonzero value below the floor is just as destructive
+    /// as zero (issue #5019 item 3: the current-hour files alone can fill
+    /// it) and must also fall back to the default.
+    #[test]
+    fn log_dir_max_bytes_default_when_env_below_floor() {
+        assert_eq!(
+            parse_log_dir_max_bytes(Some(&(MIN_LOG_DIR_MAX_BYTES - 1).to_string())),
+            LOG_DIR_MAX_BYTES
+        );
+        assert_eq!(parse_log_dir_max_bytes(Some("1")), LOG_DIR_MAX_BYTES);
+    }
+
+    /// Bound `include_str!`-scraped source to one free function's body, so a
+    /// source-scrape pin can never silently widen to the whole file or match
+    /// itself. Copied from `bin/commands/auto_update.rs::fn_body` (see its
+    /// doc for the incident history motivating each check below) rather than
+    /// shared, since this file has no existing dependency on that module.
+    fn fn_body<'a>(src: &'a str, signature: &str) -> &'a str {
+        let at = src
+            .find(signature)
+            .unwrap_or_else(|| panic!("definition not found: {signature}"));
+        // Only valid for FREE functions at column 0 — a method's closing
+        // brace is indented, so the first `\n}\n` after it belongs to the
+        // enclosing `impl`, silently returning every sibling method too.
+        let tests_at = src
+            .find("\n#[cfg(test)]\nmod ")
+            .map(|i| i + 1)
+            .expect("test module not located — this guard cannot verify anything");
+        assert!(
+            at < tests_at,
+            "`{signature}` matched inside the test module — this pin is \
+             scraping its own source and would pass vacuously"
+        );
+        assert!(
+            at == 0 || src.as_bytes()[at - 1] == b'\n',
+            "fn_body only supports column-0 free functions; `{signature}` is \
+             indented (a method?), where the `\\n}}\\n` end-anchor would slice to \
+             the end of the enclosing impl instead"
+        );
+        let after = &src[at + signature.len()..];
+        let (body, _) = after
+            .split_once("\n}\n")
+            .unwrap_or_else(|| panic!("could not locate end of: {signature}"));
+        // Vacuity detector: a correctly-bounded function body can never
+        // contain the test-module attribute. If it does, the `\n}\n` search
+        // ran past the function and this pin is measuring the whole file.
+        assert!(
+            !body.contains("\n#[cfg(test)]\nmod "),
+            "scoped region for `{signature}` escaped into the test module — this \
+             pin would pass vacuously"
+        );
+        body
+    }
+
+    /// Pin that `cleanup_old_logs` actually wires the parsed
+    /// `FREENET_LOG_DIR_MAX_BYTES` override into `prune_log_files`, rather
+    /// than computing it and discarding it in favor of the hardcoded
+    /// `LOG_DIR_MAX_BYTES` constant.
+    ///
+    /// None of the `log_dir_max_bytes_*` tests above can catch this class of
+    /// regression: they call `parse_log_dir_max_bytes` directly and stay
+    /// green even if nothing in production ever calls it — a well-tested
+    /// function wired to nothing, the same shape
+    /// `init_tracer_wires_every_error_layer_through_build_error_filter`
+    /// (`error_filter_tests`, this file) already guards against for the
+    /// error-filter wiring. Verified against a live mutation of the call
+    /// site (`let max_bytes = LOG_DIR_MAX_BYTES;`), which this pin catches
+    /// and the runtime tests above do not — see the PR description for
+    /// issue #5021.
+    ///
+    /// Source-scrape rather than a runtime assertion because reaching this
+    /// call site behaviourally would mean mutating
+    /// `FREENET_LOG_DIR_MAX_BYTES` in the process environment from a test,
+    /// exactly the cross-test interference `.claude/rules/testing.md` and
+    /// `parse_log_dir_max_bytes`'s own doc warn against.
+    #[test]
+    fn cleanup_old_logs_wires_the_parsed_budget_into_prune_log_files() {
+        let body = fn_body(
+            include_str!("tracer.rs"),
+            "fn cleanup_old_logs(log_dir: &std::path::Path) {",
+        );
+
+        // Anchor on the call itself — the API surface that must be
+        // reached — not on the local variable it's assigned to, which a
+        // harmless rename should not be able to break this pin.
+        let calls = body
+            .matches("parse_log_dir_max_bytes(log_dir_max_bytes_env().as_deref())")
+            .count();
+        assert_eq!(
+            calls, 1,
+            "cleanup_old_logs must call parse_log_dir_max_bytes(log_dir_max_bytes_env()...) \
+             exactly once to resolve the byte budget; if the call was renamed or removed, \
+             update this pin deliberately"
+        );
+
+        // And the parsed value — not a hardcoded default sitting next to
+        // it — must be what reaches prune_log_files. LOG_DIR_MAX_BYTES is
+        // a stable named constant (itself pinned elsewhere in this file),
+        // not a local variable subject to casual renaming, so anchoring
+        // the negative check on it doesn't share that fragility.
+        assert!(
+            !body.contains("prune_log_files(files, cutoff, LOG_DIR_MAX_BYTES)"),
+            "prune_log_files must never be called with the hardcoded LOG_DIR_MAX_BYTES \
+             constant directly — that would silently disconnect \
+             FREENET_LOG_DIR_MAX_BYTES from the pruner"
         );
     }
 

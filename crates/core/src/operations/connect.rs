@@ -10,9 +10,11 @@
 //!   but can be any known peer)
 //! - **Acceptor**: A peer that agrees to connect with the joiner
 //!
-//! ## Critical Behavior: Accept Only at Terminus
+//! ## Critical Behavior: Accept at (or Near) the Terminus
 //!
-//! **Relays only ACCEPT when they can't forward to a closer peer** (terminus). This means:
+//! **Relays ACCEPT when they can't forward to a closer peer** (terminus). Relays within
+//! `NEAR_TERMINUS_DISTANCE` of the target may also accept probabilistically while still
+//! forwarding (near-terminus acceptance). For a single request:
 //!
 //! ```text
 //! Joiner sends ConnectRequest targeting location 0.3
@@ -30,9 +32,11 @@
 //! Relay C (loc=0.31) ──> ACCEPTS (at terminus - no closer peer to forward to)
 //! ```
 //!
-//! The joiner typically receives ONE ConnectResponse from the terminus peer. To get multiple
-//! connections, the joiner sends multiple ConnectRequests (potentially targeting different
-//! locations). This ensures connections are naturally local (short ring distance).
+//! The joiner typically receives one ConnectResponse from the terminus, plus one more for
+//! each near-terminus relay that also accepted. To get multiple connections, the joiner sends multiple ConnectRequests
+//! targeting different locations. Terminus acceptance makes the acceptor land near the
+//! joiner's `desired_location`; the choice of `desired_location` (see "Why Target Location
+//! Matters") is what shapes the distance distribution of the joiner's connections.
 //!
 //! ## Message Flow
 //!
@@ -49,27 +53,28 @@
 //! 3. First relay fills in `joiner.peer_addr` and sends `ObservedAddress` back to joiner
 //! 4. Subsequent relays see the already-filled address
 //!
-//! ## Acceptance Criteria: Accept Only at Terminus
+//! ## Acceptance Criteria
 //!
-//! Relays only accept connect requests when they're at the routing terminus - meaning they
-//! can't forward to a peer closer to the target location. This naturally creates local
-//! connections without arbitrary distance thresholds.
+//! Relays accept connect requests at the routing terminus - meaning they can't forward to a
+//! peer closer to the target location - so the acceptor is near `desired_location` rather
+//! than whichever relay the request happened to pass through. If the terminus declines
+//! (e.g. the joiner is already connected or pending there, or it is at capacity), the
+//! request routes uphill, bounded by `uphill_budget`, and a peer farther from the target
+//! may accept instead.
 //!
-//! **Algorithm:**
+//! **Algorithm** (`RelayState::step`):
 //! 1. First, check if we can forward to a closer peer via `select_next_hop()`
-//! 2. If we CAN forward: forward only (don't accept)
-//! 3. If we CAN'T forward (terminus): accept if `should_accept()` allows
+//! 2. If we CAN forward: forward. If we are within `NEAR_TERMINUS_DISTANCE` of the target,
+//!    also accept with a probability that grows as we get closer, if `should_accept()` allows
+//! 3. If we CAN'T forward (terminus): accept if `should_accept()` allows, otherwise route
+//!    uphill. A relay that has already forwarded never also accepts at terminus.
 //!
-//! `should_accept()` still uses capacity-based evaluation:
-//! - Below min_connections → **accept**
-//! - At max_connections → **reject**
-//! - Between min and max → use density-based evaluation
-//!
-//! **Why this works for small-world topology:**
-//! - Requests route toward the target location via greedy routing
-//! - Only peers that can't forward further (near the target) accept
-//! - Gateway and early relays forward without accepting
-//! - Result: connections are naturally local (short ring distance)
+//! `should_accept()` (`ConnectionManager::should_accept`) applies capacity limits and the
+//! Kleinberg gap score (see the `topology` module docs):
+//! - At max_connections → **reject** (except nearest-neighbor lattice edges)
+//! - Below min_connections → accept below 3 open connections, then probabilistically,
+//!   favoring candidates that fill gaps in log-distance coverage
+//! - Between min and max → feed the gap score through the `ConnectionEvaluator`
 //!
 //! ## Routing
 //!
@@ -80,13 +85,22 @@
 //!
 //! ## Why Target Location Matters
 //!
-//! If the joiner targets their own location, the request routes toward peers near them on the
-//! ring. With accept-only-at-terminus, only the peer closest to the target (who can't forward
-//! further) accepts. This naturally creates local connections.
+//! The small-world (Kleinberg 1/d) structure comes from WHICH locations a peer targets, not
+//! from terminus acceptance itself. Terminus acceptance only ensures each new connection
+//! lands near its target; target selection and acceptance scoring together aim for
+//! connections spread roughly uniformly in log-distance (the 1/d distribution).
 //!
-//! To build multiple connections, the joiner sends multiple ConnectRequests. Early in bootstrap
-//! (0-4 connections), peers target their own location to build local neighborhoods. Later,
-//! density-based targeting is used to optimize for request patterns.
+//! In `join_ring_request` (used for gateway joins, cached-peer reconnects and the startup
+//! loop):
+//! - Fewer than `GAP_TARGET_THRESHOLD` (3) connections: target the peer's own location, with
+//!   jitter after consecutive failures (and an occasional widened step once jitter saturates)
+//! - `GAP_TARGET_THRESHOLD` or more: target the midpoint of the largest gap in the peer's
+//!   connection distances in log-distance space (`small_world_rand::gap_target`), falling
+//!   back to jitter if there are fewer than 3 distinct neighbor locations
+//!
+//! Ring maintenance (`TopologyManager::adjust_topology`, executed by `Ring::acquire_new`)
+//! chooses its own targets: own location and evenly spaced ring locations during bootstrap,
+//! then directional gap targets (see the `topology` module docs).
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -106,6 +120,7 @@ use crate::config::{GlobalExecutor, GlobalRng};
 use crate::dev_tool::Location;
 use crate::message::{InnerMessage, NodeEvent, Transaction};
 use crate::node::OpManager;
+use crate::node::network_status::StartupRoundOutcome;
 use crate::operations::OpError;
 use crate::ring::{KnownPeerKeyLocation, PeerAddr, PeerKeyLocation};
 use crate::router::{EstimatorType, IsotonicEstimator, IsotonicEvent};
@@ -396,6 +411,66 @@ pub(crate) struct AcceptOutcome {
     pub joiner: PeerKeyLocation,
 }
 
+/// Why a relay at terminus could not accept and rejected the request.
+///
+/// Three diagnostically different conditions that must stay distinguishable
+/// downstream: [`NoUphillPeers`](Self::NoUphillPeers) is a
+/// topology/connectivity condition (nothing unvisited left to route to),
+/// [`UphillBudgetExhausted`](Self::UphillBudgetExhausted) is the
+/// amplification bound working as designed, and
+/// [`TtlExhausted`](Self::TtlExhausted) is the request running out of network
+/// reach. The latter two have different remedies, which is why they are
+/// separate variants rather than one.
+///
+/// Carried *inside* [`RelayActions::rejected`] rather than as a second field
+/// beside a bool, so that a call site cannot consume the fact of a rejection
+/// without also getting its cause. That is the same reasoning as
+/// [`AcceptOutcome`] (#3838): paired fields which are only meaningful
+/// together drift apart at different call sites, and the type system should
+/// forbid it rather than a comment asking callers to remember.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RejectReason {
+    /// At terminus, cannot accept, and `select_uphill_hop` found no
+    /// unvisited strictly-uphill candidate. A topology/connectivity
+    /// condition — there is nowhere left to route.
+    NoUphillPeers,
+    /// At terminus, cannot accept, and the uphill budget is spent. The
+    /// amplification bound working as designed; the knob is
+    /// `DEFAULT_UPHILL_BUDGET`.
+    UphillBudgetExhausted,
+    /// At terminus, cannot accept, and the TTL is spent. The request ran
+    /// out of network reach; the knob is `max_hops_to_live`.
+    TtlExhausted,
+}
+
+impl RejectReason {
+    /// Stable reason string for the `connect_rejected` telemetry event.
+    ///
+    /// This is the ONLY thing that distinguishes the causes in a release
+    /// build: the corresponding log lines are `debug!` (#5335) and
+    /// `release_max_level_info` compiles them out entirely, so a constant
+    /// reason string here would erase the distinction in production.
+    ///
+    /// Budget and TTL are SEPARATE variants deliberately. They are the two
+    /// halves of the `uphill_budget > 0 && ttl >= 2` gate below and have
+    /// different remedies, but the `debug!` line that used to carry `ttl`
+    /// and `uphill_budget` as structured fields no longer reaches
+    /// production — so merging them would leave an operator unable to tell
+    /// which knob to reach for.
+    ///
+    /// Keep these strings distinct, and keep each aligned with the log
+    /// message in the branch that produces it, so a log line and an event
+    /// describing the same rejection never disagree. That pairing is pinned
+    /// by `each_reject_branch_logs_the_message_matching_its_reason`.
+    pub(crate) fn as_event_reason(self) -> &'static str {
+        match self {
+            Self::NoUphillPeers => "no uphill peers available",
+            Self::UphillBudgetExhausted => "uphill budget exhausted",
+            Self::TtlExhausted => "TTL exhausted",
+        }
+    }
+}
+
 /// Result of processing a request at a relay.
 #[derive(Debug, Default)]
 pub(crate) struct RelayActions {
@@ -405,9 +480,22 @@ pub(crate) struct RelayActions {
     pub accept: Option<AcceptOutcome>,
     pub forward: Option<(PeerKeyLocation, ConnectRequest)>,
     pub observed_address: Option<(PeerKeyLocation, SocketAddr)>,
-    /// True when at terminus, cannot accept, and has no routing options.
-    /// Signals that an explicit Rejected message should be sent back.
-    pub rejected: bool,
+    /// `Some` when this call reached terminus, could not accept, and had no
+    /// routing option left — carrying *why*, so the cause travels with the
+    /// decision instead of in a parallel field. See [`RejectReason`].
+    ///
+    /// This states what `handle_request` PRODUCES, not what the drivers do
+    /// with it, and the two are deliberately not the same shape — do not
+    /// read `Some` as "an explicit Rejected is sent" or `None` as "one is
+    /// not". In `connect/op_ctx_task.rs`, the retry-on-`Rejected` path sends
+    /// `Rejected` upstream whenever neither a forward nor an accept came
+    /// back, `rejected` being `None` included; and the
+    /// retry-on-`ConnectFailed` path propagates `ConnectFailed` upstream
+    /// even when this is `Some`. Both predate this field carrying a payload.
+    /// In particular, do NOT "tidy" either site into an `if let Some(..)`
+    /// gate on this field — that would silently change which message the
+    /// upstream peer receives.
+    pub rejected: Option<RejectReason>,
 }
 
 #[derive(Debug, Clone)]
@@ -573,17 +661,18 @@ impl RelayState {
             }
         }
 
-        // ACCEPT ONLY AT TERMINUS: Relays only accept when they can't forward to a closer peer.
-        // This naturally creates local connections because only peers near the target accept.
+        // ACCEPT AT TERMINUS: Relays accept when they can't forward to a closer peer, so the
+        // acceptor is near the joiner's desired_location (if the terminus declines, the
+        // request routes uphill below).
         //
         // Algorithm:
         // 1. First, check if we can forward to a closer peer
-        // 2. If we can forward: forward only (don't accept)
+        // 2. If we can forward: forward, and if we're within NEAR_TERMINUS_DISTANCE of the
+        //    target, also accept probabilistically
         // 3. If we can't forward (terminus): accept if should_accept() allows
         //
-        // This prevents early relays (gateway, first hops) from accepting connections that
-        // would be non-local on the ring. Only peers that are actually close to the target
-        // (and thus can't forward further) will accept.
+        // This prevents early relays (gateway, first hops) from accepting connections far
+        // from the requested target, which would defeat the joiner's target selection.
 
         let can_forward = self.forwarded_to.is_none() && self.request.ttl > 0;
         let next_hop = if can_forward {
@@ -655,7 +744,7 @@ impl RelayState {
             }
         }
 
-        // Only accept at terminus (can't forward to a closer peer)
+        // Strict-terminus acceptance (can't forward to a closer peer)
         // IMPORTANT: Also check that we haven't already forwarded - once we forward,
         // we're committed to that path and should not also accept. This prevents
         // the "double-accept" bug where a retry call could trigger acceptance
@@ -743,24 +832,51 @@ impl RelayState {
                     self.request.uphill_budget = self.request.uphill_budget.saturating_sub(1);
                     actions.forward = Some((peer, fwd_req));
                 } else {
-                    tracing::info!(
+                    // debug!, not info!: reaching terminus with no unvisited
+                    // uphill candidate is a routine, expected outcome of ring
+                    // routing, not an anomaly — it fires 25-65 times/minute as
+                    // standing baseline on a moderately busy peer (#5335), and
+                    // the rejection is already carried as structured telemetry
+                    // by `NetEventLog::connect_rejected` at the caller plus the
+                    // aggregate `connect_rejects_emitted` snapshot counter.
+                    // Matches the sibling already-forwarded arm below.
+                    tracing::debug!(
                         target = %self.request.desired_location,
                         ttl = self.request.ttl,
                         uphill_budget = self.request.uphill_budget,
                         visited = ?self.request.visited,
                         "connect: at terminus, cannot accept, no uphill peers available — rejecting"
                     );
-                    actions.rejected = true;
+                    actions.rejected = Some(RejectReason::NoUphillPeers);
                 }
-            } else {
-                tracing::info!(
+            } else if self.request.uphill_budget == 0 {
+                // debug!, not info!: a spent uphill budget is the amplification
+                // bound doing its job, not a fault. Same #5335 rationale as the
+                // sibling arm above.
+                //
+                // Budget is checked FIRST, so when BOTH are spent this reports
+                // budget. Deliberate: budget is decremented once per uphill
+                // retry while TTL also falls on ordinary forwards, so the
+                // budget is the tighter bound on this path and the more
+                // actionable of the two.
+                tracing::debug!(
                     target = %self.request.desired_location,
                     ttl = self.request.ttl,
                     uphill_budget = self.request.uphill_budget,
                     visited = ?self.request.visited,
-                    "connect: at terminus, cannot accept, uphill budget or TTL exhausted — rejecting"
+                    "connect: at terminus, cannot accept, uphill budget exhausted — rejecting"
                 );
-                actions.rejected = true;
+                actions.rejected = Some(RejectReason::UphillBudgetExhausted);
+            } else {
+                // Reaching here means `ttl < 2` (the other half of the gate).
+                tracing::debug!(
+                    target = %self.request.desired_location,
+                    ttl = self.request.ttl,
+                    uphill_budget = self.request.uphill_budget,
+                    visited = ?self.request.visited,
+                    "connect: at terminus, cannot accept, TTL exhausted — rejecting"
+                );
+                actions.rejected = Some(RejectReason::TtlExhausted);
             }
         } else if is_terminus && self.forwarded_to.is_some() {
             tracing::debug!(
@@ -1585,6 +1701,7 @@ pub(crate) async fn join_ring_request(
         own,
         desired_location,
         overall_timeout,
+        op_ctx_task::ClientConnectKind::Standard,
     )
     .await
 }
@@ -1629,6 +1746,7 @@ pub(crate) async fn gateway_version_probe(
         own,
         desired_location,
         None,
+        op_ctx_task::ClientConnectKind::Standard,
     )
     .await
 }
@@ -1761,8 +1879,41 @@ pub(crate) async fn initial_join_procedure(
             }
         }
 
+        // Issue #4787 instrumentation (joiner-side): record how long it takes
+        // this process to first reach `bootstrap_threshold` connections, and
+        // classify every below-threshold round by what it actually did. The
+        // latency is measured from the process-start anchor inside
+        // `record_bootstrap_min_connections_reached`, NOT from here: a clock
+        // started at this point excludes the cached-peer fast-reconnect block
+        // above (up to CACHED_PEER_TIMEOUT) and all node startup before the
+        // spawn, so on a restart — the issue's own scenario — a successful
+        // cached reconnect would report ~0s for a bootstrap that took seconds.
+        let mut min_connections_reached = false;
+
         loop {
             let open_conns = op_manager.ring.open_connections();
+
+            if !min_connections_reached && open_conns >= bootstrap_threshold {
+                min_connections_reached = true;
+                crate::node::network_status::record_bootstrap_min_connections_reached();
+            }
+
+            // Has this round already been classified (#4787)? Each branch that
+            // decides what the round does records its own outcome BEFORE
+            // awaiting anything, so a CONNECT fan-out that hangs still leaves a
+            // counted round; whatever reaches the bottom unrecorded is a round
+            // that issued nothing AND had no more specific reason, which is a
+            // quiet "nothing to do" and NOT the stall the issue was filed
+            // about. The stall — gateway transports up, no real peers acquired
+            // — routes CONNECTs through the connected gateways and is counted
+            // as `ConnectIssuedRouted`.
+            let mut round_recorded = false;
+            let mut record_round = |outcome: StartupRoundOutcome| {
+                if !round_recorded && !min_connections_reached {
+                    crate::node::network_status::record_bootstrap_startup_round(outcome);
+                }
+                round_recorded = true;
+            };
 
             let unconnected_gateways: Vec<_> =
                 op_manager.ring.is_not_connected(gateways.iter()).collect();
@@ -1872,6 +2023,7 @@ pub(crate) async fn initial_join_procedure(
                             open_connections = open_conns,
                             "All gateways in backoff, waiting before retry"
                         );
+                        record_round(StartupRoundOutcome::BackoffBlocked);
                         tokio::select! {
                             _ = tokio::time::sleep(effective_wait) => {},
                             _ = op_manager.gateway_backoff_cleared.notified() => {
@@ -1882,6 +2034,29 @@ pub(crate) async fn initial_join_procedure(
                     }
                 }
 
+                // #4787: `eligible_count == 0` can still reach here when every
+                // gateway was filtered for backoff but none reported a
+                // remaining duration, in which case the CONNECT fan-out below
+                // is empty and no CONNECT is issued. Classify by what actually
+                // happens, not by which branch we are in.
+                //
+                // No live-loop test drives THIS `BackoffBlocked` specifically,
+                // and that is a property of the branch rather than an omission:
+                // `is_in_backoff` and `remaining_backoff` evaluate the same
+                // predicate (`Instant::now() < retry_after`, `util/backoff.rs`)
+                // from separate clock reads, so reaching here needs the clock to
+                // cross `retry_after` between two calls a few instructions
+                // apart. The reachable all-in-backoff dial round takes the
+                // `min_backoff` wait path above and IS pinned, by
+                // `startup_rounds_report_backoff_when_all_unconnected_gateways_are_backed_off`.
+                // The arm stays because the alternative — assuming
+                // `eligible_count == 0` here means CONNECTs were issued — would
+                // silently mislabel the round if that race ever widened.
+                record_round(if eligible_count > 0 {
+                    StartupRoundOutcome::ConnectIssuedGateway
+                } else {
+                    StartupRoundOutcome::BackoffBlocked
+                });
                 tracing::info!(
                     "Below bootstrap threshold ({} < {}), attempting to connect to {} gateways (skipped {} in backoff)",
                     open_conns,
@@ -1922,19 +2097,49 @@ pub(crate) async fn initial_join_procedure(
             } else if use_connected_as_routers {
                 // All gateways connected but still need many more peers.
                 // Route CONNECTs through connected gateways toward gap locations.
-                let eligible: Vec<_> = {
+                // #4787: count the gateways excluded specifically FOR backoff,
+                // separately from those excluded for having no resolved socket
+                // address, so the empty-`eligible` case below is classified by
+                // the actual reason.
+                //
+                // In THIS branch the no-address case is currently unreachable,
+                // and a reader should not waste time trying to construct it:
+                // `gateways` is non-empty (the join task returns early
+                // otherwise), and `is_not_connected` counts an address-less
+                // peer as UNCONNECTED (`ring.rs`), so any such gateway would
+                // have made `unconnected_count > 0` and taken the branch above
+                // instead. The count is kept anyway rather than assuming
+                // `eligible.is_empty()` means backoff: that identity holds only
+                // via an invariant enforced two modules away, and a counter
+                // that silently mislabels a round if it ever changes is the
+                // failure mode this whole PR is about.
+                let (eligible, blocked_by_backoff) = {
                     let backoff = op_manager.gateway_backoff.lock();
-                    gateways
+                    let mut blocked = 0usize;
+                    let eligible: Vec<_> = gateways
                         .iter()
-                        .filter(|gw| {
-                            gw.socket_addr()
-                                .map(|addr| !backoff.is_in_backoff(addr))
-                                .unwrap_or(false)
+                        .filter(|gw| match gw.socket_addr() {
+                            Some(addr) if backoff.is_in_backoff(addr) => {
+                                blocked += 1;
+                                false
+                            }
+                            Some(_) => true,
+                            None => false,
                         })
-                        .collect()
+                        .collect();
+                    (eligible, blocked)
                 };
 
                 if !eligible.is_empty() {
+                    // #4787: these are CONNECT rounds too, and they are THE
+                    // rounds a stalled joiner issues — its gateway transports
+                    // are up, so the branch above (which needs an UNCONNECTED
+                    // gateway) never runs. They are counted separately from the
+                    // dial-a-gateway case above precisely because this is the
+                    // series that moves during the stall the issue describes;
+                    // an operator told to watch `no_target` instead would watch
+                    // a flat zero for the whole outage.
+                    record_round(StartupRoundOutcome::ConnectIssuedRouted);
                     tracing::info!(
                         eligible = eligible.len(),
                         total_gateways = gateways.len(),
@@ -1973,6 +2178,22 @@ pub(crate) async fn initial_join_procedure(
                             }
                         })
                         .await;
+                } else if blocked_by_backoff > 0 {
+                    // #4787: nothing was issued because every gateway this
+                    // round could route through is in exponential backoff —
+                    // which is `BackoffBlocked`, not `NoTarget`. Without this
+                    // the round fell through to the default at the bottom of
+                    // the loop and was misreported. Reachable from the
+                    // fully-isolated path (`open_conns == 0` with every gateway
+                    // transport apparently up and every gateway backed off),
+                    // i.e. exactly when the classification matters most.
+                    record_round(StartupRoundOutcome::BackoffBlocked);
+                    tracing::info!(
+                        blocked_by_backoff,
+                        total_gateways = gateways.len(),
+                        open_connections = open_conns,
+                        "All connected gateways in backoff, cannot route CONNECTs this round"
+                    );
                 }
             } else if open_conns >= bootstrap_threshold {
                 tracing::trace!(
@@ -1981,6 +2202,21 @@ pub(crate) async fn initial_join_procedure(
                     bootstrap_threshold
                 );
             }
+
+            // Nothing was issued this round and no branch above claimed a more
+            // specific reason (#4787). Principally: every gateway is connected
+            // AND the node is within `gateways.len()` of the threshold, so
+            // `use_connected_as_routers` is false and the round deliberately
+            // waits for handshakes or pending reservations to resolve. This is
+            // NOT the stall signature — see `startup_rounds_connect_issued_routed`.
+            //
+            // `record_round` is gated on `!min_connections_reached` so these
+            // stay startup-only counters: a later transient dip below
+            // `bootstrap_threshold` is ordinary post-bootstrap churn, not
+            // bootstrap. `min_connections_reached` is set at the top of this
+            // iteration, so reaching here with it false means
+            // `open_conns < bootstrap_threshold`.
+            record_round(StartupRoundOutcome::NoTarget);
 
             // Add random jitter to prevent thundering herd after gateway restart.
             // Without jitter, all peers that lose their gateway connection retry
@@ -2021,6 +2257,469 @@ mod tests {
     use super::*;
     use crate::transport::TransportKeypair;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+    // --- #4787 joiner-side bootstrap instrumentation ---------------------
+    //
+    // These drive the REAL `initial_join_procedure` loop against a real
+    // `OpManager`, which is what the previous source-scrape pin could not do:
+    // a text assertion that a gate exists says nothing about whether the loop
+    // ever reaches it, and the two shapes below are exactly the cases where it
+    // did not.
+
+    /// Build a minimal but real `OpManager` for driving the join loop.
+    async fn bootstrap_test_op_manager(id: &str, own_addr: &str) -> Arc<OpManager> {
+        let config_args = crate::config::ConfigArgs {
+            id: Some(id.to_string()),
+            mode: Some(crate::contract::OperationMode::Local),
+            ..Default::default()
+        };
+        let node_config =
+            crate::node::NodeConfig::new(config_args.build().await.expect("build Config"))
+                .await
+                .expect("build NodeConfig");
+        let (_notification_rx, notification_tx) = crate::node::event_loop_notification_channel();
+        let (ops_ch_channel, _ch_channel, _wait_for_event) =
+            crate::contract::contract_handler_channel();
+        let connection_manager = crate::ring::ConnectionManager::new(&node_config);
+        let (result_router_tx, _result_router_rx) = tokio::sync::mpsc::channel(100);
+        let task_monitor = crate::node::background_task_monitor::BackgroundTaskMonitor::new();
+        let op_manager = Arc::new(
+            OpManager::new(
+                notification_tx,
+                ops_ch_channel,
+                &node_config,
+                crate::tracing::DynamicRegister::new(vec![]),
+                connection_manager,
+                result_router_tx,
+                &task_monitor,
+            )
+            .expect("build OpManager"),
+        );
+        op_manager.ring.attach_op_manager(&op_manager);
+        op_manager
+            .ring
+            .connection_manager
+            .set_own_addr_local_for_test(own_addr.parse().unwrap());
+        // The receivers above must outlive the loop under test, otherwise the
+        // CONNECT fan-out fails for the wrong reason. Leak them for the
+        // duration of the test process rather than threading them back out.
+        std::mem::forget((_notification_rx, _ch_channel, _result_router_rx));
+        op_manager
+    }
+
+    /// Run `body` with the process-global `NETWORK_STATUS` guard held.
+    ///
+    /// The guard is acquired and released in this SYNC frame and the async body
+    /// runs inside `block_on`, so the lock is never live across an `.await` in
+    /// an async fn — the shape `clippy::await_holding_lock` forbids — while
+    /// still serializing these tests against every other test that touches the
+    /// singleton.
+    fn with_network_status_lock<F>(body: F)
+    where
+        F: std::future::Future<Output = ()>,
+    {
+        let _lock = crate::node::network_status::TEST_GLOBAL_STATE_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        crate::node::network_status::init(0, HashSet::new(), "test".to_string());
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build test runtime")
+            .block_on(body);
+    }
+
+    fn bootstrap_gateway(port: u16) -> PeerKeyLocation {
+        let pub_key = TransportKeypair::new().public().clone();
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), port);
+        PeerKeyLocation::new(pub_key, addr)
+    }
+
+    /// Total below-threshold rounds recorded so far, by category.
+    #[derive(Debug, Clone, Copy)]
+    struct RoundTotals {
+        /// Dialled gateways this node was not yet connected to.
+        gateway: u64,
+        /// Routed CONNECTs through already-connected gateways — the #4787
+        /// stall signature.
+        routed: u64,
+        backoff: u64,
+        no_target: u64,
+    }
+
+    impl RoundTotals {
+        fn read() -> Self {
+            let b = crate::node::network_status::bootstrap_churn_counts()
+                .expect("network_status singleton initialized by the test");
+            Self {
+                gateway: b.startup_rounds_connect_issued_gateway,
+                routed: b.startup_rounds_connect_issued_routed,
+                backoff: b.startup_rounds_backoff_blocked,
+                no_target: b.startup_rounds_no_target,
+            }
+        }
+
+        fn total(&self) -> u64 {
+            self.gateway + self.routed + self.backoff + self.no_target
+        }
+    }
+
+    /// Poll until the join loop has classified at least one round, or give up.
+    async fn wait_for_startup_round(deadline: Duration) -> RoundTotals {
+        let start = std::time::Instant::now();
+        loop {
+            let totals = RoundTotals::read();
+            if totals.total() > 0 || start.elapsed() >= deadline {
+                return totals;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    /// The #4787 stall, reproduced: the joiner's gateway transports are UP (so
+    /// `is_not_connected` yields nothing) while the node sits far below
+    /// `min_connections`. The first version of this instrumentation put its
+    /// only increment inside `open_conns < threshold && unconnected_count > 0`,
+    /// so it recorded ZERO for the entire multi-minute stall it was added to
+    /// measure.
+    ///
+    /// This pins WHICH series moves, not merely that something does. With
+    /// `min_connections = 25` and 1-3 gateways the stall takes the
+    /// `use_connected_as_routers` branch, so the moving series is
+    /// `connect_issued_routed` — and NOT `no_target`, which four doc sites
+    /// previously named as "the #4787 stall signature". An operator following
+    /// that guidance would have watched a series that reads flat zero for the
+    /// whole outage, which is the same defect (a counter that reads healthy
+    /// during the failure it observes) this PR exists to fix.
+    #[test]
+    fn startup_rounds_counted_while_all_gateways_appear_connected() {
+        with_network_status_lock(async {
+            let op_manager =
+                bootstrap_test_op_manager("bootstrap-4787-stall", "127.0.0.1:14787").await;
+            let cm = &op_manager.ring.connection_manager;
+            let gateways = vec![bootstrap_gateway(24787), bootstrap_gateway(24788)];
+
+            // Make every gateway look connected — the stall's defining symptom.
+            for gw in &gateways {
+                let addr = gw.socket_addr().expect("gateway has an address");
+                assert!(
+                    cm.add_connection(
+                        Location::from_address(&addr),
+                        addr,
+                        gw.pub_key().clone(),
+                        false
+                    ),
+                    "test setup: gateway must be accepted into the ring"
+                );
+            }
+            assert_eq!(op_manager.ring.open_connections(), gateways.len());
+            assert!(
+                op_manager.ring.open_connections() < cm.min_connections,
+                "test setup: node must be below the bootstrap threshold"
+            );
+            assert_eq!(
+                op_manager.ring.is_not_connected(gateways.iter()).count(),
+                0,
+                "test setup: no gateway may look unconnected — that is the stall"
+            );
+
+            let handle = initial_join_procedure(op_manager.clone(), &gateways)
+                .await
+                .expect("spawn join procedure");
+            let t = wait_for_startup_round(Duration::from_secs(10)).await;
+            handle.abort();
+
+            assert!(
+                t.total() > 0,
+                "the join loop must count a below-threshold round during the stall; got {t:?}"
+            );
+            // With 25 - 2 > 2 the loop routes CONNECTs through the connected
+            // gateways (`use_connected_as_routers`), a path the first version of
+            // this instrumentation left uncounted entirely.
+            assert!(
+                t.routed > 0,
+                "the stall must move `connect_issued_routed` — the series the \
+             docs now name as its signature; got {t:?}"
+            );
+            // The discrimination that makes the split worth having: the stall
+            // must NOT show up in the ordinary dial-a-gateway series, and must
+            // NOT show up as `no_target`, which the docs used to name.
+            assert_eq!(
+                t.gateway, 0,
+                "no gateway is unconnected here, so the dial-a-gateway series \
+             must stay at zero; got {t:?}"
+            );
+            assert_eq!(
+                t.no_target, 0,
+                "`no_target` must stay flat through the stall — documenting it \
+             as the stall signature is precisely the bug this pins; got {t:?}"
+            );
+
+            // And the joiner must be visibly un-bootstrapped rather than absent.
+            let b = crate::node::network_status::bootstrap_churn_counts().expect("initialized");
+            assert_eq!(
+                b.time_to_min_connections, None,
+                "a node that never reached min_connections must report no latency, \
+             while still being present in the snapshot"
+            );
+        });
+    }
+
+    /// The ordinary case still counts: gateways unconnected and not in backoff
+    /// means a real CONNECT round is issued to them.
+    #[test]
+    fn startup_rounds_counted_when_gateways_are_unconnected() {
+        with_network_status_lock(async {
+            let op_manager =
+                bootstrap_test_op_manager("bootstrap-4787-unconnected", "127.0.0.1:14789").await;
+            let gateways = vec![bootstrap_gateway(24790), bootstrap_gateway(24791)];
+            assert_eq!(
+                op_manager.ring.is_not_connected(gateways.iter()).count(),
+                gateways.len(),
+                "test setup: both gateways must look unconnected"
+            );
+
+            let handle = initial_join_procedure(op_manager.clone(), &gateways)
+                .await
+                .expect("spawn join procedure");
+            let t = wait_for_startup_round(Duration::from_secs(10)).await;
+            handle.abort();
+
+            assert!(
+                t.gateway > 0,
+                "a round that dials unconnected gateways must count as \
+             connect_issued_gateway; got {t:?}"
+            );
+            // The other half of the split: ordinary bootstrap must not be
+            // mistaken for the stall signature.
+            assert_eq!(
+                t.routed, 0,
+                "dialling unconnected gateways is not a routed CONNECT round; got {t:?}"
+            );
+        });
+    }
+
+    /// Branch A's backoff case: gateways are UNCONNECTED (so the dial branch
+    /// is taken, not the routed one) and every one of them is in exponential
+    /// backoff, so the round issues nothing and waits. That is `BackoffBlocked`.
+    ///
+    /// The sibling classification in branch B is pinned by
+    /// `startup_rounds_report_backoff_when_routing_through_connected_gateways`;
+    /// this is the same outcome reached by the other path, which had no live
+    /// test.
+    #[test]
+    fn startup_rounds_report_backoff_when_all_unconnected_gateways_are_backed_off() {
+        with_network_status_lock(async {
+            let op_manager =
+                bootstrap_test_op_manager("bootstrap-4787-dial-backoff", "127.0.0.1:14798").await;
+            let gateways = vec![bootstrap_gateway(24799), bootstrap_gateway(24800)];
+
+            // Unconnected, unlike the routed-branch test: this is what selects
+            // `open_conns < threshold && unconnected_count > 0`.
+            assert_eq!(
+                op_manager.ring.is_not_connected(gateways.iter()).count(),
+                gateways.len(),
+                "test setup: both gateways must look unconnected"
+            );
+
+            {
+                let mut backoff = op_manager.gateway_backoff.lock();
+                for gw in &gateways {
+                    let addr = gw.socket_addr().expect("gateway has an address");
+                    backoff.record_failure(addr);
+                    assert!(
+                        backoff.is_in_backoff(addr),
+                        "test setup: gateway must actually be in backoff"
+                    );
+                    assert!(
+                        backoff.remaining_backoff(addr).is_some(),
+                        "test setup: backoff must report a remaining duration, or \
+                     the loop takes the race fallback instead of the wait path"
+                    );
+                }
+            }
+
+            let handle = initial_join_procedure(op_manager.clone(), &gateways)
+                .await
+                .expect("spawn join procedure");
+            let t = wait_for_startup_round(Duration::from_secs(10)).await;
+            handle.abort();
+
+            assert!(
+                t.backoff > 0,
+                "a dial round with every unconnected gateway in backoff must count \
+             as backoff_blocked; got {t:?}"
+            );
+            assert_eq!(
+                t.gateway, 0,
+                "nothing was dialled — every gateway was filtered for backoff; got {t:?}"
+            );
+            assert_eq!(
+                t.no_target, 0,
+                "the round had a target and a specific reason for skipping it; got {t:?}"
+            );
+        });
+    }
+
+    /// Finding 2: `use_connected_as_routers` with every gateway in backoff
+    /// issues nothing, and that is `BackoffBlocked` — not `NoTarget`. Before
+    /// the fix this branch had no `else`, so the round fell through to the
+    /// `NoTarget` default at the bottom of the loop and was misreported as
+    /// "gateways all connected, nothing to do" while the real reason was
+    /// exponential backoff.
+    ///
+    /// The same branch is reached from the fully-isolated path
+    /// (`open_conns == 0` with every gateway transport apparently up); the
+    /// setup here uses real ring connections because that is deterministic to
+    /// construct, and the classification under test is identical.
+    #[test]
+    fn startup_rounds_report_backoff_when_routing_through_connected_gateways() {
+        with_network_status_lock(async {
+            let op_manager =
+                bootstrap_test_op_manager("bootstrap-4787-routed-backoff", "127.0.0.1:14792").await;
+            let cm = &op_manager.ring.connection_manager;
+            let gateways = vec![bootstrap_gateway(24793), bootstrap_gateway(24794)];
+
+            for gw in &gateways {
+                let addr = gw.socket_addr().expect("gateway has an address");
+                assert!(
+                    cm.add_connection(
+                        Location::from_address(&addr),
+                        addr,
+                        gw.pub_key().clone(),
+                        false
+                    ),
+                    "test setup: gateway must be accepted into the ring"
+                );
+            }
+            assert_eq!(
+                op_manager.ring.is_not_connected(gateways.iter()).count(),
+                0,
+                "test setup: no gateway may look unconnected"
+            );
+            assert!(
+                op_manager.ring.open_connections() < cm.min_connections,
+                "test setup: node must be below the bootstrap threshold"
+            );
+
+            // Every gateway in backoff, so the routed-CONNECT branch has no
+            // eligible gateway to route through.
+            {
+                let mut backoff = op_manager.gateway_backoff.lock();
+                for gw in &gateways {
+                    let addr = gw.socket_addr().expect("gateway has an address");
+                    backoff.record_failure(addr);
+                    assert!(
+                        backoff.is_in_backoff(addr),
+                        "test setup: gateway must actually be in backoff"
+                    );
+                }
+            }
+
+            let handle = initial_join_procedure(op_manager.clone(), &gateways)
+                .await
+                .expect("spawn join procedure");
+            let t = wait_for_startup_round(Duration::from_secs(10)).await;
+            handle.abort();
+
+            assert!(
+                t.backoff > 0,
+                "a routed-CONNECT round blocked entirely by gateway backoff must \
+             count as backoff_blocked; got {t:?}"
+            );
+            assert_eq!(
+                t.no_target, 0,
+                "misclassifying a backoff-blocked round as `no_target` is the bug \
+             this pins; got {t:?}"
+            );
+            assert_eq!(
+                t.routed, 0,
+                "nothing was routed — no gateway was eligible; got {t:?}"
+            );
+        });
+    }
+
+    /// The one arm with no positive pin, and the one whose documented meaning
+    /// this change altered most: `NoTarget` is now specifically "all gateways
+    /// connected AND the node is within `gateways.len()` of the threshold", so
+    /// `use_connected_as_routers` is false and the round deliberately issues
+    /// nothing. Every other shape must land in one of the three siblings.
+    ///
+    /// Without this, `NoTarget` was only ever asserted to be ZERO (by the two
+    /// tests above), which a counter that can never fire would also satisfy.
+    #[test]
+    fn startup_rounds_report_no_target_when_close_to_threshold() {
+        with_network_status_lock(async {
+            let op_manager =
+                bootstrap_test_op_manager("bootstrap-4787-no-target", "127.0.0.1:14795").await;
+            let cm = &op_manager.ring.connection_manager;
+            let gateways = vec![bootstrap_gateway(24796), bootstrap_gateway(24797)];
+            let min_conns = cm.min_connections;
+            assert!(
+                min_conns > gateways.len() + 1,
+                "test setup: this shape needs room for non-gateway peers below \
+             the threshold; min_connections={min_conns}"
+            );
+
+            // Fill the ring to exactly `min_connections - 1`, gateways included,
+            // so the remaining gap is 1 — which is <= gateways.len(), the
+            // condition that makes `use_connected_as_routers` false.
+            let mut addrs: Vec<SocketAddr> = gateways
+                .iter()
+                .map(|gw| gw.socket_addr().expect("gateway has an address"))
+                .collect();
+            for port in 30000..(30000 + (min_conns - 1 - gateways.len()) as u16) {
+                addrs.push(SocketAddr::new(
+                    IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
+                    port,
+                ));
+            }
+            for addr in &addrs {
+                let pub_key = TransportKeypair::new().public().clone();
+                assert!(
+                    cm.add_connection(Location::from_address(addr), *addr, pub_key, false),
+                    "test setup: ring must accept {addr}"
+                );
+            }
+
+            let open = op_manager.ring.open_connections();
+            assert_eq!(
+                open,
+                min_conns - 1,
+                "test setup: node must sit exactly one connection below the threshold"
+            );
+            assert!(
+                min_conns - open <= gateways.len(),
+                "test setup: the gap must be within gateways.len(), or the loop \
+             routes CONNECTs instead of idling"
+            );
+            assert_eq!(
+                op_manager.ring.is_not_connected(gateways.iter()).count(),
+                0,
+                "test setup: no gateway may look unconnected"
+            );
+
+            let handle = initial_join_procedure(op_manager.clone(), &gateways)
+                .await
+                .expect("spawn join procedure");
+            let t = wait_for_startup_round(Duration::from_secs(10)).await;
+            handle.abort();
+
+            assert!(
+                t.no_target > 0,
+                "a below-threshold round that deliberately issues nothing must \
+             count as no_target; got {t:?}"
+            );
+            assert_eq!(
+                t.routed, 0,
+                "the gap is within gateways.len(), so nothing may be routed; got {t:?}"
+            );
+            assert_eq!(
+                t.gateway, 0,
+                "every gateway is connected, so nothing may be dialled; got {t:?}"
+            );
+        });
+    }
 
     #[test]
     fn resolve_probe_gateway_addr_returns_known_socket() {
@@ -2148,7 +2847,8 @@ mod tests {
     ///    heavily, making it plausibly the worst drift case in the tree.
     /// 2. **An unbounded, remote-peer-keyed map.** `peer_adjustments` only ever
     ///    INSERTS on the incremental path (`add_event`); the ONLY thing that
-    ///    prunes it to the current window is a refit (see `IsotonicEstimator::fit`).
+    ///    prunes it to the current window is a refit (see `IsotonicEstimator::refit`,
+    ///    which rebuilds it with `anchor_peer_adjustments`).
     ///    `raw_events` is capped at `MAX_REGRESSION_POINTS`, but with no refit the
     ///    map was not capped by anything: it grew one entry per distinct peer ever
     ///    seen in CONNECT forwarding, for the node's whole life — the exact hazard
@@ -2188,7 +2888,8 @@ mod tests {
     /// `IsotonicEstimator::add_event` only ever INSERTS into `peer_adjustments`;
     /// nothing evicts from it. `raw_events` is capped at `MAX_REGRESSION_POINTS`,
     /// but the map is pruned to the current window only by a refit
-    /// (`IsotonicEstimator::fit` rebuilds it from `raw_events`). Because nothing
+    /// (`IsotonicEstimator::refit` rebuilds it from `raw_events`, via
+    /// `anchor_peer_adjustments`). Because nothing
     /// refit THIS estimator, and because it hangs off `OpManager` and so lives as
     /// long as the node, the map grew one entry per distinct peer ever seen in
     /// CONNECT forwarding, forever — an unbounded collection keyed by remote
@@ -3505,7 +4206,11 @@ mod tests {
             actions.forward.is_none(),
             "should not forward uphill when budget is exhausted"
         );
-        assert!(actions.rejected, "should reject when budget is exhausted");
+        assert_eq!(
+            actions.rejected,
+            Some(RejectReason::UphillBudgetExhausted),
+            "should reject with the budget-exhausted cause when budget is exhausted"
+        );
     }
 
     // NOTE: A test for joiner_known = None was considered, but this edge case cannot
@@ -3696,7 +4401,11 @@ mod tests {
             Instant::now(),
         );
 
-        assert!(actions.rejected, "should reject when no uphill peers");
+        assert_eq!(
+            actions.rejected,
+            Some(RejectReason::NoUphillPeers),
+            "should reject with the no-uphill-peers cause"
+        );
         assert!(actions.accept.is_none());
         assert!(actions.forward.is_none());
     }
@@ -3734,7 +4443,11 @@ mod tests {
             Instant::now(),
         );
 
-        assert!(actions.rejected, "should reject when TTL exhausted");
+        assert_eq!(
+            actions.rejected,
+            Some(RejectReason::TtlExhausted),
+            "should reject with the TTL-exhausted cause when TTL is exhausted"
+        );
         assert!(actions.accept.is_none());
         assert!(actions.forward.is_none());
     }
@@ -3775,7 +4488,10 @@ mod tests {
             Instant::now(),
         );
 
-        assert!(!actions.rejected, "should not reject when uphill available");
+        assert!(
+            actions.rejected.is_none(),
+            "should not reject when uphill available"
+        );
         assert!(actions.forward.is_some(), "should forward uphill");
         assert!(actions.accept.is_none());
         assert!(
@@ -3904,9 +4620,10 @@ mod tests {
             &estimator,
             Instant::now(),
         );
-        assert!(
+        assert_eq!(
             retry_actions.rejected,
-            "should reject when no uphill peers on retry"
+            Some(RejectReason::NoUphillPeers),
+            "should reject with the no-uphill-peers cause on retry"
         );
         assert!(retry_actions.forward.is_none());
         assert!(retry_actions.accept.is_none());
@@ -4444,5 +5161,526 @@ mod tests {
             gap_median < 0.05,
             "gap_target median ({gap_median:.4}) should be < 0.05 (Kleinberg-optimal produces short connections)"
         );
+    }
+
+    /// Return just the body of the item whose signature starts with
+    /// `signature_prefix`, bounded by brace depth.
+    ///
+    /// A bare `SOURCE[start..].find(needle)` does not stop at the function's
+    /// closing brace: it matches a *later* occurrence, very often this test
+    /// module's own assertion literal, and the pin then passes vacuously
+    /// under a name saying the case is covered. See AGENTS.md, "WHEN writing
+    /// a source-scrape pin test".
+    ///
+    /// Brace counting rather than the `\n}\n` end anchor used by
+    /// `commands::auto_update`'s helper, because `handle_request` is a method
+    /// inside an `impl` — its closing brace is indented, so that anchor would
+    /// find the enclosing `impl RelayState` brace and silently widen the
+    /// region across every sibling method.
+    ///
+    /// Two properties callers rely on, both worth knowing before reusing it:
+    ///
+    /// - The `handle_request` anchor matches the TRAIT method signature as
+    ///   well as the inherent one, so it resolves by file order rather than
+    ///   uniquely. That is safe here only because a mis-slice fails LOUDLY —
+    ///   the wrong region lacks the asserted literals — rather than passing
+    ///   vacuously. Do not assume a new anchor has that property.
+    /// - It slices from the first `{` AFTER the anchor, which is right for a
+    ///   signature and wrong for a STATEMENT: the first brace then belongs to
+    ///   whatever follows, so the statement's own text is excluded and an
+    ///   assertion about it can never see it. Match statements
+    ///   whitespace-stripped against the file instead.
+    fn fn_body<'a>(source: &'a str, signature_prefix: &str) -> &'a str {
+        let start = source
+            .find(signature_prefix)
+            .unwrap_or_else(|| panic!("anchor not found in scraped source: {signature_prefix}"));
+        // Refuse an anchor that landed inside this test module: from there the
+        // scraped region could only contain the pin's own literals, so every
+        // assertion below would pass without reading production code.
+        let tests_at = source
+            .find("\n#[cfg(test)]\nmod ")
+            .map(|i| i + 1)
+            .expect("test module not located — this guard cannot verify anything");
+        assert!(
+            start < tests_at,
+            "`{signature_prefix}` matched inside the test module — this pin \
+             would be scraping its own source and pass vacuously"
+        );
+        let brace = source[start..]
+            .find('{')
+            .unwrap_or_else(|| panic!("{signature_prefix} must have a body"));
+        let body_start = start + brace + 1;
+        let bytes = source.as_bytes();
+        let mut depth: i32 = 1;
+        let mut i = body_start;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return &source[body_start..i];
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        panic!("unbalanced braces while scanning {signature_prefix}");
+    }
+
+    /// Drive `handle_request` into the "no unvisited uphill candidate"
+    /// rejection and return the resulting actions.
+    fn reject_actions_no_uphill_peers() -> RelayActions {
+        let self_loc = make_peer(4000);
+        let joiner = make_peer(5000);
+        let mut state = RelayState {
+            upstream_addr: joiner.socket_addr().expect("test peer must have address"),
+            request: ConnectRequest {
+                desired_location: Location::random(),
+                joiner,
+                ttl: 3,
+                visited: VisitedPeers::default(),
+                uphill_budget: DEFAULT_UPHILL_BUDGET,
+            },
+            forwarded_to: None,
+            forwarded_at: None,
+            observed_sent: false,
+            accepted_locally: false,
+            response_forwarded: false,
+        };
+        let ctx = TestRelayContext::new(self_loc)
+            .accept(false)
+            .uphill_hop(None);
+        state.handle_request(
+            &ctx,
+            &HashMap::new(),
+            &mut HashMap::new(),
+            &ConnectForwardEstimator::new(),
+            Instant::now(),
+        )
+    }
+
+    /// Drive `handle_request` into the "TTL spent" rejection and return the
+    /// resulting actions.
+    fn reject_actions_ttl_exhausted() -> RelayActions {
+        let self_loc = make_peer(4000);
+        let joiner = make_peer(5000);
+        let mut state = RelayState {
+            upstream_addr: joiner.socket_addr().expect("test peer must have address"),
+            request: ConnectRequest {
+                desired_location: Location::random(),
+                joiner,
+                ttl: 0, // TTL exhausted
+                visited: VisitedPeers::default(),
+                uphill_budget: DEFAULT_UPHILL_BUDGET,
+            },
+            forwarded_to: None,
+            forwarded_at: None,
+            observed_sent: false,
+            accepted_locally: false,
+            response_forwarded: false,
+        };
+        let ctx = TestRelayContext::new(self_loc).accept(false);
+        state.handle_request(
+            &ctx,
+            &HashMap::new(),
+            &mut HashMap::new(),
+            &ConnectForwardEstimator::new(),
+            Instant::now(),
+        )
+    }
+
+    /// Drive `handle_request` into the "uphill budget spent" rejection.
+    fn reject_actions_budget_exhausted() -> RelayActions {
+        let self_loc = make_peer(4000);
+        let joiner = make_peer(5000);
+        let uphill = make_peer(6000);
+        let mut state = RelayState {
+            upstream_addr: joiner.socket_addr().expect("test peer must have address"),
+            request: ConnectRequest {
+                desired_location: Location::random(),
+                joiner,
+                ttl: 5,           // TTL is fine
+                uphill_budget: 0, // budget spent
+                visited: VisitedPeers::default(),
+            },
+            forwarded_to: None,
+            forwarded_at: None,
+            observed_sent: false,
+            accepted_locally: false,
+            response_forwarded: false,
+        };
+        let ctx = TestRelayContext::new(self_loc)
+            .accept(false)
+            .next_hop(None)
+            .uphill_hop(Some(uphill));
+        state.handle_request(
+            &ctx,
+            &HashMap::new(),
+            &mut HashMap::new(),
+            &ConnectForwardEstimator::new(),
+            Instant::now(),
+        )
+    }
+
+    /// Drive `handle_request` into the case where the uphill budget AND the
+    /// TTL are BOTH spent — the overlap the else-if precedence decides.
+    fn reject_actions_budget_and_ttl_both_exhausted() -> RelayActions {
+        let self_loc = make_peer(4000);
+        let joiner = make_peer(5000);
+        let uphill = make_peer(6000);
+        let mut state = RelayState {
+            upstream_addr: joiner.socket_addr().expect("test peer must have address"),
+            request: ConnectRequest {
+                desired_location: Location::random(),
+                joiner,
+                ttl: 0,           // reach spent
+                uphill_budget: 0, // budget spent
+                visited: VisitedPeers::default(),
+            },
+            forwarded_to: None,
+            forwarded_at: None,
+            observed_sent: false,
+            accepted_locally: false,
+            response_forwarded: false,
+        };
+        let ctx = TestRelayContext::new(self_loc)
+            .accept(false)
+            .next_hop(None)
+            .uphill_hop(Some(uphill));
+        state.handle_request(
+            &ctx,
+            &HashMap::new(),
+            &mut HashMap::new(),
+            &ConnectForwardEstimator::new(),
+            Instant::now(),
+        )
+    }
+
+    /// #5335: when the uphill budget AND the TTL are both spent, the reported
+    /// cause is BUDGET.
+    ///
+    /// The two single-condition fixtures each isolate one half of the
+    /// `uphill_budget > 0 && ttl >= 2` gate, so neither exercises the overlap
+    /// — swapping the else-if to test TTL first leaves both of them green.
+    /// This pins the documented precedence itself, which is a real decision:
+    /// budget is decremented once per uphill retry while TTL also falls on
+    /// ordinary forwards, so budget is the tighter and more actionable bound
+    /// on this path.
+    #[test]
+    fn budget_is_reported_when_budget_and_ttl_are_both_exhausted() {
+        let both_spent = reject_actions_budget_and_ttl_both_exhausted()
+            .rejected
+            .expect("budget+TTL-exhausted scenario must reject");
+
+        assert_eq!(
+            both_spent,
+            RejectReason::UphillBudgetExhausted,
+            "with BOTH spent the budget is reported, not the TTL — the \
+             else-if checks `uphill_budget == 0` first, deliberately (#5335)"
+        );
+        assert_eq!(both_spent.as_event_reason(), "uphill budget exhausted");
+    }
+
+    /// #5335: each terminus-rejection cause must reach the structured
+    /// `connect_rejected` event under its OWN distinct reason string.
+    ///
+    /// This is what makes the log downgrade a cleanup rather than a trade.
+    /// The three causes are diagnostically different — no uphill candidate is
+    /// a topology/connectivity condition, a spent budget is the amplification
+    /// bound working as designed, a spent TTL is exhausted reach — and once
+    /// the log lines are `debug!` (compiled out of release builds by
+    /// `release_max_level_info`) this event's reason is the only thing that
+    /// tells them apart in production. Before this, all three arrived as the
+    /// constant `"rejected by handle_request"`.
+    ///
+    /// Asserts the specific mapping, not merely that they differ: a test
+    /// checking only `a != b` would stay green if the arms of
+    /// `as_event_reason` were swapped.
+    #[test]
+    fn each_terminus_rejection_cause_reaches_the_event_with_its_own_reason() {
+        let no_uphill = reject_actions_no_uphill_peers()
+            .rejected
+            .expect("no-uphill-candidate scenario must reject");
+        let budget_spent = reject_actions_budget_exhausted()
+            .rejected
+            .expect("budget-exhausted scenario must reject");
+        let ttl_spent = reject_actions_ttl_exhausted()
+            .rejected
+            .expect("TTL-exhausted scenario must reject");
+
+        assert_eq!(no_uphill, RejectReason::NoUphillPeers);
+        assert_eq!(budget_spent, RejectReason::UphillBudgetExhausted);
+        assert_eq!(ttl_spent, RejectReason::TtlExhausted);
+
+        assert_eq!(
+            no_uphill.as_event_reason(),
+            "no uphill peers available",
+            "the no-uphill-candidate cause must carry its own event reason"
+        );
+        assert_eq!(
+            budget_spent.as_event_reason(),
+            "uphill budget exhausted",
+            "the budget cause must carry its own event reason"
+        );
+        assert_eq!(
+            ttl_spent.as_event_reason(),
+            "TTL exhausted",
+            "the TTL cause must carry its own event reason — budget and TTL \
+             have DIFFERENT remedies and must not be merged (#5335 F2)"
+        );
+
+        // All three distinct: a merge would make one indistinguishable from
+        // another in production, which is the whole failure mode here.
+        let reasons = [
+            no_uphill.as_event_reason(),
+            budget_spent.as_event_reason(),
+            ttl_spent.as_event_reason(),
+        ];
+        let unique: std::collections::HashSet<_> = reasons.iter().collect();
+        assert_eq!(
+            unique.len(),
+            reasons.len(),
+            "every cause must remain distinguishable in telemetry, got {reasons:?}"
+        );
+    }
+
+    /// #5335: within each rejection branch, the `debug!` message must match
+    /// the `RejectReason` that branch assigns.
+    ///
+    /// The log line and the telemetry event describe the SAME rejection, so
+    /// if their wording drifts apart an operator correlating a debug-build
+    /// log against a production event gets two different stories. Nothing
+    /// else pins this: asserting each message merely appears SOMEWHERE in
+    /// `handle_request` passes vacuously when two messages are swapped
+    /// between arms, since both are still present.
+    ///
+    /// Anchors on the assignment (`actions.rejected = Some(..)`) and looks
+    /// BACKWARD to the nearest `tracing::debug!(`, so it reads the message
+    /// belonging to that specific branch.
+    #[test]
+    fn each_reject_branch_logs_the_message_matching_its_reason() {
+        const SOURCE: &str = include_str!("connect.rs");
+        let body = fn_body(SOURCE, "pub(crate) fn handle_request<C: RelayContext>(");
+
+        for (variant, expected_message) in [
+            ("RejectReason::NoUphillPeers", "no uphill peers available"),
+            (
+                "RejectReason::UphillBudgetExhausted",
+                "uphill budget exhausted",
+            ),
+            ("RejectReason::TtlExhausted", "TTL exhausted"),
+        ] {
+            let assignment = format!("actions.rejected = Some({variant});");
+            let occurrences = body.matches(assignment.as_str()).count();
+            assert_eq!(
+                occurrences, 1,
+                "expected exactly one `{assignment}` in handle_request, found \
+                 {occurrences}"
+            );
+            let at = body.find(assignment.as_str()).expect("checked above");
+            let macro_start = body[..at]
+                .rfind("tracing::debug!(")
+                .expect("each rejection branch must log before assigning its cause");
+            let branch = &body[macro_start..at];
+            assert!(
+                branch.contains(expected_message),
+                "the branch assigning `{variant}` must log the matching \
+                 message `{expected_message}` (#5335) — a log and an event \
+                 describing one rejection must not disagree. Branch was: \
+                 {branch}"
+            );
+        }
+    }
+
+    /// #5335: EVERY `connect_rejected` emit reachable from a
+    /// `handle_request` result must pass that result's carried cause, never
+    /// a constant.
+    ///
+    /// The behavioural tests above prove `handle_request` produces the right
+    /// `RejectReason`; this proves the driver actually forwards it into the
+    /// event, the step that would silently undo the whole point. Reaching
+    /// the real emit needs a live `OpManager` and ring, so it is a source
+    /// scrape — but a CROSS-FILE one (lives in `connect.rs`, reads
+    /// `connect/op_ctx_task.rs`), so it structurally cannot be satisfied by
+    /// its own assertion literals.
+    ///
+    /// It enumerates ALL THREE `handle_request` call sites rather than the
+    /// first one. The original version of this pin scraped only the
+    /// `initial_actions` branch, and so was blind to the retry-on-`Rejected`
+    /// path — which re-runs the same `handle_request` and emitted a single
+    /// constant covering every cause, i.e. exactly the conflation this issue
+    /// is about, on roughly half of live rejections. Deriving the site list
+    /// from the calls (not from the emits) is what makes a NEW call site
+    /// fail this test rather than slip past it.
+    #[test]
+    fn every_reject_emit_from_handle_request_passes_the_carried_cause() {
+        const DRIVER_SOURCE: &str = include_str!("connect/op_ctx_task.rs");
+
+        // Anchor on the CALLS, so a fourth one cannot be added without
+        // either binding its result here or failing the count below.
+        let call_sites = DRIVER_SOURCE.matches("state.handle_request(").count();
+        assert_eq!(
+            call_sites, 3,
+            "handle_request has {call_sites} call sites in the driver, not the \
+             3 this pin enumerates. A new call site must decide what its \
+             rejection reason is before this pin can pass (#5335)."
+        );
+
+        // Every binding of a handle_request result, and how that branch must
+        // reach `connect_rejected` — or why it legitimately does not.
+        let initial = fn_body(
+            DRIVER_SOURCE,
+            "if let Some(reject_reason) = initial_actions.rejected",
+        );
+        assert!(
+            initial.contains("NetEventLog::connect_rejected("),
+            "the initial-actions branch must still emit the structured event"
+        );
+        assert!(
+            initial.contains("reject_reason.as_event_reason()"),
+            "the initial-actions branch must pass the CARRIED cause (#5335)"
+        );
+
+        // Retry after a downstream `Rejected`: same handle_request, so the
+        // same causes — a constant here is the F1 regression.
+        //
+        // Matched whitespace-stripped so a rustfmt reflow cannot disarm it,
+        // and NOT via `fn_body`: that helper slices from the first `{` AFTER
+        // its anchor, which is correct for a signature but silently excludes
+        // a STATEMENT anchor's own text (the first `{` here belongs to the
+        // following `if let`). Anchoring a pin on a statement and then
+        // asserting about that statement is a way to test nothing.
+        let squashed: String = DRIVER_SOURCE
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(
+            squashed.contains("retry.rejected.map(RejectReason::as_event_reason)"),
+            "the retry-on-Rejected path must map the carried cause into the \
+             event reason (#5335 F1) — it re-runs the SAME handle_request, so \
+             a constant string there reintroduces exactly the multi-cause \
+             conflation this issue removed, on about half of live rejections"
+        );
+        assert!(
+            squashed.contains("connect_rejected(&incoming_tx,&op_manager.ring,dl,reason)"),
+            "the retry-on-Rejected emit must pass the mapped `reason` binding, \
+             not a literal (#5335 F1)"
+        );
+
+        // The generic string survives ONLY as the no-cause fallback, never
+        // as the sole reason argument.
+        assert!(
+            squashed.contains(".unwrap_or(\"relaynoretrypeersavailable\")"),
+            "the generic reason must remain reachable only as the \
+             `unwrap_or` fallback for a handle_request result that carried no \
+             cause at all"
+        );
+        assert!(
+            !DRIVER_SOURCE.contains("\"rejected by handle_request\""),
+            "the constant reason string must not come back (#5335)"
+        );
+
+        // Third call site (retry after ConnectFailed) deliberately emits no
+        // connect_rejected — see the KNOWN GAP comment at that branch. Pin
+        // the deliberateness so a future reader does not "fix" it silently,
+        // and so deleting the rationale fails here.
+        assert!(
+            DRIVER_SOURCE.contains("KNOWN GAP (#5335)"),
+            "the ConnectFailed-propagation branch must keep its explicit \
+             KNOWN GAP rationale for emitting no connect_rejected event; if \
+             that branch starts emitting one, update this pin deliberately"
+        );
+    }
+
+    /// #5335: the two terminus-rejection arms of `RelayState::handle_request`
+    /// must log at `debug!`, never `info!`.
+    ///
+    /// All describe a routine, expected outcome of CONNECT routing — no
+    /// unvisited uphill candidate, or the uphill budget / TTL bound doing its
+    /// job. On a moderately busy peer they fired 25-65 times a minute as
+    /// standing baseline, ~22% of all log lines, drowning genuinely rare
+    /// connect failures at the level meant for things an operator should
+    /// notice by default.
+    ///
+    /// What replaces them: the rejection is emitted as a structured
+    /// `NetEventLog::connect_rejected` event by the caller in
+    /// `connect/op_ctx_task.rs`, carrying the specific cause, and aggregated
+    /// into the `connect_rejects_emitted` snapshot counter.
+    ///
+    /// That is a REPLACEMENT, not a guarantee of preservation, and the limits
+    /// are worth stating rather than claiming "nothing is lost":
+    ///
+    /// - the local `_EVENT_LOG` register is opt-in and off by default on
+    ///   network nodes;
+    /// - telemetry upload is user-disableable;
+    /// - the enqueue is a `try_send`, so events are dropped on a full channel;
+    /// - **the event is coarser than the line it replaces.** The `debug!`
+    ///   carries `ttl`, `uphill_budget` and `visited`; `connect_rejected`
+    ///   carries only `desired_location` and a reason string. Splitting
+    ///   budget from TTL in [`RejectReason`] recovers WHICH bound bound, but
+    ///   not the values — and `visited`, the actual dead-end evidence, has no
+    ///   replacement on any path.
+    ///
+    /// On a node with telemetry disabled, a release build records terminus
+    /// rejections nowhere at all. That is judged an acceptable trade for a
+    /// line at ~22% of log volume whose per-occurrence value is nil, but it
+    /// is a trade.
+    ///
+    /// Note `crates/core/Cargo.toml` enables tracing's
+    /// `release_max_level_info`, so `debug!` is compiled out of release
+    /// builds entirely rather than merely filtered — which is the point here,
+    /// but means a future marker anyone greps for must NOT live at this level.
+    ///
+    /// See also the retirement TODO at `tracing/telemetry.rs` on the
+    /// per-event `connect_rejected` firehose: retiring it in favour of
+    /// snapshot counters, which have no reason dimension, would remove this
+    /// PR's entire output while these lines stay compiled out.
+    #[test]
+    fn terminus_rejection_log_sites_use_debug_not_info() {
+        const SOURCE: &str = include_str!("connect.rs");
+        let body = fn_body(SOURCE, "pub(crate) fn handle_request<C: RelayContext>(");
+
+        // Bracket the scraped region so a mis-slice fails loudly instead of
+        // asserting against the wrong text: the sibling already-forwarded arm
+        // is inside `handle_request`, `impl RelayContext for RelayEnv` is the
+        // next item after it.
+        assert!(
+            body.contains("connect: at terminus but already forwarded"),
+            "scraped the wrong region — handle_request's body must contain the \
+             sibling already-forwarded arm"
+        );
+        assert!(
+            !body.contains("impl RelayContext for RelayEnv"),
+            "scraped region overran handle_request's closing brace"
+        );
+
+        for marker in [
+            "\"connect: at terminus, cannot accept, no uphill peers available",
+            "\"connect: at terminus, cannot accept, uphill budget exhausted",
+            "\"connect: at terminus, cannot accept, TTL exhausted",
+        ] {
+            let occurrences = body.matches(marker).count();
+            assert_eq!(
+                occurrences, 1,
+                "expected exactly one `{marker}...` log site in handle_request, \
+                 found {occurrences}. If the message was deliberately reworded, \
+                 update this pin — do not delete it (#5335)."
+            );
+            let at = body.find(marker).expect("checked by the count above");
+            let macro_start = body[..at]
+                .rfind("tracing::")
+                .expect("the log site must be a `tracing::` macro invocation");
+            let invocation = &body[macro_start..];
+            let found: String = invocation.chars().take(16).collect();
+            assert!(
+                invocation.starts_with("tracing::debug!("),
+                "`{marker}...` must be logged at debug!, not info! (#5335) — it \
+                 is a routine terminus outcome, not an anomaly, and the \
+                 rejection is already carried by NetEventLog::connect_rejected. \
+                 Found `{found}`."
+            );
+        }
     }
 }

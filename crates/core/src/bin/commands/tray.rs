@@ -262,18 +262,28 @@ mod tests {
         // bare name, because the test body itself mentions
         // `open_log_file` in its assertions and `include_str!` would
         // otherwise pick up the first textual match inside this test.
+        // Bounded to the real function body (#5102 follow-up). Two independent
+        // defects made this pin latently vacuous:
+        //   1. the anchor self-matched THIS test's own string literal, which
+        //      appears above the real definition; and
+        //   2. the end anchor `"\n#[cfg(test)]"` never matched at all — tray.rs's
+        //      only `#[cfg(test)]` is ABOVE `open_log_file` — so `unwrap_or`
+        //      silently widened the region to the entire rest of the file.
+        // It bit only by luck: `open_log_file` is currently the file's sole
+        // null-stdio site. The project's own bug-prevention rule REQUIRES every
+        // new `Command::spawn` here to null all three handles, so complying with
+        // that rule would have supplied a decoy and killed the pin guarding
+        // #3933. Slice from the LAST occurrence of the signature (the definition,
+        // not this literal) to the function's closing brace.
         let src = include_str!("tray.rs");
-        let (_, after_fn_start) = src
-            .split_once("pub fn open_log_file() {")
+        let at = src
+            .rfind("pub fn open_log_file() {")
             .expect("open_log_file definition not found");
-        // Body ends at the next blank line followed by a `#[cfg(test)]`
-        // attribute — the module-level tests block. Restricting the
-        // search window avoids double-counting nulls from unrelated
-        // helpers elsewhere in the file.
+        let after_fn_start = &src[at..];
         let body = after_fn_start
-            .split_once("\n#[cfg(test)]")
+            .split_once("\n}\n")
             .map(|(b, _)| b)
-            .unwrap_or(after_fn_start);
+            .expect("could not locate end of open_log_file");
         for handle in ["stdin", "stdout", "stderr"] {
             let pattern = format!(".{handle}(std::process::Stdio::null())");
             assert!(
@@ -537,6 +547,7 @@ mod platform {
         use tao::event::Event;
         use tao::event_loop::{ControlFlow, EventLoopBuilder};
 
+        let started = Instant::now();
         let event_loop = EventLoopBuilder::<WrapperStatus>::with_user_event().build();
         let proxy = event_loop.create_proxy();
 
@@ -618,6 +629,61 @@ mod platform {
                 }
             }
 
+            // A `freenet://` link, delivered by LaunchServices because the
+            // bundle's Info.plist claims the scheme (#5726). Handle it off the
+            // main thread: it may wait for the node to come up, and AppKit
+            // must keep pumping meanwhile. The link is not logged, since
+            // apps can carry secrets in its fragment (e.g. River invites).
+            if let Event::Opened { urls } = &event {
+                use std::sync::atomic::{AtomicUsize, Ordering};
+                // Each handler may wait for the node; cap how many run at
+                // once so a page spamming links cannot pile up threads.
+                static IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
+                const MAX_IN_FLIGHT: usize = 4;
+                /// Releases the slot however the handler ends, panics included.
+                struct Slot;
+                impl Drop for Slot {
+                    fn drop(&mut self) {
+                        IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
+                    }
+                }
+                // Wait long for the node only just after launch, when
+                // LaunchServices may have started the app to deliver this
+                // link; later, a node that is down is simply down.
+                let wait = if started.elapsed() < Duration::from_secs(90) {
+                    super::super::open_link::APP_LAUNCH_NODE_WAIT
+                } else {
+                    Duration::from_secs(3)
+                };
+                for url in urls {
+                    if IN_FLIGHT.fetch_add(1, Ordering::SeqCst) >= MAX_IN_FLIGHT {
+                        IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
+                        super::super::service::log_to_wrapper_log(
+                            "Dropped a freenet:// link: too many links already being handled",
+                        );
+                        continue;
+                    }
+                    let slot = Slot;
+                    let link = url.as_str().to_string();
+                    let spawned = std::thread::Builder::new()
+                        .name("freenet-link".into())
+                        .spawn(move || {
+                            let _slot = slot;
+                            let outcome = super::super::open_link::handle_link(&link, wait, None);
+                            super::super::service::log_to_wrapper_log(&format!(
+                                "Handled a freenet:// link from LaunchServices: outcome={}",
+                                outcome.kind()
+                            ));
+                        });
+                    if spawned.is_err() {
+                        // The closure (and its slot) was dropped: nothing leaks.
+                        super::super::service::log_to_wrapper_log(
+                            "Could not start a thread for a freenet:// link",
+                        );
+                    }
+                }
+            }
+
             // Apply status updates forwarded from the wrapper thread.
             if let Event::UserEvent(status) = event {
                 let is_terminal = state.apply_status(&status);
@@ -680,6 +746,57 @@ mod platform {
 
 #[allow(unused_imports, dead_code)]
 pub use platform::run_tray_event_loop;
+
+/// macOS: handle `freenet://` links LaunchServices delivered to THIS process
+/// when it is a second copy about to exit because another wrapper holds the
+/// single-instance lock.
+///
+/// LaunchServices launches a new copy for a link when it does not (yet) see a
+/// running instance, e.g. in the moment after login or a relaunch, before the
+/// running wrapper's AppKit loop has checked in. That copy queues the link
+/// for itself; exiting without an event loop would drop it silently. So pump
+/// one briefly, open any link it receives (the node is up: the other wrapper
+/// is running it), then exit. `tao`'s run loop ends the process when done.
+#[cfg(target_os = "macos")]
+pub fn handle_links_sent_to_duplicate(window: std::time::Duration) -> ! {
+    use std::time::{Duration, Instant};
+    use tao::event::Event;
+    use tao::event_loop::{ControlFlow, EventLoop};
+    use tao::platform::macos::{ActivationPolicy, EventLoopExtMacOS};
+
+    let started = Instant::now();
+    let deadline = started + window;
+    // Hard cap on this process's life, links included, well inside the
+    // 120s the macOS bundle updater waits for bundle processes to exit.
+    let lifetime_end = started + Duration::from_secs(60);
+    let mut event_loop = EventLoop::new();
+    // A background helper, not an app the user switched to: no Dock icon, no
+    // stealing focus (tao defaults to a regular, activating app).
+    event_loop.set_activation_policy(ActivationPolicy::Accessory);
+    event_loop.set_activate_ignoring_other_apps(false);
+    event_loop.run(move |event, _window, control_flow| {
+        *control_flow = ControlFlow::WaitUntil(deadline);
+        if let Event::Opened { urls } = event {
+            // Handled inline: this process does nothing else, and it must not
+            // exit before the browser has been asked to open the link.
+            for url in urls.iter().take(4) {
+                // The running wrapper may have only just started its node
+                // (this is the login/relaunch window), so wait as long as a
+                // fresh launch would, within the lifetime cap.
+                let wait = super::open_link::APP_LAUNCH_NODE_WAIT
+                    .min(lifetime_end.saturating_duration_since(Instant::now()));
+                let outcome = super::open_link::handle_link(url.as_str(), wait, None);
+                super::service::log_to_wrapper_log(&format!(
+                    "Handled a freenet:// link in a duplicate launch: outcome={}",
+                    outcome.kind()
+                ));
+            }
+        }
+        if Instant::now() >= deadline {
+            *control_flow = ControlFlow::Exit;
+        }
+    })
+}
 
 /// Open the latest log file in the platform's default viewer.
 #[allow(dead_code)]

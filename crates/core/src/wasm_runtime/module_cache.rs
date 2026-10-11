@@ -1234,6 +1234,19 @@ pub(crate) fn budget_for_ram(total_ram: usize) -> usize {
 /// `node::resource_metrics`) and — later — the capability-relative hosting
 /// budget (piece A2). Keeping a single source avoids two drifting notions of
 /// "how much memory does this node have". See `docs/design/hosting-eviction.md`.
+/// The node's memory limit from physical RAM and the cgroup limit, either of
+/// which may be unreadable: the smaller of the two, or whichever exists. With
+/// no cgroup limit (an uncapped host) this is physical RAM.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn combine_ram_limits(phys: Option<usize>, cgroup: Option<usize>) -> Option<usize> {
+    match (phys, cgroup) {
+        (Some(p), Some(c)) => Some(p.min(c)),
+        (Some(p), None) => Some(p),
+        (None, Some(c)) => Some(c),
+        (None, None) => None,
+    }
+}
+
 pub(crate) fn read_total_ram_bytes() -> Option<usize> {
     #[cfg(target_os = "linux")]
     {
@@ -1241,12 +1254,7 @@ pub(crate) fn read_total_ram_bytes() -> Option<usize> {
         // Clamp to the cgroup limit when one applies. If we can read physical
         // RAM, take the min; if not, fall back to the cgroup limit alone (a
         // container with no readable /proc/meminfo still gets a sane bound).
-        match (phys, read_cgroup_memory_limit_bytes()) {
-            (Some(p), Some(c)) => Some(p.min(c)),
-            (Some(p), None) => Some(p),
-            (None, Some(c)) => Some(c),
-            (None, None) => None,
-        }
+        combine_ram_limits(phys, read_cgroup_memory_limit_bytes())
     }
     #[cfg(all(unix, not(target_os = "linux")))]
     {
@@ -1263,10 +1271,159 @@ pub(crate) fn read_total_ram_bytes() -> Option<usize> {
             None
         }
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        read_windows_total_phys_bytes()
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         None
     }
+}
+
+/// Physical RAM (bytes) via `GlobalMemoryStatusEx` (#5329). No cgroup-equivalent
+/// notion exists on Windows, so this is the whole story there — unlike the
+/// Linux branch above, there is no separate container-limit source to min
+/// against.
+#[cfg(windows)]
+fn read_windows_total_phys_bytes() -> Option<usize> {
+    windows_memory_status_to_ram_bytes(windows_read_memory_status().map(|s| s.ullTotalPhys))
+}
+
+/// The `GlobalMemoryStatusEx` FFI call behind [`read_windows_total_phys_bytes`],
+/// kept separate so the one unsafe invocation lives in one place.
+#[cfg(windows)]
+fn windows_read_memory_status() -> Option<winapi::um::sysinfoapi::MEMORYSTATUSEX> {
+    use winapi::um::sysinfoapi::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+
+    // SAFETY: `MEMORYSTATUSEX` is a C-repr struct of plain integer fields
+    // (DWORD/DWORDLONG) with no padding-sensitive invariants or pointers —
+    // an all-zero bit pattern is a valid value for every field. We
+    // immediately overwrite `dwLength` below (the only field the API reads
+    // before populating the rest), so this only ever serves as a
+    // stack-owned, correctly-sized out-buffer for the FFI call that follows.
+    let mut status: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+    status.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
+    // SAFETY: `GlobalMemoryStatusEx` is an FFI call that reads system memory
+    // stats into a caller-owned `MEMORYSTATUSEX` buffer. We pass a valid,
+    // correctly-sized, stack-owned out-buffer with `dwLength` set as the API
+    // requires (the call fails with `ERROR_INVALID_PARAMETER` otherwise). It
+    // writes only into that buffer and returns nonzero on success / 0 on
+    // error (checked below); it borrows no memory past the call. No aliasing
+    // or lifetime hazards.
+    let ok = unsafe { GlobalMemoryStatusEx(&mut status) };
+    if ok == 0 { None } else { Some(status) }
+}
+
+/// Own-process working-set size (bytes) via `GetProcessMemoryInfo` (#5333) —
+/// Windows' closest analogue to Linux `VmRSS`: physical memory currently
+/// charged to this process. Backs [`read_own_rss_bytes`] on Windows.
+#[cfg(windows)]
+fn read_windows_own_rss_bytes() -> Option<usize> {
+    use winapi::um::processthreadsapi::GetCurrentProcess;
+    use winapi::um::psapi::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
+
+    // SAFETY: `PROCESS_MEMORY_COUNTERS` is a C-repr struct of plain integer
+    // fields (DWORD/SIZE_T) with no padding-sensitive invariants or
+    // pointers — an all-zero bit pattern is a valid value for every field.
+    // `cb` is overwritten below (the only field the API reads before
+    // populating the rest), so this only ever serves as a stack-owned,
+    // correctly-sized out-buffer for the FFI call that follows.
+    let mut counters: PROCESS_MEMORY_COUNTERS = unsafe { std::mem::zeroed() };
+    counters.cb = std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
+    // SAFETY: `GetCurrentProcess` returns a pseudo-handle (no resource to
+    // free, valid for the lifetime of the process) — safe to call with no
+    // preconditions. `GetProcessMemoryInfo` is an FFI call that reads this
+    // process's memory counters into a caller-owned `PROCESS_MEMORY_COUNTERS`
+    // buffer; we pass a valid, correctly-sized, stack-owned out-buffer with
+    // `cb` set as the API requires, and the pseudo-handle from the call
+    // just above. It writes only into that buffer and returns nonzero on
+    // success / 0 on error (checked below); it borrows no memory past the
+    // call. No aliasing or lifetime hazards.
+    let ok = unsafe {
+        GetProcessMemoryInfo(
+            GetCurrentProcess(),
+            &mut counters,
+            std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32,
+        )
+    };
+    windows_memory_status_to_ram_bytes(if ok == 0 {
+        None
+    } else {
+        Some(counters.WorkingSetSize as u64)
+    })
+}
+
+/// Pure `Option<DWORDLONG> -> Option<usize>` conversion shared by every
+/// Windows memory reader in this file (#5329) — split out
+/// so the actual decision logic (the `u64 -> usize` narrowing) is
+/// unit-testable on ANY host, not just a real Windows CI runner. Takes an
+/// already-`Option`-collapsed value (the caller folds the API's
+/// success/failure BOOL into `None` before calling this) so one function
+/// serves all three readers without re-deriving that fold each time.
+/// Gated on `any(windows, test)` here rather than left ungated (dead code on
+/// a non-Windows, non-test build) or gated to `windows` alone (which would
+/// undo the whole point: making it unit-testable on non-Windows CI).
+#[cfg(any(windows, test))]
+fn windows_memory_status_to_ram_bytes(raw_bytes: Option<u64>) -> Option<usize> {
+    usize::try_from(raw_bytes?).ok()
+}
+
+/// Own-process resident set size (bytes) on macOS via `task_info`'s
+/// `MACH_TASK_BASIC_INFO` flavor (#5333) — macOS's closest analogue to Linux
+/// `VmRSS`: physical memory currently resident for this task. Backs
+/// [`read_own_rss_bytes`] on macOS.
+#[cfg(target_os = "macos")]
+fn read_macos_own_rss_bytes() -> Option<usize> {
+    // `mach2` (workspace dep pinned at 0.4) does not export these at that
+    // version; `libc` has `task_info`, `MACH_TASK_BASIC_INFO`(_COUNT), and
+    // `mach_task_basic_info`.
+    use libc::{MACH_TASK_BASIC_INFO, kern_return_t, mach_task_basic_info, task_info};
+
+    // SAFETY: `mach_task_basic_info` is a C-repr struct of plain integer
+    // fields with no padding-sensitive invariants or pointers — an all-zero
+    // bit pattern is a valid value for every field, entirely overwritten by
+    // the FFI call below on success. `mach_task_self()` (unlike
+    // `mach_host_self()`, cached via `macos_cached_host_port()` above) is
+    // safe to call on every tick with no caching of its own: `libc`'s own
+    // binding for it is literally `unsafe fn mach_task_self() -> mach_port_t
+    // { mach_task_self_ }` — a read of a process-global `static` the Mach
+    // runtime initializes once at process startup, not a kernel trap that
+    // mints a new right, so there is nothing here to accumulate.
+    let mut info: mach_task_basic_info = unsafe { std::mem::zeroed() };
+    let mut count = libc::MACH_TASK_BASIC_INFO_COUNT;
+    // SAFETY: `task_info` is an FFI call that reads this task's basic info
+    // into a caller-owned `mach_task_basic_info` buffer. We pass the current
+    // task's own port (`mach_task_self`, valid for this process's lifetime),
+    // the `MACH_TASK_BASIC_INFO` flavor matching the struct we're reading
+    // into, a correctly-sized stack-owned out-buffer (`MACH_TASK_BASIC_INFO_COUNT`,
+    // the libc-provided constant matching the API's expected count rather
+    // than a hand-rolled `size_of`), and a correctly-initialized in/out count
+    // matching that buffer's size. It writes only into that buffer, up to
+    // `count` natural_t words, and returns `KERN_SUCCESS` (0) on success
+    // (checked below); it borrows no memory past the call. No aliasing or
+    // lifetime hazards.
+    #[allow(deprecated)]
+    let kr: kern_return_t = unsafe {
+        task_info(
+            libc::mach_task_self(),
+            MACH_TASK_BASIC_INFO,
+            (&mut info as *mut mach_task_basic_info).cast(),
+            &mut count,
+        )
+    };
+    if kr != libc::KERN_SUCCESS {
+        return None;
+    }
+    macos_task_info_to_rss_bytes(info.resident_size)
+}
+
+/// Pure narrowing behind [`read_macos_own_rss_bytes`], split out for the same
+/// reason as [`macos_vm_stats_to_available_bytes`] — testable on every CI
+/// platform even though the `task_info` FFI call itself only runs on macOS.
+#[cfg(any(target_os = "macos", test))]
+fn macos_task_info_to_rss_bytes(resident_size: u64) -> Option<usize> {
+    usize::try_from(resident_size).ok()
 }
 
 /// Parse physical RAM (bytes) from `/proc/meminfo`'s `MemTotal:` line.
@@ -1282,6 +1439,47 @@ fn read_proc_meminfo_total_bytes() -> Option<usize> {
 fn parse_meminfo_total_bytes(meminfo: &str) -> Option<usize> {
     for line in meminfo.lines() {
         if let Some(rest) = line.strip_prefix("MemTotal:") {
+            let kib: usize = rest.split_whitespace().next()?.parse().ok()?;
+            return kib.checked_mul(1024);
+        }
+    }
+    None
+}
+
+/// Best-effort read of THIS PROCESS's own live resident memory (RSS), in
+/// bytes: Linux (`/proc/self/status` `VmRSS`), Windows
+/// (`GetProcessMemoryInfo`'s working-set size), and macOS (`task_info`'s
+/// `resident_size`). `None` on any other platform or if the read fails.
+///
+/// Reported in telemetry as `memory_rss_bytes` (`node::resource_metrics`),
+/// where it is compared with the bytes each component accounts for (#5647).
+/// It does not drive eviction: each memory consumer enforces its own byte
+/// budget.
+pub(crate) fn read_own_rss_bytes() -> Option<usize> {
+    #[cfg(target_os = "linux")]
+    {
+        let status = std::fs::read_to_string("/proc/self/status").ok()?;
+        parse_status_vmrss_bytes(&status)
+    }
+    #[cfg(windows)]
+    {
+        read_windows_own_rss_bytes()
+    }
+    #[cfg(target_os = "macos")]
+    {
+        read_macos_own_rss_bytes()
+    }
+    #[cfg(not(any(target_os = "linux", windows, target_os = "macos")))]
+    {
+        None
+    }
+}
+
+/// Pure parse of `VmRSS` (KiB) from `/proc/self/status` contents into bytes.
+#[cfg(target_os = "linux")]
+fn parse_status_vmrss_bytes(status: &str) -> Option<usize> {
+    for line in status.lines() {
+        if let Some(rest) = line.strip_prefix("VmRSS:") {
             let kib: usize = rest.split_whitespace().next()?.parse().ok()?;
             return kib.checked_mul(1024);
         }
@@ -1772,6 +1970,137 @@ mod tests {
         let sample = "MemFree:  100 kB\nMemTotal:       16331752 kB\nBuffers:  1 kB\n";
         assert_eq!(parse_meminfo_total_bytes(sample), Some(16331752 * 1024));
         assert_eq!(parse_meminfo_total_bytes("SwapTotal: 0 kB\n"), None);
+    }
+
+    /// #5333: `VmRSS` parsing from `/proc/self/status` — the own-process
+    /// resident-memory signal that, unlike the surplus term, is never
+    /// discounted by `mem_share` in the resident-overhead budget composition.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn parse_status_vmrss_reads_kib_as_bytes() {
+        let sample = "Name:\tfreenet\nVmPeak:\t 123456 kB\nVmRSS:\t   654321 kB\nThreads:\t8\n";
+        assert_eq!(parse_status_vmrss_bytes(sample), Some(654321 * 1024));
+        assert_eq!(parse_status_vmrss_bytes("VmPeak:\t 123 kB\n"), None);
+    }
+
+    /// #5329 review: `GlobalMemoryStatusEx`'s `(BOOL, DWORDLONG)` -> RAM-bytes
+    /// decision logic, tested on ANY host (no `#[cfg(windows)]`) — mirrors
+    /// `parse_meminfo_total_reads_kib_as_bytes` above for the Linux branch.
+    /// This is what actually runs on CI today; the `#[cfg(windows)]` test
+    /// below additionally exercises the real FFI call, but only on a real
+    /// Windows runner.
+    #[test]
+    fn windows_memory_status_to_ram_bytes_converts_or_rejects() {
+        // Success: a real-looking 16 GiB reading passes through unchanged.
+        // The caller has already folded the API's BOOL result into the
+        // Option (#5333) — `Some(bytes)` models a successful call.
+        assert_eq!(
+            windows_memory_status_to_ram_bytes(Some(16 * 1024 * 1024 * 1024)),
+            Some(16 * 1024 * 1024 * 1024)
+        );
+        // API failure (BOOL == 0, per GlobalMemoryStatusEx's / GetProcessMemoryInfo's
+        // documented contract): the caller passes `None`, and it must stay
+        // `None` here too — not a `Some(0)` or a stale prior reading.
+        assert_eq!(windows_memory_status_to_ram_bytes(None), None);
+        // A degenerate-but-technically-valid 0-byte reading passes through
+        // as Some(0) rather than being conflated with the failure case above
+        // — the caller's own fallback handles a 0 total_ram identically to
+        // any other implausible value via the downstream clamp floors, so
+        // this function's job is only to distinguish "API said no" from
+        // "API said yes, here's the (possibly odd) number".
+        assert_eq!(windows_memory_status_to_ram_bytes(Some(0)), Some(0));
+    }
+
+    /// #5329 regression: on Windows, `read_total_ram_bytes()` used to return
+    /// `None` unconditionally (no branch existed at all), so every RAM-scaled
+    /// budget silently fell back to its floor value regardless of the host's
+    /// real RAM — e.g. a 16 GiB machine landing on the same 128 MiB resident-
+    /// overhead floor as a 512 MiB host, causing fast, spurious eviction.
+    /// `cargo check`/`cargo build` alone cannot catch this class of bug (a
+    /// `cfg`'d branch that compiles but was simply absent is not something a
+    /// compile-only check on a non-Windows host can distinguish from one that
+    /// works) — per `.claude/rules/deployment.md` ("WHEN adding or modifying
+    /// a platform-gated code path"), this needs to run on the real Windows CI
+    /// runner, which is exactly what a `#[cfg(windows)]`-gated `#[test]`
+    /// achieves: it only compiles and executes there.
+    ///
+    /// NOTE: as of this writing, neither Windows CI job
+    /// (`Windows Check` = `cargo check` only; `Windows Service Unit` =
+    /// `cargo build --bin freenet` + a narrow `commands::service` nextest
+    /// filter scoped to the `--bin` target) actually runs the `freenet`
+    /// LIBRARY's `--lib` test target, so THIS SPECIFIC test is not yet
+    /// exercised by CI — it needs either a future CI job that runs
+    /// `-p freenet --lib` on Windows (tracked: #5331), or manual verification
+    /// on a real Windows box. The decision logic this FFI call feeds IS
+    /// covered on every CI run regardless — see
+    /// [`windows_memory_status_to_ram_bytes`] and its platform-independent
+    /// unit test, which is where the actual risk (API-failure handling,
+    /// `u64 -> usize` narrowing) lived; this test additionally covers the FFI
+    /// plumbing itself (correct struct size/zeroing, the real syscall).
+    #[cfg(windows)]
+    #[test]
+    fn read_total_ram_bytes_returns_a_sane_value_on_windows() {
+        let ram = read_total_ram_bytes();
+        assert!(
+            ram.is_some(),
+            "GlobalMemoryStatusEx must succeed on any real Windows host — a \
+             None here means the #5329 regression is back"
+        );
+        let ram = ram.unwrap();
+        // Sanity bounds, not a tight assertion: any real CI runner has at
+        // least 512 MiB and (barring an absurd host) well under 1 TiB. A
+        // value outside this range indicates the FFI call read garbage
+        // (e.g. a missing dwLength, which GlobalMemoryStatusEx would
+        // normally reject outright, but a corrupted struct layout could
+        // still produce a wild number rather than a clean failure).
+        assert!(
+            ram >= 512 * 1024 * 1024,
+            "implausibly small RAM reading: {ram} bytes"
+        );
+        assert!(
+            ram < 1024 * 1024 * 1024 * 1024,
+            "implausibly large RAM reading: {ram} bytes"
+        );
+    }
+
+    /// Same rationale and CI-coverage caveat as
+    /// [`read_total_ram_bytes_returns_a_sane_value_on_windows`] above: compiles
+    /// and runs ONLY on a real Windows host (#5331). `GetProcessMemoryInfo`'s
+    /// working set can legitimately exceed available RAM on a heavily swapped
+    /// host, so this only checks that the call succeeds and is non-zero.
+    #[cfg(windows)]
+    #[test]
+    fn read_windows_own_rss_returns_a_sane_value_on_windows() {
+        let rss = read_windows_own_rss_bytes();
+        assert!(
+            rss.is_some(),
+            "GetProcessMemoryInfo must succeed for the calling process's own handle"
+        );
+        assert!(rss.unwrap() > 0, "implausible zero own-RSS reading");
+    }
+
+    #[test]
+    fn macos_task_info_to_rss_bytes_narrows_or_rejects() {
+        assert_eq!(macos_task_info_to_rss_bytes(0), Some(0));
+        assert_eq!(
+            macos_task_info_to_rss_bytes(4 * 1024 * 1024 * 1024),
+            Some(4 * 1024 * 1024 * 1024)
+        );
+    }
+
+    /// Same rationale as the Windows FFI smoke test above: compiles and runs
+    /// ONLY on a real macOS host. Neither macOS CI job runs the library's
+    /// `--lib` test target, so this needs manual verification on a real Mac;
+    /// the pure narrowing above IS covered on every CI run.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn read_macos_own_rss_returns_a_sane_value_on_macos() {
+        let rss = read_macos_own_rss_bytes();
+        assert!(
+            rss.is_some(),
+            "task_info must succeed for the calling process's own task port"
+        );
+        assert!(rss.unwrap() > 0, "implausible zero own-RSS reading");
     }
 
     /// `/proc/self/cgroup` parsing resolves the process's OWN cgroup sub-path for

@@ -58,4 +58,4 @@ mod time;
 pub use fault::{FaultConfig, FaultConfigBuilder, Partition};
 pub use rng::SimulationRng;
 pub use time::Wakeup;
-pub use time::{RealTime, TimeSource, TimeSourceInterval, VirtualTime, WakeupId};
+pub use time::{BoxedSleep, RealTime, TimeSource, TimeSourceInterval, VirtualTime, WakeupId};
