@@ -67,7 +67,10 @@ pub struct TransportMetrics {
     //
     // `cumulative_bytes_received` is updated post-authentication (see
     // `record_packet_received`), so it counts bytes from packets that pass
-    // `try_decrypt_sym` against an established symmetric session key.
+    // `try_decrypt_sym` against a symmetric session key (including a
+    // handshake's completion ACK), plus intro packets that decrypt with our
+    // static key on an existing connection (peer restart). The intro packet
+    // that opens a connection is not counted.
     // Counting at the raw socket would let an attacker spoofing UDP source
     // addresses inflate this counter arbitrarily (#3999).
     cumulative_bytes_sent: AtomicU64,
@@ -465,9 +468,11 @@ impl TransportMetrics {
 
     /// Record an inbound UDP packet that has passed authentication.
     ///
-    /// MUST only be called for packets that have been successfully decrypted
-    /// against an established symmetric session key — see the call site in
-    /// [`crate::transport::peer_connection::PeerConnection::recv`]. Calling
+    /// MUST only be called for packets that have been successfully decrypted:
+    /// against a symmetric session key (the call site in
+    /// [`crate::transport::peer_connection::PeerConnection::recv`], and the
+    /// handshake completion ACKs in `connection_handler`), or, on the
+    /// peer-restart path in `recv`, as an intro packet with our static key. Calling
     /// this on raw `recv_from` output would let an attacker inflate the
     /// dashboard by spoofing UDP packets from many source IPs (#3999).
     ///

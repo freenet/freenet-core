@@ -11,10 +11,11 @@
 //! What the rates measure is exactly what the counters measure (see the
 //! comment on the counters in `metrics.rs`). Both count whole UDP datagrams,
 //! encrypted, without UDP or IP headers. Upload counts every datagram a
-//! successful `send_to` put on the wire. Download counts only datagrams that
-//! decrypted with a symmetric session key, which includes a handshake's
-//! completion ACK but not intro packets or anything unauthenticated, while
-//! the outbound side of those is in upload.
+//! successful `send_to` put on the wire. Download counts datagrams that
+//! decrypted with a session key (including a handshake's completion ACK) and
+//! intro packets on an existing connection (peer restart). The intro packet
+//! that opens an inbound connection, and anything that fails to decrypt, is
+//! not counted, while the outbound side of those is in upload.
 //!
 //! A sample is the average over the interval since the previous one. That is
 //! one second while the sampler keeps up; after a stall of up to [`WINDOW`]

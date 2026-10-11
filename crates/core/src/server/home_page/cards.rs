@@ -673,7 +673,7 @@ fn bandwidth_section(history: &[RateSample]) -> String {
         r#"<div class="bw-section">
                 <h3>Transfer rate, last minute</h3>
                 {body}
-                <p class="bw-note">Freenet traffic only, as encrypted UDP datagrams without UDP or IP headers. Upload counts every datagram sent; download counts only datagrams authenticated with a session key, so the first packets of a connection's setup are not included.</p>
+                <p class="bw-note">Freenet traffic only, as encrypted UDP datagrams without UDP or IP headers. Upload counts every datagram sent; download leaves out the opening packet of each inbound connection and anything that fails to decrypt.</p>
             </div>"#
     )
 }
