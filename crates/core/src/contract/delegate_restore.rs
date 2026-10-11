@@ -14,8 +14,11 @@
 //!
 //! Both come from `run_executor_subscribe`, the same entry point the live
 //! network path uses (`contract::run_contract_op_off_loop`), which also covers
-//! the local-hit case. Nothing here registers demand a live subscribe would
-//! not: no synthetic client, no extra pin, nothing on `contract_in_use`.
+//! the local-hit case. The hold is recorded through
+//! `contract::record_delegate_demand`, the same function the live paths use,
+//! so a restored subscription also counts as local demand (`contract_in_use`,
+//! the eviction ranking's local tier, #4669) exactly as a live one does.
+//! Nothing here registers demand a live subscribe would not.
 //!
 //! # Pacing, and why there is no thundering herd
 //!
@@ -281,17 +284,10 @@ fn finish_attempt<E: std::fmt::Display>(
             // key releases exactly the entry the subscribe created. Same
             // device as the live network path's fallback key.
             let key = ContractKey::from_id_and_code(contract, CodeHash::new([0u8; 32]));
-            if !delegate_interest::record(
-                contract,
-                delegate.clone(),
-                key,
-                super::delegate_interest_release_closure(op_manager),
-                op_manager.node_identity,
-            ) {
-                // A live re-subscribe recorded this node's obligation while we
-                // were subscribing; ours is the extra refcount.
-                op_manager.interest_manager.remove_local_client(&key);
-            }
+            // `false` = a live re-subscribe recorded this node's obligation
+            // while we were subscribing; ours was the extra refcount, and
+            // `record_delegate_demand` has given it back.
+            super::record_delegate_demand(op_manager, contract, delegate, key);
             // Removed while we were subscribing? Its release ran before our
             // record, so discharge ours now. `release_pair` removes the entry
             // atomically, so if the removal's release ran after our record it

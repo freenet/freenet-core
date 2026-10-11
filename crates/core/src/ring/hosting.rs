@@ -520,6 +520,35 @@ pub struct SubscribedContractSnapshot {
 // HostingManager
 // =============================================================================
 
+/// The local subscribers of one contract: WebSocket clients, plus the number
+/// of delegates on this node holding a subscription to it (#4669).
+///
+/// `len()` and `is_empty()` count BOTH, which is the point: a delegate is a
+/// local client for demand purposes. Only the WebSocket half is addressable by
+/// `ClientId`, because only it is removed by a client disconnect. The delegate
+/// half is a count, not a set of keys: it is written only by
+/// [`HostingManager::add_delegate_subscription`] and
+/// [`HostingManager::remove_delegate_subscription`], which the delegate
+/// interest hold calls when it is recorded and when it is released
+/// (`contract::record_delegate_demand`), so the count always equals the number
+/// of holds this node has outstanding for the contract.
+#[derive(Debug, Default)]
+pub(crate) struct LocalSubscribers {
+    clients: HashSet<crate::client_events::ClientId>,
+    delegates: usize,
+}
+
+impl LocalSubscribers {
+    /// WebSocket clients plus delegates.
+    pub(crate) fn len(&self) -> usize {
+        self.clients.len() + self.delegates
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.clients.is_empty() && self.delegates == 0
+    }
+}
+
 /// Manages contract hosting and subscription state.
 ///
 /// # Subscription Model
@@ -544,9 +573,18 @@ pub(crate) struct HostingManager {
     /// directly without a parallel mirror.
     active_subscriptions: DashMap<ContractKey, SubscriptionLease>,
 
-    /// Contracts where a local client (WebSocket) is actively subscribed.
-    /// Prevents hosting cache eviction while client subscriptions exist.
-    client_subscriptions: DashMap<ContractInstanceId, HashSet<crate::client_events::ClientId>>,
+    /// Contracts a LOCAL client is subscribed to: a WebSocket client, or a
+    /// delegate running on this node (#4669). Ranks the contract in the local
+    /// tier of the eviction order and makes it `contract_in_use`.
+    ///
+    /// A delegate counts here because it acts on the user's behalf, so its
+    /// subscription is treated exactly like any other client's (Ian,
+    /// 2026-10-11). Both kinds live in ONE map so every reader of local demand
+    /// (`contract_in_use`, the eviction key, renewal, governance benefit, the
+    /// in-use set) counts them identically by construction; a second map would
+    /// have to be mirrored into each reader, and the next reader added would
+    /// silently miss it.
+    client_subscriptions: DashMap<ContractInstanceId, LocalSubscribers>,
 
     /// Unified hosting cache with byte-budget demand-ordered eviction ("fuel
     /// gauge") and TTL protection. This is the single source of truth for which
@@ -1600,7 +1638,7 @@ impl HostingManager {
         // longer needs special handling for governance: benefit is a
         // live snapshot of `local_client_count`, so a duplicate insert
         // into the set is a no-op and cannot inflate the count.
-        let is_new_for_client = entry.insert(client_id);
+        let is_new_for_client = entry.clients.insert(client_id);
         debug!(
             contract = %instance_id,
             %client_id,
@@ -1621,14 +1659,19 @@ impl HostingManager {
         let mut no_more_subscriptions = false;
 
         if let Some(mut clients) = self.client_subscriptions.get_mut(instance_id) {
-            clients.remove(&client_id);
+            clients.clients.remove(&client_id);
+            // `is_empty` counts delegates too, so a contract a delegate still
+            // holds keeps its entry when its last WebSocket client leaves.
             if clients.is_empty() {
                 no_more_subscriptions = true;
             }
         }
 
         if no_more_subscriptions {
-            self.client_subscriptions.remove(instance_id);
+            // Conditional: a delegate subscription landing after the guard was
+            // dropped must not be deleted with the entry.
+            self.client_subscriptions
+                .remove_if(instance_id, |_, subscribers| subscribers.is_empty());
         }
 
         debug!(
@@ -1641,12 +1684,57 @@ impl HostingManager {
         no_more_subscriptions
     }
 
-    /// Check if there are any client subscriptions for a contract.
+    /// Check if there are any local subscriptions for a contract: a WebSocket
+    /// client or a delegate on this node (#4669).
     pub fn has_client_subscriptions(&self, instance_id: &ContractInstanceId) -> bool {
         self.client_subscriptions
             .get(instance_id)
             .map(|clients| !clients.is_empty())
             .unwrap_or(false)
+    }
+
+    /// Register one delegate subscription to `contract` as local demand
+    /// (#4669): from here on the contract counts exactly as if a WebSocket
+    /// client were subscribed to it.
+    ///
+    /// Called only by `contract::record_delegate_demand`, paired one-for-one
+    /// with the delegate interest hold it records; the hold's release calls
+    /// [`Self::remove_delegate_subscription`]. Not idempotent, deliberately: it
+    /// counts holds, and a node holds at most one per `(contract, delegate)`.
+    pub(crate) fn add_delegate_subscription(&self, contract: &ContractKey) {
+        let mut entry = self.client_subscriptions.entry(*contract.id()).or_default();
+        entry.delegates += 1;
+        debug!(
+            contract = %contract,
+            delegates = entry.delegates,
+            "add_delegate_subscription: registered"
+        );
+    }
+
+    /// Release one delegate subscription registered by
+    /// [`Self::add_delegate_subscription`]. Saturates at zero, so a release
+    /// that finds nothing (an eviction teardown already cleared the entry) is a
+    /// no-op.
+    pub(crate) fn remove_delegate_subscription(&self, contract: &ContractKey) {
+        let became_empty = match self.client_subscriptions.get_mut(contract.id()) {
+            Some(mut entry) => {
+                entry.delegates = entry.delegates.saturating_sub(1);
+                entry.is_empty()
+            }
+            None => return,
+        };
+        if became_empty {
+            self.client_subscriptions
+                .remove_if(contract.id(), |_, subscribers| subscribers.is_empty());
+        }
+        debug!(
+            contract = %contract,
+            became_empty,
+            "remove_delegate_subscription: released"
+        );
+        // Same hook as a client disconnect: the contract may just have stopped
+        // being in use. Called with no subscription-map guard held.
+        self.maybe_record_abandonment(contract);
     }
 
     /// Remove a client from ALL its subscriptions (used when client disconnects).
@@ -1661,7 +1749,7 @@ impl HostingManager {
         let mut instance_ids_with_client: Vec<ContractInstanceId> = self
             .client_subscriptions
             .iter()
-            .filter(|entry| entry.value().contains(&client_id))
+            .filter(|entry| entry.value().clients.contains(&client_id))
             .map(|entry| *entry.key())
             .collect();
         instance_ids_with_client.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
@@ -1949,10 +2037,19 @@ impl HostingManager {
     /// would also be effectively unbounded, blocking reclamation
     /// indefinitely, which violates the cleanup-exemption rule in `AGENTS.md`
     /// (exemptions must be time-bounded). Local-client subscriptions and
-    /// downstream subscribers ARE both time-bounded and represent real
-    /// external demand: client subscriptions expire on disconnect; downstream
-    /// subscribers expire via `expire_stale_downstream_subscribers` after
-    /// `SUBSCRIPTION_LEASE_DURATION` without renewal.
+    /// downstream subscribers represent real external demand: WebSocket client
+    /// subscriptions expire on disconnect; downstream subscribers expire via
+    /// `expire_stale_downstream_subscribers` after `SUBSCRIPTION_LEASE_DURATION`
+    /// without renewal.
+    ///
+    /// A delegate's subscription counts as a local client's (#4669) and is NOT
+    /// time-bounded yet: it ends on `UnregisterDelegate`, contract removal,
+    /// notification-channel close, the per-delegate cap
+    /// (`MAX_CONTRACT_SUBSCRIPTIONS_PER_DELEGATE`) or subscriber-primary
+    /// eviction, and an inactivity horizon is the unbuilt sleep/wake half of
+    /// #4669. It is still not an eviction exemption: it orders the contract in
+    /// the local tier, and an over-budget node sheds it as a last resort
+    /// (`sync_interest_for_evicted_in_use` then releases it).
     ///
     /// The narrow case "subscribed but no local interest" is handled by the
     /// orphaned upstream subscription lapsing, not by carrying an unbounded GC
@@ -1990,7 +2087,8 @@ impl HostingManager {
     }
 
     /// The SPLIT genuine-demand counts pinning `contract`:
-    /// `(local_client_subscriptions, downstream_subscribers)`. This is the
+    /// `(local_client_subscriptions, downstream_subscribers)`, where a local
+    /// subscription is a WebSocket client's or a delegate's (#4669). This is the
     /// subscriber-primary eviction key (#4642, Ian's confirmed ordering): the
     /// cache orders victims ascending by `(local, downstream, recency_seq, key)`,
     /// so a contract THIS node's own client is subscribed to (local >= 1) is
@@ -2032,6 +2130,10 @@ impl HostingManager {
     ///   renewal loop (ring-routed via `k_closest_potentially_hosting`), NOT from
     ///   here — this PR builds no proactive re-home signal.
     /// - `client_subscriptions[key.id()]` — local WebSocket client subscriptions.
+    ///   Delegate subscriptions in the same entry are left for the consumer,
+    ///   which releases their interest holds (see
+    ///   [`EvictedInUseTeardown::delegate_subscription_count`]); after that
+    ///   release the entry is gone too.
     ///   Under the fewest-`(local, downstream)` ordering a contract with LOCAL
     ///   subscriptions is only ever a victim in the all-local-subscribed extreme
     ///   (every eligible contract carries a local subscriber and the peer is still
@@ -2062,21 +2164,34 @@ impl HostingManager {
             .remove(key)
             .map(|(_, peers)| peers.into_keys().collect())
             .unwrap_or_default();
-        let local_client_count = self
-            .client_subscriptions
-            .remove(key.id())
-            .map(|(_, clients)| clients.len())
-            .unwrap_or(0);
+        // WebSocket clients are removed here. Delegate subscriptions are NOT:
+        // each is backed by a delegate interest hold, and the consumer releases
+        // those holds (`operations::release_evicted_delegate_demand`), which
+        // decrements this count through `remove_delegate_subscription` and the
+        // `InterestManager` refcount together. Zeroing the count here as well
+        // would let a concurrent delegate subscribe's increment be cancelled by
+        // a release meant for an older hold.
+        let (local_client_count, delegate_subscription_count) =
+            match self.client_subscriptions.get_mut(key.id()) {
+                Some(mut subscribers) => {
+                    let clients = std::mem::take(&mut subscribers.clients).len();
+                    (clients, subscribers.delegates)
+                }
+                None => (0, 0),
+            };
+        self.client_subscriptions
+            .remove_if(key.id(), |_, subscribers| subscribers.is_empty());
         // Drop our own upstream lease too (same as the sweep loop's belt-and-
         // suspenders `ring.unsubscribe`), so renewal section 1 won't re-drive it.
         self.unsubscribe(key);
         let had_downstream = !downstream_peers.is_empty();
         let had_client = local_client_count > 0;
-        if had_downstream || had_client {
+        if had_downstream || had_client || delegate_subscription_count > 0 {
             debug!(
                 contract = %key,
                 had_downstream,
                 had_client,
+                delegate_subscription_count,
                 "Tore down subscription state for a subscriber-primary eviction \
                  (#4642 invariant 3); disk reclamation can now proceed"
             );
@@ -2085,6 +2200,7 @@ impl HostingManager {
             key: *key,
             downstream_peers,
             local_client_count,
+            delegate_subscription_count,
         }
     }
 
@@ -6821,6 +6937,143 @@ mod tests {
             "a torn-down eviction must not be re-driven by contracts_needing_renewal, \
              got {renewal:?}"
         );
+    }
+
+    /// #4669: a delegate subscription is a LOCAL subscription, counted exactly
+    /// like a WebSocket client's by every reader of local demand: the
+    /// in-use gate, the eviction key, the in-use set, renewal, the
+    /// unsubscribe-upstream decision, freshness and governance benefit. One
+    /// delegate and one client on two contracts must read identically.
+    #[test]
+    fn a_delegate_subscription_counts_exactly_like_a_client_subscription() {
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
+        let by_delegate = make_contract_key(1);
+        let by_client = make_contract_key(2);
+        let client = crate::client_events::ClientId::next();
+        manager.add_delegate_subscription(&by_delegate);
+        manager.add_client_subscription(by_client.id(), client);
+
+        let in_use = manager.in_use_contract_ids();
+        let benefit = manager.beneficiary_counts(1.0, 0.1);
+        let renewal = manager.contracts_needing_renewal();
+        for key in [&by_delegate, &by_client] {
+            assert!(manager.contract_in_use(key));
+            assert!(manager.has_client_subscriptions(key.id()));
+            assert_eq!(manager.local_and_downstream_counts(key), (1, 0));
+            assert_eq!(manager.local_client_count(key.id()), 1);
+            assert!(in_use.contains(key.id()));
+            assert_eq!(benefit.get(key.id()), Some(&1.0));
+            assert!(
+                renewal.iter().any(|k| k.id() == key.id()),
+                "local demand with no network subscription must be renewed"
+            );
+            assert!(!manager.should_unsubscribe_upstream(key));
+            assert!(manager.is_receiving_updates(key));
+        }
+
+        // A delegate and a client on the SAME contract are two local
+        // subscribers, and either one alone keeps it in use.
+        manager.add_client_subscription(by_delegate.id(), client);
+        assert_eq!(manager.local_and_downstream_counts(&by_delegate), (2, 0));
+        manager.remove_client_subscription(by_delegate.id(), client);
+        assert!(
+            manager.contract_in_use(&by_delegate),
+            "the last WebSocket client leaving must not drop a delegate's demand"
+        );
+
+        manager.remove_delegate_subscription(&by_delegate);
+        assert!(!manager.contract_in_use(&by_delegate));
+        assert_eq!(manager.local_and_downstream_counts(&by_delegate), (0, 0));
+        assert!(!manager.in_use_contract_ids().contains(by_delegate.id()));
+        // Releasing what is not held is a no-op, never an underflow.
+        manager.remove_delegate_subscription(&by_delegate);
+        assert_eq!(manager.local_and_downstream_counts(&by_delegate), (0, 0));
+    }
+
+    /// #4669 + hosting invariant 3: a contract held only by a delegate ranks in
+    /// the LOCAL tier of the eviction order, so a zero-subscriber contract is
+    /// shed before it even when the delegate's contract is least recent; and it
+    /// is NOT pinned, so in the all-locally-subscribed extreme it is shed as the
+    /// last resort like any other locally subscribed contract (least recent
+    /// first), its teardown reports the delegate subscription, and once the
+    /// consumer releases the delegate's hold it is no longer in use.
+    #[test]
+    fn a_delegate_only_contract_ranks_local_and_is_evicted_only_as_last_resort() {
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
+        {
+            let mut cache = manager.hosting_cache.write();
+            *cache = cache::HostingCache::new(
+                200, // room for 2 contracts at 100 bytes
+                std::sync::Arc::new(crate::util::time_source::InstantTimeSrc::new()),
+            );
+        }
+        let delegated = make_contract_key(1);
+        let unsubscribed = make_contract_key(2);
+        let client_a = make_contract_key(3);
+        let client_b = make_contract_key(4);
+        let client = crate::client_events::ClientId::next();
+        manager.add_delegate_subscription(&delegated);
+        manager.add_client_subscription(client_a.id(), client);
+        manager.add_client_subscription(client_b.id(), client);
+
+        // `delegated` is the LEAST recent; `unsubscribed` is more recent.
+        manager.record_contract_access(delegated, 100, AccessType::Get, HostingCause::Other);
+        manager.record_contract_access(unsubscribed, 100, AccessType::Get, HostingCause::Other);
+        let result =
+            manager.record_contract_access(client_a, 100, AccessType::Get, HostingCause::Other);
+        assert_eq!(
+            result.evicted,
+            vec![(unsubscribed, 0)],
+            "the zero-subscriber contract is shed first even though the \
+             delegate-held one is less recent: the delegate's subscription ranks \
+             it in the local tier"
+        );
+        assert!(result.evicted_in_use_teardown.is_empty());
+        assert!(manager.is_hosting_contract(&delegated));
+
+        // Every held contract is now locally subscribed, and the next arrival
+        // puts the node over budget. Ties break by recency, so the delegate's
+        // contract, least recent, is the last-resort victim.
+        let result =
+            manager.record_contract_access(client_b, 100, AccessType::Get, HostingCause::Other);
+        assert_eq!(
+            result.evicted,
+            vec![(delegated, 0)],
+            "a delegate subscription orders its contract last, it does not pin \
+             it: with nothing lower-ranked left, it is shed"
+        );
+        assert_eq!(result.evicted_in_use, vec![delegated]);
+        let teardown = result
+            .evicted_in_use_teardown
+            .iter()
+            .find(|t| t.key == delegated)
+            .expect("the shed delegate-held contract is torn down");
+        assert_eq!(teardown.local_client_count, 0);
+        assert_eq!(
+            teardown.delegate_subscription_count, 1,
+            "the teardown must report the delegate subscription so the consumer \
+             releases its hold"
+        );
+        assert!(!manager.is_hosting_contract(&delegated));
+        assert!(!manager.is_subscribed(&delegated));
+
+        // What the consumer's hold release does
+        // (`operations::sync_interest_for_evicted_in_use`).
+        manager.remove_delegate_subscription(&delegated);
+        assert!(
+            !manager.contract_in_use(&delegated),
+            "after the hold is released the shed contract is not in use, so \
+             disk reclamation proceeds"
+        );
+        assert!(
+            !manager
+                .contracts_needing_renewal()
+                .iter()
+                .any(|k| k.id() == delegated.id()),
+            "a shed delegate-held contract must not be re-driven by renewal"
+        );
+        assert!(manager.contract_in_use(&client_a));
+        assert!(manager.contract_in_use(&client_b));
     }
 
     /// Removing from an untracked contract is a noop; other contracts unaffected.

@@ -2056,11 +2056,7 @@ async fn cache_contract_locally(
     // `peer_contracts` / `local_client_count` entries survive and mis-target
     // UPDATE broadcasts / inflate upstream interest counts (PR #4734 Fix 1).
     for teardown in &access_result.evicted_in_use_teardown {
-        op_manager.interest_manager.remove_evicted_in_use(
-            &teardown.key,
-            &teardown.downstream_peers,
-            teardown.local_client_count,
-        );
+        crate::operations::sync_interest_for_evicted_in_use(op_manager, teardown);
     }
 
     let mut removed_contracts = Vec::new();
@@ -6197,9 +6193,10 @@ mod tests {
             "GET eviction handler must consume access_result.evicted_in_use_teardown"
         );
         assert!(
-            body.contains("remove_evicted_in_use"),
-            "GET eviction handler must call interest_manager.remove_evicted_in_use \
-             to sync the InterestManager after a subscribed eviction"
+            body.contains("operations::sync_interest_for_evicted_in_use("),
+            "GET eviction handler must call operations::sync_interest_for_evicted_in_use \
+             to sync the InterestManager (and release delegate demand) after a \
+             subscribed eviction"
         );
     }
 
