@@ -485,12 +485,8 @@ mod tests {
         );
         // The live path took its refcount and recorded it.
         op.interest_manager.add_local_client(&key);
-        assert!(delegate_interest::record(
-            contract,
-            delegate.clone(),
-            key,
-            crate::contract::delegate_interest_release_closure(&op),
-            op.node_identity,
+        assert!(crate::contract::record_delegate_demand(
+            &op, contract, &delegate, key
         ));
         assert_eq!(
             reestablish_one(&op, contract, &delegate).await,

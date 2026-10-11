@@ -2180,7 +2180,15 @@ impl HostingManager {
         // one whose increment lands before the release and whose hold lands
         // after keeps both, so the contract stays in use with no cached copy
         // until that delegate's subscription ends. Both windows are inside one
-        // task's eviction handling.
+        // task's eviction handling. A wider window of the same shape: a
+        // delegate subscribing through the local-state branch after the
+        // eviction but before the (fire-and-forget) reclamation registers
+        // demand for a contract with state on disk and no cache entry, so it
+        // is in use, not rankable for eviction, and its reclamation is
+        // re-queued until that delegate's subscription ends. The same
+        // client-subscription-only shape `phantom_in_use_count` already
+        // describes for WebSocket clients, bounded per delegate by
+        // `MAX_CONTRACT_SUBSCRIPTIONS_PER_DELEGATE`.
         let (local_client_count, delegate_subscription_count) =
             match self.client_subscriptions.get_mut(key.id()) {
                 Some(mut subscribers) => {

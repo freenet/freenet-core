@@ -287,9 +287,15 @@ pub(crate) fn release_contract(contract: &ContractInstanceId) {
 /// would also discharge holds other in-process nodes took on their own
 /// `InterestManager`s, for a contract they did not evict.
 ///
-/// The subscription-registry hook is untouched, so the delegate is still
-/// notified if the contract's state is committed again; only its demand is
-/// given back, the same as a WebSocket client's is on this path.
+/// Only the demand is given back here; the subscription-registry entry is not
+/// touched. What happens to it next depends on the reclamation that follows:
+/// normally `ContractStore::remove_contract` reclaims the contract and removes
+/// the in-memory registry entry, so the delegate is silently unsubscribed until
+/// the next boot restores its persisted row. If the contract is re-hosted
+/// before reclamation runs, the entry survives and the delegate keeps being
+/// notified, but with no hold it counts as zero demand until it re-subscribes.
+/// Either way the delegate is not told, the same last-resort outcome a
+/// WebSocket client's subscription has on this path.
 pub(crate) fn release_contract_for_node(contract: &ContractInstanceId, node: NodeIdentity) {
     let mut discharged = Vec::new();
     DELEGATE_INTEREST_HOLDS.retain(|(id, _), holds| {

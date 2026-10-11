@@ -4614,8 +4614,9 @@ impl Ring {
 
     /// Whether at least one LOCAL client (a WebSocket client or a delegate on
     /// this node, #4669) is currently subscribed to `contract` (real local
-    /// demand, distinct from downstream peer subscribers). Used by the reconcile input-builder (keystone step-2,
-    /// #4642) for `ReconcileInputs::has_local_client`.
+    /// demand, distinct from downstream peer subscribers). Used by the
+    /// reconcile input-builder (keystone step-2, #4642) for
+    /// `ReconcileInputs::has_local_client`.
     pub(crate) fn has_client_subscriptions(&self, contract: &ContractKey) -> bool {
         self.hosting_manager.has_client_subscriptions(contract.id())
     }
