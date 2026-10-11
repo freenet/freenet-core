@@ -164,19 +164,25 @@ impl BroadcastSpacing {
         peer: &PeerKey,
     ) -> Result<SendClaim, Duration> {
         let key = (*contract, peer.clone());
-        if let Some(wait) = self.remaining(contract, peer) {
-            return Err(wait);
-        }
+        // Claim first, then check the interval. A releasing claim stamps
+        // before it releases, so whoever wins the claim afterwards is sure to
+        // see the stamp; checking first could read the pair as free just
+        // before an in-flight send stamps and releases it.
         match self.in_flight.entry(key.clone()) {
-            dashmap::mapref::entry::Entry::Occupied(_) => Err(self.spacing),
+            dashmap::mapref::entry::Entry::Occupied(_) => return Err(self.spacing),
             dashmap::mapref::entry::Entry::Vacant(slot) => {
                 slot.insert(());
-                Ok(SendClaim {
-                    spacing: self.clone(),
-                    key,
-                })
             }
         }
+        if let Some(wait) = self.remaining(contract, peer) {
+            // Not a send: release without stamping.
+            self.in_flight.remove(&key);
+            return Err(wait);
+        }
+        Ok(SendClaim {
+            spacing: self.clone(),
+            key,
+        })
     }
 
     fn prune(&self, now: Instant) {
@@ -276,7 +282,9 @@ mod tests {
             "\n    }\n}\n",
         );
         for needle in [
-            "op_manager.broadcast_spacing.try_begin(key.id(), &peer_key)",
+            // Bound to a named variable, so the claim lives to the end of the
+            // iteration; `let _ =` would drop it at once and disarm it.
+            "let _claim = match op_manager.broadcast_spacing.try_begin(key.id(), &peer_key)",
             "Self::broadcast_held_legs(",
         ] {
             assert!(
@@ -293,8 +301,10 @@ mod tests {
             "\n    }\n",
         );
         assert!(
-            heal.contains("op_manager.broadcast_spacing.try_begin(key.id(), &peer_key)"),
-            "the simulation heal path must apply the spacing"
+            heal.contains("op_manager.broadcast_spacing.try_begin(key.id(), &peer_key)")
+                && heal.contains("Ok(_claim) =>"),
+            "the simulation heal path must apply the spacing and hold the claim \
+             across its send"
         );
     }
 
