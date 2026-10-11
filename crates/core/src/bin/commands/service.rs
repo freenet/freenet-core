@@ -2379,12 +2379,12 @@ echo "RC=$?"
         comm: &'a str,
         /// What `ps -o args=` prints for it.
         args: &'a str,
-        /// Its environment, one `NAME=value` per entry.
-        env: &'a [&'a str],
+        /// Its environment, one `NAME=value` per entry. `None` = unreadable.
+        env: Option<&'a [&'a str]>,
         /// Contents of `/proc/PID/cgroup`.
         cgroup: &'a str,
         /// What `systemctl show -p MainPID <unit of cgroup>` answers. `None` =
-        /// systemctl fails. `Some("SELF")` = this holder's own PID. A unit the
+        /// systemctl fails (for the whole run: the flag is global). `Some("SELF")` = this holder's own PID. A unit the
         /// manager does not know answers `MainPID=0`, as real systemd does.
         main_pid: Option<&'a str>,
         /// The holder ignores SIGTERM and only dies on SIGKILL.
@@ -2410,7 +2410,7 @@ echo "RC=$?"
         ppid: Some("1"),
         comm: "freenet",
         args: "/home/u/.local/bin/freenet network",
-        env: &["HOME=/home/u", "FREENET_WS_API_ADDRESS=127.0.0.1"],
+        env: Some(&["HOME=/home/u", "FREENET_WS_API_ADDRESS=127.0.0.1"]),
         cgroup: SESSION_CGROUP,
         main_pid: Some("0"),
         ignores_term: false,
@@ -2555,8 +2555,10 @@ echo "RC=$?"
                 }
                 std::fs::write(d.join("comm"), format!("{}\n", h.comm)).unwrap();
                 std::fs::write(d.join("args"), format!("{}\n", h.args)).unwrap();
-                let environ: String = h.env.iter().map(|e| format!("{e}\0")).collect();
-                std::fs::write(d.join("environ"), environ).unwrap();
+                if let Some(env) = h.env {
+                    let environ: String = env.iter().map(|e| format!("{e}\0")).collect();
+                    std::fs::write(d.join("environ"), environ).unwrap();
+                }
                 std::fs::write(d.join("cgroup"), h.cgroup).unwrap();
                 if h.ignores_term {
                     std::fs::write(d.join("ignores_term"), "").unwrap();
@@ -2591,10 +2593,19 @@ echo "RC=$?"
                 .env("PATH", &path_env)
                 .output()
                 .expect("failed to run systemd heal harness");
+            let stderr = String::from_utf8_lossy(&out.stderr);
             assert!(
                 out.status.success(),
-                "pre-flight body exited non-zero: {}",
-                String::from_utf8_lossy(&out.stderr)
+                "pre-flight body exited non-zero: {stderr}"
+            );
+            // The only output is the per-victim journal line; anything else
+            // (e.g. `[: unexpected operator`) is a broken body that the unit's
+            // `-` prefix would hide.
+            assert!(
+                stderr
+                    .lines()
+                    .all(|l| l.starts_with("freenet pre-flight: stopping orphaned node ")),
+                "unexpected pre-flight output: {stderr}"
             );
             let sleeps = std::fs::read_to_string(fix.join("sleeps"))
                 .map(|s| s.lines().count())
@@ -2680,11 +2691,30 @@ echo "RC=$?"
                 &["CONFIG_DIR=/srv/p2"][..],
             ] {
                 assert_eq!(
-                    one(ReapCase { env, ..o }),
+                    one(ReapCase {
+                        env: Some(env),
+                        ..o
+                    }),
                     Spared,
                     "{which}: a node configured by {env:?} is a separate instance"
                 );
             }
+
+            // Only the exact variable names count, not a suffix of another.
+            assert_eq!(
+                one(ReapCase {
+                    env: Some(&["FOO_CONFIG_DIR=x", "MY_WS_API_PORT=1"]),
+                    ..o
+                }),
+                Terminated,
+                "{which}: FOO_CONFIG_DIR / MY_WS_API_PORT are not the node's settings"
+            );
+            // An environment that cannot be read errs towards sparing.
+            assert_eq!(
+                one(ReapCase { env: None, ..o }),
+                Spared,
+                "{which}: an unreadable /proc/PID/environ must not lead to a kill"
+            );
 
             // The OTHER unit's live node, and any other service's main
             // process. Under the system manager a healthy Type=simple node has
@@ -2771,6 +2801,25 @@ echo "RC=$?"
                 }),
                 Terminated,
                 "{which}: a PPID==1 leftover in this unit's own cgroup must be reaped"
+            );
+            // ...without asking the manager about its own unit at all.
+            assert_eq!(
+                one(ReapCase {
+                    cgroup: own,
+                    main_pid: None,
+                    ..o
+                }),
+                Terminated,
+                "{which}: the own-cgroup leftover must not depend on a MainPID query"
+            );
+            // A cgroup that is no service needs no query either.
+            assert_eq!(
+                one(ReapCase {
+                    main_pid: None,
+                    ..o
+                }),
+                Terminated,
+                "{which}: a session orphan must not depend on a MainPID query"
             );
 
             // A scope nested under a `.service` ancestor is not a service.

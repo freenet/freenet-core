@@ -27,6 +27,7 @@ const ORPHAN_REAP_PREFLIGHT: &str = concat!(
     "case \"$$comm\" in *freenet*) ;; *) continue ;; esac; ",
     "args=$$(ps -o args= -p \"$$pid\" 2>/dev/null); ",
     "case \"$$args\" in \"\"|*--ws-api-port*|*--config-dir*) continue ;; esac; ",
+    "[ -r /proc/$$pid/environ ] || continue; ",
     "grep -qaE \"(^|[^A-Z_])(WS_API_PORT|CONFIG_DIR)=\" /proc/$$pid/environ 2>/dev/null && continue; ",
     "cg=$$(cat /proc/$$pid/cgroup 2>/dev/null); ",
     "[ -n \"$$cg\" ] || continue; ",
@@ -39,6 +40,7 @@ const ORPHAN_REAP_PREFLIGHT: &str = concat!(
     "[ \"$$mp\" = \"$$pid\" ] && continue; ",
     "fi; ",
     "fi; ",
+    "echo \"freenet pre-flight: stopping orphaned node $$pid: $$args\" >&2; ",
     "kill -TERM \"$$pid\" 2>/dev/null && v=\"$$v $$pid\"; ",
     "done; ",
     "w=0; while [ -n \"$$v\" ] && [ $$w -lt 45 ]; do ",
@@ -537,7 +539,8 @@ Environment={fast_crash_marker}=1
 #     service's cgroup (e.g. started from cron), whose unit reports another
 #     MainPID or none (0), is still reaped. Under the system unit a leftover in
 #     this unit's own cgroup also has PPID 1 and is reaped. An unreadable /proc
-#     entry means "skip": this path errs towards not killing.
+#     entry, or no procps `ps`, means "skip": this path errs towards not killing.
+# Each victim is logged to the journal before it is signalled.
 # Known limit: on a desktop session the user manager is the child subreaper
 # for terminals it spawned, so a node orphaned there gets the manager, not
 # PID 1, as parent and is not reaped. #5187 was an SSH session (PPID 1).
