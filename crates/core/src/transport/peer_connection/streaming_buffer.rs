@@ -190,6 +190,20 @@ impl<T: TimeSource> LockFreeStreamBuffer<T> {
     /// This is the core lock-free operation. Uses atomic CAS to insert
     /// the fragment - duplicates are idempotent no-ops.
     ///
+    /// Ordering that `StreamingInboundStream::poll_next` depends on: the slot
+    /// becomes readable, THEN the contiguous frontier advances, THEN
+    /// listeners are notified. A consumer can therefore read the last
+    /// fragment before `is_complete()` turns true, and relies on the notify
+    /// that follows (#5785). `store_slot_for_test` and
+    /// `finish_insert_for_test` split this sequence for tests; keep them in
+    /// step with any change here.
+    ///
+    /// Assumes a single inserting task per buffer, which is how the transport
+    /// receive loop uses it. Two concurrent inserts of adjacent fragments
+    /// could each miss the other's slot in `advance_frontier` under the
+    /// language memory model, because the slot CAS and the frontier's slot
+    /// load are not `SeqCst`.
+    ///
     /// # Arguments
     ///
     /// * `fragment_number` - 1-indexed fragment number (first fragment is 1)

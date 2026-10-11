@@ -690,6 +690,11 @@ impl Stream for StreamingInboundStream {
                     // Notified — clear listener and re-check buffer inline
                     // (avoids wake_by_ref spin-loop).
                     self.listener = None;
+                    // Not required for correctness: every condition only goes
+                    // from false to true, so the recheck after the fresh
+                    // listen() below catches anything this one would. It saves
+                    // arming a listener. The one below is the one that must
+                    // stay.
                     if let Some(ready) = self.recheck(next_idx) {
                         return ready;
                     }
@@ -1091,6 +1096,46 @@ mod tests {
         stream.before_rearm_listen =
             Some(Box::new(move || finisher.buffer.finish_insert_for_test()));
         assert_eq!(Pin::new(&mut stream).poll_next(&mut cx), Poll::Ready(None));
+        assert!(
+            stream.before_rearm_listen.is_none(),
+            "race hook did not run"
+        );
+    }
+
+    /// #5785: a cancel() between the first-poll checks and listen() is seen
+    /// by the check after listen().
+    #[test]
+    fn test_cancellation_before_listen_is_observed() {
+        let handle = StreamHandle::new(make_stream_id(), 1);
+        let mut stream = handle.stream();
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        let canceller = handle.clone();
+        stream.before_listen = Some(Box::new(move || canceller.cancel()));
+        assert_eq!(
+            Pin::new(&mut stream).poll_next(&mut cx),
+            Poll::Ready(Some(Err(StreamError::Cancelled)))
+        );
+        assert!(stream.before_listen.is_none(), "race hook did not run");
+    }
+
+    /// #5785: a fragment inserted between the re-arm loop's checks and its
+    /// fresh listen() is yielded by the check after listen().
+    #[test]
+    fn test_rearm_fragment_before_listen_is_observed() {
+        let handle = StreamHandle::new(make_stream_id(), 1);
+        let mut stream = handle.stream();
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        assert_eq!(Pin::new(&mut stream).poll_next(&mut cx), Poll::Pending);
+        // Wake the listener without data or cancelling this consumer.
+        handle.fork().cancel();
+        let producer = handle.clone();
+        stream.before_rearm_listen = Some(Box::new(move || {
+            producer.push_fragment(1, Bytes::from_static(b"x")).unwrap();
+        }));
+        assert_eq!(
+            Pin::new(&mut stream).poll_next(&mut cx),
+            Poll::Ready(Some(Ok(Bytes::from_static(b"x"))))
+        );
         assert!(
             stream.before_rearm_listen.is_none(),
             "race hook did not run"

@@ -4027,8 +4027,8 @@ mod tests {
         assert_streaming_buffer_roundtrip(exact + 1, Some(metadata), 9).await;
     }
 
-    /// The incremental consumer (`stream_with_reclaim`, used by piped-stream
-    /// forwarding) reads through `take()`, which empties the slot. Reading and
+    /// The incremental consumer (`stream_with_reclaim`; it has no production
+    /// caller today, piped-stream forwarding uses `stream()`) reads through `take()`, which empties the slot. Reading and
     /// inserting interleaved is an ordering `assemble()` never sees, so it gets
     /// its own byte-identity assertion.
     #[tokio::test]
