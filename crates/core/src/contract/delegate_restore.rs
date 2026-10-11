@@ -525,11 +525,19 @@ mod tests {
             &delegate,
             op.node_identity
         ));
+        assert!(
+            op.ring.contract_in_use(&key),
+            "a restored subscription is local demand exactly like a live one (#4669)"
+        );
         // UnregisterDelegate's release path.
         delegate_interest::release_delegate(&delegate);
         assert!(
             !op.interest_manager.has_local_interest(&key),
             "the restored refcount must be released by the ordinary removal path"
+        );
+        assert!(
+            !op.ring.contract_in_use(&key),
+            "the ordinary removal path must release the restored local demand too"
         );
         cleanup(&contract, &delegate);
     }
@@ -546,18 +554,24 @@ mod tests {
             delegate_subscriptions::Durability::InMemoryOnly,
         );
         op.interest_manager.add_local_client(&key); // live path's
-        delegate_interest::record(
-            contract,
-            delegate.clone(),
-            key,
-            crate::contract::delegate_interest_release_closure(&op),
-            op.node_identity,
-        );
+        assert!(crate::contract::record_delegate_demand(
+            &op, contract, &delegate, key
+        ));
         op.interest_manager.add_local_client(&key); // restore's
         assert_eq!(
             finish_attempt::<String>(&op, contract, &delegate, Ok(())),
             Attempt::Established
         );
+        // One hold, so ONE release must clear the local demand too: a restore
+        // that kept its own hosting increment would leave the contract in use
+        // after the only hold is gone.
+        delegate_interest::release_pair(&contract, &delegate);
+        assert!(
+            !op.ring.contract_in_use(&key),
+            "the losing restore must give back its local demand, not only its \
+             interest refcount (#4669)"
+        );
+        op.interest_manager.add_local_client(&key); // re-take for the drain below
         assert_eq!(
             drain_local_clients(&op, &key),
             1,

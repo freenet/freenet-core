@@ -29,6 +29,12 @@
 //! `cleanup_contract_if_no_interest` never fires: demand nothing can retire, on
 //! the interest path #5467 exists to make trustworthy.
 //!
+//! Since #4669 a hold also carries the HOSTING half of the demand: the hold is
+//! recorded by `contract::record_delegate_demand`, which registers the
+//! subscription as a local subscriber in `HostingManager` (so it counts in
+//! `contract_in_use` and the eviction ranking exactly like a WebSocket
+//! client), and the release closure gives both halves back.
+//!
 //! # Shape, and why it is this one
 //!
 //! Each hold is **self-discharging**: it stores the `ContractKey` to release
@@ -68,8 +74,11 @@ use std::sync::Arc;
 use dashmap::DashMap;
 use freenet_stdlib::prelude::{ContractInstanceId, ContractKey, DelegateKey};
 
-/// Performs the actual `InterestManager::remove_local_client`. Type-erased so
-/// this module needs no `crate::ring` or `crate::node` dependency.
+/// Performs the actual `InterestManager::remove_local_client`, and releases the
+/// hosting-side local demand registered with the hold
+/// (`Ring::remove_delegate_subscription`, #4669); see
+/// `contract::delegate_interest_release_closure`. Type-erased so this module
+/// needs no `crate::ring` or `crate::node` dependency.
 pub type InterestRelease = Arc<dyn Fn(&ContractKey) + Send + Sync>;
 
 struct Hold {
@@ -273,7 +282,7 @@ pub(crate) fn release_contract(contract: &ContractInstanceId) {
 /// leaving other nodes' holds alone (#4669).
 ///
 /// Called when subscriber-primary eviction sheds a contract a delegate on this
-/// node is subscribed to (`operations::release_evicted_delegate_demand`). The
+/// node is subscribed to (`operations::sync_interest_for_evicted_in_use`). The
 /// eviction is per-node, so the release must be too: [`release_contract`]
 /// would also discharge holds other in-process nodes took on their own
 /// `InterestManager`s, for a contract they did not evict.

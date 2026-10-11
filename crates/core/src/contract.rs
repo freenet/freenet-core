@@ -11185,6 +11185,73 @@ mod hol_4391_tests {
         released("a single release after a refused repeat");
     }
 
+    /// #4669 + hosting invariant 3: when subscriber-primary eviction sheds a
+    /// contract a delegate holds, the eviction consumer's
+    /// `operations::sync_interest_for_evicted_in_use` must release THIS node's
+    /// delegate holds, so the contract stops being in use and disk
+    /// reclamation can proceed. Without it the contract would be shed from the
+    /// cache yet stay `contract_in_use` with its reclamation re-queued every
+    /// cycle: a pin. Another node's hold on the same pair (the in-process
+    /// multi-node harness) must survive.
+    #[tokio::test]
+    async fn eviction_sync_releases_this_nodes_delegate_demand() {
+        use crate::wasm_runtime::delegate_interest;
+        use freenet_stdlib::prelude::CodeHash;
+
+        let _guard = TEST_GUARD.lock().await;
+        let (op_manager, _guards) = build_op_manager("d4669-evict").await;
+        let dkey = DelegateKey::new([0x4A; 32], CodeHash::new([0x4A; 32]));
+        let key = ContractKey::from_id_and_code(
+            freenet_stdlib::prelude::ContractInstanceId::new([0x4B; 32]),
+            CodeHash::new([0x4B; 32]),
+        );
+        op_manager.interest_manager.add_local_client(&key);
+        assert!(record_delegate_demand(&op_manager, *key.id(), &dkey, key));
+        // Another in-process node holding the same pair.
+        let other_node = op_manager.node_identity.wrapping_add(1_000_000);
+        let other_released = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = other_released.clone();
+        delegate_interest::record(
+            *key.id(),
+            dkey.clone(),
+            key,
+            Arc::new(move |_k: &ContractKey| {
+                flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            }),
+            other_node,
+        );
+        assert!(op_manager.ring.contract_in_use(&key));
+
+        // What `teardown_evicted_in_use_contract` reports for a contract held
+        // only by one delegate on this node.
+        let teardown = crate::ring::EvictedInUseTeardown {
+            key,
+            downstream_peers: Vec::new(),
+            local_client_count: 0,
+            delegate_subscription_count: 1,
+        };
+        crate::operations::sync_interest_for_evicted_in_use(&op_manager, &teardown);
+
+        assert!(
+            !op_manager.ring.contract_in_use(&key),
+            "the eviction consumer must release this node's delegate demand, or \
+             the shed contract stays in use and is never reclaimed"
+        );
+        assert!(!op_manager.interest_manager.has_local_interest(&key));
+        assert!(!delegate_interest::holds(
+            key.id(),
+            &dkey,
+            op_manager.node_identity
+        ));
+        assert!(
+            delegate_interest::holds(key.id(), &dkey, other_node)
+                && !other_released.load(std::sync::atomic::Ordering::SeqCst),
+            "another node's hold on the same pair must not be released by this \
+             node's eviction"
+        );
+        delegate_interest::release_delegate(&dkey);
+    }
+
     /// #5542 findings M4 and N2, together, because they are two halves of one
     /// branch and neither was covered.
     ///

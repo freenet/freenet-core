@@ -849,7 +849,7 @@ pub struct EvictedInUseTeardown {
     /// (#4669). Unlike the two fields above these were NOT removed by the
     /// teardown: each is backed by a delegate interest hold, and the consumer
     /// releases this node's holds for the contract
-    /// (`operations::release_evicted_delegate_demand`). The release decrements
+    /// (`operations::sync_interest_for_evicted_in_use`). The release decrements
     /// both the hosting-side count and the `InterestManager` refcount, so
     /// `contract_in_use` is false before reclamation, exactly as for a client.
     pub delegate_subscription_count: usize,

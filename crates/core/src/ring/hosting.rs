@@ -1633,7 +1633,10 @@ impl HostingManager {
         client_id: crate::client_events::ClientId,
     ) -> AddClientSubscriptionResult {
         let mut entry = self.client_subscriptions.entry(*instance_id).or_default();
-        let is_first_client = entry.is_empty();
+        // "First" WebSocket client: `hosting_started` telemetry keys on this,
+        // and delegates do not emit it, so a delegate already holding the
+        // contract must not suppress it.
+        let is_first_client = entry.clients.is_empty();
         // Idempotent re-subscribe (same client + same contract) no
         // longer needs special handling for governance: benefit is a
         // live snapshot of `local_client_count`, so a duplicate insert
@@ -2166,11 +2169,18 @@ impl HostingManager {
             .unwrap_or_default();
         // WebSocket clients are removed here. Delegate subscriptions are NOT:
         // each is backed by a delegate interest hold, and the consumer releases
-        // those holds (`operations::release_evicted_delegate_demand`), which
-        // decrements this count through `remove_delegate_subscription` and the
-        // `InterestManager` refcount together. Zeroing the count here as well
-        // would let a concurrent delegate subscribe's increment be cancelled by
-        // a release meant for an older hold.
+        // this node's holds on the contract
+        // (`operations::sync_interest_for_evicted_in_use`), which decrements
+        // this count through `remove_delegate_subscription` and the
+        // `InterestManager` refcount together, one decrement per hold. So the
+        // count and the holds cannot drift apart, which zeroing the count here
+        // would allow. What is NOT protected: a delegate subscribe that records
+        // a hold between this teardown and the consumer's release loses it to
+        // that release (its demand is shed with the contract, consistently);
+        // one whose increment lands before the release and whose hold lands
+        // after keeps both, so the contract stays in use with no cached copy
+        // until that delegate's subscription ends. Both windows are inside one
+        // task's eviction handling.
         let (local_client_count, delegate_subscription_count) =
             match self.client_subscriptions.get_mut(key.id()) {
                 Some(mut subscribers) => {
@@ -6950,6 +6960,10 @@ mod tests {
         let by_delegate = make_contract_key(1);
         let by_client = make_contract_key(2);
         let client = crate::client_events::ClientId::next();
+        // Renewal section 2 re-subscribes only contracts in the hosting cache.
+        for key in [by_delegate, by_client] {
+            manager.record_contract_access(key, 100, AccessType::Get, HostingCause::Other);
+        }
         manager.add_delegate_subscription(&by_delegate);
         manager.add_client_subscription(by_client.id(), client);
 
@@ -7074,6 +7088,55 @@ mod tests {
         );
         assert!(manager.contract_in_use(&client_a));
         assert!(manager.contract_in_use(&client_b));
+    }
+
+    /// #4669: a contract held only by a delegate is NOT a cost-eviction
+    /// candidate, exactly as a client-subscribed one is not (invariant 3:
+    /// cost candidacy requires no local subscription). Mirrors
+    /// `cost_pressure_sweep_evicts_zero_subscriber_offender_not_subscribed`
+    /// with the subscriber being a delegate.
+    #[tokio::test]
+    async fn cost_pressure_sweep_does_not_evict_a_delegate_held_contract() {
+        let clock = crate::util::time_source::SharedMockTimeSource::new();
+        let manager = HostingManager::with_time_source(
+            DEFAULT_HOSTING_BUDGET_BYTES,
+            std::sync::Arc::new(clock.clone()),
+        );
+        let junk = make_contract_key(1);
+        let delegated = make_contract_key(2);
+        manager.record_contract_access(junk, 121, AccessType::Put, HostingCause::Other);
+        manager.record_contract_access(delegated, 121, AccessType::Put, HostingCause::Other);
+        manager.add_delegate_subscription(&delegated);
+        clock.advance_time(cache::COST_RATE_MIN_WINDOW + Duration::from_secs(1));
+
+        let axes = vec![CostAxisPressure {
+            axis: "exec_cpu_micros_per_sec",
+            total_rate: 100_000.0,
+            floor: cache::EXEC_CPU_PRESSURE_FLOOR_MICROS_PER_SEC,
+            rates: [(*junk.id(), 41_000.0), (*delegated.id(), 58_000.0)]
+                .into_iter()
+                .collect(),
+        }];
+        let result = manager.sweep_expired_hosting_with_cost(&axes);
+        let expired_keys: Vec<ContractKey> = result.expired.iter().map(|(k, _)| *k).collect();
+        assert_eq!(
+            expired_keys,
+            vec![junk],
+            "the delegate-held contract carries a local subscription, so it is \
+             not a cost candidate even though it holds the larger cost share"
+        );
+        assert!(manager.is_hosting_contract(&delegated));
+
+        // Past the termination grace window (recency reset at subscription
+        // termination, invariant 3), as in the sibling test.
+        manager.remove_delegate_subscription(&delegated);
+        clock.advance_time(cache::COST_RATE_MIN_WINDOW + Duration::from_secs(1));
+        let again = manager.sweep_expired_hosting_with_cost(&axes);
+        assert!(
+            again.expired.iter().any(|(k, _)| *k == delegated),
+            "once the delegate's subscription is gone it is an ordinary \
+             zero-demand cost candidate"
+        );
     }
 
     /// Removing from an untracked contract is a noop; other contracts unaffected.

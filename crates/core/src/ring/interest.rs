@@ -994,7 +994,8 @@ pub struct LocalInterest {
     /// Whether we're hosting this contract (in our local cache).
     pub hosting: bool,
 
-    /// Number of local WebSocket clients subscribed to this contract.
+    /// Number of local subscribers: WebSocket clients and delegate
+    /// subscriptions on this node (#5615, #4669).
     pub local_client_count: usize,
 
     /// Number of downstream peers subscribed through us.
