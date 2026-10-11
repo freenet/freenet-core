@@ -73,12 +73,15 @@
 #
 # KNOWN DIVERGENCE -- the #3967 stale-orphan pre-flight is NOT ported.
 #
-#     The unit runs an `ExecStartPre` before every start that finds whoever
-#     holds the port and kills it IF it is an init-adopted orphan (PPID==1)
-#     running a DIFFERENT `Freenet version:` than the binary about to launch.
-#     Without it, an orphaned `freenet network` on an OLD binary can hold the
-#     port forever: the node exits 43 on every start, this wrapper stands down,
-#     and the orphan keeps serving stale assets with nothing to dislodge it.
+#     The unit runs an `ExecStartPre` before every start that kills an
+#     init-adopted orphan (PPID==1) `freenet network` of the same user,
+#     whatever its version (#5187), unless it is a separately configured
+#     instance or another systemd service's main process (see
+#     ORPHAN_REAP_PREFLIGHT in crates/core/src/bin/commands/service/linux.rs).
+#     Without it, an orphaned `freenet network` can hold the port forever: the
+#     node exits 43 on every start, this wrapper stands down, and the orphan
+#     runs unsupervised (on an OLD binary, serving stale assets) with nothing
+#     to dislodge it.
 #     That is a real, unattended-recovery gap and it is recorded here rather
 #     than papered over -- an earlier version of this file asserted the port
 #     holder "is healthy", which is precisely the case #3967 says it is not.
