@@ -1127,3 +1127,39 @@ Simulation guard: `test_evicted_contracts_keep_no_interest_records` asserts
 that no peer keeps records for a contract it neither hosts nor uses, and that
 reconciliation actually dropped some, so a run in which no records formed
 cannot pass.
+
+
+## Two broadcasts of one contract to one peer, back to back
+
+**Every receiver rate-limits UPDATE traffic per (sender, contract) pair.** Since
+0.2.133 that is one broadcast per 20 ms. A drop there is repaired by a
+`ResyncRequest`, and that repair is capped per contract on both sides (#5843).
+Older peers allow one UPDATE of any kind per 100 ms and never repair a drop. So a
+sender that puts two broadcasts of one contract on the wire to one peer within
+that window loses the second at that peer until anti-entropy. That takes 5 to 75
+minutes, and nothing reports an error.
+
+#5842 is the instance. A host relayed a received update and committed its own
+client update a few milliseconds later. Harvest's seller tab does this on every
+floor change. The production broadcast queue even ran two sends for one pair
+concurrently. Every relayer of the second update hit the same limit, because
+each of them had just relayed the first.
+
+**The rule:** the sender spaces broadcasts per (contract, peer). This is
+`node/network_bridge/broadcast_spacing.rs`, 150 ms, measured from the end of
+the previous send. A held send keeps its queue entry, so newer state replaces
+it, and a timer sends it, never "the next enqueue". Both fan-out paths (the
+production queue and the simulation's inline copy) must apply it, and
+`both_fan_out_paths_apply_the_spacing` pins that.
+
+**The sibling trap, same incident: a summary recorded for a peer must describe
+the bytes that peer was sent.** A queued full-state leg sent the queued state
+S1, but sent and cached the summary of whatever was stored when the leg ran
+(S2). The sender then believed the peer held S2, and S2's own fan-out skipped
+it as converged. Full-state legs now take state and summary from ONE
+contract-handler turn (`GetStateAndSummaryQuery`). Two separate reads can
+straddle a commit.
+
+Audit question when touching the fan-out: *can this path send twice to one
+peer for one contract inside the receiver's budget, and does every summary it
+records come from the same read as the bytes it sent?*

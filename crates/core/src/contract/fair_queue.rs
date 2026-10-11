@@ -648,6 +648,7 @@ fn extract_contract_id(event: &ContractHandlerEvent) -> Option<ContractInstanceI
         | ContractHandlerEvent::UpdateQuery { key, .. }
         | ContractHandlerEvent::GetSummaryQuery { key, .. }
         | ContractHandlerEvent::GetDeltaQuery { key, .. }
+        | ContractHandlerEvent::GetStateAndSummaryQuery { key }
         // EvictContract is routed to its contract's per-key queue so disk
         // reclamation is serialized with any other in-flight ops on that
         // key (e.g. a concurrent GET/PUT touching the same contract).
@@ -672,6 +673,7 @@ fn extract_contract_id(event: &ContractHandlerEvent) -> Option<ContractInstanceI
         | ContractHandlerEvent::QuerySubscriptionsResponse
         | ContractHandlerEvent::GetSummaryResponse { .. }
         | ContractHandlerEvent::GetDeltaResponse { .. }
+        | ContractHandlerEvent::GetStateAndSummaryResponse { .. }
         | ContractHandlerEvent::ClientDisconnect { .. } => None,
     }
 }

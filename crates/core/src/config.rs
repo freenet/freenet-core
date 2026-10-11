@@ -4854,6 +4854,8 @@ std::thread_local! {
         const { std::cell::Cell::new(0) };
     /// Fan-out legs dropped because the target was the delivering peer (#5147).
     static GLOBAL_BROADCAST_SENDER_SKIPS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// Simulation fan-out legs held back by the per-pair spacing (#5842).
+    static GLOBAL_BROADCAST_LEGS_SPACED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     /// Inbound broadcast payloads that reached a terminal classification
     /// (#5147). Denominator for the duplicate-delivery ratio.
     static GLOBAL_BROADCAST_DELIVERIES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
@@ -4973,6 +4975,7 @@ impl GlobalTestMetrics {
         GLOBAL_FANOUT_SUMMARY_SKIPS.with(|c| c.set(0));
         GLOBAL_BROADCAST_TARGETS_SUPPRESSED.with(|c| c.set(0));
         GLOBAL_BROADCAST_SENDER_SKIPS.with(|c| c.set(0));
+        GLOBAL_BROADCAST_LEGS_SPACED.with(|c| c.set(0));
         GLOBAL_BROADCAST_DELIVERIES.with(|c| c.set(0));
         GLOBAL_REDUNDANT_BROADCAST_DELIVERIES.with(|c| c.set(0));
         GLOBAL_FULL_STATE_SENDS.with(|c| c.set(0));
@@ -5150,6 +5153,18 @@ impl GlobalTestMetrics {
     /// amounts of work when they did not.
     pub fn record_broadcast_sender_skipped() {
         GLOBAL_BROADCAST_SENDER_SKIPS.with(|c| c.set(c.get() + 1));
+    }
+
+    /// Records one simulation fan-out leg held back because its
+    /// `(contract, peer)` was sent to inside the spacing interval (#5842).
+    /// Counted by the check that holds it.
+    pub fn record_broadcast_leg_spaced() {
+        GLOBAL_BROADCAST_LEGS_SPACED.with(|c| c.set(c.get() + 1));
+    }
+
+    /// Fan-out legs held back by the per-pair spacing since reset.
+    pub fn broadcast_legs_spaced() -> u64 {
+        GLOBAL_BROADCAST_LEGS_SPACED.with(|c| c.get())
     }
 
     /// Fan-out legs dropped because the target was the delivering peer.
