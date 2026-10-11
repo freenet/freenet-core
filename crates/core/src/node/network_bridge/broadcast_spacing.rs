@@ -358,6 +358,9 @@ mod tests {
         for i in 0..MAX_TRACKED {
             spacing.record_sent(&contract((i % 251) as u8), &peer());
         }
+        // One more record at the ceiling triggers a prune that keeps all
+        // 16384; doubling that unclamped would set the trigger out of reach.
+        spacing.record_sent(&contract(1), &peer());
         assert!(spacing.prune_at.load(Ordering::Relaxed) <= MAX_TRACKED);
         // Once they expire, the next record must still prune them.
         clock.advance_time(BROADCAST_PEER_SPACING);
