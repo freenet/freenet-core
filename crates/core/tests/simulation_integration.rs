@@ -21271,7 +21271,7 @@ fn log_join_traces(report: &SaturatedJoinReport) {
                                     .find(|(l, _)| l == to_label)
                                     .is_some_and(|(_, t)| {
                                         t.notes.iter().any(|n| {
-                                            n.what.starts_with(&needle)
+                                            n.what.starts_with(needle)
                                                 && n.what.contains(&tx_needle)
                                         })
                                     });
