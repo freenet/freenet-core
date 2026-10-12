@@ -506,6 +506,16 @@ impl EventKind {
         )
     }
 
+    /// Returns the reason string if this is a `ConnectEvent::Rejected`,
+    /// `None` for all other events.
+    #[allow(clippy::wildcard_enum_match_arm)]
+    pub fn connect_rejected_reason(&self) -> Option<&str> {
+        match self {
+            EventKind::Connect(ConnectEvent::Rejected { reason, .. }) => Some(reason),
+            _ => None,
+        }
+    }
+
     /// Returns the joiner's public key if this is a
     /// `ConnectEvent::RequestReceived`, `None` for all other events. Lets a
     /// simulation attribute CONNECT hops to the peer that asked (#5858).

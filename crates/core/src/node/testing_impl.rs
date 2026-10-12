@@ -476,7 +476,13 @@ fn fault_injection_delivery_decision(
                 inj.stats.messages_dropped_unreachable_pair += 1;
                 return PacketDeliveryDecision::Drop;
             }
-            if let Some(delay) = inj.config.pair_latency(&from, &to) {
+            if let Some(base) = inj.config.pair_latency(&from, &to) {
+                let jitter = inj.config.latency_jitter;
+                let delay = if jitter.is_zero() {
+                    base
+                } else {
+                    base + inj.rng.gen_duration(Duration::ZERO..jitter)
+                };
                 inj.stats.messages_delayed_delivered += 1;
                 inj.stats.total_latency_nanos += delay.as_nanos() as u64;
                 return PacketDeliveryDecision::DelayedDelivery(delay);
