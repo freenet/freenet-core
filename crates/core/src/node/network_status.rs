@@ -522,13 +522,17 @@ pub struct BootstrapChurnStats {
     /// `min_connections`, so it isolates slow *first* contact from slow
     /// fill-out.
     pub time_to_first_ring_connection: Option<Duration>,
-    /// Number of self-initiated CONNECT attempts (`start_client_connect`
-    /// calls, including cached-peer reconnects and gateway joins) issued
-    /// before the first ring connection. Frozen once
-    /// `time_to_first_ring_connection` is set, so it counts attempts and
-    /// not process uptime. The attempt that produces the first connection is
-    /// included (it was issued before the connection existed); attempts
-    /// issued after that moment are not.
+    /// Number of join CONNECTs (`join_ring_request` calls that reached the
+    /// point of issuing a CONNECT: cached-peer reconnects, the join loop's
+    /// gateway dials, and the zero-connection maintenance retry) issued before
+    /// the first ring connection. NOT counted: the gateway version probe,
+    /// lattice-probe CONNECTs and ring-acquisition CONNECTs (none of which is
+    /// an attempt to get a first connection), `join_ring_request` calls
+    /// refused before issuing (`UnwantedConnection`), and anything on a
+    /// gateway node. Frozen once `time_to_first_ring_connection` is set, so it
+    /// counts attempts and not process uptime. The attempt that produces the
+    /// first connection is included (it was issued before the connection
+    /// existed); attempts issued after that moment are not.
     pub connect_attempts_before_first_connection: u64,
     /// Below-threshold join-loop rounds that dialled gateways this node was
     /// not yet connected to.
@@ -1620,35 +1624,56 @@ pub fn record_bootstrap_min_connections_reached() {
 /// instrumentation), measured from the [`PROCESS_START`] anchor like
 /// [`record_bootstrap_min_connections_reached`].
 ///
-/// Called from every successful ring add, so it runs on each new connection;
-/// only the first call per process has any effect. Not reset when connections
-/// later drop to zero: a node that loses everything and rejoins is a
-/// reconnect, not a slow first join.
+/// Called from every successful ring add on a non-gateway node (the caller
+/// gates on `Ring::is_gateway`: a gateway's "first connection" is whenever a
+/// joiner happens to dial it, which says nothing about join latency). Only the
+/// first call per process has any effect, and once it is set later calls take
+/// only the shared read lock. Not reset when connections later drop to zero: a
+/// node that loses everything and rejoins is a reconnect, not a slow first
+/// join.
 pub fn record_bootstrap_first_ring_connection() {
+    let Some(status) = NETWORK_STATUS.get() else {
+        return;
+    };
+    if status.read().is_ok_and(|s| {
+        s.bootstrap_churn_stats
+            .time_to_first_ring_connection
+            .is_some()
+    }) {
+        return;
+    }
     let elapsed = since_process_start();
-    if let Some(status) = NETWORK_STATUS.get() {
-        if let Ok(mut s) = status.write() {
-            if s.bootstrap_churn_stats
-                .time_to_first_ring_connection
-                .is_none()
-            {
-                s.bootstrap_churn_stats.time_to_first_ring_connection = Some(elapsed);
-            }
+    if let Ok(mut s) = status.write() {
+        if s.bootstrap_churn_stats
+            .time_to_first_ring_connection
+            .is_none()
+        {
+            s.bootstrap_churn_stats.time_to_first_ring_connection = Some(elapsed);
         }
     }
 }
 
-/// Record one self-initiated CONNECT attempt (issue #5858 instrumentation).
-/// Counted only until the first ring connection is recorded, so the total is
-/// the number of attempts it took to get a first connection.
+/// Record one join CONNECT attempt (issue #5858 instrumentation): called from
+/// `join_ring_request` just before it issues the CONNECT, on non-gateway nodes
+/// only. Counted only until the first ring connection is recorded, so the
+/// total is the number of attempts it took to get a first connection; once
+/// that is set, calls take only the shared read lock.
 pub fn record_bootstrap_connect_attempt() {
-    if let Some(status) = NETWORK_STATUS.get() {
-        if let Ok(mut s) = status.write() {
-            let b = &mut s.bootstrap_churn_stats;
-            if b.time_to_first_ring_connection.is_none() {
-                b.connect_attempts_before_first_connection =
-                    b.connect_attempts_before_first_connection.saturating_add(1);
-            }
+    let Some(status) = NETWORK_STATUS.get() else {
+        return;
+    };
+    if status.read().is_ok_and(|s| {
+        s.bootstrap_churn_stats
+            .time_to_first_ring_connection
+            .is_some()
+    }) {
+        return;
+    }
+    if let Ok(mut s) = status.write() {
+        let b = &mut s.bootstrap_churn_stats;
+        if b.time_to_first_ring_connection.is_none() {
+            b.connect_attempts_before_first_connection =
+                b.connect_attempts_before_first_connection.saturating_add(1);
         }
     }
 }

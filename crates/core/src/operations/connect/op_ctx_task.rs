@@ -160,9 +160,6 @@ pub(crate) async fn start_client_connect(
     // `start_relay_connect` and are deliberately NOT counted (#4348). Registered
     // before the first send below so it precedes any reply or completion.
     op_manager.ring.live_tx_tracker.register_acquisition(tx);
-    // #5858: counted toward `bootstrap_connect_attempts_before_first_connection`
-    // (a no-op once this node has its first ring connection).
-    crate::node::network_status::record_bootstrap_connect_attempt();
 
     // Snapshot whether the joiner knows its own external address before
     // contacting the gateway. Mirrors legacy `JoinerState`'s

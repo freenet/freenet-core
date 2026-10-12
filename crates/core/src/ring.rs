@@ -268,6 +268,37 @@ struct RouteFailureCauseCounts {
     originator_timeout: std::sync::atomic::AtomicU64,
 }
 
+/// Copy the joiner/acceptor bootstrap counters (#4787, #5858) onto a router
+/// snapshot. A free function so the hand-mirrored field mapping is unit-tested
+/// (`apply_bootstrap_churn_stats_maps_each_field`): a swapped or dropped
+/// assignment compiles cleanly and emits a plausible wrong number.
+fn apply_bootstrap_churn_stats(
+    snapshot: &mut crate::router::RouterSnapshotInfo,
+    b: &crate::node::network_status::BootstrapChurnStats,
+) {
+    snapshot.bootstrap_transient_registered = Some(b.transient_registered);
+    snapshot.bootstrap_transient_expired = Some(b.transient_expired);
+    snapshot.bootstrap_promoted_to_ring = Some(b.promoted_to_ring);
+    snapshot.bootstrap_time_to_min_connections_secs =
+        b.time_to_min_connections.map(|d| d.as_secs_f64());
+    // `Some(false)` (never bootstrapped) is a different fact from `None`
+    // (this build/collector doesn't report it) — see #4787 finding 3.
+    snapshot.bootstrap_completed = Some(b.time_to_min_connections.is_some());
+    // #5858: time to the FIRST ring connection, in ms, plus how many join
+    // CONNECT attempts it took.
+    snapshot.bootstrap_time_to_first_ring_connection_ms = b
+        .time_to_first_ring_connection
+        .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
+    snapshot.bootstrap_connect_attempts_before_first_connection =
+        Some(b.connect_attempts_before_first_connection);
+    snapshot.bootstrap_startup_rounds_connect_issued_gateway =
+        Some(b.startup_rounds_connect_issued_gateway);
+    snapshot.bootstrap_startup_rounds_connect_issued_routed =
+        Some(b.startup_rounds_connect_issued_routed);
+    snapshot.bootstrap_startup_rounds_backoff_blocked = Some(b.startup_rounds_backoff_blocked);
+    snapshot.bootstrap_startup_rounds_no_target = Some(b.startup_rounds_no_target);
+}
+
 /// Distinct peers tracked per snapshot window by [`TimeoutLabelWindow`].
 /// Labels for peers beyond it are counted, not attributed.
 const TIMEOUT_LABEL_WINDOW_MAX_PEERS: usize = 4096;
@@ -2268,29 +2299,7 @@ impl Ring {
             // Instrumentation only, no behavior change — see
             // `network_status::BootstrapChurnStats`.
             if let Some(b) = crate::node::network_status::bootstrap_churn_counts() {
-                snapshot.bootstrap_transient_registered = Some(b.transient_registered);
-                snapshot.bootstrap_transient_expired = Some(b.transient_expired);
-                snapshot.bootstrap_promoted_to_ring = Some(b.promoted_to_ring);
-                snapshot.bootstrap_time_to_min_connections_secs =
-                    b.time_to_min_connections.map(|d| d.as_secs_f64());
-                // `Some(false)` (never bootstrapped) is a different fact from
-                // `None` (this build/collector doesn't report it) — see #4787
-                // finding 3.
-                snapshot.bootstrap_completed = Some(b.time_to_min_connections.is_some());
-                // #5858: time to the FIRST ring connection, in ms, plus how
-                // many CONNECT attempts it took.
-                snapshot.bootstrap_time_to_first_ring_connection_ms = b
-                    .time_to_first_ring_connection
-                    .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
-                snapshot.bootstrap_connect_attempts_before_first_connection =
-                    Some(b.connect_attempts_before_first_connection);
-                snapshot.bootstrap_startup_rounds_connect_issued_gateway =
-                    Some(b.startup_rounds_connect_issued_gateway);
-                snapshot.bootstrap_startup_rounds_connect_issued_routed =
-                    Some(b.startup_rounds_connect_issued_routed);
-                snapshot.bootstrap_startup_rounds_backoff_blocked =
-                    Some(b.startup_rounds_backoff_blocked);
-                snapshot.bootstrap_startup_rounds_no_target = Some(b.startup_rounds_no_target);
+                apply_bootstrap_churn_stats(&mut snapshot, &b);
             }
 
             // Computed-upstream vs. stored-`is_upstream`-flag divergence counters
@@ -4142,7 +4151,11 @@ impl Ring {
                 just_became_ready: false,
             };
         }
-        crate::node::network_status::record_bootstrap_first_ring_connection();
+        // #5858: a gateway's first connection is whenever some joiner dials
+        // it, which says nothing about join latency.
+        if !self.is_gateway {
+            crate::node::network_status::record_bootstrap_first_ring_connection();
+        }
         if let Some(own_loc) = self.connection_manager.own_location().location() {
             crate::node::network_status::set_own_location(own_loc.as_f64());
         }
@@ -10999,8 +11012,24 @@ mod cost_pressure_seam_tests {
     /// split, because gating the counter on the plain `bool` — the obvious
     /// reading of a function returning `false` on rejection — would silently
     /// count almost no promotions at all.
-    #[tokio::test]
-    async fn add_connection_reporting_separates_added_from_readiness() {
+    ///
+    /// Sync wrapper: a successful add writes the process-global
+    /// `NETWORK_STATUS` (first-ring-connection telemetry, #5858), so it takes
+    /// `TEST_GLOBAL_STATE_LOCK` like every other test that can reach it; the
+    /// guard lives in this sync frame, never across an `.await`.
+    #[test]
+    fn add_connection_reporting_separates_added_from_readiness() {
+        let _lock = crate::node::network_status::TEST_GLOBAL_STATE_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build test runtime")
+            .block_on(add_connection_reporting_separates_added_from_readiness_body());
+    }
+
+    async fn add_connection_reporting_separates_added_from_readiness_body() {
         let config_args = crate::config::ConfigArgs {
             id: Some("add-conn-outcome-4787".to_string()),
             mode: Some(crate::contract::OperationMode::Local),
@@ -11086,6 +11115,70 @@ mod cost_pressure_seam_tests {
         assert!(
             added >= max,
             "expected at least {max} accepted adds, got {added}"
+        );
+    }
+
+    /// The hand-mirrored `BootstrapChurnStats` -> `RouterSnapshotInfo` mapping
+    /// (#4787, #5858). Every field gets a DISTINCT value, so a dropped or
+    /// transposed assignment fails here instead of emitting a plausible wrong
+    /// number; the not-yet-connected state must keep `None` distinct from zero.
+    #[test]
+    fn apply_bootstrap_churn_stats_maps_each_field() {
+        use crate::node::network_status::BootstrapChurnStats;
+        use arbitrary::{Arbitrary, Unstructured};
+        use std::time::Duration;
+
+        let mut u = Unstructured::new(&[0u8; 4096]);
+        let mut snapshot = crate::router::RouterSnapshotInfo::arbitrary(&mut u)
+            .expect("construct RouterSnapshotInfo for test");
+        super::apply_bootstrap_churn_stats(
+            &mut snapshot,
+            &BootstrapChurnStats {
+                transient_registered: 11,
+                transient_expired: 12,
+                promoted_to_ring: 13,
+                time_to_min_connections: Some(Duration::from_millis(14_500)),
+                time_to_first_ring_connection: Some(Duration::from_millis(2_345)),
+                connect_attempts_before_first_connection: 17,
+                startup_rounds_connect_issued_gateway: 18,
+                startup_rounds_connect_issued_routed: 19,
+                startup_rounds_backoff_blocked: 20,
+                startup_rounds_no_target: 21,
+            },
+        );
+        assert_eq!(snapshot.bootstrap_transient_registered, Some(11));
+        assert_eq!(snapshot.bootstrap_transient_expired, Some(12));
+        assert_eq!(snapshot.bootstrap_promoted_to_ring, Some(13));
+        assert_eq!(snapshot.bootstrap_time_to_min_connections_secs, Some(14.5));
+        assert_eq!(snapshot.bootstrap_completed, Some(true));
+        assert_eq!(
+            snapshot.bootstrap_time_to_first_ring_connection_ms,
+            Some(2_345),
+            "milliseconds, not seconds"
+        );
+        assert_eq!(
+            snapshot.bootstrap_connect_attempts_before_first_connection,
+            Some(17)
+        );
+        assert_eq!(
+            snapshot.bootstrap_startup_rounds_connect_issued_gateway,
+            Some(18)
+        );
+        assert_eq!(
+            snapshot.bootstrap_startup_rounds_connect_issued_routed,
+            Some(19)
+        );
+        assert_eq!(snapshot.bootstrap_startup_rounds_backoff_blocked, Some(20));
+        assert_eq!(snapshot.bootstrap_startup_rounds_no_target, Some(21));
+
+        super::apply_bootstrap_churn_stats(&mut snapshot, &BootstrapChurnStats::default());
+        assert_eq!(snapshot.bootstrap_time_to_first_ring_connection_ms, None);
+        assert_eq!(snapshot.bootstrap_time_to_min_connections_secs, None);
+        assert_eq!(snapshot.bootstrap_completed, Some(false));
+        assert_eq!(
+            snapshot.bootstrap_connect_attempts_before_first_connection,
+            Some(0),
+            "no attempts yet is a real zero, not an absent field"
         );
     }
 

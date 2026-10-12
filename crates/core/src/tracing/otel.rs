@@ -1510,6 +1510,7 @@ fn register_ring_metrics(meter: &opentelemetry::metrics::Meter, sources: RingSou
     // and does not cover this.
     let _bootstrap_time_to_first_ring_connection = meter
         .u64_observable_gauge("freenet.bootstrap.time_to_first_ring_connection_ms")
+        .with_unit("ms")
         .with_description("Milliseconds from process start to the first ring connection (#5858)")
         .with_callback(move |observer| {
             if let Some(status) = (sources.status_scalars)() {
@@ -3034,6 +3035,37 @@ mod tests {
             assert!(
                 names.contains(&expected),
                 "instrument `{expected}` produced no datapoint; exported: {names:?}"
+            );
+        }
+
+        // Values and units, not just names (#5858): the first-connection gauge
+        // is exported in MILLISECONDS from a 1500 ms fixture, and the attempts
+        // gauge carries the fixture's count verbatim.
+        {
+            use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData};
+            #[allow(clippy::wildcard_enum_match_arm)]
+            let gauge = |name: &str| -> Option<(u64, String)> {
+                exported
+                    .iter()
+                    .flat_map(|rm| rm.scope_metrics())
+                    .flat_map(|sm| sm.metrics())
+                    .find(|m| m.name() == name)
+                    .and_then(|m| match m.data() {
+                        AggregatedMetrics::U64(MetricData::Gauge(g)) => g
+                            .data_points()
+                            .next()
+                            .map(|p| (p.value(), m.unit().to_string())),
+                        _ => None,
+                    })
+            };
+            assert_eq!(
+                gauge("freenet.bootstrap.time_to_first_ring_connection_ms"),
+                Some((1500, "ms".to_string())),
+                "first-connection gauge must export milliseconds, unit `ms`"
+            );
+            assert_eq!(
+                gauge("freenet.bootstrap.connect_attempts_before_first_connection").map(|(v, _)| v),
+                Some(3)
             );
         }
 

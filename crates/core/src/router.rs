@@ -1085,9 +1085,13 @@ pub(crate) struct RouterSnapshotInfo {
     pub bootstrap_time_to_min_connections_secs: Option<f64>,
     pub bootstrap_completed: Option<bool>,
     /// Milliseconds from process start to this node's first ring connection
-    /// (#5858), recorded once. Unsampled: rides `router_snapshot` like
-    /// `bootstrap_time_to_min_connections_secs`. `None` until the first
-    /// connection exists.
+    /// (#5858), recorded once; `None` until the first connection exists, and
+    /// never reported by gateways. Lifetime value, present on every snapshot,
+    /// but only snapshots that carry `network_efficiency_v1` (the first one
+    /// ~5 minutes after start, then every 30 minutes) bypass the node-side
+    /// 10/s limiter and the collector's 5% sampler; the plain 5-minute
+    /// snapshots are subject to both and are mostly dropped under load. Read
+    /// this field from the efficiency-carrying snapshots.
     pub bootstrap_time_to_first_ring_connection_ms: Option<u64>,
     /// Self-initiated CONNECT attempts issued before that first connection
     /// (#5858); frozen once it exists.
