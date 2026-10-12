@@ -20907,8 +20907,14 @@ fn test_saturated_join_needy_ab() {
         cfg.join_stagger = Duration::ZERO;
     }
     cfg.unreachable_pair_fraction = env("SJ_UNREACHABLE").unwrap_or(0.4);
-    cfg.configure = Some(if arm == "need" { need } else { base });
+    // `need`: the mechanism as it ships (bar sent, not enforced).
+    // `needbar`: the same with the bar enforced (information only).
+    cfg.configure = Some(if arm == "base" { base } else { need });
+    // The direct runner drives every node on this thread, so a thread-local
+    // override reaches all of them.
+    freenet::dev_tool::set_requester_bar_enforced((arm == "needbar").then_some(true));
     let report = run_saturated_join(&cfg);
+    freenet::dev_tool::set_requester_bar_enforced(None);
 
     let first = report.to_first_ring();
     let reached_min = report.to_min().iter().filter(|m| m.is_some()).count();
@@ -20929,7 +20935,7 @@ fn test_saturated_join_needy_ab() {
          first_max={}|never={}/{}|reached_min={}/{}|hops_per_node_s={:.3}|\
          est_deg_end_p10/50/90/max={}/{}/{}/{}|est_deg_join_p50={}|\
          onb_admitted={}|onb_established={}|graduated={}|dropped={}|pruned={}|\
-         released_unest={}|budget_exhausted={}|bar_unmet={}|downgraded_unknown={}|\
+         released_unest={}|budget_exhausted={}|bar_unmet={}|bar_unmet_shadow={}|downgraded_unknown={}|\
          downgraded_below_floor={}|seen_short={}|seen_bar={}|admitted_self={}|\
          admitted_lattice={}|wall={:.0}s",
         cfg.unreachable_pair_fraction * 100.0,
@@ -20958,6 +20964,7 @@ fn test_saturated_join_needy_ab() {
         a.provisional_released_unestablished,
         a.rejected_onboarding_budget_exhausted,
         a.rejected_bar_unmet,
+        a.bar_unmet_not_enforced,
         a.need_downgraded_unknown_version,
         a.need_downgraded_below_floor,
         a.requests_seen_short,

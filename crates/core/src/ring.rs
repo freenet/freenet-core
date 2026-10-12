@@ -82,7 +82,7 @@ const _: () = {
     );
 };
 
-pub(crate) mod admission;
+pub mod admission;
 pub(crate) mod broadcast_coverage;
 mod broken_invariants;
 mod connection_backoff;

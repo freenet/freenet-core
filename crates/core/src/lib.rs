@@ -194,6 +194,7 @@ pub mod dev_tool {
     pub use crate::tracing::state_verifier::{StateAnomaly, StateVerifier, VerificationReport};
 
     // Per-peer join timeline recorded by the direct runner (#5858).
+    pub use ring::admission::set_requester_bar_enforced;
     pub use ring::join_timeline::{AdmissionCounts, JoinTimeline, JoinTimelineRecorder};
 
     // Re-export topology registry for subscription validation in tests

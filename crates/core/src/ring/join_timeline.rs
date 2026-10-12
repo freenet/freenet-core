@@ -55,6 +55,7 @@ pub struct AdmissionCounts {
     pub admitted_lattice: u64,
     pub rejected_onboarding_budget_exhausted: u64,
     pub rejected_bar_unmet: u64,
+    pub bar_unmet_not_enforced: u64,
     pub provisional_graduated: u64,
     pub provisional_dropped: u64,
     pub provisional_pruned: u64,
@@ -73,6 +74,7 @@ impl std::ops::AddAssign for AdmissionCounts {
         self.admitted_lattice += o.admitted_lattice;
         self.rejected_onboarding_budget_exhausted += o.rejected_onboarding_budget_exhausted;
         self.rejected_bar_unmet += o.rejected_bar_unmet;
+        self.bar_unmet_not_enforced += o.bar_unmet_not_enforced;
         self.provisional_graduated += o.provisional_graduated;
         self.provisional_dropped += o.provisional_dropped;
         self.provisional_pruned += o.provisional_pruned;
@@ -205,6 +207,7 @@ pub(crate) fn record_admission(peer: &TransportPublicKey, s: super::admission::A
                 admitted_lattice: s.admitted_lattice,
                 rejected_onboarding_budget_exhausted: s.rejected_onboarding_budget_exhausted,
                 rejected_bar_unmet: s.rejected_bar_unmet,
+                bar_unmet_not_enforced: s.bar_unmet_not_enforced,
                 provisional_graduated: s.provisional_graduated,
                 provisional_dropped: s.provisional_dropped,
                 provisional_pruned: s.provisional_pruned,
