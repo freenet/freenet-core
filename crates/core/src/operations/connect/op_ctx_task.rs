@@ -4,13 +4,15 @@
 //! `ConnectMsg::Request` to the first-hop gateway via
 //! `OpCtx::send_to_and_collect_replies`, and drains a multi-reply
 //! receiver until `target_connections` acceptances arrive or an
-//! overall timeout fires.
+//! overall timeout fires. A CONNECT started with no ring connection also
+//! ends once nothing more is coming (`bootstrap::BootstrapRound`, #5858).
 //!
 //! Side effects per reply variant:
 //!
 //! - `Response`: `NetEventLog::connect_response_received`,
 //!   `NodeEvent::ExpectPeerConnection`, `NodeEvent::ConnectPeer`,
-//!   then await the callback (sequential per acceptor). On
+//!   then await the callback, up to `MAX_CONCURRENT_ACCEPTOR_DIALS`
+//!   acceptors at once (the rest queue). On
 //!   hole-punch success: `record_acceptor_outcome(addr, true, now)`.
 //!   On hole-punch failure: emit `ConnectMsg::ConnectFailed`
 //!   downstream; stay in loop awaiting more Responses. When
@@ -780,10 +782,12 @@ async fn begin_acceptor_dial(
 /// `mpsc::channel(0)` panics).
 ///
 /// Bypass uses `try_send`; over-capacity replies drop with a debug
-/// log (`node::try_forward_driver_reply`). Sequential hole-punch
-/// (seconds per acceptor) means worst-case
-/// burst is bounded by simultaneously-arriving relay-branch replies,
-/// which `2x` covers for normal min_connections values. A flood of
+/// log (`node::try_forward_driver_reply`). The driver drains the
+/// receiver while hole punches run (up to
+/// `MAX_CONCURRENT_ACCEPTOR_DIALS` at once, the rest queued in the
+/// driver, not the channel), so the worst-case burst is bounded by
+/// simultaneously-arriving relay-branch replies, which `2x` covers for
+/// normal min_connections values. A flood of
 /// rejects beyond `2x` would drop legitimate replies — flagged as
 /// follow-up but acceptable here because the driver re-issues nothing.
 fn compute_reply_capacity(target_connections: usize) -> usize {

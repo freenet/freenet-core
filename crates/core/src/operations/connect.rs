@@ -1906,15 +1906,6 @@ pub(crate) async fn initial_join_procedure(
                 crate::node::network_status::record_bootstrap_min_connections_reached();
             }
 
-            // Has this round already been classified (#4787)? Each branch that
-            // decides what the round does records its own outcome BEFORE
-            // awaiting anything, so a CONNECT fan-out that hangs still leaves a
-            // counted round; whatever reaches the bottom unrecorded is a round
-            // that issued nothing AND had no more specific reason, which is a
-            // quiet "nothing to do" and NOT the stall the issue was filed
-            // about. The stall — gateway transports up, no real peers acquired
-            // — routes CONNECTs through the connected gateways and is counted
-            // as `ConnectIssuedRouted`.
             // With no ring connection, rounds are paced by the bootstrap pacer
             // shared with the maintenance loop (#5858): one round at a time,
             // failed rounds spaced by a jittered exponential backoff. The
@@ -1936,6 +1927,15 @@ pub(crate) async fn initial_join_procedure(
                 None
             };
 
+            // Has this round already been classified (#4787)? Each branch that
+            // decides what the round does records its own outcome BEFORE
+            // awaiting anything, so a CONNECT fan-out that hangs still leaves a
+            // counted round; whatever reaches the bottom unrecorded is a round
+            // that issued nothing AND had no more specific reason, which is a
+            // quiet "nothing to do" and NOT the stall the issue was filed
+            // about. The stall — gateway transports up, no real peers acquired
+            // — routes CONNECTs through the connected gateways and is counted
+            // as `ConnectIssuedRouted`.
             let mut round_recorded = false;
             let mut record_round = |outcome: StartupRoundOutcome| {
                 if !round_recorded && !min_connections_reached {
