@@ -1490,6 +1490,11 @@ pub struct SimNetwork {
     /// `FaultConfig::unreachable_pair_fraction` real on the socket path. Set
     /// by [`enforce_link_faults`](Self::enforce_link_faults).
     enforce_link_faults: bool,
+    /// When true, the direct runner keeps production transport timers:
+    /// keepalive on and the 120 s idle timeout, instead of the simulation's
+    /// relaxed timers (keepalive off, 24 h idle timeout). Set by
+    /// [`production_transport_timers`](Self::production_transport_timers).
+    production_transport_timers: bool,
     /// Optional pre-operation join-convergence barrier for
     /// [`run_controlled_simulation`](Self::run_controlled_simulation). When
     /// `Some((min_fraction, max_wait))`, the controlled-event client waits —
@@ -1771,6 +1776,7 @@ impl SimNetwork {
             churn_config: None,
             node_start_delays: HashMap::new(),
             enforce_link_faults: false,
+            production_transport_timers: false,
             wait_for_join_before_ops: None,
             controlled_op_interval: None,
             governance_config_override: None,
@@ -1946,6 +1952,16 @@ impl SimNetwork {
     /// keep their current behaviour. Direct runner only.
     pub fn enforce_link_faults(&mut self) -> &mut Self {
         self.enforce_link_faults = true;
+        self
+    }
+
+    /// Keeps production transport timers in the direct runner: keepalive
+    /// pings and the 120 s idle timeout. The default simulation timers
+    /// (keepalive off, 24 h idle timeout) mean a node never notices that the
+    /// far end dropped a link, which overstates how long a half-open link
+    /// lasts (#5866). Costs wall-clock time (one keepalive task per link).
+    pub fn production_transport_timers(&mut self) -> &mut Self {
+        self.production_transport_timers = true;
         self
     }
 
@@ -5932,14 +5948,22 @@ impl SimNetwork {
         // Extend connection idle timeout for ALL simulations. In start_paused(true)
         // mode, virtual time jumps past 120s during spawn_blocking (WASM execution),
         // causing spurious connection drops even with keepalive enabled.
-        crate::config::SimulationIdleTimeout::enable();
+        if self.production_transport_timers {
+            crate::config::SimulationIdleTimeout::disable();
+        } else {
+            crate::config::SimulationIdleTimeout::enable();
+        }
 
         // Relax transport timers for ALL direct-runner simulations. Disables keepalive
         // and uses 5x slower ACK/resend/rate-update intervals. In start_paused(true)
         // mode, production-rate timer firings create excessive virtual time advances
         // that interfere with heartbeat and broadcast scheduling, causing
         // non-deterministic convergence failures even in small networks.
-        SimulationTransportOpt::enable();
+        if self.production_transport_timers {
+            SimulationTransportOpt::disable();
+        } else {
+            SimulationTransportOpt::enable();
+        }
         let use_mock_wasm = self.use_mock_wasm;
         let skip_convergence_wait = self.skip_convergence_wait;
 

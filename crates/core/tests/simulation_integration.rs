@@ -20187,6 +20187,9 @@ struct SaturatedJoinConfig {
     /// Extra `SimNetwork` setup applied before the run, e.g. feature toggles
     /// such as `enable_gateway_ack_version`.
     configure: Option<fn(&mut SimNetwork)>,
+    /// Production keepalive and 120 s idle timeout instead of the
+    /// simulation's relaxed transport timers (`production_transport_timers`).
+    production_timers: bool,
 }
 
 impl SaturatedJoinConfig {
@@ -20207,6 +20210,7 @@ impl SaturatedJoinConfig {
             latency_jitter: Duration::ZERO,
             unreachable_pair_fraction: 0.0,
             configure: None,
+            production_timers: false,
         }
     }
 
@@ -20348,17 +20352,42 @@ impl SaturatedJoinReport {
             .count()
     }
 
+    /// How fast the simulation's ULID clock ran against virtual time, in
+    /// clock-ms per virtual second, from the joiners' notes. Operation TTLs
+    /// (`Transaction::elapsed`) read that clock, so at a rate below 1000 every
+    /// TTL lasts `1000 / rate` times its nominal length in virtual time.
+    fn ulid_clock_rate(&self) -> Option<f64> {
+        let mut rates: Vec<f64> = self.timelines[self.cfg.established..]
+            .iter()
+            .filter_map(|(_, t)| {
+                let (a, b) = (t.notes.first()?, t.notes.last()?);
+                let virt = b.at.checked_sub(a.at)?.as_secs_f64();
+                (virt > 10.0).then(|| (b.sim_clock_ms - a.sim_clock_ms) as f64 / virt)
+            })
+            .collect();
+        rates.sort_by(|a, b| a.total_cmp(b));
+        rates.get(rates.len() / 2).copied()
+    }
+
     fn log(&self) {
         let mut degrees = self.established_degrees.clone();
         degrees.sort_unstable();
         let first = self.to_first_ring();
         let min = self.to_min();
+        if let Some(rate) = self.ulid_clock_rate() {
+            tracing::info!(
+                target: "saturated_join",
+                "sim ULID clock: {rate:.0} ms per virtual s, so the 60 s operation TTL lasts \
+                 ~{:.0} s of virtual time",
+                60_000.0 / rate
+            );
+        }
         tracing::info!(
             target: "saturated_join",
             "=== saturated join '{}' (seed {:#x}) ===\n\
              config: {} gateways + {} established (stagger {:?}) + {} joiners, min={} max={}, \
              join_at={:?} stagger={:?} observe_for={:?}, latency={:?}, \
-             unreachable_pairs={:.0}%\n\
+             unreachable_pairs={:.0}% jitter={:?} production_timers={}\n\
              wall clock: {:.1}s for {:?} virtual\n\
              saturation at join_at: {}/{} established at/above min ({:.0}%), \
              degree p10/p50/p90 = {}/{}/{}\n\
@@ -20386,6 +20415,8 @@ impl SaturatedJoinReport {
             self.cfg.observe_for,
             self.cfg.latency,
             self.cfg.unreachable_pair_fraction * 100.0,
+            self.cfg.latency_jitter,
+            self.cfg.production_timers,
             self.wall_clock.as_secs_f64(),
             self.cfg.total(),
             self.established_at_min,
@@ -20572,6 +20603,9 @@ fn run_saturated_join(cfg: &SaturatedJoinConfig) -> SaturatedJoinReport {
         }
         sim.with_fault_injection(faults.build());
         sim.enforce_link_faults();
+        if cfg.production_timers {
+            sim.production_transport_timers();
+        }
         if let Some(configure) = cfg.configure {
             configure(&mut sim);
         }
@@ -20832,7 +20866,7 @@ fn test_saturated_join_burst_50() {
 /// Manual exploration: every `SaturatedJoinConfig` field can be overridden
 /// from the environment (`SJ_GATEWAYS`, `SJ_ESTABLISHED`, `SJ_JOINERS`,
 /// `SJ_MIN`, `SJ_MAX`, `SJ_EST_STAGGER_MS`, `SJ_JOIN_AT_S`, `SJ_STAGGER_S`, `SJ_OBSERVE_S`,
-/// `SJ_LATENCY_MS` as `lo-hi` or `0` for none, `SJ_JITTER_MS`, `SJ_UNREACHABLE`, `SJ_SEED`).
+/// `SJ_LATENCY_MS` as `lo-hi` or `0` for none, `SJ_JITTER_MS`, `SJ_PROD_TIMERS=1`, `SJ_UNREACHABLE`, `SJ_SEED`).
 /// Logs the report and asserts nothing, so it can probe configs that do not
 /// saturate. With `SJ_JOINERS=0` it also logs the cold-burst analysis; with
 /// `SJ_TRACE` set it logs the join trace of the slow joiners (see
@@ -20873,6 +20907,7 @@ fn test_saturated_join_explore() {
         });
     }
     cfg.unreachable_pair_fraction = env("SJ_UNREACHABLE").unwrap_or(0.0);
+    cfg.production_timers = env::<u8>("SJ_PROD_TIMERS").is_some_and(|v| v == 1);
     let report = run_saturated_join(&cfg);
     if cfg.joiners == 0 {
         log_cold_burst(&report);
