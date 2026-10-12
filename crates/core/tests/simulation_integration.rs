@@ -20635,8 +20635,9 @@ fn run_saturated_join(cfg: &SaturatedJoinConfig) -> SaturatedJoinReport {
 }
 
 /// Share of established peers that must be at/above min_connections when the
-/// joiners arrive. Production has ~65% there (#5858).
-const SATURATED_JOIN_MIN_SATURATION: f64 = 0.6;
+/// joiners arrive. Production has ~65% there (#5858); the production-scale
+/// config with 40% unreachable pairs measured 50%, without them 72%.
+const SATURATED_JOIN_MIN_SATURATION: f64 = 0.5;
 
 /// The #5858 objective P1: p95 time from first CONNECT to first ring
 /// connection, in a saturated network.
@@ -20666,6 +20667,11 @@ fn test_saturated_join_smoke() {
 /// of hops were accepted, so joiners always connected within ~1s; at 300 the
 /// sim measured ~2.7 hops/s per peer and 0.74% accepted, against ~2.3 and
 /// 0.64% live (#5858).
+///
+/// 40% of non-gateway pairs are unreachable: live, 30-65% of accepted hops
+/// never become connections. Without this every joiner in the measured
+/// seeds got its first ring connection within 9s; with it the tail reaches
+/// tens of seconds.
 #[allow(dead_code)] // Used by nightly_tests-gated tests
 fn saturated_join_production_config(name: &'static str, seed: u64) -> SaturatedJoinConfig {
     SaturatedJoinConfig {
@@ -20678,6 +20684,7 @@ fn saturated_join_production_config(name: &'static str, seed: u64) -> SaturatedJ
         join_at: Duration::from_secs(500),
         join_stagger: Duration::from_secs(10),
         observe_for: Duration::from_secs(240),
+        unreachable_pair_fraction: 0.4,
         ..SaturatedJoinConfig::new(name, seed)
     }
 }
