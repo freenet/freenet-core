@@ -2042,6 +2042,7 @@ impl Ring {
             snapshot.connect_rejected_onboarding_budget_exhausted =
                 Some(admission.rejected_onboarding_budget_exhausted);
             snapshot.connect_rejected_bar_unmet = Some(admission.rejected_bar_unmet);
+            snapshot.connect_bar_unmet_not_enforced = Some(admission.bar_unmet_not_enforced);
             snapshot.connect_provisional_graduated = Some(admission.provisional_graduated);
             snapshot.connect_provisional_dropped = Some(admission.provisional_dropped);
             snapshot.connect_provisional_pruned = Some(admission.provisional_pruned);
