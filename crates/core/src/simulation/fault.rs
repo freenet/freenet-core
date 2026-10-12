@@ -100,6 +100,11 @@ pub struct FaultConfig {
     pub unreachable_pair_salt: u64,
     /// Addresses exempt from `unreachable_pair_fraction` (e.g. gateways).
     pub always_reachable: HashSet<SocketAddr>,
+    /// Extra per-packet delay, uniform in `[0, latency_jitter)`, added on top
+    /// of the fixed per-pair delay (`pair_latency`) under
+    /// `SimNetwork::enforce_link_faults`. Packets on one pair sent closer
+    /// together than this can arrive out of order.
+    pub latency_jitter: Duration,
 }
 
 impl Default for FaultConfig {
@@ -113,6 +118,7 @@ impl Default for FaultConfig {
             unreachable_pair_fraction: 0.0,
             unreachable_pair_salt: 0,
             always_reachable: HashSet::new(),
+            latency_jitter: Duration::ZERO,
         }
     }
 }
@@ -339,6 +345,13 @@ impl FaultConfigBuilder {
     pub fn unreachable_pairs(mut self, fraction: f64, salt: u64) -> Self {
         self.config.unreachable_pair_fraction = fraction.clamp(0.0, 1.0);
         self.config.unreachable_pair_salt = salt;
+        self
+    }
+
+    /// Adds a per-packet delay uniform in `[0, jitter)` on top of the fixed
+    /// per-pair latency (see `FaultConfig::latency_jitter`).
+    pub fn latency_jitter(mut self, jitter: Duration) -> Self {
+        self.config.latency_jitter = jitter;
         self
     }
 

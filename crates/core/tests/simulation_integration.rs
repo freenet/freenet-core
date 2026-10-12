@@ -20175,8 +20175,12 @@ struct SaturatedJoinConfig {
     join_stagger: Duration,
     /// How long the run continues after the last joiner starts.
     observe_for: Duration,
-    /// Per-packet latency, applied on the socket path (`enforce_link_faults`).
+    /// Link latency, applied on the socket path (`enforce_link_faults`) as a
+    /// fixed delay per node pair drawn from this range.
     latency: Option<std::ops::Range<Duration>>,
+    /// Extra per-packet delay in `[0, latency_jitter)` on top of the per-pair
+    /// latency; packets closer together than this can reorder.
+    latency_jitter: Duration,
     /// Fraction of non-gateway node pairs that can never connect (failed NAT
     /// traversal). Gateways are always reachable.
     unreachable_pair_fraction: f64,
@@ -20200,6 +20204,7 @@ impl SaturatedJoinConfig {
             join_stagger: Duration::from_secs(10),
             observe_for: Duration::from_secs(120),
             latency: Some(Duration::from_millis(20)..Duration::from_millis(150)),
+            latency_jitter: Duration::ZERO,
             unreachable_pair_fraction: 0.0,
             configure: None,
         }
@@ -20272,6 +20277,13 @@ struct SaturatedJoinReport {
     joiners: Vec<JoinerOutcome>,
     all_hops: ConnectHopStats,
     joiner_hops: ConnectHopStats,
+    /// Ring connections lost by established peers over the run.
+    established_links_dropped: usize,
+    /// Timeline of every regular node (established, then joiners), by label.
+    timelines: Vec<(String, freenet::dev_tool::JoinTimeline)>,
+    /// Public key of every node, by label.
+    keys: HashMap<String, freenet::dev_tool::TransportPublicKey>,
+    logs: Arc<Mutex<Vec<freenet::tracing::NetLogMessage>>>,
     wall_clock: Duration,
 }
 
@@ -20297,7 +20309,20 @@ fn fmt_opt(d: Option<Duration>) -> String {
         .unwrap_or_else(|| "never".to_string())
 }
 
+fn links_dropped(t: &freenet::dev_tool::JoinTimeline) -> usize {
+    t.ring_count_history
+        .windows(2)
+        .map(|w| w[0].1.saturating_sub(w[1].1))
+        .sum()
+}
+
 impl SaturatedJoinReport {
+    /// CONNECT hops received per node per virtual second, over the whole run.
+    fn hops_per_peer_per_s(&self) -> f64 {
+        let peers = self.cfg.gateways + self.cfg.established + self.cfg.joiners;
+        self.all_hops.hops as f64 / (peers as f64 * self.cfg.total().as_secs_f64())
+    }
+
     fn to_first_ring(&self) -> Vec<Option<Duration>> {
         self.joiners.iter().map(|j| j.to_first_ring).collect()
     }
@@ -20335,7 +20360,9 @@ impl SaturatedJoinReport {
              p50={} p95={} max={} never={}/{}\n\
              joiner time from first CONNECT to min_connections: p50={} p95={} \
              max={} never={}/{}\n\
-             CONNECT hops (all): {} received, {:.2}% accepted ({} by gateways), \
+             established links dropped over the run: {}\n\
+             CONNECT hops (all): {} received ({:.2} per node per second), \
+             {:.2}% accepted ({} by gateways), \
              median chain {} hops, {:.0}% of {} chains had no accepting hop\n\
              CONNECT hops (joiners' requests): {} received, {:.2}% accepted ({} by \
              gateways), median chain {} hops, {:.0}% of {} chains had no accepting hop",
@@ -20370,7 +20397,9 @@ impl SaturatedJoinReport {
             fmt_opt(censored_quantile(&min, 1.0)),
             min.iter().filter(|m| m.is_none()).count(),
             self.joiners.len(),
+            self.established_links_dropped,
             self.all_hops.hops,
+            self.hops_per_peer_per_s(),
             self.all_hops.acceptance_rate() * 100.0,
             self.all_hops.accepted_by_gateway,
             self.all_hops.median_chain(),
@@ -20383,7 +20412,14 @@ impl SaturatedJoinReport {
             self.joiner_hops.chains_without_accept_fraction() * 100.0,
             self.joiner_hops.chain_lengths.len(),
         );
-        for (label, count, first, connects) in &self.established_below_min {
+        if self.established_below_min.len() > 20 {
+            tracing::info!(
+                target: "saturated_join",
+                "  {} established peers below min at join_at; first 20:",
+                self.established_below_min.len()
+            );
+        }
+        for (label, count, first, connects) in self.established_below_min.iter().take(20) {
             tracing::info!(
                 target: "saturated_join",
                 "  established below min at join_at: {label} count={count} first ring at {} \
@@ -20517,7 +20553,9 @@ fn run_saturated_join(cfg: &SaturatedJoinConfig) -> SaturatedJoinReport {
             .collect();
         let mut faults = FaultConfig::builder();
         if let Some(latency) = &cfg.latency {
-            faults = faults.latency_range(latency.clone());
+            faults = faults
+                .latency_range(latency.clone())
+                .latency_jitter(cfg.latency_jitter);
         }
         if cfg.unreachable_pair_fraction > 0.0 {
             faults = faults
@@ -20597,11 +20635,7 @@ fn run_saturated_join(cfg: &SaturatedJoinConfig) -> SaturatedJoinReport {
                 connects_before_first_ring: t.connects_before_first_ring_connection,
                 connects_initiated: t.connects_initiated,
                 final_count: t.count_at(Duration::MAX),
-                links_dropped: t
-                    .ring_count_history
-                    .windows(2)
-                    .map(|w| w[0].1.saturating_sub(w[1].1))
-                    .sum(),
+                links_dropped: links_dropped(&t),
             }
         })
         .collect();
@@ -20620,6 +20654,17 @@ fn run_saturated_join(cfg: &SaturatedJoinConfig) -> SaturatedJoinReport {
         )
     });
 
+    let timelines: Vec<(String, freenet::dev_tool::JoinTimeline)> = (0..cfg.established
+        + cfg.joiners)
+        .map(|i| {
+            let label = NodeLabel::node(cfg.name, cfg.gateways + i);
+            (label.to_string(), timeline_of(&label))
+        })
+        .collect();
+    let established_links_dropped = timelines[..cfg.established]
+        .iter()
+        .map(|(_, t)| links_dropped(t))
+        .sum();
     let report = SaturatedJoinReport {
         cfg: cfg.clone(),
         established_at_min,
@@ -20628,6 +20673,13 @@ fn run_saturated_join(cfg: &SaturatedJoinConfig) -> SaturatedJoinReport {
         joiners,
         all_hops,
         joiner_hops,
+        established_links_dropped,
+        timelines,
+        keys: keys
+            .iter()
+            .map(|(label, key)| (label.to_string(), key.clone()))
+            .collect(),
+        logs: logs_handle,
         wall_clock: wall.elapsed(),
     };
     report.log();
@@ -20750,7 +20802,7 @@ fn test_saturated_join_burst_50() {
 /// Manual exploration: every `SaturatedJoinConfig` field can be overridden
 /// from the environment (`SJ_GATEWAYS`, `SJ_ESTABLISHED`, `SJ_JOINERS`,
 /// `SJ_MIN`, `SJ_MAX`, `SJ_EST_STAGGER_MS`, `SJ_JOIN_AT_S`, `SJ_STAGGER_S`, `SJ_OBSERVE_S`,
-/// `SJ_LATENCY_MS` as `lo-hi` or `0` for none, `SJ_UNREACHABLE`, `SJ_SEED`).
+/// `SJ_LATENCY_MS` as `lo-hi` or `0` for none, `SJ_JITTER_MS`, `SJ_UNREACHABLE`, `SJ_SEED`).
 /// Logs the report and asserts nothing, so it can probe configs that do not
 /// saturate.
 #[test_log::test]
@@ -20774,6 +20826,9 @@ fn test_saturated_join_explore() {
     if let Some(ms) = env::<u64>("SJ_EST_STAGGER_MS") {
         cfg.established_stagger = Duration::from_millis(ms);
     }
+    if let Some(ms) = env::<u64>("SJ_JITTER_MS") {
+        cfg.latency_jitter = Duration::from_millis(ms);
+    }
     if let Some(s) = env::<u64>("SJ_STAGGER_S") {
         cfg.join_stagger = Duration::from_secs(s);
     }
@@ -20787,4 +20842,218 @@ fn test_saturated_join_explore() {
     }
     cfg.unreachable_pair_fraction = env("SJ_UNREACHABLE").unwrap_or(0.0);
     run_saturated_join(&cfg);
+}
+
+// -----------------------------------------------------------------------------
+// COLD BURST (#5858): every regular node starts within ~0.1s, as a burst of new
+// peers would. Measured on unmodified main: 85% of 100 peers (min 25 / max 200,
+// no link latency) still had zero ring connections at 300s. Kept as a named
+// scenario; it reports, it does not assert an outcome.
+// -----------------------------------------------------------------------------
+
+#[allow(dead_code)] // Used by nightly_tests-gated tests
+fn cold_burst_config() -> SaturatedJoinConfig {
+    SaturatedJoinConfig {
+        gateways: 3,
+        established: 100,
+        established_stagger: Duration::from_millis(1),
+        joiners: 0,
+        min_connections: 25,
+        max_connections: 200,
+        join_at: Duration::ZERO,
+        observe_for: Duration::from_secs(600),
+        ..SaturatedJoinConfig::new("cold-burst", 0x5858_0000_0005)
+    }
+}
+
+/// Where one cohort's CONNECTs went: hop outcomes of the chains it started
+/// and the `Rejected` reasons on those chains.
+fn cohort_connect_summary(
+    logs: &[freenet::tracing::NetLogMessage],
+    cohort: &HashSet<freenet::dev_tool::TransportPublicKey>,
+    gateways: &HashSet<freenet::dev_tool::TransportPublicKey>,
+) -> (ConnectHopStats, BTreeMap<String, usize>, usize) {
+    let hops = connect_hop_stats(logs.iter(), Some(cohort), gateways);
+    let cohort_txs: HashSet<_> = logs
+        .iter()
+        .filter(|l| {
+            l.kind
+                .connect_request_received_joiner()
+                .is_some_and(|j| cohort.contains(j))
+        })
+        .map(|l| l.tx)
+        .collect();
+    let mut reasons = BTreeMap::new();
+    for log in logs {
+        if let Some(reason) = log.kind.connect_rejected_reason() {
+            if cohort_txs.contains(&log.tx) {
+                *reasons.entry(reason.to_string()).or_insert(0) += 1;
+            }
+        }
+    }
+    let terminus_rejected_at_gateway = logs
+        .iter()
+        .filter(|l| {
+            l.kind.is_connect_terminus_rejected()
+                && gateways.contains(l.peer_id.pub_key())
+                && l.kind
+                    .connect_request_received_joiner()
+                    .is_some_and(|j| cohort.contains(j))
+        })
+        .count();
+    (hops, reasons, terminus_rejected_at_gateway)
+}
+
+fn log_cold_burst(report: &SaturatedJoinReport) {
+    let n = report.timelines.len();
+    let total = report.cfg.total();
+    let mut over_time = String::new();
+    let mut t = Duration::ZERO;
+    while t <= total {
+        let zero = report
+            .timelines
+            .iter()
+            .filter(|(_, tl)| tl.count_at(t) == 0)
+            .count();
+        over_time.push_str(&format!(" {}s:{}", t.as_secs(), zero));
+        t += Duration::from_secs(30);
+    }
+    let recovery: Vec<Option<Duration>> = report
+        .timelines
+        .iter()
+        .map(|(_, tl)| {
+            tl.first_ring_connection_at()
+                .map(|f| f.saturating_sub(tl.started_at.unwrap_or_default()))
+        })
+        .collect();
+    let at_min: Vec<Option<Duration>> = report
+        .timelines
+        .iter()
+        .map(|(_, tl)| tl.reached_at(report.cfg.min_connections))
+        .collect();
+
+    // Cohorts: nodes still at zero 60s in versus nodes connected by then.
+    let probe = Duration::from_secs(60);
+    let (stuck, connected): (Vec<_>, Vec<_>) = report
+        .timelines
+        .iter()
+        .partition(|(_, tl)| tl.count_at(probe) == 0);
+    let key_set = |v: &[&(String, freenet::dev_tool::JoinTimeline)]| -> HashSet<_> {
+        v.iter()
+            .map(|(label, _)| report.keys[label].clone())
+            .collect()
+    };
+    let gateways: HashSet<_> = report
+        .keys
+        .iter()
+        .filter(|(label, _)| label.contains("-gateway-"))
+        .map(|(_, k)| k.clone())
+        .collect();
+    let stuck_keys = key_set(&stuck);
+    let connected_keys = key_set(&connected);
+    // CONNECT cadence of the stuck cohort before its first connection.
+    let mut gaps: Vec<Duration> = stuck
+        .iter()
+        .flat_map(|(_, tl)| {
+            let until = tl.first_ring_connection_at().unwrap_or(Duration::MAX);
+            let times: Vec<_> = tl
+                .connect_times
+                .iter()
+                .copied()
+                .filter(|c| *c < until)
+                .collect();
+            times
+                .windows(2)
+                .map(|w| w[1].saturating_sub(w[0]))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    gaps.sort_unstable();
+    let attempts_before: Vec<usize> = stuck
+        .iter()
+        .map(|(_, tl)| {
+            let until = tl.first_ring_connection_at().unwrap_or(Duration::MAX);
+            tl.connect_times.iter().filter(|c| **c < until).count()
+        })
+        .collect();
+
+    let rt = create_runtime();
+    let (stuck_summary, connected_summary) = rt.block_on(async {
+        let logs = report.logs.lock().await;
+        (
+            cohort_connect_summary(&logs, &stuck_keys, &gateways),
+            cohort_connect_summary(&logs, &connected_keys, &gateways),
+        )
+    });
+    let fmt_cohort =
+        |(hops, reasons, gw_terminus): &(ConnectHopStats, BTreeMap<String, usize>, usize)| {
+            format!(
+                "{} hops, {:.2}% accepted ({} by gateways), {} chains (median {} hops, \
+             {:.0}% with no accepting hop), {} terminus rejections at gateways, \
+             Rejected reasons {:?}",
+                hops.hops,
+                hops.acceptance_rate() * 100.0,
+                hops.accepted_by_gateway,
+                hops.chain_lengths.len(),
+                hops.median_chain(),
+                hops.chains_without_accept_fraction() * 100.0,
+                gw_terminus,
+                reasons,
+            )
+        };
+    tracing::info!(
+        target: "saturated_join",
+        "=== cold burst: {} nodes started within {:?} ===\n\
+         nodes at 0 ring connections over time:{}\n\
+         time from start to first ring connection: p25={} p50={} p75={} p95={} max={} \
+         never={}/{}\n\
+         time from start to min_connections: p50={} p95={} never={}/{}\n\
+         stuck cohort (0 connections at {}s): {} nodes; CONNECTs before first \
+         connection p50={} max={}; gap between those CONNECTs p50={} p90={}\n\
+         stuck cohort requests: {}\n\
+         connected cohort requests: {}",
+        n,
+        report.cfg.established_stagger * n as u32,
+        over_time,
+        fmt_opt(censored_quantile(&recovery, 0.25)),
+        fmt_opt(censored_quantile(&recovery, 0.5)),
+        fmt_opt(censored_quantile(&recovery, 0.75)),
+        fmt_opt(censored_quantile(&recovery, 0.95)),
+        fmt_opt(censored_quantile(&recovery, 1.0)),
+        recovery.iter().filter(|r| r.is_none()).count(),
+        n,
+        fmt_opt(censored_quantile(&at_min, 0.5)),
+        fmt_opt(censored_quantile(&at_min, 0.95)),
+        at_min.iter().filter(|r| r.is_none()).count(),
+        n,
+        probe.as_secs(),
+        stuck.len(),
+        {
+            let mut a = attempts_before.clone();
+            a.sort_unstable();
+            a.get(a.len() / 2).copied().unwrap_or(0)
+        },
+        attempts_before.iter().max().copied().unwrap_or(0),
+        fmt_opt(gaps.get(gaps.len() / 2).copied()),
+        fmt_opt(gaps.get(gaps.len() * 9 / 10).copied()),
+        fmt_cohort(&stuck_summary),
+        fmt_cohort(&connected_summary),
+    );
+}
+
+/// Named scenario for the "burst of new peers" risk (#5858): all regular
+/// nodes start at once against three gateways. Reports how many sit at zero
+/// ring connections over time, how long they take to recover, and what their
+/// CONNECTs ran into. Asserts only that every node started and tried.
+#[cfg(feature = "nightly_tests")]
+#[test_log::test]
+fn test_cold_burst_start() {
+    let report = run_saturated_join(&cold_burst_config());
+    log_cold_burst(&report);
+    for (label, tl) in &report.timelines {
+        assert!(
+            tl.started_at.is_some() && tl.connects_initiated > 0,
+            "{label} never started or never initiated a CONNECT"
+        );
+    }
 }

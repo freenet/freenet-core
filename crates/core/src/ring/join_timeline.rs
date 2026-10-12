@@ -35,6 +35,8 @@ pub struct JoinTimeline {
     /// Number of CONNECTs this peer initiated (gateway joins, ring
     /// acquisition, lattice probes, version probes).
     pub connects_initiated: u64,
+    /// When each of those CONNECTs was initiated.
+    pub connect_times: Vec<Duration>,
     /// `connects_initiated` at the moment the first ring connection was
     /// recorded: how many attempts the first connection took.
     pub connects_before_first_ring_connection: Option<u64>,
@@ -147,6 +149,7 @@ pub fn record_connect_initiated(peer: &TransportPublicKey) {
         recorder.with_peer(peer, |t, now| {
             t.first_connect_at.get_or_insert(now);
             t.connects_initiated += 1;
+            t.connect_times.push(now);
         });
     }
 }
