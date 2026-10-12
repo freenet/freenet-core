@@ -233,10 +233,17 @@ Joiner ← Gateway ← Relay ← ConnectResponse
 1. Can forward to closer peer? → Forward (a relay within 0.05 of the target may also accept probabilistically)
 2. At terminus but `should_accept` declines → route uphill (bounded by `uphill_budget`)
 
-`should_accept`:
+`should_accept` (the self-interest rule):
 1. At max_connections → Reject (except nearest-neighbor lattice edges)
 2. Below min_connections → Accept below 3 open connections, then probabilistically by Kleinberg gap score
 3. Between limits → Kleinberg gap score fed through the `ConnectionEvaluator`
+
+A requester can also state its need (#5858, `ConnectMsg::RequestWithNeed`, version-gated and
+chosen per hop at the connection write by `fit_request_to_hop`). The relay decides with
+`ConnectionManager::evaluate_admission_at`: a short requester may be admitted from a bounded
+onboarding budget that bypasses the evaluator window (falling back to the rule above when no slot
+is free), and a requester with a bar is refused by an acceptor that is not closer to its target.
+See [ring/README.md](../ring/README.md#small-world-properties).
 
 The joiner's choice of target location (own location early on, then log-distance gap
 targeting) shapes the topology; see [ring/README.md](../ring/README.md#small-world-properties).

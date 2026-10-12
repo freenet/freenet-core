@@ -126,19 +126,26 @@ WHEN accepting a new connection (should_accept):
      → Use ACTUAL open count, NOT speculative totals
   5. At/above min_connections: strict ConnectionEvaluator
      → Feed gap score into evaluator (accepts best candidate per window)
-  6. Requester need (#5858, ConnectMsg::RequestWithNeed, version-gated by
-     CONNECT_NEED_MIN_VERSION; a legacy Request is need-unknown → steps 1-5):
+  6. Requester need (#5858, ConnectMsg::RequestWithNeed; the wire form is
+     chosen per hop at the connection write, fit_request_to_hop, from THAT
+     connection's version vs CONNECT_NEED_MIN_VERSION; a legacy Request is
+     need-unknown → steps 1-5):
      → SHORT requester (below its own min): lattice, then capacity, then the
-       below-min soft filter, then an ONBOARDING slot (ring/admission.rs,
-       ONBOARDING_PROVISIONAL_SLOTS). Never touches the evaluator window.
-     → BAR requester: refuse (bar_unmet) unless this peer is strictly closer
-       to the target than the bar or the lattice admits it; then steps 2-5.
-     → Onboarding links are PROVISIONAL: first in line for prune/swap while
-       on probation; after ONBOARDING_PROBATION graduate if self-interest
-       would keep them (ConnectionManager::review_provisional_links), else
-       drop. The slot frees on prune, failed handshake, or decision.
-     The decision is an AdmissionCode (evaluate_admission), carried on the
-     connect_request_received event and counted per path on router_snapshot.
+       below-min soft filter, then an ONBOARDING slot (ring/admission.rs:
+       ONBOARDING_PROVISIONAL_SLOTS, token-bucket refill, one per masked
+       Location, last slot kept for nearly isolated requesters). Never
+       records into the evaluator window. No slot → falls back to steps 2-5.
+     → BAR requester: refuse (bar_unmet) unless strictly closer to the target
+       or the lattice admits it (switch: ENFORCE_REQUESTER_BAR); then 2-5.
+     → Onboarding links are PROVISIONAL: once ONBOARDING_MIN_AGE_BEFORE_PRUNE
+       old and established, first in line for prune/swap; after
+       ONBOARDING_PROBATION they graduate only as a FRESH candidate (beat the
+       evaluator window, capped per window), or if the acceptor would drop
+       below min without them, or as a lattice edge. The slot frees on prune,
+       failed handshake, or a QUEUED drop — never on the promotion that
+       consumes the reservation (take_reservation_for_promotion).
+     The decision is an AdmissionCode, counted once per request by the relay
+     driver (record_relay_admission) and carried on connect_request_received.
 
 WHEN closing a connection:
   → MUST remove from connections_by_location

@@ -191,9 +191,28 @@ converged peer adds a few non-lattice links per lattice change rather than one p
 - At/above `min_connections`: the gap score is fed to the `ConnectionEvaluator`, which accepts
   a candidate only if it beats the other candidates seen in a recent time window
 
+The rules above are the **self-interest** path. Since #5858 a requester may also state its need
+(`ConnectMsg::RequestWithNeed`, sent only to peers whose version decodes it; a legacy request is
+need-unknown and takes the self-interest path alone):
+
+- A **short** requester (fewer ring connections than its own `min_connections`) is admitted by the
+  lattice clause or the below-min filter as above, and otherwise from a small per-acceptor
+  **onboarding** budget: `ONBOARDING_PROVISIONAL_SLOTS` links on probation while below
+  `max_connections`, refilled at a bounded rate, one per masked location, with the last slot kept
+  for nearly isolated requesters. This path bypasses the evaluator window and is never recorded
+  into it. With no slot to give, the request falls back to the self-interest rule.
+- A requester with a **bar** (it already holds a connection that close to the target) is refused
+  unless this peer is strictly closer to the target or the lattice clause admits it
+  (`ENFORCE_REQUESTER_BAR`), then takes the self-interest rule.
+- An onboarding link is **provisional**: once old enough, it is the first link a prune or swap
+  sheds while on probation, and after `ONBOARDING_PROBATION` it graduates only if it would pass
+  the self-interest rule as a fresh candidate (beat the evaluator window; capped per window), if
+  the acceptor would fall below `min_connections` without it, or if it is a lattice edge.
+
 **Code reference:** `crates/core/src/topology.rs` (module docs, `adjust_topology`),
 `crates/core/src/topology/small_world_rand.rs`, `crates/core/src/ring/connection_manager.rs`
-(`should_accept`)
+(`should_accept`, `evaluate_admission`, `review_provisional_links`),
+`crates/core/src/ring/admission.rs`
 
 ### Where CONNECT Requests Are Accepted
 
@@ -339,7 +358,9 @@ flowchart LR
 
 | Method | Purpose |
 |--------|---------|
-| `should_accept()` | Evaluate new connection |
+| `should_accept()` | Evaluate new connection (need unknown) |
+| `evaluate_admission_at()` | Admission decision with the requester's need, returning an `AdmissionCode` (#5858) |
+| `review_provisional_links()` | End-of-probation review of onboarding links (#5858) |
 | `add_connection()` | Register established connection |
 | `routing()` | Select next hop for message |
 | `prune_alive_connection()` | Disconnect from peer |

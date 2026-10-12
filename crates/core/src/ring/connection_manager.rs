@@ -4149,13 +4149,6 @@ mod tests {
         );
     }
 
-    /// Companion to the marker guard: the floor must never drop to or below a
-    /// release known NOT to carry the variants.
-    ///
-    /// Kept alongside the marker test rather than replaced by it, because the
-    /// two catch different mistakes: this one catches the floor being LOWERED
-    /// (e.g. someone "fixing" a gate that seems not to fire), the marker one
-    /// catches the RELEASE advancing past a stationary floor.
     /// The send gate for `ConnectMsg::RequestWithNeed` (#5858) discriminates:
     /// unknown and pre-floor versions get the legacy request, at-floor and
     /// newer get the need. Each refusal is counted under its cause.
@@ -4218,6 +4211,28 @@ mod tests {
         }
     }
 
+    /// The CONNECT need floor's companion to its marker guard: the floor must
+    /// never drop to or below a release known NOT to carry `RequestWithNeed`.
+    #[test]
+    fn connect_need_floor_stays_above_every_release_without_the_variants() {
+        // 0.2.144 is the last release built without `RequestWithNeed`.
+        const LAST_RELEASE_WITHOUT_VARIANTS: (u8, u8, u16) = (0, 2, 144);
+        assert!(
+            crate::node::CONNECT_NEED_MIN_VERSION > LAST_RELEASE_WITHOUT_VARIANTS,
+            "CONNECT_NEED_MIN_VERSION ({:?}) dropped to or below \
+             {LAST_RELEASE_WITHOUT_VARIANTS:?}, a release with no RequestWithNeed variant \
+             index. Sending it to those peers fails to decode and drops the connection.",
+            crate::node::CONNECT_NEED_MIN_VERSION,
+        );
+    }
+
+    /// Companion to the marker guard: the floor must never drop to or below a
+    /// release known NOT to carry the variants.
+    ///
+    /// Kept alongside the marker test rather than replaced by it, because the
+    /// two catch different mistakes: this one catches the floor being LOWERED
+    /// (e.g. someone "fixing" a gate that seems not to fire), the marker one
+    /// catches the RELEASE advancing past a stationary floor.
     #[test]
     fn hash_first_floor_stays_above_every_release_without_the_variants() {
         /// Last release that does NOT carry the hash-first wire variants.
