@@ -1918,7 +1918,16 @@ impl SimNetwork {
     /// Starts regular node `label` after `delay` of virtual time instead of at
     /// its `start_backoff` stagger slot. Direct runner only. Used to join fresh
     /// peers into an already-formed network (#5858).
+    ///
+    /// Panics if `label` is not a regular node of this network (regular-node
+    /// labels are numbered after the gateways), so a mislabelled joiner cannot
+    /// silently start on time.
     pub fn with_node_start_delay(&mut self, label: &NodeLabel, delay: Duration) -> &mut Self {
+        assert!(
+            self.nodes.iter().any(|(_, l)| l == label),
+            "with_node_start_delay: {label} is not a regular node of {}",
+            self.name
+        );
         self.node_start_delays.insert(label.clone(), delay);
         self
     }
