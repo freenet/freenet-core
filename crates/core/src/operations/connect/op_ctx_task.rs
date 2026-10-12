@@ -2053,6 +2053,18 @@ mod driver_timing_tests {
         Arc<OpManager>,
         mpsc::Receiver<Either<NetMessage, NodeEvent>>,
     ) {
+        let (op_manager, events, op_execution) = op_manager_with_channels(id).await;
+        std::mem::forget(op_execution);
+        (op_manager, events)
+    }
+
+    async fn op_manager_with_channels(
+        id: &str,
+    ) -> (
+        Arc<OpManager>,
+        mpsc::Receiver<Either<NetMessage, NodeEvent>>,
+        mpsc::Receiver<(mpsc::Sender<WaiterReply>, NetMessage, Option<SocketAddr>)>,
+    ) {
         let config_args = crate::config::ConfigArgs {
             id: Some(id.to_string()),
             mode: Some(crate::contract::OperationMode::Local),
@@ -2085,12 +2097,12 @@ mod driver_timing_tests {
             .ring
             .connection_manager
             .set_own_addr_local_for_test("127.0.0.1:14858".parse().unwrap());
-        std::mem::forget((
-            ch_channel,
-            result_router_rx,
+        std::mem::forget((ch_channel, result_router_rx));
+        (
+            op_manager,
+            notification_rx.notifications_receiver,
             notification_rx.op_execution_receiver,
-        ));
-        (op_manager, notification_rx.notifications_receiver)
+        )
     }
 
     fn peer(port: u16) -> PeerKeyLocation {
@@ -2291,6 +2303,101 @@ mod driver_timing_tests {
             "a peer with a ring connection keeps its TTL-bounded collection"
         );
         drop(replies_tx);
+    }
+
+    /// Through the real entry point: a bootstrapping CONNECT to a gateway that
+    /// never answers ends after the quiet window and drops the gateway link.
+    #[tokio::test(start_paused = true)]
+    async fn start_client_connect_drops_a_gateway_link_that_never_answers() {
+        let (op_manager, mut events, mut op_execution) =
+            op_manager_with_channels("driver-dead-link-entry").await;
+        let gateway = peer(24867);
+        let gateway_addr = gateway.socket_addr().unwrap();
+        let own = op_manager.ring.connection_manager.own_location();
+        let tx = Transaction::new::<ConnectMsg>();
+        // Hold the request's reply channel open: unanswered, not closed.
+        let held = tokio::spawn(async move { op_execution.recv().await });
+        tokio::time::timeout(
+            Duration::from_secs(30),
+            super::start_client_connect(
+                tx,
+                gateway,
+                gateway_addr,
+                &op_manager,
+                own,
+                Location::new(0.5),
+                None,
+                ClientConnectKind::Standard,
+            ),
+        )
+        .await
+        .expect("a bootstrapping CONNECT must end early")
+        .expect("driver result");
+        let mut dropped = false;
+        while let Ok(event) = events.try_recv() {
+            if matches!(event, Either::Right(NodeEvent::DropConnection(a)) if a == gateway_addr) {
+                dropped = true;
+            }
+        }
+        assert!(
+            dropped,
+            "the unanswered gateway link must be dropped for a redial"
+        );
+        drop(held);
+    }
+
+    /// The maintenance loop's zero-connection bootstrap (#5858): it takes the
+    /// shared bootstrap round before acting, clears its own leftover gateway
+    /// reservations while holding it, and runs the joins in a spawned task.
+    /// Awaited inline they held the maintenance loop for a transaction TTL;
+    /// without the round it could run CONNECTs concurrently with
+    /// `initial_join_procedure`. Source pin: the loop has no test harness of its
+    /// own. Mutation-checked (each of the three removed turns it red).
+    #[test]
+    fn maintenance_bootstrap_takes_the_round_and_spawns_its_joins() {
+        const RING: &str = include_str!("../../ring.rs");
+        let prod = &RING[..RING
+            .find("\n#[cfg(test)]\nmod ")
+            .expect("expected a test module")];
+        let code: String = prod
+            .lines()
+            .map(|line| line.split_once("//").map_or(line, |(code, _)| code))
+            .collect::<Vec<_>>()
+            .join("\n")
+            .split_whitespace()
+            .collect();
+        let start = code
+            .find("asyncfnconnection_maintenance(")
+            .expect("connection_maintenance not found");
+        let maintenance = &code[start..];
+        let block_start = maintenance
+            .find("ifcurrent_conn_count==0&&!op_manager.configured_gateways.is_empty(){")
+            .expect("zero-connection bootstrap not found");
+        let block = &maintenance[block_start..];
+        let begin = block
+            .find("BootstrapRoundGuard::try_begin(&op_manager.bootstrap_pacer,")
+            .expect("the bootstrap must take the shared round");
+        let clear = block
+            .find("clear_pending_reservations_for(&gateway_addrs)")
+            .expect("the bootstrap must clear its leftover gateway reservations");
+        let spawn = block
+            .find("GlobalExecutor::spawn(")
+            .expect("the joins must run in a spawned task");
+        let join = block
+            .find("join_ring_request(")
+            .expect("the bootstrap must still join through the gateways");
+        assert!(
+            begin < clear && clear < spawn && spawn < join,
+            "take the round, clear reservations, then spawn the joins"
+        );
+        let end = maintenance
+            .find("letmax_concurrent=calculate_max_concurrent_connections(")
+            .expect("end of the bootstrap block");
+        assert_eq!(
+            maintenance[..end].matches("join_ring_request(").count(),
+            1,
+            "no other join may be awaited inline in the maintenance loop"
+        );
     }
 
     #[tokio::test]
