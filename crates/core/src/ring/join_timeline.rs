@@ -14,6 +14,7 @@
 //! production nodes, which have no current network name) record nothing.
 
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
@@ -42,6 +43,23 @@ pub struct JoinTimeline {
     pub connects_before_first_ring_connection: Option<u64>,
     /// Ring-connection count after every change, in time order.
     pub ring_count_history: Vec<(Duration, usize)>,
+    /// Free-form trace of what the peer's CONNECT machinery did, in time
+    /// order (see [`record_note`]).
+    pub notes: Vec<JoinNote>,
+}
+
+/// One step of a peer's join, recorded by [`record_note`].
+#[derive(Debug, Clone)]
+pub struct JoinNote {
+    /// Virtual time since the recorder's origin.
+    pub at: Duration,
+    /// `GlobalSimulationTime::read_time_ms()` at the same moment: the clock
+    /// `Transaction::elapsed` (and so every operation TTL) reads in a
+    /// simulation, which advances per ULID generated, not with virtual time.
+    pub sim_clock_ms: u64,
+    pub what: String,
+    /// The remote peer the step concerns, if any.
+    pub remote: Option<SocketAddr>,
 }
 
 impl JoinTimeline {
@@ -150,6 +168,24 @@ pub fn record_connect_initiated(peer: &TransportPublicKey) {
             t.first_connect_at.get_or_insert(now);
             t.connects_initiated += 1;
             t.connect_times.push(now);
+        });
+    }
+}
+
+/// Append a step to `peer`'s join trace. `f` runs only when a recorder is
+/// installed for the current network, so the formatting costs nothing on
+/// production nodes.
+pub fn record_note(peer: &TransportPublicKey, f: impl FnOnce() -> (String, Option<SocketAddr>)) {
+    if let Some(recorder) = current_recorder() {
+        let (what, remote) = f();
+        let sim_clock_ms = crate::config::GlobalSimulationTime::read_time_ms();
+        recorder.with_peer(peer, |t, now| {
+            t.notes.push(JoinNote {
+                at: now,
+                sim_clock_ms,
+                what,
+                remote,
+            });
         });
     }
 }

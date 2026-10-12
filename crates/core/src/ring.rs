@@ -6482,6 +6482,9 @@ impl Ring {
                             ever_connected = ever_had_connections,
                             "Node isolated with zero ring connections — resetting all backoff state"
                         );
+                        join_timeline::record_note(&self.connection_manager.pub_key, || {
+                            ("isolation: resetting all backoff".to_string(), None)
+                        });
                         reset_all_backoff();
                         zero_connections_since = Some(self.time_source.now());
                     }

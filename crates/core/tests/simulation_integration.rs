@@ -20285,6 +20285,8 @@ struct SaturatedJoinReport {
     timelines: Vec<(String, freenet::dev_tool::JoinTimeline)>,
     /// Public key of every node, by label.
     keys: HashMap<String, freenet::dev_tool::TransportPublicKey>,
+    /// Socket address of every node, by label.
+    addrs: HashMap<String, SocketAddr>,
     logs: Arc<Mutex<Vec<freenet::tracing::NetLogMessage>>>,
     wall_clock: Duration,
 }
@@ -20534,7 +20536,7 @@ fn run_saturated_join(cfg: &SaturatedJoinConfig) -> SaturatedJoinReport {
     setup_deterministic_state(cfg.seed);
     let rt = create_runtime();
     let nodes = cfg.established + cfg.joiners;
-    let (sim, logs_handle, recorder, keys) = rt.block_on(async {
+    let (sim, logs_handle, recorder, keys, addrs) = rt.block_on(async {
         let mut sim = SimNetwork::new(
             cfg.name,
             cfg.gateways,
@@ -20578,7 +20580,12 @@ fn run_saturated_join(cfg: &SaturatedJoinConfig) -> SaturatedJoinReport {
         let recorder = sim.join_timeline_handle();
         let keys = sim.node_public_keys();
         let logs = sim.event_logs_handle();
-        (sim, logs, recorder, keys)
+        let addrs: HashMap<String, SocketAddr> = sim
+            .all_node_addresses()
+            .iter()
+            .map(|(label, addr)| (label.to_string(), *addr))
+            .collect();
+        (sim, logs, recorder, keys, addrs)
     });
     drop(rt);
 
@@ -20693,6 +20700,7 @@ fn run_saturated_join(cfg: &SaturatedJoinConfig) -> SaturatedJoinReport {
             .map(|(label, key)| (label.to_string(), key.clone()))
             .collect(),
         logs: logs_handle,
+        addrs,
         wall_clock: wall.elapsed(),
     };
     report.log();
@@ -20817,7 +20825,9 @@ fn test_saturated_join_burst_50() {
 /// `SJ_MIN`, `SJ_MAX`, `SJ_EST_STAGGER_MS`, `SJ_JOIN_AT_S`, `SJ_STAGGER_S`, `SJ_OBSERVE_S`,
 /// `SJ_LATENCY_MS` as `lo-hi` or `0` for none, `SJ_JITTER_MS`, `SJ_UNREACHABLE`, `SJ_SEED`).
 /// Logs the report and asserts nothing, so it can probe configs that do not
-/// saturate. With `SJ_JOINERS=0` it also logs the cold-burst analysis.
+/// saturate. With `SJ_JOINERS=0` it also logs the cold-burst analysis; with
+/// `SJ_TRACE` set it logs the join trace of the slow joiners (see
+/// `log_join_traces`).
 #[test_log::test]
 #[ignore = "manual measurement, configured from SJ_* environment variables (#5858)"]
 fn test_saturated_join_explore() {
@@ -20857,6 +20867,9 @@ fn test_saturated_join_explore() {
     let report = run_saturated_join(&cfg);
     if cfg.joiners == 0 {
         log_cold_burst(&report);
+    }
+    if std::env::var("SJ_TRACE").is_ok() {
+        log_join_traces(&report);
     }
 }
 
@@ -21072,4 +21085,134 @@ fn test_cold_burst_start() {
             "{label} never started or never initiated a CONNECT"
         );
     }
+}
+
+/// Logs, for every joiner that took more than 9s to its first ring connection
+/// (or never connected) and for the three fastest, its join trace from the
+/// recorder's notes (virtual time from its first CONNECT, the simulation's
+/// ULID clock, the remote and whether that pair is unreachable), followed by
+/// the hop chain of each CONNECT it originated, from the event log.
+fn log_join_traces(report: &SaturatedJoinReport) {
+    use freenet::simulation::FaultConfig;
+
+    let cfg = &report.cfg;
+    let gateways: Vec<SocketAddr> = report
+        .addrs
+        .iter()
+        .filter(|(label, _)| label.contains("-gateway-"))
+        .map(|(_, a)| *a)
+        .collect();
+    let faults = FaultConfig::builder()
+        .unreachable_pairs(cfg.unreachable_pair_fraction, cfg.seed)
+        .always_reachable(gateways)
+        .build();
+    let label_of_addr: HashMap<SocketAddr, &str> = report
+        .addrs
+        .iter()
+        .map(|(label, a)| (*a, label.as_str()))
+        .collect();
+    let label_of_key: HashMap<&freenet::dev_tool::TransportPublicKey, &str> = report
+        .keys
+        .iter()
+        .map(|(label, k)| (k, label.as_str()))
+        .collect();
+    let short = |label: &str| label.rsplit('-').take(2).collect::<Vec<_>>().join("-");
+
+    let mut picked: Vec<&JoinerOutcome> = report
+        .joiners
+        .iter()
+        .filter(|j| j.to_first_ring.is_none_or(|d| d > Duration::from_secs(9)))
+        .collect();
+    let mut fast: Vec<&JoinerOutcome> = report
+        .joiners
+        .iter()
+        .filter(|j| j.to_first_ring.is_some_and(|d| d <= Duration::from_secs(2)))
+        .collect();
+    fast.sort_by_key(|j| j.to_first_ring);
+    picked.extend(fast.into_iter().take(3));
+
+    let rt = create_runtime();
+    rt.block_on(async {
+        let logs = report.logs.lock().await;
+        for j in picked {
+            let tl = &report
+                .timelines
+                .iter()
+                .find(|(l, _)| *l == j.label)
+                .unwrap()
+                .1;
+            let me = report.addrs[&j.label];
+            let origin = tl.first_connect_at.unwrap_or_default();
+            let clock0 = tl.notes.first().map(|n| n.sim_clock_ms).unwrap_or(0);
+            let until = tl
+                .first_ring_connection_at()
+                .map(|t| t + Duration::from_secs(5))
+                .unwrap_or(Duration::MAX);
+            let mut out = format!(
+                "=== trace {} (first ring {}, {} CONNECTs) ===\n",
+                j.label,
+                fmt_opt(j.to_first_ring),
+                j.connects_initiated
+            );
+            let mut txs: Vec<String> = Vec::new();
+            for n in tl.notes.iter().filter(|n| n.at <= until) {
+                let remote = n.remote.map(|r| {
+                    let who = label_of_addr.get(&r).map(|l| short(l)).unwrap_or_default();
+                    let reach = if faults.is_unreachable_pair(&me, &r) {
+                        " UNREACHABLE"
+                    } else {
+                        ""
+                    };
+                    format!(" -> {who}{reach}")
+                });
+                out.push_str(&format!(
+                    "  +{:>7.2}s clock+{:>6}ms {}{}\n",
+                    n.at.saturating_sub(origin).as_secs_f64(),
+                    n.sim_clock_ms.saturating_sub(clock0),
+                    n.what,
+                    remote.unwrap_or_default()
+                ));
+                if let Some(tx) = n.what.strip_prefix("CONNECT start tx=") {
+                    txs.push(tx.split(' ').next().unwrap_or_default().to_string());
+                }
+            }
+            for (at, count) in tl.ring_count_history.iter().filter(|(at, _)| *at <= until) {
+                out.push_str(&format!(
+                    "  +{:>7.2}s ring connections = {count}\n",
+                    at.saturating_sub(origin).as_secs_f64()
+                ));
+            }
+            for tx in &txs {
+                let hops: Vec<String> = logs
+                    .iter()
+                    .filter(|l| l.tx.to_string() == *tx)
+                    .filter(|l| l.kind.connect_request_received_joiner().is_some())
+                    .map(|l| {
+                        let who = label_of_key
+                            .get(l.peer_id.pub_key())
+                            .map(|l| short(l))
+                            .unwrap_or_default();
+                        let outcome = if l.kind.is_connect_accepted() {
+                            let reach = report
+                                .addrs
+                                .get(label_of_key.get(l.peer_id.pub_key()).copied().unwrap_or(""))
+                                .is_some_and(|a| faults.is_unreachable_pair(&me, a));
+                            if reach {
+                                "ACCEPT(unreachable)"
+                            } else {
+                                "ACCEPT"
+                            }
+                        } else if l.kind.is_connect_forwarded() {
+                            "fwd"
+                        } else {
+                            "REJECT"
+                        };
+                        format!("{who}:{outcome}")
+                    })
+                    .collect();
+                out.push_str(&format!("  chain {tx}: {}\n", hops.join(" ")));
+            }
+            tracing::info!(target: "saturated_join", "{out}");
+        }
+    });
 }

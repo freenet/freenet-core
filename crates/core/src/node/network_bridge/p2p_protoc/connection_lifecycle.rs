@@ -487,6 +487,18 @@ impl P2pConnManager {
                 phase = "connect",
                 "Skipping connection attempt - peer in backoff"
             );
+            crate::ring::join_timeline::record_note(
+                &self.bridge.op_manager.ring.connection_manager.pub_key,
+                || {
+                    (
+                        format!(
+                            "connect_peer tx={tx}: skipped, peer in backoff ({}s left)",
+                            remaining.as_secs()
+                        ),
+                        Some(peer_addr),
+                    )
+                },
+            );
             callback
                 .send_result(Err(()))
                 .await
@@ -554,6 +566,15 @@ impl P2pConnManager {
                     pending_txs = ?txs_entry,
                     transient,
                     "connect_peer: connection already pending, queued callback"
+                );
+                crate::ring::join_timeline::record_note(
+                    &self.bridge.op_manager.ring.connection_manager.pub_key,
+                    || {
+                        (
+                            format!("connect_peer tx={tx}: queued behind a pending handshake"),
+                            Some(peer_addr),
+                        )
+                    },
                 );
                 return Ok(());
             }
@@ -771,6 +792,17 @@ impl P2pConnManager {
                     transaction = %transaction,
                     ?error,
                     "Outbound connection failed"
+                );
+                crate::ring::join_timeline::record_note(
+                    &self.bridge.op_manager.ring.connection_manager.pub_key,
+                    || {
+                        (
+                            format!(
+                                "handshake: outbound failed tx={transaction} transient={transient}: {error}; peer backoff recorded"
+                            ),
+                            Some(peer_addr),
+                        )
+                    },
                 );
 
                 self.bridge
