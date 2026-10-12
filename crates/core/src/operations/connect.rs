@@ -1915,6 +1915,27 @@ pub(crate) async fn initial_join_procedure(
             // about. The stall — gateway transports up, no real peers acquired
             // — routes CONNECTs through the connected gateways and is counted
             // as `ConnectIssuedRouted`.
+            // With no ring connection, rounds are paced by the bootstrap pacer
+            // shared with the maintenance loop (#5858): one round at a time,
+            // failed rounds spaced by a jittered exponential backoff. The
+            // round's CONNECTs end as soon as nothing more is coming
+            // (`bootstrap::BootstrapRound`), so the next starts in seconds,
+            // not after the transaction TTL.
+            let mut bootstrap_round = if open_conns == 0 {
+                match bootstrap::wait_for_bootstrap_round(
+                    &op_manager.bootstrap_pacer,
+                    &op_manager.gateway_backoff_cleared,
+                    || op_manager.ring.open_connections() > 0,
+                )
+                .await
+                {
+                    Some(round) => Some(round),
+                    None => continue,
+                }
+            } else {
+                None
+            };
+
             let mut round_recorded = false;
             let mut record_round = |outcome: StartupRoundOutcome| {
                 if !round_recorded && !min_connections_reached {
@@ -2072,6 +2093,9 @@ pub(crate) async fn initial_join_procedure(
                     number_of_parallel_connections.min(eligible_count),
                     unconnected_count - eligible_count
                 );
+                if let Some(round) = bootstrap_round.as_mut() {
+                    round.issued = eligible_count > 0;
+                }
                 let select_all = FuturesUnordered::new();
                 for gateway in eligible_gateways
                     .into_iter()
@@ -2153,6 +2177,9 @@ pub(crate) async fn initial_join_procedure(
                         total_gateways = gateways.len(),
                         "Routing CONNECTs through connected gateways"
                     );
+                    if let Some(round) = bootstrap_round.as_mut() {
+                        round.issued = true;
+                    }
                     let select_all = FuturesUnordered::new();
                     for gateway in eligible
                         .into_iter()
@@ -2225,6 +2252,16 @@ pub(crate) async fn initial_join_procedure(
             // iteration, so reaching here with it false means
             // `open_conns < bootstrap_threshold`.
             record_round(StartupRoundOutcome::NoTarget);
+
+            if let Some(mut round) = bootstrap_round.take() {
+                let issued = round.issued;
+                round.connected = op_manager.ring.open_connections() > 0;
+                drop(round);
+                if issued {
+                    // The pacer spaces the next round.
+                    continue;
+                }
+            }
 
             // Add random jitter to prevent thundering herd after gateway restart.
             // Without jitter, all peers that lose their gateway connection retry
