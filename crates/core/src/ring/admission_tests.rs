@@ -133,7 +133,6 @@ fn onboarding_budget_is_bounded_and_frees_on_a_failed_handshake() {
         short_at(60, 0.75, start),
         AdmissionCode::RejectedOnboardingBudgetExhausted
     );
-    assert_eq!(cm.admission_stats().rejected_onboarding_budget_exhausted, 1);
     assert_eq!(
         cm.admission_stats().provisional_in_use,
         ONBOARDING_PROVISIONAL_SLOTS as u64
@@ -737,5 +736,53 @@ fn successful_handshake_consumes_the_reservation_without_freeing_the_slot() {
             .iter()
             .any(|l| l.contains("prune_in_transit_connection(")),
         "prune_in_transit_connection on the success path takes onboarding links off probation"
+    );
+}
+
+/// Review S7: a relay may decide one request several times (after an uphill
+/// rejection it re-decides). It is counted refused at most once and admitted
+/// at most once, so the counters stay per request.
+#[test]
+fn a_relay_counts_each_request_once() {
+    let cm = manager(3, 20);
+    let mut recorded = false;
+    let exhausted = Some(AdmissionCode::RejectedOnboardingBudgetExhausted);
+    cm.record_relay_admission(exhausted, &mut recorded);
+    cm.record_relay_admission(exhausted, &mut recorded);
+    assert_eq!(cm.admission_stats().rejected_onboarding_budget_exhausted, 1);
+    cm.record_relay_admission(Some(AdmissionCode::AcceptedOnboarding), &mut recorded);
+    assert_eq!(cm.admission_stats().admitted_onboarding, 1);
+    cm.record_relay_admission(None, &mut recorded);
+    assert_eq!(cm.admission_stats().admitted_onboarding, 1);
+
+    cm.record_request_seen(RequesterNeed::Short(0));
+    cm.record_request_seen(RequesterNeed::Bar(0.1));
+    cm.record_request_seen(RequesterNeed::Unknown);
+    let stats = cm.admission_stats();
+    assert_eq!((stats.requests_seen_short, stats.requests_seen_bar), (1, 1));
+}
+
+/// Source pin: the relay driver counts the need it saw and every admission
+/// decision through `record_relay_admission` (initial and both retry paths),
+/// and the decision function itself no longer counts.
+#[test]
+fn the_relay_driver_counts_admissions_once_per_request() {
+    const DRIVER_SRC: &str = include_str!("../operations/connect/op_ctx_task.rs");
+    let code: String = DRIVER_SRC
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("//"))
+        .collect::<String>()
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
+    assert_eq!(
+        code.matches(".record_relay_admission(").count(),
+        3,
+        "the initial decision and the two retry paths"
+    );
+    assert_eq!(
+        code.matches(".record_request_seen(state.request.need)")
+            .count(),
+        1
     );
 }

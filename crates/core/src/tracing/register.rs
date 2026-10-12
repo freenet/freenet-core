@@ -311,6 +311,7 @@ impl<'a> NetEventLog<'a> {
         accepted: bool,
         ttl: u8,
         admission: Option<crate::ring::admission::AdmissionCode>,
+        requester_need: crate::ring::admission::NeedClass,
     ) -> Option<Self> {
         let peer_id = Self::get_own_peer_id(ring)?;
         // Look up the full peer info from connection manager if the peer is already connected
@@ -327,6 +328,7 @@ impl<'a> NetEventLog<'a> {
                 accepted,
                 ttl,
                 admission,
+                requester_need,
             }),
         })
     }

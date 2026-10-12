@@ -823,7 +823,7 @@ impl ConnectionManager {
     /// the lattice clause) exactly as before #5858. See
     /// [`Self::evaluate_admission`].
     pub fn should_accept(&self, location: Location, addr: SocketAddr) -> bool {
-        self.evaluate_admission(location, addr, RequesterNeed::Unknown, None)
+        self.evaluate_admission_at(location, addr, RequesterNeed::Unknown, None, Instant::now())
             .accepted()
     }
 
@@ -850,6 +850,10 @@ impl ConnectionManager {
     /// Does not panic when this node has no location assigned yet: every clause
     /// that needs the own location guards `get_stored_location()` and falls
     /// through to a location-independent decision.
+    ///
+    /// Test convenience: decides at the current instant and counts the
+    /// decision, as the relay driver does for a request's first decision.
+    #[cfg(test)]
     pub(crate) fn evaluate_admission(
         &self,
         location: Location,
@@ -857,11 +861,16 @@ impl ConnectionManager {
         need: RequesterNeed,
         target: Option<Location>,
     ) -> AdmissionCode {
-        self.evaluate_admission_at(location, addr, need, target, Instant::now())
+        let code = self.evaluate_admission_at(location, addr, need, target, Instant::now());
+        self.admission_counters.record_decision(code);
+        code
     }
 
-    /// [`Self::evaluate_admission`] at an explicit `now` (the caller's time
-    /// source), which the onboarding slots record and refill against.
+    /// Decide admission at an explicit `now` (the caller's time source), which
+    /// the onboarding slots record and refill against. Does NOT count the
+    /// decision: the relay driver counts once per request
+    /// ([`Self::record_relay_admission`]), since a relay may re-decide the same
+    /// request after an uphill rejection.
     pub(crate) fn evaluate_admission_at(
         &self,
         location: Location,
@@ -870,9 +879,26 @@ impl ConnectionManager {
         target: Option<Location>,
         now: Instant,
     ) -> AdmissionCode {
-        let code = self.evaluate_admission_inner(location, addr, need, target, now);
-        self.admission_counters.record_decision(code);
-        code
+        self.evaluate_admission_inner(location, addr, need, target, now)
+    }
+
+    /// Count a relay's admission decision for one request (#5858): its first
+    /// decision always, a later one (after an uphill rejection the relay
+    /// re-decides) only if it admits. A request is therefore counted as
+    /// refused at most once, and admitted at most once.
+    /// `recorded` is the driver's per-request flag.
+    pub(crate) fn record_relay_admission(&self, code: Option<AdmissionCode>, recorded: &mut bool) {
+        if let Some(code) = code {
+            if !*recorded || code.accepted() {
+                self.admission_counters.record_decision(code);
+                *recorded = true;
+            }
+        }
+    }
+
+    /// Count one CONNECT request arriving at this hop by its stated need.
+    pub(crate) fn record_request_seen(&self, need: RequesterNeed) {
+        self.admission_counters.record_request_seen(need);
     }
 
     fn evaluate_admission_inner(

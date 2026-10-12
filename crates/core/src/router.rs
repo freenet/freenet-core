@@ -1013,6 +1013,10 @@ pub(crate) struct RouterSnapshotInfo {
     pub connect_need_downgraded_below_floor: Option<u64>,
     /// Onboarding links whose connection was established.
     pub connect_onboarding_established: Option<u64>,
+    /// CONNECT requests seen at this hop stating a short need / a bar: the
+    /// denominators for the admission counters.
+    pub connect_requests_seen_short: Option<u64>,
+    pub connect_requests_seen_bar: Option<u64>,
     pub connect_provisional_in_use: Option<u64>,
     /// Version-gate refusal counters (#5156), populated by `Ring` on the
     /// snapshot cadence from `ConnectionManager::version_gate_refusal_stats`.
@@ -3665,6 +3669,8 @@ impl Router {
             connect_need_downgraded_unknown_version: None,
             connect_need_downgraded_below_floor: None,
             connect_onboarding_established: None,
+            connect_requests_seen_short: None,
+            connect_requests_seen_bar: None,
             connect_provisional_in_use: None,
             // Version-gate refusal counters, populated by Ring on the
             // snapshot cadence (#5156).

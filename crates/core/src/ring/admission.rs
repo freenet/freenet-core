@@ -188,9 +188,38 @@ impl RequesterNeed {
         }
     }
 
+    /// The telemetry class of this need.
+    pub(crate) fn class(self) -> NeedClass {
+        match self {
+            Self::Unknown => NeedClass::Unknown,
+            Self::Short(_) => NeedClass::Short,
+            Self::Bar(_) => NeedClass::Bar,
+        }
+    }
+
     /// A short-need value for a requester holding `open` ring connections.
     pub(crate) fn short(open: usize) -> Self {
         Self::Short(u8::try_from(open).unwrap_or(u8::MAX))
+    }
+}
+
+/// The class of a requester's need, carried on the `connect_request_received`
+/// telemetry event (#5858) so admissions can be read per class.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(arbitrary::Arbitrary))]
+pub(crate) enum NeedClass {
+    Unknown,
+    Short,
+    Bar,
+}
+
+impl NeedClass {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown",
+            Self::Short => "short",
+            Self::Bar => "bar",
+        }
     }
 }
 
@@ -297,6 +326,10 @@ pub(crate) struct AdmissionStats {
     /// Onboarding links whose connection was established (the denominator
     /// for the probation outcomes).
     pub onboarding_established: u64,
+    /// CONNECT requests that arrived at this hop stating a short need / a bar
+    /// (the denominators for the admission counters).
+    pub requests_seen_short: u64,
+    pub requests_seen_bar: u64,
     /// Provisional links currently on probation (gauge).
     pub provisional_in_use: u64,
 }
@@ -317,6 +350,8 @@ pub(crate) struct AdmissionCounters {
     need_downgraded_unknown_version: AtomicU64,
     need_downgraded_below_floor: AtomicU64,
     onboarding_established: AtomicU64,
+    requests_seen_short: AtomicU64,
+    requests_seen_bar: AtomicU64,
 }
 
 /// What became of a provisional link (see [`AdmissionCounters::record_provisional`]).
@@ -364,6 +399,17 @@ impl AdmissionCounters {
         counter.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// One CONNECT request arriving at this hop, by its requester's need: the
+    /// denominators for the admission counters.
+    pub(crate) fn record_request_seen(&self, need: RequesterNeed) {
+        let counter = match need {
+            RequesterNeed::Short(_) => &self.requests_seen_short,
+            RequesterNeed::Bar(_) => &self.requests_seen_bar,
+            RequesterNeed::Unknown => return,
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub(crate) fn record_onboarding_established(&self) {
         self.onboarding_established.fetch_add(1, Ordering::Relaxed);
     }
@@ -399,6 +445,8 @@ impl AdmissionCounters {
                 .load(Ordering::Relaxed),
             need_downgraded_below_floor: self.need_downgraded_below_floor.load(Ordering::Relaxed),
             onboarding_established: self.onboarding_established.load(Ordering::Relaxed),
+            requests_seen_short: self.requests_seen_short.load(Ordering::Relaxed),
+            requests_seen_bar: self.requests_seen_bar.load(Ordering::Relaxed),
             provisional_in_use: provisional_in_use as u64,
         }
     }

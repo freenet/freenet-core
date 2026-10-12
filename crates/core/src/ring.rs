@@ -2052,6 +2052,8 @@ impl Ring {
             snapshot.connect_need_downgraded_below_floor =
                 Some(admission.need_downgraded_below_floor);
             snapshot.connect_onboarding_established = Some(admission.onboarding_established);
+            snapshot.connect_requests_seen_short = Some(admission.requests_seen_short);
+            snapshot.connect_requests_seen_bar = Some(admission.requests_seen_bar);
             snapshot.connect_provisional_in_use = Some(admission.provisional_in_use);
 
             // Version-gate refusal counters (#5156): why
