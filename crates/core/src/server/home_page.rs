@@ -261,6 +261,7 @@ mod tests {
             gateway_only_persisting: false,
             bytes_uploaded: 0,
             bytes_downloaded: 0,
+            bandwidth_history: Vec::new(),
             health: HealthLevel::Connecting,
             ring_stats: RingStatsSnapshot::default(),
             fair_queue: Default::default(),
@@ -911,6 +912,150 @@ mod tests {
             !html.contains("avg)"),
             "must not present the sentinel 0 as a measured average; got: {html}"
         );
+    }
+
+    fn rate(age_secs: u64, up: f64, down: f64) -> crate::transport::bandwidth_history::RateSample {
+        crate::transport::bandwidth_history::RateSample {
+            age: std::time::Duration::from_secs(age_secs),
+            up_bytes_per_sec: up,
+            down_bytes_per_sec: down,
+        }
+    }
+
+    /// Fewer than two samples cannot draw a line, so the card says it is
+    /// measuring instead of showing an empty or one-point chart.
+    #[test]
+    fn transfer_card_says_measuring_until_two_samples() {
+        for history in [vec![], vec![rate(0, 1e3, 2e3)]] {
+            let mut snap = base_snapshot();
+            snap.bandwidth_history = history;
+            let html = build_transfer_card(&Some(snap));
+            assert!(html.contains("Measuring transfer rates"), "{html}");
+            assert!(!html.contains("bw-line-up"), "{html}");
+        }
+    }
+
+    /// The chart draws both directions at both widths, labels the latest
+    /// rates, and its tooltips report the sampled values.
+    #[test]
+    fn transfer_card_draws_bandwidth_chart() {
+        let mut snap = base_snapshot();
+        snap.bandwidth_history = vec![
+            rate(2, 1_000.0, 250_000.0),
+            rate(1, 3_000.0, 500_000.0),
+            rate(0, 2_000.0, 125_000.0),
+        ];
+        let html = build_transfer_card(&Some(snap));
+        assert_eq!(html.matches("class=\"bw-line-up\"").count(), 2, "{html}");
+        assert_eq!(html.matches("class=\"bw-line-down\"").count(), 2, "{html}");
+        assert!(html.contains("Upload <b>2 KB/s</b>"), "{html}");
+        assert!(html.contains("Download <b>125 KB/s</b>"), "{html}");
+        assert!(
+            html.contains("<title>1 s ago: upload 3 KB/s, download 500 KB/s</title>"),
+            "{html}"
+        );
+        assert!(!html.contains("NaN"), "{html}");
+    }
+
+    /// Newest sample at the right edge, the peak at the top, zero on the
+    /// baseline, upload and download not swapped. Pinned on the desktop
+    /// chart: width 600, plot from x=62 to x=590 and y=8 to y=128.
+    #[test]
+    fn bandwidth_chart_geometry() {
+        let mut snap = base_snapshot();
+        snap.bandwidth_history = vec![rate(1, 3_000.0, 0.0), rate(0, 1_500.0, 0.0)];
+        let html = build_transfer_card(&Some(snap));
+        assert!(
+            html.contains(r#"<path d="M581.2,8.0 L590.0,68.0" class="bw-line-up"/>"#),
+            "{html}"
+        );
+        assert!(
+            html.contains(r#"<path d="M581.2,128.0 L590.0,128.0" class="bw-line-down"/>"#),
+            "{html}"
+        );
+    }
+
+    /// Tooltips exist once per sample, on the desktop chart only, and their
+    /// hover columns stay inside the plot even with only two samples.
+    #[test]
+    fn bandwidth_chart_tooltips_are_desktop_only_and_inside_the_plot() {
+        let mut snap = base_snapshot();
+        snap.bandwidth_history = vec![
+            rate(60, 1.0, 1.0),
+            rate(59, 1.0, 1.0),
+            rate(1, 1.0, 1.0),
+            rate(0, 2.0, 2.0),
+        ];
+        let html = build_transfer_card(&Some(snap));
+        assert_eq!(html.matches("<title>").count(), 4, "{html}");
+        assert!(html.contains("<title>now: upload"), "{html}");
+        let narrow = html
+            .split(r#"<div class="w-narrow">"#)
+            .nth(1)
+            .expect("narrow chart");
+        assert!(!narrow.contains("bw-hit"), "{narrow}");
+        for rect in html.split("<rect ").skip(1) {
+            let attr = |name: &str| -> f64 {
+                let v = rect.split(&format!("{name}=\"")).nth(1).unwrap();
+                v[..v.find('"').unwrap()].parse().unwrap()
+            };
+            let (x, w) = (attr("x"), attr("width"));
+            // Attributes are printed to 0.1, so allow that much rounding.
+            assert!(
+                x >= 62.0 && x + w <= 590.0 + 0.1,
+                "rect {x}+{w} outside plot"
+            );
+            // One sampling interval (528 / 60 = 8.8) or less.
+            assert!(w <= 8.8 + 0.1, "rect {x}+{w} wider than one interval");
+        }
+        // The edge columns are trimmed to half an interval rather than
+        // shifted inward over the neighbouring sample's point.
+        let widths: Vec<&str> = html
+            .split(r#"class="bw-hit""#)
+            .map(|chunk| chunk.rsplit("width=\"").next().unwrap())
+            .collect();
+        assert!(widths[0].starts_with("4.4\""), "oldest column: {html}");
+        assert!(widths[3].starts_with("4.4\""), "newest column: {html}");
+    }
+
+    /// A stalled sampler leaves an old newest sample; the headline says how
+    /// old instead of presenting it as the current rate.
+    #[test]
+    fn bandwidth_headline_flags_stale_samples() {
+        let card = |newest: u64| {
+            let mut snap = base_snapshot();
+            snap.bandwidth_history = vec![rate(newest + 1, 1.0, 1.0), rate(newest, 1.0, 1.0)];
+            build_transfer_card(&Some(snap))
+        };
+        let fresh = card(3);
+        assert!(!fresh.contains("bw-stale"), "{fresh}");
+        assert!(card(4).contains("as of 4 s ago"));
+        assert!(card(40).contains("as of 40 s ago"));
+    }
+
+    /// The y axis tops out at or above the largest rate in either direction,
+    /// so no line is clipped; an idle node still gets a usable axis.
+    #[test]
+    fn bandwidth_rate_axis_covers_the_peak() {
+        for peak in [
+            0.0,
+            1.0,
+            999.0,
+            1_000.0,
+            1_001.0,
+            7_300.0,
+            2.5e6,
+            9.99e8,
+            f64::NAN,
+        ] {
+            let (top, step) = cards::rate_axis(peak);
+            assert!(top.is_finite() && step > 0.0, "peak {peak}: {top} {step}");
+            if peak.is_finite() {
+                assert!(top >= peak, "peak {peak} clipped by axis top {top}");
+            }
+            let steps = top / step;
+            assert!((1.0..=4.0).contains(&steps), "peak {peak}: {steps} steps");
+        }
     }
 
     #[test]

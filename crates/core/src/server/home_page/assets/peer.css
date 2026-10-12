@@ -347,24 +347,6 @@ details.diag .info-grid {
   height: 0;
   border-top: 2px solid var(--accent-primary);
 }
-svg.mchart {
-  display: block;
-  width: 100%;
-  height: auto;
-  overflow: visible;
-}
-svg.mchart .ax {
-  stroke: var(--text-muted);
-  stroke-width: 1;
-}
-svg.mchart .grid {
-  stroke: var(--border-color);
-  stroke-width: 1;
-}
-svg.mchart text {
-  font: 10px var(--font-mono);
-  fill: var(--text-muted);
-}
 svg.mchart text.dl {
   font-size: 10.5px;
   fill: var(--text-secondary);
@@ -466,18 +448,7 @@ svg.mchart .line-peer {
   font-weight: 600;
   color: var(--text-primary);
 }
-/* Charts with text along an axis are rendered at two widths; show the one that
-   fits, so axis labels stay legible on a phone instead of scaling down. */
-.w-narrow {
-  display: none;
-}
 @media (max-width: 640px) {
-  .w-wide {
-    display: none;
-  }
-  .w-narrow {
-    display: block;
-  }
   .tiles,
   .acc-row {
     grid-template-columns: minmax(0, 1fr);

@@ -775,6 +775,108 @@ code {
   font-family: var(--font-mono);
   margin-top: 0.2rem;
 }
+/* ── Server-rendered SVG charts (home_page/charts.rs), shared by every page ── */
+svg.mchart {
+  display: block;
+  width: 100%;
+  height: auto;
+  overflow: visible;
+}
+svg.mchart .ax {
+  stroke: var(--text-muted);
+  stroke-width: 1;
+}
+svg.mchart .grid {
+  stroke: var(--border-color);
+  stroke-width: 1;
+}
+svg.mchart text {
+  font: 10px var(--font-mono);
+  fill: var(--text-muted);
+}
+/* Charts with text along an axis are rendered at two widths; show the one that
+   fits, so axis labels stay legible on a phone instead of scaling down. */
+.w-narrow {
+  display: none;
+}
+@media (max-width: 640px) {
+  .w-wide {
+    display: none;
+  }
+  .w-narrow {
+    display: block;
+  }
+}
+/* ── Bandwidth chart (Data Transfer card) ── */
+.bw-section {
+  padding: 0.5rem;
+  background: var(--bg-secondary);
+  border-radius: 6px;
+  border: 1px solid var(--border-color);
+}
+.bw-section h3 {
+  margin: 0 0 0.3rem;
+  font-size: 0.75rem;
+  color: var(--text-secondary);
+  font-weight: 500;
+  text-transform: uppercase;
+  font-family: var(--font-mono);
+}
+.bw-now {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem 1.2rem;
+  margin: 0 0 0.3rem;
+  font-size: 0.8rem;
+  color: var(--text-secondary);
+}
+.bw-stale {
+  color: var(--text-muted);
+}
+.bw-now b {
+  font-family: var(--font-mono);
+  color: var(--text-primary);
+}
+.bw-key {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+}
+.bw-swatch {
+  width: 16px;
+  height: 0;
+}
+.bw-swatch-up {
+  border-top: 2px solid var(--accent-primary);
+}
+.bw-swatch-down {
+  border-top: 2px dashed var(--text-secondary);
+}
+svg.mchart .bw-line-up {
+  pointer-events: none;
+  fill: none;
+  stroke: var(--accent-primary);
+  stroke-width: 2;
+}
+svg.mchart .bw-line-down {
+  pointer-events: none;
+  fill: none;
+  stroke: var(--text-secondary);
+  stroke-width: 2;
+  stroke-dasharray: 5 3;
+}
+svg.mchart .bw-hit {
+  fill: transparent;
+}
+svg.mchart .bw-hit:hover {
+  fill: var(--text-muted);
+  fill-opacity: 0.2;
+}
+.bw-note {
+  margin: 0.3rem 0 0;
+  font-size: 0.7rem;
+  color: var(--text-muted);
+}
 /* ── Transfer stats ── */
 .transfer-stat {
   display: flex;

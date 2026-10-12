@@ -199,6 +199,7 @@ pub mod peer_connection;
 // todo: optimize trackers
 mod received_packet_tracker;
 
+pub(crate) mod bandwidth_history;
 pub(crate) mod bbr;
 pub mod congestion_control;
 pub(crate) mod fixed_rate;

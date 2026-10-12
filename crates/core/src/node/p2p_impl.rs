@@ -883,6 +883,9 @@ impl NodeP2P {
             local_peer_id.clone(),
             &background_task_monitor,
         );
+        // Feeds the dashboard's bandwidth chart (#5152): two atomic loads
+        // under an uncontended lock per second, into a fixed-size buffer.
+        crate::transport::bandwidth_history::spawn_sampler(&background_task_monitor);
         // Phase 1.6 demand + outbound-class aggregators (#4074). Both are
         // always-on like the RTT aggregator: they only read atomics + the
         // bandwidth handle and emit one OTLP event per second each (no
