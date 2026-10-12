@@ -20258,6 +20258,9 @@ struct SaturatedJoinReport {
     established_at_min: usize,
     /// Ring-connection counts of established regular nodes at `join_at`.
     established_degrees: Vec<usize>,
+    /// Established peers below min_connections at `join_at`, for diagnosis:
+    /// (label, count at join_at, first ring connection, CONNECTs initiated).
+    established_below_min: Vec<(String, usize, Option<Duration>, u64)>,
     joiners: Vec<JoinerOutcome>,
     all_hops: ConnectHopStats,
     joiner_hops: ConnectHopStats,
@@ -20369,6 +20372,14 @@ impl SaturatedJoinReport {
             self.joiner_hops.chains_without_accept_fraction() * 100.0,
             self.joiner_hops.chain_lengths.len(),
         );
+        for (label, count, first, connects) in &self.established_below_min {
+            tracing::info!(
+                target: "saturated_join",
+                "  established below min at join_at: {label} count={count} first ring at {} \
+                 CONNECTs={connects}",
+                fmt_opt(*first),
+            );
+        }
         for j in &self.joiners {
             tracing::info!(
                 target: "saturated_join",
@@ -20537,6 +20548,21 @@ fn run_saturated_join(cfg: &SaturatedJoinConfig) -> SaturatedJoinReport {
         .iter()
         .filter(|&&c| c >= cfg.min_connections)
         .count();
+    let established_below_min = (0..cfg.established)
+        .filter_map(|i| {
+            let label = NodeLabel::node(cfg.name, cfg.gateways + i);
+            let t = timeline_of(&label);
+            let count = t.count_at(cfg.join_at);
+            (count < cfg.min_connections).then(|| {
+                (
+                    label.to_string(),
+                    count,
+                    t.first_ring_connection_at(),
+                    t.connects_initiated,
+                )
+            })
+        })
+        .collect();
 
     let mut joiner_keys = HashSet::new();
     let joiners: Vec<JoinerOutcome> = (0..cfg.joiners)
@@ -20578,6 +20604,7 @@ fn run_saturated_join(cfg: &SaturatedJoinConfig) -> SaturatedJoinReport {
         cfg: cfg.clone(),
         established_at_min,
         established_degrees,
+        established_below_min,
         joiners,
         all_hops,
         joiner_hops,
@@ -20667,4 +20694,43 @@ fn test_saturated_join_burst_50() {
     };
     let report = run_saturated_join(&cfg);
     report.assert_measured_a_saturated_join(SATURATED_JOIN_MIN_SATURATION);
+}
+
+/// Manual exploration: every `SaturatedJoinConfig` field can be overridden
+/// from the environment (`SJ_GATEWAYS`, `SJ_ESTABLISHED`, `SJ_JOINERS`,
+/// `SJ_MIN`, `SJ_MAX`, `SJ_JOIN_AT_S`, `SJ_STAGGER_S`, `SJ_OBSERVE_S`,
+/// `SJ_LATENCY_MS` as `lo-hi` or `0` for none, `SJ_UNREACHABLE`, `SJ_SEED`).
+/// Logs the report and asserts nothing, so it can probe configs that do not
+/// saturate.
+#[test_log::test]
+#[ignore = "manual measurement, configured from SJ_* environment variables (#5858)"]
+fn test_saturated_join_explore() {
+    fn env<T: std::str::FromStr>(key: &str) -> Option<T> {
+        std::env::var(key).ok().and_then(|v| v.parse().ok())
+    }
+    let mut cfg = SaturatedJoinConfig::new(
+        "saturated-join-explore",
+        env("SJ_SEED").unwrap_or(0x5858_0000_0004),
+    );
+    cfg.gateways = env("SJ_GATEWAYS").unwrap_or(cfg.gateways);
+    cfg.established = env("SJ_ESTABLISHED").unwrap_or(cfg.established);
+    cfg.joiners = env("SJ_JOINERS").unwrap_or(cfg.joiners);
+    cfg.min_connections = env("SJ_MIN").unwrap_or(cfg.min_connections);
+    cfg.max_connections = env("SJ_MAX").unwrap_or(cfg.max_connections);
+    if let Some(s) = env::<u64>("SJ_JOIN_AT_S") {
+        cfg.join_at = Duration::from_secs(s);
+    }
+    if let Some(s) = env::<u64>("SJ_STAGGER_S") {
+        cfg.join_stagger = Duration::from_secs(s);
+    }
+    if let Some(s) = env::<u64>("SJ_OBSERVE_S") {
+        cfg.observe_for = Duration::from_secs(s);
+    }
+    if let Ok(v) = std::env::var("SJ_LATENCY_MS") {
+        cfg.latency = v.split_once('-').and_then(|(lo, hi)| {
+            Some(Duration::from_millis(lo.parse().ok()?)..Duration::from_millis(hi.parse().ok()?))
+        });
+    }
+    cfg.unreachable_pair_fraction = env("SJ_UNREACHABLE").unwrap_or(0.0);
+    run_saturated_join(&cfg);
 }
