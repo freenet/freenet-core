@@ -8777,8 +8777,12 @@ mod tests {
             SHELL_BRIDGE_JS.contains("newContractPrefix === contractPrefix"),
             "same-contract branch must compare prefixes"
         );
+        // The frame path is built by `sameContractFramePath` (which also drops
+        // the `_freload` recovery stamp); `bridge_js_calls_the_freload_hygiene_helpers`
+        // pins that the handler calls it.
         assert!(
-            SHELL_BRIDGE_JS.contains("resolved.searchParams.set('__sandbox', '1')"),
+            SHELL_BRIDGE_JS.contains("u.searchParams.set('__sandbox', '1')")
+                && SHELL_BRIDGE_JS.contains("var newIframePath = sameContractFramePath("),
             "same-contract branch must add __sandbox=1 to navigated URL"
         );
         // Cross-contract branch: must do a top-level window.location.assign
