@@ -205,6 +205,9 @@ pub(crate) struct AdmissionStats {
     /// Requests sent in the legacy form only because the next hop's version
     /// does not understand the need (or is unknown).
     pub need_downgraded_to_legacy: u64,
+    /// Onboarding links whose connection was established (the denominator
+    /// for the probation outcomes).
+    pub onboarding_established: u64,
     /// Provisional links currently on probation (gauge).
     pub provisional_in_use: u64,
 }
@@ -223,6 +226,7 @@ pub(crate) struct AdmissionCounters {
     provisional_pruned: AtomicU64,
     provisional_released_unestablished: AtomicU64,
     need_downgraded_to_legacy: AtomicU64,
+    onboarding_established: AtomicU64,
 }
 
 /// What became of a provisional link (see [`AdmissionCounters::record_provisional`]).
@@ -268,6 +272,10 @@ impl AdmissionCounters {
         counter.fetch_add(1, Ordering::Relaxed);
     }
 
+    pub(crate) fn record_onboarding_established(&self) {
+        self.onboarding_established.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub(crate) fn record_need_downgraded(&self) {
         self.need_downgraded_to_legacy
             .fetch_add(1, Ordering::Relaxed);
@@ -289,6 +297,7 @@ impl AdmissionCounters {
                 .provisional_released_unestablished
                 .load(Ordering::Relaxed),
             need_downgraded_to_legacy: self.need_downgraded_to_legacy.load(Ordering::Relaxed),
+            onboarding_established: self.onboarding_established.load(Ordering::Relaxed),
             provisional_in_use: provisional_in_use as u64,
         }
     }
@@ -340,7 +349,6 @@ impl ProvisionalLinks {
         self.admitted_at.remove(&addr).is_some()
     }
 
-    #[cfg(test)]
     pub(crate) fn contains(&self, addr: SocketAddr) -> bool {
         self.admitted_at.contains_key(&addr)
     }

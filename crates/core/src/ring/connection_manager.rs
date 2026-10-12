@@ -2410,11 +2410,24 @@ impl ConnectionManager {
     }
 
     pub fn prune_alive_connection(&self, addr: SocketAddr) -> Option<Location> {
-        self.prune_connection(addr, true)
+        self.prune_connection(addr, true, Some(ProvisionalOutcome::Pruned))
     }
 
     pub fn prune_in_transit_connection(&self, addr: SocketAddr) -> Option<Location> {
-        self.prune_connection(addr, false)
+        self.prune_connection(addr, false, Some(ProvisionalOutcome::ReleasedUnestablished))
+    }
+
+    /// Consume the pending reservation of a connection whose handshake has
+    /// just SUCCEEDED, ahead of promoting it into the ring (the success path of
+    /// `handle_successful_connection`).
+    ///
+    /// Same bookkeeping as [`Self::prune_in_transit_connection`] except that an
+    /// onboarding slot is KEPT (#5858): the link is about to be established and
+    /// must stay on probation. Releasing it here took every onboarding link off
+    /// probation the moment it connected, so the slot bound limited only
+    /// handshakes in flight.
+    pub fn take_reservation_for_promotion(&self, addr: SocketAddr) -> Option<Location> {
+        self.prune_connection(addr, false, None)
     }
 
     /// Clear pending reservations for specific addresses.
@@ -2652,6 +2665,12 @@ impl ConnectionManager {
         // Track connection time for optimistic readiness timeout.
         self.connected_since.write().insert(addr, Instant::now());
 
+        // An onboarding link that actually established (#5858): the denominator
+        // for probation outcomes.
+        if self.provisional_links.lock().contains(addr) {
+            self.admission_counters.record_onboarding_established();
+        }
+
         // Initialize health tracking for the new peer.
         self.peer_health.lock().init_peer(addr);
 
@@ -2737,12 +2756,23 @@ impl ConnectionManager {
         true
     }
 
-    fn prune_connection(&self, addr: SocketAddr, is_alive: bool) -> Option<Location> {
+    /// `release_slot`: what to record if `addr` holds an onboarding slot, which
+    /// is then freed (#5858); `None` keeps the slot (a successful handshake
+    /// consuming its reservation, see [`Self::take_reservation_for_promotion`]).
+    fn prune_connection(
+        &self,
+        addr: SocketAddr,
+        is_alive: bool,
+        release_slot: Option<ProvisionalOutcome>,
+    ) -> Option<Location> {
         // A link on probation that goes away (pruned, dropped, or a handshake
         // that failed) frees its onboarding slot at once (#5858). Taken before
         // the ring maps: the provisional lock is never nested with them.
-        if self.provisional_links.lock().release(addr) {
-            tracing::debug!(addr = %addr, "Released onboarding slot of pruned connection");
+        if let Some(outcome) = release_slot {
+            if self.provisional_links.lock().release(addr) {
+                self.admission_counters.record_provisional(outcome);
+                tracing::debug!(addr = %addr, ?outcome, "Released onboarding slot of pruned connection");
+            }
         }
         let connection_type = if is_alive { "active" } else { "in transit" };
         tracing::info!(
