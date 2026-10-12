@@ -253,18 +253,54 @@ pub(crate) async fn start_client_connect(
                     timeout_ms = timeout.as_millis(),
                     "connect driver: overall timeout fired; exiting gracefully"
                 );
-                Ok(())
+                Ok(ClientConnectEnd::Finished)
             }
         },
         None => inner.await,
     };
+    if matches!(
+        outcome,
+        Ok(ClientConnectEnd::Bootstrap(
+            super::bootstrap::BootstrapExit::NoReply
+        ))
+    ) {
+        drop_dead_gateway_link(op_manager, tx, gateway_addr);
+    }
+    let outcome = outcome.map(|_| ());
 
     op_manager.release_pending_op_slot(tx).await;
     outcome
 }
 
+/// A bootstrapping CONNECT through `gateway_addr` heard nothing back, not even
+/// the `ObservedAddress` a live gateway sends at once (#5858). The gateway has
+/// most likely dropped this transport as a zombie, and with no close message
+/// in the protocol every later CONNECT on it would vanish too. Drop our end so
+/// the next round dials the gateway afresh (a fresh intro on the gateway's
+/// side resets a stale session, so this is safe even if the link was alive).
+/// Never drops a ring connection.
+fn drop_dead_gateway_link(op_manager: &OpManager, tx: Transaction, gateway_addr: SocketAddr) {
+    if op_manager.ring.connection_manager.is_in_ring(gateway_addr) {
+        return;
+    }
+    tracing::info!(
+        %tx,
+        gateway = %gateway_addr,
+        "connect driver: gateway did not answer a bootstrapping CONNECT; dropping the link to redial"
+    );
+    if let Err(e) = op_manager.try_notify_node_event(NodeEvent::DropConnection(gateway_addr)) {
+        tracing::warn!(
+            %tx,
+            gateway = %gateway_addr,
+            error = %e,
+            "connect driver: could not queue drop of a dead gateway link; next round reuses it"
+        );
+    }
+}
+
 /// Inner driver loop. Drains `receiver` until `target_connections`
-/// acceptances accumulate or a fatal Rejected arrives.
+/// acceptances accumulate, a fatal Rejected arrives, or (for a CONNECT sent
+/// with no ring connection) nothing more is coming.
 #[allow(clippy::too_many_arguments)]
 async fn drive_client_connect_inner(
     tx: Transaction,
@@ -276,10 +312,27 @@ async fn drive_client_connect_inner(
     mut receiver: mpsc::Receiver<WaiterReply>,
     op_manager: &OpManager,
     kind: ClientConnectKind,
-) -> Result<(), OpError> {
+) -> Result<ClientConnectEnd, OpError> {
+    use futures::StreamExt;
+    use futures::stream::FuturesUnordered;
     use std::collections::HashSet;
 
+    use super::bootstrap::{AcceptorDialQueue, BootstrapRound, MAX_CONCURRENT_ACCEPTOR_DIALS};
+
     let mut accepted: HashSet<PeerKeyLocation> = HashSet::with_capacity(target_connections);
+    // A CONNECT sent with no ring connection ends once nothing more is
+    // coming, instead of waiting for `target_connections` acceptors that one
+    // CONNECT never collects (#5858). Decided once, for this transaction.
+    let mut round = BootstrapRound::new(
+        kind == ClientConnectKind::Standard
+            && op_manager.ring.connection_manager.connection_count() == 0,
+        Instant::now(),
+    );
+    // Acceptors are dialled concurrently (bounded), so one unreachable
+    // acceptor cannot hold the next one past its hole-punch window (#5858).
+    let mut dial_queue: AcceptorDialQueue<PeerKeyLocation> =
+        AcceptorDialQueue::new(MAX_CONCURRENT_ACCEPTOR_DIALS);
+    let mut dials = FuturesUnordered::new();
 
     loop {
         if should_exit_for_ttl(&tx) {
@@ -289,7 +342,28 @@ async fn drive_client_connect_inner(
                 target_connections,
                 "connect driver: transaction timed out; exiting"
             );
-            return Ok(());
+            return Ok(ClientConnectEnd::Finished);
+        }
+        if let Some(exit) = round.exit(Instant::now(), dial_queue.busy()) {
+            tracing::info!(
+                %tx,
+                ?exit,
+                accepted = accepted.len(),
+                "connect driver: bootstrapping CONNECT has nothing more coming; ending"
+            );
+            if exit == super::bootstrap::BootstrapExit::Connected {
+                // The same success bookkeeping as reaching the target.
+                op_manager
+                    .ring
+                    .connection_manager
+                    .reset_connect_jitter_failures();
+                op_manager
+                    .gateway_backoff
+                    .lock()
+                    .record_success(gateway_addr);
+                op_manager.ring.record_connection_success(desired_location);
+            }
+            return Ok(ClientConnectEnd::Bootstrap(exit));
         }
 
         // Poll the receiver with a periodic timeout so the loop can
@@ -299,81 +373,24 @@ async fn drive_client_connect_inner(
         // sending Responses (e.g. when target_connections exceeds the
         // reachable network).
         const RECV_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
-        let msg = match tokio::time::timeout(RECV_POLL_INTERVAL, receiver.recv()).await {
-            Ok(Some(WaiterReply::Reply(msg))) => msg,
-            Ok(Some(WaiterReply::PeerDisconnected { peer })) => {
-                // The gateway we sent the CONNECT Request to was pruned
-                // mid-flight (#4313). No further Responses will arrive on
-                // this waiter; end collection with whatever was accepted.
-                tracing::debug!(
-                    %tx,
-                    %peer,
-                    accepted = accepted.len(),
-                    "connect driver: gateway disconnected mid-connect; ending reply collection"
-                );
-                break;
-            }
-            Ok(None) => break,
-            Err(_) => continue,
+        let event = crate::deterministic_select! {
+            reply = tokio::time::timeout(RECV_POLL_INTERVAL, receiver.recv()) => DriverEvent::Reply(reply),
+            dial = dials.next(), if !dials.is_empty() => DriverEvent::Dial(dial),
         };
-
-        let connect_msg = match msg {
-            NetMessage::V1(NetMessageV1::Connect(c)) => c,
-            other => {
-                tracing::warn!(
-                    tx = %tx,
-                    "connect driver received unexpected message kind: {:?}",
-                    other
-                );
-                continue;
-            }
-        };
-
-        match connect_msg {
-            ConnectMsg::Response { payload, .. } => {
-                if let Some(event) = NetEventLog::connect_response_received(
-                    &tx,
-                    &op_manager.ring,
-                    payload.acceptor.clone(),
-                ) {
-                    op_manager.ring.register_events(Either::Left(event)).await;
+        let reply = match event {
+            DriverEvent::Reply(reply) => reply,
+            DriverEvent::Dial(None) => continue,
+            DriverEvent::Dial(Some(AcceptorDial {
+                acceptor,
+                acceptor_addr,
+                result,
+            })) => {
+                if let Some(next) = dial_queue.finish() {
+                    dials.push(begin_acceptor_dial(op_manager, tx, next).await?);
                 }
-
-                let acceptor_addr = match payload.acceptor.socket_addr() {
-                    Some(a) => a,
-                    None => {
-                        tracing::warn!(
-                            tx = %tx,
-                            "connect driver: acceptor missing socket_addr; skipping"
-                        );
-                        continue;
-                    }
-                };
-
-                if !accepted.insert(payload.acceptor.clone()) {
-                    // Duplicate acceptor — ignore.
-                    continue;
-                }
-
-                op_manager
-                    .notify_node_event(NodeEvent::ExpectPeerConnection {
-                        addr: acceptor_addr,
-                    })
-                    .await?;
-
-                let (callback, mut rx) = mpsc::channel(1);
-                op_manager
-                    .notify_node_event(NodeEvent::ConnectPeer {
-                        peer: payload.acceptor.clone(),
-                        tx,
-                        callback,
-                        is_gw: false,
-                    })
-                    .await?;
-
                 // The address the connection was made to, which can differ from
                 // the advertised one when an existing transport is reused.
-                let (hole_punch_ok, connected_addr) = match rx.recv().await {
+                let (hole_punch_ok, connected_addr) = match result {
                     Some(Ok((peer_id, _remaining))) => {
                         tracing::info!(
                             %peer_id,
@@ -411,12 +428,13 @@ async fn drive_client_connect_inner(
                     None => {
                         tracing::warn!(
                             tx = %tx,
-                            acceptor = %payload.acceptor,
+                            acceptor = %acceptor,
                             "connect driver: ConnectPeer callback closed without result"
                         );
                         (false, acceptor_addr)
                     }
                 };
+                round.on_dial_done(Instant::now(), hole_punch_ok);
 
                 // Lattice-probe result (#5814). The route-to-self probe aims at
                 // the nearest UNCONNECTED peer (and near-terminus relays may also
@@ -452,7 +470,7 @@ async fn drive_client_connect_inner(
                 }
 
                 if !hole_punch_ok {
-                    accepted.remove(&payload.acceptor);
+                    accepted.remove(&acceptor);
                     let failed_msg = ConnectMsg::ConnectFailed {
                         id: tx,
                         failed_acceptor_addr: acceptor_addr,
@@ -515,7 +533,69 @@ async fn drive_client_connect_inner(
                         target_connections,
                         "connect driver: target reached, completing"
                     );
-                    return Ok(());
+                    return Ok(ClientConnectEnd::Finished);
+                }
+                continue;
+            }
+        };
+        let msg = match reply {
+            Ok(Some(WaiterReply::Reply(msg))) => {
+                round.on_reply(Instant::now());
+                msg
+            }
+            Ok(Some(WaiterReply::PeerDisconnected { peer })) => {
+                // The gateway we sent the CONNECT Request to was pruned
+                // mid-flight (#4313). No further Responses will arrive on
+                // this waiter; end collection with whatever was accepted.
+                tracing::debug!(
+                    %tx,
+                    %peer,
+                    accepted = accepted.len(),
+                    "connect driver: gateway disconnected mid-connect; ending reply collection"
+                );
+                break;
+            }
+            Ok(None) => break,
+            Err(_) => continue,
+        };
+
+        let connect_msg = match msg {
+            NetMessage::V1(NetMessageV1::Connect(c)) => c,
+            other => {
+                tracing::warn!(
+                    tx = %tx,
+                    "connect driver received unexpected message kind: {:?}",
+                    other
+                );
+                continue;
+            }
+        };
+
+        match connect_msg {
+            ConnectMsg::Response { payload, .. } => {
+                if let Some(event) = NetEventLog::connect_response_received(
+                    &tx,
+                    &op_manager.ring,
+                    payload.acceptor.clone(),
+                ) {
+                    op_manager.ring.register_events(Either::Left(event)).await;
+                }
+
+                if payload.acceptor.socket_addr().is_none() {
+                    tracing::warn!(
+                        tx = %tx,
+                        "connect driver: acceptor missing socket_addr; skipping"
+                    );
+                    continue;
+                }
+
+                if !accepted.insert(payload.acceptor.clone()) {
+                    // Duplicate acceptor — ignore.
+                    continue;
+                }
+
+                if let Some(acceptor) = dial_queue.offer(payload.acceptor.clone()) {
+                    dials.push(begin_acceptor_dial(op_manager, tx, acceptor).await?);
                 }
             }
             ConnectMsg::Rejected {
@@ -574,7 +654,7 @@ async fn drive_client_connect_inner(
                     let mut backoff = op_manager.gateway_backoff.lock();
                     backoff.record_failure(gateway_addr);
                 }
-                return Ok(());
+                return Ok(ClientConnectEnd::Finished);
             }
             ConnectMsg::ObservedAddress { address, .. } => {
                 // The joiner doesn't know its external IP behind NAT;
@@ -633,7 +713,63 @@ async fn drive_client_connect_inner(
         gateway = %gateway.pub_key(),
         "connect driver: receiver closed"
     );
-    Ok(())
+    Ok(ClientConnectEnd::Finished)
+}
+
+/// How the client CONNECT driver ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClientConnectEnd {
+    /// Target reached, transaction expired, rejected, or the waiter closed.
+    Finished,
+    /// A CONNECT sent with no ring connection ended early (#5858).
+    Bootstrap(super::bootstrap::BootstrapExit),
+}
+
+/// What woke the client driver.
+enum DriverEvent<R, D> {
+    Reply(R),
+    Dial(Option<D>),
+}
+
+/// The outcome of one acceptor dial started by [`begin_acceptor_dial`].
+struct AcceptorDial {
+    acceptor: PeerKeyLocation,
+    acceptor_addr: SocketAddr,
+    result: Option<crate::message::ConnectResult>,
+}
+
+/// Starts the hole punch to `acceptor` and returns a future that resolves
+/// with its outcome, so several acceptors can be dialled at once.
+async fn begin_acceptor_dial(
+    op_manager: &OpManager,
+    tx: Transaction,
+    acceptor: PeerKeyLocation,
+) -> Result<impl std::future::Future<Output = AcceptorDial> + Send + 'static, OpError> {
+    // The Response arm only queues acceptors that have a socket address.
+    let acceptor_addr = acceptor.socket_addr().ok_or(OpError::UnexpectedOpState)?;
+    op_manager
+        .notify_node_event(NodeEvent::ExpectPeerConnection {
+            addr: acceptor_addr,
+        })
+        .await?;
+
+    let (callback, mut rx) = mpsc::channel(1);
+    op_manager
+        .notify_node_event(NodeEvent::ConnectPeer {
+            peer: acceptor.clone(),
+            tx,
+            callback,
+            is_gw: false,
+        })
+        .await?;
+    Ok(async move {
+        let result = rx.recv().await;
+        AcceptorDial {
+            acceptor,
+            acceptor_addr,
+            result,
+        }
+    })
 }
 
 /// Capacity for the multi-reply receiver registered with the bypass.

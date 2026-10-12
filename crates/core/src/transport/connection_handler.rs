@@ -1277,6 +1277,11 @@ pub(super) const NAT_TRAVERSAL_MAX_ATTEMPTS: usize = 40;
 #[cfg(any(test, feature = "bench"))]
 pub(super) const NAT_TRAVERSAL_MAX_ATTEMPTS: usize = 10;
 
+/// How long an outbound hole punch keeps sending before it gives up, whatever
+/// the attempt count. Both sides of a CONNECT punch for this long, so it is
+/// also the window in which the joiner must start dialling an acceptor.
+pub(crate) const NAT_TRAVERSAL_DEADLINE: Duration = Duration::from_secs(3);
+
 impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
     #[tracing::instrument(level = "debug", name = "transport_listener", fields(peer = %self.this_peer_keypair.public), skip_all)]
     async fn listen(mut self) -> TransportError {
@@ -2149,7 +2154,7 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
             let mut state = HandshakePhase::StartOutbound;
             let mut attempts = 0usize;
             let start_time_nanos = time_source.now_nanos();
-            let overall_deadline = Duration::from_secs(3);
+            let overall_deadline = NAT_TRAVERSAL_DEADLINE;
 
             // Generate symmetric key using GlobalRng for deterministic simulation
             let mut inbound_sym_key_bytes = [0u8; 16];

@@ -129,6 +129,7 @@ use crate::util::{Contains, IterExt};
 
 use super::VisitedPeers;
 
+pub(crate) mod bootstrap;
 pub(crate) mod op_ctx_task;
 
 #[cfg(test)]

@@ -853,7 +853,7 @@ pub trait InnerMessage: Into<NetMessage> {
 }
 
 type RemainingChecks = Option<usize>;
-type ConnectResult = Result<(SocketAddr, RemainingChecks), ()>;
+pub(crate) type ConnectResult = Result<(SocketAddr, RemainingChecks), ()>;
 
 /// Internal node events emitted to the event loop.
 #[derive(Debug, Clone)]

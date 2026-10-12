@@ -273,6 +273,11 @@ pub(crate) struct OpManager {
     /// Notifies `initial_join_procedure` when gateway backoff is cleared,
     /// so it can wake from backoff sleep and retry immediately.
     pub gateway_backoff_cleared: Arc<tokio::sync::Notify>,
+    /// Spaces the CONNECT rounds this peer sends while it has no ring
+    /// connection, shared by `initial_join_procedure` and the maintenance
+    /// loop's zero-connection bootstrap so they never run a round at the same
+    /// time (#5858).
+    pub(crate) bootstrap_pacer: Arc<Mutex<crate::operations::connect::bootstrap::BootstrapPacer>>,
     /// Addresses blocked by local policy. Used by the connect protocol to reject
     /// join requests from blocked peers at the routing level, allowing the uphill
     /// hop mechanism to find alternate acceptors.
@@ -397,6 +402,7 @@ impl Clone for OpManager {
             streaming_threshold: self.streaming_threshold,
             gateway_backoff: self.gateway_backoff.clone(),
             gateway_backoff_cleared: self.gateway_backoff_cleared.clone(),
+            bootstrap_pacer: self.bootstrap_pacer.clone(),
             blocked_addresses: self.blocked_addresses.clone(),
             configured_gateways: self.configured_gateways.clone(),
             pending_contract_fetches: self.pending_contract_fetches.clone(),
@@ -782,6 +788,11 @@ impl OpManager {
             "update_propagation_summary",
             update_propagation_stats.clone().start_summary_task(),
         );
+        let bootstrap_pacer = Arc::new(Mutex::new(
+            crate::operations::connect::bootstrap::BootstrapPacer::new(
+                ring.connection_manager.transient_ttl(),
+            ),
+        ));
 
         Ok(Self {
             ring,
@@ -828,6 +839,7 @@ impl OpManager {
             streaming_threshold,
             gateway_backoff: Arc::new(Mutex::new(PeerConnectionBackoff::new())),
             gateway_backoff_cleared: Arc::new(tokio::sync::Notify::new()),
+            bootstrap_pacer,
             blocked_addresses: config
                 .blocked_addresses
                 .as_ref()
