@@ -786,3 +786,39 @@ fn the_relay_driver_counts_admissions_once_per_request() {
         1
     );
 }
+
+/// Source pin (review S8): the maintenance tick reviews probation, reports
+/// each drop's queueing back (so an unqueued drop keeps its slot), and routes
+/// both prune paths through the probation substitute, the remove path via
+/// `substitute_first_victim` so a substitute is never dropped twice.
+#[test]
+fn the_maintenance_tick_wires_probation_review_and_substitution() {
+    const RING_SRC: &str = include_str!("../ring.rs");
+    let start = RING_SRC
+        .find("async fn connection_maintenance(")
+        .expect("connection_maintenance");
+    let end = start
+        + RING_SRC[start..]
+            .find("async fn acquire_new(")
+            .expect("end of connection_maintenance");
+    let code: String = RING_SRC[start..end]
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("//"))
+        .collect::<String>()
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
+    for needle in [
+        ".review_provisional_links(tick_now)",
+        ".confirm_probation_drop(drop,queued)",
+        "substitute_first_victim(&mutshould_disconnect_peers,substitute)",
+        ".probation_prune_substitute(&remove,tick_now)",
+        ".probation_prune_substitute(first,tick_now)",
+    ] {
+        assert_eq!(
+            code.matches(needle).count(),
+            1,
+            "missing or duplicated: {needle}"
+        );
+    }
+}
