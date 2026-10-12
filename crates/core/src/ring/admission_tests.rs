@@ -586,10 +586,12 @@ fn a_young_link_on_probation_is_not_substituted() {
 #[test]
 fn an_unestablished_slot_is_not_substituted() {
     let cm = busy_manager();
-    let recommended = cm.get_peer_by_addr(addr(10)).expect("connected");
+    let recommended = cm.get_peer_by_addr(addr(11)).expect("connected");
     let admitted = Instant::now();
+    // At the location of an established link (0.45, port 10): an address
+    // lookup by location alone would hand back THAT peer, not the joiner.
     assert_eq!(
-        cm.evaluate_admission(Location::new(0.72), addr(99), RequesterNeed::Short(0), None),
+        cm.evaluate_admission(Location::new(0.45), addr(99), RequesterNeed::Short(0), None),
         AdmissionCode::AcceptedOnboarding
     );
     assert!(
