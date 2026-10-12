@@ -33,9 +33,10 @@ use crate::topology::{Limits, TopologyManager};
 use crate::util::backoff::{ExponentialBackoff, TrackedBackoff};
 
 use super::admission::{
-    AdmissionCode, AdmissionCounters, AdmissionStats, ENFORCE_REQUESTER_BAR, ONBOARDING_PROBATION,
+    AdmissionCode, AdmissionCounters, AdmissionStats, ONBOARDING_PROBATION,
     ONBOARDING_PROVISIONAL_SLOTS, ProbationDrop, ProvisionalLinks, ProvisionalOutcome,
-    RequesterNeed, UNCONSTRAINED_BAR, onboarding_high_priority, requester_is_short,
+    RequesterNeed, UNCONSTRAINED_BAR, onboarding_high_priority, requester_bar_enforced,
+    requester_is_short,
 };
 use super::*;
 
@@ -901,6 +902,17 @@ impl ConnectionManager {
         self.admission_counters.record_request_seen(need);
     }
 
+    /// With the bar not enforced, count a request whose bar this peer does not
+    /// meet: what enforcement would have refused (#5858). Called once per
+    /// request by the relay driver, on a hop that evaluated admission.
+    pub(crate) fn record_bar_shadow(&self, need: RequesterNeed, target: Location) {
+        if let RequesterNeed::Bar(bar) = need {
+            if !requester_bar_enforced() && !self.meets_requester_bar(Some(target), bar) {
+                self.admission_counters.record_bar_unmet_not_enforced();
+            }
+        }
+    }
+
     fn evaluate_admission_inner(
         &self,
         location: Location,
@@ -1142,7 +1154,7 @@ impl ConnectionManager {
                 }
             }
             RequesterNeed::Bar(bar)
-                if ENFORCE_REQUESTER_BAR && !self.meets_requester_bar(target, bar) =>
+                if requester_bar_enforced() && !self.meets_requester_bar(target, bar) =>
             {
                 if lattice_admits() {
                     AdmissionCode::AcceptedLattice

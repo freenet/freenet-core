@@ -262,6 +262,7 @@ fn below_min_short_requester_uses_self_interest_first() {
 
 #[test]
 fn requester_bar_rejects_an_acceptor_that_is_not_closer() {
+    let _bar = BarEnforced::on();
     let cm = manager(3, 20);
     for (i, loc) in [0.45, 0.55, 0.2].into_iter().enumerate() {
         connect(&cm, 10 + i as u16, loc);
@@ -648,6 +649,61 @@ fn an_identity_update_keeps_the_link_on_probation() {
     assert!(cm.update_peer_identity(addr(86), addr(87), keypair.public().clone()));
     assert!(!cm.is_provisional(addr(86)));
     assert!(cm.is_provisional(addr(87)));
+}
+
+/// Enforce the requester's bar on this thread for the test's duration (it
+/// ships off, `ENFORCE_REQUESTER_BAR`), restoring the default on drop.
+struct BarEnforced;
+impl BarEnforced {
+    fn on() -> Self {
+        crate::ring::admission::set_requester_bar_enforced(Some(true));
+        BarEnforced
+    }
+}
+impl Drop for BarEnforced {
+    fn drop(&mut self) {
+        crate::ring::admission::set_requester_bar_enforced(None);
+    }
+}
+
+/// D1 (owner decision): the bar ships NOT enforced. A requester whose bar
+/// this peer misses is decided on self-interest, and the refusal enforcement
+/// would have made is counted instead.
+#[test]
+fn an_unenforced_bar_is_decided_on_self_interest_and_counted() {
+    assert!(
+        !crate::ring::admission::requester_bar_enforced(),
+        "the bar ships unenforced until the simulation shows a net benefit (#5858)"
+    );
+    let cm = manager(3, 20);
+    for (i, loc) in [0.45, 0.55, 0.2].into_iter().enumerate() {
+        connect(&cm, 10 + i as u16, loc);
+    }
+    let target = Location::new(0.6); // ~0.1 from this peer at 0.5
+    assert_eq!(
+        cm.evaluate_admission(
+            Location::new(0.9),
+            addr(80),
+            RequesterNeed::Bar(0.08),
+            Some(target)
+        ),
+        AdmissionCode::AcceptedSelfInterest,
+        "an empty window admits it on self-interest"
+    );
+    cm.record_bar_shadow(RequesterNeed::Bar(0.08), target);
+    cm.record_bar_shadow(RequesterNeed::Bar(0.2), target);
+    cm.record_bar_shadow(RequesterNeed::Short(0), target);
+    let stats = cm.admission_stats();
+    assert_eq!(
+        stats.bar_unmet_not_enforced, 1,
+        "only the bar this peer misses"
+    );
+    assert_eq!(stats.rejected_bar_unmet, 0);
+
+    // With enforcement on, the shadow counter stays out of it.
+    let _bar = BarEnforced::on();
+    cm.record_bar_shadow(RequesterNeed::Bar(0.08), target);
+    assert_eq!(cm.admission_stats().bar_unmet_not_enforced, 1);
 }
 
 struct LatticeGuard;

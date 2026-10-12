@@ -871,6 +871,9 @@ async fn drive_relay_connect(
     cm.record_request_seen(state.request.need);
     let mut admission_recorded = false;
     cm.record_relay_admission(initial_actions.admission, &mut admission_recorded);
+    if initial_actions.admission.is_some() {
+        cm.record_bar_shadow(state.request.need, state.request.desired_location);
+    }
 
     // Telemetry: connect_request_received (mirrors connect.rs:1595)
     if let Some(event) = NetEventLog::connect_request_received(
