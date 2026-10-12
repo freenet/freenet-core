@@ -1597,7 +1597,15 @@ pub fn record_bootstrap_min_connections_reached() {
 /// Record one below-threshold round of `initial_join_procedure`, classified by
 /// what that round actually did (issue #4787 instrumentation, joiner-side).
 /// See [`BootstrapChurnStats`] for why the classification is the measurement.
+///
+/// Not recorded for a simulated node (a thread with a current simulation
+/// network name): the singleton describes this process's one real node, and
+/// the join loops of simulations sharing a test process otherwise land in it,
+/// which broke the `startup_rounds_*` tests under plain `cargo test`.
 pub fn record_bootstrap_startup_round(outcome: StartupRoundOutcome) {
+    if crate::ring::topology_registry::get_current_network_name().is_some() {
+        return;
+    }
     if let Some(status) = NETWORK_STATUS.get() {
         if let Ok(mut s) = status.write() {
             let b = &mut s.bootstrap_churn_stats;
@@ -2711,6 +2719,23 @@ mod tests {
             "getter returns (comparisons, divergences); every call bumps comparisons, \
              only diverged calls bump divergences"
         );
+    }
+
+    /// A simulated node's join rounds stay out of the process singleton, so a
+    /// simulation sharing the test process cannot add rounds to the
+    /// `startup_rounds_*` tests' counts.
+    #[test]
+    fn simulated_node_startup_rounds_are_not_recorded() {
+        let _lock = TEST_MUTEX.lock().unwrap();
+        init(31338, HashSet::new(), "test".to_string());
+        crate::ring::topology_registry::set_current_network_name("status-isolation");
+        record_bootstrap_startup_round(StartupRoundOutcome::ConnectIssuedRouted);
+        crate::ring::topology_registry::clear_current_network_name();
+        let counts = bootstrap_churn_counts().expect("initialized");
+        assert_eq!(counts.startup_rounds_connect_issued_routed, 0);
+        record_bootstrap_startup_round(StartupRoundOutcome::ConnectIssuedRouted);
+        let counts = bootstrap_churn_counts().expect("initialized");
+        assert_eq!(counts.startup_rounds_connect_issued_routed, 1);
     }
 
     /// End-to-end for the bootstrap-acceptance-churn counters (#4787): each
