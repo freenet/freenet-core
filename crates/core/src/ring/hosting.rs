@@ -96,7 +96,7 @@ pub(crate) use cache::disk_budget_for_clamped;
 use dashmap::{DashMap, DashSet};
 use demand::ProximityPrior;
 use disk_usage::DiskUsageTracker;
-pub(crate) use disk_usage::{DiskBudgetExceeded, DiskUsageStats};
+pub(crate) use disk_usage::{DiskBudgetExceeded, DiskUsageStats, HostingDiskPaths};
 // #5014: the wasmtime on-disk compile-cache startup sizing needs the same
 // mount-availability probe and directory walk this module already uses for
 // the aggregate disk budget, re-exported one level further in `ring.rs`.
@@ -860,12 +860,8 @@ impl HostingManager {
     /// Called once at startup (alongside `set_storage`), since `with_time_source`
     /// has no path access. The tracker starts unseeded; the first sweep tick
     /// seeds it lazily off the hot path.
-    pub(crate) fn configure_disk_tracker(
-        &self,
-        contracts_dir: std::path::PathBuf,
-        wasmtime_cache_dir: std::path::PathBuf,
-    ) {
-        *self.disk_tracker.write() = Some(DiskUsageTracker::new(contracts_dir, wasmtime_cache_dir));
+    pub(crate) fn configure_disk_tracker(&self, paths: HostingDiskPaths) {
+        *self.disk_tracker.write() = Some(DiskUsageTracker::new(paths));
     }
 
     /// Install the operator-configured disk-budget sizing knobs (#4683): the
@@ -1171,12 +1167,17 @@ impl HostingManager {
         self.disk_tracker.read().as_ref()?.available_bytes()
     }
 
-    /// Re-walk the WASM-blob and compile-cache totals. Called on the telemetry
-    /// cadence (the 60s sweep) since both are `du`-measured, not delta-tracked.
+    /// Re-walk the WASM-blob and compile-cache totals, plus the database
+    /// directory and webapp cache that are measured for reporting only (#5007).
+    /// Called on the telemetry cadence (the 60s sweep) since all four are
+    /// `du`-measured, not delta-tracked. Pinned by
+    /// `refresh_disk_usage_measures_database_and_webapp_cache`.
     pub(crate) fn refresh_disk_usage(&self) {
         if let Some(tracker) = self.disk_tracker.read().as_ref() {
             tracker.refresh_wasm();
             tracker.refresh_compile_cache();
+            tracker.refresh_db_file();
+            tracker.refresh_webapp_cache();
         }
     }
 
@@ -1286,12 +1287,42 @@ impl HostingManager {
     where
         I: IntoIterator<Item = (ContractKey, u64)>,
     {
-        self.configure_disk_tracker(
-            std::path::PathBuf::from("/nonexistent/contracts"),
-            std::path::PathBuf::from("/nonexistent/cache"),
-        );
+        self.configure_disk_tracker(HostingDiskPaths {
+            contracts_dir: std::path::PathBuf::from("/nonexistent/contracts"),
+            wasmtime_cache_dir: std::path::PathBuf::from("/nonexistent/cache"),
+            db_dir: std::path::PathBuf::from("/nonexistent/db"),
+            webapp_cache_dir: std::path::PathBuf::from("/nonexistent/webapp"),
+        });
+        self.seed_configured_disk_tracker_for_test(rows);
+    }
+
+    /// Test-only: seed the ALREADY-configured disk tracker, leaving its paths
+    /// alone, so a test can point the tracker at real temp dirs.
+    #[cfg(test)]
+    pub(crate) fn seed_configured_disk_tracker_for_test<I>(&self, rows: I)
+    where
+        I: IntoIterator<Item = (ContractKey, u64)>,
+    {
         if let Some(tracker) = self.disk_tracker.read().as_ref() {
             tracker.seed(rows);
+        }
+    }
+
+    /// Test-only: install a measured database-directory size on the configured
+    /// tracker. See `DiskUsageTracker::set_db_file_bytes_for_test`.
+    #[cfg(test)]
+    pub(crate) fn set_db_file_bytes_for_test(&self, bytes: u64) {
+        if let Some(tracker) = self.disk_tracker.read().as_ref() {
+            tracker.set_db_file_bytes_for_test(bytes);
+        }
+    }
+
+    /// Test-only: install a measured webapp-cache size on the configured
+    /// tracker.
+    #[cfg(test)]
+    pub(crate) fn set_webapp_cache_bytes_for_test(&self, bytes: u64) {
+        if let Some(tracker) = self.disk_tracker.read().as_ref() {
+            tracker.set_webapp_cache_bytes_for_test(bytes);
         }
     }
 
@@ -8057,10 +8088,12 @@ mod tests {
         assert_eq!(manager.hosting_budget_bytes(), GIB);
 
         // Tracker configured but NOT seeded → still None.
-        manager.configure_disk_tracker(
-            std::path::PathBuf::from("/nonexistent/contracts"),
-            std::path::PathBuf::from("/nonexistent/cache"),
-        );
+        manager.configure_disk_tracker(HostingDiskPaths {
+            contracts_dir: std::path::PathBuf::from("/nonexistent/contracts"),
+            wasmtime_cache_dir: std::path::PathBuf::from("/nonexistent/cache"),
+            db_dir: std::path::PathBuf::from("/nonexistent/db"),
+            webapp_cache_dir: std::path::PathBuf::from("/nonexistent/webapp"),
+        });
         assert_eq!(manager.recompute_effective_budget(0), None);
         assert_eq!(manager.hosting_budget_bytes(), GIB);
     }
@@ -8269,6 +8302,97 @@ mod tests {
         );
     }
 
+    /// `Ring` copies each `DiskUsageStats` gauge into two places: the
+    /// `RouterSnapshot` telemetry fields and the dashboard `HostingSnapshot`.
+    /// The fields share types, so a swapped pair (the database size reported
+    /// as state, say) compiles and passes every test that sets the struct
+    /// fields directly. Building a `Ring` here is not practical, so this pins
+    /// the assignment text. Comments are stripped first, so a commented-out
+    /// assignment does not satisfy it, and whitespace is stripped so a rustfmt
+    /// re-wrap cannot rot it. The scrape is cross-file (`ring.rs`), so it
+    /// cannot match its own needles.
+    #[test]
+    fn ring_copies_each_disk_gauge_into_its_own_field() {
+        let ring = strip_comments_and_whitespace(include_str!("../ring.rs"));
+        for (telemetry_field, dashboard_field, gauge) in [
+            (
+                "hosting_disk_state_bytes",
+                "disk_state_bytes",
+                "state_bytes",
+            ),
+            ("hosting_disk_db_bytes", "disk_db_bytes", "db_file_bytes"),
+            ("hosting_disk_wasm_bytes", "disk_wasm_bytes", "wasm_bytes"),
+            (
+                "hosting_disk_compile_cache_bytes",
+                "disk_compile_cache_bytes",
+                "compile_cache_bytes",
+            ),
+            (
+                "hosting_disk_webapp_cache_bytes",
+                "disk_webapp_cache_bytes",
+                "webapp_cache_bytes",
+            ),
+            (
+                "hosting_disk_total_bytes",
+                "disk_total_bytes",
+                "total_bytes",
+            ),
+        ] {
+            // The two reported gauges are already `Option` (None until first
+            // measured); the others are wrapped here.
+            let reported = matches!(gauge, "db_file_bytes" | "webapp_cache_bytes");
+            let telemetry = if reported {
+                format!("snapshot.{telemetry_field}=disk.{gauge};")
+            } else {
+                format!("snapshot.{telemetry_field}=Some(disk.{gauge});")
+            };
+            assert_eq!(
+                ring.matches(&telemetry).count(),
+                1,
+                "ring.rs must set `{telemetry_field}` from `{gauge}` exactly once"
+            );
+            let dashboard = if reported {
+                format!("let{dashboard_field}=disk.and_then(|d|d.{gauge});")
+            } else {
+                format!("let{dashboard_field}=disk.map(|d|d.{gauge});")
+            };
+            assert_eq!(
+                ring.matches(&dashboard).count(),
+                1,
+                "ring.rs must derive `{dashboard_field}` from `{gauge}` exactly once"
+            );
+        }
+    }
+
+    /// `src` with `//` line comments removed first, then `/* */` block
+    /// comments, then all whitespace. Line comments go first so a `/*` inside
+    /// one (`/// contracts_dir/*.wasm`) cannot open a block that swallows code.
+    /// String literals are not special-cased, and an unterminated `/*` drops
+    /// the rest of the file. Either can only remove text, which turns a
+    /// presence check red. An exactly-once count could in principle be satisfied
+    /// if a second, wrong occurrence were hidden behind a `"//"` or `"/*"` in
+    /// a string literal; `ring.rs` has `"//"` literals only in its test code,
+    /// where no needle sits. Do not use
+    /// this for an ABSENCE check, which removed text would satisfy.
+    fn strip_comments_and_whitespace(src: &str) -> String {
+        let no_line: String = src
+            .lines()
+            .map(|line| line.split("//").next().unwrap_or(""))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut no_block = String::with_capacity(no_line.len());
+        let mut rest = no_line.as_str();
+        while let Some(start) = rest.find("/*") {
+            no_block.push_str(&rest[..start]);
+            rest = match rest[start..].find("*/") {
+                Some(end) => &rest[start + end + 2..],
+                None => "",
+            };
+        }
+        no_block.push_str(rest);
+        no_block.chars().filter(|c| !c.is_whitespace()).collect()
+    }
+
     // --- Dashboard disk-usage panel population (follow-up to #4683/#4702) ----
     //
     // `Ring::dashboard_hosting_snapshot` maps `disk_usage_stats()` and
@@ -8297,6 +8421,143 @@ mod tests {
         );
     }
 
+    /// The sweep must re-measure the database directory and webapp cache, not
+    /// only the two budgeted gauges. Pins the CALL SITE in
+    /// `refresh_disk_usage`: deleting either new refresh leaves the tracker's
+    /// own tests green and makes the reported gauge freeze at its seed value.
+    #[test]
+    fn refresh_disk_usage_measures_database_and_webapp_cache() {
+        use std::io::Write;
+        const CHUNK: usize = 64 * 1024;
+
+        // Pseudo-random content so transparent compression cannot collapse
+        // the fixture's allocation.
+        fn write_file(path: &std::path::Path, len: usize) {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let mut state: u32 = 0x9E37_79B9;
+            let bytes: Vec<u8> = (0..len)
+                .map(|_| {
+                    state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    (state >> 24) as u8
+                })
+                .collect();
+            std::fs::File::create(path)
+                .unwrap()
+                .write_all(&bytes)
+                .unwrap();
+        }
+        fn alloc(path: &std::path::Path) -> u64 {
+            let meta = std::fs::metadata(path).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                meta.blocks() * 512
+            }
+            #[cfg(not(unix))]
+            {
+                meta.len()
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let contracts = dir.path().join("contracts");
+        let wasmtime = dir.path().join("wasmtime");
+        let db = dir.path().join("db");
+        let webapp = dir.path().join("webapp");
+        let wasm_file = contracts.join("aaaa.wasm");
+        let cache_file = wasmtime.join("mod.cache");
+        let db_file = db.join("db");
+        let webapp_file = webapp.join("aaaa").join("index.html");
+
+        write_file(&wasm_file, CHUNK);
+        write_file(&cache_file, 2 * CHUNK);
+        write_file(&db_file, 3 * CHUNK);
+        write_file(&webapp_file, 4 * CHUNK);
+
+        let manager = HostingManager::new(1024 * 1024 * 1024);
+        manager.configure_disk_tracker(HostingDiskPaths {
+            contracts_dir: contracts.clone(),
+            wasmtime_cache_dir: wasmtime.clone(),
+            db_dir: db.clone(),
+            webapp_cache_dir: webapp.clone(),
+        });
+        manager.seed_configured_disk_tracker_for_test([(make_contract_key(1), 100)]);
+        let seeded = manager.disk_usage_stats().expect("seeded");
+
+        // Everything grows after the seed by whole 64 KiB chunks, so the growth
+        // is visible to an allocation-based walk on any block size. Only a
+        // re-measure can see it.
+        write_file(&wasm_file, 11 * CHUNK);
+        write_file(&cache_file, 22 * CHUNK);
+        write_file(&db_file, 33 * CHUNK);
+        write_file(&webapp_file, 44 * CHUNK);
+        let (dbf, web) = (alloc(&db_file), alloc(&webapp_file));
+        assert!(
+            Some(dbf) > seeded.db_file_bytes && Some(web) > seeded.webapp_cache_bytes,
+            "every reported gauge must actually grow, or a dropped refresh would \
+             be invisible"
+        );
+
+        manager.refresh_disk_usage();
+
+        let stats = manager.disk_usage_stats().expect("seeded");
+        assert_eq!(
+            stats.db_file_bytes,
+            Some(dbf),
+            "the sweep must re-measure the db"
+        );
+        assert_eq!(
+            stats.webapp_cache_bytes,
+            Some(web),
+            "the sweep must re-measure the webapp cache"
+        );
+        // Budgeted gauges count apparent length, unchanged by #5007.
+        assert_eq!(stats.wasm_bytes, 11 * CHUNK as u64);
+        assert_eq!(stats.compile_cache_bytes, 22 * CHUNK as u64);
+        assert_eq!(stats.total_bytes, 100 + 33 * CHUNK as u64);
+    }
+
+    /// The eviction floor and the published disk budget do not move when the
+    /// measured database directory grows: it is reported, not budgeted (#5853).
+    /// 40 GiB is past the 32 GiB cap, so charging it in the budget's basis
+    /// would raise the budget, and charging it against the budget would
+    /// collapse it; either changes the asserted values.
+    #[test]
+    fn measured_db_size_does_not_change_the_eviction_budget() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        let available = 10 * GIB;
+        let rows = [(make_contract_key(1), 3 * GIB)];
+
+        let blind = HostingManager::new(64 * GIB);
+        blind.seed_disk_tracker_for_test(rows);
+        let blind_effective = blind.recompute_effective_budget(available);
+
+        let measured = HostingManager::new(64 * GIB);
+        measured.seed_disk_tracker_for_test(rows);
+        measured.set_db_file_bytes_for_test(40 * GIB);
+        measured.set_webapp_cache_bytes_for_test(20 * GIB);
+        let measured_effective = measured.recompute_effective_budget(available);
+
+        assert!(blind_effective.is_some());
+        assert_eq!(measured_effective, blind_effective);
+        assert_eq!(measured.disk_budget_bytes(), blind.disk_budget_bytes());
+        assert_eq!(
+            measured.hosting_budget_bytes(),
+            blind.hosting_budget_bytes()
+        );
+        // And the inputs really were different, so the equality is not vacuous.
+        assert_eq!(
+            measured.disk_usage_stats().unwrap().db_file_bytes,
+            Some(40 * GIB)
+        );
+        assert_eq!(
+            measured.disk_usage_stats().unwrap().webapp_cache_bytes,
+            Some(20 * GIB)
+        );
+        // Linear region, not a clamp: 0.5 * (3 + 10) GiB.
+        assert_eq!(blind.disk_budget_bytes(), 13 * GIB / 2);
+    }
+
     /// Tracker configured but not yet seeded (the window between
     /// `configure_disk_tracker` and the first successful `seed`): still
     /// `None` / `u64::MAX` — an in-flight seed must not leak a
@@ -8304,10 +8565,12 @@ mod tests {
     #[test]
     fn dashboard_disk_fields_absent_while_unseeded() {
         let manager = HostingManager::new(1024 * 1024 * 1024);
-        manager.configure_disk_tracker(
-            std::path::PathBuf::from("/nonexistent/contracts"),
-            std::path::PathBuf::from("/nonexistent/cache"),
-        );
+        manager.configure_disk_tracker(HostingDiskPaths {
+            contracts_dir: std::path::PathBuf::from("/nonexistent/contracts"),
+            wasmtime_cache_dir: std::path::PathBuf::from("/nonexistent/cache"),
+            db_dir: std::path::PathBuf::from("/nonexistent/db"),
+            webapp_cache_dir: std::path::PathBuf::from("/nonexistent/webapp"),
+        });
         assert!(
             manager.disk_usage_stats().is_none(),
             "configured-but-unseeded tracker → disk_usage_stats must stay None"

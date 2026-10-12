@@ -113,6 +113,8 @@ pub(crate) use hosting::DiskBudgetExceeded;
 /// Hosting-BEGIN attribution: WHY this peer started hosting a contract. Every
 /// production caller of [`Ring::host_contract`] names one.
 pub(crate) use hosting::HostingCause;
+/// The directories the aggregate disk-usage tracker measures (#5007).
+pub(crate) use hosting::HostingDiskPaths;
 /// The pre-A2 flat 1 GiB budget, used as the upgrade-migration sentinel in
 /// `config::ConfigArgs::build` so an upgraded node re-derives its hosting budget
 /// instead of keeping the historically-pinned default (#4565).
@@ -2156,13 +2158,18 @@ impl Ring {
 
             // Aggregate on-disk usage gauges (#4683): state (delta-tracked) +
             // WASM blobs + wasmtime compile cache (both du-measured) + their sum.
+            // Plus two gauges reported but NOT in that sum (#5007, #5853): the
+            // measured database directory, whose difference from `state` is the
+            // database's dead space, and the unpacked-webapp cache.
             // `None` until the tracker is configured and seeded (early startup),
-            // in which case the fields stay unset. Observational only in this PR.
+            // in which case the fields stay unset.
             let disk_usage = ring.hosting_manager.disk_usage_stats();
             if let Some(disk) = disk_usage {
                 snapshot.hosting_disk_state_bytes = Some(disk.state_bytes);
+                snapshot.hosting_disk_db_bytes = disk.db_file_bytes;
                 snapshot.hosting_disk_wasm_bytes = Some(disk.wasm_bytes);
                 snapshot.hosting_disk_compile_cache_bytes = Some(disk.compile_cache_bytes);
+                snapshot.hosting_disk_webapp_cache_bytes = disk.webapp_cache_bytes;
                 snapshot.hosting_disk_total_bytes = Some(disk.total_bytes);
             }
 
@@ -3740,14 +3747,18 @@ impl Ring {
             // Disk-usage accounting maintenance (#4683). Runs OUTSIDE any
             // hosting-cache write lock (the du-walks would stall cache readers).
             // First tick lazily seeds the tracker from the true on-disk state
-            // total; every tick re-walks the `du`-measured WASM-blob and
-            // compile-cache totals so telemetry stays fresh. Observational only
-            // in this PR — no admission/eviction decision reads these yet.
+            // total; every tick re-walks the four `du`-measured totals (WASM
+            // blobs, compile cache, the storage backend's database directory and
+            // the webapp cache, #5007) so telemetry stays fresh. The WASM and
+            // compile-cache totals feed live decisions since #4702 (the eviction
+            // floor and the pre-write admission gate read the aggregate); the
+            // database and webapp-cache measurements are reported only (#5853).
             //
-            // The seed + refresh are synchronous, blocking disk I/O: a recursive
-            // `std::fs` walk of `contracts_dir` + the wasmtime cache dir on every
-            // tick, plus a one-time sync redb `load_all_hosting_metadata` on the
-            // seeding tick. `contracts_dir` is unbounded and non-self-pruning, so
+            // The seed + refresh are synchronous, blocking disk I/O: recursive
+            // `std::fs` walks of `contracts_dir`, the wasmtime cache dir and the
+            // webapp cache plus a shallow walk of `db_dir` on every tick, plus a
+            // one-time sync redb `load_all_hosting_metadata` on the seeding
+            // tick. `contracts_dir` is unbounded and non-self-pruning, so
             // on a node hosting many contracts the walk can run for a while with
             // no `.await` point. Push it onto a blocking thread so it can never
             // stall other tasks on the async reactor — the same discipline
@@ -3967,19 +3978,18 @@ impl Ring {
         self.hosting_manager.set_storage(storage);
     }
 
-    /// Install the aggregate disk-usage tracker's paths (#4683). Called once at
-    /// startup with the node's mode-resolved contracts dir and the relocated
-    /// wasmtime compile-cache dir. The tracker is seeded lazily on the first
-    /// sweep tick.
-    pub fn set_hosting_disk_paths(
+    /// Install the aggregate disk-usage tracker's paths (#4683, #5007). Called
+    /// once at startup with every directory the node's footprint lands in: the
+    /// mode-resolved contracts dir, the relocated wasmtime compile-cache dir,
+    /// the storage backend's database dir, and the unpacked-webapp cache. The
+    /// tracker is seeded lazily on the first sweep tick.
+    pub(crate) fn set_hosting_disk_paths(
         &self,
-        contracts_dir: std::path::PathBuf,
-        wasmtime_cache_dir: std::path::PathBuf,
+        paths: HostingDiskPaths,
         hosting_disk_pct: f64,
         max_hosting_disk: u64,
     ) {
-        self.hosting_manager
-            .configure_disk_tracker(contracts_dir, wasmtime_cache_dir);
+        self.hosting_manager.configure_disk_tracker(paths);
         // #4683 eviction-floor sizing knobs (mirrors the disk paths install; the
         // config is only reachable here). The 60s sweep's recompute reads them.
         self.hosting_manager
@@ -4853,9 +4863,9 @@ impl Ring {
         self.hosting_manager
             .refresh_cache_generation(contract, new_gen);
         // Disk-usage accounting (#4683): maintain the aggregate on-disk state
-        // total by signed delta (`new − previous_for_key`). Observational only
-        // in this PR — no admission/eviction decision reads it yet. No-op until
-        // the tracker is seeded.
+        // total by signed delta (`new − previous_for_key`). Read by the
+        // eviction floor and the admission gates since #4702. No-op until the
+        // tracker is seeded.
         self.hosting_manager
             .record_state_write(contract, state_size as u64);
         self.report_contract_resource_usage(
@@ -4867,8 +4877,7 @@ impl Ring {
 
     /// Subtract a reclaimed contract's state bytes from the aggregate disk-usage
     /// tracker (#4683). Called from the executor's reclaim path on successful
-    /// state deletion. Observational only in this PR; no-op until the tracker is
-    /// seeded.
+    /// state deletion. No-op until the tracker is seeded.
     pub(crate) fn record_state_removed(&self, contract: &ContractKey) {
         self.hosting_manager.record_state_removed(contract);
     }
@@ -5314,8 +5323,10 @@ impl Ring {
         // usage.
         let disk = self.hosting_manager.disk_usage_stats();
         let disk_state_bytes = disk.map(|d| d.state_bytes);
+        let disk_db_bytes = disk.and_then(|d| d.db_file_bytes);
         let disk_wasm_bytes = disk.map(|d| d.wasm_bytes);
         let disk_compile_cache_bytes = disk.map(|d| d.compile_cache_bytes);
+        let disk_webapp_cache_bytes = disk.and_then(|d| d.webapp_cache_bytes);
         let disk_total_bytes = disk.map(|d| d.total_bytes);
         // `disk_budget_bytes` starts at `u64::MAX` until the first 60s
         // recompute installs a real value (see `HostingManager::
@@ -5332,8 +5343,10 @@ impl Ring {
             evictions_of_recently_read_total: stats.evictions_of_recently_read_total,
             contracts,
             disk_state_bytes,
+            disk_db_bytes,
             disk_wasm_bytes,
             disk_compile_cache_bytes,
+            disk_webapp_cache_bytes,
             disk_total_bytes,
             disk_budget_bytes,
             resident_overhead_budget_bytes: stats.resident_overhead_budget_bytes,

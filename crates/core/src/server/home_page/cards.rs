@@ -1805,17 +1805,39 @@ pub fn build_hosting_card(snap: &Option<network_status::NetworkStatusSnapshot>) 
         Some(total) => format_bytes(total),
         None => MEASURING.to_string(),
     };
+    // #5007: the breakdown also shows the MEASURED database directory and the
+    // webapp cache. Neither is part of "disk used" (#5853 tracks charging
+    // them), so the tooltip says so; the database figure is the one that shows
+    // dead space, since state bytes live inside it.
     let disk_breakdown_title = match (
         h.disk_state_bytes,
         h.disk_wasm_bytes,
         h.disk_compile_cache_bytes,
     ) {
-        (Some(state), Some(wasm), Some(cache)) => format!(
-            "State: {state} · WASM: {wasm} · Compile cache: {cache}",
-            state = format_bytes(state),
-            wasm = format_bytes(wasm),
-            cache = format_bytes(cache),
-        ),
+        (Some(state), Some(wasm), Some(cache)) => {
+            // Either reported gauge is `None` until its directory has been
+            // read once; say so rather than hiding the budgeted breakdown.
+            let db = match h.disk_db_bytes {
+                Some(db) => format!(
+                    "{} (about {} more than state: dead space, other tables, \
+                     database overhead and any migration backup)",
+                    format_bytes(db),
+                    format_bytes(db.saturating_sub(state)),
+                ),
+                None => "not measured".to_string(),
+            };
+            let webapp = h
+                .disk_webapp_cache_bytes
+                .map_or_else(|| "not measured".to_string(), format_bytes);
+            format!(
+                "State: {state} · WASM: {wasm} · Compile cache: {cache}. Measured \
+                 but not counted in disk used: database file: {db} · Webapp \
+                 cache (shared by every node run as this user): {webapp}",
+                state = format_bytes(state),
+                wasm = format_bytes(wasm),
+                cache = format_bytes(cache),
+            )
+        }
         _ => "Disk tracker not yet seeded".to_string(),
     };
     let disk_budget_value = match h.disk_budget_bytes {

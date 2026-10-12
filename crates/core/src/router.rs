@@ -559,17 +559,27 @@ pub(crate) struct RouterSnapshotInfo {
     /// until the ring is built. Per-node aggregate scalars.
     pub hosting_evicted_unread_total: Option<u64>,
     pub hosting_evicted_unread_age_secs_sum: Option<u64>,
-    /// Aggregate on-disk usage gauges (#4683), populated by `Ring` from the
-    /// `HostingManager`'s `DiskUsageTracker` on the snapshot cadence.
+    /// Aggregate on-disk usage gauges (#4683, #5007), populated by `Ring` from
+    /// the `HostingManager`'s `DiskUsageTracker` on the snapshot cadence.
     /// `hosting_disk_state_bytes` is the delta-tracked persisted-state total;
     /// `hosting_disk_wasm_bytes` is the `du`-measured WASM-blob total;
     /// `hosting_disk_compile_cache_bytes` is the relocated wasmtime compile-cache
-    /// total; `hosting_disk_total_bytes` is their sum — the aggregate the future
-    /// disk budget will bound. `None` until the tracker is configured and seeded
-    /// (early startup). Per-node aggregate scalars.
+    /// total; `hosting_disk_total_bytes` is their sum, the aggregate the disk
+    /// budget bounds. Reported but NOT in that sum (#5007, #5853):
+    /// `hosting_disk_db_bytes`, the allocated size of the storage backend's
+    /// database directory (its difference from state is the database's dead
+    /// space: one production peer had 583 MB of state in a 2.68 GB
+    /// database), and `hosting_disk_webapp_cache_bytes`, the unpacked-webapp
+    /// cache. The webapp cache defaults to a per-USER directory, so several
+    /// peers run as one user report the same bytes. Both are allocated blocks
+    /// on unix and apparent length elsewhere. `None` until the tracker
+    /// is configured and seeded (early startup), and for those two until their
+    /// first successful walk. Per-node aggregate scalars.
     pub hosting_disk_state_bytes: Option<u64>,
+    pub hosting_disk_db_bytes: Option<u64>,
     pub hosting_disk_wasm_bytes: Option<u64>,
     pub hosting_disk_compile_cache_bytes: Option<u64>,
+    pub hosting_disk_webapp_cache_bytes: Option<u64>,
     pub hosting_disk_total_bytes: Option<u64>,
     /// OOM-valve falsifier (subscriber-primary hosting rework, #4642): monotonic
     /// count of evictions performed under genuine RAM overflow (counted by
@@ -3488,8 +3498,10 @@ impl Router {
             // Aggregate on-disk usage gauges, populated by Ring from the
             // DiskUsageTracker on the snapshot cadence (#4683).
             hosting_disk_state_bytes: None,
+            hosting_disk_db_bytes: None,
             hosting_disk_wasm_bytes: None,
             hosting_disk_compile_cache_bytes: None,
+            hosting_disk_webapp_cache_bytes: None,
             hosting_disk_total_bytes: None,
             hosting_oom_valve_evictions_total: None,
             hosting_subscribed_evictions_total: None,

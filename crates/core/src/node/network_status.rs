@@ -2146,12 +2146,21 @@ pub struct HostingSnapshot {
     /// disk tracker is configured and seeded (early startup) — distinct from
     /// `Some(0)`, which means seeded-and-empty.
     pub disk_state_bytes: Option<u64>,
+    /// Allocated size of the storage backend's database directory (#5007).
+    /// `disk_db_bytes - disk_state_bytes` is the database's dead space plus its
+    /// overhead and any migration backup beside it. `None` until first measured.
+    /// Reported only: NOT part of `disk_total_bytes` (#5853). Same seeded-gate
+    /// semantics as `disk_state_bytes`.
+    pub disk_db_bytes: Option<u64>,
     /// Aggregate on-disk bytes used by `*.wasm` code blobs. Same
     /// seeded-gate semantics as `disk_state_bytes`.
     pub disk_wasm_bytes: Option<u64>,
     /// Aggregate on-disk bytes used by the wasmtime compile cache. Same
     /// seeded-gate semantics as `disk_state_bytes`.
     pub disk_compile_cache_bytes: Option<u64>,
+    /// Allocated size of the unpacked-webapp cache (#5007). Reported only: NOT
+    /// part of `disk_total_bytes` (#5853). Same seeded-gate semantics.
+    pub disk_webapp_cache_bytes: Option<u64>,
     /// Sum of `disk_state_bytes` + `disk_wasm_bytes` + `disk_compile_cache_bytes`
     /// — the aggregate the disk budget bounds. Same seeded-gate semantics.
     pub disk_total_bytes: Option<u64>,
