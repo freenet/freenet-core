@@ -20283,6 +20283,8 @@ struct SaturatedJoinReport {
     disconnect_reasons: BTreeMap<String, usize>,
     /// Timeline of every regular node (established, then joiners), by label.
     timelines: Vec<(String, freenet::dev_tool::JoinTimeline)>,
+    /// Timeline of every gateway, by label.
+    gateway_timelines: Vec<(String, freenet::dev_tool::JoinTimeline)>,
     /// Public key of every node, by label.
     keys: HashMap<String, freenet::dev_tool::TransportPublicKey>,
     /// Socket address of every node, by label.
@@ -20680,6 +20682,12 @@ fn run_saturated_join(cfg: &SaturatedJoinConfig) -> SaturatedJoinReport {
             (label.to_string(), timeline_of(&label))
         })
         .collect();
+    let gateway_timelines: Vec<(String, freenet::dev_tool::JoinTimeline)> = (0..cfg.gateways)
+        .map(|i| {
+            let label = NodeLabel::gateway(cfg.name, i);
+            (label.to_string(), timeline_of(&label))
+        })
+        .collect();
     let established_links_dropped = timelines[..cfg.established]
         .iter()
         .map(|(_, t)| links_dropped(t))
@@ -20695,6 +20703,7 @@ fn run_saturated_join(cfg: &SaturatedJoinConfig) -> SaturatedJoinReport {
         established_links_dropped,
         disconnect_reasons,
         timelines,
+        gateway_timelines,
         keys: keys
             .iter()
             .map(|(label, key)| (label.to_string(), key.clone()))
@@ -21192,6 +21201,12 @@ fn log_join_traces(report: &SaturatedJoinReport) {
                             .get(l.peer_id.pub_key())
                             .map(|l| short(l))
                             .unwrap_or_default();
+                        let to = l
+                            .kind
+                            .connect_request_forwarded_to()
+                            .and_then(|k| label_of_key.get(k))
+                            .map(|l| format!(">{}", short(l)))
+                            .unwrap_or_default();
                         let outcome = if l.kind.is_connect_accepted() {
                             let reach = report
                                 .addrs
@@ -21207,10 +21222,34 @@ fn log_join_traces(report: &SaturatedJoinReport) {
                         } else {
                             "REJECT"
                         };
-                        format!("{who}:{outcome}")
+                        format!("{who}:{outcome}{to}")
                     })
                     .collect();
                 out.push_str(&format!("  chain {tx}: {}\n", hops.join(" ")));
+                let needle = format!("tx={tx}");
+                for (label, other) in report
+                    .gateway_timelines
+                    .iter()
+                    .chain(report.timelines.iter())
+                {
+                    if *label == j.label {
+                        continue;
+                    }
+                    for n in other.notes.iter().filter(|n| n.what.contains(&needle)) {
+                        let remote = n
+                            .remote
+                            .and_then(|r| label_of_addr.get(&r))
+                            .map(|l| format!(" -> {}", short(l)))
+                            .unwrap_or_default();
+                        out.push_str(&format!(
+                            "    [{}] +{:.2}s {}{}\n",
+                            short(label),
+                            n.at.saturating_sub(origin).as_secs_f64(),
+                            n.what.replace(&needle, "tx"),
+                            remote
+                        ));
+                    }
+                }
             }
             tracing::info!(target: "saturated_join", "{out}");
         }

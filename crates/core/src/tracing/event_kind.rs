@@ -526,6 +526,19 @@ impl EventKind {
         }
     }
 
+    /// Returns the public key of the peer a `ConnectEvent::RequestReceived`
+    /// was forwarded to, `None` for other events or a terminus hop.
+    #[allow(clippy::wildcard_enum_match_arm)]
+    pub fn connect_request_forwarded_to(&self) -> Option<&crate::transport::TransportPublicKey> {
+        match self {
+            EventKind::Connect(ConnectEvent::RequestReceived {
+                forwarded_to: Some(to),
+                ..
+            }) => Some(to.pub_key()),
+            _ => None,
+        }
+    }
+
     /// Returns the joiner's public key if this is a
     /// `ConnectEvent::RequestReceived`, `None` for all other events. Lets a
     /// simulation attribute CONNECT hops to the peer that asked (#5858).
