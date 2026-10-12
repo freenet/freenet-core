@@ -33,9 +33,9 @@ use crate::topology::{Limits, TopologyManager};
 use crate::util::backoff::{ExponentialBackoff, TrackedBackoff};
 
 use super::admission::{
-    AdmissionCode, AdmissionCounters, AdmissionStats, ONBOARDING_PROBATION,
+    AdmissionCode, AdmissionCounters, AdmissionStats, ENFORCE_REQUESTER_BAR, ONBOARDING_PROBATION,
     ONBOARDING_PROVISIONAL_SLOTS, ProvisionalLinks, ProvisionalOutcome, RequesterNeed,
-    UNCONSTRAINED_BAR, requester_is_short,
+    UNCONSTRAINED_BAR, onboarding_high_priority, requester_is_short,
 };
 use super::*;
 
@@ -857,7 +857,20 @@ impl ConnectionManager {
         need: RequesterNeed,
         target: Option<Location>,
     ) -> AdmissionCode {
-        let code = self.evaluate_admission_inner(location, addr, need, target);
+        self.evaluate_admission_at(location, addr, need, target, Instant::now())
+    }
+
+    /// [`Self::evaluate_admission`] at an explicit `now` (the caller's time
+    /// source), which the onboarding slots record and refill against.
+    pub(crate) fn evaluate_admission_at(
+        &self,
+        location: Location,
+        addr: SocketAddr,
+        need: RequesterNeed,
+        target: Option<Location>,
+        now: Instant,
+    ) -> AdmissionCode {
+        let code = self.evaluate_admission_inner(location, addr, need, target, now);
         self.admission_counters.record_decision(code);
         code
     }
@@ -868,6 +881,7 @@ impl ConnectionManager {
         addr: SocketAddr,
         need: RequesterNeed,
         target: Option<Location>,
+        now: Instant,
     ) -> AdmissionCode {
         // Don't accept connections from ourselves
         if let Some(own_addr) = self.get_own_addr() {
@@ -881,7 +895,6 @@ impl ConnectionManager {
             }
         }
         let open = self.connection_count();
-        let now = Instant::now();
         let reserved_before = self
             .pending_reservations
             .read()
@@ -1054,7 +1067,9 @@ impl ConnectionManager {
         };
 
         let code = match need {
-            RequesterNeed::Short => {
+            RequesterNeed::Short(requester_connections) => {
+                let high_priority =
+                    onboarding_high_priority(requester_connections, self.min_connections);
                 if lattice_admits() {
                     AdmissionCode::AcceptedLattice
                 } else if total_conn >= self.max_connections {
@@ -1062,28 +1077,47 @@ impl ConnectionManager {
                 } else if open < self.min_connections && self.below_min_soft_filter(location, open)
                 {
                     AdmissionCode::AcceptedSelfInterest
-                } else if self
-                    .provisional_links
-                    .lock()
-                    .try_reserve(addr, Instant::now())
-                {
-                    // Collective duty: a short requester admitted from the
-                    // onboarding budget, bypassing (and not recorded into) the
-                    // evaluator window. The slot is on probation; see
-                    // `review_provisional_links`.
-                    tracing::info!(
-                        addr = %addr,
-                        peer_location = %location,
-                        open,
-                        total_conn,
-                        "should_accept: admitted short requester on an onboarding slot"
-                    );
-                    AdmissionCode::AcceptedOnboarding
                 } else {
-                    AdmissionCode::RejectedOnboardingBudgetExhausted
+                    let reserved = self.provisional_links.lock().try_reserve(
+                        addr,
+                        location,
+                        high_priority,
+                        now,
+                    );
+                    match reserved {
+                        Ok(()) => {
+                            // Collective duty: a short requester admitted from
+                            // the onboarding budget, bypassing (and not
+                            // recorded into) the evaluator window. The slot is
+                            // on probation; see `review_provisional_links`.
+                            tracing::info!(
+                                addr = %addr,
+                                peer_location = %location,
+                                open,
+                                total_conn,
+                                requester_connections,
+                                "should_accept: admitted short requester on an onboarding slot"
+                            );
+                            AdmissionCode::AcceptedOnboarding
+                        }
+                        // No slot: the request still competes on self-interest
+                        // exactly as a legacy one would (it recorded into the
+                        // window like any candidate). Below min the soft
+                        // filter above already declined it, so it is not
+                        // rolled twice.
+                        Err(refusal) if open >= self.min_connections => {
+                            match self.self_interest_verdict(location, addr, open, total_conn) {
+                                None => AdmissionCode::AcceptedSelfInterest,
+                                Some(_) => refusal.code(),
+                            }
+                        }
+                        Err(refusal) => refusal.code(),
+                    }
                 }
             }
-            RequesterNeed::Bar(bar) if !self.meets_requester_bar(target, bar) => {
+            RequesterNeed::Bar(bar)
+                if ENFORCE_REQUESTER_BAR && !self.meets_requester_bar(target, bar) =>
+            {
                 if lattice_admits() {
                     AdmissionCode::AcceptedLattice
                 } else {
@@ -2079,8 +2113,9 @@ impl ConnectionManager {
     /// side. A side with no connection gives [`UNCONSTRAINED_BAR`].
     /// [`RequesterNeed::Unknown`] when own location is not known yet.
     pub(crate) fn requester_need(&self, target: Location) -> RequesterNeed {
-        if requester_is_short(self.connection_count(), self.min_connections) {
-            return RequesterNeed::Short;
+        let open = self.connection_count();
+        if requester_is_short(open, self.min_connections) {
+            return RequesterNeed::short(open);
         }
         let Some(me) = self.get_stored_location() else {
             return RequesterNeed::Unknown;
