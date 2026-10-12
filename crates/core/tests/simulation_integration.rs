@@ -20162,6 +20162,11 @@ struct SaturatedJoinConfig {
     established: usize,
     /// Regular nodes started late, into the formed network.
     joiners: usize,
+    /// Spacing between established-node starts (`SimNetwork::with_start_backoff`).
+    /// Starting them all at once leaves most at zero ring connections for
+    /// minutes (see `test_saturated_join_explore` notes), so the network is
+    /// grown one node at a time, as a real one is.
+    established_stagger: Duration,
     min_connections: usize,
     max_connections: usize,
     /// Virtual time at which the first joiner starts.
@@ -20188,6 +20193,7 @@ impl SaturatedJoinConfig {
             gateways: 2,
             established: 40,
             joiners: 8,
+            established_stagger: Duration::from_secs(2),
             min_connections: 10,
             max_connections: 25,
             join_at: Duration::from_secs(240),
@@ -20231,6 +20237,8 @@ struct ConnectHopStats {
     accepted_hops: usize,
     chain_lengths: Vec<usize>,
     chains_with_accept: usize,
+    /// Accepted hops whose acceptor was a gateway.
+    accepted_by_gateway: usize,
 }
 
 impl ConnectHopStats {
@@ -20317,7 +20325,7 @@ impl SaturatedJoinReport {
         tracing::info!(
             target: "saturated_join",
             "=== saturated join '{}' (seed {:#x}) ===\n\
-             config: {} gateways + {} established + {} joiners, min={} max={}, \
+             config: {} gateways + {} established (stagger {:?}) + {} joiners, min={} max={}, \
              join_at={:?} stagger={:?} observe_for={:?}, latency={:?}, \
              unreachable_pairs={:.0}%\n\
              wall clock: {:.1}s for {:?} virtual\n\
@@ -20327,14 +20335,15 @@ impl SaturatedJoinReport {
              p50={} p95={} max={} never={}/{}\n\
              joiner time from first CONNECT to min_connections: p50={} p95={} \
              max={} never={}/{}\n\
-             CONNECT hops (all): {} received, {:.2}% accepted, median chain {} \
-             hops, {:.0}% of {} chains had no accepting hop\n\
-             CONNECT hops (joiners' requests): {} received, {:.2}% accepted, \
-             median chain {} hops, {:.0}% of {} chains had no accepting hop",
+             CONNECT hops (all): {} received, {:.2}% accepted ({} by gateways), \
+             median chain {} hops, {:.0}% of {} chains had no accepting hop\n\
+             CONNECT hops (joiners' requests): {} received, {:.2}% accepted ({} by \
+             gateways), median chain {} hops, {:.0}% of {} chains had no accepting hop",
             self.cfg.name,
             self.cfg.seed,
             self.cfg.gateways,
             self.cfg.established,
+            self.cfg.established_stagger,
             self.cfg.joiners,
             self.cfg.min_connections,
             self.cfg.max_connections,
@@ -20363,11 +20372,13 @@ impl SaturatedJoinReport {
             self.joiners.len(),
             self.all_hops.hops,
             self.all_hops.acceptance_rate() * 100.0,
+            self.all_hops.accepted_by_gateway,
             self.all_hops.median_chain(),
             self.all_hops.chains_without_accept_fraction() * 100.0,
             self.all_hops.chain_lengths.len(),
             self.joiner_hops.hops,
             self.joiner_hops.acceptance_rate() * 100.0,
+            self.joiner_hops.accepted_by_gateway,
             self.joiner_hops.median_chain(),
             self.joiner_hops.chains_without_accept_fraction() * 100.0,
             self.joiner_hops.chain_lengths.len(),
@@ -20435,6 +20446,7 @@ impl SaturatedJoinReport {
 fn connect_hop_stats<'a>(
     logs: impl Iterator<Item = &'a freenet::tracing::NetLogMessage>,
     only_joiners: Option<&HashSet<freenet::dev_tool::TransportPublicKey>>,
+    gateways: &HashSet<freenet::dev_tool::TransportPublicKey>,
 ) -> ConnectHopStats {
     let mut chains: HashMap<freenet::dev_tool::Transaction, (usize, bool)> = HashMap::new();
     let mut stats = ConnectHopStats::default();
@@ -20448,6 +20460,8 @@ fn connect_hop_stats<'a>(
         let accepted = log.kind.is_connect_accepted();
         stats.hops += 1;
         stats.accepted_hops += usize::from(accepted);
+        stats.accepted_by_gateway +=
+            usize::from(accepted && gateways.contains(log.peer_id.pub_key()));
         let chain = chains.entry(log.tx).or_insert((0, false));
         chain.0 += 1;
         chain.1 |= accepted;
@@ -20494,6 +20508,7 @@ fn run_saturated_join(cfg: &SaturatedJoinConfig) -> SaturatedJoinReport {
         .await;
         sim.use_mock_wasm = true;
         sim.skip_convergence_wait = true;
+        sim.with_start_backoff(cfg.established_stagger);
         let gateway_addrs: Vec<SocketAddr> = sim
             .all_node_addresses()
             .iter()
@@ -20591,12 +20606,17 @@ fn run_saturated_join(cfg: &SaturatedJoinConfig) -> SaturatedJoinReport {
         })
         .collect();
 
+    let gateway_keys: HashSet<_> = keys
+        .iter()
+        .filter(|(label, _)| label.is_gateway())
+        .map(|(_, key)| key.clone())
+        .collect();
     let rt = create_runtime();
     let (all_hops, joiner_hops) = rt.block_on(async {
         let logs = logs_handle.lock().await;
         (
-            connect_hop_stats(logs.iter(), None),
-            connect_hop_stats(logs.iter(), Some(&joiner_keys)),
+            connect_hop_stats(logs.iter(), None, &gateway_keys),
+            connect_hop_stats(logs.iter(), Some(&joiner_keys), &gateway_keys),
         )
     });
 
@@ -20640,9 +20660,31 @@ fn test_saturated_join_smoke() {
     report.assert_measured_a_saturated_join(SATURATED_JOIN_MIN_SATURATION);
 }
 
+/// Production degree limits (min 25, max 200) on 300 established peers grown
+/// one per second. This is the smallest scale found to reproduce the live
+/// CONNECT economics: at 100 peers each peer saw ~0.26 CONNECT hops/s and 20%
+/// of hops were accepted, so joiners always connected within ~1s; at 300 the
+/// sim measured ~2.7 hops/s per peer and 0.74% accepted, against ~2.3 and
+/// 0.64% live (#5858).
+#[allow(dead_code)] // Used by nightly_tests-gated tests
+fn saturated_join_production_config(name: &'static str, seed: u64) -> SaturatedJoinConfig {
+    SaturatedJoinConfig {
+        gateways: 3,
+        established: 300,
+        established_stagger: Duration::from_secs(1),
+        joiners: 20,
+        min_connections: 25,
+        max_connections: 200,
+        join_at: Duration::from_secs(500),
+        join_stagger: Duration::from_secs(10),
+        observe_for: Duration::from_secs(240),
+        ..SaturatedJoinConfig::new(name, seed)
+    }
+}
+
 #[allow(dead_code)] // Used by nightly_tests-gated tests
 fn saturated_join_baseline_config() -> SaturatedJoinConfig {
-    SaturatedJoinConfig::new("saturated-join-baseline", 0x5858_0000_0002)
+    saturated_join_production_config("saturated-join-baseline", 0x5858_0000_0002)
 }
 
 /// Baseline measurement at nightly scale: reports the joiners' time to first
@@ -20687,10 +20729,9 @@ fn test_saturated_join_first_connection_p95_target() {
 #[ignore = "manual measurement: 50-joiner burst into a saturated network (#5858)"]
 fn test_saturated_join_burst_50() {
     let cfg = SaturatedJoinConfig {
-        established: 100,
         joiners: 50,
         join_stagger: Duration::ZERO,
-        ..SaturatedJoinConfig::new("saturated-join-burst-50", 0x5858_0000_0003)
+        ..saturated_join_production_config("saturated-join-burst-50", 0x5858_0000_0003)
     };
     let report = run_saturated_join(&cfg);
     report.assert_measured_a_saturated_join(SATURATED_JOIN_MIN_SATURATION);
@@ -20698,7 +20739,7 @@ fn test_saturated_join_burst_50() {
 
 /// Manual exploration: every `SaturatedJoinConfig` field can be overridden
 /// from the environment (`SJ_GATEWAYS`, `SJ_ESTABLISHED`, `SJ_JOINERS`,
-/// `SJ_MIN`, `SJ_MAX`, `SJ_JOIN_AT_S`, `SJ_STAGGER_S`, `SJ_OBSERVE_S`,
+/// `SJ_MIN`, `SJ_MAX`, `SJ_EST_STAGGER_MS`, `SJ_JOIN_AT_S`, `SJ_STAGGER_S`, `SJ_OBSERVE_S`,
 /// `SJ_LATENCY_MS` as `lo-hi` or `0` for none, `SJ_UNREACHABLE`, `SJ_SEED`).
 /// Logs the report and asserts nothing, so it can probe configs that do not
 /// saturate.
@@ -20719,6 +20760,9 @@ fn test_saturated_join_explore() {
     cfg.max_connections = env("SJ_MAX").unwrap_or(cfg.max_connections);
     if let Some(s) = env::<u64>("SJ_JOIN_AT_S") {
         cfg.join_at = Duration::from_secs(s);
+    }
+    if let Some(ms) = env::<u64>("SJ_EST_STAGGER_MS") {
+        cfg.established_stagger = Duration::from_millis(ms);
     }
     if let Some(s) = env::<u64>("SJ_STAGGER_S") {
         cfg.join_stagger = Duration::from_secs(s);
