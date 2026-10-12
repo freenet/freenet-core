@@ -760,6 +760,15 @@ pub(crate) async fn start_relay_connect(
     RELAY_CONNECT_DRIVER_CALL_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
     if !op_manager.active_relay_connect_txs.insert(incoming_tx) {
+        crate::ring::join_timeline::record_note(
+            &op_manager.ring.connection_manager.pub_key,
+            || {
+                (
+                    format!("relay tx={incoming_tx}: duplicate Request dropped (dedup)"),
+                    Some(upstream_addr),
+                )
+            },
+        );
         RELAY_CONNECT_DEDUP_REJECTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         tracing::debug!(
             tx = %incoming_tx,

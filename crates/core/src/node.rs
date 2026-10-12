@@ -1310,6 +1310,23 @@ where
 
     match msg {
         NetMessageV1::Connect(ref op) => {
+            crate::ring::join_timeline::record_note(
+                &op_manager.ring.connection_manager.pub_key,
+                || {
+                    (
+                        format!(
+                            "recv {op} tx={}{}",
+                            op.id(),
+                            if pending_op_result.is_some() {
+                                " (has waiter)"
+                            } else {
+                                ""
+                            }
+                        ),
+                        source_addr,
+                    )
+                },
+            );
             // CONNECT reply forwarding: the joiner expects fan-in
             // (up to `target_connections` `Response`s over time).
             // The waiter (`OpCtx::send_and_collect_replies`) has a
