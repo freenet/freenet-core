@@ -2525,6 +2525,11 @@ async fn recover_from_stranded_requester(
                 Err(err) => (None, Some("store_lookup"), err.to_string()),
             }
         }
+        Ok(Ok(SubOpGetOutcome::NotFound(cause)))
+            if cause == crate::operations::get::op_ctx_task::PINNED_FETCH_DEADLINE_CAUSE =>
+        {
+            (None, Some("deadline"), cause)
+        }
         Ok(Ok(SubOpGetOutcome::NotFound(cause))) => (None, Some("not_found"), cause),
         Ok(Ok(SubOpGetOutcome::Infra(err))) => (None, Some("infra"), err.to_string()),
         Ok(Err(_)) => (None, Some("task_lost"), String::new()),

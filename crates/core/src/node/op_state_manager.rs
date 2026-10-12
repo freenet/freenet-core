@@ -4516,6 +4516,13 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn stranded_recovery_reroot_skips_with_no_connections() {
         let (op_manager, _guards) = build_reroot_test_op_manager("stranded-reroot-isolated").await;
+        // A known location but no connection, so it is the connection guard
+        // that refuses, not the distance-blind one further down.
+        op_manager
+            .ring
+            .connection_manager
+            .set_own_addr_local_for_test("127.0.0.1:12000".parse().unwrap());
+        assert_eq!(op_manager.ring.open_connections(), 0);
         let key = reroot_contract_key(0x60);
         op_manager.ring.subscribe(key);
         op_manager

@@ -2792,9 +2792,7 @@ pub(crate) fn start_pinned_sub_op_get<G: Send + 'static>(
         .await
         {
             Ok(outcome) => outcome,
-            Err(_elapsed) => {
-                SubOpGetOutcome::NotFound(format!("pinned fetch exceeded {}s", deadline.as_secs()))
-            }
+            Err(_elapsed) => SubOpGetOutcome::NotFound(PINNED_FETCH_DEADLINE_CAUSE.to_string()),
         };
         on_done(matches!(outcome, SubOpGetOutcome::Found(_)));
         // Receiver drop is acceptable: the caller may have given up.
@@ -2869,6 +2867,10 @@ impl Drop for SubOpGetCompletionGuard {
         self.op_manager.completed(self.tx);
     }
 }
+
+/// The `NotFound` cause a pinned fetch reports when its deadline cancelled it,
+/// so a caller can tell a cut-off fetch from a target that had nothing.
+pub(crate) const PINNED_FETCH_DEADLINE_CAUSE: &str = "pinned fetch exceeded its deadline";
 
 /// HTL of a pinned-only sub-op GET; see `sub_op_driver`.
 const PINNED_ONLY_HTL: usize = 2;
@@ -12325,7 +12327,7 @@ mod route_attempt_driver_tests {
 
         let outcome = outcome.await.expect("the fetch reports an outcome");
         assert!(
-            matches!(&outcome, SubOpGetOutcome::NotFound(cause) if cause.contains("exceeded")),
+            matches!(&outcome, SubOpGetOutcome::NotFound(cause) if cause == PINNED_FETCH_DEADLINE_CAUSE),
             "the deadline ends the fetch: {outcome:?}"
         );
         tokio::task::yield_now().await;

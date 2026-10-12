@@ -261,8 +261,9 @@ pub struct RenewalMetrics {
     /// Stranded-holder recoveries this node passed the gate for but refused
     /// because a token bucket was empty.
     pub stranded_recoveries_rate_limited: u64,
-    /// Stranded-holder recoveries refused because a fetch slot was busy: all
-    /// taken, or this requester or contract already had a fetch in flight.
+    /// Stranded-holder recoveries refused for a reason other than an empty
+    /// token bucket: a busy fetch slot (all taken, or this requester or
+    /// contract already fetching) or a pair in its failed-fetch backoff.
     pub stranded_recoveries_refused_busy: u64,
 }
 
