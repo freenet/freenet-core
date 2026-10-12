@@ -2,6 +2,7 @@
 //! fresh ephemeral peer joined through another, including previous runs'
 //! contracts (retention).
 
+use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
@@ -127,7 +128,11 @@ pub async fn run(args: PutGetArgs) -> Result<bool> {
             eprintln!("ephemeral node log tail:\n{}", node.log_tail());
             meta.duration_ms = started.elapsed().as_millis();
             meta.print();
+            report.print_summary();
             node.shutdown().await;
+            // The PUTs happened whether or not the getter could run: later
+            // runs' retention windows still need these contracts.
+            record_puts(&mut manifest, &args.manifest, run_id, now, &put_ok)?;
             return Err(e.context("connecting to ephemeral node ws api"));
         }
     };
@@ -137,7 +142,11 @@ pub async fn run(args: PutGetArgs) -> Result<bool> {
             eprintln!("ephemeral node log tail:\n{}", node.log_tail());
             meta.duration_ms = started.elapsed().as_millis();
             meta.print();
+            report.print_summary();
             node.shutdown().await;
+            // The PUTs happened whether or not the getter could run: later
+            // runs' retention windows still need these contracts.
+            record_puts(&mut manifest, &args.manifest, run_id, now, &put_ok)?;
             return Err(e);
         }
     }
@@ -214,32 +223,43 @@ pub async fn run(args: PutGetArgs) -> Result<bool> {
     client::disconnect(&mut peer).await;
     node.shutdown().await;
 
-    // Record only successfully-PUT contracts so retention runs never chase
-    // contracts that were never stored.
-    if !put_ok.is_empty() {
-        manifest.record_run(
-            RunRecord {
-                run_id,
-                timestamp: now,
-                contracts: put_ok
-                    .iter()
-                    .map(|c| ContractRecord {
-                        id: *c.contract.key().id(),
-                        label: c.label.clone(),
-                        size: c.state.as_ref().len(),
-                        state_hash: blake3::hash(c.state.as_ref()).to_hex().to_string(),
-                    })
-                    .collect(),
-            },
-            now,
-        );
-        manifest.save(&args.manifest)?;
-    }
+    record_puts(&mut manifest, &args.manifest, run_id, now, &put_ok)?;
 
     meta.duration_ms = started.elapsed().as_millis();
     meta.print();
     report.print_summary();
     Ok(report.all_ok())
+}
+
+/// Record only successfully-PUT contracts so retention runs never chase
+/// contracts that were never stored.
+fn record_puts(
+    manifest: &mut Manifest,
+    path: &Path,
+    run_id: String,
+    now: u64,
+    put_ok: &[&contracts::RunContract],
+) -> Result<()> {
+    if put_ok.is_empty() {
+        return Ok(());
+    }
+    manifest.record_run(
+        RunRecord {
+            run_id,
+            timestamp: now,
+            contracts: put_ok
+                .iter()
+                .map(|c| ContractRecord {
+                    id: *c.contract.key().id(),
+                    label: c.label.clone(),
+                    size: c.state.as_ref().len(),
+                    state_hash: blake3::hash(c.state.as_ref()).to_hex().to_string(),
+                })
+                .collect(),
+        },
+        now,
+    );
+    manifest.save(path)
 }
 
 /// One GET the run will perform, and how to check what comes back.

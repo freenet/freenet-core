@@ -440,7 +440,9 @@ async fn get_inner(
     }
 }
 
-/// Only the network section: the ring's own connections, nothing else.
+/// Asks for the network section, which lists the ring's own connections.
+/// `contract_keys` cannot be switched off: empty means every hosted contract,
+/// which on a freshly booted getter is none.
 fn ring_connections_query() -> ClientRequest<'static> {
     ClientRequest::NodeQueries(NodeQuery::NodeDiagnostics {
         config: NodeDiagnosticsConfig {
@@ -466,11 +468,15 @@ fn ring_connections_query() -> ClientRequest<'static> {
 /// completed, so nearly every nightly run issued its GETs from a node with
 /// zero ring connections: each GET was one forward through the gateway with
 /// no alternative route, and its NotFounds measured that, not the network.
+///
+/// One ring connection is the minimum bar, not proof of a well-joined peer:
+/// it may be the bootstrap gateway itself, accepted as a neighbour. The
+/// returned addresses (the report's `ephemeral_peers`) say which.
 pub async fn wait_for_ring_join(client: &mut WebApi, timeout: Duration) -> Result<Vec<String>> {
     let deadline = Instant::now() + timeout;
     loop {
         client.send(ring_connections_query()).await?;
-        match tokio::time::timeout(Duration::from_secs(5), client.recv()).await {
+        let last_seen = match tokio::time::timeout(Duration::from_secs(5), client.recv()).await {
             Ok(Ok(HostResponse::QueryResponse(QueryResponse::NodeDiagnostics(diag)))) => {
                 let peers = diag.network_info.map(|n| n.connected_peers);
                 if let Some(peers) = peers.filter(|p| !p.is_empty()) {
@@ -482,14 +488,24 @@ pub async fn wait_for_ring_join(client: &mut WebApi, timeout: Duration) -> Resul
                     );
                     return Ok(addrs);
                 }
+                "the node reported an empty ring".to_string()
             }
-            Ok(Ok(other)) => eprintln!("unexpected response to NodeDiagnostics: {other:?}"),
-            Ok(Err(e)) => eprintln!("NodeDiagnostics query error: {e}"),
-            Err(_) => eprintln!("NodeDiagnostics query timed out"),
-        }
+            Ok(Ok(other)) => {
+                eprintln!("unexpected response to NodeDiagnostics: {other:?}");
+                "an unexpected response".to_string()
+            }
+            Ok(Err(e)) => {
+                eprintln!("NodeDiagnostics query error: {e}");
+                format!("a query error ({e})")
+            }
+            Err(_) => {
+                eprintln!("NodeDiagnostics query timed out");
+                "a query that timed out".to_string()
+            }
+        };
         ensure!(
             Instant::now() < deadline,
-            "ephemeral node did not join the ring within {timeout:?}"
+            "ephemeral node did not join the ring within {timeout:?} (last poll: {last_seen})"
         );
         tokio::time::sleep(jittered(Duration::from_secs(2))).await;
     }
@@ -608,11 +624,13 @@ mod tests {
 
     const TEST_TIMEOUT: Duration = Duration::from_secs(10);
 
-    fn diagnostics_with_ring(peers: &[&str]) -> HostResult {
+    /// As the real handler does, the network section is filled only when the
+    /// query asked for it.
+    fn diagnostics_with_ring(peers: &[&str], include_network_info: bool) -> HostResult {
         Ok(HostResponse::QueryResponse(QueryResponse::NodeDiagnostics(
             NodeDiagnosticsResponse {
                 node_info: None,
-                network_info: Some(NetworkInfo {
+                network_info: include_network_info.then(|| NetworkInfo {
                     connected_peers: peers
                         .iter()
                         .map(|a| (format!("peer-at-{a}"), a.to_string()))
@@ -630,8 +648,13 @@ mod tests {
     /// A node that has a transport link to its gateway and nothing in its
     /// ring, answering each query the way the real one does: `ConnectedPeers`
     /// lists the gateway, `NodeDiagnostics` reports the ring, one entry of
-    /// `ring` per query (the last repeats).
-    async fn joining_node(listener: TcpListener, gateway: &'static str, ring: Vec<Vec<&str>>) {
+    /// `ring` per query (the last repeats). A `None` entry answers that query
+    /// with an error.
+    async fn joining_node(
+        listener: TcpListener,
+        gateway: &'static str,
+        ring: Vec<Option<Vec<&str>>>,
+    ) {
         let (stream, _) = listener.accept().await.expect("accept");
         let mut ws = tokio_tungstenite::accept_async(stream)
             .await
@@ -652,10 +675,13 @@ mod tests {
                         )],
                     }))
                 }
-                ClientRequest::NodeQueries(NodeQuery::NodeDiagnostics { .. }) => {
+                ClientRequest::NodeQueries(NodeQuery::NodeDiagnostics { config }) => {
                     let i = diagnostics_asked.min(ring.len() - 1);
                     diagnostics_asked += 1;
-                    diagnostics_with_ring(&ring[i])
+                    match &ring[i] {
+                        Some(peers) => diagnostics_with_ring(peers, config.include_network_info),
+                        None => Err(network_error_because("node busy")),
+                    }
                 }
                 other => panic!("unexpected request {other:?}"),
             };
@@ -664,7 +690,10 @@ mod tests {
         }
     }
 
-    async fn start_joining_node(gateway: &'static str, ring: Vec<Vec<&'static str>>) -> WebApi {
+    async fn start_joining_node(
+        gateway: &'static str,
+        ring: Vec<Option<Vec<&'static str>>>,
+    ) -> WebApi {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0u16))
             .await
             .expect("bind");
@@ -686,21 +715,45 @@ mod tests {
         // gateway handshake done, the ring empty. The old wait returned here
         // with the gateway as its "connection", and every GET that followed
         // was a single forward through that gateway.
-        let mut client = start_joining_node("5.9.111.215:31338", vec![vec![]]).await;
+        let mut client = start_joining_node("5.9.111.215:31338", vec![Some(vec![])]).await;
         let joined = wait_for_ring_join(&mut client, Duration::from_secs(3)).await;
+        let err = match joined {
+            Ok(peers) => {
+                panic!("a node with zero ring connections was reported as joined: {peers:?}")
+            }
+            Err(e) => e.to_string(),
+        };
+        // The specific failure, not any error: a fake node that died or a
+        // request that failed to decode would also be an Err.
         assert!(
-            joined.is_err(),
-            "a node with zero ring connections was reported as joined: {joined:?}"
+            err.contains("did not join the ring") && err.contains("empty ring"),
+            "unexpected error: {err}"
         );
     }
 
     #[tokio::test]
     async fn the_join_wait_returns_the_ring_peers_once_there_are_some() {
-        let mut client =
-            start_joining_node("5.9.111.215:31338", vec![vec![], vec!["203.0.113.7:40000"]]).await;
+        let mut client = start_joining_node(
+            "5.9.111.215:31338",
+            vec![Some(vec![]), Some(vec!["203.0.113.7:40000"])],
+        )
+        .await;
         let joined = wait_for_ring_join(&mut client, TEST_TIMEOUT)
             .await
             .expect("the node joined on the second poll");
+        assert_eq!(joined, vec!["203.0.113.7:40000".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn a_query_error_does_not_end_the_join_wait() {
+        let mut client = start_joining_node(
+            "5.9.111.215:31338",
+            vec![None, Some(vec!["203.0.113.7:40000"])],
+        )
+        .await;
+        let joined = wait_for_ring_join(&mut client, TEST_TIMEOUT)
+            .await
+            .expect("the error was one poll; the next found a ring peer");
         assert_eq!(joined, vec!["203.0.113.7:40000".to_string()]);
     }
 
