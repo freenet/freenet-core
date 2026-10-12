@@ -44,6 +44,9 @@ pub struct NetworkStats {
     pub messages_dropped_partition: u64,
     /// Messages dropped due to crashed nodes
     pub messages_dropped_crash: u64,
+    /// Messages dropped because the pair is unreachable
+    /// (`FaultConfig::unreachable_pair_fraction`)
+    pub messages_dropped_unreachable_pair: u64,
     /// Messages queued for delayed delivery (VirtualTime mode)
     pub messages_queued: u64,
     /// Messages delivered after delay
@@ -55,7 +58,10 @@ pub struct NetworkStats {
 impl NetworkStats {
     /// Returns the total number of dropped messages.
     pub fn total_dropped(&self) -> u64 {
-        self.messages_dropped_loss + self.messages_dropped_partition + self.messages_dropped_crash
+        self.messages_dropped_loss
+            + self.messages_dropped_partition
+            + self.messages_dropped_crash
+            + self.messages_dropped_unreachable_pair
     }
 
     /// Returns the message loss ratio (0.0 to 1.0).
@@ -106,6 +112,13 @@ pub struct FaultInjectorState {
     /// and `SimNetwork::run_simulation_direct` (churn driver crashes, #4694) set it
     /// so their injected faults are real packet drops rather than silent no-ops.
     pub enforce_fault_drops: bool,
+    /// Opt-in: when true, the network's packet-delivery callback also applies
+    /// `config.latency_range` (a per-packet delay drawn from `rng`) and drops
+    /// packets between `config.is_unreachable_pair` pairs. Without it those
+    /// two settings are inert on the socket path. Set by
+    /// `SimNetwork::run_simulation_direct` when the network opted in via
+    /// `SimNetwork::enforce_link_faults`.
+    pub enforce_link_faults: bool,
 }
 
 impl FaultInjectorState {
@@ -119,6 +132,7 @@ impl FaultInjectorState {
             stats: NetworkStats::default(),
             network_name: None,
             enforce_fault_drops: false,
+            enforce_link_faults: false,
         }
     }
 
@@ -296,6 +310,7 @@ mod tests {
             messages_dropped_loss: 10,
             messages_dropped_partition: 5,
             messages_dropped_crash: 5,
+            messages_dropped_unreachable_pair: 0,
             messages_queued: 0,
             messages_delayed_delivered: 20,
             total_latency_nanos: 200_000_000, // 200ms total

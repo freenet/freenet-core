@@ -471,6 +471,17 @@ fn fault_injection_delivery_decision(
                 }
             }
         }
+        if inj.enforce_link_faults {
+            if inj.config.is_unreachable_pair(&from, &to) {
+                inj.stats.messages_dropped_unreachable_pair += 1;
+                return PacketDeliveryDecision::Drop;
+            }
+            if let Some(delay) = inj.config.generate_latency(&inj.rng) {
+                inj.stats.messages_delayed_delivered += 1;
+                inj.stats.total_latency_nanos += delay.as_nanos() as u64;
+                return PacketDeliveryDecision::DelayedDelivery(delay);
+            }
+        }
     }
     PacketDeliveryDecision::Deliver
 }
@@ -1466,6 +1477,13 @@ pub struct SimNetwork {
     pub skip_convergence_wait: bool,
     /// Optional churn (crash/restart) configuration for the chaos driver.
     churn_config: Option<ChurnConfig>,
+    /// Per-node start delays that override the `start_backoff` stagger in the
+    /// direct runner. Set by [`with_node_start_delay`](Self::with_node_start_delay).
+    node_start_delays: HashMap<NodeLabel, Duration>,
+    /// When true, the direct runner makes `FaultConfig::latency_range` and
+    /// `FaultConfig::unreachable_pair_fraction` real on the socket path. Set
+    /// by [`enforce_link_faults`](Self::enforce_link_faults).
+    enforce_link_faults: bool,
     /// Optional pre-operation join-convergence barrier for
     /// [`run_controlled_simulation`](Self::run_controlled_simulation). When
     /// `Some((min_fraction, max_wait))`, the controlled-event client waits —
@@ -1745,6 +1763,8 @@ impl SimNetwork {
             use_mock_wasm: false,
             skip_convergence_wait: false,
             churn_config: None,
+            node_start_delays: HashMap::new(),
+            enforce_link_faults: false,
             wait_for_join_before_ops: None,
             controlled_op_interval: None,
             governance_config_override: None,
@@ -1893,6 +1913,48 @@ impl SimNetwork {
     pub fn with_churn(&mut self, config: ChurnConfig) -> &mut Self {
         self.churn_config = Some(config);
         self
+    }
+
+    /// Starts regular node `label` after `delay` of virtual time instead of at
+    /// its `start_backoff` stagger slot. Direct runner only. Used to join fresh
+    /// peers into an already-formed network (#5858).
+    pub fn with_node_start_delay(&mut self, label: &NodeLabel, delay: Duration) -> &mut Self {
+        self.node_start_delays.insert(label.clone(), delay);
+        self
+    }
+
+    /// Makes the direct runner apply `FaultConfig::latency_range` (a per-packet
+    /// delay) and `FaultConfig::unreachable_pair_fraction` (pairs that never
+    /// connect, modelling failed NAT traversal) on the socket path. Both are
+    /// otherwise inert: the delivery callback only enforces crashes and
+    /// partitions. Opt-in so existing simulations that set `latency_range`
+    /// keep their current behaviour. Direct runner only.
+    pub fn enforce_link_faults(&mut self) -> &mut Self {
+        self.enforce_link_faults = true;
+        self
+    }
+
+    /// Registers a [`JoinTimelineRecorder`](crate::ring::join_timeline::JoinTimelineRecorder)
+    /// for this network and returns it. The direct runner starts its clock;
+    /// afterwards it holds, per peer, when the node started, when it initiated
+    /// CONNECTs and every change in its ring-connection count, in virtual time.
+    /// Read it after the run (the `Arc` outlives the network).
+    pub fn join_timeline_handle(&self) -> Arc<crate::ring::join_timeline::JoinTimelineRecorder> {
+        crate::ring::join_timeline::install_join_timeline_recorder(&self.name)
+    }
+
+    /// Public key of every gateway and regular node, by label. Call before
+    /// running (the runners consume the node builders).
+    pub fn node_public_keys(&self) -> HashMap<NodeLabel, TransportPublicKey> {
+        let gateways = self
+            .gateways
+            .iter()
+            .map(|(b, cfg)| (cfg.label.clone(), b.config.key_pair.public().clone()));
+        let nodes = self
+            .nodes
+            .iter()
+            .map(|(b, label)| (label.clone(), b.config.key_pair.public().clone()));
+        gateways.chain(nodes).collect()
     }
 
     /// Inject a controllable hosting clock into every node this network builds,
@@ -5834,6 +5896,15 @@ impl SimNetwork {
         if self.churn_config.is_some() {
             self.enable_fault_drop_enforcement();
         }
+        if self.enforce_link_faults {
+            crate::transport::in_memory_socket::set_packet_delivery_callback(
+                &self.name,
+                Some(Arc::new(fault_injection_delivery_decision)),
+            );
+            if let Some(injector) = crate::node::network_bridge::get_fault_injector(&self.name) {
+                injector.lock().unwrap().enforce_link_faults = true;
+            }
+        }
 
         // Single-threaded runtime with paused time for deterministic execution
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -5858,6 +5929,8 @@ impl SimNetwork {
         let skip_convergence_wait = self.skip_convergence_wait;
 
         let result: anyhow::Result<()> = rt.block_on(async {
+            crate::ring::join_timeline::start_join_timeline_clock(&self.name);
+
             // Time driver: bridges tokio's paused time → VirtualTime
             // When all tasks are idle, tokio auto-advances past the 1ms sleep,
             // which wakes this driver, which advances VirtualTime, which wakes
@@ -5902,6 +5975,7 @@ impl SimNetwork {
 
                 self.labels
                     .push((label.clone(), node.config.key_pair.public().clone()));
+                crate::ring::join_timeline::record_node_started(node.config.key_pair.public());
 
                 let handle = if use_mock_wasm {
                     tokio::spawn(async move {
@@ -5956,16 +6030,23 @@ impl SimNetwork {
                 self.labels
                     .push((label.clone(), node.config.key_pair.public().clone()));
 
-                let backoff = self.start_backoff * (i as u32 + 1);
+                let backoff = self
+                    .node_start_delays
+                    .get(&label)
+                    .copied()
+                    .unwrap_or(self.start_backoff * (i as u32 + 1));
+                let pub_key = node.config.key_pair.public().clone();
                 let handle = if use_mock_wasm {
                     tokio::spawn(async move {
                         tokio::time::sleep(backoff).await;
+                        crate::ring::join_timeline::record_node_started(&pub_key);
                         node.run_node_with_mock_wasm(user_events, span, shared_storage, None)
                             .await
                     })
                 } else {
                     tokio::spawn(async move {
                         tokio::time::sleep(backoff).await;
+                        crate::ring::join_timeline::record_node_started(&pub_key);
                         node.run_node_with_shared_storage(user_events, span, shared_storage)
                             .await
                     })
@@ -6615,6 +6696,7 @@ impl Drop for SimNetwork {
         clear_renewal_metrics(&self.name);
         clear_summarize_metrics(&self.name);
         clear_zombie_sweep_observations(&self.name);
+        crate::ring::join_timeline::clear_join_timeline_recorder(&self.name);
         remove_network_socket_registry(&self.name);
         clear_network_address_mappings(&self.name);
 
