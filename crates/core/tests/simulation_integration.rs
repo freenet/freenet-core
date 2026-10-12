@@ -20804,7 +20804,7 @@ fn test_saturated_join_burst_50() {
 /// `SJ_MIN`, `SJ_MAX`, `SJ_EST_STAGGER_MS`, `SJ_JOIN_AT_S`, `SJ_STAGGER_S`, `SJ_OBSERVE_S`,
 /// `SJ_LATENCY_MS` as `lo-hi` or `0` for none, `SJ_JITTER_MS`, `SJ_UNREACHABLE`, `SJ_SEED`).
 /// Logs the report and asserts nothing, so it can probe configs that do not
-/// saturate.
+/// saturate. With `SJ_JOINERS=0` it also logs the cold-burst analysis.
 #[test_log::test]
 #[ignore = "manual measurement, configured from SJ_* environment variables (#5858)"]
 fn test_saturated_join_explore() {
@@ -20841,7 +20841,10 @@ fn test_saturated_join_explore() {
         });
     }
     cfg.unreachable_pair_fraction = env("SJ_UNREACHABLE").unwrap_or(0.0);
-    run_saturated_join(&cfg);
+    let report = run_saturated_join(&cfg);
+    if cfg.joiners == 0 {
+        log_cold_burst(&report);
+    }
 }
 
 // -----------------------------------------------------------------------------
