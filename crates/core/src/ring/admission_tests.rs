@@ -414,3 +414,76 @@ impl Drop for LatticeGuard {
         set_nn_lattice_force_active(false);
     }
 }
+
+/// The promotion path `handle_successful_connection` takes (#5858 review M1):
+/// it consumes the reservation, then adds the connection. The onboarding slot
+/// must survive that, or the link leaves probation the moment it connects and
+/// the slot bound limits only handshakes in flight.
+#[test]
+fn successful_promotion_keeps_the_link_on_probation() {
+    let cm = busy_manager();
+    assert_eq!(
+        cm.evaluate_admission(Location::new(0.72), addr(96), RequesterNeed::Short, None),
+        AdmissionCode::AcceptedOnboarding
+    );
+    let loc = cm
+        .take_reservation_for_promotion(addr(96))
+        .expect("the reservation recorded a location");
+    let keypair = TransportKeypair::new();
+    assert!(cm.add_connection(loc, addr(96), keypair.public().clone(), true));
+    assert!(
+        cm.is_provisional(addr(96)),
+        "still on probation after promotion"
+    );
+    assert_eq!(cm.admission_stats().onboarding_established, 1);
+    assert_eq!(cm.admission_stats().provisional_released_unestablished, 0);
+
+    // A real prune of the established link frees the slot, counted as pruned.
+    cm.prune_alive_connection(addr(96));
+    assert!(!cm.is_provisional(addr(96)));
+    assert_eq!(cm.admission_stats().provisional_pruned, 1);
+}
+
+/// A failed handshake frees the slot and is counted as never established.
+#[test]
+fn failed_handshake_releases_the_slot_as_unestablished() {
+    let cm = busy_manager();
+    assert_eq!(
+        cm.evaluate_admission(Location::new(0.72), addr(97), RequesterNeed::Short, None),
+        AdmissionCode::AcceptedOnboarding
+    );
+    cm.prune_in_transit_connection(addr(97));
+    assert!(!cm.is_provisional(addr(97)));
+    assert_eq!(cm.admission_stats().provisional_released_unestablished, 1);
+}
+
+/// Source pin: the success path of `handle_successful_connection` consumes the
+/// reservation with `take_reservation_for_promotion`, never with
+/// `prune_in_transit_connection` (which frees an onboarding slot).
+#[test]
+fn successful_handshake_consumes_the_reservation_without_freeing_the_slot() {
+    const LIFECYCLE_SRC: &str =
+        include_str!("../node/network_bridge/p2p_protoc/connection_lifecycle.rs");
+    let start = LIFECYCLE_SRC
+        .find("async fn handle_successful_connection(")
+        .expect("handle_successful_connection");
+    let end = start
+        + LIFECYCLE_SRC[start..]
+            .find("\n    }\n")
+            .expect("end of handle_successful_connection");
+    let code: Vec<&str> = LIFECYCLE_SRC[start..end]
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("//"))
+        .collect();
+    assert!(
+        code.iter()
+            .any(|l| l.contains("connection_manager.take_reservation_for_promotion(peer_addr)")),
+        "the promotion path must consume its reservation without freeing the slot"
+    );
+    assert!(
+        !code
+            .iter()
+            .any(|l| l.contains("prune_in_transit_connection(")),
+        "prune_in_transit_connection on the success path takes onboarding links off probation"
+    );
+}

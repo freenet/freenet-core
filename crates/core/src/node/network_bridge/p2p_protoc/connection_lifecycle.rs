@@ -1192,8 +1192,11 @@ impl P2pConnManager {
             crate::node::network_status::record_peer_connected(peer_addr, None, None);
             if promote_to_ring {
                 // Only prune reservation when promoting to ring - transient connections
-                // don't go through should_accept() so they have no reservation to prune
-                let pending_loc = connection_manager.prune_in_transit_connection(peer_addr);
+                // don't go through should_accept() so they have no reservation to prune.
+                // `take_reservation_for_promotion`, not `prune_in_transit_connection`:
+                // the handshake succeeded, so an onboarding slot stays on probation
+                // (#5858).
+                let pending_loc = connection_manager.take_reservation_for_promotion(peer_addr);
                 // Safe to unwrap: promote_to_ring is only true when peer_id.is_some()
                 let peer = peer_id
                     .as_ref()
