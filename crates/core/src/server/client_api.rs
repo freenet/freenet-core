@@ -855,6 +855,14 @@ pub(super) fn is_sensitive_query_param(param: &str) -> bool {
     decoded.starts_with("__sandbox") || decoded.starts_with("authToken")
 }
 
+/// The shell's recovery stamp `_freload` (name percent-decoded, as above).
+/// Not part of [`is_sensitive_query_param`]: the canonicalising redirects must
+/// keep it (it bounds the top-level retry), only the app's iframe drops it.
+pub(super) fn is_recovery_stamp_param(param: &str) -> bool {
+    let name = param.split('=').next().unwrap_or(param);
+    percent_decode_ascii(name) == "_freload"
+}
+
 /// Percent-decodes the ASCII escapes in a query-parameter NAME so it can be
 /// compared against a literal. Deliberately minimal: invalid escapes are left
 /// as-is (they cannot form the names we are looking for), and non-ASCII bytes
@@ -2187,6 +2195,36 @@ mod tests {
         }
         // …and one that must still be caught despite the neighbouring escape.
         assert!(is_sensitive_query_param("authT%6Fken%é=1"));
+    }
+
+    /// `_freload` is matched exactly (name percent-decoded, as the browser
+    /// reads it), and stays OUT of `is_sensitive_query_param`: that filter is
+    /// shared with the canonicalising redirects, which must keep the stamp so
+    /// the top-level connecting-page retry stays bounded.
+    #[test]
+    fn recovery_stamp_param_is_matched_exactly_and_not_sensitive() {
+        for stamp in [
+            "_freload=1-0",
+            "_freload",
+            "_freload=",
+            "_fre%6Coad=1",
+            "%5Ffreload=1",
+        ] {
+            assert!(is_recovery_stamp_param(stamp), "{stamp} is the stamp");
+            assert!(
+                !is_sensitive_query_param(stamp),
+                "{stamp} must survive the redirects' sensitive-param filter"
+            );
+        }
+        for other in [
+            "_freload2=1",
+            "x_freload=1",
+            "_FRELOAD=1",
+            "_freload_x=1",
+            "q=_freload",
+        ] {
+            assert!(!is_recovery_stamp_param(other), "{other} is an app param");
+        }
     }
 
     /// Regression test for the sub-page loss that removing the `window.open`

@@ -2171,6 +2171,17 @@ fn shell_page(
             if super::client_api::is_sensitive_query_param(param) {
                 continue;
             }
+            // `_freload` is the shell's own recovery stamp (connecting.html
+            // and the 4401 reload cap read it from the TOP-LEVEL URL). In the
+            // app's frame it is a node-internal param in the app's
+            // `location.search`, and a stale one there would make a later
+            // framed connecting page read an expired window and give up
+            // instead of retrying. Dropped here only: the 308/303 redirects
+            // share `is_sensitive_query_param` and must keep it for the
+            // top-level bound.
+            if super::client_api::is_recovery_stamp_param(param) {
+                continue;
+            }
             iframe_params.push(param.to_string());
         }
     }
@@ -7516,6 +7527,32 @@ mod tests {
         );
     }
 
+    /// PR #5750 review: the shell's `_freload` recovery stamp must not reach
+    /// the app's iframe (its `data-src`), whatever the encoding of its name,
+    /// while the app's own params still do.
+    #[tokio::test]
+    async fn shell_page_drops_recovery_stamp_from_iframe_params() {
+        let token = AuthToken::generate();
+        let qs = Some("invite=abc&_freload=1700000000000-0&_fre%6Coad=1-1&b=2".to_string());
+        let html = response_body(
+            shell_page(&token, "testkey123", ApiVersion::V1, qs, None, false).unwrap(),
+        )
+        .await;
+        let data_src = html
+            .split("data-src=\"")
+            .nth(1)
+            .and_then(|s| s.split('"').next())
+            .expect("the shell has an iframe data-src");
+        assert!(
+            !data_src.contains("_freload") && !data_src.contains("_fre%6Coad"),
+            "the recovery stamp must not be forwarded into the iframe: {data_src}"
+        );
+        assert!(
+            data_src.contains("invite=abc") && data_src.contains("b=2"),
+            "the app's own params must still be forwarded: {data_src}"
+        );
+    }
+
     #[tokio::test]
     async fn shell_page_escapes_html_in_query_params() {
         let token = AuthToken::generate();
@@ -7668,6 +7705,31 @@ mod tests {
             !SHELL_BRIDGE_JS.contains("msg.type === 'reload'"),
             "the iframe-initiated reload trigger must be removed (recovery is \
              driven by the node's trusted close code, not the app's say-so)"
+        );
+    }
+
+    /// Call-site pins for the `_freload` hygiene in the shell bridge. The pure
+    /// helpers are unit-tested in `shell_bridge_reload.test.mjs`, but those
+    /// tests extract the helpers and cannot see whether the shell still calls
+    /// them: reverting the same-contract navigation to building the frame path
+    /// from `resolved.search` (which carries a link's stamp into the frame),
+    /// or dropping the load-time `stripFreload()` call, passes every node test.
+    #[test]
+    fn bridge_js_calls_the_freload_hygiene_helpers() {
+        assert!(
+            SHELL_BRIDGE_JS.contains("var newIframePath = sameContractFramePath(")
+                && SHELL_BRIDGE_JS.contains("iframe.src = newIframePath;")
+                && SHELL_BRIDGE_JS.contains("iframePath: newIframePath"),
+            "same-contract navigation must build the frame src and \
+             history.state.iframePath from sameContractFramePath (drops _freload)"
+        );
+        assert!(
+            !SHELL_BRIDGE_JS.contains("resolved.pathname + resolved.search"),
+            "the frame path must not be rebuilt from the raw resolved query"
+        );
+        assert!(
+            SHELL_BRIDGE_JS.contains("\n  stripFreload();\n"),
+            "the shell must drop the recovery stamp from the address bar on load"
         );
     }
 
@@ -8715,8 +8777,12 @@ mod tests {
             SHELL_BRIDGE_JS.contains("newContractPrefix === contractPrefix"),
             "same-contract branch must compare prefixes"
         );
+        // The frame path is built by `sameContractFramePath` (which also drops
+        // the `_freload` recovery stamp); `bridge_js_calls_the_freload_hygiene_helpers`
+        // pins that the handler calls it.
         assert!(
-            SHELL_BRIDGE_JS.contains("resolved.searchParams.set('__sandbox', '1')"),
+            SHELL_BRIDGE_JS.contains("u.searchParams.set('__sandbox', '1')")
+                && SHELL_BRIDGE_JS.contains("var newIframePath = sameContractFramePath("),
             "same-contract branch must add __sandbox=1 to navigated URL"
         );
         // Cross-contract branch: must do a top-level window.location.assign
