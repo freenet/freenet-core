@@ -2780,6 +2780,8 @@ impl ConnectionManager {
         // Initialize health tracking for the new peer.
         self.peer_health.lock().init_peer(addr);
 
+        super::join_timeline::record_ring_connection_count(&self.pub_key, count_after);
+
         true
     }
 
@@ -2915,6 +2917,8 @@ impl ConnectionManager {
                 if bucket.is_empty() {
                     cbl.remove(&loc);
                 }
+                let count_after: usize = cbl.values().map(|conns| conns.len()).sum();
+                super::join_timeline::record_ring_connection_count(&self.pub_key, count_after);
             }
         }
 

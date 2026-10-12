@@ -90,6 +90,21 @@ pub struct FaultConfig {
     pub crashed_nodes: HashSet<SocketAddr>,
     /// Probability of a node crashing per time step
     pub node_crash_rate: f64,
+    /// Fraction (0.0 to 1.0) of node PAIRS that can never exchange packets,
+    /// modelling a failed NAT hole punch. Which pairs is a deterministic
+    /// function of the two addresses and `unreachable_pair_salt`, so it is
+    /// fixed for the whole run and reproducible under the seed. Gateways and
+    /// other publicly reachable nodes go in `always_reachable`.
+    pub unreachable_pair_fraction: f64,
+    /// Salt for the unreachable-pair selection.
+    pub unreachable_pair_salt: u64,
+    /// Addresses exempt from `unreachable_pair_fraction` (e.g. gateways).
+    pub always_reachable: HashSet<SocketAddr>,
+    /// Extra per-packet delay, uniform in `[0, latency_jitter)`, added on top
+    /// of the fixed per-pair delay (`pair_latency`) under
+    /// `SimNetwork::enforce_link_faults`. Packets on one pair sent closer
+    /// together than this can arrive out of order.
+    pub latency_jitter: Duration,
 }
 
 impl Default for FaultConfig {
@@ -100,6 +115,10 @@ impl Default for FaultConfig {
             partitions: Vec::new(),
             crashed_nodes: HashSet::new(),
             node_crash_rate: 0.0,
+            unreachable_pair_fraction: 0.0,
+            unreachable_pair_salt: 0,
+            always_reachable: HashSet::new(),
+            latency_jitter: Duration::ZERO,
         }
     }
 }
@@ -151,6 +170,40 @@ impl FaultConfig {
         self.partitions
             .iter()
             .any(|p| p.blocks(from, to, current_time))
+    }
+
+    /// Checks if `a` and `b` are one of the pairs that can never connect
+    /// (see `unreachable_pair_fraction`). Symmetric in `a` and `b`.
+    pub fn is_unreachable_pair(&self, a: &SocketAddr, b: &SocketAddr) -> bool {
+        if self.unreachable_pair_fraction <= 0.0
+            || a == b
+            || self.always_reachable.contains(a)
+            || self.always_reachable.contains(b)
+        {
+            return false;
+        }
+        let (lo, hi) = if a < b { (a, b) } else { (b, a) };
+        let mut h = splitmix64(self.unreachable_pair_salt ^ addr_bits(lo));
+        h = splitmix64(h ^ addr_bits(hi));
+        // Top 53 bits as a uniform fraction in [0, 1).
+        ((h >> 11) as f64 / (1u64 << 53) as f64) < self.unreachable_pair_fraction
+    }
+
+    /// A fixed one-way delay for the pair `a`/`b`, drawn deterministically
+    /// from `latency_range` (and `unreachable_pair_salt`), the same for every
+    /// packet in either direction. Unlike [`generate_latency`](Self::generate_latency),
+    /// which draws per packet and so reorders packets wholesale, this models a
+    /// link with a stable RTT. `None` when no latency range is configured.
+    pub fn pair_latency(&self, a: &SocketAddr, b: &SocketAddr) -> Option<Duration> {
+        let range = self.latency_range.as_ref()?;
+        let span = range.end.saturating_sub(range.start).as_nanos() as u64;
+        if span == 0 {
+            return Some(range.start);
+        }
+        let (lo, hi) = if a < b { (a, b) } else { (b, a) };
+        let mut h = splitmix64(!self.unreachable_pair_salt ^ addr_bits(lo));
+        h = splitmix64(h ^ addr_bits(hi));
+        Some(range.start + Duration::from_nanos(h % span))
     }
 
     /// Checks if a node has crashed.
@@ -215,6 +268,29 @@ impl FaultConfig {
     }
 }
 
+fn splitmix64(mut x: u64) -> u64 {
+    x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    x ^ (x >> 31)
+}
+
+/// Stable 64-bit digest of an address (IP bytes and port), independent of the
+/// std hasher.
+fn addr_bits(addr: &SocketAddr) -> u64 {
+    let mut h = u64::from(addr.port());
+    let octets: Vec<u8> = match addr.ip() {
+        std::net::IpAddr::V4(ip) => ip.octets().to_vec(),
+        std::net::IpAddr::V6(ip) => ip.octets().to_vec(),
+    };
+    for chunk in octets.chunks(8) {
+        let mut buf = [0u8; 8];
+        buf[..chunk.len()].copy_from_slice(chunk);
+        h = splitmix64(h ^ u64::from_le_bytes(buf));
+    }
+    h
+}
+
 /// Builder for creating FaultConfig with fluent API.
 #[derive(Debug, Default)]
 pub struct FaultConfigBuilder {
@@ -264,6 +340,27 @@ impl FaultConfigBuilder {
         self
     }
 
+    /// Makes `fraction` of node pairs permanently unable to exchange packets
+    /// (a failed NAT hole punch), selected deterministically from `salt`.
+    pub fn unreachable_pairs(mut self, fraction: f64, salt: u64) -> Self {
+        self.config.unreachable_pair_fraction = fraction.clamp(0.0, 1.0);
+        self.config.unreachable_pair_salt = salt;
+        self
+    }
+
+    /// Adds a per-packet delay uniform in `[0, jitter)` on top of the fixed
+    /// per-pair latency (see `FaultConfig::latency_jitter`).
+    pub fn latency_jitter(mut self, jitter: Duration) -> Self {
+        self.config.latency_jitter = jitter;
+        self
+    }
+
+    /// Exempts `addrs` (e.g. gateways) from `unreachable_pairs`.
+    pub fn always_reachable(mut self, addrs: impl IntoIterator<Item = SocketAddr>) -> Self {
+        self.config.always_reachable.extend(addrs);
+        self
+    }
+
     /// Builds the FaultConfig.
     pub fn build(self) -> FaultConfig {
         self.config
@@ -309,6 +406,71 @@ mod tests {
         for _ in 0..100 {
             assert!(!config.should_drop_message(&rng));
         }
+    }
+
+    #[test]
+    fn unreachable_pairs_are_symmetric_deterministic_and_near_the_fraction() {
+        let config = FaultConfig::builder().unreachable_pairs(0.4, 7).build();
+        let same = FaultConfig::builder().unreachable_pairs(0.4, 7).build();
+        let other_salt = FaultConfig::builder().unreachable_pairs(0.4, 8).build();
+        let mut blocked = 0;
+        let mut differs_by_salt = 0;
+        let mut total = 0;
+        for a in 1000..1040 {
+            for b in (a + 1)..1040 {
+                let (x, y) = (addr(a), addr(b));
+                let hit = config.is_unreachable_pair(&x, &y);
+                assert_eq!(hit, config.is_unreachable_pair(&y, &x), "must be symmetric");
+                assert_eq!(
+                    hit,
+                    same.is_unreachable_pair(&x, &y),
+                    "must be deterministic"
+                );
+                if hit != other_salt.is_unreachable_pair(&x, &y) {
+                    differs_by_salt += 1;
+                }
+                blocked += usize::from(hit);
+                total += 1;
+            }
+        }
+        let fraction = blocked as f64 / total as f64;
+        assert!(
+            (0.35..0.45).contains(&fraction),
+            "blocked fraction {fraction} over {total} pairs"
+        );
+        assert!(differs_by_salt > 0, "the salt must change the selection");
+    }
+
+    #[test]
+    fn unreachable_pairs_exempt_always_reachable_and_off_by_default() {
+        let gw = addr(1);
+        let config = FaultConfig::builder()
+            .unreachable_pairs(1.0, 0)
+            .always_reachable([gw])
+            .build();
+        assert!(config.is_unreachable_pair(&addr(2), &addr(3)));
+        assert!(!config.is_unreachable_pair(&gw, &addr(3)));
+        assert!(!config.is_unreachable_pair(&addr(3), &gw));
+        assert!(!config.is_unreachable_pair(&addr(2), &addr(2)));
+        assert!(!FaultConfig::new().is_unreachable_pair(&addr(2), &addr(3)));
+    }
+
+    #[test]
+    fn pair_latency_is_stable_symmetric_and_in_range() {
+        let range = Duration::from_millis(20)..Duration::from_millis(150);
+        let config = FaultConfig::builder().latency_range(range.clone()).build();
+        let mut distinct = HashSet::new();
+        for a in 1000..1020 {
+            for b in (a + 1)..1020 {
+                let d = config.pair_latency(&addr(a), &addr(b)).unwrap();
+                assert!(range.contains(&d), "{d:?} outside {range:?}");
+                assert_eq!(Some(d), config.pair_latency(&addr(b), &addr(a)));
+                assert_eq!(Some(d), config.pair_latency(&addr(a), &addr(b)));
+                distinct.insert(d);
+            }
+        }
+        assert!(distinct.len() > 100, "pairs must get different latencies");
+        assert_eq!(FaultConfig::new().pair_latency(&addr(1), &addr(2)), None);
     }
 
     #[test]
