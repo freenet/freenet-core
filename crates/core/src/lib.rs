@@ -119,13 +119,13 @@ pub mod dev_tool {
     pub use node::{
         InitPeerNode, NetworkStats, NodeConfig, PeerId,
         testing_impl::{
-            ChurnConfig, ContractDistribution, ControlledEventChain, ControlledSimulationResult,
-            ConvergedContract, ConvergenceResult, DivergedContract, EventChain, EventSummary,
-            FinalStateHandle, NetworkPeer, NodeLabel, OperationStats, OperationSummary,
-            PeerMessage, PeerStatus, PutOperationStats, RunningNode, ScheduledOperation,
-            SimNetwork, SimOperation, TurmoilConfig, TurmoilResult, UpdateOperationStats,
-            check_convergence_from_logs, check_convergence_from_logs_and_state,
-            run_turmoil_simulation,
+            ChurnConfig, ConnectAdmissionTotals, ContractDistribution, ControlledEventChain,
+            ControlledSimulationResult, ConvergedContract, ConvergenceResult, DivergedContract,
+            EventChain, EventSummary, FinalStateHandle, NetworkPeer, NodeLabel, OperationStats,
+            OperationSummary, PeerMessage, PeerStatus, PutOperationStats, RunningNode,
+            ScheduledOperation, SimNetwork, SimOperation, TurmoilConfig, TurmoilResult,
+            UpdateOperationStats, check_convergence_from_logs,
+            check_convergence_from_logs_and_state, run_turmoil_simulation,
         },
     };
     pub use ring::Location;

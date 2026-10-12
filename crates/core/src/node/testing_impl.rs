@@ -480,6 +480,21 @@ fn fault_injection_delivery_decision(
 /// This struct captures the simulation result along with topology snapshots
 /// taken at the end of the simulation (before cleanup). This allows tests
 /// to validate subscription topology after the simulation completes.
+/// Network-wide CONNECT admission counters (#5858), see
+/// [`ControlledSimulationResult::connect_admission_totals`].
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ConnectAdmissionTotals {
+    /// Requests that arrived at some hop stating a short need.
+    pub requests_seen_short: u64,
+    /// Requests admitted from an onboarding slot.
+    pub admitted_onboarding: u64,
+    /// Onboarding links whose connection was established (and was still on
+    /// probation when it was added to the ring).
+    pub onboarding_established: u64,
+    /// Onboarding links on probation at the end of the run.
+    pub provisional_in_use: u64,
+}
+
 pub struct ControlledSimulationResult {
     /// The Turmoil simulation result
     pub turmoil_result: turmoil::Result,
@@ -592,6 +607,20 @@ impl ControlledSimulationResult {
     /// Reads the same `ConnectionManager` mirror the production emission gates
     /// read, so it answers the question those gates ask rather than a proxy for
     /// it. `None` when the node never published its Ring.
+    /// CONNECT admission counters (#5858) summed over every node that published
+    /// its Ring.
+    pub fn connect_admission_totals(&self) -> ConnectAdmissionTotals {
+        let mut totals = ConnectAdmissionTotals::default();
+        for ring in self.node_rings.values() {
+            let stats = ring.connection_manager.admission_stats();
+            totals.requests_seen_short += stats.requests_seen_short;
+            totals.admitted_onboarding += stats.admitted_onboarding;
+            totals.onboarding_established += stats.onboarding_established;
+            totals.provisional_in_use += stats.provisional_in_use;
+        }
+        totals
+    }
+
     pub fn node_recorded_remote_version(
         &self,
         label: &NodeLabel,
