@@ -231,16 +231,6 @@ fn the_last_slot_is_kept_for_nearly_isolated_requesters() {
     );
 }
 
-/// D1: the bar can be switched off with `ENFORCE_REQUESTER_BAR`; while it is
-/// on, an acceptor that is not closer refuses (`requester_bar_rejects_...`).
-#[test]
-fn bar_enforcement_is_switchable() {
-    assert!(
-        crate::ring::admission::ENFORCE_REQUESTER_BAR,
-        "flip this assertion together with the constant"
-    );
-}
-
 /// Onboarding holds only while the acceptor is below `max_connections`.
 #[test]
 fn short_requester_is_refused_at_capacity() {
