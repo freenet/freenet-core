@@ -77,6 +77,14 @@ pub(crate) const ONBOARDING_GRADUATIONS_PER_WINDOW: usize = 1;
 /// evaluator window (5 min), the longer of the two.
 pub(crate) const ONBOARDING_GRADUATION_WINDOW: Duration = Duration::from_secs(300);
 
+/// A link on probation is a prune or swap substitute only once it is this old.
+///
+/// Two pending-reservation lifetimes: long enough for the joiner to use the
+/// link to issue its own CONNECTs (the maintenance loop's fast tick is a few
+/// seconds) before the acceptor can shed it, so first-in-line pruning cannot
+/// re-isolate a joiner the moment it lands.
+pub(crate) const ONBOARDING_MIN_AGE_BEFORE_PRUNE: Duration = Duration::from_secs(120);
+
 /// Admissions an onboarding slot may serve per probation period, on average.
 ///
 /// Sets the refill rate of the onboarding token bucket (see

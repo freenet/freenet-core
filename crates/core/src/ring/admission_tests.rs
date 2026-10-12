@@ -541,22 +541,76 @@ fn unestablished_provisional_slot_is_released_after_the_reservation_ttl() {
     assert_eq!(cm.admission_stats().provisional_released_unestablished, 1);
 }
 
+/// Old enough to be a prune substitute.
+fn prunable_at(admitted: Instant) -> Instant {
+    admitted + crate::ring::admission::ONBOARDING_MIN_AGE_BEFORE_PRUNE + Duration::from_secs(1)
+}
+
 #[test]
 fn a_link_on_probation_is_first_in_line_for_pruning() {
     let cm = busy_manager();
     let recommended = cm.get_peer_by_addr(addr(10)).expect("connected");
+    let admitted = Instant::now();
     assert!(
-        cm.probation_prune_substitute(&recommended).is_none(),
+        cm.probation_prune_substitute(&recommended, prunable_at(admitted))
+            .is_none(),
         "nothing on probation"
     );
     onboard(&cm, 94, 0.72);
     let substitute = cm
-        .probation_prune_substitute(&recommended)
+        .probation_prune_substitute(&recommended, prunable_at(admitted))
         .expect("the provisional link is shed instead");
     assert_eq!(substitute.socket_addr(), Some(addr(94)));
+    // The slot is freed by the prune that executes the drop, not by the
+    // choice (a swap's drop is deferred and may never happen).
+    assert!(cm.is_provisional(addr(94)));
+    cm.prune_alive_connection(addr(94));
     assert!(!cm.is_provisional(addr(94)));
     assert_eq!(cm.admission_stats().provisional_pruned, 1);
-    assert!(cm.probation_prune_substitute(&recommended).is_none());
+}
+
+/// Review S5: a link that has just landed is not shed by the next prune.
+#[test]
+fn a_young_link_on_probation_is_not_substituted() {
+    let cm = busy_manager();
+    let recommended = cm.get_peer_by_addr(addr(10)).expect("connected");
+    let admitted = Instant::now();
+    onboard(&cm, 94, 0.72);
+    assert!(
+        cm.probation_prune_substitute(&recommended, admitted + Duration::from_secs(5))
+            .is_none()
+    );
+}
+
+/// Only an ESTABLISHED link on probation is a substitute: a slot whose
+/// handshake is still in flight has no connection to shed.
+#[test]
+fn an_unestablished_slot_is_not_substituted() {
+    let cm = busy_manager();
+    let recommended = cm.get_peer_by_addr(addr(10)).expect("connected");
+    let admitted = Instant::now();
+    assert_eq!(
+        cm.evaluate_admission(Location::new(0.72), addr(99), RequesterNeed::Short(0), None),
+        AdmissionCode::AcceptedOnboarding
+    );
+    assert!(
+        cm.probation_prune_substitute(&recommended, prunable_at(admitted))
+            .is_none()
+    );
+}
+
+/// A substitute the prune had already named further down is dropped once.
+#[test]
+fn a_substitute_already_named_by_the_prune_is_dropped_once() {
+    let a = PeerKeyLocation::new(TransportKeypair::new().public().clone(), addr(1));
+    let b = PeerKeyLocation::new(TransportKeypair::new().public().clone(), addr(2));
+    let s = PeerKeyLocation::new(TransportKeypair::new().public().clone(), addr(3));
+    let mut victims = vec![a, s.clone(), b.clone()];
+    crate::ring::substitute_first_victim(&mut victims, s.clone());
+    assert_eq!(victims, vec![s.clone(), b]);
+    let mut empty = Vec::new();
+    crate::ring::substitute_first_victim(&mut empty, s.clone());
+    assert_eq!(empty, vec![s]);
 }
 
 /// A provisional link that is a per-side nearest lattice edge keeps the
@@ -565,13 +619,44 @@ fn a_link_on_probation_is_first_in_line_for_pruning() {
 fn a_lattice_edge_on_probation_is_not_substituted_into_a_prune() {
     let _guard = LatticeGuard;
     let cm = busy_manager();
+    let admitted = Instant::now();
     // Admitted for onboarding while the lattice is inactive; once it is
     // active, 0.52 is the nearest successor (closer than 0.55).
     onboard(&cm, 95, 0.52);
     set_nn_lattice_enabled(true);
     let recommended = cm.get_peer_by_addr(addr(10)).expect("connected");
-    assert!(cm.probation_prune_substitute(&recommended).is_none());
+    assert!(
+        cm.probation_prune_substitute(&recommended, prunable_at(admitted))
+            .is_none()
+    );
     assert!(cm.is_provisional(addr(95)));
+}
+
+/// With the lattice active, a short requester that would be a new per-side
+/// nearest neighbour is admitted by the lattice clause and does not use up
+/// an onboarding slot.
+#[test]
+fn a_short_lattice_candidate_does_not_spend_an_onboarding_slot() {
+    let _guard = LatticeGuard;
+    let cm = busy_manager();
+    set_nn_lattice_enabled(true);
+    assert_eq!(
+        cm.evaluate_admission(Location::new(0.52), addr(85), RequesterNeed::Short(0), None),
+        AdmissionCode::AcceptedLattice
+    );
+    assert!(!cm.is_provisional(addr(85)));
+}
+
+/// The ConnectionManager-level rename hook: a corrected peer address keeps
+/// its link on probation.
+#[test]
+fn an_identity_update_keeps_the_link_on_probation() {
+    let cm = busy_manager();
+    onboard(&cm, 86, 0.72);
+    let keypair = TransportKeypair::new();
+    assert!(cm.update_peer_identity(addr(86), addr(87), keypair.public().clone()));
+    assert!(!cm.is_provisional(addr(86)));
+    assert!(cm.is_provisional(addr(87)));
 }
 
 struct LatticeGuard;

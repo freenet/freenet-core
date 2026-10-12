@@ -6889,16 +6889,17 @@ impl Ring {
                 }
                 TopologyAdjustment::RemoveConnections(mut should_disconnect_peers) => {
                     // A link still on probation is shed first (#5858).
-                    if let Some(first) = should_disconnect_peers.first_mut() {
-                        if let Some(substitute) =
-                            self.connection_manager.probation_prune_substitute(first)
+                    if let Some(first) = should_disconnect_peers.first() {
+                        if let Some(substitute) = self
+                            .connection_manager
+                            .probation_prune_substitute(first, tick_now)
                         {
                             tracing::info!(
                                 recommended = %first,
                                 substitute = %substitute,
                                 "Topology prune: shedding a link on probation instead"
                             );
-                            *first = substitute;
+                            substitute_first_victim(&mut should_disconnect_peers, substitute);
                         }
                     }
                     for peer in should_disconnect_peers {
@@ -6924,8 +6925,9 @@ impl Ring {
                     add_location,
                 } => {
                     // A link still on probation is shed first (#5858).
-                    if let Some(substitute) =
-                        self.connection_manager.probation_prune_substitute(&remove)
+                    if let Some(substitute) = self
+                        .connection_manager
+                        .probation_prune_substitute(&remove, tick_now)
                     {
                         tracing::info!(
                             recommended = %remove,
@@ -7367,6 +7369,17 @@ fn deferred_swap_drops_to_execute(
         }
     }
     n_to_drop
+}
+
+/// Put a probation link first among a prune's victims (#5858): it replaces the
+/// first recommendation, and appears in the list only once, so a substitute
+/// the prune had already named further down is not dropped twice.
+fn substitute_first_victim(victims: &mut Vec<PeerKeyLocation>, substitute: PeerKeyLocation) {
+    victims.retain(|peer| peer != &substitute);
+    match victims.first_mut() {
+        Some(first) => *first = substitute,
+        None => victims.push(substitute),
+    }
 }
 
 /// Amount of wall time the machine was suspended across a maintenance loop
