@@ -1696,6 +1696,7 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                     accepted,
                     ttl,
                     admission,
+                    requester_need,
                 } => {
                     serde_json::json!({
                         "type": "request_received",
@@ -1707,6 +1708,7 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                         "accepted": accepted,
                         "ttl": ttl,
                         "admission": admission.map(|a| a.as_str()),
+                        "requester_need": requester_need.as_str(),
                     })
                 }
                 ConnectEvent::ResponseSent { acceptor, joiner } => {
@@ -3054,6 +3056,14 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                 obj.insert(
                     "connect_onboarding_established".to_string(),
                     serde_json::json!(snapshot.connect_onboarding_established),
+                );
+                obj.insert(
+                    "connect_requests_seen_short".to_string(),
+                    serde_json::json!(snapshot.connect_requests_seen_short),
+                );
+                obj.insert(
+                    "connect_requests_seen_bar".to_string(),
+                    serde_json::json!(snapshot.connect_requests_seen_bar),
                 );
                 obj.insert(
                     "connect_provisional_in_use".to_string(),
@@ -4445,6 +4455,8 @@ mod tests {
         info.connect_need_downgraded_unknown_version = Some(110);
         info.connect_need_downgraded_below_floor = Some(120);
         info.connect_onboarding_established = Some(121);
+        info.connect_requests_seen_short = Some(122);
+        info.connect_requests_seen_bar = Some(123);
         info.connect_provisional_in_use = Some(111);
         let json = event_kind_to_json(&EventKind::RouterSnapshot(Box::new(info)));
         for (key, want) in [
@@ -4460,6 +4472,8 @@ mod tests {
             ("connect_need_downgraded_unknown_version", 110),
             ("connect_need_downgraded_below_floor", 120),
             ("connect_onboarding_established", 121),
+            ("connect_requests_seen_short", 122),
+            ("connect_requests_seen_bar", 123),
             ("connect_provisional_in_use", 111),
         ] {
             assert_eq!(json[key], want, "{key} must reach the OTLP body");
@@ -4483,12 +4497,14 @@ mod tests {
                 accepted: false,
                 ttl: 3,
                 admission,
+                requester_need: crate::ring::admission::NeedClass::Short,
             })
         };
         let json = event_kind_to_json(&event(Some(
             AdmissionCode::RejectedOnboardingBudgetExhausted,
         )));
         assert_eq!(json["admission"], "onboarding_budget_exhausted");
+        assert_eq!(json["requester_need"], "short");
         let json = event_kind_to_json(&event(None));
         assert!(json["admission"].is_null());
     }

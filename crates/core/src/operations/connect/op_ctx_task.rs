@@ -865,6 +865,12 @@ async fn drive_relay_connect(
         let now = Instant::now();
         state.handle_request(&env, &recency, &mut forward_attempts, &estimator, now)
     };
+    // Admission telemetry (#5858): the need this hop saw, and the decision
+    // counted once per request (`record_relay_admission`).
+    let cm = &op_manager.ring.connection_manager;
+    cm.record_request_seen(state.request.need);
+    let mut admission_recorded = false;
+    cm.record_relay_admission(initial_actions.admission, &mut admission_recorded);
 
     // Telemetry: connect_request_received (mirrors connect.rs:1595)
     if let Some(event) = NetEventLog::connect_request_received(
@@ -880,6 +886,7 @@ async fn drive_relay_connect(
         initial_actions.accept.is_some(),
         state.request.ttl,
         initial_actions.admission,
+        state.request.need.class(),
     ) {
         op_manager.ring.register_events(Either::Left(event)).await;
     }
@@ -1108,6 +1115,10 @@ async fn drive_relay_connect(
                 let estimator = op_manager.connect_forward_estimator.read().clone();
                 let retry =
                     state.handle_request(&env, &recency, &mut forward_attempts, &estimator, now);
+                op_manager
+                    .ring
+                    .connection_manager
+                    .record_relay_admission(retry.admission, &mut admission_recorded);
 
                 if let Some((peer, forward_req)) = retry.forward {
                     recency.insert(peer.clone(), now);
@@ -1280,6 +1291,10 @@ async fn drive_relay_connect(
                 let estimator = op_manager.connect_forward_estimator.read().clone();
                 let retry =
                     state.handle_request(&env, &recency, &mut forward_attempts, &estimator, now);
+                op_manager
+                    .ring
+                    .connection_manager
+                    .record_relay_admission(retry.admission, &mut admission_recorded);
 
                 if let Some((peer, forward_req)) = retry.forward {
                     recency.insert(peer.clone(), now);

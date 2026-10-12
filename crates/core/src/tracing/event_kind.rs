@@ -730,8 +730,15 @@ pub(crate) enum ConnectEvent {
         /// The admission decision behind `accepted`: the path that admitted
         /// the joiner, or the cause that refused it (#5858). `None` when this
         /// hop only forwarded and never evaluated admission.
-        #[serde(default)]
+        ///
+        /// Like every field here, this changes the bincode layout of the AOF
+        /// event log; a record written by an older build fails to decode and is
+        /// skipped with a warning (`tracing/aof.rs`), which is acceptable
+        /// because the log is session-scoped (see the enum docs).
         admission: Option<crate::ring::admission::AdmissionCode>,
+        /// The requester's stated need class (#5858): `Unknown` for a legacy
+        /// request.
+        requester_need: crate::ring::admission::NeedClass,
     },
     /// A ConnectResponse message was sent (acceptor sending back to joiner).
     ResponseSent {
