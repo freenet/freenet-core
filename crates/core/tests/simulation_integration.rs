@@ -18488,6 +18488,65 @@ fn test_every_hop_summarize_calls_flat_vs_fanout() {
 ///
 /// The ack gate is opt-in per simulation rather than a suite-wide default; see
 /// `SimNetwork::enable_gateway_ack_version` for why, and for what that costs.
+/// #5858 end to end over the real transport: with the CONNECT need gate open
+/// (`enable_connect_need`) and both directions of every link knowing the
+/// remote's version, as in production (`enable_gateway_ack_version`), short
+/// joiners' requests reach other hops in the need form, acceptors at or above
+/// `min_connections` admit them from onboarding slots, and those links are
+/// still on probation when the real promotion path adds them to the ring
+/// (`onboarding_established`, which is zero if promotion freed the slot).
+///
+/// The control arm, with the gate closed, sees no short requests at all: the
+/// need never leaves the requester, so the first arm's counts are the
+/// feature's and not an artefact of the counters.
+#[test_log::test]
+fn test_connect_need_admits_short_joiners_from_onboarding_slots() {
+    const SEED: u64 = 0x5858_0B0A_2D00;
+
+    fn run(network_name: &str, enable: bool) -> freenet::dev_tool::ConnectAdmissionTotals {
+        setup_deterministic_state(SEED);
+        let rt = create_runtime();
+        let mut sim =
+            rt.block_on(async { SimNetwork::new(network_name, 1, 14, 7, 3, 10, 4, SEED).await });
+        if enable {
+            sim.enable_connect_need();
+            sim.enable_gateway_ack_version();
+        }
+        let result = sim.run_controlled_simulation(
+            SEED,
+            Vec::new(),
+            Duration::from_secs(180),
+            Duration::from_secs(10),
+        );
+        assert!(
+            result.turmoil_result.is_ok(),
+            "connect-need sim failed: {:?}",
+            result.turmoil_result.err()
+        );
+        result.connect_admission_totals()
+    }
+
+    let control = run("connect-need-control", false);
+    assert_eq!(
+        control.requests_seen_short, 0,
+        "with the gate closed the need must never reach another hop: {control:?}"
+    );
+    let enabled = run("connect-need-enabled", true);
+    eprintln!("[#5858] control={control:?} enabled={enabled:?}");
+    assert!(
+        enabled.requests_seen_short > 0,
+        "short joiners' needs must reach other hops: {enabled:?}"
+    );
+    assert!(
+        enabled.admitted_onboarding > 0,
+        "some short joiner must be admitted from an onboarding slot: {enabled:?}"
+    );
+    assert!(
+        enabled.onboarding_established > 0,
+        "an onboarding link must still be on probation when promotion adds it: {enabled:?}"
+    );
+}
+
 #[test_log::test]
 fn test_joiner_records_gateway_version_through_sim_handshake() {
     use freenet::dev_tool::NodeLabel;
