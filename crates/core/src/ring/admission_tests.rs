@@ -70,24 +70,29 @@ fn short_requester_is_admitted_despite_a_saturated_evaluator_window() {
     let legacy = cm.evaluate_admission(Location::new(0.75), addr(30), RequesterNeed::Unknown, None);
     assert_eq!(legacy, AdmissionCode::RejectedEvaluatorWindow);
 
-    let short = cm.evaluate_admission(Location::new(0.75), addr(31), RequesterNeed::Short, None);
+    let short = cm.evaluate_admission(Location::new(0.75), addr(31), RequesterNeed::Short(0), None);
     assert_eq!(short, AdmissionCode::AcceptedOnboarding);
     assert!(cm.is_provisional(addr(31)));
     assert_eq!(cm.admission_stats().admitted_onboarding, 1);
 }
 
 /// Onboarding never records into the evaluator window: after short
-/// requesters are admitted, a legacy candidate with the SAME score is still
-/// judged against an empty window and admitted.
+/// requesters are admitted, a legacy candidate with the SAME score as one of
+/// them is still judged against an empty window and admitted.
 #[test]
 fn onboarding_does_not_pollute_the_evaluator_window() {
     let cm = manager(3, 20);
     for (i, loc) in [0.45, 0.55, 0.2].into_iter().enumerate() {
         connect(&cm, 10 + i as u16, loc);
     }
-    for port in [40, 41] {
+    for (port, loc) in [(40, 0.75), (41, 0.8)] {
         assert_eq!(
-            cm.evaluate_admission(Location::new(0.75), addr(port), RequesterNeed::Short, None),
+            cm.evaluate_admission(
+                Location::new(loc),
+                addr(port),
+                RequesterNeed::Short(0),
+                None
+            ),
             AdmissionCode::AcceptedOnboarding
         );
     }
@@ -106,26 +111,134 @@ fn onboarding_budget_is_bounded_and_frees_on_a_failed_handshake() {
         connect(&cm, 10 + i as u16, loc);
     }
     saturate_window(&cm);
-    for port in 50..50 + ONBOARDING_PROVISIONAL_SLOTS as u16 {
+    let start = Instant::now();
+    let short_at = |port: u16, loc: f64, now: Instant| {
+        cm.evaluate_admission_at(
+            Location::new(loc),
+            addr(port),
+            RequesterNeed::Short(0),
+            None,
+            now,
+        )
+    };
+    for (port, loc) in [(50, 0.8), (51, 0.85)] {
         assert_eq!(
-            cm.evaluate_admission(Location::new(0.8), addr(port), RequesterNeed::Short, None),
+            short_at(port, loc, start),
             AdmissionCode::AcceptedOnboarding
         );
     }
-    let over = cm.evaluate_admission(Location::new(0.8), addr(60), RequesterNeed::Short, None);
-    assert_eq!(over, AdmissionCode::RejectedOnboardingBudgetExhausted);
+    // No slot left; the window (holding 0.75's score) also refuses the same
+    // score, so the request is refused with the onboarding cause.
+    assert_eq!(
+        short_at(60, 0.75, start),
+        AdmissionCode::RejectedOnboardingBudgetExhausted
+    );
     assert_eq!(cm.admission_stats().rejected_onboarding_budget_exhausted, 1);
     assert_eq!(
         cm.admission_stats().provisional_in_use,
         ONBOARDING_PROVISIONAL_SLOTS as u64
     );
 
-    // The first joiner's hole punch fails: its slot is freed at once.
+    // The first joiner's hole punch fails: its slot is freed at once, but the
+    // token it spent is not refunded...
     cm.prune_in_transit_connection(addr(50));
     assert!(!cm.is_provisional(addr(50)));
     assert_eq!(
-        cm.evaluate_admission(Location::new(0.8), addr(61), RequesterNeed::Short, None),
+        short_at(61, 0.75, start + Duration::from_secs(1)),
+        AdmissionCode::RejectedOnboardingRateLimited
+    );
+    // ...so the next admission waits for the refill.
+    assert_eq!(
+        short_at(
+            62,
+            0.75,
+            start + crate::ring::admission::onboarding_refill_interval() + Duration::from_secs(1)
+        ),
         AdmissionCode::AcceptedOnboarding
+    );
+}
+
+/// Review M3: with no onboarding slot to give, a short requester still
+/// competes on self-interest exactly as a legacy request would, so being short
+/// can never make a joiner worse off than not saying so.
+#[test]
+fn short_requester_without_a_slot_falls_back_to_self_interest() {
+    let cm = manager(3, 20);
+    for (i, loc) in [0.45, 0.55, 0.2].into_iter().enumerate() {
+        connect(&cm, 10 + i as u16, loc);
+    }
+    for (port, loc) in [(63, 0.8), (64, 0.85)] {
+        assert_eq!(
+            cm.evaluate_admission(
+                Location::new(loc),
+                addr(port),
+                RequesterNeed::Short(0),
+                None
+            ),
+            AdmissionCode::AcceptedOnboarding
+        );
+    }
+    // Slots full; the window is empty, so self-interest admits it.
+    assert_eq!(
+        cm.evaluate_admission(Location::new(0.75), addr(65), RequesterNeed::Short(0), None),
+        AdmissionCode::AcceptedSelfInterest
+    );
+    assert!(
+        !cm.is_provisional(addr(65)),
+        "a self-interest admission is not provisional"
+    );
+}
+
+/// A second slot is not given to the same masked location (one host using
+/// several ports), and the request falls back to self-interest instead.
+#[test]
+fn one_onboarding_slot_per_location_at_the_acceptor() {
+    let cm = manager(3, 20);
+    for (i, loc) in [0.45, 0.55, 0.2].into_iter().enumerate() {
+        connect(&cm, 10 + i as u16, loc);
+    }
+    saturate_window(&cm);
+    assert_eq!(
+        cm.evaluate_admission(Location::new(0.75), addr(66), RequesterNeed::Short(0), None),
+        AdmissionCode::AcceptedOnboarding
+    );
+    assert_eq!(
+        cm.evaluate_admission(Location::new(0.75), addr(67), RequesterNeed::Short(0), None),
+        AdmissionCode::RejectedOnboardingLocationTaken
+    );
+}
+
+/// A short requester that already holds many connections may not take the
+/// last slot, which is kept for the nearly isolated.
+#[test]
+fn the_last_slot_is_kept_for_nearly_isolated_requesters() {
+    let cm = manager(20, 40);
+    for i in 0..20u16 {
+        connect(&cm, 100 + i, 0.02 + 0.045 * i as f64);
+    }
+    saturate_window(&cm);
+    let topping_up = RequesterNeed::Short(18);
+    assert_eq!(
+        cm.evaluate_admission(Location::new(0.31), addr(68), topping_up, None),
+        AdmissionCode::AcceptedOnboarding
+    );
+    assert_eq!(
+        cm.evaluate_admission(Location::new(0.75), addr(69), topping_up, None),
+        AdmissionCode::RejectedOnboardingBudgetExhausted
+    );
+    assert_eq!(
+        cm.evaluate_admission(Location::new(0.33), addr(70), RequesterNeed::Short(0), None),
+        AdmissionCode::AcceptedOnboarding
+    );
+}
+
+/// D1: the bar can be switched off with `ENFORCE_REQUESTER_BAR`; while it is
+/// on, an acceptor that is not closer refuses (`requester_bar_rejects_...`).
+#[test]
+fn bar_enforcement_is_switchable() {
+    assert!(
+        crate::ring::admission::ENFORCE_REQUESTER_BAR,
+        "flip this assertion together with the constant"
     );
 }
 
@@ -138,7 +251,7 @@ fn short_requester_is_refused_at_capacity() {
     }
     // open 3 + this candidate = 4 = max.
     assert_eq!(
-        cm.evaluate_admission(Location::new(0.8), addr(70), RequesterNeed::Short, None),
+        cm.evaluate_admission(Location::new(0.8), addr(70), RequesterNeed::Short(0), None),
         AdmissionCode::RejectedAtCapacity
     );
     assert!(!cm.is_provisional(addr(70)));
@@ -152,7 +265,7 @@ fn below_min_short_requester_uses_self_interest_first() {
     let cm = manager(10, 20);
     connect(&cm, 10, 0.45);
     assert_eq!(
-        cm.evaluate_admission(Location::new(0.8), addr(71), RequesterNeed::Short, None),
+        cm.evaluate_admission(Location::new(0.8), addr(71), RequesterNeed::Short(0), None),
         AdmissionCode::AcceptedSelfInterest
     );
     assert!(!cm.is_provisional(addr(71)));
@@ -199,7 +312,10 @@ fn requester_bar_rejects_an_acceptor_that_is_not_closer() {
 #[test]
 fn requester_need_is_short_below_min_and_a_side_bar_above() {
     let cm = manager(3, 20);
-    assert_eq!(cm.requester_need(Location::new(0.7)), RequesterNeed::Short);
+    assert_eq!(
+        cm.requester_need(Location::new(0.7)),
+        RequesterNeed::Short(0)
+    );
     for (i, loc) in [0.45, 0.62, 0.9, 0.3].into_iter().enumerate() {
         connect(&cm, 10 + i as u16, loc);
     }
@@ -236,7 +352,12 @@ fn requester_need_without_a_connection_on_the_target_side_is_unconstrained() {
 /// Admit `port` on an onboarding slot and establish its connection.
 fn onboard(cm: &ConnectionManager, port: u16, loc: f64) {
     assert_eq!(
-        cm.evaluate_admission(Location::new(loc), addr(port), RequesterNeed::Short, None),
+        cm.evaluate_admission(
+            Location::new(loc),
+            addr(port),
+            RequesterNeed::Short(0),
+            None
+        ),
         AdmissionCode::AcceptedOnboarding
     );
     let keypair = TransportKeypair::new();
@@ -357,7 +478,7 @@ fn unestablished_provisional_slot_is_released_after_the_reservation_ttl() {
     }
     let admitted = Instant::now();
     assert_eq!(
-        cm.evaluate_admission(Location::new(0.8), addr(93), RequesterNeed::Short, None),
+        cm.evaluate_admission(Location::new(0.8), addr(93), RequesterNeed::Short(0), None),
         AdmissionCode::AcceptedOnboarding
     );
     assert!(
@@ -423,7 +544,7 @@ impl Drop for LatticeGuard {
 fn successful_promotion_keeps_the_link_on_probation() {
     let cm = busy_manager();
     assert_eq!(
-        cm.evaluate_admission(Location::new(0.72), addr(96), RequesterNeed::Short, None),
+        cm.evaluate_admission(Location::new(0.72), addr(96), RequesterNeed::Short(0), None),
         AdmissionCode::AcceptedOnboarding
     );
     let loc = cm
@@ -449,7 +570,7 @@ fn successful_promotion_keeps_the_link_on_probation() {
 fn failed_handshake_releases_the_slot_as_unestablished() {
     let cm = busy_manager();
     assert_eq!(
-        cm.evaluate_admission(Location::new(0.72), addr(97), RequesterNeed::Short, None),
+        cm.evaluate_admission(Location::new(0.72), addr(97), RequesterNeed::Short(0), None),
         AdmissionCode::AcceptedOnboarding
     );
     cm.prune_in_transit_connection(addr(97));

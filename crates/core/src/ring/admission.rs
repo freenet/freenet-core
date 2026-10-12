@@ -32,6 +32,8 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use tokio::time::Instant;
 
+use super::Location;
+
 /// Requesters holding fewer ring connections than this fraction of their own
 /// `min_connections` declare themselves short ([`RequesterNeed::Short`]).
 ///
@@ -63,6 +65,53 @@ pub(crate) const ONBOARDING_PROVISIONAL_SLOTS: usize = 2;
 /// not want frees its slot for the next joiner within minutes.
 pub(crate) const ONBOARDING_PROBATION: Duration = Duration::from_secs(600);
 
+/// Admissions an onboarding slot may serve per probation period, on average.
+///
+/// Sets the refill rate of the onboarding token bucket (see
+/// [`onboarding_refill_interval`]). Above 1 so a slot freed by a failed hole
+/// punch (most attempts fail on the live network) can serve another joiner
+/// before the probation period ends; small so a requester that repeatedly
+/// claims to be short and then drops its link costs an acceptor at most a few
+/// NAT traversals per slot per probation period. Releasing a slot never
+/// refunds a token.
+pub(crate) const ONBOARDING_ADMISSIONS_PER_SLOT_PER_PROBATION: u32 = 3;
+
+/// One onboarding token accrues every
+/// `ONBOARDING_PROBATION / (ONBOARDING_PROVISIONAL_SLOTS *
+/// ONBOARDING_ADMISSIONS_PER_SLOT_PER_PROBATION)` (100 s with the defaults);
+/// the bucket holds at most [`ONBOARDING_PROVISIONAL_SLOTS`] tokens, so a burst
+/// of joiners can fill every slot at once.
+pub(crate) fn onboarding_refill_interval() -> Duration {
+    ONBOARDING_PROBATION
+        / (ONBOARDING_PROVISIONAL_SLOTS as u32 * ONBOARDING_ADMISSIONS_PER_SLOT_PER_PROBATION)
+}
+
+/// A short requester holding at least this fraction of the ACCEPTOR's
+/// `min_connections` is low priority: it may take an onboarding slot only while
+/// [`ONBOARDING_SLOTS_KEPT_FOR_ISOLATED`] others stay free for requesters below
+/// the band. A peer with no connections at all is never crowded out by peers
+/// topping up from 24 to 25. Tuned by the saturated-network simulation.
+pub(crate) const ONBOARDING_PRIORITY_FRACTION_OF_MIN: f64 = 0.25;
+
+/// Slots kept free for high-priority (nearly isolated) requesters; see
+/// [`ONBOARDING_PRIORITY_FRACTION_OF_MIN`].
+pub(crate) const ONBOARDING_SLOTS_KEPT_FOR_ISOLATED: usize = 1;
+
+/// Whether a short requester holding `requester_connections` ring connections
+/// is high priority at an acceptor whose `min_connections` is given.
+pub(crate) fn onboarding_high_priority(requester_connections: u8, min_connections: usize) -> bool {
+    (requester_connections as f64)
+        < (min_connections as f64 * ONBOARDING_PRIORITY_FRACTION_OF_MIN).ceil()
+}
+
+/// Whether a requester's bar (`RequesterNeed::Bar`) is enforced at all.
+///
+/// Off would admit a requester with a bar exactly like a legacy one. Kept
+/// switchable while the owner decides whether the bar ships enforced: without
+/// the early stop at relays (not implemented, see `RelayState::handle_request`)
+/// enforcing it only adds rejections.
+pub(crate) const ENFORCE_REQUESTER_BAR: bool = true;
+
 /// Ring distance used as the bar when the requester holds no connection on the
 /// target's side: half the ring is the largest possible distance, so every
 /// acceptor meets it.
@@ -82,8 +131,10 @@ pub(crate) enum RequesterNeed {
     #[default]
     Unknown,
     /// The requester holds fewer ring connections than its own threshold
-    /// ([`requester_is_short`]). Eligible for the onboarding budget.
-    Short,
+    /// ([`requester_is_short`]); the value is how many it holds (saturating
+    /// at 255). Eligible for the onboarding budget, with priority to requesters
+    /// holding fewer ([`onboarding_high_priority`]).
+    Short(u8),
     /// The requester is well connected; it already holds a connection this
     /// ring distance from the request's target, so only an acceptor strictly
     /// closer to the target helps it. Admitted through self-interest only.
@@ -91,28 +142,35 @@ pub(crate) enum RequesterNeed {
 }
 
 impl RequesterNeed {
-    /// Decode the wire form: `None` means short, `Some(d)` a bar of `d`.
+    /// Decode the wire form: a `None` bar means short (holding
+    /// `requester_connections`), `Some(d)` a bar of `d`.
     ///
     /// A bar that is not a finite non-negative number cannot be compared
     /// meaningfully (a NaN would reject every acceptor), so it falls back to
     /// [`Self::Unknown`], i.e. today's admission. Values above
     /// [`UNCONSTRAINED_BAR`] are clamped to it.
-    pub(crate) fn from_wire(improvement_bar: Option<f64>) -> Self {
+    pub(crate) fn from_wire(improvement_bar: Option<f64>, requester_connections: u8) -> Self {
         match improvement_bar {
-            None => Self::Short,
+            None => Self::Short(requester_connections),
             Some(d) if d.is_finite() && d >= 0.0 => Self::Bar(d.min(UNCONSTRAINED_BAR)),
             Some(_) => Self::Unknown,
         }
     }
 
-    /// The wire form, or `None` for [`Self::Unknown`], which has no wire form
-    /// other than the legacy `ConnectMsg::Request`.
-    pub(crate) fn to_wire(self) -> Option<Option<f64>> {
+    /// The wire form `(improvement_bar, requester_connections)`, or `None` for
+    /// [`Self::Unknown`], which has no wire form other than the legacy
+    /// `ConnectMsg::Request`.
+    pub(crate) fn to_wire(self) -> Option<(Option<f64>, u8)> {
         match self {
             Self::Unknown => None,
-            Self::Short => Some(None),
-            Self::Bar(d) => Some(Some(d)),
+            Self::Short(connections) => Some((None, connections)),
+            Self::Bar(d) => Some((Some(d), 0)),
         }
+    }
+
+    /// A short-need value for a requester holding `open` ring connections.
+    pub(crate) fn short(open: usize) -> Self {
+        Self::Short(u8::try_from(open).unwrap_or(u8::MAX))
     }
 }
 
@@ -148,7 +206,8 @@ pub(crate) enum AdmissionCode {
     RejectedEvaluatorWindow,
     /// Below `min_connections` and the probabilistic Kleinberg filter declined.
     RejectedSoftFilter,
-    /// A short requester, but every onboarding slot is on probation.
+    /// A short requester, but every onboarding slot it may use is on
+    /// probation, and self-interest did not admit it either.
     RejectedOnboardingBudgetExhausted,
     /// The requester's bar: this peer is not closer to the target than a
     /// connection the requester already holds.
@@ -157,6 +216,12 @@ pub(crate) enum AdmissionCode {
     RejectedBlocked,
     /// Connection counters would overflow.
     RejectedCounterOverflow,
+    /// A short requester, but the onboarding token bucket is empty, and
+    /// self-interest did not admit it either.
+    RejectedOnboardingRateLimited,
+    /// A short requester, but its masked location already holds an onboarding
+    /// slot, and self-interest did not admit it either.
+    RejectedOnboardingLocationTaken,
 }
 
 impl AdmissionCode {
@@ -181,6 +246,8 @@ impl AdmissionCode {
             Self::RejectedBarUnmet => "bar_unmet",
             Self::RejectedBlocked => "blocked",
             Self::RejectedCounterOverflow => "counter_overflow",
+            Self::RejectedOnboardingRateLimited => "onboarding_rate_limited",
+            Self::RejectedOnboardingLocationTaken => "onboarding_location_taken",
         }
     }
 }
@@ -247,7 +314,9 @@ impl AdmissionCounters {
             AdmissionCode::AcceptedSelfInterest => &self.admitted_self_interest,
             AdmissionCode::AcceptedOnboarding => &self.admitted_onboarding,
             AdmissionCode::AcceptedLattice => &self.admitted_lattice,
-            AdmissionCode::RejectedOnboardingBudgetExhausted => {
+            AdmissionCode::RejectedOnboardingBudgetExhausted
+            | AdmissionCode::RejectedOnboardingRateLimited
+            | AdmissionCode::RejectedOnboardingLocationTaken => {
                 &self.rejected_onboarding_budget_exhausted
             }
             AdmissionCode::RejectedBarUnmet => &self.rejected_bar_unmet,
@@ -315,66 +384,158 @@ impl AdmissionCounters {
     }
 }
 
+/// Why [`ProvisionalLinks::try_reserve`] refused a slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SlotRefusal {
+    /// Every slot the requester may use is on probation (or it holds one).
+    Full,
+    /// The token bucket is empty.
+    RateLimited,
+    /// Another requester at the same masked location holds a slot.
+    LocationTaken,
+}
+
+impl SlotRefusal {
+    pub(crate) fn code(self) -> AdmissionCode {
+        match self {
+            Self::Full => AdmissionCode::RejectedOnboardingBudgetExhausted,
+            Self::RateLimited => AdmissionCode::RejectedOnboardingRateLimited,
+            Self::LocationTaken => AdmissionCode::RejectedOnboardingLocationTaken,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Slot {
+    admitted_at: Instant,
+    location: Location,
+}
+
 /// The acceptor's onboarding slots: need-admitted links on probation, keyed by
-/// the joiner's address, with the time each was admitted.
+/// the joiner's address, with the time each was admitted and its masked
+/// location.
 ///
-/// Bounded at insertion ([`Self::try_reserve`] refuses at capacity). Entries
-/// are never refreshed by use, so refusing at the cap cannot starve newcomers:
-/// every entry leaves within [`ONBOARDING_PROBATION`], when it graduates or is
-/// dropped, and earlier if its connection fails or is pruned.
+/// Three bounds, all checked in [`Self::try_reserve`]:
+/// - at most `capacity` slots, the last [`ONBOARDING_SLOTS_KEPT_FOR_ISOLATED`]
+///   only for high-priority requesters;
+/// - a token bucket refilled every [`onboarding_refill_interval`], holding at
+///   most `capacity` tokens; a reservation spends one, a release refunds none;
+/// - at most one slot per masked [`Location`] (an IPv4 /24 or IPv6 /48), so one
+///   host cannot take every slot from several ports.
 ///
-/// Time is passed in by the caller so tests can drive it.
+/// Refusing at the cap is safe: entries are never refreshed by use, and every
+/// one leaves within [`ONBOARDING_PROBATION`] (graduated or dropped) or earlier
+/// when its connection fails or is pruned. Time is passed in by the caller.
 #[derive(Debug)]
 pub(crate) struct ProvisionalLinks {
-    admitted_at: BTreeMap<SocketAddr, Instant>,
+    slots: BTreeMap<SocketAddr, Slot>,
     capacity: usize,
+    tokens: f64,
+    tokens_at: Option<Instant>,
 }
 
 impl ProvisionalLinks {
     pub(crate) fn new(capacity: usize) -> Self {
         Self {
-            admitted_at: BTreeMap::new(),
+            slots: BTreeMap::new(),
             capacity,
+            tokens: capacity as f64,
+            tokens_at: None,
         }
     }
 
-    /// Reserve a slot for `addr`. `false` when every slot is taken or `addr`
-    /// already holds one.
-    pub(crate) fn try_reserve(&mut self, addr: SocketAddr, now: Instant) -> bool {
-        if self.admitted_at.len() >= self.capacity || self.admitted_at.contains_key(&addr) {
-            return false;
+    fn refill(&mut self, now: Instant) {
+        if let Some(at) = self.tokens_at {
+            let elapsed = now.saturating_duration_since(at).as_secs_f64();
+            self.tokens = (self.tokens + elapsed / onboarding_refill_interval().as_secs_f64())
+                .min(self.capacity as f64);
         }
-        self.admitted_at.insert(addr, now);
-        true
+        self.tokens_at = Some(now);
+    }
+
+    /// Reserve a slot for `addr` at `location`. `high_priority` requesters may
+    /// use every slot; others leave [`ONBOARDING_SLOTS_KEPT_FOR_ISOLATED`] free.
+    pub(crate) fn try_reserve(
+        &mut self,
+        addr: SocketAddr,
+        location: Location,
+        high_priority: bool,
+        now: Instant,
+    ) -> Result<(), SlotRefusal> {
+        let usable = if high_priority {
+            self.capacity
+        } else {
+            self.capacity
+                .saturating_sub(ONBOARDING_SLOTS_KEPT_FOR_ISOLATED)
+        };
+        if self.slots.len() >= usable || self.slots.contains_key(&addr) {
+            return Err(SlotRefusal::Full);
+        }
+        if self.slots.values().any(|slot| slot.location == location) {
+            return Err(SlotRefusal::LocationTaken);
+        }
+        self.refill(now);
+        if self.tokens < 1.0 {
+            return Err(SlotRefusal::RateLimited);
+        }
+        self.tokens -= 1.0;
+        self.slots.insert(
+            addr,
+            Slot {
+                admitted_at: now,
+                location,
+            },
+        );
+        Ok(())
+    }
+
+    /// Put back a slot whose release could not be carried out (e.g. its drop
+    /// could not be queued), keeping its original admission time. Spends no
+    /// token and ignores the capacity: the link never left.
+    pub(crate) fn restore(&mut self, addr: SocketAddr, location: Location, admitted_at: Instant) {
+        self.slots.insert(
+            addr,
+            Slot {
+                admitted_at,
+                location,
+            },
+        );
     }
 
     /// Move `old`'s slot to `new`, keeping its admission time: the same
     /// connection, re-keyed when the peer's address is corrected.
     pub(crate) fn rename(&mut self, old: SocketAddr, new: SocketAddr) {
-        if let Some(at) = self.admitted_at.remove(&old) {
-            self.admitted_at.insert(new, at);
+        if let Some(slot) = self.slots.remove(&old) {
+            self.slots.insert(new, slot);
         }
+    }
+
+    /// Free `addr`'s slot, returning its location and admission time.
+    pub(crate) fn take(&mut self, addr: SocketAddr) -> Option<(Location, Instant)> {
+        self.slots
+            .remove(&addr)
+            .map(|slot| (slot.location, slot.admitted_at))
     }
 
     /// Free `addr`'s slot. `true` if it held one.
     pub(crate) fn release(&mut self, addr: SocketAddr) -> bool {
-        self.admitted_at.remove(&addr).is_some()
+        self.take(addr).is_some()
     }
 
     pub(crate) fn contains(&self, addr: SocketAddr) -> bool {
-        self.admitted_at.contains_key(&addr)
+        self.slots.contains_key(&addr)
     }
 
     pub(crate) fn len(&self) -> usize {
-        self.admitted_at.len()
+        self.slots.len()
     }
 
     /// Every slot with its age at `now`, oldest admission first.
     pub(crate) fn ages(&self, now: Instant) -> Vec<(SocketAddr, Duration)> {
         let mut ages: Vec<(SocketAddr, Duration)> = self
-            .admitted_at
+            .slots
             .iter()
-            .map(|(addr, at)| (*addr, now.saturating_duration_since(*at)))
+            .map(|(addr, slot)| (*addr, now.saturating_duration_since(slot.admitted_at)))
             .collect();
         ages.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
         ages
@@ -391,13 +552,14 @@ mod tests {
 
     #[test]
     fn need_wire_form_round_trips() {
-        assert_eq!(RequesterNeed::from_wire(None), RequesterNeed::Short);
+        assert_eq!(RequesterNeed::from_wire(None, 3), RequesterNeed::Short(3));
         assert_eq!(
-            RequesterNeed::from_wire(Some(0.125)),
+            RequesterNeed::from_wire(Some(0.125), 0),
             RequesterNeed::Bar(0.125)
         );
-        assert_eq!(RequesterNeed::Short.to_wire(), Some(None));
-        assert_eq!(RequesterNeed::Bar(0.25).to_wire(), Some(Some(0.25)));
+        assert_eq!(RequesterNeed::Short(4).to_wire(), Some((None, 4)));
+        assert_eq!(RequesterNeed::short(300), RequesterNeed::Short(u8::MAX));
+        assert_eq!(RequesterNeed::Bar(0.25).to_wire(), Some((Some(0.25), 0)));
         assert_eq!(RequesterNeed::Unknown.to_wire(), None);
     }
 
@@ -406,16 +568,19 @@ mod tests {
     #[test]
     fn malformed_bar_falls_back_to_unknown() {
         assert_eq!(
-            RequesterNeed::from_wire(Some(f64::NAN)),
+            RequesterNeed::from_wire(Some(f64::NAN), 0),
             RequesterNeed::Unknown
         );
         assert_eq!(
-            RequesterNeed::from_wire(Some(f64::INFINITY)),
+            RequesterNeed::from_wire(Some(f64::INFINITY), 0),
             RequesterNeed::Unknown
         );
-        assert_eq!(RequesterNeed::from_wire(Some(-0.1)), RequesterNeed::Unknown);
         assert_eq!(
-            RequesterNeed::from_wire(Some(3.0)),
+            RequesterNeed::from_wire(Some(-0.1), 0),
+            RequesterNeed::Unknown
+        );
+        assert_eq!(
+            RequesterNeed::from_wire(Some(3.0), 0),
             RequesterNeed::Bar(UNCONSTRAINED_BAR)
         );
     }
@@ -428,26 +593,87 @@ mod tests {
         assert!(!requester_is_short(0, 0));
     }
 
+    fn loc(x: f64) -> Location {
+        Location::new(x)
+    }
+
     #[test]
     fn provisional_links_refuse_at_capacity_and_free_on_release() {
         let now = Instant::now();
         let mut slots = ProvisionalLinks::new(2);
-        assert!(slots.try_reserve(addr(1), now));
-        assert!(!slots.try_reserve(addr(1), now), "one slot per address");
-        assert!(slots.try_reserve(addr(2), now));
-        assert!(!slots.try_reserve(addr(3), now), "capacity is a hard bound");
+        assert_eq!(slots.try_reserve(addr(1), loc(0.1), true, now), Ok(()));
+        assert_eq!(
+            slots.try_reserve(addr(1), loc(0.2), true, now),
+            Err(SlotRefusal::Full),
+            "one slot per address"
+        );
+        assert_eq!(slots.try_reserve(addr(2), loc(0.2), true, now), Ok(()));
+        assert_eq!(
+            slots.try_reserve(addr(3), loc(0.3), true, now),
+            Err(SlotRefusal::Full),
+            "capacity is a hard bound"
+        );
         assert_eq!(slots.len(), 2);
         assert!(slots.release(addr(1)));
         assert!(!slots.release(addr(1)));
-        assert!(slots.try_reserve(addr(3), now));
-        assert!(slots.contains(addr(3)));
+        assert!(slots.contains(addr(2)));
+    }
+
+    /// A release does not refund a token: after the burst, the next admission
+    /// waits for the refill interval even though a slot is free.
+    #[test]
+    fn released_slots_do_not_refund_onboarding_tokens() {
+        let start = Instant::now();
+        let mut slots = ProvisionalLinks::new(2);
+        assert_eq!(slots.try_reserve(addr(1), loc(0.1), true, start), Ok(()));
+        assert_eq!(slots.try_reserve(addr(2), loc(0.2), true, start), Ok(()));
+        assert!(slots.release(addr(1)));
+        assert!(slots.release(addr(2)));
+        assert_eq!(
+            slots.try_reserve(addr(3), loc(0.3), true, start + Duration::from_secs(1)),
+            Err(SlotRefusal::RateLimited)
+        );
+        let later = start + onboarding_refill_interval() + Duration::from_secs(1);
+        assert_eq!(slots.try_reserve(addr(3), loc(0.3), true, later), Ok(()));
+        assert_eq!(
+            slots.try_reserve(addr(4), loc(0.4), true, later),
+            Err(SlotRefusal::RateLimited),
+            "one interval refills one token"
+        );
+    }
+
+    #[test]
+    fn one_onboarding_slot_per_masked_location() {
+        let now = Instant::now();
+        let mut slots = ProvisionalLinks::new(2);
+        assert_eq!(slots.try_reserve(addr(1), loc(0.5), true, now), Ok(()));
+        assert_eq!(
+            slots.try_reserve(addr(2), loc(0.5), true, now),
+            Err(SlotRefusal::LocationTaken)
+        );
+    }
+
+    /// Low-priority requesters leave a slot for nearly isolated ones.
+    #[test]
+    fn low_priority_requesters_leave_a_slot_for_the_isolated() {
+        let now = Instant::now();
+        let mut slots = ProvisionalLinks::new(2);
+        assert_eq!(slots.try_reserve(addr(1), loc(0.1), false, now), Ok(()));
+        assert_eq!(
+            slots.try_reserve(addr(2), loc(0.2), false, now),
+            Err(SlotRefusal::Full)
+        );
+        assert_eq!(slots.try_reserve(addr(3), loc(0.3), true, now), Ok(()));
+        assert!(onboarding_high_priority(0, 25));
+        assert!(onboarding_high_priority(6, 25));
+        assert!(!onboarding_high_priority(7, 25));
     }
 
     #[test]
     fn provisional_rename_keeps_the_admission_time() {
         let start = Instant::now();
         let mut slots = ProvisionalLinks::new(2);
-        assert!(slots.try_reserve(addr(1), start));
+        assert_eq!(slots.try_reserve(addr(1), loc(0.1), true, start), Ok(()));
         slots.rename(addr(1), addr(9));
         assert!(!slots.contains(addr(1)));
         assert_eq!(
@@ -462,8 +688,11 @@ mod tests {
     fn provisional_ages_are_oldest_first() {
         let start = Instant::now();
         let mut slots = ProvisionalLinks::new(2);
-        assert!(slots.try_reserve(addr(1), start + Duration::from_secs(5)));
-        assert!(slots.try_reserve(addr(2), start));
+        assert_eq!(slots.try_reserve(addr(2), loc(0.2), true, start), Ok(()));
+        assert_eq!(
+            slots.try_reserve(addr(1), loc(0.1), true, start + Duration::from_secs(5)),
+            Ok(())
+        );
         let ages = slots.ages(start + Duration::from_secs(60));
         assert_eq!(
             ages,
@@ -490,6 +719,8 @@ mod tests {
             AdmissionCode::RejectedBarUnmet,
             AdmissionCode::RejectedBlocked,
             AdmissionCode::RejectedCounterOverflow,
+            AdmissionCode::RejectedOnboardingRateLimited,
+            AdmissionCode::RejectedOnboardingLocationTaken,
         ];
         let strings: std::collections::HashSet<&str> = all.iter().map(|c| c.as_str()).collect();
         assert_eq!(strings.len(), all.len());

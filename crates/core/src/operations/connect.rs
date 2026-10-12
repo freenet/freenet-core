@@ -247,6 +247,9 @@ pub(crate) enum ConnectMsg {
         id: Transaction,
         payload: ConnectRequest,
         improvement_bar: Option<f64>,
+        /// The requester's ring connections when it is short (saturating at
+        /// 255), so an acceptor can favour the nearly isolated; 0 with a bar.
+        requester_connections: u8,
     },
 }
 
@@ -269,9 +272,10 @@ impl ConnectMsg {
                 id,
                 payload,
                 improvement_bar,
+                requester_connections,
             } => {
                 let mut payload = payload.clone();
-                payload.need = RequesterNeed::from_wire(*improvement_bar);
+                payload.need = RequesterNeed::from_wire(*improvement_bar, *requester_connections);
                 Some((*id, payload))
             }
             ConnectMsg::Response { .. }
@@ -293,8 +297,9 @@ impl ConnectMsg {
                 id,
                 mut payload,
                 improvement_bar,
+                requester_connections,
             } => {
-                payload.need = RequesterNeed::from_wire(improvement_bar);
+                payload.need = RequesterNeed::from_wire(improvement_bar, requester_connections);
                 Ok((id, payload))
             }
             other @ (ConnectMsg::Response { .. }
@@ -313,11 +318,14 @@ impl ConnectMsg {
         hop_supports_need: bool,
     ) -> ConnectMsg {
         match payload.need.to_wire() {
-            Some(improvement_bar) if hop_supports_need => ConnectMsg::RequestWithNeed {
-                id,
-                payload,
-                improvement_bar,
-            },
+            Some((improvement_bar, requester_connections)) if hop_supports_need => {
+                ConnectMsg::RequestWithNeed {
+                    id,
+                    payload,
+                    improvement_bar,
+                    requester_connections,
+                }
+            }
             Some(_) | None => ConnectMsg::Request { id, payload },
         }
     }
@@ -349,7 +357,7 @@ pub(crate) fn fit_request_to_hop(
                 Ok((id, payload)) => {
                     let hop_supports_need = match payload.need {
                         RequesterNeed::Unknown => false,
-                        RequesterNeed::Short | RequesterNeed::Bar(_) => {
+                        RequesterNeed::Short(_) | RequesterNeed::Bar(_) => {
                             connection_manager.hop_version_supports_connect_need(hop_version)
                         }
                     };
@@ -401,15 +409,17 @@ impl fmt::Display for ConnectMsg {
             ConnectMsg::RequestWithNeed {
                 payload,
                 improvement_bar,
+                requester_connections,
                 ..
             } => write!(
                 f,
-                "ConnectRequest {{ desired: {}, ttl: {}, uphill: {}, joiner: {}, improvement_bar: {:?} }}",
+                "ConnectRequest {{ desired: {}, ttl: {}, uphill: {}, joiner: {}, improvement_bar: {:?}, requester_connections: {} }}",
                 payload.desired_location,
                 payload.ttl,
                 payload.uphill_budget,
                 payload.joiner,
-                improvement_bar
+                improvement_bar,
+                requester_connections
             ),
             ConnectMsg::Response { payload, .. } => {
                 write!(f, "ConnectResponse {{ acceptor: {} }}", payload.acceptor,)
@@ -1118,12 +1128,16 @@ impl RelayContext for RelayEnv<'_> {
             }
         }
 
-        self.op_manager.ring.connection_manager.evaluate_admission(
-            location,
-            addr,
-            request.need,
-            Some(request.desired_location),
-        )
+        self.op_manager
+            .ring
+            .connection_manager
+            .evaluate_admission_at(
+                location,
+                addr,
+                request.need,
+                Some(request.desired_location),
+                self.op_manager.ring.time_source.now(),
+            )
     }
 
     fn select_next_hop(
@@ -5112,8 +5126,9 @@ mod tests {
             (
                 ConnectMsg::RequestWithNeed {
                     id: tx,
-                    payload: need_request(RequesterNeed::Short),
+                    payload: need_request(RequesterNeed::Short(0)),
                     improvement_bar: None,
+                    requester_connections: 0,
                 },
                 5,
             ),
@@ -5129,7 +5144,7 @@ mod tests {
     #[test]
     fn legacy_request_encoding_is_unchanged_and_decodes_as_unknown_need() {
         let tx = Transaction::new::<ConnectMsg>();
-        let short = need_request(RequesterNeed::Short);
+        let short = need_request(RequesterNeed::Short(0));
         let mut unknown = short.clone();
         unknown.need = RequesterNeed::Unknown;
         let with_need = bincode::serialize(&ConnectMsg::Request {
@@ -5156,7 +5171,7 @@ mod tests {
     #[test]
     fn request_with_need_round_trips_short_and_bar() {
         let tx = Transaction::new::<ConnectMsg>();
-        for need in [RequesterNeed::Short, RequesterNeed::Bar(0.0625)] {
+        for need in [RequesterNeed::Short(7), RequesterNeed::Bar(0.0625)] {
             let msg = ConnectMsg::request_for_hop(tx, need_request(need), true);
             assert!(matches!(msg, ConnectMsg::RequestWithNeed { .. }), "{msg}");
             let bytes = bincode::serialize(&msg).unwrap();
@@ -5171,7 +5186,7 @@ mod tests {
     fn request_for_hop_sends_the_need_only_to_a_capable_hop() {
         let tx = Transaction::new::<ConnectMsg>();
         assert!(matches!(
-            ConnectMsg::request_for_hop(tx, need_request(RequesterNeed::Short), false),
+            ConnectMsg::request_for_hop(tx, need_request(RequesterNeed::Short(0)), false),
             ConnectMsg::Request { .. }
         ));
         assert!(matches!(
@@ -5211,7 +5226,7 @@ mod tests {
         let short = || {
             as_net(ConnectMsg::Request {
                 id: tx,
-                payload: need_request(RequesterNeed::Short),
+                payload: need_request(RequesterNeed::Short(0)),
             })
         };
         assert!(matches!(
@@ -5265,7 +5280,11 @@ mod tests {
         let tx = Transaction::new::<ConnectMsg>();
 
         let need = cm.requester_need(desired);
-        assert_eq!(need, RequesterNeed::Short, "zero ring connections is short");
+        assert_eq!(
+            need,
+            RequesterNeed::Short(0),
+            "zero ring connections is short"
+        );
         // Built with no connection to the gateway and nothing recorded for it.
         assert_eq!(cm.remote_version(gateway_addr), None);
         let built = prepare_join_request(tx, &own, &gateway, desired, 5, &[], need);
@@ -5289,7 +5308,7 @@ mod tests {
         let decoded: ConnectMsg =
             bincode::deserialize(&bincode::serialize(&sent).unwrap()).unwrap();
         let (_, payload) = decoded.inbound_request().expect("a request");
-        assert_eq!(payload.need, RequesterNeed::Short);
+        assert_eq!(payload.need, RequesterNeed::Short(0));
     }
 
     /// Source pin: the event loop fits every message to the live connection
@@ -5338,7 +5357,7 @@ mod tests {
         let joiner = make_peer(5000);
         let mut state = RelayState {
             upstream_addr: joiner.socket_addr().expect("test peer must have address"),
-            request: need_request(RequesterNeed::Short),
+            request: need_request(RequesterNeed::Short(0)),
             forwarded_to: None,
             forwarded_at: None,
             observed_sent: false,
