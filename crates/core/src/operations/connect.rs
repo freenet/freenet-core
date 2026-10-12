@@ -2465,6 +2465,99 @@ mod tests {
         });
     }
 
+    /// #5858 wiring, against the REAL join loop and the REAL ring add path:
+    /// CONNECT attempts issued by `initial_join_procedure` are counted before
+    /// the first ring connection; `Ring::add_connection_reporting` records the
+    /// first connection (a rejected add does not need to, so only the accepted
+    /// one is asserted); and neither dropping back to zero connections nor a
+    /// later add moves the recorded values.
+    #[test]
+    fn first_ring_connection_wired_through_join_loop_and_ring_add() {
+        with_network_status_lock(async {
+            let op_manager = bootstrap_test_op_manager("first-conn-5858", "127.0.0.1:14858").await;
+            let gateways = vec![bootstrap_gateway(24858)];
+
+            let b = crate::node::network_status::bootstrap_churn_counts().expect("initialized");
+            assert_eq!(b.time_to_first_ring_connection, None);
+            assert_eq!(b.connect_attempts_before_first_connection, 0);
+
+            // The join loop dials the (unconnected) gateway, which goes through
+            // `start_client_connect` and so must count an attempt.
+            let handle = initial_join_procedure(op_manager.clone(), &gateways)
+                .await
+                .expect("spawn join procedure");
+            let start = std::time::Instant::now();
+            let attempts = loop {
+                let b = crate::node::network_status::bootstrap_churn_counts().expect("initialized");
+                if b.connect_attempts_before_first_connection > 0
+                    || start.elapsed() >= Duration::from_secs(10)
+                {
+                    break b.connect_attempts_before_first_connection;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            };
+            handle.abort();
+            assert!(
+                attempts > 0,
+                "the join loop issued a CONNECT but no attempt was counted"
+            );
+            assert_eq!(
+                crate::node::network_status::bootstrap_churn_counts()
+                    .expect("initialized")
+                    .time_to_first_ring_connection,
+                None,
+                "no ring connection exists yet"
+            );
+
+            // First real ring connection via the production add path.
+            let kp = TransportKeypair::new();
+            let peer = crate::node::PeerId::new(
+                kp.public().clone(),
+                "127.0.0.3:25858".parse().expect("addr"),
+            );
+            let outcome = op_manager
+                .ring
+                .add_connection_reporting(Location::new(0.25), peer.clone(), false)
+                .await;
+            assert!(outcome.added, "test setup: ring must accept the connection");
+            let after_first =
+                crate::node::network_status::bootstrap_churn_counts().expect("initialized");
+            let first = after_first
+                .time_to_first_ring_connection
+                .expect("the first accepted ring add must record the latency");
+            let frozen_attempts = after_first.connect_attempts_before_first_connection;
+            assert!(frozen_attempts >= attempts);
+
+            // Drop to zero connections, then connect again.
+            op_manager.ring.prune_connection(peer).await;
+            assert_eq!(op_manager.ring.open_connections(), 0);
+            let kp2 = TransportKeypair::new();
+            let peer2 = crate::node::PeerId::new(
+                kp2.public().clone(),
+                "127.0.0.4:25859".parse().expect("addr"),
+            );
+            assert!(
+                op_manager
+                    .ring
+                    .add_connection_reporting(Location::new(0.75), peer2, false)
+                    .await
+                    .added
+            );
+            crate::node::network_status::record_bootstrap_connect_attempt();
+
+            let b = crate::node::network_status::bootstrap_churn_counts().expect("initialized");
+            assert_eq!(
+                b.time_to_first_ring_connection,
+                Some(first),
+                "a drop to zero and a rejoin must not reset the first-connection latency"
+            );
+            assert_eq!(
+                b.connect_attempts_before_first_connection, frozen_attempts,
+                "attempts after the first connection are not counted"
+            );
+        });
+    }
+
     /// The ordinary case still counts: gateways unconnected and not in backoff
     /// means a real CONNECT round is issued to them.
     #[test]

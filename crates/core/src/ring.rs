@@ -2277,6 +2277,13 @@ impl Ring {
                 // `None` (this build/collector doesn't report it) — see #4787
                 // finding 3.
                 snapshot.bootstrap_completed = Some(b.time_to_min_connections.is_some());
+                // #5858: time to the FIRST ring connection, in ms, plus how
+                // many CONNECT attempts it took.
+                snapshot.bootstrap_time_to_first_ring_connection_ms = b
+                    .time_to_first_ring_connection
+                    .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
+                snapshot.bootstrap_connect_attempts_before_first_connection =
+                    Some(b.connect_attempts_before_first_connection);
                 snapshot.bootstrap_startup_rounds_connect_issued_gateway =
                     Some(b.startup_rounds_connect_issued_gateway);
                 snapshot.bootstrap_startup_rounds_connect_issued_routed =
@@ -4135,6 +4142,7 @@ impl Ring {
                 just_became_ready: false,
             };
         }
+        crate::node::network_status::record_bootstrap_first_ring_connection();
         if let Some(own_loc) = self.connection_manager.own_location().location() {
             crate::node::network_status::set_own_location(own_loc.as_f64());
         }

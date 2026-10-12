@@ -150,6 +150,9 @@ pub(crate) struct OtelStatusScalars {
     pub bootstrap_transient_expired: u64,
     pub bootstrap_promoted_to_ring: u64,
     pub bootstrap_time_to_min_connections: Option<Duration>,
+    /// Time from process start to this node's FIRST ring connection (#5858).
+    pub bootstrap_time_to_first_ring_connection: Option<Duration>,
+    pub bootstrap_connect_attempts_before_first_connection: u64,
     pub bootstrap_startup_rounds_connect_issued_gateway: u64,
     pub bootstrap_startup_rounds_connect_issued_routed: u64,
     pub bootstrap_startup_rounds_backoff_blocked: u64,
@@ -188,6 +191,9 @@ pub(crate) fn otel_status_scalars() -> Option<OtelStatusScalars> {
         bootstrap_transient_expired: b.transient_expired,
         bootstrap_promoted_to_ring: b.promoted_to_ring,
         bootstrap_time_to_min_connections: b.time_to_min_connections,
+        bootstrap_time_to_first_ring_connection: b.time_to_first_ring_connection,
+        bootstrap_connect_attempts_before_first_connection: b
+            .connect_attempts_before_first_connection,
         bootstrap_startup_rounds_connect_issued_gateway: b.startup_rounds_connect_issued_gateway,
         bootstrap_startup_rounds_connect_issued_routed: b.startup_rounds_connect_issued_routed,
         bootstrap_startup_rounds_backoff_blocked: b.startup_rounds_backoff_blocked,
@@ -508,6 +514,22 @@ pub struct BootstrapChurnStats {
     /// cap-rejected promotion attempt is not counted as a promotion.
     pub promoted_to_ring: u64,
     pub time_to_min_connections: Option<Duration>,
+    /// Time from [`mark_process_start`] to the first moment this node held a
+    /// ring connection (the first accepted `Ring::add_connection_reporting`),
+    /// set at most once per process (#5858). Later drops back to zero
+    /// connections do not reset it. `None` means no ring connection yet.
+    /// Unlike `time_to_min_connections` this is not gated on reaching
+    /// `min_connections`, so it isolates slow *first* contact from slow
+    /// fill-out.
+    pub time_to_first_ring_connection: Option<Duration>,
+    /// Number of self-initiated CONNECT attempts (`start_client_connect`
+    /// calls, including cached-peer reconnects and gateway joins) issued
+    /// before the first ring connection. Frozen once
+    /// `time_to_first_ring_connection` is set, so it counts attempts and
+    /// not process uptime. The attempt that produces the first connection is
+    /// included (it was issued before the connection existed); attempts
+    /// issued after that moment are not.
+    pub connect_attempts_before_first_connection: u64,
     /// Below-threshold join-loop rounds that dialled gateways this node was
     /// not yet connected to.
     pub startup_rounds_connect_issued_gateway: u64,
@@ -1589,6 +1611,43 @@ pub fn record_bootstrap_min_connections_reached() {
         if let Ok(mut s) = status.write() {
             if s.bootstrap_churn_stats.time_to_min_connections.is_none() {
                 s.bootstrap_churn_stats.time_to_min_connections = Some(elapsed);
+            }
+        }
+    }
+}
+
+/// Record that this process now holds its first ring connection (issue #5858
+/// instrumentation), measured from the [`PROCESS_START`] anchor like
+/// [`record_bootstrap_min_connections_reached`].
+///
+/// Called from every successful ring add, so it runs on each new connection;
+/// only the first call per process has any effect. Not reset when connections
+/// later drop to zero: a node that loses everything and rejoins is a
+/// reconnect, not a slow first join.
+pub fn record_bootstrap_first_ring_connection() {
+    let elapsed = since_process_start();
+    if let Some(status) = NETWORK_STATUS.get() {
+        if let Ok(mut s) = status.write() {
+            if s.bootstrap_churn_stats
+                .time_to_first_ring_connection
+                .is_none()
+            {
+                s.bootstrap_churn_stats.time_to_first_ring_connection = Some(elapsed);
+            }
+        }
+    }
+}
+
+/// Record one self-initiated CONNECT attempt (issue #5858 instrumentation).
+/// Counted only until the first ring connection is recorded, so the total is
+/// the number of attempts it took to get a first connection.
+pub fn record_bootstrap_connect_attempt() {
+    if let Some(status) = NETWORK_STATUS.get() {
+        if let Ok(mut s) = status.write() {
+            let b = &mut s.bootstrap_churn_stats;
+            if b.time_to_first_ring_connection.is_none() {
+                b.connect_attempts_before_first_connection =
+                    b.connect_attempts_before_first_connection.saturating_add(1);
             }
         }
     }
@@ -2774,6 +2833,8 @@ mod tests {
                 transient_expired: 2,
                 promoted_to_ring: 1,
                 time_to_min_connections: Some(first),
+                time_to_first_ring_connection: None,
+                connect_attempts_before_first_connection: 0,
                 startup_rounds_connect_issued_gateway: 4,
                 startup_rounds_connect_issued_routed: 5,
                 startup_rounds_backoff_blocked: 2,
@@ -2806,6 +2867,71 @@ mod tests {
             "recorded latency {recorded:?} must be measured from the \
              process-start anchor (>= {before:?} observed just before the call), \
              not from a clock started at the call site"
+        );
+    }
+
+    /// First-ring-connection latency (#5858): set exactly once, on the first
+    /// call, measured from the process-start anchor; later calls (every new
+    /// connection, including a rejoin after dropping to zero) never move it.
+    /// The attempt counter counts up to that moment and then freezes, and both
+    /// reach the OTEL scalar source that feeds the gauges.
+    #[test]
+    fn first_ring_connection_is_recorded_once_from_process_start() {
+        let _lock = TEST_MUTEX.lock().unwrap();
+        init(31339, HashSet::new(), "test".to_string());
+
+        let b = bootstrap_churn_counts().expect("singleton is initialized");
+        assert_eq!(b.time_to_first_ring_connection, None);
+        assert_eq!(b.connect_attempts_before_first_connection, 0);
+
+        record_bootstrap_connect_attempt();
+        record_bootstrap_connect_attempt();
+        record_bootstrap_connect_attempt();
+        let b = bootstrap_churn_counts().expect("singleton is initialized");
+        assert_eq!(
+            b.connect_attempts_before_first_connection, 3,
+            "each attempt before the first connection is counted"
+        );
+        assert_eq!(
+            b.time_to_first_ring_connection, None,
+            "attempts alone must not mark a connection"
+        );
+
+        // Real elapsed time has accrued on the process-global anchor; the
+        // value must be measured from it, not from a clock started at the call.
+        let before = since_process_start();
+        record_bootstrap_first_ring_connection();
+        let first = bootstrap_churn_counts()
+            .expect("singleton is initialized")
+            .time_to_first_ring_connection
+            .expect("recorded on the first call");
+        assert!(
+            first >= before,
+            "recorded {first:?} must be measured from the process-start anchor \
+             (>= {before:?} observed just before the call)"
+        );
+
+        // A later connection (e.g. after a drop to zero and a rejoin) must not
+        // overwrite it, and attempts after it are not "before the first".
+        std::thread::sleep(Duration::from_millis(5));
+        record_bootstrap_first_ring_connection();
+        record_bootstrap_connect_attempt();
+        let b = bootstrap_churn_counts().expect("singleton is initialized");
+        assert_eq!(
+            b.time_to_first_ring_connection,
+            Some(first),
+            "the first-connection latency is set once and never reset"
+        );
+        assert_eq!(
+            b.connect_attempts_before_first_connection, 3,
+            "the attempt count freezes at the first connection"
+        );
+
+        let scalars = otel_status_scalars().expect("singleton is initialized");
+        assert_eq!(scalars.bootstrap_time_to_first_ring_connection, Some(first));
+        assert_eq!(
+            scalars.bootstrap_connect_attempts_before_first_connection, 3,
+            "the OTEL scalar source must carry both fields"
         );
     }
 
