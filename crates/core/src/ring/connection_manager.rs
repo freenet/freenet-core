@@ -1812,18 +1812,26 @@ impl ConnectionManager {
     }
 
     /// The connection a topology prune or swap should shed instead of
-    /// `recommended` (#5858): an established link still on probation, which is
-    /// first in line while its probation lasts. A per-side nearest lattice edge
-    /// is never substituted (it keeps its retention protection), nor is
-    /// anything when no link is on probation. Releases the slot of the link it
-    /// returns and counts it as pruned.
+    /// `recommended` (#5858): an ESTABLISHED link still on probation, at least
+    /// [`super::admission::ONBOARDING_MIN_AGE_BEFORE_PRUNE`] old, which is first
+    /// in line while its probation lasts. A per-side nearest lattice edge is
+    /// never substituted (it keeps its retention protection), nor is anything
+    /// when no link qualifies.
+    ///
+    /// The slot is NOT freed here: a swap's drop is deferred and may never
+    /// happen. It is freed, and counted as pruned, by the prune that follows
+    /// when the drop executes (review S4).
     pub(crate) fn probation_prune_substitute(
         &self,
         recommended: &PeerKeyLocation,
+        now: Instant,
     ) -> Option<PeerKeyLocation> {
-        let candidates = self.provisional_links.lock().ages(Instant::now());
-        let substitute = candidates.into_iter().find_map(|(addr, _)| {
-            if recommended.socket_addr() == Some(addr) {
+        let candidates = self.provisional_links.lock().ages(now);
+        candidates.into_iter().find_map(|(addr, age)| {
+            if recommended.socket_addr() == Some(addr)
+                || age < super::admission::ONBOARDING_MIN_AGE_BEFORE_PRUNE
+                || !self.is_in_ring(addr)
+            {
                 return None;
             }
             let loc = self.location_for_peer.read().get(&addr).copied()?;
@@ -1831,12 +1839,7 @@ impl ConnectionManager {
                 return None;
             }
             self.get_peer_by_addr(addr)
-                .filter(|_| self.is_in_ring(addr))
-        })?;
-        if let Some(addr) = substitute.socket_addr() {
-            self.finish_probation(addr, ProvisionalOutcome::Pruned);
-        }
-        Some(substitute)
+        })
     }
 
     /// Record the advertised location for a peer that we have decided to accept.
