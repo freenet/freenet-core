@@ -995,8 +995,9 @@ pub(crate) struct RouterSnapshotInfo {
     /// cadence from `ConnectionManager::admission_stats`. Monotonic lifetime
     /// totals except `connect_provisional_in_use` (a gauge). `admitted_*`
     /// count admission DECISIONS (a reservation), not established links.
-    /// `connect_need_downgraded_to_legacy` counts requests whose stated need
-    /// was dropped because the next hop's version could not decode it, so a
+    /// `connect_need_downgraded_{unknown_version,below_floor}` count requests
+    /// whose stated need was dropped because the next hop's version was
+    /// unknown (never heals) or below the floor (heals with upgrades), so a
     /// rollout in which no hop understands the need is distinguishable from one
     /// in which nobody needed onboarding.
     pub connect_admitted_self_interest: Option<u64>,
@@ -1008,7 +1009,10 @@ pub(crate) struct RouterSnapshotInfo {
     pub connect_provisional_dropped: Option<u64>,
     pub connect_provisional_pruned: Option<u64>,
     pub connect_provisional_released_unestablished: Option<u64>,
-    pub connect_need_downgraded_to_legacy: Option<u64>,
+    pub connect_need_downgraded_unknown_version: Option<u64>,
+    pub connect_need_downgraded_below_floor: Option<u64>,
+    /// Onboarding links whose connection was established.
+    pub connect_onboarding_established: Option<u64>,
     pub connect_provisional_in_use: Option<u64>,
     /// Version-gate refusal counters (#5156), populated by `Ring` on the
     /// snapshot cadence from `ConnectionManager::version_gate_refusal_stats`.
@@ -3670,7 +3674,9 @@ impl Router {
             connect_provisional_dropped: None,
             connect_provisional_pruned: None,
             connect_provisional_released_unestablished: None,
-            connect_need_downgraded_to_legacy: None,
+            connect_need_downgraded_unknown_version: None,
+            connect_need_downgraded_below_floor: None,
+            connect_onboarding_established: None,
             connect_provisional_in_use: None,
             // Version-gate refusal counters, populated by Ring on the
             // snapshot cadence (#5156).

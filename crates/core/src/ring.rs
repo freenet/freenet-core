@@ -2079,7 +2079,11 @@ impl Ring {
             snapshot.connect_provisional_pruned = Some(admission.provisional_pruned);
             snapshot.connect_provisional_released_unestablished =
                 Some(admission.provisional_released_unestablished);
-            snapshot.connect_need_downgraded_to_legacy = Some(admission.need_downgraded_to_legacy);
+            snapshot.connect_need_downgraded_unknown_version =
+                Some(admission.need_downgraded_unknown_version);
+            snapshot.connect_need_downgraded_below_floor =
+                Some(admission.need_downgraded_below_floor);
+            snapshot.connect_onboarding_established = Some(admission.onboarding_established);
             snapshot.connect_provisional_in_use = Some(admission.provisional_in_use);
 
             // Version-gate refusal counters (#5156): why

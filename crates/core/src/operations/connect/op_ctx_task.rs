@@ -186,14 +186,14 @@ pub(crate) async fn start_client_connect(
     exclude_addrs.extend(connected_addrs);
 
     // The joiner's stated need (#5858): short of connections, or the bar an
-    // acceptor must beat to improve its coverage of `desired_location`. Sent
-    // only if the first hop can decode it.
+    // acceptor must beat to improve its coverage of `desired_location`. It
+    // rides in memory; the event loop picks the wire form when the request is
+    // written to the gateway connection (`fit_request_to_hop`), which may not
+    // exist yet here.
     let need = op_manager
         .ring
         .connection_manager
         .requester_need(desired_location);
-    let gateway_supports_need =
-        super::hop_supports_need(&op_manager.ring.connection_manager, gateway_addr, need);
     let request_msg = super::prepare_join_request(
         tx,
         &own,
@@ -202,7 +202,6 @@ pub(crate) async fn start_client_connect(
         ttl,
         &exclude_addrs,
         need,
-        gateway_supports_need,
     );
 
     if let Some(event) = NetEventLog::connect_request_sent(
@@ -923,12 +922,10 @@ async fn drive_relay_connect(
                     let mut ctx = op_manager.op_ctx(incoming_tx);
                     let capacity =
                         compute_reply_capacity(op_manager.ring.connection_manager.min_connections);
-                    let request_msg = super::request_message_for(
-                        &op_manager.ring.connection_manager,
-                        addr,
-                        incoming_tx,
-                        request,
-                    );
+                    let request_msg = ConnectMsg::Request {
+                        id: incoming_tx,
+                        payload: request,
+                    };
                     match ctx
                         .send_to_and_collect_replies(
                             addr,
@@ -1121,12 +1118,10 @@ async fn drive_relay_connect(
                         "CONNECT relay: retrying with different uphill peer after rejection"
                     );
                     if let Some(addr) = peer.socket_addr() {
-                        let request_msg = super::request_message_for(
-                            &op_manager.ring.connection_manager,
-                            addr,
-                            incoming_tx,
-                            forward_req,
-                        );
+                        let request_msg = ConnectMsg::Request {
+                            id: incoming_tx,
+                            payload: forward_req,
+                        };
                         let mut ctx = op_manager.op_ctx(incoming_tx);
                         ctx.send_fire_and_forget(
                             addr,
@@ -1295,12 +1290,10 @@ async fn drive_relay_connect(
                         "CONNECT relay: re-routing to different peer after ConnectFailed"
                     );
                     if let Some(addr) = peer.socket_addr() {
-                        let request_msg = super::request_message_for(
-                            &op_manager.ring.connection_manager,
-                            addr,
-                            incoming_tx,
-                            forward_req,
-                        );
+                        let request_msg = ConnectMsg::Request {
+                            id: incoming_tx,
+                            payload: forward_req,
+                        };
                         let mut ctx = op_manager.op_ctx(incoming_tx);
                         ctx.send_fire_and_forget(
                             addr,

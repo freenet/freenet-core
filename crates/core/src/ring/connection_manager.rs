@@ -2037,24 +2037,31 @@ impl ConnectionManager {
         crate::node::version_supports_broadcast_target_list(self.remote_version(addr), floor)
     }
 
-    /// Whether the peer at `addr` reports a version new enough to decode
+    /// Whether a connected peer of negotiated version `hop_version` can decode
     /// `ConnectMsg::RequestWithNeed` (#5858). Same fail-closed rule as
     /// [`Self::supports_broadcast_target_list`]; the fallback is the legacy
     /// `ConnectMsg::Request`, which drops the need and is exactly what every
-    /// peer receives today. Each refusal is counted
-    /// (`AdmissionStats::need_downgraded_to_legacy`), so a rollout in which the
-    /// need never reaches anyone does not read as one in which nobody needed.
+    /// peer receives today. Takes the LIVE connection's version (see
+    /// `operations::connect::fit_request_to_hop`), not the address-keyed
+    /// mirror, so a stale record can never be trusted.
+    ///
+    /// Each refusal is counted by cause, like #5156's gates: an unknown
+    /// version never heals as the fleet upgrades, a pre-floor one does. A
+    /// rollout in which the need reaches no one is then visible.
     ///
     /// Honours `NodeConfig::connect_need_floor_override` (default OFF in
     /// simulations; `SimNetwork::enable_connect_need`).
-    pub(crate) fn supports_connect_need(&self, addr: SocketAddr) -> bool {
+    pub(crate) fn hop_version_supports_connect_need(
+        &self,
+        hop_version: Option<(u8, u8, u16)>,
+    ) -> bool {
         let floor = self
             .connect_need_floor_override
             .unwrap_or(crate::node::CONNECT_NEED_MIN_VERSION);
-        let supported =
-            crate::node::version_supports_connect_need(self.remote_version(addr), floor);
+        let supported = crate::node::version_supports_connect_need(hop_version, floor);
         if !supported {
-            self.admission_counters.record_need_downgraded();
+            self.admission_counters
+                .record_need_downgraded(hop_version.is_none());
         }
         supported
     }
@@ -4052,24 +4059,18 @@ mod tests {
     /// catches the RELEASE advancing past a stationary floor.
     /// The send gate for `ConnectMsg::RequestWithNeed` (#5858) discriminates:
     /// unknown and pre-floor versions get the legacy request, at-floor and
-    /// newer get the need. Each refusal is counted, so a rollout where the
-    /// need reaches no one is visible.
+    /// newer get the need. Each refusal is counted under its cause.
     #[test]
-    fn supports_connect_need_gate_discriminates_by_version() {
+    fn connect_need_gate_discriminates_by_version() {
         let cm = make_connection_manager(Some(make_addr(9000)), 1, 10, false);
         let floor = crate::node::CONNECT_NEED_MIN_VERSION;
-        let unknown = make_addr(9001);
-        let old = make_addr(9002);
-        let at_floor = make_addr(9003);
-        let newer = make_addr(9004);
-        cm.record_remote_version(old, Some((floor.0, floor.1, floor.2 - 1)));
-        cm.record_remote_version(at_floor, Some(floor));
-        cm.record_remote_version(newer, Some((floor.0, floor.1 + 1, 0)));
-        assert!(!cm.supports_connect_need(unknown));
-        assert!(!cm.supports_connect_need(old));
-        assert!(cm.supports_connect_need(at_floor));
-        assert!(cm.supports_connect_need(newer));
-        assert_eq!(cm.admission_stats().need_downgraded_to_legacy, 2);
+        assert!(!cm.hop_version_supports_connect_need(None));
+        assert!(!cm.hop_version_supports_connect_need(Some((floor.0, floor.1, floor.2 - 1))));
+        assert!(cm.hop_version_supports_connect_need(Some(floor)));
+        assert!(cm.hop_version_supports_connect_need(Some((floor.0, floor.1 + 1, 0))));
+        let stats = cm.admission_stats();
+        assert_eq!(stats.need_downgraded_unknown_version, 1);
+        assert_eq!(stats.need_downgraded_below_floor, 1);
     }
 
     /// Same release-tracking guard as `hash_first_floor_tracks_the_shipping_release`,

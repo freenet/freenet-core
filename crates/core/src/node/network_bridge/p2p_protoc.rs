@@ -1782,6 +1782,15 @@ impl P2pConnManager {
                                             NetMessageV1::SubscribeHint(_) => "SubscribeHint",
                                         },
                                     };
+                                    // A CONNECT request's wire form is chosen
+                                    // here, against THIS connection's version
+                                    // (#5858): the need-carrying variant only to
+                                    // a peer that can decode it.
+                                    let msg = crate::operations::connect::fit_request_to_hop(
+                                        msg,
+                                        peer_connection.remote_version,
+                                        &ctx.bridge.op_manager.ring.connection_manager,
+                                    );
                                     match tokio::time::timeout(
                                         SEND_TIMEOUT,
                                         peer_connection.sender.send(Left(msg.clone())),
