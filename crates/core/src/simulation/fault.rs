@@ -183,6 +183,23 @@ impl FaultConfig {
         ((h >> 11) as f64 / (1u64 << 53) as f64) < self.unreachable_pair_fraction
     }
 
+    /// A fixed one-way delay for the pair `a`/`b`, drawn deterministically
+    /// from `latency_range` (and `unreachable_pair_salt`), the same for every
+    /// packet in either direction. Unlike [`generate_latency`](Self::generate_latency),
+    /// which draws per packet and so reorders packets wholesale, this models a
+    /// link with a stable RTT. `None` when no latency range is configured.
+    pub fn pair_latency(&self, a: &SocketAddr, b: &SocketAddr) -> Option<Duration> {
+        let range = self.latency_range.as_ref()?;
+        let span = range.end.saturating_sub(range.start).as_nanos() as u64;
+        if span == 0 {
+            return Some(range.start);
+        }
+        let (lo, hi) = if a < b { (a, b) } else { (b, a) };
+        let mut h = splitmix64(!self.unreachable_pair_salt ^ addr_bits(lo));
+        h = splitmix64(h ^ addr_bits(hi));
+        Some(range.start + Duration::from_nanos(h % span))
+    }
+
     /// Checks if a node has crashed.
     pub fn is_crashed(&self, addr: &SocketAddr) -> bool {
         self.crashed_nodes.contains(addr)
@@ -423,6 +440,24 @@ mod tests {
         assert!(!config.is_unreachable_pair(&addr(3), &gw));
         assert!(!config.is_unreachable_pair(&addr(2), &addr(2)));
         assert!(!FaultConfig::new().is_unreachable_pair(&addr(2), &addr(3)));
+    }
+
+    #[test]
+    fn pair_latency_is_stable_symmetric_and_in_range() {
+        let range = Duration::from_millis(20)..Duration::from_millis(150);
+        let config = FaultConfig::builder().latency_range(range.clone()).build();
+        let mut distinct = HashSet::new();
+        for a in 1000..1020 {
+            for b in (a + 1)..1020 {
+                let d = config.pair_latency(&addr(a), &addr(b)).unwrap();
+                assert!(range.contains(&d), "{d:?} outside {range:?}");
+                assert_eq!(Some(d), config.pair_latency(&addr(b), &addr(a)));
+                assert_eq!(Some(d), config.pair_latency(&addr(a), &addr(b)));
+                distinct.insert(d);
+            }
+        }
+        assert!(distinct.len() > 100, "pairs must get different latencies");
+        assert_eq!(FaultConfig::new().pair_latency(&addr(1), &addr(2)), None);
     }
 
     #[test]

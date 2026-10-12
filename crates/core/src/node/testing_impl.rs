@@ -476,7 +476,7 @@ fn fault_injection_delivery_decision(
                 inj.stats.messages_dropped_unreachable_pair += 1;
                 return PacketDeliveryDecision::Drop;
             }
-            if let Some(delay) = inj.config.generate_latency(&inj.rng) {
+            if let Some(delay) = inj.config.pair_latency(&from, &to) {
                 inj.stats.messages_delayed_delivered += 1;
                 inj.stats.total_latency_nanos += delay.as_nanos() as u64;
                 return PacketDeliveryDecision::DelayedDelivery(delay);
@@ -1932,8 +1932,8 @@ impl SimNetwork {
         self
     }
 
-    /// Makes the direct runner apply `FaultConfig::latency_range` (a per-packet
-    /// delay) and `FaultConfig::unreachable_pair_fraction` (pairs that never
+    /// Makes the direct runner apply `FaultConfig::latency_range` (as a fixed
+    /// per-pair delay, see `FaultConfig::pair_latency`) and `FaultConfig::unreachable_pair_fraction` (pairs that never
     /// connect, modelling failed NAT traversal) on the socket path. Both are
     /// otherwise inert: the delivery callback only enforces crashes and
     /// partitions. Opt-in so existing simulations that set `latency_range`

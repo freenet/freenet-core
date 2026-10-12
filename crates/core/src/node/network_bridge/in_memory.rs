@@ -113,9 +113,9 @@ pub struct FaultInjectorState {
     /// so their injected faults are real packet drops rather than silent no-ops.
     pub enforce_fault_drops: bool,
     /// Opt-in: when true, the network's packet-delivery callback also applies
-    /// `config.latency_range` (a per-packet delay drawn from `rng`) and drops
-    /// packets between `config.is_unreachable_pair` pairs. Without it those
-    /// two settings are inert on the socket path. Set by
+    /// `config.latency_range` (a fixed per-pair delay, `FaultConfig::pair_latency`)
+    /// and drops packets between `config.is_unreachable_pair` pairs. Without
+    /// it those two settings are inert on the socket path. Set by
     /// `SimNetwork::run_simulation_direct` when the network opted in via
     /// `SimNetwork::enforce_link_faults`.
     pub enforce_link_faults: bool,
