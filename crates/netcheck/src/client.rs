@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Result, anyhow, bail, ensure};
 use freenet_stdlib::client_api::{
     ClientError, ClientRequest, ContractError, ContractRequest, ContractResponse, ErrorKind,
-    HostResponse, NodeQuery, QueryResponse, RequestError, WebApi,
+    HostResponse, NodeDiagnosticsConfig, NodeQuery, QueryResponse, RequestError, WebApi,
 };
 use freenet_stdlib::prelude::*;
 use tokio_tungstenite::connect_async;
@@ -440,20 +440,41 @@ async fn get_inner(
     }
 }
 
+/// Only the network section: the ring's own connections, nothing else.
+fn ring_connections_query() -> ClientRequest<'static> {
+    ClientRequest::NodeQueries(NodeQuery::NodeDiagnostics {
+        config: NodeDiagnosticsConfig {
+            include_node_info: false,
+            include_network_info: true,
+            include_subscriptions: false,
+            contract_keys: Vec::new(),
+            include_system_metrics: false,
+            include_detailed_peer_info: false,
+            include_subscriber_peer_ids: false,
+        },
+    })
+}
+
 /// Wait until the node joins the ring; returns the addresses it connected to.
 /// The report carries them: they are the only evidence of whether a GET could
 /// have been answered by the node that stored the PUTs.
+///
+/// Asks for the node's RING connections, not `ConnectedPeers`. The latter
+/// lists transport connections, which include the transient link to the
+/// bootstrap gateway that exists before, and regardless of whether, the join
+/// succeeds. Polling it made this wait pass the instant the gateway handshake
+/// completed, so nearly every nightly run issued its GETs from a node with
+/// zero ring connections: each GET was one forward through the gateway with
+/// no alternative route, and its NotFounds measured that, not the network.
 pub async fn wait_for_ring_join(client: &mut WebApi, timeout: Duration) -> Result<Vec<String>> {
     let deadline = Instant::now() + timeout;
     loop {
-        client
-            .send(ClientRequest::NodeQueries(NodeQuery::ConnectedPeers))
-            .await?;
+        client.send(ring_connections_query()).await?;
         match tokio::time::timeout(Duration::from_secs(5), client.recv()).await {
-            Ok(Ok(HostResponse::QueryResponse(QueryResponse::ConnectedPeers { peers }))) => {
-                if !peers.is_empty() {
-                    let addrs: Vec<String> =
-                        peers.iter().map(|(_, addr)| addr.to_string()).collect();
+            Ok(Ok(HostResponse::QueryResponse(QueryResponse::NodeDiagnostics(diag)))) => {
+                let peers = diag.network_info.map(|n| n.connected_peers);
+                if let Some(peers) = peers.filter(|p| !p.is_empty()) {
+                    let addrs: Vec<String> = peers.into_iter().map(|(_, addr)| addr).collect();
                     eprintln!(
                         "ephemeral node joined the ring ({} connection(s): {})",
                         addrs.len(),
@@ -462,9 +483,9 @@ pub async fn wait_for_ring_join(client: &mut WebApi, timeout: Duration) -> Resul
                     return Ok(addrs);
                 }
             }
-            Ok(Ok(other)) => eprintln!("unexpected response to ConnectedPeers: {other:?}"),
-            Ok(Err(e)) => eprintln!("ConnectedPeers query error: {e}"),
-            Err(_) => eprintln!("ConnectedPeers query timed out"),
+            Ok(Ok(other)) => eprintln!("unexpected response to NodeDiagnostics: {other:?}"),
+            Ok(Err(e)) => eprintln!("NodeDiagnostics query error: {e}"),
+            Err(_) => eprintln!("NodeDiagnostics query timed out"),
         }
         ensure!(
             Instant::now() < deadline,
@@ -479,6 +500,7 @@ mod tests {
     use std::net::Ipv4Addr;
     use std::sync::Arc;
 
+    use freenet_stdlib::client_api::{NetworkInfo, NodeDiagnosticsResponse};
     use freenet_stdlib::prelude::bincode;
     use futures::{SinkExt, StreamExt};
     use tokio::net::TcpListener;
@@ -585,6 +607,102 @@ mod tests {
     }
 
     const TEST_TIMEOUT: Duration = Duration::from_secs(10);
+
+    fn diagnostics_with_ring(peers: &[&str]) -> HostResult {
+        Ok(HostResponse::QueryResponse(QueryResponse::NodeDiagnostics(
+            NodeDiagnosticsResponse {
+                node_info: None,
+                network_info: Some(NetworkInfo {
+                    connected_peers: peers
+                        .iter()
+                        .map(|a| (format!("peer-at-{a}"), a.to_string()))
+                        .collect(),
+                    active_connections: peers.len(),
+                }),
+                subscriptions: Vec::new(),
+                contract_states: Default::default(),
+                system_metrics: None,
+                connected_peers_detailed: Vec::new(),
+            },
+        )))
+    }
+
+    /// A node that has a transport link to its gateway and nothing in its
+    /// ring, answering each query the way the real one does: `ConnectedPeers`
+    /// lists the gateway, `NodeDiagnostics` reports the ring, one entry of
+    /// `ring` per query (the last repeats).
+    async fn joining_node(listener: TcpListener, gateway: &'static str, ring: Vec<Vec<&str>>) {
+        let (stream, _) = listener.accept().await.expect("accept");
+        let mut ws = tokio_tungstenite::accept_async(stream)
+            .await
+            .expect("ws handshake");
+        let mut diagnostics_asked = 0;
+        while let Some(Ok(frame)) = ws.next().await {
+            let Message::Binary(bytes) = frame else {
+                continue;
+            };
+            let request: ClientRequest<'_> =
+                bincode::deserialize(&bytes).expect("deserialize request");
+            let response = match request {
+                ClientRequest::NodeQueries(NodeQuery::ConnectedPeers) => {
+                    Ok(HostResponse::QueryResponse(QueryResponse::ConnectedPeers {
+                        peers: vec![(
+                            "gateway".to_string(),
+                            gateway.parse().expect("gateway addr"),
+                        )],
+                    }))
+                }
+                ClientRequest::NodeQueries(NodeQuery::NodeDiagnostics { .. }) => {
+                    let i = diagnostics_asked.min(ring.len() - 1);
+                    diagnostics_asked += 1;
+                    diagnostics_with_ring(&ring[i])
+                }
+                other => panic!("unexpected request {other:?}"),
+            };
+            let bytes = bincode::serialize(&response).expect("serialize response");
+            ws.send(Message::Binary(bytes.into())).await.expect("send");
+        }
+    }
+
+    async fn start_joining_node(gateway: &'static str, ring: Vec<Vec<&'static str>>) -> WebApi {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0u16))
+            .await
+            .expect("bind");
+        let port = listener.local_addr().expect("local addr").port();
+        tokio::spawn(joining_node(listener, gateway, ring));
+        connect(
+            &format!("ws://{}:{port}", Ipv4Addr::LOCALHOST),
+            TEST_TIMEOUT,
+        )
+        .await
+        .expect("connect to fake node")
+    }
+
+    // ---- the join wait must see the ring, not the transport ----
+
+    #[tokio::test]
+    async fn a_transport_link_to_the_gateway_is_not_a_ring_join() {
+        // The state of the nightly getter in 72 of its first 75 runs: the
+        // gateway handshake done, the ring empty. The old wait returned here
+        // with the gateway as its "connection", and every GET that followed
+        // was a single forward through that gateway.
+        let mut client = start_joining_node("5.9.111.215:31338", vec![vec![]]).await;
+        let joined = wait_for_ring_join(&mut client, Duration::from_secs(3)).await;
+        assert!(
+            joined.is_err(),
+            "a node with zero ring connections was reported as joined: {joined:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_join_wait_returns_the_ring_peers_once_there_are_some() {
+        let mut client =
+            start_joining_node("5.9.111.215:31338", vec![vec![], vec!["203.0.113.7:40000"]]).await;
+        let joined = wait_for_ring_join(&mut client, TEST_TIMEOUT)
+            .await
+            .expect("the node joined on the second poll");
+        assert_eq!(joined, vec!["203.0.113.7:40000".to_string()]);
+    }
 
     // ---- defect 3: errors must be key-filtered like successes ----
 
