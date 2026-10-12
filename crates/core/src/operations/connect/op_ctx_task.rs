@@ -2023,3 +2023,299 @@ mod tests {
         );
     }
 }
+
+/// Behaviour of the client driver while this peer has no ring connection
+/// (#5858), against a real `OpManager` whose event-loop notifications this
+/// test answers itself. Paused time: the hole-punch delays and the quiet
+/// window cost nothing.
+#[cfg(test)]
+mod driver_timing_tests {
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use either::Either;
+    use tokio::sync::mpsc;
+    use tokio::time::Instant;
+
+    use super::{ClientConnectEnd, ClientConnectKind, drive_client_connect_inner};
+    use crate::message::{NetMessage, NetMessageV1, NodeEvent, Transaction};
+    use crate::node::{OpManager, WaiterReply};
+    use crate::operations::connect::bootstrap::{BOOTSTRAP_REPLY_QUIET, BootstrapExit};
+    use crate::operations::connect::{ConnectMsg, ConnectResponse};
+    use crate::ring::{Location, PeerKeyLocation};
+    use crate::transport::TransportKeypair;
+    use crate::transport::connection_handler::NAT_TRAVERSAL_DEADLINE;
+
+    async fn op_manager_with_events(
+        id: &str,
+    ) -> (
+        Arc<OpManager>,
+        mpsc::Receiver<Either<NetMessage, NodeEvent>>,
+    ) {
+        let config_args = crate::config::ConfigArgs {
+            id: Some(id.to_string()),
+            mode: Some(crate::contract::OperationMode::Local),
+            ..Default::default()
+        };
+        let node_config =
+            crate::node::NodeConfig::new(config_args.build().await.expect("build Config"))
+                .await
+                .expect("build NodeConfig");
+        let (notification_rx, notification_tx) = crate::node::event_loop_notification_channel();
+        let (ops_ch_channel, ch_channel, _wait_for_event) =
+            crate::contract::contract_handler_channel();
+        let connection_manager = crate::ring::ConnectionManager::new(&node_config);
+        let (result_router_tx, result_router_rx) = mpsc::channel(100);
+        let task_monitor = crate::node::background_task_monitor::BackgroundTaskMonitor::new();
+        let op_manager = Arc::new(
+            OpManager::new(
+                notification_tx,
+                ops_ch_channel,
+                &node_config,
+                crate::tracing::DynamicRegister::new(vec![]),
+                connection_manager,
+                result_router_tx,
+                &task_monitor,
+            )
+            .expect("build OpManager"),
+        );
+        op_manager.ring.attach_op_manager(&op_manager);
+        op_manager
+            .ring
+            .connection_manager
+            .set_own_addr_local_for_test("127.0.0.1:14858".parse().unwrap());
+        std::mem::forget((
+            ch_channel,
+            result_router_rx,
+            notification_rx.op_execution_receiver,
+        ));
+        (op_manager, notification_rx.notifications_receiver)
+    }
+
+    fn peer(port: u16) -> PeerKeyLocation {
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), port);
+        PeerKeyLocation::new(TransportKeypair::new().public().clone(), addr)
+    }
+
+    fn response(tx: Transaction, acceptor: &PeerKeyLocation) -> WaiterReply {
+        WaiterReply::Reply(NetMessage::V1(NetMessageV1::Connect(
+            ConnectMsg::Response {
+                id: tx,
+                payload: ConnectResponse {
+                    acceptor: acceptor.clone(),
+                },
+            },
+        )))
+    }
+
+    /// Answers `ConnectPeer` like the event loop: an `unreachable` acceptor
+    /// fails after the NAT traversal deadline; any other acceptor connects if
+    /// it is dialled within its own punch window, which opens when its
+    /// Response was sent (`t0`). Returns when each acceptor was dialled.
+    fn fake_event_loop(
+        mut events: mpsc::Receiver<Either<NetMessage, NodeEvent>>,
+        unreachable: SocketAddr,
+        t0: Instant,
+    ) -> tokio::task::JoinHandle<Vec<(SocketAddr, Duration)>> {
+        tokio::spawn(async move {
+            let mut dialled = Vec::new();
+            while let Some(event) = events.recv().await {
+                let Either::Right(NodeEvent::ConnectPeer { peer, callback, .. }) = event else {
+                    continue;
+                };
+                let addr = peer.socket_addr().expect("acceptor address");
+                let at = t0.elapsed();
+                dialled.push((addr, at));
+                let in_window = at < NAT_TRAVERSAL_DEADLINE;
+                tokio::spawn(async move {
+                    tokio::time::sleep(NAT_TRAVERSAL_DEADLINE).await;
+                    let result = if addr != unreachable && in_window {
+                        Ok((addr, None))
+                    } else {
+                        Err(())
+                    };
+                    let _ = callback.send(result).await;
+                });
+                if dialled.len() == 2 {
+                    return dialled;
+                }
+            }
+            dialled
+        })
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_reachable_acceptor_is_dialled_while_an_unreachable_one_is_still_failing() {
+        let (op_manager, events) = op_manager_with_events("driver-concurrent-dials").await;
+        let gateway = peer(24858);
+        let (unreachable, reachable) = (peer(24859), peer(24860));
+        let tx = Transaction::new::<ConnectMsg>();
+        let (replies_tx, replies_rx) = mpsc::channel(8);
+        let t0 = Instant::now();
+        let fake = fake_event_loop(events, unreachable.socket_addr().unwrap(), t0);
+        replies_tx.send(response(tx, &unreachable)).await.unwrap();
+        replies_tx.send(response(tx, &reachable)).await.unwrap();
+
+        let driver = drive_client_connect_inner(
+            tx,
+            gateway.clone(),
+            gateway.socket_addr().unwrap(),
+            Location::new(0.5),
+            op_manager.ring.connection_manager.min_connections,
+            false,
+            replies_rx,
+            &op_manager,
+            ClientConnectKind::Standard,
+        );
+        let dialled = tokio::select! {
+            dialled = fake => dialled.expect("fake event loop"),
+            _ = driver => panic!("driver ended before both acceptors were dialled"),
+        };
+        let reachable_at = dialled
+            .iter()
+            .find(|(a, _)| Some(*a) == reachable.socket_addr())
+            .map(|(_, at)| *at)
+            .expect("the reachable acceptor must be dialled");
+        assert!(
+            reachable_at < NAT_TRAVERSAL_DEADLINE,
+            "the reachable acceptor was dialled {reachable_at:?} after its Response, after its \
+             punch window closed: the driver waited for the unreachable one first"
+        );
+        drop(replies_tx);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_bootstrapping_connect_ends_when_nothing_more_is_coming() {
+        let (op_manager, events) = op_manager_with_events("driver-bootstrap-quiet").await;
+        std::mem::forget(events);
+        let gateway = peer(24861);
+        let tx = Transaction::new::<ConnectMsg>();
+        let (replies_tx, replies_rx) = mpsc::channel(8);
+        replies_tx
+            .send(WaiterReply::Reply(NetMessage::V1(NetMessageV1::Connect(
+                ConnectMsg::ObservedAddress {
+                    id: tx,
+                    address: "127.0.0.1:14858".parse().unwrap(),
+                },
+            ))))
+            .await
+            .unwrap();
+        let started = Instant::now();
+        let end = tokio::time::timeout(
+            Duration::from_secs(30),
+            drive_client_connect_inner(
+                tx,
+                gateway.clone(),
+                gateway.socket_addr().unwrap(),
+                Location::new(0.5),
+                op_manager.ring.connection_manager.min_connections,
+                false,
+                replies_rx,
+                &op_manager,
+                ClientConnectKind::Standard,
+            ),
+        )
+        .await
+        .expect("a CONNECT with no ring connection must not wait for the transaction TTL");
+        assert_eq!(
+            end.expect("driver result"),
+            ClientConnectEnd::Bootstrap(BootstrapExit::AllFailed)
+        );
+        assert!(started.elapsed() <= BOOTSTRAP_REPLY_QUIET + Duration::from_secs(1));
+        drop(replies_tx);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_bootstrapping_connect_that_hears_nothing_reports_a_dead_link() {
+        let (op_manager, events) = op_manager_with_events("driver-bootstrap-no-reply").await;
+        std::mem::forget(events);
+        let gateway = peer(24862);
+        let tx = Transaction::new::<ConnectMsg>();
+        let (replies_tx, replies_rx) = mpsc::channel(8);
+        let end = tokio::time::timeout(
+            Duration::from_secs(30),
+            drive_client_connect_inner(
+                tx,
+                gateway.clone(),
+                gateway.socket_addr().unwrap(),
+                Location::new(0.5),
+                op_manager.ring.connection_manager.min_connections,
+                false,
+                replies_rx,
+                &op_manager,
+                ClientConnectKind::Standard,
+            ),
+        )
+        .await
+        .expect("must end early");
+        assert_eq!(
+            end.expect("driver result"),
+            ClientConnectEnd::Bootstrap(BootstrapExit::NoReply)
+        );
+        drop(replies_tx);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_connected_peers_connect_keeps_collecting_acceptors() {
+        let (op_manager, events) = op_manager_with_events("driver-connected-peer").await;
+        std::mem::forget(events);
+        let existing = peer(24863);
+        let addr = existing.socket_addr().unwrap();
+        assert!(op_manager.ring.connection_manager.add_connection(
+            Location::from_address(&addr),
+            addr,
+            existing.pub_key().clone(),
+            false,
+        ));
+        let gateway = peer(24864);
+        let tx = Transaction::new::<ConnectMsg>();
+        let (replies_tx, replies_rx) = mpsc::channel(8);
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(30),
+            drive_client_connect_inner(
+                tx,
+                gateway.clone(),
+                gateway.socket_addr().unwrap(),
+                Location::new(0.5),
+                op_manager.ring.connection_manager.min_connections,
+                false,
+                replies_rx,
+                &op_manager,
+                ClientConnectKind::Standard,
+            ),
+        )
+        .await;
+        assert!(
+            outcome.is_err(),
+            "a peer with a ring connection keeps its TTL-bounded collection"
+        );
+        drop(replies_tx);
+    }
+
+    #[tokio::test]
+    async fn a_dead_gateway_link_is_dropped_but_never_a_ring_connection() {
+        let (op_manager, mut events) = op_manager_with_events("driver-dead-link").await;
+        let gateway = peer(24865).socket_addr().unwrap();
+        let tx = Transaction::new::<ConnectMsg>();
+        super::drop_dead_gateway_link(&op_manager, tx, gateway);
+        match events.try_recv() {
+            Ok(Either::Right(NodeEvent::DropConnection(addr))) => assert_eq!(addr, gateway),
+            other => panic!("expected a DropConnection for the gateway, got {other:?}"),
+        }
+
+        let in_ring = peer(24866);
+        let in_ring_addr = in_ring.socket_addr().unwrap();
+        assert!(op_manager.ring.connection_manager.add_connection(
+            Location::from_address(&in_ring_addr),
+            in_ring_addr,
+            in_ring.pub_key().clone(),
+            false,
+        ));
+        super::drop_dead_gateway_link(&op_manager, tx, in_ring_addr);
+        assert!(
+            events.try_recv().is_err(),
+            "a gateway that is a ring connection must not be dropped"
+        );
+    }
+}

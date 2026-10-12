@@ -6553,46 +6553,89 @@ impl Ring {
             // Gateway bootstrap fallback: at zero connections, acquire_new always
             // fails (no routing candidates). Connect to gateways directly (#3219).
             //
-            // Note: initial_join_procedure may also be attempting gateway connections
-            // concurrently. is_not_connected provides best-effort dedup via pending
-            // reservations (should_accept creates one on each join_ring_request), so
-            // the second caller typically sees the gateway as "pending" and skips it.
-            // Occasional duplicate CONNECTs are harmless — the connect state machine
-            // handles them gracefully.
+            // Shares the bootstrap pacer with `initial_join_procedure` (#5858),
+            // so the two never run a round at the same time and failed rounds
+            // are spaced by one backoff. While no round is running, a gateway
+            // reservation is a leftover of a finished round of our own (only
+            // our outbound attempts reserve a gateway), so it is cleared rather
+            // than left to gate this path for the reservation TTL. The round's
+            // CONNECTs run in a spawned task: awaited here they held the whole
+            // maintenance loop for a transaction TTL.
             if current_conn_count == 0 && !op_manager.configured_gateways.is_empty() {
-                let eligible: Vec<_> = {
-                    let backoff = op_manager.gateway_backoff.lock();
-                    self.is_not_connected(op_manager.configured_gateways.iter())
-                        .filter(|gw| {
-                            gw.socket_addr()
-                                .map(|addr| !backoff.is_in_backoff(addr))
-                                .unwrap_or(false) // skip gateways without addresses
-                        })
-                        .cloned()
-                        .collect()
-                };
+                if let Some(mut round) =
+                    crate::operations::connect::bootstrap::BootstrapRoundGuard::try_begin(
+                        &op_manager.bootstrap_pacer,
+                        tokio::time::Instant::now(),
+                    )
+                {
+                    let gateway_addrs: Vec<_> = op_manager
+                        .configured_gateways
+                        .iter()
+                        .filter_map(|gw| gw.socket_addr())
+                        .collect();
+                    self.connection_manager
+                        .clear_pending_reservations_for(&gateway_addrs);
+                    let eligible: Vec<_> = {
+                        let backoff = op_manager.gateway_backoff.lock();
+                        self.is_not_connected(op_manager.configured_gateways.iter())
+                            .filter(|gw| {
+                                gw.socket_addr()
+                                    .map(|addr| !backoff.is_in_backoff(addr))
+                                    .unwrap_or(false) // skip gateways without addresses
+                            })
+                            .take(BASE_CONCURRENT_CONNECTIONS)
+                            .cloned()
+                            .collect()
+                    };
 
-                if eligible.is_empty() {
-                    tracing::debug!(
-                        total_gateways = op_manager.configured_gateways.len(),
-                        "Zero connections — all gateways connected/pending or in backoff"
-                    );
-                } else {
-                    let attempt_count = eligible.len().min(BASE_CONCURRENT_CONNECTIONS);
-                    tracing::info!(
-                        eligible = eligible.len(),
-                        attempting = attempt_count,
-                        "Zero connections — attempting gateway bootstrap"
-                    );
-                    for gw in eligible.iter().take(BASE_CONCURRENT_CONNECTIONS) {
-                        match crate::operations::connect::join_ring_request(gw, &op_manager, None)
-                            .await
-                        {
-                            Ok(()) => tracing::debug!(gateway = %gw, "Gateway bootstrap initiated"),
-                            Err(e) => {
-                                tracing::warn!(gateway = %gw, error = %e, "Gateway bootstrap failed")
-                            }
-                        }
+                    if eligible.is_empty() {
+                        tracing::debug!(
+                            total_gateways = op_manager.configured_gateways.len(),
+                            "Zero connections — all gateways connected or in backoff"
+                        );
+                    } else {
+                        tracing::info!(
+                            attempting = eligible.len(),
+                            "Zero connections — attempting gateway bootstrap"
+                        );
+                        round.issued = true;
+                        let op_manager = op_manager.clone();
+                        GlobalExecutor::spawn(async move {
+                            use futures::StreamExt;
+                            // Move the whole guard in: a disjoint capture of
+                            // `round.connected` alone would end the round as
+                            // soon as this maintenance iteration finished.
+                            let mut round = round;
+                            let op_manager = &op_manager;
+                            let joins: futures::stream::FuturesUnordered<_> = eligible
+                                .iter()
+                                .map(|gw| async move {
+                                    (
+                                        crate::operations::connect::join_ring_request(
+                                            gw, op_manager, None,
+                                        )
+                                        .await,
+                                        gw,
+                                    )
+                                })
+                                .collect();
+                            joins
+                                .for_each(|(res, gw)| async move {
+                                    match res {
+                                        Ok(()) => tracing::debug!(
+                                            gateway = %gw,
+                                            "Gateway bootstrap initiated"
+                                        ),
+                                        Err(e) => tracing::warn!(
+                                            gateway = %gw,
+                                            error = %e,
+                                            "Gateway bootstrap failed"
+                                        ),
+                                    }
+                                })
+                                .await;
+                            round.connected = op_manager.ring.open_connections() > 0;
+                        });
                     }
                 }
             }

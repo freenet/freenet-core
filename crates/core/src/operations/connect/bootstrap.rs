@@ -197,6 +197,7 @@ impl BootstrapPacer {
     }
 
     /// Whether a round is running.
+    #[cfg(test)]
     pub(crate) fn round_in_flight(&self) -> bool {
         self.round_in_flight
     }
@@ -209,8 +210,13 @@ impl BootstrapPacer {
         true
     }
 
-    fn end(&mut self, now: Instant, connected: bool) {
+    fn end(&mut self, now: Instant, issued: bool, connected: bool) {
         self.round_in_flight = false;
+        if !issued {
+            // Nothing was sent (e.g. every gateway in backoff): not a failed
+            // round, so it does not grow the backoff.
+            return;
+        }
         if connected {
             self.failures = 0;
             self.next_allowed = None;
@@ -223,11 +229,13 @@ impl BootstrapPacer {
     }
 }
 
-/// A running bootstrap round. Ends the round when dropped; set `connected`
-/// before that if the round produced a ring connection.
+/// A running bootstrap round. Ends the round when dropped. Set `issued` once
+/// the round sends a CONNECT, and `connected` if it produced a ring
+/// connection; a round that sent nothing leaves the backoff unchanged.
 #[derive(Debug)]
 pub(crate) struct BootstrapRoundGuard {
     pacer: Arc<Mutex<BootstrapPacer>>,
+    pub(crate) issued: bool,
     pub(crate) connected: bool,
 }
 
@@ -236,6 +244,7 @@ impl BootstrapRoundGuard {
     pub(crate) fn try_begin(pacer: &Arc<Mutex<BootstrapPacer>>, now: Instant) -> Option<Self> {
         pacer.lock().try_begin(now).then(|| Self {
             pacer: pacer.clone(),
+            issued: false,
             connected: false,
         })
     }
@@ -243,7 +252,41 @@ impl BootstrapRoundGuard {
 
 impl Drop for BootstrapRoundGuard {
     fn drop(&mut self) {
-        self.pacer.lock().end(Instant::now(), self.connected);
+        self.pacer
+            .lock()
+            .end(Instant::now(), self.issued, self.connected);
+    }
+}
+
+/// How often a path waiting for a bootstrap round re-checks while the other
+/// path's round is running.
+const ROUND_IN_FLIGHT_POLL: Duration = Duration::from_secs(1);
+
+/// Waits until this peer may start a bootstrap round and starts it. Returns
+/// `None` if `has_connection` turns true first. The wait is interruptible by
+/// `cleared` (the gateway-backoff reset signal).
+pub(crate) async fn wait_for_bootstrap_round(
+    pacer: &Arc<Mutex<BootstrapPacer>>,
+    cleared: &tokio::sync::Notify,
+    has_connection: impl Fn() -> bool,
+) -> Option<BootstrapRoundGuard> {
+    loop {
+        if has_connection() {
+            return None;
+        }
+        let now = Instant::now();
+        if let Some(round) = BootstrapRoundGuard::try_begin(pacer, now) {
+            return Some(round);
+        }
+        // Either the backoff is running, or the other path's round is.
+        let wake = pacer
+            .lock()
+            .wait_until(now)
+            .unwrap_or(now + ROUND_IN_FLIGHT_POLL);
+        crate::deterministic_select! {
+            _ = tokio::time::sleep_until(wake) => {},
+            _ = cleared.notified() => {},
+        }
     }
 }
 
@@ -367,7 +410,7 @@ mod tests {
         let mut expected = BOOTSTRAP_RETRY_BASE;
         for _ in 0..8 {
             assert!(pacer.try_begin(now));
-            pacer.end(now, false);
+            pacer.end(now, true, false);
             let wait = pacer
                 .wait_until(now)
                 .expect("a failed round must back off")
@@ -390,14 +433,30 @@ mod tests {
     }
 
     #[test]
+    fn pacer_round_that_sent_nothing_does_not_back_off() {
+        let pacer = Arc::new(Mutex::new(BootstrapPacer::new(Duration::from_secs(30))));
+        let now = Instant::now();
+        drop(BootstrapRoundGuard::try_begin(&pacer, now).expect("round"));
+        assert_eq!(pacer.lock().wait_until(now), None);
+        assert_eq!(pacer.lock().failures, 0);
+        let mut issued = BootstrapRoundGuard::try_begin(&pacer, now).expect("round");
+        issued.issued = true;
+        drop(issued);
+        assert!(
+            pacer.lock().wait_until(now).is_some(),
+            "a failed round backs off"
+        );
+    }
+
+    #[test]
     fn pacer_resets_after_a_connected_round() {
         let mut pacer = BootstrapPacer::new(Duration::from_secs(30));
         let now = Instant::now();
         assert!(pacer.try_begin(now));
-        pacer.end(now, false);
+        pacer.end(now, true, false);
         pacer.next_allowed = None;
         assert!(pacer.try_begin(now));
-        pacer.end(now, true);
+        pacer.end(now, true, true);
         assert_eq!(pacer.wait_until(now), None);
         assert_eq!(pacer.failures, 0);
     }
