@@ -8371,7 +8371,8 @@ mod tests {
     /// the rest of the file. Either can only remove text, which turns a
     /// presence check red. An exactly-once count could in principle be satisfied
     /// if a second, wrong occurrence were hidden behind a `"//"` or `"/*"` in
-    /// a string literal; no such literal exists in `ring.rs` today. Do not use
+    /// a string literal; `ring.rs` has `"//"` literals only in its test code,
+    /// where no needle sits. Do not use
     /// this for an ABSENCE check, which removed text would satisfy.
     fn strip_comments_and_whitespace(src: &str) -> String {
         let no_line: String = src
