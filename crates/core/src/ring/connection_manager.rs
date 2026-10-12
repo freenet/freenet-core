@@ -1865,10 +1865,18 @@ impl ConnectionManager {
         now: Instant,
     ) -> Option<PeerKeyLocation> {
         let candidates = self.provisional_links.lock().ages(now);
+        let rule = super::admission::probation_rule();
+        let min_age = if rule == super::admission::ProbationRule::WholeProbation {
+            ONBOARDING_PROBATION
+        } else {
+            super::admission::ONBOARDING_MIN_AGE_BEFORE_PRUNE
+        };
         candidates.into_iter().find_map(|(addr, age)| {
-            if recommended.socket_addr() == Some(addr)
-                || age < super::admission::ONBOARDING_MIN_AGE_BEFORE_PRUNE
-                || !self.is_in_ring(addr)
+            if recommended.socket_addr() == Some(addr) || age < min_age || !self.is_in_ring(addr) {
+                return None;
+            }
+            if rule == super::admission::ProbationRule::ProtectIsolated
+                && self.provisional_links.lock().is_high_priority(addr)
             {
                 return None;
             }
@@ -2229,7 +2237,7 @@ impl ConnectionManager {
     }
 
     /// Whether `addr` holds an onboarding slot (a link on probation, #5858).
-    #[cfg(test)]
+    #[cfg(any(test, feature = "testing"))]
     pub(crate) fn is_provisional(&self, addr: SocketAddr) -> bool {
         self.provisional_links.lock().contains(addr)
     }

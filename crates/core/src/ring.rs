@@ -6405,7 +6405,14 @@ impl Ring {
                 let queued = match notifier.notifications_sender.try_send(Either::Right(
                     crate::message::NodeEvent::DropConnection(drop.addr),
                 )) {
-                    Ok(()) => true,
+                    Ok(()) => {
+                        join_timeline::record_link_drop(
+                            &self.connection_manager.pub_key,
+                            drop.addr,
+                            "probation_drop",
+                        );
+                        true
+                    }
                     Err(e) => {
                         tracing::warn!(
                             peer = %drop.addr,
@@ -6449,6 +6456,11 @@ impl Ring {
                     tracing::warn!(
                         peer = %addr,
                         "Evicting unhealthy peer (sustained routing failures)"
+                    );
+                    join_timeline::record_link_drop(
+                        &self.connection_manager.pub_key,
+                        addr,
+                        "unhealthy",
                     );
                     if let Err(e) = notifier
                         .notifications_sender
@@ -6863,6 +6875,7 @@ impl Ring {
                     }
                 }
                 TopologyAdjustment::RemoveConnections(mut should_disconnect_peers) => {
+                    let mut substituted = None;
                     // A link still on probation is shed first (#5858).
                     if let Some(first) = should_disconnect_peers.first() {
                         if let Some(substitute) = self
@@ -6874,11 +6887,21 @@ impl Ring {
                                 substitute = %substitute,
                                 "Topology prune: shedding a link on probation instead"
                             );
+                            substituted = substitute.socket_addr();
                             substitute_first_victim(&mut should_disconnect_peers, substitute);
                         }
                     }
                     for peer in should_disconnect_peers {
                         if let Some(addr) = peer.socket_addr() {
+                            join_timeline::record_link_drop(
+                                &self.connection_manager.pub_key,
+                                addr,
+                                if substituted == Some(addr) {
+                                    "remove_probation_substitute"
+                                } else {
+                                    "remove"
+                                },
+                            );
                             notifier
                                 .notifications_sender
                                 .send(Either::Right(crate::message::NodeEvent::DropConnection(
@@ -6900,9 +6923,14 @@ impl Ring {
                     add_location,
                 } => {
                     // A link still on probation is shed first (#5858).
-                    if let Some(substitute) = self
-                        .connection_manager
-                        .probation_prune_substitute(&remove, tick_now)
+                    let swap_substitutes =
+                        admission::probation_rule() != admission::ProbationRule::CapacityOnly;
+                    if let Some(substitute) = swap_substitutes
+                        .then(|| {
+                            self.connection_manager
+                                .probation_prune_substitute(&remove, tick_now)
+                        })
+                        .flatten()
                     {
                         tracing::info!(
                             recommended = %remove,
@@ -6966,6 +6994,15 @@ impl Ring {
                             peer = %addr,
                             connections = fresh_count,
                             "Executing deferred swap drop (replacement connected)"
+                        );
+                        join_timeline::record_link_drop(
+                            &self.connection_manager.pub_key,
+                            addr,
+                            if self.connection_manager.is_provisional(addr) {
+                                "swap_probation"
+                            } else {
+                                "swap"
+                            },
                         );
                         notifier
                             .notifications_sender

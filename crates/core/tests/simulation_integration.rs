@@ -20349,6 +20349,9 @@ struct SaturatedJoinReport {
     /// CONNECT admission counters (#5858) summed over every peer, gateways
     /// included.
     admission_totals: freenet::dev_tool::AdmissionCounts,
+    /// Link removals decided by maintenance loops, and each node's address.
+    link_drops: Vec<freenet::dev_tool::LinkDrop>,
+    addrs: HashMap<String, SocketAddr>,
 }
 
 /// The `p`-quantile of `samples`, treating `None` (never happened) as larger
@@ -20640,8 +20643,14 @@ fn run_saturated_join(cfg: &SaturatedJoinConfig) -> SaturatedJoinReport {
         let recorder = sim.join_timeline_handle();
         let keys = sim.node_public_keys();
         let logs = sim.event_logs_handle();
-        (sim, logs, recorder, keys)
+        let addrs: HashMap<String, SocketAddr> = sim
+            .all_node_addresses()
+            .iter()
+            .map(|(label, addr)| (label.to_string(), *addr))
+            .collect();
+        (sim, logs, recorder, (keys, addrs))
     });
+    let (keys, addrs) = keys;
     drop(rt);
 
     let event_phase = cfg.total().saturating_sub(RUNNER_FIXED);
@@ -20761,6 +20770,8 @@ fn run_saturated_join(cfg: &SaturatedJoinConfig) -> SaturatedJoinReport {
         logs: logs_handle,
         wall_clock: wall.elapsed(),
         admission_totals,
+        link_drops: recorder.drops(),
+        addrs,
     };
     report.log();
     report
@@ -20913,8 +20924,51 @@ fn test_saturated_join_needy_ab() {
     // The direct runner drives every node on this thread, so a thread-local
     // override reaches all of them.
     freenet::dev_tool::set_requester_bar_enforced((arm == "needbar").then_some(true));
+    let rule = match std::env::var("SJ_RULE").as_deref() {
+        Ok("a") => freenet::dev_tool::ProbationRule::CapacityOnly,
+        Ok("b") => freenet::dev_tool::ProbationRule::ProtectIsolated,
+        Ok("c") => freenet::dev_tool::ProbationRule::WholeProbation,
+        _ => freenet::dev_tool::ProbationRule::Current,
+    };
+    freenet::dev_tool::set_probation_rule(rule);
     let report = run_saturated_join(&cfg);
     freenet::dev_tool::set_requester_bar_enforced(None);
+    freenet::dev_tool::set_probation_rule(freenet::dev_tool::ProbationRule::Current);
+
+    // Where the joiners' links went: drops other peers decided against each
+    // joiner, by cause, for joiners that reached min and those that did not.
+    let mut drops_short: BTreeMap<&str, usize> = BTreeMap::new();
+    let mut drops_reached: BTreeMap<&str, usize> = BTreeMap::new();
+    let mut lost_short = 0usize;
+    let mut lost_reached = 0usize;
+    for (j, outcome) in report.joiners.iter().enumerate() {
+        let Some(addr) = report.addrs.get(&outcome.label) else {
+            continue;
+        };
+        let t = &report.timelines[cfg.established + j].1;
+        let (bucket, lost) = if outcome.to_min.is_some() {
+            (&mut drops_reached, &mut lost_reached)
+        } else {
+            (&mut drops_short, &mut lost_short)
+        };
+        *lost += outcome.links_dropped;
+        for d in report.link_drops.iter().filter(|d| d.peer == *addr) {
+            let since = d.at.saturating_sub(t.first_connect_at.unwrap_or_default());
+            let when = if since < Duration::from_secs(120) {
+                "<120s"
+            } else if since < Duration::from_secs(240) {
+                "120-240s"
+            } else {
+                ">240s"
+            };
+            let key: &'static str = Box::leak(format!("{}@{when}", d.cause).into_boxed_str());
+            *bucket.entry(key).or_insert(0) += 1;
+        }
+    }
+    eprintln!(
+        "DROPS|arm={arm}|rule={rule:?}|seed={seed:#x}|unreach={:.0}%|short_joiners_lost={lost_short}|short_attributed={drops_short:?}|reached_joiners_lost={lost_reached}|reached_attributed={drops_reached:?}",
+        cfg.unreachable_pair_fraction * 100.0
+    );
 
     let first = report.to_first_ring();
     let reached_min = report.to_min().iter().filter(|m| m.is_some()).count();
@@ -20931,7 +20985,7 @@ fn test_saturated_join_needy_ab() {
     };
     let a = report.admission_totals;
     eprintln!(
-        "AB|arm={arm}|seed={seed:#x}|unreach={:.0}%|burst={burst}|first_p50={}|first_p95={}|\
+        "AB|arm={arm}|rule={rule:?}|seed={seed:#x}|unreach={:.0}%|burst={burst}|first_p50={}|first_p95={}|\
          first_max={}|never={}/{}|reached_min={}/{}|hops_per_node_s={:.3}|\
          est_deg_end_p10/50/90/max={}/{}/{}/{}|est_deg_join_p50={}|\
          onb_admitted={}|onb_established={}|graduated={}|dropped={}|pruned={}|\

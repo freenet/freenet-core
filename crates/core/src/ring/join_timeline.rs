@@ -14,6 +14,7 @@
 //! production nodes, which have no current network name) record nothing.
 
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
@@ -121,15 +122,32 @@ impl JoinTimeline {
     }
 }
 
+/// One link removal a maintenance loop decided (#5858 investigation).
+#[derive(Debug, Clone)]
+pub struct LinkDrop {
+    pub at: Duration,
+    /// The peer that decided the drop.
+    pub by: TransportPublicKey,
+    /// The address of the peer whose link was dropped.
+    pub peer: SocketAddr,
+    pub cause: &'static str,
+}
+
 /// Shared recorder for one simulated network. Tests keep an `Arc` to it and
 /// read it after the run; `SimNetwork::Drop` only unregisters it.
 #[derive(Debug, Default)]
 pub struct JoinTimelineRecorder {
     origin: Mutex<Option<Instant>>,
     peers: Mutex<HashMap<TransportPublicKey, JoinTimeline>>,
+    drops: Mutex<Vec<LinkDrop>>,
 }
 
 impl JoinTimelineRecorder {
+    /// Every link removal recorded so far.
+    pub fn drops(&self) -> Vec<LinkDrop> {
+        self.drops.lock().clone()
+    }
+
     /// Copy of every peer's timeline recorded so far.
     pub fn snapshot(&self) -> HashMap<TransportPublicKey, JoinTimeline> {
         self.peers.lock().clone()
@@ -194,6 +212,20 @@ pub fn record_connect_initiated(peer: &TransportPublicKey) {
             t.connects_initiated += 1;
             t.connect_times.push(now);
         });
+    }
+}
+
+/// Record that `by` decided to drop its link to `peer`, and why.
+pub(crate) fn record_link_drop(by: &TransportPublicKey, peer: SocketAddr, cause: &'static str) {
+    if let Some(recorder) = current_recorder() {
+        if let Some(at) = recorder.elapsed() {
+            recorder.drops.lock().push(LinkDrop {
+                at,
+                by: by.clone(),
+                peer,
+                cause,
+            });
+        }
     }
 }
 

@@ -195,7 +195,8 @@ pub mod dev_tool {
 
     // Per-peer join timeline recorded by the direct runner (#5858).
     pub use ring::admission::set_requester_bar_enforced;
-    pub use ring::join_timeline::{AdmissionCounts, JoinTimeline, JoinTimelineRecorder};
+    pub use ring::admission::{ProbationRule, set_probation_rule};
+    pub use ring::join_timeline::{AdmissionCounts, JoinTimeline, JoinTimelineRecorder, LinkDrop};
 
     // Re-export topology registry for subscription validation in tests
     pub use ring::topology_registry::{

@@ -164,6 +164,44 @@ pub(crate) fn requester_bar_enforced() -> bool {
     ENFORCE_REQUESTER_BAR
 }
 
+/// Experimental probation-substitution rules (#5858 investigation, local).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ProbationRule {
+    /// As reviewed: any prune or swap may substitute an aged link.
+    #[default]
+    Current,
+    /// (a) Only capacity-driven removals substitute, never optional swaps.
+    CapacityOnly,
+    /// (b) A link admitted for a high-priority (nearly isolated) requester is
+    /// never substituted during probation.
+    ProtectIsolated,
+    /// (c) The minimum age before substitution is the whole probation.
+    WholeProbation,
+}
+
+#[cfg(any(test, feature = "testing"))]
+thread_local! {
+    static PROBATION_RULE: std::cell::Cell<ProbationRule> =
+        const { std::cell::Cell::new(ProbationRule::Current) };
+}
+
+/// Select the probation-substitution rule on this thread (local experiment).
+#[cfg(any(test, feature = "testing"))]
+pub fn set_probation_rule(rule: ProbationRule) {
+    PROBATION_RULE.with(|c| c.set(rule));
+}
+
+pub(crate) fn probation_rule() -> ProbationRule {
+    #[cfg(any(test, feature = "testing"))]
+    {
+        PROBATION_RULE.with(|c| c.get())
+    }
+    #[cfg(not(any(test, feature = "testing")))]
+    {
+        ProbationRule::Current
+    }
+}
+
 /// Ring distance used as the bar when the requester holds no connection on the
 /// target's side: half the ring is the largest possible distance, so every
 /// acceptor meets it.
@@ -521,6 +559,7 @@ impl SlotRefusal {
 struct Slot {
     admitted_at: Instant,
     location: Location,
+    high_priority: bool,
 }
 
 /// The acceptor's onboarding slots: need-admitted links on probation, keyed by
@@ -558,6 +597,7 @@ pub(crate) struct ProbationDrop {
     pub addr: SocketAddr,
     location: Location,
     admitted_at: Instant,
+    high_priority: bool,
 }
 
 impl ProvisionalLinks {
@@ -595,6 +635,7 @@ impl ProvisionalLinks {
             addr,
             location: slot.location,
             admitted_at: slot.admitted_at,
+            high_priority: slot.high_priority,
         })
     }
 
@@ -607,6 +648,7 @@ impl ProvisionalLinks {
             Slot {
                 admitted_at: drop.admitted_at,
                 location: drop.location,
+                high_priority: drop.high_priority,
             },
         );
     }
@@ -651,6 +693,7 @@ impl ProvisionalLinks {
             Slot {
                 admitted_at: now,
                 location,
+                high_priority,
             },
         );
         Ok(())
@@ -675,6 +718,11 @@ impl ProvisionalLinks {
 
     pub(crate) fn len(&self) -> usize {
         self.slots.len()
+    }
+
+    /// Whether `addr`'s slot was taken by a high-priority requester.
+    pub(crate) fn is_high_priority(&self, addr: SocketAddr) -> bool {
+        self.slots.get(&addr).is_some_and(|s| s.high_priority)
     }
 
     /// Every slot with its age at `now`, oldest admission first.
