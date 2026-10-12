@@ -110,6 +110,7 @@ pub(crate) use broken_invariants::{BrokenInvariant, BrokenInvariantsTracker};
 /// executor chokepoints so a write that would overflow the aggregate disk
 /// budget is refused before any bytes land.
 pub(crate) use hosting::DiskBudgetExceeded;
+pub(crate) use hosting::EvictedInUseTeardown;
 /// Hosting-BEGIN attribution: WHY this peer started hosting a contract. Every
 /// production caller of [`Ring::host_contract`] names one.
 pub(crate) use hosting::HostingCause;
@@ -3610,11 +3611,7 @@ impl Ring {
             // retraction), mirroring the GET/PUT host-formation paths.
             if let Some(op_manager) = &op_manager {
                 for teardown in &evicted_in_use_teardown {
-                    op_manager.interest_manager.remove_evicted_in_use(
-                        &teardown.key,
-                        &teardown.downstream_peers,
-                        teardown.local_client_count,
-                    );
+                    crate::operations::sync_interest_for_evicted_in_use(op_manager, teardown);
                 }
             }
 
@@ -4636,10 +4633,11 @@ impl Ring {
             .await
     }
 
-    /// Whether at least one LOCAL WebSocket client is currently subscribed to
-    /// `contract` (real local demand, distinct from downstream peer
-    /// subscribers). Used by the reconcile input-builder (keystone step-2,
-    /// #4642) for `ReconcileInputs::has_local_client`.
+    /// Whether at least one LOCAL client (a WebSocket client or a delegate on
+    /// this node, #4669) is currently subscribed to `contract` (real local
+    /// demand, distinct from downstream peer subscribers). Used by the
+    /// reconcile input-builder (keystone step-2, #4642) for
+    /// `ReconcileInputs::has_local_client`.
     pub(crate) fn has_client_subscriptions(&self, contract: &ContractKey) -> bool {
         self.hosting_manager.has_client_subscriptions(contract.id())
     }
@@ -4995,6 +4993,20 @@ impl Ring {
         // need to gate on `is_new_for_client` for scoring purposes.
         self.hosting_manager
             .add_client_subscription(instance_id, client_id)
+    }
+
+    /// Register a delegate's subscription to `contract` as local demand (#4669).
+    /// See [`hosting::HostingManager::add_delegate_subscription`]; called only
+    /// by `contract::record_delegate_demand`.
+    pub(crate) fn add_delegate_subscription(&self, contract: &ContractKey) {
+        self.hosting_manager.add_delegate_subscription(contract)
+    }
+
+    /// Release one delegate subscription registered by
+    /// [`Self::add_delegate_subscription`]. Called by the delegate interest
+    /// hold's release closure.
+    pub(crate) fn remove_delegate_subscription(&self, contract: &ContractKey) {
+        self.hosting_manager.remove_delegate_subscription(contract)
     }
 
     /// Remove a client from all its subscriptions (used when client disconnects).
@@ -8113,9 +8125,10 @@ mod k_closest_source_tests {
         // Teardown of a still-in-use victim (subscribed contract shed as a last
         // resort) must sync the InterestManager, matching GET/PUT.
         assert!(
-            body.contains("remove_evicted_in_use"),
-            "sweep must call remove_evicted_in_use to sync the InterestManager for \
-             a subscribed contract it sheds (mirrors GET/PUT)."
+            body.contains("sync_interest_for_evicted_in_use"),
+            "sweep must call operations::sync_interest_for_evicted_in_use to sync \
+             the InterestManager and release delegate demand for a subscribed \
+             contract it sheds (mirrors GET/PUT)."
         );
         // Every evicted contract must clear its local hosting flag …
         assert!(
@@ -8137,14 +8150,14 @@ mod k_closest_source_tests {
         // not the bare identifiers, so a prose mention in a leading comment (e.g.
         // "Run BEFORE the `unregister_local_hosting` loop") can't fool the check.
         let teardown_pos = body
-            .find("interest_manager.remove_evicted_in_use(")
-            .expect("remove_evicted_in_use call present");
+            .find("operations::sync_interest_for_evicted_in_use(")
+            .expect("sync_interest_for_evicted_in_use call present");
         let unregister_pos = body
             .find("interest_manager.unregister_local_hosting(")
             .expect("unregister_local_hosting call present");
         assert!(
             teardown_pos < unregister_pos,
-            "remove_evicted_in_use must precede unregister_local_hosting in the sweep \
+            "sync_interest_for_evicted_in_use must precede unregister_local_hosting in the sweep \
              so interest loss is reported against the already-zeroed subscriber counts."
         );
     }

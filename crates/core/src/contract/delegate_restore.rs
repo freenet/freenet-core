@@ -14,8 +14,11 @@
 //!
 //! Both come from `run_executor_subscribe`, the same entry point the live
 //! network path uses (`contract::run_contract_op_off_loop`), which also covers
-//! the local-hit case. Nothing here registers demand a live subscribe would
-//! not: no synthetic client, no extra pin, nothing on `contract_in_use`.
+//! the local-hit case. The hold is recorded through
+//! `contract::record_delegate_demand`, the same function the live paths use,
+//! so a restored subscription also counts as local demand (`contract_in_use`,
+//! the eviction ranking's local tier, #4669) exactly as a live one does.
+//! Nothing here registers demand a live subscribe would not.
 //!
 //! # Pacing, and why there is no thundering herd
 //!
@@ -281,17 +284,10 @@ fn finish_attempt<E: std::fmt::Display>(
             // key releases exactly the entry the subscribe created. Same
             // device as the live network path's fallback key.
             let key = ContractKey::from_id_and_code(contract, CodeHash::new([0u8; 32]));
-            if !delegate_interest::record(
-                contract,
-                delegate.clone(),
-                key,
-                super::delegate_interest_release_closure(op_manager),
-                op_manager.node_identity,
-            ) {
-                // A live re-subscribe recorded this node's obligation while we
-                // were subscribing; ours is the extra refcount.
-                op_manager.interest_manager.remove_local_client(&key);
-            }
+            // `false` = a live re-subscribe recorded this node's obligation
+            // while we were subscribing; ours was the extra refcount, and
+            // `record_delegate_demand` has given it back.
+            super::record_delegate_demand(op_manager, contract, delegate, key);
             // Removed while we were subscribing? Its release ran before our
             // record, so discharge ours now. `release_pair` removes the entry
             // atomically, so if the removal's release ran after our record it
@@ -489,12 +485,8 @@ mod tests {
         );
         // The live path took its refcount and recorded it.
         op.interest_manager.add_local_client(&key);
-        assert!(delegate_interest::record(
-            contract,
-            delegate.clone(),
-            key,
-            crate::contract::delegate_interest_release_closure(&op),
-            op.node_identity,
+        assert!(crate::contract::record_delegate_demand(
+            &op, contract, &delegate, key
         ));
         assert_eq!(
             reestablish_one(&op, contract, &delegate).await,
@@ -529,11 +521,19 @@ mod tests {
             &delegate,
             op.node_identity
         ));
+        assert!(
+            op.ring.contract_in_use(&key),
+            "a restored subscription is local demand exactly like a live one (#4669)"
+        );
         // UnregisterDelegate's release path.
         delegate_interest::release_delegate(&delegate);
         assert!(
             !op.interest_manager.has_local_interest(&key),
             "the restored refcount must be released by the ordinary removal path"
+        );
+        assert!(
+            !op.ring.contract_in_use(&key),
+            "the ordinary removal path must release the restored local demand too"
         );
         cleanup(&contract, &delegate);
     }
@@ -550,18 +550,24 @@ mod tests {
             delegate_subscriptions::Durability::InMemoryOnly,
         );
         op.interest_manager.add_local_client(&key); // live path's
-        delegate_interest::record(
-            contract,
-            delegate.clone(),
-            key,
-            crate::contract::delegate_interest_release_closure(&op),
-            op.node_identity,
-        );
+        assert!(crate::contract::record_delegate_demand(
+            &op, contract, &delegate, key
+        ));
         op.interest_manager.add_local_client(&key); // restore's
         assert_eq!(
             finish_attempt::<String>(&op, contract, &delegate, Ok(())),
             Attempt::Established
         );
+        // One hold, so ONE release must clear the local demand too: a restore
+        // that kept its own hosting increment would leave the contract in use
+        // after the only hold is gone.
+        delegate_interest::release_pair(&contract, &delegate);
+        assert!(
+            !op.ring.contract_in_use(&key),
+            "the losing restore must give back its local demand, not only its \
+             interest refcount (#4669)"
+        );
+        op.interest_manager.add_local_client(&key); // re-take for the drain below
         assert_eq!(
             drain_local_clients(&op, &key),
             1,

@@ -928,8 +928,59 @@ pub(crate) fn delegate_interest_release_closure(
     std::sync::Arc::new(move |key: &ContractKey| {
         if let Some(op_manager) = weak.upgrade() {
             op_manager.interest_manager.remove_local_client(key);
+            // The hosting half of the same demand (#4669): see
+            // `record_delegate_demand`, which registered it with the hold.
+            op_manager.ring.remove_delegate_subscription(key);
         }
     })
+}
+
+/// Record the obligation a delegate subscribe incurred, and register the
+/// subscription as LOCAL demand exactly as a WebSocket client subscription is
+/// registered (#4669).
+///
+/// The caller has already taken one `InterestManager::add_local_client`
+/// refcount for the pair. This adds the hosting half
+/// (`Ring::add_delegate_subscription`), which is what `contract_in_use`, the
+/// eviction ranking's local tier, renewal and governance benefit read, and
+/// records the hold whose release gives back both halves. Ian, 2026-10-11:
+/// "delegates act on the user's behalf therefore a contract subscription by a
+/// delegate should be treated the same as any other client".
+///
+/// One function for every site that takes the refcount (the network subscribe
+/// path, the local-state path, and the boot-time restore), so the hosting half
+/// cannot be forgotten at one of them: the "manually-inlined side effects" row
+/// in `.claude/rules/bug-prevention-patterns.md`.
+///
+/// ORDER: the hosting count is incremented BEFORE the hold is recorded and
+/// undone if the record is refused. The count is arithmetic, so it only has to
+/// see one increment per recorded hold and one decrement per release; adding
+/// first means no release can run against this hold before its increment.
+///
+/// Returns `false` if this node already held the pair's obligation (a boot-time
+/// restore and a live subscribe raced, #5493). Both halves of THIS subscribe's
+/// demand are then given back, since the existing hold already accounts for
+/// the pair.
+pub(crate) fn record_delegate_demand(
+    op_manager: &std::sync::Arc<crate::node::OpManager>,
+    contract_id: freenet_stdlib::prelude::ContractInstanceId,
+    delegate_key: &DelegateKey,
+    key: ContractKey,
+) -> bool {
+    op_manager.ring.add_delegate_subscription(&key);
+    if crate::wasm_runtime::delegate_interest::record(
+        contract_id,
+        delegate_key.clone(),
+        key,
+        delegate_interest_release_closure(op_manager),
+        op_manager.node_identity,
+    ) {
+        true
+    } else {
+        op_manager.ring.remove_delegate_subscription(&key);
+        op_manager.interest_manager.remove_local_client(&key);
+        false
+    }
 }
 
 /// The egress ban gate, applied to delegate-originated network operations
@@ -1131,22 +1182,11 @@ where
                             freenet_stdlib::prelude::CodeHash::new([0u8; 32]),
                         )
                     });
-                // WEAK, so an outstanding hold never keeps a shut-down node's
-                // `OpManager` alive. A hold that cannot upgrade has nothing
-                // left to release.
-                if !crate::wasm_runtime::delegate_interest::record(
-                    pending.contract_id,
-                    delegate_key.clone(),
-                    key,
-                    delegate_interest_release_closure(&op_manager),
-                    op_manager.node_identity,
-                ) {
-                    // This node already held the pair's obligation (the
-                    // boot-time restore recorded it while this subscribe was
-                    // in flight, #5493), so the refcount this subscribe took
-                    // is unaccounted for. Give it back rather than leak it.
-                    op_manager.interest_manager.remove_local_client(&key);
-                }
+                // A `false` means this node already held the pair's
+                // obligation (the boot-time restore recorded it while this
+                // subscribe was in flight, #5493); `record_delegate_demand`
+                // has then given back the refcount this subscribe took.
+                record_delegate_demand(&op_manager, pending.contract_id, delegate_key, key);
             }
             None => {
                 // No `OpManager` means no `run_executor_subscribe` ran, so no
@@ -2328,18 +2368,16 @@ where
                                         )
                                         .await;
                                     }
-                                    if !crate::wasm_runtime::delegate_interest::record(
+                                    // `false` = already held (boot-time
+                                    // restore won the race across the await
+                                    // above, #5493); the extra refcount has
+                                    // then been returned.
+                                    record_delegate_demand(
+                                        &op_manager,
                                         contract_id,
-                                        delegate_key.clone(),
+                                        delegate_key,
                                         full_key,
-                                        delegate_interest_release_closure(&op_manager),
-                                        op_manager.node_identity,
-                                    ) {
-                                        // Already held (boot-time restore won
-                                        // the race across the await above,
-                                        // #5493): return the extra refcount.
-                                        op_manager.interest_manager.remove_local_client(&full_key);
-                                    }
+                                    );
                                     true
                                 }
                                 // No `OpManager` means no eviction pressure worth
@@ -10977,6 +11015,241 @@ mod hol_4391_tests {
             key.id(),
             crate::wasm_runtime::delegate_subscriptions::Durability::InMemoryOnly,
         );
+    }
+
+    /// #4669. A delegate's subscription is LOCAL DEMAND, exactly like a
+    /// WebSocket client's: once a delegate subscribes to a contract this node
+    /// holds, the contract is `contract_in_use` (so it ranks in the local tier
+    /// of subscriber-primary eviction and the renewal loop keeps its lease),
+    /// and the ordinary removal path gives that demand back.
+    ///
+    /// Drives the real SUBSCRIBE arm, not the helper, because the property is
+    /// that the path a delegate actually takes registers the demand. On `main`
+    /// before #4669 the delegate took an `InterestManager` refcount here but
+    /// `contract_in_use` read only WebSocket clients and downstream peers, so
+    /// the first assertion failed: a contract held only by a delegate was a
+    /// zero-subscriber copy, the first eviction victim.
+    #[tokio::test]
+    async fn a_delegate_subscription_is_local_demand_like_a_client() {
+        use freenet_stdlib::prelude::{ContractCode, Parameters, WrappedContract};
+
+        let _guard = TEST_GUARD.lock().await;
+        let (op_manager, _guards) = build_op_manager("d4669-demand").await;
+        let (send, rcv_halve, _wait) = handler::contract_handler_channel();
+        let mut handler =
+            MockWasmContractHandler::new_test(rcv_halve, Some(op_manager.clone()), "d4669_demand")
+                .await;
+
+        let contract = ContractContainer::Wasm(ContractWasmAPIVersion::V1(WrappedContract::new(
+            Arc::new(ContractCode::from(vec![0x46u8; 32])),
+            Parameters::from(vec![]),
+        )));
+        let key = contract.key();
+
+        let script = handler.runtime_mut().delegate_script.clone();
+        script.lock().unwrap().push_back(
+            vec![OutboundDelegateMsg::SubscribeContractRequest(
+                freenet_stdlib::prelude::SubscribeContractRequest::new(*key.id()),
+            )]
+            .into(),
+        );
+        crate::wasm_runtime::delegate_subscriptions::remove_contract(
+            key.id(),
+            crate::wasm_runtime::delegate_subscriptions::Durability::InMemoryOnly,
+        );
+
+        let handle = GlobalExecutor::spawn(contract_handling(
+            handler,
+            GatedPrompter {
+                gate: Arc::new(tokio::sync::Semaphore::new(0)),
+            },
+        ));
+        let resp = tokio::time::timeout(
+            Duration::from_secs(10),
+            put_local(&send, contract, WrappedState::new(vec![7u8; 8])),
+        )
+        .await
+        .expect("PUT must not hang");
+        assert!(
+            matches!(resp, ContractHandlerEvent::PutResponse { .. }),
+            "expected a PutResponse, got {resp}"
+        );
+        assert!(
+            !op_manager.ring.contract_in_use(&key),
+            "a locally PUT contract with no subscriber must start NOT in use, or \
+             the assertions below prove nothing about the delegate"
+        );
+
+        let dkey = test_delegate_key();
+        let _ = tokio::time::timeout(
+            Duration::from_secs(10),
+            send.send_to_handler(delegate_event(&dkey)),
+        )
+        .await
+        .expect("the round trip must terminate");
+
+        assert!(
+            op_manager.interest_manager.has_local_interest(&key),
+            "the subscribe must have reached the demand-registration branch"
+        );
+        assert!(
+            op_manager.ring.contract_in_use(&key),
+            "a delegate subscription must make the contract `contract_in_use`, \
+             exactly as a WebSocket client subscription does (#4669)"
+        );
+        assert!(
+            op_manager.ring.has_client_subscriptions(&key),
+            "a delegate subscription must count as a LOCAL subscription, so the \
+             contract ranks in the local tier of the eviction order"
+        );
+
+        // The ordinary removal path gives the demand back.
+        crate::wasm_runtime::delegate_interest::release_delegate(&dkey);
+        assert!(
+            !op_manager.ring.contract_in_use(&key),
+            "UnregisterDelegate's release must drop the delegate's local demand, \
+             or the contract stays pinned in the local tier with nothing behind it"
+        );
+        assert!(!op_manager.interest_manager.has_local_interest(&key));
+
+        handle.abort();
+        crate::wasm_runtime::delegate_subscriptions::remove_contract(
+            key.id(),
+            crate::wasm_runtime::delegate_subscriptions::Durability::InMemoryOnly,
+        );
+    }
+
+    /// #4669. Every way a delegate subscription ends must drop its local
+    /// demand, because every one of them discharges the hold that
+    /// `record_delegate_demand` recorded: one delegate (`UnregisterDelegate`),
+    /// one contract (contract removal, notification-channel-closed cleanup),
+    /// one pair (the per-delegate cap's eviction), and this node's holds on a
+    /// contract shed by subscriber-primary eviction. A repeat record for a held
+    /// pair must add no demand, so one release still clears it.
+    #[tokio::test]
+    async fn every_delegate_release_path_drops_its_local_demand() {
+        use crate::wasm_runtime::delegate_interest;
+        use freenet_stdlib::prelude::CodeHash;
+
+        let _guard = TEST_GUARD.lock().await;
+        let (op_manager, _guards) = build_op_manager("d4669-release").await;
+        let dkey = DelegateKey::new([0x47; 32], CodeHash::new([0x47; 32]));
+        let other = DelegateKey::new([0x48; 32], CodeHash::new([0x48; 32]));
+        let key = ContractKey::from_id_and_code(
+            freenet_stdlib::prelude::ContractInstanceId::new([0x49; 32]),
+            CodeHash::new([0x49; 32]),
+        );
+        // Each live site takes the `InterestManager` refcount before
+        // recording; mirror that so the release has something to give back.
+        let take = |delegate: &DelegateKey| {
+            op_manager.interest_manager.add_local_client(&key);
+            record_delegate_demand(&op_manager, *key.id(), delegate, key)
+        };
+        let released = |what: &str| {
+            assert!(
+                !op_manager.ring.contract_in_use(&key),
+                "{what} must drop the delegate's local demand"
+            );
+            assert!(
+                !op_manager.interest_manager.has_local_interest(&key),
+                "{what} must give back the interest refcount with it"
+            );
+        };
+
+        assert!(take(&dkey));
+        assert!(op_manager.ring.contract_in_use(&key));
+        delegate_interest::release_delegate(&dkey);
+        released("release_delegate (UnregisterDelegate)");
+
+        assert!(take(&dkey));
+        delegate_interest::release_contract(key.id());
+        released("release_contract (contract removal / channel closed)");
+
+        assert!(take(&dkey));
+        delegate_interest::release_pair(key.id(), &dkey);
+        released("release_pair (per-delegate cap eviction)");
+
+        assert!(take(&dkey));
+        assert!(take(&other));
+        delegate_interest::release_contract_for_node(key.id(), op_manager.node_identity);
+        released("release_contract_for_node (subscriber-primary eviction)");
+
+        // A repeat for a pair this node already holds is refused and returns
+        // both halves of the extra demand, so ONE release still clears it.
+        assert!(take(&dkey));
+        assert!(
+            !take(&dkey),
+            "a second record for a held pair must be refused"
+        );
+        delegate_interest::release_pair(key.id(), &dkey);
+        released("a single release after a refused repeat");
+    }
+
+    /// #4669 + hosting invariant 3: when subscriber-primary eviction sheds a
+    /// contract a delegate holds, the eviction consumer's
+    /// `operations::sync_interest_for_evicted_in_use` must release THIS node's
+    /// delegate holds, so the contract stops being in use and disk
+    /// reclamation can proceed. Without it the contract would be shed from the
+    /// cache yet stay `contract_in_use` with its reclamation re-queued every
+    /// cycle: a pin. Another node's hold on the same pair (the in-process
+    /// multi-node harness) must survive.
+    #[tokio::test]
+    async fn eviction_sync_releases_this_nodes_delegate_demand() {
+        use crate::wasm_runtime::delegate_interest;
+        use freenet_stdlib::prelude::CodeHash;
+
+        let _guard = TEST_GUARD.lock().await;
+        let (op_manager, _guards) = build_op_manager("d4669-evict").await;
+        let dkey = DelegateKey::new([0x4A; 32], CodeHash::new([0x4A; 32]));
+        let key = ContractKey::from_id_and_code(
+            freenet_stdlib::prelude::ContractInstanceId::new([0x4B; 32]),
+            CodeHash::new([0x4B; 32]),
+        );
+        op_manager.interest_manager.add_local_client(&key);
+        assert!(record_delegate_demand(&op_manager, *key.id(), &dkey, key));
+        // Another in-process node holding the same pair.
+        let other_node = op_manager.node_identity.wrapping_add(1_000_000);
+        let other_released = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = other_released.clone();
+        delegate_interest::record(
+            *key.id(),
+            dkey.clone(),
+            key,
+            Arc::new(move |_k: &ContractKey| {
+                flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            }),
+            other_node,
+        );
+        assert!(op_manager.ring.contract_in_use(&key));
+
+        // What `teardown_evicted_in_use_contract` reports for a contract held
+        // only by one delegate on this node.
+        let teardown = crate::ring::EvictedInUseTeardown {
+            key,
+            downstream_peers: Vec::new(),
+            local_client_count: 0,
+            delegate_subscription_count: 1,
+        };
+        crate::operations::sync_interest_for_evicted_in_use(&op_manager, &teardown);
+
+        assert!(
+            !op_manager.ring.contract_in_use(&key),
+            "the eviction consumer must release this node's delegate demand, or \
+             the shed contract stays in use and is never reclaimed"
+        );
+        assert!(!op_manager.interest_manager.has_local_interest(&key));
+        assert!(!delegate_interest::holds(
+            key.id(),
+            &dkey,
+            op_manager.node_identity
+        ));
+        assert!(
+            delegate_interest::holds(key.id(), &dkey, other_node)
+                && !other_released.load(std::sync::atomic::Ordering::SeqCst),
+            "another node's hold on the same pair must not be released by this \
+             node's eviction"
+        );
+        delegate_interest::release_delegate(&dkey);
     }
 
     /// #5542 findings M4 and N2, together, because they are two halves of one

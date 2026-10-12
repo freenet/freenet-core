@@ -293,11 +293,12 @@ pub(crate) enum SubscribeOutcome {
     /// **A caller that took a resource when it registered the subscription MUST
     /// release it for the evicted contract here.** This variant exists so the
     /// registry cannot silently drop a subscription that something else is still
-    /// accounting for, and two in-flight changes make that concrete:
+    /// accounting for, and two changes make that concrete:
     ///
-    ///  * #5493 registers hosting demand alongside the subscription. Demand
-    ///    released nowhere would outlive the subscription that justified it —
-    ///    the durable claim this cap exists to bound.
+    ///  * #4669 registers hosting demand alongside the subscription (through
+    ///    the delegate interest hold, which `release_pair` discharges here).
+    ///    Demand released nowhere would outlive the subscription that
+    ///    justified it — the durable claim this cap exists to bound.
     ///  * #5615 routes the V1 path through `add_local_client`, a **refcount**
     ///    rather than the set-insert this registry used to be. A refcount
     ///    incremented per subscribe and never decremented on eviction leaks, and

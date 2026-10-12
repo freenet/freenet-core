@@ -29,6 +29,12 @@
 //! `cleanup_contract_if_no_interest` never fires: demand nothing can retire, on
 //! the interest path #5467 exists to make trustworthy.
 //!
+//! Since #4669 a hold also carries the HOSTING half of the demand: the hold is
+//! recorded by `contract::record_delegate_demand`, which registers the
+//! subscription as a local subscriber in `HostingManager` (so it counts in
+//! `contract_in_use` and the eviction ranking exactly like a WebSocket
+//! client), and the release closure gives both halves back.
+//!
 //! # Shape, and why it is this one
 //!
 //! Each hold is **self-discharging**: it stores the `ContractKey` to release
@@ -68,8 +74,11 @@ use std::sync::Arc;
 use dashmap::DashMap;
 use freenet_stdlib::prelude::{ContractInstanceId, ContractKey, DelegateKey};
 
-/// Performs the actual `InterestManager::remove_local_client`. Type-erased so
-/// this module needs no `crate::ring` or `crate::node` dependency.
+/// Performs the actual `InterestManager::remove_local_client`, and releases the
+/// hosting-side local demand registered with the hold
+/// (`Ring::remove_delegate_subscription`, #4669); see
+/// `contract::delegate_interest_release_closure`. Type-erased so this module
+/// needs no `crate::ring` or `crate::node` dependency.
 pub type InterestRelease = Arc<dyn Fn(&ContractKey) + Send + Sync>;
 
 struct Hold {
@@ -269,6 +278,41 @@ pub(crate) fn release_contract(contract: &ContractInstanceId) {
     }
 }
 
+/// Release every hold THIS node took for `contract`, across all delegates,
+/// leaving other nodes' holds alone (#4669).
+///
+/// Called when subscriber-primary eviction sheds a contract a delegate on this
+/// node is subscribed to (`operations::sync_interest_for_evicted_in_use`). The
+/// eviction is per-node, so the release must be too: [`release_contract`]
+/// would also discharge holds other in-process nodes took on their own
+/// `InterestManager`s, for a contract they did not evict.
+///
+/// Only the demand is given back here; the subscription-registry entry is not
+/// touched. What happens to it next depends on the reclamation that follows:
+/// normally `ContractStore::remove_contract` reclaims the contract and removes
+/// the in-memory registry entry, so the delegate is silently unsubscribed until
+/// the next boot restores its persisted row. If the contract is re-hosted
+/// before reclamation runs, the entry survives and the delegate keeps being
+/// notified, but with no hold it counts as zero demand until it re-subscribes.
+/// Either way the delegate is not told, the same last-resort outcome a
+/// WebSocket client's subscription has on this path.
+pub(crate) fn release_contract_for_node(contract: &ContractInstanceId, node: NodeIdentity) {
+    let mut discharged = Vec::new();
+    DELEGATE_INTEREST_HOLDS.retain(|(id, _), holds| {
+        if id == contract {
+            if let Some(hold) = holds.remove(&node) {
+                discharged.push((hold.key, hold.release));
+            }
+            !holds.is_empty()
+        } else {
+            true
+        }
+    });
+    for (key, release) in discharged {
+        release(&key);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     //! ISOLATION CONTRACT for anything added here: `DELEGATE_INTEREST_HOLDS` is
@@ -375,6 +419,40 @@ mod tests {
             1,
             "removing the pair must discharge every node's hold under it"
         );
+    }
+
+    /// Subscriber-primary eviction is per node, so its release must be too
+    /// (#4669): `release_contract_for_node` discharges every hold THIS node has
+    /// on the contract, across delegates, and leaves another node's hold on the
+    /// same pair, and this node's holds on other contracts, standing.
+    #[test]
+    fn releasing_a_contract_for_one_node_leaves_other_nodes_holds() {
+        let (release_a, seen_a) = recorder();
+        let (release_b, seen_b) = recorder();
+        let d1 = delegate(230);
+        let d2 = delegate(231);
+        let k = key(232);
+        let elsewhere = key(233);
+        record(*k.id(), d1.clone(), k, release_a.clone(), NODE_A);
+        record(*k.id(), d2.clone(), k, release_a.clone(), NODE_A);
+        record(*elsewhere.id(), d1.clone(), elsewhere, release_a, NODE_A);
+        record(*k.id(), d1.clone(), k, release_b, NODE_B);
+
+        release_contract_for_node(k.id(), NODE_A);
+
+        assert_eq!(
+            *seen_a.lock().unwrap(),
+            vec![k, k],
+            "both of node A's holds on the contract are released, and its hold \
+             on another contract is not"
+        );
+        assert!(seen_b.lock().unwrap().is_empty());
+        assert!(!holds(k.id(), &d1, NODE_A));
+        assert!(!holds(k.id(), &d2, NODE_A));
+        assert!(holds(k.id(), &d1, NODE_B), "node B's hold must survive");
+        assert!(holds(elsewhere.id(), &d1, NODE_A));
+        release_delegate(&d1);
+        release_delegate(&d2);
     }
 
     /// Two NODES in one process, subscribing the same delegate to the same
@@ -537,34 +615,107 @@ mod tests {
                  rather than widening it",
         )];
         assert!(
-            body.contains("delegate_interest::record("),
+            body.contains("record_delegate_demand("),
             "the site that installs the subscription-registry hook after a \
              successful network subscribe is the site that took the \
              `add_local_client` refcount, so it must record the obligation to \
-             release it (#5542)"
+             release it (#5542), through the shared `record_delegate_demand` \
+             so the hosting half of the demand is registered with it (#4669)"
         );
-        assert!(
-            body.contains("delegate_interest_release_closure("),
-            "the recorded obligation must be built by the shared release-closure \
-             constructor; there are two sites that take this refcount now, and a \
-             second hand-written closure is where the next divergence lives"
-        );
-        // ...and that constructor must actually decrement. Following the
-        // extraction rather than dropping the assertion: the property being
-        // pinned is "the obligation discharges to a real decrement", and it is
-        // one function further away, not gone.
+        // The shared constructor records the hold with the shared release
+        // closure AND registers the hosting half of the demand.
+        let helper = contract
+            .split("fn record_delegate_demand(")
+            .nth(1)
+            .expect("record_delegate_demand must exist");
+        let helper = &helper[..helper
+            .find("fn delegate_network_op_banned<CH>(")
+            .expect("record_delegate_demand must be followed by delegate_network_op_banned")];
+        for required in [
+            "delegate_interest::record(",
+            "delegate_interest_release_closure(",
+            "ring.add_delegate_subscription(",
+        ] {
+            assert!(
+                helper.contains(required),
+                "record_delegate_demand must call `{required}`: the hold, its \
+                 shared release closure, and the hosting-side local demand \
+                 (#4669) are registered together or not at all"
+            );
+        }
+        // ...and the release closure must actually give back BOTH halves.
+        // Bounded by the next function's actual name: the helper that follows
+        // it also mentions both calls, so an unbounded window could not tell a
+        // closure that releases nothing from one that releases both.
         let closure = contract
             .split("fn delegate_interest_release_closure(")
             .nth(1)
             .expect("delegate_interest_release_closure must exist");
-        let closure = &closure[..closure
-            .find("\nfn ")
-            .expect("delegate_interest_release_closure must be followed by another fn")];
+        let closure = &closure[..closure.find("fn record_delegate_demand(").expect(
+            "delegate_interest_release_closure must be followed by record_delegate_demand",
+        )];
         assert!(
             closure.contains("remove_local_client"),
             "the release closure must actually call `remove_local_client`; \
              recording an obligation that discharges to nothing is the same leak \
              with more code"
+        );
+        assert!(
+            closure.contains("ring.remove_delegate_subscription("),
+            "the release closure must give back the hosting-side local demand \
+             too (#4669), or every removal path (UnregisterDelegate, contract \
+             removal, channel-closed cleanup, the per-delegate cap) leaves the \
+             contract `contract_in_use` with no subscription behind it"
+        );
+    }
+
+    /// Every site that takes a delegate's `add_local_client` refcount must
+    /// register it through `record_delegate_demand` (#4669), so a delegate
+    /// subscription feeds the SAME local-subscription count a WebSocket
+    /// client's does on every path: live network subscribe, live subscribe to
+    /// a local contract, and the boot-time restore. A site calling
+    /// `delegate_interest::record` directly would take interest but no hosting
+    /// demand, which is the pre-#4669 bug on one path.
+    #[test]
+    fn every_delegate_demand_site_goes_through_record_delegate_demand() {
+        use crate::contract::source_pin_util::strip_comments;
+        let contract = strip_comments(include_str!("../contract.rs"));
+        let restore = strip_comments(include_str!("../contract/delegate_restore.rs"));
+        // Production code only: the test modules record holds directly. Cut
+        // at each file's own `mod tests`, and fail loudly if that anchor
+        // moves, rather than scraping the whole file or nothing.
+        let prod = |src: &str, anchor: &str| -> String {
+            src[..src
+                .find(anchor)
+                .unwrap_or_else(|| panic!("anchor `{anchor}` must exist"))]
+                .to_string()
+        };
+        let contract = prod(
+            &contract,
+            "#[cfg(test)]\n#[allow(clippy::wildcard_enum_match_arm)]\nmod tests {",
+        );
+        let restore = prod(&restore, "#[cfg(test)]\nmod tests {");
+        assert_eq!(
+            contract.matches("delegate_interest::record(").count(),
+            1,
+            "contract.rs must call `delegate_interest::record` exactly once, \
+             inside `record_delegate_demand`"
+        );
+        assert_eq!(
+            contract.matches("record_delegate_demand(").count(),
+            3,
+            "contract.rs: the definition plus the network path and the local \
+             path must all use `record_delegate_demand`"
+        );
+        assert!(
+            !restore.contains("delegate_interest::record("),
+            "the boot-time restore must not record a hold directly"
+        );
+        assert!(
+            restore.contains("record_delegate_demand("),
+            "the boot-time restore must register its demand through \
+             `record_delegate_demand`, so a restored subscription counts as \
+             local demand exactly like a live one"
         );
     }
 

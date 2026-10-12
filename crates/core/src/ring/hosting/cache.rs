@@ -845,6 +845,14 @@ pub struct EvictedInUseTeardown {
     /// `client_subscriptions[key.id()]`. The consumer replays
     /// `remove_local_client(&key)` once per client (the client-disconnect path).
     pub local_client_count: usize,
+    /// Number of delegate subscriptions this node held on the contract
+    /// (#4669). Unlike the two fields above these were NOT removed by the
+    /// teardown: each is backed by a delegate interest hold, and the consumer
+    /// releases this node's holds for the contract
+    /// (`operations::sync_interest_for_evicted_in_use`). The release decrements
+    /// both the hosting-side count and the `InterestManager` refcount, so
+    /// `contract_in_use` is false before reclamation, exactly as for a client.
+    pub delegate_subscription_count: usize,
 }
 
 /// A single contract evicted by the over-budget sweep, with the metadata the
