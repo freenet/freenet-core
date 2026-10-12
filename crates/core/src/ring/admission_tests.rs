@@ -369,8 +369,8 @@ fn onboard(cm: &ConnectionManager, port: u16, loc: f64) {
     ));
 }
 
-/// Six ordinary connections, each with routing traffic, so a fresh link with
-/// none is the topology manager's least valuable unless its gap value is high.
+/// Six ordinary connections with routing traffic, above `min_connections`,
+/// and a saturated evaluator window.
 fn busy_manager() -> ConnectionManager {
     let cm = manager(3, 20);
     for (i, loc) in [0.45, 0.55, 0.3, 0.7, 0.15, 0.85].into_iter().enumerate() {
@@ -386,8 +386,21 @@ fn busy_manager() -> ConnectionManager {
     cm
 }
 
+/// Put a score no candidate can beat into the evaluator window at `at`.
+fn raise_window_bar(cm: &ConnectionManager, at: Instant) {
+    cm.topology_manager
+        .write()
+        .evaluate_new_connection_with_score(f64::MAX, at);
+}
+
+fn dropped_addrs(drops: &[crate::ring::admission::ProbationDrop]) -> Vec<SocketAddr> {
+    drops.iter().map(|d| d.addr).collect()
+}
+
+/// Review S1: at the end of probation the link is judged as a FRESH
+/// candidate; one that would not beat the evaluator window is dropped.
 #[test]
-fn provisional_link_is_dropped_at_the_end_of_probation_when_least_valuable() {
+fn provisional_link_is_dropped_when_it_would_not_win_the_window() {
     let cm = busy_manager();
     let admitted = Instant::now();
     onboard(&cm, 90, 0.72);
@@ -400,13 +413,17 @@ fn provisional_link_is_dropped_at_the_end_of_probation_when_least_valuable() {
     );
     assert!(cm.is_provisional(addr(90)));
 
-    let dropped =
-        cm.review_provisional_links(admitted + ONBOARDING_PROBATION + Duration::from_secs(1));
-    assert_eq!(dropped, vec![addr(90)]);
+    let review_at = admitted + ONBOARDING_PROBATION + Duration::from_secs(1);
+    raise_window_bar(&cm, review_at);
+    let drops = cm.review_provisional_links(review_at);
+    assert_eq!(dropped_addrs(&drops), vec![addr(90)]);
     assert!(
         !cm.is_provisional(addr(90)),
-        "the slot frees with the decision"
+        "the drop decision holds the slot"
     );
+    for drop in drops {
+        cm.confirm_probation_drop(drop, true);
+    }
     let stats = cm.admission_stats();
     assert_eq!(
         (stats.provisional_dropped, stats.provisional_graduated),
@@ -414,57 +431,86 @@ fn provisional_link_is_dropped_at_the_end_of_probation_when_least_valuable() {
     );
 }
 
+/// A link that would win the window as a fresh candidate graduates, and its
+/// score is recorded there like an arrival's.
 #[test]
-fn provisional_link_graduates_when_self_interest_keeps_it() {
+fn provisional_link_graduates_when_it_would_win_the_window() {
     let cm = busy_manager();
-    // A busy, co-located pair at 0.3: one of them, not the joiner, is the
-    // least valuable connection.
-    let twin = connect(&cm, 20, 0.3);
-    let _ = twin;
     let admitted = Instant::now();
     onboard(&cm, 91, 0.98);
-    for _ in 0..50 {
-        let peer = cm.get_peer_by_addr(addr(91)).expect("connected");
-        cm.topology_manager
-            .write()
-            .outbound_request_counter
-            .record_request(peer);
-    }
-    let dropped =
-        cm.review_provisional_links(admitted + ONBOARDING_PROBATION + Duration::from_secs(1));
-    assert!(dropped.is_empty(), "kept: {dropped:?}");
+    let review_at = admitted + ONBOARDING_PROBATION + Duration::from_secs(1);
+    // The window from setup has expired by now: an empty window admits.
+    let drops = cm.review_provisional_links(review_at);
+    assert!(drops.is_empty(), "kept: {drops:?}");
     assert!(!cm.is_provisional(addr(91)), "graduation frees the slot");
     assert_eq!(cm.admission_stats().provisional_graduated, 1);
+    // The graduate's score is now in the window: an equal one loses.
+    assert_eq!(
+        cm.evaluate_admission_at(
+            Location::new(0.98),
+            addr(98),
+            RequesterNeed::Unknown,
+            None,
+            review_at
+        ),
+        AdmissionCode::RejectedEvaluatorWindow
+    );
+}
+
+/// At most ONBOARDING_GRADUATIONS_PER_WINDOW links graduate on their merits
+/// per window, even when each would win it.
+#[test]
+fn graduations_on_merit_are_capped_per_window() {
+    let cm = busy_manager();
+    let admitted = Instant::now();
+    onboard(&cm, 91, 0.98);
+    onboard(&cm, 92, 0.6);
+    let review_at = admitted + ONBOARDING_PROBATION + Duration::from_secs(1);
+    let drops = cm.review_provisional_links(review_at);
+    assert_eq!(
+        drops.len(),
+        1,
+        "one graduates, the other is capped: {drops:?}"
+    );
+    assert_eq!(cm.admission_stats().provisional_graduated, 1);
+}
+
+/// A drop that cannot be queued keeps the link on probation (review S4).
+#[test]
+fn an_unqueued_probation_drop_keeps_the_link_on_probation() {
+    let cm = busy_manager();
+    let admitted = Instant::now();
+    onboard(&cm, 90, 0.72);
+    let review_at = admitted + ONBOARDING_PROBATION + Duration::from_secs(1);
+    raise_window_bar(&cm, review_at);
+    let drops = cm.review_provisional_links(review_at);
+    assert_eq!(drops.len(), 1);
+    for drop in drops {
+        cm.confirm_probation_drop(drop, false);
+    }
+    assert!(
+        cm.is_provisional(addr(90)),
+        "restored, reviewed again next tick"
+    );
+    assert_eq!(cm.admission_stats().provisional_dropped, 0);
 }
 
 /// When dropping it would take the acceptor below `min_connections`, its
 /// self-interest keeps any link, so the provisional link graduates even though
-/// it is the least valuable one.
+/// it would not win the window.
 #[test]
 fn provisional_link_graduates_when_the_acceptor_needs_it() {
     let cm = busy_manager();
     let admitted = Instant::now();
-    // Co-located with the busy link at 0.85 and carrying no traffic: the
-    // joiner is the least valuable connection by the ranking.
     onboard(&cm, 92, 0.85);
     // Other links leave during probation: 7 -> 3 = min_connections.
     for port in [10, 11, 12, 13] {
         assert!(cm.prune_alive_connection(addr(port)).is_some());
     }
     assert_eq!(cm.connection_count(), cm.min_connections);
-    let least = cm.topology_manager.read().least_valuable_prunable_peer(
-        &cm.get_stored_location(),
-        &cm.connections_by_location.read().clone(),
-    );
-    assert_eq!(
-        least.and_then(|p| p.socket_addr()),
-        Some(addr(92)),
-        "precondition: only the acceptor's need can keep this link"
-    );
-    assert!(
-        cm.review_provisional_links(admitted + ONBOARDING_PROBATION + Duration::from_secs(1))
-            .is_empty()
-    );
+    let review_at = admitted + ONBOARDING_PROBATION + Duration::from_secs(1);
+    raise_window_bar(&cm, review_at);
+    assert!(cm.review_provisional_links(review_at).is_empty());
     assert_eq!(cm.admission_stats().provisional_graduated, 1);
 }
 
