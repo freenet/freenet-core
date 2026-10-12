@@ -20346,6 +20346,9 @@ struct SaturatedJoinReport {
     keys: HashMap<String, freenet::dev_tool::TransportPublicKey>,
     logs: Arc<Mutex<Vec<freenet::tracing::NetLogMessage>>>,
     wall_clock: Duration,
+    /// CONNECT admission counters (#5858) summed over every peer, gateways
+    /// included.
+    admission_totals: freenet::dev_tool::AdmissionCounts,
 }
 
 /// The `p`-quantile of `samples`, treating `None` (never happened) as larger
@@ -20652,6 +20655,10 @@ fn run_saturated_join(cfg: &SaturatedJoinConfig) -> SaturatedJoinReport {
     .expect("saturated-join simulation failed");
 
     let timelines = recorder.snapshot();
+    let mut admission_totals = freenet::dev_tool::AdmissionCounts::default();
+    for t in timelines.values() {
+        admission_totals += t.admission;
+    }
     let timeline_of = |label: &NodeLabel| -> freenet::dev_tool::JoinTimeline {
         let key = keys.get(label).expect("every node has a public key");
         timelines.get(key).cloned().unwrap_or_default()
@@ -20753,6 +20760,7 @@ fn run_saturated_join(cfg: &SaturatedJoinConfig) -> SaturatedJoinReport {
             .collect(),
         logs: logs_handle,
         wall_clock: wall.elapsed(),
+        admission_totals,
     };
     report.log();
     report
@@ -20869,6 +20877,95 @@ fn test_saturated_join_burst_50() {
     };
     let report = run_saturated_join(&cfg);
     report.assert_measured_a_saturated_join(SATURATED_JOIN_MIN_SATURATION);
+}
+
+/// Paired A/B measurement of the #5858 admission mechanism, run by hand.
+///
+/// `SJ_ARM=base` runs the production-faithful baseline (gateway-ack version
+/// on, the CONNECT need gate closed); `SJ_ARM=need` opens the need gate too.
+/// `SJ_SEED` and `SJ_UNREACHABLE` pick the scenario; `SJ_BURST=1` runs the
+/// 50-joiner burst. Prints one `AB|` summary line.
+#[test_log::test]
+#[ignore = "manual measurement: paired A/B of the #5858 mechanism"]
+fn test_saturated_join_needy_ab() {
+    fn env<T: std::str::FromStr>(key: &str) -> Option<T> {
+        std::env::var(key).ok().and_then(|v| v.parse().ok())
+    }
+    fn base(sim: &mut SimNetwork) {
+        sim.enable_gateway_ack_version();
+    }
+    fn need(sim: &mut SimNetwork) {
+        sim.enable_gateway_ack_version();
+        sim.enable_connect_need();
+    }
+    let arm: String = env("SJ_ARM").unwrap_or_else(|| "base".to_string());
+    let seed: u64 = env("SJ_SEED").unwrap_or(0x5858_0000_0002);
+    let burst = env::<u8>("SJ_BURST").unwrap_or(0) == 1;
+    let mut cfg = saturated_join_production_config("saturated-join-ab", seed);
+    if burst {
+        cfg.joiners = 50;
+        cfg.join_stagger = Duration::ZERO;
+    }
+    cfg.unreachable_pair_fraction = env("SJ_UNREACHABLE").unwrap_or(0.4);
+    cfg.configure = Some(if arm == "need" { need } else { base });
+    let report = run_saturated_join(&cfg);
+
+    let first = report.to_first_ring();
+    let reached_min = report.to_min().iter().filter(|m| m.is_some()).count();
+    let mut end_degrees: Vec<usize> = report.timelines[..cfg.established]
+        .iter()
+        .map(|(_, t)| t.count_at(Duration::MAX))
+        .collect();
+    end_degrees.sort_unstable();
+    let pct = |p: usize| {
+        end_degrees
+            .get(end_degrees.len() * p / 100)
+            .copied()
+            .unwrap_or(0)
+    };
+    let a = report.admission_totals;
+    eprintln!(
+        "AB|arm={arm}|seed={seed:#x}|unreach={:.0}%|burst={burst}|first_p50={}|first_p95={}|\
+         first_max={}|never={}/{}|reached_min={}/{}|hops_per_node_s={:.3}|\
+         est_deg_end_p10/50/90/max={}/{}/{}/{}|est_deg_join_p50={}|\
+         onb_admitted={}|onb_established={}|graduated={}|dropped={}|pruned={}|\
+         released_unest={}|budget_exhausted={}|bar_unmet={}|downgraded_unknown={}|\
+         downgraded_below_floor={}|seen_short={}|seen_bar={}|admitted_self={}|\
+         admitted_lattice={}|wall={:.0}s",
+        cfg.unreachable_pair_fraction * 100.0,
+        fmt_opt(censored_quantile(&first, 0.5)),
+        fmt_opt(censored_quantile(&first, 0.95)),
+        fmt_opt(censored_quantile(&first, 1.0)),
+        report.never_connected(),
+        report.joiners.len(),
+        reached_min,
+        report.joiners.len(),
+        report.hops_per_peer_per_s(),
+        pct(10),
+        pct(50),
+        pct(90),
+        end_degrees.last().copied().unwrap_or(0),
+        {
+            let mut d = report.established_degrees.clone();
+            d.sort_unstable();
+            d.get(d.len() / 2).copied().unwrap_or(0)
+        },
+        a.admitted_onboarding,
+        a.onboarding_established,
+        a.provisional_graduated,
+        a.provisional_dropped,
+        a.provisional_pruned,
+        a.provisional_released_unestablished,
+        a.rejected_onboarding_budget_exhausted,
+        a.rejected_bar_unmet,
+        a.need_downgraded_unknown_version,
+        a.need_downgraded_below_floor,
+        a.requests_seen_short,
+        a.requests_seen_bar,
+        a.admitted_self_interest,
+        a.admitted_lattice,
+        report.wall_clock.as_secs_f64(),
+    );
 }
 
 /// Manual exploration: every `SaturatedJoinConfig` field can be overridden

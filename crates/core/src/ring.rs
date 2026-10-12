@@ -3893,6 +3893,10 @@ impl Ring {
                 .map(|op| op.interest_manager.reconcile_contracts_dropped_total());
             let contract_count = snapshot.contracts.len();
             register_topology_snapshot(&network_name, snapshot);
+            join_timeline::record_admission(
+                &ring.connection_manager.pub_key,
+                ring.connection_manager.admission_stats(),
+            );
 
             tracing::info!(
                 %peer_addr,

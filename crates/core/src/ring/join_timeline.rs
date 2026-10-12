@@ -42,6 +42,47 @@ pub struct JoinTimeline {
     pub connects_before_first_ring_connection: Option<u64>,
     /// Ring-connection count after every change, in time order.
     pub ring_count_history: Vec<(Duration, usize)>,
+    /// The peer's CONNECT admission counters (#5858), as of its last
+    /// once-per-second topology snapshot.
+    pub admission: AdmissionCounts,
+}
+
+/// A copy of one peer's `ring::admission::AdmissionStats` (#5858).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct AdmissionCounts {
+    pub admitted_self_interest: u64,
+    pub admitted_onboarding: u64,
+    pub admitted_lattice: u64,
+    pub rejected_onboarding_budget_exhausted: u64,
+    pub rejected_bar_unmet: u64,
+    pub provisional_graduated: u64,
+    pub provisional_dropped: u64,
+    pub provisional_pruned: u64,
+    pub provisional_released_unestablished: u64,
+    pub onboarding_established: u64,
+    pub need_downgraded_unknown_version: u64,
+    pub need_downgraded_below_floor: u64,
+    pub requests_seen_short: u64,
+    pub requests_seen_bar: u64,
+}
+
+impl std::ops::AddAssign for AdmissionCounts {
+    fn add_assign(&mut self, o: Self) {
+        self.admitted_self_interest += o.admitted_self_interest;
+        self.admitted_onboarding += o.admitted_onboarding;
+        self.admitted_lattice += o.admitted_lattice;
+        self.rejected_onboarding_budget_exhausted += o.rejected_onboarding_budget_exhausted;
+        self.rejected_bar_unmet += o.rejected_bar_unmet;
+        self.provisional_graduated += o.provisional_graduated;
+        self.provisional_dropped += o.provisional_dropped;
+        self.provisional_pruned += o.provisional_pruned;
+        self.provisional_released_unestablished += o.provisional_released_unestablished;
+        self.onboarding_established += o.onboarding_established;
+        self.need_downgraded_unknown_version += o.need_downgraded_unknown_version;
+        self.need_downgraded_below_floor += o.need_downgraded_below_floor;
+        self.requests_seen_short += o.requests_seen_short;
+        self.requests_seen_bar += o.requests_seen_bar;
+    }
 }
 
 impl JoinTimeline {
@@ -150,6 +191,30 @@ pub fn record_connect_initiated(peer: &TransportPublicKey) {
             t.first_connect_at.get_or_insert(now);
             t.connects_initiated += 1;
             t.connect_times.push(now);
+        });
+    }
+}
+
+/// Record `peer`'s current admission counters.
+pub(crate) fn record_admission(peer: &TransportPublicKey, s: super::admission::AdmissionStats) {
+    if let Some(recorder) = current_recorder() {
+        recorder.with_peer(peer, |t, _| {
+            t.admission = AdmissionCounts {
+                admitted_self_interest: s.admitted_self_interest,
+                admitted_onboarding: s.admitted_onboarding,
+                admitted_lattice: s.admitted_lattice,
+                rejected_onboarding_budget_exhausted: s.rejected_onboarding_budget_exhausted,
+                rejected_bar_unmet: s.rejected_bar_unmet,
+                provisional_graduated: s.provisional_graduated,
+                provisional_dropped: s.provisional_dropped,
+                provisional_pruned: s.provisional_pruned,
+                provisional_released_unestablished: s.provisional_released_unestablished,
+                onboarding_established: s.onboarding_established,
+                need_downgraded_unknown_version: s.need_downgraded_unknown_version,
+                need_downgraded_below_floor: s.need_downgraded_below_floor,
+                requests_seen_short: s.requests_seen_short,
+                requests_seen_bar: s.requests_seen_bar,
+            };
         });
     }
 }
