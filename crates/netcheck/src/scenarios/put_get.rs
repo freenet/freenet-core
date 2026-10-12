@@ -112,14 +112,32 @@ pub async fn run(args: PutGetArgs) -> Result<bool> {
     tokio::time::sleep(Duration::from_secs(args.settle_secs)).await;
 
     // ---- GET phase, via a fresh ephemeral peer ----
-    let node = ephemeral::spawn_ephemeral(
+    // From here on the PUTs have happened whether or not the getter can run:
+    // every early return keeps them for later runs' retention windows, and
+    // never lets a manifest error replace the error that ended the run.
+    let keep_puts = |manifest: &mut Manifest, run_id: String| {
+        if let Err(e) = record_puts(manifest, &args.manifest, run_id, now, &put_ok) {
+            eprintln!("WARNING: could not record this run's PUTs in the manifest: {e:#}");
+        }
+    };
+    let node = match ephemeral::spawn_ephemeral(
         &args.freenet_bin,
         args.ephemeral_network_port,
         args.ephemeral_ws_port,
         &args.gateway_spec,
         args.ephemeral_dir.as_deref(),
     )
-    .await?;
+    .await
+    {
+        Ok(node) => node,
+        Err(e) => {
+            meta.duration_ms = started.elapsed().as_millis();
+            meta.print();
+            report.print_summary();
+            keep_puts(&mut manifest, run_id);
+            return Err(e.context("booting the ephemeral getter"));
+        }
+    };
 
     let join_timeout = Duration::from_secs(args.join_timeout_secs);
     let mut peer = match client::connect(&node.ws_base, join_timeout).await {
@@ -130,9 +148,7 @@ pub async fn run(args: PutGetArgs) -> Result<bool> {
             meta.print();
             report.print_summary();
             node.shutdown().await;
-            // The PUTs happened whether or not the getter could run: later
-            // runs' retention windows still need these contracts.
-            record_puts(&mut manifest, &args.manifest, run_id, now, &put_ok)?;
+            keep_puts(&mut manifest, run_id);
             return Err(e.context("connecting to ephemeral node ws api"));
         }
     };
@@ -144,9 +160,7 @@ pub async fn run(args: PutGetArgs) -> Result<bool> {
             meta.print();
             report.print_summary();
             node.shutdown().await;
-            // The PUTs happened whether or not the getter could run: later
-            // runs' retention windows still need these contracts.
-            record_puts(&mut manifest, &args.manifest, run_id, now, &put_ok)?;
+            keep_puts(&mut manifest, run_id);
             return Err(e);
         }
     }
