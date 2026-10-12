@@ -2488,7 +2488,9 @@ mod tests {
     /// Short-timeout `join_ring_request`: the result is irrelevant (nothing
     /// answers), only whether the attempt was counted.
     async fn dial(gateway: &PeerKeyLocation, op_manager: &OpManager) {
-        let _ = join_ring_request(gateway, op_manager, Some(Duration::from_millis(100))).await;
+        join_ring_request(gateway, op_manager, Some(Duration::from_millis(100)))
+            .await
+            .ok();
     }
 
     /// #5858: `connect_attempts_before_first_connection` counts exactly one
@@ -2526,11 +2528,12 @@ mod tests {
                 "a second dial adds exactly one"
             );
 
-            let _ = tokio::time::timeout(
+            tokio::time::timeout(
                 Duration::from_millis(300),
                 gateway_version_probe(&gw_c, &op_manager),
             )
-            .await;
+            .await
+            .ok();
             assert_eq!(
                 first_conn_stats().connect_attempts_before_first_connection,
                 2,
