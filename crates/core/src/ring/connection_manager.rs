@@ -18,6 +18,7 @@
 //! - `connect_jitter_failures` (`parking_lot::Mutex<(u32, Option<Instant>)>`)
 //! - `acceptor_reliability` (`parking_lot::RwLock<BTreeMap<SocketAddr, AcceptorStats>>`)
 //! - `recently_failed_addrs` (`parking_lot::Mutex<TrackedBackoff<SocketAddr>>`)
+//! - `provisional_links` (`parking_lot::Mutex<ProvisionalLinks>`, #5858)
 
 use dashmap::{DashMap, DashSet};
 use parking_lot::Mutex;
@@ -31,6 +32,11 @@ use crate::config::GlobalRng;
 use crate::topology::{Limits, TopologyManager};
 use crate::util::backoff::{ExponentialBackoff, TrackedBackoff};
 
+use super::admission::{
+    AdmissionCode, AdmissionCounters, AdmissionStats, ONBOARDING_PROBATION,
+    ONBOARDING_PROVISIONAL_SLOTS, ProvisionalLinks, ProvisionalOutcome, RequesterNeed,
+    UNCONSTRAINED_BAR, requester_is_short,
+};
 use super::*;
 
 #[derive(Clone)]
@@ -535,6 +541,19 @@ pub(crate) struct ConnectionManager {
     /// BEHAVIOUR, not just an encoding — so a sim opts in explicitly via
     /// `SimNetwork::enable_broadcast_target_list`. See `NodeConfig`.
     broadcast_target_list_floor_override: Option<(u8, u8, u16)>,
+    /// Test-only override for the CONNECT need version floor (#5858), threaded
+    /// like `broadcast_target_list_floor_override` and, like it, default OFF in
+    /// simulations. `None` in production (the real `CONNECT_NEED_MIN_VERSION`
+    /// applies). See `NodeConfig::connect_need_floor_override`.
+    connect_need_floor_override: Option<(u8, u8, u16)>,
+    /// Onboarding slots (#5858): links admitted for a short requester, on
+    /// probation. Bounded at `ONBOARDING_PROVISIONAL_SLOTS`; every entry leaves
+    /// at the end of probation (`review_provisional_links`) or earlier, when its
+    /// connection is pruned or never establishes. Locked independently of the
+    /// ring maps (see the module-level lock ordering).
+    provisional_links: Arc<Mutex<ProvisionalLinks>>,
+    /// Admission counters by path (#5858), see [`Self::admission_stats`].
+    admission_counters: Arc<AdmissionCounters>,
     /// Rotating start offset for the per-new-peer migration scan. The scan
     /// examines at most `MIGRATION_SCAN_CAP_PER_NEW_PEER` hosted contracts per
     /// event; advancing this cursor each event makes successive events cover
@@ -695,6 +714,7 @@ impl ConnectionManager {
         cm.summary_first_put_floor_override = config.summary_first_put_floor_override;
         cm.hash_first_summaries_floor_override = config.hash_first_summaries_floor_override;
         cm.broadcast_target_list_floor_override = config.broadcast_target_list_floor_override;
+        cm.connect_need_floor_override = config.connect_need_floor_override;
         cm
     }
 
@@ -737,6 +757,11 @@ impl ConnectionManager {
             summary_first_put_declined_unknown_version: Arc::new(AtomicU64::new(0)),
             summary_first_put_declined_pre_floor: Arc::new(AtomicU64::new(0)),
             broadcast_target_list_floor_override: None,
+            connect_need_floor_override: None,
+            provisional_links: Arc::new(Mutex::new(ProvisionalLinks::new(
+                ONBOARDING_PROVISIONAL_SLOTS,
+            ))),
+            admission_counters: Arc::new(AdmissionCounters::default()),
             migration_scan_cursor: Arc::new(AtomicUsize::new(0)),
             transient_connections: Arc::new(DashMap::new()),
             transient_in_use: Arc::new(AtomicUsize::new(0)),
@@ -794,10 +819,56 @@ impl ConnectionManager {
     /// Whether a node should accept a new node connection or not based
     /// on the relative location and other conditions.
     ///
+    /// A request whose need is unknown: admitted through self-interest (and
+    /// the lattice clause) exactly as before #5858. See
+    /// [`Self::evaluate_admission`].
+    pub fn should_accept(&self, location: Location, addr: SocketAddr) -> bool {
+        self.evaluate_admission(location, addr, RequesterNeed::Unknown, None)
+            .accepted()
+    }
+
+    /// Decide whether to admit the CONNECT requester at `location`/`addr`, and
+    /// say which path admitted it or why it was refused (#5858).
+    ///
+    /// Two separate budgets (see `ring::admission`):
+    ///
+    /// - SELF-INTEREST, for a requester whose need is unknown (legacy) or that
+    ///   states a bar: the pre-#5858 rule, unchanged. First connection, then
+    ///   the below-min soft filter or the at/above-min evaluator window, with
+    ///   the lattice clause as an override. A requester with a bar is refused
+    ///   first if this peer is not strictly closer to `target` than the bar,
+    ///   unless the lattice clause admits it, because then this peer does not
+    ///   improve the requester's coverage of `target`.
+    /// - ONBOARDING, for a requester that is short of connections: the lattice
+    ///   clause and the below-min soft filter still apply first, then a
+    ///   provisional slot if one is free and this peer is below
+    ///   `max_connections`. This path never touches the evaluator window, so
+    ///   onboarding traffic neither consumes nor raises its bar.
+    ///
+    /// `target` is the request's `desired_location`; only the bar uses it.
+    ///
     /// Does not panic when this node has no location assigned yet: every clause
     /// that needs the own location guards `get_stored_location()` and falls
     /// through to a location-independent decision.
-    pub fn should_accept(&self, location: Location, addr: SocketAddr) -> bool {
+    pub(crate) fn evaluate_admission(
+        &self,
+        location: Location,
+        addr: SocketAddr,
+        need: RequesterNeed,
+        target: Option<Location>,
+    ) -> AdmissionCode {
+        let code = self.evaluate_admission_inner(location, addr, need, target);
+        self.admission_counters.record_decision(code);
+        code
+    }
+
+    fn evaluate_admission_inner(
+        &self,
+        location: Location,
+        addr: SocketAddr,
+        need: RequesterNeed,
+        target: Option<Location>,
+    ) -> AdmissionCode {
         // Don't accept connections from ourselves
         if let Some(own_addr) = self.get_own_addr() {
             if own_addr == addr {
@@ -806,7 +877,7 @@ impl ConnectionManager {
                     peer_location = %location,
                     "should_accept: rejecting self-connection attempt"
                 );
-                return false;
+                return AdmissionCode::RejectedSelfConnection;
             }
         }
         let open = self.connection_count();
@@ -850,7 +921,7 @@ impl ConnectionManager {
                 peer_location = %location,
                 "Peer already pending/connected; rejecting to route uphill for diversity"
             );
-            return false;
+            return AdmissionCode::RejectedAlreadyConnected;
         }
 
         {
@@ -872,7 +943,7 @@ impl ConnectionManager {
                     "connection counters would overflow; rejecting connection"
                 );
                 self.pending_reservations.write().remove(&addr);
-                return false;
+                return AdmissionCode::RejectedCounterOverflow;
             }
         };
 
@@ -882,7 +953,7 @@ impl ConnectionManager {
                 peer_location = %location,
                 "should_accept: first connection -> accepting"
             );
-            return true;
+            return AdmissionCode::AcceptedSelfInterest;
         }
 
         // Nearest-neighbor lattice clause (mechanism 3). BEFORE the Kleinberg
@@ -967,66 +1038,119 @@ impl ConnectionManager {
             false
         };
 
-        // Use actual open connections (not inflated total_conn) for the
-        // min_connections threshold. Pending reservations are speculative —
-        // many fail to complete — so counting them pushes nodes into the
-        // topology evaluator path prematurely, causing rejections when the
-        // node genuinely needs more connections.
-        // total_conn (which includes pending) is still used for max_connections
-        // to prevent over-commitment.
-        let accepted = if total_conn >= self.max_connections {
+        // Nearest-neighbor lattice force-accept (mechanism 3). A new per-side
+        // nearest neighbor is admitted regardless of the Kleinberg verdict. UNDER
+        // max this admits a fill OR a tighten (no displacement, just bypassing
+        // Kleinberg). AT/OVER max, a strictly-closer per-side nearest (tighten OR
+        // fill) is admitted within the over-cap ceiling, displacing a non-lattice
+        // long link on the next over-max prune tick (see
+        // `admits_lattice_edge_over_cap`). Evaluated lazily: on the
+        // self-interest path it is consulted only after the Kleinberg verdict,
+        // exactly as before #5858, so a legacy request records into the
+        // evaluator window in the same cases it always did.
+        let lattice_admits = || {
+            (nn_override && total_conn < self.max_connections)
+                || self.admits_lattice_edge_over_cap(location)
+        };
+
+        let code = match need {
+            RequesterNeed::Short => {
+                if lattice_admits() {
+                    AdmissionCode::AcceptedLattice
+                } else if total_conn >= self.max_connections {
+                    AdmissionCode::RejectedAtCapacity
+                } else if open < self.min_connections && self.below_min_soft_filter(location, open)
+                {
+                    AdmissionCode::AcceptedSelfInterest
+                } else if self
+                    .provisional_links
+                    .lock()
+                    .try_reserve(addr, Instant::now())
+                {
+                    // Collective duty: a short requester admitted from the
+                    // onboarding budget, bypassing (and not recorded into) the
+                    // evaluator window. The slot is on probation; see
+                    // `review_provisional_links`.
+                    tracing::info!(
+                        addr = %addr,
+                        peer_location = %location,
+                        open,
+                        total_conn,
+                        "should_accept: admitted short requester on an onboarding slot"
+                    );
+                    AdmissionCode::AcceptedOnboarding
+                } else {
+                    AdmissionCode::RejectedOnboardingBudgetExhausted
+                }
+            }
+            RequesterNeed::Bar(bar) if !self.meets_requester_bar(target, bar) => {
+                if lattice_admits() {
+                    AdmissionCode::AcceptedLattice
+                } else {
+                    AdmissionCode::RejectedBarUnmet
+                }
+            }
+            RequesterNeed::Unknown | RequesterNeed::Bar(_) => {
+                match self.self_interest_verdict(location, addr, open, total_conn) {
+                    None => AdmissionCode::AcceptedSelfInterest,
+                    Some(_) if lattice_admits() => AdmissionCode::AcceptedLattice,
+                    Some(cause) => cause,
+                }
+            }
+        };
+        tracing::debug!(
+            addr = %addr,
+            peer_location = %location,
+            ?need,
+            admission = code.as_str(),
+            total_conn,
+            open_connections = open,
+            reserved_connections = self.pending_reservations.read().len(),
+            max_connections = self.max_connections,
+            min_connections = self.min_connections,
+            "should_accept: final decision"
+        );
+        if !code.accepted() {
+            self.pending_reservations.write().remove(&addr);
+        } else {
+            tracing::debug!(
+                addr = %addr,
+                peer_location = %location,
+                total_conn,
+                "should_accept: accepted (reserving spot)"
+            );
+            self.record_pending_location(addr, location);
+        }
+        code
+    }
+
+    /// The self-interest verdict for a candidate (the pre-#5858 rule, without
+    /// the lattice override): `None` to admit, else the cause of refusal.
+    ///
+    /// Use actual open connections (not inflated total_conn) for the
+    /// min_connections threshold. Pending reservations are speculative —
+    /// many fail to complete — so counting them pushes nodes into the
+    /// topology evaluator path prematurely, causing rejections when the
+    /// node genuinely needs more connections.
+    /// total_conn (which includes pending) is still used for max_connections
+    /// to prevent over-commitment.
+    fn self_interest_verdict(
+        &self,
+        location: Location,
+        addr: SocketAddr,
+        open: usize,
+        total_conn: usize,
+    ) -> Option<AdmissionCode> {
+        if total_conn >= self.max_connections {
             tracing::debug!(
                 addr = %addr,
                 peer_location = %location,
                 total_conn,
                 "should_accept: rejected (max connections reached)"
             );
-            false
+            Some(AdmissionCode::RejectedAtCapacity)
         } else if open < self.min_connections {
-            // Below min_connections: use gap score as a soft probabilistic
-            // filter to shape the distribution during bootstrap. We don't use
-            // the strict ConnectionEvaluator here because its "beat all in
-            // window" policy would accept at most one connection per window,
-            // stalling bootstrap when many peers try to connect.
-            //
-            // Below KLEINBERG_FILTER_MIN_CONNECTIONS we always accept (too few
-            // connections for a meaningful gap score). Above that, selectivity
-            // scales with how close we are to min_connections:
-            //   - At KLEINBERG_FILTER_MIN_CONNECTIONS: floor ~0.9 (accept almost all)
-            //   - Approaching min_connections: floor ~0.3 (be selective)
-            // This prevents bootstrap stalls when NAT traversal is unreliable
-            // while still shaping topology as the node fills up.
-            let accepted = if open < KLEINBERG_FILTER_MIN_CONNECTIONS {
-                true
-            } else if let Some(me) = self.get_stored_location() {
-                let score = self.compute_kleinberg_score(me, location);
-                // Compute a sliding floor based on how far we are from min_connections.
-                // progress=0.0 at KLEINBERG_FILTER_MIN_CONNECTIONS, 1.0 at min_connections.
-                let range = self
-                    .min_connections
-                    .saturating_sub(KLEINBERG_FILTER_MIN_CONNECTIONS);
-                let progress = if range > 0 {
-                    (open - KLEINBERG_FILTER_MIN_CONNECTIONS) as f64 / range as f64
-                } else {
-                    1.0
-                };
-                // Floor slides from 0.9 (desperate for connections) to 0.3 (nearly full).
-                let floor = 0.9 - 0.6 * progress;
-                let accept_prob = (floor + score).min(1.0);
-                tracing::debug!(
-                    open,
-                    min = self.min_connections,
-                    %progress,
-                    %floor,
-                    %score,
-                    %accept_prob,
-                    "should_accept: sliding Kleinberg floor"
-                );
-                GlobalRng::random_range(0.0..1.0) < accept_prob
-            } else {
-                true
-            };
-
+            let accepted = self.below_min_soft_filter(location, open);
             tracing::debug!(
                 addr = %addr,
                 peer_location = %location,
@@ -1035,7 +1159,7 @@ impl ConnectionManager {
                 accepted,
                 "should_accept: below min_connections (Kleinberg soft filter)"
             );
-            accepted
+            (!accepted).then_some(AdmissionCode::RejectedSoftFilter)
         } else {
             // At/above min_connections: feed gap score through the
             // ConnectionEvaluator which picks the best candidate from recent
@@ -1057,43 +1181,66 @@ impl ConnectionManager {
                 accepted,
                 "should_accept: above min_connections (Kleinberg evaluator)"
             );
-            accepted
-        };
-        // Nearest-neighbor lattice force-accept (mechanism 3). A new per-side
-        // nearest neighbor is admitted regardless of the Kleinberg verdict. UNDER
-        // max this admits a fill OR a tighten (no displacement, just bypassing
-        // Kleinberg). AT/OVER max, a strictly-closer per-side nearest (tighten OR
-        // fill) is admitted within the over-cap ceiling, displacing a non-lattice
-        // long link on the next over-max prune tick (see
-        // `admits_lattice_edge_over_cap`).
-        let accepted = accepted
-            || (nn_override && total_conn < self.max_connections)
-            // At/over max, admit a strictly-closer per-side nearest (tighten OR
-            // fill) within the over-cap ceiling.
-            || self.admits_lattice_edge_over_cap(location);
-        tracing::debug!(
-            addr = %addr,
-            peer_location = %location,
-            accepted,
-            total_conn,
-            open_connections = open,
-            reserved_connections = self.pending_reservations.read().len(),
-            max_connections = self.max_connections,
-            min_connections = self.min_connections,
-            "should_accept: final decision"
-        );
-        if !accepted {
-            self.pending_reservations.write().remove(&addr);
-        } else {
-            tracing::debug!(
-                addr = %addr,
-                peer_location = %location,
-                total_conn,
-                "should_accept: accepted (reserving spot)"
-            );
-            self.record_pending_location(addr, location);
+            (!accepted).then_some(AdmissionCode::RejectedEvaluatorWindow)
         }
-        accepted
+    }
+
+    /// Below min_connections: use gap score as a soft probabilistic
+    /// filter to shape the distribution during bootstrap. We don't use
+    /// the strict ConnectionEvaluator here because its "beat all in
+    /// window" policy would accept at most one connection per window,
+    /// stalling bootstrap when many peers try to connect.
+    ///
+    /// Below KLEINBERG_FILTER_MIN_CONNECTIONS we always accept (too few
+    /// connections for a meaningful gap score). Above that, selectivity
+    /// scales with how close we are to min_connections:
+    ///   - At KLEINBERG_FILTER_MIN_CONNECTIONS: floor ~0.9 (accept almost all)
+    ///   - Approaching min_connections: floor ~0.3 (be selective)
+    ///
+    /// This prevents bootstrap stalls when NAT traversal is unreliable
+    /// while still shaping topology as the node fills up.
+    fn below_min_soft_filter(&self, location: Location, open: usize) -> bool {
+        if open < KLEINBERG_FILTER_MIN_CONNECTIONS {
+            true
+        } else if let Some(me) = self.get_stored_location() {
+            let score = self.compute_kleinberg_score(me, location);
+            // Compute a sliding floor based on how far we are from min_connections.
+            // progress=0.0 at KLEINBERG_FILTER_MIN_CONNECTIONS, 1.0 at min_connections.
+            let range = self
+                .min_connections
+                .saturating_sub(KLEINBERG_FILTER_MIN_CONNECTIONS);
+            let progress = if range > 0 {
+                (open - KLEINBERG_FILTER_MIN_CONNECTIONS) as f64 / range as f64
+            } else {
+                1.0
+            };
+            // Floor slides from 0.9 (desperate for connections) to 0.3 (nearly full).
+            let floor = 0.9 - 0.6 * progress;
+            let accept_prob = (floor + score).min(1.0);
+            tracing::debug!(
+                open,
+                min = self.min_connections,
+                %progress,
+                %floor,
+                %score,
+                %accept_prob,
+                "should_accept: sliding Kleinberg floor"
+            );
+            GlobalRng::random_range(0.0..1.0) < accept_prob
+        } else {
+            true
+        }
+    }
+
+    /// Whether this peer is strictly closer to `target` than a requester's
+    /// `bar` (#5858), i.e. whether accepting would improve the requester's
+    /// coverage of `target`. When either location is unknown this peer cannot
+    /// judge, and the request is left to the self-interest rule.
+    fn meets_requester_bar(&self, target: Option<Location>, bar: f64) -> bool {
+        match (self.get_stored_location(), target) {
+            (Some(me), Some(target)) => me.distance(target).as_f64() < bar,
+            _ => true,
+        }
     }
 
     /// Compute the Kleinberg gap score for a candidate connection.
@@ -1224,10 +1371,10 @@ impl ConnectionManager {
     /// evidence), except at the cap: there our own cap refuses every
     /// non-lattice acceptor, and a peer at max would otherwise never sleep. A
     /// lattice edge that could not be connected, for any reason (a failed hole
-    /// punch, or our own refusal at the cap, whose outbound pre-flight check
-    /// does not exempt lattice edges, #5827), is recorded as a failed hit, and the
-    /// scheduler re-checks on its retry ladder. Returns whether a miss was
-    /// recorded.
+    /// punch, or our own refusal at the over-cap ceiling; since #5827 the
+    /// outbound pre-flight check exempts lattice edges below that ceiling), is
+    /// recorded as a failed hit, and the scheduler re-checks on its retry
+    /// ladder. Returns whether a miss was recorded.
     pub(crate) fn record_lattice_probe_result(
         &self,
         loc: Location,
@@ -1490,6 +1637,137 @@ impl ConnectionManager {
             .filter(|(_, created)| now.duration_since(*created) <= PENDING_RESERVATION_TTL)
             .count();
         established + pending < self.max_connections + LATTICE_OVERMAX_SLACK
+    }
+
+    /// Whether an outbound dial to a peer at `loc` must be refused to respect
+    /// `max_connections`: at or over the cap, unless the peer would be a new
+    /// per-side nearest lattice edge within the over-cap ceiling
+    /// ([`Self::admits_lattice_edge_over_cap`]).
+    ///
+    /// The one predicate shared by the outbound pre-flight check in
+    /// `handle_connect_peer` and both promotion gates
+    /// (`p2p_protoc/connection_lifecycle.rs`), so a lattice edge refused by one
+    /// gate is refused by all of them and admitted by all of them otherwise.
+    /// Before #5827 the pre-flight check had no lattice exemption, so a peer at
+    /// max refused its own lattice probe's acceptor before NAT traversal began.
+    pub(crate) fn refuses_connection_at_cap(&self, loc: Location) -> bool {
+        self.connection_count() >= self.max_connections && !self.admits_lattice_edge_over_cap(loc)
+    }
+
+    /// End-of-probation review of the onboarding slots (#5858), run on the
+    /// maintenance tick with that tick's `now`. Returns the links to DROP.
+    ///
+    /// For each slot:
+    /// - its connection never established and it holds no live pending
+    ///   reservation once [`PENDING_RESERVATION_TTL`] has passed: the slot is
+    ///   freed (the handshake failed; usually the prune hook already freed it);
+    /// - [`ONBOARDING_PROBATION`] has passed and it is not connected: freed;
+    /// - [`ONBOARDING_PROBATION`] has passed and it is connected: it GRADUATES
+    ///   when this peer's self-interest would keep it, and is dropped
+    ///   otherwise. Self-interest keeps it when this peer would fall below
+    ///   `min_connections` without it, when it is a per-side nearest lattice
+    ///   edge, or when the topology manager's removal ranking (the composite
+    ///   routing-value and gap score a topology swap uses) does not name it as
+    ///   the least valuable connection.
+    ///
+    /// Every slot leaves the table here or earlier, so none outlives
+    /// [`ONBOARDING_PROBATION`] plus one tick.
+    pub(crate) fn review_provisional_links(&self, now: Instant) -> Vec<SocketAddr> {
+        let ages = self.provisional_links.lock().ages(now);
+        let mut to_drop = Vec::new();
+        for (addr, age) in ages {
+            let established = self.is_in_ring(addr);
+            if !established {
+                let reserved =
+                    self.pending_reservations
+                        .read()
+                        .get(&addr)
+                        .is_some_and(|(_, created)| {
+                            now.saturating_duration_since(*created) <= PENDING_RESERVATION_TTL
+                        });
+                if age >= ONBOARDING_PROBATION || (age > PENDING_RESERVATION_TTL && !reserved) {
+                    self.finish_probation(addr, ProvisionalOutcome::ReleasedUnestablished);
+                }
+                continue;
+            }
+            if age < ONBOARDING_PROBATION {
+                continue;
+            }
+            if self.self_interest_keeps(addr, &to_drop) {
+                self.finish_probation(addr, ProvisionalOutcome::Graduated);
+                tracing::info!(addr = %addr, "Onboarding link graduated after probation");
+            } else {
+                self.finish_probation(addr, ProvisionalOutcome::Dropped);
+                tracing::info!(
+                    addr = %addr,
+                    "Onboarding link dropped after probation (not worth keeping)"
+                );
+                to_drop.push(addr);
+            }
+        }
+        to_drop
+    }
+
+    /// Whether this peer's self-interest would keep the established link to
+    /// `addr`, given that the links in `dropping` are about to go. See
+    /// [`Self::review_provisional_links`].
+    fn self_interest_keeps(&self, addr: SocketAddr, dropping: &[SocketAddr]) -> bool {
+        let remaining = self.connection_count().saturating_sub(dropping.len());
+        if remaining <= self.min_connections {
+            return true;
+        }
+        let Some(loc) = self.location_for_peer.read().get(&addr).copied() else {
+            return true;
+        };
+        if self.nn_lattice_active() && self.is_per_side_nearest(loc, addr) {
+            return true;
+        }
+        let mut neighbors = self.connections_by_location.read().clone();
+        for gone in dropping {
+            for conns in neighbors.values_mut() {
+                conns.retain(|c| c.location.socket_addr() != Some(*gone));
+            }
+        }
+        neighbors.retain(|_, conns| !conns.is_empty());
+        let least_valuable = self
+            .topology_manager
+            .read()
+            .least_valuable_prunable_peer(&self.get_stored_location(), &neighbors);
+        least_valuable.and_then(|peer| peer.socket_addr()) != Some(addr)
+    }
+
+    fn finish_probation(&self, addr: SocketAddr, outcome: ProvisionalOutcome) {
+        if self.provisional_links.lock().release(addr) {
+            self.admission_counters.record_provisional(outcome);
+        }
+    }
+
+    /// The connection a topology prune or swap should shed instead of
+    /// `recommended` (#5858): an established link still on probation, which is
+    /// first in line while its probation lasts. A per-side nearest lattice edge
+    /// is never substituted (it keeps its retention protection), nor is
+    /// anything when no link is on probation. Releases the slot of the link it
+    /// returns and counts it as pruned.
+    pub(crate) fn probation_prune_substitute(
+        &self,
+        recommended: &PeerKeyLocation,
+    ) -> Option<PeerKeyLocation> {
+        let candidates = self.provisional_links.lock().ages(Instant::now());
+        let substitute = candidates.into_iter().find_map(|(addr, _)| {
+            if recommended.socket_addr() == Some(addr) {
+                return None;
+            }
+            let loc = self.location_for_peer.read().get(&addr).copied()?;
+            if self.nn_lattice_active() && self.is_per_side_nearest(loc, addr) {
+                return None;
+            }
+            self.get_peer_by_addr(addr)
+                .filter(|_| self.is_in_ring(addr))
+        })?;
+        if let Some(addr) = substitute.socket_addr() {
+            self.finish_probation(addr, ProvisionalOutcome::Pruned);
+        }
+        Some(substitute)
     }
 
     /// Record the advertised location for a peer that we have decided to accept.
@@ -1757,6 +2035,85 @@ impl ConnectionManager {
             .broadcast_target_list_floor_override
             .unwrap_or(crate::node::BROADCAST_TARGET_LIST_MIN_VERSION);
         crate::node::version_supports_broadcast_target_list(self.remote_version(addr), floor)
+    }
+
+    /// Whether the peer at `addr` reports a version new enough to decode
+    /// `ConnectMsg::RequestWithNeed` (#5858). Same fail-closed rule as
+    /// [`Self::supports_broadcast_target_list`]; the fallback is the legacy
+    /// `ConnectMsg::Request`, which drops the need and is exactly what every
+    /// peer receives today. Each refusal is counted
+    /// (`AdmissionStats::need_downgraded_to_legacy`), so a rollout in which the
+    /// need never reaches anyone does not read as one in which nobody needed.
+    ///
+    /// Honours `NodeConfig::connect_need_floor_override` (default OFF in
+    /// simulations; `SimNetwork::enable_connect_need`).
+    pub(crate) fn supports_connect_need(&self, addr: SocketAddr) -> bool {
+        let floor = self
+            .connect_need_floor_override
+            .unwrap_or(crate::node::CONNECT_NEED_MIN_VERSION);
+        let supported =
+            crate::node::version_supports_connect_need(self.remote_version(addr), floor);
+        if !supported {
+            self.admission_counters.record_need_downgraded();
+        }
+        supported
+    }
+
+    /// This peer's need as a CONNECT requester targeting `target` (#5858).
+    ///
+    /// [`RequesterNeed::Short`] while it holds fewer ring connections than its
+    /// own threshold ([`requester_is_short`], derived from `min_connections`).
+    /// Otherwise a bar: the ring distance from `target` to this peer's nearest
+    /// connection on the target's side of it, since only an acceptor closer to
+    /// the target than that improves this peer's coverage there. A request
+    /// aimed at this peer's own location (a lattice probe, the bootstrap
+    /// target) has no side; its bar is the looser of the two per-side nearest
+    /// distances, so it never rules out an acceptor that would tighten either
+    /// side. A side with no connection gives [`UNCONSTRAINED_BAR`].
+    /// [`RequesterNeed::Unknown`] when own location is not known yet.
+    pub(crate) fn requester_need(&self, target: Location) -> RequesterNeed {
+        if requester_is_short(self.connection_count(), self.min_connections) {
+            return RequesterNeed::Short;
+        }
+        let Some(me) = self.get_stored_location() else {
+            return RequesterNeed::Unknown;
+        };
+        let target_side = me.signed_distance(target);
+        if target_side == 0.0 {
+            let looser = [true, false]
+                .into_iter()
+                .map(|side| {
+                    self.nearest_lattice_neighbor_dist(side)
+                        .unwrap_or(UNCONSTRAINED_BAR)
+                })
+                .fold(0.0_f64, f64::max);
+            return RequesterNeed::Bar(looser.min(UNCONSTRAINED_BAR));
+        }
+        let successor_side = target_side > 0.0;
+        let bar = self
+            .connections_by_location
+            .read()
+            .keys()
+            .filter(|loc| {
+                let sd = me.signed_distance(**loc);
+                sd != 0.0 && (sd > 0.0) == successor_side
+            })
+            .map(|loc| loc.distance(target).as_f64())
+            .fold(UNCONSTRAINED_BAR, f64::min);
+        RequesterNeed::Bar(bar)
+    }
+
+    /// Lifetime admission counters by path, plus the provisional links on
+    /// probation now (#5858). Read on the `router_snapshot` cadence.
+    pub(crate) fn admission_stats(&self) -> AdmissionStats {
+        let in_use = self.provisional_links.lock().len();
+        self.admission_counters.snapshot(in_use)
+    }
+
+    /// Whether `addr` holds an onboarding slot (a link on probation, #5858).
+    #[cfg(test)]
+    pub(crate) fn is_provisional(&self, addr: SocketAddr) -> bool {
+        self.provisional_links.lock().contains(addr)
     }
 
     /// Reserve the next `window`-sized slice of the hosting set for a migration
@@ -2360,6 +2717,9 @@ impl ConnectionManager {
             }
         }
 
+        // A link on probation keeps its slot under its corrected address (#5858).
+        self.provisional_links.lock().rename(old_addr, new_addr);
+
         // Migrate connected_since and peer_health to the new address.
         {
             let mut cs = self.connected_since.write();
@@ -2378,6 +2738,12 @@ impl ConnectionManager {
     }
 
     fn prune_connection(&self, addr: SocketAddr, is_alive: bool) -> Option<Location> {
+        // A link on probation that goes away (pruned, dropped, or a handshake
+        // that failed) frees its onboarding slot at once (#5858). Taken before
+        // the ring maps: the provisional lock is never nested with them.
+        if self.provisional_links.lock().release(addr) {
+            tracing::debug!(addr = %addr, "Released onboarding slot of pruned connection");
+        }
         let connection_type = if is_alive { "active" } else { "in transit" };
         tracing::info!(
             addr = %addr,
@@ -3654,6 +4020,74 @@ mod tests {
     /// two catch different mistakes: this one catches the floor being LOWERED
     /// (e.g. someone "fixing" a gate that seems not to fire), the marker one
     /// catches the RELEASE advancing past a stationary floor.
+    /// The send gate for `ConnectMsg::RequestWithNeed` (#5858) discriminates:
+    /// unknown and pre-floor versions get the legacy request, at-floor and
+    /// newer get the need. Each refusal is counted, so a rollout where the
+    /// need reaches no one is visible.
+    #[test]
+    fn supports_connect_need_gate_discriminates_by_version() {
+        let cm = make_connection_manager(Some(make_addr(9000)), 1, 10, false);
+        let floor = crate::node::CONNECT_NEED_MIN_VERSION;
+        let unknown = make_addr(9001);
+        let old = make_addr(9002);
+        let at_floor = make_addr(9003);
+        let newer = make_addr(9004);
+        cm.record_remote_version(old, Some((floor.0, floor.1, floor.2 - 1)));
+        cm.record_remote_version(at_floor, Some(floor));
+        cm.record_remote_version(newer, Some((floor.0, floor.1 + 1, 0)));
+        assert!(!cm.supports_connect_need(unknown));
+        assert!(!cm.supports_connect_need(old));
+        assert!(cm.supports_connect_need(at_floor));
+        assert!(cm.supports_connect_need(newer));
+        assert_eq!(cm.admission_stats().need_downgraded_to_legacy, 2);
+    }
+
+    /// Same release-tracking guard as `hash_first_floor_tracks_the_shipping_release`,
+    /// for the CONNECT need floor (#5858): until the release carrying
+    /// `RequestWithNeed` is cut the floor must stay ahead of the crate version,
+    /// and once `CONNECT_NEED_SHIPPED_IN` records it, the two must agree.
+    #[test]
+    fn connect_need_floor_tracks_the_shipping_release() {
+        fn crate_version() -> (u8, u8, u16) {
+            let v = env!("CARGO_PKG_VERSION");
+            let mut it = v.split('.');
+            let major = it.next().unwrap().parse().expect("major");
+            let minor = it.next().unwrap().parse().expect("minor");
+            let patch = it
+                .next()
+                .unwrap()
+                .split(['-', '+'])
+                .next()
+                .unwrap()
+                .parse()
+                .expect("patch");
+            (major, minor, patch)
+        }
+        let floor = crate::node::CONNECT_NEED_MIN_VERSION;
+        let current = crate_version();
+        match crate::node::CONNECT_NEED_SHIPPED_IN {
+            None => assert!(
+                floor > current,
+                "CONNECT_NEED_MIN_VERSION is {floor:?} but the crate is already at \
+                 {current:?}, and CONNECT_NEED_SHIPPED_IN is None. If this release \
+                 carries ConnectMsg::RequestWithNeed, set CONNECT_NEED_SHIPPED_IN to \
+                 the literal Some({floor:?}) and freeze both; if not, raise the floor \
+                 to the release that will. Otherwise peers on the real {current:?} \
+                 receive a variant they cannot decode and drop the connection."
+            ),
+            Some(shipped) => {
+                assert_eq!(
+                    shipped, floor,
+                    "CONNECT_NEED_SHIPPED_IN must equal CONNECT_NEED_MIN_VERSION"
+                );
+                assert!(
+                    floor <= current,
+                    "a release cannot have shipped in the future"
+                );
+            }
+        }
+    }
+
     #[test]
     fn hash_first_floor_stays_above_every_release_without_the_variants() {
         /// Last release that does NOT carry the hash-first wire variants.
@@ -4680,26 +5114,91 @@ mod tests {
         );
     }
 
-    /// Source-scrape pin (B1 regression guard): BOTH connection-lifecycle
-    /// promotion gates must apply the shared `admits_lattice_edge_over_cap`
-    /// exception to their `>= max_connections` reject. Without this a lattice edge
-    /// is silently dropped at the cap on the real CONNECT path and mechanism 3's
-    /// at-capacity displacement is inert — the exact defect the external review
-    /// caught (the over-max unit test passed only because it bypassed the gate).
-    /// If a future refactor drops the exception from a gate, this fails instead of
-    /// silently regressing.
+    /// Source-scrape pin (B1 regression guard, extended for #5827): EVERY
+    /// connection-lifecycle cap gate — both promotion gates AND the outbound
+    /// pre-flight check in `handle_connect_peer` — must refuse at the cap through
+    /// the shared `refuses_connection_at_cap`, which carries the lattice
+    /// exemption. Without it a lattice edge is silently dropped at the cap on the
+    /// real CONNECT path and mechanism 3's at-capacity displacement is inert —
+    /// the exact defect the external review caught for the promotion gates (the
+    /// over-max unit test passed only because it bypassed the gate), and that
+    /// #5827 found still open in the pre-flight check.
+    ///
+    /// Comment lines are ignored so prose naming the predicate cannot satisfy
+    /// the pin, and a bare `>= connection_manager.max_connections` cap test in
+    /// code (the pre-#5827 pre-flight shape) fails it outright.
     #[test]
     fn lifecycle_gates_apply_lattice_over_cap_predicate() {
         const LIFECYCLE_SRC: &str =
             include_str!("../node/network_bridge/p2p_protoc/connection_lifecycle.rs");
-        let hits = LIFECYCLE_SRC
-            .matches("admits_lattice_edge_over_cap(loc)")
+        let code_lines: Vec<&str> = LIFECYCLE_SRC
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect();
+        let hits = code_lines
+            .iter()
+            .filter(|l| l.contains("connection_manager.refuses_connection_at_cap(loc)"))
             .count();
-        assert!(
-            hits >= 2,
-            "both lifecycle promotion cap-gates must apply \
-             admits_lattice_edge_over_cap(loc); found {hits} call site(s)"
+        assert_eq!(
+            hits, 3,
+            "the two promotion cap-gates and the outbound pre-flight check must each \
+             refuse through refuses_connection_at_cap(loc); found {hits} call site(s)"
         );
+        let bare = code_lines
+            .iter()
+            .filter(|l| l.contains(">= connection_manager.max_connections"))
+            .count();
+        assert_eq!(
+            bare, 0,
+            "a cap gate compares against max_connections without the lattice \
+             exemption; route it through refuses_connection_at_cap (#5827)"
+        );
+        // The pre-flight check specifically (the #5827 site): the code between
+        // its comment and its log line must make the call.
+        let start = LIFECYCLE_SRC
+            .find("Pre-flight max_connections check")
+            .expect("pre-flight anchor");
+        let end = start
+            + LIFECYCLE_SRC[start..]
+                .find("connect_peer: skipping connection — at max_connections")
+                .expect("pre-flight log line");
+        assert!(
+            LIFECYCLE_SRC[start..end]
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .any(|l| l.contains("refuses_connection_at_cap(loc)")),
+            "the outbound pre-flight check must apply the lattice exemption (#5827)"
+        );
+    }
+
+    /// #5827: at `max_connections` the shared cap predicate refuses an ordinary
+    /// candidate but lets a strictly-closer per-side nearest lattice edge
+    /// through, within the over-cap ceiling. This is the decision the outbound
+    /// pre-flight check now makes.
+    #[test]
+    fn refuses_connection_at_cap_exempts_lattice_edges() {
+        let _nn_guard = NnLatticeOverrideGuard;
+        set_nn_lattice_enabled(true);
+        let own = Location::new(0.5);
+        let cm = make_connection_manager(Some(make_addr(8000)), 1, 4, false);
+        cm.update_location(Some(own));
+        let keypair = TransportKeypair::new();
+        for (i, loc) in [0.4, 0.6, 0.1, 0.9].into_iter().enumerate() {
+            assert!(cm.add_connection(
+                Location::new(loc),
+                make_addr(8001 + i as u16),
+                keypair.public().clone(),
+                false
+            ));
+        }
+        assert_eq!(cm.connection_count(), 4);
+        // Not a lattice edge: farther than the held successor (0.6).
+        assert!(cm.refuses_connection_at_cap(Location::new(0.7)));
+        // A tighter successor than 0.6: the exemption applies.
+        assert!(!cm.refuses_connection_at_cap(Location::new(0.55)));
+        // Below the cap nothing is refused.
+        assert!(cm.prune_alive_connection(make_addr(8003)).is_some());
+        assert!(!cm.refuses_connection_at_cap(Location::new(0.7)));
     }
 
     #[test]
@@ -7101,3 +7600,7 @@ mod tests {
 #[cfg(test)]
 #[path = "lattice_degree_model.rs"]
 mod lattice_degree_model;
+
+#[cfg(test)]
+#[path = "admission_tests.rs"]
+mod admission_tests;

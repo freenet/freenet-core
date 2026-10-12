@@ -310,6 +310,7 @@ impl<'a> NetEventLog<'a> {
         forwarded_to: Option<PeerKeyLocation>,
         accepted: bool,
         ttl: u8,
+        admission: Option<crate::ring::admission::AdmissionCode>,
     ) -> Option<Self> {
         let peer_id = Self::get_own_peer_id(ring)?;
         // Look up the full peer info from connection manager if the peer is already connected
@@ -325,6 +326,7 @@ impl<'a> NetEventLog<'a> {
                 forwarded_to,
                 accepted,
                 ttl,
+                admission,
             }),
         })
     }

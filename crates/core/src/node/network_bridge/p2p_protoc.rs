@@ -1112,6 +1112,43 @@ pub(crate) fn version_supports_broadcast_target_list(
     remote.is_some_and(|v| v >= floor)
 }
 
+/// Has the CONNECT need variant (`ConnectMsg::RequestWithNeed`, #5858)
+/// actually SHIPPED, and in which release?
+///
+/// Same contract as [`BROADCAST_TARGET_LIST_SHIPPED_IN`], guarded by
+/// `connect_need_floor_tracks_the_shipping_release`: `None` means
+/// [`CONNECT_NEED_MIN_VERSION`] is a prediction that must stay strictly ABOVE
+/// the crate version; `Some(v)` means it shipped in `v`, which must equal the
+/// floor.
+///
+/// RELEASE-TIME ACTION: when the release carrying this feature is cut, set this
+/// to a LITERAL `Some((major, minor, patch))` of that release and freeze both.
+/// Write the literal, not `Some(CONNECT_NEED_MIN_VERSION)`, for the reason
+/// given on [`BROADCAST_TARGET_LIST_SHIPPED_IN`].
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) const CONNECT_NEED_SHIPPED_IN: Option<(u8, u8, u16)> = None;
+
+/// Version floor for sending `ConnectMsg::RequestWithNeed` (#5858).
+///
+/// Below this a peer has no variant index for it, fails to bincode-decode it,
+/// and closes the connection, so the gate fails closed on an unknown version
+/// and every such hop receives the legacy `ConnectMsg::Request` instead (the
+/// need is dropped, which is today's behaviour). No version-floor bump: the
+/// feature ramps in as the fleet upgrades past this release.
+///
+/// Set to the release after 0.2.144, the version this was written against.
+pub(crate) const CONNECT_NEED_MIN_VERSION: (u8, u8, u16) = (0, 2, 145);
+
+/// Pure version-gate for the CONNECT need variant, mirroring
+/// [`version_supports_broadcast_target_list`]: `true` iff `remote` is known
+/// (`Some`) AND at least `floor`.
+pub(crate) fn version_supports_connect_need(
+    remote: Option<(u8, u8, u16)>,
+    floor: (u8, u8, u16),
+) -> bool {
+    remote.is_some_and(|v| v >= floor)
+}
+
 /// Upper bound on the number of hosted contracts examined per new-peer
 /// migration trigger. Each examined contract may emit a best-effort
 /// non-blocking `try_send` (the SubscribeHint nudge), so an unbounded scan
@@ -3562,9 +3599,9 @@ fn extract_sender_from_message(msg: &NetMessage) -> Option<PeerKeyLocation> {
             // The address may be Unknown (peer behind NAT), but the pub_key is always present.
             // We return the joiner so that the transport layer can update its connection entry
             // with the peer's identity, enabling QueryConnections to return the peer.
-            NetMessageV1::Connect(ConnectMsg::Request { payload, .. }) => {
-                Some(payload.joiner.clone())
-            }
+            NetMessageV1::Connect(
+                ConnectMsg::Request { payload, .. } | ConnectMsg::RequestWithNeed { payload, .. },
+            ) => Some(payload.joiner.clone()),
             // Other Connect messages (Response, ObservedAddress) and all other operations
             // use hop-by-hop routing via upstream_addr in operation state.
             // No sender/target is embedded - routing is determined by transport layer.

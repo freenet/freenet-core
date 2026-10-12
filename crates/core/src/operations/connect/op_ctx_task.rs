@@ -185,8 +185,25 @@ pub(crate) async fn start_client_connect(
     let mut exclude_addrs = failed_addrs;
     exclude_addrs.extend(connected_addrs);
 
-    let request_msg =
-        super::prepare_join_request(tx, &own, &gateway, desired_location, ttl, &exclude_addrs);
+    // The joiner's stated need (#5858): short of connections, or the bar an
+    // acceptor must beat to improve its coverage of `desired_location`. Sent
+    // only if the first hop can decode it.
+    let need = op_manager
+        .ring
+        .connection_manager
+        .requester_need(desired_location);
+    let gateway_supports_need =
+        super::hop_supports_need(&op_manager.ring.connection_manager, gateway_addr, need);
+    let request_msg = super::prepare_join_request(
+        tx,
+        &own,
+        &gateway,
+        desired_location,
+        ttl,
+        &exclude_addrs,
+        need,
+        gateway_supports_need,
+    );
 
     if let Some(event) = NetEventLog::connect_request_sent(
         &tx,
@@ -598,7 +615,9 @@ async fn drive_client_connect_inner(
                     "connect driver: updated own_addr and location from ObservedAddress"
                 );
             }
-            other @ ConnectMsg::Request { .. } | other @ ConnectMsg::ConnectFailed { .. } => {
+            other @ ConnectMsg::Request { .. }
+            | other @ ConnectMsg::RequestWithNeed { .. }
+            | other @ ConnectMsg::ConnectFailed { .. } => {
                 // Bypass at node.rs forwards Response/Rejected/
                 // ObservedAddress/ConnectFailed. ConnectFailed is
                 // forwarded for the relay driver's inbox — but the
@@ -861,6 +880,7 @@ async fn drive_relay_connect(
             .map(|(peer, _)| peer.clone()),
         initial_actions.accept.is_some(),
         state.request.ttl,
+        initial_actions.admission,
     ) {
         op_manager.ring.register_events(Either::Left(event)).await;
     }
@@ -903,13 +923,16 @@ async fn drive_relay_connect(
                     let mut ctx = op_manager.op_ctx(incoming_tx);
                     let capacity =
                         compute_reply_capacity(op_manager.ring.connection_manager.min_connections);
+                    let request_msg = super::request_message_for(
+                        &op_manager.ring.connection_manager,
+                        addr,
+                        incoming_tx,
+                        request,
+                    );
                     match ctx
                         .send_to_and_collect_replies(
                             addr,
-                            NetMessage::V1(NetMessageV1::Connect(ConnectMsg::Request {
-                                id: incoming_tx,
-                                payload: request,
-                            })),
+                            NetMessage::V1(NetMessageV1::Connect(request_msg)),
                             capacity,
                         )
                         .await
@@ -1098,13 +1121,16 @@ async fn drive_relay_connect(
                         "CONNECT relay: retrying with different uphill peer after rejection"
                     );
                     if let Some(addr) = peer.socket_addr() {
+                        let request_msg = super::request_message_for(
+                            &op_manager.ring.connection_manager,
+                            addr,
+                            incoming_tx,
+                            forward_req,
+                        );
                         let mut ctx = op_manager.op_ctx(incoming_tx);
                         ctx.send_fire_and_forget(
                             addr,
-                            NetMessage::V1(NetMessageV1::Connect(ConnectMsg::Request {
-                                id: incoming_tx,
-                                payload: forward_req,
-                            })),
+                            NetMessage::V1(NetMessageV1::Connect(request_msg)),
                         )
                         .await?;
                     }
@@ -1269,13 +1295,16 @@ async fn drive_relay_connect(
                         "CONNECT relay: re-routing to different peer after ConnectFailed"
                     );
                     if let Some(addr) = peer.socket_addr() {
+                        let request_msg = super::request_message_for(
+                            &op_manager.ring.connection_manager,
+                            addr,
+                            incoming_tx,
+                            forward_req,
+                        );
                         let mut ctx = op_manager.op_ctx(incoming_tx);
                         ctx.send_fire_and_forget(
                             addr,
-                            NetMessage::V1(NetMessageV1::Connect(ConnectMsg::Request {
-                                id: incoming_tx,
-                                payload: forward_req,
-                            })),
+                            NetMessage::V1(NetMessageV1::Connect(request_msg)),
                         )
                         .await?;
                     }
@@ -1349,7 +1378,7 @@ async fn drive_relay_connect(
                     .await?;
                 }
             }
-            ConnectMsg::Request { .. } => {
+            ConnectMsg::Request { .. } | ConnectMsg::RequestWithNeed { .. } => {
                 // Driver bypass at node.rs filters Request — the
                 // dispatch gate handles it as the spawn signal. If a
                 // Request reaches the driver inbox the bypass logic

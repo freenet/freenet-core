@@ -76,6 +76,12 @@
 //!   favoring candidates that fill gaps in log-distance coverage
 //! - Between min and max → feed the gap score through the `ConnectionEvaluator`
 //!
+//! A requester may also state its need (`ConnectMsg::RequestWithNeed`, #5858, sent only to
+//! peers whose version decodes it): a requester short of connections is admitted from a
+//! small per-acceptor onboarding budget that bypasses the evaluator window, and a
+//! well-connected one states a bar that an acceptor must beat. See `ring::admission` and
+//! `ConnectionManager::evaluate_admission`.
+//!
 //! ## Routing
 //!
 //! The request is routed toward `desired_location` using greedy routing:
@@ -122,6 +128,7 @@ use crate::message::{InnerMessage, NodeEvent, Transaction};
 use crate::node::OpManager;
 use crate::node::network_status::StartupRoundOutcome;
 use crate::operations::OpError;
+use crate::ring::admission::{AdmissionCode, RequesterNeed};
 use crate::ring::{KnownPeerKeyLocation, PeerAddr, PeerKeyLocation};
 use crate::router::{EstimatorType, IsotonicEstimator, IsotonicEvent};
 use crate::transport::TransportKeypair;
@@ -216,12 +223,119 @@ pub(crate) enum ConnectMsg {
         id: Transaction,
         failed_acceptor_addr: SocketAddr,
     },
+    // ---------------------------------------------------------------------
+    // APPENDED (#5858), and any future variant must be appended too: bincode
+    // encodes the variant as its positional index, so inserting one above
+    // would renumber `Response`/`Rejected`/... and mis-decode every message
+    // from an older peer. `connect_msg_wire_variant_indices_are_frozen` pins it.
+    // ---------------------------------------------------------------------
+    /// [`ConnectMsg::Request`] plus the requester's stated need (#5858).
+    ///
+    /// Sent in place of `Request` only to a peer whose reported version is at
+    /// or above `crate::node::CONNECT_NEED_MIN_VERSION`: an older peer has no
+    /// variant index for it, fails to decode it, and closes the connection. To
+    /// every other peer the legacy `Request` goes instead, which drops the need
+    /// (exactly today's behaviour). Build outbound requests with
+    /// [`request_message_for`], which makes that choice.
+    ///
+    /// `improvement_bar` is `None` when the requester is short of connections
+    /// and `Some(d)` when it already holds a connection `d` from the target;
+    /// see [`RequesterNeed`]. It is decoded into `payload.need` by
+    /// [`ConnectMsg::inbound_request`].
+    RequestWithNeed {
+        id: Transaction,
+        payload: ConnectRequest,
+        improvement_bar: Option<f64>,
+    },
+}
+
+impl ConnectMsg {
+    /// The request an inbound `Request` or `RequestWithNeed` carries, with the
+    /// requester's need decoded into [`ConnectRequest::need`]. `None` for every
+    /// other variant.
+    ///
+    /// The single decode point for the need: a legacy `Request` yields
+    /// [`RequesterNeed::Unknown`] (its `need` field is not on the wire), so a
+    /// legacy requester is admitted exactly as before #5858.
+    pub(crate) fn inbound_request(&self) -> Option<(Transaction, ConnectRequest)> {
+        match self {
+            ConnectMsg::Request { id, payload } => {
+                let mut payload = payload.clone();
+                payload.need = RequesterNeed::Unknown;
+                Some((*id, payload))
+            }
+            ConnectMsg::RequestWithNeed {
+                id,
+                payload,
+                improvement_bar,
+            } => {
+                let mut payload = payload.clone();
+                payload.need = RequesterNeed::from_wire(*improvement_bar);
+                Some((*id, payload))
+            }
+            ConnectMsg::Response { .. }
+            | ConnectMsg::ObservedAddress { .. }
+            | ConnectMsg::Rejected { .. }
+            | ConnectMsg::ConnectFailed { .. } => None,
+        }
+    }
+
+    /// The wire form of `payload` for a next hop: `RequestWithNeed` when the
+    /// requester stated a need AND the hop can decode it, the legacy `Request`
+    /// otherwise. Prefer [`request_message_for`], which reads the hop's
+    /// version.
+    pub(crate) fn request_for_hop(
+        id: Transaction,
+        payload: ConnectRequest,
+        hop_supports_need: bool,
+    ) -> ConnectMsg {
+        match payload.need.to_wire() {
+            Some(improvement_bar) if hop_supports_need => ConnectMsg::RequestWithNeed {
+                id,
+                payload,
+                improvement_bar,
+            },
+            Some(_) | None => ConnectMsg::Request { id, payload },
+        }
+    }
+}
+
+/// Build the outbound CONNECT request for the peer at `hop` in the form that
+/// peer can decode (#5858): see [`ConnectMsg::request_for_hop`]. Every outbound
+/// `Request` is built here, so a need can never reach a peer that would drop
+/// the connection on it. A need dropped because the hop is pre-floor (or of
+/// unknown version) is counted (`AdmissionStats::need_downgraded_to_legacy`).
+pub(crate) fn request_message_for(
+    connection_manager: &crate::ring::ConnectionManager,
+    hop: SocketAddr,
+    id: Transaction,
+    payload: ConnectRequest,
+) -> ConnectMsg {
+    let hop_supports_need = hop_supports_need(connection_manager, hop, payload.need);
+    ConnectMsg::request_for_hop(id, payload, hop_supports_need)
+}
+
+/// Whether `need` can be sent to the peer at `hop` (#5858): there is a need to
+/// state and the hop's version decodes `ConnectMsg::RequestWithNeed`. The
+/// version gate is consulted (and a refusal counted) only when there is a need.
+pub(crate) fn hop_supports_need(
+    connection_manager: &crate::ring::ConnectionManager,
+    hop: SocketAddr,
+    need: RequesterNeed,
+) -> bool {
+    match need {
+        RequesterNeed::Unknown => false,
+        RequesterNeed::Short | RequesterNeed::Bar(_) => {
+            connection_manager.supports_connect_need(hop)
+        }
+    }
 }
 
 impl InnerMessage for ConnectMsg {
     fn id(&self) -> &Transaction {
         match self {
             ConnectMsg::Request { id, .. }
+            | ConnectMsg::RequestWithNeed { id, .. }
             | ConnectMsg::Response { id, .. }
             | ConnectMsg::ObservedAddress { id, .. }
             | ConnectMsg::Rejected { id, .. }
@@ -231,7 +345,9 @@ impl InnerMessage for ConnectMsg {
 
     fn requested_location(&self) -> Option<Location> {
         match self {
-            ConnectMsg::Request { payload, .. } => Some(payload.desired_location),
+            ConnectMsg::Request { payload, .. } | ConnectMsg::RequestWithNeed { payload, .. } => {
+                Some(payload.desired_location)
+            }
             ConnectMsg::Rejected {
                 desired_location, ..
             } => Some(*desired_location),
@@ -249,6 +365,19 @@ impl fmt::Display for ConnectMsg {
                 f,
                 "ConnectRequest {{ desired: {}, ttl: {}, uphill: {}, joiner: {} }}",
                 payload.desired_location, payload.ttl, payload.uphill_budget, payload.joiner
+            ),
+            ConnectMsg::RequestWithNeed {
+                payload,
+                improvement_bar,
+                ..
+            } => write!(
+                f,
+                "ConnectRequest {{ desired: {}, ttl: {}, uphill: {}, joiner: {}, improvement_bar: {:?} }}",
+                payload.desired_location,
+                payload.ttl,
+                payload.uphill_budget,
+                payload.joiner,
+                improvement_bar
             ),
             ConnectMsg::Response { payload, .. } => {
                 write!(f, "ConnectResponse {{ acceptor: {} }}", payload.acceptor,)
@@ -306,6 +435,13 @@ pub(crate) struct ConnectRequest {
     /// Bounds amplification to O(uphill_budget) per transaction regardless of TTL.
     #[serde(default = "default_uphill_budget")]
     pub uphill_budget: u8,
+    /// The requester's stated need (#5858). NOT on the wire as part of this
+    /// struct, so the legacy `ConnectMsg::Request` encoding is unchanged; it
+    /// travels as `ConnectMsg::RequestWithNeed::improvement_bar` to peers that
+    /// understand it, and is decoded by [`ConnectMsg::inbound_request`].
+    /// Relays forward it unchanged: it describes the requester, not the hop.
+    #[serde(skip)]
+    pub need: RequesterNeed,
 }
 
 fn default_uphill_budget() -> u8 {
@@ -366,11 +502,12 @@ pub(crate) trait RelayContext {
     /// Location of the current peer.
     fn self_location(&self) -> &PeerKeyLocation;
 
-    /// Determine whether we should accept the joiner immediately.
+    /// Decide whether to accept the joiner immediately, and why (#5858).
     ///
     /// Takes a `KnownPeerKeyLocation` to enforce at compile time that the joiner's
-    /// address must be known before acceptance decisions can be made.
-    fn should_accept(&self, joiner: &KnownPeerKeyLocation) -> bool;
+    /// address must be known before acceptance decisions can be made. `request`
+    /// supplies the requester's stated need and its target.
+    fn admit(&self, joiner: &KnownPeerKeyLocation, request: &ConnectRequest) -> AdmissionCode;
 
     /// Choose the next hop for the request, avoiding peers already visited.
     fn select_next_hop(
@@ -496,6 +633,10 @@ pub(crate) struct RelayActions {
     /// gate on this field — that would silently change which message the
     /// upstream peer receives.
     pub rejected: Option<RejectReason>,
+    /// The last admission decision this call made, if it consulted
+    /// [`RelayContext::admit`] at all (a relay that only forwards does not).
+    /// Telemetry only: carried on `connect_request_received` (#5858).
+    pub admission: Option<AdmissionCode>,
 }
 
 #[derive(Debug, Clone)]
@@ -719,7 +860,9 @@ impl RelayState {
                             if let Ok(joiner_known) =
                                 KnownPeerKeyLocation::try_from(&self.request.joiner)
                             {
-                                if ctx.should_accept(&joiner_known) {
+                                let admission = ctx.admit(&joiner_known, &self.request);
+                                actions.admission = Some(admission);
+                                if admission.accepted() {
                                     self.accepted_locally = true;
                                     let self_loc = ctx.self_location();
                                     let acceptor = PeerKeyLocation::with_unknown_addr(
@@ -766,10 +909,17 @@ impl RelayState {
                 None
             }
         };
+        let terminus_admission =
+            (is_terminus && !self.accepted_locally && self.forwarded_to.is_none())
+                .then(|| joiner_known.as_ref().map(|j| ctx.admit(j, &self.request)))
+                .flatten();
+        if terminus_admission.is_some() {
+            actions.admission = terminus_admission;
+        }
         if is_terminus
             && !self.accepted_locally
             && self.forwarded_to.is_none()
-            && joiner_known.as_ref().is_some_and(|j| ctx.should_accept(j))
+            && terminus_admission.is_some_and(AdmissionCode::accepted)
         {
             self.accepted_locally = true;
             // Use unknown address for the acceptor - the acceptor doesn't know their own
@@ -804,6 +954,16 @@ impl RelayState {
             //
             // With DEFAULT_UPHILL_BUDGET=8 and ~84% NAT failure rate, peers get
             // enough candidates for ~72% chance of finding a reachable acceptor.
+            //
+            // TODO(#5858): a requester with a bar (`RequesterNeed::Bar`) is
+            // helped only by an acceptor closer to the target than the bar, so
+            // it would be tempting to stop here instead of routing uphill when
+            // this terminus misses the bar. Not done: an uphill hop can still
+            // route back down to an unvisited peer closer than this terminus
+            // (the requester excludes its own connections from the walk), so a
+            // relay's local view cannot prove the request unsatisfiable. A
+            // clean early stop needs a bound on what the uphill detour can
+            // reach, which the simulation should measure first.
             if self.request.uphill_budget > 0 && self.request.ttl >= 2 {
                 let uphill_hop = ctx.select_uphill_hop(
                     self.request.desired_location,
@@ -910,26 +1070,28 @@ impl RelayContext for RelayEnv<'_> {
         &self.self_location
     }
 
-    fn should_accept(&self, joiner: &KnownPeerKeyLocation) -> bool {
+    fn admit(&self, joiner: &KnownPeerKeyLocation, request: &ConnectRequest) -> AdmissionCode {
         let addr = joiner.socket_addr();
         let location = joiner.location();
 
-        // Check blocklist before capacity. If we block this peer, return false
-        // so the uphill hop mechanism can route to an alternate acceptor.
+        // Check blocklist before capacity. If we block this peer, refuse so
+        // the uphill hop mechanism can route to an alternate acceptor.
         if let Some(blocked) = &self.op_manager.blocked_addresses {
             if blocked.contains(&addr) {
                 tracing::info!(
                     joiner_addr = %addr,
                     "connect: rejecting join from blocked peer at routing level"
                 );
-                return false;
+                return AdmissionCode::RejectedBlocked;
             }
         }
 
-        self.op_manager
-            .ring
-            .connection_manager
-            .should_accept(location, addr)
+        self.op_manager.ring.connection_manager.evaluate_admission(
+            location,
+            addr,
+            request.need,
+            Some(request.desired_location),
+        )
     }
 
     fn select_next_hop(
@@ -1303,7 +1465,16 @@ impl ConnectOp {
         exclude_addrs: &[SocketAddr],
     ) -> (Transaction, Self, ConnectMsg) {
         let tx = Transaction::new::<ConnectMsg>();
-        let msg = prepare_join_request(tx, &own, &target, desired_location, ttl, exclude_addrs);
+        let msg = prepare_join_request(
+            tx,
+            &own,
+            &target,
+            desired_location,
+            ttl,
+            exclude_addrs,
+            RequesterNeed::Unknown,
+            false,
+        );
 
         let op = ConnectOp::new_joiner(
             tx,
@@ -1480,6 +1651,10 @@ pub(super) async fn dispatch_expect_connection_from(
 /// the FP rate is negligible (~0.01%). At DEFAULT_MAX_CONNECTIONS (200),
 /// the rate reaches ~39%, which would cause routing to occasionally skip
 /// reachable peers. This is an accepted trade-off for current network sizes.
+///
+/// `need` is the joiner's stated need (#5858) and `target_supports_need`
+/// whether `target` can decode it; see [`ConnectMsg::request_for_hop`].
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn prepare_join_request(
     tx: Transaction,
     own: &PeerKeyLocation,
@@ -1487,6 +1662,8 @@ pub(crate) fn prepare_join_request(
     desired_location: Location,
     ttl: u8,
     exclude_addrs: &[SocketAddr],
+    need: RequesterNeed,
+    target_supports_need: bool,
 ) -> ConnectMsg {
     let mut visited = VisitedPeers::new(&tx);
     if let Some(own_addr) = own.socket_addr() {
@@ -1515,12 +1692,10 @@ pub(crate) fn prepare_join_request(
         ttl,
         visited,
         uphill_budget: DEFAULT_UPHILL_BUDGET,
+        need,
     };
 
-    ConnectMsg::Request {
-        id: tx,
-        payload: request,
-    }
+    ConnectMsg::request_for_hop(tx, request, target_supports_need)
 }
 
 #[tracing::instrument(fields(peer = %op_manager.ring.connection_manager.pub_key), skip_all)]
@@ -3034,8 +3209,16 @@ mod tests {
             &self.self_loc
         }
 
-        fn should_accept(&self, _joiner: &KnownPeerKeyLocation) -> bool {
-            self.accept
+        fn admit(
+            &self,
+            _joiner: &KnownPeerKeyLocation,
+            _request: &ConnectRequest,
+        ) -> AdmissionCode {
+            if self.accept {
+                AdmissionCode::AcceptedSelfInterest
+            } else {
+                AdmissionCode::RejectedEvaluatorWindow
+            }
         }
 
         fn select_next_hop(
@@ -3239,6 +3422,7 @@ mod tests {
                 ttl: 3,
                 visited: VisitedPeers::default(),
                 uphill_budget: DEFAULT_UPHILL_BUDGET,
+                need: RequesterNeed::Unknown,
             },
             forwarded_to: None,
             forwarded_at: None,
@@ -3288,6 +3472,7 @@ mod tests {
                 ttl: 3,
                 visited: VisitedPeers::default(),
                 uphill_budget: DEFAULT_UPHILL_BUDGET,
+                need: RequesterNeed::Unknown,
             },
             forwarded_to: None,
             forwarded_at: None,
@@ -3337,6 +3522,7 @@ mod tests {
                 ttl: 2,
                 visited: VisitedPeers::default(),
                 uphill_budget: DEFAULT_UPHILL_BUDGET,
+                need: RequesterNeed::Unknown,
             },
             forwarded_to: None,
             forwarded_at: None,
@@ -3390,6 +3576,7 @@ mod tests {
                 ttl: 3,
                 visited: VisitedPeers::default(),
                 uphill_budget: DEFAULT_UPHILL_BUDGET,
+                need: RequesterNeed::Unknown,
             },
             forwarded_to: None,
             forwarded_at: None,
@@ -3459,6 +3646,7 @@ mod tests {
                 ttl: 3,
                 visited: VisitedPeers::default(),
                 uphill_budget: DEFAULT_UPHILL_BUDGET,
+                need: RequesterNeed::Unknown,
             },
             forwarded_to: None,
             forwarded_at: None,
@@ -3530,6 +3718,7 @@ mod tests {
                 ttl: 3,
                 visited: VisitedPeers::default(),
                 uphill_budget: DEFAULT_UPHILL_BUDGET,
+                need: RequesterNeed::Unknown,
             },
             forwarded_to: None,
             forwarded_at: None,
@@ -3607,7 +3796,8 @@ mod tests {
                     assert!(visited.probably_visited(target_addr));
                 }
             }
-            other @ ConnectMsg::Response { .. }
+            other @ ConnectMsg::RequestWithNeed { .. }
+            | other @ ConnectMsg::Response { .. }
             | other @ ConnectMsg::ObservedAddress { .. }
             | other @ ConnectMsg::Rejected { .. }
             | other @ ConnectMsg::ConnectFailed { .. } => panic!("unexpected message: {other:?}"),
@@ -3638,6 +3828,7 @@ mod tests {
             ttl: 3,
             visited,
             uphill_budget: DEFAULT_UPHILL_BUDGET,
+            need: RequesterNeed::Unknown,
         };
 
         let mut relay_op = ConnectOp::new_relay(
@@ -3720,6 +3911,7 @@ mod tests {
                 ttl: 3,
                 visited: VisitedPeers::default(),
                 uphill_budget: DEFAULT_UPHILL_BUDGET,
+                need: RequesterNeed::Unknown,
             },
             forwarded_to: None,
             forwarded_at: None,
@@ -3804,6 +3996,7 @@ mod tests {
             ttl: 3,
             visited,
             uphill_budget: DEFAULT_UPHILL_BUDGET,
+            need: RequesterNeed::Unknown,
         };
 
         let mut relay_op = ConnectOp::new_relay(
@@ -3889,6 +4082,7 @@ mod tests {
                 ttl: 3,
                 visited: VisitedPeers::default(),
                 uphill_budget: DEFAULT_UPHILL_BUDGET,
+                need: RequesterNeed::Unknown,
             },
             forwarded_to: None,
             forwarded_at: None,
@@ -3982,6 +4176,7 @@ mod tests {
                 ttl: 3,
                 visited: VisitedPeers::default(),
                 uphill_budget: DEFAULT_UPHILL_BUDGET,
+                need: RequesterNeed::Unknown,
             },
             // Simulate a prior forward that completed: the operation has
             // already committed to a path and must not also accept locally.
@@ -4056,6 +4251,7 @@ mod tests {
             ttl: 3,
             visited,
             uphill_budget: DEFAULT_UPHILL_BUDGET,
+            need: RequesterNeed::Unknown,
         };
 
         // Create the relay op as `new_relay` would on first receipt.
@@ -4130,6 +4326,7 @@ mod tests {
                 ttl: 3,
                 visited: VisitedPeers::default(),
                 uphill_budget: DEFAULT_UPHILL_BUDGET,
+                need: RequesterNeed::Unknown,
             },
             forwarded_to: None,
             forwarded_at: None,
@@ -4179,6 +4376,7 @@ mod tests {
                 ttl: 0, // TTL exhausted
                 visited: VisitedPeers::default(),
                 uphill_budget: DEFAULT_UPHILL_BUDGET,
+                need: RequesterNeed::Unknown,
             },
             forwarded_to: None,
             forwarded_at: None,
@@ -4243,6 +4441,7 @@ mod tests {
                 ttl: 3,
                 visited: VisitedPeers::default(),
                 uphill_budget: DEFAULT_UPHILL_BUDGET,
+                need: RequesterNeed::Unknown,
             },
             forwarded_to: None,
             forwarded_at: None,
@@ -4311,6 +4510,7 @@ mod tests {
                 ttl: 3,
                 visited: VisitedPeers::default(),
                 uphill_budget: DEFAULT_UPHILL_BUDGET,
+                need: RequesterNeed::Unknown,
             },
             forwarded_to: None,
             forwarded_at: None,
@@ -4365,6 +4565,7 @@ mod tests {
                 ttl: 0, // TTL exhausted
                 visited: VisitedPeers::default(),
                 uphill_budget: DEFAULT_UPHILL_BUDGET,
+                need: RequesterNeed::Unknown,
             },
             forwarded_to: None,
             forwarded_at: None,
@@ -4418,6 +4619,7 @@ mod tests {
                 ttl: 5, // TTL is fine
                 visited: VisitedPeers::default(),
                 uphill_budget: 0, // Budget exhausted
+                need: RequesterNeed::Unknown,
             },
             forwarded_to: None,
             forwarded_at: None,
@@ -4550,7 +4752,8 @@ mod tests {
         // Extract the request from the message
         let request = match msg {
             ConnectMsg::Request { payload, .. } => payload,
-            ConnectMsg::Response { .. }
+            ConnectMsg::RequestWithNeed { .. }
+            | ConnectMsg::Response { .. }
             | ConnectMsg::ObservedAddress { .. }
             | ConnectMsg::Rejected { .. }
             | ConnectMsg::ConnectFailed { .. } => panic!("Expected ConnectMsg::Request"),
@@ -4624,6 +4827,7 @@ mod tests {
                 ttl: 3,
                 visited: VisitedPeers::default(),
                 uphill_budget: DEFAULT_UPHILL_BUDGET,
+                need: RequesterNeed::Unknown,
             },
             forwarded_to: None,
             forwarded_at: None,
@@ -4668,6 +4872,7 @@ mod tests {
                 ttl: 0, // TTL exhausted
                 visited: VisitedPeers::default(),
                 uphill_budget: DEFAULT_UPHILL_BUDGET,
+                need: RequesterNeed::Unknown,
             },
             forwarded_to: None,
             forwarded_at: None,
@@ -4711,6 +4916,7 @@ mod tests {
                 ttl: 3,
                 visited: VisitedPeers::default(),
                 uphill_budget: DEFAULT_UPHILL_BUDGET,
+                need: RequesterNeed::Unknown,
             },
             forwarded_to: None,
             forwarded_at: None,
@@ -4763,6 +4969,7 @@ mod tests {
                 ttl: 3,
                 visited: VisitedPeers::default(),
                 uphill_budget: DEFAULT_UPHILL_BUDGET,
+                need: RequesterNeed::Unknown,
             },
             forwarded_to: None,
             forwarded_at: None,
@@ -4828,6 +5035,7 @@ mod tests {
                 ttl: 3,
                 visited: VisitedPeers::default(),
                 uphill_budget: DEFAULT_UPHILL_BUDGET,
+                need: RequesterNeed::Unknown,
             },
             forwarded_to: None,
             forwarded_at: None,
@@ -4900,6 +5108,7 @@ mod tests {
                 ttl: 3,
                 visited: VisitedPeers::default(),
                 uphill_budget: DEFAULT_UPHILL_BUDGET,
+                need: RequesterNeed::Unknown,
             },
             forwarded_to: None,
             forwarded_at: None,
@@ -5047,6 +5256,322 @@ mod tests {
         assert_eq!(scored[0].1.pub_key(), &good_key);
     }
 
+    // ==================== Requester need on the wire (#5858) ====================
+
+    fn need_request(need: RequesterNeed) -> ConnectRequest {
+        ConnectRequest {
+            desired_location: Location::new(0.3),
+            joiner: PeerKeyLocation::random(),
+            ttl: 5,
+            visited: VisitedPeers::default(),
+            uphill_budget: DEFAULT_UPHILL_BUDGET,
+            need,
+        }
+    }
+
+    /// bincode encodes an enum variant as its positional index (a
+    /// little-endian u32 prefix), so the five pre-#5858 `ConnectMsg` variants
+    /// must keep their indices and `RequestWithNeed` must be appended. A peer
+    /// on an older build decodes by index; an insertion above would make it
+    /// mis-read every CONNECT message.
+    #[test]
+    fn connect_msg_wire_variant_indices_are_frozen() {
+        fn variant_index(msg: &ConnectMsg) -> u32 {
+            let bytes = bincode::serialize(msg).expect("serialize ConnectMsg");
+            u32::from_le_bytes(bytes[..4].try_into().expect("variant index prefix"))
+        }
+        let tx = Transaction::new::<ConnectMsg>();
+        let addr: SocketAddr = "10.0.0.5:9000".parse().unwrap();
+        let cases = [
+            (
+                ConnectMsg::Request {
+                    id: tx,
+                    payload: need_request(RequesterNeed::Unknown),
+                },
+                0,
+            ),
+            (
+                ConnectMsg::Response {
+                    id: tx,
+                    payload: ConnectResponse {
+                        acceptor: PeerKeyLocation::random(),
+                    },
+                },
+                1,
+            ),
+            (
+                ConnectMsg::ObservedAddress {
+                    id: tx,
+                    address: addr,
+                },
+                2,
+            ),
+            (
+                ConnectMsg::Rejected {
+                    id: tx,
+                    desired_location: Location::new(0.1),
+                },
+                3,
+            ),
+            (
+                ConnectMsg::ConnectFailed {
+                    id: tx,
+                    failed_acceptor_addr: addr,
+                },
+                4,
+            ),
+            (
+                ConnectMsg::RequestWithNeed {
+                    id: tx,
+                    payload: need_request(RequesterNeed::Short),
+                    improvement_bar: None,
+                },
+                5,
+            ),
+        ];
+        for (msg, want) in cases {
+            assert_eq!(variant_index(&msg), want, "{msg} must stay variant {want}");
+        }
+    }
+
+    /// The need is not part of the legacy encoding: a `Request` built from a
+    /// short requester is byte-identical to one built with no need, so an old
+    /// peer decodes it exactly as before, and it decodes here as `Unknown`.
+    #[test]
+    fn legacy_request_encoding_is_unchanged_and_decodes_as_unknown_need() {
+        let tx = Transaction::new::<ConnectMsg>();
+        let short = need_request(RequesterNeed::Short);
+        let mut unknown = short.clone();
+        unknown.need = RequesterNeed::Unknown;
+        let with_need = bincode::serialize(&ConnectMsg::Request {
+            id: tx,
+            payload: short,
+        })
+        .unwrap();
+        let without = bincode::serialize(&ConnectMsg::Request {
+            id: tx,
+            payload: unknown,
+        })
+        .unwrap();
+        assert_eq!(
+            with_need, without,
+            "the need must not leak into the legacy form"
+        );
+
+        let decoded: ConnectMsg = bincode::deserialize(&with_need).unwrap();
+        let (id, payload) = decoded.inbound_request().expect("a request");
+        assert_eq!(id, tx);
+        assert_eq!(payload.need, RequesterNeed::Unknown);
+    }
+
+    #[test]
+    fn request_with_need_round_trips_short_and_bar() {
+        let tx = Transaction::new::<ConnectMsg>();
+        for need in [RequesterNeed::Short, RequesterNeed::Bar(0.0625)] {
+            let msg = ConnectMsg::request_for_hop(tx, need_request(need), true);
+            assert!(matches!(msg, ConnectMsg::RequestWithNeed { .. }), "{msg}");
+            let bytes = bincode::serialize(&msg).unwrap();
+            let decoded: ConnectMsg = bincode::deserialize(&bytes).unwrap();
+            let (_, payload) = decoded.inbound_request().expect("a request");
+            assert_eq!(payload.need, need);
+            assert_eq!(payload.desired_location, Location::new(0.3));
+        }
+    }
+
+    #[test]
+    fn request_for_hop_sends_the_need_only_to_a_capable_hop() {
+        let tx = Transaction::new::<ConnectMsg>();
+        assert!(matches!(
+            ConnectMsg::request_for_hop(tx, need_request(RequesterNeed::Short), false),
+            ConnectMsg::Request { .. }
+        ));
+        assert!(matches!(
+            ConnectMsg::request_for_hop(tx, need_request(RequesterNeed::Unknown), true),
+            ConnectMsg::Request { .. }
+        ));
+        assert!(matches!(
+            ConnectMsg::request_for_hop(tx, need_request(RequesterNeed::Bar(0.2)), true),
+            ConnectMsg::RequestWithNeed {
+                improvement_bar: Some(_),
+                ..
+            }
+        ));
+    }
+
+    /// `request_message_for` reads the hop's recorded version: a pre-floor or
+    /// unknown peer gets the legacy `Request` (it could not decode the new
+    /// variant and would drop the connection), a capable one gets the need.
+    #[test]
+    fn request_message_for_gates_the_need_on_the_hops_version() {
+        let cm = crate::ring::ConnectionManager::test_default();
+        let floor = crate::node::CONNECT_NEED_MIN_VERSION;
+        let old: SocketAddr = "10.0.0.6:9000".parse().unwrap();
+        let capable: SocketAddr = "10.0.0.7:9000".parse().unwrap();
+        let unknown: SocketAddr = "10.0.0.8:9000".parse().unwrap();
+        cm.record_remote_version(old, Some((floor.0, floor.1, floor.2 - 1)));
+        cm.record_remote_version(capable, Some(floor));
+        let tx = Transaction::new::<ConnectMsg>();
+        let short = || need_request(RequesterNeed::Short);
+        assert!(matches!(
+            request_message_for(&cm, old, tx, short()),
+            ConnectMsg::Request { .. }
+        ));
+        assert!(matches!(
+            request_message_for(&cm, unknown, tx, short()),
+            ConnectMsg::Request { .. }
+        ));
+        assert!(matches!(
+            request_message_for(&cm, capable, tx, short()),
+            ConnectMsg::RequestWithNeed {
+                improvement_bar: None,
+                ..
+            }
+        ));
+    }
+
+    /// The hop that matters most (#5858): a FRESH joiner — zero ring
+    /// connections, only its transient transport link to the gateway — must
+    /// send the need form to a capable gateway. In production the joiner learns
+    /// the gateway's version from `AckConnectionV2` (#5161,
+    /// `transport::connection_handler`), and `connection_lifecycle` records it
+    /// on `ConnectionManager` for every transport connection, transient ones
+    /// included; that record is what this test stages. The steps are the ones
+    /// `start_client_connect` takes (pinned below by
+    /// `drivers_build_outbound_requests_through_the_version_gate`).
+    #[test]
+    fn fresh_joiner_sends_its_need_to_a_capable_gateway() {
+        let cm = crate::ring::ConnectionManager::test_default();
+        assert_eq!(cm.connection_count(), 0);
+        let gateway_addr: SocketAddr = "10.0.0.9:31337".parse().unwrap();
+        let gateway = PeerKeyLocation::new(TransportKeypair::new().public().clone(), gateway_addr);
+        let own = PeerKeyLocation::random();
+        let desired = Location::new(0.4);
+        let tx = Transaction::new::<ConnectMsg>();
+
+        let need = cm.requester_need(desired);
+        assert_eq!(need, RequesterNeed::Short, "zero ring connections is short");
+
+        // Gateway of unknown (or pre-floor) version: the legacy form.
+        let legacy = prepare_join_request(
+            tx,
+            &own,
+            &gateway,
+            desired,
+            5,
+            &[],
+            need,
+            hop_supports_need(&cm, gateway_addr, need),
+        );
+        assert!(matches!(legacy, ConnectMsg::Request { .. }), "{legacy}");
+
+        // Capable gateway: the need form, decoded as short on arrival.
+        cm.record_remote_version(gateway_addr, Some(crate::node::CONNECT_NEED_MIN_VERSION));
+        let msg = prepare_join_request(
+            tx,
+            &own,
+            &gateway,
+            desired,
+            5,
+            &[],
+            need,
+            hop_supports_need(&cm, gateway_addr, need),
+        );
+        assert!(
+            matches!(
+                msg,
+                ConnectMsg::RequestWithNeed {
+                    improvement_bar: None,
+                    ..
+                }
+            ),
+            "{msg}"
+        );
+        let decoded: ConnectMsg = bincode::deserialize(&bincode::serialize(&msg).unwrap()).unwrap();
+        let (_, payload) = decoded.inbound_request().expect("a request");
+        assert_eq!(payload.need, RequesterNeed::Short);
+    }
+
+    /// Every outbound CONNECT request the drivers send goes through
+    /// `request_message_for` (or `prepare_join_request`, which takes the same
+    /// decision for the first hop), so none can carry a need to a peer that
+    /// cannot decode it, and none silently drops one to a peer that can.
+    #[test]
+    fn drivers_build_outbound_requests_through_the_version_gate() {
+        const DRIVER_SRC: &str = include_str!("connect/op_ctx_task.rs");
+        let code: Vec<&str> = DRIVER_SRC
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect();
+        // Construction sites, not `{ .. }` match patterns.
+        let constructions = |line: &str, variant: &str| {
+            line.matches(&format!("ConnectMsg::{variant} {{")).count()
+                - line
+                    .matches(&format!("ConnectMsg::{variant} {{ .. }}"))
+                    .count()
+        };
+        let literal_requests: usize = code
+            .iter()
+            .map(|l| constructions(l, "Request") + constructions(l, "RequestWithNeed"))
+            .sum();
+        assert_eq!(
+            literal_requests, 0,
+            "a driver builds a CONNECT request literal; use request_message_for"
+        );
+        let gated = code
+            .iter()
+            .filter(|l| l.contains("super::request_message_for("))
+            .count();
+        assert_eq!(gated, 3, "the forward, retry and re-route sends");
+        assert!(
+            code.iter().any(|l| l.contains("super::hop_supports_need(")),
+            "the joiner's first hop must be version-gated too"
+        );
+        // ...and start_client_connect must hand both the need and that
+        // decision to prepare_join_request, not a constant.
+        let start = DRIVER_SRC
+            .find("pub(crate) async fn start_client_connect(")
+            .expect("start_client_connect");
+        let body = &DRIVER_SRC[start..];
+        let call = body
+            .find("super::prepare_join_request(")
+            .expect("start_client_connect builds its request with prepare_join_request");
+        let args = &body[call..call + body[call..].find(");").expect("call end")];
+        assert!(
+            args.contains("need,") && args.contains("gateway_supports_need,"),
+            "start_client_connect must pass the joiner's need and the gateway's \
+             capability to prepare_join_request: {args}"
+        );
+    }
+
+    /// The relay reports the admission decision it made, for telemetry.
+    #[test]
+    fn relay_reports_its_admission_decision() {
+        let self_loc = make_peer(4000);
+        let joiner = make_peer(5000);
+        let mut state = RelayState {
+            upstream_addr: joiner.socket_addr().expect("test peer must have address"),
+            request: need_request(RequesterNeed::Short),
+            forwarded_to: None,
+            forwarded_at: None,
+            observed_sent: false,
+            accepted_locally: false,
+            response_forwarded: false,
+        };
+        state.request.joiner = joiner;
+        let ctx = TestRelayContext::new(self_loc).accept(false);
+        let actions = state.handle_request(
+            &ctx,
+            &HashMap::new(),
+            &mut HashMap::new(),
+            &ConnectForwardEstimator::new(),
+            Instant::now(),
+        );
+        assert_eq!(
+            actions.admission,
+            Some(AdmissionCode::RejectedEvaluatorWindow)
+        );
+    }
+
     // ==================== ConnectFailed + Jitter + Exclusion Tests ====================
 
     #[test]
@@ -5071,6 +5596,7 @@ mod tests {
                 assert_eq!(failed_acceptor_addr, addr);
             }
             ConnectMsg::Request { .. }
+            | ConnectMsg::RequestWithNeed { .. }
             | ConnectMsg::Response { .. }
             | ConnectMsg::ObservedAddress { .. }
             | ConnectMsg::Rejected { .. } => {
@@ -5271,6 +5797,7 @@ mod tests {
                 ttl: 5,
                 visited: VisitedPeers::new(&Transaction::new::<ConnectMsg>()),
                 uphill_budget: DEFAULT_UPHILL_BUDGET,
+                need: RequesterNeed::Unknown,
             },
             forwarded_to: Some(relay_peer),
             forwarded_at: Some(Instant::now()),
@@ -5319,7 +5846,8 @@ mod tests {
 
         let request = match msg {
             ConnectMsg::Request { payload, .. } => payload,
-            ConnectMsg::Response { .. }
+            ConnectMsg::RequestWithNeed { .. }
+            | ConnectMsg::Response { .. }
             | ConnectMsg::ObservedAddress { .. }
             | ConnectMsg::Rejected { .. }
             | ConnectMsg::ConnectFailed { .. } => panic!("Expected ConnectMsg::Request"),
@@ -5487,6 +6015,7 @@ mod tests {
                 ttl: 3,
                 visited: VisitedPeers::default(),
                 uphill_budget: DEFAULT_UPHILL_BUDGET,
+                need: RequesterNeed::Unknown,
             },
             forwarded_to: None,
             forwarded_at: None,
@@ -5519,6 +6048,7 @@ mod tests {
                 ttl: 0, // TTL exhausted
                 visited: VisitedPeers::default(),
                 uphill_budget: DEFAULT_UPHILL_BUDGET,
+                need: RequesterNeed::Unknown,
             },
             forwarded_to: None,
             forwarded_at: None,
@@ -5549,6 +6079,7 @@ mod tests {
                 ttl: 5,           // TTL is fine
                 uphill_budget: 0, // budget spent
                 visited: VisitedPeers::default(),
+                need: RequesterNeed::Unknown,
             },
             forwarded_to: None,
             forwarded_at: None,
@@ -5583,6 +6114,7 @@ mod tests {
                 ttl: 0,           // reach spent
                 uphill_budget: 0, // budget spent
                 visited: VisitedPeers::default(),
+                need: RequesterNeed::Unknown,
             },
             forwarded_to: None,
             forwarded_at: None,

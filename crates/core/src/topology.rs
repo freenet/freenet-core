@@ -964,6 +964,51 @@ impl TopologyManager {
             return TopologyAdjustment::NoChange;
         }
 
+        let Some(remove) = self.least_valuable_prunable_peer(my_location, neighbor_locations)
+        else {
+            return TopologyAdjustment::NoChange;
+        };
+
+        // Target the largest gap for the replacement connection.
+        let add_location = small_world_rand::gap_target_directional(my_loc, &signed_distances);
+
+        info!(
+            largest_gap,
+            expected_gap,
+            excess,
+            swap_prob,
+            remove_peer = %remove,
+            add_target = %add_location,
+            "Topology swap triggered: replacing least-routed peer with gap-targeted connection"
+        );
+
+        TopologyAdjustment::SwapConnection {
+            remove,
+            add_location,
+        }
+    }
+
+    /// The connection a topology swap would shed: the lowest composite score
+    /// of normalized routing value (raw request count) and topology importance
+    /// ([`composite_score`]), skipping the protected lattice edges and any
+    /// topology-critical connection. `None` when every connection is protected
+    /// or own location is unknown.
+    ///
+    /// Also the "would self-interest keep this link?" test applied to an
+    /// onboarding link at the end of its probation (#5858,
+    /// `ConnectionManager::review_provisional_links`): a link this ranking does
+    /// not name is one the peer would keep on its merits.
+    pub(crate) fn least_valuable_prunable_peer(
+        &self,
+        my_location: &Option<Location>,
+        neighbor_locations: &BTreeMap<Location, Vec<Connection>>,
+    ) -> Option<PeerKeyLocation> {
+        let my_loc = (*my_location)?;
+        let signed_distances: Vec<f64> = neighbor_locations
+            .keys()
+            .map(|nloc| my_loc.signed_distance(*nloc))
+            .collect();
+
         // Never swap away a guaranteed nearest-neighbor lattice edge
         // (mechanism 4). Gated on the lattice being active for this peer's budget
         // (empty below the minimum-degree floor).
@@ -1002,7 +1047,7 @@ impl TopologyManager {
 
         // Find the best peer to drop: lowest composite score of normalized
         // routing value and topology importance, respecting the topology guard.
-        let remove = peers_with_routing
+        peers_with_routing
             .into_iter()
             .filter_map(|(peer, peer_signed_dist, routing_value, peers_at_loc)| {
                 let normalized = if max_routing > 0.0 {
@@ -1019,29 +1064,7 @@ impl TopologyManager {
                 Some((peer, score))
             })
             .min_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(Ordering::Equal))
-            .map(|(peer, _)| peer);
-
-        let Some(remove) = remove else {
-            return TopologyAdjustment::NoChange;
-        };
-
-        // Target the largest gap for the replacement connection.
-        let add_location = small_world_rand::gap_target_directional(my_loc, &signed_distances);
-
-        info!(
-            largest_gap,
-            expected_gap,
-            excess,
-            swap_prob,
-            remove_peer = %remove,
-            add_target = %add_location,
-            "Topology swap triggered: replacing least-routed peer with gap-targeted connection"
-        );
-
-        TopologyAdjustment::SwapConnection {
-            remove,
-            add_location,
-        }
+            .map(|(peer, _)| peer)
     }
 }
 

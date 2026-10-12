@@ -82,6 +82,7 @@ const _: () = {
     );
 };
 
+pub(crate) mod admission;
 pub(crate) mod broadcast_coverage;
 mod broken_invariants;
 mod connection_backoff;
@@ -2062,6 +2063,24 @@ impl Ring {
             snapshot.lattice_probes_issued = Some(lattice_probes_issued);
             snapshot.lattice_probe_improvements = Some(lattice_probe_improvements);
             snapshot.lattice_probe_misses = Some(cm.lattice_probe_miss_total());
+
+            // CONNECT admission by path and onboarding probation outcomes
+            // (#5858). Hand-mirrored into `event_kind_to_json`, pinned by
+            // `router_snapshot_json_includes_connect_admission_counters`.
+            let admission = cm.admission_stats();
+            snapshot.connect_admitted_self_interest = Some(admission.admitted_self_interest);
+            snapshot.connect_admitted_onboarding = Some(admission.admitted_onboarding);
+            snapshot.connect_admitted_lattice = Some(admission.admitted_lattice);
+            snapshot.connect_rejected_onboarding_budget_exhausted =
+                Some(admission.rejected_onboarding_budget_exhausted);
+            snapshot.connect_rejected_bar_unmet = Some(admission.rejected_bar_unmet);
+            snapshot.connect_provisional_graduated = Some(admission.provisional_graduated);
+            snapshot.connect_provisional_dropped = Some(admission.provisional_dropped);
+            snapshot.connect_provisional_pruned = Some(admission.provisional_pruned);
+            snapshot.connect_provisional_released_unestablished =
+                Some(admission.provisional_released_unestablished);
+            snapshot.connect_need_downgraded_to_legacy = Some(admission.need_downgraded_to_legacy);
+            snapshot.connect_provisional_in_use = Some(admission.provisional_in_use);
 
             // Version-gate refusal counters (#5156): why
             // `supports_hash_first_summaries` / `supports_summary_first_put`
@@ -6398,6 +6417,23 @@ impl Ring {
             // to supply a `SharedMockTimeSource` without pausing the whole tokio runtime.
             let tick_now = self.time_source.now();
 
+            // End-of-probation review of onboarding links (#5858): keep the ones
+            // this peer's self-interest would keep, drop the rest so their slots
+            // serve the next joiner. Non-blocking: a drop the event loop cannot
+            // take now leaves the link in place as an ordinary connection (its
+            // slot is already freed), which is the pre-#5858 outcome.
+            for addr in self.connection_manager.review_provisional_links(tick_now) {
+                if let Err(e) = notifier.notifications_sender.try_send(Either::Right(
+                    crate::message::NodeEvent::DropConnection(addr),
+                )) {
+                    tracing::warn!(
+                        peer = %addr,
+                        error = %e,
+                        "Could not queue drop of onboarding link after probation"
+                    );
+                }
+            }
+
             // Expire old NAT traversal failure entries
             self.connection_manager.cleanup_stale_failed_addrs();
 
@@ -6841,7 +6877,20 @@ impl Ring {
                         pending_conn_adds.extend(target_locs.into_iter().take(allowed));
                     }
                 }
-                TopologyAdjustment::RemoveConnections(should_disconnect_peers) => {
+                TopologyAdjustment::RemoveConnections(mut should_disconnect_peers) => {
+                    // A link still on probation is shed first (#5858).
+                    if let Some(first) = should_disconnect_peers.first_mut() {
+                        if let Some(substitute) =
+                            self.connection_manager.probation_prune_substitute(first)
+                        {
+                            tracing::info!(
+                                recommended = %first,
+                                substitute = %substitute,
+                                "Topology prune: shedding a link on probation instead"
+                            );
+                            *first = substitute;
+                        }
+                    }
                     for peer in should_disconnect_peers {
                         if let Some(addr) = peer.socket_addr() {
                             notifier
@@ -6861,9 +6910,20 @@ impl Ring {
                     }
                 }
                 TopologyAdjustment::SwapConnection {
-                    remove,
+                    mut remove,
                     add_location,
                 } => {
+                    // A link still on probation is shed first (#5858).
+                    if let Some(substitute) =
+                        self.connection_manager.probation_prune_substitute(&remove)
+                    {
+                        tracing::info!(
+                            recommended = %remove,
+                            substitute = %substitute,
+                            "Topology swap: shedding a link on probation instead"
+                        );
+                        remove = substitute;
+                    }
                     // Connect-first swap: defer the drop until the replacement
                     // connects (connection_count > min_connections), preventing
                     // undershoot that would block future swaps. Deferred drops

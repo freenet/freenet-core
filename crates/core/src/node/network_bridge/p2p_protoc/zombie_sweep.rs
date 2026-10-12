@@ -205,7 +205,7 @@ pub(super) fn is_link_use_request(msg: &NetMessage) -> bool {
     match msg {
         NetMessage::V1(v1) => match v1 {
             NetMessageV1::Connect(m) => match m {
-                ConnectMsg::Request { .. } => true,
+                ConnectMsg::Request { .. } | ConnectMsg::RequestWithNeed { .. } => true,
                 ConnectMsg::Response { .. }
                 | ConnectMsg::ObservedAddress { .. }
                 | ConnectMsg::Rejected { .. }
@@ -2032,6 +2032,7 @@ mod tests {
                         ttl: 4,
                         visited: VisitedPeers::new(&tx),
                         uphill_budget: 8,
+                        need: Default::default(),
                     },
                 })),
                 true,

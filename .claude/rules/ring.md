@@ -44,7 +44,9 @@ WHEN accepting a new connection (should_accept):
      shared predicate admits_lattice_edge_over_cap() in should_accept, in
      add_connection, AND in BOTH connection-lifecycle promotion gates
      (p2p_protoc/connection_lifecycle.rs) so the exception is live on the
-     real CONNECT path, not just should_accept. See connection_manager.rs.
+     real CONNECT path, not just should_accept. The lifecycle gates — both
+     promotion gates AND the outbound pre-flight dial check (#5827) — share
+     refuses_connection_at_cap(). See connection_manager.rs.
      MINIMUM-DEGREE FLOOR: the whole lattice feature (this exception, the
      per-side acceptance clause, the route-to-self discovery probe, and the
      topology.rs retention exemption) is GATED OFF when this peer's CONFIGURED
@@ -124,6 +126,19 @@ WHEN accepting a new connection (should_accept):
      → Use ACTUAL open count, NOT speculative totals
   5. At/above min_connections: strict ConnectionEvaluator
      → Feed gap score into evaluator (accepts best candidate per window)
+  6. Requester need (#5858, ConnectMsg::RequestWithNeed, version-gated by
+     CONNECT_NEED_MIN_VERSION; a legacy Request is need-unknown → steps 1-5):
+     → SHORT requester (below its own min): lattice, then capacity, then the
+       below-min soft filter, then an ONBOARDING slot (ring/admission.rs,
+       ONBOARDING_PROVISIONAL_SLOTS). Never touches the evaluator window.
+     → BAR requester: refuse (bar_unmet) unless this peer is strictly closer
+       to the target than the bar or the lattice admits it; then steps 2-5.
+     → Onboarding links are PROVISIONAL: first in line for prune/swap while
+       on probation; after ONBOARDING_PROBATION graduate if self-interest
+       would keep them (ConnectionManager::review_provisional_links), else
+       drop. The slot frees on prune, failed handshake, or decision.
+     The decision is an AdmissionCode (evaluate_admission), carried on the
+     connect_request_received event and counted per path on router_snapshot.
 
 WHEN closing a connection:
   → MUST remove from connections_by_location

@@ -727,6 +727,11 @@ pub(crate) enum ConnectEvent {
         accepted: bool,
         /// Remaining hops-to-live when received.
         ttl: u8,
+        /// The admission decision behind `accepted`: the path that admitted
+        /// the joiner, or the cause that refused it (#5858). `None` when this
+        /// hop only forwarded and never evaluated admission.
+        #[serde(default)]
+        admission: Option<crate::ring::admission::AdmissionCode>,
     },
     /// A ConnectResponse message was sent (acceptor sending back to joiner).
     ResponseSent {
