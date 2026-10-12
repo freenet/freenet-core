@@ -105,6 +105,7 @@ pub(crate) use connection_manager::nn_lattice_active_for;
 pub use connection_manager::{set_nn_lattice_enabled, set_nn_lattice_force_active};
 mod connection;
 mod hosting;
+pub mod join_timeline;
 pub(crate) use broken_invariants::{BrokenInvariant, BrokenInvariantsTracker};
 /// Pre-write admission-gate rejection type (#4683, PR 3). Surfaced to the
 /// executor chokepoints so a write that would overflow the aggregate disk

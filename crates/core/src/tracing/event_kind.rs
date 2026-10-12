@@ -506,6 +506,19 @@ impl EventKind {
         )
     }
 
+    /// Returns the joiner's public key if this is a
+    /// `ConnectEvent::RequestReceived`, `None` for all other events. Lets a
+    /// simulation attribute CONNECT hops to the peer that asked (#5858).
+    #[allow(clippy::wildcard_enum_match_arm)]
+    pub fn connect_request_received_joiner(&self) -> Option<&crate::transport::TransportPublicKey> {
+        match self {
+            EventKind::Connect(ConnectEvent::RequestReceived { joiner, .. }) => {
+                Some(joiner.pub_key())
+            }
+            _ => None,
+        }
+    }
+
     /// Returns the open-connection count a peer had immediately after a
     /// `ConnectEvent::Connected` event (`this_peer_connection_count`), `None`
     /// for all other events.
