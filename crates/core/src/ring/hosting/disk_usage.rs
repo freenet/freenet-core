@@ -166,7 +166,7 @@ pub(crate) struct DiskUsageStats {
     /// Allocated size of the storage backend's database directory (#5007),
     /// shallow walk. REPORTED ONLY: not part of `total_bytes`. `None` until a
     /// walk has succeeded, so a directory that was never readable is not
-    /// reported as an empty one.
+    /// reported as an empty one. A directory that does not exist is `Some(0)`.
     pub db_file_bytes: Option<u64>,
     /// Allocated size of the unpacked-webapp cache (#5007). REPORTED ONLY: not
     /// part of `total_bytes`. `None` until a walk has succeeded.
@@ -726,6 +726,7 @@ impl DiskUsageTracker {
     /// as a healthy node with no dead space, with nothing to contradict it. If
     /// no walk has succeeded yet, the previous value is [`UNMEASURED`], which
     /// [`DiskUsageTracker::stats`] reports as `None`.
+    ///
     /// `NotFound` is a legitimate 0 (a store not created yet). The warning is
     /// edge-triggered per gauge, so a permanently unreadable directory logs
     /// once rather than once per 60s sweep, and logs again if the condition
@@ -882,7 +883,7 @@ fn du_walk_wasm(dir: &Path) -> u64 {
 }
 
 /// The disk a single file actually consumes: its **allocated blocks**, not its
-/// apparent length (#5007 follow-up).
+/// apparent length.
 ///
 /// `Metadata::len()` is what `ls` reports — the file's logical extent. For a
 /// **sparse** file that over-states consumption, because the holes occupy no
@@ -956,7 +957,9 @@ fn du_walk_shallow(dir: &Path) -> std::io::Result<u64> {
 /// Recursively sum the allocated size of every regular file under `dir` (see
 /// [`file_disk_bytes`]). Same error contract as [`du_walk_shallow`]: `Err` only
 /// when the ROOT `dir` cannot be read; an unreadable subdirectory or entry
-/// contributes 0.
+/// contributes 0. Unlike [`du_walk_shallow`], symlinks are not followed at
+/// all, which keeps the recursion free of loops; a symlinked entry contributes
+/// 0.
 fn du_walk_allocated(dir: &Path) -> std::io::Result<u64> {
     let mut total: u64 = 0;
     let mut stack = vec![dir.to_path_buf()];
@@ -1866,6 +1869,12 @@ mod tests {
         t.refresh_db_file();
         assert_eq!(t.stats().db_file_bytes, Some(0));
         assert!(!t.db_file_measure_failed.load(Ordering::Relaxed));
+
+        // And the next failure is flagged (warned) again.
+        write_file(&db, 8);
+        t.refresh_db_file();
+        assert!(t.db_file_measure_failed.load(Ordering::Relaxed));
+        assert_eq!(t.stats().db_file_bytes, Some(0), "retains the last value");
     }
 
     /// A database file symlinked from another disk is counted at its target's

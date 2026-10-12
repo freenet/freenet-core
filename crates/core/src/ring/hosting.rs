@@ -8368,9 +8368,11 @@ mod tests {
     /// comments, then all whitespace. Line comments go first so a `/*` inside
     /// one (`/// contracts_dir/*.wasm`) cannot open a block that swallows code.
     /// String literals are not special-cased, and an unterminated `/*` drops
-    /// the rest of the file: either can only remove text, which turns the
-    /// presence and exactly-once checks red. Do not use this for an ABSENCE
-    /// check, which removed text would satisfy.
+    /// the rest of the file. Either can only remove text, which turns a
+    /// presence check red. An exactly-once count could in principle be satisfied
+    /// if a second, wrong occurrence were hidden behind a `"//"` or `"/*"` in
+    /// a string literal; no such literal exists in `ring.rs` today. Do not use
+    /// this for an ABSENCE check, which removed text would satisfy.
     fn strip_comments_and_whitespace(src: &str) -> String {
         let no_line: String = src
             .lines()
@@ -8546,6 +8548,10 @@ mod tests {
         assert_eq!(
             measured.disk_usage_stats().unwrap().db_file_bytes,
             Some(40 * GIB)
+        );
+        assert_eq!(
+            measured.disk_usage_stats().unwrap().webapp_cache_bytes,
+            Some(20 * GIB)
         );
         // Linear region, not a clamp: 0.5 * (3 + 10) GiB.
         assert_eq!(blind.disk_budget_bytes(), 13 * GIB / 2);

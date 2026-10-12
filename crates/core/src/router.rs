@@ -568,8 +568,8 @@ pub(crate) struct RouterSnapshotInfo {
     /// budget bounds. Reported but NOT in that sum (#5007, #5853):
     /// `hosting_disk_db_bytes`, the allocated size of the storage backend's
     /// database directory (its difference from state is the database's dead
-    /// space, which made the sum under-count the footprint ~10x on a production
-    /// peer), and `hosting_disk_webapp_cache_bytes`, the unpacked-webapp
+    /// space: one production peer had 583 MB of state in a 2.68 GB
+    /// database), and `hosting_disk_webapp_cache_bytes`, the unpacked-webapp
     /// cache. The webapp cache defaults to a per-USER directory, so several
     /// peers run as one user report the same bytes. Both are allocated blocks
     /// on unix and apparent length elsewhere. `None` until the tracker

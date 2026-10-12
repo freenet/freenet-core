@@ -1587,8 +1587,10 @@ pub mod test {
             .expect("handler.rs must have a test module");
         // Line comments first, so a `/*` inside one cannot open a block that
         // swallows code; then `/* */` blocks, so a call wrapped in one cannot
-        // satisfy the pin. Both can only remove text, which turns the
-        // presence and exactly-once checks red.
+        // satisfy the pin. Both can only remove text, which turns a presence
+        // check red; an exactly-once count could miss a second call hidden
+        // behind a `"//"` or `"/*"` inside a string literal (none exists in
+        // this file's production half).
         let no_line = FULL[..cutoff]
             .lines()
             .map(|line| line.split("//").next().unwrap_or(""))
