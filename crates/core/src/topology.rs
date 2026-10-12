@@ -993,7 +993,6 @@ impl TopologyManager {
     /// ([`composite_score`]), skipping the protected lattice edges and any
     /// topology-critical connection. `None` when every connection is protected
     /// or own location is unknown.
-
     pub(crate) fn least_valuable_prunable_peer(
         &self,
         my_location: &Option<Location>,

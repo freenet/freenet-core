@@ -290,6 +290,10 @@ impl ConnectMsg {
     /// [`Self::inbound_request`] this does not reset a `Request`'s need: a
     /// locally built request carries the need in memory until
     /// [`fit_request_to_hop`] chooses its wire form.
+    #[allow(
+        clippy::result_large_err,
+        reason = "the Err arm hands the caller's own message back unchanged; boxing it would allocate on every outbound send"
+    )]
     pub(crate) fn into_outbound_request(self) -> Result<(Transaction, ConnectRequest), Self> {
         match self {
             ConnectMsg::Request { id, payload } => Ok((id, payload)),
