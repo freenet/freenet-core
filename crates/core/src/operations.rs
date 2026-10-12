@@ -2269,7 +2269,7 @@ mod routing_dataset_call_site_pins {
                 site("drive_client_get_inner", 1, 0, 1, &[]),
                 site("fallback_target", 1, 0, 1, &[]),
                 site("advance_to_next_peer", 1, 0, 1, &[]),
-                site("drive_sub_op_get", 1, 0, 1, &[]),
+                site("sub_op_driver", 1, 0, 1, &[]),
                 site("first_hop_candidate", 1, 0, 1, &[]),
                 site(
                     "relay_advance_to_next_peer",

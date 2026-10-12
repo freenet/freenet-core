@@ -2110,6 +2110,74 @@ impl OpManager {
         wants
     }
 
+    /// Re-root a contract this peer just started hosting through a stranded-holder
+    /// recovery (#5846, design §5d(b)), so the chain toward the key keeps
+    /// forming without waiting for the lease to come due (~6 min per hop).
+    ///
+    /// The recovery made the stranded holder our downstream, so the contract is
+    /// in use here; if no connected co-host is closer to the key and we are not
+    /// the root, we are now the stranded one and re-root the same way. Same
+    /// guards as [`select_prompt_reroots`](Self::select_prompt_reroots) for one
+    /// key (connections, ban, per-contract backoff and in-flight dedup, the
+    /// reconcile `ReRootSearch` gate) and the same shared spawn path, so its
+    /// jitter and outer deadline apply. One recovery spawns at most one re-root.
+    ///
+    /// These re-roots are bounded by the recovery rate limit (at most one per
+    /// recovery, so 20 a minute node-wide), not by the renewal loop's
+    /// per-cycle cap, and they back off under the same event-loop pressure.
+    ///
+    /// The reconcile gate is evaluated here directly rather than through
+    /// [`reconcile_wants_reroot`](Self::reconcile_wants_reroot), which records
+    /// every evaluation on the connection-drop counter. Returns whether a
+    /// re-root was spawned.
+    pub(crate) fn spawn_stranded_recovery_reroot(self: &Arc<Self>, key: ContractKey) -> bool {
+        let skip = |reason: &str| {
+            tracing::debug!(contract = %key, reason, "stranded-holder recovery: no re-root");
+            false
+        };
+        if self.ring.open_connections() == 0 {
+            return skip("no connections");
+        }
+        if self.ring.contract_ban_list.is_banned(key.id()) {
+            return skip("banned");
+        }
+        // The same backpressure the renewal loop applies: with the event loop's
+        // notification channel over half full it cuts its batch, and this extra
+        // re-root simply waits for that loop instead.
+        let sender = self.to_event_listener.notifications_sender();
+        if sender.capacity()
+            < sender.max_capacity() / crate::ring::Ring::RENEWAL_DEFER_CAPACITY_FRACTION
+        {
+            return skip("event loop under pressure");
+        }
+        if !self.ring.can_request_subscription(&key) {
+            return skip("backoff or already in flight");
+        }
+        // Distance-blind (own location unknown): do not re-root, the renewal
+        // loop will once the location is known.
+        let Some(inputs) = self.build_reconcile_inputs(&key) else {
+            return skip("own location unknown");
+        };
+        if !reconcile::reconcile(&inputs).contains(&reconcile::Action::ReRootSearch) {
+            // Root, or a closer co-host already exists: nothing to re-root.
+            tracing::debug!(contract = %key, ?inputs, "stranded-holder recovery: reconcile inputs");
+            return skip("reconcile does not want a re-root");
+        }
+        if !self.ring.mark_subscription_pending(key) {
+            return skip("already in flight");
+        }
+        tracing::info!(
+            contract = %key,
+            "stranded-holder recovery: hosting with no closer co-host, re-rooting toward the key"
+        );
+        crate::ring::Ring::spawn_renewal_subscribe_task(
+            self.clone(),
+            key,
+            self.ring.shutdown_token(),
+        );
+        true
+    }
+
     /// Drive storm-safe PROMPT re-roots for the in-use contracts a just-dropped
     /// co-host peer left stranded (#4642 piece F). The connection-drop FLIP's whole
     /// storm-safety lives here; `on_ring_connection_lost` is a thin caller.
@@ -4169,6 +4237,299 @@ mod tests {
             !op_manager.ring.can_request_subscription(&key),
             "the prompt re-root must have claimed the pending slot (per-contract dedup)"
         );
+    }
+
+    // ===== Stranded-holder recovery re-root (#5846, design §5d(b)) =====
+
+    /// A peer that just became a host through a stranded-holder recovery has a
+    /// downstream (the holder) but no co-host closer to the key, so it re-roots
+    /// toward the key itself: exactly one re-root, through the shared renewal
+    /// path, with the per-contract slot claimed so a second call (another
+    /// recovery of the same contract) spawns nothing.
+    #[tokio::test(flavor = "current_thread")]
+    async fn stranded_recovery_reroot_spawns_once_for_an_in_use_host() {
+        let (op_manager, _guards) = build_reroot_test_op_manager("stranded-reroot-once").await;
+        seed_location_and_one_connection(&op_manager);
+        let key = reroot_contract_key(0x5D);
+        op_manager.ring.subscribe(key);
+        op_manager
+            .ring
+            .add_client_subscription(key.id(), crate::client_events::ClientId::FIRST);
+
+        assert!(
+            op_manager.spawn_stranded_recovery_reroot(key),
+            "an in-use host with no closer co-host must re-root"
+        );
+        assert!(
+            !op_manager.ring.can_request_subscription(&key),
+            "the re-root must claim the per-contract slot"
+        );
+        assert!(
+            !op_manager.spawn_stranded_recovery_reroot(key),
+            "a second recovery of the same contract must not spawn a second re-root"
+        );
+        assert!(
+            op_manager.ring.is_subscribed(&key),
+            "the re-root must not tear down the lease (make-before-break)"
+        );
+    }
+
+    /// The production shape: the recovered host's ONLY demand is the stranded
+    /// holder, registered as a downstream subscriber strictly farther from the
+    /// key. That alone must entitle the re-root.
+    #[tokio::test(flavor = "current_thread")]
+    async fn stranded_recovery_reroot_counts_the_holder_as_demand() {
+        let (op_manager, _guards) =
+            build_reroot_test_op_manager("stranded-reroot-downstream").await;
+        seed_location_and_one_connection(&op_manager);
+        let key = reroot_contract_key(0x61);
+        op_manager.ring.subscribe(key);
+
+        // A holder strictly farther from the key than we are.
+        let key_loc = crate::ring::Location::from(&key);
+        let own_dist = op_manager
+            .ring
+            .connection_manager
+            .own_location()
+            .location()
+            .expect("own location")
+            .distance(key_loc);
+        let holder_addr = (36000u16..37000)
+            .map(|port| std::net::SocketAddr::from(([127, 0, 0, 1], port)))
+            .find(|addr| crate::ring::Location::from_address(addr).distance(key_loc) > own_dist)
+            .expect("an address farther from the key");
+        let holder = crate::transport::TransportKeypair::new();
+        assert!(op_manager.ring.connection_manager.add_connection(
+            crate::ring::Location::from_address(&holder_addr),
+            holder_addr,
+            holder.public().clone(),
+            false,
+        ));
+        crate::operations::subscribe::register_downstream_subscriber(
+            &op_manager,
+            &key,
+            holder_addr,
+            Some(holder.public()),
+            None,
+            &crate::message::Transaction::new::<crate::operations::subscribe::SubscribeMsg>(),
+            "",
+        )
+        .await;
+        assert!(
+            op_manager
+                .build_reconcile_inputs(&key)
+                .expect("not distance-blind")
+                .has_farther_downstream_subscriber,
+            "precondition: the holder counts as a farther downstream"
+        );
+
+        assert!(op_manager.spawn_stranded_recovery_reroot(key));
+    }
+
+    /// A contract in subscription backoff (a recent failed renewal or
+    /// re-root) is not re-rooted early: the per-contract backoff is one of the
+    /// storm guards the renewal loop applies too.
+    #[tokio::test(flavor = "current_thread")]
+    async fn stranded_recovery_reroot_respects_subscription_backoff() {
+        let (op_manager, _guards) = build_reroot_test_op_manager("stranded-reroot-backoff").await;
+        seed_location_and_one_connection(&op_manager);
+        let key = reroot_contract_key(0x65);
+        op_manager.ring.subscribe(key);
+        op_manager
+            .ring
+            .add_client_subscription(key.id(), crate::client_events::ClientId::FIRST);
+        assert!(op_manager.ring.mark_subscription_pending(key));
+        op_manager.ring.complete_subscription_request(&key, false);
+        assert!(
+            !op_manager.ring.can_request_subscription(&key),
+            "precondition: the failure put the contract in backoff"
+        );
+
+        assert!(!op_manager.spawn_stranded_recovery_reroot(key));
+    }
+
+    /// A banned contract is never re-rooted.
+    #[tokio::test(flavor = "current_thread")]
+    async fn stranded_recovery_reroot_skips_a_banned_contract() {
+        let (op_manager, _guards) = build_reroot_test_op_manager("stranded-reroot-banned").await;
+        seed_location_and_one_connection(&op_manager);
+        let key = reroot_contract_key(0x62);
+        op_manager.ring.subscribe(key);
+        op_manager
+            .ring
+            .add_client_subscription(key.id(), crate::client_events::ClientId::FIRST);
+        let _ = op_manager.ring.contract_ban_list.ban(
+            *key.id(),
+            tokio::time::Instant::now() + std::time::Duration::from_secs(3600),
+            crate::ring::contract_ban_list::BanReason::AutoMad,
+        );
+
+        assert!(!op_manager.spawn_stranded_recovery_reroot(key));
+    }
+
+    /// With the event loop's notification channel more than half full the
+    /// recovery re-root waits for the renewal loop, the same backpressure that
+    /// loop applies to itself.
+    #[tokio::test(flavor = "current_thread")]
+    async fn stranded_recovery_reroot_backs_off_under_event_loop_pressure() {
+        let (op_manager, _guards) = build_reroot_test_op_manager("stranded-reroot-pressure").await;
+        seed_location_and_one_connection(&op_manager);
+        let key = reroot_contract_key(0x63);
+        op_manager.ring.subscribe(key);
+        op_manager
+            .ring
+            .add_client_subscription(key.id(), crate::client_events::ClientId::FIRST);
+
+        let sender = op_manager.to_event_listener.notifications_sender();
+        let half = sender.max_capacity() / crate::ring::Ring::RENEWAL_DEFER_CAPACITY_FRACTION;
+        while sender.capacity() >= half {
+            sender
+                .try_send(either::Either::Right(
+                    crate::message::NodeEvent::TransactionCompleted(
+                        crate::message::Transaction::new::<
+                            crate::operations::subscribe::SubscribeMsg,
+                        >(),
+                    ),
+                ))
+                .expect("channel has room");
+        }
+
+        assert!(!op_manager.spawn_stranded_recovery_reroot(key));
+        assert!(
+            op_manager.ring.can_request_subscription(&key),
+            "a skipped re-root must not claim the slot"
+        );
+    }
+
+    /// The live state that feeds the recovery gate: the requester's hosting
+    /// advertisement and the ban list reach `RecoveryInputs`, and a peer that
+    /// is not connected yields no requester at all.
+    #[tokio::test(flavor = "current_thread")]
+    async fn stranded_recovery_inputs_read_advertisement_and_ban_list() {
+        let (op_manager, _guards) = build_reroot_test_op_manager("stranded-inputs").await;
+        seed_location_and_one_connection(&op_manager);
+        let key = reroot_contract_key(0x64);
+        let iid = *key.id();
+        let requester = crate::transport::TransportKeypair::new();
+        let requester_addr: std::net::SocketAddr = "127.0.0.1:37001".parse().unwrap();
+        assert!(op_manager.ring.connection_manager.add_connection(
+            crate::ring::Location::from_address(&requester_addr),
+            requester_addr,
+            requester.public().clone(),
+            false,
+        ));
+        let inputs = |addr| {
+            crate::operations::subscribe::op_ctx_task::stranded_recovery_inputs(
+                &op_manager,
+                iid,
+                addr,
+            )
+        };
+
+        let (before, peer) = inputs(requester_addr);
+        assert!(peer.is_some(), "a connected requester resolves");
+        assert!(!before.requester_advertises);
+        assert!(!before.banned);
+
+        register_hub_cohosting(&op_manager, requester.public(), &[iid]);
+        assert!(inputs(requester_addr).0.requester_advertises);
+
+        let _ = op_manager.ring.contract_ban_list.ban(
+            iid,
+            tokio::time::Instant::now() + std::time::Duration::from_secs(3600),
+            crate::ring::contract_ban_list::BanReason::AutoMad,
+        );
+        assert!(inputs(requester_addr).0.banned);
+
+        let stranger: std::net::SocketAddr = "127.0.0.1:37002".parse().unwrap();
+        let (unknown, peer) = inputs(stranger);
+        assert!(peer.is_none());
+        assert!(unknown.requester_location.is_none());
+    }
+
+    /// No demand, no re-root: a copy with a lease but no local client, no
+    /// downstream and no recent access is torn down by the reconcile
+    /// controller, never re-rooted (the anti-storm interest gate).
+    #[tokio::test(flavor = "current_thread")]
+    async fn stranded_recovery_reroot_skips_a_demandless_copy() {
+        let (op_manager, _guards) = build_reroot_test_op_manager("stranded-reroot-idle").await;
+        seed_location_and_one_connection(&op_manager);
+        let key = reroot_contract_key(0x5E);
+        op_manager.ring.subscribe(key);
+
+        assert!(!op_manager.spawn_stranded_recovery_reroot(key));
+        assert!(
+            op_manager.ring.can_request_subscription(&key),
+            "a skipped re-root must not claim the slot"
+        );
+    }
+
+    /// A connected co-host strictly closer to the key is already our upstream,
+    /// so there is nothing to re-root toward: the chain has reached the mesh.
+    #[tokio::test(flavor = "current_thread")]
+    async fn stranded_recovery_reroot_skips_when_a_closer_cohost_exists() {
+        let (op_manager, _guards) = build_reroot_test_op_manager("stranded-reroot-upstream").await;
+        seed_location_and_one_connection(&op_manager);
+        let key = reroot_contract_key(0x5F);
+        op_manager.ring.subscribe(key);
+        op_manager
+            .ring
+            .add_client_subscription(key.id(), crate::client_events::ClientId::FIRST);
+
+        // A co-host strictly closer to the key than we are. A connection's
+        // location is derived from its address, so pick an address that lands
+        // closer to the key.
+        let key_loc = crate::ring::Location::from(&key);
+        let own_dist = op_manager
+            .ring
+            .connection_manager
+            .own_location()
+            .location()
+            .expect("own location")
+            .distance(key_loc);
+        let cohost_addr = (35000u16..36000)
+            .map(|port| std::net::SocketAddr::from(([127, 0, 0, 1], port)))
+            .find(|addr| crate::ring::Location::from_address(addr).distance(key_loc) < own_dist)
+            .expect("an address closer to the key");
+        let cohost = crate::transport::TransportKeypair::new();
+        assert!(op_manager.ring.connection_manager.add_connection(
+            crate::ring::Location::from_address(&cohost_addr),
+            cohost_addr,
+            cohost.public().clone(),
+            false,
+        ));
+        register_hub_cohosting(&op_manager, cohost.public(), &[*key.id()]);
+        assert!(
+            op_manager
+                .build_reconcile_inputs(&key)
+                .expect("not distance-blind")
+                .computed_upstream
+                .is_some(),
+            "precondition: the co-host is our computed upstream"
+        );
+
+        assert!(!op_manager.spawn_stranded_recovery_reroot(key));
+        assert!(op_manager.ring.can_request_subscription(&key));
+    }
+
+    /// With no connections there is nowhere to route a re-root.
+    #[tokio::test(flavor = "current_thread")]
+    async fn stranded_recovery_reroot_skips_with_no_connections() {
+        let (op_manager, _guards) = build_reroot_test_op_manager("stranded-reroot-isolated").await;
+        // A known location but no connection, so it is the connection guard
+        // that refuses, not the distance-blind one further down.
+        op_manager
+            .ring
+            .connection_manager
+            .set_own_addr_local_for_test("127.0.0.1:12000".parse().unwrap());
+        assert_eq!(op_manager.ring.open_connections(), 0);
+        let key = reroot_contract_key(0x60);
+        op_manager.ring.subscribe(key);
+        op_manager
+            .ring
+            .add_client_subscription(key.id(), crate::client_events::ClientId::FIRST);
+
+        assert!(!op_manager.spawn_stranded_recovery_reroot(key));
     }
 
     // ===== Stale proximity-cache reap (#4756) =====

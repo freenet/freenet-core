@@ -254,6 +254,17 @@ pub struct RenewalMetrics {
     /// in-use contracts would record N here (the thundering-herd the #3763
     /// hollow-relay firefight fought).
     pub max_reroot_batch: u64,
+    /// Stranded-holder recoveries this node completed (#5846, design §5d(b)):
+    /// it received a subscribe from a holder, found no host beyond it, pulled
+    /// the state back from the holder and became a host.
+    pub stranded_recoveries: u64,
+    /// Stranded-holder recoveries this node passed the gate for but refused
+    /// because a token bucket was empty.
+    pub stranded_recoveries_rate_limited: u64,
+    /// Stranded-holder recoveries refused for a reason other than an empty
+    /// token bucket: a busy fetch slot (all taken, or this requester or
+    /// contract already fetching) or a pair in its failed-fetch backoff.
+    pub stranded_recoveries_refused_busy: u64,
 }
 
 static RENEWAL_METRICS_REGISTRY: LazyLock<DashMap<(String, SocketAddr), RenewalMetrics>> =
@@ -307,6 +318,41 @@ pub fn record_reroot_batch(peer_addr: SocketAddr, batch_size: u64) {
             .or_default();
         if batch_size > entry.max_reroot_batch {
             entry.max_reroot_batch = batch_size;
+        }
+    }
+}
+
+/// Record a completed stranded-holder recovery (#5846). No-op outside a
+/// simulation context (no current network name).
+pub fn record_stranded_recovery(peer_addr: SocketAddr) {
+    if let Some(network_name) = get_current_network_name() {
+        RENEWAL_METRICS_REGISTRY
+            .entry((network_name, peer_addr))
+            .or_default()
+            .stranded_recoveries += 1;
+    }
+}
+
+/// Record a stranded-holder recovery refused by the receiving-side limits
+/// (#5846), under its cause: an empty token bucket, or anything that is not a
+/// rate (a busy slot, or a pair in its failed-fetch backoff). No-op outside a
+/// simulation context (no current network name).
+pub fn record_stranded_recovery_refused(
+    peer_addr: SocketAddr,
+    refusal: crate::ring::stranded_recovery::Refusal,
+) {
+    use crate::ring::stranded_recovery::Refusal;
+    if let Some(network_name) = get_current_network_name() {
+        let mut entry = RENEWAL_METRICS_REGISTRY
+            .entry((network_name, peer_addr))
+            .or_default();
+        match refusal {
+            Refusal::RateLimited => entry.stranded_recoveries_rate_limited += 1,
+            Refusal::SlotsBusy
+            | Refusal::RequesterBusy
+            | Refusal::ContractBusy
+            | Refusal::RecentlyFailed
+            | Refusal::AlreadyFetching => entry.stranded_recoveries_refused_busy += 1,
         }
     }
 }

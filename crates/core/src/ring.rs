@@ -175,6 +175,7 @@ mod peer_connection_backoff;
 mod peer_key_location;
 mod placement_migration_metrics;
 pub(crate) mod resync_rate_limit;
+pub(crate) mod stranded_recovery;
 pub mod topology_registry;
 pub(crate) mod update_rate_limit;
 
@@ -378,6 +379,9 @@ pub(crate) struct Ring {
     /// matching `(contract, source)` entry BEFORE applying; consume-on-first-match
     /// kills replay. See `crate::ring::resync_rate_limit::OutstandingResyncRequests`.
     pub(crate) outstanding_resync_requests: Arc<resync_rate_limit::OutstandingResyncRequests>,
+    /// Receiving-side rate limit for the stranded-holder backward bootstrap
+    /// (design §5d(b), #5846). See `crate::ring::stranded_recovery`.
+    pub(crate) stranded_recovery_limiter: Arc<stranded_recovery::StrandedRecoveryLimiter>,
     /// Per-contract ban list. Populated by the governance reaper on
     /// `BanTriggered` / `BanLifted` transitions; consulted at the
     /// inbound dispatch site to drop wire requests for banned
@@ -811,6 +815,9 @@ impl Ring {
             outstanding_resync_requests: Arc::new(
                 resync_rate_limit::new_outstanding_resync_requests(time_source.clone()),
             ),
+            stranded_recovery_limiter: Arc::new(stranded_recovery::StrandedRecoveryLimiter::new(
+                time_source.clone(),
+            )),
             contract_ban_list: Arc::new(contract_ban_list::ContractBanList::new(
                 time_source.clone(),
             )),
@@ -1559,6 +1566,10 @@ impl Ring {
             // (#4864 round-8) so a burst of requests whose responses never arrive
             // cannot pin the map past OUTSTANDING_RESYNC_TTL.
             ring.outstanding_resync_requests.cleanup();
+
+            // Sweep idle stranded-recovery buckets (#5846) so the per-requester
+            // and per-contract maps stay bounded.
+            ring.stranded_recovery_limiter.cleanup();
 
             // Phase 7 ban-list maintenance. Defense-in-depth — the
             // BanLifted decisions below explicitly unban, but if any
@@ -2832,7 +2843,7 @@ impl Ring {
 
     /// Skip renewal cycle when channel remaining capacity falls below this
     /// fraction of max (i.e. channel is more than 50% full).
-    const RENEWAL_DEFER_CAPACITY_FRACTION: usize = 2; // channel_max / 2
+    pub(crate) const RENEWAL_DEFER_CAPACITY_FRACTION: usize = 2; // channel_max / 2
 
     /// Stop spawning mid-cycle when remaining capacity falls below this
     /// fraction of max (i.e. channel is more than 75% full).

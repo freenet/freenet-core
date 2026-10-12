@@ -3153,10 +3153,12 @@ impl HostingManager {
     /// - We have client subscriptions but no active network subscription
     ///
     /// Hosted contracts without active interest (no client subscriptions,
-    /// no downstream subscribers) are intentionally NOT renewed. Contracts
-    /// persisted to disk are kept as a recovery mechanism (last-resort PUT
-    /// if the contract is lost from the network) but are not actively
-    /// subscribed to avoid subscription accumulation.
+    /// no downstream subscribers) are intentionally NOT renewed, to avoid
+    /// subscription accumulation. There is no last-resort PUT for a contract
+    /// lost from near its key: a holder with demand re-places it through its
+    /// own subscribe, which the first closer peer answers by pulling the state
+    /// back from it (design §5d(b), #5846,
+    /// `operations::subscribe::op_ctx_task::recover_from_stranded_requester`).
     pub fn contracts_needing_renewal(&self) -> Vec<ContractKey> {
         let now = self.time_source.now();
         let renewal_threshold = now + SUBSCRIPTION_RENEWAL_INTERVAL;
