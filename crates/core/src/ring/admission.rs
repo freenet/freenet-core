@@ -136,25 +136,26 @@ pub(crate) fn onboarding_high_priority(requester_connections: u8, min_connection
 /// visible before anyone does. Read through [`requester_bar_enforced`].
 pub(crate) const ENFORCE_REQUESTER_BAR: bool = false;
 
-#[cfg(any(test, feature = "testing"))]
+#[cfg(test)]
 thread_local! {
     /// Test-only override of [`ENFORCE_REQUESTER_BAR`] for the current thread,
-    /// so the enforced path stays tested while it ships off.
+    /// so the enforced path stays tested while it ships off. `cfg(test)` only:
+    /// nothing outside this crate's unit tests sets it.
     static ENFORCE_REQUESTER_BAR_OVERRIDE: std::cell::Cell<Option<bool>> =
         const { std::cell::Cell::new(None) };
 }
 
 /// Override [`ENFORCE_REQUESTER_BAR`] on the current thread (`None` restores
-/// it). Test and simulation use only.
-#[cfg(any(test, feature = "testing"))]
-pub fn set_requester_bar_enforced(enforced: Option<bool>) {
+/// it). Unit tests only.
+#[cfg(test)]
+pub(crate) fn set_requester_bar_enforced(enforced: Option<bool>) {
     ENFORCE_REQUESTER_BAR_OVERRIDE.with(|c| c.set(enforced));
 }
 
 /// Whether the requester's bar is enforced on this thread: the test override
 /// if set, else [`ENFORCE_REQUESTER_BAR`].
 pub(crate) fn requester_bar_enforced() -> bool {
-    #[cfg(any(test, feature = "testing"))]
+    #[cfg(test)]
     {
         if let Some(enforced) = ENFORCE_REQUESTER_BAR_OVERRIDE.with(|c| c.get()) {
             return enforced;
