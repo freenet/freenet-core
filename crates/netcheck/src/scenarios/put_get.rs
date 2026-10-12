@@ -2,6 +2,7 @@
 //! fresh ephemeral peer joined through another, including previous runs'
 //! contracts (retention).
 
+use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
@@ -111,14 +112,32 @@ pub async fn run(args: PutGetArgs) -> Result<bool> {
     tokio::time::sleep(Duration::from_secs(args.settle_secs)).await;
 
     // ---- GET phase, via a fresh ephemeral peer ----
-    let node = ephemeral::spawn_ephemeral(
+    // From here on the PUTs have happened whether or not the getter can run:
+    // every early return keeps them for later runs' retention windows, and
+    // never lets a manifest error replace the error that ended the run.
+    let keep_puts = |manifest: &mut Manifest, run_id: String| {
+        if let Err(e) = record_puts(manifest, &args.manifest, run_id, now, &put_ok) {
+            eprintln!("WARNING: could not record this run's PUTs in the manifest: {e:#}");
+        }
+    };
+    let node = match ephemeral::spawn_ephemeral(
         &args.freenet_bin,
         args.ephemeral_network_port,
         args.ephemeral_ws_port,
         &args.gateway_spec,
         args.ephemeral_dir.as_deref(),
     )
-    .await?;
+    .await
+    {
+        Ok(node) => node,
+        Err(e) => {
+            meta.duration_ms = started.elapsed().as_millis();
+            meta.print();
+            report.print_summary();
+            keep_puts(&mut manifest, run_id);
+            return Err(e.context("booting the ephemeral getter"));
+        }
+    };
 
     let join_timeout = Duration::from_secs(args.join_timeout_secs);
     let mut peer = match client::connect(&node.ws_base, join_timeout).await {
@@ -127,7 +146,9 @@ pub async fn run(args: PutGetArgs) -> Result<bool> {
             eprintln!("ephemeral node log tail:\n{}", node.log_tail());
             meta.duration_ms = started.elapsed().as_millis();
             meta.print();
+            report.print_summary();
             node.shutdown().await;
+            keep_puts(&mut manifest, run_id);
             return Err(e.context("connecting to ephemeral node ws api"));
         }
     };
@@ -137,7 +158,9 @@ pub async fn run(args: PutGetArgs) -> Result<bool> {
             eprintln!("ephemeral node log tail:\n{}", node.log_tail());
             meta.duration_ms = started.elapsed().as_millis();
             meta.print();
+            report.print_summary();
             node.shutdown().await;
+            keep_puts(&mut manifest, run_id);
             return Err(e);
         }
     }
@@ -214,32 +237,43 @@ pub async fn run(args: PutGetArgs) -> Result<bool> {
     client::disconnect(&mut peer).await;
     node.shutdown().await;
 
-    // Record only successfully-PUT contracts so retention runs never chase
-    // contracts that were never stored.
-    if !put_ok.is_empty() {
-        manifest.record_run(
-            RunRecord {
-                run_id,
-                timestamp: now,
-                contracts: put_ok
-                    .iter()
-                    .map(|c| ContractRecord {
-                        id: *c.contract.key().id(),
-                        label: c.label.clone(),
-                        size: c.state.as_ref().len(),
-                        state_hash: blake3::hash(c.state.as_ref()).to_hex().to_string(),
-                    })
-                    .collect(),
-            },
-            now,
-        );
-        manifest.save(&args.manifest)?;
-    }
+    record_puts(&mut manifest, &args.manifest, run_id, now, &put_ok)?;
 
     meta.duration_ms = started.elapsed().as_millis();
     meta.print();
     report.print_summary();
     Ok(report.all_ok())
+}
+
+/// Record only successfully-PUT contracts so retention runs never chase
+/// contracts that were never stored.
+fn record_puts(
+    manifest: &mut Manifest,
+    path: &Path,
+    run_id: String,
+    now: u64,
+    put_ok: &[&contracts::RunContract],
+) -> Result<()> {
+    if put_ok.is_empty() {
+        return Ok(());
+    }
+    manifest.record_run(
+        RunRecord {
+            run_id,
+            timestamp: now,
+            contracts: put_ok
+                .iter()
+                .map(|c| ContractRecord {
+                    id: *c.contract.key().id(),
+                    label: c.label.clone(),
+                    size: c.state.as_ref().len(),
+                    state_hash: blake3::hash(c.state.as_ref()).to_hex().to_string(),
+                })
+                .collect(),
+        },
+        now,
+    );
+    manifest.save(path)
 }
 
 /// One GET the run will perform, and how to check what comes back.
