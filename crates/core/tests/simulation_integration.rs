@@ -20279,6 +20279,8 @@ struct SaturatedJoinReport {
     joiner_hops: ConnectHopStats,
     /// Ring connections lost by established peers over the run.
     established_links_dropped: usize,
+    /// `Disconnected` events in the whole run, by reason.
+    disconnect_reasons: BTreeMap<String, usize>,
     /// Timeline of every regular node (established, then joiners), by label.
     timelines: Vec<(String, freenet::dev_tool::JoinTimeline)>,
     /// Public key of every node, by label.
@@ -20360,7 +20362,8 @@ impl SaturatedJoinReport {
              p50={} p95={} max={} never={}/{}\n\
              joiner time from first CONNECT to min_connections: p50={} p95={} \
              max={} never={}/{}\n\
-             established links dropped over the run: {}\n\
+             established links dropped over the run: {}; Disconnected events by \
+             reason: {:?}\n\
              CONNECT hops (all): {} received ({:.2} per node per second), \
              {:.2}% accepted ({} by gateways), \
              median chain {} hops, {:.0}% of {} chains had no accepting hop\n\
@@ -20398,6 +20401,7 @@ impl SaturatedJoinReport {
             min.iter().filter(|m| m.is_none()).count(),
             self.joiners.len(),
             self.established_links_dropped,
+            self.disconnect_reasons,
             self.all_hops.hops,
             self.hops_per_peer_per_s(),
             self.all_hops.acceptance_rate() * 100.0,
@@ -20646,11 +20650,19 @@ fn run_saturated_join(cfg: &SaturatedJoinConfig) -> SaturatedJoinReport {
         .map(|(_, key)| key.clone())
         .collect();
     let rt = create_runtime();
-    let (all_hops, joiner_hops) = rt.block_on(async {
+    let (all_hops, joiner_hops, disconnect_reasons) = rt.block_on(async {
         let logs = logs_handle.lock().await;
+        let mut reasons = BTreeMap::new();
+        for log in logs.iter() {
+            if let Some(reason) = log.kind.disconnect_reason_label() {
+                let reason: String = reason.chars().take(80).collect();
+                *reasons.entry(reason).or_insert(0usize) += 1;
+            }
+        }
         (
             connect_hop_stats(logs.iter(), None, &gateway_keys),
             connect_hop_stats(logs.iter(), Some(&joiner_keys), &gateway_keys),
+            reasons,
         )
     });
 
@@ -20674,6 +20686,7 @@ fn run_saturated_join(cfg: &SaturatedJoinConfig) -> SaturatedJoinReport {
         all_hops,
         joiner_hops,
         established_links_dropped,
+        disconnect_reasons,
         timelines,
         keys: keys
             .iter()

@@ -506,6 +506,16 @@ impl EventKind {
         )
     }
 
+    /// Returns the disconnect reason (variant name, plus the message for
+    /// `Explicit`/`NetworkError`) if this is a `Disconnected` event.
+    #[allow(clippy::wildcard_enum_match_arm)]
+    pub fn disconnect_reason_label(&self) -> Option<String> {
+        match self {
+            EventKind::Disconnected { reason, .. } => Some(format!("{reason:?}")),
+            _ => None,
+        }
+    }
+
     /// Returns the reason string if this is a `ConnectEvent::Rejected`,
     /// `None` for all other events.
     #[allow(clippy::wildcard_enum_match_arm)]
