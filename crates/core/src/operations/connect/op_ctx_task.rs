@@ -2151,7 +2151,8 @@ mod driver_timing_tests {
                     } else {
                         Err(())
                     };
-                    let _ = callback.send(result).await;
+                    // The driver may already have ended; nothing to do then.
+                    callback.send(result).await.ok();
                 });
                 if dialled.len() == 2 {
                     return dialled;
