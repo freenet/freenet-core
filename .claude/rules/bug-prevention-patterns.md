@@ -1,8 +1,6 @@
 ---
 paths:
-  - "crates/core/src/bin/**"
-  - "crates/core/src/conformance/**"
-  - "crates/core/src/contract/**"
+  - "crates/core/**"
   - "scripts/**"
 ---
 
@@ -228,6 +226,17 @@ test's thread-local log capture to those callsites only. 29 failures in 1000
 0 in 2000 after the fix, and **unreachable under nextest at any repeat
 count**. `test_utils::TestLogger` still has the same hazard: #5315.
 
+The mirror shape is a **global cleared by whichever thread leaves first**.
+Instance ([#5673](https://github.com/freenet/freenet-core/issues/5673)): the
+simulation harness's packet-delivery callback, the thing that makes
+`SimOperation::CrashNode` actually drop packets, was one process-global slot,
+and every `SimNetwork::Drop` cleared it. Under plain `cargo test` the first
+simulation to finish turned crash enforcement off for every other one, so
+crash tests could pass without the crash ever happening. The fix was to key
+the state by the network that owns it, as every other harness registry
+already was. The same family still has one open member: `ADDRESS_NETWORKS`
+is keyed by bare `SocketAddr`, and simulations share one port range (#5676).
+
 Audit question for any new or changed test: *could this interact with other
 tests through global state* (a static cache, `set_global_default`, an env var,
 a singleton registry, a shared temp path)? If so, run plain `cargo test`
@@ -237,6 +246,37 @@ permanently-registered dispatchers to defeat the `live <= 1` fast path,
 `Interest::sometimes()` not `always()`, never the global default) and why the
 regression test must run in a child process, is in
 [testing.md](testing.md#cross-test-interference-is-invisible-to-ci--only-plain-cargo-test-can-see-it).
+
+### The mirror image: a failure that is the HARNESS, not the code
+
+The section above is about a real bug the runner hides. This is the same
+confusion in the other direction — **a green-code failure produced by how the
+suite was run** — and it costs time in a nastier way, because the instinct on a
+red test is to look at the diff.
+
+**A test that re-execs `std::env::current_exe()` is broken by any concurrent
+`cargo` invocation against the same target dir.** Cargo replaces the test binary
+while the test is holding a path to it, and the child fails to spawn with
+`NotFound` — nothing to do with the code under test. In `crates/core` this is
+`wasm_runtime::engine::wasmtime_engine::tests::{test_instance_virtual_memory_reservation_bounded_3986,
+test_store_refresh_reduces_vm_maps}`, which re-run themselves as subprocesses to
+measure VM maps in isolation.
+
+The symptom to recognise, so nobody bisects it:
+
+```
+panicked at .../wasmtime_engine.rs:NNNN:
+Failed to spawn subprocess: Os { code: 2, kind: NotFound, ... }
+```
+
+Not reachable in CI, which does not run concurrent cargo against one target dir.
+It is routine on a workstation running several agents, where a second `cargo
+clippy`, `cargo build` or `cargo test` in another shell is enough. **Before
+investigating a failure in these two, check whether anything else was
+building**, and re-run them with the target dir to yourself; they pass in an
+isolated run. Same species as the row above — a property of how the suite is
+run, misread as a property of what it tests.
+
 
 ## Self-satisfying `include_str!` source-scrape pins
 
@@ -458,6 +498,158 @@ not known to work.
 grep -rn 'include_str!("' crates/core/src/bin/ | grep -v assets
 ```
 
+## Finishing the sentence and stopping there
+
+The author knows the rule. They have just written it down, in a comment, in
+this edit. Then a few hundred lines away, or twenty lines below, or in the
+function immediately adjacent, the same edit does the thing the sentence
+forbids.
+
+This is not ignorance. Writing the sentence discharges the sense of having
+handled it, so the writer stops looking for the other places it applies. And
+the comment is evidence the concept was present, which is why it reads as
+covered to the next reviewer as well: a paragraph explaining a trap sits
+directly above code that walks into it, and nobody rereads the code because
+the paragraph appears to have answered for it already.
+
+The third row below is the dangerous form. A wrong comment misleads a reader
+and a weak test fails to catch a regression, but a wrong `FALSIFY` instruction
+recruits the next person into confirming something false. They run the mutation
+it names, see the result it predicts, and come away with more confidence than
+if nothing had been written.
+
+### Repeat offender history
+
+All three are from one PR,
+[#5606](https://github.com/freenet/freenet-core/pull/5606), and all three were
+authored in the same edit as the text they contradict rather than inherited
+from an earlier one.
+
+| Site | What the text said | What the same edit did |
+|------|--------------------|------------------------|
+| `contract.rs`, the sweep-budget comment vs `PARK_WORK_BUDGET` | corrected "the guard always wins that race" down to a 15 s margin, because the strong form was false | authored a fresh over-strong bound a few hundred lines away: `2 x MAX_RESUME_DRAIN_BATCH` (32), where the real per-iteration ceiling is `(MAX_RESUME_DRAIN_BATCH - 1) + 25` per loop and 80 across both |
+| `contract.rs`, `fn_region` vs `enclosing_fn` | `fn_region`'s rustdoc warns that anchoring on `"\nasync fn "` misses `pub async fn` | `enclosing_fn`, the next function in the file, was anchored on exactly that, so a chokepoint call in a new `pub async fn` was attributed to the allowed function declared above it |
+| `delegate_park.rs`, `a_partially_resolved_upsert_pair_keeps_the_unresolved_one_s_context` | a comment twenty lines above records that building the object by hand pins a true property of the wrong object, and that this is why the original bug survived | its `FALSIFY` line named a mutation that test structurally cannot see. A reviewer defaulted the context in `owed_upserts`, the only production site that builds the owed list, and the test stayed green |
+
+Two earlier instances of the same shape are recorded on that PR:
+[#5238](https://github.com/freenet/freenet-core/issues/5238) carried only one
+of two known dimensions across a bound it was otherwise correct about, and
+[#5493](https://github.com/freenet/freenet-core/pull/5493) named a bypass in a
+comment, closed it in one consumer, and left it open in a sibling consumer
+forty lines away in the same file.
+
+### A membership check answers "is it named", never "does it contribute"
+
+The cleanest statement of this whole section came out of FIXING it, and it is
+worth more than the three instances above because it says what to expect next
+time.
+
+A guard asked whether a budget's name occurred in the text of the function that
+sums the budgets. That is a membership check over characters, so it was defeated
+by a comment: this file's own new prose named a budget in an explanatory
+paragraph, and that budget's exclusion row went unconsulted from the commit that
+added the paragraph.
+
+The fix was to stop scraping and sum a slice of `(label, value)` pairs, so the
+question became "is this name a label in the slice the function accumulated" --
+a fact about the accumulation rather than about the source text. **And the same
+defect reappears one level up, immediately.** A label with a zero value satisfies
+every membership check while contributing nothing to the total:
+
+```rust
+("parked_budget_for", 0),   // present, named, summed, and worth nothing
+```
+
+So the guard needs the second question too: each term must be non-zero on a
+representative host, with the legitimate zeros written down in a table that is
+itself checked for staleness. Otherwise the exclusion table is just a third
+place an entry can sit un-consulted.
+
+**Expect this whenever a check moves from text to structure.** The move is
+almost always right -- structure cannot be defeated by an adjacent comment --
+but it inherits the question one level up, and the new level is where nobody
+looks, because the fix feels finished. Ask of any guard: *does passing it
+require the thing to CONTRIBUTE, or only to be present?*
+
+Sibling shape, same source: **a guard's own failure mode is often disguised as
+the guard working.** The mutation harness took an exclusive lock before arming
+its restore path, so an exception in between left the lock held forever -- and a
+stranded lock presents as "the harness refuses to run", which is exactly what
+correct exclusivity looks like. A guard that fails silently into its own success
+message is worse than no guard, because the reader has been given a reason to
+stop looking.
+
+### The commonest form is duller than the three above: prose that outlived its code
+
+The rows above are all a comment contradicted by code written in the SAME edit.
+The high-frequency version is a comment contradicted by code written LATER, and
+it is worth naming separately because it is not a lapse of attention: the edit
+that invalidates the prose is usually in a different paragraph, a different
+item, or a different file, and nothing in the compiler or the test suite reads
+English.
+
+One review of [#5606](https://github.com/freenet/freenet-core/pull/5606)
+produced four in one change, and the shapes are worth recognising:
+
+- **A rustdoc attached to the wrong item.** `within_fetch_allowance`'s entire
+  doc block, including the paragraph explaining why its return type is a
+  disposition rather than a `Result`, was separated from the following
+  `/// ...` by no blank line, so all of it documented the `static` beneath it
+  and the function had no doc at all.
+- **A log line naming an outcome the code stopped producing.** The same
+  function's `warn!` said it was "failing the upsert" after the behaviour
+  changed to re-running inline, where the write completes. An operator-facing
+  line that reports a failure that did not happen is worse than no line.
+- **A doc describing the design a change replaced.** `OwedUpsert` still said
+  reconciliation was a multiset match on `(contract, is_put)` twelve lines above
+  the `HashSet<UpsertId>` that replaced it, and the field doc said it too.
+- **A justification table whose reasons drifted.** Two `NOT_SUMMED` rows
+  contradicted each other about which of `MAX_PARKED_BYTES` and
+  `parked_budget_for` was summed, in a table whose stated purpose is that an
+  exclusion is a decision someone wrote down.
+
+The rule is the same search instruction, pointed the other way: **when you
+change a behaviour, grep for the prose that describes it**: the doc on the
+item, the doc on its neighbours, the log lines it emits, and any table that
+gives a reason for it. And when a doc block sits above two items, check which
+one it is actually attached to; a missing blank line moves it silently.
+
+### The rule
+
+**A comment naming a trap, a bypass, a missing dimension, or a bound that does
+not hold is a search instruction, not a completed action.** Before the edit is
+finished:
+
+- **Grep for every other consumer** of the quantity, anchor, or invariant the
+  sentence names, and check each one. The sibling is usually in the same file,
+  which is what makes it easy to miss: it was on screen.
+- **Reread what you wrote in this edit against the sentence you wrote in this
+  edit.** Every row above is a self-inflicted instance, not an inherited one.
+  The correction and the fresh violation shipped together.
+- **Run every `FALSIFY` line you write.** An instruction that has never been
+  executed is a claim about the test rather than a property of it, which is the
+  same defect as the enumerated guards and self-satisfying pins elsewhere in
+  this file. If the named mutation leaves the test green, fix the instruction
+  or the test before merging, and say in the commit message which one was
+  wrong.
+
+### Audit
+
+There is no grep for "this was actually run", so the audit is to enumerate the
+instructions and account for each:
+
+```bash
+# Every FALSIFY line is a promise that a specific mutation was applied and the
+# test went red. List them and check them off against a campaign log.
+grep -rn "FALSIFY" crates/core/src/
+
+# Comments that name a limit are the search instructions above. For each hit,
+# grep the quantity it names and inspect every OTHER consumer of it.
+grep -rnE "(does not|doesn't|cannot|can't|fails to) (catch|cover|see|hold|fire)" crates/core/src/
+grep -rniE "same (trap|shape|omission|mistake)|one indirection away" crates/core/src/
+```
+
+
 ## SIGPIPE under `pipefail`: a present marker reads as absent
 
 In a script that sets `set -o pipefail`, piping a producer into a consumer that
@@ -634,6 +826,69 @@ grep -rnE "max_tracked|MAX_TRACKED" crates/core/src/
 ```
 
 
+## A count cap reads like a memory bound; a FLAT memory cap reads like it scales
+
+**The second half of the pattern above, and it bites the fix for the first
+half.** Replacing a count cap with a byte cap is the right move — but a byte cap
+written as a bare `const` is sized for exactly one host, and every reader after
+you will assume it tracks the machine, because every budget beside it does.
+
+#5544 introduced `MAX_PARKED_BYTES: usize = 64 * 1024 * 1024` precisely because
+`MAX_PARKED_DELEGATES` bounded the NUMBER of parks and not their footprint. The
+new cap was flat. Its siblings in `contract::executor::declared_cache_ceiling`
+(`summary_budget_for`, `delta_budget_for`, `store_arena_budget_for`,
+`budget_for_ram`, ...) are all RAM-derived, so a reader comparing them sees one
+term that does not move and has no reason to think it should.
+
+**How it surfaced, which is the useful part.** The flat cap was ALSO missing from
+`declared_cache_ceiling` — and at the time `ring::hosting::cache::resident_overhead_budget_for`
+derived the hosting budget as a *residual* from that sum, so hosting had been
+treating 64 MiB already committed to parks as free. (Since #5647 the hosting
+budget is its own share of the memory limit and the sum is test-only; the
+aggregate-safety tests are now the only thing that sees a missing term, which
+makes the discovery guard below more important, not less.) Adding the term turned
+`cache_byte_budgets_are_aggregate_safe` red immediately: a 1 GiB VPS with 4
+workers declared **566,231,032 bytes against a 536,870,912 half-limit**. The
+over-commit was real from the day the cap shipped and unobservable until the
+aggregate could see the term. Fixed by making it
+`clamp(total_ram / 32, 8 MiB, 64 MiB)` like its siblings.
+
+Audit questions for any new byte budget:
+
+- **Does it scale with the host?** If it is a bare `const`, name the smallest
+  supported host and check the aggregate still fits there.
+- **Is it in the aggregate?** A budget outside `declared_cache_ceiling` is
+  memory the aggregate-safety tests never see.
+- **Can the guard on that aggregate FAIL for a budget nobody added to it?** If it
+  validates a hardcoded list, it catches removal and not addition — see below.
+
+```bash
+# Flat byte budgets, which should be rare:
+grep -rnE "^(pub(\([a-z]+\))? )?const [A-Z0-9_]+_BYTES: usize = [0-9]" crates/core/src/
+# ...against the RAM-derived shape they should usually have:
+grep -rn "fn .*_budget_for" crates/core/src/
+```
+
+### And a guard that ENUMERATES cannot fail for something new
+
+`declared_cache_ceiling_names_every_budget` was defended against every vacuity
+mode its author anticipated — anchor uniqueness, a required closing brace, a
+region-escape check — and then validated a **hardcoded list of eight names**. Its
+own doc said "a new one is added here at the same time it is added there", which
+is an honour-system requirement written as though it were a check. It catches a
+summed budget being REMOVED and cannot catch one being ADDED, which is the case
+that matters for a new budget.
+
+The companion `declared_cache_ceiling_discovers_every_budget` DISCOVERS instead:
+it walks the crate for budget-shaped declarations and requires each to be summed
+or listed in a `NOT_SUMMED` table **with a written reason**, so an exclusion is a
+visible decision rather than an omission — and asserts every `NOT_SUMMED` entry
+is still discoverable, so the table cannot rot into names that no longer exist.
+Both tests are kept, and each says in its rustdoc what the other covers: they
+catch opposite things, and deleting one because the other "looks equivalent" is
+the mistake this file exists to prevent.
+
+
 ## A refusal that is not counted renders as a clean zero
 
 **Any code path that DISCARDS an input must count the discard.** Three bare
@@ -765,3 +1020,146 @@ grep -rn "\.record_contract_update(\|\.send_update_notification(\|\.send_delegat
 # reachable from the driver.
 grep -rn "ring.subscribe(\|complete_subscription_request\|announce_contract_hosted\|fetch_contract_if_missing" crates/core/src/operations/
 ```
+
+
+## A mirror of hosting state cleaned up only when the mirror changes
+
+**State that mirrors another structure's membership must be reconciled against
+that structure on a timer, not only cleaned up at the moment the mirror
+changes.** `InterestManager` mirrors the hosting cache (`LocalInterest.hosting`,
+and the neighbour records in `interested_peers` that ride on it), and
+several paths write the mirror without consulting the source: the `Interests`
+heartbeat handler, `upsert_peer_summary_from`, a subscribe finaliser. A cleanup
+run at the instant local interest ends can be undone by a registration already
+in flight, and nothing ever runs it again.
+
+#5780: eviction cleared `LocalInterest.hosting` but left `interested_peers`.
+The records kept the contract in `contract_hash_index`, so the heartbeat kept
+advertising it, so neighbours kept refreshing the records. Evicting a contract
+freed almost none of its memory. #5779's first fix dropped the records at the
+moment interest ended (edge-triggered) and review found it raced every
+unchecked writer.
+
+### Fix shape (#5782)
+
+- **Level-triggered reconciliation** on the existing hosting sweep
+  (`InterestManager::reconcile_with_hosting`), acting only on a state that has
+  held for `RECONCILE_MIN_UNUSED_AGE`.
+- **Measure the wait in elapsed time, never in passes.** The sweep's
+  `tokio::time::interval` uses `MissedTickBehavior::Burst` (the tokio default;
+  the sweep does not set it), so after a stall two passes can run milliseconds
+  apart.
+- **Restart the wait on every change to the mirror**, not only when a pass
+  observes the source: a re-host and re-eviction between two passes is
+  invisible to the passes. A pass treats a restart as a stop signal: its
+  record removal re-checks, under the record's shard guard, that the wait
+  entry it started from is unchanged, so a subscribe refreshing an upstream
+  record mid-pass keeps it. The one write that must NOT restart the wait is
+  the pass's own stale-flag clear (`clear_local_hosting_flag`); going
+  through `unregister_local_hosting` there would stop the pass dropping the
+  records it just made eligible.
+- **Re-check the source immediately before each destructive step**, and say in
+  the doc comment that the checks are not atomic and what restores state when
+  a registration lands just after a drop.
+- **When a pass works through a bounded window, resume from a KEY, not an
+  offset.** An offset into unordered map iteration loses coverage under churn.
+- **Do not add a repair that writes the mirror from a probe that can be
+  inconclusive.** `contract_state_present` (and the async variant on SQLite
+  errors) answers "present" when it cannot tell; a repair keyed on it
+  registers and advertises stateless phantoms (#4610 shape). #5782 removed
+  such a repair rather than gate it; the residual is #5784.
+- **A node's own subscription lease is not demand.** It exists to receive
+  updates for a hosted copy, so it follows hosting and never justifies it.
+  Demand is a local client or a downstream subscriber. When the copy is gone
+  and there is no demand, do not count the lease as use and do not keep the
+  copy for it: the lease is renewed only for demand, so it lapses within one
+  lease period. The advertisement retraction refuses while a lease is live (a
+  subscribe installs it before the body arrives, so a live lease may mean a
+  host is forming), so something must retract after the lease ends. A
+  lease ends several ways (expiry, an upstream unsubscribe on collapse,
+  eviction), so reconcile against the advertised set itself: the sweep
+  examines every advertised contract, not only those with interest records
+  (up to `MAX_RECONCILE_KEYS_PER_PASS` per pass, resuming where it stopped),
+  and retracts each that is unhosted, unused and lease-free past the wait.
+  A contract tracked only by its records goes untracked once they are
+  dropped, and a retraction refused earlier is then never retried. Do not
+  retract only at the moment a flag is cleared or a lease expires: other
+  paths end the same state and nothing comes back to retry.
+
+The two paths that form a CACHE host (the GET cache path and the PUT relay
+store) go through `operations::complete_host_formation` (announce, migration
+nudge, register local hosting, interest change). The caller checks
+`is_hosting_contract` before it, and the helper checks again after the
+announce await and registers nothing if the contract was evicted meanwhile.
+Its retraction there is usually a no-op (the eviction already removed the
+advertisement entry), and every hosting retraction is best-effort: a dropped
+one is healed when a co-host re-requests our hosted set on the interest
+heartbeat. Neither check is atomic with eviction: a flag set just before an
+eviction is cleared and its advertisement retracted by reconciliation, within
+`RECONCILE_MIN_UNUSED_AGE` plus one sweep interval, since registering restarts
+the wait. The window is bounded, not closed. A re-host from state already on
+disk also requires the contract code on disk, because a partial reclamation
+can delete the code and leave the state. This is the "manually-inlined side
+effects" row applied to hosting. The subscribe finalisers in `subscribe.rs`
+announce on their own: they register demand (`add_local_client`, a downstream
+subscriber) rather than cache hosting, so they are not cache host formation.
+
+### Audit
+
+```bash
+# Production callers of the local-hosting mirror. Comment lines dropped; the
+# test modules of interest.rs, node.rs and operations/, and the simulation
+# harness node/testing_impl/in_memory.rs, also match, so read the file
+# position of each hit. Expected: the GET/PUT eviction loops and the sweep
+# (guarded unregister), complete_host_formation, reconcile_with_hosting (its
+# flag-clear restore; the clear itself is `clear_local_hosting_flag(`), and
+# startup rehydration in node/op_state_manager.rs, which registers from
+# `contract_state_present` and so inherits the inconclusive-probe caveat above.
+grep -rn "register_local_hosting(\|unregister_local_hosting(" crates/core/src --include=*.rs | grep -v ':\s*//'
+# Announce call sites. Outside `complete_host_formation` itself, expect only the
+# two subscribe finalisers in subscribe.rs (demand, not cache hosting); the
+# remaining hits are needle strings in pin tests and doc comments. A new
+# cache-hosting path must use the helper.
+grep -rn "announce_contract_hosted(" crates/core/src/operations* | grep -v "fn announce_contract_hosted\|:\s*//"
+```
+
+Simulation guard: `test_evicted_contracts_keep_no_interest_records` asserts
+that no peer keeps records for a contract it neither hosts nor uses, and that
+reconciliation actually dropped some, so a run in which no records formed
+cannot pass.
+
+
+## Two broadcasts of one contract to one peer, back to back
+
+**Every receiver rate-limits UPDATE traffic per (sender, contract) pair.** Since
+0.2.133 that is one broadcast per 20 ms. A drop there is repaired by a
+`ResyncRequest`, and that repair is capped per contract on both sides (#5843).
+Older peers allow one UPDATE of any kind per 100 ms and never repair a drop. So a
+sender that puts two broadcasts of one contract on the wire to one peer within
+that window loses the second at that peer until anti-entropy. That takes 5 to 75
+minutes, and nothing reports an error.
+
+#5842 is the instance. A host relayed a received update and committed its own
+client update a few milliseconds later. Harvest's seller tab does this on every
+floor change. The production broadcast queue even ran two sends for one pair
+concurrently. Every relayer of the second update hit the same limit, because
+each of them had just relayed the first.
+
+**The rule:** the sender spaces broadcasts per (contract, peer). This is
+`node/network_bridge/broadcast_spacing.rs`, 150 ms, measured from the end of
+the previous send. A held send keeps its queue entry, so newer state replaces
+it, and a timer sends it, never "the next enqueue". Both fan-out paths (the
+production queue and the simulation's inline copy) must apply it, and
+`both_fan_out_paths_apply_the_spacing` pins that.
+
+**The sibling trap, same incident: a summary recorded for a peer must describe
+the bytes that peer was sent.** A queued full-state leg sent the queued state
+S1, but sent and cached the summary of whatever was stored when the leg ran
+(S2). The sender then believed the peer held S2, and S2's own fan-out skipped
+it as converged. Full-state legs now take state and summary from ONE
+contract-handler turn (`GetStateAndSummaryQuery`). Two separate reads can
+straddle a commit.
+
+Audit question when touching the fan-out: *can this path send twice to one
+peer for one contract inside the receiver's budget, and does every summary it
+records come from the same read as the bytes it sent?*

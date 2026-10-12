@@ -29,7 +29,7 @@ use crate::transport::{
 /// Events emitted by the handshake driver.
 ///
 /// The connection field uses `Box<dyn PeerConnectionApi>` to type-erase the socket type,
-/// allowing the same event loop code to work with both production (UdpSocket) and
+/// allowing the same event loop code to work with both production (UdpTransportSocket) and
 /// testing (InMemorySocket) transports.
 pub(crate) enum Event {
     /// A remote peer initiated or completed a connection to us.

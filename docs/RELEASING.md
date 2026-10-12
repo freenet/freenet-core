@@ -363,6 +363,26 @@ Current wire-gated floors:
   bootstrapping round-trip and no way for the decision to go stale against a
   peer that downgraded at a reused address.
 
+- `UNTRACKED_ACK_NOOP_MIN_VERSION` in
+  `crates/core/src/transport/peer_connection.rs` (fire-and-forget ack-only
+  `NoOp`s, #5795). Not a new wire variant: it gates a RECEIVE-side decision,
+  "stop acking this peer's NoOps", which is only safe once the peer no longer
+  tracks them.
+
+  Set to **`(0, 2, 142)`** and guarded by `UNTRACKED_ACK_NOOP_SHIPPED_IN`,
+  which is ALREADY `Some((0, 2, 142))` (set in #5803 ahead of the release so
+  the 0.2.142 bump PR stays green), checked by
+  `ack_policy_tests::untracked_noop_floor_tracks_the_shipping_release`
+  (`Some(v)` must equal the floor and be at most the next patch release;
+  `None` requires the floor strictly above the crate version). **Releaser
+  check:** confirm #5803's code is in the 0.2.142 tag. If it is not, raise BOTH
+  constants to the release that carries it — nothing else will catch this.
+  Failure mode of a floor that is too LOW: we ignore NoOps a pre-#5795 peer
+  still tracks, and it retransmits each one up to `MAX_PACKET_RETRANSMITS`
+  times. Bias high.
+  `untracked_noop_floor_stays_above_every_release_that_tracks_noops` catches
+  the floor being lowered.
+
 - `BROADCAST_TARGET_LIST_MIN_VERSION` in
   `crates/core/src/node/network_bridge/p2p_protoc.rs` — the originator target
   list on contract broadcasts (#5147).
@@ -685,6 +705,39 @@ If you're bumping a major or minor version, double-check the binstall
 URL rewrite (a regression test in `crates/fdev/tests/binstall_metadata.rs`
 covers this).
 
+### The handshake floor (`min-compatible-version`)
+
+`[package.metadata.freenet] min-compatible-version` in `crates/core/Cargo.toml`
+is the oldest peer version a node will connect to. The check runs in both
+directions. It is a different mechanism from the wire-gated feature floors
+above: it refuses the connection outright, rather than deciding which message
+variants a peer can receive.
+
+`release.yml` ships the committed value unchanged, so raising it is its own
+reviewed PR, never a side effect of a release. (`scripts/release.sh` still
+rewrites it; see #5833.) `build.rs` requires an `X.Y.Z` value with the same
+major.minor as the package and no higher than the package version. The
+handshake carries only the patch component. A minor or major version bump
+therefore has to reset the floor in the same PR, or the build fails.
+
+Raise it only to cut off versions that cannot rejoin by themselves, such as
+0.2.120 and 0.2.121, which cannot detect updates (#5221). Set it to the first
+release after the broken ones, and no higher.
+
+Before raising it:
+
+- **Count what it cuts.** It is a single threshold, so it also refuses every
+  older release. Count the peers below the new value in telemetry.
+- **Tell the affected operators.** Announce the change to their operators
+  with the release. A refused node whose update check works starts a normal
+  auto-update. A node that cannot detect updates (0.2.120/0.2.121) updates
+  itself only once it has no connections left, through its supervisor's
+  `freenet update`. Until then, its operator has to run `freenet update` by
+  hand.
+- **Expect a gradual effect.** Peers still on older releases keep accepting
+  the refused versions until they update, so the refusal reaches the whole
+  network only as the release spreads.
+
 ## Rollback
 
 The release-agent refuses downgrades by design (`X.Y.Z < installed` returns
@@ -768,6 +821,16 @@ something. So a break in the installer half of the binary you are shipping is
 caught by Gate B one release later, when that binary becomes the previous one.
 Gate B is also post-publish and non-blocking, so even then it reports rather
 than stops.
+
+**Neither gate runs on a slow link.** #5790 (an update download killed by
+systemd's `TimeoutStopSec`, then an exit-42 restart loop) never showed on CI
+because runners download the release in seconds. Since #5790 the node
+downloads the release before it exits 42. Once the previous release does
+that, Gate B requires its download to finish (`MARKER_STAGE_DONE`) and
+`freenet update` to install from it (`MARKER_INSTALLED_STAGED`), so a staging
+path that silently falls back to the stop-phase download is caught; it then
+installs once more with no staged download, so the installer's own download
+path stays covered. What no gate can show is the time budget itself.
 
 **Gate A checks the COMPARISON in one direction only.** Since #5236 it checks
 the version the node says it observed (`latest=`) against the tag
@@ -980,8 +1043,11 @@ curl -sS -o /dev/null -w '%{http_code}\n' -A 'freenet-release-driver' \
 ### If Gate B fails
 
 **A red Gate B is not by itself a fleet problem, and the Matrix message is not
-enough to tell.** Five distinct outcomes end in a red job; only one of them means
-a node on the previous release genuinely cannot reach this one. **Read the
+enough to tell.** Several distinct outcomes end in a red job. Only the ones that
+name a specific detection or install failure mean a node on the previous release
+genuinely cannot reach this one; the rows that say GitHub never served this
+release as latest mean no node can see it YET, and their Response column says
+whether that is a re-run or a real problem. **Read the
 `::error::` line in the job log before doing anything** — it names which.
 
 The wording below is generated from the code, so match on the quoted phrases
@@ -993,7 +1059,24 @@ rather than on the shape of the alarm.
 | `UNVERIFIED (ENVIRONMENTAL): every attempt hit a port collision on this host` | 75 | ⚠️ quiet | Something else on the runner held the ports; the node never started. | Re-run the job. |
 | `UNVERIFIED: … reported it could not reach GitHub … but THIS RUNNER reached the same endpoint immediately afterwards` | 1 | 🚨 loud | The published binary consistently could not do what the runner just did. Most likely its persisted poll-budget cooldown (#5102), possibly a published fetch-side regression. **Not a stranded fleet.** | Read the node output. Re-run; if it recurs across releases it is not the runner. |
 | `UNVERIFIED: at least one attempt started the update check and never logged an outcome` | 1 | 🚨 loud | A hung updater, or the check was cut short. Genuinely unknown. | Re-run. Persisting, treat as a real fault. |
+| `GitHub never reported vX as latest within Ns: … last named '<older tag>'` | 1 | 🚨 loud | Before booting the node, Gate B waits (up to `CANARY_LATEST_WAIT_SECS`, 300s) for `releases/latest` to name this release (#5715). It never did. The node was **not started**, so this says nothing about the updater, but until GitHub serves this release as latest no node can see it. | Check the release is published, not a prerelease, and marked latest. `freenet update` by hand will not help: it reads the same endpoint. |
+| `GitHub reports a NEWER release than the one this run was asked to verify` | 1 | 🚨 loud | A newer release is already latest, usually because an old tag's workflow was re-run. Node not started. | Expected on a re-run of an old tag. Otherwise check which release is marked latest. |
+| `GitHub never reported vX as latest: … answered none of N probe(s) … with a release redirect, yet THIS RUNNER could connect to it during the wait` | 1 | 🚨 loud | The endpoint the node reads is answering, but not with a `/releases/tag/<tag>` redirect (HTTP error, rate limit, new redirect shape). Node not started. If it persists, no node can detect any release. | `curl -sI https://github.com/freenet/freenet-core/releases/latest` and look at the `Location`. |
+| `GitHub never reported vX as latest on 3 consecutive probes … the wait ended N answer(s) into a streak naming it … Of P probe(s), A named a different tag and B got no tag at all` | 1 | 🚨 loud | The budget ran out mid-streak. If P − A − B equals N, every answer naming the release was in that final streak, so GitHub began serving it only at the end. Otherwise it was served earlier and the streak kept breaking: on another tag (A, a flapping CDN) or on a failed probe (B). Node not started. | Re-run. If it recurs, GitHub is not serving the release consistently. |
+| `GitHub never reported vX as latest: … was still naming a different tag Ns into the wait (the cutoff for publication lag is 120s …)` | 1 | 🚨 loud | GitHub served another tag later than lag explains (at any point in the wait, not only last), then the probes failed. The stale answer is the finding. Node not started. | As for the "last named '<older tag>'" row above. |
+| `GitHub never reported vX as latest: … last named '<tag>', then answered none of the last N probe(s) with a release redirect … while THIS RUNNER could still connect` | 1 | 🚨 loud | GitHub answered, then the endpoint stopped answering with a redirect while the runner could still connect: the endpoint went bad. Node not started. | Check the endpoint by hand as above. |
+| `UNVERIFIED (ENVIRONMENTAL): … last named '<tag>', then this runner lost its connection to it` | 75 | ⚠️ quiet | GitHub answered, then the runner's network went for the rest of the wait, and no answer naming another tag came later than 120s in (which would have been the loud row above). Node not started, nothing learned. | Re-run the job. |
+| `UNVERIFIED (ENVIRONMENTAL): no probe of … releases/latest produced a release tag … and after every one of them this runner also failed to connect to it` | 75 | ⚠️ quiet | The runner could not connect to GitHub after any probe of the wait. Node not started, nothing learned. | Re-run the job. |
 | Anything naming a specific detection or install failure | 1 | 🚨 loud | The real thing. See case 3. | See case 3. |
+
+**The residual from #5715.** The latest-release wait requires three consecutive
+answers naming the release before the node boots, which removed the v0.2.136 and
+v0.2.140 false failures. It cannot rule out the node's own request landing on a
+stale CDN edge seconds later. That shows up as `compared against the WRONG
+release` or `did NOT decide to update`, with the node's logged `latest=` equal to
+the PREVIOUS version. Gate B does not retry it (a retry would let an intermittent
+real fault pass). If the job log shows the wait succeeded and the node still read
+the previous tag, re-run once. If it recurs, treat it as real.
 
 **The trap this table exists to remove.** An earlier version of this section said
 a fetch failure always gives exit 75 and the quiet ⚠️, and told the reader that
@@ -1011,7 +1094,9 @@ on an otherwise healthy runner — produces **exit 1 and the loud 🚨**, and th
 text sent the reader straight past it into "a real detection failure" and on to
 cutting a fix release for a poll-budget cooldown.
 
-**1. Environmental (exit 75, quiet ⚠️).** Two causes, both above. The previous
+**1. Environmental (exit 75, quiet ⚠️).** Three causes, all in the table above
+(the third, the runner failing to connect during the latest-release wait, never
+starts the node, so the rest of this paragraph is about the first two). The previous
 release's binary retries its startup fetch zero times, so a single bad moment on
 the network is enough to produce the first. Gate B retries (`CANARY_ATTEMPTS`, 2
 by default) and only reports this if every attempt lands the same way AND this

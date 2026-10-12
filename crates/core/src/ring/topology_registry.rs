@@ -97,6 +97,20 @@ pub struct TopologySnapshot {
     /// one handshake and can originate operations. See
     /// `SimNetwork::wait_for_join_convergence_before_ops`.
     pub connection_count: usize,
+    /// Contracts this peer keeps neighbour interest records for although it
+    /// neither hosts nor uses them and has no local interest in them (#5780).
+    /// Stamped by the registration sites; `None` when the `OpManager` was not
+    /// attached at snapshot time. See `Ring::orphan_interest_contract_count`.
+    pub orphan_interest_contracts: Option<usize>,
+    /// Contracts whose neighbour records this peer's interest reconciliation
+    /// has dropped since startup (#5780). `None` when the `OpManager` was not
+    /// attached at snapshot time.
+    pub reconcile_contracts_dropped: Option<u64>,
+    /// Contracts this peer still advertises to co-hosts although it neither
+    /// hosts nor uses them and holds no live lease toward them (#5782). `None`
+    /// when the `OpManager` was not attached at snapshot time. See
+    /// `Ring::stale_advertisement_count`.
+    pub stale_advertisements: Option<usize>,
 }
 
 impl TopologySnapshot {
@@ -109,6 +123,9 @@ impl TopologySnapshot {
             active_subscription_keys: HashSet::new(),
             timestamp_nanos: 0,
             connection_count: 0,
+            orphan_interest_contracts: None,
+            reconcile_contracts_dropped: None,
+            stale_advertisements: None,
         }
     }
 
@@ -237,6 +254,17 @@ pub struct RenewalMetrics {
     /// in-use contracts would record N here (the thundering-herd the #3763
     /// hollow-relay firefight fought).
     pub max_reroot_batch: u64,
+    /// Stranded-holder recoveries this node completed (#5846, design §5d(b)):
+    /// it received a subscribe from a holder, found no host beyond it, pulled
+    /// the state back from the holder and became a host.
+    pub stranded_recoveries: u64,
+    /// Stranded-holder recoveries this node passed the gate for but refused
+    /// because a token bucket was empty.
+    pub stranded_recoveries_rate_limited: u64,
+    /// Stranded-holder recoveries refused for a reason other than an empty
+    /// token bucket: a busy fetch slot (all taken, or this requester or
+    /// contract already fetching) or a pair in its failed-fetch backoff.
+    pub stranded_recoveries_refused_busy: u64,
 }
 
 static RENEWAL_METRICS_REGISTRY: LazyLock<DashMap<(String, SocketAddr), RenewalMetrics>> =
@@ -290,6 +318,41 @@ pub fn record_reroot_batch(peer_addr: SocketAddr, batch_size: u64) {
             .or_default();
         if batch_size > entry.max_reroot_batch {
             entry.max_reroot_batch = batch_size;
+        }
+    }
+}
+
+/// Record a completed stranded-holder recovery (#5846). No-op outside a
+/// simulation context (no current network name).
+pub fn record_stranded_recovery(peer_addr: SocketAddr) {
+    if let Some(network_name) = get_current_network_name() {
+        RENEWAL_METRICS_REGISTRY
+            .entry((network_name, peer_addr))
+            .or_default()
+            .stranded_recoveries += 1;
+    }
+}
+
+/// Record a stranded-holder recovery refused by the receiving-side limits
+/// (#5846), under its cause: an empty token bucket, or anything that is not a
+/// rate (a busy slot, or a pair in its failed-fetch backoff). No-op outside a
+/// simulation context (no current network name).
+pub fn record_stranded_recovery_refused(
+    peer_addr: SocketAddr,
+    refusal: crate::ring::stranded_recovery::Refusal,
+) {
+    use crate::ring::stranded_recovery::Refusal;
+    if let Some(network_name) = get_current_network_name() {
+        let mut entry = RENEWAL_METRICS_REGISTRY
+            .entry((network_name, peer_addr))
+            .or_default();
+        match refusal {
+            Refusal::RateLimited => entry.stranded_recoveries_rate_limited += 1,
+            Refusal::SlotsBusy
+            | Refusal::RequesterBusy
+            | Refusal::ContractBusy
+            | Refusal::RecentlyFailed
+            | Refusal::AlreadyFetching => entry.stranded_recoveries_refused_busy += 1,
         }
     }
 }
@@ -384,6 +447,64 @@ pub fn get_all_summarize_wasm_calls(network_name: &str) -> HashMap<SocketAddr, u
 /// Clear WASM-summarize counts for a network (for test cleanup).
 pub fn clear_summarize_metrics(network_name: &str) {
     SUMMARIZE_METRICS_REGISTRY.retain(|key, _| key.0 != network_name);
+}
+
+/// What one node's zombie-transport sweep concluded about one remote transport
+/// over a simulation run (#5654). Only transports that were zombies by AGE are
+/// recorded: those are the ones whose fate depends on recent requests.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ZombieSweepObservation {
+    /// Sweeps that found this transport never promoted and old enough to be a
+    /// zombie by age.
+    pub past_age_threshold: u64,
+    /// Of those, sweeps that kept it because its remote sent a request recently
+    /// and it was within the link-use caps.
+    pub kept_for_link_use: u64,
+}
+
+/// Key: (network_name, sweeping node address, remote transport address).
+static ZOMBIE_SWEEP_REGISTRY: LazyLock<
+    DashMap<(String, SocketAddr, SocketAddr), ZombieSweepObservation>,
+> = LazyLock::new(DashMap::new);
+
+/// Record one sweep's verdicts for transports that were zombies by age, as
+/// `(remote, kept_for_link_use)` pairs. The network name is read once, and on a
+/// production node (no current network name) `verdicts` is never iterated, so
+/// nothing the caller computes lazily inside it runs.
+pub fn record_zombie_sweep_verdicts(
+    sweeper: SocketAddr,
+    verdicts: impl IntoIterator<Item = (SocketAddr, bool)>,
+) {
+    let Some(network_name) = get_current_network_name() else {
+        return;
+    };
+    for (remote, kept_for_link_use) in verdicts {
+        let mut entry = ZOMBIE_SWEEP_REGISTRY
+            .entry((network_name.clone(), sweeper, remote))
+            .or_default();
+        entry.past_age_threshold += 1;
+        if kept_for_link_use {
+            entry.kept_for_link_use += 1;
+        }
+    }
+}
+
+/// Snapshot all zombie-sweep observations for a network, keyed by
+/// (sweeping node address, remote transport address).
+#[cfg(any(test, feature = "testing"))]
+pub fn get_all_zombie_sweep_observations(
+    network_name: &str,
+) -> HashMap<(SocketAddr, SocketAddr), ZombieSweepObservation> {
+    ZOMBIE_SWEEP_REGISTRY
+        .iter()
+        .filter(|entry| entry.key().0 == network_name)
+        .map(|entry| ((entry.key().1, entry.key().2), *entry.value()))
+        .collect()
+}
+
+/// Clear zombie-sweep observations for a network (for test cleanup).
+pub fn clear_zombie_sweep_observations(network_name: &str) {
+    ZOMBIE_SWEEP_REGISTRY.retain(|key, _| key.0 != network_name);
 }
 
 /// Result of topology validation.

@@ -131,6 +131,30 @@ updates:
           - "minor"
           - "patch"
 
+  # flake.lock (nixpkgs, flake-utils, rust-overlay). Nix is a supported
+  # deployment path (docs/nix.md), so these inputs are not dev-only tooling.
+  # .github/workflows/nix.yml is the build signal behind this bump, and it is
+  # path-filtered to include flake.lock for that reason.
+  - package-ecosystem: "nix"
+    directory: "/"
+    schedule:
+      interval: "monthly"
+    cooldown:
+      default-days: 7
+    # Set explicitly: omitting this caps at 5 and silently withholds the rest.
+    open-pull-requests-limit: 20
+    groups:
+      # No `update-types` filter here, unlike every other group in this file.
+      # Flake inputs are pinned to git REVISIONS, not semver versions, so there
+      # is no major/minor/patch for Dependabot to classify and a filter would
+      # either match everything or nothing. The "majors are reviewed alone"
+      # guarantee documented at the top of this file therefore does NOT extend
+      # to nix; the compensating signal is nix.yml, which builds both flake
+      # outputs and the devShell on any change to flake.lock.
+      nix:
+        patterns:
+          - "*"
+
   - package-ecosystem: "docker"
     directory: "/docker/freenet-gateway"
     schedule:

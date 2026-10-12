@@ -111,6 +111,30 @@ pub(crate) struct MockWasmRuntime {
     /// an interleaving bug: a resumed run must observe the context ITS OWN
     /// pre-park run wrote, not one a foreign run left behind.
     pub(crate) delegate_observations: DelegateObservations,
+    /// Delegate capability state, for tests of lifecycle delivery and the
+    /// unprompted-run budget. `None` (the default) behaves like an executor
+    /// without capabilities.
+    pub(crate) capabilities:
+        Option<std::sync::Arc<crate::contract::delegate_capabilities::DelegateCapabilities>>,
+    /// Delegate keys this "node" has never registered (#5727). A request to one
+    /// fails with the same `DelegateError::Missing` the real executor builds
+    /// from `RuntimeInnerError::DelegateNotFound`, before `process()` would be
+    /// entered, so it is neither recorded nor consumes a script entry.
+    pub(crate) unregistered_delegates: UnregisteredDelegates,
+    /// Delegate code this "node" stores, for the start-up manifest refresh
+    /// (`ContractExecutor::delegate_code`). Empty by default: no code.
+    pub(crate) delegate_codes: HashMap<DelegateKey, Vec<u8>>,
+    /// Force `execute_delegate_request` to answer with a `HostResponse` variant
+    /// that is NOT a delegate response.
+    ///
+    /// Exists so the "unexpected response" arm of
+    /// `handle_delegate_with_contract_requests` is reachable BEHAVIOURALLY.
+    /// Nothing else can drive it — every other mock path returns
+    /// `DelegateResponse` or `Err` — which is exactly why that prohibition was
+    /// pinned from source, and why the source pin turned out to be defeatable
+    /// by a helper-call indirection. A prohibition worth pinning is worth being
+    /// able to execute.
+    pub(crate) delegate_wrong_variant: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// One scripted delegate invocation.
@@ -144,6 +168,8 @@ pub(crate) struct DelegateObservation {
     pub inbound_kinds: Vec<&'static str>,
     /// The context this invocation read on entry.
     pub observed_context: Option<Vec<u8>>,
+    /// The parameters the run was given (empty for registration requests).
+    pub params: Vec<u8>,
 }
 
 /// Shared handle to a mock delegate's scripted runs.
@@ -160,6 +186,10 @@ pub(crate) type DelegateContexts =
 /// Shared handle to the per-invocation observation log.
 pub(crate) type DelegateObservations = std::sync::Arc<std::sync::Mutex<Vec<DelegateObservation>>>;
 
+/// Shared handle to the set of delegate keys the mock treats as never registered.
+pub(crate) type UnregisteredDelegates =
+    std::sync::Arc<std::sync::Mutex<std::collections::HashSet<DelegateKey>>>;
+
 /// Name the inbound variants so an observation can identify its logical run.
 fn inbound_kind(msg: &InboundDelegateMsg<'_>) -> &'static str {
     match msg {
@@ -174,6 +204,8 @@ fn inbound_kind(msg: &InboundDelegateMsg<'_>) -> &'static str {
         // Appended in stdlib 0.10.0.
         InboundDelegateMsg::UnsubscribeContractResponse(_) => "UnsubscribeContractResponse",
         InboundDelegateMsg::WakeupFired { .. } => "WakeupFired",
+        // Appended in stdlib 0.12.0.
+        InboundDelegateMsg::Lifecycle(_) => "Lifecycle",
         _ => "Other",
     }
 }
@@ -436,6 +468,16 @@ impl ContractExecutor for Executor<MockWasmRuntime, MockStateStorage> {
         self.bridged_lookup_key(instance_id)
     }
 
+    fn delegate_capabilities(
+        &self,
+    ) -> Option<std::sync::Arc<crate::contract::delegate_capabilities::DelegateCapabilities>> {
+        self.runtime.capabilities.clone()
+    }
+
+    fn delegate_code(&self, key: &DelegateKey) -> Option<Vec<u8>> {
+        self.runtime.delegate_codes.get(key).cloned()
+    }
+
     fn op_manager_handle(&self) -> Option<std::sync::Arc<crate::node::OpManager>> {
         self.op_manager.clone()
     }
@@ -494,6 +536,34 @@ impl ContractExecutor for Executor<MockWasmRuntime, MockStateStorage> {
         // stays the "not supported" error it has always been, so no existing
         // test changes behaviour.
         let key = req.key().clone();
+        if self
+            .runtime
+            .delegate_wrong_variant
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            // An internal invariant violation: the executor answering a
+            // delegate request with something that is not a delegate response.
+            // Any non-delegate variant does; `StreamChunk` is simply the
+            // cheapest to construct.
+            return Ok(freenet_stdlib::client_api::HostResponse::StreamChunk {
+                stream_id: 0,
+                index: 0,
+                total: 1,
+                data: Default::default(),
+            });
+        }
+
+        if self
+            .runtime
+            .unregistered_delegates
+            .lock()
+            .unwrap()
+            .contains(&key)
+        {
+            return Err(ExecutorError::request(
+                freenet_stdlib::client_api::DelegateError::Missing(key),
+            ));
+        }
 
         // Model the real `DelegateContextCache` read-modify-write around every
         // invocation (#5544 S7): read on entry, record what was seen, write on
@@ -509,13 +579,16 @@ impl ContractExecutor for Executor<MockWasmRuntime, MockStateStorage> {
         // registration variants carry none. The wildcard is required by
         // `#[non_exhaustive]` and is listed alongside the known variants so a
         // future one is not silently swallowed.
-        let inbound_kinds: Vec<&'static str> = match &req {
-            DelegateRequest::ApplicationMessages { inbound, .. } => {
-                inbound.iter().map(inbound_kind).collect()
-            }
+        let (inbound_kinds, params): (Vec<&'static str>, Vec<u8>) = match &req {
+            DelegateRequest::ApplicationMessages {
+                inbound, params, ..
+            } => (
+                inbound.iter().map(inbound_kind).collect(),
+                params.as_ref().to_vec(),
+            ),
             DelegateRequest::RegisterDelegate { .. }
             | DelegateRequest::UnregisterDelegate(_)
-            | _ => Vec::new(),
+            | _ => (Vec::new(), Vec::new()),
         };
 
         let script = self.runtime.delegate_script.lock().unwrap().pop_front();
@@ -528,6 +601,7 @@ impl ContractExecutor for Executor<MockWasmRuntime, MockStateStorage> {
                     delegate_key: key.clone(),
                     inbound_kinds: inbound_kinds.clone(),
                     observed_context: observed_context.clone(),
+                    params: params.clone(),
                 });
             if let Some(bytes) = writes {
                 rt.delegate_contexts
@@ -598,6 +672,10 @@ impl Executor<MockWasmRuntime, MockStateStorage> {
             delegate_calls: DelegateCallLog::default(),
             delegate_contexts: DelegateContexts::default(),
             delegate_observations: DelegateObservations::default(),
+            capabilities: None,
+            delegate_codes: HashMap::new(),
+            unregistered_delegates: UnregisteredDelegates::default(),
+            delegate_wrong_variant: std::sync::Arc::default(),
         };
 
         Executor::new(
@@ -632,6 +710,10 @@ impl Executor<MockWasmRuntime, MockStateStorage> {
             delegate_calls: DelegateCallLog::default(),
             delegate_contexts: DelegateContexts::default(),
             delegate_observations: DelegateObservations::default(),
+            capabilities: None,
+            delegate_codes: HashMap::new(),
+            unregistered_delegates: UnregisteredDelegates::default(),
+            delegate_wrong_variant: std::sync::Arc::default(),
         };
 
         Executor::new(state_store, || Ok(()), OperationMode::Local, runtime, None).await
@@ -658,6 +740,10 @@ impl Executor<MockWasmRuntime, MockStateStorage> {
             delegate_calls: DelegateCallLog::default(),
             delegate_contexts: DelegateContexts::default(),
             delegate_observations: DelegateObservations::default(),
+            capabilities: None,
+            delegate_codes: HashMap::new(),
+            unregistered_delegates: UnregisteredDelegates::default(),
+            delegate_wrong_variant: std::sync::Arc::default(),
         };
 
         Executor::new(

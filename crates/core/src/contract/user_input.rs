@@ -62,6 +62,29 @@ pub enum CallerIdentity {
     WebApp(String),
 }
 
+/// Who wrote a prompt's message. Decides the card's authorship label, which is
+/// the only thing on the card that tells delegate-authored text from the
+/// node's own. It comes from the runtime path that raised the prompt, never
+/// from anything a delegate sent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum PromptAuthor {
+    /// A delegate's `RequestUserInput` ("Delegate says:").
+    #[default]
+    Delegate,
+    /// The node itself, asking for a node-enforced capability grant
+    /// ("Freenet asks:"). The message text is the node's.
+    Node,
+}
+
+impl PromptAuthor {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            PromptAuthor::Delegate => "delegate",
+            PromptAuthor::Node => "node",
+        }
+    }
+}
+
 /// Abstracts user prompting for delegate `RequestUserInput` messages.
 ///
 /// Implementations receive the runtime-attested identity of the calling
@@ -77,10 +100,25 @@ pub trait UserInputPrompter: Send + Sync {
         delegate_key: &str,
         caller: CallerIdentity,
     ) -> impl std::future::Future<Output = Option<(usize, ClientResponse<'static>)>> + Send;
+
+    /// Ask the user, in the node's own voice, whether an app may use a
+    /// node-enforced capability. Returns the chosen label's index, or `None`
+    /// if unanswered. The default answers `None` (no one to ask), which the
+    /// caller treats as "ask again next time", never as a denial.
+    fn prompt_capability(
+        &self,
+        _message: String,
+        _labels: Vec<String>,
+        _delegate_key: &str,
+        _caller: CallerIdentity,
+    ) -> impl std::future::Future<Output = Option<usize>> + Send {
+        async { None }
+    }
 }
 
 /// A pending permission request awaiting user response via the web dashboard.
 pub(crate) struct PendingPrompt {
+    pub author: PromptAuthor,
     pub message: String,
     pub labels: Vec<String>,
     pub delegate_key: String,
@@ -111,6 +149,7 @@ const MAX_PENDING_PROMPTS: usize = 32;
 #[derive(Clone, Debug)]
 pub(crate) struct PromptSnapshot {
     pub nonce: String,
+    pub author: PromptAuthor,
     pub message: String,
     pub labels: Vec<String>,
     pub delegate_key: String,
@@ -376,7 +415,59 @@ impl UserInputPrompter for DashboardPrompter {
 
         let message = parse_message(request);
         let labels = parse_button_labels(request);
+        let idx = self
+            .show_and_wait(
+                PromptAuthor::Delegate,
+                message,
+                labels,
+                delegate_key,
+                caller,
+                request.request_id,
+            )
+            .await?;
+        if idx < request.responses.len() {
+            Some((idx, request.responses[idx].clone().into_owned()))
+        } else {
+            tracing::warn!("Invalid response index from dashboard");
+            None
+        }
+    }
 
+    async fn prompt_capability(
+        &self,
+        message: String,
+        labels: Vec<String>,
+        delegate_key: &str,
+        caller: CallerIdentity,
+    ) -> Option<usize> {
+        if self.pending.len() >= MAX_PENDING_PROMPTS {
+            tracing::warn!(
+                max = MAX_PENDING_PROMPTS,
+                "Too many pending permission prompts; not asking for a capability grant now"
+            );
+            return None;
+        }
+        let count = labels.len();
+        let idx = self
+            .show_and_wait(PromptAuthor::Node, message, labels, delegate_key, caller, 0)
+            .await?;
+        (idx < count).then_some(idx)
+    }
+}
+
+impl DashboardPrompter {
+    /// Register a prompt, surface it, and wait for the user's click. Shared by
+    /// delegate-authored and node-authored prompts so the two cannot drift in
+    /// how they are shown, capped, cancelled or timed out.
+    async fn show_and_wait(
+        &self,
+        author: PromptAuthor,
+        message: String,
+        labels: Vec<String>,
+        delegate_key: &str,
+        caller: CallerIdentity,
+        request_id: u32,
+    ) -> Option<usize> {
         // Generate a 128-bit cryptographic nonce for the permission URL
         let nonce = generate_nonce();
 
@@ -395,6 +486,7 @@ impl UserInputPrompter for DashboardPrompter {
         self.pending.insert(
             nonce.clone(),
             PendingPrompt {
+                author,
                 message: message.clone(),
                 labels: labels.clone(),
                 delegate_key: stored_delegate_key.clone(),
@@ -423,6 +515,7 @@ impl UserInputPrompter for DashboardPrompter {
         // if it falls back to a registry lookup.
         emit_prompt_event(PromptEvent::Added(PromptSnapshot {
             nonce: nonce.clone(),
+            author,
             message,
             labels,
             delegate_key: stored_delegate_key,
@@ -442,7 +535,8 @@ impl UserInputPrompter for DashboardPrompter {
 
         // Log at debug, not info -- nonce is the sole auth token for this prompt
         tracing::debug!(
-            request_id = request.request_id,
+            request_id,
+            author = author.as_str(),
             "Permission prompt created, waiting for user response via dashboard"
         );
 
@@ -464,14 +558,7 @@ impl UserInputPrompter for DashboardPrompter {
         }
 
         match result {
-            Ok(Ok(idx)) if idx < request.responses.len() => {
-                let response = request.responses[idx].clone().into_owned();
-                Some((idx, response))
-            }
-            Ok(Ok(_)) => {
-                tracing::warn!(nonce = %nonce, "Invalid response index from dashboard");
-                None
-            }
+            Ok(Ok(idx)) => Some(idx),
             Ok(Err(_)) => {
                 tracing::debug!(nonce = %nonce, "Permission prompt channel closed");
                 None
@@ -577,6 +664,16 @@ impl UserInputPrompter for AutoApprovePrompter {
             .responses
             .first()
             .map(|r| (0, r.clone().into_owned()))
+    }
+
+    async fn prompt_capability(
+        &self,
+        _message: String,
+        labels: Vec<String>,
+        _delegate_key: &str,
+        _caller: CallerIdentity,
+    ) -> Option<usize> {
+        (!labels.is_empty()).then_some(0)
     }
 }
 
@@ -700,6 +797,7 @@ mod tests {
             pending.insert(
                 format!("nonce_{i}"),
                 PendingPrompt {
+                    author: PromptAuthor::Delegate,
                     message: "test".to_string(),
                     labels: vec!["OK".to_string()],
                     delegate_key: String::new(),
@@ -735,6 +833,7 @@ mod tests {
     /// &self.nonce).is_some()`, the mutation that survived the whole 5465-test
     /// suite before this test existed. Both assertions go red.
     #[tokio::test]
+    #[serial_test::serial(prompt_events)]
     async fn a_prompt_cancelled_mid_await_removes_its_pending_entry() {
         let pending: PendingPrompts = Arc::new(DashMap::new());
         let prompter = noop_prompter(pending.clone());
@@ -765,17 +864,50 @@ mod tests {
         );
         // The broadcast is process-global and shared with other tests, so match
         // on OUR nonce rather than on the next event to arrive.
+        //
+        // TWO CHANGES, and the first is the one that actually closes it.
+        // `PROMPT_EVENTS` is process-global with a capacity of
+        // `PROMPT_EVENT_CAPACITY`, shared with every other test in this binary,
+        // so this receiver could fall behind through no fault of the code under
+        // test. The `#[serial(prompt_events)]` attribute on the three tests in
+        // this module that touch that channel stops THEM publishing into each
+        // other's window. It does not cover every publisher: tests in
+        // `server::client_api::permission_prompts` also send on this channel
+        // and are not in that group, so under `cargo test` they can still
+        // publish between the subscribe above and this drain (nextest's
+        // process-per-test isolation hides it).
+        //
+        // That is why handling `Lagged` matters, and saying so matters too:
+        // `while let Ok(..)` BREAKS on that arm, so a lagged
+        // receiver reported `removed == false` and failed with a message
+        // accusing `PromptEntryGuard` of never emitting `Removed`. Now the
+        // skipped count rides in the failure message, so a lag caused by
+        // another publisher is reported as that rather than blamed on the
+        // guard. Only `Empty`/`Closed` end the drain.
         let mut removed = false;
-        while let Ok(event) = events.try_recv() {
-            if matches!(&event, PromptEvent::Removed { nonce: n } if *n == nonce) {
-                removed = true;
-                break;
+        let mut lagged = 0u64;
+        loop {
+            match events.try_recv() {
+                Ok(event) => {
+                    if matches!(&event, PromptEvent::Removed { nonce: n } if *n == nonce) {
+                        removed = true;
+                        break;
+                    }
+                }
+                Err(broadcast::error::TryRecvError::Lagged(skipped)) => {
+                    lagged += skipped;
+                }
+                Err(_) => break,
             }
         }
         assert!(
             removed,
             "the guard must emit Removed for the cancelled prompt so open tabs \
-             stop displaying a dialog that can no longer be answered"
+             stop displaying a dialog that can no longer be answered. \
+             (Receiver lagged by {lagged} events; if that is non-zero this \
+             binary published more than PROMPT_EVENT_CAPACITY prompt events \
+             between the subscribe above and this drain, and the failure is \
+             the shared channel rather than the guard.)"
         );
     }
 
@@ -1043,6 +1175,7 @@ mod tests {
     /// double-emit-avoidance path; the timeout-driven `Removed` path is
     /// covered by `test_prompt_timeout_emits_removed`.
     #[tokio::test]
+    #[serial_test::serial(prompt_events)]
     async fn test_prompt_added_emitted_and_external_remove_skips_cleanup_removed() {
         // Subscribe BEFORE spawning the prompter so we don't miss the
         // synchronous Added event.
@@ -1109,6 +1242,7 @@ mod tests {
     /// When the prompter's own timeout cleanup runs, it must emit Removed
     /// so subscribers on either transport dismiss the overlay.
     #[tokio::test(start_paused = true)]
+    #[serial_test::serial(prompt_events)]
     async fn test_prompt_timeout_emits_removed() {
         let mut rx = prompt_events().subscribe();
 

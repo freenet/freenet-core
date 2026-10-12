@@ -467,6 +467,57 @@ pub(super) fn should_broadcast_contract(op_manager: &Arc<OpManager>, key: &Contr
     op_manager.ring.should_summarize_or_broadcast(key)
 }
 
+/// The stored state of `key` and its summary, read in one contract-handler
+/// turn so the summary describes exactly that state (#5842). `None` when the
+/// handler cannot produce both; the caller must then not record a summary for
+/// the state it sends.
+pub(super) async fn get_contract_snapshot(
+    op_manager: &OpManager,
+    key: &ContractKey,
+) -> Option<(WrappedState, freenet_stdlib::prelude::StateSummary<'static>)> {
+    use crate::contract::ContractHandlerEvent;
+
+    match op_manager
+        .notify_contract_handler_with_timeout(
+            ContractHandlerEvent::GetStateAndSummaryQuery { key: *key },
+            crate::ring::interest::BROADCAST_CH_TIMEOUT,
+        )
+        .await
+    {
+        Ok(ContractHandlerEvent::GetStateAndSummaryResponse {
+            snapshot: Ok(snapshot),
+            ..
+        }) => Some(snapshot),
+        Ok(ContractHandlerEvent::GetStateAndSummaryResponse {
+            snapshot: Err(error),
+            ..
+        }) => {
+            tracing::debug!(
+                contract = %key,
+                %error,
+                "Broadcast: could not read a state+summary snapshot"
+            );
+            None
+        }
+        Ok(other) => {
+            tracing::warn!(
+                contract = %key,
+                response = ?other,
+                "Unexpected response to GetStateAndSummaryQuery"
+            );
+            None
+        }
+        Err(error) => {
+            tracing::debug!(
+                contract = %key,
+                %error,
+                "Broadcast: state+summary snapshot request failed"
+            );
+            None
+        }
+    }
+}
+
 /// Decision for one (contract, peer) fan-out send, derived WITHOUT any WASM
 /// call — a byte comparison plus the shared in-memory delta cache. See
 /// [`plan_fanout_send`].
@@ -656,6 +707,7 @@ mod queue {
     use crate::node::OpManager;
     use crate::ring::{PeerKey, PeerKeyLocation};
 
+    use super::super::broadcast_spacing::BroadcastSpacing;
     use super::super::p2p_protoc::P2pBridge;
     use super::FanoutTargets;
     use super::{QueueScheduling, QueuedPayloadClass, SendLanePermit, broadcast_to_single_peer};
@@ -755,6 +807,18 @@ mod queue {
         )
     }
 
+    /// What [`QueueState::pop_ready`] found for a lane.
+    enum PopReady {
+        Ready(BroadcastEntry),
+        /// Entries are queued but none may be sent yet. `wake_in` is the
+        /// shortest remaining spacing among them; `None` means every blocked
+        /// entry waits on an in-flight send, whose completion wakes the lane.
+        Blocked {
+            wake_in: Option<std::time::Duration>,
+        },
+        Empty,
+    }
+
     /// A pending broadcast entry in the queue.
     struct BroadcastEntry {
         key: ContractKey,
@@ -809,9 +873,12 @@ mod queue {
         /// Actual entries, keyed by (contract, peer). Dedup replaces the state in-place.
         entries: HashMap<DedupeKey, BroadcastEntry>,
         /// Pairs already removed from the queue but waiting for a permit or
-        /// actively sending. Observation-only: enqueue still behaves exactly
-        /// as before, while telemetry can identify duplicates that queued
-        /// deduplication cannot see.
+        /// actively sending. Since #5842 this also BLOCKS: `pop_ready` will not
+        /// start a second send for a pair while one is in flight, so a queued
+        /// newer state for it waits (and keeps being replaced) until the first
+        /// finishes and the spacing interval passes. Best-effort: a pair that
+        /// `track_active` refuses (the map at `DEFAULT_MAX_QUEUE_DEPTH`) is not
+        /// blocked while in flight; it is still stamped when it finishes.
         active: HashMap<DedupeKey, u64>,
         /// Number of entries queued in the small lane. Maintained under the
         /// queue lock so head-of-line observation is O(1).
@@ -968,8 +1035,103 @@ mod queue {
             Some(entry)
         }
 
+        /// Pop the oldest entry queued for `lane` that may be SENT now (#5842):
+        /// no send for its `(contract, peer)` is in flight, and the previous one
+        /// finished at least `BROADCAST_PEER_SPACING` ago. An entry that is not
+        /// ready stays queued, so a newer state for the pair still replaces it.
+        fn pop_ready(
+            &mut self,
+            lane: QueuedPayloadClass,
+            now: Instant,
+            spacing: &BroadcastSpacing,
+        ) -> PopReady {
+            let order = match lane {
+                QueuedPayloadClass::Small => &self.small_order,
+                QueuedPayloadClass::Large => &self.large_order,
+            };
+            let mut blocked = false;
+            let mut wake_in: Option<std::time::Duration> = None;
+            let mut ready = None;
+            for (seq, key) in order {
+                if self.active.contains_key(key) {
+                    // Woken when that send finishes; see `ActiveSendGuard`.
+                    blocked = true;
+                    continue;
+                }
+                let peer = PeerKey::from(key.1.pub_key().clone());
+                if let Some(wait) = spacing.remaining(key.0.id(), &peer) {
+                    blocked = true;
+                    wake_in = Some(wake_in.map_or(wait, |w| w.min(wait)));
+                    continue;
+                }
+                ready = Some(*seq);
+                break;
+            }
+            let Some(seq) = ready else {
+                return if blocked {
+                    PopReady::Blocked { wake_in }
+                } else {
+                    PopReady::Empty
+                };
+            };
+            let key = self
+                .order_mut(lane)
+                .remove(&seq)
+                .expect("seq was read from this order map under the same lock");
+            let entry = self
+                .entries
+                .remove(&key)
+                .expect("order maps and entries are mutated together");
+            debug_assert_eq!(entry.lane, lane, "entry popped from the wrong lane");
+            if matches!(lane, QueuedPayloadClass::Small) {
+                self.set_small_queued(self.small_queued.saturating_sub(1), now);
+            }
+            PopReady::Ready(entry)
+        }
+
         /// Drop the globally oldest entry across both lanes (capacity eviction).
-        fn evict_oldest(&mut self, now: Instant) -> Option<BroadcastEntry> {
+        ///
+        /// An entry held back by #5842's spacing (its pair is in flight, or was
+        /// sent to inside the interval) is evicted only when every entry is
+        /// held. Holding keeps such an entry queued longer and at its original
+        /// sequence, so without this it would be the preferred victim and the
+        /// spacing would turn a receiver-side drop into a sender-side one.
+        fn evict_oldest(
+            &mut self,
+            now: Instant,
+            spacing: &BroadcastSpacing,
+        ) -> Option<BroadcastEntry> {
+            let mut unheld: Option<(u64, QueuedPayloadClass)> = None;
+            for (lane, order) in [
+                (QueuedPayloadClass::Small, &self.small_order),
+                (QueuedPayloadClass::Large, &self.large_order),
+            ] {
+                let first_unheld = order.iter().find(|(_, key)| {
+                    !self.active.contains_key(key)
+                        && spacing
+                            .remaining(key.0.id(), &PeerKey::from(key.1.pub_key().clone()))
+                            .is_none()
+                });
+                if let Some((seq, _)) = first_unheld
+                    && unheld.is_none_or(|(best, _)| *seq < best)
+                {
+                    unheld = Some((*seq, lane));
+                }
+            }
+            if let Some((seq, lane)) = unheld {
+                let key = self
+                    .order_mut(lane)
+                    .remove(&seq)
+                    .expect("seq was read from this order map under the same lock");
+                let entry = self
+                    .entries
+                    .remove(&key)
+                    .expect("order maps and entries are mutated together");
+                if matches!(lane, QueuedPayloadClass::Small) {
+                    self.set_small_queued(self.small_queued.saturating_sub(1), now);
+                }
+                return Some(entry);
+            }
             let oldest_small = self.small_order.keys().next().copied();
             let oldest_large = self.large_order.keys().next().copied();
             let lane = match (oldest_small, oldest_large) {
@@ -1053,34 +1215,86 @@ mod queue {
         queue: Arc<Mutex<QueueState>>,
         key: DedupeKey,
         tracked: bool,
+        /// Stamped and woken when the send ends, however it ends (#5842): the
+        /// pair's next send must wait out the spacing from HERE, and a lane
+        /// holding that next send has nothing else to wake it.
+        group: LaneGroup,
+        spaced: bool,
     }
 
     impl ActiveSendGuard {
+        /// Start the pair's spacing interval. Must run BEFORE the pair leaves
+        /// `active`: `pop_ready` treats a pair that is neither in flight nor
+        /// stamped as sendable, so a lane that takes the queue lock between an
+        /// untrack and a later stamp would send the next state back to back,
+        /// which is the #5842 loss this exists to prevent.
+        ///
+        /// Stamped even when the send turned out to be a converged-peer skip:
+        /// the queue cannot see that from here, and the cost is that the pair's
+        /// next real send waits at most one spacing interval.
+        fn stamp(&mut self) {
+            if self.spaced {
+                return;
+            }
+            self.spaced = true;
+            let peer = PeerKey::from(self.key.1.pub_key().clone());
+            self.group.spacing.record_sent(self.key.0.id(), &peer);
+        }
+
+        /// Wake both lanes. Must run AFTER the pair leaves `active`, or a woken
+        /// lane still sees it in flight and parks with nothing left to wake it.
+        fn wake(group: &LaneGroup) {
+            group.small_notify.notify_one();
+            group.large_notify.notify_one();
+        }
+
         /// Normal completion path: update the refcount directly and disarm the
         /// cancellation fallback. The caller releases its semaphore permit
         /// first, so diagnostic cleanup never holds scheduler capacity idle.
         async fn finish(mut self) {
+            self.stamp();
             if self.tracked {
                 self.queue.lock().await.untrack_active(&self.key);
                 self.tracked = false;
             }
+            Self::wake(&self.group);
         }
     }
 
     impl Drop for ActiveSendGuard {
         fn drop(&mut self) {
-            if !self.tracked {
+            if self.spaced && !self.tracked {
+                // `finish` already ran.
                 return;
             }
-            if let Ok(mut queue) = self.queue.try_lock() {
-                queue.untrack_active(&self.key);
+            self.stamp();
+            if !self.tracked {
+                Self::wake(&self.group);
+                return;
+            }
+            let untracked_now = match self.queue.try_lock() {
+                Ok(mut queue) => {
+                    queue.untrack_active(&self.key);
+                    true
+                }
+                Err(_) => false,
+            };
+            if untracked_now {
+                self.tracked = false;
+                Self::wake(&self.group);
                 return;
             }
             let queue = self.queue.clone();
             let key = self.key.clone();
+            let group = self.group.clone();
+            // With no runtime (process teardown) the pair stays in `active`.
+            // Since #5842 that blocks the pair rather than only skewing a
+            // metric, which is harmless only because nothing drains after
+            // teardown.
             if let Ok(runtime) = tokio::runtime::Handle::try_current() {
                 runtime.spawn(async move {
                     queue.lock().await.untrack_active(&key);
+                    Self::wake(&group);
                 });
             }
         }
@@ -1109,10 +1323,23 @@ mod queue {
         small_payload_concurrency: usize,
         large_payload_concurrency: usize,
         max_queue_depth: usize,
+        /// Per-`(contract, peer)` send spacing (#5842). The node's instance
+        /// (`OpManager::broadcast_spacing`) in production; see `with_spacing`.
+        spacing: Arc<BroadcastSpacing>,
     }
 
     impl BroadcastQueue {
+        /// A queue with its own spacing state, for tests. A node must use
+        /// [`Self::with_spacing`] so the queue and the rest of the node share
+        /// one record of when each pair was last sent to.
+        #[cfg(test)]
         pub(crate) fn new() -> Self {
+            Self::with_spacing(Arc::new(BroadcastSpacing::new(Arc::new(
+                crate::util::time_source::InstantTimeSrc::new(),
+            ))))
+        }
+
+        pub(crate) fn with_spacing(spacing: Arc<BroadcastSpacing>) -> Self {
             Self {
                 queue: Arc::new(Mutex::new(QueueState::new())),
                 small_notify: Arc::new(Notify::new()),
@@ -1120,6 +1347,7 @@ mod queue {
                 small_payload_concurrency: DEFAULT_SMALL_PAYLOAD_CONCURRENCY,
                 large_payload_concurrency: DEFAULT_LARGE_PAYLOAD_CONCURRENCY,
                 max_queue_depth: DEFAULT_MAX_QUEUE_DEPTH,
+                spacing,
             }
         }
 
@@ -1213,7 +1441,7 @@ mod queue {
             } else {
                 // Evict oldest if at capacity
                 while queue.len() >= self.max_queue_depth {
-                    if let Some(entry) = queue.evict_oldest(Instant::now()) {
+                    if let Some(entry) = queue.evict_oldest(Instant::now(), &self.spacing) {
                         crate::node::BROADCAST_QUEUE_EFFICIENCY_METRICS.record_capacity_eviction();
                         tracing::warn!(
                             contract = %entry.key,
@@ -1292,6 +1520,7 @@ mod queue {
                 upgrade_slots,
                 small_notify: self.small_notify.clone(),
                 large_notify: self.large_notify.clone(),
+                spacing: self.spacing.clone(),
             };
 
             let spawn_lane = |lane| {
@@ -1347,6 +1576,9 @@ mod queue {
         upgrade_slots: Arc<Semaphore>,
         small_notify: Arc<Notify>,
         large_notify: Arc<Notify>,
+        /// Per-`(contract, peer)` send spacing (#5842), shared with the
+        /// simulation fan-out through `OpManager::broadcast_spacing`.
+        spacing: Arc<BroadcastSpacing>,
     }
 
     impl LaneGroup {
@@ -1433,10 +1665,20 @@ mod queue {
 
             // Drain all available entries
             let mut drained_any = false;
+            // Set when the lane still holds entries that may not be sent yet:
+            // how long until the nearest one may (#5842).
+            let mut wake_in: Option<std::time::Duration> = None;
             loop {
                 let (entry, active_tracked) = {
                     let mut q = queue.lock().await;
-                    let entry = q.pop_lane(lane, Instant::now());
+                    let entry = match q.pop_ready(lane, Instant::now(), &group.spacing) {
+                        PopReady::Ready(entry) => Some(entry),
+                        PopReady::Blocked { wake_in: next } => {
+                            wake_in = next;
+                            None
+                        }
+                        PopReady::Empty => None,
+                    };
                     let active_tracked = entry.as_ref().is_none_or(|entry| {
                         let tracked = q.track_active((entry.key, entry.target.clone()));
                         if !tracked {
@@ -1475,6 +1717,8 @@ mod queue {
                     queue: queue.clone(),
                     key: (entry.key, entry.target.clone()),
                     tracked: active_tracked,
+                    group: group.clone(),
+                    spaced: false,
                 };
                 let permit = semaphore.clone().acquire_owned().await;
                 let hol_metrics = hol_block.as_ref().and_then(HolBlockHandle::finish_now);
@@ -1524,8 +1768,19 @@ mod queue {
             }
 
             if !drained_any {
-                // This lane was empty, wait for new entries
-                notified.await;
+                // Nothing could be sent: wait for an enqueue, a finished send
+                // (`ActiveSendGuard` wakes both lanes), or the end of the
+                // nearest spacing interval. The timer is what sends a held
+                // state when nothing else happens (#5842).
+                match wake_in {
+                    Some(wait) => {
+                        tokio::select! {
+                            () = notified => {}
+                            () = tokio::time::sleep(wait) => {}
+                        }
+                    }
+                    None => notified.await,
+                }
                 // ...which may have been the sibling drain shutting us down
                 // rather than an enqueue. `LaneDrainGuard` would shut the
                 // sibling down on the way out regardless; the explicit call
@@ -1548,6 +1803,12 @@ mod queue {
     mod observation_tests {
         use super::*;
         use std::time::Duration;
+
+        fn test_spacing() -> Arc<BroadcastSpacing> {
+            Arc::new(BroadcastSpacing::new(Arc::new(
+                crate::util::time_source::InstantTimeSrc::new(),
+            )))
+        }
 
         #[test]
         fn hol_integral_includes_small_entries_arriving_during_wait() {
@@ -1799,6 +2060,7 @@ mod queue {
                 upgrade_slots,
                 small_notify: queue.small_notify.clone(),
                 large_notify: queue.large_notify.clone(),
+                spacing: test_spacing(),
             };
             let workers = [QueuedPayloadClass::Small, QueuedPayloadClass::Large]
                 .into_iter()
@@ -1940,6 +2202,7 @@ mod queue {
                 upgrade_slots: Arc::new(Semaphore::new(super::super::MAX_PARKED_LANE_UPGRADES)),
                 small_notify: queue.small_notify.clone(),
                 large_notify: queue.large_notify.clone(),
+                spacing: test_spacing(),
             };
             let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
             let worker = tokio::spawn(drain_lane(
@@ -1998,6 +2261,277 @@ mod queue {
                  delivered to"
             );
             assert_ne!(*dispatched, *superseded);
+
+            worker.abort();
+        }
+
+        /// #5842: a send that ends by unwinding (a panic in the send, or the
+        /// task being dropped) goes through `ActiveSendGuard::drop`, not
+        /// `finish`. The pair must still leave `active`, be stamped, and wake
+        /// the lane, or its held state is parked forever.
+        #[tokio::test(start_paused = true)]
+        #[serial_test::serial(broadcast_queue_depth_gauge)]
+        async fn a_held_state_still_goes_when_the_send_ahead_of_it_unwinds() {
+            let queue = BroadcastQueue::new();
+            let group = LaneGroup {
+                small_pool: Arc::new(Semaphore::new(4)),
+                large_pool: Arc::new(Semaphore::new(4)),
+                upgrade_slots: Arc::new(Semaphore::new(super::super::MAX_PARKED_LANE_UPGRADES)),
+                small_notify: queue.small_notify.clone(),
+                large_notify: queue.large_notify.clone(),
+                spacing: test_spacing(),
+            };
+            let release = Arc::new(Notify::new());
+            let first = Arc::new(AtomicBool::new(true));
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+            let worker = {
+                let release = release.clone();
+                tokio::spawn(drain_lane(
+                    QueuedPayloadClass::Small,
+                    queue.queue.clone(),
+                    group,
+                    move |entry: BroadcastEntry, scheduling: QueueScheduling| {
+                        let tx = tx.clone();
+                        let release = release.clone();
+                        let unwind = first.swap(false, Ordering::SeqCst);
+                        async move {
+                            let _scheduling = scheduling;
+                            // See `spawn_lanes` for why this spelling.
+                            #[allow(clippy::let_underscore_must_use)]
+                            let _ = tx.send((entry.new_state.size(), tokio::time::Instant::now()));
+                            if unwind {
+                                release.notified().await;
+                                panic!("the first send unwinds (expected by this test)");
+                            }
+                        }
+                    },
+                ))
+            };
+
+            let key = contract(59);
+            let peer = PeerKeyLocation::random();
+            for size in [1, 2] {
+                queue
+                    .enqueue_in_lane(
+                        QueuedPayloadClass::Small,
+                        key,
+                        peer.clone(),
+                        state(size),
+                        super::super::no_fanout(),
+                    )
+                    .await;
+                if size == 1 {
+                    let got = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                        .await
+                        .unwrap()
+                        .map(|(size, _)| size);
+                    assert_eq!(got, Some(1));
+                }
+            }
+            let unwound_at = tokio::time::Instant::now();
+            release.notify_one();
+            let (size, sent_at) = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .expect("the held state must go after the unwound send")
+                .unwrap();
+            assert_eq!(size, 2);
+            // The unwind path must stamp the pair too, or the held state goes
+            // straight after the send ahead of it.
+            assert!(
+                sent_at.duration_since(unwound_at)
+                    >= super::super::super::broadcast_spacing::BROADCAST_PEER_SPACING,
+                "the held state went {:?} after the unwind",
+                sent_at.duration_since(unwound_at)
+            );
+
+            worker.abort();
+        }
+
+        /// #5842: a held entry stays queued at its original sequence, so it is
+        /// usually the oldest. Capacity eviction must take an entry that is
+        /// free to go before one held back by the spacing, or spacing turns a
+        /// receiver-side drop into a sender-side one.
+        #[test]
+        fn eviction_takes_an_unheld_entry_before_a_held_one() {
+            use crate::ring::PeerKey;
+
+            let spacing = test_spacing();
+            let mut queue = QueueState::new();
+            // Distinct KEYS: `PeerKeyLocation::random` varies only the address,
+            // and the spacing is per public key.
+            let distinct = |port: u16| {
+                PeerKeyLocation::new(
+                    crate::transport::TransportKeypair::new().public().clone(),
+                    std::net::SocketAddr::from(([127, 0, 0, 1], port)),
+                )
+            };
+            let (held_peer, free_peer) = (distinct(47201), distinct(47202));
+            let key = contract(60);
+            for (seq, target) in [(0u64, held_peer.clone()), (1, free_peer.clone())] {
+                queue.push_new(
+                    (key, target.clone()),
+                    BroadcastEntry {
+                        key,
+                        target,
+                        new_state: state(1),
+                        fanout: super::super::no_fanout(),
+                        state_size: 1,
+                        lane: QueuedPayloadClass::Small,
+                        seq,
+                    },
+                );
+            }
+            spacing.record_sent(key.id(), &PeerKey::from(held_peer.pub_key().clone()));
+
+            let evicted = queue
+                .evict_oldest(Instant::now(), &spacing)
+                .expect("an entry is evicted");
+            assert_eq!(evicted.target, free_peer, "the unheld entry goes first");
+            let evicted = queue
+                .evict_oldest(Instant::now(), &spacing)
+                .expect("with only held entries left, the oldest still goes");
+            assert_eq!(evicted.target, held_peer);
+
+            // A pair with a send in flight is held too, though never stamped.
+            let (busy_peer, idle_peer) = (distinct(47205), distinct(47206));
+            for (seq, target) in [(2u64, busy_peer.clone()), (3, idle_peer.clone())] {
+                queue.push_new(
+                    (key, target.clone()),
+                    BroadcastEntry {
+                        key,
+                        target,
+                        new_state: state(1),
+                        fanout: super::super::no_fanout(),
+                        state_size: 1,
+                        lane: QueuedPayloadClass::Small,
+                        seq,
+                    },
+                );
+            }
+            assert!(queue.track_active((key, busy_peer.clone())));
+            let evicted = queue
+                .evict_oldest(Instant::now(), &spacing)
+                .expect("an entry is evicted");
+            assert_eq!(evicted.target, idle_peer, "an in-flight pair is held");
+        }
+
+        /// #5842: the queue never runs two sends for one `(contract, peer)` at
+        /// once, and the next one waits out `BROADCAST_PEER_SPACING` after the
+        /// previous finished. Then it goes on its own, with nothing else
+        /// enqueued, carrying the newest state. A different peer is not held.
+        ///
+        /// Before the fix the second send was dispatched while the first was
+        /// still in flight, so the receiver saw two broadcasts of one contract
+        /// milliseconds apart and its rate limiter dropped the second.
+        #[tokio::test(start_paused = true)]
+        #[serial_test::serial(broadcast_queue_depth_gauge)]
+        async fn a_pair_sends_one_at_a_time_and_the_held_state_goes_after_the_spacing() {
+            use super::super::super::broadcast_spacing::BROADCAST_PEER_SPACING;
+
+            let queue = BroadcastQueue::new();
+            let group = LaneGroup {
+                small_pool: Arc::new(Semaphore::new(4)),
+                large_pool: Arc::new(Semaphore::new(4)),
+                upgrade_slots: Arc::new(Semaphore::new(super::super::MAX_PARKED_LANE_UPGRADES)),
+                small_notify: queue.small_notify.clone(),
+                large_notify: queue.large_notify.clone(),
+                spacing: test_spacing(),
+            };
+            // The first dispatch holds its send open until released; the rest
+            // complete at once.
+            let release = Arc::new(Notify::new());
+            let first = Arc::new(AtomicBool::new(true));
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+            let worker = {
+                let release = release.clone();
+                tokio::spawn(drain_lane(
+                    QueuedPayloadClass::Small,
+                    queue.queue.clone(),
+                    group,
+                    move |entry: BroadcastEntry, scheduling: QueueScheduling| {
+                        let tx = tx.clone();
+                        let release = release.clone();
+                        let hold = first.swap(false, Ordering::SeqCst);
+                        async move {
+                            let _scheduling = scheduling;
+                            drop(tx.send((
+                                entry.target.clone(),
+                                entry.new_state.size(),
+                                tokio::time::Instant::now(),
+                            )));
+                            if hold {
+                                release.notified().await;
+                            }
+                        }
+                    },
+                ))
+            };
+            async fn next<T>(
+                rx: &mut tokio::sync::mpsc::UnboundedReceiver<T>,
+            ) -> Result<Option<T>, tokio::time::error::Elapsed> {
+                tokio::time::timeout(Duration::from_secs(5), rx.recv()).await
+            }
+
+            let key = contract(58);
+            // Distinct public keys: `PeerKeyLocation::random` varies only the
+            // address, and the spacing is per public key.
+            let distinct = |port: u16| {
+                PeerKeyLocation::new(
+                    crate::transport::TransportKeypair::new().public().clone(),
+                    std::net::SocketAddr::from(([127, 0, 0, 1], port)),
+                )
+            };
+            let peer = distinct(47203);
+            let other = distinct(47204);
+            let enqueue = |target: &PeerKeyLocation, size: usize| {
+                queue.enqueue_in_lane(
+                    QueuedPayloadClass::Small,
+                    key,
+                    target.clone(),
+                    state(size),
+                    super::super::no_fanout(),
+                )
+            };
+
+            enqueue(&peer, 1).await;
+            let (to, size, _) = next(&mut rx).await.unwrap().unwrap();
+            assert_eq!((to, size), (peer.clone(), 1));
+
+            // Two newer states for the busy pair, and one for another peer.
+            enqueue(&peer, 2).await;
+            enqueue(&peer, 3).await;
+            enqueue(&other, 9).await;
+            let (to, size, _) = next(&mut rx).await.unwrap().unwrap();
+            assert_eq!(
+                (to, size),
+                (other.clone(), 9),
+                "another peer must not wait behind the busy pair"
+            );
+            assert!(
+                next(&mut rx).await.is_err(),
+                "a second send for the pair must not start while the first is in flight"
+            );
+
+            // tokio time: under `start_paused` it is the clock the spacing
+            // and its timer run on.
+            let finished = tokio::time::Instant::now();
+            release.notify_one();
+            let (to, size, sent_at) = next(&mut rx)
+                .await
+                .expect("the held state must go when the spacing ends, with nothing else enqueued")
+                .unwrap();
+            assert_eq!(to, peer);
+            assert_eq!(size, 3, "the held entry carries the newest state");
+            assert!(
+                sent_at.duration_since(finished) >= BROADCAST_PEER_SPACING,
+                "sent {:?} after the previous send finished; the spacing is {:?}",
+                sent_at.duration_since(finished),
+                BROADCAST_PEER_SPACING
+            );
+            assert!(
+                next(&mut rx).await.is_err(),
+                "the superseded state is never sent"
+            );
 
             worker.abort();
         }
@@ -2106,6 +2640,7 @@ mod queue {
                 upgrade_slots: Arc::new(Semaphore::new(2)),
                 small_notify: queue.small_notify.clone(),
                 large_notify: queue.large_notify.clone(),
+                spacing: test_spacing(),
             };
             let (tx, mut ran) = tokio::sync::mpsc::unbounded_channel();
             let workers: Vec<_> = [QueuedPayloadClass::Small, QueuedPayloadClass::Large]
@@ -2215,6 +2750,7 @@ mod queue {
                 upgrade_slots: upgrade_slots.clone(),
                 small_notify: queue.small_notify.clone(),
                 large_notify: queue.large_notify.clone(),
+                spacing: test_spacing(),
             };
             // Large-lane sends HOLD their permit until the test releases them,
             // so the large pool stays saturated and every small send mispredicts
@@ -3345,10 +3881,10 @@ fn record_delivery_to_interest<T: crate::util::time_source::TimeSource + Sync>(
     // Track delta vs full state sends for testing (PR #2763)
     if sent_delta {
         interest_manager.record_delta_send(state_size, payload_size);
-        crate::config::GlobalTestMetrics::record_delta_send();
+        crate::config::GlobalTestMetrics::record_delta_send(payload_size);
     } else {
         interest_manager.record_full_state_send();
-        crate::config::GlobalTestMetrics::record_full_state_send();
+        crate::config::GlobalTestMetrics::record_full_state_send(payload_size);
     }
 
     // Issue #3046: Refresh the peer's interest TTL on every successful send
@@ -3846,6 +4382,49 @@ pub(super) async fn broadcast_to_single_peer(
             )
         }
     };
+    // #5842: a FULL-STATE payload and the summary we send and record with it
+    // must describe the same state. `our_summary` was read from the store at
+    // the top of this function, but `new_state` is the state of the write that
+    // queued this leg; when a later write commits in between, the summary is
+    // NEWER than `new_state`. Recording that summary as the peer's made the
+    // later write's own fan-out skip this peer as "already converged", and the
+    // peer stayed behind until anti-entropy. So a full-state leg sends the
+    // stored state and its summary, read together in one handler turn.
+    //
+    // The delta arm needs no snapshot: `compute_delta` diffs the state stored
+    // when it runs, which is never older than the state `our_summary` was read
+    // from, so the summary recorded for the peer can only be OLDER than what it
+    // received. An older recorded summary costs at most a redundant send; a
+    // newer one loses an update.
+    let (payload, sent_summary, sent_state_size) = match payload {
+        // `our_summary` is `None` when the summary query already failed,
+        // usually a handler timeout. Asking the same handler again would only
+        // hold this leg's permit for a second timeout; there is no summary to
+        // record either way.
+        DeltaOrFullState::FullState(_) if our_summary.is_none() => (
+            DeltaOrFullState::FullState(new_state.as_ref().to_vec()),
+            None,
+            new_state.size(),
+        ),
+        DeltaOrFullState::FullState(_) => match get_contract_snapshot(op_manager, &key).await {
+            Some((state, summary)) => (
+                DeltaOrFullState::FullState(state.as_ref().to_vec()),
+                Some(summary),
+                state.size(),
+            ),
+            // Without a snapshot we cannot say which state a summary describes,
+            // so send the queued state and record no summary for the peer. If
+            // the handler is too loaded to answer, the peer stays on full state
+            // until it is not; the previous fallback, recording a summary we
+            // could not vouch for, is the loss this replaces.
+            None => (
+                DeltaOrFullState::FullState(new_state.as_ref().to_vec()),
+                None,
+                new_state.size(),
+            ),
+        },
+        delta @ DeltaOrFullState::Delta(_) => (delta, our_summary, new_state.size()),
+    };
     let payload_size = payload.size();
     match (
         queued_class,
@@ -3908,7 +4487,7 @@ pub(super) async fn broadcast_to_single_peer(
     // summary — treating a drop as a delivery defeats the next summary-mismatch
     // round that would re-send the state.
     let send_result = if use_streaming {
-        let sender_summary_bytes = our_summary
+        let sender_summary_bytes = sent_summary
             .as_ref()
             .map(|s| s.as_ref().to_vec())
             .unwrap_or_default();
@@ -4030,8 +4609,8 @@ pub(super) async fn broadcast_to_single_peer(
                     sent_delta,
                     &key,
                     &peer_key,
-                    our_summary.as_ref(),
-                    new_state.size(),
+                    sent_summary.as_ref(),
+                    sent_state_size,
                     payload_size,
                 );
                 // Telemetry gauge (#4440): post-dispatch outcome — a drop,
@@ -4090,7 +4669,7 @@ pub(super) async fn broadcast_to_single_peer(
                 id: update_tx,
                 key,
                 payload,
-                sender_summary_bytes: our_summary
+                sender_summary_bytes: sent_summary
                     .as_ref()
                     .map(|s| s.as_ref().to_vec())
                     .unwrap_or_default(),
@@ -4102,7 +4681,7 @@ pub(super) async fn broadcast_to_single_peer(
                 id: update_tx,
                 key,
                 payload,
-                sender_summary_bytes: our_summary
+                sender_summary_bytes: sent_summary
                     .as_ref()
                     .map(|s| s.as_ref().to_vec())
                     .unwrap_or_default(),
@@ -4154,8 +4733,8 @@ pub(super) async fn broadcast_to_single_peer(
                 sent_delta,
                 &key,
                 &peer_key,
-                our_summary.as_ref(),
-                new_state.size(),
+                sent_summary.as_ref(),
+                sent_state_size,
                 payload_size,
             );
         }
@@ -5487,5 +6066,263 @@ mod tests {
             "the atomic peer-summary result must carry the reason through so \
              tracked and untracked missing-summary sends remain distinct"
         );
+    }
+
+    /// One full-state leg for S1 then one for S2 to a peer whose summary was
+    /// never seen, with S2 already stored throughout. Returns every full state
+    /// put on the wire with the summary sent alongside it, the summary cached
+    /// for the peer after each leg, and S1/S2.
+    async fn run_two_full_state_legs(
+        snapshot_ok: bool,
+    ) -> (
+        Vec<(Vec<u8>, Vec<u8>)>,
+        Vec<Option<StateSummary<'static>>>,
+        freenet_stdlib::prelude::WrappedState,
+        freenet_stdlib::prelude::WrappedState,
+    ) {
+        use std::net::SocketAddr;
+        use std::sync::Arc;
+
+        use freenet_stdlib::prelude::WrappedState;
+
+        use crate::contract::{ContractHandlerEvent, StoreResponse};
+        use crate::message::{DeltaOrFullState, NetMessage, NetMessageV1};
+        use crate::node::network_bridge::p2p_protoc::{P2pBridge, P2pBridgeEvent};
+        use crate::operations::update::UpdateMsg;
+        use crate::ring::PeerKeyLocation;
+
+        let s1 = WrappedState::new(vec![1u8; 32]);
+        let s2 = WrappedState::new(vec![2u8; 32]);
+
+        let config_args = crate::config::ConfigArgs {
+            id: Some(format!("bq-5842-snapshot-{snapshot_ok}")),
+            mode: Some(crate::contract::OperationMode::Local),
+            ..Default::default()
+        };
+        let node_config =
+            crate::node::NodeConfig::new(config_args.build().await.expect("build Config"))
+                .await
+                .expect("build NodeConfig");
+        let (_notifications, notification_tx) = crate::node::event_loop_notification_channel();
+        let (ops_ch_channel, mut ch_channel, wait_for_event) =
+            crate::contract::contract_handler_channel();
+        let connection_manager = crate::ring::ConnectionManager::new(&node_config);
+        let (result_router_tx, _result_router_rx) = tokio::sync::mpsc::channel(100);
+        let task_monitor = crate::node::background_task_monitor::BackgroundTaskMonitor::new();
+        let op_manager = Arc::new(
+            crate::node::OpManager::new(
+                notification_tx,
+                ops_ch_channel,
+                &node_config,
+                crate::tracing::DynamicRegister::new(vec![]),
+                connection_manager,
+                result_router_tx,
+                &task_monitor,
+            )
+            .expect("build OpManager"),
+        );
+        op_manager.ring.attach_op_manager(&op_manager);
+        let self_addr: SocketAddr = "127.0.0.1:47100".parse().unwrap();
+        op_manager
+            .ring
+            .connection_manager
+            .set_own_addr_local_for_test(self_addr);
+
+        let key = ContractKey::from_id_and_code(
+            ContractInstanceId::new([58u8; 32]),
+            CodeHash::new([42u8; 32]),
+        );
+        let _ = op_manager.ring.host_contract(
+            key,
+            32,
+            crate::ring::AccessType::Put,
+            crate::ring::HostingCause::Other,
+        );
+
+        let peer_addr: SocketAddr = "127.0.0.1:47101".parse().unwrap();
+        let peer_pub = crate::transport::TransportPublicKey::from_bytes([7u8; 32]);
+        assert!(op_manager.ring.connection_manager.add_connection(
+            crate::ring::Location::new(0.3),
+            peer_addr,
+            peer_pub.clone(),
+            false,
+        ));
+        let target = PeerKeyLocation::new(peer_pub.clone(), peer_addr);
+        let peer_key = PeerKey::from(peer_pub);
+
+        // The stand-in executor. The stored state is S2 throughout: the second
+        // write has already committed when the S1 leg runs.
+        let stored = s2.clone();
+        let handler = tokio::spawn(async move {
+            while let Ok((id, ev, _priority)) = ch_channel.recv_from_sender().await {
+                #[allow(
+                    clippy::wildcard_enum_match_arm,
+                    reason = "stand-in executor serving only the queries a \
+                              broadcast leg issues; anything else is a test bug"
+                )]
+                let response = match ev {
+                    ContractHandlerEvent::GetSummaryQuery { key } => {
+                        ContractHandlerEvent::GetSummaryResponse {
+                            key,
+                            summary: Ok(summary_of(stored.as_ref())),
+                        }
+                    }
+                    ContractHandlerEvent::GetQuery { .. } => ContractHandlerEvent::GetResponse {
+                        key: Some(key),
+                        response: Ok(StoreResponse {
+                            state: Some(stored.clone()),
+                            contract: None,
+                        }),
+                    },
+                    ContractHandlerEvent::GetStateAndSummaryQuery { key } => {
+                        ContractHandlerEvent::GetStateAndSummaryResponse {
+                            key,
+                            snapshot: if snapshot_ok {
+                                Ok((stored.clone(), summary_of(stored.as_ref())))
+                            } else {
+                                Err(crate::contract::ExecutorError::other(
+                                    crate::contract::ContractQueueFull,
+                                ))
+                            },
+                        }
+                    }
+                    other => panic!("unexpected handler event: {other:?}"),
+                };
+                if ch_channel.send_to_sender(id, response).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        let (bridge_tx, mut bridge_rx) = tokio::sync::mpsc::channel::<P2pBridgeEvent>(16);
+        let bridge = P2pBridge::new_for_test(bridge_tx, op_manager.clone());
+        let fanout: super::FanoutTargets = Arc::new(vec![target.pub_key().clone()]);
+
+        // Every full state put on the wire to the peer, in order, with the
+        // summary the peer was told it describes.
+        let mut sent: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        let mut recorded = Vec::new();
+        for new_state in [s1.clone(), s2.clone()] {
+            super::broadcast_to_single_peer(
+                &bridge,
+                &op_manager,
+                key,
+                new_state,
+                target.clone(),
+                None,
+                fanout.clone(),
+            )
+            .await;
+            while let Ok(ev) = bridge_rx.try_recv() {
+                let P2pBridgeEvent::Message(_, msg) = ev else {
+                    continue;
+                };
+                let NetMessage::V1(NetMessageV1::Update(update)) = *msg else {
+                    continue;
+                };
+                #[allow(
+                    clippy::wildcard_enum_match_arm,
+                    reason = "only the two inline broadcast variants carry a payload here"
+                )]
+                match update {
+                    UpdateMsg::BroadcastTo {
+                        payload: DeltaOrFullState::FullState(bytes),
+                        sender_summary_bytes,
+                        ..
+                    }
+                    | UpdateMsg::BroadcastToV2 {
+                        payload: DeltaOrFullState::FullState(bytes),
+                        sender_summary_bytes,
+                        ..
+                    } => sent.push((bytes, sender_summary_bytes)),
+                    other => panic!("expected an inline full-state broadcast, got {other:?}"),
+                }
+            }
+            recorded.push(
+                op_manager
+                    .interest_manager
+                    .get_peer_summary(&key, &peer_key),
+            );
+        }
+
+        handler.abort();
+        drop((wait_for_event, task_monitor));
+        (sent, recorded, s1, s2)
+    }
+
+    /// The stand-in contract's summary function: one byte naming the state.
+    fn summary_of(state: &[u8]) -> StateSummary<'static> {
+        StateSummary::from(vec![0xA0 | state[0]])
+    }
+
+    /// #5842: a full-state send must never record a summary NEWER than the
+    /// state it put on the wire.
+    ///
+    /// Shape of the bug: a fan-out for state S1 is queued; before its leg runs,
+    /// a second write commits S2. The leg sent `new_state` (S1) as full state
+    /// but sent, and cached as the peer's summary, the CURRENT summary (S2's).
+    /// The sender then believed the peer held S2, so S2's own fan-out to that
+    /// peer took the "already converged" skip and the peer never got S2 until
+    /// anti-entropy, 5 to 75 minutes later.
+    ///
+    /// The stand-in contract handler holds S2 as the stored state, and is asked
+    /// to broadcast S1 then S2 to a peer whose summary it has never seen
+    /// (the full-state arm). Whatever went on the wire, the summary cached for
+    /// the peer must be the summary of bytes it was actually sent, and the peer
+    /// must end up having been sent S2.
+    #[tokio::test(flavor = "current_thread")]
+    async fn full_state_send_never_records_a_summary_newer_than_the_bytes_sent() {
+        let (sent, recorded, _s1, s2) = run_two_full_state_legs(true).await;
+        // After each leg that sent something, the summary cached for the peer
+        // describes the last state it was sent, never a newer one.
+        let mut last_sent: Option<&Vec<u8>> = None;
+        let mut sent_iter = sent.iter();
+        for rec in &recorded {
+            if let Some((bytes, _)) = sent_iter.next() {
+                last_sent = Some(bytes);
+            }
+            if let Some(bytes) = last_sent {
+                assert_eq!(
+                    rec.as_ref(),
+                    Some(&summary_of(bytes)),
+                    "the peer was sent state {:?} but is recorded as holding \
+                     the summary of the stored state",
+                    bytes[0],
+                );
+            }
+        }
+        for (bytes, summary) in &sent {
+            assert_eq!(
+                summary.as_slice(),
+                summary_of(bytes).as_ref(),
+                "the summary on the wire must describe the state on the wire"
+            );
+        }
+        assert!(
+            sent.iter().any(|(bytes, _)| bytes == s2.as_ref()),
+            "the peer was never sent S2: the S2 fan-out was skipped as already \
+             converged (sent: {:?})",
+            sent.iter().map(|(b, _)| b[0]).collect::<Vec<_>>()
+        );
+    }
+
+    /// #5842 fallback: when the handler cannot produce a snapshot, a full-state
+    /// leg sends the queued state, sends an EMPTY sender summary (the receiver
+    /// reads that as "unknown", see `seed_sender_summary_from_broadcast`), and
+    /// records nothing for the peer. Recording the stored summary here is
+    /// exactly the original bug.
+    #[tokio::test(flavor = "current_thread")]
+    async fn without_a_snapshot_a_full_state_leg_records_no_summary() {
+        let (sent, recorded, s1, s2) = run_two_full_state_legs(false).await;
+        assert_eq!(sent.len(), 2, "both legs still send: {sent:?}");
+        assert_eq!(sent[0].0.as_slice(), s1.as_ref());
+        assert_eq!(sent[1].0.as_slice(), s2.as_ref());
+        for (_, summary) in &sent {
+            assert!(
+                summary.is_empty(),
+                "no summary may be claimed without a snapshot"
+            );
+        }
+        assert_eq!(recorded, vec![None, None], "nothing recorded for the peer");
     }
 }

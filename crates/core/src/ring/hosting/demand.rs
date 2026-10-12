@@ -120,7 +120,8 @@ pub(crate) struct ProximityPrior {
     regression: IsotonicRegression<f64>,
     /// Raw input points in insertion order. When the length exceeds
     /// [`MAX_PRIOR_POINTS`], the oldest is evicted via `remove_points` so the
-    /// fit tracks a bounded recent window.
+    /// fit tracks a bounded recent window — approximately; see `observe` and
+    /// #5661.
     raw_points: VecDeque<Point<f64>>,
 }
 
@@ -154,15 +155,18 @@ impl ProximityPrior {
         self.raw_points.push_back(point);
         if self.raw_points.len() > MAX_PRIOR_POINTS {
             if let Some(oldest) = self.raw_points.pop_front() {
-                // `remove_points` correctly drops the sample even after PAVA has
-                // pooled it into a merged block: pav_regression's `remove_points`
-                // subtracts the removed point's weighted influence from the
-                // nearest aggregate AND decrements the centroid exactly (see its
-                // rustdoc), so the oldest observation's contribution is removed,
-                // not retained. This is the same incremental rolling-window
-                // mechanism the router's `IsotonicEstimator` relies on in
-                // production; a full rebuild from `raw_points` here would be
-                // O(n log n) per observation for no correctness gain.
+                // KNOWN INEXACT, tracked in #5661. pav_regression 0.7.0's
+                // `remove_points` subtracts the removed point from the aggregate
+                // CLOSEST in x, which need not be the aggregate PAVA pooled it
+                // into, and can leave aggregates no data could produce. The
+                // centroid is decremented exactly; the fitted blocks are not.
+                // `add_points` is not exact either: it re-pools already-pooled
+                // blocks, so its result depends on insertion order. The router's
+                // `IsotonicEstimator` used the same mechanism and was corrupted
+                // by it between refits; since #5658 it rebuilds its fit from a
+                // sorted window instead. This estimator has no refit at all, so
+                // any error here persists. Left as-is only because `predict()`
+                // no longer drives retention (see its docs).
                 self.regression.remove_points(&[oldest]);
             }
         }

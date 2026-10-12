@@ -111,16 +111,24 @@ impl ContractHandler for NetworkContractHandler {
         // This must be done before loading the cache so evictions work correctly
         let storage = executor.state_store().inner().clone();
         op_manager.ring.set_hosting_storage(storage.clone());
-        // Aggregate disk-usage tracker paths (#4683): the mode-resolved
+        // Aggregate disk-usage tracker paths (#4683, #5007): the mode-resolved
         // contracts dir (WASM blobs) and the relocated wasmtime compile-cache
-        // dir. Seeded lazily on the first sweep tick.
+        // dir, which the disk budget counts, plus the database dir and the
+        // webapp cache, which are measured and reported only. This is the only
+        // place the tracker learns these paths. Seeded lazily on the first
+        // sweep tick. Pinned by
+        // `hosting_disk_paths_are_installed_from_the_node_config`.
         op_manager.ring.set_hosting_disk_paths(
-            config.contracts_dir(),
-            config.wasmtime_cache_dir(),
+            crate::ring::HostingDiskPaths {
+                contracts_dir: config.contracts_dir(),
+                wasmtime_cache_dir: config.wasmtime_cache_dir(),
+                db_dir: config.db_dir(),
+                webapp_cache_dir: config.ws_api.webapp_cache_dir.clone(),
+            },
             config.hosting_disk_pct,
             config.max_hosting_disk,
         );
-        // Resident-overhead (count-derived) budget's live-surplus share (#5333).
+        // Share of the memory limit hosted contracts may hold in RAM (#5647).
         op_manager
             .ring
             .configure_resident_overhead_mem_share(config.hosting_mem_share);
@@ -160,10 +168,9 @@ impl ContractHandler for NetworkContractHandler {
         // Populate neighbor hosting from hosted contracts so HostingStateResponse
         // reports our full contract set when ring connections establish.
         let hosted_keys = op_manager.ring.hosting_contract_keys();
-        let hosted_ids = hosted_keys.iter().map(|k| *k.id());
         op_manager
             .neighbor_hosting
-            .initialize_from_hosting_cache(hosted_ids);
+            .initialize_from_hosting_cache(hosted_keys.into_iter());
 
         // #4780: also rehydrate InterestManager local-hosting for every restored
         // hosted contract, so a client GET for a cached contract serves LOCALLY
@@ -181,6 +188,16 @@ impl ContractHandler for NetworkContractHandler {
         // copies with no freshening path and re-introduce the #3698 stale-serve
         // bug. See .claude/rules/hosting-invariants.md (invariant 1).
         op_manager.rehydrate_local_hosting_interest();
+
+        // Restore persisted delegate subscriptions (#5493). AFTER the hosting
+        // cache and interest rehydration above, so a restored subscribe that
+        // hits a locally hosted contract sees it as local; BEFORE this
+        // function returns, which is before the event loop exists, so no
+        // delegate can run while its subscriptions are still missing. The
+        // registry half is synchronous; the network half is paced in the
+        // background (`delegate_restore`). Inert when nothing was persisted.
+        let restored = crate::wasm_runtime::delegate_subscriptions::restore_from_storage(&storage);
+        super::delegate_restore::spawn_reestablish(op_manager.clone(), restored);
 
         Ok(Self { executor, channel })
     }
@@ -947,6 +964,22 @@ pub(crate) enum ContractHandlerEvent {
         key: ContractKey,
         delta: Result<StateDelta<'static>, ExecutorError>,
     },
+    /// Read a contract's stored state and its summary as one snapshot.
+    ///
+    /// Both come from a single turn of the contract-handling loop, which is
+    /// also where every state write runs, so no write can land between them.
+    /// A `GetQuery` followed by a `GetSummaryQuery` gives no such guarantee:
+    /// the summary can describe a state committed after the one returned.
+    /// The broadcast fan-out needs the pair to agree, because it records the
+    /// summary as what the peer now holds (#5842).
+    GetStateAndSummaryQuery {
+        key: ContractKey,
+    },
+    /// Response to a GetStateAndSummaryQuery
+    GetStateAndSummaryResponse {
+        key: ContractKey,
+        snapshot: Result<(WrappedState, StateSummary<'static>), ExecutorError>,
+    },
     /// A client has disconnected — clean up its entries in shared_summaries
     /// and shared_notifications. Fire-and-forget: no response is sent.
     ClientDisconnect {
@@ -1080,6 +1113,13 @@ impl std::fmt::Display for ContractHandlerEvent {
             ContractHandlerEvent::GetDeltaResponse { key, delta } => match delta {
                 Ok(_) => write!(f, "get delta response {{ {key} }}"),
                 Err(e) => write!(f, "get delta failed {{ {key}, error: {e} }}"),
+            },
+            ContractHandlerEvent::GetStateAndSummaryQuery { key } => {
+                write!(f, "get state and summary query {{ {key} }}")
+            }
+            ContractHandlerEvent::GetStateAndSummaryResponse { key, snapshot } => match snapshot {
+                Ok(_) => write!(f, "get state and summary response {{ {key} }}"),
+                Err(e) => write!(f, "get state and summary failed {{ {key}, error: {e} }}"),
             },
             ContractHandlerEvent::ClientDisconnect { client_id } => {
                 write!(f, "client disconnect {{ {client_id} }}")
@@ -1443,6 +1483,153 @@ pub mod test {
             "Expected NoEvHandlerResponse, got {:?}",
             result
         );
+    }
+
+    /// Call-site pin: the disk-usage tracker must be installed with all four of
+    /// the node's own directories (#4683, #5007).
+    ///
+    /// The tracker cannot walk a directory it was never given, so a field
+    /// dropped here, or wired to the wrong accessor, silently reproduces the
+    /// blind spots #5007 closes (a database whose dead space nothing reports, a
+    /// webapp cache nothing measures), or mis-sizes the budgeted WASM and
+    /// compile-cache gauges, while every other test stays green.
+    ///
+    /// Nothing else can catch it. The `HostingDiskPaths` fields are all
+    /// `PathBuf`, so the type system permits both omission (via struct-update
+    /// syntax) and transposition; and a behavioral test would have to boot a
+    /// real node with a real store, which is what this whole file's `build` path
+    /// does only in integration tests that do not assert on disk accounting.
+    ///
+    /// Read against the comment-stripped, whitespace-collapsed production half
+    /// of this file so a rustfmt re-wrap of the call cannot rot the needles, and
+    /// the needles are assembled from fragments so this test cannot match its
+    /// own source through `include_str!`.
+    #[test]
+    fn hosting_disk_paths_are_installed_from_the_node_config() {
+        let src = production_source();
+
+        let call = concat!("set_hosting_disk", "_paths(");
+        assert_eq!(
+            src.matches(call).count(),
+            1,
+            "pin guard: expected exactly one disk-paths install in this file, so \
+             this test is asserting against the wrong thing"
+        );
+        let args = call_arguments(&src, call);
+
+        for (field, accessor) in [
+            // Pre-#5007 pair. Present so the pin covers the whole struct, not
+            // only the fields the issue added.
+            (
+                concat!("contracts", "_dir:"),
+                concat!("config.contracts", "_dir()"),
+            ),
+            (
+                concat!("wasmtime_cache", "_dir:"),
+                concat!("config.wasmtime_cache", "_dir()"),
+            ),
+            // #5007 blind spot 1: the storage backend's database directory. Its
+            // measured size is the only term that can see redb's dead space.
+            (concat!("db", "_dir:"), concat!("config.db", "_dir()")),
+            // #5007 blind spot 2: the unpacked-webapp cache. Reported, not
+            // budgeted — but it has to be measured to be reported at all, and it
+            // must come from the node's OWN config, never the process-wide
+            // default, for the same reason `server.rs` threads it.
+            (
+                concat!("webapp_cache", "_dir:"),
+                concat!("config.ws_api.webapp_cache", "_dir"),
+            ),
+        ] {
+            // Field and accessor must be ADJACENT, so a transposition (two
+            // fields swapping accessors) fails here as well as an omission.
+            // Whitespace is already stripped from `args`.
+            let pair = format!("{field}{accessor}");
+            assert!(
+                args.contains(&pair),
+                "the disk tracker must be installed with `{field}` resolved from \
+                 the node's config via `{accessor}`; found arguments `{args}`"
+            );
+        }
+
+        // The substitution template must not exist on this path at all: the
+        // process-wide webapp-cache default would measure some other node's
+        // directory (or the developer's) instead of this one's.
+        // Checked against the RAW production text, not the comment-stripped
+        // one: stripping can only remove text, which an absence check would
+        // read as a pass. A mention in a comment fails this, which is the safe
+        // direction.
+        const FULL: &str = include_str!("handler.rs");
+        let raw_production = &FULL[..FULL
+            .find(concat!("pub mod ", "test {"))
+            .expect("handler.rs must have a test module")];
+        assert!(
+            !raw_production.contains(concat!("default_webapp", "_cache_dir")),
+            "the node's disk accounting must never resolve the process-wide \
+             webapp cache default — it has to measure the directory this node \
+             actually serves from"
+        );
+    }
+
+    /// Production half of this file, comment-stripped and whitespace-collapsed,
+    /// for the source pin above.
+    ///
+    /// Cut at the test module's `mod` line, NOT at `#[cfg(test)]`: that
+    /// attribute also sits on individual test-only items earlier in this file,
+    /// so cutting there truncates the slice the pin reads and turns it vacuous
+    /// rather than red. Comments are dropped before collapsing so a `//` line
+    /// cannot run into the code below it, and whitespace is collapsed so a
+    /// rustfmt re-wrap of a call's arguments cannot rot a needle. The needle for
+    /// the cut is split so it cannot match its own source.
+    fn production_source() -> String {
+        const FULL: &str = include_str!("handler.rs");
+        let cutoff = FULL
+            .find(concat!("pub mod ", "test {"))
+            .expect("handler.rs must have a test module");
+        // Line comments first, so a `/*` inside one cannot open a block that
+        // swallows code; then `/* */` blocks, so a call wrapped in one cannot
+        // satisfy the pin. Both can only remove text, which turns a presence
+        // check red; an exactly-once count could miss a second call hidden
+        // behind a `"//"` or `"/*"` inside a string literal (none exists in
+        // this file's production half).
+        let no_line = FULL[..cutoff]
+            .lines()
+            .map(|line| line.split("//").next().unwrap_or(""))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut production = String::with_capacity(no_line.len());
+        let mut rest = no_line.as_str();
+        while let Some(start) = rest.find(concat!("/", "*")) {
+            production.push_str(&rest[..start]);
+            rest = match rest[start..].find(concat!("*", "/")) {
+                Some(end) => &rest[start + end + 2..],
+                None => "",
+            };
+        }
+        production.push_str(rest);
+        production.chars().filter(|c| !c.is_whitespace()).collect()
+    }
+
+    /// The balanced-parenthesis argument list of the (single) call to
+    /// `call_prefix` within `src`.
+    fn call_arguments(src: &str, call_prefix: &str) -> String {
+        let start = src
+            .find(call_prefix)
+            .unwrap_or_else(|| panic!("could not find {call_prefix}"))
+            + call_prefix.len();
+        let mut depth: i32 = 1;
+        for (offset, ch) in src[start..].char_indices() {
+            match ch {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return src[start..start + offset].to_string();
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("unterminated call to {call_prefix}");
     }
 }
 

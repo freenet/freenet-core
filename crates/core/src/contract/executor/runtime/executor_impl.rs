@@ -79,13 +79,18 @@ where
         let hosted = om.ring.hosting_contracts_count();
         let needed = crate::contract::executor::summary_cache_count_target(hosted);
         // needed >= SUMMARY_CACHE_COUNT_MIN > 0 by construction (summary_cache_count_target clamps); unwrap_or is just panic-proofing.
-        if needed > self.summary_cache.cap().get() {
-            self.summary_cache
-                .grow(NonZeroUsize::new(needed).unwrap_or(NonZeroUsize::MIN));
+        // Each lock is held for one compare-and-grow only (see
+        // `SharedSummaryCache`'s locking rule).
+        use crate::contract::executor::lock_fast_path_cache;
+        {
+            let mut summary_cache = lock_fast_path_cache(&self.summary_cache);
+            if needed > summary_cache.cap().get() {
+                summary_cache.grow(NonZeroUsize::new(needed).unwrap_or(NonZeroUsize::MIN));
+            }
         }
-        if needed > self.delta_cache.cap().get() {
-            self.delta_cache
-                .grow(NonZeroUsize::new(needed).unwrap_or(NonZeroUsize::MIN));
+        let mut delta_cache = lock_fast_path_cache(&self.delta_cache);
+        if needed > delta_cache.cap().get() {
+            delta_cache.grow(NonZeroUsize::new(needed).unwrap_or(NonZeroUsize::MIN));
         }
     }
 
@@ -95,6 +100,73 @@ where
     ) -> Option<ContractKey> {
         let code_hash = self.runtime.code_hash_from_id(instance_id)?;
         Some(ContractKey::from_id_and_code(*instance_id, code_hash))
+    }
+
+    /// The stored parameters for `key`, but only if they are the parameters its
+    /// instance id was derived from.
+    ///
+    /// The params row is keyed by instance id alone, and every operation that
+    /// arrives without code runs the contract with what it finds there. A row
+    /// whose parameters do not derive the instance id, under the code hash the
+    /// instance->code index holds for it, is treated as absent rather than
+    /// used. The next verified container for the instance rewrites it.
+    ///
+    /// With no index row there is no code hash to check against and nothing to
+    /// protect: every path that runs or serves a contract resolves its code
+    /// through that index, so such a contract cannot be run either way. The
+    /// params are returned unchecked, which keeps that case's existing errors.
+    /// That relies on one contract's operations being serialized node-wide (the
+    /// contract-handling loop runs them one at a time), so the instance cannot
+    /// gain an index row part-way through an operation that read its parameters
+    /// here, such as the initial-state install that writes them back.
+    pub(in crate::contract::executor) async fn verified_stored_params(
+        &self,
+        key: &ContractKey,
+    ) -> Result<Option<Parameters<'static>>, ExecutorError> {
+        let Some(params) = self
+            .state_store
+            .get_params(key)
+            .await
+            .map_err(ExecutorError::other)?
+        else {
+            return Ok(None);
+        };
+        let Some(code_hash) = self.runtime.code_hash_from_id(key.id()) else {
+            return Ok(Some(params));
+        };
+        let encoded_code_hash =
+            ContractKey::from_id_and_code(*key.id(), code_hash).encoded_code_hash();
+        match ContractKey::from_params(encoded_code_hash.clone(), params.clone()) {
+            Ok(derived) if derived.id() == key.id() => Ok(Some(params)),
+            _ => {
+                // WARN, not debug: a row that fails this check means the node was
+                // holding parameters it cannot vouch for, which an operator should
+                // be able to see in a release build. Once per contract per process,
+                // because the refusal repeats on every read (summaries run on each
+                // interest heartbeat). Bounded; past the bound it keeps warning
+                // rather than going quiet.
+                const REPORTED_CAP: usize = 4096;
+                static REPORTED: std::sync::LazyLock<dashmap::DashSet<ContractInstanceId>> =
+                    std::sync::LazyLock::new(dashmap::DashSet::new);
+                let first_report = REPORTED.len() >= REPORTED_CAP || REPORTED.insert(*key.id());
+                if first_report {
+                    tracing::warn!(
+                        contract = %key,
+                        code_hash = %encoded_code_hash,
+                        params_len = params.as_ref().len(),
+                        "Stored parameters for this contract do not derive its instance id, \
+                         so this node will not run or serve it. Re-PUT the contract (for \
+                         example `fdev publish` of the same contract) to repair them"
+                    );
+                } else {
+                    tracing::debug!(
+                        contract = %key,
+                        "Stored contract parameters still do not derive the instance id"
+                    );
+                }
+                Ok(None)
+            }
+        }
     }
 
     pub(in crate::contract::executor) async fn bridged_fetch_contract(
@@ -287,37 +359,22 @@ where
                 "Upserting contract state"
             );
         }
+        // A container's params are persisted further down, once `store_contract`
+        // has verified the container; see the `ensure_params` call there.
         let params = if let Some(code) = &code {
-            let p = code.params();
-            // Ensure params are persisted to state_store so they survive restarts.
-            // The code path (PUT via GET) always provides params in the container,
-            // but state_store.store() is only called for new contracts. If the contract
-            // already exists (merge path), commit_state_update() calls state_store.update()
-            // which doesn't write params. Persisting here covers all cases.
-            if let Err(e) = self.state_store.ensure_params(key, p.clone()).await {
+            code.params()
+        } else {
+            self.verified_stored_params(&key).await?.ok_or_else(|| {
                 tracing::warn!(
                     contract = %key,
-                    error = %e,
-                    "Failed to persist contract parameters to state_store"
+                    is_delta = matches!(update, Either::Right(_)),
+                    "Contract parameters not found in state_store"
                 );
-            }
-            p
-        } else {
-            self.state_store
-                .get_params(&key)
-                .await
-                .map_err(ExecutorError::other)?
-                .ok_or_else(|| {
-                    tracing::warn!(
-                        contract = %key,
-                        is_delta = matches!(update, Either::Right(_)),
-                        "Contract parameters not found in state_store"
-                    );
-                    ExecutorError::request(StdContractError::Put {
-                        key,
-                        cause: "missing contract parameters".into(),
-                    })
-                })?
+                ExecutorError::request(StdContractError::Put {
+                    key,
+                    cause: "missing contract parameters".into(),
+                })
+            })?
         };
 
         // Track if we stored a new contract. `charged_wasm` carries the blob
@@ -431,6 +488,27 @@ where
             } else {
                 (false, false, None)
             };
+
+        // Persist the container's params so they survive restarts. The code path
+        // (PUT via GET) always provides params in the container, but
+        // state_store.store() is only called for new contracts; if the contract
+        // already exists (merge path), commit_state_update() calls
+        // state_store.update(), which doesn't write params.
+        //
+        // This must follow verification. Every branch above that had a container
+        // passed it through `store_contract`, which returns an error (propagated
+        // by `?`) unless the key is derived from the container's code and params,
+        // and the params row is keyed by instance id alone. So only params that
+        // verification has bound to this instance id may be written to it.
+        if code.is_some() {
+            if let Err(e) = self.state_store.ensure_params(key, params.clone()).await {
+                tracing::warn!(
+                    contract = %key,
+                    error = %e,
+                    "Failed to persist contract parameters to state_store"
+                );
+            }
+        }
 
         let is_new_contract = self.state_store.get(&key).await.is_err();
 
@@ -1402,12 +1480,10 @@ where
         // secret export) MUST stay read-only w.r.t. contract state, or it could
         // populate the detector against a state a concurrent write has changed.
         if let Some(detector_hash) = self.state_store.cached_state_hash(&key) {
-            // Resolve the hit to an owned value BEFORE recording: `LruCache::get`
-            // borrows the executor mutably (it reorders the recency list), so the
-            // counter read cannot overlap it. The clone is the same one the
-            // return did before; it just moves ahead of the borrow's end.
-            let hit = self
-                .summary_cache
+            // Resolve the hit to an owned value inside one statement, so the
+            // shared-cache lock (a temporary guard) is released before anything
+            // else runs — never held across WASM or an `.await`.
+            let hit = crate::contract::executor::lock_fast_path_cache(&self.summary_cache)
                 .get(&key)
                 .and_then(|(hash, summary)| (*hash == detector_hash).then(|| summary.clone()));
             if let Some(cached_summary) = hit {
@@ -1443,10 +1519,9 @@ where
         self.state_store.cache_state_hash(key, state_hash);
 
         // The summary may already be cached under this exact hash even when the
-        // detector was cold (the summary cache is per-executor; the detector is
-        // shared). Reuse it to skip the WASM call.
-        let reload_hit = self
-            .summary_cache
+        // detector was cold (the detector is a bounded moka cache that can evict
+        // independently, and is reset on restart). Reuse it to skip the WASM call.
+        let reload_hit = crate::contract::executor::lock_fast_path_cache(&self.summary_cache)
             .get(&key)
             .and_then(|(hash, summary)| (*hash == state_hash).then(|| summary.clone()));
         if let Some(cached_summary) = reload_hit {
@@ -1459,17 +1534,12 @@ where
             return Ok(cached_summary);
         }
 
-        let params = self
-            .state_store
-            .get_params(&key)
-            .await
-            .map_err(ExecutorError::other)?
-            .ok_or_else(|| {
-                ExecutorError::request(StdContractError::Get {
-                    key,
-                    cause: "contract parameters not found".into(),
-                })
-            })?;
+        let params = self.verified_stored_params(&key).await?.ok_or_else(|| {
+            ExecutorError::request(StdContractError::Get {
+                key,
+                cause: "contract parameters not found".into(),
+            })
+        })?;
 
         // Summarize-storm falsifier (spec step 8 / #4440): count the actual WASM
         // `summarize_state` invocation — the SLOW-path miss the state-hash cache
@@ -1508,7 +1578,8 @@ where
             .summarize_state(&key, &params, &state)
             .map_err(|e| ExecutorError::execution(e, None))?;
 
-        self.summary_cache.put(key, (state_hash, summary.clone()));
+        crate::contract::executor::lock_fast_path_cache(&self.summary_cache)
+            .put(key, (state_hash, summary.clone()));
         Ok(summary)
     }
 
@@ -1548,9 +1619,11 @@ where
         // contract state.
         if let Some(detector_hash) = self.state_store.cached_state_hash(&key) {
             let cache_key = (key, detector_hash, summary_hash);
-            // Owned before recording: `LruCache::get` borrows mutably (see the
-            // summarize twin above).
-            let hit = self.delta_cache.get(&cache_key).cloned();
+            // Owned within one statement so the shared-cache lock is released
+            // immediately (see the summarize twin above).
+            let hit = crate::contract::executor::lock_fast_path_cache(&self.delta_cache)
+                .get(&cache_key)
+                .cloned();
             if let Some(cached_delta) = hit {
                 // Field-visible cache-HIT count; see the summarize twin above
                 // and `ring::contract_exec_metrics`. This arm runs per-SUBSCRIBER
@@ -1581,7 +1654,9 @@ where
         self.state_store.cache_state_hash(key, state_hash);
 
         let cache_key = (key, state_hash, summary_hash);
-        let reload_hit = self.delta_cache.get(&cache_key).cloned();
+        let reload_hit = crate::contract::executor::lock_fast_path_cache(&self.delta_cache)
+            .get(&cache_key)
+            .cloned();
         if let Some(cached_delta) = reload_hit {
             // Slow path reached (state loaded + hashed) but the WASM call was
             // still elided; see the summarize twin above.
@@ -1591,17 +1666,12 @@ where
             return Ok(cached_delta);
         }
 
-        let params = self
-            .state_store
-            .get_params(&key)
-            .await
-            .map_err(ExecutorError::other)?
-            .ok_or_else(|| {
-                ExecutorError::request(StdContractError::Get {
-                    key,
-                    cause: "contract parameters not found".into(),
-                })
-            })?;
+        let params = self.verified_stored_params(&key).await?.ok_or_else(|| {
+            ExecutorError::request(StdContractError::Get {
+                key,
+                cause: "contract parameters not found".into(),
+            })
+        })?;
 
         // The delta twin of the summarize slow-path counter: a true cache miss
         // that actually runs the contract's WASM `get_state_delta`. Recorded at
@@ -1615,7 +1685,8 @@ where
             .get_state_delta(&key, &params, &state, &their_summary)
             .map_err(|e| ExecutorError::execution(e, None))?;
 
-        self.delta_cache.put(cache_key, delta.clone());
+        crate::contract::executor::lock_fast_path_cache(&self.delta_cache)
+            .put(cache_key, delta.clone());
         Ok(delta)
     }
 
@@ -1668,15 +1739,10 @@ where
         &self,
         key: &ContractKey,
     ) -> Result<Option<ContractContainer>, ExecutorError> {
-        let Some(parameters) = self
-            .state_store
-            .get_params(key)
-            .await
-            .map_err(ExecutorError::other)?
-        else {
+        let Some(parameters) = self.verified_stored_params(key).await? else {
             tracing::debug!(
                 contract = %key,
-                "Contract parameters not in state_store, cannot fetch contract"
+                "No usable contract parameters in state_store, cannot fetch contract"
             );
             return Ok(None);
         };
@@ -2378,7 +2444,7 @@ where
 
     /// Send notifications to delegates subscribed to a contract's state changes.
     ///
-    /// Checks the global `DELEGATE_SUBSCRIPTIONS` registry and sends a
+    /// Checks the global `delegate_subscriptions` registry and sends a
     /// `DelegateNotification` for each subscribed delegate through the channel.
     ///
     /// This is a **best-effort, lossy** notification path: if the bounded channel
@@ -2392,14 +2458,12 @@ where
         };
 
         let instance_id = *key.id();
-        // Snapshot subscribers and release the DashMap read-lock before sending
-        let subscribers: Vec<DelegateKey> = {
-            let entry = crate::wasm_runtime::DELEGATE_SUBSCRIPTIONS.get(&instance_id);
-            match entry {
-                Some(ref s) if !s.is_empty() => s.iter().cloned().collect(),
-                _ => return,
-            }
-        };
+        // Snapshot subscribers; the registry returns an owned Vec so no shard
+        // lock is held across the sends below.
+        let subscribers = crate::wasm_runtime::delegate_subscriptions::subscribers_of(&instance_id);
+        if subscribers.is_empty() {
+            return;
+        }
 
         tracing::debug!(
             contract = %key,
@@ -2416,7 +2480,18 @@ where
                 contract_id: instance_id,
                 new_state: Arc::clone(&shared_state),
             }) {
-                Ok(()) => {}
+                Ok(()) => {
+                    // Ordinary use, which is what orders cap eviction: a
+                    // subscription that is actually delivering stays warm, so
+                    // the one dropped under pressure is whichever this delegate
+                    // has heard about least recently. Stamped on successful
+                    // enqueue only — a notification dropped by a full channel is
+                    // not evidence the delegate is using the subscription.
+                    crate::wasm_runtime::delegate_subscriptions::note_notified(
+                        &instance_id,
+                        &delegate_key,
+                    );
+                }
                 Err(mpsc::error::TrySendError::Full(_)) => {
                     static DROPPED: AtomicUsize = AtomicUsize::new(0);
                     let total = DROPPED.fetch_add(1, Ordering::Relaxed) + 1;
@@ -2433,8 +2508,18 @@ where
                         "Delegate notification channel closed — removing stale subscriptions"
                     );
                     // Receiver is gone; clean up all subscriptions for this contract
-                    // to prevent repeated failed sends on future state updates.
-                    crate::wasm_runtime::DELEGATE_SUBSCRIPTIONS.remove(&instance_id);
+                    // to prevent repeated failed sends on future state updates,
+                    // and release the interest they took (#5542).
+                    //
+                    // IN MEMORY ONLY. This channel closes when the node shuts
+                    // down, and the persisted subscriptions must survive
+                    // exactly that (#5493): erasing them here would erase every
+                    // delegate's subscriptions on every clean shutdown.
+                    crate::wasm_runtime::delegate_subscriptions::remove_contract(
+                        &instance_id,
+                        crate::wasm_runtime::delegate_subscriptions::Durability::InMemoryOnly,
+                    );
+                    crate::wasm_runtime::delegate_interest::release_contract(&instance_id);
                     return;
                 }
             }

@@ -1,4 +1,5 @@
-//! Connection strategies: current Freenet algorithm and proposed small-world improvement.
+//! Connection strategies: Freenet's v0.1.128 algorithm (`Current`, a historical snapshot)
+//! and the proposed small-world improvement.
 //!
 //! ## SmallWorld strategy — theoretical basis
 //!

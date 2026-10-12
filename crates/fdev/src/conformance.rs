@@ -121,7 +121,7 @@ pub struct ConformanceConfig {
     #[arg(long)]
     pub(crate) json: bool,
 
-    /// Write a bincode-encoded evidence file per distinct enforceable
+    /// Write a framed evidence file per distinct enforceable
     /// violation into this directory (created if it does not exist).
     #[arg(long = "evidence-out")]
     pub(crate) evidence_out: Option<PathBuf>,
@@ -475,7 +475,9 @@ fn parse_properties(names: &[String]) -> anyhow::Result<Vec<ConformanceProperty>
 /// differ, and both are worth knowing.
 async fn verify_evidence(config: &ConformanceConfig, path: &PathBuf) -> anyhow::Result<()> {
     let bytes = read_file(path)?;
-    let evidence = ConformanceEvidence::decode(&bytes)
+    // A file the operator chose, so evidence written before framing existed is
+    // accepted here. A path receiving bytes from a peer must use the strict `decode`.
+    let evidence = ConformanceEvidence::decode_file(&bytes)
         .with_context(|| format!("decoding evidence {}", path.display()))?;
 
     // Bounds-check with the same function a receiving peer uses, so this command
@@ -2777,6 +2779,54 @@ mod tests {
         assert_eq!(summary.input_bytes_before_shrinking, 128);
     }
 
+    /// Verify write_evidence produces framed evidence readable by ConformanceEvidence::decode.
+    /// Kills mutant where write_evidence uses raw bincode serialization.
+    #[test]
+    fn write_evidence_produces_framed_evidence_readable_by_decode() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let out = dir.path().join("evidence");
+        let mut oracle = CountingOracle::default();
+
+        let property = ConformanceProperty::StateCommutativity;
+        let case = ConformanceCase::new(
+            property,
+            vec![Bytes::from(vec![7u8; 64]), Bytes::from(vec![8u8; 64])],
+        );
+
+        let summary = write_evidence(
+            &out,
+            ContractInstanceId::new([3u8; 32]),
+            &[],
+            &[(case, PropertyOutcome::Violated(violation_of(property)))],
+            &mut oracle,
+            &[],
+            &[],
+        )
+        .expect("write evidence");
+
+        assert_eq!(summary.files_written, 1);
+
+        let entries: Vec<_> = std::fs::read_dir(&out)
+            .expect("read dir")
+            .filter_map(|e| e.ok())
+            .collect();
+        assert_eq!(
+            entries.len(),
+            1,
+            "exactly one evidence file must exist on disk"
+        );
+
+        let path = entries[0].path();
+        let bytes = std::fs::read(&path).expect("read evidence file");
+
+        // Golden wire-format pin: exactly 10 bytes framing (8 bytes magic + LE u16 schema_version 2)
+        assert_eq!(&bytes[..10], b"FRNTEVD1\x02\x00");
+
+        // Decode using ConformanceEvidence::decode: verifies producer and consumer agree
+        let evidence = ConformanceEvidence::decode(&bytes).expect("decode written evidence");
+        assert_eq!(evidence.schema_version, 2);
+    }
+
     /// "wrote 0 evidence file(s)" must never stand alone.
     ///
     /// `findings_too_large`'s own doc comment says silently writing nothing would look
@@ -3165,6 +3215,28 @@ mod tests {
         assert!(
             msg.contains("not conformance evidence (bad magic)"),
             "error should indicate bad magic; got: {msg}"
+        );
+    }
+
+    /// `--evidence` reads files, which may predate framing, so it uses `decode_file`
+    /// rather than the strict `decode`, and recognises a pre-framing file as old
+    /// evidence instead of calling it foreign. Switching `verify_evidence` back to
+    /// `decode` makes this fail: the same file then reads as bad magic.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn verify_evidence_recognises_a_file_written_before_framing() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let evidence_path = dir.path().join("evidence.bin");
+        // An unframed schema-1 payload, as v0.2.129 to v0.2.132 wrote.
+        std::fs::write(&evidence_path, [1u8, 0, 0xff, 0xff, 0xff]).expect("write file");
+
+        let config = wasm_only_config(None);
+        let err = verify_evidence(&config, &evidence_path)
+            .await
+            .expect_err("a schema-1 file must be refused");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("written by an older build"),
+            "a pre-framing file must be recognised as old evidence; got: {msg}"
         );
     }
 

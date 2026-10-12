@@ -12,7 +12,6 @@ use std::{
     collections::{BTreeMap, HashMap, HashSet},
     sync::Arc,
 };
-use tokio::net::UdpSocket;
 use tokio::sync::mpsc::{self, Receiver, Sender, error::TryRecvError};
 use tokio::time::Instant;
 use tokio::time::{sleep, timeout};
@@ -32,8 +31,8 @@ use crate::ring::PeerKey;
 use crate::ring::{Distance, Location};
 use crate::transport::{
     BroadcastDeliveryOutcome, CongestionControlConfig, ExpectedInboundTracker, PeerConnectionApi,
-    Socket, TransportError, TransportKeypair, TransportPublicKey, create_connection_handler,
-    global_bandwidth::GlobalBandwidthManager, peer_connection::StreamId,
+    Socket, TransportError, TransportKeypair, TransportPublicKey, UdpTransportSocket,
+    create_connection_handler, global_bandwidth::GlobalBandwidthManager, peer_connection::StreamId,
 };
 use crate::util::time_source::{DynTimeSource, InstantTimeSrc};
 use crate::{
@@ -53,7 +52,11 @@ mod broadcast;
 mod connection_lifecycle;
 mod dispatch;
 mod migration;
-mod v2_drain;
+mod zombie_sweep;
+
+use zombie_sweep::ZombieSweepState;
+#[cfg(test)]
+use zombie_sweep::{TransportActivity, is_zombie};
 
 /// Represents the different ways the event loop can exit.
 ///
@@ -89,94 +92,6 @@ impl std::error::Error for EventLoopExitReason {}
 /// poll. A diagnostics query is best-effort, so cap the wait and serve an empty
 /// result on timeout rather than freezing (or, previously, killing) the listener.
 const QUERY_SUBSCRIPTIONS_HANDLER_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// Bound on the state read the V2 delegate broadcast drain performs.
-///
-/// Same hazard and same remedy as [`QUERY_SUBSCRIPTIONS_HANDLER_TIMEOUT`]: the
-/// read runs INLINE on the network event loop, and the handler's own timeout is
-/// `CH_EV_RESPONSE_TIME_OUT` (300 s), so an unbounded await here is the #4549
-/// wedge — a saturated contract handler stalls, then kills, the listener.
-///
-/// TIGHT ON PURPOSE, and it was briefly widened to `BROADCAST_CH_TIMEOUT`
-/// (10 s) on reasoning that does not hold. Recorded because the reasoning was
-/// plausible and will be re-invented otherwise.
-///
-/// The widening argued that `handle_broadcast_state_change`, called three lines
-/// later on this same arm, already spends `BROADCAST_CH_TIMEOUT` per target, so
-/// a tighter cap here protected nothing. **That is false in a production
-/// build.** In production the handler resolves targets in memory and hands off
-/// to `BroadcastQueue::enqueue`, a mutex-guarded push; every
-/// `BROADCAST_CH_TIMEOUT` round trip lives in `broadcast_to_single_peer`, which
-/// runs inside the spawned `drain_lane` workers, OFF this loop. The function
-/// that does await per target inline, `broadcast_state_to_peers`, is
-/// `#[cfg(feature = "simulation_tests")]`. So the comparison was against a path
-/// the shipped binary does not take.
-///
-/// The second argument was that a stall here produces no slow-iteration warning
-/// — `SLOW_EVENT_THRESHOLD` is measured around `process_select_result`, and the
-/// `NodeAction` dispatch containing this arm runs after that elapsed time is
-/// taken. That part is TRUE, and it argues the opposite way: an unobserved
-/// stall needs a tighter bound, not a looser one, because nothing will tell an
-/// operator it happened.
-///
-/// What the bound trades. Expiry drops one broadcast, which is recoverable —
-/// the next write to the contract re-announces it, and anti-entropy repairs it
-/// otherwise. Overrunning starves the network event loop, which processes no
-/// UDP and no connection events while it waits, and that is not recoverable.
-/// The asymmetry matters more than it looks because the coalescing marker is
-/// PER CONTRACT: a delegate writing across N contracts queues N distinct
-/// drains, so the worst case is N times this bound of dead loop, not one.
-pub(crate) const V2_BROADCAST_DRAIN_READ_TIMEOUT: Duration = Duration::from_secs(2);
-
-/// Count of V2 delegate broadcasts dropped because the drain could not read
-/// local state.
-///
-/// A counter, not only a log line: `crates/core/Cargo.toml` enables tracing's
-/// `release_max_level_info`, so anything logged below INFO does not exist in a
-/// release binary. The accompanying message is therefore WARN, and this counter
-/// gives the same fact a form an operator can poll and graph rather than grep.
-/// `.claude/rules/code-style.md` requires exactly this of a drop that is
-/// invisible on the happy path — a refusal that is not counted renders as a
-/// clean zero.
-static V2_BROADCAST_DRAINS_DROPPED: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-
-/// Count a dropped V2 broadcast drain, and WARN at power-of-two milestones.
-///
-/// RATE-LIMITED on purpose, and the reason is a production incident rather than
-/// taste. `try_notify_node_event_on` logs its `Full` arm at `debug!` with the
-/// note that a per-occurrence WARN there flooded production gateways after the
-/// HN spike (#4238) at 8-14 MB/hour. This path is reached under exactly that
-/// condition — a saturated node — and once per V2 write, so an unconditional
-/// WARN here would re-create the same flood by a different door.
-///
-/// `release_max_level_info` still rules out `debug!` (the drop would leave no
-/// evidence in a release build, the #4981 shape), so the answer is neither
-/// every occurrence nor none: count all, warn at 1, 2, 4, 8, ... exactly as
-/// `tracing::register::note_dropped_event_log` does for the same trade.
-fn note_v2_broadcast_drain_dropped(key: &freenet_stdlib::prelude::ContractKey) {
-    let dropped =
-        V2_BROADCAST_DRAINS_DROPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-    if dropped.is_power_of_two() {
-        tracing::warn!(
-            contract = %key,
-            dropped_total = dropped,
-            timeout_secs = V2_BROADCAST_DRAIN_READ_TIMEOUT.as_secs(),
-            "V2 delegate broadcast dropped: could not read local state to announce, and \
-             the bounded retry did not recover it. The usual cause is the contract-handling \
-             loop being held by the delegate that made this write — a delegate awaiting user \
-             input holds it for a human-scale time and will not be recovered by retries \
-             (#5544/#5554 remove that precondition). The write is committed locally; a peer \
-             hosting or using this contract re-learns it EVENTUALLY via anti-entropy, \
-             or sooner on the delegate's next write. Eventually is the honest word: \
-             INTEREST_HEARTBEAT_INTERVAL (300s) is the heartbeat PERIOD, not a recovery \
-             bound — each exchange carries at most MAX_SUMMARY_ENTRIES_PER_MESSAGE \
-             entries, chosen by RANDOM ROTATION when a peer shares more contracts than \
-             that, so a busy node needs several rounds and the count is probabilistic. \
-             Logged at power-of-two milestones (#4238)."
-        );
-    }
-}
 
 /// Best-effort, bounded query to the contract handler for application-level
 /// subscriptions, used by the diagnostics arms of the network event loop (#4549).
@@ -311,6 +226,18 @@ impl P2pBridge {
             log_register: Arc::new(event_register),
             gateways,
         }
+    }
+
+    /// A bridge whose outbound messages land on `sender`, for tests that drive
+    /// the real send path and read what it put on the wire.
+    #[cfg(test)]
+    pub(crate) fn new_for_test(sender: Sender<P2pBridgeEvent>, op_manager: Arc<OpManager>) -> Self {
+        Self::new(
+            sender,
+            op_manager,
+            crate::tracing::DynamicRegister::new(vec![]),
+            Arc::new(Vec::new()),
+        )
     }
 
     /// Wake any drivers whose downstream peer just disconnected.
@@ -609,67 +536,18 @@ struct ConnectionEntry {
     /// Used for zombie detection: connections not promoted to the ring
     /// within a timeout are considered zombies and dropped.
     created_at: Instant,
+    /// When the remote last sent a request over this transport (see
+    /// `zombie_sweep::is_link_use_request`), shared with the transport's
+    /// `peer_connection_listener`, which stamps each request as it receives it.
+    /// The zombie sweep judges a transport that was never promoted to the ring
+    /// by this rather than by `created_at`, so a link the remote is still
+    /// sending requests over is not collected out from under it (#5654), within
+    /// the per-IP and global caps in `zombie_sweep`.
+    link_use: zombie_sweep::LinkUseStamp,
     /// The remote peer's negotiated protocol version, if known.
     /// `None` when the version wasn't exchanged (e.g. joiner->gateway path).
     /// Used to gate version-dependent message types (e.g. SubscribeHint).
     remote_version: Option<(u8, u8, u16)>,
-}
-
-/// Check whether a transport connection is a zombie: old enough but not
-/// promoted to ring, not pending reservation, and not a gateway.
-///
-/// Gateway connections are exempt below a 1-hour absolute cap because they
-/// are intentionally transient (never promoted to ring) but actively needed
-/// for routing (#3595).
-///
-/// Two thresholds for non-gateway connections:
-/// Zombie thresholds are derived from `transient_ttl` (configurable, default 30s):
-///
-/// - `zombie_threshold` = `transient_ttl * 3`: catches connections with no pending
-///   reservation. Must be greater than `PENDING_RESERVATION_TTL` (60s) so that a
-///   connection isn't immediately killed after its reservation expires. Previous
-///   hardcoded value of 300s caused gateways to accumulate ~250 zombie transports,
-///   overwhelming the packet processing channel and dropping keepalive packets.
-/// - `absolute_zombie_threshold` = `transient_ttl * 6`: overrides `has_pending` to
-///   break the refresh cycle where `connection_maintenance()` perpetually renews
-///   pending reservations on gateway transports. Previous hardcoded value of 600s
-///   allowed zombie transports to linger far too long.
-fn is_zombie(
-    created_at_elapsed: Duration,
-    in_ring: bool,
-    has_pending: bool,
-    is_gateway: bool,
-    transient_ttl: Duration,
-) -> bool {
-    let zombie_threshold = transient_ttl * 3;
-    let absolute_zombie_threshold = transient_ttl * 6;
-
-    if in_ring {
-        return false;
-    }
-    // Gateway transient connections are intentionally not promoted to ring,
-    // but the node needs them for routing. Without this exemption, gateways
-    // enter a zombie→prune→reconnect→zombie death spiral that breaks all
-    // streaming transfers (#3595).
-    //
-    // The exemption is time-bounded: truly dead gateway connections (no
-    // traffic for 1 hour) are still cleaned up. The transport-level idle
-    // timeout is the primary backstop, but this ensures no permanent leaks.
-    /// Gateway connections get a generous exemption window (1 hour) because they
-    /// are intentionally transient but needed for routing. The transport-level
-    /// idle timeout (120s keepalive) is the primary cleanup mechanism for dead
-    /// gateways; this threshold is the safety net.
-    const GATEWAY_ZOMBIE_EXEMPTION: Duration = Duration::from_secs(3600);
-    if is_gateway && created_at_elapsed < GATEWAY_ZOMBIE_EXEMPTION {
-        return false;
-    }
-    if created_at_elapsed > zombie_threshold && !has_pending {
-        return true;
-    }
-    if created_at_elapsed > absolute_zombie_threshold {
-        return true;
-    }
-    false
 }
 
 /// Monotonically increasing counter for generating unique connection IDs.
@@ -840,15 +718,6 @@ pub(in crate::node) struct P2pConnManager {
     blocked_addresses: Option<HashSet<SocketAddr>>,
     /// Per-contract retry count for broadcasts that found no targets yet.
     broadcast_retries: HashMap<freenet_stdlib::prelude::ContractKey, u8>,
-    /// Per-contract retry count for a V2 delegate broadcast drain whose state
-    /// read came back `Unavailable`.
-    ///
-    /// Separate from `broadcast_retries`, which counts a different failure (a
-    /// fan-out that resolved no targets). This one counts "we could not read
-    /// what to send". Bounded by [`Self::MAX_V2_DRAIN_RETRIES`]; the entry is
-    /// removed on success, on a definitive `NotHeld`, and on exhaustion, so it
-    /// cannot accumulate per contract.
-    v2_drain_retries: HashMap<freenet_stdlib::prelude::ContractKey, u8>,
     /// Tracks how many consecutive broadcast cycles found zero targets per contract.
     /// Used to suppress repetitive WARN logs after the first few failures.
     /// Bounded to MAX_BROADCAST_STREAK_ENTRIES to prevent unbounded growth from
@@ -1365,6 +1234,8 @@ impl P2pConnManager {
             .ring
             .connection_manager
             .try_set_own_addr(advertised_addr);
+        #[cfg(not(feature = "simulation_tests"))]
+        let broadcast_spacing = bridge.op_manager.broadcast_spacing.clone();
 
         // Uptime is measured from here — the last step of node construction,
         // immediately before the event loop starts serving. Reading `now()` once
@@ -1420,16 +1291,17 @@ impl P2pConnManager {
             congestion_config: config.config.network_api.build_congestion_config(),
             blocked_addresses: config.blocked_addresses.clone(),
             broadcast_retries: HashMap::new(),
-            v2_drain_retries: HashMap::new(),
             broadcast_no_target_streak: HashMap::new(),
             #[cfg(not(feature = "simulation_tests"))]
-            broadcast_queue: super::broadcast_queue::BroadcastQueue::new(),
+            broadcast_queue: super::broadcast_queue::BroadcastQueue::with_spacing(
+                broadcast_spacing,
+            ),
         })
     }
 
-    /// Runs the event listener with `UdpSocket` (production mode).
+    /// Runs the event listener with `UdpTransportSocket` (production mode).
     ///
-    /// This is a convenience wrapper around `run_event_listener_with_socket<UdpSocket>`.
+    /// This is a convenience wrapper around `run_event_listener_with_socket<UdpTransportSocket>`.
     #[allow(clippy::too_many_arguments)]
     #[tracing::instrument(name = "network_event_listener", fields(peer = %self.bridge.op_manager.ring.connection_manager.pub_key), skip_all)]
     pub async fn run_event_listener(
@@ -1439,7 +1311,7 @@ impl P2pConnManager {
         notification_channel: EventLoopNotificationsReceiver,
         node_controller: Receiver<NodeEvent>,
     ) -> anyhow::Result<Infallible> {
-        self.run_event_listener_with_socket::<UdpSocket>(
+        self.run_event_listener_with_socket::<UdpTransportSocket>(
             op_manager,
             client_wait_for_transaction,
             notification_channel,
@@ -1451,7 +1323,7 @@ impl P2pConnManager {
     /// Runs the event listener with a configurable socket type.
     ///
     /// This is the generic version that allows using different socket implementations:
-    /// - `UdpSocket` for production
+    /// - `UdpTransportSocket` for production
     /// - `InMemorySocket` for testing
     ///
     /// The socket type only affects connection establishment. Once connections are
@@ -1489,7 +1361,6 @@ impl P2pConnManager {
             ack_version_floor_override,
             blocked_addresses,
             broadcast_retries,
-            v2_drain_retries,
             broadcast_no_target_streak,
             #[cfg(not(feature = "simulation_tests"))]
             broadcast_queue,
@@ -1585,7 +1456,6 @@ impl P2pConnManager {
             ack_version_floor_override,
             blocked_addresses,
             broadcast_retries,
-            v2_drain_retries,
             broadcast_no_target_streak,
             #[cfg(not(feature = "simulation_tests"))]
             broadcast_queue: broadcast_queue.clone(),
@@ -1606,6 +1476,7 @@ impl P2pConnManager {
         let mut slow_event_count = 0u64;
         let mut last_stats_log = Instant::now();
         const STATS_LOG_INTERVAL: Duration = Duration::from_secs(30);
+        let mut zombie_sweep_state = ZombieSweepState::new(Instant::now());
         const SLOW_EVENT_THRESHOLD: Duration = Duration::from_millis(100);
 
         // Monitor both the event stream AND the UDP listen task.
@@ -1640,43 +1511,52 @@ impl P2pConnManager {
                     ));
                 },
 
-                maybe_result = StreamExt::next(&mut select_stream) => {
-                    let Some(result) = maybe_result else {
-                        break;
-                    };
-                    result
+                // Also wakes for a zombie sweep backlog deadline, so a backlog
+                // drains on a quiet node (see `zombie_sweep::next_wake`).
+                wake = zombie_sweep::next_wake(&mut select_stream, zombie_sweep_state.backlog_deadline()) => {
+                    match wake {
+                        zombie_sweep::LoopWake::Event(Some(result)) => Some(result),
+                        zombie_sweep::LoopWake::Event(None) => break,
+                        zombie_sweep::LoopWake::ZombieSweepDue => None,
+                    }
                 },
             };
 
-            loop_iteration_count += 1;
+            let event = if let Some(result) = result {
+                loop_iteration_count += 1;
 
-            let event_type = match &result {
-                priority_select::SelectResult::Notification(_) => "notification",
-                priority_select::SelectResult::OpExecution(_) => "op_execution",
-                priority_select::SelectResult::PeerConnection(_) => "peer_connection",
-                priority_select::SelectResult::ConnBridge(_) => "conn_bridge",
-                priority_select::SelectResult::Handshake(_) => "handshake",
-                priority_select::SelectResult::NodeController(_) => "node_controller",
-                priority_select::SelectResult::ClientTransaction(_) => "client_transaction",
-                priority_select::SelectResult::ExecutorTransaction(_) => "executor_transaction",
+                let event_type = match &result {
+                    priority_select::SelectResult::Notification(_) => "notification",
+                    priority_select::SelectResult::OpExecution(_) => "op_execution",
+                    priority_select::SelectResult::PeerConnection(_) => "peer_connection",
+                    priority_select::SelectResult::ConnBridge(_) => "conn_bridge",
+                    priority_select::SelectResult::Handshake(_) => "handshake",
+                    priority_select::SelectResult::NodeController(_) => "node_controller",
+                    priority_select::SelectResult::ClientTransaction(_) => "client_transaction",
+                    priority_select::SelectResult::ExecutorTransaction(_) => "executor_transaction",
+                };
+
+                let process_start = Instant::now();
+
+                // Process the result using the existing handler
+                let event = ctx
+                    .process_select_result(result, &mut state, &handshake_cmd_sender)
+                    .await?;
+
+                let elapsed = process_start.elapsed();
+                if elapsed > SLOW_EVENT_THRESHOLD {
+                    slow_event_count += 1;
+                    tracing::warn!(
+                        event_type,
+                        elapsed_ms = elapsed.as_millis(),
+                        "Slow event loop iteration"
+                    );
+                }
+                event
+            } else {
+                // Woken only for a zombie sweep backlog slice; it runs below.
+                EventResult::Continue
             };
-
-            let process_start = Instant::now();
-
-            // Process the result using the existing handler
-            let event = ctx
-                .process_select_result(result, &mut state, &handshake_cmd_sender)
-                .await?;
-
-            let elapsed = process_start.elapsed();
-            if elapsed > SLOW_EVENT_THRESHOLD {
-                slow_event_count += 1;
-                tracing::warn!(
-                    event_type,
-                    elapsed_ms = elapsed.as_millis(),
-                    "Slow event loop iteration"
-                );
-            }
 
             // Periodic stats logging
             if last_stats_log.elapsed() > STATS_LOG_INTERVAL {
@@ -1719,52 +1599,19 @@ impl P2pConnManager {
                 slow_event_count = 0;
                 last_stats_log = Instant::now();
 
-                // Zombie transport cleanup: remove connections older than 3× transient_ttl
-                // that haven't been promoted to ring and have no pending reservation.
-                // An absolute threshold of 6× transient_ttl overrides pending reservations
-                // to catch gateway transports stuck in a pending-refresh cycle.
-                //
-                // IMPORTANT: We use drop_zombie_connection (non-blocking try_send)
-                // instead of drop_connection_by_addr to avoid a circular deadlock
-                // with the handshake driver (#3519). We also cap the batch size to
-                // limit event loop latency — each zombie cleanup involves topology
-                // pruning and orphaned transaction handling. With a 100ms timeout
-                // per zombie, 64 zombies = ~6.4s worst case per cycle.
-                // Remaining zombies will be cleaned up in the next 30s cycle.
-                const MAX_ZOMBIE_CLEANUP_PER_CYCLE: usize = 64;
-                let transient_ttl = op_manager.ring.connection_manager.transient_ttl();
-                let zombie_addrs: Vec<SocketAddr> = ctx
-                    .connections
-                    .iter()
-                    .filter(|(addr, entry)| {
-                        let is_gateway = ctx
-                            .gateways
-                            .iter()
-                            .any(|gw| gw.socket_addr() == Some(**addr));
-                        is_zombie(
-                            entry.created_at.elapsed(),
-                            op_manager.ring.connection_manager.is_in_ring(**addr),
-                            op_manager
-                                .ring
-                                .connection_manager
-                                .has_connection_or_pending(**addr),
-                            is_gateway,
-                            transient_ttl,
-                        )
-                    })
-                    .map(|(addr, _)| *addr)
-                    .take(MAX_ZOMBIE_CLEANUP_PER_CYCLE)
-                    .collect();
-                if !zombie_addrs.is_empty() {
-                    tracing::info!(
-                        zombie_count = zombie_addrs.len(),
-                        "Cleaning up zombie transports (not promoted to ring)"
-                    );
+                // Zombie transport cleanup (see `zombie_sweep`). A slice drops at
+                // most MAX_ZOMBIE_CLEANUP_PER_CYCLE transports. Both this tick and
+                // the backlog check below use `ZombieSweepState::slice_due`, so no
+                // slice starts within the required spacing of the previous one.
+                if zombie_sweep_state.slice_due(Instant::now(), true) {
+                    ctx.sweep_zombie_transports(
+                        &handshake_cmd_sender,
+                        &mut zombie_sweep_state,
+                        true,
+                    )
+                    .await;
                 }
-                for addr in &zombie_addrs {
-                    ctx.drop_zombie_connection(*addr, &handshake_cmd_sender)
-                        .await;
-                }
+                zombie_sweep_state.report(Instant::now());
 
                 // Periodic cleanup of pending_op_results: remove entries where the
                 // receiver has been dropped (closed sender). This is a safety net for
@@ -1792,6 +1639,9 @@ impl P2pConnManager {
                     }
                     state.last_pending_op_cleanup = Instant::now();
                 }
+            } else if zombie_sweep_state.slice_due(Instant::now(), false) {
+                ctx.sweep_zombie_transports(&handshake_cmd_sender, &mut zombie_sweep_state, false)
+                    .await;
             }
 
             match event {
@@ -3036,30 +2886,6 @@ impl P2pConnManager {
                                 )
                                 .await;
                             }
-                            NodeEvent::V2DelegateStateChanged { key } => {
-                                // Extracted so it is reachable from a test —
-                                // see `v2_drain`, and the mutation results that
-                                // motivated it. Inline in this `select!` arm,
-                                // deleting the fan-out left the whole suite
-                                // green.
-                                //
-                                // Linear backoff with +/-20% jitter so a burst
-                                // of contracts failing together does not retry
-                                // in lockstep against the one serial loop that
-                                // was already too busy to answer
-                                // (`code-style.md`). Drawn here, not inside, so
-                                // the retry arithmetic is deterministic under
-                                // test.
-                                let jitter_pct: u64 =
-                                    crate::config::GlobalRng::random_range(80u64..=120u64);
-                                v2_drain::handle_v2_delegate_state_changed(
-                                    &mut ctx,
-                                    &op_manager,
-                                    key,
-                                    jitter_pct,
-                                )
-                                .await;
-                            }
                             NodeEvent::SyncStateToPeer {
                                 key,
                                 new_state,
@@ -3513,6 +3339,7 @@ async fn peer_connection_listener(
     conn_events: Sender<ConnEvent>,
     connection_id: u64,
     outbound_mix: std::sync::Arc<crate::node::network_bridge::outbound_message_mix::OutboundMix>,
+    link_use: zombie_sweep::LinkUseStamp,
 ) {
     let remote_addr = conn.remote_addr();
     tracing::debug!(
@@ -3653,6 +3480,10 @@ async fn peer_connection_listener(
                                 msg_type = %net_message,
                                 "[CONN_LIFECYCLE] Received inbound NetMessage from peer"
                             );
+                            // Stamp a request BEFORE queueing it: the event loop
+                            // may not dequeue it for a while, and the zombie sweep
+                            // must already see this transport as in use (#5654).
+                            zombie_sweep::record_link_use_request(&link_use, &net_message, Instant::now());
                             if conn_events
                                 .send(ConnEvent::InboundMessage(IncomingMessage::with_remote(
                                     net_message,
@@ -4544,6 +4375,7 @@ pub(crate) mod tests {
                 pub_key: None,
                 connection_id: 10,
                 created_at: Instant::now(),
+                link_use: super::zombie_sweep::LinkUseStamp::new(Instant::now()),
                 remote_version: None,
             },
         );
@@ -4555,6 +4387,7 @@ pub(crate) mod tests {
                 pub_key: None,
                 connection_id: 20,
                 created_at: Instant::now(),
+                link_use: super::zombie_sweep::LinkUseStamp::new(Instant::now()),
                 remote_version: None,
             },
         );
@@ -4575,12 +4408,20 @@ pub(crate) mod tests {
     const TEST_TRANSIENT_TTL: Duration = Duration::from_secs(30);
     // With TTL=30s: zombie_threshold=90s, absolute_zombie_threshold=180s
 
+    /// A transport whose remote has sent no request since it was established.
+    /// Every test below uses this, so each keeps its pre-#5654 meaning: for such
+    /// a transport the idle-time thresholds are exactly the old age thresholds.
+    /// The #5654 behaviour is tested in `zombie_sweep::tests`.
+    fn never_used(age: Duration) -> super::TransportActivity {
+        super::TransportActivity::never_used(age)
+    }
+
     #[test]
     fn test_zombie_detection_ignores_young_connections() {
         // Connection younger than zombie threshold (90s) should never be a zombie
         let elapsed = Duration::from_secs(60);
         assert!(
-            !super::is_zombie(elapsed, false, false, false, TEST_TRANSIENT_TTL),
+            !super::is_zombie(never_used(elapsed), false, false, false, TEST_TRANSIENT_TTL),
             "Young connection should not be zombie"
         );
     }
@@ -4590,7 +4431,7 @@ pub(crate) mod tests {
         // In-ring connection should never be a zombie regardless of age
         let elapsed = Duration::from_secs(400);
         assert!(
-            !super::is_zombie(elapsed, true, false, false, TEST_TRANSIENT_TTL),
+            !super::is_zombie(never_used(elapsed), true, false, false, TEST_TRANSIENT_TTL),
             "Ring connection should not be zombie"
         );
     }
@@ -4600,7 +4441,7 @@ pub(crate) mod tests {
         // Old connection that isn't in ring, no pending → zombie
         let elapsed = Duration::from_secs(91); // > 90s
         assert!(
-            super::is_zombie(elapsed, false, false, false, TEST_TRANSIENT_TTL),
+            super::is_zombie(never_used(elapsed), false, false, false, TEST_TRANSIENT_TTL),
             "Old unpromoted connection should be zombie"
         );
     }
@@ -4610,7 +4451,7 @@ pub(crate) mod tests {
         // Old connection not in ring, but has pending reservation → not zombie (under absolute)
         let elapsed = Duration::from_secs(120); // > 90s but < 180s
         assert!(
-            !super::is_zombie(elapsed, false, true, false, TEST_TRANSIENT_TTL),
+            !super::is_zombie(never_used(elapsed), false, true, false, TEST_TRANSIENT_TTL),
             "Connection with pending reservation below absolute threshold should not be zombie"
         );
     }
@@ -4621,7 +4462,7 @@ pub(crate) mod tests {
         // The absolute threshold (180s) overrides has_pending
         let elapsed = Duration::from_secs(181);
         assert!(
-            super::is_zombie(elapsed, false, true, false, TEST_TRANSIENT_TTL),
+            super::is_zombie(never_used(elapsed), false, true, false, TEST_TRANSIENT_TTL),
             "Absolute threshold should override has_pending"
         );
     }
@@ -4631,7 +4472,7 @@ pub(crate) mod tests {
         // Connection 181s old, in_ring=true → NOT zombie
         let elapsed = Duration::from_secs(181);
         assert!(
-            !super::is_zombie(elapsed, true, true, false, TEST_TRANSIENT_TTL),
+            !super::is_zombie(never_used(elapsed), true, true, false, TEST_TRANSIENT_TTL),
             "Ring connection should never be zombie even past absolute threshold"
         );
     }
@@ -4640,7 +4481,7 @@ pub(crate) mod tests {
     fn test_zombie_boundary_exactly_at_threshold() {
         // Exactly 90s, no pending, not in ring → NOT zombie (uses > not >=)
         assert!(!super::is_zombie(
-            Duration::from_secs(90),
+            never_used(Duration::from_secs(90)),
             false,
             false,
             false,
@@ -4652,7 +4493,7 @@ pub(crate) mod tests {
     fn test_zombie_boundary_exactly_at_absolute() {
         // Exactly 180s, has_pending, not in ring → NOT zombie (uses > not >=)
         assert!(!super::is_zombie(
-            Duration::from_secs(180),
+            never_used(Duration::from_secs(180)),
             false,
             true,
             false,
@@ -4666,14 +4507,14 @@ pub(crate) mod tests {
         // classified as zombies within the 1-hour gateway exemption (#3595).
         let elapsed = Duration::from_secs(400); // Well past normal absolute threshold (180s)
         assert!(
-            !super::is_zombie(elapsed, false, false, true, TEST_TRANSIENT_TTL),
+            !super::is_zombie(never_used(elapsed), false, false, true, TEST_TRANSIENT_TTL),
             "Gateway connection should not be zombie within exemption window"
         );
 
         // But truly stale gateway connections (>1 hour) ARE cleaned up.
         let stale = Duration::from_secs(3601);
         assert!(
-            super::is_zombie(stale, false, false, true, TEST_TRANSIENT_TTL),
+            super::is_zombie(never_used(stale), false, false, true, TEST_TRANSIENT_TTL),
             "Gateway connection past 1-hour cap should be zombie"
         );
     }
@@ -4685,7 +4526,7 @@ pub(crate) mod tests {
         let large_ttl = Duration::from_secs(120);
         // 200s: not zombie even without pending (< 360s)
         assert!(!super::is_zombie(
-            Duration::from_secs(200),
+            never_used(Duration::from_secs(200)),
             false,
             false,
             false,
@@ -4693,7 +4534,7 @@ pub(crate) mod tests {
         ));
         // 400s: zombie without pending (> 360s)
         assert!(super::is_zombie(
-            Duration::from_secs(400),
+            never_used(Duration::from_secs(400)),
             false,
             false,
             false,
@@ -4701,7 +4542,7 @@ pub(crate) mod tests {
         ));
         // 400s with pending: not zombie (< 720s)
         assert!(!super::is_zombie(
-            Duration::from_secs(400),
+            never_used(Duration::from_secs(400)),
             false,
             true,
             false,
@@ -4709,7 +4550,7 @@ pub(crate) mod tests {
         ));
         // 721s: zombie even with pending (> 720s)
         assert!(super::is_zombie(
-            Duration::from_secs(721),
+            never_used(Duration::from_secs(721)),
             false,
             true,
             false,
@@ -5429,65 +5270,6 @@ pub(crate) mod tests {
              over-suppression. Every queue test passes an empty fanout, so no \
              behavioural test distinguishes the two."
         );
-    }
-
-    /// The V2 drain retry POLICY, which the source-order pins cannot reach.
-    ///
-    /// The pins assert the shape of the dispatch arm; they cannot tell you that
-    /// retries stop at the cap or that the jitter stays inside its documented
-    /// band. Both matter here for a specific reason: the drops are CORRELATED —
-    /// the read fails because it is queued behind a delegate notification
-    /// batch, so one busy batch drops many contracts at once. Un-jittered
-    /// backoff would then re-queue all of them in lockstep against the same
-    /// serial loop that was already too busy, making the retry amplify the
-    /// congestion it exists to recover from.
-    #[test]
-    fn v2_drain_retry_policy_is_bounded_and_jittered() {
-        use super::P2pConnManager;
-
-        // Stops exactly at the cap, and the cap is what gives up.
-        for attempts in 0..P2pConnManager::MAX_V2_DRAIN_RETRIES {
-            assert!(
-                P2pConnManager::plan_v2_drain_retry(attempts, 100).is_some(),
-                "attempt {attempts} is below MAX_V2_DRAIN_RETRIES and must still retry"
-            );
-        }
-        assert!(
-            P2pConnManager::plan_v2_drain_retry(P2pConnManager::MAX_V2_DRAIN_RETRIES, 100)
-                .is_none(),
-            "at MAX_V2_DRAIN_RETRIES the drain must give up rather than retry forever — an \
-             unbounded retry here is a loop against the contract handler that is already \
-             saturated"
-        );
-        assert!(
-            P2pConnManager::plan_v2_drain_retry(u8::MAX, 100).is_none(),
-            "any count past the cap must also give up"
-        );
-
-        // Linear growth at the neutral factor.
-        let base = P2pConnManager::V2_DRAIN_RETRY_BASE_DELAY;
-        assert_eq!(P2pConnManager::plan_v2_drain_retry(0, 100), Some(base));
-        assert_eq!(P2pConnManager::plan_v2_drain_retry(1, 100), Some(base * 2));
-        assert_eq!(P2pConnManager::plan_v2_drain_retry(2, 100), Some(base * 3));
-
-        // Jitter band: +/-20% of the linear delay at each attempt, and the
-        // extremes must actually MOVE the delay — a jitter that silently
-        // collapsed to 1.0 would pass a bounds-only check.
-        for attempts in 0..P2pConnManager::MAX_V2_DRAIN_RETRIES {
-            let linear = base * u32::from(attempts + 1);
-            let low = P2pConnManager::plan_v2_drain_retry(attempts, 80).unwrap();
-            let high = P2pConnManager::plan_v2_drain_retry(attempts, 120).unwrap();
-            assert!(
-                low < linear && high > linear,
-                "jitter must actually spread attempt {attempts}: got low={low:?}, \
-                 linear={linear:?}, high={high:?}. If low == high == linear the jitter \
-                 factor is being ignored and correlated drops will retry in lockstep"
-            );
-            assert!(
-                low >= linear.mul_f64(0.8) && high <= linear.mul_f64(1.2),
-                "jitter must stay within the documented +/-20% band at attempt {attempts}"
-            );
-        }
     }
 
     /// Phase 7 egress self-block pin (#4300). `handle_broadcast_state_change`

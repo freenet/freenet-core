@@ -8,7 +8,7 @@
 //! exactly that.
 //!
 //! This module is the *single* implementation of what "conformance" means. The
-//! offline `fdev verify-merge` harness and (later) the node-side checker both call
+//! offline `fdev verify-merge` harness and the node's opt-in shadow-mode checker both call
 //! [`verify_case`], so the developer-facing answer and the network-facing answer
 //! cannot disagree.
 //!
@@ -35,6 +35,8 @@
 //! - [`capture`] — operator-enabled recording of real contract traffic for replay.
 //! - [`sampler`] — the bounded, restart-safe store of states a peer observed.
 //! - [`focus`] — which contracts a peer watches, and when it moves on.
+//! - [`shadow`] — the opt-in loop that replays sampled states on a peer and records
+//!   what it would remove, without acting on it.
 //! - [`policy`] — what a peer is permitted to do about a finding. Deletion is the
 //!   last step of the RFC's deployment plan, and this is where that ordering is
 //!   enforced and tested rather than merely intended.
@@ -54,8 +56,11 @@
 //! are where the measured production damage actually came from (#5153), and a
 //! re-apply probe cannot see any of them.
 //!
-//! This module does not replace or disable that probe. Nothing here is wired into
-//! the node yet.
+//! This module does not replace or disable that probe. The node can run this verifier
+//! in an opt-in shadow mode: set `FREENET_CONFORMANCE_CAPTURE_DIR` (see [`capture`] and
+//! [`shadow`]) and it samples observed states and records what it *would* remove.
+//! Nothing is ever removed: [`EnforcementMode::Enforce`] is not reachable from
+//! configuration, and with the variable unset none of this runs.
 //!
 //! # The bias toward `Inconclusive`
 //!

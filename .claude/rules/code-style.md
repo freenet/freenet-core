@@ -28,22 +28,11 @@ paths:
 
 ### WHEN handling errors
 
-```
-Is this production code?
-  → YES: Use explicit match/if-let, never .unwrap()
-  → Use thiserror for custom error types
-
-Is this test code?
-  → .unwrap() and .expect("reason") are acceptable
-```
-
-**Production pattern:**
-```rust
-match operation() {
-    Ok(result) => process(result),
-    Err(e) => return Err(e.into()),
-}
-```
+- **Production code: avoid `.unwrap()`.** Use explicit `match`/`if let` and propagate.
+  Where a call is infallible by construction, say why in a comment - the codebase has
+  such cases, and an unexplained `.unwrap()` is indistinguishable from an oversight.
+- **Test code: `.unwrap()` and `.expect("reason")` are fine.**
+- Use `thiserror` for custom error types.
 
 ### WHEN writing async code
 
@@ -144,11 +133,22 @@ actors (clients, network peers) can influence.
      for coverage + hard byte budget + per-entry overhead floor); do not
      hand-roll byte accounting a third time (#4804 wrote it, #4805 shared it)
    → Name any new cache byte budget in
-     contract::executor::declared_cache_ceiling. The hosting budget
-     (ring::hosting::cache::resident_overhead_budget_for) is a RESIDUAL of
-     that sum, so an unnamed budget silently over-grants hosted contracts
-     against memory already committed. Pinned by
-     declared_cache_ceiling_names_every_budget.
+     contract::executor::declared_cache_ceiling (test-only since #5647).
+     Each memory consumer has its own byte budget; the test
+     ring::hosting::cache::tests::declared_caches_plus_hosting_budget_leave_room_for_the_runtime
+     checks that the declared caches plus the hosting budget stay within 75%
+     of the memory limit at the shipped shapes, so an unnamed budget is
+     memory that check never sees. Naming is pinned by TWO tests that catch
+     OPPOSITE things, and citing only the first is how a reader ends up
+     trusting the weaker one: declared_cache_ceiling_names_every_budget
+     validates a hardcoded list, so it catches a summed budget being
+     REMOVED and cannot catch one being ADDED, which is the case that
+     matters for a new budget. declared_cache_ceiling_discovers_every_budget
+     walks the crate for budget-shaped declarations and requires each to be
+     summed or listed in NOT_SUMMED with a written reason. Both read the
+     LABELS of declared_cache_ceiling_terms rather than scraping source
+     text, because a name occurring in the function body does not mean its
+     value entered the total.
 
 WHY: Unbounded collections are amplification vectors.
 An attacker who can register N subscribers or open N channels can
@@ -319,19 +319,10 @@ CORRECT:
 
 ### WHEN you need time/rng/sockets in `crates/core/`
 
-```
-Need current time?
-  → DO NOT use: std::time::Instant::now(), tokio::time::sleep()
-  → USE: TimeSource trait (crates/core/src/simulation/)
-
-Need randomness?
-  → DO NOT use: rand::random(), rand::thread_rng()
-  → USE: GlobalRng (crates/core/src/config.rs)
-
-Need network socket in tests?
-  → DO NOT use: tokio::net::UdpSocket
-  → USE: Socket trait (crates/core/src/transport/)
-```
+DST requirements (TimeSource, GlobalRng, Socket trait) are canonical in
+`.claude/rules/testing.md` — see "When writing new code in `crates/core/`".
+Two narrow, deliberate exceptions to the TimeSource/GlobalRng rule exist and
+are documented here because they don't live anywhere else:
 
 #### Exception: real wall-clock comparison against `boot_time::Instant`
 

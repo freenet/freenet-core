@@ -201,6 +201,11 @@ pub(crate) struct OpManager {
     /// because that event carries no provenance — see
     /// [`crate::ring::broadcast_coverage::BroadcastCoverageStore`].
     pub broadcast_coverage: Arc<crate::ring::broadcast_coverage::BroadcastCoverageStore>,
+    /// When each `(contract, peer)` pair last finished a broadcast, so the
+    /// fan-out never sends two of one contract to one peer closer together
+    /// than the receiver's rate limit allows (#5842). See
+    /// [`crate::node::network_bridge::broadcast_spacing`].
+    pub broadcast_spacing: Arc<crate::node::network_bridge::broadcast_spacing::BroadcastSpacing>,
     /// Bounded per-contract UPDATE-propagation counters. Fed from the
     /// broadcast fan-out path and drained by a periodic background task that
     /// emits an INFO `update_propagation_summary` line per window. Restores
@@ -216,24 +221,6 @@ pub(crate) struct OpManager {
     /// network instead of landing locally-hosted only (issue #4359).
     pub(crate) pending_broadcasts:
         Arc<crate::operations::update::pending_broadcast::PendingBroadcastStore>,
-    /// Contracts with a V2 delegate state-change broadcast already queued and
-    /// not yet drained.
-    ///
-    /// The queued event names the contract and carries no state; the handler
-    /// re-reads the current stored state when it drains. So the queue holds a
-    /// contract id per pending broadcast rather than a `WrappedState`, and its
-    /// cost does not scale with state size. This set is what makes the queued
-    /// broadcasts coalesce: while one is outstanding for a contract, further
-    /// writes to that contract add nothing to the queue, and the single drain
-    /// broadcasts whatever is stored by the time it runs.
-    ///
-    /// Membership is cleared by the handler BEFORE it re-reads, so a write
-    /// landing during the read queues a fresh event rather than being folded
-    /// into one already in flight.
-    pub(crate) v2_delegate_broadcast_pending: Arc<dashmap::DashSet<ContractInstanceId>>,
-    /// Serialises the marker insert / enqueue / rollback triple in
-    /// [`OpManager::queue_v2_delegate_broadcast`]. See that function.
-    v2_delegate_broadcast_queue_lock: Arc<Mutex<()>>,
     /// Request router for client request deduplication.
     ///
     /// This is initialized lazily from `client_event_handling` because the router is only
@@ -247,6 +234,17 @@ pub(crate) struct OpManager {
     ///
     /// Wrapped in Arc for sharing with `garbage_cleanup_task`.
     request_router: Arc<OnceLock<Arc<RequestRouter>>>,
+    /// This node's delegate capability state, set once by the executor pool
+    /// when it is built, so the HTTP server can answer "Apps and permissions"
+    /// requests. `None` until then (and on executors without capabilities).
+    ///
+    /// WEAK: the pool owns it. `DelegateCapabilities` holds a redb handle, and
+    /// the `OpManager` outlives the node's run loop, so a strong reference
+    /// here would keep the database file locked after shutdown and break an
+    /// in-process restart (`test_in_process_restart_releases_redb_lock`).
+    delegate_capabilities: Arc<
+        OnceLock<std::sync::Weak<crate::contract::delegate_capabilities::DelegateCapabilities>>,
+    >,
     /// Registry for handling race conditions between stream fragments and metadata messages.
     /// Coordinates transport layer (which receives fragments) with operations layer
     /// (which receives RequestStreaming/ResponseStreaming messages).
@@ -261,6 +259,12 @@ pub(crate) struct OpManager {
     /// stream-inactivity timeout instead of a fixed per-attempt deadline. See
     /// `operations::stream_progress`.
     stream_progress_registry: Arc<StreamProgressRegistry>,
+    /// Per-attempt record of the peer an originator's GET/PUT attempt was
+    /// actually forwarded to (#5657). Same two-task shape as
+    /// `stream_progress_registry`: the retry loop registers a slot keyed by the
+    /// attempt `Transaction` (removed by an RAII guard), the originator-loopback
+    /// relay fills it. See `operations::route_attempt`.
+    attempt_hop_registry: Arc<crate::operations::route_attempt::AttemptHopRegistry>,
     /// Size threshold in bytes above which streaming is used.
     pub streaming_threshold: usize,
     /// Backoff tracker for failed gateway connection attempts.
@@ -282,6 +286,23 @@ pub(crate) struct OpManager {
     /// Maps contract instance ID to the timestamp (ms since epoch via GlobalSimulationTime)
     /// when the fetch was initiated, with a cooldown to avoid repeated fetch attempts.
     pub(crate) pending_contract_fetches: Arc<DashMap<ContractInstanceId, u64>>,
+    /// Identity of this `OpManager` instance, unique for the life of the
+    /// process (#5542 finding C).
+    ///
+    /// Used as the node component of a key in the process-global
+    /// `wasm_runtime::delegate_interest` hold map, which has to distinguish two
+    /// nodes running in ONE process — the in-process multi-node test harness.
+    ///
+    /// A MONOTONIC COUNTER, not `Arc::as_ptr`. The pointer was the obvious
+    /// choice and is wrong: `OpManager` has no `Drop`, and glibc's tcache
+    /// reuses freed allocations LIFO, so a second `OpManager` can land on a
+    /// dropped one's address and silently inherit its identity — at which point
+    /// its `record` is discarded as a duplicate and its refcount leaks. That is
+    /// reachable only under `cargo test`, because the binary uses jemalloc and
+    /// the test harness does not; `cargo test` is the runner `AGENTS.md` tells
+    /// contributors to use, and the one where cross-test interference is
+    /// observable at all (#5314).
+    pub(crate) node_identity: crate::wasm_runtime::delegate_interest::NodeIdentity,
     /// Transactions with an active driver relay-GET driver at this
     /// node. Populated by `start_relay_get` before spawn and removed by
     /// an RAII guard on the driver task. Consulted by the dispatch gate
@@ -322,8 +343,13 @@ pub(crate) struct OpManager {
     /// shutdown drain in `ShutdownHandle::shutdown` to wait for
     /// client-initiated work (most importantly PUTs from the
     /// `freenet-git` mirror) to finish before tearing down peer
-    /// connections. The drain is bounded by `config.shutdown_drain_secs`.
+    /// connections. The drain is bounded by `config.shutdown_drain_secs`
+    /// and by each op's drain deadline (`inflight_client_op_deadlines`).
     pub(crate) inflight_client_ops: Arc<AtomicUsize>,
+    /// Drain deadlines of the same drivers (admission + `OPERATION_TTL`,
+    /// pushed out by streaming progress), so the drain can stop waiting
+    /// for ones past theirs (#5838). See [`ClientOpDeadlines`].
+    pub(crate) inflight_client_op_deadlines: Arc<ClientOpDeadlines>,
     /// Set to `true` by `ShutdownHandle::shutdown` *before* the drain
     /// begins, so `start_client_{put,get,update,subscribe}` can fail
     /// fast with `OpError::NodeShuttingDown` instead of bumping the
@@ -360,25 +386,30 @@ impl Clone for OpManager {
             interest_manager: self.interest_manager.clone(),
             broadcast_dedup_cache: self.broadcast_dedup_cache.clone(),
             broadcast_coverage: self.broadcast_coverage.clone(),
+            broadcast_spacing: self.broadcast_spacing.clone(),
             update_propagation_stats: self.update_propagation_stats.clone(),
             pending_broadcasts: self.pending_broadcasts.clone(),
-            v2_delegate_broadcast_pending: self.v2_delegate_broadcast_pending.clone(),
-            v2_delegate_broadcast_queue_lock: self.v2_delegate_broadcast_queue_lock.clone(),
             request_router: self.request_router.clone(),
+            delegate_capabilities: self.delegate_capabilities.clone(),
             orphan_stream_registry: self.orphan_stream_registry.clone(),
             stream_progress_registry: self.stream_progress_registry.clone(),
+            attempt_hop_registry: self.attempt_hop_registry.clone(),
             streaming_threshold: self.streaming_threshold,
             gateway_backoff: self.gateway_backoff.clone(),
             gateway_backoff_cleared: self.gateway_backoff_cleared.clone(),
             blocked_addresses: self.blocked_addresses.clone(),
             configured_gateways: self.configured_gateways.clone(),
             pending_contract_fetches: self.pending_contract_fetches.clone(),
+            // The SAME node, so the same identity. A fresh id here would make
+            // one node look like two to the delegate-interest hold map.
+            node_identity: self.node_identity,
             active_relay_get_txs: self.active_relay_get_txs.clone(),
             active_relay_update_txs: self.active_relay_update_txs.clone(),
             active_relay_put_txs: self.active_relay_put_txs.clone(),
             active_relay_subscribe_txs: self.active_relay_subscribe_txs.clone(),
             active_relay_connect_txs: self.active_relay_connect_txs.clone(),
             inflight_client_ops: self.inflight_client_ops.clone(),
+            inflight_client_op_deadlines: self.inflight_client_op_deadlines.clone(),
             shutting_down: self.shutting_down.clone(),
         }
     }
@@ -393,14 +424,104 @@ impl Clone for OpManager {
 /// a branch can't leak count.
 ///
 /// The shutdown drain in `ShutdownHandle::shutdown` reads the counter
-/// via [`OpManager::inflight_client_op_count`] and waits for it to
-/// reach zero before letting the node tear down.
+/// and waits for it to reach zero before letting the node tear down,
+/// or until every op still counted is past its drain deadline in
+/// [`ClientOpDeadlines`] (#5838).
 pub(crate) struct ClientOpGuard {
     counter: Arc<AtomicUsize>,
+    deadlines: Arc<ClientOpDeadlines>,
+    id: u64,
+}
+
+/// How long the shutdown drain may still wait for each in-flight
+/// client-originated driver, keyed by a monotonically increasing id.
+///
+/// Each op gets a drain deadline of admission time plus
+/// [`DEFAULT_CLIENT_OP_DRAIN_WINDOW`] (`OPERATION_TTL`). Past it, the op
+/// is retrying, or still waiting on a peer that never answered, and the
+/// drain stops waiting for it. A driver in a phase that can legitimately
+/// take longer (a streaming PUT transfer, a GET stream assembly) pushes
+/// its deadline out with [`note_client_op_progress`] each time that
+/// phase makes progress. A summary-first PUT probe that never got a
+/// reply makes none: that is what held the #5838 stop (see #5839).
+///
+/// Issue #5838: a SIGTERM caught 14 River PUTs that were 68-119 s old,
+/// waiting on summary-first probes; the drain waited its full 30 s for
+/// them and 8 were still running when it gave up.
+///
+/// Locked when an op starts and ends, about once a second per streaming
+/// op while it streams, and once per 200 ms drain poll.
+#[derive(Default)]
+pub(crate) struct ClientOpDeadlines {
+    inner: Mutex<ClientOpDeadlinesInner>,
+}
+
+#[derive(Default)]
+struct ClientOpDeadlinesInner {
+    next_id: u64,
+    /// id -> drain deadline
+    ops: std::collections::HashMap<u64, tokio::time::Instant>,
+}
+
+/// Drain window for a client op whose driver does not set one:
+/// `OPERATION_TTL`, the attempt deadline of every non-streaming
+/// operation. The ops the drain exists for (a `freenet-git` mirror
+/// push caught by a release restart) are seconds old when the signal
+/// arrives.
+pub(crate) const DEFAULT_CLIENT_OP_DRAIN_WINDOW: std::time::Duration = crate::config::OPERATION_TTL;
+
+impl ClientOpDeadlines {
+    pub(crate) fn register(&self, window: std::time::Duration) -> u64 {
+        let deadline = tokio::time::Instant::now() + window;
+        let mut inner = self.inner.lock();
+        let id = inner.next_id;
+        inner.next_id += 1;
+        inner.ops.insert(id, deadline);
+        id
+    }
+
+    /// Push op `id`'s drain deadline out to at least `window` from now.
+    /// Never pulls it in. Returns whether the op was found (production
+    /// ignores it: an op that has already finished needs nothing).
+    pub(crate) fn extend_from_now(&self, id: u64, window: std::time::Duration) -> bool {
+        let until = tokio::time::Instant::now() + window;
+        let mut inner = self.inner.lock();
+        let Some(deadline) = inner.ops.get_mut(&id) else {
+            return false;
+        };
+        if *deadline < until {
+            *deadline = until;
+        }
+        true
+    }
+
+    /// Set op `id`'s drain deadline to exactly `window` from now, for
+    /// the end of a phase whose longer window should not carry over.
+    /// `now + window` is never earlier than the admission deadline as
+    /// long as `window >= DEFAULT_CLIENT_OP_DRAIN_WINDOW`.
+    pub(crate) fn set_from_now(&self, id: u64, window: std::time::Duration) {
+        if let Some(deadline) = self.inner.lock().ops.get_mut(&id) {
+            *deadline = tokio::time::Instant::now() + window;
+        }
+    }
+
+    pub(crate) fn unregister(&self, id: u64) {
+        self.inner.lock().ops.remove(&id);
+    }
+
+    /// The latest drain deadline among in-flight ops, if any.
+    pub(crate) fn latest_deadline(&self) -> Option<tokio::time::Instant> {
+        self.inner.lock().ops.values().copied().max()
+    }
 }
 
 impl ClientOpGuard {
-    fn new(counter: Arc<AtomicUsize>) -> Self {
+    pub(super) fn new(counter: Arc<AtomicUsize>, deadlines: Arc<ClientOpDeadlines>) -> Self {
+        // Register BEFORE the counter bump: a drain that sees this op
+        // through the SeqCst counter load must also find its deadline,
+        // or it would treat the op as not worth waiting for. Pinned by
+        // `client_op_deadline_registered_while_counted`.
+        let id = deadlines.register(DEFAULT_CLIENT_OP_DRAIN_WINDOW);
         // SeqCst, not Relaxed — the increment participates in a
         // two-atomic Dekker-style handshake with `shutting_down`
         // (see `OpManager::admit_client_op`). Under a relaxed model
@@ -409,8 +530,109 @@ impl ClientOpGuard {
         // Codex + skeptical r3 finding. The cost is negligible
         // (once per client request, not in a hot loop).
         counter.fetch_add(1, Ordering::SeqCst);
-        Self { counter }
+        Self {
+            counter,
+            deadlines,
+            id,
+        }
     }
+
+    /// Handle that lets this op's driver extend its own drain deadline
+    /// through [`note_client_op_progress`]. Install it with
+    /// [`with_client_op_drain`] around the driver future.
+    pub(crate) fn drain_handle(&self) -> ClientOpDrainHandle {
+        ClientOpDrainHandle {
+            deadlines: self.deadlines.clone(),
+            id: self.id,
+            last_noted: std::cell::Cell::new(None),
+        }
+    }
+}
+
+/// The in-flight client op whose driver is running on the current task,
+/// for [`note_client_op_progress`].
+#[derive(Clone)]
+pub(crate) struct ClientOpDrainHandle {
+    deadlines: Arc<ClientOpDeadlines>,
+    id: u64,
+    /// The deadline this task last set, so a stream's per-fragment
+    /// wakeups take the shared lock only when they move it by a second.
+    last_noted: std::cell::Cell<Option<tokio::time::Instant>>,
+}
+
+tokio::task_local! {
+    static CLIENT_OP_DRAIN: ClientOpDrainHandle;
+}
+
+/// Run a client-op driver with its drain handle installed, so phases
+/// deep in the driver can call [`note_client_op_progress`] without the
+/// handle being threaded through every signature.
+pub(crate) async fn with_client_op_drain<F: std::future::Future>(
+    handle: ClientOpDrainHandle,
+    driver: F,
+) -> F::Output {
+    CLIENT_OP_DRAIN.scope(handle, driver).await
+}
+
+/// Drain window for the tail of a client op after a streaming phase ends
+/// (finalize, deliver the result, a blocking subscribe): the same
+/// `OPERATION_TTL` a freshly admitted op gets (#5838).
+pub(crate) const CLIENT_OP_TAIL_DRAIN_WINDOW: std::time::Duration = crate::config::OPERATION_TTL;
+
+/// Minimum extra reach before a task takes the shared lock again, so a
+/// fast stream's per-fragment wakeups do not each take it.
+const CLIENT_OP_PROGRESS_NOTE_SPACING: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Called by a client-op driver when a long-running phase starts or makes
+/// progress: a streaming PUT attempt, a GET stream claim or assembly, or
+/// the reply or completion that ends one. These can legitimately outlast
+/// [`DEFAULT_CLIENT_OP_DRAIN_WINDOW`] (#5838). `window` is that phase's
+/// own liveness rule: the timeout after which the phase itself would
+/// declare the stream dead (a phase end uses
+/// [`note_client_op_phase_end`] instead). The shutdown drain then keeps
+/// waiting for the op for at least `window` from now, so it never gives
+/// up on a phase sooner than the phase itself would, and stops waiting
+/// once the phase has gone quiet for that long.
+///
+/// A call that would move the deadline less than
+/// [`CLIENT_OP_PROGRESS_NOTE_SPACING`] past the last one this task made
+/// is skipped; to cover that, every note reaches one spacing past
+/// `window`, so the deadline is always at least `now + window`.
+///
+/// A no-op outside a `with_client_op_drain` scope: relay drivers share
+/// the streaming code, and sub-op GETs (including the contract fetches a
+/// client UPDATE or SUBSCRIBE may wait on) run on their own spawned tasks.
+pub(crate) fn note_client_op_progress(window: std::time::Duration) {
+    let _outside_a_client_op = CLIENT_OP_DRAIN.try_with(|h| {
+        // Every note reaches one spacing further than asked, so a call the
+        // throttle skips (it would have moved the deadline by less than
+        // the spacing) never leaves the deadline short of `now + window`.
+        let reach = window + CLIENT_OP_PROGRESS_NOTE_SPACING;
+        let until = tokio::time::Instant::now() + reach;
+        if h.last_noted
+            .get()
+            .is_some_and(|last| until < last + CLIENT_OP_PROGRESS_NOTE_SPACING)
+        {
+            return;
+        }
+        h.last_noted.set(Some(until));
+        h.deadlines.extend_from_now(h.id, reach);
+    });
+}
+
+/// Called when a streaming phase ends (a PUT attempt's reply, ceiling or
+/// stall, a GET assembly's completion): sets the op's drain deadline to
+/// [`CLIENT_OP_TAIL_DRAIN_WINDOW`] from now, replacing the phase's longer
+/// window, so the tail (finalize, deliver, a blocking subscribe, or the
+/// retry a rejection leads to) gets exactly the window a fresh op gets
+/// (#5838). Never throttled. A no-op outside a client-op scope.
+pub(crate) fn note_client_op_phase_end() {
+    let _outside_a_client_op = CLIENT_OP_DRAIN.try_with(|h| {
+        h.last_noted.set(Some(
+            tokio::time::Instant::now() + CLIENT_OP_TAIL_DRAIN_WINDOW,
+        ));
+        h.deadlines.set_from_now(h.id, CLIENT_OP_TAIL_DRAIN_WINDOW);
+    });
 }
 
 impl Drop for ClientOpGuard {
@@ -421,132 +643,11 @@ impl Drop for ClientOpGuard {
         // late observation is an extra 200ms poll interval before
         // the drain notices counter==0.
         self.counter.fetch_sub(1, Ordering::Relaxed);
-    }
-}
-
-/// Outcome of [`OpManager::queue_v2_delegate_broadcast`].
-///
-/// Three outcomes, not two, because a `bool` conflated the one case where
-/// NOTHING WENT WRONG with the one case where a write goes unannounced — and
-/// the caller then counted both as drops. Coalescing is the common, healthy
-/// path on any node whose delegate writes the same contract twice in quick
-/// succession, so counting it poisoned the very signal that exists to make a
-/// real drop visible: the drop WARN fires at powers of two, so inflating the
-/// counter with non-events pushes the next milestone exponentially further out
-/// and a genuine drop then logs nothing at all (#4981's shape, arrived at from
-/// the opposite direction).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum V2BroadcastQueued {
-    /// An event was enqueued; a drain will run for this contract.
-    Queued,
-    /// A drain was already outstanding for this contract and had not yet run.
-    /// **Nothing was lost:** the drain re-reads stored state rather than
-    /// carrying a snapshot, so it announces this write too.
-    Coalesced,
-    /// The notification channel would have blocked, and the marker was
-    /// released. This write goes unannounced. Already counted and WARNed by
-    /// `note_v2_broadcast_enqueue_dropped` inside the call, so a caller must
-    /// NOT count it a second time.
-    EnqueueFailed,
-}
-
-/// Outcome of a bounded state read on the V2 broadcast drain path.
-///
-/// Three-way on purpose: collapsing `NotHeld` and `Unavailable` into one
-/// `None` is what let a transient read failure silently discard a write that
-/// had already committed and already returned success to the delegate — the
-/// #5479 shape, reintroduced inside its own fix. See
-/// [`OpManager::read_state_for_broadcast_drain`].
-#[derive(Debug)]
-pub(crate) enum DrainStateRead {
-    /// State read successfully; broadcast it.
-    Found(WrappedState),
-    /// We genuinely do not hold this contract. Not broadcasting is correct
-    /// and final — there is nothing to send.
-    NotHeld,
-    /// The read failed or timed out. We may or may not hold the contract; the
-    /// write it would have announced has already committed. NOT the same as
-    /// `NotHeld`, and must not be silent.
-    Unavailable,
-}
-
-/// Count of V2 delegate broadcasts dropped because the notification channel
-/// would have blocked.
-///
-/// A counter as well as a log line, for the reason `.claude/rules/code-style.md`
-/// gives: a refusal that is not counted renders as a clean zero. The paired
-/// message is WARN because `crates/core/Cargo.toml` enables tracing's
-/// `release_max_level_info` — anything below INFO does not exist in a release
-/// binary, which is how #4981 discarded legitimate traffic with no greppable
-/// evidence.
-///
-/// KNOWN LIMIT: this drop heals on the delegate's NEXT write, which is prompt
-/// for a chatty writer and not prompt at all for an infrequent one. A delegate
-/// that writes once a day and loses that write to a full channel stays
-/// unpropagated until the following day, and the anti-entropy heartbeat only
-/// helps peers already interested in the contract. Re-attempting from the loop
-/// instead of dropping needs a bounded sweep of the pending set with its own
-/// TTL — a design change, not a tweak — and is tracked separately.
-static V2_BROADCAST_ENQUEUE_DROPPED: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-
-/// Count a dropped V2 broadcast enqueue, warning only at power-of-two milestones.
-///
-/// RATE-LIMITED deliberately. This fires exactly when the notification channel
-/// is `Full`, and `try_notify_node_event_on` logs that same condition at
-/// `debug!` precisely because a per-occurrence WARN on it flooded production
-/// gateways after the HN spike (#4238) at 8-14 MB/hour. The marker is released
-/// on failure, so every subsequent write to the contract retries and would log
-/// again — an unconditional WARN here is that incident by another door.
-/// `release_max_level_info` still rules out `debug!` (the drop would leave no
-/// evidence in a release build, the #4981 shape), so the resolution is the one
-/// `tracing::register::note_dropped_event_log` already uses for this exact
-/// trade: count every occurrence, warn at 1, 2, 4, 8, ...
-fn note_v2_broadcast_enqueue_dropped(key: &ContractKey, err: &OpError) {
-    let dropped =
-        V2_BROADCAST_ENQUEUE_DROPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-    if dropped.is_power_of_two() {
-        tracing::warn!(
-            contract = %key,
-            error = %err,
-            dropped_total = dropped,
-            "V2 delegate state-change broadcast dropped: notification channel would block. \
-             The write is committed locally; the network learns of it on the next write, \
-             or eventually via anti-entropy — 300s is the heartbeat PERIOD, not a \
-             recovery bound, since each exchange is capped and randomly sampled. \
-             Logged at power-of-two milestones (#4238)."
-        );
-    }
-}
-
-/// Map a contract-handler reply onto a [`DrainStateRead`].
-///
-/// Split out from [`OpManager::read_state_for_broadcast_drain`] so the mapping
-/// can be tested exhaustively without a live contract handler. The async
-/// wrapper is then only the round trip; this is the part with the decision in
-/// it, and the decision is the one that regressed before: collapsing a failed
-/// read into the same answer as "we do not hold it" is what silently discarded
-/// an already-committed write.
-pub(crate) fn classify_drain_read(
-    reply: Result<crate::contract::ContractHandlerEvent, ContractError>,
-) -> DrainStateRead {
-    use crate::contract::ContractHandlerEvent;
-    match reply {
-        // The handler answered and it holds state for the contract.
-        Ok(ContractHandlerEvent::GetResponse {
-            response: Ok(store_response),
-            ..
-        }) => match store_response.state {
-            Some(state) => DrainStateRead::Found(state),
-            // Answered, and we genuinely hold no state. Final: nothing to send.
-            None => DrainStateRead::NotHeld,
-        },
-        // The handler answered with an executor error, or answered something
-        // that is not a GetResponse at all. Either way we learned nothing about
-        // whether we hold the contract, so this is NOT `NotHeld`.
-        Ok(_) => DrainStateRead::Unavailable,
-        // Timed out, channel closed, or the handler is gone.
-        Err(_) => DrainStateRead::Unavailable,
+        // Unregister AFTER the decrement, so a counted op always has a
+        // deadline. The reverse order lets a drain poll see a counted
+        // op with no deadline and log that the remaining ops were
+        // abandoned when this one had in fact just finished.
+        self.deadlines.unregister(self.id);
     }
 }
 
@@ -566,6 +667,11 @@ impl OpManager {
         result_router_tx: mpsc::Sender<(Transaction, HostResult)>,
         task_monitor: &super::background_task_monitor::BackgroundTaskMonitor,
     ) -> anyhow::Result<Self> {
+        // Monotonic per-process instance id. `Relaxed` is sufficient: the only
+        // requirement is uniqueness, not ordering against other memory.
+        static NEXT_NODE_IDENTITY: std::sync::atomic::AtomicUsize =
+            std::sync::atomic::AtomicUsize::new(1);
+        let node_identity = NEXT_NODE_IDENTITY.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let ring = Ring::new(
             config,
             notification_channel.clone(),
@@ -700,15 +806,25 @@ impl OpManager {
             broadcast_coverage: Arc::new(
                 crate::ring::broadcast_coverage::BroadcastCoverageStore::new(),
             ),
+            // The spacing waits on tokio time (`tokio::time::sleep`), so
+            // it reads the same clock rather than the hosting override, which
+            // sims advance by hand.
+            broadcast_spacing: Arc::new(
+                crate::node::network_bridge::broadcast_spacing::BroadcastSpacing::new(Arc::new(
+                    InstantTimeSrc::new(),
+                )),
+            ),
             update_propagation_stats,
             pending_broadcasts: Arc::new(
                 crate::operations::update::pending_broadcast::PendingBroadcastStore::new(),
             ),
-            v2_delegate_broadcast_pending: Arc::new(dashmap::DashSet::new()),
-            v2_delegate_broadcast_queue_lock: Arc::new(Mutex::new(())),
             request_router,
+            delegate_capabilities: Arc::new(OnceLock::new()),
             orphan_stream_registry,
             stream_progress_registry: Arc::new(StreamProgressRegistry::new()),
+            attempt_hop_registry: Arc::new(
+                crate::operations::route_attempt::AttemptHopRegistry::new(),
+            ),
             streaming_threshold,
             gateway_backoff: Arc::new(Mutex::new(PeerConnectionBackoff::new())),
             gateway_backoff_cleared: Arc::new(tokio::sync::Notify::new()),
@@ -724,12 +840,14 @@ impl OpManager {
                     .collect(),
             ),
             pending_contract_fetches,
+            node_identity,
             active_relay_get_txs,
             active_relay_update_txs,
             active_relay_put_txs,
             active_relay_subscribe_txs,
             active_relay_connect_txs,
             inflight_client_ops: Arc::new(AtomicUsize::new(0)),
+            inflight_client_op_deadlines: Arc::new(ClientOpDeadlines::default()),
             shutting_down: Arc::new(AtomicBool::new(false)),
         })
     }
@@ -820,7 +938,10 @@ impl OpManager {
     /// and counter bump are atomic. Kept module-private for the
     /// `admit_client_op` implementation.
     fn client_op_guard(&self) -> ClientOpGuard {
-        ClientOpGuard::new(self.inflight_client_ops.clone())
+        ClientOpGuard::new(
+            self.inflight_client_ops.clone(),
+            self.inflight_client_op_deadlines.clone(),
+        )
     }
 
     /// Atomically check the shutdown admission gate AND bump the
@@ -900,6 +1021,34 @@ impl OpManager {
     /// without holding an `Arc<OpManager>` across the drain wait.
     pub(crate) fn inflight_client_ops_handle(&self) -> Arc<AtomicUsize> {
         self.inflight_client_ops.clone()
+    }
+
+    /// Cloneable handle to the in-flight client ops' drain deadlines,
+    /// read by the shutdown drain alongside the counter (#5838).
+    pub(crate) fn inflight_client_op_deadlines_handle(&self) -> Arc<ClientOpDeadlines> {
+        self.inflight_client_op_deadlines.clone()
+    }
+
+    /// Set once by the executor pool; later calls are ignored.
+    pub(crate) fn set_delegate_capabilities(
+        &self,
+        caps: &Arc<crate::contract::delegate_capabilities::DelegateCapabilities>,
+    ) {
+        if self
+            .delegate_capabilities
+            .set(Arc::downgrade(caps))
+            .is_err()
+        {
+            tracing::debug!("delegate capabilities already set; ignoring repeat wiring");
+        }
+    }
+
+    pub(crate) fn delegate_capabilities(
+        &self,
+    ) -> Option<Arc<crate::contract::delegate_capabilities::DelegateCapabilities>> {
+        self.delegate_capabilities
+            .get()
+            .and_then(std::sync::Weak::upgrade)
     }
 
     /// Set the request router for cleaning up stale entries when operations complete.
@@ -1091,214 +1240,9 @@ impl OpManager {
         .await;
     }
 
-    /// Queue a V2 delegate state-change broadcast for `key`, coalescing with
-    /// any broadcast already queued for the same contract.
-    ///
-    /// Returns `true` when an event was actually enqueued. A `false` return is
-    /// the normal coalesced case — a broadcast for this contract is already
-    /// outstanding and will pick up this write when it drains, because it
-    /// re-reads the stored state rather than carrying a snapshot.
-    ///
-    /// Synchronous and non-blocking on purpose: the only caller runs inside a
-    /// WASM host call on the V2 delegate write path, where blocking would be
-    /// worse than a dropped broadcast. A drop is recoverable — the next write
-    /// or a summary-mismatch resync re-announces the state.
-    ///
-    /// # The marker insert and the enqueue are made atomic by a lock
-    ///
-    /// `insert`, `try_notify_node_event` and the rollback below are three
-    /// operations, and the coalescing contract depends on another caller never
-    /// observing the marker between them. A short mutex supplies that.
-    ///
-    /// IT USED TO SAY THE SERIAL LOOP SUPPLIED IT, AND THAT WAS FALSE — the
-    /// comment asserted "the sole caller is a WASM host call executing on
-    /// `contract_handling`", and this very PR added a second caller: the drain
-    /// retry in `p2p_protoc`, which runs inside `tokio::spawn` on the
-    /// multi-threaded runtime. So the PR shipped the concurrent writer its own
-    /// safety argument said the protocol could not survive. Two reviewers found
-    /// it independently; it is recorded here rather than quietly corrected
-    /// because the shape is the one worth recognising — a true claim ("the
-    /// write path is serial") about the wrong set (the write path was, the
-    /// caller set was not).
-    ///
-    /// The sequence it made reachable, all of it silent:
-    ///
-    /// * retry task R inserts the marker and is preempted before its enqueue;
-    /// * delegate write W, on the loop, sees the marker present, coalesces, and
-    ///   returns `Coalesced` — correct only if R's broadcast actually happens;
-    /// * R's enqueue fails, so R rolls the marker back and counts ONE drop.
-    ///
-    /// No event exists, so no drain runs and no retry is scheduled for either.
-    /// W's committed write is never announced, the delegate was told it
-    /// succeeded, and the counter reports one loss where there were at least
-    /// two. Reachability needs the notification channel full during the
-    /// interleave — which is precisely the condition the retry exists for.
-    ///
-    /// With the lock held across all three steps, a caller sees either no
-    /// marker, or a marker whose enqueue has already succeeded. It never sees
-    /// one that is about to be rolled back, so a coalesce is always a real
-    /// promise. The lock is uncontended in the common case and covers no
-    /// `.await`.
-    ///
-    /// An earlier version of this comment claimed a lock here would be the
-    /// wrong fix and that only "marker owned by the enqueuer, cleared at the
-    /// drain" would do. That was also wrong: the drain deliberately clears the
-    /// marker BEFORE its read, so that a write landing during the read is not
-    /// swallowed, and moving the clear to after the read would trade this bug
-    /// for that one.
-    pub(crate) fn queue_v2_delegate_broadcast(&self, key: ContractKey) -> V2BroadcastQueued {
-        // Held across insert, enqueue and rollback. See this function's docs:
-        // without it, a caller can coalesce into a marker that is about to be
-        // rolled back, and its write is then never announced.
-        let _serialise = self.v2_delegate_broadcast_queue_lock.lock();
-
-        // `insert` returns false when the id was already present, i.e. a
-        // broadcast is queued and undrained: coalesce into it and enqueue
-        // nothing.
-        if !self.v2_delegate_broadcast_pending.insert(*key.id()) {
-            return V2BroadcastQueued::Coalesced;
-        }
-        if let Err(err) =
-            self.try_notify_node_event(crate::message::NodeEvent::V2DelegateStateChanged { key })
-        {
-            // Release the marker. Leaving it set after a failed enqueue would
-            // latch this contract permanently: every later write would see a
-            // broadcast "already queued" that no handler will ever drain, and
-            // the contract would silently stop propagating for the process
-            // lifetime.
-            self.v2_delegate_broadcast_pending.remove(key.id());
-            note_v2_broadcast_enqueue_dropped(&key, &err);
-            return V2BroadcastQueued::EnqueueFailed;
-        }
-        V2BroadcastQueued::Queued
-    }
-
-    /// Read the current stored state for `key` for a V2 broadcast drain,
-    /// BOUNDED and distinguishing "not held" from "could not read".
-    ///
-    /// Two things this does not share with
-    /// [`Self::read_current_contract_state`], both because this one runs INLINE
-    /// on the network event loop rather than in a spawned task:
-    ///
-    /// * **It is bounded.** The plain read inherits the handler's own
-    ///   `CH_EV_RESPONSE_TIME_OUT` (300 s). A bare `.await` of that on this loop
-    ///   is the #4549 wedge — see this file's `query_app_subscriptions_bounded`,
-    ///   whose comment records a saturated handler killing the network event
-    ///   listener and taking a gateway network-dead. Same remedy, same reason.
-    /// * **It reports the failure.** The plain read maps every failure to
-    ///   `None`, which the caller cannot tell from "we do not hold this
-    ///   contract". For a drain those need opposite handling: not held is a
-    ///   correct no-op, a failed read means a committed write goes unannounced.
-    ///
-    /// # Why this read can time out, and what that costs
-    ///
-    /// The read is a `GetQuery` to the SERIAL `contract_handling` loop, and the
-    /// event being drained was queued by a V2 delegate write that executed ON
-    /// that loop. So the read cannot be served until that delegate returns.
-    ///
-    /// For a delegate that merely computes, that is microseconds and the
-    /// bounded retry at the drain site covers any transient overrun. For a
-    /// delegate that requests USER INPUT it is not: `prompter.prompt(..)` is
-    /// awaited inline inside `handle_delegate_with_contract_requests`, which
-    /// `contract_handling` awaits in turn, so the loop is held for as long as a
-    /// human takes to answer. Such a write is committed, reported successful to
-    /// the delegate, and its broadcast dropped — retries cannot outlast a human.
-    ///
-    /// That case is bounded, not silent: it is counted and WARNed at the drain
-    /// site, and a peer hosting or actively using the contract re-learns the
-    /// state EVENTUALLY, and "eventually" is the strongest word available here.
-    /// An earlier version of this comment said "within one anti-entropy round
-    /// (300 s)", and a later one softened it to "up to 300 s, staggered". Both
-    /// were wrong in the same way: `INTEREST_HEARTBEAT_INTERVAL` is the PERIOD
-    /// at which the heartbeat fires, not a bound on when a given contract is
-    /// repaired.
-    ///
-    /// Two things break the bound, neither visible from this file:
-    ///
-    /// * **The exchange is capped and randomly sampled.** A summary reply
-    ///   carries at most `MAX_SUMMARY_ENTRIES_PER_MESSAGE` entries; when a peer
-    ///   shares more contracts than that, the list is rotated by a RANDOM
-    ///   offset and truncated (`node.rs`, the `Summaries` arm). So a node with
-    ///   many contracts covers them across several rounds, and the number of
-    ///   rounds is probabilistic rather than `ceil(N / cap)`.
-    /// * **The repair needs local interest too.** The exchange only reaches
-    ///   contracts in the interest-hash intersection that pass
-    ///   `has_local_interest`. The live broadcast path has no such condition —
-    ///   since #4642 step 9 it is advertised-co-hosts-only. The two sets are
-    ///   related through the interest index rather than identical, so the peer
-    ///   superset argument below is about PEERS while the quantity that
-    ///   actually matters is the (peer, contract) pair.
-    ///
-    /// This matters because this paragraph is the entire justification for
-    /// dropping a write that already committed and already returned success to
-    /// the delegate. An operator reading "300 s" will wait five minutes for a
-    /// self-heal that may take considerably longer.
-    ///
-    /// That recovery covers the right PEERS, not merely the right contracts,
-    /// and the two are not the same claim. The heartbeat enumerates every
-    /// CONNECTED peer (`get_connections_by_location`), while a broadcast target
-    /// must be an advertised co-host resolved through the same connection
-    /// table — so the heartbeat's peer set is a strict SUPERSET of the
-    /// broadcast's, and no peer that would have received the fan-out is
-    /// missed. The contract-level gate matches too: the heartbeat summarize and
-    /// the broadcast fan-out share the one `should_summarize_or_broadcast`
-    /// predicate, deliberately, so they cannot drift — see
-    /// `broadcast_queue::should_broadcast_contract`, which says so explicitly.
-    /// The comparison that drives the repair reads FACT on both sides (our real
-    /// summary against the peer's real digest, never our cached belief about
-    /// that peer), which is what makes it a repair rather than a re-assertion
-    /// of the same stale view.
-    /// The real fix is #5544/#5554, which parks delegates off this loop and
-    /// removes the precondition entirely.
-    pub(crate) async fn read_state_for_broadcast_drain(
-        &self,
-        key: &ContractKey,
-        timeout: std::time::Duration,
-    ) -> DrainStateRead {
-        use crate::contract::ContractHandlerEvent;
-        // BACKGROUND, not the `NetworkRelay` default (#4534). This read is
-        // best-effort by construction — its whole failure story is "the write
-        // goes unannounced and anti-entropy repairs it" — so under queue
-        // pressure it must be shed BEFORE genuine relayed peer operations, not
-        // compete with them. `NetworkRelay` is not shed first; only
-        // `ClientLocal` gets the reserve.
-        //
-        // The sibling this path is otherwise modelled on, the periodic interest
-        // -sync summarize, already uses `Background` for exactly this reason.
-        // And the pressure is self-inflicted if it is not: the coalescing
-        // marker is per contract, so a delegate writing N contracts issues N
-        // of these at an already-saturated handler.
-        match self
-            .notify_contract_handler_with_timeout_prioritized(
-                ContractHandlerEvent::GetQuery {
-                    instance_id: *key.id(),
-                    return_contract_code: false,
-                },
-                timeout,
-                crate::contract::Priority::Background,
-            )
-            .await
-        {
-            Ok(ev) => classify_drain_read(Ok(ev)),
-            Err(e) => classify_drain_read(Err(e)),
-        }
-    }
-
-    /// Clear the queued-broadcast marker for `key`, called by the handler when
-    /// it begins draining. See [`Self::queue_v2_delegate_broadcast`].
-    pub(crate) fn clear_v2_delegate_broadcast_pending(&self, key: &ContractKey) {
-        self.v2_delegate_broadcast_pending.remove(key.id());
-    }
-
     /// Read the current local state for `key` from the contract handler, or
     /// `None` if we don't host it / the read fails. Used by the #4359 deferred
     /// re-broadcast flush to avoid re-emitting superseded give-up-time bytes.
-    ///
-    /// NOT used by the V2 delegate broadcast drain, which needs a bounded read
-    /// that distinguishes a failure from "not held" and therefore has its own
-    /// [`Self::read_state_for_broadcast_drain`]. An earlier version of this
-    /// comment claimed the drain as a caller and widened the visibility for it;
-    /// both were wrong, and the visibility is back to private.
     async fn read_current_contract_state(&self, key: &ContractKey) -> Option<WrappedState> {
         use crate::contract::ContractHandlerEvent;
         match self
@@ -1817,23 +1761,6 @@ impl OpManager {
             .await
     }
 
-    /// As [`Self::notify_contract_handler_with_timeout`], but at an explicit
-    /// priority class (#4534).
-    ///
-    /// Exists because `Priority::DEFAULT` is `NetworkRelay`, which the fair
-    /// queue does NOT shed first — correct for relayed peer operations, wrong
-    /// for best-effort maintenance work that is explicitly allowed to fail.
-    pub async fn notify_contract_handler_with_timeout_prioritized(
-        &self,
-        msg: ContractHandlerEvent,
-        timeout: std::time::Duration,
-        priority: crate::contract::Priority,
-    ) -> Result<ContractHandlerEvent, ContractError> {
-        self.ch_outbound
-            .send_to_handler_with_timeout(msg, timeout, priority)
-            .await
-    }
-
     /// Fire-and-forget notification to the contract handler at an explicit
     /// priority class (#4534). Used for maintenance events (e.g. EvictContract)
     /// where no response is needed and the caller must not block.
@@ -2021,6 +1948,14 @@ impl OpManager {
         &self.stream_progress_registry
     }
 
+    /// Per-attempt first-hop registry for originator route attribution
+    /// (#5657). See `operations::route_attempt::AttemptHopRegistry`.
+    pub(crate) fn attempt_hop_registry(
+        &self,
+    ) -> &Arc<crate::operations::route_attempt::AttemptHopRegistry> {
+        &self.attempt_hop_registry
+    }
+
     /// Determines if streaming should be used for a payload of the given size.
     ///
     /// Returns `true` if the payload size exceeds the streaming threshold.
@@ -2173,6 +2108,74 @@ impl OpManager {
             divergence,
         );
         wants
+    }
+
+    /// Re-root a contract this peer just started hosting through a stranded-holder
+    /// recovery (#5846, design §5d(b)), so the chain toward the key keeps
+    /// forming without waiting for the lease to come due (~6 min per hop).
+    ///
+    /// The recovery made the stranded holder our downstream, so the contract is
+    /// in use here; if no connected co-host is closer to the key and we are not
+    /// the root, we are now the stranded one and re-root the same way. Same
+    /// guards as [`select_prompt_reroots`](Self::select_prompt_reroots) for one
+    /// key (connections, ban, per-contract backoff and in-flight dedup, the
+    /// reconcile `ReRootSearch` gate) and the same shared spawn path, so its
+    /// jitter and outer deadline apply. One recovery spawns at most one re-root.
+    ///
+    /// These re-roots are bounded by the recovery rate limit (at most one per
+    /// recovery, so 20 a minute node-wide), not by the renewal loop's
+    /// per-cycle cap, and they back off under the same event-loop pressure.
+    ///
+    /// The reconcile gate is evaluated here directly rather than through
+    /// [`reconcile_wants_reroot`](Self::reconcile_wants_reroot), which records
+    /// every evaluation on the connection-drop counter. Returns whether a
+    /// re-root was spawned.
+    pub(crate) fn spawn_stranded_recovery_reroot(self: &Arc<Self>, key: ContractKey) -> bool {
+        let skip = |reason: &str| {
+            tracing::debug!(contract = %key, reason, "stranded-holder recovery: no re-root");
+            false
+        };
+        if self.ring.open_connections() == 0 {
+            return skip("no connections");
+        }
+        if self.ring.contract_ban_list.is_banned(key.id()) {
+            return skip("banned");
+        }
+        // The same backpressure the renewal loop applies: with the event loop's
+        // notification channel over half full it cuts its batch, and this extra
+        // re-root simply waits for that loop instead.
+        let sender = self.to_event_listener.notifications_sender();
+        if sender.capacity()
+            < sender.max_capacity() / crate::ring::Ring::RENEWAL_DEFER_CAPACITY_FRACTION
+        {
+            return skip("event loop under pressure");
+        }
+        if !self.ring.can_request_subscription(&key) {
+            return skip("backoff or already in flight");
+        }
+        // Distance-blind (own location unknown): do not re-root, the renewal
+        // loop will once the location is known.
+        let Some(inputs) = self.build_reconcile_inputs(&key) else {
+            return skip("own location unknown");
+        };
+        if !reconcile::reconcile(&inputs).contains(&reconcile::Action::ReRootSearch) {
+            // Root, or a closer co-host already exists: nothing to re-root.
+            tracing::debug!(contract = %key, ?inputs, "stranded-holder recovery: reconcile inputs");
+            return skip("reconcile does not want a re-root");
+        }
+        if !self.ring.mark_subscription_pending(key) {
+            return skip("already in flight");
+        }
+        tracing::info!(
+            contract = %key,
+            "stranded-holder recovery: hosting with no closer co-host, re-rooting toward the key"
+        );
+        crate::ring::Ring::spawn_renewal_subscribe_task(
+            self.clone(),
+            key,
+            self.ring.shutdown_token(),
+        );
+        true
     }
 
     /// Drive storm-safe PROMPT re-roots for the in-use contracts a just-dropped
@@ -3019,97 +3022,6 @@ mod tests {
     /// is GONE — the collapse DECISION now DRIVES one level up
     /// (`reconcile_wants_collapse` at the callers), so the function must no longer
     /// build a reconcile snapshot or run the action-set comparator here.
-    /// PIN: the marker triple in `queue_v2_delegate_broadcast` is serialised.
-    ///
-    /// The function inserts a marker, enqueues an event, and rolls the marker
-    /// back if the enqueue fails. A caller that observes the marker BETWEEN the
-    /// insert and a failed enqueue coalesces into a promise that will not be
-    /// kept, and its committed write is never announced — silently, and with
-    /// the drop counter under-reporting by exactly the number of coalescers.
-    ///
-    /// This is not hypothetical. The function's doc used to assert the triple
-    /// was safe because "the sole caller is a WASM host call executing on
-    /// `contract_handling`", while this same PR added a second caller inside a
-    /// `tokio::spawn` on the multi-threaded runtime. The claim was true of the
-    /// WRITE PATH and false of the CALLER SET.
-    ///
-    /// Pinned from source because the race needs two threads interleaving at a
-    /// specific instruction with a full notification channel — reliably
-    /// unreproducible in a unit test. What IS checkable is that the lock is
-    /// still taken, and taken BEFORE the insert.
-    ///
-    /// FALSIFY: delete the `lock()` line, or move it below the `insert`.
-    /// Verified both fail.
-    #[test]
-    fn queue_v2_delegate_broadcast_serialises_its_marker_triple() {
-        const SRC: &str = include_str!("op_state_manager.rs");
-        let start = SRC
-            .find("pub(crate) fn queue_v2_delegate_broadcast(")
-            .expect("queue_v2_delegate_broadcast must exist");
-        let rest = &SRC[start + 1..];
-        let end = rest
-            .find("\n    pub")
-            .map(|e| start + 1 + e)
-            .unwrap_or(SRC.len());
-        // Strip line comments: every needle below also appears in this
-        // function's own prose, and a scrape that counted those would report a
-        // true fact about the wrong text.
-        let body: String = SRC[start..end]
-            .lines()
-            .map(|l| match l.find("//") {
-                Some(i) => &l[..i],
-                None => l,
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-
-        let lock = body.find("v2_delegate_broadcast_queue_lock.lock()").expect(
-            "the marker triple must be serialised by the queue lock; without it a \
-             concurrent caller can coalesce into a marker that is then rolled back",
-        );
-
-        // THE GUARD MUST BE BOUND TO A LIVE NAME, not taken and dropped.
-        //
-        // Found by a reviewer defeating the first version of this pin: writing
-        //
-        //     drop(self.v2_delegate_broadcast_queue_lock.lock());
-        //
-        // leaves the needle present and still before the insert, so the pin
-        // passed while the lock was released immediately and the serialisation
-        // it exists to enforce was gone. `let _ = ...` does the same thing, and
-        // differs from the correct `let _serialise = ...` by one character --
-        // a known Rust footgun and exactly the edit an "unused variable"
-        // cleanup suggests.
-        let line_start = body[..lock].rfind('\n').map(|i| i + 1).unwrap_or(0);
-        let line = body[line_start..].lines().next().unwrap_or("").trim();
-        assert!(
-            !line.starts_with("drop("),
-            "the lock must be BOUND, not taken and dropped on the spot: a \
-             temporary guard is released at the end of the statement, so the \
-             insert and the enqueue below run unserialised. Found: {line:?}"
-        );
-        let binding = line
-            .strip_prefix("let ")
-            .and_then(|rest| rest.split('=').next())
-            .map(str::trim)
-            .unwrap_or("");
-        assert!(
-            binding != "_" && !binding.is_empty(),
-            "the lock guard must bind to a NAMED variable that lives to the end \
-             of the function. `let _ = ..` drops it immediately, which is the \
-             same defect as `drop(..)` and one character from correct. \
-             Found binding: {binding:?} in {line:?}"
-        );
-        let insert = body
-            .find("v2_delegate_broadcast_pending.insert(")
-            .expect("the marker insert must still exist");
-        assert!(
-            lock < insert,
-            "the lock must be acquired BEFORE the marker insert, or the window \
-             it exists to close is still open"
-        );
-    }
-
     #[test]
     fn send_unsubscribe_upstream_drives_off_stored_upstream_after_flip() {
         const SRC: &str = include_str!("op_state_manager.rs");
@@ -4325,6 +4237,299 @@ mod tests {
             !op_manager.ring.can_request_subscription(&key),
             "the prompt re-root must have claimed the pending slot (per-contract dedup)"
         );
+    }
+
+    // ===== Stranded-holder recovery re-root (#5846, design §5d(b)) =====
+
+    /// A peer that just became a host through a stranded-holder recovery has a
+    /// downstream (the holder) but no co-host closer to the key, so it re-roots
+    /// toward the key itself: exactly one re-root, through the shared renewal
+    /// path, with the per-contract slot claimed so a second call (another
+    /// recovery of the same contract) spawns nothing.
+    #[tokio::test(flavor = "current_thread")]
+    async fn stranded_recovery_reroot_spawns_once_for_an_in_use_host() {
+        let (op_manager, _guards) = build_reroot_test_op_manager("stranded-reroot-once").await;
+        seed_location_and_one_connection(&op_manager);
+        let key = reroot_contract_key(0x5D);
+        op_manager.ring.subscribe(key);
+        op_manager
+            .ring
+            .add_client_subscription(key.id(), crate::client_events::ClientId::FIRST);
+
+        assert!(
+            op_manager.spawn_stranded_recovery_reroot(key),
+            "an in-use host with no closer co-host must re-root"
+        );
+        assert!(
+            !op_manager.ring.can_request_subscription(&key),
+            "the re-root must claim the per-contract slot"
+        );
+        assert!(
+            !op_manager.spawn_stranded_recovery_reroot(key),
+            "a second recovery of the same contract must not spawn a second re-root"
+        );
+        assert!(
+            op_manager.ring.is_subscribed(&key),
+            "the re-root must not tear down the lease (make-before-break)"
+        );
+    }
+
+    /// The production shape: the recovered host's ONLY demand is the stranded
+    /// holder, registered as a downstream subscriber strictly farther from the
+    /// key. That alone must entitle the re-root.
+    #[tokio::test(flavor = "current_thread")]
+    async fn stranded_recovery_reroot_counts_the_holder_as_demand() {
+        let (op_manager, _guards) =
+            build_reroot_test_op_manager("stranded-reroot-downstream").await;
+        seed_location_and_one_connection(&op_manager);
+        let key = reroot_contract_key(0x61);
+        op_manager.ring.subscribe(key);
+
+        // A holder strictly farther from the key than we are.
+        let key_loc = crate::ring::Location::from(&key);
+        let own_dist = op_manager
+            .ring
+            .connection_manager
+            .own_location()
+            .location()
+            .expect("own location")
+            .distance(key_loc);
+        let holder_addr = (36000u16..37000)
+            .map(|port| std::net::SocketAddr::from(([127, 0, 0, 1], port)))
+            .find(|addr| crate::ring::Location::from_address(addr).distance(key_loc) > own_dist)
+            .expect("an address farther from the key");
+        let holder = crate::transport::TransportKeypair::new();
+        assert!(op_manager.ring.connection_manager.add_connection(
+            crate::ring::Location::from_address(&holder_addr),
+            holder_addr,
+            holder.public().clone(),
+            false,
+        ));
+        crate::operations::subscribe::register_downstream_subscriber(
+            &op_manager,
+            &key,
+            holder_addr,
+            Some(holder.public()),
+            None,
+            &crate::message::Transaction::new::<crate::operations::subscribe::SubscribeMsg>(),
+            "",
+        )
+        .await;
+        assert!(
+            op_manager
+                .build_reconcile_inputs(&key)
+                .expect("not distance-blind")
+                .has_farther_downstream_subscriber,
+            "precondition: the holder counts as a farther downstream"
+        );
+
+        assert!(op_manager.spawn_stranded_recovery_reroot(key));
+    }
+
+    /// A contract in subscription backoff (a recent failed renewal or
+    /// re-root) is not re-rooted early: the per-contract backoff is one of the
+    /// storm guards the renewal loop applies too.
+    #[tokio::test(flavor = "current_thread")]
+    async fn stranded_recovery_reroot_respects_subscription_backoff() {
+        let (op_manager, _guards) = build_reroot_test_op_manager("stranded-reroot-backoff").await;
+        seed_location_and_one_connection(&op_manager);
+        let key = reroot_contract_key(0x65);
+        op_manager.ring.subscribe(key);
+        op_manager
+            .ring
+            .add_client_subscription(key.id(), crate::client_events::ClientId::FIRST);
+        assert!(op_manager.ring.mark_subscription_pending(key));
+        op_manager.ring.complete_subscription_request(&key, false);
+        assert!(
+            !op_manager.ring.can_request_subscription(&key),
+            "precondition: the failure put the contract in backoff"
+        );
+
+        assert!(!op_manager.spawn_stranded_recovery_reroot(key));
+    }
+
+    /// A banned contract is never re-rooted.
+    #[tokio::test(flavor = "current_thread")]
+    async fn stranded_recovery_reroot_skips_a_banned_contract() {
+        let (op_manager, _guards) = build_reroot_test_op_manager("stranded-reroot-banned").await;
+        seed_location_and_one_connection(&op_manager);
+        let key = reroot_contract_key(0x62);
+        op_manager.ring.subscribe(key);
+        op_manager
+            .ring
+            .add_client_subscription(key.id(), crate::client_events::ClientId::FIRST);
+        let _ = op_manager.ring.contract_ban_list.ban(
+            *key.id(),
+            tokio::time::Instant::now() + std::time::Duration::from_secs(3600),
+            crate::ring::contract_ban_list::BanReason::AutoMad,
+        );
+
+        assert!(!op_manager.spawn_stranded_recovery_reroot(key));
+    }
+
+    /// With the event loop's notification channel more than half full the
+    /// recovery re-root waits for the renewal loop, the same backpressure that
+    /// loop applies to itself.
+    #[tokio::test(flavor = "current_thread")]
+    async fn stranded_recovery_reroot_backs_off_under_event_loop_pressure() {
+        let (op_manager, _guards) = build_reroot_test_op_manager("stranded-reroot-pressure").await;
+        seed_location_and_one_connection(&op_manager);
+        let key = reroot_contract_key(0x63);
+        op_manager.ring.subscribe(key);
+        op_manager
+            .ring
+            .add_client_subscription(key.id(), crate::client_events::ClientId::FIRST);
+
+        let sender = op_manager.to_event_listener.notifications_sender();
+        let half = sender.max_capacity() / crate::ring::Ring::RENEWAL_DEFER_CAPACITY_FRACTION;
+        while sender.capacity() >= half {
+            sender
+                .try_send(either::Either::Right(
+                    crate::message::NodeEvent::TransactionCompleted(
+                        crate::message::Transaction::new::<
+                            crate::operations::subscribe::SubscribeMsg,
+                        >(),
+                    ),
+                ))
+                .expect("channel has room");
+        }
+
+        assert!(!op_manager.spawn_stranded_recovery_reroot(key));
+        assert!(
+            op_manager.ring.can_request_subscription(&key),
+            "a skipped re-root must not claim the slot"
+        );
+    }
+
+    /// The live state that feeds the recovery gate: the requester's hosting
+    /// advertisement and the ban list reach `RecoveryInputs`, and a peer that
+    /// is not connected yields no requester at all.
+    #[tokio::test(flavor = "current_thread")]
+    async fn stranded_recovery_inputs_read_advertisement_and_ban_list() {
+        let (op_manager, _guards) = build_reroot_test_op_manager("stranded-inputs").await;
+        seed_location_and_one_connection(&op_manager);
+        let key = reroot_contract_key(0x64);
+        let iid = *key.id();
+        let requester = crate::transport::TransportKeypair::new();
+        let requester_addr: std::net::SocketAddr = "127.0.0.1:37001".parse().unwrap();
+        assert!(op_manager.ring.connection_manager.add_connection(
+            crate::ring::Location::from_address(&requester_addr),
+            requester_addr,
+            requester.public().clone(),
+            false,
+        ));
+        let inputs = |addr| {
+            crate::operations::subscribe::op_ctx_task::stranded_recovery_inputs(
+                &op_manager,
+                iid,
+                addr,
+            )
+        };
+
+        let (before, peer) = inputs(requester_addr);
+        assert!(peer.is_some(), "a connected requester resolves");
+        assert!(!before.requester_advertises);
+        assert!(!before.banned);
+
+        register_hub_cohosting(&op_manager, requester.public(), &[iid]);
+        assert!(inputs(requester_addr).0.requester_advertises);
+
+        let _ = op_manager.ring.contract_ban_list.ban(
+            iid,
+            tokio::time::Instant::now() + std::time::Duration::from_secs(3600),
+            crate::ring::contract_ban_list::BanReason::AutoMad,
+        );
+        assert!(inputs(requester_addr).0.banned);
+
+        let stranger: std::net::SocketAddr = "127.0.0.1:37002".parse().unwrap();
+        let (unknown, peer) = inputs(stranger);
+        assert!(peer.is_none());
+        assert!(unknown.requester_location.is_none());
+    }
+
+    /// No demand, no re-root: a copy with a lease but no local client, no
+    /// downstream and no recent access is torn down by the reconcile
+    /// controller, never re-rooted (the anti-storm interest gate).
+    #[tokio::test(flavor = "current_thread")]
+    async fn stranded_recovery_reroot_skips_a_demandless_copy() {
+        let (op_manager, _guards) = build_reroot_test_op_manager("stranded-reroot-idle").await;
+        seed_location_and_one_connection(&op_manager);
+        let key = reroot_contract_key(0x5E);
+        op_manager.ring.subscribe(key);
+
+        assert!(!op_manager.spawn_stranded_recovery_reroot(key));
+        assert!(
+            op_manager.ring.can_request_subscription(&key),
+            "a skipped re-root must not claim the slot"
+        );
+    }
+
+    /// A connected co-host strictly closer to the key is already our upstream,
+    /// so there is nothing to re-root toward: the chain has reached the mesh.
+    #[tokio::test(flavor = "current_thread")]
+    async fn stranded_recovery_reroot_skips_when_a_closer_cohost_exists() {
+        let (op_manager, _guards) = build_reroot_test_op_manager("stranded-reroot-upstream").await;
+        seed_location_and_one_connection(&op_manager);
+        let key = reroot_contract_key(0x5F);
+        op_manager.ring.subscribe(key);
+        op_manager
+            .ring
+            .add_client_subscription(key.id(), crate::client_events::ClientId::FIRST);
+
+        // A co-host strictly closer to the key than we are. A connection's
+        // location is derived from its address, so pick an address that lands
+        // closer to the key.
+        let key_loc = crate::ring::Location::from(&key);
+        let own_dist = op_manager
+            .ring
+            .connection_manager
+            .own_location()
+            .location()
+            .expect("own location")
+            .distance(key_loc);
+        let cohost_addr = (35000u16..36000)
+            .map(|port| std::net::SocketAddr::from(([127, 0, 0, 1], port)))
+            .find(|addr| crate::ring::Location::from_address(addr).distance(key_loc) < own_dist)
+            .expect("an address closer to the key");
+        let cohost = crate::transport::TransportKeypair::new();
+        assert!(op_manager.ring.connection_manager.add_connection(
+            crate::ring::Location::from_address(&cohost_addr),
+            cohost_addr,
+            cohost.public().clone(),
+            false,
+        ));
+        register_hub_cohosting(&op_manager, cohost.public(), &[*key.id()]);
+        assert!(
+            op_manager
+                .build_reconcile_inputs(&key)
+                .expect("not distance-blind")
+                .computed_upstream
+                .is_some(),
+            "precondition: the co-host is our computed upstream"
+        );
+
+        assert!(!op_manager.spawn_stranded_recovery_reroot(key));
+        assert!(op_manager.ring.can_request_subscription(&key));
+    }
+
+    /// With no connections there is nowhere to route a re-root.
+    #[tokio::test(flavor = "current_thread")]
+    async fn stranded_recovery_reroot_skips_with_no_connections() {
+        let (op_manager, _guards) = build_reroot_test_op_manager("stranded-reroot-isolated").await;
+        // A known location but no connection, so it is the connection guard
+        // that refuses, not the distance-blind one further down.
+        op_manager
+            .ring
+            .connection_manager
+            .set_own_addr_local_for_test("127.0.0.1:12000".parse().unwrap());
+        assert_eq!(op_manager.ring.open_connections(), 0);
+        let key = reroot_contract_key(0x60);
+        op_manager.ring.subscribe(key);
+        op_manager
+            .ring
+            .add_client_subscription(key.id(), crate::client_events::ClientId::FIRST);
+
+        assert!(!op_manager.spawn_stranded_recovery_reroot(key));
     }
 
     // ===== Stale proximity-cache reap (#4756) =====
@@ -5798,12 +6003,19 @@ mod tests {
     #[test]
     fn client_op_guard_decrements_on_panic() {
         let counter = Arc::new(AtomicUsize::new(0));
+        let starts = Arc::new(ClientOpDeadlines::default());
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _guard = ClientOpGuard::new(counter.clone());
+            let _guard = ClientOpGuard::new(counter.clone(), starts.clone());
             assert_eq!(counter.load(Ordering::Relaxed), 1);
+            assert!(starts.latest_deadline().is_some());
             panic!("simulated driver panic");
         }));
         assert!(result.is_err(), "the closure must have panicked");
+        assert!(
+            starts.latest_deadline().is_none(),
+            "ClientOpGuard::Drop must remove the op's drain deadline even on \
+             panic, or the drain keeps waiting for a dead driver"
+        );
         assert_eq!(
             counter.load(Ordering::Relaxed),
             0,
@@ -5828,7 +6040,7 @@ mod tests {
         let op_state = include_str!("op_state_manager.rs");
         // Counter bump in ClientOpGuard::new.
         let new_body = op_state
-            .split("fn new(counter: Arc<AtomicUsize>) -> Self {")
+            .split("fn new(counter: Arc<AtomicUsize>, deadlines: Arc<ClientOpDeadlines>) -> Self {")
             .nth(1)
             .and_then(|s| s.split("Self {").next())
             .expect("ClientOpGuard::new body must be findable");
@@ -5872,6 +6084,116 @@ mod tests {
         );
     }
 
+    /// `extend_from_now` only ever pushes a deadline out, and an unknown
+    /// (already finished) op is left alone.
+    #[tokio::test(start_paused = true)]
+    async fn client_op_deadline_extension_never_shortens() {
+        let deadlines = ClientOpDeadlines::default();
+        let id = deadlines.register(DEFAULT_CLIENT_OP_DRAIN_WINDOW);
+        let initial = deadlines.latest_deadline().unwrap();
+        assert!(deadlines.extend_from_now(id, std::time::Duration::from_secs(1)));
+        assert_eq!(deadlines.latest_deadline().unwrap(), initial);
+        assert!(deadlines.extend_from_now(id, std::time::Duration::from_secs(600)));
+        let extended = deadlines.latest_deadline().unwrap();
+        assert!(extended > initial);
+        assert!(deadlines.extend_from_now(id, std::time::Duration::from_secs(5)));
+        assert_eq!(deadlines.latest_deadline().unwrap(), extended);
+        assert!(!deadlines.extend_from_now(id + 1, std::time::Duration::from_secs(5)));
+        deadlines.unregister(id);
+        assert!(deadlines.latest_deadline().is_none());
+    }
+
+    /// A phase end lands even right after a fragment note (it is never
+    /// throttled), and it REPLACES a longer phase window: the tail after
+    /// a 240 s streaming PUT window gets exactly the tail window.
+    #[tokio::test(start_paused = true)]
+    async fn phase_end_lands_after_a_fragment_note_and_replaces_a_longer_window() {
+        let deadlines = Arc::new(ClientOpDeadlines::default());
+        let guard = ClientOpGuard::new(Arc::new(AtomicUsize::new(0)), deadlines.clone());
+        tokio::time::advance(std::time::Duration::from_secs(100)).await;
+        with_client_op_drain(guard.drain_handle(), async {
+            note_client_op_progress(std::time::Duration::from_secs(5));
+            tokio::time::advance(std::time::Duration::from_millis(100)).await;
+            note_client_op_phase_end();
+        })
+        .await;
+        assert_eq!(
+            deadlines.latest_deadline().unwrap(),
+            tokio::time::Instant::now() + CLIENT_OP_TAIL_DRAIN_WINDOW,
+            "a phase end 100 ms after a fragment note must land and set the tail window"
+        );
+        // A longer phase window does not carry over into the tail.
+        with_client_op_drain(guard.drain_handle(), async {
+            note_client_op_progress(std::time::Duration::from_secs(240));
+            note_client_op_phase_end();
+        })
+        .await;
+        assert_eq!(
+            deadlines.latest_deadline().unwrap(),
+            tokio::time::Instant::now() + CLIENT_OP_TAIL_DRAIN_WINDOW,
+        );
+    }
+
+    /// Source-grep pin (#5838): a counted client op must always have a
+    /// drain deadline. `ClientOpGuard::new` registers the deadline
+    /// before the SeqCst counter bump, and `Drop` decrements before
+    /// unregistering. Swapping either pair lets a drain see a counted op
+    /// with no deadline: on admission it would skip an op that just
+    /// started, and the drain tests (which drive real guards) only
+    /// exercise the intended order.
+    #[test]
+    fn client_op_deadline_registered_while_counted() {
+        // Production code only, so an anchor that moves cannot match this
+        // test's own string literals; method bodies end at their
+        // 4-space-indented closing brace.
+        let src = include_str!("op_state_manager.rs");
+        let production = src
+            .split_once("\n#[cfg(test)]\nmod ")
+            .expect("test module must be locatable")
+            .0;
+        let method_body = |sig: &str| -> &str {
+            let (_, after) = production
+                .split_once(sig)
+                .unwrap_or_else(|| panic!("{sig} not found in production code"));
+            after
+                .split_once("\n    }\n")
+                .unwrap_or_else(|| panic!("end of {sig} not found"))
+                .0
+        };
+
+        let new_body = method_body(
+            "    pub(super) fn new(counter: Arc<AtomicUsize>, deadlines: Arc<ClientOpDeadlines>) -> Self {",
+        );
+        let register = new_body
+            .find("deadlines.register(")
+            .expect("ClientOpGuard::new must register a drain deadline");
+        let bump = new_body
+            .find("counter.fetch_add(1, Ordering::SeqCst)")
+            .expect("ClientOpGuard::new must bump the counter");
+        assert!(
+            register < bump,
+            "ClientOpGuard::new must register the deadline BEFORE the counter bump"
+        );
+
+        let (_, after_impl) = production
+            .split_once("impl Drop for ClientOpGuard {")
+            .expect("impl Drop for ClientOpGuard not found in production code");
+        let drop_body = after_impl
+            .split_once("\n    }\n")
+            .expect("end of ClientOpGuard::drop not found")
+            .0;
+        let decrement = drop_body
+            .find("self.counter.fetch_sub(1,")
+            .expect("ClientOpGuard::drop must decrement the counter");
+        let unregister = drop_body
+            .find("self.deadlines.unregister(self.id)")
+            .expect("ClientOpGuard::drop must unregister the deadline");
+        assert!(
+            decrement < unregister,
+            "ClientOpGuard::drop must decrement BEFORE unregistering the deadline"
+        );
+    }
+
     /// Source-grep pin: `admit_client_op` must bump the counter
     /// BEFORE checking the gate. The reverse order (check-then-bump)
     /// re-opens the Codex r2 TOCTOU. The `admit_client_op_refuses_when_shutting_down`
@@ -5911,6 +6233,7 @@ mod tests {
     #[test]
     fn admit_client_op_refuses_when_shutting_down() {
         let counter = Arc::new(AtomicUsize::new(0));
+        let starts = Arc::new(ClientOpDeadlines::default());
         let gate = Arc::new(AtomicBool::new(true)); // pre-flipped
         // Build a minimal stand-in: just the two atomics — we test
         // `admit_client_op` against an `OpManager`-shaped struct by
@@ -5919,7 +6242,7 @@ mod tests {
         // is a 4-line function; pinning its semantic via a parallel
         // implementation is acceptable for a single-function gate.
         let admit = || -> Option<ClientOpGuard> {
-            let guard = ClientOpGuard::new(counter.clone());
+            let guard = ClientOpGuard::new(counter.clone(), starts.clone());
             if gate.load(Ordering::Relaxed) {
                 drop(guard);
                 return None;
@@ -5937,6 +6260,11 @@ mod tests {
             "the bump-then-check pattern must net-zero the counter \
              on rejection — otherwise the gate leaks bumped counts \
              that the drain then waits on indefinitely."
+        );
+        assert!(
+            starts.latest_deadline().is_none(),
+            "a refused admission must not leave a drain deadline behind, \
+             or the drain waits for an op that never ran"
         );
 
         // Open the gate; admit succeeds and bumps the counter.
@@ -6148,76 +6476,20 @@ mod tests {
              rejoin anti-entropy (#4780)",
         );
     }
+}
 
-    /// `classify_drain_read` must keep "we hold no state" and "the read failed"
-    /// APART. Collapsing them is what let a transient GetQuery failure silently
-    /// discard a write that had already committed and already returned success
-    /// to the delegate — #5479's own shape, reappearing inside its fix.
-    ///
-    /// Exhaustive over the four reply shapes on purpose: three of them are
-    /// error-ish and only ONE of those three is safe to treat as final.
-    #[test]
-    fn classify_drain_read_separates_not_held_from_unavailable() {
-        use crate::contract::ContractHandlerEvent;
-        use crate::contract::StoreResponse;
-        use freenet_stdlib::prelude::WrappedState;
+/// Test-only access to real `ClientOpGuard`s from outside `crate::node`.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::*;
 
-        // 1. Answered, state present → broadcast it.
-        let found = classify_drain_read(Ok(ContractHandlerEvent::GetResponse {
-            key: None,
-            response: Ok(StoreResponse {
-                state: Some(WrappedState::new(vec![1, 2, 3])),
-                contract: None,
-            }),
-        }));
-        match found {
-            DrainStateRead::Found(state) => assert_eq!(state.as_ref(), &[1, 2, 3]),
-            other @ DrainStateRead::NotHeld | other @ DrainStateRead::Unavailable => {
-                panic!("state present must map to Found, got {other:?}")
-            }
-        }
+    pub(crate) fn deadlines() -> Arc<ClientOpDeadlines> {
+        Arc::new(ClientOpDeadlines::default())
+    }
 
-        // 2. Answered, no state → we genuinely do not hold it. Final, silent.
-        assert!(
-            matches!(
-                classify_drain_read(Ok(ContractHandlerEvent::GetResponse {
-                    key: None,
-                    response: Ok(StoreResponse {
-                        state: None,
-                        contract: None,
-                    }),
-                })),
-                DrainStateRead::NotHeld
-            ),
-            "an answered read with no state means we do not hold the contract; not \
-             broadcasting is correct and there is nothing to warn about"
-        );
+    pub(crate) const TAIL_WINDOW: std::time::Duration = CLIENT_OP_TAIL_DRAIN_WINDOW;
 
-        // 3. Answered with an executor error → we learned NOTHING about whether
-        //    we hold it, so this must NOT be NotHeld.
-        assert!(
-            matches!(
-                classify_drain_read(Ok(ContractHandlerEvent::GetResponse {
-                    key: None,
-                    response: Err(crate::contract::ExecutorError::other(anyhow::anyhow!(
-                        "executor failure"
-                    ))),
-                })),
-                DrainStateRead::Unavailable
-            ),
-            "an executor error tells us nothing about whether we hold the contract, so \
-             it must be Unavailable — treating it as NotHeld silently drops a committed \
-             write's announcement"
-        );
-
-        // 4. Transport failure (timeout, closed channel, dead handler).
-        assert!(
-            matches!(
-                classify_drain_read(Err(ContractError::NoEvHandlerResponse)),
-                DrainStateRead::Unavailable
-            ),
-            "a failed round trip must be Unavailable, never NotHeld — this is the \
-             timeout case the bounded read exists to produce"
-        );
+    pub(crate) fn admit_test_client_op(deadlines: &Arc<ClientOpDeadlines>) -> ClientOpGuard {
+        ClientOpGuard::new(Arc::new(AtomicUsize::new(0)), deadlines.clone())
     }
 }

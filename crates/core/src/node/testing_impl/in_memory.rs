@@ -529,8 +529,17 @@ async fn append_contracts(
                 // The returned announcement is dropped because the node has no ring
                 // connections yet at startup (the exchange runs later, on
                 // connection-established).
+                //
+                // An advertising seed also registers local hosting interest, as
+                // production host formation does (`complete_host_formation`
+                // announces AND calls `register_local_hosting`). Without it the
+                // seeded host advertises a copy its own GET relay then treats as
+                // stale cache and refuses to serve, which no production host
+                // does (#5846: a directed fetch from such a seed was forwarded
+                // away instead of answered).
                 if advertise_seeded_hosts {
                     let _ = op_manager.neighbor_hosting.on_contract_hosted(&key);
+                    let _ = op_manager.interest_manager.register_local_hosting(&key);
                 }
             }
             super::SeedMode::Demandless => {

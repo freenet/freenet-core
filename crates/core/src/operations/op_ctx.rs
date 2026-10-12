@@ -480,6 +480,76 @@ pub(crate) trait RetryDriver {
     fn stream_progress(&self) -> Option<crate::operations::stream_progress::StreamProgress> {
         None
     }
+
+    /// The recorder that labels this driver's non-success attempts for the
+    /// router's failure-probability model (#5657).
+    ///
+    /// Defaults to `None` (record nothing). When `Some`, [`drive_retry_loop`]
+    /// reports every attempt that ended without a terminal reply to it,
+    /// attributed to the peer the loopback relay ACTUALLY forwarded the attempt
+    /// to (see [`crate::operations::route_attempt::AttemptHopRegistry`]):
+    /// a timeout or a dropped connection as a failure, and a
+    /// [`AttemptOutcome::Retry`] reply as a `NotFound`.
+    fn attempt_recorder(
+        &mut self,
+    ) -> Option<&mut crate::operations::route_attempt::RouteAttemptRecorder> {
+        None
+    }
+
+    /// Called when an attempt classified [`AttemptOutcome::Terminal`], with the
+    /// peer that attempt was actually forwarded to (`None` when the loopback
+    /// relay did not forward it, e.g. the reply was produced locally). Lets the
+    /// driver attribute its terminal success event to the real hop rather than
+    /// its own `current_target` guess. Default: ignore.
+    fn on_terminal_hop(&mut self, _hop: Option<crate::ring::PeerKeyLocation>) {}
+
+    /// Called when an attempt was answered [`AttemptOutcome::Retry`] (a
+    /// `NotFound`), with the peer that attempt was actually forwarded to
+    /// (`None` when none was recorded), before `advance()`. A driver may avoid
+    /// that peer as a later attempt's FIRST hop (see
+    /// [`Self::first_hop_exclusions`]), and nowhere else: a relay also answers
+    /// `NotFound` when its own downstream send failed or its connection
+    /// dropped, so the peer may still be the only route to a host. Timeouts
+    /// and disconnects are not reported here. Default: ignore.
+    fn on_not_found_hop(&mut self, _hop: Option<&crate::ring::PeerKeyLocation>) {}
+
+    /// Called once per attempt, before its outcome is handled, with the peer
+    /// the attempt was actually forwarded to (`None` when none was recorded).
+    /// Not called for an attempt that ends in a local infra retry (a callback
+    /// dropped on this node, retried on the same peer without spending the
+    /// retry budget): no verdict came from the peer. Default: ignore.
+    fn on_attempt_hop(&mut self, _hop: Option<&crate::ring::PeerKeyLocation>) {}
+
+    /// Peers the originator-loopback relay should not pick as this attempt's
+    /// first hop, handed to it through
+    /// [`crate::operations::route_attempt::AttemptHopRegistry`] and applied to
+    /// that one pick only. They are never put in the request's visited bloom,
+    /// so relays further along may still route through them. Default: none.
+    fn first_hop_exclusions(&self) -> Vec<std::net::SocketAddr> {
+        Vec::new()
+    }
+
+    /// The peer the originator-loopback relay should use as this attempt's
+    /// first hop instead of its own ranking, handed over the same way as
+    /// [`Self::first_hop_exclusions`]. The relay honours it only while that
+    /// peer is still one of its routing candidates, and otherwise picks as
+    /// usual. Default: none.
+    fn first_hop_pin(&self) -> Option<std::net::SocketAddr> {
+        None
+    }
+}
+
+/// Report one non-terminal attempt outcome to the driver's recorder, if any.
+/// The ONLY place [`drive_retry_loop`] labels an attempt; every non-terminal
+/// resolution arm calls it.
+fn record_attempt_failure<D: RetryDriver>(
+    driver: &mut D,
+    hop: Option<crate::ring::PeerKeyLocation>,
+    failure: crate::operations::route_attempt::AttemptFailure,
+) {
+    if let Some(recorder) = driver.attempt_recorder() {
+        recorder.record_attempt(hop.as_ref(), failure, true);
+    }
 }
 
 /// Maximum cheap, fast retries of a `NotificationError` (local callback
@@ -599,6 +669,12 @@ async fn await_streaming_attempt(
     use crate::operations::STREAMING_ATTEMPT_TIMEOUT_CAP;
     use crate::operations::stream_progress::STREAM_OP_INACTIVITY_TIMEOUT;
 
+    // A streaming attempt is live by its own rule (no
+    // `STREAM_OP_INACTIVITY_TIMEOUT` of silence) from the moment it starts;
+    // keep a client op's shutdown drain waiting for it on the same terms
+    // (#5838). Each fragment and the final reply note again below.
+    crate::node::note_client_op_progress(STREAM_OP_INACTIVITY_TIMEOUT);
+
     let handle = progress.handle();
     // NOTE: deliberately NOT resetting the progress clock here, though
     // `StreamProgress` is built once per OPERATION and cloned per attempt so a
@@ -627,11 +703,28 @@ async fn await_streaming_attempt(
 
         tokio::select! {
             // Arm 1: terminal reply (unchanged semantics).
-            reply = &mut round_trip => return Ok(reply),
+            reply = &mut round_trip => {
+                // The transfer ended with a reply: give the op's tail
+                // (finalize, deliver the result, or the retry a rejection
+                // leads to; the reply kind is not distinguished) its drain
+                // window, replacing the streaming window (#5838).
+                crate::node::note_client_op_phase_end();
+                return Ok(reply);
+            }
             // Arm 3: hard ceiling.
-            _ = &mut ceiling => return Err(TimeoutCause::StreamCeiling),
+            _ = &mut ceiling => {
+                // The phase is over; do not leave its streaming window on
+                // the op (#5838).
+                crate::node::note_client_op_phase_end();
+                return Err(TimeoutCause::StreamCeiling);
+            }
             // Arm 2: a fragment landed — reset the inactivity window.
-            _ = handle.notified() => continue,
+            _ = handle.notified() => {
+                // A fragment moved: keep a client op's shutdown drain
+                // waiting for it (#5838).
+                crate::node::note_client_op_progress(STREAM_OP_INACTIVITY_TIMEOUT);
+                continue;
+            }
             // Arm 2: inactivity window elapsed with no Notify ping. Before
             // declaring a stall, re-read the atomic: a fragment that landed in
             // the Notify race window (notify_one permit consumed elsewhere, or
@@ -644,8 +737,13 @@ async fn await_streaming_attempt(
                 // Only a confirmed stall returns `TimeoutCause::StreamStall`.
                 let elapsed = handle.since_last();
                 if elapsed < STREAM_OP_INACTIVITY_TIMEOUT {
+                    // A fragment raced this arm and is recognised here
+                    // rather than in the notified arm: refresh the client
+                    // op's drain deadline the same way (#5838).
+                    crate::node::note_client_op_progress(STREAM_OP_INACTIVITY_TIMEOUT);
                     continue;
                 }
+                crate::node::note_client_op_phase_end();
                 return Err(TimeoutCause::StreamStall);
             }
         }
@@ -686,6 +784,18 @@ pub(crate) async fn drive_retry_loop<D: RetryDriver>(
 
         let request = driver.build_request(attempt_tx);
 
+        // Route attribution slot for this attempt (#5657). Registered BEFORE
+        // the send (Initialize-Before-Send): the originator-loopback relay that
+        // picks the real first hop may run before `send_and_await` returns.
+        // Dropped at the end of this iteration on every path, so a `continue`
+        // or `return` cannot leak it.
+        let hop_slot = op_manager.attempt_hop_registry().register_excluding(
+            attempt_tx,
+            driver.first_hop_exclusions(),
+            driver.first_hop_pin(),
+        );
+        let attempt_started = tokio::time::Instant::now();
+
         let attempt_timeout = driver.attempt_timeout();
         let mut ctx = op_manager.op_ctx(attempt_tx);
 
@@ -720,6 +830,22 @@ pub(crate) async fn drive_retry_loop<D: RetryDriver>(
             }
         };
 
+        // The hop this attempt was forwarded to and when, read NOW (#5657): a
+        // loopback `record_hop` landing during the release await below would
+        // otherwise be blamed for a timeout that fired before the relay
+        // forwarded the request.
+        let attempt_resolved = tokio::time::Instant::now();
+        let hop_record = hop_slot.hop_record();
+        let attempt_hop = hop_record.as_ref().map(|(hop, _)| hop.clone());
+        // A local callback drop within the infra-retry budget is retried on
+        // the same peer below. It got no verdict from that peer, so the driver
+        // does not count it as an attempt on it (#5660).
+        let infra_retry = matches!(round_trip, Ok(Err(OpError::NotificationError)))
+            && infra_retries < MAX_INFRA_RETRIES;
+        if !infra_retry {
+            driver.on_attempt_hop(attempt_hop.as_ref());
+        }
+
         // Release the per-attempt pending_op_results slot regardless
         // of outcome. Without this, slots are only reclaimed by the
         // 60s periodic sweep.
@@ -735,7 +861,7 @@ pub(crate) async fn drive_retry_loop<D: RetryDriver>(
             // for the budget analysis. Capped to avoid burning CPU in
             // a true shutdown (where the receiver is genuinely
             // dropped and will keep failing).
-            Ok(Err(OpError::NotificationError)) if infra_retries < MAX_INFRA_RETRIES => {
+            Ok(Err(OpError::NotificationError)) if infra_retry => {
                 infra_retries += 1;
                 tracing::debug!(
                     tx = %client_tx,
@@ -769,6 +895,22 @@ pub(crate) async fn drive_retry_loop<D: RetryDriver>(
                     error = %err,
                     "{op_label}: send_and_await failed; advancing"
                 );
+                // Only a dropped connection TO THE ATTEMPTED HOP is attributable
+                // to it. A `NotificationError` that outlived the infra-retry
+                // budget is a local callback drop, and a disconnect of some
+                // other peer is not this hop's doing.
+                let hop = attempt_hop;
+                let blame = match (&err, hop.as_ref().and_then(|h| h.socket_addr())) {
+                    (OpError::PeerDisconnected { peer }, Some(hop_addr)) => *peer == hop_addr,
+                    _ => false,
+                };
+                if blame {
+                    record_attempt_failure(
+                        driver,
+                        hop,
+                        crate::operations::route_attempt::AttemptFailure::SendFailure,
+                    );
+                }
                 match driver.advance() {
                     AdvanceOutcome::Next => continue,
                     AdvanceOutcome::Exhausted => {
@@ -790,6 +932,24 @@ pub(crate) async fn drive_retry_loop<D: RetryDriver>(
                     timeout_secs = cause.budget(attempt_timeout).as_secs(),
                     "{op_label}: attempt timed out; advancing"
                 );
+                // Blame the hop only if the loopback relay's local dispatch
+                // returned with a meaningful share of the attempt still to
+                // run: a hop dispatched near the deadline, or whose dispatch
+                // had not returned, did not stall it (#5657).
+                let blamed = hop_record
+                    .filter(|(_, dispatched_at)| {
+                        crate::operations::route_attempt::hop_had_budget_share(
+                            attempt_started,
+                            *dispatched_at,
+                            attempt_resolved,
+                        )
+                    })
+                    .map(|(hop, _)| hop);
+                record_attempt_failure(
+                    driver,
+                    blamed,
+                    crate::operations::route_attempt::AttemptFailure::Timeout,
+                );
                 match driver.advance() {
                     AdvanceOutcome::Next => continue,
                     AdvanceOutcome::Exhausted => {
@@ -805,6 +965,7 @@ pub(crate) async fn drive_retry_loop<D: RetryDriver>(
 
         match driver.classify(reply) {
             AttemptOutcome::Terminal(value) => {
+                driver.on_terminal_hop(attempt_hop);
                 return RetryLoopOutcome::Done(value);
             }
             AttemptOutcome::Retry => {
@@ -814,6 +975,15 @@ pub(crate) async fn drive_retry_loop<D: RetryDriver>(
                     attempt = attempt_count,
                     outcome = "retry",
                     "{op_label}: peer indicated retry; advancing"
+                );
+                // `Retry` means the peer answered but could not serve the
+                // contract: GET's `NotFound` is its only producer, and PUT
+                // never returns it.
+                driver.on_not_found_hop(attempt_hop.as_ref());
+                record_attempt_failure(
+                    driver,
+                    attempt_hop,
+                    crate::operations::route_attempt::AttemptFailure::NotFound,
                 );
                 match driver.advance() {
                     AdvanceOutcome::Next => continue,
@@ -861,6 +1031,33 @@ mod tests {
     use crate::node::{EventLoopNotificationsReceiver, event_loop_notification_channel};
     use crate::operations::connect::ConnectMsg;
     use tokio::time::{Duration, timeout};
+
+    /// #5657 L2: the attempt's hop is read BEFORE the pending-slot release
+    /// await, and never re-read after it. A loopback `record_hop` landing
+    /// during that await must not be blamed for a timeout that fired before
+    /// the relay forwarded the request.
+    #[test]
+    fn attempt_hop_is_read_before_the_release_await() {
+        use crate::operations::route_attempt::driver_test_support::production_fn_body;
+        let body = production_fn_body(
+            include_str!("op_ctx.rs"),
+            "pub(crate) async fn drive_retry_loop<D: RetryDriver>(",
+        );
+        let read = body
+            .find("let hop_record = hop_slot.hop_record();")
+            .expect("the hop must be read once, into hop_record");
+        let release = body
+            .find("op_manager.release_pending_op_slot(attempt_tx).await;")
+            .expect("the retry loop releases the pending slot");
+        assert!(
+            read < release,
+            "the hop must be read before the release await"
+        );
+        assert!(
+            !body[release..].contains("hop_slot.hop"),
+            "no hop read may follow the release await"
+        );
+    }
 
     /// Behavioural pin on `drive_retry_loop`'s `AttemptOutcome::Terminal`
     /// arm: it MUST return `RetryLoopOutcome::Done(value)` synchronously,
@@ -1732,9 +1929,6 @@ mod tests {
             .expect("executor task should complete without panicking");
     }
 
-    /// `RetryDriver::attempt_timeout`'s default value is the unscaled
-    /// [`OPERATION_TTL`] that non-streaming and pre-#4001 op drivers
-    /// (GET / SUBSCRIBE) rely on. Drivers that need a different
     /// Source-grep pin for the fast infra-retry path in
     /// `drive_retry_loop`. A `NotificationError` (local callback
     /// dropped without a reply) is a transient infra hiccup, NOT a
@@ -1753,13 +1947,28 @@ mod tests {
     #[test]
     fn drive_retry_loop_has_fast_infra_retry_path() {
         let src = include_str!("op_ctx.rs");
-        let loop_pos = src
-            .find("pub(crate) async fn drive_retry_loop")
-            .expect("drive_retry_loop must exist");
-        let body = &src[loop_pos..];
+        // Every assertion reads the production body only, so no assertion's
+        // own text can satisfy it — and with the `//` comments stripped, so
+        // production PROSE cannot either. Without the strip, `MAX_INFRA_RETRIES`
+        // below is satisfied by the arm's own explanatory comment, which
+        // survives deleting the code that reads the cap. (Line comments only:
+        // this body has no block comment, and no string literal in it contains
+        // `//`, so keep needles out of string literals.)
+        let raw = crate::operations::route_attempt::driver_test_support::production_fn_body(
+            src,
+            "pub(crate) async fn drive_retry_loop",
+        );
+        let body: String = raw
+            .lines()
+            .map(|line| line.split_once("//").map_or(line, |(code, _)| code))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let body = body.as_str();
         assert!(
             body.contains("MAX_INFRA_RETRIES"),
-            "drive_retry_loop must reference the MAX_INFRA_RETRIES cap"
+            "drive_retry_loop's CODE must reference the MAX_INFRA_RETRIES cap \
+             (comments are stripped before this check, so naming it only in \
+             prose does not count)"
         );
         assert!(
             body.contains("Ok(Err(OpError::NotificationError))"),
@@ -1768,9 +1977,10 @@ mod tests {
              real wire errors and call advance()"
         );
         assert!(
-            body.contains("if infra_retries < MAX_INFRA_RETRIES"),
-            "the NotificationError arm must be guarded by \
-             `if infra_retries < MAX_INFRA_RETRIES` so a true shutdown \
+            body.contains("&& infra_retries < MAX_INFRA_RETRIES;")
+                && body.contains("Ok(Err(OpError::NotificationError)) if infra_retry =>"),
+            "the NotificationError arm must be guarded by `infra_retry`, which \
+             requires `infra_retries < MAX_INFRA_RETRIES`, so a true shutdown \
              doesn't loop forever burning CPU"
         );
         // The infra-retry arm must `continue` (re-attempt same peer)
@@ -1779,7 +1989,7 @@ mod tests {
         // `match` (the regular wire_error arm) and assert it doesn't
         // contain `driver.advance()`.
         let infra_arm_start = body
-            .find("Ok(Err(OpError::NotificationError))")
+            .find("Ok(Err(OpError::NotificationError)) if infra_retry =>")
             .expect("matched above");
         let next_arm_start = body[infra_arm_start..]
             .find("Ok(Err(err)) => {")
@@ -1798,6 +2008,9 @@ mod tests {
         );
     }
 
+    /// `RetryDriver::attempt_timeout`'s default value is the unscaled
+    /// [`OPERATION_TTL`] that non-streaming and pre-#4001 op drivers
+    /// (GET / SUBSCRIBE) rely on. Drivers that need a different
     /// per-attempt timeout — currently only PUT, for streaming-payload
     /// scaling per #4001 — must override explicitly. Pin the default so
     /// a refactor that changes the trait can't silently shift behaviour
@@ -2174,6 +2387,110 @@ mod tests {
         );
         assert_eq!(result.unwrap().unwrap().id(), &tx);
         producer.await.expect("producer task panicked");
+    }
+
+    /// #5838: a streaming attempt run by a client-op driver must keep that
+    /// op's shutdown-drain deadline a progress window ahead of its start,
+    /// of each fragment, and of its final reply, or a healthy transfer
+    /// older than `OPERATION_TTL` is abandoned at SIGTERM. Drives the real
+    /// `await_streaming_attempt` inside the real `with_client_op_drain`
+    /// scope, so a broken scope (whose note is a silent no-op) fails here.
+    #[tokio::test(start_paused = true)]
+    async fn streaming_attempt_notes_client_op_progress() {
+        use crate::node::op_state_manager_test_support::{
+            TAIL_WINDOW, admit_test_client_op, deadlines,
+        };
+        const PROGRESS_WINDOW: Duration = STREAM_OP_INACTIVITY_TIMEOUT;
+
+        let (mut ctx, tx, handle, progress, mut rx) = streaming_attempt_fixture();
+        let registry = deadlines();
+        let guard = admit_test_client_op(&registry);
+        // An old op: its admission deadline is long past.
+        tokio::time::advance(Duration::from_secs(100)).await;
+        let t0 = tokio::time::Instant::now();
+        assert!(registry.latest_deadline().unwrap() < t0);
+
+        let samples = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let observed = samples.clone();
+        let observer_registry = registry.clone();
+        let peer = tokio::spawn(async move {
+            let (reply_sender, _outbound, _target) =
+                rx.recv().await.expect("outbound msg should be delivered");
+            let sample = |at| {
+                observed
+                    .lock()
+                    .push((at, observer_registry.latest_deadline().unwrap()));
+            };
+            tokio::time::sleep_until(t0 + Duration::from_millis(500)).await;
+            sample(tokio::time::Instant::now()); // before any fragment
+            tokio::time::sleep_until(t0 + Duration::from_secs(5)).await;
+            handle.record(); // one fragment
+            tokio::time::sleep_until(t0 + Duration::from_millis(5100)).await;
+            sample(tokio::time::Instant::now());
+            // A long quiet phase after the last fragment (still inside the
+            // attempt's own inactivity window). The reply's tail window ends
+            // before the fragment's would, so the exact-deadline assertion
+            // below tells replacing the window from keeping the longer one.
+            tokio::time::sleep_until(t0 + Duration::from_secs(100)).await;
+            reply_sender
+                .try_send(WaiterReply::Reply(dummy_reply_with_tx(tx)))
+                .expect("reply channel accepts the reply");
+        });
+        let result = crate::node::with_client_op_drain(
+            guard.drain_handle(),
+            await_streaming_attempt(&mut ctx, dummy_reply_with_tx(tx), &progress),
+        )
+        .await;
+        let replied = tokio::time::Instant::now();
+        assert!(result.is_ok());
+        peer.await.expect("peer task panicked");
+
+        let samples = samples.lock().clone();
+        assert!(
+            samples[0].1 >= t0 + PROGRESS_WINDOW,
+            "starting the attempt must extend the drain deadline"
+        );
+        assert!(
+            samples[1].1 >= t0 + Duration::from_secs(5) + PROGRESS_WINDOW,
+            "a fragment must extend the drain deadline"
+        );
+        assert!(
+            registry.latest_deadline().unwrap() == replied + TAIL_WINDOW,
+            "the final reply must give the op's tail exactly its window"
+        );
+    }
+
+    /// #5838: a streaming attempt that ends in a stall must not leave its
+    /// 240 s streaming window on the client op: the phase end replaces it
+    /// with the tail window, as a reply does.
+    #[tokio::test(start_paused = true)]
+    async fn stalled_streaming_attempt_ends_the_drain_phase() {
+        use crate::node::op_state_manager_test_support::{
+            TAIL_WINDOW, admit_test_client_op, deadlines,
+        };
+
+        let (mut ctx, tx, _handle, progress, mut rx) = streaming_attempt_fixture();
+        let registry = deadlines();
+        let guard = admit_test_client_op(&registry);
+        // The peer accepts the request and then never sends anything.
+        let peer = tokio::spawn(async move {
+            let delivered = rx.recv().await.expect("outbound msg should be delivered");
+            tokio::time::sleep(Duration::from_secs(3600)).await;
+            drop(delivered);
+        });
+        let result = crate::node::with_client_op_drain(
+            guard.drain_handle(),
+            await_streaming_attempt(&mut ctx, dummy_reply_with_tx(tx), &progress),
+        )
+        .await;
+        let ended = tokio::time::Instant::now();
+        assert!(matches!(result, Err(TimeoutCause::StreamStall)));
+        assert_eq!(
+            registry.latest_deadline(),
+            Some(ended + TAIL_WINDOW),
+            "a stalled attempt must end its drain phase with the tail window"
+        );
+        peer.abort();
     }
 
     /// Progress flows for 40 s then stops. The inactivity timeout MUST fire
@@ -2666,9 +2983,11 @@ mod tests {
             .find("_ = &mut ceiling =>")
             .expect("the hard-ceiling select arm must exist");
         let ceiling_arm = &body[ceiling_arm_start..];
+        // The arm runs up to the next select arm (it also ends the
+        // client-op drain phase, #5838, so it is no longer one line).
         let ceiling_arm_end = ceiling_arm
-            .find('\n')
-            .expect("the ceiling arm must be a single line");
+            .find("_ = handle.notified()")
+            .expect("the fragment arm must follow the ceiling arm");
         let ceiling_arm = &ceiling_arm[..ceiling_arm_end];
         assert!(
             ceiling_arm.contains("Err(TimeoutCause::StreamCeiling)"),
@@ -2686,6 +3005,27 @@ mod tests {
         assert!(
             !stall_arm.contains("StreamCeiling"),
             "the stall arm must not report a ceiling"
+        );
+
+        // #5838: every exit ends the client-op drain phase, and a fragment
+        // recognised by the fallback refreshes the drain deadline. The
+        // reply and stall exits also have behavioural tests; the ceiling
+        // exit and the fallback note are pinned here.
+        assert!(
+            ceiling_arm.contains("note_client_op_phase_end()"),
+            "the ceiling arm must end the client-op drain phase"
+        );
+        let fallback = stall_arm
+            .split_once("if elapsed < STREAM_OP_INACTIVITY_TIMEOUT {")
+            .expect("the stall arm must keep its since_last fallback")
+            .1;
+        let fallback = fallback
+            .split_once("continue;")
+            .expect("the fallback must continue")
+            .0;
+        assert!(
+            fallback.contains("note_client_op_progress(STREAM_OP_INACTIVITY_TIMEOUT)"),
+            "a fragment recognised by the fallback must refresh the drain deadline"
         );
 
         assert!(

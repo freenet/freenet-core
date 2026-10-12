@@ -115,36 +115,83 @@ pub struct ConfigArgs {
 
     /// Budget in bytes for hosted contract state. Once it is exceeded,
     /// contracts are evicted (least valuable first) and their on-disk state is
-    /// reclaimed. This counts contract state only; WASM code blobs and database
-    /// overhead are extra. Default: 1 GiB.
+    /// reclaimed. This counts contract state only, which is kept on disk (only
+    /// memory-bounded caches of it are held in RAM); WASM code blobs and
+    /// database overhead are extra. Default: one eighth of the memory available
+    /// to the node (system RAM, or the cgroup limit if lower), clamped to
+    /// 128 MiB - 1 GiB.
+    ///
+    /// Set it higher to contribute more disk to the network, but keep it a
+    /// few GiB BELOW the disk budget. The disk budget is the smaller of
+    /// `--hosting-disk-pct` of the space available to Freenet (Freenet's own
+    /// usage plus free space) and `--max-hosting-disk` (default 32 GiB), and it
+    /// counts WASM code and the compile cache (up to about 512 MiB) as well as
+    /// state, so the headroom is for those. If this value is not at least that
+    /// far below the disk budget, the node can stop accepting new contracts
+    /// and state growth instead of evicting to make room. For example, with
+    /// 40 GiB available and default settings the disk budget is
+    /// min(0.5 x 40 GiB, 32 GiB) = 20 GiB, so set this to about 17 GiB; on a
+    /// larger disk the 32 GiB cap binds unless `--max-hosting-disk` is raised
+    /// too. Allow more headroom if the node hosts many contracts with distinct
+    /// code, since WASM grows with those. The number of contracts hosted is
+    /// limited separately by available memory, so raising this does not make a
+    /// node take on more contracts than its memory can hold.
+    // Internal: the explicit value is passed to `HostingManager` unclamped;
+    // only the DEFAULT is RAM-scaled. (One exception: a config.toml value of
+    // exactly 1 GiB is the legacy flat-default sentinel and re-derives from RAM,
+    // see `ConfigArgs::build`; a CLI or env value of 1 GiB still wins.) The
+    // resident-overhead (contract-count) budget derives from
+    // `budget_for_ram(total_ram)`, not from this value, so an override cannot
+    // move it. Pinned by `explicit_state_budget_above_ram_clamp_survives_recompute`.
+    //
+    // The "keep this below the disk budget" advice exists because eviction
+    // compares STATE bytes against `min(this, disk_budget)` while the admission
+    // gates (`admit_state_write` / `admit_state_update` / `admit_wasm_write`)
+    // refuse against `disk_budget` using state + WASM + compile cache. Whenever
+    // this value is within (WASM + compile cache) of disk_budget, or above it,
+    // there is a band — state in (disk_budget - WASM - cache, min(this,
+    // disk_budget)] — where writes are refused and eviction never fires. It is phrased against the DISK BUDGET, not the
+    // `--max-hosting-disk` flag, because `disk_budget = min(pct * (freenet_used
+    // + free), cap)`: an operator giving "half the disk" at the default pct hits
+    // the band via the pct term no matter how high the cap is set.
+    // That mismatch is a code gap (#5652); until it is fixed the help text must
+    // steer operators away from it.
     #[arg(long, env = "MAX_HOSTING_STORAGE")]
     pub max_hosting_storage: Option<u64>,
 
-    /// Fraction (0.0 to 1.0) of the disk space available to Freenet (`used +
-    /// free` on the data-dir mount) used to size the disk budget. Hosting
-    /// eviction uses whichever budget is smaller, memory or disk. Default: 0.5.
+    /// Fraction (0.0 to 1.0) of the disk space available to Freenet (Freenet's
+    /// own usage plus the free space on the data-dir mount) used to size the
+    /// disk budget. The disk budget bounds contract state, WASM code and the
+    /// compile cache together (database overhead is extra), and also caps
+    /// `--max-hosting-storage`, which should be kept a few GiB below it.
+    /// Default: 0.5.
     // Internal (#4683): `effective_budget = min(ram_budget, disk_budget)`.
     #[arg(long, env = "HOSTING_DISK_PCT")]
     pub hosting_disk_pct: Option<f64>,
 
     /// Upper limit in bytes on the disk budget, so a host with a very large
-    /// data disk does not get an unbounded budget. This is the disk equivalent
-    /// of `--max-hosting-storage`. Default: 32 GiB.
+    /// data disk does not get an unbounded budget. It bounds contract state,
+    /// WASM code and the compile cache together (database overhead is extra).
+    /// To contribute more than about 32 GiB of state, raise this so the disk
+    /// budget stays a few GiB above `--max-hosting-storage`. Raising it has no
+    /// effect if `--hosting-disk-pct` of the available disk space is already the
+    /// smaller limit; raise that instead, leaving room for database overhead
+    /// and anything else on the disk. Default: 32 GiB.
     // Internal: #4683.
     #[arg(long, env = "MAX_HOSTING_DISK")]
     pub max_hosting_disk: Option<u64>,
 
-    /// Fraction (0.0 to 1.0) of spare host memory (this process's resident size
-    /// plus the memory the system reports as available) that the
-    /// resident-overhead budget may claim on top of what it already uses. That
-    /// budget limits how far an otherwise idle host grows the number of
-    /// contracts it hosts, so Freenet does not dominate the process list on a
-    /// machine with plenty of free memory. It is a separate axis from
-    /// `--max-hosting-storage`, which bounds state bytes. Default: 0.125.
-    // Internal (#5333): applies to the resident-overhead (count-derived)
-    // eviction budget, and never shrinks it below the host's already-declared
-    // static caches. The 1/8 default matches qBittorrent's disk-cache "auto"
-    // default and this codebase's own pre-existing `/8` convention.
+    /// Fraction (0.0 to 1.0) of this node's memory limit that hosted contracts
+    /// may hold in RAM (mainly the summaries neighbours send so the node can
+    /// keep each hosted contract up to date). The limit is physical RAM, or a
+    /// smaller cgroup / systemd `MemoryMax` limit when one applies; the budget
+    /// is never below 64 MiB. Past it, the node stops hosting its
+    /// least-demanded contracts. A separate axis from `--max-hosting-storage`,
+    /// which bounds state bytes on disk. Default: 0.125.
+    // Internal (#5647): before #5647 this was a share of LIVE spare memory added
+    // to current RSS, applied to a count-based estimate; a persisted
+    // non-default value now means a share of the whole limit. The 1/8 default
+    // matches this codebase's other RAM-scaled budgets.
     #[arg(long, env = "HOSTING_MEM_SHARE")]
     pub hosting_mem_share: Option<f64>,
 
@@ -1735,10 +1782,9 @@ pub struct Config {
     /// operator override survives a flag-less restart.
     #[serde(default = "default_max_hosting_disk", rename = "max-hosting-disk")]
     pub max_hosting_disk: u64,
-    /// Fraction (0.0-1.0) of LIVE host-wide surplus memory the resident-
-    /// overhead (count-derived) eviction budget may claim on top of its own
-    /// RSS (#5333). Default 0.125 (1/8). Persisted so an operator override
-    /// survives a flag-less restart.
+    /// Fraction (0.0-1.0) of the node's memory limit (cgroup-aware) that hosted
+    /// contracts may hold in RAM (#5647). Default 0.125 (1/8). Persisted so an
+    /// operator override survives a flag-less restart.
     #[serde(default = "default_hosting_mem_share", rename = "hosting-mem-share")]
     pub hosting_mem_share: f64,
     /// Per-user secret-storage quota in bytes for hosted mode (#4561, P5 of
@@ -1822,11 +1868,22 @@ pub struct Config {
     /// client-originated operations (PUT/UPDATE/GET/SUBSCRIBE) to
     /// finish before tearing down peer connections.
     ///
+    /// Each op is waited for only until its own drain deadline: 60 s
+    /// (`OPERATION_TTL`) after it was admitted, pushed out by streaming
+    /// activity to whatever that phase's own liveness rule allows (240 s
+    /// of silence for a streaming PUT attempt, a GET stream claim while it
+    /// is pending, about 6 s between a GET stream's fragments) and to 60 s after a
+    /// streaming phase ends. An op past that deadline is retrying,
+    /// stalled, or waiting on a peer that never answered, and is not
+    /// waited for (#5838). Client UPDATE and SUBSCRIBE ops have no
+    /// streaming phase and get the 60 s window only. Every wait is still
+    /// bounded by this setting.
+    ///
     /// Set to `0` to disable the drain entirely (legacy behaviour:
     /// disconnect immediately on SIGTERM). Default is 30s, which
     /// covers a typical `freenet-git` mirror push (~3 MiB pack split
     /// into 4 chunks) plus headroom. systemd's `TimeoutStopSec` is
-    /// set to 45s in this PR (30s drain + 15s peer-teardown
+    /// 45s in the generated unit (30s drain + 15s peer-teardown
     /// headroom) — raise both in lockstep if you raise this value;
     /// `TimeoutStopSec` is the hard ceiling at which systemd
     /// SIGKILLs the process.
@@ -1938,8 +1995,8 @@ fn default_max_hosting_disk() -> u64 {
     crate::ring::DEFAULT_MAX_HOSTING_DISK_BYTES
 }
 
-/// Default fraction of live host-wide surplus memory the resident-overhead
-/// eviction budget may claim (#5333): resolves to
+/// Default fraction of the node's memory limit that hosted contracts may hold
+/// in RAM (#5647): resolves to
 /// [`crate::ring::DEFAULT_RESIDENT_OVERHEAD_MEM_SHARE`] (0.125), the single
 /// source of truth shared with the sizing math.
 fn default_hosting_mem_share() -> f64 {
@@ -4663,6 +4720,53 @@ impl GlobalSimulationTime {
 std::thread_local! {
     static SIMULATION_TRANSPORT_OPT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static SIMULATION_IDLE_TIMEOUT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static SIMULATION_FORCE_NOOP_GATE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static SIMULATION_FORCED_NOOP_GATE_CONNECTIONS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Test-only: treat every remote as running a release at or above
+/// `UNTRACKED_ACK_NOOP_MIN_VERSION` (#5795), so the receive-side "do not ack
+/// a capable peer's NoOps" gate is ON even though simulated peers all report
+/// the current, pre-floor crate version.
+///
+/// Thread-local, like [`SimulationTransportOpt`], so concurrent tests do not
+/// interfere: it applies to connections CREATED on the calling thread while
+/// enabled (the decision is fixed in `PeerConnection::new`). Honoured only in
+/// `test` / `testing` builds; a release binary ignores it. For a whole-suite
+/// local run, `FREENET_TEST_FORCE_NOOP_GATE=1` enables it on every thread.
+pub struct SimulationForceNoopGate;
+
+impl SimulationForceNoopGate {
+    /// Force the gate on for connections created on this thread.
+    pub fn enable() {
+        SIMULATION_FORCE_NOOP_GATE.with(|f| f.set(true));
+    }
+
+    /// Stop forcing the gate on this thread.
+    pub fn disable() {
+        SIMULATION_FORCE_NOOP_GATE.with(|f| f.set(false));
+    }
+
+    /// Number of connections created on this thread with the gate forced on,
+    /// so a test can prove the override actually reached the transport.
+    pub fn forced_connection_count() -> u64 {
+        SIMULATION_FORCED_NOOP_GATE_CONNECTIONS.with(|c| c.get())
+    }
+
+    /// Record one connection created with the gate forced on.
+    #[cfg(any(test, feature = "testing"))]
+    pub(crate) fn record_forced_connection() {
+        SIMULATION_FORCED_NOOP_GATE_CONNECTIONS.with(|c| c.set(c.get() + 1));
+    }
+
+    /// Whether the gate is forced on for this thread.
+    pub fn is_enabled() -> bool {
+        static FROM_ENV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        SIMULATION_FORCE_NOOP_GATE.with(|f| f.get())
+            || *FROM_ENV.get_or_init(|| {
+                std::env::var("FREENET_TEST_FORCE_NOOP_GATE").is_ok_and(|v| v == "1")
+            })
+    }
 }
 
 /// Opt-in transport timer optimization for large-scale simulations.
@@ -4741,6 +4845,7 @@ std::thread_local! {
     /// rather than inferred from the total (#5510).
     static GLOBAL_DELTA_FAILURE_RESYNCS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static GLOBAL_DELTA_SENDS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static GLOBAL_DELTA_SEND_BYTES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     /// Fan-out legs skipped because the peer's cached summary already matched
     /// ours (the pre-existing mechanism, counted for #5147 diagnosis).
     static GLOBAL_FANOUT_SUMMARY_SKIPS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
@@ -4749,6 +4854,8 @@ std::thread_local! {
         const { std::cell::Cell::new(0) };
     /// Fan-out legs dropped because the target was the delivering peer (#5147).
     static GLOBAL_BROADCAST_SENDER_SKIPS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// Simulation fan-out legs held back by the per-pair spacing (#5842).
+    static GLOBAL_BROADCAST_LEGS_SPACED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     /// Inbound broadcast payloads that reached a terminal classification
     /// (#5147). Denominator for the duplicate-delivery ratio.
     static GLOBAL_BROADCAST_DELIVERIES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
@@ -4757,6 +4864,7 @@ std::thread_local! {
     static GLOBAL_REDUNDANT_BROADCAST_DELIVERIES: std::cell::Cell<u64> =
         const { std::cell::Cell::new(0) };
     static GLOBAL_FULL_STATE_SENDS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static GLOBAL_FULL_STATE_SEND_BYTES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static GLOBAL_PENDING_OP_INSERTS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static GLOBAL_PENDING_OP_REMOVES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static GLOBAL_PENDING_OP_HWM: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
@@ -4863,12 +4971,15 @@ impl GlobalTestMetrics {
         GLOBAL_RESYNC_REQUESTS.with(|c| c.set(0));
         GLOBAL_DELTA_FAILURE_RESYNCS.with(|c| c.set(0));
         GLOBAL_DELTA_SENDS.with(|c| c.set(0));
+        GLOBAL_DELTA_SEND_BYTES.with(|c| c.set(0));
         GLOBAL_FANOUT_SUMMARY_SKIPS.with(|c| c.set(0));
         GLOBAL_BROADCAST_TARGETS_SUPPRESSED.with(|c| c.set(0));
         GLOBAL_BROADCAST_SENDER_SKIPS.with(|c| c.set(0));
+        GLOBAL_BROADCAST_LEGS_SPACED.with(|c| c.set(0));
         GLOBAL_BROADCAST_DELIVERIES.with(|c| c.set(0));
         GLOBAL_REDUNDANT_BROADCAST_DELIVERIES.with(|c| c.set(0));
         GLOBAL_FULL_STATE_SENDS.with(|c| c.set(0));
+        GLOBAL_FULL_STATE_SEND_BYTES.with(|c| c.set(0));
         GLOBAL_PENDING_OP_INSERTS.with(|c| c.set(0));
         GLOBAL_PENDING_OP_SKIPS.with(|c| c.set(0));
         GLOBAL_PENDING_OP_REMOVES.with(|c| c.set(0));
@@ -5044,6 +5155,18 @@ impl GlobalTestMetrics {
         GLOBAL_BROADCAST_SENDER_SKIPS.with(|c| c.set(c.get() + 1));
     }
 
+    /// Records one simulation fan-out leg held back because its
+    /// `(contract, peer)` was sent to inside the spacing interval (#5842).
+    /// Counted by the check that holds it.
+    pub fn record_broadcast_leg_spaced() {
+        GLOBAL_BROADCAST_LEGS_SPACED.with(|c| c.set(c.get() + 1));
+    }
+
+    /// Fan-out legs held back by the per-pair spacing since reset.
+    pub fn broadcast_legs_spaced() -> u64 {
+        GLOBAL_BROADCAST_LEGS_SPACED.with(|c| c.get())
+    }
+
     /// Fan-out legs dropped because the target was the delivering peer.
     pub fn broadcast_sender_skips() -> u64 {
         GLOBAL_BROADCAST_SENDER_SKIPS.with(|c| c.get())
@@ -5087,10 +5210,11 @@ impl GlobalTestMetrics {
         GLOBAL_REDUNDANT_BROADCAST_DELIVERIES.with(|c| c.get())
     }
 
-    /// Records that a delta was sent in a state change broadcast.
-    /// Called from p2p_protoc.rs when sent_delta = true.
-    pub fn record_delta_send() {
+    /// Records that a delta of `payload_bytes` was sent in a state change
+    /// broadcast. Called from p2p_protoc.rs when sent_delta = true.
+    pub fn record_delta_send(payload_bytes: usize) {
         GLOBAL_DELTA_SENDS.with(|c| c.set(c.get() + 1));
+        GLOBAL_DELTA_SEND_BYTES.with(|c| c.set(c.get() + payload_bytes as u64));
     }
 
     /// Returns the total number of delta sends since last reset.
@@ -5098,15 +5222,26 @@ impl GlobalTestMetrics {
         GLOBAL_DELTA_SENDS.with(|c| c.get())
     }
 
-    /// Records that full state was sent in a state change broadcast.
-    /// Called from p2p_protoc.rs when sent_delta = false.
-    pub fn record_full_state_send() {
+    /// Payload bytes of every delta counted by [`Self::delta_sends`].
+    pub fn delta_send_bytes() -> u64 {
+        GLOBAL_DELTA_SEND_BYTES.with(|c| c.get())
+    }
+
+    /// Records that a full state of `payload_bytes` was sent in a state change
+    /// broadcast. Called from p2p_protoc.rs when sent_delta = false.
+    pub fn record_full_state_send(payload_bytes: usize) {
         GLOBAL_FULL_STATE_SENDS.with(|c| c.set(c.get() + 1));
+        GLOBAL_FULL_STATE_SEND_BYTES.with(|c| c.set(c.get() + payload_bytes as u64));
     }
 
     /// Returns the total number of full state sends since last reset.
     pub fn full_state_sends() -> u64 {
         GLOBAL_FULL_STATE_SENDS.with(|c| c.get())
+    }
+
+    /// Payload bytes of every full state counted by [`Self::full_state_sends`].
+    pub fn full_state_send_bytes() -> u64 {
+        GLOBAL_FULL_STATE_SEND_BYTES.with(|c| c.get())
     }
 
     pub fn record_pending_op_insert() {

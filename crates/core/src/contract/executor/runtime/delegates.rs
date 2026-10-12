@@ -283,11 +283,26 @@ impl Executor<Runtime> {
             DelegateRequest::UnregisterDelegate(key) => {
                 self.delegate_origin_ids.remove(&key);
 
-                // Remove delegate from all contract subscription entries
-                crate::wasm_runtime::DELEGATE_SUBSCRIPTIONS.retain(|_, subscribers| {
-                    subscribers.remove(&key);
-                    !subscribers.is_empty()
-                });
+                // Remove delegate from all contract subscription entries. Goes
+                // through the registry's own function so the reverse index used
+                // for the per-delegate cap is cleared too — a stale entry there
+                // would hold cap budget for a delegate that no longer exists,
+                // and nothing ages it out.
+                // Persisted rows go too, or the next boot would restore them.
+                crate::wasm_runtime::delegate_subscriptions::remove_delegate(
+                    &key,
+                    crate::wasm_runtime::delegate_subscriptions::Durability::Persist(
+                        self.state_store.inner(),
+                    ),
+                );
+                // ...and give back the local interest those subscriptions took
+                // (#5542). Dropping the subscription without this leaves
+                // `local_interests` permanently above zero for the contract, so
+                // `cleanup_contract_if_no_interest` never fires and the node
+                // holds demand nothing can retire. A pair that took no refcount
+                // — a subscribe answered from the local store — has no hold
+                // recorded, so this is a no-op for it.
+                crate::wasm_runtime::delegate_interest::release_delegate(&key);
 
                 // Clean up delegate creation tracking to prevent unbounded growth
                 self.runtime.inherited_origins.remove(&key);

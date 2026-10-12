@@ -5,10 +5,12 @@
 
 mod assets;
 mod cards;
+mod charts;
 mod contract_detail;
 mod estimator;
 mod favicon;
 mod peer_detail;
+mod routing;
 
 use axum::extract::Path;
 use axum::response::{Html, IntoResponse};
@@ -26,6 +28,7 @@ use cards::{
 use contract_detail::contract_detail_html;
 use favicon::{build_dashboard_title, build_favicon_data_uri};
 use peer_detail::peer_detail_html;
+use routing::routing_html;
 
 /// Freenet rabbit silhouette SVG path, derived from freenet_logo.svg.
 /// Used for the favicon with a solid color fill (no gradient) so the
@@ -105,6 +108,11 @@ pub(super) async fn peer_detail(Path(address): Path<String>) -> impl IntoRespons
     Html(peer_detail_html(&address))
 }
 
+/// Handler for `GET /routing` — the network-wide routing model page.
+pub(super) async fn routing() -> impl IntoResponse {
+    Html(routing_html())
+}
+
 /// Per-contract detail page (#5369). Accepts either the full `ContractKey`
 /// encoding or the `ContractInstanceId`, because the dashboard's own cards key
 /// on different ones and an operator pasting either should land somewhere.
@@ -113,8 +121,24 @@ pub(super) async fn contract_detail(Path(key): Path<String>) -> impl IntoRespons
 }
 
 fn homepage_html() -> String {
-    let snap = network_status::get_snapshot();
+    homepage_html_for(network_status::get_snapshot())
+}
 
+/// Renders the homepage from an explicit snapshot rather than reading the
+/// process-global `network_status` state directly. Split out so tests can
+/// pass a known snapshot (including `None`) instead of relying on nothing
+/// else in the same `cargo test` process having touched the global — see
+/// #5732. `network_status::init` overwrites its `OnceLock`'s contents in
+/// place on every call (it does not leak state from one initializer to the
+/// next), but it does stamp a fresh `started_at`, and `get_snapshot()`'s
+/// health computation treats `open_connections == 0 && elapsed_secs > 60`
+/// as `Trouble`. So if some other test (e.g. in `operations::connect` or
+/// `ring::connection_manager`) calls `network_status::init` and then more
+/// than 60 real seconds pass before a test reads `homepage_html()`'s global
+/// snapshot, the rendered title silently changes — an order/timing
+/// dependency `homepage_html()`'s old single-source-of-truth read could not
+/// be isolated from.
+fn homepage_html_for(snap: Option<network_status::NetworkStatusSnapshot>) -> String {
     let (version, uptime) = match &snap {
         Some(s) => (s.version.as_str(), format_duration(s.elapsed_secs)),
         None => ("?", "0s".to_string()),
@@ -204,9 +228,8 @@ mod tests {
     };
     use super::contract_detail::contract_detail_html_from;
     use super::estimator::{
-        RegKind, build_estimator_chart, build_estimator_chart_or_placeholder,
-        build_regression_chart, build_reliability_chart, build_renegade_accuracy_panel,
-        failure_chart_y_max, fmt_prediction_prob, fmt_prediction_speed, fmt_prediction_time,
+        ChartUnit, RegKind, build_accuracy_panel, build_estimator_chart,
+        build_estimator_chart_or_placeholder, build_regression_chart, failure_chart_y_max,
     };
     use super::favicon::{build_dashboard_title, build_favicon_data_uri};
     use super::peer_detail::peer_detail_html;
@@ -218,7 +241,6 @@ mod tests {
         FailureSnapshot, HealthLevel, NatStatsSnapshot, NetworkStatusSnapshot, OpStatsSnapshot,
         RingStatsSnapshot,
     };
-    use crate::router::AdjustmentMode;
     use crate::transport::metrics::TransportSnapshot;
     use std::net::SocketAddr;
 
@@ -236,9 +258,10 @@ mod tests {
             contracts: Vec::new(),
             op_stats: OpStatsSnapshot::default(),
             nat_stats: NatStatsSnapshot::default(),
-            gateway_only: false,
+            gateway_only_persisting: false,
             bytes_uploaded: 0,
             bytes_downloaded: 0,
+            bandwidth_history: Vec::new(),
             health: HealthLevel::Connecting,
             ring_stats: RingStatsSnapshot::default(),
             fair_queue: Default::default(),
@@ -263,10 +286,7 @@ mod tests {
     /// tested) makes the rule's edge cases explicit and guards against the JS
     /// drifting from the intended behaviour. It lives in the test module (not as
     /// production code) because the production decision is made in JS, not in the
-    /// server-side render — and keeping it inside the single `#[cfg(test)]`
-    /// boundary preserves the source-scrape pin invariant relied on by
-    /// `peer_detail_panel_calls_estimator_helper_for_all_three_components` (the
-    /// first `#[cfg(test)]` marker must be the production/test boundary).
+    /// server-side render.
     ///
     /// The mismatch is meaningful in the #3967 / #4289 scenario: a browser is
     /// still holding a cached homepage emitted by an old binary while a newer
@@ -577,7 +597,7 @@ mod tests {
         // Degraded
         let mut snap = base_snapshot();
         snap.health = HealthLevel::Degraded;
-        snap.gateway_only = true;
+        snap.gateway_only_persisting = true;
         snap.open_connections = 1;
         let html = build_status_card(&Some(snap));
         assert!(html.contains("health-degraded"), "degraded banner missing");
@@ -597,6 +617,20 @@ mod tests {
         assert!(html.contains("health-trouble"), "trouble banner missing");
     }
 
+    /// dashboard.js reopens only `main details[id]` after it swaps `<main>`,
+    /// so a `<details>` without an id snaps shut on every refresh.
+    pub(super) fn assert_every_details_has_an_id(html: &str) {
+        // The embedded dashboard.js mentions `<details>` in a comment.
+        let html = match (html.find("<script>"), html.rfind("</script>")) {
+            (Some(start), Some(end)) => format!("{}{}", &html[..start], &html[end..]),
+            _ => html.to_string(),
+        };
+        for (at, _) in html.match_indices("<details") {
+            let tag = &html[at..at + html[at..].find('>').unwrap()];
+            assert!(tag.contains(" id=\""), "{tag} has no id");
+        }
+    }
+
     #[test]
     fn failures_demoted_when_connected() {
         let mut snap = base_snapshot();
@@ -612,6 +646,7 @@ mod tests {
             html.contains("diagnostics-muted"),
             "failures should be demoted when connected"
         );
+        assert_every_details_has_an_id(&html);
         assert!(
             !html.contains(r#"class="diagnostics""#),
             "should not use prominent diagnostics style"
@@ -879,6 +914,150 @@ mod tests {
         );
     }
 
+    fn rate(age_secs: u64, up: f64, down: f64) -> crate::transport::bandwidth_history::RateSample {
+        crate::transport::bandwidth_history::RateSample {
+            age: std::time::Duration::from_secs(age_secs),
+            up_bytes_per_sec: up,
+            down_bytes_per_sec: down,
+        }
+    }
+
+    /// Fewer than two samples cannot draw a line, so the card says it is
+    /// measuring instead of showing an empty or one-point chart.
+    #[test]
+    fn transfer_card_says_measuring_until_two_samples() {
+        for history in [vec![], vec![rate(0, 1e3, 2e3)]] {
+            let mut snap = base_snapshot();
+            snap.bandwidth_history = history;
+            let html = build_transfer_card(&Some(snap));
+            assert!(html.contains("Measuring transfer rates"), "{html}");
+            assert!(!html.contains("bw-line-up"), "{html}");
+        }
+    }
+
+    /// The chart draws both directions at both widths, labels the latest
+    /// rates, and its tooltips report the sampled values.
+    #[test]
+    fn transfer_card_draws_bandwidth_chart() {
+        let mut snap = base_snapshot();
+        snap.bandwidth_history = vec![
+            rate(2, 1_000.0, 250_000.0),
+            rate(1, 3_000.0, 500_000.0),
+            rate(0, 2_000.0, 125_000.0),
+        ];
+        let html = build_transfer_card(&Some(snap));
+        assert_eq!(html.matches("class=\"bw-line-up\"").count(), 2, "{html}");
+        assert_eq!(html.matches("class=\"bw-line-down\"").count(), 2, "{html}");
+        assert!(html.contains("Upload <b>2 KB/s</b>"), "{html}");
+        assert!(html.contains("Download <b>125 KB/s</b>"), "{html}");
+        assert!(
+            html.contains("<title>1 s ago: upload 3 KB/s, download 500 KB/s</title>"),
+            "{html}"
+        );
+        assert!(!html.contains("NaN"), "{html}");
+    }
+
+    /// Newest sample at the right edge, the peak at the top, zero on the
+    /// baseline, upload and download not swapped. Pinned on the desktop
+    /// chart: width 600, plot from x=62 to x=590 and y=8 to y=128.
+    #[test]
+    fn bandwidth_chart_geometry() {
+        let mut snap = base_snapshot();
+        snap.bandwidth_history = vec![rate(1, 3_000.0, 0.0), rate(0, 1_500.0, 0.0)];
+        let html = build_transfer_card(&Some(snap));
+        assert!(
+            html.contains(r#"<path d="M581.2,8.0 L590.0,68.0" class="bw-line-up"/>"#),
+            "{html}"
+        );
+        assert!(
+            html.contains(r#"<path d="M581.2,128.0 L590.0,128.0" class="bw-line-down"/>"#),
+            "{html}"
+        );
+    }
+
+    /// Tooltips exist once per sample, on the desktop chart only, and their
+    /// hover columns stay inside the plot even with only two samples.
+    #[test]
+    fn bandwidth_chart_tooltips_are_desktop_only_and_inside_the_plot() {
+        let mut snap = base_snapshot();
+        snap.bandwidth_history = vec![
+            rate(60, 1.0, 1.0),
+            rate(59, 1.0, 1.0),
+            rate(1, 1.0, 1.0),
+            rate(0, 2.0, 2.0),
+        ];
+        let html = build_transfer_card(&Some(snap));
+        assert_eq!(html.matches("<title>").count(), 4, "{html}");
+        assert!(html.contains("<title>now: upload"), "{html}");
+        let narrow = html
+            .split(r#"<div class="w-narrow">"#)
+            .nth(1)
+            .expect("narrow chart");
+        assert!(!narrow.contains("bw-hit"), "{narrow}");
+        for rect in html.split("<rect ").skip(1) {
+            let attr = |name: &str| -> f64 {
+                let v = rect.split(&format!("{name}=\"")).nth(1).unwrap();
+                v[..v.find('"').unwrap()].parse().unwrap()
+            };
+            let (x, w) = (attr("x"), attr("width"));
+            // Attributes are printed to 0.1, so allow that much rounding.
+            assert!(
+                x >= 62.0 && x + w <= 590.0 + 0.1,
+                "rect {x}+{w} outside plot"
+            );
+            // One sampling interval (528 / 60 = 8.8) or less.
+            assert!(w <= 8.8 + 0.1, "rect {x}+{w} wider than one interval");
+        }
+        // The edge columns are trimmed to half an interval rather than
+        // shifted inward over the neighbouring sample's point.
+        let widths: Vec<&str> = html
+            .split(r#"class="bw-hit""#)
+            .map(|chunk| chunk.rsplit("width=\"").next().unwrap())
+            .collect();
+        assert!(widths[0].starts_with("4.4\""), "oldest column: {html}");
+        assert!(widths[3].starts_with("4.4\""), "newest column: {html}");
+    }
+
+    /// A stalled sampler leaves an old newest sample; the headline says how
+    /// old instead of presenting it as the current rate.
+    #[test]
+    fn bandwidth_headline_flags_stale_samples() {
+        let card = |newest: u64| {
+            let mut snap = base_snapshot();
+            snap.bandwidth_history = vec![rate(newest + 1, 1.0, 1.0), rate(newest, 1.0, 1.0)];
+            build_transfer_card(&Some(snap))
+        };
+        let fresh = card(3);
+        assert!(!fresh.contains("bw-stale"), "{fresh}");
+        assert!(card(4).contains("as of 4 s ago"));
+        assert!(card(40).contains("as of 40 s ago"));
+    }
+
+    /// The y axis tops out at or above the largest rate in either direction,
+    /// so no line is clipped; an idle node still gets a usable axis.
+    #[test]
+    fn bandwidth_rate_axis_covers_the_peak() {
+        for peak in [
+            0.0,
+            1.0,
+            999.0,
+            1_000.0,
+            1_001.0,
+            7_300.0,
+            2.5e6,
+            9.99e8,
+            f64::NAN,
+        ] {
+            let (top, step) = cards::rate_axis(peak);
+            assert!(top.is_finite() && step > 0.0, "peak {peak}: {top} {step}");
+            if peak.is_finite() {
+                assert!(top >= peak, "peak {peak} clipped by axis top {top}");
+            }
+            let steps = top / step;
+            assert!((1.0..=4.0).contains(&steps), "peak {peak}: {steps} steps");
+        }
+    }
+
     #[test]
     fn format_bytes_units() {
         assert_eq!(format_bytes(0), "0 B");
@@ -1032,11 +1211,16 @@ mod tests {
     fn homepage_renders_dynamic_title() {
         // The rendered page must carry the derived title, not a static
         // placeholder — the JS refresh path re-reads it from `doc.title`.
-        let html = homepage_html();
+        //
+        // Pass `None` explicitly rather than going through `homepage_html()`
+        // (which reads the process-global `network_status` snapshot) — see
+        // `homepage_html_for`'s doc comment for why that global made this
+        // test order/timing-dependent (#5732).
+        let html = homepage_html_for(None);
         assert!(
             html.contains("<title>\u{26A1} Dashboard</title>"),
-            "no snapshot exists in the unit-test process, so the homepage \
-             must render the 'trying to connect' title, got: {html}"
+            "with no snapshot, the homepage must render the 'trying to \
+             connect' title, got: {html}"
         );
     }
 
@@ -1208,48 +1392,6 @@ mod tests {
     }
 
     #[test]
-    fn reliability_chart_empty_is_placeholder() {
-        let svg = build_reliability_chart(&[], None);
-        assert!(svg.contains("collecting data"));
-        assert!(svg.contains("<svg"));
-    }
-
-    #[test]
-    fn reliability_chart_renders_points_and_brier() {
-        // Well-separated: low predicted -> success, high predicted -> failure.
-        let pairs: Vec<(f64, f64)> = (0..20)
-            .map(|i| (i as f64 / 20.0, if i > 10 { 1.0 } else { 0.0 }))
-            .collect();
-        let svg = build_reliability_chart(&pairs, Some(0.042));
-        assert!(svg.contains("Failure (calibration)"));
-        assert!(svg.contains("Brier 0.042"));
-        assert!(svg.contains("n=20"));
-        assert!(svg.contains("<circle"), "bins should render as points");
-    }
-
-    #[test]
-    fn reliability_chart_filters_nonfinite() {
-        let pairs = vec![
-            (0.5, 0.0),
-            (f64::NAN, 1.0),
-            (0.3, f64::NAN),
-            (f64::INFINITY, 0.0),
-            (0.7, 1.0),
-        ];
-        // Only 2 valid pairs survive the finite filter.
-        let svg = build_reliability_chart(&pairs, None);
-        assert!(svg.contains("n=2"));
-    }
-
-    #[test]
-    fn reliability_chart_boundary_values_no_panic() {
-        // p == 1.0 and p == 0.0 must clamp into a bin without panicking.
-        let svg = build_reliability_chart(&[(1.0, 0.0), (0.0, 1.0)], Some(0.5));
-        assert!(svg.contains("<svg"));
-        assert!(svg.contains("n=2"));
-    }
-
-    #[test]
     fn regression_chart_sparse_is_placeholder() {
         // Fewer than 2 valid (positive, finite) points -> placeholder.
         let svg = build_regression_chart("Response time", RegKind::Time, &[(0.5, 0.4)]);
@@ -1268,7 +1410,10 @@ mod tests {
             .collect();
         let svg = build_regression_chart("Response time", RegKind::Time, &pairs);
         assert!(svg.contains("Response time"));
-        assert!(svg.contains("median err"));
+        assert!(
+            svg.contains("typically within &#215;1.1 · last 20"),
+            "the headline is the typical miss factor, as on the peer page: {svg}"
+        );
         assert!(svg.contains("<circle"));
         assert!(
             svg.contains("ms"),
@@ -1339,44 +1484,18 @@ mod tests {
 
     #[test]
     fn accuracy_panel_empty_when_no_data() {
-        assert_eq!(
-            build_renegade_accuracy_panel(&[], None, &[], &[]),
-            String::new()
-        );
+        assert_eq!(build_accuracy_panel(&[], &[]), String::new());
     }
 
     #[test]
-    fn accuracy_panel_renders_all_three_models() {
-        let failure: Vec<(f64, f64)> = (0..20)
-            .map(|i| (i as f64 / 20.0, if i > 10 { 1.0 } else { 0.0 }))
+    fn accuracy_panel_renders_both_timing_models() {
+        let response: Vec<(f64, f64)> = (1..=20)
+            .map(|i| (i as f64 * 0.01, i as f64 * 0.01))
             .collect();
-        let svg = build_renegade_accuracy_panel(&failure, Some(0.05), &[], &[]);
-        assert!(svg.contains("Prediction Accuracy"));
-        assert!(svg.contains("Failure (calibration)"));
-        // Timing models have no data yet -> their placeholders still appear.
-        assert!(svg.contains("Response time"));
-        assert!(svg.contains("Transfer speed"));
-    }
-
-    #[test]
-    fn fmt_prediction_time_sentinel_values() {
-        assert_eq!(fmt_prediction_time(f64::MAX / 2.0), "N/A");
-        assert_eq!(fmt_prediction_time(f64::INFINITY), "N/A");
-        assert_eq!(fmt_prediction_time(f64::NAN), "N/A");
-        assert_eq!(fmt_prediction_time(-1.0), "N/A");
-        assert_eq!(fmt_prediction_time(0.0), "0.000s");
-        assert_eq!(fmt_prediction_time(1.5), "1.500s");
-        assert_eq!(fmt_prediction_time(1.0e9), "N/A"); // at the limit
-        assert_eq!(fmt_prediction_time(999_999_999.0), "999999999.000s");
-    }
-
-    #[test]
-    fn fmt_prediction_speed_sentinel_values() {
-        assert_eq!(fmt_prediction_speed(0.0), "N/A");
-        assert_eq!(fmt_prediction_speed(-5.0), "N/A");
-        assert_eq!(fmt_prediction_speed(f64::NAN), "N/A");
-        assert_eq!(fmt_prediction_speed(f64::INFINITY), "N/A");
-        assert_eq!(fmt_prediction_speed(1024.0), "1024 B/s");
+        let svg = build_accuracy_panel(&response, &[]);
+        assert!(svg.contains("Response time") && svg.contains("<circle"));
+        // The transfer model has no data yet, so its placeholder still appears.
+        assert!(svg.contains("Transfer speed") && svg.contains("collecting data"));
     }
 
     /// Regression: with no data the helper must still emit a titled
@@ -1390,12 +1509,11 @@ mod tests {
     fn build_estimator_chart_or_placeholder_empty_renders_titled_placeholder() {
         let html = build_estimator_chart_or_placeholder(
             "Response Time (s)",
+            ChartUnit::Seconds,
+            560.0,
             &[],
             &[],
             (0.0, 0.0),
-            None,
-            AdjustmentMode::Additive,
-            None,
             "0",
             "auto",
             "No timed responses have been observed from this peer yet.",
@@ -1422,66 +1540,21 @@ mod tests {
         let scatter = vec![(0.05, 0.0), (0.1, 1.0), (0.3, 0.0), (0.4, 1.0)];
         let html = build_estimator_chart_or_placeholder(
             "Failure Probability",
+            ChartUnit::Probability,
+            560.0,
             &curve,
             &scatter,
             (0.0, 0.5),
-            None,
-            AdjustmentMode::Additive,
-            None,
             "0.0",
             "1.0",
             "no data",
         );
         assert!(html.contains("<svg"), "should render an SVG, got: {html}");
-        assert!(
-            html.contains("<circle"),
-            "raw observations should render as scatter circles, got: {html}"
+        assert_eq!(
+            html.matches("h0").count(),
+            4,
+            "each raw observation renders as a scatter dot, got: {html}"
         );
-    }
-
-    /// Regression: the per-tab "Outcomes vs Distance" panel must call
-    /// `build_estimator_chart_or_placeholder` for all three
-    /// prediction-component slots (Failure Probability, Response Time,
-    /// Transfer Rate). Hiding empty slots previously masked the
-    /// driver data-collection regression for months — keeping every
-    /// slot visible makes future regressions detectable on sight.
-    /// Source-scrape rather than HTML-grep because the visible-when-empty
-    /// behaviour depends on a router_snapshot being present, and the
-    /// `home_page.rs::tests` module does not have a snapshot fixture
-    /// builder.
-    #[test]
-    fn peer_detail_panel_calls_estimator_helper_for_all_three_components() {
-        let src = include_str!("home_page/peer_detail.rs");
-        let prod = src;
-        for title in [
-            "Failure Probability",
-            "Response Time (s)",
-            "Transfer Rate (B/s)",
-        ] {
-            // Find the helper call site and walk forward up to 200 bytes
-            // for the title literal. Whitespace-tolerant so rustfmt
-            // doesn't churn this pin.
-            let mut found = false;
-            let mut cursor = 0;
-            while let Some(call) = prod[cursor..].find("build_estimator_chart_or_placeholder(") {
-                let abs = cursor + call;
-                let tail_end = (abs + 400).min(prod.len());
-                let needle = format!("\"{title}\"");
-                if prod[abs..tail_end].contains(&needle) {
-                    found = true;
-                    break;
-                }
-                cursor = abs + 1;
-            }
-            assert!(
-                found,
-                "peer-detail panel builder must call \
-                 build_estimator_chart_or_placeholder with title {title:?} so the slot is \
-                 always visible. Without this every prediction-component \
-                 slot can silently disappear when its estimator has no \
-                 data — the original regression."
-            );
-        }
     }
 
     #[test]
@@ -1489,12 +1562,11 @@ mod tests {
         let curve = vec![(0.0, 0.1), (0.25, 0.5), (0.5, 0.9)];
         let html = build_estimator_chart_or_placeholder(
             "Failure Probability",
+            ChartUnit::Probability,
+            560.0,
             &curve,
             &[],
             (0.0, 0.5),
-            None,
-            AdjustmentMode::Additive,
-            None,
             "0.0",
             "1.0",
             "should not see this",
@@ -1508,11 +1580,18 @@ mod tests {
 
     #[test]
     fn failure_chart_y_max_zooms_to_twice_right_edge() {
-        // Monotonic, tiny failure curve: right edge is 0.04 → axis top 0.08, so
-        // the line sits around mid-height instead of hugging y=0.
+        // Monotonic, tiny failure curve: right edge is 0.04 → twice that is
+        // 0.08, rounded up to 0.10 for round ticks, so the line sits below
+        // mid-height instead of hugging y=0.
         let curve = vec![(0.0, 0.001), (0.25, 0.02), (0.5, 0.04)];
-        let y_max = failure_chart_y_max(&curve, None);
-        assert!((y_max - 0.08).abs() < 1e-9, "expected 0.08, got {y_max}");
+        let y_max = failure_chart_y_max(&curve);
+        assert!((y_max - 0.10).abs() < 1e-9, "expected 0.10, got {y_max}");
+        // Twice the right edge already on a round step stays put.
+        let on_step = failure_chart_y_max(&[(0.0, 0.0), (0.5, 0.025)]);
+        assert!(
+            (on_step - 0.05).abs() < 1e-9,
+            "expected 0.05, got {on_step}"
+        );
     }
 
     #[test]
@@ -1520,28 +1599,16 @@ mod tests {
         // No failures observed (all-zero curve) → keep the original 0..1 axis
         // rather than collapsing to a degenerate zero-height range.
         let curve = vec![(0.0, 0.0), (0.5, 0.0)];
-        assert_eq!(failure_chart_y_max(&curve, None), 1.0);
+        assert_eq!(failure_chart_y_max(&curve), 1.0);
         // An empty curve also falls back to the full range.
-        assert_eq!(failure_chart_y_max(&[], None), 1.0);
+        assert_eq!(failure_chart_y_max(&[]), 1.0);
     }
 
     #[test]
     fn failure_chart_y_max_capped_at_one() {
         // A large right edge would give 2x > 1; a probability axis can't exceed 1.
         let curve = vec![(0.0, 0.2), (0.5, 0.7)];
-        assert_eq!(failure_chart_y_max(&curve, None), 1.0);
-    }
-
-    #[test]
-    fn failure_chart_y_max_accounts_for_peer_adjustment() {
-        let curve = vec![(0.0, 0.001), (0.5, 0.02)];
-        // Upward adjustment lifts the peer-adjusted line, so the axis must grow
-        // to keep it on-screen: (0.02 + 0.03) * 2 = 0.10.
-        let up = failure_chart_y_max(&curve, Some(0.03));
-        assert!((up - 0.10).abs() < 1e-9, "expected 0.10, got {up}");
-        // A downward adjustment must not shrink the axis below the global edge.
-        let down = failure_chart_y_max(&curve, Some(-0.01));
-        assert!((down - 0.04).abs() < 1e-9, "expected 0.04, got {down}");
+        assert_eq!(failure_chart_y_max(&curve), 1.0);
     }
 
     #[test]
@@ -1550,18 +1617,19 @@ mod tests {
         let curve = vec![(0.0, 0.1), (0.25, 0.5), (0.5, 0.9)];
         let html = build_estimator_chart(
             "Failure Probability",
+            ChartUnit::Probability,
+            560.0,
             &curve,
             &[],
             (0.0, 0.5),
-            None,
-            AdjustmentMode::Additive,
-            None,
             "0.0",
             "1.0",
         );
         assert!(
-            html.contains(">Distance<"),
-            "estimator chart must label its x-axis 'Distance', got: {html}"
+            html.contains(
+                ">ring distance between peer and contract (0 = same spot, 0.5 = opposite side)<"
+            ),
+            "estimator chart must label its x-axis as the peer page does, got: {html}"
         );
     }
 
@@ -1573,23 +1641,41 @@ mod tests {
         let curve = vec![(0.0, 0.0), (0.25, 0.003), (0.5, 0.005)];
         let html = build_estimator_chart(
             "Failure Probability",
+            ChartUnit::Probability,
+            560.0,
             &curve,
             &[],
             (0.0, 0.5),
-            None,
-            AdjustmentMode::Additive,
-            None,
             "0.0",
             "0.01",
         );
         assert!(
-            html.contains(">0.0050<"),
+            html.contains(">0.50%<"),
             "middle y-tick must remain readable at a small range, got: {html}"
         );
         assert!(
-            html.contains(">0.0100<"),
+            html.contains(">1.00%<"),
             "top y-tick must remain readable at a small range, got: {html}"
         );
+    }
+
+    #[test]
+    fn estimator_failure_axis_ticks_land_on_round_percentages() {
+        // Twice a right edge of 8.15% read as "0.0% / 8.2% / 16.3%".
+        let curve = vec![(0.0, 0.01), (0.25, 0.04), (0.5, 0.0815)];
+        let html = build_estimator_chart(
+            "Failure Probability",
+            ChartUnit::Probability,
+            560.0,
+            &curve,
+            &[],
+            (0.0, 0.5),
+            "0",
+            &failure_chart_y_max(&curve).to_string(),
+        );
+        for tick in [">0%<", ">10%<", ">20%<"] {
+            assert!(html.contains(tick), "missing tick {tick}: {html}");
+        }
     }
 
     #[test]
@@ -1597,47 +1683,25 @@ mod tests {
         // With a zoomed failure axis (0.0 .. 0.08), raw failure outcomes at
         // y=1.0 are off-scale-high. They must still render (clamped to the top
         // edge) instead of vanishing, so failures stay visible on the
-        // low-probability peers the zoom targets. The fitted curve renders as a
-        // <path>, so every <circle> here is a scatter dot.
+        // low-probability peers the zoom targets. The scatter is one path of
+        // zero-length `h0` segments, one per dot; the curve has none.
         let curve = vec![(0.0, 0.001), (0.25, 0.02), (0.5, 0.04)];
         let scatter = vec![(0.1, 0.0), (0.2, 1.0), (0.3, 1.0)];
         let html = build_estimator_chart(
             "Failure Probability",
+            ChartUnit::Probability,
+            560.0,
             &curve,
             &scatter,
             (0.0, 0.5),
-            None,
-            AdjustmentMode::Additive,
-            None,
             "0.0",
             "0.08",
         );
-        let circles = html.matches("<circle").count();
+        let dots = html.matches("h0").count();
         assert!(
-            circles >= 3,
-            "all 3 scatter dots (incl. the 2 off-scale failures) must render, got {circles}: {html}"
+            dots >= 3,
+            "all 3 scatter dots (incl. the 2 off-scale failures) must render, got {dots}: {html}"
         );
-    }
-
-    #[test]
-    fn peer_detail_links_renegade_to_repo() {
-        // The "Renegade" label on the Routing Model card links to the project repo.
-        let src = include_str!("home_page/peer_detail.rs");
-        assert!(
-            src.contains(r#"href="https://github.com/sanity/renegade""#),
-            "the Renegade label must link to https://github.com/sanity/renegade"
-        );
-    }
-
-    #[test]
-    fn fmt_prediction_prob_sentinel_values() {
-        assert_eq!(fmt_prediction_prob(f64::NAN), "N/A");
-        assert_eq!(fmt_prediction_prob(f64::INFINITY), "N/A");
-        assert_eq!(fmt_prediction_prob(-0.1), "N/A");
-        assert_eq!(fmt_prediction_prob(1.1), "N/A");
-        assert_eq!(fmt_prediction_prob(0.0), "0.0000");
-        assert_eq!(fmt_prediction_prob(1.0), "1.0000");
-        assert_eq!(fmt_prediction_prob(0.5), "0.5000");
     }
 
     fn sample_peer(addr: &str, location: f64) -> crate::node::network_status::PeerSnapshot {
@@ -1690,6 +1754,15 @@ mod tests {
             html.contains("data-sort=\"2048\""),
             "recv bytes cell must carry raw byte count for sorting"
         );
+    }
+
+    /// The network-wide routing page is reachable from the home dashboard,
+    /// even on a node with no peers yet (the status card always renders once
+    /// the node is up; the peers card does not).
+    #[test]
+    fn status_card_links_to_the_routing_page() {
+        let html = build_status_card(&Some(base_snapshot()));
+        assert!(html.contains(r#"href="/routing""#), "{html}");
     }
 
     #[test]
@@ -2556,12 +2629,61 @@ mod tests {
         );
         assert!(
             html.contains("64.0 MB / 256.0 MB"),
-            "RAM used/budget tile — got:\n{html}"
+            "contract-state used/budget tile — got:\n{html}"
         );
-        // Non-zero recently-read evictions are the miscalibration alarm: colored.
+        // This tile was labelled "RAM used" until 2026-09 and it is not RAM: it
+        // is tracked contract STATE bytes against a ceiling on that state. An
+        // operator read it as resident memory and reported a 4 GB node "near
+        // full" while the process was using under 1 GB.
+        //
+        // Assert the whole label ELEMENT, not the phrase: the tooltip on this
+        // same tile contains "contract state" in prose, so an unanchored
+        // `contains` would survive deleting the label itself.
         assert!(
-            html.contains("var(--danger"),
-            "recently-read eviction count should be highlighted — got:\n{html}"
+            html.contains(r#"<div class="g-norm-label">Contract state</div>"#),
+            "state tile must be labelled as contract state, not memory — got:\n{html}"
+        );
+        // Pin the INVARIANT, not one spelling of its violation: any memory word
+        // in this label re-creates the confusion, not just the string that
+        // shipped. (`.claude/rules/browser-assets.md` rule 2.)
+        for banned in [
+            "RAM used",
+            "Memory used",
+            "Mem used",
+            "RSS used",
+            "RAM",
+            "RSS",
+        ] {
+            assert!(
+                !html.contains(&format!(">{banned}<")),
+                "the state tile must not be labelled {banned:?}: it measures contract \
+                 state bytes, not the node's resident memory — got:\n{html}"
+            );
+        }
+        // The tooltip is the load-bearing half of the fix — the label says what
+        // the number is, the tooltip says what it is NOT. Dropping `title=` from
+        // the tile passed every test before this assertion existed.
+        assert!(
+            html.contains("Contract STATE bytes, not the node's resident memory"),
+            "the state tile must carry its corrective tooltip — got:\n{html}"
+        );
+        // The tooltip must not restate the RAM-scaled DEFAULT as if it were the
+        // only path: `budget_bytes` is "the RAM-scaled default, or the operator
+        // override", further tightened to min(RAM, disk). An operator running
+        // --max-hosting-storage would otherwise read a confident falsehood inside
+        // the tooltip whose whole purpose is to stop a misreading of this tile.
+        assert!(
+            html.contains("max-hosting-storage") && html.contains("disk budget"),
+            "the state tooltip must name the operator override and the disk-budget \
+             floor, not just the RAM-scaled default — got:\n{html}"
+        );
+        // A non-zero "evicted w/ demand" count is NOT coloured. It is a
+        // lifetime counter that any node running at its ceiling accumulates,
+        // so colouring it on `> 0` kept the tile red on a healthy peer. (This
+        // fixture has a non-zero count; the assertion used to demand red.)
+        assert!(
+            !html.contains("var(--danger") && !html.contains("var(--warn"),
+            "a lifetime eviction count must not be styled as an alarm — got:\n{html}"
         );
         // The next-to-evict badge attaches to the first eligible row.
         let victim_idx = html.find("VICTIM_FULL").expect("victim row present");
@@ -2866,8 +2988,10 @@ mod tests {
             evictions_of_recently_read_total: 0,
             contracts: vec![mk_hosted_entry("A", false)],
             disk_state_bytes: None,
+            disk_db_bytes: None,
             disk_wasm_bytes: None,
             disk_compile_cache_bytes: None,
+            disk_webapp_cache_bytes: None,
             disk_total_bytes: None,
             disk_budget_bytes: None,
             ..Default::default()
@@ -2907,10 +3031,14 @@ mod tests {
             budget_evictions_total: 0,
             evictions_of_recently_read_total: 0,
             contracts: vec![mk_hosted_entry("A", false)],
-            disk_state_bytes: Some(100 * 1024 * 1024),
+            // #5007: the database directory is far bigger than the live rows;
+            // the gap is dead space. It is reported, not part of the total.
+            disk_state_bytes: Some(40 * 1024 * 1024),
+            disk_db_bytes: Some(100 * 1024 * 1024),
             disk_wasm_bytes: Some(20 * 1024 * 1024),
             disk_compile_cache_bytes: Some(5 * 1024 * 1024),
-            disk_total_bytes: Some(125 * 1024 * 1024),
+            disk_webapp_cache_bytes: Some(7 * 1024 * 1024),
+            disk_total_bytes: Some(65 * 1024 * 1024),
             disk_budget_bytes: Some(500 * 1024 * 1024),
             ..Default::default()
         };
@@ -2920,30 +3048,47 @@ mod tests {
             "seeded snapshot must not show 'measuring…' — got:\n{html}"
         );
         assert!(
-            html.contains("125.0 MB"),
+            html.contains("65.0 MB"),
             "disk-used total tile — got:\n{html}"
         );
         assert!(html.contains("500.0 MB"), "disk-budget tile — got:\n{html}");
-        // Headroom = budget(500) - used(125) = 375 MB.
+        // Headroom = budget(500) - used(65) = 435 MB.
         assert!(
-            html.contains("375.0 MB"),
+            html.contains("435.0 MB"),
             "disk-headroom tile (budget - used) — got:\n{html}"
         );
         // Breakdown surfaced in the title tooltip.
         assert!(
-            html.contains("State: 100.0 MB")
+            html.contains("State: 40.0 MB")
                 && html.contains("WASM: 20.0 MB")
                 && html.contains("Compile cache: 5.0 MB"),
             "per-component breakdown in tooltip — got:\n{html}"
         );
+        // #5007: the tooltip reports the measured database size and its dead
+        // space, and the webapp cache, marked as not counted in "disk used".
+        assert!(
+            html.contains(
+                "not counted in disk used: database file: 100.0 MB (about 60.0 MB more than state"
+            ),
+            "tooltip must show the measured database size and its dead space — got:\n{html}"
+        );
+        assert!(
+            html.contains("this user): 7.0 MB"),
+            "tooltip must report the webapp cache — got:\n{html}"
+        );
         // The explanatory paragraph must name the pressures that can actually
         // trigger a sweep. It used to claim the floor was "min(RAM budget,
         // disk budget)", and this assertion pinned that wording — which is how
-        // the claim outlived the two axes added since: the count-derived
-        // resident-overhead ceiling (#5325, the one that binds first on a
-        // real low-RAM peer) and cost pressure (#4861). Pin the axes, not the
-        // phrasing, so adding a fifth fails here instead of going unnoticed.
-        for axis in ["state bytes", "disk", "resident-overhead", "update work"] {
+        // the claim outlived the two axes added since: the contract-memory
+        // ceiling (#5325, counted since #5647) and cost pressure (#4861). Pin
+        // the axes, not the phrasing, so adding a fifth fails here instead of
+        // going unnoticed.
+        for axis in [
+            "state bytes",
+            "disk",
+            "memory hosted contracts hold",
+            "update work",
+        ] {
             assert!(
                 html.contains(axis),
                 "explanatory paragraph must name the {axis:?} eviction pressure \
@@ -2952,16 +3097,55 @@ mod tests {
         }
     }
 
-    /// The count-derived pressure axis (#5325) must render as contract SLOTS,
-    /// not as bytes.
-    ///
-    /// The underlying pair is `contract_count * 1 MiB` against a RAM-scaled
-    /// ceiling, so printing it as "30.0 MB / 100.0 MB" reads as measured
-    /// memory. It is not measured, and what it constrains is a number of
-    /// contracts — a low-RAM peer showed "520.0 MB / 524.0 MB" when the honest
-    /// statement was "520 of 524 contract slots used".
+    /// A reported gauge that has not been measured yet (`None` until its
+    /// directory is first read, #5007) shows as "not measured" without hiding
+    /// the budgeted breakdown, and an allocated database smaller than the
+    /// logical state shows a 0 difference rather than wrapping.
     #[test]
-    fn hosting_card_renders_slot_axis_as_counts_not_bytes() {
+    fn hosting_card_disk_breakdown_with_unmeasured_and_small_db() {
+        use crate::node::network_status::HostingSnapshot;
+        let mut snap = base_snapshot();
+        // Non-empty hosting fields: an empty snapshot renders no card at all.
+        snap.hosting = HostingSnapshot {
+            budget_bytes: 256 * 1024 * 1024,
+            used_bytes: 64 * 1024 * 1024,
+            contract_count: 1,
+            contracts: vec![mk_hosted_entry("A", false)],
+            disk_state_bytes: Some(40 * 1024 * 1024),
+            disk_db_bytes: None,
+            disk_wasm_bytes: Some(20 * 1024 * 1024),
+            disk_compile_cache_bytes: Some(5 * 1024 * 1024),
+            disk_webapp_cache_bytes: None,
+            disk_total_bytes: Some(65 * 1024 * 1024),
+            disk_budget_bytes: Some(500 * 1024 * 1024),
+            ..Default::default()
+        };
+        let mut unmeasured = base_snapshot();
+        unmeasured.hosting = snap.hosting.clone();
+        let html = build_hosting_card(&Some(unmeasured));
+        assert!(
+            html.contains("State: 40.0 MB")
+                && html.contains("database file: not measured")
+                && html.contains("this user): not measured"),
+            "unmeasured gauges must not hide the breakdown — got:\n{html}"
+        );
+
+        snap.hosting.disk_db_bytes = Some(30 * 1024 * 1024);
+
+        let html = build_hosting_card(&Some(snap));
+        assert!(
+            html.contains("database file: 30.0 MB (about 0 B more than state"),
+            "a database smaller than state must not wrap — got:\n{html}"
+        );
+    }
+
+    /// The resident-overhead axis (#5325, #5647) renders as MEMORY in bytes.
+    ///
+    /// Before #5647 it rendered as contract SLOTS, because the figure was
+    /// `contract_count * 1 MiB`, a count wearing memory units. It is now the
+    /// counted bytes hosted contracts hold in RAM, so bytes are the honest unit.
+    #[test]
+    fn hosting_card_renders_memory_axis_as_bytes() {
         use crate::node::network_status::HostingSnapshot;
         let mut snap = base_snapshot();
         snap.hosting = HostingSnapshot {
@@ -2970,29 +3154,26 @@ mod tests {
             contract_count: 30,
             contracts: vec![mk_hosted_entry("A", false)],
             resident_overhead_budget_bytes: 100 * 1024 * 1024,
-            estimated_resident_overhead_bytes: 30 * 1024 * 1024,
-            contract_slot_budget: 100,
+            resident_overhead_bytes: 30 * 1024 * 1024,
             resident_overhead_evictions_total: 7,
             ..Default::default()
         };
         let html = build_hosting_card(&Some(snap));
         assert!(
-            html.contains("Contract slots used") && html.contains("30 / 100"),
-            "slot axis must render as counts — got:\n{html}"
+            html.contains("Contract memory") && html.contains("30.0 MB / 100.0 MB"),
+            "memory axis must render as bytes — got:\n{html}"
         );
         assert!(
-            html.contains(">70<"),
-            "slots free = budget(100) - used(30) — got:\n{html}"
+            html.contains(">70.0 MB<"),
+            "memory headroom = budget(100 MB) - used(30 MB) — got:\n{html}"
         );
         assert!(
             html.contains(">7<"),
-            "slot-pressure eviction counter renders the snapshot value — got:\n{html}"
+            "memory-pressure eviction counter renders the snapshot value — got:\n{html}"
         );
-        // The byte framing must be gone: it is what made this read as RAM.
         assert!(
-            !html.contains("Resident overhead (est.)")
-                && !html.contains("Resident overhead budget"),
-            "the byte-denominated resident-overhead tiles must not return — got:\n{html}"
+            !html.contains("Contract slots used") && !html.contains("Slots free"),
+            "the slot tiles are gone: there is no per-contract constant to divide by — got:\n{html}"
         );
     }
 
@@ -3000,7 +3181,7 @@ mod tests {
     /// closest to binding.
     ///
     /// Measured on a live low-RAM peer: 34% of the state-byte budget, 1% of
-    /// the disk budget, 99.2% of the contract-slot ceiling. All three rendered
+    /// the disk budget, 99.2% of the contract-memory ceiling. All three rendered
     /// as identical muted tiles, so the only number that mattered was
     /// indistinguishable from the two with room to spare.
     #[test]
@@ -3011,9 +3192,10 @@ mod tests {
             // State bytes: 34% used.
             budget_bytes: 1000,
             used_bytes: 340,
-            // Slots: 99% used — this is the binding axis.
+            // Contract memory: 99% used — this is the binding axis.
             contract_count: 99,
-            contract_slot_budget: 100,
+            resident_overhead_budget_bytes: 100,
+            resident_overhead_bytes: 99,
             // Disk: 1% used.
             disk_total_bytes: Some(10),
             disk_budget_bytes: Some(1000),
@@ -3022,18 +3204,332 @@ mod tests {
         };
         let html = build_hosting_card(&Some(snap));
         assert!(
-            html.contains("Closest limit:") && html.contains("contract slots"),
+            html.contains("Closest limit:") && html.contains("contract memory"),
             "the binding axis must be named — got:\n{html}"
         );
         assert!(
-            html.contains("99 of 100"),
+            html.contains("99 B of 100 B"),
             "the binding axis detail must show its own units — got:\n{html}"
         );
-        // At 99% it must be flagged, not left in the same muted grey as an
-        // axis with room to spare.
+        // Naming it is the whole signal. It is NOT coloured: a contract-memory ceiling
+        // is a cache ceiling and 99% is where a busy node is supposed to sit
+        // (this test used to assert red here, which is the false alarm
+        // `hosting_card_full_cache_axis_is_not_an_alarm` now pins against).
+        let strips = binding_strips(&html);
         assert!(
-            html.contains("var(--danger"),
-            "a near-full binding axis must be coloured — got:\n{html}"
+            !strips.contains("var(--danger") && !strips.contains("var(--warn"),
+            "a nearly-full cache axis is normal and must not be coloured — got:\n{strips}"
+        );
+    }
+
+    /// The "Closest limit" strips only, so a colour assertion cannot be
+    /// satisfied (or tripped) by some other tile on the card.
+    fn binding_strips(html: &str) -> &str {
+        let start = html
+            .find(r#"<div class="hz-binding""#)
+            .expect("the card must render a closest-limit strip");
+        let len = html[start..]
+            .find(r#"<div class="g-verdict-row">"#)
+            .expect("the tiles follow the strip");
+        &html[start..start + len]
+    }
+
+    /// A full cache is the steady state, not an alarm.
+    ///
+    /// Reported from a live peer: "Closest limit: contract memory — 508 of 508
+    /// (100%)" over a solid red bar. Nothing was wrong. A cache is supposed to
+    /// be full: the sweep trims back to the budget and stops, so a busy node
+    /// sits at or around N of N for as long as it stays busy. The strip
+    /// coloured purely on utilisation and so was red on every peer doing the
+    /// most useful work. Same for contract state, which nova's own peer showed
+    /// at "1023.9 MB of 1.0 GB (100%)".
+    #[test]
+    fn hosting_card_full_cache_axis_is_not_an_alarm() {
+        use crate::node::network_status::HostingSnapshot;
+        for (label, hosting) in [
+            (
+                "slots exactly full",
+                HostingSnapshot {
+                    budget_bytes: 1000,
+                    used_bytes: 100,
+                    contract_count: 508,
+                    resident_overhead_budget_bytes: 508,
+                    resident_overhead_bytes: 508,
+                    contracts: vec![mk_hosted_entry("A", true)],
+                    ..Default::default()
+                },
+            ),
+            (
+                "state a hair under full",
+                HostingSnapshot {
+                    budget_bytes: 1_000_000,
+                    used_bytes: 999_900,
+                    contract_count: 5,
+                    resident_overhead_budget_bytes: 508,
+                    resident_overhead_bytes: 5,
+                    contracts: vec![mk_hosted_entry("A", true)],
+                    ..Default::default()
+                },
+            ),
+        ] {
+            let mut snap = base_snapshot();
+            snap.hosting = hosting;
+            let html = build_hosting_card(&Some(snap));
+            let strips = binding_strips(&html);
+            assert!(
+                strips.contains("(100%)"),
+                "{label}: fixture must render at 100% — got:\n{strips}"
+            );
+            assert!(
+                !strips.contains("var(--danger") && !strips.contains("var(--warn"),
+                "{label}: a full cache axis must render neutral — got:\n{strips}"
+            );
+            assert!(
+                strips.contains("var(--text-muted"),
+                "{label}: the bar must still be drawn, in the neutral tone — got:\n{strips}"
+            );
+            assert!(
+                strips.contains("Full is normal here"),
+                "{label}: a full bar must say in words that full is normal — got:\n{strips}"
+            );
+        }
+    }
+
+    /// Below the point where a reader would wonder, the strip says nothing extra.
+    #[test]
+    fn hosting_card_cache_axis_with_room_carries_no_note() {
+        use crate::node::network_status::HostingSnapshot;
+        let mut snap = base_snapshot();
+        snap.hosting = HostingSnapshot {
+            budget_bytes: 1000,
+            used_bytes: 500,
+            contract_count: 5,
+            resident_overhead_budget_bytes: 100,
+            resident_overhead_bytes: 5,
+            contracts: vec![mk_hosted_entry("A", true)],
+            ..Default::default()
+        };
+        let html = build_hosting_card(&Some(snap));
+        assert!(
+            !html.contains("hz-binding-note"),
+            "a half-full cache needs no explanation — got:\n{html}"
+        );
+    }
+
+    /// "Full is normal" is only said of a bar that prints as full. At 76% the
+    /// bar visibly has room and the sentence would be false.
+    #[test]
+    fn hosting_card_does_not_call_a_part_full_cache_full() {
+        use crate::node::network_status::HostingSnapshot;
+        for count in [76, 99] {
+            let mut snap = base_snapshot();
+            snap.hosting = HostingSnapshot {
+                budget_bytes: 1000,
+                used_bytes: 100,
+                contract_count: count,
+                resident_overhead_budget_bytes: 100,
+                resident_overhead_bytes: count,
+                contracts: vec![mk_hosted_entry("A", true)],
+                ..Default::default()
+            };
+            let html = build_hosting_card(&Some(snap));
+            let strips = binding_strips(&html);
+            assert!(
+                strips.contains(&format!("({count}%)")) && !strips.contains("hz-binding-note"),
+                "a cache at {count}% is neither full nor over and needs no note — got:\n{strips}"
+            );
+        }
+    }
+
+    /// OVER a cache ceiling is not an alarm either. It is the eviction sweep's
+    /// trigger, and on the slot axis a busy node spends much of its time a few
+    /// contracts over: the sweep only fires after ~2.5 minutes over, trims to
+    /// exactly N, and the next arrival puts it over again. At the 128-slot
+    /// floor a single extra contract prints as 101%, so colouring "over" would
+    /// keep the smallest peers amber in normal operation. It is described in
+    /// words, never coloured.
+    #[test]
+    fn hosting_card_over_budget_cache_axis_is_explained_not_coloured() {
+        use crate::node::network_status::HostingSnapshot;
+        for (count, budget, printed) in [
+            // One over at a small budget.
+            (129, 128, "129 B of 128 B (101%)"),
+            // One over on a bigger node: prints as 100%, but the detail text
+            // says 509 B of 508 B, so the note must say "over" and not "full".
+            (509, 508, "509 B of 508 B (100%)"),
+            // Well over.
+            (120, 100, "120 B of 100 B (120%)"),
+        ] {
+            let mut snap = base_snapshot();
+            snap.hosting = HostingSnapshot {
+                budget_bytes: 1000,
+                used_bytes: 100,
+                contract_count: count,
+                resident_overhead_budget_bytes: budget,
+                resident_overhead_bytes: count,
+                contracts: vec![mk_hosted_entry("A", true)],
+                ..Default::default()
+            };
+            let html = build_hosting_card(&Some(snap));
+            let strips = binding_strips(&html);
+            assert!(
+                strips.contains(printed),
+                "fixture must render as {printed} — got:\n{strips}"
+            );
+            assert!(
+                !strips.contains("var(--warn") && !strips.contains("var(--danger"),
+                "{printed}: an over-budget cache axis must not be coloured — got:\n{strips}"
+            );
+            assert!(
+                strips.contains("A little over is normal") && !strips.contains("Full is normal"),
+                "{printed}: over must be described as over, not as full — got:\n{strips}"
+            );
+        }
+
+        // The state-byte axis has its own wording: crossing it evicts at once.
+        let mut snap = base_snapshot();
+        snap.hosting = HostingSnapshot {
+            budget_bytes: 100,
+            used_bytes: 150,
+            contract_count: 1,
+            resident_overhead_budget_bytes: 100,
+            resident_overhead_bytes: 1,
+            contracts: vec![mk_hosted_entry("A", true)],
+            ..Default::default()
+        };
+        let html = build_hosting_card(&Some(snap));
+        let strips = binding_strips(&html);
+        assert!(
+            strips.contains("how eviction is triggered")
+                && !strips.contains("var(--warn")
+                && !strips.contains("var(--danger"),
+            "an over-budget state axis is explained, not coloured — got:\n{strips}"
+        );
+    }
+
+    /// Disk is not a cache: filling it refuses writes, so it keeps the
+    /// utilisation thresholds the cache axes lost.
+    #[test]
+    fn hosting_card_disk_axis_still_warns_as_it_fills() {
+        use crate::node::network_status::HostingSnapshot;
+        for (used, shown, colour, other) in [
+            (740, "(74%)", "var(--text-muted", "var(--warn"),
+            (750, "(75%)", "var(--warn", "var(--danger"),
+            (899, "(90%)", "var(--danger", "var(--warn"),
+            (1100, "(110%)", "var(--danger", "var(--warn"),
+        ] {
+            let mut snap = base_snapshot();
+            snap.hosting = HostingSnapshot {
+                budget_bytes: 1000,
+                used_bytes: 10,
+                contract_count: 1,
+                resident_overhead_budget_bytes: 100,
+                resident_overhead_bytes: 1,
+                disk_total_bytes: Some(used),
+                disk_budget_bytes: Some(1000),
+                contracts: vec![mk_hosted_entry("A", true)],
+                ..Default::default()
+            };
+            let html = build_hosting_card(&Some(snap));
+            let strips = binding_strips(&html);
+            assert!(
+                strips.contains("<strong>disk</strong>") && strips.contains(shown),
+                "disk at {used}/1000 must be the closest limit at {shown} — got:\n{strips}"
+            );
+            assert!(
+                strips.contains(colour) && !strips.contains(other),
+                "disk at {shown} must be {colour} — got:\n{strips}"
+            );
+        }
+    }
+
+    /// A full cache must not hide a disk that is genuinely running out.
+    ///
+    /// The strip names the single highest-utilisation axis. Before full cache
+    /// axes went neutral that was harmless, since whichever axis won was red
+    /// anyway. Now a contract-memory ceiling at its normal 100% would outrank a disk at
+    /// 95% and the one real warning on the card would disappear behind a grey
+    /// bar, so any other axis in a warning state gets its own strip.
+    #[test]
+    fn hosting_card_full_cache_does_not_hide_a_disk_warning() {
+        use crate::node::network_status::HostingSnapshot;
+        let mut snap = base_snapshot();
+        snap.hosting = HostingSnapshot {
+            budget_bytes: 1000,
+            used_bytes: 100,
+            contract_count: 508,
+            resident_overhead_budget_bytes: 508,
+            resident_overhead_bytes: 508,
+            disk_total_bytes: Some(950),
+            disk_budget_bytes: Some(1000),
+            contracts: vec![mk_hosted_entry("A", true)],
+            ..Default::default()
+        };
+        let html = build_hosting_card(&Some(snap));
+        let strips = binding_strips(&html);
+        assert!(
+            strips.contains("Closest limit: <strong>contract memory</strong>"),
+            "the highest-utilisation axis is still the closest — got:\n{strips}"
+        );
+        assert!(
+            strips.contains("Also near its limit: <strong>disk</strong>")
+                && strips.contains("var(--danger"),
+            "a disk at 95% must get its own red strip — got:\n{strips}"
+        );
+        assert!(
+            !strips.contains("<strong>contract state</strong>"),
+            "an axis with room to spare gets no strip — got:\n{strips}"
+        );
+        assert_eq!(
+            strips.matches(r#"class="hz-binding""#).count(),
+            2,
+            "exactly the closest axis plus the one in a warning state — got:\n{strips}"
+        );
+
+        // A disk that is itself over its limit, behind a cache that is further
+        // over, must not be introduced as merely "near" its limit.
+        let mut snap = base_snapshot();
+        snap.hosting = HostingSnapshot {
+            budget_bytes: 1000,
+            used_bytes: 100,
+            contract_count: 130,
+            resident_overhead_budget_bytes: 100,
+            resident_overhead_bytes: 130,
+            disk_total_bytes: Some(1200),
+            disk_budget_bytes: Some(1000),
+            contracts: vec![mk_hosted_entry("A", true)],
+            ..Default::default()
+        };
+        let html = build_hosting_card(&Some(snap));
+        let strips = binding_strips(&html);
+        assert!(
+            strips.contains("Closest limit: <strong>contract memory</strong>")
+                && strips.contains("Also over its limit: <strong>disk</strong>")
+                && strips.contains("new writes are being refused"),
+            "a disk over its limit must say so — got:\n{strips}"
+        );
+
+        // Exactly full is already refusing writes. "Refused once this is full"
+        // would describe the present as the future.
+        let mut snap = base_snapshot();
+        snap.hosting = HostingSnapshot {
+            budget_bytes: 1000,
+            used_bytes: 100,
+            contract_count: 1,
+            resident_overhead_budget_bytes: 100,
+            resident_overhead_bytes: 1,
+            disk_total_bytes: Some(1000),
+            disk_budget_bytes: Some(1000),
+            contracts: vec![mk_hosted_entry("A", true)],
+            ..Default::default()
+        };
+        let html = build_hosting_card(&Some(snap));
+        let strips = binding_strips(&html);
+        assert!(
+            strips.contains("(100%)")
+                && strips.contains("new writes are being refused")
+                && !strips.contains("once this is full"),
+            "a disk exactly at its limit is refusing writes now — got:\n{strips}"
         );
     }
 
@@ -3048,7 +3544,8 @@ mod tests {
             used_bytes: 900,
             // Slots only 10%.
             contract_count: 10,
-            contract_slot_budget: 100,
+            resident_overhead_budget_bytes: 100,
+            resident_overhead_bytes: 10,
             contracts: vec![mk_hosted_entry("A", true)],
             ..Default::default()
         };
@@ -3058,7 +3555,7 @@ mod tests {
             "state bytes at 90% must outrank slots at 10% — got:\n{html}"
         );
         assert!(
-            !html.contains("Closest limit: <strong>contract slots"),
+            !html.contains("Closest limit: <strong>contract memory"),
             "the slack axis must not be reported as closest — got:\n{html}"
         );
     }
@@ -3119,7 +3616,8 @@ mod tests {
             used_bytes: 100,
             contract_count: 5,
             // A slot budget of 0 means "not configured", NOT "no slots left".
-            contract_slot_budget: 0,
+            resident_overhead_budget_bytes: 0,
+            resident_overhead_bytes: 5,
             // Disk tracker unseeded.
             disk_total_bytes: None,
             disk_budget_bytes: None,
@@ -3132,9 +3630,189 @@ mod tests {
             "the one configured axis must be reported — got:\n{html}"
         );
         assert!(
-            !html.contains("contract slots</strong>"),
+            !html.contains("contract memory</strong>"),
             "an unconfigured axis must not be ranked at all — got:\n{html}"
         );
+    }
+
+    // ─── Normal states must not be styled as alarms ────────────────────
+    //
+    // Each of these pins a state that every healthy node passes through, or
+    // rests in, and that the dashboard used to present in warning colours.
+    // SCOPE: they assert emitted markup and stylesheet text. They do not load
+    // a browser, so they cannot see a colour applied by some other rule.
+
+    /// A node that has just joined is connected only to a gateway. That is
+    /// the first step of joining, not a firewall fault.
+    #[test]
+    fn status_card_does_not_diagnose_a_firewall_while_still_joining() {
+        let mut snap = base_snapshot();
+        snap.open_connections = 1;
+        snap.gateway_only_persisting = false;
+        snap.health = HealthLevel::Connecting;
+        let html = build_status_card(&Some(snap));
+        assert!(
+            html.contains("health-connecting"),
+            "a node still joining is shown as connecting — got:\n{html}"
+        );
+        assert!(
+            !html.contains("Firewall likely blocking"),
+            "gateway-only within the joining grace is not a firewall diagnosis — got:\n{html}"
+        );
+        assert!(
+            !html.contains("health-degraded") && !html.contains("Only connected to gateways"),
+            "no degraded banner while still joining — got:\n{html}"
+        );
+
+        // Once it has persisted, the warning is real and must still appear.
+        let mut snap = base_snapshot();
+        snap.open_connections = 1;
+        snap.gateway_only_persisting = true;
+        snap.health = HealthLevel::Degraded;
+        let html = build_status_card(&Some(snap));
+        assert!(
+            html.contains("Firewall likely blocking")
+                && html.contains("Only connected to gateways"),
+            "a persisting gateway-only state must still warn — got:\n{html}"
+        );
+    }
+
+    /// One failed hole-punch is not a blocked port. Single attempts fail
+    /// routinely; the verdict needs a sample.
+    #[test]
+    fn nat_line_gives_no_verdict_on_a_handful_of_attempts() {
+        use crate::node::network_status::NAT_MIN_ATTEMPTS_FOR_VERDICT;
+        let card = |attempts: u32| {
+            let mut snap = base_snapshot();
+            snap.open_connections = 2;
+            snap.health = HealthLevel::Healthy;
+            snap.nat_stats.attempts = attempts;
+            snap.nat_stats.successes = 0;
+            snap.nat_stats.recent_attempts = attempts;
+            snap.nat_stats.recent_successes = 0;
+            build_status_card(&Some(snap))
+        };
+
+        for attempts in [1, NAT_MIN_ATTEMPTS_FOR_VERDICT - 1] {
+            let html = card(attempts);
+            assert!(
+                html.contains(&format!("0/{attempts} successful")),
+                "the counts are facts and must still be shown — got:\n{html}"
+            );
+            for alarm in ["nat-fail", "Port may be blocked", "nat-advice"] {
+                assert!(
+                    !html.contains(alarm),
+                    "{attempts} failed attempt(s) must not render {alarm:?} — got:\n{html}"
+                );
+            }
+        }
+
+        let html = card(NAT_MIN_ATTEMPTS_FOR_VERDICT);
+        for alarm in ["nat-fail", "Port may be blocked", "nat-advice"] {
+            assert!(
+                html.contains(alarm),
+                "every attempt failing over a real sample must still render {alarm:?} — got:\n{html}"
+            );
+        }
+    }
+
+    /// The favicon's dark red is the NAT-specific "blocked" verdict, so it
+    /// shares the verdict's sample floor.
+    ///
+    /// What this does NOT change, deliberately: a NAT failure recorded while
+    /// the node has no connections also lands in `failures`, and with zero
+    /// connections any failure still drives the plain-red favicon and the
+    /// warning title. That is the existing "cannot connect and here is why"
+    /// path, not a verdict on the port, so the fixture includes the failure
+    /// entry production would have alongside the NAT count.
+    #[test]
+    fn favicon_gives_no_nat_verdict_on_one_attempt() {
+        let one_failed_attempt = || {
+            let mut snap = base_snapshot();
+            snap.nat_stats.attempts = 1;
+            snap.nat_stats.successes = 0;
+            snap.failures.push(FailureSnapshot {
+                address: "1.2.3.4:1234".parse::<SocketAddr>().unwrap(),
+                reason_html: "NAT traversal failed".to_string(),
+            });
+            snap
+        };
+        let uri = build_favicon_data_uri(&Some(one_failed_attempt()));
+        assert!(
+            !uri.contains("%238b0000"),
+            "one failed NAT attempt must not be the dark-red 'blocked' verdict — got: {uri}"
+        );
+        assert!(
+            uri.contains("%23f44336"),
+            "with no connections, the recorded failure still shows as a failure — got: {uri}"
+        );
+        assert_eq!(
+            build_dashboard_title(&Some(one_failed_attempt())),
+            "\u{26A0} Dashboard",
+            "with no connections, a recorded failure still warns in the title"
+        );
+
+        // Once connected, neither a single failed attempt nor its failure
+        // entry colours anything.
+        let mut snap = one_failed_attempt();
+        snap.open_connections = 2;
+        let uri = build_favicon_data_uri(&Some(snap));
+        assert!(
+            uri.contains("%230abab5"),
+            "connected wins over a single failed NAT attempt — got: {uri}"
+        );
+    }
+
+    /// The declarations of one top-level rule in the dashboard stylesheet.
+    /// Anchored at the start of a line so a selector that merely CONTAINS
+    /// `selector` (`[data-theme='light'] .op-fail`) is not mistaken for it, and
+    /// a missing rule fails loudly rather than matching something else.
+    fn css_rule(selector: &str) -> &'static str {
+        let css = include_str!("home_page/assets/style.css");
+        let open = format!("\n{selector} {{");
+        let start = css
+            .find(&open)
+            .unwrap_or_else(|| panic!("style.css has no top-level `{selector}` rule"))
+            + open.len();
+        let len = css[start..].find('}').expect("rule is closed");
+        &css[start..start + len]
+    }
+
+    /// Colours the dashboard uses to mean "something is wrong".
+    const ALARM_COLOURS: [&str; 7] = [
+        "#f87171", "#dc2626", "#ff6b6b", "#b3261e", "#ff8a3d", "--danger", "--warn",
+    ];
+
+    /// The operations card's failure count is mostly requests the network
+    /// could not route, is non-zero on every healthy node, and rendered a red
+    /// "0" on a node with none. The cross identifies it; red mis-describes it.
+    #[test]
+    fn operation_failure_count_is_not_styled_as_an_alarm() {
+        let rule = css_rule(".op-fail");
+        for colour in ALARM_COLOURS {
+            assert!(
+                !rule.contains(colour),
+                "`.op-fail` must not use alarm colour {colour} — rule:\n{rule}"
+            );
+        }
+        let css = include_str!("home_page/assets/style.css");
+        assert!(
+            !css.contains("[data-theme='light'] .op-fail"),
+            "no per-theme override may put the alarm colour back on `.op-fail`"
+        );
+    }
+
+    /// "Next to evict" marks a position in an ordering and is present on any
+    /// node hosting anything, including one far under budget.
+    #[test]
+    fn next_to_evict_badge_is_not_styled_as_an_alarm() {
+        let rule = css_rule(".hz-next");
+        for colour in ALARM_COLOURS {
+            assert!(
+                !rule.contains(colour),
+                "`.hz-next` must not use alarm colour {colour} — rule:\n{rule}"
+            );
+        }
     }
 
     // ─── Long-table filter controls ────────────────────────────────

@@ -8,7 +8,8 @@
 <style>*{{margin:0;padding:0}}html,body{{width:100%;height:100%;overflow:hidden}}iframe{{width:100%;height:100%;border:none;display:block}}</style>{hosted_styles}
 </head>
 <body>
-{hosted_bar}<iframe id="app" sandbox="allow-scripts allow-forms allow-popups allow-popups-to-escape-sandbox allow-downloads allow-modals" allow="clipboard-read; clipboard-write" data-src="{iframe_src}"></iframe>
+<!-- allow="fullscreen *": the `*` is REQUIRED, do not tidy it to `fullscreen`. A bare `fullscreen` means `fullscreen 'src'`, and this frame is opaque-origin (sandbox withholds allow-same-origin), which 'src' cannot match in Firefox or WebKit - only Chromium resolves it against the src URL. `*` is the only allowlist form that matches an opaque origin; it grants nothing extra, since the frame only ever loads this node's own contract bytes. -->
+{hosted_bar}<iframe id="app" sandbox="allow-scripts allow-forms allow-popups allow-popups-to-escape-sandbox allow-downloads allow-modals" allow="clipboard-read; clipboard-write; fullscreen *" data-src="{iframe_src}"></iframe>
 <script>
 {SHELL_BRIDGE_JS}
 </script>

@@ -112,7 +112,11 @@ pub struct PutGetArgs {
     #[arg(long, default_value_t = 120)]
     pub op_timeout_secs: u64,
 
-    /// Deadline for the ephemeral node to join the ring, seconds.
+    /// Deadline for the ephemeral node to join the ring, seconds. Joined means
+    /// at least one ring connection, not just the gateway handshake. Missing it
+    /// ends the run before any GET. If every PUT succeeded, the run is published
+    /// as an error (the check could not run) rather than a findability failure;
+    /// a failed PUT still makes it a failure. The run's PUTs are still recorded.
     #[arg(long, default_value_t = 120)]
     pub join_timeout_secs: u64,
 

@@ -547,6 +547,7 @@ mod platform {
         use tao::event::Event;
         use tao::event_loop::{ControlFlow, EventLoopBuilder};
 
+        let started = Instant::now();
         let event_loop = EventLoopBuilder::<WrapperStatus>::with_user_event().build();
         let proxy = event_loop.create_proxy();
 
@@ -628,6 +629,61 @@ mod platform {
                 }
             }
 
+            // A `freenet://` link, delivered by LaunchServices because the
+            // bundle's Info.plist claims the scheme (#5726). Handle it off the
+            // main thread: it may wait for the node to come up, and AppKit
+            // must keep pumping meanwhile. The link is not logged, since
+            // apps can carry secrets in its fragment (e.g. River invites).
+            if let Event::Opened { urls } = &event {
+                use std::sync::atomic::{AtomicUsize, Ordering};
+                // Each handler may wait for the node; cap how many run at
+                // once so a page spamming links cannot pile up threads.
+                static IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
+                const MAX_IN_FLIGHT: usize = 4;
+                /// Releases the slot however the handler ends, panics included.
+                struct Slot;
+                impl Drop for Slot {
+                    fn drop(&mut self) {
+                        IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
+                    }
+                }
+                // Wait long for the node only just after launch, when
+                // LaunchServices may have started the app to deliver this
+                // link; later, a node that is down is simply down.
+                let wait = if started.elapsed() < Duration::from_secs(90) {
+                    super::super::open_link::APP_LAUNCH_NODE_WAIT
+                } else {
+                    Duration::from_secs(3)
+                };
+                for url in urls {
+                    if IN_FLIGHT.fetch_add(1, Ordering::SeqCst) >= MAX_IN_FLIGHT {
+                        IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
+                        super::super::service::log_to_wrapper_log(
+                            "Dropped a freenet:// link: too many links already being handled",
+                        );
+                        continue;
+                    }
+                    let slot = Slot;
+                    let link = url.as_str().to_string();
+                    let spawned = std::thread::Builder::new()
+                        .name("freenet-link".into())
+                        .spawn(move || {
+                            let _slot = slot;
+                            let outcome = super::super::open_link::handle_link(&link, wait, None);
+                            super::super::service::log_to_wrapper_log(&format!(
+                                "Handled a freenet:// link from LaunchServices: outcome={}",
+                                outcome.kind()
+                            ));
+                        });
+                    if spawned.is_err() {
+                        // The closure (and its slot) was dropped: nothing leaks.
+                        super::super::service::log_to_wrapper_log(
+                            "Could not start a thread for a freenet:// link",
+                        );
+                    }
+                }
+            }
+
             // Apply status updates forwarded from the wrapper thread.
             if let Event::UserEvent(status) = event {
                 let is_terminal = state.apply_status(&status);
@@ -690,6 +746,57 @@ mod platform {
 
 #[allow(unused_imports, dead_code)]
 pub use platform::run_tray_event_loop;
+
+/// macOS: handle `freenet://` links LaunchServices delivered to THIS process
+/// when it is a second copy about to exit because another wrapper holds the
+/// single-instance lock.
+///
+/// LaunchServices launches a new copy for a link when it does not (yet) see a
+/// running instance, e.g. in the moment after login or a relaunch, before the
+/// running wrapper's AppKit loop has checked in. That copy queues the link
+/// for itself; exiting without an event loop would drop it silently. So pump
+/// one briefly, open any link it receives (the node is up: the other wrapper
+/// is running it), then exit. `tao`'s run loop ends the process when done.
+#[cfg(target_os = "macos")]
+pub fn handle_links_sent_to_duplicate(window: std::time::Duration) -> ! {
+    use std::time::{Duration, Instant};
+    use tao::event::Event;
+    use tao::event_loop::{ControlFlow, EventLoop};
+    use tao::platform::macos::{ActivationPolicy, EventLoopExtMacOS};
+
+    let started = Instant::now();
+    let deadline = started + window;
+    // Hard cap on this process's life, links included, well inside the
+    // 120s the macOS bundle updater waits for bundle processes to exit.
+    let lifetime_end = started + Duration::from_secs(60);
+    let mut event_loop = EventLoop::new();
+    // A background helper, not an app the user switched to: no Dock icon, no
+    // stealing focus (tao defaults to a regular, activating app).
+    event_loop.set_activation_policy(ActivationPolicy::Accessory);
+    event_loop.set_activate_ignoring_other_apps(false);
+    event_loop.run(move |event, _window, control_flow| {
+        *control_flow = ControlFlow::WaitUntil(deadline);
+        if let Event::Opened { urls } = event {
+            // Handled inline: this process does nothing else, and it must not
+            // exit before the browser has been asked to open the link.
+            for url in urls.iter().take(4) {
+                // The running wrapper may have only just started its node
+                // (this is the login/relaunch window), so wait as long as a
+                // fresh launch would, within the lifetime cap.
+                let wait = super::open_link::APP_LAUNCH_NODE_WAIT
+                    .min(lifetime_end.saturating_duration_since(Instant::now()));
+                let outcome = super::open_link::handle_link(url.as_str(), wait, None);
+                super::service::log_to_wrapper_log(&format!(
+                    "Handled a freenet:// link in a duplicate launch: outcome={}",
+                    outcome.kind()
+                ));
+            }
+        }
+        if Instant::now() >= deadline {
+            *control_flow = ControlFlow::Exit;
+        }
+    })
+}
 
 /// Open the latest log file in the platform's default viewer.
 #[allow(dead_code)]

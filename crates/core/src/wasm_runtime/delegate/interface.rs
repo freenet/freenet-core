@@ -59,12 +59,11 @@ impl DelegateRuntimeInterface for Runtime {
         if inbound.is_empty() {
             return Ok(results);
         }
-        let (mut running, api_version) = self.prepare_delegate_call(params, delegate_key, 4096)?;
+        let mut running = self.prepare_delegate_call(params, delegate_key, 4096)?;
         let instance_id = running.id;
 
         tracing::debug!(
             delegate_key = %delegate_key,
-            api_version = %api_version,
             "Starting delegate execution"
         );
 
@@ -128,7 +127,6 @@ impl DelegateRuntimeInterface for Runtime {
                             std::mem::take(&mut context),
                             &running.handle,
                             instance_id,
-                            api_version,
                         )?;
                         context = updated_context;
 
@@ -154,7 +152,6 @@ impl DelegateRuntimeInterface for Runtime {
                             std::mem::take(&mut context),
                             &running.handle,
                             instance_id,
-                            api_version,
                         )?;
                         context = updated_context;
 
@@ -180,7 +177,6 @@ impl DelegateRuntimeInterface for Runtime {
                             std::mem::take(&mut context),
                             &running.handle,
                             instance_id,
-                            api_version,
                         )?;
                         context = updated_context;
 
@@ -210,7 +206,6 @@ impl DelegateRuntimeInterface for Runtime {
                             std::mem::take(&mut context),
                             &running.handle,
                             instance_id,
-                            api_version,
                         )?;
                         context = updated_context;
 
@@ -241,7 +236,6 @@ impl DelegateRuntimeInterface for Runtime {
                             std::mem::take(&mut context),
                             &running.handle,
                             instance_id,
-                            api_version,
                         )?;
                         context = updated_context;
 

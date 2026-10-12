@@ -1044,3 +1044,525 @@ async fn summarize_arms_partition_every_call_exactly_once() {
         "no WASM call fired: the partition holds vacuously"
     );
 }
+
+// =========================================================================
+// CACHE OCCUPANCY GAUGES (why a miss happened, not just that it did)
+// =========================================================================
+
+/// The summary and delta caches publish their occupancy into the node's
+/// `ContractExecMetrics`, which `router_snapshot` exports. Entries and counted
+/// bytes must track what is actually resident, so an operator can see the byte
+/// budget binding (bytes pinned at budget, evictions climbing) instead of
+/// inferring it from a rising WASM-call rate.
+#[tokio::test(flavor = "current_thread")]
+async fn cache_occupancy_reaches_contract_exec_metrics() {
+    use crate::util::byte_bounded_lru::CACHE_ENTRY_OVERHEAD_BYTES;
+
+    let storage = MockStateStorage::new();
+    let (op_manager, _guards) = build_op_manager("cache_occupancy_gauges").await;
+    let mut exec = Executor::new_mock_wasm_uncached_with_op_manager(
+        "cache_occupancy_gauges",
+        storage.clone(),
+        op_manager.clone(),
+    )
+    .await
+    .expect("create executor with op_manager");
+
+    let before = op_manager
+        .ring
+        .contract_exec_metrics()
+        .fast_path_cache_snapshot();
+    assert!(
+        before.summary.budget_bytes > 0 && before.delta.budget_bytes > 0,
+        "an attached cache must publish its byte budget: {before:?}"
+    );
+    assert_eq!((before.summary.entries, before.summary.bytes), (0, 0));
+
+    let peer_summary = StateSummary::from(vec![7u8; 4]);
+    for i in 0..3u8 {
+        let contract = test_contract(format!("cache_occupancy_{i}").as_bytes());
+        let key = contract.key();
+        exec.upsert_contract_state(
+            key,
+            Either::Left(WrappedState::new(vec![i, 1, 2, 3, 4])),
+            RelatedContracts::default(),
+            Some(contract.clone()),
+        )
+        .await
+        .expect("PUT");
+        exec.summarize_contract_state(key).await.expect("summarize");
+        exec.get_contract_state_delta(key, peer_summary.clone())
+            .await
+            .expect("delta");
+    }
+
+    let after = op_manager
+        .ring
+        .contract_exec_metrics()
+        .fast_path_cache_snapshot();
+    // MockWasmRuntime summaries are blake3 digests (32 B); its deltas are the
+    // full 5-byte state.
+    assert_eq!(after.summary.entries, 3);
+    assert_eq!(
+        after.summary.bytes,
+        3 * (32 + CACHE_ENTRY_OVERHEAD_BYTES) as u64
+    );
+    assert_eq!(after.delta.entries, 3);
+    assert_eq!(
+        after.delta.bytes,
+        3 * (5 + CACHE_ENTRY_OVERHEAD_BYTES) as u64
+    );
+    assert_eq!(after.summary.count_cap_evictions_total, 0);
+    assert_eq!(after.summary.byte_budget_evictions_total, 0);
+    assert_eq!(after.delta.count_cap_evictions_total, 0);
+    assert_eq!(after.delta.byte_budget_evictions_total, 0);
+
+    // Dropping the executor withdraws its caches' contribution entirely.
+    drop(exec);
+    let dropped = op_manager
+        .ring
+        .contract_exec_metrics()
+        .fast_path_cache_snapshot();
+    assert_eq!(
+        (
+            dropped.summary.entries,
+            dropped.summary.bytes,
+            dropped.summary.budget_bytes
+        ),
+        (0, 0, 0),
+        "a dropped executor must not leave phantom cache occupancy"
+    );
+}
+
+// =========================================================================
+// POOL-SHARED CACHES (#5795)
+// =========================================================================
+//
+// A `RuntimePool` gives every executor the SAME summary/delta cache pair and
+// the SAME `StateStore` (whose change-detector is a shared moka cache). These
+// tests model that with two mock executors wired the same way: `pool_pair`
+// shares the state store and installs one cache pair on both. The (key,
+// state_hash) validation is unchanged, so sharing must never serve a summary
+// or delta computed against a different state.
+
+use crate::contract::executor::{
+    SharedDeltaCache, SharedSummaryCache, lock_fast_path_cache, new_delta_cache, new_summary_cache,
+};
+use crate::util::byte_bounded_lru::CACHE_ENTRY_OVERHEAD_BYTES;
+
+/// Counted weight of one `MockWasmRuntime` summary (a 32-byte blake3 digest).
+const MOCK_SUMMARY_WEIGHT: usize = 32 + CACHE_ENTRY_OVERHEAD_BYTES;
+
+type MockExec = Executor<MockWasmRuntime, MockStateStorage>;
+
+/// Two executors over one storage + one `StateStore`, both pointed at the given
+/// cache pair — the shape `RuntimePool::new` builds.
+async fn pool_pair(
+    id: &str,
+    op_manager: &Arc<OpManager>,
+    summary: SharedSummaryCache,
+    delta: SharedDeltaCache,
+) -> (MockExec, MockExec, MockStateStorage) {
+    let storage = MockStateStorage::new();
+    let mut e0 =
+        Executor::new_mock_wasm_uncached_with_op_manager(id, storage.clone(), op_manager.clone())
+            .await
+            .expect("executor 0");
+    let mut e1 =
+        Executor::new_mock_wasm_uncached_with_op_manager(id, storage.clone(), op_manager.clone())
+            .await
+            .expect("executor 1");
+    e1.state_store = e0.state_store.clone();
+    e0.set_shared_fast_path_caches(summary.clone(), delta.clone());
+    e1.set_shared_fast_path_caches(summary, delta);
+    (e0, e1, storage)
+}
+
+async fn put_state(exec: &mut MockExec, seed: &str, state: Vec<u8>) -> ContractKey {
+    let contract = test_contract(seed.as_bytes());
+    let key = contract.key();
+    exec.upsert_contract_state(
+        key,
+        Either::Left(WrappedState::new(state)),
+        RelatedContracts::default(),
+        Some(contract),
+    )
+    .await
+    .expect("PUT");
+    key
+}
+
+/// A summary computed via executor 0 is a FAST hit via executor 1 — no WASM
+/// call. The control half runs the same sequence with per-executor caches (the
+/// pre-#5795 shape) and asserts executor 1 then DOES run the WASM, so the first
+/// half is decisive rather than passing for an unrelated reason.
+#[tokio::test(flavor = "current_thread")]
+async fn summary_cached_via_one_executor_is_a_hit_via_another() {
+    let (op_manager, _guards) = build_op_manager("shared_summary_hit").await;
+    let (mut e0, mut e1, _storage) = pool_pair(
+        "shared_summary_hit",
+        &op_manager,
+        new_summary_cache(1 << 20, 1 << 20, None),
+        new_delta_cache(1 << 20, 1 << 20, None),
+    )
+    .await;
+    let key = put_state(&mut e0, "shared_summary_hit", vec![1, 2, 3]).await;
+
+    let before = exec_counts(&op_manager);
+    let s0 = e0
+        .summarize_contract_state(key)
+        .await
+        .expect("summarize via e0");
+    let s1 = e1
+        .summarize_contract_state(key)
+        .await
+        .expect("summarize via e1");
+    let after = exec_counts(&op_manager);
+    assert_eq!(s0.as_ref(), s1.as_ref());
+    assert_eq!(
+        after.summarize_wasm_calls - before.summarize_wasm_calls,
+        1,
+        "only the first executor may run the WASM; the second must hit the shared cache"
+    );
+    assert_eq!(after.summarize_fast_hits - before.summarize_fast_hits, 1);
+
+    // Control: same wiring but each executor keeps its OWN cache.
+    let (op_manager, _guards2) = build_op_manager("unshared_summary_miss").await;
+    let (mut e0, mut e1, _storage) = pool_pair(
+        "unshared_summary_miss",
+        &op_manager,
+        new_summary_cache(1 << 20, 1 << 20, None),
+        new_delta_cache(1 << 20, 1 << 20, None),
+    )
+    .await;
+    e1.set_shared_fast_path_caches(
+        new_summary_cache(1 << 20, 1 << 20, None),
+        new_delta_cache(1 << 20, 1 << 20, None),
+    );
+    let key = put_state(&mut e0, "unshared_summary_miss", vec![1, 2, 3]).await;
+    let before = exec_counts(&op_manager);
+    e0.summarize_contract_state(key)
+        .await
+        .expect("summarize via e0");
+    e1.summarize_contract_state(key)
+        .await
+        .expect("summarize via e1");
+    let after = exec_counts(&op_manager);
+    assert_eq!(
+        after.summarize_wasm_calls - before.summarize_wasm_calls,
+        2,
+        "control: with per-executor caches the second executor re-runs the WASM"
+    );
+}
+
+/// The delta twin: a delta computed via executor 0 for a given peer summary is
+/// a fast hit via executor 1.
+#[tokio::test(flavor = "current_thread")]
+async fn delta_cached_via_one_executor_is_a_hit_via_another() {
+    let (op_manager, _guards) = build_op_manager("shared_delta_hit").await;
+    let (mut e0, mut e1, _storage) = pool_pair(
+        "shared_delta_hit",
+        &op_manager,
+        new_summary_cache(1 << 20, 1 << 20, None),
+        new_delta_cache(1 << 20, 1 << 20, None),
+    )
+    .await;
+    let key = put_state(&mut e0, "shared_delta_hit", vec![4, 5, 6]).await;
+    let peer = StateSummary::from(vec![9u8; 4]);
+
+    let before = exec_counts(&op_manager);
+    let d0 = e0
+        .get_contract_state_delta(key, peer.clone())
+        .await
+        .expect("delta via e0");
+    let d1 = e1
+        .get_contract_state_delta(key, peer.clone())
+        .await
+        .expect("delta via e1");
+    let after = exec_counts(&op_manager);
+    assert_eq!(d0.as_ref(), d1.as_ref());
+    assert_eq!(after.delta_wasm_calls - before.delta_wasm_calls, 1);
+    assert_eq!(after.delta_fast_hits - before.delta_fast_hits, 1);
+}
+
+/// A state written via executor 1 invalidates what executor 0 cached: the next
+/// summarize/delta via executor 0 sees a hash mismatch and recomputes against
+/// the NEW state. This is the divergence guard for the shared cache.
+#[tokio::test(flavor = "current_thread")]
+async fn state_change_via_another_executor_invalidates_shared_entries() {
+    let (op_manager, _guards) = build_op_manager("shared_invalidate").await;
+    let (mut e0, mut e1, _storage) = pool_pair(
+        "shared_invalidate",
+        &op_manager,
+        new_summary_cache(1 << 20, 1 << 20, None),
+        new_delta_cache(1 << 20, 1 << 20, None),
+    )
+    .await;
+    let state_a = vec![1u8, 1, 1];
+    let state_b = vec![2u8, 2, 2, 2];
+    let key = put_state(&mut e0, "shared_invalidate", state_a.clone()).await;
+    let peer = StateSummary::from(vec![3u8; 4]);
+
+    let sa = e0.summarize_contract_state(key).await.expect("summarize A");
+    assert_eq!(sa.as_ref(), blake3::hash(&state_a).as_bytes());
+    let da = e0
+        .get_contract_state_delta(key, peer.clone())
+        .await
+        .expect("delta A");
+    assert_eq!(da.as_ref(), state_a.as_slice());
+
+    // UPDATE through the OTHER executor. The mock runtime's contract-code store
+    // is per executor (the real pool's is shared), so hand e1 the code.
+    e1.upsert_contract_state(
+        key,
+        Either::Left(WrappedState::new(state_b.clone())),
+        RelatedContracts::default(),
+        Some(test_contract(b"shared_invalidate")),
+    )
+    .await
+    .expect("UPDATE B via e1");
+
+    let before = exec_counts(&op_manager);
+    let sb = e0.summarize_contract_state(key).await.expect("summarize B");
+    let db = e0
+        .get_contract_state_delta(key, peer.clone())
+        .await
+        .expect("delta B");
+    let after = exec_counts(&op_manager);
+    assert_eq!(
+        sb.as_ref(),
+        blake3::hash(&state_b).as_bytes(),
+        "summary must reflect B, never the shared cache's stale A"
+    );
+    assert_eq!(db.as_ref(), state_b.as_slice(), "delta must reflect B");
+    assert_eq!(after.summarize_wasm_calls - before.summarize_wasm_calls, 1);
+    assert_eq!(after.delta_wasm_calls - before.delta_wasm_calls, 1);
+}
+
+/// Scaled model of the production failure: a per-executor budget that holds
+/// only `PER_EXEC` summaries (the 32 MiB / ~16.7 KB ≈ 1,900 River case) and a
+/// working set larger than that but within the pool aggregate. The shared cache
+/// at `POOL × PER_EXEC` holds the whole set: no eviction, and a second pass is
+/// all fast hits with zero WASM. The control cache at the per-executor budget
+/// evicts and re-runs the WASM on the second pass.
+#[tokio::test(flavor = "current_thread")]
+async fn no_eviction_when_working_set_fits_the_aggregate_budget() {
+    const PER_EXEC: usize = 40;
+    const POOL: usize = 4;
+    const WORKING_SET: usize = 150; // > PER_EXEC, <= POOL * PER_EXEC
+
+    async fn two_passes(budget: usize, id: &str) -> (u64, u64) {
+        let (op_manager, _guards) = build_op_manager(id).await;
+        let summary = new_summary_cache(
+            budget,
+            budget,
+            Some(
+                op_manager
+                    .ring
+                    .contract_exec_metrics()
+                    .summary_cache_gauges()
+                    .clone(),
+            ),
+        );
+        let (mut e0, mut e1, _storage) = pool_pair(
+            id,
+            &op_manager,
+            summary.clone(),
+            new_delta_cache(1 << 20, 1 << 20, None),
+        )
+        .await;
+        let mut keys = Vec::new();
+        for i in 0..WORKING_SET {
+            keys.push(
+                put_state(&mut e0, &format!("{id}_{i}"), vec![i as u8, (i >> 8) as u8]).await,
+            );
+        }
+        // Pass 1 alternates executors, as a pool with off-loop exports would.
+        for (i, key) in keys.iter().enumerate() {
+            let e = if i % 2 == 0 { &mut e0 } else { &mut e1 };
+            e.summarize_contract_state(*key).await.expect("pass 1");
+        }
+        let before = exec_counts(&op_manager);
+        for (i, key) in keys.iter().enumerate() {
+            let e = if i % 2 == 0 { &mut e1 } else { &mut e0 };
+            e.summarize_contract_state(*key).await.expect("pass 2");
+        }
+        let after = exec_counts(&op_manager);
+        let evictions = op_manager
+            .ring
+            .contract_exec_metrics()
+            .fast_path_cache_snapshot()
+            .summary;
+        let evictions = evictions.count_cap_evictions_total + evictions.byte_budget_evictions_total;
+        (
+            after.summarize_wasm_calls - before.summarize_wasm_calls,
+            evictions,
+        )
+    }
+
+    let (wasm, evictions) =
+        two_passes(POOL * PER_EXEC * MOCK_SUMMARY_WEIGHT, "aggregate_fits").await;
+    assert_eq!(
+        evictions, 0,
+        "the working set fits the aggregate: nothing may be evicted"
+    );
+    assert_eq!(
+        wasm, 0,
+        "pass 2 must be served entirely from the shared cache"
+    );
+
+    let (wasm, evictions) = two_passes(PER_EXEC * MOCK_SUMMARY_WEIGHT, "per_exec_thrash").await;
+    assert!(
+        evictions > 0 && wasm > 0,
+        "control: a per-executor-sized cache must evict and re-run WASM \
+         (evictions={evictions}, wasm={wasm})"
+    );
+}
+
+/// The shared cache still enforces its byte budget: past capacity it evicts LRU
+/// entries, total counted bytes never exceed the budget, and every eviction is
+/// counted in the metrics `router_snapshot` exports.
+#[tokio::test(flavor = "current_thread")]
+async fn shared_cache_budget_is_enforced_and_evictions_are_counted() {
+    const CAPACITY: usize = 10;
+    const INSERTED: usize = 25;
+    let budget = CAPACITY * MOCK_SUMMARY_WEIGHT;
+    let (op_manager, _guards) = build_op_manager("shared_budget").await;
+    let metrics = op_manager.ring.contract_exec_metrics();
+    let summary = new_summary_cache(budget, budget, Some(metrics.summary_cache_gauges().clone()));
+    let delta_budget = CAPACITY * (2 + CACHE_ENTRY_OVERHEAD_BYTES);
+    let delta = new_delta_cache(
+        delta_budget,
+        delta_budget,
+        Some(metrics.delta_cache_gauges().clone()),
+    );
+    let (mut e0, mut e1, _storage) =
+        pool_pair("shared_budget", &op_manager, summary.clone(), delta.clone()).await;
+    let peer = StateSummary::from(vec![1u8; 4]);
+    for i in 0..INSERTED {
+        let e = if i % 2 == 0 { &mut e0 } else { &mut e1 };
+        let key = put_state(e, &format!("shared_budget_{i}"), vec![i as u8, 0]).await;
+        e.summarize_contract_state(key).await.expect("summarize");
+        e.get_contract_state_delta(key, peer.clone())
+            .await
+            .expect("delta");
+        let cache = lock_fast_path_cache(&summary);
+        assert!(
+            cache.total_bytes() <= budget,
+            "byte budget exceeded at insert {i}"
+        );
+    }
+
+    assert_eq!(lock_fast_path_cache(&summary).len(), CAPACITY);
+    assert_eq!(lock_fast_path_cache(&delta).len(), CAPACITY);
+    let snap = metrics.fast_path_cache_snapshot();
+    assert_eq!(snap.summary.entries, CAPACITY as u64);
+    assert_eq!(snap.summary.bytes, budget as u64);
+    assert_eq!(snap.summary.budget_bytes, budget as u64);
+    assert_eq!(
+        snap.summary.byte_budget_evictions_total,
+        (INSERTED - CAPACITY) as u64,
+        "the byte budget is what binds here, so every eviction is a byte eviction"
+    );
+    assert_eq!(snap.summary.count_cap_evictions_total, 0);
+    assert_eq!(snap.delta.entries, CAPACITY as u64);
+    assert_eq!(
+        snap.delta.byte_budget_evictions_total,
+        (INSERTED - CAPACITY) as u64
+    );
+}
+
+/// The detector-WARM fast path across executors. Executor 0 caches the summary
+/// of state A. Executor 1 then writes state B and warms the shared detector
+/// with B's hash WITHOUT touching the summary cache (a delta call loads and
+/// hashes the state). Executor 0's next summarize therefore finds a warm
+/// detector (B) next to a cached entry for A: only the fast path's hash
+/// comparison stands between it and serving A's summary for state B.
+#[tokio::test(flavor = "current_thread")]
+async fn warm_detector_fast_path_rejects_entry_cached_for_an_older_state() {
+    let (op_manager, _guards) = build_op_manager("warm_detector_cross_exec").await;
+    let (mut e0, mut e1, _storage) = pool_pair(
+        "warm_detector_cross_exec",
+        &op_manager,
+        new_summary_cache(1 << 20, 1 << 20, None),
+        new_delta_cache(1 << 20, 1 << 20, None),
+    )
+    .await;
+    let state_a = vec![5u8, 5, 5];
+    let state_b = vec![6u8, 6, 6, 6];
+    let key = put_state(&mut e0, "warm_detector_cross_exec", state_a.clone()).await;
+    let sa = e0.summarize_contract_state(key).await.expect("summarize A");
+    assert_eq!(sa.as_ref(), blake3::hash(&state_a).as_bytes());
+
+    e1.upsert_contract_state(
+        key,
+        Either::Left(WrappedState::new(state_b.clone())),
+        RelatedContracts::default(),
+        Some(test_contract(b"warm_detector_cross_exec")),
+    )
+    .await
+    .expect("UPDATE B via e1");
+    // Warm the shared detector with B via executor 1, leaving the summary cache
+    // holding A's entry.
+    e1.get_contract_state_delta(key, StateSummary::from(vec![0u8; 4]))
+        .await
+        .expect("delta B via e1 warms the detector");
+    let b_hash = crate::wasm_runtime::state_hash(&WrappedState::new(state_b.clone()));
+    assert_eq!(
+        e0.state_store.cached_state_hash(&key),
+        Some(b_hash),
+        "precondition: executor 0 sees a WARM detector holding B's hash"
+    );
+
+    let before = exec_counts(&op_manager);
+    let sb = e0.summarize_contract_state(key).await.expect("summarize B");
+    let after = exec_counts(&op_manager);
+    assert_eq!(
+        sb.as_ref(),
+        blake3::hash(&state_b).as_bytes(),
+        "the warm-detector fast path must not serve A's cached summary for B"
+    );
+    assert_eq!(after.summarize_fast_hits, before.summarize_fast_hits);
+    assert_eq!(after.summarize_wasm_calls - before.summarize_wasm_calls, 1);
+}
+
+/// The pool-shared cache refuses a single summary larger than its per-entry
+/// cap (one executor's budget) even though the aggregate budget could hold it,
+/// so it is recomputed rather than cached, and nothing resident is evicted.
+#[tokio::test(flavor = "current_thread")]
+async fn shared_cache_refuses_entry_above_the_per_entry_cap() {
+    let (op_manager, _guards) = build_op_manager("per_entry_cap").await;
+    let metrics = op_manager.ring.contract_exec_metrics();
+    // Aggregate holds plenty of mock summaries; the per-entry cap is just
+    // below one mock summary's counted weight, so every summary is "oversized".
+    let summary = new_summary_cache(
+        100 * MOCK_SUMMARY_WEIGHT,
+        MOCK_SUMMARY_WEIGHT - 1,
+        Some(metrics.summary_cache_gauges().clone()),
+    );
+    let (mut e0, mut e1, _storage) = pool_pair(
+        "per_entry_cap",
+        &op_manager,
+        summary.clone(),
+        new_delta_cache(1 << 20, 1 << 20, None),
+    )
+    .await;
+    let key = put_state(&mut e0, "per_entry_cap", vec![1, 2, 3]).await;
+
+    let before = exec_counts(&op_manager);
+    e0.summarize_contract_state(key).await.expect("summarize 1");
+    e1.summarize_contract_state(key).await.expect("summarize 2");
+    let after = exec_counts(&op_manager);
+    assert_eq!(
+        after.summarize_wasm_calls - before.summarize_wasm_calls,
+        2,
+        "an over-cap summary must not be cached, so both calls run the WASM"
+    );
+    assert_eq!(lock_fast_path_cache(&summary).len(), 0);
+    let snap = metrics.fast_path_cache_snapshot().summary;
+    assert_eq!(snap.entries, 0);
+    assert_eq!(
+        snap.count_cap_evictions_total + snap.byte_budget_evictions_total,
+        0
+    );
+}

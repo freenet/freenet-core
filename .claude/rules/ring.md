@@ -78,15 +78,36 @@ WHEN accepting a new connection (should_accept):
      populated). The SLACK budget is GLOBAL (counts all non-stale reservations,
      not just over-cap lattice ones), so on a node AT max unrelated in-flight
      handshakes can throttle tightening until they drain (bounded by the TTL;
-     continuous discovery retries). This only bites nodes genuinely at max (mostly
+     lattice discovery's finite re-checks may retry it). This only bites nodes genuinely at max (mostly
      busy gateways); a peer below max tightens via the under-cap path, which never
      consults this ceiling. A lattice-private budget is a possible future
      refinement. A second, independent bound: each admitted candidate that
      ESTABLISHES advances the per-side current-nearest, so the established sequence
      is strictly decreasing (a short records chain) and the absolute ceiling
-     hard-bounds the ESTABLISHED set. The route-to-self discovery probe
-     likewise runs CONTINUOUSLY (decaying toward tau_max, never stopping when both
-     sides are filled) so a filled-but-loose edge keeps tightening. See
+     hard-bounds the ESTABLISHED set. The route-to-self discovery probe does
+     not stop when both sides are filled (decaying toward tau_max), so a
+     filled-but-loose edge keeps tightening, BUT it SLEEPS once both sides look
+     tight (ring.rs LatticeProbeScheduler): a connected probe acceptor that is
+     not the per-side nearest (ConnectionManager::record_lattice_probe_result)
+     is a MISS for its side, and for the other side too when it lies farther
+     out than that side's held nearest, recorded by the CONNECT driver for
+     ClientConnectKind::LatticeProbe with the scheduler generation current at
+     launch. A miss on each side in the current generation puts discovery to
+     sleep until a per-side nearest distance changes (fill, tighten, loss, or
+     widening) or a re-check starts a new generation. Re-checks are FINITE
+     per lattice state, because each re-check of a tight lattice keeps a link
+     (ring.rs lattice_probe_timing: 2h, 4h, 8h; after a failed hit, i.e. a
+     closer peer found but not connected, 10 to 80 min, up to four times,
+     not reset by lattice changes, then the re-check ladder). A miss is EVIDENCE, not proof: a failed
+     hole punch, a near-terminus relay, or a recently-failed nearest peer, or
+     one that rejected the request, can make a loose side look tight, which
+     is why it re-checks and why acceptors that failed to connect are not
+     misses (except at this peer's own max_connections, where our cap refuses
+     every non-lattice acceptor). Probe acceptors are never DROPPED by the driver:
+     the transport has no close message, so a dropped link stays dead on the
+     far end until its idle timeout. Probing forever and keeping every result
+     added a non-lattice link per probe (nothing prunes below max at low
+     bandwidth), so degree crept with uptime (#5814). See
      connection_manager.rs and ring.rs.
   3. Compute Kleinberg gap score (small_world_rand::kleinberg_score):
      → Map all connection distances to log-space (1/d = uniform in log)
@@ -193,6 +214,229 @@ WHEN selecting next hop for message:
 WHEN routing fails (no peers):
   → Return RingError::EmptyRing
   → Do NOT panic or unwrap
+```
+
+### Routing Predictors (#4485)
+
+```
+ONE estimator routes: the hierarchical empirical-Bayes estimator
+(router/hierarchical.rs). An EB-shrunk isotonic distance curve, then a
+root > peer > (peer, band) hierarchy shrunk by evidence, with the forgetting
+horizon chosen online. The legacy stack (Renegade, the fixed 50:50 blend, the
+residual correction) was removed by #5681, after the hierarchical estimator had
+been soaked on a gateway with FREENET_ROUTING_HIERARCHICAL=1 and shipped as the
+default. The build WITHOUT the legacy stack has not itself been soaked: its
+confirmation soak is pending and gates the release that carries it.
+FREENET_ROUTING_HIERARCHICAL and FREENET_ROUTING_RESIDUAL_CORRECTION are
+ignored, with a warning at startup when set.
+
+The FAILURE stage chooses its forgetting horizon from a shorter menu
+(FAILURE_HORIZONS_HOURS) than the timing stages (LOG_HORIZONS_HOURS), so a
+failure burst is tracked faster, and it carries a CONTRACT-LEVEL TERM: a second
+hierarchy, contract > (contract, peer), whose effect is subtracted from what the
+peer levels learn (from OTHER peers only, so a peer's own failures never explain
+themselves away) and added back to a forecast (from all present peers). It
+exists because a failure on a contract nobody can serve was learned as evidence
+about the peer that was asked, which raised that peer's forecasts for every
+other contract (#5700, #5702). It is on unconditionally; there is no flag for it.
+
+The ISOTONIC estimators (isotonic_estimator.rs) REMAIN, in four routing roles
+(router.rs) plus two others:
+  - the 50-event gate between distance-only and prediction-based routing
+    (has_sufficient_routing_events reads the failure estimator's window)
+  - below the gate, the "prefer untried peers" order: a peer with an entry in
+    the failure estimator's per-peer EWMA map sorts after one without
+  - the fallback for a TIMING stage without a hierarchical curve yet (timing
+    stages need 30 samples; the failure stage is warm long before the gate
+    opens), with the transfer-speed floor below
+  - a peer the isotonic failure estimate rejects (no location) gets no
+    prediction and sorts after every peer that has one
+  - not routing: the dashboard's distance charts and the peer page's
+    per-peer windows (IsotonicEstimator::points_for_peer: the scatter, and
+    the reliability tile and request tabs, which count the failure window);
+    and ConnectForwardEstimator (CONNECT) is an IsotonicEstimator of its own
+Do not remove them without replacing every role.
+
+WHEN touching the router:
+  → router/golden_replay.rs pins routing decisions bit for bit to the last
+    build that routed with the legacy stack still present (origin/main
+    46bf2002f, flag on; first generated on the soaked d9fa29522 and
+    regenerated once for #5702, see its module doc). Keep it green.
+    Regenerate its golden files ONLY on a shipped or soaked build and for a
+    change you can attribute number by number, never to make it pass.
+  → The two known divergences from that build:
+    (1) a timing stage holding 10-29 samples no longer blends Renegade into
+        its isotonic fallback. Pinned by
+        a_cold_timing_stage_falls_back_to_the_isotonic_estimate_alone.
+    (2) the isotonic transfer-speed estimate routing uses is floored at
+        DEGENERATE_SPEED_FLOOR_BPS (1e-6 B/s, tiny so a floored peer still sorts
+        after every working one), a lower bound on EVERY estimate
+        (`raw.max(floor)`), where the reference build priced a zero estimate
+        at the f64::MAX/2 sentinel. The floor must stay ONE value for every
+        candidate: a floor relative to the curve at each candidate's own
+        distance reordered peers across distances (the curve falls with
+        distance, the additive per-peer adjustment does not), and one relative
+        to the curve's minimum tied real estimates because the curve
+        extrapolates toward zero. Pinned by
+        a_degenerate_isotonic_transfer_speed_is_floored and the
+        a_floored_transfer_speed_* ranking tests; golden_replay skips the
+        decisions it changes (golden/degenerate.txt). A floored peer sorts
+        last, so while the transfer stage is cold (or the fallback switch is
+        on) it is offered almost no new transfers and its estimate is largely
+        STICKY: it recovers when the hierarchical transfer stage warms (30
+        transfers node-wide; never, with the switch on) or a refit re-anchors
+        its adjustment. Same as main's sentinel, now written down.
+    Both act only while a timing stage has no hierarchical curve (fewer than
+    30 samples), but they reach golden_replay differently. (1) acts only at
+    10-29 samples, the window golden_replay does NOT compare. (2) acts from
+    the 5th transfer, when the isotonic transfer estimate first exists, so at
+    5-9 transfers it acts INSIDE compared decisions; that is why
+    golden/degenerate.txt exists. That cold period is not a startup
+    curiosity: the router is rebuilt empty on every restart, and timed
+    samples are about 4% of route events (payload transfers about 2%), so it
+    recurs after every restart and lasts a long time. A confirmation soak
+    must therefore include decisions made soon after a node restart, not only
+    a long-running node.
+  → Routing-behaviour guards cover BOTH paths through Training: History (a
+    history-built router never feeds the hierarchical estimator, so it routes
+    on the isotonic fallback) and WarmHierarchical (trained through add_event
+    with a frozen clock; asserts every FAILURE probability, and every timing
+    estimate the estimator supplies, came from the hierarchical estimate). Its
+    timing stages warm only after 30 timed successes, so a guard whose
+    property depends on timing must train that many and call
+    assert_hierarchical_timing_decides. Where both paths agree bit for bit
+    (all-success data), add a FALLBACK_STAGE_EVALUATIONS delta check. Give a
+    new guard both modes.
+  → The hierarchical estimator's time comes from the router's injected
+    TimeSource, never the host wall clock. Ring wires ring.time_source, an
+    InstantTimeSrc reading tokio's clock: it advances under a paused tokio
+    runtime (direct sim runner) but NOT under hosting_time_source_override.
+    Router-level tests inject a SharedMockTimeSource and advance it by hand.
+  → Its peer tables are sized from max_connections (peer_capacity), evict
+    LRU in batches, and export evictions — do not hard-code a peer cap
+  → The peer page states what routing EXPECTS, from the lines it draws.
+    Its prediction LINES are routing's own predictions
+    (PeerRoutingSnapshot::curves: HierarchicalRouting::peer_curves once a
+    timing stage is warm, else the isotonic estimate with its per-peer
+    correction; empty before the 50-event gate and for a peer with no
+    location), pinned against predict_routing_outcome by
+    routing_curves_are_what_routing_predicts and
+    a_cold_timing_stage_shows_the_estimate_routing_falls_back_to. Its "N×
+    faster/slower than distance alone" is Router::expected_response_factor,
+    the ratio of those two response-time lines at distance 0 (pinned by
+    the_expected_factor_is_the_ratio_of_the_lines_at_distance_zero), NOT
+    exp(offset): the lines are expected values, bound included, and a
+    median would disagree with them. peer_offsets (the learned typical
+    difference and its adopted weight) gates whether a reading is stated
+    (weight >= 0.5) and places the failure dots in percentage points.
+    Level::residual_steps repeats Level::residual's arithmetic for this and
+    is pinned against it by residual_steps_match_the_residual_routing_reads.
+    The response-time tile shows prediction_at_own_location. Per-peer
+    eligible/chosen counts (PeerSelectionCounts) count only
+    DecisionLog::Joinable decisions and halve (exactly; chosen is f64) when
+    eligible reaches SELECTION_RECENT_DECISIONS
+  → PAIRED VALUES, failure probability: the estimator returns TWO failure
+    numbers per candidate and they are not interchangeable.
+    failure_probability is clamped to [0, 1] and is what is REPORTED and
+    RECORDED (RoutingPrediction, the dataset, telemetry, the dashboard);
+    failure_ranking (hierarchical::ranking_failure_probability) is what the
+    cost formula RANKS BY, and it keeps the order of the forecasts above 1 so
+    that several peers clamped at 1 are not tied. They differ only above 1,
+    and then by at most RANKING_OVERSHOOT_SLOPE per unit of overshoot. Below 0
+    the ranking value is pinned at 0 deliberately: carrying the downward
+    overshoot made the no-timing cost branch (failure * 3.0) negative for the
+    healthiest peers, which the dashboard then printed as "N/A". Consequences to
+    keep in mind: an offline tool CANNOT reproduce the router's order among
+    candidates that all clamp, because the unbounded value is recorded
+    nowhere; and recomputing expected_total_time from the recorded
+    failure_probability reproduces it only to within the slope.
+  → Do NOT write that a contract-level change "cannot change which peer is
+    picked". A quantity common to every candidate cannot reorder the
+    candidates' failure PROBABILITIES, but routing ranks by
+    `t + transfer + 3*t*p`, so a common change of `d` moves candidate i's cost
+    by `3*t_i*d`, which differs across candidates whose response times differ.
+    See hierarchical.rs, "Contract term", and
+    a_shared_contract_effect_reweights_peers_that_differ_in_response_time.
+  → The contract term must export enough to tell "it worked and helped
+    nothing" from "it never activated". _contract_estimable_refits is NECESSARY
+    and not sufficient for that: the effect is also refused per query below the
+    present-peer bar, and on the recorded soak most failures are on contracts
+    that never reach it, so a node estimable at every refit that moves no
+    forecast would read as active. The counters that answer the question are
+    _contract_effects_applied and _contract_forecast_offsets; read
+    _contract_tau2 beside _contract_qualifying_contracts, because a value
+    resting on two contracts is otherwise indistinguishable from one resting on
+    eighty, and beside _contract_den_below_two_refits, which counts the refits
+    on which fewer than two contracts qualified so the term was off despite
+    counting as estimable. Know what _contract_effects_applied does NOT cover:
+    it counts the LIVE learn path only, and only where the explaining bound
+    left a non-zero adjustment, so it is not a total of every residual the term
+    has moved (the per-refit re-adjustment of the whole window is counted
+    nowhere). Do NOT quote _contract_estimable_refits on its own as the term's
+    activity: on the recorded streams 595 of 796 refits were estimable but the
+    term could act on only 285 of them (158 with fewer than two qualifying
+    contracts, a further 152 with tau2_contract computing to exactly zero), so
+    the estimable count reads as "working everywhere" and overstates by 2x.
+    A related property of the estimator, measured 2026-09-18: a contract whose
+    peers DISAGREE sharply contributes its spread to tau2_peer rather than
+    tau2_contract, so the term is silent on it unless other contracts supply
+    the between-contract variance. That is a different gate from the
+    present-peer bar and compounds with it. All of these reach the snapshot
+    and the dashboard's /routing page (Diagnostics); the OTLP body carries the ones a fleet-wide
+    question needs (_effects_applied, _forecast_offsets, _estimable_refits,
+    _qualifying_contracts, _floor_bound_refits, _contracts, _tau2) and NOT the
+    saturation gauges or _den_below_two_refits, which are dashboard-only by
+    choice and listed as such on the telemetry pin (telemetry.rs is
+    hand-mirrored: a new RouterSnapshotInfo field is invisible to the collector
+    unless added there). Do not add a mechanism whose activation nothing
+    reports, and do not mistake "the mechanism could act" for "the mechanism
+    acted".
+
+EMERGENCY FALLBACK: FREENET_ROUTING_FALLBACK_ISOTONIC=1 (default off, fail-safe
+parse) routes EVERY stage on the isotonic estimate with the per-peer EWMA, the
+path a cold timing stage already takes. For use only if the hierarchical
+estimator misbehaves in production; no release has routed on it as a whole;
+WARN at startup when set (and when set to a value it does not recognise);
+slated for removal once hierarchical is proven (#5792). Every node logs its mode once at
+startup at INFO (router.rs routing_mode_line): grep `estimator: enabled
+(default)` or `estimator: disabled via`, never the bare prefix.
+Pinned by the_isotonic_fallback_switch_routes_every_stage_on_the_isotonic_estimate;
+golden_replay runs with it unset. FREENET_ROUTING_LEGACY_LABELS (#5653) still
+restores the pre-#5657 failure labels, a label switch, not an estimator one.
+The routing dataset's candidate log (FREENET_ROUTING_DATASET_CANDIDATES) records
+the isotonic fallback as its `legacy` model; use a rate of 0.01 or less until
+its capture cost is re-measured without Renegade (router/dataset.rs "Cost").
+
+HOW THE PROMOTION WAS DECIDED (the method to reuse for a future estimator),
+both parts on data collected after #5653 (failure labels) was deployed:
+  (a) OFFLINE, on the routing dataset (FREENET_ROUTING_DATASET), gated by
+      /home/ian/code/tmp/routing-soak-gate/PLAN-v2.md (2026-09-17, approved by
+      Ian), which superseded a Brier-first gate: M1 within-contract RANKING
+      (delta C-index, non-inferiority margin -0.05; it cannot resolve on the
+      recorded data at that margin, so it was REPORTED), M2 dead-contract
+      POLLUTION (excess forecast on successes of recently storm-tainted peers),
+      and M3 failure Brier only as a non-inferiority check (CI upper bound at
+      most 1.10). The Brier-first gate weighted contract-level calibration on
+      failed relayed GETs heavily, which affects candidate ORDERING only
+      indirectly. Two blind spots to keep in view: the gate scores the
+      recorded CLAMPED forecast, so it cannot see the ranking value above, and
+      M2 scores only forecasts too high on successes, so an over-correction
+      reads as an improvement. Route lines record only the chosen peer;
+      FREENET_ROUTING_DATASET_CANDIDATES adds a `decision` line per routing
+      decision for ranking comparisons over the candidates the ACTING model
+      chose among (no exploration, so an unselected peer's outcome is
+      unobserved; the by-value join is biased in the two directions the
+      router/dataset.rs module doc "Joining" names).
+  (b) ON-FIELD CROSSOVER between the two nova gateways, swapping which one
+      runs the candidate halfway through the window, compared WITHIN each
+      gateway (GET success rate, latency, chosen-peer failure rate). The
+      gateways differ in connection population, so a one-gateway-per-arm
+      comparison is confounded by gateway identity.
+Live instruments on the snapshot and dashboard: failure_skill_hierarchical,
+response/transfer_time_rmse_secs_* (hierarchical vs the isotonic fallback,
+paired, each error clipped to 10x its own outcome with a 1 ms floor, forgotten
+over 24h; the clip is one-sided and favours the higher forecast), and
+hierarchical_*_log_shape (the lognormal assumption behind E[T]).
 ```
 
 ## State Consistency Invariants
@@ -395,20 +639,27 @@ then call the existing per-key primary-origin remover for each entry.
    → distance(a, b) must equal distance(b, a)
 ```
 
-### WHEN implementing accept-only-at-terminus
+### WHEN changing where CONNECT relays accept (operations/connect.rs)
 
 ```
-The rule: Only accept connections at terminus (can't forward to closer peer)
+Terminus acceptance is NOT what creates the small-world topology. The 1/d
+distribution comes from target selection (log-distance gap targeting, see
+topology.rs) and the Kleinberg gap score in should_accept (above).
 
-CORRECT:
-  if can_route_closer(target) {
-      forward_only();  // Don't accept
-  } else {
-      evaluate_acceptance();  // May accept
-  }
+Terminus acceptance only makes the acceptor land near the joiner's
+desired_location, so the joiner's targeting takes effect:
+  - can forward closer → forward (relays within NEAR_TERMINUS_DISTANCE of
+    the target may also accept probabilistically)
+  - terminus → accept if should_accept() allows, else route uphill
+    (bounded by uphill_budget; should_accept rejects already-connected
+    peers precisely to force this)
+  - a relay that has already forwarded MUST NOT also accept at terminus
+    (the double-accept bug)
 
-WRONG:
-  accept_all_requests();  // Breaks small-world topology
+WRONG: gateway/early relays accepting regardless of distance to the target.
+WHY:   the connection lands wherever the request passed through, so the
+       joiner's gap-targeted desired_location is ignored.
+See: RelayState::step in operations/connect.rs
 ```
 
 ## Common Patterns

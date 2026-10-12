@@ -273,24 +273,67 @@ async fn run_blocked_peers_test(attempt: usize) -> anyhow::Result<()> {
         let container = common::load_contract(&path_to_code, params)?;
         let contract_key = container.key();
 
-        tracing::info!("Gateway putting contract...");
-        client_gw
-            .send(ClientRequest::ContractOp(ContractRequest::Put {
-                contract: container.clone(),
-                state: WrappedState::new(serde_json::to_vec(&Ping::default())?),
-                related_contracts: RelatedContracts::new(),
-                subscribe: false,
-                blocking_subscribe: false,
-            }))
-            .await?;
+        // Retry the PUT the way the GETs below are retried (#5671). The ping
+        // contract is about 220 KB, so this is a streaming PUT, which cannot
+        // fail over to another peer: one stalled stream costs a whole attempt,
+        // and the node's own budget for one attempt at this size is 90 s
+        // (60 s plus payload / 20 KiB/s, at least 30 s). A single 60 s wait was
+        // shorter than one attempt, so no retry could ever fit. A relay that
+        // cannot receive the stream now reports it at once (#5671), so an
+        // attempt that loses its stream no longer sits out that whole budget.
+        const PUT_ATTEMPTS: usize = 3;
+        const PUT_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(100);
+        let mut deployed = false;
+        for put_attempt in 1..=PUT_ATTEMPTS {
+            tracing::info!(
+                "Gateway putting contract (attempt {}/{})...",
+                put_attempt,
+                PUT_ATTEMPTS
+            );
+            client_gw
+                .send(ClientRequest::ContractOp(ContractRequest::Put {
+                    contract: container.clone(),
+                    state: WrappedState::new(serde_json::to_vec(&Ping::default())?),
+                    related_contracts: RelatedContracts::new(),
+                    subscribe: false,
+                    blocking_subscribe: false,
+                }))
+                .await?;
 
-        tokio::time::timeout(
-            Duration::from_secs(60),
-            wait_for_put_response(&mut client_gw, &contract_key),
-        )
-        .await
-        .map_err(|_| anyhow!("Gateway put timed out"))?
-        .map_err(anyhow::Error::msg)?;
+            match tokio::time::timeout(
+                PUT_ATTEMPT_TIMEOUT,
+                wait_for_put_response(&mut client_gw, &contract_key),
+            )
+            .await
+            {
+                Ok(Ok(_)) => {
+                    deployed = true;
+                    break;
+                }
+                Ok(Err(e)) => {
+                    tracing::warn!(
+                        "Gateway: PUT attempt {}/{} failed: {}, retrying...",
+                        put_attempt,
+                        PUT_ATTEMPTS,
+                        e
+                    );
+                    sleep(Duration::from_secs(5)).await;
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        "Gateway: PUT attempt {}/{} timed out, retrying...",
+                        put_attempt,
+                        PUT_ATTEMPTS
+                    );
+                }
+            }
+        }
+        if !deployed {
+            return Err(anyhow!(
+                "Gateway failed to put contract after {} attempts",
+                PUT_ATTEMPTS
+            ));
+        }
         tracing::info!("Gateway: contract deployed!");
 
         // Node1 and Node2 get the contract (with retry — on slow CI runners the
