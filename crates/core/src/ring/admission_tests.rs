@@ -700,34 +700,50 @@ fn failed_handshake_releases_the_slot_as_unestablished() {
     assert_eq!(cm.admission_stats().provisional_released_unestablished, 1);
 }
 
-/// Source pin: the success path of `handle_successful_connection` consumes the
-/// reservation with `take_reservation_for_promotion`, never with
-/// `prune_in_transit_connection` (which frees an onboarding slot).
+/// Source pin (review M1): NEITHER promotion path frees an onboarding slot
+/// before adding the connection to the ring. `handle_successful_connection`
+/// consumes its reservation with `take_reservation_for_promotion`; the
+/// `handle_connect_peer` path (an existing transport reused, a transient
+/// promoted) adds the connection without pruning. A prune on either path
+/// takes the link off probation the moment it connects.
 #[test]
-fn successful_handshake_consumes_the_reservation_without_freeing_the_slot() {
+fn neither_promotion_path_frees_the_onboarding_slot() {
     const LIFECYCLE_SRC: &str =
         include_str!("../node/network_bridge/p2p_protoc/connection_lifecycle.rs");
-    let start = LIFECYCLE_SRC
-        .find("async fn handle_successful_connection(")
-        .expect("handle_successful_connection");
-    let end = start
-        + LIFECYCLE_SRC[start..]
-            .find("\n    }\n")
-            .expect("end of handle_successful_connection");
-    let code: Vec<&str> = LIFECYCLE_SRC[start..end]
-        .lines()
-        .filter(|l| !l.trim_start().starts_with("//"))
-        .collect();
-    assert!(
-        code.iter()
-            .any(|l| l.contains("connection_manager.take_reservation_for_promotion(peer_addr)")),
-        "the promotion path must consume its reservation without freeing the slot"
+    fn region_to_add<'a>(src: &'a str, anchor: &str) -> Vec<&'a str> {
+        let start = src
+            .find(anchor)
+            .unwrap_or_else(|| panic!("anchor {anchor}"));
+        let end = start
+            + src[start..]
+                .find("add_connection_reporting(")
+                .expect("the promotion adds the connection");
+        src[start..end]
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect()
+    }
+    let success = region_to_add(LIFECYCLE_SRC, "async fn handle_successful_connection(");
+    let reuse = region_to_add(
+        LIFECYCLE_SRC,
+        "connect_peer: reusing existing transport / promoting transient if present",
     );
+    for (name, code) in [
+        ("handle_successful_connection", &success),
+        ("handle_connect_peer", &reuse),
+    ] {
+        assert!(
+            !code.iter().any(|l| {
+                l.contains("prune_in_transit_connection(") || l.contains("prune_alive_connection(")
+            }),
+            "{name}: a prune before promotion takes onboarding links off probation"
+        );
+    }
     assert!(
-        !code
+        success
             .iter()
-            .any(|l| l.contains("prune_in_transit_connection(")),
-        "prune_in_transit_connection on the success path takes onboarding links off probation"
+            .any(|l| l.contains("connection_manager.take_reservation_for_promotion(peer_addr)")),
+        "the success path must consume its reservation without freeing the slot"
     );
 }
 
