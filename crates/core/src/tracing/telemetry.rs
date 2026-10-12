@@ -3337,6 +3337,14 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                         snapshot.bootstrap_transient_registered,
                     ),
                     (
+                        "bootstrap_time_to_first_ring_connection_ms",
+                        snapshot.bootstrap_time_to_first_ring_connection_ms,
+                    ),
+                    (
+                        "bootstrap_connect_attempts_before_first_connection",
+                        snapshot.bootstrap_connect_attempts_before_first_connection,
+                    ),
+                    (
                         "bootstrap_transient_expired",
                         snapshot.bootstrap_transient_expired,
                     ),
@@ -4389,6 +4397,8 @@ mod tests {
         info.bootstrap_promoted_to_ring = Some(1);
         info.bootstrap_time_to_min_connections_secs = Some(12.5);
         info.bootstrap_completed = Some(true);
+        info.bootstrap_time_to_first_ring_connection_ms = Some(1500);
+        info.bootstrap_connect_attempts_before_first_connection = Some(7);
         info.bootstrap_startup_rounds_connect_issued_gateway = Some(4);
         info.bootstrap_startup_rounds_connect_issued_routed = Some(5);
         info.bootstrap_startup_rounds_backoff_blocked = Some(3);
@@ -4399,6 +4409,11 @@ mod tests {
         assert_eq!(json["bootstrap_promoted_to_ring"], 1);
         assert_eq!(json["bootstrap_time_to_min_connections_secs"], 12.5);
         assert_eq!(json["bootstrap_completed"], true);
+        assert_eq!(json["bootstrap_time_to_first_ring_connection_ms"], 1500);
+        assert_eq!(
+            json["bootstrap_connect_attempts_before_first_connection"],
+            7
+        );
         assert_eq!(json["bootstrap_startup_rounds_connect_issued_gateway"], 4);
         assert_eq!(json["bootstrap_startup_rounds_connect_issued_routed"], 5);
         assert_eq!(json["bootstrap_startup_rounds_backoff_blocked"], 3);

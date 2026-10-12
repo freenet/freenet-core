@@ -1504,6 +1504,39 @@ fn register_ring_metrics(meter: &opentelemetry::metrics::Meter, sources: RingSou
         })
         .build();
 
+    // #5858: time from process start to the FIRST ring connection, and the
+    // CONNECT attempts it took. No datapoint until the first connection
+    // exists; `freenet.bootstrap.completed` (below) is about min_connections
+    // and does not cover this.
+    let _bootstrap_time_to_first_ring_connection = meter
+        .u64_observable_gauge("freenet.bootstrap.time_to_first_ring_connection_ms")
+        .with_unit("ms")
+        .with_description("Milliseconds from process start to the first ring connection (#5858)")
+        .with_callback(move |observer| {
+            if let Some(status) = (sources.status_scalars)() {
+                if let Some(elapsed) = status.bootstrap_time_to_first_ring_connection {
+                    observer.observe(u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX), &[]);
+                }
+            }
+        })
+        .build();
+
+    let _bootstrap_connect_attempts_before_first_connection = meter
+        .u64_observable_gauge("freenet.bootstrap.connect_attempts_before_first_connection")
+        .with_description(
+            "CONNECT attempts issued before the first ring connection; frozen \
+             once it exists (#5858)",
+        )
+        .with_callback(move |observer| {
+            if let Some(status) = (sources.status_scalars)() {
+                observer.observe(
+                    status.bootstrap_connect_attempts_before_first_connection,
+                    &[],
+                );
+            }
+        })
+        .build();
+
     // 1 once this process has reached `min_connections`, 0 before that (#4787
     // finding 3). Without it a permanently-stuck joiner is indistinguishable
     // from an old build or a dropped collector: both simply have no
@@ -1969,6 +2002,10 @@ mod tests {
                 // datapoint at all and its name goes unasserted — same
                 // reasoning as `lattice_successor_distance` above.
                 bootstrap_time_to_min_connections: Some(std::time::Duration::from_secs(7)),
+                bootstrap_time_to_first_ring_connection: Some(std::time::Duration::from_millis(
+                    1500,
+                )),
+                bootstrap_connect_attempts_before_first_connection: 3,
                 bootstrap_transient_registered: 10,
                 bootstrap_transient_expired: 9,
                 bootstrap_promoted_to_ring: 1,
@@ -2990,12 +3027,45 @@ mod tests {
             // Bootstrap-acceptance-churn instrumentation (#4787).
             "freenet.bootstrap.churn",
             "freenet.bootstrap.time_to_min_connections_seconds",
+            "freenet.bootstrap.time_to_first_ring_connection_ms",
+            "freenet.bootstrap.connect_attempts_before_first_connection",
             "freenet.bootstrap.completed",
             "freenet.bootstrap.startup_rounds",
         ] {
             assert!(
                 names.contains(&expected),
                 "instrument `{expected}` produced no datapoint; exported: {names:?}"
+            );
+        }
+
+        // Values and units, not just names (#5858): the first-connection gauge
+        // is exported in MILLISECONDS from a 1500 ms fixture, and the attempts
+        // gauge carries the fixture's count verbatim.
+        {
+            use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData};
+            #[allow(clippy::wildcard_enum_match_arm)]
+            let gauge = |name: &str| -> Option<(u64, String)> {
+                exported
+                    .iter()
+                    .flat_map(|rm| rm.scope_metrics())
+                    .flat_map(|sm| sm.metrics())
+                    .find(|m| m.name() == name)
+                    .and_then(|m| match m.data() {
+                        AggregatedMetrics::U64(MetricData::Gauge(g)) => g
+                            .data_points()
+                            .next()
+                            .map(|p| (p.value(), m.unit().to_string())),
+                        _ => None,
+                    })
+            };
+            assert_eq!(
+                gauge("freenet.bootstrap.time_to_first_ring_connection_ms"),
+                Some((1500, "ms".to_string())),
+                "first-connection gauge must export milliseconds, unit `ms`"
+            );
+            assert_eq!(
+                gauge("freenet.bootstrap.connect_attempts_before_first_connection").map(|(v, _)| v),
+                Some(3)
             );
         }
 
