@@ -1849,16 +1849,24 @@ impl ConnectionManager {
         }
     }
 
-    /// The connection a topology prune or swap should shed instead of
-    /// `recommended` (#5858): an ESTABLISHED link still on probation, at least
+    /// The connection a CAPACITY-driven prune (over `max_connections`, or
+    /// resource pressure) should shed instead of `recommended` (#5858): an
+    /// ESTABLISHED link still on probation, at least
     /// [`super::admission::ONBOARDING_MIN_AGE_BEFORE_PRUNE`] old, which is first
     /// in line while its probation lasts. A per-side nearest lattice edge is
     /// never substituted (it keeps its retention protection), nor is anything
     /// when no link qualifies.
     ///
-    /// The slot is NOT freed here: a swap's drop is deferred and may never
-    /// happen. It is freed, and counted as pruned, by the prune that follows
-    /// when the drop executes (review S4).
+    /// The principle: probation protects the acceptor's self-interest links
+    /// under CAPACITY pressure, so onboarding never displaces them. An optional
+    /// topology swap is not capacity pressure, and it does not spend a joiner's
+    /// lifeline, so the swap path never calls this. A liar's links still face
+    /// the fresh-candidate test at the end of probation
+    /// ([`Self::review_provisional_links`]) and remain first in line for
+    /// capacity prunes.
+    ///
+    /// The slot is NOT freed here; the prune that executes the drop frees it
+    /// and counts it as pruned (review S4).
     pub(crate) fn probation_prune_substitute(
         &self,
         recommended: &PeerKeyLocation,

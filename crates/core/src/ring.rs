@@ -6924,21 +6924,13 @@ impl Ring {
                     }
                 }
                 TopologyAdjustment::SwapConnection {
-                    mut remove,
+                    remove,
                     add_location,
                 } => {
-                    // A link still on probation is shed first (#5858).
-                    if let Some(substitute) = self
-                        .connection_manager
-                        .probation_prune_substitute(&remove, tick_now)
-                    {
-                        tracing::info!(
-                            recommended = %remove,
-                            substitute = %substitute,
-                            "Topology swap: shedding a link on probation instead"
-                        );
-                        remove = substitute;
-                    }
+                    // No probation substitution here (#5858): a swap is an
+                    // optional topology improvement, not capacity pressure, and
+                    // does not spend a joiner's lifeline. See
+                    // `ConnectionManager::probation_prune_substitute`.
                     // Connect-first swap: defer the drop until the replacement
                     // connects (connection_count > min_connections), preventing
                     // undershoot that would block future swaps. Deferred drops

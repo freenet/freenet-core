@@ -22,7 +22,8 @@
 //! A link admitted for onboarding is PROVISIONAL. After [`ONBOARDING_PROBATION`]
 //! it graduates if the acceptor's self-interest would keep it, and is dropped
 //! otherwise (`ConnectionManager::review_provisional_links`). While on
-//! probation it is the first link a topology prune sheds.
+//! probation it is the first link a capacity-driven prune sheds (never an
+//! optional topology swap).
 
 use std::collections::{BTreeMap, VecDeque};
 use std::net::SocketAddr;
@@ -77,7 +78,7 @@ pub(crate) const ONBOARDING_GRADUATIONS_PER_WINDOW: usize = 1;
 /// evaluator window (5 min), the longer of the two.
 pub(crate) const ONBOARDING_GRADUATION_WINDOW: Duration = Duration::from_secs(300);
 
-/// A link on probation is a prune or swap substitute only once it is this old.
+/// A link on probation is a capacity-prune substitute only once it is this old.
 ///
 /// Two pending-reservation lifetimes: long enough for the joiner to use the
 /// link to issue its own CONNECTs (the maintenance loop's fast tick is a few
@@ -350,7 +351,7 @@ pub(crate) struct AdmissionStats {
     pub provisional_graduated: u64,
     /// Provisional links dropped at the end of probation.
     pub provisional_dropped: u64,
-    /// Provisional links shed early by a topology prune or swap.
+    /// Provisional links shed early by a capacity-driven prune.
     pub provisional_pruned: u64,
     /// Provisional slots freed because the connection never established.
     pub provisional_released_unestablished: u64,

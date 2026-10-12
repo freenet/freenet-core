@@ -140,7 +140,9 @@ WHEN accepting a new connection (should_accept):
        FALSE (#5858 owner decision; would-refuse counted as
        bar_unmet_not_enforced; tests enforce via set_requester_bar_enforced); then 2-5.
      → Onboarding links are PROVISIONAL: once ONBOARDING_MIN_AGE_BEFORE_PRUNE
-       old and established, first in line for prune/swap; after
+       old and established, first in line for CAPACITY prunes (never for
+       optional topology swaps: probation protects self-interest links under
+       capacity pressure, it does not spend a joiner's lifeline); after
        ONBOARDING_PROBATION they graduate only as a FRESH candidate (beat the
        evaluator window, capped per window), or if the acceptor would drop
        below min without them, or as a lattice edge. The slot frees on prune,

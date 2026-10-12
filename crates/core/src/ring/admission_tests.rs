@@ -876,7 +876,6 @@ fn the_maintenance_tick_wires_probation_review_and_substitution() {
         ".review_provisional_links(tick_now)",
         ".confirm_probation_drop(drop,queued)",
         "substitute_first_victim(&mutshould_disconnect_peers,substitute)",
-        ".probation_prune_substitute(&remove,tick_now)",
         ".probation_prune_substitute(first,tick_now)",
     ] {
         assert_eq!(
@@ -885,4 +884,18 @@ fn the_maintenance_tick_wires_probation_review_and_substitution() {
             "missing or duplicated: {needle}"
         );
     }
+    // Capacity prunes only: the swap arm must not substitute (#5858).
+    let swap = &RING_SRC[RING_SRC
+        .find("TopologyAdjustment::SwapConnection {")
+        .expect("swap arm")..];
+    let swap_arm: String = swap[..swap
+        .find("TopologyAdjustment::NoChange")
+        .expect("end of swap arm")]
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("//"))
+        .collect();
+    assert!(
+        !swap_arm.contains("probation_prune_substitute("),
+        "an optional topology swap must not substitute a probation link"
+    );
 }
