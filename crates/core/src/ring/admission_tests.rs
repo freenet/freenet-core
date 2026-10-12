@@ -1,0 +1,416 @@
+//! Tests for the two-budget CONNECT admission (#5858): the onboarding path,
+//! the requester's bar, and the provisional-link lifecycle.
+
+use super::*;
+use crate::topology::rate::Rate;
+use crate::transport::TransportKeypair;
+
+/// A peer at location 0.5 with the lattice off (`max_connections` is below the
+/// lattice floor and the force override is cleared), so the self-interest and
+/// onboarding paths are observed without the lattice clause interfering.
+fn manager(min: usize, max: usize) -> ConnectionManager {
+    set_nn_lattice_force_active(false);
+    let keypair = TransportKeypair::new();
+    let own_location = AtomicU64::new(u64::from_le_bytes(0.5f64.to_le_bytes()));
+    ConnectionManager::init(
+        Rate::new_per_second(1_000_000.0),
+        Rate::new_per_second(1_000_000.0),
+        min,
+        max,
+        7,
+        (keypair.public().clone(), Some(addr(1)), own_location),
+        false,
+        10,
+        Duration::from_secs(60),
+        0,
+    )
+}
+
+fn addr(port: u16) -> SocketAddr {
+    SocketAddr::from(([10, 1, 0, 1], port))
+}
+
+fn connect(cm: &ConnectionManager, port: u16, loc: f64) -> PeerKeyLocation {
+    let keypair = TransportKeypair::new();
+    assert!(cm.add_connection(
+        Location::new(loc),
+        addr(port),
+        keypair.public().clone(),
+        false
+    ));
+    PeerKeyLocation::new(keypair.public().clone(), addr(port))
+}
+
+/// Fill the evaluator window with a winning score so every later legacy
+/// candidate at a worse-or-equal location loses it.
+fn saturate_window(cm: &ConnectionManager) {
+    let first = cm.evaluate_admission(Location::new(0.75), addr(900), RequesterNeed::Unknown, None);
+    assert_eq!(
+        first,
+        AdmissionCode::AcceptedSelfInterest,
+        "empty window admits"
+    );
+    let second =
+        cm.evaluate_admission(Location::new(0.75), addr(901), RequesterNeed::Unknown, None);
+    assert_eq!(
+        second,
+        AdmissionCode::RejectedEvaluatorWindow,
+        "an equal score does not beat the window"
+    );
+}
+
+#[test]
+fn short_requester_is_admitted_despite_a_saturated_evaluator_window() {
+    let cm = manager(3, 20);
+    for (i, loc) in [0.45, 0.55, 0.2].into_iter().enumerate() {
+        connect(&cm, 10 + i as u16, loc);
+    }
+    saturate_window(&cm);
+
+    let legacy = cm.evaluate_admission(Location::new(0.75), addr(30), RequesterNeed::Unknown, None);
+    assert_eq!(legacy, AdmissionCode::RejectedEvaluatorWindow);
+
+    let short = cm.evaluate_admission(Location::new(0.75), addr(31), RequesterNeed::Short, None);
+    assert_eq!(short, AdmissionCode::AcceptedOnboarding);
+    assert!(cm.is_provisional(addr(31)));
+    assert_eq!(cm.admission_stats().admitted_onboarding, 1);
+}
+
+/// Onboarding never records into the evaluator window: after short
+/// requesters are admitted, a legacy candidate with the SAME score is still
+/// judged against an empty window and admitted.
+#[test]
+fn onboarding_does_not_pollute_the_evaluator_window() {
+    let cm = manager(3, 20);
+    for (i, loc) in [0.45, 0.55, 0.2].into_iter().enumerate() {
+        connect(&cm, 10 + i as u16, loc);
+    }
+    for port in [40, 41] {
+        assert_eq!(
+            cm.evaluate_admission(Location::new(0.75), addr(port), RequesterNeed::Short, None),
+            AdmissionCode::AcceptedOnboarding
+        );
+    }
+    let legacy = cm.evaluate_admission(Location::new(0.75), addr(42), RequesterNeed::Unknown, None);
+    assert_eq!(
+        legacy,
+        AdmissionCode::AcceptedSelfInterest,
+        "a needy score recorded into the window would have refused this equal-score candidate"
+    );
+}
+
+#[test]
+fn onboarding_budget_is_bounded_and_frees_on_a_failed_handshake() {
+    let cm = manager(3, 20);
+    for (i, loc) in [0.45, 0.55, 0.2].into_iter().enumerate() {
+        connect(&cm, 10 + i as u16, loc);
+    }
+    saturate_window(&cm);
+    for port in 50..50 + ONBOARDING_PROVISIONAL_SLOTS as u16 {
+        assert_eq!(
+            cm.evaluate_admission(Location::new(0.8), addr(port), RequesterNeed::Short, None),
+            AdmissionCode::AcceptedOnboarding
+        );
+    }
+    let over = cm.evaluate_admission(Location::new(0.8), addr(60), RequesterNeed::Short, None);
+    assert_eq!(over, AdmissionCode::RejectedOnboardingBudgetExhausted);
+    assert_eq!(cm.admission_stats().rejected_onboarding_budget_exhausted, 1);
+    assert_eq!(
+        cm.admission_stats().provisional_in_use,
+        ONBOARDING_PROVISIONAL_SLOTS as u64
+    );
+
+    // The first joiner's hole punch fails: its slot is freed at once.
+    cm.prune_in_transit_connection(addr(50));
+    assert!(!cm.is_provisional(addr(50)));
+    assert_eq!(
+        cm.evaluate_admission(Location::new(0.8), addr(61), RequesterNeed::Short, None),
+        AdmissionCode::AcceptedOnboarding
+    );
+}
+
+/// Onboarding holds only while the acceptor is below `max_connections`.
+#[test]
+fn short_requester_is_refused_at_capacity() {
+    let cm = manager(1, 4);
+    for (i, loc) in [0.45, 0.55, 0.2].into_iter().enumerate() {
+        connect(&cm, 10 + i as u16, loc);
+    }
+    // open 3 + this candidate = 4 = max.
+    assert_eq!(
+        cm.evaluate_admission(Location::new(0.8), addr(70), RequesterNeed::Short, None),
+        AdmissionCode::RejectedAtCapacity
+    );
+    assert!(!cm.is_provisional(addr(70)));
+}
+
+/// Below `min_connections` a short requester takes the ordinary
+/// (self-interest) admission when the soft filter allows it, keeping the
+/// onboarding slots for acceptors that are full of their own choosing.
+#[test]
+fn below_min_short_requester_uses_self_interest_first() {
+    let cm = manager(10, 20);
+    connect(&cm, 10, 0.45);
+    assert_eq!(
+        cm.evaluate_admission(Location::new(0.8), addr(71), RequesterNeed::Short, None),
+        AdmissionCode::AcceptedSelfInterest
+    );
+    assert!(!cm.is_provisional(addr(71)));
+}
+
+#[test]
+fn requester_bar_rejects_an_acceptor_that_is_not_closer() {
+    let cm = manager(3, 20);
+    for (i, loc) in [0.45, 0.55, 0.2].into_iter().enumerate() {
+        connect(&cm, 10 + i as u16, loc);
+    }
+    let target = Some(Location::new(0.6)); // ~0.1 from this peer at 0.5
+    assert_eq!(
+        cm.evaluate_admission(
+            Location::new(0.9),
+            addr(80),
+            RequesterNeed::Bar(0.08),
+            target
+        ),
+        AdmissionCode::RejectedBarUnmet,
+        "a farther acceptor does not improve the requester's coverage"
+    );
+    assert_eq!(cm.admission_stats().rejected_bar_unmet, 1);
+    // A refused bar touched neither the window nor the onboarding budget: the
+    // next legacy candidate meets an empty window.
+    assert_eq!(
+        cm.evaluate_admission(Location::new(0.9), addr(81), RequesterNeed::Unknown, None),
+        AdmissionCode::AcceptedSelfInterest
+    );
+    // A bar this peer beats goes through self-interest (the window now
+    // refuses an equal score) and never onboarding.
+    assert_eq!(
+        cm.evaluate_admission(
+            Location::new(0.9),
+            addr(82),
+            RequesterNeed::Bar(0.2),
+            target
+        ),
+        AdmissionCode::RejectedEvaluatorWindow
+    );
+    assert!(!cm.is_provisional(addr(82)));
+}
+
+#[test]
+fn requester_need_is_short_below_min_and_a_side_bar_above() {
+    let cm = manager(3, 20);
+    assert_eq!(cm.requester_need(Location::new(0.7)), RequesterNeed::Short);
+    for (i, loc) in [0.45, 0.62, 0.9, 0.3].into_iter().enumerate() {
+        connect(&cm, 10 + i as u16, loc);
+    }
+    // Target 0.7 lies on the successor side; the successor-side connections
+    // are 0.62 (0.08 away) and 0.9 (0.2 away).
+    let RequesterNeed::Bar(bar) = cm.requester_need(Location::new(0.7)) else {
+        panic!("a well-connected requester states a bar");
+    };
+    assert!((bar - 0.08).abs() < 1e-9, "bar {bar}");
+    // Predecessor side: 0.45 and 0.3 against target 0.35.
+    let RequesterNeed::Bar(bar) = cm.requester_need(Location::new(0.35)) else {
+        panic!("bar expected");
+    };
+    assert!((bar - 0.05).abs() < 1e-9, "bar {bar}");
+    // Aimed at own location (a lattice probe): the looser of the per-side
+    // nearest distances, 0.12 (successor 0.62) vs 0.05 (predecessor 0.45).
+    let RequesterNeed::Bar(bar) = cm.requester_need(Location::new(0.5)) else {
+        panic!("bar expected");
+    };
+    assert!((bar - 0.12).abs() < 1e-9, "bar {bar}");
+}
+
+#[test]
+fn requester_need_without_a_connection_on_the_target_side_is_unconstrained() {
+    let cm = manager(2, 20);
+    connect(&cm, 10, 0.4);
+    connect(&cm, 11, 0.3);
+    assert_eq!(
+        cm.requester_need(Location::new(0.7)),
+        RequesterNeed::Bar(UNCONSTRAINED_BAR)
+    );
+}
+
+/// Admit `port` on an onboarding slot and establish its connection.
+fn onboard(cm: &ConnectionManager, port: u16, loc: f64) {
+    assert_eq!(
+        cm.evaluate_admission(Location::new(loc), addr(port), RequesterNeed::Short, None),
+        AdmissionCode::AcceptedOnboarding
+    );
+    let keypair = TransportKeypair::new();
+    assert!(cm.add_connection(
+        Location::new(loc),
+        addr(port),
+        keypair.public().clone(),
+        true
+    ));
+}
+
+/// Six ordinary connections, each with routing traffic, so a fresh link with
+/// none is the topology manager's least valuable unless its gap value is high.
+fn busy_manager() -> ConnectionManager {
+    let cm = manager(3, 20);
+    for (i, loc) in [0.45, 0.55, 0.3, 0.7, 0.15, 0.85].into_iter().enumerate() {
+        let peer = connect(&cm, 10 + i as u16, loc);
+        for _ in 0..5 {
+            cm.topology_manager
+                .write()
+                .outbound_request_counter
+                .record_request(peer.clone());
+        }
+    }
+    saturate_window(&cm);
+    cm
+}
+
+#[test]
+fn provisional_link_is_dropped_at_the_end_of_probation_when_least_valuable() {
+    let cm = busy_manager();
+    let admitted = Instant::now();
+    onboard(&cm, 90, 0.72);
+
+    assert!(cm.review_provisional_links(admitted).is_empty());
+    assert!(
+        cm.review_provisional_links(admitted + ONBOARDING_PROBATION - Duration::from_secs(1))
+            .is_empty(),
+        "still on probation"
+    );
+    assert!(cm.is_provisional(addr(90)));
+
+    let dropped =
+        cm.review_provisional_links(admitted + ONBOARDING_PROBATION + Duration::from_secs(1));
+    assert_eq!(dropped, vec![addr(90)]);
+    assert!(
+        !cm.is_provisional(addr(90)),
+        "the slot frees with the decision"
+    );
+    let stats = cm.admission_stats();
+    assert_eq!(
+        (stats.provisional_dropped, stats.provisional_graduated),
+        (1, 0)
+    );
+}
+
+#[test]
+fn provisional_link_graduates_when_self_interest_keeps_it() {
+    let cm = busy_manager();
+    // A busy, co-located pair at 0.3: one of them, not the joiner, is the
+    // least valuable connection.
+    let twin = connect(&cm, 20, 0.3);
+    let _ = twin;
+    let admitted = Instant::now();
+    onboard(&cm, 91, 0.98);
+    for _ in 0..50 {
+        let peer = cm.get_peer_by_addr(addr(91)).expect("connected");
+        cm.topology_manager
+            .write()
+            .outbound_request_counter
+            .record_request(peer);
+    }
+    let dropped =
+        cm.review_provisional_links(admitted + ONBOARDING_PROBATION + Duration::from_secs(1));
+    assert!(dropped.is_empty(), "kept: {dropped:?}");
+    assert!(!cm.is_provisional(addr(91)), "graduation frees the slot");
+    assert_eq!(cm.admission_stats().provisional_graduated, 1);
+}
+
+/// When dropping it would take the acceptor below `min_connections`, its
+/// self-interest keeps any link, so the provisional link graduates even though
+/// it is the least valuable one.
+#[test]
+fn provisional_link_graduates_when_the_acceptor_needs_it() {
+    let cm = busy_manager();
+    let admitted = Instant::now();
+    // Co-located with the busy link at 0.85 and carrying no traffic: the
+    // joiner is the least valuable connection by the ranking.
+    onboard(&cm, 92, 0.85);
+    // Other links leave during probation: 7 -> 3 = min_connections.
+    for port in [10, 11, 12, 13] {
+        assert!(cm.prune_alive_connection(addr(port)).is_some());
+    }
+    assert_eq!(cm.connection_count(), cm.min_connections);
+    let least = cm.topology_manager.read().least_valuable_prunable_peer(
+        &cm.get_stored_location(),
+        &cm.connections_by_location.read().clone(),
+    );
+    assert_eq!(
+        least.and_then(|p| p.socket_addr()),
+        Some(addr(92)),
+        "precondition: only the acceptor's need can keep this link"
+    );
+    assert!(
+        cm.review_provisional_links(admitted + ONBOARDING_PROBATION + Duration::from_secs(1))
+            .is_empty()
+    );
+    assert_eq!(cm.admission_stats().provisional_graduated, 1);
+}
+
+/// A slot whose connection never establishes is freed once its reservation
+/// has gone stale, well before the end of probation.
+#[test]
+fn unestablished_provisional_slot_is_released_after_the_reservation_ttl() {
+    let cm = manager(3, 20);
+    for (i, loc) in [0.45, 0.55, 0.2].into_iter().enumerate() {
+        connect(&cm, 10 + i as u16, loc);
+    }
+    let admitted = Instant::now();
+    assert_eq!(
+        cm.evaluate_admission(Location::new(0.8), addr(93), RequesterNeed::Short, None),
+        AdmissionCode::AcceptedOnboarding
+    );
+    assert!(
+        cm.review_provisional_links(admitted + Duration::from_secs(5))
+            .is_empty()
+    );
+    assert!(cm.is_provisional(addr(93)), "handshake still in flight");
+    let later = admitted + PENDING_RESERVATION_TTL + Duration::from_secs(5);
+    assert!(
+        cm.review_provisional_links(later).is_empty(),
+        "nothing to drop"
+    );
+    assert!(!cm.is_provisional(addr(93)));
+    assert_eq!(cm.admission_stats().provisional_released_unestablished, 1);
+}
+
+#[test]
+fn a_link_on_probation_is_first_in_line_for_pruning() {
+    let cm = busy_manager();
+    let recommended = cm.get_peer_by_addr(addr(10)).expect("connected");
+    assert!(
+        cm.probation_prune_substitute(&recommended).is_none(),
+        "nothing on probation"
+    );
+    onboard(&cm, 94, 0.72);
+    let substitute = cm
+        .probation_prune_substitute(&recommended)
+        .expect("the provisional link is shed instead");
+    assert_eq!(substitute.socket_addr(), Some(addr(94)));
+    assert!(!cm.is_provisional(addr(94)));
+    assert_eq!(cm.admission_stats().provisional_pruned, 1);
+    assert!(cm.probation_prune_substitute(&recommended).is_none());
+}
+
+/// A provisional link that is a per-side nearest lattice edge keeps the
+/// lattice's retention protection: it is not the prune substitute.
+#[test]
+fn a_lattice_edge_on_probation_is_not_substituted_into_a_prune() {
+    let _guard = LatticeGuard;
+    let cm = busy_manager();
+    // Admitted for onboarding while the lattice is inactive; once it is
+    // active, 0.52 is the nearest successor (closer than 0.55).
+    onboard(&cm, 95, 0.52);
+    set_nn_lattice_enabled(true);
+    let recommended = cm.get_peer_by_addr(addr(10)).expect("connected");
+    assert!(cm.probation_prune_substitute(&recommended).is_none());
+    assert!(cm.is_provisional(addr(95)));
+}
+
+struct LatticeGuard;
+impl Drop for LatticeGuard {
+    fn drop(&mut self) {
+        set_nn_lattice_enabled(true);
+        set_nn_lattice_force_active(false);
+    }
+}

@@ -65,9 +65,10 @@ pub(crate) use network_bridge::broadcast_queue_metrics::BROADCAST_QUEUE_EFFICIEN
 // re-export rather than a path through `network_bridge` directly. Mirrors
 // `BROADCAST_STREAM_METRICS` above.
 pub(crate) use network_bridge::p2p_protoc::{
-    BROADCAST_TARGET_LIST_MIN_VERSION, HASH_FIRST_SUMMARIES_MIN_VERSION,
+    BROADCAST_TARGET_LIST_MIN_VERSION, CONNECT_NEED_MIN_VERSION, HASH_FIRST_SUMMARIES_MIN_VERSION,
     SUMMARY_FIRST_PUT_MIN_VERSION, version_supports_broadcast_target_list,
-    version_supports_hash_first_summaries, version_supports_summary_first_put,
+    version_supports_connect_need, version_supports_hash_first_summaries,
+    version_supports_summary_first_put,
 };
 // Test-only: the release-timing marker has no runtime reader by design (see
 // its rustdoc), so re-exporting it unconditionally is an unused import in the
@@ -77,6 +78,8 @@ pub(crate) use network_bridge::event_loop_notification_channel_with_capacity;
 #[cfg(test)]
 #[allow(unused_imports)]
 pub(crate) use network_bridge::p2p_protoc::BROADCAST_TARGET_LIST_SHIPPED_IN;
+#[cfg(test)]
+pub(crate) use network_bridge::p2p_protoc::CONNECT_NEED_SHIPPED_IN;
 #[cfg(test)]
 pub(crate) use network_bridge::p2p_protoc::HASH_FIRST_SHIPPED_IN;
 #[cfg(test)]
@@ -515,6 +518,20 @@ pub struct NodeConfig {
     /// serialized.
     #[serde(skip)]
     pub(crate) broadcast_target_list_floor_override: Option<(u8, u8, u16)>,
+    /// Test-only override for the CONNECT need version floor
+    /// ([`CONNECT_NEED_MIN_VERSION`], #5858), consulted as
+    /// `connect_need_floor_override.unwrap_or(CONNECT_NEED_MIN_VERSION)` by
+    /// `ConnectionManager::supports_connect_need`.
+    ///
+    /// In production this is `None` → the real floor. Simulations default it
+    /// OFF, like `broadcast_target_list_floor_override`: opening the gate
+    /// changes admission BEHAVIOUR (the onboarding path and the requester's
+    /// bar), so a sim asserting on topology would otherwise exercise a
+    /// different admission rule than it was written for. Opt in via
+    /// `SimNetwork::enable_connect_need`. Not cfg-gated, for the same reason as
+    /// the others. `#[serde(skip)]`; never serialized.
+    #[serde(skip)]
+    pub(crate) connect_need_floor_override: Option<(u8, u8, u16)>,
     /// Test-only harness flag: when set, a startup-hosted contract
     /// (`SeedHostedContract`, i.e. `append_contracts` with `subscription =
     /// true`) is registered in the neighbor-hosting advertised set so the
@@ -744,6 +761,7 @@ impl NodeConfig {
             hash_first_summaries_floor_override: None,
             ack_version_floor_override: None,
             broadcast_target_list_floor_override: None,
+            connect_need_floor_override: None,
             advertise_seeded_hosts: false,
             hosting_time_source_override: None,
             update_rate_limit_time_source_override: None,
@@ -1348,13 +1366,15 @@ where
             // joiner-side replies first. Originator state lives in
             // `start_client_connect` task locals; there is no
             // joiner-side legacy state machine.
-            if let connect::ConnectMsg::Request { id, payload } = op {
+            // `inbound_request` covers both `Request` and the need-carrying
+            // `RequestWithNeed` (#5858), decoding the need into the payload.
+            if let Some((id, payload)) = op.inbound_request() {
                 if let Some(upstream_addr) = source_addr {
-                    if !op_manager.active_relay_connect_txs.contains(id) {
+                    if !op_manager.active_relay_connect_txs.contains(&id) {
                         if let Err(err) = connect::op_ctx_task::start_relay_connect(
                             op_manager.clone(),
-                            *id,
-                            payload.clone(),
+                            id,
+                            payload,
                             upstream_addr,
                         )
                         .await
@@ -9835,8 +9855,9 @@ mod tests {
             // doesn't exist yet, dropping them silently.
             let window = connect_branch_window();
             // Locate the bypass `matches!` block specifically — the
-            // dispatch gate further down does destructure
-            // `ConnectMsg::Request { id, payload }`, which is fine.
+            // dispatch gate further down does decode `Request` and
+            // `RequestWithNeed` (via `ConnectMsg::inbound_request`), which is
+            // fine. The `contains` below also matches `RequestWithNeed`.
             let bypass_anchor = "if matches!(\n                op,";
             let bypass_start = window
                 .find(bypass_anchor)

@@ -1695,6 +1695,7 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                     forwarded_to,
                     accepted,
                     ttl,
+                    admission,
                 } => {
                     serde_json::json!({
                         "type": "request_received",
@@ -1705,6 +1706,7 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                         "forwarded_to": forwarded_to.as_ref().map(|p| p.to_string()),
                         "accepted": accepted,
                         "ttl": ttl,
+                        "admission": admission.map(|a| a.as_str()),
                     })
                 }
                 ConnectEvent::ResponseSent { acceptor, joiner } => {
@@ -3002,6 +3004,52 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                 obj.insert(
                     "lattice_probe_misses".to_string(),
                     serde_json::json!(snapshot.lattice_probe_misses),
+                );
+                // CONNECT admission counters (#5858): same hand-mirror footgun.
+                // Pinned by `router_snapshot_json_includes_connect_admission_counters`.
+                obj.insert(
+                    "connect_admitted_self_interest".to_string(),
+                    serde_json::json!(snapshot.connect_admitted_self_interest),
+                );
+                obj.insert(
+                    "connect_admitted_onboarding".to_string(),
+                    serde_json::json!(snapshot.connect_admitted_onboarding),
+                );
+                obj.insert(
+                    "connect_admitted_lattice".to_string(),
+                    serde_json::json!(snapshot.connect_admitted_lattice),
+                );
+                obj.insert(
+                    "connect_rejected_onboarding_budget_exhausted".to_string(),
+                    serde_json::json!(snapshot.connect_rejected_onboarding_budget_exhausted),
+                );
+                obj.insert(
+                    "connect_rejected_bar_unmet".to_string(),
+                    serde_json::json!(snapshot.connect_rejected_bar_unmet),
+                );
+                obj.insert(
+                    "connect_provisional_graduated".to_string(),
+                    serde_json::json!(snapshot.connect_provisional_graduated),
+                );
+                obj.insert(
+                    "connect_provisional_dropped".to_string(),
+                    serde_json::json!(snapshot.connect_provisional_dropped),
+                );
+                obj.insert(
+                    "connect_provisional_pruned".to_string(),
+                    serde_json::json!(snapshot.connect_provisional_pruned),
+                );
+                obj.insert(
+                    "connect_provisional_released_unestablished".to_string(),
+                    serde_json::json!(snapshot.connect_provisional_released_unestablished),
+                );
+                obj.insert(
+                    "connect_need_downgraded_to_legacy".to_string(),
+                    serde_json::json!(snapshot.connect_need_downgraded_to_legacy),
+                );
+                obj.insert(
+                    "connect_provisional_in_use".to_string(),
+                    serde_json::json!(snapshot.connect_provisional_in_use),
                 );
                 // Version-gate refusal counters (#5156): same hand-mirror
                 // footgun as the gauges above — a new `RouterSnapshotInfo`
@@ -4358,6 +4406,71 @@ mod tests {
         ] {
             assert_eq!(json[key], want, "{key} must reach the OTLP body");
         }
+    }
+
+    /// Pin: the CONNECT admission counters (#5858) must reach the
+    /// hand-mirrored OTLP body. Each field gets a distinct value so a swapped
+    /// key is caught too.
+    #[test]
+    fn router_snapshot_json_includes_connect_admission_counters() {
+        use arbitrary::{Arbitrary, Unstructured};
+        let mut u = Unstructured::new(&[0u8; 4096]);
+        let mut info = crate::router::RouterSnapshotInfo::arbitrary(&mut u)
+            .expect("construct RouterSnapshotInfo for test");
+        info.connect_admitted_self_interest = Some(101);
+        info.connect_admitted_onboarding = Some(102);
+        info.connect_admitted_lattice = Some(103);
+        info.connect_rejected_onboarding_budget_exhausted = Some(104);
+        info.connect_rejected_bar_unmet = Some(105);
+        info.connect_provisional_graduated = Some(106);
+        info.connect_provisional_dropped = Some(107);
+        info.connect_provisional_pruned = Some(108);
+        info.connect_provisional_released_unestablished = Some(109);
+        info.connect_need_downgraded_to_legacy = Some(110);
+        info.connect_provisional_in_use = Some(111);
+        let json = event_kind_to_json(&EventKind::RouterSnapshot(Box::new(info)));
+        for (key, want) in [
+            ("connect_admitted_self_interest", 101),
+            ("connect_admitted_onboarding", 102),
+            ("connect_admitted_lattice", 103),
+            ("connect_rejected_onboarding_budget_exhausted", 104),
+            ("connect_rejected_bar_unmet", 105),
+            ("connect_provisional_graduated", 106),
+            ("connect_provisional_dropped", 107),
+            ("connect_provisional_pruned", 108),
+            ("connect_provisional_released_unestablished", 109),
+            ("connect_need_downgraded_to_legacy", 110),
+            ("connect_provisional_in_use", 111),
+        ] {
+            assert_eq!(json[key], want, "{key} must reach the OTLP body");
+        }
+    }
+
+    /// Pin: the admission code on `connect_request_received` (#5858) reaches
+    /// the OTLP body as its stable string, and is null when the hop never
+    /// evaluated admission.
+    #[test]
+    fn connect_request_received_json_carries_admission_code() {
+        use crate::ring::admission::AdmissionCode;
+        let joiner = crate::ring::PeerKeyLocation::random();
+        let event = |admission| {
+            EventKind::Connect(crate::tracing::ConnectEvent::RequestReceived {
+                desired_location: crate::ring::Location::new(0.25),
+                joiner: joiner.clone(),
+                from_addr: "127.0.0.1:4000".parse().unwrap(),
+                from_peer: None,
+                forwarded_to: None,
+                accepted: false,
+                ttl: 3,
+                admission,
+            })
+        };
+        let json = event_kind_to_json(&event(Some(
+            AdmissionCode::RejectedOnboardingBudgetExhausted,
+        )));
+        assert_eq!(json["admission"], "onboarding_budget_exhausted");
+        let json = event_kind_to_json(&event(None));
+        assert!(json["admission"].is_null());
     }
 
     /// Pin: the connect-emission counters (firehose-retirement precursor) must

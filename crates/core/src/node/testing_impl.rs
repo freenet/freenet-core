@@ -1568,6 +1568,13 @@ pub struct SimNetwork {
     /// subject and this suppression. Tests that want it call
     /// [`enable_broadcast_target_list`](Self::enable_broadcast_target_list).
     broadcast_target_list_floor_override: Option<(u8, u8, u16)>,
+    /// Per-node override for the CONNECT need version floor (#5858).
+    ///
+    /// Defaults OFF, like `broadcast_target_list_floor_override`: it changes
+    /// admission behaviour (onboarding slots, the requester's bar), not just an
+    /// encoding. Tests that want it call
+    /// [`enable_connect_need`](Self::enable_connect_need).
+    connect_need_floor_override: Option<(u8, u8, u16)>,
     /// Optional controllable hosting clock injected into every node's
     /// `HostingManager` (via `NodeConfig::hosting_time_source_override`). When
     /// set, hosting-cache TTL and subscription-lease eviction advance ONLY when
@@ -1777,6 +1784,9 @@ impl SimNetwork {
             // Fail-CLOSED by default, like the two behavioural gates above and
             // unlike hash-first (#5147). See the field's rustdoc.
             broadcast_target_list_floor_override: Some(Self::SIM_MIGRATION_DISABLED_FLOOR),
+            // Fail-CLOSED by default: a behavioural gate (#5858). See the
+            // field's rustdoc.
+            connect_need_floor_override: Some(Self::SIM_MIGRATION_DISABLED_FLOOR),
             hosting_clock: None,
             hosting_budget_override: None,
             shared_rings: HashMap::new(),
@@ -2228,6 +2238,31 @@ impl SimNetwork {
         }
         for (builder, _) in self.nodes.iter_mut() {
             builder.config.broadcast_target_list_floor_override = floor;
+        }
+        self
+    }
+
+    /// Turn the CONNECT need variant (#5858) ON for this simulation by pinning
+    /// the per-node version floor to the always-passing
+    /// [`Self::SIM_MIGRATION_ENABLED_FLOOR`]: requesters then state their need
+    /// to every hop whose version is known, and acceptors run the onboarding
+    /// path and the requester's bar.
+    ///
+    /// Not the default, so the two arms of an admission measurement differ by
+    /// this one call. A version is known only on the direction of a link the
+    /// remote introduced itself over unless
+    /// [`enable_gateway_ack_version`](Self::enable_gateway_ack_version) is also
+    /// set, as production is (#5161): without it the joiner's first hop to a
+    /// gateway falls back to the legacy request.
+    #[allow(dead_code)]
+    pub fn enable_connect_need(&mut self) -> &mut Self {
+        let floor = Some(Self::SIM_MIGRATION_ENABLED_FLOOR);
+        self.connect_need_floor_override = floor;
+        for (builder, _) in self.gateways.iter_mut() {
+            builder.config.connect_need_floor_override = floor;
+        }
+        for (builder, _) in self.nodes.iter_mut() {
+            builder.config.connect_need_floor_override = floor;
         }
         self
     }
@@ -2916,6 +2951,7 @@ impl SimNetwork {
             config.hash_first_summaries_floor_override = self.hash_first_summaries_floor_override;
             config.ack_version_floor_override = self.ack_version_floor_override;
             config.broadcast_target_list_floor_override = self.broadcast_target_list_floor_override;
+            config.connect_need_floor_override = self.connect_need_floor_override;
             config.hosting_time_source_override = self
                 .hosting_clock
                 .clone()
@@ -3019,6 +3055,7 @@ impl SimNetwork {
             config.hash_first_summaries_floor_override = self.hash_first_summaries_floor_override;
             config.ack_version_floor_override = self.ack_version_floor_override;
             config.broadcast_target_list_floor_override = self.broadcast_target_list_floor_override;
+            config.connect_need_floor_override = self.connect_need_floor_override;
             config.hosting_time_source_override = self
                 .hosting_clock
                 .clone()

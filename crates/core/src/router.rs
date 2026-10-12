@@ -991,6 +991,25 @@ pub(crate) struct RouterSnapshotInfo {
     /// once both sides have one, discovery sleeps, so on a converged peer
     /// `probes_issued` flattens by design (#5814).
     pub lattice_probe_misses: Option<u64>,
+    /// CONNECT admission by path (#5858), populated by `Ring` on the snapshot
+    /// cadence from `ConnectionManager::admission_stats`. Monotonic lifetime
+    /// totals except `connect_provisional_in_use` (a gauge). `admitted_*`
+    /// count admission DECISIONS (a reservation), not established links.
+    /// `connect_need_downgraded_to_legacy` counts requests whose stated need
+    /// was dropped because the next hop's version could not decode it, so a
+    /// rollout in which no hop understands the need is distinguishable from one
+    /// in which nobody needed onboarding.
+    pub connect_admitted_self_interest: Option<u64>,
+    pub connect_admitted_onboarding: Option<u64>,
+    pub connect_admitted_lattice: Option<u64>,
+    pub connect_rejected_onboarding_budget_exhausted: Option<u64>,
+    pub connect_rejected_bar_unmet: Option<u64>,
+    pub connect_provisional_graduated: Option<u64>,
+    pub connect_provisional_dropped: Option<u64>,
+    pub connect_provisional_pruned: Option<u64>,
+    pub connect_provisional_released_unestablished: Option<u64>,
+    pub connect_need_downgraded_to_legacy: Option<u64>,
+    pub connect_provisional_in_use: Option<u64>,
     /// Version-gate refusal counters (#5156), populated by `Ring` on the
     /// snapshot cadence from `ConnectionManager::version_gate_refusal_stats`.
     /// `supports_hash_first_summaries` and `supports_summary_first_put` both
@@ -3629,6 +3648,18 @@ impl Router {
             lattice_probes_issued: None,
             lattice_probe_improvements: None,
             lattice_probe_misses: None,
+            // CONNECT admission counters (#5858), populated by Ring.
+            connect_admitted_self_interest: None,
+            connect_admitted_onboarding: None,
+            connect_admitted_lattice: None,
+            connect_rejected_onboarding_budget_exhausted: None,
+            connect_rejected_bar_unmet: None,
+            connect_provisional_graduated: None,
+            connect_provisional_dropped: None,
+            connect_provisional_pruned: None,
+            connect_provisional_released_unestablished: None,
+            connect_need_downgraded_to_legacy: None,
+            connect_provisional_in_use: None,
             // Version-gate refusal counters, populated by Ring on the
             // snapshot cadence (#5156).
             hash_first_summaries_declined_unknown_version: None,
