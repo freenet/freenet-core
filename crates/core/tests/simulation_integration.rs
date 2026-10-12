@@ -21143,6 +21143,39 @@ fn log_join_traces(report: &SaturatedJoinReport) {
     let rt = create_runtime();
     rt.block_on(async {
         let logs = report.logs.lock().await;
+
+        // Network-wide: CONNECT forwards whose target never logged receiving
+        // the request, split by whether the pair is an unreachable one.
+        let received: HashSet<(String, &freenet::dev_tool::TransportPublicKey)> = logs
+            .iter()
+            .filter(|l| l.kind.connect_request_received_joiner().is_some())
+            .map(|l| (l.tx.to_string(), l.peer_id.pub_key()))
+            .collect();
+        let (mut forwards, mut lost, mut lost_unreachable, mut forwards_unreachable) =
+            (0usize, 0usize, 0usize, 0usize);
+        for l in logs.iter() {
+            let Some(to) = l.kind.connect_request_forwarded_to() else {
+                continue;
+            };
+            forwards += 1;
+            let pair = label_of_key
+                .get(l.peer_id.pub_key())
+                .and_then(|f| report.addrs.get(*f))
+                .zip(label_of_key.get(to).and_then(|t| report.addrs.get(*t)));
+            let unreachable = pair.is_some_and(|(a, b)| faults.is_unreachable_pair(a, b));
+            forwards_unreachable += usize::from(unreachable);
+            if !received.contains(&(l.tx.to_string(), to)) {
+                lost += 1;
+                lost_unreachable += usize::from(unreachable);
+            }
+        }
+        tracing::info!(
+            target: "saturated_join",
+            "CONNECT forwards network-wide: {forwards}, of which {forwards_unreachable} \
+             between an unreachable pair; {lost} never logged at the target \
+             ({lost_unreachable} of those between an unreachable pair)"
+        );
+
         for j in picked {
             let tl = &report
                 .timelines
@@ -21201,11 +21234,45 @@ fn log_join_traces(report: &SaturatedJoinReport) {
                             .get(l.peer_id.pub_key())
                             .map(|l| short(l))
                             .unwrap_or_default();
+                        // A forward whose target never noted receiving this tx
+                        // was lost in transit; say whether the pair is one of
+                        // the unreachable ones.
                         let to = l
                             .kind
                             .connect_request_forwarded_to()
                             .and_then(|k| label_of_key.get(k))
-                            .map(|l| format!(">{}", short(l)))
+                            .map(|to_label| {
+                                let needle = "recv ConnectRequest";
+                                let tx_needle = format!("tx={tx}");
+                                let received = report
+                                    .gateway_timelines
+                                    .iter()
+                                    .chain(report.timelines.iter())
+                                    .find(|(l, _)| l == to_label)
+                                    .is_some_and(|(_, t)| {
+                                        t.notes.iter().any(|n| {
+                                            n.what.starts_with(&needle)
+                                                && n.what.contains(&tx_needle)
+                                        })
+                                    });
+                                let lost = if received {
+                                    String::new()
+                                } else {
+                                    let from = label_of_key
+                                        .get(l.peer_id.pub_key())
+                                        .and_then(|f| report.addrs.get(*f));
+                                    let to_addr = report.addrs.get(*to_label);
+                                    let unreachable = match (from, to_addr) {
+                                        (Some(a), Some(b)) => faults.is_unreachable_pair(a, b),
+                                        _ => false,
+                                    };
+                                    format!(
+                                        "[LOST{}]",
+                                        if unreachable { ",unreachable pair" } else { "" }
+                                    )
+                                };
+                                format!(">{}{lost}", short(to_label))
+                            })
                             .unwrap_or_default();
                         let outcome = if l.kind.is_connect_accepted() {
                             let reach = report
