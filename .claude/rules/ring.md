@@ -136,7 +136,9 @@ WHEN accepting a new connection (should_accept):
        Location, last slot kept for nearly isolated requesters). Never
        records into the evaluator window. No slot → falls back to steps 2-5.
      → BAR requester: refuse (bar_unmet) unless strictly closer to the target
-       or the lattice admits it (switch: ENFORCE_REQUESTER_BAR); then 2-5.
+       or the lattice admits it — ONLY when ENFORCE_REQUESTER_BAR, which ships
+       FALSE (#5858 owner decision; would-refuse counted as
+       bar_unmet_not_enforced; tests enforce via set_requester_bar_enforced); then 2-5.
      → Onboarding links are PROVISIONAL: once ONBOARDING_MIN_AGE_BEFORE_PRUNE
        old and established, first in line for prune/swap; after
        ONBOARDING_PROBATION they graduate only as a FRESH candidate (beat the

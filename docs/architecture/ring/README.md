@@ -203,7 +203,9 @@ need-unknown and takes the self-interest path alone):
   into it. With no slot to give, the request falls back to the self-interest rule.
 - A requester with a **bar** (it already holds a connection that close to the target) is refused
   unless this peer is strictly closer to the target or the lattice clause admits it
-  (`ENFORCE_REQUESTER_BAR`), then takes the self-interest rule.
+  (`ENFORCE_REQUESTER_BAR`), then takes the self-interest rule. The bar ships NOT enforced (owner
+  decision, #5858) until the simulation shows a net benefit; what it would have refused is counted
+  (`connect_bar_unmet_not_enforced`).
 - An onboarding link is **provisional**: once old enough, it is the first link a prune or swap
   sheds while on probation, and after `ONBOARDING_PROBATION` it graduates only if it would pass
   the self-interest rule as a fresh candidate (beat the evaluator window; capped per window), if

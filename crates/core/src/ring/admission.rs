@@ -124,13 +124,44 @@ pub(crate) fn onboarding_high_priority(requester_connections: u8, min_connection
         < (min_connections as f64 * ONBOARDING_PRIORITY_FRACTION_OF_MIN).ceil()
 }
 
-/// Whether a requester's bar (`RequesterNeed::Bar`) is enforced at all.
+/// Whether a requester's bar (`RequesterNeed::Bar`) is enforced.
 ///
-/// Off would admit a requester with a bar exactly like a legacy one. Kept
-/// switchable while the owner decides whether the bar ships enforced: without
-/// the early stop at relays (not implemented, see `RelayState::handle_request`)
-/// enforcing it only adds rejections.
-pub(crate) const ENFORCE_REQUESTER_BAR: bool = true;
+/// OFF (#5858, owner decision): requesters still send their bar and it still
+/// reaches telemetry, but an acceptor admits a requester with a bar exactly
+/// like a legacy one, until the simulation shows enforcing it is a net
+/// benefit. Without the early stop at relays (not implemented, see
+/// `RelayState::handle_request`) enforcement only adds rejections and uphill
+/// hops. A request enforcement WOULD have refused is counted
+/// (`AdmissionStats::bar_unmet_not_enforced`), so the cost of turning it on is
+/// visible before anyone does. Read through [`requester_bar_enforced`].
+pub(crate) const ENFORCE_REQUESTER_BAR: bool = false;
+
+#[cfg(any(test, feature = "testing"))]
+thread_local! {
+    /// Test-only override of [`ENFORCE_REQUESTER_BAR`] for the current thread,
+    /// so the enforced path stays tested while it ships off.
+    static ENFORCE_REQUESTER_BAR_OVERRIDE: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Override [`ENFORCE_REQUESTER_BAR`] on the current thread (`None` restores
+/// it). Test and simulation use only.
+#[cfg(any(test, feature = "testing"))]
+pub fn set_requester_bar_enforced(enforced: Option<bool>) {
+    ENFORCE_REQUESTER_BAR_OVERRIDE.with(|c| c.set(enforced));
+}
+
+/// Whether the requester's bar is enforced on this thread: the test override
+/// if set, else [`ENFORCE_REQUESTER_BAR`].
+pub(crate) fn requester_bar_enforced() -> bool {
+    #[cfg(any(test, feature = "testing"))]
+    {
+        if let Some(enforced) = ENFORCE_REQUESTER_BAR_OVERRIDE.with(|c| c.get()) {
+            return enforced;
+        }
+    }
+    ENFORCE_REQUESTER_BAR
+}
 
 /// Ring distance used as the bar when the requester holds no connection on the
 /// target's side: half the ring is the largest possible distance, so every
@@ -310,6 +341,10 @@ pub(crate) struct AdmissionStats {
     pub admitted_lattice: u64,
     pub rejected_onboarding_budget_exhausted: u64,
     pub rejected_bar_unmet: u64,
+    /// Requests whose bar this peer did not meet, decided on self-interest
+    /// because the bar is not enforced (`ENFORCE_REQUESTER_BAR`): what
+    /// enforcement would have refused (unless the lattice admitted them).
+    pub bar_unmet_not_enforced: u64,
     /// Provisional links kept at the end of probation.
     pub provisional_graduated: u64,
     /// Provisional links dropped at the end of probation.
@@ -343,6 +378,7 @@ pub(crate) struct AdmissionCounters {
     admitted_lattice: AtomicU64,
     rejected_onboarding_budget_exhausted: AtomicU64,
     rejected_bar_unmet: AtomicU64,
+    bar_unmet_not_enforced: AtomicU64,
     provisional_graduated: AtomicU64,
     provisional_dropped: AtomicU64,
     provisional_pruned: AtomicU64,
@@ -410,6 +446,12 @@ impl AdmissionCounters {
         counter.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// A request the bar would have refused, admitted on self-interest
+    /// because enforcement is off. Once per request.
+    pub(crate) fn record_bar_unmet_not_enforced(&self) {
+        self.bar_unmet_not_enforced.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub(crate) fn record_onboarding_established(&self) {
         self.onboarding_established.fetch_add(1, Ordering::Relaxed);
     }
@@ -434,6 +476,7 @@ impl AdmissionCounters {
                 .rejected_onboarding_budget_exhausted
                 .load(Ordering::Relaxed),
             rejected_bar_unmet: self.rejected_bar_unmet.load(Ordering::Relaxed),
+            bar_unmet_not_enforced: self.bar_unmet_not_enforced.load(Ordering::Relaxed),
             provisional_graduated: self.provisional_graduated.load(Ordering::Relaxed),
             provisional_dropped: self.provisional_dropped.load(Ordering::Relaxed),
             provisional_pruned: self.provisional_pruned.load(Ordering::Relaxed),

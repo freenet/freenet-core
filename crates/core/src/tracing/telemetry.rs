@@ -3030,6 +3030,10 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                     serde_json::json!(snapshot.connect_rejected_bar_unmet),
                 );
                 obj.insert(
+                    "connect_bar_unmet_not_enforced".to_string(),
+                    serde_json::json!(snapshot.connect_bar_unmet_not_enforced),
+                );
+                obj.insert(
                     "connect_provisional_graduated".to_string(),
                     serde_json::json!(snapshot.connect_provisional_graduated),
                 );
@@ -4440,6 +4444,7 @@ mod tests {
         info.connect_admitted_lattice = Some(103);
         info.connect_rejected_onboarding_budget_exhausted = Some(104);
         info.connect_rejected_bar_unmet = Some(105);
+        info.connect_bar_unmet_not_enforced = Some(124);
         info.connect_provisional_graduated = Some(106);
         info.connect_provisional_dropped = Some(107);
         info.connect_provisional_pruned = Some(108);
@@ -4457,6 +4462,7 @@ mod tests {
             ("connect_admitted_lattice", 103),
             ("connect_rejected_onboarding_budget_exhausted", 104),
             ("connect_rejected_bar_unmet", 105),
+            ("connect_bar_unmet_not_enforced", 124),
             ("connect_provisional_graduated", 106),
             ("connect_provisional_dropped", 107),
             ("connect_provisional_pruned", 108),

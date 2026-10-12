@@ -1005,6 +1005,9 @@ pub(crate) struct RouterSnapshotInfo {
     pub connect_admitted_lattice: Option<u64>,
     pub connect_rejected_onboarding_budget_exhausted: Option<u64>,
     pub connect_rejected_bar_unmet: Option<u64>,
+    /// Requests the bar would have refused while it is not enforced
+    /// (`ENFORCE_REQUESTER_BAR`, #5858).
+    pub connect_bar_unmet_not_enforced: Option<u64>,
     pub connect_provisional_graduated: Option<u64>,
     pub connect_provisional_dropped: Option<u64>,
     pub connect_provisional_pruned: Option<u64>,
@@ -3662,6 +3665,7 @@ impl Router {
             connect_admitted_lattice: None,
             connect_rejected_onboarding_budget_exhausted: None,
             connect_rejected_bar_unmet: None,
+            connect_bar_unmet_not_enforced: None,
             connect_provisional_graduated: None,
             connect_provisional_dropped: None,
             connect_provisional_pruned: None,
