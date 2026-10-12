@@ -2383,6 +2383,123 @@ mod tests {
             .block_on(body);
     }
 
+    /// A joiner whose gateways never answer (#5858): every round's CONNECTs
+    /// go unanswered. Before the fix each CONNECT ran to the transaction TTL
+    /// and the loop waited for all of them, so the second round started a TTL
+    /// later; now each ends after the quiet window and the pacer spaces the
+    /// rounds with a growing, capped backoff. Paused time; the test plays the
+    /// event loop, holding every CONNECT's reply channel open so it is
+    /// neither answered nor closed.
+    #[test]
+    fn isolated_joiner_retries_in_seconds_with_a_bounded_backoff() {
+        let _lock = crate::node::network_status::TEST_GLOBAL_STATE_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        crate::node::network_status::init(0, HashSet::new(), "test".to_string());
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .start_paused(true)
+            .build()
+            .expect("build test runtime")
+            .block_on(async {
+                let config_args = crate::config::ConfigArgs {
+                    id: Some("bootstrap-5858-pacing".to_string()),
+                    mode: Some(crate::contract::OperationMode::Local),
+                    ..Default::default()
+                };
+                let node_config =
+                    crate::node::NodeConfig::new(config_args.build().await.expect("Config"))
+                        .await
+                        .expect("NodeConfig");
+                let (notification_rx, notification_tx) =
+                    crate::node::event_loop_notification_channel();
+                let (ops_ch_channel, ch_channel, _wait_for_event) =
+                    crate::contract::contract_handler_channel();
+                let connection_manager = crate::ring::ConnectionManager::new(&node_config);
+                let (result_router_tx, result_router_rx) = tokio::sync::mpsc::channel(100);
+                let task_monitor =
+                    crate::node::background_task_monitor::BackgroundTaskMonitor::new();
+                let op_manager = Arc::new(
+                    OpManager::new(
+                        notification_tx,
+                        ops_ch_channel,
+                        &node_config,
+                        crate::tracing::DynamicRegister::new(vec![]),
+                        connection_manager,
+                        result_router_tx,
+                        &task_monitor,
+                    )
+                    .expect("OpManager"),
+                );
+                op_manager.ring.attach_op_manager(&op_manager);
+                op_manager
+                    .ring
+                    .connection_manager
+                    .set_own_addr_local_for_test("127.0.0.1:14858".parse().unwrap());
+                let crate::node::EventLoopNotificationsReceiver {
+                    notifications_receiver,
+                    mut op_execution_receiver,
+                } = notification_rx;
+                std::mem::forget((ch_channel, result_router_rx, notifications_receiver));
+
+                let gateways = vec![bootstrap_gateway(25858), bootstrap_gateway(25859)];
+                let start = Instant::now();
+                let handle = initial_join_procedure(op_manager.clone(), &gateways)
+                    .await
+                    .expect("spawn join procedure");
+                let mut requests = Vec::new();
+                let mut held = Vec::new();
+                let horizon = Duration::from_secs(120);
+                while let Ok(Some((reply, msg, _target))) = tokio::time::timeout(
+                    horizon.saturating_sub(start.elapsed()),
+                    op_execution_receiver.recv(),
+                )
+                .await
+                {
+                    if matches!(
+                        msg,
+                        crate::message::NetMessage::V1(crate::message::NetMessageV1::Connect(
+                            ConnectMsg::Request { .. } | ConnectMsg::RequestWithNeed { .. }
+                        ))
+                    ) {
+                        requests.push(start.elapsed());
+                    }
+                    held.push(reply);
+                }
+                handle.abort();
+
+                let second_round = requests
+                    .iter()
+                    .find(|t| **t > Duration::from_secs(1))
+                    .copied();
+                assert!(
+                    second_round.is_some_and(|t| t < Duration::from_secs(15)),
+                    "the second round must start seconds after the first, not after the \
+                     transaction TTL; CONNECT requests at {requests:?}"
+                );
+                // Rounds: quiet window plus 1, 2, 4, 8, 16, 30 s (+-20%) of backoff,
+                // two gateways per round. A storm, or two paths running rounds
+                // at once, would exceed this.
+                assert!(
+                    requests.len() <= 2 * 8,
+                    "{} CONNECT requests in {horizon:?}: the backoff is not bounding \
+                     the retry rate; at {requests:?}",
+                    requests.len()
+                );
+                let mut gaps: Vec<Duration> = requests
+                    .windows(2)
+                    .map(|w| w[1].saturating_sub(w[0]))
+                    .filter(|g| *g > Duration::from_secs(1))
+                    .collect();
+                gaps.sort();
+                assert!(
+                    gaps.last().is_some_and(|g| *g > Duration::from_secs(20)),
+                    "the backoff must grow between failed rounds; gaps {gaps:?}"
+                );
+                drop(held);
+            });
+    }
+
     fn bootstrap_gateway(port: u16) -> PeerKeyLocation {
         let pub_key = TransportKeypair::new().public().clone();
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), port);
