@@ -29,6 +29,10 @@ impl P2pConnManager {
             )
         };
         let pub_key_to_remove = entry.pub_key.clone();
+        crate::ring::join_timeline::record_note(
+            &self.bridge.op_manager.ring.connection_manager.pub_key,
+            || ("transport: dropped on request".to_string(), Some(peer_addr)),
+        );
 
         tracing::trace!(
             peer_addr = %peer_addr,
@@ -139,6 +143,15 @@ impl P2pConnManager {
             )
         };
         let pub_key_to_remove = entry.pub_key.clone();
+        crate::ring::join_timeline::record_note(
+            &self.bridge.op_manager.ring.connection_manager.pub_key,
+            || {
+                (
+                    "transport: dropped by zombie sweep".to_string(),
+                    Some(peer_addr),
+                )
+            },
+        );
 
         // Non-blocking send to handshake driver to avoid deadlock (#3519).
         // For zombie transports (already established connections), the expected_inbound

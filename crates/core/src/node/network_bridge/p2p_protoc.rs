@@ -2076,6 +2076,10 @@ impl P2pConnManager {
                             error,
                             connection_id,
                         } => {
+                            crate::ring::join_timeline::record_note(
+                                &ctx.bridge.op_manager.ring.connection_manager.pub_key,
+                                || (format!("transport: closed ({error})"), Some(remote_addr)),
+                            );
                             tracing::debug!(
                                 peer_addr = %remote_addr,
                                 error = ?error,

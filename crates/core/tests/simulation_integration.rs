@@ -21218,6 +21218,26 @@ fn log_join_traces(report: &SaturatedJoinReport) {
                     txs.push(tx.split(' ').next().unwrap_or_default().to_string());
                 }
             }
+            // Transport teardown on the far side of this joiner's links.
+            for (label, other) in report
+                .gateway_timelines
+                .iter()
+                .chain(report.timelines.iter())
+            {
+                for n in other
+                    .notes
+                    .iter()
+                    .filter(|n| n.at <= until && n.what.starts_with("transport:"))
+                    .filter(|n| n.remote == Some(me))
+                {
+                    out.push_str(&format!(
+                        "  +{:>7.2}s [{}] {} -> this joiner\n",
+                        n.at.saturating_sub(origin).as_secs_f64(),
+                        short(label),
+                        n.what
+                    ));
+                }
+            }
             for (at, count) in tl.ring_count_history.iter().filter(|(at, _)| *at <= until) {
                 out.push_str(&format!(
                     "  +{:>7.2}s ring connections = {count}\n",
