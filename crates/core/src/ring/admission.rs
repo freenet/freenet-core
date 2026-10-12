@@ -24,7 +24,7 @@
 //! otherwise (`ConnectionManager::review_provisional_links`). While on
 //! probation it is the first link a topology prune sheds.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -64,6 +64,18 @@ pub(crate) const ONBOARDING_PROVISIONAL_SLOTS: usize = 2;
 /// while below `min_connections`), short enough that a link the acceptor does
 /// not want frees its slot for the next joiner within minutes.
 pub(crate) const ONBOARDING_PROBATION: Duration = Duration::from_secs(600);
+
+/// At most this many onboarding links graduate on their self-interest merits
+/// per [`ONBOARDING_GRADUATION_WINDOW`]: graduation admits a link that never
+/// faced the evaluator when it arrived, so it is capped like an admission. One
+/// matches what the evaluator itself admits per window. (A link kept because
+/// the acceptor would fall below `min_connections` without it, or because it
+/// is a lattice edge, is not counted.)
+pub(crate) const ONBOARDING_GRADUATIONS_PER_WINDOW: usize = 1;
+
+/// The window [`ONBOARDING_GRADUATIONS_PER_WINDOW`] is counted over: the slow
+/// evaluator window (5 min), the longer of the two.
+pub(crate) const ONBOARDING_GRADUATION_WINDOW: Duration = Duration::from_secs(300);
 
 /// Admissions an onboarding slot may serve per probation period, on average.
 ///
@@ -432,6 +444,20 @@ pub(crate) struct ProvisionalLinks {
     capacity: usize,
     tokens: f64,
     tokens_at: Option<Instant>,
+    /// Self-interest graduations within the last
+    /// [`ONBOARDING_GRADUATION_WINDOW`]; at most
+    /// [`ONBOARDING_GRADUATIONS_PER_WINDOW`] entries.
+    graduations: VecDeque<Instant>,
+}
+
+/// A probation decision to drop a link, carrying what is needed to put its
+/// slot back if the drop cannot be queued
+/// (`ConnectionManager::confirm_probation_drop`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ProbationDrop {
+    pub addr: SocketAddr,
+    location: Location,
+    admitted_at: Instant,
 }
 
 impl ProvisionalLinks {
@@ -441,7 +467,48 @@ impl ProvisionalLinks {
             capacity,
             tokens: capacity as f64,
             tokens_at: None,
+            graduations: VecDeque::new(),
         }
+    }
+
+    /// Whether another self-interest graduation fits in the window at `now`.
+    pub(crate) fn graduation_allowed(&mut self, now: Instant) -> bool {
+        while self
+            .graduations
+            .front()
+            .is_some_and(|at| now.saturating_duration_since(*at) >= ONBOARDING_GRADUATION_WINDOW)
+        {
+            self.graduations.pop_front();
+        }
+        self.graduations.len() < ONBOARDING_GRADUATIONS_PER_WINDOW
+    }
+
+    pub(crate) fn record_graduation(&mut self, now: Instant) {
+        if self.graduations.len() < ONBOARDING_GRADUATIONS_PER_WINDOW {
+            self.graduations.push_back(now);
+        }
+    }
+
+    /// Take `addr`'s slot for a drop decision (see [`ProbationDrop`]).
+    pub(crate) fn take_for_drop(&mut self, addr: SocketAddr) -> Option<ProbationDrop> {
+        self.slots.remove(&addr).map(|slot| ProbationDrop {
+            addr,
+            location: slot.location,
+            admitted_at: slot.admitted_at,
+        })
+    }
+
+    /// Put back the slot of a drop that could not be queued, with its original
+    /// admission time. Spends no token and ignores the capacity: the link
+    /// never left.
+    pub(crate) fn restore(&mut self, drop: ProbationDrop) {
+        self.slots.insert(
+            drop.addr,
+            Slot {
+                admitted_at: drop.admitted_at,
+                location: drop.location,
+            },
+        );
     }
 
     fn refill(&mut self, now: Instant) {
@@ -489,19 +556,6 @@ impl ProvisionalLinks {
         Ok(())
     }
 
-    /// Put back a slot whose release could not be carried out (e.g. its drop
-    /// could not be queued), keeping its original admission time. Spends no
-    /// token and ignores the capacity: the link never left.
-    pub(crate) fn restore(&mut self, addr: SocketAddr, location: Location, admitted_at: Instant) {
-        self.slots.insert(
-            addr,
-            Slot {
-                admitted_at,
-                location,
-            },
-        );
-    }
-
     /// Move `old`'s slot to `new`, keeping its admission time: the same
     /// connection, re-keyed when the peer's address is corrected.
     pub(crate) fn rename(&mut self, old: SocketAddr, new: SocketAddr) {
@@ -510,16 +564,9 @@ impl ProvisionalLinks {
         }
     }
 
-    /// Free `addr`'s slot, returning its location and admission time.
-    pub(crate) fn take(&mut self, addr: SocketAddr) -> Option<(Location, Instant)> {
-        self.slots
-            .remove(&addr)
-            .map(|slot| (slot.location, slot.admitted_at))
-    }
-
     /// Free `addr`'s slot. `true` if it held one.
     pub(crate) fn release(&mut self, addr: SocketAddr) -> bool {
-        self.take(addr).is_some()
+        self.slots.remove(&addr).is_some()
     }
 
     pub(crate) fn contains(&self, addr: SocketAddr) -> bool {
@@ -667,6 +714,31 @@ mod tests {
         assert!(onboarding_high_priority(0, 25));
         assert!(onboarding_high_priority(6, 25));
         assert!(!onboarding_high_priority(7, 25));
+    }
+
+    #[test]
+    fn graduations_are_capped_per_window() {
+        let start = Instant::now();
+        let mut slots = ProvisionalLinks::new(2);
+        assert!(slots.graduation_allowed(start));
+        slots.record_graduation(start);
+        assert!(!slots.graduation_allowed(start + Duration::from_secs(1)));
+        assert!(slots.graduation_allowed(start + ONBOARDING_GRADUATION_WINDOW));
+    }
+
+    #[test]
+    fn a_drop_that_is_not_queued_restores_the_slot() {
+        let start = Instant::now();
+        let mut slots = ProvisionalLinks::new(2);
+        assert_eq!(slots.try_reserve(addr(1), loc(0.1), true, start), Ok(()));
+        let drop = slots.take_for_drop(addr(1)).expect("held");
+        assert!(!slots.contains(addr(1)));
+        slots.restore(drop);
+        assert_eq!(
+            slots.ages(start + Duration::from_secs(7)),
+            vec![(addr(1), Duration::from_secs(7))],
+            "restored with its original admission time"
+        );
     }
 
     #[test]

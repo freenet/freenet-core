@@ -993,11 +993,7 @@ impl TopologyManager {
     /// ([`composite_score`]), skipping the protected lattice edges and any
     /// topology-critical connection. `None` when every connection is protected
     /// or own location is unknown.
-    ///
-    /// Also the "would self-interest keep this link?" test applied to an
-    /// onboarding link at the end of its probation (#5858,
-    /// `ConnectionManager::review_provisional_links`): a link this ranking does
-    /// not name is one the peer would keep on its merits.
+
     pub(crate) fn least_valuable_prunable_peer(
         &self,
         my_location: &Option<Location>,

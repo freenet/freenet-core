@@ -6391,18 +6391,24 @@ impl Ring {
             // End-of-probation review of onboarding links (#5858): keep the ones
             // this peer's self-interest would keep, drop the rest so their slots
             // serve the next joiner. Non-blocking: a drop the event loop cannot
-            // take now leaves the link in place as an ordinary connection (its
-            // slot is already freed), which is the pre-#5858 outcome.
-            for addr in self.connection_manager.review_provisional_links(tick_now) {
-                if let Err(e) = notifier.notifications_sender.try_send(Either::Right(
-                    crate::message::NodeEvent::DropConnection(addr),
+            // take now puts the slot back, so the link stays on probation and
+            // is reviewed again next tick.
+            for drop in self.connection_manager.review_provisional_links(tick_now) {
+                let queued = match notifier.notifications_sender.try_send(Either::Right(
+                    crate::message::NodeEvent::DropConnection(drop.addr),
                 )) {
-                    tracing::warn!(
-                        peer = %addr,
-                        error = %e,
-                        "Could not queue drop of onboarding link after probation"
-                    );
-                }
+                    Ok(()) => true,
+                    Err(e) => {
+                        tracing::warn!(
+                            peer = %drop.addr,
+                            error = %e,
+                            "Could not queue drop of onboarding link after probation; \
+                             keeping it on probation"
+                        );
+                        false
+                    }
+                };
+                self.connection_manager.confirm_probation_drop(drop, queued);
             }
 
             // Expire old NAT traversal failure entries

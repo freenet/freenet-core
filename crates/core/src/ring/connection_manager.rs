@@ -34,8 +34,8 @@ use crate::util::backoff::{ExponentialBackoff, TrackedBackoff};
 
 use super::admission::{
     AdmissionCode, AdmissionCounters, AdmissionStats, ENFORCE_REQUESTER_BAR, ONBOARDING_PROBATION,
-    ONBOARDING_PROVISIONAL_SLOTS, ProvisionalLinks, ProvisionalOutcome, RequesterNeed,
-    UNCONSTRAINED_BAR, onboarding_high_priority, requester_is_short,
+    ONBOARDING_PROVISIONAL_SLOTS, ProbationDrop, ProvisionalLinks, ProvisionalOutcome,
+    RequesterNeed, UNCONSTRAINED_BAR, onboarding_high_priority, requester_is_short,
 };
 use super::*;
 
@@ -1689,7 +1689,9 @@ impl ConnectionManager {
     }
 
     /// End-of-probation review of the onboarding slots (#5858), run on the
-    /// maintenance tick with that tick's `now`. Returns the links to DROP.
+    /// maintenance tick with that tick's `now`. Returns the links to DROP; their
+    /// slots are held by the returned [`ProbationDrop`]s until the caller
+    /// reports whether the drop was queued ([`Self::confirm_probation_drop`]).
     ///
     /// For each slot:
     /// - its connection never established and it holds no live pending
@@ -1697,18 +1699,14 @@ impl ConnectionManager {
     ///   freed (the handshake failed; usually the prune hook already freed it);
     /// - [`ONBOARDING_PROBATION`] has passed and it is not connected: freed;
     /// - [`ONBOARDING_PROBATION`] has passed and it is connected: it GRADUATES
-    ///   when this peer's self-interest would keep it, and is dropped
-    ///   otherwise. Self-interest keeps it when this peer would fall below
-    ///   `min_connections` without it, when it is a per-side nearest lattice
-    ///   edge, or when the topology manager's removal ranking (the composite
-    ///   routing-value and gap score a topology swap uses) does not name it as
-    ///   the least valuable connection.
+    ///   when this peer's self-interest would keep it
+    ///   ([`Self::self_interest_keeps`]), and is dropped otherwise.
     ///
-    /// Every slot leaves the table here or earlier, so none outlives
-    /// [`ONBOARDING_PROBATION`] plus one tick.
-    pub(crate) fn review_provisional_links(&self, now: Instant) -> Vec<SocketAddr> {
+    /// Every slot leaves the table here or earlier (a drop that cannot be
+    /// queued is put back and reviewed again next tick).
+    pub(crate) fn review_provisional_links(&self, now: Instant) -> Vec<ProbationDrop> {
         let ages = self.provisional_links.lock().ages(now);
-        let mut to_drop = Vec::new();
+        let mut to_drop: Vec<ProbationDrop> = Vec::new();
         for (addr, age) in ages {
             let established = self.is_in_ring(addr);
             if !established {
@@ -1727,47 +1725,84 @@ impl ConnectionManager {
             if age < ONBOARDING_PROBATION {
                 continue;
             }
-            if self.self_interest_keeps(addr, &to_drop) {
+            let dropping: Vec<SocketAddr> = to_drop.iter().map(|d| d.addr).collect();
+            if self.self_interest_keeps(addr, &dropping, now) {
                 self.finish_probation(addr, ProvisionalOutcome::Graduated);
                 tracing::info!(addr = %addr, "Onboarding link graduated after probation");
-            } else {
-                self.finish_probation(addr, ProvisionalOutcome::Dropped);
+            } else if let Some(drop) = self.provisional_links.lock().take_for_drop(addr) {
                 tracing::info!(
                     addr = %addr,
                     "Onboarding link dropped after probation (not worth keeping)"
                 );
-                to_drop.push(addr);
+                to_drop.push(drop);
             }
         }
         to_drop
     }
 
+    /// Report whether the drop of a probation link was queued (#5858 review
+    /// S4). Queued: counted as dropped (the prune that follows finds no slot).
+    /// Not queued: the slot is put back, so the link stays on probation and is
+    /// reviewed again instead of lingering untracked.
+    pub(crate) fn confirm_probation_drop(&self, drop: ProbationDrop, queued: bool) {
+        if queued {
+            self.admission_counters
+                .record_provisional(ProvisionalOutcome::Dropped);
+        } else {
+            self.provisional_links.lock().restore(drop);
+        }
+    }
+
     /// Whether this peer's self-interest would keep the established link to
-    /// `addr`, given that the links in `dropping` are about to go. See
-    /// [`Self::review_provisional_links`].
-    fn self_interest_keeps(&self, addr: SocketAddr, dropping: &[SocketAddr]) -> bool {
+    /// `addr` at the end of its probation, given that the links in `dropping`
+    /// are about to go (#5858). See [`Self::review_provisional_links`].
+    ///
+    /// Kept when this peer would fall below `min_connections` without it, or
+    /// when it is a per-side nearest lattice edge. Otherwise it is judged as a
+    /// FRESH candidate: its Kleinberg gap score against this peer's other
+    /// connections must beat the evaluator window, exactly as an arriving
+    /// candidate's must, and the score is recorded there like one. At most
+    /// [`super::admission::ONBOARDING_GRADUATIONS_PER_WINDOW`] such graduations
+    /// per window. Fails closed: an unknown own or peer location drops it.
+    fn self_interest_keeps(&self, addr: SocketAddr, dropping: &[SocketAddr], now: Instant) -> bool {
         let remaining = self.connection_count().saturating_sub(dropping.len());
         if remaining <= self.min_connections {
             return true;
         }
         let Some(loc) = self.location_for_peer.read().get(&addr).copied() else {
-            return true;
+            return false;
         };
         if self.nn_lattice_active() && self.is_per_side_nearest(loc, addr) {
             return true;
         }
-        let mut neighbors = self.connections_by_location.read().clone();
-        for gone in dropping {
-            for conns in neighbors.values_mut() {
-                conns.retain(|c| c.location.socket_addr() != Some(*gone));
-            }
+        let Some(me) = self.get_stored_location() else {
+            return false;
+        };
+        if !self.provisional_links.lock().graduation_allowed(now) {
+            return false;
         }
-        neighbors.retain(|_, conns| !conns.is_empty());
-        let least_valuable = self
+        let score = {
+            let connections = self.connections_by_location.read();
+            let others = connections.iter().flat_map(|(other_loc, conns)| {
+                conns
+                    .iter()
+                    .filter(|c| {
+                        c.location
+                            .socket_addr()
+                            .is_none_or(|a| a != addr && !dropping.contains(&a))
+                    })
+                    .map(move |_| me.distance(*other_loc).as_f64())
+            });
+            crate::topology::small_world_rand::kleinberg_score(me.distance(loc).as_f64(), others)
+        };
+        let passes = self
             .topology_manager
-            .read()
-            .least_valuable_prunable_peer(&self.get_stored_location(), &neighbors);
-        least_valuable.and_then(|peer| peer.socket_addr()) != Some(addr)
+            .write()
+            .evaluate_new_connection_with_score(score, now);
+        if passes {
+            self.provisional_links.lock().record_graduation(now);
+        }
+        passes
     }
 
     fn finish_probation(&self, addr: SocketAddr, outcome: ProvisionalOutcome) {
