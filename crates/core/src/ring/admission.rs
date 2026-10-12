@@ -203,8 +203,10 @@ pub(crate) struct AdmissionStats {
     /// Provisional slots freed because the connection never established.
     pub provisional_released_unestablished: u64,
     /// Requests sent in the legacy form only because the next hop's version
-    /// does not understand the need (or is unknown).
-    pub need_downgraded_to_legacy: u64,
+    /// is unknown (`_unknown_version`, never heals) or known but below the
+    /// floor (`_below_floor`, heals as the fleet upgrades).
+    pub need_downgraded_unknown_version: u64,
+    pub need_downgraded_below_floor: u64,
     /// Onboarding links whose connection was established (the denominator
     /// for the probation outcomes).
     pub onboarding_established: u64,
@@ -225,7 +227,8 @@ pub(crate) struct AdmissionCounters {
     provisional_dropped: AtomicU64,
     provisional_pruned: AtomicU64,
     provisional_released_unestablished: AtomicU64,
-    need_downgraded_to_legacy: AtomicU64,
+    need_downgraded_unknown_version: AtomicU64,
+    need_downgraded_below_floor: AtomicU64,
     onboarding_established: AtomicU64,
 }
 
@@ -276,9 +279,15 @@ impl AdmissionCounters {
         self.onboarding_established.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_need_downgraded(&self) {
-        self.need_downgraded_to_legacy
-            .fetch_add(1, Ordering::Relaxed);
+    /// `unknown_version`: the hop's version is unknown (never heals), as
+    /// opposed to known but below the floor (heals as the fleet upgrades).
+    pub(crate) fn record_need_downgraded(&self, unknown_version: bool) {
+        let counter = if unknown_version {
+            &self.need_downgraded_unknown_version
+        } else {
+            &self.need_downgraded_below_floor
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
     }
 
     pub(crate) fn snapshot(&self, provisional_in_use: usize) -> AdmissionStats {
@@ -296,7 +305,10 @@ impl AdmissionCounters {
             provisional_released_unestablished: self
                 .provisional_released_unestablished
                 .load(Ordering::Relaxed),
-            need_downgraded_to_legacy: self.need_downgraded_to_legacy.load(Ordering::Relaxed),
+            need_downgraded_unknown_version: self
+                .need_downgraded_unknown_version
+                .load(Ordering::Relaxed),
+            need_downgraded_below_floor: self.need_downgraded_below_floor.load(Ordering::Relaxed),
             onboarding_established: self.onboarding_established.load(Ordering::Relaxed),
             provisional_in_use: provisional_in_use as u64,
         }

@@ -3044,8 +3044,16 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                     serde_json::json!(snapshot.connect_provisional_released_unestablished),
                 );
                 obj.insert(
-                    "connect_need_downgraded_to_legacy".to_string(),
-                    serde_json::json!(snapshot.connect_need_downgraded_to_legacy),
+                    "connect_need_downgraded_unknown_version".to_string(),
+                    serde_json::json!(snapshot.connect_need_downgraded_unknown_version),
+                );
+                obj.insert(
+                    "connect_need_downgraded_below_floor".to_string(),
+                    serde_json::json!(snapshot.connect_need_downgraded_below_floor),
+                );
+                obj.insert(
+                    "connect_onboarding_established".to_string(),
+                    serde_json::json!(snapshot.connect_onboarding_established),
                 );
                 obj.insert(
                     "connect_provisional_in_use".to_string(),
@@ -4426,7 +4434,9 @@ mod tests {
         info.connect_provisional_dropped = Some(107);
         info.connect_provisional_pruned = Some(108);
         info.connect_provisional_released_unestablished = Some(109);
-        info.connect_need_downgraded_to_legacy = Some(110);
+        info.connect_need_downgraded_unknown_version = Some(110);
+        info.connect_need_downgraded_below_floor = Some(120);
+        info.connect_onboarding_established = Some(121);
         info.connect_provisional_in_use = Some(111);
         let json = event_kind_to_json(&EventKind::RouterSnapshot(Box::new(info)));
         for (key, want) in [
@@ -4439,7 +4449,9 @@ mod tests {
             ("connect_provisional_dropped", 107),
             ("connect_provisional_pruned", 108),
             ("connect_provisional_released_unestablished", 109),
-            ("connect_need_downgraded_to_legacy", 110),
+            ("connect_need_downgraded_unknown_version", 110),
+            ("connect_need_downgraded_below_floor", 120),
+            ("connect_onboarding_established", 121),
             ("connect_provisional_in_use", 111),
         ] {
             assert_eq!(json[key], want, "{key} must reach the OTLP body");

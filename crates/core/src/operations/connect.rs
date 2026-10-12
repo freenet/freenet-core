@@ -235,8 +235,9 @@ pub(crate) enum ConnectMsg {
     /// or above `crate::node::CONNECT_NEED_MIN_VERSION`: an older peer has no
     /// variant index for it, fails to decode it, and closes the connection. To
     /// every other peer the legacy `Request` goes instead, which drops the need
-    /// (exactly today's behaviour). Build outbound requests with
-    /// [`request_message_for`], which makes that choice.
+    /// (exactly today's behaviour). The form is chosen per hop, at send time,
+    /// by [`fit_request_to_hop`]; drivers build a plain `Request` carrying the
+    /// need in memory.
     ///
     /// `improvement_bar` is `None` when the requester is short of connections
     /// and `Some(d)` when it already holds a connection `d` from the target;
@@ -280,10 +281,32 @@ impl ConnectMsg {
         }
     }
 
+    /// The request an OUTBOUND `Request` or `RequestWithNeed` carries, with the
+    /// in-memory need intact (`Err(self)` for every other variant). Unlike
+    /// [`Self::inbound_request`] this does not reset a `Request`'s need: a
+    /// locally built request carries the need in memory until
+    /// [`fit_request_to_hop`] chooses its wire form.
+    pub(crate) fn into_outbound_request(self) -> Result<(Transaction, ConnectRequest), Self> {
+        match self {
+            ConnectMsg::Request { id, payload } => Ok((id, payload)),
+            ConnectMsg::RequestWithNeed {
+                id,
+                mut payload,
+                improvement_bar,
+            } => {
+                payload.need = RequesterNeed::from_wire(improvement_bar);
+                Ok((id, payload))
+            }
+            other @ (ConnectMsg::Response { .. }
+            | ConnectMsg::ObservedAddress { .. }
+            | ConnectMsg::Rejected { .. }
+            | ConnectMsg::ConnectFailed { .. }) => Err(other),
+        }
+    }
+
     /// The wire form of `payload` for a next hop: `RequestWithNeed` when the
     /// requester stated a need AND the hop can decode it, the legacy `Request`
-    /// otherwise. Prefer [`request_message_for`], which reads the hop's
-    /// version.
+    /// otherwise. Outbound messages get it from [`fit_request_to_hop`].
     pub(crate) fn request_for_hop(
         id: Transaction,
         payload: ConnectRequest,
@@ -300,34 +323,43 @@ impl ConnectMsg {
     }
 }
 
-/// Build the outbound CONNECT request for the peer at `hop` in the form that
-/// peer can decode (#5858): see [`ConnectMsg::request_for_hop`]. Every outbound
-/// `Request` is built here, so a need can never reach a peer that would drop
-/// the connection on it. A need dropped because the hop is pre-floor (or of
-/// unknown version) is counted (`AdmissionStats::need_downgraded_to_legacy`).
-pub(crate) fn request_message_for(
+/// Fit an outbound message to the peer it is about to be written to (#5858).
+///
+/// Called at the single point where the event loop hands a message to a live
+/// connection (`p2p_protoc.rs`, `OutboundMessageWithTarget`), with that
+/// connection's OWN negotiated version. A CONNECT request leaves as
+/// `RequestWithNeed` when the requester stated a need and the peer can decode
+/// it, and as the legacy `Request` otherwise; every other message passes
+/// through unchanged.
+///
+/// Deciding here rather than when the request is built matters for the hop
+/// that matters most: a fresh joiner builds its first request before any
+/// connection to the gateway exists, so no version is known then (review M2).
+/// It also means only a CURRENTLY connected peer's version is ever trusted,
+/// never a stale record left by an earlier connection at the same address.
+pub(crate) fn fit_request_to_hop(
+    msg: crate::message::NetMessage,
+    hop_version: Option<(u8, u8, u16)>,
     connection_manager: &crate::ring::ConnectionManager,
-    hop: SocketAddr,
-    id: Transaction,
-    payload: ConnectRequest,
-) -> ConnectMsg {
-    let hop_supports_need = hop_supports_need(connection_manager, hop, payload.need);
-    ConnectMsg::request_for_hop(id, payload, hop_supports_need)
-}
-
-/// Whether `need` can be sent to the peer at `hop` (#5858): there is a need to
-/// state and the hop's version decodes `ConnectMsg::RequestWithNeed`. The
-/// version gate is consulted (and a refusal counted) only when there is a need.
-pub(crate) fn hop_supports_need(
-    connection_manager: &crate::ring::ConnectionManager,
-    hop: SocketAddr,
-    need: RequesterNeed,
-) -> bool {
-    match need {
-        RequesterNeed::Unknown => false,
-        RequesterNeed::Short | RequesterNeed::Bar(_) => {
-            connection_manager.supports_connect_need(hop)
+) -> crate::message::NetMessage {
+    use crate::message::{NetMessage, NetMessageV1};
+    match msg {
+        NetMessage::V1(NetMessageV1::Connect(connect)) => {
+            let connect = match connect.into_outbound_request() {
+                Ok((id, payload)) => {
+                    let hop_supports_need = match payload.need {
+                        RequesterNeed::Unknown => false,
+                        RequesterNeed::Short | RequesterNeed::Bar(_) => {
+                            connection_manager.hop_version_supports_connect_need(hop_version)
+                        }
+                    };
+                    ConnectMsg::request_for_hop(id, payload, hop_supports_need)
+                }
+                Err(other) => other,
+            };
+            NetMessage::V1(NetMessageV1::Connect(connect))
         }
+        other @ NetMessage::V1(_) => other,
     }
 }
 
@@ -1473,7 +1505,6 @@ impl ConnectOp {
             ttl,
             exclude_addrs,
             RequesterNeed::Unknown,
-            false,
         );
 
         let op = ConnectOp::new_joiner(
@@ -1652,8 +1683,9 @@ pub(super) async fn dispatch_expect_connection_from(
 /// the rate reaches ~39%, which would cause routing to occasionally skip
 /// reachable peers. This is an accepted trade-off for current network sizes.
 ///
-/// `need` is the joiner's stated need (#5858) and `target_supports_need`
-/// whether `target` can decode it; see [`ConnectMsg::request_for_hop`].
+/// `need` is the joiner's stated need (#5858). It rides in memory on the
+/// legacy `Request`; [`fit_request_to_hop`] picks the wire form when the
+/// message is written to the gateway connection.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn prepare_join_request(
     tx: Transaction,
@@ -1663,7 +1695,6 @@ pub(crate) fn prepare_join_request(
     ttl: u8,
     exclude_addrs: &[SocketAddr],
     need: RequesterNeed,
-    target_supports_need: bool,
 ) -> ConnectMsg {
     let mut visited = VisitedPeers::new(&tx);
     if let Some(own_addr) = own.socket_addr() {
@@ -1695,7 +1726,10 @@ pub(crate) fn prepare_join_request(
         need,
     };
 
-    ConnectMsg::request_for_hop(tx, request, target_supports_need)
+    ConnectMsg::Request {
+        id: tx,
+        payload: request,
+    }
 }
 
 #[tracing::instrument(fields(peer = %op_manager.ring.connection_manager.pub_key), skip_all)]
@@ -5153,46 +5187,73 @@ mod tests {
         ));
     }
 
-    /// `request_message_for` reads the hop's recorded version: a pre-floor or
-    /// unknown peer gets the legacy `Request` (it could not decode the new
-    /// variant and would drop the connection), a capable one gets the need.
+    fn as_net(msg: ConnectMsg) -> crate::message::NetMessage {
+        crate::message::NetMessage::V1(crate::message::NetMessageV1::Connect(msg))
+    }
+
+    fn as_connect(msg: crate::message::NetMessage) -> ConnectMsg {
+        match msg {
+            crate::message::NetMessage::V1(crate::message::NetMessageV1::Connect(c)) => c,
+            other => panic!("expected a CONNECT message, got {other}"),
+        }
+    }
+
+    /// `fit_request_to_hop` decides the form from the live connection's own
+    /// version: unknown or pre-floor gets the legacy `Request` (it could not
+    /// decode the new variant and would drop the connection), capable gets the
+    /// need, and a `RequestWithNeed` headed for an incapable peer is downgraded.
     #[test]
-    fn request_message_for_gates_the_need_on_the_hops_version() {
+    fn fit_request_to_hop_gates_the_need_on_the_hops_version() {
         let cm = crate::ring::ConnectionManager::test_default();
         let floor = crate::node::CONNECT_NEED_MIN_VERSION;
-        let old: SocketAddr = "10.0.0.6:9000".parse().unwrap();
-        let capable: SocketAddr = "10.0.0.7:9000".parse().unwrap();
-        let unknown: SocketAddr = "10.0.0.8:9000".parse().unwrap();
-        cm.record_remote_version(old, Some((floor.0, floor.1, floor.2 - 1)));
-        cm.record_remote_version(capable, Some(floor));
+        let old = Some((floor.0, floor.1, floor.2 - 1));
         let tx = Transaction::new::<ConnectMsg>();
-        let short = || need_request(RequesterNeed::Short);
+        let short = || {
+            as_net(ConnectMsg::Request {
+                id: tx,
+                payload: need_request(RequesterNeed::Short),
+            })
+        };
         assert!(matches!(
-            request_message_for(&cm, old, tx, short()),
+            as_connect(fit_request_to_hop(short(), old, &cm)),
             ConnectMsg::Request { .. }
         ));
         assert!(matches!(
-            request_message_for(&cm, unknown, tx, short()),
+            as_connect(fit_request_to_hop(short(), None, &cm)),
             ConnectMsg::Request { .. }
         ));
         assert!(matches!(
-            request_message_for(&cm, capable, tx, short()),
+            as_connect(fit_request_to_hop(short(), Some(floor), &cm)),
             ConnectMsg::RequestWithNeed {
                 improvement_bar: None,
                 ..
             }
         ));
+        let with_need = as_net(ConnectMsg::request_for_hop(
+            tx,
+            need_request(RequesterNeed::Bar(0.1)),
+            true,
+        ));
+        assert!(matches!(
+            as_connect(fit_request_to_hop(with_need, old, &cm)),
+            ConnectMsg::Request { .. }
+        ));
+        // Non-request messages pass through untouched.
+        let rejected = as_net(ConnectMsg::Rejected {
+            id: tx,
+            desired_location: Location::new(0.2),
+        });
+        assert!(matches!(
+            as_connect(fit_request_to_hop(rejected, Some(floor), &cm)),
+            ConnectMsg::Rejected { .. }
+        ));
     }
 
-    /// The hop that matters most (#5858): a FRESH joiner — zero ring
-    /// connections, only its transient transport link to the gateway — must
-    /// send the need form to a capable gateway. In production the joiner learns
-    /// the gateway's version from `AckConnectionV2` (#5161,
-    /// `transport::connection_handler`), and `connection_lifecycle` records it
-    /// on `ConnectionManager` for every transport connection, transient ones
-    /// included; that record is what this test stages. The steps are the ones
-    /// `start_client_connect` takes (pinned below by
-    /// `drivers_build_outbound_requests_through_the_version_gate`).
+    /// The hop that matters most (#5858, review M2): a FRESH joiner with zero
+    /// ring connections builds its first request before any connection to the
+    /// gateway exists, so no version is known at build time. The need must
+    /// still reach a capable gateway, because the form is chosen when the
+    /// message is written to the connection, from that connection's version.
     #[test]
     fn fresh_joiner_sends_its_need_to_a_capable_gateway() {
         let cm = crate::ring::ConnectionManager::test_default();
@@ -5205,96 +5266,68 @@ mod tests {
 
         let need = cm.requester_need(desired);
         assert_eq!(need, RequesterNeed::Short, "zero ring connections is short");
+        // Built with no connection to the gateway and nothing recorded for it.
+        assert_eq!(cm.remote_version(gateway_addr), None);
+        let built = prepare_join_request(tx, &own, &gateway, desired, 5, &[], need);
 
-        // Gateway of unknown (or pre-floor) version: the legacy form.
-        let legacy = prepare_join_request(
-            tx,
-            &own,
-            &gateway,
-            desired,
-            5,
-            &[],
-            need,
-            hop_supports_need(&cm, gateway_addr, need),
-        );
-        assert!(matches!(legacy, ConnectMsg::Request { .. }), "{legacy}");
-
-        // Capable gateway: the need form, decoded as short on arrival.
-        cm.record_remote_version(gateway_addr, Some(crate::node::CONNECT_NEED_MIN_VERSION));
-        let msg = prepare_join_request(
-            tx,
-            &own,
-            &gateway,
-            desired,
-            5,
-            &[],
-            need,
-            hop_supports_need(&cm, gateway_addr, need),
-        );
+        // Written to the gateway connection once it exists, with its version.
+        let sent = as_connect(fit_request_to_hop(
+            as_net(built),
+            Some(crate::node::CONNECT_NEED_MIN_VERSION),
+            &cm,
+        ));
         assert!(
             matches!(
-                msg,
+                sent,
                 ConnectMsg::RequestWithNeed {
                     improvement_bar: None,
                     ..
                 }
             ),
-            "{msg}"
+            "{sent}"
         );
-        let decoded: ConnectMsg = bincode::deserialize(&bincode::serialize(&msg).unwrap()).unwrap();
+        let decoded: ConnectMsg =
+            bincode::deserialize(&bincode::serialize(&sent).unwrap()).unwrap();
         let (_, payload) = decoded.inbound_request().expect("a request");
         assert_eq!(payload.need, RequesterNeed::Short);
     }
 
-    /// Every outbound CONNECT request the drivers send goes through
-    /// `request_message_for` (or `prepare_join_request`, which takes the same
-    /// decision for the first hop), so none can carry a need to a peer that
-    /// cannot decode it, and none silently drops one to a peer that can.
+    /// Source pin: the event loop fits every message to the live connection
+    /// it is written to, and the drivers no longer choose the form.
     #[test]
-    fn drivers_build_outbound_requests_through_the_version_gate() {
-        const DRIVER_SRC: &str = include_str!("connect/op_ctx_task.rs");
-        let code: Vec<&str> = DRIVER_SRC
+    fn outbound_requests_are_fitted_at_the_connection_write() {
+        const BRIDGE_SRC: &str = include_str!("../node/network_bridge/p2p_protoc.rs");
+        let arm = BRIDGE_SRC
+            .find("ConnEvent::OutboundMessageWithTarget { target_addr, msg } => {")
+            .expect("outbound arm");
+        let write = arm
+            + BRIDGE_SRC[arm..]
+                .find("peer_connection.sender.send(Left(msg.clone()))")
+                .expect("the connection write");
+        // Whitespace-stripped code (comments dropped), so a rustfmt reflow of
+        // the call cannot disarm the pin.
+        let code: String = BRIDGE_SRC[arm..write]
             .lines()
             .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<String>()
+            .chars()
+            .filter(|c| !c.is_whitespace())
             .collect();
-        // Construction sites, not `{ .. }` match patterns.
-        let constructions = |line: &str, variant: &str| {
-            line.matches(&format!("ConnectMsg::{variant} {{")).count()
-                - line
-                    .matches(&format!("ConnectMsg::{variant} {{ .. }}"))
-                    .count()
-        };
-        let literal_requests: usize = code
-            .iter()
-            .map(|l| constructions(l, "Request") + constructions(l, "RequestWithNeed"))
-            .sum();
-        assert_eq!(
-            literal_requests, 0,
-            "a driver builds a CONNECT request literal; use request_message_for"
-        );
-        let gated = code
-            .iter()
-            .filter(|l| l.contains("super::request_message_for("))
+        let fit = code
+            .matches("letmsg=crate::operations::connect::fit_request_to_hop(msg,peer_connection.remote_version,")
             .count();
-        assert_eq!(gated, 3, "the forward, retry and re-route sends");
-        assert!(
-            code.iter().any(|l| l.contains("super::hop_supports_need(")),
-            "the joiner's first hop must be version-gated too"
+        assert_eq!(
+            fit, 1,
+            "the write must be preceded by fit_request_to_hop with the live version"
         );
-        // ...and start_client_connect must hand both the need and that
-        // decision to prepare_join_request, not a constant.
-        let start = DRIVER_SRC
-            .find("pub(crate) async fn start_client_connect(")
-            .expect("start_client_connect");
-        let body = &DRIVER_SRC[start..];
-        let call = body
-            .find("super::prepare_join_request(")
-            .expect("start_client_connect builds its request with prepare_join_request");
-        let args = &body[call..call + body[call..].find(");").expect("call end")];
+
+        const DRIVER_SRC: &str = include_str!("connect/op_ctx_task.rs");
         assert!(
-            args.contains("need,") && args.contains("gateway_supports_need,"),
-            "start_client_connect must pass the joiner's need and the gateway's \
-             capability to prepare_join_request: {args}"
+            !DRIVER_SRC
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .any(|l| l.contains("RequestWithNeed {") && !l.contains("RequestWithNeed { .. }")),
+            "drivers must not build the need form themselves; the write site chooses it"
         );
     }
 
