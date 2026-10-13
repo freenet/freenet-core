@@ -260,16 +260,17 @@ sequenceDiagram
 3. **Connection establishment** - Acceptor at terminus connects
 
 **Rounds with no ring connection (#5858):** the startup loop and the maintenance loop's
-zero-connection fallback share one bootstrap pacer, so one round of gateway CONNECTs runs
-at a time. A round's CONNECT ends once nothing is in flight and nothing has arrived for a
-quiet window (12 s before the first acceptor dial finishes, 6 s after; counted from the
-gateway link coming up), not at the 60 s transaction TTL. Its acceptors are dialled
-concurrently (up to 4) so one unreachable acceptor does not hold up the rest. A failed round
-is followed by a jittered backoff of 1, 2, 4, 8, 16, then 30 s; a connected one by 5 s; the
-backoff resets once a ring connection has lasted 30 s, and isolation recovery clears it.
-Two silent rounds in a row through a gateway drop that transport for a fresh handshake.
-With no gateway answering, rounds start at about 0, 16, 33, 52, 75, 106 s and then every
-~45 s.
+zero-connection fallback share one bootstrap pacer. A round (one CONNECT per gateway) runs in
+the background: the next starts after a jittered backoff of 5, 10, 20, then 30 s, without
+waiting for earlier rounds' CONNECTs, which still collect replies to their 60 s TTL (live
+replies are often slow: first reply p50 3.5 s, p95 41 s). At most 3 rounds are outstanding.
+The backoff resets once a ring connection has lasted 30 s, and isolation recovery clears it;
+once connected, no new bootstrap rounds start but outstanding CONNECTs run on. Acceptors
+are dialled concurrently (up to 4) so one unreachable acceptor does not hold up the rest.
+While the joiner does not know its own address, the gateway's `ObservedAddress` shows the
+link is alive; two gateway joins in a row ending without one drop that transport for a
+fresh handshake. With no gateway answering, rounds start at about 0, 5, 15, 60, 90 s and
+then every ~30 s (the old loop: one per ~62 s).
 
 **Target selection in `join_ring_request`** (gateway joins, cached-peer reconnects, the
 startup loop):

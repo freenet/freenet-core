@@ -2052,6 +2052,12 @@ impl ConnectionManager {
         *self.own_addr.lock() = Some(addr);
     }
 
+    /// Forgets this node's address, as for a fresh joiner (test-only).
+    #[cfg(test)]
+    pub(crate) fn clear_own_addr_for_test(&self) {
+        *self.own_addr.lock() = None;
+    }
+
     pub fn prune_alive_connection(&self, addr: SocketAddr) -> Option<Location> {
         self.prune_connection(addr, true)
     }

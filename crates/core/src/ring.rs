@@ -6028,13 +6028,14 @@ impl Ring {
 
     /// The maintenance loop's zero-connection gateway bootstrap (#5858).
     ///
-    /// Shares the bootstrap pacer with `initial_join_procedure`, so the two
-    /// never run a round at the same time and failed rounds are spaced by one
-    /// backoff. Gateway reservations left by finished paced rounds are cleared
-    /// rather than left to gate this path for the reservation TTL; one made by
-    /// a CONNECT sent outside a round (while this peer still had a connection)
-    /// may be live, so it is left alone. The round's CONNECTs run in a spawned
-    /// task: awaited here they held the whole maintenance loop for a
+    /// Shares the bootstrap pacer with `initial_join_procedure`, so rounds
+    /// from the two paths are spaced by one backoff and count toward one cap
+    /// on outstanding rounds. Gateway reservations made by paced rounds are
+    /// cleared rather than left to gate this path for the reservation TTL (the
+    /// pacer bounds the CONNECTs behind them); one made by a CONNECT sent
+    /// outside a round (while this peer still had a connection) is left alone.
+    /// The round's CONNECTs run in a spawned task that holds the round until
+    /// they end: awaited here they held the whole maintenance loop for a
     /// transaction TTL. Returns whether CONNECTs were sent.
     pub(crate) fn maintenance_gateway_bootstrap(
         &self,
@@ -6073,7 +6074,7 @@ impl Ring {
             attempting = eligible.len(),
             "Zero connections — attempting gateway bootstrap"
         );
-        round.issued = true;
+        round.issue();
         for addr in eligible.iter().filter_map(|gw| gw.socket_addr()) {
             round.own_reservation(addr);
         }
@@ -6081,10 +6082,8 @@ impl Ring {
         let shutdown = self.shutdown.clone();
         GlobalExecutor::spawn(async move {
             use futures::StreamExt;
-            // Move the whole guard in: a disjoint capture of
-            // `round.connected` alone would end the round as soon as this
-            // function returned.
-            let mut round = round;
+            // Move the guard in: it frees the round's slot when the joins end.
+            let round = round;
             let op_manager = &op_manager;
             let joins: futures::stream::FuturesUnordered<_> = eligible
                 .iter()
@@ -6106,10 +6105,8 @@ impl Ring {
                 }
             });
             // Ends with the node rather than outliving it.
-            if sleep_or_shutdown(&shutdown, joins).await {
-                return;
-            }
-            round.connected = op_manager.ring.open_connections() > 0;
+            sleep_or_shutdown(&shutdown, joins).await;
+            drop(round);
         });
         true
     }
@@ -6603,12 +6600,19 @@ impl Ring {
             // now >= next_probe`) is extracted into `should_probe_gateway` so each branch
             // is unit-testable. Without the empty-gateways guard merged into the same
             // condition, the index/modulo on the next line would panic.
-            if should_probe_gateway(
-                is_gateway,
-                !op_manager.configured_gateways.is_empty(),
-                self.time_source.now(),
-                next_gateway_probe,
-            ) {
+            //
+            // Not while isolated (#5858): the bootstrap rounds below are
+            // CONNECTs to the gateways already, paced and capped, and an
+            // unpaced probe CONNECT next to them would add a request the pacer
+            // does not count.
+            if current_conn_count > 0
+                && should_probe_gateway(
+                    is_gateway,
+                    !op_manager.configured_gateways.is_empty(),
+                    self.time_source.now(),
+                    next_gateway_probe,
+                )
+            {
                 let gw_index =
                     GlobalRng::random_u64() as usize % op_manager.configured_gateways.len();
                 let gateway = &op_manager.configured_gateways[gw_index];

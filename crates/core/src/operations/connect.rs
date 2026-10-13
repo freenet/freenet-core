@@ -78,18 +78,18 @@
 //!
 //! ## Joining With No Ring Connection
 //!
-//! A CONNECT sent while the joiner has no ring connection (`bootstrap` module, #5858):
-//! - **Ends early.** It stops once nothing is in flight and nothing has arrived for a quiet
-//!   window (12 s before the first dial outcome, 6 s after one; the clock starts when the
-//!   gateway link is up), instead of collecting acceptors until the 60 s transaction TTL.
+//! A gateway join sent while the joiner has no ring connection (`bootstrap` module, #5858):
+//! - **Overlaps.** The startup loop and the maintenance loop's zero-connection fallback share
+//!   one `BootstrapPacer`. A round runs in the background, so the next starts after a
+//!   jittered backoff (5, 10, 20, then 30 s) without waiting for earlier CONNECTs, which
+//!   still collect replies to their TTL. At most `MAX_OUTSTANDING_BOOTSTRAP_ROUNDS` are
+//!   outstanding; the backoff resets once a ring connection has lasted 30 s.
 //! - **Dials concurrently.** Up to `MAX_CONCURRENT_ACCEPTOR_DIALS` acceptors are dialled at
 //!   once, so an unreachable acceptor cannot hold a reachable one past its hole-punch
 //!   window. A peer that already has a connection still dials one at a time.
-//! - **Is paced.** The startup loop and the maintenance loop's zero-connection fallback
-//!   share one `BootstrapPacer`: one round at a time, failed rounds spaced by a jittered
-//!   1 s to 30 s exponential backoff, which resets once a ring connection has lasted 30 s.
-//! - **Redials a dead gateway link.** Two silent rounds in a row through one gateway (not
-//!   even an `ObservedAddress`) drop that transport so the next round re-handshakes.
+//! - **Redials a dead gateway link.** While the joiner does not know its address, the
+//!   gateway answers with `ObservedAddress`; two joins in a row through one gateway that
+//!   end without it drop that transport so the next round re-handshakes.
 //!
 //! ## Routing
 //!
@@ -1785,6 +1785,32 @@ pub(crate) async fn gateway_version_probe(
 /// See issue #3304.
 pub(crate) const GATEWAY_BACKOFF_POLL_CAP: Duration = Duration::from_secs(30);
 
+/// Runs one round's gateway joins. A paced bootstrap round's joins run in a
+/// spawned task that holds the round until every CONNECT has ended (#5858),
+/// so the join loop can start the next round after the pacer's backoff
+/// instead of waiting for these to reach their TTL. Without a round (this peer
+/// has a connection) they are awaited, as before. Returns whether the joins
+/// were spawned.
+async fn run_gateway_joins<F>(joins: F, round: Option<bootstrap::BootstrapRoundGuard>) -> bool
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    match round {
+        Some(mut round) => {
+            round.issue();
+            GlobalExecutor::spawn(async move {
+                joins.await;
+                drop(round);
+            });
+            true
+        }
+        None => {
+            joins.await;
+            false
+        }
+    }
+}
+
 pub(crate) async fn initial_join_procedure(
     op_manager: Arc<OpManager>,
     gateways: &[PeerKeyLocation],
@@ -1926,11 +1952,10 @@ pub(crate) async fn initial_join_procedure(
             }
 
             // With no ring connection, rounds are paced by the bootstrap pacer
-            // shared with the maintenance loop (#5858): one round at a time,
-            // failed rounds spaced by a jittered exponential backoff. The
-            // round's CONNECTs end as soon as nothing more is coming
-            // (`bootstrap::BootstrapRound`), so the next starts in seconds,
-            // not after the transaction TTL.
+            // shared with the maintenance loop (#5858). A round's joins run in
+            // a spawned task (`run_gateway_joins`), so the next round starts
+            // after the pacer's backoff while earlier CONNECTs are still
+            // collecting replies, up to `MAX_OUTSTANDING_BOOTSTRAP_ROUNDS`.
             let mut bootstrap_round = if open_conns == 0 {
                 match bootstrap::wait_for_bootstrap_round(
                     &op_manager.bootstrap_pacer,
@@ -1945,6 +1970,8 @@ pub(crate) async fn initial_join_procedure(
             } else {
                 None
             };
+            // A paced round's joins were spawned; the pacer spaces the next.
+            let mut round_issued = false;
 
             // Has this round already been classified (#4787)? Each branch that
             // decides what the round does records its own outcome BEFORE
@@ -2116,9 +2143,6 @@ pub(crate) async fn initial_join_procedure(
                     number_of_parallel_connections.min(eligible_count),
                     unconnected_count - eligible_count
                 );
-                if let Some(round) = bootstrap_round.as_mut() {
-                    round.issued = eligible_count > 0;
-                }
                 let select_all = FuturesUnordered::new();
                 for gateway in eligible_gateways
                     .into_iter()
@@ -2131,29 +2155,35 @@ pub(crate) async fn initial_join_procedure(
                     {
                         round.own_reservation(addr);
                     }
+                    let gateway = gateway.clone();
                     let op_manager = op_manager.clone();
                     select_all.push(async move {
-                        (join_ring_request(gateway, &op_manager, None).await, gateway)
+                        (
+                            join_ring_request(&gateway, &op_manager, None).await,
+                            gateway,
+                        )
                     });
                 }
-                select_all
-                    .for_each(|(res, gateway)| async move {
-                        if let Err(error) = res {
-                            if !matches!(
-                                error,
-                                OpError::ConnError(
-                                    crate::node::ConnectionError::UnwantedConnection
-                                )
-                            ) {
-                                tracing::error!(
-                                    %gateway,
-                                    %error,
-                                    "Failed while attempting connection to gateway"
-                                );
-                            }
+                let joins = select_all.for_each(|(res, gateway)| async move {
+                    if let Err(error) = res {
+                        if !matches!(
+                            error,
+                            OpError::ConnError(crate::node::ConnectionError::UnwantedConnection)
+                        ) {
+                            tracing::error!(
+                                %gateway,
+                                %error,
+                                "Failed while attempting connection to gateway"
+                            );
                         }
-                    })
-                    .await;
+                    }
+                });
+                let round = if eligible_count > 0 {
+                    bootstrap_round.take()
+                } else {
+                    None
+                };
+                round_issued = run_gateway_joins(joins, round).await;
             } else if use_connected_as_routers {
                 // All gateways connected but still need many more peers.
                 // Route CONNECTs through connected gateways toward gap locations.
@@ -2205,9 +2235,6 @@ pub(crate) async fn initial_join_procedure(
                         total_gateways = gateways.len(),
                         "Routing CONNECTs through connected gateways"
                     );
-                    if let Some(round) = bootstrap_round.as_mut() {
-                        round.issued = true;
-                    }
                     let select_all = FuturesUnordered::new();
                     for gateway in eligible
                         .into_iter()
@@ -2223,24 +2250,23 @@ pub(crate) async fn initial_join_procedure(
                             )
                         });
                     }
-                    select_all
-                        .for_each(|(res, gateway)| async move {
-                            if let Err(error) = res {
-                                if !matches!(
-                                    error,
-                                    OpError::ConnError(
-                                        crate::node::ConnectionError::UnwantedConnection
-                                    )
-                                ) {
-                                    tracing::error!(
-                                        %gateway,
-                                        %error,
-                                        "Failed while routing CONNECT through gateway"
-                                    );
-                                }
+                    let joins = select_all.for_each(|(res, gateway)| async move {
+                        if let Err(error) = res {
+                            if !matches!(
+                                error,
+                                OpError::ConnError(
+                                    crate::node::ConnectionError::UnwantedConnection
+                                )
+                            ) {
+                                tracing::error!(
+                                    %gateway,
+                                    %error,
+                                    "Failed while routing CONNECT through gateway"
+                                );
                             }
-                        })
-                        .await;
+                        }
+                    });
+                    round_issued = run_gateway_joins(joins, bootstrap_round.take()).await;
                 } else if blocked_by_backoff > 0 {
                     // #4787: nothing was issued because every gateway this
                     // round could route through is in exponential backoff —
@@ -2281,15 +2307,12 @@ pub(crate) async fn initial_join_procedure(
             // `open_conns < bootstrap_threshold`.
             record_round(StartupRoundOutcome::NoTarget);
 
-            if let Some(mut round) = bootstrap_round.take() {
-                let issued = round.issued;
-                round.connected = op_manager.ring.open_connections() > 0;
-                drop(round);
-                if issued {
-                    // The pacer spaces the next round, with its own jitter, so
-                    // the fixed wait below is skipped (#5858).
-                    continue;
-                }
+            // A round that sent nothing frees its slot without backing off.
+            drop(bootstrap_round.take());
+            if round_issued {
+                // The pacer spaces the next round, with its own jitter, so
+                // the fixed wait below is skipped (#5858).
+                continue;
             }
 
             // Add random jitter to prevent thundering herd after gateway restart.
@@ -2459,24 +2482,25 @@ mod tests {
             .find("GlobalExecutor::spawn(asyncmove{")
             .expect("the joins must run in a spawned task");
         let owns = body
-            .find("letmutround=round;")
-            .expect("the spawned task must move the whole round guard in");
+            .find("letround=round;")
+            .expect("the spawned task must move the round guard in");
         let join = body
             .find("join_ring_request(")
             .expect("the bootstrap must join through the gateways");
-        let connected = body
-            .find("round.connected=op_manager.ring.open_connections()>0;")
-            .expect("the round must report whether it connected");
+        let release = body
+            .find("sleep_or_shutdown(&shutdown,joins).await;drop(round);")
+            .expect("the round must be held until its joins end");
         assert!(
-            begin < spawn && spawn < owns && owns < join && join < connected,
-            "take the round, then spawn the joins with the guard moved in"
+            begin < spawn && spawn < owns && owns < join && join < release,
+            "take the round, then spawn the joins holding it until they end"
         );
     }
 
-    /// The maintenance bootstrap and the join loop take turns (#5858): while
-    /// one path's round runs the other starts none, and the maintenance round
-    /// clears only reservations that paced rounds own, so the reservation of a
-    /// CONNECT sent outside any round survives it.
+    /// The maintenance bootstrap and the join loop share one pacer (#5858):
+    /// while one path is taking a round, or inside the backoff after it, the
+    /// other starts none; and the maintenance round clears only reservations
+    /// that paced rounds own, so the reservation of a CONNECT sent outside any
+    /// round survives it.
     #[test]
     fn maintenance_and_join_loop_bootstrap_rounds_exclude_each_other() {
         let _lock = crate::node::network_status::TEST_GLOBAL_STATE_LOCK
@@ -2567,7 +2591,7 @@ mod tests {
                 );
                 assert!(
                     bootstrap::BootstrapRoundGuard::try_begin(pacer, Instant::now()).is_none(),
-                    "the join loop must not start a round while maintenance runs one"
+                    "the join loop must not start a round inside the backoff after maintenance's"
                 );
 
                 let mut targets = Vec::new();
@@ -2594,14 +2618,15 @@ mod tests {
     }
 
     /// A joiner whose gateways never answer (#5858): every round's CONNECTs
-    /// go unanswered. Before the fix each CONNECT ran to the transaction TTL
-    /// and the loop waited for all of them, so the second round started a TTL
-    /// later; now each ends after the quiet window and the pacer spaces the
-    /// rounds with a growing, capped backoff. Paused time; the test plays the
-    /// event loop, holding every CONNECT's reply channel open so it is
-    /// neither answered nor closed.
+    /// go unanswered. Before the fix the loop waited for each round's
+    /// CONNECTs to reach the transaction TTL, so the second round started a
+    /// TTL later; now the next round starts after the pacer's backoff while
+    /// the earlier CONNECTs keep waiting, up to the cap on outstanding rounds,
+    /// and a round whose CONNECTs end frees its slot. Paused time; the test
+    /// plays the event loop, holding each CONNECT's reply channel open (neither
+    /// answered nor closed) until it chooses to end that transaction.
     #[test]
-    fn isolated_joiner_retries_in_seconds_with_a_bounded_backoff() {
+    fn isolated_joiner_overlaps_rounds_up_to_the_cap() {
         let _lock = crate::node::network_status::TEST_GLOBAL_STATE_LOCK
             .lock()
             .unwrap_or_else(|p| p.into_inner());
@@ -2659,55 +2684,77 @@ mod tests {
                     .expect("spawn join procedure");
                 let mut requests = Vec::new();
                 let mut held = Vec::new();
-                let horizon = Duration::from_secs(120);
-                while let Ok(Some((reply, msg, _target))) = tokio::time::timeout(
-                    horizon.saturating_sub(start.elapsed()),
-                    op_execution_receiver.recv(),
-                )
-                .await
-                {
-                    if matches!(
-                        msg,
-                        crate::message::NetMessage::V1(crate::message::NetMessageV1::Connect(
-                            ConnectMsg::Request { .. }
-                        ))
-                    ) {
-                        requests.push(start.elapsed());
-                    }
-                    held.push(reply);
-                }
-                handle.abort();
+                let mut collect_until =
+                    async |until: Duration, requests: &mut Vec<Duration>, held: &mut Vec<_>| {
+                        while let Ok(Some((reply, msg, _target))) = tokio::time::timeout(
+                            until.saturating_sub(start.elapsed()),
+                            op_execution_receiver.recv(),
+                        )
+                        .await
+                        {
+                            if matches!(
+                                msg,
+                                crate::message::NetMessage::V1(
+                                    crate::message::NetMessageV1::Connect(
+                                        ConnectMsg::Request { .. }
+                                    )
+                                )
+                            ) {
+                                requests.push(start.elapsed());
+                            }
+                            held.push(reply);
+                        }
+                    };
+                collect_until(Duration::from_secs(50), &mut requests, &mut held).await;
 
-                let second_round = requests
+                let rounds = |requests: &[Duration]| {
+                    let mut starts: Vec<Duration> = Vec::new();
+                    for t in requests {
+                        if starts
+                            .last()
+                            .is_none_or(|s| *t > *s + Duration::from_secs(1))
+                        {
+                            starts.push(*t);
+                        }
+                    }
+                    starts
+                };
+                let starts = rounds(&requests);
+                assert!(
+                    starts.get(1).is_some_and(|t| *t < Duration::from_secs(7)),
+                    "the second round must start after the first backoff while the first \
+                     round's CONNECTs are still waiting; CONNECT requests at {requests:?}"
+                );
+                assert_eq!(
+                    starts.len(),
+                    bootstrap::MAX_OUTSTANDING_BOOTSTRAP_ROUNDS,
+                    "rounds overlap only up to the cap while none has ended; requests at \
+                     {requests:?}"
+                );
+                assert_eq!(
+                    requests.len(),
+                    2 * bootstrap::MAX_OUTSTANDING_BOOTSTRAP_ROUNDS,
+                    "one CONNECT per gateway per round; requests at {requests:?}"
+                );
+
+                // The first round's two CONNECTs end (their transactions
+                // close): its slot frees, and the next round follows at once,
+                // the backoff having long passed.
+                held.drain(..2);
+                collect_until(Duration::from_secs(60), &mut requests, &mut held).await;
+                handle.abort();
+                let after: Vec<_> = requests
                     .iter()
-                    .find(|t| **t > Duration::from_secs(1))
-                    .copied();
-                assert!(
-                    second_round.is_some_and(|t| t < Duration::from_secs(20)),
-                    "the second round must start seconds after the first, not after the \
-                     transaction TTL; CONNECT requests at {requests:?}"
-                );
-                // A round with no reply lasts the handshake deadline plus the
-                // pre-dial quiet window (3 + 12 s); the second starts after 1 s of
-                // backoff, at ~16 s, against the 60 s TTL before.
-                // Rounds: that, plus 1, 2, 4, 8, 16, 30 s (+-20%) of backoff,
-                // two gateways per round. A storm, or two paths running rounds
-                // at once, would exceed this.
-                assert!(
-                    requests.len() <= 2 * 8,
-                    "{} CONNECT requests in {horizon:?}: the backoff is not bounding \
-                     the retry rate; at {requests:?}",
-                    requests.len()
-                );
-                let mut gaps: Vec<Duration> = requests
-                    .windows(2)
-                    .map(|w| w[1].saturating_sub(w[0]))
-                    .filter(|g| *g > Duration::from_secs(1))
+                    .filter(|t| **t >= Duration::from_secs(50))
                     .collect();
-                gaps.sort();
+                assert_eq!(
+                    after.len(),
+                    2,
+                    "a freed slot must start one more round; requests at {requests:?}"
+                );
                 assert!(
-                    gaps.last().is_some_and(|g| *g > Duration::from_secs(20)),
-                    "the backoff must grow between failed rounds; gaps {gaps:?}"
+                    after.iter().all(|t| **t < Duration::from_secs(53)),
+                    "the round must follow the freed slot promptly; requests at {requests:?}"
                 );
                 drop(held);
             });

@@ -4,8 +4,9 @@
 //! `ConnectMsg::Request` to the first-hop gateway via
 //! `OpCtx::send_to_and_collect_replies`, and drains a multi-reply
 //! receiver until `target_connections` acceptances arrive or an
-//! overall timeout fires. A CONNECT started with no ring connection also
-//! ends once nothing more is coming (`bootstrap::BootstrapRound`, #5858).
+//! overall timeout fires. A gateway join started with no ring connection
+//! dials its acceptors concurrently and reports whether the gateway ever
+//! answered (`ClientConnectEnd::GatewaySilent`, #5858).
 //!
 //! Side effects per reply variant:
 //!
@@ -175,6 +176,7 @@ pub(crate) async fn start_client_connect(
     // where `ObservedAddress` is never delivered (e.g. if the transport
     // prematurely fills in the joiner's address, preventing emission).
     let started_without_address = op_manager.ring.connection_manager.get_own_addr().is_none();
+    let sent_at = Instant::now();
     let ttl = op_manager
         .ring
         .max_hops_to_live
@@ -265,25 +267,13 @@ pub(crate) async fn start_client_connect(
         },
         None => inner.await,
     };
-    match outcome {
-        Ok(ClientConnectEnd::Bootstrap(super::bootstrap::BootstrapExit::NoReply))
-            if kind == ClientConnectKind::VersionProbe => {}
-        Ok(ClientConnectEnd::Bootstrap(super::bootstrap::BootstrapExit::NoReply)) => {
-            if op_manager
-                .bootstrap_pacer
-                .lock()
-                .gateway_silent(gateway_addr)
-            {
-                drop_dead_gateway_link(op_manager, tx, gateway_addr).await;
-            }
-        }
-        Ok(ClientConnectEnd::Bootstrap(_)) => {
-            op_manager
-                .bootstrap_pacer
-                .lock()
-                .gateway_answered(gateway_addr);
-        }
-        Ok(ClientConnectEnd::Finished) | Err(_) => {}
+    if matches!(outcome, Ok(ClientConnectEnd::GatewaySilent))
+        && op_manager
+            .bootstrap_pacer
+            .lock()
+            .gateway_silent(gateway_addr, sent_at)
+    {
+        drop_dead_gateway_link(op_manager, tx, gateway_addr).await;
     }
     let outcome = outcome.map(|_| ());
 
@@ -291,8 +281,8 @@ pub(crate) async fn start_client_connect(
     outcome
 }
 
-/// Bootstrapping CONNECTs through `gateway_addr` heard nothing back, not even
-/// the `ObservedAddress` a live gateway sends at once, for
+/// Bootstrapping CONNECTs through `gateway_addr` ended without the
+/// `ObservedAddress` a live gateway sends as soon as it has the request, for
 /// `SILENT_ROUNDS_BEFORE_REDIAL` rounds in a row (#5858). The gateway has
 /// most likely dropped this transport as a zombie, and with no close message
 /// in the protocol every later CONNECT on it would vanish too. Drop our end so
@@ -341,8 +331,8 @@ async fn drop_dead_gateway_link(op_manager: &OpManager, tx: Transaction, gateway
 const STALE_LINK_DROP_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Inner driver loop. Drains `receiver` until `target_connections`
-/// acceptances accumulate, a fatal Rejected arrives, or (for a CONNECT sent
-/// with no ring connection) nothing more is coming.
+/// acceptors are connected, a Rejected arrives (after which the dials already
+/// started are still finished), or the transaction ends.
 #[allow(clippy::too_many_arguments)]
 async fn drive_client_connect_inner(
     tx: Transaction,
@@ -359,22 +349,26 @@ async fn drive_client_connect_inner(
     use futures::stream::FuturesUnordered;
     use std::collections::HashSet;
 
-    use super::bootstrap::{
-        AcceptorDialQueue, BootstrapRound, BootstrapTiming, MAX_CONCURRENT_ACCEPTOR_DIALS,
-    };
+    use super::bootstrap::{AcceptorDialQueue, MAX_CONCURRENT_ACCEPTOR_DIALS};
 
     let mut accepted: HashSet<PeerKeyLocation> = HashSet::with_capacity(target_connections);
     // Acceptors actually connected. `accepted` also holds acceptors still
     // queued or being dialled, so it cannot decide that the target is reached.
     let mut connected_dials: usize = 0;
-    // A CONNECT sent with no ring connection ends once nothing more is
-    // coming, instead of waiting for `target_connections` acceptors that one
-    // CONNECT never collects (#5858). Decided once, for this transaction.
-    let bootstrapping = matches!(
-        kind,
-        ClientConnectKind::Standard | ClientConnectKind::VersionProbe
-    ) && op_manager.ring.connection_manager.connection_count() == 0;
-    let mut round = BootstrapRound::new(bootstrapping, Instant::now(), BootstrapTiming::default());
+    // A gateway join sent with no ring connection (#5858), decided once for
+    // this transaction. It collects replies to its TTL like any CONNECT (live
+    // replies are often slow), but dials concurrently and reports whether the
+    // gateway ever answered.
+    let bootstrapping = kind == ClientConnectKind::Standard
+        && op_manager.ring.connection_manager.connection_count() == 0;
+    // The gateway sends `ObservedAddress` as soon as it has the request, but
+    // only while this peer's address is unknown; otherwise any reply shows
+    // the gateway is there, and silence proves nothing.
+    let mut heard_gateway = false;
+    // A Rejected ends reply collection, but acceptors already being dialled
+    // are still finished: a failed punch still gets its ConnectFailed, and a
+    // successful one is not counted against the gateway.
+    let mut rejected = false;
     // While bootstrapping, acceptors are dialled concurrently (bounded), so
     // one unreachable acceptor cannot hold the next one past its hole-punch
     // window (#5858). A peer that already has a connection keeps dialling
@@ -387,6 +381,14 @@ async fn drive_client_connect_inner(
         });
     let mut dials = FuturesUnordered::new();
 
+    let silent_end = |heard_gateway: bool| {
+        if bootstrapping && started_without_address && !heard_gateway {
+            ClientConnectEnd::GatewaySilent
+        } else {
+            ClientConnectEnd::Finished
+        }
+    };
+
     loop {
         if should_exit_for_ttl(&tx) {
             tracing::debug!(
@@ -395,34 +397,18 @@ async fn drive_client_connect_inner(
                 target_connections,
                 "connect driver: transaction timed out; exiting"
             );
-            return Ok(ClientConnectEnd::Finished);
+            return Ok(silent_end(heard_gateway));
         }
-        if bootstrapping && !round.link_up() {
-            let cm = &op_manager.ring.connection_manager;
-            if cm.is_transient(gateway_addr) || cm.is_in_ring(gateway_addr) {
-                round.on_link_up(Instant::now());
-            }
-        }
-        if let Some(exit) = round.exit(Instant::now(), dial_queue.busy()) {
-            tracing::info!(
-                %tx,
-                ?exit,
-                accepted = accepted.len(),
-                "connect driver: bootstrapping CONNECT has nothing more coming; ending"
-            );
-            if exit == super::bootstrap::BootstrapExit::Connected {
-                // The same success bookkeeping as reaching the target.
-                op_manager
-                    .ring
-                    .connection_manager
-                    .reset_connect_jitter_failures();
+        if rejected && !dial_queue.busy() {
+            if connected_dials == 0 {
+                // Gateway rotation backoff (2c), unless a dial of this
+                // CONNECT connected after all.
                 op_manager
                     .gateway_backoff
                     .lock()
-                    .record_success(gateway_addr);
-                op_manager.ring.record_connection_success(desired_location);
+                    .record_failure(gateway_addr);
             }
-            return Ok(ClientConnectEnd::Bootstrap(exit));
+            return Ok(ClientConnectEnd::Finished);
         }
 
         // Poll the receiver with a periodic timeout so the loop can
@@ -432,9 +418,14 @@ async fn drive_client_connect_inner(
         // sending Responses (e.g. when target_connections exceeds the
         // reachable network).
         const RECV_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
-        let event = crate::deterministic_select! {
-            reply = tokio::time::timeout(RECV_POLL_INTERVAL, receiver.recv()) => DriverEvent::Reply(reply),
-            dial = dials.next(), if !dials.is_empty() => DriverEvent::Dial(dial),
+        let event = if rejected {
+            // Collection is over; only the started dials are left.
+            DriverEvent::Dial(dials.next().await)
+        } else {
+            crate::deterministic_select! {
+                reply = tokio::time::timeout(RECV_POLL_INTERVAL, receiver.recv()) => DriverEvent::Reply(reply),
+                dial = dials.next(), if !dials.is_empty() => DriverEvent::Dial(dial),
+            }
         };
         let reply = match event {
             DriverEvent::Reply(reply) => reply,
@@ -493,7 +484,6 @@ async fn drive_client_connect_inner(
                         (false, acceptor_addr)
                     }
                 };
-                round.on_dial_done(Instant::now(), hole_punch_ok);
 
                 // Lattice-probe result (#5814). The route-to-self probe aims at
                 // the nearest UNCONNECTED peer (and near-terminus relays may also
@@ -564,9 +554,6 @@ async fn drive_client_connect_inner(
                 }
 
                 connected_dials += 1;
-                if bootstrapping {
-                    op_manager.bootstrap_pacer.lock().note_connected();
-                }
                 if connected_dials >= target_connections {
                     // INVARIANT (mirrors legacy JoinerState::register_acceptance
                     // at connect.rs:1352-1359): if the joiner started without
@@ -603,7 +590,21 @@ async fn drive_client_connect_inner(
         };
         let msg = match reply {
             Ok(Some(WaiterReply::Reply(msg))) => {
-                round.on_reply(Instant::now());
+                let first_answer = !heard_gateway
+                    && (!started_without_address
+                        || matches!(
+                            &msg,
+                            NetMessage::V1(NetMessageV1::Connect(
+                                ConnectMsg::ObservedAddress { .. }
+                            ))
+                        ));
+                if bootstrapping && first_answer {
+                    heard_gateway = true;
+                    op_manager
+                        .bootstrap_pacer
+                        .lock()
+                        .gateway_answered(gateway_addr, Instant::now());
+                }
                 msg
             }
             Ok(Some(WaiterReply::PeerDisconnected { peer })) => {
@@ -710,14 +711,13 @@ async fn drive_client_connect_inner(
                          non-escalating reject backoff (#4362)"
                     );
                 }
-                // Gateway rotation backoff is UNCONDITIONAL: even under min we
-                // want the next attempt to advance to a DIFFERENT gateway so we
-                // escape the saturated neighborhood (2c).
-                {
-                    let mut backoff = op_manager.gateway_backoff.lock();
-                    backoff.record_failure(gateway_addr);
-                }
-                return Ok(ClientConnectEnd::Finished);
+                // Gateway rotation backoff: even under min we want the next
+                // attempt to advance to a DIFFERENT gateway so we escape the
+                // saturated neighborhood (2c). Recorded once the dials already
+                // started have finished (top of the loop), and only if none of
+                // them connected.
+                rejected = true;
+                continue;
             }
             ConnectMsg::ObservedAddress { address, .. } => {
                 // The joiner doesn't know its external IP behind NAT;
@@ -776,7 +776,7 @@ async fn drive_client_connect_inner(
         gateway = %gateway.pub_key(),
         "connect driver: receiver closed"
     );
-    Ok(ClientConnectEnd::Finished)
+    Ok(silent_end(heard_gateway))
 }
 
 /// How the client CONNECT driver ended.
@@ -784,8 +784,10 @@ async fn drive_client_connect_inner(
 enum ClientConnectEnd {
     /// Target reached, transaction expired, rejected, or the waiter closed.
     Finished,
-    /// A CONNECT sent with no ring connection ended early (#5858).
-    Bootstrap(super::bootstrap::BootstrapExit),
+    /// A gateway join sent with no ring connection and no known own address
+    /// ended without the gateway's `ObservedAddress` (#5858): the gateway may
+    /// never have had the request.
+    GatewaySilent,
 }
 
 /// What woke the client driver.
@@ -2051,8 +2053,8 @@ mod tests {
 
 /// Behaviour of the client driver while this peer has no ring connection
 /// (#5858), against a real `OpManager` whose event-loop notifications this
-/// test answers itself. Paused time: the hole-punch delays and the quiet
-/// window cost nothing.
+/// test answers itself. Paused time: hole-punch delays and long silences cost
+/// nothing.
 #[cfg(test)]
 mod driver_timing_tests {
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -2066,7 +2068,6 @@ mod driver_timing_tests {
     use super::{ClientConnectEnd, ClientConnectKind, drive_client_connect_inner};
     use crate::message::{NetMessage, NetMessageV1, NodeEvent, Transaction};
     use crate::node::{OpManager, WaiterReply};
-    use crate::operations::connect::bootstrap::{BootstrapExit, BootstrapTiming};
     use crate::operations::connect::{ConnectMsg, ConnectResponse};
     use crate::ring::{Location, PeerKeyLocation};
     use crate::transport::TransportKeypair;
@@ -2085,6 +2086,29 @@ mod driver_timing_tests {
 
     async fn op_manager_with_channels(
         id: &str,
+    ) -> (
+        Arc<OpManager>,
+        mpsc::Receiver<Either<NetMessage, NodeEvent>>,
+        mpsc::Receiver<(mpsc::Sender<WaiterReply>, NetMessage, Option<SocketAddr>)>,
+    ) {
+        op_manager_at(id, true).await
+    }
+
+    /// A fresh joiner: it does not know its own address yet, so its gateway
+    /// joins expect an `ObservedAddress`.
+    async fn unaddressed_op_manager(
+        id: &str,
+    ) -> (
+        Arc<OpManager>,
+        mpsc::Receiver<Either<NetMessage, NodeEvent>>,
+        mpsc::Receiver<(mpsc::Sender<WaiterReply>, NetMessage, Option<SocketAddr>)>,
+    ) {
+        op_manager_at(id, false).await
+    }
+
+    async fn op_manager_at(
+        id: &str,
+        addressed: bool,
     ) -> (
         Arc<OpManager>,
         mpsc::Receiver<Either<NetMessage, NodeEvent>>,
@@ -2118,10 +2142,14 @@ mod driver_timing_tests {
             .expect("build OpManager"),
         );
         op_manager.ring.attach_op_manager(&op_manager);
-        op_manager
-            .ring
-            .connection_manager
-            .set_own_addr_local_for_test("127.0.0.1:14858".parse().unwrap());
+        if addressed {
+            op_manager
+                .ring
+                .connection_manager
+                .set_own_addr_local_for_test("127.0.0.1:14858".parse().unwrap());
+        } else {
+            op_manager.ring.connection_manager.clear_own_addr_for_test();
+        }
         std::mem::forget((ch_channel, result_router_rx));
         (
             op_manager,
@@ -2223,78 +2251,176 @@ mod driver_timing_tests {
         drop(replies_tx);
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn a_bootstrapping_connect_ends_when_nothing_more_is_coming() {
-        let (op_manager, events) = op_manager_with_events("driver-bootstrap-quiet").await;
-        std::mem::forget(events);
-        let gateway = peer(24861);
-        let tx = Transaction::new::<ConnectMsg>();
-        let (replies_tx, replies_rx) = mpsc::channel(8);
-        replies_tx
-            .send(WaiterReply::Reply(NetMessage::V1(NetMessageV1::Connect(
-                ConnectMsg::ObservedAddress {
-                    id: tx,
-                    address: "127.0.0.1:14858".parse().unwrap(),
-                },
-            ))))
-            .await
-            .unwrap();
-        let started = Instant::now();
-        let end = tokio::time::timeout(
-            Duration::from_secs(30),
-            drive_client_connect_inner(
-                tx,
-                gateway.clone(),
-                gateway.socket_addr().unwrap(),
-                Location::new(0.5),
-                op_manager.ring.connection_manager.min_connections,
-                false,
-                replies_rx,
-                &op_manager,
-                ClientConnectKind::Standard,
-            ),
-        )
-        .await
-        .expect("a CONNECT with no ring connection must not wait for the transaction TTL");
-        assert_eq!(
-            end.expect("driver result"),
-            ClientConnectEnd::Bootstrap(BootstrapExit::AllFailed)
-        );
-        assert!(
-            started.elapsed()
-                <= BootstrapTiming::default().before_first_dial + Duration::from_secs(1)
-        );
-        drop(replies_tx);
+    /// While alive, the driver's handling of `ObservedAddress` (which calls
+    /// `set_own_addr`) leaves the process-global `network_status` address
+    /// alone, as for a simulated node, so these tests cannot race
+    /// `test_set_own_addr_atomic_with_network_status`. The test runtime is
+    /// single-threaded, so the thread-local marker covers the driver.
+    struct NoGlobalAddress;
+
+    impl NoGlobalAddress {
+        fn new() -> Self {
+            crate::ring::topology_registry::set_current_network_name("driver-timing-tests");
+            Self
+        }
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn a_bootstrapping_connect_that_hears_nothing_reports_a_dead_link() {
-        let (op_manager, events) = op_manager_with_events("driver-bootstrap-no-reply").await;
+    impl Drop for NoGlobalAddress {
+        fn drop(&mut self) {
+            crate::ring::topology_registry::clear_current_network_name();
+        }
+    }
+
+    fn observed_address(tx: Transaction) -> WaiterReply {
+        WaiterReply::Reply(NetMessage::V1(NetMessageV1::Connect(
+            ConnectMsg::ObservedAddress {
+                id: tx,
+                address: "127.0.0.1:14858".parse().unwrap(),
+            },
+        )))
+    }
+
+    /// How a bootstrapping CONNECT that started without knowing this peer's
+    /// address ends once its replies stop, given what arrived first.
+    async fn bootstrapping_end(
+        id: &str,
+        first: Option<WaiterReply>,
+        port: u16,
+    ) -> ClientConnectEnd {
+        let _marker = NoGlobalAddress::new();
+        let (op_manager, events) = op_manager_with_events(id).await;
         std::mem::forget(events);
-        let gateway = peer(24862);
+        let gateway = peer(port);
+        let (replies_tx, replies_rx) = mpsc::channel(8);
+        if let Some(first) = first {
+            replies_tx.send(first).await.unwrap();
+        }
+        drop(replies_tx);
+        drive_client_connect_inner(
+            Transaction::new::<ConnectMsg>(),
+            gateway.clone(),
+            gateway.socket_addr().unwrap(),
+            Location::new(0.5),
+            op_manager.ring.connection_manager.min_connections,
+            true,
+            replies_rx,
+            &op_manager,
+            ClientConnectKind::Standard,
+        )
+        .await
+        .expect("driver result")
+    }
+
+    /// Gateway liveness is the gateway's own `ObservedAddress`, not whether
+    /// any acceptor answered: an acceptor's Response alone does not show the
+    /// gateway link is alive, and its absence does not show it is dead.
+    #[tokio::test(start_paused = true)]
+    async fn a_gateway_join_is_silent_only_without_the_gateways_observed_address() {
+        assert_eq!(
+            bootstrapping_end("driver-liveness-none", None, 24861).await,
+            ClientConnectEnd::GatewaySilent
+        );
+        let tx = Transaction::new::<ConnectMsg>();
+        assert_eq!(
+            bootstrapping_end(
+                "driver-liveness-observed",
+                Some(observed_address(tx)),
+                24862
+            )
+            .await,
+            ClientConnectEnd::Finished,
+            "the gateway answered with ObservedAddress; no acceptor answering is not a dead link"
+        );
+        let tx = Transaction::new::<ConnectMsg>();
+        assert_eq!(
+            bootstrapping_end(
+                "driver-liveness-response",
+                Some(response(tx, &peer(24863))),
+                24864
+            )
+            .await,
+            ClientConnectEnd::GatewaySilent,
+            "an acceptor's Response without the gateway's ObservedAddress does not show the link"
+        );
+    }
+
+    /// A peer that knows its address gets no `ObservedAddress`, so silence
+    /// proves nothing about its gateway link.
+    #[tokio::test(start_paused = true)]
+    async fn an_addressed_peers_silent_join_is_not_reported() {
+        let (op_manager, events) = op_manager_with_events("driver-liveness-addressed").await;
+        std::mem::forget(events);
+        let gateway = peer(24869);
+        let (replies_tx, replies_rx) = mpsc::channel(8);
+        drop(replies_tx);
+        let end = drive_client_connect_inner(
+            Transaction::new::<ConnectMsg>(),
+            gateway.clone(),
+            gateway.socket_addr().unwrap(),
+            Location::new(0.5),
+            op_manager.ring.connection_manager.min_connections,
+            false,
+            replies_rx,
+            &op_manager,
+            ClientConnectKind::Standard,
+        )
+        .await
+        .expect("driver result");
+        assert_eq!(end, ClientConnectEnd::Finished);
+    }
+
+    /// A bootstrapping CONNECT is not cut short by silence (#5858): live
+    /// replies are often slow, so it keeps collecting, and a re-routed
+    /// acceptor that answers 30 s after a failed dial is still dialled.
+    #[tokio::test(start_paused = true)]
+    async fn a_bootstrapping_connect_keeps_collecting_through_a_long_silence() {
+        let _marker = NoGlobalAddress::new();
+        let (op_manager, events) = op_manager_with_events("driver-bootstrap-slow").await;
+        let gateway = peer(24875);
+        let (bad, late) = (peer(24876), peer(24877));
+        let log = scripted_event_loop(events, vec![bad.socket_addr().unwrap()]);
         let tx = Transaction::new::<ConnectMsg>();
         let (replies_tx, replies_rx) = mpsc::channel(8);
-        let end = tokio::time::timeout(
-            Duration::from_secs(30),
+        replies_tx.send(observed_address(tx)).await.unwrap();
+        replies_tx.send(response(tx, &bad)).await.unwrap();
+        let late_reply = late.clone();
+        let feeder = async move {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            replies_tx.send(response(tx, &late_reply)).await.unwrap();
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            // The transaction ends.
+            drop(replies_tx);
+        };
+        let started = Instant::now();
+        let (end, ()) = tokio::join!(
             drive_client_connect_inner(
                 tx,
                 gateway.clone(),
                 gateway.socket_addr().unwrap(),
                 Location::new(0.5),
                 op_manager.ring.connection_manager.min_connections,
-                false,
+                true,
                 replies_rx,
                 &op_manager,
                 ClientConnectKind::Standard,
             ),
-        )
-        .await
-        .expect("must end early");
-        assert_eq!(
-            end.expect("driver result"),
-            ClientConnectEnd::Bootstrap(BootstrapExit::NoReply)
+            feeder
         );
-        drop(replies_tx);
+        assert_eq!(end.expect("driver result"), ClientConnectEnd::Finished);
+        assert!(
+            started.elapsed() >= Duration::from_secs(40),
+            "the CONNECT ended after {:?}, before its replies stopped",
+            started.elapsed()
+        );
+        let log = log.lock();
+        assert_eq!(log.connect_failed, vec![bad.socket_addr().unwrap()]);
+        assert!(
+            log.dials
+                .iter()
+                .any(|(a, _)| Some(*a) == late.socket_addr()),
+            "the late acceptor must be dialled; dials {:?}",
+            log.dials
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -2334,66 +2460,80 @@ mod driver_timing_tests {
         drop(replies_tx);
     }
 
-    /// Through the real entry point: a bootstrapping CONNECT to a gateway that
-    /// never answers ends after the quiet window and drops the gateway link.
+    /// Plays the event loop for a gateway that never answers: every request
+    /// goes out and its transaction then ends with no reply.
+    fn unanswered_requests(
+        mut op_execution: mpsc::Receiver<(
+            mpsc::Sender<WaiterReply>,
+            NetMessage,
+            Option<SocketAddr>,
+        )>,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            while let Some((reply, _msg, _target)) = op_execution.recv().await {
+                drop(reply);
+            }
+        })
+    }
+
+    fn drops_link(
+        events: &mut mpsc::Receiver<Either<NetMessage, NodeEvent>>,
+        gateway_addr: SocketAddr,
+    ) -> bool {
+        let mut dropped = false;
+        while let Ok(event) = events.try_recv() {
+            if matches!(event, Either::Right(NodeEvent::DropStaleGatewayLink { addr, .. }) if addr == gateway_addr)
+            {
+                dropped = true;
+            }
+        }
+        dropped
+    }
+
+    async fn connect_once(
+        op_manager: &OpManager,
+        gateway: &PeerKeyLocation,
+        kind: ClientConnectKind,
+    ) {
+        let own = op_manager.ring.connection_manager.own_location();
+        tokio::time::timeout(
+            Duration::from_secs(60),
+            super::start_client_connect(
+                Transaction::new::<ConnectMsg>(),
+                gateway.clone(),
+                gateway.socket_addr().unwrap(),
+                op_manager,
+                own,
+                Location::new(0.5),
+                None,
+                kind,
+            ),
+        )
+        .await
+        .expect("the CONNECT ends when its transaction does")
+        .expect("driver result");
+    }
+
+    /// Through the real entry point: gateway joins that end without the
+    /// gateway's `ObservedAddress` drop the link on the second in a row.
     #[tokio::test(start_paused = true)]
     async fn start_client_connect_drops_a_gateway_link_that_never_answers() {
-        let (op_manager, mut events, mut op_execution) =
-            op_manager_with_channels("driver-dead-link-entry").await;
+        let (op_manager, mut events, op_execution) =
+            unaddressed_op_manager("driver-dead-link-entry").await;
         let gateway = peer(24867);
         let gateway_addr = gateway.socket_addr().unwrap();
-        // Hold every request's reply channel open: unanswered, not closed.
-        let held = tokio::spawn(async move {
-            let mut held = Vec::new();
-            while let Some(item) = op_execution.recv().await {
-                held.push(item);
-            }
-            held
-        });
-        let round = || {
-            let gateway = gateway.clone();
-            let op_manager = op_manager.clone();
-            async move {
-                let own = op_manager.ring.connection_manager.own_location();
-                tokio::time::timeout(
-                    Duration::from_secs(60),
-                    super::start_client_connect(
-                        Transaction::new::<ConnectMsg>(),
-                        gateway,
-                        gateway_addr,
-                        &op_manager,
-                        own,
-                        Location::new(0.5),
-                        None,
-                        ClientConnectKind::Standard,
-                    ),
-                )
-                .await
-                .expect("a bootstrapping CONNECT must end early")
-                .expect("driver result");
-            }
-        };
-        let dropped = |events: &mut mpsc::Receiver<Either<NetMessage, NodeEvent>>| {
-            let mut dropped = false;
-            while let Ok(event) = events.try_recv() {
-                if matches!(event, Either::Right(NodeEvent::DropStaleGatewayLink { addr, .. }) if addr == gateway_addr)
-                {
-                    dropped = true;
-                }
-            }
-            dropped
-        };
-        round().await;
+        let requests = unanswered_requests(op_execution);
+        connect_once(&op_manager, &gateway, ClientConnectKind::Standard).await;
         assert!(
-            !dropped(&mut events),
+            !drops_link(&mut events, gateway_addr),
             "one silent round may be a slow gateway: the link must be kept"
         );
-        round().await;
+        connect_once(&op_manager, &gateway, ClientConnectKind::Standard).await;
         assert!(
-            dropped(&mut events),
+            drops_link(&mut events, gateway_addr),
             "a second silent round in a row must drop the link for a redial"
         );
-        held.abort();
+        requests.abort();
     }
 
     /// A version probe runs outside the bootstrap pacer, so its silence must
@@ -2401,47 +2541,23 @@ mod driver_timing_tests {
     /// then one silent join drop nothing.
     #[tokio::test(start_paused = true)]
     async fn a_silent_version_probe_does_not_count_toward_a_redial() {
-        let (op_manager, mut events, mut op_execution) =
-            op_manager_with_channels("driver-probe-silent").await;
+        let (op_manager, mut events, op_execution) =
+            unaddressed_op_manager("driver-probe-silent").await;
         let gateway = peer(24868);
         let gateway_addr = gateway.socket_addr().unwrap();
-        let held = tokio::spawn(async move {
-            let mut held = Vec::new();
-            while let Some(item) = op_execution.recv().await {
-                held.push(item);
-            }
-            held
-        });
+        let requests = unanswered_requests(op_execution);
         for kind in [
             ClientConnectKind::VersionProbe,
             ClientConnectKind::VersionProbe,
             ClientConnectKind::Standard,
         ] {
-            let own = op_manager.ring.connection_manager.own_location();
-            tokio::time::timeout(
-                Duration::from_secs(60),
-                super::start_client_connect(
-                    Transaction::new::<ConnectMsg>(),
-                    gateway.clone(),
-                    gateway_addr,
-                    &op_manager,
-                    own,
-                    Location::new(0.5),
-                    None,
-                    kind,
-                ),
-            )
-            .await
-            .expect("a CONNECT with no ring connection must end early")
-            .expect("driver result");
+            connect_once(&op_manager, &gateway, kind).await;
         }
-        while let Ok(event) = events.try_recv() {
-            assert!(
-                !matches!(event, Either::Right(NodeEvent::DropStaleGatewayLink { .. })),
-                "a probe's silence redialled the gateway link"
-            );
-        }
-        held.abort();
+        assert!(
+            !drops_link(&mut events, gateway_addr),
+            "a probe's silence redialled the gateway link"
+        );
+        requests.abort();
     }
 
     /// What the scripted event loop saw.
@@ -2619,34 +2735,43 @@ mod driver_timing_tests {
         drop(replies_tx);
     }
 
-    /// A failed dial restarts the quiet window: the relay re-routes the
-    /// CONNECT on `ConnectFailed`, and an acceptor that answers late in the
-    /// post-dial window is still dialled.
-    #[tokio::test(start_paused = true)]
-    async fn a_failed_dial_restarts_the_quiet_window_for_the_re_routed_acceptor() {
-        let (op_manager, events) = op_manager_with_events("driver-bootstrap-reroute").await;
-        let gateway = peer(24875);
-        let (bad, rerouted) = (peer(24876), peer(24877));
-        let log = scripted_event_loop(events, vec![bad.socket_addr().unwrap()]);
+    fn rejected(tx: Transaction) -> WaiterReply {
+        WaiterReply::Reply(NetMessage::V1(NetMessageV1::Connect(
+            ConnectMsg::Rejected {
+                id: tx,
+                desired_location: Location::new(0.5),
+            },
+        )))
+    }
+
+    /// A Rejected arriving while an acceptor is being dialled (a near-terminus
+    /// relay accepted and forwarded on, and a later hop rejected) must not
+    /// abandon that dial. Returns the end, what the event loop saw, and
+    /// whether the gateway was backed off.
+    async fn rejected_mid_dial(
+        id: &str,
+        acceptor_reachable: bool,
+    ) -> (ClientConnectEnd, Vec<SocketAddr>, bool) {
+        let (op_manager, events) = op_manager_with_events(id).await;
+        let gateway = peer(24880);
+        let gateway_addr = gateway.socket_addr().unwrap();
+        let acceptor = peer(24881);
+        let unreachable = if acceptor_reachable {
+            vec![]
+        } else {
+            vec![acceptor.socket_addr().unwrap()]
+        };
+        let log = scripted_event_loop(events, unreachable);
         let tx = Transaction::new::<ConnectMsg>();
         let (replies_tx, replies_rx) = mpsc::channel(8);
-        replies_tx.send(response(tx, &bad)).await.unwrap();
-        let timing = BootstrapTiming::default();
-        let late = replies_tx.clone();
-        let rerouted_reply = rerouted.clone();
-        tokio::spawn(async move {
-            // The bad dial fails at the NAT deadline; answer 1 s before the
-            // post-dial window that starts then would close.
-            tokio::time::sleep(NAT_TRAVERSAL_DEADLINE + timing.after_dial - Duration::from_secs(1))
-                .await;
-            late.send(response(tx, &rerouted_reply)).await.unwrap();
-        });
+        replies_tx.send(response(tx, &acceptor)).await.unwrap();
+        replies_tx.send(rejected(tx)).await.unwrap();
         let end = tokio::time::timeout(
-            Duration::from_secs(50),
+            Duration::from_secs(30),
             drive_client_connect_inner(
                 tx,
                 gateway.clone(),
-                gateway.socket_addr().unwrap(),
+                gateway_addr,
                 Location::new(0.5),
                 op_manager.ring.connection_manager.min_connections,
                 false,
@@ -2656,56 +2781,45 @@ mod driver_timing_tests {
             ),
         )
         .await
-        .expect("a bootstrapping CONNECT ends early")
+        .expect("a rejected CONNECT ends once its dial has")
         .expect("driver result");
-        assert_eq!(end, ClientConnectEnd::Bootstrap(BootstrapExit::Connected));
-        let log = log.lock();
-        assert_eq!(log.connect_failed, vec![bad.socket_addr().unwrap()]);
-        assert!(
-            log.dials
-                .iter()
-                .any(|(a, _)| Some(*a) == rerouted.socket_addr()),
-            "the re-routed acceptor must be dialled; dials {:?}",
-            log.dials
+        // Let the scripted event loop take the driver's last notification.
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert_eq!(
+            log.lock().dials.len(),
+            1,
+            "the acceptor that answered before the rejection is dialled"
         );
+        let failed = log.lock().connect_failed.clone();
+        let backed_off = op_manager
+            .gateway_backoff
+            .lock()
+            .is_in_backoff(gateway_addr);
         drop(replies_tx);
+        (end, failed, backed_off)
     }
 
-    /// A bootstrapping CONNECT that connected an acceptor and then went
-    /// quiet ends as `Connected` with the same success bookkeeping as
-    /// reaching the target.
     #[tokio::test(start_paused = true)]
-    async fn a_bootstrapping_connect_that_connected_records_success() {
-        let (op_manager, events) = op_manager_with_events("driver-bootstrap-connected").await;
-        let gateway = peer(24878);
-        let gateway_addr = gateway.socket_addr().unwrap();
-        let acceptor = peer(24879);
-        let desired = Location::new(0.5);
-        record_prior_failures(&op_manager, gateway_addr, desired);
-        let _log = scripted_event_loop(events, vec![]);
-        let tx = Transaction::new::<ConnectMsg>();
-        let (replies_tx, replies_rx) = mpsc::channel(8);
-        replies_tx.send(response(tx, &acceptor)).await.unwrap();
-        let end = tokio::time::timeout(
-            Duration::from_secs(50),
-            drive_client_connect_inner(
-                tx,
-                gateway.clone(),
-                gateway_addr,
-                desired,
-                op_manager.ring.connection_manager.min_connections,
-                false,
-                replies_rx,
-                &op_manager,
-                ClientConnectKind::Standard,
-            ),
-        )
-        .await
-        .expect("a bootstrapping CONNECT ends early")
-        .expect("driver result");
-        assert_eq!(end, ClientConnectEnd::Bootstrap(BootstrapExit::Connected));
-        assert_success_recorded(&op_manager, gateway_addr, desired);
-        drop(replies_tx);
+    async fn a_rejection_lets_a_started_dial_finish_and_spares_the_gateway_if_it_connects() {
+        let (end, failed, backed_off) = rejected_mid_dial("driver-reject-ok", true).await;
+        assert_eq!(end, ClientConnectEnd::Finished);
+        assert!(failed.is_empty());
+        assert!(
+            !backed_off,
+            "the CONNECT produced a connection: the gateway must not be backed off"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_rejection_still_reports_a_started_dial_that_fails() {
+        let (end, failed, backed_off) = rejected_mid_dial("driver-reject-fail", false).await;
+        assert_eq!(end, ClientConnectEnd::Finished);
+        assert_eq!(
+            failed.len(),
+            1,
+            "the failed punch must still be reported with ConnectFailed"
+        );
+        assert!(backed_off, "nothing connected: the gateway is backed off");
     }
 
     #[tokio::test(start_paused = true)]
