@@ -17,16 +17,17 @@
 //! - Gateway liveness: a CONNECT that starts without this peer knowing its
 //!   own address gets an `ObservedAddress` from the gateway as soon as the
 //!   gateway has it. [`SILENT_ROUNDS_BEFORE_REDIAL`] such CONNECTs in a row
-//!   ending without one mark the gateway link as dead.
+//!   without one by [`GATEWAY_ANSWER_DEADLINE`] mark the gateway link as dead,
+//!   and it is dropped for a fresh handshake.
 //!
-//! Request rate when no gateway answers at all (each CONNECT then lives its
-//! full TTL, 60 s): rounds start at 0, 5 and 15 s; the cap then holds the
-//! fourth until the first ends at 60 s, and from there the 30 s backoff cap
-//! spaces them: 60, 90, 120 s and so on (each wait +-20%). That is five rounds
-//! in the first 100 s where the TTL-bound loop managed two, and one round per
-//! ~30 s after that against one per ~62 s, about 2x. Each round sends one
-//! CONNECT per eligible gateway, as before, and no gateway ever has more than
-//! three of this peer's bootstrap CONNECTs outstanding.
+//! Request rate when no gateway answers at all: the backoff alone allows
+//! rounds at 0, 5, 15, 35, 65 and 95 s and then one per 30 s (each wait
+//! +-20%); the cap can only delay them (if every CONNECT lives its full 60 s
+//! TTL: 0, 5, 15, 60, 90, 120 s). At most six rounds in the first 100 s where
+//! the TTL-bound loop managed two, and one round per ~30 s after that against
+//! one per ~62 s, about 2x. Each round sends one CONNECT per eligible gateway,
+//! as before, and no gateway ever has more than three of this peer's bootstrap
+//! CONNECTs outstanding.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
@@ -58,11 +59,19 @@ pub(crate) const MAX_CONCURRENT_ACCEPTOR_DIALS: usize = 4;
 /// have not answered three only multiply the load on them.
 pub(crate) const MAX_OUTSTANDING_BOOTSTRAP_ROUNDS: usize = 3;
 
-/// Consecutive bootstrapping CONNECTs through one gateway that must end
-/// without its `ObservedAddress` before the link is treated as dead and
+/// Consecutive bootstrapping CONNECTs through one gateway that must miss its
+/// `ObservedAddress` deadline before the link is treated as dead and
 /// redialled. One can be a slow or overloaded gateway (its restart admission
 /// ramp, say), and dropping the link then would only add handshakes to it.
 pub(crate) const SILENT_ROUNDS_BEFORE_REDIAL: u32 = 2;
+
+/// How long a gateway join waits for the gateway's `ObservedAddress` before
+/// it counts as silent. The gateway sends it on receipt, so this covers the
+/// handshake (the 3 s NAT traversal deadline) and a long queue at a busy
+/// gateway; a link that misses it twice in a row is redialled no sooner than
+/// 20 s after the first round (rounds at 0 and 5 s). The CONNECT itself keeps
+/// collecting replies either way.
+pub(crate) const GATEWAY_ANSWER_DEADLINE: Duration = Duration::from_secs(15);
 
 /// Gateways whose liveness is tracked at once; well above any configured
 /// gateway list, and only a bound on the map.
@@ -220,8 +229,8 @@ impl BootstrapPacer {
         liveness.last_answer = Some(now);
     }
 
-    /// A bootstrapping CONNECT through `gateway`, sent at `sent`, ended
-    /// without the gateway's `ObservedAddress`. Returns true once that has
+    /// A bootstrapping CONNECT through `gateway`, sent at `sent`, has had no
+    /// `ObservedAddress` from the gateway by [`GATEWAY_ANSWER_DEADLINE`]. Returns true once that has
     /// happened [`SILENT_ROUNDS_BEFORE_REDIAL`] times in a row, and resets the
     /// count: the caller drops the link to redial it. Rounds overlap, so a
     /// CONNECT sent before the gateway's last answer says nothing about the

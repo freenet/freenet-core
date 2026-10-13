@@ -88,8 +88,8 @@
 //!   once, so an unreachable acceptor cannot hold a reachable one past its hole-punch
 //!   window. A peer that already has a connection still dials one at a time.
 //! - **Redials a dead gateway link.** While the joiner does not know its address, the
-//!   gateway answers with `ObservedAddress`; two joins in a row through one gateway that
-//!   end without it drop that transport so the next round re-handshakes.
+//!   gateway answers with `ObservedAddress`; two joins in a row through one gateway without
+//!   it by `GATEWAY_ANSWER_DEADLINE` drop that transport so the next round re-handshakes.
 //!
 //! ## Routing
 //!

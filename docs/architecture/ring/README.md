@@ -268,9 +268,9 @@ The backoff resets once a ring connection has lasted 30 s, and isolation recover
 once connected, no new bootstrap rounds start but outstanding CONNECTs run on. Acceptors
 are dialled concurrently (up to 4) so one unreachable acceptor does not hold up the rest.
 While the joiner does not know its own address, the gateway's `ObservedAddress` shows the
-link is alive; two gateway joins in a row ending without one drop that transport for a
-fresh handshake. With no gateway answering, rounds start at about 0, 5, 15, 60, 90 s and
-then every ~30 s (the old loop: one per ~62 s).
+link is alive; two gateway joins in a row without one after 15 s drop that transport for a
+fresh handshake (the joins keep collecting). With no gateway answering, rounds start at
+most at 0, 5, 15, 35, 65, 95 s and then every ~30 s (the old loop: one per ~62 s).
 
 **Target selection in `join_ring_request`** (gateway joins, cached-peer reconnects, the
 startup loop):
