@@ -935,16 +935,21 @@ impl ConfigArgs {
             // two loopbacks Local mode has ever written are therefore treated
             // as re-derivable for a non-gateway network node, like
             // `is_auto_derivable_ws_api_address` above. A flag or env value
-            // still wins, and gateways keep theirs (Local mode never wrote a
-            // gateway's config; loopback test gateways are deliberate).
-            // Accepted edge: an operator who hand-wrote exactly `::1` or
-            // `127.0.0.1` into config.toml for a non-gateway is re-derived too;
-            // the remedy is `--network-address`, and the startup warning in
-            // `NodeConfig::new` names the value it ignored.
+            // still wins. Gateways keep theirs, and so do nodes on a local or
+            // test network (`skip_load_from_network`): loopback is deliberate
+            // there. Every other non-gateway loads the public gateways, so a
+            // loopback bind can never reach them.
+            // Accepted edge: a non-gateway whose config.toml holds exactly `::1`
+            // or `127.0.0.1` because an operator wrote it by hand, or passed it
+            // as a flag on an earlier boot (flags persist), is re-derived too.
+            // The remedy is to pass the flag on every boot, and
+            // `Config::log_network_address_migration` names the value ignored.
             let persisted_network_address = cfg.network_api.address;
             let rederive = self.network_api.address.is_none()
                 && self.mode.unwrap_or(OperationMode::Network) == OperationMode::Network
                 && !(self.network_api.is_gateway || cfg.is_gateway)
+                && !(self.network_api.skip_load_from_network
+                    || cfg.network_api.skip_load_from_network)
                 && is_local_mode_default_network_address(persisted_network_address);
             if rederive {
                 dropped_persisted_network_loopback = Some(persisted_network_address);
@@ -2092,6 +2097,30 @@ impl Config {
         self.config_paths.clone()
     }
 
+    /// Report a loopback `network-address` that `build()` discarded from
+    /// config.toml and re-derived (#5798).
+    ///
+    /// **Call this AFTER [`set_logger`]**, for the same reason as
+    /// [`Config::log_client_api_exposure`]. It fires on ONE boot: `build()` has
+    /// already rewritten config.toml with the new address, so if this line is
+    /// lost the operator never learns their bind moved. That is why it runs
+    /// straight after the logger exists, before anything at startup can fail.
+    pub fn log_network_address_migration(&self) {
+        if let Some(ignored) = self.network_api.dropped_persisted_loopback {
+            tracing::warn!(
+                %ignored,
+                network_address = %self.network_api.address,
+                config_file = %self.config_dir().join("config.toml").display(),
+                "Ignoring network-address {ignored} from config.toml: a network listener \
+                 bound to loopback is unreachable to every peer, so this node could never \
+                 connect (#5798). Earlier `freenet local` runs wrote this value. Now \
+                 listening on {}. If you need loopback, pass --network-address on every \
+                 start.",
+                self.network_api.address
+            );
+        }
+    }
+
     /// Report how the client (HTTP/WebSocket) API's exposure was decided.
     ///
     /// **Call this AFTER [`set_logger`].** These messages cannot live in
@@ -2667,8 +2696,9 @@ pub struct NetworkApiConfig {
     /// because this code wrote it itself, so the bind was re-derived (#5798).
     ///
     /// Recorded, NOT logged: `build()` runs before the tracing subscriber is
-    /// installed, so `NodeConfig::new` reports it. `Some` only on the boot that
-    /// moved the bind; the next boot reads back the re-derived value.
+    /// installed, so [`Config::log_network_address_migration`] reports it.
+    /// `Some` only on the boot that moved the bind; the next boot reads back
+    /// the re-derived value.
     #[serde(skip)]
     pub dropped_persisted_loopback: Option<IpAddr>,
 }
@@ -11195,6 +11225,11 @@ shutdown-drain-secs = 42
                  runs before set_logger",
             ),
             (
+                "config.log_network_address_migration()",
+                "nothing would report a re-derived loopback network-address (#5798) — \
+                 build() cannot, it runs before set_logger",
+            ),
+            (
                 "merge_pre_subcommand_ws_api_args(",
                 "flags placed before the subcommand would be silently discarded, \
                  leaving the node loopback-only against the operator's intent",
@@ -11245,6 +11280,12 @@ shutdown-drain-secs = 42
         let dir = tempfile::tempdir().unwrap();
         let loopback = IpAddr::V6(Ipv6Addr::LOCALHOST);
         boot_network_address(dir.path(), OperationMode::Network, Some(loopback), false).await;
+        let persisted = std::fs::read_to_string(dir.path().join("config.toml")).unwrap();
+        assert!(
+            persisted.contains(r#"network-address = "::1""#)
+                && persisted.contains(r#"mode = "network""#),
+            "premise: config.toml must hold the reported shape:\n{persisted}"
+        );
 
         let cfg = boot_network_address(dir.path(), OperationMode::Network, None, false).await;
         assert_eq!(
@@ -11344,5 +11385,112 @@ shutdown-drain-secs = 42
         assert!(cfg.is_gateway);
         assert_eq!(cfg.network_api.address, loopback);
         assert_eq!(cfg.network_api.dropped_persisted_loopback, None);
+    }
+
+    /// The file exactly as the old Local-mode writer left it, before any
+    /// network boot had rewritten `mode`.
+    #[tokio::test]
+    async fn network_boot_migrates_a_file_written_by_old_local_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        boot_network_address(dir.path(), OperationMode::Local, None, false).await;
+        let path = dir.path().join("config.toml");
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(written.contains(r#"mode = "local""#), "premise:\n{written}");
+        let legacy = written.replace(r#"network-address = "::""#, r#"network-address = "::1""#);
+        assert_ne!(
+            legacy, written,
+            "premise: network-address was not persisted"
+        );
+        std::fs::write(&path, legacy).unwrap();
+
+        let cfg = boot_network_address(dir.path(), OperationMode::Network, None, false).await;
+        assert_eq!(cfg.network_api.address, default_listening_address());
+        assert_eq!(
+            cfg.network_api.dropped_persisted_loopback,
+            Some(IpAddr::V6(Ipv6Addr::LOCALHOST))
+        );
+    }
+
+    /// Local mode never binds the P2P socket, so it has no reason to touch a
+    /// persisted value, and must not report one it did not drop.
+    #[tokio::test]
+    async fn local_boot_leaves_a_persisted_loopback_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let loopback = IpAddr::V6(Ipv6Addr::LOCALHOST);
+        boot_network_address(dir.path(), OperationMode::Network, Some(loopback), false).await;
+
+        let cfg = boot_network_address(dir.path(), OperationMode::Local, None, false).await;
+        assert_eq!(cfg.network_api.address, loopback);
+        assert_eq!(cfg.network_api.dropped_persisted_loopback, None);
+    }
+
+    /// `--is-gateway` on this boot exempts the node even when config.toml does
+    /// not yet record it as a gateway.
+    #[tokio::test]
+    async fn gateway_flag_on_this_boot_keeps_persisted_loopback() {
+        let dir = tempfile::tempdir().unwrap();
+        let loopback = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        boot_network_address(dir.path(), OperationMode::Network, Some(loopback), false).await;
+
+        let cfg = boot_network_address(dir.path(), OperationMode::Network, None, true).await;
+        assert_eq!(cfg.network_api.address, loopback);
+        assert_eq!(cfg.network_api.dropped_persisted_loopback, None);
+    }
+
+    /// A node on a local or test network (`skip_load_from_network`) keeps its
+    /// loopback bind: it does not load the public gateways, so loopback can be
+    /// exactly what it needs. Restored from the file, like `is_gateway`.
+    #[tokio::test]
+    async fn local_network_node_keeps_persisted_loopback() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_server, index_url) = empty_gateways_index_server();
+        let loopback = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let mut first = ws_api_test_args(OperationMode::Network, dir.path());
+        first.network_api.address = Some(loopback);
+        first.network_api.skip_load_from_network = true;
+        first
+            .build_with_gateways_index(&index_url)
+            .await
+            .expect("first build should succeed");
+
+        let cfg = ws_api_test_args(OperationMode::Network, dir.path())
+            .build_with_gateways_index(&index_url)
+            .await
+            .expect("second build should succeed");
+        assert!(cfg.network_api.skip_load_from_network);
+        assert_eq!(cfg.network_api.address, loopback);
+        assert_eq!(cfg.network_api.dropped_persisted_loopback, None);
+    }
+
+    /// The migration is reported once, after the logger exists. `build()`
+    /// cannot log it, and config.toml is already rewritten, so this is the
+    /// operator's only notice that the bind moved.
+    #[tokio::test]
+    async fn network_address_migration_is_reported_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let loopback = IpAddr::V6(Ipv6Addr::LOCALHOST);
+        boot_network_address(dir.path(), OperationMode::Network, Some(loopback), false).await;
+        let migrated = boot_network_address(dir.path(), OperationMode::Network, None, false).await;
+        let steady = boot_network_address(dir.path(), OperationMode::Network, None, false).await;
+
+        let (logs, guard) = crate::util::test_log_capture::install();
+        migrated.log_network_address_migration();
+        let after_migration = logs.lock().unwrap().clone();
+        logs.lock().unwrap().clear();
+        steady.log_network_address_migration();
+        drop(guard);
+        let after_steady = logs.lock().unwrap().clone();
+
+        assert!(
+            after_migration
+                .iter()
+                .any(|l| l.starts_with("WARN") && l.contains("ignored=::1")),
+            "the migration boot must warn naming the ignored value; captured: \
+             {after_migration:?}"
+        );
+        assert!(
+            after_steady.is_empty(),
+            "a steady boot must say nothing; captured: {after_steady:?}"
+        );
     }
 }

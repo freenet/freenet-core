@@ -725,29 +725,17 @@ impl NodeConfig {
             config.network_api.address,
             config.network_api.port
         );
-        // Reported here rather than in `ConfigArgs::build()`, which runs before
-        // the tracing subscriber exists (#5798).
-        let config_file = config.config_dir().join("config.toml");
-        if let Some(ignored) = config.network_api.dropped_persisted_loopback {
-            tracing::warn!(
-                ignored = %ignored,
-                network_address = %config.network_api.address,
-                config_file = %config_file.display(),
-                "Ignoring network-address {ignored} from config.toml: it was written by an \
-                 earlier `freenet local` run, and a network listener bound to loopback is \
-                 unreachable to every peer (#5798). Listening on {} instead; pass \
-                 --network-address to choose the address explicitly.",
-                config.network_api.address
-            );
-        }
+        // After the gateway loop because it needs the resolved gateway
+        // addresses. A persisted loopback was already migrated by `build()`, so
+        // this fires for one set this boot by flag, env or a non-default value.
         if loopback_listener_with_remote_gateways(config.network_api.address, &gateway_addrs) {
             tracing::warn!(
                 network_address = %config.network_api.address,
-                config_file = %config_file.display(),
                 "network-address {} is a loopback address, so this node can only exchange \
-                 packets with this machine and cannot reach its gateways. It will not join \
-                 the network. Remove network-address from config.toml, or pass \
-                 --network-address :: to listen on all interfaces.",
+                 packets with this machine and cannot reach its gateways (#5798). It will \
+                 not join the network. Check the --network-address flag, the \
+                 NETWORK_ADDRESS environment variable and config.toml; use :: (or 0.0.0.0 \
+                 on an IPv4-only host) to listen on all interfaces.",
                 config.network_api.address
             );
         }
@@ -6402,6 +6390,7 @@ mod tests {
     #[case::mixed_gateways("::1", &["127.0.0.1:31337", "5.9.111.215:31337"], true)]
     // Loopback-only test networks are deliberate.
     #[case::all_loopback_gateways("127.0.0.1", &["127.0.0.2:31337", "[::1]:31338"], false)]
+    #[case::v4_mapped_loopback_gateway("::1", &["[::ffff:127.0.0.1]:31337"], false)]
     #[case::no_gateways("::1", &[], false)]
     #[case::wildcard_listener("::", &["5.9.111.215:31337"], false)]
     #[case::v4_wildcard_listener("0.0.0.0", &["5.9.111.215:31337"], false)]
@@ -15572,6 +15561,53 @@ mod tests {
     /// deleting the call from `NodeConfig::new` turns them red. Six PRs in this
     /// disk-usage series shipped tests that passed with the production call
     /// site removed; this is the check that catches that.
+    /// The unreachable-gateway warning is wired into `NodeConfig::new` and fed
+    /// the resolved gateway addresses (#5798): the predicate alone being right
+    /// says nothing about whether startup ever calls it.
+    mod loopback_listener_warning_wiring {
+        use super::*;
+        use crate::config::{Address, GatewayConfig};
+        use crate::contract::OperationMode;
+
+        async fn warnings_for(listener: IpAddr) -> Vec<String> {
+            let temp_dir = tempfile::tempdir().unwrap();
+            let dir = temp_dir.path();
+            let mut config = crate::config::event_log_test_args(dir, OperationMode::Network)
+                .build()
+                .await
+                .expect("build Config");
+            let key_path = dir.join("remote_gw.pub");
+            std::fs::write(&key_path, hex::encode([7u8; 32])).unwrap();
+            config.gateways = vec![GatewayConfig {
+                address: Address::HostAddress("5.9.111.215:31337".parse().unwrap()),
+                public_key_path: key_path,
+                location: None,
+            }];
+            config.network_api.address = listener;
+
+            let (logs, guard) = crate::util::test_log_capture::install();
+            NodeConfig::new(config).await.expect("build NodeConfig");
+            drop(guard);
+            let captured = logs.lock().unwrap().clone();
+            captured
+                .into_iter()
+                .filter(|l| l.starts_with("WARN") && l.contains("is a loopback address"))
+                .collect()
+        }
+
+        #[tokio::test]
+        async fn loopback_listener_with_a_remote_gateway_warns() {
+            let warnings = warnings_for(IpAddr::V6(Ipv6Addr::LOCALHOST)).await;
+            assert_eq!(warnings.len(), 1, "captured: {warnings:?}");
+        }
+
+        #[tokio::test]
+        async fn wildcard_listener_does_not_warn() {
+            let warnings = warnings_for(IpAddr::V6(Ipv6Addr::UNSPECIFIED)).await;
+            assert!(warnings.is_empty(), "captured: {warnings:?}");
+        }
+    }
+
     mod event_log_reclaim_wiring {
         use super::*;
         use crate::contract::OperationMode;
