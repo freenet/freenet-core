@@ -2120,6 +2120,10 @@ pub(crate) async fn initial_join_procedure(
 
         loop {
             let open_conns = op_manager.ring.open_connections();
+            op_manager
+                .bootstrap_pacer
+                .lock()
+                .observe_connections(tokio::time::Instant::now(), open_conns > 0);
 
             if !min_connections_reached && open_conns >= bootstrap_threshold {
                 min_connections_reached = true;
