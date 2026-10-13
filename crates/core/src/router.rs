@@ -10414,7 +10414,14 @@ mod tests {
     /// ring bands 0-3 only (so bands 4-7 are unrecorded for everyone).
     fn spread_router(rounds: u64, timed: bool) -> (Router, Vec<PeerKeyLocation>) {
         let mut router = warm_hierarchical_router(&[]);
-        let peers: Vec<PeerKeyLocation> = (0..12).map(|_| PeerKeyLocation::random()).collect();
+        // `PeerKeyLocation::random` draws addresses, hence ring locations, from
+        // the thread's RNG. Unseeded, a rare draw (about 1 in 100) leaves no
+        // peer whose probabilities are unclamped in an unrecorded band, which
+        // the failure-offset test needs, so the peers are pinned.
+        let peers: Vec<PeerKeyLocation> = {
+            let _seed = GlobalRng::seed_guard(0x4485_5E4D);
+            (0..12).map(|_| PeerKeyLocation::random()).collect()
+        };
         for round in 0..rounds {
             for (index, peer) in peers.iter().enumerate() {
                 let jitter_ms = 100 + (index as u64 * 7 + round * 13) % 50;
