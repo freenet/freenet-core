@@ -2484,73 +2484,268 @@ mod driver_timing_tests {
         held.abort();
     }
 
-    fn spawn_or_end(block: &str) -> usize {
-        block.find("GlobalExecutor::spawn(").unwrap_or(block.len())
+    /// What the scripted event loop saw.
+    #[derive(Debug, Default)]
+    struct DialLog {
+        /// Each acceptor dialled, and when (from the start of the test).
+        dials: Vec<(SocketAddr, Duration)>,
+        /// Most dials in flight at once.
+        max_in_flight: usize,
+        /// Acceptors the driver reported to the gateway as failed.
+        connect_failed: Vec<SocketAddr>,
     }
 
-    /// The maintenance loop's zero-connection bootstrap (#5858): it takes the
-    /// shared bootstrap round before acting, clears only the leftover gateway
-    /// reservations of paced rounds while holding it, and runs the joins in a
-    /// spawned task.
-    /// Awaited inline they held the maintenance loop for a transaction TTL;
-    /// without the round it could run CONNECTs concurrently with
-    /// `initial_join_procedure`. Source pin: the loop has no test harness of its
-    /// own. Mutation-checked (each of the three removed turns it red).
-    #[test]
-    fn maintenance_bootstrap_takes_the_round_and_spawns_its_joins() {
-        const RING: &str = include_str!("../../ring.rs");
-        let prod = &RING[..RING
-            .find("\n#[cfg(test)]\nmod ")
-            .expect("expected a test module")];
-        let code: String = prod
-            .lines()
-            .map(|line| line.split_once("//").map_or(line, |(code, _)| code))
-            .collect::<Vec<_>>()
-            .join("\n")
-            .split_whitespace()
-            .collect();
-        let start = code
-            .find("asyncfnconnection_maintenance(")
-            .expect("connection_maintenance not found");
-        let maintenance = &code[start..];
-        let block_start = maintenance
-            .find("ifcurrent_conn_count==0&&!op_manager.configured_gateways.is_empty(){")
-            .expect("zero-connection bootstrap not found");
-        let block = &maintenance[block_start..];
-        let begin = block
-            .find("BootstrapRoundGuard::try_begin(&op_manager.bootstrap_pacer,")
-            .expect("the bootstrap must take the shared round");
-        let clear = block
-            .find("clear_pending_reservations_for(&owned)")
-            .expect("the bootstrap must clear its leftover gateway reservations");
+    /// Plays the event loop: every dial takes the NAT traversal deadline and
+    /// fails for the acceptors in `unreachable`, connects otherwise.
+    fn scripted_event_loop(
+        mut events: mpsc::Receiver<Either<NetMessage, NodeEvent>>,
+        unreachable: Vec<SocketAddr>,
+    ) -> Arc<parking_lot::Mutex<DialLog>> {
+        let log = Arc::new(parking_lot::Mutex::new(DialLog::default()));
+        let in_flight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let t0 = Instant::now();
+        let shared = log.clone();
+        tokio::spawn(async move {
+            use std::sync::atomic::Ordering::SeqCst;
+            while let Some(event) = events.recv().await {
+                match event {
+                    Either::Right(NodeEvent::ConnectPeer { peer, callback, .. }) => {
+                        let addr = peer.socket_addr().expect("acceptor address");
+                        let now_in_flight = in_flight.fetch_add(1, SeqCst) + 1;
+                        {
+                            let mut log = shared.lock();
+                            log.dials.push((addr, t0.elapsed()));
+                            log.max_in_flight = log.max_in_flight.max(now_in_flight);
+                        }
+                        let ok = !unreachable.contains(&addr);
+                        let in_flight = in_flight.clone();
+                        tokio::spawn(async move {
+                            tokio::time::sleep(NAT_TRAVERSAL_DEADLINE).await;
+                            in_flight.fetch_sub(1, SeqCst);
+                            let result = if ok { Ok((addr, None)) } else { Err(()) };
+                            callback.send(result).await.ok();
+                        });
+                    }
+                    Either::Right(NodeEvent::SendNetMessage { msg, .. }) => {
+                        if let NetMessage::V1(NetMessageV1::Connect(ConnectMsg::ConnectFailed {
+                            failed_acceptor_addr,
+                            ..
+                        })) = *msg
+                        {
+                            shared.lock().connect_failed.push(failed_acceptor_addr);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        });
+        log
+    }
+
+    /// Bookkeeping a successful CONNECT must leave, set up to fail first.
+    fn record_prior_failures(op_manager: &OpManager, gateway_addr: SocketAddr, desired: Location) {
+        op_manager
+            .gateway_backoff
+            .lock()
+            .record_failure(gateway_addr);
+        op_manager.ring.record_connection_failure(
+            desired,
+            crate::ring::ConnectionFailureReason::RoutingFailed,
+        );
+        op_manager
+            .ring
+            .connection_manager
+            .increment_connect_jitter_failures(Instant::now());
         assert!(
-            block[..spawn_or_end(block)]
-                .contains("letowned=op_manager.bootstrap_pacer.lock().take_owned_reservations();"),
-            "only reservations owned by paced rounds may be cleared"
+            op_manager
+                .gateway_backoff
+                .lock()
+                .is_in_backoff(gateway_addr)
+        );
+        assert!(op_manager.ring.is_in_connection_backoff(desired));
+        assert!(
+            op_manager
+                .ring
+                .connection_manager
+                .connect_jitter_failure_count()
+                > 0
+        );
+    }
+
+    fn assert_success_recorded(
+        op_manager: &OpManager,
+        gateway_addr: SocketAddr,
+        desired: Location,
+    ) {
+        assert!(
+            !op_manager
+                .gateway_backoff
+                .lock()
+                .is_in_backoff(gateway_addr),
+            "the gateway's backoff must be cleared"
         );
         assert!(
-            !block[..spawn_or_end(block)]
-                .contains("clear_pending_reservations_for(&gateway_addrs)"),
-            "clearing every gateway reservation would cancel a live CONNECT"
+            !op_manager.ring.is_in_connection_backoff(desired),
+            "the target's connection backoff must be cleared"
         );
-        let spawn = block
-            .find("GlobalExecutor::spawn(")
-            .expect("the joins must run in a spawned task");
-        let join = block
-            .find("join_ring_request(")
-            .expect("the bootstrap must still join through the gateways");
-        assert!(
-            begin < clear && clear < spawn && spawn < join,
-            "take the round, clear reservations, then spawn the joins"
-        );
-        let end = maintenance
-            .find("letmax_concurrent=calculate_max_concurrent_connections(")
-            .expect("end of the bootstrap block");
         assert_eq!(
-            maintenance[..end].matches("join_ring_request(").count(),
-            1,
-            "no other join may be awaited inline in the maintenance loop"
+            op_manager
+                .ring
+                .connection_manager
+                .connect_jitter_failure_count(),
+            0,
+            "the jitter failure count must be reset"
         );
+    }
+
+    /// A peer that already has a connection (#5858 leaves it unchanged):
+    /// acceptors are dialled one at a time, a failed one is reported to the
+    /// gateway, and the CONNECT ends when `target_connections` acceptors have
+    /// actually connected, not when that many have answered.
+    #[tokio::test(start_paused = true)]
+    async fn a_connected_peers_connect_dials_one_at_a_time_and_ends_at_the_target() {
+        let (op_manager, events) = op_manager_with_events("driver-connected-target").await;
+        let existing = peer(24870);
+        let existing_addr = existing.socket_addr().unwrap();
+        assert!(op_manager.ring.connection_manager.add_connection(
+            Location::from_address(&existing_addr),
+            existing_addr,
+            existing.pub_key().clone(),
+            false,
+        ));
+        let gateway = peer(24871);
+        let gateway_addr = gateway.socket_addr().unwrap();
+        let (bad, good, other) = (peer(24872), peer(24873), peer(24874));
+        let desired = Location::new(0.5);
+        record_prior_failures(&op_manager, gateway_addr, desired);
+        let log = scripted_event_loop(events, vec![bad.socket_addr().unwrap()]);
+        let tx = Transaction::new::<ConnectMsg>();
+        let (replies_tx, replies_rx) = mpsc::channel(8);
+        for acceptor in [&bad, &good, &other] {
+            replies_tx.send(response(tx, acceptor)).await.unwrap();
+        }
+        let end = tokio::time::timeout(
+            Duration::from_secs(50),
+            drive_client_connect_inner(
+                tx,
+                gateway.clone(),
+                gateway_addr,
+                desired,
+                2,
+                false,
+                replies_rx,
+                &op_manager,
+                ClientConnectKind::Standard,
+            ),
+        )
+        .await
+        .expect("the target is reachable well inside the TTL")
+        .expect("driver result");
+        assert_eq!(end, ClientConnectEnd::Finished);
+        let log = log.lock();
+        let dialled: Vec<_> = log.dials.iter().map(|(a, _)| *a).collect();
+        assert_eq!(
+            dialled,
+            vec![
+                bad.socket_addr().unwrap(),
+                good.socket_addr().unwrap(),
+                other.socket_addr().unwrap()
+            ],
+            "two answered acceptors are not two connections: the third must be dialled"
+        );
+        assert_eq!(log.max_in_flight, 1, "a connected peer dials one at a time");
+        assert_eq!(log.connect_failed, vec![bad.socket_addr().unwrap()]);
+        assert_success_recorded(&op_manager, gateway_addr, desired);
+        drop(replies_tx);
+    }
+
+    /// A failed dial restarts the quiet window: the relay re-routes the
+    /// CONNECT on `ConnectFailed`, and an acceptor that answers late in the
+    /// post-dial window is still dialled.
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_dial_restarts_the_quiet_window_for_the_re_routed_acceptor() {
+        let (op_manager, events) = op_manager_with_events("driver-bootstrap-reroute").await;
+        let gateway = peer(24875);
+        let (bad, rerouted) = (peer(24876), peer(24877));
+        let log = scripted_event_loop(events, vec![bad.socket_addr().unwrap()]);
+        let tx = Transaction::new::<ConnectMsg>();
+        let (replies_tx, replies_rx) = mpsc::channel(8);
+        replies_tx.send(response(tx, &bad)).await.unwrap();
+        let timing = BootstrapTiming::default();
+        let late = replies_tx.clone();
+        let rerouted_reply = rerouted.clone();
+        tokio::spawn(async move {
+            // The bad dial fails at the NAT deadline; answer 1 s before the
+            // post-dial window that starts then would close.
+            tokio::time::sleep(NAT_TRAVERSAL_DEADLINE + timing.after_dial - Duration::from_secs(1))
+                .await;
+            late.send(response(tx, &rerouted_reply)).await.unwrap();
+        });
+        let end = tokio::time::timeout(
+            Duration::from_secs(50),
+            drive_client_connect_inner(
+                tx,
+                gateway.clone(),
+                gateway.socket_addr().unwrap(),
+                Location::new(0.5),
+                op_manager.ring.connection_manager.min_connections,
+                false,
+                replies_rx,
+                &op_manager,
+                ClientConnectKind::Standard,
+            ),
+        )
+        .await
+        .expect("a bootstrapping CONNECT ends early")
+        .expect("driver result");
+        assert_eq!(end, ClientConnectEnd::Bootstrap(BootstrapExit::Connected));
+        let log = log.lock();
+        assert_eq!(log.connect_failed, vec![bad.socket_addr().unwrap()]);
+        assert!(
+            log.dials
+                .iter()
+                .any(|(a, _)| Some(*a) == rerouted.socket_addr()),
+            "the re-routed acceptor must be dialled; dials {:?}",
+            log.dials
+        );
+        drop(replies_tx);
+    }
+
+    /// A bootstrapping CONNECT that connected an acceptor and then went
+    /// quiet ends as `Connected` with the same success bookkeeping as
+    /// reaching the target.
+    #[tokio::test(start_paused = true)]
+    async fn a_bootstrapping_connect_that_connected_records_success() {
+        let (op_manager, events) = op_manager_with_events("driver-bootstrap-connected").await;
+        let gateway = peer(24878);
+        let gateway_addr = gateway.socket_addr().unwrap();
+        let acceptor = peer(24879);
+        let desired = Location::new(0.5);
+        record_prior_failures(&op_manager, gateway_addr, desired);
+        let _log = scripted_event_loop(events, vec![]);
+        let tx = Transaction::new::<ConnectMsg>();
+        let (replies_tx, replies_rx) = mpsc::channel(8);
+        replies_tx.send(response(tx, &acceptor)).await.unwrap();
+        let end = tokio::time::timeout(
+            Duration::from_secs(50),
+            drive_client_connect_inner(
+                tx,
+                gateway.clone(),
+                gateway_addr,
+                desired,
+                op_manager.ring.connection_manager.min_connections,
+                false,
+                replies_rx,
+                &op_manager,
+                ClientConnectKind::Standard,
+            ),
+        )
+        .await
+        .expect("a bootstrapping CONNECT ends early")
+        .expect("driver result");
+        assert_eq!(end, ClientConnectEnd::Bootstrap(BootstrapExit::Connected));
+        assert_success_recorded(&op_manager, gateway_addr, desired);
+        drop(replies_tx);
     }
 
     #[tokio::test(start_paused = true)]

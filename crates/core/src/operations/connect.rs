@@ -2625,6 +2625,185 @@ mod tests {
             .block_on(body);
     }
 
+    /// Comment-stripped, whitespace-free text of `body`, for pins.
+    fn squash(body: &str) -> String {
+        body.lines()
+            .map(|line| line.split_once("//").map_or(line, |(code, _)| code))
+            .collect::<Vec<_>>()
+            .join("\n")
+            .split_whitespace()
+            .collect()
+    }
+
+    /// The maintenance loop's zero-connection bootstrap (#5858), for what the
+    /// behavioural test below cannot see: the loop calls it, awaits no join
+    /// inline (awaited, the joins held the loop for a transaction TTL), and
+    /// the spawned task owns the whole round guard (a disjoint capture of
+    /// `round.connected` would end the round when the call returned).
+    #[test]
+    fn maintenance_bootstrap_takes_the_round_and_spawns_its_joins() {
+        const RING: &str = include_str!("../ring.rs");
+        let maintenance = squash(fn_body(RING, "async fn connection_maintenance("));
+        assert!(
+            maintenance.contains(
+                "ifcurrent_conn_count==0&&!op_manager.configured_gateways.is_empty(){\
+                 self.maintenance_gateway_bootstrap(&op_manager,&op_manager.configured_gateways);}"
+            ),
+            "the maintenance loop must run the zero-connection bootstrap"
+        );
+        assert_eq!(
+            maintenance.matches("join_ring_request(").count(),
+            0,
+            "no join may be awaited inline in the maintenance loop"
+        );
+        let body = squash(fn_body(
+            RING,
+            "pub(crate) fn maintenance_gateway_bootstrap(",
+        ));
+        let begin = body
+            .find(
+                "letSome(mutround)=crate::operations::connect::bootstrap::BootstrapRoundGuard::\
+                 try_begin(&op_manager.bootstrap_pacer,tokio::time::Instant::now(),)else{returnfalse;};",
+            )
+            .expect("the bootstrap must take the shared round before acting");
+        let spawn = body
+            .find("GlobalExecutor::spawn(asyncmove{")
+            .expect("the joins must run in a spawned task");
+        let owns = body
+            .find("letmutround=round;")
+            .expect("the spawned task must move the whole round guard in");
+        let join = body
+            .find("join_ring_request(")
+            .expect("the bootstrap must join through the gateways");
+        let connected = body
+            .find("round.connected=op_manager.ring.open_connections()>0;")
+            .expect("the round must report whether it connected");
+        assert!(
+            begin < spawn && spawn < owns && owns < join && join < connected,
+            "take the round, then spawn the joins with the guard moved in"
+        );
+    }
+
+    /// The maintenance bootstrap and the join loop take turns (#5858): while
+    /// one path's round runs the other starts none, and the maintenance round
+    /// clears only reservations that paced rounds own, so the reservation of a
+    /// CONNECT sent outside any round survives it.
+    #[test]
+    fn maintenance_and_join_loop_bootstrap_rounds_exclude_each_other() {
+        let _lock = crate::node::network_status::TEST_GLOBAL_STATE_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        crate::node::network_status::init(0, HashSet::new(), "test".to_string());
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .start_paused(true)
+            .build()
+            .expect("build test runtime")
+            .block_on(async {
+                let config_args = crate::config::ConfigArgs {
+                    id: Some("bootstrap-5858-exclusion".to_string()),
+                    mode: Some(crate::contract::OperationMode::Local),
+                    ..Default::default()
+                };
+                let node_config =
+                    crate::node::NodeConfig::new(config_args.build().await.expect("Config"))
+                        .await
+                        .expect("NodeConfig");
+                let (notification_rx, notification_tx) =
+                    crate::node::event_loop_notification_channel();
+                let (ops_ch_channel, ch_channel, _wait_for_event) =
+                    crate::contract::contract_handler_channel();
+                let connection_manager = crate::ring::ConnectionManager::new(&node_config);
+                let (result_router_tx, result_router_rx) = tokio::sync::mpsc::channel(100);
+                let task_monitor =
+                    crate::node::background_task_monitor::BackgroundTaskMonitor::new();
+                let op_manager = Arc::new(
+                    OpManager::new(
+                        notification_tx,
+                        ops_ch_channel,
+                        &node_config,
+                        crate::tracing::DynamicRegister::new(vec![]),
+                        connection_manager,
+                        result_router_tx,
+                        &task_monitor,
+                    )
+                    .expect("OpManager"),
+                );
+                op_manager.ring.attach_op_manager(&op_manager);
+                op_manager
+                    .ring
+                    .connection_manager
+                    .set_own_addr_local_for_test("127.0.0.1:14859".parse().unwrap());
+                let crate::node::EventLoopNotificationsReceiver {
+                    notifications_receiver,
+                    mut op_execution_receiver,
+                } = notification_rx;
+                std::mem::forget((ch_channel, result_router_rx, notifications_receiver));
+
+                let gateways = vec![bootstrap_gateway(25870), bootstrap_gateway(25871)];
+                let live = gateways[0].socket_addr().unwrap();
+                let owned = gateways[1].socket_addr().unwrap();
+                let pacer = &op_manager.bootstrap_pacer;
+                let ring = &op_manager.ring;
+
+                let join_loop_round =
+                    bootstrap::BootstrapRoundGuard::try_begin(pacer, Instant::now())
+                        .expect("no round is running yet");
+                assert!(
+                    !ring.maintenance_gateway_bootstrap(&op_manager, &gateways),
+                    "maintenance must not start a round while the join loop runs one"
+                );
+                drop(join_loop_round);
+                assert!(
+                    op_execution_receiver.try_recv().is_err(),
+                    "no CONNECT may go out while the other path's round runs"
+                );
+
+                // A finished paced round left its reservation at `owned`; a
+                // CONNECT sent outside any round holds one at `live`.
+                bootstrap::BootstrapRoundGuard::try_begin(pacer, Instant::now())
+                    .expect("the join loop's round ended")
+                    .own_reservation(owned);
+                for addr in [live, owned] {
+                    ring.connection_manager.inject_reservation(
+                        addr,
+                        Location::from_address(&addr),
+                        Instant::now(),
+                    );
+                }
+                assert!(ring.maintenance_gateway_bootstrap(&op_manager, &gateways));
+                assert!(
+                    ring.connection_manager.has_connection_or_pending(live),
+                    "the reservation of a CONNECT outside any round was cleared"
+                );
+                assert!(
+                    bootstrap::BootstrapRoundGuard::try_begin(pacer, Instant::now()).is_none(),
+                    "the join loop must not start a round while maintenance runs one"
+                );
+
+                let mut targets = Vec::new();
+                let mut held = Vec::new();
+                while let Ok(Some((reply, msg, target))) =
+                    tokio::time::timeout(Duration::from_secs(1), op_execution_receiver.recv()).await
+                {
+                    if matches!(
+                        msg,
+                        crate::message::NetMessage::V1(crate::message::NetMessageV1::Connect(
+                            ConnectMsg::Request { .. } | ConnectMsg::RequestWithNeed { .. }
+                        ))
+                    ) {
+                        targets.push(target);
+                    }
+                    held.push(reply);
+                }
+                assert_eq!(
+                    targets,
+                    vec![Some(owned)],
+                    "only the gateway whose leftover reservation was cleared is joined"
+                );
+            });
+    }
+
     /// A joiner whose gateways never answer (#5858): every round's CONNECTs
     /// go unanswered. Before the fix each CONNECT ran to the transaction TTL
     /// and the loop waited for all of them, so the second round started a TTL
