@@ -2073,6 +2073,10 @@ impl Ring {
             snapshot.connect_admitted_lattice = Some(admission.admitted_lattice);
             snapshot.connect_rejected_onboarding_budget_exhausted =
                 Some(admission.rejected_onboarding_budget_exhausted);
+            snapshot.connect_rejected_onboarding_rate_limited =
+                Some(admission.rejected_onboarding_rate_limited);
+            snapshot.connect_rejected_onboarding_location_taken =
+                Some(admission.rejected_onboarding_location_taken);
             snapshot.connect_rejected_bar_unmet = Some(admission.rejected_bar_unmet);
             snapshot.connect_bar_unmet_not_enforced = Some(admission.bar_unmet_not_enforced);
             snapshot.connect_provisional_graduated = Some(admission.provisional_graduated);

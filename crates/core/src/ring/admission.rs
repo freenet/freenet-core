@@ -341,7 +341,12 @@ pub(crate) struct AdmissionStats {
     pub admitted_self_interest: u64,
     pub admitted_onboarding: u64,
     pub admitted_lattice: u64,
+    /// Short requests refused an onboarding slot, by cause: every usable slot
+    /// on probation, the token bucket empty, or the masked location already
+    /// holding a slot (and self-interest did not admit them either).
     pub rejected_onboarding_budget_exhausted: u64,
+    pub rejected_onboarding_rate_limited: u64,
+    pub rejected_onboarding_location_taken: u64,
     pub rejected_bar_unmet: u64,
     /// Requests whose bar this peer did not meet, decided on self-interest
     /// because the bar is not enforced (`ENFORCE_REQUESTER_BAR`): what
@@ -379,6 +384,8 @@ pub(crate) struct AdmissionCounters {
     admitted_onboarding: AtomicU64,
     admitted_lattice: AtomicU64,
     rejected_onboarding_budget_exhausted: AtomicU64,
+    rejected_onboarding_rate_limited: AtomicU64,
+    rejected_onboarding_location_taken: AtomicU64,
     rejected_bar_unmet: AtomicU64,
     bar_unmet_not_enforced: AtomicU64,
     provisional_graduated: AtomicU64,
@@ -407,10 +414,12 @@ impl AdmissionCounters {
             AdmissionCode::AcceptedSelfInterest => &self.admitted_self_interest,
             AdmissionCode::AcceptedOnboarding => &self.admitted_onboarding,
             AdmissionCode::AcceptedLattice => &self.admitted_lattice,
-            AdmissionCode::RejectedOnboardingBudgetExhausted
-            | AdmissionCode::RejectedOnboardingRateLimited
-            | AdmissionCode::RejectedOnboardingLocationTaken => {
+            AdmissionCode::RejectedOnboardingBudgetExhausted => {
                 &self.rejected_onboarding_budget_exhausted
+            }
+            AdmissionCode::RejectedOnboardingRateLimited => &self.rejected_onboarding_rate_limited,
+            AdmissionCode::RejectedOnboardingLocationTaken => {
+                &self.rejected_onboarding_location_taken
             }
             AdmissionCode::RejectedBarUnmet => &self.rejected_bar_unmet,
             // The remaining causes predate #5858 and are carried per event
@@ -476,6 +485,12 @@ impl AdmissionCounters {
             admitted_lattice: self.admitted_lattice.load(Ordering::Relaxed),
             rejected_onboarding_budget_exhausted: self
                 .rejected_onboarding_budget_exhausted
+                .load(Ordering::Relaxed),
+            rejected_onboarding_rate_limited: self
+                .rejected_onboarding_rate_limited
+                .load(Ordering::Relaxed),
+            rejected_onboarding_location_taken: self
+                .rejected_onboarding_location_taken
                 .load(Ordering::Relaxed),
             rejected_bar_unmet: self.rejected_bar_unmet.load(Ordering::Relaxed),
             bar_unmet_not_enforced: self.bar_unmet_not_enforced.load(Ordering::Relaxed),
