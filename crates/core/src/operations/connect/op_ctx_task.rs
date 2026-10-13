@@ -105,8 +105,13 @@ impl Drop for RelayConnectInflightGuard {
 /// driver does with an acceptance.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ClientConnectKind {
-    /// Gateway join, ring acquisition, version probe.
+    /// Gateway join, ring acquisition.
     Standard,
+    /// Periodic gateway version probe (#3677). Like a gateway join it ends
+    /// early when this peer has no ring connection, but it runs outside the
+    /// bootstrap pacer, so a probe that hears nothing does not count toward
+    /// redialling the gateway link.
+    VersionProbe,
     /// Route-to-self nearest-neighbor lattice probe (`Ring::connection_maintenance`),
     /// issued in scheduler `generation`: an acceptor that is not a lattice edge
     /// is reported as a probe miss for that generation
@@ -261,6 +266,8 @@ pub(crate) async fn start_client_connect(
         None => inner.await,
     };
     match outcome {
+        Ok(ClientConnectEnd::Bootstrap(super::bootstrap::BootstrapExit::NoReply))
+            if kind == ClientConnectKind::VersionProbe => {}
         Ok(ClientConnectEnd::Bootstrap(super::bootstrap::BootstrapExit::NoReply)) => {
             if op_manager
                 .bootstrap_pacer
@@ -363,8 +370,10 @@ async fn drive_client_connect_inner(
     // A CONNECT sent with no ring connection ends once nothing more is
     // coming, instead of waiting for `target_connections` acceptors that one
     // CONNECT never collects (#5858). Decided once, for this transaction.
-    let bootstrapping = kind == ClientConnectKind::Standard
-        && op_manager.ring.connection_manager.connection_count() == 0;
+    let bootstrapping = matches!(
+        kind,
+        ClientConnectKind::Standard | ClientConnectKind::VersionProbe
+    ) && op_manager.ring.connection_manager.connection_count() == 0;
     let mut round = BootstrapRound::new(bootstrapping, Instant::now(), BootstrapTiming::default());
     // While bootstrapping, acceptors are dialled concurrently (bounded), so
     // one unreachable acceptor cannot hold the next one past its hole-punch
@@ -2384,6 +2393,54 @@ mod driver_timing_tests {
             dropped(&mut events),
             "a second silent round in a row must drop the link for a redial"
         );
+        held.abort();
+    }
+
+    /// A version probe runs outside the bootstrap pacer, so its silence must
+    /// not count toward redialling the gateway link: two silent probes and
+    /// then one silent join drop nothing.
+    #[tokio::test(start_paused = true)]
+    async fn a_silent_version_probe_does_not_count_toward_a_redial() {
+        let (op_manager, mut events, mut op_execution) =
+            op_manager_with_channels("driver-probe-silent").await;
+        let gateway = peer(24868);
+        let gateway_addr = gateway.socket_addr().unwrap();
+        let held = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Some(item) = op_execution.recv().await {
+                held.push(item);
+            }
+            held
+        });
+        for kind in [
+            ClientConnectKind::VersionProbe,
+            ClientConnectKind::VersionProbe,
+            ClientConnectKind::Standard,
+        ] {
+            let own = op_manager.ring.connection_manager.own_location();
+            tokio::time::timeout(
+                Duration::from_secs(60),
+                super::start_client_connect(
+                    Transaction::new::<ConnectMsg>(),
+                    gateway.clone(),
+                    gateway_addr,
+                    &op_manager,
+                    own,
+                    Location::new(0.5),
+                    None,
+                    kind,
+                ),
+            )
+            .await
+            .expect("a CONNECT with no ring connection must end early")
+            .expect("driver result");
+        }
+        while let Ok(event) = events.try_recv() {
+            assert!(
+                !matches!(event, Either::Right(NodeEvent::DropStaleGatewayLink { .. })),
+                "a probe's silence redialled the gateway link"
+            );
+        }
         held.abort();
     }
 

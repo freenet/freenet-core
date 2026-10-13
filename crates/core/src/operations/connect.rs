@@ -1754,7 +1754,7 @@ pub(crate) async fn gateway_version_probe(
         own,
         desired_location,
         None,
-        op_ctx_task::ClientConnectKind::Standard,
+        op_ctx_task::ClientConnectKind::VersionProbe,
     )
     .await
 }
