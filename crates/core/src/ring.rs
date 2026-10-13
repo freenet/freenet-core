@@ -6462,6 +6462,12 @@ impl Ring {
             let current_conn_count = self.connection_manager.connection_count();
             // Expose to update check task for version mismatch decisions (#3204).
             crate::transport::set_open_connection_count(current_conn_count);
+            // A connection gained by any path counts toward resetting the
+            // bootstrap backoff (#5858).
+            op_manager
+                .bootstrap_pacer
+                .lock()
+                .observe_connections(tokio::time::Instant::now(), current_conn_count > 0);
             if current_conn_count == 0 {
                 // Use shorter threshold before first successful connection so
                 // cold-start failures (e.g., after OS restart) recover in ~30s

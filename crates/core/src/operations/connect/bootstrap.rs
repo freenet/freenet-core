@@ -60,6 +60,15 @@ const MAX_TRACKED_GATEWAYS: usize = 64;
 /// First wait after a bootstrap round that ended with no ring connection.
 const BOOTSTRAP_RETRY_BASE: Duration = Duration::from_secs(1);
 
+/// Wait after a round that produced a ring connection, before another may
+/// start. A connection that drops at once (a churning acceptor) would
+/// otherwise let rounds run back to back.
+const CONNECTED_ROUND_GAP: Duration = Duration::from_secs(5);
+
+/// How long a ring connection must persist before the failure count resets.
+/// Until then a lost connection resumes the backoff where it was.
+const CONNECTION_PERSISTS: Duration = Duration::from_secs(30);
+
 /// How a bootstrapping CONNECT ended, decided by [`BootstrapRound`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BootstrapExit {
@@ -252,6 +261,8 @@ pub(crate) struct BootstrapPacer {
     /// round (with a ring connection) is not recorded: its reservation may
     /// belong to a CONNECT still in flight.
     owned_reservations: HashSet<SocketAddr>,
+    /// Since when this peer has had a ring connection without a break.
+    connected_since: Option<Instant>,
 }
 
 impl BootstrapPacer {
@@ -266,6 +277,22 @@ impl BootstrapPacer {
             round_in_flight: false,
             silent_rounds: HashMap::new(),
             owned_reservations: HashSet::new(),
+            connected_since: None,
+        }
+    }
+
+    /// Records whether this peer has a ring connection, however it got it.
+    /// Once a connection has lasted [`CONNECTION_PERSISTS`] the backoff
+    /// starts over.
+    pub(crate) fn observe_connections(&mut self, now: Instant, has_connection: bool) {
+        if !has_connection {
+            self.connected_since = None;
+            return;
+        }
+        let since = *self.connected_since.get_or_insert(now);
+        if now.saturating_duration_since(since) >= CONNECTION_PERSISTS {
+            self.failures = 0;
+            self.next_allowed = None;
         }
     }
 
@@ -324,15 +351,16 @@ impl BootstrapPacer {
             // round, so it does not grow the backoff.
             return;
         }
-        if connected {
-            self.failures = 0;
-            self.next_allowed = None;
+        let jitter: f64 = GlobalRng::random_range(0.8_f64..=1.2_f64);
+        let delay = if connected {
+            // The failure count stays until the connection has persisted
+            // (`observe_connections`).
+            CONNECTED_ROUND_GAP
         } else {
             self.failures = self.failures.saturating_add(1);
-            let delay = self.backoff.delay_for_failures(self.failures);
-            let jitter: f64 = GlobalRng::random_range(0.8_f64..=1.2_f64);
-            self.next_allowed = Some(now + delay.mul_f64(jitter));
-        }
+            self.backoff.delay_for_failures(self.failures)
+        };
+        self.next_allowed = Some(now + delay.mul_f64(jitter));
     }
 }
 
@@ -632,7 +660,7 @@ mod tests {
     }
 
     #[test]
-    fn pacer_resets_after_a_connected_round() {
+    fn a_connected_round_keeps_a_gap_and_the_failure_count() {
         let mut pacer = BootstrapPacer::new(Duration::from_secs(30));
         let now = Instant::now();
         assert!(pacer.try_begin(now));
@@ -640,7 +668,44 @@ mod tests {
         pacer.next_allowed = None;
         assert!(pacer.try_begin(now));
         pacer.end(now, true, true);
-        assert_eq!(pacer.wait_until(now), None);
+        let gap = pacer
+            .wait_until(now)
+            .expect("a connected round still spaces the next");
+        let gap = gap - now;
+        assert!(
+            gap >= CONNECTED_ROUND_GAP.mul_f64(0.8) && gap <= CONNECTED_ROUND_GAP.mul_f64(1.2),
+            "gap {gap:?}"
+        );
+        assert_eq!(
+            pacer.failures, 1,
+            "a connection that may churn resets nothing"
+        );
+    }
+
+    #[test]
+    fn a_persistent_connection_resets_the_backoff() {
+        let mut pacer = BootstrapPacer::new(Duration::from_secs(30));
+        let t0 = Instant::now();
+        for _ in 0..4 {
+            pacer.next_allowed = None;
+            assert!(pacer.try_begin(t0));
+            pacer.end(t0, true, false);
+        }
+        // A connection gained by any path: not the pacer's own round.
+        pacer.observe_connections(t0, true);
+        pacer.observe_connections(t0 + CONNECTION_PERSISTS - Duration::from_millis(1), true);
+        assert_eq!(pacer.failures, 4, "not yet persistent");
+        // A drop restarts the clock.
+        pacer.observe_connections(t0 + CONNECTION_PERSISTS, false);
+        pacer.observe_connections(t0 + CONNECTION_PERSISTS, true);
+        pacer.observe_connections(
+            t0 + 2 * CONNECTION_PERSISTS - Duration::from_millis(1),
+            true,
+        );
+        assert_eq!(pacer.failures, 4, "the clock restarts after a drop");
+        let later = t0 + 2 * CONNECTION_PERSISTS;
+        pacer.observe_connections(later, true);
         assert_eq!(pacer.failures, 0);
+        assert_eq!(pacer.wait_until(later), None);
     }
 }
