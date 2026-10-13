@@ -60,6 +60,11 @@ const MAX_TRACKED_GATEWAYS: usize = 64;
 /// First wait after a bootstrap round that ended with no ring connection.
 const BOOTSTRAP_RETRY_BASE: Duration = Duration::from_secs(1);
 
+/// Lowest cap on the wait between failed rounds, whatever the transient TTL.
+/// A short TTL (tests, or a misconfiguration) must not turn a total gateway
+/// outage into a retry every few seconds.
+const BOOTSTRAP_RETRY_CAP_FLOOR: Duration = Duration::from_secs(30);
+
 /// Wait after a round that produced a ring connection, before another may
 /// start. A connection that drops at once (a churning acceptor) would
 /// otherwise let rounds run back to back.
@@ -270,7 +275,7 @@ impl BootstrapPacer {
         Self {
             backoff: ExponentialBackoff::new(
                 BOOTSTRAP_RETRY_BASE,
-                transient_ttl.max(BOOTSTRAP_RETRY_BASE),
+                transient_ttl.max(BOOTSTRAP_RETRY_CAP_FLOOR),
             ),
             failures: 0,
             next_allowed: None,
@@ -656,6 +661,22 @@ mod tests {
         assert!(
             pacer.lock().take_owned_reservations().is_empty(),
             "taken once, then forgotten"
+        );
+    }
+
+    #[test]
+    fn a_short_transient_ttl_does_not_lower_the_backoff_cap() {
+        let mut pacer = BootstrapPacer::new(Duration::from_secs(2));
+        let now = Instant::now();
+        for _ in 0..10 {
+            pacer.next_allowed = None;
+            assert!(pacer.try_begin(now));
+            pacer.end(now, true, false);
+        }
+        let wait = pacer.wait_until(now).unwrap() - now;
+        assert!(
+            wait >= BOOTSTRAP_RETRY_CAP_FLOOR.mul_f64(0.8),
+            "a 2 s TTL capped the backoff at {wait:?}"
         );
     }
 
