@@ -328,15 +328,19 @@ async fn drive_client_connect_inner(
     // A CONNECT sent with no ring connection ends once nothing more is
     // coming, instead of waiting for `target_connections` acceptors that one
     // CONNECT never collects (#5858). Decided once, for this transaction.
-    let mut round = BootstrapRound::new(
-        kind == ClientConnectKind::Standard
-            && op_manager.ring.connection_manager.connection_count() == 0,
-        Instant::now(),
-    );
-    // Acceptors are dialled concurrently (bounded), so one unreachable
-    // acceptor cannot hold the next one past its hole-punch window (#5858).
+    let bootstrapping = kind == ClientConnectKind::Standard
+        && op_manager.ring.connection_manager.connection_count() == 0;
+    let mut round = BootstrapRound::new(bootstrapping, Instant::now());
+    // While bootstrapping, acceptors are dialled concurrently (bounded), so
+    // one unreachable acceptor cannot hold the next one past its hole-punch
+    // window (#5858). A peer that already has a connection keeps dialling
+    // one at a time, as before.
     let mut dial_queue: AcceptorDialQueue<PeerKeyLocation> =
-        AcceptorDialQueue::new(MAX_CONCURRENT_ACCEPTOR_DIALS);
+        AcceptorDialQueue::new(if bootstrapping {
+            MAX_CONCURRENT_ACCEPTOR_DIALS
+        } else {
+            1
+        });
     let mut dials = FuturesUnordered::new();
 
     loop {
