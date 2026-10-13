@@ -2578,7 +2578,7 @@ mod tests {
                     if matches!(
                         msg,
                         crate::message::NetMessage::V1(crate::message::NetMessageV1::Connect(
-                            ConnectMsg::Request { .. } | ConnectMsg::RequestWithNeed { .. }
+                            ConnectMsg::Request { .. }
                         ))
                     ) {
                         targets.push(target);
@@ -2669,7 +2669,7 @@ mod tests {
                     if matches!(
                         msg,
                         crate::message::NetMessage::V1(crate::message::NetMessageV1::Connect(
-                            ConnectMsg::Request { .. } | ConnectMsg::RequestWithNeed { .. }
+                            ConnectMsg::Request { .. }
                         ))
                     ) {
                         requests.push(start.elapsed());
