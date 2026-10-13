@@ -2535,7 +2535,7 @@ mod driver_timing_tests {
                             shared.lock().connect_failed.push(failed_acceptor_addr);
                         }
                     }
-                    _ => {}
+                    Either::Left(_) | Either::Right(_) => {}
                 }
             }
         });

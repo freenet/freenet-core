@@ -2371,7 +2371,12 @@ impl P2pConnManager {
                                     );
                                 }
                                 // The sender waits on this with a timeout.
-                                let _ = done.try_send(());
+                                if done.try_send(()).is_err() {
+                                    tracing::debug!(
+                                        peer_addr = %addr,
+                                        "Stale gateway link handled after its sender stopped waiting"
+                                    );
+                                }
                             }
                             NodeEvent::DropAllConnections => {
                                 let all_addrs: Vec<SocketAddr> =
