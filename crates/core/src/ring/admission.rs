@@ -643,7 +643,17 @@ impl ProvisionalLinks {
             return Err(SlotRefusal::LocationTaken);
         }
         self.refill(now);
-        if self.tokens < 1.0 {
+        // A low-priority requester must leave a token for each slot kept for
+        // the isolated, or the bucket (not the slots) would be what runs out
+        // for them: one shared bucket, with the reserve enforced on both of
+        // its limits, rather than per-class buckets that would double the
+        // admission rate.
+        let tokens_needed = if high_priority {
+            1.0
+        } else {
+            1.0 + ONBOARDING_SLOTS_KEPT_FOR_ISOLATED as f64
+        };
+        if self.tokens < tokens_needed {
             return Err(SlotRefusal::RateLimited);
         }
         self.tokens -= 1.0;
@@ -815,6 +825,24 @@ mod tests {
         assert!(onboarding_high_priority(0, 25));
         assert!(onboarding_high_priority(6, 25));
         assert!(!onboarding_high_priority(7, 25));
+    }
+
+    /// The isolated reserve applies to the token bucket too: with one token
+    /// left, a low-priority requester is refused and a nearly isolated one is
+    /// admitted.
+    #[test]
+    fn low_priority_requesters_leave_a_token_for_the_isolated() {
+        let start = Instant::now();
+        let mut slots = ProvisionalLinks::new(2);
+        // Drain one token with a slot that is then freed (no refund).
+        assert_eq!(slots.try_reserve(addr(1), loc(0.1), true, start), Ok(()));
+        assert!(slots.release(addr(1)));
+        assert_eq!(
+            slots.try_reserve(addr(2), loc(0.2), false, start),
+            Err(SlotRefusal::RateLimited),
+            "the last token is kept for the isolated"
+        );
+        assert_eq!(slots.try_reserve(addr(3), loc(0.3), true, start), Ok(()));
     }
 
     #[test]
