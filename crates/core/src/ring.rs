@@ -6593,6 +6593,7 @@ impl Ring {
                             round.own_reservation(addr);
                         }
                         let op_manager = op_manager.clone();
+                        let shutdown = self.shutdown.clone();
                         GlobalExecutor::spawn(async move {
                             use futures::StreamExt;
                             // Move the whole guard in: a disjoint capture of
@@ -6612,21 +6613,23 @@ impl Ring {
                                     )
                                 })
                                 .collect();
-                            joins
-                                .for_each(|(res, gw)| async move {
-                                    match res {
-                                        Ok(()) => tracing::debug!(
-                                            gateway = %gw,
-                                            "Gateway bootstrap initiated"
-                                        ),
-                                        Err(e) => tracing::warn!(
-                                            gateway = %gw,
-                                            error = %e,
-                                            "Gateway bootstrap failed"
-                                        ),
-                                    }
-                                })
-                                .await;
+                            let joins = joins.for_each(|(res, gw)| async move {
+                                match res {
+                                    Ok(()) => tracing::debug!(
+                                        gateway = %gw,
+                                        "Gateway bootstrap initiated"
+                                    ),
+                                    Err(e) => tracing::warn!(
+                                        gateway = %gw,
+                                        error = %e,
+                                        "Gateway bootstrap failed"
+                                    ),
+                                }
+                            });
+                            // Ends with the node rather than outliving it.
+                            if sleep_or_shutdown(&shutdown, joins).await {
+                                return;
+                            }
                             round.connected = op_manager.ring.open_connections() > 0;
                         });
                     }
