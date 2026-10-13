@@ -571,6 +571,9 @@ async fn drive_client_connect_inner(
                 }
 
                 connected_dials += 1;
+                if bootstrapping {
+                    op_manager.bootstrap_pacer.lock().note_connected();
+                }
                 if connected_dials >= target_connections {
                     // INVARIANT (mirrors legacy JoinerState::register_acceptance
                     // at connect.rs:1352-1359): if the joiner started without
