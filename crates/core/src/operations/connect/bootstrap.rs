@@ -15,6 +15,14 @@
 //! - [`BootstrapPacer`]: the join loop and the maintenance loop share one
 //!   pacer, so at most one bootstrap round runs at a time and failed rounds
 //!   are spaced by a jittered exponential backoff.
+//!
+//! Retry rate when no gateway answers at all: a round lasts the NAT
+//! traversal deadline plus the pre-dial quiet window (3 + 12 s), then waits
+//! 1, 2, 4, 8, 16 s and from then on 30 s (each +-20%). Rounds start at about
+//! 0, 16, 33, 52, 75, 106 and 151 s, then every ~45 s: five rounds in the
+//! first 100 s where the TTL-bound loop managed two, and about 1.4x its
+//! steady rate (one round per ~62 s) after that. Each round sends one CONNECT
+//! per eligible gateway, as before.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
