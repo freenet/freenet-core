@@ -214,7 +214,7 @@ need-unknown and takes the self-interest path alone):
 
 **Code reference:** `crates/core/src/topology.rs` (module docs, `adjust_topology`),
 `crates/core/src/topology/small_world_rand.rs`, `crates/core/src/ring/connection_manager.rs`
-(`should_accept`, `evaluate_admission`, `review_provisional_links`),
+(`should_accept`, `evaluate_admission_at`, `review_provisional_links`),
 `crates/core/src/ring/admission.rs`
 
 ### Where CONNECT Requests Are Accepted

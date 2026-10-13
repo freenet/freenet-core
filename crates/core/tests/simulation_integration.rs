@@ -18457,37 +18457,6 @@ fn test_every_hop_summarize_calls_flat_vs_fanout() {
     );
 }
 
-/// **#5161 end to end, through the real handshake, with its own controls.**
-///
-/// A regular node connects to a gateway. Before this fix, its side of that link
-/// carried no version at all: the version rides in the asymmetrically-encrypted
-/// intro packet, only the RECEIVING side of an intro learns it, and a gateway
-/// never sends one back — it replies with an `AckConnection` that has no version
-/// field. So `remote_version` was `None` for every gateway link a node held, and
-/// every `version_supports_*` gate fell back to the legacy wire format on
-/// exactly the highest-degree, highest-traffic links on the network.
-///
-/// Three simulations, run in one test so the claims are measured differences
-/// rather than assertions against a remembered baseline a later edit could
-/// quietly invalidate. They differ only in their two floor overrides (and in
-/// network name, which the harness requires to be unique):
-///
-/// - **control** — gate off. Reproduces the pre-fix behaviour exactly. Without
-///   this arm the enabled arm could pass on a harness that populated versions
-///   by some other route, and would never have failed against the bug.
-/// - **enabled** — gate on. The node records the gateway's *exact* version, and
-///   `supports_hash_first_summaries` is true for that link.
-/// - **enabled, hash-first floor unreachable** — the arm that stops the
-///   hash-first assertion from being a restatement. With the sim's default
-///   hash-first floor of `(0,0,0)`, `supports_hash_first_summaries` reduces
-///   algebraically to `remote_version.is_some()`, so asserting it alongside
-///   `is_some()` carries no independent information (a reviewer caught this).
-///   Pinning that floor out of reach makes the two disagree: the version is
-///   known and the gate is still false, which is what proves the gate composes
-///   version AND floor rather than merely echoing the version.
-///
-/// The ack gate is opt-in per simulation rather than a suite-wide default; see
-/// `SimNetwork::enable_gateway_ack_version` for why, and for what that costs.
 /// #5858 end to end over the real transport: with the CONNECT need gate open
 /// (`enable_connect_need`) and both directions of every link knowing the
 /// remote's version, as in production (`enable_gateway_ack_version`), short
@@ -18547,6 +18516,37 @@ fn test_connect_need_admits_short_joiners_from_onboarding_slots() {
     );
 }
 
+/// **#5161 end to end, through the real handshake, with its own controls.**
+///
+/// A regular node connects to a gateway. Before this fix, its side of that link
+/// carried no version at all: the version rides in the asymmetrically-encrypted
+/// intro packet, only the RECEIVING side of an intro learns it, and a gateway
+/// never sends one back — it replies with an `AckConnection` that has no version
+/// field. So `remote_version` was `None` for every gateway link a node held, and
+/// every `version_supports_*` gate fell back to the legacy wire format on
+/// exactly the highest-degree, highest-traffic links on the network.
+///
+/// Three simulations, run in one test so the claims are measured differences
+/// rather than assertions against a remembered baseline a later edit could
+/// quietly invalidate. They differ only in their two floor overrides (and in
+/// network name, which the harness requires to be unique):
+///
+/// - **control** — gate off. Reproduces the pre-fix behaviour exactly. Without
+///   this arm the enabled arm could pass on a harness that populated versions
+///   by some other route, and would never have failed against the bug.
+/// - **enabled** — gate on. The node records the gateway's *exact* version, and
+///   `supports_hash_first_summaries` is true for that link.
+/// - **enabled, hash-first floor unreachable** — the arm that stops the
+///   hash-first assertion from being a restatement. With the sim's default
+///   hash-first floor of `(0,0,0)`, `supports_hash_first_summaries` reduces
+///   algebraically to `remote_version.is_some()`, so asserting it alongside
+///   `is_some()` carries no independent information (a reviewer caught this).
+///   Pinning that floor out of reach makes the two disagree: the version is
+///   known and the gate is still false, which is what proves the gate composes
+///   version AND floor rather than merely echoing the version.
+///
+/// The ack gate is opt-in per simulation rather than a suite-wide default; see
+/// `SimNetwork::enable_gateway_ack_version` for why, and for what that costs.
 #[test_log::test]
 fn test_joiner_records_gateway_version_through_sim_handshake() {
     use freenet::dev_tool::NodeLabel;

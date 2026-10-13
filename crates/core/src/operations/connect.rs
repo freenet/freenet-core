@@ -79,8 +79,9 @@
 //! A requester may also state its need (`ConnectMsg::RequestWithNeed`, #5858, sent only to
 //! peers whose version decodes it): a requester short of connections is admitted from a
 //! small per-acceptor onboarding budget that bypasses the evaluator window, and a
-//! well-connected one states a bar that an acceptor must beat. See `ring::admission` and
-//! `ConnectionManager::evaluate_admission`.
+//! well-connected one sends a bar (the bar is sent but not enforced,
+//! `ENFORCE_REQUESTER_BAR`). See `ring::admission` and
+//! `ConnectionManager::evaluate_admission_at`.
 //!
 //! ## Routing
 //!

@@ -521,7 +521,7 @@ pub struct NodeConfig {
     /// Test-only override for the CONNECT need version floor
     /// ([`CONNECT_NEED_MIN_VERSION`], #5858), consulted as
     /// `connect_need_floor_override.unwrap_or(CONNECT_NEED_MIN_VERSION)` by
-    /// `ConnectionManager::supports_connect_need`.
+    /// `ConnectionManager::hop_version_supports_connect_need`.
     ///
     /// In production this is `None` → the real floor. Simulations default it
     /// OFF, like `broadcast_target_list_floor_override`: opening the gate

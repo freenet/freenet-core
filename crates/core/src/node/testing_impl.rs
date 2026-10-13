@@ -475,11 +475,6 @@ fn fault_injection_delivery_decision(
     PacketDeliveryDecision::Deliver
 }
 
-/// Result of a controlled simulation, including topology snapshots.
-///
-/// This struct captures the simulation result along with topology snapshots
-/// taken at the end of the simulation (before cleanup). This allows tests
-/// to validate subscription topology after the simulation completes.
 /// Network-wide CONNECT admission counters (#5858), see
 /// [`ControlledSimulationResult::connect_admission_totals`].
 #[derive(Debug, Clone, Copy, Default)]
@@ -495,6 +490,11 @@ pub struct ConnectAdmissionTotals {
     pub provisional_in_use: u64,
 }
 
+/// Result of a controlled simulation, including topology snapshots.
+///
+/// This struct captures the simulation result along with topology snapshots
+/// taken at the end of the simulation (before cleanup). This allows tests
+/// to validate subscription topology after the simulation completes.
 pub struct ControlledSimulationResult {
     /// The Turmoil simulation result
     pub turmoil_result: turmoil::Result,
@@ -601,12 +601,6 @@ impl ControlledSimulationResult {
             .fold((0, 0), |(f, s), t| (f + t.failures, s + t.successes))
     }
 
-    /// The protocol version `label`'s node had recorded for the peer at `addr`
-    /// at the end of the run, or `None` if it never learned one (#5161).
-    ///
-    /// Reads the same `ConnectionManager` mirror the production emission gates
-    /// read, so it answers the question those gates ask rather than a proxy for
-    /// it. `None` when the node never published its Ring.
     /// CONNECT admission counters (#5858) summed over every node that published
     /// its Ring.
     pub fn connect_admission_totals(&self) -> ConnectAdmissionTotals {
@@ -621,6 +615,12 @@ impl ControlledSimulationResult {
         totals
     }
 
+    /// The protocol version `label`'s node had recorded for the peer at `addr`
+    /// at the end of the run, or `None` if it never learned one (#5161).
+    ///
+    /// Reads the same `ConnectionManager` mirror the production emission gates
+    /// read, so it answers the question those gates ask rather than a proxy for
+    /// it. `None` when the node never published its Ring.
     pub fn node_recorded_remote_version(
         &self,
         label: &NodeLabel,

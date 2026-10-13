@@ -822,7 +822,7 @@ impl ConnectionManager {
     ///
     /// A request whose need is unknown: admitted through self-interest (and
     /// the lattice clause) exactly as before #5858. See
-    /// [`Self::evaluate_admission`].
+    /// [`Self::evaluate_admission_at`].
     pub fn should_accept(&self, location: Location, addr: SocketAddr) -> bool {
         self.evaluate_admission_at(location, addr, RequesterNeed::Unknown, None, Instant::now())
             .accepted()
