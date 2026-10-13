@@ -330,6 +330,13 @@ impl BootstrapPacer {
         self.silent_rounds.remove(&gateway);
     }
 
+    /// The gateway backoff was cleared (isolation recovery, suspend): the
+    /// next round may start at once. The failure count stays, so the round
+    /// after that is still spaced.
+    pub(crate) fn clear_wait(&mut self) {
+        self.next_allowed = None;
+    }
+
     /// When the next round may start, if it has to wait.
     pub(crate) fn wait_until(&self, now: Instant) -> Option<Instant> {
         self.next_allowed.filter(|t| *t > now)
@@ -661,6 +668,33 @@ mod tests {
         assert!(
             pacer.lock().take_owned_reservations().is_empty(),
             "taken once, then forgotten"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_cleared_gateway_backoff_lets_the_next_round_start_at_once() {
+        let pacer = Arc::new(Mutex::new(BootstrapPacer::new(Duration::from_secs(30))));
+        let cleared = tokio::sync::Notify::new();
+        for _ in 0..6 {
+            pacer.lock().next_allowed = None;
+            assert!(pacer.lock().try_begin(Instant::now()));
+            pacer.lock().end(Instant::now(), true, false);
+        }
+        assert!(pacer.lock().wait_until(Instant::now()).is_some());
+        let start = Instant::now();
+        let waiter = wait_for_bootstrap_round(&pacer, &cleared, || false);
+        let clear = async {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            // What `reset_all_backoff` does.
+            pacer.lock().clear_wait();
+            cleared.notify_waiters();
+        };
+        let (round, ()) = tokio::join!(waiter, clear);
+        assert!(round.is_some());
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "the round waited {:?} past the clear",
+            start.elapsed()
         );
     }
 
