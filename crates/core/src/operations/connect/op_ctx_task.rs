@@ -2424,9 +2424,14 @@ mod driver_timing_tests {
         held.abort();
     }
 
+    fn spawn_or_end(block: &str) -> usize {
+        block.find("GlobalExecutor::spawn(").unwrap_or(block.len())
+    }
+
     /// The maintenance loop's zero-connection bootstrap (#5858): it takes the
-    /// shared bootstrap round before acting, clears its own leftover gateway
-    /// reservations while holding it, and runs the joins in a spawned task.
+    /// shared bootstrap round before acting, clears only the leftover gateway
+    /// reservations of paced rounds while holding it, and runs the joins in a
+    /// spawned task.
     /// Awaited inline they held the maintenance loop for a transaction TTL;
     /// without the round it could run CONNECTs concurrently with
     /// `initial_join_procedure`. Source pin: the loop has no test harness of its
@@ -2456,8 +2461,18 @@ mod driver_timing_tests {
             .find("BootstrapRoundGuard::try_begin(&op_manager.bootstrap_pacer,")
             .expect("the bootstrap must take the shared round");
         let clear = block
-            .find("clear_pending_reservations_for(&gateway_addrs)")
+            .find("clear_pending_reservations_for(&owned)")
             .expect("the bootstrap must clear its leftover gateway reservations");
+        assert!(
+            block[..spawn_or_end(block)]
+                .contains("letowned=op_manager.bootstrap_pacer.lock().take_owned_reservations();"),
+            "only reservations owned by paced rounds may be cleared"
+        );
+        assert!(
+            !block[..spawn_or_end(block)]
+                .contains("clear_pending_reservations_for(&gateway_addrs)"),
+            "clearing every gateway reservation would cancel a live CONNECT"
+        );
         let spawn = block
             .find("GlobalExecutor::spawn(")
             .expect("the joins must run in a spawned task");

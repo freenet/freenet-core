@@ -16,7 +16,7 @@
 //!   pacer, so at most one bootstrap round runs at a time and failed rounds
 //!   are spaced by a jittered exponential backoff.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -247,6 +247,11 @@ pub(crate) struct BootstrapPacer {
     next_allowed: Option<Instant>,
     round_in_flight: bool,
     silent_rounds: HashMap<SocketAddr, u32>,
+    /// Gateways that paced rounds have sent CONNECTs through, so whatever
+    /// reservation they hold is a leftover of ours. A CONNECT sent outside a
+    /// round (with a ring connection) is not recorded: its reservation may
+    /// belong to a CONNECT still in flight.
+    owned_reservations: HashSet<SocketAddr>,
 }
 
 impl BootstrapPacer {
@@ -260,7 +265,14 @@ impl BootstrapPacer {
             next_allowed: None,
             round_in_flight: false,
             silent_rounds: HashMap::new(),
+            owned_reservations: HashSet::new(),
         }
+    }
+
+    /// Gateway reservations left by finished paced rounds, which the caller
+    /// may clear; forgets them.
+    pub(crate) fn take_owned_reservations(&mut self) -> Vec<SocketAddr> {
+        self.owned_reservations.drain().collect()
     }
 
     /// A bootstrapping CONNECT through `gateway` heard nothing. Returns true
@@ -342,6 +354,15 @@ impl BootstrapRoundGuard {
             issued: false,
             connected: false,
         })
+    }
+
+    /// This round is sending a CONNECT through `gateway`, so the reservation
+    /// it makes there is the round's own.
+    pub(crate) fn own_reservation(&self, gateway: SocketAddr) {
+        let mut pacer = self.pacer.lock();
+        if pacer.owned_reservations.len() < MAX_TRACKED_GATEWAYS {
+            pacer.owned_reservations.insert(gateway);
+        }
     }
 }
 
@@ -593,6 +614,21 @@ mod tests {
         assert!(!pacer.gateway_silent(other), "counts are per gateway");
         assert!(pacer.gateway_silent(gw), "two in a row redial");
         assert!(!pacer.gateway_silent(gw), "and the count starts over");
+    }
+
+    #[test]
+    fn only_reservations_of_paced_rounds_are_offered_for_clearing() {
+        let pacer = Arc::new(Mutex::new(BootstrapPacer::new(Duration::from_secs(30))));
+        let gw: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        assert!(pacer.lock().take_owned_reservations().is_empty());
+        let round = BootstrapRoundGuard::try_begin(&pacer, Instant::now()).unwrap();
+        round.own_reservation(gw);
+        drop(round);
+        assert_eq!(pacer.lock().take_owned_reservations(), vec![gw]);
+        assert!(
+            pacer.lock().take_owned_reservations().is_empty(),
+            "taken once, then forgotten"
+        );
     }
 
     #[test]
