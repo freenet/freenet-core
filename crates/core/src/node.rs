@@ -564,6 +564,18 @@ pub struct NodeConfig {
         Option<crate::util::time_source::DynTimeSource>,
 }
 
+/// True when the network listener is bound to loopback but at least one
+/// gateway is not, so every packet to that gateway fails (#5798).
+///
+/// Loopback-only test networks (every peer and gateway on `127.0.0.x`) are
+/// deliberate and stay silent.
+fn loopback_listener_with_remote_gateways(listener_ip: IpAddr, gateways: &[SocketAddr]) -> bool {
+    listener_ip.to_canonical().is_loopback()
+        && gateways
+            .iter()
+            .any(|gw| !gw.ip().to_canonical().is_loopback())
+}
+
 impl NodeConfig {
     /// This node's own peer id as a telemetry attribution string
     /// (public key + best-effort address). The address portion falls
@@ -626,6 +638,7 @@ impl NodeConfig {
         let own_pub_key = config.transport_keypair().public();
 
         let mut gateways = Vec::with_capacity(config.gateways.len());
+        let mut gateway_addrs = Vec::with_capacity(config.gateways.len());
         for gw in &config.gateways {
             let GatewayConfig {
                 address,
@@ -700,6 +713,7 @@ impl NodeConfig {
             }
 
             let address = Self::parse_socket_addr(address).await?;
+            gateway_addrs.push(address);
             let peer_key_location = PeerKeyLocation::new(transport_pub_key, address);
             let location = location
                 .map(Location::new)
@@ -711,6 +725,32 @@ impl NodeConfig {
             config.network_api.address,
             config.network_api.port
         );
+        // Reported here rather than in `ConfigArgs::build()`, which runs before
+        // the tracing subscriber exists (#5798).
+        let config_file = config.config_dir().join("config.toml");
+        if let Some(ignored) = config.network_api.dropped_persisted_loopback {
+            tracing::warn!(
+                ignored = %ignored,
+                network_address = %config.network_api.address,
+                config_file = %config_file.display(),
+                "Ignoring network-address {ignored} from config.toml: it was written by an \
+                 earlier `freenet local` run, and a network listener bound to loopback is \
+                 unreachable to every peer (#5798). Listening on {} instead; pass \
+                 --network-address to choose the address explicitly.",
+                config.network_api.address
+            );
+        }
+        if loopback_listener_with_remote_gateways(config.network_api.address, &gateway_addrs) {
+            tracing::warn!(
+                network_address = %config.network_api.address,
+                config_file = %config_file.display(),
+                "network-address {} is a loopback address, so this node can only exchange \
+                 packets with this machine and cannot reach its gateways. It will not join \
+                 the network. Remove network-address from config.toml, or pass \
+                 --network-address :: to listen on all interfaces.",
+                config.network_api.address
+            );
+        }
         if let Some(own_addr) = &config.peer_id {
             tracing::info!("Node external address: {}", own_addr.socket_addr());
         }
@@ -6352,6 +6392,32 @@ mod tests {
 
     use super::*;
     use rstest::rstest;
+
+    #[rstest]
+    // The #5798 shape: P2P socket on `::1`, gateways on the public internet.
+    #[case::v6_loopback_public_gateway("::1", &["5.9.111.215:31337"], true)]
+    #[case::v4_loopback_public_gateway("127.0.0.1", &["5.9.111.215:31337"], true)]
+    #[case::v4_mapped_loopback("::ffff:127.0.0.1", &["5.9.111.215:31337"], true)]
+    // One remote gateway is enough: it can never be reached.
+    #[case::mixed_gateways("::1", &["127.0.0.1:31337", "5.9.111.215:31337"], true)]
+    // Loopback-only test networks are deliberate.
+    #[case::all_loopback_gateways("127.0.0.1", &["127.0.0.2:31337", "[::1]:31338"], false)]
+    #[case::no_gateways("::1", &[], false)]
+    #[case::wildcard_listener("::", &["5.9.111.215:31337"], false)]
+    #[case::v4_wildcard_listener("0.0.0.0", &["5.9.111.215:31337"], false)]
+    #[case::lan_listener("192.168.1.19", &["5.9.111.215:31337"], false)]
+    fn loopback_listener_with_remote_gateways_5798(
+        #[case] listener: &str,
+        #[case] gateways: &[&str],
+        #[case] expected: bool,
+    ) {
+        let listener: IpAddr = listener.parse().unwrap();
+        let gateways: Vec<SocketAddr> = gateways.iter().map(|g| g.parse().unwrap()).collect();
+        assert_eq!(
+            loopback_listener_with_remote_gateways(listener, &gateways),
+            expected
+        );
+    }
 
     /// Strip `//` comment lines from a source window before asserting on it.
     ///

@@ -842,6 +842,9 @@ impl ConfigArgs {
         // actually narrowed. Also carries the address FAMILY forward, which the
         // re-derivation must not change. See the merge site.
         let mut dropped_persisted_wildcard: Option<IpAddr> = None;
+        // Set when the merge below discards a loopback `network-address` that
+        // Local mode wrote (#5798). Carries the address family forward.
+        let mut dropped_persisted_network_loopback: Option<IpAddr> = None;
 
         // Captured BEFORE the merge below, because the merge folds a PERSISTED
         // `allowed-source-cidrs` back into `self` and `build()` then persists
@@ -923,9 +926,33 @@ impl ConfigArgs {
             self.ws_api
                 .per_user_export_min_interval_secs
                 .get_or_insert(cfg.ws_api.per_user_export_min_interval_secs);
-            self.network_api
-                .address
-                .get_or_insert(cfg.network_api.address);
+            // #5798: `freenet local` used to persist its loopback default as
+            // `network-address`, and local and network mode share this file, so
+            // every later `freenet network` boot inherited it and bound the P2P
+            // socket where no peer can reach it. Each network boot then
+            // rewrote the file with `mode = "network"`, so by now the file's
+            // mode cannot say who wrote the address; only the value can. The
+            // two loopbacks Local mode has ever written are therefore treated
+            // as re-derivable for a non-gateway network node, like
+            // `is_auto_derivable_ws_api_address` above. A flag or env value
+            // still wins, and gateways keep theirs (Local mode never wrote a
+            // gateway's config; loopback test gateways are deliberate).
+            // Accepted edge: an operator who hand-wrote exactly `::1` or
+            // `127.0.0.1` into config.toml for a non-gateway is re-derived too;
+            // the remedy is `--network-address`, and the startup warning in
+            // `NodeConfig::new` names the value it ignored.
+            let persisted_network_address = cfg.network_api.address;
+            let rederive = self.network_api.address.is_none()
+                && self.mode.unwrap_or(OperationMode::Network) == OperationMode::Network
+                && !(self.network_api.is_gateway || cfg.is_gateway)
+                && is_local_mode_default_network_address(persisted_network_address);
+            if rederive {
+                dropped_persisted_network_loopback = Some(persisted_network_address);
+            } else {
+                self.network_api
+                    .address
+                    .get_or_insert(persisted_network_address);
+            }
             self.network_api
                 .network_port
                 .get_or_insert(cfg.network_api.port);
@@ -1430,9 +1457,14 @@ impl ConfigArgs {
             mode,
             peer_id,
             network_api: NetworkApiConfig {
-                address: self.network_api.address.unwrap_or_else(|| match mode {
-                    OperationMode::Local => default_local_address(),
-                    OperationMode::Network => default_listening_address(),
+                // The same default in both modes: Local mode never binds the
+                // P2P socket, so its value only ever reached config.toml, where
+                // the next network boot read it back (#5798).
+                address: self.network_api.address.unwrap_or_else(|| {
+                    match dropped_persisted_network_loopback {
+                        Some(IpAddr::V4(_)) => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+                        _ => default_listening_address(),
+                    }
                 }),
                 port: self
                     .network_api
@@ -1483,7 +1515,7 @@ impl ConfigArgs {
                     .unwrap_or_else(default_congestion_control),
                 bbr_startup_rate: self.network_api.bbr_startup_rate,
                 skip_load_from_network: self.network_api.skip_load_from_network,
-                dropped_persisted_loopback: None,
+                dropped_persisted_loopback: dropped_persisted_network_loopback,
             },
             ws_api: WebsocketApiConfig {
                 address: ws_api_address,
@@ -3551,6 +3583,19 @@ fn is_auto_derivable_ws_api_address(addr: IpAddr) -> bool {
     match addr {
         IpAddr::V4(v4) => v4 == Ipv4Addr::UNSPECIFIED || v4 == Ipv4Addr::LOCALHOST,
         IpAddr::V6(v6) => v6 == Ipv6Addr::UNSPECIFIED || v6 == Ipv6Addr::LOCALHOST,
+    }
+}
+
+/// True for a `network-address` that `freenet local` has itself written into
+/// the shared `config.toml`: `127.0.0.1` in early releases, `::1` later (#5798).
+///
+/// Enumerated exactly, like [`is_auto_derivable_ws_api_address`], so any other
+/// loopback address (`127.0.0.5`, a per-service alias) is an operator's choice
+/// and is kept.
+fn is_local_mode_default_network_address(addr: IpAddr) -> bool {
+    match addr {
+        IpAddr::V4(v4) => v4 == Ipv4Addr::LOCALHOST,
+        IpAddr::V6(v6) => v6 == Ipv6Addr::LOCALHOST,
     }
 }
 
