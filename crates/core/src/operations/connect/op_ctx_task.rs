@@ -335,7 +335,9 @@ async fn drive_client_connect_inner(
     use futures::stream::FuturesUnordered;
     use std::collections::HashSet;
 
-    use super::bootstrap::{AcceptorDialQueue, BootstrapRound, MAX_CONCURRENT_ACCEPTOR_DIALS};
+    use super::bootstrap::{
+        AcceptorDialQueue, BootstrapRound, BootstrapTiming, MAX_CONCURRENT_ACCEPTOR_DIALS,
+    };
 
     let mut accepted: HashSet<PeerKeyLocation> = HashSet::with_capacity(target_connections);
     // Acceptors actually connected. `accepted` also holds acceptors still
@@ -346,7 +348,7 @@ async fn drive_client_connect_inner(
     // CONNECT never collects (#5858). Decided once, for this transaction.
     let bootstrapping = kind == ClientConnectKind::Standard
         && op_manager.ring.connection_manager.connection_count() == 0;
-    let mut round = BootstrapRound::new(bootstrapping, Instant::now());
+    let mut round = BootstrapRound::new(bootstrapping, Instant::now(), BootstrapTiming::default());
     // While bootstrapping, acceptors are dialled concurrently (bounded), so
     // one unreachable acceptor cannot hold the next one past its hole-punch
     // window (#5858). A peer that already has a connection keeps dialling
@@ -368,6 +370,12 @@ async fn drive_client_connect_inner(
                 "connect driver: transaction timed out; exiting"
             );
             return Ok(ClientConnectEnd::Finished);
+        }
+        if bootstrapping && !round.link_up() {
+            let cm = &op_manager.ring.connection_manager;
+            if cm.is_transient(gateway_addr) || cm.is_in_ring(gateway_addr) {
+                round.on_link_up(Instant::now());
+            }
         }
         if let Some(exit) = round.exit(Instant::now(), dial_queue.busy()) {
             tracing::info!(
@@ -2053,7 +2061,7 @@ mod driver_timing_tests {
     use super::{ClientConnectEnd, ClientConnectKind, drive_client_connect_inner};
     use crate::message::{NetMessage, NetMessageV1, NodeEvent, Transaction};
     use crate::node::{OpManager, WaiterReply};
-    use crate::operations::connect::bootstrap::{BOOTSTRAP_REPLY_QUIET, BootstrapExit};
+    use crate::operations::connect::bootstrap::{BootstrapExit, BootstrapTiming};
     use crate::operations::connect::{ConnectMsg, ConnectResponse};
     use crate::ring::{Location, PeerKeyLocation};
     use crate::transport::TransportKeypair;
@@ -2247,7 +2255,10 @@ mod driver_timing_tests {
             end.expect("driver result"),
             ClientConnectEnd::Bootstrap(BootstrapExit::AllFailed)
         );
-        assert!(started.elapsed() <= BOOTSTRAP_REPLY_QUIET + Duration::from_secs(1));
+        assert!(
+            started.elapsed()
+                <= BootstrapTiming::default().before_first_dial + Duration::from_secs(1)
+        );
         drop(replies_tx);
     }
 
