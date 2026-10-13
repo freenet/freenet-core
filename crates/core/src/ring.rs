@@ -6326,6 +6326,9 @@ impl Ring {
             let reset_all_backoff = || {
                 self.reset_all_connection_backoff();
                 op_manager.gateway_backoff.lock().clear();
+                // The bootstrap pacer's wait too, or the woken join loop would
+                // go straight back to sleep on it (#5858).
+                op_manager.bootstrap_pacer.lock().clear_wait();
                 op_manager.gateway_backoff_cleared.notify_waiters();
                 // Also clear stale pending reservations for gateways — without this,
                 // gateways appear "connected/pending" via has_connection_or_pending()
