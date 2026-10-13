@@ -2114,12 +2114,12 @@ impl Config {
                 network_address = %self.network_api.address,
                 config_file = %self.config_dir().join("config.toml").display(),
                 "Ignoring network-address {ignored} from config.toml: a network listener \
-                 bound to loopback cannot reach the public gateways (#5798). Older \
-                 `freenet local` runs wrote this value; it may also come from a hand edit \
-                 or an earlier --network-address flag. Will listen on {} instead. To keep \
-                 a loopback address on a local or test network, pass both \
-                 --skip-load-from-network and --network-address (or set NETWORK_ADDRESS) \
-                 on every start.",
+                 bound to loopback cannot reach the public gateways (#5798). The value may \
+                 have been written by an older `freenet local` run, a hand edit or an \
+                 earlier --network-address flag. Will listen on {} instead. To keep a \
+                 loopback address on a local or test network, pass --network-address (or \
+                 set NETWORK_ADDRESS) together with --skip-load-from-network, which is \
+                 remembered once set.",
                 self.network_api.address
             );
         }
@@ -11230,7 +11230,7 @@ shutdown-drain-secs = 42
                  runs before set_logger",
             ),
             (
-                "merge_pre_subcommand_ws_api_args(",
+                "merge_pre_subcommand_args(",
                 "flags placed before the subcommand would be silently discarded, \
                  leaving the node loopback-only against the operator's intent",
             ),
@@ -11243,11 +11243,9 @@ shutdown-drain-secs = 42
         // The merge must run for BOTH subcommands, not just whichever one a
         // refactor happened to keep.
         assert_eq!(
-            main_body
-                .matches("merge_pre_subcommand_ws_api_args(")
-                .count(),
+            main_body.matches("merge_pre_subcommand_args(").count(),
             2,
-            "merge_pre_subcommand_ws_api_args must be called from the Network arm \
+            "merge_pre_subcommand_args must be called from the Network arm \
              AND the Local arm"
         );
     }

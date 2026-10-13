@@ -1510,9 +1510,8 @@ fn run_node(config_args: ConfigArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Carry the client-API exposure flags, and the flags that decide the
-/// overlay's bind (`--network-address`, `--is-gateway`,
-/// `--skip-load-from-network`), across the subcommand boundary.
+/// Carry the client-API exposure flags and the peer-setup flags across the
+/// subcommand boundary.
 ///
 /// `--ws-api-address` / `--allowed-host` / `--allowed-source-cidrs` placed
 /// BEFORE the subcommand (`freenet --ws-api-address :: network`) land in the
@@ -1525,22 +1524,38 @@ fn run_node(config_args: ConfigArgs) -> anyhow::Result<()> {
 /// while the operator believes they opted out. Previously the same typo was
 /// harmless, because network mode bound `::` either way.
 ///
-/// The network flags get the same treatment (#5798): a persisted loopback
-/// address is re-derived unless this boot passes `--network-address`, or marks
-/// the node a gateway or part of a local network. Dropping any of them before
-/// the subcommand would discard the operator's explicit choice and then widen
-/// their bind. The two booleans can only switch ON, like
-/// `--disable-auto-update`.
+/// The peer-setup flags (bind address and port, public address and port,
+/// `--is-gateway`, `--skip-load-from-network`, `--gateway`, `--location`,
+/// `--transport-keypair`) get
+/// the same treatment (#5798). A persisted loopback address is re-derived
+/// unless this boot passes `--network-address` or marks the node a gateway or
+/// part of a local network, so dropping any of those would discard the
+/// operator's choice and widen their bind. They are carried as a group because
+/// they only make sense together: a gateway needs its public address, port
+/// and identity, and a local network needs its `--gateway` list. The booleans can only
+/// switch ON, like `--disable-auto-update`.
 ///
 /// The subcommand's own value wins; the top-level one only fills a gap. An
 /// env-bound value (`NETWORK_ADDRESS`, `FREENET_WS_API_ADDRESS`, ...) counts as
 /// the subcommand's own, because clap reads it at both levels, so it beats a
 /// flag placed before the subcommand.
-fn merge_pre_subcommand_ws_api_args(config: &mut ConfigArgs, top_level: &ConfigArgs) {
+fn merge_pre_subcommand_args(config: &mut ConfigArgs, top_level: &ConfigArgs) {
     config.ws_api.address = config.ws_api.address.or(top_level.ws_api.address);
-    config.network_api.address = config.network_api.address.or(top_level.network_api.address);
-    config.network_api.is_gateway |= top_level.network_api.is_gateway;
-    config.network_api.skip_load_from_network |= top_level.network_api.skip_load_from_network;
+    let (net, top) = (&mut config.network_api, &top_level.network_api);
+    net.address = net.address.or(top.address);
+    net.network_port = net.network_port.or(top.network_port);
+    net.public_address = net.public_address.or(top.public_address);
+    net.public_port = net.public_port.or(top.public_port);
+    net.location = net.location.or(top.location);
+    net.gateway = net.gateway.take().or_else(|| top.gateway.clone());
+    net.gateways = net.gateways.take().or_else(|| top.gateways.clone());
+    net.is_gateway |= top.is_gateway;
+    net.skip_load_from_network |= top.skip_load_from_network;
+    config.secrets.transport_keypair = config
+        .secrets
+        .transport_keypair
+        .take()
+        .or_else(|| top_level.secrets.transport_keypair.clone());
     config.ws_api.allowed_host = config
         .ws_api
         .allowed_host
@@ -1608,13 +1623,13 @@ fn freenet_main() -> anyhow::Result<()> {
             // opt-out leaves the from-source node auto-updating (the exact loop
             // we are preventing).
             config.disable_auto_update |= cli.config.disable_auto_update;
-            merge_pre_subcommand_ws_api_args(&mut config, &cli.config);
+            merge_pre_subcommand_args(&mut config, &cli.config);
             run_node(config)
         }
         Some(Command::Local { mut config }) => {
             config.mode = Some(OperationMode::Local);
             config.disable_auto_update |= cli.config.disable_auto_update;
-            merge_pre_subcommand_ws_api_args(&mut config, &cli.config);
+            merge_pre_subcommand_args(&mut config, &cli.config);
             run_node(config)
         }
         None => {
@@ -2183,7 +2198,7 @@ mod tests {
     /// loopback-only while the operator believes they widened it.
     #[test]
     fn ws_api_exposure_flags_are_honored_before_the_subcommand() {
-        use super::{Cli, Command, merge_pre_subcommand_ws_api_args};
+        use super::{Cli, Command, merge_pre_subcommand_args};
         use clap::Parser;
         for argv in [
             vec![
@@ -2212,7 +2227,7 @@ mod tests {
                 Some(Command::Network { config }) => config,
                 _ => panic!("expected network subcommand"),
             };
-            merge_pre_subcommand_ws_api_args(&mut config, &cli.config);
+            merge_pre_subcommand_args(&mut config, &cli.config);
             assert_eq!(
                 config.ws_api.address,
                 Some("::".parse().unwrap()),
@@ -2236,15 +2251,16 @@ mod tests {
     /// loopback address the operator just asked for.
     #[test]
     fn network_address_is_honored_before_the_subcommand() {
-        use super::{Cli, Command, merge_pre_subcommand_ws_api_args};
-        use clap::Parser;
+        use super::{Cli, Command, merge_pre_subcommand_args};
         // clap reads NETWORK_ADDRESS at both levels, and an env value beats a
-        // pre-subcommand flag, so this test needs it unset. Fail loudly rather
-        // than with a confusing address mismatch.
-        assert!(
-            std::env::var_os("NETWORK_ADDRESS").is_none(),
-            "unset NETWORK_ADDRESS to run this test"
-        );
+        // pre-subcommand flag. Strip the env binding from this parser so the
+        // caller's environment cannot decide the outcome.
+        let parse = |argv: &[&str]| -> Cli {
+            use clap::{CommandFactory, FromArgMatches};
+            let strip = |cmd: clap::Command| cmd.mut_arg("network_address", |a| a.env(None));
+            let cmd = strip(Cli::command()).mut_subcommand("network", strip);
+            Cli::from_arg_matches(&cmd.try_get_matches_from(argv).expect("parse")).expect("matches")
+        };
         for (argv, expected) in [
             (
                 vec!["freenet", "--network-address", "::1", "network"],
@@ -2266,12 +2282,12 @@ mod tests {
                 "127.0.0.1",
             ),
         ] {
-            let cli = Cli::try_parse_from(&argv).expect("parse");
+            let cli = parse(&argv);
             let mut config = match cli.command {
                 Some(Command::Network { config }) => config,
                 _ => panic!("expected network subcommand"),
             };
-            merge_pre_subcommand_ws_api_args(&mut config, &cli.config);
+            merge_pre_subcommand_args(&mut config, &cli.config);
             assert_eq!(
                 config.network_api.address,
                 Some(expected.parse().unwrap()),
@@ -2280,42 +2296,91 @@ mod tests {
         }
     }
 
-    /// #5798: the two flags that exempt a persisted loopback address from
+    /// #5798: the flags that exempt a persisted loopback address from
     /// re-derivation must survive before the subcommand too, or following the
-    /// startup warning's own advice would still widen the bind.
+    /// startup warning's own advice would still widen the bind. Each one is
+    /// checked alone, so a merge that cross-wires them fails.
     #[test]
     fn exemption_flags_are_honored_before_the_subcommand() {
-        use super::{Cli, Command, merge_pre_subcommand_ws_api_args};
+        use super::{Cli, Command, merge_pre_subcommand_args};
         use clap::Parser;
-        for argv in [
-            vec![
-                "freenet",
-                "--is-gateway",
-                "--skip-load-from-network",
-                "network",
-            ],
-            vec![
-                "freenet",
-                "network",
-                "--is-gateway",
-                "--skip-load-from-network",
-            ],
+        for (argv, gateway, skip) in [
+            (vec!["freenet", "--is-gateway", "network"], true, false),
+            (
+                vec!["freenet", "--skip-load-from-network", "network"],
+                false,
+                true,
+            ),
+            (vec!["freenet", "network", "--is-gateway"], true, false),
+            (
+                vec!["freenet", "network", "--skip-load-from-network"],
+                false,
+                true,
+            ),
+            (vec!["freenet", "network"], false, false),
         ] {
             let cli = Cli::try_parse_from(&argv).expect("parse");
             let mut config = match cli.command {
                 Some(Command::Network { config }) => config,
                 _ => panic!("expected network subcommand"),
             };
-            merge_pre_subcommand_ws_api_args(&mut config, &cli.config);
-            assert!(config.network_api.is_gateway, "{argv:?}");
-            assert!(config.network_api.skip_load_from_network, "{argv:?}");
+            merge_pre_subcommand_args(&mut config, &cli.config);
+            assert_eq!(config.network_api.is_gateway, gateway, "{argv:?}");
+            assert_eq!(config.network_api.skip_load_from_network, skip, "{argv:?}");
         }
+    }
+
+    /// The flags an exemption depends on travel with it: a gateway named
+    /// before the subcommand must keep its public address and port (or
+    /// `validate()` refuses to boot it), and a local network keeps its
+    /// `--gateway` list (or it silently starts isolated).
+    #[test]
+    fn peer_setup_flags_are_honored_before_the_subcommand() {
+        use super::{Cli, Command, merge_pre_subcommand_args};
+        use clap::Parser;
+        let cli = Cli::try_parse_from([
+            "freenet",
+            "--is-gateway",
+            "--public-network-address",
+            "203.0.113.7",
+            "--public-network-port",
+            "31337",
+            "--network-port",
+            "31338",
+            "--gateway",
+            "gw.example:31337",
+            "--location",
+            "0.25",
+            "--transport-keypair",
+            "/keys/gw.key",
+            "network",
+        ])
+        .expect("parse");
+        let mut config = match cli.command {
+            Some(Command::Network { config }) => config,
+            _ => panic!("expected network subcommand"),
+        };
+        merge_pre_subcommand_args(&mut config, &cli.config);
+        let net = &config.network_api;
+        assert!(net.is_gateway);
+        assert_eq!(net.public_address, Some("203.0.113.7".parse().unwrap()));
+        assert_eq!(net.public_port, Some(31337));
+        assert_eq!(net.network_port, Some(31338));
+        assert_eq!(
+            net.gateway.as_deref(),
+            Some(&["gw.example:31337".to_string()][..])
+        );
+        assert_eq!(net.location, Some(0.25));
+        assert_eq!(
+            config.secrets.transport_keypair.as_deref(),
+            Some(std::path::Path::new("/keys/gw.key"))
+        );
     }
 
     /// The subcommand's own value wins; the top-level one only fills a gap.
     #[test]
     fn subcommand_ws_api_address_beats_the_pre_subcommand_one() {
-        use super::{Cli, Command, merge_pre_subcommand_ws_api_args};
+        use super::{Cli, Command, merge_pre_subcommand_args};
         use clap::Parser;
         let cli = Cli::try_parse_from([
             "freenet",
@@ -2330,7 +2395,7 @@ mod tests {
             Some(Command::Network { config }) => config,
             _ => panic!("expected network subcommand"),
         };
-        merge_pre_subcommand_ws_api_args(&mut config, &cli.config);
+        merge_pre_subcommand_args(&mut config, &cli.config);
         assert_eq!(config.ws_api.address, Some("127.0.0.1".parse().unwrap()));
     }
 
