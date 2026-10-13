@@ -76,6 +76,21 @@
 //!   favoring candidates that fill gaps in log-distance coverage
 //! - Between min and max → feed the gap score through the `ConnectionEvaluator`
 //!
+//! ## Joining With No Ring Connection
+//!
+//! A CONNECT sent while the joiner has no ring connection (`bootstrap` module, #5858):
+//! - **Ends early.** It stops once nothing is in flight and nothing has arrived for a quiet
+//!   window (12 s before the first dial outcome, 6 s after one; the clock starts when the
+//!   gateway link is up), instead of collecting acceptors until the 60 s transaction TTL.
+//! - **Dials concurrently.** Up to `MAX_CONCURRENT_ACCEPTOR_DIALS` acceptors are dialled at
+//!   once, so an unreachable acceptor cannot hold a reachable one past its hole-punch
+//!   window. A peer that already has a connection still dials one at a time.
+//! - **Is paced.** The startup loop and the maintenance loop's zero-connection fallback
+//!   share one `BootstrapPacer`: one round at a time, failed rounds spaced by a jittered
+//!   1 s to 30 s exponential backoff, which resets once a ring connection has lasted 30 s.
+//! - **Redials a dead gateway link.** Two silent rounds in a row through one gateway (not
+//!   even an `ObservedAddress`) drop that transport so the next round re-handshakes.
+//!
 //! ## Routing
 //!
 //! The request is routed toward `desired_location` using greedy routing:
@@ -2271,7 +2286,8 @@ pub(crate) async fn initial_join_procedure(
                 round.connected = op_manager.ring.open_connections() > 0;
                 drop(round);
                 if issued {
-                    // The pacer spaces the next round.
+                    // The pacer spaces the next round, with its own jitter, so
+                    // the fixed wait below is skipped (#5858).
                     continue;
                 }
             }
@@ -2279,6 +2295,8 @@ pub(crate) async fn initial_join_procedure(
             // Add random jitter to prevent thundering herd after gateway restart.
             // Without jitter, all peers that lose their gateway connection retry
             // at the same interval, causing synchronized reconnection storms.
+            // With no connection this wait is reached only by a round that sent
+            // nothing; a round that sent CONNECTs is spaced by the pacer above.
             let jitter_ms = GlobalRng::random_u64() % 2000; // 0-2s jitter
             let base_wait_ms = if open_conns == 0 {
                 tracing::debug!(

@@ -259,6 +259,18 @@ sequenceDiagram
 2. **NAT discovery** - First relay observes external address
 3. **Connection establishment** - Acceptor at terminus connects
 
+**Rounds with no ring connection (#5858):** the startup loop and the maintenance loop's
+zero-connection fallback share one bootstrap pacer, so one round of gateway CONNECTs runs
+at a time. A round's CONNECT ends once nothing is in flight and nothing has arrived for a
+quiet window (12 s before the first acceptor dial finishes, 6 s after; counted from the
+gateway link coming up), not at the 60 s transaction TTL. Its acceptors are dialled
+concurrently (up to 4) so one unreachable acceptor does not hold up the rest. A failed round
+is followed by a jittered backoff of 1, 2, 4, 8, 16, then 30 s; a connected one by 5 s; the
+backoff resets once a ring connection has lasted 30 s, and isolation recovery clears it.
+Two silent rounds in a row through a gateway drop that transport for a fresh handshake.
+With no gateway answering, rounds start at about 0, 16, 33, 52, 75, 106 s and then every
+~45 s.
+
 **Target selection in `join_ring_request`** (gateway joins, cached-peer reconnects, the
 startup loop):
 - Fewer than 3 connections: target own location, with jitter after consecutive failures
