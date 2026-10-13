@@ -2496,6 +2496,40 @@ mod driver_timing_tests {
         );
     }
 
+    /// A slow gateway is not a dead one: two overlapping joins whose
+    /// `ObservedAddress` arrives 10 s after each request, inside the deadline,
+    /// keep the link.
+    #[tokio::test(start_paused = true)]
+    async fn a_gateway_that_answers_within_the_deadline_keeps_its_link() {
+        let _marker = NoGlobalAddress::new();
+        let (op_manager, mut events, mut op_execution) =
+            unaddressed_op_manager("driver-liveness-slow").await;
+        let gateway = peer(24882);
+        let gateway_addr = gateway.socket_addr().unwrap();
+        let script = tokio::spawn(async move {
+            let mut answers = Vec::new();
+            while let Some((reply, msg, _target)) = op_execution.recv().await {
+                if let NetMessage::V1(NetMessageV1::Connect(ConnectMsg::Request { id, .. })) = msg {
+                    answers.push(tokio::spawn(async move {
+                        tokio::time::sleep(Duration::from_secs(10)).await;
+                        reply.send(observed_address(id)).await.ok();
+                        // Hold the channel open: the join runs to its timeout.
+                        std::future::pending::<()>().await;
+                    }));
+                }
+            }
+        });
+        tokio::join!(
+            connect_once(&op_manager, &gateway, ClientConnectKind::Standard),
+            connect_once(&op_manager, &gateway, ClientConnectKind::Standard),
+        );
+        assert!(
+            !drops_link(&mut events, gateway_addr),
+            "answers inside the deadline must not count as silence"
+        );
+        script.abort();
+    }
+
     /// A peer that knows its address gets no `ObservedAddress`, so silence
     /// proves nothing about its gateway link.
     #[tokio::test(start_paused = true)]
