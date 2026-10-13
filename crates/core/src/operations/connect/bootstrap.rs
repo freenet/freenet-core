@@ -268,6 +268,10 @@ pub(crate) struct BootstrapPacer {
     owned_reservations: HashSet<SocketAddr>,
     /// Since when this peer has had a ring connection without a break.
     connected_since: Option<Instant>,
+    /// A CONNECT of the running round connected an acceptor. Read when the
+    /// round ends, since the ring may not have registered that connection
+    /// yet.
+    round_connected: bool,
 }
 
 impl BootstrapPacer {
@@ -283,6 +287,15 @@ impl BootstrapPacer {
             silent_rounds: HashMap::new(),
             owned_reservations: HashSet::new(),
             connected_since: None,
+            round_connected: false,
+        }
+    }
+
+    /// A bootstrapping CONNECT connected an acceptor; the running round, if
+    /// any, counts as connected however it reads the ring when it ends.
+    pub(crate) fn note_connected(&mut self) {
+        if self.round_in_flight {
+            self.round_connected = true;
         }
     }
 
@@ -353,11 +366,13 @@ impl BootstrapPacer {
             return false;
         }
         self.round_in_flight = true;
+        self.round_connected = false;
         true
     }
 
     fn end(&mut self, now: Instant, issued: bool, connected: bool) {
         self.round_in_flight = false;
+        let connected = connected || std::mem::take(&mut self.round_connected);
         if !issued {
             // Nothing was sent (e.g. every gateway in backoff): not a failed
             // round, so it does not grow the backoff.
@@ -735,6 +750,22 @@ mod tests {
             pacer.failures, 1,
             "a connection that may churn resets nothing"
         );
+    }
+
+    #[test]
+    fn a_dial_that_connected_counts_even_if_the_ring_has_not_caught_up() {
+        let pacer = Arc::new(Mutex::new(BootstrapPacer::new(Duration::from_secs(30))));
+        pacer.lock().note_connected();
+        let round = BootstrapRoundGuard::try_begin(&pacer, Instant::now()).unwrap();
+        assert!(
+            !pacer.lock().round_connected,
+            "a connection outside any round is not carried into the next"
+        );
+        let mut round = round;
+        round.issued = true;
+        pacer.lock().note_connected();
+        drop(round); // `connected` left false: the ring read lagged.
+        assert_eq!(pacer.lock().failures, 0, "the round counts as connected");
     }
 
     #[test]
