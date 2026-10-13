@@ -1610,6 +1610,9 @@ pub fn since_process_start() -> Duration {
 /// Idempotent: only the first call per process has any effect, so a wobble
 /// around the threshold does not overwrite the real bootstrap latency.
 pub fn record_bootstrap_min_connections_reached() {
+    if simulated_node() {
+        return;
+    }
     let elapsed = since_process_start();
     if let Some(status) = NETWORK_STATUS.get() {
         if let Ok(mut s) = status.write() {
@@ -1632,6 +1635,9 @@ pub fn record_bootstrap_min_connections_reached() {
 /// node that loses everything and rejoins is a reconnect, not a slow first
 /// join.
 pub fn record_bootstrap_first_ring_connection() {
+    if simulated_node() {
+        return;
+    }
     let Some(status) = NETWORK_STATUS.get() else {
         return;
     };
@@ -1659,6 +1665,9 @@ pub fn record_bootstrap_first_ring_connection() {
 /// total is the number of attempts it took to get a first connection; once
 /// that is set, calls take only the shared read lock.
 pub fn record_bootstrap_connect_attempt() {
+    if simulated_node() {
+        return;
+    }
     let Some(status) = NETWORK_STATUS.get() else {
         return;
     };
@@ -1678,6 +1687,15 @@ pub fn record_bootstrap_connect_attempt() {
     }
 }
 
+/// Whether the caller runs on a simulation thread (one with a current
+/// simulation network name). The bootstrap figures and the external address
+/// here describe this process's one real node; under plain `cargo test` the
+/// in-lib simulations' nodes share the process and would otherwise write
+/// them, breaking the tests that assert on them (#5858).
+fn simulated_node() -> bool {
+    crate::ring::topology_registry::get_current_network_name().is_some()
+}
+
 /// Record one below-threshold round of `initial_join_procedure`, classified by
 /// what that round actually did (issue #4787 instrumentation, joiner-side).
 /// See [`BootstrapChurnStats`] for why the classification is the measurement.
@@ -1687,7 +1705,7 @@ pub fn record_bootstrap_connect_attempt() {
 /// the join loops of simulations sharing a test process otherwise land in it,
 /// which broke the `startup_rounds_*` tests under plain `cargo test`.
 pub fn record_bootstrap_startup_round(outcome: StartupRoundOutcome) {
-    if crate::ring::topology_registry::get_current_network_name().is_some() {
+    if simulated_node() {
         return;
     }
     if let Some(status) = NETWORK_STATUS.get() {
@@ -1867,10 +1885,10 @@ pub fn set_own_location(location: f64) {
 
 /// Set this node's externally observed address (as reported by peers).
 pub fn set_external_address(addr: SocketAddr) {
-    // Not for a simulated node, as with `record_bootstrap_startup_round`: an
-    // in-lib simulation's nodes would otherwise overwrite this process's
-    // address and race `test_set_own_addr_atomic_with_network_status`.
-    if crate::ring::topology_registry::get_current_network_name().is_some() {
+    // Not for a simulated node: an in-lib simulation's nodes would otherwise
+    // overwrite this process's address and race
+    // `test_set_own_addr_atomic_with_network_status`.
+    if simulated_node() {
         return;
     }
     if let Some(status) = NETWORK_STATUS.get() {
@@ -2831,6 +2849,23 @@ mod tests {
         set_external_address("127.0.0.1:31340".parse().unwrap());
         crate::ring::topology_registry::clear_current_network_name();
         assert_eq!(external_address(), Some(real));
+    }
+
+    /// A simulated node's join attempts, first ring connection and reaching
+    /// min_connections stay out of the process singleton too.
+    #[test]
+    fn simulated_node_join_latency_is_not_recorded() {
+        let _lock = TEST_MUTEX.lock().unwrap();
+        init(31341, HashSet::new(), "test".to_string());
+        crate::ring::topology_registry::set_current_network_name("status-isolation-join");
+        record_bootstrap_connect_attempt();
+        record_bootstrap_first_ring_connection();
+        record_bootstrap_min_connections_reached();
+        crate::ring::topology_registry::clear_current_network_name();
+        let counts = bootstrap_churn_counts().expect("initialized");
+        assert_eq!(counts.connect_attempts_before_first_connection, 0);
+        assert_eq!(counts.time_to_first_ring_connection, None);
+        assert_eq!(counts.time_to_min_connections, None);
     }
 
     /// A simulated node's join rounds stay out of the process singleton, so a
