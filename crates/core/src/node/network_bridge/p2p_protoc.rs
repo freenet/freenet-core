@@ -1907,8 +1907,13 @@ impl P2pConnManager {
 
                                     // Spawn a task to wait for connection and then send the message
                                     let target_peer_for_resend = target_peer.clone();
+                                    let connect_request = is_unsent_connect_request(&msg_clone);
                                     GlobalExecutor::spawn(async move {
-                                        match timeout(Duration::from_secs(20), result.recv()).await
+                                        let resent = match timeout(
+                                            Duration::from_secs(20),
+                                            result.recv(),
+                                        )
+                                        .await
                                         {
                                             Ok(Some(Ok((connected_addr, _)))) => {
                                                 tracing::debug!(
@@ -1939,6 +1944,7 @@ impl P2pConnManager {
                                                         "Failed to reschedule message after connection established"
                                                     );
                                                 }
+                                                true
                                             }
                                             Ok(Some(Err(e))) => {
                                                 tracing::debug!(
@@ -1948,6 +1954,7 @@ impl P2pConnManager {
                                                     phase = "error",
                                                     "Connection attempt failed"
                                                 );
+                                                false
                                             }
                                             Ok(None) => {
                                                 tracing::error!(
@@ -1956,6 +1963,7 @@ impl P2pConnManager {
                                                     phase = "error",
                                                     "Response channel closed before connection result received"
                                                 );
+                                                false
                                             }
                                             Err(_) => {
                                                 tracing::error!(
@@ -1964,7 +1972,25 @@ impl P2pConnManager {
                                                     phase = "timeout",
                                                     "Timeout waiting for connection establishment"
                                                 );
+                                                false
                                             }
+                                        };
+                                        // A CONNECT request that never went out
+                                        // has nothing in flight: end its driver
+                                        // now, as for a peer pruned mid-flight,
+                                        // instead of leaving it to wait out its
+                                        // TTL (#5858). Other ops keep their own
+                                        // retry handling.
+                                        if !resent && connect_request {
+                                            bridge_sender
+                                                .send(P2pBridgeEvent::NodeAction(
+                                                    NodeEvent::TransactionOrphaned {
+                                                        tx,
+                                                        peer: target_addr,
+                                                    },
+                                                ))
+                                                .await
+                                                .ok();
                                         }
                                     });
                                 }
@@ -2960,6 +2986,19 @@ impl ConnectResultSender for mpsc::Sender<Result<(SocketAddr, Option<usize>), ()
     }
 }
 
+/// A message dropped because its target could not be connected, whose
+/// driver should be told at once: a joiner's CONNECT request (#5858). Its
+/// transaction has nothing in flight, so ending it frees the bootstrap round
+/// instead of holding it for the transaction TTL.
+fn is_unsent_connect_request(msg: &NetMessage) -> bool {
+    matches!(
+        msg,
+        NetMessage::V1(NetMessageV1::Connect(
+            crate::operations::connect::ConnectMsg::Request { .. }
+        ))
+    )
+}
+
 /// Fail every callback awaiting a connection to `peer_addr` after a connect
 /// attempt was abandoned (e.g. its `HandshakeCommand::Connect` enqueue was
 /// dropped on a full/closed handshake command channel, #4145).
@@ -3643,6 +3682,36 @@ pub(crate) mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::sync::mpsc;
     use tokio::time::{Duration, Instant, sleep, timeout};
+
+    /// Only a joiner's CONNECT request is ended at once when its target could
+    /// not be connected (#5858); every other message keeps its op's own retry
+    /// handling.
+    #[test]
+    fn only_an_unsent_connect_request_is_ended_at_once() {
+        use crate::message::{NetMessage, NetMessageV1, Transaction};
+        use crate::operations::connect::{ConnectMsg, prepare_join_request};
+        use crate::ring::{Location, PeerKeyLocation};
+        use crate::transport::TransportKeypair;
+
+        let peer = |port: u16| {
+            PeerKeyLocation::new(
+                TransportKeypair::new().public().clone(),
+                std::net::SocketAddr::from(([127, 0, 0, 1], port)),
+            )
+        };
+        let tx = Transaction::new::<ConnectMsg>();
+        let request = prepare_join_request(tx, &peer(1), &peer(2), Location::new(0.5), 10, &[]);
+        assert!(super::is_unsent_connect_request(&NetMessage::V1(
+            NetMessageV1::Connect(request)
+        )));
+        let observed = ConnectMsg::ObservedAddress {
+            id: tx,
+            address: std::net::SocketAddr::from(([127, 0, 0, 1], 3)),
+        };
+        assert!(!super::is_unsent_connect_request(&NetMessage::V1(
+            NetMessageV1::Connect(observed)
+        )));
+    }
 
     /// A fake [`super::ContractPresenceOracle`] for testing
     /// [`super::collect_contract_states`] without standing up a real `Ring`.
