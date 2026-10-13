@@ -827,7 +827,8 @@ fn a_relay_counts_each_request_once() {
 }
 
 /// Source pin: the relay driver counts the need it saw and every admission
-/// decision through `record_relay_admission` (initial and both retry paths),
+/// decision through `record_relay_admission` (initial, and both retry paths via
+/// `settle_retry_admission`),
 /// and the decision function itself no longer counts.
 #[test]
 fn the_relay_driver_counts_admissions_once_per_request() {
@@ -841,8 +842,14 @@ fn the_relay_driver_counts_admissions_once_per_request() {
         .collect();
     assert_eq!(
         code.matches(".record_relay_admission(").count(),
-        3,
-        "the initial decision and the two retry paths"
+        2,
+        "the initial decision, and settle_retry_admission for the retries"
+    );
+    assert_eq!(
+        code.matches("=settle_retry_admission(&op_manager.ring.connection_manager,")
+            .count(),
+        2,
+        "both retry paths settle their admission"
     );
     assert_eq!(
         code.matches(".record_request_seen(state.request.need)")
