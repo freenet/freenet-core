@@ -267,7 +267,7 @@ pub(crate) async fn start_client_connect(
                 .lock()
                 .gateway_silent(gateway_addr)
             {
-                drop_dead_gateway_link(op_manager, tx, gateway_addr);
+                drop_dead_gateway_link(op_manager, tx, gateway_addr).await;
             }
         }
         Ok(ClientConnectEnd::Bootstrap(_)) => {
@@ -292,24 +292,46 @@ pub(crate) async fn start_client_connect(
 /// the next round dials the gateway afresh (a fresh intro on the gateway's
 /// side resets a stale session, so this is safe even if the link was alive).
 /// Never drops a ring connection.
-fn drop_dead_gateway_link(op_manager: &OpManager, tx: Transaction, gateway_addr: SocketAddr) {
+///
+/// Waits (bounded) for the event loop to handle the drop. The next round's
+/// CONNECT goes out on the op-execution channel, which the event loop can
+/// otherwise serve first, sending it over the link about to be dropped.
+async fn drop_dead_gateway_link(op_manager: &OpManager, tx: Transaction, gateway_addr: SocketAddr) {
     if op_manager.ring.connection_manager.is_in_ring(gateway_addr) {
         return;
     }
     tracing::info!(
         %tx,
         gateway = %gateway_addr,
-        "connect driver: gateway did not answer a bootstrapping CONNECT; dropping the link to redial"
+        "connect driver: gateway did not answer bootstrapping CONNECTs; dropping the link to redial"
     );
-    if let Err(e) = op_manager.try_notify_node_event(NodeEvent::DropConnection(gateway_addr)) {
+    let (done, mut dropped) = mpsc::channel(1);
+    if let Err(e) = op_manager.try_notify_node_event(NodeEvent::DropStaleGatewayLink {
+        addr: gateway_addr,
+        done,
+    }) {
         tracing::warn!(
             %tx,
             gateway = %gateway_addr,
             error = %e,
             "connect driver: could not queue drop of a dead gateway link; next round reuses it"
         );
+        return;
+    }
+    if tokio::time::timeout(STALE_LINK_DROP_WAIT, dropped.recv())
+        .await
+        .is_err()
+    {
+        tracing::debug!(
+            %tx,
+            gateway = %gateway_addr,
+            "connect driver: dead gateway link drop not confirmed in time; continuing"
+        );
     }
 }
+
+/// Bound on waiting for the event loop to drop a dead gateway link.
+const STALE_LINK_DROP_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Inner driver loop. Drains `receiver` until `target_connections`
 /// acceptances accumulate, a fatal Rejected arrives, or (for a CONNECT sent
@@ -2342,7 +2364,7 @@ mod driver_timing_tests {
         let dropped = |events: &mut mpsc::Receiver<Either<NetMessage, NodeEvent>>| {
             let mut dropped = false;
             while let Ok(event) = events.try_recv() {
-                if matches!(event, Either::Right(NodeEvent::DropConnection(a)) if a == gateway_addr)
+                if matches!(event, Either::Right(NodeEvent::DropStaleGatewayLink { addr, .. }) if addr == gateway_addr)
                 {
                     dropped = true;
                 }
@@ -2416,16 +2438,34 @@ mod driver_timing_tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_dead_gateway_link_is_dropped_but_never_a_ring_connection() {
         let (op_manager, mut events) = op_manager_with_events("driver-dead-link").await;
         let gateway = peer(24865).socket_addr().unwrap();
         let tx = Transaction::new::<ConnectMsg>();
-        super::drop_dead_gateway_link(&op_manager, tx, gateway);
-        match events.try_recv() {
-            Ok(Either::Right(NodeEvent::DropConnection(addr))) => assert_eq!(addr, gateway),
-            other => panic!("expected a DropConnection for the gateway, got {other:?}"),
-        }
+        let drop = {
+            let op_manager = op_manager.clone();
+            tokio::spawn(async move {
+                super::drop_dead_gateway_link(&op_manager, tx, gateway).await;
+            })
+        };
+        let done = match events.recv().await {
+            Some(Either::Right(NodeEvent::DropStaleGatewayLink { addr, done })) => {
+                assert_eq!(addr, gateway);
+                done
+            }
+            other => panic!("expected a DropStaleGatewayLink for the gateway, got {other:?}"),
+        };
+        tokio::task::yield_now().await;
+        assert!(
+            !drop.is_finished(),
+            "the caller must wait for the event loop to drop the link"
+        );
+        done.try_send(()).unwrap();
+        tokio::time::timeout(Duration::from_millis(100), drop)
+            .await
+            .expect("the caller returns once the drop is confirmed")
+            .unwrap();
 
         let in_ring = peer(24866);
         let in_ring_addr = in_ring.socket_addr().unwrap();
@@ -2435,7 +2475,7 @@ mod driver_timing_tests {
             in_ring.pub_key().clone(),
             false,
         ));
-        super::drop_dead_gateway_link(&op_manager, tx, in_ring_addr);
+        super::drop_dead_gateway_link(&op_manager, tx, in_ring_addr).await;
         assert!(
             events.try_recv().is_err(),
             "a gateway that is a ring connection must not be dropped"

@@ -2300,6 +2300,33 @@ impl P2pConnManager {
                                     );
                                 }
                             }
+                            NodeEvent::DropStaleGatewayLink { addr, done } => {
+                                // Checked here, not only by the sender: the
+                                // gateway may have become a ring connection
+                                // while this event was queued (#5858).
+                                if ctx
+                                    .bridge
+                                    .op_manager
+                                    .ring
+                                    .connection_manager
+                                    .is_in_ring(addr)
+                                {
+                                    tracing::debug!(
+                                        peer_addr = %addr,
+                                        "Stale gateway link is now a ring connection - keeping it"
+                                    );
+                                } else if !ctx
+                                    .drop_connection_by_addr(addr, &handshake_cmd_sender)
+                                    .await
+                                {
+                                    tracing::debug!(
+                                        peer_addr = %addr,
+                                        "Stale gateway link already gone - ignoring"
+                                    );
+                                }
+                                // The sender waits on this with a timeout.
+                                let _ = done.try_send(());
+                            }
                             NodeEvent::DropAllConnections => {
                                 let all_addrs: Vec<SocketAddr> =
                                     ctx.connections.keys().copied().collect();

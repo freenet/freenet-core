@@ -860,6 +860,14 @@ pub(crate) type ConnectResult = Result<(SocketAddr, RemainingChecks), ()>;
 pub(crate) enum NodeEvent {
     /// Drop the given peer connection by socket address.
     DropConnection(SocketAddr),
+    /// Drop a gateway link that bootstrapping CONNECTs found dead, unless
+    /// the gateway is a ring connection by the time the event loop handles
+    /// this. `done` is signalled either way, so the sender can hold its next
+    /// CONNECT until the drop has happened (#5858).
+    DropStaleGatewayLink {
+        addr: SocketAddr,
+        done: tokio::sync::mpsc::Sender<()>,
+    },
     /// Drop all connections (ring + transient). Used after suspend/resume
     /// to force fresh transport reconnection to gateways.
     DropAllConnections,
@@ -1027,6 +1035,9 @@ impl Display for NodeEvent {
         match self {
             NodeEvent::DropConnection(peer) => {
                 write!(f, "DropConnection (from {peer})")
+            }
+            NodeEvent::DropStaleGatewayLink { addr, .. } => {
+                write!(f, "DropStaleGatewayLink (from {addr})")
             }
             NodeEvent::DropAllConnections => {
                 write!(f, "DropAllConnections")
