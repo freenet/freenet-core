@@ -2277,6 +2277,10 @@ pub(crate) async fn initial_join_procedure(
                             "All gateways in backoff, waiting before retry"
                         );
                         record_round(StartupRoundOutcome::BackoffBlocked);
+                        // This round sent nothing: end it before sleeping, or
+                        // it would block the maintenance path's round for the
+                        // whole wait.
+                        drop(bootstrap_round.take());
                         tokio::select! {
                             _ = tokio::time::sleep(effective_wait) => {},
                             _ = op_manager.gateway_backoff_cleared.notified() => {
