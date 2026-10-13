@@ -897,6 +897,14 @@ impl ConnectionManager {
         }
     }
 
+    /// Undo an admission decision that was discarded before any response went
+    /// out (#5858): release the pending reservation, and an onboarding slot
+    /// with its token, without counting a probation outcome.
+    pub(crate) fn abandon_admission(&self, addr: SocketAddr) {
+        self.provisional_links.lock().abandon(addr);
+        self.prune_connection(addr, false, None);
+    }
+
     /// Count one CONNECT request arriving at this hop by its stated need.
     pub(crate) fn record_request_seen(&self, need: RequesterNeed) {
         self.admission_counters.record_request_seen(need);

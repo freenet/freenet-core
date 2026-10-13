@@ -1118,10 +1118,11 @@ async fn drive_relay_connect(
                 let estimator = op_manager.connect_forward_estimator.read().clone();
                 let retry =
                     state.handle_request(&env, &recency, &mut forward_attempts, &estimator, now);
-                op_manager
-                    .ring
-                    .connection_manager
-                    .record_relay_admission(retry.admission, &mut admission_recorded);
+                let retry = settle_retry_admission(
+                    &op_manager.ring.connection_manager,
+                    retry,
+                    &mut admission_recorded,
+                );
 
                 if let Some((peer, forward_req)) = retry.forward {
                     recency.insert(peer.clone(), now);
@@ -1294,10 +1295,11 @@ async fn drive_relay_connect(
                 let estimator = op_manager.connect_forward_estimator.read().clone();
                 let retry =
                     state.handle_request(&env, &recency, &mut forward_attempts, &estimator, now);
-                op_manager
-                    .ring
-                    .connection_manager
-                    .record_relay_admission(retry.admission, &mut admission_recorded);
+                let retry = settle_retry_admission(
+                    &op_manager.ring.connection_manager,
+                    retry,
+                    &mut admission_recorded,
+                );
 
                 if let Some((peer, forward_req)) = retry.forward {
                     recency.insert(peer.clone(), now);
@@ -1404,6 +1406,30 @@ async fn drive_relay_connect(
     }
 }
 
+/// Settle the admission a retry's `handle_request` made (#5858).
+///
+/// The retry paths act on a forward OR an accept, never both. When a retry
+/// returns both (a near-terminus accept while forwarding), the accept is not
+/// acted on, so its reservation (and any onboarding slot with its token) is
+/// released here and the decision is not counted; otherwise the decision is
+/// counted once per request (`record_relay_admission`).
+fn settle_retry_admission(
+    connection_manager: &crate::ring::ConnectionManager,
+    mut retry: super::RelayActions,
+    admission_recorded: &mut bool,
+) -> super::RelayActions {
+    if retry.forward.is_some() {
+        if let Some(accept) = retry.accept.take() {
+            if let Some(addr) = accept.joiner.socket_addr() {
+                connection_manager.abandon_admission(addr);
+            }
+            retry.admission = None;
+        }
+    }
+    connection_manager.record_relay_admission(retry.admission, admission_recorded);
+    retry
+}
+
 /// Decide whether the driver loop should exit because the transaction
 /// has exceeded its TTL.
 ///
@@ -1421,6 +1447,87 @@ fn should_exit_for_ttl(tx: &Transaction) -> bool {
 
 #[cfg(test)]
 mod tests {
+
+    /// #5858 re-review: a retry that returns both a forward and a
+    /// near-terminus accept must not strand the accept's reservation (the
+    /// retry paths act on the forward only).
+    #[test]
+    fn a_retry_that_forwards_releases_its_unused_accept() {
+        use super::settle_retry_admission;
+        use crate::operations::connect::{
+            AcceptOutcome, ConnectRequest, ConnectResponse, DEFAULT_UPHILL_BUDGET, RelayActions,
+        };
+        use crate::ring::PeerKeyLocation;
+        use crate::ring::admission::{AdmissionCode, RequesterNeed};
+        use tokio::time::Instant;
+        let cm = crate::ring::ConnectionManager::test_default();
+        cm.update_location(Some(crate::ring::Location::new(0.5)));
+        let joiner_addr: SocketAddr = "10.4.0.1:4000".parse().unwrap();
+        let keypair = crate::transport::TransportKeypair::new();
+        let joiner = PeerKeyLocation::new(keypair.public().clone(), joiner_addr);
+        for (i, loc) in [0.45, 0.55, 0.2, 0.7].into_iter().enumerate() {
+            let k = crate::transport::TransportKeypair::new();
+            let a: SocketAddr = format!("10.4.1.{}:4000", i + 1).parse().unwrap();
+            assert!(cm.add_connection(
+                crate::ring::Location::new(loc),
+                a,
+                k.public().clone(),
+                false
+            ));
+        }
+        let code = cm.evaluate_admission_at(
+            crate::ring::Location::new(0.8),
+            joiner_addr,
+            RequesterNeed::Short(0),
+            None,
+            Instant::now(),
+        );
+        assert_eq!(code, AdmissionCode::AcceptedOnboarding);
+        assert_eq!(cm.admission_stats().provisional_in_use, 1);
+        let retry = RelayActions {
+            accept: Some(AcceptOutcome {
+                response: ConnectResponse {
+                    acceptor: PeerKeyLocation::random(),
+                },
+                joiner: joiner.clone(),
+            }),
+            forward: Some((
+                PeerKeyLocation::random(),
+                ConnectRequest {
+                    desired_location: crate::ring::Location::new(0.8),
+                    joiner,
+                    ttl: 3,
+                    visited: crate::operations::VisitedPeers::default(),
+                    uphill_budget: DEFAULT_UPHILL_BUDGET,
+                    need: RequesterNeed::Short(0),
+                },
+            )),
+            admission: Some(code),
+            ..Default::default()
+        };
+        let mut recorded = false;
+        let settled = settle_retry_admission(&cm, retry, &mut recorded);
+        assert!(settled.accept.is_none());
+        assert!(settled.forward.is_some());
+        let stats = cm.admission_stats();
+        assert_eq!(stats.provisional_in_use, 0, "the slot is released");
+        assert_eq!(
+            stats.admitted_onboarding, 0,
+            "the discarded admission is not counted"
+        );
+        // The refunded token admits the next short requester at once.
+        let next: SocketAddr = "10.4.0.2:4000".parse().unwrap();
+        assert_eq!(
+            cm.evaluate_admission_at(
+                crate::ring::Location::new(0.85),
+                next,
+                RequesterNeed::Short(0),
+                None,
+                Instant::now()
+            ),
+            AdmissionCode::AcceptedOnboarding
+        );
+    }
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
     use super::{compute_reply_capacity, should_exit_for_ttl};

@@ -675,6 +675,17 @@ impl ProvisionalLinks {
         }
     }
 
+    /// Undo a reservation that was never acted on (the admission was
+    /// discarded before any response went out): free the slot AND refund its
+    /// token. `true` if `addr` held a slot.
+    pub(crate) fn abandon(&mut self, addr: SocketAddr) -> bool {
+        let held = self.slots.remove(&addr).is_some();
+        if held {
+            self.tokens = (self.tokens + 1.0).min(self.capacity as f64);
+        }
+        held
+    }
+
     /// Free `addr`'s slot. `true` if it held one.
     pub(crate) fn release(&mut self, addr: SocketAddr) -> bool {
         self.slots.remove(&addr).is_some()
@@ -843,6 +854,21 @@ mod tests {
             "the last token is kept for the isolated"
         );
         assert_eq!(slots.try_reserve(addr(3), loc(0.3), true, start), Ok(()));
+    }
+
+    #[test]
+    fn an_abandoned_reservation_refunds_its_token() {
+        let start = Instant::now();
+        let mut slots = ProvisionalLinks::new(2);
+        assert_eq!(slots.try_reserve(addr(1), loc(0.1), true, start), Ok(()));
+        assert_eq!(slots.try_reserve(addr(2), loc(0.2), true, start), Ok(()));
+        assert!(slots.abandon(addr(2)));
+        assert!(!slots.abandon(addr(2)));
+        assert_eq!(
+            slots.try_reserve(addr(3), loc(0.3), true, start),
+            Ok(()),
+            "the abandoned reservation's token came back"
+        );
     }
 
     #[test]
