@@ -1783,6 +1783,12 @@ pub fn set_own_location(location: f64) {
 
 /// Set this node's externally observed address (as reported by peers).
 pub fn set_external_address(addr: SocketAddr) {
+    // Not for a simulated node, as with `record_bootstrap_startup_round`: an
+    // in-lib simulation's nodes would otherwise overwrite this process's
+    // address and race `test_set_own_addr_atomic_with_network_status`.
+    if crate::ring::topology_registry::get_current_network_name().is_some() {
+        return;
+    }
     if let Some(status) = NETWORK_STATUS.get() {
         if let Ok(mut s) = status.write() {
             s.external_address = Some(addr);
@@ -2719,6 +2725,20 @@ mod tests {
             "getter returns (comparisons, divergences); every call bumps comparisons, \
              only diverged calls bump divergences"
         );
+    }
+
+    /// A simulated node's observed address stays out of the process singleton,
+    /// which describes this process's one real node.
+    #[test]
+    fn simulated_node_external_address_is_not_recorded() {
+        let _lock = TEST_MUTEX.lock().unwrap();
+        init(31339, HashSet::new(), "test".to_string());
+        let real: SocketAddr = "127.0.0.1:31339".parse().unwrap();
+        set_external_address(real);
+        crate::ring::topology_registry::set_current_network_name("status-isolation-addr");
+        set_external_address("127.0.0.1:31340".parse().unwrap());
+        crate::ring::topology_registry::clear_current_network_name();
+        assert_eq!(external_address(), Some(real));
     }
 
     /// A simulated node's join rounds stay out of the process singleton, so a
