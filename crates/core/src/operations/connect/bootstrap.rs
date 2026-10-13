@@ -16,7 +16,8 @@
 //!   pacer, so at most one bootstrap round runs at a time and failed rounds
 //!   are spaced by a jittered exponential backoff.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -45,6 +46,16 @@ pub(crate) const BOOTSTRAP_REPLY_QUIET: Duration =
 /// saturated-join simulation (two to four acceptors per CONNECT) while
 /// bounding the parallel handshakes a single CONNECT can start.
 pub(crate) const MAX_CONCURRENT_ACCEPTOR_DIALS: usize = 4;
+
+/// Consecutive bootstrapping CONNECTs through one gateway that must hear
+/// nothing at all before its link is treated as dead and redialled. One
+/// silent round can be a slow or overloaded gateway (its restart admission
+/// ramp, say), and dropping the link then would only add handshakes to it.
+pub(crate) const SILENT_ROUNDS_BEFORE_REDIAL: u32 = 2;
+
+/// Gateways whose silent-round count is tracked at once; well above any
+/// configured gateway list, and only a bound on the map.
+const MAX_TRACKED_GATEWAYS: usize = 64;
 
 /// First wait after a bootstrap round that ended with no ring connection.
 const BOOTSTRAP_RETRY_BASE: Duration = Duration::from_secs(1);
@@ -235,6 +246,7 @@ pub(crate) struct BootstrapPacer {
     failures: u32,
     next_allowed: Option<Instant>,
     round_in_flight: bool,
+    silent_rounds: HashMap<SocketAddr, u32>,
 }
 
 impl BootstrapPacer {
@@ -247,7 +259,31 @@ impl BootstrapPacer {
             failures: 0,
             next_allowed: None,
             round_in_flight: false,
+            silent_rounds: HashMap::new(),
         }
+    }
+
+    /// A bootstrapping CONNECT through `gateway` heard nothing. Returns true
+    /// once that has happened [`SILENT_ROUNDS_BEFORE_REDIAL`] times in a row,
+    /// and resets the count: the caller drops the link to redial it.
+    pub(crate) fn gateway_silent(&mut self, gateway: SocketAddr) -> bool {
+        if self.silent_rounds.len() >= MAX_TRACKED_GATEWAYS
+            && !self.silent_rounds.contains_key(&gateway)
+        {
+            self.silent_rounds.clear();
+        }
+        let count = self.silent_rounds.entry(gateway).or_insert(0);
+        *count += 1;
+        if *count >= SILENT_ROUNDS_BEFORE_REDIAL {
+            self.silent_rounds.remove(&gateway);
+            return true;
+        }
+        false
+    }
+
+    /// A bootstrapping CONNECT through `gateway` heard back.
+    pub(crate) fn gateway_answered(&mut self, gateway: SocketAddr) {
+        self.silent_rounds.remove(&gateway);
     }
 
     /// When the next round may start, if it has to wait.
@@ -544,6 +580,19 @@ mod tests {
             pacer.lock().wait_until(now).is_some(),
             "a failed round backs off"
         );
+    }
+
+    #[test]
+    fn a_gateway_link_is_redialled_only_after_consecutive_silent_rounds() {
+        let mut pacer = BootstrapPacer::new(Duration::from_secs(30));
+        let gw: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let other: SocketAddr = "127.0.0.1:2".parse().unwrap();
+        assert!(!pacer.gateway_silent(gw), "one silent round is not enough");
+        pacer.gateway_answered(gw);
+        assert!(!pacer.gateway_silent(gw), "an answer resets the count");
+        assert!(!pacer.gateway_silent(other), "counts are per gateway");
+        assert!(pacer.gateway_silent(gw), "two in a row redial");
+        assert!(!pacer.gateway_silent(gw), "and the count starts over");
     }
 
     #[test]

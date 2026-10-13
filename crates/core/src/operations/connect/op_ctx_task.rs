@@ -276,13 +276,23 @@ pub(crate) async fn start_client_connect(
         },
         None => inner.await,
     };
-    if matches!(
-        outcome,
-        Ok(ClientConnectEnd::Bootstrap(
-            super::bootstrap::BootstrapExit::NoReply
-        ))
-    ) {
-        drop_dead_gateway_link(op_manager, tx, gateway_addr);
+    match outcome {
+        Ok(ClientConnectEnd::Bootstrap(super::bootstrap::BootstrapExit::NoReply)) => {
+            if op_manager
+                .bootstrap_pacer
+                .lock()
+                .gateway_silent(gateway_addr)
+            {
+                drop_dead_gateway_link(op_manager, tx, gateway_addr);
+            }
+        }
+        Ok(ClientConnectEnd::Bootstrap(_)) => {
+            op_manager
+                .bootstrap_pacer
+                .lock()
+                .gateway_answered(gateway_addr);
+        }
+        Ok(ClientConnectEnd::Finished) | Err(_) => {}
     }
     let outcome = outcome.map(|_| ());
 
@@ -290,8 +300,9 @@ pub(crate) async fn start_client_connect(
     outcome
 }
 
-/// A bootstrapping CONNECT through `gateway_addr` heard nothing back, not even
-/// the `ObservedAddress` a live gateway sends at once (#5858). The gateway has
+/// Bootstrapping CONNECTs through `gateway_addr` heard nothing back, not even
+/// the `ObservedAddress` a live gateway sends at once, for
+/// `SILENT_ROUNDS_BEFORE_REDIAL` rounds in a row (#5858). The gateway has
 /// most likely dropped this transport as a zombie, and with no close message
 /// in the protocol every later CONNECT on it would vanish too. Drop our end so
 /// the next round dials the gateway afresh (a fresh intro on the gateway's
@@ -2337,37 +2348,58 @@ mod driver_timing_tests {
             op_manager_with_channels("driver-dead-link-entry").await;
         let gateway = peer(24867);
         let gateway_addr = gateway.socket_addr().unwrap();
-        let own = op_manager.ring.connection_manager.own_location();
-        let tx = Transaction::new::<ConnectMsg>();
-        // Hold the request's reply channel open: unanswered, not closed.
-        let held = tokio::spawn(async move { op_execution.recv().await });
-        tokio::time::timeout(
-            Duration::from_secs(30),
-            super::start_client_connect(
-                tx,
-                gateway,
-                gateway_addr,
-                &op_manager,
-                own,
-                Location::new(0.5),
-                None,
-                ClientConnectKind::Standard,
-            ),
-        )
-        .await
-        .expect("a bootstrapping CONNECT must end early")
-        .expect("driver result");
-        let mut dropped = false;
-        while let Ok(event) = events.try_recv() {
-            if matches!(event, Either::Right(NodeEvent::DropConnection(a)) if a == gateway_addr) {
-                dropped = true;
+        // Hold every request's reply channel open: unanswered, not closed.
+        let held = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Some(item) = op_execution.recv().await {
+                held.push(item);
             }
-        }
+            held
+        });
+        let round = || {
+            let gateway = gateway.clone();
+            let op_manager = op_manager.clone();
+            async move {
+                let own = op_manager.ring.connection_manager.own_location();
+                tokio::time::timeout(
+                    Duration::from_secs(60),
+                    super::start_client_connect(
+                        Transaction::new::<ConnectMsg>(),
+                        gateway,
+                        gateway_addr,
+                        &op_manager,
+                        own,
+                        Location::new(0.5),
+                        None,
+                        ClientConnectKind::Standard,
+                    ),
+                )
+                .await
+                .expect("a bootstrapping CONNECT must end early")
+                .expect("driver result");
+            }
+        };
+        let dropped = |events: &mut mpsc::Receiver<Either<NetMessage, NodeEvent>>| {
+            let mut dropped = false;
+            while let Ok(event) = events.try_recv() {
+                if matches!(event, Either::Right(NodeEvent::DropConnection(a)) if a == gateway_addr)
+                {
+                    dropped = true;
+                }
+            }
+            dropped
+        };
+        round().await;
         assert!(
-            dropped,
-            "the unanswered gateway link must be dropped for a redial"
+            !dropped(&mut events),
+            "one silent round may be a slow gateway: the link must be kept"
         );
-        drop(held);
+        round().await;
+        assert!(
+            dropped(&mut events),
+            "a second silent round in a row must drop the link for a redial"
+        );
+        held.abort();
     }
 
     /// The maintenance loop's zero-connection bootstrap (#5858): it takes the
