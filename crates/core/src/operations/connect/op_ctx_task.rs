@@ -338,6 +338,9 @@ async fn drive_client_connect_inner(
     use super::bootstrap::{AcceptorDialQueue, BootstrapRound, MAX_CONCURRENT_ACCEPTOR_DIALS};
 
     let mut accepted: HashSet<PeerKeyLocation> = HashSet::with_capacity(target_connections);
+    // Acceptors actually connected. `accepted` also holds acceptors still
+    // queued or being dialled, so it cannot decide that the target is reached.
+    let mut connected_dials: usize = 0;
     // A CONNECT sent with no ring connection ends once nothing more is
     // coming, instead of waiting for `target_connections` acceptors that one
     // CONNECT never collects (#5858). Decided once, for this transaction.
@@ -522,7 +525,8 @@ async fn drive_client_connect_inner(
                     continue;
                 }
 
-                if accepted.len() >= target_connections {
+                connected_dials += 1;
+                if connected_dials >= target_connections {
                     // INVARIANT (mirrors legacy JoinerState::register_acceptance
                     // at connect.rs:1352-1359): if the joiner started without
                     // knowing its external address, ObservedAddress must have
