@@ -564,6 +564,18 @@ pub struct NodeConfig {
         Option<crate::util::time_source::DynTimeSource>,
 }
 
+/// True when the network listener is bound to loopback but at least one
+/// gateway is not, so every packet to that gateway fails (#5798).
+///
+/// Loopback-only test networks (every peer and gateway on `127.0.0.x`) are
+/// deliberate and stay silent.
+fn loopback_listener_with_remote_gateways(listener_ip: IpAddr, gateways: &[SocketAddr]) -> bool {
+    listener_ip.to_canonical().is_loopback()
+        && gateways
+            .iter()
+            .any(|gw| !gw.ip().to_canonical().is_loopback())
+}
+
 impl NodeConfig {
     /// This node's own peer id as a telemetry attribution string
     /// (public key + best-effort address). The address portion falls
@@ -626,6 +638,7 @@ impl NodeConfig {
         let own_pub_key = config.transport_keypair().public();
 
         let mut gateways = Vec::with_capacity(config.gateways.len());
+        let mut gateway_addrs = Vec::with_capacity(config.gateways.len());
         for gw in &config.gateways {
             let GatewayConfig {
                 address,
@@ -700,6 +713,7 @@ impl NodeConfig {
             }
 
             let address = Self::parse_socket_addr(address).await?;
+            gateway_addrs.push(address);
             let peer_key_location = PeerKeyLocation::new(transport_pub_key, address);
             let location = location
                 .map(Location::new)
@@ -711,6 +725,22 @@ impl NodeConfig {
             config.network_api.address,
             config.network_api.port
         );
+        // After the gateway loop because it needs the resolved gateway
+        // addresses. `build()` already migrated the common persisted case, so
+        // this fires for a loopback set by flag or env, a non-default loopback
+        // value, or one `build()` deliberately kept (a gateway, or a
+        // `skip_load_from_network` node) that still lists a remote gateway.
+        if loopback_listener_with_remote_gateways(config.network_api.address, &gateway_addrs) {
+            tracing::warn!(
+                network_address = %config.network_api.address,
+                "network-address {} is a loopback address, so this node can only exchange \
+                 packets with this machine and cannot reach its non-loopback gateways \
+                 (#5798). Check the --network-address flag, the NETWORK_ADDRESS \
+                 environment variable and config.toml; use :: (or 0.0.0.0 on an \
+                 IPv4-only host) to listen on all interfaces.",
+                config.network_api.address
+            );
+        }
         if let Some(own_addr) = &config.peer_id {
             tracing::info!("Node external address: {}", own_addr.socket_addr());
         }
@@ -6352,6 +6382,33 @@ mod tests {
 
     use super::*;
     use rstest::rstest;
+
+    #[rstest]
+    // The #5798 shape: P2P socket on `::1`, gateways on the public internet.
+    #[case::v6_loopback_public_gateway("::1", &["5.9.111.215:31337"], true)]
+    #[case::v4_loopback_public_gateway("127.0.0.1", &["5.9.111.215:31337"], true)]
+    #[case::v4_mapped_loopback("::ffff:127.0.0.1", &["5.9.111.215:31337"], true)]
+    // One remote gateway is enough: it can never be reached.
+    #[case::mixed_gateways("::1", &["127.0.0.1:31337", "5.9.111.215:31337"], true)]
+    // Loopback-only test networks are deliberate.
+    #[case::all_loopback_gateways("127.0.0.1", &["127.0.0.2:31337", "[::1]:31338"], false)]
+    #[case::v4_mapped_loopback_gateway("::1", &["[::ffff:127.0.0.1]:31337"], false)]
+    #[case::no_gateways("::1", &[], false)]
+    #[case::wildcard_listener("::", &["5.9.111.215:31337"], false)]
+    #[case::v4_wildcard_listener("0.0.0.0", &["5.9.111.215:31337"], false)]
+    #[case::lan_listener("192.168.1.19", &["5.9.111.215:31337"], false)]
+    fn loopback_listener_with_remote_gateways_5798(
+        #[case] listener: &str,
+        #[case] gateways: &[&str],
+        #[case] expected: bool,
+    ) {
+        let listener: IpAddr = listener.parse().unwrap();
+        let gateways: Vec<SocketAddr> = gateways.iter().map(|g| g.parse().unwrap()).collect();
+        assert_eq!(
+            loopback_listener_with_remote_gateways(listener, &gateways),
+            expected
+        );
+    }
 
     /// Strip `//` comment lines from a source window before asserting on it.
     ///
@@ -15496,6 +15553,53 @@ mod tests {
             DigestVerdict::PeerHasNoState,
             "neither side holds state: nothing to exchange, nothing to heal"
         );
+    }
+
+    /// The unreachable-gateway warning is wired into `NodeConfig::new` and fed
+    /// the resolved gateway addresses (#5798): the predicate alone being right
+    /// says nothing about whether startup ever calls it.
+    mod loopback_listener_warning_wiring {
+        use super::*;
+        use crate::config::{Address, GatewayConfig};
+        use crate::contract::OperationMode;
+
+        async fn warnings_for(listener: IpAddr) -> Vec<String> {
+            let temp_dir = tempfile::tempdir().unwrap();
+            let dir = temp_dir.path();
+            let mut config = crate::config::event_log_test_args(dir, OperationMode::Network)
+                .build()
+                .await
+                .expect("build Config");
+            let key_path = dir.join("remote_gw.pub");
+            std::fs::write(&key_path, hex::encode([7u8; 32])).unwrap();
+            config.gateways = vec![GatewayConfig {
+                address: Address::HostAddress("5.9.111.215:31337".parse().unwrap()),
+                public_key_path: key_path,
+                location: None,
+            }];
+            config.network_api.address = listener;
+
+            let (logs, guard) = crate::util::test_log_capture::install();
+            NodeConfig::new(config).await.expect("build NodeConfig");
+            drop(guard);
+            let captured = logs.lock().unwrap().clone();
+            captured
+                .into_iter()
+                .filter(|l| l.starts_with("WARN") && l.contains("is a loopback address"))
+                .collect()
+        }
+
+        #[tokio::test]
+        async fn loopback_listener_with_a_remote_gateway_warns() {
+            let warnings = warnings_for(IpAddr::V6(Ipv6Addr::LOCALHOST)).await;
+            assert_eq!(warnings.len(), 1, "captured: {warnings:?}");
+        }
+
+        #[tokio::test]
+        async fn wildcard_listener_does_not_warn() {
+            let warnings = warnings_for(IpAddr::V6(Ipv6Addr::UNSPECIFIED)).await;
+            assert!(warnings.is_empty(), "captured: {warnings:?}");
+        }
     }
 
     /// #5035: the orphaned-`_EVENT_LOG`-segment reclaim must actually be wired

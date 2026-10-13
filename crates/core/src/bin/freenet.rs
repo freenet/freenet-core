@@ -1493,6 +1493,9 @@ fn run_node(config_args: ConfigArgs) -> anyhow::Result<()> {
         // this is the only place an operator learns that their node stopped
         // answering clients on other machines, and why.
         config.log_client_api_exposure();
+        // Same reason: a loopback `network-address` dropped from config.toml
+        // (#5798) is reported only on the boot that moved it.
+        config.log_network_address_migration();
         // The logger is needed before this info which is why it's here instead of above
         tracing::info!(
             max_blocking_threads,
