@@ -1,3 +1,16 @@
+/// Simulation-only instrumentation (the join timeline, #5858): the enclosed
+/// statements compile only in `test` / `testing` builds, so a production build
+/// contains none of them. Defined before the modules so it is in scope in all
+/// of them.
+macro_rules! sim_instrument {
+    ($($body:tt)*) => {
+        #[cfg(any(test, feature = "testing"))]
+        {
+            $($body)*
+        }
+    };
+}
+
 /// Clients events related logic and type definitions.
 pub(crate) mod client_events;
 
@@ -194,6 +207,7 @@ pub mod dev_tool {
     pub use crate::tracing::state_verifier::{StateAnomaly, StateVerifier, VerificationReport};
 
     // Per-peer join timeline recorded by the direct runner (#5858).
+    #[cfg(any(test, feature = "testing"))]
     pub use ring::join_timeline::{JoinTimeline, JoinTimelineRecorder};
 
     // Re-export topology registry for subscription validation in tests

@@ -160,13 +160,17 @@ pub(crate) async fn start_client_connect(
     // `start_relay_connect` and are deliberately NOT counted (#4348). Registered
     // before the first send below so it precedes any reply or completion.
     op_manager.ring.live_tx_tracker.register_acquisition(tx);
-    crate::ring::join_timeline::record_connect_initiated(own.pub_key());
-    crate::ring::join_timeline::record_note(own.pub_key(), || {
-        (
-            format!("CONNECT start tx={tx} kind={kind:?} desired={desired_location} via gateway"),
-            Some(gateway_addr),
-        )
-    });
+    sim_instrument! {
+        crate::ring::join_timeline::record_connect_initiated(own.pub_key());
+    }
+    sim_instrument! {
+        crate::ring::join_timeline::record_note(own.pub_key(), || {
+            (
+                format!("CONNECT start tx={tx} kind={kind:?} desired={desired_location} via gateway"),
+                Some(gateway_addr),
+            )
+        });
+    }
 
     // Snapshot whether the joiner knows its own external address before
     // contacting the gateway. Mirrors legacy `JoinerState`'s
@@ -266,16 +270,18 @@ pub(crate) async fn start_client_connect(
         None => inner.await,
     };
 
-    crate::ring::join_timeline::record_note(&op_manager.ring.connection_manager.pub_key, || {
-        (
-            format!(
-                "CONNECT end tx={tx} ok={} (tx age on the sim clock {}ms)",
-                outcome.is_ok(),
-                tx.elapsed().as_millis()
-            ),
-            None,
-        )
-    });
+    sim_instrument! {
+        crate::ring::join_timeline::record_note(&op_manager.ring.connection_manager.pub_key, || {
+            (
+                format!(
+                    "CONNECT end tx={tx} ok={} (tx age on the sim clock {}ms)",
+                    outcome.is_ok(),
+                    tx.elapsed().as_millis()
+                ),
+                None,
+            )
+        });
+    }
     op_manager.release_pending_op_slot(tx).await;
     outcome
 }
@@ -297,21 +303,20 @@ async fn drive_client_connect_inner(
     use std::collections::HashSet;
 
     let mut accepted: HashSet<PeerKeyLocation> = HashSet::with_capacity(target_connections);
-    let me = op_manager.ring.connection_manager.pub_key.clone();
-    let note = |what: String, remote: Option<std::net::SocketAddr>| {
-        crate::ring::join_timeline::record_note(&me, || (what, remote));
-    };
 
     loop {
         if should_exit_for_ttl(&tx) {
-            note(
-                format!(
-                    "driver exit tx={tx}: TTL (accepted {}, tx age {}ms)",
-                    accepted.len(),
-                    tx.elapsed().as_millis()
-                ),
-                None,
-            );
+            sim_instrument! {
+                crate::ring::join_timeline::record_note(
+                    &op_manager.ring.connection_manager.pub_key,
+                    || (format!(
+                        "driver exit tx={tx}: TTL (accepted {}, tx age {}ms)",
+                        accepted.len(),
+                        tx.elapsed().as_millis()
+                    ),
+                    None,),
+                );
+            }
             tracing::debug!(
                 %tx,
                 accepted = accepted.len(),
@@ -331,7 +336,12 @@ async fn drive_client_connect_inner(
         let msg = match tokio::time::timeout(RECV_POLL_INTERVAL, receiver.recv()).await {
             Ok(Some(WaiterReply::Reply(msg))) => msg,
             Ok(Some(WaiterReply::PeerDisconnected { peer })) => {
-                note(format!("driver exit tx={tx}: gateway disconnected"), None);
+                sim_instrument! {
+                    crate::ring::join_timeline::record_note(
+                        &op_manager.ring.connection_manager.pub_key,
+                        || (format!("driver exit tx={tx}: gateway disconnected"), None),
+                    );
+                }
                 // The gateway we sent the CONNECT Request to was pruned
                 // mid-flight (#4313). No further Responses will arrive on
                 // this waiter; end collection with whatever was accepted.
@@ -344,7 +354,12 @@ async fn drive_client_connect_inner(
                 break;
             }
             Ok(None) => {
-                note(format!("driver exit tx={tx}: receiver closed"), None);
+                sim_instrument! {
+                    crate::ring::join_timeline::record_note(
+                        &op_manager.ring.connection_manager.pub_key,
+                        || (format!("driver exit tx={tx}: receiver closed"), None),
+                    );
+                }
                 break;
             }
             Err(_) => continue,
@@ -387,10 +402,14 @@ async fn drive_client_connect_inner(
                     // Duplicate acceptor — ignore.
                     continue;
                 }
-                note(
-                    format!("Response tx={tx}: accepted by acceptor"),
-                    Some(acceptor_addr),
-                );
+                sim_instrument! {
+                    crate::ring::join_timeline::record_note(
+                        &op_manager.ring.connection_manager.pub_key,
+                        || (format!("Response tx={tx}: accepted by acceptor"),
+                        Some(acceptor_addr),),
+                    );
+                }
+                #[cfg(any(test, feature = "testing"))]
                 let connect_peer_started = tokio::time::Instant::now();
 
                 op_manager
@@ -489,14 +508,17 @@ async fn drive_client_connect_inner(
                     }
                 }
 
-                note(
-                    format!(
-                        "ConnectPeer tx={tx}: {} after {}ms",
-                        if hole_punch_ok { "connected" } else { "FAILED" },
-                        connect_peer_started.elapsed().as_millis()
-                    ),
-                    Some(acceptor_addr),
-                );
+                sim_instrument! {
+                    crate::ring::join_timeline::record_note(
+                        &op_manager.ring.connection_manager.pub_key,
+                        || (format!(
+                            "ConnectPeer tx={tx}: {} after {}ms",
+                            if hole_punch_ok { "connected" } else { "FAILED" },
+                            connect_peer_started.elapsed().as_millis()
+                        ),
+                        Some(acceptor_addr),),
+                    );
+                }
                 if !hole_punch_ok {
                     accepted.remove(&payload.acceptor);
                     let failed_msg = ConnectMsg::ConnectFailed {
@@ -555,7 +577,12 @@ async fn drive_client_connect_inner(
                         backoff.record_success(gateway_addr);
                     }
                     op_manager.ring.record_connection_success(desired_location);
-                    note(format!("driver exit tx={tx}: target reached"), None);
+                    sim_instrument! {
+                        crate::ring::join_timeline::record_note(
+                            &op_manager.ring.connection_manager.pub_key,
+                            || (format!("driver exit tx={tx}: target reached"), None),
+                        );
+                    }
                     tracing::info!(
                         tx = %tx,
                         accepted = accepted.len(),
@@ -569,12 +596,15 @@ async fn drive_client_connect_inner(
                 desired_location: dl,
                 ..
             } => {
-                note(
-                    format!(
-                        "driver exit tx={tx}: Rejected (desired {dl}), gateway backoff recorded"
-                    ),
-                    Some(gateway_addr),
-                );
+                sim_instrument! {
+                    crate::ring::join_timeline::record_note(
+                        &op_manager.ring.connection_manager.pub_key,
+                        || (format!(
+                            "driver exit tx={tx}: Rejected (desired {dl}), gateway backoff recorded"
+                        ),
+                        Some(gateway_addr),),
+                    );
+                }
                 tracing::info!(
                     tx = %tx,
                     desired_location = %dl,
@@ -760,15 +790,17 @@ pub(crate) async fn start_relay_connect(
     RELAY_CONNECT_DRIVER_CALL_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
     if !op_manager.active_relay_connect_txs.insert(incoming_tx) {
-        crate::ring::join_timeline::record_note(
-            &op_manager.ring.connection_manager.pub_key,
-            || {
-                (
-                    format!("relay tx={incoming_tx}: duplicate Request dropped (dedup)"),
-                    Some(upstream_addr),
-                )
-            },
-        );
+        sim_instrument! {
+            crate::ring::join_timeline::record_note(
+                &op_manager.ring.connection_manager.pub_key,
+                || {
+                    (
+                        format!("relay tx={incoming_tx}: duplicate Request dropped (dedup)"),
+                        Some(upstream_addr),
+                    )
+                },
+            );
+        }
         RELAY_CONNECT_DEDUP_REJECTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         tracing::debug!(
             tx = %incoming_tx,

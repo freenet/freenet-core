@@ -1548,16 +1548,18 @@ pub(crate) async fn join_ring_request(
         .connection_manager
         .should_accept(gateway_location, gateway_addr)
     {
-        crate::ring::join_timeline::record_note(
-            &op_manager.ring.connection_manager.pub_key,
-            || {
-                (
-                "join_ring_request: gateway refused by own should_accept (pending or connected)"
-                    .to_string(),
-                Some(gateway_addr),
-            )
-            },
-        );
+        sim_instrument! {
+            crate::ring::join_timeline::record_note(
+                &op_manager.ring.connection_manager.pub_key,
+                || {
+                    (
+                    "join_ring_request: gateway refused by own should_accept (pending or connected)"
+                        .to_string(),
+                    Some(gateway_addr),
+                )
+                },
+            );
+        }
         return Err(OpError::ConnError(ConnectionError::UnwantedConnection));
     }
 
@@ -1942,17 +1944,19 @@ pub(crate) async fn initial_join_procedure(
             );
 
             let unconnected_count = unconnected_gateways.len();
-            crate::ring::join_timeline::record_note(
-                &op_manager.ring.connection_manager.pub_key,
-                || {
-                    (
-                        format!(
-                            "join round: open={open_conns} unconnected_gateways={unconnected_count}"
-                        ),
-                        None,
-                    )
-                },
-            );
+            sim_instrument! {
+                crate::ring::join_timeline::record_note(
+                    &op_manager.ring.connection_manager.pub_key,
+                    || {
+                        (
+                            format!(
+                                "join round: open={open_conns} unconnected_gateways={unconnected_count}"
+                            ),
+                            None,
+                        )
+                    },
+                );
+            }
 
             // When fully isolated (0 connections) but all gateways appear "connected/pending",
             // force-clear stale pending reservations so gateways become retryable immediately.
@@ -2052,17 +2056,19 @@ pub(crate) async fn initial_join_procedure(
                             "All gateways in backoff, waiting before retry"
                         );
                         record_round(StartupRoundOutcome::BackoffBlocked);
-                        crate::ring::join_timeline::record_note(
-                            &op_manager.ring.connection_manager.pub_key,
-                            || {
-                                (
-                                    format!(
-                                        "join round: all gateways in backoff, waiting {effective_wait:?}"
-                                    ),
-                                    None,
-                                )
-                            },
-                        );
+                        sim_instrument! {
+                            crate::ring::join_timeline::record_note(
+                                &op_manager.ring.connection_manager.pub_key,
+                                || {
+                                    (
+                                        format!(
+                                            "join round: all gateways in backoff, waiting {effective_wait:?}"
+                                        ),
+                                        None,
+                                    )
+                                },
+                            );
+                        }
                         tokio::select! {
                             _ = tokio::time::sleep(effective_wait) => {},
                             _ = op_manager.gateway_backoff_cleared.notified() => {
@@ -2179,15 +2185,17 @@ pub(crate) async fn initial_join_procedure(
                     // an operator told to watch `no_target` instead would watch
                     // a flat zero for the whole outage.
                     record_round(StartupRoundOutcome::ConnectIssuedRouted);
-                    crate::ring::join_timeline::record_note(
-                        &op_manager.ring.connection_manager.pub_key,
-                        || {
-                            (
-                                "join round: routing CONNECTs via connected gateways".to_string(),
-                                None,
-                            )
-                        },
-                    );
+                    sim_instrument! {
+                        crate::ring::join_timeline::record_note(
+                            &op_manager.ring.connection_manager.pub_key,
+                            || {
+                                (
+                                    "join round: routing CONNECTs via connected gateways".to_string(),
+                                    None,
+                                )
+                            },
+                        );
+                    }
                     tracing::info!(
                         eligible = eligible.len(),
                         total_gateways = gateways.len(),
@@ -2236,17 +2244,19 @@ pub(crate) async fn initial_join_procedure(
                     // transport apparently up and every gateway backed off),
                     // i.e. exactly when the classification matters most.
                     record_round(StartupRoundOutcome::BackoffBlocked);
-                    crate::ring::join_timeline::record_note(
-                        &op_manager.ring.connection_manager.pub_key,
-                        || {
-                            (
-                                format!(
-                                    "join round: {blocked_by_backoff} connected gateways in backoff"
-                                ),
-                                None,
-                            )
-                        },
-                    );
+                    sim_instrument! {
+                        crate::ring::join_timeline::record_note(
+                            &op_manager.ring.connection_manager.pub_key,
+                            || {
+                                (
+                                    format!(
+                                        "join round: {blocked_by_backoff} connected gateways in backoff"
+                                    ),
+                                    None,
+                                )
+                            },
+                        );
+                    }
                     tracing::info!(
                         blocked_by_backoff,
                         total_gateways = gateways.len(),
@@ -2305,15 +2315,17 @@ pub(crate) async fn initial_join_procedure(
                 LONG_WAIT_SECS * 1000
             };
 
-            crate::ring::join_timeline::record_note(
-                &op_manager.ring.connection_manager.pub_key,
-                || {
-                    (
-                        format!("join round end: sleeping {}ms", base_wait_ms + jitter_ms),
-                        None,
-                    )
-                },
-            );
+            sim_instrument! {
+                crate::ring::join_timeline::record_note(
+                    &op_manager.ring.connection_manager.pub_key,
+                    || {
+                        (
+                            format!("join round end: sleeping {}ms", base_wait_ms + jitter_ms),
+                            None,
+                        )
+                    },
+                );
+            }
             tokio::time::sleep(Duration::from_millis(base_wait_ms + jitter_ms)).await;
         }
     });

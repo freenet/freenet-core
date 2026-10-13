@@ -1965,6 +1965,7 @@ impl SimNetwork {
         self
     }
 
+    #[cfg(any(test, feature = "testing"))]
     /// Registers a [`JoinTimelineRecorder`](crate::ring::join_timeline::JoinTimelineRecorder)
     /// for this network and returns it. The direct runner starts its clock;
     /// afterwards it holds, per peer, when the node started, when it initiated
@@ -6735,6 +6736,7 @@ impl Drop for SimNetwork {
         clear_renewal_metrics(&self.name);
         clear_summarize_metrics(&self.name);
         clear_zombie_sweep_observations(&self.name);
+        #[cfg(any(test, feature = "testing"))]
         crate::ring::join_timeline::clear_join_timeline_recorder(&self.name);
         remove_network_socket_registry(&self.name);
         clear_network_address_mappings(&self.name);

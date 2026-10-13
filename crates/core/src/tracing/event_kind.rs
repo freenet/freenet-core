@@ -508,6 +508,7 @@ impl EventKind {
 
     /// Returns the disconnect reason (variant name, plus the message for
     /// `Explicit`/`NetworkError`) if this is a `Disconnected` event.
+    #[cfg(any(test, feature = "testing"))]
     #[allow(clippy::wildcard_enum_match_arm)]
     pub fn disconnect_reason_label(&self) -> Option<String> {
         match self {
@@ -518,6 +519,7 @@ impl EventKind {
 
     /// Returns the reason string if this is a `ConnectEvent::Rejected`,
     /// `None` for all other events.
+    #[cfg(any(test, feature = "testing"))]
     #[allow(clippy::wildcard_enum_match_arm)]
     pub fn connect_rejected_reason(&self) -> Option<&str> {
         match self {
@@ -528,6 +530,7 @@ impl EventKind {
 
     /// Returns the public key of the peer a `ConnectEvent::RequestReceived`
     /// was forwarded to, `None` for other events or a terminus hop.
+    #[cfg(any(test, feature = "testing"))]
     #[allow(clippy::wildcard_enum_match_arm)]
     pub fn connect_request_forwarded_to(&self) -> Option<&crate::transport::TransportPublicKey> {
         match self {
@@ -542,6 +545,7 @@ impl EventKind {
     /// Returns the joiner's public key if this is a
     /// `ConnectEvent::RequestReceived`, `None` for all other events. Lets a
     /// simulation attribute CONNECT hops to the peer that asked (#5858).
+    #[cfg(any(test, feature = "testing"))]
     #[allow(clippy::wildcard_enum_match_arm)]
     pub fn connect_request_received_joiner(&self) -> Option<&crate::transport::TransportPublicKey> {
         match self {

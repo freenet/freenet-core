@@ -105,6 +105,7 @@ pub(crate) use connection_manager::nn_lattice_active_for;
 pub use connection_manager::{set_nn_lattice_enabled, set_nn_lattice_force_active};
 mod connection;
 mod hosting;
+#[cfg(any(test, feature = "testing"))]
 pub mod join_timeline;
 pub(crate) use broken_invariants::{BrokenInvariant, BrokenInvariantsTracker};
 /// Pre-write admission-gate rejection type (#4683, PR 3). Surfaced to the
@@ -6482,9 +6483,11 @@ impl Ring {
                             ever_connected = ever_had_connections,
                             "Node isolated with zero ring connections — resetting all backoff state"
                         );
-                        join_timeline::record_note(&self.connection_manager.pub_key, || {
-                            ("isolation: resetting all backoff".to_string(), None)
-                        });
+                        sim_instrument! {
+                            join_timeline::record_note(&self.connection_manager.pub_key, || {
+                                ("isolation: resetting all backoff".to_string(), None)
+                            });
+                        }
                         reset_all_backoff();
                         zero_connections_since = Some(self.time_source.now());
                     }
