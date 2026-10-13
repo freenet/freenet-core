@@ -1523,9 +1523,15 @@ fn run_node(config_args: ConfigArgs) -> anyhow::Result<()> {
 /// while the operator believes they opted out. Previously the same typo was
 /// harmless, because network mode bound `::` either way.
 ///
+/// `--network-address` gets the same treatment (#5798): a persisted loopback
+/// address is re-derived unless this boot passes the flag, so dropping a
+/// pre-subcommand `--network-address` would discard the operator's explicit
+/// choice and then widen their bind.
+///
 /// The subcommand's own value wins; the top-level one only fills a gap.
 fn merge_pre_subcommand_ws_api_args(config: &mut ConfigArgs, top_level: &ConfigArgs) {
     config.ws_api.address = config.ws_api.address.or(top_level.ws_api.address);
+    config.network_api.address = config.network_api.address.or(top_level.network_api.address);
     config.ws_api.allowed_host = config
         .ws_api
         .allowed_host
@@ -2212,6 +2218,48 @@ mod tests {
                 config.ws_api.allowed_source_cidrs.as_deref(),
                 Some(&["100.64.0.0/10".to_string()][..]),
                 "--allowed-source-cidrs must survive in either position: {argv:?}"
+            );
+        }
+    }
+
+    /// #5798: an explicit `--network-address` must survive in either position,
+    /// or `build()` treats the boot as flag-less and re-derives a persisted
+    /// loopback address the operator just asked for.
+    #[test]
+    fn network_address_is_honored_before_the_subcommand() {
+        use super::{Cli, Command, merge_pre_subcommand_ws_api_args};
+        use clap::Parser;
+        for (argv, expected) in [
+            (
+                vec!["freenet", "--network-address", "::1", "network"],
+                "::1",
+            ),
+            (
+                vec!["freenet", "network", "--network-address", "::1"],
+                "::1",
+            ),
+            (
+                vec![
+                    "freenet",
+                    "--network-address",
+                    "::1",
+                    "network",
+                    "--network-address",
+                    "127.0.0.1",
+                ],
+                "127.0.0.1",
+            ),
+        ] {
+            let cli = Cli::try_parse_from(&argv).expect("parse");
+            let mut config = match cli.command {
+                Some(Command::Network { config }) => config,
+                _ => panic!("expected network subcommand"),
+            };
+            merge_pre_subcommand_ws_api_args(&mut config, &cli.config);
+            assert_eq!(
+                config.network_api.address,
+                Some(expected.parse().unwrap()),
+                "{argv:?}"
             );
         }
     }

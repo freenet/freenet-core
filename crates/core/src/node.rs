@@ -726,16 +726,18 @@ impl NodeConfig {
             config.network_api.port
         );
         // After the gateway loop because it needs the resolved gateway
-        // addresses. A persisted loopback was already migrated by `build()`, so
-        // this fires for one set this boot by flag, env or a non-default value.
+        // addresses. `build()` already migrated the common persisted case, so
+        // this fires for a loopback set by flag or env, a non-default loopback
+        // value, or one `build()` deliberately kept (a gateway, or a
+        // `skip_load_from_network` node) that still lists a remote gateway.
         if loopback_listener_with_remote_gateways(config.network_api.address, &gateway_addrs) {
             tracing::warn!(
                 network_address = %config.network_api.address,
                 "network-address {} is a loopback address, so this node can only exchange \
-                 packets with this machine and cannot reach its gateways (#5798). It will \
-                 not join the network. Check the --network-address flag, the \
-                 NETWORK_ADDRESS environment variable and config.toml; use :: (or 0.0.0.0 \
-                 on an IPv4-only host) to listen on all interfaces.",
+                 packets with this machine and cannot reach its non-loopback gateways \
+                 (#5798). Check the --network-address flag, the NETWORK_ADDRESS \
+                 environment variable and config.toml; use :: (or 0.0.0.0 on an \
+                 IPv4-only host) to listen on all interfaces.",
                 config.network_api.address
             );
         }
@@ -15553,14 +15555,6 @@ mod tests {
         );
     }
 
-    /// #5035: the orphaned-`_EVENT_LOG`-segment reclaim must actually be wired
-    /// into node startup, and must respect the enabled/disabled decision there.
-    ///
-    /// These drive the real startup entry point (`NodeConfig::new`, what
-    /// `freenet network` calls) rather than the reclaim helper directly, so
-    /// deleting the call from `NodeConfig::new` turns them red. Six PRs in this
-    /// disk-usage series shipped tests that passed with the production call
-    /// site removed; this is the check that catches that.
     /// The unreachable-gateway warning is wired into `NodeConfig::new` and fed
     /// the resolved gateway addresses (#5798): the predicate alone being right
     /// says nothing about whether startup ever calls it.
@@ -15608,6 +15602,14 @@ mod tests {
         }
     }
 
+    /// #5035: the orphaned-`_EVENT_LOG`-segment reclaim must actually be wired
+    /// into node startup, and must respect the enabled/disabled decision there.
+    ///
+    /// These drive the real startup entry point (`NodeConfig::new`, what
+    /// `freenet network` calls) rather than the reclaim helper directly, so
+    /// deleting the call from `NodeConfig::new` turns them red. Six PRs in this
+    /// disk-usage series shipped tests that passed with the production call
+    /// site removed; this is the check that catches that.
     mod event_log_reclaim_wiring {
         use super::*;
         use crate::contract::OperationMode;
