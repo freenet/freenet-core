@@ -7,8 +7,8 @@
 //! again. Three pieces here bound that:
 //!
 //! - [`BootstrapRound`]: a CONNECT sent with no ring connection ends once
-//!   nothing is in flight and nothing has arrived for
-//!   [`BOOTSTRAP_REPLY_QUIET`], instead of at the TTL.
+//!   nothing is in flight and nothing has arrived for a quiet window
+//!   ([`BootstrapTiming`]), instead of at the TTL.
 //! - [`AcceptorDialQueue`]: acceptors are dialled concurrently, up to
 //!   [`MAX_CONCURRENT_ACCEPTOR_DIALS`], so an unreachable acceptor no longer
 //!   holds up a reachable one until its hole-punch window has passed.
@@ -26,14 +26,13 @@ use tokio::time::Instant;
 use crate::config::GlobalRng;
 use crate::util::backoff::ExponentialBackoff;
 
-/// How long a bootstrapping CONNECT waits, with no dial in flight, for one
-/// more reply before it ends.
+/// How long a bootstrapping CONNECT waits after a dial outcome, with no dial
+/// in flight, for one more reply before it ends ([`BootstrapTiming`] doubles
+/// it before the first dial outcome).
 ///
 /// Two hole-punch deadlines: a dial that fails at the end of the acceptor's
 /// punch window makes the joiner send `ConnectFailed`, and the relay's
-/// re-routed acceptor has to answer within this window. A live gateway's first
-/// reply (`ObservedAddress`) arrives within one round trip, so a CONNECT that
-/// hears nothing at all in this window went into a dead gateway link.
+/// re-routed acceptor has to answer within this window.
 pub(crate) const BOOTSTRAP_REPLY_QUIET: Duration =
     Duration::from_secs(2 * crate::transport::connection_handler::NAT_TRAVERSAL_DEADLINE.as_secs());
 
@@ -62,39 +61,90 @@ pub(crate) enum BootstrapExit {
     NoReply,
 }
 
+/// How long a bootstrapping CONNECT waits for its next reply (#5858).
+///
+/// Two windows, because the first reply takes longer than the later ones:
+/// before any acceptor has been dialled the request still has to cross the
+/// gateway and a chain of relays, and an acceptor's Response comes back the
+/// same way; after a dial outcome the only thing left to wait for is a
+/// re-routed acceptor answering a `ConnectFailed`. Both are provisional
+/// until calibrated from the `time_to_first_ring_connection` telemetry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct BootstrapTiming {
+    /// Quiet time allowed before the first dial outcome.
+    pub(crate) before_first_dial: Duration,
+    /// Quiet time allowed after a dial outcome.
+    pub(crate) after_dial: Duration,
+}
+
+impl Default for BootstrapTiming {
+    fn default() -> Self {
+        Self {
+            before_first_dial: 2 * BOOTSTRAP_REPLY_QUIET,
+            after_dial: BOOTSTRAP_REPLY_QUIET,
+        }
+    }
+}
+
 /// Exit policy for one CONNECT sent while this peer had no ring connection.
 ///
 /// Disabled (never exits early) for a peer that already had a connection when
 /// the CONNECT started, which keeps the TTL-bounded collection that ring
 /// acquisition relies on.
+///
+/// The quiet clock starts when the gateway link is up (the transport is
+/// established, or the gateway has answered), so a slow handshake does not
+/// eat the window. If the link is not up within the NAT traversal deadline
+/// the handshake has failed, and the clock starts then.
 #[derive(Debug)]
 pub(crate) struct BootstrapRound {
     enabled: bool,
-    last_activity: Instant,
+    timing: BootstrapTiming,
+    started: Instant,
+    link_up_at: Option<Instant>,
+    last_activity: Option<Instant>,
+    dial_outcome_seen: bool,
     heard_anything: bool,
     connected: bool,
 }
 
 impl BootstrapRound {
-    pub(crate) fn new(enabled: bool, now: Instant) -> Self {
+    pub(crate) fn new(enabled: bool, now: Instant, timing: BootstrapTiming) -> Self {
         Self {
             enabled,
-            last_activity: now,
+            timing,
+            started: now,
+            link_up_at: None,
+            last_activity: None,
+            dial_outcome_seen: false,
             heard_anything: false,
             connected: false,
         }
     }
 
-    /// Any message for this transaction arrived.
+    /// Whether the link to the gateway is known to be up.
+    pub(crate) fn link_up(&self) -> bool {
+        self.link_up_at.is_some()
+    }
+
+    /// The gateway transport is established.
+    pub(crate) fn on_link_up(&mut self, now: Instant) {
+        self.link_up_at.get_or_insert(now);
+    }
+
+    /// Any message for this transaction arrived (which also shows the
+    /// gateway link is up).
     pub(crate) fn on_reply(&mut self, now: Instant) {
+        self.on_link_up(now);
         self.heard_anything = true;
-        self.last_activity = now;
+        self.last_activity = Some(now);
     }
 
     /// A dial to an acceptor finished.
     pub(crate) fn on_dial_done(&mut self, now: Instant, connected: bool) {
+        self.dial_outcome_seen = true;
         self.connected |= connected;
-        self.last_activity = now;
+        self.last_activity = Some(now);
     }
 
     /// Whether the CONNECT should end now. `busy` is true while a dial is in
@@ -104,7 +154,16 @@ impl BootstrapRound {
         if !self.enabled || busy {
             return None;
         }
-        if now.saturating_duration_since(self.last_activity) < BOOTSTRAP_REPLY_QUIET {
+        let origin = self
+            .link_up_at
+            .unwrap_or(self.started + crate::transport::connection_handler::NAT_TRAVERSAL_DEADLINE);
+        let reference = self.last_activity.map_or(origin, |t| t.max(origin));
+        let window = if self.dial_outcome_seen {
+            self.timing.after_dial
+        } else {
+            self.timing.before_first_dial
+        };
+        if now.saturating_duration_since(reference) < window {
             return None;
         }
         Some(if self.connected {
@@ -298,59 +357,98 @@ mod tests {
         start + Duration::from_secs_f64(secs)
     }
 
+    fn round(t0: Instant) -> BootstrapRound {
+        BootstrapRound::new(true, t0, BootstrapTiming::default())
+    }
+
     #[test]
-    fn bootstrap_round_waits_for_quiet_then_reports_how_it_ended() {
+    fn bootstrap_round_uses_the_long_window_until_a_dial_outcome() {
         let t0 = Instant::now();
-        let mut round = BootstrapRound::new(true, t0);
+        let timing = BootstrapTiming::default();
+        let mut round = round(t0);
+        round.on_reply(at(t0, 0.2));
+        assert_eq!(round.exit(at(t0, 0.2) + timing.after_dial, false), None);
+        assert_eq!(
+            round.exit(at(t0, 0.2) + timing.before_first_dial, false),
+            Some(BootstrapExit::AllFailed)
+        );
+    }
+
+    #[test]
+    fn bootstrap_round_uses_the_short_window_after_a_dial_outcome() {
+        let t0 = Instant::now();
+        let timing = BootstrapTiming::default();
+        let mut round = round(t0);
         round.on_reply(at(t0, 0.2));
         round.on_dial_done(at(t0, 3.0), false);
+        let after = at(t0, 3.0);
         assert_eq!(
-            round.exit(at(t0, 3.0 + 5.9), false),
-            None,
-            "still quiet-waiting"
+            round.exit(after + timing.after_dial - Duration::from_millis(1), false),
+            None
         );
         assert_eq!(
-            round.exit(at(t0, 3.0 + 6.0), false),
+            round.exit(after + timing.after_dial, false),
             Some(BootstrapExit::AllFailed)
         );
         round.on_dial_done(at(t0, 10.0), true);
         assert_eq!(
-            round.exit(at(t0, 16.0), false),
+            round.exit(at(t0, 10.0) + timing.after_dial, false),
             Some(BootstrapExit::Connected)
+        );
+    }
+
+    #[test]
+    fn bootstrap_round_quiet_clock_starts_when_the_link_is_up() {
+        let t0 = Instant::now();
+        let timing = BootstrapTiming::default();
+        let mut round = round(t0);
+        // A slow gateway handshake: the link comes up at 5 s.
+        round.on_link_up(at(t0, 5.0));
+        assert_eq!(
+            round.exit(
+                at(t0, 5.0) + timing.before_first_dial - Duration::from_millis(1),
+                false
+            ),
+            None,
+            "the window counts from the link coming up, not from the start"
+        );
+        assert_eq!(
+            round.exit(at(t0, 5.0) + timing.before_first_dial, false),
+            Some(BootstrapExit::NoReply)
+        );
+    }
+
+    #[test]
+    fn bootstrap_round_without_a_link_counts_from_the_handshake_deadline() {
+        let t0 = Instant::now();
+        let timing = BootstrapTiming::default();
+        let round = round(t0);
+        let deadline = t0 + crate::transport::connection_handler::NAT_TRAVERSAL_DEADLINE;
+        assert_eq!(
+            round.exit(
+                deadline + timing.before_first_dial - Duration::from_millis(1),
+                false
+            ),
+            None
+        );
+        assert_eq!(
+            round.exit(deadline + timing.before_first_dial, false),
+            Some(BootstrapExit::NoReply)
         );
     }
 
     #[test]
     fn bootstrap_round_never_exits_while_a_dial_is_pending() {
         let t0 = Instant::now();
-        let round = BootstrapRound::new(true, t0);
+        let round = round(t0);
         assert_eq!(round.exit(at(t0, 1000.0), true), None);
-    }
-
-    #[test]
-    fn bootstrap_round_with_no_reply_at_all_reports_a_dead_link() {
-        let t0 = Instant::now();
-        let round = BootstrapRound::new(true, t0);
-        assert_eq!(round.exit(at(t0, 6.0), false), Some(BootstrapExit::NoReply));
     }
 
     #[test]
     fn bootstrap_round_disabled_for_a_connected_peer_never_exits_early() {
         let t0 = Instant::now();
-        let round = BootstrapRound::new(false, t0);
+        let round = BootstrapRound::new(false, t0, BootstrapTiming::default());
         assert_eq!(round.exit(at(t0, 1000.0), false), None);
-    }
-
-    #[test]
-    fn quiet_window_covers_a_failed_punch_and_a_re_route() {
-        assert!(
-            BOOTSTRAP_REPLY_QUIET > crate::transport::connection_handler::NAT_TRAVERSAL_DEADLINE,
-            "a re-routed acceptor answers after the failed acceptor's punch window"
-        );
-        assert!(
-            BOOTSTRAP_REPLY_QUIET < crate::config::OPERATION_TTL / 4,
-            "the point is to end well before the transaction TTL"
-        );
     }
 
     #[test]

@@ -2473,11 +2473,14 @@ mod tests {
                     .find(|t| **t > Duration::from_secs(1))
                     .copied();
                 assert!(
-                    second_round.is_some_and(|t| t < Duration::from_secs(15)),
+                    second_round.is_some_and(|t| t < Duration::from_secs(20)),
                     "the second round must start seconds after the first, not after the \
                      transaction TTL; CONNECT requests at {requests:?}"
                 );
-                // Rounds: quiet window plus 1, 2, 4, 8, 16, 30 s (+-20%) of backoff,
+                // A round with no reply lasts the handshake deadline plus the
+                // pre-dial quiet window (3 + 12 s); the second starts after 1 s of
+                // backoff, at ~16 s, against the 60 s TTL before.
+                // Rounds: that, plus 1, 2, 4, 8, 16, 30 s (+-20%) of backoff,
                 // two gateways per round. A storm, or two paths running rounds
                 // at once, would exceed this.
                 assert!(
