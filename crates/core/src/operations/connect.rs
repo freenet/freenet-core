@@ -2103,6 +2103,11 @@ pub(crate) async fn initial_join_procedure(
                     .take(number_of_parallel_connections)
                 {
                     tracing::info!(%gateway, "Attempting connection to gateway");
+                    if let (Some(round), Some(addr)) =
+                        (bootstrap_round.as_ref(), gateway.socket_addr())
+                    {
+                        round.own_reservation(addr);
+                    }
                     let op_manager = op_manager.clone();
                     select_all.push(async move {
                         (join_ring_request(gateway, &op_manager, None).await, gateway)

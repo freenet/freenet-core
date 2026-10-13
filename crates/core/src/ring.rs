@@ -6539,10 +6539,11 @@ impl Ring {
             //
             // Shares the bootstrap pacer with `initial_join_procedure` (#5858),
             // so the two never run a round at the same time and failed rounds
-            // are spaced by one backoff. While no round is running, a gateway
-            // reservation is a leftover of a finished round of our own (only
-            // our outbound attempts reserve a gateway), so it is cleared rather
-            // than left to gate this path for the reservation TTL. The round's
+            // are spaced by one backoff. Gateway reservations left by finished
+            // paced rounds are cleared rather than left to gate this path for
+            // the reservation TTL; one made by a CONNECT sent outside a round
+            // (while this peer still had a connection) may be live, so it is
+            // left alone. The round's
             // CONNECTs run in a spawned task: awaited here they held the whole
             // maintenance loop for a transaction TTL.
             if current_conn_count == 0 && !op_manager.configured_gateways.is_empty() {
@@ -6552,13 +6553,9 @@ impl Ring {
                         tokio::time::Instant::now(),
                     )
                 {
-                    let gateway_addrs: Vec<_> = op_manager
-                        .configured_gateways
-                        .iter()
-                        .filter_map(|gw| gw.socket_addr())
-                        .collect();
+                    let owned = op_manager.bootstrap_pacer.lock().take_owned_reservations();
                     self.connection_manager
-                        .clear_pending_reservations_for(&gateway_addrs);
+                        .clear_pending_reservations_for(&owned);
                     let eligible: Vec<_> = {
                         let backoff = op_manager.gateway_backoff.lock();
                         self.is_not_connected(op_manager.configured_gateways.iter())
@@ -6583,6 +6580,9 @@ impl Ring {
                             "Zero connections — attempting gateway bootstrap"
                         );
                         round.issued = true;
+                        for addr in eligible.iter().filter_map(|gw| gw.socket_addr()) {
+                            round.own_reservation(addr);
+                        }
                         let op_manager = op_manager.clone();
                         GlobalExecutor::spawn(async move {
                             use futures::StreamExt;
