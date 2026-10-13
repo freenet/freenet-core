@@ -2116,10 +2116,10 @@ impl Config {
                 "Ignoring network-address {ignored} from config.toml: a network listener \
                  bound to loopback cannot reach the public gateways (#5798). Older \
                  `freenet local` runs wrote this value; it may also come from a hand edit \
-                 or an earlier --network-address flag. Will listen on {} instead. On a \
-                 local or test network, pass --skip-load-from-network; to keep a specific \
-                 address, pass --network-address after the subcommand, or set \
-                 NETWORK_ADDRESS, on every start.",
+                 or an earlier --network-address flag. Will listen on {} instead. To keep \
+                 a loopback address on a local or test network, pass both \
+                 --skip-load-from-network and --network-address (or set NETWORK_ADDRESS) \
+                 on every start.",
                 self.network_api.address
             );
         }
@@ -11303,6 +11303,14 @@ shutdown-drain-secs = 42
         // Boot 3: the migrated value is what config.toml now holds, so there is
         // nothing left to report. Re-announcing an unchanged bind every boot is
         // how a log line gets tuned out.
+        let rewritten = std::fs::read_to_string(dir.path().join("config.toml")).unwrap();
+        assert!(
+            !rewritten.contains("dropped") && rewritten.contains(r#"network-address = "::""#),
+            "the migration boot must persist the re-derived address and nothing else: the \
+             record is per-boot (`#[serde(skip)]`), and an older binary restored by \
+             rollback must not meet a key it does not know:\n{rewritten}"
+        );
+
         let steady = boot_network_address(dir.path(), OperationMode::Network, None, false).await;
         assert_eq!(steady.network_api.address, default_listening_address());
         assert_eq!(steady.network_api.dropped_persisted_loopback, None);
@@ -11519,10 +11527,12 @@ shutdown-drain-secs = 42
         };
         let logger = at_statement("freenet::config::set_logger(");
         let report = at_statement("config.log_network_address_migration();");
+        let node = at_statement("run(config).await");
         assert!(
-            logger < report,
-            "log_network_address_migration must run after set_logger, or its one-shot \
-             warning has no subscriber and is lost"
+            logger < report && report < node,
+            "log_network_address_migration must run after set_logger (or its one-shot \
+             warning has no subscriber) and before the node starts (or a startup failure \
+             loses it, with config.toml already rewritten)"
         );
     }
 
