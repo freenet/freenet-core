@@ -1887,7 +1887,8 @@ fn structural_path_missing_response(
 ///   bundle does unpack. `errors.rs` sets `no-store` on its transient answers
 ///   for the same reason. Since #5323 the route also sets `no-store` on every
 ///   response under the contract key (`client_api::no_store`). This header is
-///   kept so that callers which bypass the router still get it.
+///   kept as belt-and-braces, and the unit tests here that call
+///   `variable_content` directly pin it.
 fn asset_not_found_response() -> axum::response::Response {
     (
         axum::http::StatusCode::NOT_FOUND,

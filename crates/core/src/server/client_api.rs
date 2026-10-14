@@ -2756,16 +2756,22 @@ mod tests {
 
         // Routes outside the contract subtree keep their own cache policy: the
         // notification worker is deliberately cacheable, and the node's own
-        // pages and unmatched paths are out of scope (#4289).
+        // pages are out of scope (#4289). These catch the layer being widened to
+        // the whole router. (Whether the 404 fallback is wrapped depends on
+        // merge order here, so `no_store`'s own test pins that.)
         let resp = get("/freenet-notify-sw.js".to_string(), None).await;
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(cache_control(&resp).as_deref(), Some("max-age=3600"));
-        for uri in ["/v1/version", "/no-such-route"] {
+        for (uri, status) in [
+            ("/v1/version", StatusCode::OK),
+            ("/no-such-route", StatusCode::NOT_FOUND),
+        ] {
             let resp = get(uri.to_string(), None).await;
-            assert_eq!(
-                cache_control(&resp),
-                None,
-                "{uri} is outside the contract subtree and must not be no-store"
+            assert_eq!(resp.status(), status, "{uri}");
+            assert_ne!(
+                cache_control(&resp).as_deref(),
+                Some("no-store"),
+                "{uri} is outside the contract subtree and must not get its no-store"
             );
         }
 
