@@ -10,7 +10,7 @@ import { test, expect, type Response } from "@playwright/test";
 // `client_api.rs`).
 //
 // The header is applied by a layer over the contract-content routes in
-// `client_api/v1.rs` and `v2.rs`, keyed on `Content-Type: text/html`. The Rust
+// `client_api/v1.rs` and `v2.rs`, keyed on the HTML `Content-Type`. The Rust
 // router test (`contract_html_is_served_no_store_and_assets_are_not` in
 // `client_api.rs`) drives every pipeline, including the JS rewrite branch and
 // `ServeFile` assets, which this fixture never reaches because it contains

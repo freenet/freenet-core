@@ -384,9 +384,9 @@ impl Config {
 /// are content-hashed.
 ///
 /// Assets are deliberately not touched. Hashed assets are safe to cache, and
-/// the reverse proxy in front of try.freenet.org (nova's Caddyfile, `@assets`
-/// in that vhost) adds `Cache-Control: public, max-age=31536000, immutable` to
-/// every path under `assets/`. It passes the node's own `Cache-Control` through
+/// the reverse proxy in front of try.freenet.org (its `@assets` matcher) adds
+/// `Cache-Control: public, max-age=31536000, immutable` to files directly under
+/// `assets/`. It passes the node's own `Cache-Control` through
 /// alongside, so a `no-store` from here would cancel that in the browser.
 /// Unhashed assets served by `ServeFile` therefore stay heuristically cacheable
 /// through its `Last-Modified`. Fixing those needs conditional requests plus
@@ -2702,8 +2702,8 @@ mod tests {
             // real browser session.
             const NO_STORE: Option<&str> = Some("no-store");
             // The last column records whether the response carries
-            // `Last-Modified`, which is what makes a response heuristically
-            // cacheable. It pins the premises the scoping rests on: the JS
+            // `Last-Modified`, which in practice is what makes browsers treat a
+            // response as heuristically cacheable. It pins the premises the scoping rests on: the JS
             // rewrite branch has none (so leaving it alone is safe), and
             // `ServeFile` assets do (the exposure #5888 tracks). It also tells
             // the raw-HTML row apart from the sandbox rows, which serve the
