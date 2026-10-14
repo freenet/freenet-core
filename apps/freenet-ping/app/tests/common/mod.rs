@@ -707,9 +707,9 @@ pub async fn get_contract_state(
 /// and a fixed sleep either wastes time or fails a correct run (#4910).
 ///
 /// The deadline is hard: each GET is bounded by the time remaining, and on
-/// timeout the error reports the keys last observed. Keep `timeout` short
-/// enough that only live delivery can satisfy it; a generous one also admits
-/// slower background repair paths and hides a broken live path.
+/// timeout the error reports the keys last observed. Keep `timeout` short:
+/// a generous one gives slower background repair paths time to deliver the
+/// update, which can hide a broken live delivery path.
 ///
 /// Success means the update reached `client`'s node only while `client`
 /// holds a subscription to the contract: then the node serves these GETs
@@ -731,8 +731,9 @@ pub async fn wait_for_ping_entry(
             Ok(Ok(state)) => {
                 polls += 1;
                 if state.contains_key(expected_name) {
-                    // eprintln, not tracing: these tests install no subscriber,
-                    // and the elapsed time is the signal for propagation drift.
+                    // eprintln, not tracing: these tests install no subscriber.
+                    // The elapsed time is the signal for propagation drift; it
+                    // shows in --no-capture runs and in a failing test's output.
                     eprintln!(
                         "observed ping entry '{expected_name}' after {:?} ({polls} polls)",
                         start.elapsed()
