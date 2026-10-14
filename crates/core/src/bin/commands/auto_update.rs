@@ -2517,7 +2517,7 @@ mod tests {
         let home = unusable_home(tmp.path());
         let systemd = tmp.path().join("var-lib-freenet");
         // Re-exec the running image: after a concurrent rebuild replaces the test
-        // binary, current_exe() reports "<path> (deleted)" and the spawn fails (#5185).
+        // binary, Linux current_exe() reports "<path> (deleted)" and the spawn fails (#5185).
         let exe = if cfg!(target_os = "linux") {
             std::path::PathBuf::from("/proc/self/exe")
         } else {
