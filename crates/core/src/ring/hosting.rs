@@ -490,15 +490,34 @@ pub(crate) struct SubscriptionLease {
     pub expires_at: Instant,
     /// Most recent state update observed (for dashboard display).
     pub last_updated: Option<Instant>,
-    /// The upstream that last answered `Subscribed` was not one of our ring
-    /// connections (the bootstrap-gateway fallback of an empty-ring node). Such
-    /// an upstream cannot have registered us as its downstream subscriber, so
-    /// no UPDATE reaches us through it (#2524). `contracts_needing_renewal`
-    /// renews a provisional lease as soon as the renewal loop runs (it only
-    /// runs with a ring connection) instead of waiting for the lease to near
-    /// expiry. Cleared when a subscribe is answered by a ring connection.
-    pub provisional: bool,
+    /// When this lease became PROVISIONAL: it was answered through the
+    /// bootstrap-gateway fallback of an empty-ring node, and a gateway that
+    /// does not hold us as a ring connection cannot register us as its
+    /// downstream subscriber, so no UPDATE reaches us through it (#2524).
+    /// `contracts_needing_renewal` renews a provisional lease as soon as the
+    /// renewal loop runs (it only runs with a ring connection) instead of
+    /// waiting for the lease to near expiry.
+    ///
+    /// Cleared by a subscribe answered over the ring and by a root-satisfied
+    /// renewal. Time-bounded as a backstop (AGENTS.md: exemptions expire):
+    /// after [`PROVISIONAL_LEASE_TTL`] the mark is ignored and the lease
+    /// renews on the normal cadence, so a lease kept alive by other paths
+    /// (`ring.subscribe` from host-formation) cannot stay due forever.
+    pub provisional_since: Option<Instant>,
 }
+
+fn lease_is_provisional(lease: &SubscriptionLease, now: Instant) -> bool {
+    lease
+        .provisional_since
+        .is_some_and(|since| now.saturating_duration_since(since) < PROVISIONAL_LEASE_TTL)
+}
+
+/// How long a lease stays provisional (see
+/// [`SubscriptionLease::provisional_since`]). One lease duration: by then the
+/// normal near-expiry renewal would have re-subscribed it anyway, and failed
+/// early renewals have retried under the subscription backoff, which is
+/// capped below the lease duration.
+pub(crate) const PROVISIONAL_LEASE_TTL: Duration = SUBSCRIPTION_LEASE_DURATION;
 
 /// Public dashboard snapshot of one subscribed contract.
 ///
@@ -1440,7 +1459,7 @@ impl HostingManager {
                     subscribed_since: now,
                     expires_at,
                     last_updated: None,
-                    provisional: false,
+                    provisional_since: None,
                 });
                 true
             }
@@ -1457,21 +1476,24 @@ impl HostingManager {
         SubscribeResult { is_new, expires_at }
     }
 
-    /// Record whether the subscription to `contract` was last answered by an
-    /// upstream that is not one of our ring connections (see
-    /// [`SubscriptionLease::provisional`]). No-op without a lease.
+    /// Record whether the subscription to `contract` was last answered through
+    /// the bootstrap-gateway fallback (see
+    /// [`SubscriptionLease::provisional_since`]). Marking restarts the TTL.
+    /// No-op without a lease.
     pub fn set_subscription_provisional(&self, contract: &ContractKey, provisional: bool) {
+        let now = self.time_source.now();
         if let Some(mut entry) = self.active_subscriptions.get_mut(contract) {
-            entry.provisional = provisional;
+            entry.provisional_since = provisional.then_some(now);
         }
     }
 
-    /// Whether the subscription to `contract` is provisional (see
-    /// [`SubscriptionLease::provisional`]).
+    /// Whether the subscription to `contract` is provisional and still within
+    /// [`PROVISIONAL_LEASE_TTL`].
     pub fn is_subscription_provisional(&self, contract: &ContractKey) -> bool {
+        let now = self.time_source.now();
         self.active_subscriptions
             .get(contract)
-            .is_some_and(|lease| lease.provisional)
+            .is_some_and(|lease| lease_is_provisional(lease.value(), now))
     }
 
     /// Renew an existing subscription.
@@ -3310,7 +3332,7 @@ impl HostingManager {
     ///
     /// Returns contracts where:
     /// - We have an active subscription that will expire soon, or is
-    ///   provisional (see [`SubscriptionLease::provisional`]), OR
+    ///   provisional (see [`SubscriptionLease::provisional_since`]), OR
     /// - We have client subscriptions but no active network subscription
     ///
     /// Hosted contracts without active interest (no client subscriptions,
@@ -3357,7 +3379,7 @@ impl HostingManager {
                 (
                     *entry.key(),
                     entry.value().expires_at,
-                    entry.value().provisional,
+                    lease_is_provisional(entry.value(), now),
                 )
             })
             .collect();
@@ -5171,7 +5193,11 @@ mod tests {
     /// is not due; clearing the flag makes the provisional one not due either.
     #[test]
     fn provisional_lease_is_due_at_once_while_in_use() {
-        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
+        let clock = crate::util::time_source::SharedMockTimeSource::new();
+        let manager = HostingManager::with_time_source(
+            DEFAULT_HOSTING_BUDGET_BYTES,
+            std::sync::Arc::new(clock.clone()),
+        );
         let provisional = make_contract_key(1);
         let ordinary = make_contract_key(2);
         for key in [provisional, ordinary] {
@@ -5191,6 +5217,23 @@ mod tests {
 
         manager.set_subscription_provisional(&provisional, false);
         assert!(manager.contracts_needing_renewal().is_empty());
+
+        // Backstop: a lease kept alive by other `subscribe()` calls (as
+        // host-formation does) stops being due early once the mark is older
+        // than PROVISIONAL_LEASE_TTL.
+        manager.set_subscription_provisional(&provisional, true);
+        clock.advance_time(PROVISIONAL_LEASE_TTL - Duration::from_secs(60));
+        manager.subscribe(provisional);
+        manager.subscribe(ordinary);
+        assert_eq!(manager.contracts_needing_renewal(), vec![provisional]);
+        clock.advance_time(Duration::from_secs(120));
+        manager.subscribe(provisional);
+        manager.subscribe(ordinary);
+        assert!(!manager.is_subscription_provisional(&provisional));
+        assert!(
+            manager.contracts_needing_renewal().is_empty(),
+            "an expired provisional mark must not keep the lease due"
+        );
     }
 
     // Removed: test_contracts_needing_renewal_includes_hosted was added in #3763

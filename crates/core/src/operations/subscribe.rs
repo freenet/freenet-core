@@ -687,7 +687,7 @@ pub(super) async fn finalize_originator_subscribe(
 /// sent an UPDATE. The hop still answers it `Subscribed`: that is the
 /// bootstrap path of an empty-ring node (#4361), and the requester repairs it
 /// by re-subscribing through the ring once it has a ring connection (#2524,
-/// `SubscriptionLease::provisional`).
+/// `SubscriptionLease::provisional_since`).
 pub(super) fn resolve_downstream_peer(
     op_manager: &OpManager,
     requester_addr: std::net::SocketAddr,
