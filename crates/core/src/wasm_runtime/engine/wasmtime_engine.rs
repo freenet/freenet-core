@@ -5289,9 +5289,11 @@ mod tests {
             return;
         }
 
-        // Parent: re-invoke this exact test in a fresh process.
-        let exe = std::env::current_exe().expect("current_exe");
-        let output = Command::new(&exe)
+        // Parent: re-invoke this exact test in a fresh process. Spawn
+        // /proc/self/exe (the running image), not current_exe(): if a concurrent
+        // rebuild replaces the binary, current_exe() returns "<path> (deleted)"
+        // and the spawn fails with ENOENT (#5185).
+        let output = Command::new("/proc/self/exe")
             .args([
                 "--exact",
                 "wasm_runtime::engine::wasmtime_engine::tests::test_store_refresh_reduces_vm_maps",
@@ -5477,8 +5479,8 @@ mod tests {
             return;
         }
 
-        let exe = std::env::current_exe().expect("current_exe");
-        let output = Command::new(&exe)
+        // /proc/self/exe, not current_exe(): see test_store_refresh_reduces_vm_maps (#5185).
+        let output = Command::new("/proc/self/exe")
             .args([
                 "--exact",
                 "wasm_runtime::engine::wasmtime_engine::tests::test_instance_virtual_memory_reservation_bounded_3986",
