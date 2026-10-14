@@ -1622,7 +1622,9 @@ pub(crate) async fn join_ring_request(
     // the counter itself only grows when a CONNECT has ended without a
     // connection (below): with overlapping bootstrap rounds, counting every
     // attempt reached the widened re-route in seconds instead of minutes.
+    let jittered = std::sync::atomic::AtomicBool::new(false);
     let apply_bootstrap_jitter = |base: Location| -> Location {
+        jittered.store(true, std::sync::atomic::Ordering::Relaxed);
         let failures = op_manager
             .ring
             .connection_manager
@@ -1736,9 +1738,10 @@ pub(crate) async fn join_ring_request(
         op_ctx_task::ClientConnectKind::Standard,
     )
     .await;
-    if !matches!(connected, Ok(n) if n > 0) {
-        // The attempt ended without a connection: the next one jitters
-        // further (#4362).
+    if jittered.load(std::sync::atomic::Ordering::Relaxed) && !matches!(connected, Ok(n) if n > 0) {
+        // A jittered attempt ended without a connection: the next one
+        // jitters further (#4362). Gap-targeted attempts never touched the
+        // counter, as before.
         op_manager
             .ring
             .connection_manager
@@ -2992,6 +2995,9 @@ mod tests {
         with_network_status_lock(async {
             let op_manager =
                 bootstrap_test_op_manager("jitter-5858-ended", "127.0.0.1:14861").await;
+            // Virtual time from here on: the probe below must see the attempt
+            // still running however slow the machine is.
+            tokio::time::pause();
             let cm = &op_manager.ring.connection_manager;
             let gateway = bootstrap_gateway(24871);
             let attempt =
@@ -3007,6 +3013,32 @@ mod tests {
                 1,
                 "an attempt that ended without a connection is"
             );
+        });
+    }
+
+    /// A gap-targeted attempt (3+ connections) never touched the #4362 jitter
+    /// counter on main and still does not when it ends without a connection
+    /// (re-review N4).
+    #[test]
+    fn a_gap_targeted_attempt_does_not_grow_the_jitter_counter() {
+        with_network_status_lock(async {
+            let op_manager = bootstrap_test_op_manager("jitter-5858-gap", "127.0.0.1:14862").await;
+            tokio::time::pause();
+            let cm = &op_manager.ring.connection_manager;
+            for (i, loc) in [0.1, 0.4, 0.7].into_iter().enumerate() {
+                let addr: SocketAddr = format!("127.0.0.5:{}", 26000 + i).parse().unwrap();
+                assert!(cm.add_connection(
+                    Location::new(loc),
+                    addr,
+                    TransportKeypair::new().public().clone(),
+                    false
+                ));
+            }
+            let gateway = bootstrap_gateway(24872);
+            join_ring_request(&gateway, &op_manager, Some(Duration::from_millis(300)))
+                .await
+                .ok();
+            assert_eq!(cm.connect_jitter_failure_count(), 0);
         });
     }
 
