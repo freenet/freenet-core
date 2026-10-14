@@ -1461,8 +1461,10 @@ impl ConnectionManager {
     /// [`Self::refuses_connection_at_cap`] for an outbound dial that has not
     /// started yet, used by the pre-flight check in `handle_connect_peer`.
     /// `in_flight` lists the other outbound dials still awaiting a handshake
-    /// (the caller excludes peers already in the ring). Those holding no
-    /// non-stale pending reservation also count toward the over-cap ceiling.
+    /// that take a ring slot if they succeed (the caller leaves out transient
+    /// dials, unspecified addresses and peers already in the ring). Those
+    /// holding no non-stale pending reservation also count toward the over-cap
+    /// ceiling.
     /// When we are the acceptor a dial holds a reservation, which the ceiling
     /// already counts. When we are the requester it holds none, so without
     /// this term a full node handed several lattice candidates before any
@@ -4799,10 +4801,23 @@ mod tests {
             &body[start..start + len]
         }
 
+        /// Whether `call` appears in CODE in `region`: `/* .. */` comments and
+        /// everything after `//` on a line are stripped first, so a commented
+        /// out call cannot satisfy the pin. (A `//` inside a string literal
+        /// also cuts the line; that can only make the pin fail, never pass.)
         fn code_calls(region: &str, call: &str) -> bool {
-            region
-                .lines()
-                .filter(|l| !l.trim_start().starts_with("//"))
+            let mut code = String::with_capacity(region.len());
+            let mut rest = region;
+            while let Some(open) = rest.find("/*") {
+                code.push_str(&rest[..open]);
+                rest = match rest[open..].find("*/") {
+                    Some(close) => &rest[open + close + 2..],
+                    None => "",
+                };
+            }
+            code.push_str(rest);
+            code.lines()
+                .map(|l| l.split("//").next().unwrap_or(""))
                 .any(|l| l.contains(call))
         }
 
@@ -4854,18 +4869,13 @@ mod tests {
                     "Pre-flight max_connections check",
                     "connect_peer: skipping connection — at max_connections",
                 ),
-                ".awaiting_connection",
+                "state.slot_taking_dials(peer_addr,",
             ),
-            "the outbound pre-flight check must count dials in awaiting_connection"
+            "the outbound pre-flight check must count the slot-taking dials in awaiting_connection"
         );
 
-        let bare = LIFECYCLE_SRC
-            .lines()
-            .filter(|l| !l.trim_start().starts_with("//"))
-            .filter(|l| l.contains(">= connection_manager.max_connections"))
-            .count();
-        assert_eq!(
-            bare, 0,
+        assert!(
+            !code_calls(LIFECYCLE_SRC, ">= connection_manager.max_connections"),
             "a cap gate compares against max_connections without the lattice \
              exemption; route it through refuses_connection_at_cap (#5827)"
         );
