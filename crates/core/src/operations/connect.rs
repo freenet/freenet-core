@@ -1614,11 +1614,17 @@ pub(crate) async fn join_ring_request(
     // Helper: apply jitter to base_location for NAT-compatible acceptor exploration.
     // After consecutive hole-punch failures, the same location routes to the same
     // acceptors. Jittering explores different ring regions.
+    //
+    // `failures` counts this attempt as the next failure, as before #5858, but
+    // the counter itself only grows when a CONNECT has ended without a
+    // connection (below): with overlapping bootstrap rounds, counting every
+    // attempt reached the widened re-route in seconds instead of minutes.
     let apply_bootstrap_jitter = |base: Location| -> Location {
         let failures = op_manager
             .ring
             .connection_manager
-            .increment_connect_jitter_failures(now);
+            .connect_jitter_failures_at(now)
+            .saturating_add(1);
         // Bootstrap-only widened re-route: once bounded jitter has saturated
         // and we are still below the gap-targeting threshold (true bootstrap),
         // occasionally take a larger (but still bounded) jitter step so the
@@ -1716,7 +1722,7 @@ pub(crate) async fn join_ring_request(
     if !op_manager.ring.is_gateway() {
         crate::node::network_status::record_bootstrap_connect_attempt();
     }
-    op_ctx_task::start_client_connect(
+    let connected = op_ctx_task::start_client_connect_counted(
         tx,
         gateway.clone(),
         gateway_addr,
@@ -1726,7 +1732,16 @@ pub(crate) async fn join_ring_request(
         overall_timeout,
         op_ctx_task::ClientConnectKind::Standard,
     )
-    .await
+    .await;
+    if !matches!(connected, Ok(n) if n > 0) {
+        // The attempt ended without a connection: the next one jitters
+        // further (#4362).
+        op_manager
+            .ring
+            .connection_manager
+            .increment_connect_jitter_failures(Instant::now());
+    }
+    connected.map(|_| ())
 }
 
 /// Resolve the socket address of a gateway selected for a version probe.
@@ -2906,6 +2921,33 @@ mod tests {
         join_ring_request(gateway, op_manager, Some(Duration::from_millis(100)))
             .await
             .ok();
+    }
+
+    /// The #4362 jitter counter grows when a join attempt has ended without a
+    /// connection, not when it starts (review item 5): with overlapping
+    /// bootstrap rounds, counting starts reached the widened re-route in
+    /// seconds.
+    #[test]
+    fn jitter_failures_count_ended_attempts_not_started_ones() {
+        with_network_status_lock(async {
+            let op_manager =
+                bootstrap_test_op_manager("jitter-5858-ended", "127.0.0.1:14861").await;
+            let cm = &op_manager.ring.connection_manager;
+            let gateway = bootstrap_gateway(24871);
+            let attempt =
+                join_ring_request(&gateway, &op_manager, Some(Duration::from_millis(300)));
+            let during = async {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                cm.connect_jitter_failure_count()
+            };
+            let (_, during) = tokio::join!(attempt, during);
+            assert_eq!(during, 0, "an attempt still running is not a failure");
+            assert_eq!(
+                cm.connect_jitter_failure_count(),
+                1,
+                "an attempt that ended without a connection is"
+            );
+        });
     }
 
     /// #5858: `connect_attempts_before_first_connection` counts exactly one

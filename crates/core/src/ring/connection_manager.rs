@@ -2875,6 +2875,16 @@ impl ConnectionManager {
         *count
     }
 
+    /// The consecutive connect failure count as of `now`, with the same decay
+    /// as [`Self::increment_connect_jitter_failures`] but nothing recorded.
+    pub fn connect_jitter_failures_at(&self, now: Instant) -> u32 {
+        let (count, last_failure) = *self.connect_jitter_failures.lock();
+        let decay_steps = last_failure.map_or(0, |ts| {
+            (now.duration_since(ts).as_secs() / Self::JITTER_DECAY_INTERVAL.as_secs()) as u32
+        });
+        count.saturating_sub(decay_steps)
+    }
+
     /// Reset consecutive connect failure counter (called on successful connect).
     pub fn reset_connect_jitter_failures(&self) {
         let mut guard = self.connect_jitter_failures.lock();

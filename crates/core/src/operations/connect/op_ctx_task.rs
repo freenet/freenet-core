@@ -159,6 +159,33 @@ pub(crate) async fn start_client_connect(
     overall_timeout: Option<std::time::Duration>,
     kind: ClientConnectKind,
 ) -> Result<(), OpError> {
+    start_client_connect_counted(
+        tx,
+        gateway,
+        gateway_addr,
+        op_manager,
+        own,
+        desired_location,
+        overall_timeout,
+        kind,
+    )
+    .await
+    .map(|_| ())
+}
+
+/// [`start_client_connect`], returning how many acceptors the CONNECT
+/// connected.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn start_client_connect_counted(
+    tx: Transaction,
+    gateway: PeerKeyLocation,
+    gateway_addr: SocketAddr,
+    op_manager: &OpManager,
+    own: PeerKeyLocation,
+    desired_location: Location,
+    overall_timeout: Option<std::time::Duration>,
+    kind: ClientConnectKind,
+) -> Result<usize, OpError> {
     // Count this CONNECT toward the connection_maintenance acquisition throttle.
     // `start_client_connect` is the single entry for every *self-initiated*
     // (originator) CONNECT — ring acquisition (`Ring::acquire_new`), gateway
@@ -240,7 +267,8 @@ pub(crate) async fn start_client_connect(
         }
     };
 
-    let inner = drive_client_connect_inner(
+    let mut connected = 0;
+    let inner = drive_client_connect(
         tx,
         gateway,
         gateway_addr,
@@ -250,6 +278,7 @@ pub(crate) async fn start_client_connect(
         receiver,
         op_manager,
         kind,
+        &mut connected,
     );
 
     let outcome = match overall_timeout {
@@ -266,7 +295,7 @@ pub(crate) async fn start_client_connect(
         },
         None => inner.await,
     };
-    let outcome = outcome.map(|_| ());
+    let outcome = outcome.map(|_| connected);
 
     op_manager.release_pending_op_slot(tx).await;
     outcome
@@ -324,9 +353,11 @@ const STALE_LINK_DROP_WAIT: std::time::Duration = std::time::Duration::from_secs
 
 /// Inner driver loop. Drains `receiver` until `target_connections`
 /// acceptors are connected, a Rejected arrives (after which the dials already
-/// started are still finished), or the transaction ends.
+/// started are still finished), or the transaction ends. `connected_dials`
+/// counts the acceptors connected, as they connect, so a caller that cuts
+/// the driver short still has it.
 #[allow(clippy::too_many_arguments)]
-async fn drive_client_connect_inner(
+async fn drive_client_connect(
     tx: Transaction,
     gateway: PeerKeyLocation,
     gateway_addr: SocketAddr,
@@ -336,6 +367,7 @@ async fn drive_client_connect_inner(
     mut receiver: mpsc::Receiver<WaiterReply>,
     op_manager: &OpManager,
     kind: ClientConnectKind,
+    connected_dials: &mut usize,
 ) -> Result<ClientConnectEnd, OpError> {
     use futures::StreamExt;
     use futures::stream::FuturesUnordered;
@@ -347,9 +379,9 @@ async fn drive_client_connect_inner(
     };
 
     let mut accepted: HashSet<PeerKeyLocation> = HashSet::with_capacity(target_connections);
-    // Acceptors actually connected. `accepted` also holds acceptors still
-    // queued or being dialled, so it cannot decide that the target is reached.
-    let mut connected_dials: usize = 0;
+    // `connected_dials`: acceptors actually connected. `accepted` also holds
+    // acceptors still queued or being dialled, so it cannot decide that the
+    // target is reached.
     // A gateway join sent with no ring connection (#5858), decided once for
     // this transaction. It collects replies to its TTL like any CONNECT (live
     // replies are often slow), but dials concurrently and checks that the
@@ -419,7 +451,7 @@ async fn drive_client_connect_inner(
                 // always rotated, as before #5858; a bootstrapping one is
                 // spared only if a dial still in flight at the Rejected
                 // connected.
-                let spared = bootstrapping && connected_dials > connected_at_reject;
+                let spared = bootstrapping && *connected_dials > connected_at_reject;
                 if end == CollectionEnd::Rejected && !spared {
                     op_manager
                         .gateway_backoff
@@ -575,8 +607,8 @@ async fn drive_client_connect_inner(
                     continue;
                 }
 
-                connected_dials += 1;
-                if connected_dials >= target_connections {
+                *connected_dials += 1;
+                if *connected_dials >= target_connections {
                     // INVARIANT (mirrors legacy JoinerState::register_acceptance
                     // at connect.rs:1352-1359): if the joiner started without
                     // knowing its external address, ObservedAddress must have
@@ -765,7 +797,7 @@ async fn drive_client_connect_inner(
                 // saturated neighborhood (2c). Recorded once the dials already
                 // started have finished (top of the loop), and only if none of
                 // them connected.
-                connected_at_reject = connected_dials;
+                connected_at_reject = *connected_dials;
                 collection_end = Some((CollectionEnd::Rejected, Instant::now()));
                 continue;
             }
@@ -2068,16 +2100,26 @@ mod tests {
             "\n}\n",
         );
         assert!(
-            start.contains("kind:ClientConnectKind,") && start.contains("op_manager,kind,);"),
-            "start_client_connect must forward its kind to the inner driver"
+            start.contains("kind:ClientConnectKind,") && start.contains("overall_timeout,kind,)"),
+            "start_client_connect must forward its kind to start_client_connect_counted"
         );
-        let body = item(&driver, "async fn drive_client_connect_inner(", "\n}\n");
+        let counted = item(
+            &driver,
+            "pub(crate) async fn start_client_connect_counted(",
+            "\n}\n",
+        );
+        assert!(
+            counted.contains("kind:ClientConnectKind,")
+                && counted.contains("op_manager,kind,&mutconnected,);"),
+            "start_client_connect_counted must forward its kind to the driver"
+        );
+        let body = item(&driver, "async fn drive_client_connect(", "\n}\n");
         let joined = body
             .find("\"connectdriver:joinedpeer\"")
             .expect("hole-punch result handling not found");
         let gate = body
             .find("ifletClientConnectKind::LatticeProbe{generation}=kind{")
-            .expect("lattice-probe miss report not found in drive_client_connect_inner");
+            .expect("lattice-probe miss report not found in drive_client_connect");
         let failed = body
             .find("if!hole_punch_ok{")
             .expect("hole-punch failure branch not found");
@@ -2115,7 +2157,7 @@ mod driver_timing_tests {
     use tokio::sync::mpsc;
     use tokio::time::Instant;
 
-    use super::{ClientConnectEnd, ClientConnectKind, drive_client_connect_inner};
+    use super::{ClientConnectEnd, ClientConnectKind};
     use crate::message::{NetMessage, NetMessageV1, NodeEvent, Transaction};
     use crate::node::{OpManager, WaiterReply};
     use crate::operations::connect::bootstrap::GATEWAY_ANSWER_DEADLINE;
@@ -2123,6 +2165,35 @@ mod driver_timing_tests {
     use crate::ring::{Location, PeerKeyLocation};
     use crate::transport::TransportKeypair;
     use crate::transport::connection_handler::NAT_TRAVERSAL_DEADLINE;
+
+    /// [`super::drive_client_connect`] without the connected count.
+    #[allow(clippy::too_many_arguments)]
+    async fn drive_client_connect_inner(
+        tx: Transaction,
+        gateway: PeerKeyLocation,
+        gateway_addr: SocketAddr,
+        desired_location: Location,
+        target_connections: usize,
+        started_without_address: bool,
+        receiver: mpsc::Receiver<WaiterReply>,
+        op_manager: &OpManager,
+        kind: ClientConnectKind,
+    ) -> Result<ClientConnectEnd, crate::operations::OpError> {
+        let mut connected = 0;
+        super::drive_client_connect(
+            tx,
+            gateway,
+            gateway_addr,
+            desired_location,
+            target_connections,
+            started_without_address,
+            receiver,
+            op_manager,
+            kind,
+            &mut connected,
+        )
+        .await
+    }
 
     async fn op_manager_with_events(
         id: &str,
