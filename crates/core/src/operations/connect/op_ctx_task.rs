@@ -3078,6 +3078,44 @@ mod driver_timing_tests {
         );
     }
 
+    /// The same when the transaction's TTL runs out while a dial is in flight
+    /// (re-review testing 2). Real time: the TTL is read from the wall clock,
+    /// so the transaction expires 2 s in, during a 3 s dial.
+    #[tokio::test]
+    async fn a_ttl_expiring_mid_dial_still_lets_the_dial_finish() {
+        let (op_manager, events) = op_manager_with_events("driver-drain-ttl").await;
+        let _log = scripted_event_loop(events, vec![]);
+        let tx = Transaction::new_expiring_in::<ConnectMsg>(Duration::from_secs(2));
+        let gateway = peer(24896);
+        let acceptor = peer(24897);
+        let (replies_tx, replies_rx) = mpsc::channel(8);
+        replies_tx.send(response(tx, &acceptor)).await.unwrap();
+        let mut connected = 0;
+        let started = Instant::now();
+        let end = tokio::time::timeout(
+            Duration::from_secs(30),
+            super::drive_client_connect(
+                tx,
+                gateway.clone(),
+                gateway.socket_addr().unwrap(),
+                Location::new(0.5),
+                op_manager.ring.connection_manager.min_connections,
+                false,
+                replies_rx,
+                &op_manager,
+                ClientConnectKind::Standard,
+                &mut connected,
+            ),
+        )
+        .await
+        .expect("the drain is bounded")
+        .expect("driver result");
+        assert_eq!(end, ClientConnectEnd::Finished);
+        assert_eq!(connected, 1, "the dial in flight at the TTL was finished");
+        assert!(started.elapsed() >= NAT_TRAVERSAL_DEADLINE);
+        drop(replies_tx);
+    }
+
     /// The same when the gateway is pruned mid-flight.
     #[tokio::test(start_paused = true)]
     async fn a_pruned_gateway_still_lets_started_dials_finish() {

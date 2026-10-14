@@ -51,6 +51,24 @@ impl Transaction {
         Self::update(ty.0, id, None)
     }
 
+    /// A new transaction of type `T` whose TTL runs out `remaining` from now
+    /// (test-only), for exercising what happens when it expires mid-flight.
+    #[cfg(test)]
+    pub(crate) fn new_expiring_in<T: TxType>(remaining: Duration) -> Self {
+        let tx = Self::new::<T>();
+        let ts = tx.id.timestamp_ms();
+        let backdated = ts.saturating_sub(
+            crate::config::OPERATION_TTL
+                .saturating_sub(remaining)
+                .as_millis() as u64,
+        );
+        const TIMESTAMP_MASK: u128 = 0x00000000000000000000FFFFFFFFFFFFFFFF;
+        Self {
+            id: Ulid((tx.id.0 & TIMESTAMP_MASK) | ((backdated as u128) << 80)),
+            parent: None,
+        }
+    }
+
     /// Creates a child transaction with the specified type, linked to the parent
     /// for atomicity tracking in composite operations.
     pub(crate) fn new_child_of<T: TxType>(parent: &Transaction) -> Self {
