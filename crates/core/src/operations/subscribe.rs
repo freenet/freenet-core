@@ -145,6 +145,12 @@ pub(super) enum InitialRequest {
         alternatives: Vec<PeerKeyLocation>,
         /// Initial HTL for the request (= `op_manager.ring.max_hops_to_live`).
         htl: usize,
+        /// `target` is a configured gateway chosen because the ring was empty
+        /// (the #4361 bootstrap fallback). Such a gateway does not hold us as
+        /// a ring connection, so it cannot register us as its downstream
+        /// subscriber; a `Subscribed` from it makes the lease provisional
+        /// (#2524).
+        via_bootstrap_gateway: bool,
     },
 }
 
@@ -221,6 +227,9 @@ pub(super) async fn prepare_initial_request(
     // Find a peer to forward the request to (needed even if we have contract locally)
     let mut visited = super::VisitedPeers::new(&id);
     visited.mark_visited(own_addr);
+
+    // Set when the target is the bootstrap gateway of an empty ring (below).
+    let mut via_bootstrap_gateway = false;
 
     // Directed subscribe: a caller (e.g. a received SubscribeHint) named the
     // first hop explicitly. Bypass ring selection and target `holder` directly,
@@ -326,6 +335,7 @@ pub(super) async fn prepare_initial_request(
                                 crate::router::dataset::UncapturedReason::BootstrapGateway,
                             );
                         }
+                        via_bootstrap_gateway = true;
                         gateway
                     } else if let Some(key) = super::has_contract(op_manager, instance_id).await? {
                         // No gateway either - fall back to local completion only if isolated.
@@ -379,6 +389,7 @@ pub(super) async fn prepare_initial_request(
         visited,
         alternatives: candidates,
         htl: op_manager.ring.max_hops_to_live,
+        via_bootstrap_gateway,
     })
 }
 
@@ -545,16 +556,19 @@ pub(super) async fn finalize_originator_subscribe(
     // greedy. (The value is only used as the directed/ordinary marker — the
     // actual fetch target is the responder, resolved below.)
     directed_holder: Option<PeerKeyLocation>,
+    // The request went to the bootstrap gateway of an empty ring (#4361):
+    // the gateway could not register us as its downstream subscriber, so the
+    // lease is provisional and is renewed through the ring once we have a ring
+    // connection (#2524). Decided at SEND time, not by resolving `upstream_addr`
+    // here: a ring upstream that dropped between its reply and this point
+    // would also fail to resolve, yet it did register us.
+    via_bootstrap_gateway: bool,
 ) {
-    let upstream = op_manager
+    if let Some(pkl) = op_manager
         .ring
         .connection_manager
-        .get_peer_by_addr(upstream_addr);
-    // An upstream that is not a ring connection (the bootstrap-gateway fallback
-    // of an empty-ring node, #4361) resolves us the same way and so cannot have
-    // registered us as its downstream subscriber (#2524).
-    let provisional = upstream.is_none();
-    if let Some(pkl) = upstream {
+        .get_peer_by_addr(upstream_addr)
+    {
         let peer_key = crate::ring::interest::PeerKey::from(pkl.pub_key);
         // Refresh-if-present, register-if-absent. A bare `register_peer_interest`
         // inserts a fresh `PeerInterest` over an existing entry and WIPES its
@@ -589,7 +603,7 @@ pub(super) async fn finalize_originator_subscribe(
     op_manager.ring.subscribe(key);
     op_manager
         .ring
-        .set_subscription_provisional(&key, provisional);
+        .set_subscription_provisional(&key, via_bootstrap_gateway);
     op_manager.ring.complete_subscription_request(&key, true);
 
     // Fetch the contract body if we don't have it locally. The result

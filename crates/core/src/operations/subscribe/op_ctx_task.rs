@@ -716,34 +716,43 @@ async fn drive_client_subscribe_inner(
     )
     .await?;
 
-    let (target_peer, target_addr, mut visited, mut alternatives, htl) = match initial {
-        InitialRequest::LocallyComplete { key } => {
-            // Local completion reuses the existing helper. It publishes
-            // via `NodeEvent::LocalSubscribeComplete` → `result_router_tx`,
-            // so the driver MUST NOT deliver a second time — return
-            // `SkipAlreadyDelivered` to explicitly signal that to
-            // `deliver_outcome`.
-            complete_local_subscription(op_manager, client_tx, key, is_renewal).await?;
-            return Ok(DriverOutcome::SkipAlreadyDelivered);
-        }
-        InitialRequest::NoHostingPeers => {
-            return Ok(DriverOutcome::Publish(Err(ErrorKind::OperationError {
-                cause: format!("no remote peers available for subscription to {instance_id}")
-                    .into(),
+    let (target_peer, target_addr, mut visited, mut alternatives, htl, via_bootstrap_gateway) =
+        match initial {
+            InitialRequest::LocallyComplete { key } => {
+                // Local completion reuses the existing helper. It publishes
+                // via `NodeEvent::LocalSubscribeComplete` → `result_router_tx`,
+                // so the driver MUST NOT deliver a second time — return
+                // `SkipAlreadyDelivered` to explicitly signal that to
+                // `deliver_outcome`.
+                complete_local_subscription(op_manager, client_tx, key, is_renewal).await?;
+                return Ok(DriverOutcome::SkipAlreadyDelivered);
             }
-            .into())));
-        }
-        InitialRequest::PeerNotJoined => {
-            return Err(RingError::PeerNotJoined.into());
-        }
-        InitialRequest::NetworkRequest {
-            target,
-            target_addr,
-            visited,
-            alternatives,
-            htl,
-        } => (target, target_addr, visited, alternatives, htl),
-    };
+            InitialRequest::NoHostingPeers => {
+                return Ok(DriverOutcome::Publish(Err(ErrorKind::OperationError {
+                    cause: format!("no remote peers available for subscription to {instance_id}")
+                        .into(),
+                }
+                .into())));
+            }
+            InitialRequest::PeerNotJoined => {
+                return Err(RingError::PeerNotJoined.into());
+            }
+            InitialRequest::NetworkRequest {
+                target,
+                target_addr,
+                visited,
+                alternatives,
+                htl,
+                via_bootstrap_gateway,
+            } => (
+                target,
+                target_addr,
+                visited,
+                alternatives,
+                htl,
+                via_bootstrap_gateway,
+            ),
+        };
 
     tracing::debug!(
         tx = %client_tx,
@@ -767,6 +776,8 @@ async fn drive_client_subscribe_inner(
     let mut attempts_at_hop: usize = 1;
     let mut current_target: PeerKeyLocation = target_peer;
     let mut current_target_addr: std::net::SocketAddr = target_addr;
+    // Whether `current_target` is the empty-ring bootstrap gateway (#2524).
+    let mut target_via_bootstrap = via_bootstrap_gateway;
     let mut is_first_attempt = true;
 
     // Renewal task budget (issue #4350). `recover_orphaned_subscriptions`
@@ -966,6 +977,9 @@ async fn drive_client_subscribe_inner(
                 {
                     Some((next_target, next_addr)) => {
                         current_target = next_target;
+                        // Retries come from ring selection, never the
+                        // bootstrap fallback.
+                        target_via_bootstrap = false;
                         current_target_addr = next_addr;
                         // Phase 2b spin-loop guard (#3808): pace retries
                         // with a small jittered delay before re-sending.
@@ -1038,6 +1052,9 @@ async fn drive_client_subscribe_inner(
                 {
                     Some((next_target, next_addr)) => {
                         current_target = next_target;
+                        // Retries come from ring selection, never the
+                        // bootstrap fallback.
+                        target_via_bootstrap = false;
                         current_target_addr = next_addr;
                         // Phase 2b spin-loop guard (#3808): pace retries
                         // with a small jittered delay before re-sending.
@@ -1142,6 +1159,7 @@ async fn drive_client_subscribe_inner(
                     current_target_addr,
                     is_renewal,
                     directed_holder.clone(),
+                    target_via_bootstrap,
                 )
                 .await;
                 return Ok(DriverOutcome::Publish(Ok(HostResponse::ContractResponse(
@@ -1191,6 +1209,9 @@ async fn drive_client_subscribe_inner(
                 {
                     Some((next_target, next_addr)) => {
                         current_target = next_target;
+                        // Retries come from ring selection, never the
+                        // bootstrap fallback.
+                        target_via_bootstrap = false;
                         current_target_addr = next_addr;
                         // Phase 2b spin-loop guard (#3808): pace retries
                         // with a small jittered delay before re-sending.
@@ -5452,6 +5473,51 @@ mod bootstrap_subscription_tests {
             times[1] - times[0] >= std::time::Duration::from_secs(15),
             "the retry waits out the backoff: {:?}",
             times[1] - times[0]
+        );
+    }
+
+    /// A ring upstream that answers `Subscribed` and then drops before
+    /// finalization did register us, so the lease is NOT provisional: the mark
+    /// is decided by how the request was routed (the empty-ring bootstrap
+    /// fallback), not by whether the upstream still resolves afterwards.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn ring_upstream_dropping_after_reply_is_not_provisional() {
+        let (op_manager, rx, _peers, _guards, store) =
+            op_manager_with_peers_and_store("sub-ring-upstream-drops", 3).await;
+        let instance_id = ContractInstanceId::new([69u8; 32]);
+        let key = contract(instance_id);
+        let cm = op_manager.clone();
+        serve_attempts(
+            op_manager.clone(),
+            rx,
+            crate::message::TransactionType::Subscribe,
+            move |_, msg, target| {
+                let answer = match msg {
+                    NetMessage::V1(NetMessageV1::Subscribe(SubscribeMsg::Request { .. })) => {
+                        let target = target.expect("requests carry a target");
+                        // The upstream answers, then its connection drops.
+                        assert!(
+                            cm.ring
+                                .connection_manager
+                                .prune_alive_connection(target)
+                                .is_some()
+                        );
+                        store_contract(&store, key);
+                        Answer::Reply(subscribed(msg, key))
+                    }
+                    _ => Answer::DropWaiter,
+                };
+                Step { hop: None, answer }
+            },
+        );
+        op_manager
+            .ring
+            .add_client_subscription(&instance_id, crate::client_events::ClientId::next());
+        subscribe(&op_manager, instance_id, false).await;
+        assert!(op_manager.ring.is_subscribed(&key));
+        assert!(
+            !op_manager.ring.is_subscription_provisional(&key),
+            "a ring upstream that registered us must not make the lease provisional"
         );
     }
 
