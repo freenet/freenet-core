@@ -2609,21 +2609,25 @@ mod tests {
                 match msg {
                     ClientConnection::NewConnection { callbacks, .. } => {
                         let id = ClientId::next();
-                        let _ = callbacks.send(HostCallbackResult::NewId { id });
+                        callbacks
+                            .send(HostCallbackResult::NewId { id })
+                            .expect("handler awaits its client id");
                         clients.insert(id, callbacks);
                     }
                     ClientConnection::Request { client_id, req, .. } => {
                         if let ClientRequest::ContractOp(ContractRequest::Get { .. }) = *req {
-                            let _ = clients[&client_id].send(HostCallbackResult::Result {
-                                id: client_id,
-                                result: Ok(HostResponse::ContractResponse(
-                                    ContractResponse::GetResponse {
-                                        key: contract.key(),
-                                        contract: Some(contract.clone()),
-                                        state: state.clone(),
-                                    },
-                                )),
-                            });
+                            clients[&client_id]
+                                .send(HostCallbackResult::Result {
+                                    id: client_id,
+                                    result: Ok(HostResponse::ContractResponse(
+                                        ContractResponse::GetResponse {
+                                            key: contract.key(),
+                                            contract: Some(contract.clone()),
+                                            state: state.clone(),
+                                        },
+                                    )),
+                                })
+                                .expect("handler awaits its GetResponse");
                         }
                     }
                 }
