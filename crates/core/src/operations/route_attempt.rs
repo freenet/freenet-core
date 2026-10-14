@@ -860,8 +860,6 @@ pub(crate) mod driver_test_support {
     /// [`op_manager_with_peers_and_store`], with the event-loop channels
     /// sized `channel_capacity` (`None`: the default). A small capacity lets
     /// a test hold a dispatch up.
-    // The stub contract handler answers two events and leaves every other
-    // variant unanswered on purpose, so its wildcard arm is the point.
     pub(crate) async fn op_manager_with_peers_and_store_on(
         id: &str,
         peers: usize,
@@ -893,6 +891,8 @@ pub(crate) mod driver_test_support {
         (op_manager, rx, guards, store)
     }
 
+    // The stub contract handler answers two events and leaves every other
+    // variant unanswered on purpose, so its wildcard arm is the point.
     #[allow(clippy::wildcard_enum_match_arm)]
     async fn build_op_manager(
         id: &str,
