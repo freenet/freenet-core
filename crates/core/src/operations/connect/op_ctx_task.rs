@@ -473,7 +473,19 @@ async fn drive_client_connect(
                 // spared only if a dial still in flight at the Rejected
                 // connected.
                 let spared = bootstrapping && *connected_dials > connected_at_reject;
-                if end == CollectionEnd::Rejected && !spared {
+                // Overlapping bootstrap CONNECTs already in flight when the
+                // gateway was backed off add nothing: the backoff escalates
+                // once per rejection of a CONNECT sent after it, as with
+                // one round at a time.
+                if end == CollectionEnd::Rejected
+                    && !spared
+                    && (!bootstrapping
+                        || op_manager.bootstrap_pacer.lock().gateway_rejected(
+                            gateway_addr,
+                            started,
+                            Instant::now(),
+                        ))
+                {
                     op_manager
                         .gateway_backoff
                         .lock()

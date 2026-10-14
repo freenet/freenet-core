@@ -195,6 +195,8 @@ struct GatewayLiveness {
     last_answer: Option<Instant>,
     /// When this peer last dropped the link to redial it.
     redialled: Option<Instant>,
+    /// When a bootstrap CONNECT's rejection last backed the gateway off.
+    backed_off: Option<Instant>,
 }
 
 /// Spacing of bootstrap rounds, shared by `initial_join_procedure` and the
@@ -315,6 +317,24 @@ impl BootstrapPacer {
         }
         liveness.silent = 0;
         liveness.redialled = Some(now);
+        true
+    }
+
+    /// A bootstrapping CONNECT through `gateway`, sent at `sent`, was
+    /// rejected. Returns whether to back the gateway off: not if it was
+    /// already backed off after this CONNECT went out, so overlapping
+    /// CONNECTs that were in flight together escalate the backoff once.
+    pub(crate) fn gateway_rejected(
+        &mut self,
+        gateway: SocketAddr,
+        sent: Instant,
+        now: Instant,
+    ) -> bool {
+        let liveness = self.liveness(gateway);
+        if liveness.backed_off.is_some_and(|t| t >= sent) {
+            return false;
+        }
+        liveness.backed_off = Some(now);
         true
     }
 
@@ -676,6 +696,22 @@ mod tests {
         assert!(
             pacer.gateway_silent(gw, at(10), at(25)),
             "the next silent join redials at once, not after the interval"
+        );
+    }
+
+    #[test]
+    fn overlapping_rejected_connects_back_a_gateway_off_once() {
+        let mut pacer = BootstrapPacer::new(Duration::from_secs(30));
+        let gw: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let t0 = Instant::now();
+        let at = |s: u64| t0 + Duration::from_secs(s);
+        // Rounds at 0, 5 and 15 s, all rejected after the first backoff.
+        assert!(pacer.gateway_rejected(gw, at(0), at(16)));
+        assert!(!pacer.gateway_rejected(gw, at(5), at(17)));
+        assert!(!pacer.gateway_rejected(gw, at(15), at(18)));
+        assert!(
+            pacer.gateway_rejected(gw, at(60), at(62)),
+            "a CONNECT sent after the backoff escalates it again"
         );
     }
 
