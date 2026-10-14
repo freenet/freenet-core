@@ -714,6 +714,9 @@ pub async fn get_contract_state(
 /// Success means the update reached `client`'s node only while `client`
 /// holds a subscription to the contract: then the node serves these GETs
 /// from its local copy (`is_receiving_updates`) instead of the network.
+///
+/// Do not reuse `client` after an `Err`: a GET abandoned at the deadline may
+/// still answer later, and a following GET could accept that stale response.
 pub async fn wait_for_ping_entry(
     client: &mut WebApi,
     key: ContractKey,
@@ -727,6 +730,13 @@ pub async fn wait_for_ping_entry(
     let mut last_keys: Option<Vec<String>> = None;
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            anyhow::bail!(
+                "ping entry '{expected_name}' not observed within {timeout:?} \
+                 ({polls} polls, {:?} elapsed); last observed keys: {last_keys:?}",
+                start.elapsed()
+            );
+        }
         match tokio::time::timeout(remaining, get_contract_state(client, key, false)).await {
             Ok(Ok(state)) => {
                 polls += 1;
@@ -748,18 +758,11 @@ pub async fn wait_for_ping_entry(
                     start.elapsed()
                 )));
             }
-            // The GET itself ran past the deadline; fall through to the bail.
-            Err(_) => {}
+            // The GET itself ran past the deadline; the next iteration bails.
+            Err(_) => continue,
         }
-        let now = tokio::time::Instant::now();
-        if now >= deadline {
-            anyhow::bail!(
-                "ping entry '{expected_name}' not observed within {timeout:?} \
-                 ({polls} polls, {:?} elapsed); last observed keys: {last_keys:?}",
-                start.elapsed()
-            );
-        }
-        sleep(POLL_INTERVAL.min(deadline - now)).await;
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        sleep(POLL_INTERVAL.min(remaining)).await;
     }
 }
 

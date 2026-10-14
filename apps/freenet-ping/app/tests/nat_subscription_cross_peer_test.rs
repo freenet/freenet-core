@@ -39,6 +39,9 @@
 //! peer(0) would never be registered reachable and the update would not
 //! arrive — the check would time out and fail the test.
 //!
+//! (This "ONLY route" claim predates live UPDATE fan-out becoming
+//! advertised-co-host-only and may no longer hold: see #5880.)
+//!
 //! ## Contract hosting note
 //!
 //! The contract is deployed (PUT) from the gateway, mirroring the existing
@@ -68,10 +71,9 @@ use freenet_stdlib::{
 use freenet_test_network::{FreenetBinary, NetworkBuilder, TestNetwork};
 use std::{path::PathBuf, time::Duration};
 
-/// How long the subscribed peer may take to observe the update. Twice the
-/// old fixed 10s window, for slow CI runners, but kept well under the 30s
-/// subscription recovery period (`SUBSCRIPTION_RECOVERY_INTERVAL`) to reduce
-/// the chance that a background heal, rather than live delivery, passes it.
+/// How long the subscribed peer may take to observe the update. A healthy
+/// run observes it in about 1s; 20s is twice the old fixed 10s window, slack
+/// for a slow CI runner without waiting long enough to absorb a slow path.
 const UPDATE_PROPAGATION_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Cross-peer NAT subscription delivery: a NAT peer subscribes through the

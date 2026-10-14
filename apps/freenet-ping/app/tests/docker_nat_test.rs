@@ -22,10 +22,9 @@ use freenet_stdlib::{
 use freenet_test_network::{FreenetBinary, NetworkBuilder, TestNetwork};
 use std::{path::PathBuf, time::Duration};
 
-/// How long the subscribed peer may take to observe the update. Twice the
-/// old fixed 10s window, for slow CI runners, but kept well under the 30s
-/// subscription recovery period (`SUBSCRIPTION_RECOVERY_INTERVAL`) to reduce
-/// the chance that a background heal, rather than live delivery, passes it.
+/// How long the subscribed peer may take to observe the update. A healthy
+/// run observes it in about 1s; 20s is twice the old fixed 10s window, slack
+/// for a slow CI runner without waiting long enough to absorb a slow path.
 const UPDATE_PROPAGATION_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Test contract operations (PUT -> SUBSCRIBE -> UPDATE -> GET) across a
