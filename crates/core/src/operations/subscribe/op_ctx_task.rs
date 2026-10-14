@@ -5397,6 +5397,77 @@ mod bootstrap_subscription_tests {
         );
     }
 
+    /// The bootstrap gateway attempt fails (send failure, timeout, or NotFound),
+    /// the node meanwhile gets a ring connection, and the retry through that
+    /// ring peer subscribes: the lease is NOT provisional, because the peer
+    /// that answered holds us as a ring connection. One case per retry arm of
+    /// the driver, each of which must reset the bootstrap bit.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn ring_retry_after_failed_gateway_attempt_is_not_provisional() {
+        for (label, case) in [
+            ("sub-gateway-wire-error-then-ring", 0u8),
+            ("sub-gateway-timeout-then-ring", 1),
+            ("sub-gateway-not-found-then-ring", 2),
+        ] {
+            let gateway_addr: std::net::SocketAddr = "127.0.0.1:31000".parse().unwrap();
+            let gateway = PeerKeyLocation::new(
+                crate::transport::TransportKeypair::new().public().clone(),
+                gateway_addr,
+            );
+            let (op_manager, rx, _guards, store) = op_manager_with_gateway(label, gateway).await;
+            let instance_id = ContractInstanceId::new([72u8; 32]);
+            let key = contract(instance_id);
+            let ring_peer: std::net::SocketAddr = "127.0.0.1:31001".parse().unwrap();
+            let targets = Arc::new(Mutex::new(Vec::new()));
+            let record = targets.clone();
+            let node = op_manager.clone();
+            serve_attempts(
+                op_manager.clone(),
+                rx,
+                crate::message::TransactionType::Subscribe,
+                move |_, msg, target| {
+                    let NetMessage::V1(NetMessageV1::Subscribe(SubscribeMsg::Request { .. })) = msg
+                    else {
+                        return Step {
+                            hop: None,
+                            answer: Answer::DropWaiter,
+                        };
+                    };
+                    let target = target.expect("requests carry a target");
+                    record.lock().push(target);
+                    let answer = if target == gateway_addr {
+                        // The node joins while the gateway attempt fails.
+                        add_ring_peer(&node, 31001);
+                        match case {
+                            0 => Answer::PeerDisconnectedFor(gateway_addr),
+                            1 => Answer::Never,
+                            _ => Answer::Reply(NetMessage::from(SubscribeMsg::Response {
+                                id: *msg.id(),
+                                instance_id: *key.id(),
+                                result: SubscribeMsgResult::NotFound,
+                                hop_count: 1,
+                            })),
+                        }
+                    } else {
+                        store_contract(&store, key);
+                        Answer::Reply(subscribed(msg, key))
+                    };
+                    Step { hop: None, answer }
+                },
+            );
+            subscribe(&op_manager, instance_id, false).await;
+            assert_eq!(
+                targets.lock().clone(),
+                vec![gateway_addr, ring_peer],
+                "{label}: gateway first, then the ring retry"
+            );
+            assert!(
+                !op_manager.ring.is_subscription_provisional(&key),
+                "{label}: a subscription answered by a ring peer must not be provisional"
+            );
+        }
+    }
+
     /// A provisional lease whose renewal completes locally (no network round
     /// trip: here the node has lost its address, as a not-joined node) stops
     /// being provisional, so it is not re-run on every tick.
