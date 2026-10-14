@@ -728,12 +728,14 @@ pub async fn wait_for_ping_entry(
     let deadline = start + timeout;
     let mut polls = 0u32;
     let mut last_keys: Option<Vec<String>> = None;
+    let mut get_in_flight_at_deadline = false;
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
             anyhow::bail!(
                 "ping entry '{expected_name}' not observed within {timeout:?} \
-                 ({polls} polls, {:?} elapsed); last observed keys: {last_keys:?}",
+                 ({polls} polls, {:?} elapsed, GET in flight at deadline: \
+                 {get_in_flight_at_deadline}); last observed keys: {last_keys:?}",
                 start.elapsed()
             );
         }
@@ -759,7 +761,10 @@ pub async fn wait_for_ping_entry(
                 )));
             }
             // The GET itself ran past the deadline; the next iteration bails.
-            Err(_) => continue,
+            Err(_) => {
+                get_in_flight_at_deadline = true;
+                continue;
+            }
         }
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         sleep(POLL_INTERVAL.min(remaining)).await;

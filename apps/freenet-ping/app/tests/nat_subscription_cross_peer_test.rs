@@ -72,8 +72,9 @@ use freenet_test_network::{FreenetBinary, NetworkBuilder, TestNetwork};
 use std::{path::PathBuf, time::Duration};
 
 /// How long the subscribed peer may take to observe the update. A healthy
-/// run observes it in about 1s; 20s is twice the old fixed 10s window, slack
-/// for a slow CI runner without waiting long enough to absorb a slow path.
+/// run observes it within the first 1s poll; 20s is twice the old fixed 10s
+/// window, slack for a slow CI runner. Keep it short: a longer window makes it
+/// more likely that a background repair, not live delivery, satisfies the check.
 const UPDATE_PROPAGATION_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Cross-peer NAT subscription delivery: a NAT peer subscribes through the
