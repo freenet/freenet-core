@@ -5627,12 +5627,16 @@ mod bootstrap_subscription_tests {
             !op_manager.ring.can_request_subscription(&key),
             "a failed renewal puts the contract in the subscription backoff"
         );
+        // The lease is still due, so only the backoff stops the loop from
+        // re-sending it. `can_request_subscription` above is the backoff
+        // check: the initial backoff (15 s) is shorter than the loop's 30 s
+        // tick, so the gap between the two attempts cannot tell backoff from
+        // tick cadence and is not asserted.
+        assert!(op_manager.ring.contracts_needing_renewal().contains(&key));
         attempts(2).await;
-        let times = ring_requests.lock().clone();
         assert!(
-            times[1] - times[0] >= std::time::Duration::from_secs(15),
-            "the retry waits out the backoff: {:?}",
-            times[1] - times[0]
+            op_manager.ring.is_subscription_provisional(&key),
+            "still provisional after the second failure"
         );
     }
 
