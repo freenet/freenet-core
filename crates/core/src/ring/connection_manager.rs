@@ -2093,10 +2093,12 @@ impl ConnectionManager {
         // has_connection_or_pending() returns false for these addresses. A
         // reservation can be promoted to an established connection between the
         // two phases (overlapping bootstrap rounds, #5858); that peer's mapping
-        // is ACTUAL state now and must stay, or a later prune would find no
-        // location and leave a ghost in connections_by_location. Checked under
-        // location_for_peer (#1) then connections_by_location (#2), the
-        // documented order.
+        // is ACTUAL state now and must stay. Checked under location_for_peer
+        // (#1) then connections_by_location (#2), the documented order. This
+        // narrows the race but cannot close it: an add can still land between
+        // its own two locks after this check. `prune_connection` removes the
+        // ghost such an interleaving leaves (an established entry with no
+        // mapping), which closes the residue.
         if !removed.is_empty() {
             let mut location_for_peer = self.location_for_peer.write();
             let connections = self.connections_by_location.read();
@@ -2462,7 +2464,7 @@ impl ConnectionManager {
                         }
                     }
                     drop(locations_for_peer);
-                    self.ready_peers.remove(&addr);
+                    self.forget_pruned_peer(addr);
                     return Some(loc);
                 }
                 tracing::debug!("no location found for peer, skip pruning");
@@ -2496,16 +2498,21 @@ impl ConnectionManager {
             self.pending_reservations.write().remove(&addr);
         }
 
-        // Clean up readiness state for the pruned peer
-        self.ready_peers.remove(&addr);
-
-        // Clean up connection timestamp for optimistic readiness
-        self.connected_since.write().remove(&addr);
-
-        // Clean up health tracking for the pruned peer
-        self.peer_health.lock().remove_peer(addr);
+        self.forget_pruned_peer(addr);
 
         Some(loc)
+    }
+
+    /// Per-peer state every prune of an established connection clears,
+    /// shared by the normal path and the no-mapping (ghost) path so they
+    /// cannot drift apart.
+    fn forget_pruned_peer(&self, addr: SocketAddr) {
+        // Readiness state
+        self.ready_peers.remove(&addr);
+        // Connection timestamp for optimistic readiness
+        self.connected_since.write().remove(&addr);
+        // Health tracking
+        self.peer_health.lock().remove_peer(addr);
     }
 
     /// Test-only: push a raw [`Connection`] straight into
@@ -3165,9 +3172,14 @@ mod tests {
             false
         ));
         cm.location_for_peer.write().remove(&addr);
+        assert!(cm.connected_since.read().contains_key(&addr));
         assert!(cm.prune_alive_connection(addr).is_some());
         assert_eq!(cm.connection_count(), 0);
         assert!(!cm.is_in_ring(addr));
+        assert!(
+            !cm.connected_since.read().contains_key(&addr),
+            "a ghost prune clears the same per-peer state as a normal one"
+        );
     }
 
     /// A bootstrap round clears only the reservation its own CONNECT made: one

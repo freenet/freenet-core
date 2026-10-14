@@ -195,6 +195,9 @@ struct GatewayLiveness {
     last_answer: Option<Instant>,
     /// When this peer last dropped the link to redial it.
     redialled: Option<Instant>,
+    /// `redialled` before the latest redial, restored if that redial could
+    /// not be sent.
+    previous_redial: Option<Instant>,
     /// When a bootstrap CONNECT's rejection last backed the gateway off.
     backed_off: Option<Instant>,
 }
@@ -316,6 +319,7 @@ impl BootstrapPacer {
             return false;
         }
         liveness.silent = 0;
+        liveness.previous_redial = liveness.redialled;
         liveness.redialled = Some(now);
         true
     }
@@ -339,10 +343,11 @@ impl BootstrapPacer {
     }
 
     /// The redial [`Self::gateway_silent`] asked for could not be sent:
-    /// forget it, and leave the link one silent join short of the next.
+    /// forget it (the previous real redial's time stands), and leave the link
+    /// one silent join short of the next.
     pub(crate) fn redial_not_sent(&mut self, gateway: SocketAddr) {
         let liveness = self.liveness(gateway);
-        liveness.redialled = None;
+        liveness.redialled = liveness.previous_redial;
         liveness.silent = SILENT_ROUNDS_BEFORE_REDIAL.saturating_sub(1);
     }
 
@@ -712,6 +717,25 @@ mod tests {
         assert!(
             pacer.gateway_rejected(gw, at(60), at(62)),
             "a CONNECT sent after the backoff escalates it again"
+        );
+    }
+
+    #[test]
+    fn an_unsent_redial_keeps_the_previous_redials_time() {
+        let mut pacer = BootstrapPacer::new(Duration::from_secs(30));
+        let gw: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let t0 = Instant::now();
+        let at = |s: u64| t0 + Duration::from_secs(s);
+        redialled_at_20(&mut pacer, gw, at);
+        // A second redial, well after the interval, that cannot be sent.
+        let later = 20 + MIN_REDIAL_INTERVAL.as_secs() + 10;
+        assert!(!pacer.gateway_silent(gw, at(later), at(later + 15)));
+        assert!(pacer.gateway_silent(gw, at(later + 5), at(later + 20)));
+        pacer.redial_not_sent(gw);
+        // Joins sent before the real redial at 20 s still do not count.
+        assert!(
+            !pacer.gateway_silent(gw, at(10), at(later + 25)),
+            "the real redial's time must survive an unsent one"
         );
     }
 

@@ -1910,17 +1910,12 @@ impl P2pConnManager {
                                         )
                                         .is_some()
                                         {
-                                            if let Some(sender) =
-                                                state.pending_op_results.remove(&tx)
-                                            {
-                                                #[allow(clippy::let_underscore_must_use)]
-                                                let _ = sender.try_send(
-                                                    WaiterReply::PeerDisconnected {
-                                                        peer: target_addr,
-                                                    },
-                                                );
-                                                crate::config::GlobalTestMetrics::record_pending_op_remove();
-                                            }
+                                            orphan_transaction(
+                                                &mut state,
+                                                &ctx.bridge.op_manager.ring.live_tx_tracker,
+                                                tx,
+                                                target_addr,
+                                            );
                                         }
                                         continue;
                                     }
@@ -2821,26 +2816,12 @@ impl P2pConnManager {
                                     .remove_finished_transaction(tx);
                             }
                             NodeEvent::TransactionOrphaned { tx, peer } => {
-                                // The awaited peer was pruned mid-flight (#4313).
-                                // Deliver the cause THROUGH the waiter channel
-                                // before the sender drops, so the parked driver's
-                                // recv() yields PeerDisconnected before None —
-                                // race-free, no side registry. Then clean up like
-                                // TransactionCompleted.
-                                state.tx_to_client.remove(&tx);
-                                if let Some(sender) = state.pending_op_results.remove(&tx) {
-                                    // Best-effort: a full channel means a real
-                                    // reply is already queued, a closed one means
-                                    // the driver already exited — both benign.
-                                    #[allow(clippy::let_underscore_must_use)]
-                                    let _ = sender.try_send(WaiterReply::PeerDisconnected { peer });
-                                    crate::config::GlobalTestMetrics::record_pending_op_remove();
-                                }
-                                ctx.bridge
-                                    .op_manager
-                                    .ring
-                                    .live_tx_tracker
-                                    .remove_finished_transaction(tx);
+                                orphan_transaction(
+                                    &mut state,
+                                    &ctx.bridge.op_manager.ring.live_tx_tracker,
+                                    tx,
+                                    peer,
+                                );
                             }
                             NodeEvent::LocalSubscribeComplete {
                                 tx,
@@ -3021,6 +3002,29 @@ impl ConnectResultSender for mpsc::Sender<Result<(SocketAddr, Option<usize>), ()
     ) -> Pin<Box<dyn Future<Output = Result<(), ()>> + Send + '_>> {
         async move { self.send(result).await.map_err(|_| ()) }.boxed()
     }
+}
+
+/// End `tx`'s driver because the peer it waits on is gone (#4313) or its
+/// request never left (#5858): deliver the cause THROUGH the waiter channel
+/// before the sender drops, so the parked driver's recv() yields
+/// PeerDisconnected before None (race-free, no side registry), then clean up
+/// like TransactionCompleted. Shared by every orphaning site so they cannot
+/// drift apart.
+fn orphan_transaction(
+    state: &mut EventListenerState,
+    live_tx_tracker: &crate::ring::LiveTransactionTracker,
+    tx: Transaction,
+    peer: SocketAddr,
+) {
+    state.tx_to_client.remove(&tx);
+    if let Some(sender) = state.pending_op_results.remove(&tx) {
+        // Best-effort: a full channel means a real reply is already queued, a
+        // closed one means the driver already exited — both benign.
+        #[allow(clippy::let_underscore_must_use)]
+        let _ = sender.try_send(WaiterReply::PeerDisconnected { peer });
+        crate::config::GlobalTestMetrics::record_pending_op_remove();
+    }
+    live_tx_tracker.remove_finished_transaction(tx);
 }
 
 /// What to tell the event loop when `msg`, waiting for a connection to
@@ -3787,10 +3791,32 @@ pub(crate) mod tests {
     #[test]
     fn the_resend_waiter_reports_only_a_message_it_did_not_send() {
         const SOURCE: &str = include_str!("p2p_protoc.rs");
-        let prod = &SOURCE[..SOURCE
+        // Scoped to the event-loop function that holds both drop sites: a
+        // whole-file scrape could match these literals anywhere.
+        let signature = "pub async fn run_event_listener_with_socket<S: Socket>(";
+        let start = SOURCE.find(signature).expect("event-loop function renamed");
+        let tests_at = SOURCE
             .find("\n#[cfg(test)]\npub(crate) mod tests")
-            .expect("tests")];
-        let code: String = prod.split_whitespace().collect();
+            .expect("tests");
+        assert!(start < tests_at, "the anchor must be production code");
+        let open = start + SOURCE[start..].find('{').expect("function body");
+        let bytes = SOURCE.as_bytes();
+        let (mut depth, mut end) = (0i32, open);
+        for (i, b) in bytes.iter().enumerate().skip(open) {
+            match b {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = i;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        assert!(end > open && end < tests_at, "unbalanced body slice");
+        let code: String = SOURCE[open..end].split_whitespace().collect();
         let own = "&ctx.bridge.op_manager.ring.connection_manager.pub_key,";
         let notice = code
             .find(&format!(
@@ -3809,7 +3835,7 @@ pub(crate) mod tests {
             .expect("the ConnectPeer full/closed branch");
         let inline = code[dropped..]
             .find(&format!(
-                "ifunsent_message_notice(&msg,tx,target_addr,{own}).is_some(){{ifletSome(sender)=state.pending_op_results.remove(&tx){{"
+                "ifunsent_message_notice(&msg,tx,target_addr,{own}).is_some(){{orphan_transaction(&mutstate,&ctx.bridge.op_manager.ring.live_tx_tracker,tx,target_addr,);}}"
             ))
             .expect("the full/closed branch must end an unsent CONNECT's driver");
         let cont = code[dropped..].find("continue;").expect("the branch ends");
@@ -5109,7 +5135,18 @@ pub(crate) mod tests {
             .find("\n                            }\n")
             .map(|p| arm_start + p)
             .expect("TransactionOrphaned arm closer not found");
-        let body = &SOURCE[arm_start..arm_end];
+        assert!(
+            SOURCE[arm_start..arm_end].contains("orphan_transaction("),
+            "the TransactionOrphaned arm must go through orphan_transaction"
+        );
+        let fn_start = SOURCE
+            .find("\nfn orphan_transaction(")
+            .expect("orphan_transaction renamed or removed");
+        let fn_end = fn_start
+            + SOURCE[fn_start..]
+                .find("\n}\n")
+                .expect("end of orphan_transaction");
+        let body = &SOURCE[fn_start..fn_end];
 
         let send_pos = body
             .find("WaiterReply::PeerDisconnected")

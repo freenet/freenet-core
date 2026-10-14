@@ -3078,22 +3078,47 @@ mod driver_timing_tests {
         );
     }
 
+    /// Simulation time for transaction TTLs on this (single-threaded) test
+    /// runtime, cleared on drop so it cannot leak into the next test.
+    struct SimulationClock;
+
+    impl SimulationClock {
+        fn set(ms: u64) -> Self {
+            crate::config::GlobalSimulationTime::set_time_ms(ms);
+            Self
+        }
+    }
+
+    impl Drop for SimulationClock {
+        fn drop(&mut self) {
+            crate::config::GlobalSimulationTime::clear_time();
+        }
+    }
+
     /// The same when the transaction's TTL runs out while a dial is in flight
-    /// (re-review testing 2). Real time: the TTL is read from the wall clock,
-    /// so the transaction expires 2 s in, during a 3 s dial.
-    #[tokio::test]
+    /// (re-review testing 2). Deterministic: the TTL reads the simulation
+    /// clock, which the test moves past the TTL 1 s into a 3 s dial (paused
+    /// tokio time).
+    #[tokio::test(start_paused = true)]
     async fn a_ttl_expiring_mid_dial_still_lets_the_dial_finish() {
         let (op_manager, events) = op_manager_with_events("driver-drain-ttl").await;
         let _log = scripted_event_loop(events, vec![]);
-        let tx = Transaction::new_expiring_in::<ConnectMsg>(Duration::from_secs(2));
+        const EPOCH_MS: u64 = 1_700_000_000_000;
+        let _clock = SimulationClock::set(EPOCH_MS);
+        let tx = Transaction::new::<ConnectMsg>();
         let gateway = peer(24896);
         let acceptor = peer(24897);
         let (replies_tx, replies_rx) = mpsc::channel(8);
         replies_tx.send(response(tx, &acceptor)).await.unwrap();
+        let expire = async {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            crate::config::GlobalSimulationTime::set_time_ms(
+                EPOCH_MS + crate::config::OPERATION_TTL.as_millis() as u64 + 1_000,
+            );
+        };
         let mut connected = 0;
         let started = Instant::now();
-        let end = tokio::time::timeout(
-            Duration::from_secs(30),
+        let (end, ()) = tokio::join!(
             super::drive_client_connect(
                 tx,
                 gateway.clone(),
@@ -3106,13 +3131,14 @@ mod driver_timing_tests {
                 ClientConnectKind::Standard,
                 &mut connected,
             ),
-        )
-        .await
-        .expect("the drain is bounded")
-        .expect("driver result");
-        assert_eq!(end, ClientConnectEnd::Finished);
+            expire
+        );
+        assert_eq!(end.expect("driver result"), ClientConnectEnd::Finished);
         assert_eq!(connected, 1, "the dial in flight at the TTL was finished");
-        assert!(started.elapsed() >= NAT_TRAVERSAL_DEADLINE);
+        assert!(
+            started.elapsed() >= NAT_TRAVERSAL_DEADLINE,
+            "the CONNECT waited for its dial"
+        );
         drop(replies_tx);
     }
 
