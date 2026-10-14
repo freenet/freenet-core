@@ -8427,6 +8427,17 @@ mod k_closest_source_tests {
         }
         let candidates: Vec<ContractKey> = ordinary.iter().chain(&provisional).copied().collect();
 
+        // Small batches (the reduced batch under channel backpressure is
+        // `batch / 4`): a batch of 2 gives one front position to a marked
+        // lease, and `.max(1)` still gives a batch of 1 its one position.
+        let two = ring.order_renewal_batch(candidates.clone(), 2);
+        assert!(
+            provisional.contains(&two[0]) && ordinary.contains(&two[1]),
+            "{two:?}"
+        );
+        let one = ring.order_renewal_batch(candidates.clone(), 1);
+        assert_eq!(one[0], provisional[0], "{one:?}");
+
         let ordered = ring.order_renewal_batch(candidates, batch);
         let front_provisional = ordered[..batch]
             .iter()
