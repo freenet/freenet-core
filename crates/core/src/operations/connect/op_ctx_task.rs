@@ -108,10 +108,10 @@ impl Drop for RelayConnectInflightGuard {
 pub(crate) enum ClientConnectKind {
     /// Gateway join, ring acquisition.
     Standard,
-    /// Periodic gateway version probe (#3677). Like a gateway join it ends
-    /// early when this peer has no ring connection, but it runs outside the
-    /// bootstrap pacer, so a probe that hears nothing does not count toward
-    /// redialling the gateway link.
+    /// Periodic gateway version probe (#3677). Never treated as a bootstrap
+    /// join: it runs outside the bootstrap pacer (and is skipped while this
+    /// peer has no connection), so a probe that hears nothing does not count
+    /// toward redialling the gateway link.
     VersionProbe,
     /// Route-to-self nearest-neighbor lattice probe (`Ring::connection_maintenance`),
     /// issued in scheduler `generation`: an acceptor that is not a lattice edge

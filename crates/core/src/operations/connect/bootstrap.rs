@@ -17,8 +17,9 @@
 //! - Gateway liveness: a CONNECT that starts without this peer knowing its
 //!   own address gets an `ObservedAddress` from the gateway as soon as the
 //!   gateway has it. [`SILENT_ROUNDS_BEFORE_REDIAL`] such CONNECTs in a row
-//!   without one by [`GATEWAY_ANSWER_DEADLINE`] mark the gateway link as dead,
-//!   and it is dropped for a fresh handshake.
+//!   through a configured gateway without one by [`GATEWAY_ANSWER_DEADLINE`]
+//!   mark the link as dead, and it is dropped for a fresh handshake, at most
+//!   once per [`MIN_REDIAL_INTERVAL`].
 //!
 //! Request rate when no gateway answers at all: the backoff alone allows
 //! rounds at 0, 5, 15, 35, 65 and 95 s and then one per 30 s (each wait
@@ -26,8 +27,16 @@
 //! TTL: 0, 5, 15, 60, 90, 120 s). At most six rounds in the first 100 s where
 //! the TTL-bound loop managed two, and one round per ~30 s after that against
 //! one per ~62 s, about 2x. Each round sends one CONNECT per eligible gateway,
-//! as before, and no gateway ever has more than three of this peer's bootstrap
-//! CONNECTs outstanding.
+//! as before. That doubles CONNECT messages, not handshakes: the per-address
+//! dial backoff still bounds the handshakes that reach the wire at about
+//! main's rate.
+//!
+//! Paced rounds put at most [`MAX_OUTSTANDING_BOOTSTRAP_ROUNDS`] of this
+//! peer's bootstrap CONNECTs on a gateway at once; a join-loop round started
+//! while the peer still had a connection is unpaced and can add one more. The
+//! cost in a healthy mass join is up to three times the relayed CONNECT state
+//! at gateways, and three times the acceptor reservations, per joiner while it
+//! has no connection.
 
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
@@ -53,7 +62,9 @@ pub(crate) const MAX_CONCURRENT_ACCEPTOR_DIALS: usize = 4;
 /// Bootstrap rounds whose CONNECTs may be outstanding at once.
 ///
 /// A round sends one CONNECT per gateway, so this is also the most of this
-/// peer's bootstrap CONNECTs any one gateway sees at a time. Three lets the
+/// peer's paced bootstrap CONNECTs any one gateway sees at a time (an unpaced
+/// round started while the peer still had a connection can add one). Three
+/// lets the
 /// joiner retry twice while its first CONNECTs are still in the slow tail of
 /// live replies (p90 27 s), and stops it there: more rounds into gateways that
 /// have not answered three only multiply the load on them.

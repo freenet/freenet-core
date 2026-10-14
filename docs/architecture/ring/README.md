@@ -263,14 +263,22 @@ sequenceDiagram
 zero-connection fallback share one bootstrap pacer. A round (one CONNECT per gateway) runs in
 the background: the next starts after a jittered backoff of 5, 10, 20, then 30 s, without
 waiting for earlier rounds' CONNECTs, which still collect replies to their 60 s TTL (live
-replies are often slow: first reply p50 3.5 s, p95 41 s). At most 3 rounds are outstanding.
-The backoff resets once a ring connection has lasted 30 s, and isolation recovery clears it;
-once connected, no new bootstrap rounds start but outstanding CONNECTs run on. Acceptors
-are dialled concurrently (up to 4) so one unreachable acceptor does not hold up the rest.
-While the joiner does not know its own address, the gateway's `ObservedAddress` shows the
-link is alive; two gateway joins in a row without one after 15 s drop that transport for a
-fresh handshake (the joins keep collecting). With no gateway answering, rounds start at
-most at 0, 5, 15, 35, 65, 95 s and then every ~30 s (the old loop: one per ~62 s).
+replies are often slow: first reply p50 3.5 s, p95 41 s). At most 3 paced rounds are
+outstanding (an unpaced round started while the peer still had a connection can add one).
+The backoff resets once a ring connection has lasted 30 s; isolation recovery shortens a
+stale wait to a jittered 5 s unless a round started in the last 30 s. Once connected, no
+new bootstrap rounds start but outstanding CONNECTs run on. Acceptors are dialled
+concurrently (up to 4, at most 2x `min_connections` per CONNECT), and every end of
+collection (Rejected, TTL, waiter closed) still finishes the dials already taken. While
+the joiner does not know its own address, the gateway's `ObservedAddress` shows the link
+is alive; two joins in a row through a configured gateway without one after 15 s drop that
+transport for a fresh handshake (the joins keep collecting), at most once per 2 min. A
+CONNECT request dropped because its gateway handshake failed ends its driver at once.
+With no gateway answering, rounds start at most at 0, 5, 15, 35, 65, 95 s and then every
+~30 s (the old loop: one per ~62 s); that doubles CONNECT messages, while the per-address
+dial backoff keeps wire handshakes near main's rate. The join loop still clears every
+gateway reservation when fully isolated (#3319); the maintenance bootstrap clears only
+those its paced rounds made.
 
 **Target selection in `join_ring_request`** (gateway joins, cached-peer reconnects, the
 startup loop):

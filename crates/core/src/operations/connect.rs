@@ -89,7 +89,10 @@
 //!   window. A peer that already has a connection still dials one at a time.
 //! - **Redials a dead gateway link.** While the joiner does not know its address, the
 //!   gateway answers with `ObservedAddress`; two joins in a row through one gateway without
-//!   it by `GATEWAY_ANSWER_DEADLINE` drop that transport so the next round re-handshakes.
+//!   it by `GATEWAY_ANSWER_DEADLINE` drop that transport so the next round re-handshakes
+//!   (at most once per 2 min per gateway).
+//! - **Finishes its dials.** However collection ends (Rejected, TTL, the waiter closing),
+//!   the acceptors already taken are still dialled, at most `acceptor_limit` per CONNECT.
 //!
 //! ## Routing
 //!
