@@ -5338,8 +5338,7 @@ mod bootstrap_subscription_tests {
         .await;
         // The answer is fire-and-forget: let the scripted loop drain it.
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        let responses = seen.lock().responses.clone();
-        responses
+        seen.lock().responses.clone()
     }
 
     /// (c) The gateway keeps answering `Subscribed` to a requester it reaches
