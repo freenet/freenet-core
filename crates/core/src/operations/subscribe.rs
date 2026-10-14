@@ -671,6 +671,26 @@ pub(super) async fn finalize_originator_subscribe(
     }
 }
 
+/// The `PeerKey` a requester would be registered under as our downstream
+/// subscriber, looked up by address among our RING connections.
+///
+/// `None` for a requester we reach only over a transient link: the transient
+/// table records no public key, and UPDATE fan-out resolves its targets among
+/// ring connections only, so such a requester can be neither registered nor
+/// sent an UPDATE (#2524). A SUBSCRIBE hop checks this BEFORE answering, so it
+/// never answers `Subscribed` to a requester it cannot serve.
+pub(super) fn resolve_downstream_peer(
+    op_manager: &OpManager,
+    requester_addr: std::net::SocketAddr,
+    source_addr: Option<std::net::SocketAddr>,
+) -> Option<crate::ring::interest::PeerKey> {
+    let connections = &op_manager.ring.connection_manager;
+    connections
+        .get_peer_by_addr(requester_addr)
+        .or_else(|| source_addr.and_then(|sa| connections.get_peer_by_addr(sa)))
+        .map(|pkl| crate::ring::interest::PeerKey::from(pkl.pub_key))
+}
+
 /// Register a downstream subscriber for a contract.
 ///
 /// Resolves the requester's `PeerKey` from the pre-resolved public key (preferred,
@@ -688,17 +708,7 @@ pub(crate) async fn register_downstream_subscriber(
 ) {
     let peer_key = requester_pub_key
         .map(|pk| crate::ring::interest::PeerKey::from(pk.clone()))
-        .or_else(|| {
-            op_manager
-                .ring
-                .connection_manager
-                .get_peer_by_addr(requester_addr)
-                .or_else(|| {
-                    source_addr
-                        .and_then(|sa| op_manager.ring.connection_manager.get_peer_by_addr(sa))
-                })
-                .map(|pkl| crate::ring::interest::PeerKey::from(pkl.pub_key))
-        });
+        .or_else(|| resolve_downstream_peer(op_manager, requester_addr, source_addr));
 
     if let Some(peer_key) = peer_key {
         let outcome = op_manager

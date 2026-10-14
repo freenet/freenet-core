@@ -1745,6 +1745,43 @@ async fn drive_relay_subscribe(
         "SUBSCRIBE relay: processing Request"
     );
 
+    // ── Step 0: Only answer a requester we can register (#2524) ──────────
+    // Every `Subscribed` this driver sends goes out BEFORE the requester is
+    // registered as our downstream subscriber (Fix A below), and registration
+    // resolves the requester among our RING connections. A requester we reach
+    // only over a transient link cannot be resolved, so a `Subscribed` would
+    // leave it believing it is subscribed while it receives no UPDATE from us,
+    // silently, on every renewal. Answer NotFound up front instead: the
+    // requester's driver then tries its next candidate, and we neither search
+    // nor take a lease for demand we cannot serve. The originator loopback
+    // (`upstream_addr == own_addr`) is not a remote requester and is exempt.
+    let originator_loopback =
+        Some(upstream_addr) == op_manager.ring.connection_manager.get_own_addr();
+    if !originator_loopback
+        && super::resolve_downstream_peer(op_manager, upstream_addr, Some(upstream_addr)).is_none()
+    {
+        tracing::warn!(
+            tx = %incoming_tx,
+            %instance_id,
+            %upstream_addr,
+            is_transient = op_manager.ring.connection_manager.is_transient(upstream_addr),
+            phase = "subscribe_requester_unregistrable",
+            "SUBSCRIBE: requester is not a ring connection, so it cannot be registered \
+             as a downstream subscriber; answering NotFound so it subscribes elsewhere"
+        );
+        // Deliberately no `subscribe_not_found` telemetry event: the contract
+        // was not looked for, so this must not count as a routing dead-end.
+        return relay_subscribe_send_response(
+            op_manager,
+            incoming_tx,
+            instance_id,
+            SubscribeMsgResult::NotFound,
+            upstream_addr,
+            op_manager.ring.max_hops_to_live.saturating_sub(htl),
+        )
+        .await;
+    }
+
     // ── Step 1: Local-hit fast path (with brief wait-for-in-flight-PUT) ──
     if let Some(key) = super::wait_for_contract_with_timeout(
         op_manager,
@@ -1771,9 +1808,9 @@ async fn drive_relay_subscribe(
         // it can never leave a phantom). Deferring it past the send keeps any
         // contract-handling work off the upstream critical path (uniform with the
         // forwarded path, where the fetch can take up to CONTRACT_WAIT_TIMEOUT_MS
-        // and must not stack across a multi-hop chain). The relay driver path does
-        // not know the requester's `TransportPublicKey`; the addr-based fallback in
-        // `register_downstream_subscriber` is adequate for relay hops.
+        // and must not stack across a multi-hop chain). This driver does not know
+        // the requester's `TransportPublicKey`; registration resolves it by
+        // address, which Step 0 has already checked succeeds (#2524).
         let send_result = relay_subscribe_send_response(
             op_manager,
             incoming_tx,
@@ -5213,6 +5250,8 @@ mod unregistrable_requester_tests {
             requester,
         )
         .await;
+        // The answer is fire-and-forget: let the scripted loop drain it.
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         // The hosting map holds downstream subscribers only; the interest map
         // would also count the responder, registered as our upstream.
         let registered = op_manager.ring.has_downstream_subscribers(&key);
