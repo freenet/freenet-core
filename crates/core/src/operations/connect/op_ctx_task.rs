@@ -393,10 +393,16 @@ async fn drive_client_connect(
     // the gateway is there, and silence proves nothing. A join still waiting
     // for it at the deadline counts as silent toward redialling the link,
     // and keeps collecting.
+    // Only through a configured gateway: a cached-peer reconnect is also a
+    // Standard join at zero connections, but its first hop is no gateway.
     let started = Instant::now();
     let mut heard_gateway = false;
-    let mut answer_deadline =
-        (bootstrapping && started_without_address).then(|| started + GATEWAY_ANSWER_DEADLINE);
+    let through_gateway = op_manager
+        .configured_gateways
+        .iter()
+        .any(|gw| gw.socket_addr() == Some(gateway_addr));
+    let mut answer_deadline = (bootstrapping && started_without_address && through_gateway)
+        .then(|| started + GATEWAY_ANSWER_DEADLINE);
     // Reply collection ends on a Rejected, the TTL, or the waiter closing, but
     // acceptors already taken are still dialled to the end (bounded by
     // `DIAL_DRAIN_LIMIT`): a failed punch still gets its ConnectFailed, a
@@ -2229,6 +2235,8 @@ mod driver_timing_tests {
         op_manager_at(id, false).await
     }
 
+    const GATEWAY_PORTS: [u16; 7] = [24862, 24864, 24867, 24868, 24869, 24882, 24883];
+
     async fn op_manager_at(
         id: &str,
         addressed: bool,
@@ -2242,10 +2250,19 @@ mod driver_timing_tests {
             mode: Some(crate::contract::OperationMode::Local),
             ..Default::default()
         };
-        let node_config =
+        let mut node_config =
             crate::node::NodeConfig::new(config_args.build().await.expect("build Config"))
                 .await
                 .expect("build NodeConfig");
+        // The ports the liveness tests use as gateways; anything else is a
+        // non-gateway first hop.
+        for port in GATEWAY_PORTS {
+            let gateway = peer(port);
+            let location = Location::from_address(&gateway.socket_addr().unwrap());
+            node_config
+                .gateways
+                .push(crate::node::InitPeerNode::new(gateway, location));
+        }
         let (notification_rx, notification_tx) = crate::node::event_loop_notification_channel();
         let (ops_ch_channel, ch_channel, _wait_for_event) =
             crate::contract::contract_handler_channel();
@@ -2694,6 +2711,15 @@ mod driver_timing_tests {
             "A was sent before the gateway answered B; it must not count toward a redial"
         );
         script.abort();
+    }
+
+    /// A cached-peer reconnect is a Standard join at zero connections too,
+    /// but through a peer that is no gateway: its silence says nothing about
+    /// a gateway link and never drops one (review nit).
+    #[tokio::test(start_paused = true)]
+    async fn a_join_through_a_non_gateway_never_counts_toward_a_redial() {
+        let (first, second) = two_joins("driver-liveness-cached", 24884, false, |_| None).await;
+        assert_eq!((first, second), (false, false));
     }
 
     /// A peer that knows its address gets no `ObservedAddress`, so silence
