@@ -1224,10 +1224,9 @@ impl ConnectionManager {
     /// evidence), except at the cap: there our own cap refuses every
     /// non-lattice acceptor, and a peer at max would otherwise never sleep. A
     /// lattice edge that could not be connected, for any reason (a failed hole
-    /// punch, or our own refusal at the cap, whose outbound pre-flight check
-    /// does not exempt lattice edges, #5827), is recorded as a failed hit, and the
-    /// scheduler re-checks on its retry ladder. Returns whether a miss was
-    /// recorded.
+    /// punch, or our own refusal once the over-cap ceiling is used up), is
+    /// recorded as a failed hit, and the scheduler re-checks on its retry ladder.
+    /// Returns whether a miss was recorded.
     pub(crate) fn record_lattice_probe_result(
         &self,
         loc: Location,
@@ -1383,9 +1382,10 @@ impl ConnectionManager {
     /// victim), bringing the node back to `max_connections`.
     ///
     /// This is the SINGLE over-cap admission predicate shared by every gate that
-    /// can add a ring connection: `should_accept`, the two connection-lifecycle
-    /// promotion gates (`p2p_protoc/connection_lifecycle.rs`), and
-    /// [`Self::add_connection`]. Keeping the decision in one place is deliberate —
+    /// can add a ring connection: `should_accept`, the three connection-lifecycle
+    /// cap gates (`p2p_protoc/connection_lifecycle.rs`: the outbound pre-flight
+    /// check in `handle_connect_peer` and both promotion gates, through
+    /// [`Self::refuses_connection_at_cap`]), and [`Self::add_connection`]. Keeping the decision in one place is deliberate —
     /// before it was wired through the lifecycle gates, mechanism 3's over-cap
     /// displacement was inert on the real CONNECT path (the gates rejected at
     /// `>= max_connections` first).
@@ -1445,8 +1445,13 @@ impl ConnectionManager {
     ///
     /// The one predicate shared by the outbound pre-flight check in
     /// `handle_connect_peer` and both promotion gates
-    /// (`p2p_protoc/connection_lifecycle.rs`), so a lattice edge refused by one
-    /// gate is refused by all of them and admitted by all of them otherwise.
+    /// (`p2p_protoc/connection_lifecycle.rs`), so every gate applies the same
+    /// lattice exemption. They need not reach the same answer for the same
+    /// candidate: the over-cap ceiling counts pending reservations, and when we
+    /// are the acceptor the candidate's own reservation is still held at the
+    /// pre-flight check (as in `should_accept`) but already released at the
+    /// promotion gate in `handle_successful_connection`, so the pre-flight check
+    /// can refuse one slot earlier than that gate.
     /// Before #5827 the pre-flight check had no lattice exemption, so a peer at
     /// max refused its own lattice probe's acceptor before NAT traversal began.
     pub(crate) fn refuses_connection_at_cap(&self, loc: Location) -> bool {
@@ -2162,10 +2167,11 @@ impl ConnectionManager {
         // over-max ceiling (`admits_lattice_edge_over_cap`, see
         // LATTICE_OVERMAX_SLACK). The over-max topology prune sheds a non-lattice
         // connection on the next maintenance tick (lattice edges are protected
-        // there), bringing the node back to max. The two connection-lifecycle
-        // promotion gates apply the SAME predicate before reaching here, so a
-        // lattice edge is no longer silently dropped at the cap on the real
-        // CONNECT path.
+        // there), bringing the node back to max. The three connection-lifecycle
+        // cap gates (the outbound pre-flight check and both promotion gates)
+        // apply the SAME predicate before reaching here, through
+        // `refuses_connection_at_cap`, so a lattice edge is no longer silently
+        // dropped at the cap on the real CONNECT path.
         //
         // F4 (atomicity): the cap count-check, the over-cap admission check, the
         // relocation removal, and the insert all run under ONE held
@@ -4155,8 +4161,8 @@ mod tests {
     /// admits any strictly-closer per-side nearest — a TIGHTEN of a filled side OR
     /// a FILL of an empty one — within the over-max ceiling. A candidate no closer
     /// than the current per-side nearest (a farther non-lattice peer) is never
-    /// admissible. It is the exact decision both connection-lifecycle promotion
-    /// gates apply on the real CONNECT path (see the source-scrape pin below).
+    /// admissible. It is the exact decision the connection-lifecycle cap gates
+    /// apply on the real CONNECT path (see the source-scrape pin below).
     #[test]
     fn admits_lattice_edge_over_cap_predicate() {
         let _nn_guard = NnLatticeOverrideGuard;
