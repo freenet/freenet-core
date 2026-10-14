@@ -12482,10 +12482,15 @@ fn run_close_cluster_placement(
             network_name,
             1,
             num_nodes,
-            10,
-            7,
+            // The client-GET run makes its dead-end structural (#5806): at HTL
+            // 3 a GET entering the cluster exhausts there and comes back
+            // NotFound, instead of a wide walk finding the host on some seeds.
+            if client_get { 3 } else { 10 },
+            if client_get { 3 } else { 7 },
             8,
-            3,
+            // ... and with min_connections 4 the requester links every peer it
+            // can reach (see the partition below).
+            if client_get { 4 } else { 3 },
             SEED,
             &node_locations,
         )
@@ -12528,6 +12533,35 @@ fn run_close_cluster_placement(
         },
     )];
     if client_get {
+        // Structural dead-end (#5806): the requester can reach only cluster
+        // nodes 1 and 2, the host and the gateway, so its ring neighbours are
+        // exactly those four. Its GET's first hops by distance to the key are
+        // the two cluster peers, which dead-end (HTL 3) with NotFound, and the
+        // retry budget (4 attempts, one per distinct first hop) is enough to
+        // reach the host whatever order the gateway takes. Before, the
+        // requester linked up to six cluster peers, so the outcome depended
+        // on how many of them the seed's topology put ahead of the host.
+        use freenet::simulation::{FaultConfig, Partition};
+        let requester_addr = sim
+            .node_address(&requester_label)
+            .expect("requester address");
+        let unreachable: HashSet<SocketAddr> = (3..=6)
+            .map(|n| {
+                sim.node_address(&NodeLabel::node(network_name, n))
+                    .expect("cluster address")
+            })
+            .collect();
+        sim.with_fault_injection(
+            FaultConfig::builder()
+                .partition(
+                    Partition::new([requester_addr].into_iter().collect(), unreachable)
+                        .permanent(0),
+                )
+                .build(),
+        );
+        // Every peer joined and the requester's links settled before it asks.
+        sim.wait_for_join_convergence_before_ops(1.0, Duration::from_secs(120));
+        sim.with_controlled_op_interval(Duration::from_secs(60));
         operations.push(ScheduledOperation::new(
             requester_label,
             SimOperation::Get {
@@ -12614,15 +12648,29 @@ fn test_contract_stays_off_close_cluster_without_migration() {
 ///
 /// Mechanism: the requester's router labels each peer that answered NotFound at
 /// most once per operation, so two or more NotFound labels means two or more
-/// distinct first hops. That assertion is what pins the fix: the outcome has
-/// no margin, since the GET resolves on its fourth and last attempt, so one
-/// more NotFound first hop in this topology would turn it red with no
-/// regression in retry diversity.
+/// distinct first hops.
+///
+/// The dead-end is structural, not seed-found (#5806): the requester can
+/// reach only two cluster peers, the host and the gateway (a partition), and
+/// HTL 3 makes a GET entering the cluster exhaust there. Its two cluster first
+/// hops always answer NotFound, and with four ring neighbours and four
+/// attempts the GET always reaches the host. The preconditions below check
+/// that shape, so a change that breaks it fails at its cause.
 #[test_log::test]
 fn test_get_retries_resolve_close_cluster_dead_end_without_migration() {
     const NETWORK_NAME: &str = "get-placement-deadend-control";
     let (result, contract_key) = run_close_cluster_placement(NETWORK_NAME, false, true);
     let requester = freenet::dev_tool::NodeLabel::node(NETWORK_NAME, 8);
+    let node = |n| freenet::dev_tool::NodeLabel::node(NETWORK_NAME, n);
+    let links: Vec<usize> = (1..=7)
+        .filter(|n| result.node_is_connected_to(&requester, &node(*n)))
+        .collect();
+    assert_eq!(
+        links,
+        vec![1, 2, 7],
+        "precondition: the requester's ring neighbours must be cluster nodes 1 and 2 and \
+         the host (plus the gateway), or the dead-end is not the structural one"
+    );
 
     let requester_has_state = result
         .node_storages
@@ -12630,10 +12678,7 @@ fn test_get_retries_resolve_close_cluster_dead_end_without_migration() {
         .is_some_and(|s| s.get_stored_state(&contract_key).is_some());
     assert!(
         requester_has_state,
-        "with retry diversity the requester GET must resolve without migration. This run \
-         has no margin (it resolves on the last attempt), so red here can also mean one \
-         more NotFound first hop in this topology rather than a retry-diversity \
-         regression: check the mechanism assertion below first"
+        "with retry diversity the requester GET must resolve without migration"
     );
     let (not_found, _, _) = result
         .node_route_failure_causes(&requester)
