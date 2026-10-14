@@ -372,6 +372,32 @@ impl Config {
     }
 }
 
+/// Wraps the routes that serve contract content in `Cache-Control: no-store`.
+///
+/// A contract's bundle is mutable at a stable URL: `fdev website update`
+/// changes what `/v{1,2}/contract/web/<key>/…` returns while every URL beneath
+/// the key stays the same. With no cache directive the browser falls back to
+/// heuristic freshness and an already-open tab keeps running the superseded
+/// build, and the app cannot fix that itself because the stale document is
+/// the one that would have carried the fix (#5323).
+///
+/// Applied as a layer rather than at each response site because contract bytes
+/// leave through several unrelated pipelines (shell page, sandboxed HTML, the
+/// JS rewrite branch, `ServeFile`), and a header wired into only some of them
+/// reproduces the bug. `overriding` so no handler can leave a cacheable
+/// response behind it.
+///
+/// `Router::layer` only wraps routes added BEFORE it, so callers pass the
+/// content routes in on their own and merge the result. The no-trailing-slash
+/// 308 stays outside: it carries no contract content and is meant to be
+/// cacheable (#4019).
+fn no_store<S: Clone + Send + Sync + 'static>(content_routes: Router<S>) -> Router<S> {
+    content_routes.layer(tower_http::set_header::SetResponseHeaderLayer::overriding(
+        axum::http::header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-store"),
+    ))
+}
+
 #[instrument(level = "debug")]
 async fn home() -> axum::response::Response {
     axum::response::Response::default()
@@ -2515,5 +2541,190 @@ mod tests {
             ("x-forwarded-host", "public.example, proxy.internal"),
         ]));
         assert_eq!(origin, "https://public.example");
+    }
+
+    /// Regression for #5323: every response carrying contract content must be
+    /// `Cache-Control: no-store`, and the no-trailing-slash 308 must not be.
+    ///
+    /// Drives the REAL composed router rather than a handler, because the bug
+    /// is about the route tree: contract bytes leave through four unrelated
+    /// pipelines (shell page, sandboxed HTML, the JS rewrite branch,
+    /// `ServeFile`), and a header wired into only some of them would pass a
+    /// handler-level test while the rest stayed cacheable. Each case asserts a
+    /// 200 and a body only its pipeline produces, so an early error response
+    /// (which carries `no-store` of its own) cannot stand in for the success
+    /// path it was meant to exercise.
+    #[tokio::test]
+    async fn contract_content_routes_are_served_no_store() {
+        use axum::body::{Body, to_bytes};
+        use axum::http::{Request, StatusCode, header::CACHE_CONTROL};
+        use freenet_stdlib::client_api::{ClientRequest, ContractRequest, ContractResponse};
+        use freenet_stdlib::prelude::{
+            ContractCode, ContractContainer, ContractWasmAPIVersion, Parameters, WrappedContract,
+            WrappedState,
+        };
+        use tower::ServiceExt;
+
+        // A real packed bundle, so the stub node's GetResponse unpacks into the
+        // cache and each pipeline serves an actual file.
+        let mut archive = tar::Builder::new(std::io::Cursor::new(Vec::new()));
+        for (name, body) in [
+            ("index.html", &b"<html><body>root-5323</body></html>"[..]),
+            ("page.html", b"<html><body>page-5323</body></html>"),
+            ("app.js", b"fetch(\"/./assets/app.wasm\");"),
+            ("style.css", b"body { color: red; }"),
+        ] {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(body.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            archive.append_data(&mut header, name, body).unwrap();
+        }
+        let state = WrappedState::new(
+            super::super::app_packaging::WebApp::from_data(Vec::new(), archive)
+                .unwrap()
+                .pack()
+                .unwrap(),
+        );
+        // Unique code ⇒ unique key, so process-global cache state left by other
+        // tests cannot reach this one.
+        let contract = ContractContainer::Wasm(ContractWasmAPIVersion::V1(WrappedContract::new(
+            Arc::new(ContractCode::from(b"issue-5323-no-store".to_vec())),
+            Parameters::from(vec![]),
+        )));
+        let key = contract.key().id().to_string();
+
+        let cache_root = tempfile::tempdir().unwrap();
+        let (mut api, router) = HttpClientApi::as_router_with_origin_contracts(
+            &"127.0.0.1:0".parse().unwrap(),
+            Arc::new(DashMap::new()),
+            crate::contract::user_input::pending_prompts(),
+            cache_root.path().to_path_buf(),
+        );
+
+        // Stub node: assigns client ids and answers every GET with the bundle.
+        let node = tokio::spawn(async move {
+            let mut clients = HashMap::new();
+            while let Some(msg) = api.proxy_server_request.recv().await {
+                match msg {
+                    ClientConnection::NewConnection { callbacks, .. } => {
+                        let id = ClientId::next();
+                        let _ = callbacks.send(HostCallbackResult::NewId { id });
+                        clients.insert(id, callbacks);
+                    }
+                    ClientConnection::Request { client_id, req, .. } => {
+                        if let ClientRequest::ContractOp(ContractRequest::Get { .. }) = *req {
+                            let _ = clients[&client_id].send(HostCallbackResult::Result {
+                                id: client_id,
+                                result: Ok(HostResponse::ContractResponse(
+                                    ContractResponse::GetResponse {
+                                        key: contract.key(),
+                                        contract: Some(contract.clone()),
+                                        state: state.clone(),
+                                    },
+                                )),
+                            });
+                        }
+                    }
+                }
+            }
+        });
+
+        let get = |uri: String, fetch_dest: Option<&'static str>| {
+            let router = router.clone();
+            async move {
+                let mut req = Request::builder().uri(&uri);
+                if let Some(dest) = fetch_dest {
+                    req = req.header("sec-fetch-dest", dest);
+                }
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(30),
+                    router.oneshot(req.body(Body::empty()).unwrap()),
+                )
+                .await
+                .unwrap_or_else(|_| panic!("{uri} hung"))
+                .unwrap()
+            }
+        };
+
+        for prefix in ["v1", "v2"] {
+            let base = format!("/{prefix}/contract/web/{key}");
+            // The shell is listed first: it is what populates the cache, as in a
+            // real browser session.
+            for (pipeline, uri, fetch_dest, expected_body) in [
+                (
+                    "shell page",
+                    format!("{base}/"),
+                    None,
+                    "__sandbox=1".to_string(),
+                ),
+                (
+                    "deep-link shell page",
+                    format!("{base}/page.html"),
+                    Some("document"),
+                    "__sandbox=1".to_string(),
+                ),
+                (
+                    "sandboxed contract HTML",
+                    format!("{base}/?__sandbox=1"),
+                    Some("iframe"),
+                    "root-5323".to_string(),
+                ),
+                (
+                    "sandboxed sub-page HTML",
+                    format!("{base}/page.html?__sandbox=1"),
+                    Some("iframe"),
+                    "page-5323".to_string(),
+                ),
+                (
+                    "JS rewrite branch",
+                    format!("{base}/app.js"),
+                    Some("script"),
+                    format!("\"{base}/assets/app.wasm\""),
+                ),
+                (
+                    "ServeFile asset",
+                    format!("{base}/style.css"),
+                    Some("style"),
+                    "color: red".to_string(),
+                ),
+            ] {
+                let resp = get(uri.clone(), fetch_dest).await;
+                let status = resp.status();
+                let cache_control = resp.headers().get(CACHE_CONTROL).cloned();
+                let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+                let body = String::from_utf8_lossy(&body);
+                assert_eq!(
+                    status,
+                    StatusCode::OK,
+                    "{pipeline} ({uri}) must succeed, or this is not testing its \
+                     success pipeline; body: {body}"
+                );
+                assert!(
+                    body.contains(&expected_body),
+                    "{uri} must be served by the {pipeline} pipeline \
+                     (expected {expected_body:?}); got: {body}"
+                );
+                assert_eq!(
+                    cache_control.as_ref().and_then(|v| v.to_str().ok()),
+                    Some("no-store"),
+                    "{pipeline} ({uri}) must be `Cache-Control: no-store`, or a \
+                     browser that has it open keeps running the old bundle after \
+                     a republish (#5323)"
+                );
+            }
+
+            // The redirect carries no contract content and was made a 308 so the
+            // browser can cache it (#4019); the layer must not reach it.
+            let resp = get(base.clone(), None).await;
+            assert_eq!(resp.status(), StatusCode::PERMANENT_REDIRECT, "{base}");
+            assert_eq!(
+                resp.headers().get(CACHE_CONTROL),
+                None,
+                "the no-trailing-slash redirect {base} must stay cacheable"
+            );
+        }
+
+        node.abort();
     }
 }
