@@ -372,6 +372,61 @@ impl Config {
     }
 }
 
+/// Wraps the routes that serve contract content so every HTML document they
+/// return is `Cache-Control: no-store`. Other responses are left as they are.
+///
+/// A contract's bundle is mutable at a stable URL: `fdev website update`
+/// changes what `/v{1,2}/contract/web/<key>/…` returns while every URL beneath
+/// the key stays the same, so a cached document pins an open tab to the old
+/// build, and the app cannot fix that itself because the stale document is the
+/// one that would have carried the fix (#5323). The HTML is what names the
+/// assets to load, so keeping it fresh is enough for any app whose asset names
+/// are content-hashed.
+///
+/// Assets are deliberately not touched. Hashed assets are safe to cache, and
+/// the reverse proxy in front of try.freenet.org (its `@assets` matcher) adds
+/// `Cache-Control: public, max-age=31536000, immutable` to files directly under
+/// `assets/`. It passes the node's own `Cache-Control` through
+/// alongside, so a `no-store` from here would cancel that in the browser.
+/// Unhashed assets served by `ServeFile` therefore stay heuristically cacheable
+/// through its `Last-Modified`. Fixing those needs conditional requests plus
+/// `no-cache`, not `no-store` (#5888).
+///
+/// Keyed on the response `Content-Type` and applied to the routes rather than
+/// at each response site, because HTML leaves through several unrelated
+/// pipelines (shell page, sandboxed HTML, raw HTML through `ServeFile`), and a
+/// header wired into only some of them reproduces the bug. `overriding` so no
+/// handler can leave a cacheable document behind it.
+///
+/// The layer only wraps routes added BEFORE it, so callers pass the content
+/// routes in on their own and merge the result. The no-trailing-slash 308 stays
+/// outside: it carries no contract content and is meant to be cacheable
+/// (#4019). `route_layer` rather than `layer` so the sub-router's default 404
+/// fallback is not wrapped: merged fallbacks replace one another, and a wrapped
+/// one could otherwise become the node-wide 404 depending on merge order.
+fn no_store_html<S: Clone + Send + Sync + 'static>(content_routes: Router<S>) -> Router<S> {
+    content_routes.route_layer(tower_http::set_header::SetResponseHeaderLayer::overriding(
+        axum::http::header::CACHE_CONTROL,
+        |response: &axum::response::Response| {
+            is_html_response(response).then(|| axum::http::HeaderValue::from_static("no-store"))
+        },
+    ))
+}
+
+/// Whether `response` is an HTML document, by its `Content-Type`.
+fn is_html_response(response: &axum::response::Response) -> bool {
+    response
+        .headers()
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split(';').next())
+        .map(str::trim)
+        .is_some_and(|mime| {
+            mime.eq_ignore_ascii_case("text/html")
+                || mime.eq_ignore_ascii_case("application/xhtml+xml")
+        })
+}
+
 #[instrument(level = "debug")]
 async fn home() -> axum::response::Response {
     axum::response::Response::default()
@@ -2521,5 +2576,352 @@ mod tests {
             ("x-forwarded-host", "public.example, proxy.internal"),
         ]));
         assert_eq!(origin, "https://public.example");
+    }
+
+    /// Regression for #5323: every HTML document served under a contract key
+    /// must be `Cache-Control: no-store`, while assets and the no-trailing-slash
+    /// 308 keep their caching untouched.
+    ///
+    /// Drives the REAL composed router rather than a handler, because the bug
+    /// is about the route tree: HTML leaves through several unrelated pipelines
+    /// (shell page, sandboxed HTML, raw HTML through `ServeFile`), and a header
+    /// wired into only some of them would pass a handler-level test while the
+    /// rest stayed cacheable. The asset cases pin the other half: a `no-store`
+    /// there would cancel try.freenet.org's immutable caching of hashed assets.
+    /// Each case asserts a 200 and a body only its pipeline produces, so an
+    /// early error response (which carries `no-store` of its own) cannot stand
+    /// in for the success path it was meant to exercise.
+    #[tokio::test]
+    async fn contract_html_is_served_no_store_and_assets_are_not() {
+        use axum::body::{Body, to_bytes};
+        use axum::http::{
+            Method, Request, StatusCode,
+            header::{CACHE_CONTROL, LAST_MODIFIED},
+        };
+        use freenet_stdlib::client_api::{ClientRequest, ContractRequest, ContractResponse};
+        use freenet_stdlib::prelude::{
+            ContractCode, ContractContainer, ContractWasmAPIVersion, Parameters, WrappedContract,
+            WrappedState,
+        };
+        use tower::ServiceExt;
+
+        // A real packed bundle, so the stub node's GetResponse unpacks into the
+        // cache and each pipeline serves an actual file.
+        let mut archive = tar::Builder::new(std::io::Cursor::new(Vec::new()));
+        for (name, body) in [
+            ("index.html", &b"<html><body>root-5323</body></html>"[..]),
+            ("page.html", b"<html><body>page-5323</body></html>"),
+            ("app.js", b"fetch(\"/./assets/app.wasm\");"),
+            ("style.css", b"body { color: red; }"),
+        ] {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(body.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            archive.append_data(&mut header, name, body).unwrap();
+        }
+        let state = WrappedState::new(
+            super::super::app_packaging::WebApp::from_data(Vec::new(), archive)
+                .unwrap()
+                .pack()
+                .unwrap(),
+        );
+        // Unique code ⇒ unique key, so process-global cache state left by other
+        // tests cannot reach this one.
+        let contract = ContractContainer::Wasm(ContractWasmAPIVersion::V1(WrappedContract::new(
+            Arc::new(ContractCode::from(b"issue-5323-no-store".to_vec())),
+            Parameters::from(vec![]),
+        )));
+        let key = contract.key().id().to_string();
+
+        let cache_root = tempfile::tempdir().unwrap();
+        let (mut api, router) = HttpClientApi::as_router_with_origin_contracts(
+            &"127.0.0.1:0".parse().unwrap(),
+            Arc::new(DashMap::new()),
+            crate::contract::user_input::pending_prompts(),
+            cache_root.path().to_path_buf(),
+        );
+
+        // Stub node: assigns client ids and answers every GET with the bundle.
+        // A send to a handler that has already given up is ignored rather than
+        // panicking here: the panic would be swallowed with this task, and the
+        // handler's own request then fails with a clearer message.
+        let node = tokio::spawn(async move {
+            let mut clients = HashMap::new();
+            while let Some(msg) = api.proxy_server_request.recv().await {
+                match msg {
+                    ClientConnection::NewConnection { callbacks, .. } => {
+                        let id = ClientId::next();
+                        if callbacks.send(HostCallbackResult::NewId { id }).is_ok() {
+                            clients.insert(id, callbacks);
+                        }
+                    }
+                    ClientConnection::Request { client_id, req, .. } => {
+                        let Some(callbacks) = clients.get(&client_id) else {
+                            continue;
+                        };
+                        if let ClientRequest::ContractOp(ContractRequest::Get { .. }) = *req {
+                            let _sent = callbacks
+                                .send(HostCallbackResult::Result {
+                                    id: client_id,
+                                    result: Ok(HostResponse::ContractResponse(
+                                        ContractResponse::GetResponse {
+                                            key: contract.key(),
+                                            contract: Some(contract.clone()),
+                                            state: state.clone(),
+                                        },
+                                    )),
+                                })
+                                .is_ok();
+                        }
+                    }
+                }
+            }
+        });
+
+        let request = |method: Method, uri: String, fetch_dest: Option<&'static str>| {
+            let router = router.clone();
+            async move {
+                let mut req = Request::builder().method(method).uri(&uri);
+                if let Some(dest) = fetch_dest {
+                    req = req.header("sec-fetch-dest", dest);
+                }
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(30),
+                    router.oneshot(req.body(Body::empty()).unwrap()),
+                )
+                .await
+                .unwrap_or_else(|_| panic!("{uri} hung"))
+                .unwrap()
+            }
+        };
+        let get = |uri: String, fetch_dest| request(Method::GET, uri, fetch_dest);
+        let cache_control = |resp: &axum::response::Response| {
+            resp.headers()
+                .get(CACHE_CONTROL)
+                .map(|v| v.to_str().unwrap().to_string())
+        };
+
+        for prefix in ["v1", "v2"] {
+            let base = format!("/{prefix}/contract/web/{key}");
+            // The shell is listed first: it is what populates the cache, as in a
+            // real browser session.
+            const NO_STORE: Option<&str> = Some("no-store");
+            // The last column records whether the response carries
+            // `Last-Modified`, which in practice is what makes browsers treat a
+            // response as heuristically cacheable. It pins the premises the scoping rests on: the JS
+            // rewrite branch has none (so leaving it alone is safe), and
+            // `ServeFile` assets do (the exposure #5888 tracks). It also tells
+            // the raw-HTML row apart from the sandbox rows, which serve the
+            // same body.
+            for (pipeline, uri, fetch_dest, expected_body, expected_cache_control, last_modified) in [
+                (
+                    "shell page",
+                    format!("{base}/"),
+                    None,
+                    "__sandbox=1".to_string(),
+                    NO_STORE,
+                    false,
+                ),
+                (
+                    "deep-link shell page",
+                    format!("{base}/page.html"),
+                    Some("document"),
+                    "__sandbox=1".to_string(),
+                    NO_STORE,
+                    false,
+                ),
+                (
+                    "sandboxed contract HTML",
+                    format!("{base}/?__sandbox=1"),
+                    Some("iframe"),
+                    "root-5323".to_string(),
+                    NO_STORE,
+                    false,
+                ),
+                (
+                    "sandboxed sub-page HTML",
+                    format!("{base}/page.html?__sandbox=1"),
+                    Some("iframe"),
+                    "page-5323".to_string(),
+                    NO_STORE,
+                    false,
+                ),
+                (
+                    // An app framing its own HTML without `__sandbox`: served
+                    // raw by `ServeFile`, which adds `Last-Modified`, so it is
+                    // the most cacheable HTML of all without the layer.
+                    "raw HTML through ServeFile",
+                    format!("{base}/page.html"),
+                    Some("iframe"),
+                    "page-5323".to_string(),
+                    NO_STORE,
+                    true,
+                ),
+                (
+                    "JS rewrite branch",
+                    format!("{base}/app.js"),
+                    Some("script"),
+                    format!("\"{base}/assets/app.wasm\""),
+                    None,
+                    false,
+                ),
+                (
+                    "ServeFile asset",
+                    format!("{base}/style.css"),
+                    Some("style"),
+                    "color: red".to_string(),
+                    None,
+                    true,
+                ),
+            ] {
+                let resp = get(uri.clone(), fetch_dest).await;
+                let status = resp.status();
+                let header = cache_control(&resp);
+                let has_last_modified = resp.headers().contains_key(LAST_MODIFIED);
+                let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+                let body = String::from_utf8_lossy(&body);
+                assert_eq!(
+                    status,
+                    StatusCode::OK,
+                    "{pipeline} ({uri}) must succeed, or this is not testing its \
+                     success pipeline; body: {body}"
+                );
+                assert!(
+                    body.contains(&expected_body),
+                    "{uri} must be served by the {pipeline} pipeline \
+                     (expected {expected_body:?}); got: {body}"
+                );
+                assert_eq!(
+                    header.as_deref(),
+                    expected_cache_control,
+                    "{pipeline} ({uri}): HTML must be `Cache-Control: no-store`, or \
+                     a browser that has it open keeps running the old bundle after \
+                     a republish (#5323); assets must be left alone"
+                );
+                assert_eq!(
+                    has_last_modified, last_modified,
+                    "{pipeline} ({uri}): unexpected presence of Last-Modified"
+                );
+            }
+
+            // HEAD is served by the same `get` route, so it is covered too.
+            let uri = format!("{base}/page.html?__sandbox=1");
+            let resp = request(Method::HEAD, uri.clone(), Some("iframe")).await;
+            assert_eq!(resp.status(), StatusCode::OK, "HEAD {uri}");
+            assert_eq!(cache_control(&resp).as_deref(), Some("no-store"));
+
+            // A sandbox URL loaded as a top-level document is answered with a
+            // 303 to the shell. It carries no HTML, so the layer leaves it
+            // alone, which is fine: a 303 is not cacheable by default.
+            let resp = get(format!("{base}/?__sandbox=1"), Some("document")).await;
+            assert_eq!(resp.status(), StatusCode::SEE_OTHER, "{base}/?__sandbox=1");
+            assert_eq!(cache_control(&resp), None);
+
+            // The redirect carries no contract content and was made a 308 so the
+            // browser can cache it (#4019). It is outside the layer, and untyped
+            // besides, so this pins the result rather than the routing.
+            let resp = get(base.clone(), None).await;
+            assert_eq!(resp.status(), StatusCode::PERMANENT_REDIRECT, "{base}");
+            assert_eq!(
+                cache_control(&resp),
+                None,
+                "the no-trailing-slash redirect {base} must stay cacheable"
+            );
+        }
+
+        // Routes outside the contract subtree keep their own cache policy. The
+        // node's homepage is HTML, so it is the case that catches the layer
+        // being widened to the whole router; the node's own pages are out of
+        // scope (#4289). The notification worker is deliberately cacheable.
+        // (Whether the 404 fallback is wrapped depends on merge order here, so
+        // `no_store_html`'s own test pins that.)
+        let resp = get("/freenet-notify-sw.js".to_string(), None).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(cache_control(&resp).as_deref(), Some("max-age=3600"));
+        for (uri, status) in [("/", StatusCode::OK), ("/v1/version", StatusCode::OK)] {
+            let resp = get(uri.to_string(), None).await;
+            assert_eq!(resp.status(), status, "{uri}");
+            assert_ne!(
+                cache_control(&resp).as_deref(),
+                Some("no-store"),
+                "{uri} is outside the contract subtree and must not get its no-store"
+            );
+        }
+
+        node.abort();
+    }
+
+    /// `no_store_html` must replace a cacheable header a handler set on HTML
+    /// (including XHTML), leave non-HTML responses alone, wrap only the routes
+    /// it was given, and leave the sub-router's fallback alone (a merged
+    /// fallback can become the whole node's 404). The fallback is HTML so that
+    /// wrapping it would actually show.
+    #[tokio::test]
+    async fn no_store_html_overrides_only_html_and_wraps_only_its_routes() {
+        use axum::http::{Request, StatusCode, header::CACHE_CONTROL, header::CONTENT_TYPE};
+        use axum::routing::get;
+        use tower::ServiceExt;
+
+        let html = || async {
+            (
+                [
+                    (CONTENT_TYPE, "Text/HTML; charset=utf-8"),
+                    (CACHE_CONTROL, "max-age=3600"),
+                ],
+                "<p>",
+            )
+        };
+        let xhtml = || async {
+            (
+                [
+                    (CONTENT_TYPE, "application/xhtml+xml"),
+                    (CACHE_CONTROL, "max-age=3600"),
+                ],
+                "<p/>",
+            )
+        };
+        let css = || async {
+            (
+                [(CONTENT_TYPE, "text/css"), (CACHE_CONTROL, "max-age=3600")],
+                "p {}",
+            )
+        };
+        let router: Router = Router::new()
+            .merge(no_store_html(
+                Router::new()
+                    .route("/inside.html", get(html))
+                    .route("/inside.xhtml", get(xhtml))
+                    .route("/inside.css", get(css))
+                    .fallback(html),
+            ))
+            .route("/outside.html", get(html));
+
+        for (uri, status, expected) in [
+            ("/inside.html", StatusCode::OK, Some("no-store")),
+            ("/inside.xhtml", StatusCode::OK, Some("no-store")),
+            ("/inside.css", StatusCode::OK, Some("max-age=3600")),
+            ("/outside.html", StatusCode::OK, Some("max-age=3600")),
+            ("/missing", StatusCode::OK, Some("max-age=3600")),
+        ] {
+            let resp = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(uri)
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), status, "{uri}");
+            assert_eq!(
+                resp.headers()
+                    .get(CACHE_CONTROL)
+                    .map(|v| v.to_str().unwrap()),
+                expected,
+                "{uri}"
+            );
+        }
     }
 }

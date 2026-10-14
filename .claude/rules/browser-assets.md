@@ -105,3 +105,24 @@ Anything the shell holds — a connection, a timer, a listener, an observer — 
 held once per open tab, and users routinely keep several Freenet apps open
 against one origin. Before adding a persistent resource, multiply it by ten
 tabs and check the browser-imposed ceiling.
+
+### 6. Contract HTML is served `no-store`, by route, not by handler
+
+A contract's bundle changes at a stable URL on every republish, so a cached
+HTML document under `/v{1,2}/contract/web/<key>/` pins an open tab to the old
+build (#5323). The guarantee is the `no_store_html(...)` wrapper in
+`client_api/v1.rs` and `v2.rs`, keyed on the HTML `Content-Type`, not any
+handler. A new route that serves contract HTML (or a new API version module)
+must be registered inside it. Nothing will fail if it is not, because
+`contract_html_is_served_no_store_and_assets_are_not` only exercises the
+routes it lists.
+
+Assets are deliberately NOT `no-store`: the reverse proxy in front of
+try.freenet.org (its `@assets` matcher) adds
+`Cache-Control: public, max-age=31536000, immutable` to files directly under
+`assets/` and passes the node's header through alongside, so a `no-store` from
+the node would cancel that in the browser. Unhashed assets therefore stay
+heuristically cacheable through `ServeFile`'s `Last-Modified`; the fix for
+those is conditional requests plus `no-cache` (#5888), not `no-store`. The
+match is by `Content-Type` (`text/html`, `application/xhtml+xml`), so an SVG
+loaded as a document is not covered.

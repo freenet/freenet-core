@@ -24,8 +24,13 @@ pub(super) fn routes(config: Config) -> Router {
         // and is the modern equivalent of 301 for GETs.
         // (freenet/freenet-core#4019)
         .route("/v1/contract/web/{key}", get(web_root_redirect_v1))
-        .route("/v1/contract/web/{key}/", get(web_home_v1))
-        .route("/v1/contract/web/{key}/{*path}", get(web_subpages_v1))
+        // Everything under the key serves contract content; its HTML documents
+        // must not be cached (#5323). The redirect above stays outside.
+        .merge(no_store_html(
+            Router::new()
+                .route("/v1/contract/web/{key}/", get(web_home_v1))
+                .route("/v1/contract/web/{key}/{*path}", get(web_subpages_v1)),
+        ))
         .with_state(config)
 }
 

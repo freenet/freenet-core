@@ -16,8 +16,13 @@ pub(super) fn routes(config: Config) -> Router {
         .route("/v2", get(home))
         // No-trailing-slash redirect — see v1.rs for the rationale.
         .route("/v2/contract/web/{key}", get(web_root_redirect_v2))
-        .route("/v2/contract/web/{key}/", get(web_home_v2))
-        .route("/v2/contract/web/{key}/{*path}", get(web_subpages_v2))
+        // Everything under the key serves contract content; its HTML documents
+        // must not be cached (#5323). The redirect above stays outside.
+        .merge(no_store_html(
+            Router::new()
+                .route("/v2/contract/web/{key}/", get(web_home_v2))
+                .route("/v2/contract/web/{key}/{*path}", get(web_subpages_v2)),
+        ))
         .with_state(config)
 }
 

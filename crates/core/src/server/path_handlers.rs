@@ -1885,8 +1885,9 @@ fn structural_path_missing_response(
 ///   default where the 500 this replaced was not, so without this a transient
 ///   miss could be remembered by the browser and strand the app once the
 ///   bundle does unpack. `errors.rs` sets `no-store` on its transient answers
-///   for the same reason. (#5323 tracks this route having no cache policy at
-///   all; this is not that fix.)
+///   for the same reason. The route-level layer added for #5323
+///   (`client_api::no_store_html`) covers HTML documents only, so this header
+///   is what keeps the miss uncacheable.
 fn asset_not_found_response() -> axum::response::Response {
     (
         axum::http::StatusCode::NOT_FOUND,
