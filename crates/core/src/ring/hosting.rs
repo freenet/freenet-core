@@ -490,6 +490,14 @@ pub(crate) struct SubscriptionLease {
     pub expires_at: Instant,
     /// Most recent state update observed (for dashboard display).
     pub last_updated: Option<Instant>,
+    /// The upstream that last answered `Subscribed` was not one of our ring
+    /// connections (the bootstrap-gateway fallback of an empty-ring node). Such
+    /// an upstream cannot have registered us as its downstream subscriber, so
+    /// no UPDATE reaches us through it (#2524). `contracts_needing_renewal`
+    /// renews a provisional lease as soon as the renewal loop runs (it only
+    /// runs with a ring connection) instead of waiting for the lease to near
+    /// expiry. Cleared when a subscribe is answered by a ring connection.
+    pub provisional: bool,
 }
 
 /// Public dashboard snapshot of one subscribed contract.
@@ -1432,6 +1440,7 @@ impl HostingManager {
                     subscribed_since: now,
                     expires_at,
                     last_updated: None,
+                    provisional: false,
                 });
                 true
             }
@@ -1446,6 +1455,23 @@ impl HostingManager {
         );
 
         SubscribeResult { is_new, expires_at }
+    }
+
+    /// Record whether the subscription to `contract` was last answered by an
+    /// upstream that is not one of our ring connections (see
+    /// [`SubscriptionLease::provisional`]). No-op without a lease.
+    pub fn set_subscription_provisional(&self, contract: &ContractKey, provisional: bool) {
+        if let Some(mut entry) = self.active_subscriptions.get_mut(contract) {
+            entry.provisional = provisional;
+        }
+    }
+
+    /// Whether the subscription to `contract` is provisional (see
+    /// [`SubscriptionLease::provisional`]).
+    pub fn is_subscription_provisional(&self, contract: &ContractKey) -> bool {
+        self.active_subscriptions
+            .get(contract)
+            .is_some_and(|lease| lease.provisional)
     }
 
     /// Renew an existing subscription.
@@ -3283,7 +3309,8 @@ impl HostingManager {
     /// Get contracts that need subscription renewal.
     ///
     /// Returns contracts where:
-    /// - We have an active subscription that will expire soon, OR
+    /// - We have an active subscription that will expire soon, or is
+    ///   provisional (see [`SubscriptionLease::provisional`]), OR
     /// - We have client subscriptions but no active network subscription
     ///
     /// Hosted contracts without active interest (no client subscriptions,
@@ -3317,19 +3344,32 @@ impl HostingManager {
         //    set the budget may not touch.
         //
         // Collect and sort for deterministic iteration order
+        //
+        //    A PROVISIONAL lease (answered through the bootstrap gateway, which
+        //    could not register us, #2524) is due at once rather than near
+        //    expiry, under the same `contract_in_use` gate. The renewal loop runs
+        //    only with a ring connection, so this re-subscribes through the ring
+        //    as soon as the node has one, at the loop's own rate cap.
         let mut active_subs: Vec<_> = self
             .active_subscriptions
             .iter()
-            .map(|entry| (*entry.key(), entry.value().expires_at))
+            .map(|entry| {
+                (
+                    *entry.key(),
+                    entry.value().expires_at,
+                    entry.value().provisional,
+                )
+            })
             .collect();
-        active_subs.sort_by(|(a, _), (b, _)| a.id().as_bytes().cmp(b.id().as_bytes()));
+        active_subs.sort_by(|(a, _, _), (b, _, _)| a.id().as_bytes().cmp(b.id().as_bytes()));
 
-        for (key, expires_at) in active_subs {
+        for (key, expires_at, provisional) in active_subs {
             // `contract_in_use` reads only the client-subscription and
             // downstream-subscriber maps (never `hosting_cache`), and `active_subs`
             // is already materialized above, so no active_subscriptions shard guard
             // is held across this call.
-            if expires_at <= renewal_threshold && expires_at > now && self.contract_in_use(&key) {
+            let due = provisional || expires_at <= renewal_threshold;
+            if due && expires_at > now && self.contract_in_use(&key) {
                 needs_renewal_set.insert(key);
             }
         }
@@ -5123,6 +5163,34 @@ mod tests {
             !needs_renewal.contains(&contract),
             "Hosted-only contract should NOT be in renewal list"
         );
+    }
+
+    /// #2524: a provisional lease (answered by a non-ring upstream) is due for
+    /// renewal at once, but only under the same `contract_in_use` gate as a
+    /// near-expiry lease (the #3763 storm guard). A fresh non-provisional lease
+    /// is not due; clearing the flag makes the provisional one not due either.
+    #[test]
+    fn provisional_lease_is_due_at_once_while_in_use() {
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
+        let provisional = make_contract_key(1);
+        let ordinary = make_contract_key(2);
+        for key in [provisional, ordinary] {
+            manager.subscribe(key);
+        }
+        manager.set_subscription_provisional(&provisional, true);
+        assert!(manager.is_subscription_provisional(&provisional));
+        assert!(
+            manager.contracts_needing_renewal().is_empty(),
+            "not in use: a provisional lease must not self-renew"
+        );
+
+        for key in [provisional, ordinary] {
+            manager.add_client_subscription(key.id(), crate::client_events::ClientId::next());
+        }
+        assert_eq!(manager.contracts_needing_renewal(), vec![provisional]);
+
+        manager.set_subscription_provisional(&provisional, false);
+        assert!(manager.contracts_needing_renewal().is_empty());
     }
 
     // Removed: test_contracts_needing_renewal_includes_hosted was added in #3763

@@ -3167,6 +3167,11 @@ impl Ring {
             // (first N in iteration order) would always be tried first, blocking later
             // contracts from ever being attempted when they hit the batch limit.
             GlobalRng::shuffle(&mut contracts_needing_renewal);
+            // Provisional leases (#2524) first: their upstream could not
+            // register us, so they get no UPDATEs until renewed, while a
+            // near-expiry lease still works. Stable sort keeps the shuffle
+            // within each group.
+            contracts_needing_renewal.sort_by_key(|key| !ring.is_subscription_provisional(key));
 
             // Get op_manager to spawn subscription requests
             let Some(op_manager) = ring.upgrade_op_manager() else {
@@ -4611,6 +4616,17 @@ impl Ring {
     /// will expire after `SUBSCRIPTION_LEASE_DURATION` unless renewed.
     pub fn subscribe(&self, contract: ContractKey) -> SubscribeResult {
         self.hosting_manager.subscribe(contract)
+    }
+
+    /// See [`hosting::HostingManager::set_subscription_provisional`].
+    pub fn set_subscription_provisional(&self, contract: &ContractKey, provisional: bool) {
+        self.hosting_manager
+            .set_subscription_provisional(contract, provisional)
+    }
+
+    /// See [`hosting::HostingManager::is_subscription_provisional`].
+    pub fn is_subscription_provisional(&self, contract: &ContractKey) -> bool {
+        self.hosting_manager.is_subscription_provisional(contract)
     }
 
     /// Unsubscribe from a contract.

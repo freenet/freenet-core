@@ -546,11 +546,15 @@ pub(super) async fn finalize_originator_subscribe(
     // actual fetch target is the responder, resolved below.)
     directed_holder: Option<PeerKeyLocation>,
 ) {
-    if let Some(pkl) = op_manager
+    let upstream = op_manager
         .ring
         .connection_manager
-        .get_peer_by_addr(upstream_addr)
-    {
+        .get_peer_by_addr(upstream_addr);
+    // An upstream that is not a ring connection (the bootstrap-gateway fallback
+    // of an empty-ring node, #4361) resolves us the same way and so cannot have
+    // registered us as its downstream subscriber (#2524).
+    let provisional = upstream.is_none();
+    if let Some(pkl) = upstream {
         let peer_key = crate::ring::interest::PeerKey::from(pkl.pub_key);
         // Refresh-if-present, register-if-absent. A bare `register_peer_interest`
         // inserts a fresh `PeerInterest` over an existing entry and WIPES its
@@ -583,6 +587,9 @@ pub(super) async fn finalize_originator_subscribe(
     }
 
     op_manager.ring.subscribe(key);
+    op_manager
+        .ring
+        .set_subscription_provisional(&key, provisional);
     op_manager.ring.complete_subscription_request(&key, true);
 
     // Fetch the contract body if we don't have it locally. The result
@@ -677,8 +684,10 @@ pub(super) async fn finalize_originator_subscribe(
 /// `None` for a requester we reach only over a transient link: the transient
 /// table records no public key, and UPDATE fan-out resolves its targets among
 /// ring connections only, so such a requester can be neither registered nor
-/// sent an UPDATE (#2524). A SUBSCRIBE hop checks this BEFORE answering, so it
-/// never answers `Subscribed` to a requester it cannot serve.
+/// sent an UPDATE. The hop still answers it `Subscribed`: that is the
+/// bootstrap path of an empty-ring node (#4361), and the requester repairs it
+/// by re-subscribing through the ring once it has a ring connection (#2524,
+/// `SubscriptionLease::provisional`).
 pub(super) fn resolve_downstream_peer(
     op_manager: &OpManager,
     requester_addr: std::net::SocketAddr,
@@ -765,6 +774,22 @@ pub(crate) async fn register_downstream_subscriber(
                 "Downstream subscriber limit reached — skipping peer interest registration"
             );
         }
+    } else if op_manager
+        .ring
+        .connection_manager
+        .is_transient(requester_addr)
+    {
+        // Expected: an empty-ring node subscribes through us over its
+        // transient bootstrap link (#4361). It marks that subscription
+        // provisional and re-subscribes through the ring once it has a ring
+        // connection (#2524), so this is not worth a WARN per request.
+        tracing::debug!(
+            tx = %tx,
+            contract = %key,
+            requester_addr = %requester_addr,
+            "Subscribe: transient requester not registered as downstream{}",
+            warn_suffix
+        );
     } else {
         tracing::warn!(
             tx = %tx,
