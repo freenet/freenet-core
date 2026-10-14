@@ -206,6 +206,8 @@ pub(crate) struct BootstrapPacer {
     owned_reservations: HashSet<SocketAddr>,
     /// Since when this peer has had a ring connection without a break.
     connected_since: Option<Instant>,
+    /// When the last round was issued.
+    last_issued: Option<Instant>,
 }
 
 impl BootstrapPacer {
@@ -222,6 +224,7 @@ impl BootstrapPacer {
             liveness: HashMap::new(),
             owned_reservations: HashSet::new(),
             connected_since: None,
+            last_issued: None,
         }
     }
 
@@ -279,11 +282,23 @@ impl BootstrapPacer {
         false
     }
 
-    /// The gateway backoff was cleared (isolation recovery, suspend): the
-    /// next round may start at once. The failure count stays, so the round
-    /// after that is still spaced.
-    pub(crate) fn clear_wait(&mut self) {
-        self.next_allowed = None;
+    /// The gateway backoff was cleared (isolation recovery, suspend). If no
+    /// round has started for [`BOOTSTRAP_RETRY_CAP_FLOOR`], the wait may have
+    /// been set long ago (before a suspend, say): the next round may start
+    /// within a jittered [`BOOTSTRAP_RETRY_BASE`]. Otherwise the wait stands.
+    /// Isolation recovery fires about every 30 s while a peer has never
+    /// connected, so clearing the wait outright would cut the backoff short
+    /// on every reset, and the jitter keeps peers whose timers started
+    /// together from firing at once. The failure count stays either way.
+    pub(crate) fn backoff_reset(&mut self, now: Instant) {
+        let recent = self
+            .last_issued
+            .is_some_and(|t| now.saturating_duration_since(t) < BOOTSTRAP_RETRY_CAP_FLOOR);
+        if recent {
+            return;
+        }
+        let jitter: f64 = GlobalRng::random_range(0.0_f64..=1.0_f64);
+        self.next_allowed = Some(now + BOOTSTRAP_RETRY_BASE.mul_f64(jitter));
     }
 
     /// When the next round may start, if it has to wait for the backoff.
@@ -311,6 +326,7 @@ impl BootstrapPacer {
 
     fn issue(&mut self, now: Instant) {
         self.issuing = false;
+        self.last_issued = Some(now);
         self.failures = self.failures.saturating_add(1);
         let jitter: f64 = GlobalRng::random_range(0.8_f64..=1.2_f64);
         let delay = self.backoff.delay_for_failures(self.failures);
@@ -608,34 +624,55 @@ mod tests {
         );
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn a_cleared_gateway_backoff_lets_the_next_round_start_at_once() {
-        let pacer = pacer(30);
-        let cleared = tokio::sync::Notify::new();
-        for _ in 0..6 {
+    /// Issue `n` rounds back to back, leaving the backoff of the last.
+    fn issue_rounds(pacer: &Arc<Mutex<BootstrapPacer>>, n: usize, at: Instant) {
+        for _ in 0..n {
             let mut p = pacer.lock();
             p.next_allowed = None;
             p.outstanding = 0;
-            assert!(p.try_begin(Instant::now()));
-            p.issue(Instant::now());
+            assert!(p.try_begin(at));
+            p.issue(at);
             p.end(true);
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_backoff_reset_long_after_the_last_round_lets_the_next_start_soon() {
+        let pacer = pacer(600);
+        let cleared = tokio::sync::Notify::new();
+        issue_rounds(&pacer, 12, Instant::now());
+        // A long wait from before a suspend; the clock has moved on since.
+        tokio::time::sleep(BOOTSTRAP_RETRY_CAP_FLOOR).await;
         assert!(pacer.lock().wait_until(Instant::now()).is_some());
         let start = Instant::now();
         let waiter = wait_for_bootstrap_round(&pacer, &cleared, || false);
         let clear = async {
             tokio::time::sleep(Duration::from_secs(1)).await;
             // What `reset_all_backoff` does.
-            pacer.lock().clear_wait();
+            pacer.lock().backoff_reset(Instant::now());
             cleared.notify_waiters();
         };
         let (round, ()) = tokio::join!(waiter, clear);
         assert!(round.is_some());
         assert!(
-            start.elapsed() < Duration::from_secs(2),
-            "the round waited {:?} past the clear",
+            start.elapsed() <= Duration::from_secs(1) + BOOTSTRAP_RETRY_BASE + ROUND_POLL,
+            "the round waited {:?} past the reset",
             start.elapsed()
         );
+    }
+
+    /// Isolation recovery resets every ~30 s while a peer has never
+    /// connected; a reset right after a round must not cut its backoff short
+    /// (review item 4).
+    #[test]
+    fn a_backoff_reset_right_after_a_round_keeps_its_wait() {
+        let pacer = pacer(30);
+        let now = Instant::now();
+        issue_rounds(&pacer, 6, now);
+        let wait = pacer.lock().wait_until(now);
+        assert!(wait.is_some());
+        pacer.lock().backoff_reset(now + Duration::from_secs(1));
+        assert_eq!(pacer.lock().wait_until(now), wait);
     }
 
     #[tokio::test(start_paused = true)]
