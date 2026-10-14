@@ -1208,7 +1208,13 @@ mod tests {
         let obstructed = tmp.path().join("freenet").join("webapp_cache");
 
         for (label, cache) in [("benign", &benign), ("obstructed", &obstructed)] {
-            let exe = std::env::current_exe().expect("test binary path");
+            // Re-exec the running image: after a concurrent rebuild replaces the test
+            // binary, Linux current_exe() reports "<path> (deleted)" and the spawn fails (#5185).
+            let exe = if cfg!(target_os = "linux") {
+                std::path::PathBuf::from("/proc/self/exe")
+            } else {
+                std::env::current_exe().expect("test binary path")
+            };
             let output = std::process::Command::new(exe)
                 .args(["--exact", "--test-threads=1", "--nocapture", CHILD_TEST])
                 .env(CHILD_ENV, "1")
