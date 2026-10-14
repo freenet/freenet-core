@@ -1224,10 +1224,9 @@ impl ConnectionManager {
     /// evidence), except at the cap: there our own cap refuses every
     /// non-lattice acceptor, and a peer at max would otherwise never sleep. A
     /// lattice edge that could not be connected, for any reason (a failed hole
-    /// punch, or our own refusal at the cap, whose outbound pre-flight check
-    /// does not exempt lattice edges, #5827), is recorded as a failed hit, and the
-    /// scheduler re-checks on its retry ladder. Returns whether a miss was
-    /// recorded.
+    /// punch, or our own refusal once the over-cap ceiling is used up), is
+    /// recorded as a failed hit, and the scheduler re-checks on its retry ladder.
+    /// Returns whether a miss was recorded.
     pub(crate) fn record_lattice_probe_result(
         &self,
         loc: Location,
@@ -1383,9 +1382,10 @@ impl ConnectionManager {
     /// victim), bringing the node back to `max_connections`.
     ///
     /// This is the SINGLE over-cap admission predicate shared by every gate that
-    /// can add a ring connection: `should_accept`, the two connection-lifecycle
-    /// promotion gates (`p2p_protoc/connection_lifecycle.rs`), and
-    /// [`Self::add_connection`]. Keeping the decision in one place is deliberate —
+    /// can add a ring connection: `should_accept`, the three connection-lifecycle
+    /// cap gates (`p2p_protoc/connection_lifecycle.rs`: the outbound pre-flight
+    /// check in `handle_connect_peer` and both promotion gates, through
+    /// [`Self::refuses_connection_at_cap`]), and [`Self::add_connection`]. Keeping the decision in one place is deliberate —
     /// before it was wired through the lifecycle gates, mechanism 3's over-cap
     /// displacement was inert on the real CONNECT path (the gates rejected at
     /// `>= max_connections` first).
@@ -1436,6 +1436,26 @@ impl ConnectionManager {
     /// the ESTABLISHED count regardless.
     pub(crate) fn admits_lattice_edge_over_cap(&self, loc: Location) -> bool {
         self.admits_lattice_edge_over_cap_in(&self.connections_by_location.read(), loc)
+    }
+
+    /// Whether a connection to a peer at `loc` must be refused to respect
+    /// `max_connections`: at or over the cap, unless the peer would be a new
+    /// per-side nearest lattice edge within the over-cap ceiling
+    /// ([`Self::admits_lattice_edge_over_cap`]).
+    ///
+    /// The one predicate shared by the outbound pre-flight check in
+    /// `handle_connect_peer` and both promotion gates
+    /// (`p2p_protoc/connection_lifecycle.rs`), so every gate applies the same
+    /// lattice exemption. They need not reach the same answer for the same
+    /// candidate: the over-cap ceiling counts pending reservations, and when we
+    /// are the acceptor the candidate's own reservation is still held at the
+    /// pre-flight check (as in `should_accept`) but already released at the
+    /// promotion gate in `handle_successful_connection`, so the pre-flight check
+    /// can refuse one slot earlier than that gate.
+    /// Before #5827 the pre-flight check had no lattice exemption, so a peer at
+    /// max refused its own lattice probe's acceptor before NAT traversal began.
+    pub(crate) fn refuses_connection_at_cap(&self, loc: Location) -> bool {
+        self.connection_count() >= self.max_connections && !self.admits_lattice_edge_over_cap(loc)
     }
 
     /// [`Self::admits_lattice_edge_over_cap`] evaluated against an ALREADY-HELD
@@ -2199,10 +2219,11 @@ impl ConnectionManager {
         // over-max ceiling (`admits_lattice_edge_over_cap`, see
         // LATTICE_OVERMAX_SLACK). The over-max topology prune sheds a non-lattice
         // connection on the next maintenance tick (lattice edges are protected
-        // there), bringing the node back to max. The two connection-lifecycle
-        // promotion gates apply the SAME predicate before reaching here, so a
-        // lattice edge is no longer silently dropped at the cap on the real
-        // CONNECT path.
+        // there), bringing the node back to max. The three connection-lifecycle
+        // cap gates (the outbound pre-flight check and both promotion gates)
+        // apply the SAME predicate before reaching here, through
+        // `refuses_connection_at_cap`, so a lattice edge is no longer silently
+        // dropped at the cap on the real CONNECT path.
         //
         // F4 (atomicity): the cap count-check, the over-cap admission check, the
         // relocation removal, and the insert all run under ONE held
@@ -4301,8 +4322,8 @@ mod tests {
     /// admits any strictly-closer per-side nearest — a TIGHTEN of a filled side OR
     /// a FILL of an empty one — within the over-max ceiling. A candidate no closer
     /// than the current per-side nearest (a farther non-lattice peer) is never
-    /// admissible. It is the exact decision both connection-lifecycle promotion
-    /// gates apply on the real CONNECT path (see the source-scrape pin below).
+    /// admissible. It is the exact decision the connection-lifecycle cap gates
+    /// apply on the real CONNECT path (see the source-scrape pin below).
     #[test]
     fn admits_lattice_edge_over_cap_predicate() {
         let _nn_guard = NnLatticeOverrideGuard;
@@ -4841,26 +4862,160 @@ mod tests {
         );
     }
 
-    /// Source-scrape pin (B1 regression guard): BOTH connection-lifecycle
-    /// promotion gates must apply the shared `admits_lattice_edge_over_cap`
-    /// exception to their `>= max_connections` reject. Without this a lattice edge
-    /// is silently dropped at the cap on the real CONNECT path and mechanism 3's
-    /// at-capacity displacement is inert — the exact defect the external review
-    /// caught (the over-max unit test passed only because it bypassed the gate).
-    /// If a future refactor drops the exception from a gate, this fails instead of
-    /// silently regressing.
+    /// Source-scrape pin (B1 regression guard, extended for #5827): EACH
+    /// connection-lifecycle cap gate must refuse at the cap through the shared
+    /// `refuses_connection_at_cap`, which carries the lattice exemption. The
+    /// gates are the transient-promotion gate and the outbound pre-flight check
+    /// in `handle_connect_peer`, and the promotion gate in
+    /// `handle_successful_connection`. Without the exemption a lattice edge is
+    /// silently dropped at the cap on the real CONNECT path and mechanism 3's
+    /// at-capacity displacement is inert: the exact defect the external review
+    /// caught for the promotion gates (the over-max unit test passed only
+    /// because it bypassed the gate), and that #5827 found still open in the
+    /// pre-flight check.
+    ///
+    /// Each gate is checked inside its own function, between an anchor before
+    /// it and its own refusal log line, so a call at one gate cannot stand in
+    /// for a missing one at another. Comments (line, trailing and block) are
+    /// stripped so prose or a commented-out call cannot satisfy the pin, and a
+    /// bare
+    /// `>= connection_manager.max_connections` cap test in code (the pre-#5827
+    /// pre-flight shape) fails it outright.
     #[test]
     fn lifecycle_gates_apply_lattice_over_cap_predicate() {
         const LIFECYCLE_SRC: &str =
             include_str!("../node/network_bridge/p2p_protoc/connection_lifecycle.rs");
-        let hits = LIFECYCLE_SRC
-            .matches("admits_lattice_edge_over_cap(loc)")
-            .count();
+
+        /// The body of the function whose signature starts with `signature`,
+        /// braces included. Panics rather than returning a wrong slice: a
+        /// missing anchor or unbalanced braces fail the pin loudly.
+        fn fn_body<'a>(src: &'a str, signature: &str) -> &'a str {
+            let start = src
+                .find(signature)
+                .unwrap_or_else(|| panic!("`{signature}` not found in connection_lifecycle.rs"));
+            let open = start
+                + src[start..]
+                    .find('{')
+                    .unwrap_or_else(|| panic!("`{signature}` has no body"));
+            let mut depth = 0usize;
+            for (i, b) in src.as_bytes()[open..].iter().enumerate() {
+                match b {
+                    b'{' => depth += 1,
+                    b'}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            return &src[open..=open + i];
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            panic!("unbalanced braces in the body of `{signature}`")
+        }
+
+        /// The text of `body` from `from` up to (not including) the first `to`
+        /// after it.
+        fn region<'a>(body: &'a str, from: &str, to: &str) -> &'a str {
+            let start = body
+                .find(from)
+                .unwrap_or_else(|| panic!("gate anchor `{from}` not found in its function"));
+            let len = body[start..]
+                .find(to)
+                .unwrap_or_else(|| panic!("gate log line `{to}` not found after `{from}`"));
+            &body[start..start + len]
+        }
+
+        /// Whether `call` appears in CODE in `region`: `/* .. */` comments and
+        /// everything after `//` on a line are stripped first, so a commented
+        /// out call cannot satisfy the pin. (A `//` inside a string literal
+        /// also cuts the line; that can only make the pin fail, never pass.)
+        fn code_calls(region: &str, call: &str) -> bool {
+            let mut code = String::with_capacity(region.len());
+            let mut rest = region;
+            while let Some(open) = rest.find("/*") {
+                code.push_str(&rest[..open]);
+                rest = match rest[open..].find("*/") {
+                    Some(close) => &rest[open + close + 2..],
+                    None => "",
+                };
+            }
+            code.push_str(rest);
+            code.lines()
+                .map(|l| l.split("//").next().unwrap_or(""))
+                .any(|l| l.contains(call))
+        }
+
+        const CALL: &str = "connection_manager.refuses_connection_at_cap(loc)";
+        let connect_peer = fn_body(LIFECYCLE_SRC, "async fn handle_connect_peer(");
+        let successful = fn_body(LIFECYCLE_SRC, "async fn handle_successful_connection(");
+        let gates = [
+            (
+                "handle_connect_peer transient-promotion gate",
+                region(
+                    connect_peer,
+                    "connection_manager.drop_transient(peer_addr)",
+                    "connect_peer: rejecting transient promotion to enforce cap",
+                ),
+            ),
+            (
+                "handle_connect_peer outbound pre-flight check (#5827)",
+                region(
+                    connect_peer,
+                    "Pre-flight max_connections check",
+                    "connect_peer: skipping connection — at max_connections",
+                ),
+            ),
+            (
+                "handle_successful_connection promotion gate",
+                region(
+                    successful,
+                    "if promote_to_ring {",
+                    "handle_successful_connection: rejecting new connection to enforce cap",
+                ),
+            ),
+        ];
+        for (gate, region) in gates {
+            assert!(
+                code_calls(region, CALL),
+                "the {gate} must refuse at the cap through `{CALL}`"
+            );
+        }
+
         assert!(
-            hits >= 2,
-            "both lifecycle promotion cap-gates must apply \
-             admits_lattice_edge_over_cap(loc); found {hits} call site(s)"
+            !code_calls(LIFECYCLE_SRC, ">= connection_manager.max_connections"),
+            "a cap gate compares against max_connections without the lattice \
+             exemption; route it through refuses_connection_at_cap (#5827)"
         );
+    }
+
+    /// #5827: at `max_connections` the shared cap predicate refuses an ordinary
+    /// candidate but lets a strictly-closer per-side nearest lattice edge
+    /// through, within the over-cap ceiling. This is the decision the outbound
+    /// pre-flight check now makes.
+    #[test]
+    fn refuses_connection_at_cap_exempts_lattice_edges() {
+        let _nn_guard = NnLatticeOverrideGuard;
+        set_nn_lattice_enabled(true);
+        let own = Location::new(0.5);
+        let cm = make_connection_manager(Some(make_addr(8000)), 1, 4, false);
+        cm.update_location(Some(own));
+        let keypair = TransportKeypair::new();
+        for (i, loc) in [0.4, 0.6, 0.1, 0.9].into_iter().enumerate() {
+            assert!(cm.add_connection(
+                Location::new(loc),
+                make_addr(8001 + i as u16),
+                keypair.public().clone(),
+                false
+            ));
+        }
+        assert_eq!(cm.connection_count(), 4);
+        // Not a lattice edge: farther than the held successor (0.6).
+        assert!(cm.refuses_connection_at_cap(Location::new(0.7)));
+        // A tighter successor than 0.6: the exemption applies.
+        assert!(!cm.refuses_connection_at_cap(Location::new(0.55)));
+        // Below the cap nothing is refused.
+        assert!(cm.prune_alive_connection(make_addr(8003)).is_some());
+        assert!(!cm.refuses_connection_at_cap(Location::new(0.7)));
     }
 
     #[test]

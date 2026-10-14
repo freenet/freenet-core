@@ -320,9 +320,7 @@ impl P2pConnManager {
                 // farther non-lattice link next tick. See
                 // connection_manager.rs::{admits_lattice_edge_over_cap, LATTICE_OVERMAX_SLACK}.
                 let current = connection_manager.connection_count();
-                if current >= connection_manager.max_connections
-                    && !connection_manager.admits_lattice_edge_over_cap(loc)
-                {
+                if connection_manager.refuses_connection_at_cap(loc) {
                     tracing::warn!(
                         tx = %tx,
                         %peer,
@@ -506,10 +504,17 @@ impl P2pConnManager {
         // the connection was already accepted at the protocol level (the CONNECT terminus handler in connect.rs)
         // and re-rolling the probabilistic Kleinberg filter would discard connections
         // after costly NAT traversal for no capacity reason (#3545).
+        // The cap has the SAME nearest-neighbor lattice exemption
+        // (`admits_lattice_edge_over_cap`) as should_accept, add_connection and
+        // both promotion gates; this check and the promotion gates share
+        // `refuses_connection_at_cap`. Without it a peer at max refused its own
+        // lattice probe's acceptor here, before NAT traversal, so tightening at
+        // capacity never succeeded from our side (#5827).
         if !transient && !peer_addr.ip().is_unspecified() {
             let connection_manager = &self.bridge.op_manager.ring.connection_manager;
             let current = connection_manager.connection_count();
-            if current >= connection_manager.max_connections {
+            let loc = Location::from_address(&peer_addr);
+            if connection_manager.refuses_connection_at_cap(loc) {
                 tracing::info!(
                     tx = %tx,
                     remote = %peer_addr,
@@ -1215,9 +1220,7 @@ impl P2pConnManager {
                 // farther non-lattice link next tick. See
                 // connection_manager.rs::{admits_lattice_edge_over_cap, LATTICE_OVERMAX_SLACK}.
                 let current = connection_manager.connection_count();
-                if current >= connection_manager.max_connections
-                    && !connection_manager.admits_lattice_edge_over_cap(loc)
-                {
+                if connection_manager.refuses_connection_at_cap(loc) {
                     tracing::warn!(
                         %peer_addr,
                         current_connections = current,

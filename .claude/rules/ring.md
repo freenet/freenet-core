@@ -42,9 +42,11 @@ WHEN accepting a new connection (should_accept):
      which the topology maintenance loop's over-max prune sheds next tick
      (protected lattice edges are never the prune victim). Applied via the
      shared predicate admits_lattice_edge_over_cap() in should_accept, in
-     add_connection, AND in BOTH connection-lifecycle promotion gates
-     (p2p_protoc/connection_lifecycle.rs) so the exception is live on the
-     real CONNECT path, not just should_accept. See connection_manager.rs.
+     add_connection, AND in all three connection-lifecycle cap gates (the
+     outbound pre-flight check in handle_connect_peer and both promotion
+     gates, p2p_protoc/connection_lifecycle.rs, through
+     refuses_connection_at_cap()) so the exception is live on the real
+     CONNECT path, not just should_accept. See connection_manager.rs.
      MINIMUM-DEGREE FLOOR: the whole lattice feature (this exception, the
      per-side acceptance clause, the route-to-self discovery probe, and the
      topology.rs retention exemption) is GATED OFF when this peer's CONFIGURED
