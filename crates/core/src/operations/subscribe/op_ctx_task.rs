@@ -5439,6 +5439,50 @@ mod bootstrap_subscription_tests {
         );
     }
 
+    /// A provisional lease the renewal loop's reconcile gate suppresses (in use
+    /// only through a downstream subscriber that is not strictly farther from
+    /// the key, here one we cannot resolve) loses its mark on that tick, so it
+    /// does not take an evaluation slot on every tick until the TTL.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn gate_suppressed_provisional_lease_loses_its_mark() {
+        let gateway_addr: std::net::SocketAddr = "127.0.0.1:31000".parse().unwrap();
+        let gateway = PeerKeyLocation::new(
+            crate::transport::TransportKeypair::new().public().clone(),
+            gateway_addr,
+        );
+        let (op_manager, rx, _guards, store) =
+            op_manager_with_gateway("sub-bootstrap-gate-suppressed", gateway).await;
+        let instance_id = ContractInstanceId::new([71u8; 32]);
+        let key = contract(instance_id);
+        let seen = serve(&op_manager, rx, store, key);
+        subscribe(&op_manager, instance_id, false).await;
+        assert!(op_manager.ring.is_subscription_provisional(&key));
+        // In use (so `contracts_needing_renewal` emits it) but not wanted by
+        // the strict reconcile gate: no local client, and the only downstream
+        // subscriber does not resolve to a strictly-farther connected peer.
+        let _ = op_manager.ring.add_downstream_subscriber(
+            &key,
+            crate::ring::interest::PeerKey::from(
+                crate::transport::TransportKeypair::new().public().clone(),
+            ),
+        );
+        assert!(op_manager.ring.contracts_needing_renewal().contains(&key));
+        assert!(!op_manager.reconcile_wants_renewal(&key));
+
+        let ring_peer = add_ring_peer(&op_manager, 31001);
+        // The loop's first pass runs 2-5 s after the first ring connection.
+        tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+        assert!(
+            !seen.lock().request_targets.contains(&ring_peer),
+            "a gate-suppressed renewal is not sent"
+        );
+        assert!(
+            !op_manager.ring.is_subscription_provisional(&key),
+            "a gate-suppressed provisional lease must lose its mark"
+        );
+        assert!(!op_manager.ring.contracts_needing_renewal().contains(&key));
+    }
+
     /// A failed early renewal through the ring keeps the provisional mark,
     /// puts the contract in the subscription backoff, and the renewal loop
     /// retries it once the backoff allows.

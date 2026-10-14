@@ -3347,6 +3347,11 @@ impl Ring {
                 // flip's effect — the "renewal tracks active demand, not cache size"
                 // ship-gate falsifier — not a shadow divergence).
                 if !op_manager.reconcile_wants_renewal(&contract) {
+                    // The controller does not want this lease maintained, so a
+                    // provisional mark (#2524) has nothing to repair. Left set,
+                    // the lease would be due, pass `contract_in_use`, and burn
+                    // an `evaluated` slot here on every tick until its TTL.
+                    ring.set_subscription_provisional(&contract, false);
                     tracing::debug!(
                         %contract,
                         "renewal skipped: reconcile interest gate says not in use \
