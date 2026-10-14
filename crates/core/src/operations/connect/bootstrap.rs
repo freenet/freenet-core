@@ -631,21 +631,39 @@ mod tests {
         );
     }
 
+    /// Redial `gw` at 20 s: silent joins sent at 0 and 5 s.
+    fn redialled_at_20(pacer: &mut BootstrapPacer, gw: SocketAddr, at: impl Fn(u64) -> Instant) {
+        assert!(!pacer.gateway_silent(gw, at(0), at(15)));
+        assert!(pacer.gateway_silent(gw, at(5), at(20)), "redial at 20 s");
+    }
+
     #[test]
-    fn a_link_is_redialled_at_most_once_per_interval_and_old_connects_do_not_count() {
+    fn connects_sent_over_the_old_link_do_not_count_after_a_redial() {
         let mut pacer = BootstrapPacer::new(Duration::from_secs(30));
         let gw: SocketAddr = "127.0.0.1:1".parse().unwrap();
         let t0 = Instant::now();
         let at = |s: u64| t0 + Duration::from_secs(s);
-        assert!(!pacer.gateway_silent(gw, at(0), at(15)));
-        assert!(pacer.gateway_silent(gw, at(5), at(20)), "redial at 20 s");
-        // CONNECTs that went over the old link, judged after the redial.
+        redialled_at_20(&mut pacer, gw, at);
+        // Joins that went over the old link, judged after the redial.
         assert!(!pacer.gateway_silent(gw, at(15), at(30)));
+        assert!(!pacer.gateway_silent(gw, at(18), at(33)));
+        // Well past the interval, the new link needs two silent joins of
+        // its own: the old ones above must not have been counted.
+        let later = 30 + MIN_REDIAL_INTERVAL.as_secs();
         assert!(
-            !pacer.gateway_silent(gw, at(18), at(33)),
-            "CONNECTs from before the redial say nothing about the new link"
+            !pacer.gateway_silent(gw, at(later), at(later + 15)),
+            "joins sent before the redial said nothing about the new link"
         );
-        // Two silent CONNECTs on the new link, too soon after the redial.
+        assert!(pacer.gateway_silent(gw, at(later + 5), at(later + 20)));
+    }
+
+    #[test]
+    fn a_link_is_redialled_at_most_once_per_interval() {
+        let mut pacer = BootstrapPacer::new(Duration::from_secs(30));
+        let gw: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let t0 = Instant::now();
+        let at = |s: u64| t0 + Duration::from_secs(s);
+        redialled_at_20(&mut pacer, gw, at);
         assert!(!pacer.gateway_silent(gw, at(25), at(40)));
         assert!(
             !pacer.gateway_silent(gw, at(30), at(45)),
