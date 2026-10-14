@@ -6049,8 +6049,7 @@ impl Ring {
             return false;
         };
         let owned = op_manager.bootstrap_pacer.lock().take_owned_reservations();
-        self.connection_manager
-            .clear_pending_reservations_for(&owned);
+        self.connection_manager.clear_owned_reservations(&owned);
         let eligible: Vec<PeerKeyLocation> = {
             let backoff = op_manager.gateway_backoff.lock();
             self.is_not_connected(gateways.iter())

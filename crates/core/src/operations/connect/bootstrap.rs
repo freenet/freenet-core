@@ -29,7 +29,7 @@
 //! as before, and no gateway ever has more than three of this peer's bootstrap
 //! CONNECTs outstanding.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -208,10 +208,12 @@ pub(crate) struct BootstrapPacer {
     /// Rounds taken whose CONNECTs have not all ended.
     outstanding: usize,
     liveness: HashMap<SocketAddr, GatewayLiveness>,
-    /// Gateways that paced rounds have sent CONNECTs through, so whatever
-    /// reservation they hold is ours and bounded by this pacer. A CONNECT sent
-    /// outside a round (with a ring connection) is not recorded.
-    owned_reservations: HashSet<SocketAddr>,
+    /// Gateways that paced rounds have sent CONNECTs through, and when: the
+    /// reservation each made there is ours and bounded by this pacer. A
+    /// CONNECT sent outside a round (with a ring connection) is not recorded,
+    /// and the time keeps a later, unrelated reservation at the same gateway
+    /// from being taken for ours (`ConnectionManager::clear_owned_reservations`).
+    owned_reservations: HashMap<SocketAddr, Instant>,
     /// Since when this peer has had a ring connection without a break.
     connected_since: Option<Instant>,
     /// When the last round was issued.
@@ -230,7 +232,7 @@ impl BootstrapPacer {
             issuing: false,
             outstanding: 0,
             liveness: HashMap::new(),
-            owned_reservations: HashSet::new(),
+            owned_reservations: HashMap::new(),
             connected_since: None,
             last_issued: None,
         }
@@ -251,9 +253,9 @@ impl BootstrapPacer {
         }
     }
 
-    /// Gateway reservations made by paced rounds, which the caller may clear;
-    /// forgets them.
-    pub(crate) fn take_owned_reservations(&mut self) -> Vec<SocketAddr> {
+    /// Gateway reservations made by paced rounds, with when each round sent
+    /// its CONNECT, which the caller may clear; forgets them.
+    pub(crate) fn take_owned_reservations(&mut self) -> Vec<(SocketAddr, Instant)> {
         self.owned_reservations.drain().collect()
     }
 
@@ -399,7 +401,7 @@ impl BootstrapRoundGuard {
     pub(crate) fn own_reservation(&self, gateway: SocketAddr) {
         let mut pacer = self.pacer.lock();
         if pacer.owned_reservations.len() < MAX_TRACKED_GATEWAYS {
-            pacer.owned_reservations.insert(gateway);
+            pacer.owned_reservations.insert(gateway, Instant::now());
         }
     }
 }
@@ -670,7 +672,8 @@ mod tests {
         let round = BootstrapRoundGuard::try_begin(&pacer, Instant::now()).unwrap();
         round.own_reservation(gw);
         drop(round);
-        assert_eq!(pacer.lock().take_owned_reservations(), vec![gw]);
+        let owned = pacer.lock().take_owned_reservations();
+        assert_eq!(owned.iter().map(|(a, _)| *a).collect::<Vec<_>>(), vec![gw]);
         assert!(
             pacer.lock().take_owned_reservations().is_empty(),
             "taken once, then forgotten"

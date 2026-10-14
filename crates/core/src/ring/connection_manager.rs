@@ -2103,6 +2103,33 @@ impl ConnectionManager {
         }
     }
 
+    /// Clears the pending reservations a bootstrap round made: for each
+    /// `(addr, sent)`, the reservation at `addr` only if it was created within
+    /// [`Self::OWNED_RESERVATION_WINDOW`] after the round sent its CONNECT
+    /// there. A reservation made later at the same address belongs to another
+    /// attempt and is left alone (#5858).
+    pub fn clear_owned_reservations(&self, owned: &[(SocketAddr, Instant)]) {
+        let addrs: Vec<SocketAddr> = {
+            let pending = self.pending_reservations.read();
+            owned
+                .iter()
+                .filter(|(addr, sent)| {
+                    pending.get(addr).is_some_and(|(_, created)| {
+                        *created >= *sent
+                            && created.duration_since(*sent) <= Self::OWNED_RESERVATION_WINDOW
+                    })
+                })
+                .map(|(addr, _)| *addr)
+                .collect()
+        };
+        self.clear_pending_reservations_for(&addrs);
+    }
+
+    /// How soon after a round sends its CONNECT the reservation it makes is
+    /// created: the join reserves the gateway first thing, so seconds cover a
+    /// busy runtime.
+    const OWNED_RESERVATION_WINDOW: Duration = Duration::from_secs(5);
+
     /// Get the duration of an existing connection by address in milliseconds.
     /// Returns None if the connection doesn't exist.
     pub fn get_connection_duration_ms(&self, addr: SocketAddr) -> Option<u64> {
@@ -3055,6 +3082,26 @@ mod tests {
 
     fn make_addr(port: u16) -> SocketAddr {
         SocketAddr::from(([127, 0, 0, 1], port))
+    }
+
+    /// A bootstrap round clears only the reservation its own CONNECT made: one
+    /// made later at the same gateway by another attempt stays (#5858).
+    #[test]
+    fn owned_reservations_clear_only_the_rounds_own() {
+        let cm = make_connection_manager(Some(make_addr(7100)), 2, 50, false);
+        let (ours, later) = (make_addr(7101), make_addr(7102));
+        let sent = Instant::now();
+        cm.inject_reservation(ours, Location::new(0.1), sent + Duration::from_millis(5));
+        cm.inject_reservation(later, Location::new(0.2), sent + Duration::from_secs(60));
+        cm.clear_owned_reservations(&[(ours, sent), (later, sent)]);
+        assert!(
+            !cm.has_connection_or_pending(ours),
+            "the round's own reservation is cleared"
+        );
+        assert!(
+            cm.pending_reservations.read().contains_key(&later),
+            "a later attempt's reservation at the same gateway is left alone"
+        );
     }
 
     fn age_reservation(cm: &ConnectionManager, addr: SocketAddr, age: Duration) {
