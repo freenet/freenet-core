@@ -835,12 +835,6 @@ mod test {
             );
         }
     }
-}
-
-#[cfg(test)]
-mod ipv4_mapped_tests {
-    use super::Location;
-    use std::net::SocketAddr;
 
     /// A dual-stack socket's view of an IPv4 peer gets that peer's IPv4
     /// location, independent of port, like the plain IPv4 address does.
@@ -861,6 +855,32 @@ mod ipv4_mapped_tests {
             Location::from_address(&mapped_other_net).as_f64(),
             loc,
             "different /24, same port: different locations"
+        );
+    }
+
+    /// The mapping must not disturb the other IPv6 cases. A mapped LOOPBACK
+    /// address takes the IPv4 loopback path, so its port still separates
+    /// simulation peers. `::1` and an IPv4-COMPATIBLE `::a.b.c.d` are not
+    /// IPv4-mapped and keep their IPv6-arm location (first 48 bits zero, so the
+    /// port is mixed in); a future "simplify to `to_ipv4()`" would move both.
+    #[test]
+    fn mapping_leaves_loopback_and_ipv4_compatible_addresses_alone() {
+        let loc = |s: &str| Location::from_address(&s.parse::<SocketAddr>().unwrap()).as_f64();
+        assert_eq!(loc("[::ffff:127.0.0.1]:5000"), loc("127.0.0.1:5000"));
+        assert_ne!(
+            loc("[::ffff:127.0.0.1]:5000"),
+            loc("[::ffff:127.0.0.1]:5001"),
+            "a mapped loopback address still includes the port"
+        );
+
+        let ipv6_arm_zero_prefix =
+            |port: u16| distribute_hash((port as u64) << 48) as f64 / u64::MAX as f64;
+        assert_eq!(loc("[::1]:5000"), ipv6_arm_zero_prefix(5000));
+        assert_eq!(loc("[::203.0.113.7]:5000"), ipv6_arm_zero_prefix(5000));
+        assert_ne!(
+            loc("[::203.0.113.7]:5000"),
+            loc("203.0.113.7:5000"),
+            "an IPv4-compatible address is not treated as its IPv4 address"
         );
     }
 }
