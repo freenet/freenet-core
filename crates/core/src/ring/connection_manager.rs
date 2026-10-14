@@ -1435,7 +1435,7 @@ impl ConnectionManager {
     /// short records chain, O(log) expected), and the absolute ceiling hard-bounds
     /// the ESTABLISHED count regardless.
     pub(crate) fn admits_lattice_edge_over_cap(&self, loc: Location) -> bool {
-        self.admits_lattice_edge_over_cap_in(&self.connections_by_location.read(), loc, 0)
+        self.admits_lattice_edge_over_cap_in(&self.connections_by_location.read(), loc)
     }
 
     /// Whether a connection to a peer at `loc` must be refused to respect
@@ -1458,53 +1458,17 @@ impl ConnectionManager {
         self.connection_count() >= self.max_connections && !self.admits_lattice_edge_over_cap(loc)
     }
 
-    /// [`Self::refuses_connection_at_cap`] for an outbound dial that has not
-    /// started yet, used by the pre-flight check in `handle_connect_peer`.
-    /// `in_flight` lists the other outbound dials still awaiting a handshake
-    /// that take a ring slot if they succeed (the caller leaves out transient
-    /// dials, unspecified addresses and peers already in the ring). Those
-    /// holding no non-stale pending reservation also count toward the over-cap
-    /// ceiling.
-    /// When we are the acceptor a dial holds a reservation, which the ceiling
-    /// already counts. When we are the requester it holds none, so without
-    /// this term a full node handed several lattice candidates before any
-    /// handshake completed would start NAT traversal for every one of them,
-    /// only for the promotion gates and `add_connection` to refuse the excess.
-    pub(crate) fn refuses_dial_at_cap(&self, loc: Location, in_flight: &[SocketAddr]) -> bool {
-        if self.connection_count() < self.max_connections {
-            return false;
-        }
-        let unreserved = {
-            let now = Instant::now();
-            let pending = self.pending_reservations.read();
-            in_flight
-                .iter()
-                .filter(|addr| {
-                    !pending.get(addr).is_some_and(|(_, created)| {
-                        now.duration_since(*created) <= PENDING_RESERVATION_TTL
-                    })
-                })
-                .count()
-        };
-        // `pending_reservations` (#3) is released above, before
-        // `connections_by_location` (#2) is taken: never #3 then #2.
-        !self.admits_lattice_edge_over_cap_in(&self.connections_by_location.read(), loc, unreserved)
-    }
-
     /// [`Self::admits_lattice_edge_over_cap`] evaluated against an ALREADY-HELD
     /// `connections_by_location` map, so [`Self::add_connection`] can run the
     /// count-check under the SAME write guard that performs the insert. This is
     /// what makes the over-cap ceiling (`max_connections + LATTICE_OVERMAX_SLACK`)
     /// a HARD invariant under concurrent adds rather than a racy check-then-insert
     /// (F4). `connections` is the held map; the strict-closer check and the count
-    /// both read it directly, no re-locking. `in_flight` is further speculative
-    /// state the caller counts toward the ceiling (outbound dials holding no
-    /// reservation, see [`Self::refuses_dial_at_cap`]); 0 everywhere else.
+    /// both read it directly, no re-locking.
     fn admits_lattice_edge_over_cap_in(
         &self,
         connections: &BTreeMap<Location, Vec<Connection>>,
         loc: Location,
-        in_flight: usize,
     ) -> bool {
         // Cheap ordinal check first: most candidates are not a strictly-closer
         // per-side nearest, so bail before taking the `pending_reservations` lock.
@@ -1545,7 +1509,7 @@ impl ConnectionManager {
             .values()
             .filter(|(_, created)| now.duration_since(*created) <= PENDING_RESERVATION_TTL)
             .count();
-        established + pending + in_flight < self.max_connections + LATTICE_OVERMAX_SLACK
+        established + pending < self.max_connections + LATTICE_OVERMAX_SLACK
     }
 
     /// Record the advertised location for a peer that we have decided to accept.
@@ -2277,7 +2241,7 @@ impl ConnectionManager {
                 // link next tick and the superseded former-nearest demotes into the
                 // long-link pool automatically (the reserved slot is derived on
                 // demand from the live connection set).
-                if self.admits_lattice_edge_over_cap_in(&cbl, loc, 0) {
+                if self.admits_lattice_edge_over_cap_in(&cbl, loc) {
                     tracing::debug!(
                         addr = %addr,
                         peer_location = %loc,
@@ -4739,9 +4703,7 @@ mod tests {
 
     /// Source-scrape pin (B1 regression guard, extended for #5827): EACH
     /// connection-lifecycle cap gate must refuse at the cap through the shared
-    /// `refuses_connection_at_cap` (`refuses_dial_at_cap` at the pre-flight
-    /// check, which also counts in-flight dials), carrying the lattice
-    /// exemption. The
+    /// `refuses_connection_at_cap`, which carries the lattice exemption. The
     /// gates are the transient-promotion gate and the outbound pre-flight check
     /// in `handle_connect_peer`, and the promotion gate in
     /// `handle_successful_connection`. Without the exemption a lattice edge is
@@ -4753,8 +4715,9 @@ mod tests {
     ///
     /// Each gate is checked inside its own function, between an anchor before
     /// it and its own refusal log line, so a call at one gate cannot stand in
-    /// for a missing one at another. Comment lines are ignored so prose naming
-    /// the predicate cannot satisfy the pin, and a bare
+    /// for a missing one at another. Comments (line, trailing and block) are
+    /// stripped so prose or a commented-out call cannot satisfy the pin, and a
+    /// bare
     /// `>= connection_manager.max_connections` cap test in code (the pre-#5827
     /// pre-flight shape) fails it outright.
     #[test]
@@ -4822,13 +4785,11 @@ mod tests {
         }
 
         const CALL: &str = "connection_manager.refuses_connection_at_cap(loc)";
-        const DIAL_CALL: &str = "connection_manager.refuses_dial_at_cap(loc, &in_flight)";
         let connect_peer = fn_body(LIFECYCLE_SRC, "async fn handle_connect_peer(");
         let successful = fn_body(LIFECYCLE_SRC, "async fn handle_successful_connection(");
         let gates = [
             (
                 "handle_connect_peer transient-promotion gate",
-                CALL,
                 region(
                     connect_peer,
                     "connection_manager.drop_transient(peer_addr)",
@@ -4837,7 +4798,6 @@ mod tests {
             ),
             (
                 "handle_connect_peer outbound pre-flight check (#5827)",
-                DIAL_CALL,
                 region(
                     connect_peer,
                     "Pre-flight max_connections check",
@@ -4846,7 +4806,6 @@ mod tests {
             ),
             (
                 "handle_successful_connection promotion gate",
-                CALL,
                 region(
                     successful,
                     "if promote_to_ring {",
@@ -4854,25 +4813,12 @@ mod tests {
                 ),
             ),
         ];
-        for (gate, call, region) in gates {
+        for (gate, region) in gates {
             assert!(
-                code_calls(region, call),
-                "the {gate} must refuse at the cap through `{call}`"
+                code_calls(region, CALL),
+                "the {gate} must refuse at the cap through `{CALL}`"
             );
         }
-        // The pre-flight check must hand the predicate the dials still
-        // awaiting a handshake, or its in-flight term is always zero.
-        assert!(
-            code_calls(
-                region(
-                    connect_peer,
-                    "Pre-flight max_connections check",
-                    "connect_peer: skipping connection — at max_connections",
-                ),
-                "state.slot_taking_dials(peer_addr,",
-            ),
-            "the outbound pre-flight check must count the slot-taking dials in awaiting_connection"
-        );
 
         assert!(
             !code_calls(LIFECYCLE_SRC, ">= connection_manager.max_connections"),
@@ -4885,63 +4831,6 @@ mod tests {
     /// candidate but lets a strictly-closer per-side nearest lattice edge
     /// through, within the over-cap ceiling. This is the decision the outbound
     /// pre-flight check now makes.
-    /// #5881 review: the pre-flight check counts outbound dials still awaiting a
-    /// handshake toward the over-cap ceiling, unless they hold a pending
-    /// reservation (already counted). A full node handed several lattice
-    /// candidates at once therefore starts NAT traversal for at most
-    /// LATTICE_OVERMAX_SLACK of them.
-    #[test]
-    fn refuses_dial_at_cap_counts_unreserved_in_flight_dials() {
-        let _nn_guard = NnLatticeOverrideGuard;
-        set_nn_lattice_enabled(true);
-        let max = 3usize;
-        let cm = make_connection_manager(None, 2, max, false);
-        cm.update_location(Some(Location::new(0.5)));
-        let kp = TransportKeypair::new();
-        // Successor side filled to the cap; nearest successor is 0.60.
-        for (i, l) in [0.60_f64, 0.70, 0.80].into_iter().enumerate() {
-            cm.add_connection(
-                Location::new(l),
-                make_addr(8510 + i as u16),
-                kp.public().clone(),
-                false,
-            );
-        }
-        assert_eq!(cm.connection_count(), max, "at the cap");
-        assert_eq!(LATTICE_OVERMAX_SLACK, 2, "test assumes SLACK == 2");
-        let tighten = Location::new(0.55);
-        let (dial_a, dial_b) = (make_addr(8520), make_addr(8521));
-
-        // No dial in flight: the tighten passes, as refuses_connection_at_cap.
-        assert!(!cm.refuses_dial_at_cap(tighten, &[]));
-        assert!(!cm.refuses_connection_at_cap(tighten));
-        // One unreserved dial in flight: 3 + 0 + 1 = 4 < 5, still room.
-        assert!(!cm.refuses_dial_at_cap(tighten, &[dial_a]));
-        // Two: 3 + 0 + 2 = 5, the ceiling. The promotion-gate predicate, which
-        // does not count dials, still admits it.
-        assert!(cm.refuses_dial_at_cap(tighten, &[dial_a, dial_b]));
-        assert!(!cm.refuses_connection_at_cap(tighten));
-
-        // A dial that holds a non-stale reservation is counted once, as a
-        // reservation: 3 + 1 + 1 = 5 with dial_a reserved, not 6.
-        cm.inject_reservation(dial_a, Location::new(0.2), Instant::now());
-        assert!(cm.refuses_dial_at_cap(tighten, &[dial_a, dial_b]));
-        assert!(!cm.refuses_dial_at_cap(tighten, &[dial_a]));
-        // Once that reservation is stale, the dial counts as unreserved again.
-        age_reservation(
-            &cm,
-            dial_a,
-            PENDING_RESERVATION_TTL + Duration::from_secs(1),
-        );
-        assert!(!cm.refuses_dial_at_cap(tighten, &[dial_a]));
-        assert!(cm.refuses_dial_at_cap(tighten, &[dial_a, dial_b]));
-
-        // A non-lattice candidate is refused regardless; below the cap nothing is.
-        assert!(cm.refuses_dial_at_cap(Location::new(0.65), &[]));
-        assert!(cm.prune_alive_connection(make_addr(8512)).is_some());
-        assert!(!cm.refuses_dial_at_cap(Location::new(0.65), &[dial_a, dial_b]));
-    }
-
     #[test]
     fn refuses_connection_at_cap_exempts_lattice_edges() {
         let _nn_guard = NnLatticeOverrideGuard;

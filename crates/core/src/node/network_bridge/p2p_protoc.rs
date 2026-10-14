@@ -2999,12 +2999,6 @@ struct EventListenerState {
     client_waiting_transaction: Vec<(WaitingTransaction, HashSet<ClientId>)>,
     awaiting_connection: HashMap<SocketAddr, Vec<Box<dyn ConnectResultSender>>>,
     awaiting_connection_txs: HashMap<SocketAddr, Vec<Transaction>>,
-    /// Addresses in `awaiting_connection` with at least one non-transient
-    /// requester, i.e. dials that take a ring slot if they succeed. Pruned to
-    /// `awaiting_connection`'s keys whenever a dial is registered
-    /// ([`Self::record_dial_requester`]); readers go through
-    /// [`Self::slot_taking_dials`], which ignores entries no longer awaiting.
-    non_transient_dials: HashSet<SocketAddr>,
     pending_op_results: HashMap<Transaction, Sender<WaiterReply>>,
     /// Last time pending_op_results was scanned for closed senders.
     last_pending_op_cleanup: Instant,
@@ -3026,46 +3020,9 @@ impl EventListenerState {
             pending_op_results: HashMap::new(),
             last_pending_op_cleanup: Instant::now(),
             awaiting_connection_txs: HashMap::new(),
-            non_transient_dials: HashSet::new(),
             peer_backoff: PeerConnectionBackoff::new(),
             last_backoff_cleanup: Instant::now(),
         }
-    }
-
-    /// Note a requester of the dial to `addr`, before it is queued in
-    /// `awaiting_connection`. A non-transient requester marks the dial as one
-    /// that takes a ring slot; a transient one leaves the mark as it is, since
-    /// another requester of the same dial may be non-transient.
-    fn record_dial_requester(&mut self, addr: SocketAddr, transient: bool) {
-        let awaiting = &self.awaiting_connection;
-        self.non_transient_dials
-            .retain(|dial| awaiting.contains_key(dial));
-        if !transient {
-            self.non_transient_dials.insert(addr);
-        }
-    }
-
-    /// Outbound dials still awaiting a handshake that take a ring slot if
-    /// they succeed: non-transient, to a specified address, not `exclude`
-    /// (the dial being decided) and not already in the ring. Transient dials
-    /// (gateway and relay hops) take no slot unless later promoted, and an
-    /// unspecified address is never dialled, so neither counts toward the
-    /// pre-flight over-cap ceiling (`ConnectionManager::refuses_dial_at_cap`).
-    fn slot_taking_dials(
-        &self,
-        exclude: SocketAddr,
-        in_ring: impl Fn(SocketAddr) -> bool,
-    ) -> Vec<SocketAddr> {
-        self.awaiting_connection
-            .keys()
-            .filter(|addr| {
-                **addr != exclude
-                    && !addr.ip().is_unspecified()
-                    && self.non_transient_dials.contains(*addr)
-                    && !in_ring(**addr)
-            })
-            .copied()
-            .collect()
     }
 }
 
@@ -6259,53 +6216,6 @@ pub(crate) mod tests {
     ///       failure).
     /// This drives the extracted `fail_awaiting_connection` helper directly,
     /// which owns (b)-(d).
-    /// #5881 review: the pre-flight over-cap ceiling counts only dials that
-    /// take a ring slot. A transient dial, an unspecified address, the dial
-    /// being decided and a peer already in the ring are left out; a dial with
-    /// a non-transient requester counts even if a transient one queued first.
-    #[test]
-    fn slot_taking_dials_skips_transient_unspecified_and_in_ring() {
-        use crate::transport::ExpectedInboundTracker;
-        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-
-        let mut state = super::EventListenerState::new(ExpectedInboundTracker::empty_for_test());
-        let addr = |port| SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), port);
-        let unspecified = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0);
-        let (lattice, transient, in_ring, deciding, joined) =
-            (addr(1), addr(2), addr(3), addr(4), addr(5));
-        let queue = |state: &mut super::EventListenerState, a: SocketAddr, t: bool| {
-            state.record_dial_requester(a, t);
-            state.awaiting_connection.entry(a).or_default();
-        };
-        queue(&mut state, lattice, false);
-        queue(&mut state, transient, true);
-        queue(&mut state, in_ring, false);
-        queue(&mut state, deciding, false);
-        queue(&mut state, unspecified, false);
-        // A transient requester first, then a non-transient one on the same dial.
-        queue(&mut state, joined, true);
-        queue(&mut state, joined, false);
-
-        let mut dials = state.slot_taking_dials(deciding, |a| a == in_ring);
-        dials.sort();
-        assert_eq!(dials, vec![lattice, joined]);
-
-        // A dial that is no longer awaiting is not counted, and its mark is
-        // pruned at the next registration; re-dialling it transiently does not
-        // revive the mark.
-        state.awaiting_connection.remove(&lattice);
-        assert_eq!(
-            state.slot_taking_dials(deciding, |a| a == in_ring),
-            vec![joined]
-        );
-        queue(&mut state, lattice, true);
-        assert!(!state.non_transient_dials.contains(&lattice));
-        assert_eq!(
-            state.slot_taking_dials(deciding, |a| a == in_ring),
-            vec![joined]
-        );
-    }
-
     #[tokio::test]
     async fn connect_command_drop_fails_callbacks_without_backoff() {
         use crate::dev_tool::Transaction;

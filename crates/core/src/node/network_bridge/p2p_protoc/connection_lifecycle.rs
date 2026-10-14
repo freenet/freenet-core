@@ -514,18 +514,7 @@ impl P2pConnManager {
             let connection_manager = &self.bridge.op_manager.ring.connection_manager;
             let current = connection_manager.connection_count();
             let loc = Location::from_address(&peer_addr);
-            // Other outbound dials still awaiting a handshake that take a
-            // ring slot if they succeed (non-transient ones). As the requester
-            // we hold no reservation for them, so without counting them a full
-            // node handed several lattice candidates at once would start NAT
-            // traversal for every one (`refuses_dial_at_cap`). Collected only
-            // at the cap, where the predicate reads them.
-            let in_flight: Vec<SocketAddr> = if connection_manager.at_max_connections() {
-                state.slot_taking_dials(peer_addr, |addr| connection_manager.is_in_ring(addr))
-            } else {
-                Vec::new()
-            };
-            if connection_manager.refuses_dial_at_cap(loc, &in_flight) {
+            if connection_manager.refuses_connection_at_cap(loc) {
                 tracing::info!(
                     tx = %tx,
                     remote = %peer_addr,
@@ -549,7 +538,6 @@ impl P2pConnManager {
             }
         }
 
-        state.record_dial_requester(peer_addr, transient);
         match state.awaiting_connection.entry(peer_addr) {
             std::collections::hash_map::Entry::Occupied(mut callbacks) => {
                 let txs_entry = state.awaiting_connection_txs.entry(peer_addr).or_default();
