@@ -73,6 +73,12 @@ pub(crate) const SILENT_ROUNDS_BEFORE_REDIAL: u32 = 2;
 /// collecting replies either way.
 pub(crate) const GATEWAY_ANSWER_DEADLINE: Duration = Duration::from_secs(15);
 
+/// Least time between two redials of one gateway's link. A gateway that is
+/// slow rather than gone would otherwise be re-handshaken about once a
+/// minute by every joiner, landing on a gateway that is already behind; a
+/// dead link still recovers within this.
+const MIN_REDIAL_INTERVAL: Duration = Duration::from_secs(120);
+
 /// Gateways whose liveness is tracked at once; well above any configured
 /// gateway list, and only a bound on the map.
 const MAX_TRACKED_GATEWAYS: usize = 64;
@@ -176,6 +182,8 @@ struct GatewayLiveness {
     silent: u32,
     /// When the gateway last answered.
     last_answer: Option<Instant>,
+    /// When this peer last dropped the link to redial it.
+    redialled: Option<Instant>,
 }
 
 /// Spacing of bootstrap rounds, shared by `initial_join_procedure` and the
@@ -267,19 +275,34 @@ impl BootstrapPacer {
     /// `ObservedAddress` from the gateway by [`GATEWAY_ANSWER_DEADLINE`]. Returns true once that has
     /// happened [`SILENT_ROUNDS_BEFORE_REDIAL`] times in a row, and resets the
     /// count: the caller drops the link to redial it. Rounds overlap, so a
-    /// CONNECT sent before the gateway's last answer says nothing about the
-    /// link now and is not counted.
-    pub(crate) fn gateway_silent(&mut self, gateway: SocketAddr, sent: Instant) -> bool {
+    /// CONNECT sent before the gateway's last answer, or before the last
+    /// redial (it went over the old link), says nothing about the link now and
+    /// is not counted. A link is redialled at most once per
+    /// [`MIN_REDIAL_INTERVAL`].
+    pub(crate) fn gateway_silent(
+        &mut self,
+        gateway: SocketAddr,
+        sent: Instant,
+        now: Instant,
+    ) -> bool {
         let liveness = self.liveness(gateway);
-        if liveness.last_answer.is_some_and(|answer| answer >= sent) {
+        let stale = |t: Option<Instant>| t.is_some_and(|t| t >= sent);
+        if stale(liveness.last_answer) || stale(liveness.redialled) {
             return false;
         }
         liveness.silent += 1;
-        if liveness.silent >= SILENT_ROUNDS_BEFORE_REDIAL {
-            liveness.silent = 0;
-            return true;
+        if liveness.silent < SILENT_ROUNDS_BEFORE_REDIAL {
+            return false;
         }
-        false
+        if liveness
+            .redialled
+            .is_some_and(|t| now.saturating_duration_since(t) < MIN_REDIAL_INTERVAL)
+        {
+            return false;
+        }
+        liveness.silent = 0;
+        liveness.redialled = Some(now);
+        true
     }
 
     /// The gateway backoff was cleared (isolation recovery, suspend). If no
@@ -573,22 +596,52 @@ mod tests {
         let t0 = Instant::now();
         let at = |s: u64| t0 + Duration::from_secs(s);
         assert!(
-            !pacer.gateway_silent(gw, at(0)),
+            !pacer.gateway_silent(gw, at(0), at(0)),
             "one silent round is not enough"
         );
         pacer.gateway_answered(gw, at(1));
         assert!(
-            !pacer.gateway_silent(gw, at(2)),
+            !pacer.gateway_silent(gw, at(2), at(2)),
             "an answer resets the count"
         );
         assert!(
-            !pacer.gateway_silent(other, at(2)),
+            !pacer.gateway_silent(other, at(2), at(2)),
             "counts are per gateway"
         );
-        assert!(pacer.gateway_silent(gw, at(3)), "two in a row redial");
         assert!(
-            !pacer.gateway_silent(gw, at(4)),
+            pacer.gateway_silent(gw, at(3), at(3)),
+            "two in a row redial"
+        );
+        assert!(
+            !pacer.gateway_silent(gw, at(4), at(4)),
             "and the count starts over"
+        );
+    }
+
+    #[test]
+    fn a_link_is_redialled_at_most_once_per_interval_and_old_connects_do_not_count() {
+        let mut pacer = BootstrapPacer::new(Duration::from_secs(30));
+        let gw: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let t0 = Instant::now();
+        let at = |s: u64| t0 + Duration::from_secs(s);
+        assert!(!pacer.gateway_silent(gw, at(0), at(15)));
+        assert!(pacer.gateway_silent(gw, at(5), at(20)), "redial at 20 s");
+        // CONNECTs that went over the old link, judged after the redial.
+        assert!(!pacer.gateway_silent(gw, at(15), at(30)));
+        assert!(
+            !pacer.gateway_silent(gw, at(18), at(33)),
+            "CONNECTs from before the redial say nothing about the new link"
+        );
+        // Two silent CONNECTs on the new link, too soon after the redial.
+        assert!(!pacer.gateway_silent(gw, at(25), at(40)));
+        assert!(
+            !pacer.gateway_silent(gw, at(30), at(45)),
+            "no second redial within MIN_REDIAL_INTERVAL"
+        );
+        let later = 20 + MIN_REDIAL_INTERVAL.as_secs();
+        assert!(
+            pacer.gateway_silent(gw, at(later - 10), at(later)),
+            "a still-silent link is redialled once the interval has passed"
         );
     }
 
@@ -600,13 +653,13 @@ mod tests {
         let at = |s: u64| t0 + Duration::from_secs(s);
         // Rounds at 0 and 5 s; the gateway answers the 15 s round at once.
         pacer.gateway_answered(gw, at(15));
-        assert!(!pacer.gateway_silent(gw, at(0)));
+        assert!(!pacer.gateway_silent(gw, at(0), at(0)));
         assert!(
-            !pacer.gateway_silent(gw, at(5)),
+            !pacer.gateway_silent(gw, at(5), at(5)),
             "CONNECTs from before the gateway answered say nothing about the link now"
         );
-        assert!(!pacer.gateway_silent(gw, at(20)));
-        assert!(pacer.gateway_silent(gw, at(25)));
+        assert!(!pacer.gateway_silent(gw, at(20), at(20)));
+        assert!(pacer.gateway_silent(gw, at(25), at(25)));
     }
 
     #[test]

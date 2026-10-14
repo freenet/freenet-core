@@ -437,10 +437,11 @@ async fn drive_client_connect(
         }
         if answer_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
             answer_deadline = None;
-            let redial = op_manager
-                .bootstrap_pacer
-                .lock()
-                .gateway_silent(gateway_addr, started);
+            let redial = op_manager.bootstrap_pacer.lock().gateway_silent(
+                gateway_addr,
+                started,
+                Instant::now(),
+            );
             if redial {
                 drop_dead_gateway_link(op_manager, tx, gateway_addr).await;
             }
