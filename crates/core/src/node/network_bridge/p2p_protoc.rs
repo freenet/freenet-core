@@ -1907,7 +1907,8 @@ impl P2pConnManager {
 
                                     // Spawn a task to wait for connection and then send the message
                                     let target_peer_for_resend = target_peer.clone();
-                                    let connect_request = is_unsent_connect_request(&msg_clone);
+                                    let unsent_notice =
+                                        unsent_message_notice(&msg_clone, tx, target_addr);
                                     GlobalExecutor::spawn(async move {
                                         let resent = match timeout(
                                             Duration::from_secs(20),
@@ -1981,14 +1982,9 @@ impl P2pConnManager {
                                         // instead of leaving it to wait out its
                                         // TTL (#5858). Other ops keep their own
                                         // retry handling.
-                                        if !resent && connect_request {
+                                        if let (false, Some(notice)) = (resent, unsent_notice) {
                                             bridge_sender
-                                                .send(P2pBridgeEvent::NodeAction(
-                                                    NodeEvent::TransactionOrphaned {
-                                                        tx,
-                                                        peer: target_addr,
-                                                    },
-                                                ))
+                                                .send(P2pBridgeEvent::NodeAction(notice))
                                                 .await
                                                 .ok();
                                         }
@@ -2986,17 +2982,27 @@ impl ConnectResultSender for mpsc::Sender<Result<(SocketAddr, Option<usize>), ()
     }
 }
 
-/// A message dropped because its target could not be connected, whose
-/// driver should be told at once: a joiner's CONNECT request (#5858). Its
-/// transaction has nothing in flight, so ending it frees the bootstrap round
-/// instead of holding it for the transaction TTL.
-fn is_unsent_connect_request(msg: &NetMessage) -> bool {
+/// What to tell the event loop when `msg`, waiting for a connection to
+/// `target_addr`, was dropped because the connection failed. Only a joiner's
+/// CONNECT request is reported (#5858): its transaction has nothing in
+/// flight, so ending its driver at once (as for a peer pruned mid-flight)
+/// frees the bootstrap round instead of holding it for the transaction TTL.
+/// Other messages keep their ops' own retry handling.
+fn unsent_message_notice(
+    msg: &NetMessage,
+    tx: Transaction,
+    target_addr: SocketAddr,
+) -> Option<NodeEvent> {
     matches!(
         msg,
         NetMessage::V1(NetMessageV1::Connect(
             crate::operations::connect::ConnectMsg::Request { .. }
         ))
     )
+    .then_some(NodeEvent::TransactionOrphaned {
+        tx,
+        peer: target_addr,
+    })
 }
 
 /// Fail every callback awaiting a connection to `peer_addr` after a connect
@@ -3688,7 +3694,7 @@ pub(crate) mod tests {
     /// handling.
     #[test]
     fn only_an_unsent_connect_request_is_ended_at_once() {
-        use crate::message::{NetMessage, NetMessageV1, Transaction};
+        use crate::message::{NetMessage, NetMessageV1, NodeEvent, Transaction};
         use crate::operations::connect::{ConnectMsg, prepare_join_request};
         use crate::ring::{Location, PeerKeyLocation};
         use crate::transport::TransportKeypair;
@@ -3699,18 +3705,53 @@ pub(crate) mod tests {
                 std::net::SocketAddr::from(([127, 0, 0, 1], port)),
             )
         };
+        let gateway = std::net::SocketAddr::from(([127, 0, 0, 1], 2));
         let tx = Transaction::new::<ConnectMsg>();
         let request = prepare_join_request(tx, &peer(1), &peer(2), Location::new(0.5), 10, &[]);
-        assert!(super::is_unsent_connect_request(&NetMessage::V1(
-            NetMessageV1::Connect(request)
-        )));
+        match super::unsent_message_notice(
+            &NetMessage::V1(NetMessageV1::Connect(request)),
+            tx,
+            gateway,
+        ) {
+            Some(NodeEvent::TransactionOrphaned { tx: t, peer }) => {
+                assert_eq!((t, peer), (tx, gateway));
+            }
+            other => panic!("an unsent CONNECT request must end its driver, got {other:?}"),
+        }
         let observed = ConnectMsg::ObservedAddress {
             id: tx,
             address: std::net::SocketAddr::from(([127, 0, 0, 1], 3)),
         };
-        assert!(!super::is_unsent_connect_request(&NetMessage::V1(
-            NetMessageV1::Connect(observed)
-        )));
+        assert!(
+            super::unsent_message_notice(
+                &NetMessage::V1(NetMessageV1::Connect(observed)),
+                tx,
+                gateway
+            )
+            .is_none()
+        );
+    }
+
+    /// The resend waiter reports an unsent CONNECT only when it did not
+    /// resend it (#5858). Source pin: the waiter runs inside the event loop,
+    /// which has no harness here.
+    #[test]
+    fn the_resend_waiter_reports_only_a_message_it_did_not_send() {
+        const SOURCE: &str = include_str!("p2p_protoc.rs");
+        let prod = &SOURCE[..SOURCE
+            .find("\n#[cfg(test)]\npub(crate) mod tests")
+            .expect("tests")];
+        let code: String = prod.split_whitespace().collect();
+        let notice = code
+            .find("letunsent_notice=unsent_message_notice(&msg_clone,tx,target_addr);")
+            .expect("the waiter must work out the notice before msg_clone is moved");
+        let sent = code[notice..]
+            .find("iflet(false,Some(notice))=(resent,unsent_notice){bridge_sender.send(P2pBridgeEvent::NodeAction(notice))")
+            .expect("the notice must go out only when the message was not resent");
+        let resent_ok = code[notice..]
+            .find("\"Failedtoreschedulemessageafterconnectionestablished\");}true}")
+            .expect("a resent message must count as sent");
+        assert!(resent_ok < sent);
     }
 
     /// A fake [`super::ContractPresenceOracle`] for testing

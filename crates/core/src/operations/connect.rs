@@ -2511,6 +2511,48 @@ mod tests {
         );
     }
 
+    /// While isolated the maintenance loop sends no version probe (#5858):
+    /// the paced bootstrap rounds already reach the gateways, and an unpaced
+    /// probe CONNECT would be a request the pacer does not count.
+    #[test]
+    fn maintenance_skips_version_probes_while_isolated() {
+        const RING: &str = include_str!("../ring.rs");
+        let maintenance = squash(fn_body(RING, "async fn connection_maintenance("));
+        let probe = maintenance
+            .find("crate::operations::connect::gateway_version_probe(gateway,&op_manager)")
+            .expect("the maintenance loop probes gateway versions");
+        let guard = maintenance
+            .find("ifcurrent_conn_count>0&&should_probe_gateway(")
+            .expect("the version probe must be skipped at zero connections");
+        assert!(guard < probe, "the guard must gate the probe");
+    }
+
+    /// The Turmoil runner marks its thread as running a simulation before it
+    /// builds any host, as the other runners do, so its nodes leave the
+    /// process-global network_status alone (Codex P2).
+    #[test]
+    fn the_turmoil_runner_sets_the_simulation_marker() {
+        const TESTING: &str = include_str!("../node/testing_impl.rs");
+        let start = TESTING
+            .find("    pub fn run_simulation<R, F, Fut>(")
+            .expect("run_simulation not found");
+        let end = start
+            + TESTING[start..]
+                .find("\n    }\n")
+                .expect("end of run_simulation");
+        let body = squash(&TESTING[start..end]);
+        let marker = body
+            .find("crate::ring::topology_registry::set_current_network_name(&self.name);")
+            .expect("run_simulation must set the simulation marker");
+        let build = body
+            .find("turmoil::Builder::new()")
+            .expect("run_simulation builds the Turmoil simulation");
+        assert!(
+            marker < build,
+            "the marker must be set before any host runs"
+        );
+    }
+
     /// The maintenance bootstrap and the join loop share one pacer (#5858):
     /// while one path is taking a round, or inside the backoff after it, the
     /// other starts none; and the maintenance round clears only reservations

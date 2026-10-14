@@ -2654,6 +2654,48 @@ mod driver_timing_tests {
         script.abort();
     }
 
+    /// Overlapping joins through one gateway are judged against when each
+    /// was sent (review item 8): a join sent before the gateway's last answer
+    /// says nothing about the link now. Join A (t=0) goes unanswered, join B
+    /// (t=5 s) is answered at once; A's deadline then passes, and one more
+    /// unanswered join C must not make A and C two silent rounds in a row.
+    #[tokio::test(start_paused = true)]
+    async fn an_overlapping_join_sent_before_the_gateways_answer_is_not_counted() {
+        let _marker = NoGlobalAddress::new();
+        let (op_manager, mut events, mut op_execution) =
+            unaddressed_op_manager("driver-liveness-overlap").await;
+        let gateway = peer(24883);
+        let gateway_addr = gateway.socket_addr().unwrap();
+        let script = tokio::spawn(async move {
+            let mut held = Vec::new();
+            let mut nth = 0;
+            while let Some((reply, msg, _target)) = op_execution.recv().await {
+                if let NetMessage::V1(NetMessageV1::Connect(ConnectMsg::Request { id, .. })) = msg {
+                    nth += 1;
+                    if nth == 2 {
+                        reply.send(observed_address(id)).await.ok();
+                    }
+                }
+                held.push(reply);
+            }
+        });
+        let a = connect_once(&op_manager, &gateway, ClientConnectKind::Standard);
+        let b = async {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            connect_once(&op_manager, &gateway, ClientConnectKind::Standard).await;
+            // B's ObservedAddress taught this peer its address; C starts
+            // unaddressed again so it is judged.
+            op_manager.ring.connection_manager.clear_own_addr_for_test();
+        };
+        tokio::join!(a, b);
+        connect_once(&op_manager, &gateway, ClientConnectKind::Standard).await;
+        assert!(
+            !drops_link(&mut events, gateway_addr),
+            "A was sent before the gateway answered B; it must not count toward a redial"
+        );
+        script.abort();
+    }
+
     /// A peer that knows its address gets no `ObservedAddress`, so silence
     /// proves nothing about its gateway link.
     #[tokio::test(start_paused = true)]
