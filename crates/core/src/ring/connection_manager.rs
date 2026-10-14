@@ -4701,60 +4701,120 @@ mod tests {
         );
     }
 
-    /// Source-scrape pin (B1 regression guard, extended for #5827): EVERY
-    /// connection-lifecycle cap gate — both promotion gates AND the outbound
-    /// pre-flight check in `handle_connect_peer` — must refuse at the cap through
-    /// the shared `refuses_connection_at_cap`, which carries the lattice
-    /// exemption. Without it a lattice edge is silently dropped at the cap on the
-    /// real CONNECT path and mechanism 3's at-capacity displacement is inert —
-    /// the exact defect the external review caught for the promotion gates (the
-    /// over-max unit test passed only because it bypassed the gate), and that
-    /// #5827 found still open in the pre-flight check.
+    /// Source-scrape pin (B1 regression guard, extended for #5827): EACH
+    /// connection-lifecycle cap gate must refuse at the cap through the shared
+    /// `refuses_connection_at_cap`, which carries the lattice exemption. The
+    /// gates are the transient-promotion gate and the outbound pre-flight check
+    /// in `handle_connect_peer`, and the promotion gate in
+    /// `handle_successful_connection`. Without the exemption a lattice edge is
+    /// silently dropped at the cap on the real CONNECT path and mechanism 3's
+    /// at-capacity displacement is inert: the exact defect the external review
+    /// caught for the promotion gates (the over-max unit test passed only
+    /// because it bypassed the gate), and that #5827 found still open in the
+    /// pre-flight check.
     ///
-    /// Comment lines are ignored so prose naming the predicate cannot satisfy
-    /// the pin, and a bare `>= connection_manager.max_connections` cap test in
-    /// code (the pre-#5827 pre-flight shape) fails it outright.
+    /// Each gate is checked inside its own function, between an anchor before
+    /// it and its own refusal log line, so a call at one gate cannot stand in
+    /// for a missing one at another. Comment lines are ignored so prose naming
+    /// the predicate cannot satisfy the pin, and a bare
+    /// `>= connection_manager.max_connections` cap test in code (the pre-#5827
+    /// pre-flight shape) fails it outright.
     #[test]
     fn lifecycle_gates_apply_lattice_over_cap_predicate() {
         const LIFECYCLE_SRC: &str =
             include_str!("../node/network_bridge/p2p_protoc/connection_lifecycle.rs");
-        let code_lines: Vec<&str> = LIFECYCLE_SRC
+
+        /// The body of the function whose signature starts with `signature`,
+        /// braces included. Panics rather than returning a wrong slice: a
+        /// missing anchor or unbalanced braces fail the pin loudly.
+        fn fn_body<'a>(src: &'a str, signature: &str) -> &'a str {
+            let start = src
+                .find(signature)
+                .unwrap_or_else(|| panic!("`{signature}` not found in connection_lifecycle.rs"));
+            let open = start
+                + src[start..]
+                    .find('{')
+                    .unwrap_or_else(|| panic!("`{signature}` has no body"));
+            let mut depth = 0usize;
+            for (i, b) in src.as_bytes()[open..].iter().enumerate() {
+                match b {
+                    b'{' => depth += 1,
+                    b'}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            return &src[open..=open + i];
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            panic!("unbalanced braces in the body of `{signature}`")
+        }
+
+        /// The text of `body` from `from` up to (not including) the first `to`
+        /// after it.
+        fn region<'a>(body: &'a str, from: &str, to: &str) -> &'a str {
+            let start = body
+                .find(from)
+                .unwrap_or_else(|| panic!("gate anchor `{from}` not found in its function"));
+            let len = body[start..]
+                .find(to)
+                .unwrap_or_else(|| panic!("gate log line `{to}` not found after `{from}`"));
+            &body[start..start + len]
+        }
+
+        fn code_calls(region: &str, call: &str) -> bool {
+            region
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .any(|l| l.contains(call))
+        }
+
+        const CALL: &str = "connection_manager.refuses_connection_at_cap(loc)";
+        let connect_peer = fn_body(LIFECYCLE_SRC, "async fn handle_connect_peer(");
+        let successful = fn_body(LIFECYCLE_SRC, "async fn handle_successful_connection(");
+        let gates = [
+            (
+                "handle_connect_peer transient-promotion gate",
+                region(
+                    connect_peer,
+                    "connection_manager.drop_transient(peer_addr)",
+                    "connect_peer: rejecting transient promotion to enforce cap",
+                ),
+            ),
+            (
+                "handle_connect_peer outbound pre-flight check (#5827)",
+                region(
+                    connect_peer,
+                    "Pre-flight max_connections check",
+                    "connect_peer: skipping connection — at max_connections",
+                ),
+            ),
+            (
+                "handle_successful_connection promotion gate",
+                region(
+                    successful,
+                    "if promote_to_ring {",
+                    "handle_successful_connection: rejecting new connection to enforce cap",
+                ),
+            ),
+        ];
+        for (gate, region) in gates {
+            assert!(
+                code_calls(region, CALL),
+                "the {gate} must refuse at the cap through `{CALL}`"
+            );
+        }
+
+        let bare = LIFECYCLE_SRC
             .lines()
             .filter(|l| !l.trim_start().starts_with("//"))
-            .collect();
-        let hits = code_lines
-            .iter()
-            .filter(|l| l.contains("connection_manager.refuses_connection_at_cap(loc)"))
-            .count();
-        assert_eq!(
-            hits, 3,
-            "the two promotion cap-gates and the outbound pre-flight check must each \
-             refuse through refuses_connection_at_cap(loc); found {hits} call site(s)"
-        );
-        let bare = code_lines
-            .iter()
             .filter(|l| l.contains(">= connection_manager.max_connections"))
             .count();
         assert_eq!(
             bare, 0,
             "a cap gate compares against max_connections without the lattice \
              exemption; route it through refuses_connection_at_cap (#5827)"
-        );
-        // The pre-flight check specifically (the #5827 site): the code between
-        // its comment and its log line must make the call.
-        let start = LIFECYCLE_SRC
-            .find("Pre-flight max_connections check")
-            .expect("pre-flight anchor");
-        let end = start
-            + LIFECYCLE_SRC[start..]
-                .find("connect_peer: skipping connection — at max_connections")
-                .expect("pre-flight log line");
-        assert!(
-            LIFECYCLE_SRC[start..end]
-                .lines()
-                .filter(|l| !l.trim_start().starts_with("//"))
-                .any(|l| l.contains("refuses_connection_at_cap(loc)")),
-            "the outbound pre-flight check must apply the lattice exemption (#5827)"
         );
     }
 
