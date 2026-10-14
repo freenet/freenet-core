@@ -2281,7 +2281,11 @@ mod driver_timing_tests {
             )
             .expect("build OpManager"),
         );
-        op_manager.ring.attach_op_manager(&op_manager);
+        // Not attached to its ring: the ring's maintenance loop then parks
+        // instead of running its own zero-connection bootstrap through the
+        // gateways configured above, which would send CONNECTs these tests
+        // do not expect and count join attempts in the process-global
+        // network_status that other tests assert on.
         if addressed {
             op_manager
                 .ring
