@@ -5089,3 +5089,217 @@ mod route_attempt_driver_tests {
         );
     }
 }
+
+/// #2524: a hop must never answer `Subscribed` to a requester it cannot
+/// register as a downstream subscriber. The real `drive_relay_subscribe`
+/// against a scripted event loop, once with the requester on a transient link
+/// only (no ring connection, so no `PeerKey` to register and no UPDATE fan-out
+/// target) and once, as the control, with the requester as a ring connection.
+#[cfg(test)]
+mod unregistrable_requester_tests {
+    use super::*;
+    use crate::operations::route_attempt::driver_test_support::{
+        Answer, LocalStore, Step, op_manager_with_peers_and_store, serve_attempts,
+    };
+    use parking_lot::Mutex;
+
+    /// Not one of the harness's ring connections (those are 127.0.0.1:30000+).
+    const TRANSIENT_REQUESTER: &str = "127.0.0.1:40000";
+
+    fn contract(instance_id: ContractInstanceId) -> freenet_stdlib::prelude::ContractKey {
+        freenet_stdlib::prelude::ContractKey::from_id_and_code(
+            instance_id,
+            freenet_stdlib::prelude::CodeHash::new([9u8; 32]),
+        )
+    }
+
+    fn store_contract(store: &LocalStore, key: freenet_stdlib::prelude::ContractKey) {
+        *store.lock() = Some((
+            key,
+            freenet_stdlib::prelude::WrappedState::new(vec![1, 2, 3]),
+        ));
+    }
+
+    /// What the scripted loop saw: the results answered to the requester, and
+    /// how many requests were forwarded to anyone else.
+    #[derive(Default)]
+    struct Seen {
+        answers: Vec<SubscribeMsgResult>,
+        forwards: usize,
+    }
+
+    /// Serve the hop's outbound traffic. A forwarded request is answered
+    /// `Subscribed`, and the body then lands in the local store, as it would
+    /// once host-formation fetched it from the responder.
+    fn serve(
+        op_manager: &Arc<OpManager>,
+        rx: tokio::sync::mpsc::Receiver<crate::node::OpExecutionPayload>,
+        requester: std::net::SocketAddr,
+        store: LocalStore,
+        key: freenet_stdlib::prelude::ContractKey,
+    ) -> Arc<Mutex<Seen>> {
+        let seen = Arc::new(Mutex::new(Seen::default()));
+        let record = seen.clone();
+        serve_attempts(
+            op_manager.clone(),
+            rx,
+            crate::message::TransactionType::Subscribe,
+            move |_, msg, target| {
+                let answer = match msg {
+                    NetMessage::V1(NetMessageV1::Subscribe(SubscribeMsg::Response {
+                        result,
+                        ..
+                    })) if target == Some(requester) => {
+                        record.lock().answers.push(result.clone());
+                        Answer::DropWaiter
+                    }
+                    NetMessage::V1(NetMessageV1::Subscribe(SubscribeMsg::Request { .. })) => {
+                        record.lock().forwards += 1;
+                        store_contract(&store, key);
+                        Answer::Reply(NetMessage::from(SubscribeMsg::Response {
+                            id: *msg.id(),
+                            instance_id: *key.id(),
+                            result: SubscribeMsgResult::Subscribed { key },
+                            hop_count: 1,
+                        }))
+                    }
+                    _ => Answer::DropWaiter,
+                };
+                Step { hop: None, answer }
+            },
+        );
+        seen
+    }
+
+    /// What one run of the hop did.
+    struct HopRun {
+        answers: Vec<SubscribeMsgResult>,
+        /// The requester is our downstream subscriber (hosting map or interest).
+        registered: bool,
+        /// This node installed its own subscription lease.
+        leased: bool,
+        forwards: usize,
+    }
+
+    async fn run_hop(label: &str, transient_requester: bool, locally_stored: bool) -> HopRun {
+        let (op_manager, rx, peers, _guards, store) =
+            op_manager_with_peers_and_store(label, 3).await;
+        let instance_id = ContractInstanceId::new([61u8; 32]);
+        let key = contract(instance_id);
+        if locally_stored {
+            store_contract(&store, key);
+        }
+        let requester = if transient_requester {
+            let addr: std::net::SocketAddr = TRANSIENT_REQUESTER.parse().unwrap();
+            assert!(
+                op_manager
+                    .ring
+                    .connection_manager
+                    .try_register_transient(addr, None)
+            );
+            addr
+        } else {
+            peers[0].socket_addr().unwrap()
+        };
+        let seen = serve(&op_manager, rx, requester, store, key);
+        let _result = drive_relay_subscribe(
+            &op_manager,
+            Transaction::new::<SubscribeMsg>(),
+            instance_id,
+            3,
+            VisitedPeers::new(&Transaction::new::<SubscribeMsg>()),
+            false,
+            requester,
+        )
+        .await;
+        let registered = op_manager.ring.has_downstream_subscribers(&key)
+            || !op_manager
+                .interest_manager
+                .get_interested_peers(&key)
+                .is_empty();
+        let leased = op_manager.ring.is_subscribed(&key);
+        let seen = seen.lock();
+        HopRun {
+            answers: seen.answers.clone(),
+            registered,
+            leased,
+            forwards: seen.forwards,
+        }
+    }
+
+    fn assert_subscribed_only_if_registered(label: &str, run: &HopRun) {
+        assert_eq!(
+            run.answers.len(),
+            1,
+            "{label}: exactly one answer: {:?}",
+            run.answers
+        );
+        let subscribed = matches!(run.answers[0], SubscribeMsgResult::Subscribed { .. });
+        assert!(
+            !subscribed || run.registered,
+            "{label}: answered Subscribed to a requester that was never registered \
+             as a downstream subscriber, so it would never receive an UPDATE (#2524)"
+        );
+    }
+
+    fn assert_told_to_try_elsewhere(label: &str, run: &HopRun) {
+        assert_subscribed_only_if_registered(label, run);
+        assert!(
+            matches!(run.answers[0], SubscribeMsgResult::NotFound),
+            "{label}: the requester must be told to try elsewhere: {:?}",
+            run.answers
+        );
+        assert!(!run.registered, "{label}");
+        assert!(
+            !run.leased,
+            "{label}: a requester we cannot serve is not demand for a lease"
+        );
+        assert_eq!(
+            run.forwards, 0,
+            "{label}: no search is run for a requester we cannot serve"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn local_hit_never_answers_subscribed_to_an_unregistrable_requester() {
+        let label = "sub-unregistrable-local-hit";
+        assert_told_to_try_elsewhere(label, &run_hop(label, true, true).await);
+
+        // Control: the same hop registers a ring-connected requester.
+        let label = "sub-registrable-local-hit";
+        let run = run_hop(label, false, true).await;
+        assert_subscribed_only_if_registered(label, &run);
+        assert!(
+            matches!(run.answers[0], SubscribeMsgResult::Subscribed { .. })
+                && run.registered
+                && run.leased,
+            "{label}: {:?} registered={} leased={}",
+            run.answers,
+            run.registered,
+            run.leased
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn forwarded_search_never_answers_subscribed_to_an_unregistrable_requester() {
+        let label = "sub-unregistrable-forward";
+        assert_told_to_try_elsewhere(label, &run_hop(label, true, false).await);
+
+        // Control: the same hop forwards for, and registers, a ring-connected
+        // requester.
+        let label = "sub-registrable-forward";
+        let run = run_hop(label, false, false).await;
+        assert_subscribed_only_if_registered(label, &run);
+        assert!(
+            matches!(run.answers[0], SubscribeMsgResult::Subscribed { .. })
+                && run.registered
+                && run.leased
+                && run.forwards == 1,
+            "{label}: {:?} registered={} leased={} forwards={}",
+            run.answers,
+            run.registered,
+            run.leased,
+            run.forwards
+        );
+    }
+}
