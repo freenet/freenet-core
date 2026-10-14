@@ -365,10 +365,12 @@ async fn drive_client_connect_inner(
     let mut heard_gateway = false;
     let mut answer_deadline =
         (bootstrapping && started_without_address).then(|| started + GATEWAY_ANSWER_DEADLINE);
-    // A Rejected ends reply collection, but acceptors already being dialled
-    // are still finished: a failed punch still gets its ConnectFailed, and a
-    // successful one is not counted against the gateway.
-    let mut rejected = false;
+    // Reply collection ends on a Rejected, the TTL, or the waiter closing, but
+    // acceptors already taken are still dialled to the end (bounded by
+    // `DIAL_DRAIN_LIMIT`): a failed punch still gets its ConnectFailed, a
+    // queued acceptor still gets its ConnectPeer, and a successful one is not
+    // counted against the gateway.
+    let mut collection_end: Option<(CollectionEnd, Instant)> = None;
     // While bootstrapping, acceptors are dialled concurrently (bounded), so
     // one unreachable acceptor cannot hold the next one past its hole-punch
     // window (#5858). A peer that already has a connection keeps dialling
@@ -384,14 +386,19 @@ async fn drive_client_connect_inner(
     let mut dials = FuturesUnordered::new();
 
     loop {
-        if should_exit_for_ttl(&tx) {
+        if collection_end.is_none() && should_exit_for_ttl(&tx) {
             tracing::debug!(
                 %tx,
                 accepted = accepted.len(),
                 target_connections,
-                "connect driver: transaction timed out; exiting"
+                "connect driver: transaction timed out; finishing started dials"
             );
-            return Ok(ClientConnectEnd::Finished);
+            collection_end = Some((CollectionEnd::Ended, Instant::now()));
+        }
+        if collection_end.is_some() {
+            // No more gateway answers are expected; a CONNECT ending is not
+            // a gateway's silence.
+            answer_deadline = None;
         }
         if answer_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
             answer_deadline = None;
@@ -403,16 +410,18 @@ async fn drive_client_connect_inner(
                 drop_dead_gateway_link(op_manager, tx, gateway_addr).await;
             }
         }
-        if rejected && !dial_queue.busy() {
-            if connected_dials == 0 {
-                // Gateway rotation backoff (2c), unless a dial of this
-                // CONNECT connected after all.
-                op_manager
-                    .gateway_backoff
-                    .lock()
-                    .record_failure(gateway_addr);
+        if let Some((end, since)) = collection_end {
+            if !dial_queue.busy() || Instant::now() >= since + DIAL_DRAIN_LIMIT {
+                if end == CollectionEnd::Rejected && connected_dials == 0 {
+                    // Gateway rotation backoff (2c), unless a dial of this
+                    // CONNECT connected after all.
+                    op_manager
+                        .gateway_backoff
+                        .lock()
+                        .record_failure(gateway_addr);
+                }
+                return Ok(ClientConnectEnd::Finished);
             }
-            return Ok(ClientConnectEnd::Finished);
         }
 
         // Poll the receiver with a periodic timeout so the loop can
@@ -422,9 +431,12 @@ async fn drive_client_connect_inner(
         // sending Responses (e.g. when target_connections exceeds the
         // reachable network).
         const RECV_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
-        let event = if rejected {
-            // Collection is over; only the started dials are left.
-            DriverEvent::Dial(dials.next().await)
+        let event = if let Some((_, since)) = collection_end {
+            // Collection is over; only the taken acceptors' dials are left.
+            match tokio::time::timeout_at(since + DIAL_DRAIN_LIMIT, dials.next()).await {
+                Ok(dial) => DriverEvent::Dial(dial),
+                Err(_) => continue,
+            }
         } else {
             crate::deterministic_select! {
                 reply = tokio::time::timeout(RECV_POLL_INTERVAL, receiver.recv()) => DriverEvent::Reply(reply),
@@ -622,9 +634,20 @@ async fn drive_client_connect_inner(
                     accepted = accepted.len(),
                     "connect driver: gateway disconnected mid-connect; ending reply collection"
                 );
-                break;
+                collection_end = Some((CollectionEnd::Ended, Instant::now()));
+                continue;
             }
-            Ok(None) => break,
+            Ok(None) => {
+                tracing::debug!(
+                    tx = %tx,
+                    accepted = accepted.len(),
+                    target_connections,
+                    gateway = %gateway.pub_key(),
+                    "connect driver: receiver closed"
+                );
+                collection_end = Some((CollectionEnd::Ended, Instant::now()));
+                continue;
+            }
             Err(_) => continue,
         };
 
@@ -736,7 +759,7 @@ async fn drive_client_connect_inner(
                 // saturated neighborhood (2c). Recorded once the dials already
                 // started have finished (top of the loop), and only if none of
                 // them connected.
-                rejected = true;
+                collection_end = Some((CollectionEnd::Rejected, Instant::now()));
                 continue;
             }
             ConnectMsg::ObservedAddress { address, .. } => {
@@ -785,19 +808,23 @@ async fn drive_client_connect_inner(
             }
         }
     }
-
-    // Channel closed: bypass slot torn down or executor shutting down.
-    // Treat as benign completion — accepted acceptors (if any) already
-    // landed in the ring via NodeEvent::ConnectPeer.
-    tracing::debug!(
-        tx = %tx,
-        accepted = accepted.len(),
-        target_connections,
-        gateway = %gateway.pub_key(),
-        "connect driver: receiver closed"
-    );
-    Ok(ClientConnectEnd::Finished)
 }
+
+/// Why a client CONNECT stopped collecting replies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CollectionEnd {
+    /// A relay rejected the request.
+    Rejected,
+    /// The TTL passed, the gateway was pruned, or the waiter closed.
+    Ended,
+}
+
+/// How long a CONNECT that has stopped collecting keeps finishing the dials
+/// of acceptors it already took: ten hole-punch deadlines, room for the
+/// queued acceptors of a peer that dials one at a time.
+const DIAL_DRAIN_LIMIT: std::time::Duration = std::time::Duration::from_secs(
+    10 * crate::transport::connection_handler::NAT_TRAVERSAL_DEADLINE.as_secs(),
+);
 
 /// How the client CONNECT driver ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2753,6 +2780,135 @@ mod driver_timing_tests {
         assert_eq!(log.connect_failed, vec![bad.socket_addr().unwrap()]);
         assert_success_recorded(&op_manager, gateway_addr, desired);
         drop(replies_tx);
+    }
+
+    /// A peer with a ring connection (it dials one acceptor at a time).
+    fn connect_existing_peer(op_manager: &OpManager, port: u16) {
+        let existing = peer(port);
+        let addr = existing.socket_addr().unwrap();
+        assert!(op_manager.ring.connection_manager.add_connection(
+            Location::from_address(&addr),
+            addr,
+            existing.pub_key().clone(),
+            false,
+        ));
+    }
+
+    /// Feeds `replies` to a CONNECT, then ends its collection with `last`
+    /// (`None`: the waiter closes). Returns what the event loop saw.
+    async fn collection_ends_after(
+        op_manager: &OpManager,
+        events: mpsc::Receiver<Either<NetMessage, NodeEvent>>,
+        unreachable: Vec<SocketAddr>,
+        target_connections: usize,
+        replies: Vec<WaiterReply>,
+        last: Option<WaiterReply>,
+    ) -> Arc<parking_lot::Mutex<DialLog>> {
+        let log = scripted_event_loop(events, unreachable);
+        let gateway = peer(24890);
+        let (replies_tx, replies_rx) = mpsc::channel(64);
+        for reply in replies {
+            replies_tx.send(reply).await.unwrap();
+        }
+        if let Some(last) = last {
+            replies_tx.send(last).await.unwrap();
+        }
+        drop(replies_tx);
+        let end = tokio::time::timeout(
+            Duration::from_secs(60),
+            drive_client_connect_inner(
+                Transaction::new::<ConnectMsg>(),
+                gateway.clone(),
+                gateway.socket_addr().unwrap(),
+                Location::new(0.5),
+                target_connections,
+                false,
+                replies_rx,
+                op_manager,
+                ClientConnectKind::Standard,
+            ),
+        )
+        .await
+        .expect("the drain is bounded")
+        .expect("driver result");
+        assert_eq!(end, ClientConnectEnd::Finished);
+        // Let the scripted event loop take the driver's last notification.
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        log
+    }
+
+    /// When the waiter closes, acceptors already taken are still dialled,
+    /// queued ones included, and a failed punch still reports ConnectFailed
+    /// (review item 2: a connected peer dials one at a time, so the second
+    /// acceptor is queued when the waiter closes).
+    #[tokio::test(start_paused = true)]
+    async fn a_closed_waiter_still_finishes_started_and_queued_dials() {
+        let (op_manager, events) = op_manager_with_events("driver-drain-closed").await;
+        connect_existing_peer(&op_manager, 24891);
+        let tx = Transaction::new::<ConnectMsg>();
+        let (bad, good) = (peer(24892), peer(24893));
+        let log = collection_ends_after(
+            &op_manager,
+            events,
+            vec![bad.socket_addr().unwrap()],
+            op_manager.ring.connection_manager.min_connections,
+            vec![response(tx, &bad), response(tx, &good)],
+            None,
+        )
+        .await;
+        let log = log.lock();
+        let dialled: Vec<_> = log.dials.iter().map(|(a, _)| *a).collect();
+        assert_eq!(
+            dialled,
+            vec![bad.socket_addr().unwrap(), good.socket_addr().unwrap()]
+        );
+        assert_eq!(log.connect_failed, vec![bad.socket_addr().unwrap()]);
+    }
+
+    /// The same when the gateway is pruned mid-flight.
+    #[tokio::test(start_paused = true)]
+    async fn a_pruned_gateway_still_lets_started_dials_finish() {
+        let (op_manager, events) = op_manager_with_events("driver-drain-pruned").await;
+        let tx = Transaction::new::<ConnectMsg>();
+        let bad = peer(24894);
+        let log = collection_ends_after(
+            &op_manager,
+            events,
+            vec![bad.socket_addr().unwrap()],
+            op_manager.ring.connection_manager.min_connections,
+            vec![response(tx, &bad)],
+            Some(WaiterReply::PeerDisconnected {
+                peer: peer(24890).socket_addr().unwrap(),
+            }),
+        )
+        .await;
+        let log = log.lock();
+        assert_eq!(log.dials.len(), 1);
+        assert_eq!(log.connect_failed, vec![bad.socket_addr().unwrap()]);
+    }
+
+    /// A first hop that keeps sending distinct Responses gets no more than
+    /// `acceptor_limit` dials out of one CONNECT (review item 1).
+    #[tokio::test(start_paused = true)]
+    async fn one_connect_dials_no_more_than_its_acceptor_limit() {
+        let (op_manager, events) = op_manager_with_events("driver-acceptor-limit").await;
+        let tx = Transaction::new::<ConnectMsg>();
+        let acceptors: Vec<_> = (0..10).map(|i| peer(24900 + i)).collect();
+        let unreachable = acceptors.iter().map(|a| a.socket_addr().unwrap()).collect();
+        let target = 2;
+        let log = collection_ends_after(
+            &op_manager,
+            events,
+            unreachable,
+            target,
+            acceptors.iter().map(|a| response(tx, a)).collect(),
+            None,
+        )
+        .await;
+        assert_eq!(
+            log.lock().dials.len(),
+            crate::operations::connect::bootstrap::acceptor_limit(target)
+        );
     }
 
     fn rejected(tx: Transaction) -> WaiterReply {
