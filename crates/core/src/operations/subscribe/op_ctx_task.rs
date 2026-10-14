@@ -5098,6 +5098,7 @@ mod route_attempt_driver_tests {
 #[cfg(test)]
 mod unregistrable_requester_tests {
     use super::*;
+    use crate::message::MessageStats;
     use crate::operations::route_attempt::driver_test_support::{
         Answer, LocalStore, Step, op_manager_with_peers_and_store, serve_attempts,
     };
@@ -5174,7 +5175,7 @@ mod unregistrable_requester_tests {
     /// What one run of the hop did.
     struct HopRun {
         answers: Vec<SubscribeMsgResult>,
-        /// The requester is our downstream subscriber (hosting map or interest).
+        /// The requester is our downstream subscriber.
         registered: bool,
         /// This node installed its own subscription lease.
         leased: bool,
@@ -5212,11 +5213,9 @@ mod unregistrable_requester_tests {
             requester,
         )
         .await;
-        let registered = op_manager.ring.has_downstream_subscribers(&key)
-            || !op_manager
-                .interest_manager
-                .get_interested_peers(&key)
-                .is_empty();
+        // The hosting map holds downstream subscribers only; the interest map
+        // would also count the responder, registered as our upstream.
+        let registered = op_manager.ring.has_downstream_subscribers(&key);
         let leased = op_manager.ring.is_subscribed(&key);
         let seen = seen.lock();
         HopRun {
