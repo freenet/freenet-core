@@ -595,6 +595,13 @@ async fn drive_client_connect(
 
                 if !hole_punch_ok {
                     accepted.remove(&acceptor);
+                    if collection_end.is_some() {
+                        // Nobody reads replies any more: a re-route would
+                        // only reserve a new acceptor for nothing, and with
+                        // the gateway pruned it would start a fresh handshake
+                        // outside the pacer for a dead transaction.
+                        continue;
+                    }
                     let failed_msg = ConnectMsg::ConnectFailed {
                         id: tx,
                         failed_acceptor_addr: acceptor_addr,
@@ -3029,9 +3036,9 @@ mod driver_timing_tests {
     }
 
     /// When the waiter closes, acceptors already taken are still dialled,
-    /// queued ones included, and a failed punch still reports ConnectFailed
-    /// (review item 2: a connected peer dials one at a time, so the second
-    /// acceptor is queued when the waiter closes).
+    /// queued ones included (review item 2: a connected peer dials one at a
+    /// time, so the second acceptor is queued when the waiter closes), but a
+    /// failed punch asks for no re-route (re-review N1).
     #[tokio::test(start_paused = true)]
     async fn a_closed_waiter_still_finishes_started_and_queued_dials() {
         let (op_manager, events) = op_manager_with_events("driver-drain-closed").await;
@@ -3053,7 +3060,10 @@ mod driver_timing_tests {
             dialled,
             vec![bad.socket_addr().unwrap(), good.socket_addr().unwrap()]
         );
-        assert_eq!(log.connect_failed, vec![bad.socket_addr().unwrap()]);
+        assert!(
+            log.connect_failed.is_empty(),
+            "no re-route once collection has ended: nobody would read it"
+        );
     }
 
     /// The same when the gateway is pruned mid-flight.
@@ -3075,7 +3085,10 @@ mod driver_timing_tests {
         .await;
         let log = log.lock();
         assert_eq!(log.dials.len(), 1);
-        assert_eq!(log.connect_failed, vec![bad.socket_addr().unwrap()]);
+        assert!(
+            log.connect_failed.is_empty(),
+            "no re-route through a pruned gateway: it would start a fresh handshake"
+        );
     }
 
     /// A first hop that keeps sending distinct Responses gets no more than
@@ -3203,13 +3216,12 @@ mod driver_timing_tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn a_rejection_still_reports_a_started_dial_that_fails() {
+    async fn a_rejection_drains_a_failing_dial_without_a_reroute() {
         let (end, failed, backed_off) = rejected_mid_dial("driver-reject-fail", false).await;
         assert_eq!(end, ClientConnectEnd::Finished);
-        assert_eq!(
-            failed.len(),
-            1,
-            "the failed punch must still be reported with ConnectFailed"
+        assert!(
+            failed.is_empty(),
+            "after a Rejected nobody reads a re-routed acceptor's Response"
         );
         assert!(backed_off, "nothing connected: the gateway is backed off");
     }
