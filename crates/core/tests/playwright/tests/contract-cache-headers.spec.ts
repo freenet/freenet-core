@@ -1,21 +1,22 @@
 import { test, expect, type Response } from "@playwright/test";
 
-// Contract web responses must be `Cache-Control: no-store` (freenet-core#5323).
+// Contract HTML documents must be `Cache-Control: no-store` (freenet-core#5323).
 //
 // A contract's bundle is mutable at a stable URL: `fdev website update` changes
-// what `/v1/contract/web/<key>/` returns while the URL stays the same. With no
-// cache directive a browser that has the app open keeps running the superseded
-// build until a hard refresh, and the app cannot fix that itself, because the
-// stale document is the one that would have carried the fix.
+// what `/v1/contract/web/<key>/` returns while the URL stays the same. A cached
+// document pins an open tab to the superseded build, and the app cannot fix
+// that itself, because the stale document is the one that would have carried
+// the fix. Assets are deliberately left alone (see `no_store_html` in
+// `client_api.rs`).
 //
-// The header is applied as a layer over the contract-content routes in
-// `client_api/v1.rs` and `v2.rs`. The Rust router test
-// (`contract_content_routes_are_served_no_store` in `client_api.rs`) drives
-// every pipeline that emits contract bytes, including the JS rewrite branch and
-// `ServeFile`, which this fixture never reaches because it contains only HTML.
-// What it cannot see is the router as the harness node composes it, and what an
-// engine actually receives for the documents it loads, including the sandboxed
-// iframe. That is what this spec checks.
+// The header is applied by a layer over the contract-content routes in
+// `client_api/v1.rs` and `v2.rs`, keyed on `Content-Type: text/html`. The Rust
+// router test (`contract_html_is_served_no_store_and_assets_are_not` in
+// `client_api.rs`) drives every pipeline, including the JS rewrite branch and
+// `ServeFile` assets, which this fixture never reaches because it contains
+// only HTML. What it cannot see is the router as the harness node composes it,
+// and what an engine actually receives for the documents it loads, including
+// the sandboxed iframe. That is what this spec checks.
 
 const shellUrl = process.env.FREENET_SHELL_URL;
 

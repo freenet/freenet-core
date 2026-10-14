@@ -106,12 +106,19 @@ held once per open tab, and users routinely keep several Freenet apps open
 against one origin. Before adding a persistent resource, multiply it by ten
 tabs and check the browser-imposed ceiling.
 
-### 6. Contract content is served `no-store`, by route, not by handler
+### 6. Contract HTML is served `no-store`, by route, not by handler
 
-A contract's bundle changes at a stable URL on every republish, so anything
-cached under `/v{1,2}/contract/web/<key>/` pins an open tab to the old build
-(#5323). The guarantee is the `no_store(...)` wrapper in `client_api/v1.rs` and
-`v2.rs`, not any handler. A new route that serves contract bytes (or a new API
-version module) must be registered inside it. Nothing will fail if it is not,
-because `contract_content_routes_are_served_no_store` only exercises the routes
-it lists. The no-trailing-slash 308 stays outside on purpose (#4019).
+A contract's bundle changes at a stable URL on every republish, so a cached
+HTML document under `/v{1,2}/contract/web/<key>/` pins an open tab to the old
+build (#5323). The guarantee is the `no_store_html(...)` wrapper in
+`client_api/v1.rs` and `v2.rs`, keyed on `Content-Type: text/html`, not any
+handler. A new route that serves contract HTML (or a new API version module)
+must be registered inside it. Nothing will fail if it is not, because
+`contract_html_is_served_no_store_and_assets_are_not` only exercises the
+routes it lists.
+
+Assets are deliberately NOT `no-store`: try.freenet.org's reverse proxy marks
+hashed `assets/*` immutable, and a `no-store` from the node cancels that in the
+browser. Unhashed assets therefore stay heuristically cacheable through
+`ServeFile`'s `Last-Modified`; the fix for those is validators, not `no-store`.
+The no-trailing-slash 308 stays outside the wrapper on purpose (#4019).

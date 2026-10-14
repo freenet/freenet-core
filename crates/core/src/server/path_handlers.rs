@@ -1885,10 +1885,9 @@ fn structural_path_missing_response(
 ///   default where the 500 this replaced was not, so without this a transient
 ///   miss could be remembered by the browser and strand the app once the
 ///   bundle does unpack. `errors.rs` sets `no-store` on its transient answers
-///   for the same reason. Since #5323 the route also sets `no-store` on every
-///   response under the contract key (`client_api::no_store`). This header is
-///   kept as belt-and-braces, and the unit tests here that call
-///   `variable_content` directly pin it.
+///   for the same reason. The route-level layer added for #5323
+///   (`client_api::no_store_html`) covers HTML documents only, so this header
+///   is what keeps the miss uncacheable.
 fn asset_not_found_response() -> axum::response::Response {
     (
         axum::http::StatusCode::NOT_FOUND,
@@ -2012,9 +2011,9 @@ pub(super) async fn variable_content(
     match serve_file.try_call(fake_req).await {
         // tower-http 0.7.0 answers a missing file with its OWN bare 404 here
         // (0.7.1 returns `Err` instead — see below). That response carries no
-        // `Cache-Control`. Normalise it: whichever way the dependency reports
-        // the miss, this function returns the same answer. (Through the router
-        // the `no_store` layer would cover a bare 404 too.)
+        // `Cache-Control`, so without this the miss would be cacheable on one
+        // dependency version and not the other. Normalise it: whichever way
+        // the dependency reports the miss, the client gets the same answer.
         Ok(response) if response.status() == axum::http::StatusCode::NOT_FOUND => {
             Ok(asset_not_found_response())
         }
