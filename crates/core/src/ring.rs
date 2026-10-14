@@ -127,6 +127,8 @@ pub(crate) use hosting::MAX_DEFAULT_HOSTING_BUDGET_BYTES;
 /// compile-cache's configured-budget bound's floor (#5328 review), so this is
 /// a genuine production dependency now, not test-only.
 pub(crate) use hosting::MIN_DEFAULT_HOSTING_BUDGET_BYTES;
+#[cfg(test)]
+pub(crate) use hosting::PROVISIONAL_RETRY_INTERVAL;
 /// Single source of truth for the default hosted-contract-state budget.
 /// `config::default_max_hosting_storage()` resolves to this so the
 /// operator-facing default and the in-code fallback can never drift. The
@@ -3327,6 +3329,11 @@ impl Ring {
                     break;
                 }
                 evaluated += 1;
+                // A provisional lease (#2524) is due early at most once per
+                // PROVISIONAL_RETRY_INTERVAL, whatever comes of this
+                // evaluation: a suppressed, failed or non-repairing renewal
+                // keeps the mark but cannot re-arm it on every tick.
+                ring.record_provisional_renewal_attempt(&contract);
 
                 // FLIP (#4642 keystone): interest-gated renewal DRIVEN by the
                 // reconcile controller's interest gate (design §5a
@@ -3344,11 +3351,6 @@ impl Ring {
                 // flip's effect — the "renewal tracks active demand, not cache size"
                 // ship-gate falsifier — not a shadow divergence).
                 if !op_manager.reconcile_wants_renewal(&contract) {
-                    // The controller does not want this lease maintained, so a
-                    // provisional mark (#2524) has nothing to repair. Left set,
-                    // the lease would be due, pass `contract_in_use`, and burn
-                    // an `evaluated` slot here on every tick until its TTL.
-                    ring.set_subscription_provisional(&contract, false);
                     tracing::debug!(
                         %contract,
                         "renewal skipped: reconcile interest gate says not in use \
@@ -4671,6 +4673,21 @@ impl Ring {
     /// See [`hosting::HostingManager::is_subscription_provisional`].
     pub fn is_subscription_provisional(&self, contract: &ContractKey) -> bool {
         self.hosting_manager.is_subscription_provisional(contract)
+    }
+
+    /// See [`hosting::HostingManager::provisional_attempted_at`].
+    #[cfg(test)]
+    pub(crate) fn provisional_attempted_at(
+        &self,
+        contract: &ContractKey,
+    ) -> Option<tokio::time::Instant> {
+        self.hosting_manager.provisional_attempted_at(contract)
+    }
+
+    /// See [`hosting::HostingManager::record_provisional_renewal_attempt`].
+    pub(crate) fn record_provisional_renewal_attempt(&self, contract: &ContractKey) {
+        self.hosting_manager
+            .record_provisional_renewal_attempt(contract)
     }
 
     /// Unsubscribe from a contract.

@@ -430,11 +430,6 @@ async fn complete_local_subscription(
         }
     }
 
-    // Completed with no upstream at all, so a provisional mark (#2524) has
-    // nothing left to repair. Left set, a renewal ending here would leave the
-    // lease due on every renewal tick until the mark's TTL.
-    op_manager.ring.set_subscription_provisional(&key, false);
-
     // Notify client layer that subscription is complete. The actual update
     // delivery happens through the executor's update_notifications when
     // contract state changes, not through network broadcast targets.
@@ -706,7 +701,7 @@ pub(super) async fn finalize_originator_subscribe(
 /// sent an UPDATE. The hop still answers it `Subscribed`: that is the
 /// bootstrap path of an empty-ring node (#4361), and the requester repairs it
 /// by re-subscribing through the ring once it has a ring connection (#2524,
-/// `SubscriptionLease::provisional_since`).
+/// `SubscriptionLease::provisional`).
 pub(super) fn resolve_downstream_peer(
     op_manager: &OpManager,
     requester_addr: std::net::SocketAddr,
