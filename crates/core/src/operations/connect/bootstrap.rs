@@ -94,33 +94,64 @@ const BOOTSTRAP_RETRY_CAP_FLOOR: Duration = Duration::from_secs(30);
 /// that connects and drops at once does not let rounds run back to back.
 const CONNECTION_PERSISTS: Duration = Duration::from_secs(30);
 
+/// Most acceptors one CONNECT will dial over its life, re-routes included.
+///
+/// A CONNECT collects at most `target_connections` acceptors, so twice that
+/// leaves room for an acceptor re-routed after each failed punch. Without a
+/// bound a misbehaving first hop could keep sending distinct Responses for the
+/// whole TTL and have this peer dial every one.
+pub(crate) fn acceptor_limit(target_connections: usize) -> usize {
+    target_connections
+        .saturating_mul(2)
+        .max(MAX_CONCURRENT_ACCEPTOR_DIALS)
+}
+
+/// What [`AcceptorDialQueue::offer`] did with an acceptor.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Offer<T> {
+    /// Dial it now.
+    Dial(T),
+    /// Queued until a dial finishes.
+    Queued,
+    /// The CONNECT has already taken its limit of acceptors; ignore it.
+    Refused,
+}
+
 /// Bounded set of acceptor dials for one CONNECT: up to `cap` in flight, the
-/// rest queued in arrival order.
+/// rest queued in arrival order, and no more than `limit` taken in all.
 #[derive(Debug)]
 pub(crate) struct AcceptorDialQueue<T> {
     cap: usize,
+    limit: usize,
+    taken: usize,
     in_flight: usize,
     queued: VecDeque<T>,
 }
 
 impl<T> AcceptorDialQueue<T> {
-    pub(crate) fn new(cap: usize) -> Self {
+    pub(crate) fn new(cap: usize, limit: usize) -> Self {
         Self {
             cap: cap.max(1),
+            limit,
+            taken: 0,
             in_flight: 0,
             queued: VecDeque::new(),
         }
     }
 
-    /// An acceptor answered. Returns it if it may be dialled now; otherwise it
-    /// is queued until a dial finishes.
-    pub(crate) fn offer(&mut self, acceptor: T) -> Option<T> {
+    /// An acceptor answered: dial it now, queue it, or refuse it once the
+    /// CONNECT has taken `limit` acceptors.
+    pub(crate) fn offer(&mut self, acceptor: T) -> Offer<T> {
+        if self.taken >= self.limit {
+            return Offer::Refused;
+        }
+        self.taken += 1;
         if self.in_flight < self.cap {
             self.in_flight += 1;
-            Some(acceptor)
+            Offer::Dial(acceptor)
         } else {
             self.queued.push_back(acceptor);
-            None
+            Offer::Queued
         }
     }
 
@@ -386,15 +417,15 @@ mod tests {
 
     #[test]
     fn dial_queue_dials_up_to_cap_concurrently_then_queues_in_order() {
-        let mut q = AcceptorDialQueue::new(2);
-        assert_eq!(q.offer('a'), Some('a'));
+        let mut q = AcceptorDialQueue::new(2, 10);
+        assert_eq!(q.offer('a'), Offer::Dial('a'));
         assert_eq!(
             q.offer('b'),
-            Some('b'),
+            Offer::Dial('b'),
             "a second acceptor is dialled at once"
         );
-        assert_eq!(q.offer('c'), None);
-        assert_eq!(q.offer('d'), None);
+        assert_eq!(q.offer('c'), Offer::Queued);
+        assert_eq!(q.offer('d'), Offer::Queued);
         assert!(q.busy());
         assert_eq!(q.finish(), Some('c'));
         assert_eq!(q.finish(), Some('d'));
@@ -406,20 +437,37 @@ mod tests {
 
     #[test]
     fn dial_queue_cap_of_zero_still_dials_one() {
-        let mut q = AcceptorDialQueue::new(0);
-        assert_eq!(q.offer(1), Some(1));
-        assert_eq!(q.offer(2), None);
+        let mut q = AcceptorDialQueue::new(0, 10);
+        assert_eq!(q.offer(1), Offer::Dial(1));
+        assert_eq!(q.offer(2), Offer::Queued);
     }
 
     #[test]
     fn production_dial_cap_dials_more_than_one_acceptor_at_a_time() {
-        let mut q = AcceptorDialQueue::new(MAX_CONCURRENT_ACCEPTOR_DIALS);
-        assert_eq!(q.offer(1), Some(1));
+        let mut q = AcceptorDialQueue::new(MAX_CONCURRENT_ACCEPTOR_DIALS, 10);
+        assert_eq!(q.offer(1), Offer::Dial(1));
         assert_eq!(
             q.offer(2),
-            Some(2),
+            Offer::Dial(2),
             "head-of-line dialling lets a reachable acceptor's punch window expire"
         );
+    }
+
+    #[test]
+    fn dial_queue_takes_no_more_than_its_limit_over_the_connects_life() {
+        let mut q = AcceptorDialQueue::new(1, 3);
+        assert_eq!(q.offer(1), Offer::Dial(1));
+        assert_eq!(q.offer(2), Offer::Queued);
+        assert_eq!(q.finish(), Some(2));
+        assert_eq!(q.finish(), None);
+        assert_eq!(q.offer(3), Offer::Dial(3));
+        assert_eq!(
+            q.offer(4),
+            Offer::Refused,
+            "finished dials still count: a first hop cannot refill the queue"
+        );
+        assert!(acceptor_limit(25) >= 25);
+        assert!(acceptor_limit(0) >= 1);
     }
 
     #[test]

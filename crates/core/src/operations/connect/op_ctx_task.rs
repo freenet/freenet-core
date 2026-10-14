@@ -342,7 +342,8 @@ async fn drive_client_connect_inner(
     use std::collections::HashSet;
 
     use super::bootstrap::{
-        AcceptorDialQueue, GATEWAY_ANSWER_DEADLINE, MAX_CONCURRENT_ACCEPTOR_DIALS,
+        AcceptorDialQueue, GATEWAY_ANSWER_DEADLINE, MAX_CONCURRENT_ACCEPTOR_DIALS, Offer,
+        acceptor_limit,
     };
 
     let mut accepted: HashSet<PeerKeyLocation> = HashSet::with_capacity(target_connections);
@@ -372,12 +373,14 @@ async fn drive_client_connect_inner(
     // one unreachable acceptor cannot hold the next one past its hole-punch
     // window (#5858). A peer that already has a connection keeps dialling
     // one at a time, as before.
-    let mut dial_queue: AcceptorDialQueue<PeerKeyLocation> =
-        AcceptorDialQueue::new(if bootstrapping {
+    let mut dial_queue: AcceptorDialQueue<PeerKeyLocation> = AcceptorDialQueue::new(
+        if bootstrapping {
             MAX_CONCURRENT_ACCEPTOR_DIALS
         } else {
             1
-        });
+        },
+        acceptor_limit(target_connections),
+    );
     let mut dials = FuturesUnordered::new();
 
     loop {
@@ -655,13 +658,28 @@ async fn drive_client_connect_inner(
                     continue;
                 }
 
-                if !accepted.insert(payload.acceptor.clone()) {
+                if accepted.contains(&payload.acceptor) {
                     // Duplicate acceptor — ignore.
                     continue;
                 }
 
-                if let Some(acceptor) = dial_queue.offer(payload.acceptor.clone()) {
-                    dials.push(begin_acceptor_dial(op_manager, tx, acceptor).await?);
+                // `accepted` only grows with what the queue takes, so both
+                // stay within `acceptor_limit`.
+                match dial_queue.offer(payload.acceptor.clone()) {
+                    Offer::Dial(acceptor) => {
+                        accepted.insert(acceptor.clone());
+                        dials.push(begin_acceptor_dial(op_manager, tx, acceptor).await?);
+                    }
+                    Offer::Queued => {
+                        accepted.insert(payload.acceptor.clone());
+                    }
+                    Offer::Refused => {
+                        tracing::debug!(
+                            tx = %tx,
+                            acceptor = %payload.acceptor,
+                            "connect driver: acceptor limit reached; ignoring Response"
+                        );
+                    }
                 }
             }
             ConnectMsg::Rejected {
