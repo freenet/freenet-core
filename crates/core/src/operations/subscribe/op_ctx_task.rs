@@ -5252,6 +5252,50 @@ mod bootstrap_subscription_tests {
         );
     }
 
+    /// Measurement for (a) through the REAL renewal loop
+    /// (`Ring::recover_orphaned_subscriptions`, spawned with the ring and
+    /// parked until the first ring connection): virtual time from the node's
+    /// first ring connection until its bootstrap subscription is re-sent to a
+    /// ring peer. Before #2524 that waited for the lease's renewal window,
+    /// ~6 minutes after subscribing.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn bootstrap_subscription_reaches_the_ring_soon_after_first_connection() {
+        let gateway_addr: std::net::SocketAddr = "127.0.0.1:31000".parse().unwrap();
+        let gateway = PeerKeyLocation::new(
+            crate::transport::TransportKeypair::new().public().clone(),
+            gateway_addr,
+        );
+        let (op_manager, rx, _guards, store) =
+            op_manager_with_gateway("sub-bootstrap-renewal-loop", gateway).await;
+        let instance_id = ContractInstanceId::new([66u8; 32]);
+        let key = contract(instance_id);
+        let seen = serve(&op_manager, rx, store, key);
+        op_manager
+            .ring
+            .add_client_subscription(&instance_id, crate::client_events::ClientId::next());
+        subscribe(&op_manager, instance_id, false).await;
+        assert_eq!(seen.lock().request_targets, vec![gateway_addr]);
+
+        let connected_at = tokio::time::Instant::now();
+        let ring_peer = add_ring_peer(&op_manager, 31001);
+        // The 8-minute subscription lease.
+        let limit = std::time::Duration::from_secs(8 * 60);
+        while !seen.lock().request_targets.contains(&ring_peer) {
+            assert!(
+                connected_at.elapsed() < limit,
+                "the bootstrap subscription never reached a ring peer within the lease"
+            );
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        }
+        let delay = connected_at.elapsed();
+        eprintln!("first ring connection -> ring re-subscribe: {delay:?}");
+        // Loop start jitter (2-5 s) + spawn jitter (0-15 s) + the 1 s poll.
+        assert!(
+            delay <= std::time::Duration::from_secs(21),
+            "re-subscribe through the ring took {delay:?} after the first ring connection"
+        );
+    }
+
     /// (b) A subscription answered by a ring connection is NOT renewed early.
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn ring_subscription_is_not_renewed_early() {
