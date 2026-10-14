@@ -14736,13 +14736,18 @@ fn test_injected_hosting_clock_drives_subscription_lease_lapse() {
         });
 
         let ops = vec![
-            // Gateway hosts + announces the contract so the subscriber can reach it.
+            // Gateway hosts the contract so the subscriber can reach it. Seeded,
+            // not PUT: a PUT is the gateway's own local demand, which renews its
+            // subscription on its own schedule, and whether that renewal lands
+            // before or after the clock advance below depends on the renewal
+            // loop's phase (30 s cycle, 0-15 s random start), not on the clock
+            // injection under test. Seeding leaves the crashed subscriber's
+            // lease as the only demand.
             ScheduledOperation::new(
                 gateway.clone(),
-                SimOperation::Put {
+                SimOperation::SeedHostedContract {
                     contract: contract.clone(),
                     state: SimOperation::create_test_state(51),
-                    subscribe: false,
                 },
             ),
             // A node subscribes → forms a real subscription lease (timestamp read
