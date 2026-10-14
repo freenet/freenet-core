@@ -3226,11 +3226,8 @@ impl Ring {
             // first: their upstream could not register us, so they get no
             // UPDATEs until renewed. The cap keeps near-expiry ordinary leases,
             // which lapse if starved, from losing every slot to them.
-            let contracts_needing_renewal = order_renewal_candidates(
-                contracts_needing_renewal,
-                |key| ring.is_subscription_provisional(key),
-                (batch_limit / 2).max(1),
-            );
+            let contracts_needing_renewal =
+                ring.order_renewal_batch(contracts_needing_renewal, batch_limit);
 
             let mut attempted = 0;
             let mut skipped = 0;
@@ -3424,6 +3421,21 @@ impl Ring {
                 }
             }
         }
+    }
+
+    /// Order one renewal tick's candidates for a batch of `batch_limit`:
+    /// provisional leases (#2524) take up to half of the front positions
+    /// first (see [`order_renewal_candidates`]).
+    fn order_renewal_batch(
+        &self,
+        candidates: Vec<ContractKey>,
+        batch_limit: usize,
+    ) -> Vec<ContractKey> {
+        order_renewal_candidates(
+            candidates,
+            |key| self.is_subscription_provisional(key),
+            (batch_limit / 2).max(1),
+        )
     }
 
     /// Spawn ONE renewal / re-root subscribe task for `contract_key` and return
@@ -8295,69 +8307,134 @@ mod k_closest_source_tests {
         );
     }
 
+    use freenet_stdlib::prelude::ContractKey;
+
+    fn renewal_key(i: u8) -> ContractKey {
+        use freenet_stdlib::prelude::{CodeHash, ContractInstanceId};
+        ContractKey::from_id_and_code(ContractInstanceId::new([i; 32]), CodeHash::new([1; 32]))
+    }
+
     /// #2524 fairness: with more due leases than one tick's batch, provisional
-    /// leases take at most half of the batch from the front, ordinary ones
+    /// leases take at most half of the batch's front positions, ordinary ones
     /// fill the rest, and leftover provisional ones come last. With too few
-    /// ordinary candidates the provisional ones use the free slots.
+    /// ordinary candidates the provisional ones use the free positions.
     #[test]
     fn renewal_order_caps_provisional_leases_at_half_the_batch() {
-        use freenet_stdlib::prelude::{CodeHash, ContractInstanceId, ContractKey};
-        let key = |i: u8| {
-            ContractKey::from_id_and_code(ContractInstanceId::new([i; 32]), CodeHash::new([1; 32]))
-        };
-        let provisional = |k: &ContractKey| k.id().as_bytes()[0] >= 100;
         use super::{Ring, order_renewal_candidates};
         let batch = Ring::MAX_RECOVERY_ATTEMPTS_PER_INTERVAL;
+        assert!(
+            (4..100).contains(&batch),
+            "test sizes assume a 4..100 batch"
+        );
         let slots = (batch / 2).max(1);
-
-        // 12 provisional and 8 ordinary, interleaved as a shuffle leaves them.
-        let mixed: Vec<ContractKey> = (0..20u8)
-            .map(|i| if i % 5 < 3 { key(100 + i) } else { key(i) })
+        // More provisional than a whole batch, and enough ordinary to fill
+        // the rest of it, interleaved as a shuffle leaves them.
+        let (n_provisional, n_ordinary) = (batch + 2, batch - 2);
+        let provisional = |k: &ContractKey| k.id().as_bytes()[0] >= 100;
+        let (mut p, mut o) = (100u8..(100 + n_provisional as u8), 0u8..(n_ordinary as u8));
+        let mixed: Vec<ContractKey> = (0..n_provisional + n_ordinary)
+            .filter_map(|i| {
+                if i % 2 == 0 {
+                    p.next().or_else(|| o.next())
+                } else {
+                    o.next().or_else(|| p.next())
+                }
+            })
+            .map(renewal_key)
             .collect();
-        assert_eq!(mixed.iter().filter(|k| provisional(k)).count(), 12);
+        assert_eq!(
+            mixed.iter().filter(|k| provisional(k)).count(),
+            n_provisional
+        );
+
         let ordered = order_renewal_candidates(mixed.clone(), provisional, slots);
         assert_eq!(ordered.len(), mixed.len());
-        let front = &ordered[..batch];
-        assert_eq!(front.iter().filter(|k| provisional(k)).count(), slots);
+        assert_eq!(
+            ordered[..batch].iter().filter(|k| provisional(k)).count(),
+            slots,
+            "provisional leases take exactly half of the batch"
+        );
         assert!(
             ordered[..slots].iter().all(provisional),
             "provisional first"
         );
         assert!(
-            ordered[slots + 8..].iter().all(provisional),
-            "leftovers last"
+            ordered[slots + n_ordinary..].iter().all(provisional),
+            "leftover provisional leases last"
         );
-        let order_in = |keys: &[ContractKey], ordinary: bool| -> Vec<ContractKey> {
+        let group = |keys: &[ContractKey], want_provisional: bool| -> Vec<ContractKey> {
             keys.iter()
-                .filter(|k| provisional(k) != ordinary)
+                .filter(|k| provisional(k) == want_provisional)
                 .copied()
                 .collect()
         };
-        assert_eq!(order_in(&ordered, true), order_in(&mixed, true));
-        assert_eq!(order_in(&ordered, false), order_in(&mixed, false));
+        assert_eq!(group(&ordered, true), group(&mixed, true));
+        assert_eq!(group(&ordered, false), group(&mixed, false));
 
         // Only provisional leases due: they use the whole batch.
-        let only: Vec<ContractKey> = (100..115u8).map(key).collect();
+        let only: Vec<ContractKey> = (100..(100 + n_provisional as u8))
+            .map(renewal_key)
+            .collect();
         assert_eq!(
             order_renewal_candidates(only.clone(), provisional, slots),
             only
         );
     }
 
-    /// Source pin for the fairness cap above: the renewal loop orders its
-    /// candidates with `order_renewal_candidates`, capped at half the batch,
-    /// before it spends the batch.
+    /// The loop's ordering (`Ring::order_renewal_batch`) on a real ring: the
+    /// provisional predicate is the lease's mark and the cap is half the batch.
+    /// Candidates arrive ordinary-first, so without the provisional priority
+    /// the batch's front would hold too few provisional leases, and without
+    /// the cap too many.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn renewal_batch_order_prioritises_marked_leases_up_to_half() {
+        let (op_manager, _rx, _peers, _guards) =
+            crate::operations::route_attempt::driver_test_support::op_manager_with_peers(
+                "renewal-batch-order",
+                1,
+            )
+            .await;
+        let ring = &op_manager.ring;
+        let batch = super::Ring::MAX_RECOVERY_ATTEMPTS_PER_INTERVAL;
+        let slots = (batch / 2).max(1);
+        let (n_provisional, n_ordinary) = (batch + 2, batch - 2);
+        let ordinary: Vec<ContractKey> = (0..n_ordinary as u8).map(renewal_key).collect();
+        let provisional: Vec<ContractKey> = (100..(100 + n_provisional as u8))
+            .map(renewal_key)
+            .collect();
+        for key in ordinary.iter().chain(&provisional) {
+            ring.subscribe(*key);
+        }
+        for key in &provisional {
+            ring.set_subscription_provisional(key, true);
+        }
+        let candidates: Vec<ContractKey> = ordinary.iter().chain(&provisional).copied().collect();
+
+        let ordered = ring.order_renewal_batch(candidates, batch);
+        let front_provisional = ordered[..batch]
+            .iter()
+            .filter(|k| provisional.contains(k))
+            .count();
+        assert_eq!(
+            front_provisional, slots,
+            "half of the batch goes to marked leases: {ordered:?}"
+        );
+        assert_eq!(&ordered[..slots], &provisional[..slots]);
+    }
+
+    /// Source pin: the renewal loop orders its candidates with
+    /// `Ring::order_renewal_batch` (behaviour tested above) before it spends
+    /// the batch. Comments are stripped so a commented-out call fails.
     #[test]
     fn renewal_loop_orders_candidates_with_the_provisional_cap() {
         let src = production_source();
-        let loop_body = extract_fn_body(src, "async fn recover_orphaned_subscriptions(");
+        let loop_body = crate::contract::source_pin_util::strip_comments(extract_fn_body(
+            src,
+            "async fn recover_orphaned_subscriptions(",
+        ));
         let order = loop_body
-            .find("order_renewal_candidates(")
-            .expect("the renewal loop must order candidates with order_renewal_candidates");
-        assert!(
-            loop_body[order..].contains("(batch_limit / 2).max(1)"),
-            "provisional leases are capped at half of the tick's batch"
-        );
+            .find("ring.order_renewal_batch(contracts_needing_renewal, batch_limit)")
+            .expect("the renewal loop must order its candidates with order_renewal_batch");
         let spend = loop_body
             .find("for contract in contracts_needing_renewal")
             .expect("the loop spends the ordered candidates");
