@@ -699,6 +699,49 @@ pub async fn get_contract_state(
         .map_err(|e| anyhow::anyhow!("Failed to get contract state: {}", e))
 }
 
+/// Polls `client`'s view of the contract until its state contains
+/// `expected_name`, failing once `timeout` elapses.
+///
+/// Use this instead of a fixed sleep followed by a one-shot assert when
+/// waiting for an update to propagate: under CI load propagation time varies,
+/// and a fixed sleep either wastes time or fails a correct run (#4910).
+///
+/// The timeout still fails loudly, reporting the keys last observed, so a
+/// genuine propagation failure is not masked. If `client` holds a
+/// subscription to the contract, its node serves these GETs from its local
+/// copy rather than fetching from the network, so success means the update
+/// reached that node.
+pub async fn wait_for_ping_entry(
+    client: &mut WebApi,
+    key: ContractKey,
+    expected_name: &str,
+    timeout: Duration,
+) -> Result<Ping> {
+    const POLL_INTERVAL: Duration = Duration::from_secs(1);
+    let start = tokio::time::Instant::now();
+    let mut polls = 0u32;
+    loop {
+        let state = get_contract_state(client, key, false).await?;
+        polls += 1;
+        if state.contains_key(expected_name) {
+            tracing::info!(
+                elapsed = ?start.elapsed(),
+                polls,
+                "observed expected ping entry '{expected_name}'"
+            );
+            return Ok(state);
+        }
+        if start.elapsed() >= timeout {
+            anyhow::bail!(
+                "ping entry '{expected_name}' not observed within {timeout:?} \
+                 ({polls} polls); last observed keys: {:?}",
+                state.keys().collect::<Vec<_>>()
+            );
+        }
+        sleep(POLL_INTERVAL).await;
+    }
+}
+
 pub async fn update_contract_state(
     client: &mut WebApi,
     key: ContractKey,

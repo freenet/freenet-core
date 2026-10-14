@@ -8,10 +8,10 @@
 
 mod common;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use common::{
     APP_TAG, PACKAGE_DIR, PATH_TO_CONTRACT, connect_ws_with_retry, get_contract_state,
-    load_contract, subscribe_to_contract, update_contract_state,
+    load_contract, subscribe_to_contract, update_contract_state, wait_for_ping_entry,
 };
 use freenet_ping_app::ping_client::wait_for_put_response;
 use freenet_ping_types::{Ping, PingContractOptions};
@@ -21,6 +21,11 @@ use freenet_stdlib::{
 };
 use freenet_test_network::{FreenetBinary, NetworkBuilder, TestNetwork};
 use std::{path::PathBuf, time::Duration};
+
+/// How long the subscribed peer may take to observe the gateway's update.
+/// Generous because Docker NAT on a loaded CI runner is slow; a healthy run
+/// usually observes it within seconds.
+const UPDATE_PROPAGATION_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Test contract operations (PUT -> SUBSCRIBE -> UPDATE -> GET) across a
 /// Docker NAT network with 1 gateway and 3 peers.
@@ -122,17 +127,17 @@ async fn test_contract_operations_via_docker_nat() -> Result<()> {
     update_contract_state(&mut gw_client, contract_key, update).await?;
     tracing::info!("State update sent from gateway");
 
-    // Allow update propagation
-    tokio::time::sleep(Duration::from_secs(10)).await;
-
     // --- Verify peer received the update ---
-    let peer_state = get_contract_state(&mut peer_client, contract_key, false).await?;
-    assert!(
-        peer_state.contains_key("nat-test-node"),
-        "Peer should have received the 'nat-test-node' key via subscription. \
-         Got keys: {:?}",
-        peer_state.keys().collect::<Vec<_>>()
-    );
+    // Poll rather than sleep-then-assert: propagation time varies under CI
+    // load (#4910). The deadline still fails the test if delivery is broken.
+    wait_for_ping_entry(
+        &mut peer_client,
+        contract_key,
+        "nat-test-node",
+        UPDATE_PROPAGATION_TIMEOUT,
+    )
+    .await
+    .context("Peer should have received the 'nat-test-node' key via subscription.")?;
 
     tracing::info!("Docker NAT contract operations test passed");
     Ok(())
