@@ -29,6 +29,12 @@ impl P2pConnManager {
             )
         };
         let pub_key_to_remove = entry.pub_key.clone();
+        sim_instrument! {
+            crate::ring::join_timeline::record_note(
+                &self.bridge.op_manager.ring.connection_manager.pub_key,
+                || ("transport: dropped on request".to_string(), Some(peer_addr)),
+            );
+        }
 
         tracing::trace!(
             peer_addr = %peer_addr,
@@ -139,6 +145,17 @@ impl P2pConnManager {
             )
         };
         let pub_key_to_remove = entry.pub_key.clone();
+        sim_instrument! {
+            crate::ring::join_timeline::record_note(
+                &self.bridge.op_manager.ring.connection_manager.pub_key,
+                || {
+                    (
+                        "transport: dropped by zombie sweep".to_string(),
+                        Some(peer_addr),
+                    )
+                },
+            );
+        }
 
         // Non-blocking send to handshake driver to avoid deadlock (#3519).
         // For zombie transports (already established connections), the expected_inbound
@@ -487,6 +504,20 @@ impl P2pConnManager {
                 phase = "connect",
                 "Skipping connection attempt - peer in backoff"
             );
+            sim_instrument! {
+                crate::ring::join_timeline::record_note(
+                    &self.bridge.op_manager.ring.connection_manager.pub_key,
+                    || {
+                        (
+                            format!(
+                                "connect_peer tx={tx}: skipped, peer in backoff ({}s left)",
+                                remaining.as_secs()
+                            ),
+                            Some(peer_addr),
+                        )
+                    },
+                );
+            }
             callback
                 .send_result(Err(()))
                 .await
@@ -555,6 +586,17 @@ impl P2pConnManager {
                     transient,
                     "connect_peer: connection already pending, queued callback"
                 );
+                sim_instrument! {
+                    crate::ring::join_timeline::record_note(
+                        &self.bridge.op_manager.ring.connection_manager.pub_key,
+                        || {
+                            (
+                                format!("connect_peer tx={tx}: queued behind a pending handshake"),
+                                Some(peer_addr),
+                            )
+                        },
+                    );
+                }
                 return Ok(());
             }
             std::collections::hash_map::Entry::Vacant(entry) => {
@@ -772,6 +814,19 @@ impl P2pConnManager {
                     ?error,
                     "Outbound connection failed"
                 );
+                sim_instrument! {
+                    crate::ring::join_timeline::record_note(
+                        &self.bridge.op_manager.ring.connection_manager.pub_key,
+                        || {
+                            (
+                                format!(
+                                    "handshake: outbound failed tx={transaction} transient={transient}: {error}; peer backoff recorded"
+                                ),
+                                Some(peer_addr),
+                            )
+                        },
+                    );
+                }
 
                 self.bridge
                     .op_manager

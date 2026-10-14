@@ -1717,6 +1717,31 @@ impl P2pConnManager {
 
                             // Look up the connection using the explicit target address
                             let peer_connection = ctx.connections.get(&target_addr);
+                            #[cfg(any(test, feature = "testing"))]
+                            let is_connect_msg =
+                                matches!(&msg, NetMessage::V1(NetMessageV1::Connect(_)));
+                            sim_instrument! {
+                                if is_connect_msg {
+                                    crate::ring::join_timeline::record_note(
+                                        &ctx.bridge.op_manager.ring.connection_manager.pub_key,
+                                        || {
+                                            (
+                                                format!(
+                                                    "send {} tx={}: {}",
+                                                    msg,
+                                                    msg.id(),
+                                                    if peer_connection.is_some() {
+                                                        "existing transport"
+                                                    } else {
+                                                        "no transport"
+                                                    }
+                                                ),
+                                                Some(target_addr),
+                                            )
+                                        },
+                                    );
+                                }
+                            }
 
                             match peer_connection {
                                 Some(peer_connection) => {
@@ -1760,6 +1785,26 @@ impl P2pConnManager {
                                             );
                                         }
                                         Ok(Err(_closed)) => {
+                                            sim_instrument! {
+                                                if is_connect_msg {
+                                                    crate::ring::join_timeline::record_note(
+                                                        &ctx.bridge
+                                                            .op_manager
+                                                            .ring
+                                                            .connection_manager
+                                                            .pub_key,
+                                                        || {
+                                                            (
+                                                                format!(
+                                                                    "send tx={}: peer connection channel closed, dropped",
+                                                                    msg.id()
+                                                                ),
+                                                                Some(target_addr),
+                                                            )
+                                                        },
+                                                    );
+                                                }
+                                            }
                                             tracing::error!(
                                                 tx = %msg.id(),
                                                 peer_addr = %target_addr,
@@ -1769,6 +1814,26 @@ impl P2pConnManager {
                                             );
                                         }
                                         Err(_timeout) => {
+                                            sim_instrument! {
+                                                if is_connect_msg {
+                                                    crate::ring::join_timeline::record_note(
+                                                        &ctx.bridge
+                                                            .op_manager
+                                                            .ring
+                                                            .connection_manager
+                                                            .pub_key,
+                                                        || {
+                                                            (
+                                                                format!(
+                                                                    "send tx={}: outbound channel full, dropped",
+                                                                    msg.id()
+                                                                ),
+                                                                Some(target_addr),
+                                                            )
+                                                        },
+                                                    );
+                                                }
+                                            }
                                             tracing::warn!(
                                                 tx = %msg.id(),
                                                 peer_addr = %target_addr,
@@ -1810,6 +1875,21 @@ impl P2pConnManager {
                                             .cloned()
                                     });
 
+                                    sim_instrument! {
+                                        if target_peer.is_none() && is_connect_msg {
+                                            crate::ring::join_timeline::record_note(
+                                                &ctx.bridge.op_manager.ring.connection_manager.pub_key,
+                                                || {
+                                                    (
+                                                        format!(
+                                                            "send tx={tx}: no transport and no peer info, dropped"
+                                                        ),
+                                                        Some(target_addr),
+                                                    )
+                                                },
+                                            );
+                                        }
+                                    }
                                     let Some(target_peer) = target_peer else {
                                         // Can't establish connection without peer info.
                                         // This happens when the connection was dropped before we could
@@ -1907,10 +1987,33 @@ impl P2pConnManager {
 
                                     // Spawn a task to wait for connection and then send the message
                                     let target_peer_for_resend = target_peer.clone();
+                                    #[cfg(any(test, feature = "testing"))]
+                                    let me = ctx
+                                        .bridge
+                                        .op_manager
+                                        .ring
+                                        .connection_manager
+                                        .pub_key
+                                        .clone();
                                     GlobalExecutor::spawn(async move {
+                                        #[cfg(any(test, feature = "testing"))]
+                                        let waited = tokio::time::Instant::now();
                                         match timeout(Duration::from_secs(20), result.recv()).await
                                         {
                                             Ok(Some(Ok((connected_addr, _)))) => {
+                                                sim_instrument! {
+                                                    if is_connect_msg {
+                                                        crate::ring::join_timeline::record_note(&me, || {
+                                                            (
+                                                                format!(
+                                                                    "send tx={tx}: connected, resending after {}ms",
+                                                                    waited.elapsed().as_millis()
+                                                                ),
+                                                                Some(target_addr),
+                                                            )
+                                                        });
+                                                    }
+                                                }
                                                 tracing::debug!(
                                                     tx = %tx,
                                                     peer_addr = %connected_addr,
@@ -1941,6 +2044,19 @@ impl P2pConnManager {
                                                 }
                                             }
                                             Ok(Some(Err(e))) => {
+                                                sim_instrument! {
+                                                    if is_connect_msg {
+                                                        crate::ring::join_timeline::record_note(&me, || {
+                                                            (
+                                                                format!(
+                                                                    "send tx={tx}: dial FAILED, message dropped after {}ms",
+                                                                    waited.elapsed().as_millis()
+                                                                ),
+                                                                Some(target_addr),
+                                                            )
+                                                        });
+                                                    }
+                                                }
                                                 tracing::debug!(
                                                     tx = %tx,
                                                     peer_addr = %target_addr,
@@ -1950,6 +2066,19 @@ impl P2pConnManager {
                                                 );
                                             }
                                             Ok(None) => {
+                                                sim_instrument! {
+                                                    if is_connect_msg {
+                                                        crate::ring::join_timeline::record_note(&me, || {
+                                                            (
+                                                                format!(
+                                                                    "send tx={tx}: callback closed, message dropped after {}ms",
+                                                                    waited.elapsed().as_millis()
+                                                                ),
+                                                                Some(target_addr),
+                                                            )
+                                                        });
+                                                    }
+                                                }
                                                 tracing::error!(
                                                     tx = %tx,
                                                     peer_addr = %target_addr,
@@ -1958,6 +2087,19 @@ impl P2pConnManager {
                                                 );
                                             }
                                             Err(_) => {
+                                                sim_instrument! {
+                                                    if is_connect_msg {
+                                                        crate::ring::join_timeline::record_note(&me, || {
+                                                            (
+                                                                format!(
+                                                                    "send tx={tx}: dial timed out (20s), message dropped after {}ms",
+                                                                    waited.elapsed().as_millis()
+                                                                ),
+                                                                Some(target_addr),
+                                                            )
+                                                        });
+                                                    }
+                                                }
                                                 tracing::error!(
                                                     tx = %tx,
                                                     peer_addr = %target_addr,
@@ -1975,6 +2117,12 @@ impl P2pConnManager {
                             error,
                             connection_id,
                         } => {
+                            sim_instrument! {
+                                crate::ring::join_timeline::record_note(
+                                    &ctx.bridge.op_manager.ring.connection_manager.pub_key,
+                                    || (format!("transport: closed ({error})"), Some(remote_addr)),
+                                );
+                            }
                             tracing::debug!(
                                 peer_addr = %remote_addr,
                                 error = ?error,
