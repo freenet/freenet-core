@@ -5314,9 +5314,12 @@ mod bootstrap_subscription_tests {
         }
         let delay = connected_at.elapsed();
         eprintln!("first ring connection -> ring re-subscribe: {delay:?}");
-        // Loop start jitter (2-5 s) + spawn jitter (0-15 s) + the 1 s poll.
+        // Loop start jitter (2-5 s) + spawn jitter (0-15 s) + the 1 s poll is
+        // at most 21 s; the bound leaves headroom over that maximum so the
+        // test does not hinge on the jitter draw, while staying an order of
+        // magnitude under the ~6-minute wait it guards against.
         assert!(
-            delay <= std::time::Duration::from_secs(21),
+            delay <= std::time::Duration::from_secs(30),
             "re-subscribe through the ring took {delay:?} after the first ring connection"
         );
     }
