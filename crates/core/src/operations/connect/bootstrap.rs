@@ -318,6 +318,14 @@ impl BootstrapPacer {
         true
     }
 
+    /// The redial [`Self::gateway_silent`] asked for could not be sent:
+    /// forget it, and leave the link one silent join short of the next.
+    pub(crate) fn redial_not_sent(&mut self, gateway: SocketAddr) {
+        let liveness = self.liveness(gateway);
+        liveness.redialled = None;
+        liveness.silent = SILENT_ROUNDS_BEFORE_REDIAL.saturating_sub(1);
+    }
+
     /// The gateway backoff was cleared (isolation recovery, suspend). If no
     /// round has started for [`BOOTSTRAP_RETRY_CAP_FLOOR`], the wait may have
     /// been set long ago (before a suspend, say): the next round may start
@@ -655,6 +663,20 @@ mod tests {
             "joins sent before the redial said nothing about the new link"
         );
         assert!(pacer.gateway_silent(gw, at(later + 5), at(later + 20)));
+    }
+
+    #[test]
+    fn a_redial_that_was_not_sent_is_retried_by_the_next_silent_join() {
+        let mut pacer = BootstrapPacer::new(Duration::from_secs(30));
+        let gw: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let t0 = Instant::now();
+        let at = |s: u64| t0 + Duration::from_secs(s);
+        redialled_at_20(&mut pacer, gw, at);
+        pacer.redial_not_sent(gw);
+        assert!(
+            pacer.gateway_silent(gw, at(10), at(25)),
+            "the next silent join redials at once, not after the interval"
+        );
     }
 
     #[test]

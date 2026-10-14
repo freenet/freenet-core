@@ -314,9 +314,16 @@ pub(crate) async fn start_client_connect_counted(
 /// Waits (bounded) for the event loop to handle the drop. The next round's
 /// CONNECT goes out on the op-execution channel, which the event loop can
 /// otherwise serve first, sending it over the link about to be dropped.
-async fn drop_dead_gateway_link(op_manager: &OpManager, tx: Transaction, gateway_addr: SocketAddr) {
+///
+/// Returns false if the drop could not be queued, so the caller can undo the
+/// redial it recorded.
+async fn drop_dead_gateway_link(
+    op_manager: &OpManager,
+    tx: Transaction,
+    gateway_addr: SocketAddr,
+) -> bool {
     if op_manager.ring.connection_manager.is_in_ring(gateway_addr) {
-        return;
+        return true;
     }
     tracing::info!(
         %tx,
@@ -334,7 +341,7 @@ async fn drop_dead_gateway_link(op_manager: &OpManager, tx: Transaction, gateway
             error = %e,
             "connect driver: could not queue drop of a dead gateway link; next round reuses it"
         );
-        return;
+        return false;
     }
     if tokio::time::timeout(STALE_LINK_DROP_WAIT, dropped.recv())
         .await
@@ -346,6 +353,7 @@ async fn drop_dead_gateway_link(op_manager: &OpManager, tx: Transaction, gateway
             "connect driver: dead gateway link drop not confirmed in time; continuing"
         );
     }
+    true
 }
 
 /// Bound on waiting for the event loop to drop a dead gateway link.
@@ -448,8 +456,14 @@ async fn drive_client_connect(
                 started,
                 Instant::now(),
             );
-            if redial {
-                drop_dead_gateway_link(op_manager, tx, gateway_addr).await;
+            if redial && !drop_dead_gateway_link(op_manager, tx, gateway_addr).await {
+                // Not dropped: let the next silent join try again rather
+                // than wait out the redial interval for a redial that never
+                // happened.
+                op_manager
+                    .bootstrap_pacer
+                    .lock()
+                    .redial_not_sent(gateway_addr);
             }
         }
         if let Some((end, since)) = collection_end {
@@ -2724,6 +2738,32 @@ mod driver_timing_tests {
     async fn a_join_through_a_non_gateway_never_counts_toward_a_redial() {
         let (first, second) = two_joins("driver-liveness-cached", 24884, false, |_| None).await;
         assert_eq!((first, second), (false, false));
+    }
+
+    /// If the drop of a dead link cannot be queued (the event loop's channel
+    /// is gone or full), the recorded redial is undone (Codex re-review P2):
+    /// otherwise the link would wait out MIN_REDIAL_INTERVAL for a redial that
+    /// never happened.
+    #[tokio::test(start_paused = true)]
+    async fn a_redial_that_could_not_be_queued_is_undone() {
+        let (op_manager, events, op_execution) =
+            unaddressed_op_manager("driver-redial-unsent").await;
+        // The event loop is gone: every notification fails to queue.
+        drop(events);
+        let gateway = peer(24867);
+        let gateway_addr = gateway.socket_addr().unwrap();
+        let script = scripted_gateway(op_execution, |_| None);
+        connect_once(&op_manager, &gateway, ClientConnectKind::Standard).await;
+        connect_once(&op_manager, &gateway, ClientConnectKind::Standard).await;
+        let now = Instant::now();
+        assert!(
+            op_manager
+                .bootstrap_pacer
+                .lock()
+                .gateway_silent(gateway_addr, now, now),
+            "the next silent join must ask for the redial again"
+        );
+        script.abort();
     }
 
     /// A peer that knows its address gets no `ObservedAddress`, so silence
