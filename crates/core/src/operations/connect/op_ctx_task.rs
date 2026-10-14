@@ -371,6 +371,9 @@ async fn drive_client_connect_inner(
     // queued acceptor still gets its ConnectPeer, and a successful one is not
     // counted against the gateway.
     let mut collection_end: Option<(CollectionEnd, Instant)> = None;
+    // Acceptors connected when a Rejected arrived: only a dial still in flight
+    // then can spare the gateway its backoff.
+    let mut connected_at_reject: usize = 0;
     // While bootstrapping, acceptors are dialled concurrently (bounded), so
     // one unreachable acceptor cannot hold the next one past its hole-punch
     // window (#5858). A peer that already has a connection keeps dialling
@@ -412,9 +415,12 @@ async fn drive_client_connect_inner(
         }
         if let Some((end, since)) = collection_end {
             if !dial_queue.busy() || Instant::now() >= since + DIAL_DRAIN_LIMIT {
-                if end == CollectionEnd::Rejected && connected_dials == 0 {
-                    // Gateway rotation backoff (2c), unless a dial of this
-                    // CONNECT connected after all.
+                // Gateway rotation backoff (2c). A peer with a connection is
+                // always rotated, as before #5858; a bootstrapping one is
+                // spared only if a dial still in flight at the Rejected
+                // connected.
+                let spared = bootstrapping && connected_dials > connected_at_reject;
+                if end == CollectionEnd::Rejected && !spared {
                     op_manager
                         .gateway_backoff
                         .lock()
@@ -759,6 +765,7 @@ async fn drive_client_connect_inner(
                 // saturated neighborhood (2c). Recorded once the dials already
                 // started have finished (top of the loop), and only if none of
                 // them connected.
+                connected_at_reject = connected_dials;
                 collection_end = Some((CollectionEnd::Rejected, Instant::now()));
                 continue;
             }
@@ -2928,7 +2935,18 @@ mod driver_timing_tests {
         id: &str,
         acceptor_reachable: bool,
     ) -> (ClientConnectEnd, Vec<SocketAddr>, bool) {
+        rejected_mid_dial_as(id, acceptor_reachable, false).await
+    }
+
+    async fn rejected_mid_dial_as(
+        id: &str,
+        acceptor_reachable: bool,
+        connected_peer: bool,
+    ) -> (ClientConnectEnd, Vec<SocketAddr>, bool) {
         let (op_manager, events) = op_manager_with_events(id).await;
+        if connected_peer {
+            connect_existing_peer(&op_manager, 24895);
+        }
         let gateway = peer(24880);
         let gateway_addr = gateway.socket_addr().unwrap();
         let acceptor = peer(24881);
@@ -2983,6 +3001,20 @@ mod driver_timing_tests {
         assert!(
             !backed_off,
             "the CONNECT produced a connection: the gateway must not be backed off"
+        );
+    }
+
+    /// A peer that already has a connection is rotated off a rejecting
+    /// gateway whatever its dials do, as on main (rule 2c, review item 3).
+    #[tokio::test(start_paused = true)]
+    async fn a_connected_peer_is_always_rotated_off_a_rejecting_gateway() {
+        let (end, failed, backed_off) =
+            rejected_mid_dial_as("driver-reject-connected", true, true).await;
+        assert_eq!(end, ClientConnectEnd::Finished);
+        assert!(failed.is_empty());
+        assert!(
+            backed_off,
+            "a connected peer always backs off a rejecting gateway"
         );
     }
 
