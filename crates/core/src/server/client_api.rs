@@ -387,12 +387,14 @@ impl Config {
 /// reproduces the bug. `overriding` so no handler can leave a cacheable
 /// response behind it.
 ///
-/// `Router::layer` only wraps routes added BEFORE it, so callers pass the
-/// content routes in on their own and merge the result. The no-trailing-slash
-/// 308 stays outside: it carries no contract content and is meant to be
-/// cacheable (#4019).
+/// The layer only wraps routes added BEFORE it, so callers pass the content
+/// routes in on their own and merge the result. The no-trailing-slash 308 stays
+/// outside: it carries no contract content and is meant to be cacheable
+/// (#4019). `route_layer` rather than `layer` so the sub-router's default 404
+/// fallback is not wrapped: merged fallbacks replace one another, and a wrapped
+/// one could otherwise become the node-wide 404 depending on merge order.
 fn no_store<S: Clone + Send + Sync + 'static>(content_routes: Router<S>) -> Router<S> {
-    content_routes.layer(tower_http::set_header::SetResponseHeaderLayer::overriding(
+    content_routes.route_layer(tower_http::set_header::SetResponseHeaderLayer::overriding(
         axum::http::header::CACHE_CONTROL,
         axum::http::HeaderValue::from_static("no-store"),
     ))
@@ -2557,7 +2559,7 @@ mod tests {
     #[tokio::test]
     async fn contract_content_routes_are_served_no_store() {
         use axum::body::{Body, to_bytes};
-        use axum::http::{Request, StatusCode, header::CACHE_CONTROL};
+        use axum::http::{Method, Request, StatusCode, header::CACHE_CONTROL};
         use freenet_stdlib::client_api::{ClientRequest, ContractRequest, ContractResponse};
         use freenet_stdlib::prelude::{
             ContractCode, ContractContainer, ContractWasmAPIVersion, Parameters, WrappedContract,
@@ -2603,20 +2605,25 @@ mod tests {
         );
 
         // Stub node: assigns client ids and answers every GET with the bundle.
+        // A send to a handler that has already given up is ignored rather than
+        // panicking here: the panic would be swallowed with this task, and the
+        // handler's own request then fails with a clearer message.
         let node = tokio::spawn(async move {
             let mut clients = HashMap::new();
             while let Some(msg) = api.proxy_server_request.recv().await {
                 match msg {
                     ClientConnection::NewConnection { callbacks, .. } => {
                         let id = ClientId::next();
-                        callbacks
-                            .send(HostCallbackResult::NewId { id })
-                            .expect("handler awaits its client id");
-                        clients.insert(id, callbacks);
+                        if callbacks.send(HostCallbackResult::NewId { id }).is_ok() {
+                            clients.insert(id, callbacks);
+                        }
                     }
                     ClientConnection::Request { client_id, req, .. } => {
+                        let Some(callbacks) = clients.get(&client_id) else {
+                            continue;
+                        };
                         if let ClientRequest::ContractOp(ContractRequest::Get { .. }) = *req {
-                            clients[&client_id]
+                            let _sent = callbacks
                                 .send(HostCallbackResult::Result {
                                     id: client_id,
                                     result: Ok(HostResponse::ContractResponse(
@@ -2627,17 +2634,17 @@ mod tests {
                                         },
                                     )),
                                 })
-                                .expect("handler awaits its GetResponse");
+                                .is_ok();
                         }
                     }
                 }
             }
         });
 
-        let get = |uri: String, fetch_dest: Option<&'static str>| {
+        let request = |method: Method, uri: String, fetch_dest: Option<&'static str>| {
             let router = router.clone();
             async move {
-                let mut req = Request::builder().uri(&uri);
+                let mut req = Request::builder().method(method).uri(&uri);
                 if let Some(dest) = fetch_dest {
                     req = req.header("sec-fetch-dest", dest);
                 }
@@ -2649,6 +2656,12 @@ mod tests {
                 .unwrap_or_else(|_| panic!("{uri} hung"))
                 .unwrap()
             }
+        };
+        let get = |uri: String, fetch_dest| request(Method::GET, uri, fetch_dest);
+        let cache_control = |resp: &axum::response::Response| {
+            resp.headers()
+                .get(CACHE_CONTROL)
+                .map(|v| v.to_str().unwrap().to_string())
         };
 
         for prefix in ["v1", "v2"] {
@@ -2695,7 +2708,7 @@ mod tests {
             ] {
                 let resp = get(uri.clone(), fetch_dest).await;
                 let status = resp.status();
-                let cache_control = resp.headers().get(CACHE_CONTROL).cloned();
+                let header = cache_control(&resp);
                 let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
                 let body = String::from_utf8_lossy(&body);
                 assert_eq!(
@@ -2710,7 +2723,7 @@ mod tests {
                      (expected {expected_body:?}); got: {body}"
                 );
                 assert_eq!(
-                    cache_control.as_ref().and_then(|v| v.to_str().ok()),
+                    header.as_deref(),
                     Some("no-store"),
                     "{pipeline} ({uri}) must be `Cache-Control: no-store`, or a \
                      browser that has it open keeps running the old bundle after \
@@ -2718,17 +2731,84 @@ mod tests {
                 );
             }
 
+            // HEAD is served by the same `get` route, so it is covered too.
+            let resp = request(Method::HEAD, format!("{base}/style.css"), Some("style")).await;
+            assert_eq!(resp.status(), StatusCode::OK, "HEAD {base}/style.css");
+            assert_eq!(cache_control(&resp).as_deref(), Some("no-store"));
+
+            // A sandbox URL loaded as a top-level document is answered with a
+            // 303 to the shell. It sits inside the subtree, so it is no-store,
+            // which costs nothing: a 303 is not cacheable by default.
+            let resp = get(format!("{base}/?__sandbox=1"), Some("document")).await;
+            assert_eq!(resp.status(), StatusCode::SEE_OTHER, "{base}/?__sandbox=1");
+            assert_eq!(cache_control(&resp).as_deref(), Some("no-store"));
+
             // The redirect carries no contract content and was made a 308 so the
             // browser can cache it (#4019); the layer must not reach it.
             let resp = get(base.clone(), None).await;
             assert_eq!(resp.status(), StatusCode::PERMANENT_REDIRECT, "{base}");
             assert_eq!(
-                resp.headers().get(CACHE_CONTROL),
+                cache_control(&resp),
                 None,
                 "the no-trailing-slash redirect {base} must stay cacheable"
             );
         }
 
+        // Routes outside the contract subtree keep their own cache policy: the
+        // notification worker is deliberately cacheable, and the node's own
+        // pages and unmatched paths are out of scope (#4289).
+        let resp = get("/freenet-notify-sw.js".to_string(), None).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(cache_control(&resp).as_deref(), Some("max-age=3600"));
+        for uri in ["/v1/version", "/no-such-route"] {
+            let resp = get(uri.to_string(), None).await;
+            assert_eq!(
+                cache_control(&resp),
+                None,
+                "{uri} is outside the contract subtree and must not be no-store"
+            );
+        }
+
         node.abort();
+    }
+
+    /// `no_store` must replace a cacheable header a handler set, wrap only the
+    /// routes it was given, and leave the sub-router's 404 fallback alone (a
+    /// merged fallback can become the whole node's 404).
+    #[tokio::test]
+    async fn no_store_overrides_handler_headers_and_wraps_only_its_routes() {
+        use axum::http::{Request, StatusCode, header::CACHE_CONTROL};
+        use axum::routing::get;
+        use tower::ServiceExt;
+
+        let cacheable = || async { ([(CACHE_CONTROL, "max-age=3600")], "body") };
+        let router: Router = Router::new()
+            .merge(no_store(Router::new().route("/inside", get(cacheable))))
+            .route("/outside", get(cacheable));
+
+        for (uri, status, expected) in [
+            ("/inside", StatusCode::OK, Some("no-store")),
+            ("/outside", StatusCode::OK, Some("max-age=3600")),
+            ("/missing", StatusCode::NOT_FOUND, None),
+        ] {
+            let resp = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(uri)
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), status, "{uri}");
+            assert_eq!(
+                resp.headers()
+                    .get(CACHE_CONTROL)
+                    .map(|v| v.to_str().unwrap()),
+                expected,
+                "{uri}"
+            );
+        }
     }
 }
