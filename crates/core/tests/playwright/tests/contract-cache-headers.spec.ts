@@ -12,10 +12,10 @@ import { test, expect, type Response } from "@playwright/test";
 // `client_api/v1.rs` and `v2.rs`. The Rust router test
 // (`contract_content_routes_are_served_no_store` in `client_api.rs`) drives
 // every pipeline that emits contract bytes, including the JS rewrite branch and
-// `ServeFile`, which this fixture has no assets to reach. What it cannot see is
-// the node's full production composition and what an engine actually receives
-// for the documents it loads, including the sandboxed iframe, which is what
-// this spec checks.
+// `ServeFile`, which this fixture never reaches because it contains only HTML.
+// What it cannot see is the router as the harness node composes it, and what an
+// engine actually receives for the documents it loads, including the sandboxed
+// iframe. That is what this spec checks.
 
 const shellUrl = process.env.FREENET_SHELL_URL;
 
