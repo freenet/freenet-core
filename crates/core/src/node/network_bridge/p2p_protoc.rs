@@ -1895,6 +1895,33 @@ impl P2pConnManager {
                                              Sustained occurrences indicate fan-out / migration load \
                                              overwhelming the event loop."
                                         );
+                                        // A joiner's CONNECT request has no op
+                                        // retry: end its driver now, as the
+                                        // resend waiter does, rather than leave
+                                        // it holding a bootstrap round for its
+                                        // TTL (#5858). Handled inline: this IS
+                                        // the event loop, and the channel that
+                                        // would carry the notice is the full one.
+                                        if unsent_message_notice(
+                                            &msg,
+                                            tx,
+                                            target_addr,
+                                            &ctx.bridge.op_manager.ring.connection_manager.pub_key,
+                                        )
+                                        .is_some()
+                                        {
+                                            if let Some(sender) =
+                                                state.pending_op_results.remove(&tx)
+                                            {
+                                                #[allow(clippy::let_underscore_must_use)]
+                                                let _ = sender.try_send(
+                                                    WaiterReply::PeerDisconnected {
+                                                        peer: target_addr,
+                                                    },
+                                                );
+                                                crate::config::GlobalTestMetrics::record_pending_op_remove();
+                                            }
+                                        }
                                         continue;
                                     }
 
@@ -1907,8 +1934,12 @@ impl P2pConnManager {
 
                                     // Spawn a task to wait for connection and then send the message
                                     let target_peer_for_resend = target_peer.clone();
-                                    let unsent_notice =
-                                        unsent_message_notice(&msg_clone, tx, target_addr);
+                                    let unsent_notice = unsent_message_notice(
+                                        &msg_clone,
+                                        tx,
+                                        target_addr,
+                                        &ctx.bridge.op_manager.ring.connection_manager.pub_key,
+                                    );
                                     GlobalExecutor::spawn(async move {
                                         let resent = match timeout(
                                             Duration::from_secs(20),
@@ -2983,23 +3014,26 @@ impl ConnectResultSender for mpsc::Sender<Result<(SocketAddr, Option<usize>), ()
 }
 
 /// What to tell the event loop when `msg`, waiting for a connection to
-/// `target_addr`, was dropped because the connection failed. Only a joiner's
-/// CONNECT request is reported (#5858): its transaction has nothing in
-/// flight, so ending its driver at once (as for a peer pruned mid-flight)
-/// frees the bootstrap round instead of holding it for the transaction TTL.
-/// Other messages keep their ops' own retry handling.
+/// `target_addr`, was dropped because the connection failed. Only this
+/// node's own CONNECT request as a joiner (`own`) is reported (#5858): its
+/// transaction has nothing in flight, so ending its driver at once (as for a
+/// peer pruned mid-flight) frees the bootstrap round instead of holding it
+/// for the transaction TTL. A relayed request and every other message keep
+/// their ops' own retry handling.
 fn unsent_message_notice(
     msg: &NetMessage,
     tx: Transaction,
     target_addr: SocketAddr,
+    own: &TransportPublicKey,
 ) -> Option<NodeEvent> {
-    matches!(
-        msg,
-        NetMessage::V1(NetMessageV1::Connect(
-            crate::operations::connect::ConnectMsg::Request { .. }
-        ))
-    )
-    .then_some(NodeEvent::TransactionOrphaned {
+    let NetMessage::V1(NetMessageV1::Connect(crate::operations::connect::ConnectMsg::Request {
+        payload,
+        ..
+    })) = msg
+    else {
+        return None;
+    };
+    (payload.joiner.pub_key() == own).then_some(NodeEvent::TransactionOrphaned {
         tx,
         peer: target_addr,
     })
@@ -3689,9 +3723,9 @@ pub(crate) mod tests {
     use tokio::sync::mpsc;
     use tokio::time::{Duration, Instant, sleep, timeout};
 
-    /// Only a joiner's CONNECT request is ended at once when its target could
-    /// not be connected (#5858); every other message keeps its op's own retry
-    /// handling.
+    /// Only this node's own CONNECT request as a joiner is ended at once
+    /// when its target could not be connected (#5858); a relayed request and
+    /// every other message keep their ops' own retry handling.
     #[test]
     fn only_an_unsent_connect_request_is_ended_at_once() {
         use crate::message::{NetMessage, NetMessageV1, NodeEvent, Transaction};
@@ -3705,36 +3739,41 @@ pub(crate) mod tests {
                 std::net::SocketAddr::from(([127, 0, 0, 1], port)),
             )
         };
+        let (me, other) = (peer(1), peer(4));
         let gateway = std::net::SocketAddr::from(([127, 0, 0, 1], 2));
         let tx = Transaction::new::<ConnectMsg>();
-        let request = prepare_join_request(tx, &peer(1), &peer(2), Location::new(0.5), 10, &[]);
-        match super::unsent_message_notice(
-            &NetMessage::V1(NetMessageV1::Connect(request)),
-            tx,
-            gateway,
-        ) {
+        let own_request = prepare_join_request(tx, &me, &peer(2), Location::new(0.5), 10, &[]);
+        let notice = |msg: ConnectMsg| {
+            super::unsent_message_notice(
+                &NetMessage::V1(NetMessageV1::Connect(msg)),
+                tx,
+                gateway,
+                me.pub_key(),
+            )
+        };
+        match notice(own_request) {
             Some(NodeEvent::TransactionOrphaned { tx: t, peer }) => {
                 assert_eq!((t, peer), (tx, gateway));
             }
             other => panic!("an unsent CONNECT request must end its driver, got {other:?}"),
         }
+        let relayed = prepare_join_request(tx, &other, &peer(2), Location::new(0.5), 10, &[]);
+        assert!(
+            notice(relayed).is_none(),
+            "a relayed request is not ours to end"
+        );
         let observed = ConnectMsg::ObservedAddress {
             id: tx,
             address: std::net::SocketAddr::from(([127, 0, 0, 1], 3)),
         };
-        assert!(
-            super::unsent_message_notice(
-                &NetMessage::V1(NetMessageV1::Connect(observed)),
-                tx,
-                gateway
-            )
-            .is_none()
-        );
+        assert!(notice(observed).is_none());
     }
 
-    /// The resend waiter reports an unsent CONNECT only when it did not
-    /// resend it (#5858). Source pin: the waiter runs inside the event loop,
-    /// which has no harness here.
+    /// Both places that drop a message waiting for a connection report an
+    /// unsent CONNECT (#5858): the resend waiter, only when it did not resend
+    /// it, and the full/closed ConnectPeer dispatch (re-review N3), inline
+    /// since that channel is the full one. Source pin: both run inside the
+    /// event loop, which has no harness here.
     #[test]
     fn the_resend_waiter_reports_only_a_message_it_did_not_send() {
         const SOURCE: &str = include_str!("p2p_protoc.rs");
@@ -3742,8 +3781,11 @@ pub(crate) mod tests {
             .find("\n#[cfg(test)]\npub(crate) mod tests")
             .expect("tests")];
         let code: String = prod.split_whitespace().collect();
+        let own = "&ctx.bridge.op_manager.ring.connection_manager.pub_key,";
         let notice = code
-            .find("letunsent_notice=unsent_message_notice(&msg_clone,tx,target_addr);")
+            .find(&format!(
+                "letunsent_notice=unsent_message_notice(&msg_clone,tx,target_addr,{own});"
+            ))
             .expect("the waiter must work out the notice before msg_clone is moved");
         let sent = code[notice..]
             .find("iflet(false,Some(notice))=(resent,unsent_notice){bridge_sender.send(P2pBridgeEvent::NodeAction(notice))")
@@ -3752,6 +3794,16 @@ pub(crate) mod tests {
             .find("\"Failedtoreschedulemessageafterconnectionestablished\");}true}")
             .expect("a resent message must count as sent");
         assert!(resent_ok < sent);
+        let dropped = code
+            .find("overwhelmingtheeventloop.\");")
+            .expect("the ConnectPeer full/closed branch");
+        let inline = code[dropped..]
+            .find(&format!(
+                "ifunsent_message_notice(&msg,tx,target_addr,{own}).is_some(){{ifletSome(sender)=state.pending_op_results.remove(&tx){{"
+            ))
+            .expect("the full/closed branch must end an unsent CONNECT's driver");
+        let cont = code[dropped..].find("continue;").expect("the branch ends");
+        assert!(inline < cont, "before the branch moves on");
     }
 
     /// A fake [`super::ContractPresenceOracle`] for testing
