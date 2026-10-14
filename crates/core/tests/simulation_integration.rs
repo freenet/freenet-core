@@ -8424,14 +8424,19 @@ fn test_connect_despite_nat_partition() {
 /// Regression test for #5654: the gateway's zombie-transport sweep must not
 /// collect a link that a peer which cannot join the ring is still using.
 ///
-/// **The bug.** With this seed, one node's every CONNECT is rejected (a
-/// saturated neighbourhood), so its gateway transport is its only route and is
-/// never in the gateway's ring. The gateway's zombie sweep judged that
+/// **The bug.** A node that cannot join the ring has its gateway transport as
+/// its only route, and that transport is never in the gateway's ring. The gateway's zombie sweep judged that
 /// transport purely by AGE (`> 3 × transient_ttl`, 90s by default) and dropped
 /// it. The transport has no close message, so the peer was never told; it
 /// exempts its own gateway links from zombie cleanup and only notices a dead
 /// link after its 120s idle timeout. GETs it sent into the dead link timed out
 /// and reported NotFound for a contract that exists.
+///
+/// **The stranded node.** Node 12 is cut off from every other regular node
+/// (a permanent partition), so no acceptor can ever reach it and only the
+/// gateway can. This used to rely on a seed in which node 12's every CONNECT
+/// happened to be rejected; #5858's faster join retries let it join there, so
+/// the stranding is now explicit rather than a seed accident.
 ///
 /// **The scenario.** 1 gateway + 12 nodes. Every node GETs a contract that has
 /// not been PUT yet, the gateway PUTs it, then every node GETs it again, with
@@ -8453,6 +8458,7 @@ fn test_connect_despite_nat_partition() {
 #[test_log::test]
 fn test_gateway_zombie_sweep_keeps_unjoined_peers_live_link() {
     use freenet::dev_tool::{NodeLabel, ScheduledOperation, SimOperation, register_crdt_contract};
+    use freenet::simulation::{FaultConfig, Partition};
 
     const SEED: u64 = 0x4485_0000_0001;
     const NETWORK_NAME: &str = "gw-zombie-live-link";
@@ -8482,6 +8488,20 @@ fn test_gateway_zombie_sweep_keeps_unjoined_peers_live_link() {
     let unjoined_addr = sim
         .node_address(&NodeLabel::node(NETWORK_NAME, UNJOINED_NODE))
         .expect("unjoined node address");
+    // Strand node 12: no other regular node can reach it, so it can never
+    // connect an acceptor, while the gateway still can.
+    let others: HashSet<SocketAddr> = (1..=num_nodes)
+        .filter(|i| *i != UNJOINED_NODE)
+        .map(|i| {
+            sim.node_address(&NodeLabel::node(NETWORK_NAME, i))
+                .expect("node address")
+        })
+        .collect();
+    sim.with_fault_injection(
+        FaultConfig::builder()
+            .partition(Partition::new([unjoined_addr].into_iter().collect(), others).permanent(0))
+            .build(),
+    );
 
     let contract = SimOperation::create_test_contract(0x85);
     let contract_id = *contract.key().id();
