@@ -17,7 +17,19 @@ impl Location {
     }
 
     fn deterministic_loc(addr: &std::net::SocketAddr) -> Self {
-        match addr.ip() {
+        // An IPv4-mapped IPv6 address (`::ffff:a.b.c.d`, what a dual-stack
+        // socket reports for an IPv4 peer) is the IPv4 peer: derive its
+        // location from the IPv4 address. Its first three segments are zero,
+        // so the IPv6 arm would otherwise mix in the PORT, letting one host
+        // take a fresh location per port and defeating the /24 mask.
+        let ip = match addr.ip() {
+            std::net::IpAddr::V6(ipv6) => ipv6
+                .to_ipv4_mapped()
+                .map(std::net::IpAddr::V4)
+                .unwrap_or(std::net::IpAddr::V6(ipv6)),
+            ip @ std::net::IpAddr::V4(_) => ip,
+        };
+        match ip {
             std::net::IpAddr::V4(ipv4) => {
                 let value: u32 = ipv4.into();
                 // Mask out the last byte for sybil mitigation
@@ -822,5 +834,53 @@ mod test {
                 "|signed_distance({a},{b})|={sd} != distance({a},{b})={d}"
             );
         }
+    }
+
+    /// A dual-stack socket's view of an IPv4 peer gets that peer's IPv4
+    /// location, independent of port, like the plain IPv4 address does.
+    #[test]
+    fn ipv4_mapped_addresses_get_the_ipv4_location() {
+        let v4: SocketAddr = "203.0.113.7:5000".parse().unwrap();
+        let mapped: SocketAddr = "[::ffff:203.0.113.7]:5000".parse().unwrap();
+        let mapped_other_port: SocketAddr = "[::ffff:203.0.113.9]:6000".parse().unwrap();
+        let loc = Location::from_address(&v4).as_f64();
+        assert_eq!(Location::from_address(&mapped).as_f64(), loc);
+        assert_eq!(
+            Location::from_address(&mapped_other_port).as_f64(),
+            loc,
+            "same /24, different port: one location"
+        );
+        let mapped_other_net: SocketAddr = "[::ffff:198.51.100.7]:5000".parse().unwrap();
+        assert_ne!(
+            Location::from_address(&mapped_other_net).as_f64(),
+            loc,
+            "different /24, same port: different locations"
+        );
+    }
+
+    /// The mapping must not disturb the other IPv6 cases. A mapped LOOPBACK
+    /// address takes the IPv4 loopback path, so its port still separates
+    /// simulation peers. `::1` and an IPv4-COMPATIBLE `::a.b.c.d` are not
+    /// IPv4-mapped and keep their IPv6-arm location (first 48 bits zero, so the
+    /// port is mixed in); a future "simplify to `to_ipv4()`" would move both.
+    #[test]
+    fn mapping_leaves_loopback_and_ipv4_compatible_addresses_alone() {
+        let loc = |s: &str| Location::from_address(&s.parse::<SocketAddr>().unwrap()).as_f64();
+        assert_eq!(loc("[::ffff:127.0.0.1]:5000"), loc("127.0.0.1:5000"));
+        assert_ne!(
+            loc("[::ffff:127.0.0.1]:5000"),
+            loc("[::ffff:127.0.0.1]:5001"),
+            "a mapped loopback address still includes the port"
+        );
+
+        let ipv6_arm_zero_prefix =
+            |port: u16| distribute_hash((port as u64) << 48) as f64 / u64::MAX as f64;
+        assert_eq!(loc("[::1]:5000"), ipv6_arm_zero_prefix(5000));
+        assert_eq!(loc("[::203.0.113.7]:5000"), ipv6_arm_zero_prefix(5000));
+        assert_ne!(
+            loc("[::203.0.113.7]:5000"),
+            loc("203.0.113.7:5000"),
+            "an IPv4-compatible address is not treated as its IPv4 address"
+        );
     }
 }
