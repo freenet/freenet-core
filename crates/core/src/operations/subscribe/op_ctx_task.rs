@@ -5397,6 +5397,48 @@ mod bootstrap_subscription_tests {
         );
     }
 
+    /// A provisional lease whose renewal completes locally (no network round
+    /// trip: here the node has lost its address, as a not-joined node) stops
+    /// being provisional, so it is not re-run on every tick.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn locally_completed_renewal_clears_the_provisional_mark() {
+        let gateway_addr: std::net::SocketAddr = "127.0.0.1:31000".parse().unwrap();
+        let gateway = PeerKeyLocation::new(
+            crate::transport::TransportKeypair::new().public().clone(),
+            gateway_addr,
+        );
+        let (op_manager, rx, _guards, store) =
+            op_manager_with_gateway("sub-bootstrap-local-complete", gateway).await;
+        let instance_id = ContractInstanceId::new([70u8; 32]);
+        let key = contract(instance_id);
+        let seen = serve(&op_manager, rx, store, key);
+        op_manager
+            .ring
+            .add_client_subscription(&instance_id, crate::client_events::ClientId::next());
+        subscribe(&op_manager, instance_id, false).await;
+        assert!(op_manager.ring.is_subscription_provisional(&key));
+
+        op_manager.ring.connection_manager.clear_own_addr_for_test();
+        let outcome = drive_client_subscribe_inner(
+            &op_manager,
+            instance_id,
+            Transaction::new::<SubscribeMsg>(),
+            true,
+            None,
+        )
+        .await
+        .expect("driver returns an outcome");
+        assert!(
+            matches!(outcome, DriverOutcome::SkipAlreadyDelivered),
+            "the renewal completes locally: {outcome:?}"
+        );
+        assert_eq!(seen.lock().request_targets, vec![gateway_addr]);
+        assert!(
+            !op_manager.ring.is_subscription_provisional(&key),
+            "a locally completed renewal must clear the mark"
+        );
+    }
+
     /// A failed early renewal through the ring keeps the provisional mark,
     /// puts the contract in the subscription backoff, and the renewal loop
     /// retries it once the backoff allows.

@@ -430,6 +430,11 @@ async fn complete_local_subscription(
         }
     }
 
+    // Completed with no upstream at all, so a provisional mark (#2524) has
+    // nothing left to repair. Left set, a renewal ending here would leave the
+    // lease due on every renewal tick until the mark's TTL.
+    op_manager.ring.set_subscription_provisional(&key, false);
+
     // Notify client layer that subscription is complete. The actual update
     // delivery happens through the executor's update_notifications when
     // contract state changes, not through network broadcast targets.
