@@ -2008,19 +2008,37 @@ impl P2pConnManager {
                                         // instead of leaving it to wait out its
                                         // TTL (#5858). Other ops keep their own
                                         // retry handling.
-                                        // Non-blocking (channel-safety rule #6):
-                                        // on a full channel the notice is
-                                        // dropped and the driver waits out its
-                                        // TTL, as before #5858.
+                                        // This is the only notice, and a lost one
+                                        // holds the join's pending slot and
+                                        // bootstrap-round guard until the TTL, so
+                                        // wait out a transient backlog rather than
+                                        // drop it. Bounded (channel-safety rule
+                                        // #6): this is the spawned resend waiter,
+                                        // not the event loop.
+                                        const UNSENT_NOTICE_SEND_TIMEOUT: Duration =
+                                            Duration::from_secs(5);
                                         if let (false, Some(notice)) = (resent, unsent_notice) {
-                                            if bridge_sender
-                                                .try_send(P2pBridgeEvent::NodeAction(notice))
-                                                .is_err()
+                                            if let Err(e) = bridge_sender
+                                                .send_timeout(
+                                                    P2pBridgeEvent::NodeAction(notice),
+                                                    UNSENT_NOTICE_SEND_TIMEOUT,
+                                                )
+                                                .await
                                             {
-                                                tracing::debug!(
+                                                let reason = match e {
+                                                    mpsc::error::SendTimeoutError::Timeout(_) => {
+                                                        "timeout"
+                                                    }
+                                                    mpsc::error::SendTimeoutError::Closed(_) => {
+                                                        "closed"
+                                                    }
+                                                };
+                                                tracing::warn!(
                                                     tx = %tx,
                                                     peer_addr = %target_addr,
-                                                    "Bridge channel full; unsent CONNECT notice dropped"
+                                                    reason,
+                                                    "Unsent CONNECT notice not delivered; \
+                                                     the driver waits out its TTL"
                                                 );
                                             }
                                         }
@@ -3824,7 +3842,7 @@ pub(crate) mod tests {
             ))
             .expect("the waiter must work out the notice before msg_clone is moved");
         let sent = code[notice..]
-            .find("iflet(false,Some(notice))=(resent,unsent_notice){ifbridge_sender.try_send(P2pBridgeEvent::NodeAction(notice))")
+            .find("iflet(false,Some(notice))=(resent,unsent_notice){ifletErr(e)=bridge_sender.send_timeout(P2pBridgeEvent::NodeAction(notice),UNSENT_NOTICE_SEND_TIMEOUT,).await")
             .expect("the notice must go out only when the message was not resent");
         let resent_ok = code[notice..]
             .find("\"Failedtoreschedulemessageafterconnectionestablished\");}true}")
