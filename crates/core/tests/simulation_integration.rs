@@ -8480,7 +8480,7 @@ fn test_gateway_zombie_sweep_keeps_unjoined_peers_live_link() {
         .await
     });
     sim.with_controlled_op_interval(Duration::from_secs(5));
-    // The unjoined node for this seed. See "Coupling" above.
+    // The node stranded by the partition below. See "The stranded node" above.
     const UNJOINED_NODE: usize = 12;
     let gateway_addr = sim
         .node_address(&NodeLabel::gateway(NETWORK_NAME, 0))
@@ -12447,8 +12447,11 @@ type CloseClusterRun = (
 /// Close-cluster placement scenario shared by the migration and retry tests:
 /// six peers tightly around the contract's key, one far host (node 7, seeded)
 /// and one far requester (node 8), which GETs the contract when `client_get`.
-/// Same seed and topology in every caller, so callers differ only in the two
-/// flags.
+/// Same seed and ring locations in every caller. `migration` changes nothing
+/// else; `client_get` also makes the GET's dead-end structural (HTL 3,
+/// `min_connections` 4, the requester partitioned from cluster nodes 3..=6, and
+/// a wait for join convergence before the operations), so the two client-GET
+/// settings are not the same network.
 fn run_close_cluster_placement(
     network_name: &'static str,
     migration: bool,
@@ -12638,11 +12641,12 @@ fn test_contract_stays_off_close_cluster_without_migration() {
 
 /// Retry diversity (#5660) resolves the close-cluster dead-end on its own.
 ///
-/// The original negative-control scenario, run under its original network
-/// name, so main's history of this exact run dead-ending is evidence that the
-/// fix changes the outcome. Migration is pinned OFF: a far requester GETs a
-/// contract held only by a far host (node 7), and the peers closest to the key
-/// do not hold it. Before retry diversity every retry re-picked the same first
+/// Descended from the original negative-control scenario and kept under its
+/// network name, but no longer the same run: the client-GET settings of
+/// `run_close_cluster_placement` (#5806) changed its HTL, connections and
+/// reachability. Migration is pinned OFF: a far requester GETs a contract held
+/// only by a far host (node 7), and the peers closest to the key do not hold
+/// it. Before retry diversity every retry re-picked the same first
 /// hop and the GET dead-ended at the cluster. Now each retry starts from a
 /// first hop that has not answered NotFound, and the requester gets the state.
 ///
@@ -13170,17 +13174,21 @@ fn test_many_stranded_contracts_recover_without_a_storm() {
 }
 
 /// §5d(b) recovery on a sparse ring (#5846): four peers tight around the key
-/// and eleven spread over the rest of the ring, at most four connections each
-/// and HTL 4, so the holder (half a ring away) is not a neighbour of the key
-/// region. Only the holder has the contract, with a client subscription.
+/// and eleven spread over the rest of the ring, at most six connections each
+/// and HTL 4. The holder (half a ring away) is partitioned from the four, so
+/// it is not a neighbour of the key region; a precondition checks that it
+/// ends the run linked to none of them. Only the holder has the contract,
+/// with a client subscription.
 ///
 /// The holder's subscribe makes its first closer hop a host. If that peer has
 /// no host closer to the key and is not the root, it re-roots the same way
 /// (in this topology it turns out to be the root already). A reader a quarter
 /// ring away on the other side then GETs the contract.
 ///
-/// Returns `(run, recoveries, reader NotFound labels, reader got state,
-/// nearest-to-key peer hosts)`.
+/// Returns `(run, recoveries, reader NotFound labels, reader got state, a
+/// peer of the tight key cluster hosts the contract and completed a
+/// recovery itself)`. The last is tied to the recovery so a copy cached by
+/// the reader's GET on its way back cannot satisfy it.
 fn run_sparse_stranded_holder(
     network_name: &'static str,
     seed: u64,
@@ -13244,6 +13252,15 @@ fn run_sparse_stranded_holder(
     // hosting is the recovery re-placing the contract next to its key, and
     // before the fix none of them ever held it.
     let nearest_set: Vec<usize> = ranked.iter().copied().take(4).collect();
+    let nearest_addrs: Vec<(usize, std::net::SocketAddr)> = nearest_set
+        .iter()
+        .map(|n| {
+            let addr = sim
+                .node_address(&NodeLabel::node(network_name, *n))
+                .expect("near-key peer address");
+            (*n, addr)
+        })
+        .collect();
     // Node numbers follow `node_locations`: 5..=15 are the spread peers at
     // key + 0.08 * (n - 4).
     let holder_no = 10; // key + 0.48
@@ -13251,6 +13268,21 @@ fn run_sparse_stranded_holder(
     let holder = NodeLabel::node(network_name, holder_no);
     let reader = NodeLabel::node(network_name, reader_no);
     let reader_addr = sim.node_address(&reader).expect("reader address");
+    // Strand the holder: it cannot reach the key cluster, so it never links
+    // to it. At six connections it otherwise can, and its subscribe then
+    // lands next to the key with no recovery at all.
+    {
+        use freenet::simulation::{FaultConfig, Partition};
+        let holder_addr = sim.node_address(&holder).expect("holder address");
+        let cluster: HashSet<SocketAddr> = nearest_addrs.iter().map(|(_, a)| *a).collect();
+        sim.with_fault_injection(
+            FaultConfig::builder()
+                .partition(
+                    Partition::new([holder_addr].into_iter().collect(), cluster).permanent(0),
+                )
+                .build(),
+        );
+    }
     let operations = vec![
         ScheduledOperation::new(
             holder.clone(),
@@ -13259,7 +13291,7 @@ fn run_sparse_stranded_holder(
                 state: state_v1,
             },
         ),
-        ScheduledOperation::new(holder, SimOperation::Subscribe { contract_id }),
+        ScheduledOperation::new(holder.clone(), SimOperation::Subscribe { contract_id }),
         ScheduledOperation::new(
             reader.clone(),
             SimOperation::Get {
@@ -13295,6 +13327,18 @@ fn run_sparse_stranded_holder(
         "precondition: the reader must have joined the ring (ring connections: \
          {reader_links:?}); a capacity shortfall, not the recovery, is then the cause"
     );
+    // Precondition: the holder is stranded. Linked straight to a peer of the
+    // key cluster, its subscribe would land there without any recovery.
+    let holder_near_links: Vec<usize> = nearest_set
+        .iter()
+        .copied()
+        .filter(|n| result.node_is_connected_to(&holder, &NodeLabel::node(network_name, *n)))
+        .collect();
+    assert!(
+        holder_near_links.is_empty(),
+        "precondition: the holder must not be linked to the key cluster \
+         {nearest_set:?}, but is linked to {holder_near_links:?}"
+    );
     let recoveries: u64 = result
         .renewal_metrics
         .values()
@@ -13307,9 +13351,13 @@ fn run_sparse_stranded_holder(
         .node_storages
         .get(&reader)
         .is_some_and(|s| s.get_stored_state(&key).is_some());
-    let nearest_hosts = nearest_set
-        .iter()
-        .any(|n| result.is_node_hosting(&NodeLabel::node(network_name, *n), &key));
+    let nearest_recovered = nearest_addrs.iter().any(|(n, addr)| {
+        result.is_node_hosting(&NodeLabel::node(network_name, *n), &key)
+            && result
+                .renewal_metrics
+                .get(addr)
+                .is_some_and(|m| m.stranded_recoveries >= 1)
+    });
     tracing::info!(
         holder_no,
         reader_no,
@@ -13317,7 +13365,7 @@ fn run_sparse_stranded_holder(
         recoveries,
         not_found,
         reader_has_state,
-        nearest_hosts,
+        nearest_recovered,
         hosts = ?(1..=NUM_NODES)
             .filter(|n| result.is_node_hosting(&NodeLabel::node(network_name, *n), &key))
             .collect::<Vec<_>>(),
@@ -13332,14 +13380,14 @@ fn run_sparse_stranded_holder(
         recoveries,
         not_found,
         reader_has_state,
-        nearest_hosts,
+        nearest_recovered,
     )
 }
 
 /// §5d(b) recovery on a sparse ring (#5846). See `run_sparse_stranded_holder`.
 /// Before the fix no peer near the key ever held the contract and no
-/// recovery ran; after it the holder's subscribe has re-placed the contract
-/// on one of the four peers tight around the key.
+/// recovery ran; after it the holder's subscribe has re-placed the contract,
+/// by a recovery, on one of the four peers tight around the key.
 ///
 /// The far GET is a liveness check, NOT the discriminating assertion: at this
 /// size, a GET finds the holder by routing or by the terminal consult even
@@ -13353,13 +13401,13 @@ fn run_sparse_stranded_holder(
 #[test_log::test]
 fn test_stranded_holder_recovery_on_sparse_ring_places_contract_near_key() {
     const NETWORK_NAME: &str = "stranded-holder-sparse";
-    let (_run, recoveries, not_found, reader_has_state, nearest_hosts) =
+    let (_run, recoveries, not_found, reader_has_state, nearest_recovered) =
         run_sparse_stranded_holder(NETWORK_NAME, 0x5D_B000_0003);
 
     assert!(
-        nearest_hosts,
-        "no peer of the tight key cluster hosts the contract: the holder's \
-         subscribe never re-placed it near the key"
+        nearest_recovered,
+        "no peer of the tight key cluster hosts the contract by its own recovery: \
+         the holder's subscribe never re-placed it near the key"
     );
     assert!(recoveries >= 1, "no stranded-holder recovery ran");
     assert!(
@@ -14761,12 +14809,13 @@ fn test_advance_hosting_clock_without_control_is_graceful_noop() {
 ///   * control: advance 1 min  (< SUBSCRIPTION_LEASE_DURATION = 8 min) → lease survives
 ///   * test:    advance 20 min (> SUBSCRIPTION_LEASE_DURATION)         → lease lapses
 ///
-/// A gateway hosts + announces a contract and a node subscribes to it, forming a
-/// real subscription (leases on both peers). The subscriber is then SILENTLY
-/// crashed (`CrashNode`): a silent crash sends no `Unsubscribe` (so the leases are
-/// NOT torn down immediately — that is what a clean `Disconnect` would do) and
-/// stops the subscriber renewing (so nothing refreshes the leases). The leases can
-/// therefore lapse ONLY via the injected clock crossing the 8-minute duration.
+/// A gateway is seeded with a contract (seeding also gives the gateway its own
+/// lease) and a node subscribes to it, forming a real subscription lease on the
+/// subscriber. The subscriber is then SILENTLY crashed (`CrashNode`): a silent
+/// crash sends no `Unsubscribe` (so the leases are NOT torn down immediately —
+/// that is what a clean `Disconnect` would do) and stops the subscriber renewing
+/// (so nothing refreshes the leases). The leases can therefore lapse ONLY via the
+/// injected clock crossing the 8-minute duration.
 ///
 /// If the clock injection were broken (an `AdvanceHostingClock` that never reaches
 /// the `HostingManager`), the leases would either both survive (with the crash
@@ -14785,9 +14834,10 @@ fn test_injected_hosting_clock_drives_subscription_lease_lapse() {
     const SUPER_LEASE_ADVANCE: Duration = Duration::from_secs(20 * 60); // 20 min > 8 min
 
     // Runs the scenario with a given clock advance; returns how many peers still
-    // hold the contract in `active_subscriptions` network-wide, plus the crashed-
-    // packet count (a discriminating signal that the scripted crash took effect).
-    let run = |network: &str, seed: u64, advance: Duration| -> (usize, u64) {
+    // hold the contract in `active_subscriptions` network-wide, whether the
+    // subscriber itself is among them, and the crashed-packet count (a
+    // discriminating signal that the scripted crash took effect).
+    let run = |network: &str, seed: u64, advance: Duration| -> (usize, bool, u64) {
         setup_deterministic_state(seed);
         let rt = create_runtime();
         let gateway = NodeLabel::gateway(network, 0);
@@ -14801,6 +14851,9 @@ fn test_injected_hosting_clock_drives_subscription_lease_lapse() {
             // under test control (advanced deterministically, without running
             // minutes of virtual time).
             sim.enable_hosting_time_control();
+            // A Subscribe sent before the subscriber has joined is refused and
+            // never retried, so no lease would form.
+            sim.wait_for_join_convergence_before_ops(1.0, Duration::from_secs(60));
             sim
         });
 
@@ -14819,9 +14872,18 @@ fn test_injected_hosting_clock_drives_subscription_lease_lapse() {
                     state: SimOperation::create_test_state(51),
                 },
             ),
-            // A node subscribes → forms a real subscription lease (timestamp read
-            // from the injected hosting clock) on the subscriber and the gateway.
-            ScheduledOperation::new(subscriber.clone(), SimOperation::Subscribe { contract_id }),
+            // A node GETs and subscribes → forms a real subscription lease
+            // (timestamp read from the injected hosting clock) on the
+            // subscriber. A bare Subscribe is refused: the node must hold the
+            // contract first.
+            ScheduledOperation::new(
+                subscriber.clone(),
+                SimOperation::Get {
+                    contract_id,
+                    return_contract_code: true,
+                    subscribe: true,
+                },
+            ),
             // Silent crash: the subscriber sends NO Unsubscribe (so the leases are
             // not torn down immediately) and stops renewing (so nothing refreshes
             // them). The leases can now lapse ONLY via the injected clock crossing
@@ -14853,12 +14915,20 @@ fn test_injected_hosting_clock_drives_subscription_lease_lapse() {
             .iter()
             .filter(|s| s.active_subscription_keys.contains(&contract_id))
             .count();
-        (subscribed_peers, result.crash_packets_dropped())
+        // The gateway's seeded lease counts in `subscribed_peers` whether or not
+        // the Subscribe formed, so read the subscriber's own lease separately.
+        let subscriber_subscribed = result.node_subscription_count(&subscriber) > 0;
+        (
+            subscribed_peers,
+            subscriber_subscribed,
+            result.crash_packets_dropped(),
+        )
     };
 
     const SEED: u64 = 0x4642_A003_CAFE;
-    let (control_count, control_dropped) = run("clock-lease-control", SEED, SUB_LEASE_ADVANCE);
-    let (test_count, test_dropped) = run("clock-lease-test", SEED, SUPER_LEASE_ADVANCE);
+    let (control_count, control_subscriber, control_dropped) =
+        run("clock-lease-control", SEED, SUB_LEASE_ADVANCE);
+    let (test_count, _, test_dropped) = run("clock-lease-test", SEED, SUPER_LEASE_ADVANCE);
 
     tracing::info!(
         control_count,
@@ -14879,13 +14949,15 @@ fn test_injected_hosting_clock_drives_subscription_lease_lapse() {
     );
 
     // Sanity: the subscription genuinely FORMED and SURVIVED the sub-lease advance
-    // (otherwise the comparison below would be vacuous). At least the gateway still
-    // holds the contract in active_subscriptions 1 minute in.
+    // (otherwise the comparison below would be vacuous). The gateway's own seeded
+    // lease would satisfy a bare count of one, so require the subscriber's lease
+    // too.
     assert!(
-        control_count >= 1,
-        "sub-lease advance ({}s < 8min): the subscription must still be held by at least \
-         one peer — the lease is younger than SUBSCRIPTION_LEASE_DURATION, so it must NOT \
-         lapse; got {control_count} subscribed peer(s)",
+        control_subscriber && control_count >= 2,
+        "sub-lease advance ({}s < 8min): the subscriber's lease and the gateway's must \
+         both survive — each is younger than SUBSCRIPTION_LEASE_DURATION, so it must NOT \
+         lapse; got {control_count} subscribed peer(s), subscriber subscribed: \
+         {control_subscriber}",
         SUB_LEASE_ADVANCE.as_secs(),
     );
 
