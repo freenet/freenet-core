@@ -4603,6 +4603,11 @@ impl SimNetwork {
         let epoch_offset = seed % RANGE_MS;
         GlobalSimulationTime::set_time_ms(BASE_EPOCH_MS + epoch_offset);
 
+        // Mark this thread as running a simulation, as the other runners do:
+        // Turmoil runs every host on it, and process-global state such as
+        // `network_status` ignores simulated nodes by this marker (#5858).
+        crate::ring::topology_registry::set_current_network_name(&self.name);
+
         // Build Turmoil simulation with seeded RNG for deterministic execution
         let mut sim = turmoil::Builder::new()
             .simulation_duration(simulation_duration)

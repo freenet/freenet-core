@@ -2052,6 +2052,12 @@ impl ConnectionManager {
         *self.own_addr.lock() = Some(addr);
     }
 
+    /// Forgets this node's address, as for a fresh joiner (test-only).
+    #[cfg(test)]
+    pub(crate) fn clear_own_addr_for_test(&self) {
+        *self.own_addr.lock() = None;
+    }
+
     pub fn prune_alive_connection(&self, addr: SocketAddr) -> Option<Location> {
         self.prune_connection(addr, true)
     }
@@ -2084,10 +2090,29 @@ impl ConnectionManager {
         }; // pending_reservations lock released
 
         // Phase 2: Remove corresponding location_for_peer entries so
-        // has_connection_or_pending() returns false for these addresses.
+        // has_connection_or_pending() returns false for these addresses. A
+        // reservation can be promoted to an established connection between the
+        // two phases (overlapping bootstrap rounds, #5858); that peer's mapping
+        // is ACTUAL state now and must stay. Checked under location_for_peer
+        // (#1) then connections_by_location (#2), the documented order. This
+        // narrows the race but cannot close it: an add can still land between
+        // its own two locks after this check. `prune_connection` removes the
+        // ghost such an interleaving leaves (an established entry with no
+        // mapping), which closes the residue.
         if !removed.is_empty() {
             let mut location_for_peer = self.location_for_peer.write();
+            let connections = self.connections_by_location.read();
             for addr in &removed {
+                let established = location_for_peer.get(addr).is_some_and(|loc| {
+                    connections.get(loc).is_some_and(|conns| {
+                        conns
+                            .iter()
+                            .any(|c| c.location.socket_addr() == Some(*addr))
+                    })
+                });
+                if established {
+                    continue;
+                }
                 location_for_peer.remove(addr);
                 tracing::debug!(
                     addr = %addr,
@@ -2096,6 +2121,33 @@ impl ConnectionManager {
             }
         }
     }
+
+    /// Clears the pending reservations a bootstrap round made: for each
+    /// `(addr, sent)`, the reservation at `addr` only if it was created within
+    /// [`Self::OWNED_RESERVATION_WINDOW`] after the round sent its CONNECT
+    /// there. A reservation made later at the same address belongs to another
+    /// attempt and is left alone (#5858).
+    pub fn clear_owned_reservations(&self, owned: &[(SocketAddr, Instant)]) {
+        let addrs: Vec<SocketAddr> = {
+            let pending = self.pending_reservations.read();
+            owned
+                .iter()
+                .filter(|(addr, sent)| {
+                    pending.get(addr).is_some_and(|(_, created)| {
+                        *created >= *sent
+                            && created.duration_since(*sent) <= Self::OWNED_RESERVATION_WINDOW
+                    })
+                })
+                .map(|(addr, _)| *addr)
+                .collect()
+        };
+        self.clear_pending_reservations_for(&addrs);
+    }
+
+    /// How soon after a round sends its CONNECT the reservation it makes is
+    /// created: the join reserves the gateway first thing, so seconds cover a
+    /// busy runtime.
+    const OWNED_RESERVATION_WINDOW: Duration = Duration::from_secs(5);
 
     /// Get the duration of an existing connection by address in milliseconds.
     /// Returns None if the connection doesn't exist.
@@ -2389,6 +2441,32 @@ impl ConnectionManager {
 
         let Some(loc) = locations_for_peer.remove(&addr) else {
             if is_alive {
+                // No mapping, but an established entry may still exist (its
+                // mapping lost to a concurrent reservation cleanup between an
+                // add's two locks). Remove it rather than leave a ghost
+                // connection that blocks zero-connection recovery.
+                let cbl = &mut *self.connections_by_location.write();
+                let ghost = cbl.iter().find_map(|(loc, conns)| {
+                    conns
+                        .iter()
+                        .any(|c| c.location.socket_addr() == Some(addr))
+                        .then_some(*loc)
+                });
+                if let Some(loc) = ghost {
+                    tracing::warn!(
+                        addr = %addr,
+                        "prune_connection: removing an established connection with no location mapping"
+                    );
+                    if let Some(bucket) = cbl.get_mut(&loc) {
+                        bucket.retain(|c| c.location.socket_addr() != Some(addr));
+                        if bucket.is_empty() {
+                            cbl.remove(&loc);
+                        }
+                    }
+                    drop(locations_for_peer);
+                    self.forget_pruned_peer(addr);
+                    return Some(loc);
+                }
                 tracing::debug!("no location found for peer, skip pruning");
                 return None;
             } else {
@@ -2420,16 +2498,21 @@ impl ConnectionManager {
             self.pending_reservations.write().remove(&addr);
         }
 
-        // Clean up readiness state for the pruned peer
-        self.ready_peers.remove(&addr);
-
-        // Clean up connection timestamp for optimistic readiness
-        self.connected_since.write().remove(&addr);
-
-        // Clean up health tracking for the pruned peer
-        self.peer_health.lock().remove_peer(addr);
+        self.forget_pruned_peer(addr);
 
         Some(loc)
+    }
+
+    /// Per-peer state every prune of an established connection clears,
+    /// shared by the normal path and the no-mapping (ghost) path so they
+    /// cannot drift apart.
+    fn forget_pruned_peer(&self, addr: SocketAddr) {
+        // Readiness state
+        self.ready_peers.remove(&addr);
+        // Connection timestamp for optimistic readiness
+        self.connected_since.write().remove(&addr);
+        // Health tracking
+        self.peer_health.lock().remove_peer(addr);
     }
 
     /// Test-only: push a raw [`Connection`] straight into
@@ -2869,6 +2952,16 @@ impl ConnectionManager {
         *count
     }
 
+    /// The consecutive connect failure count as of `now`, with the same decay
+    /// as [`Self::increment_connect_jitter_failures`] but nothing recorded.
+    pub fn connect_jitter_failures_at(&self, now: Instant) -> u32 {
+        let (count, last_failure) = *self.connect_jitter_failures.lock();
+        let decay_steps = last_failure.map_or(0, |ts| {
+            (now.duration_since(ts).as_secs() / Self::JITTER_DECAY_INTERVAL.as_secs()) as u32
+        });
+        count.saturating_sub(decay_steps)
+    }
+
     /// Reset consecutive connect failure counter (called on successful connect).
     pub fn reset_connect_jitter_failures(&self) {
         let mut guard = self.connect_jitter_failures.lock();
@@ -3039,6 +3132,74 @@ mod tests {
 
     fn make_addr(port: u16) -> SocketAddr {
         SocketAddr::from(([127, 0, 0, 1], port))
+    }
+
+    /// A reservation promoted to an established connection between the two
+    /// phases of a reservation cleanup keeps its mapping (Codex P1): otherwise
+    /// a later prune finds no location and leaves a ghost connection.
+    #[test]
+    fn reservation_cleanup_keeps_the_mapping_of_a_promoted_connection() {
+        let cm = make_connection_manager(Some(make_addr(7200)), 2, 50, false);
+        let addr = make_addr(7201);
+        let loc = Location::new(0.3);
+        cm.inject_reservation(addr, loc, Instant::now());
+        // Promoted while the reservation is still recorded (the cleanup's
+        // first phase then removes it).
+        assert!(cm.add_connection(loc, addr, TransportKeypair::new().public().clone(), false));
+        cm.pending_reservations
+            .write()
+            .insert(addr, (loc, Instant::now()));
+        cm.clear_pending_reservations_for(&[addr]);
+        assert!(cm.is_in_ring(addr));
+        assert!(
+            cm.location_for_peer.read().contains_key(&addr),
+            "an established connection's mapping is actual state"
+        );
+        assert!(cm.prune_alive_connection(addr).is_some());
+        assert_eq!(cm.connection_count(), 0, "no ghost connection left behind");
+    }
+
+    /// An established connection that lost its mapping anyway (an add
+    /// interleaved between its two locks) is still pruned.
+    #[test]
+    fn pruning_removes_an_established_connection_without_a_mapping() {
+        let cm = make_connection_manager(Some(make_addr(7300)), 2, 50, false);
+        let addr = make_addr(7301);
+        assert!(cm.add_connection(
+            Location::new(0.4),
+            addr,
+            TransportKeypair::new().public().clone(),
+            false
+        ));
+        cm.location_for_peer.write().remove(&addr);
+        assert!(cm.connected_since.read().contains_key(&addr));
+        assert!(cm.prune_alive_connection(addr).is_some());
+        assert_eq!(cm.connection_count(), 0);
+        assert!(!cm.is_in_ring(addr));
+        assert!(
+            !cm.connected_since.read().contains_key(&addr),
+            "a ghost prune clears the same per-peer state as a normal one"
+        );
+    }
+
+    /// A bootstrap round clears only the reservation its own CONNECT made: one
+    /// made later at the same gateway by another attempt stays (#5858).
+    #[test]
+    fn owned_reservations_clear_only_the_rounds_own() {
+        let cm = make_connection_manager(Some(make_addr(7100)), 2, 50, false);
+        let (ours, later) = (make_addr(7101), make_addr(7102));
+        let sent = Instant::now();
+        cm.inject_reservation(ours, Location::new(0.1), sent + Duration::from_millis(5));
+        cm.inject_reservation(later, Location::new(0.2), sent + Duration::from_secs(60));
+        cm.clear_owned_reservations(&[(ours, sent), (later, sent)]);
+        assert!(
+            !cm.has_connection_or_pending(ours),
+            "the round's own reservation is cleared"
+        );
+        assert!(
+            cm.pending_reservations.read().contains_key(&later),
+            "a later attempt's reservation at the same gateway is left alone"
+        );
     }
 
     fn age_reservation(cm: &ConnectionManager, addr: SocketAddr, age: Duration) {

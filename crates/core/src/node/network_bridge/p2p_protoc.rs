@@ -1895,6 +1895,28 @@ impl P2pConnManager {
                                              Sustained occurrences indicate fan-out / migration load \
                                              overwhelming the event loop."
                                         );
+                                        // A joiner's CONNECT request has no op
+                                        // retry: end its driver now, as the
+                                        // resend waiter does, rather than leave
+                                        // it holding a bootstrap round for its
+                                        // TTL (#5858). Handled inline: this IS
+                                        // the event loop, and the channel that
+                                        // would carry the notice is the full one.
+                                        if unsent_message_notice(
+                                            &msg,
+                                            tx,
+                                            target_addr,
+                                            &ctx.bridge.op_manager.ring.connection_manager.pub_key,
+                                        )
+                                        .is_some()
+                                        {
+                                            orphan_transaction(
+                                                &mut state,
+                                                &ctx.bridge.op_manager.ring.live_tx_tracker,
+                                                tx,
+                                                target_addr,
+                                            );
+                                        }
                                         continue;
                                     }
 
@@ -1907,8 +1929,18 @@ impl P2pConnManager {
 
                                     // Spawn a task to wait for connection and then send the message
                                     let target_peer_for_resend = target_peer.clone();
+                                    let unsent_notice = unsent_message_notice(
+                                        &msg_clone,
+                                        tx,
+                                        target_addr,
+                                        &ctx.bridge.op_manager.ring.connection_manager.pub_key,
+                                    );
                                     GlobalExecutor::spawn(async move {
-                                        match timeout(Duration::from_secs(20), result.recv()).await
+                                        let resent = match timeout(
+                                            Duration::from_secs(20),
+                                            result.recv(),
+                                        )
+                                        .await
                                         {
                                             Ok(Some(Ok((connected_addr, _)))) => {
                                                 tracing::debug!(
@@ -1939,6 +1971,7 @@ impl P2pConnManager {
                                                         "Failed to reschedule message after connection established"
                                                     );
                                                 }
+                                                true
                                             }
                                             Ok(Some(Err(e))) => {
                                                 tracing::debug!(
@@ -1948,6 +1981,7 @@ impl P2pConnManager {
                                                     phase = "error",
                                                     "Connection attempt failed"
                                                 );
+                                                false
                                             }
                                             Ok(None) => {
                                                 tracing::error!(
@@ -1956,6 +1990,7 @@ impl P2pConnManager {
                                                     phase = "error",
                                                     "Response channel closed before connection result received"
                                                 );
+                                                false
                                             }
                                             Err(_) => {
                                                 tracing::error!(
@@ -1963,6 +1998,47 @@ impl P2pConnManager {
                                                     peer_addr = %target_addr,
                                                     phase = "timeout",
                                                     "Timeout waiting for connection establishment"
+                                                );
+                                                false
+                                            }
+                                        };
+                                        // A CONNECT request that never went out
+                                        // has nothing in flight: end its driver
+                                        // now, as for a peer pruned mid-flight,
+                                        // instead of leaving it to wait out its
+                                        // TTL (#5858). Other ops keep their own
+                                        // retry handling.
+                                        // This is the only notice, and a lost one
+                                        // holds the join's pending slot and
+                                        // bootstrap-round guard until the TTL, so
+                                        // wait out a transient backlog rather than
+                                        // drop it. Bounded (channel-safety rule
+                                        // #6): this is the spawned resend waiter,
+                                        // not the event loop.
+                                        const UNSENT_NOTICE_SEND_TIMEOUT: Duration =
+                                            Duration::from_secs(5);
+                                        if let (false, Some(notice)) = (resent, unsent_notice) {
+                                            if let Err(e) = bridge_sender
+                                                .send_timeout(
+                                                    P2pBridgeEvent::NodeAction(notice),
+                                                    UNSENT_NOTICE_SEND_TIMEOUT,
+                                                )
+                                                .await
+                                            {
+                                                let reason = match e {
+                                                    mpsc::error::SendTimeoutError::Timeout(_) => {
+                                                        "timeout"
+                                                    }
+                                                    mpsc::error::SendTimeoutError::Closed(_) => {
+                                                        "closed"
+                                                    }
+                                                };
+                                                tracing::warn!(
+                                                    tx = %tx,
+                                                    peer_addr = %target_addr,
+                                                    reason,
+                                                    "Unsent CONNECT notice not delivered; \
+                                                     the driver waits out its TTL"
                                                 );
                                             }
                                         }
@@ -2297,6 +2373,38 @@ impl P2pConnManager {
                                         peer_addr = %peer_addr,
                                         phase = "disconnect",
                                         "Drop connection requested for unknown address - ignoring"
+                                    );
+                                }
+                            }
+                            NodeEvent::DropStaleGatewayLink { addr, done } => {
+                                // Checked here, not only by the sender: the
+                                // gateway may have become a ring connection
+                                // while this event was queued (#5858).
+                                if ctx
+                                    .bridge
+                                    .op_manager
+                                    .ring
+                                    .connection_manager
+                                    .is_in_ring(addr)
+                                {
+                                    tracing::debug!(
+                                        peer_addr = %addr,
+                                        "Stale gateway link is now a ring connection - keeping it"
+                                    );
+                                } else if !ctx
+                                    .drop_connection_by_addr(addr, &handshake_cmd_sender)
+                                    .await
+                                {
+                                    tracing::debug!(
+                                        peer_addr = %addr,
+                                        "Stale gateway link already gone - ignoring"
+                                    );
+                                }
+                                // The sender waits on this with a timeout.
+                                if done.try_send(()).is_err() {
+                                    tracing::debug!(
+                                        peer_addr = %addr,
+                                        "Stale gateway link handled after its sender stopped waiting"
                                     );
                                 }
                             }
@@ -2726,26 +2834,12 @@ impl P2pConnManager {
                                     .remove_finished_transaction(tx);
                             }
                             NodeEvent::TransactionOrphaned { tx, peer } => {
-                                // The awaited peer was pruned mid-flight (#4313).
-                                // Deliver the cause THROUGH the waiter channel
-                                // before the sender drops, so the parked driver's
-                                // recv() yields PeerDisconnected before None —
-                                // race-free, no side registry. Then clean up like
-                                // TransactionCompleted.
-                                state.tx_to_client.remove(&tx);
-                                if let Some(sender) = state.pending_op_results.remove(&tx) {
-                                    // Best-effort: a full channel means a real
-                                    // reply is already queued, a closed one means
-                                    // the driver already exited — both benign.
-                                    #[allow(clippy::let_underscore_must_use)]
-                                    let _ = sender.try_send(WaiterReply::PeerDisconnected { peer });
-                                    crate::config::GlobalTestMetrics::record_pending_op_remove();
-                                }
-                                ctx.bridge
-                                    .op_manager
-                                    .ring
-                                    .live_tx_tracker
-                                    .remove_finished_transaction(tx);
+                                orphan_transaction(
+                                    &mut state,
+                                    &ctx.bridge.op_manager.ring.live_tx_tracker,
+                                    tx,
+                                    peer,
+                                );
                             }
                             NodeEvent::LocalSubscribeComplete {
                                 tx,
@@ -2926,6 +3020,55 @@ impl ConnectResultSender for mpsc::Sender<Result<(SocketAddr, Option<usize>), ()
     ) -> Pin<Box<dyn Future<Output = Result<(), ()>> + Send + '_>> {
         async move { self.send(result).await.map_err(|_| ()) }.boxed()
     }
+}
+
+/// End `tx`'s driver because the peer it waits on is gone (#4313) or its
+/// request never left (#5858): deliver the cause THROUGH the waiter channel
+/// before the sender drops, so the parked driver's recv() yields
+/// PeerDisconnected before None (race-free, no side registry), then clean up
+/// like TransactionCompleted. Shared by every orphaning site so they cannot
+/// drift apart.
+fn orphan_transaction(
+    state: &mut EventListenerState,
+    live_tx_tracker: &crate::ring::LiveTransactionTracker,
+    tx: Transaction,
+    peer: SocketAddr,
+) {
+    state.tx_to_client.remove(&tx);
+    if let Some(sender) = state.pending_op_results.remove(&tx) {
+        // Best-effort: a full channel means a real reply is already queued, a
+        // closed one means the driver already exited — both benign.
+        #[allow(clippy::let_underscore_must_use)]
+        let _ = sender.try_send(WaiterReply::PeerDisconnected { peer });
+        crate::config::GlobalTestMetrics::record_pending_op_remove();
+    }
+    live_tx_tracker.remove_finished_transaction(tx);
+}
+
+/// What to tell the event loop when `msg`, waiting for a connection to
+/// `target_addr`, was dropped because the connection failed. Only this
+/// node's own CONNECT request as a joiner (`own`) is reported (#5858): its
+/// transaction has nothing in flight, so ending its driver at once (as for a
+/// peer pruned mid-flight) frees the bootstrap round instead of holding it
+/// for the transaction TTL. A relayed request and every other message keep
+/// their ops' own retry handling.
+fn unsent_message_notice(
+    msg: &NetMessage,
+    tx: Transaction,
+    target_addr: SocketAddr,
+    own: &TransportPublicKey,
+) -> Option<NodeEvent> {
+    let NetMessage::V1(NetMessageV1::Connect(crate::operations::connect::ConnectMsg::Request {
+        payload,
+        ..
+    })) = msg
+    else {
+        return None;
+    };
+    (payload.joiner.pub_key() == own).then_some(NodeEvent::TransactionOrphaned {
+        tx,
+        peer: target_addr,
+    })
 }
 
 /// Fail every callback awaiting a connection to `peer_addr` after a connect
@@ -3611,6 +3754,111 @@ pub(crate) mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::sync::mpsc;
     use tokio::time::{Duration, Instant, sleep, timeout};
+
+    /// Only this node's own CONNECT request as a joiner is ended at once
+    /// when its target could not be connected (#5858); a relayed request and
+    /// every other message keep their ops' own retry handling.
+    #[test]
+    fn only_an_unsent_connect_request_is_ended_at_once() {
+        use crate::message::{NetMessage, NetMessageV1, NodeEvent, Transaction};
+        use crate::operations::connect::{ConnectMsg, prepare_join_request};
+        use crate::ring::{Location, PeerKeyLocation};
+        use crate::transport::TransportKeypair;
+
+        let peer = |port: u16| {
+            PeerKeyLocation::new(
+                TransportKeypair::new().public().clone(),
+                std::net::SocketAddr::from(([127, 0, 0, 1], port)),
+            )
+        };
+        let (me, other) = (peer(1), peer(4));
+        let gateway = std::net::SocketAddr::from(([127, 0, 0, 1], 2));
+        let tx = Transaction::new::<ConnectMsg>();
+        let own_request = prepare_join_request(tx, &me, &peer(2), Location::new(0.5), 10, &[]);
+        let notice = |msg: ConnectMsg| {
+            super::unsent_message_notice(
+                &NetMessage::V1(NetMessageV1::Connect(msg)),
+                tx,
+                gateway,
+                me.pub_key(),
+            )
+        };
+        match notice(own_request) {
+            Some(NodeEvent::TransactionOrphaned { tx: t, peer }) => {
+                assert_eq!((t, peer), (tx, gateway));
+            }
+            other => panic!("an unsent CONNECT request must end its driver, got {other:?}"),
+        }
+        let relayed = prepare_join_request(tx, &other, &peer(2), Location::new(0.5), 10, &[]);
+        assert!(
+            notice(relayed).is_none(),
+            "a relayed request is not ours to end"
+        );
+        let observed = ConnectMsg::ObservedAddress {
+            id: tx,
+            address: std::net::SocketAddr::from(([127, 0, 0, 1], 3)),
+        };
+        assert!(notice(observed).is_none());
+    }
+
+    /// Both places that drop a message waiting for a connection report an
+    /// unsent CONNECT (#5858): the resend waiter, only when it did not resend
+    /// it, and the full/closed ConnectPeer dispatch (re-review N3), inline
+    /// since that channel is the full one. Source pin: both run inside the
+    /// event loop, which has no harness here.
+    #[test]
+    fn the_resend_waiter_reports_only_a_message_it_did_not_send() {
+        const SOURCE: &str = include_str!("p2p_protoc.rs");
+        // Scoped to the event-loop function that holds both drop sites: a
+        // whole-file scrape could match these literals anywhere.
+        let signature = "pub async fn run_event_listener_with_socket<S: Socket>(";
+        let start = SOURCE.find(signature).expect("event-loop function renamed");
+        let tests_at = SOURCE
+            .find("\n#[cfg(test)]\npub(crate) mod tests")
+            .expect("tests");
+        assert!(start < tests_at, "the anchor must be production code");
+        let open = start + SOURCE[start..].find('{').expect("function body");
+        let bytes = SOURCE.as_bytes();
+        let (mut depth, mut end) = (0i32, open);
+        for (i, b) in bytes.iter().enumerate().skip(open) {
+            match b {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = i;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        assert!(end > open && end < tests_at, "unbalanced body slice");
+        let code: String = SOURCE[open..end].split_whitespace().collect();
+        let own = "&ctx.bridge.op_manager.ring.connection_manager.pub_key,";
+        let notice = code
+            .find(&format!(
+                "letunsent_notice=unsent_message_notice(&msg_clone,tx,target_addr,{own});"
+            ))
+            .expect("the waiter must work out the notice before msg_clone is moved");
+        let sent = code[notice..]
+            .find("iflet(false,Some(notice))=(resent,unsent_notice){ifletErr(e)=bridge_sender.send_timeout(P2pBridgeEvent::NodeAction(notice),UNSENT_NOTICE_SEND_TIMEOUT,).await")
+            .expect("the notice must go out only when the message was not resent");
+        let resent_ok = code[notice..]
+            .find("\"Failedtoreschedulemessageafterconnectionestablished\");}true}")
+            .expect("a resent message must count as sent");
+        assert!(resent_ok < sent);
+        let dropped = code
+            .find("overwhelmingtheeventloop.\");")
+            .expect("the ConnectPeer full/closed branch");
+        let inline = code[dropped..]
+            .find(&format!(
+                "ifunsent_message_notice(&msg,tx,target_addr,{own}).is_some(){{orphan_transaction(&mutstate,&ctx.bridge.op_manager.ring.live_tx_tracker,tx,target_addr,);}}"
+            ))
+            .expect("the full/closed branch must end an unsent CONNECT's driver");
+        let cont = code[dropped..].find("continue;").expect("the branch ends");
+        assert!(inline < cont, "before the branch moves on");
+    }
 
     /// A fake [`super::ContractPresenceOracle`] for testing
     /// [`super::collect_contract_states`] without standing up a real `Ring`.
@@ -4905,7 +5153,18 @@ pub(crate) mod tests {
             .find("\n                            }\n")
             .map(|p| arm_start + p)
             .expect("TransactionOrphaned arm closer not found");
-        let body = &SOURCE[arm_start..arm_end];
+        assert!(
+            SOURCE[arm_start..arm_end].contains("orphan_transaction("),
+            "the TransactionOrphaned arm must go through orphan_transaction"
+        );
+        let fn_start = SOURCE
+            .find("\nfn orphan_transaction(")
+            .expect("orphan_transaction renamed or removed");
+        let fn_end = fn_start
+            + SOURCE[fn_start..]
+                .find("\n}\n")
+                .expect("end of orphan_transaction");
+        let body = &SOURCE[fn_start..fn_end];
 
         let send_pos = body
             .find("WaiterReply::PeerDisconnected")

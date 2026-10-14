@@ -31,9 +31,11 @@ impl PeerConnectionBackoff {
     /// Default base backoff interval (30 seconds).
     ///
     /// This is set high enough that even the first failure creates meaningful backoff.
-    /// Connect requests arrive approximately every 60 seconds (operation timeout interval),
-    /// so a 30-second base ensures the first failure already blocks half of subsequent attempts.
-    /// See issue #2595 for context.
+    /// It was sized when a bootstrapping peer retried each gateway about every 60 seconds
+    /// (the operation timeout, #2595). Bootstrap rounds now overlap and start as often as
+    /// 5 s apart at first, settling to one per ~30 s (`operations::connect::bootstrap`,
+    /// #5858), so a 30-second base blocks the next one to two rounds through a gateway
+    /// that failed, rather than half of them.
     const DEFAULT_BASE_INTERVAL: Duration = Duration::from_secs(30);
 
     /// Default maximum backoff interval (90 seconds).

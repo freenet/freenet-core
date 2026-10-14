@@ -76,6 +76,24 @@
 //!   favoring candidates that fill gaps in log-distance coverage
 //! - Between min and max → feed the gap score through the `ConnectionEvaluator`
 //!
+//! ## Joining With No Ring Connection
+//!
+//! A gateway join sent while the joiner has no ring connection (`bootstrap` module, #5858):
+//! - **Overlaps.** The startup loop and the maintenance loop's zero-connection fallback share
+//!   one `BootstrapPacer`. A round runs in the background, so the next starts after a
+//!   jittered backoff (5, 10, 20, then 30 s) without waiting for earlier CONNECTs, which
+//!   still collect replies to their TTL. At most `MAX_OUTSTANDING_BOOTSTRAP_ROUNDS` are
+//!   outstanding; the backoff resets once a ring connection has lasted 30 s.
+//! - **Dials concurrently.** Up to `MAX_CONCURRENT_ACCEPTOR_DIALS` acceptors are dialled at
+//!   once, so an unreachable acceptor cannot hold a reachable one past its hole-punch
+//!   window. A peer that already has a connection still dials one at a time.
+//! - **Redials a dead gateway link.** While the joiner does not know its address, the
+//!   gateway answers with `ObservedAddress`; two joins in a row through one gateway without
+//!   it by `GATEWAY_ANSWER_DEADLINE` drop that transport so the next round re-handshakes
+//!   (at most once per 2 min per gateway).
+//! - **Finishes its dials.** However collection ends (Rejected, TTL, the waiter closing),
+//!   the acceptors already taken are still dialled, at most `acceptor_limit` per CONNECT.
+//!
 //! ## Routing
 //!
 //! The request is routed toward `desired_location` using greedy routing:
@@ -129,6 +147,7 @@ use crate::util::{Contains, IterExt};
 
 use super::VisitedPeers;
 
+pub(crate) mod bootstrap;
 pub(crate) mod op_ctx_task;
 
 #[cfg(test)]
@@ -1598,11 +1617,19 @@ pub(crate) async fn join_ring_request(
     // Helper: apply jitter to base_location for NAT-compatible acceptor exploration.
     // After consecutive hole-punch failures, the same location routes to the same
     // acceptors. Jittering explores different ring regions.
+    //
+    // `failures` counts this attempt as the next failure, as before #5858, but
+    // the counter itself only grows when a CONNECT has ended without a
+    // connection (below): with overlapping bootstrap rounds, counting every
+    // attempt reached the widened re-route in seconds instead of minutes.
+    let jittered = std::sync::atomic::AtomicBool::new(false);
     let apply_bootstrap_jitter = |base: Location| -> Location {
+        jittered.store(true, std::sync::atomic::Ordering::Relaxed);
         let failures = op_manager
             .ring
             .connection_manager
-            .increment_connect_jitter_failures(now);
+            .connect_jitter_failures_at(now)
+            .saturating_add(1);
         // Bootstrap-only widened re-route: once bounded jitter has saturated
         // and we are still below the gap-targeting threshold (true bootstrap),
         // occasionally take a larger (but still bounded) jitter step so the
@@ -1700,7 +1727,7 @@ pub(crate) async fn join_ring_request(
     if !op_manager.ring.is_gateway() {
         crate::node::network_status::record_bootstrap_connect_attempt();
     }
-    op_ctx_task::start_client_connect(
+    let connected = op_ctx_task::start_client_connect_counted(
         tx,
         gateway.clone(),
         gateway_addr,
@@ -1710,7 +1737,17 @@ pub(crate) async fn join_ring_request(
         overall_timeout,
         op_ctx_task::ClientConnectKind::Standard,
     )
-    .await
+    .await;
+    if jittered.load(std::sync::atomic::Ordering::Relaxed) && !matches!(connected, Ok(n) if n > 0) {
+        // A jittered attempt ended without a connection: the next one
+        // jitters further (#4362). Gap-targeted attempts never touched the
+        // counter, as before.
+        op_manager
+            .ring
+            .connection_manager
+            .increment_connect_jitter_failures(Instant::now());
+    }
+    connected.map(|_| ())
 }
 
 /// Resolve the socket address of a gateway selected for a version probe.
@@ -1753,7 +1790,7 @@ pub(crate) async fn gateway_version_probe(
         own,
         desired_location,
         None,
-        op_ctx_task::ClientConnectKind::Standard,
+        op_ctx_task::ClientConnectKind::VersionProbe,
     )
     .await
 }
@@ -1768,6 +1805,41 @@ pub(crate) async fn gateway_version_probe(
 /// ±20% jitter is applied at each call site to prevent thundering herd.
 /// See issue #3304.
 pub(crate) const GATEWAY_BACKOFF_POLL_CAP: Duration = Duration::from_secs(30);
+
+/// Runs one round's gateway joins. A paced bootstrap round's joins run in a
+/// spawned task that holds the round until every CONNECT has ended (#5858),
+/// so the join loop can start the next round after the pacer's backoff
+/// instead of waiting for these to reach their TTL. Without a round (this peer
+/// has a connection) they are awaited, as before. Returns whether the joins
+/// were spawned.
+async fn run_gateway_joins<F>(
+    joins: F,
+    round: Option<bootstrap::BootstrapRoundGuard>,
+    shutdown: tokio_util::sync::CancellationToken,
+) -> bool
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    match round {
+        Some(mut round) => {
+            round.issue();
+            GlobalExecutor::spawn(async move {
+                // Ends with the node rather than outliving it.
+                tokio::select! {
+                    biased;
+                    _ = shutdown.cancelled() => {},
+                    _ = joins => {},
+                }
+                drop(round);
+            });
+            true
+        }
+        None => {
+            joins.await;
+            false
+        }
+    }
+}
 
 pub(crate) async fn initial_join_procedure(
     op_manager: Arc<OpManager>,
@@ -1899,11 +1971,37 @@ pub(crate) async fn initial_join_procedure(
 
         loop {
             let open_conns = op_manager.ring.open_connections();
+            op_manager
+                .bootstrap_pacer
+                .lock()
+                .observe_connections(tokio::time::Instant::now(), open_conns > 0);
 
             if !min_connections_reached && open_conns >= bootstrap_threshold {
                 min_connections_reached = true;
                 crate::node::network_status::record_bootstrap_min_connections_reached();
             }
+
+            // With no ring connection, rounds are paced by the bootstrap pacer
+            // shared with the maintenance loop (#5858). A round's joins run in
+            // a spawned task (`run_gateway_joins`), so the next round starts
+            // after the pacer's backoff while earlier CONNECTs are still
+            // collecting replies, up to `MAX_OUTSTANDING_BOOTSTRAP_ROUNDS`.
+            let mut bootstrap_round = if open_conns == 0 {
+                match bootstrap::wait_for_bootstrap_round(
+                    &op_manager.bootstrap_pacer,
+                    &op_manager.gateway_backoff_cleared,
+                    || op_manager.ring.open_connections() > 0,
+                )
+                .await
+                {
+                    Some(round) => Some(round),
+                    None => continue,
+                }
+            } else {
+                None
+            };
+            // A paced round's joins were spawned; the pacer spaces the next.
+            let mut round_issued = false;
 
             // Has this round already been classified (#4787)? Each branch that
             // decides what the round does records its own outcome BEFORE
@@ -2031,6 +2129,10 @@ pub(crate) async fn initial_join_procedure(
                             "All gateways in backoff, waiting before retry"
                         );
                         record_round(StartupRoundOutcome::BackoffBlocked);
+                        // This round sent nothing: end it before sleeping, or
+                        // it would block the maintenance path's round for the
+                        // whole wait.
+                        drop(bootstrap_round.take());
                         tokio::select! {
                             _ = tokio::time::sleep(effective_wait) => {},
                             _ = op_manager.gateway_backoff_cleared.notified() => {
@@ -2078,29 +2180,41 @@ pub(crate) async fn initial_join_procedure(
                     .take(number_of_parallel_connections)
                 {
                     tracing::info!(%gateway, "Attempting connection to gateway");
+                    if let (Some(round), Some(addr)) =
+                        (bootstrap_round.as_ref(), gateway.socket_addr())
+                    {
+                        round.own_reservation(addr);
+                    }
+                    let gateway = gateway.clone();
                     let op_manager = op_manager.clone();
                     select_all.push(async move {
-                        (join_ring_request(gateway, &op_manager, None).await, gateway)
+                        (
+                            join_ring_request(&gateway, &op_manager, None).await,
+                            gateway,
+                        )
                     });
                 }
-                select_all
-                    .for_each(|(res, gateway)| async move {
-                        if let Err(error) = res {
-                            if !matches!(
-                                error,
-                                OpError::ConnError(
-                                    crate::node::ConnectionError::UnwantedConnection
-                                )
-                            ) {
-                                tracing::error!(
-                                    %gateway,
-                                    %error,
-                                    "Failed while attempting connection to gateway"
-                                );
-                            }
+                let joins = select_all.for_each(|(res, gateway)| async move {
+                    if let Err(error) = res {
+                        if !matches!(
+                            error,
+                            OpError::ConnError(crate::node::ConnectionError::UnwantedConnection)
+                        ) {
+                            tracing::error!(
+                                %gateway,
+                                %error,
+                                "Failed while attempting connection to gateway"
+                            );
                         }
-                    })
-                    .await;
+                    }
+                });
+                let round = if eligible_count > 0 {
+                    bootstrap_round.take()
+                } else {
+                    None
+                };
+                round_issued =
+                    run_gateway_joins(joins, round, op_manager.ring.shutdown_token()).await;
             } else if use_connected_as_routers {
                 // All gateways connected but still need many more peers.
                 // Route CONNECTs through connected gateways toward gap locations.
@@ -2167,24 +2281,28 @@ pub(crate) async fn initial_join_procedure(
                             )
                         });
                     }
-                    select_all
-                        .for_each(|(res, gateway)| async move {
-                            if let Err(error) = res {
-                                if !matches!(
-                                    error,
-                                    OpError::ConnError(
-                                        crate::node::ConnectionError::UnwantedConnection
-                                    )
-                                ) {
-                                    tracing::error!(
-                                        %gateway,
-                                        %error,
-                                        "Failed while routing CONNECT through gateway"
-                                    );
-                                }
+                    let joins = select_all.for_each(|(res, gateway)| async move {
+                        if let Err(error) = res {
+                            if !matches!(
+                                error,
+                                OpError::ConnError(
+                                    crate::node::ConnectionError::UnwantedConnection
+                                )
+                            ) {
+                                tracing::error!(
+                                    %gateway,
+                                    %error,
+                                    "Failed while routing CONNECT through gateway"
+                                );
                             }
-                        })
-                        .await;
+                        }
+                    });
+                    round_issued = run_gateway_joins(
+                        joins,
+                        bootstrap_round.take(),
+                        op_manager.ring.shutdown_token(),
+                    )
+                    .await;
                 } else if blocked_by_backoff > 0 {
                     // #4787: nothing was issued because every gateway this
                     // round could route through is in exponential backoff —
@@ -2225,9 +2343,19 @@ pub(crate) async fn initial_join_procedure(
             // `open_conns < bootstrap_threshold`.
             record_round(StartupRoundOutcome::NoTarget);
 
+            // A round that sent nothing frees its slot without backing off.
+            drop(bootstrap_round.take());
+            if round_issued {
+                // The pacer spaces the next round, with its own jitter, so
+                // the fixed wait below is skipped (#5858).
+                continue;
+            }
+
             // Add random jitter to prevent thundering herd after gateway restart.
             // Without jitter, all peers that lose their gateway connection retry
             // at the same interval, causing synchronized reconnection storms.
+            // With no connection this wait is reached only by a round that sent
+            // nothing; a round that sent CONNECTs is spaced by the pacer above.
             let jitter_ms = GlobalRng::random_u64() % 2000; // 0-2s jitter
             let base_wait_ms = if open_conns == 0 {
                 tracing::debug!(
@@ -2343,6 +2471,371 @@ mod tests {
             .build()
             .expect("build test runtime")
             .block_on(body);
+    }
+
+    /// Comment-stripped, whitespace-free text of `body`, for pins.
+    fn squash(body: &str) -> String {
+        body.lines()
+            .map(|line| line.split_once("//").map_or(line, |(code, _)| code))
+            .collect::<Vec<_>>()
+            .join("\n")
+            .split_whitespace()
+            .collect()
+    }
+
+    /// The maintenance loop's zero-connection bootstrap (#5858), for what the
+    /// behavioural test below cannot see: the loop calls it, awaits no join
+    /// inline (awaited, the joins held the loop for a transaction TTL), and
+    /// the spawned task owns the whole round guard (a disjoint capture of
+    /// `round.connected` would end the round when the call returned).
+    #[test]
+    fn maintenance_bootstrap_takes_the_round_and_spawns_its_joins() {
+        const RING: &str = include_str!("../ring.rs");
+        let maintenance = squash(fn_body(RING, "async fn connection_maintenance("));
+        assert!(
+            maintenance.contains(
+                "ifcurrent_conn_count==0&&!op_manager.configured_gateways.is_empty(){\
+                 self.maintenance_gateway_bootstrap(&op_manager,&op_manager.configured_gateways);}"
+            ),
+            "the maintenance loop must run the zero-connection bootstrap"
+        );
+        assert_eq!(
+            maintenance.matches("join_ring_request(").count(),
+            0,
+            "no join may be awaited inline in the maintenance loop"
+        );
+        let body = squash(fn_body(
+            RING,
+            "pub(crate) fn maintenance_gateway_bootstrap(",
+        ));
+        let begin = body
+            .find(
+                "letSome(mutround)=crate::operations::connect::bootstrap::BootstrapRoundGuard::\
+                 try_begin(&op_manager.bootstrap_pacer,tokio::time::Instant::now(),)else{returnfalse;};",
+            )
+            .expect("the bootstrap must take the shared round before acting");
+        let spawn = body
+            .find("GlobalExecutor::spawn(asyncmove{")
+            .expect("the joins must run in a spawned task");
+        let owns = body
+            .find("letround=round;")
+            .expect("the spawned task must move the round guard in");
+        let join = body
+            .find("join_ring_request(")
+            .expect("the bootstrap must join through the gateways");
+        let release = body
+            .find("sleep_or_shutdown(&shutdown,joins).await;drop(round);")
+            .expect("the round must be held until its joins end");
+        assert!(
+            begin < spawn && spawn < owns && owns < join && join < release,
+            "take the round, then spawn the joins holding it until they end"
+        );
+    }
+
+    /// While isolated the maintenance loop sends no version probe (#5858):
+    /// the paced bootstrap rounds already reach the gateways, and an unpaced
+    /// probe CONNECT would be a request the pacer does not count.
+    #[test]
+    fn maintenance_skips_version_probes_while_isolated() {
+        const RING: &str = include_str!("../ring.rs");
+        let maintenance = squash(fn_body(RING, "async fn connection_maintenance("));
+        let probe = maintenance
+            .find("crate::operations::connect::gateway_version_probe(gateway,&op_manager)")
+            .expect("the maintenance loop probes gateway versions");
+        let guard = maintenance
+            .find("ifcurrent_conn_count>0&&should_probe_gateway(")
+            .expect("the version probe must be skipped at zero connections");
+        assert!(guard < probe, "the guard must gate the probe");
+    }
+
+    /// The Turmoil runner marks its thread as running a simulation before it
+    /// builds any host, as the other runners do, so its nodes leave the
+    /// process-global network_status alone (Codex P2).
+    #[test]
+    fn the_turmoil_runner_sets_the_simulation_marker() {
+        const TESTING: &str = include_str!("../node/testing_impl.rs");
+        let start = TESTING
+            .find("    pub fn run_simulation<R, F, Fut>(")
+            .expect("run_simulation not found");
+        let end = start
+            + TESTING[start..]
+                .find("\n    }\n")
+                .expect("end of run_simulation");
+        let body = squash(&TESTING[start..end]);
+        let marker = body
+            .find("crate::ring::topology_registry::set_current_network_name(&self.name);")
+            .expect("run_simulation must set the simulation marker");
+        let build = body
+            .find("turmoil::Builder::new()")
+            .expect("run_simulation builds the Turmoil simulation");
+        assert!(
+            marker < build,
+            "the marker must be set before any host runs"
+        );
+    }
+
+    /// The maintenance bootstrap and the join loop share one pacer (#5858):
+    /// while one path is taking a round, or inside the backoff after it, the
+    /// other starts none; and the maintenance round clears only reservations
+    /// that paced rounds own, so the reservation of a CONNECT sent outside any
+    /// round survives it.
+    #[test]
+    fn maintenance_and_join_loop_bootstrap_rounds_exclude_each_other() {
+        let _lock = crate::node::network_status::TEST_GLOBAL_STATE_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        crate::node::network_status::init(0, HashSet::new(), "test".to_string());
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .start_paused(true)
+            .build()
+            .expect("build test runtime")
+            .block_on(async {
+                let config_args = crate::config::ConfigArgs {
+                    id: Some("bootstrap-5858-exclusion".to_string()),
+                    mode: Some(crate::contract::OperationMode::Local),
+                    ..Default::default()
+                };
+                let node_config =
+                    crate::node::NodeConfig::new(config_args.build().await.expect("Config"))
+                        .await
+                        .expect("NodeConfig");
+                let (notification_rx, notification_tx) =
+                    crate::node::event_loop_notification_channel();
+                let (ops_ch_channel, ch_channel, _wait_for_event) =
+                    crate::contract::contract_handler_channel();
+                let connection_manager = crate::ring::ConnectionManager::new(&node_config);
+                let (result_router_tx, result_router_rx) = tokio::sync::mpsc::channel(100);
+                let task_monitor =
+                    crate::node::background_task_monitor::BackgroundTaskMonitor::new();
+                let op_manager = Arc::new(
+                    OpManager::new(
+                        notification_tx,
+                        ops_ch_channel,
+                        &node_config,
+                        crate::tracing::DynamicRegister::new(vec![]),
+                        connection_manager,
+                        result_router_tx,
+                        &task_monitor,
+                    )
+                    .expect("OpManager"),
+                );
+                op_manager.ring.attach_op_manager(&op_manager);
+                op_manager
+                    .ring
+                    .connection_manager
+                    .set_own_addr_local_for_test("127.0.0.1:14859".parse().unwrap());
+                let crate::node::EventLoopNotificationsReceiver {
+                    notifications_receiver,
+                    mut op_execution_receiver,
+                } = notification_rx;
+                std::mem::forget((ch_channel, result_router_rx, notifications_receiver));
+
+                let gateways = vec![bootstrap_gateway(25870), bootstrap_gateway(25871)];
+                let live = gateways[0].socket_addr().unwrap();
+                let owned = gateways[1].socket_addr().unwrap();
+                let pacer = &op_manager.bootstrap_pacer;
+                let ring = &op_manager.ring;
+
+                let join_loop_round =
+                    bootstrap::BootstrapRoundGuard::try_begin(pacer, Instant::now())
+                        .expect("no round is running yet");
+                assert!(
+                    !ring.maintenance_gateway_bootstrap(&op_manager, &gateways),
+                    "maintenance must not start a round while the join loop runs one"
+                );
+                drop(join_loop_round);
+                assert!(
+                    op_execution_receiver.try_recv().is_err(),
+                    "no CONNECT may go out while the other path's round runs"
+                );
+
+                // A finished paced round left its reservation at `owned`; a
+                // CONNECT sent outside any round holds one at `live`.
+                bootstrap::BootstrapRoundGuard::try_begin(pacer, Instant::now())
+                    .expect("the join loop's round ended")
+                    .own_reservation(owned);
+                for addr in [live, owned] {
+                    ring.connection_manager.inject_reservation(
+                        addr,
+                        Location::from_address(&addr),
+                        Instant::now(),
+                    );
+                }
+                assert!(ring.maintenance_gateway_bootstrap(&op_manager, &gateways));
+                assert!(
+                    ring.connection_manager.has_connection_or_pending(live),
+                    "the reservation of a CONNECT outside any round was cleared"
+                );
+                assert!(
+                    bootstrap::BootstrapRoundGuard::try_begin(pacer, Instant::now()).is_none(),
+                    "the join loop must not start a round inside the backoff after maintenance's"
+                );
+
+                let mut targets = Vec::new();
+                let mut held = Vec::new();
+                while let Ok(Some((reply, msg, target))) =
+                    tokio::time::timeout(Duration::from_secs(1), op_execution_receiver.recv()).await
+                {
+                    if matches!(
+                        msg,
+                        crate::message::NetMessage::V1(crate::message::NetMessageV1::Connect(
+                            ConnectMsg::Request { .. }
+                        ))
+                    ) {
+                        targets.push(target);
+                    }
+                    held.push(reply);
+                }
+                assert_eq!(
+                    targets,
+                    vec![Some(owned)],
+                    "only the gateway whose leftover reservation was cleared is joined"
+                );
+            });
+    }
+
+    /// A joiner whose gateways never answer (#5858): every round's CONNECTs
+    /// go unanswered. Before the fix the loop waited for each round's
+    /// CONNECTs to reach the transaction TTL, so the second round started a
+    /// TTL later; now the next round starts after the pacer's backoff while
+    /// the earlier CONNECTs keep waiting, up to the cap on outstanding rounds,
+    /// and a round whose CONNECTs end frees its slot. Paused time; the test
+    /// plays the event loop, holding each CONNECT's reply channel open (neither
+    /// answered nor closed) until it chooses to end that transaction.
+    #[test]
+    fn isolated_joiner_overlaps_rounds_up_to_the_cap() {
+        let _lock = crate::node::network_status::TEST_GLOBAL_STATE_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        crate::node::network_status::init(0, HashSet::new(), "test".to_string());
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .start_paused(true)
+            .build()
+            .expect("build test runtime")
+            .block_on(async {
+                let config_args = crate::config::ConfigArgs {
+                    id: Some("bootstrap-5858-pacing".to_string()),
+                    mode: Some(crate::contract::OperationMode::Local),
+                    ..Default::default()
+                };
+                let node_config =
+                    crate::node::NodeConfig::new(config_args.build().await.expect("Config"))
+                        .await
+                        .expect("NodeConfig");
+                let (notification_rx, notification_tx) =
+                    crate::node::event_loop_notification_channel();
+                let (ops_ch_channel, ch_channel, _wait_for_event) =
+                    crate::contract::contract_handler_channel();
+                let connection_manager = crate::ring::ConnectionManager::new(&node_config);
+                let (result_router_tx, result_router_rx) = tokio::sync::mpsc::channel(100);
+                let task_monitor =
+                    crate::node::background_task_monitor::BackgroundTaskMonitor::new();
+                let op_manager = Arc::new(
+                    OpManager::new(
+                        notification_tx,
+                        ops_ch_channel,
+                        &node_config,
+                        crate::tracing::DynamicRegister::new(vec![]),
+                        connection_manager,
+                        result_router_tx,
+                        &task_monitor,
+                    )
+                    .expect("OpManager"),
+                );
+                op_manager.ring.attach_op_manager(&op_manager);
+                op_manager
+                    .ring
+                    .connection_manager
+                    .set_own_addr_local_for_test("127.0.0.1:14858".parse().unwrap());
+                let crate::node::EventLoopNotificationsReceiver {
+                    notifications_receiver,
+                    mut op_execution_receiver,
+                } = notification_rx;
+                std::mem::forget((ch_channel, result_router_rx, notifications_receiver));
+
+                let gateways = vec![bootstrap_gateway(25858), bootstrap_gateway(25859)];
+                let start = Instant::now();
+                let handle = initial_join_procedure(op_manager.clone(), &gateways)
+                    .await
+                    .expect("spawn join procedure");
+                let mut requests = Vec::new();
+                let mut held = Vec::new();
+                let mut collect_until =
+                    async |until: Duration, requests: &mut Vec<Duration>, held: &mut Vec<_>| {
+                        while let Ok(Some((reply, msg, _target))) = tokio::time::timeout(
+                            until.saturating_sub(start.elapsed()),
+                            op_execution_receiver.recv(),
+                        )
+                        .await
+                        {
+                            if matches!(
+                                msg,
+                                crate::message::NetMessage::V1(
+                                    crate::message::NetMessageV1::Connect(
+                                        ConnectMsg::Request { .. }
+                                    )
+                                )
+                            ) {
+                                requests.push(start.elapsed());
+                            }
+                            held.push(reply);
+                        }
+                    };
+                collect_until(Duration::from_secs(50), &mut requests, &mut held).await;
+
+                let rounds = |requests: &[Duration]| {
+                    let mut starts: Vec<Duration> = Vec::new();
+                    for t in requests {
+                        if starts
+                            .last()
+                            .is_none_or(|s| *t > *s + Duration::from_secs(1))
+                        {
+                            starts.push(*t);
+                        }
+                    }
+                    starts
+                };
+                let starts = rounds(&requests);
+                assert!(
+                    starts.get(1).is_some_and(|t| *t < Duration::from_secs(7)),
+                    "the second round must start after the first backoff while the first \
+                     round's CONNECTs are still waiting; CONNECT requests at {requests:?}"
+                );
+                assert_eq!(
+                    starts.len(),
+                    bootstrap::MAX_OUTSTANDING_BOOTSTRAP_ROUNDS,
+                    "rounds overlap only up to the cap while none has ended; requests at \
+                     {requests:?}"
+                );
+                assert_eq!(
+                    requests.len(),
+                    2 * bootstrap::MAX_OUTSTANDING_BOOTSTRAP_ROUNDS,
+                    "one CONNECT per gateway per round; requests at {requests:?}"
+                );
+
+                // The first round's two CONNECTs end (their transactions
+                // close): its slot frees, and the next round follows at once,
+                // the backoff having long passed.
+                held.drain(..2);
+                collect_until(Duration::from_secs(60), &mut requests, &mut held).await;
+                handle.abort();
+                let after: Vec<_> = requests
+                    .iter()
+                    .filter(|t| **t >= Duration::from_secs(50))
+                    .collect();
+                assert_eq!(
+                    after.len(),
+                    2,
+                    "a freed slot must start one more round; requests at {requests:?}"
+                );
+                assert!(
+                    after.iter().all(|t| **t < Duration::from_secs(53)),
+                    "the round must follow the freed slot promptly; requests at {requests:?}"
+                );
+                drop(held);
+            });
     }
 
     fn bootstrap_gateway(port: u16) -> PeerKeyLocation {
@@ -2491,6 +2984,62 @@ mod tests {
         join_ring_request(gateway, op_manager, Some(Duration::from_millis(100)))
             .await
             .ok();
+    }
+
+    /// The #4362 jitter counter grows when a join attempt has ended without a
+    /// connection, not when it starts (review item 5): with overlapping
+    /// bootstrap rounds, counting starts reached the widened re-route in
+    /// seconds.
+    #[test]
+    fn jitter_failures_count_ended_attempts_not_started_ones() {
+        with_network_status_lock(async {
+            let op_manager =
+                bootstrap_test_op_manager("jitter-5858-ended", "127.0.0.1:14861").await;
+            // Virtual time from here on: the probe below must see the attempt
+            // still running however slow the machine is.
+            tokio::time::pause();
+            let cm = &op_manager.ring.connection_manager;
+            let gateway = bootstrap_gateway(24871);
+            let attempt =
+                join_ring_request(&gateway, &op_manager, Some(Duration::from_millis(300)));
+            let during = async {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                cm.connect_jitter_failure_count()
+            };
+            let (_, during) = tokio::join!(attempt, during);
+            assert_eq!(during, 0, "an attempt still running is not a failure");
+            assert_eq!(
+                cm.connect_jitter_failure_count(),
+                1,
+                "an attempt that ended without a connection is"
+            );
+        });
+    }
+
+    /// A gap-targeted attempt (3+ connections) never touched the #4362 jitter
+    /// counter on main and still does not when it ends without a connection
+    /// (re-review N4).
+    #[test]
+    fn a_gap_targeted_attempt_does_not_grow_the_jitter_counter() {
+        with_network_status_lock(async {
+            let op_manager = bootstrap_test_op_manager("jitter-5858-gap", "127.0.0.1:14862").await;
+            tokio::time::pause();
+            let cm = &op_manager.ring.connection_manager;
+            for (i, loc) in [0.1, 0.4, 0.7].into_iter().enumerate() {
+                let addr: SocketAddr = format!("127.0.0.5:{}", 26000 + i).parse().unwrap();
+                assert!(cm.add_connection(
+                    Location::new(loc),
+                    addr,
+                    TransportKeypair::new().public().clone(),
+                    false
+                ));
+            }
+            let gateway = bootstrap_gateway(24872);
+            join_ring_request(&gateway, &op_manager, Some(Duration::from_millis(300)))
+                .await
+                .ok();
+            assert_eq!(cm.connect_jitter_failure_count(), 0);
+        });
     }
 
     /// #5858: `connect_attempts_before_first_connection` counts exactly one

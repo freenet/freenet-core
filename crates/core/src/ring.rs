@@ -6023,6 +6023,93 @@ impl Ring {
         }
     }
 
+    /// Base number of concurrent connection acquisition attempts (steady-state).
+    const BASE_CONCURRENT_CONNECTIONS: usize = 3;
+
+    /// The maintenance loop's zero-connection gateway bootstrap (#5858).
+    ///
+    /// Shares the bootstrap pacer with `initial_join_procedure`, so rounds
+    /// from the two paths are spaced by one backoff and count toward one cap
+    /// on outstanding rounds. Gateway reservations made by paced rounds are
+    /// cleared rather than left to gate this path for the reservation TTL (the
+    /// pacer bounds the CONNECTs behind them); one made by a CONNECT sent
+    /// outside a round (while this peer still had a connection) is left alone.
+    /// The round's CONNECTs run in a spawned task that holds the round until
+    /// they end: awaited here they held the whole maintenance loop for a
+    /// transaction TTL. Returns whether CONNECTs were sent.
+    pub(crate) fn maintenance_gateway_bootstrap(
+        &self,
+        op_manager: &Arc<OpManager>,
+        gateways: &[PeerKeyLocation],
+    ) -> bool {
+        let Some(mut round) = crate::operations::connect::bootstrap::BootstrapRoundGuard::try_begin(
+            &op_manager.bootstrap_pacer,
+            tokio::time::Instant::now(),
+        ) else {
+            return false;
+        };
+        let owned = op_manager.bootstrap_pacer.lock().take_owned_reservations();
+        self.connection_manager.clear_owned_reservations(&owned);
+        let eligible: Vec<PeerKeyLocation> = {
+            let backoff = op_manager.gateway_backoff.lock();
+            self.is_not_connected(gateways.iter())
+                .filter(|gw| {
+                    gw.socket_addr()
+                        .map(|addr| !backoff.is_in_backoff(addr))
+                        .unwrap_or(false) // skip gateways without addresses
+                })
+                .take(Self::BASE_CONCURRENT_CONNECTIONS)
+                .cloned()
+                .collect()
+        };
+        if eligible.is_empty() {
+            tracing::debug!(
+                total_gateways = gateways.len(),
+                "Zero connections — all gateways connected or in backoff"
+            );
+            return false;
+        }
+        tracing::info!(
+            attempting = eligible.len(),
+            "Zero connections — attempting gateway bootstrap"
+        );
+        round.issue();
+        for addr in eligible.iter().filter_map(|gw| gw.socket_addr()) {
+            round.own_reservation(addr);
+        }
+        let op_manager = op_manager.clone();
+        let shutdown = self.shutdown.clone();
+        GlobalExecutor::spawn(async move {
+            use futures::StreamExt;
+            // Move the guard in: it frees the round's slot when the joins end.
+            let round = round;
+            let op_manager = &op_manager;
+            let joins: futures::stream::FuturesUnordered<_> = eligible
+                .iter()
+                .map(|gw| async move {
+                    (
+                        crate::operations::connect::join_ring_request(gw, op_manager, None).await,
+                        gw,
+                    )
+                })
+                .collect();
+            let joins = joins.for_each(|(res, gw)| async move {
+                match res {
+                    Ok(()) => tracing::debug!(gateway = %gw, "Gateway bootstrap initiated"),
+                    Err(e) => tracing::warn!(
+                        gateway = %gw,
+                        error = %e,
+                        "Gateway bootstrap failed"
+                    ),
+                }
+            });
+            // Ends with the node rather than outliving it.
+            sleep_or_shutdown(&shutdown, joins).await;
+            drop(round);
+        });
+        true
+    }
+
     async fn connection_maintenance(
         self: Arc<Self>,
         notifier: EventLoopNotificationsSender,
@@ -6044,9 +6131,6 @@ impl Ring {
         const FAST_CHECK_TICK_DURATION: Duration = Duration::from_secs(1);
 
         const REGENERATE_DENSITY_MAP_INTERVAL: Duration = Duration::from_secs(60);
-
-        /// Base number of concurrent connection acquisition attempts (steady-state).
-        const BASE_CONCURRENT_CONNECTIONS: usize = 3;
 
         let mut check_interval = tokio::time::interval(CHECK_TICK_DURATION);
         check_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -6333,6 +6417,13 @@ impl Ring {
             let reset_all_backoff = || {
                 self.reset_all_connection_backoff();
                 op_manager.gateway_backoff.lock().clear();
+                // The bootstrap pacer's wait too, unless a round started
+                // recently, or the woken join loop would go straight back to
+                // sleep on a stale wait (#5858).
+                op_manager
+                    .bootstrap_pacer
+                    .lock()
+                    .backoff_reset(tokio::time::Instant::now());
                 op_manager.gateway_backoff_cleared.notify_waiters();
                 // Also clear stale pending reservations for gateways — without this,
                 // gateways appear "connected/pending" via has_connection_or_pending()
@@ -6462,6 +6553,12 @@ impl Ring {
             let current_conn_count = self.connection_manager.connection_count();
             // Expose to update check task for version mismatch decisions (#3204).
             crate::transport::set_open_connection_count(current_conn_count);
+            // A connection gained by any path counts toward resetting the
+            // bootstrap backoff (#5858).
+            op_manager
+                .bootstrap_pacer
+                .lock()
+                .observe_connections(tokio::time::Instant::now(), current_conn_count > 0);
             if current_conn_count == 0 {
                 // Use shorter threshold before first successful connection so
                 // cold-start failures (e.g., after OS restart) recover in ~30s
@@ -6506,12 +6603,19 @@ impl Ring {
             // now >= next_probe`) is extracted into `should_probe_gateway` so each branch
             // is unit-testable. Without the empty-gateways guard merged into the same
             // condition, the index/modulo on the next line would panic.
-            if should_probe_gateway(
-                is_gateway,
-                !op_manager.configured_gateways.is_empty(),
-                self.time_source.now(),
-                next_gateway_probe,
-            ) {
+            //
+            // Not while isolated (#5858): the bootstrap rounds below are
+            // CONNECTs to the gateways already, paced and capped, and an
+            // unpaced probe CONNECT next to them would add a request the pacer
+            // does not count.
+            if current_conn_count > 0
+                && should_probe_gateway(
+                    is_gateway,
+                    !op_manager.configured_gateways.is_empty(),
+                    self.time_source.now(),
+                    next_gateway_probe,
+                )
+            {
                 let gw_index =
                     GlobalRng::random_u64() as usize % op_manager.configured_gateways.len();
                 let gateway = &op_manager.configured_gateways[gw_index];
@@ -6535,50 +6639,10 @@ impl Ring {
             }
 
             // Gateway bootstrap fallback: at zero connections, acquire_new always
-            // fails (no routing candidates). Connect to gateways directly (#3219).
-            //
-            // Note: initial_join_procedure may also be attempting gateway connections
-            // concurrently. is_not_connected provides best-effort dedup via pending
-            // reservations (should_accept creates one on each join_ring_request), so
-            // the second caller typically sees the gateway as "pending" and skips it.
-            // Occasional duplicate CONNECTs are harmless — the connect state machine
-            // handles them gracefully.
+            // fails (no routing candidates). Connect to gateways directly (#3219),
+            // paced with `initial_join_procedure` (#5858).
             if current_conn_count == 0 && !op_manager.configured_gateways.is_empty() {
-                let eligible: Vec<_> = {
-                    let backoff = op_manager.gateway_backoff.lock();
-                    self.is_not_connected(op_manager.configured_gateways.iter())
-                        .filter(|gw| {
-                            gw.socket_addr()
-                                .map(|addr| !backoff.is_in_backoff(addr))
-                                .unwrap_or(false) // skip gateways without addresses
-                        })
-                        .cloned()
-                        .collect()
-                };
-
-                if eligible.is_empty() {
-                    tracing::debug!(
-                        total_gateways = op_manager.configured_gateways.len(),
-                        "Zero connections — all gateways connected/pending or in backoff"
-                    );
-                } else {
-                    let attempt_count = eligible.len().min(BASE_CONCURRENT_CONNECTIONS);
-                    tracing::info!(
-                        eligible = eligible.len(),
-                        attempting = attempt_count,
-                        "Zero connections — attempting gateway bootstrap"
-                    );
-                    for gw in eligible.iter().take(BASE_CONCURRENT_CONNECTIONS) {
-                        match crate::operations::connect::join_ring_request(gw, &op_manager, None)
-                            .await
-                        {
-                            Ok(()) => tracing::debug!(gateway = %gw, "Gateway bootstrap initiated"),
-                            Err(e) => {
-                                tracing::warn!(gateway = %gw, error = %e, "Gateway bootstrap failed")
-                            }
-                        }
-                    }
-                }
+                self.maintenance_gateway_bootstrap(&op_manager, &op_manager.configured_gateways);
             }
 
             // Scale concurrent connection limit based on deficit to min_connections.
