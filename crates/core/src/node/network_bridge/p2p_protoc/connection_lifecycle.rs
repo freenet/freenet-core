@@ -514,7 +514,23 @@ impl P2pConnManager {
             let connection_manager = &self.bridge.op_manager.ring.connection_manager;
             let current = connection_manager.connection_count();
             let loc = Location::from_address(&peer_addr);
-            if connection_manager.refuses_connection_at_cap(loc) {
+            // Other outbound dials still awaiting a handshake take a slot if
+            // they succeed. As the requester we hold no reservation for them,
+            // so without counting them a full node handed several lattice
+            // candidates at once would start NAT traversal for every one
+            // (`refuses_dial_at_cap`). Collected only at the cap, where the
+            // predicate reads them.
+            let in_flight: Vec<SocketAddr> = if connection_manager.at_max_connections() {
+                state
+                    .awaiting_connection
+                    .keys()
+                    .filter(|addr| **addr != peer_addr && !connection_manager.is_in_ring(**addr))
+                    .copied()
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            if connection_manager.refuses_dial_at_cap(loc, &in_flight) {
                 tracing::info!(
                     tx = %tx,
                     remote = %peer_addr,
