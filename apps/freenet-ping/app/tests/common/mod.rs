@@ -699,6 +699,78 @@ pub async fn get_contract_state(
         .map_err(|e| anyhow::anyhow!("Failed to get contract state: {}", e))
 }
 
+/// Polls `client`'s view of the contract until its state contains
+/// `expected_name`, failing once `timeout` elapses.
+///
+/// Use this instead of a fixed sleep followed by a one-shot assert when
+/// waiting for an update to propagate: under CI load propagation time varies,
+/// and a fixed sleep either wastes time or fails a correct run (#4910).
+///
+/// The deadline is hard: each GET is bounded by the time remaining, and on
+/// timeout the error reports the keys last observed. Keep `timeout` short:
+/// a generous one gives slower background repair paths time to deliver the
+/// update, which can hide a broken live delivery path.
+///
+/// Success means the update reached `client`'s node only while `client`
+/// holds a subscription to the contract: then the node serves these GETs
+/// from its local copy (`is_receiving_updates`) instead of the network.
+///
+/// Do not reuse `client` after an `Err`: a GET abandoned at the deadline may
+/// still answer later, and a following GET could accept that stale response.
+pub async fn wait_for_ping_entry(
+    client: &mut WebApi,
+    key: ContractKey,
+    expected_name: &str,
+    timeout: Duration,
+) -> Result<Ping> {
+    const POLL_INTERVAL: Duration = Duration::from_secs(1);
+    let start = tokio::time::Instant::now();
+    let deadline = start + timeout;
+    let mut polls = 0u32;
+    let mut last_keys: Option<Vec<String>> = None;
+    let mut get_in_flight_at_deadline = false;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            anyhow::bail!(
+                "ping entry '{expected_name}' not observed within {timeout:?} \
+                 ({polls} polls, {:?} elapsed, GET in flight at deadline: \
+                 {get_in_flight_at_deadline}); last observed keys: {last_keys:?}",
+                start.elapsed()
+            );
+        }
+        match tokio::time::timeout(remaining, get_contract_state(client, key, false)).await {
+            Ok(Ok(state)) => {
+                polls += 1;
+                if state.contains_key(expected_name) {
+                    // eprintln, not tracing: these tests install no subscriber.
+                    // The elapsed time is the signal for propagation drift; it
+                    // shows in --no-capture runs and in a failing test's output.
+                    eprintln!(
+                        "observed ping entry '{expected_name}' after {:?} ({polls} polls)",
+                        start.elapsed()
+                    );
+                    return Ok(state);
+                }
+                last_keys = Some(state.keys().cloned().collect());
+            }
+            Ok(Err(e)) => {
+                return Err(e.context(format!(
+                    "GET failed after {:?} while waiting for ping entry '{expected_name}'",
+                    start.elapsed()
+                )));
+            }
+            // The GET itself ran past the deadline; the next iteration bails.
+            Err(_) => {
+                get_in_flight_at_deadline = true;
+                continue;
+            }
+        }
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        sleep(POLL_INTERVAL.min(remaining)).await;
+    }
+}
+
 pub async fn update_contract_state(
     client: &mut WebApi,
     key: ContractKey,

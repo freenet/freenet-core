@@ -33,11 +33,14 @@
 //!
 //! peer(1)'s update never transits the subscriber's own client. The ONLY route
 //! by which peer(0) can observe peer(1)'s key is the gateway-held downstream
-//! registration keyed on peer(0)'s NAT-observed address. So the final
-//! `assert!` that peer(0)'s state contains the key peer(1) set is contingent on
-//! the NAT address-filling path working end to end. If address-filling
-//! regressed, peer(0) would never be registered reachable and the update would
-//! not arrive — the assertion would fail.
+//! registration keyed on peer(0)'s NAT-observed address. So the final check
+//! that peer(0)'s state contains the key peer(1) set is contingent on the NAT
+//! address-filling path working end to end. If address-filling regressed,
+//! peer(0) would never be registered reachable and the update would not
+//! arrive — the check would time out and fail the test.
+//!
+//! (This "ONLY route" claim predates live UPDATE fan-out becoming
+//! advertised-co-host-only and may no longer hold: see #5880.)
 //!
 //! ## Contract hosting note
 //!
@@ -54,10 +57,10 @@
 
 mod common;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use common::{
     APP_TAG, PACKAGE_DIR, PATH_TO_CONTRACT, connect_ws_with_retry, get_contract_state,
-    load_contract, subscribe_to_contract, update_contract_state,
+    load_contract, subscribe_to_contract, update_contract_state, wait_for_ping_entry,
 };
 use freenet_ping_app::ping_client::wait_for_put_response;
 use freenet_ping_types::{Ping, PingContractOptions};
@@ -67,6 +70,12 @@ use freenet_stdlib::{
 };
 use freenet_test_network::{FreenetBinary, NetworkBuilder, TestNetwork};
 use std::{path::PathBuf, time::Duration};
+
+/// How long the subscribed peer may take to observe the update. A healthy
+/// run observes it within the first 1s poll; 20s is twice the old fixed 10s
+/// window, slack for a slow CI runner. Keep it short: a longer window makes it
+/// more likely that a background repair, not live delivery, satisfies the check.
+const UPDATE_PROPAGATION_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Cross-peer NAT subscription delivery: a NAT peer subscribes through the
 /// gateway, a *different* NAT peer updates, and the subscriber receives it.
@@ -177,20 +186,22 @@ async fn test_nat_subscription_cross_peer_update_via_docker_nat() -> Result<()> 
     update_contract_state(&mut updater_client, contract_key, update).await?;
     tracing::info!("State update sent from updater peer (peer1)");
 
-    // Allow update propagation.
-    tokio::time::sleep(Duration::from_secs(10)).await;
-
     // --- Verify the subscriber peer received the cross-peer update ---
-    let subscriber_state = get_contract_state(&mut subscriber_client, contract_key, false).await?;
-    assert!(
-        subscriber_state.contains_key("cross-peer-nat-node"),
+    // Poll rather than sleep-then-assert: propagation time varies under CI
+    // load (#4910). The deadline still fails the test if delivery is broken.
+    wait_for_ping_entry(
+        &mut subscriber_client,
+        contract_key,
+        "cross-peer-nat-node",
+        UPDATE_PROPAGATION_TIMEOUT,
+    )
+    .await
+    .context(
         "Subscriber peer (peer0, behind NAT) should have received the \
          'cross-peer-nat-node' key set by a DIFFERENT NAT peer (peer1) via \
          gateway-relayed downstream subscription. Delivery requires the gateway \
-         to have registered peer0 by its NAT-observed source_addr. \
-         Got keys: {:?}",
-        subscriber_state.keys().collect::<Vec<_>>()
-    );
+         to have registered peer0 by its NAT-observed source_addr.",
+    )?;
 
     tracing::info!("Docker NAT cross-peer subscription test passed");
     Ok(())
