@@ -268,7 +268,8 @@ outstanding (an unpaced round started while the peer still had a connection can 
 The backoff resets once a ring connection has lasted 30 s; isolation recovery shortens a
 stale wait to a jittered 5 s unless a round started in the last 30 s. Once connected, no
 new bootstrap rounds start but outstanding CONNECTs run on. Acceptors are dialled
-concurrently (up to 4, at most 2x `min_connections` per CONNECT), and every end of
+concurrently (up to 4 at once; at most 2x `min_connections`, and no fewer than 4, per
+CONNECT), and every end of
 collection (Rejected, TTL, waiter closed) still finishes the dials already taken. While
 the joiner does not know its own address, the gateway's `ObservedAddress` shows the link
 is alive; two joins in a row through a configured gateway without one after 15 s drop that
