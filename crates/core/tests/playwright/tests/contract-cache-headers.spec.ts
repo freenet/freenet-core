@@ -60,17 +60,25 @@ test("the shell and the sandboxed app document are served no-store", async ({
 
   const isSandbox = (r: Response) =>
     new URL(r.url()).searchParams.get("__sandbox") === "1";
-  // Both documents must have been seen, or the assertions below could pass
-  // over a set that is missing the pipeline they are meant to cover.
-  expect(contractResponses.some((r) => !isSandbox(r))).toBe(true);
-  expect(contractResponses.some(isSandbox)).toBe(true);
-
+  // Only documents are covered; assets keep their caching (#5888). The fixture
+  // is all HTML, so this skips nothing today.
+  const documents: { response: Response; cacheControl?: string }[] = [];
   for (const response of contractResponses) {
     // `allHeaders` rather than `headers`: the latter omits some headers in
     // some engines.
     const headers = await response.allHeaders();
+    if (/^(text\/html|application\/xhtml\+xml)\b/i.test(headers["content-type"] ?? "")) {
+      documents.push({ response, cacheControl: headers["cache-control"] });
+    }
+  }
+  // Both documents must be among them, or the assertions below could pass
+  // over a set that is missing the pipeline they are meant to cover.
+  expect(documents.some(({ response }) => !isSandbox(response))).toBe(true);
+  expect(documents.some(({ response }) => isSandbox(response))).toBe(true);
+
+  for (const { response, cacheControl } of documents) {
     expect(
-      headers["cache-control"],
+      cacheControl,
       `${response.url()} must be no-store, or an open tab keeps running the ` +
         `old bundle after a republish (#5323)`,
     ).toBe("no-store");

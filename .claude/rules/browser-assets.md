@@ -117,8 +117,12 @@ must be registered inside it. Nothing will fail if it is not, because
 `contract_html_is_served_no_store_and_assets_are_not` only exercises the
 routes it lists.
 
-Assets are deliberately NOT `no-store`: try.freenet.org's reverse proxy marks
-hashed `assets/*` immutable, and a `no-store` from the node cancels that in the
-browser. Unhashed assets therefore stay heuristically cacheable through
-`ServeFile`'s `Last-Modified`; the fix for those is validators, not `no-store`.
-The no-trailing-slash 308 stays outside the wrapper on purpose (#4019).
+Assets are deliberately NOT `no-store`: the reverse proxy in front of
+try.freenet.org (nova's Caddyfile, `@assets` in that vhost) adds
+`Cache-Control: public, max-age=31536000, immutable` to every path under
+`assets/` and passes the node's header through alongside, so a `no-store` from
+the node would cancel that in the browser. Unhashed assets therefore stay
+heuristically cacheable through `ServeFile`'s `Last-Modified`; the fix for
+those is conditional requests plus `no-cache` (#5888), not `no-store`. The
+match is by `Content-Type` (`text/html`, `application/xhtml+xml`), so an SVG
+loaded as a document is not covered.

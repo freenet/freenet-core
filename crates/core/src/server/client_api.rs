@@ -384,10 +384,13 @@ impl Config {
 /// are content-hashed.
 ///
 /// Assets are deliberately not touched. Hashed assets are safe to cache, and
-/// try.freenet.org's reverse proxy caches `assets/*` as immutable, which a
-/// `no-store` from here would cancel in the browser. Unhashed assets served by
-/// `ServeFile` stay heuristically cacheable through its `Last-Modified`; fixing
-/// that needs validators, not `no-store` (#5323 follow-up).
+/// the reverse proxy in front of try.freenet.org (nova's Caddyfile, `@assets`
+/// in that vhost) adds `Cache-Control: public, max-age=31536000, immutable` to
+/// every path under `assets/`. It passes the node's own `Cache-Control` through
+/// alongside, so a `no-store` from here would cancel that in the browser.
+/// Unhashed assets served by `ServeFile` therefore stay heuristically cacheable
+/// through its `Last-Modified`. Fixing those needs conditional requests plus
+/// `no-cache`, not `no-store` (#5888).
 ///
 /// Keyed on the response `Content-Type` and applied to the routes rather than
 /// at each response site, because HTML leaves through several unrelated
@@ -417,7 +420,11 @@ fn is_html_response(response: &axum::response::Response) -> bool {
         .get(axum::http::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.split(';').next())
-        .is_some_and(|mime| mime.trim().eq_ignore_ascii_case("text/html"))
+        .map(str::trim)
+        .is_some_and(|mime| {
+            mime.eq_ignore_ascii_case("text/html")
+                || mime.eq_ignore_ascii_case("application/xhtml+xml")
+        })
 }
 
 #[instrument(level = "debug")]
@@ -2581,7 +2588,10 @@ mod tests {
     #[tokio::test]
     async fn contract_html_is_served_no_store_and_assets_are_not() {
         use axum::body::{Body, to_bytes};
-        use axum::http::{Method, Request, StatusCode, header::CACHE_CONTROL};
+        use axum::http::{
+            Method, Request, StatusCode,
+            header::{CACHE_CONTROL, LAST_MODIFIED},
+        };
         use freenet_stdlib::client_api::{ClientRequest, ContractRequest, ContractResponse};
         use freenet_stdlib::prelude::{
             ContractCode, ContractContainer, ContractWasmAPIVersion, Parameters, WrappedContract,
@@ -2691,13 +2701,21 @@ mod tests {
             // The shell is listed first: it is what populates the cache, as in a
             // real browser session.
             const NO_STORE: Option<&str> = Some("no-store");
-            for (pipeline, uri, fetch_dest, expected_body, expected_cache_control) in [
+            // The last column records whether the response carries
+            // `Last-Modified`, which is what makes a response heuristically
+            // cacheable. It pins the premises the scoping rests on: the JS
+            // rewrite branch has none (so leaving it alone is safe), and
+            // `ServeFile` assets do (the exposure #5888 tracks). It also tells
+            // the raw-HTML row apart from the sandbox rows, which serve the
+            // same body.
+            for (pipeline, uri, fetch_dest, expected_body, expected_cache_control, last_modified) in [
                 (
                     "shell page",
                     format!("{base}/"),
                     None,
                     "__sandbox=1".to_string(),
                     NO_STORE,
+                    false,
                 ),
                 (
                     "deep-link shell page",
@@ -2705,6 +2723,7 @@ mod tests {
                     Some("document"),
                     "__sandbox=1".to_string(),
                     NO_STORE,
+                    false,
                 ),
                 (
                     "sandboxed contract HTML",
@@ -2712,6 +2731,7 @@ mod tests {
                     Some("iframe"),
                     "root-5323".to_string(),
                     NO_STORE,
+                    false,
                 ),
                 (
                     "sandboxed sub-page HTML",
@@ -2719,6 +2739,7 @@ mod tests {
                     Some("iframe"),
                     "page-5323".to_string(),
                     NO_STORE,
+                    false,
                 ),
                 (
                     // An app framing its own HTML without `__sandbox`: served
@@ -2729,6 +2750,7 @@ mod tests {
                     Some("iframe"),
                     "page-5323".to_string(),
                     NO_STORE,
+                    true,
                 ),
                 (
                     "JS rewrite branch",
@@ -2736,6 +2758,7 @@ mod tests {
                     Some("script"),
                     format!("\"{base}/assets/app.wasm\""),
                     None,
+                    false,
                 ),
                 (
                     "ServeFile asset",
@@ -2743,11 +2766,13 @@ mod tests {
                     Some("style"),
                     "color: red".to_string(),
                     None,
+                    true,
                 ),
             ] {
                 let resp = get(uri.clone(), fetch_dest).await;
                 let status = resp.status();
                 let header = cache_control(&resp);
+                let has_last_modified = resp.headers().contains_key(LAST_MODIFIED);
                 let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
                 let body = String::from_utf8_lossy(&body);
                 assert_eq!(
@@ -2768,6 +2793,10 @@ mod tests {
                      a browser that has it open keeps running the old bundle after \
                      a republish (#5323); assets must be left alone"
                 );
+                assert_eq!(
+                    has_last_modified, last_modified,
+                    "{pipeline} ({uri}): unexpected presence of Last-Modified"
+                );
             }
 
             // HEAD is served by the same `get` route, so it is covered too.
@@ -2784,7 +2813,8 @@ mod tests {
             assert_eq!(cache_control(&resp), None);
 
             // The redirect carries no contract content and was made a 308 so the
-            // browser can cache it (#4019); the layer must not reach it.
+            // browser can cache it (#4019). It is outside the layer, and untyped
+            // besides, so this pins the result rather than the routing.
             let resp = get(base.clone(), None).await;
             assert_eq!(resp.status(), StatusCode::PERMANENT_REDIRECT, "{base}");
             assert_eq!(
@@ -2794,18 +2824,16 @@ mod tests {
             );
         }
 
-        // Routes outside the contract subtree keep their own cache policy: the
-        // notification worker is deliberately cacheable, and the node's own
-        // pages are out of scope (#4289). These catch the layer being widened to
-        // the whole router. (Whether the 404 fallback is wrapped depends on
-        // merge order here, so `no_store_html`'s own test pins that.)
+        // Routes outside the contract subtree keep their own cache policy. The
+        // node's homepage is HTML, so it is the case that catches the layer
+        // being widened to the whole router; the node's own pages are out of
+        // scope (#4289). The notification worker is deliberately cacheable.
+        // (Whether the 404 fallback is wrapped depends on merge order here, so
+        // `no_store_html`'s own test pins that.)
         let resp = get("/freenet-notify-sw.js".to_string(), None).await;
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(cache_control(&resp).as_deref(), Some("max-age=3600"));
-        for (uri, status) in [
-            ("/v1/version", StatusCode::OK),
-            ("/no-such-route", StatusCode::NOT_FOUND),
-        ] {
+        for (uri, status) in [("/", StatusCode::OK), ("/v1/version", StatusCode::OK)] {
             let resp = get(uri.to_string(), None).await;
             assert_eq!(resp.status(), status, "{uri}");
             assert_ne!(
@@ -2818,10 +2846,11 @@ mod tests {
         node.abort();
     }
 
-    /// `no_store_html` must replace a cacheable header a handler set on HTML,
-    /// leave non-HTML responses alone, wrap only the routes it was given, and
-    /// leave the sub-router's 404 fallback alone (a merged fallback can become
-    /// the whole node's 404).
+    /// `no_store_html` must replace a cacheable header a handler set on HTML
+    /// (including XHTML), leave non-HTML responses alone, wrap only the routes
+    /// it was given, and leave the sub-router's fallback alone (a merged
+    /// fallback can become the whole node's 404). The fallback is HTML so that
+    /// wrapping it would actually show.
     #[tokio::test]
     async fn no_store_html_overrides_only_html_and_wraps_only_its_routes() {
         use axum::http::{Request, StatusCode, header::CACHE_CONTROL, header::CONTENT_TYPE};
@@ -2837,6 +2866,15 @@ mod tests {
                 "<p>",
             )
         };
+        let xhtml = || async {
+            (
+                [
+                    (CONTENT_TYPE, "application/xhtml+xml"),
+                    (CACHE_CONTROL, "max-age=3600"),
+                ],
+                "<p/>",
+            )
+        };
         let css = || async {
             (
                 [(CONTENT_TYPE, "text/css"), (CACHE_CONTROL, "max-age=3600")],
@@ -2847,15 +2885,18 @@ mod tests {
             .merge(no_store_html(
                 Router::new()
                     .route("/inside.html", get(html))
-                    .route("/inside.css", get(css)),
+                    .route("/inside.xhtml", get(xhtml))
+                    .route("/inside.css", get(css))
+                    .fallback(html),
             ))
             .route("/outside.html", get(html));
 
         for (uri, status, expected) in [
             ("/inside.html", StatusCode::OK, Some("no-store")),
+            ("/inside.xhtml", StatusCode::OK, Some("no-store")),
             ("/inside.css", StatusCode::OK, Some("max-age=3600")),
             ("/outside.html", StatusCode::OK, Some("max-age=3600")),
-            ("/missing", StatusCode::NOT_FOUND, None),
+            ("/missing", StatusCode::OK, Some("max-age=3600")),
         ] {
             let resp = router
                 .clone()
