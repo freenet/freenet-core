@@ -550,6 +550,28 @@ enum OpManagerState<T> {
     Detached,
 }
 
+/// Order one renewal tick's (already shuffled) candidates: at most
+/// `provisional_slots` provisional leases (#2524) first, then every ordinary
+/// candidate, then the remaining provisional ones. The loop spends its batch
+/// from the front, so provisional leases get priority without ever taking more
+/// than `provisional_slots` slots from ordinary renewals that need them; when
+/// there are too few ordinary candidates the rest fall to provisional ones.
+/// Order within each group is preserved.
+fn order_renewal_candidates(
+    candidates: Vec<ContractKey>,
+    is_provisional: impl Fn(&ContractKey) -> bool,
+    provisional_slots: usize,
+) -> Vec<ContractKey> {
+    let (provisional, ordinary): (Vec<_>, Vec<_>) =
+        candidates.into_iter().partition(|key| is_provisional(key));
+    let split = provisional_slots.min(provisional.len());
+    let mut ordered = Vec::with_capacity(provisional.len() + ordinary.len());
+    ordered.extend_from_slice(&provisional[..split]);
+    ordered.extend(ordinary);
+    ordered.extend_from_slice(&provisional[split..]);
+    ordered
+}
+
 /// Classify a `RwLock<Option<Weak<T>>>` back-reference into the three states
 /// the maintenance loop cares about. Generic over `T` so it can be
 /// unit-tested with a stand-in `Arc` instead of a full `OpManager` (#3308).
@@ -3167,11 +3189,6 @@ impl Ring {
             // (first N in iteration order) would always be tried first, blocking later
             // contracts from ever being attempted when they hit the batch limit.
             GlobalRng::shuffle(&mut contracts_needing_renewal);
-            // Provisional leases (#2524) first: their upstream could not
-            // register us, so they get no UPDATEs until renewed, while a
-            // near-expiry lease still works. Stable sort keeps the shuffle
-            // within each group.
-            contracts_needing_renewal.sort_by_key(|key| !ring.is_subscription_provisional(key));
 
             // Get op_manager to spawn subscription requests
             let Some(op_manager) = ring.upgrade_op_manager() else {
@@ -3204,6 +3221,16 @@ impl Ring {
                 } else {
                     Self::MAX_RECOVERY_ATTEMPTS_PER_INTERVAL
                 };
+
+            // Provisional leases (#2524) get up to half of this tick's slots
+            // first: their upstream could not register us, so they get no
+            // UPDATEs until renewed. The cap keeps near-expiry ordinary leases,
+            // which lapse if starved, from losing every slot to them.
+            let contracts_needing_renewal = order_renewal_candidates(
+                contracts_needing_renewal,
+                |key| ring.is_subscription_provisional(key),
+                (batch_limit / 2).max(1),
+            );
 
             let mut attempted = 0;
             let mut skipped = 0;
@@ -8260,6 +8287,78 @@ mod k_closest_source_tests {
             teardown_pos < unregister_pos,
             "sync_interest_for_evicted_in_use must precede unregister_local_hosting in the sweep \
              so interest loss is reported against the already-zeroed subscriber counts."
+        );
+    }
+
+    /// #2524 fairness: with more due leases than one tick's batch, provisional
+    /// leases take at most half of the batch from the front, ordinary ones
+    /// fill the rest, and leftover provisional ones come last. With too few
+    /// ordinary candidates the provisional ones use the free slots.
+    #[test]
+    fn renewal_order_caps_provisional_leases_at_half_the_batch() {
+        use freenet_stdlib::prelude::{CodeHash, ContractInstanceId, ContractKey};
+        let key = |i: u8| {
+            ContractKey::from_id_and_code(ContractInstanceId::new([i; 32]), CodeHash::new([1; 32]))
+        };
+        let provisional = |k: &ContractKey| k.id().as_bytes()[0] >= 100;
+        use super::{Ring, order_renewal_candidates};
+        let batch = Ring::MAX_RECOVERY_ATTEMPTS_PER_INTERVAL;
+        let slots = (batch / 2).max(1);
+
+        // 12 provisional and 8 ordinary, interleaved as a shuffle leaves them.
+        let mixed: Vec<ContractKey> = (0..20u8)
+            .map(|i| if i % 5 < 3 { key(100 + i) } else { key(i) })
+            .collect();
+        assert_eq!(mixed.iter().filter(|k| provisional(k)).count(), 12);
+        let ordered = order_renewal_candidates(mixed.clone(), provisional, slots);
+        assert_eq!(ordered.len(), mixed.len());
+        let front = &ordered[..batch];
+        assert_eq!(front.iter().filter(|k| provisional(k)).count(), slots);
+        assert!(
+            ordered[..slots].iter().all(provisional),
+            "provisional first"
+        );
+        assert!(
+            ordered[slots + 8..].iter().all(provisional),
+            "leftovers last"
+        );
+        let order_in = |keys: &[ContractKey], ordinary: bool| -> Vec<ContractKey> {
+            keys.iter()
+                .filter(|k| provisional(k) != ordinary)
+                .copied()
+                .collect()
+        };
+        assert_eq!(order_in(&ordered, true), order_in(&mixed, true));
+        assert_eq!(order_in(&ordered, false), order_in(&mixed, false));
+
+        // Only provisional leases due: they use the whole batch.
+        let only: Vec<ContractKey> = (100..115u8).map(key).collect();
+        assert_eq!(
+            order_renewal_candidates(only.clone(), provisional, slots),
+            only
+        );
+    }
+
+    /// Source pin for the fairness cap above: the renewal loop orders its
+    /// candidates with `order_renewal_candidates`, capped at half the batch,
+    /// before it spends the batch.
+    #[test]
+    fn renewal_loop_orders_candidates_with_the_provisional_cap() {
+        let src = production_source();
+        let loop_body = extract_fn_body(src, "async fn recover_orphaned_subscriptions(");
+        let order = loop_body
+            .find("order_renewal_candidates(")
+            .expect("the renewal loop must order candidates with order_renewal_candidates");
+        assert!(
+            loop_body[order..].contains("(batch_limit / 2).max(1)"),
+            "provisional leases are capped at half of the tick's batch"
+        );
+        let spend = loop_body
+            .find("for contract in contracts_needing_renewal")
+            .expect("the loop spends the ordered candidates");
+        assert!(
+            order < spend,
+            "ordering must happen before the batch is spent"
         );
     }
 
