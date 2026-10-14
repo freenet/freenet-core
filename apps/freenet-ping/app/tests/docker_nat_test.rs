@@ -22,10 +22,11 @@ use freenet_stdlib::{
 use freenet_test_network::{FreenetBinary, NetworkBuilder, TestNetwork};
 use std::{path::PathBuf, time::Duration};
 
-/// How long the subscribed peer may take to observe the gateway's update.
-/// Generous because Docker NAT on a loaded CI runner is slow; a healthy run
-/// usually observes it within seconds.
-const UPDATE_PROPAGATION_TIMEOUT: Duration = Duration::from_secs(60);
+/// How long the subscribed peer may take to observe the update. Twice the
+/// old fixed 10s window, for slow CI runners, but deliberately below the 30s
+/// periodic subscription recovery (`SUBSCRIPTION_RECOVERY_INTERVAL`) so that
+/// only live update delivery can pass, not a background heal of a broken path.
+const UPDATE_PROPAGATION_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Test contract operations (PUT -> SUBSCRIBE -> UPDATE -> GET) across a
 /// Docker NAT network with 1 gateway and 3 peers.

@@ -706,11 +706,14 @@ pub async fn get_contract_state(
 /// waiting for an update to propagate: under CI load propagation time varies,
 /// and a fixed sleep either wastes time or fails a correct run (#4910).
 ///
-/// The timeout still fails loudly, reporting the keys last observed, so a
-/// genuine propagation failure is not masked. If `client` holds a
-/// subscription to the contract, its node serves these GETs from its local
-/// copy rather than fetching from the network, so success means the update
-/// reached that node.
+/// The deadline is hard: each GET is bounded by the time remaining, and on
+/// timeout the error reports the keys last observed. Keep `timeout` short
+/// enough that only live delivery can satisfy it; a generous one also admits
+/// slower background repair paths and hides a broken live path.
+///
+/// Success means the update reached `client`'s node only while `client`
+/// holds a subscription to the contract: then the node serves these GETs
+/// from its local copy (`is_receiving_updates`) instead of the network.
 pub async fn wait_for_ping_entry(
     client: &mut WebApi,
     key: ContractKey,
@@ -719,26 +722,43 @@ pub async fn wait_for_ping_entry(
 ) -> Result<Ping> {
     const POLL_INTERVAL: Duration = Duration::from_secs(1);
     let start = tokio::time::Instant::now();
+    let deadline = start + timeout;
     let mut polls = 0u32;
+    let mut last_keys: Option<Vec<String>> = None;
     loop {
-        let state = get_contract_state(client, key, false).await?;
-        polls += 1;
-        if state.contains_key(expected_name) {
-            tracing::info!(
-                elapsed = ?start.elapsed(),
-                polls,
-                "observed expected ping entry '{expected_name}'"
-            );
-            return Ok(state);
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        match tokio::time::timeout(remaining, get_contract_state(client, key, false)).await {
+            Ok(Ok(state)) => {
+                polls += 1;
+                if state.contains_key(expected_name) {
+                    // eprintln, not tracing: these tests install no subscriber,
+                    // and the elapsed time is the signal for propagation drift.
+                    eprintln!(
+                        "observed ping entry '{expected_name}' after {:?} ({polls} polls)",
+                        start.elapsed()
+                    );
+                    return Ok(state);
+                }
+                last_keys = Some(state.keys().cloned().collect());
+            }
+            Ok(Err(e)) => {
+                return Err(e.context(format!(
+                    "GET failed after {:?} while waiting for ping entry '{expected_name}'",
+                    start.elapsed()
+                )));
+            }
+            // The GET itself ran past the deadline; fall through to the bail.
+            Err(_) => {}
         }
-        if start.elapsed() >= timeout {
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
             anyhow::bail!(
                 "ping entry '{expected_name}' not observed within {timeout:?} \
-                 ({polls} polls); last observed keys: {:?}",
-                state.keys().collect::<Vec<_>>()
+                 ({polls} polls, {:?} elapsed); last observed keys: {last_keys:?}",
+                start.elapsed()
             );
         }
-        sleep(POLL_INTERVAL).await;
+        sleep(POLL_INTERVAL.min(deadline - now)).await;
     }
 }
 
