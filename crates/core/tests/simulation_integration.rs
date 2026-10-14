@@ -13173,7 +13173,12 @@ fn run_sparse_stranded_holder(
             // these 16 peers and finds the holder wherever it is.
             4,
             4,
-            4, // max_connections: sparse, so the holder is not a neighbour of the key region
+            // max_connections: sparse, so the holder is not a neighbour of the
+            // key region, but not so tight that joining is a capacity lottery.
+            // At 4, 16 peers have ~48 endpoint slots for 16 joiners and which
+            // ones fit depends on join timing; late joiners could be refused
+            // by every acceptor (open + reserved + 1 >= max) and never join.
+            6,
             2,
             seed,
             &node_locations,
@@ -13189,13 +13194,18 @@ fn run_sparse_stranded_holder(
 
     let locs = sim.get_peer_locations();
     let ranked = nodes_by_distance_to_key(&locs, NUM_NODES, key_loc);
-    let nearest_no = ranked[0];
+    // The four peers tight around the key (within 0.006 of it). Which of them
+    // the holder's subscribe roots at depends on who links to whom; any one
+    // hosting is the recovery re-placing the contract next to its key, and
+    // before the fix none of them ever held it.
+    let nearest_set: Vec<usize> = ranked.iter().copied().take(4).collect();
     // Node numbers follow `node_locations`: 5..=15 are the spread peers at
     // key + 0.08 * (n - 4).
     let holder_no = 10; // key + 0.48
     let reader_no = 14; // key + 0.80, reaches the key from the other side
     let holder = NodeLabel::node(network_name, holder_no);
     let reader = NodeLabel::node(network_name, reader_no);
+    let reader_addr = sim.node_address(&reader).expect("reader address");
     let operations = vec![
         ScheduledOperation::new(
             holder.clone(),
@@ -13228,6 +13238,18 @@ fn run_sparse_stranded_holder(
         result.turmoil_result.err()
     );
 
+    // Precondition: the reader is on the ring, so a join-capacity shortfall
+    // fails here, at its cause, and not as a missing GET result below.
+    let reader_links = result
+        .topology_snapshots
+        .iter()
+        .find(|snap| snap.peer_addr == reader_addr)
+        .map(|snap| snap.connection_count);
+    assert!(
+        reader_links.is_some_and(|n| n > 0),
+        "precondition: the reader must have joined the ring (ring connections: \
+         {reader_links:?}); a capacity shortfall, not the recovery, is then the cause"
+    );
     let recoveries: u64 = result
         .renewal_metrics
         .values()
@@ -13240,11 +13262,13 @@ fn run_sparse_stranded_holder(
         .node_storages
         .get(&reader)
         .is_some_and(|s| s.get_stored_state(&key).is_some());
-    let nearest_hosts = result.is_node_hosting(&NodeLabel::node(network_name, nearest_no), &key);
+    let nearest_hosts = nearest_set
+        .iter()
+        .any(|n| result.is_node_hosting(&NodeLabel::node(network_name, *n), &key));
     tracing::info!(
         holder_no,
         reader_no,
-        nearest_no,
+        ?nearest_set,
         recoveries,
         not_found,
         reader_has_state,
@@ -13268,9 +13292,9 @@ fn run_sparse_stranded_holder(
 }
 
 /// §5d(b) recovery on a sparse ring (#5846). See `run_sparse_stranded_holder`.
-/// Before the fix the peer nearest the key never held the contract and no
+/// Before the fix no peer near the key ever held the contract and no
 /// recovery ran; after it the holder's subscribe has re-placed the contract
-/// there.
+/// on one of the four peers tight around the key.
 ///
 /// The far GET is a liveness check, NOT the discriminating assertion: at this
 /// size, a GET finds the holder by routing or by the terminal consult even
@@ -13289,8 +13313,8 @@ fn test_stranded_holder_recovery_on_sparse_ring_places_contract_near_key() {
 
     assert!(
         nearest_hosts,
-        "the peer nearest the key does not host the contract: the holder's \
-         subscribe never re-placed it there"
+        "no peer of the tight key cluster hosts the contract: the holder's \
+         subscribe never re-placed it near the key"
     );
     assert!(recoveries >= 1, "no stranded-holder recovery ran");
     assert!(
