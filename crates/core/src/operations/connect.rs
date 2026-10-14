@@ -1806,7 +1806,11 @@ pub(crate) const GATEWAY_BACKOFF_POLL_CAP: Duration = Duration::from_secs(30);
 /// instead of waiting for these to reach their TTL. Without a round (this peer
 /// has a connection) they are awaited, as before. Returns whether the joins
 /// were spawned.
-async fn run_gateway_joins<F>(joins: F, round: Option<bootstrap::BootstrapRoundGuard>) -> bool
+async fn run_gateway_joins<F>(
+    joins: F,
+    round: Option<bootstrap::BootstrapRoundGuard>,
+    shutdown: tokio_util::sync::CancellationToken,
+) -> bool
 where
     F: std::future::Future<Output = ()> + Send + 'static,
 {
@@ -1814,7 +1818,12 @@ where
         Some(mut round) => {
             round.issue();
             GlobalExecutor::spawn(async move {
-                joins.await;
+                // Ends with the node rather than outliving it.
+                tokio::select! {
+                    biased;
+                    _ = shutdown.cancelled() => {},
+                    _ = joins => {},
+                }
                 drop(round);
             });
             true
@@ -2198,7 +2207,8 @@ pub(crate) async fn initial_join_procedure(
                 } else {
                     None
                 };
-                round_issued = run_gateway_joins(joins, round).await;
+                round_issued =
+                    run_gateway_joins(joins, round, op_manager.ring.shutdown_token()).await;
             } else if use_connected_as_routers {
                 // All gateways connected but still need many more peers.
                 // Route CONNECTs through connected gateways toward gap locations.
@@ -2281,7 +2291,12 @@ pub(crate) async fn initial_join_procedure(
                             }
                         }
                     });
-                    round_issued = run_gateway_joins(joins, bootstrap_round.take()).await;
+                    round_issued = run_gateway_joins(
+                        joins,
+                        bootstrap_round.take(),
+                        op_manager.ring.shutdown_token(),
+                    )
+                    .await;
                 } else if blocked_by_backoff > 0 {
                     // #4787: nothing was issued because every gateway this
                     // round could route through is in exponential backoff —
