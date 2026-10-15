@@ -515,12 +515,14 @@ pub(crate) struct SubscriptionLease {
 }
 
 /// How often the renewal loop retries an unrepaired provisional lease (see
-/// [`SubscriptionLease::provisional`]). Equal to
-/// [`SUBSCRIPTION_RENEWAL_INTERVAL`], the nominal renewal cadence of any lease,
-/// so a provisional lease never costs more than an ordinarily renewed one,
-/// while an unrepaired one still retries well inside the ~6 minutes it would
-/// otherwise wait for its near-expiry renewal. The first attempt is
-/// immediate.
+/// [`SubscriptionLease::provisional`]). The first attempt is immediate; after
+/// that the lease is due at most every 120 s, where an ordinary lease is due
+/// about every 6 minutes (near expiry of its 8-minute lease), so an unrepaired
+/// provisional lease costs up to ~3x an ordinary one until repaired. Set to
+/// [`SUBSCRIPTION_RENEWAL_INTERVAL`], the nominal client renewal cadence: a
+/// lease that gets no UPDATEs should retry well inside the ~6 minutes, and the
+/// extra renewals are further bounded by the loop's per-tick cap and the
+/// half-batch provisional cap.
 pub(crate) const PROVISIONAL_RETRY_INTERVAL: Duration = SUBSCRIPTION_RENEWAL_INTERVAL;
 
 /// Whether a provisional lease is due for its early renewal at `now`.
