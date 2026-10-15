@@ -919,6 +919,20 @@ pub(crate) mod driver_test_support {
         Box<dyn std::any::Any>,
         LocalStore,
     ) {
+        // A non-gateway node with a configured gateway and no ring connections
+        // makes the ring's maintenance task dial that gateway
+        // (`join_ring_request`), and every such dial bumps the process-global
+        // `network_status` first-connection counter. Tests asserting on that
+        // counter (`join_attempts_counted_once_per_dial_and_not_for_probes`)
+        // hold `TEST_GLOBAL_STATE_LOCK`, so this node must hold it too for as
+        // long as its maintenance task can run, i.e. until the returned
+        // guards drop. Taken before the `OpManager` exists so no dial can
+        // precede it. Nodes without a gateway never dial and stay parallel.
+        let global_state = (!gateways.is_empty()).then(|| {
+            crate::node::network_status::TEST_GLOBAL_STATE_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+        });
         let config_args = crate::config::ConfigArgs {
             id: Some(id.to_string()),
             mode: Some(crate::contract::OperationMode::Local),
@@ -1053,6 +1067,7 @@ pub(crate) mod driver_test_support {
             wait_for_event,
             result_router_rx,
             task_monitor,
+            global_state,
         ));
         (op_manager, op_execution_receiver, added, guards, store)
     }
