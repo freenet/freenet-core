@@ -3708,7 +3708,7 @@ echo "RC=$?"
         let measured = pos("let child_runtime_secs = child_started.elapsed().as_secs();");
         let noted = pos("note_child_runtime(&mut state, child_runtime_secs);");
         let sentinel = pos("if exit_code == SENTINEL_RESTART {");
-        let update = pos("spawn_update_command(&exe_path, Some(exit_code))");
+        let update = pos("spawn_update_command(&exe_path, log_dir, Some(exit_code))");
         let decided = pos("next_wrapper_action(&mut state, exit_code, is_port_conflict");
         assert!(
             measured < update,
@@ -4328,40 +4328,87 @@ echo "RC=$?"
     ///
     /// The Windows-only failure mode — `Command::spawn()` returning
     /// "The handle is invalid" (os error 6) when the parent has called
-    /// `FreeConsole()` and no explicit `Stdio::null()` is set — cannot
-    /// be exercised in a portable unit test. This pin instead enforces
-    /// that the guard remains present in the source: if a future
-    /// refactor removes the `.stdin/.stdout/.stderr(Stdio::null())`
-    /// lines from `spawn_update_command`, the test fails with a
-    /// specific error message pointing at the relevant issues rather
-    /// than silently shipping the regression to Windows users.
+    /// `FreeConsole()` and a standard handle is left to be inherited —
+    /// cannot be exercised in a portable unit test. This pin instead
+    /// enforces that every handle stays explicitly set in the source: stdin
+    /// to null, and stdout/stderr to `update_output_stdio`, which yields the
+    /// wrapper log or, when that cannot be opened, null (#5799). If a future
+    /// refactor drops any of them, the test fails with a specific error
+    /// message pointing at the relevant issues rather than silently shipping
+    /// the regression to Windows users.
     #[test]
     fn spawn_update_command_must_null_all_three_standard_handles() {
         let src = include_str!("service/wrapper.rs");
-        let (_, after_fn_start) = src
-            .split_once("fn spawn_update_command(")
-            .expect("spawn_update_command definition not found");
-        // Limit to the function body — stop at the next top-level fn
-        // so trailing source doesn't accidentally pass the check.
-        let (body, _) = after_fn_start
-            .split_once("\nfn ")
-            .expect("could not locate end of spawn_update_command");
-        let code_only: String = body
-            .lines()
-            .map(|line| line.split_once("//").map(|(c, _)| c).unwrap_or(line))
-            .collect::<Vec<_>>()
-            .join("\n");
-        for handle in ["stdin", "stdout", "stderr"] {
-            let pattern = format!(".{handle}(std::process::Stdio::null())");
+        let body_of = |signature: &str| -> String {
+            let (_, after_fn_start) = src
+                .split_once(signature)
+                .unwrap_or_else(|| panic!("`{signature}` definition not found"));
+            // Limit to the function body — stop at the next top-level item
+            // so trailing source doesn't accidentally pass the check.
+            let (body, _) = after_fn_start
+                .split_once("\n}\n")
+                .unwrap_or_else(|| panic!("could not locate end of `{signature}`"));
+            body.lines()
+                .map(|line| line.split_once("//").map(|(c, _)| c).unwrap_or(line))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let spawn = body_of("pub(super) fn spawn_update_command(");
+        for pattern in [
+            "let (stdout, stderr) = update_output_stdio(log_dir);",
+            ".stdin(std::process::Stdio::null())",
+            ".stdout(stdout)",
+            ".stderr(stderr);",
+        ] {
             assert!(
-                code_only.contains(&pattern),
-                "spawn_update_command must call `{}` — without it, Windows \
-                 autostart fires a silent spawn failure with os error 6 \
-                 (#3933 / #3934). The fix pattern matches the network-child \
-                 spawn in run_wrapper_loop.",
-                pattern
+                spawn.contains(pattern),
+                "spawn_update_command must contain `{pattern}` — a standard handle \
+                 left to be inherited makes Windows autostart fire a silent spawn \
+                 failure with os error 6 (#3933 / #3934)."
             );
         }
+        let stdio = body_of("pub(super) fn update_output_stdio(");
+        assert!(
+            stdio.contains("Err(_) => (std::process::Stdio::null(), std::process::Stdio::null()),"),
+            "update_output_stdio must fall back to null, never to an inherited \
+             handle, when the wrapper log cannot be opened (#3933 / #3934)"
+        );
+    }
+
+    /// #5799: `freenet update`'s output reaches the wrapper log. It used to go
+    /// to null, so a failed auto-update left no reason in the wrapper log or
+    /// in `freenet service report`.
+    #[test]
+    #[cfg(unix)]
+    fn update_output_is_appended_to_the_wrapper_log() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log_dir = tmp.path();
+        wrapper::log_wrapper_event(log_dir, "Update needed, running freenet update...");
+        let (stdout, stderr) = wrapper::update_output_stdio(log_dir);
+        let status = std::process::Command::new("sh")
+            .args(["-c", "echo updater-stdout; echo updater-stderr >&2; exit 1"])
+            .stdin(std::process::Stdio::null())
+            .stdout(stdout)
+            .stderr(stderr)
+            .status()
+            .unwrap();
+        assert!(!status.success());
+        let logs: String = std::fs::read_dir(log_dir)
+            .unwrap()
+            .map(|e| std::fs::read_to_string(e.unwrap().path()).unwrap())
+            .collect();
+        for line in [
+            "Update needed, running freenet update...",
+            "updater-stdout",
+            "updater-stderr",
+        ] {
+            assert!(logs.contains(line), "wrapper log lacks {line:?}: {logs}");
+        }
+        // Appended, never truncating what the wrapper logged before it.
+        assert!(
+            logs.find("Update needed").unwrap() < logs.find("updater-stderr").unwrap(),
+            "{logs}"
+        );
     }
 
     /// #4073 crash-loop auto-rollback (cross-platform source-scrape pins).
@@ -4393,14 +4440,14 @@ echo "RC=$?"
         let src = include_str!("service/wrapper.rs");
         // The post-crash auto-update path passes the node's exit code.
         assert!(
-            src.contains("spawn_update_command(&exe_path, Some(exit_code))"),
+            src.contains("spawn_update_command(&exe_path, log_dir, Some(exit_code))"),
             "the wrapper's post-stop auto-update must pass Some(exit_code) so \
              `freenet update` can drive crash-loop auto-rollback (#4073)"
         );
         // Manual / tray "Check for Updates" paths must NOT pass an exit code —
         // they are not crashes and must never be counted toward a rollback.
         assert!(
-            src.contains("spawn_update_command(&exe_path, None)"),
+            src.contains("spawn_update_command(&exe_path, log_dir, None)"),
             "manual tray update paths must pass None so they are not counted as \
              probation crashes (#4073)"
         );

@@ -913,6 +913,174 @@ pub fn is_version_install_gated(version: &str) -> bool {
         .unwrap_or(false)
 }
 
+// ── Per-target-version transient-failure cooldown (#5799) ──────────────────
+//
+// The install gate above deliberately ignores TRANSIENT failures (a download
+// that did not complete, an unreachable GitHub host), because gating on them
+// would permanently suppress a good release after a brief outage. Ignoring them
+// entirely left nothing to stop the loop on a network where GitHub downloads
+// keep failing: detect X → exit 42 → the download fails → restart on the old
+// binary → re-detect X → exit 42, every few minutes, for as long as the network
+// stays bad (a node in China was reported doing exactly that, #5799).
+//
+// This cooldown is the time-bounded answer. A transient failure to fetch X,
+// whether the node's own download in advance or the updater's, records X with
+// a retry time; until then nothing exits for X and the node keeps running on
+// its current binary. The wait doubles from [`UPDATE_COOLDOWN_BASE`] with each
+// consecutive failure of the same version, up to [`UPDATE_COOLDOWN_MAX`], with
+// ±[`UPDATE_COOLDOWN_JITTER`] so nodes that failed together do not retry
+// together. It always expires, so a good release is delayed, never suppressed;
+// a different (newer) version starts afresh; a successful install clears it.
+//
+// Degrade-safe like the gate: a missing, corrupt or unreadable record reads as
+// "no cooldown". The worst that costs is one attempt, which is the behaviour
+// before this existed, whereas failing closed could hold back an update.
+
+/// The wait after the first transient failure to fetch a version.
+pub(crate) const UPDATE_COOLDOWN_BASE: std::time::Duration = std::time::Duration::from_secs(3600);
+/// The longest wait, reached after a few consecutive failures of one version.
+pub(crate) const UPDATE_COOLDOWN_MAX: std::time::Duration =
+    std::time::Duration::from_secs(24 * 3600);
+/// Fraction by which each wait is randomly shortened or lengthened.
+const UPDATE_COOLDOWN_JITTER: f64 = 0.2;
+/// Per-target-version cooldown record (JSON).
+const UPDATE_COOLDOWN_FILE: &str = "update_cooldown.json";
+/// Longest error text kept in the record, so a pathological error cannot bloat
+/// the file that `freenet service report` reads.
+const UPDATE_COOLDOWN_ERROR_MAX_CHARS: usize = 500;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct UpdateCooldownState {
+    /// The target version whose download keeps failing.
+    pub version: String,
+    /// Consecutive transient failures of that version.
+    pub failures: u32,
+    /// Unix seconds before which nothing should exit to update to `version`.
+    pub retry_at_unix: u64,
+    /// The last failure, for the logs and `freenet service report`.
+    pub last_error: String,
+}
+
+/// The wait after the `failures`-th consecutive failure, given a uniform
+/// sample `rand_unit` in `[0, 1]`: [`UPDATE_COOLDOWN_BASE`] doubled per
+/// failure, capped at [`UPDATE_COOLDOWN_MAX`], scaled by a factor in
+/// `[1 - UPDATE_COOLDOWN_JITTER, 1 + UPDATE_COOLDOWN_JITTER]`.
+pub(crate) fn update_cooldown_delay(failures: u32, rand_unit: f64) -> std::time::Duration {
+    let doublings = failures.saturating_sub(1).min(16);
+    let base = UPDATE_COOLDOWN_BASE
+        .saturating_mul(1u32 << doublings)
+        .min(UPDATE_COOLDOWN_MAX);
+    let factor =
+        1.0 - UPDATE_COOLDOWN_JITTER + 2.0 * UPDATE_COOLDOWN_JITTER * rand_unit.clamp(0.0, 1.0);
+    base.mul_f64(factor)
+}
+
+pub(crate) fn read_update_cooldown_at(dir: &Path) -> Option<UpdateCooldownState> {
+    let raw = std::fs::read_to_string(dir.join(UPDATE_COOLDOWN_FILE)).ok()?;
+    serde_json::from_str(&raw).ok()
+}
+
+/// Record a transient failure to fetch `version` at `now`, and return the
+/// number of consecutive failures of it, this one included. A record for a
+/// different version is replaced, so an older release's failures never delay
+/// a newer one.
+pub(crate) fn record_update_cooldown_at(
+    dir: &Path,
+    version: &str,
+    error: &str,
+    now: SystemTime,
+    rand_unit: f64,
+) -> u32 {
+    let failures = match read_update_cooldown_at(dir) {
+        Some(prev) if prev.version == version => prev.failures.saturating_add(1),
+        _ => 1,
+    };
+    let now_unix = now
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let state = UpdateCooldownState {
+        version: version.to_string(),
+        failures,
+        retry_at_unix: now_unix
+            .saturating_add(update_cooldown_delay(failures, rand_unit).as_secs()),
+        last_error: error
+            .chars()
+            .take(UPDATE_COOLDOWN_ERROR_MAX_CHARS)
+            .collect(),
+    };
+    let written = serde_json::to_vec(&state)
+        .context("serialize update cooldown")
+        .and_then(|raw| atomic_write(&dir.join(UPDATE_COOLDOWN_FILE), &raw));
+    if let Err(e) = written {
+        // The caller still decides not to exit for this attempt; only the
+        // memory across restarts is lost.
+        tracing::warn!(version, error = %e, "Failed to persist the update cooldown (#5799)");
+    }
+    failures
+}
+
+/// Record a transient failure to fetch `version` against the shared state
+/// directory. Returns the consecutive failure count, or 0 when there is no
+/// state directory to record it in.
+pub fn record_update_cooldown(version: &str, error: &str) -> u32 {
+    let rand_unit = freenet::config::GlobalRng::random_range(0.0_f64..1.0);
+    state_dir()
+        .map(|dir| record_update_cooldown_at(&dir, version, error, SystemTime::now(), rand_unit))
+        .unwrap_or(0)
+}
+
+/// How long until `version` may be tried again, or `None` when it is not
+/// cooling down. A retry time further ahead than the longest possible wait is
+/// not a clock that is a little off but a bogus record, and is ignored rather
+/// than obeyed.
+pub(crate) fn update_cooldown_remaining_at(
+    dir: &Path,
+    version: &str,
+    now: SystemTime,
+) -> Option<std::time::Duration> {
+    let state = read_update_cooldown_at(dir).filter(|s| s.version == version)?;
+    let retry_at = UNIX_EPOCH.checked_add(std::time::Duration::from_secs(state.retry_at_unix))?;
+    let remaining = retry_at.duration_since(now).ok()?;
+    let longest = UPDATE_COOLDOWN_MAX.mul_f64(1.0 + UPDATE_COOLDOWN_JITTER);
+    (!remaining.is_zero() && remaining <= longest).then_some(remaining)
+}
+
+/// [`update_cooldown_remaining_at`] against the shared state directory.
+pub fn update_cooldown_remaining(version: &str) -> Option<std::time::Duration> {
+    state_dir().and_then(|dir| update_cooldown_remaining_at(&dir, version, SystemTime::now()))
+}
+
+fn clear_update_cooldown_at(dir: &Path) {
+    let _rm = std::fs::remove_file(dir.join(UPDATE_COOLDOWN_FILE));
+}
+
+/// Clear the cooldown (after a successful install, or when already up to date).
+pub fn clear_update_cooldown() {
+    if let Some(dir) = state_dir() {
+        clear_update_cooldown_at(&dir);
+    }
+}
+
+/// One line describing the cooldown for `freenet service report`, or `None`
+/// when there is no record.
+pub(crate) fn update_cooldown_summary_at(dir: &Path, now: SystemTime) -> Option<String> {
+    let state = read_update_cooldown_at(dir)?;
+    let wait = match update_cooldown_remaining_at(dir, &state.version, now) {
+        Some(remaining) => format!("next attempt in {} min", remaining.as_secs().div_ceil(60)),
+        None => "cooldown over, next update check may try again".to_string(),
+    };
+    Some(format!(
+        "Update to {} failed {} time(s) in a row ({wait}). Last error: {}",
+        state.version, state.failures, state.last_error
+    ))
+}
+
+/// [`update_cooldown_summary_at`] against the shared state directory.
+pub fn update_cooldown_summary() -> Option<String> {
+    state_dir().and_then(|dir| update_cooldown_summary_at(&dir, SystemTime::now()))
+}
+
 // ── Post-stop crash classification / handling / rollback ───────────────────
 
 /// Read the raw post-stop status string the supervisor forwarded, if any. May
@@ -2122,6 +2290,143 @@ mod tests {
         assert!(!is_version_install_gated_at(dir, "0.2.91"));
         // The old version is no longer tracked, so it is no longer gated either.
         assert!(!is_version_install_gated_at(dir, "0.2.90"));
+    }
+
+    #[test]
+    fn update_cooldown_doubles_from_an_hour_to_a_day_with_jitter() {
+        let hour = std::time::Duration::from_secs(3600);
+        let expected = [1, 2, 4, 8, 16, 24, 24];
+        for (failures, hours) in (1u32..).zip(expected) {
+            assert_eq!(
+                update_cooldown_delay(failures, 0.5),
+                hour * hours,
+                "{failures}"
+            );
+        }
+        // Zero is treated as the first failure, and a huge count stays capped.
+        assert_eq!(update_cooldown_delay(0, 0.5), hour);
+        assert_eq!(update_cooldown_delay(u32::MAX, 0.5), UPDATE_COOLDOWN_MAX);
+        // ±20%, never more, and out-of-range samples are clamped.
+        assert_eq!(update_cooldown_delay(1, 0.0), hour.mul_f64(0.8));
+        assert_eq!(update_cooldown_delay(1, 1.0), hour.mul_f64(1.2));
+        assert_eq!(update_cooldown_delay(1, -5.0), hour.mul_f64(0.8));
+        assert_eq!(
+            update_cooldown_delay(6, 7.0),
+            UPDATE_COOLDOWN_MAX.mul_f64(1.2)
+        );
+    }
+
+    #[test]
+    fn update_cooldown_holds_a_version_until_it_expires() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let now = SystemTime::now();
+        let hour = std::time::Duration::from_secs(3600);
+        assert!(update_cooldown_remaining_at(dir, "0.2.141", now).is_none());
+
+        assert_eq!(
+            record_update_cooldown_at(dir, "0.2.141", "connect timeout", now, 0.5),
+            1
+        );
+        let remaining = update_cooldown_remaining_at(dir, "0.2.141", now).unwrap();
+        assert!(remaining <= hour && remaining > hour - std::time::Duration::from_secs(2));
+        // Only that version: an older or newer release is not held back.
+        assert!(update_cooldown_remaining_at(dir, "0.2.142", now).is_none());
+        // It expires on its own.
+        assert!(update_cooldown_remaining_at(dir, "0.2.141", now + hour).is_none());
+
+        // Consecutive failures of the same version lengthen it.
+        assert_eq!(
+            record_update_cooldown_at(dir, "0.2.141", "connect timeout", now, 0.5),
+            2
+        );
+        assert!(update_cooldown_remaining_at(dir, "0.2.141", now + hour).is_some());
+        assert!(update_cooldown_remaining_at(dir, "0.2.141", now + hour * 2).is_none());
+
+        // A newer release starts its own count at once.
+        assert_eq!(
+            record_update_cooldown_at(dir, "0.2.142", "reset by peer", now, 0.5),
+            1
+        );
+        assert!(update_cooldown_remaining_at(dir, "0.2.141", now).is_none());
+
+        clear_update_cooldown_at(dir);
+        assert!(read_update_cooldown_at(dir).is_none());
+        assert!(update_cooldown_remaining_at(dir, "0.2.142", now).is_none());
+        clear_update_cooldown_at(dir); // idempotent
+    }
+
+    #[test]
+    fn update_cooldown_degrades_to_no_cooldown_on_damage() {
+        // A cooldown that fails closed could hold an update back for good;
+        // failing open costs one attempt, which is the behaviour before it.
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let now = SystemTime::now();
+        std::fs::write(dir.join(UPDATE_COOLDOWN_FILE), "{not valid json").unwrap();
+        assert!(update_cooldown_remaining_at(dir, "0.2.141", now).is_none());
+        assert!(update_cooldown_summary_at(dir, now).is_none());
+        // The next failure starts a fresh count rather than inheriting damage.
+        assert_eq!(record_update_cooldown_at(dir, "0.2.141", "x", now, 0.5), 1);
+
+        // A retry time further out than any real cooldown is a bogus record
+        // (a clock that jumped, a hand edit) and is ignored.
+        let bogus = UpdateCooldownState {
+            version: "0.2.141".into(),
+            failures: 1,
+            retry_at_unix: u64::MAX,
+            last_error: String::new(),
+        };
+        std::fs::write(
+            dir.join(UPDATE_COOLDOWN_FILE),
+            serde_json::to_vec(&bogus).unwrap(),
+        )
+        .unwrap();
+        assert!(update_cooldown_remaining_at(dir, "0.2.141", now).is_none());
+        let far = UpdateCooldownState {
+            retry_at_unix: now
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+                .saturating_add(UPDATE_COOLDOWN_MAX.as_secs() * 2),
+            ..bogus
+        };
+        std::fs::write(
+            dir.join(UPDATE_COOLDOWN_FILE),
+            serde_json::to_vec(&far).unwrap(),
+        )
+        .unwrap();
+        assert!(update_cooldown_remaining_at(dir, "0.2.141", now).is_none());
+    }
+
+    #[test]
+    fn update_cooldown_summary_names_the_version_and_the_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let now = SystemTime::now();
+        assert!(update_cooldown_summary_at(dir, now).is_none());
+        let long_error = format!("error sending request: {}", "x".repeat(2000));
+        record_update_cooldown_at(dir, "0.2.141", &long_error, now, 0.5);
+        let summary = update_cooldown_summary_at(dir, now).unwrap();
+        assert!(summary.contains("0.2.141"), "{summary}");
+        assert!(summary.contains("1 time(s)"), "{summary}");
+        assert!(summary.contains("next attempt in 60 min"), "{summary}");
+        assert!(summary.contains("error sending request"), "{summary}");
+        // The stored error is bounded.
+        assert_eq!(
+            read_update_cooldown_at(dir)
+                .unwrap()
+                .last_error
+                .chars()
+                .count(),
+            UPDATE_COOLDOWN_ERROR_MAX_CHARS
+        );
+        let later = now + std::time::Duration::from_secs(2 * 3600);
+        assert!(
+            update_cooldown_summary_at(dir, later)
+                .unwrap()
+                .contains("cooldown over"),
+        );
     }
 
     #[test]

@@ -383,6 +383,15 @@ pub enum UpdateCheckResult {
     ///
     /// [`Skipped`]: UpdateCheckResult::Skipped
     PinnedKnownBad,
+    /// The newer version on GitHub is cooling down after earlier attempts
+    /// could not download it (#5799); carries how long is left. Like
+    /// [`RateLimited`], this is not a "no update" signal: the caller keeps its
+    /// driving signal and must NOT fall through to the legacy "max-backoff + 0
+    /// connections -> exit 42" fallback. The check backoff grows, so the
+    /// signal is re-checked at most hourly and acted on once the cooldown ends.
+    ///
+    /// [`RateLimited`]: UpdateCheckResult::RateLimited
+    CoolingDown(Duration),
 }
 
 /// Check if an update is available, respecting rate limits and failure counts.
@@ -518,6 +527,18 @@ pub async fn check_if_update_available(current_version: &str) -> UpdateCheckResu
                     // check still catches a later strictly-newer release.
                     increase_backoff();
                     return UpdateCheckResult::PinnedKnownBad;
+                }
+                if let Some(remaining) = super::rollback::update_cooldown_remaining(&latest) {
+                    tracing::info!(
+                        version = %latest,
+                        retry_in_min = remaining.as_secs().div_ceil(60),
+                        "Newer version is cooling down after failed downloads; not exiting for \
+                         it yet (#5799)"
+                    );
+                    // Grow the backoff, as for a pinned version: there is
+                    // nothing to act on until the cooldown ends.
+                    increase_backoff();
+                    return UpdateCheckResult::CoolingDown(remaining);
                 }
                 tracing::info!(
                     current = %current_version,

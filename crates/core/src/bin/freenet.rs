@@ -593,15 +593,31 @@ async fn run_network_node_with_signals(
                     "Startup check: newer version is locally blocked (crash-loop known-bad pin or \
                      repeated install failures); not triggering auto-update (#4073)"
                 );
+            } else if let Some(remaining) =
+                commands::rollback::update_cooldown_remaining(&new_version)
+            {
+                // #5799: an earlier attempt could not download this release.
+                // Exiting for it again now would only restart the node on the
+                // same binary; the periodic re-poll tries again later.
+                tracing::warn!(
+                    new_version = %new_version,
+                    retry_in_min = remaining.as_secs().div_ceil(60),
+                    "Startup check: newer version is cooling down after failed downloads; \
+                     staying on the current version for now (#5799)"
+                );
             } else {
                 tracing::info!(
                     new_version = %new_version,
                     "Startup check: newer version on GitHub, triggering auto-update"
                 );
-                stage_latest_release(build_info::VERSION).await;
-                #[allow(clippy::let_underscore_must_use)]
-                let _ = update_tx.send(new_version);
-                return;
+                if stage_latest_release(build_info::VERSION)
+                    .await
+                    .should_exit()
+                {
+                    #[allow(clippy::let_underscore_must_use)]
+                    let _ = update_tx.send(new_version);
+                    return;
+                }
             }
         }
         // INFO, not `debug!`: release builds set `release_max_level_info`
@@ -689,10 +705,14 @@ async fn run_network_node_with_signals(
                             new_version = %new_version,
                             "Urgent update confirmed on GitHub, triggering immediate auto-update"
                         );
-                        stage_latest_release(build_info::VERSION).await;
-                        #[allow(clippy::let_underscore_must_use)]
-                        let _ = update_tx.send(new_version);
-                        return;
+                        if stage_latest_release(build_info::VERSION)
+                            .await
+                            .should_exit()
+                        {
+                            #[allow(clippy::let_underscore_must_use)]
+                            let _ = update_tx.send(new_version);
+                            return;
+                        }
                     }
                     UpdateCheckResult::Skipped => {
                         // GitHub not reachable or no update yet; will retry next tick
@@ -702,6 +722,12 @@ async fn run_network_node_with_signals(
                         // check. Do nothing and retry when the bucket refills —
                         // do NOT exit 42 (the supervisor's `freenet update`
                         // shares the empty bucket and would no-op).
+                    }
+                    UpdateCheckResult::CoolingDown(_) => {
+                        // #5799: the release could not be downloaded recently.
+                        // Keep the urgent signal; the grown check backoff
+                        // re-checks it, and it is acted on once the cooldown
+                        // ends.
                     }
                     UpdateCheckResult::PinnedKnownBad => {
                         // #4073: the only newer release is pinned known-bad on
@@ -751,10 +777,14 @@ async fn run_network_node_with_signals(
                                         new_version = %new_version,
                                         "Update confirmed on GitHub after stagger, triggering auto-update"
                                     );
-                                    stage_latest_release(build_info::VERSION).await;
-                                    #[allow(clippy::let_underscore_must_use)]
-                                    let _ = update_tx.send(new_version);
-                                    return;
+                                    if stage_latest_release(build_info::VERSION)
+                                        .await
+                                        .should_exit()
+                                    {
+                                        #[allow(clippy::let_underscore_must_use)]
+                                        let _ = update_tx.send(new_version);
+                                        return;
+                                    }
                                 }
                                 UpdateCheckResult::Skipped => {
                                     // GitHub unreachable or no update yet. Enter cooldown
@@ -769,6 +799,12 @@ async fn run_network_node_with_signals(
                                     // stagger deadline armed (do NOT enter the long
                                     // cooldown) so we re-check promptly once the bucket
                                     // refills, without hitting GitHub meanwhile.
+                                }
+                                UpdateCheckResult::CoolingDown(remaining) => {
+                                    // #5799: drop the stagger until the cooldown
+                                    // ends; a fresh one starts after it.
+                                    stagger_deadline = None;
+                                    stagger_cooldown_until = Some(Instant::now() + remaining);
                                 }
                                 UpdateCheckResult::PinnedKnownBad => {
                                     // #4073: discovered version is pinned known-bad
@@ -825,10 +861,14 @@ async fn run_network_node_with_signals(
                             "Isolated with version mismatch >6h — forcing exit for auto-update"
                         );
                         clear_version_mismatch();
-                        stage_latest_release(build_info::VERSION).await;
-                        #[allow(clippy::let_underscore_must_use)]
-                        let _ = update_tx.send("unknown (hard timeout)".to_string());
-                        return;
+                        if stage_latest_release(build_info::VERSION)
+                            .await
+                            .should_exit()
+                        {
+                            #[allow(clippy::let_underscore_must_use)]
+                            let _ = update_tx.send("unknown (hard timeout)".to_string());
+                            return;
+                        }
                     }
                 }
 
@@ -847,10 +887,14 @@ async fn run_network_node_with_signals(
                             new_version = %new_version,
                             "Newer version confirmed on GitHub, triggering auto-update"
                         );
-                        stage_latest_release(build_info::VERSION).await;
-                        #[allow(clippy::let_underscore_must_use)]
-                        let _ = update_tx.send(new_version);
-                        return;
+                        if stage_latest_release(build_info::VERSION)
+                            .await
+                            .should_exit()
+                        {
+                            #[allow(clippy::let_underscore_must_use)]
+                            let _ = update_tx.send(new_version);
+                            return;
+                        }
                     }
                     UpdateCheckResult::Skipped if has_reached_max_backoff() => {
                         let open_connections = get_open_connection_count();
@@ -868,10 +912,15 @@ async fn run_network_node_with_signals(
                                      trusting gateway version signal, exiting for auto-update"
                                 );
                                 clear_version_mismatch();
-                                stage_latest_release(build_info::VERSION).await;
-                                #[allow(clippy::let_underscore_must_use)]
-                                let _ = update_tx.send("unknown (gateway mismatch)".to_string());
-                                return;
+                                if stage_latest_release(build_info::VERSION)
+                                    .await
+                                    .should_exit()
+                                {
+                                    #[allow(clippy::let_underscore_must_use)]
+                                    let _ =
+                                        update_tx.send("unknown (gateway mismatch)".to_string());
+                                    return;
+                                }
                             }
                         } else {
                             tracing::info!(
@@ -892,6 +941,12 @@ async fn run_network_node_with_signals(
                         // the same empty bucket and would just exit "already up to
                         // date", so exiting here would be a pointless restart loop.
                         // Keep the mismatch flag and retry once the bucket refills.
+                    }
+                    UpdateCheckResult::CoolingDown(_) => {
+                        // #5799: like RateLimited, a separate arm so it never
+                        // reaches the max-backoff "trust the gateway, exit 42"
+                        // fallback. The mismatch flag is kept; the release is
+                        // acted on once its cooldown ends.
                     }
                     UpdateCheckResult::PinnedKnownBad => {
                         // #4073: the gateway-advertised newer release is pinned
@@ -980,15 +1035,28 @@ async fn run_network_node_with_signals(
                                  known-bad pin or repeated install failures); not triggering \
                                  auto-update (#4073)"
                             );
+                        } else if let Some(remaining) =
+                            commands::rollback::update_cooldown_remaining(&new_version)
+                        {
+                            tracing::info!(
+                                new_version = %new_version,
+                                retry_in_min = remaining.as_secs().div_ceil(60),
+                                "Periodic re-poll: newer version is cooling down after failed \
+                                 downloads; staying on the current version for now (#5799)"
+                            );
                         } else {
                             tracing::info!(
                                 new_version = %new_version,
                                 "Periodic re-poll: newer version on GitHub, triggering auto-update"
                             );
-                            stage_latest_release(build_info::VERSION).await;
-                            #[allow(clippy::let_underscore_must_use)]
-                            let _ = update_tx.send(new_version);
-                            return;
+                            if stage_latest_release(build_info::VERSION)
+                                .await
+                                .should_exit()
+                            {
+                                #[allow(clippy::let_underscore_must_use)]
+                                let _ = update_tx.send(new_version);
+                                return;
+                            }
                         }
                     }
                 } else {
@@ -2788,8 +2856,11 @@ mod tests {
     /// the node is still running. A trigger that sends without staging hands
     /// the download back to systemd's `ExecStopPost`, whose `TimeoutStopSec`
     /// kills it on a slow link, and the node restart-loops on the old version.
+    /// #5799: and it must exit only when staging says so. A send that ignores
+    /// the decision exits after a download GitHub would not serve, into an
+    /// updater that fails the same way, and the node restart-loops again.
     /// The sends stay inline (the canary pins them), so this checks each one
-    /// is directly preceded by the staging call.
+    /// is directly inside the staging decision.
     #[test]
     fn every_update_trigger_downloads_before_exiting() {
         let src = strip_line_comments(include_str!("freenet.rs"));
@@ -2797,24 +2868,31 @@ mod tests {
             .split_once(concat!("#[cfg(test)]\n", "mod tests {"))
             .expect("test module not found")
             .0;
-        let statements: Vec<&str> = production
-            .lines()
-            .map(str::trim)
-            .filter(|l| !l.is_empty() && !l.starts_with("#["))
-            .collect();
+        // Whitespace-free, so rustfmt's line breaks inside the condition do
+        // not matter. Comments were stripped above.
+        let flat: String = production.split_whitespace().collect();
         // Every send, in whatever form, so a trigger spelled differently from
         // the `let _ =` form cannot slip past the check below.
         let all_sends = production.matches(concat!("update_tx", ".send(")).count();
+        let decision = concat!(
+            "if",
+            "stage_latest_release(build_info::VERSION).await.should_exit(){",
+            "#[allow(clippy::let_underscore_must_use)]"
+        );
         let mut sends = 0;
-        for (i, stmt) in statements.iter().enumerate() {
-            if stmt.starts_with(concat!("let _ = update_tx", ".send(")) {
-                sends += 1;
-                assert_eq!(
-                    i.checked_sub(1).map(|p| statements[p]),
-                    Some("stage_latest_release(build_info::VERSION).await;"),
-                    "update trigger `{stmt}` must call stage_latest_release first (#5790)"
-                );
-            }
+        for (at, _) in flat.match_indices(concat!("let_=update_tx", ".send(")) {
+            sends += 1;
+            let site = &flat[at..];
+            let stmt = &site[..site.find(';').map_or(site.len(), |end| end + 1)];
+            assert!(
+                flat[..at].ends_with(decision),
+                "update trigger `{stmt}` must call stage_latest_release first (#5790) and \
+                 send only when it says to exit (#5799)"
+            );
+            assert!(
+                site[stmt.len()..].starts_with("return;}"),
+                "update trigger `{stmt}` must return inside the staging decision"
+            );
         }
         assert_eq!(
             sends, 7,

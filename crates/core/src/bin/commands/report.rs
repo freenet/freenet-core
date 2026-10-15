@@ -90,6 +90,11 @@ pub struct DiagnosticReport {
     /// silently drops the field without telling us why.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub network_status_error: Option<String>,
+    /// Why auto-update is holding off, when an update recently failed to
+    /// download (#5799). Read from the state directory, so it is present even
+    /// when the failure is older than the log window.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_update_status: Option<String>,
     /// User's problem description
     pub user_message: Option<String>,
 }
@@ -193,6 +198,7 @@ impl ReportCommand {
             Ok(diag) => (Some(diag), None),
             Err(e) => (None, Some(e)),
         };
+        let auto_update_status = super::rollback::update_cooldown_summary();
         let user_message = self.get_user_message()?;
 
         let client_timestamp = chrono::Utc::now().to_rfc3339();
@@ -205,6 +211,7 @@ impl ReportCommand {
             config,
             network_status,
             network_status_error,
+            auto_update_status,
             user_message,
         })
     }
@@ -372,6 +379,9 @@ impl ReportCommand {
             (Some(_), _) => println!("  - Node status: running"),
             (None, Some(err)) => println!("  - Node status: unreachable ({err})"),
             (None, None) => println!("  - Node status: not running or unreachable"),
+        }
+        if let Some(status) = &report.auto_update_status {
+            println!("  - Auto-update: {status}");
         }
     }
 
@@ -1013,6 +1023,7 @@ mod tests {
             config: None,
             network_status: None,
             network_status_error: None,
+            auto_update_status: None,
             user_message: None,
         }
     }
@@ -1363,6 +1374,7 @@ mod tests {
             config: None,
             network_status: None,
             network_status_error: None,
+            auto_update_status: None,
             user_message: Some("Test message".to_string()),
         };
 
@@ -1895,6 +1907,7 @@ stack backtrace:
             config: None,
             network_status: None,
             network_status_error: None,
+            auto_update_status: None,
             user_message: None,
         };
 

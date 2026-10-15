@@ -215,6 +215,25 @@ pub fn update_counter_action(outcome: UpdateSubprocessOutcome) -> UpdateCounterA
     }
 }
 
+/// Record that installing `version` failed for a transient reason, so the
+/// node's update triggers leave it alone for a cooldown instead of exiting for
+/// it again at once (#5799). Also says so on stderr even under `--quiet`: this
+/// is the line a supervisor's log (systemd's journal, the Windows wrapper's
+/// log) needs in order to show why an update did not happen.
+fn note_transient_install_failure(version: &str, error: &anyhow::Error) {
+    let failures = super::rollback::record_update_cooldown(version, &format!("{error:#}"));
+    let streak = match failures {
+        0 => String::new(),
+        n => format!(" (failure {n} in a row)"),
+    };
+    #[allow(clippy::let_underscore_must_use)]
+    let _ = writeln!(
+        io::stderr(),
+        "Freenet update to {version} failed{streak}: {error:#}. The node keeps running its \
+         current version and tries again after a cooldown (#5799)."
+    );
+}
+
 /// Classify the exit status of a `freenet update` subprocess invocation.
 /// Pure over just the `io::Result<ExitStatus>` so it can be unit-tested
 /// with synthetic inputs.
@@ -436,6 +455,8 @@ impl UpdateCommand {
             // target install to gate anymore — clear the per-version
             // install-failure counter too (#4073).
             super::rollback::clear_install_failures();
+            // Nor is any release cooling down after failed downloads (#5799).
+            super::rollback::clear_update_cooldown();
             // Nothing to install, so nothing staged in advance (#5790) is useful.
             staged::discard();
             // Exit with a distinct code so the service wrapper knows no update
@@ -492,7 +513,15 @@ impl UpdateCommand {
         // gnu→musl fallback search and the macOS DMG lookup). Requested by exact
         // tag rather than `/releases/latest` so we install the release we just
         // decided about, even if a newer one is published in between.
-        let latest = fetch_release_assets(&latest_tag, self.quiet).await?;
+        let latest = match fetch_release_assets(&latest_tag, self.quiet).await {
+            Ok(latest) => latest,
+            Err(e) => {
+                // The asset list could not be fetched (network, rate limit, a
+                // release whose assets have not appeared yet): transient.
+                note_transient_install_failure(latest_version, &e);
+                return Err(e);
+            }
+        };
         // #4073 per-target-version install-failure gate. Count a DETERMINISTIC
         // install failure of this version — a checksum mismatch or invalid
         // release signature (`ReleaseVerificationError`) — toward the gate. After
@@ -516,6 +545,7 @@ impl UpdateCommand {
         match &install_result {
             Ok(InstallOutcome::Installed) => {
                 super::rollback::clear_install_failures();
+                super::rollback::clear_update_cooldown();
                 // The staged copy (#5790) has served its purpose. Kept on any
                 // failure, so the next attempt need not download it again.
                 staged::discard();
@@ -525,8 +555,14 @@ impl UpdateCommand {
             }) => {
                 if *verification_failure {
                     super::rollback::record_install_failure(latest_version);
+                } else {
+                    // transient bundle failure: leave the gate unchanged, but
+                    // cool the release down (#5799).
+                    note_transient_install_failure(
+                        latest_version,
+                        &anyhow::anyhow!("the app bundle update could not be downloaded"),
+                    );
                 }
-                // transient bundle failure: leave the gate unchanged.
             }
             Err(e) if is_release_verification_failure(e) => {
                 super::rollback::record_install_failure(latest_version)
@@ -543,7 +579,13 @@ impl UpdateCommand {
             // already rate-limit-bounded retry cadence. Only a PRESENT-but-WRONG
             // artifact (checksum mismatch / invalid signature) is an unambiguous
             // bad-release signal and is gated above via ReleaseVerificationError.
-            Err(_) => {}
+            //
+            // What IS recorded is a time-bounded cooldown (#5799): without it,
+            // a node whose network cannot download from GitHub restarts on its
+            // old binary, detects this release again and exits for it again
+            // within minutes, indefinitely. The cooldown always expires, so it
+            // delays this release, never suppresses it.
+            Err(e) => note_transient_install_failure(latest_version, e),
         }
         install_result.map(|_| ())
     }
