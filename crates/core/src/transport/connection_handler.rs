@@ -20,6 +20,7 @@ use futures::{
 };
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
+use recv_errors::{RecvErrorAction, RecvErrorLog, RecvErrorPause, RecvErrorTracker};
 use tokio::{
     net::UdpSocket,
     sync::{mpsc, oneshot},
@@ -1294,6 +1295,7 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
         let mut gw_connection_tasks = FuturesUnordered::new();
         let mut outdated_peer: HashMap<SocketAddr, u64> = HashMap::new();
         let mut last_cleanup_nanos = self.time_source.now_nanos();
+        let mut recv_errors = RecvErrorTracker::default();
 
         'outer: loop {
             // DST: Use deterministic_select! for fair but deterministic branch ordering
@@ -1301,6 +1303,7 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                 recv_result = self.socket_listener.recv_from(&mut buf) => {
                     match recv_result {
                         Ok((size, remote_addr)) => {
+                            recv_errors.on_success();
                             if let Some(time_nanos) = outdated_peer.get(&remote_addr) {
                                 let now_nanos = self.time_source.now_nanos();
                                 if now_nanos.saturating_sub(*time_nanos) < OUTDATED_PEER_EXPIRY.as_nanos() as u64 {
@@ -1575,30 +1578,47 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                             }
                         }
                         Err(e) => {
-                            // Transient errors (e.g., ECONNREFUSED on Linux for ICMP port unreachable)
-                            // should not kill the listener. Only fatal errors should exit.
-                            let kind = e.kind();
-                            if matches!(kind, std::io::ErrorKind::ConnectionReset
-                                | std::io::ErrorKind::ConnectionRefused
-                                | std::io::ErrorKind::ConnectionAborted
-                                | std::io::ErrorKind::Interrupted
-                                | std::io::ErrorKind::WouldBlock
-                                | std::io::ErrorKind::TimedOut)
-                            {
-                                tracing::warn!(
-                                    error = ?e,
-                                    error_kind = ?kind,
-                                    "Transient UDP recv_from error, continuing"
-                                );
-                                continue;
+                            // Ending this task force-exits the node, so only an
+                            // error that means the socket itself is unusable may
+                            // do it. Any other error drops this read and the loop
+                            // carries on. See `recv_errors` for the classification.
+                            let verdict = recv_errors.on_error(&e, self.time_source.now_nanos());
+                            let suppressed = match verdict.log {
+                                RecvErrorLog::Emit { suppressed } => Some(suppressed),
+                                RecvErrorLog::Suppress => None,
+                            };
+                            match verdict.action {
+                                RecvErrorAction::Exit => {
+                                    tracing::error!(
+                                        error = ?e,
+                                        error_kind = ?e.kind(),
+                                        os_error = ?e.raw_os_error(),
+                                        class = ?verdict.class,
+                                        suppressed_since_last_log = suppressed.unwrap_or(0),
+                                        bind_addr = %self.this_addr,
+                                        "Fatal UDP recv_from error, listen task exiting"
+                                    );
+                                    return e.into();
+                                }
+                                RecvErrorAction::Continue { pause } => {
+                                    if let Some(suppressed) = suppressed {
+                                        tracing::warn!(
+                                            error = ?e,
+                                            error_kind = ?e.kind(),
+                                            os_error = ?e.raw_os_error(),
+                                            class = ?verdict.class,
+                                            suppressed_since_last_log = suppressed,
+                                            "UDP recv_from error, dropping the read and continuing"
+                                        );
+                                    }
+                                    match pause {
+                                        RecvErrorPause::None => {}
+                                        RecvErrorPause::Yield => tokio::task::yield_now().await,
+                                        RecvErrorPause::Sleep(d) => self.time_source.sleep(d).await,
+                                    }
+                                    continue;
+                                }
                             }
-                            tracing::error!(
-                                error = ?e,
-                                error_kind = ?kind,
-                                bind_addr = %self.this_addr,
-                                "Fatal UDP recv_from error, listen task exiting"
-                            );
-                            return e.into();
                         }
                     }
                 },
@@ -2780,6 +2800,7 @@ struct InboundRemoteConnection {
     inbound_packet_sender: mpsc::Sender<PacketData<UnknownEncryption>>,
 }
 
+mod recv_errors;
 mod version_cmp;
 
 /// Smoke tests pinning the contract the transport layer relies on from
@@ -4892,5 +4913,330 @@ pub mod mock_transport {
         drop(gw_outbound);
 
         Ok(())
+    }
+
+    /// Wraps a [`MockSocket`] and makes `recv_from` return the queued errors,
+    /// one per call, before it delivers any packet. Lets a test drive the
+    /// listener's receive-error handling with real OS error codes.
+    #[cfg(test)]
+    struct RecvErrorInjectingSocket {
+        inner: MockSocket,
+        errors: std::sync::Mutex<std::collections::VecDeque<std::io::Error>>,
+    }
+
+    #[cfg(test)]
+    impl Socket for RecvErrorInjectingSocket {
+        async fn bind(_addr: SocketAddr) -> Result<Self, std::io::Error> {
+            unimplemented!()
+        }
+
+        async fn recv_from(&self, buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
+            let injected = self.errors.lock().unwrap().pop_front();
+            if let Some(err) = injected {
+                return Err(err);
+            }
+            self.inner.recv_from(buf).await
+        }
+
+        async fn send_to(&self, buf: &[u8], target: SocketAddr) -> std::io::Result<usize> {
+            self.inner.send_to(buf, target).await
+        }
+
+        fn send_to_blocking(&self, buf: &[u8], target: SocketAddr) -> std::io::Result<usize> {
+            self.inner.send_to_blocking(buf, target)
+        }
+    }
+
+    /// Start a non-gateway listener whose socket first returns `errors`, and
+    /// hand back its listen task so the test can see whether it exited.
+    #[cfg(test)]
+    async fn spawn_listener_with_recv_errors(
+        port: u16,
+        channels: Channels,
+        errors: Vec<std::io::Error>,
+    ) -> (
+        TransportPublicKey,
+        OutboundConnectionHandler<RecvErrorInjectingSocket>,
+        tokio::task::JoinHandle<TransportError>,
+        SocketAddr,
+    ) {
+        let addr: SocketAddr = (Ipv4Addr::LOCALHOST, port).into();
+        let socket = RecvErrorInjectingSocket {
+            inner: MockSocket::new(Default::default(), Default::default(), addr, channels).await,
+            errors: std::sync::Mutex::new(errors.into()),
+        };
+        let keypair = TransportKeypair::new();
+        let public = keypair.public.clone();
+        let (handler, _new_connections, listen_handle) =
+            OutboundConnectionHandler::config_listener(
+                Arc::new(socket),
+                keypair,
+                false,
+                addr,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .expect("listener setup");
+        (public, handler, listen_handle, addr)
+    }
+
+    /// The UDP listener must survive receive errors that say nothing about the
+    /// socket itself: a message-size error, a network reset or an unreachable
+    /// host/network report (all of which Windows can return from `recv_from`),
+    /// and an error kind the classifier has never heard of. Each used to end
+    /// the listen task, which force-exits the node. After the
+    /// errors the listener must still read packets, shown by completing a
+    /// handshake through it.
+    #[tokio::test]
+    async fn listener_survives_nonfatal_recv_errors_and_keeps_receiving() -> anyhow::Result<()> {
+        let channels: Channels = Arc::new(DashMap::new());
+        let errors = vec![
+            std::io::Error::from_raw_os_error(10040), // WSAEMSGSIZE
+            std::io::Error::from_raw_os_error(10052), // WSAENETRESET
+            std::io::Error::from_raw_os_error(10065), // WSAEHOSTUNREACH
+            std::io::Error::from_raw_os_error(10051), // WSAENETUNREACH
+            std::io::Error::from(std::io::ErrorKind::HostUnreachable),
+            std::io::Error::from(std::io::ErrorKind::NetworkUnreachable),
+            std::io::Error::other("an error the classifier does not know"),
+        ];
+        let (a_pub, mut peer_a, listen_a, a_addr) =
+            spawn_listener_with_recv_errors(47_100, channels.clone(), errors).await;
+        let (b_pub, mut peer_b, b_addr) = create_mock_peer(Default::default(), channels).await?;
+
+        let b_task = GlobalExecutor::spawn(async move {
+            let conn = peer_b.connect(a_pub, a_addr).await;
+            let conn = tokio::time::timeout(Duration::from_secs(10), conn).await??;
+            Ok::<_, anyhow::Error>(conn)
+        });
+        let conn = peer_a.connect(b_pub, b_addr).await;
+        let a_to_b = tokio::time::timeout(Duration::from_secs(10), conn).await??;
+        let b_to_a = b_task.await??;
+        assert_eq!(a_to_b.remote_addr(), b_addr);
+        assert_eq!(b_to_a.remote_addr(), a_addr);
+
+        assert!(
+            !listen_a.is_finished(),
+            "listener must keep running after non-fatal recv errors"
+        );
+        listen_a.abort();
+        Ok(())
+    }
+
+    /// The other half of the contract: an error that means the socket itself
+    /// is gone must still end the listen task, otherwise the node sits alive
+    /// but deaf and is never restarted.
+    #[tokio::test]
+    async fn listener_exits_on_fatal_recv_error() {
+        #[allow(unused_mut)]
+        let mut fatal = vec![
+            (std::io::Error::from_raw_os_error(10038), "WSAENOTSOCK"),
+            (std::io::Error::from_raw_os_error(10058), "WSAESHUTDOWN"),
+            (
+                std::io::Error::from(std::io::ErrorKind::NotConnected),
+                "NotConnected",
+            ),
+        ];
+        #[cfg(unix)]
+        fatal.push((std::io::Error::from_raw_os_error(libc::EBADF), "EBADF"));
+
+        for (i, (err, name)) in fatal.into_iter().enumerate() {
+            let channels: Channels = Arc::new(DashMap::new());
+            let (_pub, _handler, listen, _addr) =
+                spawn_listener_with_recv_errors(47_200 + i as u16, channels, vec![err]).await;
+            let exited = tokio::time::timeout(Duration::from_secs(5), listen).await;
+            assert!(
+                matches!(exited, Ok(Ok(TransportError::IO(_)))),
+                "{name}: listener must exit with the IO error, got {exited:?}"
+            );
+        }
+    }
+
+    #[cfg(test)]
+    enum RecvStep {
+        /// Advance virtual time by the duration, then fail the read.
+        Error(Duration, std::io::Error),
+        /// Deliver a datagram.
+        Packet(SocketAddr, Vec<u8>),
+    }
+
+    #[cfg(test)]
+    #[derive(Default)]
+    struct ScriptProgress {
+        /// The listener asked for a read after the last step.
+        finished: std::sync::atomic::AtomicBool,
+        /// The listener dropped its socket, i.e. the listen task ended.
+        dropped: std::sync::atomic::AtomicBool,
+    }
+
+    /// A socket whose reads follow a fixed script, advancing a [`VirtualTime`]
+    /// as it goes, so a test can put minutes of receive errors in front of the
+    /// listener instantly. Sends are discarded.
+    #[cfg(test)]
+    struct ScriptedRecvSocket {
+        script: std::sync::Mutex<std::collections::VecDeque<RecvStep>>,
+        time: VirtualTime,
+        progress: Arc<ScriptProgress>,
+    }
+
+    #[cfg(test)]
+    impl Socket for ScriptedRecvSocket {
+        async fn bind(_addr: SocketAddr) -> Result<Self, std::io::Error> {
+            unimplemented!()
+        }
+
+        async fn recv_from(&self, buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
+            let step = self.script.lock().unwrap().pop_front();
+            match step {
+                Some(RecvStep::Error(elapsed, err)) => {
+                    self.time.advance(elapsed);
+                    Err(err)
+                }
+                Some(RecvStep::Packet(from, data)) => {
+                    buf[..data.len()].copy_from_slice(&data);
+                    Ok((data.len(), from))
+                }
+                None => {
+                    self.progress.finished.store(true, Ordering::SeqCst);
+                    std::future::pending().await
+                }
+            }
+        }
+
+        async fn send_to(&self, buf: &[u8], _target: SocketAddr) -> std::io::Result<usize> {
+            Ok(buf.len())
+        }
+
+        fn send_to_blocking(&self, buf: &[u8], _target: SocketAddr) -> std::io::Result<usize> {
+            Ok(buf.len())
+        }
+    }
+
+    #[cfg(test)]
+    impl Drop for ScriptedRecvSocket {
+        fn drop(&mut self) {
+            self.progress.dropped.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// Run a VirtualTime listener over `script` and report whether it read
+    /// past the end of the script (`true`) or ended its listen task (`false`).
+    #[cfg(test)]
+    async fn listener_survives_script(script: Vec<RecvStep>) -> bool {
+        run_scripted_listener(script).await.0
+    }
+
+    /// [`listener_survives_script`], also returning the listener's handler so
+    /// a test can see what the listener did with the datagrams it read.
+    #[cfg(test)]
+    async fn run_scripted_listener(
+        script: Vec<RecvStep>,
+    ) -> (
+        bool,
+        OutboundConnectionHandler<ScriptedRecvSocket, VirtualTime>,
+    ) {
+        let time = VirtualTime::new();
+        let progress = Arc::new(ScriptProgress::default());
+        let socket = ScriptedRecvSocket {
+            script: std::sync::Mutex::new(script.into()),
+            time: time.clone(),
+            progress: progress.clone(),
+        };
+        let addr: SocketAddr = (Ipv4Addr::LOCALHOST, 47_300).into();
+        let (handler, _new_connections) =
+            OutboundConnectionHandler::<_, VirtualTime>::config_listener_with_virtual_time(
+                Arc::new(socket),
+                TransportKeypair::new(),
+                false,
+                addr,
+                None,
+                None,
+                None,
+                time,
+                None,
+            )
+            .expect("listener setup");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let finished = progress.finished.load(Ordering::SeqCst);
+            let dropped = progress.dropped.load(Ordering::SeqCst);
+            if finished || dropped {
+                return (finished && !dropped, handler);
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "listener neither finished the script nor exited"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    #[cfg(test)]
+    fn unclassified_errors(count: usize) -> impl Iterator<Item = RecvStep> {
+        (0..count).map(|_| {
+            RecvStep::Error(
+                Duration::from_millis(100),
+                std::io::Error::other("scripted"),
+            )
+        })
+    }
+
+    /// A successful read in the listen loop must reset the error run. 700
+    /// unclassified errors over 70 s, one datagram, then 400 more: without the
+    /// reset the run holds 1000 errors over 100 s and the listener exits.
+    #[tokio::test]
+    async fn listener_successful_read_resets_recv_error_run() {
+        let from: SocketAddr = (Ipv4Addr::LOCALHOST, 47_301).into();
+        let script = unclassified_errors(700)
+            .chain([RecvStep::Packet(from, vec![0u8; 64])])
+            .chain(unclassified_errors(400))
+            .collect();
+        assert!(
+            listener_survives_script(script).await,
+            "the datagram between the two error runs must reset the run"
+        );
+    }
+
+    /// Control for the test above: the same 1100 errors with no datagram
+    /// between them do end the listener, so the survival above is due to the
+    /// read and not to the script being too short to trigger an exit.
+    #[tokio::test]
+    async fn listener_exits_on_persistent_unclassified_recv_errors() {
+        assert!(
+            !listener_survives_script(unclassified_errors(1100).collect()).await,
+            "1100 unclassified errors over 110 s with no read must end the listener"
+        );
+    }
+
+    /// Transient errors never end the listener and never delay it. 13,000 of
+    /// them over 650 s with no successful read, then a datagram, then 7,000
+    /// more: the listener must survive all 20,000 and handle the datagram in
+    /// between. Each error advances virtual time only when the listener asks
+    /// for its next read, so any sleep on this path (which waits on that same
+    /// clock) would stall the listener and fail the test, while the yield the
+    /// long run triggers does not.
+    #[tokio::test]
+    async fn listener_reads_through_long_transient_error_run() {
+        fn transient(count: usize) -> impl Iterator<Item = RecvStep> {
+            (0..count).map(|_| {
+                RecvStep::Error(
+                    Duration::from_millis(50),
+                    std::io::Error::from_raw_os_error(10051), // WSAENETUNREACH
+                )
+            })
+        }
+        let from: SocketAddr = (Ipv4Addr::new(127, 0, 0, 9), 47_302).into();
+        let script = transient(13_000)
+            .chain([RecvStep::Packet(from, vec![0u8; 64])])
+            .chain(transient(7_000))
+            .collect();
+        let (survived, handler) = run_scripted_listener(script).await;
+        assert!(survived, "transient errors must never end the listener");
+        assert!(
+            handler.expected_non_gateway.contains(&from.ip()),
+            "the datagram in the middle of the run must have been handled"
+        );
     }
 }
