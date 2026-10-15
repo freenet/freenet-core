@@ -325,8 +325,9 @@ impl Grant {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct DelegateRecord {
     pub manifest: DelegateManifest,
-    /// The parameters the delegate was registered with, so lifecycle runs get
-    /// them (a notification run gets empty parameters, #5616; these must not).
+    /// The parameters the delegate was registered with, so lifecycle and
+    /// wake-up runs get them. (Notification runs and inter-delegate hops read
+    /// theirs from the delegate store's `.reg` record instead, #5616.)
     pub params: Vec<u8>,
     pub apps: Vec<AppIdentity>,
     /// `Installed` has been delivered on this node.

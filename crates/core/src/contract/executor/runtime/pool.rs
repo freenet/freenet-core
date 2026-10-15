@@ -993,6 +993,22 @@ impl ContractExecutor for RuntimePool {
             .find_map(|executor| executor.runtime.delegate_code(key))
     }
 
+    fn registered_delegate_params(
+        &self,
+        key: &DelegateKey,
+    ) -> Result<Parameters<'static>, crate::wasm_runtime::ParamsUnavailable> {
+        // Read from the pool's own handles rather than through an executor,
+        // as `delegate_code` does: every executor's store shares this index
+        // and directory, and a checked-out executor cannot answer, so going
+        // through one would turn "every executor busy" into "no parameters"
+        // and skip a run that should have happened.
+        crate::wasm_runtime::registered_params(
+            &self.config.delegates_dir(),
+            &self.shared_stores.delegate_index,
+            key,
+        )
+    }
+
     fn delegate_subscription_store(&self) -> Option<Storage> {
         Some(self.shared_state_store.inner().clone())
     }
@@ -1853,6 +1869,91 @@ mod tests {
             pool.delegate_code(&DelegateKey::new([1; 32], CodeHash::new([1; 32]))),
             None
         );
+    }
+
+    /// #5616: a node-started delegate run gets its parameters from
+    /// `RuntimePool::registered_delegate_params`, and the pool answers from its
+    /// own shared index and delegate directory rather than through an
+    /// executor. So the answer must not depend on an executor being free: with
+    /// EVERY executor checked out, a registered delegate still gets its
+    /// parameters. Going through an executor, as `delegate_code` does, would
+    /// turn "all busy" into "no parameters" and silently drop the run.
+    #[cfg(feature = "wasmtime-backend")]
+    #[tokio::test]
+    async fn registered_delegate_params_answers_with_every_executor_checked_out() {
+        use crate::wasm_runtime::{DelegateRuntimeInterface, ParamsUnavailable};
+        use chacha20poly1305::{KeyInit, XChaCha20Poly1305};
+
+        let config_args = ConfigArgs {
+            id: Some("pool-registered-params".to_string()),
+            mode: Some(OperationMode::Local),
+            ..Default::default()
+        };
+        let node_config =
+            crate::node::NodeConfig::new(config_args.build().await.expect("build Config"))
+                .await
+                .expect("build NodeConfig");
+        let config = node_config.config.clone();
+        let (_notification_rx, notification_tx) = crate::node::event_loop_notification_channel();
+        let (ops_ch_channel, _ch_channel, _wait_for_event) =
+            crate::contract::contract_handler_channel();
+        let connection_manager = crate::ring::ConnectionManager::new(&node_config);
+        let (result_router_tx, _result_router_rx) = tokio::sync::mpsc::channel(100);
+        let task_monitor = crate::node::background_task_monitor::BackgroundTaskMonitor::new();
+        let op_manager = Arc::new(
+            OpManager::new(
+                notification_tx,
+                ops_ch_channel,
+                &node_config,
+                crate::tracing::DynamicRegister::new(vec![]),
+                connection_manager,
+                result_router_tx,
+                &task_monitor,
+            )
+            .expect("build OpManager"),
+        );
+        let mut pool = RuntimePool::new(
+            config,
+            op_manager,
+            NonZeroUsize::new(2).expect("nonzero pool size"),
+        )
+        .await
+        .expect("build RuntimePool");
+
+        // Any bytes do: registration stores the module without running it.
+        let code = vec![0x5A; 64];
+        let delegate = DelegateContainer::Wasm(DelegateWasmAPIVersion::V1(Delegate::from((
+            &code.into(),
+            &b"room-5616".to_vec().into(),
+        ))));
+        let key = delegate.key().clone();
+        pool.runtimes[0]
+            .as_mut()
+            .expect("pool executor present")
+            .runtime
+            .register_delegate(
+                delegate,
+                XChaCha20Poly1305::new(&[0u8; 32].into()),
+                [0u8; 24].into(),
+            )
+            .expect("register the delegate");
+
+        let checked_out = [pool.pop_executor().await, pool.pop_executor().await];
+        assert!(
+            pool.runtimes.iter().all(Option::is_none),
+            "every executor must be checked out, or this measures nothing"
+        );
+        assert_eq!(
+            pool.registered_delegate_params(&key)
+                .map(|p| p.as_ref().to_vec()),
+            Ok(b"room-5616".to_vec())
+        );
+        assert_eq!(
+            pool.registered_delegate_params(&DelegateKey::new([1; 32], CodeHash::new([1; 32])))
+                .map(|p| p.as_ref().to_vec()),
+            Err(ParamsUnavailable::NotRegistered)
+        );
+        drop(checked_out);
     }
 
     /// Every executor of a real `RuntimePool` — including a replacement — uses

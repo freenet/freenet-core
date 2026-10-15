@@ -259,6 +259,13 @@ impl ContractExecutor for Executor<Runtime> {
         Some(self.state_store.inner().clone())
     }
 
+    fn registered_delegate_params(
+        &self,
+        key: &DelegateKey,
+    ) -> Result<Parameters<'static>, crate::wasm_runtime::ParamsUnavailable> {
+        self.runtime.registered_delegate_params(key)
+    }
+
     async fn fetch_contract(
         &mut self,
         key: ContractKey,

@@ -1,0 +1,18 @@
+[package]
+name = "test-delegate-echo-params"
+version = "0.1.0"
+edition = "2024"
+description = "Test delegate that reports the parameters each run was given (client request vs contract notification), for #5616"
+
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+freenet-stdlib = { version = "0.12.1", features = ["contract"] }
+
+[features]
+default = ["freenet-main-delegate"]
+freenet-main-delegate = []
+trace = ["freenet-stdlib/trace"]

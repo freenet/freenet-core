@@ -4,14 +4,24 @@ use freenet_stdlib::prelude::{
     DelegateWasmAPIVersion, Parameters,
 };
 use moka::sync::Cache as MokaCache;
-use std::{fs::File, fs::OpenOptions, io::Write, path::PathBuf, sync::Arc};
+use std::{
+    fs::File,
+    io::{Read, Write},
+    path::PathBuf,
+    sync::Arc,
+};
 
+use crate::contract::delegate_capabilities::MAX_STORED_PARAMS_BYTES;
 use crate::contract::storages::Storage;
 
 use super::RuntimeResult;
 
 /// Registration record version for .reg files
 const REG_FILE_VERSION: u8 = 1;
+
+/// In the name of a temporary `.reg` record (`ensure_reg_file`), which never
+/// ends in `.reg` itself.
+const REG_TMP_MARKER: &str = ".reg.tmp-";
 
 /// Delegate instance index (`DelegateKey -> CodeHash`) shared across every pool
 /// executor's [`DelegateStore`], so a delegate registered or removed via one
@@ -118,6 +128,20 @@ impl DelegateStore {
         if let Ok(dir) = std::fs::read_dir(&delegates_dir) {
             for entry in dir.flatten() {
                 let path = entry.path();
+                // A temporary record left by a crash mid-repair
+                // (`ensure_reg_file`). Never a record itself. Deleting it
+                // unconditionally relies on no `ensure_reg_file` being in
+                // flight while a store is built over this directory: both run
+                // on the contract loop (registration, replacement executors)
+                // or before it starts (pool start-up), one at a time.
+                if path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.contains(REG_TMP_MARKER))
+                {
+                    drop(std::fs::remove_file(&path));
+                    continue;
+                }
                 if path.extension().is_none_or(|e| e != "reg") {
                     continue;
                 }
@@ -262,8 +286,9 @@ impl DelegateStore {
         code_hash: &CodeHash,
         params: &Parameters<'_>,
     ) -> RuntimeResult<()> {
-        // Ensure .reg file exists (supplementary backup for crash recovery)
-        write_reg_file_if_missing(&self.delegates_dir, key, code_hash, params)?;
+        // Ensure the .reg record holds this registration: a backup for crash
+        // recovery, and where node-started runs read their parameters (#5616).
+        ensure_reg_file(&self.delegates_dir, key, code_hash, params)?;
 
         if !self.key_to_code_part.contains_key(key) {
             self.db
@@ -444,7 +469,7 @@ impl DelegateStore {
         file.write_all(output.as_slice())?;
         file.sync_all()?;
 
-        write_reg_file_if_missing(&self.delegates_dir, key, code_hash, &params)?;
+        ensure_reg_file(&self.delegates_dir, key, code_hash, &params)?;
 
         self.db
             .store_delegate_index(key, code_hash)
@@ -519,10 +544,162 @@ impl DelegateStore {
     pub fn code_hash_from_key(&self, key: &DelegateKey) -> Option<CodeHash> {
         self.key_to_code_part.get(key).map(|r| *r.value())
     }
+
+    /// The parameters `key` was registered with on this node. See
+    /// [`registered_params`].
+    pub fn registered_params(
+        &self,
+        key: &DelegateKey,
+    ) -> Result<Parameters<'static>, ParamsUnavailable> {
+        registered_params(&self.delegates_dir, &self.key_to_code_part, key)
+    }
 }
 
-/// Write a .reg registration record file if it doesn't already exist.
-fn write_reg_file_if_missing(
+/// Why [`registered_params`] could not establish a delegate's parameters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParamsUnavailable {
+    /// This node has not registered the key.
+    NotRegistered,
+    /// No registration record, and the key is not derived from empty
+    /// parameters, so they cannot be recovered.
+    NoRecord,
+    /// The registration record exists but could not be read.
+    Unreadable(std::io::ErrorKind),
+    /// The record holds more than `MAX_STORED_PARAMS_BYTES` of parameters.
+    TooLarge,
+    /// The record is corrupt, names different code than the index, or its
+    /// parameters do not derive the key.
+    Invalid,
+    /// The executor has no delegate store to ask.
+    NoStore,
+}
+
+impl std::fmt::Display for ParamsUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::NotRegistered => "the delegate is not registered on this node",
+            Self::NoRecord => {
+                "the delegate has no registration record and its key is not derived \
+                 from empty parameters (registering it again restores the record)"
+            }
+            Self::Unreadable(kind) => {
+                return write!(
+                    f,
+                    "the delegate's registration record could not be read ({kind})"
+                );
+            }
+            Self::TooLarge => "the delegate's registered parameters exceed the size limit",
+            Self::Invalid => {
+                "the delegate's registration record is corrupt or does not match its \
+                 key (registering it again normally repairs the record)"
+            }
+            Self::NoStore => "this executor has no delegate store",
+        })
+    }
+}
+
+/// Header of a `.reg` record: version, code hash, parameter length.
+const REG_HEADER_LEN: usize = 1 + 32 + 4;
+
+/// The parameters `key` was registered with on this node, for a run the NODE
+/// starts (a contract notification, an inter-delegate hop) and so has no
+/// caller to supply them (#5616). An error means this node cannot establish
+/// them, and the caller must not run the delegate: running it with other
+/// parameters (it used to get empty ones) runs a different instance of it,
+/// silently.
+///
+/// # Source
+///
+/// - **The key itself, first.** A delegate key is `BLAKE3(code_hash ‖ params)`,
+///   so a key that derives from EMPTY parameters proves they were empty. That
+///   is the common case and needs no IO, and it holds whatever state the
+///   record is in.
+/// - **Otherwise the `.reg` record** [`DelegateStore::store_delegate`] writes
+///   for every registration (#3344), which holds the parameters verbatim. The
+///   index is not enough: it maps a key to its code hash only.
+///
+/// # What is checked
+///
+/// - **Index-gated**, for the trust reason `fetch_delegate` gives: the answer
+///   is a function of what this node registered, not of which files exist.
+/// - **The record's code hash must match the index**, and **the key must be
+///   derived from that code hash and the record's parameters**. The key is a
+///   commitment to the parameters, so a record that does not reproduce it is
+///   refused rather than used.
+/// - **Bounded read**: at most `MAX_STORED_PARAMS_BYTES` (64 KiB) of
+///   parameters, since this runs on the contract loop. The limit is borrowed
+///   from the capability record, which applies it to the parameters it keeps
+///   for lifecycle and wake-up runs; for notifications and hops it is new
+///   with #5616. A delegate over it gets no node-started runs.
+///
+/// A missing or damaged record is normally repaired by the next registration
+/// of the delegate (`ensure_reg_file`, which logs a record it cannot replace).
+pub fn registered_params(
+    delegates_dir: &std::path::Path,
+    index: &DashMap<DelegateKey, CodeHash>,
+    key: &DelegateKey,
+) -> Result<Parameters<'static>, ParamsUnavailable> {
+    let code_hash = *index
+        .get(key)
+        .ok_or(ParamsUnavailable::NotRegistered)?
+        .value();
+    let empty = Parameters::from(Vec::<u8>::new());
+    if key_derives_from(key, &code_hash, &empty) {
+        return Ok(empty);
+    }
+
+    let reg_path = delegates_dir.join(key.encode()).with_extension("reg");
+    let file = match File::open(&reg_path) {
+        Ok(file) => file,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Err(ParamsUnavailable::NoRecord);
+        }
+        Err(err) => return Err(ParamsUnavailable::Unreadable(err.kind())),
+    };
+    // One byte past the limit, so an oversized record is detected rather than
+    // silently truncated into a parse failure.
+    let limit = (REG_HEADER_LEN + MAX_STORED_PARAMS_BYTES + 1) as u64;
+    let mut data = Vec::new();
+    if let Err(err) = file.take(limit).read_to_end(&mut data) {
+        return Err(ParamsUnavailable::Unreadable(err.kind()));
+    }
+    if data.len() > REG_HEADER_LEN + MAX_STORED_PARAMS_BYTES {
+        return Err(ParamsUnavailable::TooLarge);
+    }
+    let (reg_code_hash, params) = parse_reg_file(&data).ok_or(ParamsUnavailable::Invalid)?;
+    if reg_code_hash != code_hash || !key_derives_from(key, &code_hash, &params) {
+        return Err(ParamsUnavailable::Invalid);
+    }
+    Ok(params)
+}
+
+/// Whether `key` is the delegate key of `code_hash` under `params`.
+fn key_derives_from(key: &DelegateKey, code_hash: &CodeHash, params: &Parameters<'_>) -> bool {
+    DelegateKey::from_params(code_hash.encode(), params).is_ok_and(|derived| derived == *key)
+}
+
+/// Make the `.reg` record for `key` hold exactly this registration, writing it
+/// if it is missing and REPLACING it if it holds anything else.
+///
+/// Replacing matters since #5616: node-started runs read their parameters
+/// from this record, so a record left truncated by a crash or a full disk
+/// mid-write would otherwise silence the delegate's notifications on this
+/// node for good, because re-registering used to keep any existing record.
+/// The caller has verified the registration's identity
+/// (`verify_delegate_identity`), so its parameters are the authoritative
+/// ones. The write goes through a temporary file and a rename, so a record is
+/// never observed half-written.
+///
+/// Errors when no record can be seen (missing, or its existence cannot be
+/// established) and one cannot be written, which is what the old
+/// `create_new` write did. A record that exists but cannot be read or
+/// replaced is logged and left: failing the registration over it would turn
+/// "this delegate's node-started runs are skipped" into "the app cannot
+/// register its delegate", and would also block the very re-registration
+/// that repairs it once the cause clears. Whatever is left in place,
+/// `registered_params` re-derives the key from it, so a stale record can only
+/// cause skipped runs, never a run with the wrong parameters.
+fn ensure_reg_file(
     delegates_dir: &std::path::Path,
     key: &DelegateKey,
     code_hash: &CodeHash,
@@ -531,25 +708,75 @@ fn write_reg_file_if_missing(
     let reg_path = delegates_dir.join(key.encode()).with_extension("reg");
 
     let params_bytes = params.as_ref();
-    let mut reg = Vec::with_capacity(1 + 32 + 4 + params_bytes.len());
+    let mut reg = Vec::with_capacity(REG_HEADER_LEN + params_bytes.len());
     reg.push(REG_FILE_VERSION);
     reg.extend_from_slice(code_hash.as_ref());
     reg.extend_from_slice(&(params_bytes.len() as u32).to_le_bytes());
     reg.extend_from_slice(params_bytes);
 
-    // Atomic create: create_new(true) fails with AlreadyExists if file exists,
-    // avoiding TOCTOU race between exists() check and File::create().
-    let mut file = match OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&reg_path)
-    {
-        Ok(f) => f,
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Ok(()),
-        Err(e) => return Err(e.into()),
+    // Whether a record exists is decided by its metadata, which needs no file
+    // descriptor: an open can fail for reasons that say nothing about the
+    // record (out of descriptors, the directory itself unusable), and reading
+    // those as "a record exists" would let a registration succeed with no
+    // record written at all.
+    let record_exists = std::fs::symlink_metadata(&reg_path).is_ok();
+    if record_exists {
+        // Read one byte more than the expected record, which is all it takes
+        // to tell "identical" from "different".
+        let existing = File::open(&reg_path).and_then(|file| {
+            let mut existing = Vec::new();
+            file.take(reg.len() as u64 + 1).read_to_end(&mut existing)?;
+            Ok(existing)
+        });
+        match existing {
+            Ok(existing) if existing == reg => return Ok(()),
+            Ok(_) => tracing::warn!(
+                delegate = %key,
+                path = %reg_path.display(),
+                "Replacing a delegate registration record that does not match its \
+                 registration"
+            ),
+            Err(e) => tracing::warn!(
+                delegate = %key,
+                path = %reg_path.display(),
+                error = %e,
+                "Cannot read a delegate registration record; replacing it"
+            ),
+        }
+    }
+
+    // A name no other writer uses, so two concurrent registrations cannot
+    // interleave in one temporary file. It does not end in `.reg`, so the
+    // start-up scan never reads one left behind by a crash; it deletes it.
+    static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let tmp_path = delegates_dir.join(format!(
+        "{}{REG_TMP_MARKER}{}-{}",
+        key.encode(),
+        std::process::id(),
+        TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    let write = || -> std::io::Result<()> {
+        let mut file = File::create(&tmp_path)?;
+        file.write_all(&reg)?;
+        file.sync_all()?;
+        std::fs::rename(&tmp_path, &reg_path)
     };
-    file.write_all(&reg)?;
-    file.sync_all()?;
+    if let Err(e) = write() {
+        // Best effort: do not leave the temporary file behind.
+        drop(std::fs::remove_file(&tmp_path));
+        if !record_exists {
+            return Err(e.into());
+        }
+        tracing::warn!(
+            delegate = %key,
+            path = %reg_path.display(),
+            error = %e,
+            "Failed to repair a delegate registration record; its notifications \
+             and inter-delegate messages stay skipped until a registration can \
+             repair it"
+        );
+        return Ok(());
+    }
 
     tracing::debug!("Wrote .reg file: {}", reg_path.display());
     Ok(())
@@ -1051,6 +1278,298 @@ mod test {
         assert!(store.fetch_delegate(&key1, &vec![].into()).is_some());
         assert!(store.fetch_delegate(&key2, &vec![1, 2, 3].into()).is_some());
 
+        Ok(())
+    }
+
+    /// A store in a fresh temp dir, plus the dir and its delegates dir.
+    async fn params_store() -> (DelegateStore, PathBuf, tempfile::TempDir) {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let delegate_dir = temp_dir.path().join("delegates");
+        let db = create_test_db(temp_dir.path()).await;
+        let store = DelegateStore::new(delegate_dir.clone(), 10_000, db).expect("store");
+        (store, delegate_dir, temp_dir)
+    }
+
+    fn reg_path_of(dir: &std::path::Path, d: &DelegateContainer) -> PathBuf {
+        dir.join(d.key().encode()).with_extension("reg")
+    }
+
+    fn params_of(
+        store: &DelegateStore,
+        d: &DelegateContainer,
+    ) -> Result<Vec<u8>, ParamsUnavailable> {
+        store
+            .registered_params(d.key())
+            .map(|p| p.as_ref().to_vec())
+    }
+
+    /// #5616: `registered_params` recovers exactly the parameters a delegate
+    /// was registered with, so a node-started run (contract notification,
+    /// inter-delegate hop) can run the SAME instance a client run does, and
+    /// keeps two instances of one code apart.
+    #[tokio::test]
+    async fn registered_params_returns_the_registration_params()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (mut store, _dir, _tmp) = params_store().await;
+        let code: Vec<u8> = vec![7, 7, 7, 7];
+        let room_a = honest_delegate(code.clone(), b"room-a".to_vec());
+        let room_b = honest_delegate(code.clone(), b"room-b".to_vec());
+        let empty = honest_delegate(code, vec![]);
+        for delegate in [&room_a, &room_b, &empty] {
+            store.store_delegate(delegate.clone())?;
+        }
+
+        assert_eq!(params_of(&store, &room_a), Ok(b"room-a".to_vec()));
+        assert_eq!(params_of(&store, &room_b), Ok(b"room-b".to_vec()));
+        assert_eq!(params_of(&store, &empty), Ok(vec![]));
+        Ok(())
+    }
+
+    /// Index-gated: a key this node never registered, or has removed, has no
+    /// parameters, even when a `.reg` record for it sits in the directory.
+    #[tokio::test]
+    async fn registered_params_is_index_gated() -> Result<(), Box<dyn std::error::Error>> {
+        let (mut store, dir, _tmp) = params_store().await;
+
+        let never = honest_delegate(vec![1, 2, 3], b"p".to_vec());
+        ensure_reg_file(
+            &dir,
+            never.key(),
+            never.code_hash(),
+            &Parameters::from(b"p".to_vec()),
+        )?;
+        assert_eq!(
+            params_of(&store, &never),
+            Err(ParamsUnavailable::NotRegistered)
+        );
+
+        let removed = honest_delegate(vec![1, 2, 4], b"q".to_vec());
+        store.store_delegate(removed.clone())?;
+        assert_eq!(params_of(&store, &removed), Ok(b"q".to_vec()));
+        store.remove_delegate(removed.key())?;
+        assert_eq!(
+            params_of(&store, &removed),
+            Err(ParamsUnavailable::NotRegistered)
+        );
+        Ok(())
+    }
+
+    /// The key proves EMPTY parameters without any record, whatever state the
+    /// record is in; non-empty parameters cannot be recovered without one.
+    #[tokio::test]
+    async fn registered_params_without_a_record_only_vouches_for_empty_params()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (mut store, dir, _tmp) = params_store().await;
+        let empty = honest_delegate(vec![4, 4], vec![]);
+        let empty_corrupt = honest_delegate(vec![4, 5], vec![]);
+        let parameterized = honest_delegate(vec![4, 4], b"room".to_vec());
+        for delegate in [&empty, &empty_corrupt, &parameterized] {
+            store.store_delegate(delegate.clone())?;
+        }
+        std::fs::remove_file(reg_path_of(&dir, &empty))?;
+        std::fs::write(reg_path_of(&dir, &empty_corrupt), [0xFF, 1, 2])?;
+        std::fs::remove_file(reg_path_of(&dir, &parameterized))?;
+
+        assert_eq!(params_of(&store, &empty), Ok(vec![]));
+        assert_eq!(
+            params_of(&store, &empty_corrupt),
+            Ok(vec![]),
+            "a damaged record must not cost an empty-params delegate its runs"
+        );
+        assert_eq!(
+            params_of(&store, &parameterized),
+            Err(ParamsUnavailable::NoRecord),
+            "non-empty params cannot be recovered without a record, and must not \
+             be guessed as empty"
+        );
+        Ok(())
+    }
+
+    /// A record that is corrupt, names other code, or whose parameters do not
+    /// derive the key is refused rather than used: running with it would be
+    /// the #5616 bug. So is one over the size limit.
+    #[tokio::test]
+    async fn registered_params_refuses_a_record_that_does_not_match_the_key()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (mut store, dir, _tmp) = params_store().await;
+        let tampered = honest_delegate(vec![9, 9], b"real".to_vec());
+        let corrupt = honest_delegate(vec![9, 9], b"other".to_vec());
+        let other_code = honest_delegate(vec![9, 9], b"third".to_vec());
+        let big = vec![0xAB; MAX_STORED_PARAMS_BYTES + 1];
+        let oversized = honest_delegate(vec![9, 9], big.clone());
+        for delegate in [&tampered, &corrupt, &other_code, &oversized] {
+            store.store_delegate(delegate.clone())?;
+        }
+
+        ensure_reg_file(
+            &dir,
+            tampered.key(),
+            tampered.code_hash(),
+            &Parameters::from(b"fake".to_vec()),
+        )?;
+        assert_eq!(
+            params_of(&store, &tampered),
+            Err(ParamsUnavailable::Invalid)
+        );
+
+        std::fs::write(reg_path_of(&dir, &corrupt), [REG_FILE_VERSION, 1, 2, 3])?;
+        assert_eq!(params_of(&store, &corrupt), Err(ParamsUnavailable::Invalid));
+
+        ensure_reg_file(
+            &dir,
+            other_code.key(),
+            &CodeHash::new([0x42; 32]),
+            &Parameters::from(b"third".to_vec()),
+        )?;
+        assert_eq!(
+            params_of(&store, &other_code),
+            Err(ParamsUnavailable::Invalid)
+        );
+
+        assert_eq!(
+            params_of(&store, &oversized),
+            Err(ParamsUnavailable::TooLarge)
+        );
+        Ok(())
+    }
+
+    /// Registering again repairs a missing OR damaged record. Before #5616 an
+    /// existing record was never rewritten, which was harmless while it was
+    /// only a crash-recovery backup; now that node-started runs read their
+    /// parameters from it, a record torn by a crash would have silenced the
+    /// delegate's notifications on this node for good.
+    #[tokio::test]
+    async fn registering_again_repairs_a_missing_or_damaged_record()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (mut store, dir, _tmp) = params_store().await;
+        let missing = honest_delegate(vec![3, 3], b"missing".to_vec());
+        let torn = honest_delegate(vec![3, 3], b"torn".to_vec());
+        // A damaged version byte: any guard that leaves "unknown versions"
+        // alone would leave this one unrepaired.
+        let garbled = honest_delegate(vec![3, 3], b"garbled".to_vec());
+        for delegate in [&missing, &torn, &garbled] {
+            store.store_delegate(delegate.clone())?;
+        }
+        std::fs::remove_file(reg_path_of(&dir, &missing))?;
+        std::fs::write(reg_path_of(&dir, &torn), [REG_FILE_VERSION, 1])?;
+        std::fs::write(reg_path_of(&dir, &garbled), [0xFF, 9, 9])?;
+        for delegate in [&missing, &torn, &garbled] {
+            assert!(params_of(&store, delegate).is_err());
+        }
+
+        for delegate in [&missing, &torn, &garbled] {
+            store.store_delegate(delegate.clone())?;
+        }
+        assert_eq!(params_of(&store, &missing), Ok(b"missing".to_vec()));
+        assert_eq!(params_of(&store, &torn), Ok(b"torn".to_vec()));
+        assert_eq!(params_of(&store, &garbled), Ok(b"garbled".to_vec()));
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)?
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().contains(REG_TMP_MARKER))
+            .collect();
+        assert!(leftovers.is_empty(), "no temporary record left behind");
+        Ok(())
+    }
+
+    /// The size limit is inclusive: params of exactly `MAX_STORED_PARAMS_BYTES`
+    /// are returned, one byte more is `TooLarge`.
+    #[tokio::test]
+    async fn registered_params_size_limit_is_inclusive() -> Result<(), Box<dyn std::error::Error>> {
+        let (mut store, _dir, _tmp) = params_store().await;
+        let at_limit = vec![0xCD; MAX_STORED_PARAMS_BYTES];
+        let at = honest_delegate(vec![6, 6], at_limit.clone());
+        let past = honest_delegate(vec![6, 6], vec![0xCD; MAX_STORED_PARAMS_BYTES + 1]);
+        store.store_delegate(at.clone())?;
+        store.store_delegate(past.clone())?;
+        assert_eq!(params_of(&store, &at), Ok(at_limit));
+        assert_eq!(params_of(&store, &past), Err(ParamsUnavailable::TooLarge));
+        Ok(())
+    }
+
+    /// A record that exists but cannot be read is `Unreadable` (with the
+    /// reason), and does NOT make a registration fail: the old `create_new`
+    /// write never failed over an existing record, and failing would also
+    /// block the re-registration that repairs it.
+    #[tokio::test]
+    async fn an_unreadable_record_is_reported_and_does_not_fail_registration()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (mut store, dir, _tmp) = params_store().await;
+        let delegate = honest_delegate(vec![8, 8], b"room".to_vec());
+        store.store_delegate(delegate.clone())?;
+        let reg = reg_path_of(&dir, &delegate);
+        std::fs::remove_file(&reg)?;
+        // A directory where the record should be: opening or reading it fails,
+        // and so does renaming a file over it.
+        std::fs::create_dir(&reg)?;
+        assert!(matches!(
+            params_of(&store, &delegate),
+            Err(ParamsUnavailable::Unreadable(_))
+        ));
+
+        store
+            .store_delegate(delegate.clone())
+            .expect("an unrepairable existing record must not fail registration");
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)?
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().contains(REG_TMP_MARKER))
+            .collect();
+        assert!(leftovers.is_empty(), "no temporary record left behind");
+        Ok(())
+    }
+
+    /// A record that cannot be SEEN and cannot be written still fails, as the
+    /// old `create_new` write did: reporting success with no record would
+    /// leave the delegate with no crash-recovery backup and no node-started
+    /// runs, silently. The directory is replaced by a plain file, so opening
+    /// the record fails with `NotADirectory` rather than `NotFound`: an open
+    /// error that says nothing about the record must not be read as "a record
+    /// exists".
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_record_that_cannot_be_seen_or_written_fails()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let dir = temp_dir.path().join("delegates");
+        std::fs::write(&dir, b"not a directory")?;
+        let delegate = honest_delegate(vec![1, 9], b"room".to_vec());
+        assert!(
+            ensure_reg_file(
+                &dir,
+                delegate.key(),
+                delegate.code_hash(),
+                &Parameters::from(b"room".to_vec()),
+            )
+            .is_err(),
+            "a record that cannot be seen or written must fail registration"
+        );
+        Ok(())
+    }
+
+    /// A temporary record left by a crash mid-repair is deleted at start-up
+    /// and never read as a record.
+    #[tokio::test]
+    async fn startup_deletes_temporary_records() -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let delegate_dir = temp_dir.path().join("delegates");
+        std::fs::create_dir_all(&delegate_dir)?;
+        let delegate = honest_delegate(vec![5, 5], b"room".to_vec());
+        let tmp = delegate_dir.join(format!("{}{REG_TMP_MARKER}1-0", delegate.key().encode()));
+        // A valid record body, so restoring it would be observable.
+        let mut body = vec![REG_FILE_VERSION];
+        body.extend_from_slice(delegate.code_hash().as_ref());
+        body.extend_from_slice(&4u32.to_le_bytes());
+        body.extend_from_slice(b"room");
+        std::fs::write(&tmp, body)?;
+
+        let db = create_test_db(temp_dir.path()).await;
+        let store = DelegateStore::new(delegate_dir, 10_000, db)?;
+        assert!(!tmp.exists(), "the temporary record must be deleted");
+        // Also held by the extension filter alone; kept so a change to the
+        // scan that reads temporary records as records fails here.
+        assert!(
+            store.code_hash_from_key(delegate.key()).is_none(),
+            "a temporary record must never be restored into the index"
+        );
         Ok(())
     }
 

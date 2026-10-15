@@ -2510,10 +2510,12 @@ where
         //   SendDelegateMessage in response, it is filtered out (not delivered). This
         //   prevents infinite recursion between delegates. We use execute_delegate_request
         //   (not the full delivery loop) for the same reason.
-        // - Target delegate receives empty params because params are not stored in the
-        //   delegate registry — they are passed per-request at the API layer. If a target
-        //   delegate's process() relies on params, the caller must use ApplicationMessages
-        //   directly. This is a known v1 limitation.
+        // - Target delegate runs with the params IT was registered with on this node
+        //   (`registered_delegate_params`, #5616), never the caller's and never empty
+        //   ones: a delegate key is `BLAKE3(code_hash ‖ params)`, so other params would
+        //   run a different instance of the target. A target whose params this node
+        //   cannot establish (unregistered, or its registration record is missing or
+        //   corrupt) is not run; the message is dropped and logged.
         // - The caller's delegate key is passed as `caller_delegate` so the receiver
         //   sees `MessageOrigin::Delegate(caller_key)` and can authorize on it
         //   (issue #3860). The runtime attests this identity — the calling delegate
@@ -2534,12 +2536,6 @@ where
 
             for msg in delegate_messages {
                 let target_key = msg.target.clone();
-                let inbound = vec![InboundDelegateMsg::DelegateMessage(msg)];
-                let target_req = DelegateRequest::ApplicationMessages {
-                    key: target_key.clone(),
-                    params: Parameters::from(Vec::new()),
-                    inbound,
-                };
                 // PER-DELEGATE EXCLUSION, second door (#5544 B2).
                 //
                 // This is the SECOND call site of `execute_delegate_request`,
@@ -2579,6 +2575,31 @@ where
                     );
                     continue;
                 }
+
+                // The TARGET's registered params (#5616): see the design notes
+                // above. Same rule as the notification path, for the same
+                // reason: no established params, no run.
+                let target_params = match contract_handler
+                    .executor()
+                    .registered_delegate_params(&target_key)
+                {
+                    Ok(params) => params,
+                    Err(reason) => {
+                        tracing::warn!(
+                            from_delegate = %delegate_key,
+                            target_delegate = %target_key,
+                            %reason,
+                            "Dropped an inter-delegate message: cannot establish the \
+                             parameters the target was registered with (#5616)"
+                        );
+                        continue;
+                    }
+                };
+                let target_req = DelegateRequest::ApplicationMessages {
+                    key: target_key.clone(),
+                    params: target_params,
+                    inbound: vec![InboundDelegateMsg::DelegateMessage(msg)],
+                };
 
                 match contract_handler
                     .executor()
@@ -4463,6 +4484,40 @@ async fn handle_delegate_notification<CH, P>(
     // and the redundancy costs less than a missed exit.
     delegate_app_registry::sweep_expired();
 
+    // THE DELEGATE'S REGISTERED PARAMETERS, NOT EMPTY ONES (#5616).
+    //
+    // A delegate key is `BLAKE3(code_hash ‖ params)` and the params are handed
+    // to `process()`. This run has no client to supply them, and it used to
+    // pass empty ones, so a parameterized delegate (per room, per user) ran as
+    // a different instance of itself, with no error and no log line. The
+    // params go into `req`, so a run queued behind a park and a run that parks
+    // and resumes (`Continuation::params`) carry them too.
+    //
+    // No established params means NO RUN. Running with empty ones instead is
+    // the silent misbehaviour this fixes; skipping is the notification
+    // pipeline's documented best-effort contract (a dropped notification), and
+    // it is logged with the reason. In practice that is an unregistered
+    // delegate (whose run would fail as `Missing` anyway) or a parameterized
+    // delegate whose registration record is missing or damaged, which its
+    // next registration normally repairs.
+    let params = match contract_handler
+        .executor()
+        .registered_delegate_params(&delegate_key)
+    {
+        Ok(params) => params,
+        Err(reason) => {
+            tracing::warn!(
+                delegate = %delegate_key,
+                contract = %contract_id,
+                %reason,
+                "Dropped a contract notification: cannot establish the parameters \
+                 the delegate was registered with, and running it with any others \
+                 would run a different instance of it (#5616)"
+            );
+            return;
+        }
+    };
+
     // Unwrap the Arc — if this is the last subscriber the state moves without cloning,
     // otherwise a clone is made (unavoidable since ContractNotification owns the state).
     let owned_state = Arc::try_unwrap(new_state).unwrap_or_else(|arc| (*arc).clone());
@@ -4477,7 +4532,7 @@ async fn handle_delegate_notification<CH, P>(
 
     let req = DelegateRequest::ApplicationMessages {
         key: delegate_key.clone(),
-        params: Parameters::from(vec![]),
+        params,
         inbound,
     };
 
@@ -13120,6 +13175,210 @@ mod hol_4391_tests {
         gate.add_permits(1);
         let _ = tokio::time::timeout(Duration::from_secs(5), parked).await;
         handle.abort();
+    }
+
+    /// A contract notification for `key`, as the executor's fan-out builds it.
+    fn notification_for(key: &DelegateKey) -> executor::DelegateNotification {
+        executor::DelegateNotification {
+            delegate_key: key.clone(),
+            contract_id: ContractInstanceId::new([0x16; 32]),
+            new_state: Arc::new(WrappedState::new(b"changed".to_vec())),
+        }
+    }
+
+    /// #5616: a contract-notification run enters the delegate with the
+    /// parameters it was REGISTERED with — on its first leg, on the leg that
+    /// resumes after it parks, AND on a second notification that queued behind
+    /// that park and drains after it — rather than empty ones.
+    ///
+    /// Nothing downstream would catch empty params: the store resolves the
+    /// code through its index and attaches whatever params the request
+    /// carries, so a parameterized delegate silently ran as a different
+    /// instance of itself. The resume leg rides `Continuation::params` and the
+    /// queued run rides `PendingRun::Notification { req }`, both taken from
+    /// the request built here, so both are asserted too.
+    ///
+    /// FALSIFY by restoring `params: Parameters::from(vec![])` in
+    /// `handle_delegate_notification`: every observation becomes empty.
+    #[tokio::test]
+    async fn a_notification_run_gets_the_registered_params_on_every_leg_5616() {
+        let _guard = TEST_GUARD.lock().await;
+        let (mut handler, _send) = build_handler(vec![]).await;
+        let rt = handler.runtime_mut();
+        let observations = rt.delegate_observations.clone();
+        let key = DelegateKey::new(
+            [0x56; 32],
+            freenet_stdlib::prelude::CodeHash::new([0x16; 32]),
+        );
+        rt.registered_params
+            .lock()
+            .unwrap()
+            .insert(key.clone(), Some(b"room-7".to_vec()));
+        // First leg parks on a prompt; the resumed leg finishes; then the
+        // notification that queued behind the park drains and finishes.
+        let script = rt.delegate_script.clone();
+        script.lock().unwrap().push_back(prompt_outbound().into());
+        script.lock().unwrap().push_back(Vec::new().into());
+        script.lock().unwrap().push_back(Vec::new().into());
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut park = delegate_park::DelegateParkCtx::new(tx);
+        let prompter = Arc::new(crate::contract::user_input::AutoApprovePrompter);
+
+        handle_delegate_notification(
+            &mut handler,
+            notification_for(&key),
+            &prompter,
+            Some(&mut park),
+        )
+        .await;
+        assert!(park.is_parked(&key), "the first leg must park");
+        handle_delegate_notification(
+            &mut handler,
+            notification_for(&key),
+            &prompter,
+            Some(&mut park),
+        )
+        .await;
+        let resume = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("the off-loop task must deliver a resume")
+            .expect("resume channel open");
+        handle_delegate_resume(&mut handler, &mut park, &prompter, resume).await;
+
+        let seen = observations.lock().unwrap().clone();
+        assert_eq!(seen.len(), 3, "three runs, got {seen:?}");
+        assert_eq!(seen[0].inbound_kinds, vec!["ContractNotification"]);
+        assert_eq!(seen[1].inbound_kinds, vec!["UserResponse"]);
+        assert_eq!(seen[2].inbound_kinds, vec!["ContractNotification"]);
+        for (leg, obs) in ["first", "resumed", "queued"].iter().zip(&seen) {
+            assert_eq!(
+                obs.params,
+                b"room-7".to_vec(),
+                "the {leg} leg of a notification run must get the delegate's \
+                 registered params (#5616)"
+            );
+        }
+    }
+
+    /// #5616: a notification for a delegate whose parameters this node cannot
+    /// establish is NOT run — rather than run with empty ones, which is a
+    /// different delegate instance.
+    ///
+    /// FALSIFY by falling back to empty params on `Err`: the delegate is
+    /// entered once with `[]`.
+    #[tokio::test]
+    async fn a_notification_is_not_run_without_provable_params_5616() {
+        let _guard = TEST_GUARD.lock().await;
+        let (mut handler, _send) = build_handler(vec![]).await;
+        let rt = handler.runtime_mut();
+        let observations = rt.delegate_observations.clone();
+        let script = rt.delegate_script.clone();
+        script.lock().unwrap().push_back(Vec::new().into());
+        let key = DelegateKey::new(
+            [0x57; 32],
+            freenet_stdlib::prelude::CodeHash::new([0x16; 32]),
+        );
+        rt.registered_params
+            .lock()
+            .unwrap()
+            .insert(key.clone(), None);
+
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut park = delegate_park::DelegateParkCtx::new(tx);
+        let prompter = Arc::new(crate::contract::user_input::AutoApprovePrompter);
+        handle_delegate_notification(
+            &mut handler,
+            notification_for(&key),
+            &prompter,
+            Some(&mut park),
+        )
+        .await;
+
+        assert!(
+            observations.lock().unwrap().is_empty(),
+            "the delegate must not be entered without provable params (#5616)"
+        );
+        assert_eq!(
+            script.lock().unwrap().len(),
+            1,
+            "no run consumed the script"
+        );
+    }
+
+    /// #5616, second door: an inter-delegate message enters the TARGET with
+    /// the target's own registered params, and is dropped when the node cannot
+    /// establish them. It used to pass empty params, under a comment claiming
+    /// params were not stored anywhere (they are, in the `.reg` record).
+    ///
+    /// FALSIFY by restoring `params: Parameters::from(Vec::new())` on the
+    /// hop: B is entered with `[]`.
+    #[tokio::test]
+    async fn an_inter_delegate_message_runs_the_target_with_its_registered_params_5616() {
+        for (target_params, expect_entered) in
+            [(Some(b"target-params".to_vec()), true), (None, false)]
+        {
+            let _guard = TEST_GUARD.lock().await;
+            let (mut handler, send) = build_handler(vec![]).await;
+            let rt = handler.runtime_mut();
+            let observations = rt.delegate_observations.clone();
+            let key_a =
+                DelegateKey::new([0x58; 32], freenet_stdlib::prelude::CodeHash::new([8; 32]));
+            let key_b =
+                DelegateKey::new([0x59; 32], freenet_stdlib::prelude::CodeHash::new([9; 32]));
+            rt.registered_params
+                .lock()
+                .unwrap()
+                .insert(key_b.clone(), target_params.clone());
+            // A (client-driven) messages B; B's run, if delivered, is empty.
+            let script = rt.delegate_script.clone();
+            script.lock().unwrap().push_back(
+                vec![OutboundDelegateMsg::SendDelegateMessage(
+                    freenet_stdlib::prelude::DelegateMessage::new(
+                        key_b.clone(),
+                        key_a.clone(),
+                        b"ping".to_vec(),
+                    ),
+                )]
+                .into(),
+            );
+            script.lock().unwrap().push_back(Vec::new().into());
+
+            let handle = GlobalExecutor::spawn(contract_handling(
+                handler,
+                crate::contract::user_input::AutoApprovePrompter,
+            ));
+            let resp = tokio::time::timeout(
+                Duration::from_secs(5),
+                send.send_to_handler(delegate_event(&key_a)),
+            )
+            .await
+            .expect("A's request must complete");
+            assert!(resp.is_ok(), "A's client must be answered, got {resp:?}");
+            handle.abort();
+
+            let entered_b: Vec<_> = observations
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|o| o.delegate_key == key_b)
+                .cloned()
+                .collect();
+            if expect_entered {
+                assert_eq!(entered_b.len(), 1, "the hop must reach B once");
+                assert_eq!(
+                    entered_b[0].params,
+                    b"target-params".to_vec(),
+                    "the hop must run B with B's registered params (#5616)"
+                );
+            } else {
+                assert!(
+                    entered_b.is_empty(),
+                    "B must not be entered without provable params (#5616), got \
+                     {entered_b:?}"
+                );
+            }
+        }
     }
 
     /// A continuation standing in for a delegate parked on a prompt.
