@@ -1385,9 +1385,10 @@ const SIM_PORT_RANGE: u16 = 10000;
 /// The port derived from `peer_seed`, or, if `taken` holds it, the next port
 /// after it (wrapping within the band) that `taken` does not hold.
 fn next_free_sim_port(peer_seed: u64, taken: &HashSet<u16>) -> u16 {
-    let derived = (peer_seed % SIM_PORT_RANGE as u64) as u16;
-    (0..SIM_PORT_RANGE)
-        .map(|step| SIM_PORT_BASE + (derived + step) % SIM_PORT_RANGE)
+    let range = u64::from(SIM_PORT_RANGE);
+    let derived = peer_seed % range;
+    (0..range)
+        .map(|step| SIM_PORT_BASE + ((derived + step) % range) as u16)
         .find(|port| !taken.contains(port))
         .unwrap_or_else(|| panic!("more than {SIM_PORT_RANGE} simulated peers in one network"))
 }
@@ -1406,11 +1407,11 @@ fn next_free_sim_port(peer_seed: u64, taken: &HashSet<u16>) -> u16 {
 /// [`SimNetwork::get_peer_locations`].
 ///
 /// The search range excludes the `50000..=59999` band used by
-/// `SimNetwork::allocate_deterministic_port`, so explicit ports never collide with the
-/// default-path derived ports.
+/// `SimNetwork::allocate_deterministic_port`, so explicit ports never collide
+/// with the default-path derived ports.
 pub fn loopback_ports_for_locations(targets: &[f64]) -> Vec<u16> {
     use std::collections::HashSet;
-    const SEARCH_RANGE: std::ops::RangeInclusive<u16> = 1024..=49999;
+    const SEARCH_RANGE: std::ops::RangeInclusive<u16> = 1024..=(SIM_PORT_BASE - 1);
     let mut used: HashSet<u16> = HashSet::new();
     let mut out = Vec::with_capacity(targets.len());
     for &target in targets {
@@ -2896,9 +2897,11 @@ impl SimNetwork {
     /// 40% of 100-peer networks and nearly every 300-peer one. Two nodes bound
     /// to one address cross-wire: the later bind takes every packet, and the
     /// other node never completes a handshake or gets a ring connection
-    /// (#5864). So a port already held by an earlier peer of this network
-    /// moves to the next free one. Peers whose derived port is free keep it,
-    /// so networks without a collision are unchanged.
+    /// (#5864). So a peer whose derived port an earlier peer of this network
+    /// already holds moves to the next free one. Peers whose derived port is
+    /// free keep it, so networks without a collision are unchanged; in a
+    /// network with one, the moved peer's address and ring location differ
+    /// from what the same seed gave before #5864.
     fn allocate_deterministic_port(&self, peer_index: usize) -> u16 {
         let taken: HashSet<u16> = self.node_addresses.values().map(|a| a.port()).collect();
         let peer_seed = self.derive_peer_seed(peer_index);
@@ -7045,16 +7048,35 @@ mod tests {
             by_index.len(),
             "two peers share a loopback address"
         );
-        // Only a peer whose derived port an earlier peer already holds moves.
+        // Each node is configured to bind the address recorded for it.
+        let configured = sim
+            .gateways
+            .iter()
+            .map(|(builder, gw)| (&gw.label, builder.config.network_listener_port))
+            .chain(
+                sim.nodes
+                    .iter()
+                    .map(|(builder, label)| (label, builder.config.network_listener_port)),
+            );
+        for (label, port) in configured {
+            assert_eq!(
+                port,
+                sim.node_addresses[label].port(),
+                "{label} binds another port"
+            );
+        }
+        // A peer moves only if an earlier peer already holds its derived port
+        // (a move can push a later peer along), and then to the next free one.
         let mut allocated = HashSet::new();
         let mut moved = 0;
         for (index, port) in by_index {
-            if allocated.contains(&derived[index]) {
-                assert_ne!(port, derived[index], "peer {index} kept a taken port");
+            let expected = if allocated.contains(&derived[index]) {
                 moved += 1;
+                next_free_sim_port(derive_peer_seed(SEED, index), &allocated)
             } else {
-                assert_eq!(port, derived[index], "peer {index} moved off a free port");
-            }
+                derived[index]
+            };
+            assert_eq!(port, expected, "peer {index} got the wrong port");
             allocated.insert(port);
         }
         assert!(moved > 0, "the colliding peer must have moved");
