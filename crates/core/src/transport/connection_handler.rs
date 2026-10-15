@@ -1901,10 +1901,18 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                             crate::transport::signal_urgent_update();
                         }
                         let packet = SymmetricMessage::ack_error(&outbound_key)?;
-                        socket
-                            .send_to(&packet.prepared_send(), remote_addr)
-                            .await
-                            .map_err(|_| TransportError::ChannelClosed)?;
+                        // Best effort: the peer is refused either way, and
+                        // returning the mismatch rather than the send error
+                        // is what makes the listener remember it as outdated.
+                        if let Err(err) = socket.send_to(&packet.prepared_send(), remote_addr).await
+                        {
+                            tracing::warn!(
+                                peer_addr = %remote_addr,
+                                direction = "inbound",
+                                error = %err,
+                                "Failed to send version-mismatch ack"
+                            );
+                        }
                         return Err(TransportError::ProtocolVersionMismatch {
                             expected: PCK_VERSION.to_string(),
                             actual: reason.to_string(),
@@ -1931,7 +1939,7 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
             socket
                 .send_to(&outbound_ack_packet.clone().prepared_send(), remote_addr)
                 .await
-                .map_err(|_| TransportError::ChannelClosed)?;
+                .map_err(|err| handshake_send_failed(remote_addr, "inbound", err))?;
 
             // wait until the remote sends the ack packet
             let timeout_result = crate::deterministic_select! {
@@ -2195,6 +2203,15 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
 
             let mut sent_tracker = SentPacketTracker::new_with_time_source(time_source.clone());
 
+            // A failed send is handled like a datagram lost on the wire: the
+            // loop sends again on its next pass, so an error that clears (a
+            // network coming back) does not end the attempt. The error itself
+            // cannot say whether it will clear: a socket bound to [::1] gets
+            // ENETUNREACH for every off-host destination, the same error a
+            // returning network gives (#5871). The deadline bounds both, and
+            // if the last send failed the attempt reports that error.
+            let mut last_send_error: Option<std::io::Error> = None;
+
             // NAT traversal: keep sending packets throughout the deadline to maintain NAT bindings.
             // The acceptor may start hole-punching well before the joiner, so we must keep
             // sending until the deadline expires, not just until we've sent MAX_ATTEMPTS packets.
@@ -2210,10 +2227,21 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                                 direction = "outbound",
                                 "Sending protocol version and inbound key"
                             );
-                            socket
+                            match socket
                                 .send_to(outbound_intro_packet.data(), remote_addr)
                                 .await
-                                .map_err(|_| TransportError::ChannelClosed)?;
+                            {
+                                Ok(_) => last_send_error = None,
+                                Err(err) => {
+                                    tracing::debug!(
+                                        peer_addr = %remote_addr,
+                                        direction = "outbound",
+                                        error = %err,
+                                        "Failed to send intro packet, re-sending on the next pass"
+                                    );
+                                    last_send_error = Some(err);
+                                }
+                            }
                             attempts += 1;
                         }
                         HandshakePhase::RemoteInbound => {
@@ -2235,14 +2263,24 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                                 remote_protoc_version,
                                 ack_version_floor,
                             )?;
-                            socket
-                                .send_to(our_inbound.data(), remote_addr)
-                                .await
-                                .map_err(|_| TransportError::ChannelClosed)?;
-                            sent_tracker.report_sent_packet(
-                                SymmetricMessage::FIRST_PACKET_ID,
-                                our_inbound.data().into(),
-                            );
+                            match socket.send_to(our_inbound.data(), remote_addr).await {
+                                Ok(_) => {
+                                    last_send_error = None;
+                                    sent_tracker.report_sent_packet(
+                                        SymmetricMessage::FIRST_PACKET_ID,
+                                        our_inbound.data().into(),
+                                    );
+                                }
+                                Err(err) => {
+                                    tracing::debug!(
+                                        peer_addr = %remote_addr,
+                                        direction = "outbound",
+                                        error = %err,
+                                        "Failed to send ack, re-sending on the next pass"
+                                    );
+                                    last_send_error = Some(err);
+                                }
+                            }
                             attempts += 1;
                         }
                     }
@@ -2358,10 +2396,19 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                                                 inbound_sym_key_bytes,
                                                 remote_addr,
                                             )?;
+                                            // One-shot: nothing later in this
+                                            // attempt re-sends it, so a failure
+                                            // ends the attempt.
                                             socket
                                                 .send_to(ack_packet.data(), remote_addr)
                                                 .await
-                                                .map_err(|_| TransportError::ChannelClosed)?;
+                                                .map_err(|err| {
+                                                    handshake_send_failed(
+                                                        remote_addr,
+                                                        "outbound",
+                                                        err,
+                                                    )
+                                                })?;
                                             let (inbound_sender, inbound_recv) =
                                                 mpsc::channel(INBOUND_CHANNEL_CAPACITY);
 
@@ -2610,6 +2657,17 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
 
             let elapsed_nanos = time_source.now_nanos().saturating_sub(start_time_nanos);
             let elapsed_ms = elapsed_nanos / 1_000_000;
+            if let Some(err) = last_send_error {
+                tracing::warn!(
+                    peer_addr = %remote_addr,
+                    attempts,
+                    elapsed_ms,
+                    direction = "outbound",
+                    error = %err,
+                    "Outbound handshake failed: sends to the remote are failing"
+                );
+                return Err(TransportError::SendFailed(remote_addr, err.kind()));
+            }
             tracing::warn!(
                 peer_addr = %remote_addr,
                 attempts,
@@ -2623,6 +2681,27 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
         };
         (f.boxed(), inbound_from_remote)
     }
+}
+
+/// Turn a failed handshake `send_to` into the error the handshake returns.
+///
+/// Logs the full OS error first, with the destination, because `SendFailed`
+/// keeps only its `ErrorKind`, and some kinds (`Uncategorized`) name nothing.
+/// Before #5871 these sends mapped every error to `ChannelClosed` and the OS
+/// error was lost. No consumer of a handshake result classifies it with
+/// `is_transient_send_failure`; that predicate is for established connections.
+fn handshake_send_failed(
+    remote_addr: SocketAddr,
+    direction: &'static str,
+    err: std::io::Error,
+) -> TransportError {
+    tracing::warn!(
+        peer_addr = %remote_addr,
+        direction,
+        error = %err,
+        "Handshake send failed"
+    );
+    TransportError::SendFailed(remote_addr, err.kind())
 }
 
 /// Build the success ack for a peer whose protocol version we have just parsed
