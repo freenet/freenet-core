@@ -1381,6 +1381,7 @@ fn derive_peer_seed(master_seed: u64, peer_index: usize) -> u64 {
 /// Band of loopback ports [`SimNetwork`] derives peer ports from.
 const SIM_PORT_BASE: u16 = 50000;
 const SIM_PORT_RANGE: u16 = 10000;
+const _: () = assert!(SIM_PORT_BASE as u32 + SIM_PORT_RANGE as u32 <= u16::MAX as u32 + 1);
 
 /// The port derived from `peer_seed`, or, if `taken` holds it, the next port
 /// after it (wrapping within the band) that `taken` does not hold.
@@ -1406,7 +1407,7 @@ fn next_free_sim_port(peer_seed: u64, taken: &HashSet<u16>) -> u16 {
 /// deterministic. Read the achieved locations back with
 /// [`SimNetwork::get_peer_locations`].
 ///
-/// The search range excludes the `50000..=59999` band used by
+/// The search range ends below `SIM_PORT_BASE`, the band used by
 /// `SimNetwork::allocate_deterministic_port`, so explicit ports never collide
 /// with the default-path derived ports.
 pub fn loopback_ports_for_locations(targets: &[f64]) -> Vec<u16> {
@@ -2901,7 +2902,7 @@ impl SimNetwork {
     /// already holds moves to the next free one. Peers whose derived port is
     /// free keep it, so networks without a collision are unchanged; in a
     /// network with one, the moved peer's address and ring location differ
-    /// from what the same seed gave before #5864.
+    /// from what the same seed gave before this allocation was added.
     fn allocate_deterministic_port(&self, peer_index: usize) -> u16 {
         let taken: HashSet<u16> = self.node_addresses.values().map(|a| a.port()).collect();
         let peer_seed = self.derive_peer_seed(peer_index);
@@ -7004,8 +7005,9 @@ mod tests {
     /// the later bind took every packet and the other node never got a ring
     /// connection. The cold-burst scenario's network (3 gateways, 100 nodes,
     /// seed 0x5858_0000_0005) has such a pair. Every peer must get its own
-    /// address, and peers whose derived port was free must keep it, so
-    /// networks without a collision are unchanged.
+    /// address and be configured to bind it. Peers whose derived port was
+    /// free must keep it, so networks without a collision are unchanged; a
+    /// peer whose port was taken must move to the next free one.
     #[test]
     fn sim_network_gives_every_peer_a_distinct_address() {
         const SEED: u64 = 0x5858_0000_0005;
@@ -7058,13 +7060,16 @@ mod tests {
                     .iter()
                     .map(|(builder, label)| (label, builder.config.network_listener_port)),
             );
+        let mut checked = 0;
         for (label, port) in configured {
+            checked += 1;
             assert_eq!(
                 port,
                 sim.node_addresses[label].port(),
                 "{label} binds another port"
             );
         }
+        assert_eq!(checked, GATEWAYS + NODES);
         // A peer moves only if an earlier peer already holds its derived port
         // (a move can push a later peer along), and then to the next free one.
         let mut allocated = HashSet::new();
