@@ -4475,6 +4475,82 @@ echo "RC=$?"
         );
     }
 
+    /// #5799: the macOS launchd wrapper runs `freenet update` with the plist's
+    /// /dev/null stdio, so the updater's reason for a failed update was lost.
+    /// `run_update` sends its stderr to the unified log through `logger` and
+    /// keeps its exit status. Drives the generated function in `sh` with a
+    /// stand-in updater and a `logger` stub, on every platform.
+    #[test]
+    #[cfg(unix)]
+    fn macos_wrapper_logs_the_updaters_stderr_and_keeps_its_status() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let fake = tmp.path().join("freenet");
+        std::fs::write(
+            &fake,
+            "#!/bin/sh\necho \"post-stop=$FREENET_POST_STOP_EXIT_CODE args=$*\" >&2\nexit 3\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let script = generate_wrapper_script(&fake);
+        let start = script
+            .find("run_update() {")
+            .expect("run_update is defined");
+        let body = &script[start..];
+        let function = &body[..body.find("\n}\n").expect("end of run_update") + 3];
+        for site in [
+            "if run_update; then\n            log_event \"Update successful",
+            "if run_update; then\n                log_event \"Post-crash update/rollback",
+        ] {
+            assert!(
+                script.contains(site),
+                "both post-stop updates go through run_update: {site}"
+            );
+        }
+        // The whole script still parses.
+        let script_path = tmp.path().join("wrapper.sh");
+        std::fs::write(&script_path, &script).unwrap();
+        let parsed = std::process::Command::new("bash")
+            .arg("-n")
+            .arg(&script_path)
+            .status()
+            .unwrap();
+        assert!(parsed.success(), "generated wrapper script must parse");
+        let captured = tmp.path().join("logged");
+        let harness = format!(
+            "logger() {{ shift 2; [ \"$1\" = -f ] && cat \"$2\" >> '{log}'; }}\n\
+             EXIT_CODE=42\n{function}\nrun_update\necho \"rc=$?\"\n",
+            log = captured.display(),
+        );
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&harness)
+            .env("TMPDIR", tmp.path())
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains("rc=3"),
+            "the updater's status survives: {stdout}"
+        );
+        let logged = std::fs::read_to_string(&captured).unwrap_or_default();
+        assert!(
+            logged.contains("post-stop=42 args=update --quiet"),
+            "the updater's stderr reaches logger: {logged:?}"
+        );
+        let leftovers = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter(|e| {
+                e.as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("freenet-update.")
+            })
+            .count();
+        assert_eq!(leftovers, 0, "the temporary file is removed");
+    }
+
     #[test]
     fn in_process_wrapper_only_passes_exit_code_on_post_crash_update() {
         let src = include_str!("service/wrapper.rs");

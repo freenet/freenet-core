@@ -124,8 +124,10 @@ fn install_macos_service() -> Result<()> {
     Ok(())
 }
 
-#[cfg(target_os = "macos")]
-pub fn generate_wrapper_script(binary_path: &Path) -> String {
+// Compiled everywhere (a pure string builder) so the script's behaviour can be
+// tested on every CI platform, not only where launchd exists.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub fn generate_wrapper_script(binary_path: &std::path::Path) -> String {
     format!(
         r#"#!/bin/bash
 # Freenet service wrapper for auto-update support.
@@ -173,6 +175,25 @@ MAX_PORT_CONFLICT_KILLS=3  # Give up after this many kill attempts
 # and so does not accumulate.
 log_event() {{
     logger -t freenet "$1"
+}}
+
+# Run the post-stop `freenet update`, forwarding the node's exit code (#4073).
+# Its stderr, where it says why an update failed (#5799), goes to the unified
+# log through `logger`: the plist sends this script's own output to /dev/null,
+# so without this the reason would be lost.
+run_update() {{
+    UPDATE_ERR="$(mktemp "${{TMPDIR:-/tmp}}/freenet-update.XXXXXX" 2>/dev/null)" || UPDATE_ERR=""
+    if [ -n "$UPDATE_ERR" ]; then
+        {post_stop_env}=$EXIT_CODE "{binary}" update --quiet 2>"$UPDATE_ERR"
+    else
+        {post_stop_env}=$EXIT_CODE "{binary}" update --quiet
+    fi
+    RUN_UPDATE_RC=$?
+    if [ -n "$UPDATE_ERR" ]; then
+        [ -s "$UPDATE_ERR" ] && logger -t freenet -f "$UPDATE_ERR"
+        rm -f "$UPDATE_ERR"
+    fi
+    return $RUN_UPDATE_RC
 }}
 
 # Exit the wrapper loop once consecutive failures hit the cap, so a node that
@@ -339,7 +360,7 @@ while true; do
         # Pass the node's exit code so crash-loop auto-rollback (#4073) can tell
         # a post-stop restart from a manual update and count crashes of a
         # probationary version.
-        if {post_stop_env}=$EXIT_CODE "{binary}" update --quiet; then
+        if run_update; then
             log_event "Update successful, restarting..."
             CONSECUTIVE_FAILURES=0
             PORT_CONFLICT_KILLS=0
@@ -406,7 +427,7 @@ while true; do
             # to the previous binary, and a genuine newer release self-heals
             # forward. Exit 0 => binary changed (rolled back or updated) =>
             # restart immediately; any other status => fall through to backoff.
-            if {post_stop_env}=$EXIT_CODE "{binary}" update --quiet; then
+            if run_update; then
                 log_event "Post-crash update/rollback applied (exit $EXIT_CODE); restarting..."
                 CONSECUTIVE_FAILURES=0
                 PORT_CONFLICT_KILLS=0
