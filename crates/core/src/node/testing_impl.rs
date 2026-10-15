@@ -1364,6 +1364,34 @@ impl Default for ChurnConfig {
     }
 }
 
+/// Derives a deterministic per-peer seed from a network's master seed and the
+/// peer's index.
+fn derive_peer_seed(master_seed: u64, peer_index: usize) -> u64 {
+    // Use a simple but effective mixing function
+    let mut seed = master_seed;
+    seed = seed.wrapping_add(peer_index as u64);
+    seed ^= seed >> 33;
+    seed = seed.wrapping_mul(0xff51afd7ed558ccd);
+    seed ^= seed >> 33;
+    seed = seed.wrapping_mul(0xc4ceb9fe1a85ec53);
+    seed ^= seed >> 33;
+    seed
+}
+
+/// Band of loopback ports [`SimNetwork`] derives peer ports from.
+const SIM_PORT_BASE: u16 = 50000;
+const SIM_PORT_RANGE: u16 = 10000;
+
+/// The port derived from `peer_seed`, or, if `taken` holds it, the next port
+/// after it (wrapping within the band) that `taken` does not hold.
+fn next_free_sim_port(peer_seed: u64, taken: &HashSet<u16>) -> u16 {
+    let derived = (peer_seed % SIM_PORT_RANGE as u64) as u16;
+    (0..SIM_PORT_RANGE)
+        .map(|step| SIM_PORT_BASE + (derived + step) % SIM_PORT_RANGE)
+        .find(|port| !taken.contains(port))
+        .unwrap_or_else(|| panic!("more than {SIM_PORT_RANGE} simulated peers in one network"))
+}
+
 /// For each target ring location, find a distinct IPv6-loopback port whose
 /// `Location::from_address((::1, port))` is closest (in ring distance) to that
 /// target. Used by [`SimNetwork::new_with_node_locations`] to place nodes at
@@ -1378,7 +1406,7 @@ impl Default for ChurnConfig {
 /// [`SimNetwork::get_peer_locations`].
 ///
 /// The search range excludes the `50000..=59999` band used by
-/// `derive_deterministic_port`, so explicit ports never collide with the
+/// `SimNetwork::allocate_deterministic_port`, so explicit ports never collide with the
 /// default-path derived ports.
 pub fn loopback_ports_for_locations(targets: &[f64]) -> Vec<u16> {
     use std::collections::HashSet;
@@ -1596,7 +1624,7 @@ pub struct SimNetwork {
     shared_rings: HashMap<NodeLabel, Arc<parking_lot::Mutex<Option<Arc<crate::ring::Ring>>>>>,
     /// Optional explicit loopback ports for regular nodes, indexed by
     /// regular-node order (i.e. `node_no - number_of_gateways`). When present,
-    /// `config_nodes` uses these instead of `derive_deterministic_port`, which
+    /// `config_nodes` uses these instead of `allocate_deterministic_port`, which
     /// lets a test place nodes at chosen ring locations: a peer's location is
     /// `Location::from_address(&addr)`, a pure function of the loopback port, so
     /// choosing the port chooses the location *consistently* (the address-derived
@@ -1854,15 +1882,7 @@ impl SimNetwork {
 
     /// Derives a deterministic per-peer seed from the master seed and peer index.
     fn derive_peer_seed(&self, peer_index: usize) -> u64 {
-        // Use a simple but effective mixing function
-        let mut seed = self.seed;
-        seed = seed.wrapping_add(peer_index as u64);
-        seed ^= seed >> 33;
-        seed = seed.wrapping_mul(0xff51afd7ed558ccd);
-        seed ^= seed >> 33;
-        seed = seed.wrapping_mul(0xc4ceb9fe1a85ec53);
-        seed ^= seed >> 33;
-        seed
+        derive_peer_seed(self.seed, peer_index)
     }
 
     /// Makes this network's injected crashes and partitions REAL packet
@@ -2869,14 +2889,20 @@ impl SimNetwork {
         self.clean_up_tmp_dirs = false;
     }
 
-    /// Derives a deterministic port from seed and peer index for simulation.
-    /// Uses ports in the dynamic range (49152-65535) to avoid conflicts.
-    fn derive_deterministic_port(&self, peer_index: usize) -> u16 {
-        const BASE_PORT: u16 = 50000;
-        const PORT_RANGE: u16 = 10000;
-        // Use peer seed to get a deterministic offset
+    /// Picks a deterministic, network-unique loopback port for peer `peer_index`.
+    ///
+    /// The port is derived from the peer's seed in `50000..60000`. Drawn
+    /// independently, two of a network's peers often get the same port: about
+    /// 40% of 100-peer networks and nearly every 300-peer one. Two nodes bound
+    /// to one address cross-wire: the later bind takes every packet, and the
+    /// other node never completes a handshake or gets a ring connection
+    /// (#5864). So a port already held by an earlier peer of this network
+    /// moves to the next free one. Peers whose derived port is free keep it,
+    /// so networks without a collision are unchanged.
+    fn allocate_deterministic_port(&self, peer_index: usize) -> u16 {
+        let taken: HashSet<u16> = self.node_addresses.values().map(|a| a.port()).collect();
         let peer_seed = self.derive_peer_seed(peer_index);
-        BASE_PORT + ((peer_seed % PORT_RANGE as u64) as u16)
+        next_free_sim_port(peer_seed, &taken)
     }
 
     async fn config_gateways(&mut self, num: NonZeroUsize) {
@@ -2885,7 +2911,7 @@ impl SimNetwork {
         for node_no in 0..num.into() {
             let label = NodeLabel::gateway(&self.name, node_no);
             // Use deterministic port for simulation instead of querying system
-            let port = self.derive_deterministic_port(node_no);
+            let port = self.allocate_deterministic_port(node_no);
             let keypair = crate::transport::TransportKeypair::new();
             let addr: SocketAddr = (Ipv6Addr::LOCALHOST, port).into();
             let peer_key_location = PeerKeyLocation::new(keypair.public().clone(), addr);
@@ -3041,7 +3067,7 @@ impl SimNetwork {
             // compute from this peer's address.
             let port = match &self.node_port_override {
                 Some(ports) => ports[node_no - self.number_of_gateways],
-                None => self.derive_deterministic_port(node_no),
+                None => self.allocate_deterministic_port(node_no),
             };
             let addr: SocketAddr = (Ipv6Addr::LOCALHOST, port).into();
             // Use location computed from address for consistency with PeerKeyLocation::location().
@@ -6958,6 +6984,81 @@ use crate::contract::OperationMode;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn next_free_sim_port_skips_taken_ports_and_wraps() {
+        let derived = |seed: u64| SIM_PORT_BASE + (seed % SIM_PORT_RANGE as u64) as u16;
+        assert_eq!(next_free_sim_port(7, &HashSet::new()), derived(7));
+        let taken: HashSet<u16> = [derived(7), derived(7) + 1].into_iter().collect();
+        assert_eq!(next_free_sim_port(7, &taken), derived(7) + 2);
+        // The last port of the band wraps to the first.
+        let last = u64::from(SIM_PORT_RANGE - 1);
+        let taken: HashSet<u16> = [SIM_PORT_BASE + SIM_PORT_RANGE - 1].into_iter().collect();
+        assert_eq!(next_free_sim_port(last, &taken), SIM_PORT_BASE);
+    }
+
+    /// #5864: two peers of one network were given the same loopback port, so
+    /// the later bind took every packet and the other node never got a ring
+    /// connection. The cold-burst scenario's network (3 gateways, 100 nodes,
+    /// seed 0x5858_0000_0005) has such a pair. Every peer must get its own
+    /// address, and peers whose derived port was free must keep it, so
+    /// networks without a collision are unchanged.
+    #[test]
+    fn sim_network_gives_every_peer_a_distinct_address() {
+        const SEED: u64 = 0x5858_0000_0005;
+        const GATEWAYS: usize = 3;
+        const NODES: usize = 100;
+        let derived: Vec<u16> = (0..GATEWAYS + NODES)
+            .map(|i| next_free_sim_port(derive_peer_seed(SEED, i), &HashSet::new()))
+            .collect();
+        let distinct_derived: HashSet<u16> = derived.iter().copied().collect();
+        assert!(
+            distinct_derived.len() < derived.len(),
+            "test setup: this seed must derive a duplicate port, or the test proves nothing"
+        );
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let sim = rt.block_on(SimNetwork::new(
+            "sim-port-collision-5864",
+            GATEWAYS,
+            NODES,
+            7,
+            3,
+            200,
+            25,
+            SEED,
+        ));
+
+        let mut by_index: Vec<(usize, u16)> = sim
+            .node_addresses
+            .iter()
+            .map(|(label, addr)| (label.number(), addr.port()))
+            .collect();
+        by_index.sort_unstable();
+        assert_eq!(by_index.len(), GATEWAYS + NODES);
+        let ports: HashSet<u16> = by_index.iter().map(|(_, port)| *port).collect();
+        assert_eq!(
+            ports.len(),
+            by_index.len(),
+            "two peers share a loopback address"
+        );
+        // Only a peer whose derived port an earlier peer already holds moves.
+        let mut allocated = HashSet::new();
+        let mut moved = 0;
+        for (index, port) in by_index {
+            if allocated.contains(&derived[index]) {
+                assert_ne!(port, derived[index], "peer {index} kept a taken port");
+                moved += 1;
+            } else {
+                assert_eq!(port, derived[index], "peer {index} moved off a free port");
+            }
+            allocated.insert(port);
+        }
+        assert!(moved > 0, "the colliding peer must have moved");
+    }
 
     /// #5172: the log-only check reads a peer's LAST LOGGED hash, which goes
     /// stale when the peer's own client write commits without logging one.
