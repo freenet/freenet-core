@@ -1166,8 +1166,8 @@ pub(crate) trait ContractExecutor: Send + 'static {
     /// empty parameters instead is #5616. See
     /// [`crate::wasm_runtime::registered_params`].
     ///
-    /// `NoStore` by default, for executors with no delegate store. None of
-    /// them is driven by `contract_handling`, the only caller.
+    /// `NoStore` by default, for executors with no delegate store. Those
+    /// cannot run delegates at all, so nothing is lost by refusing here.
     fn registered_delegate_params(
         &self,
         _key: &DelegateKey,

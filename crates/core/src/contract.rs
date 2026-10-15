@@ -13265,7 +13265,7 @@ mod hol_4391_tests {
     /// establish is NOT run — rather than run with empty ones, which is a
     /// different delegate instance.
     ///
-    /// FALSIFY by falling back to empty params on `None`: the delegate is
+    /// FALSIFY by falling back to empty params on `Err`: the delegate is
     /// entered once with `[]`.
     #[tokio::test]
     async fn a_notification_is_not_run_without_provable_params_5616() {
