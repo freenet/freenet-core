@@ -17,8 +17,10 @@ name: CI
 #    frequent, that step-level version is the right answer, with data behind it.
 # 2. Skip expensive jobs on main push — PR already validated
 # 3. Skip NAT validation for dependabot PRs — Test is sufficient for version bumps
-# 4. Run fast checks (Fmt, Clippy) in parallel with the heavy jobs. Nothing
+# 4. Run fast checks (Fmt, Clippy) in parallel with the heavy jobs. No test job
 #    `needs:` Fmt: a formatting slip must not suppress the test signal (#5621).
+#    The price is that a PR with a formatting error spends runner minutes on
+#    the heavy jobs until the next push cancels the run.
 # 5. Run required checks in merge_group to satisfy branch protection
 # 6. Split unit/integration and simulation tests for parallelism
 # 7. Tiered merge_group depth (#3973):
@@ -68,8 +70,8 @@ concurrency:
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
-  # Fast checks first - fail fast on simple issues
-  # Order: fastest to slowest for single-runner efficiency
+  # Fast checks run in parallel with the heavy jobs; nothing `needs:` them (see
+  # the note on fmt_check). Order here is just fastest to slowest.
 
   # Fast checks on GitHub-hosted runners (don't block nova)
   conventional_commits:
@@ -113,7 +115,10 @@ jobs:
     timeout-minutes: 5
     # Run in parallel with conventional_commits (both are fast GitHub-hosted checks)
     #
-    # DO NOT add `needs: fmt_check` to any other job (#5621). It used to gate
+    # DO NOT add `needs: fmt_check` to a test or build job (#5621). Rule Lint
+    # enforces this for every required-context job, with an allowlist for the
+    # two failure observers (claude-ci-analysis, notify_dev_room_main_failure),
+    # which need the edge to fire on `failure()`. It used to gate
     # the Windows/macOS/unit/simulation/NAT jobs, so one misplaced line wrap
     # made all of them report SKIPPED: grey, which reads as "not applicable"
     # rather than "never got to run", leaving a release gate with no test
@@ -449,7 +454,7 @@ jobs:
       - name: Required-check path-filter linter self-test
         run: python3 .github/scripts/check_required_check_path_filters.py --self-test
 
-      - name: Check required-check workflows carry no PR path filter
+      - name: Check required-check workflows (no PR path filter, no needs on a required job)
         run: python3 .github/scripts/check_required_check_path_filters.py .github/workflows
 
       - name: Check for banned patterns in new code
