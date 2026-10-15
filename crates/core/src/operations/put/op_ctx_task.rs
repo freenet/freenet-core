@@ -22,6 +22,7 @@
 use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use either::Either;
 use freenet_stdlib::client_api::{ContractResponse, ErrorKind, HostResponse};
@@ -784,6 +785,42 @@ async fn publish_locally_stored_put(
 
 // --- Summary-first PUT (originator pre-phase, #4642 step 3-bis) ---
 
+/// Wait budget for a summary-first probe sent with `htl == 0`: the receiver
+/// does not forward, so this covers one link round trip plus the holder's
+/// summary and reverse-delta computation. See [`probe_round_trip_timeout`].
+const PROBE_TERMINAL_BUDGET: Duration = Duration::from_secs(5);
+
+/// Extra wait granted per remaining hop of a summary-first probe. It is also
+/// the margin by which each relay's downstream wait undercuts its upstream's
+/// wait, so it must cover one relay's processing plus one link's reply latency.
+/// See [`probe_round_trip_timeout`].
+const PROBE_PER_HOP_BUDGET: Duration = Duration::from_secs(1);
+
+/// How long a node that sends a `PutMsg::ProbeRequest` carrying `htl` waits
+/// for the matching `ProbeResponse` (#5839).
+///
+/// Two properties matter:
+///
+/// - **Not scaled by payload.** The probe carries only a state summary, so the
+///   full-state attempt timeout (`compute_put_attempt_timeout`, which grows
+///   with state + code size) does not apply. Using it made the originator wait
+///   `OPERATION_TTL + max(30 s, payload / 20 KiB/s)` (100-160 s for River
+///   rooms) whenever a reply was lost, before the full-state fallback began.
+/// - **Strictly decreasing along the path.** The originator sends `htl` and
+///   waits `T(htl)`; a relay that receives `htl` forwards `htl - 1` and waits
+///   `T(htl - 1)`, which is [`PROBE_PER_HOP_BUDGET`] shorter. So when a hop
+///   gives up on its downstream and answers `holder_found = false` (see
+///   `drive_relay_probe`), that answer reaches its upstream while the upstream
+///   is still waiting, and the no-holder verdict propagates back to the
+///   originator instead of every hop timing out together.
+///
+/// `htl` is clamped to this node's `max_hops_to_live` so a wire-supplied HTL
+/// cannot stretch a relay's wait.
+fn probe_round_trip_timeout(htl: usize, max_hops_to_live: usize) -> Duration {
+    let hops = u32::try_from(htl.min(max_hops_to_live)).unwrap_or(u32::MAX);
+    PROBE_TERMINAL_BUDGET.saturating_add(PROBE_PER_HOP_BUDGET.saturating_mul(hops))
+}
+
 /// Outcome of [`try_summary_first_put`].
 enum SummaryFirstOutcome {
     /// A holder was found; a reconcile delta (if any was needed) has
@@ -899,8 +936,11 @@ async fn try_summary_first_put(
         skip_list: own_addr.into_iter().collect::<HashSet<_>>(),
     });
     let mut ctx = op_manager.op_ctx(probe_tx);
-    let probe_timeout =
-        compute_put_attempt_timeout(op_manager.streaming_threshold, value, contract);
+    // The probe carries only a summary, so its wait is NOT scaled by the
+    // payload the way a full-state attempt is (#5839: scaling it by state +
+    // code size stalled every client PUT 100-160 s whenever a probe reply
+    // went missing). See `probe_round_trip_timeout`.
+    let probe_timeout = probe_round_trip_timeout(htl, op_manager.ring.max_hops_to_live);
     let round_trip =
         tokio::time::timeout(probe_timeout, ctx.send_to_and_await(target_addr, probe_msg)).await;
     op_manager.release_pending_op_slot(probe_tx).await;
@@ -4192,9 +4232,32 @@ pub(crate) async fn start_relay_probe(
             contract = %key,
             %upstream_addr,
             phase = "relay_probe_dedup_reject",
-            "PUT probe relay: duplicate ProbeRequest for in-flight tx, dropping"
+            "PUT probe relay: duplicate ProbeRequest for in-flight tx; \
+             replying no-holder to its sender"
         );
-        return Ok(());
+        // A duplicate means the probe looped back to a hop already on its
+        // path. Answer the sender with `holder_found = false` instead of
+        // dropping it (#5839): a dropped duplicate left the sender, and every
+        // hop upstream of it, waiting out its full timeout. Unlike a
+        // duplicate full-state `Request` (see `start_relay_put`), a
+        // `ProbeResponse` cannot report a false success: the worst outcome
+        // is that the originator ships full state.
+        //
+        // No `release_pending_op_slot` here: the in-flight driver for this
+        // tx owns that slot and its live `pending_op_results` waiter; the
+        // in-flight driver releases it at exit.
+        let hop_count = op_manager.ring.max_hops_to_live.saturating_sub(htl);
+        return relay_probe_send_response(
+            &op_manager,
+            incoming_tx,
+            key,
+            false,
+            hop_count,
+            None,
+            None,
+            upstream_addr,
+        )
+        .await;
     }
 
     let guard = RelayProbeInflightGuard {
@@ -4592,35 +4655,43 @@ async fn drive_relay_probe(
         skip_list: new_skip_list,
     });
 
+    // Wait one `PROBE_PER_HOP_BUDGET` less than our upstream does (it sent
+    // us `htl` and waits `probe_round_trip_timeout(htl)`), so a no-holder
+    // answer we send after giving up still reaches it in time (#5839).
+    let downstream_timeout = probe_round_trip_timeout(new_htl, op_manager.ring.max_hops_to_live);
     let mut ctx = op_manager.op_ctx(incoming_tx);
-    let round_trip =
-        tokio::time::timeout(OPERATION_TTL, ctx.send_to_and_await(next_addr, forward)).await;
+    let round_trip = tokio::time::timeout(
+        downstream_timeout,
+        ctx.send_to_and_await(next_addr, forward),
+    )
+    .await;
     // Interim release, mirroring `drive_relay_put`'s post-`send_to_and_await`
     // release: the downstream reply has already arrived (or timed out), and
     // the upstream `ProbeResponse` send below re-registers under the same
     // tx; the final release happens at `start_relay_probe`'s driver exit.
     op_manager.release_pending_op_slot(incoming_tx).await;
 
-    let reply = match round_trip {
-        Ok(Ok(reply)) => reply,
-        Ok(Err(err)) => return Err(err),
-        Err(_elapsed) => return Err(OpError::UnexpectedOpState),
-    };
-
+    // Any downstream failure (send error, timeout, unexpected reply) is
+    // answered upstream with `holder_found = false` rather than dropped
+    // (#5839). A dropped answer left every upstream hop, and finally the
+    // originator, waiting out its full timeout before falling back to the
+    // full-state PUT. Reporting no-holder is the safe direction: the
+    // originator then ships full state, which is an idempotent merge at any
+    // peer that does hold the contract.
     #[allow(clippy::wildcard_enum_match_arm)]
-    match reply {
-        NetMessage::V1(NetMessageV1::Put(PutMsg::ProbeResponse {
+    let failure = match round_trip {
+        Ok(Ok(NetMessage::V1(NetMessageV1::Put(PutMsg::ProbeResponse {
             holder_found,
             hop_count: downstream_hop_count,
             holder_summary,
             reverse_delta,
             ..
-        })) => {
+        })))) => {
             // Pass the reverse leg straight through: only the terminal
             // holder can compute the delta the originator is missing, so an
             // intermediate routing hop just relays it upstream unchanged
             // (same as `holder_summary`).
-            relay_probe_send_response(
+            return relay_probe_send_response(
                 op_manager,
                 incoming_tx,
                 key,
@@ -4630,10 +4701,31 @@ async fn drive_relay_probe(
                 reverse_delta,
                 upstream_addr,
             )
-            .await
+            .await;
         }
-        _other => Err(OpError::UnexpectedOpState),
-    }
+        Ok(Ok(_other)) => "unexpected reply",
+        Ok(Err(_)) => "send failed",
+        Err(_elapsed) => "timed out",
+    };
+    tracing::debug!(
+        tx = %incoming_tx,
+        contract = %key,
+        %next_addr,
+        failure,
+        phase = "relay_probe_downstream_failed",
+        "PUT probe relay: downstream probe failed; replying no-holder upstream"
+    );
+    relay_probe_send_response(
+        op_manager,
+        incoming_tx,
+        key,
+        false,
+        hop_count,
+        None,
+        None,
+        upstream_addr,
+    )
+    .await
 }
 
 /// Spawn a relay driver for a fresh inbound `PutMsg::ProbeReconcile`.
@@ -9313,5 +9405,317 @@ mod streaming_relay_failure_tests {
         assert!(consume(&key_a, RelayStreamFault::Assembly));
         assert!(consume(&key_a, RelayStreamFault::Assembly));
         assert!(!consume(&key_a, RelayStreamFault::Assembly), "budget spent");
+    }
+}
+
+/// Summary-first probe relays must always answer upstream (#5839).
+///
+/// A relay that dropped its answer when its own downstream failed left the
+/// originator waiting out its whole probe timeout (100-160 s for River rooms,
+/// back when that timeout was scaled by payload) before the full-state PUT
+/// could start. These drive the real `drive_relay_probe` / `start_relay_probe`
+/// against a stubbed event loop and check what reaches the upstream peer.
+#[cfg(test)]
+mod relay_probe_failure_tests {
+    use super::*;
+    use crate::message::MessageStats;
+    use crate::node::OpExecutionPayload;
+    use crate::operations::route_attempt::driver_test_support::op_manager_with_peers;
+
+    /// Every PUT message the relay handed to the event loop, with its target.
+    type Sent = Arc<parking_lot::Mutex<Vec<(NetMessage, Option<SocketAddr>)>>>;
+
+    /// A version every summary-first gate accepts.
+    const PROBE_CAPABLE_VERSION: (u8, u8, u16) = (0, 2, 200);
+
+    /// The HTL the relay receives. It forwards `RELAY_HTL - 1`.
+    const RELAY_HTL: usize = 6;
+
+    /// How the relay's downstream hop fails.
+    #[derive(Clone, Copy, Debug)]
+    enum Downstream {
+        /// The send fails: the waiter is dropped without a reply.
+        SendFails,
+        /// The downstream peer is pruned before it answers.
+        Disconnects,
+        /// The probe is delivered and nothing ever comes back.
+        NeverAnswers,
+        /// Something other than a `ProbeResponse` comes back.
+        WrongReply,
+    }
+
+    fn upstream() -> SocketAddr {
+        "10.0.0.42:31337".parse().unwrap()
+    }
+
+    fn key() -> ContractKey {
+        ContractKey::from_id_and_code(
+            ContractInstanceId::new([58u8; 32]),
+            CodeHash::new([39u8; 32]),
+        )
+    }
+
+    /// Play the event loop: record every PUT message, and fail a forwarded
+    /// `ProbeRequest` as `downstream` says. Every other waiter is held open.
+    fn stub_event_loop(
+        mut rx: tokio::sync::mpsc::Receiver<OpExecutionPayload>,
+        downstream: Downstream,
+    ) -> Sent {
+        let sent = Sent::default();
+        let log = sent.clone();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Some((reply_tx, msg, target)) = rx.recv().await {
+                if msg.id().transaction_type() != crate::message::TransactionType::Put {
+                    held.push(reply_tx);
+                    continue;
+                }
+                log.lock().push((msg.clone(), target));
+                let forwarded_probe = matches!(
+                    msg,
+                    NetMessage::V1(NetMessageV1::Put(PutMsg::ProbeRequest { .. }))
+                ) && target != Some(upstream());
+                if !forwarded_probe {
+                    held.push(reply_tx);
+                    continue;
+                }
+                match downstream {
+                    Downstream::SendFails => drop(reply_tx),
+                    Downstream::Disconnects => reply_tx
+                        .try_send(WaiterReply::PeerDisconnected {
+                            peer: target.expect("a forward has a target"),
+                        })
+                        .expect("the forward's waiter accepts its reply"),
+                    Downstream::NeverAnswers => held.push(reply_tx),
+                    Downstream::WrongReply => reply_tx
+                        .try_send(WaiterReply::Reply(NetMessage::from(
+                            PutMsg::ForwardingAck {
+                                id: *msg.id(),
+                                contract_key: key(),
+                            },
+                        )))
+                        .expect("the forward's waiter accepts its reply"),
+                }
+            }
+        });
+        sent
+    }
+
+    /// What reached `upstream()` for `tx`, in order.
+    fn upstream_replies(sent: &Sent, tx: Transaction) -> Vec<PutMsg> {
+        sent.lock()
+            .iter()
+            .filter(|(msg, target)| *target == Some(upstream()) && *msg.id() == tx)
+            .filter_map(|(msg, _)| match msg {
+                NetMessage::V1(NetMessageV1::Put(put)) => Some(put.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Whether the relay forwarded the probe to a downstream peer.
+    fn forwarded(sent: &Sent, tx: Transaction) -> bool {
+        sent.lock().iter().any(|(msg, target)| {
+            *msg.id() == tx
+                && *target != Some(upstream())
+                && matches!(
+                    msg,
+                    NetMessage::V1(NetMessageV1::Put(PutMsg::ProbeRequest { .. }))
+                )
+        })
+    }
+
+    fn assert_single_no_holder(label: &str, replies: &[PutMsg]) {
+        assert_eq!(
+            replies.len(),
+            1,
+            "{label}: exactly one answer must reach upstream, got {replies:?}"
+        );
+        let PutMsg::ProbeResponse {
+            holder_found,
+            holder_summary,
+            reverse_delta,
+            ..
+        } = &replies[0]
+        else {
+            panic!(
+                "{label}: expected a ProbeResponse upstream, got {:?}",
+                replies[0]
+            );
+        };
+        assert!(
+            !holder_found,
+            "{label}: a failed probe must report no holder"
+        );
+        assert!(
+            holder_summary.is_none() && reverse_delta.is_none(),
+            "{label}: a no-holder answer carries no holder data"
+        );
+    }
+
+    /// Run a non-holding relay whose only next hop fails as `downstream` says.
+    /// Returns what reached upstream and how long the first answer took, in
+    /// virtual time.
+    async fn relay_with(downstream: Downstream) -> (Vec<PutMsg>, Option<Duration>) {
+        let label = format!("relay-probe-5839-{downstream:?}");
+        let (op_manager, rx, peers, _guards) = op_manager_with_peers(&label, 1).await;
+        let next_hop = peers[0].socket_addr().expect("peer address");
+        op_manager
+            .ring
+            .connection_manager
+            .record_remote_version(next_hop, Some(PROBE_CAPABLE_VERSION));
+        let sent = stub_event_loop(rx, downstream);
+
+        let tx = Transaction::new::<PutMsg>();
+        let start = tokio::time::Instant::now();
+        // The relay's own result is not what the upstream sees; the
+        // assertions are on what it sent.
+        let _result = drive_relay_probe(
+            &op_manager,
+            tx,
+            key(),
+            StateSummary::from(vec![1u8; 16]),
+            RELAY_HTL,
+            HashSet::new(),
+            upstream(),
+        )
+        .await;
+        let elapsed = start.elapsed();
+        // Let the stubbed event loop record the last send.
+        tokio::task::yield_now().await;
+
+        assert!(
+            forwarded(&sent, tx),
+            "{downstream:?}: the relay must forward the probe to its next hop, \
+             or this test exercises nothing"
+        );
+        let replies = upstream_replies(&sent, tx);
+        let first = (!replies.is_empty()).then_some(elapsed);
+        (replies, first)
+    }
+
+    /// A relay whose downstream fails answers `holder_found = false` upstream
+    /// instead of dropping the probe.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn relay_answers_no_holder_when_downstream_fails() {
+        for downstream in [
+            Downstream::SendFails,
+            Downstream::Disconnects,
+            Downstream::WrongReply,
+        ] {
+            let (replies, first) = relay_with(downstream).await;
+            assert_single_no_holder(&format!("{downstream:?}"), &replies);
+            assert!(
+                first.expect("answered") < Duration::from_secs(1),
+                "{downstream:?}: a failure the relay sees at once must be answered \
+                 at once, took {first:?}"
+            );
+        }
+    }
+
+    /// A relay whose downstream never answers gives up and answers no-holder
+    /// BEFORE its own upstream stops waiting for it, so the verdict propagates
+    /// back to the originator instead of every hop timing out together.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn relay_answers_before_its_upstream_gives_up_when_downstream_is_silent() {
+        let (replies, first) = relay_with(Downstream::NeverAnswers).await;
+        assert_single_no_holder("NeverAnswers", &replies);
+        let first = first.expect("answered");
+        let max_htl = crate::ring::Ring::DEFAULT_MAX_HOPS_TO_LIVE;
+        let upstream_waits = probe_round_trip_timeout(RELAY_HTL, max_htl);
+        assert!(
+            first < upstream_waits,
+            "the relay answered after {first:?}, but its upstream (which sent \
+             htl {RELAY_HTL}) stops waiting at {upstream_waits:?}"
+        );
+        assert!(
+            first >= probe_round_trip_timeout(RELAY_HTL - 1, max_htl),
+            "the relay must give its downstream its full budget, answered after {first:?}"
+        );
+    }
+
+    /// A duplicate `ProbeRequest` (the probe looped back to a hop already on
+    /// its path) is answered no-holder, and the in-flight relay keeps its
+    /// dedup entry.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn duplicate_probe_is_answered_no_holder() {
+        let (op_manager, rx, _peers, _guards) =
+            op_manager_with_peers("relay-probe-5839-dup", 0).await;
+        let sent = stub_event_loop(rx, Downstream::NeverAnswers);
+        let tx = Transaction::new::<PutMsg>();
+        // A relay for `tx` is already in flight on this node.
+        assert!(op_manager.active_relay_put_txs.insert(tx));
+
+        start_relay_probe(
+            op_manager.clone(),
+            tx,
+            key(),
+            StateSummary::from(vec![1u8; 16]),
+            RELAY_HTL,
+            HashSet::new(),
+            upstream(),
+        )
+        .await
+        .expect("the duplicate is answered");
+        tokio::task::yield_now().await;
+
+        assert_single_no_holder("duplicate", &upstream_replies(&sent, tx));
+        assert!(
+            op_manager.active_relay_put_txs.contains(&tx),
+            "the in-flight relay still owns the tx"
+        );
+    }
+
+    /// The originator's probe wait must be the hop-budgeted probe timeout,
+    /// not the full-state attempt timeout that grows with state + code size
+    /// (the 100-160 s stall in #5839). `try_summary_first_put` needs a whole
+    /// contract handler to run, so this pins the call instead.
+    #[test]
+    fn originator_probe_wait_is_not_scaled_by_payload() {
+        let src = include_str!("op_ctx_task.rs");
+        let fn_start = src
+            .find("async fn try_summary_first_put(")
+            .expect("try_summary_first_put not found");
+        let after = &src[fn_start..];
+        // A top-level fn ends at the first `}` in column 0.
+        let body = &after[..after.find("\n}\n").expect("end of try_summary_first_put")];
+        let code: String = body
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            code.contains("probe_round_trip_timeout(htl,"),
+            "the originator must wait probe_round_trip_timeout for its probe"
+        );
+        assert!(
+            !code.contains("compute_put_attempt_timeout("),
+            "the probe carries only a summary; its wait must not scale with the payload"
+        );
+    }
+
+    /// The probe wait does not depend on the payload, shrinks by exactly one
+    /// per-hop budget at each hop, and stays short.
+    #[test]
+    fn probe_round_trip_timeout_decreases_per_hop_and_stays_short() {
+        let max_htl = crate::ring::Ring::DEFAULT_MAX_HOPS_TO_LIVE;
+        for htl in 1..=max_htl {
+            assert_eq!(
+                probe_round_trip_timeout(htl, max_htl) - probe_round_trip_timeout(htl - 1, max_htl),
+                PROBE_PER_HOP_BUDGET,
+                "each hop must wait one per-hop budget less than its upstream (htl {htl})"
+            );
+        }
+        assert_eq!(probe_round_trip_timeout(0, max_htl), PROBE_TERMINAL_BUDGET);
+        assert!(
+            probe_round_trip_timeout(max_htl, max_htl) <= Duration::from_secs(20),
+            "an originator probe must not stall a PUT for long: {:?}",
+            probe_round_trip_timeout(max_htl, max_htl)
+        );
+        assert_eq!(
+            probe_round_trip_timeout(usize::MAX, max_htl),
+            probe_round_trip_timeout(max_htl, max_htl),
+            "a wire-supplied HTL must not stretch the wait"
+        );
     }
 }
