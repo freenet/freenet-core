@@ -5239,4 +5239,340 @@ pub mod mock_transport {
             "the datagram in the middle of the run must have been handled"
         );
     }
+
+    /// The error an AF_INET6 socket bound to `[::1]` returns for every
+    /// off-host destination on Linux (measured), and also what a network
+    /// that is coming back returns: ENETUNREACH, as a real OS error so the
+    /// tests can check its text reaches the log (#5871).
+    #[cfg(test)]
+    fn enetunreach() -> std::io::Error {
+        #[cfg(unix)]
+        {
+            std::io::Error::from_raw_os_error(libc::ENETUNREACH)
+        }
+        #[cfg(not(unix))]
+        {
+            std::io::Error::from_raw_os_error(10051) // WSAENETUNREACH
+        }
+    }
+
+    /// Wraps a [`MockSocket`] and fails with [`enetunreach`] every send for
+    /// which `fail(send_index, packet)` is true. Counts the failed sends.
+    #[cfg(test)]
+    struct SendErrorInjectingSocket {
+        inner: MockSocket,
+        fail: fn(usize, &[u8]) -> bool,
+        sends: AtomicUsize,
+        failures: Arc<AtomicUsize>,
+    }
+
+    #[cfg(test)]
+    impl Socket for SendErrorInjectingSocket {
+        async fn bind(_addr: SocketAddr) -> Result<Self, std::io::Error> {
+            unimplemented!()
+        }
+
+        async fn recv_from(&self, buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
+            self.inner.recv_from(buf).await
+        }
+
+        async fn send_to(&self, buf: &[u8], target: SocketAddr) -> std::io::Result<usize> {
+            let index = self.sends.fetch_add(1, Ordering::SeqCst);
+            if (self.fail)(index, buf) {
+                self.failures.fetch_add(1, Ordering::SeqCst);
+                return Err(enetunreach());
+            }
+            self.inner.send_to(buf, target).await
+        }
+
+        fn send_to_blocking(&self, buf: &[u8], target: SocketAddr) -> std::io::Result<usize> {
+            self.inner.send_to_blocking(buf, target)
+        }
+    }
+
+    #[cfg(test)]
+    fn is_intro(buf: &[u8]) -> bool {
+        PacketData::<UnknownEncryption, MAX_PACKET_SIZE>::from_buf(buf).is_intro_packet()
+    }
+
+    /// Start a listener on `port` whose sends `fail` selects fail.
+    #[cfg(test)]
+    async fn spawn_listener_with_send_errors(
+        port: u16,
+        is_gateway: bool,
+        channels: Channels,
+        fail: fn(usize, &[u8]) -> bool,
+    ) -> (
+        TransportPublicKey,
+        OutboundConnectionHandler<SendErrorInjectingSocket>,
+        SocketAddr,
+        Arc<AtomicUsize>,
+    ) {
+        let addr: SocketAddr = (Ipv4Addr::LOCALHOST, port).into();
+        let failures = Arc::new(AtomicUsize::new(0));
+        let socket = SendErrorInjectingSocket {
+            inner: MockSocket::new(Default::default(), Default::default(), addr, channels).await,
+            fail,
+            sends: AtomicUsize::new(0),
+            failures: failures.clone(),
+        };
+        let keypair = TransportKeypair::new();
+        let public = keypair.public.clone();
+        let (handler, _new_connections, _listen_handle) =
+            OutboundConnectionHandler::config_listener(
+                Arc::new(socket),
+                keypair,
+                is_gateway,
+                addr,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .expect("listener setup");
+        (public, handler, addr, failures)
+    }
+
+    /// Wait until some captured line satisfies `pred`, or give up after 10 s.
+    #[cfg(test)]
+    async fn wait_for_log(
+        logs: &crate::util::test_log_capture::CapturedLogs,
+        pred: impl Fn(&str) -> bool,
+    ) -> Option<String> {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(line) = logs.lock().unwrap().iter().find(|l| pred(l)) {
+                return Some(line.clone());
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return None;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// #5871: when every handshake send fails, the outbound attempt must
+    /// end with an error naming the send failure and the destination, not
+    /// `ChannelClosed` ("transport handler channel closed, socket likely
+    /// closed"), and the OS error itself must reach the log. It must also
+    /// keep re-sending until the attempt's deadline, as it does for a lost
+    /// datagram, rather than giving up on the first failure.
+    #[tokio::test]
+    async fn nat_traversal_send_failure_reports_os_error_not_channel_closed() {
+        let (logs, guard) = crate::util::test_log_capture::install();
+        let channels: Channels = Arc::new(DashMap::new());
+        let (_pub, mut peer, _addr, failures) =
+            spawn_listener_with_send_errors(47_400, false, channels, |_, _| true).await;
+        let remote_addr: SocketAddr = (Ipv4Addr::LOCALHOST, 47_401).into();
+        let remote_pub = TransportKeypair::new().public;
+
+        let conn = peer.connect(remote_pub, remote_addr).await;
+        let result = tokio::time::timeout(Duration::from_secs(10), conn)
+            .await
+            .expect("a failing attempt must end at its deadline, not hang");
+        let err = match result {
+            Ok(_) => panic!("every send failed, so the handshake cannot succeed"),
+            Err(err) => err,
+        };
+        assert!(
+            matches!(
+                err,
+                TransportError::SendFailed(addr, std::io::ErrorKind::NetworkUnreachable)
+                    if addr == remote_addr
+            ),
+            "expected SendFailed({remote_addr}, NetworkUnreachable), got {err:?}"
+        );
+        assert!(
+            failures.load(Ordering::SeqCst) > 1,
+            "a send failure must not end the attempt at once; the intro loop \
+             re-sends as for a lost datagram (failures = {})",
+            failures.load(Ordering::SeqCst)
+        );
+
+        let os_error = format!("os error {}", enetunreach().raw_os_error().unwrap());
+        let peer_field = format!("peer_addr={remote_addr}");
+        let line = wait_for_log(&logs, |l| {
+            l.starts_with("WARN") && l.contains(&os_error) && l.contains(&peer_field)
+        })
+        .await;
+        drop(guard);
+        assert!(
+            line.is_some(),
+            "a WARN naming the OS error and the destination must be logged; captured: {:?}",
+            logs.lock().unwrap()
+        );
+    }
+
+    /// #5871, the other half of the retry decision: a send failure that
+    /// clears (a network coming back) must not kill the attempt. The first
+    /// two sends fail; the handshake must still complete.
+    #[tokio::test]
+    async fn nat_traversal_survives_send_failures_that_clear() -> anyhow::Result<()> {
+        let channels: Channels = Arc::new(DashMap::new());
+        let (a_pub, mut peer_a, a_addr, failures) =
+            spawn_listener_with_send_errors(47_410, false, channels.clone(), |i, _| i < 2).await;
+        let (b_pub, mut peer_b, b_addr) = create_mock_peer(Default::default(), channels).await?;
+
+        let b_task = GlobalExecutor::spawn(async move {
+            let conn = peer_b.connect(a_pub, a_addr).await;
+            let conn = tokio::time::timeout(Duration::from_secs(10), conn).await??;
+            Ok::<_, anyhow::Error>(conn)
+        });
+        let conn = peer_a.connect(b_pub, b_addr).await;
+        let a_to_b = tokio::time::timeout(Duration::from_secs(10), conn).await??;
+        let b_to_a = b_task.await??;
+        assert_eq!(a_to_b.remote_addr(), b_addr);
+        assert_eq!(b_to_a.remote_addr(), a_addr);
+        assert_eq!(
+            failures.load(Ordering::SeqCst),
+            2,
+            "the test only means something if the injected failures happened"
+        );
+        Ok(())
+    }
+
+    /// #5871, the one-shot send at the end of the joiner's handshake: the
+    /// joiner's intro reaches the gateway, but its reply to the gateway's ack
+    /// fails. There is nothing left in the attempt to re-send it, so the
+    /// attempt ends at once, with the send error rather than `ChannelClosed`.
+    #[tokio::test]
+    async fn joiner_ack_send_failure_reports_send_error() -> anyhow::Result<()> {
+        let channels: Channels = Arc::new(DashMap::new());
+        let (gw_pub, (_gw_handler, _gw_conns), gw_addr) =
+            create_mock_gateway(Default::default(), channels.clone()).await?;
+        let (_pub, mut joiner, _addr, failures) =
+            spawn_listener_with_send_errors(47_420, false, channels, |_, buf| !is_intro(buf)).await;
+
+        let conn = joiner.connect(gw_pub, gw_addr).await;
+        let result = tokio::time::timeout(Duration::from_secs(10), conn).await?;
+        let err = match result {
+            Ok(_) => panic!("the joiner's ack could not be sent, so it must not report success"),
+            Err(err) => err,
+        };
+        assert!(
+            matches!(
+                err,
+                TransportError::SendFailed(addr, std::io::ErrorKind::NetworkUnreachable)
+                    if addr == gw_addr
+            ),
+            "expected SendFailed({gw_addr}, NetworkUnreachable), got {err:?}"
+        );
+        assert_eq!(failures.load(Ordering::SeqCst), 1);
+        Ok(())
+    }
+
+    /// #5871, gateway side: when the gateway's ack to a joiner cannot be
+    /// sent, the failed handshake must be logged with the send error and
+    /// the OS error, not as `ChannelClosed`.
+    #[tokio::test]
+    async fn gateway_ack_send_failure_logs_send_error() -> anyhow::Result<()> {
+        let (logs, guard) = crate::util::test_log_capture::install();
+        let channels: Channels = Arc::new(DashMap::new());
+        let (gw_pub, _gw, gw_addr, failures) =
+            spawn_listener_with_send_errors(47_430, true, channels.clone(), |_, _| true).await;
+        let (_pub, mut joiner, joiner_addr) =
+            create_mock_peer(Default::default(), channels).await?;
+
+        let conn = joiner.connect(gw_pub, gw_addr).await;
+        let joiner_task =
+            GlobalExecutor::spawn(tokio::time::timeout(Duration::from_secs(10), conn));
+
+        let send_failed = format!("send to {joiner_addr} failed");
+        let failed_line = wait_for_log(&logs, |l| {
+            l.contains("Failed to establish gateway connection")
+        })
+        .await;
+        let os_error = format!("os error {}", enetunreach().raw_os_error().unwrap());
+        let warn_line = wait_for_log(&logs, |l| {
+            l.starts_with("WARN")
+                && l.contains(&os_error)
+                && l.contains(&format!("peer_addr={joiner_addr}"))
+        })
+        .await;
+        joiner_task.abort();
+        drop(guard);
+
+        let failed_line = failed_line.unwrap_or_else(|| {
+            panic!(
+                "the gateway must log the failed handshake; captured: {:?}",
+                logs.lock().unwrap()
+            )
+        });
+        assert!(
+            failed_line.contains(&send_failed),
+            "the failure must name the send error and the joiner, got: {failed_line}"
+        );
+        assert!(
+            !failed_line.contains("channel closed"),
+            "a send error is not a closed channel, got: {failed_line}"
+        );
+        assert!(
+            warn_line.is_some(),
+            "a WARN naming the OS error and the joiner must be logged; captured: {:?}",
+            logs.lock().unwrap()
+        );
+        assert!(failures.load(Ordering::SeqCst) >= 1);
+        Ok(())
+    }
+
+    /// #5871, gateway side, version mismatch: the `ack_error` that tells an
+    /// incompatible joiner why it was refused is best effort. If it cannot
+    /// be sent, the handshake must still end as a version mismatch (which is
+    /// what makes the listener remember the peer as outdated), and the send
+    /// error must be logged with the OS error, not reported as
+    /// `ChannelClosed`.
+    #[tokio::test]
+    async fn gateway_version_mismatch_ack_send_failure_still_reports_mismatch() {
+        let (logs, guard) = crate::util::test_log_capture::install();
+        let channels: Channels = Arc::new(DashMap::new());
+        let (gw_pub, _gw, gw_addr, failures) =
+            spawn_listener_with_send_errors(47_440, true, channels.clone(), |_, _| true).await;
+
+        // An old-format 0.0.1 version, below every build's min_compatible.
+        let joiner_addr: SocketAddr = (Ipv4Addr::LOCALHOST, 47_441).into();
+        let raw = MockSocket::new(
+            Default::default(),
+            Default::default(),
+            joiner_addr,
+            channels,
+        )
+        .await;
+        let old_version: [u8; 8] = [0, 0, 1, 0, 0, 0, 0, 0];
+        assert!(version_cmp::is_compatible(&PROTOC_VERSION, &old_version).is_err());
+        let mut intro = [0u8; 8 + 16];
+        intro[..8].copy_from_slice(&old_version);
+        let packet = PacketData::<_, MAX_PACKET_SIZE>::encrypt_with_pubkey(&intro, &gw_pub);
+        raw.send_to(packet.data(), gw_addr).await.unwrap();
+
+        let failed_line = wait_for_log(&logs, |l| {
+            l.contains("Failed to establish gateway connection")
+        })
+        .await;
+        let os_error = format!("os error {}", enetunreach().raw_os_error().unwrap());
+        let warn_line = wait_for_log(&logs, |l| {
+            l.starts_with("WARN")
+                && l.contains(&os_error)
+                && l.contains(&format!("peer_addr={joiner_addr}"))
+        })
+        .await;
+        drop(guard);
+
+        let failed_line = failed_line.unwrap_or_else(|| {
+            panic!(
+                "the gateway must log the refused handshake; captured: {:?}",
+                logs.lock().unwrap()
+            )
+        });
+        assert!(
+            failed_line.contains("Version incompatibility"),
+            "an unsendable ack_error must not hide the version mismatch, got: {failed_line}"
+        );
+        assert!(
+            warn_line.is_some(),
+            "a WARN naming the OS error and the joiner must be logged; captured: {:?}",
+            logs.lock().unwrap()
+        );
+        assert_eq!(failures.load(Ordering::SeqCst), 1);
+    }
 }
