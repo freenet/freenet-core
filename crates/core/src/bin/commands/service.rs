@@ -4338,7 +4338,9 @@ echo "RC=$?"
     /// the regression to Windows users.
     #[test]
     fn spawn_update_command_must_null_all_three_standard_handles() {
-        let src = include_str!("service/wrapper.rs");
+        // Normalised: a Windows checkout has CRLF line endings, and the
+        // `\n}\n` end anchor below would never match.
+        let src = include_str!("service/wrapper.rs").replace("\r\n", "\n");
         let body_of = |signature: &str| -> String {
             let (_, after_fn_start) = src
                 .split_once(signature)

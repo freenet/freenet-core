@@ -4198,6 +4198,7 @@ done
     fn transient_install_failures_cool_the_release_down() {
         const SRC: &str = include_str!("update.rs");
         let code: String = SRC
+            .replace("\r\n", "\n")
             .split_once(concat!("#[cfg(test)]\n", "mod tests {"))
             .expect("test module not found")
             .0
@@ -4236,7 +4237,9 @@ done
             2,
             "both the Installed outcome and the already-up-to-date exit clear the cooldown"
         );
-        let note = SRC
+        // CRLF-normalised for a Windows checkout, so the `\n}\n` anchor matches.
+        let src = SRC.replace("\r\n", "\n");
+        let note = src
             .split_once("\nfn note_transient_install_failure(")
             .expect("helper not found")
             .1;
