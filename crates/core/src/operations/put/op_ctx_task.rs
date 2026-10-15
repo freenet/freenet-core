@@ -4419,11 +4419,15 @@ async fn compute_probe_reverse_delta(
              failed); originator heals via GET/anti-entropy"
         );
     }
-    let delta = reverse_delta_from_compute_result(computed);
-    let delta_len = delta.as_ref().map_or(0, |d| d.size());
-    let capped = cap_reverse_delta(delta, op_manager.streaming_threshold);
+    let delta_len = match &computed {
+        Ok(Some(d)) => d.size(),
+        Ok(None) | Err(_) => 0,
+    };
+    let capped = reverse_delta_from_compute_result(computed, op_manager.streaming_threshold);
     if capped.is_none() && delta_len > 0 {
-        tracing::debug!(
+        // INFO: release builds compile debug out, and this is the only sign
+        // that an originator was left to converge via anti-entropy.
+        tracing::info!(
             tx = %incoming_tx,
             contract = %key,
             delta_len,
@@ -4461,12 +4465,14 @@ fn cap_reverse_delta(
 /// `Ok(Some)` ships the delta; `Ok(None)` (the originator is already current —
 /// the contract produced an empty delta) and `Err` (the delta is inefficient
 /// or uncomputable) both ship nothing (`None`), leaving the originator to
-/// heal via a normal GET / anti-entropy. Kept as a pure function so the three
+/// heal via a normal GET / anti-entropy. A delta larger than `max_bytes` is
+/// also dropped (see [`cap_reverse_delta`]). Kept as a pure function so the
 /// arms are unit-testable without a live contract handler.
 fn reverse_delta_from_compute_result(
     computed: Result<Option<StateDelta<'static>>, crate::ring::interest::DeltaUnavailable>,
+    max_bytes: usize,
 ) -> Option<StateDelta<'static>> {
-    computed.unwrap_or(None)
+    cap_reverse_delta(computed.unwrap_or(None), max_bytes)
 }
 
 /// Routes a `PutMsg::ProbeRequest` toward `key`, or answers it directly when
@@ -5035,7 +5041,8 @@ mod tests {
     #[test]
     fn reverse_delta_from_compute_result_maps_all_arms() {
         // Holder ahead: a real reverse delta is shipped back to the originator.
-        let shipped = reverse_delta_from_compute_result(Ok(Some(StateDelta::from(vec![1, 2, 3]))));
+        let shipped =
+            reverse_delta_from_compute_result(Ok(Some(StateDelta::from(vec![1, 2, 3]))), 3);
         assert_eq!(
             shipped.as_ref().map(|d| d.as_ref().to_vec()),
             Some(vec![1, 2, 3]),
@@ -5043,7 +5050,7 @@ mod tests {
         );
 
         // Originator already current (empty delta from the contract): send nothing.
-        let already_current = reverse_delta_from_compute_result(Ok(None));
+        let already_current = reverse_delta_from_compute_result(Ok(None), usize::MAX);
         assert!(
             already_current.is_none(),
             "Ok(None) (originator already current) must send NO reverse delta"
@@ -5055,23 +5062,36 @@ mod tests {
         // Both Err variants must behave identically here: the reverse leg
         // ships nothing whether the post-compute gate refused an oversized
         // delta (#4923) or the contract's delta computation failed.
-        let inefficient = reverse_delta_from_compute_result(Err(
-            crate::ring::interest::DeltaUnavailable::NotEfficient {
+        let inefficient = reverse_delta_from_compute_result(
+            Err(crate::ring::interest::DeltaUnavailable::NotEfficient {
                 summary_size: 600,
                 state_size: 1000,
-            },
-        ));
+            }),
+            usize::MAX,
+        );
         assert!(
             inefficient.is_none(),
             "Err (computed delta not smaller than full state) must send NO \
              reverse delta"
         );
-        let uncomputable = reverse_delta_from_compute_result(Err(
-            crate::ring::interest::DeltaUnavailable::ComputeFailed("wasm exploded".into()),
-        ));
+        let uncomputable = reverse_delta_from_compute_result(
+            Err(crate::ring::interest::DeltaUnavailable::ComputeFailed(
+                "wasm exploded".into(),
+            )),
+            usize::MAX,
+        );
         assert!(
             uncomputable.is_none(),
             "Err (delta computation failed) must send NO reverse delta"
+        );
+
+        // Larger than the cap (#5839): send nothing, so the ProbeResponse
+        // stays within the probe's per-hop budget.
+        let oversized =
+            reverse_delta_from_compute_result(Ok(Some(StateDelta::from(vec![1, 2, 3, 4]))), 3);
+        assert!(
+            oversized.is_none(),
+            "a reverse delta above the cap must not be shipped"
         );
     }
 
@@ -9554,7 +9574,6 @@ mod relay_probe_failure_tests {
             .collect()
     }
 
-    /// Whether the relay forwarded the probe to a downstream peer.
     /// The HTL of the probe the relay forwarded downstream, if it did.
     fn forwarded_htl(sent: &Sent, tx: Transaction) -> Option<usize> {
         sent.lock().iter().find_map(|(msg, target)| match msg {
