@@ -17,7 +17,8 @@ name: CI
 #    frequent, that step-level version is the right answer, with data behind it.
 # 2. Skip expensive jobs on main push — PR already validated
 # 3. Skip NAT validation for dependabot PRs — Test is sufficient for version bumps
-# 4. Run fast checks (Fmt, Clippy) in parallel for quick fail-fast
+# 4. Run fast checks (Fmt, Clippy) in parallel with the heavy jobs. Nothing
+#    `needs:` Fmt: a formatting slip must not suppress the test signal (#5621).
 # 5. Run required checks in merge_group to satisfy branch protection
 # 6. Split unit/integration and simulation tests for parallelism
 # 7. Tiered merge_group depth (#3973):
@@ -111,6 +112,16 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     # Run in parallel with conventional_commits (both are fast GitHub-hosted checks)
+    #
+    # DO NOT add `needs: fmt_check` to any other job (#5621). It used to gate
+    # the Windows/macOS/unit/simulation/NAT jobs, so one misplaced line wrap
+    # made all of them report SKIPPED: grey, which reads as "not applicable"
+    # rather than "never got to run", leaving a release gate with no test
+    # signal that looked like a single red check. Fmt is itself a required
+    # status context (branch protection and the merge queue read it directly,
+    # there is no aggregate job), so a Fmt failure still blocks merge without
+    # the `needs:` edges. The cost is that a PR with a formatting error now
+    # spends runner minutes on the heavy jobs.
 
     steps:
       - uses: actions/checkout@v7
@@ -693,7 +704,7 @@ jobs:
 
           echo "Rule lint passed — no banned patterns in new code"
 
-  # Clippy runs in parallel with fmt_check for faster fail-fast
+  # Clippy runs in parallel with fmt_check (and with every heavy job)
   # Using Ubicloud for faster builds with more cores
   clippy_check:
     name: Clippy
@@ -800,7 +811,6 @@ jobs:
     name: Windows Check
     runs-on: windows-latest
     timeout-minutes: 20
-    needs: fmt_check
     if: github.event_name == 'pull_request' || github.event_name == 'merge_group'
 
     steps:
@@ -823,7 +833,6 @@ jobs:
     # tiered model (#3973) doesn't apply here.
     runs-on: ubicloud-standard-16
     timeout-minutes: 30
-    needs: fmt_check
     # Skip on push to main (PR already validated) and on release branches
     # themselves (the release version-bump PR is gated by its merge_group entry,
     # which runs the full suite). The release merge_group entry IS the
@@ -1012,7 +1021,6 @@ jobs:
     # 45, not 30: the freenet:// LaunchServices e2e rebuilds the freenet crate
     # (auto-update off) and waits for the app to launch and handle links.
     timeout-minutes: 45
-    needs: fmt_check
     # Same skip conditions as test_unit (see test_unit comment for details).
     if: |
       (github.event_name == 'pull_request' || github.event_name == 'merge_group') &&
@@ -1104,7 +1112,6 @@ jobs:
     # this job at least once (cache only saves on `github.ref ==
     # refs/heads/main`, see the cache step below).
     timeout-minutes: 60
-    needs: fmt_check
     # Same skip conditions as test_unit (see test_unit comment for details).
     if: |
       (github.event_name == 'pull_request' || github.event_name == 'merge_group') &&
@@ -1202,7 +1209,6 @@ jobs:
     # is gated off (see skip_check below).
     runs-on: "${{ (github.event_name == 'merge_group' && !startsWith(github.event.merge_group.head_commit.message, 'build: release')) && 'ubuntu-latest' || 'ubicloud-standard-16' }}"
     timeout-minutes: 40
-    needs: fmt_check
     # Same skip conditions as test_unit (see test_unit comment for details)
     if: |
       (github.event_name == 'pull_request' || github.event_name == 'merge_group') &&
@@ -1442,7 +1448,6 @@ jobs:
 
   nat_validation:
     name: NAT Validation
-    needs: fmt_check
     # Run on the heavy runner for PRs (validates the change) and for release
     # merge_group entries (the full-suite release gate). Skip the real steps on
     # non-release merge_group entries to avoid contending for ubicloud-standard-16
