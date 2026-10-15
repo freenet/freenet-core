@@ -1185,6 +1185,11 @@ async fn try_summary_first_put(
 /// the two can never drift relative to each other — see
 /// `.claude/rules/bug-prevention-patterns.md` ("Manually-mirrored
 /// telemetry counters").
+///
+/// `new_contract` is the probe's `holder_found == false`, which since #5839
+/// also covers a relay that answered no-holder because its own downstream
+/// failed (the wire format carries no reason). It means "full state shipped
+/// after the probe", not strictly "nobody hosts this contract".
 fn record_put_probe_outcome(new_contract: bool, bytes: u64) {
     if new_contract {
         crate::config::GlobalTestMetrics::record_put_probe_new_contract(bytes);
@@ -4414,7 +4419,39 @@ async fn compute_probe_reverse_delta(
              failed); originator heals via GET/anti-entropy"
         );
     }
-    reverse_delta_from_compute_result(computed)
+    let delta = reverse_delta_from_compute_result(computed);
+    let delta_len = delta.as_ref().map_or(0, |d| d.size());
+    let capped = cap_reverse_delta(delta, op_manager.streaming_threshold);
+    if capped.is_none() && delta_len > 0 {
+        tracing::debug!(
+            tx = %incoming_tx,
+            contract = %key,
+            delta_len,
+            cap = op_manager.streaming_threshold,
+            phase = "relay_probe_reverse_delta_too_large",
+            "PUT probe: reverse delta too large for the probe's hop budget; \
+             originator heals via GET/anti-entropy"
+        );
+    }
+    capped
+}
+
+/// Drop a reverse-leg delta larger than `max_bytes` (the node's streaming
+/// threshold).
+///
+/// The `ProbeResponse` that carries it travels back through every relay on
+/// the probe path, and each relay must receive it within the probe's
+/// hop-budgeted wait (`probe_round_trip_timeout`, #5839), which has only
+/// `PROBE_PER_HOP_BUDGET` of slack per hop. A delta close to the state size
+/// would make a live holder look absent: the upstream hop gives up
+/// mid-transfer, answers no-holder, and full state ships anyway. Without the
+/// delta the originator still completes the PUT and converges through the
+/// normal GET / anti-entropy path, as it does when the delta is inefficient.
+fn cap_reverse_delta(
+    delta: Option<StateDelta<'static>>,
+    max_bytes: usize,
+) -> Option<StateDelta<'static>> {
+    delta.filter(|d| d.size() <= max_bytes)
 }
 
 /// Map an [`InterestManager::compute_delta`](crate::ring::interest::InterestManager::compute_delta)
@@ -4641,7 +4678,11 @@ async fn drive_relay_probe(
         .await;
     }
 
-    let new_htl = htl.saturating_sub(1);
+    // Clamped to our `max_hops_to_live` before decrementing, so an oversized
+    // wire HTL shrinks here and the per-hop wait gradient below stays strictly
+    // decreasing along the rest of the path (#5839).
+    let max_htl = op_manager.ring.max_hops_to_live;
+    let new_htl = htl.min(max_htl).saturating_sub(1);
     let forward = NetMessage::from(PutMsg::ProbeRequest {
         id: incoming_tx,
         contract_key: key,
@@ -4653,10 +4694,7 @@ async fn drive_relay_probe(
     // Wait one `PROBE_PER_HOP_BUDGET` less than our upstream does (it sent
     // us `htl` and waits `probe_round_trip_timeout(htl)`), so a no-holder
     // answer we send after giving up still reaches it in time (#5839).
-    // `htl` is clamped first so a wire HTL above our `max_hops_to_live`
-    // still leaves us strictly shorter than an upstream with the same cap.
-    let max_htl = op_manager.ring.max_hops_to_live;
-    let downstream_timeout = probe_round_trip_timeout(htl.min(max_htl).saturating_sub(1), max_htl);
+    let downstream_timeout = probe_round_trip_timeout(new_htl, max_htl);
     let mut ctx = op_manager.op_ctx(incoming_tx);
     let round_trip = tokio::time::timeout(
         downstream_timeout,
@@ -8314,7 +8352,7 @@ mod tests {
             + start;
         let body = &src[start..end];
         assert!(
-            body.contains("let new_htl = htl.saturating_sub(1);"),
+            body.contains("let new_htl = htl.min(max_htl).saturating_sub(1);"),
             "drive_relay_probe must decrement htl before forwarding"
         );
         assert!(
@@ -9409,7 +9447,9 @@ mod streaming_relay_failure_tests {
     }
 }
 
-/// Summary-first probe relays must always answer upstream (#5839).
+/// Summary-first probe relays answer upstream when their downstream fails
+/// (#5839). (A duplicate or banned-contract probe is still dropped; the
+/// sender's own hop-budgeted wait bounds that.)
 ///
 /// A relay that dropped its answer when its own downstream failed left the
 /// originator waiting out its whole probe timeout (100-160 s for River rooms,
@@ -9515,14 +9555,15 @@ mod relay_probe_failure_tests {
     }
 
     /// Whether the relay forwarded the probe to a downstream peer.
-    fn forwarded(sent: &Sent, tx: Transaction) -> bool {
-        sent.lock().iter().any(|(msg, target)| {
-            *msg.id() == tx
-                && *target != Some(upstream())
-                && matches!(
-                    msg,
-                    NetMessage::V1(NetMessageV1::Put(PutMsg::ProbeRequest { .. }))
-                )
+    /// The HTL of the probe the relay forwarded downstream, if it did.
+    fn forwarded_htl(sent: &Sent, tx: Transaction) -> Option<usize> {
+        sent.lock().iter().find_map(|(msg, target)| match msg {
+            NetMessage::V1(NetMessageV1::Put(PutMsg::ProbeRequest { id, htl, .. }))
+                if *id == tx && *target != Some(upstream()) =>
+            {
+                Some(*htl)
+            }
+            _ => None,
         })
     }
 
@@ -9557,7 +9598,10 @@ mod relay_probe_failure_tests {
     /// Run a non-holding relay whose only next hop fails as `downstream` says.
     /// Returns what reached upstream and how long the first answer took, in
     /// virtual time.
-    async fn relay_with(downstream: Downstream, htl: usize) -> (Vec<PutMsg>, Option<Duration>) {
+    async fn relay_with(
+        downstream: Downstream,
+        htl: usize,
+    ) -> (Vec<PutMsg>, Option<Duration>, usize) {
         let label = format!("relay-probe-5839-{downstream:?}-{htl}");
         let (op_manager, rx, peers, _guards) = op_manager_with_peers(&label, 1).await;
         let next_hop = peers[0].socket_addr().expect("peer address");
@@ -9587,20 +9631,21 @@ mod relay_probe_failure_tests {
         // Let the stubbed event loop record the last send.
         tokio::time::sleep(Duration::from_millis(10)).await;
 
-        assert!(
-            forwarded(&sent, tx),
-            "{downstream:?}: the relay must forward the probe to its next hop, \
-             or this test exercises nothing"
-        );
+        let forwarded_htl = forwarded_htl(&sent, tx).unwrap_or_else(|| {
+            panic!(
+                "{downstream:?}: the relay must forward the probe to its next hop, \
+                 or this test exercises nothing"
+            )
+        });
         let replies = upstream_replies(&sent, tx);
         let first = (!replies.is_empty()).then_some(elapsed);
-        (replies, first)
+        (replies, first, forwarded_htl)
     }
 
     /// A relay whose downstream fails answers `holder_found = false` upstream
     /// at once instead of dropping the probe.
     async fn assert_immediate_no_holder(downstream: Downstream) {
-        let (replies, first) = relay_with(downstream, RELAY_HTL).await;
+        let (replies, first, _) = relay_with(downstream, RELAY_HTL).await;
         assert_single_no_holder(&format!("{downstream:?}"), &replies);
         assert!(
             first.expect("answered") < Duration::from_secs(1),
@@ -9629,7 +9674,12 @@ mod relay_probe_failure_tests {
     /// back to the originator instead of every hop timing out together.
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn relay_answers_before_its_upstream_gives_up_when_downstream_is_silent() {
-        let (replies, first) = relay_with(Downstream::NeverAnswers, RELAY_HTL).await;
+        let (replies, first, forwarded_htl) = relay_with(Downstream::NeverAnswers, RELAY_HTL).await;
+        assert_eq!(
+            forwarded_htl,
+            RELAY_HTL - 1,
+            "the relay forwards a decremented HTL"
+        );
         assert_single_no_holder("NeverAnswers", &replies);
         let first = first.expect("answered");
         let max_htl = crate::ring::Ring::DEFAULT_MAX_HOPS_TO_LIVE;
@@ -9650,9 +9700,16 @@ mod relay_probe_failure_tests {
     /// relay still answers before an upstream with the same cap gives up.
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn oversized_wire_htl_still_answers_before_upstream() {
-        let (replies, first) = relay_with(Downstream::NeverAnswers, usize::MAX).await;
+        let (replies, first, forwarded_htl) =
+            relay_with(Downstream::NeverAnswers, usize::MAX).await;
         assert_single_no_holder("oversized htl", &replies);
         let max_htl = crate::ring::Ring::DEFAULT_MAX_HOPS_TO_LIVE;
+        assert_eq!(
+            forwarded_htl,
+            max_htl - 1,
+            "an oversized HTL must be clamped before it is forwarded, so the next \
+             hop's wait is shorter again"
+        );
         let first = first.expect("answered");
         assert!(
             first < probe_round_trip_timeout(usize::MAX, max_htl),
@@ -9763,6 +9820,17 @@ mod relay_probe_failure_tests {
             "the originator must give up after the probe budget {budget:?}, \
              not the payload-scaled {payload_timeout:?}; gave up after {elapsed:?}"
         );
+    }
+
+    /// A reverse delta larger than the streaming threshold is dropped, so the
+    /// `ProbeResponse` stays small enough to cross each hop within the probe's
+    /// per-hop slack.
+    #[test]
+    fn reverse_delta_above_streaming_threshold_is_dropped() {
+        let delta = |len: usize| Some(StateDelta::from(vec![3u8; len]));
+        assert_eq!(cap_reverse_delta(delta(64), 64).map(|d| d.size()), Some(64));
+        assert!(cap_reverse_delta(delta(65), 64).is_none());
+        assert!(cap_reverse_delta(None, 64).is_none());
     }
 
     /// The probe wait does not depend on the payload, shrinks by exactly one
