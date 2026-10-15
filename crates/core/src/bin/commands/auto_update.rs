@@ -2123,13 +2123,27 @@ pub(crate) fn decide_newer_release_from(
     }
 }
 
-/// [`decide_newer_release_from`] against this node's state.
-pub fn decide_newer_release(version: &str, urgent: bool) -> NewerRelease {
+/// [`decide_newer_release_from`] against the state in `dir`.
+pub(crate) fn decide_newer_release_at(
+    dir: &std::path::Path,
+    version: &str,
+    urgent: bool,
+    now: SystemTime,
+) -> NewerRelease {
     decide_newer_release_from(
-        super::rollback::is_version_pinned_bad(version)
-            || super::rollback::is_version_install_gated(version),
-        super::rollback::update_cooldown_remaining(version, urgent),
+        super::rollback::is_version_pinned_bad_at(dir, version)
+            || super::rollback::is_version_install_gated_at(dir, version),
+        super::rollback::update_cooldown_remaining_at(dir, version, now, urgent),
     )
+}
+
+/// [`decide_newer_release_at`] against this node's state directory. With no
+/// state directory nothing is blocked or cooling down.
+pub fn decide_newer_release(version: &str, urgent: bool) -> NewerRelease {
+    match state_dir() {
+        Some(dir) => decide_newer_release_at(&dir, version, urgent, SystemTime::now()),
+        None => NewerRelease::Trigger,
+    }
 }
 
 #[cfg(test)]
@@ -2896,6 +2910,33 @@ mod tests {
         assert_eq!(
             repoll_after_hold(now + hour, now + hour * 6, 0.5),
             now + hour
+        );
+    }
+
+    #[test]
+    fn newer_release_decision_reads_the_node_state() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let now = SystemTime::now();
+        assert_eq!(
+            decide_newer_release_at(dir, "0.2.141", false, now),
+            NewerRelease::Trigger
+        );
+        super::super::rollback::record_update_cooldown_at(dir, "0.2.141", "x", now, 0.5);
+        assert!(matches!(
+            decide_newer_release_at(dir, "0.2.141", false, now),
+            NewerRelease::CoolingDown(_)
+        ));
+        assert_eq!(
+            decide_newer_release_at(dir, "0.2.142", false, now),
+            NewerRelease::Trigger
+        );
+        for _ in 0..super::super::rollback::INSTALL_FAILURE_GATE_THRESHOLD {
+            super::super::rollback::record_install_failure_at(dir, "0.2.141");
+        }
+        assert_eq!(
+            decide_newer_release_at(dir, "0.2.141", false, now),
+            NewerRelease::Blocked
         );
     }
 
