@@ -26,8 +26,8 @@ The knowledge was not even new -- ``macos-dmg-swap-e2e.yml`` carries a comment
 saying precisely this above its own filter-free ``on:`` block. A comment in one
 file protected nothing in the other two. Hence this linter.
 
-It makes two checks, because a path filter is only one of the ways a required
-context stops reporting:
+It makes three checks, because a path filter is only one of the ways a required
+context stops reporting or stops being informative:
 
 1. **No path filter on a gating trigger.** A workflow is in scope only if it
    defines a job whose reported context is in ``REQUIRED_CONTEXTS``. Other
@@ -46,11 +46,20 @@ context stops reporting:
    cannot read -- all of which would otherwise silently narrow its scope to
    nothing.
 
+3. **No job ``needs:`` a required-context job** (#5621), except the observers in
+   ``NEEDS_ALLOWLIST``. A job whose ``needs:`` ancestor fails is reported
+   SKIPPED, which renders grey and reads as "not applicable". ``Fmt`` used to
+   gate six heavy jobs this way, so one misplaced line wrap left a release gate
+   with no test signal that looked like a single red check. A required context
+   already blocks merge on its own; a ``needs:`` edge on it adds nothing but
+   that ambiguity.
+
 Parser scope, stated because check 1's message reads like total coverage and is
 not: block- and flow-style filters are both detected, at the 2-space trigger /
 4-space key indentation every workflow in this repo uses. A workflow written
-with 4-space YAML indentation, a flow-style ``on:`` mapping, or a job ``name:``
-carrying a trailing comment is not parsed. Check 2 is the backstop for exactly
+with 4-space YAML indentation or a flow-style ``on:`` mapping is not parsed.
+Check 3 additionally fails closed on a job key it cannot read (a quoted id, a
+flow-mapping job), because a job it cannot see is a job it cannot check. Check 2 is the backstop for exactly
 that: a required-context workflow this parser cannot read drops out of the
 coverage set and fails.
 
@@ -99,6 +108,20 @@ REQUIRED_CONTEXTS = frozenset(
     }
 )
 
+# Jobs allowed to `needs:` a required-context job. Both are failure OBSERVERS:
+# they run only when a dependency fails (`if: failure()`), so the edge is what
+# makes them fire at all, and neither produces test signal that could be hidden.
+NEEDS_ALLOWLIST = frozenset({"claude-ci-analysis", "notify_dev_room_main_failure"})
+
+# `    needs:` at four-space indent inside a job. Its VALUE is everything up to the
+# next job key: the rest of that line, plus any following blank, comment or
+# more-indented line, plus a `- item` sequence written at the key's own indent.
+# That covers inline, flow (single- or multi-line), quoted, commented and block
+# forms without trying to parse YAML structure -- the failure mode of a stricter
+# regex is to go quiet on a valid form, and this check must not go quiet.
+NEEDS_RE = re.compile(r"^    ['\"]?needs['\"]?\s*:(?P<value>.*)$")
+IDENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_-]*")
+
 # Triggers whose runs gate a pull request. `push` is excluded on purpose (see
 # the module docstring).
 GATING_TRIGGERS = ("pull_request", "pull_request_target")
@@ -111,7 +134,7 @@ JOBS_RE = re.compile(r"^jobs:\s*(?:#.*)?$")
 # name, when set, is `    name: ...` at exactly four. The context GitHub reports
 # is the `name:` if present, otherwise the job id.
 JOB_ID_RE = re.compile(r"^  (?P<id>[A-Za-z_][A-Za-z0-9_-]*):\s*(?:#.*)?$")
-JOB_NAME_RE = re.compile(r"^    name:\s*(?P<name>.+?)\s*$")
+JOB_NAME_RE = re.compile(r"^    name:\s*(?P<name>[^#]+?)\s*(?:#.*)?$")
 
 # `  pull_request:` / `  pull_request_target:` at exactly two-space indent is a
 # trigger under `on:`. Deeper indents are something else.
@@ -141,7 +164,11 @@ def _jobs_block(lines: list[str]) -> tuple[int, int]:
         return len(lines), len(lines)
     end = len(lines)
     for i in range(jobs_at + 1, len(lines)):
-        if lines[i] and not lines[i][0].isspace():
+        if (
+            lines[i]
+            and not lines[i][0].isspace()
+            and not lines[i].startswith("#")
+        ):
             end = i
             break
     return jobs_at + 1, end
@@ -212,6 +239,105 @@ def check_source(text: str, name: str) -> list[str]:
     return errors
 
 
+def _bracket_depth(text: str) -> int:
+    """Net count of opened-minus-closed flow brackets, ignoring comments."""
+    code = text.split("#", 1)[0]
+    return code.count("[") + code.count("{") - code.count("]") - code.count("}")
+
+
+def check_needs(text: str, name: str) -> list[str]:
+    """Errors for jobs that `needs:` a required-context job (see check 3)."""
+    lines = text.splitlines()
+    start, end = _jobs_block(lines)
+
+    # Pass 1: which job ids report a required context.
+    required_ids: set[str] = set()
+    current_id: str | None = None
+    for line in lines[start:end]:
+        job = JOB_ID_RE.match(line)
+        if job:
+            current_id = job.group("id")
+            if current_id in REQUIRED_CONTEXTS:
+                required_ids.add(current_id)
+            continue
+        named = JOB_NAME_RE.match(line)
+        if named and current_id is not None:
+            if named.group("name").strip("'\"") in REQUIRED_CONTEXTS:
+                required_ids.add(current_id)
+
+    # Pass 2: every `needs:` entry, with the job it belongs to.
+    errors = []
+    current_id = None
+    i = start
+    while i < end:
+        line = lines[i]
+        job = JOB_ID_RE.match(line)
+        if job:
+            current_id = job.group("id")
+            i += 1
+            continue
+        if re.match(r"^  \S", line) and not line.lstrip().startswith("#"):
+            # A job key we cannot read (quoted id, flow-mapping job, ...).
+            # Staying silent would also leave `current_id` pointing at the
+            # PREVIOUS job, which could be an allowlisted observer.
+            current_id = None
+            errors.append(
+                f"{name}:{i + 1}: cannot parse this job key, so its `needs:` "
+                f"cannot be checked against required status contexts. Write "
+                f"it as a plain `  <id>:` line."
+            )
+            i += 1
+            continue
+        needs = NEEDS_RE.match(line)
+        if not needs:
+            i += 1
+            continue
+
+        needs_at = i
+        span = [needs.group("value")]
+        # Unclosed `[` / `{` means a multi-line flow collection, whose
+        # continuation lines may sit at ANY indent, including the key's own.
+        depth = _bracket_depth(needs.group("value"))
+        i += 1
+        while i < end:
+            nxt = lines[i]
+            stripped = nxt.strip()
+            indent = len(nxt) - len(nxt.lstrip())
+            if (
+                depth > 0
+                or not stripped
+                or stripped.startswith("#")
+                or indent > 4
+                or (indent == 4 and stripped.startswith("-"))
+            ):
+                depth += _bracket_depth(nxt)
+                span.append(nxt)
+                i += 1
+            else:
+                break
+        if current_id is None or current_id in NEEDS_ALLOWLIST:
+            continue
+        needed = []
+        for chunk in span:
+            needed.extend(IDENT_RE.findall(chunk.split("#", 1)[0]))
+        for dep in dict.fromkeys(needed):
+            if dep in required_ids:
+                errors.append(
+                    f"{name}:{needs_at + 1}: job `{current_id}` has "
+                    f"`needs: {dep}`, and `{dep}` reports a required status "
+                    f"context.\n"
+                    f"    If `{dep}` fails, `{current_id}` is reported SKIPPED: "
+                    f"grey, which reads as 'not applicable' rather than 'never "
+                    f"got to run', so a PR can look healthier than it is "
+                    f"(#5621: Fmt gated the whole test suite this way).\n"
+                    f"    A required context already blocks merge on its own, "
+                    f"so the edge adds no safety. Remove it, or if "
+                    f"`{current_id}` is a failure observer, add it to "
+                    f"NEEDS_ALLOWLIST."
+                )
+    return errors
+
+
 def check_dir(workflow_dir: Path, require_coverage: bool = True) -> list[str]:
     errors = []
     covered: set[str] = set()
@@ -223,6 +349,7 @@ def check_dir(workflow_dir: Path, require_coverage: bool = True) -> list[str]:
         text = path.read_text(encoding="utf-8")
         covered |= reported_contexts(text)
         errors.extend(check_source(text, str(path)))
+        errors.extend(check_needs(text, str(path)))
 
     if require_coverage:
         missing = sorted(REQUIRED_CONTEXTS - covered)
@@ -450,6 +577,55 @@ _CASES = [
 ]
 
 
+def _needs_fixture(needs_lines: str, job: str = "heavy") -> str:
+    return (
+        "name: CI\non:\n  pull_request:\n\njobs:\n"
+        "  fmt_check:\n    name: Fmt\n    runs-on: ubuntu-latest\n"
+        f"  {job}:\n    name: Heavy\n{needs_lines}    runs-on: ubuntu-latest\n"
+    )
+
+
+# (description, source, expected error count, expected first error line)
+_NEEDS_CASES = [
+    ("no needs at all", _needs_fixture(""), 0, None),
+    ("inline `needs: fmt_check` (the #5621 shape)", _needs_fixture("    needs: fmt_check\n"), 1, 11),
+    ("quoted inline value", _needs_fixture("    needs: 'fmt_check'\n"), 1, 11),
+    ("flow-list needs including a required job", _needs_fixture("    needs: [other, fmt_check]  # c\n"), 1, 11),
+    ("multi-line flow list", _needs_fixture("    needs: [\n      other,\n      fmt_check\n    ]\n"), 1, 11),
+    ("block list", _needs_fixture("    needs:\n      - other\n      - fmt_check\n"), 1, 11),
+    ("block list with comment lines between items", _needs_fixture("    needs:\n      # gate\n      - other\n\n      # more\n      - fmt_check\n"), 1, 11),
+    ("block list with quoted items", _needs_fixture("    needs:\n      - \"fmt_check\"\n"), 1, 11),
+    ("block list at the key's own indent", _needs_fixture("    needs:\n    - fmt_check\n"), 1, 11),
+    ("two required deps in one list", _needs_fixture("    needs: [fmt_check, clippy_check]\n").replace("  heavy:", "  clippy_check:\n    name: Clippy\n    runs-on: ubuntu-latest\n  heavy:"), 2, 14),
+    ("needs on a non-required job", _needs_fixture("    needs: other\n"), 0, None),
+    ("quoted `\"needs\"` key", _needs_fixture("    \"needs\": fmt_check\n"), 1, 11),
+    ("`needs :` with a space before the colon", _needs_fixture("    needs : fmt_check\n"), 1, 11),
+    ("a commented-out needs is not an edge", _needs_fixture("    # needs: fmt_check\n"), 0, None),
+    ("needs value that merely follows a comment", _needs_fixture("    needs: other  # fmt_check\n"), 0, None),
+    ("required job identified by its id, not a name", "name: CI\non:\n  pull_request:\n\njobs:\n  Fmt:\n    runs-on: ubuntu-latest\n  heavy:\n    needs: Fmt\n    runs-on: ubuntu-latest\n", 1, 9),
+    ("required job defined AFTER its dependent", "name: CI\non:\n  pull_request:\n\njobs:\n  heavy:\n    needs: fmt_check\n    runs-on: ubuntu-latest\n  fmt_check:\n    name: Fmt\n    runs-on: ubuntu-latest\n", 1, 7),
+    ("allowlisted claude-ci-analysis may need a required job", _needs_fixture("    needs: fmt_check\n", job="claude-ci-analysis"), 0, None),
+    ("allowlisted notify_dev_room_main_failure may need a required job", _needs_fixture("    needs: fmt_check\n", job="notify_dev_room_main_failure"), 0, None),
+    (
+        "the allowlist is per-job: an offender after an observer is still flagged",
+        _needs_fixture("    needs: fmt_check\n", job="claude-ci-analysis")
+        + "  heavy:\n    needs: fmt_check\n    runs-on: ubuntu-latest\n",
+        1,
+        14,
+    ),
+    ("multi-line flow list with items at the key's own indent", _needs_fixture("    needs: [\n    other,\n    fmt_check\n    ]\n"), 1, 11),
+    ("multi-line flow list opened with an item", _needs_fixture("    needs: [other,\n    fmt_check]\n"), 1, 11),
+    ("`name:` with a trailing comment still counts as required", "name: CI\non:\n  pull_request:\n\njobs:\n  fmt_check:\n    name: Fmt  # required\n  heavy:\n    needs: fmt_check\n", 1, 9),
+    ("unreadable (quoted) job key fails closed", "name: CI\non:\n  pull_request:\n\njobs:\n  fmt_check:\n    name: Fmt\n  \"heavy\":\n    needs: fmt_check\n", 1, 8),
+    (
+        "a column-0 comment inside jobs: does not hide later jobs",
+        "name: CI\non:\n  pull_request:\n\njobs:\n  fmt_check:\n    name: Fmt\n    runs-on: ubuntu-latest\n# stray\n  heavy:\n    needs: fmt_check\n    runs-on: ubuntu-latest\n",
+        1,
+        11,
+    ),
+]
+
+
 def _coverage_fixture(rename: str | None = None) -> dict[str, str]:
     """One filter-free workflow per required context, optionally renaming one."""
     files = {}
@@ -494,6 +670,19 @@ def self_test() -> int:
             )
             failures += 1
 
+    for desc, source, expected, expected_line in _NEEDS_CASES:
+        errors = check_needs(source, "<fixture>")
+        line = _first_error_line(errors)
+        if len(errors) == expected and line == expected_line:
+            print(f"ok   - needs: {desc}")
+        else:
+            print(
+                f"FAIL - needs: {desc}: expected {expected} error(s) at line "
+                f"{expected_line}, got {len(errors)} at line {line}",
+                file=sys.stderr,
+            )
+            failures += 1
+
     for desc, files, expected in _COVERAGE_CASES:
         with tempfile.TemporaryDirectory() as tmp:
             for filename, source in files.items():
@@ -509,7 +698,7 @@ def self_test() -> int:
             )
             failures += 1
 
-    total = len(_CASES) + len(_COVERAGE_CASES)
+    total = len(_CASES) + len(_NEEDS_CASES) + len(_COVERAGE_CASES)
     if failures:
         print(f"\n{failures} self-test failure(s)", file=sys.stderr)
         return 1
@@ -533,8 +722,8 @@ def main(argv: list[str]) -> int:
     errors = check_dir(workflow_dir, require_coverage=require_coverage)
     if errors:
         print(
-            "ERROR: required-check path-filter check failed "
-            "(see #5451 for what this prevents)"
+            "ERROR: required-check workflow check failed "
+            "(see #5451 and #5621 for what this prevents)"
         )
         for err in errors:
             print(f"  - {err}")
