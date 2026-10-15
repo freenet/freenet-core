@@ -490,6 +490,47 @@ pub(crate) struct SubscriptionLease {
     pub expires_at: Instant,
     /// Most recent state update observed (for dashboard display).
     pub last_updated: Option<Instant>,
+    /// The lease is PROVISIONAL: it was answered through the bootstrap-gateway
+    /// fallback of an empty-ring node, and a gateway that does not hold us as
+    /// a ring connection cannot register us as its downstream subscriber, so
+    /// no UPDATE reaches us through it (#2524). `contracts_needing_renewal`
+    /// renews a provisional lease early, through the ring (the renewal loop
+    /// only runs with a ring connection), instead of waiting for it to near
+    /// expiry.
+    ///
+    /// The mark persists until a genuine repair: a `Subscribed` from an
+    /// upstream reached over the ring, or a root-satisfied renewal (a root has
+    /// no upstream). It is deliberately NOT aged out: other paths keep the
+    /// lease alive (`ring.subscribe` from host-formation, on every downstream
+    /// renewal), so an aged-out mark would leave a lease that never gets an
+    /// UPDATE and never re-subscribes upstream. Its cost is bounded by cadence
+    /// instead: see `provisional_attempted_at`.
+    pub provisional: bool,
+    /// When the renewal loop last considered this provisional lease. A
+    /// provisional lease is due early at most once per
+    /// [`PROVISIONAL_RETRY_INTERVAL`], so an outcome that does not repair it
+    /// (a failure, a reconcile-gate suppression, a local completion) cannot
+    /// re-arm it on every tick. `None` = not yet considered: due at once.
+    pub provisional_attempted_at: Option<Instant>,
+}
+
+/// How often the renewal loop retries an unrepaired provisional lease (see
+/// [`SubscriptionLease::provisional`]). The first attempt is immediate; after
+/// that the lease is due at most every 120 s, where an ordinary lease is due
+/// about every 6 minutes (near expiry of its 8-minute lease), so an unrepaired
+/// provisional lease costs up to ~3x an ordinary one until repaired. Set to
+/// [`SUBSCRIPTION_RENEWAL_INTERVAL`], the nominal client renewal cadence: a
+/// lease that gets no UPDATEs should retry well inside the ~6 minutes, and the
+/// extra renewals are further bounded by the loop's per-tick cap and the
+/// half-batch provisional cap.
+pub(crate) const PROVISIONAL_RETRY_INTERVAL: Duration = SUBSCRIPTION_RENEWAL_INTERVAL;
+
+/// Whether a provisional lease is due for its early renewal at `now`.
+fn provisional_renewal_due(lease: &SubscriptionLease, now: Instant) -> bool {
+    lease.provisional
+        && lease
+            .provisional_attempted_at
+            .is_none_or(|at| now.saturating_duration_since(at) >= PROVISIONAL_RETRY_INTERVAL)
 }
 
 /// Public dashboard snapshot of one subscribed contract.
@@ -1432,6 +1473,8 @@ impl HostingManager {
                     subscribed_since: now,
                     expires_at,
                     last_updated: None,
+                    provisional: false,
+                    provisional_attempted_at: None,
                 });
                 true
             }
@@ -1446,6 +1489,49 @@ impl HostingManager {
         );
 
         SubscribeResult { is_new, expires_at }
+    }
+
+    /// Record whether the subscription to `contract` was last answered through
+    /// the bootstrap-gateway fallback (see [`SubscriptionLease::provisional`]).
+    /// Marking an already-provisional lease keeps its retry cadence, so a
+    /// repeated bootstrap answer cannot make it due again early; clearing
+    /// resets both. No-op without a lease.
+    pub fn set_subscription_provisional(&self, contract: &ContractKey, provisional: bool) {
+        if let Some(mut entry) = self.active_subscriptions.get_mut(contract) {
+            if !provisional {
+                entry.provisional_attempted_at = None;
+            }
+            entry.provisional = provisional;
+        }
+    }
+
+    /// Whether the subscription to `contract` is provisional (see
+    /// [`SubscriptionLease::provisional`]).
+    pub fn is_subscription_provisional(&self, contract: &ContractKey) -> bool {
+        self.active_subscriptions
+            .get(contract)
+            .is_some_and(|lease| lease.provisional)
+    }
+
+    /// When the renewal loop last considered the provisional lease for
+    /// `contract` (test observability for the retry cadence).
+    #[cfg(test)]
+    pub(crate) fn provisional_attempted_at(&self, contract: &ContractKey) -> Option<Instant> {
+        self.active_subscriptions
+            .get(contract)
+            .and_then(|lease| lease.provisional_attempted_at)
+    }
+
+    /// The renewal loop is considering the provisional lease for `contract`
+    /// now: it is not due early again before [`PROVISIONAL_RETRY_INTERVAL`].
+    /// No-op for a lease that is not provisional.
+    pub fn record_provisional_renewal_attempt(&self, contract: &ContractKey) {
+        let now = self.time_source.now();
+        if let Some(mut entry) = self.active_subscriptions.get_mut(contract)
+            && entry.provisional
+        {
+            entry.provisional_attempted_at = Some(now);
+        }
     }
 
     /// Renew an existing subscription.
@@ -3283,7 +3369,9 @@ impl HostingManager {
     /// Get contracts that need subscription renewal.
     ///
     /// Returns contracts where:
-    /// - We have an active subscription that will expire soon, OR
+    /// - We have an active subscription that will expire soon, or is
+    ///   provisional and due for its early retry (see
+    ///   [`SubscriptionLease::provisional`]), OR
     /// - We have client subscriptions but no active network subscription
     ///
     /// Hosted contracts without active interest (no client subscriptions,
@@ -3317,19 +3405,33 @@ impl HostingManager {
         //    set the budget may not touch.
         //
         // Collect and sort for deterministic iteration order
+        //
+        //    A PROVISIONAL lease (answered through the bootstrap gateway, which
+        //    could not register us, #2524) is due early, under the same
+        //    `contract_in_use` gate: at once, then at most once per
+        //    PROVISIONAL_RETRY_INTERVAL until repaired. The renewal loop runs
+        //    only with a ring connection, so this re-subscribes through the ring
+        //    as soon as the node has one, at the loop's own rate cap.
         let mut active_subs: Vec<_> = self
             .active_subscriptions
             .iter()
-            .map(|entry| (*entry.key(), entry.value().expires_at))
+            .map(|entry| {
+                (
+                    *entry.key(),
+                    entry.value().expires_at,
+                    provisional_renewal_due(entry.value(), now),
+                )
+            })
             .collect();
-        active_subs.sort_by(|(a, _), (b, _)| a.id().as_bytes().cmp(b.id().as_bytes()));
+        active_subs.sort_by(|(a, _, _), (b, _, _)| a.id().as_bytes().cmp(b.id().as_bytes()));
 
-        for (key, expires_at) in active_subs {
+        for (key, expires_at, provisional) in active_subs {
             // `contract_in_use` reads only the client-subscription and
             // downstream-subscriber maps (never `hosting_cache`), and `active_subs`
             // is already materialized above, so no active_subscriptions shard guard
             // is held across this call.
-            if expires_at <= renewal_threshold && expires_at > now && self.contract_in_use(&key) {
+            let due = provisional || expires_at <= renewal_threshold;
+            if due && expires_at > now && self.contract_in_use(&key) {
                 needs_renewal_set.insert(key);
             }
         }
@@ -5122,6 +5224,91 @@ mod tests {
         assert!(
             !needs_renewal.contains(&contract),
             "Hosted-only contract should NOT be in renewal list"
+        );
+    }
+
+    /// #2524: a provisional lease (answered by a non-ring upstream) is due for
+    /// renewal at once, but only under the same `contract_in_use` gate as a
+    /// near-expiry lease (the #3763 storm guard). A fresh non-provisional lease
+    /// is not due; clearing the flag makes the provisional one not due either.
+    #[test]
+    fn provisional_lease_is_due_at_once_while_in_use() {
+        let clock = crate::util::time_source::SharedMockTimeSource::new();
+        let manager = HostingManager::with_time_source(
+            DEFAULT_HOSTING_BUDGET_BYTES,
+            std::sync::Arc::new(clock.clone()),
+        );
+        let provisional = make_contract_key(1);
+        let ordinary = make_contract_key(2);
+        for key in [provisional, ordinary] {
+            manager.subscribe(key);
+        }
+        manager.set_subscription_provisional(&provisional, true);
+        assert!(manager.is_subscription_provisional(&provisional));
+        assert!(
+            manager.contracts_needing_renewal().is_empty(),
+            "not in use: a provisional lease must not self-renew"
+        );
+
+        for key in [provisional, ordinary] {
+            manager.add_client_subscription(key.id(), crate::client_events::ClientId::next());
+        }
+        assert_eq!(manager.contracts_needing_renewal(), vec![provisional]);
+
+        manager.set_subscription_provisional(&provisional, false);
+        assert!(manager.contracts_needing_renewal().is_empty());
+    }
+
+    /// #2524: an unrepaired provisional lease is due early at most once per
+    /// PROVISIONAL_RETRY_INTERVAL after the renewal loop considers it, and the
+    /// mark never ages out: a lease kept alive by other `subscribe()` calls
+    /// (host-formation refreshes it on every downstream renewal) keeps being
+    /// retried at the cadence for as long as it stays unrepaired. Re-marking
+    /// does not reset the cadence; a repair (clear) does.
+    #[test]
+    fn provisional_lease_retries_at_the_cadence_until_repaired() {
+        let clock = crate::util::time_source::SharedMockTimeSource::new();
+        let manager = HostingManager::with_time_source(
+            DEFAULT_HOSTING_BUDGET_BYTES,
+            std::sync::Arc::new(clock.clone()),
+        );
+        let key = make_contract_key(1);
+        let start = clock.current_time();
+        manager.subscribe(key);
+        manager.add_client_subscription(key.id(), crate::client_events::ClientId::next());
+        manager.set_subscription_provisional(&key, true);
+        assert_eq!(manager.contracts_needing_renewal(), vec![key]);
+
+        let step = Duration::from_secs(1);
+        for round in 0..6 {
+            manager.record_provisional_renewal_attempt(&key);
+            manager.set_subscription_provisional(&key, true);
+            clock.advance_time(PROVISIONAL_RETRY_INTERVAL - step);
+            manager.subscribe(key);
+            assert!(
+                manager.contracts_needing_renewal().is_empty(),
+                "round {round}: not due again before the retry interval"
+            );
+            clock.advance_time(step);
+            manager.subscribe(key);
+            assert_eq!(
+                manager.contracts_needing_renewal(),
+                vec![key],
+                "round {round}: due again at the retry interval, the mark never ages out"
+            );
+        }
+        assert!(
+            clock.current_time() - start > SUBSCRIPTION_LEASE_DURATION,
+            "the rounds outlast a lease duration (where a TTL used to drop the mark)"
+        );
+
+        manager.record_provisional_renewal_attempt(&key);
+        manager.set_subscription_provisional(&key, false);
+        manager.set_subscription_provisional(&key, true);
+        assert_eq!(
+            manager.contracts_needing_renewal(),
+            vec![key],
+            "a repair resets the cadence; a later bootstrap answer is due at once"
         );
     }
 

@@ -145,6 +145,12 @@ pub(super) enum InitialRequest {
         alternatives: Vec<PeerKeyLocation>,
         /// Initial HTL for the request (= `op_manager.ring.max_hops_to_live`).
         htl: usize,
+        /// `target` is a configured gateway chosen because the ring was empty
+        /// (the #4361 bootstrap fallback). Such a gateway does not hold us as
+        /// a ring connection, so it cannot register us as its downstream
+        /// subscriber; a `Subscribed` from it makes the lease provisional
+        /// (#2524).
+        via_bootstrap_gateway: bool,
     },
 }
 
@@ -221,6 +227,9 @@ pub(super) async fn prepare_initial_request(
     // Find a peer to forward the request to (needed even if we have contract locally)
     let mut visited = super::VisitedPeers::new(&id);
     visited.mark_visited(own_addr);
+
+    // Set when the target is the bootstrap gateway of an empty ring (below).
+    let mut via_bootstrap_gateway = false;
 
     // Directed subscribe: a caller (e.g. a received SubscribeHint) named the
     // first hop explicitly. Bypass ring selection and target `holder` directly,
@@ -326,6 +335,7 @@ pub(super) async fn prepare_initial_request(
                                 crate::router::dataset::UncapturedReason::BootstrapGateway,
                             );
                         }
+                        via_bootstrap_gateway = true;
                         gateway
                     } else if let Some(key) = super::has_contract(op_manager, instance_id).await? {
                         // No gateway either - fall back to local completion only if isolated.
@@ -379,6 +389,7 @@ pub(super) async fn prepare_initial_request(
         visited,
         alternatives: candidates,
         htl: op_manager.ring.max_hops_to_live,
+        via_bootstrap_gateway,
     })
 }
 
@@ -545,12 +556,28 @@ pub(super) async fn finalize_originator_subscribe(
     // greedy. (The value is only used as the directed/ordinary marker — the
     // actual fetch target is the responder, resolved below.)
     directed_holder: Option<PeerKeyLocation>,
+    // The request went to the bootstrap gateway of an empty ring (#4361):
+    // the gateway could not register us as its downstream subscriber, so the
+    // lease is provisional and is renewed through the ring once we have a ring
+    // connection (#2524).
+    via_bootstrap_gateway: bool,
 ) {
-    if let Some(pkl) = op_manager
+    let upstream = op_manager
         .ring
         .connection_manager
-        .get_peer_by_addr(upstream_addr)
-    {
+        .get_peer_by_addr(upstream_addr);
+    // Provisional unless the answer looks like a repair (#2524): it came over
+    // the ring AND the answering upstream is still a ring connection now. A
+    // hop sends `Subscribed` BEFORE its body fetch and registration of the
+    // requester (operations.md: forward upstream before contract-handling
+    // work), so a ring upstream that dropped in between may never have
+    // registered us. A still-connected ring responder is only our best local
+    // evidence of registration, not proof: it registers nobody if that
+    // post-ACK fetch fails or its subscriber cap rejects us. That residual is
+    // the same as on main (which never retries early); proving registration
+    // would need a wire-level registration ack (#2524).
+    let provisional = via_bootstrap_gateway || upstream.is_none();
+    if let Some(pkl) = upstream {
         let peer_key = crate::ring::interest::PeerKey::from(pkl.pub_key);
         // Refresh-if-present, register-if-absent. A bare `register_peer_interest`
         // inserts a fresh `PeerInterest` over an existing entry and WIPES its
@@ -583,6 +610,9 @@ pub(super) async fn finalize_originator_subscribe(
     }
 
     op_manager.ring.subscribe(key);
+    op_manager
+        .ring
+        .set_subscription_provisional(&key, provisional);
     op_manager.ring.complete_subscription_request(&key, true);
 
     // Fetch the contract body if we don't have it locally. The result
@@ -671,6 +701,28 @@ pub(super) async fn finalize_originator_subscribe(
     }
 }
 
+/// The `PeerKey` a requester would be registered under as our downstream
+/// subscriber, looked up by address among our RING connections.
+///
+/// `None` for a requester we reach only over a transient link: the transient
+/// table records no public key, and UPDATE fan-out resolves its targets among
+/// ring connections only, so such a requester can be neither registered nor
+/// sent an UPDATE. The hop still answers it `Subscribed`: that is the
+/// bootstrap path of an empty-ring node (#4361), and the requester repairs it
+/// by re-subscribing through the ring once it has a ring connection (#2524,
+/// `SubscriptionLease::provisional`).
+pub(super) fn resolve_downstream_peer(
+    op_manager: &OpManager,
+    requester_addr: std::net::SocketAddr,
+    source_addr: Option<std::net::SocketAddr>,
+) -> Option<crate::ring::interest::PeerKey> {
+    let connections = &op_manager.ring.connection_manager;
+    connections
+        .get_peer_by_addr(requester_addr)
+        .or_else(|| source_addr.and_then(|sa| connections.get_peer_by_addr(sa)))
+        .map(|pkl| crate::ring::interest::PeerKey::from(pkl.pub_key))
+}
+
 /// Register a downstream subscriber for a contract.
 ///
 /// Resolves the requester's `PeerKey` from the pre-resolved public key (preferred,
@@ -688,17 +740,7 @@ pub(crate) async fn register_downstream_subscriber(
 ) {
     let peer_key = requester_pub_key
         .map(|pk| crate::ring::interest::PeerKey::from(pk.clone()))
-        .or_else(|| {
-            op_manager
-                .ring
-                .connection_manager
-                .get_peer_by_addr(requester_addr)
-                .or_else(|| {
-                    source_addr
-                        .and_then(|sa| op_manager.ring.connection_manager.get_peer_by_addr(sa))
-                })
-                .map(|pkl| crate::ring::interest::PeerKey::from(pkl.pub_key))
-        });
+        .or_else(|| resolve_downstream_peer(op_manager, requester_addr, source_addr));
 
     if let Some(peer_key) = peer_key {
         let outcome = op_manager
@@ -755,6 +797,22 @@ pub(crate) async fn register_downstream_subscriber(
                 "Downstream subscriber limit reached — skipping peer interest registration"
             );
         }
+    } else if op_manager
+        .ring
+        .connection_manager
+        .is_transient(requester_addr)
+    {
+        // Expected: an empty-ring node subscribes through us over its
+        // transient bootstrap link (#4361). It marks that subscription
+        // provisional and re-subscribes through the ring once it has a ring
+        // connection (#2524), so this is not worth a WARN per request.
+        tracing::debug!(
+            tx = %tx,
+            contract = %key,
+            requester_addr = %requester_addr,
+            "Subscribe: transient requester not registered as downstream{}",
+            warn_suffix
+        );
     } else {
         tracing::warn!(
             tx = %tx,
@@ -865,6 +923,23 @@ pub(super) async fn finalize_host_subscribe(
     )
     .await;
     op_manager.ring.subscribe(key);
+    // A ring upstream answered this forwarded subscribe and is still
+    // connected: our best local evidence that it registered us as its
+    // downstream, so treat it as a repair of a provisional lease (#2524), on
+    // the same condition as the originator's in
+    // `finalize_originator_subscribe`. It is not proof: the upstream answered
+    // before its own body fetch and registration, and registers nobody if
+    // that fetch fails or its subscriber cap rejects us (the residual
+    // documented there). A local hit (`upstream_peer` None) repairs nothing.
+    if upstream_peer.as_ref().is_some_and(|peer| {
+        op_manager
+            .ring
+            .connection_manager
+            .get_peer_by_pub_key(&peer.0)
+            .is_some()
+    }) {
+        op_manager.ring.set_subscription_provisional(&key, false);
+    }
     // Register the RESPONDER as our UPSTREAM interest (review Fix D), mirroring
     // `finalize_originator_subscribe`'s step 1. Without this the relay is an
     // incomplete host: `send_unsubscribe_upstream` would find no upstream peer if

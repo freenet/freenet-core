@@ -408,6 +408,10 @@ pub(crate) async fn run_renewal_subscribe(
         if op_manager.ring.contract_in_use(&key) {
             op_manager.ring.subscribe(key);
         }
+        // A root has no upstream to be registered with, so a provisional
+        // mark (#2524) is moot here. Left set, the lease would be due on every
+        // tick and, sorted first, take ordinary renewals' batch slots.
+        op_manager.ring.set_subscription_provisional(&key, false);
         op_manager.ring.record_renewal_terminus_satisfied();
         // Simulation-test observability (no-op in production — see
         // `topology_registry::record_renewal_terminus_satisfied`).
@@ -712,34 +716,43 @@ async fn drive_client_subscribe_inner(
     )
     .await?;
 
-    let (target_peer, target_addr, mut visited, mut alternatives, htl) = match initial {
-        InitialRequest::LocallyComplete { key } => {
-            // Local completion reuses the existing helper. It publishes
-            // via `NodeEvent::LocalSubscribeComplete` → `result_router_tx`,
-            // so the driver MUST NOT deliver a second time — return
-            // `SkipAlreadyDelivered` to explicitly signal that to
-            // `deliver_outcome`.
-            complete_local_subscription(op_manager, client_tx, key, is_renewal).await?;
-            return Ok(DriverOutcome::SkipAlreadyDelivered);
-        }
-        InitialRequest::NoHostingPeers => {
-            return Ok(DriverOutcome::Publish(Err(ErrorKind::OperationError {
-                cause: format!("no remote peers available for subscription to {instance_id}")
-                    .into(),
+    let (target_peer, target_addr, mut visited, mut alternatives, htl, via_bootstrap_gateway) =
+        match initial {
+            InitialRequest::LocallyComplete { key } => {
+                // Local completion reuses the existing helper. It publishes
+                // via `NodeEvent::LocalSubscribeComplete` → `result_router_tx`,
+                // so the driver MUST NOT deliver a second time — return
+                // `SkipAlreadyDelivered` to explicitly signal that to
+                // `deliver_outcome`.
+                complete_local_subscription(op_manager, client_tx, key, is_renewal).await?;
+                return Ok(DriverOutcome::SkipAlreadyDelivered);
             }
-            .into())));
-        }
-        InitialRequest::PeerNotJoined => {
-            return Err(RingError::PeerNotJoined.into());
-        }
-        InitialRequest::NetworkRequest {
-            target,
-            target_addr,
-            visited,
-            alternatives,
-            htl,
-        } => (target, target_addr, visited, alternatives, htl),
-    };
+            InitialRequest::NoHostingPeers => {
+                return Ok(DriverOutcome::Publish(Err(ErrorKind::OperationError {
+                    cause: format!("no remote peers available for subscription to {instance_id}")
+                        .into(),
+                }
+                .into())));
+            }
+            InitialRequest::PeerNotJoined => {
+                return Err(RingError::PeerNotJoined.into());
+            }
+            InitialRequest::NetworkRequest {
+                target,
+                target_addr,
+                visited,
+                alternatives,
+                htl,
+                via_bootstrap_gateway,
+            } => (
+                target,
+                target_addr,
+                visited,
+                alternatives,
+                htl,
+                via_bootstrap_gateway,
+            ),
+        };
 
     tracing::debug!(
         tx = %client_tx,
@@ -763,6 +776,8 @@ async fn drive_client_subscribe_inner(
     let mut attempts_at_hop: usize = 1;
     let mut current_target: PeerKeyLocation = target_peer;
     let mut current_target_addr: std::net::SocketAddr = target_addr;
+    // Whether `current_target` is the empty-ring bootstrap gateway (#2524).
+    let mut target_via_bootstrap = via_bootstrap_gateway;
     let mut is_first_attempt = true;
 
     // Renewal task budget (issue #4350). `recover_orphaned_subscriptions`
@@ -962,6 +977,9 @@ async fn drive_client_subscribe_inner(
                 {
                     Some((next_target, next_addr)) => {
                         current_target = next_target;
+                        // Retries come from ring selection, never the
+                        // bootstrap fallback.
+                        target_via_bootstrap = false;
                         current_target_addr = next_addr;
                         // Phase 2b spin-loop guard (#3808): pace retries
                         // with a small jittered delay before re-sending.
@@ -1034,6 +1052,9 @@ async fn drive_client_subscribe_inner(
                 {
                     Some((next_target, next_addr)) => {
                         current_target = next_target;
+                        // Retries come from ring selection, never the
+                        // bootstrap fallback.
+                        target_via_bootstrap = false;
                         current_target_addr = next_addr;
                         // Phase 2b spin-loop guard (#3808): pace retries
                         // with a small jittered delay before re-sending.
@@ -1138,6 +1159,7 @@ async fn drive_client_subscribe_inner(
                     current_target_addr,
                     is_renewal,
                     directed_holder.clone(),
+                    target_via_bootstrap,
                 )
                 .await;
                 return Ok(DriverOutcome::Publish(Ok(HostResponse::ContractResponse(
@@ -1187,6 +1209,9 @@ async fn drive_client_subscribe_inner(
                 {
                     Some((next_target, next_addr)) => {
                         current_target = next_target;
+                        // Retries come from ring selection, never the
+                        // bootstrap fallback.
+                        target_via_bootstrap = false;
                         current_target_addr = next_addr;
                         // Phase 2b spin-loop guard (#3808): pace retries
                         // with a small jittered delay before re-sending.
@@ -5086,6 +5111,952 @@ mod route_attempt_driver_tests {
         assert!(
             !crate::contract::source_pin_util::strip_comments(body).contains("contract_exists()"),
             "a Subscribed carries no state, so it is never existence proof (#5657)"
+        );
+    }
+}
+
+/// #2524: a subscription answered over the bootstrap-gateway fallback is
+/// provisional (the gateway cannot register a requester that is not its ring
+/// connection, so it sends us no UPDATE) and is renewed through the ring as
+/// soon as the node has a ring connection. The hop side keeps answering such a
+/// requester `Subscribed`: refusing it breaks the bootstrap path (#4361).
+#[cfg(test)]
+mod bootstrap_subscription_tests {
+    use super::*;
+    use crate::message::MessageStats;
+    use crate::operations::route_attempt::driver_test_support::{
+        Answer, LocalStore, Step, op_manager_with_gateway, op_manager_with_peers_and_store,
+        serve_attempts,
+    };
+    use parking_lot::Mutex;
+
+    fn contract(instance_id: ContractInstanceId) -> freenet_stdlib::prelude::ContractKey {
+        freenet_stdlib::prelude::ContractKey::from_id_and_code(
+            instance_id,
+            freenet_stdlib::prelude::CodeHash::new([9u8; 32]),
+        )
+    }
+
+    fn store_contract(store: &LocalStore, key: freenet_stdlib::prelude::ContractKey) {
+        *store.lock() = Some((
+            key,
+            freenet_stdlib::prelude::WrappedState::new(vec![1, 2, 3]),
+        ));
+    }
+
+    fn subscribed(msg: &NetMessage, key: freenet_stdlib::prelude::ContractKey) -> NetMessage {
+        NetMessage::from(SubscribeMsg::Response {
+            id: *msg.id(),
+            instance_id: *key.id(),
+            result: SubscribeMsgResult::Subscribed { key },
+            hop_count: 1,
+        })
+    }
+
+    /// Answer every outbound SUBSCRIBE request `Subscribed` (the body then
+    /// lands locally, as host-formation's fetch would), recording each
+    /// request's target and each response's (target, result).
+    #[derive(Default)]
+    struct Seen {
+        request_targets: Vec<std::net::SocketAddr>,
+        responses: Vec<(std::net::SocketAddr, SubscribeMsgResult)>,
+    }
+
+    fn serve(
+        op_manager: &Arc<OpManager>,
+        rx: tokio::sync::mpsc::Receiver<crate::node::OpExecutionPayload>,
+        store: LocalStore,
+        key: freenet_stdlib::prelude::ContractKey,
+    ) -> Arc<Mutex<Seen>> {
+        let seen = Arc::new(Mutex::new(Seen::default()));
+        let record = seen.clone();
+        serve_attempts(
+            op_manager.clone(),
+            rx,
+            crate::message::TransactionType::Subscribe,
+            move |_, msg, target| {
+                let target = target.expect("subscribe traffic carries a target");
+                let answer = match msg {
+                    NetMessage::V1(NetMessageV1::Subscribe(SubscribeMsg::Request { .. })) => {
+                        record.lock().request_targets.push(target);
+                        store_contract(&store, key);
+                        Answer::Reply(subscribed(msg, key))
+                    }
+                    NetMessage::V1(NetMessageV1::Subscribe(SubscribeMsg::Response {
+                        result,
+                        ..
+                    })) => {
+                        record.lock().responses.push((target, result.clone()));
+                        Answer::DropWaiter
+                    }
+                    _ => Answer::DropWaiter,
+                };
+                Step { hop: None, answer }
+            },
+        );
+        seen
+    }
+
+    async fn subscribe(
+        op_manager: &Arc<OpManager>,
+        instance_id: ContractInstanceId,
+        is_renewal: bool,
+    ) {
+        let outcome = drive_client_subscribe_inner(
+            op_manager,
+            instance_id,
+            Transaction::new::<SubscribeMsg>(),
+            is_renewal,
+            None,
+        )
+        .await
+        .expect("driver returns an outcome");
+        assert!(
+            matches!(outcome, DriverOutcome::Publish(Ok(_))),
+            "subscribe must succeed: {outcome:?}"
+        );
+    }
+
+    fn add_ring_peer(op_manager: &OpManager, port: u16) -> std::net::SocketAddr {
+        let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+        assert!(op_manager.ring.connection_manager.add_connection(
+            crate::ring::Location::new(0.3),
+            addr,
+            crate::transport::TransportKeypair::new().public().clone(),
+            false,
+        ));
+        addr
+    }
+
+    /// (a) An empty-ring node subscribes through its configured gateway
+    /// (bootstrap fallback). Once the node has a ring connection, that
+    /// subscription is due for renewal straight away, and the renewal goes to
+    /// the ring peer and clears the provisional mark. Before #2524 it waited
+    /// until the lease neared expiry (~6 of its 8 minutes) with no UPDATEs.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn bootstrap_subscription_is_renewed_through_the_ring_once_connected() {
+        let gateway_addr: std::net::SocketAddr = "127.0.0.1:31000".parse().unwrap();
+        let gateway = PeerKeyLocation::new(
+            crate::transport::TransportKeypair::new().public().clone(),
+            gateway_addr,
+        );
+        let (op_manager, rx, _guards, store) =
+            op_manager_with_gateway("sub-bootstrap-provisional", gateway).await;
+        let instance_id = ContractInstanceId::new([62u8; 32]);
+        let key = contract(instance_id);
+        let seen = serve(&op_manager, rx, store, key);
+        op_manager
+            .ring
+            .add_client_subscription(&instance_id, crate::client_events::ClientId::next());
+
+        subscribe(&op_manager, instance_id, false).await;
+        assert_eq!(
+            seen.lock().request_targets,
+            vec![gateway_addr],
+            "an empty-ring node subscribes through the bootstrap gateway"
+        );
+        assert!(op_manager.ring.is_subscribed(&key));
+
+        let ring_peer = add_ring_peer(&op_manager, 31001);
+        assert!(
+            op_manager.ring.contracts_needing_renewal().contains(&key),
+            "a subscription answered by a non-ring gateway must be due for renewal \
+             as soon as the node has a ring connection, not when its lease nears \
+             expiry (#2524)"
+        );
+
+        subscribe(&op_manager, instance_id, true).await;
+        assert_eq!(
+            seen.lock().request_targets.last(),
+            Some(&ring_peer),
+            "the renewal goes through the ring"
+        );
+        assert!(
+            !op_manager.ring.contracts_needing_renewal().contains(&key),
+            "once a ring peer answered, the lease is ordinary again"
+        );
+    }
+
+    /// Measurement for (a) through the REAL renewal loop
+    /// (`Ring::recover_orphaned_subscriptions`, spawned with the ring and
+    /// parked until the first ring connection): virtual time from the node's
+    /// first ring connection until its bootstrap subscription is re-sent to a
+    /// ring peer. Before #2524 that waited for the lease's renewal window,
+    /// ~6 minutes after subscribing.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn bootstrap_subscription_reaches_the_ring_soon_after_first_connection() {
+        let gateway_addr: std::net::SocketAddr = "127.0.0.1:31000".parse().unwrap();
+        let gateway = PeerKeyLocation::new(
+            crate::transport::TransportKeypair::new().public().clone(),
+            gateway_addr,
+        );
+        let (op_manager, rx, _guards, store) =
+            op_manager_with_gateway("sub-bootstrap-renewal-loop", gateway).await;
+        let instance_id = ContractInstanceId::new([66u8; 32]);
+        let key = contract(instance_id);
+        let seen = serve(&op_manager, rx, store, key);
+        op_manager
+            .ring
+            .add_client_subscription(&instance_id, crate::client_events::ClientId::next());
+        subscribe(&op_manager, instance_id, false).await;
+        assert_eq!(seen.lock().request_targets, vec![gateway_addr]);
+
+        let connected_at = tokio::time::Instant::now();
+        let ring_peer = add_ring_peer(&op_manager, 31001);
+        // The 8-minute subscription lease.
+        let limit = std::time::Duration::from_secs(8 * 60);
+        while !seen.lock().request_targets.contains(&ring_peer) {
+            assert!(
+                connected_at.elapsed() < limit,
+                "the bootstrap subscription never reached a ring peer within the lease"
+            );
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        }
+        let delay = connected_at.elapsed();
+        eprintln!("first ring connection -> ring re-subscribe: {delay:?}");
+        // Loop start jitter (2-5 s) + spawn jitter (0-15 s) + the 1 s poll is
+        // at most 21 s; the bound leaves headroom over that maximum so the
+        // test does not hinge on the jitter draw, while staying an order of
+        // magnitude under the ~6-minute wait it guards against.
+        assert!(
+            delay <= std::time::Duration::from_secs(30),
+            "re-subscribe through the ring took {delay:?} after the first ring connection"
+        );
+    }
+
+    /// A provisional lease whose renewal is root-satisfied (this node is the
+    /// body-holding subscription root, so the renewal sends nothing) stops
+    /// being due: a root has no upstream to register with. Left provisional it
+    /// would be due on every tick and take ordinary renewals' batch slots.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn root_satisfied_renewal_clears_the_provisional_mark() {
+        let gateway_addr: std::net::SocketAddr = "127.0.0.1:31000".parse().unwrap();
+        let gateway = PeerKeyLocation::new(
+            crate::transport::TransportKeypair::new().public().clone(),
+            gateway_addr,
+        );
+        let (op_manager, rx, _guards, store) =
+            op_manager_with_gateway("sub-bootstrap-root-satisfied", gateway).await;
+        let instance_id = ContractInstanceId::new([67u8; 32]);
+        let key = contract(instance_id);
+        let seen = serve(&op_manager, rx, store, key);
+        op_manager
+            .ring
+            .add_client_subscription(&instance_id, crate::client_events::ClientId::next());
+        subscribe(&op_manager, instance_id, false).await;
+        assert!(op_manager.ring.is_subscription_provisional(&key));
+
+        // Become the root: host the body, and connect only to a peer farther
+        // from the contract than we are. A neighbour's ring location is
+        // derived from its address, so pick the address accordingly.
+        op_manager.ring.host_contract(
+            key,
+            3,
+            crate::ring::AccessType::Get,
+            crate::ring::HostingCause::Other,
+        );
+        let contract_location = crate::ring::Location::from(&key);
+        let own_distance = op_manager
+            .ring
+            .connection_manager
+            .own_location()
+            .location()
+            .unwrap()
+            .distance(contract_location);
+        let far_peer = (1..=250u8)
+            .map(|i| std::net::SocketAddr::from(([10, i, 0, 1], 31002)))
+            .find(|addr| {
+                crate::ring::Location::from_address(addr).distance(contract_location) > own_distance
+            })
+            .expect("an address farther from the contract than this node");
+        assert!(op_manager.ring.connection_manager.add_connection(
+            crate::ring::Location::from_address(&far_peer),
+            far_peer,
+            crate::transport::TransportKeypair::new().public().clone(),
+            false,
+        ));
+        assert!(op_manager.ring.is_subscription_root(&key));
+        assert!(op_manager.ring.contracts_needing_renewal().contains(&key));
+
+        let outcome = run_renewal_subscribe(
+            op_manager.clone(),
+            instance_id,
+            Transaction::new::<SubscribeMsg>(),
+        )
+        .await;
+        assert!(matches!(outcome, RenewalOutcome::Success), "{outcome:?}");
+        assert_eq!(
+            seen.lock().request_targets,
+            vec![gateway_addr],
+            "a root-satisfied renewal sends nothing"
+        );
+        assert!(!op_manager.ring.is_subscription_provisional(&key));
+        assert!(
+            !op_manager.ring.contracts_needing_renewal().contains(&key),
+            "a root-satisfied provisional lease must stop being due"
+        );
+    }
+
+    /// The bootstrap gateway attempt fails (send failure, timeout, or NotFound),
+    /// the node meanwhile gets a ring connection, and the retry through that
+    /// ring peer subscribes: the lease is NOT provisional, because the peer
+    /// that answered holds us as a ring connection. One case per retry arm of
+    /// the driver, each of which must reset the bootstrap bit.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn ring_retry_after_failed_gateway_attempt_is_not_provisional() {
+        for (label, case) in [
+            ("sub-gateway-wire-error-then-ring", 0u8),
+            ("sub-gateway-timeout-then-ring", 1),
+            ("sub-gateway-not-found-then-ring", 2),
+        ] {
+            let gateway_addr: std::net::SocketAddr = "127.0.0.1:31000".parse().unwrap();
+            let gateway = PeerKeyLocation::new(
+                crate::transport::TransportKeypair::new().public().clone(),
+                gateway_addr,
+            );
+            let (op_manager, rx, _guards, store) = op_manager_with_gateway(label, gateway).await;
+            let instance_id = ContractInstanceId::new([72u8; 32]);
+            let key = contract(instance_id);
+            let ring_peer: std::net::SocketAddr = "127.0.0.1:31001".parse().unwrap();
+            let targets = Arc::new(Mutex::new(Vec::new()));
+            let record = targets.clone();
+            let node = op_manager.clone();
+            serve_attempts(
+                op_manager.clone(),
+                rx,
+                crate::message::TransactionType::Subscribe,
+                move |_, msg, target| {
+                    let NetMessage::V1(NetMessageV1::Subscribe(SubscribeMsg::Request { .. })) = msg
+                    else {
+                        return Step {
+                            hop: None,
+                            answer: Answer::DropWaiter,
+                        };
+                    };
+                    let target = target.expect("requests carry a target");
+                    record.lock().push(target);
+                    let answer = if target == gateway_addr {
+                        // The node joins while the gateway attempt fails.
+                        add_ring_peer(&node, 31001);
+                        match case {
+                            0 => Answer::PeerDisconnectedFor(gateway_addr),
+                            1 => Answer::Never,
+                            _ => Answer::Reply(NetMessage::from(SubscribeMsg::Response {
+                                id: *msg.id(),
+                                instance_id: *key.id(),
+                                result: SubscribeMsgResult::NotFound,
+                                hop_count: 1,
+                            })),
+                        }
+                    } else {
+                        store_contract(&store, key);
+                        Answer::Reply(subscribed(msg, key))
+                    };
+                    Step { hop: None, answer }
+                },
+            );
+            subscribe(&op_manager, instance_id, false).await;
+            assert_eq!(
+                targets.lock().clone(),
+                vec![gateway_addr, ring_peer],
+                "{label}: gateway first, then the ring retry"
+            );
+            assert!(
+                !op_manager.ring.is_subscription_provisional(&key),
+                "{label}: a subscription answered by a ring peer must not be provisional"
+            );
+        }
+    }
+
+    /// Sample, once per virtual second for `total`, when the renewal loop last
+    /// considered `key`'s provisional lease; return each distinct evaluation
+    /// time, in order.
+    async fn observe_provisional_evaluations(
+        op_manager: &OpManager,
+        key: &freenet_stdlib::prelude::ContractKey,
+        total: std::time::Duration,
+    ) -> Vec<tokio::time::Instant> {
+        let mut seen = Vec::new();
+        let until = tokio::time::Instant::now() + total;
+        while tokio::time::Instant::now() < until {
+            if let Some(at) = op_manager.ring.provisional_attempted_at(key)
+                && seen.last() != Some(&at)
+            {
+                seen.push(at);
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        }
+        seen
+    }
+
+    /// An observation window that ends before a lease taken at its start nears
+    /// expiry (6 of its 8 minutes). From then on an unrefreshed lease is due on
+    /// every tick by the ordinary near-expiry rule, as on main, which the
+    /// provisional cadence does not change.
+    const BEFORE_NEAR_EXPIRY: std::time::Duration = std::time::Duration::from_secs(330);
+
+    /// The loop evaluated the lease at least `min` times, never twice within
+    /// the provisional retry interval.
+    fn assert_retried_at_the_cadence(
+        label: &str,
+        evaluations: &[tokio::time::Instant],
+        min: usize,
+    ) {
+        assert!(
+            evaluations.len() >= min,
+            "{label}: expected at least {min} evaluations, saw {}",
+            evaluations.len()
+        );
+        for pair in evaluations.windows(2) {
+            assert!(
+                pair[1] - pair[0] >= crate::ring::PROVISIONAL_RETRY_INTERVAL,
+                "{label}: evaluated again after {:?}, inside the retry interval",
+                pair[1] - pair[0]
+            );
+        }
+    }
+
+    /// A provisional lease whose renewal completes locally (no network round
+    /// trip: here the node has a ring connection but has lost its own address,
+    /// as a node mid-rejoin) KEEPS its mark, so the early renewal still runs
+    /// once the node can route again, and costs at most one renewal-loop
+    /// evaluation per retry interval meanwhile.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn locally_completed_renewal_keeps_the_mark_at_the_cadence() {
+        let gateway_addr: std::net::SocketAddr = "127.0.0.1:31000".parse().unwrap();
+        let gateway = PeerKeyLocation::new(
+            crate::transport::TransportKeypair::new().public().clone(),
+            gateway_addr,
+        );
+        let (op_manager, rx, _guards, store) =
+            op_manager_with_gateway("sub-bootstrap-local-complete", gateway).await;
+        let instance_id = ContractInstanceId::new([70u8; 32]);
+        let key = contract(instance_id);
+        let seen = serve(&op_manager, rx, store, key);
+        op_manager
+            .ring
+            .add_client_subscription(&instance_id, crate::client_events::ClientId::next());
+        subscribe(&op_manager, instance_id, false).await;
+        assert!(op_manager.ring.is_subscription_provisional(&key));
+
+        let ring_peer = add_ring_peer(&op_manager, 31001);
+        op_manager.ring.connection_manager.clear_own_addr_for_test();
+        let evaluations =
+            observe_provisional_evaluations(&op_manager, &key, BEFORE_NEAR_EXPIRY).await;
+        assert!(
+            !seen.lock().request_targets.contains(&ring_peer),
+            "the renewals completed locally, nothing reached the ring"
+        );
+        assert!(
+            op_manager.ring.is_subscription_provisional(&key),
+            "a locally completed renewal must keep the mark"
+        );
+        assert_retried_at_the_cadence("local completion", &evaluations, 3);
+    }
+
+    /// A provisional lease the renewal loop's reconcile gate suppresses (in use
+    /// only through a downstream subscriber that is not strictly farther from
+    /// the key, here one we cannot resolve) KEEPS its mark, so the early
+    /// renewal runs once the suppression lifts, and costs at most one
+    /// evaluation per retry interval meanwhile.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn gate_suppressed_provisional_lease_keeps_its_mark_at_the_cadence() {
+        let gateway_addr: std::net::SocketAddr = "127.0.0.1:31000".parse().unwrap();
+        let gateway = PeerKeyLocation::new(
+            crate::transport::TransportKeypair::new().public().clone(),
+            gateway_addr,
+        );
+        let (op_manager, rx, _guards, store) =
+            op_manager_with_gateway("sub-bootstrap-gate-suppressed", gateway).await;
+        let instance_id = ContractInstanceId::new([71u8; 32]);
+        let key = contract(instance_id);
+        let seen = serve(&op_manager, rx, store, key);
+        subscribe(&op_manager, instance_id, false).await;
+        assert!(op_manager.ring.is_subscription_provisional(&key));
+        // In use (so `contracts_needing_renewal` emits it) but not wanted by
+        // the strict reconcile gate: no local client, and the only downstream
+        // subscriber does not resolve to a strictly-farther connected peer.
+        let _ = op_manager.ring.add_downstream_subscriber(
+            &key,
+            crate::ring::interest::PeerKey::from(
+                crate::transport::TransportKeypair::new().public().clone(),
+            ),
+        );
+        assert!(op_manager.ring.contracts_needing_renewal().contains(&key));
+        assert!(!op_manager.reconcile_wants_renewal(&key));
+
+        let ring_peer = add_ring_peer(&op_manager, 31001);
+        let evaluations =
+            observe_provisional_evaluations(&op_manager, &key, BEFORE_NEAR_EXPIRY).await;
+        assert!(
+            !seen.lock().request_targets.contains(&ring_peer),
+            "a gate-suppressed renewal is not sent"
+        );
+        assert!(
+            op_manager.ring.is_subscription_provisional(&key),
+            "a gate-suppressed provisional lease must keep its mark"
+        );
+        assert_retried_at_the_cadence("gate suppression", &evaluations, 3);
+    }
+
+    /// Codex's scenario: an unrepaired provisional lease kept alive by other
+    /// `ring.subscribe` calls (host-formation does this on every downstream
+    /// renewal) keeps its mark well past a lease duration, so the renewal loop
+    /// keeps attempting the upstream re-subscribe through the ring at the
+    /// retry cadence. The first ring peer that answers `Subscribed` repairs it.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn kept_alive_provisional_lease_keeps_retrying_until_repaired() {
+        let gateway_addr: std::net::SocketAddr = "127.0.0.1:31000".parse().unwrap();
+        let gateway = PeerKeyLocation::new(
+            crate::transport::TransportKeypair::new().public().clone(),
+            gateway_addr,
+        );
+        let (op_manager, rx, _guards, store) =
+            op_manager_with_gateway("sub-bootstrap-kept-alive", gateway).await;
+        let instance_id = ContractInstanceId::new([73u8; 32]);
+        let key = contract(instance_id);
+        let ring_peer: std::net::SocketAddr = "127.0.0.1:31001".parse().unwrap();
+        let ring_answers = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let ring_requests = Arc::new(Mutex::new(Vec::new()));
+        let (answers, record) = (ring_answers.clone(), ring_requests.clone());
+        serve_attempts(
+            op_manager.clone(),
+            rx,
+            crate::message::TransactionType::Subscribe,
+            move |_, msg, target| {
+                let NetMessage::V1(NetMessageV1::Subscribe(SubscribeMsg::Request { .. })) = msg
+                else {
+                    return Step {
+                        hop: None,
+                        answer: Answer::DropWaiter,
+                    };
+                };
+                let ok =
+                    target != Some(ring_peer) || answers.load(std::sync::atomic::Ordering::SeqCst);
+                if target == Some(ring_peer) {
+                    record.lock().push(tokio::time::Instant::now());
+                }
+                let answer = if ok {
+                    store_contract(&store, key);
+                    Answer::Reply(subscribed(msg, key))
+                } else {
+                    Answer::Reply(NetMessage::from(SubscribeMsg::Response {
+                        id: *msg.id(),
+                        instance_id: *key.id(),
+                        result: SubscribeMsgResult::NotFound,
+                        hop_count: 1,
+                    }))
+                };
+                Step { hop: None, answer }
+            },
+        );
+        op_manager
+            .ring
+            .add_client_subscription(&instance_id, crate::client_events::ClientId::next());
+        subscribe(&op_manager, instance_id, false).await;
+        assert!(op_manager.ring.is_subscription_provisional(&key));
+        assert_eq!(add_ring_peer(&op_manager, 31001), ring_peer);
+
+        // Twelve minutes, well past one 8-minute lease, with host-formation
+        // refreshing the lease every minute and every ring attempt failing.
+        let started = tokio::time::Instant::now();
+        let mut evaluations = Vec::new();
+        for _ in 0..12 {
+            op_manager.ring.subscribe(key);
+            evaluations.extend(
+                observe_provisional_evaluations(
+                    &op_manager,
+                    &key,
+                    std::time::Duration::from_secs(60),
+                )
+                .await,
+            );
+            evaluations.dedup();
+        }
+        assert!(
+            op_manager.ring.is_subscription_provisional(&key),
+            "an unrepaired mark must not age out while the lease is kept alive"
+        );
+        assert_retried_at_the_cadence("kept alive", &evaluations, 3);
+        let lease = std::time::Duration::from_secs(8 * 60);
+        assert!(
+            ring_requests.lock().iter().any(|at| *at - started > lease),
+            "the upstream re-subscribe is still attempted after a lease duration: {:?}",
+            ring_requests.lock()
+        );
+
+        // The ring peer starts answering: the next attempt repairs the lease.
+        ring_answers.store(true, std::sync::atomic::Ordering::SeqCst);
+        for _ in 0..(10 * 60) {
+            if !op_manager.ring.is_subscription_provisional(&key) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        }
+        assert!(
+            !op_manager.ring.is_subscription_provisional(&key),
+            "a Subscribed from the ring peer repairs the lease"
+        );
+    }
+
+    /// A failed early renewal through the ring keeps the provisional mark and
+    /// puts the contract in the subscription backoff; the renewal loop then
+    /// attempts it again.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn failed_ring_renewal_keeps_the_mark_and_enters_backoff() {
+        let gateway_addr: std::net::SocketAddr = "127.0.0.1:31000".parse().unwrap();
+        let gateway = PeerKeyLocation::new(
+            crate::transport::TransportKeypair::new().public().clone(),
+            gateway_addr,
+        );
+        let (op_manager, rx, _guards, store) =
+            op_manager_with_gateway("sub-bootstrap-renewal-fails", gateway).await;
+        let instance_id = ContractInstanceId::new([68u8; 32]);
+        let key = contract(instance_id);
+        let ring_peer: std::net::SocketAddr = "127.0.0.1:31001".parse().unwrap();
+        // The gateway subscribes us; the ring peer answers every renewal NotFound.
+        let ring_requests = Arc::new(Mutex::new(Vec::new()));
+        let record = ring_requests.clone();
+        serve_attempts(
+            op_manager.clone(),
+            rx,
+            crate::message::TransactionType::Subscribe,
+            move |_, msg, target| {
+                let answer = match msg {
+                    NetMessage::V1(NetMessageV1::Subscribe(SubscribeMsg::Request { .. })) => {
+                        if target == Some(ring_peer) {
+                            record.lock().push(tokio::time::Instant::now());
+                            Answer::Reply(NetMessage::from(SubscribeMsg::Response {
+                                id: *msg.id(),
+                                instance_id: *key.id(),
+                                result: SubscribeMsgResult::NotFound,
+                                hop_count: 1,
+                            }))
+                        } else {
+                            store_contract(&store, key);
+                            Answer::Reply(subscribed(msg, key))
+                        }
+                    }
+                    _ => Answer::DropWaiter,
+                };
+                Step { hop: None, answer }
+            },
+        );
+        op_manager
+            .ring
+            .add_client_subscription(&instance_id, crate::client_events::ClientId::next());
+        subscribe(&op_manager, instance_id, false).await;
+        assert!(op_manager.ring.is_subscription_provisional(&key));
+
+        assert_eq!(add_ring_peer(&op_manager, 31001), ring_peer);
+        let attempts = |n: usize| {
+            let ring_requests = ring_requests.clone();
+            async move {
+                for _ in 0..(5 * 60) {
+                    if ring_requests.lock().len() >= n {
+                        return;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                }
+                panic!("fewer than {n} renewal attempts reached the ring peer");
+            }
+        };
+        attempts(1).await;
+        // Let the failed renewal task finish and record its outcome.
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        assert!(
+            op_manager.ring.is_subscription_provisional(&key),
+            "a failed renewal must keep the mark"
+        );
+        assert!(
+            !op_manager.ring.can_request_subscription(&key),
+            "a failed renewal puts the contract in the subscription backoff"
+        );
+        // `can_request_subscription` above is the backoff check. The gap to
+        // the next attempt is not asserted here: it is set by the provisional
+        // retry cadence (pinned by `assert_retried_at_the_cadence` elsewhere),
+        // not by the backoff.
+        attempts(2).await;
+        assert!(
+            op_manager.ring.is_subscription_provisional(&key),
+            "still provisional after the second failure"
+        );
+    }
+
+    /// A ring upstream that answers `Subscribed` and then drops before
+    /// finalization may never have registered us (a hop answers before it
+    /// registers the requester), so the lease IS provisional and is
+    /// re-subscribed through the ring early.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn ring_upstream_dropping_before_finalize_is_provisional() {
+        let (op_manager, rx, _peers, _guards, store) =
+            op_manager_with_peers_and_store("sub-ring-upstream-drops", 3).await;
+        let instance_id = ContractInstanceId::new([69u8; 32]);
+        let key = contract(instance_id);
+        let cm = op_manager.clone();
+        serve_attempts(
+            op_manager.clone(),
+            rx,
+            crate::message::TransactionType::Subscribe,
+            move |_, msg, target| {
+                let answer = match msg {
+                    NetMessage::V1(NetMessageV1::Subscribe(SubscribeMsg::Request { .. })) => {
+                        let target = target.expect("requests carry a target");
+                        // The upstream answers, then its connection drops.
+                        assert!(
+                            cm.ring
+                                .connection_manager
+                                .prune_alive_connection(target)
+                                .is_some()
+                        );
+                        store_contract(&store, key);
+                        Answer::Reply(subscribed(msg, key))
+                    }
+                    _ => Answer::DropWaiter,
+                };
+                Step { hop: None, answer }
+            },
+        );
+        op_manager
+            .ring
+            .add_client_subscription(&instance_id, crate::client_events::ClientId::next());
+        subscribe(&op_manager, instance_id, false).await;
+        assert!(op_manager.ring.is_subscribed(&key));
+        assert!(
+            op_manager.ring.is_subscription_provisional(&key),
+            "a ring upstream that dropped before finalize may not have registered us"
+        );
+    }
+
+    /// A provisional node that forwards a downstream's subscribe, answered by
+    /// a ring upstream (which registers it as its downstream), has its lease
+    /// repaired by that host-formation.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn forwarded_subscribe_answered_over_the_ring_repairs_the_lease() {
+        let gateway_addr: std::net::SocketAddr = "127.0.0.1:31000".parse().unwrap();
+        let gateway = PeerKeyLocation::new(
+            crate::transport::TransportKeypair::new().public().clone(),
+            gateway_addr,
+        );
+        let (op_manager, rx, _guards, store) =
+            op_manager_with_gateway("sub-bootstrap-forward-repairs", gateway).await;
+        let instance_id = ContractInstanceId::new([75u8; 32]);
+        let key = contract(instance_id);
+        let downstream: std::net::SocketAddr = "127.0.0.1:31001".parse().unwrap();
+        let upstream: std::net::SocketAddr = "127.0.0.1:31002".parse().unwrap();
+        let forwarded_to = Arc::new(Mutex::new(Vec::new()));
+        let record = forwarded_to.clone();
+        serve_attempts(
+            op_manager.clone(),
+            rx,
+            crate::message::TransactionType::Subscribe,
+            move |_, msg, target| {
+                let NetMessage::V1(NetMessageV1::Subscribe(SubscribeMsg::Request { .. })) = msg
+                else {
+                    return Step {
+                        hop: None,
+                        answer: Answer::DropWaiter,
+                    };
+                };
+                let target = target.expect("requests carry a target");
+                if target != gateway_addr {
+                    // Only a ring answer brings the body, so the hop below
+                    // forwards instead of answering from a local copy.
+                    record.lock().push(target);
+                    store_contract(&store, key);
+                }
+                Step {
+                    hop: None,
+                    answer: Answer::Reply(subscribed(msg, key)),
+                }
+            },
+        );
+        op_manager
+            .ring
+            .add_client_subscription(&instance_id, crate::client_events::ClientId::next());
+        subscribe(&op_manager, instance_id, false).await;
+        assert!(op_manager.ring.is_subscription_provisional(&key));
+
+        assert_eq!(add_ring_peer(&op_manager, 31001), downstream);
+        assert_eq!(add_ring_peer(&op_manager, 31002), upstream);
+        let _result = drive_relay_subscribe(
+            &op_manager,
+            Transaction::new::<SubscribeMsg>(),
+            instance_id,
+            3,
+            VisitedPeers::new(&Transaction::new::<SubscribeMsg>()),
+            false,
+            downstream,
+        )
+        .await;
+        assert_eq!(
+            forwarded_to.lock().clone(),
+            vec![upstream],
+            "the hop forwards the downstream's subscribe over the ring"
+        );
+        assert!(op_manager.ring.has_downstream_subscribers(&key));
+        assert!(
+            !op_manager.ring.is_subscription_provisional(&key),
+            "a ring upstream answering a forwarded subscribe repairs the lease"
+        );
+    }
+
+    /// An already-provisional lease whose ring renewal is answered by a peer
+    /// that then drops before finalization is not repaired: it keeps its mark.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn provisional_lease_keeps_its_mark_when_the_ring_responder_drops() {
+        let gateway_addr: std::net::SocketAddr = "127.0.0.1:31000".parse().unwrap();
+        let gateway = PeerKeyLocation::new(
+            crate::transport::TransportKeypair::new().public().clone(),
+            gateway_addr,
+        );
+        let (op_manager, rx, _guards, store) =
+            op_manager_with_gateway("sub-bootstrap-responder-drops", gateway).await;
+        let instance_id = ContractInstanceId::new([74u8; 32]);
+        let key = contract(instance_id);
+        let node = op_manager.clone();
+        let targets = Arc::new(Mutex::new(Vec::new()));
+        let record = targets.clone();
+        serve_attempts(
+            op_manager.clone(),
+            rx,
+            crate::message::TransactionType::Subscribe,
+            move |_, msg, target| {
+                let NetMessage::V1(NetMessageV1::Subscribe(SubscribeMsg::Request { .. })) = msg
+                else {
+                    return Step {
+                        hop: None,
+                        answer: Answer::DropWaiter,
+                    };
+                };
+                let target = target.expect("requests carry a target");
+                record.lock().push(target);
+                if target != gateway_addr {
+                    // The ring responder answers, then its connection drops.
+                    assert!(
+                        node.ring
+                            .connection_manager
+                            .prune_alive_connection(target)
+                            .is_some()
+                    );
+                }
+                store_contract(&store, key);
+                Step {
+                    hop: None,
+                    answer: Answer::Reply(subscribed(msg, key)),
+                }
+            },
+        );
+        op_manager
+            .ring
+            .add_client_subscription(&instance_id, crate::client_events::ClientId::next());
+        subscribe(&op_manager, instance_id, false).await;
+        assert!(op_manager.ring.is_subscription_provisional(&key));
+
+        let ring_peer = add_ring_peer(&op_manager, 31001);
+        subscribe(&op_manager, instance_id, true).await;
+        assert_eq!(targets.lock().last(), Some(&ring_peer));
+        assert!(
+            op_manager.ring.is_subscription_provisional(&key),
+            "a responder that dropped before finalize does not repair the lease"
+        );
+    }
+
+    /// (b) A subscription answered by a ring connection is NOT renewed early.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn ring_subscription_is_not_renewed_early() {
+        let (op_manager, rx, _peers, _guards, store) =
+            op_manager_with_peers_and_store("sub-ring-not-provisional", 3).await;
+        let instance_id = ContractInstanceId::new([63u8; 32]);
+        let key = contract(instance_id);
+        let _seen = serve(&op_manager, rx, store, key);
+        op_manager
+            .ring
+            .add_client_subscription(&instance_id, crate::client_events::ClientId::next());
+
+        subscribe(&op_manager, instance_id, false).await;
+        assert!(op_manager.ring.is_subscribed(&key));
+        assert!(!op_manager.ring.is_subscription_provisional(&key));
+        assert!(
+            !op_manager.ring.contracts_needing_renewal().contains(&key),
+            "a fresh lease answered by a ring peer waits for its renewal window"
+        );
+    }
+
+    /// Run the hop driver for a request from `requester`, return its answers.
+    async fn run_hop(
+        op_manager: &Arc<OpManager>,
+        rx: tokio::sync::mpsc::Receiver<crate::node::OpExecutionPayload>,
+        store: LocalStore,
+        key: freenet_stdlib::prelude::ContractKey,
+        requester: std::net::SocketAddr,
+    ) -> Vec<(std::net::SocketAddr, SubscribeMsgResult)> {
+        let seen = serve(op_manager, rx, store, key);
+        let _result = drive_relay_subscribe(
+            op_manager,
+            Transaction::new::<SubscribeMsg>(),
+            *key.id(),
+            3,
+            VisitedPeers::new(&Transaction::new::<SubscribeMsg>()),
+            false,
+            requester,
+        )
+        .await;
+        // The answer is fire-and-forget: let the scripted loop drain it.
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        seen.lock().responses.clone()
+    }
+
+    /// (c) The gateway keeps answering `Subscribed` to a requester it reaches
+    /// only over a transient link, on a local hit and after forwarding. That is
+    /// the bootstrap path of an empty-ring node (#4361); answering NotFound
+    /// would fail its subscribe outright.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn gateway_answers_a_transient_bootstrapping_requester_subscribed() {
+        for (label, locally_stored) in [
+            ("sub-transient-requester-local-hit", true),
+            ("sub-transient-requester-forward", false),
+        ] {
+            let (op_manager, rx, _peers, _guards, store) =
+                op_manager_with_peers_and_store(label, 3).await;
+            let key = contract(ContractInstanceId::new([64u8; 32]));
+            if locally_stored {
+                store_contract(&store, key);
+            }
+            let requester: std::net::SocketAddr = "127.0.0.1:40000".parse().unwrap();
+            assert!(
+                op_manager
+                    .ring
+                    .connection_manager
+                    .try_register_transient(requester, None)
+            );
+            let responses = run_hop(&op_manager, rx, store, key, requester).await;
+            assert!(
+                matches!(
+                    responses.as_slice(),
+                    [(to, SubscribeMsgResult::Subscribed { .. })] if *to == requester
+                ),
+                "{label}: {responses:?}"
+            );
+        }
+    }
+
+    /// (d) Originator loopback: a SUBSCRIBE the node routes to itself
+    /// (`upstream_addr == own_addr`) is still answered `Subscribed`.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn originator_loopback_is_answered_subscribed() {
+        let (op_manager, rx, _peers, _guards, store) =
+            op_manager_with_peers_and_store("sub-loopback-local-hit", 3).await;
+        let key = contract(ContractInstanceId::new([65u8; 32]));
+        store_contract(&store, key);
+        let own = op_manager.ring.connection_manager.get_own_addr().unwrap();
+        let responses = run_hop(&op_manager, rx, store, key, own).await;
+        assert!(
+            matches!(
+                responses.as_slice(),
+                [(to, SubscribeMsgResult::Subscribed { .. })] if *to == own
+            ),
+            "{responses:?}"
         );
     }
 }

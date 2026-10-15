@@ -860,13 +860,45 @@ pub(crate) mod driver_test_support {
     /// [`op_manager_with_peers_and_store`], with the event-loop channels
     /// sized `channel_capacity` (`None`: the default). A small capacity lets
     /// a test hold a dispatch up.
-    // The stub contract handler answers two events and leaves every other
-    // variant unanswered on purpose, so its wildcard arm is the point.
-    #[allow(clippy::wildcard_enum_match_arm)]
     pub(crate) async fn op_manager_with_peers_and_store_on(
         id: &str,
         peers: usize,
         channel_capacity: Option<usize>,
+    ) -> (
+        Arc<OpManager>,
+        tokio::sync::mpsc::Receiver<OpExecutionPayload>,
+        Vec<PeerKeyLocation>,
+        Box<dyn std::any::Any>,
+        LocalStore,
+    ) {
+        build_op_manager(id, peers, channel_capacity, &[]).await
+    }
+
+    /// [`op_manager_with_peers_and_store`] for a node with NO ring connections
+    /// and `gateway` configured, i.e. a freshly-bootstrapped node whose ops
+    /// take the bootstrap-gateway fallback (#4361).
+    pub(crate) async fn op_manager_with_gateway(
+        id: &str,
+        gateway: PeerKeyLocation,
+    ) -> (
+        Arc<OpManager>,
+        tokio::sync::mpsc::Receiver<OpExecutionPayload>,
+        Box<dyn std::any::Any>,
+        LocalStore,
+    ) {
+        let (op_manager, rx, _no_peers, guards, store) =
+            build_op_manager(id, 0, None, std::slice::from_ref(&gateway)).await;
+        (op_manager, rx, guards, store)
+    }
+
+    // The stub contract handler answers two events and leaves every other
+    // variant unanswered on purpose, so its wildcard arm is the point.
+    #[allow(clippy::wildcard_enum_match_arm)]
+    async fn build_op_manager(
+        id: &str,
+        peers: usize,
+        channel_capacity: Option<usize>,
+        gateways: &[PeerKeyLocation],
     ) -> (
         Arc<OpManager>,
         tokio::sync::mpsc::Receiver<OpExecutionPayload>,
@@ -879,10 +911,16 @@ pub(crate) mod driver_test_support {
             mode: Some(crate::contract::OperationMode::Local),
             ..Default::default()
         };
-        let node_config =
+        let mut node_config =
             crate::node::NodeConfig::new(config_args.build().await.expect("build Config"))
                 .await
                 .expect("build NodeConfig");
+        node_config.gateways.extend(gateways.iter().map(|gw| {
+            crate::node::InitPeerNode::new(
+                gw.clone(),
+                Location::from_address(&gw.socket_addr().unwrap()),
+            )
+        }));
         let (notification_rx, notification_tx) = match channel_capacity {
             Some(capacity) => crate::node::event_loop_notification_channel_with_capacity(capacity),
             None => crate::node::event_loop_notification_channel(),
