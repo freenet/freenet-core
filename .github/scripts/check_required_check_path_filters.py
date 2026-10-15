@@ -57,8 +57,9 @@ context stops reporting or stops being informative:
 Parser scope, stated because check 1's message reads like total coverage and is
 not: block- and flow-style filters are both detected, at the 2-space trigger /
 4-space key indentation every workflow in this repo uses. A workflow written
-with 4-space YAML indentation, a flow-style ``on:`` mapping, or a job ``name:``
-carrying a trailing comment is not parsed. Check 2 is the backstop for exactly
+with 4-space YAML indentation or a flow-style ``on:`` mapping is not parsed.
+Check 3 additionally fails closed on a job key it cannot read (a quoted id, a
+flow-mapping job), because a job it cannot see is a job it cannot check. Check 2 is the backstop for exactly
 that: a required-context workflow this parser cannot read drops out of the
 coverage set and fails.
 
@@ -133,7 +134,7 @@ JOBS_RE = re.compile(r"^jobs:\s*(?:#.*)?$")
 # name, when set, is `    name: ...` at exactly four. The context GitHub reports
 # is the `name:` if present, otherwise the job id.
 JOB_ID_RE = re.compile(r"^  (?P<id>[A-Za-z_][A-Za-z0-9_-]*):\s*(?:#.*)?$")
-JOB_NAME_RE = re.compile(r"^    name:\s*(?P<name>.+?)\s*$")
+JOB_NAME_RE = re.compile(r"^    name:\s*(?P<name>[^#]+?)\s*(?:#.*)?$")
 
 # `  pull_request:` / `  pull_request_target:` at exactly two-space indent is a
 # trigger under `on:`. Deeper indents are something else.
@@ -238,6 +239,12 @@ def check_source(text: str, name: str) -> list[str]:
     return errors
 
 
+def _bracket_depth(text: str) -> int:
+    """Net count of opened-minus-closed flow brackets, ignoring comments."""
+    code = text.split("#", 1)[0]
+    return code.count("[") + code.count("{") - code.count("]") - code.count("}")
+
+
 def check_needs(text: str, name: str) -> list[str]:
     """Errors for jobs that `needs:` a required-context job (see check 3)."""
     lines = text.splitlines()
@@ -269,6 +276,18 @@ def check_needs(text: str, name: str) -> list[str]:
             current_id = job.group("id")
             i += 1
             continue
+        if re.match(r"^  \S", line) and not line.lstrip().startswith("#"):
+            # A job key we cannot read (quoted id, flow-mapping job, ...).
+            # Staying silent would also leave `current_id` pointing at the
+            # PREVIOUS job, which could be an allowlisted observer.
+            current_id = None
+            errors.append(
+                f"{name}:{i + 1}: cannot parse this job key, so its `needs:` "
+                f"cannot be checked against required status contexts. Write "
+                f"it as a plain `  <id>:` line."
+            )
+            i += 1
+            continue
         needs = NEEDS_RE.match(line)
         if not needs:
             i += 1
@@ -276,17 +295,22 @@ def check_needs(text: str, name: str) -> list[str]:
 
         needs_at = i
         span = [needs.group("value")]
+        # Unclosed `[` / `{` means a multi-line flow collection, whose
+        # continuation lines may sit at ANY indent, including the key's own.
+        depth = _bracket_depth(needs.group("value"))
         i += 1
         while i < end:
             nxt = lines[i]
             stripped = nxt.strip()
             indent = len(nxt) - len(nxt.lstrip())
             if (
-                not stripped
+                depth > 0
+                or not stripped
                 or stripped.startswith("#")
                 or indent > 4
                 or (indent == 4 and stripped.startswith("-"))
             ):
+                depth += _bracket_depth(nxt)
                 span.append(nxt)
                 i += 1
             else:
@@ -587,6 +611,10 @@ _NEEDS_CASES = [
         1,
         14,
     ),
+    ("multi-line flow list with items at the key's own indent", _needs_fixture("    needs: [\n    other,\n    fmt_check\n    ]\n"), 1, 11),
+    ("multi-line flow list opened with an item", _needs_fixture("    needs: [other,\n    fmt_check]\n"), 1, 11),
+    ("`name:` with a trailing comment still counts as required", "name: CI\non:\n  pull_request:\n\njobs:\n  fmt_check:\n    name: Fmt  # required\n  heavy:\n    needs: fmt_check\n", 1, 9),
+    ("unreadable (quoted) job key fails closed", "name: CI\non:\n  pull_request:\n\njobs:\n  fmt_check:\n    name: Fmt\n  \"heavy\":\n    needs: fmt_check\n", 1, 8),
     (
         "a column-0 comment inside jobs: does not hide later jobs",
         "name: CI\non:\n  pull_request:\n\njobs:\n  fmt_check:\n    name: Fmt\n    runs-on: ubuntu-latest\n# stray\n  heavy:\n    needs: fmt_check\n    runs-on: ubuntu-latest\n",
