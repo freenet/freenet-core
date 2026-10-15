@@ -278,9 +278,12 @@ the aggregator tasks. They exist only for the staged rollout in
 NAT traversal:
   1. Send multiple intro packets — `NAT_TRAVERSAL_MAX_ATTEMPTS` (40 in release builds, 10 under `cfg(test)`) at a 200 ms cadence, capped by a 3 s `overall_deadline` (so ~15 attempts at production settings)
      → A failed `send_to` in this loop counts as a lost datagram, not an abort;
-       if the last send failed, the attempt ends with `SendFailed` and the OS
-       error is logged. One-shot handshake sends fail via `SendFailed` at once.
-       Never map a send error to `ChannelClosed` (#5871).
+       if the last send failed, the attempt ends with `SendFailed`, and either
+       way the final warn carries `failed_sends` and the last OS error. The
+       gateway success ack and the joiner's final ack fail via `SendFailed` at
+       once; the best-effort version-mismatch ack only logs, so the peer is
+       still recorded as outdated. Never map a send error to `ChannelClosed`
+       (#5871).
   2. Use exponential backoff: 50ms → 300ms → 1s → 5s
   3. First relay observes external address (ObservedAddress msg)
   4. Rate limit: 1 intro packet/second per source IP

@@ -374,7 +374,10 @@ impl TransportError {
     ///
     /// Covers:
     /// - [`TransportError::SendFailed`]: a transient UDP send error (e.g.
-    ///   ENETUNREACH) on a single packet.
+    ///   ENETUNREACH) on a single packet of an established connection.
+    ///   The handshake also returns `SendFailed` (#5871), and there it is
+    ///   FATAL: it ends the connection attempt. Do not apply this predicate
+    ///   to the result of a connect; it describes established connections.
     /// - [`TransportError::OutboundStreamFailed`]: any stream-scoped failure
     ///   in `outbound_stream::{send_stream, pipe_stream}` — the
     ///   congestion-window wait exceeding `CWND_WAIT_TIMEOUT`, or (for the

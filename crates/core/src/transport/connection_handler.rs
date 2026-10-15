@@ -1904,9 +1904,11 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                         // Best effort: the peer is refused either way, and
                         // returning the mismatch rather than the send error
                         // is what makes the listener remember it as outdated.
+                        // Logged at info!: a spoofed-source intro can trigger
+                        // it (see `handshake_send_failed`).
                         if let Err(err) = socket.send_to(&packet.prepared_send(), remote_addr).await
                         {
-                            tracing::warn!(
+                            tracing::info!(
                                 peer_addr = %remote_addr,
                                 direction = "inbound",
                                 error = %err,
@@ -2210,7 +2212,7 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
             // ENETUNREACH for every off-host destination, the same error a
             // returning network gives (#5871). The deadline bounds both, and
             // if the last send failed the attempt reports that error.
-            let mut last_send_error: Option<std::io::Error> = None;
+            let mut send_failures = HandshakeSendFailures::default();
 
             // NAT traversal: keep sending packets throughout the deadline to maintain NAT bindings.
             // The acceptor may start hole-punching well before the joiner, so we must keep
@@ -2227,21 +2229,13 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                                 direction = "outbound",
                                 "Sending protocol version and inbound key"
                             );
-                            match socket
-                                .send_to(outbound_intro_packet.data(), remote_addr)
-                                .await
-                            {
-                                Ok(_) => last_send_error = None,
-                                Err(err) => {
-                                    tracing::debug!(
-                                        peer_addr = %remote_addr,
-                                        direction = "outbound",
-                                        error = %err,
-                                        "Failed to send intro packet, re-sending on the next pass"
-                                    );
-                                    last_send_error = Some(err);
-                                }
-                            }
+                            send_failures.record(
+                                socket
+                                    .send_to(outbound_intro_packet.data(), remote_addr)
+                                    .await,
+                                remote_addr,
+                                "intro",
+                            );
                             attempts += 1;
                         }
                         HandshakePhase::RemoteInbound => {
@@ -2263,23 +2257,15 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                                 remote_protoc_version,
                                 ack_version_floor,
                             )?;
-                            match socket.send_to(our_inbound.data(), remote_addr).await {
-                                Ok(_) => {
-                                    last_send_error = None;
-                                    sent_tracker.report_sent_packet(
-                                        SymmetricMessage::FIRST_PACKET_ID,
-                                        our_inbound.data().into(),
-                                    );
-                                }
-                                Err(err) => {
-                                    tracing::debug!(
-                                        peer_addr = %remote_addr,
-                                        direction = "outbound",
-                                        error = %err,
-                                        "Failed to send ack, re-sending on the next pass"
-                                    );
-                                    last_send_error = Some(err);
-                                }
+                            if send_failures.record(
+                                socket.send_to(our_inbound.data(), remote_addr).await,
+                                remote_addr,
+                                "ack",
+                            ) {
+                                sent_tracker.report_sent_packet(
+                                    SymmetricMessage::FIRST_PACKET_ID,
+                                    our_inbound.data().into(),
+                                );
                             }
                             attempts += 1;
                         }
@@ -2657,10 +2643,20 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
 
             let elapsed_nanos = time_source.now_nanos().saturating_sub(start_time_nanos);
             let elapsed_ms = elapsed_nanos / 1_000_000;
-            if let Some(err) = last_send_error {
+            // The returned error follows the LAST send: if it failed, the
+            // send error is the most specific explanation available. If it
+            // succeeded, the remote was reachable from our side at the end and
+            // simply did not answer, so the attempt ends as before. Either way
+            // the warn line carries the failure count and the last OS error,
+            // so sends that failed mid-attempt are visible in release builds.
+            if let (true, Some(err)) = (
+                send_failures.last_send_failed,
+                send_failures.last_error.as_ref(),
+            ) {
                 tracing::warn!(
                     peer_addr = %remote_addr,
                     attempts,
+                    failed_sends = send_failures.count,
                     elapsed_ms,
                     direction = "outbound",
                     error = %err,
@@ -2671,6 +2667,8 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
             tracing::warn!(
                 peer_addr = %remote_addr,
                 attempts,
+                failed_sends = send_failures.count,
+                last_send_error = %send_failures.last_error_text(),
                 elapsed_ms,
                 direction = "outbound",
                 "Outbound handshake failed: max connection attempts reached"
@@ -2683,6 +2681,54 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
     }
 }
 
+/// Send failures seen during one `traverse_nat` attempt (#5871).
+#[derive(Default)]
+struct HandshakeSendFailures {
+    /// Failed sends so far in this attempt.
+    count: usize,
+    /// The most recent OS error, kept after a later send succeeds so the
+    /// attempt's final log line can still name it.
+    last_error: Option<std::io::Error>,
+    /// Whether the most recent send failed. Decides the returned error.
+    last_send_failed: bool,
+}
+
+impl HandshakeSendFailures {
+    /// Record one send's outcome. Returns true if the send succeeded.
+    fn record(
+        &mut self,
+        result: std::io::Result<usize>,
+        remote_addr: SocketAddr,
+        packet: &'static str,
+    ) -> bool {
+        match result {
+            Ok(_) => {
+                self.last_send_failed = false;
+                true
+            }
+            Err(err) => {
+                tracing::debug!(
+                    peer_addr = %remote_addr,
+                    direction = "outbound",
+                    packet,
+                    error = %err,
+                    "Handshake send failed, re-sending on the next pass"
+                );
+                self.count += 1;
+                self.last_send_failed = true;
+                self.last_error = Some(err);
+                false
+            }
+        }
+    }
+
+    fn last_error_text(&self) -> String {
+        self.last_error
+            .as_ref()
+            .map_or_else(|| "none".to_string(), ToString::to_string)
+    }
+}
+
 /// Turn a failed handshake `send_to` into the error the handshake returns.
 ///
 /// Logs the full OS error first, with the destination, because `SendFailed`
@@ -2690,17 +2736,30 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
 /// Before #5871 these sends mapped every error to `ChannelClosed` and the OS
 /// error was lost. No consumer of a handshake result classifies it with
 /// `is_transient_send_failure`; that predicate is for established connections.
+///
+/// Inbound (gateway) failures log at `info!`: an unauthenticated intro with a
+/// spoofed source address can trigger them, limited only by the per-IP intro
+/// rate limit, so they must not flood the warn level.
 fn handshake_send_failed(
     remote_addr: SocketAddr,
     direction: &'static str,
     err: std::io::Error,
 ) -> TransportError {
-    tracing::warn!(
-        peer_addr = %remote_addr,
-        direction,
-        error = %err,
-        "Handshake send failed"
-    );
+    if direction == "inbound" {
+        tracing::info!(
+            peer_addr = %remote_addr,
+            direction,
+            error = %err,
+            "Handshake send failed"
+        );
+    } else {
+        tracing::warn!(
+            peer_addr = %remote_addr,
+            direction,
+            error = %err,
+            "Handshake send failed"
+        );
+    }
     TransportError::SendFailed(remote_addr, err.kind())
 }
 
@@ -5414,6 +5473,10 @@ pub mod mock_transport {
     }
 
     /// Wait until some captured line satisfies `pred`, or give up after 10 s.
+    ///
+    /// The capture is thread-local, so the tests using it rely on the default
+    /// current-thread `#[tokio::test]` runtime, which polls the listener and
+    /// handshake tasks on the test's own thread.
     #[cfg(test)]
     async fn wait_for_log(
         logs: &crate::util::test_log_capture::CapturedLogs,
@@ -5462,8 +5525,16 @@ pub mod mock_transport {
             ),
             "expected SendFailed({remote_addr}, NetworkUnreachable), got {err:?}"
         );
+        // The user-visible "Failed NAT traversal" line prints this Display.
+        assert_eq!(
+            err.to_string(),
+            format!("send to {remote_addr} failed: network unreachable")
+        );
+        // NAT_TRAVERSAL_MAX_ATTEMPTS is 10 under cfg(test) at a ~250 ms
+        // cadence; 5 shows sustained re-sending without depending on the
+        // scheduler delivering all 10 before the deadline.
         assert!(
-            failures.load(Ordering::SeqCst) > 1,
+            failures.load(Ordering::SeqCst) >= 5,
             "a send failure must not end the attempt at once; the intro loop \
              re-sends as for a lost datagram (failures = {})",
             failures.load(Ordering::SeqCst)
@@ -5509,6 +5580,92 @@ pub mod mock_transport {
             "the test only means something if the injected failures happened"
         );
         Ok(())
+    }
+
+    /// Run one outbound attempt from a listener whose sends `fail` selects,
+    /// at a target that receives every packet and never answers. Returns the
+    /// attempt's error, the number of failed sends, and the captured logs.
+    #[cfg(test)]
+    async fn attempt_against_silent_target(
+        port: u16,
+        fail: fn(usize, &[u8]) -> bool,
+    ) -> (TransportError, usize, Vec<String>) {
+        let (logs, guard) = crate::util::test_log_capture::install();
+        let channels: Channels = Arc::new(DashMap::new());
+        let (_pub, mut peer, _addr, failures) =
+            spawn_listener_with_send_errors(port, false, channels.clone(), fail).await;
+        let remote_addr: SocketAddr = (Ipv4Addr::LOCALHOST, port + 1).into();
+        // Registered in `channels`, so sends to it succeed; nothing reads it.
+        let _silent = MockSocket::new(
+            Default::default(),
+            Default::default(),
+            remote_addr,
+            channels,
+        )
+        .await;
+
+        let conn = peer
+            .connect(TransportKeypair::new().public, remote_addr)
+            .await;
+        let result = tokio::time::timeout(Duration::from_secs(10), conn)
+            .await
+            .expect("the attempt must end at its deadline");
+        drop(guard);
+        let err = match result {
+            Ok(_) => panic!("a target that never answers cannot complete a handshake"),
+            Err(err) => err,
+        };
+        let captured = logs.lock().unwrap().clone();
+        (err, failures.load(Ordering::SeqCst), captured)
+    }
+
+    /// #5871: sends that fail and then recover, followed by a remote that
+    /// never answers, must end as an ordinary unanswered attempt, not as a
+    /// send failure (the last send went out). The failures must still be
+    /// visible: the final warn carries their count and the last OS error.
+    #[tokio::test]
+    async fn nat_traversal_recovered_send_failures_end_as_unanswered_attempt() {
+        let (err, failures, logs) = attempt_against_silent_target(47_450, |i, _| i < 2).await;
+        assert_eq!(failures, 2, "the injected failures must have happened");
+        assert!(
+            matches!(err, TransportError::ConnectionEstablishmentFailure { .. }),
+            "the last send succeeded, so this is not a send failure; got {err:?}"
+        );
+        assert!(
+            !logs
+                .iter()
+                .any(|l| l.contains("sends to the remote are failing")),
+            "must not claim sends are failing after they recovered; captured: {logs:?}"
+        );
+        let os_error = format!("os error {}", enetunreach().raw_os_error().unwrap());
+        assert!(
+            logs.iter().any(|l| l.starts_with("WARN")
+                && l.contains("max connection attempts reached")
+                && l.contains("failed_sends=2")
+                && l.contains(&os_error)),
+            "the final warn must report the 2 failed sends and the OS error; captured: {logs:?}"
+        );
+    }
+
+    /// The mirror of the test above: sends that succeed and then start
+    /// failing end the attempt with the send error, counted in the warn.
+    #[tokio::test]
+    async fn nat_traversal_send_failures_at_the_end_report_send_error() {
+        let (err, failures, logs) = attempt_against_silent_target(47_460, |i, _| i >= 3).await;
+        assert!(failures >= 1, "the injected failures must have happened");
+        assert!(
+            matches!(
+                err,
+                TransportError::SendFailed(_, std::io::ErrorKind::NetworkUnreachable)
+            ),
+            "the last send failed, so the attempt reports it; got {err:?}"
+        );
+        assert!(
+            logs.iter().any(|l| l.starts_with("WARN")
+                && l.contains("sends to the remote are failing")
+                && l.contains(&format!("failed_sends={failures}"))),
+            "the final warn must count the failed sends; captured: {logs:?}"
+        );
     }
 
     /// #5871, the one-shot send at the end of the joiner's handshake: the
@@ -5563,8 +5720,8 @@ pub mod mock_transport {
         })
         .await;
         let os_error = format!("os error {}", enetunreach().raw_os_error().unwrap());
-        let warn_line = wait_for_log(&logs, |l| {
-            l.starts_with("WARN")
+        let info_line = wait_for_log(&logs, |l| {
+            l.starts_with("INFO")
                 && l.contains(&os_error)
                 && l.contains(&format!("peer_addr={joiner_addr}"))
         })
@@ -5587,8 +5744,8 @@ pub mod mock_transport {
             "a send error is not a closed channel, got: {failed_line}"
         );
         assert!(
-            warn_line.is_some(),
-            "a WARN naming the OS error and the joiner must be logged; captured: {:?}",
+            info_line.is_some(),
+            "an INFO naming the OS error and the joiner must be logged; captured: {:?}",
             logs.lock().unwrap()
         );
         assert!(failures.load(Ordering::SeqCst) >= 1);
@@ -5629,8 +5786,8 @@ pub mod mock_transport {
         })
         .await;
         let os_error = format!("os error {}", enetunreach().raw_os_error().unwrap());
-        let warn_line = wait_for_log(&logs, |l| {
-            l.starts_with("WARN")
+        let info_line = wait_for_log(&logs, |l| {
+            l.starts_with("INFO")
                 && l.contains(&os_error)
                 && l.contains(&format!("peer_addr={joiner_addr}"))
         })
@@ -5648,8 +5805,8 @@ pub mod mock_transport {
             "an unsendable ack_error must not hide the version mismatch, got: {failed_line}"
         );
         assert!(
-            warn_line.is_some(),
-            "a WARN naming the OS error and the joiner must be logged; captured: {:?}",
+            info_line.is_some(),
+            "an INFO naming the OS error and the joiner must be logged; captured: {:?}",
             logs.lock().unwrap()
         );
         assert_eq!(failures.load(Ordering::SeqCst), 1);
