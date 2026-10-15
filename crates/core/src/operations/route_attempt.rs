@@ -677,7 +677,7 @@ pub(crate) mod driver_test_support {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use freenet_stdlib::prelude::WrappedState;
+    use freenet_stdlib::prelude::{StateSummary, WrappedState};
 
     use crate::contract::{ContractHandlerEvent, StoreResponse};
     use crate::message::{MessageStats, NetMessage};
@@ -759,6 +759,19 @@ pub(crate) mod driver_test_support {
 
     fn rejects_stores(id: &str) -> bool {
         store_rejections().contains(id)
+    }
+
+    fn summary_answerers() -> &'static dashmap::DashSet<String> {
+        static ANSWERERS: std::sync::OnceLock<dashmap::DashSet<String>> =
+            std::sync::OnceLock::new();
+        ANSWERERS.get_or_init(dashmap::DashSet::new)
+    }
+
+    /// Make the stub contract handler of the test node built with `id` answer
+    /// a `GetSummaryQuery` for the stored contract (its summary is the stored
+    /// state's bytes). By default that query is left unanswered.
+    pub(crate) fn answer_summaries(id: &str) {
+        summary_answerers().insert(id.to_string());
     }
 
     /// The pre-#5657 non-router inputs for `peer`: its `peer_health`
@@ -972,6 +985,25 @@ pub(crate) mod driver_test_support {
                         let response = ContractHandlerEvent::PutResponse {
                             new_value,
                             state_changed: !refused,
+                        };
+                        let _answered = ch_channel.send_to_sender(id, response).await;
+                    }
+                    ContractHandlerEvent::GetSummaryQuery { key }
+                        if summary_answerers().contains(&node_id) =>
+                    {
+                        let stored = handler_store
+                            .lock()
+                            .clone()
+                            .filter(|(stored_key, _)| *stored_key == key);
+                        let response = ContractHandlerEvent::GetSummaryResponse {
+                            key,
+                            summary: stored
+                                .map(|(_, state)| StateSummary::from(state.as_ref().to_vec()))
+                                .ok_or_else(|| {
+                                    crate::contract::ExecutorError::other(anyhow::anyhow!(
+                                        "no stored state to summarize"
+                                    ))
+                                }),
                         };
                         let _answered = ch_channel.send_to_sender(id, response).await;
                     }
