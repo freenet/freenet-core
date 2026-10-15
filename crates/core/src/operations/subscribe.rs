@@ -559,16 +559,20 @@ pub(super) async fn finalize_originator_subscribe(
     // The request went to the bootstrap gateway of an empty ring (#4361):
     // the gateway could not register us as its downstream subscriber, so the
     // lease is provisional and is renewed through the ring once we have a ring
-    // connection (#2524). Decided at SEND time, not by resolving `upstream_addr`
-    // here: a ring upstream that dropped between its reply and this point
-    // would also fail to resolve, yet it did register us.
+    // connection (#2524).
     via_bootstrap_gateway: bool,
 ) {
-    if let Some(pkl) = op_manager
+    let upstream = op_manager
         .ring
         .connection_manager
-        .get_peer_by_addr(upstream_addr)
-    {
+        .get_peer_by_addr(upstream_addr);
+    // Provisional unless the answer is a genuine repair (#2524): it came over
+    // the ring AND the answering upstream is still a ring connection now. A
+    // hop sends `Subscribed` BEFORE it registers the requester
+    // (operations.md: forward upstream before contract-handling work), so a
+    // ring upstream that dropped in between may never have registered us.
+    let provisional = via_bootstrap_gateway || upstream.is_none();
+    if let Some(pkl) = upstream {
         let peer_key = crate::ring::interest::PeerKey::from(pkl.pub_key);
         // Refresh-if-present, register-if-absent. A bare `register_peer_interest`
         // inserts a fresh `PeerInterest` over an existing entry and WIPES its
@@ -603,7 +607,7 @@ pub(super) async fn finalize_originator_subscribe(
     op_manager.ring.subscribe(key);
     op_manager
         .ring
-        .set_subscription_provisional(&key, via_bootstrap_gateway);
+        .set_subscription_provisional(&key, provisional);
     op_manager.ring.complete_subscription_request(&key, true);
 
     // Fetch the contract body if we don't have it locally. The result

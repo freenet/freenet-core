@@ -5784,11 +5784,11 @@ mod bootstrap_subscription_tests {
     }
 
     /// A ring upstream that answers `Subscribed` and then drops before
-    /// finalization did register us, so the lease is NOT provisional: the mark
-    /// is decided by how the request was routed (the empty-ring bootstrap
-    /// fallback), not by whether the upstream still resolves afterwards.
+    /// finalization may never have registered us (a hop answers before it
+    /// registers the requester), so the lease IS provisional and is
+    /// re-subscribed through the ring early.
     #[tokio::test(flavor = "current_thread", start_paused = true)]
-    async fn ring_upstream_dropping_after_reply_is_not_provisional() {
+    async fn ring_upstream_dropping_before_finalize_is_provisional() {
         let (op_manager, rx, _peers, _guards, store) =
             op_manager_with_peers_and_store("sub-ring-upstream-drops", 3).await;
         let instance_id = ContractInstanceId::new([69u8; 32]);
@@ -5823,8 +5823,69 @@ mod bootstrap_subscription_tests {
         subscribe(&op_manager, instance_id, false).await;
         assert!(op_manager.ring.is_subscribed(&key));
         assert!(
-            !op_manager.ring.is_subscription_provisional(&key),
-            "a ring upstream that registered us must not make the lease provisional"
+            op_manager.ring.is_subscription_provisional(&key),
+            "a ring upstream that dropped before finalize may not have registered us"
+        );
+    }
+
+    /// An already-provisional lease whose ring renewal is answered by a peer
+    /// that then drops before finalization is not repaired: it keeps its mark.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn provisional_lease_keeps_its_mark_when_the_ring_responder_drops() {
+        let gateway_addr: std::net::SocketAddr = "127.0.0.1:31000".parse().unwrap();
+        let gateway = PeerKeyLocation::new(
+            crate::transport::TransportKeypair::new().public().clone(),
+            gateway_addr,
+        );
+        let (op_manager, rx, _guards, store) =
+            op_manager_with_gateway("sub-bootstrap-responder-drops", gateway).await;
+        let instance_id = ContractInstanceId::new([74u8; 32]);
+        let key = contract(instance_id);
+        let node = op_manager.clone();
+        let targets = Arc::new(Mutex::new(Vec::new()));
+        let record = targets.clone();
+        serve_attempts(
+            op_manager.clone(),
+            rx,
+            crate::message::TransactionType::Subscribe,
+            move |_, msg, target| {
+                let NetMessage::V1(NetMessageV1::Subscribe(SubscribeMsg::Request { .. })) = msg
+                else {
+                    return Step {
+                        hop: None,
+                        answer: Answer::DropWaiter,
+                    };
+                };
+                let target = target.expect("requests carry a target");
+                record.lock().push(target);
+                if target != gateway_addr {
+                    // The ring responder answers, then its connection drops.
+                    assert!(
+                        node.ring
+                            .connection_manager
+                            .prune_alive_connection(target)
+                            .is_some()
+                    );
+                }
+                store_contract(&store, key);
+                Step {
+                    hop: None,
+                    answer: Answer::Reply(subscribed(msg, key)),
+                }
+            },
+        );
+        op_manager
+            .ring
+            .add_client_subscription(&instance_id, crate::client_events::ClientId::next());
+        subscribe(&op_manager, instance_id, false).await;
+        assert!(op_manager.ring.is_subscription_provisional(&key));
+
+        let ring_peer = add_ring_peer(&op_manager, 31001);
+        subscribe(&op_manager, instance_id, true).await;
+        assert_eq!(targets.lock().last(), Some(&ring_peer));
+        assert!(
+            op_manager.ring.is_subscription_provisional(&key),
+            "a responder that dropped before finalize does not repair the lease"
         );
     }
 
