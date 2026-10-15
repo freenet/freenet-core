@@ -566,11 +566,16 @@ pub(super) async fn finalize_originator_subscribe(
         .ring
         .connection_manager
         .get_peer_by_addr(upstream_addr);
-    // Provisional unless the answer is a genuine repair (#2524): it came over
+    // Provisional unless the answer looks like a repair (#2524): it came over
     // the ring AND the answering upstream is still a ring connection now. A
-    // hop sends `Subscribed` BEFORE it registers the requester
-    // (operations.md: forward upstream before contract-handling work), so a
-    // ring upstream that dropped in between may never have registered us.
+    // hop sends `Subscribed` BEFORE its body fetch and registration of the
+    // requester (operations.md: forward upstream before contract-handling
+    // work), so a ring upstream that dropped in between may never have
+    // registered us. A still-connected ring responder is only our best local
+    // evidence of registration, not proof: it registers nobody if that
+    // post-ACK fetch fails or its subscriber cap rejects us. That residual is
+    // the same as on main (which never retries early); proving registration
+    // would need a wire-level registration ack (#2524).
     let provisional = via_bootstrap_gateway || upstream.is_none();
     if let Some(pkl) = upstream {
         let peer_key = crate::ring::interest::PeerKey::from(pkl.pub_key);
@@ -918,11 +923,14 @@ pub(super) async fn finalize_host_subscribe(
     )
     .await;
     op_manager.ring.subscribe(key);
-    // A ring upstream answered this forwarded subscribe and, while still
-    // connected, has registered us as its downstream: a genuine repair of a
-    // provisional lease (#2524), on the same condition as the originator's
-    // in `finalize_originator_subscribe`. A local hit (`upstream_peer` None)
-    // repairs nothing.
+    // A ring upstream answered this forwarded subscribe and is still
+    // connected: our best local evidence that it registered us as its
+    // downstream, so treat it as a repair of a provisional lease (#2524), on
+    // the same condition as the originator's in
+    // `finalize_originator_subscribe`. It is not proof: the upstream answered
+    // before its own body fetch and registration, and registers nobody if
+    // that fetch fails or its subscriber cap rejects us (the residual
+    // documented there). A local hit (`upstream_peer` None) repairs nothing.
     if upstream_peer.as_ref().is_some_and(|peer| {
         op_manager
             .ring
