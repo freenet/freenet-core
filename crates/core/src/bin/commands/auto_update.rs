@@ -2702,6 +2702,35 @@ mod tests {
         );
     }
 
+    /// #5799: a newer release that is cooling down after failed downloads is
+    /// reported as `CoolingDown`, not `UpdateAvailable`, so no peer-signal
+    /// trigger exits for it, and the backoff GROWS rather than resetting so
+    /// the signal is not re-checked every minute meanwhile.
+    #[test]
+    fn peer_signal_check_reports_a_cooling_down_release_before_confirming_it() {
+        let src = include_str!("auto_update.rs");
+        let body = fn_body(src, "pub async fn check_if_update_available(");
+        let cooling = body
+            .find("if let Some(remaining) = super::rollback::update_cooldown_remaining(&latest) {")
+            .expect("check_if_update_available must consult the update cooldown (#5799)");
+        let arm = &body[cooling..];
+        let arm = &arm[..arm
+            .find("\n                }\n")
+            .expect("end of cooldown branch")];
+        assert!(
+            arm.contains("increase_backoff();")
+                && arm.contains("return UpdateCheckResult::CoolingDown(remaining);"),
+            "a cooling-down release must grow the backoff and return CoolingDown: {arm}"
+        );
+        let confirmed = body
+            .find("UpdateCheckResult::UpdateAvailable(latest)")
+            .expect("UpdateAvailable not found");
+        assert!(
+            cooling < confirmed,
+            "the cooldown must be consulted before an update is confirmed (#5799)"
+        );
+    }
+
     #[test]
     fn an_overflowing_retry_stamp_is_ignored_not_a_panic() {
         // A corrupt or hand-edited stamp too large for SystemTime used to

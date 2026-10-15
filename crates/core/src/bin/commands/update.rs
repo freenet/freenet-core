@@ -567,7 +567,8 @@ impl UpdateCommand {
             Err(e) if is_release_verification_failure(e) => {
                 super::rollback::record_install_failure(latest_version)
             }
-            // Transient install error: neither record nor clear — retry later.
+            // Transient install error: neither record nor clear the gate — retry
+            // later, after a cooldown (below).
             //
             // DELIBERATELY includes the fail-closed "missing artifact" refusals
             // (absent SHA256SUMS.txt, no manifest entry for our asset, absent
@@ -4184,6 +4185,67 @@ done
             !catch_body.contains("record_install_failure")
                 && !catch_body.contains("clear_install_failures"),
             "the transient Err arm must neither record nor clear the gate"
+        );
+    }
+
+    /// #5799: a transient failure to install a release must cool that release
+    /// down, or the node restarts on its old binary, detects the release again
+    /// and exits for it again within minutes, for as long as the network
+    /// stays bad. Every transient exit of `run_async` once the version is
+    /// known records it, and both "we are current" outcomes clear it.
+    /// Source-scrape pins, as `run_async` needs GitHub and the real state dir.
+    #[test]
+    fn transient_install_failures_cool_the_release_down() {
+        const SRC: &str = include_str!("update.rs");
+        let code: String = SRC
+            .split_once(concat!("#[cfg(test)]\n", "mod tests {"))
+            .expect("test module not found")
+            .0
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n")
+            .split_whitespace()
+            .collect();
+        for (needle, why) in [
+            (
+                "Err(e)=>{note_transient_install_failure(latest_version,&e);returnErr(e);}",
+                "a failed asset-list fetch",
+            ),
+            (
+                "Err(e)=>note_transient_install_failure(latest_version,e),}install_result",
+                "the catch-all transient install error",
+            ),
+            (
+                "}else{note_transient_install_failure(latest_version,",
+                "a transient app-bundle failure",
+            ),
+            (
+                "clear_install_failures();super::rollback::clear_update_cooldown();",
+                "a successful install and an up-to-date node",
+            ),
+        ] {
+            assert!(
+                code.contains(needle),
+                "update.rs must handle {why} for the #5799 cooldown (`{needle}`)"
+            );
+        }
+        assert_eq!(
+            code.matches("super::rollback::clear_update_cooldown();")
+                .count(),
+            2,
+            "both the Installed outcome and the already-up-to-date exit clear the cooldown"
+        );
+        let note = SRC
+            .split_once("\nfn note_transient_install_failure(")
+            .expect("helper not found")
+            .1;
+        let note = &note[..note.find("\n}\n").expect("end of helper")];
+        assert!(
+            note.lines().any(|l| l
+                .trim()
+                .starts_with("let failures = super::rollback::record_update_cooldown(version,")),
+            "the helper must record the cooldown"
         );
     }
 

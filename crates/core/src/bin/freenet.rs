@@ -2993,6 +2993,35 @@ mod tests {
         }
     }
 
+    /// #5799: a `CoolingDown` result (the release could not be downloaded
+    /// recently) must NEVER drive an exit-42 update, and like `RateLimited`
+    /// must be its own arm so it cannot reach the max-backoff "trust the
+    /// gateway, exit 42" fallback that a `Skipped` result feeds.
+    #[test]
+    fn cooling_down_never_triggers_exit_42() {
+        let src = strip_line_comments(include_str!("freenet.rs"));
+        let needle = concat!("UpdateCheckResult::", "CoolingDown(");
+        let arms: Vec<&str> = src.split(needle).skip(1).collect();
+        assert_eq!(
+            arms.len(),
+            3,
+            "expected a CoolingDown arm in each of the 3 update-trigger priorities \
+             (urgent / stagger / legacy mismatch) (#5799)"
+        );
+        for (i, arm) in arms.iter().enumerate() {
+            let end = arm
+                .find("UpdateCheckResult::")
+                .unwrap_or(arm.len())
+                .min(400);
+            let body = &arm[..end];
+            assert!(
+                !body.contains("update_tx.send"),
+                "CoolingDown arm #{i} must NOT send an update -- exiting 42 for a \
+                 release that cannot be downloaded restarts the node in a loop (#5799)"
+            );
+        }
+    }
+
     /// Source-scrape pin for #4580: each Freenet supervisor must set the
     /// `FREENET_SUPERVISED` marker on the `freenet network` child it spawns, so
     /// the node can tell it is supervised and log calmly instead of erroring on
