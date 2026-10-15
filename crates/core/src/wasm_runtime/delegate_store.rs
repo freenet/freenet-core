@@ -1167,6 +1167,129 @@ mod test {
         Ok(())
     }
 
+    /// #5616: `registered_params` recovers exactly the parameters a delegate
+    /// was registered with, so a node-started run (contract notification,
+    /// inter-delegate hop) can run the SAME instance a client run does, and
+    /// keeps two instances of one code apart.
+    #[tokio::test]
+    async fn registered_params_returns_the_registration_params()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let delegate_dir = temp_dir.path().join("delegates");
+        let db = create_test_db(temp_dir.path()).await;
+        let mut store = DelegateStore::new(delegate_dir, 10_000, db)?;
+
+        let code: Vec<u8> = vec![7, 7, 7, 7];
+        let room_a = honest_delegate(code.clone(), b"room-a".to_vec());
+        let room_b = honest_delegate(code.clone(), b"room-b".to_vec());
+        let empty = honest_delegate(code, vec![]);
+        for delegate in [&room_a, &room_b, &empty] {
+            store.store_delegate(delegate.clone())?;
+        }
+
+        let params_of = |d: &DelegateContainer| {
+            store
+                .registered_params(d.key())
+                .map(|p| p.as_ref().to_vec())
+        };
+        assert_eq!(params_of(&room_a), Some(b"room-a".to_vec()));
+        assert_eq!(params_of(&room_b), Some(b"room-b".to_vec()));
+        assert_eq!(params_of(&empty), Some(vec![]));
+        Ok(())
+    }
+
+    /// Index-gated: a key this node never registered has no parameters, even
+    /// when a `.reg` record for it sits in the directory.
+    #[tokio::test]
+    async fn registered_params_is_index_gated() -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let delegate_dir = temp_dir.path().join("delegates");
+        let db = create_test_db(temp_dir.path()).await;
+        let store = DelegateStore::new(delegate_dir.clone(), 10_000, db)?;
+
+        let delegate = honest_delegate(vec![1, 2, 3], b"p".to_vec());
+        write_reg_file_if_missing(
+            &delegate_dir,
+            delegate.key(),
+            delegate.code_hash(),
+            &Parameters::from(b"p".to_vec()),
+        )?;
+        assert!(store.registered_params(delegate.key()).is_none());
+        Ok(())
+    }
+
+    /// No `.reg` record: the parameters are unrecoverable, UNLESS the key
+    /// itself proves they were empty.
+    #[tokio::test]
+    async fn registered_params_without_a_record_only_vouches_for_empty_params()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let delegate_dir = temp_dir.path().join("delegates");
+        let db = create_test_db(temp_dir.path()).await;
+        let mut store = DelegateStore::new(delegate_dir.clone(), 10_000, db)?;
+
+        let empty = honest_delegate(vec![4, 4], vec![]);
+        let parameterized = honest_delegate(vec![4, 4], b"room".to_vec());
+        for delegate in [&empty, &parameterized] {
+            store.store_delegate(delegate.clone())?;
+            std::fs::remove_file(
+                delegate_dir
+                    .join(delegate.key().encode())
+                    .with_extension("reg"),
+            )?;
+        }
+
+        assert_eq!(
+            store
+                .registered_params(empty.key())
+                .map(|p| p.as_ref().to_vec()),
+            Some(vec![]),
+            "a key derived from empty params proves them without a record"
+        );
+        assert!(
+            store.registered_params(parameterized.key()).is_none(),
+            "non-empty params cannot be recovered without a record, and must not \
+             be guessed as empty"
+        );
+        Ok(())
+    }
+
+    /// A record whose parameters do not derive the key, or which is corrupt,
+    /// is refused rather than used: running with it would be the #5616 bug.
+    #[tokio::test]
+    async fn registered_params_refuses_a_record_that_does_not_derive_the_key()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let delegate_dir = temp_dir.path().join("delegates");
+        let db = create_test_db(temp_dir.path()).await;
+        let mut store = DelegateStore::new(delegate_dir.clone(), 10_000, db)?;
+
+        let tampered = honest_delegate(vec![9, 9], b"real".to_vec());
+        let corrupt = honest_delegate(vec![9, 9], b"other".to_vec());
+        for delegate in [&tampered, &corrupt] {
+            store.store_delegate(delegate.clone())?;
+        }
+
+        let tampered_reg = delegate_dir
+            .join(tampered.key().encode())
+            .with_extension("reg");
+        std::fs::remove_file(&tampered_reg)?;
+        write_reg_file_if_missing(
+            &delegate_dir,
+            tampered.key(),
+            tampered.code_hash(),
+            &Parameters::from(b"fake".to_vec()),
+        )?;
+        assert!(store.registered_params(tampered.key()).is_none());
+
+        let corrupt_reg = delegate_dir
+            .join(corrupt.key().encode())
+            .with_extension("reg");
+        std::fs::write(&corrupt_reg, [REG_FILE_VERSION, 1, 2, 3])?;
+        assert!(store.registered_params(corrupt.key()).is_none());
+        Ok(())
+    }
+
     /// .reg files enable index recovery when ReDb entries are lost
     #[tokio::test]
     async fn reg_files_restore_lost_redb_entries() -> Result<(), Box<dyn std::error::Error>> {

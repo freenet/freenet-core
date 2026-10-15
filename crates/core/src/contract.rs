@@ -13170,6 +13170,198 @@ mod hol_4391_tests {
         handle.abort();
     }
 
+    /// A contract notification for `key`, as the executor's fan-out builds it.
+    fn notification_for(key: &DelegateKey) -> executor::DelegateNotification {
+        executor::DelegateNotification {
+            delegate_key: key.clone(),
+            contract_id: ContractInstanceId::new([0x16; 32]),
+            new_state: Arc::new(WrappedState::new(b"changed".to_vec())),
+        }
+    }
+
+    /// #5616: a contract-notification run enters the delegate with the
+    /// parameters it was REGISTERED with — on its first leg AND on the leg
+    /// that resumes after it parks — rather than empty ones.
+    ///
+    /// Nothing downstream would catch empty params: the store resolves the
+    /// code through its index and attaches whatever params the request
+    /// carries, so a parameterized delegate silently ran as a different
+    /// instance of itself. The resume leg rides `Continuation::params`, which
+    /// is taken from this run's request, so it is asserted too.
+    ///
+    /// FALSIFY by restoring `params: Parameters::from(vec![])` in
+    /// `handle_delegate_notification`: both observations become empty.
+    #[tokio::test]
+    async fn a_notification_run_gets_the_registered_params_on_both_legs_5616() {
+        let _guard = TEST_GUARD.lock().await;
+        let (mut handler, _send) = build_handler(vec![]).await;
+        let rt = handler.runtime_mut();
+        let observations = rt.delegate_observations.clone();
+        let key = DelegateKey::new(
+            [0x56; 32],
+            freenet_stdlib::prelude::CodeHash::new([0x16; 32]),
+        );
+        rt.registered_params
+            .lock()
+            .unwrap()
+            .insert(key.clone(), Some(b"room-7".to_vec()));
+        // First leg parks on a prompt; the resumed leg finishes.
+        let script = rt.delegate_script.clone();
+        script.lock().unwrap().push_back(prompt_outbound().into());
+        script.lock().unwrap().push_back(Vec::new().into());
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut park = delegate_park::DelegateParkCtx::new(tx);
+        let prompter = Arc::new(crate::contract::user_input::AutoApprovePrompter);
+
+        handle_delegate_notification(
+            &mut handler,
+            notification_for(&key),
+            &prompter,
+            Some(&mut park),
+        )
+        .await;
+        assert!(park.is_parked(&key), "the first leg must park");
+        let resume = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("the off-loop task must deliver a resume")
+            .expect("resume channel open");
+        handle_delegate_resume(&mut handler, &mut park, &prompter, resume).await;
+
+        let seen = observations.lock().unwrap().clone();
+        assert_eq!(seen.len(), 2, "two legs, got {seen:?}");
+        assert_eq!(seen[0].inbound_kinds, vec!["ContractNotification"]);
+        assert_eq!(seen[1].inbound_kinds, vec!["UserResponse"]);
+        for (leg, obs) in ["first", "resumed"].iter().zip(&seen) {
+            assert_eq!(
+                obs.params,
+                b"room-7".to_vec(),
+                "the {leg} leg of a notification run must get the delegate's \
+                 registered params (#5616)"
+            );
+        }
+    }
+
+    /// #5616: a notification for a delegate whose parameters this node cannot
+    /// establish is NOT run — rather than run with empty ones, which is a
+    /// different delegate instance.
+    ///
+    /// FALSIFY by falling back to empty params on `None`: the delegate is
+    /// entered once with `[]`.
+    #[tokio::test]
+    async fn a_notification_is_not_run_without_provable_params_5616() {
+        let _guard = TEST_GUARD.lock().await;
+        let (mut handler, _send) = build_handler(vec![]).await;
+        let rt = handler.runtime_mut();
+        let observations = rt.delegate_observations.clone();
+        let script = rt.delegate_script.clone();
+        script.lock().unwrap().push_back(Vec::new().into());
+        let key = DelegateKey::new(
+            [0x57; 32],
+            freenet_stdlib::prelude::CodeHash::new([0x16; 32]),
+        );
+        rt.registered_params
+            .lock()
+            .unwrap()
+            .insert(key.clone(), None);
+
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut park = delegate_park::DelegateParkCtx::new(tx);
+        let prompter = Arc::new(crate::contract::user_input::AutoApprovePrompter);
+        handle_delegate_notification(
+            &mut handler,
+            notification_for(&key),
+            &prompter,
+            Some(&mut park),
+        )
+        .await;
+
+        assert!(
+            observations.lock().unwrap().is_empty(),
+            "the delegate must not be entered without provable params (#5616)"
+        );
+        assert_eq!(
+            script.lock().unwrap().len(),
+            1,
+            "no run consumed the script"
+        );
+    }
+
+    /// #5616, second door: an inter-delegate message enters the TARGET with
+    /// the target's own registered params, and is dropped when the node cannot
+    /// establish them. It used to pass empty params, under a comment claiming
+    /// params were not stored anywhere (they are, in the `.reg` record).
+    ///
+    /// FALSIFY by restoring `params: Parameters::from(Vec::new())` on the
+    /// hop: B is entered with `[]`.
+    #[tokio::test]
+    async fn an_inter_delegate_message_runs_the_target_with_its_registered_params_5616() {
+        for (target_params, expect_entered) in
+            [(Some(b"target-params".to_vec()), true), (None, false)]
+        {
+            let _guard = TEST_GUARD.lock().await;
+            let (mut handler, send) = build_handler(vec![]).await;
+            let rt = handler.runtime_mut();
+            let observations = rt.delegate_observations.clone();
+            let key_a =
+                DelegateKey::new([0x58; 32], freenet_stdlib::prelude::CodeHash::new([8; 32]));
+            let key_b =
+                DelegateKey::new([0x59; 32], freenet_stdlib::prelude::CodeHash::new([9; 32]));
+            rt.registered_params
+                .lock()
+                .unwrap()
+                .insert(key_b.clone(), target_params.clone());
+            // A (client-driven) messages B; B's run, if delivered, is empty.
+            let script = rt.delegate_script.clone();
+            script.lock().unwrap().push_back(
+                vec![OutboundDelegateMsg::SendDelegateMessage(
+                    freenet_stdlib::prelude::DelegateMessage::new(
+                        key_b.clone(),
+                        key_a.clone(),
+                        b"ping".to_vec(),
+                    ),
+                )]
+                .into(),
+            );
+            script.lock().unwrap().push_back(Vec::new().into());
+
+            let handle = GlobalExecutor::spawn(contract_handling(
+                handler,
+                crate::contract::user_input::AutoApprovePrompter,
+            ));
+            let resp = tokio::time::timeout(
+                Duration::from_secs(5),
+                send.send_to_handler(delegate_event(&key_a)),
+            )
+            .await
+            .expect("A's request must complete");
+            assert!(resp.is_ok(), "A's client must be answered, got {resp:?}");
+            handle.abort();
+
+            let entered_b: Vec<_> = observations
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|o| o.delegate_key == key_b)
+                .cloned()
+                .collect();
+            if expect_entered {
+                assert_eq!(entered_b.len(), 1, "the hop must reach B once");
+                assert_eq!(
+                    entered_b[0].params,
+                    b"target-params".to_vec(),
+                    "the hop must run B with B's registered params (#5616)"
+                );
+            } else {
+                assert!(
+                    entered_b.is_empty(),
+                    "B must not be entered without provable params (#5616), got \
+                     {entered_b:?}"
+                );
+            }
+        }
+    }
+
     /// A continuation standing in for a delegate parked on a prompt.
     fn parked_continuation() -> delegate_park::Continuation {
         delegate_park::Continuation {
