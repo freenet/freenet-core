@@ -4642,14 +4642,28 @@ mod tests {
     ///    request at once while nothing bounds the warm refreshes that follow.
     #[tokio::test]
     async fn refresh_lock_table_is_bounded_prunes_safely_and_overflows_per_contract() {
+        // Simulate sibling tests of the same process that hold table entries
+        // (`refresh_cache_if_due` holds one for the length of a refresh). More
+        // than REFRESH_LOCK_OVERFLOW_STRIPES of them guarantees (pigeonhole)
+        // that two of this test's ids land on one overflow stripe.
+        let siblings: Vec<_> = (0..(REFRESH_LOCK_OVERFLOW_STRIPES + 6))
+            .map(|i| {
+                let mut bytes = [0u8; 32];
+                bytes[0] = 0x41;
+                bytes[1..9].copy_from_slice(&(i as u64).to_be_bytes());
+                let id = ContractInstanceId::new(bytes);
+                (id, refresh_lock_for(&id))
+            })
+            .collect();
         let mut bytes = [0u8; 32];
         bytes[0] = 0x3c;
         let held_id = ContractInstanceId::new(bytes);
-        let guard = acquire_refresh_lock(&held_id).await;
-        let held_lock = CONTRACT_REFRESH_LOCKS
-            .get(&held_id)
-            .map(|entry| entry.clone())
-            .expect("the held lock must be in the table");
+        // Held as an `Arc` clone, not a locked guard: see the fill loop below.
+        let held_lock = refresh_lock_for(&held_id);
+        assert!(
+            CONTRACT_REFRESH_LOCKS.contains_key(&held_id),
+            "the held lock must be in the table"
+        );
 
         let sprayed: Vec<_> = (0..(MAX_REFRESH_LOCKS + 64))
             .map(|i| {
@@ -4679,16 +4693,38 @@ mod tests {
              it — a replacement lets two refreshers for one contract run at once"
         );
 
-        // Now fill the table with locks that are HELD, so the prune can reclaim
-        // nothing and a newcomer has to take the overflow path.
+        // Now fill the table with locks that are HELD (an `Arc` clone keeps
+        // `strong_count > 1`, which is all the prune looks at), so the prune
+        // can reclaim nothing and a newcomer has to take the overflow path.
+        //
+        // The mutexes are deliberately NOT locked. Once sibling tests hold
+        // entries, some of this loop's ids would be handed an overflow stripe,
+        // and two of them can share one; awaiting a tokio mutex this task
+        // already holds is a self-deadlock production never reaches (one lock
+        // per task). Fill until a new id is refused admission (the prune
+        // has nothing left to reclaim) rather than for a fixed count, so the
+        // number of siblings and leftover entries does not matter.
         let mut held = Vec::with_capacity(MAX_REFRESH_LOCKS);
         let mut held_ids = Vec::with_capacity(MAX_REFRESH_LOCKS);
-        for i in 0..MAX_REFRESH_LOCKS {
+        let mut i = 0u64;
+        loop {
+            assert!(
+                i <= 2 * MAX_REFRESH_LOCKS as u64,
+                "the refresh-lock table never filled; is something removing entries?"
+            );
             let mut bytes = [0u8; 32];
             bytes[0] = 0x3f;
-            bytes[1..9].copy_from_slice(&(i as u64).to_be_bytes());
+            bytes[1..9].copy_from_slice(&i.to_be_bytes());
             let id = ContractInstanceId::new(bytes);
-            held.push(acquire_refresh_lock(&id).await);
+            i += 1;
+            let lock = refresh_lock_for(&id);
+            if !CONTRACT_REFRESH_LOCKS.contains_key(&id) {
+                // Not admitted: the prune found nothing left to reclaim, so
+                // the table is full of held entries (`lock` is an overflow
+                // stripe and is dropped).
+                break;
+            }
+            held.push(lock);
             held_ids.push(id);
         }
 
@@ -4712,7 +4748,7 @@ mod tests {
             "the full-table path must hand out the contract's overflow stripe"
         );
 
-        drop(guard);
+        drop(held_lock);
         drop(held);
 
         // `CONTRACT_REFRESH_LOCKS` is process-global and `cargo test` runs these
@@ -4720,6 +4756,9 @@ mod tests {
         // push a sibling test's `acquire_refresh_lock` toward the overflow
         // stripes and change what it measures. Nextest would never show it (one
         // process per test) — see `.claude/rules/testing.md`.
+        for (id, _) in &siblings {
+            CONTRACT_REFRESH_LOCKS.remove(id);
+        }
         for id in sprayed.iter().chain(held_ids.iter()) {
             CONTRACT_REFRESH_LOCKS.remove(id);
         }
