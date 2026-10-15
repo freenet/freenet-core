@@ -371,8 +371,12 @@ async fn a_notification_run_sees_the_same_params_as_a_client_run() {
     const PARAMS: &[u8] = b"room-5616";
     let node = Node::start("notification-params-wasm-e2e").await;
 
-    let code = crate::wasm_runtime::tests::get_test_module("test_delegate_echo_params")
-        .expect("build the fixture delegate");
+    let code = tokio::task::spawn_blocking(|| {
+        crate::wasm_runtime::tests::get_test_module("test_delegate_echo_params")
+            .expect("build the fixture delegate")
+    })
+    .await
+    .expect("join fixture build");
     let delegate = DelegateContainer::Wasm(DelegateWasmAPIVersion::V1(Delegate::from((
         &code.into(),
         &PARAMS.to_vec().into(),

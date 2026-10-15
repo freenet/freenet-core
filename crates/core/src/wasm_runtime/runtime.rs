@@ -1009,7 +1009,7 @@ impl Runtime {
     pub(crate) fn registered_delegate_params(
         &self,
         key: &DelegateKey,
-    ) -> Option<Parameters<'static>> {
+    ) -> Result<Parameters<'static>, super::ParamsUnavailable> {
         self.delegate_store.registered_params(key)
     }
 

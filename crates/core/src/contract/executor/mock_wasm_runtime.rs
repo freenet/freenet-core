@@ -126,7 +126,7 @@ pub(crate) struct MockWasmRuntime {
     pub(crate) delegate_codes: HashMap<DelegateKey, Vec<u8>>,
     /// What `ContractExecutor::registered_delegate_params` answers per key:
     /// `Some(params)` for a delegate registered with those parameters, `None`
-    /// for one whose parameters this "node" cannot vouch for. A key with no
+    /// for one whose parameters this "node" cannot establish (`NoRecord`). A key with no
     /// entry answers empty parameters, unless it is in
     /// `unregistered_delegates` — i.e. the mock otherwise models every
     /// delegate as registered with empty parameters, as before #5616.
@@ -489,9 +489,16 @@ impl ContractExecutor for Executor<MockWasmRuntime, MockStateStorage> {
         self.runtime.delegate_codes.get(key).cloned()
     }
 
-    fn registered_delegate_params(&self, key: &DelegateKey) -> Option<Parameters<'static>> {
+    fn registered_delegate_params(
+        &self,
+        key: &DelegateKey,
+    ) -> Result<Parameters<'static>, crate::wasm_runtime::ParamsUnavailable> {
+        use crate::wasm_runtime::ParamsUnavailable;
         if let Some(entry) = self.runtime.registered_params.lock().unwrap().get(key) {
-            return entry.clone().map(Parameters::from);
+            return entry
+                .clone()
+                .map(Parameters::from)
+                .ok_or(ParamsUnavailable::NoRecord);
         }
         if self
             .runtime
@@ -500,9 +507,9 @@ impl ContractExecutor for Executor<MockWasmRuntime, MockStateStorage> {
             .unwrap()
             .contains(key)
         {
-            return None;
+            return Err(ParamsUnavailable::NotRegistered);
         }
-        Some(Parameters::from(Vec::<u8>::new()))
+        Ok(Parameters::from(Vec::<u8>::new()))
     }
 
     fn op_manager_handle(&self) -> Option<std::sync::Arc<crate::node::OpManager>> {

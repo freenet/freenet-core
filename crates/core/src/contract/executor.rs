@@ -1161,15 +1161,18 @@ pub(crate) trait ContractExecutor: Send + 'static {
 
     /// The parameters `key` was registered with on this node, for a run the
     /// NODE starts and so has no caller to supply them (a contract
-    /// notification, an inter-delegate hop). `None` means this node cannot
-    /// vouch for them, and the caller must not run the delegate: running with
+    /// notification, an inter-delegate hop). An error means this node cannot
+    /// establish them, and the caller must not run the delegate: running with
     /// empty parameters instead is #5616. See
     /// [`crate::wasm_runtime::registered_params`].
     ///
-    /// `None` by default, for executors with no delegate store; none of them
-    /// produce contract notifications.
-    fn registered_delegate_params(&self, _key: &DelegateKey) -> Option<Parameters<'static>> {
-        None
+    /// `NoStore` by default, for executors with no delegate store. None of
+    /// them is driven by `contract_handling`, the only caller.
+    fn registered_delegate_params(
+        &self,
+        _key: &DelegateKey,
+    ) -> Result<Parameters<'static>, crate::wasm_runtime::ParamsUnavailable> {
+        Err(crate::wasm_runtime::ParamsUnavailable::NoStore)
     }
 
     /// The node's durable store, for mirroring delegate subscriptions to disk
@@ -2600,8 +2603,9 @@ mod tests {
             ),
             (
                 "MAX_STORED_PARAMS_BYTES",
-                "per-delegate cap on the parameters kept for lifecycle runs, a \
-                 size limit on one entry rather than a cache budget. Stored in \
+                "per-delegate cap on the parameters kept for lifecycle runs \
+                 and read for node-started runs (#5616), a size limit on one \
+                 entry rather than a cache budget. Stored in \
                  redb in the default build; the non-redb in-memory store can \
                  hold MAX_CAPABILITY_RECORDS of them",
             ),

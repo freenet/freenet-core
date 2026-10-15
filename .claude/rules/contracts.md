@@ -83,6 +83,15 @@ refresh_capability_manifests re-reads manifests from stored code (older nodes
 stored them without `wakeups`). A parked unprompted run is charged for its
 resumed legs too (handle_delegate_resume, #5748).
 
+Parameters of node-started runs (#5616): a run the NODE starts has no caller
+to supply the delegate's parameters, and a delegate key is
+`BLAKE3(code_hash ‖ params)`, so running with any others runs a different
+instance. Lifecycle and wake-up runs take them from the capability record;
+contract notifications and inter-delegate hops take them from
+`registered_delegate_params` (the store's `.reg` record, key-verified). NEVER
+pass `Parameters::from(vec![])` for a node-started run; if the parameters
+cannot be established, do not run it (log the reason).
+
 Consent: wake-ups ride the existing Background grant (decided with the work's
 brief: "gate on the #5730 Background grant"); an app granted under the older
 card text gets periodic runs without a new prompt. Revoking stops them at the

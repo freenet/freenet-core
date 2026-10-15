@@ -31,7 +31,8 @@ pub(crate) use contract::{
 pub use contract_store::{ContractStore, SharedCodeCache, SharedContractIndex};
 pub(crate) use delegate::DelegateRuntimeInterface;
 pub use delegate_store::{
-    DelegateStore, SharedDelegateCodeCache, SharedDelegateIndex, registered_params,
+    DelegateStore, ParamsUnavailable, SharedDelegateCodeCache, SharedDelegateIndex,
+    registered_params,
 };
 
 /// The per-node store state every pool executor's `ContractStore` and
