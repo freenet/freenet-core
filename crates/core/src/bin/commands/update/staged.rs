@@ -1997,7 +1997,7 @@ mod tests {
     /// marker and the panic containment must be in it, not just exist.
     #[test]
     fn entry_point_logs_the_canary_marker_and_contains_panics() {
-        let src = include_str!("staged.rs");
+        let src = include_str!("staged.rs").replace("\r\n", "\n");
         let production = src
             .split_once(concat!("#[cfg(test)]\n", "mod tests {"))
             .expect("test module not found")
@@ -2178,7 +2178,7 @@ mod tests {
     /// it: binding it to `_` would release it at once.
     #[test]
     fn stage_into_holds_the_lock_while_downloading() {
-        let src = include_str!("staged.rs");
+        let src = include_str!("staged.rs").replace("\r\n", "\n");
         let production = src
             .split_once(concat!("#[cfg(test)]\n", "mod tests {"))
             .unwrap()
@@ -2688,7 +2688,7 @@ mod tests {
     /// Cross-file, so these needles cannot match their own literals.
     #[test]
     fn installer_installs_from_and_cleans_up_the_cache() {
-        let src = include_str!("../update.rs");
+        let src = include_str!("../update.rs").replace("\r\n", "\n");
         let production = src
             .split_once("\n#[cfg(test)]\nmod tests {")
             .expect("update.rs test module not found")

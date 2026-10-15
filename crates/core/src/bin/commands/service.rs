@@ -4379,16 +4379,27 @@ echo "RC=$?"
 
     /// #5799: `freenet update`'s output reaches the wrapper log. It used to go
     /// to null, so a failed auto-update left no reason in the wrapper log or
-    /// in `freenet service report`.
+    /// in `freenet service report`. Runs a real child on every platform,
+    /// including the Windows job, which is where the wrapper runs.
     #[test]
-    #[cfg(unix)]
     fn update_output_is_appended_to_the_wrapper_log() {
         let tmp = tempfile::tempdir().unwrap();
         let log_dir = tmp.path();
         wrapper::log_wrapper_event(log_dir, "Update needed, running freenet update...");
         let (stdout, stderr) = wrapper::update_output_stdio(log_dir);
-        let status = std::process::Command::new("sh")
-            .args(["-c", "echo updater-stdout; echo updater-stderr >&2; exit 1"])
+        let mut child = if cfg!(windows) {
+            let mut cmd = std::process::Command::new("cmd");
+            cmd.args([
+                "/C",
+                "echo updater-stdout& echo updater-stderr 1>&2& exit /B 1",
+            ]);
+            cmd
+        } else {
+            let mut cmd = std::process::Command::new("sh");
+            cmd.args(["-c", "echo updater-stdout; echo updater-stderr >&2; exit 1"]);
+            cmd
+        };
+        let status = child
             .stdin(std::process::Stdio::null())
             .stdout(stdout)
             .stderr(stderr)
@@ -4411,6 +4422,33 @@ echo "RC=$?"
             logs.find("Update needed").unwrap() < logs.find("updater-stderr").unwrap(),
             "{logs}"
         );
+    }
+
+    /// When the wrapper log cannot be opened, the updater's output goes to
+    /// null rather than to an inherited handle, and the child still starts
+    /// (#3933 / #3934: an inherited invalid handle is what stopped it).
+    #[test]
+    fn update_output_falls_back_to_null_when_the_log_cannot_be_opened() {
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = tmp.path().join("no-such-dir");
+        let (stdout, stderr) = wrapper::update_output_stdio(&missing);
+        let mut child = if cfg!(windows) {
+            let mut cmd = std::process::Command::new("cmd");
+            cmd.args(["/C", "echo dropped& echo dropped 1>&2"]);
+            cmd
+        } else {
+            let mut cmd = std::process::Command::new("sh");
+            cmd.args(["-c", "echo dropped; echo dropped >&2"]);
+            cmd
+        };
+        let status = child
+            .stdin(std::process::Stdio::null())
+            .stdout(stdout)
+            .stderr(stderr)
+            .status()
+            .expect("the child must start with the null fallback");
+        assert!(status.success());
+        assert!(!missing.exists(), "nothing may be created in its place");
     }
 
     /// #4073 crash-loop auto-rollback (cross-platform source-scrape pins).

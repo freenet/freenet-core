@@ -941,7 +941,8 @@ mod tests {
     /// behind such proxies with `UnknownIssuer` and those tests stay green.
     #[test]
     fn upload_client_is_built_with_os_root_certificates() {
-        let src = include_str!("report.rs");
+        // CRLF-normalised for a Windows checkout, so the `\n` anchors match.
+        let src = &include_str!("report.rs").replace("\r\n", "\n");
         // Production hands the upload a fresh builder (tests pass one that
         // ignores proxy settings)...
         let entry = item_code(src, "    async fn upload_report(", "\n    }\n");

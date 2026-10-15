@@ -3054,7 +3054,7 @@ mod tests {
         // explaining why the call was removed legitimately mentions
         // the function by name. Strip line comments first so a comment
         // using the call-syntax form in example code would not trip us.
-        let src = include_str!("auto_update.rs");
+        let src = include_str!("auto_update.rs").replace("\r\n", "\n"); // CRLF on Windows
         let (_, after_fn_start) = src
             .split_once("pub async fn check_if_update_available(")
             .expect("check_if_update_available definition not found");
@@ -3570,8 +3570,10 @@ mod tests {
         // CRLF) would otherwise skip the check entirely and leave every pin
         // silently unguarded — a fail-OPEN inside the guard whose whole purpose
         // is to stop things failing open. Refuse rather than verify nothing.
+        // Both line endings: a Windows checkout has CRLF.
         let tests_at = src
             .find("\n#[cfg(test)]\nmod ")
+            .or_else(|| src.find("\n#[cfg(test)]\r\nmod "))
             .map(|i| i + 1)
             .expect("test module not located — this guard cannot verify anything");
         assert!(
@@ -3586,9 +3588,12 @@ mod tests {
              the end of the enclosing impl instead"
         );
         let after = &src[at + signature.len()..];
-        let (body, _) = after
-            .split_once("\n}\n")
+        let end = [after.find("\n}\n"), after.find("\n}\r\n")]
+            .into_iter()
+            .flatten()
+            .min()
             .unwrap_or_else(|| panic!("could not locate end of: {signature}"));
+        let body = &after[..end];
         // Vacuity detector: a correctly-bounded function body can never contain
         // the test-module attribute. If it does, the `\n}\n` search ran past the
         // function and this pin is measuring the whole file.
@@ -3597,7 +3602,7 @@ mod tests {
             // on a doc comment inside the scraped body that merely mentions
             // `#[cfg(test)]` — the same naive-substring mistake, from the other
             // direction, and the one that actually bit this file.
-            !body.contains("\n#[cfg(test)]\nmod "),
+            !body.contains("\n#[cfg(test)]\nmod ") && !body.contains("\n#[cfg(test)]\r\nmod "),
             "scoped region for `{signature}` escaped into the test module — this \
              pin would pass vacuously"
         );
