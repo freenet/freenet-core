@@ -5828,6 +5828,79 @@ mod bootstrap_subscription_tests {
         );
     }
 
+    /// A provisional node that forwards a downstream's subscribe, answered by
+    /// a ring upstream (which registers it as its downstream), has its lease
+    /// repaired by that host-formation.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn forwarded_subscribe_answered_over_the_ring_repairs_the_lease() {
+        let gateway_addr: std::net::SocketAddr = "127.0.0.1:31000".parse().unwrap();
+        let gateway = PeerKeyLocation::new(
+            crate::transport::TransportKeypair::new().public().clone(),
+            gateway_addr,
+        );
+        let (op_manager, rx, _guards, store) =
+            op_manager_with_gateway("sub-bootstrap-forward-repairs", gateway).await;
+        let instance_id = ContractInstanceId::new([75u8; 32]);
+        let key = contract(instance_id);
+        let downstream: std::net::SocketAddr = "127.0.0.1:31001".parse().unwrap();
+        let upstream: std::net::SocketAddr = "127.0.0.1:31002".parse().unwrap();
+        let forwarded_to = Arc::new(Mutex::new(Vec::new()));
+        let record = forwarded_to.clone();
+        serve_attempts(
+            op_manager.clone(),
+            rx,
+            crate::message::TransactionType::Subscribe,
+            move |_, msg, target| {
+                let NetMessage::V1(NetMessageV1::Subscribe(SubscribeMsg::Request { .. })) = msg
+                else {
+                    return Step {
+                        hop: None,
+                        answer: Answer::DropWaiter,
+                    };
+                };
+                let target = target.expect("requests carry a target");
+                if target != gateway_addr {
+                    // Only a ring answer brings the body, so the hop below
+                    // forwards instead of answering from a local copy.
+                    record.lock().push(target);
+                    store_contract(&store, key);
+                }
+                Step {
+                    hop: None,
+                    answer: Answer::Reply(subscribed(msg, key)),
+                }
+            },
+        );
+        op_manager
+            .ring
+            .add_client_subscription(&instance_id, crate::client_events::ClientId::next());
+        subscribe(&op_manager, instance_id, false).await;
+        assert!(op_manager.ring.is_subscription_provisional(&key));
+
+        assert_eq!(add_ring_peer(&op_manager, 31001), downstream);
+        assert_eq!(add_ring_peer(&op_manager, 31002), upstream);
+        let _result = drive_relay_subscribe(
+            &op_manager,
+            Transaction::new::<SubscribeMsg>(),
+            instance_id,
+            3,
+            VisitedPeers::new(&Transaction::new::<SubscribeMsg>()),
+            false,
+            downstream,
+        )
+        .await;
+        assert_eq!(
+            forwarded_to.lock().clone(),
+            vec![upstream],
+            "the hop forwards the downstream's subscribe over the ring"
+        );
+        assert!(op_manager.ring.has_downstream_subscribers(&key));
+        assert!(
+            !op_manager.ring.is_subscription_provisional(&key),
+            "a ring upstream answering a forwarded subscribe repairs the lease"
+        );
+    }
+
     /// An already-provisional lease whose ring renewal is answered by a peer
     /// that then drops before finalization is not repaired: it keeps its mark.
     #[tokio::test(flavor = "current_thread", start_paused = true)]

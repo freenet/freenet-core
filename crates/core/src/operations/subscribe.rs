@@ -918,6 +918,20 @@ pub(super) async fn finalize_host_subscribe(
     )
     .await;
     op_manager.ring.subscribe(key);
+    // A ring upstream answered this forwarded subscribe and, while still
+    // connected, has registered us as its downstream: a genuine repair of a
+    // provisional lease (#2524), on the same condition as the originator's
+    // in `finalize_originator_subscribe`. A local hit (`upstream_peer` None)
+    // repairs nothing.
+    if upstream_peer.as_ref().is_some_and(|peer| {
+        op_manager
+            .ring
+            .connection_manager
+            .get_peer_by_pub_key(&peer.0)
+            .is_some()
+    }) {
+        op_manager.ring.set_subscription_provisional(&key, false);
+    }
     // Register the RESPONDER as our UPSTREAM interest (review Fix D), mirroring
     // `finalize_originator_subscribe`'s step 1. Without this the relay is an
     // incomplete host: `send_unsubscribe_upstream` would find no upstream peer if
