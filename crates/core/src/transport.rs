@@ -351,6 +351,11 @@ pub enum TransportError {
         "Version incompatibility with gateway\n  Your client version: {actual}\n  Gateway version: {expected}\n  \n  To fix this, update your Freenet client:\n    cargo install --force freenet --version {expected}\n  \n  Or if building from source:\n    git pull && cargo install --path crates/core"
     )]
     ProtocolVersionMismatch { expected: String, actual: String },
+    /// A UDP `send_to` to this address failed with this error kind. On an
+    /// established connection it is transient: one packet failed and the
+    /// connection survives (see [`Self::is_transient_send_failure`]). When
+    /// a handshake returns it, it is fatal: the connection attempt is over
+    /// (#5871).
     #[error("send to {0} failed: {1}")]
     SendFailed(SocketAddr, std::io::ErrorKind),
     #[error("outbound stream to {0} failed (stream-scoped, connection survives)")]

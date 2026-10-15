@@ -843,9 +843,10 @@ impl<S, T: TimeSource> ConnectionStateManager<S, T> {
     /// per-handshake consumer cannot stall the listener for other peers.
     /// Dropped intro packets are recoverable — `connect_outbound_inner`
     /// retries up to `NAT_TRAVERSAL_MAX_ATTEMPTS` (40 in release builds,
-    /// 10 under `cfg(test)`) at a 200 ms cadence, capped by the 3 s
+    /// 10 under `cfg(test)`) at a ~250 ms cadence (a 200 ms receive wait
+    /// plus the 50 ms `INITIAL_INTERVAL` sleep), capped by the 3 s
     /// `overall_deadline`. So at production settings the remote peer
-    /// fires roughly 15 intro packets during the deadline window — a
+    /// fires roughly 12 intro packets during the deadline window — a
     /// transient channel-full event degrades latency but does not break
     /// the handshake.
     fn try_send_nat_traversal(
@@ -2257,6 +2258,10 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                                 remote_protoc_version,
                                 ack_version_floor,
                             )?;
+                            // Bookkeeping hygiene only: this tracker is not
+                            // consumed after RemoteInbound (a successful
+                            // completion builds a fresh one), so skipping an
+                            // unsent packet changes no accounting.
                             if send_failures.record(
                                 socket.send_to(our_inbound.data(), remote_addr).await,
                                 remote_addr,
@@ -4601,7 +4606,7 @@ pub mod mock_transport {
         assert_eq!(peer_b_conn.remote_addr(), gw_addr);
 
         // The connection should have completed quickly (within the first attempt window)
-        // If the bug exists, this would take multiple retries (16+ attempts at 200ms each = 3+ seconds)
+        // If the bug exists, this would take multiple retries (~12 attempts at ~250ms each = 3 seconds)
         assert!(
             elapsed < Duration::from_secs(2),
             "Connection took {:?}, which suggests multiple retry attempts were needed. \
@@ -5674,6 +5679,7 @@ pub mod mock_transport {
     /// attempt ends at once, with the send error rather than `ChannelClosed`.
     #[tokio::test]
     async fn joiner_ack_send_failure_reports_send_error() -> anyhow::Result<()> {
+        let (logs, guard) = crate::util::test_log_capture::install();
         let channels: Channels = Arc::new(DashMap::new());
         let (gw_pub, (_gw_handler, _gw_conns), gw_addr) =
             create_mock_gateway(Default::default(), channels.clone()).await?;
@@ -5695,6 +5701,24 @@ pub mod mock_transport {
             "expected SendFailed({gw_addr}, NetworkUnreachable), got {err:?}"
         );
         assert_eq!(failures.load(Ordering::SeqCst), 1);
+
+        // Outbound failures are ours to fix, so they log at WARN (inbound
+        // ones, which a spoofed intro can trigger, log at INFO).
+        let os_error = format!("os error {}", enetunreach().raw_os_error().unwrap());
+        let line = wait_for_log(&logs, |l| {
+            l.starts_with("WARN")
+                && l.contains("direction=\"outbound\"")
+                && l.contains(&os_error)
+                && l.contains(&format!("peer_addr={gw_addr}"))
+        })
+        .await;
+        drop(guard);
+        assert!(
+            line.is_some(),
+            "a WARN naming the outbound direction, OS error and gateway must be logged; \
+             captured: {:?}",
+            logs.lock().unwrap()
+        );
         Ok(())
     }
 
