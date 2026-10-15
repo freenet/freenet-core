@@ -10,6 +10,10 @@
 //! its own module, armed, and re-entered with a `WakeupFired` it decodes, all
 //! through the code a node actually runs. This does.
 //!
+//! The same harness also drives the other run the node starts on its own, a
+//! contract notification, against `tests/test-delegate-echo-params` (#5616):
+//! see [`a_notification_run_sees_the_same_params_as_a_client_run`].
+//!
 //! Time: the capability clock is real time plus an offset the test advances,
 //! not a paused tokio clock. A paused clock auto-advances while a WASM call
 //! waits on `spawn_blocking`, which fires the call's wall-clock backstop and
@@ -346,4 +350,136 @@ async fn a_real_delegate_is_woken_with_no_client_connected() {
         node.nudge().await;
     }
     assert_eq!(delivered(), 2, "no wake-up after revocation");
+}
+
+/// #5616, end to end on the same production handler and pool: a REAL
+/// parameterized delegate, driven once by a client request and once by a
+/// contract notification, must see the SAME parameters both times.
+///
+/// The client supplies the parameters itself; the notification run is
+/// started by the node, which used to hand the delegate EMPTY ones — nothing
+/// errored and nothing logged, the delegate simply ran as a different
+/// instance of itself. The notification leg is the real one: a contract PUT
+/// through the handler, fanned out by the pool to the subscribed delegate,
+/// run by the loop. The fixture records the parameters of its notification
+/// run in its secrets, since that run has no client to answer.
+///
+/// FALSIFY by restoring `params: Parameters::from(vec![])` in
+/// `handle_delegate_notification`: the notified parameters come back empty.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_notification_run_sees_the_same_params_as_a_client_run() {
+    const PARAMS: &[u8] = b"room-5616";
+    let node = Node::start("notification-params-wasm-e2e").await;
+
+    let code = crate::wasm_runtime::tests::get_test_module("test_delegate_echo_params")
+        .expect("build the fixture delegate");
+    let delegate = DelegateContainer::Wasm(DelegateWasmAPIVersion::V1(Delegate::from((
+        &code.into(),
+        &PARAMS.to_vec().into(),
+    ))));
+    let key = delegate.key().clone();
+    node.request(ContractHandlerEvent::DelegateRequest {
+        req: DelegateRequest::RegisterDelegate {
+            delegate,
+            cipher: [0u8; 32],
+            nonce: [0u8; 24],
+        },
+        origin_contract: None,
+        connection_scope: crate::client_events::ConnectionScope::Local,
+        user_context: None,
+    })
+    .await;
+
+    #[allow(clippy::wildcard_enum_match_arm)]
+    let report = || async {
+        let outbound = node
+            .request(ContractHandlerEvent::DelegateRequest {
+                req: DelegateRequest::ApplicationMessages {
+                    key: key.clone(),
+                    params: Parameters::from(PARAMS.to_vec()),
+                    inbound: vec![InboundDelegateMsg::ApplicationMessage(
+                        ApplicationMessage::new(b"params?".to_vec()),
+                    )],
+                },
+                origin_contract: None,
+                connection_scope: crate::client_events::ConnectionScope::Local,
+                user_context: None,
+            })
+            .await;
+        let payload = outbound
+            .into_iter()
+            .find_map(|m| match m {
+                OutboundDelegateMsg::ApplicationMessage(m) => Some(m.payload),
+                _ => None,
+            })
+            .expect("the fixture answers `params?`");
+        String::from_utf8(payload).expect("the fixture answers in UTF-8")
+    };
+
+    // Client leg, before any notification.
+    assert_eq!(report().await, "client:room-5616|notified:none");
+
+    // Notification leg: subscribe the delegate to a contract, then change
+    // the contract's state through the handler. Distinct contract params so
+    // the process-global subscription registry cannot collide with another
+    // test's (see `delegate_notification_wasm_tests::params`).
+    let contract = tokio::task::spawn_blocking(|| {
+        crate::test_utils::load_contract(
+            "test-contract-mock-aligned",
+            Parameters::from(b"5616".to_vec()),
+        )
+    })
+    .await
+    .expect("join contract compile")
+    .expect("compile contract");
+    let contract_id = *contract.key().id();
+    crate::wasm_runtime::delegate_subscriptions::subscribe(
+        contract_id,
+        &key,
+        crate::wasm_runtime::delegate_subscriptions::Durability::InMemoryOnly,
+    );
+    struct Unsubscribe(ContractInstanceId, DelegateKey);
+    impl Drop for Unsubscribe {
+        fn drop(&mut self) {
+            crate::wasm_runtime::delegate_subscriptions::unsubscribe(
+                &self.0,
+                &self.1,
+                crate::wasm_runtime::delegate_subscriptions::Durability::InMemoryOnly,
+            );
+        }
+    }
+    let _unsubscribe = Unsubscribe(contract_id, key.clone());
+
+    #[allow(clippy::wildcard_enum_match_arm)]
+    match node
+        .send
+        .send_to_handler(ContractHandlerEvent::PutQuery {
+            key: contract.key(),
+            state: WrappedState::new(b"changed".to_vec()),
+            related_contracts: RelatedContracts::default(),
+            contract: Some(contract.clone()),
+        })
+        .await
+        .expect("handler reply")
+    {
+        ContractHandlerEvent::PutResponse { new_value, .. } => {
+            new_value.expect("the PUT lands");
+        }
+        other => panic!("expected a PutResponse, got {other}"),
+    }
+
+    // The notification is delivered on a later loop iteration.
+    let mut last = String::new();
+    for _ in 0..400 {
+        last = report().await;
+        if !last.ends_with("notified:none") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(
+        last, "client:room-5616|notified:room-5616",
+        "a contract-notification run must get the parameters the delegate was \
+         registered with, exactly as a client run does (#5616)"
+    );
 }
