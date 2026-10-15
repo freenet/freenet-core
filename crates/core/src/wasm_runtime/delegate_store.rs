@@ -690,13 +690,15 @@ fn key_derives_from(key: &DelegateKey, code_hash: &CodeHash, params: &Parameters
 /// ones. The write goes through a temporary file and a rename, so a record is
 /// never observed half-written.
 ///
-/// Errors only when there is NO record and one cannot be written, which is
-/// what the old `create_new` write did. A record that exists but cannot be
-/// read or replaced is logged and left: failing the registration over it
-/// would turn "this delegate's node-started runs are skipped" into "the app
-/// cannot register its delegate", and would also block the very
-/// re-registration that repairs it once the cause clears.
-///
+/// Errors when no record can be seen (missing, or its existence cannot be
+/// established) and one cannot be written, which is what the old
+/// `create_new` write did. A record that exists but cannot be read or
+/// replaced is logged and left: failing the registration over it would turn
+/// "this delegate's node-started runs are skipped" into "the app cannot
+/// register its delegate", and would also block the very re-registration
+/// that repairs it once the cause clears. Whatever is left in place,
+/// `registered_params` re-derives the key from it, so a stale record can only
+/// cause skipped runs, never a run with the wrong parameters.
 fn ensure_reg_file(
     delegates_dir: &std::path::Path,
     key: &DelegateKey,
@@ -1442,19 +1444,25 @@ mod test {
         let (mut store, dir, _tmp) = params_store().await;
         let missing = honest_delegate(vec![3, 3], b"missing".to_vec());
         let torn = honest_delegate(vec![3, 3], b"torn".to_vec());
-        for delegate in [&missing, &torn] {
+        // A damaged version byte: any guard that leaves "unknown versions"
+        // alone would leave this one unrepaired.
+        let garbled = honest_delegate(vec![3, 3], b"garbled".to_vec());
+        for delegate in [&missing, &torn, &garbled] {
             store.store_delegate(delegate.clone())?;
         }
         std::fs::remove_file(reg_path_of(&dir, &missing))?;
         std::fs::write(reg_path_of(&dir, &torn), [REG_FILE_VERSION, 1])?;
-        assert!(params_of(&store, &missing).is_err());
-        assert!(params_of(&store, &torn).is_err());
+        std::fs::write(reg_path_of(&dir, &garbled), [0xFF, 9, 9])?;
+        for delegate in [&missing, &torn, &garbled] {
+            assert!(params_of(&store, delegate).is_err());
+        }
 
-        for delegate in [&missing, &torn] {
+        for delegate in [&missing, &torn, &garbled] {
             store.store_delegate(delegate.clone())?;
         }
         assert_eq!(params_of(&store, &missing), Ok(b"missing".to_vec()));
         assert_eq!(params_of(&store, &torn), Ok(b"torn".to_vec()));
+        assert_eq!(params_of(&store, &garbled), Ok(b"garbled".to_vec()));
         let leftovers: Vec<_> = std::fs::read_dir(&dir)?
             .flatten()
             .filter(|e| e.file_name().to_string_lossy().contains(REG_TMP_MARKER))
@@ -1509,22 +1517,30 @@ mod test {
         Ok(())
     }
 
-    /// A MISSING record that cannot be written still fails the registration,
-    /// as the old `create_new` write did: reporting success with no record
-    /// would leave the delegate with no crash-recovery backup and no
-    /// node-started runs, silently.
+    /// A record that cannot be SEEN and cannot be written still fails, as the
+    /// old `create_new` write did: reporting success with no record would
+    /// leave the delegate with no crash-recovery backup and no node-started
+    /// runs, silently. The directory is replaced by a plain file, so opening
+    /// the record fails with `NotADirectory` rather than `NotFound`: an open
+    /// error that says nothing about the record must not be read as "a record
+    /// exists".
+    #[cfg(unix)]
     #[tokio::test]
-    async fn a_missing_record_that_cannot_be_written_fails_registration()
+    async fn a_record_that_cannot_be_seen_or_written_fails()
     -> Result<(), Box<dyn std::error::Error>> {
-        let (mut store, dir, _tmp) = params_store().await;
+        let temp_dir = tempfile::tempdir()?;
+        let dir = temp_dir.path().join("delegates");
+        std::fs::write(&dir, b"not a directory")?;
         let delegate = honest_delegate(vec![1, 9], b"room".to_vec());
-        store.store_delegate(delegate.clone())?;
-        // The code stays cached, so re-registering takes the early-return path
-        // that only ensures the index and the record.
-        std::fs::remove_dir_all(&dir)?;
         assert!(
-            store.store_delegate(delegate).is_err(),
-            "a record that is missing and cannot be written must fail registration"
+            ensure_reg_file(
+                &dir,
+                delegate.key(),
+                delegate.code_hash(),
+                &Parameters::from(b"room".to_vec()),
+            )
+            .is_err(),
+            "a record that cannot be seen or written must fail registration"
         );
         Ok(())
     }
