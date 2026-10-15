@@ -450,10 +450,12 @@ pub(super) fn run_wrapper(version: &str) -> Result<()> {
     // was launched by Windows autostart and never had a console at all),
     // the inherited standard handles are invalid. ANY `Command::spawn()`
     // reachable from this function MUST explicitly set
-    // `.stdin/.stdout/.stderr(Stdio::null())` — otherwise `spawn()` fails
-    // with "The handle is invalid" (os error 6) and the child silently
-    // never starts. Known spawn sites downstream of here:
-    //   - `spawn_update_command`                   (this file)
+    // `.stdin/.stdout/.stderr` (to `Stdio::null()`, or to a file it opened)
+    // — otherwise `spawn()` fails with "The handle is invalid" (os error 6)
+    // and the child silently never starts. Known spawn sites downstream of
+    // here:
+    //   - `spawn_update_command`                   (this file; stdout/stderr
+    //     to the wrapper log, #5799)
     //   - network child in `run_wrapper_loop`      (this file, ~line 1452)
     //   - `spawn_new_wrapper`                      (this file)
     //   - `open_log_file` notepad/open/xdg-open    (tray.rs)

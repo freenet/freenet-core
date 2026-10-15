@@ -1063,9 +1063,21 @@ pub fn clear_update_cooldown() {
 }
 
 /// One line describing the cooldown for `freenet service report`, or `None`
-/// when there is no record.
-pub(crate) fn update_cooldown_summary_at(dir: &Path, now: SystemTime) -> Option<String> {
+/// when there is no record, or only one for a version this binary already is
+/// or has passed (installed some other way, so nothing is pending).
+pub(crate) fn update_cooldown_summary_at(
+    dir: &Path,
+    current_version: &str,
+    now: SystemTime,
+) -> Option<String> {
     let state = read_update_cooldown_at(dir)?;
+    let superseded = semver::Version::parse(&state.version)
+        .ok()
+        .zip(semver::Version::parse(current_version).ok())
+        .is_some_and(|(failed, current)| failed <= current);
+    if superseded {
+        return None;
+    }
     let wait = match update_cooldown_remaining_at(dir, &state.version, now) {
         Some(remaining) => format!("next attempt in {} min", remaining.as_secs().div_ceil(60)),
         None => "cooldown over, next update check may try again".to_string(),
@@ -1077,8 +1089,8 @@ pub(crate) fn update_cooldown_summary_at(dir: &Path, now: SystemTime) -> Option<
 }
 
 /// [`update_cooldown_summary_at`] against the shared state directory.
-pub fn update_cooldown_summary() -> Option<String> {
-    state_dir().and_then(|dir| update_cooldown_summary_at(&dir, SystemTime::now()))
+pub fn update_cooldown_summary(current_version: &str) -> Option<String> {
+    state_dir().and_then(|dir| update_cooldown_summary_at(&dir, current_version, SystemTime::now()))
 }
 
 // ── Post-stop crash classification / handling / rollback ───────────────────
@@ -2365,7 +2377,7 @@ mod tests {
         let now = SystemTime::now();
         std::fs::write(dir.join(UPDATE_COOLDOWN_FILE), "{not valid json").unwrap();
         assert!(update_cooldown_remaining_at(dir, "0.2.141", now).is_none());
-        assert!(update_cooldown_summary_at(dir, now).is_none());
+        assert!(update_cooldown_summary_at(dir, "0.2.140", now).is_none());
         // The next failure starts a fresh count rather than inheriting damage.
         assert_eq!(record_update_cooldown_at(dir, "0.2.141", "x", now, 0.5), 1);
 
@@ -2404,10 +2416,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path();
         let now = SystemTime::now();
-        assert!(update_cooldown_summary_at(dir, now).is_none());
+        assert!(update_cooldown_summary_at(dir, "0.2.140", now).is_none());
         let long_error = format!("error sending request: {}", "x".repeat(2000));
         record_update_cooldown_at(dir, "0.2.141", &long_error, now, 0.5);
-        let summary = update_cooldown_summary_at(dir, now).unwrap();
+        let summary = update_cooldown_summary_at(dir, "0.2.140", now).unwrap();
         assert!(summary.contains("0.2.141"), "{summary}");
         assert!(summary.contains("1 time(s)"), "{summary}");
         assert!(summary.contains("next attempt in 60 min"), "{summary}");
@@ -2423,10 +2435,13 @@ mod tests {
         );
         let later = now + std::time::Duration::from_secs(2 * 3600);
         assert!(
-            update_cooldown_summary_at(dir, later)
+            update_cooldown_summary_at(dir, "0.2.140", later)
                 .unwrap()
                 .contains("cooldown over"),
         );
+        // Once this binary is that version or newer, nothing is pending.
+        assert!(update_cooldown_summary_at(dir, "0.2.141", now).is_none());
+        assert!(update_cooldown_summary_at(dir, "0.2.150", now).is_none());
     }
 
     #[test]

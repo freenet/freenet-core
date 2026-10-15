@@ -198,7 +198,7 @@ impl ReportCommand {
             Ok(diag) => (Some(diag), None),
             Err(e) => (None, Some(e)),
         };
-        let auto_update_status = super::rollback::update_cooldown_summary();
+        let auto_update_status = super::rollback::update_cooldown_summary(version);
         let user_message = self.get_user_message()?;
 
         let client_timestamp = chrono::Utc::now().to_rfc3339();
