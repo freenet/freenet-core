@@ -3291,6 +3291,19 @@ mod tests {
                 "*next_repoll=repoll_after_hold(*next_repoll,until,rand_unit);",
                 "the re-poll schedule",
             ),
+            (
+                "UpdatePreparation::Stay{version,retry_in}=>{stagger_deadline=None;hold_after_stay(",
+                "the stagger, whose expired deadline would re-fire every tick",
+            ),
+            (
+                "letpending=ifcommands::auto_update::is_locked_out(){\
+                 commands::rollback::update_cooldown_pending(build_info::VERSION,urgent)",
+                "a locked-out node's re-poll, before it claims its daily retry",
+            ),
+            (
+                "leturgent=commands::auto_update::node_is_urgent();",
+                "the urgency that caps the cooldown at an hour (review C)",
+            ),
         ] {
             assert_eq!(
                 flat.matches(gate).count(),
@@ -3310,6 +3323,22 @@ mod tests {
         assert_eq!(
             flat.matches("decide_newer_release(&new_version,").count(),
             2
+        );
+        // The loop's triggers pass the node's urgency; only the startup check,
+        // with no connections yet by construction, passes `false`.
+        assert_eq!(
+            flat.matches("UpdateTarget{version:Some(&new_version),urgent,}")
+                .count(),
+            4
+        );
+        assert_eq!(
+            flat.matches("UpdateTarget{version:None,urgent,}").count(),
+            2
+        );
+        assert_eq!(
+            flat.matches("UpdateTarget{version:Some(&new_version),urgent:false,}")
+                .count(),
+            1
         );
     }
 

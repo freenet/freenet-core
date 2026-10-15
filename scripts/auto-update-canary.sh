@@ -111,9 +111,17 @@ MARKER_DISABLED='Auto-update is DISABLED'
 # can decide anything, so a previous release that logs it HAS staging, and from
 # then on Gate B requires DONE (INFO) from the node and INSTALLED_STAGED (an
 # unconditional stderr line) from `freenet update`. A staging that silently
-# skips, fails, or is ignored by the installer falls back to downloading inside
+# skips, or is ignored by the installer, falls back to downloading inside
 # systemd's TimeoutStopSec -- the #5790 restart loop on a slow link, which CI's
 # fast network would never show. Releases that predate staging pass unchanged.
+#
+# #5799 changed what a FAILED staging does. A previous release that contains it
+# no longer exits 42 when it cannot fetch the release: it stays on its version,
+# holds for a cooldown, and the canary's deadline stops it (exit 124). So Gate
+# B reads the staging failure lines (UNRESOLVED, FAILED) on the non-42 path as
+# well: a rate limit there is environmental (EXIT_UNVERIFIED_ENVIRONMENTAL),
+# anything else is a staging failure. A previous release from before #5799
+# still exits 42 after a failed staging and is handled by the exit-42 branch.
 #
 # These are matched against the PREVIOUS release's output by THIS script, so a
 # reword in the source cannot simply be mirrored here: keep accepting the old

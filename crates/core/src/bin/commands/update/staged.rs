@@ -22,6 +22,20 @@
 //! Only nodes already running a release that contains this module benefit: the
 //! node that stages and the `freenet update` that installs are both the binary
 //! on disk, so a node on an older release still downloads in `ExecStopPost`.
+//!
+//! Staging also decides whether to exit at all (#5799). When GitHub cannot be
+//! reached for the release (a network error, a missing asset, a rate limit,
+//! the deadline, or a failed tag lookup), exiting would only hand the same
+//! download to an updater that fails it too, after which the supervisor
+//! restarts the old binary and it detects the same release again. So the node
+//! stays on its current binary ([`UpdatePreparation::Stay`]) and records a
+//! per-release cooldown in the state directory (`rollback::record_update_cooldown_at`):
+//! an hour after the first failure, doubling to a day, with ±20% jitter, at
+//! most an hour for a node that gains nothing from waiting. The update triggers
+//! hold until it ends. Every exit that leaves the download to the updater
+//! records one too, since systemd may kill the updater before it can. Three
+//! failures in a row, or one that cannot be recorded, exit anyway, so a fault
+//! in staging itself cannot hold an update back for good.
 
 use std::fs;
 use std::io::Write as _;
@@ -2154,6 +2168,9 @@ mod tests {
         let server = Server::run(); // no expectations: staging must not download
         let outcome = stage_into_with(&root, &server, Ok(TAG.into()), None, &|_| false).await;
         assert_eq!(outcome, Staging::Skipped);
+        // #5799 review F: recorded before the exit, in case the updater is
+        // killed before it can record anything.
+        assert_eq!(cooldown_record(&root).map(|r| r.failures), Some(1));
 
         drop(child);
         assert!(
@@ -2478,6 +2495,30 @@ mod tests {
         let outcome = stage_once(&root, &server.url_str("/"), STAGE_DEADLINE).await;
         assert_eq!(outcome, Staging::Staged);
         assert!(cooldown_record(&root).is_none());
+    }
+
+    /// The macOS bundle branch, which no Linux CI job compiles in, must route
+    /// through `decide_without_staging` rather than exiting outright.
+    #[test]
+    fn the_bundle_branch_uses_the_shared_decision() {
+        let src = include_str!("staged.rs").replace("\r\n", "\n");
+        let production = src
+            .split_once(concat!("#[cfg(test)]\n", "mod tests {"))
+            .unwrap()
+            .0;
+        let flat: String = production.split_whitespace().collect();
+        let branch = flat
+            .split_once("ifin_bundle{")
+            .expect("the bundle branch")
+            .1;
+        let branch = &branch[..branch.find('}').unwrap()];
+        assert_eq!(
+            branch,
+            concat!(
+                "letstaging=decide_without_staging(&root,tag,current_version,target);",
+                "returnpreparation(&staging,&root,version.as_deref(),target.urgent);"
+            )
+        );
     }
 
     /// #5799 review D: an install that stages nothing (a macOS app bundle)
