@@ -4499,7 +4499,7 @@ async fn handle_delegate_notification<CH, P>(
     // it is logged with the reason. In practice that is an unregistered
     // delegate (whose run would fail as `Missing` anyway) or a parameterized
     // delegate whose registration record is missing or damaged, which its
-    // next registration repairs.
+    // next registration normally repairs.
     let params = match contract_handler
         .executor()
         .registered_delegate_params(&delegate_key)
