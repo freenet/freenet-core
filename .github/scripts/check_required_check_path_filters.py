@@ -112,10 +112,14 @@ REQUIRED_CONTEXTS = frozenset(
 # makes them fire at all, and neither produces test signal that could be hidden.
 NEEDS_ALLOWLIST = frozenset({"claude-ci-analysis", "notify_dev_room_main_failure"})
 
-# `    needs: x` / `    needs: [a, b]` at four-space indent inside a job, and
-# the block form's `      - x` items on the following lines.
-NEEDS_RE = re.compile(r"^    needs:\s*(?P<value>[^#\s][^#]*?)?\s*(?:#.*)?$")
-NEEDS_ITEM_RE = re.compile(r"^      -\s*(?P<id>[A-Za-z_][A-Za-z0-9_-]*)\s*(?:#.*)?$")
+# `    needs:` at four-space indent inside a job. Its VALUE is everything up to the
+# next job key: the rest of that line, plus any following blank, comment or
+# more-indented line, plus a `- item` sequence written at the key's own indent.
+# That covers inline, flow (single- or multi-line), quoted, commented and block
+# forms without trying to parse YAML structure -- the failure mode of a stricter
+# regex is to go quiet on a valid form, and this check must not go quiet.
+NEEDS_RE = re.compile(r"^    needs:(?P<value>.*)$")
+IDENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_-]*")
 
 # Triggers whose runs gate a pull request. `push` is excluded on purpose (see
 # the module docstring).
@@ -159,7 +163,11 @@ def _jobs_block(lines: list[str]) -> tuple[int, int]:
         return len(lines), len(lines)
     end = len(lines)
     for i in range(jobs_at + 1, len(lines)):
-        if lines[i] and not lines[i][0].isspace():
+        if (
+            lines[i]
+            and not lines[i][0].isspace()
+            and not lines[i].startswith("#")
+        ):
             end = i
             break
     return jobs_at + 1, end
@@ -253,33 +261,47 @@ def check_needs(text: str, name: str) -> list[str]:
     # Pass 2: every `needs:` entry, with the job it belongs to.
     errors = []
     current_id = None
-    in_block_list = False
-    for i in range(start, end):
+    i = start
+    while i < end:
         line = lines[i]
         job = JOB_ID_RE.match(line)
         if job:
             current_id = job.group("id")
-            in_block_list = False
+            i += 1
             continue
-        needed: list[str] = []
         needs = NEEDS_RE.match(line)
-        if needs:
-            value = (needs.group("value") or "").strip()
-            in_block_list = not value
-            needed = re.findall(r"[A-Za-z_][A-Za-z0-9_-]*", value)
-        elif in_block_list:
-            item = NEEDS_ITEM_RE.match(line)
-            if item:
-                needed = [item.group("id")]
+        if not needs:
+            i += 1
+            continue
+
+        needs_at = i
+        span = [needs.group("value")]
+        i += 1
+        while i < end:
+            nxt = lines[i]
+            stripped = nxt.strip()
+            indent = len(nxt) - len(nxt.lstrip())
+            if (
+                not stripped
+                or stripped.startswith("#")
+                or indent > 4
+                or (indent == 4 and stripped.startswith("-"))
+            ):
+                span.append(nxt)
+                i += 1
             else:
-                in_block_list = False
+                break
         if current_id is None or current_id in NEEDS_ALLOWLIST:
             continue
-        for dep in needed:
+        needed = []
+        for chunk in span:
+            needed.extend(IDENT_RE.findall(chunk.split("#", 1)[0]))
+        for dep in dict.fromkeys(needed):
             if dep in required_ids:
                 errors.append(
-                    f"{name}:{i + 1}: job `{current_id}` has `needs: {dep}`, "
-                    f"and `{dep}` reports a required status context.\n"
+                    f"{name}:{needs_at + 1}: job `{current_id}` has "
+                    f"`needs: {dep}`, and `{dep}` reports a required status "
+                    f"context.\n"
                     f"    If `{dep}` fails, `{current_id}` is reported SKIPPED: "
                     f"grey, which reads as 'not applicable' rather than 'never "
                     f"got to run', so a PR can look healthier than it is "
@@ -543,10 +565,34 @@ def _needs_fixture(needs_lines: str, job: str = "heavy") -> str:
 _NEEDS_CASES = [
     ("no needs at all", _needs_fixture(""), 0, None),
     ("inline `needs: fmt_check` (the #5621 shape)", _needs_fixture("    needs: fmt_check\n"), 1, 11),
+    ("quoted inline value", _needs_fixture("    needs: 'fmt_check'\n"), 1, 11),
     ("flow-list needs including a required job", _needs_fixture("    needs: [other, fmt_check]  # c\n"), 1, 11),
-    ("block-list needs including a required job", _needs_fixture("    needs:\n      - other\n      - fmt_check\n"), 1, 13),
+    ("multi-line flow list", _needs_fixture("    needs: [\n      other,\n      fmt_check\n    ]\n"), 1, 11),
+    ("block list", _needs_fixture("    needs:\n      - other\n      - fmt_check\n"), 1, 11),
+    ("block list with comment lines between items", _needs_fixture("    needs:\n      # gate\n      - other\n\n      # more\n      - fmt_check\n"), 1, 11),
+    ("block list with quoted items", _needs_fixture("    needs:\n      - \"fmt_check\"\n"), 1, 11),
+    ("block list at the key's own indent", _needs_fixture("    needs:\n    - fmt_check\n"), 1, 11),
+    ("two required deps in one list", _needs_fixture("    needs: [fmt_check, clippy_check]\n").replace("  heavy:", "  clippy_check:\n    name: Clippy\n    runs-on: ubuntu-latest\n  heavy:"), 2, 14),
     ("needs on a non-required job", _needs_fixture("    needs: other\n"), 0, None),
-    ("allowlisted observer needs a required job", _needs_fixture("    needs: fmt_check\n", job="claude-ci-analysis"), 0, None),
+    ("a commented-out needs is not an edge", _needs_fixture("    # needs: fmt_check\n"), 0, None),
+    ("needs value that merely follows a comment", _needs_fixture("    needs: other  # fmt_check\n"), 0, None),
+    ("required job identified by its id, not a name", "name: CI\non:\n  pull_request:\n\njobs:\n  Fmt:\n    runs-on: ubuntu-latest\n  heavy:\n    needs: Fmt\n    runs-on: ubuntu-latest\n", 1, 9),
+    ("required job defined AFTER its dependent", "name: CI\non:\n  pull_request:\n\njobs:\n  heavy:\n    needs: fmt_check\n    runs-on: ubuntu-latest\n  fmt_check:\n    name: Fmt\n    runs-on: ubuntu-latest\n", 1, 7),
+    ("allowlisted claude-ci-analysis may need a required job", _needs_fixture("    needs: fmt_check\n", job="claude-ci-analysis"), 0, None),
+    ("allowlisted notify_dev_room_main_failure may need a required job", _needs_fixture("    needs: fmt_check\n", job="notify_dev_room_main_failure"), 0, None),
+    (
+        "the allowlist is per-job: an offender after an observer is still flagged",
+        _needs_fixture("    needs: fmt_check\n", job="claude-ci-analysis")
+        + "  heavy:\n    needs: fmt_check\n    runs-on: ubuntu-latest\n",
+        1,
+        14,
+    ),
+    (
+        "a column-0 comment inside jobs: does not hide later jobs",
+        "name: CI\non:\n  pull_request:\n\njobs:\n  fmt_check:\n    name: Fmt\n    runs-on: ubuntu-latest\n# stray\n  heavy:\n    needs: fmt_check\n    runs-on: ubuntu-latest\n",
+        1,
+        11,
+    ),
 ]
 
 

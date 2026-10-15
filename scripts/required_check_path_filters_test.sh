@@ -150,7 +150,31 @@ check "ignores workflows that provide no required context" "$UNRELATED_RC" "0"
 # a gating trigger, and every required context actually reported by something.
 REPO_RC=0
 python3 "$LINTER" "$REPO_ROOT/.github/workflows" >/dev/null 2>&1 || REPO_RC=$?
-check "this repo's required-check workflows carry no PR path filter" "$REPO_RC" "0"
+check "this repo's required-check workflows pass the linter (no PR path filter, no needs on a required job)" "$REPO_RC" "0"
+
+# #5621: `needs: fmt_check` on a test job made a Fmt failure report every test
+# job as SKIPPED. Re-add the edge to a copy of the REAL workflows and require the
+# linter to refuse it -- the hand-written self-test fixtures prove the parser,
+# this proves it reads the file that actually ships. awk inserts the edge right
+# after the `name:` line of the Unit & Integration job.
+mkdir -p "$TEST_TMP/needs_mut"
+cp "$REPO_ROOT"/.github/workflows/*.yml "$TEST_TMP/needs_mut/"
+awk '{print} /^    name: Unit & Integration$/ {print "    needs: fmt_check"}' \
+    "$CI_YML" > "$TEST_TMP/needs_mut/ci.yml"
+check "the mutation was applied to the copy" \
+    "$(grep -c '^    needs: fmt_check$' "$TEST_TMP/needs_mut/ci.yml")" "1"
+NEEDS_MUT_RC=0
+NEEDS_MUT_OUT=$(python3 "$LINTER" "$TEST_TMP/needs_mut" 2>&1) || NEEDS_MUT_RC=$?
+check "linter rejects needs: fmt_check re-added to test_unit" "$NEEDS_MUT_RC" "1"
+check "linter names the offending job" \
+    "$(grep -c 'job `test_unit` has `needs: fmt_check`' <<<"$NEEDS_MUT_OUT")" "1"
+
+# NEEDS_ALLOWLIST names two failure observers by job id. If either is renamed,
+# its exemption silently covers nothing and the rename passes the linter.
+for observer in claude-ci-analysis notify_dev_room_main_failure; do
+    check "allowlisted observer $observer still exists in ci.yml" \
+        "$(grep -c "^  $observer:\$" "$CI_YML")" "1"
+done
 
 # Pin the CI wiring. Without this, deleting the steps from ci.yml silently
 # retires the guard while every test above still passes.
