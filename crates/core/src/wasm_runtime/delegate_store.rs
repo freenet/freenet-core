@@ -519,6 +519,119 @@ impl DelegateStore {
     pub fn code_hash_from_key(&self, key: &DelegateKey) -> Option<CodeHash> {
         self.key_to_code_part.get(key).map(|r| *r.value())
     }
+
+    /// The parameters `key` was registered with on this node. See
+    /// [`registered_params`].
+    pub fn registered_params(&self, key: &DelegateKey) -> Option<Parameters<'static>> {
+        registered_params(&self.delegates_dir, &self.key_to_code_part, key)
+    }
+}
+
+/// The parameters `key` was registered with on this node, or `None` if this
+/// node cannot PROVE what they were.
+///
+/// A delegate run is `process(ctx, params, ..)`, and nothing downstream checks
+/// the `params` a caller hands in against the delegate's identity:
+/// [`DelegateStore::fetch_delegate`] resolves the CODE through the index and
+/// attaches whatever parameters it was given. A client request supplies them
+/// itself; a run the NODE starts (a contract notification, an inter-delegate
+/// hop) has no caller to supply them, and used to pass empty ones, silently
+/// running a parameterized delegate as a different instance of itself (#5616).
+/// This is where such a run gets the real ones.
+///
+/// # Source
+///
+/// The `.reg` record [`DelegateStore::store_delegate`] writes for every
+/// registration (#3344), which holds the parameters verbatim. The index is not
+/// enough: it maps a key to its code hash only.
+///
+/// # What is checked, and why `None` rather than a guess
+///
+/// - **Index-gated**, for the trust reason `fetch_delegate` gives: the answer
+///   is a function of what this node registered, not of which files exist.
+/// - **The record's code hash must match the index**, and **the key must be
+///   derived from that code hash and these parameters** (`BLAKE3(code_hash ‖
+///   params)`). The key IS a commitment to the parameters, so a record that
+///   does not reproduce it is corrupt, and running with it would be the very
+///   bug this function exists to prevent.
+/// - **No record** (a registration older than `.reg` files that was never
+///   repeated, or a record lost on disk): the parameters are unrecoverable,
+///   EXCEPT that a key derived from EMPTY parameters proves they were empty.
+///   That case returns them; any other returns `None`.
+///
+/// Callers treat `None` as "do not run": a run with parameters the node cannot
+/// vouch for is the silent misbehaviour #5616 describes, and skipping it is
+/// visible in the log where the misbehaviour was not.
+///
+/// A synchronous read of a sub-kilobyte file; its callers are about to run a
+/// whole WASM invocation.
+pub fn registered_params(
+    delegates_dir: &std::path::Path,
+    index: &DashMap<DelegateKey, CodeHash>,
+    key: &DelegateKey,
+) -> Option<Parameters<'static>> {
+    let code_hash = *index.get(key)?.value();
+    let reg_path = delegates_dir.join(key.encode()).with_extension("reg");
+    let params = match std::fs::read(&reg_path) {
+        Ok(data) => {
+            let Some((reg_code_hash, params)) = parse_reg_file(&data) else {
+                tracing::warn!(
+                    delegate = %key,
+                    path = %reg_path.display(),
+                    "Delegate registration record is corrupt or of an unsupported \
+                     version; its parameters cannot be recovered"
+                );
+                return None;
+            };
+            if reg_code_hash != code_hash {
+                tracing::warn!(
+                    delegate = %key,
+                    %code_hash,
+                    %reg_code_hash,
+                    "Delegate registration record names different code than the \
+                     index; its parameters cannot be trusted"
+                );
+                return None;
+            }
+            params
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            let empty = Parameters::from(Vec::<u8>::new());
+            if key_derives_from(key, &code_hash, &empty) {
+                return Some(empty);
+            }
+            tracing::warn!(
+                delegate = %key,
+                "Delegate has no registration record and its key is not derived \
+                 from empty parameters; its parameters cannot be recovered"
+            );
+            return None;
+        }
+        Err(err) => {
+            tracing::warn!(
+                delegate = %key,
+                path = %reg_path.display(),
+                error = %err,
+                "Failed to read delegate registration record"
+            );
+            return None;
+        }
+    };
+    if !key_derives_from(key, &code_hash, &params) {
+        tracing::warn!(
+            delegate = %key,
+            params_bytes = params.as_ref().len(),
+            "Delegate registration record's parameters do not derive its key; \
+             refusing to use them"
+        );
+        return None;
+    }
+    Some(params)
+}
+
+/// Whether `key` is the delegate key of `code_hash` under `params`.
+fn key_derives_from(key: &DelegateKey, code_hash: &CodeHash, params: &Parameters<'_>) -> bool {
+    DelegateKey::from_params(code_hash.encode(), params).is_ok_and(|derived| derived == *key)
 }
 
 /// Write a .reg registration record file if it doesn't already exist.

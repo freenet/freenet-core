@@ -993,6 +993,19 @@ impl ContractExecutor for RuntimePool {
             .find_map(|executor| executor.runtime.delegate_code(key))
     }
 
+    fn registered_delegate_params(&self, key: &DelegateKey) -> Option<Parameters<'static>> {
+        // Read from the pool's own handles rather than through an executor,
+        // as `delegate_code` does: every executor's store shares this index
+        // and directory, and a checked-out executor cannot answer, so going
+        // through one would turn "every executor busy" into "no parameters"
+        // and skip a run that should have happened.
+        crate::wasm_runtime::registered_params(
+            &self.config.delegates_dir(),
+            &self.shared_stores.delegate_index,
+            key,
+        )
+    }
+
     fn delegate_subscription_store(&self) -> Option<Storage> {
         Some(self.shared_state_store.inner().clone())
     }

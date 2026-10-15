@@ -1004,6 +1004,15 @@ impl Runtime {
             .map(|d| d.code().data().to_vec())
     }
 
+    /// The parameters `key` was registered with on this node. See
+    /// [`super::registered_params`].
+    pub(crate) fn registered_delegate_params(
+        &self,
+        key: &DelegateKey,
+    ) -> Option<Parameters<'static>> {
+        self.delegate_store.registered_params(key)
+    }
+
     /// Check if the runtime is in a healthy state and can execute WASM.
     pub fn is_healthy(&self) -> bool {
         self.engine.is_healthy()

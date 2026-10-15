@@ -2510,10 +2510,12 @@ where
         //   SendDelegateMessage in response, it is filtered out (not delivered). This
         //   prevents infinite recursion between delegates. We use execute_delegate_request
         //   (not the full delivery loop) for the same reason.
-        // - Target delegate receives empty params because params are not stored in the
-        //   delegate registry — they are passed per-request at the API layer. If a target
-        //   delegate's process() relies on params, the caller must use ApplicationMessages
-        //   directly. This is a known v1 limitation.
+        // - Target delegate runs with the params IT was registered with on this node
+        //   (`registered_delegate_params`, #5616), never the caller's and never empty
+        //   ones: a delegate key is `BLAKE3(code_hash ‖ params)`, so other params would
+        //   run a different instance of the target. A target whose params this node
+        //   cannot establish (unregistered, or its registration record is missing or
+        //   corrupt) is not run; the message is dropped and logged.
         // - The caller's delegate key is passed as `caller_delegate` so the receiver
         //   sees `MessageOrigin::Delegate(caller_key)` and can authorize on it
         //   (issue #3860). The runtime attests this identity — the calling delegate
@@ -2534,10 +2536,25 @@ where
 
             for msg in delegate_messages {
                 let target_key = msg.target.clone();
+                // The TARGET's registered params (#5616): see the design notes
+                // above. Same rule as the notification path, for the same
+                // reason: no provable params, no run.
+                let Some(target_params) = contract_handler
+                    .executor()
+                    .registered_delegate_params(&target_key)
+                else {
+                    tracing::warn!(
+                        from_delegate = %delegate_key,
+                        target_delegate = %target_key,
+                        "Dropped an inter-delegate message: this node cannot establish \
+                         the parameters the target was registered with (#5616)"
+                    );
+                    continue;
+                };
                 let inbound = vec![InboundDelegateMsg::DelegateMessage(msg)];
                 let target_req = DelegateRequest::ApplicationMessages {
                     key: target_key.clone(),
-                    params: Parameters::from(Vec::new()),
+                    params: target_params,
                     inbound,
                 };
                 // PER-DELEGATE EXCLUSION, second door (#5544 B2).
@@ -4463,6 +4480,37 @@ async fn handle_delegate_notification<CH, P>(
     // and the redundancy costs less than a missed exit.
     delegate_app_registry::sweep_expired();
 
+    // THE DELEGATE'S REGISTERED PARAMETERS, NOT EMPTY ONES (#5616).
+    //
+    // A delegate key is `BLAKE3(code_hash ‖ params)` and the params are handed
+    // to `process()`, but nothing downstream checks the params a request
+    // carries against the key: the store resolves the code through its index
+    // and attaches whatever it was given. This run has no client to supply
+    // them, and it used to pass empty ones, so a parameterized delegate (per
+    // room, per user) ran as a different instance of itself, with no error and
+    // no log line. The params go into `req`, so a run queued behind a park and
+    // a run that parks and resumes (`Continuation::params`) carry them too.
+    //
+    // No provable params means NO RUN. Running with empty ones instead is the
+    // silent misbehaviour this fixes; skipping is the notification pipeline's
+    // documented best-effort contract (a dropped notification), and it is
+    // logged. In practice `None` is an unregistered delegate (whose run would
+    // fail as `Missing` anyway) or a registration record that is missing or
+    // corrupt, which `registered_params` logs with the reason.
+    let Some(params) = contract_handler
+        .executor()
+        .registered_delegate_params(&delegate_key)
+    else {
+        tracing::warn!(
+            delegate = %delegate_key,
+            contract = %contract_id,
+            "Dropped a contract notification: this node cannot establish the \
+             parameters the delegate was registered with, and running it with \
+             any others would run a different delegate instance (#5616)"
+        );
+        return;
+    };
+
     // Unwrap the Arc — if this is the last subscriber the state moves without cloning,
     // otherwise a clone is made (unavoidable since ContractNotification owns the state).
     let owned_state = Arc::try_unwrap(new_state).unwrap_or_else(|arc| (*arc).clone());
@@ -4477,7 +4525,7 @@ async fn handle_delegate_notification<CH, P>(
 
     let req = DelegateRequest::ApplicationMessages {
         key: delegate_key.clone(),
-        params: Parameters::from(vec![]),
+        params,
         inbound,
     };
 

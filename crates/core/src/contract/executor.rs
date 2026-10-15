@@ -1159,6 +1159,19 @@ pub(crate) trait ContractExecutor: Send + 'static {
         None
     }
 
+    /// The parameters `key` was registered with on this node, for a run the
+    /// NODE starts and so has no caller to supply them (a contract
+    /// notification, an inter-delegate hop). `None` means this node cannot
+    /// vouch for them, and the caller must not run the delegate: running with
+    /// empty parameters instead is #5616. See
+    /// [`crate::wasm_runtime::registered_params`].
+    ///
+    /// `None` by default, for executors with no delegate store; none of them
+    /// produce contract notifications.
+    fn registered_delegate_params(&self, _key: &DelegateKey) -> Option<Parameters<'static>> {
+        None
+    }
+
     /// The node's durable store, for mirroring delegate subscriptions to disk
     /// so they survive a restart (#5493).
     ///
