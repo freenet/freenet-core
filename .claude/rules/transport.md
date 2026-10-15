@@ -276,12 +276,22 @@ the aggregator tasks. They exist only for the staged rollout in
 
 ```
 NAT traversal:
-  1. Send multiple intro packets — `NAT_TRAVERSAL_MAX_ATTEMPTS` (40 in release builds, 10 under `cfg(test)`) at a 200 ms cadence, capped by a 3 s `overall_deadline` (so ~15 attempts at production settings)
+  1. Send multiple intro packets — `NAT_TRAVERSAL_MAX_ATTEMPTS` (40 in release builds, 10 under `cfg(test)`) at a ~250 ms cadence (200 ms receive wait + 50 ms `INITIAL_INTERVAL`), capped by a 3 s `overall_deadline` (so ~12 attempts at production settings)
   2. Use exponential backoff: 50ms → 300ms → 1s → 5s
   3. First relay observes external address (ObservedAddress msg)
   4. Rate limit: 1 intro packet/second per source IP
   5. Gateway ramp-up: 5/s for 30s, 20/s for 2min, unlimited after
      (prevents thundering herd after gateway restart)
+
+Handshake send failures (#5871):
+  → In the intro resend loop a failed `send_to` counts as a lost datagram,
+    not an abort. When the attempt runs to its deadline, it ends with
+    `SendFailed` if the last send failed, and the final warn carries
+    `failed_sends` and the last OS error either way.
+  → The gateway success ack and the joiner's final ack are one-shot and fail
+    via `SendFailed` at once. The best-effort version-mismatch ack only
+    logs, so the peer is still recorded as outdated.
+  → Never map a send error to `ChannelClosed`.
 
 Restart detection (all peers, not just gateways):
   → If an intro packet arrives on an established connection, attempt
