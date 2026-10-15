@@ -119,7 +119,7 @@ NEEDS_ALLOWLIST = frozenset({"claude-ci-analysis", "notify_dev_room_main_failure
 # That covers inline, flow (single- or multi-line), quoted, commented and block
 # forms without trying to parse YAML structure -- the failure mode of a stricter
 # regex is to go quiet on a valid form, and this check must not go quiet.
-NEEDS_RE = re.compile(r"^    needs:(?P<value>.*)$")
+NEEDS_RE = re.compile(r"^    ['\"]?needs['\"]?\s*:(?P<value>.*)$")
 IDENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_-]*")
 
 # Triggers whose runs gate a pull request. `push` is excluded on purpose (see
@@ -598,6 +598,8 @@ _NEEDS_CASES = [
     ("block list at the key's own indent", _needs_fixture("    needs:\n    - fmt_check\n"), 1, 11),
     ("two required deps in one list", _needs_fixture("    needs: [fmt_check, clippy_check]\n").replace("  heavy:", "  clippy_check:\n    name: Clippy\n    runs-on: ubuntu-latest\n  heavy:"), 2, 14),
     ("needs on a non-required job", _needs_fixture("    needs: other\n"), 0, None),
+    ("quoted `\"needs\"` key", _needs_fixture("    \"needs\": fmt_check\n"), 1, 11),
+    ("`needs :` with a space before the colon", _needs_fixture("    needs : fmt_check\n"), 1, 11),
     ("a commented-out needs is not an edge", _needs_fixture("    # needs: fmt_check\n"), 0, None),
     ("needs value that merely follows a comment", _needs_fixture("    needs: other  # fmt_check\n"), 0, None),
     ("required job identified by its id, not a name", "name: CI\non:\n  pull_request:\n\njobs:\n  Fmt:\n    runs-on: ubuntu-latest\n  heavy:\n    needs: Fmt\n    runs-on: ubuntu-latest\n", 1, 9),
