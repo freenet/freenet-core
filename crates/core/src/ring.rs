@@ -8450,6 +8450,39 @@ mod k_closest_source_tests {
         assert_eq!(&ordered[..slots], &provisional[..slots]);
     }
 
+    /// Source pin (#2524): the loop stamps a provisional lease's retry cadence
+    /// only once it actually evaluates it, i.e. after the evaluation-budget
+    /// break, so a lease cut off by `evaluated >= batch_limit` stays due for
+    /// the next tick instead of waiting a whole retry interval unevaluated.
+    #[test]
+    fn renewal_loop_stamps_provisional_cadence_only_when_evaluating() {
+        let src = production_source();
+        let loop_body = crate::contract::source_pin_util::strip_comments(extract_fn_body(
+            src,
+            "async fn recover_orphaned_subscriptions(",
+        ));
+        let budget_break = loop_body
+            .find("if evaluated >= batch_limit {")
+            .expect("the evaluation-budget break");
+        let counted = loop_body
+            .find("evaluated += 1;")
+            .expect("the evaluation count");
+        let stamp = loop_body
+            .find("ring.record_provisional_renewal_attempt(&contract);")
+            .expect("the loop stamps provisional evaluations");
+        assert_eq!(
+            loop_body
+                .matches("record_provisional_renewal_attempt(")
+                .count(),
+            1,
+            "one stamp site"
+        );
+        assert!(
+            budget_break < counted && counted < stamp,
+            "stamp only after the budget break and the evaluation count"
+        );
+    }
+
     /// Source pin: the renewal loop orders its candidates with
     /// `Ring::order_renewal_batch` (behaviour tested above) before it spends
     /// the batch. Comments are stripped so a commented-out call fails.
