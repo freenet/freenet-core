@@ -384,14 +384,18 @@ pub enum UpdateCheckResult {
     /// [`Skipped`]: UpdateCheckResult::Skipped
     PinnedKnownBad,
     /// The newer version on GitHub is cooling down after earlier attempts
-    /// could not download it (#5799); carries how long is left. Like
-    /// [`RateLimited`], this is not a "no update" signal: the caller keeps its
-    /// driving signal and must NOT fall through to the legacy "max-backoff + 0
-    /// connections -> exit 42" fallback. The check backoff grows, so the
-    /// signal is re-checked at most hourly and acted on once the cooldown ends.
+    /// could not download it (#5799). Like [`RateLimited`], this is not a "no
+    /// update" signal: the caller keeps its driving signal, holds every update
+    /// trigger for `remaining` (see [`UpdateHold`]), and must NOT fall through
+    /// to the legacy "max-backoff + 0 connections -> exit 42" fallback. The
+    /// check backoff is left alone rather than grown, so this result never
+    /// walks a node toward that fallback.
     ///
     /// [`RateLimited`]: UpdateCheckResult::RateLimited
-    CoolingDown(Duration),
+    CoolingDown {
+        version: String,
+        remaining: Duration,
+    },
 }
 
 /// Check if an update is available, respecting rate limits and failure counts.
@@ -528,17 +532,22 @@ pub async fn check_if_update_available(current_version: &str) -> UpdateCheckResu
                     increase_backoff();
                     return UpdateCheckResult::PinnedKnownBad;
                 }
-                if let Some(remaining) = super::rollback::update_cooldown_remaining(&latest) {
+                if let Some(remaining) =
+                    super::rollback::update_cooldown_remaining(&latest, node_is_urgent())
+                {
                     tracing::info!(
                         version = %latest,
                         retry_in_min = remaining.as_secs().div_ceil(60),
                         "Newer version is cooling down after failed downloads; not exiting for \
                          it yet (#5799)"
                     );
-                    // Grow the backoff, as for a pinned version: there is
-                    // nothing to act on until the cooldown ends.
-                    increase_backoff();
-                    return UpdateCheckResult::CoolingDown(remaining);
+                    // The backoff is NOT grown: at its maximum a plain
+                    // `Skipped` feeds the gateway-trust exit-42 fallback. The
+                    // caller's hold keeps the triggers quiet instead.
+                    return UpdateCheckResult::CoolingDown {
+                        version: latest,
+                        remaining,
+                    };
                 }
                 tracing::info!(
                     current = %current_version,
@@ -2012,6 +2021,117 @@ pub fn jittered_repoll_interval(base: Duration, jitter_fraction: f64, rand_unit:
     base.mul_f64(factor)
 }
 
+// =============================================================================
+// Holding the update triggers after the node decided to stay (#5799)
+// =============================================================================
+
+/// Whether the node gains nothing from staying on its current binary: a peer
+/// requires a newer version than ours, or it has no connections. Such a node's
+/// update cooldown is capped at an hour (see
+/// `rollback::update_cooldown_remaining_at`).
+pub fn node_is_urgent() -> bool {
+    freenet::transport::is_urgent_update() || get_open_connection_count() == 0
+}
+
+/// Whether auto-update is locked out after repeated failed installs (#3934),
+/// so that claiming an attempt would spend the once-a-day retry.
+pub(crate) fn is_locked_out() -> bool {
+    get_update_failure_count() >= MAX_UPDATE_FAILURES
+}
+
+/// Keeps the update triggers quiet after the node decided to stay on its
+/// current binary (#5799), so they neither re-poll GitHub every minute for a
+/// release they cannot fetch nor fall into the exit-42 fallbacks meanwhile.
+///
+/// A hold is for one release (`version`), or for whatever the latest release
+/// is when the node did not know which one it was preparing. A trigger that
+/// knows of a DIFFERENT release is not held: a newer release starts afresh.
+/// The driving signals (urgent, version mismatch, stagger) are left in place,
+/// so they act again as soon as the hold ends.
+#[derive(Debug, Default)]
+pub struct UpdateHold {
+    until: Option<std::time::Instant>,
+    version: Option<String>,
+}
+
+impl UpdateHold {
+    /// Whether a trigger for `version` (`None`: one that does not know which
+    /// release it would install) may prepare an update at `now`.
+    pub fn allows(&self, version: Option<&str>, now: std::time::Instant) -> bool {
+        match self.until {
+            None => true,
+            Some(until) if now >= until => true,
+            Some(_) => matches!(
+                (version, self.version.as_deref()),
+                (Some(found), Some(held)) if found != held
+            ),
+        }
+    }
+
+    /// Hold the triggers for `version` until `now + retry_in`, and return when
+    /// that is.
+    pub fn hold(
+        &mut self,
+        version: Option<String>,
+        retry_in: Duration,
+        now: std::time::Instant,
+    ) -> std::time::Instant {
+        let until = now + retry_in;
+        self.until = Some(until);
+        self.version = version;
+        until
+    }
+}
+
+/// Longest extra wait after a hold ends before the re-poll that follows it,
+/// so nodes that failed together do not all retry in the same minute.
+pub const HOLD_REPOLL_JITTER: Duration = Duration::from_secs(5 * 60);
+
+/// When the periodic re-poll should next run, given a hold that ends at
+/// `hold_until` and a uniform sample `rand_unit` in `[0, 1]`. Pulled in to
+/// just after the hold, so a release that could not be fetched is retried
+/// when its cooldown ends rather than at the next 6 h re-poll; never pushed
+/// later than it already was.
+pub fn repoll_after_hold(
+    next_repoll: std::time::Instant,
+    hold_until: std::time::Instant,
+    rand_unit: f64,
+) -> std::time::Instant {
+    next_repoll.min(hold_until + HOLD_REPOLL_JITTER.mul_f64(rand_unit.clamp(0.0, 1.0)))
+}
+
+/// What the startup check and the periodic re-poll do with a newer release.
+#[derive(Debug, PartialEq, Eq)]
+pub enum NewerRelease {
+    /// Pinned known-bad or install-gated (#4073): the installer would refuse it.
+    Blocked,
+    /// Cooling down after failed downloads (#5799): hold for this long.
+    CoolingDown(Duration),
+    /// Prepare it.
+    Trigger,
+}
+
+/// Pure decision behind [`decide_newer_release`].
+pub(crate) fn decide_newer_release_from(
+    blocked: bool,
+    cooling_down: Option<Duration>,
+) -> NewerRelease {
+    match (blocked, cooling_down) {
+        (true, _) => NewerRelease::Blocked,
+        (false, Some(remaining)) => NewerRelease::CoolingDown(remaining),
+        (false, None) => NewerRelease::Trigger,
+    }
+}
+
+/// [`decide_newer_release_from`] against this node's state.
+pub fn decide_newer_release(version: &str, urgent: bool) -> NewerRelease {
+    decide_newer_release_from(
+        super::rollback::is_version_pinned_bad(version)
+            || super::rollback::is_version_install_gated(version),
+        super::rollback::update_cooldown_remaining(version, urgent),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     /// A transient read error must not be persisted as a permanent lockout.
@@ -2711,24 +2831,89 @@ mod tests {
         // CRLF-normalised for a Windows checkout, so the `\n` anchors match.
         let src = include_str!("auto_update.rs").replace("\r\n", "\n");
         let body = fn_body(&src, "pub async fn check_if_update_available(");
-        let cooling = body
-            .find("if let Some(remaining) = super::rollback::update_cooldown_remaining(&latest) {")
+        let flat: String = body.split_whitespace().collect();
+        let cooling = flat
+            .find(concat!(
+                "ifletSome(remaining)=",
+                "super::rollback::update_cooldown_remaining(&latest,node_is_urgent()){"
+            ))
             .expect("check_if_update_available must consult the update cooldown (#5799)");
-        let arm = &body[cooling..];
+        let arm = &flat[cooling..];
         let arm = &arm[..arm
-            .find("\n                }\n")
-            .expect("end of cooldown branch")];
+            .find("returnUpdateCheckResult::CoolingDown{")
+            .expect("returns CoolingDown")];
+        // #5799 review E: growing the backoff here walked a cooling-down node
+        // into the max-backoff "trust the gateway, exit 42" fallback.
         assert!(
-            arm.contains("increase_backoff();")
-                && arm.contains("return UpdateCheckResult::CoolingDown(remaining);"),
-            "a cooling-down release must grow the backoff and return CoolingDown: {arm}"
+            !arm.contains("increase_backoff()"),
+            "a cooling-down release must not grow the backoff: {arm}"
         );
-        let confirmed = body
+        let confirmed = flat
             .find("UpdateCheckResult::UpdateAvailable(latest)")
             .expect("UpdateAvailable not found");
         assert!(
             cooling < confirmed,
             "the cooldown must be consulted before an update is confirmed (#5799)"
+        );
+    }
+
+    #[test]
+    fn a_hold_is_for_one_release_and_ends() {
+        let now = std::time::Instant::now();
+        let hour = Duration::from_secs(3600);
+        let mut hold = UpdateHold::default();
+        assert!(hold.allows(None, now) && hold.allows(Some("0.2.141"), now));
+
+        let until = hold.hold(Some("0.2.141".into()), hour, now);
+        assert_eq!(until, now + hour);
+        assert!(
+            !hold.allows(None, now),
+            "a trigger that knows no version waits"
+        );
+        assert!(!hold.allows(Some("0.2.141"), now), "the held release waits");
+        assert!(
+            hold.allows(Some("0.2.142"), now),
+            "a different release starts afresh"
+        );
+        assert!(hold.allows(None, until) && hold.allows(Some("0.2.141"), until));
+
+        // Held for whatever the latest release is: everything waits.
+        hold.hold(None, hour, now);
+        assert!(!hold.allows(Some("0.2.142"), now));
+        assert!(hold.allows(Some("0.2.142"), now + hour));
+    }
+
+    #[test]
+    fn the_repoll_is_pulled_in_to_just_after_a_hold_never_pushed_out() {
+        let now = std::time::Instant::now();
+        let hour = Duration::from_secs(3600);
+        let six_hours = now + hour * 6;
+        assert_eq!(repoll_after_hold(six_hours, now + hour, 0.0), now + hour);
+        assert_eq!(
+            repoll_after_hold(six_hours, now + hour, 1.0),
+            now + hour + HOLD_REPOLL_JITTER
+        );
+        assert_eq!(
+            repoll_after_hold(now + hour, now + hour * 6, 0.5),
+            now + hour
+        );
+    }
+
+    #[test]
+    fn newer_release_decision() {
+        let hour = Duration::from_secs(3600);
+        assert_eq!(
+            decide_newer_release_from(true, Some(hour)),
+            NewerRelease::Blocked
+        );
+        assert_eq!(decide_newer_release_from(true, None), NewerRelease::Blocked);
+        assert_eq!(
+            decide_newer_release_from(false, Some(hour)),
+            NewerRelease::CoolingDown(hour)
+        );
+        assert_eq!(
+            decide_newer_release_from(false, None),
+            NewerRelease::Trigger
         );
     }
 

@@ -11,7 +11,9 @@ use std::process::Command;
 use super::rollback;
 
 mod staged;
-pub(crate) use staged::{discard_stale as discard_stale_staged, stage_latest_release};
+pub(crate) use staged::{
+    UpdatePreparation, UpdateTarget, discard_stale as discard_stale_staged, stage_latest_release,
+};
 
 #[cfg(target_os = "macos")]
 use super::service::generate_wrapper_script;
@@ -215,22 +217,26 @@ pub fn update_counter_action(outcome: UpdateSubprocessOutcome) -> UpdateCounterA
     }
 }
 
-/// Record that installing `version` failed for a transient reason, so the
-/// node's update triggers leave it alone for a cooldown instead of exiting for
-/// it again at once (#5799). Also says so on stderr even under `--quiet`: this
-/// is the line a supervisor's log (systemd's journal, the Windows wrapper's
-/// log) needs in order to show why an update did not happen.
-fn note_transient_install_failure(version: &str, error: &anyhow::Error) {
+/// Record that installing `version` failed for a reason other than a bad
+/// release (a verification failure counts toward the #4073 gate instead), so
+/// the node's update triggers hold it for a cooldown instead of exiting for it
+/// again at once (#5799). Usually that reason is the network; it can also be
+/// local, such as a binary this account cannot replace, which `replace_binary`
+/// additionally counts toward the #3934 lockout. Also says so on stderr even
+/// under `--quiet`: this is the line a supervisor's log (systemd's journal,
+/// the Windows wrapper's log, the macOS wrapper's log) needs in order to show
+/// why an update did not happen.
+fn note_install_failure(version: &str, error: &anyhow::Error) {
     let failures = super::rollback::record_update_cooldown(version, &format!("{error:#}"));
     let streak = match failures {
-        0 => String::new(),
-        n => format!(" (failure {n} in a row)"),
+        Some(n) => format!(" (failure {n} in a row)"),
+        None => String::new(),
     };
     #[allow(clippy::let_underscore_must_use)]
     let _ = writeln!(
         io::stderr(),
-        "Freenet update to {version} failed{streak}: {error:#}. The node keeps running its \
-         current version and tries again after a cooldown (#5799)."
+        "Freenet update to {version} failed{streak}: {error:#}. Auto-update holds this release \
+         for a cooldown before trying it again (#5799)."
     );
 }
 
@@ -518,7 +524,7 @@ impl UpdateCommand {
             Err(e) => {
                 // The asset list could not be fetched (network, rate limit, a
                 // release whose assets have not appeared yet): transient.
-                note_transient_install_failure(latest_version, &e);
+                note_install_failure(latest_version, &e);
                 return Err(e);
             }
         };
@@ -558,7 +564,7 @@ impl UpdateCommand {
                 } else {
                     // transient bundle failure: leave the gate unchanged, but
                     // cool the release down (#5799).
-                    note_transient_install_failure(
+                    note_install_failure(
                         latest_version,
                         &anyhow::anyhow!("the app bundle update could not be downloaded"),
                     );
@@ -586,7 +592,7 @@ impl UpdateCommand {
             // old binary, detects this release again and exits for it again
             // within minutes, indefinitely. The cooldown always expires, so it
             // delays this release, never suppresses it.
-            Err(e) => note_transient_install_failure(latest_version, e),
+            Err(e) => note_install_failure(latest_version, e),
         }
         install_result.map(|_| ())
     }
@@ -4210,15 +4216,15 @@ done
             .collect();
         for (needle, why) in [
             (
-                "Err(e)=>{note_transient_install_failure(latest_version,&e);returnErr(e);}",
+                "Err(e)=>{note_install_failure(latest_version,&e);returnErr(e);}",
                 "a failed asset-list fetch",
             ),
             (
-                "Err(e)=>note_transient_install_failure(latest_version,e),}install_result",
+                "Err(e)=>note_install_failure(latest_version,e),}install_result",
                 "the catch-all transient install error",
             ),
             (
-                "}else{note_transient_install_failure(latest_version,",
+                "}else{note_install_failure(latest_version,",
                 "a transient app-bundle failure",
             ),
             (
@@ -4240,7 +4246,7 @@ done
         // CRLF-normalised for a Windows checkout, so the `\n}\n` anchor matches.
         let src = SRC.replace("\r\n", "\n");
         let note = src
-            .split_once("\nfn note_transient_install_failure(")
+            .split_once("\nfn note_install_failure(")
             .expect("helper not found")
             .1;
         let note = &note[..note.find("\n}\n").expect("end of helper")];
