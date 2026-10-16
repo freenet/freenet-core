@@ -4642,10 +4642,26 @@ mod tests {
     ///    request at once while nothing bounds the warm refreshes that follow.
     #[tokio::test]
     async fn refresh_lock_table_is_bounded_prunes_safely_and_overflows_per_contract() {
+        // Hang detector only, not a fix: a regression that locks in the fill
+        // below would self-deadlock, and this makes it fail loudly in-process.
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            refresh_lock_table_scenario(),
+        )
+        .await
+        .expect(
+            "refresh-lock table scenario hung: the fill must not await a tokio \
+             mutex it already holds (overflow stripes are shared by id hash)",
+        );
+    }
+
+    async fn refresh_lock_table_scenario() {
         // Simulate sibling tests of the same process that hold table entries
-        // (`refresh_cache_if_due` holds one for the length of a refresh). More
-        // than REFRESH_LOCK_OVERFLOW_STRIPES of them guarantees (pigeonhole)
-        // that two of this test's ids land on one overflow stripe.
+        // (`refresh_cache_if_due` holds one for the length of a refresh). With
+        // more than REFRESH_LOCK_OVERFLOW_STRIPES of them, a fill that LOCKED
+        // every id would put two ids on one overflow stripe (pigeonhole) and
+        // deadlock deterministically. The fill below does not lock, so it
+        // cannot.
         let siblings: Vec<_> = (0..(REFRESH_LOCK_OVERFLOW_STRIPES + 6))
             .map(|i| {
                 let mut bytes = [0u8; 32];
@@ -4655,6 +4671,12 @@ mod tests {
                 (id, refresh_lock_for(&id))
             })
             .collect();
+        for (id, _) in &siblings {
+            assert!(
+                CONTRACT_REFRESH_LOCKS.contains_key(id),
+                "a simulated sibling must actually occupy a table entry"
+            );
+        }
         let mut bytes = [0u8; 32];
         bytes[0] = 0x3c;
         let held_id = ContractInstanceId::new(bytes);
@@ -4702,12 +4724,15 @@ mod tests {
         // and two of them can share one; awaiting a tokio mutex this task
         // already holds is a self-deadlock production never reaches (one lock
         // per task). Fill until a new id is refused admission (the prune
-        // has nothing left to reclaim) rather than for a fixed count, so the
-        // number of siblings and leftover entries does not matter.
+        // has nothing left to reclaim) rather than for a fixed count, so
+        // leftover unheld entries and any number of held sibling entries only
+        // change how many ids fit, not whether the loop ends. The assertions
+        // after the loop use the id that was actually refused, so a real
+        // sibling freeing an entry afterwards cannot make them race.
         let mut held = Vec::with_capacity(MAX_REFRESH_LOCKS);
         let mut held_ids = Vec::with_capacity(MAX_REFRESH_LOCKS);
         let mut i = 0u64;
-        loop {
+        let (refused_id, refused_lock) = loop {
             assert!(
                 i <= 2 * MAX_REFRESH_LOCKS as u64,
                 "the refresh-lock table never filled; is something removing entries?"
@@ -4721,32 +4746,37 @@ mod tests {
             if !CONTRACT_REFRESH_LOCKS.contains_key(&id) {
                 // Not admitted: the prune found nothing left to reclaim, so
                 // the table is full of held entries (`lock` is an overflow
-                // stripe and is dropped).
-                break;
+                // stripe).
+                break (id, lock);
             }
             held.push(lock);
             held_ids.push(id);
-        }
-
-        let mut bytes = [0u8; 32];
-        bytes[0] = 0x40;
-        let newcomer = ContractInstanceId::new(bytes);
-        let first = refresh_lock_for(&newcomer);
-        let second = refresh_lock_for(&newcomer);
+        };
+        // Slack for real siblings holding entries; catches a cap lowered well
+        // below MAX_REFRESH_LOCKS, which would otherwise refuse early.
         assert!(
-            !CONTRACT_REFRESH_LOCKS.contains_key(&newcomer),
-            "a full table must not admit another entry — that is the cap"
+            held.len() + siblings.len() + 1 >= MAX_REFRESH_LOCKS - 256,
+            "the table refused admission after only {} held entries; is the cap \
+             below MAX_REFRESH_LOCKS?",
+            held.len()
         );
         assert!(
-            Arc::ptr_eq(&first, &second),
-            "two callers for one contract must still meet on the same mutex \
-             when the table is full, or the overflow path silently stops \
-             coalescing every request at once"
-        );
-        assert!(
-            Arc::ptr_eq(&first, &overflow_refresh_lock(&newcomer)),
+            Arc::ptr_eq(&refused_lock, &overflow_refresh_lock(&refused_id)),
             "the full-table path must hand out the contract's overflow stripe"
         );
+        let again = refresh_lock_for(&refused_id);
+        // Skip only if a real sibling freed an entry in the instant since the
+        // refusal, which legitimately admits the id.
+        if !CONTRACT_REFRESH_LOCKS.contains_key(&refused_id) {
+            assert!(
+                Arc::ptr_eq(&refused_lock, &again),
+                "two callers for one contract must still meet on the same mutex \
+                 when the table is full, or the overflow path silently stops \
+                 coalescing every request at once"
+            );
+        }
+        drop(again);
+        drop(refused_lock);
 
         drop(held_lock);
         drop(held);
