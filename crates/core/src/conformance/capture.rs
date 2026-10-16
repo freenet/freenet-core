@@ -716,6 +716,11 @@ async fn run_writer(
                         continue;
                     }
                 };
+                // Counted for every observed merge, BEFORE `record` applies the
+                // scope: focus weighting needs to know which contracts are busy
+                // before they are focused, and `record` discards out-of-focus
+                // observations (#5913).
+                shadow.note_merge(observation.contract);
                 if let Some(evicted) = record(&mut samplers, &scope, observation) {
                     // Dropping the entry alone orphans the file: eviction fires on
                     // every rotation once the map is full, so the directory would
@@ -808,7 +813,13 @@ async fn run_writer(
                         tracked = samplers.len(),
                         candidates = focus.candidates,
                         candidate_source = focus.source.as_str(),
+                        active_candidates = focus.active_candidates,
                         focused = focus.selected.len(),
+                        // Focus contracts that have had no merge at all so far this
+                        // period: never examined, as opposed to examined and clean.
+                        unobserved_this_period = shadow.unobserved_this_period(),
+                        activity_tracked = shadow.activity_tracked(),
+                        activity_evicted = shadow.activity_evicted(),
                         scope = scope.as_str(),
                         // The two counts the dashboard is fed just below, under the
                         // names the completed-probe line uses for them. Without these
@@ -885,6 +896,7 @@ async fn run_writer(
                     awaiting_samples,
                 );
                 shadow.record(&findings);
+                shadow.note_judged(&report.judged);
                 // Reported even when nothing was checked. A shadow period that finds
                 // nothing and a shadow period that never ran look identical in a
                 // findings-only log, and telling them apart is most of what this
@@ -906,8 +918,18 @@ async fn run_writer(
                     // back to whatever the sampler already held.
                     candidates = last_focus.candidates,
                     candidate_source = last_focus.source.as_str(),
+                    // How many candidates focus weighted by recent merges (#5913).
+                    // Zero means this period's draw was uniform.
+                    active_candidates = last_focus.active_candidates,
                     scope = scope.as_str(),
                     focused = report.focused,
+                    // Never examined, kept beside examined-and-clean: focus contracts
+                    // with no merge observed so far this period.
+                    unobserved_this_period = shadow.unobserved_this_period(),
+                    activity_tracked = shadow.activity_tracked(),
+                    // Non-zero means the activity map hit its cap and busy contracts
+                    // may be reading as cold. Visible in release builds on purpose.
+                    activity_evicted = shadow.activity_evicted(),
                     probed = report.probed,
                     cases = report.cases,
                     inconclusive = report.inconclusive,
@@ -2252,6 +2274,86 @@ mod probe_wiring_pins {
                  — or, worse, the helper's own version has drifted from it"
             );
         }
+    }
+
+    /// Byte offset of `call` in `body` where it sits at statement position: nothing
+    /// but whitespace before it on its line. A commented-out call is filtered by
+    /// `run_writer_code_only`; this rejects one moved into an expression or a
+    /// branch-shaped prefix (see `.claude/rules/bug-prevention-patterns.md`).
+    fn statement_at(body: &str, call: &str) -> Option<usize> {
+        body.match_indices(call).map(|(i, _)| i).find(|i| {
+            let line_start = body[..*i].rfind('\n').map_or(0, |n| n + 1);
+            body[line_start..*i].trim().is_empty()
+        })
+    }
+
+    /// Every observed merge must reach focus weighting, BEFORE the scope filter.
+    ///
+    /// `record` discards out-of-focus observations, so counting after it (or inside
+    /// it, behind the scope check) would only ever count contracts that are already
+    /// focused, and weighting would favour nothing new: #5913 reinstated with every
+    /// test of the weighting itself still green. Nothing calls `run_writer`, so only a
+    /// pin can see the order.
+    #[test]
+    fn every_observed_merge_is_counted_before_the_scope_filter() {
+        let body = run_writer_code_only();
+        let transition = body
+            .find("CaptureMsg::Transition(observation) => *observation")
+            .expect("run_writer no longer unpacks transitions this way; re-anchor");
+        let counted = statement_at(&body, "shadow.note_merge(observation.contract);").expect(
+            "run_writer no longer feeds observed merges to focus weighting, so focus \
+             falls back to a uniform draw over a mostly-cold hosted set (#5913)",
+        );
+        let filtered = statement_at(
+            &body,
+            "if let Some(evicted) = record(&mut samplers, &scope, observation)",
+        )
+        .expect("run_writer no longer records observations this way; re-anchor");
+        assert!(
+            transition < counted && counted < filtered,
+            "merge activity is counted outside the transition path or after `record` \
+             filters by scope, so out-of-focus merges never reach the weighting"
+        );
+    }
+
+    /// A completed probe's verdicts must reach the focus period, or every period
+    /// summary reports `judged=0` and the #5913 acceptance measure reads as failing
+    /// whatever focus does.
+    #[test]
+    fn judged_contracts_reach_the_focus_period() {
+        let body = run_writer_code_only();
+        assert!(
+            statement_at(&body, "shadow.note_judged(&report.judged);").is_some(),
+            "run_writer no longer tells the focus period which contracts were judged"
+        );
+    }
+
+    /// Both tick lines carry `unobserved_this_period` and `active_candidates`.
+    ///
+    /// The barren line is the one #5913's peer logged 49 times in a row; leaving the
+    /// field off it would hide "never examined" on exactly the tick shape where it
+    /// matters most. Counted, so a third tick line cannot satisfy the pin for one of
+    /// the two that lack it.
+    #[test]
+    fn both_tick_lines_report_never_examined_beside_examined() {
+        let body = run_writer_code_only();
+        let lines = body.matches("\"conformance shadow tick").count();
+        assert_eq!(
+            lines, 2,
+            "expected two shadow tick lines; re-check this pin"
+        );
+        assert_eq!(
+            body.matches("unobserved_this_period = shadow.unobserved_this_period()")
+                .count(),
+            lines,
+            "a shadow tick line does not report focus contracts with no merges, so a \
+             never-examined period reads like a clean one"
+        );
+        assert_eq!(
+            body.matches("active_candidates =").count(),
+            lines,
+            "a shadow tick line does not say whether selection was weighted"
+        );
     }
 
     #[test]

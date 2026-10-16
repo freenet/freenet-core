@@ -40,6 +40,7 @@ use freenet_stdlib::prelude::ContractInstanceId;
 // time budget cuts a probe short without actually spending ten seconds doing it.
 use tokio::time::Instant;
 
+use super::activity::MergeActivity;
 use super::bundle::ReplayBundle;
 use super::focus::FocusSelector;
 use super::generator::{GeneratorConfig, generate_cases};
@@ -237,7 +238,6 @@ impl ShadowReport {
     }
 }
 
-/// The shadow loop's state, owned by the capture writer task.
 /// Where this tick's focus candidates came from.
 ///
 /// Reported on every tick rather than assumed. The two sources have very different
@@ -315,9 +315,122 @@ pub(crate) struct FocusTick {
     /// How many contracts were eligible. Distinguishes "this peer hosts almost
     /// nothing" from "selection is broken".
     pub candidates: usize,
+    /// How many of those candidates had recent merge activity in the weights this
+    /// period selects with (#5913).
+    ///
+    /// Zero means selection was uniform this tick: either the peer has observed no
+    /// merges for anything it hosts, or it restarted and has not reached its first
+    /// probe tick. Without this a uniform draw and a weighted one log identically.
+    pub active_candidates: usize,
     pub source: CandidateSource,
 }
 
+/// What one focus period established, reported when the period ends.
+///
+/// The point is the `unobserved` count. A focus contract that received no merge for
+/// its whole time in focus was never examined, and a period of those reads as a clean
+/// period in any log that only counts findings. #5913's twelve-hour run was exactly
+/// that: 49 ticks, every focused contract `tracked=0`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct FocusPeriodSummary {
+    /// The epoch that ended.
+    pub epoch: u64,
+    /// Focus stints in the period: each contract selected, counted once per
+    /// continuous stretch in focus. Usually the focus size, more when the hosted set
+    /// changed mid-period and moved focus.
+    pub focused: usize,
+    /// Stints that ended with zero merges observed for the contract while it was in
+    /// focus. These contracts were never examined, not examined and found clean.
+    pub unobserved: usize,
+    /// Stints in which at least one probe reached a verdict on the contract.
+    pub judged: usize,
+}
+
+/// Per-period bookkeeping for the focus contracts, so "never examined" stays visible.
+///
+/// Bounded by the focus size: only the CURRENT focus contracts are held, and a
+/// contract leaving focus is folded into three counters at once.
+#[derive(Debug, Default)]
+struct FocusPeriod {
+    current: HashMap<ContractInstanceId, PeriodMember>,
+    departed: usize,
+    departed_unobserved: usize,
+    departed_judged: usize,
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct PeriodMember {
+    observations: u64,
+    judged: bool,
+}
+
+impl FocusPeriod {
+    /// Make `selected` the current focus set, folding any contract leaving it into
+    /// the departed counts.
+    fn enter(&mut self, selected: &[ContractInstanceId]) {
+        let leaving: Vec<ContractInstanceId> = self
+            .current
+            .keys()
+            .filter(|id| !selected.contains(id))
+            .copied()
+            .collect();
+        for id in leaving {
+            if let Some(member) = self.current.remove(&id) {
+                self.fold(member);
+            }
+        }
+        for id in selected {
+            self.current.entry(*id).or_default();
+        }
+    }
+
+    fn fold(&mut self, member: PeriodMember) {
+        self.departed += 1;
+        if member.observations == 0 {
+            self.departed_unobserved += 1;
+        }
+        if member.judged {
+            self.departed_judged += 1;
+        }
+    }
+
+    fn observe(&mut self, contract: &ContractInstanceId) {
+        if let Some(member) = self.current.get_mut(contract) {
+            member.observations = member.observations.saturating_add(1);
+        }
+    }
+
+    fn judged(&mut self, contract: &ContractInstanceId) {
+        if let Some(member) = self.current.get_mut(contract) {
+            member.judged = true;
+        }
+    }
+
+    fn unobserved_now(&self) -> usize {
+        self.current
+            .values()
+            .filter(|member| member.observations == 0)
+            .count()
+    }
+
+    /// Close the period and start an empty one.
+    fn finish(&mut self, epoch: u64) -> FocusPeriodSummary {
+        let current: Vec<PeriodMember> = self.current.drain().map(|(_, m)| m).collect();
+        for member in current {
+            self.fold(member);
+        }
+        let summary = FocusPeriodSummary {
+            epoch,
+            focused: self.departed,
+            unobserved: self.departed_unobserved,
+            judged: self.departed_judged,
+        };
+        *self = FocusPeriod::default();
+        summary
+    }
+}
+
+/// The shadow loop's state, owned by the capture writer task.
 pub struct ShadowRunner {
     mode: EnforcementMode,
     selector: FocusSelector,
@@ -329,6 +442,17 @@ pub struct ShadowRunner {
     /// on rotation, which is also what makes the log a per-epoch summary rather than
     /// an ever-growing set.
     logged: HashSet<(ContractInstanceId, ConformanceProperty)>,
+    /// Merges observed per contract, decayed once per period (#5913).
+    activity: MergeActivity,
+    /// The activity this period selects with, frozen when the period starts.
+    ///
+    /// Frozen rather than read live because focus is recomputed every tick: live
+    /// weights would move focus whenever the counts moved, abandoning half-built
+    /// samples mid-period, which is what rotating only at period boundaries exists to
+    /// prevent. Selection is therefore deterministic given (salt, epoch, this map).
+    weights: HashMap<ContractInstanceId, u32>,
+    /// What the current period's focus contracts have and have not seen.
+    period: FocusPeriod,
 }
 
 impl ShadowRunner {
@@ -348,6 +472,9 @@ impl ShadowRunner {
             ticks: 0,
             dir: dir.to_path_buf(),
             logged: HashSet::new(),
+            activity: MergeActivity::default(),
+            weights: HashMap::new(),
+            period: FocusPeriod::default(),
         }
     }
 
@@ -360,13 +487,71 @@ impl ShadowRunner {
     /// Separate from [`focus`](Self::focus) so focus can be computed at startup
     /// without consuming a tick. Rotation counts probe ticks rather than wall time so
     /// a peer that was down does not skip epochs it never sampled in.
-    pub(crate) fn advance(&mut self) {
+    ///
+    /// On rotation it also closes the focus period (logged, and returned so a test can
+    /// read it), freezes the activity the next period selects with, and then decays
+    /// the activity counts, so their half-life is one period.
+    ///
+    /// Between rotations the frozen weights are replaced only while they are EMPTY.
+    /// That is the restart path: activity is not persisted, so a restarted peer
+    /// selects uniformly until its first probe tick and then weights by what it has
+    /// observed since starting, rather than waiting up to a whole period. It is also
+    /// the path for a peer whose last period saw no merges at all. Once non-empty, the
+    /// weights hold until the period ends.
+    pub(crate) fn advance(&mut self) -> Option<FocusPeriodSummary> {
         self.ticks = self.ticks.wrapping_add(1);
         if self.ticks % ROTATE_EVERY_TICKS == 0 {
+            let ended = self.period.finish(self.selector.epoch());
+            tracing::info!(
+                epoch = ended.epoch,
+                focused = ended.focused,
+                unobserved = ended.unobserved,
+                judged = ended.judged,
+                "conformance focus period ended"
+            );
             self.selector.rotate();
             self.logged.clear();
             store_epoch(&self.dir, self.selector.epoch());
+            self.weights = self.activity.snapshot();
+            self.activity.decay();
+            return Some(ended);
         }
+        if self.weights.is_empty() {
+            self.weights = self.activity.snapshot();
+        }
+        None
+    }
+
+    /// Count a merge the capture task observed.
+    ///
+    /// Called for EVERY observed merge, focused or not, because weighting has to
+    /// know about contracts that are not in focus yet. It must stay ahead of the scope
+    /// filter in `capture::run_writer`, which discards out-of-focus observations.
+    pub(crate) fn note_merge(&mut self, contract: ContractInstanceId) {
+        self.activity.record(contract);
+        self.period.observe(&contract);
+    }
+
+    /// Record which focus contracts a completed probe reached a verdict on.
+    pub(crate) fn note_judged(&mut self, judged: &[JudgedContract]) {
+        for contract in judged {
+            self.period.judged(&contract.contract);
+        }
+    }
+
+    /// Current focus contracts with no merge observed so far this period.
+    pub(crate) fn unobserved_this_period(&self) -> usize {
+        self.period.unobserved_now()
+    }
+
+    /// Contracts whose merge activity is being tracked.
+    pub(crate) fn activity_tracked(&self) -> usize {
+        self.activity.len()
+    }
+
+    /// Activity entries evicted at the tracking cap since this runner started.
+    pub(crate) fn activity_evicted(&self) -> u64 {
+        self.activity.evicted()
     }
 
     /// The contracts this peer should be watching right now.
@@ -392,8 +577,13 @@ impl ShadowRunner {
     /// silent, but reinstates exactly the #5366 horizon - so the tick reports which
     /// source it used. `candidates=sampler` means focus has stopped covering the
     /// hosted set, a state that otherwise looks identical to a peer hosting little.
+    ///
+    /// Selection within the pool is weighted by recent merge activity (#5913): a
+    /// contract that receives no merges while focused cannot be sampled, so uniform
+    /// focus over a mostly-cold hosted set judged nothing. Activity only weights the
+    /// pool; it never adds to it, so focus still comes from the hosted set.
     pub(crate) fn focus(
-        &self,
+        &mut self,
         hosted: Option<Vec<ContractInstanceId>>,
         fallback: &[ContractInstanceId],
     ) -> FocusTick {
@@ -401,9 +591,19 @@ impl ShadowRunner {
             return FocusTick::default();
         }
         let (candidates, source) = candidate_pool(hosted, fallback);
+        let weights = &self.weights;
+        let selected = self
+            .selector
+            .select_weighted(&candidates, |id| weights.get(id).copied().unwrap_or(0));
+        let active_candidates = candidates
+            .iter()
+            .filter(|id| weights.contains_key(id))
+            .count();
+        self.period.enter(&selected);
         FocusTick {
-            selected: self.selector.select(&candidates),
+            selected,
             candidates: candidates.len(),
+            active_candidates,
             source,
         }
     }
@@ -943,7 +1143,7 @@ pub(crate) async fn probe_fixture_contract(
     }
 
     let dir = tempfile::TempDir::new()?;
-    let runner = ShadowRunner::new(dir.path(), EnforcementMode::Shadow);
+    let mut runner = ShadowRunner::new(dir.path(), EnforcementMode::Shadow);
     let focus = runner.focus(None, &samplers.keys().copied().collect::<Vec<_>>());
     let (work, awaiting) = runner.select(&focus, &samplers);
     assert!(
@@ -1242,7 +1442,7 @@ mod tests {
     #[tokio::test]
     async fn focus_selects_from_the_hosted_set_it_is_given() -> anyhow::Result<()> {
         let dir = tempfile::TempDir::new()?;
-        let runner = ShadowRunner::new(dir.path(), EnforcementMode::Shadow);
+        let mut runner = ShadowRunner::new(dir.path(), EnforcementMode::Shadow);
         let hosted: Vec<_> = (10..40u8).map(instance).collect();
 
         let tick = runner.focus(Some(hosted.clone()), &[instance(1), instance(2)]);
@@ -1310,6 +1510,230 @@ mod tests {
 
     fn instance(n: u8) -> ContractInstanceId {
         ContractInstanceId::new([n; 32])
+    }
+
+    // ------------------------------------------------- activity-weighted focus (#5913)
+
+    /// A runner whose salt is fixed, so a test of the wiring is deterministic rather
+    /// than depending on whatever `OsRng` drew for this temp dir.
+    fn runner_with_salt(dir: &Path, salt: [u8; 32]) -> ShadowRunner {
+        std::fs::write(dir.join(SALT_FILE), salt).expect("write salt");
+        ShadowRunner::new(dir, EnforcementMode::Shadow)
+    }
+
+    /// 60 hosted contracts, of which the first ten are busy.
+    fn hosted_with_busy() -> (Vec<ContractInstanceId>, Vec<ContractInstanceId>) {
+        let hosted: Vec<_> = (0..60u8).map(instance).collect();
+        let busy = hosted[..10].to_vec();
+        (hosted, busy)
+    }
+
+    /// A salt for which the uniform draw over `hosted_with_busy` misses every busy
+    /// contract. Searched for rather than hard-coded, so the precondition is checked
+    /// rather than assumed, and a change to the scoring cannot leave this test
+    /// asserting against a draw that happens to hit anyway.
+    fn salt_where_uniform_misses_busy() -> [u8; 32] {
+        let (hosted, busy) = hosted_with_busy();
+        (0..=255u8)
+            .map(|n| [n; 32])
+            .find(|salt| {
+                FocusSelector::new(*salt, MAX_FOCUS_CONTRACTS)
+                    .select(&hosted)
+                    .iter()
+                    .all(|c| !busy.contains(c))
+            })
+            .expect("no salt in 256 has a uniform draw missing ten of sixty contracts")
+    }
+
+    /// The wiring, end to end through the runner: merges counted by `note_merge`
+    /// reach focus at the next probe tick, and focus then lands on a busy contract
+    /// that the uniform draw for the same salt and epoch missed.
+    ///
+    /// This is also the restart path: a fresh runner has no activity, selects
+    /// uniformly, and weights from its first probe tick rather than a period later.
+    #[test]
+    fn merges_observed_before_a_probe_tick_steer_focus_toward_busy_contracts() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut runner = runner_with_salt(dir.path(), salt_where_uniform_misses_busy());
+        let (hosted, busy) = hosted_with_busy();
+
+        let before = runner.focus(Some(hosted.clone()), &[]);
+        assert!(
+            before.selected.iter().all(|c| !busy.contains(c)),
+            "precondition: the uniform draw already includes a busy contract"
+        );
+        assert_eq!(before.active_candidates, 0, "no merges seen yet");
+
+        for contract in &busy {
+            for _ in 0..40 {
+                runner.note_merge(*contract);
+            }
+        }
+        assert!(runner.advance().is_none(), "the first tick must not rotate");
+        let after = runner.focus(Some(hosted.clone()), &[]);
+
+        assert_eq!(runner.epoch(), 0, "same epoch: only the weights changed");
+        assert_eq!(after.active_candidates, busy.len());
+        assert!(
+            after.selected.iter().any(|c| busy.contains(c)),
+            "ten of sixty hosted contracts were merging and focus picked neither of \
+             them: activity observed by the runner is not reaching selection"
+        );
+    }
+
+    /// Within a period the weights are frozen, so new activity cannot move focus
+    /// until the period ends. Otherwise every tick could abandon a half-built sample.
+    #[test]
+    fn focus_does_not_move_mid_period_when_activity_changes() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut runner = runner_with_salt(dir.path(), [3; 32]);
+        let (hosted, busy) = hosted_with_busy();
+        for contract in &busy {
+            runner.note_merge(*contract);
+        }
+        runner.advance();
+        let settled = runner.focus(Some(hosted.clone()), &[]).selected;
+
+        // A burst on contracts that were cold when the period's weights were frozen.
+        for contract in &hosted[30..] {
+            for _ in 0..1_000 {
+                runner.note_merge(*contract);
+            }
+        }
+        for _ in 1..ROTATE_EVERY_TICKS - 1 {
+            assert!(runner.advance().is_none());
+            assert_eq!(
+                runner.focus(Some(hosted.clone()), &[]).selected,
+                settled,
+                "focus moved mid-period because activity changed"
+            );
+        }
+        // The period boundary is where the new activity is allowed in.
+        assert!(
+            runner.advance().is_some(),
+            "the period did not end on schedule"
+        );
+        let next = runner.focus(Some(hosted.clone()), &[]);
+        assert_eq!(
+            next.active_candidates,
+            hosted.len() - 20,
+            "the next period did not freeze the activity seen during this one"
+        );
+    }
+
+    /// Activity decays at each period boundary, so a contract that went quiet stops
+    /// being favoured instead of holding its weight forever.
+    #[test]
+    fn activity_decays_once_per_period() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut runner = runner_with_salt(dir.path(), [5; 32]);
+        for _ in 0..8 {
+            runner.note_merge(instance(1));
+        }
+        for _ in 0..ROTATE_EVERY_TICKS {
+            runner.advance();
+        }
+        assert_eq!(
+            runner.activity.count(&instance(1)),
+            4,
+            "one period halves it"
+        );
+        assert_eq!(
+            runner.weights.get(&instance(1)),
+            Some(&8),
+            "the frozen weights must be the activity BEFORE decay"
+        );
+        for _ in 0..ROTATE_EVERY_TICKS * 3 {
+            runner.advance();
+        }
+        assert_eq!(
+            runner.activity_tracked(),
+            0,
+            "a contract with no merges for four periods is still tracked"
+        );
+    }
+
+    /// The tick field: focus contracts that have seen no merge are counted as
+    /// unobserved, and the period summary carries the whole-period count.
+    ///
+    /// "Never examined" next to "examined and clean": #5913's peer ran 49 ticks in
+    /// which every focus contract was `tracked=0`, and nothing in the tick said so in
+    /// those words.
+    #[test]
+    fn focus_contracts_with_no_merges_are_reported_unobserved() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut runner = runner_with_salt(dir.path(), [7; 32]);
+        let hosted: Vec<_> = (0..20u8).map(instance).collect();
+        let focus = runner.focus(Some(hosted.clone()), &[]);
+        assert_eq!(focus.selected.len(), 2);
+        assert_eq!(runner.unobserved_this_period(), 2, "nothing observed yet");
+
+        // One focus contract gets merges; the other never does.
+        let busy = focus.selected[0];
+        runner.note_merge(busy);
+        runner.note_merge(busy);
+        // Merges for a contract NOT in focus do not count toward the focus set.
+        let outsider = hosted
+            .iter()
+            .copied()
+            .find(|c| !focus.selected.contains(c))
+            .expect("an unfocused contract");
+        runner.note_merge(outsider);
+        assert_eq!(runner.unobserved_this_period(), 1);
+
+        runner.note_judged(&[JudgedContract {
+            contract: busy,
+            verdicts: 3,
+            inconclusive: 0,
+        }]);
+
+        let mut summary = None;
+        for _ in 0..ROTATE_EVERY_TICKS {
+            summary = summary.or(runner.advance());
+        }
+        let summary = summary.expect("the period never ended");
+        assert_eq!(
+            summary,
+            FocusPeriodSummary {
+                epoch: 0,
+                focused: 2,
+                unobserved: 1,
+                judged: 1,
+            },
+            "the period summary must keep the never-observed focus contract visible \
+             beside the judged one"
+        );
+    }
+
+    /// A contract that leaves focus mid-period (the hosted set changed) is still
+    /// counted, rather than vanishing from the period because it is no longer current.
+    #[test]
+    fn a_contract_leaving_focus_mid_period_is_still_counted() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut runner = runner_with_salt(dir.path(), [11; 32]);
+        let hosted: Vec<_> = (0..20u8).map(instance).collect();
+        let first = runner.focus(Some(hosted.clone()), &[]).selected;
+
+        // The peer stops hosting both focus contracts before either saw a merge.
+        let shrunk: Vec<_> = hosted
+            .iter()
+            .copied()
+            .filter(|c| !first.contains(c))
+            .collect();
+        let second = runner.focus(Some(shrunk.clone()), &[]).selected;
+        assert!(second.iter().all(|c| !first.contains(c)));
+        runner.note_merge(second[0]);
+
+        let mut summary = None;
+        for _ in 0..ROTATE_EVERY_TICKS {
+            summary = summary.or(runner.advance());
+        }
+        let summary = summary.expect("the period never ended");
+        assert_eq!(summary.focused, 4, "two departed stints plus two current");
+        assert_eq!(
+            summary.unobserved, 3,
+            "both departed contracts and one current one saw no merge"
+        );
     }
 
     /// Build a sampler map by pushing observations through the real admission path,
@@ -1526,7 +1950,7 @@ mod tests {
             &[(vec![1], vec![1, 2]), (vec![2], vec![2, 3])],
         );
         let dir = tempfile::TempDir::new()?;
-        let runner = ShadowRunner::new(dir.path(), EnforcementMode::Shadow);
+        let mut runner = ShadowRunner::new(dir.path(), EnforcementMode::Shadow);
         let focus = runner.focus(None, &samplers.keys().copied().collect::<Vec<_>>());
         let (work, _awaiting) = runner.select(&focus, &samplers);
         assert!(!work.is_empty(), "nothing selected, so this proves nothing");
