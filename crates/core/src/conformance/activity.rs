@@ -59,11 +59,22 @@ pub(crate) const MAX_TRACKED_ACTIVITY: usize = 1024;
 /// once the map stayed full. Same shape as the UPDATE limiter's fix (#4997).
 const EVICTION_BATCH_DIVISOR: usize = 64;
 
+/// The most activity a contract can bank, as a multiple of the weight cap.
+///
+/// Weight saturates at [`super::focus::ACTIVITY_WEIGHT_CAP`], so anything above it buys
+/// nothing now and only delays decay later. Without a clamp, a burst of 10,000 merges
+/// would hold maximum weight for seven periods (fourteen hours) after the contract
+/// went quiet. At twice the cap it holds it for at most one period after the burst.
+pub(crate) const STORED_ACTIVITY_CAP: u32 = 2 * super::focus::ACTIVITY_WEIGHT_CAP;
+
 /// Recent merge counts per contract.
 #[derive(Debug, Clone)]
 pub(crate) struct MergeActivity {
     counts: HashMap<ContractInstanceId, u32>,
     cap: usize,
+    /// Per-peer secret that orders ties at eviction, so which equally-quiet contract
+    /// loses its record is not a function of the id an author chose.
+    salt: [u8; 32],
     /// Entries evicted to make room since this tracker was created.
     ///
     /// Reported on the shadow tick so a peer that outgrew the cap is visible in a
@@ -72,6 +83,7 @@ pub(crate) struct MergeActivity {
     evicted: u64,
 }
 
+#[cfg(test)]
 impl Default for MergeActivity {
     fn default() -> Self {
         Self::with_cap(MAX_TRACKED_ACTIVITY)
@@ -79,18 +91,25 @@ impl Default for MergeActivity {
 }
 
 impl MergeActivity {
-    pub(crate) fn with_cap(cap: usize) -> Self {
+    /// A tracker holding at most `cap` contracts, breaking eviction ties with `salt`.
+    pub(crate) fn new(cap: usize, salt: [u8; 32]) -> Self {
         Self {
             counts: HashMap::new(),
             cap: cap.max(1),
+            salt,
             evicted: 0,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_cap(cap: usize) -> Self {
+        Self::new(cap, [0; 32])
     }
 
     /// Count one merge observed for `contract`.
     pub(crate) fn record(&mut self, contract: ContractInstanceId) {
         if let Some(count) = self.counts.get_mut(&contract) {
-            *count = count.saturating_add(1);
+            *count = count.saturating_add(1).min(STORED_ACTIVITY_CAP);
             return;
         }
         if self.counts.len() >= self.cap {
@@ -130,25 +149,37 @@ impl MergeActivity {
         self.evicted
     }
 
-    /// Remove the least active batch of entries, ties broken by id so the result does
-    /// not depend on hash-map iteration order.
+    /// Remove the least active batch of entries.
+    ///
+    /// Ties are broken by a salted hash of the id, so the result does not depend on
+    /// hash-map iteration order and is not a fixed function of the id either.
     fn evict_least_active(&mut self) {
         let batch = (self.cap / EVICTION_BATCH_DIVISOR)
             .max(1)
             .min(self.counts.len());
-        let mut ranked: Vec<(u32, ContractInstanceId)> = self
+        let salt = self.salt;
+        let tie = |id: &ContractInstanceId| -> [u8; 32] {
+            let mut hasher = blake3::Hasher::new();
+            hasher.update(b"freenet-conformance-activity-evict-v1");
+            hasher.update(&salt);
+            hasher.update(id.as_bytes());
+            *hasher.finalize().as_bytes()
+        };
+        let mut ranked: Vec<(u32, [u8; 32], ContractInstanceId)> = self
             .counts
             .iter()
-            .map(|(id, count)| (*count, *id))
+            .map(|(id, count)| (*count, tie(id), *id))
             .collect();
-        let order = |a: &(u32, ContractInstanceId), b: &(u32, ContractInstanceId)| {
+        let order = |a: &(u32, [u8; 32], ContractInstanceId),
+                     b: &(u32, [u8; 32], ContractInstanceId)| {
             a.0.cmp(&b.0)
-                .then_with(|| a.1.as_bytes().cmp(b.1.as_bytes()))
+                .then_with(|| a.1.cmp(&b.1))
+                .then_with(|| a.2.as_bytes().cmp(b.2.as_bytes()))
         };
         if batch < ranked.len() {
             ranked.select_nth_unstable_by(batch, order);
         }
-        for (_, id) in ranked.into_iter().take(batch) {
+        for (_, _, id) in ranked.into_iter().take(batch) {
             // Counted from what was actually removed, not from the batch size.
             if self.counts.remove(&id).is_some() {
                 self.evicted += 1;
@@ -294,6 +325,86 @@ mod tests {
         let mut activity = MergeActivity::default();
         activity.counts.insert(id(1), u32::MAX);
         activity.record(id(1));
-        assert_eq!(activity.count(&id(1)), u32::MAX);
+        assert_eq!(activity.count(&id(1)), STORED_ACTIVITY_CAP);
+    }
+
+    /// A burst must not bank hours of maximum weight (#5914 review D3).
+    ///
+    /// Counts halve once per period, so an unclamped burst of 10,000 merges would
+    /// stay above the weight cap for seven periods (fourteen hours) after the
+    /// contract went quiet. Clamped at twice the weight cap, it stays at the cap for
+    /// at most one period after the burst and then decays like anything else.
+    #[test]
+    fn a_burst_cannot_bank_more_than_the_stored_cap() {
+        let mut activity = MergeActivity::default();
+        for _ in 0..10_000 {
+            activity.record(id(1));
+        }
+        assert_eq!(
+            activity.count(&id(1)),
+            STORED_ACTIVITY_CAP,
+            "a burst banked more activity than the stored cap"
+        );
+        activity.decay();
+        activity.decay();
+        assert!(
+            activity.count(&id(1)) < crate::conformance::focus::ACTIVITY_WEIGHT_CAP,
+            "two quiet periods after a burst the contract still holds maximum weight"
+        );
+    }
+
+    /// Batching at the production cap: one insertion past it evicts cap/64 entries,
+    /// not one, so a persistently full map does not scan on every newcomer.
+    #[test]
+    fn eviction_batches_at_the_production_cap() {
+        let mut activity = MergeActivity::new(MAX_TRACKED_ACTIVITY, [1; 32]);
+        for n in 0..MAX_TRACKED_ACTIVITY as u16 {
+            activity.record(id(n));
+        }
+        assert_eq!(activity.evicted(), 0);
+        activity.record(id(60_000));
+        let batch = MAX_TRACKED_ACTIVITY / EVICTION_BATCH_DIVISOR;
+        assert_eq!(activity.evicted() as usize, batch);
+        assert_eq!(activity.len(), MAX_TRACKED_ACTIVITY - batch + 1);
+        // The next cap/64 - 1 newcomers fit without another scan.
+        for n in 0..(batch - 1) as u16 {
+            activity.record(id(61_000 + n));
+        }
+        assert_eq!(
+            activity.evicted() as usize,
+            batch,
+            "evicted again before the batch was used up"
+        );
+    }
+
+    /// Ties among equally quiet contracts are broken by a per-peer salt, not by id.
+    ///
+    /// Lowest-id-first is a systematic bias an author can aim at: grind an id that
+    /// sorts high and your activity record is the last one evicted on every peer.
+    #[test]
+    fn eviction_ties_are_salted_not_lowest_id_first() {
+        let cap = 64;
+        let survivors_for = |salt: u8| {
+            let mut activity = MergeActivity::new(cap, [salt; 32]);
+            for n in 0..cap as u16 {
+                activity.record(id(n));
+            }
+            activity.record(id(9_000));
+            (0..cap as u16)
+                .filter(|n| activity.counts.contains_key(&id(*n)))
+                .collect::<Vec<_>>()
+        };
+        let lowest_evicted = (1..cap as u16).collect::<Vec<_>>();
+        let outcomes: std::collections::HashSet<_> = (0..8u8).map(survivors_for).collect();
+        assert!(
+            outcomes.len() > 1,
+            "eight salts evicted the same tied contract, so the salt plays no part"
+        );
+        assert!(
+            outcomes
+                .iter()
+                .any(|survivors| *survivors != lowest_evicted),
+            "ties are always broken lowest-id first"
+        );
     }
 }

@@ -472,7 +472,7 @@ impl ShadowRunner {
             ticks: 0,
             dir: dir.to_path_buf(),
             logged: HashSet::new(),
-            activity: MergeActivity::default(),
+            activity: MergeActivity::new(super::activity::MAX_TRACKED_ACTIVITY, salt),
             weights: HashMap::new(),
             period: FocusPeriod::default(),
         }
