@@ -4376,67 +4376,150 @@ async fn a_node_without_the_contract(
     candidates: &[&str],
     tag: &'static str,
 ) -> anyhow::Result<(WebApi, ContractContainer)> {
-    // RETRY WITH A FRESH KEY rather than failing on the first unlucky placement
-    // (#5542 F6). The precondition this helper establishes is not under the
-    // test's control: under every-hop placement a PUT stores at every hop, so
-    // every candidate holding the contract is a routine outcome rather than an
-    // anomaly, and failing on it makes a correct implementation look broken.
+    // CHOOSE THE KEY FROM THE RING, NOT BY RETRYING (#5627). Whether a candidate
+    // ends up holding the contract is decided by greedy PUT routing, which is a
+    // function of where the nodes sit on the ring. The harness derives each
+    // node's ring position from its loopback IP, and the IP block comes from a
+    // process-global counter, so under plain `cargo test` (several tests in one
+    // process) the layout differs from run to run. Some layouts walk the PUT
+    // across every node (observed: all four instances on all three candidates),
+    // so retrying with a fresh key cannot help: the layout, not the key, is the
+    // cause.
     //
-    // Each attempt PUTs a DIFFERENT instance of the same code — the parameters
-    // change the instance id, so each is an independent draw against the same
-    // topology. Covering every candidate once is ordinary; covering every
-    // candidate on all four independent keys is not, so a failure after that is
-    // signal rather than luck.
+    // The PUT is relayed to the closest-to-key neighbour of each holder, and
+    // the chain finalizes at the first node whose next hop would climb away
+    // (`put_routing_should_terminate`); the replication copy past that point is
+    // skipped for streaming-size payloads, which this contract is. A chain that
+    // starts by descending (the publisher's closest neighbour is closer to the
+    // key than the publisher) therefore only ever visits strictly closer nodes,
+    // so it cannot reach the node FARTHEST from the key. The publisher is always
+    // connected to the gateway, so "the gateway is closer to the key than the
+    // publisher" guarantees the first hop descends.
     //
-    // Attempt 0 uses the bare tag as parameters; later attempts append a counter byte.
     assert!(
         !tag.is_empty(),
         "tag must be non-empty and unique per calling test"
     );
-    const MAX_PLACEMENT_ATTEMPTS: u8 = 4;
-    let mut placement = Vec::new();
-    for attempt in 0..MAX_PLACEMENT_ATTEMPTS {
+    // So: read the real ring positions, search keys (pure computation, no
+    // network, no sleeping) for a key where the gateway is closer than the
+    // publisher and one candidate is the farthest node of all, PUT it once, and
+    // still PROBE that the chosen node does not hold it. The probe stays because
+    // it is what stops this test passing vacuously if the routing model above
+    // ever stops being true; it then fails loudly with the layout.
+    let publisher_name = "node-a";
+    let mut ring_positions: Vec<(String, f64)> = Vec::new();
+    for name in ["gateway", publisher_name].iter().chain(candidates.iter()) {
+        let node = ctx.node(name)?;
+        let (stream, _) = connect_async(&node.ws_url()).await?;
+        let mut client = WebApi::start(stream);
+        ring_positions.push((name.to_string(), node_ring_location(&mut client).await?));
+    }
+    let position_of = |name: &str| {
+        ring_positions
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, loc)| freenet::dev_tool::Location::new(*loc))
+            .expect("position recorded for every node")
+    };
+
+    let mut chosen = None;
+    'keys: for i in 0..=u8::MAX {
         let mut raw = tag.as_bytes().to_vec();
-        if attempt != 0 {
-            raw.push(attempt);
+        if i != 0 {
+            raw.push(i);
         }
         let contract = load_contract(contract_name, Parameters::from(raw))?;
-        let contract_key = contract.key();
-
-        let publisher = ctx.node("node-a")?;
-        let (stream_a, _) = connect_async(&publisher.ws_url()).await?;
-        let mut client_a = WebApi::start(stream_a);
-        put_and_await(&mut client_a, &contract, state.clone()).await?;
-
-        placement.clear();
-        for name in candidates {
-            let node = ctx.node(name)?;
-            let (stream, _) = connect_async(&node.ws_url()).await?;
-            let mut client = WebApi::start(stream);
-            let holds = node_has_contract_locally(&mut client, contract_key).await?;
-            tracing::info!(node = %name, attempt, holds, "#5542: local-presence probe");
-            if !holds {
-                return Ok((client, contract));
-            }
-            placement.push(*name);
+        let key_location = freenet::dev_tool::Location::from(&contract.key());
+        let distance = |name: &str| position_of(name).distance(key_location).as_f64();
+        const MARGIN: f64 = 1e-6;
+        // The publisher's first hop must descend.
+        if distance("gateway") + MARGIN >= distance(publisher_name) {
+            continue;
         }
-        tracing::warn!(
-            attempt,
-            ?placement,
-            "#5542: every candidate holds this instance; retrying with a fresh key"
-        );
+        for probe in candidates {
+            let probe_distance = distance(probe);
+            // Strictly farther than every other node, with a margin so a
+            // rounding difference cannot flip the order.
+            let farthest = ring_positions
+                .iter()
+                .map(|(n, _)| n.as_str())
+                .filter(|n| n != probe)
+                .all(|n| distance(n) + MARGIN < probe_distance);
+            if farthest {
+                chosen = Some((contract, probe));
+                break 'keys;
+            }
+        }
     }
-    bail!(
-        "every candidate node {placement:?} holds all {MAX_PLACEMENT_ATTEMPTS} independently \
-         keyed instances of this contract, so a delegate operation on any of them is \
-         answered from the local store and this run cannot observe #5542 at all. Failing \
-         rather than passing vacuously: the earlier version of this test did the latter and \
-         was green against unfixed main. One unlucky placement is ordinary and is retried; \
-         {MAX_PLACEMENT_ATTEMPTS} in a row is not, so treat this as signal about placement \
-         rather than as flakiness. The fully deterministic fix is to select the probe node \
-         by ring distance from the contract key, which needs the multi-node harness to \
-         validate."
-    )
+    let Some((contract, probe)) = chosen else {
+        bail!(
+            "no key among 256 tags puts the gateway closer to the key than {publisher_name} and a \
+             candidate farthest of all; positions: {ring_positions:?}. Failing rather than \
+             passing vacuously."
+        );
+    };
+    let contract_key = contract.key();
+    tracing::info!(
+        ?ring_positions,
+        probe,
+        "#5627: ring layout and chosen probe node"
+    );
+
+    let publisher = ctx.node(publisher_name)?;
+    let (stream_a, _) = connect_async(&publisher.ws_url()).await?;
+    let mut client_a = WebApi::start(stream_a);
+    put_and_await(&mut client_a, &contract, state).await?;
+
+    let node = ctx.node(probe)?;
+    let (stream, _) = connect_async(&node.ws_url()).await?;
+    let mut client = WebApi::start(stream);
+    let holds = node_has_contract_locally(&mut client, contract_key).await?;
+    tracing::info!(node = %probe, holds, "#5542: local-presence probe");
+    ensure!(
+        !holds,
+        "{probe} holds the contract although the ring layout {ring_positions:?} should have kept \
+         the PUT away from it. Failing rather than passing vacuously: a delegate operation on \
+         {probe} would be answered from the local store and this run could not observe #5542 at \
+         all. The routing model described in this helper (#5627) no longer holds; re-derive it."
+    );
+    Ok((client, contract))
+}
+
+/// The ring position PUT routing uses for `client`'s node: derived from its address.
+async fn node_ring_location(client: &mut WebApi) -> anyhow::Result<f64> {
+    let config = freenet_stdlib::client_api::NodeDiagnosticsConfig {
+        include_node_info: true,
+        include_network_info: false,
+        include_subscriptions: false,
+        contract_keys: vec![],
+        include_system_metrics: false,
+        include_detailed_peer_info: false,
+        include_subscriber_peer_ids: false,
+    };
+    client
+        .send(ClientRequest::NodeQueries(
+            freenet_stdlib::client_api::NodeQuery::NodeDiagnostics { config },
+        ))
+        .await?;
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while std::time::Instant::now() < deadline {
+        match timeout(Duration::from_secs(5), client.recv()).await {
+            Ok(Ok(HostResponse::QueryResponse(QueryResponse::NodeDiagnostics(response)))) => {
+                let addr = response
+                    .node_info
+                    .and_then(|info| info.listening_address)
+                    .ok_or_else(|| anyhow::anyhow!("node reported no address"))?;
+                // PUT routing compares address-derived positions
+                // (`ConnectionManager::own_location`), NOT the position in
+                // `NodeInfo::location`, which the harness assigns at random.
+                return Ok(freenet::dev_tool::Location::from_address(&addr.parse()?).as_f64());
+            }
+            Ok(Ok(other)) => tracing::debug!(?other, "ignoring while awaiting diagnostics"),
+            Ok(Err(e)) => bail!("websocket error awaiting diagnostics: {e}"),
+            Err(_) => {}
+        }
+    }
+    bail!("no NodeDiagnostics response within 30s")
 }
 
 /// Regression test for #5542: a delegate GET reaches the NETWORK for a contract
