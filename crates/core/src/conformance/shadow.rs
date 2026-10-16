@@ -527,8 +527,12 @@ impl ShadowRunner {
     /// Called for EVERY observed merge, focused or not, because weighting has to
     /// know about contracts that are not in focus yet. It must stay ahead of the scope
     /// filter in `capture::run_writer`, which discards out-of-focus observations.
-    pub(crate) fn note_merge(&mut self, contract: ContractInstanceId) {
-        self.activity.record(contract);
+    /// `counts_as_activity` is [`super::capture::counts_as_activity`]'s verdict: only
+    /// a merge that changed state and could have been sampled raises the weight.
+    pub(crate) fn note_merge(&mut self, contract: ContractInstanceId, counts_as_activity: bool) {
+        if counts_as_activity {
+            self.activity.record(contract);
+        }
         self.period.observe(&contract);
     }
 
@@ -1566,7 +1570,7 @@ mod tests {
 
         for contract in &busy {
             for _ in 0..40 {
-                runner.note_merge(*contract);
+                runner.note_merge(*contract, true);
             }
         }
         assert!(runner.advance().is_none(), "the first tick must not rotate");
@@ -1589,7 +1593,7 @@ mod tests {
         let mut runner = runner_with_salt(dir.path(), [3; 32]);
         let (hosted, busy) = hosted_with_busy();
         for contract in &busy {
-            runner.note_merge(*contract);
+            runner.note_merge(*contract, true);
         }
         runner.advance();
         let settled = runner.focus(Some(hosted.clone()), &[]).selected;
@@ -1597,7 +1601,7 @@ mod tests {
         // A burst on contracts that were cold when the period's weights were frozen.
         for contract in &hosted[30..] {
             for _ in 0..1_000 {
-                runner.note_merge(*contract);
+                runner.note_merge(*contract, true);
             }
         }
         for _ in 1..ROTATE_EVERY_TICKS - 1 {
@@ -1628,7 +1632,7 @@ mod tests {
         let dir = tempfile::TempDir::new().expect("tempdir");
         let mut runner = runner_with_salt(dir.path(), [5; 32]);
         for _ in 0..8 {
-            runner.note_merge(instance(1));
+            runner.note_merge(instance(1), true);
         }
         for _ in 0..ROTATE_EVERY_TICKS {
             runner.advance();
@@ -1653,6 +1657,18 @@ mod tests {
         );
     }
 
+    /// A merge that cannot count as activity (no state change, or too large to
+    /// sample) is not recorded at all.
+    #[test]
+    fn a_merge_that_is_not_activity_does_not_raise_weight() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut runner = runner_with_salt(dir.path(), [13; 32]);
+        for _ in 0..100 {
+            runner.note_merge(instance(1), false);
+        }
+        assert_eq!(runner.activity_tracked(), 0);
+    }
+
     /// The tick field: focus contracts that have seen no merge are counted as
     /// unobserved, and the period summary carries the whole-period count.
     ///
@@ -1670,15 +1686,15 @@ mod tests {
 
         // One focus contract gets merges; the other never does.
         let busy = focus.selected[0];
-        runner.note_merge(busy);
-        runner.note_merge(busy);
+        runner.note_merge(busy, true);
+        runner.note_merge(busy, true);
         // Merges for a contract NOT in focus do not count toward the focus set.
         let outsider = hosted
             .iter()
             .copied()
             .find(|c| !focus.selected.contains(c))
             .expect("an unfocused contract");
-        runner.note_merge(outsider);
+        runner.note_merge(outsider, true);
         assert_eq!(runner.unobserved_this_period(), 1);
 
         runner.note_judged(&[JudgedContract {
@@ -1722,7 +1738,7 @@ mod tests {
             .collect();
         let second = runner.focus(Some(shrunk.clone()), &[]).selected;
         assert!(second.iter().all(|c| !first.contains(c)));
-        runner.note_merge(second[0]);
+        runner.note_merge(second[0], true);
 
         let mut summary = None;
         for _ in 0..ROTATE_EVERY_TICKS {

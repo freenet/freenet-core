@@ -1824,6 +1824,14 @@ where
         // stall a merge — capture losing observations is always preferable to
         // synchronization queueing behind it.
         if let Some(capture) = crate::conformance::capture::global() {
+            // Every merge is offered here, focused or not, and that is load-bearing:
+            // conformance focus weighting counts merge activity per contract from
+            // these observations in `capture::run_writer` (#5913), including for
+            // contracts not yet in focus. Filtering by focus at this point to save the
+            // copies would blind that count and return focus to a uniform draw over
+            // mostly-cold contracts. Move the activity count here, as an O(1)
+            // increment, before adding any such filter.
+            //
             // Measure first, copy later.
             //
             // Everything below this point that costs an allocation happens inside the

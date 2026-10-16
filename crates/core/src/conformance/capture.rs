@@ -666,6 +666,10 @@ async fn run_writer(
     // tick can report them rather than silently omitting them from `focused`.
     let mut awaiting_samples = 0usize;
     let wide = wide_capture_requested();
+    // Read once: the sampler's per-state ceiling, so a merge whose states could never
+    // be admitted does not count as activity. The environment does not change at
+    // runtime, and re-reading it per observation would be a syscall per merge.
+    let activity_max_state_bytes = sampler_config().max_state_bytes;
     let startup_focus = shadow.focus(
         hosted_contracts(),
         &samplers.keys().copied().collect::<Vec<_>>(),
@@ -720,7 +724,8 @@ async fn run_writer(
                 // scope: focus weighting needs to know which contracts are busy
                 // before they are focused, and `record` discards out-of-focus
                 // observations (#5913).
-                shadow.note_merge(observation.contract);
+                let meaningful = counts_as_activity(&observation, activity_max_state_bytes);
+                shadow.note_merge(observation.contract, meaningful);
                 if let Some(evicted) = record(&mut samplers, &scope, observation) {
                     // Dropping the entry alone orphans the file: eviction fires on
                     // every rotation once the map is full, so the directory would
@@ -1004,6 +1009,31 @@ async fn run_writer(
         related_untracked,
     )
     .await;
+}
+
+/// Whether an observed merge counts toward focus activity (#5913, #5914 review D2).
+///
+/// Two conditions, both about whether focusing on the contract could have produced a
+/// sample from this merge:
+///
+/// - **It changed the state.** The executor offers an observation before its
+///   new==current short-circuit, so duplicate deliveries and replays of the current
+///   state arrive here too. They add nothing to sample, and counting them would let
+///   anyone raise a contract's weight by replaying its state.
+/// - **The sampler could admit it.** A state or delta above the per-state ceiling is
+///   refused as too large even for a focused contract.
+///
+/// Runs on the capture task, never on the merge path. The state comparison is a
+/// length check first and a byte comparison only when lengths match.
+pub(crate) fn counts_as_activity(observation: &Observation, max_state_bytes: usize) -> bool {
+    if observation.result_state == observation.base_state {
+        return false;
+    }
+    let fits = |bytes: &[u8]| bytes.len() <= max_state_bytes;
+    fits(&observation.base_state)
+        && fits(&observation.result_state)
+        && observation.incoming_state.as_deref().is_none_or(fits)
+        && observation.delta.as_deref().is_none_or(fits)
 }
 
 pub(crate) struct TrackedContract {
@@ -2300,7 +2330,11 @@ mod probe_wiring_pins {
         let transition = body
             .find("CaptureMsg::Transition(observation) => *observation")
             .expect("run_writer no longer unpacks transitions this way; re-anchor");
-        let counted = statement_at(&body, "shadow.note_merge(observation.contract);").expect(
+        let counted = statement_at(
+            &body,
+            "shadow.note_merge(observation.contract, meaningful);",
+        )
+        .expect(
             "run_writer no longer feeds observed merges to focus weighting, so focus \
              falls back to a uniform draw over a mostly-cold hosted set (#5913)",
         );
@@ -2775,6 +2809,43 @@ mod tests {
             result_state: vec![1, 2, 3],
             related: Vec::new(),
         }
+    }
+
+    /// A merge that leaves the state unchanged is not activity (#5914 review D2).
+    ///
+    /// The executor emits an observation BEFORE its new==current short-circuit, so
+    /// duplicate deliveries and replays of the current state reach the writer. Counting
+    /// them would let anyone weight focus toward a contract by replaying its state,
+    /// and would weight toward contracts that produce nothing new to sample.
+    #[test]
+    fn a_merge_that_changes_nothing_is_not_activity() {
+        let mut observation = observation_for(instance(1));
+        observation.result_state = observation.base_state.clone();
+        assert!(!counts_as_activity(&observation, 1024));
+    }
+
+    #[test]
+    fn a_merge_that_changes_state_is_activity() {
+        assert!(counts_as_activity(&observation_for(instance(1)), 1024));
+    }
+
+    /// A merge the sampler would refuse as too large cannot produce a sample even
+    /// when its contract is focused, so it must not attract focus either.
+    #[test]
+    fn a_merge_too_large_to_sample_is_not_activity() {
+        let observation = observation_for(instance(1));
+        // `observation_for`'s largest state is 3 bytes.
+        assert!(counts_as_activity(&observation, 3));
+        assert!(
+            !counts_as_activity(&observation, 2),
+            "result too large to sample"
+        );
+        let mut big_delta = observation_for(instance(1));
+        big_delta.delta = Some(vec![0; 4]);
+        assert!(
+            !counts_as_activity(&big_delta, 3),
+            "delta too large to sample"
+        );
     }
 
     fn focused_on(ids: &[u8]) -> SamplingScope {
