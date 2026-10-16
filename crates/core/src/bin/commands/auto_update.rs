@@ -532,9 +532,10 @@ pub async fn check_if_update_available(current_version: &str) -> UpdateCheckResu
                     increase_backoff();
                     return UpdateCheckResult::PinnedKnownBad;
                 }
-                if let Some(remaining) =
-                    super::rollback::update_cooldown_remaining(&latest, node_is_urgent())
-                {
+                if let Some(remaining) = super::rollback::update_cooldown_remaining(
+                    &latest,
+                    node_is_urgent(current_version),
+                ) {
                     tracing::info!(
                         version = %latest,
                         retry_in_min = remaining.as_secs().div_ceil(60),
@@ -1784,6 +1785,9 @@ pub enum ClaimRefused {
     CoolingDown,
     /// Locked out, cooldown passed, but the retry could not be recorded.
     NotRecordable,
+    /// Locked out, and the newer release is cooling down after failed
+    /// downloads (#5799): spending the daily retry now would only fail again.
+    ReleaseCoolingDown,
 }
 
 impl std::fmt::Display for ClaimRefused {
@@ -1799,6 +1803,10 @@ impl std::fmt::Display for ClaimRefused {
                 "auto-update is locked out and its once-a-day retry could not be recorded \
                  in the state directory"
             }
+            Self::ReleaseCoolingDown => {
+                "auto-update is locked out (#3934) and the newer release is cooling down \
+                 after failed downloads (#5799); its once-a-day retry waits for the cooldown"
+            }
         })
     }
 }
@@ -1813,11 +1821,38 @@ impl std::fmt::Display for ClaimRefused {
 /// updater. Whether or not the failed install gets recorded, and whichever
 /// path spends the retry, every later claim sees it and refuses, so the
 /// restart that follows a failed attempt does not start another.
+///
+/// A locked-out node also refuses while a newer release is cooling down after
+/// failed downloads (#5799), so every path that claims (the startup check, the
+/// re-poll, the peer-signal checks, the fallbacks) keeps its one retry for
+/// when that release can actually be fetched.
 pub fn claim_update_attempt() -> Result<UpdateAttempt, ClaimRefused> {
+    let current = env!("CARGO_PKG_VERSION");
     match state_dir() {
-        Some(dir) => claim_update_attempt_at(&dir, SystemTime::now()),
+        Some(dir) => claim_update_attempt_unless_cooling_at(
+            &dir,
+            current,
+            SystemTime::now(),
+            node_is_urgent(current),
+        ),
         None => Err(ClaimRefused::NoStateDir),
     }
+}
+
+/// [`claim_update_attempt_at`], refusing first when locked out and a newer
+/// release is cooling down. Writes nothing in that case.
+pub(crate) fn claim_update_attempt_unless_cooling_at(
+    dir: &std::path::Path,
+    current_version: &str,
+    now: SystemTime,
+    urgent: bool,
+) -> Result<UpdateAttempt, ClaimRefused> {
+    if is_locked_out_at(dir)
+        && super::rollback::update_cooldown_pending_at(dir, current_version, now, urgent).is_some()
+    {
+        return Err(ClaimRefused::ReleaseCoolingDown);
+    }
+    claim_update_attempt_at(dir, now)
 }
 
 pub(crate) fn claim_update_attempt_at(
@@ -2025,18 +2060,51 @@ pub fn jittered_repoll_interval(base: Duration, jitter_fraction: f64, rand_unit:
 // Holding the update triggers after the node decided to stay (#5799)
 // =============================================================================
 
-/// Whether the node gains nothing from staying on its current binary: a peer
-/// requires a newer version than ours, or it has no connections. Such a node's
-/// update cooldown is capped at an hour (see
-/// `rollback::update_cooldown_remaining_at`).
-pub fn node_is_urgent() -> bool {
-    freenet::transport::is_urgent_update() || get_open_connection_count() == 0
+/// Whether the node gains nothing from staying on its current binary: it has
+/// no connections, or a peer requires a newer version than ours AND at least
+/// two handshakes (`MIN_VERSION_REPORTERS`, via `get_highest_seen_version`)
+/// have reported a newer release. Such a node's update cooldown is capped at
+/// an hour (see `rollback::update_cooldown_remaining_at`).
+///
+/// The corroboration is there because one handshake can set the urgent flag,
+/// and an urgent node whose downloads fail exits for the updater about hourly
+/// once a release has failed three times. It is the same lightweight quorum
+/// the stagger trigger relies on; it does not stop a peer that reconnects to
+/// report twice, which then costs at most that hourly cadence (the cadence
+/// before #5799 was every ~20 minutes).
+pub fn node_is_urgent(current_version: &str) -> bool {
+    urgency_from(
+        get_open_connection_count(),
+        freenet::transport::is_urgent_update(),
+        freenet::transport::get_highest_seen_version(),
+        current_version,
+    )
+}
+
+/// Pure decision behind [`node_is_urgent`].
+pub(crate) fn urgency_from(
+    open_connections: usize,
+    urgent_flag: bool,
+    highest_seen: Option<(u8, u8, u16)>,
+    current_version: &str,
+) -> bool {
+    let corroborated = highest_seen
+        .zip(Version::parse(current_version).ok())
+        .is_some_and(|((major, minor, patch), current)| {
+            (u64::from(major), u64::from(minor), u64::from(patch))
+                > (current.major, current.minor, current.patch)
+        });
+    open_connections == 0 || (urgent_flag && corroborated)
 }
 
 /// Whether auto-update is locked out after repeated failed installs (#3934),
 /// so that claiming an attempt would spend the once-a-day retry.
 pub(crate) fn is_locked_out() -> bool {
-    get_update_failure_count() >= MAX_UPDATE_FAILURES
+    state_dir().is_some_and(|dir| is_locked_out_at(&dir))
+}
+
+pub(crate) fn is_locked_out_at(dir: &std::path::Path) -> bool {
+    get_update_failure_count_at(dir) >= MAX_UPDATE_FAILURES
 }
 
 /// Keeps the update triggers quiet after the node decided to stay on its
@@ -2048,38 +2116,111 @@ pub(crate) fn is_locked_out() -> bool {
 /// knows of a DIFFERENT release is not held: a newer release starts afresh.
 /// The driving signals (urgent, version mismatch, stagger) are left in place,
 /// so they act again as soon as the hold ends.
+///
+/// A hold for a known release does not keep its own deadline: it holds for as
+/// long as that release's cooldown record says, read again on every check with
+/// the node's urgency at that moment. So a node that becomes urgent or loses
+/// its connections mid-hold is released within the hour cap, a cleared record
+/// (an install, an up-to-date updater run) releases it at once, and a machine
+/// that sleeps does not stretch it, because the record is in wall-clock time.
+/// A hold for an unknown release, which has no record, ends at a wall-clock
+/// deadline.
+///
+/// Limits: it lives in memory, so a restart forgets it (the startup check then
+/// consults the record directly); and it holds only the triggers, not a
+/// manual `freenet update`.
 #[derive(Debug, Default)]
 pub struct UpdateHold {
-    until: Option<std::time::Instant>,
+    active: bool,
     version: Option<String>,
+    /// Wall-clock end of a hold for an unknown release.
+    until: Option<SystemTime>,
+    /// Drawn once per hold, so the re-poll after it is not re-randomised (and
+    /// pulled ever earlier) on every tick.
+    repoll_jitter: Duration,
+}
+
+/// What [`UpdateHold::poll`] found.
+#[derive(Debug, PartialEq, Eq)]
+pub enum HoldState {
+    /// No hold.
+    Free,
+    /// Held for this much longer.
+    Holding(Duration),
+    /// The hold ended since the last poll; the re-poll should run soon.
+    Released,
 }
 
 impl UpdateHold {
-    /// Whether a trigger for `version` (`None`: one that does not know which
-    /// release it would install) may prepare an update at `now`.
-    pub fn allows(&self, version: Option<&str>, now: std::time::Instant) -> bool {
-        match self.until {
-            None => true,
-            Some(until) if now >= until => true,
-            Some(_) => matches!(
-                (version, self.version.as_deref()),
-                (Some(found), Some(held)) if found != held
-            ),
-        }
-    }
-
-    /// Hold the triggers for `version` until `now + retry_in`, and return when
-    /// that is.
+    /// Hold the triggers for `version` (any release when `None`). `retry_in`
+    /// bounds a hold for an unknown release; a known release's hold follows
+    /// its cooldown record instead.
     pub fn hold(
         &mut self,
         version: Option<String>,
         retry_in: Duration,
-        now: std::time::Instant,
-    ) -> std::time::Instant {
-        let until = now + retry_in;
-        self.until = Some(until);
+        now: SystemTime,
+        repoll_jitter: Duration,
+    ) {
+        self.active = true;
+        self.until = version.is_none().then(|| now + retry_in);
         self.version = version;
-        until
+        self.repoll_jitter = repoll_jitter;
+    }
+
+    /// How much longer the hold lasts, if at all. `cooldown` is the release's
+    /// remaining cooldown as recorded, at the node's current urgency.
+    fn remaining(
+        &self,
+        now: SystemTime,
+        cooldown: &dyn Fn(&str) -> Option<Duration>,
+    ) -> Option<Duration> {
+        if !self.active {
+            return None;
+        }
+        match (&self.version, self.until) {
+            (Some(version), _) => cooldown(version),
+            (None, Some(until)) => until.duration_since(now).ok().filter(|d| !d.is_zero()),
+            (None, None) => None,
+        }
+    }
+
+    /// Re-derive the hold, once per tick, and end it when it is over.
+    pub fn poll(
+        &mut self,
+        now: SystemTime,
+        cooldown: &dyn Fn(&str) -> Option<Duration>,
+    ) -> HoldState {
+        match self.remaining(now, cooldown) {
+            Some(left) => HoldState::Holding(left),
+            None if self.active => {
+                self.active = false;
+                HoldState::Released
+            }
+            None => HoldState::Free,
+        }
+    }
+
+    /// Whether a trigger for `version` (`None`: one that does not know which
+    /// release it would install) may prepare an update now.
+    pub fn allows(
+        &self,
+        version: Option<&str>,
+        now: SystemTime,
+        cooldown: &dyn Fn(&str) -> Option<Duration>,
+    ) -> bool {
+        if self.remaining(now, cooldown).is_none() {
+            return true;
+        }
+        matches!(
+            (version, self.version.as_deref()),
+            (Some(found), Some(held)) if found != held
+        )
+    }
+
+    /// The extra wait after the hold before the re-poll.
+    pub fn repoll_jitter(&self) -> Duration {
+        self.repoll_jitter
     }
 }
 
@@ -2087,17 +2228,17 @@ impl UpdateHold {
 /// so nodes that failed together do not all retry in the same minute.
 pub const HOLD_REPOLL_JITTER: Duration = Duration::from_secs(5 * 60);
 
-/// When the periodic re-poll should next run, given a hold that ends at
-/// `hold_until` and a uniform sample `rand_unit` in `[0, 1]`. Pulled in to
-/// just after the hold, so a release that could not be fetched is retried
-/// when its cooldown ends rather than at the next 6 h re-poll; never pushed
-/// later than it already was.
+/// When the periodic re-poll should next run, given a hold that ends in
+/// `left` plus `jitter`. Pulled in to just after the hold, so a release that
+/// could not be fetched is retried when its cooldown ends rather than at the
+/// next 6 h re-poll; never pushed later than it already was.
 pub fn repoll_after_hold(
     next_repoll: std::time::Instant,
-    hold_until: std::time::Instant,
-    rand_unit: f64,
+    now: std::time::Instant,
+    left: Duration,
+    jitter: Duration,
 ) -> std::time::Instant {
-    next_repoll.min(hold_until + HOLD_REPOLL_JITTER.mul_f64(rand_unit.clamp(0.0, 1.0)))
+    next_repoll.min(now + left + jitter)
 }
 
 /// What the startup check and the periodic re-poll do with a newer release.
@@ -2849,7 +2990,7 @@ mod tests {
         let cooling = flat
             .find(concat!(
                 "ifletSome(remaining)=",
-                "super::rollback::update_cooldown_remaining(&latest,node_is_urgent()){"
+                "super::rollback::update_cooldown_remaining(&latest,node_is_urgent(current_version),){"
             ))
             .expect("check_if_update_available must consult the update cooldown (#5799)");
         let arm = &flat[cooling..];
@@ -2859,8 +3000,8 @@ mod tests {
         // #5799 review E: growing the backoff here walked a cooling-down node
         // into the max-backoff "trust the gateway, exit 42" fallback.
         assert!(
-            !arm.contains("increase_backoff()"),
-            "a cooling-down release must not grow the backoff: {arm}"
+            !arm.contains("increase_backoff()") && !arm.contains("reset_backoff()"),
+            "a cooling-down release must leave the backoff alone: {arm}"
         );
         let confirmed = flat
             .find("UpdateCheckResult::UpdateAvailable(latest)")
@@ -2871,30 +3012,104 @@ mod tests {
         );
     }
 
+    /// The cooldown lookup a hold re-derives from, backed by a temp state dir
+    /// at a given urgency.
+    fn recorded(
+        dir: &std::path::Path,
+        now: SystemTime,
+        urgent: bool,
+    ) -> impl Fn(&str) -> Option<Duration> + '_ {
+        move |version: &str| {
+            super::super::rollback::update_cooldown_remaining_at(dir, version, now, urgent)
+        }
+    }
+
     #[test]
-    fn a_hold_is_for_one_release_and_ends() {
-        let now = std::time::Instant::now();
+    fn a_hold_is_for_one_release_and_follows_its_record() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let now = SystemTime::now();
         let hour = Duration::from_secs(3600);
         let mut hold = UpdateHold::default();
-        assert!(hold.allows(None, now) && hold.allows(Some("0.2.141"), now));
+        let calm = recorded(dir, now, false);
+        assert!(hold.allows(None, now, &calm) && hold.allows(Some("0.2.141"), now, &calm));
+        assert_eq!(hold.poll(now, &calm), HoldState::Free);
 
-        let until = hold.hold(Some("0.2.141".into()), hour, now);
-        assert_eq!(until, now + hour);
+        super::super::rollback::record_update_cooldown_at(dir, "0.2.141", "x", now, 0.5);
+        hold.hold(Some("0.2.141".into()), hour, now, Duration::from_secs(60));
         assert!(
-            !hold.allows(None, now),
+            !hold.allows(None, now, &calm),
             "a trigger that knows no version waits"
         );
-        assert!(!hold.allows(Some("0.2.141"), now), "the held release waits");
         assert!(
-            hold.allows(Some("0.2.142"), now),
+            !hold.allows(Some("0.2.141"), now, &calm),
+            "the held release waits"
+        );
+        assert!(
+            hold.allows(Some("0.2.142"), now, &calm),
             "a different release starts afresh"
         );
-        assert!(hold.allows(None, until) && hold.allows(Some("0.2.141"), until));
+        assert!(matches!(hold.poll(now, &calm), HoldState::Holding(_)));
+        assert_eq!(hold.repoll_jitter(), Duration::from_secs(60));
 
-        // Held for whatever the latest release is: everything waits.
-        hold.hold(None, hour, now);
-        assert!(!hold.allows(Some("0.2.142"), now));
-        assert!(hold.allows(Some("0.2.142"), now + hour));
+        // It ends when the record says so, not at a deadline of its own.
+        let later = now + hour;
+        let at_end = recorded(dir, later, false);
+        assert!(hold.allows(Some("0.2.141"), later, &at_end));
+        assert_eq!(hold.poll(later, &at_end), HoldState::Released);
+        assert_eq!(hold.poll(later, &at_end), HoldState::Free, "released once");
+
+        // A cleared record (an install, an up-to-date updater run) releases it.
+        hold.hold(Some("0.2.141".into()), hour, now, Duration::ZERO);
+        super::super::rollback::clear_update_cooldown_at(dir);
+        assert_eq!(hold.poll(now, &calm), HoldState::Released);
+    }
+
+    /// #5896 review 2, item 1: a hold set while the node was fine (the
+    /// startup check passes `urgent = false`) must end within the hour cap
+    /// once the node turns urgent or loses its connections, not at the
+    /// doubled cooldown it was set for.
+    #[test]
+    fn a_hold_ends_within_the_cap_when_the_node_turns_urgent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let now = SystemTime::now();
+        let hour = Duration::from_secs(3600);
+        for _ in 0..4 {
+            super::super::rollback::record_update_cooldown_at(dir, "0.2.141", "x", now, 0.5);
+        }
+        let calm = super::super::rollback::update_cooldown_remaining_at(dir, "0.2.141", now, false)
+            .unwrap();
+        assert!(calm > hour * 6, "{calm:?}");
+        let mut hold = UpdateHold::default();
+        hold.hold(Some("0.2.141".into()), calm, now, Duration::ZERO);
+
+        let in_two_hours = now + hour * 2;
+        assert!(matches!(
+            hold.poll(in_two_hours, &recorded(dir, in_two_hours, false)),
+            HoldState::Holding(_)
+        ));
+        let urgent = recorded(dir, in_two_hours, true);
+        assert!(hold.allows(Some("0.2.141"), in_two_hours, &urgent));
+        assert_eq!(hold.poll(in_two_hours, &urgent), HoldState::Released);
+    }
+
+    /// A hold for an unknown release has no record and ends at a wall-clock
+    /// deadline, which a suspended machine does not stretch.
+    #[test]
+    fn a_hold_for_an_unknown_release_ends_at_its_deadline() {
+        let now = SystemTime::now();
+        let hour = Duration::from_secs(3600);
+        let none = |_: &str| -> Option<Duration> { panic!("no record is consulted") };
+        let mut hold = UpdateHold::default();
+        hold.hold(None, hour, now, Duration::ZERO);
+        assert!(
+            !hold.allows(Some("0.2.142"), now, &none),
+            "everything waits"
+        );
+        assert_eq!(hold.poll(now, &none), HoldState::Holding(hour));
+        assert_eq!(hold.poll(now + hour, &none), HoldState::Released);
+        assert!(hold.allows(None, now + hour, &none));
     }
 
     #[test]
@@ -2902,15 +3117,113 @@ mod tests {
         let now = std::time::Instant::now();
         let hour = Duration::from_secs(3600);
         let six_hours = now + hour * 6;
-        assert_eq!(repoll_after_hold(six_hours, now + hour, 0.0), now + hour);
         assert_eq!(
-            repoll_after_hold(six_hours, now + hour, 1.0),
+            repoll_after_hold(six_hours, now, hour, Duration::ZERO),
+            now + hour
+        );
+        assert_eq!(
+            repoll_after_hold(six_hours, now, hour, HOLD_REPOLL_JITTER),
             now + hour + HOLD_REPOLL_JITTER
         );
         assert_eq!(
-            repoll_after_hold(now + hour, now + hour * 6, 0.5),
+            repoll_after_hold(now + hour, now, hour * 6, Duration::ZERO),
             now + hour
         );
+    }
+
+    /// One handshake can set the urgent flag; it caps the cooldown only when
+    /// the stagger quorum agrees a newer release exists (review 2, item 8).
+    /// No connections at all is urgent by itself.
+    #[test]
+    fn urgency_needs_corroboration_unless_isolated() {
+        assert!(urgency_from(0, false, None, "0.2.140"));
+        assert!(
+            !urgency_from(5, true, None, "0.2.140"),
+            "one handshake is not enough"
+        );
+        assert!(
+            !urgency_from(5, true, Some((0, 2, 140)), "0.2.140"),
+            "not newer"
+        );
+        assert!(urgency_from(5, true, Some((0, 2, 141)), "0.2.140"));
+        assert!(
+            !urgency_from(5, false, Some((0, 2, 141)), "0.2.140"),
+            "no urgent flag"
+        );
+        assert!(urgency_from(5, true, Some((1, 0, 0)), "0.2.140"));
+    }
+
+    /// #5896 review 2, item 3: a locked-out node does not spend its daily
+    /// retry while a newer release is cooling down, whichever path claims.
+    #[test]
+    fn a_locked_out_node_keeps_its_retry_while_a_release_cools_down() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let stamp = lock_out(dir);
+        let after_lockout = stamp + UPDATE_LOCKOUT_COOLDOWN;
+        assert!(is_locked_out_at(dir));
+        super::super::rollback::record_update_cooldown_at(dir, "0.2.141", "x", after_lockout, 0.5);
+        assert_eq!(
+            claim_update_attempt_unless_cooling_at(dir, "0.2.140", after_lockout, false).err(),
+            Some(ClaimRefused::ReleaseCoolingDown)
+        );
+        assert!(
+            !dir.join(LOCKOUT_RETRY_FILE).exists(),
+            "the refusal must not spend the retry"
+        );
+        // Not locked out: the cooldown is the staging decision's business.
+        let fresh = tempfile::tempdir().unwrap();
+        super::super::rollback::record_update_cooldown_at(
+            fresh.path(),
+            "0.2.141",
+            "x",
+            after_lockout,
+            0.5,
+        );
+        assert!(!is_locked_out_at(fresh.path()));
+        assert!(
+            claim_update_attempt_unless_cooling_at(fresh.path(), "0.2.140", after_lockout, false)
+                .is_ok()
+        );
+        // Once the cooldown is over, the locked-out node spends its retry.
+        let later = after_lockout + Duration::from_secs(2 * 3600);
+        assert!(claim_update_attempt_unless_cooling_at(dir, "0.2.140", later, false).is_ok());
+        assert!(dir.join(LOCKOUT_RETRY_FILE).exists());
+    }
+
+    /// Every claim goes through the cooldown-aware variant.
+    #[test]
+    fn the_public_claim_consults_the_release_cooldown() {
+        let src = include_str!("auto_update.rs").replace("\r\n", "\n");
+        let body = fn_body(&src, "pub fn claim_update_attempt(");
+        let flat: String = body.split_whitespace().collect();
+        assert!(flat.contains("claim_update_attempt_unless_cooling_at(&dir,current,"));
+        assert!(!flat.contains("claim_update_attempt_at("));
+    }
+
+    #[test]
+    fn newer_release_decision_blocks_a_pinned_release_and_passes_urgency() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let now = SystemTime::now();
+        super::super::rollback::pin_known_bad_at(dir, "0.2.141").unwrap();
+        assert_eq!(
+            decide_newer_release_at(dir, "0.2.141", false, now),
+            NewerRelease::Blocked
+        );
+        let hour = Duration::from_secs(3600);
+        for _ in 0..4 {
+            super::super::rollback::record_update_cooldown_at(dir, "0.2.150", "x", now, 0.5);
+        }
+        let NewerRelease::CoolingDown(calm) = decide_newer_release_at(dir, "0.2.150", false, now)
+        else {
+            panic!("cooling down")
+        };
+        let NewerRelease::CoolingDown(urgent) = decide_newer_release_at(dir, "0.2.150", true, now)
+        else {
+            panic!("cooling down")
+        };
+        assert!(calm > hour * 4 && urgent <= hour, "{calm:?} {urgent:?}");
     }
 
     #[test]

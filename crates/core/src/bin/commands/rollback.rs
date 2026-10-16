@@ -1127,7 +1127,7 @@ fn is_not_newer(version: &str, current: &str) -> bool {
         .is_some_and(|(version, current)| version <= current)
 }
 
-fn clear_update_cooldown_at(dir: &Path) {
+pub(crate) fn clear_update_cooldown_at(dir: &Path) {
     let _rm = std::fs::remove_file(dir.join(UPDATE_COOLDOWN_FILE));
 }
 

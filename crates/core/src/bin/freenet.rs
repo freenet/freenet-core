@@ -331,7 +331,7 @@ async fn run_network_node_with_signals(
     disable_auto_update: bool,
 ) -> anyhow::Result<()> {
     use commands::auto_update::{
-        NewerRelease, UpdateHold, decide_newer_release, repoll_after_hold,
+        HoldState, NewerRelease, UpdateHold, decide_newer_release, repoll_after_hold,
     };
     use commands::auto_update::{
         UPDATE_REPOLL_INTERVAL, UPDATE_REPOLL_JITTER_FRACTION, UpdateCheckResult,
@@ -496,7 +496,7 @@ async fn run_network_node_with_signals(
     // auto-update ON — see `auto_update_is_disabled`.
     let auto_update_disabled = auto_update_is_disabled(build_info::GIT_DIRTY, disable_auto_update);
     let update_check_task = GlobalExecutor::spawn(async move {
-        use std::time::Instant;
+        use std::time::{Instant, SystemTime};
 
         if auto_update_disabled {
             // Loud, operator-visible (issue #4580): this node never even checks
@@ -588,9 +588,10 @@ async fn run_network_node_with_signals(
                 retry_in_min = retry_in.as_secs().div_ceil(60),
                 "Holding auto-update until the release can be tried again (#5799)"
             );
-            let until = hold.hold(version, retry_in, Instant::now());
             let rand_unit = freenet::config::GlobalRng::random_range(0.0_f64..1.0);
-            *next_repoll = repoll_after_hold(*next_repoll, until, rand_unit);
+            let jitter = commands::auto_update::HOLD_REPOLL_JITTER.mul_f64(rand_unit);
+            hold.hold(version, retry_in, SystemTime::now(), jitter);
+            *next_repoll = repoll_after_hold(*next_repoll, Instant::now(), retry_in, jitter);
         }
 
         let startup_attempt = commands::auto_update::claim_update_attempt();
@@ -737,12 +738,36 @@ async fn run_network_node_with_signals(
 
             // Recomputed each tick: a node with nothing to gain from staying put
             // has its cooldown capped at an hour (#5799).
-            let urgent = commands::auto_update::node_is_urgent();
+            let urgent = commands::auto_update::node_is_urgent(build_info::VERSION);
+            // A hold follows the release's cooldown record at this urgency, so
+            // it ends early when the node turns urgent and does not stretch
+            // across a suspend; the re-poll follows it in.
+            let cooldown =
+                |version: &str| commands::rollback::update_cooldown_remaining(version, urgent);
+            match update_hold.poll(SystemTime::now(), &cooldown) {
+                HoldState::Holding(left) => {
+                    next_repoll = repoll_after_hold(
+                        next_repoll,
+                        Instant::now(),
+                        left,
+                        update_hold.repoll_jitter(),
+                    );
+                }
+                HoldState::Released => {
+                    next_repoll = repoll_after_hold(
+                        next_repoll,
+                        Instant::now(),
+                        std::time::Duration::ZERO,
+                        update_hold.repoll_jitter(),
+                    );
+                }
+                HoldState::Free => {}
+            }
 
             // --- Priority 1: Urgent update (breaking change) ---
             // Held (#5799): the urgent signal is kept and acts again once the
             // hold ends, without asking GitHub every minute meanwhile.
-            if is_urgent_update() && update_hold.allows(None, Instant::now()) {
+            if is_urgent_update() && update_hold.allows(None, SystemTime::now(), &cooldown) {
                 tracing::warn!("Urgent update needed (remote's min_compatible > our version)");
                 match check_if_update_available(build_info::VERSION).await {
                     UpdateCheckResult::UpdateAvailable(new_version) => {
@@ -813,7 +838,7 @@ async fn run_network_node_with_signals(
             if let (Some(our_ver), Some(highest)) = (our_version, get_highest_seen_version()) {
                 // Held (#5799): no stagger is armed or checked until the hold
                 // ends; the re-poll pulled in to just after it retries first.
-                if highest > our_ver && update_hold.allows(None, Instant::now()) {
+                if highest > our_ver && update_hold.allows(None, SystemTime::now(), &cooldown) {
                     // Don't re-arm stagger if we're in cooldown after a failed check.
                     let in_cooldown =
                         stagger_cooldown_until.is_some_and(|until| Instant::now() < until);
@@ -940,7 +965,7 @@ async fn run_network_node_with_signals(
                     // Checked before the claim, so a held node (#5799) does not
                     // spend a locked-out node's daily retry either.
                     if since.elapsed() > HARD_EXIT_TIMEOUT
-                        && update_hold.allows(None, Instant::now())
+                        && update_hold.allows(None, SystemTime::now(), &cooldown)
                         && claim_update_attempt()
                             .inspect_err(|_| isolated_mismatch_since = Some(Instant::now()))
                             .is_ok()
@@ -979,7 +1004,7 @@ async fn run_network_node_with_signals(
 
                 // A locked-out node does not check GitHub here, so saying it
                 // does every 60s tick would be both noise and false.
-                let held = !update_hold.allows(None, Instant::now());
+                let held = !update_hold.allows(None, SystemTime::now(), &cooldown);
                 if held {
                     tracing::debug!("Version mismatch detected; auto-update held (#5799)");
                 } else if should_attempt_update() {
@@ -1211,7 +1236,11 @@ async fn run_network_node_with_signals(
                                 );
                             }
                             NewerRelease::Trigger
-                                if !update_hold.allows(Some(&new_version), Instant::now()) =>
+                                if !update_hold.allows(
+                                    Some(&new_version),
+                                    SystemTime::now(),
+                                    &cooldown,
+                                ) =>
                             {
                                 tracing::info!(
                                     new_version = %new_version,
@@ -3092,9 +3121,14 @@ mod tests {
                 "update trigger `{stmt}` must return in the Exit arm, then have a Stay arm"
             );
             let stay = &rest[stay_arm.len()..];
+            let stay = &stay[..stay.find('}').unwrap_or(stay.len())];
             assert!(
-                stay[..stay.find('}').unwrap_or(stay.len())].contains(hold),
+                stay.contains(hold),
                 "update trigger `{stmt}` must hold the triggers when staging stays"
+            );
+            assert!(
+                !stay.contains("clear_"),
+                "update trigger `{stmt}` must keep its signal when staging stays: {stay}"
             );
             // #5799 review A: no driving signal is cleared on the way to the
             // decision, or a stay would drop it and nothing would retry.
@@ -3260,15 +3294,15 @@ mod tests {
         let flat = squeeze(production);
         for (gate, what) in [
             (
-                "ifis_urgent_update()&&update_hold.allows(None,Instant::now()){",
+                "ifis_urgent_update()&&update_hold.allows(None,SystemTime::now(),&cooldown){",
                 "the urgent check",
             ),
             (
-                "ifhighest>our_ver&&update_hold.allows(None,Instant::now()){",
+                "ifhighest>our_ver&&update_hold.allows(None,SystemTime::now(),&cooldown){",
                 "the stagger",
             ),
             (
-                "letheld=!update_hold.allows(None,Instant::now());",
+                "letheld=!update_hold.allows(None,SystemTime::now(),&cooldown);",
                 "the mismatch check",
             ),
             (
@@ -3276,11 +3310,11 @@ mod tests {
                 "the mismatch check and its max-backoff fallback",
             ),
             (
-                "&&update_hold.allows(None,Instant::now())&&claim_update_attempt()",
+                "&&update_hold.allows(None,SystemTime::now(),&cooldown)&&claim_update_attempt()",
                 "the isolation hard timeout, before its claim",
             ),
             (
-                "NewerRelease::Triggerif!update_hold.allows(Some(&new_version),Instant::now())=>{",
+                "NewerRelease::Triggerif!update_hold.allows(Some(&new_version),SystemTime::now(),&cooldown",
                 "the re-poll",
             ),
             (
@@ -3288,8 +3322,25 @@ mod tests {
                 "the update loop's ticks",
             ),
             (
-                "*next_repoll=repoll_after_hold(*next_repoll,until,rand_unit);",
+                "*next_repoll=repoll_after_hold(*next_repoll,Instant::now(),retry_in,jitter);",
                 "the re-poll schedule",
+            ),
+            (
+                "hold.hold(version,retry_in,SystemTime::now(),jitter);",
+                "the hold itself, with the stay's version and duration",
+            ),
+            (
+                concat!(
+                    "letcooldown=|version:&str|",
+                    "commands::rollback::update_cooldown_remaining(version,urgent);",
+                    "matchupdate_hold.poll(SystemTime::now(),&cooldown){",
+                    "HoldState::Holding(left)=>{next_repoll=repoll_after_hold(",
+                    "next_repoll,Instant::now(),left,update_hold.repoll_jitter(),);}",
+                    "HoldState::Released=>{next_repoll=repoll_after_hold(",
+                    "next_repoll,Instant::now(),std::time::Duration::ZERO,",
+                    "update_hold.repoll_jitter(),);}HoldState::Free=>{}}"
+                ),
+                "the per-tick re-derivation of the hold at the node's live urgency (review 2)",
             ),
             (
                 "UpdatePreparation::Stay{version,retry_in}=>{stagger_deadline=None;hold_after_stay(",
@@ -3301,7 +3352,7 @@ mod tests {
                 "a locked-out node's re-poll, before it claims its daily retry",
             ),
             (
-                "leturgent=commands::auto_update::node_is_urgent();",
+                "leturgent=commands::auto_update::node_is_urgent(build_info::VERSION);",
                 "the urgency that caps the cooldown at an hour (review C)",
             ),
         ] {
@@ -3323,6 +3374,29 @@ mod tests {
         assert_eq!(
             flat.matches("decide_newer_release(&new_version,").count(),
             2
+        );
+        // Every hold, with its exact arguments, so a zero duration or a dropped
+        // version cannot slip in (review 2, item 7).
+        for (call, count) in [
+            (
+                "hold_after_stay(&mutupdate_hold,&mutnext_repoll,version,retry_in",
+                7,
+            ),
+            (
+                "hold_after_stay(&mutupdate_hold,&mutnext_repoll,Some(version),remaining",
+                4,
+            ),
+            (
+                "hold_after_stay(&mutupdate_hold,&mutnext_repoll,Some(new_version),remaining",
+                2,
+            ),
+        ] {
+            assert_eq!(flat.matches(call).count(), count, "`{call}`");
+        }
+        assert_eq!(
+            flat.matches("hold_after_stay(").count(),
+            7 + 4 + 2 + 1,
+            "a new hold site"
         );
         // The loop's triggers pass the node's urgency; only the startup check,
         // with no connections yet by construction, passes `false`.
@@ -3736,7 +3810,7 @@ mod tests {
         ))));
         for (opener, send) in [
             (
-                "ifsince.elapsed()>HARD_EXIT_TIMEOUT&&update_hold.allows(None,Instant::now())\
+                "ifsince.elapsed()>HARD_EXIT_TIMEOUT&&update_hold.allows(None,SystemTime::now(),&cooldown)\
                  &&claim_update_attempt()\
                  .inspect_err(|_|isolated_mismatch_since=Some(Instant::now())).is_ok(){",
                 concat!("update_tx", ".send(\"unknown(hardtimeout)\".to_string())"),

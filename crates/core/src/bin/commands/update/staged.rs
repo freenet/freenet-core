@@ -32,10 +32,17 @@
 //! per-release cooldown in the state directory (`rollback::record_update_cooldown_at`):
 //! an hour after the first failure, doubling to a day, with ±20% jitter, at
 //! most an hour for a node that gains nothing from waiting. The update triggers
-//! hold until it ends. Every exit that leaves the download to the updater
-//! records one too, since systemd may kill the updater before it can. Three
-//! failures in a row, or one that cannot be recorded, exit anyway, so a fault
-//! in staging itself cannot hold an update back for good.
+//! hold until it ends. Staging records one before it exits as well, whether
+//! the download succeeded or is left to the updater, since systemd may kill
+//! the updater before it records anything and a restart would otherwise detect
+//! the same release and exit again at once; a successful install clears it.
+//! (Exits that stage nothing record nothing here: a macOS app bundle, a node
+//! with no usable state directory, a panic with no known release. The updater
+//! records its own failures.) Three failures in a row, or one that cannot be
+//! recorded, exit anyway, so a fault in staging itself cannot hold an update
+//! back for good. A failed lookup of the release tag counts only when the
+//! trigger knew which release it found; otherwise there is nothing to record
+//! it against, and the node holds for the base hour without counting.
 
 use std::fs;
 use std::io::Write as _;
@@ -70,6 +77,9 @@ const STAGE_DEADLINE: Duration = Duration::from_secs(2 * 3600);
 /// for good, while the cooldown it follows (one hour, doubling, capped at a
 /// day; see `rollback::UPDATE_COOLDOWN_BASE`) keeps those exits hours apart.
 const FALLBACK_AFTER_FAILURES: u32 = 3;
+/// Waits before retrying the release tag lookup. A single failed lookup would
+/// otherwise cost an hour's hold for one network blip.
+const TAG_LOOKUP_RETRY_DELAYS: [Duration; 2] = [Duration::from_secs(5), Duration::from_secs(15)];
 /// Waits between failed attempts. The number of entries is the number of
 /// retries. Only network failures are retried; see [`worth_retrying`].
 const STAGE_RETRY_DELAYS: [Duration; 5] = [
@@ -413,7 +423,24 @@ pub(crate) async fn stage_latest_release(
     // shows up as "prepared but never downloaded" instead of as a binary that
     // predates staging.
     tracing::info!("Preparing the update before exiting (#5790)");
-    contain_panic(stage_latest_release_inner(current_version, target)).await
+    contain_panic(stage_latest_release_inner(current_version, target), || {
+        record_panic(target)
+    })
+    .await
+}
+
+/// After a contained panic, record a failure of the release the trigger found,
+/// if it knew one, so the restart that follows the exit holds instead of
+/// panicking its way through the same exit again.
+fn record_panic(target: UpdateTarget<'_>) {
+    if let (Some(version), Some(root)) = (target.version, cache_root()) {
+        if record_failure(&root, version, "preparing the update panicked").is_none() {
+            tracing::warn!(
+                version,
+                "Could not record the failure to stage the update (#5799)"
+            );
+        }
+    }
 }
 
 /// Run `fut`, turning a panic into a log line and an exit. The update-check
@@ -422,6 +449,7 @@ pub(crate) async fn stage_latest_release(
 /// running the updater, on every attempt.
 async fn contain_panic(
     fut: impl std::future::Future<Output = UpdatePreparation>,
+    on_panic: impl FnOnce(),
 ) -> UpdatePreparation {
     use futures::FutureExt;
     match std::panic::AssertUnwindSafe(fut).catch_unwind().await {
@@ -430,8 +458,34 @@ async fn contain_panic(
             tracing::error!(
                 "Downloading the update in advance panicked; exiting for the update anyway"
             );
+            on_panic();
             UpdatePreparation::Exit
         }
+    }
+}
+
+/// Run the tag `lookup`, retrying after about `delays[i]` (±20%) unless the
+/// failure is a rate limit, where retrying is what escalates it.
+async fn lookup_with_retries<F, Fut>(mut lookup: F, delays: &[Duration]) -> Result<String>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<String>>,
+{
+    let mut delays = delays.iter();
+    loop {
+        let e = match lookup().await {
+            Ok(tag) => return Ok(tag),
+            Err(e) => e,
+        };
+        let Some(delay) = delays.next() else {
+            return Err(e);
+        };
+        if e.downcast_ref::<GithubRateLimitedError>().is_some() {
+            return Err(e);
+        }
+        let delay = delay.mul_f64(freenet::config::GlobalRng::random_range(0.8_f64..1.2));
+        tracing::info!(error = %format!("{e:#}"), retry_in_secs = delay.as_secs(), "Release tag lookup failed; retrying");
+        tokio::time::sleep(delay).await;
     }
 }
 
@@ -447,7 +501,11 @@ async fn stage_latest_release_inner(
     // redirect the updater uses, so both normally see the same tag; if a newer
     // release lands in between, the updater finds no cache for it and
     // downloads as before.
-    let tag = super::super::auto_update::fetch_latest_release_tag(false).await;
+    let tag = lookup_with_retries(
+        || super::super::auto_update::fetch_latest_release_tag(false),
+        &TAG_LOOKUP_RETRY_DELAYS,
+    )
+    .await;
     let version = tag
         .as_ref()
         .ok()
@@ -610,6 +668,12 @@ fn defer_after_transient_failure(root: &Path, version: &str, error: &str, urgent
     );
     Staging::Deferred
 }
+
+/// The record left by an exit to install a staged release. The install clears
+/// it; if the updater is killed or fails before it can, this is what makes the
+/// restart hold instead of exiting again at once.
+const INSTALL_PENDING: &str =
+    "exited to install the downloaded update; the install did not report success";
 
 /// Record a failure to stage `version` before an exit that leaves the
 /// download to the updater. Under systemd the updater runs inside
@@ -776,7 +840,7 @@ async fn stage_into(
                 "Update downloaded and verified; exiting to install it ({tag}, {}s)",
                 started.elapsed().as_secs()
             );
-            return Staging::Staged;
+            return exit_after_recording(root, version, INSTALL_PENDING, Staging::Staged);
         }
         StageOutcome::Failed(e) if is_permanent(&e) => {
             tracing::warn!(
@@ -820,7 +884,7 @@ async fn stage_into(
             "The freenet archive is downloaded and verified; exiting to install it, fdev will be \
              downloaded by the updater"
         );
-        return Staging::Staged;
+        return exit_after_recording(root, version, INSTALL_PENDING, Staging::Staged);
     }
     defer_after_transient_failure(root, version, &transient_error, target.urgent)
 }
@@ -2031,7 +2095,10 @@ mod tests {
             statements[1..],
             [
                 "tracing::info!(\"Preparing the update before exiting (#5790)\");",
-                "contain_panic(stage_latest_release_inner(current_version, target)).await",
+                "contain_panic(stage_latest_release_inner(current_version, target), || {",
+                "record_panic(target)",
+                "})",
+                ".await",
             ],
             "stage_latest_release must log the marker, then return staging's decision from \
              inside contain_panic"
@@ -2310,6 +2377,162 @@ mod tests {
         assert_stays_for_the_cooldown(&outcome, &root);
     }
 
+    /// #5896 review 2: an exit after a successful staging records too. The
+    /// updater can fail before it records anything (a killed `ExecStopPost`, a
+    /// network error on its tag probe, an empty install bucket), and the restart
+    /// would then find the cache valid and exit again within seconds. With the
+    /// record it holds instead; an install clears it.
+    #[tokio::test]
+    async fn a_restart_after_a_staged_exit_holds_until_the_install_clears_it() {
+        let freenet = freenet_asset_name();
+        let manifest = manifest_for(&[(&freenet, b"archive")]);
+        let server = serve_release(manifest.as_bytes(), None, &[(&freenet, b"archive")]);
+        let (_tmp, root) = test_root();
+        let first = stage_once(&root, &server.url_str("/"), STAGE_DEADLINE).await;
+        assert_eq!(first, Staging::Staged);
+        assert!(prepared(&first, &root).should_exit());
+        let record = cooldown_record(&root).expect("recorded before the exit");
+        assert_eq!((record.version.as_str(), record.failures), ("9.9.9", 1));
+        assert_eq!(record.last_error, INSTALL_PENDING);
+        // The updater never reported back. The restart's attempt holds, with
+        // no request at all.
+        let quiet = Server::run();
+        let restarted = stage_once(&root, &quiet.url_str("/"), STAGE_DEADLINE).await;
+        assert_eq!(restarted, Staging::CoolingDown);
+        assert_stays_for_the_cooldown(&restarted, &root);
+    }
+
+    /// A freenet archive with no manifest beside it was never verified (the
+    /// manifest is written only after it verifies), so a transient failure in
+    /// that state is not an "only fdev failed" exit: the node stays.
+    #[tokio::test]
+    async fn an_archive_without_its_manifest_is_not_treated_as_staged() {
+        let server = Server::run();
+        server.expect(
+            Expectation::matching(any())
+                .times(..)
+                .respond_with(status_code(500)),
+        );
+        let (_tmp, root) = test_root();
+        let dir = root.join(TAG);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join(freenet_asset_name()), b"unverified").unwrap();
+        let outcome = stage_once(&root, &server.url_str("/"), STAGE_DEADLINE).await;
+        assert_eq!(outcome, Staging::Deferred);
+        assert!(!prepared(&outcome, &root).should_exit());
+    }
+
+    /// The lock-error exit records as well (review F).
+    #[tokio::test]
+    async fn a_cache_lock_error_records_before_exiting() {
+        let server = Server::run();
+        let (_tmp, root) = test_root();
+        // A directory where the lock file goes: it cannot be opened.
+        fs::create_dir_all(root.with_extension("lock")).unwrap();
+        let outcome = stage_into_with(&root, &server, Ok(TAG.into()), None, &|_| false).await;
+        assert_eq!(outcome, Staging::Skipped);
+        assert_eq!(cooldown_record(&root).map(|r| r.failures), Some(1));
+    }
+
+    /// An urgent node's stay is capped at the base cooldown whatever the
+    /// failure count (review C, carried into the hold).
+    #[test]
+    fn an_urgent_nodes_stay_is_capped_at_the_base_cooldown() {
+        use super::super::super::rollback::{UPDATE_COOLDOWN_BASE, record_update_cooldown_at};
+        let (tmp, root) = test_root();
+        let now = std::time::SystemTime::now();
+        for _ in 0..4 {
+            record_update_cooldown_at(tmp.path(), "9.9.9", "x", now, 0.5);
+        }
+        let UpdatePreparation::Stay { retry_in: calm, .. } =
+            preparation(&Staging::CoolingDown, &root, Some("9.9.9"), false)
+        else {
+            panic!("stays");
+        };
+        let UpdatePreparation::Stay {
+            retry_in: urgent, ..
+        } = preparation(&Staging::CoolingDown, &root, Some("9.9.9"), true)
+        else {
+            panic!("stays");
+        };
+        assert!(calm > UPDATE_COOLDOWN_BASE * 4, "{calm:?}");
+        assert!(urgent <= UPDATE_COOLDOWN_BASE, "{urgent:?}");
+    }
+
+    /// The entry point hands the trigger's urgency to both the staging
+    /// decision and the hold it returns.
+    #[test]
+    fn staging_passes_the_triggers_urgency_through() {
+        let src = include_str!("staged.rs").replace("\r\n", "\n");
+        let production = src
+            .split_once(concat!("#[cfg(test)]\n", "mod tests {"))
+            .unwrap()
+            .0;
+        let start = production
+            .find("async fn stage_latest_release_inner(")
+            .unwrap();
+        let body = &production[start..];
+        let flat: String = body[..body.find("\n}\n").unwrap()]
+            .split_whitespace()
+            .collect();
+        assert!(flat.contains("std::future::ready(tag),target,version_blocked,"));
+        assert_eq!(
+            // `str::matches`, not the httptest `Matcher` trait in scope here.
+            str::matches(
+                flat.as_str(),
+                "preparation(&staging,&root,version.as_deref(),target.urgent)"
+            )
+            .count(),
+            2
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_tag_lookup_is_retried_but_not_into_a_rate_limit() {
+        let mut calls = 0;
+        let tag = lookup_with_retries(
+            || {
+                calls += 1;
+                let n = calls;
+                async move {
+                    if n < 3 {
+                        anyhow::bail!("blip")
+                    } else {
+                        Ok(TAG.to_string())
+                    }
+                }
+            },
+            &TAG_LOOKUP_RETRY_DELAYS,
+        )
+        .await;
+        assert_eq!(tag.unwrap(), TAG);
+        assert_eq!(calls, 3);
+
+        let mut calls = 0;
+        let limited = lookup_with_retries(
+            || {
+                calls += 1;
+                async { Err(GithubRateLimitedError { retry_after: None }.into()) }
+            },
+            &TAG_LOOKUP_RETRY_DELAYS,
+        )
+        .await;
+        assert!(limited.is_err());
+        assert_eq!(calls, 1, "a rate limit is not retried");
+
+        let mut calls = 0;
+        let down = lookup_with_retries(
+            || {
+                calls += 1;
+                async { anyhow::bail!("down") }
+            },
+            &TAG_LOOKUP_RETRY_DELAYS,
+        )
+        .await;
+        assert!(down.is_err());
+        assert_eq!(calls, TAG_LOOKUP_RETRY_DELAYS.len() + 1);
+    }
+
     /// The fallback threshold is part of the contract with the PR's stated
     /// worst-case delays; changing it is a decision, not a tweak.
     #[test]
@@ -2494,7 +2717,9 @@ mod tests {
         let (_tmp, root) = test_root();
         let outcome = stage_once(&root, &server.url_str("/"), STAGE_DEADLINE).await;
         assert_eq!(outcome, Staging::Staged);
-        assert!(cooldown_record(&root).is_none());
+        // Recorded as an exit to install, not as a failure to fetch.
+        let record = cooldown_record(&root).expect("recorded before the exit");
+        assert_eq!(record.last_error, INSTALL_PENDING);
     }
 
     /// The macOS bundle branch, which no Linux CI job compiles in, must route
@@ -2625,16 +2850,21 @@ mod tests {
 
     #[tokio::test]
     async fn a_panic_while_staging_still_lets_the_update_proceed() {
+        let mut recorded = false;
         assert_eq!(
-            contain_panic(async { panic!("staging bug") }).await,
+            contain_panic(async { panic!("staging bug") }, || recorded = true).await,
             UpdatePreparation::Exit
         );
+        assert!(recorded, "a contained panic runs its recording hook");
         // And a decision to stay is passed through, not overridden.
         let stay = || UpdatePreparation::Stay {
             version: None,
             retry_in: Duration::from_secs(1),
         };
-        assert_eq!(contain_panic(async move { stay() }).await, stay());
+        assert_eq!(
+            contain_panic(async move { stay() }, || panic!("no panic, no hook")).await,
+            stay()
+        );
     }
 
     #[tokio::test(start_paused = true)]
