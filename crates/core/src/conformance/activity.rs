@@ -4,9 +4,10 @@
 //! production-shape peer that judged nothing for twelve hours (#5913): most hosted
 //! contracts receive no UPDATE in a given two-hour focus period, a focused contract
 //! only gains samples from merges it receives while focused, and so the focused pair
-//! almost always had nothing to check. This module counts merges per contract so
-//! [`super::focus::FocusSelector::select_weighted`] can prefer contracts that will
-//! actually produce evidence.
+//! almost always had nothing to check. This module counts merges per contract so the
+//! weighted focus slot ([`super::focus::FocusSelector::select_split`]) can prefer
+//! contracts that will actually produce evidence. Only state-changing merges the
+//! sampler could admit are counted (`capture::counts_as_activity`).
 //!
 //! # Cost, and where it is paid
 //!
@@ -36,9 +37,9 @@
 //!
 //! Activity is lost on restart, deliberately. It is a short-horizon estimate with a
 //! half-life of one focus period, so a persisted copy would be mostly stale by the
-//! time a restarted peer read it. A restarted peer selects as it did before #5913
-//! (uniformly over the hosted set) until its first probe tick, then weights by
-//! whatever it has observed since starting. See `ShadowRunner::advance`.
+//! time a restarted peer read it. A restarted peer's weighted slot draws uniformly
+//! until it has observed state-changing merges, and weights by them from the next
+//! draw on; the uniform slot is unaffected either way. See `ShadowRunner::advance`.
 
 use std::collections::HashMap;
 
@@ -131,14 +132,9 @@ impl MergeActivity {
         });
     }
 
-    #[cfg(test)]
+    /// Current activity for `contract`; zero if not tracked.
     pub(crate) fn count(&self, contract: &ContractInstanceId) -> u32 {
         self.counts.get(contract).copied().unwrap_or(0)
-    }
-
-    /// A copy of every non-zero count, for freezing selection weights for a period.
-    pub(crate) fn snapshot(&self) -> HashMap<ContractInstanceId, u32> {
-        self.counts.clone()
     }
 
     pub(crate) fn len(&self) -> usize {

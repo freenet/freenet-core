@@ -1323,6 +1323,8 @@ pub(crate) fn record_related(
 /// file behind forever, and since eviction happens on every rotation once the map is
 /// full, those orphans accumulate without bound - which also lets `reload` resurrect a
 /// long-evicted contract ahead of the current focus set on the next restart.
+/// Test-only since `run_writer` moved to [`record_with_outcome`].
+#[cfg(test)]
 #[must_use = "the evicted contract's bundle must be deleted, or it is orphaned on disk"]
 pub(crate) fn record(
     samplers: &mut HashMap<ContractInstanceId, TrackedContract>,

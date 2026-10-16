@@ -43,7 +43,7 @@ use tokio::time::Instant;
 use super::activity::MergeActivity;
 use super::bundle::ReplayBundle;
 use super::capture::RecordOutcome;
-use super::focus::FocusSelector;
+use super::focus::{FocusSelector, FocusSlot};
 use super::generator::{GeneratorConfig, generate_cases};
 use super::policy::{ConformanceAction, EnforcementMode, decide};
 use super::property::{ConformanceProperty, PropertyOutcome};
@@ -316,12 +316,11 @@ pub(crate) struct FocusTick {
     /// How many contracts were eligible. Distinguishes "this peer hosts almost
     /// nothing" from "selection is broken".
     pub candidates: usize,
-    /// How many of those candidates had recent merge activity in the weights this
-    /// period selects with (#5913).
+    /// How many of those candidates have recent merge activity (#5913).
     ///
-    /// Zero means selection was uniform this tick: either the peer has observed no
-    /// merges for anything it hosts, or it restarted and has not reached its first
-    /// probe tick. Without this a uniform draw and a weighted one log identically.
+    /// Zero means the weighted slot was drawn uniformly this tick: the peer has seen
+    /// no state-changing merge for anything it hosts recently, which is a fact about
+    /// traffic, not about selection. Counted over the candidates only.
     pub active_candidates: usize,
     pub source: CandidateSource,
 }
@@ -359,6 +358,16 @@ pub(crate) struct FocusPeriodSummary {
     pub stints_without_new_samples: usize,
     /// Stints in which at least one probe reached a verdict on the contract.
     pub judged: usize,
+    /// Stints in the uniform slot, and how many of them were judged.
+    pub uniform_stints: usize,
+    pub judged_uniform: usize,
+    /// Stints in the weighted slot, and how many of them were judged.
+    pub weighted_stints: usize,
+    pub judged_weighted: usize,
+    /// Sum of the activity each weighted stint had when it was drawn. With
+    /// `weighted_stints`, says whether the weighted slot actually landed on busy
+    /// contracts or was effectively a uniform draw.
+    pub weighted_selected_activity: u64,
 }
 
 /// Per-period bookkeeping for the focus contracts.
@@ -371,22 +380,43 @@ struct FocusPeriod {
     totals: FocusPeriodSummary,
 }
 
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 struct PeriodMember {
+    slot: FocusSlot,
+    /// Activity when this stint was drawn.
+    activity: u32,
     seen: u64,
     admitted: u64,
     refused: u64,
     judged: bool,
 }
 
+impl PeriodMember {
+    fn new(slot: FocusSlot, activity: u32) -> Self {
+        Self {
+            slot,
+            activity,
+            seen: 0,
+            admitted: 0,
+            refused: 0,
+            judged: false,
+        }
+    }
+}
+
 impl FocusPeriod {
     /// Make `selected` the current focus set, folding any contract leaving it into
     /// the totals, and remember the pool it was drawn from.
-    fn enter(&mut self, selected: &[ContractInstanceId], candidates: usize, active: usize) {
+    fn enter(
+        &mut self,
+        selected: &[(ContractInstanceId, FocusSlot, u32)],
+        candidates: usize,
+        active: usize,
+    ) {
         let leaving: Vec<ContractInstanceId> = self
             .current
             .keys()
-            .filter(|id| !selected.contains(id))
+            .filter(|id| !selected.iter().any(|(s, _, _)| s == *id))
             .copied()
             .collect();
         for id in leaving {
@@ -394,8 +424,12 @@ impl FocusPeriod {
                 self.fold(member);
             }
         }
-        for id in selected {
-            self.current.entry(*id).or_default();
+        // A contract already in focus continues its stint (and keeps the slot it was
+        // drawn into); a new one starts a stint.
+        for (id, slot, activity) in selected {
+            self.current
+                .entry(*id)
+                .or_insert_with(|| PeriodMember::new(*slot, *activity));
         }
         self.totals.candidates = candidates;
         self.totals.active_candidates = active;
@@ -413,6 +447,30 @@ impl FocusPeriod {
         if member.judged {
             totals.judged += 1;
         }
+        match member.slot {
+            FocusSlot::Uniform => {
+                totals.uniform_stints += 1;
+                totals.judged_uniform += usize::from(member.judged);
+            }
+            FocusSlot::Weighted => {
+                totals.weighted_stints += 1;
+                totals.judged_weighted += usize::from(member.judged);
+                totals.weighted_selected_activity = totals
+                    .weighted_selected_activity
+                    .saturating_add(u64::from(member.activity));
+            }
+        }
+    }
+
+    /// Current focus contracts that must not be displaced: the sampler has admitted
+    /// something new for them this stint, so moving them would abandon a sample
+    /// being built.
+    fn accruing(&self) -> Vec<(ContractInstanceId, FocusSlot)> {
+        self.current
+            .iter()
+            .filter(|(_, member)| member.admitted > 0)
+            .map(|(id, member)| (*id, member.slot))
+            .collect()
     }
 
     fn seen(&mut self, contract: &ContractInstanceId) {
@@ -473,15 +531,16 @@ pub struct ShadowRunner {
     /// on rotation, which is also what makes the log a per-epoch summary rather than
     /// an ever-growing set.
     logged: HashSet<(ContractInstanceId, ConformanceProperty)>,
-    /// Merges observed per contract, decayed once per period (#5913).
-    activity: MergeActivity,
-    /// The activity this period selects with, frozen when the period starts.
+    /// State-changing merges observed per contract, decayed once per period and
+    /// read CURRENT at every draw (#5913, #5914 review D1).
     ///
-    /// Frozen rather than read live because focus is recomputed every tick: live
-    /// weights would move focus whenever the counts moved, abandoning half-built
-    /// samples mid-period, which is what rotating only at period boundaries exists to
-    /// prevent. Selection is therefore deterministic given (salt, epoch, this map).
-    weights: HashMap<ContractInstanceId, u32>,
+    /// Not frozen per period: frozen weights could not see a contract that was quiet
+    /// before a period and bursts during it, and focused it less than a uniform draw
+    /// would while it had the most to check. Re-reading at each probe tick does not
+    /// churn focus, because a focus contract the sampler is admitting new samples for
+    /// is kept (see `FocusPeriod::accruing`); only a pick that has gathered nothing is
+    /// re-drawn.
+    activity: MergeActivity,
     /// What the current period's focus contracts have and have not seen.
     period: FocusPeriod,
     /// Whether the current period began in this process. False until the first
@@ -507,7 +566,6 @@ impl ShadowRunner {
             dir: dir.to_path_buf(),
             logged: HashSet::new(),
             activity: MergeActivity::new(super::activity::MAX_TRACKED_ACTIVITY, salt),
-            weights: HashMap::new(),
             period: FocusPeriod::default(),
             period_complete: false,
         }
@@ -524,15 +582,11 @@ impl ShadowRunner {
     /// a peer that was down does not skip epochs it never sampled in.
     ///
     /// On rotation it also closes the focus period (logged, and returned so a test can
-    /// read it), freezes the activity the next period selects with, and then decays
-    /// the activity counts, so their half-life is one period.
+    /// read it) and decays the activity counts, so their half-life is one period.
     ///
-    /// Between rotations the frozen weights are replaced only while they are EMPTY.
-    /// That is the restart path: activity is not persisted, so a restarted peer
-    /// selects uniformly until its first probe tick and then weights by what it has
-    /// observed since starting, rather than waiting up to a whole period. It is also
-    /// the path for a peer whose last period saw no merges at all. Once non-empty, the
-    /// weights hold until the period ends.
+    /// Activity is not persisted. A restarted peer's weighted slot draws from what it
+    /// has observed since starting, which is uniform until the first state-changing
+    /// merge arrives; the period it restarts into is reported `complete=false`.
     pub(crate) fn advance(&mut self) -> Option<FocusPeriodSummary> {
         self.ticks = self.ticks.wrapping_add(1);
         if self.ticks % ROTATE_EVERY_TICKS == 0 {
@@ -551,17 +605,18 @@ impl ShadowRunner {
                 samples_refused = ended.samples_refused,
                 stints_without_new_samples = ended.stints_without_new_samples,
                 judged = ended.judged,
+                uniform_stints = ended.uniform_stints,
+                judged_uniform = ended.judged_uniform,
+                weighted_stints = ended.weighted_stints,
+                judged_weighted = ended.judged_weighted,
+                weighted_selected_activity = ended.weighted_selected_activity,
                 "conformance focus period ended"
             );
             self.selector.rotate();
             self.logged.clear();
             store_epoch(&self.dir, self.selector.epoch());
-            self.weights = self.activity.snapshot();
             self.activity.decay();
             return Some(ended);
-        }
-        if self.weights.is_empty() {
-            self.weights = self.activity.snapshot();
         }
         None
     }
@@ -637,10 +692,12 @@ impl ShadowRunner {
     /// source it used. `candidates=sampler` means focus has stopped covering the
     /// hosted set, a state that otherwise looks identical to a peer hosting little.
     ///
-    /// Selection within the pool is weighted by recent merge activity (#5913): a
-    /// contract that receives no merges while focused cannot be sampled, so uniform
-    /// focus over a mostly-cold hosted set judged nothing. Activity only weights the
-    /// pool; it never adds to it, so focus still comes from the hosted set.
+    /// Within the pool, one slot is a uniform salted draw and the rest are weighted by
+    /// current merge activity ([`FocusSelector::select_split`]; #5913, #5914 review
+    /// D1). A contract that receives no merges while focused cannot be sampled, so a
+    /// fully uniform draw over a mostly-cold hosted set judged nothing; a fully
+    /// weighted one let busy decoys crowd out quiet contracts. Activity only weights
+    /// the pool; it never adds to it, so focus still comes from the hosted set.
     pub(crate) fn focus(
         &mut self,
         hosted: Option<Vec<ContractInstanceId>>,
@@ -650,16 +707,25 @@ impl ShadowRunner {
             return FocusTick::default();
         }
         let (candidates, source) = candidate_pool(hosted, fallback);
-        let weights = &self.weights;
-        let selected = self
-            .selector
-            .select_weighted(&candidates, |id| weights.get(id).copied().unwrap_or(0));
+        let activity = &self.activity;
+        let picks = self.selector.select_split(
+            &candidates,
+            |id| activity.count(id),
+            &self.period.accruing(),
+        );
         let active_candidates = candidates
             .iter()
-            .filter(|id| weights.contains_key(id))
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .filter(|id| activity.count(id) > 0)
             .count();
+        let entered: Vec<(ContractInstanceId, FocusSlot, u32)> = picks
+            .iter()
+            .map(|(id, slot)| (*id, *slot, activity.count(id)))
+            .collect();
         self.period
-            .enter(&selected, candidates.len(), active_candidates);
+            .enter(&entered, candidates.len(), active_candidates);
+        let selected = picks.into_iter().map(|(id, _)| id).collect();
         FocusTick {
             selected,
             candidates: candidates.len(),
@@ -1588,21 +1654,22 @@ mod tests {
         (hosted, busy)
     }
 
-    /// A salt for which the uniform draw over `hosted_with_busy` misses every busy
-    /// contract. Searched for rather than hard-coded, so the precondition is checked
-    /// rather than assumed, and a change to the scoring cannot leave this test
-    /// asserting against a draw that happens to hit anyway.
-    fn salt_where_uniform_misses_busy() -> [u8; 32] {
+    /// A salt for which the focus draw over `hosted_with_busy` misses every busy
+    /// contract when nothing is active, and hits one once the busy ones are. Searched
+    /// for rather than hard-coded, so the precondition is checked rather than assumed.
+    fn salt_where_activity_changes_the_draw() -> [u8; 32] {
         let (hosted, busy) = hosted_with_busy();
         (0..=255u8)
             .map(|n| [n; 32])
             .find(|salt| {
-                FocusSelector::new(*salt, MAX_FOCUS_CONTRACTS)
-                    .select(&hosted)
-                    .iter()
-                    .all(|c| !busy.contains(c))
+                let selector = FocusSelector::new(*salt, MAX_FOCUS_CONTRACTS);
+                let quiet = selector.select_split(&hosted, |_| 0, &[]);
+                let busy_draw =
+                    selector.select_split(&hosted, |c| if busy.contains(c) { 40 } else { 0 }, &[]);
+                quiet.iter().all(|(c, _)| !busy.contains(c))
+                    && busy_draw.iter().any(|(c, _)| busy.contains(c))
             })
-            .expect("no salt in 256 has a uniform draw missing ten of sixty contracts")
+            .expect("no salt in 256 where activity changes the draw")
     }
 
     /// The wiring, end to end through the runner: merges counted by `note_merge`
@@ -1614,7 +1681,7 @@ mod tests {
     #[test]
     fn merges_observed_before_a_probe_tick_steer_focus_toward_busy_contracts() {
         let dir = tempfile::TempDir::new().expect("tempdir");
-        let mut runner = runner_with_salt(dir.path(), salt_where_uniform_misses_busy());
+        let mut runner = runner_with_salt(dir.path(), salt_where_activity_changes_the_draw());
         let (hosted, busy) = hosted_with_busy();
 
         let before = runner.focus(Some(hosted.clone()), &[]);
@@ -1641,46 +1708,6 @@ mod tests {
         );
     }
 
-    /// Within a period the weights are frozen, so new activity cannot move focus
-    /// until the period ends. Otherwise every tick could abandon a half-built sample.
-    #[test]
-    fn focus_does_not_move_mid_period_when_activity_changes() {
-        let dir = tempfile::TempDir::new().expect("tempdir");
-        let mut runner = runner_with_salt(dir.path(), [3; 32]);
-        let (hosted, busy) = hosted_with_busy();
-        for contract in &busy {
-            runner.note_merge(*contract, true);
-        }
-        runner.advance();
-        let settled = runner.focus(Some(hosted.clone()), &[]).selected;
-
-        // A burst on contracts that were cold when the period's weights were frozen.
-        for contract in &hosted[30..] {
-            for _ in 0..1_000 {
-                runner.note_merge(*contract, true);
-            }
-        }
-        for _ in 1..ROTATE_EVERY_TICKS - 1 {
-            assert!(runner.advance().is_none());
-            assert_eq!(
-                runner.focus(Some(hosted.clone()), &[]).selected,
-                settled,
-                "focus moved mid-period because activity changed"
-            );
-        }
-        // The period boundary is where the new activity is allowed in.
-        assert!(
-            runner.advance().is_some(),
-            "the period did not end on schedule"
-        );
-        let next = runner.focus(Some(hosted.clone()), &[]);
-        assert_eq!(
-            next.active_candidates,
-            hosted.len() - 20,
-            "the next period did not freeze the activity seen during this one"
-        );
-    }
-
     /// Activity decays at each period boundary, so a contract that went quiet stops
     /// being favoured instead of holding its weight forever.
     #[test]
@@ -1690,18 +1717,15 @@ mod tests {
         for _ in 0..8 {
             runner.note_merge(instance(1), true);
         }
-        for _ in 0..ROTATE_EVERY_TICKS {
+        for _ in 0..ROTATE_EVERY_TICKS - 1 {
             runner.advance();
         }
+        assert_eq!(runner.activity.count(&instance(1)), 8, "decayed mid-period");
+        runner.advance();
         assert_eq!(
             runner.activity.count(&instance(1)),
             4,
             "one period halves it"
-        );
-        assert_eq!(
-            runner.weights.get(&instance(1)),
-            Some(&8),
-            "the frozen weights must be the activity BEFORE decay"
         );
         for _ in 0..ROTATE_EVERY_TICKS * 3 {
             runner.advance();
@@ -1710,6 +1734,121 @@ mod tests {
             runner.activity_tracked(),
             0,
             "a contract with no merges for four periods is still tracked"
+        );
+    }
+
+    /// A salt for which a burst on `burst`, starting after the period's first draw,
+    /// wins the weighted slot at the next tick, while that first draw (made from the
+    /// pre-burst activity) missed every burst contract.
+    fn salt_where_a_burst_wins_the_weighted_slot(
+        hosted: &[ContractInstanceId],
+        before: &impl Fn(&ContractInstanceId) -> u32,
+        during: &impl Fn(&ContractInstanceId) -> u32,
+        burst: &[ContractInstanceId],
+    ) -> [u8; 32] {
+        (0..=255u8)
+            .map(|n| [n; 32])
+            .find(|salt| {
+                let selector = FocusSelector::new(*salt, MAX_FOCUS_CONTRACTS);
+                let first = selector.select_split(hosted, before, &[]);
+                let next = selector.select_split(hosted, during, &[]);
+                first.iter().all(|(c, _)| !burst.contains(c))
+                    && next.iter().any(|(c, _)| burst.contains(c))
+            })
+            .expect("no salt in 256 has a burst win the weighted slot")
+    }
+
+    /// The bursty-evasion inversion (#5914 review D1): weights frozen at the start
+    /// of a period could not see a contract that was quiet before the period and
+    /// bursts during it, so it was focused LESS than under a uniform draw exactly
+    /// while it had the most to check. Activity must reach the weighted slot at the
+    /// next probe tick.
+    #[test]
+    fn a_burst_during_the_period_reaches_the_weighted_slot_at_the_next_tick() {
+        let hosted: Vec<_> = (0..60u8).map(instance).collect();
+        let burst: Vec<_> = (40..50u8).map(instance).collect();
+        let before = |c: &ContractInstanceId| u32::from(*c == instance(59)) * 5;
+        let during = |c: &ContractInstanceId| {
+            if burst.contains(c) { 60 } else { before(c) }
+        };
+        let salt = salt_where_a_burst_wins_the_weighted_slot(&hosted, &before, &during, &burst);
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut runner = runner_with_salt(dir.path(), salt);
+
+        for _ in 0..5 {
+            runner.note_merge(instance(59), true);
+        }
+        runner.advance();
+        let first = runner.focus(Some(hosted.clone()), &[]).selected;
+        assert!(first.iter().all(|c| !burst.contains(c)), "precondition");
+
+        for contract in &burst {
+            for _ in 0..60 {
+                runner.note_merge(*contract, true);
+            }
+        }
+        assert!(runner.advance().is_none(), "still mid-period");
+        let next = runner.focus(Some(hosted.clone()), &[]).selected;
+        assert!(
+            next.iter().any(|c| burst.contains(c)),
+            "ten contracts started merging mid-period and the next tick still did not \
+             focus on any of them: {next:?}"
+        );
+    }
+
+    /// A focus contract that is accruing samples is not displaced mid-period, however
+    /// much activity appears elsewhere. Moving it would abandon a half-built sample.
+    #[test]
+    fn a_focus_contract_with_new_samples_is_not_displaced() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut runner = runner_with_salt(dir.path(), [21; 32]);
+        let hosted: Vec<_> = (0..60u8).map(instance).collect();
+        runner.advance();
+        let first = runner.focus(Some(hosted.clone()), &[]).selected;
+        for contract in &first {
+            runner.note_merge(*contract, true);
+            runner.note_admission(contract, RecordOutcome::Admitted);
+        }
+        for contract in hosted.iter().filter(|c| !first.contains(c)) {
+            for _ in 0..100 {
+                runner.note_merge(*contract, true);
+            }
+        }
+        for _ in 1..ROTATE_EVERY_TICKS - 1 {
+            assert!(runner.advance().is_none());
+            let mut now = runner.focus(Some(hosted.clone()), &[]).selected;
+            let mut was = first.clone();
+            now.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+            was.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+            assert_eq!(now, was, "a focus contract accruing samples was displaced");
+        }
+    }
+
+    /// Activity on contracts the peer does not host can neither be selected nor
+    /// stop candidates' activity from counting (#5914 review T5: a stray merge on a
+    /// non-candidate used to freeze the period as uniform).
+    #[test]
+    fn activity_outside_the_candidates_does_not_mask_candidate_activity() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut runner = runner_with_salt(dir.path(), [23; 32]);
+        let hosted: Vec<_> = (0..20u8).map(instance).collect();
+        runner.note_merge(instance(200), true);
+        runner.advance();
+        let first = runner.focus(Some(hosted.clone()), &[]);
+        assert_eq!(
+            first.active_candidates, 0,
+            "a non-candidate counted as active"
+        );
+        assert!(!first.selected.contains(&instance(200)));
+
+        for _ in 0..10 {
+            runner.note_merge(instance(3), true);
+        }
+        runner.advance();
+        let next = runner.focus(Some(hosted.clone()), &[]);
+        assert_eq!(
+            next.active_candidates, 1,
+            "a candidate's activity was ignored because a non-candidate had merged first"
         );
     }
 
@@ -1744,8 +1883,9 @@ mod tests {
 
     /// Every field of the period summary comes from its own source.
     ///
-    /// The values are chosen pairwise distinct so a field assigned from the wrong
-    /// counter (the review's surviving mutant was `unobserved = judged`) cannot pass.
+    /// The scenario gives the fields different values wherever it can (the review's
+    /// surviving mutant was a field fed from another counter); where two fields
+    /// legitimately coincide, the log-line pin below still catches a swap.
     #[test]
     fn the_period_summary_counts_each_field_from_its_own_source() {
         use RecordOutcome::{Admitted, NothingNew, Refused};
@@ -1753,22 +1893,47 @@ mod tests {
         let mut runner = runner_with_salt(dir.path(), [7; 32]);
         let hosted: Vec<_> = (0..20u8).map(instance).collect();
         let focus = runner.focus(Some(hosted.clone()), &[]);
+        // Uniform slot first, then weighted.
         let (a, b) = (focus.selected[0], focus.selected[1]);
 
-        // a: 6 merges seen, 3 admitted, 2 refused, 1 nothing new; judged.
+        // a: 6 seen, 3 admitted, 2 refused, 1 nothing new; judged.
         feed(
             &mut runner,
             a,
             &[Admitted, Admitted, Admitted, Refused, Refused, NothingNew],
         );
-        // b: 4 merges seen, nothing admitted; not judged.
-        feed(&mut runner, b, &[NothingNew, NothingNew, Refused, Refused]);
-        runner.note_judged(&[JudgedContract {
-            contract: a,
-            verdicts: 3,
-            inconclusive: 0,
-        }]);
+        // b: 4 seen, nothing admitted; judged from retained samples anyway.
+        feed(
+            &mut runner,
+            b,
+            &[NothingNew, NothingNew, NothingNew, NothingNew],
+        );
+        runner.note_judged(&[
+            JudgedContract {
+                contract: a,
+                verdicts: 3,
+                inconclusive: 0,
+            },
+            JudgedContract {
+                contract: b,
+                verdicts: 1,
+                inconclusive: 0,
+            },
+        ]);
         assert_eq!(runner.focus_without_new_samples(), 1, "b has nothing new");
+
+        // Every other contract becomes active, then b stops being hosted: a is kept
+        // (it is accruing samples), the weighted slot is redrawn to some c.
+        for contract in hosted.iter().filter(|c| **c != a && **c != b) {
+            for _ in 0..7 {
+                runner.note_merge(*contract, true);
+            }
+        }
+        let without_b: Vec<_> = hosted.iter().copied().filter(|c| *c != b).collect();
+        let second = runner.focus(Some(without_b), &[]).selected;
+        assert_eq!(second[0], a, "a contract accruing samples was displaced");
+        let c = second[1];
+        feed(&mut runner, c, &[Admitted, Refused, Refused, Refused]);
 
         let summary = end_period(&mut runner);
         assert_eq!(
@@ -1776,14 +1941,19 @@ mod tests {
             FocusPeriodSummary {
                 epoch: 0,
                 complete: false,
-                candidates: 20,
-                active_candidates: 0,
-                stints: 2,
-                merges_seen: 10,
-                samples_admitted: 3,
-                samples_refused: 4,
+                candidates: 19,
+                active_candidates: 19,
+                stints: 3,
+                merges_seen: 14,
+                samples_admitted: 4,
+                samples_refused: 5,
                 stints_without_new_samples: 1,
-                judged: 1,
+                judged: 2,
+                uniform_stints: 1,
+                judged_uniform: 1,
+                weighted_stints: 2,
+                judged_weighted: 1,
+                weighted_selected_activity: 7,
             }
         );
     }
@@ -1888,6 +2058,11 @@ mod tests {
             "samples_refused",
             "stints_without_new_samples",
             "judged",
+            "uniform_stints",
+            "judged_uniform",
+            "weighted_stints",
+            "judged_weighted",
+            "weighted_selected_activity",
         ] {
             let pair = format!("{field} = ended.{field},");
             assert_eq!(

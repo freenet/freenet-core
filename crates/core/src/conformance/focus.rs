@@ -74,6 +74,15 @@ pub fn focus_weight(activity: u32) -> f64 {
     COLD_FOCUS_WEIGHT + f64::from(activity.min(ACTIVITY_WEIGHT_CAP))
 }
 
+/// Which draw put a contract in focus.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum FocusSlot {
+    /// A uniform salted draw over the candidates. Activity plays no part.
+    Uniform,
+    /// A draw weighted by current activity.
+    Weighted,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FocusSelector {
     /// Per-peer secret. Persisted so focus does not reshuffle on every restart,
@@ -119,16 +128,27 @@ impl FocusSelector {
         self.epoch = self.epoch.wrapping_add(1);
     }
 
-    /// The contracts this peer should watch right now, given what it hosts,
-    /// drawn uniformly.
+    /// The `max_focus` candidates with the lowest salted scores: a uniform draw.
     ///
-    /// Deterministic for a given `(salt, epoch, candidates)`, so a peer that
-    /// restarts mid-period resumes watching the same contracts instead of
-    /// abandoning a half-built sample. [`select_weighted`](Self::select_weighted) with
-    /// no activity anywhere; the shadow runner uses that form, whose activity is not
-    /// persisted (see `ShadowRunner::advance` for what that costs a restart).
+    /// Deterministic for a given `(salt, epoch, candidates)`. This is the rule the
+    /// uniform focus slot uses (see [`select_split`](Self::select_split)).
     pub fn select(&self, candidates: &[ContractInstanceId]) -> Vec<ContractInstanceId> {
-        self.select_weighted(candidates, |_| 0)
+        let mut scored: Vec<([u8; 32], ContractInstanceId)> = candidates
+            .iter()
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .map(|id| (self.score(id), *id))
+            .collect();
+        // Tie-break on the id so the result is total-ordered even in the
+        // astronomically unlikely case of a score collision.
+        scored.sort_by(|(sa, ia), (sb, ib)| {
+            sa.cmp(sb).then_with(|| ia.as_bytes().cmp(ib.as_bytes()))
+        });
+        scored
+            .into_iter()
+            .take(self.max_focus)
+            .map(|(_, id)| id)
+            .collect()
     }
 
     /// The contracts to watch, drawn with probability weighted by recent activity.
@@ -149,7 +169,7 @@ impl FocusSelector {
             .collect::<HashSet<_>>()
             .into_iter()
             .map(|id| {
-                let score = self.score(id);
+                let score = self.weighted_score(id);
                 (draw_key(&score, focus_weight(activity(id))), score, *id)
             })
             .collect();
@@ -167,9 +187,108 @@ impl FocusSelector {
             .collect()
     }
 
+    /// The focus set: one uniform slot, the rest weighted by current activity.
+    ///
+    /// - The **uniform slot** is the lowest salted score among the candidates, exactly
+    ///   [`select`](Self::select)'s first pick. Activity plays no part, so every
+    ///   hosted contract is explored at about one in N per period whatever anyone
+    ///   does to activity elsewhere.
+    /// - The **weighted slots** (`max_focus - 1` of them) are drawn by
+    ///   [`select_weighted`](Self::select_weighted)'s rule from the remaining
+    ///   candidates, using whatever `activity` says now. The caller re-draws at each
+    ///   probe tick, so a contract that starts bursting mid-period is seen at the next
+    ///   tick rather than the next period.
+    ///
+    /// `kept` are current focus contracts the caller will not displace (in the shadow
+    /// runner: those the sampler has admitted something new for this period). Each
+    /// stays in its slot if it is still a candidate; only the remaining slots are
+    /// drawn. With `max_focus == 1` there is only the uniform slot.
+    ///
+    /// Deterministic for a given `(salt, epoch, candidates, activity, kept)`,
+    /// independent of candidate order and duplicates. Returned uniform slot first,
+    /// then weighted slots in draw order.
+    pub fn select_split(
+        &self,
+        candidates: &[ContractInstanceId],
+        activity: impl Fn(&ContractInstanceId) -> u32,
+        kept: &[(ContractInstanceId, FocusSlot)],
+    ) -> Vec<(ContractInstanceId, FocusSlot)> {
+        let pool: HashSet<ContractInstanceId> = candidates.iter().copied().collect();
+        let uniform_slots = self.max_focus.min(1);
+        let weighted_slots = self.max_focus - uniform_slots;
+        let capacity = |slot: FocusSlot| match slot {
+            FocusSlot::Uniform => uniform_slots,
+            FocusSlot::Weighted => weighted_slots,
+        };
+
+        // Kept contracts first, in a fixed order so the caller's order is irrelevant.
+        let mut kept: Vec<(ContractInstanceId, FocusSlot)> = kept
+            .iter()
+            .copied()
+            .filter(|(id, _)| pool.contains(id))
+            .collect();
+        kept.sort_by(|(ia, sa), (ib, sb)| {
+            sa.cmp(sb).then_with(|| ia.as_bytes().cmp(ib.as_bytes()))
+        });
+        let mut chosen: Vec<(ContractInstanceId, FocusSlot)> = Vec::with_capacity(self.max_focus);
+        for (id, slot) in kept {
+            let used = chosen.iter().filter(|(_, s)| *s == slot).count();
+            if used < capacity(slot) && !chosen.iter().any(|(c, _)| *c == id) {
+                chosen.push((id, slot));
+            }
+        }
+        let taken = |chosen: &[(ContractInstanceId, FocusSlot)], id: &ContractInstanceId| {
+            chosen.iter().any(|(c, _)| c == id)
+        };
+
+        if chosen.iter().all(|(_, s)| *s != FocusSlot::Uniform) && uniform_slots > 0 {
+            let remaining: Vec<ContractInstanceId> = pool
+                .iter()
+                .filter(|id| !taken(&chosen, id))
+                .copied()
+                .collect();
+            if let Some(id) = self.select(&remaining).first() {
+                chosen.push((*id, FocusSlot::Uniform));
+            }
+        }
+        let have = chosen
+            .iter()
+            .filter(|(_, s)| *s == FocusSlot::Weighted)
+            .count();
+        let need = weighted_slots.saturating_sub(have);
+        if need > 0 {
+            let remaining: Vec<ContractInstanceId> = pool
+                .iter()
+                .filter(|id| !taken(&chosen, id))
+                .copied()
+                .collect();
+            let drawn = self.select_weighted(&remaining, activity);
+            chosen.extend(
+                drawn
+                    .into_iter()
+                    .take(need)
+                    .map(|id| (id, FocusSlot::Weighted)),
+            );
+        }
+        chosen.sort_by_key(|(_, slot)| *slot);
+        chosen
+    }
+
     fn score(&self, id: &ContractInstanceId) -> [u8; 32] {
         let mut hasher = blake3::Hasher::new();
         hasher.update(b"freenet-conformance-focus-v1");
+        hasher.update(&self.salt);
+        hasher.update(&self.epoch.to_le_bytes());
+        hasher.update(id.as_bytes());
+        *hasher.finalize().as_bytes()
+    }
+
+    /// The score the weighted draw uses: same inputs, separate domain, so the
+    /// weighted slot is independent of the uniform one rather than being the uniform
+    /// draw's runner-up.
+    fn weighted_score(&self, id: &ContractInstanceId) -> [u8; 32] {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"freenet-conformance-focus-weighted-v1");
         hasher.update(&self.salt);
         hasher.update(&self.epoch.to_le_bytes());
         hasher.update(id.as_bytes());
@@ -179,12 +298,10 @@ impl FocusSelector {
 
 /// A candidate's sort key: `-ln(u) / weight`, lowest first.
 ///
-/// `u` is uniform in `(0, 1]`, taken from the top 53 bits of the salted score and
-/// arranged so that a LOWER score gives a LARGER `u` and so a smaller key. With equal
-/// weights the order is therefore the score order the uniform draw always used, and a
-/// peer with no recorded activity watches exactly what it watched before #5913. `u` is
-/// never zero, so the logarithm is finite, and the weight is at least
-/// [`COLD_FOCUS_WEIGHT`], so the key is never NaN.
+/// `u` is uniform in `(0, 1]`, taken from the top 53 bits of the salted score (a
+/// lower score gives a larger `u` and so a smaller key, so with equal weights the
+/// order is the score order). `u` is never zero, so the logarithm is finite, and the
+/// weight is at least [`COLD_FOCUS_WEIGHT`], so the key is never NaN.
 fn draw_key(score: &[u8; 32], weight: f64) -> f64 {
     const SCALE: u64 = 1 << 53;
     let mut top = [0u8; 8];
@@ -462,35 +579,6 @@ mod tests {
         assert_eq!(first, selector.select_weighted(&shuffled, activity));
     }
 
-    /// With no activity anywhere, weighting reduces to the pre-#5913 draw: the
-    /// lowest salted scores.
-    ///
-    /// A restarted peer has no activity yet and must behave exactly as before rather
-    /// than in some third way. Compared against the old rule written out here, not
-    /// against `select`, which now delegates to `select_weighted` and would make this
-    /// a tautology.
-    #[test]
-    fn no_activity_selects_exactly_what_uniform_selection_did() {
-        for salt in 0..64u8 {
-            let mut selector = FocusSelector::new([salt; 32], 2);
-            for _ in 0..4 {
-                let pool = candidates(40);
-                let mut by_score: Vec<_> = pool.iter().map(|c| (selector.score(c), *c)).collect();
-                by_score.sort_by(|(sa, a), (sb, b)| {
-                    sa.cmp(sb).then_with(|| a.as_bytes().cmp(b.as_bytes()))
-                });
-                let lowest: Vec<_> = by_score.iter().take(2).map(|(_, c)| *c).collect();
-                assert_eq!(
-                    selector.select_weighted(&pool, |_| 0),
-                    lowest,
-                    "salt {salt}, epoch {}: zero activity changed the selection",
-                    selector.epoch()
-                );
-                selector.rotate();
-            }
-        }
-    }
-
     /// Weighting stays keyed on the salt: peers still spread out across the busy set
     /// rather than all converging on the same "busiest" pair.
     #[test]
@@ -519,5 +607,116 @@ mod tests {
         let picked = selector.select_weighted(&pool, |c| if *c == outsider { u32::MAX } else { 0 });
         assert!(!picked.contains(&outsider));
         assert_eq!(picked.len(), 2);
+    }
+
+    // ------------------------------------------------- uniform + weighted split (D1)
+
+    /// The lowest uniform score among `pool`, i.e. the pre-#5913 first pick.
+    fn lowest_score(selector: &FocusSelector, pool: &[ContractInstanceId]) -> ContractInstanceId {
+        *pool
+            .iter()
+            .min_by(|a, b| {
+                selector
+                    .score(a)
+                    .cmp(&selector.score(b))
+                    .then_with(|| a.as_bytes().cmp(b.as_bytes()))
+            })
+            .expect("non-empty pool")
+    }
+
+    /// One slot is a pure uniform salted draw: no amount of activity anywhere moves
+    /// it (#5914 review D1). That is what guarantees exploration of quiet contracts at
+    /// an absolute rate of about one in N per period, which a pumped decoy cannot
+    /// dilute, and it is exactly the pre-#5913 first pick.
+    #[test]
+    fn the_uniform_slot_ignores_activity() {
+        let pool = candidates(40);
+        for salt in 0..64u8 {
+            let mut selector = FocusSelector::new([salt; 32], 2);
+            for _ in 0..4 {
+                let quiet = selector.select_split(&pool, |_| 0, &[]);
+                let pumped = selector.select_split(
+                    &pool,
+                    |c| {
+                        if c.as_bytes()[0] % 2 == 0 {
+                            u32::MAX
+                        } else {
+                            0
+                        }
+                    },
+                    &[],
+                );
+                let uniform_of = |picks: &[(ContractInstanceId, FocusSlot)]| {
+                    picks
+                        .iter()
+                        .filter(|(_, slot)| *slot == FocusSlot::Uniform)
+                        .map(|(id, _)| *id)
+                        .collect::<Vec<_>>()
+                };
+                let expected = vec![lowest_score(&selector, &pool)];
+                assert_eq!(uniform_of(&quiet), expected, "salt {salt}");
+                assert_eq!(
+                    uniform_of(&pumped),
+                    expected,
+                    "activity moved the uniform slot"
+                );
+                assert_eq!(quiet.len(), 2);
+                assert_eq!(
+                    pumped
+                        .iter()
+                        .filter(|(_, s)| *s == FocusSlot::Weighted)
+                        .count(),
+                    1
+                );
+                selector.rotate();
+            }
+        }
+    }
+
+    /// A contract the caller keeps (it is accruing samples) keeps its slot, however
+    /// much activity appears elsewhere.
+    #[test]
+    fn a_kept_contract_keeps_its_slot() {
+        let pool = candidates(40);
+        let busy = |c: &ContractInstanceId| if c.as_bytes()[0] >= 20 { 1_000 } else { 0 };
+        for salt in 0..32u8 {
+            let selector = FocusSelector::new([salt; 32], 2);
+            let uniform = lowest_score(&selector, &pool);
+            let kept = if uniform == id(3) { id(4) } else { id(3) };
+            let picks = selector.select_split(&pool, busy, &[(kept, FocusSlot::Weighted)]);
+            assert!(
+                picks.contains(&(kept, FocusSlot::Weighted)),
+                "salt {salt}: a contract accruing samples was displaced: {picks:?}"
+            );
+            assert_eq!(picks.len(), 2);
+        }
+    }
+
+    /// A kept contract the peer no longer hosts is not kept.
+    #[test]
+    fn a_kept_contract_outside_the_candidates_is_dropped() {
+        let pool = candidates(10);
+        let gone = id(200);
+        let picks = FocusSelector::new([5; 32], 2).select_split(
+            &pool,
+            |_| 0,
+            &[(gone, FocusSlot::Weighted)],
+        );
+        assert!(picks.iter().all(|(c, _)| *c != gone));
+        assert_eq!(picks.len(), 2);
+    }
+
+    /// Deterministic for (salt, epoch, candidates, activity, kept), whatever the
+    /// candidate order or duplication.
+    #[test]
+    fn the_split_is_deterministic() {
+        let selector = FocusSelector::new([9; 32], 2);
+        let pool = candidates(60);
+        let activity = |c: &ContractInstanceId| u32::from(c.as_bytes()[0] % 7);
+        let first = selector.select_split(&pool, activity, &[]);
+        let mut shuffled = pool.clone();
+        shuffled.reverse();
+        shuffled.extend(pool.iter().copied());
+        assert_eq!(first, selector.select_split(&shuffled, activity, &[]));
     }
 }
