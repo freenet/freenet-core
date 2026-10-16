@@ -4363,6 +4363,7 @@ async fn a_node_without_the_contract(
     contract_name: &str,
     state: WrappedState,
     candidates: &[&str],
+    salt: &[u8],
 ) -> anyhow::Result<(WebApi, ContractContainer)> {
     // RETRY WITH A FRESH KEY rather than failing on the first unlucky placement
     // (#5542 F6). The precondition this helper establishes is not under the
@@ -4376,18 +4377,24 @@ async fn a_node_without_the_contract(
     // candidate on all four independent keys is not, so a failure after that is
     // signal rather than luck.
     //
-    // ATTEMPT 0 USES EMPTY PARAMETERS, byte-identical to what this test did
+    // `salt` is prefixed to every attempt's parameters so a test can own its
+    // contract instance. A test that SUBSCRIBES a delegate must pass a non-empty
+    // salt: delegate subscriptions are a process-global registry keyed by
+    // contract instance id, and every node in the test binary shares it, so a
+    // subscription on the common empty-params instance would push notifications
+    // onto other tests' delegate sockets. Tests that never subscribe pass `&[]`.
+    //
+    // WITH AN EMPTY SALT, ATTEMPT 0 USES EMPTY PARAMETERS, byte-identical to what this test did
     // before, so the path CI has already exercised is unchanged and the retry
     // only runs in the case that previously failed outright.
     const MAX_PLACEMENT_ATTEMPTS: u8 = 4;
     let mut placement = Vec::new();
     for attempt in 0..MAX_PLACEMENT_ATTEMPTS {
-        let params = if attempt == 0 {
-            Parameters::from(vec![])
-        } else {
-            Parameters::from(vec![attempt])
-        };
-        let contract = load_contract(contract_name, params)?;
+        let mut raw = salt.to_vec();
+        if attempt != 0 {
+            raw.push(attempt);
+        }
+        let contract = load_contract(contract_name, Parameters::from(raw))?;
         let contract_key = contract.key();
 
         let publisher = ctx.node("node-a")?;
@@ -4462,9 +4469,14 @@ async fn test_delegate_get_reaches_the_network_for_an_unseen_contract(
     ));
     // The helper chooses the instance, because it may need several to find a
     // node that does not hold one (#5542 F6).
-    let (mut client, contract) =
-        a_node_without_the_contract(ctx, TEST_CONTRACT, state, &["node-b", "node-c", "node-d"])
-            .await?;
+    let (mut client, contract) = a_node_without_the_contract(
+        ctx,
+        TEST_CONTRACT,
+        state,
+        &["node-b", "node-c", "node-d"],
+        &[],
+    )
+    .await?;
     let contract_id = *contract.key().id();
 
     register_delegate(&mut client, &delegate, &delegate_key).await?;
@@ -4543,9 +4555,14 @@ async fn test_delegate_subscribe_reaches_the_network_for_an_unseen_contract(
     ));
     // The helper chooses the instance, because it may need several to find a
     // node that does not hold one (#5542 F6).
-    let (mut client, contract) =
-        a_node_without_the_contract(ctx, TEST_CONTRACT, state, &["node-b", "node-c", "node-d"])
-            .await?;
+    let (mut client, contract) = a_node_without_the_contract(
+        ctx,
+        TEST_CONTRACT,
+        state,
+        &["node-b", "node-c", "node-d"],
+        b"delegate-subscribe-isolated",
+    )
+    .await?;
     let contract_id = *contract.key().id();
 
     register_delegate(&mut client, &delegate, &delegate_key).await?;
