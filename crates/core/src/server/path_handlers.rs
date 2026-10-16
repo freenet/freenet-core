@@ -4752,10 +4752,15 @@ mod tests {
             held.push(lock);
             held_ids.push(id);
         };
+        assert!(
+            CONTRACT_REFRESH_LOCKS.len() <= MAX_REFRESH_LOCKS,
+            "the refresh-lock table exceeded its cap, got {}",
+            CONTRACT_REFRESH_LOCKS.len()
+        );
         // Slack for real siblings holding entries; catches a cap lowered well
         // below MAX_REFRESH_LOCKS, which would otherwise refuse early.
         assert!(
-            held.len() + siblings.len() + 1 >= MAX_REFRESH_LOCKS - 256,
+            held.len() + siblings.len() + 1 >= MAX_REFRESH_LOCKS - 64,
             "the table refused admission after only {} held entries; is the cap \
              below MAX_REFRESH_LOCKS?",
             held.len()
@@ -4793,6 +4798,7 @@ mod tests {
             CONTRACT_REFRESH_LOCKS.remove(id);
         }
         CONTRACT_REFRESH_LOCKS.remove(&held_id);
+        CONTRACT_REFRESH_LOCKS.remove(&refused_id);
     }
 
     /// #3977-interaction regression for the cold/warm split: a WARM-but-stale
