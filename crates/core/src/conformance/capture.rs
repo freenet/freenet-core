@@ -726,7 +726,10 @@ async fn run_writer(
                 // observations (#5913).
                 let meaningful = counts_as_activity(&observation, activity_max_state_bytes);
                 shadow.note_merge(observation.contract, meaningful);
-                if let Some(evicted) = record(&mut samplers, &scope, observation) {
+                let contract = observation.contract;
+                let (evicted, outcome) = record_with_outcome(&mut samplers, &scope, observation);
+                shadow.note_admission(&contract, outcome);
+                if let Some(evicted) = evicted {
                     // Dropping the entry alone orphans the file: eviction fires on
                     // every rotation once the map is full, so the directory would
                     // grow without bound and `reload` could resurrect a long-evicted
@@ -820,9 +823,11 @@ async fn run_writer(
                         candidate_source = focus.source.as_str(),
                         active_candidates = focus.active_candidates,
                         focused = focus.selected.len(),
-                        // Focus contracts that have had no merge at all so far this
-                        // period: never examined, as opposed to examined and clean.
-                        unobserved_this_period = shadow.unobserved_this_period(),
+                        // Focus contracts the sampler has admitted nothing new for so
+                        // far this period, and how far into the period this tick is
+                        // (a count early in a period is not yet meaningful).
+                        focus_without_new_samples = shadow.focus_without_new_samples(),
+                        period_tick = shadow.period_tick(),
                         activity_tracked = shadow.activity_tracked(),
                         activity_evicted = shadow.activity_evicted(),
                         scope = scope.as_str(),
@@ -928,9 +933,11 @@ async fn run_writer(
                     active_candidates = last_focus.active_candidates,
                     scope = scope.as_str(),
                     focused = report.focused,
-                    // Never examined, kept beside examined-and-clean: focus contracts
-                    // with no merge observed so far this period.
-                    unobserved_this_period = shadow.unobserved_this_period(),
+                    // Focus contracts the sampler has admitted nothing new for so far
+                    // this period. Not "never examined": retained samples from before
+                    // can still be judged. The period-ended line has the full picture.
+                    focus_without_new_samples = shadow.focus_without_new_samples(),
+                    period_tick = shadow.period_tick(),
                     activity_tracked = shadow.activity_tracked(),
                     // Non-zero means the activity map hit its cap and busy contracts
                     // may be reading as cold. Visible in release builds on purpose.
@@ -1322,6 +1329,33 @@ pub(crate) fn record(
     scope: &SamplingScope,
     observation: Observation,
 ) -> Option<ContractInstanceId> {
+    record_with_outcome(samplers, scope, observation).0
+}
+
+/// What [`record_with_outcome`] did with an observation, for focus-period accounting.
+///
+/// Produced where the admission decision is made, not re-derived by the caller from
+/// sampler sizes (see the "metric re-derived at the call site" pattern in
+/// `.claude/rules/bug-prevention-patterns.md`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RecordOutcome {
+    /// Not in sampling scope, so not collected.
+    OutOfScope,
+    /// The sampler retained something new from this merge.
+    Admitted,
+    /// In scope, but the sampler already held it or chose not to keep it.
+    NothingNew,
+    /// In scope, and refused: too large, over budget, or no tracking slot.
+    Refused,
+}
+
+/// [`record`], also reporting what the sampler did with the observation.
+#[must_use = "the evicted contract's bundle must be deleted, or it is orphaned on disk"]
+pub(crate) fn record_with_outcome(
+    samplers: &mut HashMap<ContractInstanceId, TrackedContract>,
+    scope: &SamplingScope,
+    observation: Observation,
+) -> (Option<ContractInstanceId>, RecordOutcome) {
     let known = samplers.contains_key(&observation.contract);
     if !scope.admits(&observation.contract) {
         // Not in focus, so not COLLECTED - whether or not it is already tracked.
@@ -1338,7 +1372,7 @@ pub(crate) fn record(
         //
         // Retention is preserved: an out-of-focus entry stays in the map, and stays on
         // disk, until eviction needs its slot. It simply stops growing.
-        return None;
+        return (None, RecordOutcome::OutOfScope);
     }
     let mut evicted = None;
     if !known && samplers.len() >= MAX_TRACKED_CONTRACTS {
@@ -1393,7 +1427,7 @@ pub(crate) fn record(
                          contract: every tracked contract is in focus"
                     );
                 }
-                return None;
+                return (None, RecordOutcome::Refused);
             }
         }
     }
@@ -1431,8 +1465,12 @@ pub(crate) fn record(
     if matches!(admission, Admission::TooLarge) {
         tracked.refused_too_large += 1;
     }
-
-    evicted
+    let outcome = match admission {
+        Admission::Stored => RecordOutcome::Admitted,
+        Admission::Duplicate | Admission::NotSelected => RecordOutcome::NothingNew,
+        Admission::TooLarge | Admission::NoBudget => RecordOutcome::Refused,
+    };
+    (evicted, outcome)
 }
 
 /// Related state a contract offered and capture would not keep.
@@ -2340,7 +2378,7 @@ mod probe_wiring_pins {
         );
         let filtered = statement_at(
             &body,
-            "if let Some(evicted) = record(&mut samplers, &scope, observation)",
+            "let (evicted, outcome) = record_with_outcome(&mut samplers, &scope, observation);",
         )
         .expect("run_writer no longer records observations this way; re-anchor");
         assert!(
@@ -2377,11 +2415,16 @@ mod probe_wiring_pins {
             "expected two shadow tick lines; re-check this pin"
         );
         assert_eq!(
-            body.matches("unobserved_this_period = shadow.unobserved_this_period()")
+            body.matches("focus_without_new_samples = shadow.focus_without_new_samples()")
                 .count(),
             lines,
-            "a shadow tick line does not report focus contracts with no merges, so a \
-             never-examined period reads like a clean one"
+            "a shadow tick line does not report focus contracts with nothing newly \
+             sampled, so an unexamined period reads like a clean one"
+        );
+        assert_eq!(
+            body.matches("period_tick = shadow.period_tick()").count(),
+            lines,
+            "a shadow tick line does not say how far into the period it is"
         );
         assert_eq!(
             body.matches("active_candidates =").count(),
@@ -2846,6 +2889,29 @@ mod tests {
             !counts_as_activity(&big_delta, 3),
             "delta too large to sample"
         );
+    }
+
+    /// `record_with_outcome` reports what the sampler actually did, which is what the
+    /// focus period counts (#5914 review D5): a merge that reached the writer is not
+    /// the same as a sample retained.
+    #[test]
+    fn record_reports_what_admission_did() {
+        let mut samplers = HashMap::new();
+        let scope = focused_on(&[1]);
+        let (_, outside) = record_with_outcome(&mut samplers, &scope, observation_for(instance(2)));
+        assert_eq!(outside, RecordOutcome::OutOfScope);
+        let (_, first) = record_with_outcome(&mut samplers, &scope, observation_for(instance(1)));
+        assert_eq!(first, RecordOutcome::Admitted);
+        let (_, again) = record_with_outcome(&mut samplers, &scope, observation_for(instance(1)));
+        assert_eq!(
+            again,
+            RecordOutcome::NothingNew,
+            "a duplicate transition is not new"
+        );
+        let mut huge = observation_for(instance(1));
+        huge.result_state = vec![7; SamplerConfig::default().max_state_bytes + 1];
+        let (_, refused) = record_with_outcome(&mut samplers, &scope, huge);
+        assert_eq!(refused, RecordOutcome::Refused);
     }
 
     fn focused_on(ids: &[u8]) -> SamplingScope {

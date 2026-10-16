@@ -42,6 +42,7 @@ use tokio::time::Instant;
 
 use super::activity::MergeActivity;
 use super::bundle::ReplayBundle;
+use super::capture::RecordOutcome;
 use super::focus::FocusSelector;
 use super::generator::{GeneratorConfig, generate_cases};
 use super::policy::{ConformanceAction, EnforcementMode, decide};
@@ -327,47 +328,61 @@ pub(crate) struct FocusTick {
 
 /// What one focus period established, reported when the period ends.
 ///
-/// The point is the `unobserved` count. A focus contract that received no merge for
-/// its whole time in focus was never examined, and a period of those reads as a clean
-/// period in any log that only counts findings. #5913's twelve-hour run was exactly
-/// that: 49 ticks, every focused contract `tracked=0`.
+/// Built to answer the #5913 acceptance question (did this period judge anything?)
+/// and, when it did not, to say why: no candidates, no activity, merges that never
+/// arrived, or merges the sampler refused. Each count is produced where its decision
+/// is made (selection, admission, probe), not re-derived from sizes afterwards.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct FocusPeriodSummary {
     /// The epoch that ended.
     pub epoch: u64,
-    /// Focus stints in the period: each contract selected, counted once per
-    /// continuous stretch in focus. Usually the focus size, more when the hosted set
-    /// changed mid-period and moved focus.
-    pub focused: usize,
-    /// Stints that ended with zero merges observed for the contract while it was in
-    /// focus. These contracts were never examined, not examined and found clean.
-    pub unobserved: usize,
+    /// Whether this process saw the whole period. False for the first period after a
+    /// start or restart: it began before this process did (the epoch is persisted,
+    /// the tick count is not), and its first ticks may have drawn from the sampler
+    /// fallback while the hosted source warmed up. Exclude these when measuring.
+    pub complete: bool,
+    /// Size of the candidate pool at the period's last selection.
+    pub candidates: usize,
+    /// Candidates with recent activity at the period's last selection.
+    pub active_candidates: usize,
+    /// Focus stints: each contract selected, counted once per continuous stretch in
+    /// focus. Usually the focus size; more when focus moved mid-period.
+    pub stints: usize,
+    /// Merges that reached the capture task for a contract while it was in focus.
+    pub merges_seen: u64,
+    /// Of those, merges from which the sampler retained something new.
+    pub samples_admitted: u64,
+    /// Of those, merges the sampler refused (too large, over budget, no slot).
+    pub samples_refused: u64,
+    /// Stints in which the sampler retained nothing new. Not the same as "never
+    /// examined": samples retained from an earlier stint can still be judged.
+    pub stints_without_new_samples: usize,
     /// Stints in which at least one probe reached a verdict on the contract.
     pub judged: usize,
 }
 
-/// Per-period bookkeeping for the focus contracts, so "never examined" stays visible.
+/// Per-period bookkeeping for the focus contracts.
 ///
 /// Bounded by the focus size: only the CURRENT focus contracts are held, and a
-/// contract leaving focus is folded into three counters at once.
+/// contract leaving focus is folded into the totals at once.
 #[derive(Debug, Default)]
 struct FocusPeriod {
     current: HashMap<ContractInstanceId, PeriodMember>,
-    departed: usize,
-    departed_unobserved: usize,
-    departed_judged: usize,
+    totals: FocusPeriodSummary,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
 struct PeriodMember {
-    observations: u64,
+    seen: u64,
+    admitted: u64,
+    refused: u64,
     judged: bool,
 }
 
 impl FocusPeriod {
     /// Make `selected` the current focus set, folding any contract leaving it into
-    /// the departed counts.
-    fn enter(&mut self, selected: &[ContractInstanceId]) {
+    /// the totals, and remember the pool it was drawn from.
+    fn enter(&mut self, selected: &[ContractInstanceId], candidates: usize, active: usize) {
         let leaving: Vec<ContractInstanceId> = self
             .current
             .keys()
@@ -382,21 +397,38 @@ impl FocusPeriod {
         for id in selected {
             self.current.entry(*id).or_default();
         }
+        self.totals.candidates = candidates;
+        self.totals.active_candidates = active;
     }
 
     fn fold(&mut self, member: PeriodMember) {
-        self.departed += 1;
-        if member.observations == 0 {
-            self.departed_unobserved += 1;
+        let totals = &mut self.totals;
+        totals.stints += 1;
+        totals.merges_seen = totals.merges_seen.saturating_add(member.seen);
+        totals.samples_admitted = totals.samples_admitted.saturating_add(member.admitted);
+        totals.samples_refused = totals.samples_refused.saturating_add(member.refused);
+        if member.admitted == 0 {
+            totals.stints_without_new_samples += 1;
         }
         if member.judged {
-            self.departed_judged += 1;
+            totals.judged += 1;
         }
     }
 
-    fn observe(&mut self, contract: &ContractInstanceId) {
+    fn seen(&mut self, contract: &ContractInstanceId) {
         if let Some(member) = self.current.get_mut(contract) {
-            member.observations = member.observations.saturating_add(1);
+            member.seen = member.seen.saturating_add(1);
+        }
+    }
+
+    fn admission(&mut self, contract: &ContractInstanceId, outcome: RecordOutcome) {
+        let Some(member) = self.current.get_mut(contract) else {
+            return;
+        };
+        match outcome {
+            RecordOutcome::Admitted => member.admitted = member.admitted.saturating_add(1),
+            RecordOutcome::Refused => member.refused = member.refused.saturating_add(1),
+            RecordOutcome::NothingNew | RecordOutcome::OutOfScope => {}
         }
     }
 
@@ -406,24 +438,23 @@ impl FocusPeriod {
         }
     }
 
-    fn unobserved_now(&self) -> usize {
+    fn without_new_samples_now(&self) -> usize {
         self.current
             .values()
-            .filter(|member| member.observations == 0)
+            .filter(|member| member.admitted == 0)
             .count()
     }
 
     /// Close the period and start an empty one.
-    fn finish(&mut self, epoch: u64) -> FocusPeriodSummary {
+    fn finish(&mut self, epoch: u64, complete: bool) -> FocusPeriodSummary {
         let current: Vec<PeriodMember> = self.current.drain().map(|(_, m)| m).collect();
         for member in current {
             self.fold(member);
         }
         let summary = FocusPeriodSummary {
             epoch,
-            focused: self.departed,
-            unobserved: self.departed_unobserved,
-            judged: self.departed_judged,
+            complete,
+            ..self.totals
         };
         *self = FocusPeriod::default();
         summary
@@ -453,6 +484,9 @@ pub struct ShadowRunner {
     weights: HashMap<ContractInstanceId, u32>,
     /// What the current period's focus contracts have and have not seen.
     period: FocusPeriod,
+    /// Whether the current period began in this process. False until the first
+    /// rotation after start, because the persisted epoch outlives the tick count.
+    period_complete: bool,
 }
 
 impl ShadowRunner {
@@ -475,6 +509,7 @@ impl ShadowRunner {
             activity: MergeActivity::new(super::activity::MAX_TRACKED_ACTIVITY, salt),
             weights: HashMap::new(),
             period: FocusPeriod::default(),
+            period_complete: false,
         }
     }
 
@@ -501,11 +536,20 @@ impl ShadowRunner {
     pub(crate) fn advance(&mut self) -> Option<FocusPeriodSummary> {
         self.ticks = self.ticks.wrapping_add(1);
         if self.ticks % ROTATE_EVERY_TICKS == 0 {
-            let ended = self.period.finish(self.selector.epoch());
+            let ended = self
+                .period
+                .finish(self.selector.epoch(), self.period_complete);
+            self.period_complete = true;
             tracing::info!(
                 epoch = ended.epoch,
-                focused = ended.focused,
-                unobserved = ended.unobserved,
+                complete = ended.complete,
+                candidates = ended.candidates,
+                active_candidates = ended.active_candidates,
+                stints = ended.stints,
+                merges_seen = ended.merges_seen,
+                samples_admitted = ended.samples_admitted,
+                samples_refused = ended.samples_refused,
+                stints_without_new_samples = ended.stints_without_new_samples,
                 judged = ended.judged,
                 "conformance focus period ended"
             );
@@ -533,7 +577,12 @@ impl ShadowRunner {
         if counts_as_activity {
             self.activity.record(contract);
         }
-        self.period.observe(&contract);
+        self.period.seen(&contract);
+    }
+
+    /// Record what the sampler did with a merge, for the focus period's counts.
+    pub(crate) fn note_admission(&mut self, contract: &ContractInstanceId, outcome: RecordOutcome) {
+        self.period.admission(contract, outcome);
     }
 
     /// Record which focus contracts a completed probe reached a verdict on.
@@ -543,9 +592,15 @@ impl ShadowRunner {
         }
     }
 
-    /// Current focus contracts with no merge observed so far this period.
-    pub(crate) fn unobserved_this_period(&self) -> usize {
-        self.period.unobserved_now()
+    /// Current focus contracts the sampler has admitted nothing new for this period.
+    pub(crate) fn focus_without_new_samples(&self) -> usize {
+        self.period.without_new_samples_now()
+    }
+
+    /// Probe ticks into the current period, `0..ROTATE_EVERY_TICKS`. Zero on the
+    /// tick that rotated.
+    pub(crate) fn period_tick(&self) -> u32 {
+        self.ticks % ROTATE_EVERY_TICKS
     }
 
     /// Contracts whose merge activity is being tracked.
@@ -603,7 +658,8 @@ impl ShadowRunner {
             .iter()
             .filter(|id| weights.contains_key(id))
             .count();
-        self.period.enter(&selected);
+        self.period
+            .enter(&selected, candidates.len(), active_candidates);
         FocusTick {
             selected,
             candidates: candidates.len(),
@@ -1669,56 +1725,89 @@ mod tests {
         assert_eq!(runner.activity_tracked(), 0);
     }
 
-    /// The tick field: focus contracts that have seen no merge are counted as
-    /// unobserved, and the period summary carries the whole-period count.
-    ///
-    /// "Never examined" next to "examined and clean": #5913's peer ran 49 ticks in
-    /// which every focus contract was `tracked=0`, and nothing in the tick said so in
-    /// those words.
-    #[test]
-    fn focus_contracts_with_no_merges_are_reported_unobserved() {
-        let dir = tempfile::TempDir::new().expect("tempdir");
-        let mut runner = runner_with_salt(dir.path(), [7; 32]);
-        let hosted: Vec<_> = (0..20u8).map(instance).collect();
-        let focus = runner.focus(Some(hosted.clone()), &[]);
-        assert_eq!(focus.selected.len(), 2);
-        assert_eq!(runner.unobserved_this_period(), 2, "nothing observed yet");
+    /// Feed a focus member `seen` merges with the given admission outcomes, the way
+    /// `capture::run_writer` does: `note_merge` first, then `note_admission`.
+    fn feed(runner: &mut ShadowRunner, contract: ContractInstanceId, outcomes: &[RecordOutcome]) {
+        for outcome in outcomes {
+            runner.note_merge(contract, true);
+            runner.note_admission(&contract, *outcome);
+        }
+    }
 
-        // One focus contract gets merges; the other never does.
-        let busy = focus.selected[0];
-        runner.note_merge(busy, true);
-        runner.note_merge(busy, true);
-        // Merges for a contract NOT in focus do not count toward the focus set.
-        let outsider = hosted
-            .iter()
-            .copied()
-            .find(|c| !focus.selected.contains(c))
-            .expect("an unfocused contract");
-        runner.note_merge(outsider, true);
-        assert_eq!(runner.unobserved_this_period(), 1);
-
-        runner.note_judged(&[JudgedContract {
-            contract: busy,
-            verdicts: 3,
-            inconclusive: 0,
-        }]);
-
+    fn end_period(runner: &mut ShadowRunner) -> FocusPeriodSummary {
         let mut summary = None;
         for _ in 0..ROTATE_EVERY_TICKS {
             summary = summary.or(runner.advance());
         }
-        let summary = summary.expect("the period never ended");
+        summary.expect("the period never ended")
+    }
+
+    /// Every field of the period summary comes from its own source.
+    ///
+    /// The values are chosen pairwise distinct so a field assigned from the wrong
+    /// counter (the review's surviving mutant was `unobserved = judged`) cannot pass.
+    #[test]
+    fn the_period_summary_counts_each_field_from_its_own_source() {
+        use RecordOutcome::{Admitted, NothingNew, Refused};
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut runner = runner_with_salt(dir.path(), [7; 32]);
+        let hosted: Vec<_> = (0..20u8).map(instance).collect();
+        let focus = runner.focus(Some(hosted.clone()), &[]);
+        let (a, b) = (focus.selected[0], focus.selected[1]);
+
+        // a: 6 merges seen, 3 admitted, 2 refused, 1 nothing new; judged.
+        feed(
+            &mut runner,
+            a,
+            &[Admitted, Admitted, Admitted, Refused, Refused, NothingNew],
+        );
+        // b: 4 merges seen, nothing admitted; not judged.
+        feed(&mut runner, b, &[NothingNew, NothingNew, Refused, Refused]);
+        runner.note_judged(&[JudgedContract {
+            contract: a,
+            verdicts: 3,
+            inconclusive: 0,
+        }]);
+        assert_eq!(runner.focus_without_new_samples(), 1, "b has nothing new");
+
+        let summary = end_period(&mut runner);
         assert_eq!(
             summary,
             FocusPeriodSummary {
                 epoch: 0,
-                focused: 2,
-                unobserved: 1,
+                complete: false,
+                candidates: 20,
+                active_candidates: 0,
+                stints: 2,
+                merges_seen: 10,
+                samples_admitted: 3,
+                samples_refused: 4,
+                stints_without_new_samples: 1,
                 judged: 1,
-            },
-            "the period summary must keep the never-observed focus contract visible \
-             beside the judged one"
+            }
         );
+    }
+
+    /// The first period after a start began before this process did, so it is
+    /// marked incomplete; the next one is whole.
+    #[test]
+    fn a_period_begun_before_a_restart_is_marked_incomplete() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut runner = runner_with_salt(dir.path(), [9; 32]);
+        assert!(
+            !end_period(&mut runner).complete,
+            "first period after start"
+        );
+        assert!(
+            end_period(&mut runner).complete,
+            "a period begun in this process"
+        );
+
+        // A restart: a new runner over the same directory resumes the epoch but not
+        // the tick count, so its first period is partial again.
+        let mut restarted = ShadowRunner::new(dir.path(), EnforcementMode::Shadow);
+        assert_eq!(restarted.epoch(), 2);
+        assert!(!end_period(&mut restarted).complete);
     }
 
     /// A contract that leaves focus mid-period (the hosted set changed) is still
@@ -1729,8 +1818,9 @@ mod tests {
         let mut runner = runner_with_salt(dir.path(), [11; 32]);
         let hosted: Vec<_> = (0..20u8).map(instance).collect();
         let first = runner.focus(Some(hosted.clone()), &[]).selected;
+        feed(&mut runner, first[0], &[RecordOutcome::NothingNew]);
 
-        // The peer stops hosting both focus contracts before either saw a merge.
+        // The peer stops hosting both focus contracts.
         let shrunk: Vec<_> = hosted
             .iter()
             .copied()
@@ -1738,18 +1828,74 @@ mod tests {
             .collect();
         let second = runner.focus(Some(shrunk.clone()), &[]).selected;
         assert!(second.iter().all(|c| !first.contains(c)));
-        runner.note_merge(second[0], true);
+        feed(&mut runner, second[0], &[RecordOutcome::Admitted]);
 
-        let mut summary = None;
-        for _ in 0..ROTATE_EVERY_TICKS {
-            summary = summary.or(runner.advance());
-        }
-        let summary = summary.expect("the period never ended");
-        assert_eq!(summary.focused, 4, "two departed stints plus two current");
+        let summary = end_period(&mut runner);
+        assert_eq!(summary.stints, 4, "two departed stints plus two current");
         assert_eq!(
-            summary.unobserved, 3,
-            "both departed contracts and one current one saw no merge"
+            summary.merges_seen, 2,
+            "the departed stint's merge was kept"
         );
+        assert_eq!(
+            summary.stints_without_new_samples, 3,
+            "both departed contracts and one current one admitted nothing"
+        );
+    }
+
+    /// Pin: the "conformance focus period ended" line reports each summary field
+    /// under its own name. A behavioural test of the summary cannot see the log, and
+    /// a line that printed `judged` under `stints_without_new_samples` would mislead
+    /// the acceptance measurement while every test stayed green.
+    #[test]
+    fn the_period_line_reports_every_field_under_its_own_name() {
+        let src = include_str!("shadow.rs");
+        let tests_at = src.find("\nmod tests {").expect("test module");
+        let start = src
+            .find("    pub(crate) fn advance(&mut self)")
+            .expect("advance not found");
+        assert!(start < tests_at, "matched inside the test module");
+        let after = &src[start..];
+        let open = after.find('{').expect("advance has no body");
+        let mut depth = 0usize;
+        let mut end = None;
+        for (offset, ch) in after[open..].char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = Some(open + offset + 1);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let body: String = after[..end.expect("unbalanced")]
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(body.contains("\"conformance focus period ended\""));
+        for field in [
+            "epoch",
+            "complete",
+            "candidates",
+            "active_candidates",
+            "stints",
+            "merges_seen",
+            "samples_admitted",
+            "samples_refused",
+            "stints_without_new_samples",
+            "judged",
+        ] {
+            let pair = format!("{field} = ended.{field},");
+            assert_eq!(
+                body.matches(&pair).count(),
+                1,
+                "the period-ended line does not report `{field}` from `ended.{field}`"
+            );
+        }
     }
 
     /// Build a sampler map by pushing observations through the real admission path,
