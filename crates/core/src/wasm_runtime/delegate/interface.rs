@@ -57,6 +57,14 @@ impl DelegateRuntimeInterface for Runtime {
     ) -> RuntimeResult<Vec<OutboundDelegateMsg>> {
         let mut results = Vec::with_capacity(inbound.len());
         if inbound.is_empty() {
+            // Nothing runs, but a request naming a registered delegate with
+            // params that do not derive its key is refused here as well, so it
+            // does not read as a success. An unregistered key keeps its empty
+            // answer: an app may send an empty request only to open its
+            // notification path, and that is not changed here.
+            if let Some(code_hash) = self.delegate_store.code_hash_from_key(delegate_key) {
+                Runtime::check_delegate_params(delegate_key, &code_hash, params)?;
+            }
             return Ok(results);
         }
         let mut running = self.prepare_delegate_call(params, delegate_key, 4096)?;

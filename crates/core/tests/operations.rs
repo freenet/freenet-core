@@ -4246,6 +4246,7 @@ async fn node_has_contract_locally(client: &mut WebApi, key: ContractKey) -> any
 async fn run_delegate_command(
     client: &mut WebApi,
     delegate_key: &DelegateKey,
+    params: &Parameters<'static>,
     command: &DelegateCommand,
     wait: Duration,
 ) -> anyhow::Result<DelegateCommandResponse> {
@@ -4254,7 +4255,7 @@ async fn run_delegate_command(
         .send(ClientRequest::DelegateOp(
             freenet_stdlib::client_api::DelegateRequest::ApplicationMessages {
                 key: delegate_key.clone(),
-                params: Parameters::from(vec![]),
+                params: params.clone(),
                 inbound: vec![InboundDelegateMsg::ApplicationMessage(
                     ApplicationMessage::new(payload),
                 )],
@@ -4467,7 +4468,11 @@ async fn test_delegate_get_reaches_the_network_for_an_unseen_contract(
     const TEST_DELEGATE: &str = "test-delegate-capabilities";
     const TEST_CONTRACT: &str = "test-contract-integration";
 
-    let delegate = load_delegate(TEST_DELEGATE, Parameters::from(vec![]))?;
+    // Non-empty params: this GET parks off the loop and resumes when the
+    // network answers, and every run of the round-trip, the resume included,
+    // must use the params the key commits to.
+    let params = Parameters::from(b"parked-get".to_vec());
+    let delegate = load_delegate(TEST_DELEGATE, params.clone())?;
     let delegate_key = delegate.key().clone();
 
     let state = WrappedState::from(test_utils::create_todo_list_with_item(
@@ -4490,6 +4495,7 @@ async fn test_delegate_get_reaches_the_network_for_an_unseen_contract(
     let response = run_delegate_command(
         &mut client,
         &delegate_key,
+        &params,
         &DelegateCommand::GetContractState { contract_id },
         Duration::from_secs(120),
     )
@@ -4580,6 +4586,7 @@ async fn test_delegate_subscribe_reaches_the_network_for_an_unseen_contract(
     let response = run_delegate_command(
         &mut client,
         &delegate_key,
+        &Parameters::from(vec![]),
         &DelegateCommand::SubscribeContract { contract_id },
         Duration::from_secs(180),
     )

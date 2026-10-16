@@ -1618,6 +1618,15 @@ where
                     );
                     return DelegateRunOutcome::Failed(err);
                 }
+                // Caused by the request; the executor already logged it once
+                // at warn with the key.
+                if err.is_params_mismatch() {
+                    tracing::debug!(
+                        delegate_key = %delegate_key,
+                        "Delegate request refused: parameters do not match the delegate key"
+                    );
+                    return DelegateRunOutcome::Failed(err);
+                }
                 tracing::error!(
                     delegate_key = %delegate_key,
                     error = %err,
@@ -13191,10 +13200,9 @@ mod hol_4391_tests {
     /// resumes after it parks, AND on a second notification that queued behind
     /// that park and drains after it — rather than empty ones.
     ///
-    /// Nothing downstream would catch empty params: the store resolves the
-    /// code through its index and attaches whatever params the request
-    /// carries, so a parameterized delegate silently ran as a different
-    /// instance of itself. The resume leg rides `Continuation::params` and the
+    /// Empty params for a parameterized delegate are refused by the runtime
+    /// (`Runtime::prepare_delegate_call`), so a run built with them would
+    /// fail rather than run as the delegate it names. The resume leg rides `Continuation::params` and the
     /// queued run rides `PendingRun::Notification { req }`, both taken from
     /// the request built here, so both are asserted too.
     ///

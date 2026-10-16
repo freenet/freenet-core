@@ -46,6 +46,12 @@ impl_err!(delegate::DelegateExecError);
 impl_err!(runtime::ContractExecError);
 impl_err!(engine::WasmError);
 
+/// The text a refused delegate run reports, followed by a space and the
+/// delegate key (`RuntimeInnerError::DelegateParamsMismatch`). Clients receive
+/// it inside `DelegateError::ExecutionError`.
+pub(crate) const DELEGATE_PARAMS_MISMATCH: &str =
+    "delegate request parameters do not match the delegate key";
+
 #[derive(thiserror::Error, Debug)]
 pub(crate) enum RuntimeInnerError {
     #[error(transparent)]
@@ -66,6 +72,12 @@ pub(crate) enum RuntimeInnerError {
     // delegate runtime errors
     #[error("delegate {0} not found in store")]
     DelegateNotFound(DelegateKey),
+
+    /// The parameters supplied for a delegate run do not derive its key
+    /// under the code hash this node indexed for it. Refused before the
+    /// delegate runs; see `Runtime::prepare_delegate_call`.
+    #[error("{msg} {0}", msg = DELEGATE_PARAMS_MISMATCH)]
+    DelegateParamsMismatch(DelegateKey),
 
     /// A delegate offered for storage carries a key that is not derived from
     /// its own code and parameters, so the node cannot store it under an

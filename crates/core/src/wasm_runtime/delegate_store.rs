@@ -634,6 +634,9 @@ const REG_HEADER_LEN: usize = 1 + 32 + 4;
 ///
 /// A missing or damaged record is normally repaired by the next registration
 /// of the delegate (`ensure_reg_file`, which logs a record it cannot replace).
+///
+/// Every run, client-started or not, is also checked against the key in
+/// `Runtime::prepare_delegate_call`.
 pub fn registered_params(
     delegates_dir: &std::path::Path,
     index: &DashMap<DelegateKey, CodeHash>,
@@ -674,7 +677,15 @@ pub fn registered_params(
 }
 
 /// Whether `key` is the delegate key of `code_hash` under `params`.
-fn key_derives_from(key: &DelegateKey, code_hash: &CodeHash, params: &Parameters<'_>) -> bool {
+///
+/// Pure computation, no IO. `code_hash` must come from this node's index
+/// (`DelegateStore::code_hash_from_key`), never from `key.code_hash()`, which
+/// is unverified serde data.
+pub(crate) fn key_derives_from(
+    key: &DelegateKey,
+    code_hash: &CodeHash,
+    params: &Parameters<'_>,
+) -> bool {
     DelegateKey::from_params(code_hash.encode(), params).is_ok_and(|derived| derived == *key)
 }
 
