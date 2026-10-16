@@ -719,4 +719,132 @@ mod tests {
         shuffled.extend(pool.iter().copied());
         assert_eq!(first, selector.select_split(&shuffled, activity, &[]));
     }
+
+    // ------------------------------------------- rates at realistic activity (T1-T3)
+
+    /// The fraction of `trials` (salt, epoch) draws in which `draw` hits `busy`.
+    fn hit_rate(
+        busy: &HashSet<ContractInstanceId>,
+        draw: impl Fn(&FocusSelector) -> Vec<ContractInstanceId>,
+    ) -> (f64, usize) {
+        let mut hits = 0usize;
+        let mut trials = 0usize;
+        for salt in 0..=255u8 {
+            let mut selector = FocusSelector::new([salt; 32], 2);
+            for _ in 0..4 {
+                trials += 1;
+                if draw(&selector).iter().any(|c| busy.contains(c)) {
+                    hits += 1;
+                }
+                selector.rotate();
+            }
+        }
+        (hits as f64 / trials as f64, trials)
+    }
+
+    /// Hit rates of the uniform+weighted split at realistic activity (#5914 review
+    /// T1): 143 hosted (the #5913 peer's high-water mark), 4 to 20 of them busy, at
+    /// 1, 3 and 10 recent merges each.
+    ///
+    /// Each rate is asserted against the closed form for this design: the uniform
+    /// slot hits with `b/N`; otherwise the weighted slot's first draw over the other
+    /// `N - 1` hits with `b*w / (b*w + (N-1-b))`, `w = 1 + count`. The point of
+    /// printing them is the conclusion the PR has to state: at one or three merges per
+    /// period and a handful of busy contracts the hit rate stays low. If a deployed
+    /// peer shows `active_candidates` near zero, the cause is traffic, not selection.
+    #[test]
+    fn hit_rates_at_realistic_activity_match_the_design() {
+        const HOSTED: u8 = 143;
+        let pool = candidates(HOSTED);
+        let n = f64::from(HOSTED);
+        for busy_count in [4usize, 10, 20] {
+            let stride = usize::from(HOSTED) / busy_count;
+            let busy: HashSet<_> = (0..busy_count).map(|i| pool[i * stride]).collect();
+            let b = busy_count as f64;
+            let (uniform_pair, _) = hit_rate(&busy, |s| s.select(&pool));
+            for count in [1u32, 3, 10] {
+                let activity = |c: &ContractInstanceId| if busy.contains(c) { count } else { 0 };
+                let (split, trials) = hit_rate(&busy, |s| {
+                    s.select_split(&pool, activity, &[])
+                        .into_iter()
+                        .map(|(c, _)| c)
+                        .collect()
+                });
+                let w = focus_weight(count);
+                let expected = b / n + (n - b) / n * (b * w / (b * w + (n - 1.0 - b)));
+                println!(
+                    "busy={busy_count:>2}/{HOSTED} merges={count:>2}: split={split:.3} \
+                     expected={expected:.3} uniform_pair={uniform_pair:.3} ({trials} draws)"
+                );
+                assert!(
+                    (split - expected).abs() < 0.05,
+                    "busy={busy_count} merges={count}: measured {split:.3}, design says \
+                     {expected:.3}"
+                );
+                assert!(
+                    split + 0.03 >= uniform_pair,
+                    "busy={busy_count} merges={count}: the split ({split:.3}) does worse \
+                     than the uniform pair it replaced ({uniform_pair:.3})"
+                );
+            }
+        }
+    }
+
+    /// The cap, exercised through the draw itself (T2): a contract at the cap and
+    /// one at `u32::MAX` win the weighted slot about equally often.
+    #[test]
+    fn activity_past_the_cap_wins_no_more_often_than_activity_at_it() {
+        let at_cap = id(1);
+        let flooded = id(2);
+        let pool = [at_cap, flooded];
+        let mut flooded_first = 0usize;
+        let mut trials = 0usize;
+        for salt in 0..=255u8 {
+            let mut selector = FocusSelector::new([salt; 32], 1);
+            for _ in 0..16 {
+                trials += 1;
+                let picked = selector.select_weighted(&pool, |c| {
+                    if *c == flooded {
+                        u32::MAX
+                    } else {
+                        ACTIVITY_WEIGHT_CAP
+                    }
+                });
+                flooded_first += usize::from(picked == [flooded]);
+                selector.rotate();
+            }
+        }
+        let rate = flooded_first as f64 / trials as f64;
+        assert!(
+            (rate - 0.5).abs() < 0.04,
+            "a flooded contract won {rate:.3} of {trials} draws against one at the cap; \
+             activity past the cap is buying weight"
+        );
+    }
+
+    /// The weighted draw is proportional to weight (T3): a candidate with weight 4
+    /// wins a two-way draw against weight 1 about 4/5 of the time.
+    #[test]
+    fn the_weighted_draw_is_proportional_to_weight() {
+        let cold = id(1);
+        let warm = id(2);
+        let pool = [cold, warm];
+        let mut warm_first = 0usize;
+        let mut trials = 0usize;
+        for salt in 0..=255u8 {
+            let mut selector = FocusSelector::new([salt; 32], 1);
+            for _ in 0..16 {
+                trials += 1;
+                // Weight 1 + 3 = 4 against weight 1.
+                let picked = selector.select_weighted(&pool, |c| u32::from(*c == warm) * 3);
+                warm_first += usize::from(picked == [warm]);
+                selector.rotate();
+            }
+        }
+        let rate = warm_first as f64 / trials as f64;
+        assert!(
+            (rate - 0.8).abs() < 0.04,
+            "weight 4 against 1 won {rate:.3} of {trials} draws; expected about 0.8"
+        );
+    }
 }
