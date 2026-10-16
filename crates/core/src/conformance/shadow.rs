@@ -55,20 +55,23 @@ use super::verifier::verify_case;
 /// Small on purpose. Watching more is not free — each focus contract is a probe's
 /// worth of WASM execution per tick — and it buys less than it looks like it should,
 /// because coverage across the network comes from every peer watching a *different*
-/// couple of contracts, not from any one peer watching many. Two is the RFC's
-/// "simple independent randomized policy" read literally.
+/// couple of contracts, not from any one peer watching many. Two is one uniform slot
+/// and one activity-weighted slot (see `focus::FocusSelector::select_split`); with
+/// one, there would be no weighted slot at all.
 const MAX_FOCUS_CONTRACTS: usize = 2;
 
 /// How often a probe runs.
 pub const PROBE_INTERVAL: Duration = Duration::from_secs(15 * 60);
 
-/// Ticks before the focus set is reshuffled.
+/// Ticks in a focus period, after which the epoch advances and every score changes.
 ///
-/// Rotation is what stops a contract that happens to be unlucky today from being the
-/// only thing this peer ever looks at, and what stops an author who somehow learns
-/// they are being watched from staying watched. Eight ticks at fifteen minutes is two
-/// hours, long enough for a sampler to accumulate something worth checking and short
-/// enough that a day covers many contracts.
+/// The period is what the uniform slot is fixed for, and what stops an author who
+/// somehow learns they are being watched from staying watched. The weighted slot is
+/// re-drawn more often than this, at every tick, from current activity, but only
+/// while it has gathered nothing new; a contract the sampler is admitting samples for
+/// keeps its slot until the period ends. Eight ticks at fifteen minutes is two hours,
+/// long enough for a sampler to accumulate something worth checking and short enough
+/// that a day covers many contracts.
 const ROTATE_EVERY_TICKS: u32 = 8;
 
 /// Cases checked per contract per tick.

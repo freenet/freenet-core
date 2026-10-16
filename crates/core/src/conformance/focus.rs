@@ -1,47 +1,47 @@
 //! Choosing which contracts a peer watches, and when it moves on.
 //!
-//! Focus selection has one security requirement that shapes the whole design: **it
-//! must not be controllable by the contract being tested.** A contract author picks
-//! their own contract id, so any selection rule that is a pure function of the id
-//! (nearest to the peer's ring location, lowest hash, most active) is a rule the
-//! author can aim or dodge — they could grind ids until their contract is never
-//! anyone's focus, or until it is *everyone's* focus and the checking cost becomes
-//! an amplification vector.
+//! Focus selection has one security requirement that shapes the whole design: **a
+//! contract author must not be able to aim selection or dodge it.** An author picks
+//! their own contract id, so any rule that is a pure function of the id (nearest to
+//! the peer's ring location, lowest hash) is a rule they can grind ids against, until
+//! their contract is never anyone's focus, or is *everyone's* focus and the checking
+//! cost becomes an amplification vector.
 //!
-//! So selection is keyed on a per-peer secret salt. Scores are
-//! `blake3(salt || epoch || contract_id)`, and the peer watches the lowest few.
-//! Without knowing a peer's salt an author cannot predict, or influence, whether
-//! that peer is looking at them; and because every peer has a different salt, the
-//! network as a whole covers a broad spread of contracts while each peer watches
-//! almost none.
+//! So every draw is keyed on a per-peer secret salt: scores are
+//! `blake3(domain || salt || epoch || contract_id)`. Without a peer's salt an author
+//! can neither predict whether that peer is watching them nor grind an id that
+//! changes the answer, and because every peer has a different salt the network covers
+//! a broad spread of contracts while each peer watches almost none. Rotation is an
+//! epoch bump, which reshuffles every score at once.
 //!
-//! Rotation is just an epoch bump, which reshuffles every score at once.
+//! # Two slots: one uniform, one weighted by activity (#5913, #5914)
 //!
-//! # Weighting by recent activity (#5913)
+//! A purely uniform draw judged nothing on a production-shape peer for twelve hours:
+//! most hosted contracts receive no merge in a given focus period, and a focused
+//! contract is only sampled from merges it receives while focused. A purely weighted
+//! draw has the opposite failure: busy decoys, or anyone pumping updates into some
+//! contract, crowd a quiet contract's chance down by up to the weight cap. So the
+//! focus set is split ([`FocusSelector::select_split`]):
 //!
-//! A uniform draw over the hosted set judged nothing on a production-shape peer for
-//! twelve hours: most hosted contracts receive no merge in a given focus period, and
-//! a focused contract is only sampled from merges it receives while focused. So the
-//! draw is weighted by how many merges this peer recently observed for each contract
-//! ([`super::activity`]). It remains a salted random draw: the salted score supplies
-//! the randomness and the weight only skews it (weighted sampling without replacement,
-//! Efraimidis-Spirakis: each candidate's key is `-ln(u) / w` for a salted uniform
-//! `u`, and the lowest keys win). Two bounds keep the weight from becoming a lever:
+//! - **The uniform slot** is the lowest salted score among the candidates. Activity
+//!   plays no part, so every hosted contract is explored at about one in N per
+//!   period whatever happens to activity anywhere. This is the RFC's "retain some
+//!   random exploration even if activity weighting is later added", made absolute
+//!   rather than a floor that pumping can dilute.
+//! - **The weighted slot** is a salted draw weighted by how many state-changing
+//!   merges this peer recently observed for each contract ([`super::activity`]),
+//!   read at each probe tick so a contract that starts merging mid-period is seen at
+//!   the next tick. Weighted sampling without replacement (Efraimidis-Spirakis: each
+//!   candidate's key is `-ln(u) / w` for a salted uniform `u`, lowest keys win), on a
+//!   separately domained score so it is independent of the uniform slot.
 //!
-//! - **Floor.** A contract with no activity keeps weight [`COLD_FOCUS_WEIGHT`], so
-//!   quiet contracts are still explored (the RFC: "retain some random exploration
-//!   even if activity weighting is later added"). Staying quiet lowers a contract's
-//!   chance, but a quiet contract also has no merges to check.
-//! - **Cap.** Activity beyond [`ACTIVITY_WEIGHT_CAP`] adds nothing. Without it, one
-//!   contract flooded with UPDATEs would become every hosting peer's focus, and
-//!   pumping decoys would pull the fleet's attention off a target. With it, a decoy
-//!   competes with an active target as an equal. Per-peer cost is unchanged in any
-//!   case: focus is still at most `max_focus` contracts.
-//!
-//! Activity is not a pure function of the contract id, and it is local to each peer,
-//! so the "grind an id" argument above does not apply to it. What an actor CAN do is
-//! send real updates to a contract to raise its weight on the peers hosting it, which
-//! buys at most the cap and spends their own traffic to draw scrutiny.
+//! Activity is a bounded lever, not a pure function of the id, and it is local to
+//! each peer. What an actor CAN do is send real, state-changing updates to raise a
+//! contract's weight in the weighted slot on the peers hosting it. That buys at most
+//! [`ACTIVITY_WEIGHT_CAP`] (a contract with no activity keeps
+//! [`COLD_FOCUS_WEIGHT`]), costs the actor their own traffic, draws scrutiny onto the
+//! contract they pump, and cannot touch the uniform slot. Per-peer cost is unchanged:
+//! focus is still at most `max_focus` contracts.
 
 use std::collections::HashSet;
 
@@ -481,12 +481,14 @@ mod tests {
         hits
     }
 
-    /// The #5913 regression: uniform focus over a mostly-cold hosted set almost never
-    /// lands on a contract that is receiving merges, so a production-shape peer judged
-    /// nothing for twelve hours. Weighting by recent merges must fix that.
+    /// The #5913 regression, on the weighted draw alone: uniform focus over a
+    /// mostly-cold hosted set almost never lands on a contract that is receiving
+    /// merges, so a production-shape peer judged nothing for twelve hours.
     ///
-    /// 140 hosted, 4 busy, 2 focus slots: uniform picks a busy contract in about 6% of
-    /// periods; the weighted draw must do so in most of them.
+    /// 140 hosted, 4 busy, 2 slots both weighted: uniform picks a busy contract in
+    /// about 6% of periods; the weighted draw must do so in most of them. The
+    /// production split (one uniform slot) is measured in
+    /// `hit_rates_at_realistic_activity_match_the_design`.
     #[test]
     fn weighted_focus_finds_the_busy_contracts_uniform_focus_misses() {
         let (pool, busy) = mostly_cold(&[3, 50, 97, 131], 140);
@@ -510,7 +512,8 @@ mod tests {
 
     /// Weighting must not starve quiet contracts entirely: the RFC asks to "retain
     /// some random exploration", and a contract must not be able to hide from every
-    /// peer just by being quiet.
+    /// peer just by being quiet. The weighted draw keeps a small non-zero chance; the
+    /// split's uniform slot keeps the full uniform one.
     #[test]
     fn a_cold_contract_keeps_a_small_nonzero_chance() {
         let pool = candidates(11);
@@ -535,11 +538,33 @@ mod tests {
             "a cold contract among busy ones was never selected in {trials} periods, \
              so weighting has removed random exploration"
         );
-        // Uniform would pick it in 2/11 of periods. Weighted must be far below that.
+        // A uniform pair would pick it in 2/11 of periods; weighted must be well
+        // below that (a quarter of it), or activity is not weighting anything.
+        let rate = picked_cold as f64 / trials as f64;
+        let uniform_pair_rate = 2.0 / 11.0;
         assert!(
-            picked_cold * 11 < trials * 2 / 4,
-            "a cold contract was picked {picked_cold}/{trials} times, close to the \
-             uniform rate, so activity is not weighting anything"
+            rate < uniform_pair_rate / 4.0,
+            "a cold contract was picked at {rate:.3}, close to the uniform rate \
+             {uniform_pair_rate:.3}, so activity is not weighting anything"
+        );
+
+        // The split's uniform slot ignores activity, so the same cold contract keeps
+        // at least its 1/11 uniform chance there.
+        let mut split_picked = 0usize;
+        for salt in 0..=255u8 {
+            let mut selector = FocusSelector::new([salt; 32], 2);
+            for _ in 0..16 {
+                let picks =
+                    selector.select_split(&pool, |c| if *c == cold { 0 } else { 1_000 }, &[]);
+                split_picked += usize::from(picks.iter().any(|(c, _)| *c == cold));
+                selector.rotate();
+            }
+        }
+        let split_rate = split_picked as f64 / trials as f64;
+        assert!(
+            split_rate > 1.0 / 11.0 - 0.03,
+            "the split picked a cold contract at {split_rate:.3}, below its uniform \
+             slot's 1/11, so activity is leaking into the uniform slot"
         );
     }
 

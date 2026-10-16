@@ -22,7 +22,11 @@
 //!
 //! **It is bounded.** Per-contract sampling goes through [`ContractSampler`], which
 //! caps bytes rather than item counts, so a contract with large states cannot grow
-//! the corpus without limit. The number of contracts tracked is capped too.
+//! the corpus without limit. The number of contracts tracked is capped too. The
+//! writer also counts merge activity per contract for focus weighting
+//! (`counts_as_activity`, `ShadowRunner::note_merge`); that count lives in a
+//! fixed-size, capped map (`activity::MAX_TRACKED_ACTIVITY`) and costs the writer a
+//! hash-map increment per observation, nothing on the merge path.
 //!
 //! # Privacy
 //!
