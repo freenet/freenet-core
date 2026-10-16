@@ -1879,6 +1879,37 @@ stack backtrace:
         );
     }
 
+    /// #5799: the report carries why auto-update is holding off, taken from
+    /// the cooldown record for this binary's version, omitted when there is
+    /// none, and printed in the summary.
+    #[test]
+    fn the_report_carries_the_auto_update_status() {
+        let src = include_str!("report.rs").replace("\r\n", "\n");
+        let production = src
+            .split_once(concat!("#[cfg(test)]\n", "mod tests {"))
+            .unwrap()
+            .0;
+        let flat: String = production.split_whitespace().collect();
+        assert!(
+            flat.contains(
+                "letauto_update_status=super::rollback::update_cooldown_summary(version);"
+            )
+        );
+        assert!(flat.contains("network_status_error,auto_update_status,user_message,})"));
+        assert!(flat.contains(
+            "ifletSome(status)=&report.auto_update_status{println!(\"-Auto-update:{status}\");}"
+        ));
+        let mut report = sample_report();
+        assert!(
+            !serde_json::to_string(&report)
+                .unwrap()
+                .contains("auto_update_status")
+        );
+        report.auto_update_status = Some("Update to 0.2.141 failed 1 time(s)".into());
+        let json = serde_json::to_string(&report).unwrap();
+        assert!(json.contains("\"auto_update_status\":\"Update to 0.2.141 failed"));
+    }
+
     /// Serialization must round-trip the new `network_status_error` field
     /// and omit it from JSON when `None` so existing report schemas stay
     /// unchanged on the server side.

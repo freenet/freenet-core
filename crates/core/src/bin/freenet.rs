@@ -529,6 +529,8 @@ async fn run_network_node_with_signals(
         // A release staged for an update this binary already is (#5790) has
         // served its purpose, however the update was applied.
         commands::update::discard_stale_staged(build_info::VERSION);
+        // And state-file temporaries a power cut left behind (#5799).
+        commands::rollback::sweep_stale_temp_files();
 
         // --- Startup update check (#3864) ---
         //

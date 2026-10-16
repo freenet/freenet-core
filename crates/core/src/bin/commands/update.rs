@@ -240,6 +240,17 @@ fn note_install_failure(version: &str, error: &anyhow::Error) {
     );
 }
 
+/// [`note_install_failure`] for the release the node staged before it exited,
+/// when this run gives up before learning the tag itself: a network error on
+/// the tag probe, or one of the rate-limit exits. Without it the restart would
+/// find no cooldown and the staged cache still valid, and exit again within
+/// seconds (#5799). Nothing staged, nothing recorded.
+fn note_failure_of_staged_release(error: &anyhow::Error) {
+    if let Some(tag) = staged::staged_tag() {
+        note_install_failure(super::auto_update::version_from_tag(&tag), error);
+    }
+}
+
 /// Classify the exit status of a `freenet update` subprocess invocation.
 /// Pure over just the `io::Result<ExitStatus>` so it can be unit-tested
 /// with synthetic inputs.
@@ -426,7 +437,15 @@ impl UpdateCommand {
         //     on EVERY non-clean node exit (so a crash-looping node used to burn
         //     REST quota once per crash), and
         //   * `--check`, which never installs by definition.
-        let latest_tag = probe_latest_tag(self.force, self.quiet).await?;
+        let latest_tag = match probe_latest_tag(self.force, self.quiet).await {
+            Ok(tag) => tag,
+            Err(e) => {
+                // The tag could not be learned. If the node staged a release
+                // before exiting, that is the one this run was for (#5799).
+                note_failure_of_staged_release(&e);
+                return Err(e);
+            }
+        };
         // `latest_tag` is the tag verbatim (`v0.2.118`); `latest_version` is its
         // semver part. Both are kept: the version is what we compare and what
         // the rollback/pin bookkeeping keys on, while the RAW tag is what
@@ -1365,6 +1384,7 @@ async fn probe_latest_tag(force: bool, quiet: bool) -> Result<String> {
                 eprintln!("{}", rate_limited.user_message());
             }
             tracing::warn!("Update check deferred: {}", rate_limited.user_message());
+            note_failure_of_staged_release(&anyhow::anyhow!("{}", rate_limited.user_message()));
             std::process::exit(EXIT_CODE_ALREADY_UP_TO_DATE);
         }
     }
@@ -1379,6 +1399,9 @@ async fn probe_latest_tag(force: bool, quiet: bool) -> Result<String> {
         tracing::warn!(
             "GitHub update poll rate-limited (token bucket empty); exiting as up-to-date (#4073)"
         );
+        note_failure_of_staged_release(&anyhow::anyhow!(
+            "skipped: too many recent GitHub polls (#4073 token bucket)"
+        ));
         std::process::exit(EXIT_CODE_ALREADY_UP_TO_DATE);
     }
 
@@ -1411,6 +1434,7 @@ async fn probe_latest_tag(force: bool, quiet: bool) -> Result<String> {
                     eprintln!("{}", rate_limited.user_message());
                 }
                 tracing::warn!("Update check deferred: {}", rate_limited.user_message());
+                note_failure_of_staged_release(&anyhow::anyhow!("{}", rate_limited.user_message()));
                 std::process::exit(EXIT_CODE_ALREADY_UP_TO_DATE);
             }
             Err(e).context("Failed to determine the latest Freenet release")
@@ -1480,6 +1504,12 @@ async fn fetch_release_assets(tag: &str, quiet: bool) -> Result<Release> {
             eprintln!("{}", rate_limited.user_message());
         }
         tracing::warn!("Update deferred: {}", rate_limited.user_message());
+        // The release is known here: hold it for a cooldown, so the restart
+        // does not exit for it again at once (#5799).
+        note_install_failure(
+            super::auto_update::version_from_tag(tag),
+            &anyhow::anyhow!("{}", rate_limited.user_message()),
+        );
         std::process::exit(EXIT_CODE_ALREADY_UP_TO_DATE);
     }
 
@@ -4202,18 +4232,29 @@ done
     /// Source-scrape pins, as `run_async` needs GitHub and the real state dir.
     #[test]
     fn transient_install_failures_cool_the_release_down() {
-        const SRC: &str = include_str!("update.rs");
-        let code: String = SRC
-            .replace("\r\n", "\n")
+        // CRLF-normalised for a Windows checkout, so the `\n` anchors match.
+        let src = include_str!("update.rs").replace("\r\n", "\n");
+        let production = src
             .split_once(concat!("#[cfg(test)]\n", "mod tests {"))
             .expect("test module not found")
-            .0
-            .lines()
-            .filter(|l| !l.trim_start().starts_with("//"))
-            .collect::<Vec<_>>()
-            .join("\n")
-            .split_whitespace()
-            .collect();
+            .0;
+        // Each scraped region is one function, comments dropped, whitespace
+        // removed, so a pin cannot be satisfied by another item's code.
+        let region = |signature: &str, end: &str| -> String {
+            let at = production
+                .find(signature)
+                .unwrap_or_else(|| panic!("`{signature}` not found"));
+            let body = &production[at..];
+            body[..body
+                .find(end)
+                .unwrap_or_else(|| panic!("end of `{signature}`"))]
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .collect::<String>()
+                .split_whitespace()
+                .collect()
+        };
+        let run_async = region("\n    async fn run_async(", "\n    }\n");
         for (needle, why) in [
             (
                 "Err(e)=>{note_install_failure(latest_version,&e);returnErr(e);}",
@@ -4221,11 +4262,15 @@ done
             ),
             (
                 "Err(e)=>note_install_failure(latest_version,e),}install_result",
-                "the catch-all transient install error",
+                "the catch-all install error",
             ),
             (
                 "}else{note_install_failure(latest_version,",
-                "a transient app-bundle failure",
+                "a non-verification app-bundle failure",
+            ),
+            (
+                "Err(e)=>{note_failure_of_staged_release(&e);returnErr(e);}",
+                "a failed tag probe, against the staged release",
             ),
             (
                 "clear_install_failures();super::rollback::clear_update_cooldown();",
@@ -4233,29 +4278,53 @@ done
             ),
         ] {
             assert!(
-                code.contains(needle),
-                "update.rs must handle {why} for the #5799 cooldown (`{needle}`)"
+                run_async.contains(needle),
+                "run_async must handle {why} for the #5799 cooldown (`{needle}`)"
             );
         }
         assert_eq!(
-            code.matches("super::rollback::clear_update_cooldown();")
+            run_async
+                .matches("super::rollback::clear_update_cooldown();")
                 .count(),
             2,
             "both the Installed outcome and the already-up-to-date exit clear the cooldown"
         );
-        // CRLF-normalised for a Windows checkout, so the `\n}\n` anchor matches.
-        let src = SRC.replace("\r\n", "\n");
-        let note = src
-            .split_once("\nfn note_install_failure(")
-            .expect("helper not found")
+        // A release that fails verification goes to the #4073 gate, not to the
+        // cooldown: that is what stops a bad release from looping.
+        let verification = run_async
+            .split_once("Err(e)ifis_release_verification_failure(e)=>")
+            .expect("verification arm")
             .1;
-        let note = &note[..note.find("\n}\n").expect("end of helper")];
+        let verification = &verification[..verification.find("Err(e)=>").unwrap()];
         assert!(
-            note.lines().any(|l| l
-                .trim()
-                .starts_with("let failures = super::rollback::record_update_cooldown(version,")),
+            verification.contains("record_install_failure(latest_version)")
+                && !verification.contains("note_install_failure"),
+            "the verification arm must count toward the gate, not the cooldown: {verification}"
+        );
+        // Every early exit of the tag probe records against the staged release.
+        let probe = region("\nasync fn probe_latest_tag(", "\n}\n");
+        assert_eq!(
+            probe.matches("note_failure_of_staged_release(").count(),
+            3,
+            "the cached cooldown, the empty bucket and the live rate limit"
+        );
+        assert_eq!(
+            probe
+                .matches("std::process::exit(EXIT_CODE_ALREADY_UP_TO_DATE)")
+                .count(),
+            3
+        );
+        let assets = region("\nasync fn fetch_release_assets(", "\n}\n");
+        assert!(assets.contains(
+            "note_install_failure(super::auto_update::version_from_tag(tag),&anyhow::anyhow!("
+        ));
+        let note = region("\nfn note_install_failure(", "\n}\n");
+        assert!(
+            note.contains("letfailures=super::rollback::record_update_cooldown(version,"),
             "the helper must record the cooldown"
         );
+        let staged = region("\nfn note_failure_of_staged_release(", "\n}\n");
+        assert!(staged.contains("ifletSome(tag)=staged::staged_tag(){note_install_failure("));
     }
 
     // ---- Ed25519 release-manifest signing + verification (auto-update). ----

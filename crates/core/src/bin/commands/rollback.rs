@@ -273,6 +273,16 @@ fn fsync_dir(dir: &Path) {
 /// half-written marker/pin that mis-drives the rollback decision.
 fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     use std::io::Write;
+    atomic_write_with(path, bytes, |file, bytes| file.write_all(bytes))
+}
+
+/// [`atomic_write`] with the write injected, so the cleanup on a failed write
+/// is testable.
+fn atomic_write_with(
+    path: &Path,
+    bytes: &[u8],
+    write: impl FnOnce(&mut std::fs::File, &[u8]) -> std::io::Result<()>,
+) -> Result<()> {
     let dir = path.parent().context("path has no parent directory")?;
     std::fs::create_dir_all(dir).ok();
     let file_name = path
@@ -285,10 +295,17 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let tmp = dir.join(format!(".{file_name}.{}.{seq}.tmp", std::process::id()));
-    {
-        let mut f = std::fs::File::create(&tmp).context("create temp for atomic write")?;
-        f.write_all(bytes).context("write temp for atomic write")?;
-        f.sync_all().context("fsync temp for atomic write")?;
+    let written = std::fs::File::create(&tmp)
+        .context("create temp for atomic write")
+        .and_then(|mut f| {
+            write(&mut f, bytes).context("write temp for atomic write")?;
+            f.sync_all().context("fsync temp for atomic write")
+        });
+    if let Err(e) = written {
+        // The name is unique per call, so a temp left here would never be
+        // reused or replaced: every failed write would leak another file.
+        let _rm = std::fs::remove_file(&tmp);
+        return Err(e);
     }
     if let Err(e) = std::fs::rename(&tmp, path) {
         let _rm = std::fs::remove_file(&tmp);
@@ -296,6 +313,49 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     }
     fsync_dir(dir);
     Ok(())
+}
+
+/// The files [`atomic_write`] writes in the state directory.
+const ATOMIC_FILES: [&str; 4] = [
+    PROBATION_FILE,
+    KNOWN_BAD_FILE,
+    INSTALL_FAILURES_FILE,
+    UPDATE_COOLDOWN_FILE,
+];
+
+/// A temporary file older than this is left over from a process that died
+/// mid-write (a power cut), not one being written now.
+const STALE_TEMP_AGE: std::time::Duration = std::time::Duration::from_secs(3600);
+
+/// Remove [`atomic_write`] temporaries left behind by a process that died
+/// before it could rename or remove them. Run by the node at startup.
+pub fn sweep_stale_temp_files() {
+    if let Some(dir) = state_dir() {
+        sweep_stale_temp_files_at(&dir, SystemTime::now());
+    }
+}
+
+pub(crate) fn sweep_stale_temp_files_at(dir: &Path, now: SystemTime) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let ours = name.ends_with(".tmp")
+            && ATOMIC_FILES
+                .iter()
+                .any(|file| name.starts_with(&format!(".{file}.")));
+        let stale = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .is_ok_and(|modified| {
+                now.duration_since(modified)
+                    .is_ok_and(|age| age >= STALE_TEMP_AGE)
+            });
+        if ours && stale {
+            let _rm = std::fs::remove_file(entry.path());
+        }
+    }
 }
 
 /// SHA-256 + byte length of a file, streamed in chunks.
@@ -2685,11 +2745,51 @@ mod tests {
         let dir = tmp.path();
         record_install_failure_at(dir, "0.2.90");
         assert!(read_install_failures_at(dir).is_some());
-        let leftover_tmp = dir.join(format!(".{INSTALL_FAILURES_FILE}.tmp"));
-        assert!(
-            !leftover_tmp.exists(),
-            "atomic_write must not leave a temp file behind"
-        );
+        // Any temp name, not one spelling of it: since #5799 the name is
+        // unique per call, so checking a fixed name could never fail.
+        assert_eq!(temp_files(dir), Vec::<String>::new());
+    }
+
+    fn temp_files(dir: &Path) -> Vec<String> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".tmp"))
+            .collect()
+    }
+
+    #[test]
+    fn a_failed_atomic_write_leaves_no_temp_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let failed = atomic_write_with(&dir.join(UPDATE_COOLDOWN_FILE), b"x", |_, _| {
+            Err(std::io::Error::other("disk full"))
+        });
+        assert!(failed.is_err());
+        assert_eq!(temp_files(dir), Vec::<String>::new());
+        assert!(!dir.join(UPDATE_COOLDOWN_FILE).exists());
+    }
+
+    #[test]
+    fn stale_temp_files_of_ours_are_swept_and_nothing_else() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        for name in [
+            ".update_cooldown.json.123.0.tmp",
+            ".install_failures.json.tmp",
+            ".someone_elses.tmp",
+            "update_cooldown.json",
+        ] {
+            std::fs::write(dir.join(name), b"x").unwrap();
+        }
+        // Too young: a write may be in progress.
+        sweep_stale_temp_files_at(dir, SystemTime::now());
+        assert_eq!(temp_files(dir).len(), 3);
+        sweep_stale_temp_files_at(dir, SystemTime::now() + STALE_TEMP_AGE);
+        let mut left = temp_files(dir);
+        left.sort();
+        assert_eq!(left, [".someone_elses.tmp"]);
+        assert!(dir.join("update_cooldown.json").exists());
     }
 
     #[test]

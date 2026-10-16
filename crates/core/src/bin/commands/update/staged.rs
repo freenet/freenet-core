@@ -334,6 +334,22 @@ fn discard_stale_at(root: &Path, current_version: &str, blocked: impl Fn(&str) -
     }
 }
 
+/// The tag of the release staged in the cache, if a complete one is there (its
+/// manifest is written only after the freenet archive verified). The updater
+/// records a failure against it when it exits before it can learn the tag
+/// itself (#5799), so the node's restart holds rather than exiting again.
+pub(super) fn staged_tag() -> Option<String> {
+    staged_tag_at(&cache_root()?)
+}
+
+fn staged_tag_at(root: &Path) -> Option<String> {
+    fs::read_dir(root)
+        .ok()?
+        .flatten()
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .find(|tag| tag_dir(root, tag).is_ok_and(|dir| dir.join(MANIFEST).is_file()))
+}
+
 /// A version this node refuses to install (#4073): pinned known-bad after a
 /// crash-loop rollback, or gated after repeated install failures.
 fn version_blocked(version: &str) -> bool {
@@ -2531,6 +2547,20 @@ mod tests {
         .await;
         assert!(down.is_err());
         assert_eq!(calls, TAG_LOOKUP_RETRY_DELAYS.len() + 1);
+    }
+
+    #[test]
+    fn the_staged_tag_is_the_one_with_a_manifest() {
+        let (_tmp, root) = test_root();
+        assert_eq!(staged_tag_at(&root), None);
+        fs::create_dir_all(root.join("v9.9.8")).unwrap();
+        assert_eq!(
+            staged_tag_at(&root),
+            None,
+            "a partial download is not staged"
+        );
+        write_staged(&root, &[(MANIFEST, b"m")]);
+        assert_eq!(staged_tag_at(&root).as_deref(), Some(TAG));
     }
 
     /// The fallback threshold is part of the contract with the PR's stated
