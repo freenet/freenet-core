@@ -1027,6 +1027,12 @@ pub(crate) struct UpdateCooldownState {
     /// [`update_cooldown_remaining_at`]). 0 in a record that predates it.
     #[serde(default)]
     pub failed_at_unix: u64,
+    /// Unix seconds when a node with nothing to gain from waiting may retry:
+    /// [`UPDATE_COOLDOWN_BASE`] after the failure, jittered like every other
+    /// wait so urgent nodes that failed together do not retry together. 0 in
+    /// a record that predates it, which then uses the unjittered base.
+    #[serde(default)]
+    pub urgent_retry_at_unix: u64,
     /// The last failure, for the logs and `freenet service report`.
     pub last_error: String,
 }
@@ -1084,6 +1090,11 @@ pub(crate) fn record_update_cooldown_at(
         retry_at_unix: now_unix
             .saturating_add(update_cooldown_delay(failures, rand_unit).as_secs()),
         failed_at_unix: now_unix,
+        urgent_retry_at_unix: now_unix.saturating_add(
+            UPDATE_COOLDOWN_BASE
+                .mul_f64(update_cooldown_jitter_factor(rand_unit))
+                .as_secs(),
+        ),
         last_error: error
             .chars()
             .take(UPDATE_COOLDOWN_ERROR_MAX_CHARS)
@@ -1115,15 +1126,85 @@ pub fn record_update_cooldown(version: &str, error: &str) -> Option<u32> {
     })
 }
 
+/// Make sure `version` is held for a cooldown WITHOUT counting a failure.
+///
+/// For updater runs that gave up before attempting a download (a cached
+/// GitHub cooldown, an empty install bucket, a rate limit, a failed tag
+/// probe). The supervisor runs `freenet update` after every non-clean exit,
+/// crashes included, so counting these would walk a crash-looping node's
+/// release toward the 24 h cooldown and past the fallback without a single
+/// download attempt. What they must do is keep the restart from exiting for
+/// the release again at once, so:
+///
+/// - a live record for `version` is left as it is;
+/// - an expired one gets a fresh wait at its existing failure count;
+/// - with no record (or one for an older release) a hold at one failure is
+///   written, the least a hold can be;
+/// - a record for a NEWER release is never overwritten by a stale one.
+///
+/// Returns whether a hold for `version` exists afterwards.
+pub(crate) fn hold_update_without_counting_at(
+    dir: &Path,
+    version: &str,
+    error: &str,
+    now: SystemTime,
+    rand_unit: f64,
+) -> bool {
+    let previous = read_update_cooldown_at(dir);
+    let failures = match &previous {
+        Some(prev) if prev.version == version => {
+            if update_cooldown_remaining_at(dir, version, now, false).is_some() {
+                return true;
+            }
+            prev.failures.max(1)
+        }
+        Some(prev) if !is_not_newer(&prev.version, version) => return false,
+        _ => 1,
+    };
+    let now_unix = now
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let delay = update_cooldown_delay(failures, rand_unit);
+    let state = UpdateCooldownState {
+        version: version.to_string(),
+        failures,
+        retry_at_unix: now_unix.saturating_add(delay.as_secs()),
+        failed_at_unix: now_unix,
+        urgent_retry_at_unix: now_unix.saturating_add(
+            UPDATE_COOLDOWN_BASE
+                .mul_f64(update_cooldown_jitter_factor(rand_unit))
+                .as_secs(),
+        ),
+        last_error: error
+            .chars()
+            .take(UPDATE_COOLDOWN_ERROR_MAX_CHARS)
+            .collect(),
+    };
+    serde_json::to_vec(&state)
+        .context("serialize update cooldown")
+        .and_then(|raw| atomic_write(&dir.join(UPDATE_COOLDOWN_FILE), &raw))
+        .is_ok()
+}
+
+/// [`hold_update_without_counting_at`] against the shared state directory.
+pub fn hold_update_without_counting(version: &str, error: &str) -> bool {
+    let rand_unit = freenet::config::GlobalRng::random_range(0.0_f64..1.0);
+    state_dir().is_some_and(|dir| {
+        hold_update_without_counting_at(&dir, version, error, SystemTime::now(), rand_unit)
+    })
+}
+
 /// How long until `version` may be tried again, or `None` when it is not
 /// cooling down. A retry time further ahead than the longest possible wait is
 /// not a clock that is a little off but a bogus record, and is ignored rather
 /// than obeyed.
 ///
 /// `urgent` is for a node that gains nothing from staying on its current
-/// binary: one whose peers require a newer version, or that has no
-/// connections. It waits at most [`UPDATE_COOLDOWN_BASE`] after the last
-/// failure instead of the doubled wait, so it retries hourly.
+/// binary (see `auto_update::node_is_urgent`: isolated for a while, or a
+/// corroborated newer release its peers require). It waits about
+/// [`UPDATE_COOLDOWN_BASE`] (±20%) after the last failure instead of the
+/// doubled wait, so it retries about hourly.
 pub(crate) fn update_cooldown_remaining_at(
     dir: &Path,
     version: &str,
@@ -1132,12 +1213,15 @@ pub(crate) fn update_cooldown_remaining_at(
 ) -> Option<std::time::Duration> {
     let state = read_update_cooldown_at(dir).filter(|s| s.version == version)?;
     let mut retry_at_unix = state.retry_at_unix;
-    if urgent && state.failed_at_unix > 0 {
-        retry_at_unix = retry_at_unix.min(
-            state
-                .failed_at_unix
-                .saturating_add(UPDATE_COOLDOWN_BASE.as_secs()),
-        );
+    if urgent {
+        let urgent_at = match (state.urgent_retry_at_unix, state.failed_at_unix) {
+            (0, 0) => None,
+            (0, failed_at) => Some(failed_at.saturating_add(UPDATE_COOLDOWN_BASE.as_secs())),
+            (urgent_at, _) => Some(urgent_at),
+        };
+        if let Some(urgent_at) = urgent_at {
+            retry_at_unix = retry_at_unix.min(urgent_at);
+        }
     }
     let retry_at = UNIX_EPOCH.checked_add(std::time::Duration::from_secs(retry_at_unix))?;
     let remaining = retry_at.duration_since(now).ok()?;
@@ -2533,6 +2617,7 @@ mod tests {
             failures: 1,
             retry_at_unix: u64::MAX,
             failed_at_unix: 0,
+            urgent_retry_at_unix: 0,
             last_error: String::new(),
         };
         std::fs::write(
@@ -2578,6 +2663,7 @@ mod tests {
         // A record written before `failed_at_unix` existed is not shortened.
         let mut old = read_update_cooldown_at(dir).unwrap();
         old.failed_at_unix = 0;
+        old.urgent_retry_at_unix = 0;
         std::fs::write(
             dir.join(UPDATE_COOLDOWN_FILE),
             serde_json::to_vec(&old).unwrap(),
@@ -2587,6 +2673,80 @@ mod tests {
         let legacy = r#"{"version":"0.2.141","failures":1,"retry_at_unix":1,"last_error":""}"#;
         std::fs::write(dir.join(UPDATE_COOLDOWN_FILE), legacy).unwrap();
         assert_eq!(read_update_cooldown_at(dir).unwrap().failed_at_unix, 0);
+    }
+
+    /// Urgent nodes that failed together do not retry together: the hour
+    /// cap is jittered ±20% (round-3 review, item 8).
+    #[test]
+    fn the_urgent_cap_is_jittered() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let now = SystemTime::now();
+        let hour = std::time::Duration::from_secs(3600);
+        for _ in 0..3 {
+            record_update_cooldown_at(dir, "0.2.141", "x", now, 0.0);
+        }
+        let early = update_cooldown_remaining_at(dir, "0.2.141", now, true).unwrap();
+        assert!(
+            early <= hour.mul_f64(0.8)
+                && early > hour.mul_f64(0.8) - std::time::Duration::from_secs(2)
+        );
+        record_update_cooldown_at(dir, "0.2.141", "x", now, 1.0);
+        let late = update_cooldown_remaining_at(dir, "0.2.141", now, true).unwrap();
+        assert!(
+            late <= hour.mul_f64(1.2)
+                && late > hour.mul_f64(1.2) - std::time::Duration::from_secs(2)
+        );
+    }
+
+    /// Updater runs that made no download attempt hold the release without
+    /// counting a failure (round-3 review, item 4).
+    #[test]
+    fn a_hold_without_counting_never_advances_the_count() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let now = SystemTime::now();
+        let hour = std::time::Duration::from_secs(3600);
+        // No record: a hold at one failure.
+        assert!(hold_update_without_counting_at(
+            dir, "0.2.141", "skipped", now, 0.5
+        ));
+        let first = read_update_cooldown_at(dir).unwrap();
+        assert_eq!((first.version.as_str(), first.failures), ("0.2.141", 1));
+        assert!(update_cooldown_remaining_at(dir, "0.2.141", now, false).is_some());
+        // A live record is left exactly as it is, however often it is asked.
+        record_update_cooldown_at(dir, "0.2.141", "real", now, 0.5);
+        let live = read_update_cooldown_at(dir).unwrap();
+        for _ in 0..10 {
+            assert!(hold_update_without_counting_at(
+                dir, "0.2.141", "skipped", now, 0.5
+            ));
+        }
+        assert_eq!(read_update_cooldown_at(dir).unwrap(), live);
+        // An expired one gets a fresh wait at the same count.
+        let later = now + hour * 3;
+        assert!(update_cooldown_remaining_at(dir, "0.2.141", later, false).is_none());
+        assert!(hold_update_without_counting_at(
+            dir, "0.2.141", "skipped", later, 0.5
+        ));
+        let renewed = read_update_cooldown_at(dir).unwrap();
+        assert_eq!(renewed.failures, live.failures);
+        assert!(update_cooldown_remaining_at(dir, "0.2.141", later, false).is_some());
+        // A stale staged tag never overwrites a record for a newer release.
+        record_update_cooldown_at(dir, "0.2.150", "newer", now, 0.5);
+        assert!(!hold_update_without_counting_at(
+            dir, "0.2.141", "stale", now, 0.5
+        ));
+        assert_eq!(read_update_cooldown_at(dir).unwrap().version, "0.2.150");
+        // An older release's record is replaced.
+        assert!(hold_update_without_counting_at(
+            dir, "0.2.151", "skipped", now, 0.5
+        ));
+        let replaced = read_update_cooldown_at(dir).unwrap();
+        assert_eq!(
+            (replaced.version.as_str(), replaced.failures),
+            ("0.2.151", 1)
+        );
     }
 
     /// A failure that cannot be recorded must not be reported as recorded:
@@ -2662,6 +2822,23 @@ mod tests {
         assert!(update_cooldown_pending_at(dir, "0.2.141", now, false).is_none());
         let later = now + std::time::Duration::from_secs(2 * 3600);
         assert!(update_cooldown_pending_at(dir, "0.2.140", later, false).is_none());
+    }
+
+    /// B21: a release pinned known-bad is reported as not retried. B22: an
+    /// unparseable version is shown, never silently dropped as superseded.
+    #[test]
+    fn the_summary_handles_pinned_and_unparseable_versions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let now = SystemTime::now();
+        record_update_cooldown_at(dir, "0.2.141", "x", now, 0.5);
+        pin_known_bad_at(dir, "0.2.141").unwrap();
+        let pinned = update_cooldown_summary_at(dir, "0.2.140", now).unwrap();
+        assert!(pinned.contains("will not retry"), "{pinned}");
+        record_update_cooldown_at(dir, "not-a-version", "x", now, 0.5);
+        let odd = update_cooldown_summary_at(dir, "0.2.140", now).unwrap();
+        assert!(odd.contains("not-a-version"), "{odd}");
+        assert!(update_cooldown_summary_at(dir, "garbage", now).is_some());
     }
 
     #[test]
@@ -2770,6 +2947,19 @@ mod tests {
         assert!(!dir.join(UPDATE_COOLDOWN_FILE).exists());
     }
 
+    /// T2: a failed rename (here onto a non-empty directory) also removes
+    /// the uniquely named temp.
+    #[test]
+    fn a_failed_rename_leaves_no_temp_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let target = dir.join(UPDATE_COOLDOWN_FILE);
+        std::fs::create_dir(&target).unwrap();
+        std::fs::write(target.join("occupied"), b"x").unwrap();
+        assert!(atomic_write(&target, b"x").is_err());
+        assert_eq!(temp_files(dir), Vec::<String>::new());
+    }
+
     #[test]
     fn stale_temp_files_of_ours_are_swept_and_nothing_else() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2782,8 +2972,10 @@ mod tests {
         ] {
             std::fs::write(dir.join(name), b"x").unwrap();
         }
-        // Too young: a write may be in progress.
+        // Too young: a write may be in progress, ten minutes in or not.
         sweep_stale_temp_files_at(dir, SystemTime::now());
+        assert_eq!(temp_files(dir).len(), 3);
+        sweep_stale_temp_files_at(dir, SystemTime::now() + std::time::Duration::from_secs(600));
         assert_eq!(temp_files(dir).len(), 3);
         sweep_stale_temp_files_at(dir, SystemTime::now() + STALE_TEMP_AGE);
         let mut left = temp_files(dir);

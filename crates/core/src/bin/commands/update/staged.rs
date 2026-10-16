@@ -334,14 +334,36 @@ fn discard_stale_at(root: &Path, current_version: &str, blocked: impl Fn(&str) -
     }
 }
 
-/// The tag of the release staged in the cache, if a complete one is there (its
-/// manifest is written only after the freenet archive verified). The updater
-/// records a failure against it when it exits before it can learn the tag
-/// itself (#5799), so the node's restart holds rather than exiting again.
-pub(super) fn staged_tag() -> Option<String> {
-    staged_tag_at(&cache_root()?)
+/// Hold the staged release for a cooldown without counting a failure, for an
+/// updater run that gave up before attempting a download (see
+/// `rollback::hold_update_without_counting_at`). Nothing staged, nothing held.
+pub(super) fn hold_staged_release(reason: &str) {
+    if let Some(root) = cache_root() {
+        let rand_unit = freenet::config::GlobalRng::random_range(0.0_f64..1.0);
+        hold_staged_release_at(&root, reason, std::time::SystemTime::now(), rand_unit);
+    }
 }
 
+fn hold_staged_release_at(
+    root: &Path,
+    reason: &str,
+    now: std::time::SystemTime,
+    rand_unit: f64,
+) -> bool {
+    let (Some(tag), Some(state_dir)) = (staged_tag_at(root), root.parent()) else {
+        return false;
+    };
+    super::super::rollback::hold_update_without_counting_at(
+        state_dir,
+        super::super::auto_update::version_from_tag(&tag),
+        reason,
+        now,
+        rand_unit,
+    )
+}
+
+/// The tag of the release staged in the cache under `root`, if a complete one
+/// is there (its manifest is written only after the freenet archive verified).
 fn staged_tag_at(root: &Path) -> Option<String> {
     fs::read_dir(root)
         .ok()?
@@ -449,8 +471,14 @@ pub(crate) async fn stage_latest_release(
 /// if it knew one, so the restart that follows the exit holds instead of
 /// panicking its way through the same exit again.
 fn record_panic(target: UpdateTarget<'_>) {
-    if let (Some(version), Some(root)) = (target.version, cache_root()) {
-        if record_failure(&root, version, "preparing the update panicked").is_none() {
+    if let Some(root) = cache_root() {
+        record_panic_at(&root, target);
+    }
+}
+
+fn record_panic_at(root: &Path, target: UpdateTarget<'_>) {
+    if let Some(version) = target.version {
+        if record_failure(root, version, "preparing the update panicked").is_none() {
             tracing::warn!(
                 version,
                 "Could not record the failure to stage the update (#5799)"
@@ -768,7 +796,17 @@ fn decide_without_staging(
     target: UpdateTarget<'_>,
 ) -> Staging {
     match decide_before_download(root, tag, current_version, target, version_blocked) {
-        Ok(_) => Staging::Skipped,
+        // Recorded before the exit, like a staged one: if the DMG swap or the
+        // updater's own download fails before it records anything, the
+        // restart holds instead of exiting again within a minute. After a
+        // successful swap the record is for this binary's own version, which
+        // nothing consults.
+        Ok(tag) => exit_after_recording(
+            root,
+            super::super::auto_update::version_from_tag(&tag),
+            INSTALL_PENDING,
+            Staging::Skipped,
+        ),
         Err(staging) => staging,
     }
 }
@@ -2563,6 +2601,84 @@ mod tests {
         assert_eq!(staged_tag_at(&root).as_deref(), Some(TAG));
     }
 
+    /// U1/U8: an updater run that gave up before downloading holds the staged
+    /// release without counting; with nothing staged it holds nothing.
+    #[test]
+    fn an_updater_skip_holds_the_staged_release_without_counting() {
+        let (_tmp, root) = test_root();
+        let now = std::time::SystemTime::now();
+        assert!(
+            !hold_staged_release_at(&root, "skipped", now, 0.5),
+            "nothing staged"
+        );
+        assert!(cooldown_record(&root).is_none());
+        write_staged(&root, &[(MANIFEST, b"m")]);
+        for _ in 0..5 {
+            assert!(hold_staged_release_at(&root, "skipped", now, 0.5));
+        }
+        let record = cooldown_record(&root).unwrap();
+        assert_eq!((record.version.as_str(), record.failures), ("9.9.9", 1));
+    }
+
+    /// R7: a contained panic records against the release the trigger knew.
+    #[test]
+    fn a_contained_panic_records_against_the_known_release() {
+        let (_tmp, root) = test_root();
+        record_panic_at(&root, UpdateTarget::default());
+        assert!(
+            cooldown_record(&root).is_none(),
+            "no release known, nothing recorded"
+        );
+        record_panic_at(
+            &root,
+            UpdateTarget {
+                version: Some("9.9.9"),
+                urgent: false,
+            },
+        );
+        let record = cooldown_record(&root).unwrap();
+        assert_eq!(record.version, "9.9.9");
+        assert!(record.last_error.contains("panicked"));
+    }
+
+    /// L2-L6: the two retries wait 5 s and 15 s (±20%), and the entry point
+    /// uses them.
+    #[tokio::test(start_paused = true)]
+    async fn the_tag_lookup_retries_wait_their_schedule() {
+        let started = tokio::time::Instant::now();
+        let mut calls = 0;
+        let result = lookup_with_retries(
+            || {
+                calls += 1;
+                async { anyhow::bail!("down") }
+            },
+            &TAG_LOOKUP_RETRY_DELAYS,
+        )
+        .await;
+        assert!(result.is_err());
+        assert_eq!(calls, 3);
+        let waited = started.elapsed();
+        assert!(
+            waited >= Duration::from_secs(16) && waited <= Duration::from_secs(24),
+            "{waited:?}"
+        );
+        assert_eq!(
+            TAG_LOOKUP_RETRY_DELAYS,
+            [Duration::from_secs(5), Duration::from_secs(15)]
+        );
+        let src = include_str!("staged.rs").replace("\r\n", "\n");
+        let production = src
+            .split_once(concat!("#[cfg(test)]\n", "mod tests {"))
+            .unwrap()
+            .0;
+        let flat: String = production.split_whitespace().collect();
+        assert!(flat.contains(concat!(
+            "lettag=lookup_with_retries(",
+            "||super::super::auto_update::fetch_latest_release_tag(false),",
+            "&TAG_LOOKUP_RETRY_DELAYS,).await;"
+        )));
+    }
+
     /// The fallback threshold is part of the contract with the PR's stated
     /// worst-case delays; changing it is a decision, not a tweak.
     #[test]
@@ -2782,17 +2898,16 @@ mod tests {
     /// keeps failing to download. Platform-independent, so tested here.
     #[test]
     fn an_install_that_stages_nothing_still_honours_the_cooldown() {
-        let (tmp, root) = test_root();
+        let (_tmp, root) = test_root();
         let none = UpdateTarget::default();
         let offline = || Err(anyhow::anyhow!("offline"));
         assert_eq!(
             decide_without_staging(&root, offline(), "9.9.8", none),
             Staging::Deferred
         );
-        assert_eq!(
-            decide_without_staging(&root, Ok(TAG.into()), "9.9.8", none),
-            Staging::Skipped,
-            "nothing cooling down: exit for the updater"
+        assert!(
+            cooldown_record(&root).is_none(),
+            "no release to record against"
         );
         let known = UpdateTarget {
             version: Some("9.9.9"),
@@ -2802,15 +2917,34 @@ mod tests {
             decide_without_staging(&root, offline(), "9.9.8", known),
             Staging::Deferred
         );
-        assert!(
-            cooldown_record(&root).is_some(),
-            "recorded against the known release"
-        );
+        assert_eq!(cooldown_record(&root).map(|r| r.failures), Some(1));
         assert_eq!(
             decide_without_staging(&root, Ok(TAG.into()), "9.9.8", none),
             Staging::CoolingDown
         );
-        let _ = tmp;
+    }
+
+    /// Round-3 review, item 2: the bundle's exit for the updater records
+    /// first, so a DMG swap or download that fails before the updater records
+    /// anything leaves the restart holding instead of exiting within a minute.
+    #[test]
+    fn an_install_that_stages_nothing_records_before_its_exit() {
+        let (_tmp, root) = test_root();
+        assert_eq!(
+            decide_without_staging(&root, Ok(TAG.into()), "9.9.8", UpdateTarget::default()),
+            Staging::Skipped,
+            "nothing cooling down: exit for the updater"
+        );
+        let record = cooldown_record(&root).expect("recorded before the exit");
+        assert_eq!(
+            (record.version.as_str(), record.last_error.as_str()),
+            ("9.9.9", INSTALL_PENDING)
+        );
+        assert_eq!(
+            decide_without_staging(&root, Ok(TAG.into()), "9.9.8", UpdateTarget::default()),
+            Staging::CoolingDown,
+            "the restart holds"
+        );
     }
 
     #[tokio::test]

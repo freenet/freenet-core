@@ -598,12 +598,13 @@ async fn run_network_node_with_signals(
                 "Holding auto-update until the release can be tried again (#5799)"
             );
             let rand_unit = freenet::config::GlobalRng::random_range(0.0_f64..1.0);
-            let jitter = commands::auto_update::HOLD_REPOLL_JITTER.mul_f64(rand_unit);
+            let jitter = commands::auto_update::hold_repoll_jitter(rand_unit);
             hold.hold(version, retry_in, SystemTime::now(), jitter);
             *next_repoll = repoll_after_hold(*next_repoll, Instant::now(), retry_in, jitter);
         }
 
-        let startup_attempt = commands::auto_update::claim_update_attempt();
+        // At the urgency the startup decision below uses (#5799).
+        let startup_attempt = commands::auto_update::claim_update_attempt_at_urgency(false);
         if let Err(reason) = &startup_attempt {
             tracing::warn!(
                 reason = %reason,
@@ -3169,7 +3170,7 @@ mod tests {
             .find("std::future::pending::<()>().await;")
             .expect("auto-update-disabled branch not found");
         let startup_check = production
-            .find("let startup_attempt = commands::auto_update::claim_update_attempt();")
+            .find("let startup_attempt = commands::auto_update::claim_update_attempt_at_urgency(false);")
             .expect("startup update check not found");
         assert!(
             disabled_return < cleanup && cleanup < startup_check,
