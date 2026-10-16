@@ -4359,21 +4359,22 @@ async fn put_and_await(
 /// instead of passing quietly — a vacuous pass is the outcome to design
 /// against, because it reports success while checking less.
 ///
-/// **`salt`: a test that SUBSCRIBES a delegate must pass a non-empty one.**
-/// It is prefixed to every attempt's contract parameters so the test owns its
-/// instance. Delegate subscriptions are a process-global registry keyed by
-/// contract instance id and shared by every node in the test binary, so a
-/// subscription on the common empty-params instance would push
-/// `ContractNotificationReceived` onto other tests' delegate sockets under plain
-/// `cargo test` (nextest's process-per-test hides it). A test that never
-/// subscribes passes `&[]`, which keeps its parameters byte-identical to the
-/// unsalted form. Enforced by `subscribing_tests_use_a_salted_contract_instance`.
+/// **`tag`: a required, non-empty name that gives each caller its own contract
+/// instance.** It is used as the contract parameters (plus a counter byte on
+/// retries), so no two callers can share an instance. That matters because
+/// delegate subscriptions are a process-global registry keyed by contract
+/// instance id and shared by every node in the test binary: a subscription on an
+/// instance another test also uses would push `ContractNotificationReceived`
+/// onto that test's delegate socket under plain `cargo test` (nextest's
+/// process-per-test hides it). Pass a tag unique to the calling test. A test that
+/// subscribes leaves the subscription on its instance for the life of the
+/// process, so nothing in this binary may update that instance.
 async fn a_node_without_the_contract(
     ctx: &mut TestContext,
     contract_name: &str,
     state: WrappedState,
     candidates: &[&str],
-    salt: &[u8],
+    tag: &'static str,
 ) -> anyhow::Result<(WebApi, ContractContainer)> {
     // RETRY WITH A FRESH KEY rather than failing on the first unlucky placement
     // (#5542 F6). The precondition this helper establishes is not under the
@@ -4387,13 +4388,15 @@ async fn a_node_without_the_contract(
     // candidate on all four independent keys is not, so a failure after that is
     // signal rather than luck.
     //
-    // WITH AN EMPTY SALT, ATTEMPT 0 USES EMPTY PARAMETERS, byte-identical to what this test did
-    // before, so the path CI has already exercised is unchanged and the retry
-    // only runs in the case that previously failed outright.
+    // Attempt 0 uses the bare tag as parameters; later attempts append a counter byte.
+    assert!(
+        !tag.is_empty(),
+        "tag must be non-empty and unique per calling test"
+    );
     const MAX_PLACEMENT_ATTEMPTS: u8 = 4;
     let mut placement = Vec::new();
     for attempt in 0..MAX_PLACEMENT_ATTEMPTS {
-        let mut raw = salt.to_vec();
+        let mut raw = tag.as_bytes().to_vec();
         if attempt != 0 {
             raw.push(attempt);
         }
@@ -4477,7 +4480,7 @@ async fn test_delegate_get_reaches_the_network_for_an_unseen_contract(
         TEST_CONTRACT,
         state,
         &["node-b", "node-c", "node-d"],
-        &[],
+        "delegate-get-unseen-contract",
     )
     .await?;
     let contract_id = *contract.key().id();
@@ -4559,7 +4562,7 @@ async fn test_delegate_subscribe_reaches_the_network_for_an_unseen_contract(
     // The helper chooses the instance, because it may need several to find a
     // node that does not hold one (#5542 F6).
     //
-    // This test leaves a delegate subscription on the SALTED instance for the
+    // This test leaves a delegate subscription on its OWN instance for the
     // life of the process (the registry is never cleared), so nothing in this
     // binary may update that instance.
     let (mut client, contract) = a_node_without_the_contract(
@@ -4567,7 +4570,7 @@ async fn test_delegate_subscribe_reaches_the_network_for_an_unseen_contract(
         TEST_CONTRACT,
         state,
         &["node-b", "node-c", "node-d"],
-        b"delegate-subscribe-isolated",
+        "delegate-subscribe-unseen-contract",
     )
     .await?;
     let contract_id = *contract.key().id();
@@ -5309,49 +5312,4 @@ async fn test_update_contract_by_instance_id_4978(ctx: &mut TestContext) -> Test
     );
 
     Ok(())
-}
-
-/// Pin: every test fn here that issues a delegate `SubscribeContract` must obtain
-/// its contract from `a_node_without_the_contract` with a non-empty salt (see that
-/// helper's docs for why). Source scrape, in the repo's style. Fails closed: it
-/// must find at least one subscribing test, so a rename of the needle or of the
-/// helper cannot make it vacuous.
-#[test]
-fn subscribing_tests_use_a_salted_contract_instance() {
-    const SRC: &str = include_str!("operations.rs");
-    // Built at runtime so this fn's own source does not contain the needle.
-    let needle = ["DelegateCommand::", "SubscribeContract {"].concat();
-    let helper_call = "a_node_without_the_contract(";
-
-    let mut checked = 0;
-    // Split into fn-level chunks at top-level `fn` / `async fn` items.
-    let mut starts: Vec<usize> = SRC
-        .match_indices("\nasync fn ")
-        .chain(SRC.match_indices("\nfn "))
-        .map(|(i, _)| i)
-        .collect();
-    starts.sort_unstable();
-    starts.push(SRC.len());
-    for w in starts.windows(2) {
-        let body = &SRC[w[0]..w[1]];
-        if !body.contains(&needle) {
-            continue;
-        }
-        let name = body.trim_start().lines().next().unwrap_or("");
-        let call_at = body.find(helper_call).unwrap_or_else(|| {
-            panic!("{name}: subscribes a delegate but does not use {helper_call}")
-        });
-        let call = &body[call_at..];
-        let call = &call[..call.find(".await").expect("helper call is awaited")];
-        assert!(
-            call.contains("b\"") && !call.contains("&[]"),
-            "{name}: delegate subscriptions are process-global; pass a non-empty salt \
-             to {helper_call} so the subscribed instance is not shared with other tests"
-        );
-        checked += 1;
-    }
-    assert!(
-        checked >= 1,
-        "found no test that subscribes a delegate; the scrape is stale, not the rule satisfied"
-    );
 }
