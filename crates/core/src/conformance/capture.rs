@@ -2357,18 +2357,28 @@ mod probe_wiring_pins {
         })
     }
 
-    /// Every observed merge must reach focus weighting, BEFORE the scope filter.
+    /// Every observed merge must reach focus weighting, BEFORE the scope filter, and
+    /// unconditionally.
     ///
-    /// `record` discards out-of-focus observations, so counting after it (or inside
-    /// it, behind the scope check) would only ever count contracts that are already
-    /// focused, and weighting would favour nothing new: #5913 reinstated with every
-    /// test of the weighting itself still green. Nothing calls `run_writer`, so only a
-    /// pin can see the order.
+    /// `record_with_outcome` discards out-of-focus observations, so counting after it,
+    /// or behind any condition on scope, would only count contracts already in focus
+    /// and weighting would favour nothing new: #5913 reinstated with every test of
+    /// the weighting itself still green. Nothing calls `run_writer`, so only a pin
+    /// can see this.
+    ///
+    /// Order alone is not enough, as review demonstrated: wrapping the call in a
+    /// multi-line `if scope.admits(..) {` kept it at statement position and before
+    /// `record_with_outcome`, and the first version of this pin passed. So it also
+    /// requires (a) the call at the SAME brace depth as the transition arm's `let`
+    /// and the `record_with_outcome` call, and (b) nothing between the end of the
+    /// `let observation = match msg { .. };` statement and the call except the
+    /// `counts_as_activity` binding, so no `if`, `match`, `continue` or early return
+    /// can sit in front of it either.
     #[test]
     fn every_observed_merge_is_counted_before_the_scope_filter() {
         let body = run_writer_code_only();
-        let transition = body
-            .find("CaptureMsg::Transition(observation) => *observation")
+        let arm = body
+            .find("let observation = match msg {")
             .expect("run_writer no longer unpacks transitions this way; re-anchor");
         let counted = statement_at(
             &body,
@@ -2376,7 +2386,7 @@ mod probe_wiring_pins {
         )
         .expect(
             "run_writer no longer feeds observed merges to focus weighting, so focus \
-             falls back to a uniform draw over a mostly-cold hosted set (#5913)",
+                 falls back to a uniform draw over a mostly-cold hosted set (#5913)",
         );
         let filtered = statement_at(
             &body,
@@ -2384,10 +2394,62 @@ mod probe_wiring_pins {
         )
         .expect("run_writer no longer records observations this way; re-anchor");
         assert!(
-            transition < counted && counted < filtered,
-            "merge activity is counted outside the transition path or after `record` \
-             filters by scope, so out-of-focus merges never reach the weighting"
+            arm < counted && counted < filtered,
+            "merge activity is counted outside the transition path or after the scope \
+             filter, so out-of-focus merges never reach the weighting"
         );
+
+        let depth_between = |from: usize, to: usize| -> i64 {
+            body[from..to]
+                .chars()
+                .map(|c| match c {
+                    '{' => 1,
+                    '}' => -1,
+                    _ => 0,
+                })
+                .sum()
+        };
+        assert_eq!(
+            depth_between(arm, counted),
+            0,
+            "the merge count is nested inside a block the transition arm is not, so a \
+             condition (a scope check most plausibly) decides whether it runs"
+        );
+        assert_eq!(
+            depth_between(counted, filtered),
+            0,
+            "the scope filter moved into a block"
+        );
+
+        // The `let observation = match msg { .. };` statement's own extent.
+        let open = arm + body[arm..].find('{').expect("match has a body");
+        let mut depth = 0i64;
+        let mut close = None;
+        for (offset, ch) in body[open..].char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        close = Some(open + offset);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let close = close.expect("the transition match is not brace-balanced");
+        let between = body[close + 1..counted].trim_start_matches(';');
+        for line in between.lines() {
+            let line = line.trim();
+            assert!(
+                line.is_empty()
+                    || line
+                        == "let meaningful = counts_as_activity(&observation, activity_max_state_bytes);",
+                "`{line}` sits between unpacking a transition and counting it; nothing \
+                 may decide whether a merge is counted except `counts_as_activity`"
+            );
+        }
     }
 
     /// A completed probe's verdicts must reach the focus period, or every period
