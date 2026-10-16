@@ -2072,6 +2072,13 @@ pub fn jittered_repoll_interval(base: Duration, jitter_fraction: f64, rand_unit:
 /// the stagger trigger relies on; it does not stop a peer that reconnects to
 /// report twice, which then costs at most that hourly cadence (the cadence
 /// before #5799 was every ~20 minutes).
+///
+/// A deliberate consequence: a node with no connections, including one that
+/// just restarted and has none yet, retries hourly. An isolated node gains
+/// nothing from staying on its binary, so once a release has failed three
+/// times it exits for the updater about hourly while its downloads keep
+/// failing. The startup check itself passes `urgent = false` (no node has
+/// connections before it starts), and the loop re-derives urgency every tick.
 pub fn node_is_urgent(current_version: &str) -> bool {
     urgency_from(
         get_open_connection_count(),
@@ -2979,8 +2986,9 @@ mod tests {
 
     /// #5799: a newer release that is cooling down after failed downloads is
     /// reported as `CoolingDown`, not `UpdateAvailable`, so no peer-signal
-    /// trigger exits for it, and the backoff GROWS rather than resetting so
-    /// the signal is not re-checked every minute meanwhile.
+    /// trigger exits for it. The backoff is left alone, neither grown (that
+    /// walked a node into the max-backoff exit-42 fallback) nor reset; the
+    /// caller's hold keeps the signal from being re-checked meanwhile.
     #[test]
     fn peer_signal_check_reports_a_cooling_down_release_before_confirming_it() {
         // CRLF-normalised for a Windows checkout, so the `\n` anchors match.

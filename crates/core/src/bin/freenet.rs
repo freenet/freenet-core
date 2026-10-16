@@ -473,8 +473,10 @@ async fn run_network_node_with_signals(
 
     // Monitor for version mismatches and check for updates (#3204).
     //
-    // Four update triggers (checked each 60s tick):
-    //   1. Urgent update: remote's min_compatible > our version → verify with GitHub, exit immediately
+    // A startup check, then four update triggers (checked each 60s tick), plus
+    // two fallbacks that exit without knowing a version (isolated >6h with a
+    // mismatch; max backoff with 0 connections):
+    //   1. Urgent update: remote's min_compatible > our version → verify with GitHub, prepare
     //   2. Decentralized discovery: highest_seen_version > our version → start stagger timer,
     //      verify with GitHub when timer expires
     //   3. Legacy mismatch: existing backoff-based mechanism (fallback)
@@ -486,6 +488,11 @@ async fn run_network_node_with_signals(
     //
     // GitHub verification before exit-42 is always required — decentralized discovery
     // tells us *when* to check, GitHub confirms *what* to install.
+    //
+    // Every trigger prepares the update first (#5790) and exits only when that
+    // says to (#5799): when GitHub cannot be reached for the release the node
+    // stays on its current binary, and an `UpdateHold` keeps all of the
+    // triggers above quiet until the release's cooldown ends.
     //
     // Disabled for dirty builds — `freenet update` replaces the binary with a
     // prebuilt release, which would discard local modifications (#3245)
