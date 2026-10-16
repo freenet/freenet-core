@@ -3301,10 +3301,13 @@ mod tests {
             );
         }
         // The stagger's arm also drops its expired deadline (urgent, stagger,
-        // mismatch is the order of the arms).
+        // mismatch is the order of the arms). Bounded like the bodies above:
+        // an unbounded arm runs on to the stagger's other arms, which reset it
+        // too.
+        let stagger = &arms[1][..arms[1].find("UpdateCheckResult::").unwrap_or(arms[1].len())];
         assert!(
-            arms[1].contains("stagger_deadline = None;"),
-            "the stagger's CoolingDown arm must drop the expired deadline"
+            stagger.contains("stagger_deadline = None;"),
+            "the stagger's CoolingDown arm must drop the expired deadline: {stagger}"
         );
     }
 
@@ -3355,6 +3358,13 @@ mod tests {
             (
                 "hold.hold(version,retry_in,SystemTime::now(),jitter);",
                 "the hold itself, with the stay's version and duration",
+            ),
+            (
+                concat!(
+                    "letrand_unit=freenet::config::GlobalRng::random_range(0.0_f64..1.0);",
+                    "letjitter=commands::auto_update::hold_repoll_jitter(rand_unit);"
+                ),
+                "the hold's re-poll jitter, drawn per hold",
             ),
             (
                 concat!(
