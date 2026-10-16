@@ -4378,8 +4378,9 @@ echo "RC=$?"
     }
 
     /// #5799: `freenet update`'s output reaches the wrapper log. It used to go
-    /// to null, so a failed auto-update left no reason in the wrapper log or
-    /// in `freenet service report`. Runs a real child on every platform,
+    /// to null, so a failed auto-update left no reason in the wrapper log (and
+    /// `freenet service report`, which now carries that log's end). Runs a
+    /// real child on every platform,
     /// including the Windows job, which is where the wrapper runs.
     #[test]
     fn update_output_is_appended_to_the_wrapper_log() {

@@ -3177,6 +3177,13 @@ mod tests {
             "discard_stale_staged must run after the auto-update-disabled return and \
              before the startup check"
         );
+        let sweep = production
+            .find("commands::rollback::sweep_stale_temp_files();")
+            .expect("the update task must sweep stale state-file temporaries (#5799)");
+        assert!(
+            disabled_return < sweep && sweep < startup_check,
+            "the temp sweep must run once auto-update is known to be on, before the startup check"
+        );
         assert_eq!(
             all_sends, sends,
             "every send on update_tx must use the checked `let _ =` trigger form"
@@ -3288,7 +3295,17 @@ mod tests {
                 body.contains("hold_after_stay("),
                 "CoolingDown arm #{i} must hold the triggers"
             );
+            assert!(
+                !body.contains("clear_"),
+                "CoolingDown arm #{i} must keep its signal: {body}"
+            );
         }
+        // The stagger's arm also drops its expired deadline (urgent, stagger,
+        // mismatch is the order of the arms).
+        assert!(
+            arms[1].contains("stagger_deadline = None;"),
+            "the stagger's CoolingDown arm must drop the expired deadline"
+        );
     }
 
     /// #5799 review A, B, E, K: every trigger is gated by the hold, so after a

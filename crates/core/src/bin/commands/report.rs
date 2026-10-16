@@ -31,6 +31,8 @@ const LOG_RETENTION_MINUTES: i64 = 30;
 /// Maximum size of each log stream in the report (2 MB for the main log and
 /// 2 MB for the error log)
 const MAX_TOTAL_LOG_SIZE: usize = 2 * 1024 * 1024;
+/// How much of the service wrapper's log a report carries, from its end.
+const MAX_WRAPPER_LOG_SIZE: usize = 64 * 1024;
 /// Maximum length for a single log line (10 KB) - longer lines are truncated
 const MAX_LINE_LENGTH: usize = 10 * 1024;
 /// Default WebSocket API port
@@ -128,6 +130,12 @@ pub struct LogContents {
     /// Original size of the error log file on disk
     #[serde(default)]
     pub error_log_original_size_bytes: u64,
+    /// The end of the service wrapper's log (Windows, and the macOS tray
+    /// path), which holds `freenet update`'s output, so a failed auto-update
+    /// shows why (#5799). Its lines carry no date, so it is cut by size
+    /// rather than by the time window the node's logs use.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wrapper_log: Option<String>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -239,6 +247,7 @@ impl ReportCommand {
             error_log_size_bytes: error_log_size,
             main_log_original_size_bytes: main_log_original_size,
             error_log_original_size_bytes: error_log_original_size,
+            wrapper_log: read_wrapper_log_tail(&log_dir, MAX_WRAPPER_LOG_SIZE),
         })
     }
 
@@ -365,6 +374,12 @@ impl ReportCommand {
             );
         } else {
             println!("  - Logs: {}", format_bytes(original_size));
+        }
+        if let Some(wrapper) = &report.logs.wrapper_log {
+            println!(
+                "  - Service wrapper log: {}",
+                format_bytes(wrapper.len() as u64)
+            );
         }
 
         println!(
@@ -600,6 +615,23 @@ fn find_log_files(log_dir: &PathBuf, prefix: &str) -> Vec<PathBuf> {
     });
 
     files
+}
+
+/// The last `max_bytes` of the newest service wrapper log
+/// (`freenet-wrapper.YYYY-MM-DD.log`), starting at a line boundary, or `None`
+/// when there is none.
+fn read_wrapper_log_tail(log_dir: &PathBuf, max_bytes: usize) -> Option<String> {
+    let newest = find_log_files(log_dir, "freenet-wrapper")
+        .into_iter()
+        .next()?;
+    let bytes = fs::read(newest).ok()?;
+    let start = bytes.len().saturating_sub(max_bytes);
+    let tail = &bytes[start..];
+    let tail = match (start > 0, tail.iter().position(|&b| b == b'\n')) {
+        (true, Some(newline)) => &tail[newline + 1..],
+        _ => tail,
+    };
+    (!tail.is_empty()).then(|| String::from_utf8_lossy(tail).into_owned())
 }
 
 /// Read and merge multiple log files, filtering to the last 30 minutes.
@@ -1020,6 +1052,7 @@ mod tests {
                 error_log_size_bytes: 0,
                 main_log_original_size_bytes: 0,
                 error_log_original_size_bytes: 0,
+                wrapper_log: None,
             },
             config: None,
             network_status: None,
@@ -1371,6 +1404,7 @@ mod tests {
                 error_log_size_bytes: 0,
                 main_log_original_size_bytes: 100,
                 error_log_original_size_bytes: 0,
+                wrapper_log: None,
             },
             config: None,
             network_status: None,
@@ -1879,6 +1913,41 @@ stack backtrace:
         );
     }
 
+    /// Round-3 review, item 5: the Windows wrapper writes `freenet update`'s
+    /// output to `freenet-wrapper.YYYY-MM-DD.log`, which the node-log pattern
+    /// never matched. The report carries the newest one's end, cut at a line.
+    #[test]
+    fn the_report_carries_the_end_of_the_wrapper_log() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
+        assert_eq!(read_wrapper_log_tail(&dir, 64), None);
+        fs::write(dir.join("freenet.2026-10-15.log"), "node line\n").unwrap();
+        assert_eq!(read_wrapper_log_tail(&dir, 64), None, "not a wrapper log");
+        let mut log = String::new();
+        for i in 0..20 {
+            log.push_str(&format!("12:00:{i:02}: line {i}\n"));
+        }
+        log.push_str("Freenet update to 0.2.141 failed: connection reset\n");
+        fs::write(dir.join("freenet-wrapper.2026-10-15.log"), &log).unwrap();
+        let tail = read_wrapper_log_tail(&dir, 80).unwrap();
+        assert!(tail.ends_with("connection reset\n"), "{tail}");
+        assert!(tail.len() <= 80);
+        assert!(
+            tail.starts_with("12:") || tail.starts_with("Freenet"),
+            "starts at a line: {tail}"
+        );
+        let whole = read_wrapper_log_tail(&dir, 64 * 1024).unwrap();
+        assert_eq!(whole, log);
+        let report = ReportCommand {
+            local: None,
+            message: None,
+            no_message: true,
+            server: String::new(),
+        };
+        let logs = report.collect_logs(Some(dir)).unwrap();
+        assert!(logs.wrapper_log.unwrap().contains("connection reset"));
+    }
+
     /// #5799: the report carries why auto-update is holding off, taken from
     /// the cooldown record for this binary's version, omitted when there is
     /// none, and printed in the summary.
@@ -1935,6 +2004,7 @@ stack backtrace:
                 error_log_size_bytes: 0,
                 main_log_original_size_bytes: 0,
                 error_log_original_size_bytes: 0,
+                wrapper_log: None,
             },
             config: None,
             network_status: None,

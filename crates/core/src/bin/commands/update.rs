@@ -2610,10 +2610,13 @@ fn ensure_service_file_updated(binary_path: &Path, quiet: bool) -> Result<()> {
         // helpers race the bootout; `kickstart` does not re-read the
         // plist.) The new plist therefore takes effect at the next
         // user-driven reload or reboot. The wrapper-script rewrite
-        // (issue #4251) DOES take effect at the next wrapper iteration
-        // — that's where the dominant unbounded freenet.log growth was
-        // coming from. Once the OS reads the new plist, the smaller
-        // launchd-captured stdout/stderr also stops accumulating.
+        // (issue #4251) takes effect when the wrapper process next starts,
+        // not at its next loop iteration: bash has already parsed the
+        // running `while` loop. It is also written by the binary doing the
+        // updating, so a change to the script template (such as #5799's
+        // `run_update`) reaches a node one release after it ships. Once the
+        // OS reads the new plist, the smaller launchd-captured
+        // stdout/stderr also stops accumulating.
         if !quiet {
             println!(
                 "launchd plist updated. To apply immediately without rebooting, run:\n  \

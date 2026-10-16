@@ -1303,7 +1303,12 @@ pub(crate) fn update_cooldown_summary_at(
     } else {
         match update_cooldown_remaining_at(dir, &state.version, now, false) {
             Some(remaining) => {
-                format!("next attempt in {} min", remaining.as_secs().div_ceil(60))
+                // "Within": a node with nothing to gain from waiting retries
+                // sooner (see `update_cooldown_remaining_at`).
+                format!(
+                    "next attempt within {} min",
+                    remaining.as_secs().div_ceil(60)
+                )
             }
             None => "cooldown over, the next update check may try again".to_string(),
         }
@@ -2852,7 +2857,7 @@ mod tests {
         let summary = update_cooldown_summary_at(dir, "0.2.140", now).unwrap();
         assert!(summary.contains("0.2.141"), "{summary}");
         assert!(summary.contains("1 time(s)"), "{summary}");
-        assert!(summary.contains("next attempt in 60 min"), "{summary}");
+        assert!(summary.contains("next attempt within 60 min"), "{summary}");
         assert!(summary.contains("error sending request"), "{summary}");
         // The stored error is bounded.
         assert_eq!(
