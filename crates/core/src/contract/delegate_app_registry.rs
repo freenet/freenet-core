@@ -34,26 +34,49 @@
 //! # Lifetime: a registration lives exactly as long as its connection
 //!
 //! A registration is removed when its connection goes away, never because it
-//! has been idle. Clean disconnects ([`remove_client`], which each exit path
-//! of the WebSocket connection task triggers) and delegate unregistration
+//! has been idle. Clean disconnects ([`remove_client`], which every exit of the
+//! WebSocket connection task's main loop triggers) and delegate unregistration
 //! ([`remove_delegate`]) purge eagerly. The backstop for a connection that ended
-//! without that event is the channel itself: the receiving end lives in the
-//! connection task, so once the task is gone the sender reports closed, and
-//! [`sweep_closed`] and [`route_to_apps`] prune it.
+//! without that event (a cancelled or panicked task) is the channel itself: the
+//! receiving end lives in the connection task's listener map, so once the task
+//! is gone the sender reports closed, and [`sweep_closed`] and [`route_to_apps`]
+//! prune it. `websocket::tests::client_disconnect_drops_listeners_and_notifies_the_node`
+//! pins that the task drops those receivers when the client goes away.
 //!
-//! This is not an unbounded GC exemption (AGENTS.md): nothing here outlives the
-//! connection that owns it, and the connection's own liveness is enforced
-//! below this module. The WebSocket task pings every 30 s, so a peer that
-//! vanished without closing leaves unacknowledged data in flight, the TCP
-//! retransmission timeout errors the socket, and the task exits.
+//! This deliberately departs from the literal AGENTS.md rule that cleanup be
+//! bounded by a TTL or an absolute age. The bound is the connection's lifetime,
+//! and that lifetime is NOT bounded in time by anything in the node:
 //!
-//! An earlier revision instead expired a registration 30 minutes after the
-//! app's last `ApplicationMessages` request. That evicted exactly the
-//! legitimate case, an app that registers once and then only listens, which
-//! silently stopped receiving pushes while still connected. It bounded nothing
-//! an abuser cares about either: re-sending one request restamped the TTL.
-//! Off-host connections held open are bounded by [`LOCAL_RESERVED_SLOTS`] and
-//! the caps, not by age.
+//!  * A peer that vanished without closing is cut off by the kernel. The
+//!    connection task pings every 30 s, the ping goes unacknowledged, and the
+//!    TCP retransmission timeout (about 15 minutes on Linux defaults) errors the
+//!    socket. Behind a reverse proxy the node's TCP peer is the proxy, so this
+//!    depends on the proxy tearing down its upstream.
+//!  * A peer whose TCP stack stays up keeps its connection for as long as it
+//!    likes, even if it never reads: there is no WebSocket pong or idle
+//!    deadline, and a ping send into a full socket buffer waits indefinitely.
+//!
+//! That is acceptable because the registration is not what such a peer holds
+//! open. Its connection, task, socket buffers and contract subscriptions live
+//! exactly as long, with or without this registry, and a registration adds one
+//! sender clone within the caps below. What the registry must never do is
+//! outlive its connection, and it does not.
+//!
+//! An earlier revision expired a registration 30 minutes after the app's last
+//! `ApplicationMessages` request. That evicted exactly the legitimate case, an
+//! app that registers once and then only listens, which silently stopped
+//! receiving pushes while still connected. It bounded nothing an abuser cares
+//! about either: re-sending one request restamped the TTL. Off-host connections
+//! held open are bounded by [`LOCAL_RESERVED_SLOTS`] and the caps, not by age.
+//!
+//! One consequence is a real trade-off rather than a free win: a slot in
+//! [`MAX_APPS_PER_DELEGATE`] or [`MAX_DELEGATES_PER_CLIENT`] is now held for
+//! the life of the connection rather than for 30 minutes after its last
+//! request, and both caps refuse newcomers. Behind a colocated reverse proxy
+//! every client is `Local` (see `ConnectionScope::from_source_ip`), so the
+//! 129th concurrent connection to one delegate is refused until one of the 128
+//! disconnects. Under the TTL it could register only by silently cutting an
+//! idle incumbent off, which is the bug this replaced.
 
 use std::sync::LazyLock;
 
@@ -131,6 +154,11 @@ struct AppRegistration {
     /// once-per-registration rather than once-per-notification. See
     /// [`route_to_apps`].
     withhold_logged: bool,
+    /// Whether this registration has already reported a full channel since its
+    /// last successful delivery. Read and set ONLY through
+    /// [`AppRegistration::latch_full_report`] and cleared on delivery. See
+    /// [`route_to_apps`].
+    full_logged: bool,
     sender: mpsc::Sender<HostResult>,
 }
 
@@ -150,6 +178,17 @@ impl AppRegistration {
             return false;
         }
         self.withhold_logged = true;
+        true
+    }
+
+    /// Claim the right to report this registration's channel as full: `true`
+    /// once, then `false` until a delivery succeeds and clears the flag. A
+    /// method for the same reason as [`Self::latch_withhold_report`].
+    fn latch_full_report(&mut self) -> bool {
+        if self.full_logged {
+            return false;
+        }
+        self.full_logged = true;
         true
     }
 }
@@ -239,6 +278,7 @@ pub(crate) fn register_app(
         client_id,
         identity,
         withhold_logged: false,
+        full_logged: false,
         sender,
     });
     *count += 1;
@@ -328,15 +368,24 @@ pub(crate) fn route_to_apps(delegate_key: &DelegateKey, message: HostResult) -> 
         }
         match app.sender.try_send(message.clone()) {
             Ok(()) => {
+                app.full_logged = false;
                 delivered += 1;
                 true
             }
             Err(mpsc::error::TrySendError::Full(_)) => {
-                tracing::warn!(
-                    delegate = %delegate_key,
-                    client_id = %app.client_id,
-                    "App notification channel full — delegate ApplicationMessage dropped"
-                );
+                // Once per stall, not once per message. A connection that is
+                // alive but not reading keeps its registration for as long as
+                // it stays connected (module docs), and this fan-out runs per
+                // contract-state change, so a per-message line would repeat for
+                // that whole time.
+                if app.latch_full_report() {
+                    tracing::warn!(
+                        delegate = %delegate_key,
+                        client_id = %app.client_id,
+                        "App notification channel full — delegate ApplicationMessages \
+                         dropped until the app drains it. Logged once per stall."
+                    );
+                }
                 true
             }
             Err(mpsc::error::TrySendError::Closed(_)) => {
@@ -494,8 +543,12 @@ mod tests {
     async fn per_delegate_cap_rejects_excess_apps() {
         let ns = Namespace::new();
         let dk = ns.key(0);
+        // Receivers held for the whole test: a closed registration is fair game
+        // for any concurrent test's `sweep_closed`, which would free a slot.
+        let mut keepalive = Vec::new();
         for i in 0..MAX_APPS_PER_DELEGATE {
-            let (tx, _rx) = mpsc::channel::<HostResult>(1);
+            let (tx, rx) = mpsc::channel::<HostResult>(1);
+            keepalive.push(rx);
             assert!(register_app(&dk, ns.client(i), AppIdentity::Local, tx));
         }
         let (tx, _rx) = mpsc::channel::<HostResult>(1);
@@ -515,8 +568,11 @@ mod tests {
     async fn per_client_cap_rejects_excess_delegates() {
         let ns = Namespace::new();
         let client = ns.client(0);
+        // Held for the whole test, as in `per_delegate_cap_rejects_excess_apps`.
+        let mut keepalive = Vec::new();
         for i in 0..MAX_DELEGATES_PER_CLIENT {
-            let (tx, _rx) = mpsc::channel::<HostResult>(1);
+            let (tx, rx) = mpsc::channel::<HostResult>(1);
+            keepalive.push(rx);
             assert!(register_app(&ns.key(i), client, AppIdentity::Local, tx));
         }
         let (tx, _rx) = mpsc::channel::<HostResult>(1);
@@ -566,29 +622,51 @@ mod tests {
     }
 
     /// A registration whose connection ended without a clean disconnect is
-    /// reaped by the sweep alone. Observed through `registration_count`, not
-    /// `route_to_apps`, because routing prunes closed channels itself and would
-    /// pass with the sweep deleted.
+    /// reaped by the sweep alone, and a live one beside it on the same delegate
+    /// is untouched. Observed through `registration_count`, not `route_to_apps`,
+    /// because routing prunes closed channels itself and would pass with the
+    /// sweep deleted.
     #[tokio::test(start_paused = true)]
     #[serial_test::serial]
     async fn sweep_prunes_closed_registration() {
         let ns = Namespace::new();
         let dk = ns.key(0);
-        let (tx, rx) = mpsc::channel::<HostResult>(1);
-        assert!(register_app(&dk, ns.client(0), AppIdentity::Local, tx));
-        drop(rx);
+        let (dead_tx, dead_rx) = mpsc::channel::<HostResult>(1);
+        let (live_tx, mut live_rx) = mpsc::channel::<HostResult>(1);
+        assert!(register_app(&dk, ns.client(0), AppIdentity::Local, dead_tx));
+        assert!(register_app(&dk, ns.client(1), AppIdentity::Local, live_tx));
+        drop(dead_rx);
 
         sweep_closed();
         assert_eq!(
             registration_count(&dk),
-            0,
-            "a closed registration must be swept"
+            1,
+            "exactly the closed registration must be swept"
         );
         assert!(
             CLIENT_REGISTRATION_COUNTS
                 .get(&ns.client(0))
                 .is_none_or(|c| *c == 0),
-            "sweeping must release the client's registration count"
+            "sweeping must release the dead client's registration count"
+        );
+        assert_eq!(
+            CLIENT_REGISTRATION_COUNTS.get(&ns.client(1)).map(|c| *c),
+            Some(1),
+            "the live client's count must be untouched"
+        );
+        assert_eq!(route_to_apps(&dk, host_msg()), 1);
+        assert!(
+            live_rx.try_recv().is_ok(),
+            "the survivor must still deliver"
+        );
+
+        // Once the last registration goes, the delegate's entry goes with it,
+        // or the map keeps one empty `Vec` per delegate ever registered.
+        drop(live_rx);
+        sweep_closed();
+        assert!(
+            DELEGATE_APPS.get(&dk).is_none(),
+            "an emptied delegate entry must be removed"
         );
     }
 
@@ -602,10 +680,20 @@ mod tests {
         let dk = ns.key(0);
         let (tx, mut rx) = mpsc::channel::<HostResult>(4);
         assert!(register_app(&dk, ns.client(0), AppIdentity::Local, tx));
+        // An off-host registration lives by the same rule: it is never a
+        // delivery target, but it is not reaped while connected either.
+        let (remote_tx, _remote_rx) = mpsc::channel::<HostResult>(4);
+        assert!(register_app(
+            &dk,
+            ns.client(1),
+            AppIdentity::Remote,
+            remote_tx
+        ));
 
-        // A day with no further `ApplicationMessages`: the app only listens.
+        // A day with no further `ApplicationMessages`: the apps only listen.
         tokio::time::advance(std::time::Duration::from_secs(24 * 60 * 60)).await;
         sweep_closed();
+        assert_eq!(registration_count(&dk), 2);
         assert_eq!(
             route_to_apps(&dk, host_msg()),
             1,
@@ -843,6 +931,43 @@ mod tests {
             spent,
             "the report must be claimable only once per registration, or every \
              contract-state change emits a shipped log line per parked connection"
+        );
+    }
+
+    /// A full channel is reported once per stall, not once per notification,
+    /// and the report re-arms after a successful delivery. A connection that is
+    /// alive but not reading keeps its registration indefinitely, so a
+    /// per-message line would repeat for as long as it stays connected.
+    #[tokio::test(start_paused = true)]
+    #[serial_test::serial]
+    async fn full_channel_is_reported_once_per_stall() {
+        let ns = Namespace::new();
+        let dk = ns.key(0);
+        let (tx, mut rx) = mpsc::channel::<HostResult>(1);
+        assert!(register_app(&dk, ns.client(0), AppIdentity::Local, tx));
+
+        assert_eq!(route_to_apps(&dk, host_msg()), 1, "fills the channel");
+        for _ in 0..4 {
+            assert_eq!(route_to_apps(&dk, host_msg()), 0, "channel full");
+        }
+        let claim = || {
+            DELEGATE_APPS
+                .get_mut(&dk)
+                .map(|mut apps| apps.iter_mut().all(|a| a.latch_full_report()))
+                .unwrap_or(false)
+        };
+        // Assert the LATCH, as `withhold_is_reported_once_per_registration`
+        // does: after four full sends the right to report is already spent.
+        assert!(
+            !claim(),
+            "a stalled channel must be reported once, not once per notification"
+        );
+
+        assert!(rx.try_recv().is_ok());
+        assert_eq!(route_to_apps(&dk, host_msg()), 1, "the app drained it");
+        assert!(
+            claim(),
+            "a successful delivery must re-arm the report for the next stall"
         );
     }
 

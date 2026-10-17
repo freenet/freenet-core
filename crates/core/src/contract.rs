@@ -4461,7 +4461,7 @@ async fn handle_delegate_notification<CH, P>(
 
     // SWEEP OF THE delegate->apps REGISTRY, AT THE TOP, BEFORE ANY EXIT.
     //
-    // `sweep_closed` is the registry's only production caller and is what
+    // This is the only production call site of `sweep_closed`, which is what
     // reaps registrations whose connection ended without a clean disconnect,
     // for every delegate rather than only the one being notified. #5263 placed
     // it before its execution-failure return, reasoning that a delegate which
@@ -4480,8 +4480,9 @@ async fn handle_delegate_notification<CH, P>(
     // at a glance.
     //
     // On the resume path, where this frame is long gone,
-    // `route_notification_outbound` still prunes closed registrations for the
-    // delegate it routes for, because `route_to_apps` does.
+    // `route_notification_outbound` prunes closed registrations only for the
+    // delegate it routes for, and only when the run produced an
+    // `ApplicationMessage` to route, because that is when `route_to_apps` runs.
     delegate_app_registry::sweep_closed();
 
     // THE DELEGATE'S REGISTERED PARAMETERS, NOT EMPTY ONES (#5616).
@@ -7936,8 +7937,8 @@ mod tests {
     /// Pin: the delegate->apps registry sweep must not be skippable by ANY exit
     /// from the notification path.
     ///
-    /// PROHIBITION (from #5263, restated behaviourally and WIDENED): the sweep
-    /// is the registry's only production caller and is what reaps registrations
+    /// PROHIBITION (from #5263, restated behaviourally and WIDENED): this is the
+    /// only production call site of the sweep, which is what reaps registrations
     /// whose connection died without a clean disconnect. It must not become
     /// conditional on the delegate doing anything in particular.
     ///
@@ -12833,7 +12834,11 @@ mod hol_4391_tests {
     /// FALSIFY by making the sweep conditional, or deleting it (the dead
     /// registration survives), or by expiring registrations on age again (the
     /// live one is reaped).
+    // `serial` as well as `TEST_GUARD`: the registry's own unit tests call
+    // `sweep_closed` directly under `serial`, and a concurrent sweep from one of
+    // them could reap `dead_key` and pass this test with the call deleted.
     #[tokio::test(start_paused = true)]
+    #[serial_test::serial]
     async fn the_notification_path_actually_runs_the_registry_sweep() {
         let _guard = TEST_GUARD.lock().await;
         let (mut handler, _send) = build_handler(vec![]).await;

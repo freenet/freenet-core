@@ -350,8 +350,8 @@ GUARDS_CASES = [
     (
         "chokepoint reached from an unenumerated spawn form inside an allowed function",
         CONTRACT,
-        "    delegate_app_registry::sweep_expired();",
-        "    delegate_app_registry::sweep_expired();\n"
+        "    delegate_app_registry::sweep_closed();",
+        "    delegate_app_registry::sweep_closed();\n"
         "    if false {\n"
         "        tokio::task::spawn_local(async move {\n"
         '            let _ = "handle_delegate_with_contract_requests(";\n'
@@ -410,17 +410,17 @@ GUARDS_CASES = [
     (
         "the notification path's registry sweep made conditional, position unchanged",
         CONTRACT,
-        "    delegate_app_registry::sweep_expired();",
-        "    if false {\n        delegate_app_registry::sweep_expired();\n    }",
+        "    delegate_app_registry::sweep_closed();",
+        "    if false {\n        delegate_app_registry::sweep_closed();\n    }",
         ["the_notification_path_actually_runs_the_registry_sweep"],
         "RED",
     ),
     (
         "...and the SOURCE PIN for it, under the same mutation: the documented limit",
         CONTRACT,
-        "    delegate_app_registry::sweep_expired();",
-        "    if false {\n        delegate_app_registry::sweep_expired();\n    }",
-        ["ttl_sweep_precedes_every_exit_from_the_notification_path"],
+        "    delegate_app_registry::sweep_closed();",
+        "    if false {\n        delegate_app_registry::sweep_closed();\n    }",
+        ["registry_sweep_precedes_every_exit_from_the_notification_path"],
         "GREEN",
     ),
     # Added after the rebase onto #5615, which added the third sink.
