@@ -2707,6 +2707,80 @@ mod tests {
         );
     }
 
+    /// Merge and admission counts survive a restart through `flush_period` alone,
+    /// with no verdict to trigger an earlier write (#5914 review round 4: the A1
+    /// test let note_judged's own persist carry them, so a no-op flush survived).
+    /// Each case ends with one lone kind of update before the final flush, so a
+    /// later write cannot carry an update that failed to mark the period dirty.
+    #[test]
+    fn flushed_merge_and_admission_counts_survive_a_restart() {
+        for lone_admission_last in [false, true] {
+            let dir = tempfile::TempDir::new().expect("tempdir");
+            let hosted: Vec<_> = (0..20u8).map(instance).collect();
+            let mut first = runner_with_salt(dir.path(), [9; 32]);
+            end_period(&mut first);
+            let focus = first.focus(Some(hosted), &[]).selected;
+            first.advance();
+            feed(
+                &mut first,
+                focus[0],
+                &[RecordOutcome::Admitted, RecordOutcome::Refused],
+            );
+            first.flush_period();
+            if lone_admission_last {
+                first.note_admission(&focus[0], RecordOutcome::Admitted);
+            } else {
+                first.note_merge(focus[0], None);
+            }
+            first.flush_period();
+            drop(first);
+            let ended = end_period(&mut ShadowRunner::new(dir.path(), EnforcementMode::Shadow));
+            let expected = if lone_admission_last {
+                (2, 2, 1)
+            } else {
+                (3, 1, 1)
+            };
+            assert_eq!(
+                (
+                    ended.merges_seen,
+                    ended.samples_admitted,
+                    ended.samples_refused
+                ),
+                expected,
+                "flush_period did not checkpoint the counts (lone admission last: \
+                 {lone_admission_last})"
+            );
+        }
+    }
+
+    /// Without a flush (or a tick, draw or verdict) the counts since the last write
+    /// are lost: the tolerance FocusPeriodSummary::complete documents, and evidence
+    /// that the previous test's survival is the flush's doing.
+    #[test]
+    fn unflushed_merge_and_admission_counts_are_lost_on_restart() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let hosted: Vec<_> = (0..20u8).map(instance).collect();
+        let mut first = runner_with_salt(dir.path(), [9; 32]);
+        end_period(&mut first);
+        let focus = first.focus(Some(hosted), &[]).selected;
+        first.advance();
+        feed(
+            &mut first,
+            focus[0],
+            &[RecordOutcome::Admitted, RecordOutcome::Refused],
+        );
+        drop(first);
+        let ended = end_period(&mut ShadowRunner::new(dir.path(), EnforcementMode::Shadow));
+        assert_eq!(
+            (
+                ended.merges_seen,
+                ended.samples_admitted,
+                ended.samples_refused
+            ),
+            (0, 0, 0)
+        );
+    }
+
     /// A contract that changes slot mid-period ends one stint and starts another, so
     /// each slot is credited only with what happened in it (#5914 review round 3,
     /// A2). Relabelling the whole stint moved a weighted verdict to the uniform slot.
