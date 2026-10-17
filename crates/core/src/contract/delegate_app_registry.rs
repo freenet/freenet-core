@@ -67,7 +67,7 @@
 //! below. What the registry must never do is keep a registration usable past
 //! its connection, and it does not: once the connection is gone the channel is
 //! closed, so the registration can deliver nothing, and it is pruned by the
-//! next registration for its delegate, sweep, or delivery attempt.
+//! next new registration for its delegate, sweep, or delivery attempt.
 //!
 //! An earlier revision expired a registration 30 minutes after the app's last
 //! `ApplicationMessages` request. That evicted exactly the legitimate case, an
@@ -231,8 +231,8 @@ static CLIENT_REGISTRATION_COUNTS: LazyLock<DashMap<ClientId, usize>> =
 /// Register `client_id`'s notification channel with `delegate_key`, or replace
 /// its channel if already registered.
 ///
-/// Returns `false` (and does not register) when a per-key or per-client cap
-/// would be exceeded, so the caller can log the rejection. Re-registering an
+/// Returns `false` (and does not register) when the per-key, off-host or
+/// per-client cap would be exceeded, so the caller can log the rejection. Re-registering an
 /// existing `(delegate, client)` pair always succeeds and replaces the sender:
 /// each request carries a fresh channel, and the one it replaces is dropped.
 pub(crate) fn register_app(
@@ -314,9 +314,11 @@ pub(crate) fn register_app(
             cap = MAX_DELEGATES_PER_CLIENT,
             "Rejecting app registration: client at max delegate registrations"
         );
-        // Do not leave behind the empty entry `or_default` created above for a
-        // delegate this client was refused on: nothing else removes it until
-        // the next notification-path sweep.
+        // Do not leave behind an empty entry for a delegate this client was
+        // refused on (one `or_default` just created, or one the prune above
+        // emptied): nothing else removes it until the next notification-path
+        // sweep. `remove_if` re-checks emptiness under the shard lock, so a
+        // concurrent registration that landed in between is kept.
         drop(count);
         let now_empty = apps.is_empty();
         drop(apps);
@@ -369,9 +371,9 @@ pub(crate) fn register_app(
 /// real per-client authorization model, not a routing filter.
 ///
 /// Uses `try_send` (never `.await`) so it is safe to call from the
-/// single-threaded contract-handling loop — a full or closed client channel is
-/// dropped and logged once per run of full sends, never blocks the loop (see
-/// `.claude/rules/channel-safety.md`).
+/// single-threaded contract-handling loop: a message to a full channel is
+/// dropped (the registration is kept, and the stall is logged once per run of
+/// full sends), never blocking the loop (see `.claude/rules/channel-safety.md`).
 /// Returns the number of apps the message was delivered to. Closed channels are
 /// pruned as a side effect (the client is gone).
 pub(crate) fn route_to_apps(delegate_key: &DelegateKey, message: HostResult) -> usize {
@@ -684,6 +686,23 @@ mod tests {
                 .is_none(),
             "a refused registration must not leave an empty delegate entry behind"
         );
+
+        // ...but the cleanup is for EMPTY entries only: refusing this client on
+        // a delegate that holds another client's live registration must leave
+        // that registration alone.
+        let shared = ns.key(MAX_DELEGATES_PER_CLIENT + 1);
+        let (other_tx, mut other_rx) = mpsc::channel::<HostResult>(1);
+        assert!(register_app(
+            &shared,
+            ns.client(1),
+            AppIdentity::Local,
+            other_tx
+        ));
+        let (tx, _rx2) = mpsc::channel::<HostResult>(1);
+        assert!(!register_app(&shared, client, AppIdentity::Local, tx));
+        assert_eq!(registration_count(&shared), 1);
+        assert_eq!(route_to_apps(&shared, host_msg()), 1);
+        assert!(other_rx.try_recv().is_ok());
     }
 
     #[tokio::test(start_paused = true)]
@@ -979,6 +998,11 @@ mod tests {
         assert!(
             register_app(&dk, ns.client(off_host_cap), AppIdentity::Remote, tx),
             "a dead off-host registration must not hold an off-host slot"
+        );
+        assert_eq!(
+            registration_count(&dk),
+            off_host_cap,
+            "only the dead registration may be pruned"
         );
         assert!(
             CLIENT_REGISTRATION_COUNTS
