@@ -4676,9 +4676,21 @@ mod tests {
         // And the matching subscription callback was delivered to the client's
         // response channel, keyed by the delegate for logging.
         match cb_rx.try_recv() {
-            Ok(HostCallbackResult::SubscriptionChannel { id, key, .. }) => {
+            Ok(HostCallbackResult::SubscriptionChannel { id, key, callback }) => {
                 assert_eq!(id, client_id);
                 assert_eq!(key, delegate_key.to_string());
+                // The callback is the receiving end of the very sender the
+                // registry will hold: once the connection drops it, the
+                // registry's sender reports closed. `delegate_app_registry`'s
+                // closed-channel pruning rests on this pairing.
+                let registered = open_req.notification_channel.as_ref().unwrap();
+                assert!(!registered.is_closed());
+                drop(callback);
+                assert!(
+                    registered.is_closed(),
+                    "the registered sender must be paired with the callback \
+                     receiver handed to the connection"
+                );
             }
             other => panic!(
                 "expected a SubscriptionChannel callback for the delegate request, got {other:?}"

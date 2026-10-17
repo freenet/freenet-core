@@ -4475,9 +4475,9 @@ async fn handle_delegate_notification<CH, P>(
     // exit, rather than #5263's unbounded loss: every park terminates, but the
     // resumed run does not sweep (see below). That bound depends on the park
     // machinery working and on further notifications arriving, and a backstop
-    // must not be conditional on the thing it backs up. Hoisting to the top makes "on every exit" true by position
-    // rather than by argument, which is also the only form a reader can check
-    // at a glance.
+    // must not be conditional on the thing it backs up. Hoisting to the top
+    // makes "on every exit" true by position rather than by argument, which is
+    // also the only form a reader can check at a glance.
     //
     // On the resume path, where this frame is long gone,
     // `route_notification_outbound` prunes closed registrations only for the

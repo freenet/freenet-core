@@ -34,9 +34,10 @@
 //! # Lifetime: a registration never outlives its connection
 //!
 //! A registration is removed when its connection goes away (or the delegate is
-//! unregistered), never because it has been idle. Clean disconnects ([`remove_client`], which every exit of the
-//! WebSocket connection task's main loop triggers) and delegate unregistration
-//! ([`remove_delegate`]) purge eagerly. The backstop for a connection that ended
+//! unregistered), never because it has been idle. Clean disconnects
+//! ([`remove_client`], which every exit of the WebSocket connection task's main
+//! loop triggers) and delegate unregistration ([`remove_delegate`]) purge
+//! eagerly. The backstop for a connection that ended
 //! without that event (a cancelled or panicked task) is the channel itself: the
 //! receiving end lives in the connection task's listener map, so once the task
 //! is gone the sender reports closed, and [`sweep_closed`] and [`route_to_apps`]
@@ -63,8 +64,10 @@
 //! open. Its connection, task, socket buffers and contract subscriptions live
 //! exactly as long, with or without this registry. A registration adds that
 //! request's notification channel and its listener entry, within the caps
-//! below. What the registry must never do is outlive its connection, and it
-//! does not.
+//! below. What the registry must never do is keep a registration usable past
+//! its connection, and it does not: once the connection is gone the channel is
+//! closed, so the registration can deliver nothing, and it is pruned by the
+//! next registration for its delegate, sweep, or delivery attempt.
 //!
 //! An earlier revision expired a registration 30 minutes after the app's last
 //! `ApplicationMessages` request. That evicted exactly the legitimate case, an
@@ -119,7 +122,9 @@ pub(crate) const MAX_APPS_PER_DELEGATE: usize = 128;
 /// because nothing here is dead.
 ///
 /// Capping `Remote` occupancy below the total leaves this many slots that only a
-/// local client can take, so the local app can always register. 32 is far above
+/// local client can take, so the local app can always register over off-host
+/// clients (behind a colocated reverse proxy every client is local; see the
+/// module docs). 32 is far above
 /// the real local count (usually one app, occasionally a few) while still
 /// leaving 96 for off-host clients, which register successfully and simply
 /// receive no pushed output.
@@ -242,8 +247,9 @@ pub(crate) fn register_app(
     if let Some(existing) = apps.iter_mut().find(|a| a.client_id == client_id) {
         existing.sender = sender;
         existing.identity = identity;
-        // `full_logged` is left alone: the fresh channel's first send succeeds
-        // and clears it, so the next stall on the new channel is reported.
+        // `full_logged` is left alone: the fresh channel has room (it holds at
+        // most the request's own reply), so the next delivery succeeds and
+        // clears it, and the next stall on the new channel is reported.
         // A refresh is the same connection, so do NOT re-arm the withhold log:
         // an app that talks to a delegate in a loop would otherwise defeat the
         // once-per-registration bound.
@@ -253,7 +259,8 @@ pub(crate) fn register_app(
     // A slot held by a dead registration must not count against the caps
     // below. Without this, a connection that ended without a clean disconnect
     // keeps refusing newcomers until the next notification-path sweep, which
-    // may never come for a delegate with no notification traffic. O(n) over a
+    // runs only when some delegate on the node is notified and so may never
+    // come on a quiet node. Only this delegate's list is pruned. O(n) over a
     // list bounded by `MAX_APPS_PER_DELEGATE`, on a path that already scans it.
     let mut closed: Vec<ClientId> = Vec::new();
     apps.retain(|a| {
@@ -307,6 +314,15 @@ pub(crate) fn register_app(
             cap = MAX_DELEGATES_PER_CLIENT,
             "Rejecting app registration: client at max delegate registrations"
         );
+        // Do not leave behind the empty entry `or_default` created above for a
+        // delegate this client was refused on: nothing else removes it until
+        // the next notification-path sweep.
+        drop(count);
+        let now_empty = apps.is_empty();
+        drop(apps);
+        if now_empty {
+            DELEGATE_APPS.remove_if(delegate_key, |_, v| v.is_empty());
+        }
         return false;
     }
 
@@ -354,7 +370,8 @@ pub(crate) fn register_app(
 ///
 /// Uses `try_send` (never `.await`) so it is safe to call from the
 /// single-threaded contract-handling loop — a full or closed client channel is
-/// dropped/logged, never blocks the loop (see `.claude/rules/channel-safety.md`).
+/// dropped and logged once per run of full sends, never blocks the loop (see
+/// `.claude/rules/channel-safety.md`).
 /// Returns the number of apps the message was delivered to. Closed channels are
 /// pruned as a side effect (the client is gone).
 pub(crate) fn route_to_apps(delegate_key: &DelegateKey, message: HostResult) -> usize {
@@ -372,14 +389,16 @@ pub(crate) fn route_to_apps(delegate_key: &DelegateKey, message: HostResult) -> 
             // Before this fix the `try_send` below was what reaped
             // registrations whose client had vanished without a clean
             // disconnect. Skipping ahead of it would mean a non-local
-            // registration is only reaped by the next `sweep_closed`.
+            // registration is only reaped by the next `sweep_closed` or
+            // registration for this delegate.
             // `is_closed()` gives the same liveness signal `try_send` gave,
             // without delivering anything.
             //
             // SCOPE OF THIS PRUNE, precisely: it reaps CLOSED senders only. It
             // does NOT close the slot-exhaustion DoS, because the cheaper attack
             // holds its connections OPEN and nothing here is dead.
-            // `LOCAL_RESERVED_SLOTS` is what makes that attack a non-problem; the
+            // `LOCAL_RESERVED_SLOTS` is what makes that attack a non-problem for
+            // off-host connections (see its docs for the proxy caveat); the
             // two are complementary and neither substitutes for the other.
             if app.sender.is_closed() {
                 closed_clients.push(app.client_id);
@@ -473,7 +492,7 @@ pub(crate) fn remove_delegate(delegate_key: &DelegateKey) {
 ///
 /// The backstop for connections that ended without a clean disconnect event.
 /// [`route_to_apps`] prunes the same way, but only for the delegate it is
-/// delivering for; this covers delegates that receive no notifications. An open
+/// delivering for; this covers delegates that are not being routed to. An open
 /// channel is never pruned, however long it has been idle: see the module docs.
 pub(crate) fn sweep_closed() {
     let mut closed: Vec<ClientId> = Vec::new();
@@ -525,7 +544,7 @@ mod tests {
     // is safe without serialization.
     static NS: AtomicUsize = AtomicUsize::new(1);
 
-    /// A block of 2^16 distinct delegate keys + client ids private to one test.
+    /// A block of 2^24 distinct delegate keys + client ids private to one test.
     struct Namespace(usize);
     impl Namespace {
         fn new() -> Self {
@@ -538,7 +557,7 @@ mod tests {
             DelegateKey::new(bytes, CodeHash::new(bytes))
         }
         fn client(&self, n: usize) -> ClientId {
-            // 16 low bits for the per-test index, rest for the namespace.
+            // 24 low bits for the per-test index, rest for the namespace.
             ClientId((self.0 << 24) | (n & 0xFF_FFFF))
         }
     }
@@ -658,6 +677,12 @@ mod tests {
                 tx
             ),
             "registration past per-client cap must be rejected"
+        );
+        assert!(
+            DELEGATE_APPS
+                .get(&ns.key(MAX_DELEGATES_PER_CLIENT))
+                .is_none(),
+            "a refused registration must not leave an empty delegate entry behind"
         );
     }
 
@@ -923,6 +948,43 @@ mod tests {
                 .get(&ns.client(0))
                 .is_none_or(|c| *c == 0),
             "pruning must release the client's registration count"
+        );
+    }
+
+    /// Dead off-host registrations do not count against the off-host cap
+    /// either: an off-host caller that opens and drops connections must not
+    /// fill `MAX_APPS_PER_DELEGATE - LOCAL_RESERVED_SLOTS` with corpses that
+    /// refuse the next off-host client until a notification-path sweep.
+    #[tokio::test(start_paused = true)]
+    #[serial_test::serial]
+    async fn dead_remote_registrations_free_off_host_slots() {
+        let ns = Namespace::new();
+        let dk = ns.key(0);
+        let off_host_cap = MAX_APPS_PER_DELEGATE - LOCAL_RESERVED_SLOTS;
+        let mut keepalive = Vec::new();
+        for i in 0..off_host_cap {
+            let (tx, rx) = mpsc::channel::<HostResult>(1);
+            keepalive.push(rx);
+            assert!(register_app(&dk, ns.client(i), AppIdentity::Remote, tx));
+        }
+        // Counterfactual: at the off-host cap, a live set refuses the next one.
+        let (tx, _rx) = mpsc::channel::<HostResult>(1);
+        assert!(
+            !register_app(&dk, ns.client(off_host_cap), AppIdentity::Remote, tx),
+            "the off-host cap must hold while every incumbent is live"
+        );
+
+        drop(keepalive.pop());
+        let (tx, _rx2) = mpsc::channel::<HostResult>(1);
+        assert!(
+            register_app(&dk, ns.client(off_host_cap), AppIdentity::Remote, tx),
+            "a dead off-host registration must not hold an off-host slot"
+        );
+        assert!(
+            CLIENT_REGISTRATION_COUNTS
+                .get(&ns.client(off_host_cap - 1))
+                .is_none_or(|c| *c == 0),
+            "the pruned client's registration count must be released"
         );
     }
 
