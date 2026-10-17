@@ -2496,6 +2496,48 @@ mod probe_wiring_pins {
         );
     }
 
+    /// `observe_transition` gets the real scope and the sampler's real per-state
+    /// ceiling (#5914 review round 3, A4). Passing `0` (or any too-small limit)
+    /// makes every merge "too large to sample", so no activity is ever counted and
+    /// focus silently returns to the uniform draw that judged nothing in #5913;
+    /// passing `SamplingScope::Wide` samples everything. Neither fails a function
+    /// test, because the function is correct; only its call site is wrong.
+    #[test]
+    fn observe_transition_gets_the_real_scope_and_ceiling() {
+        let body = run_writer_code_only();
+        let anchor = "let evicted = observe_transition(";
+        let start =
+            statement_at(&body, anchor).expect("observe_transition call moved") + anchor.len();
+        let args = call_args_at(&body, start, "observe_transition");
+        assert_eq!(
+            args,
+            [
+                "&mut shadow",
+                "&mut samplers",
+                "&scope",
+                "observation",
+                "activity_max_state_bytes"
+            ],
+            "run_writer passes observe_transition something other than the live \
+             runner, samplers, scope, observation and the sampler's ceiling"
+        );
+        let loop_start = body.find("loop {").expect("run_writer has no select loop");
+        let bound = statement_at(
+            &body,
+            "let activity_max_state_bytes = sampler_config().max_state_bytes;",
+        )
+        .expect(
+            "the activity ceiling is no longer the sampler's own max_state_bytes, so \
+             activity can disagree with what the sampler would admit",
+        );
+        assert!(bound < loop_start, "the ceiling is rebound inside the loop");
+        assert_eq!(
+            body.matches("let activity_max_state_bytes").count(),
+            1,
+            "the activity ceiling is bound more than once; a shadowing binding wins"
+        );
+    }
+
     /// A completed probe's verdicts must reach the focus period, or every period
     /// summary reports `judged=0` and the #5913 acceptance measure reads as failing
     /// whatever focus does.
