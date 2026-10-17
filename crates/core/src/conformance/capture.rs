@@ -1471,12 +1471,17 @@ pub(crate) fn record_with_outcome(
     if matches!(admission, Admission::TooLarge) {
         tracked.refused_too_large += 1;
     }
-    let outcome = match admission {
+    (evicted, outcome_of(admission))
+}
+
+/// How a sampler admission maps onto the focus period's counts. Exhaustive, so a new
+/// `Admission` variant has to be classified here.
+fn outcome_of(admission: Admission) -> RecordOutcome {
+    match admission {
         Admission::Stored => RecordOutcome::Admitted,
         Admission::Duplicate | Admission::NotSelected => RecordOutcome::NothingNew,
         Admission::TooLarge | Admission::NoBudget => RecordOutcome::Refused,
-    };
-    (evicted, outcome)
+    }
 }
 
 /// Related state a contract offered and capture would not keep.
@@ -2456,6 +2461,25 @@ mod probe_wiring_pins {
         }
     }
 
+    /// What the sampler did with each merge must reach the focus period, after the
+    /// decision is made. Without it `admitted` stays zero for every contract, so
+    /// nothing is ever "accruing" (mid-period re-draws then displace a contract that is
+    /// building a sample) and every period reports `samples_admitted=0`.
+    #[test]
+    fn admission_outcomes_reach_the_focus_period() {
+        let body = run_writer_code_only();
+        let recorded = statement_at(
+            &body,
+            "let (evicted, outcome) = record_with_outcome(&mut samplers, &scope, observation);",
+        )
+        .expect("run_writer no longer records observations this way; re-anchor");
+        let noted = statement_at(&body, "shadow.note_admission(&contract, outcome);").expect(
+            "run_writer no longer tells the focus period what admission decided, so \
+             keep-if-accruing and the period's admitted/refused counts are dead",
+        );
+        assert!(recorded < noted, "the outcome is noted before it exists");
+    }
+
     /// A completed probe's verdicts must reach the focus period, or every period
     /// summary reports `judged=0` and the #5913 acceptance measure reads as failing
     /// whatever focus does.
@@ -2959,6 +2983,43 @@ mod tests {
         );
     }
 
+    /// A delta-only update has no full incoming state (`incoming_state == None`). It is the
+    /// common shape of a real UPDATE and must count (mutation: `is_none_or` -> `is_some_and`).
+    #[test]
+    fn a_delta_only_merge_is_activity() {
+        let mut observation = observation_for(instance(1));
+        observation.incoming_state = None;
+        observation.delta = Some(vec![9]);
+        assert!(counts_as_activity(&observation, 1024));
+    }
+
+    /// A same-length edit is a change (mutation: compare lengths instead of bytes).
+    #[test]
+    fn an_edit_that_keeps_the_length_is_activity() {
+        let mut observation = observation_for(instance(1));
+        observation.base_state = vec![1, 2, 3];
+        observation.result_state = vec![1, 2, 4];
+        assert!(counts_as_activity(&observation, 1024));
+    }
+
+    /// Each of base and incoming, alone, is enough to make the merge unsampleable.
+    #[test]
+    fn an_oversized_base_or_incoming_state_blocks_activity_on_its_own() {
+        // observation_for: base 2 bytes, incoming 2, result 3.
+        let mut big_base = observation_for(instance(1));
+        big_base.base_state = vec![1; 8];
+        assert!(
+            !counts_as_activity(&big_base, 4),
+            "base too large to sample"
+        );
+        let mut big_incoming = observation_for(instance(1));
+        big_incoming.incoming_state = Some(vec![2; 8]);
+        assert!(
+            !counts_as_activity(&big_incoming, 4),
+            "incoming too large to sample"
+        );
+    }
+
     /// `record_with_outcome` reports what the sampler actually did, which is what the
     /// focus period counts (#5914 review D5): a merge that reached the writer is not
     /// the same as a sample retained.
@@ -2980,6 +3041,40 @@ mod tests {
         huge.result_state = vec![7; SamplerConfig::default().max_state_bytes + 1];
         let (_, refused) = record_with_outcome(&mut samplers, &scope, huge);
         assert_eq!(refused, RecordOutcome::Refused);
+    }
+
+    /// Every admission arm maps to the outcome the period counts it under. The
+    /// `NotSelected` and `NoBudget` arms are hard to reach through a real sampler, so
+    /// the mapping is tested directly (#5914 review round 2, K6).
+    #[test]
+    fn every_admission_maps_to_its_outcome() {
+        assert_eq!(outcome_of(Admission::Stored), RecordOutcome::Admitted);
+        assert_eq!(outcome_of(Admission::Duplicate), RecordOutcome::NothingNew);
+        assert_eq!(
+            outcome_of(Admission::NotSelected),
+            RecordOutcome::NothingNew
+        );
+        assert_eq!(outcome_of(Admission::TooLarge), RecordOutcome::Refused);
+        assert_eq!(outcome_of(Admission::NoBudget), RecordOutcome::Refused);
+    }
+
+    /// No tracking slot for a focused contract (every tracked contract is in focus)
+    /// is a refusal, not a silent out-of-scope.
+    #[test]
+    fn no_tracking_slot_for_a_focused_contract_is_refused() {
+        let mut samplers = HashMap::new();
+        let ids: Vec<u8> = (0..=MAX_TRACKED_CONTRACTS as u8).collect();
+        let scope = focused_on(&ids);
+        for id in &ids[..MAX_TRACKED_CONTRACTS] {
+            let (_, outcome) =
+                record_with_outcome(&mut samplers, &scope, observation_for(instance(*id)));
+            assert_eq!(outcome, RecordOutcome::Admitted);
+        }
+        let last = ids[MAX_TRACKED_CONTRACTS];
+        let (evicted, outcome) =
+            record_with_outcome(&mut samplers, &scope, observation_for(instance(last)));
+        assert_eq!(evicted, None);
+        assert_eq!(outcome, RecordOutcome::Refused);
     }
 
     fn focused_on(ids: &[u8]) -> SamplingScope {

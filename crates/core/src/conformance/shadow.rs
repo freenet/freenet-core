@@ -1961,6 +1961,122 @@ mod tests {
         );
     }
 
+    fn judged(contract: ContractInstanceId) -> JudgedContract {
+        JudgedContract {
+            contract,
+            verdicts: 1,
+            inconclusive: 0,
+        }
+    }
+
+    /// A summary covers one period: the next starts from zero.
+    #[test]
+    fn each_period_summary_covers_only_its_own_period() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut runner = runner_with_salt(dir.path(), [7; 32]);
+        let hosted: Vec<_> = (0..20u8).map(instance).collect();
+        let first_focus = runner.focus(Some(hosted.clone()), &[]).selected;
+        feed(
+            &mut runner,
+            first_focus[0],
+            &[RecordOutcome::Admitted, RecordOutcome::Refused],
+        );
+        let first = end_period(&mut runner);
+        assert_eq!((first.merges_seen, first.stints), (2, 2));
+
+        runner.focus(Some(hosted.clone()), &[]);
+        let second = end_period(&mut runner);
+        assert_eq!(
+            (
+                second.merges_seen,
+                second.samples_admitted,
+                second.samples_refused,
+                second.stints
+            ),
+            (0, 0, 0, 2),
+            "the second period's summary still carries the first period's counts"
+        );
+        assert!(second.complete);
+    }
+
+    /// `judged_uniform` and `judged_weighted` say WHICH slot produced a verdict, which
+    /// is what the uniform/weighted split exists to measure.
+    #[test]
+    fn a_verdict_is_attributed_to_the_slot_that_was_judged() {
+        for judged_index in [0usize, 1] {
+            let dir = tempfile::TempDir::new().expect("tempdir");
+            let mut runner = runner_with_salt(dir.path(), [7; 32]);
+            let hosted: Vec<_> = (0..20u8).map(instance).collect();
+            let selected = runner.focus(Some(hosted), &[]).selected;
+            // selected[0] is the uniform slot, selected[1] the weighted one.
+            runner.note_judged(&[judged(selected[judged_index])]);
+            let summary = end_period(&mut runner);
+            let expected = if judged_index == 0 { (1, 0) } else { (0, 1) };
+            assert_eq!(
+                (summary.judged_uniform, summary.judged_weighted),
+                expected,
+                "judged slot {judged_index}"
+            );
+        }
+    }
+
+    /// `weighted_selected_activity` is the activity of WEIGHTED stints at the moment
+    /// they were drawn: not the uniform stints', and not refreshed while the stint
+    /// continues.
+    #[test]
+    fn weighted_selected_activity_is_the_weighted_stints_activity_when_drawn() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut runner = runner_with_salt(dir.path(), [7; 32]);
+        let hosted: Vec<_> = (0..20u8).map(instance).collect();
+        for contract in &hosted {
+            for _ in 0..5 {
+                runner.note_merge(*contract, true);
+            }
+        }
+        let first = runner.focus(Some(hosted.clone()), &[]).selected;
+        let weighted = first[1];
+        // The weighted pick keeps winning after it gets much busier, so its stint continues.
+        for _ in 0..60 {
+            runner.note_merge(weighted, true);
+        }
+        let second = runner.focus(Some(hosted), &[]).selected;
+        assert!(
+            second.contains(&weighted),
+            "precondition: the stint continues"
+        );
+        let summary = end_period(&mut runner);
+        assert_eq!(
+            summary.weighted_selected_activity, 5,
+            "uniform stints' activity leaked in, or a continuing stint's was refreshed"
+        );
+    }
+
+    /// Keep-if-accruing keys on what the sampler ADMITTED, not on merges merely seen:
+    /// a focus contract whose merges all added nothing new is re-drawn.
+    #[test]
+    fn a_focus_contract_whose_merges_added_nothing_is_displaced() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut runner = runner_with_salt(dir.path(), [21; 32]);
+        let hosted: Vec<_> = (0..60u8).map(instance).collect();
+        let first = runner.focus(Some(hosted.clone()), &[]).selected;
+        let weighted = first[1];
+        for _ in 0..4 {
+            runner.note_merge(weighted, true);
+            runner.note_admission(&weighted, RecordOutcome::NothingNew);
+        }
+        for contract in hosted.iter().filter(|c| !first.contains(c)) {
+            for _ in 0..100 {
+                runner.note_merge(*contract, true);
+            }
+        }
+        let now = runner.focus(Some(hosted), &[]).selected;
+        assert_eq!(now[0], first[0], "the uniform slot does not move");
+        assert_ne!(
+            now[1], weighted,
+            "a weighted contract that admitted nothing new was kept anyway"
+        );
+    }
+
     /// The first period after a start began before this process did, so it is
     /// marked incomplete; the next one is whole.
     #[test]
