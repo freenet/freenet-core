@@ -87,6 +87,8 @@ pub(crate) const RECENT_STATES: usize = 4;
 #[derive(Debug, Clone)]
 struct Entry {
     count: u32,
+    /// A counted merge since the last decay. Decides whether a count of one survives.
+    merged_this_period: bool,
     recent: [StateDigest; RECENT_STATES],
     filled: u8,
     next: u8,
@@ -98,6 +100,7 @@ impl Entry {
         recent[0] = digest;
         Self {
             count: 1,
+            merged_this_period: true,
             recent,
             filled: 1,
             next: 1 % RECENT_STATES as u8,
@@ -164,6 +167,7 @@ impl MergeActivity {
                 return false;
             }
             entry.count = entry.count.saturating_add(1).min(STORED_ACTIVITY_CAP);
+            entry.merged_this_period = true;
             return true;
         }
         if self.counts.len() >= self.cap {
@@ -173,16 +177,23 @@ impl MergeActivity {
         true
     }
 
-    /// Halve every count and forget contracts that reach zero.
+    /// Halve every count, rounding up, and forget a contract once it has gone a whole
+    /// period without a counted merge and is down to one.
     ///
-    /// Called once per focus period, which makes the count an exponentially-decayed
-    /// merge total with a half-life of one period: a contract that merges steadily at
-    /// `r` per period settles near `2r`, and one that goes quiet is forgotten after
-    /// `log2(count)` periods.
+    /// Called once per focus period, so the count is an exponentially-decayed merge
+    /// total with a half-life of one period: a contract merging steadily at `r` per
+    /// period settles near `2r`, and one that goes quiet is forgotten after about
+    /// `log2(count) + 1` periods. Rounding up is what keeps a contract that merges
+    /// about once per period weighted: integer halving turned its one merge into zero
+    /// at every rotation, so it read as cold whenever its next merge arrived.
     pub(crate) fn decay(&mut self) {
         self.counts.retain(|_, entry| {
-            entry.count /= 2;
-            entry.count > 0
+            let merged = std::mem::replace(&mut entry.merged_this_period, false);
+            if !merged && entry.count <= 1 {
+                return false;
+            }
+            entry.count = entry.count.div_ceil(2);
+            true
         });
     }
 
@@ -361,12 +372,18 @@ mod tests {
         assert_eq!(activity.count(&id(1)), 4);
         assert_eq!(
             activity.count(&id(2)),
-            0,
-            "a single merge should not survive a period"
+            1,
+            "a merge in the period just ended must survive into the next one"
         );
-        assert_eq!(activity.len(), 1, "a zero count must free its slot");
 
         activity.decay();
+        assert_eq!(
+            activity.count(&id(2)),
+            0,
+            "a one-off merge outlived a quiet period"
+        );
+        assert_eq!(activity.len(), 1, "a forgotten contract must free its slot");
+
         activity.decay();
         activity.decay();
         assert_eq!(
@@ -374,6 +391,24 @@ mod tests {
             0,
             "a contract that stopped merging was never forgotten"
         );
+    }
+
+    /// A contract that merges about once per focus period stays weighted (found
+    /// measuring #5914 round 2's realistic rates). Integer halving turned its single
+    /// merge into zero at every rotation, so it was never weighted when its next merge
+    /// arrived: in the real-runner simulation, 143 hosted with 4 such contracts got a
+    /// new sample in 5% of periods.
+    #[test]
+    fn a_contract_merging_once_per_period_stays_weighted() {
+        let mut activity = MergeActivity::default();
+        for period in 0..6 {
+            activity.record(id(1), fresh());
+            activity.decay();
+            assert!(
+                activity.count(&id(1)) >= 1,
+                "period {period}: a once-per-period contract read as cold after rotation"
+            );
+        }
     }
 
     #[test]
