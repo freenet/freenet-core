@@ -308,9 +308,15 @@ async fn verifier_matches_real_wasm_for_every_planted_defect()
         ),
         ConformanceProperty::StateIdempotence,
     );
-    // Associativity breaks too, which the mode's documentation claims and this
-    // asserts rather than leaving in prose. Needs three states by definition.
-    assert_violates(
+    // Strict associativity breaks too, but since #5915 that is reported only if the
+    // groupings fail to heal, and for this mode the heal step cannot decide: every
+    // merge rotates the state, so iterating toward a fixpoint neither settles nor
+    // repeats a state within `MAX_HEAL_PASSES`, and running out of budget is
+    // inconclusive by design. A larger budget would not help: the rotation can
+    // settle on the full 0..=255 alphabet, which absorbs everything, so the honest
+    // answer for this law here really is "cannot tell". The mode is still caught,
+    // under idempotence above, which is the law that names its defect.
+    assert_eq!(
         verify_case(
             &mut never_settles,
             &ConformanceCase::new(
@@ -318,7 +324,7 @@ async fn verifier_matches_real_wasm_for_every_planted_defect()
                 vec![bytes(&[1, 2]), bytes(&[2, 3]), bytes(&[5, 6])],
             ),
         ),
-        ConformanceProperty::StateAssociativity,
+        PropertyOutcome::Inconclusive(super::property::Inconclusive::RoundLimit),
     );
     // Commutativity still HOLDS for this arm: the rewrite is applied to a union, and
     // a union is symmetric. Asserting it keeps the mode's description honest rather
@@ -334,7 +340,7 @@ async fn verifier_matches_real_wasm_for_every_planted_defect()
     );
     assert!(
         !commutativity_still_holds.is_violation(),
-        "this mode should break idempotence and associativity only; a commutativity \
+        "this mode should break idempotence only; a commutativity \
          finding means the arm no longer isolates what its documentation claims: \
          {commutativity_still_holds:?}"
     );

@@ -44,6 +44,18 @@ pub const DETERMINISM_REPEATS: usize = 3;
 /// rewrites a non-canonical stored state once and then stabilizes.
 pub const MAX_CANONICALIZATION_APPLIES: usize = 3;
 
+/// How many full passes over `(L, R, A, B, C)` the associativity heal step may take
+/// before it gives up, as [`Inconclusive::RoundLimit`].
+///
+/// Measured, not guessed: over the bounded-retention fixture's whole 80-state space
+/// (512,000 triples, 36,252 failing strict associativity), every healing triple
+/// reaches its fixpoint within 2 passes, and only 16 need the second (a raised cap
+/// re-admitting a truncated message). 4 doubles that. Too small a bound can only
+/// cost coverage, never accuse anyone, because running out is inconclusive; too
+/// large a bound costs work, and only on a triple that has already failed the
+/// strict check: at most `5 * MAX_HEAL_PASSES` extra merges.
+pub const MAX_HEAL_PASSES: usize = 4;
+
 /// One property plus the exact inputs to check it with.
 ///
 /// Cases are the unit of work everywhere: the generator produces them, the verifier
@@ -461,65 +473,63 @@ fn run<O: ConformanceOracle + ?Sized>(
                 return Ok(PropertyOutcome::Holds);
             }
 
-            // The two groupings differ. Report that only if it does not heal (#5915),
-            // with the same guard `path_agreement` applies to its two paths.
+            // The two groupings differ. That alone is not reported (#5915): no
+            // contract with bounded retention can satisfy strict associativity. A
+            // grouping that truncated an old entry to make room cannot refill the slot
+            // when a later removal (a ban) or a raised cap frees it, while the other
+            // grouping still holds the entry. Measured on River's room contract: ~30%
+            // of generated triples fail strictly and every one converges on the next
+            // exchange. Reporting them would make every capped chat, feed or log
+            // removable, and anyone able to trigger a removal could build a failing
+            // triple on purpose. So it is reported only if it does not HEAL, in the
+            // sense `associativity_heals` defines.
             //
-            // Strict associativity is unsatisfiable for any contract with bounded
-            // retention. A grouping that truncated an old entry to make room cannot
-            // refill the slot when a later removal (a ban) or a raised cap frees it,
-            // while the other grouping still holds the entry and can. Measured on
-            // River's room contract: ~30% of generated triples fail strictly, and
-            // every one converges on the next exchange. Reporting those would make
-            // every capped chat, feed or log removable, and anyone able to trigger a
-            // removal could build a failing triple on purpose.
-            //
-            // So model that next exchange, and require it to SETTLE the divergence,
-            // not merely end it. With `M = merge(L, R)`, the case heals only if:
-            //
-            //   merge(R, L) == M   the peer holding each grouping, receiving the
-            //                      other's whole state, lands on the same state;
-            //   merge(M, L) == M   and that state absorbs both groupings, so a peer
-            //   merge(M, R) == M   still gossiping either one cannot move it again.
-            //
-            // Convergence alone is not enough. A commutative merge converges on one
-            // exchange by definition, so a convergence-only guard silenced every
-            // commutative contract, including ones that never settle: integer
-            // averaging converges to a midpoint that merging either grouping back in
-            // moves off again. The absorption clauses are what separate "the next
-            // exchange repairs it" (bounded retention: `M` is the refilled log, which
-            // already holds everything either grouping does) from "the next exchange
-            // only moves the disagreement somewhere else".
-            //
-            // Same validity precondition first, for the reason `path_agreement`
-            // gives: a grouping the contract rejects never reaches another peer, so
-            // asking whether it reconciles asks about a history that cannot happen.
-            // A merge emitting an invalid state is `EmittedStateValidity`'s defect.
-            //
-            // A reconciling merge that errors is `Inconclusive` via `?`, as in
-            // `path_agreement`: the guard errs toward silence.
-            //
-            // The digests reported are still the two groupings, so `verify_case`'s
-            // re-run compares the same pair it always did.
-            require_valid(oracle, &ab_c, &case.related)?;
-            require_valid(oracle, &a_bc, &case.related)?;
-            let converged = merge(oracle, &ab_c, &a_bc)?;
-            let heals = merge(oracle, &a_bc, &ab_c)? == converged
-                && merge(oracle, &converged, &ab_c)? == converged
-                && merge(oracle, &converged, &a_bc)? == converged;
-            if heals {
-                return Ok(PropertyOutcome::Holds);
+            // A grouping the contract rejects is reported outright. Both inputs and
+            // both intermediates are valid, so this is the contract emitting a state
+            // it rejects from valid inputs: the network drops it, and the peer that
+            // computed it can never agree with the one that computed the other. That
+            // was a violation before #5915 and stays one.
+            for grouping in [&ab_c, &a_bc] {
+                match oracle
+                    .validate_state(grouping, &case.related)
+                    .map_err(inconclusive_from)?
+                {
+                    ValidateResult::Valid => {}
+                    ValidateResult::RequestRelated(_) => return Err(Inconclusive::RelatedRequired),
+                    ValidateResult::Invalid => {
+                        return Ok(compare(
+                            case.property,
+                            &ab_c,
+                            &a_bc,
+                            "merge(merge(A, B), C) differs from merge(A, merge(B, C)), and \
+                             the contract rejects one grouping as invalid: from valid \
+                             inputs it emitted a state it will not accept",
+                        ));
+                    }
+                }
             }
 
-            Ok(compare(
-                case.property,
-                &ab_c,
-                &a_bc,
-                "merge(merge(A, B), C) differs from merge(A, merge(B, C)), and the \
-                 difference does not heal: one exchange between the two groupings \
-                 does not converge to a state that absorbs both, so peers that \
-                 received the same updates grouped differently do not settle on \
-                 one state",
-            ))
+            let detail = match associativity_heals(oracle, &ab_c, &a_bc, [a, b, c])? {
+                Heal::Healed => return Ok(PropertyOutcome::Holds),
+                Heal::OutOfPasses => return Err(Inconclusive::RoundLimit),
+                Heal::NotConverged => "merge(merge(A, B), C) differs from merge(A, merge(B, C)), \
+                     and merging each grouping into the other does not reach one state, so \
+                     two peers that received the same updates grouped differently still \
+                     disagree after reconciling"
+                    .to_string(),
+                Heal::Cycle => "merge(merge(A, B), C) differs from merge(A, merge(B, C)), and \
+                     the groupings never settle: re-merging them and the three inputs into \
+                     the state they converge to revisits an earlier state without reaching \
+                     a fixpoint, so under re-delivery the merge cycles and peers never agree"
+                    .to_string(),
+                Heal::Refused(reason) => format!(
+                    "merge(merge(A, B), C) differs from merge(A, merge(B, C)), and the \
+                     contract refused a merge needed to reconcile them ({reason}): both \
+                     sides are valid states it emitted itself, so the peers holding them \
+                     can never agree (#5725)"
+                ),
+            };
+            Ok(compare(case.property, &ab_c, &a_bc, &detail))
         }
 
         ConformanceProperty::EmittedStateValidity => {
@@ -803,6 +813,113 @@ fn run<O: ConformanceOracle + ?Sized>(
                  the two can never agree",
             ))
         }
+    }
+}
+
+/// How the heal step for [`ConformanceProperty::StateAssociativity`] ended.
+enum Heal {
+    /// The groupings converge and the state they converge to is a fixpoint.
+    Healed,
+    /// `merge(L, R) != merge(R, L)`: one exchange does not even agree.
+    NotConverged,
+    /// A state repeated before any fixpoint was reached.
+    Cycle,
+    /// The contract itself rejected a heal-step merge between valid states.
+    Refused(String),
+    /// [`MAX_HEAL_PASSES`] ran out with neither a fixpoint nor a repeat.
+    OutOfPasses,
+}
+
+/// Do two differing groupings `L` and `R` of a triple heal? (#5915)
+///
+/// Healing means: one exchange converges, `merge(R, L) == merge(L, R) = M`, and
+/// iterating `M` by merging in `L`, `R`, `A`, `B` and `C` until nothing changes
+/// reaches a fixpoint, a state every one of the five merges into without moving it.
+/// That is what "the peers settle" means once at-least-once delivery can re-deliver
+/// any of the five at any time.
+///
+/// # Why each part is needed
+///
+/// - **Convergence alone** silences every commutative merge, because
+///   `merge(L, R) == merge(R, L)` by definition there.
+/// - **Absorbing `L` and `R` alone** silences every pick-one merge, because `M`
+///   is then `L` or `R` and absorbs both by construction. A pick-one merge whose
+///   winner relation is cyclic (wrapping sequence numbers, rock-paper-scissors)
+///   genuinely never converges and escaped every enforceable law that way.
+/// - **Absorbing `A`, `B` and `C` without iterating** is too strict: a raised cap
+///   can re-admit a message that was truncated, so a bounded log's `M` may need one
+///   more merge before it is stable (2 of the bounded-log fixture's 36,252
+///   strictly failing triples).
+///
+/// # Verdicts
+///
+/// - A repeated state is a [`Heal::Cycle`]: the merges are deterministic, so a
+///   delivery schedule that re-delivers the same inputs in the same order walks the
+///   same loop forever. That is a concrete non-converging history, not a guess.
+/// - Running out of passes is [`Heal::OutOfPasses`], never a violation: a slow
+///   climb is not proof of anything.
+/// - A heal-step merge the CONTRACT rejects is [`Heal::Refused`], a violation. The
+///   strict check has already failed on valid inputs and both groupings are valid,
+///   so the contract is refusing to reconcile two states it emitted itself, which is
+///   the non-convergence #5725 describes. A RUNTIME or resource failure stays
+///   `Inconclusive` (#5509): it may be the harness, and a contract is never removed
+///   for that. This is a residual: a contract that traps or exhausts its budget on a
+///   heal-step merge escapes this law, as it escapes every other law here.
+///
+/// The visited set holds 32-byte digests rather than states, so a large state cannot
+/// make it expensive; it never holds more than `5 * MAX_HEAL_PASSES + 1` entries.
+fn associativity_heals<O: ConformanceOracle + ?Sized>(
+    oracle: &mut O,
+    left: &[u8],
+    right: &[u8],
+    inputs: [&[u8]; 3],
+) -> Result<Heal, Inconclusive> {
+    let mut converged = match heal_merge(oracle, left, right)? {
+        Ok(state) => state,
+        Err(reason) => return Ok(Heal::Refused(reason)),
+    };
+    match heal_merge(oracle, right, left)? {
+        Ok(state) if state == converged => {}
+        Ok(_) => return Ok(Heal::NotConverged),
+        Err(reason) => return Ok(Heal::Refused(reason)),
+    }
+
+    let absorbed = [left, right, inputs[0], inputs[1], inputs[2]];
+    let mut seen: HashSet<[u8; 32]> = HashSet::new();
+    seen.insert(*blake3::hash(&converged).as_bytes());
+    for _ in 0..MAX_HEAL_PASSES {
+        let mut changed = false;
+        for other in absorbed {
+            let next = match heal_merge(oracle, &converged, other)? {
+                Ok(state) => state,
+                Err(reason) => return Ok(Heal::Refused(reason)),
+            };
+            if next != converged {
+                if !seen.insert(*blake3::hash(&next).as_bytes()) {
+                    return Ok(Heal::Cycle);
+                }
+                converged = next;
+                changed = true;
+            }
+        }
+        if !changed {
+            return Ok(Heal::Healed);
+        }
+    }
+    Ok(Heal::OutOfPasses)
+}
+
+/// A heal-step merge: the contract's own rejection comes back as `Ok(Err(reason))`
+/// so the caller can report it, and every other failure as `Err`, inconclusive.
+fn heal_merge<O: ConformanceOracle + ?Sized>(
+    oracle: &mut O,
+    base: &[u8],
+    other: &[u8],
+) -> Result<Result<Vec<u8>, String>, Inconclusive> {
+    match merge(oracle, base, other) {
+        Ok(state) => Ok(Ok(state)),
+        Err(Inconclusive::ContractError(reason)) => Ok(Err(reason)),
+        Err(other) => Err(other),
     }
 }
 

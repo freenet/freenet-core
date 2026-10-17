@@ -587,27 +587,34 @@ fn groupings_that_never_reconcile_are_still_reported() {
 /// come from the validity check and not from the heal step.
 #[test]
 fn an_invalid_grouping_is_reported() {
-    // The removal shape: `L = [2, 103]`, which this contract alone refuses.
+    // The removal shape: `L = [2, 103]`, `R = [1, 2, 103]`. Each grouping in turn is
+    // the one state this contract refuses, so dropping the validity check on EITHER
+    // side turns one iteration green.
     let (a, b, c): (&[u8], &[u8], &[u8]) = (&[1, 2], &[3], &[LOG_BAN + 3]);
     let left = bounded_log(&bounded_log(a, b), c);
+    let right = bounded_log(a, &bounded_log(b, c));
     assert_eq!(left, vec![2, LOG_BAN + 3]);
-    let rejected = left.clone();
-    let mut fake = bounded_log_contract().validating(move |state| {
-        if state != rejected.as_slice() && bounded_log(state, &[]) == state {
-            Ok(ValidateResult::Valid)
-        } else {
-            Ok(ValidateResult::Invalid)
+    assert_eq!(right, vec![1, 2, LOG_BAN + 3]);
+    for (side, rejected) in [("L", left), ("R", right)] {
+        let mut fake = bounded_log_contract().validating(move |state| {
+            if state != rejected.as_slice() && bounded_log(state, &[]) == state {
+                Ok(ValidateResult::Valid)
+            } else {
+                Ok(ValidateResult::Invalid)
+            }
+        });
+        match verify_case(
+            &mut fake,
+            &case(ConformanceProperty::StateAssociativity, &[a, b, c]),
+        ) {
+            PropertyOutcome::Violated(v) => {
+                assert_eq!(v.property, ConformanceProperty::StateAssociativity);
+                assert!(v.detail.contains("rejects"), "{side}: {}", v.detail);
+            }
+            other @ (PropertyOutcome::Holds | PropertyOutcome::Inconclusive(_)) => {
+                panic!("an invalid {side} grouping must be reported, got {other:?}")
+            }
         }
-    });
-    match verify_case(
-        &mut fake,
-        &case(ConformanceProperty::StateAssociativity, &[a, b, c]),
-    ) {
-        PropertyOutcome::Violated(v) => {
-            assert_eq!(v.property, ConformanceProperty::StateAssociativity);
-            assert!(v.detail.contains("rejects"), "{}", v.detail);
-        }
-        other => panic!("an invalid grouping must be reported, got {other:?}"),
     }
 }
 
