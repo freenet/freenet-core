@@ -3299,7 +3299,7 @@ mod tests {
         let mut shadow = runner_for_test(dir.path());
         let mut samplers = HashMap::new();
         for n in 0..MAX_TRACKED_CONTRACTS as u8 {
-            let _ = record(
+            let _evicted = record(
                 &mut samplers,
                 &SamplingScope::Wide,
                 observation_for(instance(n)),
