@@ -726,15 +726,14 @@ async fn run_writer(
                         continue;
                     }
                 };
-                // Counted for every observed merge, BEFORE `record` applies the
-                // scope: focus weighting needs to know which contracts are busy
-                // before they are focused, and `record` discards out-of-focus
-                // observations (#5913).
-                let meaningful = activity_digest(&observation, activity_max_state_bytes);
-                shadow.note_merge(observation.contract, meaningful);
-                let contract = observation.contract;
-                let (evicted, outcome) = record_with_outcome(&mut samplers, &scope, observation);
-                shadow.note_admission(&contract, outcome);
+                // Every transition, unconditionally: see `observe_transition`.
+                let evicted = observe_transition(
+                    &mut shadow,
+                    &mut samplers,
+                    &scope,
+                    observation,
+                    activity_max_state_bytes,
+                );
                 if let Some(evicted) = evicted {
                     // Dropping the entry alone orphans the file: eviction fires on
                     // every rotation once the map is full, so the directory would
@@ -1497,6 +1496,30 @@ pub(crate) fn record_with_outcome(
         tracked.refused_too_large += 1;
     }
     (evicted, outcome_of(admission))
+}
+
+/// One transition's whole path through the capture task (#5914 review round 2, K5).
+///
+/// In order: count it toward focus activity (every transition, focused or not, since
+/// weighting has to see contracts before they are focused), offer it to the sampler
+/// under the current scope, and tell the focus period what the sampler did. One
+/// function so the order is tested directly rather than scraped out of `run_writer`;
+/// `run_writer` must call it for every transition with no condition in front.
+/// Returns the contract the sampler evicted to make room, whose bundle the caller
+/// must delete.
+#[must_use = "the evicted contract's bundle must be deleted, or it is orphaned on disk"]
+pub(crate) fn observe_transition(
+    shadow: &mut crate::conformance::shadow::ShadowRunner,
+    samplers: &mut HashMap<ContractInstanceId, TrackedContract>,
+    scope: &SamplingScope,
+    observation: Observation,
+    max_state_bytes: usize,
+) -> Option<ContractInstanceId> {
+    let contract = observation.contract;
+    shadow.note_merge(contract, activity_digest(&observation, max_state_bytes));
+    let (evicted, outcome) = record_with_outcome(samplers, scope, observation);
+    shadow.note_admission(&contract, outcome);
+    evicted
 }
 
 /// How a sampler admission maps onto the focus period's counts. Exhaustive, so a new
@@ -2391,80 +2414,59 @@ mod probe_wiring_pins {
         })
     }
 
-    /// Every observed merge must reach focus weighting, BEFORE the scope filter, and
-    /// unconditionally.
+    /// Every transition must go through `observe_transition`, unconditionally.
     ///
-    /// `record_with_outcome` discards out-of-focus observations, so counting after it,
-    /// or behind any condition on scope, would only count contracts already in focus
-    /// and weighting would favour nothing new: #5913 reinstated with every test of
-    /// the weighting itself still green. Nothing calls `run_writer`, so only a pin
-    /// can see this.
-    ///
-    /// Order alone is not enough, as review demonstrated: wrapping the call in a
-    /// multi-line `if scope.admits(..) {` kept it at statement position and before
-    /// `record_with_outcome`, and the first version of this pin passed. So it also
-    /// requires (a) the call at the SAME brace depth as the transition arm's `let`
-    /// and the `record_with_outcome` call, and (b) nothing between the end of the
-    /// `let observation = match msg { .. };` statement and the call except the
-    /// `counts_as_activity` binding, so no `if`, `match`, `continue` or early return
-    /// can sit in front of it either.
+    /// The ORDER inside it (count activity before the scope filter, report admission
+    /// after) is tested directly in `capture::tests`. What only a pin can see is that
+    /// `run_writer` calls it for every transition: wrapping it in a multi-line
+    /// `if scope.admits(..) {`, putting a `continue` in front of it, or guarding the
+    /// match arm (`CaptureMsg::Transition(o) if .. =>`) would each count only focused
+    /// contracts and reinstate #5913 with every behavioural test green. So: the arm is
+    /// exactly `CaptureMsg::Transition(observation) => *observation,`; the call is at
+    /// the same brace depth as the `let observation = match msg` statement; and
+    /// nothing but whitespace sits between that statement's end and the call.
     #[test]
-    fn every_observed_merge_is_counted_before_the_scope_filter() {
+    fn every_transition_goes_through_observe_transition_unconditionally() {
         let body = run_writer_code_only();
         let arm = body
             .find("let observation = match msg {")
             .expect("run_writer no longer unpacks transitions this way; re-anchor");
-        let counted = statement_at(
-            &body,
-            "shadow.note_merge(observation.contract, meaningful);",
-        )
-        .expect(
-            "run_writer no longer feeds observed merges to focus weighting, so focus \
-                 falls back to a uniform draw over a mostly-cold hosted set (#5913)",
-        );
-        let filtered = statement_at(
-            &body,
-            "let (evicted, outcome) = record_with_outcome(&mut samplers, &scope, observation);",
-        )
-        .expect("run_writer no longer records observations this way; re-anchor");
         assert!(
-            arm < counted && counted < filtered,
-            "merge activity is counted outside the transition path or after the scope \
-             filter, so out-of-focus merges never reach the weighting"
+            statement_at(
+                &body,
+                "CaptureMsg::Transition(observation) => *observation,"
+            )
+            .is_some(),
+            "the transition arm is no longer unconditional; a guard on it decides which \
+             merges are counted"
         );
-
-        let depth_between = |from: usize, to: usize| -> i64 {
-            body[from..to]
-                .chars()
-                .map(|c| match c {
-                    '{' => 1,
-                    '}' => -1,
-                    _ => 0,
-                })
-                .sum()
-        };
+        let called = statement_at(&body, "let evicted = observe_transition(").expect(
+            "run_writer no longer routes transitions through observe_transition, so \
+             merge activity and admission outcomes may not reach focus (#5913)",
+        );
+        assert!(arm < called);
+        let depth: i64 = body[arm..called]
+            .chars()
+            .map(|c| match c {
+                '{' => 1,
+                '}' => -1,
+                _ => 0,
+            })
+            .sum();
         assert_eq!(
-            depth_between(arm, counted),
-            0,
-            "the merge count is nested inside a block the transition arm is not, so a \
+            depth, 0,
+            "observe_transition is nested inside a block the transition arm is not, so a \
              condition (a scope check most plausibly) decides whether it runs"
         );
-        assert_eq!(
-            depth_between(counted, filtered),
-            0,
-            "the scope filter moved into a block"
-        );
-
-        // The `let observation = match msg { .. };` statement's own extent.
         let open = arm + body[arm..].find('{').expect("match has a body");
-        let mut depth = 0i64;
+        let mut level = 0i64;
         let mut close = None;
         for (offset, ch) in body[open..].char_indices() {
             match ch {
-                '{' => depth += 1,
+                '{' => level += 1,
                 '}' => {
-                    depth -= 1;
-                    if depth == 0 {
+                    level -= 1;
+                    if level == 0 {
                         close = Some(open + offset);
                         break;
                     }
@@ -2473,36 +2475,13 @@ mod probe_wiring_pins {
             }
         }
         let close = close.expect("the transition match is not brace-balanced");
-        let between = body[close + 1..counted].trim_start_matches(';');
-        for line in between.lines() {
-            let line = line.trim();
-            assert!(
-                line.is_empty()
-                    || line
-                        == "let meaningful = activity_digest(&observation, activity_max_state_bytes);",
-                "`{line}` sits between unpacking a transition and counting it; nothing \
-                 may decide whether a merge is counted except `counts_as_activity`"
-            );
-        }
-    }
-
-    /// What the sampler did with each merge must reach the focus period, after the
-    /// decision is made. Without it `admitted` stays zero for every contract, so
-    /// nothing is ever "accruing" (mid-period re-draws then displace a contract that is
-    /// building a sample) and every period reports `samples_admitted=0`.
-    #[test]
-    fn admission_outcomes_reach_the_focus_period() {
-        let body = run_writer_code_only();
-        let recorded = statement_at(
-            &body,
-            "let (evicted, outcome) = record_with_outcome(&mut samplers, &scope, observation);",
-        )
-        .expect("run_writer no longer records observations this way; re-anchor");
-        let noted = statement_at(&body, "shadow.note_admission(&contract, outcome);").expect(
-            "run_writer no longer tells the focus period what admission decided, so \
-             keep-if-accruing and the period's admitted/refused counts are dead",
+        let between = body[close + 1..called].trim_start_matches(';');
+        assert!(
+            between.trim().is_empty(),
+            "`{}` sits between unpacking a transition and observing it; nothing may \
+             decide whether a merge is observed",
+            between.trim()
         );
-        assert!(recorded < noted, "the outcome is noted before it exists");
     }
 
     /// A completed probe's verdicts must reach the focus period, or every period
@@ -3116,6 +3095,83 @@ mod tests {
         let mut no_op = observation_for(instance(1));
         no_op.result_state = no_op.base_state.clone();
         assert_eq!(activity_digest(&no_op, 1024), None);
+    }
+
+    fn runner_for_test(dir: &std::path::Path) -> crate::conformance::shadow::ShadowRunner {
+        crate::conformance::shadow::ShadowRunner::new(
+            dir,
+            crate::conformance::policy::EnforcementMode::Shadow,
+        )
+    }
+
+    /// An out-of-focus transition counts toward activity but is not sampled: the
+    /// count happens before the scope filter (K5 replaces the source pin for this).
+    #[test]
+    fn observe_transition_counts_an_out_of_focus_merge_without_sampling_it() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut shadow = runner_for_test(dir.path());
+        let mut samplers = HashMap::new();
+        let evicted = observe_transition(
+            &mut shadow,
+            &mut samplers,
+            &focused_on(&[9]),
+            observation_for(instance(1)),
+            1024,
+        );
+        assert_eq!(evicted, None);
+        assert!(samplers.is_empty(), "an out-of-focus merge was sampled");
+        assert_eq!(
+            shadow.activity_tracked(),
+            1,
+            "an out-of-focus merge did not reach focus weighting"
+        );
+    }
+
+    /// A transition for a focus contract reaches the sampler AND the focus period,
+    /// which then knows the contract is accruing samples.
+    #[test]
+    fn observe_transition_reports_admission_to_the_focus_period() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut shadow = runner_for_test(dir.path());
+        let hosted: Vec<_> = (0..10u8).map(instance).collect();
+        let focus = shadow.focus(Some(hosted), &[]);
+        let target = focus.selected[0];
+        let scope = SamplingScope::Focused(focus.selected.iter().copied().collect());
+        assert_eq!(shadow.focus_without_new_samples(), 2);
+        let mut samplers = HashMap::new();
+        let _evicted = observe_transition(
+            &mut shadow,
+            &mut samplers,
+            &scope,
+            observation_for(target),
+            1024,
+        );
+        assert!(
+            samplers.contains_key(&target),
+            "a focused merge was not sampled"
+        );
+        assert_eq!(
+            shadow.focus_without_new_samples(),
+            1,
+            "the sampler admitted a new sample and the focus period never heard"
+        );
+    }
+
+    /// A merge that changes nothing reaches the sampler but adds no weight.
+    #[test]
+    fn observe_transition_does_not_weight_a_no_op_merge() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut shadow = runner_for_test(dir.path());
+        let mut no_op = observation_for(instance(1));
+        no_op.result_state = no_op.base_state.clone();
+        let _evicted = observe_transition(
+            &mut shadow,
+            &mut HashMap::new(),
+            &SamplingScope::Wide,
+            no_op,
+            1024,
+        );
+        assert_eq!(shadow.activity_tracked(), 0);
     }
 
     fn focused_on(ids: &[u8]) -> SamplingScope {
