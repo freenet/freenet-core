@@ -224,34 +224,14 @@ async fn verifier_matches_real_wasm_for_every_planted_defect()
     // further down rather than being an exception this loop must dodge. The claim
     // is that associativity is the law that NAMES the defect and no pairwise state
     // law fires, not that nothing else in the module can see it.
-    //
-    // Since #5915 associativity reports only groupings that do not heal: they must
-    // converge on one exchange to a state absorbing both. This mode's merge commutes,
-    // so its groupings always converge; it is reported where the converged state
-    // fails to absorb one of them. `(1)`, `(2,3,4)`, `(5)` is such a triple
-    // (`L = {2,4,5}`, `R = {1,2,3}`, `M = {2,3,5}`, and `merge(M, R) = {1,2,3}`).
-    // `(1,2)`, `(3,4)`, `(5,6)`, the triple used before #5915, fails strictly but
-    // heals, so it is pinned silent alongside: the guard discriminates, it does not
-    // simply flag every capped set.
     let mut capped = RuntimeOracle::standalone(wasm.clone(), vec![CAPPED_SET]).await?;
     let associativity_case = ConformanceCase::new(
         ConformanceProperty::StateAssociativity,
-        vec![bytes(&[1]), bytes(&[2, 3, 4]), bytes(&[5])],
+        vec![bytes(&[1, 2]), bytes(&[3, 4]), bytes(&[5, 6])],
     );
     assert_violates(
         verify_case(&mut capped, &associativity_case),
         ConformanceProperty::StateAssociativity,
-    );
-    assert_eq!(
-        verify_case(
-            &mut capped,
-            &ConformanceCase::new(
-                ConformanceProperty::StateAssociativity,
-                vec![bytes(&[1, 2]), bytes(&[3, 4]), bytes(&[5, 6])],
-            ),
-        ),
-        PropertyOutcome::Holds,
-        "this triple's groupings converge to a state absorbing both, so it heals"
     );
     for pairwise in [
         ConformanceCase::new(
