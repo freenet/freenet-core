@@ -24,9 +24,11 @@
 //! caps bytes rather than item counts, so a contract with large states cannot grow
 //! the corpus without limit. The number of contracts tracked is capped too. The
 //! writer also counts merge activity per contract for focus weighting
-//! (`counts_as_activity`, `ShadowRunner::note_merge`); that count lives in a
-//! fixed-size, capped map (`activity::MAX_TRACKED_ACTIVITY`) and costs the writer a
-//! hash-map increment per observation, nothing on the merge path.
+//! (`activity_digest`, `ShadowRunner::note_merge`) in a fixed-size, capped map
+//! (`activity::MAX_TRACKED_ACTIVITY`). Per observation that costs the writer the size
+//! checks, a byte comparison of base and result when their lengths match, and a
+//! BLAKE3 hash of the result state (at most the per-state ceiling, 1 MiB by default:
+//! about 0.35 ms single-threaded in a release build); nothing on the merge path.
 //!
 //! # Privacy
 //!
@@ -728,7 +730,7 @@ async fn run_writer(
                 // scope: focus weighting needs to know which contracts are busy
                 // before they are focused, and `record` discards out-of-focus
                 // observations (#5913).
-                let meaningful = counts_as_activity(&observation, activity_max_state_bytes);
+                let meaningful = activity_digest(&observation, activity_max_state_bytes);
                 shadow.note_merge(observation.contract, meaningful);
                 let contract = observation.contract;
                 let (evicted, outcome) = record_with_outcome(&mut samplers, &scope, observation);
@@ -1027,24 +1029,47 @@ async fn run_writer(
 /// Two conditions, both about whether focusing on the contract could have produced a
 /// sample from this merge:
 ///
+/// - **The sampler could admit it.** A state or delta above the per-state ceiling is
+///   refused as too large even for a focused contract.
 /// - **It changed the state.** The executor offers an observation before its
 ///   new==current short-circuit, so duplicate deliveries and replays of the current
 ///   state arrive here too. They add nothing to sample, and counting them would let
 ///   anyone raise a contract's weight by replaying its state.
-/// - **The sampler could admit it.** A state or delta above the per-state ceiling is
-///   refused as too large even for a focused contract.
 ///
-/// Runs on the capture task, never on the merge path. The state comparison is a
-/// length check first and a byte comparison only when lengths match.
+/// The size checks come first, then a length comparison, so the byte comparison runs
+/// only for states that fit and are the same length. Runs on the capture task, never
+/// on the merge path. Repeats of a RECENT state are caught separately, by
+/// [`activity_digest`] and the tracker's ring.
 pub(crate) fn counts_as_activity(observation: &Observation, max_state_bytes: usize) -> bool {
-    if observation.result_state == observation.base_state {
-        return false;
-    }
     let fits = |bytes: &[u8]| bytes.len() <= max_state_bytes;
-    fits(&observation.base_state)
+    let fits_all = fits(&observation.base_state)
         && fits(&observation.result_state)
         && observation.incoming_state.as_deref().is_none_or(fits)
-        && observation.delta.as_deref().is_none_or(fits)
+        && observation.delta.as_deref().is_none_or(fits);
+    if !fits_all {
+        return false;
+    }
+    observation.result_state.len() != observation.base_state.len()
+        || observation.result_state != observation.base_state
+}
+
+/// The result-state digest a counting merge contributes to the activity tracker, or
+/// `None` if the merge does not count at all (see [`counts_as_activity`]).
+///
+/// Hashing runs only after the cheap checks pass, and only over a state within the
+/// sampler's per-state ceiling, on the capture task. BLAKE3 truncated to 128 bits: the
+/// digest only has to tell a contract's last few states apart.
+pub(crate) fn activity_digest(
+    observation: &Observation,
+    max_state_bytes: usize,
+) -> Option<super::activity::StateDigest> {
+    if !counts_as_activity(observation, max_state_bytes) {
+        return None;
+    }
+    let hash = blake3::hash(&observation.result_state);
+    let mut first = [0u8; 16];
+    first.copy_from_slice(&hash.as_bytes()[..16]);
+    Some(u128::from_le_bytes(first))
 }
 
 pub(crate) struct TrackedContract {
@@ -2454,7 +2479,7 @@ mod probe_wiring_pins {
             assert!(
                 line.is_empty()
                     || line
-                        == "let meaningful = counts_as_activity(&observation, activity_max_state_bytes);",
+                        == "let meaningful = activity_digest(&observation, activity_max_state_bytes);",
                 "`{line}` sits between unpacking a transition and counting it; nothing \
                  may decide whether a merge is counted except `counts_as_activity`"
             );
@@ -3075,6 +3100,22 @@ mod tests {
             record_with_outcome(&mut samplers, &scope, observation_for(instance(last)));
         assert_eq!(evicted, None);
         assert_eq!(outcome, RecordOutcome::Refused);
+    }
+
+    /// Equal result states give equal digests and different ones differ; a merge
+    /// that does not count gives none.
+    #[test]
+    fn activity_digest_identifies_the_result_state() {
+        let a = observation_for(instance(1));
+        let mut same = observation_for(instance(2));
+        same.base_state = vec![9];
+        assert_eq!(activity_digest(&a, 1024), activity_digest(&same, 1024));
+        let mut other = observation_for(instance(1));
+        other.result_state = vec![1, 2, 4];
+        assert_ne!(activity_digest(&a, 1024), activity_digest(&other, 1024));
+        let mut no_op = observation_for(instance(1));
+        no_op.result_state = no_op.base_state.clone();
+        assert_eq!(activity_digest(&no_op, 1024), None);
     }
 
     fn focused_on(ids: &[u8]) -> SamplingScope {

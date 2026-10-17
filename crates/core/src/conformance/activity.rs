@@ -13,7 +13,10 @@
 //!
 //! Nothing here runs on the merge path. Counting happens in the capture writer task,
 //! when an observation leaves the queue (`capture::run_writer`), so a merge pays the
-//! cost it already paid for capture and nothing more. Recording is a hash-map increment.
+//! cost it already paid for capture and nothing more. Per observation the writer pays
+//! the size checks and state comparison in `capture::counts_as_activity`, one BLAKE3
+//! hash of the result state, and here a lookup in a [`RECENT_STATES`]-entry ring plus
+//! a hash-map increment.
 //! Once the tracked set is full, an insertion evicts a batch of the least active
 //! entries in one linear pass, so the scan runs at most once per
 //! `cap / EVICTION_BATCH_DIVISOR` new contracts rather than on every one.
@@ -28,8 +31,9 @@
 //!
 //! # Bounded
 //!
-//! At most [`MAX_TRACKED_ACTIVITY`] contracts, each a fixed-size id and a `u32`, so the
-//! count cap is also the memory cap (roughly 60 KiB at the default). Decay is applied by
+//! At most [`MAX_TRACKED_ACTIVITY`] contracts, each a fixed-size id, a `u32` count and
+//! [`RECENT_STATES`] 16-byte digests, so the count cap is also the memory cap (roughly
+//! 150 KiB at the default, map overhead included). Decay is applied by
 //! the caller once per focus period (`ShadowRunner::advance`), halving every count, so
 //! a contract that stops merging drops out within a few periods.
 //!
@@ -68,10 +72,54 @@ const EVICTION_BATCH_DIVISOR: usize = 64;
 /// went quiet. At twice the cap it holds it for at most one period after the burst.
 pub(crate) const STORED_ACTIVITY_CAP: u32 = 2 * super::focus::ACTIVITY_WEIGHT_CAP;
 
+/// A 128-bit BLAKE3 digest of a merge's result state, for spotting repeats.
+pub(crate) type StateDigest = u128;
+
+/// How many recent result states per contract are remembered for deduplication.
+///
+/// A contract toggling between a few states (A -> B -> A ...) changes state on every
+/// merge but gives the sampler nothing new after the first of each, so those merges
+/// must not count as activity (#5914 review round 2, K2). Four covers the common
+/// toggles; a contract cycling through more than four states does gain weight, and
+/// does give the sampler distinct states to keep.
+pub(crate) const RECENT_STATES: usize = 4;
+
+#[derive(Debug, Clone)]
+struct Entry {
+    count: u32,
+    recent: [StateDigest; RECENT_STATES],
+    filled: u8,
+    next: u8,
+}
+
+impl Entry {
+    fn new(digest: StateDigest) -> Self {
+        let mut recent = [0; RECENT_STATES];
+        recent[0] = digest;
+        Self {
+            count: 1,
+            recent,
+            filled: 1,
+            next: 1 % RECENT_STATES as u8,
+        }
+    }
+
+    /// Remember `digest`; false if it was already among the recent states.
+    fn remember(&mut self, digest: StateDigest) -> bool {
+        if self.recent[..usize::from(self.filled)].contains(&digest) {
+            return false;
+        }
+        self.recent[usize::from(self.next)] = digest;
+        self.next = (self.next + 1) % RECENT_STATES as u8;
+        self.filled = (self.filled + 1).min(RECENT_STATES as u8);
+        true
+    }
+}
+
 /// Recent merge counts per contract.
 #[derive(Debug, Clone)]
 pub(crate) struct MergeActivity {
-    counts: HashMap<ContractInstanceId, u32>,
+    counts: HashMap<ContractInstanceId, Entry>,
     cap: usize,
     /// Per-peer secret that orders ties at eviction, so which equally-quiet contract
     /// loses its record is not a function of the id an author chose.
@@ -107,16 +155,22 @@ impl MergeActivity {
         Self::new(cap, [0; 32])
     }
 
-    /// Count one merge observed for `contract`.
-    pub(crate) fn record(&mut self, contract: ContractInstanceId) {
-        if let Some(count) = self.counts.get_mut(&contract) {
-            *count = count.saturating_add(1).min(STORED_ACTIVITY_CAP);
-            return;
+    /// Count one merge for `contract` whose result state hashes to `digest`, unless
+    /// that state was among the contract's last [`RECENT_STATES`]. Returns whether it
+    /// counted.
+    pub(crate) fn record(&mut self, contract: ContractInstanceId, digest: StateDigest) -> bool {
+        if let Some(entry) = self.counts.get_mut(&contract) {
+            if !entry.remember(digest) {
+                return false;
+            }
+            entry.count = entry.count.saturating_add(1).min(STORED_ACTIVITY_CAP);
+            return true;
         }
         if self.counts.len() >= self.cap {
             self.evict_least_active();
         }
-        self.counts.insert(contract, 1);
+        self.counts.insert(contract, Entry::new(digest));
+        true
     }
 
     /// Halve every count and forget contracts that reach zero.
@@ -126,15 +180,15 @@ impl MergeActivity {
     /// `r` per period settles near `2r`, and one that goes quiet is forgotten after
     /// `log2(count)` periods.
     pub(crate) fn decay(&mut self) {
-        self.counts.retain(|_, count| {
-            *count /= 2;
-            *count > 0
+        self.counts.retain(|_, entry| {
+            entry.count /= 2;
+            entry.count > 0
         });
     }
 
     /// Current activity for `contract`; zero if not tracked.
     pub(crate) fn count(&self, contract: &ContractInstanceId) -> u32 {
-        self.counts.get(contract).copied().unwrap_or(0)
+        self.counts.get(contract).map_or(0, |entry| entry.count)
     }
 
     pub(crate) fn len(&self) -> usize {
@@ -164,7 +218,7 @@ impl MergeActivity {
         let mut ranked: Vec<(u32, [u8; 32], ContractInstanceId)> = self
             .counts
             .iter()
-            .map(|(id, count)| (*count, tie(id), *id))
+            .map(|(id, entry)| (entry.count, tie(id), *id))
             .collect();
         let order = |a: &(u32, [u8; 32], ContractInstanceId),
                      b: &(u32, [u8; 32], ContractInstanceId)| {
@@ -188,6 +242,12 @@ impl MergeActivity {
 mod tests {
     use super::*;
 
+    /// A digest no other call returns, for tests that mean "a merge with a new state".
+    fn fresh() -> StateDigest {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        u128::from(NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+    }
+
     fn id(n: u16) -> ContractInstanceId {
         let mut bytes = [0u8; 32];
         bytes[..2].copy_from_slice(&n.to_be_bytes());
@@ -198,9 +258,9 @@ mod tests {
     fn record_counts_merges_per_contract() {
         let mut activity = MergeActivity::default();
         for _ in 0..5 {
-            activity.record(id(1));
+            activity.record(id(1), fresh());
         }
-        activity.record(id(2));
+        activity.record(id(2), fresh());
         assert_eq!(activity.count(&id(1)), 5);
         assert_eq!(activity.count(&id(2)), 1);
         assert_eq!(
@@ -220,7 +280,7 @@ mod tests {
         let cap = 128;
         let mut activity = MergeActivity::with_cap(cap);
         for n in 0..5_000u16 {
-            activity.record(id(n));
+            activity.record(id(n), fresh());
             assert!(
                 activity.len() <= cap,
                 "tracked {} contracts with a cap of {cap}",
@@ -247,11 +307,11 @@ mod tests {
         // Eight busy contracts, then far more one-off contracts than the cap.
         for busy in 0..8u16 {
             for _ in 0..100 {
-                activity.record(id(busy));
+                activity.record(id(busy), fresh());
             }
         }
         for cold in 1_000..2_000u16 {
-            activity.record(id(cold));
+            activity.record(id(cold), fresh());
         }
         for busy in 0..8u16 {
             assert_eq!(
@@ -273,12 +333,12 @@ mod tests {
         let mut activity = MergeActivity::with_cap(cap);
         for incumbent in 0..cap as u16 {
             for _ in 0..10 {
-                activity.record(id(incumbent));
+                activity.record(id(incumbent), fresh());
             }
         }
         let newcomer = id(9_999);
         for _ in 0..50 {
-            activity.record(newcomer);
+            activity.record(newcomer, fresh());
         }
         assert_eq!(
             activity.count(&newcomer),
@@ -293,9 +353,9 @@ mod tests {
     fn decay_halves_and_forgets_quiet_contracts() {
         let mut activity = MergeActivity::default();
         for _ in 0..8 {
-            activity.record(id(1));
+            activity.record(id(1), fresh());
         }
-        activity.record(id(2));
+        activity.record(id(2), fresh());
 
         activity.decay();
         assert_eq!(activity.count(&id(1)), 4);
@@ -319,8 +379,14 @@ mod tests {
     #[test]
     fn counts_saturate_rather_than_wrap() {
         let mut activity = MergeActivity::default();
-        activity.counts.insert(id(1), u32::MAX);
-        activity.record(id(1));
+        activity.counts.insert(
+            id(1),
+            Entry {
+                count: u32::MAX,
+                ..Entry::new(0)
+            },
+        );
+        activity.record(id(1), fresh());
         assert_eq!(activity.count(&id(1)), STORED_ACTIVITY_CAP);
     }
 
@@ -334,7 +400,7 @@ mod tests {
     fn a_burst_cannot_bank_more_than_the_stored_cap() {
         let mut activity = MergeActivity::default();
         for _ in 0..10_000 {
-            activity.record(id(1));
+            activity.record(id(1), fresh());
         }
         assert_eq!(
             activity.count(&id(1)),
@@ -355,16 +421,16 @@ mod tests {
     fn eviction_batches_at_the_production_cap() {
         let mut activity = MergeActivity::new(MAX_TRACKED_ACTIVITY, [1; 32]);
         for n in 0..MAX_TRACKED_ACTIVITY as u16 {
-            activity.record(id(n));
+            activity.record(id(n), fresh());
         }
         assert_eq!(activity.evicted(), 0);
-        activity.record(id(60_000));
+        activity.record(id(60_000), fresh());
         let batch = MAX_TRACKED_ACTIVITY / EVICTION_BATCH_DIVISOR;
         assert_eq!(activity.evicted() as usize, batch);
         assert_eq!(activity.len(), MAX_TRACKED_ACTIVITY - batch + 1);
         // The next cap/64 - 1 newcomers fit without another scan.
         for n in 0..(batch - 1) as u16 {
-            activity.record(id(61_000 + n));
+            activity.record(id(61_000 + n), fresh());
         }
         assert_eq!(
             activity.evicted() as usize,
@@ -383,9 +449,9 @@ mod tests {
         let survivors_for = |salt: u8| {
             let mut activity = MergeActivity::new(cap, [salt; 32]);
             for n in 0..cap as u16 {
-                activity.record(id(n));
+                activity.record(id(n), fresh());
             }
-            activity.record(id(9_000));
+            activity.record(id(9_000), fresh());
             (0..cap as u16)
                 .filter(|n| activity.counts.contains_key(&id(*n)))
                 .collect::<Vec<_>>()
@@ -401,6 +467,42 @@ mod tests {
                 .iter()
                 .any(|survivors| *survivors != lowest_evicted),
             "ties are always broken lowest-id first"
+        );
+    }
+
+    /// A toggle (A -> B -> A -> B ...) changes state on every merge and gives the
+    /// sampler nothing new after the first of each, so it counts twice, not forty
+    /// times (#5914 review round 2, K2).
+    #[test]
+    fn a_contract_toggling_between_states_counts_each_state_once() {
+        let mut activity = MergeActivity::default();
+        let (a, b) = (fresh(), fresh());
+        let counted: usize = (0..40)
+            .map(|i| usize::from(activity.record(id(1), if i % 2 == 0 { a } else { b })))
+            .sum();
+        assert_eq!(counted, 2);
+        assert_eq!(activity.count(&id(1)), 2);
+    }
+
+    /// The window is the last RECENT_STATES states: a state that has fallen out of it
+    /// counts again, and distinct states always count.
+    #[test]
+    fn the_dedup_window_is_the_last_few_states() {
+        let mut activity = MergeActivity::default();
+        let states: Vec<_> = (0..=RECENT_STATES).map(|_| fresh()).collect();
+        for state in &states {
+            assert!(
+                activity.record(id(1), *state),
+                "a distinct state was not counted"
+            );
+        }
+        assert!(
+            !activity.record(id(1), states[RECENT_STATES]),
+            "the latest state counted twice"
+        );
+        assert!(
+            activity.record(id(1), states[0]),
+            "a state older than the window was still deduplicated"
         );
     }
 }

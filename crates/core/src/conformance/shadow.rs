@@ -633,11 +633,16 @@ impl ShadowRunner {
     /// Called for EVERY observed merge, focused or not, because weighting has to
     /// know about contracts that are not in focus yet. It must stay ahead of the scope
     /// filter in `capture::run_writer`, which discards out-of-focus observations.
-    /// `counts_as_activity` is [`super::capture::counts_as_activity`]'s verdict: only
-    /// a merge that changed state and could have been sampled raises the weight.
-    pub(crate) fn note_merge(&mut self, contract: ContractInstanceId, counts_as_activity: bool) {
-        if counts_as_activity {
-            self.activity.record(contract);
+    /// `activity` is [`super::capture::activity_digest`]'s verdict: `None` for a merge
+    /// that cannot count, otherwise its result-state digest, which counts unless the
+    /// contract produced that state recently.
+    pub(crate) fn note_merge(
+        &mut self,
+        contract: ContractInstanceId,
+        activity: Option<super::activity::StateDigest>,
+    ) {
+        if let Some(digest) = activity {
+            self.activity.record(contract, digest);
         }
         self.period.seen(&contract);
     }
@@ -1641,6 +1646,25 @@ mod tests {
         assert_eq!(source, CandidateSource::Hosted);
     }
 
+    /// A result-state digest no other call returns: "a merge that produced a new
+    /// state".
+    fn fresh_state() -> crate::conformance::activity::StateDigest {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        u128::from(NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+    }
+
+    /// Toggling between two states through the runner counts each state once.
+    #[test]
+    fn a_toggling_contract_gains_no_weight_after_its_first_two_states() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut runner = runner_with_salt(dir.path(), [31; 32]);
+        let (a, b) = (fresh_state(), fresh_state());
+        for i in 0..40 {
+            runner.note_merge(instance(1), Some(if i % 2 == 0 { a } else { b }));
+        }
+        assert_eq!(runner.activity.count(&instance(1)), 2);
+    }
+
     fn instance(n: u8) -> ContractInstanceId {
         ContractInstanceId::new([n; 32])
     }
@@ -1700,7 +1724,7 @@ mod tests {
 
         for contract in &busy {
             for _ in 0..40 {
-                runner.note_merge(*contract, true);
+                runner.note_merge(*contract, Some(fresh_state()));
             }
         }
         assert!(runner.advance().is_none(), "the first tick must not rotate");
@@ -1722,7 +1746,7 @@ mod tests {
         let dir = tempfile::TempDir::new().expect("tempdir");
         let mut runner = runner_with_salt(dir.path(), [5; 32]);
         for _ in 0..8 {
-            runner.note_merge(instance(1), true);
+            runner.note_merge(instance(1), Some(fresh_state()));
         }
         for _ in 0..ROTATE_EVERY_TICKS - 1 {
             runner.advance();
@@ -1783,7 +1807,7 @@ mod tests {
         let mut runner = runner_with_salt(dir.path(), salt);
 
         for _ in 0..5 {
-            runner.note_merge(instance(59), true);
+            runner.note_merge(instance(59), Some(fresh_state()));
         }
         runner.advance();
         let first = runner.focus(Some(hosted.clone()), &[]).selected;
@@ -1791,7 +1815,7 @@ mod tests {
 
         for contract in &burst {
             for _ in 0..60 {
-                runner.note_merge(*contract, true);
+                runner.note_merge(*contract, Some(fresh_state()));
             }
         }
         assert!(runner.advance().is_none(), "still mid-period");
@@ -1813,12 +1837,12 @@ mod tests {
         runner.advance();
         let first = runner.focus(Some(hosted.clone()), &[]).selected;
         for contract in &first {
-            runner.note_merge(*contract, true);
+            runner.note_merge(*contract, Some(fresh_state()));
             runner.note_admission(contract, RecordOutcome::Admitted);
         }
         for contract in hosted.iter().filter(|c| !first.contains(c)) {
             for _ in 0..100 {
-                runner.note_merge(*contract, true);
+                runner.note_merge(*contract, Some(fresh_state()));
             }
         }
         for _ in 1..ROTATE_EVERY_TICKS - 1 {
@@ -1839,7 +1863,7 @@ mod tests {
         let dir = tempfile::TempDir::new().expect("tempdir");
         let mut runner = runner_with_salt(dir.path(), [23; 32]);
         let hosted: Vec<_> = (0..20u8).map(instance).collect();
-        runner.note_merge(instance(200), true);
+        runner.note_merge(instance(200), Some(fresh_state()));
         runner.advance();
         let first = runner.focus(Some(hosted.clone()), &[]);
         assert_eq!(
@@ -1849,7 +1873,7 @@ mod tests {
         assert!(!first.selected.contains(&instance(200)));
 
         for _ in 0..10 {
-            runner.note_merge(instance(3), true);
+            runner.note_merge(instance(3), Some(fresh_state()));
         }
         runner.advance();
         let next = runner.focus(Some(hosted.clone()), &[]);
@@ -1866,7 +1890,7 @@ mod tests {
         let dir = tempfile::TempDir::new().expect("tempdir");
         let mut runner = runner_with_salt(dir.path(), [13; 32]);
         for _ in 0..100 {
-            runner.note_merge(instance(1), false);
+            runner.note_merge(instance(1), None);
         }
         assert_eq!(runner.activity_tracked(), 0);
     }
@@ -1875,7 +1899,7 @@ mod tests {
     /// `capture::run_writer` does: `note_merge` first, then `note_admission`.
     fn feed(runner: &mut ShadowRunner, contract: ContractInstanceId, outcomes: &[RecordOutcome]) {
         for outcome in outcomes {
-            runner.note_merge(contract, true);
+            runner.note_merge(contract, Some(fresh_state()));
             runner.note_admission(&contract, *outcome);
         }
     }
@@ -1933,7 +1957,7 @@ mod tests {
         // (it is accruing samples), the weighted slot is redrawn to some c.
         for contract in hosted.iter().filter(|c| **c != a && **c != b) {
             for _ in 0..7 {
-                runner.note_merge(*contract, true);
+                runner.note_merge(*contract, Some(fresh_state()));
             }
         }
         let without_b: Vec<_> = hosted.iter().copied().filter(|c| *c != b).collect();
@@ -2034,14 +2058,14 @@ mod tests {
         let hosted: Vec<_> = (0..20u8).map(instance).collect();
         for contract in &hosted {
             for _ in 0..5 {
-                runner.note_merge(*contract, true);
+                runner.note_merge(*contract, Some(fresh_state()));
             }
         }
         let first = runner.focus(Some(hosted.clone()), &[]).selected;
         let weighted = first[1];
         // The weighted pick keeps winning after it gets much busier, so its stint continues.
         for _ in 0..60 {
-            runner.note_merge(weighted, true);
+            runner.note_merge(weighted, Some(fresh_state()));
         }
         let second = runner.focus(Some(hosted), &[]).selected;
         assert!(
@@ -2065,12 +2089,12 @@ mod tests {
         let first = runner.focus(Some(hosted.clone()), &[]).selected;
         let weighted = first[1];
         for _ in 0..4 {
-            runner.note_merge(weighted, true);
+            runner.note_merge(weighted, Some(fresh_state()));
             runner.note_admission(&weighted, RecordOutcome::NothingNew);
         }
         for contract in hosted.iter().filter(|c| !first.contains(c)) {
             for _ in 0..100 {
-                runner.note_merge(*contract, true);
+                runner.note_merge(*contract, Some(fresh_state()));
             }
         }
         let now = runner.focus(Some(hosted), &[]).selected;
@@ -2109,7 +2133,7 @@ mod tests {
             );
             // Both accrue; neither may be displaced.
             for contract in &second {
-                runner.note_merge(*contract, true);
+                runner.note_merge(*contract, Some(fresh_state()));
                 runner.note_admission(contract, RecordOutcome::Admitted);
             }
             let third = runner.focus(Some(without_uniform), &[]).selected;
