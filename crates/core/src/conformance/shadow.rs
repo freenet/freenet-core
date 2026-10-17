@@ -662,7 +662,6 @@ impl ShadowRunner {
 
     /// Write the current period beside the epoch (best-effort).
     fn persist_period(&mut self) {
-        self.period_dirty = false;
         let mut members: Vec<(ContractInstanceId, PeriodMember)> = self
             .period
             .current
@@ -670,7 +669,9 @@ impl ShadowRunner {
             .map(|(id, member)| (*id, *member))
             .collect();
         members.sort_by(|(a, _), (b, _)| a.as_bytes().cmp(b.as_bytes()));
-        store_period(
+        // Clean only once the checkpoint is on disk (#5914 review round 4): a failed
+        // write leaves the period dirty, so the next flush retries it.
+        let written = store_period(
             &self.dir,
             &PersistedPeriod {
                 salt_check: self.salt_check,
@@ -681,6 +682,9 @@ impl ShadowRunner {
                 totals: self.period.totals,
             },
         );
+        if written {
+            self.period_dirty = false;
+        }
     }
 
     pub fn epoch(&self) -> u64 {
@@ -1410,9 +1414,10 @@ fn load_period(dir: &Path, epoch: u64, salt: &[u8; 32]) -> Option<PersistedPerio
     (saved.epoch == epoch && saved.salt_check == salt_check(salt)).then_some(saved)
 }
 
-/// Persist the current period beside the epoch. Best-effort like the epoch: a peer
-/// that cannot write it reports its next period after a restart as incomplete.
-fn store_period(dir: &Path, period: &PersistedPeriod) {
+/// Persist the current period beside the epoch, returning whether it was written.
+/// Best-effort like the epoch: a peer that cannot write it reports its next period
+/// after a restart as incomplete, and retries at the next flush.
+fn store_period(dir: &Path, period: &PersistedPeriod) -> bool {
     let path = dir.join(PERIOD_FILE);
     // Written to a temporary file and renamed over the old one, so a crash mid-write
     // leaves the previous checkpoint rather than a torn file (#5914 review round 3,
@@ -1432,13 +1437,17 @@ fn store_period(dir: &Path, period: &PersistedPeriod) {
             })
         })
         .and_then(|()| std::fs::rename(&staging, &path));
-    if let Err(err) = written {
-        tracing::warn!(
-            path = %path.display(),
-            error = %err,
-            "could not persist the conformance focus period; a restart will start an \
-             incomplete one"
-        );
+    match written {
+        Ok(()) => true,
+        Err(err) => {
+            tracing::warn!(
+                path = %path.display(),
+                error = %err,
+                "could not persist the conformance focus period; a restart will start an \
+                 incomplete one"
+            );
+            false
+        }
     }
 }
 
@@ -2664,6 +2673,35 @@ mod tests {
             ),
             (2, 1, 1, 1),
             "counts written since the last tick were lost on restart"
+        );
+    }
+
+    /// A checkpoint that fails to write leaves the period dirty, so the next flush
+    /// retries it (#5914 review round 4).
+    #[test]
+    fn a_failed_checkpoint_is_retried_at_the_next_flush() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let hosted: Vec<_> = (0..20u8).map(instance).collect();
+        let mut runner = runner_with_salt(dir.path(), [9; 32]);
+        end_period(&mut runner);
+        let focus = runner.focus(Some(hosted), &[]).selected;
+        runner.advance();
+        feed(&mut runner, focus[0], &[RecordOutcome::Admitted]);
+
+        // A directory where the staging file goes makes the write fail.
+        let staging = dir.path().join(format!("{PERIOD_FILE}.tmp"));
+        std::fs::create_dir(&staging).expect("block the staging file");
+        runner.flush_period();
+        assert!(runner.period_dirty, "a failed checkpoint was marked clean");
+
+        std::fs::remove_dir(&staging).expect("unblock");
+        runner.flush_period();
+        assert!(!runner.period_dirty);
+        drop(runner);
+        let ended = end_period(&mut ShadowRunner::new(dir.path(), EnforcementMode::Shadow));
+        assert_eq!(
+            ended.samples_admitted, 1,
+            "the retried checkpoint was not written"
         );
     }
 
