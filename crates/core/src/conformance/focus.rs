@@ -81,7 +81,7 @@ pub fn focus_weight(activity: u32) -> f64 {
 }
 
 /// Which draw put a contract in focus.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum FocusSlot {
     /// A uniform salted draw over the candidates. Activity plays no part.
     Uniform,

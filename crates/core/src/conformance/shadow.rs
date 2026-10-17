@@ -111,6 +111,10 @@ const SALT_FILE: &str = "focus-salt";
 /// Filename of the persisted focus epoch, beside the salt.
 const EPOCH_FILE: &str = "focus-epoch";
 
+/// Filename of the persisted focus period (ticks into it and its accounting), beside
+/// the epoch, so a restart resumes the period rather than starting a partial one.
+const PERIOD_FILE: &str = "focus-period";
+
 /// What one tick did. Counters only — never contract state, never evidence bytes.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct ShadowReport {
@@ -334,14 +338,16 @@ pub(crate) struct FocusTick {
 /// and, when it did not, to say why: no candidates, no activity, merges that never
 /// arrived, or merges the sampler refused. Each count is produced where its decision
 /// is made (selection, admission, probe), not re-derived from sizes afterwards.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct FocusPeriodSummary {
     /// The epoch that ended.
     pub epoch: u64,
-    /// Whether this process saw the whole period. False for the first period after a
-    /// start or restart: it began before this process did (the epoch is persisted,
-    /// the tick count is not), and its first ticks may have drawn from the sampler
-    /// fallback while the hosted source warmed up. Exclude these when measuring.
+    /// Whether the period's accounting is continuous: it began at a rotation, and
+    /// its state survived every restart since (it is persisted beside the epoch,
+    /// #5914 review round 2, K7). False for the first period on a fresh capture
+    /// directory, or after the persisted period could not be read. It does not mean
+    /// the peer was up throughout: merges during downtime were never observed.
+    /// Exclude incomplete periods when measuring.
     pub complete: bool,
     /// Size of the candidate pool at the period's last selection.
     pub candidates: usize,
@@ -383,7 +389,7 @@ struct FocusPeriod {
     totals: FocusPeriodSummary,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 struct PeriodMember {
     slot: FocusSlot,
     /// Activity when this stint was drawn.
@@ -571,9 +577,14 @@ pub struct ShadowRunner {
     activity: MergeActivity,
     /// What the current period's focus contracts have and have not seen.
     period: FocusPeriod,
-    /// Whether the current period began in this process. False until the first
-    /// rotation after start, because the persisted epoch outlives the tick count.
+    /// Whether the current period's accounting is continuous (see
+    /// [`FocusPeriodSummary::complete`]). Persisted with the period.
     period_complete: bool,
+    /// The period was restored from disk and has not yet been re-drawn from the
+    /// hosted set. While set, a draw that could only use the sampler fallback (the
+    /// hosted source registers after the capture task starts) keeps the restored
+    /// focus instead of replacing it with sampler keys.
+    resumed: bool,
 }
 
 impl ShadowRunner {
@@ -587,16 +598,51 @@ impl ShadowRunner {
     pub fn new(dir: &Path, mode: EnforcementMode) -> Self {
         let salt = load_or_create_salt(dir);
         let epoch = load_epoch(dir);
+        let restored = load_period(dir, epoch);
+        let resumed = restored.is_some();
+        let (ticks, period, period_complete) = match restored {
+            Some(saved) => (
+                saved.ticks_into_period % ROTATE_EVERY_TICKS,
+                FocusPeriod {
+                    current: saved.members.into_iter().collect(),
+                    totals: saved.totals,
+                },
+                saved.complete,
+            ),
+            None => (0, FocusPeriod::default(), false),
+        };
         Self {
             mode,
             selector: FocusSelector::resuming_at(salt, MAX_FOCUS_CONTRACTS, epoch),
-            ticks: 0,
+            ticks,
             dir: dir.to_path_buf(),
             logged: HashSet::new(),
             activity: MergeActivity::new(super::activity::MAX_TRACKED_ACTIVITY, salt),
-            period: FocusPeriod::default(),
-            period_complete: false,
+            period,
+            period_complete,
+            resumed,
         }
+    }
+
+    /// Write the current period beside the epoch (best-effort).
+    fn persist_period(&self) {
+        let mut members: Vec<(ContractInstanceId, PeriodMember)> = self
+            .period
+            .current
+            .iter()
+            .map(|(id, member)| (*id, *member))
+            .collect();
+        members.sort_by(|(a, _), (b, _)| a.as_bytes().cmp(b.as_bytes()));
+        store_period(
+            &self.dir,
+            &PersistedPeriod {
+                epoch: self.selector.epoch(),
+                ticks_into_period: self.ticks % ROTATE_EVERY_TICKS,
+                complete: self.period_complete,
+                members,
+                totals: self.period.totals,
+            },
+        );
     }
 
     pub fn epoch(&self) -> u64 {
@@ -612,9 +658,10 @@ impl ShadowRunner {
     /// On rotation it also closes the focus period (logged, and returned so a test can
     /// read it) and decays the activity counts, so their half-life is one period.
     ///
-    /// Activity is not persisted. A restarted peer's weighted slot draws from what it
-    /// has observed since starting, which is uniform until the first state-changing
-    /// merge arrives; the period it restarts into is reported `complete=false`.
+    /// The period (ticks into it, its members and its counts) is persisted after every
+    /// tick, so a restart resumes it on schedule and its summary stays `complete`
+    /// (#5914 review round 2, K7). Activity is not persisted: a restarted peer's
+    /// weighted slot draws uniformly until the first state-changing merge arrives.
     pub(crate) fn advance(&mut self) -> Option<FocusPeriodSummary> {
         self.ticks = self.ticks.wrapping_add(1);
         if self.ticks % ROTATE_EVERY_TICKS == 0 {
@@ -644,9 +691,12 @@ impl ShadowRunner {
             self.logged.clear();
             store_epoch(&self.dir, self.selector.epoch());
             self.activity.decay();
+            self.resumed = false;
+            self.persist_period();
             return Some(ended);
         }
         self.period.tick();
+        self.persist_period();
         None
     }
 
@@ -741,6 +791,29 @@ impl ShadowRunner {
             return FocusTick::default();
         }
         let (candidates, source) = candidate_pool(hosted, fallback);
+        if self.resumed && source == CandidateSource::SamplerFallback {
+            // Just restarted, hosted source not registered yet: keep watching what the
+            // period was watching rather than replacing it with sampler keys and
+            // folding fallback stints into a resumed period.
+            let mut current: Vec<(ContractInstanceId, FocusSlot)> = self
+                .period
+                .current
+                .iter()
+                .map(|(id, member)| (*id, member.slot))
+                .collect();
+            current.sort_by(|(ia, sa), (ib, sb)| {
+                sa.cmp(sb).then_with(|| ia.as_bytes().cmp(ib.as_bytes()))
+            });
+            return FocusTick {
+                selected: current.into_iter().map(|(id, _)| id).collect(),
+                candidates: candidates.len(),
+                active_candidates: 0,
+                source,
+            };
+        }
+        if source == CandidateSource::Hosted {
+            self.resumed = false;
+        }
         let activity = &self.activity;
         let picks = self.selector.select_split(
             &candidates,
@@ -760,6 +833,7 @@ impl ShadowRunner {
         self.period
             .enter(&entered, candidates.len(), active_candidates);
         let selected = picks.into_iter().map(|(id, _)| id).collect();
+        self.persist_period();
         FocusTick {
             selected,
             candidates: candidates.len(),
@@ -1219,6 +1293,56 @@ fn store_epoch(dir: &Path, epoch: u64) {
             error = %err,
             "could not persist the conformance focus epoch; focus rotation will \
              restart from zero after a restart"
+        );
+    }
+}
+
+/// What survives a restart of the current focus period.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct PersistedPeriod {
+    epoch: u64,
+    ticks_into_period: u32,
+    complete: bool,
+    members: Vec<(ContractInstanceId, PeriodMember)>,
+    totals: FocusPeriodSummary,
+}
+
+/// Read the persisted period for `epoch`. `None` when absent, unreadable, or for a
+/// different epoch, in which case the caller starts an incomplete period.
+fn load_period(dir: &Path, epoch: u64) -> Option<PersistedPeriod> {
+    let raw = std::fs::read(dir.join(PERIOD_FILE)).ok()?;
+    let saved: PersistedPeriod = match serde_json::from_slice(&raw) {
+        Ok(saved) => saved,
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                "conformance focus period file is unreadable; starting an incomplete period"
+            );
+            return None;
+        }
+    };
+    (saved.epoch == epoch).then_some(saved)
+}
+
+/// Persist the current period beside the epoch. Best-effort like the epoch: a peer
+/// that cannot write it reports its next period after a restart as incomplete.
+fn store_period(dir: &Path, period: &PersistedPeriod) {
+    let path = dir.join(PERIOD_FILE);
+    // Owner-only like the salt and epoch: it names the contracts this peer watches.
+    let written = serde_json::to_vec(period)
+        .map_err(std::io::Error::other)
+        .and_then(|bytes| {
+            crate::wasm_runtime::create_owner_only(&path).and_then(|mut file| {
+                use std::io::Write;
+                file.write_all(&bytes)
+            })
+        });
+    if let Err(err) = written {
+        tracing::warn!(
+            path = %path.display(),
+            error = %err,
+            "could not persist the conformance focus period; a restart will start an \
+             incomplete one"
         );
     }
 }
@@ -2263,25 +2387,99 @@ mod tests {
         );
     }
 
-    /// The first period after a start began before this process did, so it is
-    /// marked incomplete; the next one is whole.
+    /// The first period on a fresh capture directory is incomplete; later ones are
+    /// complete, including across a restart, which resumes the period.
     #[test]
-    fn a_period_begun_before_a_restart_is_marked_incomplete() {
+    fn only_the_first_period_on_a_fresh_directory_is_incomplete() {
         let dir = tempfile::TempDir::new().expect("tempdir");
         let mut runner = runner_with_salt(dir.path(), [9; 32]);
         assert!(
             !end_period(&mut runner).complete,
-            "first period after start"
+            "first period on a fresh directory"
         );
         assert!(
             end_period(&mut runner).complete,
-            "a period begun in this process"
+            "a period begun at a rotation"
         );
+        drop(runner);
 
-        // A restart: a new runner over the same directory resumes the epoch but not
-        // the tick count, so its first period is partial again.
         let mut restarted = ShadowRunner::new(dir.path(), EnforcementMode::Shadow);
         assert_eq!(restarted.epoch(), 2);
+        assert!(
+            end_period(&mut restarted).complete,
+            "a restart at a period boundary must not make the next period partial"
+        );
+    }
+
+    /// A restart mid-period resumes the period on schedule with its counts and its
+    /// focus (#5914 review round 2, K7). A peer that restarts more often than every
+    /// two hours otherwise never produces a complete period.
+    #[test]
+    fn a_restart_mid_period_resumes_the_period() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let hosted: Vec<_> = (0..20u8).map(instance).collect();
+        let mut first = runner_with_salt(dir.path(), [9; 32]);
+        end_period(&mut first); // into a complete period
+        let focus = first.focus(Some(hosted.clone()), &[]).selected;
+        feed(
+            &mut first,
+            focus[0],
+            &[
+                RecordOutcome::Admitted,
+                RecordOutcome::Admitted,
+                RecordOutcome::Refused,
+            ],
+        );
+        for _ in 0..3 {
+            assert!(first.advance().is_none());
+        }
+        drop(first);
+
+        let mut resumed = ShadowRunner::new(dir.path(), EnforcementMode::Shadow);
+        // Before the hosted source registers, the restored focus is kept.
+        let mut kept = resumed.focus(None, &[instance(99)]).selected;
+        let mut was = focus.clone();
+        kept.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+        was.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+        assert_eq!(
+            kept, was,
+            "a restart replaced the period's focus with sampler keys"
+        );
+
+        let mut ended = None;
+        let mut ticks = 0;
+        while ended.is_none() {
+            ticks += 1;
+            ended = resumed.advance();
+        }
+        assert_eq!(
+            ticks,
+            ROTATE_EVERY_TICKS - 3,
+            "the period did not resume on schedule"
+        );
+        let ended = ended.expect("ended");
+        assert!(ended.complete);
+        assert_eq!(
+            (
+                ended.merges_seen,
+                ended.samples_admitted,
+                ended.samples_refused,
+                ended.stints
+            ),
+            (3, 2, 1, 2),
+            "the restart lost the period's counts"
+        );
+    }
+
+    /// An unreadable persisted period starts an incomplete one rather than failing.
+    #[test]
+    fn an_unreadable_period_file_starts_an_incomplete_period() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut runner = runner_with_salt(dir.path(), [9; 32]);
+        end_period(&mut runner);
+        drop(runner);
+        std::fs::write(dir.path().join(PERIOD_FILE), b"not a period").expect("write");
+        let mut restarted = ShadowRunner::new(dir.path(), EnforcementMode::Shadow);
         assert!(!end_period(&mut restarted).complete);
     }
 
