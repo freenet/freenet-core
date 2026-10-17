@@ -2115,11 +2115,12 @@ fn a_sound_bounded_collection_is_not_accused() {
 }
 
 /// The same cap, evicting by something INDEPENDENT of the merge's own ordering, is
-/// caught. Before #5915 such a contract was already removal-eligible under
-/// `StateAssociativity` for the same underlying reason (an entry dropped early
-/// destroys information a different merge order would have kept); its merge is a
-/// function of the union, so it commutes, so its groupings now heal and this
-/// property is the one that names it.
+/// caught — and that is correct rather than a false positive: such a contract is
+/// already removal-eligible under `StateAssociativity`, for the same underlying
+/// reason (an entry dropped early destroys information a different merge order
+/// would have kept). Under the #5915 heal guard that holds on triples whose
+/// converged state fails to absorb a grouping, such as `(1)`, `(2,3,4)`, `(5)`,
+/// asserted below, and not on every strictly failing triple.
 ///
 /// Asserted rather than left in prose, because it is the boundary the severity
 /// argument rests on: the property distinguishes the two caps, and does not simply
@@ -2143,6 +2144,16 @@ fn capped_collection_evicting_outside_the_merge_order_is_caught() {
     assert_violates(
         verify_case(&mut fake, &built),
         ConformanceProperty::TransitionPathAgreement,
+    );
+    assert_violates(
+        verify_case(
+            &mut fake,
+            &case(
+                ConformanceProperty::StateAssociativity,
+                &[&[1], &[2, 3, 4], &[5]],
+            ),
+        ),
+        ConformanceProperty::StateAssociativity,
     );
 
     // ...and the SOUND cap above really is a different answer from this one, so the
@@ -2185,12 +2196,13 @@ fn capped_collection_evicting_outside_the_merge_order_is_caught() {
 /// Until #5915 that made it removal-eligible under `StateAssociativity` before the
 /// transition law was consulted, which is what this test was written to pin: the
 /// transition law condemned no contract the settled algebra acquitted. **That no
-/// longer holds.** The merge is a function of the union, so it commutes on every
-/// pair, so each of those 532 groupings heals on one more exchange and
-/// associativity is now silent on it. The transition law still fires, so this
-/// contract is now condemned by `TransitionPathAgreement` ALONE. Both facts are
-/// asserted, so the gap in that property's severity argument is visible here
-/// rather than only in its documentation.
+/// longer holds, and the stronger converge-and-absorb guard does not restore it.**
+/// The merge is a function of the union, so every grouping converges in one
+/// exchange, and brute force over the same 15 states (2026-10-17) finds the
+/// converged state absorbs both groupings in ALL 532 strictly failing triples.
+/// Associativity is therefore silent on this contract, and `TransitionPathAgreement`
+/// condemns it ALONE. Both facts are asserted, so the gap in that property's
+/// severity argument is visible here rather than only in its documentation.
 #[test]
 fn a_partially_ordered_cap_heals_under_associativity_but_not_the_transition_law() {
     const N: usize = 2;

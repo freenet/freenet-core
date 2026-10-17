@@ -473,11 +473,22 @@ fn run<O: ConformanceOracle + ?Sized>(
             // every capped chat, feed or log removable, and anyone able to trigger a
             // removal could build a failing triple on purpose.
             //
-            // So model that next exchange: the peer holding each grouping receives
-            // the other's whole state. If both land on one state, the peers agree and
-            // the divergence was transient. If not, two peers given the same updates
-            // grouped differently still disagree after reconciling, which is the
-            // defect this law exists to name.
+            // So model that next exchange, and require it to SETTLE the divergence,
+            // not merely end it. With `M = merge(L, R)`, the case heals only if:
+            //
+            //   merge(R, L) == M   the peer holding each grouping, receiving the
+            //                      other's whole state, lands on the same state;
+            //   merge(M, L) == M   and that state absorbs both groupings, so a peer
+            //   merge(M, R) == M   still gossiping either one cannot move it again.
+            //
+            // Convergence alone is not enough. A commutative merge converges on one
+            // exchange by definition, so a convergence-only guard silenced every
+            // commutative contract, including ones that never settle: integer
+            // averaging converges to a midpoint that merging either grouping back in
+            // moves off again. The absorption clauses are what separate "the next
+            // exchange repairs it" (bounded retention: `M` is the refilled log, which
+            // already holds everything either grouping does) from "the next exchange
+            // only moves the disagreement somewhere else".
             //
             // Same validity precondition first, for the reason `path_agreement`
             // gives: a grouping the contract rejects never reaches another peer, so
@@ -487,17 +498,15 @@ fn run<O: ConformanceOracle + ?Sized>(
             // A reconciling merge that errors is `Inconclusive` via `?`, as in
             // `path_agreement`: the guard errs toward silence.
             //
-            // CONSEQUENCE, stated so nobody has to rediscover it: when the merge
-            // commutes on these two states, `merge(L, R) == merge(R, L)` by
-            // definition, so this guard heals. A finding here therefore also means
-            // the merge failed to commute on the two groupings. The digests reported
-            // are still the two groupings, so `verify_case`'s re-run compares the same
-            // pair it always did.
+            // The digests reported are still the two groupings, so `verify_case`'s
+            // re-run compares the same pair it always did.
             require_valid(oracle, &ab_c, &case.related)?;
             require_valid(oracle, &a_bc, &case.related)?;
-            let left_receives_right = merge(oracle, &ab_c, &a_bc)?;
-            let right_receives_left = merge(oracle, &a_bc, &ab_c)?;
-            if left_receives_right == right_receives_left {
+            let converged = merge(oracle, &ab_c, &a_bc)?;
+            let heals = merge(oracle, &a_bc, &ab_c)? == converged
+                && merge(oracle, &converged, &ab_c)? == converged
+                && merge(oracle, &converged, &a_bc)? == converged;
+            if heals {
                 return Ok(PropertyOutcome::Holds);
             }
 
@@ -506,9 +515,10 @@ fn run<O: ConformanceOracle + ?Sized>(
                 &ab_c,
                 &a_bc,
                 "merge(merge(A, B), C) differs from merge(A, merge(B, C)), and the \
-                 difference does not heal: merging each grouping into the other does \
-                 not reach one state, so two peers that received the same updates \
-                 grouped differently still disagree after reconciling",
+                 difference does not heal: one exchange between the two groupings \
+                 does not converge to a state that absorbs both, so peers that \
+                 received the same updates grouped differently do not settle on \
+                 one state",
             ))
         }
 

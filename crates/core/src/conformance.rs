@@ -9,9 +9,9 @@
 //!
 //! One law is checked in a weaker form than the RFC #5320 table states it.
 //! Associativity is reported only when `merge(merge(A, B), C)` and
-//! `merge(A, merge(B, C))` still differ after one more exchange between them (#5915),
-//! because no contract with bounded retention can satisfy the strict form. See
-//! [`ConformanceProperty::StateAssociativity`].
+//! `merge(A, merge(B, C))` differ and do not converge in one exchange to a state
+//! that absorbs both (#5915), because no contract with bounded retention can satisfy
+//! the strict form. See [`ConformanceProperty::StateAssociativity`].
 //!
 //! This module is the *single* implementation of what "conformance" means. The
 //! offline `fdev verify-merge` harness and the node's opt-in shadow-mode checker both call
