@@ -352,7 +352,9 @@ pub(crate) struct FocusPeriodSummary {
     /// review rounds 3 and 4). The node's usual exit path calls
     /// `std::process::exit` without closing that channel, so ANY restart, graceful
     /// or not, can lose up to the last minute of merge and admission counts from a
-    /// period that still reads `complete`; verdicts are never lost that way.
+    /// period that still reads `complete`. A verdict is written at once and, if that
+    /// write fails, retried at the next flush, so a verdict is lost only when the
+    /// checkpoint keeps failing until the process exits.
     /// Exclude incomplete periods when measuring.
     pub complete: bool,
     /// Size of the candidate pool at the period's last selection.
@@ -671,8 +673,9 @@ impl ShadowRunner {
             .map(|(id, member)| (*id, *member))
             .collect();
         members.sort_by(|(a, _), (b, _)| a.as_bytes().cmp(b.as_bytes()));
-        // Clean only once the checkpoint is on disk (#5914 review round 4): a failed
-        // write leaves the period dirty, so the next flush retries it.
+        // Clean exactly when the checkpoint is on disk, from whichever path wrote it
+        // (a tick, a draw, a verdict or the flush): a failed write leaves the period
+        // dirty, so the next 60 s flush retries it (#5914 review rounds 4 and final).
         let written = store_period(
             &self.dir,
             &PersistedPeriod {
@@ -684,9 +687,7 @@ impl ShadowRunner {
                 totals: self.period.totals,
             },
         );
-        if written {
-            self.period_dirty = false;
-        }
+        self.period_dirty = !written;
     }
 
     pub fn epoch(&self) -> u64 {
@@ -2778,6 +2779,44 @@ mod tests {
                 ended.samples_refused
             ),
             (0, 0, 0)
+        );
+    }
+
+    /// A failed checkpoint from ANY write path, not only the flush, leaves the
+    /// period dirty for the next flush to retry (#5914 final review). A verdict's own
+    /// immediate write failing used to leave a clean flag, so the verdict was lost.
+    #[test]
+    fn a_failed_verdict_checkpoint_is_retried_at_the_next_flush() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let hosted: Vec<_> = (0..20u8).map(instance).collect();
+        let mut runner = runner_with_salt(dir.path(), [9; 32]);
+        end_period(&mut runner);
+        let focus = runner.focus(Some(hosted), &[]).selected;
+        runner.advance();
+        assert!(
+            !runner.period_dirty,
+            "precondition: the tick checkpoint landed"
+        );
+
+        let staging = dir.path().join(format!("{PERIOD_FILE}.tmp"));
+        std::fs::create_dir(&staging).expect("block the staging file");
+        runner.note_judged(&[JudgedContract {
+            contract: focus[0],
+            verdicts: 1,
+            inconclusive: 0,
+        }]);
+        assert!(
+            runner.period_dirty,
+            "a failed verdict checkpoint was left clean"
+        );
+
+        std::fs::remove_dir(&staging).expect("unblock");
+        runner.flush_period();
+        drop(runner);
+        let ended = end_period(&mut ShadowRunner::new(dir.path(), EnforcementMode::Shadow));
+        assert_eq!(
+            ended.judged, 1,
+            "the verdict was lost with its failed checkpoint"
         );
     }
 
