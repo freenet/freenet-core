@@ -616,6 +616,8 @@ pub struct ShadowRunner {
     /// The period changed since it was last persisted (merges or admissions on a
     /// focus member). Cleared by every write; see [`flush_period`](Self::flush_period).
     period_dirty: bool,
+    /// [`salt_check`] of this runner's salt, written into the persisted period.
+    salt_check: [u8; 8],
 }
 
 impl ShadowRunner {
@@ -629,7 +631,7 @@ impl ShadowRunner {
     pub fn new(dir: &Path, mode: EnforcementMode) -> Self {
         let salt = load_or_create_salt(dir);
         let epoch = load_epoch(dir);
-        let restored = load_period(dir, epoch);
+        let restored = load_period(dir, epoch, &salt);
         let resumed = restored.is_some();
         let (ticks, period, period_complete) = match restored {
             Some(saved) => (
@@ -653,6 +655,7 @@ impl ShadowRunner {
             period_complete,
             resumed,
             period_dirty: false,
+            salt_check: salt_check(&salt),
         }
     }
 
@@ -669,6 +672,7 @@ impl ShadowRunner {
         store_period(
             &self.dir,
             &PersistedPeriod {
+                salt_check: self.salt_check,
                 epoch: self.selector.epoch(),
                 ticks_into_period: self.ticks % ROTATE_EVERY_TICKS,
                 complete: self.period_complete,
@@ -1356,6 +1360,9 @@ fn store_epoch(dir: &Path, epoch: u64) {
 /// What survives a restart of the current focus period.
 #[derive(serde::Serialize, serde::Deserialize)]
 struct PersistedPeriod {
+    /// Which salt drew this period's focus ([`salt_check`]), so a changed salt does
+    /// not resume another identity's period (#5914 review round 3, B3).
+    salt_check: [u8; 8],
     epoch: u64,
     ticks_into_period: u32,
     complete: bool,
@@ -1363,9 +1370,23 @@ struct PersistedPeriod {
     totals: FocusPeriodSummary,
 }
 
-/// Read the persisted period for `epoch`. `None` when absent, unreadable, or for a
-/// different epoch, in which case the caller starts an incomplete period.
-fn load_period(dir: &Path, epoch: u64) -> Option<PersistedPeriod> {
+/// A short, non-secret fingerprint of the focus salt for [`PersistedPeriod`].
+///
+/// Domain-separated and truncated, so the period file reveals nothing usable about
+/// the salt itself, which is the secret that keeps focus unpredictable.
+fn salt_check(salt: &[u8; 32]) -> [u8; 8] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"freenet-conformance-period-salt-check-v1");
+    hasher.update(salt);
+    let mut check = [0u8; 8];
+    check.copy_from_slice(&hasher.finalize().as_bytes()[..8]);
+    check
+}
+
+/// Read the persisted period for `epoch` under `salt`. `None` when absent,
+/// unreadable, for a different epoch or salt, or holding more members than there are
+/// focus slots; the caller then starts an incomplete period.
+fn load_period(dir: &Path, epoch: u64, salt: &[u8; 32]) -> Option<PersistedPeriod> {
     let raw = std::fs::read(dir.join(PERIOD_FILE)).ok()?;
     let saved: PersistedPeriod = match serde_json::from_slice(&raw) {
         Ok(saved) => saved,
@@ -1377,22 +1398,39 @@ fn load_period(dir: &Path, epoch: u64) -> Option<PersistedPeriod> {
             return None;
         }
     };
-    (saved.epoch == epoch).then_some(saved)
+    if saved.members.len() > MAX_FOCUS_CONTRACTS {
+        tracing::warn!(
+            members = saved.members.len(),
+            "conformance focus period file holds more members than focus slots; \
+             starting an incomplete period"
+        );
+        return None;
+    }
+    (saved.epoch == epoch && saved.salt_check == salt_check(salt)).then_some(saved)
 }
 
 /// Persist the current period beside the epoch. Best-effort like the epoch: a peer
 /// that cannot write it reports its next period after a restart as incomplete.
 fn store_period(dir: &Path, period: &PersistedPeriod) {
     let path = dir.join(PERIOD_FILE);
-    // Owner-only like the salt and epoch: it names the contracts this peer watches.
+    // Written to a temporary file and renamed over the old one, so a crash mid-write
+    // leaves the previous checkpoint rather than a torn file (#5914 review round 3,
+    // B4). Owner-only like the salt and epoch: it names the contracts this peer
+    // watches.
+    let staging = dir.join(format!("{PERIOD_FILE}.tmp"));
     let written = serde_json::to_vec(period)
         .map_err(std::io::Error::other)
         .and_then(|bytes| {
-            crate::wasm_runtime::create_owner_only(&path).and_then(|mut file| {
+            crate::wasm_runtime::create_owner_only(&staging).and_then(|mut file| {
                 use std::io::Write;
+                // No fsync: the rename protects against a crashed process, which is
+                // the case that matters; after a power loss an unreadable file just
+                // starts an incomplete period. The checkpoint is written at every
+                // draw and tick, so an fsync each time would cost more than it saves.
                 file.write_all(&bytes)
             })
-        });
+        })
+        .and_then(|()| std::fs::rename(&staging, &path));
     if let Err(err) = written {
         tracing::warn!(
             path = %path.display(),
@@ -2666,6 +2704,55 @@ mod tests {
             );
         }
         assert!(checked > 0, "no salt exercised the case");
+    }
+
+    /// A period persisted under a different salt is not resumed (#5914 review round
+    /// 3, B3): its members were drawn by another peer identity's scores, and resuming
+    /// them would credit this salt's period with that draw.
+    #[test]
+    fn a_changed_salt_does_not_resume_the_old_period() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let hosted: Vec<_> = (0..20u8).map(instance).collect();
+        let mut first = runner_with_salt(dir.path(), [9; 32]);
+        end_period(&mut first);
+        let picked = first.focus(Some(hosted), &[]).selected;
+        first.advance();
+        drop(first);
+        let mut other = runner_with_salt(dir.path(), [10; 32]);
+        assert!(
+            other.period.current.is_empty(),
+            "a period drawn under another salt was resumed: {picked:?}"
+        );
+        assert!(!end_period(&mut other).complete);
+    }
+
+    /// A persisted period cannot restore more members than there are focus slots
+    /// (#5914 review round 3, B4): the file is local, but nothing else bounds it.
+    #[test]
+    fn a_restored_period_is_capped_at_the_focus_size() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut first = runner_with_salt(dir.path(), [9; 32]);
+        end_period(&mut first);
+        first.focus(Some((0..20u8).map(instance).collect()), &[]);
+        first.advance();
+        drop(first);
+        let path = dir.path().join(PERIOD_FILE);
+        let mut saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).expect("read")).expect("json");
+        let member = saved["members"][0].clone();
+        let members = saved["members"].as_array_mut().expect("members");
+        for n in 100..110u8 {
+            let mut extra = member.clone();
+            extra[0] = serde_json::to_value(instance(n)).expect("id");
+            members.push(extra);
+        }
+        std::fs::write(&path, serde_json::to_vec(&saved).expect("json")).expect("write");
+        let restored = ShadowRunner::new(dir.path(), EnforcementMode::Shadow);
+        assert!(
+            restored.period.current.len() <= MAX_FOCUS_CONTRACTS,
+            "restored {} focus members",
+            restored.period.current.len()
+        );
     }
 
     /// An unreadable persisted period starts an incomplete one rather than failing.
