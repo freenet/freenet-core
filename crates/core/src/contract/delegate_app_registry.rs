@@ -31,16 +31,29 @@
 //! caps a client could open unbounded channels or a delegate could accrue
 //! unbounded fan-out targets — an amplification vector.
 //!
-//! # TTL / GC-exemption bound (AGENTS.md)
+//! # Lifetime: a registration lives exactly as long as its connection
 //!
-//! Each registration records the [`tokio::time::Instant`] it was last
-//! (re)confirmed. [`REGISTRATION_TTL`] bounds how long a registration survives
-//! without the app talking to the delegate again; [`sweep_expired`] prunes
-//! entries past the TTL. This guarantees the map cannot pin channels for a
-//! disconnected-but-not-cleanly-closed client forever, satisfying the AGENTS.md
-//! rule that any cleanup exemption be time-bounded. Clean disconnects
-//! ([`remove_client`]) and delegate unregistration ([`remove_delegate`]) purge
-//! eagerly; the TTL is the backstop.
+//! A registration is removed when its connection goes away, never because it
+//! has been idle. Clean disconnects ([`remove_client`], which each exit path
+//! of the WebSocket connection task triggers) and delegate unregistration
+//! ([`remove_delegate`]) purge eagerly. The backstop for a connection that ended
+//! without that event is the channel itself: the receiving end lives in the
+//! connection task, so once the task is gone the sender reports closed, and
+//! [`sweep_closed`] and [`route_to_apps`] prune it.
+//!
+//! This is not an unbounded GC exemption (AGENTS.md): nothing here outlives the
+//! connection that owns it, and the connection's own liveness is enforced
+//! below this module. The WebSocket task pings every 30 s, so a peer that
+//! vanished without closing leaves unacknowledged data in flight, the TCP
+//! retransmission timeout errors the socket, and the task exits.
+//!
+//! An earlier revision instead expired a registration 30 minutes after the
+//! app's last `ApplicationMessages` request. That evicted exactly the
+//! legitimate case, an app that registers once and then only listens, which
+//! silently stopped receiving pushes while still connected. It bounded nothing
+//! an abuser cares about either: re-sending one request restamped the TTL.
+//! Off-host connections held open are bounded by [`LOCAL_RESERVED_SLOTS`] and
+//! the caps, not by age.
 
 use std::sync::LazyLock;
 
@@ -77,16 +90,6 @@ pub(crate) const LOCAL_RESERVED_SLOTS: usize = 32;
 /// delegates to hold many channels.
 pub(crate) const MAX_DELEGATES_PER_CLIENT: usize = 256;
 
-/// How long a registration survives without the app re-confirming it (by
-/// talking to the delegate again). The registry is refreshed on every
-/// `DelegateRequest` the app sends, so an actively-used app never expires; this
-/// only reaps apps whose connection died without a clean disconnect event.
-///
-/// 30 minutes is comfortably longer than any reasonable gap between an app's
-/// delegate interactions while keeping stale channels from lingering for the
-/// process lifetime.
-pub(crate) const REGISTRATION_TTL: std::time::Duration = std::time::Duration::from_secs(30 * 60);
-
 /// Who made a registration, from the perspective that decides whether it may
 /// receive a delegate's notification output.
 ///
@@ -106,8 +109,8 @@ pub(crate) enum AppIdentity {
     /// weight that also invites the next reader to gate on it, which is exactly
     /// what [`route_to_apps`] explains must not happen.
     Local,
-    /// Not provably local. Recorded so the caps and TTL bookkeeping stay
-    /// identical, but never a delivery target.
+    /// Not provably local. Recorded so the caps and pruning stay identical,
+    /// but never a delivery target.
     Remote,
 }
 
@@ -117,8 +120,8 @@ impl AppIdentity {
     }
 }
 
-/// One app's registration with a delegate: where to push messages, who
-/// registered it, plus when it was last confirmed (for TTL eviction).
+/// One app's registration with a delegate: where to push messages and who
+/// registered it.
 struct AppRegistration {
     client_id: ClientId,
     identity: AppIdentity,
@@ -129,10 +132,6 @@ struct AppRegistration {
     /// [`route_to_apps`].
     withhold_logged: bool,
     sender: mpsc::Sender<HostResult>,
-    /// `tokio::time::Instant` (not `std::time::Instant`) so tests using
-    /// `tokio::time::pause` / `advance` can drive TTL eviction deterministically,
-    /// matching the convention used by `DelegateContextEntry` and `RealTime`.
-    last_seen: tokio::time::Instant,
 }
 
 impl AppRegistration {
@@ -168,27 +167,25 @@ static DELEGATE_APPS: LazyLock<DashMap<DelegateKey, Vec<AppRegistration>>> =
 static CLIENT_REGISTRATION_COUNTS: LazyLock<DashMap<ClientId, usize>> =
     LazyLock::new(DashMap::default);
 
-/// Register `client_id`'s notification channel with `delegate_key`, or refresh
-/// its TTL if already registered.
+/// Register `client_id`'s notification channel with `delegate_key`, or replace
+/// its channel if already registered.
 ///
 /// Returns `false` (and does not register) when a per-key or per-client cap
 /// would be exceeded, so the caller can log the rejection. Re-registering an
-/// existing `(delegate, client)` pair always succeeds and refreshes both the
-/// sender (the client may have reconnected with a fresh channel) and the TTL.
+/// existing `(delegate, client)` pair always succeeds and replaces the sender:
+/// each request carries a fresh channel, and the one it replaces is dropped.
 pub(crate) fn register_app(
     delegate_key: &DelegateKey,
     client_id: ClientId,
     identity: AppIdentity,
     sender: mpsc::Sender<HostResult>,
 ) -> bool {
-    let now = tokio::time::Instant::now();
     let mut apps = DELEGATE_APPS.entry(delegate_key.clone()).or_default();
 
-    // Refresh path: already registered → update sender + TTL, no cap change.
+    // Refresh path: already registered → update sender, no cap change.
     if let Some(existing) = apps.iter_mut().find(|a| a.client_id == client_id) {
         existing.sender = sender;
         existing.identity = identity;
-        existing.last_seen = now;
         // A refresh is the same connection, so do NOT re-arm the withhold log:
         // an app that talks to a delegate in a loop would otherwise defeat the
         // once-per-registration bound.
@@ -243,7 +240,6 @@ pub(crate) fn register_app(
         identity,
         withhold_logged: false,
         sender,
-        last_seen: now,
     });
     *count += 1;
     true
@@ -300,9 +296,9 @@ pub(crate) fn route_to_apps(delegate_key: &DelegateKey, message: HostResult) -> 
             // Before this fix the `try_send` below was what reaped
             // registrations whose client had vanished without a clean
             // disconnect. Skipping ahead of it would mean a non-local
-            // registration is never reaped, so dead slots would survive the full
-            // `REGISTRATION_TTL`. `is_closed()` gives the same liveness signal
-            // `try_send` gave, without delivering anything.
+            // registration is only reaped by the next `sweep_closed`.
+            // `is_closed()` gives the same liveness signal `try_send` gave,
+            // without delivering anything.
             //
             // SCOPE OF THIS PRUNE, precisely: it reaps CLOSED senders only. It
             // does NOT close the slot-exhaustion DoS, because the cheaper attack
@@ -387,24 +383,35 @@ pub(crate) fn remove_delegate(delegate_key: &DelegateKey) {
     }
 }
 
-/// Prune registrations older than [`REGISTRATION_TTL`]. The TTL backstop for
-/// clients that vanished without a clean disconnect or channel-close signal.
-pub(crate) fn sweep_expired() {
-    let now = tokio::time::Instant::now();
-    let mut expired: Vec<ClientId> = Vec::new();
+/// Prune every registration whose channel is closed, across all delegates.
+///
+/// The backstop for connections that ended without a clean disconnect event.
+/// [`route_to_apps`] prunes the same way, but only for the delegate it is
+/// delivering for; this covers delegates that receive no notifications. An open
+/// channel is never pruned, however long it has been idle: see the module docs.
+pub(crate) fn sweep_closed() {
+    let mut closed: Vec<ClientId> = Vec::new();
     DELEGATE_APPS.retain(|_, apps| {
         apps.retain(|a| {
-            let keep = now.saturating_duration_since(a.last_seen) < REGISTRATION_TTL;
+            let keep = !a.sender.is_closed();
             if !keep {
-                expired.push(a.client_id);
+                closed.push(a.client_id);
             }
             keep
         });
         !apps.is_empty()
     });
-    for client_id in expired {
+    for client_id in closed {
         decrement_client_count(client_id);
     }
+}
+
+/// Number of registrations for `delegate_key`, without pruning anything (unlike
+/// [`route_to_apps`], which would reap a closed registration itself and so
+/// cannot observe whether something else did).
+#[cfg(test)]
+pub(crate) fn registration_count(delegate_key: &DelegateKey) -> usize {
+    DELEGATE_APPS.get(delegate_key).map_or(0, |apps| apps.len())
 }
 
 fn decrement_client_count(client_id: ClientId) {
@@ -558,44 +565,81 @@ mod tests {
         }
     }
 
+    /// A registration whose connection ended without a clean disconnect is
+    /// reaped by the sweep alone. Observed through `registration_count`, not
+    /// `route_to_apps`, because routing prunes closed channels itself and would
+    /// pass with the sweep deleted.
     #[tokio::test(start_paused = true)]
     #[serial_test::serial]
-    async fn ttl_sweep_evicts_stale_registration() {
+    async fn sweep_prunes_closed_registration() {
         let ns = Namespace::new();
         let dk = ns.key(0);
-        let (tx, _rx) = mpsc::channel::<HostResult>(1);
+        let (tx, rx) = mpsc::channel::<HostResult>(1);
         assert!(register_app(&dk, ns.client(0), AppIdentity::Local, tx));
+        drop(rx);
 
-        tokio::time::advance(REGISTRATION_TTL + std::time::Duration::from_secs(1)).await;
-        sweep_expired();
+        sweep_closed();
         assert_eq!(
-            route_to_apps(&dk, host_msg()),
+            registration_count(&dk),
             0,
-            "stale registration must be swept after TTL"
+            "a closed registration must be swept"
+        );
+        assert!(
+            CLIENT_REGISTRATION_COUNTS
+                .get(&ns.client(0))
+                .is_none_or(|c| *c == 0),
+            "sweeping must release the client's registration count"
         );
     }
 
+    /// #5919 regression: an app that registers once and then only listens must
+    /// keep receiving pushes. A 30-minute TTL on the last `ApplicationMessages`
+    /// request used to drop such an app while it was still connected.
     #[tokio::test(start_paused = true)]
     #[serial_test::serial]
-    async fn reregister_refreshes_ttl() {
+    async fn idle_live_registration_still_receives_pushes() {
         let ns = Namespace::new();
         let dk = ns.key(0);
-        let client = ns.client(0);
         let (tx, mut rx) = mpsc::channel::<HostResult>(4);
-        assert!(register_app(&dk, client, AppIdentity::Local, tx.clone()));
+        assert!(register_app(&dk, ns.client(0), AppIdentity::Local, tx));
 
-        // Advance nearly to TTL, then refresh.
-        tokio::time::advance(REGISTRATION_TTL - std::time::Duration::from_secs(10)).await;
-        assert!(register_app(&dk, client, AppIdentity::Local, tx));
-        // Advance past the ORIGINAL expiry but within the refreshed window.
-        tokio::time::advance(std::time::Duration::from_secs(20)).await;
-        sweep_expired();
+        // A day with no further `ApplicationMessages`: the app only listens.
+        tokio::time::advance(std::time::Duration::from_secs(24 * 60 * 60)).await;
+        sweep_closed();
         assert_eq!(
             route_to_apps(&dk, host_msg()),
             1,
-            "refreshed registration must survive"
+            "a connected app must keep receiving pushes however long it has \
+             been since it last talked to the delegate"
         );
         assert!(rx.try_recv().is_ok());
+    }
+
+    /// Re-registering replaces the channel. Liveness is judged on the CURRENT
+    /// sender, so a refresh that kept the old one would get a live app reaped as
+    /// soon as the old channel's receiver went away.
+    #[tokio::test(start_paused = true)]
+    #[serial_test::serial]
+    async fn reregister_replaces_channel() {
+        let ns = Namespace::new();
+        let dk = ns.key(0);
+        let client = ns.client(0);
+        let (old_tx, old_rx) = mpsc::channel::<HostResult>(4);
+        assert!(register_app(&dk, client, AppIdentity::Local, old_tx));
+        let (new_tx, mut new_rx) = mpsc::channel::<HostResult>(4);
+        assert!(register_app(&dk, client, AppIdentity::Local, new_tx));
+        drop(old_rx);
+
+        sweep_closed();
+        assert_eq!(
+            route_to_apps(&dk, host_msg()),
+            1,
+            "the refreshed registration must survive and deliver"
+        );
+        assert!(
+            new_rx.try_recv().is_ok(),
+            "delivery must use the new channel"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -680,9 +724,9 @@ mod tests {
     ///
     /// Skipping ahead of `try_send` removed the only reaper on this path. An
     /// off-host caller could then fill `MAX_APPS_PER_DELEGATE` with dead
-    /// registrations and starve the legitimate local app for the full
-    /// `REGISTRATION_TTL`, renewably — the same remotely-triggerable denial of
-    /// service that made the record-matching design unacceptable.
+    /// registrations and starve the legitimate local app until something else
+    /// reaped them, renewably — the same remotely-triggerable denial of service
+    /// that made the record-matching design unacceptable.
     #[tokio::test(start_paused = true)]
     #[serial_test::serial]
     async fn dead_non_local_registration_is_pruned_not_parked() {
@@ -706,7 +750,7 @@ mod tests {
         assert!(
             DELEGATE_APPS.get(&dk).is_none_or(|apps| apps.is_empty()),
             "a dead non-local registration must be reaped, or an off-host caller \
-             can hold every slot for the whole TTL and starve the local app"
+             can hold every slot with dead registrations and starve the local app"
         );
         // The per-client slot must be released too, or the cap leaks.
         assert!(
