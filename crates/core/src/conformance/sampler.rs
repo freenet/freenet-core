@@ -307,7 +307,14 @@ impl ContractSampler {
             _ => None,
         })
         .collect();
-        let retained_state = !newly_stored.is_empty();
+        // Judged at every return, never once up front: later steps (making room for
+        // the result, the budget loop) can shed a state this call just stored, and
+        // "retained" must describe what is held when the caller hears about it.
+        let still_held = |sampler: &Self| {
+            newly_stored
+                .iter()
+                .any(|hash| sampler.blobs.contains_key(hash))
+        };
         let kept = |a: Admission| matches!(a, Admission::Stored | Admission::Duplicate);
         if !kept(base_admission)
             || !kept(result_admission)
@@ -328,9 +335,9 @@ impl ContractSampler {
             .flatten()
             .any(|a| matches!(a, Admission::TooLarge))
             {
-                return (Admission::TooLarge, retained_state);
+                return (Admission::TooLarge, still_held(self));
             }
-            return (Admission::NotSelected, retained_state);
+            return (Admission::NotSelected, still_held(self));
         }
 
         // Deltas and summaries are contract-controlled and stored inline, so they
@@ -338,7 +345,7 @@ impl ContractSampler {
         // must not be able to buy unbounded retention with it.
         let payload_bytes = delta.map_or(0, <[u8]>::len) + summary.map_or(0, <[u8]>::len);
         if payload_bytes > self.config.max_state_bytes {
-            return (Admission::TooLarge, retained_state);
+            return (Admission::TooLarge, still_held(self));
         }
 
         let record = TransitionRecord {
@@ -349,7 +356,7 @@ impl ContractSampler {
             summary: summary.map(<[u8]>::to_vec),
         };
         if self.transitions.contains(&record) {
-            return (Admission::Duplicate, retained_state);
+            return (Admission::Duplicate, still_held(self));
         }
         self.transitions.push_back(record.clone());
         while self.transitions.len() > self.config.transitions {
@@ -370,9 +377,7 @@ impl ContractSampler {
         // zero-length history, or shed by the budget loop it just triggered, was not
         // stored, and a state stored on the way in may have been shed too.
         let kept_record = self.transitions.contains(&record);
-        let kept_state = newly_stored
-            .iter()
-            .any(|hash| self.blobs.contains_key(hash));
+        let kept_state = still_held(self);
         let admission = if kept_record {
             Admission::Stored
         } else if slotted && shed {

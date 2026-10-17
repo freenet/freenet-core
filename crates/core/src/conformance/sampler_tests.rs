@@ -656,3 +656,39 @@ fn a_transition_shed_by_the_budget_is_not_reported_stored() {
     );
     assert!(retained, "the states survived and were not reported");
 }
+
+/// A base stored on the way in and then shed while making room for the result is
+/// not retained. The early-return paths reported `retained` from what was admitted
+/// along the way rather than from what is still held (#5914 final review).
+#[test]
+fn a_base_stored_then_shed_for_the_result_is_not_retained() {
+    let mut sampler = ContractSampler::new(SamplerConfig {
+        earliest: 2,
+        recent: 0,
+        reservoir: 0,
+        largest: 1,
+        smallest: 0,
+        transitions: 8,
+        max_bytes: 12,
+        max_state_bytes: 12,
+        seed: 1,
+    });
+    // An earlier state fills the first earliest slot.
+    assert_eq!(sampler.observe_state(&[7, 7, 7, 7]), Admission::Stored);
+    // The base takes the second earliest slot (8 of 12 bytes). The 10-byte result
+    // wants the largest stratum; making room pops the newest earliest member (the
+    // base) and still cannot fit it, so the result is refused for budget.
+    let base = [1, 1, 1, 1];
+    let (admission, retained) =
+        sampler.observe_transition_retaining(&base, None, Some(&[9]), None, &[2; 10]);
+    assert_eq!(admission, Admission::NotSelected);
+    assert_eq!(
+        sampler.distinct_states(),
+        1,
+        "precondition: the base was shed"
+    );
+    assert!(
+        !retained,
+        "a base shed before returning was reported retained"
+    );
+}
