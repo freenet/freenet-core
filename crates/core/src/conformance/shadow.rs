@@ -2781,6 +2781,25 @@ mod tests {
         );
     }
 
+    /// An AdmittedPartly outcome adds to `admitted` as well as `refused`, and keeps
+    /// its member accruing (#5914 review round 4, A3 gap).
+    #[test]
+    fn a_partly_admitted_merge_counts_toward_admitted_and_keeps_its_member() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut runner = runner_with_salt(dir.path(), [9; 32]);
+        let focus = runner
+            .focus(Some((0..20u8).map(instance).collect()), &[])
+            .selected;
+        feed(&mut runner, focus[0], &[RecordOutcome::AdmittedPartly]);
+        runner.advance();
+        assert!(
+            runner.period.accruing().iter().any(|(c, _)| *c == focus[0]),
+            "a partly admitted merge did not count as accruing"
+        );
+        let ended = end_period(&mut runner);
+        assert_eq!((ended.samples_admitted, ended.samples_refused), (1, 1));
+    }
+
     /// A contract that changes slot mid-period ends one stint and starts another, so
     /// each slot is credited only with what happened in it (#5914 review round 3,
     /// A2). Relabelling the whole stint moved a weighted verdict to the uniform slot.

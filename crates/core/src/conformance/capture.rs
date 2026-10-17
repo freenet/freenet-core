@@ -3358,6 +3358,27 @@ mod tests {
         assert_eq!(shadow.activity_tracked(), 0);
     }
 
+    /// Through the real sampler: a transition refused as NotSelected (its result has
+    /// no stratum to join) after its base state WAS stored reports retained content,
+    /// and so maps to Admitted (#5914 review round 4, A3 gap).
+    #[test]
+    fn a_not_selected_transition_that_stored_its_base_counts_as_admitted() {
+        let mut sampler = ContractSampler::new(SamplerConfig {
+            earliest: 1,
+            recent: 0,
+            reservoir: 0,
+            largest: 0,
+            smallest: 0,
+            transitions: 8,
+            ..SamplerConfig::default()
+        });
+        let (admission, retained) =
+            sampler.observe_transition_retaining(&[1], None, Some(&[9]), None, &[2, 2]);
+        assert_eq!(admission, Admission::NotSelected);
+        assert!(retained, "the stored base state was not reported");
+        assert_eq!(outcome_of(admission, retained), RecordOutcome::Admitted);
+    }
+
     fn focused_on(ids: &[u8]) -> SamplingScope {
         SamplingScope::Focused(ids.iter().copied().map(instance).collect())
     }
