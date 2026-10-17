@@ -16,7 +16,72 @@ pub enum ConformanceProperty {
     StateIdempotence,
     /// `merge(A, B) == merge(B, A)`
     StateCommutativity,
-    /// `merge(merge(A, B), C) == merge(A, merge(B, C))`
+    /// `merge(merge(A, B), C) == merge(A, merge(B, C))`, or the two groupings heal:
+    /// they converge in one exchange to a state that, re-merged with both groupings
+    /// and all three inputs, settles at a fixpoint.
+    ///
+    /// # What is checked (#5915)
+    ///
+    /// With `L = merge(merge(A, B), C)` and `R = merge(A, merge(B, C))`, `L == R`
+    /// holds outright. Otherwise:
+    ///
+    /// 1. `L` and `R` must be valid, or it is a violation: from valid inputs the
+    ///    contract emitted a state it rejects.
+    /// 2. `merge(R, L)` must equal `M = merge(L, R)`, or it is a violation: one
+    ///    exchange does not even agree.
+    /// 3. `M` is iterated by merging in `L`, `R`, `A`, `B` and `C` until a full pass
+    ///    changes nothing. A fixpoint heals. Each step that moves the iterate must
+    ///    also absorb a re-delivery of the same input, or it is a violation. A state
+    ///    that repeats is a cycle and a violation. Running out of `MAX_HEAL_PASSES`
+    ///    passes with none of these is [`Inconclusive::RoundLimit`].
+    ///
+    /// A heal-step merge the contract itself rejects is a violation: both sides are
+    /// valid states it emitted, so it is refusing to reconcile its own output
+    /// (#5725). A runtime or resource failure there stays inconclusive (#5509), which
+    /// leaves a residual: a contract that traps on a heal-step merge escapes this
+    /// law, as it escapes every other law in this module.
+    ///
+    /// # Why strict associativity is not the law
+    ///
+    /// Any contract with bounded retention fails it, and cannot help failing it.
+    /// A grouping that truncated an old entry to make room cannot refill the slot
+    /// when a later removal (a ban) or a raised cap frees it, while the other
+    /// grouping still holds the entry. Measured on River's room contract
+    /// (freenet/river#793): 956 of 3200 generated triples fail strictly, about 30%,
+    /// and every one converges on the next exchange. Enforcing the strict form would
+    /// make every capped chat, feed or log removable, and a participant able to
+    /// trigger a removal could build a failing triple on purpose. Ian's decision,
+    /// 2026-10-16: heal-guarded, not diagnostic-only, severity unchanged; 2026-10-17:
+    /// healing means converge AND stable.
+    ///
+    /// # Why the heal step is a fixpoint and not something cheaper
+    ///
+    /// - **Convergence alone** silenced every commutative merge, because
+    ///   `merge(L, R) == merge(R, L)` by definition there; integer averaging got
+    ///   through.
+    /// - **`M` absorbing `L` and `R`** silenced every pick-one merge, because `M` is
+    ///   then `L` or `R`. One whose winner relation is cyclic (wrapping sequence
+    ///   numbers, rock-paper-scissors) never converges and escaped every enforceable
+    ///   law that way: a probe saw 1916 strict failures and reported none.
+    /// - **Cycle detection alone** misses a merge that keeps moving without ever
+    ///   repeating inside the budget: on any domain wider than a byte, averaging and
+    ///   "max + 1" climbing came back inconclusive. So each step that moves the
+    ///   iterate re-delivers the same input and requires
+    ///   `merge(merge(M, X), X) == merge(M, X)`, which any join satisfies and those
+    ///   merges fail at any width. A failure is a violation.
+    /// - **`M` absorbing all five without iterating** is too strict: a raised cap can
+    ///   re-admit a truncated message, so a bounded log may need one more merge.
+    ///
+    /// # Measured
+    ///
+    /// On small, exhaustively enumerated state spaces (these numbers do not
+    /// generalize past them): the bounded-log fixture's 80 states heal on every one
+    /// of 36,252 strictly failing triples, within 2 passes, and so does its
+    /// keep-oldest variant (21,980). The fixture shapes this law reported before
+    /// #5915 are reported again: averaging (0..=20), the partially-ordered cap and
+    /// `NEVER_SETTLES` on every strict failure, `CAPPED_SET` on 23,812 of 26,034
+    /// (6-element universe; the rest settle). Averaging and climbing are reported at
+    /// 32 and 64 bits too, by the re-delivery check rather than by enumeration.
     StateAssociativity,
     /// Every state emitted by `update_state` is itself valid.
     EmittedStateValidity,
@@ -343,6 +408,17 @@ pub enum ConformanceProperty {
     /// nothing it had not already lost. Either way there is no contract that this
     /// property alone condemns while the settled algebra would have acquitted it.
     ///
+    /// **What changed with #5915.** `StateAssociativity` no longer means strict
+    /// associativity: it accepts groupings that heal (converge, then settle at a
+    /// fixpoint). So "satisfies the three laws" no longer implies a semilattice join
+    /// in the algebra above, and for a contract that passes only through the heal
+    /// step the sentence above rests on measurement rather than proof. What was
+    /// measured: every bounded-collection contract this argument cites is still
+    /// condemned by `StateAssociativity` (the partially-ordered cap on all 532 of its
+    /// strict failures, `CAPPED_SET` on most of them), and this property fires on
+    /// none of 5,124 transitions of the bounded-retention log that the heal step
+    /// acquits.
+    ///
     /// Two guards keep it from firing on a contract that is merely doing bookkeeping
     /// rather than losing information:
     ///
@@ -379,9 +455,11 @@ pub enum ConformanceProperty {
     ///   `(({1} ⊔ {2}) ⊔ {3,5}) = {2,3}` against `({1} ⊔ ({2} ⊔ {3,5})) = {1,3}`.
     ///   So it is already removal-eligible under `StateAssociativity` before this
     ///   property is consulted, which closes the gap: the transition law condemns no
-    ///   contract the settled algebra acquits. It does also fire here — base
-    ///   `{2,5}`, an op reaching `{2,3}`, `merge(base, result) = {3,5}` — which is
-    ///   the consistency the algebra above predicts, not a second accusation.
+    ///   contract the settled algebra acquits. Under the #5915 heal step every one of
+    ///   those 532 triples cycles rather than settling, so this still holds. It
+    ///   does also fire here — base `{2,5}`, an op reaching `{2,3}`,
+    ///   `merge(base, result) = {3,5}` — which is the consistency the algebra above
+    ///   predicts, not a second accusation.
     ///
     /// All of these are pinned by tests.
     ///

@@ -76,8 +76,10 @@ pub enum SubCommand {
         command: crate::website::WebsiteCommand,
     },
     /// Check that a contract's merge obeys the laws the network requires: that
-    /// merging is order-independent, groups the same way whichever pairing is used,
-    /// and applying the same change twice does nothing the second time.
+    /// merging is order-independent, that merges grouped differently converge in one
+    /// exchange and then settle on a state that re-merging the groupings and their
+    /// inputs no longer changes, and that applying the same change twice does nothing
+    /// the second time.
     ///
     /// A contract that breaks these usually cannot converge — two peers given the same
     /// updates in different orders end up with different state, never agree, and

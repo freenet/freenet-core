@@ -25,10 +25,12 @@
 //!                                by something other than the merge's own ordering.
 //!                                Commutative and idempotent, so no PAIRWISE state
 //!                                law sees it and only a three-state case reveals
-//!                                it. The transition law sees it too, from the same
-//!                                information loss, and that is asserted rather than
-//!                                left implicit — but associativity is the law that
-//!                                names it, and the pairwise ones stay silent.
+//!                                it, on triples that do not converge to an
+//!                                absorbing fixpoint (#5915; most strict failures,
+//!                                not all). The transition law sees it too, from the
+//!                                same information loss, and that is asserted rather
+//!                                than left implicit — but associativity is the law
+//!                                that names it, and the pairwise ones stay silent.
 //!   6 NEVER_SETTLES            — merge rewrites the state on every apply, so
 //!                                merge(A, A) never reaches a fixpoint. Idempotence
 //!                                and associativity break; commutativity still HOLDS
@@ -220,7 +222,9 @@ fn merge_state(m: u8, current: &[u8], incoming: &[u8]) -> Vec<u8> {
         //
         // This is the "cap the collection at N" rule real applications write, and
         // it is why associativity needs a three-state check of its own rather
-        // than being assumed to follow from the pairwise laws.
+        // than being assumed to follow from the pairwise laws. Since #5915 that
+        // check reports it on triples that do not converge to an absorbing
+        // fixpoint, which is most of its strict failures but not all.
         //
         // The eviction has to pick its victim from the whole set, not from the
         // ordering the merge is defined over. Keeping the largest N would be
@@ -233,7 +237,8 @@ fn merge_state(m: u8, current: &[u8], incoming: &[u8]) -> Vec<u8> {
         //
         // The pairwise laws still hold: the result depends only on the union, so
         // it is commutative, and a state already at or under the cap merged with
-        // itself is unchanged, so it is idempotent. Only the triple reveals it.
+        // itself is unchanged, so it is idempotent. Only a triple reveals it, one
+        // whose groupings do not converge to an absorbing fixpoint.
         CAPPED_SET => capped(current, incoming),
         // First write wins on a key collision — `entry(key).or_insert(value)`.
         //
