@@ -40,8 +40,10 @@ use freenet_stdlib::prelude::ContractInstanceId;
 // time budget cuts a probe short without actually spending ten seconds doing it.
 use tokio::time::Instant;
 
+use super::activity::MergeActivity;
 use super::bundle::ReplayBundle;
-use super::focus::FocusSelector;
+use super::capture::RecordOutcome;
+use super::focus::{FocusSelector, FocusSlot};
 use super::generator::{GeneratorConfig, generate_cases};
 use super::policy::{ConformanceAction, EnforcementMode, decide};
 use super::property::{ConformanceProperty, PropertyOutcome};
@@ -53,20 +55,23 @@ use super::verifier::verify_case;
 /// Small on purpose. Watching more is not free — each focus contract is a probe's
 /// worth of WASM execution per tick — and it buys less than it looks like it should,
 /// because coverage across the network comes from every peer watching a *different*
-/// couple of contracts, not from any one peer watching many. Two is the RFC's
-/// "simple independent randomized policy" read literally.
+/// couple of contracts, not from any one peer watching many. Two is one uniform slot
+/// and one activity-weighted slot (see `focus::FocusSelector::select_split`); with
+/// one, there would be no weighted slot at all.
 const MAX_FOCUS_CONTRACTS: usize = 2;
 
 /// How often a probe runs.
 pub const PROBE_INTERVAL: Duration = Duration::from_secs(15 * 60);
 
-/// Ticks before the focus set is reshuffled.
+/// Ticks in a focus period, after which the epoch advances and every score changes.
 ///
-/// Rotation is what stops a contract that happens to be unlucky today from being the
-/// only thing this peer ever looks at, and what stops an author who somehow learns
-/// they are being watched from staying watched. Eight ticks at fifteen minutes is two
-/// hours, long enough for a sampler to accumulate something worth checking and short
-/// enough that a day covers many contracts.
+/// The period is what the uniform slot is fixed for, and what stops an author who
+/// somehow learns they are being watched from staying watched. The weighted slot is
+/// re-drawn at every tick from current activity and goes to the draw's current
+/// winner; the keys are fixed for the period, so it only moves when activity reorders
+/// the draw. Eight ticks at fifteen minutes is two hours,
+/// long enough for a sampler to accumulate something worth checking and short enough
+/// that a day covers many contracts.
 const ROTATE_EVERY_TICKS: u32 = 8;
 
 /// Cases checked per contract per tick.
@@ -105,6 +110,10 @@ const SALT_FILE: &str = "focus-salt";
 
 /// Filename of the persisted focus epoch, beside the salt.
 const EPOCH_FILE: &str = "focus-epoch";
+
+/// Filename of the persisted focus period (ticks into it and its accounting), beside
+/// the epoch, so a restart resumes the period rather than starting a partial one.
+const PERIOD_FILE: &str = "focus-period";
 
 /// What one tick did. Counters only — never contract state, never evidence bytes.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -237,7 +246,6 @@ impl ShadowReport {
     }
 }
 
-/// The shadow loop's state, owned by the capture writer task.
 /// Where this tick's focus candidates came from.
 ///
 /// Reported on every tick rather than assumed. The two sources have very different
@@ -315,9 +323,270 @@ pub(crate) struct FocusTick {
     /// How many contracts were eligible. Distinguishes "this peer hosts almost
     /// nothing" from "selection is broken".
     pub candidates: usize,
+    /// How many of those candidates have recent merge activity (#5913).
+    ///
+    /// Zero means the weighted slot was drawn uniformly this tick: the peer has seen
+    /// no state-changing merge for anything it hosts recently, which is a fact about
+    /// traffic, not about selection. Counted over the candidates only.
+    pub active_candidates: usize,
     pub source: CandidateSource,
 }
 
+/// What one focus period established, reported when the period ends.
+///
+/// Built to answer the #5913 acceptance question (did this period judge anything?)
+/// and, when it did not, to say why: no candidates, no activity, merges that never
+/// arrived, or merges the sampler refused. Each count is produced where its decision
+/// is made (selection, admission, probe), not re-derived from sizes afterwards.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct FocusPeriodSummary {
+    /// The epoch that ended.
+    pub epoch: u64,
+    /// Whether the period's accounting is continuous: it began at a rotation, and
+    /// its state survived every restart since (it is persisted beside the epoch,
+    /// #5914 review round 2, K7). False for the first period on a fresh capture
+    /// directory, or after the persisted period could not be read. It does not mean
+    /// the peer was up throughout: merges during downtime were never observed.
+    /// Counts are checkpointed at every tick, every draw, every verdict, the
+    /// capture writer's 60 s flush and when the capture channel closes (#5914
+    /// review rounds 3 and 4). The node's usual exit path calls
+    /// `std::process::exit` without closing that channel, so ANY restart, graceful
+    /// or not, can lose up to the last minute of merge and admission counts from a
+    /// period that still reads `complete`. A verdict is written at once and, if that
+    /// write fails, retried at the next flush, so a verdict is lost only when the
+    /// checkpoint keeps failing until the process exits.
+    /// Exclude incomplete periods when measuring.
+    pub complete: bool,
+    /// Size of the candidate pool at the period's last selection.
+    pub candidates: usize,
+    /// Candidates with recent activity at the period's last selection.
+    pub active_candidates: usize,
+    /// Focus stints: each contract selected, counted once per continuous stretch in
+    /// focus. Usually the focus size; more when focus moved mid-period.
+    pub stints: usize,
+    /// Merges that reached the capture task for a contract while it was in focus.
+    pub merges_seen: u64,
+    /// Of those, merges from which the sampler retained something new.
+    pub samples_admitted: u64,
+    /// Of those, merges the sampler refused (too large, over budget, no slot).
+    pub samples_refused: u64,
+    /// Stints in which the sampler retained nothing new. Not the same as "never
+    /// examined": samples retained from an earlier stint can still be judged.
+    pub stints_without_new_samples: usize,
+    /// Stints in which at least one probe reached a verdict on the contract.
+    pub judged: usize,
+    /// Stints in the uniform slot, and how many of them were judged.
+    pub uniform_stints: usize,
+    pub judged_uniform: usize,
+    /// Stints in the weighted slot, and how many of them were judged.
+    pub weighted_stints: usize,
+    pub judged_weighted: usize,
+    /// Sum, over weighted stints, of the contract's raw activity count (decayed
+    /// merges, not the selection weight) when the stint was drawn. With
+    /// `weighted_stints`, says whether the weighted slot actually landed on busy
+    /// contracts or was effectively a uniform draw.
+    pub weighted_selected_activity: u64,
+}
+
+/// Per-period bookkeeping for the focus contracts.
+///
+/// Bounded by the focus size: only the CURRENT focus contracts are held, and a
+/// contract leaving focus is folded into the totals at once.
+#[derive(Debug, Default)]
+struct FocusPeriod {
+    current: HashMap<ContractInstanceId, PeriodMember>,
+    totals: FocusPeriodSummary,
+}
+
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
+struct PeriodMember {
+    slot: FocusSlot,
+    /// Activity when this stint was drawn.
+    activity: u32,
+    seen: u64,
+    admitted: u64,
+    /// Admitted since the most recent probe tick, and during the interval before it.
+    /// A member is kept only while the second is non-zero (#5914 review round 2, K1).
+    admitted_this_tick: u64,
+    admitted_last_tick: u64,
+    refused: u64,
+    judged: bool,
+}
+
+impl PeriodMember {
+    fn new(slot: FocusSlot, activity: u32) -> Self {
+        Self {
+            slot,
+            activity,
+            seen: 0,
+            admitted: 0,
+            admitted_this_tick: 0,
+            admitted_last_tick: 0,
+            refused: 0,
+            judged: false,
+        }
+    }
+}
+
+impl FocusPeriod {
+    /// Make `selected` the current focus set, folding any contract leaving it into
+    /// the totals, and remember the pool it was drawn from.
+    fn enter(
+        &mut self,
+        selected: &[(ContractInstanceId, FocusSlot, u32)],
+        candidates: usize,
+        active: usize,
+    ) {
+        let leaving: Vec<ContractInstanceId> = self
+            .current
+            .keys()
+            .filter(|id| !selected.iter().any(|(s, _, _)| s == *id))
+            .copied()
+            .collect();
+        for id in leaving {
+            if let Some(member) = self.current.remove(&id) {
+                self.fold(member);
+            }
+        }
+        // A contract already in focus in the same slot continues its stint, with its
+        // activity at selection not refreshed. A contract whose slot changed (the
+        // weighted pick becomes the uniform pick when the peer stops hosting the old
+        // one) ends its stint in the old slot and starts one in the new slot, so each
+        // slot is credited only with what happened in it (#5914 review round 3, A2).
+        // Its keep state carries over: it is the same sample being built. A new
+        // contract starts a stint.
+        for (id, slot, activity) in selected {
+            let moved = match self.current.get(id) {
+                Some(member) if member.slot != *slot => Some(*member),
+                _ => None,
+            };
+            if let Some(old) = moved {
+                self.fold(old);
+                let mut fresh = PeriodMember::new(*slot, *activity);
+                fresh.admitted_this_tick = old.admitted_this_tick;
+                fresh.admitted_last_tick = old.admitted_last_tick;
+                self.current.insert(*id, fresh);
+            } else {
+                self.current
+                    .entry(*id)
+                    .or_insert_with(|| PeriodMember::new(*slot, *activity));
+            }
+        }
+        self.totals.candidates = candidates;
+        self.totals.active_candidates = active;
+    }
+
+    fn fold(&mut self, member: PeriodMember) {
+        let totals = &mut self.totals;
+        totals.stints += 1;
+        totals.merges_seen = totals.merges_seen.saturating_add(member.seen);
+        totals.samples_admitted = totals.samples_admitted.saturating_add(member.admitted);
+        totals.samples_refused = totals.samples_refused.saturating_add(member.refused);
+        if member.admitted == 0 {
+            totals.stints_without_new_samples += 1;
+        }
+        if member.judged {
+            totals.judged += 1;
+        }
+        match member.slot {
+            FocusSlot::Uniform => {
+                totals.uniform_stints += 1;
+                totals.judged_uniform += usize::from(member.judged);
+            }
+            FocusSlot::Weighted => {
+                totals.weighted_stints += 1;
+                totals.judged_weighted += usize::from(member.judged);
+                totals.weighted_selected_activity = totals
+                    .weighted_selected_activity
+                    .saturating_add(u64::from(member.activity));
+            }
+        }
+    }
+
+    /// A probe tick: what each member admitted in the interval just ended becomes
+    /// the evidence [`accruing`](Self::accruing) keeps it on.
+    fn tick(&mut self) {
+        for member in self.current.values_mut() {
+            member.admitted_last_tick = std::mem::take(&mut member.admitted_this_tick);
+        }
+    }
+
+    /// Current focus contracts accruing samples: the sampler admitted something new
+    /// for them in the interval before the latest probe tick. A uniform one keeps its
+    /// slot; a weighted one keeps its slot only while it still wins the weighted draw
+    /// (`FocusSelector::select_split`).
+    ///
+    /// Only the latest interval counts (#5914 review round 2, K1). Keeping any
+    /// member that had EVER admitted a sample this stint let one early sample lock
+    /// the weighted slot for the rest of the period, against any burst elsewhere.
+    fn accruing(&self) -> Vec<(ContractInstanceId, FocusSlot)> {
+        self.current
+            .iter()
+            .filter(|(_, member)| member.admitted_last_tick > 0)
+            .map(|(id, member)| (*id, member.slot))
+            .collect()
+    }
+
+    /// Count a merge for a focus member; whether it was one.
+    fn seen(&mut self, contract: &ContractInstanceId) -> bool {
+        match self.current.get_mut(contract) {
+            Some(member) => {
+                member.seen = member.seen.saturating_add(1);
+                true
+            }
+            None => false,
+        }
+    }
+
+    fn admission(&mut self, contract: &ContractInstanceId, outcome: RecordOutcome) {
+        let Some(member) = self.current.get_mut(contract) else {
+            return;
+        };
+        match outcome {
+            RecordOutcome::Admitted => {
+                member.admitted = member.admitted.saturating_add(1);
+                member.admitted_this_tick = member.admitted_this_tick.saturating_add(1);
+            }
+            RecordOutcome::Refused => member.refused = member.refused.saturating_add(1),
+            RecordOutcome::AdmittedPartly => {
+                member.admitted = member.admitted.saturating_add(1);
+                member.admitted_this_tick = member.admitted_this_tick.saturating_add(1);
+                member.refused = member.refused.saturating_add(1);
+            }
+            RecordOutcome::NothingNew | RecordOutcome::OutOfScope => {}
+        }
+    }
+
+    fn judged(&mut self, contract: &ContractInstanceId) {
+        if let Some(member) = self.current.get_mut(contract) {
+            member.judged = true;
+        }
+    }
+
+    fn without_new_samples_now(&self) -> usize {
+        self.current
+            .values()
+            .filter(|member| member.admitted == 0)
+            .count()
+    }
+
+    /// Close the period and start an empty one.
+    fn finish(&mut self, epoch: u64, complete: bool) -> FocusPeriodSummary {
+        let current: Vec<PeriodMember> = self.current.drain().map(|(_, m)| m).collect();
+        for member in current {
+            self.fold(member);
+        }
+        let summary = FocusPeriodSummary {
+            epoch,
+            complete,
+            ..self.totals
+        };
+        *self = FocusPeriod::default();
+        summary
+    }
+}
+
+/// The shadow loop's state, owned by the capture writer task.
 pub struct ShadowRunner {
     mode: EnforcementMode,
     selector: FocusSelector,
@@ -329,6 +598,31 @@ pub struct ShadowRunner {
     /// on rotation, which is also what makes the log a per-epoch summary rather than
     /// an ever-growing set.
     logged: HashSet<(ContractInstanceId, ConformanceProperty)>,
+    /// State-changing merges observed per contract, decayed once per period and
+    /// read CURRENT at every draw (#5913, #5914 review D1).
+    ///
+    /// Not frozen per period: frozen weights could not see a contract that was quiet
+    /// before a period and bursts during it, and focused it less than a uniform draw
+    /// would while it had the most to check. Re-reading at each probe tick churns
+    /// little, because the draw's keys are fixed for the period: the weighted slot
+    /// moves only when activity reorders the draw (a challenger beats the incumbent).
+    /// An accruing uniform member is kept outright (see `FocusPeriod::accruing`).
+    activity: MergeActivity,
+    /// What the current period's focus contracts have and have not seen.
+    period: FocusPeriod,
+    /// Whether the current period's accounting is continuous (see
+    /// [`FocusPeriodSummary::complete`]). Persisted with the period.
+    period_complete: bool,
+    /// The period was restored from disk and has not yet been re-drawn from the
+    /// hosted set. While set, a draw that could only use the sampler fallback (the
+    /// hosted source registers after the capture task starts) keeps the restored
+    /// focus instead of replacing it with sampler keys.
+    resumed: bool,
+    /// The period changed since it was last persisted (merges or admissions on a
+    /// focus member). Cleared by every write; see [`flush_period`](Self::flush_period).
+    period_dirty: bool,
+    /// [`salt_check`] of this runner's salt, written into the persisted period.
+    salt_check: [u8; 8],
 }
 
 impl ShadowRunner {
@@ -342,13 +636,58 @@ impl ShadowRunner {
     pub fn new(dir: &Path, mode: EnforcementMode) -> Self {
         let salt = load_or_create_salt(dir);
         let epoch = load_epoch(dir);
+        let restored = load_period(dir, epoch, &salt);
+        let resumed = restored.is_some();
+        let (ticks, period, period_complete) = match restored {
+            Some(saved) => (
+                saved.ticks_into_period % ROTATE_EVERY_TICKS,
+                FocusPeriod {
+                    current: saved.members.into_iter().collect(),
+                    totals: saved.totals,
+                },
+                saved.complete,
+            ),
+            None => (0, FocusPeriod::default(), false),
+        };
         Self {
             mode,
             selector: FocusSelector::resuming_at(salt, MAX_FOCUS_CONTRACTS, epoch),
-            ticks: 0,
+            ticks,
             dir: dir.to_path_buf(),
             logged: HashSet::new(),
+            activity: MergeActivity::new(super::activity::MAX_TRACKED_ACTIVITY, salt),
+            period,
+            period_complete,
+            resumed,
+            period_dirty: false,
+            salt_check: salt_check(&salt),
         }
+    }
+
+    /// Write the current period beside the epoch (best-effort).
+    fn persist_period(&mut self) {
+        let mut members: Vec<(ContractInstanceId, PeriodMember)> = self
+            .period
+            .current
+            .iter()
+            .map(|(id, member)| (*id, *member))
+            .collect();
+        members.sort_by(|(a, _), (b, _)| a.as_bytes().cmp(b.as_bytes()));
+        // Clean exactly when the checkpoint is on disk, from whichever path wrote it
+        // (a tick, a draw, a verdict or the flush): a failed write leaves the period
+        // dirty, so the next 60 s flush retries it (#5914 review rounds 4 and final).
+        let written = store_period(
+            &self.dir,
+            &PersistedPeriod {
+                salt_check: self.salt_check,
+                epoch: self.selector.epoch(),
+                ticks_into_period: self.ticks % ROTATE_EVERY_TICKS,
+                complete: self.period_complete,
+                members,
+                totals: self.period.totals,
+            },
+        );
+        self.period_dirty = !written;
     }
 
     pub fn epoch(&self) -> u64 {
@@ -360,13 +699,125 @@ impl ShadowRunner {
     /// Separate from [`focus`](Self::focus) so focus can be computed at startup
     /// without consuming a tick. Rotation counts probe ticks rather than wall time so
     /// a peer that was down does not skip epochs it never sampled in.
-    pub(crate) fn advance(&mut self) {
+    ///
+    /// On rotation it also closes the focus period (logged, and returned so a test can
+    /// read it) and decays the activity counts, so their half-life is one period.
+    ///
+    /// The period (ticks into it, its members and its counts) is persisted after every
+    /// tick, so a restart resumes it on schedule and its summary stays `complete`
+    /// (#5914 review round 2, K7). Activity is not persisted: a restarted peer's
+    /// weighted slot draws uniformly until the first state-changing merge arrives.
+    pub(crate) fn advance(&mut self) -> Option<FocusPeriodSummary> {
         self.ticks = self.ticks.wrapping_add(1);
         if self.ticks % ROTATE_EVERY_TICKS == 0 {
+            let ended = self
+                .period
+                .finish(self.selector.epoch(), self.period_complete);
+            self.period_complete = true;
+            tracing::info!(
+                epoch = ended.epoch,
+                complete = ended.complete,
+                candidates = ended.candidates,
+                active_candidates = ended.active_candidates,
+                stints = ended.stints,
+                merges_seen = ended.merges_seen,
+                samples_admitted = ended.samples_admitted,
+                samples_refused = ended.samples_refused,
+                stints_without_new_samples = ended.stints_without_new_samples,
+                judged = ended.judged,
+                uniform_stints = ended.uniform_stints,
+                judged_uniform = ended.judged_uniform,
+                weighted_stints = ended.weighted_stints,
+                judged_weighted = ended.judged_weighted,
+                weighted_selected_activity = ended.weighted_selected_activity,
+                "conformance focus period ended"
+            );
             self.selector.rotate();
             self.logged.clear();
             store_epoch(&self.dir, self.selector.epoch());
+            self.activity.decay();
+            self.resumed = false;
+            self.persist_period();
+            return Some(ended);
         }
+        self.period.tick();
+        self.persist_period();
+        None
+    }
+
+    /// Count a merge the capture task observed.
+    ///
+    /// Called for EVERY observed merge, focused or not, because weighting has to
+    /// know about contracts that are not in focus yet. It must stay ahead of the scope
+    /// filter in `capture::run_writer`, which discards out-of-focus observations.
+    /// `activity` is [`super::capture::activity_digest`]'s verdict: `None` for a merge
+    /// that cannot count, otherwise its result-state digest, which counts unless the
+    /// contract produced that state recently.
+    pub(crate) fn note_merge(
+        &mut self,
+        contract: ContractInstanceId,
+        activity: Option<super::activity::StateDigest>,
+    ) {
+        if let Some(digest) = activity {
+            self.activity.record(contract, digest);
+        }
+        if self.period.seen(&contract) {
+            self.period_dirty = true;
+        }
+    }
+
+    /// Record what the sampler did with a merge, for the focus period's counts.
+    pub(crate) fn note_admission(&mut self, contract: &ContractInstanceId, outcome: RecordOutcome) {
+        if self.period.current.contains_key(contract) {
+            self.period.admission(contract, outcome);
+            self.period_dirty = true;
+        }
+    }
+
+    /// Record which focus contracts a completed probe reached a verdict on.
+    pub(crate) fn note_judged(&mut self, judged: &[JudgedContract]) {
+        for contract in judged {
+            self.period.judged(&contract.contract);
+        }
+        // Verdicts are what the acceptance measure counts, and arrive about once
+        // per tick, so they are persisted at once rather than at the next flush.
+        if !judged.is_empty() {
+            self.persist_period();
+        }
+    }
+
+    /// Persist the period if merges or admissions changed it since the last write.
+    ///
+    /// Called from the capture writer's periodic flush (`FLUSH_EVERY`, 60 s), so
+    /// merge and admission counts are written at most once a minute instead of on
+    /// every observation (#5914 review round 3, A1). A restart loses at most that
+    /// interval's counts, which is the tolerance `FocusPeriodSummary::complete`
+    /// states.
+    pub(crate) fn flush_period(&mut self) {
+        if self.period_dirty {
+            self.persist_period();
+        }
+    }
+
+    /// Current focus contracts the sampler has admitted nothing new for this period.
+    pub(crate) fn focus_without_new_samples(&self) -> usize {
+        self.period.without_new_samples_now()
+    }
+
+    /// Probe ticks into the current period, `0..ROTATE_EVERY_TICKS`. Zero on the
+    /// tick that rotated.
+    pub(crate) fn period_tick(&self) -> u32 {
+        self.ticks % ROTATE_EVERY_TICKS
+    }
+
+    /// Contracts whose merge activity is being tracked.
+    pub(crate) fn activity_tracked(&self) -> usize {
+        self.activity.len()
+    }
+
+    /// Activity entries evicted at the tracking cap since this runner started.
+    pub(crate) fn activity_evicted(&self) -> u64 {
+        self.activity.evicted()
     }
 
     /// The contracts this peer should be watching right now.
@@ -392,8 +843,15 @@ impl ShadowRunner {
     /// silent, but reinstates exactly the #5366 horizon - so the tick reports which
     /// source it used. `candidates=sampler` means focus has stopped covering the
     /// hosted set, a state that otherwise looks identical to a peer hosting little.
+    ///
+    /// Within the pool, one slot is a uniform salted draw and the rest are weighted by
+    /// current merge activity ([`FocusSelector::select_split`]; #5913, #5914 review
+    /// D1). A contract that receives no merges while focused cannot be sampled, so a
+    /// fully uniform draw over a mostly-cold hosted set judged nothing; a fully
+    /// weighted one let busy decoys crowd out quiet contracts. Activity only weights
+    /// the pool; it never adds to it, so focus still comes from the hosted set.
     pub(crate) fn focus(
-        &self,
+        &mut self,
         hosted: Option<Vec<ContractInstanceId>>,
         fallback: &[ContractInstanceId],
     ) -> FocusTick {
@@ -401,9 +859,53 @@ impl ShadowRunner {
             return FocusTick::default();
         }
         let (candidates, source) = candidate_pool(hosted, fallback);
+        if self.resumed && source == CandidateSource::SamplerFallback {
+            // Just restarted, hosted source not registered yet: keep watching what the
+            // period was watching rather than replacing it with sampler keys and
+            // folding fallback stints into a resumed period.
+            let mut current: Vec<(ContractInstanceId, FocusSlot)> = self
+                .period
+                .current
+                .iter()
+                .map(|(id, member)| (*id, member.slot))
+                .collect();
+            current.sort_by(|(ia, sa), (ib, sb)| {
+                sa.cmp(sb).then_with(|| ia.as_bytes().cmp(ib.as_bytes()))
+            });
+            return FocusTick {
+                selected: current.into_iter().map(|(id, _)| id).collect(),
+                candidates: candidates.len(),
+                active_candidates: 0,
+                source,
+            };
+        }
+        if source == CandidateSource::Hosted {
+            self.resumed = false;
+        }
+        let activity = &self.activity;
+        let picks = self.selector.select_split(
+            &candidates,
+            |id| activity.count(id),
+            &self.period.accruing(),
+        );
+        let active_candidates = candidates
+            .iter()
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .filter(|id| activity.count(id) > 0)
+            .count();
+        let entered: Vec<(ContractInstanceId, FocusSlot, u32)> = picks
+            .iter()
+            .map(|(id, slot)| (*id, *slot, activity.count(id)))
+            .collect();
+        self.period
+            .enter(&entered, candidates.len(), active_candidates);
+        let selected = picks.into_iter().map(|(id, _)| id).collect();
+        self.persist_period();
         FocusTick {
-            selected: self.selector.select(&candidates),
+            selected,
             candidates: candidates.len(),
+            active_candidates,
             source,
         }
     }
@@ -863,6 +1365,95 @@ fn store_epoch(dir: &Path, epoch: u64) {
     }
 }
 
+/// What survives a restart of the current focus period.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct PersistedPeriod {
+    /// Which salt drew this period's focus ([`salt_check`]), so a changed salt does
+    /// not resume another identity's period (#5914 review round 3, B3).
+    salt_check: [u8; 8],
+    epoch: u64,
+    ticks_into_period: u32,
+    complete: bool,
+    members: Vec<(ContractInstanceId, PeriodMember)>,
+    totals: FocusPeriodSummary,
+}
+
+/// A short, non-secret fingerprint of the focus salt for [`PersistedPeriod`].
+///
+/// Domain-separated and truncated, so the period file reveals nothing usable about
+/// the salt itself, which is the secret that keeps focus unpredictable.
+fn salt_check(salt: &[u8; 32]) -> [u8; 8] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"freenet-conformance-period-salt-check-v1");
+    hasher.update(salt);
+    let mut check = [0u8; 8];
+    check.copy_from_slice(&hasher.finalize().as_bytes()[..8]);
+    check
+}
+
+/// Read the persisted period for `epoch` under `salt`. `None` when absent,
+/// unreadable, for a different epoch or salt, or holding more members than there are
+/// focus slots; the caller then starts an incomplete period.
+fn load_period(dir: &Path, epoch: u64, salt: &[u8; 32]) -> Option<PersistedPeriod> {
+    let raw = std::fs::read(dir.join(PERIOD_FILE)).ok()?;
+    let saved: PersistedPeriod = match serde_json::from_slice(&raw) {
+        Ok(saved) => saved,
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                "conformance focus period file is unreadable; starting an incomplete period"
+            );
+            return None;
+        }
+    };
+    if saved.members.len() > MAX_FOCUS_CONTRACTS {
+        tracing::warn!(
+            members = saved.members.len(),
+            "conformance focus period file holds more members than focus slots; \
+             starting an incomplete period"
+        );
+        return None;
+    }
+    (saved.epoch == epoch && saved.salt_check == salt_check(salt)).then_some(saved)
+}
+
+/// Persist the current period beside the epoch, returning whether it was written.
+/// Best-effort like the epoch: a peer that cannot write it reports its next period
+/// after a restart as incomplete, and retries at the next flush.
+fn store_period(dir: &Path, period: &PersistedPeriod) -> bool {
+    let path = dir.join(PERIOD_FILE);
+    // Written to a temporary file and renamed over the old one, so a crash mid-write
+    // leaves the previous checkpoint rather than a torn file (#5914 review round 3,
+    // B4). Owner-only like the salt and epoch: it names the contracts this peer
+    // watches.
+    let staging = dir.join(format!("{PERIOD_FILE}.tmp"));
+    let written = serde_json::to_vec(period)
+        .map_err(std::io::Error::other)
+        .and_then(|bytes| {
+            crate::wasm_runtime::create_owner_only(&staging).and_then(|mut file| {
+                use std::io::Write;
+                // No fsync: the rename protects against a crashed process, which is
+                // the case that matters; after a power loss an unreadable file just
+                // starts an incomplete period. The checkpoint is written at every
+                // draw and tick, so an fsync each time would cost more than it saves.
+                file.write_all(&bytes)
+            })
+        })
+        .and_then(|()| std::fs::rename(&staging, &path));
+    match written {
+        Ok(()) => true,
+        Err(err) => {
+            tracing::warn!(
+                path = %path.display(),
+                error = %err,
+                "could not persist the conformance focus period; a restart will start an \
+                 incomplete one"
+            );
+            false
+        }
+    }
+}
+
 /// Drive a REAL probe of the deliberately-defective fixture contract, end to end.
 ///
 /// A seam, not a convenience. Everything downstream of a probe — `checked_contracts`,
@@ -943,7 +1534,7 @@ pub(crate) async fn probe_fixture_contract(
     }
 
     let dir = tempfile::TempDir::new()?;
-    let runner = ShadowRunner::new(dir.path(), EnforcementMode::Shadow);
+    let mut runner = ShadowRunner::new(dir.path(), EnforcementMode::Shadow);
     let focus = runner.focus(None, &samplers.keys().copied().collect::<Vec<_>>());
     let (work, awaiting) = runner.select(&focus, &samplers);
     assert!(
@@ -1242,7 +1833,7 @@ mod tests {
     #[tokio::test]
     async fn focus_selects_from_the_hosted_set_it_is_given() -> anyhow::Result<()> {
         let dir = tempfile::TempDir::new()?;
-        let runner = ShadowRunner::new(dir.path(), EnforcementMode::Shadow);
+        let mut runner = ShadowRunner::new(dir.path(), EnforcementMode::Shadow);
         let hosted: Vec<_> = (10..40u8).map(instance).collect();
 
         let tick = runner.focus(Some(hosted.clone()), &[instance(1), instance(2)]);
@@ -1308,8 +1899,1288 @@ mod tests {
         assert_eq!(source, CandidateSource::Hosted);
     }
 
+    /// A result-state digest no other call returns: "a merge that produced a new
+    /// state".
+    fn fresh_state() -> crate::conformance::activity::StateDigest {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        u128::from(NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+    }
+
+    /// Toggling between two states through the runner counts each state once.
+    #[test]
+    fn a_toggling_contract_gains_no_weight_after_its_first_two_states() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut runner = runner_with_salt(dir.path(), [31; 32]);
+        let (a, b) = (fresh_state(), fresh_state());
+        for i in 0..40 {
+            runner.note_merge(instance(1), Some(if i % 2 == 0 { a } else { b }));
+        }
+        assert_eq!(runner.activity.count(&instance(1)), 2);
+    }
+
     fn instance(n: u8) -> ContractInstanceId {
         ContractInstanceId::new([n; 32])
+    }
+
+    // ------------------------------------------------- activity-weighted focus (#5913)
+
+    /// A runner whose salt is fixed, so a test of the wiring is deterministic rather
+    /// than depending on whatever `OsRng` drew for this temp dir.
+    fn runner_with_salt(dir: &Path, salt: [u8; 32]) -> ShadowRunner {
+        std::fs::write(dir.join(SALT_FILE), salt).expect("write salt");
+        ShadowRunner::new(dir, EnforcementMode::Shadow)
+    }
+
+    /// 60 hosted contracts, of which the first ten are busy.
+    fn hosted_with_busy() -> (Vec<ContractInstanceId>, Vec<ContractInstanceId>) {
+        let hosted: Vec<_> = (0..60u8).map(instance).collect();
+        let busy = hosted[..10].to_vec();
+        (hosted, busy)
+    }
+
+    /// A salt for which the focus draw over `hosted_with_busy` misses every busy
+    /// contract when nothing is active, and hits one once the busy ones are. Searched
+    /// for rather than hard-coded, so the precondition is checked rather than assumed.
+    fn salt_where_activity_changes_the_draw() -> [u8; 32] {
+        let (hosted, busy) = hosted_with_busy();
+        (0..=255u8)
+            .map(|n| [n; 32])
+            .find(|salt| {
+                let selector = FocusSelector::new(*salt, MAX_FOCUS_CONTRACTS);
+                let quiet = selector.select_split(&hosted, |_| 0, &[]);
+                let busy_draw =
+                    selector.select_split(&hosted, |c| if busy.contains(c) { 40 } else { 0 }, &[]);
+                quiet.iter().all(|(c, _)| !busy.contains(c))
+                    && busy_draw.iter().any(|(c, _)| busy.contains(c))
+            })
+            .expect("no salt in 256 where activity changes the draw")
+    }
+
+    /// The wiring, end to end through the runner: merges counted by `note_merge`
+    /// reach focus at the next probe tick, and focus then lands on a busy contract
+    /// that the uniform draw for the same salt and epoch missed.
+    ///
+    /// This is also the restart path: a fresh runner has no activity, selects
+    /// uniformly, and weights from its first probe tick rather than a period later.
+    #[test]
+    fn merges_observed_before_a_probe_tick_steer_focus_toward_busy_contracts() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut runner = runner_with_salt(dir.path(), salt_where_activity_changes_the_draw());
+        let (hosted, busy) = hosted_with_busy();
+
+        let before = runner.focus(Some(hosted.clone()), &[]);
+        assert!(
+            before.selected.iter().all(|c| !busy.contains(c)),
+            "precondition: the uniform draw already includes a busy contract"
+        );
+        assert_eq!(before.active_candidates, 0, "no merges seen yet");
+
+        for contract in &busy {
+            for _ in 0..40 {
+                runner.note_merge(*contract, Some(fresh_state()));
+            }
+        }
+        assert!(runner.advance().is_none(), "the first tick must not rotate");
+        let after = runner.focus(Some(hosted.clone()), &[]);
+
+        assert_eq!(runner.epoch(), 0, "same epoch: only the weights changed");
+        assert_eq!(after.active_candidates, busy.len());
+        assert!(
+            after.selected.iter().any(|c| busy.contains(c)),
+            "ten of sixty hosted contracts were merging and focus picked neither of \
+             them: activity observed by the runner is not reaching selection"
+        );
+    }
+
+    /// Activity decays at each period boundary, so a contract that went quiet stops
+    /// being favoured instead of holding its weight forever.
+    #[test]
+    fn activity_decays_once_per_period() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut runner = runner_with_salt(dir.path(), [5; 32]);
+        for _ in 0..8 {
+            runner.note_merge(instance(1), Some(fresh_state()));
+        }
+        for _ in 0..ROTATE_EVERY_TICKS - 1 {
+            runner.advance();
+        }
+        assert_eq!(runner.activity.count(&instance(1)), 8, "decayed mid-period");
+        runner.advance();
+        assert_eq!(
+            runner.activity.count(&instance(1)),
+            4,
+            "one period halves it"
+        );
+        for _ in 0..ROTATE_EVERY_TICKS * 3 {
+            runner.advance();
+        }
+        assert_eq!(
+            runner.activity_tracked(),
+            0,
+            "a contract with no merges for four periods is still tracked"
+        );
+    }
+
+    /// A salt for which a burst on `burst`, starting after the period's first draw,
+    /// wins the weighted slot at the next tick, while that first draw (made from the
+    /// pre-burst activity) missed every burst contract.
+    fn salt_where_a_burst_wins_the_weighted_slot(
+        hosted: &[ContractInstanceId],
+        before: &impl Fn(&ContractInstanceId) -> u32,
+        during: &impl Fn(&ContractInstanceId) -> u32,
+        burst: &[ContractInstanceId],
+    ) -> [u8; 32] {
+        (0..=255u8)
+            .map(|n| [n; 32])
+            .find(|salt| {
+                let selector = FocusSelector::new(*salt, MAX_FOCUS_CONTRACTS);
+                let first = selector.select_split(hosted, before, &[]);
+                let next = selector.select_split(hosted, during, &[]);
+                first.iter().all(|(c, _)| !burst.contains(c))
+                    && next.iter().any(|(c, _)| burst.contains(c))
+            })
+            .expect("no salt in 256 has a burst win the weighted slot")
+    }
+
+    /// The bursty-evasion inversion (#5914 review D1): weights frozen at the start
+    /// of a period could not see a contract that was quiet before the period and
+    /// bursts during it, so it was focused LESS than under a uniform draw exactly
+    /// while it had the most to check. Activity must reach the weighted slot at the
+    /// next probe tick.
+    #[test]
+    fn a_burst_during_the_period_reaches_the_weighted_slot_at_the_next_tick() {
+        let hosted: Vec<_> = (0..60u8).map(instance).collect();
+        let burst: Vec<_> = (40..50u8).map(instance).collect();
+        let before = |c: &ContractInstanceId| u32::from(*c == instance(59)) * 5;
+        let during = |c: &ContractInstanceId| {
+            if burst.contains(c) { 60 } else { before(c) }
+        };
+        let salt = salt_where_a_burst_wins_the_weighted_slot(&hosted, &before, &during, &burst);
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut runner = runner_with_salt(dir.path(), salt);
+
+        for _ in 0..5 {
+            runner.note_merge(instance(59), Some(fresh_state()));
+        }
+        runner.advance();
+        let first = runner.focus(Some(hosted.clone()), &[]).selected;
+        assert!(first.iter().all(|c| !burst.contains(c)), "precondition");
+
+        for contract in &burst {
+            for _ in 0..60 {
+                runner.note_merge(*contract, Some(fresh_state()));
+            }
+        }
+        assert!(runner.advance().is_none(), "still mid-period");
+        let next = runner.focus(Some(hosted.clone()), &[]).selected;
+        assert!(
+            next.iter().any(|c| burst.contains(c)),
+            "ten contracts started merging mid-period and the next tick still did not \
+             focus on any of them: {next:?}"
+        );
+    }
+
+    /// A uniform-slot contract that is accruing samples is not displaced mid-period
+    /// when the peer starts hosting a contract that outscores it: moving it would
+    /// abandon a sample being built.
+    #[test]
+    fn an_accruing_uniform_contract_is_not_displaced_by_a_new_candidate() {
+        let all: Vec<_> = (0..61u8).map(instance).collect();
+        let mut checked = 0;
+        for salt in 0..64u8 {
+            // A salt for which the contract the peer starts hosting later outscores
+            // the uniform pick it has now.
+            let selector = FocusSelector::new([salt; 32], MAX_FOCUS_CONTRACTS);
+            let (newcomer, hosted) = (all[60], all[..60].to_vec());
+            if selector.select(&all)[0] != newcomer {
+                continue;
+            }
+            checked += 1;
+            let dir = tempfile::TempDir::new().expect("tempdir");
+            let mut runner = runner_with_salt(dir.path(), [salt; 32]);
+            runner.advance();
+            let uniform = runner.focus(Some(hosted.clone()), &[]).selected[0];
+            runner.note_merge(uniform, Some(fresh_state()));
+            runner.note_admission(&uniform, RecordOutcome::Admitted);
+            runner.advance();
+            let now = runner.focus(Some(all.clone()), &[]).selected;
+            assert_eq!(
+                now[0], uniform,
+                "salt {salt}: an accruing uniform contract was displaced by a newcomer"
+            );
+        }
+        assert!(checked > 0, "no salt exercised the case");
+    }
+
+    /// A focus contract is kept only while it keeps accruing: one that admitted a
+    /// sample early in the period and nothing since is eligible to be re-drawn at the
+    /// next tick (#5914 review round 2, K1). Under keep-if-ever-admitted, one early
+    /// sample locked the weighted slot for the rest of the period against any burst.
+    #[test]
+    fn a_focus_contract_that_stopped_accruing_is_not_kept() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut runner = runner_with_salt(dir.path(), [21; 32]);
+        let hosted: Vec<_> = (0..60u8).map(instance).collect();
+        runner.advance();
+        let first = runner.focus(Some(hosted.clone()), &[]).selected;
+        let weighted = first[1];
+        runner.note_merge(weighted, Some(fresh_state()));
+        runner.note_admission(&weighted, RecordOutcome::Admitted);
+
+        runner.advance();
+        assert!(
+            runner.period.accruing().iter().any(|(c, _)| *c == weighted),
+            "a contract that admitted a sample in the last interval was not kept"
+        );
+        runner.focus(Some(hosted.clone()), &[]);
+
+        // A whole interval with nothing new.
+        runner.advance();
+        assert!(
+            runner.period.accruing().iter().all(|(c, _)| *c != weighted),
+            "a contract that admitted nothing in the last interval is still locked in"
+        );
+    }
+
+    /// Busy decoys plus a contract that bursts mid-period, through the real runner
+    /// (#5914 review round 2, K1; modelled on the skeptical lens's simulation).
+    ///
+    /// Ten decoys merge (and are sampled) five times every tick, so under
+    /// keep-while-accruing they hold the weighted slot for good; the target bursts at
+    /// thirty merges a tick for four ticks in the middle of the third period. (At ten
+    /// a tick the target's advantage over the uniform pair is real but within noise at
+    /// 256 salts: the decoys sit at the weight cap, so a burster's weighted chance is
+    /// about its weight over ten capped weights.) The design must focus the target during its burst
+    /// on more salts than the uniform pair it replaced, or busy decoys have bought a
+    /// blind spot.
+    #[test]
+    fn a_mid_period_burst_beats_busy_decoys_to_the_weighted_slot() {
+        let hosted: Vec<_> = (0..60u8).map(instance).collect();
+        let target = hosted[0];
+        let decoys: Vec<_> = hosted[1..=10].to_vec();
+        let (burst_from, burst_len) = (18u32, 4u32);
+        let (mut caught, mut uniform_caught) = (0usize, 0usize);
+        for salt in 0..=255u8 {
+            let dir = tempfile::TempDir::new().expect("tempdir");
+            let mut runner = runner_with_salt(dir.path(), [salt; 32]);
+            let (mut hit, mut uniform_hit) = (false, false);
+            for tick in 1..=burst_from + burst_len {
+                runner.advance();
+                let focus = runner.focus(Some(hosted.clone()), &[]).selected;
+                let uniform_pair =
+                    FocusSelector::resuming_at([salt; 32], MAX_FOCUS_CONTRACTS, runner.epoch())
+                        .select(&hosted);
+                let bursting = tick >= burst_from;
+                let mut merges: Vec<ContractInstanceId> = decoys
+                    .iter()
+                    .flat_map(|d| std::iter::repeat_n(*d, 5))
+                    .collect();
+                if bursting {
+                    merges.extend(std::iter::repeat_n(target, 30));
+                    hit |= focus.contains(&target);
+                    uniform_hit |= uniform_pair.contains(&target);
+                }
+                for contract in merges {
+                    runner.note_merge(contract, Some(fresh_state()));
+                    let outcome = if focus.contains(&contract) {
+                        RecordOutcome::Admitted
+                    } else {
+                        RecordOutcome::OutOfScope
+                    };
+                    runner.note_admission(&contract, outcome);
+                }
+            }
+            caught += usize::from(hit);
+            uniform_caught += usize::from(uniform_hit);
+        }
+        assert!(
+            caught > uniform_caught,
+            "the burst was focused on {caught}/256 salts against {uniform_caught}/256 for \
+             the uniform pair: busy decoys are locking the weighted slot"
+        );
+    }
+
+    /// The tick-line telemetry the runner reports (S4): `period_tick` counts ticks
+    /// into the period and is zero on the rotation tick; `activity_tracked` and
+    /// `activity_evicted` are the tracker's own numbers.
+    #[test]
+    fn the_tick_telemetry_reports_the_runners_own_numbers() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut runner = runner_with_salt(dir.path(), [41; 32]);
+        for tick in 1..ROTATE_EVERY_TICKS {
+            runner.advance();
+            assert_eq!(runner.period_tick(), tick);
+        }
+        assert!(runner.advance().is_some());
+        assert_eq!(runner.period_tick(), 0, "the rotation tick is tick zero");
+
+        let cap = crate::conformance::activity::MAX_TRACKED_ACTIVITY;
+        for n in 0..=cap {
+            let mut bytes = [0u8; 32];
+            bytes[..8].copy_from_slice(&(n as u64).to_be_bytes());
+            runner.note_merge(ContractInstanceId::new(bytes), Some(fresh_state()));
+        }
+        assert!(
+            runner.activity_evicted() > 0,
+            "one past the cap evicted nothing"
+        );
+        assert_eq!(
+            runner.activity_tracked() as u64 + runner.activity_evicted(),
+            cap as u64 + 1
+        );
+    }
+
+    /// The runner breaks activity-eviction ties with ITS salt (F26): two peers with
+    /// different salts evict different equally-quiet contracts.
+    #[test]
+    fn eviction_ties_use_the_peers_salt() {
+        let cap = crate::conformance::activity::MAX_TRACKED_ACTIVITY;
+        let ids: Vec<_> = (0..=cap)
+            .map(|n| {
+                let mut bytes = [0u8; 32];
+                bytes[..8].copy_from_slice(&(n as u64).to_be_bytes());
+                ContractInstanceId::new(bytes)
+            })
+            .collect();
+        let survivors = |salt: u8| {
+            let dir = tempfile::TempDir::new().expect("tempdir");
+            let mut runner = runner_with_salt(dir.path(), [salt; 32]);
+            for id in &ids {
+                runner.note_merge(*id, Some(fresh_state()));
+            }
+            ids.iter()
+                .filter(|id| runner.activity.count(id) > 0)
+                .copied()
+                .collect::<HashSet<_>>()
+        };
+        assert_ne!(
+            survivors(1),
+            survivors(2),
+            "two salts evicted the same tied contracts: the runner's salt is not reaching \
+             the tracker"
+        );
+    }
+
+    /// Activity on contracts the peer does not host can neither be selected nor
+    /// stop candidates' activity from counting (#5914 review T5: a stray merge on a
+    /// non-candidate used to freeze the period as uniform).
+    #[test]
+    fn activity_outside_the_candidates_does_not_mask_candidate_activity() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut runner = runner_with_salt(dir.path(), [23; 32]);
+        let hosted: Vec<_> = (0..20u8).map(instance).collect();
+        runner.note_merge(instance(200), Some(fresh_state()));
+        runner.advance();
+        let first = runner.focus(Some(hosted.clone()), &[]);
+        assert_eq!(
+            first.active_candidates, 0,
+            "a non-candidate counted as active"
+        );
+        assert!(!first.selected.contains(&instance(200)));
+
+        for _ in 0..10 {
+            runner.note_merge(instance(3), Some(fresh_state()));
+        }
+        runner.advance();
+        let next = runner.focus(Some(hosted.clone()), &[]);
+        assert_eq!(
+            next.active_candidates, 1,
+            "a candidate's activity was ignored because a non-candidate had merged first"
+        );
+    }
+
+    /// A merge that cannot count as activity (no state change, or too large to
+    /// sample) is not recorded at all.
+    #[test]
+    fn a_merge_that_is_not_activity_does_not_raise_weight() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut runner = runner_with_salt(dir.path(), [13; 32]);
+        for _ in 0..100 {
+            runner.note_merge(instance(1), None);
+        }
+        assert_eq!(runner.activity_tracked(), 0);
+    }
+
+    /// Feed a focus member `seen` merges with the given admission outcomes, the way
+    /// `capture::run_writer` does: `note_merge` first, then `note_admission`.
+    fn feed(runner: &mut ShadowRunner, contract: ContractInstanceId, outcomes: &[RecordOutcome]) {
+        for outcome in outcomes {
+            runner.note_merge(contract, Some(fresh_state()));
+            runner.note_admission(&contract, *outcome);
+        }
+    }
+
+    fn end_period(runner: &mut ShadowRunner) -> FocusPeriodSummary {
+        let mut summary = None;
+        for _ in 0..ROTATE_EVERY_TICKS {
+            summary = summary.or(runner.advance());
+        }
+        summary.expect("the period never ended")
+    }
+
+    /// Every field of the period summary comes from its own source.
+    ///
+    /// The scenario gives the fields different values wherever it can (the review's
+    /// surviving mutant was a field fed from another counter); where two fields
+    /// legitimately coincide, the log-line pin below still catches a swap.
+    #[test]
+    fn the_period_summary_counts_each_field_from_its_own_source() {
+        use RecordOutcome::{Admitted, NothingNew, Refused};
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut runner = runner_with_salt(dir.path(), [7; 32]);
+        let hosted: Vec<_> = (0..20u8).map(instance).collect();
+        let focus = runner.focus(Some(hosted.clone()), &[]);
+        // Uniform slot first, then weighted.
+        let (a, b) = (focus.selected[0], focus.selected[1]);
+
+        // a: 6 seen, 3 admitted, 2 refused, 1 nothing new; judged.
+        feed(
+            &mut runner,
+            a,
+            &[Admitted, Admitted, Admitted, Refused, Refused, NothingNew],
+        );
+        // b: 4 seen, nothing admitted; judged from retained samples anyway.
+        feed(
+            &mut runner,
+            b,
+            &[NothingNew, NothingNew, NothingNew, NothingNew],
+        );
+        runner.note_judged(&[
+            JudgedContract {
+                contract: a,
+                verdicts: 3,
+                inconclusive: 0,
+            },
+            JudgedContract {
+                contract: b,
+                verdicts: 1,
+                inconclusive: 0,
+            },
+        ]);
+        assert_eq!(runner.focus_without_new_samples(), 1, "b has nothing new");
+
+        // Every other contract becomes active, then b stops being hosted: a is kept
+        // (it is accruing samples), the weighted slot is redrawn to some c.
+        for contract in hosted.iter().filter(|c| **c != a && **c != b) {
+            for _ in 0..7 {
+                runner.note_merge(*contract, Some(fresh_state()));
+            }
+        }
+        let without_b: Vec<_> = hosted.iter().copied().filter(|c| *c != b).collect();
+        let second = runner.focus(Some(without_b), &[]).selected;
+        assert_eq!(second[0], a, "a contract accruing samples was displaced");
+        let c = second[1];
+        feed(&mut runner, c, &[Admitted, Refused, Refused, Refused]);
+
+        let summary = end_period(&mut runner);
+        assert_eq!(
+            summary,
+            FocusPeriodSummary {
+                epoch: 0,
+                complete: false,
+                candidates: 19,
+                active_candidates: 19,
+                stints: 3,
+                merges_seen: 14,
+                samples_admitted: 4,
+                samples_refused: 5,
+                stints_without_new_samples: 1,
+                judged: 2,
+                uniform_stints: 1,
+                judged_uniform: 1,
+                weighted_stints: 2,
+                judged_weighted: 1,
+                weighted_selected_activity: 7,
+            }
+        );
+    }
+
+    fn judged(contract: ContractInstanceId) -> JudgedContract {
+        JudgedContract {
+            contract,
+            verdicts: 1,
+            inconclusive: 0,
+        }
+    }
+
+    /// A summary covers one period: the next starts from zero.
+    #[test]
+    fn each_period_summary_covers_only_its_own_period() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut runner = runner_with_salt(dir.path(), [7; 32]);
+        let hosted: Vec<_> = (0..20u8).map(instance).collect();
+        let first_focus = runner.focus(Some(hosted.clone()), &[]).selected;
+        feed(
+            &mut runner,
+            first_focus[0],
+            &[RecordOutcome::Admitted, RecordOutcome::Refused],
+        );
+        let first = end_period(&mut runner);
+        assert_eq!((first.merges_seen, first.stints), (2, 2));
+
+        runner.focus(Some(hosted.clone()), &[]);
+        let second = end_period(&mut runner);
+        assert_eq!(
+            (
+                second.merges_seen,
+                second.samples_admitted,
+                second.samples_refused,
+                second.stints
+            ),
+            (0, 0, 0, 2),
+            "the second period's summary still carries the first period's counts"
+        );
+        assert!(second.complete);
+    }
+
+    /// `judged_uniform` and `judged_weighted` say WHICH slot produced a verdict, which
+    /// is what the uniform/weighted split exists to measure.
+    #[test]
+    fn a_verdict_is_attributed_to_the_slot_that_was_judged() {
+        for judged_index in [0usize, 1] {
+            let dir = tempfile::TempDir::new().expect("tempdir");
+            let mut runner = runner_with_salt(dir.path(), [7; 32]);
+            let hosted: Vec<_> = (0..20u8).map(instance).collect();
+            let selected = runner.focus(Some(hosted), &[]).selected;
+            // selected[0] is the uniform slot, selected[1] the weighted one.
+            runner.note_judged(&[judged(selected[judged_index])]);
+            let summary = end_period(&mut runner);
+            let expected = if judged_index == 0 { (1, 0) } else { (0, 1) };
+            assert_eq!(
+                (summary.judged_uniform, summary.judged_weighted),
+                expected,
+                "judged slot {judged_index}"
+            );
+        }
+    }
+
+    /// `weighted_selected_activity` is the activity of WEIGHTED stints at the moment
+    /// they were drawn: not the uniform stints', and not refreshed while the stint
+    /// continues.
+    #[test]
+    fn weighted_selected_activity_is_the_weighted_stints_activity_when_drawn() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut runner = runner_with_salt(dir.path(), [7; 32]);
+        let hosted: Vec<_> = (0..20u8).map(instance).collect();
+        for contract in &hosted {
+            for _ in 0..5 {
+                runner.note_merge(*contract, Some(fresh_state()));
+            }
+        }
+        let first = runner.focus(Some(hosted.clone()), &[]).selected;
+        let weighted = first[1];
+        // The weighted pick keeps winning after it gets much busier, so its stint continues.
+        for _ in 0..60 {
+            runner.note_merge(weighted, Some(fresh_state()));
+        }
+        let second = runner.focus(Some(hosted), &[]).selected;
+        assert!(
+            second.contains(&weighted),
+            "precondition: the stint continues"
+        );
+        let summary = end_period(&mut runner);
+        assert_eq!(
+            summary.weighted_selected_activity, 5,
+            "uniform stints' activity leaked in, or a continuing stint's was refreshed"
+        );
+    }
+
+    /// Keep-if-accruing keys on what the sampler ADMITTED, not on merges merely seen:
+    /// a focus contract whose merges all added nothing new is re-drawn.
+    #[test]
+    fn a_focus_contract_whose_merges_added_nothing_is_displaced() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut runner = runner_with_salt(dir.path(), [21; 32]);
+        let hosted: Vec<_> = (0..60u8).map(instance).collect();
+        let first = runner.focus(Some(hosted.clone()), &[]).selected;
+        let weighted = first[1];
+        for _ in 0..4 {
+            runner.note_merge(weighted, Some(fresh_state()));
+            runner.note_admission(&weighted, RecordOutcome::NothingNew);
+        }
+        for contract in hosted.iter().filter(|c| !first.contains(c)) {
+            for _ in 0..100 {
+                runner.note_merge(*contract, Some(fresh_state()));
+            }
+        }
+        let now = runner.focus(Some(hosted), &[]).selected;
+        assert_eq!(now[0], first[0], "the uniform slot does not move");
+        assert_ne!(
+            now[1], weighted,
+            "a weighted contract that admitted nothing new was kept anyway"
+        );
+    }
+
+    /// A continuing stint takes the slot of the draw that keeps it (#5914 review
+    /// round 2, K4). When the peer stops hosting the uniform pick, the weighted pick
+    /// can become the new uniform pick; leaving it labelled Weighted gave the period
+    /// two Weighted members, so once both accrued, the split could keep only one and
+    /// displaced an accruing contract.
+    #[test]
+    fn a_continuing_stint_takes_its_new_slot() {
+        let hosted: Vec<_> = (0..10u8).map(instance).collect();
+        let mut checked = 0;
+        for salt in 0..=255u8 {
+            let dir = tempfile::TempDir::new().expect("tempdir");
+            let mut runner = runner_with_salt(dir.path(), [salt; 32]);
+            let first = runner.focus(Some(hosted.clone()), &[]).selected;
+            let (uniform, weighted) = (first[0], first[1]);
+            let without_uniform: Vec<_> =
+                hosted.iter().copied().filter(|c| *c != uniform).collect();
+            let second = runner.focus(Some(without_uniform.clone()), &[]).selected;
+            if second[0] != weighted {
+                continue;
+            }
+            checked += 1;
+            assert_eq!(
+                runner.period.current.get(&weighted).map(|m| m.slot),
+                Some(FocusSlot::Uniform),
+                "salt {salt}: a stint that moved to the uniform slot kept its old label"
+            );
+            // Both accrue through an interval; neither may be displaced at the tick.
+            for contract in &second {
+                runner.note_merge(*contract, Some(fresh_state()));
+                runner.note_admission(contract, RecordOutcome::Admitted);
+            }
+            runner.advance();
+            let third = runner.focus(Some(without_uniform), &[]).selected;
+            assert!(
+                second.iter().all(|c| third.contains(c)),
+                "salt {salt}: an accruing contract was displaced: {second:?} -> {third:?}"
+            );
+        }
+        assert!(
+            checked > 0,
+            "no salt exercised the case; this test proves nothing"
+        );
+    }
+
+    /// The first period on a fresh capture directory is incomplete; later ones are
+    /// complete, including across a restart, which resumes the period.
+    #[test]
+    fn only_the_first_period_on_a_fresh_directory_is_incomplete() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut runner = runner_with_salt(dir.path(), [9; 32]);
+        assert!(
+            !end_period(&mut runner).complete,
+            "first period on a fresh directory"
+        );
+        assert!(
+            end_period(&mut runner).complete,
+            "a period begun at a rotation"
+        );
+        drop(runner);
+
+        let mut restarted = ShadowRunner::new(dir.path(), EnforcementMode::Shadow);
+        assert_eq!(restarted.epoch(), 2);
+        assert!(
+            end_period(&mut restarted).complete,
+            "a restart at a period boundary must not make the next period partial"
+        );
+    }
+
+    /// A restart mid-period resumes the period on schedule with its counts and its
+    /// focus (#5914 review round 2, K7). A peer that restarts more often than every
+    /// two hours otherwise never produces a complete period.
+    #[test]
+    fn a_restart_mid_period_resumes_the_period() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let hosted: Vec<_> = (0..20u8).map(instance).collect();
+        let mut first = runner_with_salt(dir.path(), [9; 32]);
+        end_period(&mut first); // into a complete period
+        let focus = first.focus(Some(hosted.clone()), &[]).selected;
+        feed(
+            &mut first,
+            focus[0],
+            &[
+                RecordOutcome::Admitted,
+                RecordOutcome::Admitted,
+                RecordOutcome::Refused,
+            ],
+        );
+        for _ in 0..3 {
+            assert!(first.advance().is_none());
+        }
+        drop(first);
+
+        let mut resumed = ShadowRunner::new(dir.path(), EnforcementMode::Shadow);
+        // Before the hosted source registers, the restored focus is kept.
+        let mut kept = resumed.focus(None, &[instance(99)]).selected;
+        let mut was = focus.clone();
+        kept.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+        was.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+        assert_eq!(
+            kept, was,
+            "a restart replaced the period's focus with sampler keys"
+        );
+
+        let mut ended = None;
+        let mut ticks = 0;
+        while ended.is_none() {
+            ticks += 1;
+            ended = resumed.advance();
+        }
+        assert_eq!(
+            ticks,
+            ROTATE_EVERY_TICKS - 3,
+            "the period did not resume on schedule"
+        );
+        let ended = ended.expect("ended");
+        assert!(ended.complete);
+        assert_eq!(
+            (
+                ended.merges_seen,
+                ended.samples_admitted,
+                ended.samples_refused,
+                ended.stints
+            ),
+            (3, 2, 1, 2),
+            "the restart lost the period's counts"
+        );
+    }
+
+    /// A verdict survives a restart straight away, and merge/admission counts do
+    /// once the writer's periodic flush has run (#5914 review round 3, A1). Before,
+    /// both were only written at the next tick or draw, so a restart lost them while
+    /// the restored period still claimed `complete`.
+    #[test]
+    fn verdicts_and_flushed_counts_survive_a_restart() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let hosted: Vec<_> = (0..20u8).map(instance).collect();
+        let mut first = runner_with_salt(dir.path(), [9; 32]);
+        end_period(&mut first);
+        let focus = first.focus(Some(hosted.clone()), &[]).selected;
+        first.advance();
+        feed(
+            &mut first,
+            focus[0],
+            &[RecordOutcome::Admitted, RecordOutcome::Refused],
+        );
+        first.flush_period();
+        first.note_judged(&[JudgedContract {
+            contract: focus[0],
+            verdicts: 1,
+            inconclusive: 0,
+        }]);
+        drop(first);
+
+        let mut resumed = ShadowRunner::new(dir.path(), EnforcementMode::Shadow);
+        let ended = end_period(&mut resumed);
+        assert!(ended.complete);
+        assert_eq!(
+            (
+                ended.merges_seen,
+                ended.samples_admitted,
+                ended.samples_refused,
+                ended.judged
+            ),
+            (2, 1, 1, 1),
+            "counts written since the last tick were lost on restart"
+        );
+    }
+
+    /// A checkpoint that fails to write leaves the period dirty, so the next flush
+    /// retries it (#5914 review round 4).
+    #[test]
+    fn a_failed_checkpoint_is_retried_at_the_next_flush() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let hosted: Vec<_> = (0..20u8).map(instance).collect();
+        let mut runner = runner_with_salt(dir.path(), [9; 32]);
+        end_period(&mut runner);
+        let focus = runner.focus(Some(hosted), &[]).selected;
+        runner.advance();
+        feed(&mut runner, focus[0], &[RecordOutcome::Admitted]);
+
+        // A directory where the staging file goes makes the write fail.
+        let staging = dir.path().join(format!("{PERIOD_FILE}.tmp"));
+        std::fs::create_dir(&staging).expect("block the staging file");
+        runner.flush_period();
+        assert!(runner.period_dirty, "a failed checkpoint was marked clean");
+
+        std::fs::remove_dir(&staging).expect("unblock");
+        runner.flush_period();
+        assert!(!runner.period_dirty);
+        drop(runner);
+        let ended = end_period(&mut ShadowRunner::new(dir.path(), EnforcementMode::Shadow));
+        assert_eq!(
+            ended.samples_admitted, 1,
+            "the retried checkpoint was not written"
+        );
+    }
+
+    /// Merge and admission counts survive a restart through `flush_period` alone,
+    /// with no verdict to trigger an earlier write (#5914 review round 4: the A1
+    /// test let note_judged's own persist carry them, so a no-op flush survived).
+    /// Each case ends with one lone kind of update before the final flush, so a
+    /// later write cannot carry an update that failed to mark the period dirty.
+    #[test]
+    fn flushed_merge_and_admission_counts_survive_a_restart() {
+        for lone_admission_last in [false, true] {
+            let dir = tempfile::TempDir::new().expect("tempdir");
+            let hosted: Vec<_> = (0..20u8).map(instance).collect();
+            let mut first = runner_with_salt(dir.path(), [9; 32]);
+            end_period(&mut first);
+            let focus = first.focus(Some(hosted), &[]).selected;
+            first.advance();
+            feed(
+                &mut first,
+                focus[0],
+                &[RecordOutcome::Admitted, RecordOutcome::Refused],
+            );
+            first.flush_period();
+            if lone_admission_last {
+                first.note_admission(&focus[0], RecordOutcome::Admitted);
+            } else {
+                first.note_merge(focus[0], None);
+            }
+            first.flush_period();
+            drop(first);
+            let ended = end_period(&mut ShadowRunner::new(dir.path(), EnforcementMode::Shadow));
+            let expected = if lone_admission_last {
+                (2, 2, 1)
+            } else {
+                (3, 1, 1)
+            };
+            assert_eq!(
+                (
+                    ended.merges_seen,
+                    ended.samples_admitted,
+                    ended.samples_refused
+                ),
+                expected,
+                "flush_period did not checkpoint the counts (lone admission last: \
+                 {lone_admission_last})"
+            );
+        }
+    }
+
+    /// Without a flush (or a tick, draw or verdict) the counts since the last write
+    /// are lost: the tolerance FocusPeriodSummary::complete documents, and evidence
+    /// that the previous test's survival is the flush's doing.
+    #[test]
+    fn unflushed_merge_and_admission_counts_are_lost_on_restart() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let hosted: Vec<_> = (0..20u8).map(instance).collect();
+        let mut first = runner_with_salt(dir.path(), [9; 32]);
+        end_period(&mut first);
+        let focus = first.focus(Some(hosted), &[]).selected;
+        first.advance();
+        feed(
+            &mut first,
+            focus[0],
+            &[RecordOutcome::Admitted, RecordOutcome::Refused],
+        );
+        drop(first);
+        let ended = end_period(&mut ShadowRunner::new(dir.path(), EnforcementMode::Shadow));
+        assert_eq!(
+            (
+                ended.merges_seen,
+                ended.samples_admitted,
+                ended.samples_refused
+            ),
+            (0, 0, 0)
+        );
+    }
+
+    /// A failed checkpoint from ANY write path, not only the flush, leaves the
+    /// period dirty for the next flush to retry (#5914 final review). A verdict's own
+    /// immediate write failing used to leave a clean flag, so the verdict was lost.
+    #[test]
+    fn a_failed_verdict_checkpoint_is_retried_at_the_next_flush() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let hosted: Vec<_> = (0..20u8).map(instance).collect();
+        let mut runner = runner_with_salt(dir.path(), [9; 32]);
+        end_period(&mut runner);
+        let focus = runner.focus(Some(hosted), &[]).selected;
+        runner.advance();
+        assert!(
+            !runner.period_dirty,
+            "precondition: the tick checkpoint landed"
+        );
+
+        let staging = dir.path().join(format!("{PERIOD_FILE}.tmp"));
+        std::fs::create_dir(&staging).expect("block the staging file");
+        runner.note_judged(&[JudgedContract {
+            contract: focus[0],
+            verdicts: 1,
+            inconclusive: 0,
+        }]);
+        assert!(
+            runner.period_dirty,
+            "a failed verdict checkpoint was left clean"
+        );
+
+        std::fs::remove_dir(&staging).expect("unblock");
+        runner.flush_period();
+        drop(runner);
+        let ended = end_period(&mut ShadowRunner::new(dir.path(), EnforcementMode::Shadow));
+        assert_eq!(
+            ended.judged, 1,
+            "the verdict was lost with its failed checkpoint"
+        );
+    }
+
+    /// An AdmittedPartly outcome adds to `admitted` as well as `refused`, and keeps
+    /// its member accruing (#5914 review round 4, A3 gap).
+    #[test]
+    fn a_partly_admitted_merge_counts_toward_admitted_and_keeps_its_member() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut runner = runner_with_salt(dir.path(), [9; 32]);
+        let focus = runner
+            .focus(Some((0..20u8).map(instance).collect()), &[])
+            .selected;
+        feed(&mut runner, focus[0], &[RecordOutcome::AdmittedPartly]);
+        runner.advance();
+        assert!(
+            runner.period.accruing().iter().any(|(c, _)| *c == focus[0]),
+            "a partly admitted merge did not count as accruing"
+        );
+        let ended = end_period(&mut runner);
+        assert_eq!((ended.samples_admitted, ended.samples_refused), (1, 1));
+    }
+
+    /// A contract that changes slot mid-period ends one stint and starts another, so
+    /// each slot is credited only with what happened in it (#5914 review round 3,
+    /// A2). Relabelling the whole stint moved a weighted verdict to the uniform slot.
+    #[test]
+    fn a_slot_change_ends_one_stint_and_starts_another() {
+        let hosted: Vec<_> = (0..10u8).map(instance).collect();
+        let mut checked = 0;
+        for salt in 0..=255u8 {
+            let dir = tempfile::TempDir::new().expect("tempdir");
+            let mut runner = runner_with_salt(dir.path(), [salt; 32]);
+            let first = runner.focus(Some(hosted.clone()), &[]).selected;
+            let (uniform, weighted) = (first[0], first[1]);
+            runner.note_judged(&[JudgedContract {
+                contract: weighted,
+                verdicts: 1,
+                inconclusive: 0,
+            }]);
+            let without_uniform: Vec<_> =
+                hosted.iter().copied().filter(|c| *c != uniform).collect();
+            let second = runner.focus(Some(without_uniform), &[]).selected;
+            if second[0] != weighted {
+                continue;
+            }
+            checked += 1;
+            let ended = end_period(&mut runner);
+            assert_eq!(
+                (
+                    ended.stints,
+                    ended.uniform_stints,
+                    ended.weighted_stints,
+                    ended.judged_uniform,
+                    ended.judged_weighted
+                ),
+                (4, 2, 2, 0, 1),
+                "salt {salt}: a slot change re-attributed the stint: {ended:?}"
+            );
+        }
+        assert!(checked > 0, "no salt exercised the case");
+    }
+
+    /// A period persisted under a different salt is not resumed (#5914 review round
+    /// 3, B3): its members were drawn by another peer identity's scores, and resuming
+    /// them would credit this salt's period with that draw.
+    #[test]
+    fn a_changed_salt_does_not_resume_the_old_period() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let hosted: Vec<_> = (0..20u8).map(instance).collect();
+        let mut first = runner_with_salt(dir.path(), [9; 32]);
+        end_period(&mut first);
+        let picked = first.focus(Some(hosted), &[]).selected;
+        first.advance();
+        drop(first);
+        let mut other = runner_with_salt(dir.path(), [10; 32]);
+        assert!(
+            other.period.current.is_empty(),
+            "a period drawn under another salt was resumed: {picked:?}"
+        );
+        assert!(!end_period(&mut other).complete);
+    }
+
+    /// A persisted period cannot restore more members than there are focus slots
+    /// (#5914 review round 3, B4): the file is local, but nothing else bounds it.
+    #[test]
+    fn a_restored_period_is_capped_at_the_focus_size() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut first = runner_with_salt(dir.path(), [9; 32]);
+        end_period(&mut first);
+        first.focus(Some((0..20u8).map(instance).collect()), &[]);
+        first.advance();
+        drop(first);
+        let path = dir.path().join(PERIOD_FILE);
+        let mut saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).expect("read")).expect("json");
+        let member = saved["members"][0].clone();
+        let members = saved["members"].as_array_mut().expect("members");
+        for n in 100..110u8 {
+            let mut extra = member.clone();
+            extra[0] = serde_json::to_value(instance(n)).expect("id");
+            members.push(extra);
+        }
+        std::fs::write(&path, serde_json::to_vec(&saved).expect("json")).expect("write");
+        let restored = ShadowRunner::new(dir.path(), EnforcementMode::Shadow);
+        assert!(
+            restored.period.current.len() <= MAX_FOCUS_CONTRACTS,
+            "restored {} focus members",
+            restored.period.current.len()
+        );
+    }
+
+    /// A runner restarted into a complete period, with its draw persisted.
+    fn restarted_mid_period(
+        dir: &Path,
+        hosted: &[ContractInstanceId],
+    ) -> (ShadowRunner, Vec<ContractInstanceId>) {
+        let mut first = runner_with_salt(dir, [9; 32]);
+        end_period(&mut first);
+        first.advance();
+        let picked = first.focus(Some(hosted.to_vec()), &[]).selected;
+        drop(first);
+        (ShadowRunner::new(dir, EnforcementMode::Shadow), picked)
+    }
+
+    /// Resumption ends at the first hosted draw (B1): from then on the runner draws
+    /// normally, including from the fallback if the source goes away again.
+    #[test]
+    fn a_resumed_runner_draws_normally_once_the_hosted_source_arrives() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let hosted: Vec<_> = (0..20u8).map(instance).collect();
+        let (mut resumed, picked) = restarted_mid_period(dir.path(), &hosted);
+        // The persisted draw (made at a draw, not a tick) is what resumes, in slot
+        // order, and reports no activity it has not seen.
+        let tick = resumed.focus(None, &[instance(99)]);
+        assert_eq!(
+            tick.selected, picked,
+            "the resumed focus is not the persisted draw"
+        );
+        assert_eq!(tick.active_candidates, 0);
+
+        let elsewhere: Vec<_> = (40..60u8).map(instance).collect();
+        let drawn = resumed.focus(Some(elsewhere.clone()), &[]).selected;
+        assert!(
+            drawn.iter().all(|c| elsewhere.contains(c)),
+            "a hosted draw kept old focus"
+        );
+        let fallback = resumed.focus(None, &[instance(99)]).selected;
+        assert_eq!(
+            fallback,
+            vec![instance(99)],
+            "resumption outlived the hosted draw"
+        );
+    }
+
+    /// Resumption also ends at a rotation (B1).
+    #[test]
+    fn resumption_ends_at_rotation() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let hosted: Vec<_> = (0..20u8).map(instance).collect();
+        let (mut resumed, _) = restarted_mid_period(dir.path(), &hosted);
+        while resumed.advance().is_none() {}
+        assert_eq!(
+            resumed.focus(None, &[instance(99)]).selected,
+            vec![instance(99)]
+        );
+    }
+
+    /// A restart during the first, incomplete period stays incomplete (B1).
+    #[test]
+    fn a_restart_during_an_incomplete_period_stays_incomplete() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut first = runner_with_salt(dir.path(), [9; 32]);
+        first.advance();
+        first.advance();
+        drop(first);
+        let mut resumed = ShadowRunner::new(dir.path(), EnforcementMode::Shadow);
+        let mut ticks = 0;
+        let ended = loop {
+            ticks += 1;
+            if let Some(ended) = resumed.advance() {
+                break ended;
+            }
+        };
+        assert_eq!(
+            ticks,
+            ROTATE_EVERY_TICKS - 2,
+            "the period did not resume on schedule"
+        );
+        assert!(
+            !ended.complete,
+            "a period that began before any rotation claimed complete"
+        );
+    }
+
+    /// A period persisted for another epoch is not resumed (B6).
+    #[test]
+    fn a_period_from_another_epoch_is_not_resumed() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let hosted: Vec<_> = (0..20u8).map(instance).collect();
+        let (_, _) = restarted_mid_period(dir.path(), &hosted);
+        std::fs::write(dir.path().join(EPOCH_FILE), b"7").expect("epoch");
+        let resumed = ShadowRunner::new(dir.path(), EnforcementMode::Shadow);
+        assert_eq!(resumed.epoch(), 7);
+        assert!(
+            resumed.period.current.is_empty(),
+            "another epoch's period resumed"
+        );
+    }
+
+    /// Departed stints persist with the totals (B6), and an out-of-range tick count
+    /// in the file is reduced into the period.
+    #[test]
+    fn restored_totals_include_departed_stints_and_ticks_are_reduced() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let hosted: Vec<_> = (0..20u8).map(instance).collect();
+        let mut first = runner_with_salt(dir.path(), [9; 32]);
+        end_period(&mut first);
+        let picked = first.focus(Some(hosted.clone()), &[]).selected;
+        feed(&mut first, picked[0], &[RecordOutcome::Admitted]);
+        let rest: Vec<_> = hosted
+            .iter()
+            .copied()
+            .filter(|c| !picked.contains(c))
+            .collect();
+        first.focus(Some(rest), &[]);
+        first.advance();
+        drop(first);
+
+        let path = dir.path().join(PERIOD_FILE);
+        let mut saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).expect("read")).expect("json");
+        saved["ticks_into_period"] = serde_json::json!(ROTATE_EVERY_TICKS + 3);
+        std::fs::write(&path, serde_json::to_vec(&saved).expect("json")).expect("write");
+
+        let mut resumed = ShadowRunner::new(dir.path(), EnforcementMode::Shadow);
+        assert_eq!(resumed.period_tick(), 3);
+        let ended = end_period(&mut resumed);
+        assert_eq!(
+            (ended.stints, ended.merges_seen),
+            (4, 1),
+            "departed stints were lost"
+        );
+    }
+
+    /// An admission only counts toward keeping a member once its interval has ended
+    /// at a tick: a draw in mid-interval does not see it (B6, K1).
+    #[test]
+    fn an_admission_keeps_a_member_only_after_the_tick() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut runner = runner_with_salt(dir.path(), [21; 32]);
+        let hosted: Vec<_> = (0..20u8).map(instance).collect();
+        let picked = runner.focus(Some(hosted), &[]).selected;
+        feed(&mut runner, picked[0], &[RecordOutcome::Admitted]);
+        assert!(
+            runner.period.accruing().is_empty(),
+            "kept before its interval ended"
+        );
+        runner.advance();
+        assert_eq!(runner.period.accruing().len(), 1);
+    }
+
+    /// An unreadable persisted period starts an incomplete one rather than failing.
+    #[test]
+    fn an_unreadable_period_file_starts_an_incomplete_period() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut runner = runner_with_salt(dir.path(), [9; 32]);
+        end_period(&mut runner);
+        drop(runner);
+        std::fs::write(dir.path().join(PERIOD_FILE), b"not a period").expect("write");
+        let mut restarted = ShadowRunner::new(dir.path(), EnforcementMode::Shadow);
+        assert!(!end_period(&mut restarted).complete);
+    }
+
+    /// A contract that leaves focus mid-period (the hosted set changed) is still
+    /// counted, rather than vanishing from the period because it is no longer current.
+    #[test]
+    fn a_contract_leaving_focus_mid_period_is_still_counted() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut runner = runner_with_salt(dir.path(), [11; 32]);
+        let hosted: Vec<_> = (0..20u8).map(instance).collect();
+        let first = runner.focus(Some(hosted.clone()), &[]).selected;
+        feed(&mut runner, first[0], &[RecordOutcome::NothingNew]);
+
+        // The peer stops hosting both focus contracts.
+        let shrunk: Vec<_> = hosted
+            .iter()
+            .copied()
+            .filter(|c| !first.contains(c))
+            .collect();
+        let second = runner.focus(Some(shrunk.clone()), &[]).selected;
+        assert!(second.iter().all(|c| !first.contains(c)));
+        feed(&mut runner, second[0], &[RecordOutcome::Admitted]);
+
+        let summary = end_period(&mut runner);
+        assert_eq!(summary.stints, 4, "two departed stints plus two current");
+        assert_eq!(
+            summary.merges_seen, 2,
+            "the departed stint's merge was kept"
+        );
+        assert_eq!(
+            summary.stints_without_new_samples, 3,
+            "both departed contracts and one current one admitted nothing"
+        );
+    }
+
+    /// Pin: the "conformance focus period ended" line reports each summary field
+    /// under its own name. A behavioural test of the summary cannot see the log, and
+    /// a line that printed `judged` under `stints_without_new_samples` would mislead
+    /// the acceptance measurement while every test stayed green.
+    #[test]
+    fn the_period_line_reports_every_field_under_its_own_name() {
+        let src = include_str!("shadow.rs");
+        let tests_at = src.find("\nmod tests {").expect("test module");
+        let start = src
+            .find("    pub(crate) fn advance(&mut self)")
+            .expect("advance not found");
+        assert!(start < tests_at, "matched inside the test module");
+        let after = &src[start..];
+        let open = after.find('{').expect("advance has no body");
+        let mut depth = 0usize;
+        let mut end = None;
+        for (offset, ch) in after[open..].char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = Some(open + offset + 1);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let body: String = after[..end.expect("unbalanced")]
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(body.contains("\"conformance focus period ended\""));
+        for field in [
+            "epoch",
+            "complete",
+            "candidates",
+            "active_candidates",
+            "stints",
+            "merges_seen",
+            "samples_admitted",
+            "samples_refused",
+            "stints_without_new_samples",
+            "judged",
+            "uniform_stints",
+            "judged_uniform",
+            "weighted_stints",
+            "judged_weighted",
+            "weighted_selected_activity",
+        ] {
+            let pair = format!("{field} = ended.{field},");
+            assert_eq!(
+                body.matches(&pair).count(),
+                1,
+                "the period-ended line does not report `{field}` from `ended.{field}`"
+            );
+        }
     }
 
     /// Build a sampler map by pushing observations through the real admission path,
@@ -1526,7 +3397,7 @@ mod tests {
             &[(vec![1], vec![1, 2]), (vec![2], vec![2, 3])],
         );
         let dir = tempfile::TempDir::new()?;
-        let runner = ShadowRunner::new(dir.path(), EnforcementMode::Shadow);
+        let mut runner = ShadowRunner::new(dir.path(), EnforcementMode::Shadow);
         let focus = runner.focus(None, &samplers.keys().copied().collect::<Vec<_>>());
         let (work, _awaiting) = runner.select(&focus, &samplers);
         assert!(!work.is_empty(), "nothing selected, so this proves nothing");

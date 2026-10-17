@@ -606,3 +606,89 @@ fn duplicate_candidates_do_not_waste_focus_slots() {
     assert_eq!(selected.len(), 2);
     assert_ne!(selected[0], selected[1]);
 }
+
+// ------------------------------------------- admission after shedding (#5914 r4)
+
+/// With no transition slots, a transition is pushed and immediately popped. It must
+/// not be reported as stored; the states it brought were kept, and that is reported.
+#[test]
+fn a_transition_with_no_slot_is_not_reported_stored() {
+    let mut sampler = ContractSampler::new(SamplerConfig {
+        transitions: 0,
+        ..config()
+    });
+    let (admission, retained) =
+        sampler.observe_transition_retaining(&state(1, 4), None, Some(&[9]), None, &state(2, 4));
+    assert_eq!(
+        admission,
+        Admission::NotSelected,
+        "a transition with nowhere to live must be NotSelected"
+    );
+    assert!(
+        retained,
+        "the new base and result states were kept and not reported"
+    );
+}
+
+/// A transition whose payload pushes the store over budget is shed by the very
+/// loop that admitted it; that is not "stored" either.
+#[test]
+fn a_transition_shed_by_the_budget_is_not_reported_stored() {
+    let mut sampler = ContractSampler::new(SamplerConfig {
+        earliest: 2,
+        recent: 1,
+        reservoir: 0,
+        largest: 0,
+        smallest: 0,
+        transitions: 8,
+        max_bytes: 10,
+        max_state_bytes: 10,
+        seed: 1,
+    });
+    // States: 2 + 3 bytes fit; the 10-byte delta takes the store to 15 > 10, and
+    // shedding drops the transition first (recency holds a single member).
+    let (admission, retained) =
+        sampler.observe_transition_retaining(&[1, 1], None, Some(&[0; 10]), None, &[2, 2, 2]);
+    assert_eq!(
+        admission,
+        Admission::NoBudget,
+        "a transition shed by the budget loop must be NoBudget"
+    );
+    assert!(retained, "the states survived and were not reported");
+}
+
+/// A base stored on the way in and then shed while making room for the result is
+/// not retained. The early-return paths reported `retained` from what was admitted
+/// along the way rather than from what is still held (#5914 final review).
+#[test]
+fn a_base_stored_then_shed_for_the_result_is_not_retained() {
+    let mut sampler = ContractSampler::new(SamplerConfig {
+        earliest: 2,
+        recent: 0,
+        reservoir: 0,
+        largest: 1,
+        smallest: 0,
+        transitions: 8,
+        max_bytes: 12,
+        max_state_bytes: 12,
+        seed: 1,
+    });
+    // An earlier state fills the first earliest slot.
+    assert_eq!(sampler.observe_state(&[7, 7, 7, 7]), Admission::Stored);
+    // The base takes the second earliest slot (8 of 12 bytes). The 10-byte result
+    // wants the largest stratum; making room pops the newest earliest member (the
+    // base) and still cannot fit it, so the result is refused for budget.
+    let base = [1, 1, 1, 1];
+    let (admission, retained) =
+        sampler.observe_transition_retaining(&base, None, Some(&[9]), None, &[2; 10]);
+    assert_eq!(admission, Admission::NotSelected);
+    assert_eq!(
+        sampler.distinct_states(),
+        1,
+        "precondition: the base was shed"
+    );
+    assert!(
+        !retained,
+        "a base shed before returning was reported retained"
+    );
+}
