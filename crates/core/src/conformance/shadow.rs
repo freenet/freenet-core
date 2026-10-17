@@ -67,9 +67,9 @@ pub const PROBE_INTERVAL: Duration = Duration::from_secs(15 * 60);
 ///
 /// The period is what the uniform slot is fixed for, and what stops an author who
 /// somehow learns they are being watched from staying watched. The weighted slot is
-/// re-drawn more often than this, at every tick, from current activity, but only
-/// while it has gathered nothing new; a contract the sampler is admitting samples for
-/// keeps its slot until the period ends. Eight ticks at fifteen minutes is two hours,
+/// re-drawn at every tick from current activity and goes to the draw's current
+/// winner; the keys are fixed for the period, so it only moves when activity reorders
+/// the draw. Eight ticks at fifteen minutes is two hours,
 /// long enough for a sampler to accumulate something worth checking and short enough
 /// that a day covers many contracts.
 const ROTATE_EVERY_TICKS: u32 = 8;
@@ -507,9 +507,10 @@ impl FocusPeriod {
         }
     }
 
-    /// Current focus contracts that must not be displaced: the sampler admitted
-    /// something new for them in the interval before the latest probe tick, so
-    /// moving them would abandon a sample being built.
+    /// Current focus contracts accruing samples: the sampler admitted something new
+    /// for them in the interval before the latest probe tick. A uniform one keeps its
+    /// slot; a weighted one keeps its slot only while it still wins the weighted draw
+    /// (`FocusSelector::select_split`).
     ///
     /// Only the latest interval counts (#5914 review round 2, K1). Keeping any
     /// member that had EVER admitted a sample this stint let one early sample lock
@@ -598,10 +599,10 @@ pub struct ShadowRunner {
     ///
     /// Not frozen per period: frozen weights could not see a contract that was quiet
     /// before a period and bursts during it, and focused it less than a uniform draw
-    /// would while it had the most to check. Re-reading at each probe tick does not
-    /// churn focus, because a focus contract the sampler is admitting new samples for
-    /// is kept (see `FocusPeriod::accruing`); only a pick that has gathered nothing is
-    /// re-drawn.
+    /// would while it had the most to check. Re-reading at each probe tick churns
+    /// little, because the draw's keys are fixed for the period: the weighted slot
+    /// moves only when activity reorders the draw (a challenger beats the incumbent).
+    /// An accruing uniform member is kept outright (see `FocusPeriod::accruing`).
     activity: MergeActivity,
     /// What the current period's focus contracts have and have not seen.
     period: FocusPeriod,
@@ -2753,6 +2754,156 @@ mod tests {
             "restored {} focus members",
             restored.period.current.len()
         );
+    }
+
+    /// A runner restarted into a complete period, with its draw persisted.
+    fn restarted_mid_period(
+        dir: &Path,
+        hosted: &[ContractInstanceId],
+    ) -> (ShadowRunner, Vec<ContractInstanceId>) {
+        let mut first = runner_with_salt(dir, [9; 32]);
+        end_period(&mut first);
+        first.advance();
+        let picked = first.focus(Some(hosted.to_vec()), &[]).selected;
+        drop(first);
+        (ShadowRunner::new(dir, EnforcementMode::Shadow), picked)
+    }
+
+    /// Resumption ends at the first hosted draw (B1): from then on the runner draws
+    /// normally, including from the fallback if the source goes away again.
+    #[test]
+    fn a_resumed_runner_draws_normally_once_the_hosted_source_arrives() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let hosted: Vec<_> = (0..20u8).map(instance).collect();
+        let (mut resumed, picked) = restarted_mid_period(dir.path(), &hosted);
+        // The persisted draw (made at a draw, not a tick) is what resumes, in slot
+        // order, and reports no activity it has not seen.
+        let tick = resumed.focus(None, &[instance(99)]);
+        assert_eq!(
+            tick.selected, picked,
+            "the resumed focus is not the persisted draw"
+        );
+        assert_eq!(tick.active_candidates, 0);
+
+        let elsewhere: Vec<_> = (40..60u8).map(instance).collect();
+        let drawn = resumed.focus(Some(elsewhere.clone()), &[]).selected;
+        assert!(
+            drawn.iter().all(|c| elsewhere.contains(c)),
+            "a hosted draw kept old focus"
+        );
+        let fallback = resumed.focus(None, &[instance(99)]).selected;
+        assert_eq!(
+            fallback,
+            vec![instance(99)],
+            "resumption outlived the hosted draw"
+        );
+    }
+
+    /// Resumption also ends at a rotation (B1).
+    #[test]
+    fn resumption_ends_at_rotation() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let hosted: Vec<_> = (0..20u8).map(instance).collect();
+        let (mut resumed, _) = restarted_mid_period(dir.path(), &hosted);
+        while resumed.advance().is_none() {}
+        assert_eq!(
+            resumed.focus(None, &[instance(99)]).selected,
+            vec![instance(99)]
+        );
+    }
+
+    /// A restart during the first, incomplete period stays incomplete (B1).
+    #[test]
+    fn a_restart_during_an_incomplete_period_stays_incomplete() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut first = runner_with_salt(dir.path(), [9; 32]);
+        first.advance();
+        first.advance();
+        drop(first);
+        let mut resumed = ShadowRunner::new(dir.path(), EnforcementMode::Shadow);
+        let mut ticks = 0;
+        let ended = loop {
+            ticks += 1;
+            if let Some(ended) = resumed.advance() {
+                break ended;
+            }
+        };
+        assert_eq!(
+            ticks,
+            ROTATE_EVERY_TICKS - 2,
+            "the period did not resume on schedule"
+        );
+        assert!(
+            !ended.complete,
+            "a period that began before any rotation claimed complete"
+        );
+    }
+
+    /// A period persisted for another epoch is not resumed (B6).
+    #[test]
+    fn a_period_from_another_epoch_is_not_resumed() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let hosted: Vec<_> = (0..20u8).map(instance).collect();
+        let (_, _) = restarted_mid_period(dir.path(), &hosted);
+        std::fs::write(dir.path().join(EPOCH_FILE), b"7").expect("epoch");
+        let resumed = ShadowRunner::new(dir.path(), EnforcementMode::Shadow);
+        assert_eq!(resumed.epoch(), 7);
+        assert!(
+            resumed.period.current.is_empty(),
+            "another epoch's period resumed"
+        );
+    }
+
+    /// Departed stints persist with the totals (B6), and an out-of-range tick count
+    /// in the file is reduced into the period.
+    #[test]
+    fn restored_totals_include_departed_stints_and_ticks_are_reduced() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let hosted: Vec<_> = (0..20u8).map(instance).collect();
+        let mut first = runner_with_salt(dir.path(), [9; 32]);
+        end_period(&mut first);
+        let picked = first.focus(Some(hosted.clone()), &[]).selected;
+        feed(&mut first, picked[0], &[RecordOutcome::Admitted]);
+        let rest: Vec<_> = hosted
+            .iter()
+            .copied()
+            .filter(|c| !picked.contains(c))
+            .collect();
+        first.focus(Some(rest), &[]);
+        first.advance();
+        drop(first);
+
+        let path = dir.path().join(PERIOD_FILE);
+        let mut saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).expect("read")).expect("json");
+        saved["ticks_into_period"] = serde_json::json!(ROTATE_EVERY_TICKS + 3);
+        std::fs::write(&path, serde_json::to_vec(&saved).expect("json")).expect("write");
+
+        let mut resumed = ShadowRunner::new(dir.path(), EnforcementMode::Shadow);
+        assert_eq!(resumed.period_tick(), 3);
+        let ended = end_period(&mut resumed);
+        assert_eq!(
+            (ended.stints, ended.merges_seen),
+            (4, 1),
+            "departed stints were lost"
+        );
+    }
+
+    /// An admission only counts toward keeping a member once its interval has ended
+    /// at a tick: a draw in mid-interval does not see it (B6, K1).
+    #[test]
+    fn an_admission_keeps_a_member_only_after_the_tick() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut runner = runner_with_salt(dir.path(), [21; 32]);
+        let hosted: Vec<_> = (0..20u8).map(instance).collect();
+        let picked = runner.focus(Some(hosted), &[]).selected;
+        feed(&mut runner, picked[0], &[RecordOutcome::Admitted]);
+        assert!(
+            runner.period.accruing().is_empty(),
+            "kept before its interval ended"
+        );
+        runner.advance();
+        assert_eq!(runner.period.accruing().len(), 1);
     }
 
     /// An unreadable persisted period starts an incomplete one rather than failing.

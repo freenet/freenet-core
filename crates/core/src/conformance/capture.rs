@@ -2584,6 +2584,16 @@ mod probe_wiring_pins {
             lines,
             "a shadow tick line does not say whether selection was weighted"
         );
+        for exact in [
+            "active_candidates = focus.active_candidates,",
+            "active_candidates = last_focus.active_candidates,",
+        ] {
+            assert_eq!(
+                body.matches(exact).count(),
+                1,
+                "a tick line no longer reports the draw's own `{exact}`"
+            );
+        }
         for pair in [
             "activity_tracked = shadow.activity_tracked()",
             "activity_evicted = shadow.activity_evicted()",
@@ -3279,6 +3289,49 @@ mod tests {
             tracked.sampler.distinct_states() > 0,
             "precondition: states were kept"
         );
+    }
+
+    /// `observe_transition` hands back the contract the sampler evicted, whose bundle
+    /// the caller must delete (B6).
+    #[test]
+    fn observe_transition_returns_the_evicted_contract() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut shadow = runner_for_test(dir.path());
+        let mut samplers = HashMap::new();
+        for n in 0..MAX_TRACKED_CONTRACTS as u8 {
+            let _ = record(
+                &mut samplers,
+                &SamplingScope::Wide,
+                observation_for(instance(n)),
+            );
+        }
+        let newcomer = instance(200);
+        let evicted = observe_transition(
+            &mut shadow,
+            &mut samplers,
+            &focused_on(&[200]),
+            observation_for(newcomer),
+            1024,
+        );
+        let evicted = evicted.expect("a full map must evict for a focused newcomer");
+        assert!(!samplers.contains_key(&evicted));
+        assert!(samplers.contains_key(&newcomer));
+    }
+
+    /// `observe_transition` applies the ceiling it is given to activity (B6).
+    #[test]
+    fn observe_transition_does_not_weight_a_merge_over_its_ceiling() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut shadow = runner_for_test(dir.path());
+        // observation_for's result state is 3 bytes.
+        let _evicted = observe_transition(
+            &mut shadow,
+            &mut HashMap::new(),
+            &SamplingScope::Wide,
+            observation_for(instance(1)),
+            2,
+        );
+        assert_eq!(shadow.activity_tracked(), 0);
     }
 
     fn focused_on(ids: &[u8]) -> SamplingScope {

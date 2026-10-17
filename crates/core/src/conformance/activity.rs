@@ -82,6 +82,11 @@ pub(crate) type StateDigest = u128;
 /// must not count as activity (#5914 review round 2, K2). Four covers the common
 /// toggles; a contract cycling through more than four states does gain weight, and
 /// does give the sampler distinct states to keep.
+///
+/// This filters BENIGN repetition only. It is not adversarial protection: any
+/// contract whose state carries a counter or timestamp produces a new digest on
+/// every merge, so a sender wanting weight for a contract gets it either way. The
+/// weight cap and the uniform slot are what bound that.
 pub(crate) const RECENT_STATES: usize = 4;
 
 #[derive(Debug, Clone)]
@@ -641,5 +646,28 @@ mod tests {
             counted += usize::from(activity.record(id(1), digest));
         }
         assert_eq!(counted, 1_000);
+    }
+
+    /// A three-state cycle counts each state once (the ring holds at least three).
+    #[test]
+    fn a_three_state_cycle_counts_each_state_once() {
+        let mut activity = MergeActivity::default();
+        let states = [fresh(), fresh(), fresh()];
+        let counted: usize = (0..30)
+            .map(|i| usize::from(activity.record(id(1), states[i % 3])))
+            .sum();
+        assert_eq!(counted, 3);
+    }
+
+    /// A five-state cycle outruns the four-entry ring and keeps counting, which is
+    /// the documented window, not a bug.
+    #[test]
+    fn a_five_state_cycle_outruns_the_ring() {
+        let mut activity = MergeActivity::default();
+        let states = [fresh(), fresh(), fresh(), fresh(), fresh()];
+        let counted: usize = (0..30)
+            .map(|i| usize::from(activity.record(id(1), states[i % 5])))
+            .sum();
+        assert_eq!(counted, 30);
     }
 }

@@ -228,62 +228,38 @@ impl FocusSelector {
         let pool: HashSet<ContractInstanceId> = candidates.iter().copied().collect();
         let uniform_slots = self.max_focus.min(1);
         let weighted_slots = self.max_focus - uniform_slots;
-        let capacity = |slot: FocusSlot| match slot {
-            FocusSlot::Uniform => uniform_slots,
-            FocusSlot::Weighted => weighted_slots,
-        };
-
-        // Kept contracts first, in a fixed order so the caller's order is irrelevant.
-        let mut kept: Vec<(ContractInstanceId, FocusSlot)> = kept
-            .iter()
-            .copied()
-            .filter(|(id, _)| pool.contains(id))
-            .collect();
-        kept.sort_by(|(ia, sa), (ib, sb)| {
-            sa.cmp(sb).then_with(|| ia.as_bytes().cmp(ib.as_bytes()))
-        });
         let mut chosen: Vec<(ContractInstanceId, FocusSlot)> = Vec::with_capacity(self.max_focus);
-        for (id, slot) in kept {
-            // Weighted members are not reserved: they compete in the draw below, and
-            // keep their slot exactly when they still win it.
-            if slot == FocusSlot::Weighted {
-                continue;
-            }
-            let used = chosen.iter().filter(|(_, s)| *s == slot).count();
-            if used < capacity(slot) && !chosen.iter().any(|(c, _)| *c == id) {
-                chosen.push((id, slot));
-            }
-        }
-        let taken = |chosen: &[(ContractInstanceId, FocusSlot)], id: &ContractInstanceId| {
-            chosen.iter().any(|(c, _)| c == id)
-        };
 
-        if chosen.iter().all(|(_, s)| *s != FocusSlot::Uniform) && uniform_slots > 0 {
-            let remaining: Vec<ContractInstanceId> = pool
+        // The uniform slot: a kept uniform member if there is one and it is still a
+        // candidate (lowest id first, so the caller's order is irrelevant), otherwise
+        // the lowest score. Kept WEIGHTED members are deliberately not consulted:
+        // they compete in the weighted draw below and keep the slot exactly when they
+        // still win it.
+        if uniform_slots > 0 {
+            let kept_uniform = kept
                 .iter()
-                .filter(|id| !taken(&chosen, id))
-                .copied()
-                .collect();
-            if let Some(id) = self.select(&remaining).first() {
-                chosen.push((*id, FocusSlot::Uniform));
+                .filter(|(id, slot)| *slot == FocusSlot::Uniform && pool.contains(id))
+                .map(|(id, _)| *id)
+                .min_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+            let uniform = kept_uniform.or_else(|| {
+                let all: Vec<ContractInstanceId> = pool.iter().copied().collect();
+                self.select(&all).first().copied()
+            });
+            if let Some(id) = uniform {
+                chosen.push((id, FocusSlot::Uniform));
             }
         }
-        let have = chosen
-            .iter()
-            .filter(|(_, s)| *s == FocusSlot::Weighted)
-            .count();
-        let need = weighted_slots.saturating_sub(have);
-        if need > 0 {
+        if weighted_slots > 0 {
             let remaining: Vec<ContractInstanceId> = pool
                 .iter()
-                .filter(|id| !taken(&chosen, id))
+                .filter(|id| !chosen.iter().any(|(c, _)| c == *id))
                 .copied()
                 .collect();
             let drawn = self.select_weighted(&remaining, activity);
             chosen.extend(
                 drawn
                     .into_iter()
-                    .take(need)
+                    .take(weighted_slots)
                     .map(|id| (id, FocusSlot::Weighted)),
             );
         }
@@ -814,7 +790,8 @@ mod tests {
     ///
     /// Each rate is asserted against the closed form for this design: the uniform
     /// slot hits with `b/N`; otherwise the weighted slot's first draw over the other
-    /// `N - 1` hits with `b*w / (b*w + (N-1-b))`, `w = 1 + count`. The point of
+    /// `N - 1` hits with `b*w / (b*w + 0.1*(N-1-b))`, `w = 0.1 + count` (a cold
+    /// contract weighs 0.1 in the weighted slot). The point of
     /// printing them is the conclusion the PR has to state: at one or three merges per
     /// period and a handful of busy contracts the hit rate stays low. If a deployed
     /// peer shows `active_candidates` near zero, the cause is traffic, not selection.
@@ -898,8 +875,8 @@ mod tests {
         );
     }
 
-    /// The weighted draw is proportional to weight (T3): a candidate with weight 4
-    /// wins a two-way draw against weight 1 about 4/5 of the time.
+    /// The weighted draw is proportional to weight (T3): activity 4 (weight 4.1)
+    /// wins a two-way draw against activity 1 (weight 1.1) about 4.1/5.2 of the time.
     #[test]
     fn the_weighted_draw_is_proportional_to_weight() {
         let cold = id(1);
@@ -941,5 +918,32 @@ mod tests {
             (focus_weight(ACTIVITY_WEIGHT_CAP) - (0.1 + f64::from(ACTIVITY_WEIGHT_CAP))).abs()
                 < 1e-12
         );
+    }
+
+    /// Two kept uniform members cannot both hold the single uniform slot.
+    #[test]
+    fn only_one_kept_contract_holds_the_uniform_slot() {
+        let pool = candidates(20);
+        let picks = FocusSelector::new([3; 32], 2).select_split(
+            &pool,
+            |_| 0,
+            &[(id(4), FocusSlot::Uniform), (id(5), FocusSlot::Uniform)],
+        );
+        assert_eq!(
+            picks
+                .iter()
+                .filter(|(_, s)| *s == FocusSlot::Uniform)
+                .count(),
+            1
+        );
+        assert_eq!(picks.len(), 2);
+    }
+
+    /// The weight cap is 63 merges: 62 < 63 == 64 (a literal pin, since every other
+    /// test reads the constant and would follow any change to it).
+    #[test]
+    fn the_weight_cap_is_sixty_three_merges() {
+        assert!(focus_weight(62) < focus_weight(63));
+        assert_eq!(focus_weight(63), focus_weight(64));
     }
 }
