@@ -619,10 +619,10 @@ fn a_transition_with_no_slot_is_not_reported_stored() {
     });
     let (admission, retained) =
         sampler.observe_transition_retaining(&state(1, 4), None, Some(&[9]), None, &state(2, 4));
-    assert_ne!(
+    assert_eq!(
         admission,
-        Admission::Stored,
-        "a transition with nowhere to live was reported stored"
+        Admission::NotSelected,
+        "a transition with nowhere to live must be NotSelected"
     );
     assert!(
         retained,
@@ -649,10 +649,10 @@ fn a_transition_shed_by_the_budget_is_not_reported_stored() {
     // shedding drops the transition first (recency holds a single member).
     let (admission, retained) =
         sampler.observe_transition_retaining(&[1, 1], None, Some(&[0; 10]), None, &[2, 2, 2]);
-    assert_ne!(
+    assert_eq!(
         admission,
-        Admission::Stored,
-        "a shed transition was reported stored"
+        Admission::NoBudget,
+        "a transition shed by the budget loop must be NoBudget"
     );
     assert!(retained, "the states survived and were not reported");
 }
