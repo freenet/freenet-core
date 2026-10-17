@@ -427,11 +427,15 @@ impl FocusPeriod {
                 self.fold(member);
             }
         }
-        // A contract already in focus continues its stint (and keeps the slot it was
-        // drawn into); a new one starts a stint.
+        // A contract already in focus continues its stint, taking the slot of the
+        // draw that kept it (the weighted pick becomes the uniform pick when the
+        // peer stops hosting the old one; a stale label would give the period two
+        // Weighted members and the split could then keep only one). Its activity at
+        // selection is not refreshed. A new contract starts a stint.
         for (id, slot, activity) in selected {
             self.current
                 .entry(*id)
+                .and_modify(|member| member.slot = *slot)
                 .or_insert_with(|| PeriodMember::new(*slot, *activity));
         }
         self.totals.candidates = candidates;
@@ -2074,6 +2078,49 @@ mod tests {
         assert_ne!(
             now[1], weighted,
             "a weighted contract that admitted nothing new was kept anyway"
+        );
+    }
+
+    /// A continuing stint takes the slot of the draw that keeps it (#5914 review
+    /// round 2, K4). When the peer stops hosting the uniform pick, the weighted pick
+    /// can become the new uniform pick; leaving it labelled Weighted gave the period
+    /// two Weighted members, so once both accrued, the split could keep only one and
+    /// displaced an accruing contract.
+    #[test]
+    fn a_continuing_stint_takes_its_new_slot() {
+        let hosted: Vec<_> = (0..10u8).map(instance).collect();
+        let mut checked = 0;
+        for salt in 0..=255u8 {
+            let dir = tempfile::TempDir::new().expect("tempdir");
+            let mut runner = runner_with_salt(dir.path(), [salt; 32]);
+            let first = runner.focus(Some(hosted.clone()), &[]).selected;
+            let (uniform, weighted) = (first[0], first[1]);
+            let without_uniform: Vec<_> =
+                hosted.iter().copied().filter(|c| *c != uniform).collect();
+            let second = runner.focus(Some(without_uniform.clone()), &[]).selected;
+            if second[0] != weighted {
+                continue;
+            }
+            checked += 1;
+            assert_eq!(
+                runner.period.current.get(&weighted).map(|m| m.slot),
+                Some(FocusSlot::Uniform),
+                "salt {salt}: a stint that moved to the uniform slot kept its old label"
+            );
+            // Both accrue; neither may be displaced.
+            for contract in &second {
+                runner.note_merge(*contract, true);
+                runner.note_admission(contract, RecordOutcome::Admitted);
+            }
+            let third = runner.focus(Some(without_uniform), &[]).selected;
+            assert!(
+                second.iter().all(|c| third.contains(c)),
+                "salt {salt}: an accruing contract was displaced: {second:?} -> {third:?}"
+            );
+        }
+        assert!(
+            checked > 0,
+            "no salt exercised the case; this test proves nothing"
         );
     }
 
