@@ -22,6 +22,25 @@
 //! Only nodes already running a release that contains this module benefit: the
 //! node that stages and the `freenet update` that installs are both the binary
 //! on disk, so a node on an older release still downloads in `ExecStopPost`.
+//!
+//! Staging also decides whether to exit at all (#5799). When GitHub cannot be
+//! reached for the release, exiting would hand the same download to an updater
+//! that fails it too, and the supervisor would restart the old binary into the
+//! same decision. So the node stays on its current binary
+//! ([`UpdatePreparation::Stay`]) and records a cooldown for the release
+//! (`rollback::record_update_failure_at`: 1 h, 2 h, then 4 h, ±20%), which
+//! every update trigger checks before it asks GitHub anything. Every exit
+//! records first too, including the exit to install a staged release (a
+//! successful install clears it), because systemd may kill the updater before
+//! it records anything. Three failures of one release in a row, or one that
+//! cannot be recorded, exit anyway: a fault here can delay an update but never
+//! prevent one.
+//!
+//! Staging's GitHub traffic has a hard ceiling that does not depend on any of
+//! that: every request round spends a token from the node's persisted poll
+//! bucket (#4073), and a node starts at most
+//! `rollback::ARCHIVE_DOWNLOADS_PER_DAY` staging runs that download the
+//! release archive, per release per day.
 
 use std::fs;
 use std::io::Write as _;
@@ -48,6 +67,14 @@ const RELEASE_DOWNLOAD_PREFIX: &str = "https://github.com/freenet/freenet-core/r
 /// isolation trigger that used to exit at once. A partial download survives in
 /// the cache, so the next attempt (after the restart) resumes it.
 const STAGE_DEADLINE: Duration = Duration::from_secs(2 * 3600);
+/// Consecutive failures of one release after which a failed attempt exits 42
+/// anyway, so the updater tries its own download (#5799).
+const FALLBACK_AFTER_FAILURES: u32 = 3;
+/// What an exit to install a staged release records. The install clears it;
+/// if the updater fails or is killed before it can, the restart holds instead
+/// of exiting for the same release again at once.
+const INSTALL_PENDING: &str =
+    "exited to install the downloaded update; the install did not report success";
 /// Waits between failed attempts. The number of entries is the number of
 /// retries. Only network failures are retried; see [`worth_retrying`].
 const STAGE_RETRY_DELAYS: [Duration; 5] = [
@@ -112,12 +139,26 @@ impl std::fmt::Display for AssetMissing {
 
 impl std::error::Error for AssetMissing {}
 
+/// The node's GitHub poll bucket is empty (#4073). Not retried: the bucket is
+/// what bounds staging's traffic.
+#[derive(Debug)]
+struct PollBucketEmpty;
+
+impl std::fmt::Display for PollBucketEmpty {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the node's GitHub poll budget is spent; waiting for it to refill (#4073)")
+    }
+}
+
+impl std::error::Error for PollBucketEmpty {}
+
 /// Whether another attempt could succeed. Everything is retried except three
 /// failures that come back the same every time: a rate limit (retrying into it
 /// is what escalates it), a release that fails verification, and a cache that
 /// cannot be written.
 fn worth_retrying(e: &anyhow::Error) -> bool {
-    e.downcast_ref::<GithubRateLimitedError>().is_none()
+    e.downcast_ref::<PollBucketEmpty>().is_none()
+        && e.downcast_ref::<GithubRateLimitedError>().is_none()
         && e.downcast_ref::<ReleaseVerificationError>().is_none()
         && e.downcast_ref::<CacheIoError>().is_none()
 }
@@ -302,6 +343,38 @@ fn discard_stale_at(root: &Path, current_version: &str, blocked: impl Fn(&str) -
     }
 }
 
+/// Hold the staged release for a cooldown without counting a failure, for an
+/// updater run that gave up before attempting a download (see
+/// `rollback::hold_update_without_counting_at`). Nothing staged, nothing held.
+pub(super) fn hold_staged_release(reason: &str) {
+    if let Some(root) = cache_root() {
+        let rand_unit = freenet::config::GlobalRng::random_range(0.0_f64..1.0);
+        hold_staged_release_at(&root, reason, std::time::SystemTime::now(), rand_unit);
+    }
+}
+
+fn hold_staged_release_at(root: &Path, reason: &str, now: std::time::SystemTime, rand_unit: f64) {
+    if let (Some(tag), Some(state_dir)) = (staged_tag_at(root), root.parent()) {
+        super::super::rollback::hold_update_without_counting_at(
+            state_dir,
+            super::super::auto_update::version_from_tag(&tag),
+            reason,
+            now,
+            rand_unit,
+        );
+    }
+}
+
+/// The tag of the release staged under `root`, if a complete one is there (its
+/// manifest is written only after the freenet archive verified).
+fn staged_tag_at(root: &Path) -> Option<String> {
+    fs::read_dir(root)
+        .ok()?
+        .flatten()
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .find(|tag| tag_dir(root, tag).is_ok_and(|dir| dir.join(MANIFEST).is_file()))
+}
+
 /// A version this node refuses to install (#4073): pinned known-bad after a
 /// crash-loop rollback, or gated after repeated install failures.
 fn version_blocked(version: &str) -> bool {
@@ -333,56 +406,104 @@ fn free_bytes(_dir: &Path) -> Option<u64> {
 
 // ── Node side: download before exiting ──────────────────────────────────────
 
+/// What the node does once [`stage_latest_release`] returns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use]
+pub(crate) enum UpdatePreparation {
+    /// Exit 42: the updater installs, from the cache when staging succeeded
+    /// and from the network otherwise.
+    Exit,
+    /// Keep running on the current binary (#5799). The release could not be
+    /// fetched, or is cooling down; the triggers check its record before they
+    /// try again.
+    Stay,
+}
+
+impl UpdatePreparation {
+    pub(crate) fn should_exit(self) -> bool {
+        self == Self::Exit
+    }
+}
+
 /// Download and verify the latest release into the cache before the node
-/// exits for an update. Never fails and never panics: whatever happens, the
-/// caller goes on to exit 42 and the post-stop updater installs, from the cache
-/// when this succeeded and from the network otherwise.
-///
-/// Runs while the node is still serving, so a slow download costs nothing but
-/// time. Gives up after [`STAGE_DEADLINE`] so that a problem here can delay an
-/// update but never prevent one.
-pub(crate) async fn stage_latest_release(current_version: &str) {
+/// exits for an update, and decide whether to exit at all. Never fails and
+/// never panics. `target` is the release the trigger detected, when it knows
+/// one: a failed tag lookup is then recorded against it.
+pub(crate) async fn stage_latest_release(
+    current_version: &str,
+    target: Option<&str>,
+) -> UpdatePreparation {
     // Before anything can decide to skip: the release canary (Gate B) arms its
     // staging check on this line, so a later regression in any skip condition
     // shows up as "prepared but never downloaded" instead of as a binary that
     // predates staging.
     tracing::info!("Preparing the update before exiting (#5790)");
-    contain_panic(stage_latest_release_inner(current_version)).await;
+    contain_panic(stage_latest_release_inner(current_version, target), || {
+        record_panic(target)
+    })
+    .await
 }
 
-/// Run `fut`, turning a panic into a log line. The update-check task sends on
-/// `update_tx` only after staging returns; a panic unwinding through it would
-/// drop the sender, and the node would exit 0 without ever running the
-/// updater, on every attempt.
-async fn contain_panic(fut: impl std::future::Future<Output = ()>) {
+/// Run `fut`, turning a panic into a log line and an exit. The update-check
+/// task sends on `update_tx` only after staging returns; a panic unwinding
+/// through it would drop the sender, and the node would exit 0 without ever
+/// running the updater, on every attempt. `on_panic` records the failure.
+async fn contain_panic(
+    fut: impl std::future::Future<Output = UpdatePreparation>,
+    on_panic: impl FnOnce(),
+) -> UpdatePreparation {
     use futures::FutureExt;
-    if std::panic::AssertUnwindSafe(fut)
-        .catch_unwind()
-        .await
-        .is_err()
-    {
-        tracing::error!(
-            "Downloading the update in advance panicked; exiting for the update anyway"
-        );
+    match std::panic::AssertUnwindSafe(fut).catch_unwind().await {
+        Ok(preparation) => preparation,
+        Err(_) => {
+            tracing::error!(
+                "Downloading the update in advance panicked; exiting for the update anyway"
+            );
+            on_panic();
+            UpdatePreparation::Exit
+        }
     }
 }
 
-async fn stage_latest_release_inner(current_version: &str) {
+fn record_panic(target: Option<&str>) {
+    if let Some(root) = cache_root() {
+        record_panic_at(&root, target);
+    }
+}
+
+fn record_panic_at(root: &Path, target: Option<&str>) {
+    if let Some(version) = target {
+        record_failure(root, version, "preparing the update panicked");
+    }
+}
+
+async fn stage_latest_release_inner(
+    current_version: &str,
+    target: Option<&str>,
+) -> UpdatePreparation {
+    let Some(root) = cache_root() else {
+        tracing::warn!("No usable state directory; the update will be downloaded after exit");
+        return UpdatePreparation::Exit;
+    };
+    // The tag the updater will install. Resolved through the same quota-free
+    // redirect the updater uses, so both normally see the same tag; if a newer
+    // release lands in between, the updater finds no cache for it and
+    // downloads as before.
+    let lookup = || super::super::auto_update::fetch_latest_release_tag(false);
     #[cfg(target_os = "macos")]
     {
-        // An app-bundle install updates from the DMG, not from these archives.
+        // An app-bundle install updates from the DMG, not from these archives,
+        // so nothing is staged; the lookup, cooldown and records still apply.
         let in_bundle = std::env::current_exe()
             .ok()
             .and_then(|exe| super::super::service::macos_app_bundle_path(&exe))
             .is_some();
         if in_bundle {
-            return;
+            return decide_without_staging(&root, current_version, target, lookup)
+                .await
+                .preparation();
         }
     }
-    let Some(root) = cache_root() else {
-        tracing::warn!("No usable state directory; the update will be downloaded after exit");
-        return;
-    };
     let verify = |manifest: &[u8], signature: Option<&[u8]>| {
         super::verify_release_manifest_signature(manifest, signature, true)
     };
@@ -392,65 +513,256 @@ async fn stage_latest_release_inner(current_version: &str) {
         current_version,
         // Unknown off unix, where the check is skipped.
         root.parent().and_then(free_bytes),
-        // The tag the updater will install. Resolved through the same
-        // quota-free redirect the updater uses, so both normally see the same
-        // tag; if a newer release lands in between, the updater finds no cache
-        // for it and downloads as before.
-        super::super::auto_update::fetch_latest_release_tag(false),
+        lookup,
+        target,
         version_blocked,
         &verify,
         &STAGE_RETRY_DELAYS,
         STAGE_DEADLINE,
     )
-    .await;
+    .await
+    .preparation()
 }
 
-/// What [`stage_into`] did. Only logged in production; tests assert on it.
+/// What [`stage_into`] did. Tests assert on it; production acts on
+/// [`Staging::preparation`].
 #[derive(Debug, PartialEq)]
 enum Staging {
+    /// Nothing downloaded, for a reason that leaves the download to the
+    /// updater (low disk, cache locked, nothing newer to install).
     Skipped,
     Staged,
+    /// Failed in a way another attempt would repeat: the release fails
+    /// verification, or the cache cannot be written. The updater, which counts
+    /// verification failures toward the #4073 install gate, takes over.
     Failed,
-    TimedOut,
+    /// GitHub could not be reached for the release. The node stays.
+    Deferred,
+    /// The release is cooling down; nothing was attempted. The node stays.
+    CoolingDown,
+    /// The poll bucket or the daily download ceiling refused the attempt.
+    /// The node stays; no failure is counted.
+    Throttled,
+    /// A failure after `FALLBACK_AFTER_FAILURES` in a row, or one that could
+    /// not be recorded: exit so the updater tries its own download.
+    FallingBack,
 }
 
-/// Decide whether to stage and do it. Everything environmental (cache root,
-/// download host, free space, tag lookup, the #4073 block list, signature key,
-/// retry schedule) is a parameter, so tests can drive every branch without the
-/// real state directory or GitHub.
-#[allow(clippy::too_many_arguments)]
-async fn stage_into(
-    root: &Path,
-    download_prefix: &str,
-    current_version: &str,
-    free: Option<u64>,
-    resolve_tag: impl std::future::Future<Output = Result<String>>,
-    blocked: impl Fn(&str) -> bool,
-    verify: ManifestVerifier<'_>,
-    delays: &[Duration],
-    deadline: Duration,
-) -> Staging {
-    if let Some(free) = free {
-        if free < MIN_FREE_BYTES {
-            tracing::warn!(
-                free_mib = free / (1024 * 1024),
-                "Too little free space to download the update in advance; it will be downloaded after exit"
-            );
-            return Staging::Skipped;
+impl Staging {
+    fn preparation(&self) -> UpdatePreparation {
+        match self {
+            Staging::Deferred | Staging::CoolingDown | Staging::Throttled => {
+                UpdatePreparation::Stay
+            }
+            Staging::Skipped | Staging::Staged | Staging::Failed | Staging::FallingBack => {
+                UpdatePreparation::Exit
+            }
         }
     }
-    let tag = match resolve_tag.await {
+}
+
+/// Whether a staging failure would come back the same on the next attempt.
+fn is_permanent(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<ReleaseVerificationError>().is_some()
+        || e.downcast_ref::<CacheIoError>().is_some()
+}
+
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Record a failure of `version` in the state directory beside `root`. `None`
+/// when it could not be recorded.
+fn record_failure(root: &Path, version: &str, error: &str) -> Option<u32> {
+    let rand_unit = freenet::config::GlobalRng::random_range(0.0_f64..1.0);
+    super::super::rollback::record_update_failure_at(
+        root.parent()?,
+        version,
+        error,
+        std::time::SystemTime::now(),
+        rand_unit,
+    )
+}
+
+/// Record a failure before an exit that leaves the download (or the install)
+/// to the updater, which systemd may kill before it records anything.
+fn exit_after_recording(root: &Path, version: &str, reason: &str, staging: Staging) -> Staging {
+    record_failure(root, version, reason);
+    staging
+}
+
+/// Record a failure to fetch `version` and decide what the node does next:
+/// stay, unless this is the third in a row or it could not be recorded.
+fn after_transient_failure(root: &Path, version: &str, error: &str) -> Staging {
+    match record_failure(root, version, error) {
+        Some(failures) if failures < FALLBACK_AFTER_FAILURES => {
+            tracing::warn!(
+                version,
+                failures,
+                "Staying on the current version and trying the update again after a cooldown (#5799)"
+            );
+            Staging::Deferred
+        }
+        failures => {
+            tracing::warn!(
+                version,
+                ?failures,
+                "Could not fetch the update {FALLBACK_AFTER_FAILURES} times in a row, or could not \
+                 record the failure; exiting so the updater tries its own download (#5799)"
+            );
+            Staging::FallingBack
+        }
+    }
+}
+
+/// Hold `version` without counting a failure (the bucket or the ceiling said
+/// no, so nothing was attempted) and stay.
+fn throttled(root: &Path, version: Option<&str>, why: &str) -> Staging {
+    tracing::info!(why, "Not downloading the update in advance now (#5799)");
+    if let (Some(version), Some(state_dir)) = (version, root.parent()) {
+        let rand_unit = freenet::config::GlobalRng::random_range(0.0_f64..1.0);
+        super::super::rollback::hold_update_without_counting_at(
+            state_dir,
+            version,
+            why,
+            std::time::SystemTime::now(),
+            rand_unit,
+        );
+    }
+    Staging::Throttled
+}
+
+/// Spend a token from the node's GitHub poll bucket beside `root`. Without a
+/// state directory there is nothing to spend from, and staging could not
+/// record anything either; allowed, as before #5799.
+fn spend_poll_token(root: &Path) -> bool {
+    root.parent()
+        .is_none_or(|dir| super::super::auto_update::try_consume_node_poll_at(dir, now_unix()))
+}
+
+/// Everything staging decides before it downloads: the poll budget, the tag
+/// lookup, the #4073 block list and the cooldown. `Ok` carries the tag.
+async fn decide_before_download<F, Fut>(
+    root: &Path,
+    current_version: &str,
+    lookup: F,
+    target: Option<&str>,
+    blocked: impl Fn(&str) -> bool,
+) -> std::result::Result<String, Staging>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<String>>,
+{
+    if !spend_poll_token(root) {
+        return Err(throttled(
+            root,
+            target,
+            "the node's GitHub poll budget is spent (#4073)",
+        ));
+    }
+    // Resolved first: the updater's first step is the same lookup, so when it
+    // fails here an exit would only restart the node on the same binary.
+    let tag = match lookup().await {
         Ok(tag) => tag,
         Err(e) => {
-            tracing::warn!(error = %e, "Could not resolve the release to download in advance; the update will be downloaded after exit");
-            return Staging::Skipped;
+            tracing::warn!(error = %e, "Could not resolve the release to download in advance; staying on the current version (#5799)");
+            return Err(match target {
+                Some(version) => after_transient_failure(root, version, &format!("{e:#}")),
+                None => Staging::Deferred,
+            });
         }
     };
     // A tag that passes this is a semver version, so `tag_dir` will accept it;
     // `stage_release_at` checks again regardless.
     if !should_stage(&tag, current_version, blocked) {
         tracing::info!(tag = %tag, "No newer installable release to download in advance");
-        return Staging::Skipped;
+        return Err(Staging::Skipped);
+    }
+    let version = super::super::auto_update::version_from_tag(&tag);
+    let cooling = root.parent().and_then(|dir| {
+        super::super::rollback::update_cooldown_remaining_at(
+            dir,
+            version,
+            std::time::SystemTime::now(),
+        )
+    });
+    if let Some(left) = cooling {
+        tracing::info!(tag = %tag, retry_in_min = left.as_secs().div_ceil(60), "Update is cooling down after failed attempts; staying on the current version (#5799)");
+        return Err(Staging::CoolingDown);
+    }
+    Ok(tag)
+}
+
+/// The decision for an install that stages nothing (a macOS app bundle, which
+/// updates from the DMG): the same checks as [`stage_into`], then an exit for
+/// the updater, recorded first. Platform-independent so it is tested
+/// everywhere.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+async fn decide_without_staging<F, Fut>(
+    root: &Path,
+    current_version: &str,
+    target: Option<&str>,
+    lookup: F,
+) -> Staging
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<String>>,
+{
+    match decide_before_download(root, current_version, lookup, target, version_blocked).await {
+        Ok(tag) => exit_after_recording(
+            root,
+            super::super::auto_update::version_from_tag(&tag),
+            INSTALL_PENDING,
+            Staging::Skipped,
+        ),
+        Err(staging) => staging,
+    }
+}
+
+/// Whether the freenet archive of `tag` is in the cache with its manifest,
+/// which is written only once that archive has verified.
+fn freenet_archive_staged(root: &Path, tag: &str) -> bool {
+    tag_dir(root, tag)
+        .is_ok_and(|dir| dir.join(MANIFEST).is_file() && dir.join(freenet_asset_name()).is_file())
+}
+
+/// Decide whether to stage and do it. Everything environmental (cache root
+/// and the state directory beside it, download host, free space, tag lookup,
+/// the #4073 block list, signature key, retry schedule) is a parameter, so
+/// tests can drive every branch without the real state directory or GitHub.
+#[allow(clippy::too_many_arguments)]
+async fn stage_into<F, Fut>(
+    root: &Path,
+    download_prefix: &str,
+    current_version: &str,
+    free: Option<u64>,
+    lookup: F,
+    target: Option<&str>,
+    blocked: impl Fn(&str) -> bool,
+    verify: ManifestVerifier<'_>,
+    delays: &[Duration],
+    deadline: Duration,
+) -> Staging
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<String>>,
+{
+    let tag = match decide_before_download(root, current_version, lookup, target, blocked).await {
+        Ok(tag) => tag,
+        Err(staging) => return staging,
+    };
+    let version = super::super::auto_update::version_from_tag(&tag);
+    if let Some(free) = free {
+        if free < MIN_FREE_BYTES {
+            tracing::warn!(
+                free_mib = free / (1024 * 1024),
+                "Too little free space to download the update in advance; it will be downloaded after exit"
+            );
+            return exit_after_recording(root, version, "too little free space", Staging::Skipped);
+        }
     }
     let _lock = match try_lock(root) {
         Ok(Some(lock)) => lock,
@@ -458,53 +770,99 @@ async fn stage_into(
             tracing::info!(
                 "Another process is downloading the update in advance; leaving it to that"
             );
-            return Staging::Skipped;
+            return exit_after_recording(root, version, "cache busy", Staging::Skipped);
         }
         Err(e) => {
             tracing::warn!(error = %e, "Cannot lock the update cache; the update will be downloaded after exit");
-            return Staging::Skipped;
+            return exit_after_recording(root, version, "cache lock failed", Staging::Skipped);
         }
     };
+    // The hard ceiling (#5799): at most a few runs that download the archive,
+    // per release per day, whatever the cooldown decided.
+    let ceiling_allows = freenet_archive_staged(root, &tag)
+        || root.parent().is_none_or(|dir| {
+            super::super::rollback::take_archive_download_at(
+                dir,
+                version,
+                std::time::SystemTime::now(),
+            )
+        });
+    if !ceiling_allows {
+        return throttled(
+            root,
+            Some(version),
+            "the daily ceiling on staged downloads is reached",
+        );
+    }
 
     tracing::info!(tag = %tag, "Downloading the update before exiting, so the restart only has to install it");
     let started = tokio::time::Instant::now();
     let outcome = stage_within(
-        || stage_release_at(root, download_prefix, &tag, verify),
+        || async {
+            // Every request round spends a token, retries included.
+            if !spend_poll_token(root) {
+                return Err(PollBucketEmpty.into());
+            }
+            stage_release_at(root, download_prefix, &tag, verify).await
+        },
         delays,
         deadline,
     )
     .await;
-    match outcome {
+    let error = match outcome {
         StageOutcome::Staged => {
             tracing::info!(
                 "Update downloaded and verified; exiting to install it ({tag}, {}s)",
                 started.elapsed().as_secs()
             );
-            Staging::Staged
+            return exit_after_recording(root, version, INSTALL_PENDING, Staging::Staged);
         }
-        StageOutcome::Failed(e) => {
-            // A rate limit on the asset downloads is NOT recorded as a
-            // cooldown: the updater that runs next would honour it and refuse
-            // to install at all, so the exit would buy nothing. (The tag
-            // lookup above does record one when the redirect itself is
-            // limited, as every caller of it does; the updater's own probe of
-            // the same endpoint would hit that limit anyway.)
+        StageOutcome::Failed(e) if is_permanent(&e) => {
             tracing::warn!(
                 tag = %tag,
                 error = %format!("{e:#}"),
                 "Could not download the update in advance; exiting anyway, the updater will download what is missing"
             );
-            Staging::Failed
+            return exit_after_recording(root, version, &format!("{e:#}"), Staging::Failed);
+        }
+        StageOutcome::Failed(e) => {
+            // A rate limit on the asset downloads is NOT recorded as a GitHub
+            // cooldown: the updater would honour that and refuse to install at
+            // all. It is a failure of THIS release instead, which only the
+            // node's own triggers consult.
+            tracing::warn!(
+                tag = %tag,
+                error = %format!("{e:#}"),
+                "Could not download the update in advance; GitHub could not be reached for it (#5799)"
+            );
+            e
         }
         StageOutcome::TimedOut => {
             tracing::warn!(
                 tag = %tag,
                 deadline_secs = deadline.as_secs(),
-                "Downloading the update in advance timed out; exiting anyway, a later attempt resumes the partial download"
+                "Downloading the update in advance timed out; a later attempt resumes the partial download (#5799)"
             );
-            Staging::TimedOut
+            anyhow::anyhow!(
+                "the download did not finish within {} minutes",
+                deadline.as_secs() / 60
+            )
         }
+    };
+    // #5791's rule: an fdev failure never costs the freenet archive. When
+    // freenet is staged, exit to install it; the updater downloads fdev.
+    if freenet_archive_staged(root, &tag) {
+        tracing::info!(tag = %tag, "The freenet archive is downloaded and verified; exiting to install it, fdev will be downloaded by the updater");
+        return exit_after_recording(root, version, INSTALL_PENDING, Staging::Staged);
     }
+    if error.downcast_ref::<PollBucketEmpty>().is_some() {
+        return throttled(
+            root,
+            Some(version),
+            "the node's GitHub poll budget is spent (#4073)",
+        );
+    }
+    after_transient_failure(root, version, &format!("{error:#}"))
 }
 
 /// Whether `tag` is a release worth downloading: newer than this binary, and
@@ -1517,13 +1875,50 @@ mod tests {
             &server.url_str("/"),
             "9.9.8",
             free,
-            async move { tag },
+            move || async move { tag },
+            None,
             blocked,
             &unsigned,
             &[],
             STAGE_DEADLINE,
         )
         .await
+    }
+
+    /// Drive `stage_into` for `TAG` against `prefix`, no retries.
+    async fn stage_once(root: &Path, prefix: &str, deadline: Duration) -> Staging {
+        stage_into(
+            root,
+            prefix,
+            "9.9.8",
+            None,
+            || async { Ok(TAG.to_string()) },
+            None,
+            |_: &str| false,
+            &unsigned,
+            &[],
+            deadline,
+        )
+        .await
+    }
+
+    /// The cooldown record beside `root`, if any.
+    fn cooldown(root: &Path) -> Option<super::super::super::rollback::UpdateCooldownState> {
+        super::super::super::rollback::read_update_cooldown_at(root.parent().unwrap())
+    }
+
+    /// A server whose release archive always answers 500, as a network where
+    /// GitHub's asset downloads fail does. Counts the archive requests.
+    fn failing_release() -> Server {
+        let freenet = freenet_asset_name();
+        let manifest = manifest_for(&[(&freenet, b"archive")]);
+        let server = serve_release(manifest.as_bytes(), None, &[]);
+        server.expect(
+            Expectation::matching(request::method_path("GET", asset_path(&freenet)))
+                .times(..)
+                .respond_with(status_code(500)),
+        );
+        server
     }
 
     #[tokio::test]
@@ -1542,8 +1937,11 @@ mod tests {
         )
         .await;
         assert_eq!(outcome, Staging::Staged);
+        assert!(outcome.preparation().should_exit());
         let release = release_listing(&[MANIFEST, &freenet]);
         assert!(load_at(root.as_path(), &release, &unsigned).await.is_some());
+        // Recorded before the exit; the install clears it.
+        assert_eq!(cooldown(&root).unwrap().last_error, INSTALL_PENDING);
     }
 
     #[tokio::test]
@@ -1558,28 +1956,26 @@ mod tests {
             Option<u64>,
             &'a dyn Fn(&str) -> bool,
         );
-        let cases: [Case<'_>; 4] = [
-            ("low disk", Ok(TAG.into()), Some(MIN_FREE_BYTES - 1), &none),
-            (
-                "tag lookup failed",
-                Err(anyhow::anyhow!("offline")),
-                None,
-                &none,
-            ),
+        let cases: [Case<'_>; 3] = [
             ("not newer", Ok("v9.9.8".into()), None, &none),
             ("blocked", Ok(TAG.into()), None, &|v| v == "9.9.9"),
+            ("low disk", Ok(TAG.into()), Some(MIN_FREE_BYTES - 1), &none),
         ];
         for (case, tag, free, blocked) in cases {
             let outcome = stage_into_with(root.as_path(), &server, tag, free, blocked).await;
             assert_eq!(outcome, Staging::Skipped, "{case}");
+            assert!(outcome.preparation().should_exit(), "{case}");
         }
+        // Only the low-disk exit had a release to install, and it records
+        // first, in case the updater is killed before it can (#5799).
+        assert_eq!(cooldown(&root).map(|r| r.failures), Some(1));
     }
 
     /// `stage_latest_release` is the only entry point the node calls; the
     /// marker and the panic containment must be in it, not just exist.
     #[test]
     fn entry_point_logs_the_canary_marker_and_contains_panics() {
-        let src = include_str!("staged.rs");
+        let src = include_str!("staged.rs").replace("\r\n", "\n");
         let production = src
             .split_once(concat!("#[cfg(test)]\n", "mod tests {"))
             .expect("test module not found")
@@ -1588,6 +1984,7 @@ mod tests {
             .find("pub(crate) async fn stage_latest_release(")
             .expect("entry point not found");
         let body = &production[start..];
+        let body = &body[body.find(" {\n").expect("body")..];
         let body = &body[..body.find("\n}\n").expect("end of entry point")];
         let statements: Vec<&str> = body
             .lines()
@@ -1598,7 +1995,10 @@ mod tests {
             statements[1..],
             [
                 "tracing::info!(\"Preparing the update before exiting (#5790)\");",
-                "contain_panic(stage_latest_release_inner(current_version)).await;",
+                "contain_panic(stage_latest_release_inner(current_version, target), || {",
+                "record_panic(target)",
+                "})",
+                ".await",
             ],
             "stage_latest_release must log the marker, then run staging inside contain_panic"
         );
@@ -1758,12 +2158,12 @@ mod tests {
     /// it: binding it to `_` would release it at once.
     #[test]
     fn stage_into_holds_the_lock_while_downloading() {
-        let src = include_str!("staged.rs");
+        let src = include_str!("staged.rs").replace("\r\n", "\n");
         let production = src
             .split_once(concat!("#[cfg(test)]\n", "mod tests {"))
             .unwrap()
             .0;
-        let start = production.find("async fn stage_into(").unwrap();
+        let start = production.find("async fn stage_into<").unwrap();
         let body = &production[start..];
         let body = &body[..body.find("\n}\n").unwrap()];
         assert!(
@@ -1779,50 +2179,279 @@ mod tests {
 
     // Real time: these talk to local sockets, which a paused clock would
     // time out before they answer.
+    /// #5799 regression. A download that fails because GitHub cannot be
+    /// reached used to end in "exiting anyway": exit 42, the updater fails the
+    /// same download, the supervisor restarts the old binary, which detects the
+    /// same release and exits again, for as long as the network stays bad. Now
+    /// the node stays, and the release cools down so nothing tries it again
+    /// meanwhile; the third failure in a row exits for the updater.
     #[tokio::test]
-    async fn stage_into_reports_failure_and_timeout() {
-        let freenet = freenet_asset_name();
-        let manifest = manifest_for(&[(&freenet, b"archive")]);
-        let server = serve_release(manifest.as_bytes(), None, &[]);
-        server.expect(
-            Expectation::matching(request::method_path("GET", asset_path(&freenet)))
-                .respond_with(status_code(500)),
-        );
+    async fn a_network_failure_stays_cools_down_and_falls_back_on_the_third() {
         let (_tmp, root) = test_root();
-        let none = |_: &str| false;
-        let outcome = stage_into(
-            &root,
-            &server.url_str("/"),
-            "9.9.8",
-            None,
-            async { Ok(TAG.to_string()) },
-            none,
-            &unsigned,
-            &[],
-            STAGE_DEADLINE,
-        )
-        .await;
-        assert_eq!(outcome, Staging::Failed);
+        let server = failing_release();
+        let outcome = stage_once(&root, &server.url_str("/"), STAGE_DEADLINE).await;
+        assert_eq!(outcome, Staging::Deferred);
+        assert!(!outcome.preparation().should_exit());
+        let record = cooldown(&root).expect("recorded");
+        assert_eq!((record.version.as_str(), record.failures), ("9.9.9", 1));
+        assert!(record.last_error.contains("500"), "{}", record.last_error);
 
+        // The next attempt holds without a single request.
+        let quiet = Server::run();
+        let outcome = stage_once(&root, &quiet.url_str("/"), STAGE_DEADLINE).await;
+        assert_eq!(outcome, Staging::CoolingDown);
+        assert!(!outcome.preparation().should_exit());
+
+        // Expire it and fail again: still staying at two.
+        let state_dir = root.parent().unwrap();
+        super::super::super::rollback::clear_update_cooldown_at(state_dir);
+        let long_ago = std::time::SystemTime::now() - Duration::from_secs(7 * 24 * 3600);
+        for _ in 0..FALLBACK_AFTER_FAILURES - 2 {
+            super::super::super::rollback::record_update_failure_at(
+                state_dir, "9.9.9", "earlier", long_ago, 0.5,
+            );
+        }
+        let outcome = stage_once(&root, &server.url_str("/"), STAGE_DEADLINE).await;
+        assert_eq!(outcome, Staging::Deferred);
+        // And the third exits so the updater tries its own download.
+        super::super::super::rollback::record_update_failure_at(
+            state_dir, "9.9.9", "earlier", long_ago, 0.5,
+        );
+        let outcome = stage_once(&root, &server.url_str("/"), STAGE_DEADLINE).await;
+        assert_eq!(outcome, Staging::FallingBack);
+        assert!(outcome.preparation().should_exit());
+        assert_eq!(FALLBACK_AFTER_FAILURES, 3);
+    }
+
+    #[tokio::test]
+    async fn a_timeout_stays_and_records() {
         let never = Server::run();
         never.expect(
             Expectation::matching(any())
                 .times(..)
                 .respond_with(delay_and_then(Duration::from_secs(3600), status_code(200))),
         );
-        let outcome = stage_into(
-            &root,
-            &never.url_str("/"),
-            "9.9.8",
+        let (_tmp, root) = test_root();
+        let outcome = stage_once(&root, &never.url_str("/"), Duration::from_millis(1)).await;
+        assert_eq!(outcome, Staging::Deferred);
+        assert_eq!(cooldown(&root).map(|r| r.failures), Some(1));
+    }
+
+    /// A failure that cannot be recorded would never reach the fallback, so
+    /// the node fails open and exits.
+    #[tokio::test]
+    async fn an_unrecordable_failure_exits() {
+        let (tmp, root) = test_root();
+        fs::create_dir_all(tmp.path().join("update_cooldown.json")).unwrap();
+        let outcome = stage_once(&root, &failing_release().url_str("/"), STAGE_DEADLINE).await;
+        assert_eq!(outcome, Staging::FallingBack);
+    }
+
+    /// A release that fails verification, or a cache that cannot be written,
+    /// is not a network problem: exit for the updater (which counts
+    /// verification failures toward the #4073 gate), recording first.
+    #[tokio::test]
+    async fn permanent_failures_exit_and_record() {
+        let freenet = freenet_asset_name();
+        let manifest = manifest_for(&[(&freenet, b"good bytes")]);
+        let server = serve_release(manifest.as_bytes(), None, &[(&freenet, b"tampered!!")]);
+        let (_tmp, root) = test_root();
+        let outcome = stage_once(&root, &server.url_str("/"), STAGE_DEADLINE).await;
+        assert_eq!(outcome, Staging::Failed);
+        assert!(outcome.preparation().should_exit());
+        assert_eq!(cooldown(&root).map(|r| r.failures), Some(1));
+
+        let tmp = tempfile::tempdir().unwrap();
+        let file_root = tmp.path().join(CACHE_DIR);
+        fs::write(&file_root, b"not a directory").unwrap();
+        let outcome = stage_once(&file_root, &failing_release().url_str("/"), STAGE_DEADLINE).await;
+        assert_eq!(outcome, Staging::Failed);
+        assert_eq!(cooldown(&file_root).map(|r| r.failures), Some(1));
+    }
+
+    /// A restart after a staged exit whose install never reported back holds
+    /// instead of exiting again within seconds.
+    #[tokio::test]
+    async fn a_restart_after_a_staged_exit_holds() {
+        let freenet = freenet_asset_name();
+        let manifest = manifest_for(&[(&freenet, b"archive")]);
+        let server = serve_release(manifest.as_bytes(), None, &[(&freenet, b"archive")]);
+        let (_tmp, root) = test_root();
+        assert_eq!(
+            stage_once(&root, &server.url_str("/"), STAGE_DEADLINE).await,
+            Staging::Staged
+        );
+        let quiet = Server::run();
+        assert_eq!(
+            stage_once(&root, &quiet.url_str("/"), STAGE_DEADLINE).await,
+            Staging::CoolingDown
+        );
+    }
+
+    /// #5791's rule: an fdev failure never costs the freenet archive.
+    #[tokio::test]
+    async fn an_fdev_only_failure_still_installs_the_staged_freenet() {
+        let freenet = freenet_asset_name();
+        let fdev = fdev_asset_name();
+        let manifest = manifest_for(&[(&freenet, b"archive"), (&fdev, b"fdev")]);
+        let server = serve_release(manifest.as_bytes(), None, &[(&freenet, b"archive")]);
+        server.expect(
+            Expectation::matching(request::method_path("GET", asset_path(&fdev)))
+                .times(..)
+                .respond_with(status_code(500)),
+        );
+        let (_tmp, root) = test_root();
+        let outcome = stage_once(&root, &server.url_str("/"), STAGE_DEADLINE).await;
+        assert_eq!(outcome, Staging::Staged);
+        assert_eq!(cooldown(&root).unwrap().last_error, INSTALL_PENDING);
+    }
+
+    /// A failed tag lookup stays: the updater's first step is the same lookup.
+    /// It counts only against a release the trigger knew.
+    #[tokio::test]
+    async fn a_failed_tag_lookup_stays_and_counts_only_a_known_release() {
+        let server = Server::run();
+        let (_tmp, root) = test_root();
+        let run = |target| {
+            let root = root.clone();
+            let prefix = server.url_str("/");
+            async move {
+                stage_into(
+                    &root,
+                    &prefix,
+                    "9.9.8",
+                    None,
+                    || async { Err::<String, _>(anyhow::anyhow!("offline")) },
+                    target,
+                    |_: &str| false,
+                    &unsigned,
+                    &[],
+                    STAGE_DEADLINE,
+                )
+                .await
+            }
+        };
+        assert_eq!(run(None).await, Staging::Deferred);
+        assert!(cooldown(&root).is_none());
+        assert_eq!(run(Some("9.9.9")).await, Staging::Deferred);
+        assert_eq!(cooldown(&root).map(|r| r.failures), Some(1));
+    }
+
+    /// The hard ceiling (#5799): even if the cooldown never held anything,
+    /// a node starts at most `ARCHIVE_DOWNLOADS_PER_DAY` archive-downloading
+    /// runs per release per day, and every request round spends a token from
+    /// the poll bucket, so neither bound depends on the cooldown being right.
+    #[tokio::test]
+    async fn the_download_ceiling_holds_with_no_cooldown_at_all() {
+        use super::super::super::rollback::ARCHIVE_DOWNLOADS_PER_DAY;
+        let freenet = freenet_asset_name();
+        let manifest = manifest_for(&[(&freenet, b"archive")]);
+        let server = serve_release(manifest.as_bytes(), None, &[]);
+        server.expect(
+            Expectation::matching(request::method_path("GET", asset_path(&freenet)))
+                .times(ARCHIVE_DOWNLOADS_PER_DAY as usize)
+                .respond_with(status_code(500)),
+        );
+        let (_tmp, root) = test_root();
+        let state_dir = root.parent().unwrap().to_path_buf();
+        for _ in 0..20 {
+            // As if the cooldown were broken: forget it, and refill the poll
+            // bucket, before every run.
+            super::super::super::rollback::clear_update_cooldown_at(&state_dir);
+            fs::remove_file(state_dir.join("github_poll_bucket_node")).ok();
+            let outcome = stage_once(&root, &server.url_str("/"), STAGE_DEADLINE).await;
+            assert!(!outcome.preparation().should_exit() || outcome == Staging::FallingBack);
+        }
+        // `times(ARCHIVE_DOWNLOADS_PER_DAY)` fails the test on one more.
+    }
+
+    /// The poll bucket alone bounds staging's requests too: with the ceiling
+    /// and the cooldown both forgotten before every run, the bucket stops the
+    /// runs after its capacity.
+    #[tokio::test]
+    async fn the_poll_bucket_bounds_staging_requests() {
+        let freenet = freenet_asset_name();
+        let manifest = manifest_for(&[(&freenet, b"archive")]);
+        let server = serve_release(manifest.as_bytes(), None, &[]);
+        let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = hits.clone();
+        server.expect(
+            Expectation::matching(request::method_path("GET", asset_path(&freenet)))
+                .times(..)
+                .respond_with(move || {
+                    counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    status_code(500)
+                }),
+        );
+        let (_tmp, root) = test_root();
+        let state_dir = root.parent().unwrap().to_path_buf();
+        let mut throttled = 0;
+        for _ in 0..20 {
+            super::super::super::rollback::clear_update_cooldown_at(&state_dir);
+            fs::remove_file(state_dir.join("staged_downloads.json")).ok();
+            if stage_once(&root, &server.url_str("/"), STAGE_DEADLINE).await == Staging::Throttled {
+                throttled += 1;
+            }
+        }
+        // Each run spends two tokens (the lookup, one attempt); the bucket
+        // holds eight, so at most four runs reach GitHub.
+        let reached = hits.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(reached <= 4, "{reached} runs reached GitHub");
+        assert!(throttled >= 16, "{throttled}");
+    }
+
+    /// The install that stages nothing (a macOS app bundle) records before its
+    /// exit and honours the cooldown. Platform-independent, so tested here.
+    #[tokio::test]
+    async fn an_install_that_stages_nothing_records_and_honours_the_cooldown() {
+        let (_tmp, root) = test_root();
+        let ok = || async { Ok(TAG.to_string()) };
+        assert_eq!(
+            decide_without_staging(&root, "9.9.8", None, ok).await,
+            Staging::Skipped
+        );
+        assert_eq!(cooldown(&root).unwrap().last_error, INSTALL_PENDING);
+        assert_eq!(
+            decide_without_staging(&root, "9.9.8", None, ok).await,
+            Staging::CoolingDown
+        );
+    }
+
+    #[test]
+    fn an_updater_skip_holds_the_staged_release_without_counting() {
+        let (_tmp, root) = test_root();
+        let now = std::time::SystemTime::now();
+        hold_staged_release_at(&root, "skipped", now, 0.5);
+        assert!(cooldown(&root).is_none(), "nothing staged, nothing held");
+        write_staged(&root, &[(MANIFEST, b"m")]);
+        for _ in 0..5 {
+            hold_staged_release_at(&root, "skipped", now, 0.5);
+        }
+        let record = cooldown(&root).unwrap();
+        assert_eq!((record.version.as_str(), record.failures), ("9.9.9", 1));
+    }
+
+    #[test]
+    fn the_staged_tag_is_the_one_with_a_manifest() {
+        let (_tmp, root) = test_root();
+        assert_eq!(staged_tag_at(&root), None);
+        fs::create_dir_all(root.join("v9.9.8")).unwrap();
+        assert_eq!(
+            staged_tag_at(&root),
             None,
-            async { Ok(TAG.to_string()) },
-            none,
-            &unsigned,
-            &[],
-            Duration::from_millis(1),
-        )
-        .await;
-        assert_eq!(outcome, Staging::TimedOut);
+            "a partial download is not staged"
+        );
+        write_staged(&root, &[(MANIFEST, b"m")]);
+        assert_eq!(staged_tag_at(&root).as_deref(), Some(TAG));
+    }
+
+    #[test]
+    fn a_contained_panic_records_against_a_known_release() {
+        let (_tmp, root) = test_root();
+        record_panic_at(&root, None);
+        assert!(cooldown(&root).is_none());
+        record_panic_at(&root, Some("9.9.9"));
+        assert!(cooldown(&root).unwrap().last_error.contains("panicked"));
     }
 
     #[tokio::test]
@@ -1892,7 +2521,16 @@ mod tests {
 
     #[tokio::test]
     async fn a_panic_while_staging_still_lets_the_update_proceed() {
-        contain_panic(async { panic!("staging bug") }).await;
+        let mut recorded = false;
+        assert_eq!(
+            contain_panic(async { panic!("staging bug") }, || recorded = true).await,
+            UpdatePreparation::Exit
+        );
+        assert!(recorded);
+        assert_eq!(
+            contain_panic(async { UpdatePreparation::Stay }, || panic!("no hook")).await,
+            UpdatePreparation::Stay
+        );
     }
 
     #[tokio::test(start_paused = true)]

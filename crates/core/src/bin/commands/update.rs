@@ -215,6 +215,35 @@ pub fn update_counter_action(outcome: UpdateSubprocessOutcome) -> UpdateCounterA
     }
 }
 
+/// Record that installing `version` failed for a reason other than a bad
+/// release (a verification failure counts toward the #4073 gate instead), so
+/// the node's triggers hold it for a cooldown instead of exiting for it again
+/// at once (#5799). Says so on stderr even under `--quiet`: the line a
+/// supervisor's log (the journal, the Windows wrapper's log, the macOS
+/// wrapper's log) needs to show why an update did not happen.
+fn note_install_failure(version: &str, error: &anyhow::Error) {
+    let streak = match super::rollback::record_update_failure(version, &format!("{error:#}")) {
+        Some(n) => format!(" (failure {n} in a row)"),
+        None => String::new(),
+    };
+    #[allow(clippy::let_underscore_must_use)]
+    let _ = writeln!(
+        io::stderr(),
+        "Freenet update to {version} failed{streak}: {error:#}. Auto-update holds this release \
+         for a cooldown before trying it again (#5799)."
+    );
+}
+
+/// Hold the release the node staged before it exited, without counting a
+/// failure, when this run gives up before attempting a download (a failed tag
+/// probe, a rate-limit or empty-bucket exit). Without the hold the restart
+/// would find no cooldown and the staged cache still valid, and exit again at
+/// once; counting it would let a crash-looping node, whose every exit runs
+/// this updater, reach the fallback without a single download (#5799).
+fn hold_staged_release(error: &anyhow::Error) {
+    staged::hold_staged_release(&format!("{error:#}"));
+}
+
 /// Classify the exit status of a `freenet update` subprocess invocation.
 /// Pure over just the `io::Result<ExitStatus>` so it can be unit-tested
 /// with synthetic inputs.
@@ -401,7 +430,21 @@ impl UpdateCommand {
         //     on EVERY non-clean node exit (so a crash-looping node used to burn
         //     REST quota once per crash), and
         //   * `--check`, which never installs by definition.
-        let latest_tag = probe_latest_tag(self.force, self.quiet).await?;
+        // `--check` installs nothing, so it never touches the cooldown.
+        let hold_on_skip = !self.check;
+        let latest_tag = match probe_latest_tag(self.force, self.quiet, hold_on_skip).await {
+            Ok(tag) => tag,
+            Err(e) => {
+                // The tag could not be learned. If the node staged a release
+                // before exiting, that is the one this run was for: hold it,
+                // without counting a failure, since nothing was attempted
+                // (#5799).
+                if hold_on_skip {
+                    hold_staged_release(&e);
+                }
+                return Err(e);
+            }
+        };
         // `latest_tag` is the tag verbatim (`v0.2.118`); `latest_version` is its
         // semver part. Both are kept: the version is what we compare and what
         // the rollback/pin bookkeeping keys on, while the RAW tag is what
@@ -436,6 +479,8 @@ impl UpdateCommand {
             // target install to gate anymore — clear the per-version
             // install-failure counter too (#4073).
             super::rollback::clear_install_failures();
+            // Nor is any release cooling down after failed attempts (#5799).
+            super::rollback::clear_update_cooldown();
             // Nothing to install, so nothing staged in advance (#5790) is useful.
             staged::discard();
             // Exit with a distinct code so the service wrapper knows no update
@@ -492,7 +537,13 @@ impl UpdateCommand {
         // gnu→musl fallback search and the macOS DMG lookup). Requested by exact
         // tag rather than `/releases/latest` so we install the release we just
         // decided about, even if a newer one is published in between.
-        let latest = fetch_release_assets(&latest_tag, self.quiet).await?;
+        let latest = match fetch_release_assets(&latest_tag, self.quiet).await {
+            Ok(latest) => latest,
+            Err(e) => {
+                note_install_failure(latest_version, &e);
+                return Err(e);
+            }
+        };
         // #4073 per-target-version install-failure gate. Count a DETERMINISTIC
         // install failure of this version — a checksum mismatch or invalid
         // release signature (`ReleaseVerificationError`) — toward the gate. After
@@ -516,6 +567,7 @@ impl UpdateCommand {
         match &install_result {
             Ok(InstallOutcome::Installed) => {
                 super::rollback::clear_install_failures();
+                super::rollback::clear_update_cooldown();
                 // The staged copy (#5790) has served its purpose. Kept on any
                 // failure, so the next attempt need not download it again.
                 staged::discard();
@@ -525,13 +577,20 @@ impl UpdateCommand {
             }) => {
                 if *verification_failure {
                     super::rollback::record_install_failure(latest_version);
+                } else {
+                    // transient bundle failure: leave the gate unchanged, but
+                    // cool the release down (#5799).
+                    note_install_failure(
+                        latest_version,
+                        &anyhow::anyhow!("the app bundle update could not be downloaded"),
+                    );
                 }
-                // transient bundle failure: leave the gate unchanged.
             }
             Err(e) if is_release_verification_failure(e) => {
                 super::rollback::record_install_failure(latest_version)
             }
-            // Transient install error: neither record nor clear — retry later.
+            // Transient install error: neither record nor clear the gate — retry
+            // later, after a cooldown (below).
             //
             // DELIBERATELY includes the fail-closed "missing artifact" refusals
             // (absent SHA256SUMS.txt, no manifest entry for our asset, absent
@@ -543,7 +602,11 @@ impl UpdateCommand {
             // already rate-limit-bounded retry cadence. Only a PRESENT-but-WRONG
             // artifact (checksum mismatch / invalid signature) is an unambiguous
             // bad-release signal and is gated above via ReleaseVerificationError.
-            Err(_) => {}
+            //
+            // What IS recorded is a time-bounded cooldown (#5799): without it a
+            // node that cannot download the release restarts, detects it again
+            // and exits for it again within minutes. It always expires.
+            Err(e) => note_install_failure(latest_version, e),
         }
         install_result.map(|_| ())
     }
@@ -1286,7 +1349,7 @@ impl Checksums {
 /// used instead of `api.github.com`.
 ///
 /// [`auto_update::GITHUB_LATEST_REDIRECT_URL`]: super::auto_update
-async fn probe_latest_tag(force: bool, quiet: bool) -> Result<String> {
+async fn probe_latest_tag(force: bool, quiet: bool, hold_on_skip: bool) -> Result<String> {
     // Persistent local rate limit (#4073): this is the supervisor-side choke
     // point — the on-crash / on-update `freenet update` one-shot reaches GitHub
     // through here. It uses its OWN on-disk token bucket (the INSTALL bucket),
@@ -1316,6 +1379,9 @@ async fn probe_latest_tag(force: bool, quiet: bool) -> Result<String> {
                 eprintln!("{}", rate_limited.user_message());
             }
             tracing::warn!("Update check deferred: {}", rate_limited.user_message());
+            if hold_on_skip {
+                hold_staged_release(&anyhow::anyhow!("{}", rate_limited.user_message()));
+            }
             std::process::exit(EXIT_CODE_ALREADY_UP_TO_DATE);
         }
     }
@@ -1330,6 +1396,11 @@ async fn probe_latest_tag(force: bool, quiet: bool) -> Result<String> {
         tracing::warn!(
             "GitHub update poll rate-limited (token bucket empty); exiting as up-to-date (#4073)"
         );
+        if hold_on_skip {
+            hold_staged_release(&anyhow::anyhow!(
+                "skipped: too many recent GitHub polls (#4073 token bucket)"
+            ));
+        }
         std::process::exit(EXIT_CODE_ALREADY_UP_TO_DATE);
     }
 
@@ -1362,6 +1433,9 @@ async fn probe_latest_tag(force: bool, quiet: bool) -> Result<String> {
                     eprintln!("{}", rate_limited.user_message());
                 }
                 tracing::warn!("Update check deferred: {}", rate_limited.user_message());
+                if hold_on_skip {
+                    hold_staged_release(&anyhow::anyhow!("{}", rate_limited.user_message()));
+                }
                 std::process::exit(EXIT_CODE_ALREADY_UP_TO_DATE);
             }
             Err(e).context("Failed to determine the latest Freenet release")
@@ -1431,6 +1505,12 @@ async fn fetch_release_assets(tag: &str, quiet: bool) -> Result<Release> {
             eprintln!("{}", rate_limited.user_message());
         }
         tracing::warn!("Update deferred: {}", rate_limited.user_message());
+        // The release is known here: hold it without counting a failure (no
+        // download was attempted), so the restart does not exit again (#5799).
+        super::rollback::hold_update_without_counting(
+            super::auto_update::version_from_tag(tag),
+            &rate_limited.user_message(),
+        );
         std::process::exit(EXIT_CODE_ALREADY_UP_TO_DATE);
     }
 
@@ -4143,6 +4223,78 @@ done
                 && !catch_body.contains("clear_install_failures"),
             "the transient Err arm must neither record nor clear the gate"
         );
+    }
+
+    /// #5799: the updater records a failed install, holds (without counting)
+    /// on every exit that attempted no download, never touches the cooldown
+    /// under `--check`, sends verification failures to the #4073 gate, and
+    /// clears the record on an install or an up-to-date node. Function-bounded
+    /// scrapes, since `run_async` needs GitHub and the real state directory.
+    #[test]
+    fn the_updater_keeps_the_cooldown_record() {
+        let src = include_str!("update.rs").replace("\r\n", "\n");
+        let production = src
+            .split_once(concat!("#[cfg(test)]\n", "mod tests {"))
+            .expect("test module")
+            .0;
+        let region = |signature: &str, end: &str| -> String {
+            let at = production
+                .find(signature)
+                .unwrap_or_else(|| panic!("{signature}"));
+            let body = &production[at..];
+            body[..body
+                .find(end)
+                .unwrap_or_else(|| panic!("end of {signature}"))]
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .collect::<String>()
+                .split_whitespace()
+                .collect()
+        };
+        let run_async = region("\n    async fn run_async(", "\n    }\n");
+        for needle in [
+            "lethold_on_skip=!self.check;",
+            "letlatest_tag=matchprobe_latest_tag(self.force,self.quiet,hold_on_skip).await{",
+            "Err(e)=>{ifhold_on_skip{hold_staged_release(&e);}returnErr(e);}",
+            "Err(e)=>{note_install_failure(latest_version,&e);returnErr(e);}",
+            "Err(e)=>note_install_failure(latest_version,e),}install_result",
+            "}else{note_install_failure(latest_version,",
+        ] {
+            assert!(run_async.contains(needle), "run_async: `{needle}`");
+        }
+        assert_eq!(
+            run_async
+                .matches("super::rollback::clear_update_cooldown();")
+                .count(),
+            2
+        );
+        let verification = run_async
+            .split_once("Err(e)ifis_release_verification_failure(e)=>")
+            .unwrap()
+            .1;
+        let verification = &verification[..verification.find("Err(e)=>").unwrap()];
+        assert!(
+            !verification.contains("note_install_failure"),
+            "{verification}"
+        );
+        let probe = region("\nasync fn probe_latest_tag(", "\n}\n");
+        assert_eq!(
+            probe.matches("ifhold_on_skip{hold_staged_release(").count(),
+            3
+        );
+        assert_eq!(
+            probe
+                .matches("std::process::exit(EXIT_CODE_ALREADY_UP_TO_DATE)")
+                .count(),
+            3
+        );
+        assert!(!probe.contains("note_install_failure"));
+        let assets = region("\nasync fn fetch_release_assets(", "\n}\n");
+        assert!(assets.contains("super::rollback::hold_update_without_counting("));
+        let note = region("\nfn note_install_failure(", "\n}\n");
+        assert!(note.contains("super::rollback::record_update_failure(version,"));
+        let hold = region("\nfn hold_staged_release(", "\n}\n");
+        assert!(hold.contains("staged::hold_staged_release(&format!(\"{error:#}\"));"));
     }
 
     // ---- Ed25519 release-manifest signing + verification (auto-update). ----

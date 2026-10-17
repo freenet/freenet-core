@@ -273,17 +273,37 @@ fn fsync_dir(dir: &Path) {
 /// half-written marker/pin that mis-drives the rollback decision.
 fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     use std::io::Write;
+    atomic_write_with(path, bytes, |file, bytes| file.write_all(bytes))
+}
+
+/// [`atomic_write`] with the write injected, so the cleanup is testable.
+fn atomic_write_with(
+    path: &Path,
+    bytes: &[u8],
+    write: impl FnOnce(&mut std::fs::File, &[u8]) -> std::io::Result<()>,
+) -> Result<()> {
     let dir = path.parent().context("path has no parent directory")?;
     std::fs::create_dir_all(dir).ok();
     let file_name = path
         .file_name()
         .context("path has no file name")?
         .to_string_lossy();
-    let tmp = dir.join(format!(".{file_name}.tmp"));
-    {
-        let mut f = std::fs::File::create(&tmp).context("create temp for atomic write")?;
-        f.write_all(bytes).context("write temp for atomic write")?;
-        f.sync_all().context("fsync temp for atomic write")?;
+    // Unique per process and call: the node, the updater and a tray "Check
+    // for Updates" can write the same file at once, and a shared temporary
+    // name would let one rename another's half-written bytes into place.
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = dir.join(format!(".{file_name}.{}.{seq}.tmp", std::process::id()));
+    let written = std::fs::File::create(&tmp)
+        .context("create temp for atomic write")
+        .and_then(|mut f| {
+            write(&mut f, bytes).context("write temp for atomic write")?;
+            f.sync_all().context("fsync temp for atomic write")
+        });
+    if let Err(e) = written {
+        // A unique name is never reused, so a temp left here would stay.
+        let _rm = std::fs::remove_file(&tmp);
+        return Err(e);
     }
     if let Err(e) = std::fs::rename(&tmp, path) {
         let _rm = std::fs::remove_file(&tmp);
@@ -911,6 +931,308 @@ pub fn is_version_install_gated(version: &str) -> bool {
     state_dir()
         .map(|d| is_version_install_gated_at(d.as_path(), version))
         .unwrap_or(false)
+}
+
+// ── Per-target-version update cooldown (#5799) ─────────────────────────────
+//
+// The install gate above deliberately ignores TRANSIENT failures, because
+// gating on them would permanently suppress a good release after a brief
+// outage. Ignoring them entirely left nothing to stop the loop on a network
+// where GitHub downloads keep failing: detect X, exit 42, the download fails,
+// restart on the old binary, detect X, exit 42, every few minutes (#5799).
+//
+// This record is the time-bounded answer. A failure to fetch X, by the node or
+// by the updater, records X with a retry time; until then nothing asks GitHub
+// about X or exits for it. The wait is 1 h, then 2 h, then 4 h at most, each
+// ±20%. It always expires, a different (newer) release starts afresh, and a
+// successful install clears it. A missing, corrupt or implausible record reads
+// as no cooldown: the worst that costs is one attempt, the behaviour before.
+
+/// The wait after the first failure to fetch a release.
+pub(crate) const UPDATE_COOLDOWN_BASE: std::time::Duration = std::time::Duration::from_secs(3600);
+/// The longest wait, from the third consecutive failure on.
+pub(crate) const UPDATE_COOLDOWN_MAX: std::time::Duration =
+    std::time::Duration::from_secs(4 * 3600);
+/// Fraction by which each wait is randomly shortened or lengthened.
+const UPDATE_COOLDOWN_JITTER: f64 = 0.2;
+const UPDATE_COOLDOWN_FILE: &str = "update_cooldown.json";
+/// Longest error text kept, so the record `freenet service report` reads
+/// stays small.
+const UPDATE_COOLDOWN_ERROR_MAX_CHARS: usize = 500;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct UpdateCooldownState {
+    /// The release that could not be fetched.
+    pub version: String,
+    /// Consecutive failures of that release.
+    pub failures: u32,
+    /// Unix seconds of the last failure.
+    pub failed_at_unix: u64,
+    /// Unix seconds before which nothing asks GitHub about, or exits for,
+    /// `version`. Stored rather than derived so its jitter is stable.
+    pub retry_at_unix: u64,
+    /// The last failure, for `freenet service report`.
+    pub last_error: String,
+}
+
+/// The wait after the `failures`-th consecutive failure, given a uniform
+/// sample `rand_unit` in `[0, 1]`: 1 h, 2 h, then 4 h, each ±20%.
+pub(crate) fn update_cooldown_delay(failures: u32, rand_unit: f64) -> std::time::Duration {
+    let doublings = failures.saturating_sub(1).min(8);
+    let base = UPDATE_COOLDOWN_BASE
+        .saturating_mul(1u32 << doublings)
+        .min(UPDATE_COOLDOWN_MAX);
+    let factor =
+        1.0 - UPDATE_COOLDOWN_JITTER + 2.0 * UPDATE_COOLDOWN_JITTER * rand_unit.clamp(0.0, 1.0);
+    base.mul_f64(factor)
+}
+
+pub(crate) fn read_update_cooldown_at(dir: &Path) -> Option<UpdateCooldownState> {
+    let raw = std::fs::read_to_string(dir.join(UPDATE_COOLDOWN_FILE)).ok()?;
+    serde_json::from_str(&raw).ok()
+}
+
+fn unix_secs(time: SystemTime) -> u64 {
+    time.duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Write a record for `version` at `failures`, waiting from `now`. `false`
+/// when it could not be written.
+fn write_update_cooldown_at(
+    dir: &Path,
+    version: &str,
+    failures: u32,
+    error: &str,
+    now: SystemTime,
+    rand_unit: f64,
+) -> bool {
+    let now_unix = unix_secs(now);
+    let state = UpdateCooldownState {
+        version: version.to_string(),
+        failures,
+        failed_at_unix: now_unix,
+        retry_at_unix: now_unix
+            .saturating_add(update_cooldown_delay(failures, rand_unit).as_secs()),
+        last_error: error
+            .chars()
+            .take(UPDATE_COOLDOWN_ERROR_MAX_CHARS)
+            .collect(),
+    };
+    let written = serde_json::to_vec(&state)
+        .context("serialize update cooldown")
+        .and_then(|raw| atomic_write(&dir.join(UPDATE_COOLDOWN_FILE), &raw));
+    if let Err(e) = &written {
+        tracing::warn!(version, error = %e, "Failed to persist the update cooldown (#5799)");
+    }
+    written.is_ok()
+}
+
+/// Record a failure to fetch `version` and return the consecutive failure
+/// count, this one included. A record for another release is replaced.
+///
+/// `None` when it could not be written. Callers then exit for the update (fail
+/// open): an unrecorded failure would never count toward the fallback, and the
+/// node could stay on its old binary for good.
+pub(crate) fn record_update_failure_at(
+    dir: &Path,
+    version: &str,
+    error: &str,
+    now: SystemTime,
+    rand_unit: f64,
+) -> Option<u32> {
+    let failures = match read_update_cooldown_at(dir) {
+        Some(prev) if prev.version == version => prev.failures.saturating_add(1),
+        _ => 1,
+    };
+    write_update_cooldown_at(dir, version, failures, error, now, rand_unit).then_some(failures)
+}
+
+/// [`record_update_failure_at`] against the shared state directory.
+pub fn record_update_failure(version: &str, error: &str) -> Option<u32> {
+    let rand_unit = freenet::config::GlobalRng::random_range(0.0_f64..1.0);
+    state_dir().and_then(|dir| {
+        record_update_failure_at(&dir, version, error, SystemTime::now(), rand_unit)
+    })
+}
+
+/// Make sure `version` is held WITHOUT counting a failure, for updater runs
+/// that gave up before attempting a download (a cached GitHub cooldown, an
+/// empty install bucket, a rate limit, a failed tag probe). The supervisor runs
+/// `freenet update` after every non-clean exit, crashes included, so counting
+/// these would walk a crash-looping node to the fallback without a single
+/// download. A live record is left alone; an expired one gets a fresh wait at
+/// its count; with none, or one for an older release, a hold at one failure is
+/// written; a newer release's record is never overwritten.
+pub(crate) fn hold_update_without_counting_at(
+    dir: &Path,
+    version: &str,
+    error: &str,
+    now: SystemTime,
+    rand_unit: f64,
+) {
+    let failures = match read_update_cooldown_at(dir) {
+        Some(prev) if prev.version == version => {
+            if update_cooldown_remaining_at(dir, version, now).is_some() {
+                return;
+            }
+            prev.failures.max(1)
+        }
+        Some(prev) if !is_not_newer(&prev.version, version) => return,
+        _ => 1,
+    };
+    write_update_cooldown_at(dir, version, failures, error, now, rand_unit);
+}
+
+/// [`hold_update_without_counting_at`] against the shared state directory.
+pub fn hold_update_without_counting(version: &str, error: &str) {
+    let rand_unit = freenet::config::GlobalRng::random_range(0.0_f64..1.0);
+    if let Some(dir) = state_dir() {
+        hold_update_without_counting_at(&dir, version, error, SystemTime::now(), rand_unit);
+    }
+}
+
+/// How long until `version` may be tried again, or `None` when it is not
+/// cooling down. A retry time further out than the longest possible wait is a
+/// bogus record (a clock that jumped, a hand edit), and is ignored.
+pub(crate) fn update_cooldown_remaining_at(
+    dir: &Path,
+    version: &str,
+    now: SystemTime,
+) -> Option<std::time::Duration> {
+    let state = read_update_cooldown_at(dir).filter(|s| s.version == version)?;
+    let retry_at = UNIX_EPOCH.checked_add(std::time::Duration::from_secs(state.retry_at_unix))?;
+    let remaining = retry_at.duration_since(now).ok()?;
+    let longest = UPDATE_COOLDOWN_MAX.mul_f64(1.0 + UPDATE_COOLDOWN_JITTER);
+    (!remaining.is_zero() && remaining <= longest).then_some(remaining)
+}
+
+/// The release cooling down, and for how long, if it is newer than
+/// `current_version`. This is what the update triggers check before they ask
+/// GitHub anything: they would find that same release.
+pub(crate) fn update_cooldown_pending_at(
+    dir: &Path,
+    current_version: &str,
+    now: SystemTime,
+) -> Option<(String, std::time::Duration)> {
+    let state = read_update_cooldown_at(dir)?;
+    if is_not_newer(&state.version, current_version) {
+        return None;
+    }
+    let remaining = update_cooldown_remaining_at(dir, &state.version, now)?;
+    Some((state.version, remaining))
+}
+
+/// [`update_cooldown_pending_at`] against the shared state directory.
+pub fn update_cooldown_pending(current_version: &str) -> Option<(String, std::time::Duration)> {
+    state_dir().and_then(|dir| update_cooldown_pending_at(&dir, current_version, SystemTime::now()))
+}
+
+/// Whether `version` is not newer than `current` (semver). Unparseable
+/// versions count as newer, so a record is never silently dropped.
+fn is_not_newer(version: &str, current: &str) -> bool {
+    semver::Version::parse(version)
+        .ok()
+        .zip(semver::Version::parse(current).ok())
+        .is_some_and(|(version, current)| version <= current)
+}
+
+pub(crate) fn clear_update_cooldown_at(dir: &Path) {
+    let _rm = std::fs::remove_file(dir.join(UPDATE_COOLDOWN_FILE));
+}
+
+/// Clear the cooldown (after a successful install, or when already up to date).
+pub fn clear_update_cooldown() {
+    if let Some(dir) = state_dir() {
+        clear_update_cooldown_at(&dir);
+    }
+}
+
+/// One line for `freenet service report`, or `None` when nothing is pending.
+pub(crate) fn update_cooldown_summary_at(
+    dir: &Path,
+    current_version: &str,
+    now: SystemTime,
+) -> Option<String> {
+    let state = read_update_cooldown_at(dir)?;
+    if is_not_newer(&state.version, current_version) {
+        return None;
+    }
+    let wait = if is_version_install_gated_at(dir, &state.version)
+        || is_version_pinned_bad_at(dir, &state.version)
+    {
+        "auto-update will not retry it: it is blocked by repeated install failures or a \
+         crash-loop rollback (#4073); run `freenet update --force` to override"
+            .to_string()
+    } else {
+        match update_cooldown_remaining_at(dir, &state.version, now) {
+            Some(left) => format!("next attempt in {} min", left.as_secs().div_ceil(60)),
+            None => "cooldown over, the next update check may try again".to_string(),
+        }
+    };
+    Some(format!(
+        "Update to {} failed {} time(s) in a row ({wait}). Last error: {}",
+        state.version, state.failures, state.last_error
+    ))
+}
+
+/// [`update_cooldown_summary_at`] against the shared state directory.
+pub fn update_cooldown_summary(current_version: &str) -> Option<String> {
+    state_dir().and_then(|dir| update_cooldown_summary_at(&dir, current_version, SystemTime::now()))
+}
+
+// ── Hard ceiling on staged release downloads (#5799) ───────────────────────
+//
+// Independent of the cooldown above, so a bug in it cannot turn the fleet's
+// download-in-advance into a flood that GitHub throttles. A node downloads the
+// release archive in advance at most `ARCHIVE_DOWNLOADS_PER_DAY` times per
+// release per day. (Every staging request also spends a token from the node's
+// GitHub poll bucket, #4073, which bounds the rest.) A missing or corrupt
+// record allows a download; one that cannot be written refuses it, since an
+// unwritten count could not stop the next one.
+
+/// Full staged downloads of one release a node may start per day.
+pub(crate) const ARCHIVE_DOWNLOADS_PER_DAY: u32 = 3;
+const ARCHIVE_DOWNLOAD_WINDOW: std::time::Duration = std::time::Duration::from_secs(24 * 3600);
+const ARCHIVE_DOWNLOADS_FILE: &str = "staged_downloads.json";
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct ArchiveDownloads {
+    version: String,
+    window_start_unix: u64,
+    count: u32,
+}
+
+/// Spend one of today's staged downloads of `version`. `false` when the
+/// ceiling is reached or the spend could not be recorded: the caller must not
+/// download.
+pub(crate) fn take_archive_download_at(dir: &Path, version: &str, now: SystemTime) -> bool {
+    let now_unix = unix_secs(now);
+    let current = std::fs::read_to_string(dir.join(ARCHIVE_DOWNLOADS_FILE))
+        .ok()
+        .and_then(|raw| serde_json::from_str::<ArchiveDownloads>(&raw).ok())
+        .filter(|d| {
+            d.version == version
+                && d.window_start_unix <= now_unix
+                && now_unix - d.window_start_unix < ARCHIVE_DOWNLOAD_WINDOW.as_secs()
+        });
+    let next = match current {
+        Some(d) if d.count >= ARCHIVE_DOWNLOADS_PER_DAY => return false,
+        Some(d) => ArchiveDownloads {
+            count: d.count + 1,
+            ..d
+        },
+        None => ArchiveDownloads {
+            version: version.to_string(),
+            window_start_unix: now_unix,
+            count: 1,
+        },
+    };
+    serde_json::to_vec(&next)
+        .context("serialize staged downloads")
+        .and_then(|raw| atomic_write(&dir.join(ARCHIVE_DOWNLOADS_FILE), &raw))
+        .is_ok()
 }
 
 // ── Post-stop crash classification / handling / rollback ───────────────────
@@ -2165,11 +2487,276 @@ mod tests {
         let dir = tmp.path();
         record_install_failure_at(dir, "0.2.90");
         assert!(read_install_failures_at(dir).is_some());
-        let leftover_tmp = dir.join(format!(".{INSTALL_FAILURES_FILE}.tmp"));
-        assert!(
-            !leftover_tmp.exists(),
-            "atomic_write must not leave a temp file behind"
+        // Any temp name: since #5799 the name is unique per call, so checking
+        // one fixed spelling could never fail.
+        assert_eq!(temp_files(dir), Vec::<String>::new());
+    }
+
+    fn temp_files(dir: &Path) -> Vec<String> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".tmp"))
+            .collect()
+    }
+
+    #[test]
+    fn a_failed_atomic_write_leaves_no_temp_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let failed = atomic_write_with(&dir.join(UPDATE_COOLDOWN_FILE), b"x", |_, _| {
+            Err(std::io::Error::other("disk full"))
+        });
+        assert!(failed.is_err());
+        assert_eq!(temp_files(dir), Vec::<String>::new());
+        // A failed rename (onto a non-empty directory) too.
+        let target = dir.join("occupied");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::write(target.join("x"), b"x").unwrap();
+        assert!(atomic_write(&target, b"x").is_err());
+        assert_eq!(temp_files(dir), Vec::<String>::new());
+    }
+
+    /// Concurrent writers (the node, the updater, a tray "Check for Updates")
+    /// never rename each other's half-written bytes into place.
+    #[test]
+    fn concurrent_cooldown_writes_leave_a_valid_record() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
+        let now = SystemTime::now();
+        let writers: Vec<_> = (0..8)
+            .map(|i| {
+                let dir = dir.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..50 {
+                        record_update_failure_at(&dir, "0.2.141", &"e".repeat(i * 40), now, 0.5)
+                            .expect("write");
+                    }
+                })
+            })
+            .collect();
+        for w in writers {
+            w.join().unwrap();
+        }
+        assert_eq!(read_update_cooldown_at(&dir).unwrap().version, "0.2.141");
+        assert_eq!(temp_files(&dir), Vec::<String>::new());
+    }
+
+    #[test]
+    fn the_cooldown_is_an_hour_then_two_then_four_with_jitter() {
+        let hour = std::time::Duration::from_secs(3600);
+        for (failures, hours) in [(0, 1), (1, 1), (2, 2), (3, 4), (4, 4), (u32::MAX, 4)] {
+            assert_eq!(
+                update_cooldown_delay(failures, 0.5),
+                hour * hours,
+                "{failures}"
+            );
+        }
+        assert_eq!(update_cooldown_delay(1, 0.0), hour.mul_f64(0.8));
+        assert_eq!(update_cooldown_delay(1, 1.0), hour.mul_f64(1.2));
+        assert_eq!(
+            update_cooldown_delay(3, 9.0),
+            UPDATE_COOLDOWN_MAX.mul_f64(1.2)
         );
+    }
+
+    #[test]
+    fn the_cooldown_holds_a_release_until_it_expires() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let now = SystemTime::now();
+        let hour = std::time::Duration::from_secs(3600);
+        assert!(update_cooldown_remaining_at(dir, "0.2.141", now).is_none());
+        assert_eq!(
+            record_update_failure_at(dir, "0.2.141", "reset", now, 0.5),
+            Some(1)
+        );
+        let left = update_cooldown_remaining_at(dir, "0.2.141", now).unwrap();
+        assert!(left <= hour && left > hour - std::time::Duration::from_secs(2));
+        assert!(
+            update_cooldown_remaining_at(dir, "0.2.142", now).is_none(),
+            "per release"
+        );
+        assert!(
+            update_cooldown_remaining_at(dir, "0.2.141", now + hour).is_none(),
+            "expires"
+        );
+        assert_eq!(
+            record_update_failure_at(dir, "0.2.141", "reset", now, 0.5),
+            Some(2)
+        );
+        assert!(update_cooldown_remaining_at(dir, "0.2.141", now + hour).is_some());
+        assert_eq!(
+            update_cooldown_pending_at(dir, "0.2.140", now)
+                .map(|(v, _)| v)
+                .as_deref(),
+            Some("0.2.141")
+        );
+        assert!(
+            update_cooldown_pending_at(dir, "0.2.141", now).is_none(),
+            "not newer"
+        );
+        assert_eq!(
+            record_update_failure_at(dir, "0.2.142", "x", now, 0.5),
+            Some(1),
+            "afresh"
+        );
+        clear_update_cooldown_at(dir);
+        assert!(read_update_cooldown_at(dir).is_none());
+    }
+
+    /// A cooldown that fails closed could hold an update back for good;
+    /// failing open costs one attempt, the behaviour before it existed.
+    #[test]
+    fn a_damaged_or_implausible_record_is_no_cooldown() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let now = SystemTime::now();
+        std::fs::write(dir.join(UPDATE_COOLDOWN_FILE), "{not json").unwrap();
+        assert!(update_cooldown_remaining_at(dir, "0.2.141", now).is_none());
+        assert!(update_cooldown_pending_at(dir, "0.2.140", now).is_none());
+        assert_eq!(
+            record_update_failure_at(dir, "0.2.141", "x", now, 0.5),
+            Some(1)
+        );
+        let mut state = read_update_cooldown_at(dir).unwrap();
+        state.retry_at_unix = unix_secs(now) + UPDATE_COOLDOWN_MAX.as_secs() * 2;
+        std::fs::write(
+            dir.join(UPDATE_COOLDOWN_FILE),
+            serde_json::to_vec(&state).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            update_cooldown_remaining_at(dir, "0.2.141", now).is_none(),
+            "clock skew"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn an_unwritable_record_is_reported_so_the_caller_fails_open() {
+        let tmp = tempfile::tempdir().unwrap();
+        // A directory where the record goes: neither readable nor replaceable.
+        std::fs::create_dir(tmp.path().join(UPDATE_COOLDOWN_FILE)).unwrap();
+        let now = SystemTime::now();
+        assert_eq!(
+            record_update_failure_at(tmp.path(), "0.2.141", "x", now, 0.5),
+            None
+        );
+    }
+
+    /// Updater runs that made no download attempt hold the release without
+    /// counting a failure.
+    #[test]
+    fn a_hold_without_counting_never_advances_the_count() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let now = SystemTime::now();
+        let hour = std::time::Duration::from_secs(3600);
+        hold_update_without_counting_at(dir, "0.2.141", "skipped", now, 0.5);
+        let first = read_update_cooldown_at(dir).unwrap();
+        assert_eq!((first.version.as_str(), first.failures), ("0.2.141", 1));
+        record_update_failure_at(dir, "0.2.141", "real", now, 0.5);
+        let live = read_update_cooldown_at(dir).unwrap();
+        for _ in 0..10 {
+            hold_update_without_counting_at(dir, "0.2.141", "skipped", now, 0.5);
+        }
+        assert_eq!(
+            read_update_cooldown_at(dir).unwrap(),
+            live,
+            "a live record is untouched"
+        );
+        let later = now + hour * 3;
+        hold_update_without_counting_at(dir, "0.2.141", "skipped", later, 0.5);
+        assert_eq!(
+            read_update_cooldown_at(dir).unwrap().failures,
+            live.failures
+        );
+        assert!(update_cooldown_remaining_at(dir, "0.2.141", later).is_some());
+        record_update_failure_at(dir, "0.2.150", "newer", now, 0.5);
+        hold_update_without_counting_at(dir, "0.2.141", "stale", now, 0.5);
+        assert_eq!(read_update_cooldown_at(dir).unwrap().version, "0.2.150");
+    }
+
+    #[test]
+    fn the_summary_names_the_release_and_says_when() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let now = SystemTime::now();
+        assert!(update_cooldown_summary_at(dir, "0.2.140", now).is_none());
+        let long_error = format!("error sending request: {}", "x".repeat(2000));
+        record_update_failure_at(dir, "0.2.141", &long_error, now, 0.5);
+        let summary = update_cooldown_summary_at(dir, "0.2.140", now).unwrap();
+        assert!(
+            summary.contains("0.2.141") && summary.contains("1 time(s)"),
+            "{summary}"
+        );
+        assert!(summary.contains("next attempt in 60 min"), "{summary}");
+        assert_eq!(
+            read_update_cooldown_at(dir)
+                .unwrap()
+                .last_error
+                .chars()
+                .count(),
+            UPDATE_COOLDOWN_ERROR_MAX_CHARS
+        );
+        let later = now + std::time::Duration::from_secs(2 * 3600);
+        assert!(
+            update_cooldown_summary_at(dir, "0.2.140", later)
+                .unwrap()
+                .contains("cooldown over")
+        );
+        assert!(
+            update_cooldown_summary_at(dir, "0.2.141", now).is_none(),
+            "installed"
+        );
+        pin_known_bad_at(dir, "0.2.141").unwrap();
+        assert!(
+            update_cooldown_summary_at(dir, "0.2.140", now)
+                .unwrap()
+                .contains("will not retry")
+        );
+        record_update_failure_at(dir, "not-a-version", "x", now, 0.5);
+        assert!(
+            update_cooldown_summary_at(dir, "0.2.140", now).is_some(),
+            "never dropped"
+        );
+    }
+
+    /// The ceiling on staged downloads holds on its own, whatever the
+    /// cooldown says: three per release per day per node.
+    #[test]
+    fn staged_downloads_are_capped_per_release_per_day() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let now = SystemTime::now();
+        for _ in 0..ARCHIVE_DOWNLOADS_PER_DAY {
+            assert!(take_archive_download_at(dir, "0.2.141", now));
+        }
+        for _ in 0..100 {
+            assert!(
+                !take_archive_download_at(dir, "0.2.141", now),
+                "ceiling reached"
+            );
+        }
+        let next_day = now + ARCHIVE_DOWNLOAD_WINDOW;
+        assert!(
+            take_archive_download_at(dir, "0.2.141", next_day),
+            "a new day"
+        );
+        assert!(
+            take_archive_download_at(dir, "0.2.142", next_day),
+            "a new release"
+        );
+        // A record from the future (a clock stepped back) starts a new window
+        // rather than blocking until then.
+        assert!(take_archive_download_at(dir, "0.2.142", now));
+        // Corrupt: allowed. Unwritable: refused.
+        std::fs::write(dir.join(ARCHIVE_DOWNLOADS_FILE), "{bad").unwrap();
+        assert!(take_archive_download_at(dir, "0.2.141", now));
+        std::fs::remove_file(dir.join(ARCHIVE_DOWNLOADS_FILE)).unwrap();
+        std::fs::create_dir(dir.join(ARCHIVE_DOWNLOADS_FILE)).unwrap();
+        assert!(!take_archive_download_at(dir, "0.2.141", now));
     }
 
     #[test]

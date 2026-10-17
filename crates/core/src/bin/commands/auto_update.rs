@@ -383,6 +383,13 @@ pub enum UpdateCheckResult {
     ///
     /// [`Skipped`]: UpdateCheckResult::Skipped
     PinnedKnownBad,
+    /// A newer release is cooling down after failed attempts to fetch it
+    /// (#5799), so GitHub was not asked. Like [`RateLimited`], not a "no
+    /// update" signal: the caller keeps its driving signal and must NOT fall
+    /// through to the max-backoff exit-42 fallback.
+    ///
+    /// [`RateLimited`]: UpdateCheckResult::RateLimited
+    CoolingDown,
 }
 
 /// Check if an update is available, respecting rate limits and failure counts.
@@ -406,6 +413,13 @@ pub enum UpdateCheckResult {
 static LOCKOUT_WARNED_AT: AtomicU32 = AtomicU32::new(u32::MAX);
 
 pub async fn check_if_update_available(current_version: &str) -> UpdateCheckResult {
+    // #5799: before any request and before any claim. GitHub would report the
+    // release that cannot be fetched again; the backoff is left alone.
+    if super::rollback::update_cooldown_pending(current_version).is_some() {
+        tracing::debug!("Update check skipped: a newer release is cooling down (#5799)");
+        return UpdateCheckResult::CoolingDown;
+    }
+
     // Don't check if we've failed too many times
     if !should_attempt_update() {
         // Loud, operator-visible (issue #4580): a lockout means this peer has
@@ -1504,6 +1518,13 @@ pub(crate) fn try_consume_node_poll() -> bool {
     try_consume_poll_bucket(NODE_POLL_BUCKET_FILE)
 }
 
+/// Spend a token from the node's bucket in `dir`. Staging spends one per
+/// GitHub request round (#5799), so its traffic is bounded by the same
+/// persisted bucket as detection, whatever the cooldown decides.
+pub(crate) fn try_consume_node_poll_at(dir: &std::path::Path, now_unix: u64) -> bool {
+    try_consume_github_poll_at(dir, NODE_POLL_BUCKET_FILE, now_unix)
+}
+
 /// Try to consume one token from the INSTALL poll bucket (`get_latest_release`).
 /// Independent of the node bucket so the node can never starve the installer.
 pub(crate) fn try_consume_install_poll() -> bool {
@@ -1754,6 +1775,9 @@ pub enum ClaimRefused {
     CoolingDown,
     /// Locked out, cooldown passed, but the retry could not be recorded.
     NotRecordable,
+    /// Locked out, and the newer release is cooling down after failed
+    /// attempts (#5799): spending the daily retry now would only fail again.
+    ReleaseCoolingDown,
 }
 
 impl std::fmt::Display for ClaimRefused {
@@ -1769,6 +1793,10 @@ impl std::fmt::Display for ClaimRefused {
                 "auto-update is locked out and its once-a-day retry could not be recorded \
                  in the state directory"
             }
+            Self::ReleaseCoolingDown => {
+                "auto-update is locked out (#3934) and the newer release is cooling down \
+                 after failed attempts (#5799); the daily retry waits for the cooldown"
+            }
         })
     }
 }
@@ -1783,11 +1811,33 @@ impl std::fmt::Display for ClaimRefused {
 /// updater. Whether or not the failed install gets recorded, and whichever
 /// path spends the retry, every later claim sees it and refuses, so the
 /// restart that follows a failed attempt does not start another.
+///
+/// A locked-out node also refuses while a newer release is cooling down
+/// (#5799), so its one retry waits until that release can be fetched.
 pub fn claim_update_attempt() -> Result<UpdateAttempt, ClaimRefused> {
     match state_dir() {
-        Some(dir) => claim_update_attempt_at(&dir, SystemTime::now()),
+        Some(dir) => claim_update_attempt_unless_cooling_at(
+            &dir,
+            env!("CARGO_PKG_VERSION"),
+            SystemTime::now(),
+        ),
         None => Err(ClaimRefused::NoStateDir),
     }
+}
+
+/// [`claim_update_attempt_at`], refusing first, and writing nothing, when
+/// locked out and a newer release is cooling down.
+pub(crate) fn claim_update_attempt_unless_cooling_at(
+    dir: &std::path::Path,
+    current_version: &str,
+    now: SystemTime,
+) -> Result<UpdateAttempt, ClaimRefused> {
+    if get_update_failure_count_at(dir) >= MAX_UPDATE_FAILURES
+        && super::rollback::update_cooldown_pending_at(dir, current_version, now).is_some()
+    {
+        return Err(ClaimRefused::ReleaseCoolingDown);
+    }
+    claim_update_attempt_at(dir, now)
 }
 
 pub(crate) fn claim_update_attempt_at(
@@ -2679,6 +2729,59 @@ mod tests {
             at_statement(claim) < at_statement(fetch),
             "check_if_update_available must spend the lockout claim before asking GitHub (#3934)"
         );
+    }
+
+    /// #5799: the cooldown is checked before any GitHub request and before
+    /// the lockout claim.
+    #[test]
+    fn the_peer_signal_check_consults_the_cooldown_first() {
+        let src = include_str!("auto_update.rs").replace("\r\n", "\n");
+        let body = fn_body(&src, "pub async fn check_if_update_available(");
+        let flat: String = body.split_whitespace().collect();
+        let cooling = flat
+            .find(concat!(
+                "ifsuper::rollback::update_cooldown_pending(current_version).is_some(){",
+                "tracing::debug!(\"Updatecheckskipped:anewerreleaseiscoolingdown(#5799)\");",
+                "returnUpdateCheckResult::CoolingDown;}"
+            ))
+            .expect("the cooldown check");
+        for later in [
+            "should_attempt_update()",
+            "claim_update_attempt()",
+            "get_latest_version()",
+        ] {
+            assert!(cooling < flat.find(later).unwrap(), "before `{later}`");
+        }
+    }
+
+    /// #5799: a locked-out node keeps its daily retry while a newer release
+    /// cools down, whichever path claims.
+    #[test]
+    fn a_locked_out_node_keeps_its_retry_while_a_release_cools_down() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let now = lock_out(dir) + UPDATE_LOCKOUT_COOLDOWN;
+        super::super::rollback::record_update_failure_at(dir, "0.2.141", "x", now, 0.5);
+        assert_eq!(
+            claim_update_attempt_unless_cooling_at(dir, "0.2.140", now).err(),
+            Some(ClaimRefused::ReleaseCoolingDown)
+        );
+        assert!(
+            !dir.join(LOCKOUT_RETRY_FILE).exists(),
+            "the refusal spends nothing"
+        );
+        // Already on that release: nothing pending, the claim goes ahead.
+        assert!(claim_update_attempt_unless_cooling_at(dir, "0.2.141", now).is_ok());
+        // Not locked out: unaffected.
+        let fresh = tempfile::tempdir().unwrap();
+        super::super::rollback::record_update_failure_at(fresh.path(), "0.2.141", "x", now, 0.5);
+        assert!(claim_update_attempt_unless_cooling_at(fresh.path(), "0.2.140", now).is_ok());
+        // The public claim goes through this check.
+        let src = include_str!("auto_update.rs").replace("\r\n", "\n");
+        let flat: String = fn_body(&src, "pub fn claim_update_attempt(")
+            .split_whitespace()
+            .collect();
+        assert!(flat.contains("claim_update_attempt_unless_cooling_at(&dir,env!(\"CARGO_PKG_VERSION\"),SystemTime::now(),)"));
     }
 
     #[test]

@@ -13,13 +13,21 @@ PR touches one of these patterns, apply the corresponding rule.
 
 Any child `Command::spawn()` reachable from a process that has called
 `FreeConsole()` — or was launched by Windows autostart without a
-console at all — MUST explicitly null all three standard handles:
+console at all — MUST explicitly set all three standard handles, to
+null or to a file it opened itself:
 
 ```rust
 cmd.stdin(std::process::Stdio::null())
    .stdout(std::process::Stdio::null())
    .stderr(std::process::Stdio::null());
 ```
+
+What is forbidden is INHERITING a handle, not writing somewhere. A file
+handle is as valid for a console-less child as null is, and null discards
+output an operator may need: `spawn_update_command` nulled the updater's
+stderr, so a failed auto-update left no reason in any log (#5799). It now
+appends stdout/stderr to the wrapper log, falling back to null when the
+log cannot be opened (`update_output_stdio`).
 
 Inheriting the parent's invalid standard handles makes `spawn()` fail
 with `"The handle is invalid"` (`ERROR_INVALID_HANDLE`, os error 6).
@@ -33,7 +41,7 @@ misdiagnosed as a network failure, AV lock, or permission issue.
 |-------|------|-----|
 | (original) | network-child spawn in `run_wrapper_loop` | `service.rs` — null stdio on the `freenet network` child spawn. |
 | [#3933](https://github.com/freenet/freenet-core/issues/3933) | `open_log_file` notepad / open / xdg-open | `tray.rs` — null stdio on the viewer spawn. |
-| [#3934](https://github.com/freenet/freenet-core/issues/3934) | `spawn_update_command` | `service.rs` — null stdio; caused the exit-42 restart loop. |
+| [#3934](https://github.com/freenet/freenet-core/issues/3934) | `spawn_update_command` | `service.rs` — null stdio; caused the exit-42 restart loop. Since #5799 stdout/stderr go to the wrapper log instead, never inherited. |
 
 A cross-reference comment on the `FreeConsole()` call in
 `service.rs::run_wrapper` enumerates the known downstream spawn sites.
@@ -41,8 +49,8 @@ Add any new one to that list the same commit you introduce it.
 
 ### Audit
 
-Every `Command::new(...)` hit below must either set null stdio on all
-three handles OR document why the call site is safe (e.g. user-facing
+Every `Command::new(...)` hit below must either set all three handles
+explicitly (null, or a file it opened) OR document why the call site is safe (e.g. user-facing
 CLI entry point that has not detached from its console).
 
 ```bash

@@ -871,6 +871,15 @@ path that silently falls back to the stop-phase download is caught; it then
 installs once more with no staged download, so the installer's own download
 path stays covered. What no gate can show is the time budget itself.
 
+Since #5799, a node that cannot fetch the release stays on its current version
+instead of exiting 42, and retries after a cooldown. Once the previous release
+contains that, a staging failure on the runner shows up in Gate B as a node
+that never exited (the canary's deadline stops it) rather than as an exit 42
+after a failed download. Gate B classifies both the same way: if the staging
+failure line says GitHub rate-limited the runner, the result is UNVERIFIED
+(exit 75, environmental, re-run the job); any other staging failure is a
+failure.
+
 **Gate A checks the COMPARISON in one direction only.** Since #5236 it checks
 the version the node says it observed (`latest=`) against the tag
 `releases/latest` actually resolves to, so a fetch or normaliser that returns
