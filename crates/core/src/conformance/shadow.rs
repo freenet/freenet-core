@@ -373,7 +373,8 @@ pub(crate) struct FocusPeriodSummary {
     /// Stints in the weighted slot, and how many of them were judged.
     pub weighted_stints: usize,
     pub judged_weighted: usize,
-    /// Sum of the activity each weighted stint had when it was drawn. With
+    /// Sum, over weighted stints, of the contract's raw activity count (decayed
+    /// merges, not the selection weight) when the stint was drawn. With
     /// `weighted_stints`, says whether the weighted slot actually landed on busy
     /// contracts or was effectively a uniform draw.
     pub weighted_selected_activity: u64,
@@ -2090,6 +2091,67 @@ mod tests {
             caught > uniform_caught,
             "the burst was focused on {caught}/256 salts against {uniform_caught}/256 for \
              the uniform pair: busy decoys are locking the weighted slot"
+        );
+    }
+
+    /// The tick-line telemetry the runner reports (S4): `period_tick` counts ticks
+    /// into the period and is zero on the rotation tick; `activity_tracked` and
+    /// `activity_evicted` are the tracker's own numbers.
+    #[test]
+    fn the_tick_telemetry_reports_the_runners_own_numbers() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut runner = runner_with_salt(dir.path(), [41; 32]);
+        for tick in 1..ROTATE_EVERY_TICKS {
+            runner.advance();
+            assert_eq!(runner.period_tick(), tick);
+        }
+        assert!(runner.advance().is_some());
+        assert_eq!(runner.period_tick(), 0, "the rotation tick is tick zero");
+
+        let cap = crate::conformance::activity::MAX_TRACKED_ACTIVITY;
+        for n in 0..=cap {
+            let mut bytes = [0u8; 32];
+            bytes[..8].copy_from_slice(&(n as u64).to_be_bytes());
+            runner.note_merge(ContractInstanceId::new(bytes), Some(fresh_state()));
+        }
+        assert!(
+            runner.activity_evicted() > 0,
+            "one past the cap evicted nothing"
+        );
+        assert_eq!(
+            runner.activity_tracked() as u64 + runner.activity_evicted(),
+            cap as u64 + 1
+        );
+    }
+
+    /// The runner breaks activity-eviction ties with ITS salt (F26): two peers with
+    /// different salts evict different equally-quiet contracts.
+    #[test]
+    fn eviction_ties_use_the_peers_salt() {
+        let cap = crate::conformance::activity::MAX_TRACKED_ACTIVITY;
+        let ids: Vec<_> = (0..=cap)
+            .map(|n| {
+                let mut bytes = [0u8; 32];
+                bytes[..8].copy_from_slice(&(n as u64).to_be_bytes());
+                ContractInstanceId::new(bytes)
+            })
+            .collect();
+        let survivors = |salt: u8| {
+            let dir = tempfile::TempDir::new().expect("tempdir");
+            let mut runner = runner_with_salt(dir.path(), [salt; 32]);
+            for id in &ids {
+                runner.note_merge(*id, Some(fresh_state()));
+            }
+            ids.iter()
+                .filter(|id| runner.activity.count(id) > 0)
+                .copied()
+                .collect::<HashSet<_>>()
+        };
+        assert_ne!(
+            survivors(1),
+            survivors(2),
+            "two salts evicted the same tied contracts: the runner's salt is not reaching \
+             the tracker"
         );
     }
 

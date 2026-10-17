@@ -933,8 +933,9 @@ async fn run_writer(
                     // back to whatever the sampler already held.
                     candidates = last_focus.candidates,
                     candidate_source = last_focus.source.as_str(),
-                    // How many candidates focus weighted by recent merges (#5913).
-                    // Zero means this period's draw was uniform.
+                    // Candidates with recent state-changing merges (#5913). Zero
+                    // means the weighted slot's draw this tick was effectively
+                    // uniform, for lack of traffic; the uniform slot always is.
                     active_candidates = last_focus.active_candidates,
                     scope = scope.as_str(),
                     focused = report.focused,
@@ -2496,14 +2497,17 @@ mod probe_wiring_pins {
         );
     }
 
-    /// Both tick lines carry `unobserved_this_period` and `active_candidates`.
+    /// Both tick lines carry the focus telemetry: `focus_without_new_samples`,
+    /// `period_tick`, `active_candidates`, `activity_tracked` and `activity_evicted`,
+    /// each read from the runner rather than recomputed.
     ///
-    /// The barren line is the one #5913's peer logged 49 times in a row; leaving the
-    /// field off it would hide "never examined" on exactly the tick shape where it
-    /// matters most. Counted, so a third tick line cannot satisfy the pin for one of
-    /// the two that lack it.
+    /// The barren line is the one #5913's peer logged 49 times in a row; leaving a
+    /// field off it would hide "nothing newly sampled" on exactly the tick shape where
+    /// it matters most. Counted, so a third tick line cannot satisfy the pin for one
+    /// of the two that lack it. What the runner returns for each is tested in
+    /// `shadow::tests`.
     #[test]
-    fn both_tick_lines_report_never_examined_beside_examined() {
+    fn both_tick_lines_carry_the_focus_telemetry() {
         let body = run_writer_code_only();
         let lines = body.matches("\"conformance shadow tick").count();
         assert_eq!(
@@ -2527,6 +2531,16 @@ mod probe_wiring_pins {
             lines,
             "a shadow tick line does not say whether selection was weighted"
         );
+        for pair in [
+            "activity_tracked = shadow.activity_tracked()",
+            "activity_evicted = shadow.activity_evicted()",
+        ] {
+            assert_eq!(
+                body.matches(pair).count(),
+                lines,
+                "a shadow tick line does not report `{pair}`"
+            );
+        }
     }
 
     #[test]
