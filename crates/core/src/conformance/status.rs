@@ -776,19 +776,13 @@ mod tests {
         record
     }
 
-    /// The fixture contract's MUTUAL_REJECTION mode — see
-    /// `tests/test-contract-conformance/src/lib.rs`. Breaks more than one merge law
-    /// (commutativity among them) across many generated cases, so one probe of it
-    /// returns many findings across MORE THAN ONE property: the input that tells a
-    /// deduplicating assembly apart both from one that appends and from one that
-    /// collapses everything onto the contract. The tests assert both facts from the
-    /// probe's own output rather than relying on this sentence.
-    ///
-    /// These tests used mode 6 (NEVER_SETTLES) until #5915. Its associativity
-    /// cases are now inconclusive (the heal step's pass budget runs out without a
-    /// fixpoint or a repeated state), so it is reported under idempotence alone and
-    /// could no longer tell deduplication from collapsing.
-    const MUTUAL_REJECTION: u8 = 2;
+    /// The fixture contract's NEVER_SETTLES mode — see
+    /// `tests/test-contract-conformance/src/lib.rs`. Breaks state idempotence and
+    /// state associativity on most generated cases, so one probe of it returns many
+    /// findings across MORE THAN ONE property: the input that tells a deduplicating
+    /// assembly apart both from one that appends and from one that collapses
+    /// everything onto the contract.
+    const NEVER_SETTLES: u8 = 6;
 
     /// #5403 H1: the FIRST record for a violating contract must carry one finding
     /// per broken law, not one per violating case.
@@ -800,7 +794,7 @@ mod tests {
     /// this path.
     ///
     /// The input is a real probe of the deliberately-defective fixture contract in
-    /// mode 2 (MUTUAL_REJECTION), which breaks more than one merge law.
+    /// mode 6 (NEVER_SETTLES), which breaks two merge laws on most generated cases.
     /// `probe_one` pushes one `Finding` per violating case and `generate_cases`
     /// produces up to `MAX_CASES_PER_PROBE` (64) of them, so the tick that ARRIVES
     /// here legitimately repeats a property many times; deduplicating it is the
@@ -817,7 +811,7 @@ mod tests {
     async fn a_first_record_carries_one_finding_per_broken_law_not_per_case()
     -> Result<(), Box<dyn std::error::Error>> {
         let (id, report, findings) =
-            crate::conformance::shadow::probe_fixture_contract(MUTUAL_REJECTION).await?;
+            crate::conformance::shadow::probe_fixture_contract(NEVER_SETTLES).await?;
 
         // The input must genuinely repeat, or this test cannot distinguish a
         // deduplicating assembly from one that appends. Established from the probe's
@@ -903,7 +897,7 @@ mod tests {
     async fn re_recording_a_tick_does_not_change_what_the_page_shows()
     -> Result<(), Box<dyn std::error::Error>> {
         let (id, report, findings) =
-            crate::conformance::shadow::probe_fixture_contract(MUTUAL_REJECTION).await?;
+            crate::conformance::shadow::probe_fixture_contract(NEVER_SETTLES).await?;
 
         let mut status = MergeCheckStatus::default();
         status.record(

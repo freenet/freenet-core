@@ -53,7 +53,7 @@ pub const MAX_CANONICALIZATION_APPLIES: usize = 3;
 /// re-admitting a truncated message). 4 doubles that. Too small a bound can only
 /// cost coverage, never accuse anyone, because running out is inconclusive; too
 /// large a bound costs work, and only on a triple that has already failed the
-/// strict check: at most `5 * MAX_HEAL_PASSES` extra merges.
+/// strict check: at most `2 + 10 * MAX_HEAL_PASSES` extra merges.
 pub const MAX_HEAL_PASSES: usize = 4;
 
 /// One property plus the exact inputs to check it with.
@@ -517,6 +517,11 @@ fn run<O: ConformanceOracle + ?Sized>(
                      two peers that received the same updates grouped differently still \
                      disagree after reconciling"
                     .to_string(),
+                Heal::Redelivery => "merge(merge(A, B), C) differs from merge(A, merge(B, C)), \
+                     and the groupings never settle: while reconciling them, merging the \
+                     same state in a second time moved the result again, so under \
+                     at-least-once delivery the state keeps moving and peers never agree"
+                    .to_string(),
                 Heal::Cycle => "merge(merge(A, B), C) differs from merge(A, merge(B, C)), and \
                      the groupings never settle: re-merging them and the three inputs into \
                      the state they converge to revisits an earlier state without reaching \
@@ -824,6 +829,8 @@ enum Heal {
     NotConverged,
     /// A state repeated before any fixpoint was reached.
     Cycle,
+    /// Re-delivering an input the iterate had just absorbed moved it again.
+    Redelivery,
     /// The contract itself rejected a heal-step merge between valid states.
     Refused(String),
     /// [`MAX_HEAL_PASSES`] ran out with neither a fixpoint nor a repeat.
@@ -846,6 +853,11 @@ enum Heal {
 ///   is then `L` or `R` and absorbs both by construction. A pick-one merge whose
 ///   winner relation is cyclic (wrapping sequence numbers, rock-paper-scissors)
 ///   genuinely never converges and escaped every enforceable law that way.
+/// - **Cycle detection alone** misses a merge that keeps moving without ever
+///   repeating inside the budget, which on a domain wider than a byte is every
+///   averaging or "max + 1" merge. So each step that moves the iterate also
+///   re-delivers the same input, and requires `merge(merge(M, X), X) == merge(M, X)`.
+///   Any join satisfies it; averaging and climbing fail it at any width.
 /// - **Absorbing `A`, `B` and `C` without iterating** is too strict: a raised cap
 ///   can re-admit a message that was truncated, so a bounded log's `M` may need one
 ///   more merge before it is stable (2 of the bounded-log fixture's 36,252
@@ -856,8 +868,12 @@ enum Heal {
 /// - A repeated state is a [`Heal::Cycle`]: the merges are deterministic, so a
 ///   delivery schedule that re-delivers the same inputs in the same order walks the
 ///   same loop forever. That is a concrete non-converging history, not a guess.
-/// - Running out of passes is [`Heal::OutOfPasses`], never a violation: a slow
-///   climb is not proof of anything.
+/// - A re-delivery that moves the iterate is [`Heal::Redelivery`], a violation:
+///   under at-least-once delivery the state never stops moving.
+/// - Running out of passes is [`Heal::OutOfPasses`], never a violation. With the
+///   re-delivery check in front of it, what reaches it is a merge that absorbs every
+///   re-delivery yet keeps moving across different inputs without repeating, which
+///   is not proof of anything within a bounded budget.
 /// - A heal-step merge the CONTRACT rejects is [`Heal::Refused`], a violation. The
 ///   strict check has already failed on valid inputs and both groupings are valid,
 ///   so the contract is refusing to reconcile two states it emitted itself, which is
@@ -868,6 +884,9 @@ enum Heal {
 ///
 /// The visited set holds 32-byte digests rather than states, so a large state cannot
 /// make it expensive; it never holds more than `5 * MAX_HEAL_PASSES + 1` entries.
+/// Each moving step costs two merges, so the heal step is at most
+/// `2 + 10 * MAX_HEAL_PASSES` merges, spent only on a triple that already failed the
+/// strict check.
 fn associativity_heals<O: ConformanceOracle + ?Sized>(
     oracle: &mut O,
     left: &[u8],
@@ -895,6 +914,14 @@ fn associativity_heals<O: ConformanceOracle + ?Sized>(
                 Err(reason) => return Ok(Heal::Refused(reason)),
             };
             if next != converged {
+                // At-least-once delivery can hand the peer `other` again at once.
+                // A join absorbs it (`(m ⊔ x) ⊔ x == m ⊔ x`); a merge that moves
+                // again is not settling, whatever the domain size.
+                match heal_merge(oracle, &next, other)? {
+                    Ok(again) if again == next => {}
+                    Ok(_) => return Ok(Heal::Redelivery),
+                    Err(reason) => return Ok(Heal::Refused(reason)),
+                }
                 if !seen.insert(*blake3::hash(&next).as_bytes()) {
                     return Ok(Heal::Cycle);
                 }
@@ -1241,11 +1268,18 @@ fn apply_updates<O: ConformanceOracle + ?Sized>(
 fn inconclusive_from(err: OracleError) -> Inconclusive {
     match err.kind {
         OracleErrorKind::Resource => Inconclusive::ResourceLimit(err.message),
-        // A contract rejection and a host/WASM failure are both non-enforceable —
-        // neither is a merge-law proof, and treating a trap as a violation would
-        // mean removing a contract for a bug in the runtime executing it. That
-        // severity call is shared and stays shared. The LABEL is not: a trap in the
-        // host or the WASM module is not the contract's fault, and folding it into
+        // A contract rejection and a host/WASM failure are both non-enforceable
+        // HERE: by default neither is a merge-law proof, and treating a trap as a
+        // violation would mean removing a contract for a bug in the runtime
+        // executing it. The one exception is a caller that has already established
+        // a violation's premise and then needs a merge the contract refuses:
+        // `heal_merge` turns a `ContractError` (never a runtime or resource one)
+        // into a `StateAssociativity` finding, because by then the contract is
+        // refusing to reconcile two valid states it emitted itself (#5725). Every
+        // other caller still gets the inconclusive below.
+        //
+        // The two are also LABELLED apart: a trap in the host or the WASM module is
+        // not the contract's fault, and folding it into
         // `ContractError` names the wrong culprit and hides the one signal that
         // would tell us the harness itself has a bug (#5509).
         OracleErrorKind::Contract => Inconclusive::ContractError(err.message),

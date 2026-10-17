@@ -33,14 +33,13 @@
 //!                                that names it, and the pairwise ones stay silent.
 //!   6 NEVER_SETTLES            — merge rewrites the state on every apply, so
 //!                                merge(A, A) never reaches a fixpoint. Idempotence
-//!                                breaks, and strict associativity (inconclusive
-//!                                under the #5915 heal step); commutativity still
-//!                                HOLDS here, because the rewrite is applied to a
-//!                                union and a union is symmetric. Modelled on a live
-//!                                contract whose states were all a fixed 3488 bytes
-//!                                and whose content changed on every re-apply — that
-//!                                one broke commutativity too, for reasons this arm
-//!                                does not reproduce.
+//!                                and associativity break; commutativity still HOLDS
+//!                                here, because the rewrite is applied to a union and
+//!                                a union is symmetric. Modelled on a live contract
+//!                                whose states were all a fixed 3488 bytes and whose
+//!                                content changed on every re-apply — that one broke
+//!                                commutativity too, for reasons this arm does not
+//!                                reproduce.
 //!   7 REQUIRES_RELATED         — validate_state cannot decide without another
 //!                                contract's state and asks for it. The merge itself
 //!                                conforms. Proves the verifier declines rather than

@@ -30,9 +30,10 @@ pub enum ConformanceProperty {
     /// 2. `merge(R, L)` must equal `M = merge(L, R)`, or it is a violation: one
     ///    exchange does not even agree.
     /// 3. `M` is iterated by merging in `L`, `R`, `A`, `B` and `C` until a full pass
-    ///    changes nothing. A fixpoint heals. A state that repeats first is a cycle
-    ///    and a violation. Running out of `MAX_HEAL_PASSES` passes with neither is
-    ///    [`Inconclusive::RoundLimit`].
+    ///    changes nothing. A fixpoint heals. Each step that moves the iterate must
+    ///    also absorb a re-delivery of the same input, or it is a violation. A state
+    ///    that repeats is a cycle and a violation. Running out of `MAX_HEAL_PASSES`
+    ///    passes with none of these is [`Inconclusive::RoundLimit`].
     ///
     /// A heal-step merge the contract itself rejects is a violation: both sides are
     /// valid states it emitted, so it is refusing to reconcile its own output
@@ -62,18 +63,25 @@ pub enum ConformanceProperty {
     ///   then `L` or `R`. One whose winner relation is cyclic (wrapping sequence
     ///   numbers, rock-paper-scissors) never converges and escaped every enforceable
     ///   law that way: a probe saw 1916 strict failures and reported none.
+    /// - **Cycle detection alone** misses a merge that keeps moving without ever
+    ///   repeating inside the budget: on any domain wider than a byte, averaging and
+    ///   "max + 1" climbing came back inconclusive. So each step that moves the
+    ///   iterate re-delivers the same input and requires
+    ///   `merge(merge(M, X), X) == merge(M, X)`, which any join satisfies and those
+    ///   merges fail at any width. A failure is a violation.
     /// - **`M` absorbing all five without iterating** is too strict: a raised cap can
     ///   re-admit a truncated message, so a bounded log may need one more merge.
     ///
     /// # Measured
     ///
-    /// Over the bounded-log fixture's whole 80-state space, every one of 36,252
-    /// strictly failing triples heals, within 2 passes. The fixture shapes this law
-    /// reported before #5915 are reported again: averaging and the partially-ordered
-    /// cap on every strict failure, `CAPPED_SET` on 23,812 of 26,034 (6-element
-    /// universe; the rest settle). `NEVER_SETTLES` is inconclusive here, since it
-    /// rotates without repeating, and is reported under
-    /// [`ConformanceProperty::StateIdempotence`] instead.
+    /// On small, exhaustively enumerated state spaces (these numbers do not
+    /// generalize past them): the bounded-log fixture's 80 states heal on every one
+    /// of 36,252 strictly failing triples, within 2 passes, and so does its
+    /// keep-oldest variant (21,980). The fixture shapes this law reported before
+    /// #5915 are reported again: averaging (0..=20), the partially-ordered cap and
+    /// `NEVER_SETTLES` on every strict failure, `CAPPED_SET` on 23,812 of 26,034
+    /// (6-element universe; the rest settle). Averaging and climbing are reported at
+    /// 32 and 64 bits too, by the re-delivery check rather than by enumeration.
     StateAssociativity,
     /// Every state emitted by `update_state` is itself valid.
     EmittedStateValidity,

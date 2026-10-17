@@ -4966,22 +4966,20 @@ mod tests {
     /// could see a defect in the code that BUILDS one; three review rounds each
     /// found a defect on that path and no test failed.
     ///
-    /// The probe returns many findings across more than one property (asserted
-    /// below). When this was written against mode 6 (NEVER_SETTLES), it returned
-    /// thirteen findings across two, and before the fix the card rendered thirteen
-    /// rows, eleven of them byte-identical duplicates, which then persisted for the
-    /// record's whole residency in the window because later ticks deduplicate
-    /// AGAINST them. Mode 2 (MUTUAL_REJECTION) since #5915: mode 6's associativity
-    /// cases are now inconclusive, leaving it one broken law.
+    /// Mode 6 (NEVER_SETTLES) breaks two merge laws on most generated cases, and one
+    /// probe returns thirteen findings across those two. Before the fix the card
+    /// rendered thirteen rows, eleven of them byte-identical duplicates, which then
+    /// persisted for the record's whole residency in the window because later ticks
+    /// deduplicate AGAINST them.
     #[tokio::test(flavor = "multi_thread")]
     async fn merge_card_renders_one_row_per_broken_law_from_a_real_probe()
     -> Result<(), Box<dyn std::error::Error>> {
         // Keep in sync with the mode constants in
         // `tests/test-contract-conformance/src/lib.rs`.
-        const MUTUAL_REJECTION: u8 = 2;
+        const NEVER_SETTLES: u8 = 6;
 
         let (id, report, findings) =
-            crate::conformance::shadow::probe_fixture_contract(MUTUAL_REJECTION).await?;
+            crate::conformance::shadow::probe_fixture_contract(NEVER_SETTLES).await?;
         let distinct: std::collections::BTreeSet<&str> = findings
             .iter()
             .map(|f| f.violation.property.as_str())

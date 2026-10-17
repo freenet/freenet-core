@@ -1466,12 +1466,12 @@ fn store_period(dir: &Path, period: &PersistedPeriod) -> bool {
 /// what a probe emits.
 ///
 /// `mode` selects the fixture's defect — see `tests/test-contract-conformance`. Every
-/// caller today passes mode 2 (MUTUAL_REJECTION), which breaks more than one merge law
-/// and repeats each of them across the tick's cases: the input that distinguishes a
-/// deduplicating assembly both from one that appends and from one that collapses
-/// everything onto the contract. (Callers used mode 6, NEVER_SETTLES, until #5915 made
-/// its associativity cases inconclusive, leaving it one broken law. An earlier version of
-/// this doc named mode 1, LAST_WRITE_WINS, which nothing calls it with.)
+/// caller today passes mode 6 (NEVER_SETTLES), which breaks more than one merge law on
+/// most generated cases and repeats each of them across the tick's cases: the input
+/// that distinguishes a deduplicating assembly both from one that appends and from one
+/// that collapses everything onto the contract. (This doc named mode 1,
+/// LAST_WRITE_WINS, which nothing calls it with — a reader checking the fixture would
+/// have found a different defect than the tests actually exercise.)
 ///
 /// Returns the fixture's instance id alongside the probe's own two outputs, which are
 /// exactly the pair `capture::run_writer` hands to `status::publish` — and the report
