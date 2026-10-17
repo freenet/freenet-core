@@ -390,6 +390,10 @@ struct PeriodMember {
     activity: u32,
     seen: u64,
     admitted: u64,
+    /// Admitted since the most recent probe tick, and during the interval before it.
+    /// A member is kept only while the second is non-zero (#5914 review round 2, K1).
+    admitted_this_tick: u64,
+    admitted_last_tick: u64,
     refused: u64,
     judged: bool,
 }
@@ -401,6 +405,8 @@ impl PeriodMember {
             activity,
             seen: 0,
             admitted: 0,
+            admitted_this_tick: 0,
+            admitted_last_tick: 0,
             refused: 0,
             judged: false,
         }
@@ -469,13 +475,25 @@ impl FocusPeriod {
         }
     }
 
-    /// Current focus contracts that must not be displaced: the sampler has admitted
-    /// something new for them this stint, so moving them would abandon a sample
-    /// being built.
+    /// A probe tick: what each member admitted in the interval just ended becomes
+    /// the evidence [`accruing`](Self::accruing) keeps it on.
+    fn tick(&mut self) {
+        for member in self.current.values_mut() {
+            member.admitted_last_tick = std::mem::take(&mut member.admitted_this_tick);
+        }
+    }
+
+    /// Current focus contracts that must not be displaced: the sampler admitted
+    /// something new for them in the interval before the latest probe tick, so
+    /// moving them would abandon a sample being built.
+    ///
+    /// Only the latest interval counts (#5914 review round 2, K1). Keeping any
+    /// member that had EVER admitted a sample this stint let one early sample lock
+    /// the weighted slot for the rest of the period, against any burst elsewhere.
     fn accruing(&self) -> Vec<(ContractInstanceId, FocusSlot)> {
         self.current
             .iter()
-            .filter(|(_, member)| member.admitted > 0)
+            .filter(|(_, member)| member.admitted_last_tick > 0)
             .map(|(id, member)| (*id, member.slot))
             .collect()
     }
@@ -491,7 +509,10 @@ impl FocusPeriod {
             return;
         };
         match outcome {
-            RecordOutcome::Admitted => member.admitted = member.admitted.saturating_add(1),
+            RecordOutcome::Admitted => {
+                member.admitted = member.admitted.saturating_add(1);
+                member.admitted_this_tick = member.admitted_this_tick.saturating_add(1);
+            }
             RecordOutcome::Refused => member.refused = member.refused.saturating_add(1),
             RecordOutcome::NothingNew | RecordOutcome::OutOfScope => {}
         }
@@ -625,6 +646,7 @@ impl ShadowRunner {
             self.activity.decay();
             return Some(ended);
         }
+        self.period.tick();
         None
     }
 
@@ -1848,11 +1870,46 @@ mod tests {
         for _ in 1..ROTATE_EVERY_TICKS - 1 {
             assert!(runner.advance().is_none());
             let mut now = runner.focus(Some(hosted.clone()), &[]).selected;
+            // Still accruing: each keeps admitting something new every interval.
+            for contract in &now {
+                runner.note_merge(*contract, Some(fresh_state()));
+                runner.note_admission(contract, RecordOutcome::Admitted);
+            }
             let mut was = first.clone();
             now.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
             was.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
             assert_eq!(now, was, "a focus contract accruing samples was displaced");
         }
+    }
+
+    /// A focus contract is kept only while it keeps accruing: one that admitted a
+    /// sample early in the period and nothing since is eligible to be re-drawn at the
+    /// next tick (#5914 review round 2, K1). Under keep-if-ever-admitted, one early
+    /// sample locked the weighted slot for the rest of the period against any burst.
+    #[test]
+    fn a_focus_contract_that_stopped_accruing_is_not_kept() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut runner = runner_with_salt(dir.path(), [21; 32]);
+        let hosted: Vec<_> = (0..60u8).map(instance).collect();
+        runner.advance();
+        let first = runner.focus(Some(hosted.clone()), &[]).selected;
+        let weighted = first[1];
+        runner.note_merge(weighted, Some(fresh_state()));
+        runner.note_admission(&weighted, RecordOutcome::Admitted);
+
+        runner.advance();
+        assert!(
+            runner.period.accruing().iter().any(|(c, _)| *c == weighted),
+            "a contract that admitted a sample in the last interval was not kept"
+        );
+        runner.focus(Some(hosted.clone()), &[]);
+
+        // A whole interval with nothing new.
+        runner.advance();
+        assert!(
+            runner.period.accruing().iter().all(|(c, _)| *c != weighted),
+            "a contract that admitted nothing in the last interval is still locked in"
+        );
     }
 
     /// Activity on contracts the peer does not host can neither be selected nor
@@ -2131,11 +2188,12 @@ mod tests {
                 Some(FocusSlot::Uniform),
                 "salt {salt}: a stint that moved to the uniform slot kept its old label"
             );
-            // Both accrue; neither may be displaced.
+            // Both accrue through an interval; neither may be displaced at the tick.
             for contract in &second {
                 runner.note_merge(*contract, Some(fresh_state()));
                 runner.note_admission(contract, RecordOutcome::Admitted);
             }
+            runner.advance();
             let third = runner.focus(Some(without_uniform), &[]).selected;
             assert!(
                 second.iter().all(|c| third.contains(c)),
