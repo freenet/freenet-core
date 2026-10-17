@@ -371,15 +371,25 @@ fn non_idempotent_merge_is_caught() {
 
 /// Commutative and idempotent, but not associative: integer averaging.
 ///
-/// `avg(avg(1,3),5) = 3` while `avg(1,avg(3,5)) = 2`. Until #5915 this was the
-/// pin that associativity catches what the pairwise laws miss, and it asserted a
-/// violation. Under the heal guard it is NOT reported, and that is the decided
-/// behaviour rather than a gap the test papers over: one more exchange takes both
-/// peers to `avg(3,2) == avg(2,3) == 2`, so they agree. More generally, any merge
-/// that commutes on the two groupings heals by definition. Both halves are asserted:
-/// the strict failure, so the triple still exercises the guard, and the silence.
+/// Worth having as a distinct case because a detector that only checks pairs would
+/// call this contract clean. It is also the pin for the ABSORPTION half of the heal
+/// guard (#5915): the merge commutes, so the two groupings always converge on one
+/// exchange, `merge(L, R) == merge(R, L) == M`. What fails is that `M` does not
+/// absorb both groupings, so a peer that merges either one back in moves off `M`
+/// and the network keeps churning.
+///
+/// Two triples, one per absorption clause, so deleting either clause turns one of
+/// them green:
+///
+/// - `(0, 0, 8)`: `L = 4`, `R = 2`, `M = 3`. `M` absorbs `L` (`avg(3, 4) = 3`)
+///   but not `R` (`avg(3, 2) = 2`).
+/// - `(8, 0, 0)`: `L = 2`, `R = 4`, `M = 3`. `M` absorbs `R` but not `L`.
+///
+/// And one triple that is NOT reported, because it heals: `(1, 3, 5)` gives `L = 3`,
+/// `R = 2`, `M = 2`, and `M` absorbs both. Groupings one apart heal; two or more
+/// apart do not. This was the triple the test used before #5915.
 #[test]
-fn a_commutative_non_associative_merge_heals_and_is_not_reported() {
+fn associativity_only_defect_needs_the_triple_check() {
     fn avg(a: &[u8], b: &[u8]) -> Vec<u8> {
         let (x, y) = (
             a.first().copied().unwrap_or(0),
@@ -410,13 +420,39 @@ fn a_commutative_non_associative_merge_heals_and_is_not_reported() {
         &case(ConformanceProperty::StateIdempotence, &[&[1]]),
     ));
 
-    let (left, right) = (avg(&avg(&[1], &[3]), &[5]), avg(&[1], &avg(&[3], &[5])));
-    assert_ne!(left, right, "the triple must fail strict associativity");
-    assert_eq!(avg(&left, &right), avg(&right, &left), "and must heal");
+    // (triple, M absorbs L, M absorbs R). Each fact is asserted from the merge
+    // itself, so the triples cannot drift away from the clause they pin.
+    for (triple, absorbs_left, absorbs_right) in [
+        ([[0u8], [0], [8]], true, false),
+        ([[8u8], [0], [0]], false, true),
+    ] {
+        let [a, b, c] = triple;
+        let (left, right) = (avg(&avg(&a, &b), &c), avg(&a, &avg(&b, &c)));
+        let m = avg(&left, &right);
+        assert_ne!(left, right, "{triple:?} must fail strict associativity");
+        assert_eq!(m, avg(&right, &left), "{triple:?}: the groupings converge");
+        assert_eq!(avg(&m, &left) == m, absorbs_left, "{triple:?}: M vs L");
+        assert_eq!(avg(&m, &right) == m, absorbs_right, "{triple:?}: M vs R");
 
-    let mut fake = build();
+        assert_violates(
+            verify_case(
+                &mut build(),
+                &case(ConformanceProperty::StateAssociativity, &[&a, &b, &c]),
+            ),
+            ConformanceProperty::StateAssociativity,
+        );
+    }
+
+    let (left, right) = (avg(&avg(&[1], &[3]), &[5]), avg(&[1], &avg(&[3], &[5])));
+    let m = avg(&left, &right);
+    assert_ne!(left, right, "(1, 3, 5) must fail strict associativity");
+    assert_eq!(
+        (avg(&m, &left), avg(&m, &right)),
+        (m.clone(), m),
+        "(1, 3, 5) must heal"
+    );
     assert_holds(verify_case(
-        &mut fake,
+        &mut build(),
         &case(ConformanceProperty::StateAssociativity, &[&[1], &[3], &[5]]),
     ));
 }
@@ -505,11 +541,17 @@ fn a_bounded_retention_triple_that_heals_is_not_reported() {
             left, right,
             "{shape}: the triple must fail strict associativity, or this tests nothing"
         );
+        let m = bounded_log(&left, &right);
         assert_eq!(
-            bounded_log(&left, &right),
+            m,
             bounded_log(&right, &left),
             "{shape}: the two groupings must converge on one more exchange, or this \
              is not the healing shape #5915 describes"
+        );
+        assert_eq!(
+            (bounded_log(&m, &left), bounded_log(&m, &right)),
+            (m.clone(), m.clone()),
+            "{shape}: the converged state must absorb both groupings"
         );
 
         // The pairwise laws hold, so the triple is the only place this could fire.
