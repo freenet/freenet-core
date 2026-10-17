@@ -1378,6 +1378,10 @@ pub(crate) enum RecordOutcome {
     NothingNew,
     /// In scope, and refused: too large, over budget, or no tracking slot.
     Refused,
+    /// The sampler retained new content (a base or result state) AND refused the
+    /// transition itself, e.g. for a delta over the per-state ceiling. Counts as
+    /// both admitted and refused.
+    AdmittedPartly,
 }
 
 /// [`record`], also reporting what the sampler did with the observation.
@@ -1486,7 +1490,7 @@ pub(crate) fn record_with_outcome(
         max_related_total,
     );
 
-    let admission = tracked.sampler.observe_transition(
+    let (admission, retained) = tracked.sampler.observe_transition_retaining(
         &observation.base_state,
         observation.incoming_state.as_deref(),
         observation.delta.as_deref(),
@@ -1496,7 +1500,7 @@ pub(crate) fn record_with_outcome(
     if matches!(admission, Admission::TooLarge) {
         tracked.refused_too_large += 1;
     }
-    (evicted, outcome_of(admission))
+    (evicted, outcome_of(admission, retained))
 }
 
 /// One transition's whole path through the capture task (#5914 review round 2, K5).
@@ -1525,11 +1529,16 @@ pub(crate) fn observe_transition(
 
 /// How a sampler admission maps onto the focus period's counts. Exhaustive, so a new
 /// `Admission` variant has to be classified here.
-fn outcome_of(admission: Admission) -> RecordOutcome {
-    match admission {
-        Admission::Stored => RecordOutcome::Admitted,
-        Admission::Duplicate | Admission::NotSelected => RecordOutcome::NothingNew,
-        Admission::TooLarge | Admission::NoBudget => RecordOutcome::Refused,
+///
+/// `retained` is whether the sampler kept anything new from the merge, which can be
+/// true even when the transition itself was refused (#5914 review round 3, A3).
+fn outcome_of(admission: Admission, retained: bool) -> RecordOutcome {
+    match (admission, retained) {
+        (Admission::Stored, _) => RecordOutcome::Admitted,
+        (Admission::Duplicate | Admission::NotSelected, true) => RecordOutcome::Admitted,
+        (Admission::Duplicate | Admission::NotSelected, false) => RecordOutcome::NothingNew,
+        (Admission::TooLarge | Admission::NoBudget, true) => RecordOutcome::AdmittedPartly,
+        (Admission::TooLarge | Admission::NoBudget, false) => RecordOutcome::Refused,
     }
 }
 
@@ -3066,14 +3075,15 @@ mod tests {
     /// the mapping is tested directly (#5914 review round 2, K6).
     #[test]
     fn every_admission_maps_to_its_outcome() {
-        assert_eq!(outcome_of(Admission::Stored), RecordOutcome::Admitted);
-        assert_eq!(outcome_of(Admission::Duplicate), RecordOutcome::NothingNew);
-        assert_eq!(
-            outcome_of(Admission::NotSelected),
-            RecordOutcome::NothingNew
-        );
-        assert_eq!(outcome_of(Admission::TooLarge), RecordOutcome::Refused);
-        assert_eq!(outcome_of(Admission::NoBudget), RecordOutcome::Refused);
+        use Admission::*;
+        assert_eq!(outcome_of(Stored, true), RecordOutcome::Admitted);
+        assert_eq!(outcome_of(Duplicate, false), RecordOutcome::NothingNew);
+        assert_eq!(outcome_of(NotSelected, false), RecordOutcome::NothingNew);
+        assert_eq!(outcome_of(NotSelected, true), RecordOutcome::Admitted);
+        assert_eq!(outcome_of(TooLarge, false), RecordOutcome::Refused);
+        assert_eq!(outcome_of(NoBudget, false), RecordOutcome::Refused);
+        assert_eq!(outcome_of(TooLarge, true), RecordOutcome::AdmittedPartly);
+        assert_eq!(outcome_of(NoBudget, true), RecordOutcome::AdmittedPartly);
     }
 
     /// No tracking slot for a focused contract (every tracked contract is in focus)
@@ -3186,6 +3196,24 @@ mod tests {
             1024,
         );
         assert_eq!(shadow.activity_tracked(), 0);
+    }
+
+    /// A merge whose states are new but whose transition is refused (delta over the
+    /// per-state ceiling) still gave the sampler new samples, so it counts as
+    /// admitted as well as refused (#5914 review round 3, A3).
+    #[test]
+    fn a_partly_admitted_merge_counts_as_admitted_and_refused() {
+        let mut samplers = HashMap::new();
+        let scope = focused_on(&[1]);
+        let mut observation = observation_for(instance(1));
+        observation.delta = Some(vec![0; SamplerConfig::default().max_state_bytes + 1]);
+        let (_, outcome) = record_with_outcome(&mut samplers, &scope, observation);
+        assert_eq!(outcome, RecordOutcome::AdmittedPartly);
+        let tracked = samplers.get(&instance(1)).expect("tracked");
+        assert!(
+            tracked.sampler.distinct_states() > 0,
+            "precondition: states were kept"
+        );
     }
 
     fn focused_on(ids: &[u8]) -> SamplingScope {

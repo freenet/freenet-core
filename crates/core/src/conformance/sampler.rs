@@ -262,6 +262,26 @@ impl ContractSampler {
         summary: Option<&[u8]>,
         result: &[u8],
     ) -> Admission {
+        self.observe_transition_retaining(base, incoming_state, delta, summary, result)
+            .0
+    }
+
+    /// [`observe_transition`](Self::observe_transition), also saying whether anything
+    /// new was retained.
+    ///
+    /// The two can disagree: the base or result state can be stored as a new sample
+    /// and the transition itself then refused (its delta too large, say). The
+    /// returned `Admission` describes the transition; the flag says whether the
+    /// corpus gained anything, which is what a caller counting "new samples" needs
+    /// (#5914 review round 3, A3).
+    pub fn observe_transition_retaining(
+        &mut self,
+        base: &[u8],
+        incoming_state: Option<&[u8]>,
+        delta: Option<&[u8]>,
+        summary: Option<&[u8]>,
+        result: &[u8],
+    ) -> (Admission, bool) {
         let base_admission = self.observe_state(base);
         let result_admission = self.observe_state(result);
         let incoming_admission = incoming_state.map(|incoming| self.observe_state(incoming));
@@ -274,6 +294,14 @@ impl ContractSampler {
         // bundle claimed a transition while omitting the full-state update that
         // caused it, and anyone replaying it would be reasoning about a step that
         // never happened as described.
+        let retained_state = [
+            Some(base_admission),
+            Some(result_admission),
+            incoming_admission,
+        ]
+        .into_iter()
+        .flatten()
+        .any(|a| matches!(a, Admission::Stored));
         let kept = |a: Admission| matches!(a, Admission::Stored | Admission::Duplicate);
         if !kept(base_admission)
             || !kept(result_admission)
@@ -294,9 +322,9 @@ impl ContractSampler {
             .flatten()
             .any(|a| matches!(a, Admission::TooLarge))
             {
-                return Admission::TooLarge;
+                return (Admission::TooLarge, retained_state);
             }
-            return Admission::NotSelected;
+            return (Admission::NotSelected, retained_state);
         }
 
         // Deltas and summaries are contract-controlled and stored inline, so they
@@ -304,7 +332,7 @@ impl ContractSampler {
         // must not be able to buy unbounded retention with it.
         let payload_bytes = delta.map_or(0, <[u8]>::len) + summary.map_or(0, <[u8]>::len);
         if payload_bytes > self.config.max_state_bytes {
-            return Admission::TooLarge;
+            return (Admission::TooLarge, retained_state);
         }
 
         let record = TransitionRecord {
@@ -315,7 +343,7 @@ impl ContractSampler {
             summary: summary.map(<[u8]>::to_vec),
         };
         if self.transitions.contains(&record) {
-            return Admission::Duplicate;
+            return (Admission::Duplicate, retained_state);
         }
         self.transitions.push_back(record);
         while self.transitions.len() > self.config.transitions {
@@ -329,7 +357,7 @@ impl ContractSampler {
             }
         }
         self.collect_garbage();
-        Admission::Stored
+        (Admission::Stored, true)
     }
 
     /// Flatten into material the generator can build cases from.

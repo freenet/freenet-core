@@ -521,6 +521,11 @@ impl FocusPeriod {
                 member.admitted_this_tick = member.admitted_this_tick.saturating_add(1);
             }
             RecordOutcome::Refused => member.refused = member.refused.saturating_add(1),
+            RecordOutcome::AdmittedPartly => {
+                member.admitted = member.admitted.saturating_add(1);
+                member.admitted_this_tick = member.admitted_this_tick.saturating_add(1);
+                member.refused = member.refused.saturating_add(1);
+            }
             RecordOutcome::NothingNew | RecordOutcome::OutOfScope => {}
         }
     }
