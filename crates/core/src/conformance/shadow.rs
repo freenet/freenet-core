@@ -347,6 +347,10 @@ pub(crate) struct FocusPeriodSummary {
     /// #5914 review round 2, K7). False for the first period on a fresh capture
     /// directory, or after the persisted period could not be read. It does not mean
     /// the peer was up throughout: merges during downtime were never observed.
+    /// Counts are checkpointed at every tick, every draw, every verdict and the
+    /// capture writer's 60 s flush, so a crash can lose at most the last minute of
+    /// merge and admission counts from a period that still reads `complete`
+    /// (#5914 review round 3, A1); verdicts are never lost that way.
     /// Exclude incomplete periods when measuring.
     pub complete: bool,
     /// Size of the candidate pool at the period's last selection.
@@ -518,9 +522,14 @@ impl FocusPeriod {
             .collect()
     }
 
-    fn seen(&mut self, contract: &ContractInstanceId) {
-        if let Some(member) = self.current.get_mut(contract) {
-            member.seen = member.seen.saturating_add(1);
+    /// Count a merge for a focus member; whether it was one.
+    fn seen(&mut self, contract: &ContractInstanceId) -> bool {
+        match self.current.get_mut(contract) {
+            Some(member) => {
+                member.seen = member.seen.saturating_add(1);
+                true
+            }
+            None => false,
         }
     }
 
@@ -604,6 +613,9 @@ pub struct ShadowRunner {
     /// hosted source registers after the capture task starts) keeps the restored
     /// focus instead of replacing it with sampler keys.
     resumed: bool,
+    /// The period changed since it was last persisted (merges or admissions on a
+    /// focus member). Cleared by every write; see [`flush_period`](Self::flush_period).
+    period_dirty: bool,
 }
 
 impl ShadowRunner {
@@ -640,11 +652,13 @@ impl ShadowRunner {
             period,
             period_complete,
             resumed,
+            period_dirty: false,
         }
     }
 
     /// Write the current period beside the epoch (best-effort).
-    fn persist_period(&self) {
+    fn persist_period(&mut self) {
+        self.period_dirty = false;
         let mut members: Vec<(ContractInstanceId, PeriodMember)> = self
             .period
             .current
@@ -735,18 +749,41 @@ impl ShadowRunner {
         if let Some(digest) = activity {
             self.activity.record(contract, digest);
         }
-        self.period.seen(&contract);
+        if self.period.seen(&contract) {
+            self.period_dirty = true;
+        }
     }
 
     /// Record what the sampler did with a merge, for the focus period's counts.
     pub(crate) fn note_admission(&mut self, contract: &ContractInstanceId, outcome: RecordOutcome) {
-        self.period.admission(contract, outcome);
+        if self.period.current.contains_key(contract) {
+            self.period.admission(contract, outcome);
+            self.period_dirty = true;
+        }
     }
 
     /// Record which focus contracts a completed probe reached a verdict on.
     pub(crate) fn note_judged(&mut self, judged: &[JudgedContract]) {
         for contract in judged {
             self.period.judged(&contract.contract);
+        }
+        // Verdicts are what the acceptance measure counts, and arrive about once
+        // per tick, so they are persisted at once rather than at the next flush.
+        if !judged.is_empty() {
+            self.persist_period();
+        }
+    }
+
+    /// Persist the period if merges or admissions changed it since the last write.
+    ///
+    /// Called from the capture writer's periodic flush (`FLUSH_EVERY`, 60 s), so
+    /// merge and admission counts are written at most once a minute instead of on
+    /// every observation (#5914 review round 3, A1). A crash loses at most that
+    /// interval's counts, which is the tolerance `FocusPeriodSummary::complete`
+    /// states.
+    pub(crate) fn flush_period(&mut self) {
+        if self.period_dirty {
+            self.persist_period();
         }
     }
 
@@ -2548,6 +2585,46 @@ mod tests {
             ),
             (3, 2, 1, 2),
             "the restart lost the period's counts"
+        );
+    }
+
+    /// A verdict survives a restart straight away, and merge/admission counts do
+    /// once the writer's periodic flush has run (#5914 review round 3, A1). Before,
+    /// both were only written at the next tick or draw, so a restart lost them while
+    /// the restored period still claimed `complete`.
+    #[test]
+    fn verdicts_and_flushed_counts_survive_a_restart() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let hosted: Vec<_> = (0..20u8).map(instance).collect();
+        let mut first = runner_with_salt(dir.path(), [9; 32]);
+        end_period(&mut first);
+        let focus = first.focus(Some(hosted.clone()), &[]).selected;
+        first.advance();
+        feed(
+            &mut first,
+            focus[0],
+            &[RecordOutcome::Admitted, RecordOutcome::Refused],
+        );
+        first.flush_period();
+        first.note_judged(&[JudgedContract {
+            contract: focus[0],
+            verdicts: 1,
+            inconclusive: 0,
+        }]);
+        drop(first);
+
+        let mut resumed = ShadowRunner::new(dir.path(), EnforcementMode::Shadow);
+        let ended = end_period(&mut resumed);
+        assert!(ended.complete);
+        assert_eq!(
+            (
+                ended.merges_seen,
+                ended.samples_admitted,
+                ended.samples_refused,
+                ended.judged
+            ),
+            (2, 1, 1, 1),
+            "counts written since the last tick were lost on restart"
         );
     }
 

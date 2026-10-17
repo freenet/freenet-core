@@ -792,6 +792,8 @@ async fn run_writer(
                 )
                 .await;
                 since_flush = 0;
+                // The focus period's merge/admission counts, at most once a minute.
+                shadow.flush_period();
             }
             // Only start a probe when none is in flight. A probe that overran its
             // interval must not have a second one stacked on top of it: that is how a
@@ -2550,6 +2552,27 @@ mod probe_wiring_pins {
                 "a shadow tick line does not report `{pair}`"
             );
         }
+    }
+
+    /// The periodic flush also checkpoints the focus period, or merge and admission
+    /// counts since the last tick are lost on a restart while the period still
+    /// claims to be complete (#5914 review round 3, A1).
+    #[test]
+    fn the_periodic_flush_checkpoints_the_focus_period() {
+        let body = run_writer_code_only();
+        let arm = body
+            .find("_ = flush.tick() =>")
+            .expect("the flush arm moved; re-anchor");
+        let flushed = statement_at(&body, "shadow.flush_period();")
+            .expect("run_writer never flushes the period");
+        let next_arm = body[arm..]
+            .find("_ = probe.tick()")
+            .map(|offset| arm + offset)
+            .expect("the probe arm moved; re-anchor");
+        assert!(
+            arm < flushed && flushed < next_arm,
+            "the period flush is not inside the periodic flush arm"
+        );
     }
 
     #[test]
