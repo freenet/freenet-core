@@ -659,6 +659,17 @@ mod tests {
         assert_eq!(counted, 3);
     }
 
+    /// A four-state cycle still counts each state once: the ring is four wide.
+    #[test]
+    fn a_four_state_cycle_counts_each_state_once() {
+        let mut activity = MergeActivity::default();
+        let states = [fresh(), fresh(), fresh(), fresh()];
+        let counted: usize = (0..40)
+            .map(|i| usize::from(activity.record(id(1), states[i % 4])))
+            .sum();
+        assert_eq!(counted, 4);
+    }
+
     /// A five-state cycle outruns the four-entry ring and keeps counting, which is
     /// the documented window, not a bug.
     #[test]
