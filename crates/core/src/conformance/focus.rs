@@ -54,19 +54,25 @@ use serde::{Deserialize, Serialize};
 /// each doing a little, not from any peer doing a lot. Operational tunable.
 pub const DEFAULT_MAX_FOCUS_CONTRACTS: usize = 2;
 
-/// Selection weight of a contract with no recent merges.
+/// Weighted-slot weight of a contract with no recent merges.
 ///
-/// Non-zero so cold contracts keep a chance; see the module docs.
-pub const COLD_FOCUS_WEIGHT: f64 = 1.0;
+/// A tenth of a contract with one merge (#5914 review round 2, K3). Exploring cold
+/// contracts is the uniform slot's job; at weight 1 the weighted slot spent most of
+/// its draws on cold contracts whenever a few busy ones sat among a hundred quiet
+/// ones. Non-zero so the draw stays well defined and a hosted set with no activity
+/// at all still fills the slot (uniformly).
+pub const COLD_FOCUS_WEIGHT: f64 = 0.1;
 
 /// Recent merges beyond this count add no further weight.
 ///
-/// So the busiest contract is at most `1 + 63 = 64` times as likely to be drawn first
-/// as a cold one. Large enough that a handful of active contracts dominate a hosted
-/// set of a hundred cold ones (the #5913 shape); small enough that activity cannot
-/// make any single contract a near-certain pick on every peer hosting it. Since
-/// counts halve once per focus period, a contract settles at the cap from about 32
-/// merges per period. Operational tunable.
+/// The busiest contract is then at most about 57 times as likely to win the weighted
+/// slot as a contract with one merge (`63.1 / 1.1`), and about 630 times a cold one.
+/// What the cap bounds is the advantage of flooding: past it, more updates buy
+/// nothing, so a pumped decoy competes with an active target as an equal. It does not
+/// stop one capped contract among many quiet ones from winning the weighted slot most
+/// of the time on the peers hosting it; the uniform slot is unaffected either way.
+/// Counts halve once per focus period, so a contract settles at the cap from about
+/// 32 merges per period. Operational tunable.
 pub const ACTIVITY_WEIGHT_CAP: u32 = 63;
 
 /// The selection weight for a contract with `activity` recent merges.
@@ -525,7 +531,7 @@ mod tests {
             for _ in 0..16 {
                 trials += 1;
                 if selector
-                    .select_weighted(&pool, |c| if *c == cold { 0 } else { 1_000 })
+                    .select_weighted(&pool, |c| if *c == cold { 0 } else { 10 })
                     .contains(&cold)
                 {
                     picked_cold += 1;
@@ -795,8 +801,11 @@ mod tests {
                         .map(|(c, _)| c)
                         .collect()
                 });
-                let w = focus_weight(count);
-                let expected = b / n + (n - b) / n * (b * w / (b * w + (n - 1.0 - b)));
+                // Literal weights, not `focus_weight`, so a change to the production
+                // weights cannot move the expectation with it (S5): a cold contract
+                // weighs 0.1 in the weighted slot, a busy one 0.1 + count.
+                let (cold_w, w) = (0.1, 0.1 + f64::from(count));
+                let expected = b / n + (n - b) / n * (b * w / (b * w + cold_w * (n - 1.0 - b)));
                 println!(
                     "busy={busy_count:>2}/{HOSTED} merges={count:>2}: split={split:.3} \
                      expected={expected:.3} uniform_pair={uniform_pair:.3} ({trials} draws)"
@@ -811,6 +820,13 @@ mod tests {
                     "busy={busy_count} merges={count}: the split ({split:.3}) does worse \
                      than the uniform pair it replaced ({uniform_pair:.3})"
                 );
+                if count == 10 {
+                    assert!(
+                        split - uniform_pair > 0.3,
+                        "busy={busy_count} at 10 merges: the split ({split:.3}) gains less \
+                         than 0.3 over the uniform pair ({uniform_pair:.3})"
+                    );
+                }
             }
         }
     }
@@ -860,16 +876,35 @@ mod tests {
             let mut selector = FocusSelector::new([salt; 32], 1);
             for _ in 0..16 {
                 trials += 1;
-                // Weight 1 + 3 = 4 against weight 1.
-                let picked = selector.select_weighted(&pool, |c| u32::from(*c == warm) * 3);
+                // Activity 4 against activity 1: weight 4.1 against 1.1.
+                let picked = selector.select_weighted(&pool, |c| if *c == warm { 4 } else { 1 });
                 warm_first += usize::from(picked == [warm]);
                 selector.rotate();
             }
         }
         let rate = warm_first as f64 / trials as f64;
+        let expected = 4.1 / (4.1 + 1.1);
         assert!(
-            (rate - 0.8).abs() < 0.04,
-            "weight 4 against 1 won {rate:.3} of {trials} draws; expected about 0.8"
+            (rate - expected).abs() < 0.04,
+            "weight 4.1 against 1.1 won {rate:.3} of {trials} draws; expected {expected:.3}"
+        );
+    }
+
+    /// In the weighted slot a cold contract weighs a tenth of a contract with one
+    /// merge (#5914 review round 2, K3). Exploration of cold contracts is the uniform
+    /// slot's job now, so at weight 1 the weighted slot spent most of its draws on
+    /// cold contracts whenever a few busy ones sat among a hundred quiet ones.
+    #[test]
+    fn a_cold_contract_weighs_a_tenth_of_one_merge_in_the_weighted_slot() {
+        assert!(
+            (focus_weight(0) - 0.1).abs() < 1e-12,
+            "cold weight {}",
+            focus_weight(0)
+        );
+        assert!((focus_weight(1) - 1.1).abs() < 1e-12);
+        assert!(
+            (focus_weight(ACTIVITY_WEIGHT_CAP) - (0.1 + f64::from(ACTIVITY_WEIGHT_CAP))).abs()
+                < 1e-12
         );
     }
 }
