@@ -89,6 +89,9 @@ struct Entry {
     count: u32,
     /// A counted merge since the last decay. Decides whether a count of one survives.
     merged_this_period: bool,
+    /// Any merge offered since the last decay, counted or deduplicated. Keeps the
+    /// digest ring alive for a contract that is still re-offering recent states.
+    touched_this_period: bool,
     recent: [StateDigest; RECENT_STATES],
     filled: u8,
     next: u8,
@@ -101,6 +104,7 @@ impl Entry {
         Self {
             count: 1,
             merged_this_period: true,
+            touched_this_period: true,
             recent,
             filled: 1,
             next: 1 % RECENT_STATES as u8,
@@ -163,6 +167,7 @@ impl MergeActivity {
     /// counted.
     pub(crate) fn record(&mut self, contract: ContractInstanceId, digest: StateDigest) -> bool {
         if let Some(entry) = self.counts.get_mut(&contract) {
+            entry.touched_this_period = true;
             if !entry.remember(digest) {
                 return false;
             }
@@ -178,7 +183,9 @@ impl MergeActivity {
     }
 
     /// Halve every count, rounding up, and forget a contract once it has gone a whole
-    /// period without a counted merge and is down to one.
+    /// period without a counted merge and is down to one, unless it is still being
+    /// offered (deduplicated) recent states, in which case it is kept at zero so its
+    /// digest ring survives (#5914 review round 3, A5).
     ///
     /// Called once per focus period, so the count is an exponentially-decayed merge
     /// total with a half-life of one period: a contract merging steadily at `r` per
@@ -189,7 +196,17 @@ impl MergeActivity {
     pub(crate) fn decay(&mut self) {
         self.counts.retain(|_, entry| {
             let merged = std::mem::replace(&mut entry.merged_this_period, false);
+            let touched = std::mem::replace(&mut entry.touched_this_period, false);
             if !merged && entry.count <= 1 {
+                if touched {
+                    // Still re-offering states it produced recently (a toggler):
+                    // keep the entry, and so its digest ring, at zero weight.
+                    // Forgetting it let the same states count again two periods
+                    // later, forever. Bounded like every entry: the slot goes to
+                    // eviction first, since a zero count is the least active.
+                    entry.count = 0;
+                    return true;
+                }
                 return false;
             }
             entry.count = entry.count.div_ceil(2);
@@ -539,5 +556,90 @@ mod tests {
             activity.record(id(1), states[0]),
             "a state older than the window was still deduplicated"
         );
+    }
+
+    /// A toggler does not regain weight when its count decays away (#5914 review
+    /// round 3, A5). Forgetting the entry also forgot its digest ring, so the same two
+    /// states counted again two periods later, forever.
+    #[test]
+    fn a_toggler_does_not_regain_weight_after_decay() {
+        let mut activity = MergeActivity::default();
+        let (a, b) = (fresh(), fresh());
+        for period in 0..10 {
+            for _ in 0..4 {
+                activity.record(id(1), a);
+                activity.record(id(1), b);
+            }
+            if period >= 2 {
+                assert_eq!(
+                    activity.count(&id(1)),
+                    0,
+                    "period {period}: a contract toggling between two known states \
+                     regained weight"
+                );
+            }
+            activity.decay();
+        }
+    }
+
+    /// A retained zero-count entry that produces a genuinely new state counts again
+    /// and survives the next decay.
+    #[test]
+    fn a_kept_zero_entry_counts_a_genuinely_new_state() {
+        let mut activity = MergeActivity::default();
+        let (a, b) = (fresh(), fresh());
+        for _ in 0..3 {
+            activity.record(id(1), a);
+            activity.record(id(1), b);
+            activity.decay();
+        }
+        assert!(
+            activity.record(id(1), fresh()),
+            "a new state was not counted"
+        );
+        activity.decay();
+        assert_eq!(
+            activity.count(&id(1)),
+            1,
+            "a counted merge did not survive decay"
+        );
+    }
+
+    /// A quiet contract down to two halves to one rather than being forgotten.
+    #[test]
+    fn a_quiet_count_of_two_halves_rather_than_vanishing() {
+        let mut activity = MergeActivity::default();
+        activity.record(id(1), fresh());
+        activity.record(id(1), fresh());
+        activity.decay(); // merged: 2 -> 1
+        activity.record(id(1), fresh());
+        activity.record(id(1), fresh());
+        activity.record(id(1), fresh()); // 4
+        activity.decay(); // merged: 4 -> 2
+        activity.decay(); // quiet, 2 -> 1
+        assert_eq!(activity.count(&id(1)), 1);
+    }
+
+    /// The digest keeps its full width: a thousand distinct states all count.
+    #[test]
+    fn distinct_states_never_collide_in_the_ring() {
+        let mut activity = MergeActivity::default();
+        let mut counted = 0;
+        for n in 0..1_000u32 {
+            let observation = crate::conformance::capture::Observation {
+                contract: id(1),
+                code_hash: [0; 32],
+                parameters: vec![],
+                base_state: vec![0],
+                incoming_state: None,
+                delta: Some(vec![1]),
+                result_state: n.to_le_bytes().to_vec(),
+                related: vec![],
+            };
+            let digest =
+                crate::conformance::capture::activity_digest(&observation, 1024).expect("counts");
+            counted += usize::from(activity.record(id(1), digest));
+        }
+        assert_eq!(counted, 1_000);
     }
 }
