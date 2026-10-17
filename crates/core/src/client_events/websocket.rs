@@ -5133,4 +5133,46 @@ mod tests {
             "the node must be told the client disconnected"
         );
     }
+
+    /// The same for a client that vanishes WITHOUT a close frame, as when its
+    /// process is killed: the socket is simply dropped. The delegate app
+    /// registry relies on this to prune registrations whose connection ended
+    /// without a clean disconnect (see `delegate_app_registry`'s module docs).
+    #[tokio::test]
+    async fn client_vanishing_without_close_frame_drops_listeners() {
+        let mut h = start_ws_harness().await;
+        let sub = h.subscribe("contract-vanish");
+        // Prove the listener is live in the connection's map first.
+        sub.send(tagged_notification("before-vanish"))
+            .await
+            .unwrap();
+        assert!(h.next_notification().await.contains("before-vanish"));
+        let WsHarness {
+            client,
+            // Held, so the node side of the connection stays open and only the
+            // client's departure can end the task.
+            callbacks: _callbacks,
+            mut forwarded,
+            ..
+        } = h;
+        drop(client);
+
+        tokio::time::timeout(WS_STEP, sub.closed())
+            .await
+            .expect("listener receiver not dropped after the client vanished");
+        let disconnect_seen = tokio::time::timeout(WS_STEP, async {
+            while let Some(req) = forwarded.recv().await {
+                if matches!(req, ClientRequest::Disconnect { .. }) {
+                    return true;
+                }
+            }
+            false
+        })
+        .await
+        .expect("timed out waiting for the Disconnect");
+        assert!(
+            disconnect_seen,
+            "the node must be told the client went away"
+        );
+    }
 }

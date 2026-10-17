@@ -4465,17 +4465,17 @@ async fn handle_delegate_notification<CH, P>(
     // reaps registrations whose connection ended without a clean disconnect,
     // for every delegate rather than only the one being notified. #5263 placed
     // it before its execution-failure return, reasoning that a delegate which
-    // fails on EVERY invocation must not disable the only GC. That reasoning
+    // fails on EVERY invocation must not disable the only sweep. That reasoning
     // is right and #5544 adds two more ways to leave this function that its
     // author could not have known about: the delegate is already parked and
     // this notification is queued, or this run itself parks. Both returned
     // without sweeping.
     //
-    // A parked delegate recovers — every park terminates, and the resumed run
-    // sweeps — so the effect was a DELAY of about one park lifetime rather
-    // than #5263's unbounded loss. But that bound depends on the park
-    // machinery working, and a backstop must not be conditional on the thing
-    // it backs up. Hoisting to the top makes "on every exit" true by position
+    // The effect was a DELAY until the next notification that took a sweeping
+    // exit, rather than #5263's unbounded loss: every park terminates, but the
+    // resumed run does not sweep (see below). That bound depends on the park
+    // machinery working and on further notifications arriving, and a backstop
+    // must not be conditional on the thing it backs up. Hoisting to the top makes "on every exit" true by position
     // rather than by argument, which is also the only form a reader can check
     // at a glance.
     //
@@ -8026,7 +8026,7 @@ mod tests {
         assert!(
             sweep < first_exit,
             "the registry sweep must precede EVERY exit from the notification path, \
-             not just the execution-failure one. It is the registry's only GC \
+             not just the execution-failure one. It is the registry's only sweep \
              and must not be conditional on how this invocation happens to \
              leave — #5263's case was a delegate failing every time; #5544 \
              added a delegate PARKING every time. sweep at {sweep}, first exit \
@@ -12826,7 +12826,7 @@ mod hol_4391_tests {
     /// the sweep stops the test passing vacuously.
     ///
     /// A second, LIVE registration sits beside it for the same span and must
-    /// still deliver afterwards (#5919). An earlier version of this test kept
+    /// still deliver afterwards (#5920). An earlier version of this test kept
     /// its receiver alive and asserted the registration was reaped after a
     /// 30-minute TTL, which pinned the bug: an app that registered once and
     /// then only listened stopped receiving pushes while still connected.
@@ -12837,6 +12837,9 @@ mod hol_4391_tests {
     // `serial` as well as `TEST_GUARD`: the registry's own unit tests call
     // `sweep_closed` directly under `serial`, and a concurrent sweep from one of
     // them could reap `dead_key` and pass this test with the call deleted.
+    // This narrows that window rather than closing it: other notification
+    // tests (`capability_loop_tests`) sweep under neither lock. That can only
+    // ever make this test pass spuriously under a mutation, never fail.
     #[tokio::test(start_paused = true)]
     #[serial_test::serial]
     async fn the_notification_path_actually_runs_the_registry_sweep() {
@@ -12911,7 +12914,7 @@ mod hol_4391_tests {
             ),
             1,
             "a connected app must survive the sweep however long it has been idle \
-             (#5919)"
+             (#5920)"
         );
         assert!(live_rx.try_recv().is_ok());
     }
