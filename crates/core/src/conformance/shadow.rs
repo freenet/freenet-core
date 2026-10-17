@@ -440,16 +440,29 @@ impl FocusPeriod {
                 self.fold(member);
             }
         }
-        // A contract already in focus continues its stint, taking the slot of the
-        // draw that kept it (the weighted pick becomes the uniform pick when the
-        // peer stops hosting the old one; a stale label would give the period two
-        // Weighted members and the split could then keep only one). Its activity at
-        // selection is not refreshed. A new contract starts a stint.
+        // A contract already in focus in the same slot continues its stint, with its
+        // activity at selection not refreshed. A contract whose slot changed (the
+        // weighted pick becomes the uniform pick when the peer stops hosting the old
+        // one) ends its stint in the old slot and starts one in the new slot, so each
+        // slot is credited only with what happened in it (#5914 review round 3, A2).
+        // Its keep state carries over: it is the same sample being built. A new
+        // contract starts a stint.
         for (id, slot, activity) in selected {
-            self.current
-                .entry(*id)
-                .and_modify(|member| member.slot = *slot)
-                .or_insert_with(|| PeriodMember::new(*slot, *activity));
+            let moved = match self.current.get(id) {
+                Some(member) if member.slot != *slot => Some(*member),
+                _ => None,
+            };
+            if let Some(old) = moved {
+                self.fold(old);
+                let mut fresh = PeriodMember::new(*slot, *activity);
+                fresh.admitted_this_tick = old.admitted_this_tick;
+                fresh.admitted_last_tick = old.admitted_last_tick;
+                self.current.insert(*id, fresh);
+            } else {
+                self.current
+                    .entry(*id)
+                    .or_insert_with(|| PeriodMember::new(*slot, *activity));
+            }
         }
         self.totals.candidates = candidates;
         self.totals.active_candidates = active;
@@ -2536,6 +2549,46 @@ mod tests {
             (3, 2, 1, 2),
             "the restart lost the period's counts"
         );
+    }
+
+    /// A contract that changes slot mid-period ends one stint and starts another, so
+    /// each slot is credited only with what happened in it (#5914 review round 3,
+    /// A2). Relabelling the whole stint moved a weighted verdict to the uniform slot.
+    #[test]
+    fn a_slot_change_ends_one_stint_and_starts_another() {
+        let hosted: Vec<_> = (0..10u8).map(instance).collect();
+        let mut checked = 0;
+        for salt in 0..=255u8 {
+            let dir = tempfile::TempDir::new().expect("tempdir");
+            let mut runner = runner_with_salt(dir.path(), [salt; 32]);
+            let first = runner.focus(Some(hosted.clone()), &[]).selected;
+            let (uniform, weighted) = (first[0], first[1]);
+            runner.note_judged(&[JudgedContract {
+                contract: weighted,
+                verdicts: 1,
+                inconclusive: 0,
+            }]);
+            let without_uniform: Vec<_> =
+                hosted.iter().copied().filter(|c| *c != uniform).collect();
+            let second = runner.focus(Some(without_uniform), &[]).selected;
+            if second[0] != weighted {
+                continue;
+            }
+            checked += 1;
+            let ended = end_period(&mut runner);
+            assert_eq!(
+                (
+                    ended.stints,
+                    ended.uniform_stints,
+                    ended.weighted_stints,
+                    ended.judged_uniform,
+                    ended.judged_weighted
+                ),
+                (4, 2, 2, 0, 1),
+                "salt {salt}: a slot change re-attributed the stint: {ended:?}"
+            );
+        }
+        assert!(checked > 0, "no salt exercised the case");
     }
 
     /// An unreadable persisted period starts an incomplete one rather than failing.
