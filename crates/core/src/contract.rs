@@ -4468,30 +4468,31 @@ async fn handle_delegate_notification<CH, P>(
         "Delivering contract notification to delegate"
     );
 
-    // TTL SWEEP OF THE delegate->apps REGISTRY, AT THE TOP, BEFORE ANY EXIT.
+    // SWEEP OF THE delegate->apps REGISTRY, AT THE TOP, BEFORE ANY EXIT.
     //
-    // `sweep_expired` is the registry's only production caller and is what
-    // time-bounds the map per the AGENTS.md GC-exemption rule. #5263 placed it
-    // before its execution-failure return, reasoning that a delegate which
-    // fails on EVERY invocation must not disable the only GC. That reasoning
+    // This is the only production call site of `sweep_closed`, which is what
+    // reaps registrations whose connection ended without a clean disconnect,
+    // for every delegate rather than only the one being notified. #5263 placed
+    // it before its execution-failure return, reasoning that a delegate which
+    // fails on EVERY invocation must not disable the only sweep. That reasoning
     // is right and #5544 adds two more ways to leave this function that its
     // author could not have known about: the delegate is already parked and
     // this notification is queued, or this run itself parks. Both returned
     // without sweeping.
     //
-    // A parked delegate recovers — every park terminates, and the resumed run
-    // sweeps — so the effect was a DELAY of about one park lifetime rather
-    // than #5263's unbounded loss. But that bound depends on the park
-    // machinery working, and a backstop must not be conditional on the thing
-    // it backs up. Hoisting to the top makes "on every exit" true by position
-    // rather than by argument, which is also the only form a reader can check
-    // at a glance.
+    // The effect was a DELAY until the next notification that took a sweeping
+    // exit, rather than #5263's unbounded loss: every park terminates, but the
+    // resumed run does not sweep (see below). That bound depends on the park
+    // machinery working and on further notifications arriving, and a backstop
+    // must not be conditional on the thing it backs up. Hoisting to the top
+    // makes "on every exit" true by position rather than by argument, which is
+    // also the only form a reader can check at a glance.
     //
-    // `route_notification_outbound` sweeps too, covering the resume path where
-    // this frame is long gone. The overlap is deliberate: `sweep_expired` is a
-    // `retain` over a `DashMap` and is idempotent, so a second call is cheap
-    // and the redundancy costs less than a missed exit.
-    delegate_app_registry::sweep_expired();
+    // On the resume path, where this frame is long gone,
+    // `route_notification_outbound` prunes closed registrations only for the
+    // delegate it routes for, and only when the run produced an
+    // `ApplicationMessage` to route, because that is when `route_to_apps` runs.
+    delegate_app_registry::sweep_closed();
 
     // THE DELEGATE'S REGISTERED PARAMETERS, NOT EMPTY ONES (#5616).
     //
@@ -4650,7 +4651,8 @@ async fn handle_delegate_notification<CH, P>(
     match outcome {
         // Notification-driven run: no client responder to stash. The residual
         // messages are routed by `handle_delegate_resume` when the park
-        // resolves. The TTL sweep has already run at the top of this function.
+        // resolves. The registry sweep has already run at the top of this
+        // function.
         DelegateRunOutcome::Parked => {}
         // Nothing to propagate: a notification has no client waiting. Already
         // logged inside `handle_delegate_with_contract_requests` (#5263).
@@ -7941,13 +7943,13 @@ mod tests {
         );
     }
 
-    /// Pin: the delegate->apps TTL sweep must not be skippable by ANY exit
+    /// Pin: the delegate->apps registry sweep must not be skippable by ANY exit
     /// from the notification path.
     ///
-    /// PROHIBITION (from #5263, restated behaviourally and WIDENED): the sweep
-    /// is the registry's only production caller and is what time-bounds the map
-    /// per the AGENTS.md GC-exemption rule. It must not become conditional on
-    /// the delegate doing anything in particular.
+    /// PROHIBITION (from #5263, restated behaviourally and WIDENED): this is the
+    /// only production call site of the sweep, which is what reaps registrations
+    /// whose connection died without a clean disconnect. It must not become
+    /// conditional on the delegate doing anything in particular.
     ///
     /// The original asserted the sweep appears before "the execution-failure
     /// early return" — anchoring on one named exit, because that was the only
@@ -7976,7 +7978,7 @@ mod tests {
     /// also occur in this function's own text, which `include_str!` pulls in
     /// (see #5450).
     #[test]
-    fn ttl_sweep_precedes_every_exit_from_the_notification_path() {
+    fn registry_sweep_precedes_every_exit_from_the_notification_path() {
         let full = include_str!("contract.rs");
         let cutoff = full
             .find("\nmod tests {")
@@ -8017,7 +8019,7 @@ mod tests {
             .join("\n");
 
         let sweep = code
-            .find("delegate_app_registry::sweep_expired()")
+            .find("delegate_app_registry::sweep_closed()")
             .expect("the notification path must sweep the delegate->apps registry");
 
         // EVERY way out of this function, not one named one. `return` covers
@@ -8032,8 +8034,8 @@ mod tests {
 
         assert!(
             sweep < first_exit,
-            "the TTL sweep must precede EVERY exit from the notification path, \
-             not just the execution-failure one. It is the registry's only GC \
+            "the registry sweep must precede EVERY exit from the notification path, \
+             not just the execution-failure one. It is the registry's only sweep \
              and must not be conditional on how this invocation happens to \
              leave — #5263's case was a delegate failing every time; #5544 \
              added a delegate PARKING every time. sweep at {sweep}, first exit \
@@ -12815,57 +12817,82 @@ mod hol_4391_tests {
         }
     }
 
-    /// P4b: the notification path must actually RUN the delegate->apps TTL
-    /// sweep, not merely contain it.
+    /// P4b: the notification path must actually RUN the delegate->apps
+    /// registry sweep, not merely contain it.
     ///
-    /// `sweep_expired` is that registry's ONLY garbage collection — the
-    /// AGENTS.md GC-exemption bound rests on it — and the sibling source pin
-    /// checks where the call SITS. Wrapping it in `if black_box(false) { .. }`
-    /// with its position unchanged leaves that pin green while nothing is ever
-    /// reaped, which a mutation campaign demonstrated. Position cannot express
+    /// `sweep_closed` is that registry's ONLY garbage collection for delegates
+    /// that are not being routed to, and the sibling source pin checks where
+    /// the call SITS. Wrapping it in `if black_box(false) { .. }` with its
+    /// position unchanged leaves that pin green while nothing is ever reaped,
+    /// which a mutation campaign demonstrated. Position cannot express
     /// conditionality.
     ///
     /// So this drives the path and observes the consequence: a registration
-    /// older than `REGISTRATION_TTL` is gone afterwards. `route_to_apps`
-    /// returning 0 is the observation, and the assertion BEFORE the sweep is
-    /// what stops it passing vacuously — the registration must be live first,
-    /// or "nothing was delivered" proves nothing.
+    /// whose connection went away without a clean disconnect is gone
+    /// afterwards. It is observed through `registration_count`, NOT
+    /// `route_to_apps`: routing prunes a closed channel itself, so a zero from
+    /// it would pass with the sweep deleted. The live-delivery assertion BEFORE
+    /// the sweep stops the test passing vacuously.
     ///
-    /// FALSIFY by making the sweep conditional, or deleting it.
+    /// A second, LIVE registration sits beside it for the same span and must
+    /// still deliver afterwards (#5920). An earlier version of this test kept
+    /// its receiver alive and asserted the registration was reaped after a
+    /// 30-minute TTL, which pinned the bug: an app that registered once and
+    /// then only listened stopped receiving pushes while still connected.
+    ///
+    /// FALSIFY by making the sweep conditional, or deleting it (the dead
+    /// registration survives), or by expiring registrations on age again (the
+    /// live one is reaped).
+    // `serial` as well as `TEST_GUARD`: the registry's own unit tests call
+    // `sweep_closed` directly under `serial`, and a concurrent sweep from one of
+    // them could reap `dead_key` and pass this test with the call deleted.
+    // This narrows that window rather than closing it: other notification
+    // tests (`capability_loop_tests`) sweep under neither lock. That can only
+    // ever make this test pass spuriously under a mutation, never fail.
     #[tokio::test(start_paused = true)]
+    #[serial_test::serial]
     async fn the_notification_path_actually_runs_the_registry_sweep() {
         let _guard = TEST_GUARD.lock().await;
         let (mut handler, _send) = build_handler(vec![]).await;
 
-        // A delegate key of its own, so a parallel test's registrations in this
-        // process-global registry cannot be confused for this one's.
-        let key = DelegateKey::new(
+        // Delegate keys of their own, so a parallel test's registrations in
+        // this process-global registry cannot be confused for these.
+        let dead_key = DelegateKey::new(
             [0x5b; 32],
             freenet_stdlib::prelude::CodeHash::new([0x5b; 32]),
         );
-        let (tx, _rx) = tokio::sync::mpsc::channel(4);
-        assert!(
-            delegate_app_registry::register_app(
-                &key,
-                crate::client_events::ClientId::next(),
-                delegate_app_registry::AppIdentity::Local,
-                tx,
-            ),
-            "the registration must be accepted, or this test measures nothing"
+        let live_key = DelegateKey::new(
+            [0x5c; 32],
+            freenet_stdlib::prelude::CodeHash::new([0x5c; 32]),
         );
+        let (dead_tx, dead_rx) = tokio::sync::mpsc::channel(4);
+        let (live_tx, mut live_rx) = tokio::sync::mpsc::channel(4);
+        for (key, tx) in [(&dead_key, dead_tx), (&live_key, live_tx)] {
+            assert!(
+                delegate_app_registry::register_app(
+                    key,
+                    crate::client_events::ClientId::next(),
+                    delegate_app_registry::AppIdentity::Local,
+                    tx,
+                ),
+                "the registration must be accepted, or this test measures nothing"
+            );
+        }
         assert_eq!(
             delegate_app_registry::route_to_apps(
-                &key,
+                &dead_key,
                 Ok(freenet_stdlib::client_api::HostResponse::Ok)
             ),
             1,
-            "COUNTERFACTUAL: the registration must be live before the sweep, or \
-             a later zero would prove nothing"
+            "COUNTERFACTUAL: the registration must be live before its connection \
+             goes away, or a later zero would prove nothing"
         );
 
-        // Past the TTL, so the sweep has something to reap.
-        tokio::time::advance(delegate_app_registry::REGISTRATION_TTL + Duration::from_secs(1))
-            .await;
+        // The connection ends without a clean disconnect event.
+        drop(dead_rx);
+        // Far past the 30-minute TTL this registry used to apply, with no
+        // further request from the live app.
+        tokio::time::advance(Duration::from_secs(24 * 60 * 60)).await;
 
         // Any notification drives the path; this one is for an unrelated
         // delegate, which is the point — the sweep is the registry's GC and
@@ -12883,15 +12910,22 @@ mod hol_4391_tests {
         .await;
 
         assert_eq!(
+            delegate_app_registry::registration_count(&dead_key),
+            0,
+            "the notification path must RUN the registry sweep, not merely \
+             contain it: this registration's channel is closed and nothing else \
+             reaps the delegate->apps registry for an unrouted delegate"
+        );
+        assert_eq!(
             delegate_app_registry::route_to_apps(
-                &key,
+                &live_key,
                 Ok(freenet_stdlib::client_api::HostResponse::Ok)
             ),
-            0,
-            "the notification path must RUN the TTL sweep, not merely contain \
-             it: this registration is past REGISTRATION_TTL and nothing else \
-             reaps the delegate->apps registry"
+            1,
+            "a connected app must survive the sweep however long it has been idle \
+             (#5920)"
         );
+        assert!(live_rx.try_recv().is_ok());
     }
 
     /// P5b: the executor answering a delegate request with a variant that is

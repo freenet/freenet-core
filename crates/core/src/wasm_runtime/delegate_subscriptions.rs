@@ -192,7 +192,7 @@ static BY_CONTRACT: LazyLock<DashMap<ContractInstanceId, HashSet<DelegateKey>>> 
 ///
 /// `tokio::time::Instant` (not `std::time::Instant`) so tests using
 /// `tokio::time::pause` / `advance` can drive eviction order deterministically,
-/// matching `AppRegistration::last_seen` and `DelegateContextEntry`.
+/// matching `DelegateContextEntry`.
 static BY_DELEGATE: LazyLock<
     DashMap<DelegateKey, HashMap<ContractInstanceId, tokio::time::Instant>>,
 > = LazyLock::new(DashMap::default);
