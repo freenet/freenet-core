@@ -457,11 +457,58 @@ fn run<O: ConformanceOracle + ?Sized>(
             require_valid(oracle, &bc, &case.related)?;
             let ab_c = merge(oracle, &ab, c)?;
             let a_bc = merge(oracle, a, &bc)?;
+            if ab_c == a_bc {
+                return Ok(PropertyOutcome::Holds);
+            }
+
+            // The two groupings differ. Report that only if it does not heal (#5915),
+            // with the same guard `path_agreement` applies to its two paths.
+            //
+            // Strict associativity is unsatisfiable for any contract with bounded
+            // retention. A grouping that truncated an old entry to make room cannot
+            // refill the slot when a later removal (a ban) or a raised cap frees it,
+            // while the other grouping still holds the entry and can. Measured on
+            // River's room contract: ~30% of generated triples fail strictly, and
+            // every one converges on the next exchange. Reporting those would make
+            // every capped chat, feed or log removable, and anyone able to trigger a
+            // removal could build a failing triple on purpose.
+            //
+            // So model that next exchange: the peer holding each grouping receives
+            // the other's whole state. If both land on one state, the peers agree and
+            // the divergence was transient. If not, two peers given the same updates
+            // grouped differently still disagree after reconciling, which is the
+            // defect this law exists to name.
+            //
+            // Same validity precondition first, for the reason `path_agreement`
+            // gives: a grouping the contract rejects never reaches another peer, so
+            // asking whether it reconciles asks about a history that cannot happen.
+            // A merge emitting an invalid state is `EmittedStateValidity`'s defect.
+            //
+            // A reconciling merge that errors is `Inconclusive` via `?`, as in
+            // `path_agreement`: the guard errs toward silence.
+            //
+            // CONSEQUENCE, stated so nobody has to rediscover it: when the merge
+            // commutes on these two states, `merge(L, R) == merge(R, L)` by
+            // definition, so this guard heals. A finding here therefore also means
+            // the merge failed to commute on the two groupings. The digests reported
+            // are still the two groupings, so `verify_case`'s re-run compares the same
+            // pair it always did.
+            require_valid(oracle, &ab_c, &case.related)?;
+            require_valid(oracle, &a_bc, &case.related)?;
+            let left_receives_right = merge(oracle, &ab_c, &a_bc)?;
+            let right_receives_left = merge(oracle, &a_bc, &ab_c)?;
+            if left_receives_right == right_receives_left {
+                return Ok(PropertyOutcome::Holds);
+            }
+
             Ok(compare(
                 case.property,
                 &ab_c,
                 &a_bc,
-                "merge(merge(A, B), C) must equal merge(A, merge(B, C))",
+                "merge(merge(A, B), C) differs from merge(A, merge(B, C)), and the \
+                 difference does not heal: merging each grouping into the other does \
+                 not reach one state, so two peers that received the same updates \
+                 grouped differently still disagree after reconciling",
             ))
         }
 

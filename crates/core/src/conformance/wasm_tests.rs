@@ -213,25 +213,27 @@ async fn verifier_matches_real_wasm_for_every_planted_defect()
 
     // ------------------------------------------------- mode 5: capped collection
     //
-    // The only planted defect that the PAIRWISE state laws cannot see. Asserting the
-    // associativity violation alone would not show that: a mode that also broke
-    // commutativity would satisfy that assertion while proving nothing about the
-    // three-state check. So assert the pairwise laws still HOLD here — that is
-    // what makes this a test of associativity specifically.
+    // A defect the PAIRWISE state laws cannot see. Until #5915 associativity named
+    // it. Under the heal guard it does not: the merge is a function of the union, so
+    // it commutes, so the two groupings of any failing triple converge on one more
+    // exchange and `StateAssociativity` holds. That is the decided behaviour for
+    // bounded retention, asserted here against real WASM so the fake-contract tests
+    // are not the only evidence. The transition law is now the one that names this
+    // mode, further down.
     //
-    // "Pairwise" is doing real work in that sentence: the transition law sees this
-    // mode too, from the same information loss, and that is asserted deliberately
-    // further down rather than being an exception this loop must dodge. The claim
-    // is that associativity is the law that NAMES the defect and no pairwise state
-    // law fires, not that nothing else in the module can see it.
+    // The pairwise laws are still asserted to HOLD, so a mode that drifted into
+    // breaking commutativity (and therefore failing to heal) shows up as a pairwise
+    // finding rather than silently reviving the associativity one.
     let mut capped = RuntimeOracle::standalone(wasm.clone(), vec![CAPPED_SET]).await?;
     let associativity_case = ConformanceCase::new(
         ConformanceProperty::StateAssociativity,
         vec![bytes(&[1, 2]), bytes(&[3, 4]), bytes(&[5, 6])],
     );
-    assert_violates(
+    assert_eq!(
         verify_case(&mut capped, &associativity_case),
-        ConformanceProperty::StateAssociativity,
+        PropertyOutcome::Holds,
+        "a commutative capped set's groupings heal on one more exchange, so \
+         associativity must not report it (#5915)"
     );
     for pairwise in [
         ConformanceCase::new(
@@ -248,8 +250,7 @@ async fn verifier_matches_real_wasm_for_every_planted_defect()
             verify_case(&mut capped, &pairwise),
             PropertyOutcome::Holds,
             "among the PAIRWISE state laws the capped-collection mode should break \
-             none — associativity is the one that names it — but {property} did not \
-             hold"
+             none, but {property} did not hold"
         );
     }
 
@@ -259,10 +260,11 @@ async fn verifier_matches_real_wasm_for_every_planted_defect()
     // rests on, so it is measured here against real WASM rather than argued. This
     // cap evicts by an index derived from the set's own contents — independent of
     // the merge's ordering — and merging the reached state back into its base
-    // genuinely does not reproduce it. That is the same information loss
-    // `StateAssociativity` already reports for this mode, so the contract is
-    // removal-eligible either way; what matters is that it is a real divergence and
-    // not an artifact of capping.
+    // genuinely does not reproduce it. Before #5915 `StateAssociativity` reported
+    // the same information loss, so the contract was removal-eligible either way.
+    // Since the heal guard it is this property alone, which is an open question for
+    // that property's severity (see `TransitionPathAgreement`'s rustdoc); what this
+    // asserts is that it is a real divergence and not an artifact of capping.
     //
     // The cap applies to the mode's DELTA path as well as its merge path, which is
     // what makes that true. Without it the recorded `result` would carry more than
@@ -308,9 +310,12 @@ async fn verifier_matches_real_wasm_for_every_planted_defect()
         ),
         ConformanceProperty::StateIdempotence,
     );
-    // Associativity breaks too, which the mode's documentation claims and this
-    // asserts rather than leaving in prose. Needs three states by definition.
-    assert_violates(
+    // Associativity is NOT reported since #5915, and this asserts it rather than
+    // leaving it in prose. The groupings differ strictly, but the rewrite is applied
+    // to a union, so the merge commutes and one more exchange lands both peers on the
+    // same state: the guard heals. The defect is still caught, under idempotence
+    // above, which is the law that names it.
+    assert_eq!(
         verify_case(
             &mut never_settles,
             &ConformanceCase::new(
@@ -318,7 +323,9 @@ async fn verifier_matches_real_wasm_for_every_planted_defect()
                 vec![bytes(&[1, 2]), bytes(&[2, 3]), bytes(&[5, 6])],
             ),
         ),
-        ConformanceProperty::StateAssociativity,
+        PropertyOutcome::Holds,
+        "a commutative merge's groupings heal, so associativity must not report \
+         this mode (#5915)"
     );
     // Commutativity still HOLDS for this arm: the rewrite is applied to a union, and
     // a union is symmetric. Asserting it keeps the mode's description honest rather
@@ -334,7 +341,7 @@ async fn verifier_matches_real_wasm_for_every_planted_defect()
     );
     assert!(
         !commutativity_still_holds.is_violation(),
-        "this mode should break idempotence and associativity only; a commutativity \
+        "this mode should break idempotence only; a commutativity \
          finding means the arm no longer isolates what its documentation claims: \
          {commutativity_still_holds:?}"
     );

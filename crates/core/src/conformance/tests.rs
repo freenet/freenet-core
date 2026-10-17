@@ -371,10 +371,15 @@ fn non_idempotent_merge_is_caught() {
 
 /// Commutative and idempotent, but not associative: integer averaging.
 ///
-/// `avg(avg(1,3),5) = 3` while `avg(1,avg(3,5)) = 2`. Worth having as a distinct
-/// case because a detector that only checks pairs would call this contract clean.
+/// `avg(avg(1,3),5) = 3` while `avg(1,avg(3,5)) = 2`. Until #5915 this was the
+/// pin that associativity catches what the pairwise laws miss, and it asserted a
+/// violation. Under the heal guard it is NOT reported, and that is the decided
+/// behaviour rather than a gap the test papers over: one more exchange takes both
+/// peers to `avg(3,2) == avg(2,3) == 2`, so they agree. More generally, any merge
+/// that commutes on the two groupings heals by definition. Both halves are asserted:
+/// the strict failure, so the triple still exercises the guard, and the silence.
 #[test]
-fn associativity_only_defect_needs_the_triple_check() {
+fn a_commutative_non_associative_merge_heals_and_is_not_reported() {
     fn avg(a: &[u8], b: &[u8]) -> Vec<u8> {
         let (x, y) = (
             a.first().copied().unwrap_or(0),
@@ -405,14 +410,15 @@ fn associativity_only_defect_needs_the_triple_check() {
         &case(ConformanceProperty::StateIdempotence, &[&[1]]),
     ));
 
+    let (left, right) = (avg(&avg(&[1], &[3]), &[5]), avg(&[1], &avg(&[3], &[5])));
+    assert_ne!(left, right, "the triple must fail strict associativity");
+    assert_eq!(avg(&left, &right), avg(&right, &left), "and must heal");
+
     let mut fake = build();
-    assert_violates(
-        verify_case(
-            &mut fake,
-            &case(ConformanceProperty::StateAssociativity, &[&[1], &[3], &[5]]),
-        ),
-        ConformanceProperty::StateAssociativity,
-    );
+    assert_holds(verify_case(
+        &mut fake,
+        &case(ConformanceProperty::StateAssociativity, &[&[1], &[3], &[5]]),
+    ));
 }
 
 // ------------------------------------- associativity heals or it is reported (#5915)
@@ -2067,10 +2073,11 @@ fn a_sound_bounded_collection_is_not_accused() {
 }
 
 /// The same cap, evicting by something INDEPENDENT of the merge's own ordering, is
-/// caught — and that is correct rather than a false positive: such a contract is
-/// already removal-eligible under `StateAssociativity`, for the same underlying
-/// reason (an entry dropped early destroys information a different merge order
-/// would have kept).
+/// caught. Before #5915 such a contract was already removal-eligible under
+/// `StateAssociativity` for the same underlying reason (an entry dropped early
+/// destroys information a different merge order would have kept); its merge is a
+/// function of the union, so it commutes, so its groupings now heal and this
+/// property is the one that names it.
 ///
 /// Asserted rather than left in prose, because it is the boundary the severity
 /// argument rests on: the property distinguishes the two caps, and does not simply
@@ -2131,16 +2138,19 @@ fn capped_collection_evicting_outside_the_merge_order_is_caught() {
 /// Brute-forced over its whole state space on 2026-08-23 (universe of five elements,
 /// `1` causally after `5`, N = 2, ties by keeping the largest: 15 valid states) it
 /// is commutative and idempotent with zero failures, and NOT associative — 532
-/// failing triples. So it is already removal-eligible under `StateAssociativity`
-/// before this property is consulted, which is what closes the gap: the transition
-/// law condemns no contract the settled algebra acquits. It fires here too, which is
-/// the consistency the semilattice argument in `TransitionPathAgreement`'s
-/// documentation predicts rather than a second, independent accusation.
+/// failing triples.
 ///
-/// Both halves are asserted. Asserting only the firing would leave the important
-/// half — that associativity already had it — as prose.
+/// Until #5915 that made it removal-eligible under `StateAssociativity` before the
+/// transition law was consulted, which is what this test was written to pin: the
+/// transition law condemned no contract the settled algebra acquitted. **That no
+/// longer holds.** The merge is a function of the union, so it commutes on every
+/// pair, so each of those 532 groupings heals on one more exchange and
+/// associativity is now silent on it. The transition law still fires, so this
+/// contract is now condemned by `TransitionPathAgreement` ALONE. Both facts are
+/// asserted, so the gap in that property's severity argument is visible here
+/// rather than only in its documentation.
 #[test]
-fn a_partially_ordered_cap_is_already_caught_by_associativity() {
+fn a_partially_ordered_cap_heals_under_associativity_but_not_the_transition_law() {
     const N: usize = 2;
     // `1` is causally after `5`, so a set holding both keeps only `1`.
     fn dominates(after: u8, before: u8) -> bool {
@@ -2173,18 +2183,25 @@ fn a_partially_ordered_cap_is_already_caught_by_associativity() {
             })
     };
 
-    // The half that closes the gap: associativity already condemns it. The triple is
-    // the smallest of the 532 the brute force found.
-    assert_violates(
-        verify_case(
-            &mut fake(),
-            &case(
-                ConformanceProperty::StateAssociativity,
-                &[&[1], &[2], &[3, 5]],
-            ),
-        ),
-        ConformanceProperty::StateAssociativity,
+    // The smallest of the 532 strictly failing triples the brute force found. It
+    // still fails strictly, and it heals, so associativity is silent.
+    let strict = |a: &[u8], b: &[u8], c: &[u8]| {
+        let left = cap(&cap(a, b).unwrap(), c).unwrap();
+        let right = cap(a, &cap(b, c).unwrap()).unwrap();
+        (left, right)
+    };
+    let (left, right) = strict(&[1], &[2], &[3, 5]);
+    assert_eq!(
+        (left.as_slice(), right.as_slice()),
+        (&[2, 3][..], &[1, 3][..])
     );
+    assert_holds(verify_case(
+        &mut fake(),
+        &case(
+            ConformanceProperty::StateAssociativity,
+            &[&[1], &[2], &[3, 5]],
+        ),
+    ));
 
     // ...and the pairwise laws do NOT, which is why the shape looked plausible.
     for pairwise in [
@@ -2200,7 +2217,8 @@ fn a_partially_ordered_cap_is_already_caught_by_associativity() {
         );
     }
 
-    // The transition law fires too, on the step the brute force identified.
+    // The transition law fires, on the step the brute force identified, and is now
+    // the only removal-eligible property that does.
     let mut oracle = fake();
     let built = transition_case(&mut oracle, &[2, 5], &[1, 3]);
     assert_eq!(
