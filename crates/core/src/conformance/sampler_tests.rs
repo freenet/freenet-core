@@ -606,3 +606,53 @@ fn duplicate_candidates_do_not_waste_focus_slots() {
     assert_eq!(selected.len(), 2);
     assert_ne!(selected[0], selected[1]);
 }
+
+// ------------------------------------------- admission after shedding (#5914 r4)
+
+/// With no transition slots, a transition is pushed and immediately popped. It must
+/// not be reported as stored; the states it brought were kept, and that is reported.
+#[test]
+fn a_transition_with_no_slot_is_not_reported_stored() {
+    let mut sampler = ContractSampler::new(SamplerConfig {
+        transitions: 0,
+        ..config()
+    });
+    let (admission, retained) =
+        sampler.observe_transition_retaining(&state(1, 4), None, Some(&[9]), None, &state(2, 4));
+    assert_ne!(
+        admission,
+        Admission::Stored,
+        "a transition with nowhere to live was reported stored"
+    );
+    assert!(
+        retained,
+        "the new base and result states were kept and not reported"
+    );
+}
+
+/// A transition whose payload pushes the store over budget is shed by the very
+/// loop that admitted it; that is not "stored" either.
+#[test]
+fn a_transition_shed_by_the_budget_is_not_reported_stored() {
+    let mut sampler = ContractSampler::new(SamplerConfig {
+        earliest: 2,
+        recent: 1,
+        reservoir: 0,
+        largest: 0,
+        smallest: 0,
+        transitions: 8,
+        max_bytes: 10,
+        max_state_bytes: 10,
+        seed: 1,
+    });
+    // States: 2 + 3 bytes fit; the 10-byte delta takes the store to 15 > 10, and
+    // shedding drops the transition first (recency holds a single member).
+    let (admission, retained) =
+        sampler.observe_transition_retaining(&[1, 1], None, Some(&[0; 10]), None, &[2, 2, 2]);
+    assert_ne!(
+        admission,
+        Admission::Stored,
+        "a shed transition was reported stored"
+    );
+    assert!(retained, "the states survived and were not reported");
+}

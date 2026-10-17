@@ -294,14 +294,20 @@ impl ContractSampler {
         // bundle claimed a transition while omitting the full-state update that
         // caused it, and anyone replaying it would be reasoning about a step that
         // never happened as described.
-        let retained_state = [
-            Some(base_admission),
-            Some(result_admission),
-            incoming_admission,
+        // The states this call newly stored, so "retained" can be judged by what is
+        // still held at the end rather than by what was admitted along the way.
+        let newly_stored: Vec<StateHash> = [
+            (Some(base_admission), Some(base)),
+            (Some(result_admission), Some(result)),
+            (incoming_admission, incoming_state),
         ]
         .into_iter()
-        .flatten()
-        .any(|a| matches!(a, Admission::Stored));
+        .filter_map(|(admission, bytes)| match (admission, bytes) {
+            (Some(Admission::Stored), Some(bytes)) => Some(hash_of(bytes)),
+            _ => None,
+        })
+        .collect();
+        let retained_state = !newly_stored.is_empty();
         let kept = |a: Admission| matches!(a, Admission::Stored | Admission::Duplicate);
         if !kept(base_admission)
             || !kept(result_admission)
@@ -345,19 +351,36 @@ impl ContractSampler {
         if self.transitions.contains(&record) {
             return (Admission::Duplicate, retained_state);
         }
-        self.transitions.push_back(record);
+        self.transitions.push_back(record.clone());
         while self.transitions.len() > self.config.transitions {
             self.transitions.pop_front();
         }
+        let slotted = self.transitions.contains(&record);
         // Transition payloads count against the byte budget, so admitting one can
         // put the store over it. Shed until it fits, exactly as a state would.
+        let mut shed = false;
         while self.stored_bytes() > self.config.max_bytes {
             if !self.drop_lowest_value() {
                 break;
             }
+            shed = true;
         }
         self.collect_garbage();
-        (Admission::Stored, true)
+        // Report what is held NOW (#5914 review round 4). A record pushed into a
+        // zero-length history, or shed by the budget loop it just triggered, was not
+        // stored, and a state stored on the way in may have been shed too.
+        let kept_record = self.transitions.contains(&record);
+        let kept_state = newly_stored
+            .iter()
+            .any(|hash| self.blobs.contains_key(hash));
+        let admission = if kept_record {
+            Admission::Stored
+        } else if slotted && shed {
+            Admission::NoBudget
+        } else {
+            Admission::NotSelected
+        };
+        (admission, kept_record || kept_state)
     }
 
     /// Flatten into material the generator can build cases from.
