@@ -205,10 +205,16 @@ impl FocusSelector {
     ///   probe tick, so a contract that starts bursting mid-period is seen at the next
     ///   tick rather than the next period.
     ///
-    /// `kept` are current focus contracts the caller will not displace (in the shadow
-    /// runner: those the sampler has admitted something new for this period). Each
-    /// stays in its slot if it is still a candidate; only the remaining slots are
-    /// drawn. With `max_focus == 1` there is only the uniform slot.
+    /// `kept` are current focus contracts the caller would rather not displace (in
+    /// the shadow runner: those the sampler admitted something new for in the last
+    /// interval). A kept UNIFORM member keeps its slot while it is a candidate, so a
+    /// newly hosted contract with a lower score does not displace a sample being
+    /// built. A kept WEIGHTED member keeps its slot only while no challenger's
+    /// current key beats it (#5914 review round 2, K1): otherwise contracts that
+    /// stay busy, decoys included, would hold the weighted slot for the rest of the
+    /// period against any burst elsewhere. Since keys are fixed for the epoch, that
+    /// is the weighted draw's current winner, which only changes when activity
+    /// reorders it. With `max_focus == 1` there is only the uniform slot.
     ///
     /// Deterministic for a given `(salt, epoch, candidates, activity, kept)`,
     /// independent of candidate order and duplicates. Returned uniform slot first,
@@ -238,6 +244,11 @@ impl FocusSelector {
         });
         let mut chosen: Vec<(ContractInstanceId, FocusSlot)> = Vec::with_capacity(self.max_focus);
         for (id, slot) in kept {
+            // Weighted members are not reserved: they compete in the draw below, and
+            // keep their slot exactly when they still win it.
+            if slot == FocusSlot::Weighted {
+                continue;
+            }
             let used = chosen.iter().filter(|(_, s)| *s == slot).count();
             if used < capacity(slot) && !chosen.iter().any(|(c, _)| *c == id) {
                 chosen.push((id, slot));
@@ -704,23 +715,47 @@ mod tests {
         }
     }
 
-    /// A contract the caller keeps (it is accruing samples) keeps its slot, however
-    /// much activity appears elsewhere.
+    /// A kept UNIFORM contract keeps its slot when a lower-scoring contract joins
+    /// the candidates; a kept WEIGHTED contract keeps its slot only while it still
+    /// wins the draw, so a challenger whose current key beats it takes the slot.
     #[test]
-    fn a_kept_contract_keeps_its_slot() {
+    fn kept_contracts_keep_the_uniform_slot_but_must_win_the_weighted_one() {
         let pool = candidates(40);
-        let busy = |c: &ContractInstanceId| if c.as_bytes()[0] >= 20 { 1_000 } else { 0 };
+        let mut challenged = 0;
         for salt in 0..32u8 {
             let selector = FocusSelector::new([salt; 32], 2);
-            let uniform = lowest_score(&selector, &pool);
-            let kept = if uniform == id(3) { id(4) } else { id(3) };
-            let picks = selector.select_split(&pool, busy, &[(kept, FocusSlot::Weighted)]);
+            let uniform = lowest_score(&selector, &pool[1..]);
+            // pool[0] joins later; when it outscores the kept uniform member it must
+            // not displace it.
+            let picks = selector.select_split(&pool, |_| 0, &[(uniform, FocusSlot::Uniform)]);
             assert!(
-                picks.contains(&(kept, FocusSlot::Weighted)),
-                "salt {salt}: a contract accruing samples was displaced: {picks:?}"
+                picks.contains(&(uniform, FocusSlot::Uniform)),
+                "salt {salt}: a kept uniform member was displaced: {picks:?}"
             );
-            assert_eq!(picks.len(), 2);
+
+            // A cold weighted member against a busy challenger.
+            let kept = pool
+                .iter()
+                .copied()
+                .find(|c| *c != uniform && c.as_bytes()[0] < 20)
+                .expect("a cold contract");
+            let busy = |c: &ContractInstanceId| if c.as_bytes()[0] >= 20 { 1_000 } else { 0 };
+            let picks = selector.select_split(
+                &pool,
+                busy,
+                &[(uniform, FocusSlot::Uniform), (kept, FocusSlot::Weighted)],
+            );
+            let fresh = selector.select_split(&pool, busy, &[(uniform, FocusSlot::Uniform)]);
+            assert_eq!(
+                picks, fresh,
+                "salt {salt}: a kept weighted member beat the draw it lost"
+            );
+            challenged += usize::from(!picks.contains(&(kept, FocusSlot::Weighted)));
         }
+        assert!(
+            challenged > 0,
+            "no kept weighted member was ever challenged"
+        );
     }
 
     /// A kept contract the peer no longer hosts is not kept.

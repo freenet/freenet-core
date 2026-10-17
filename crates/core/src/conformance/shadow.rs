@@ -1849,37 +1849,36 @@ mod tests {
         );
     }
 
-    /// A focus contract that is accruing samples is not displaced mid-period, however
-    /// much activity appears elsewhere. Moving it would abandon a half-built sample.
+    /// A uniform-slot contract that is accruing samples is not displaced mid-period
+    /// when the peer starts hosting a contract that outscores it: moving it would
+    /// abandon a sample being built.
     #[test]
-    fn a_focus_contract_with_new_samples_is_not_displaced() {
-        let dir = tempfile::TempDir::new().expect("tempdir");
-        let mut runner = runner_with_salt(dir.path(), [21; 32]);
-        let hosted: Vec<_> = (0..60u8).map(instance).collect();
-        runner.advance();
-        let first = runner.focus(Some(hosted.clone()), &[]).selected;
-        for contract in &first {
-            runner.note_merge(*contract, Some(fresh_state()));
-            runner.note_admission(contract, RecordOutcome::Admitted);
-        }
-        for contract in hosted.iter().filter(|c| !first.contains(c)) {
-            for _ in 0..100 {
-                runner.note_merge(*contract, Some(fresh_state()));
+    fn an_accruing_uniform_contract_is_not_displaced_by_a_new_candidate() {
+        let all: Vec<_> = (0..61u8).map(instance).collect();
+        let mut checked = 0;
+        for salt in 0..64u8 {
+            // A salt for which the contract the peer starts hosting later outscores
+            // the uniform pick it has now.
+            let selector = FocusSelector::new([salt; 32], MAX_FOCUS_CONTRACTS);
+            let (newcomer, hosted) = (all[60], all[..60].to_vec());
+            if selector.select(&all)[0] != newcomer {
+                continue;
             }
+            checked += 1;
+            let dir = tempfile::TempDir::new().expect("tempdir");
+            let mut runner = runner_with_salt(dir.path(), [salt; 32]);
+            runner.advance();
+            let uniform = runner.focus(Some(hosted.clone()), &[]).selected[0];
+            runner.note_merge(uniform, Some(fresh_state()));
+            runner.note_admission(&uniform, RecordOutcome::Admitted);
+            runner.advance();
+            let now = runner.focus(Some(all.clone()), &[]).selected;
+            assert_eq!(
+                now[0], uniform,
+                "salt {salt}: an accruing uniform contract was displaced by a newcomer"
+            );
         }
-        for _ in 1..ROTATE_EVERY_TICKS - 1 {
-            assert!(runner.advance().is_none());
-            let mut now = runner.focus(Some(hosted.clone()), &[]).selected;
-            // Still accruing: each keeps admitting something new every interval.
-            for contract in &now {
-                runner.note_merge(*contract, Some(fresh_state()));
-                runner.note_admission(contract, RecordOutcome::Admitted);
-            }
-            let mut was = first.clone();
-            now.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
-            was.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
-            assert_eq!(now, was, "a focus contract accruing samples was displaced");
-        }
+        assert!(checked > 0, "no salt exercised the case");
     }
 
     /// A focus contract is kept only while it keeps accruing: one that admitted a
@@ -1909,6 +1908,64 @@ mod tests {
         assert!(
             runner.period.accruing().iter().all(|(c, _)| *c != weighted),
             "a contract that admitted nothing in the last interval is still locked in"
+        );
+    }
+
+    /// Busy decoys plus a contract that bursts mid-period, through the real runner
+    /// (#5914 review round 2, K1; modelled on the skeptical lens's simulation).
+    ///
+    /// Ten decoys merge (and are sampled) five times every tick, so under
+    /// keep-while-accruing they hold the weighted slot for good; the target bursts at
+    /// thirty merges a tick for four ticks in the middle of the third period. (At ten
+    /// a tick the target's advantage over the uniform pair is real but within noise at
+    /// 256 salts: the decoys sit at the weight cap, so a burster's weighted chance is
+    /// about its weight over ten capped weights.) The design must focus the target during its burst
+    /// on more salts than the uniform pair it replaced, or busy decoys have bought a
+    /// blind spot.
+    #[test]
+    fn a_mid_period_burst_beats_busy_decoys_to_the_weighted_slot() {
+        let hosted: Vec<_> = (0..60u8).map(instance).collect();
+        let target = hosted[0];
+        let decoys: Vec<_> = hosted[1..=10].to_vec();
+        let (burst_from, burst_len) = (18u32, 4u32);
+        let (mut caught, mut uniform_caught) = (0usize, 0usize);
+        for salt in 0..=255u8 {
+            let dir = tempfile::TempDir::new().expect("tempdir");
+            let mut runner = runner_with_salt(dir.path(), [salt; 32]);
+            let (mut hit, mut uniform_hit) = (false, false);
+            for tick in 1..=burst_from + burst_len {
+                runner.advance();
+                let focus = runner.focus(Some(hosted.clone()), &[]).selected;
+                let uniform_pair =
+                    FocusSelector::resuming_at([salt; 32], MAX_FOCUS_CONTRACTS, runner.epoch())
+                        .select(&hosted);
+                let bursting = tick >= burst_from;
+                let mut merges: Vec<ContractInstanceId> = decoys
+                    .iter()
+                    .flat_map(|d| std::iter::repeat_n(*d, 5))
+                    .collect();
+                if bursting {
+                    merges.extend(std::iter::repeat_n(target, 30));
+                    hit |= focus.contains(&target);
+                    uniform_hit |= uniform_pair.contains(&target);
+                }
+                for contract in merges {
+                    runner.note_merge(contract, Some(fresh_state()));
+                    let outcome = if focus.contains(&contract) {
+                        RecordOutcome::Admitted
+                    } else {
+                        RecordOutcome::OutOfScope
+                    };
+                    runner.note_admission(&contract, outcome);
+                }
+            }
+            caught += usize::from(hit);
+            uniform_caught += usize::from(uniform_hit);
+        }
+        assert!(
+            caught > uniform_caught,
+            "the burst was focused on {caught}/256 salts against {uniform_caught}/256 for \
+             the uniform pair: busy decoys are locking the weighted slot"
         );
     }
 
