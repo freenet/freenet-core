@@ -29,7 +29,10 @@ pub(crate) use contract::{
     ContractRuntimeBridge, ContractRuntimeInterface, ContractStoreBridge, classify_result,
 };
 pub use contract_store::{ContractStore, SharedCodeCache, SharedContractIndex};
+#[cfg(test)]
+pub(crate) use delegate::DelegateExecError;
 pub(crate) use delegate::DelegateRuntimeInterface;
+pub(crate) use delegate_store::key_derives_from;
 pub use delegate_store::{
     DelegateStore, ParamsUnavailable, SharedDelegateCodeCache, SharedDelegateIndex,
     registered_params,
@@ -63,7 +66,7 @@ impl SharedStores {
     }
 }
 pub(crate) use engine::BackendEngine;
-pub(crate) use error::{ContractError, RuntimeInnerError, RuntimeResult};
+pub(crate) use error::{ContractError, DELEGATE_PARAMS_MISMATCH, RuntimeInnerError, RuntimeResult};
 pub use mock_state_storage::MockStateStorage;
 #[cfg(test)]
 pub(crate) use module_cache::combine_ram_limits;

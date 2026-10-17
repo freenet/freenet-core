@@ -225,6 +225,7 @@ fn classify(err: RuntimeContractError) -> OracleError {
         | RuntimeInnerError::SecretStoreError(_)
         | RuntimeInnerError::Serialization(_)
         | RuntimeInnerError::DelegateNotFound(_)
+        | RuntimeInnerError::DelegateParamsMismatch(_)
         | RuntimeInnerError::DelegateIdentityMismatch { .. }
         | RuntimeInnerError::DelegateExecError(_)
         | RuntimeInnerError::ContractNotFound(_)

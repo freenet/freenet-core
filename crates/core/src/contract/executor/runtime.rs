@@ -1867,9 +1867,7 @@ mod remove_contract_tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn unattested_delegate_can_still_dispatch_to_another_delegate() {
         use freenet_stdlib::client_api::DelegateRequest;
-        use freenet_stdlib::prelude::{
-            Delegate, DelegateContainer, DelegateWasmAPIVersion, Parameters,
-        };
+        use freenet_stdlib::prelude::{Delegate, DelegateContainer, DelegateWasmAPIVersion};
 
         let (mut executor, _contracts_dir, _temp) =
             build_disk_executor("unattested-inter-delegate").await;
@@ -1899,7 +1897,9 @@ mod remove_contract_tests {
         let result = executor.delegate_request(
             DelegateRequest::ApplicationMessages {
                 key: victim.key().clone(),
-                params: Parameters::from(Vec::new()),
+                // The victim's own params, so the request reaches execution
+                // instead of being refused for a params mismatch.
+                params: victim.params().clone().into_owned(),
                 inbound: vec![],
             },
             None,
@@ -1913,6 +1913,12 @@ mod remove_contract_tests {
         // Asserting on the absence of that refusal is the whole point: a
         // re-introduced gate would short-circuit before execution.
         if let Err(e) = result {
+            // A params-mismatch refusal would also stop before execution and
+            // make the assertion below pass without testing anything.
+            assert!(
+                !e.is_params_mismatch(),
+                "the request must carry the victim's params; got: {e}"
+            );
             let msg = e.to_string();
             assert!(
                 !msg.contains("attested registration origin") && !msg.contains("dispatch refused"),

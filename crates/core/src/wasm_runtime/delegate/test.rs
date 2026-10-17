@@ -18,6 +18,16 @@ use super::*;
 
 const TEST_DELEGATE_2: &str = "test_delegate_2";
 
+/// The parameters a fixture delegate was built with. A run must be given
+/// these: parameters that do not derive the key are refused.
+#[allow(clippy::wildcard_enum_match_arm)]
+fn container_params(d: &DelegateContainer) -> Parameters<'static> {
+    match d {
+        DelegateContainer::Wasm(DelegateWasmAPIVersion::V1(d)) => d.params().clone().into_owned(),
+        _ => unreachable!("fixtures are V1 WASM delegates"),
+    }
+}
+
 /// Message types for test-delegate-2 (host function API)
 mod delegate2_messages {
     use super::*;
@@ -965,7 +975,7 @@ async fn test_delegate_cache_evicts_by_bytes() -> Result<(), Box<dyn std::error:
         let msg = ApplicationMessage::new(payload.clone());
         runtime.inbound_app_message(
             d.key(),
-            &vec![].into(),
+            &container_params(d),
             None,
             None,
             vec![InboundDelegateMsg::ApplicationMessage(msg)],
@@ -1095,7 +1105,7 @@ async fn same_code_different_params_share_one_delegate_module()
         let msg = ApplicationMessage::new(payload.clone());
         runtime.inbound_app_message(
             d.key(),
-            &vec![].into(),
+            &container_params(d),
             None,
             None,
             vec![InboundDelegateMsg::ApplicationMessage(msg)],
@@ -1161,7 +1171,7 @@ async fn unregister_keeps_a_module_a_sibling_delegate_still_runs()
         let msg = ApplicationMessage::new(payload.clone());
         runtime.inbound_app_message(
             d.key(),
-            &vec![].into(),
+            &container_params(d),
             None,
             None,
             vec![InboundDelegateMsg::ApplicationMessage(msg)],
@@ -4995,6 +5005,102 @@ async fn a_delegate_without_a_manifest_cannot_decode_lifecycle()
     assert!(
         result.is_err(),
         "an old delegate must fail to decode a Lifecycle message, got {result:?}"
+    );
+    Ok(())
+}
+
+/// A run whose params do not derive the delegate key is refused by the
+/// runtime with `DelegateParamsMismatch`, before any module is compiled, and
+/// also when the request carries no inbound messages. Matching params run.
+///
+/// FALSIFY by making `Runtime::check_delegate_params` return `Ok(())`: the
+/// mismatched runs execute and the first assertion fails.
+#[tokio::test(flavor = "multi_thread")]
+async fn runtime_refuses_params_that_do_not_derive_the_key()
+-> Result<(), Box<dyn std::error::Error>> {
+    use super::super::RuntimeInnerError;
+    use crate::contract::storages::Storage;
+
+    // Built here rather than with `setup_runtime_with_params` so the run gets
+    // the widened `delegate_fixture_config` budget (see its doc).
+    let _temp_dir = get_temp_dir();
+    let db = Storage::new(_temp_dir.path()).await?;
+    let contract_store = ContractStore::new(_temp_dir.path().join("c"), 10_000, db.clone())?;
+    let delegate_store = DelegateStore::new(_temp_dir.path().join("d"), 10_000, db.clone())?;
+    let secret_store = SecretsStore::new(_temp_dir.path().join("s"), Default::default(), db)?;
+    let mut runtime = Runtime::build_with_config(
+        contract_store,
+        delegate_store,
+        secret_store,
+        false,
+        delegate_fixture_config(),
+    )?;
+    let delegate = DelegateContainer::Wasm(DelegateWasmAPIVersion::V1(Delegate::from((
+        &super::super::tests::get_test_module(TEST_DELEGATE_2)?.into(),
+        &b"key-params".to_vec().into(),
+    ))));
+    runtime.delegate_store.store_delegate(delegate.clone())?;
+    let cipher_key = XChaCha20Poly1305::generate_key(&mut OsRng);
+    runtime.secret_store.register_delegate(
+        delegate.key().clone(),
+        XChaCha20Poly1305::new(&cipher_key),
+        XChaCha20Poly1305::generate_nonce(&mut OsRng),
+    )?;
+    let key = delegate.key().clone();
+    let msg = || {
+        let payload =
+            bincode::serialize(&delegate2_messages::InboundAppMessage::IncrementCounter).unwrap();
+        vec![InboundDelegateMsg::ApplicationMessage(
+            ApplicationMessage::new(payload),
+        )]
+    };
+
+    assert_eq!(
+        runtime.delegate_modules.lock().unwrap().len(),
+        0,
+        "nothing is compiled before the first run"
+    );
+    for (params, inbound) in [
+        (b"other".to_vec(), msg()),
+        (Vec::new(), msg()),
+        (b"other".to_vec(), vec![]),
+    ] {
+        let err = runtime
+            .inbound_app_message(&key, &params.clone().into(), None, None, inbound)
+            .expect_err("params that do not derive the key must be refused");
+        assert!(
+            matches!(err.deref(), RuntimeInnerError::DelegateParamsMismatch(k) if *k == key),
+            "expected DelegateParamsMismatch for params {params:?}, got {err}"
+        );
+    }
+    assert_eq!(
+        runtime.delegate_modules.lock().unwrap().len(),
+        0,
+        "a refused run must not compile the delegate"
+    );
+
+    runtime.inbound_app_message(&key, &b"key-params".to_vec().into(), None, None, msg())?;
+    assert_eq!(
+        runtime.delegate_modules.lock().unwrap().len(),
+        1,
+        "a matching run compiles the delegate, so the count above can move"
+    );
+    runtime.inbound_app_message(&key, &b"key-params".to_vec().into(), None, None, vec![])?;
+
+    // An unregistered key keeps its answers: missing with a message, empty
+    // without one.
+    let unknown = DelegateKey::new([0x5e; 32], CodeHash::new([0x5f; 32]));
+    let err = runtime
+        .inbound_app_message(&unknown, &Vec::new().into(), None, None, msg())
+        .expect_err("an unregistered delegate is missing");
+    assert!(matches!(
+        err.deref(),
+        RuntimeInnerError::DelegateNotFound(_)
+    ));
+    assert!(
+        runtime
+            .inbound_app_message(&unknown, &Vec::new().into(), None, None, vec![])?
+            .is_empty()
     );
     Ok(())
 }

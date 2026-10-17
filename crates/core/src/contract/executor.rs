@@ -292,6 +292,10 @@ pub struct ExecutorError {
     /// Timeout quarantine, suppressing honest peers for up to 2h. The typed field
     /// is unforgeable through contract return text.
     host_timeout: Option<HostTimeoutClass>,
+    /// Set ONLY by [`ExecutorError::execution`] from the typed
+    /// `RuntimeInnerError::DelegateParamsMismatch`, so a delegate cannot set
+    /// it through the text of its own error. See [`Self::is_params_mismatch`].
+    params_mismatch: bool,
 }
 
 /// Provenance class for a host-originated execution timeout (#4864 round-9). See
@@ -349,6 +353,7 @@ impl ExecutorError {
             inner: Either::Right(error.into()),
             fatal: false,
             host_timeout: None,
+            params_mismatch: false,
         }
     }
 
@@ -358,6 +363,7 @@ impl ExecutorError {
             inner: Either::Right(anyhow::anyhow!("internal error")),
             fatal: false,
             host_timeout: None,
+            params_mismatch: false,
         }
     }
 
@@ -366,6 +372,7 @@ impl ExecutorError {
             inner: Either::Left(Box::new(error.into())),
             fatal: false,
             host_timeout: None,
+            params_mismatch: false,
         }
     }
 
@@ -395,8 +402,13 @@ impl ExecutorError {
         } else {
             None
         };
+        let params_mismatch = matches!(
+            outer_error.deref(),
+            RuntimeInnerError::DelegateParamsMismatch(_)
+        );
         let mut err = Self::execution_classified(outer_error, op);
         err.host_timeout = host_timeout;
+        err.params_mismatch = params_mismatch;
         err
     }
 
@@ -434,6 +446,15 @@ impl ExecutorError {
 
         if let RuntimeInnerError::DelegateNotFound(key) = error {
             return ExecutorError::request(StdDelegateError::Missing(key.clone()));
+        }
+
+        // An existing stdlib variant on purpose: adding one to the protocol
+        // enum would break clients built against older stdlib releases.
+        if let RuntimeInnerError::DelegateParamsMismatch(_) = error {
+            return ExecutorError::request(StdDelegateError::ExecutionError(
+                // The runtime error's own text, the single source of the message.
+                format!("{error}").into(),
+            ));
         }
 
         if let RuntimeInnerError::DelegateExecError(e) = error {
@@ -698,6 +719,7 @@ impl ExecutorError {
             inner: Either::Right(anyhow::Error::new(DeferRelatedFetch { missing })),
             fatal: false,
             host_timeout: None,
+            params_mismatch: false,
         }
     }
 
@@ -712,12 +734,14 @@ impl ExecutorError {
                     inner: Either::Right(err),
                     fatal: self.fatal,
                     host_timeout: self.host_timeout,
+                    params_mismatch: self.params_mismatch,
                 }),
             },
             inner @ Either::Left(_) => Err(Self {
                 inner,
                 fatal: self.fatal,
                 host_timeout: self.host_timeout,
+                params_mismatch: self.params_mismatch,
             }),
         }
     }
@@ -731,7 +755,7 @@ impl ExecutorError {
     /// warn level rather than error.
     ///
     /// It also decides what the CLIENT sees (#5727): the executor loop returns it
-    /// as a failure, and `client_events::missing_delegate_client_error` keeps it
+    /// as a failure, and `client_events::typed_delegate_client_error` keeps it
     /// as the typed `DelegateError::Missing` rather than an `OperationError`
     /// string, which in turn lets the websocket `DelegateRateLimiter` back off
     /// repeated requests for the same missing key.
@@ -743,6 +767,14 @@ impl ExecutorError {
                 RequestError::DelegateError(StdDelegateError::Missing(_))
             )
         )
+    }
+
+    /// Whether this is the refusal of a delegate run whose parameters do not
+    /// derive its key (see `Runtime::prepare_delegate_call`). Read from a
+    /// typed flag, not from the message, which a delegate's own error text
+    /// could reproduce.
+    pub(crate) fn is_params_mismatch(&self) -> bool {
+        self.params_mismatch
     }
 
     pub fn unwrap_request(self) -> RequestError {
@@ -767,6 +799,15 @@ impl ExecutorError {
         Self::execution(ce, Some(InnerOpError::Upsert(key)))
     }
 
+    /// Test-only faithful constructor for the refusal of a delegate run whose
+    /// params do not derive its key, built the way the executor builds it.
+    #[cfg(test)]
+    pub(crate) fn test_params_mismatch(key: DelegateKey) -> Self {
+        use crate::wasm_runtime::{ContractError, RuntimeInnerError};
+        let ce: ContractError = RuntimeInnerError::DelegateParamsMismatch(key.clone()).into();
+        Self::execution(ce, Some(InnerOpError::Delegate(key)))
+    }
+
     /// Test-only faithful constructor for a HOST scheduler-overload timeout
     /// (#4864 round-9). See [`ExecutorError::test_host_compute_timeout`].
     #[cfg(test)]
@@ -784,6 +825,7 @@ impl From<RequestError> for ExecutorError {
             inner: Either::Left(Box::new(value)),
             fatal: false,
             host_timeout: None,
+            params_mismatch: false,
         }
     }
 }
@@ -803,6 +845,7 @@ impl From<Box<RequestError>> for ExecutorError {
             inner: Either::Left(value),
             fatal: false,
             host_timeout: None,
+            params_mismatch: false,
         }
     }
 }
@@ -2956,6 +2999,45 @@ mod tests {
 
     mod executor_error_tests {
         use super::*;
+
+        /// The params-mismatch classification comes from the typed runtime
+        /// error, never from the message: a delegate's own error whose text is
+        /// identical to the refusal is not classified as one.
+        ///
+        /// FALSIFY by classifying on the message prefix again: the delegate
+        /// error is classified as a refusal.
+        #[test]
+        fn params_mismatch_is_classified_from_the_typed_error_not_its_text() {
+            use crate::wasm_runtime::{ContractError, DelegateExecError, RuntimeInnerError};
+            let key = DelegateKey::new(
+                [0x21; 32],
+                freenet_stdlib::prelude::CodeHash::new([0x22; 32]),
+            );
+
+            let refused: ContractError =
+                RuntimeInnerError::DelegateParamsMismatch(key.clone()).into();
+            let refused =
+                ExecutorError::execution(refused, Some(InnerOpError::Delegate(key.clone())));
+            assert!(refused.is_params_mismatch());
+
+            let same_text: ContractError = RuntimeInnerError::DelegateExecError(
+                DelegateExecError::DelegateError(freenet_stdlib::prelude::DelegateError::Other(
+                    format!("{} {key}", crate::wasm_runtime::DELEGATE_PARAMS_MISMATCH),
+                )),
+            )
+            .into();
+            let same_text =
+                ExecutorError::execution(same_text, Some(InnerOpError::Delegate(key.clone())));
+            assert_eq!(
+                same_text.to_string(),
+                refused.to_string(),
+                "the delegate error must carry the refusal's exact text for this test to mean anything"
+            );
+            assert!(
+                !same_text.is_params_mismatch(),
+                "a delegate's own error text must not be classified as a node refusal"
+            );
+        }
 
         #[test]
         fn test_executor_error_other_is_not_request() {

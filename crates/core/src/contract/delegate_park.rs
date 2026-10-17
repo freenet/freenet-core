@@ -1074,8 +1074,8 @@ pub(super) enum Delivery {
 ///
 /// `params` is carried explicitly and is NOT optional: `DelegateKey` identity
 /// covers `BLAKE3(code_hash ‖ params)` and the params are threaded into the
-/// WASM env, so resuming with empty params would run a different delegate
-/// instance. (The notification path used to start runs that way; since #5616
+/// WASM env, so resuming with empty params would be refused by the runtime
+/// (`Runtime::prepare_delegate_call`). (The notification path used to start runs that way; since #5616
 /// it uses the delegate's registered params, which this then carries.)
 pub(super) struct Continuation {
     /// Iterations this round-trip has already consumed, so

@@ -396,6 +396,12 @@ impl Executor<Runtime> {
                                 delegate_key = %key_display,
                                 "Delegate not found in store (expected for migration probes)"
                             );
+                        } else if exec_err.is_params_mismatch() {
+                            // Caused by the request, not by this node: warn.
+                            tracing::warn!(
+                                delegate_key = %key_display,
+                                "Delegate request refused: parameters do not match the delegate key"
+                            );
                         } else {
                             tracing::error!(
                                 delegate_key = %key_display,
