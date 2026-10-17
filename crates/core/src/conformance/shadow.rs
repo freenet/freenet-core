@@ -347,10 +347,12 @@ pub(crate) struct FocusPeriodSummary {
     /// #5914 review round 2, K7). False for the first period on a fresh capture
     /// directory, or after the persisted period could not be read. It does not mean
     /// the peer was up throughout: merges during downtime were never observed.
-    /// Counts are checkpointed at every tick, every draw, every verdict and the
-    /// capture writer's 60 s flush, so a crash can lose at most the last minute of
-    /// merge and admission counts from a period that still reads `complete`
-    /// (#5914 review round 3, A1); verdicts are never lost that way.
+    /// Counts are checkpointed at every tick, every draw, every verdict, the
+    /// capture writer's 60 s flush and when the capture channel closes (#5914
+    /// review rounds 3 and 4). The node's usual exit path calls
+    /// `std::process::exit` without closing that channel, so ANY restart, graceful
+    /// or not, can lose up to the last minute of merge and admission counts from a
+    /// period that still reads `complete`; verdicts are never lost that way.
     /// Exclude incomplete periods when measuring.
     pub complete: bool,
     /// Size of the candidate pool at the period's last selection.
@@ -787,7 +789,7 @@ impl ShadowRunner {
     ///
     /// Called from the capture writer's periodic flush (`FLUSH_EVERY`, 60 s), so
     /// merge and admission counts are written at most once a minute instead of on
-    /// every observation (#5914 review round 3, A1). A crash loses at most that
+    /// every observation (#5914 review round 3, A1). A restart loses at most that
     /// interval's counts, which is the tolerance `FocusPeriodSummary::complete`
     /// states.
     pub(crate) fn flush_period(&mut self) {

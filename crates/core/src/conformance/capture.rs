@@ -1016,7 +1016,12 @@ async fn run_writer(
         }
     }
 
-    // Channel closed: the node is going away. Write what we have.
+    // Channel closed: every capture handle is gone. Write what we have, and
+    // checkpoint the focus period too (#5914 review round 4). Note this path is
+    // NOT the node's restart path: the handle lives in the `CAPTURE` static and the
+    // node exits through `std::process::exit` (including for auto-update), so the
+    // channel never closes there. It covers embedders and tests that start capture
+    // with `start` and drop their handles.
     write_all(
         &dir,
         &samplers,
@@ -1024,6 +1029,7 @@ async fn run_writer(
         related_untracked,
     )
     .await;
+    shadow.flush_period();
 }
 
 /// Whether an observed merge counts toward focus activity (#5913, #5914 review D2).
@@ -2624,6 +2630,24 @@ mod probe_wiring_pins {
         assert!(
             arm < flushed && flushed < next_arm,
             "the period flush is not inside the periodic flush arm"
+        );
+    }
+
+    /// The shutdown path checkpoints the focus period too (#5914 review round 4).
+    /// When the channel closes the writer saves the samplers, and must checkpoint the
+    /// period with them. (That path is not the node's restart path, which exits the
+    /// process with the channel still open; see the comment at the call.)
+    #[test]
+    fn shutdown_checkpoints_the_focus_period() {
+        let body = run_writer_code_only();
+        let closed = body
+            .rfind("write_all(")
+            .expect("run_writer no longer writes the samplers on shutdown; re-anchor");
+        let loop_end = body.rfind("loop {").expect("select loop");
+        assert!(closed > loop_end);
+        assert!(
+            body[closed..].contains("shadow.flush_period();"),
+            "the shutdown path saves the samplers but not the focus period"
         );
     }
 
