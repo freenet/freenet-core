@@ -16,7 +16,62 @@ pub enum ConformanceProperty {
     StateIdempotence,
     /// `merge(A, B) == merge(B, A)`
     StateCommutativity,
-    /// `merge(merge(A, B), C) == merge(A, merge(B, C))`
+    /// `merge(merge(A, B), C) == merge(A, merge(B, C))`, or the two groupings
+    /// converge in one exchange to a state that absorbs both.
+    ///
+    /// # What is checked (#5915)
+    ///
+    /// With `L = merge(merge(A, B), C)` and `R = merge(A, merge(B, C))`, `L == R`
+    /// holds outright. Otherwise both must be valid, and with `M = merge(L, R)` the
+    /// case heals only if
+    ///
+    /// ```text
+    /// merge(R, L) == M   and   merge(M, L) == M   and   merge(M, R) == M
+    /// ```
+    ///
+    /// The first clause is one reconciling exchange in both directions: the peer
+    /// holding each grouping receives the other's whole state and they land on the
+    /// same state. The other two make that state stable: a peer still gossiping
+    /// either grouping cannot move it again. Anything else is a violation, and a
+    /// merge that errors along the way is `Inconclusive`. It is the same heal idea
+    /// as [`ConformanceProperty::PathAgreement`]'s guard, a divergence the next
+    /// exchange repairs is not non-convergence, with validity required of both
+    /// sides as there; a merge emitting an invalid state is
+    /// [`ConformanceProperty::EmittedStateValidity`]'s defect.
+    ///
+    /// # Why strict associativity is not the law
+    ///
+    /// Any contract with bounded retention fails it, and cannot help failing it.
+    /// A grouping that truncated an old entry to make room cannot refill the slot
+    /// when a later removal (a ban) or a raised cap frees it, while the other
+    /// grouping still holds the entry. Measured on River's room contract
+    /// (freenet/river#793): 956 of 3200 generated triples fail strictly, about 30%,
+    /// and every one converges on the next exchange. Enforcing the strict form would
+    /// make every capped chat, feed or log removable, and a participant able to
+    /// trigger a removal could build a failing triple on purpose. Ian's decision,
+    /// 2026-10-16: heal-guarded, not diagnostic-only, severity unchanged. In those
+    /// shapes the converged state is the refilled log, which already holds
+    /// everything either grouping does, so it absorbs both.
+    ///
+    /// # Why convergence alone is not enough
+    ///
+    /// A commutative merge satisfies `merge(R, L) == merge(L, R)` by definition, so
+    /// a convergence-only guard (the first version of this change) silenced every
+    /// commutative contract. Integer averaging shows what that lets through: the
+    /// groupings converge to a midpoint, and merging either grouping back in moves
+    /// the state off it again, so the network never settles. The absorption clauses
+    /// catch that (Ian, 2026-10-17).
+    ///
+    /// # What the guard still lets through
+    ///
+    /// A contract whose groupings differ but converge to a state absorbing both is
+    /// not reported, even when the merge is not a semilattice join. Measured: the
+    /// partially-ordered cap documented under
+    /// [`ConformanceProperty::TransitionPathAgreement`] heals in all 532 of its
+    /// strictly failing triples, so this property no longer condemns it. A
+    /// content-indexed cap (`CAPPED_SET` in the fixture contract) is still reported,
+    /// but only on triples where the converged state fails to absorb a grouping, not
+    /// on every strict failure.
     StateAssociativity,
     /// Every state emitted by `update_state` is itself valid.
     EmittedStateValidity,
@@ -343,6 +398,25 @@ pub enum ConformanceProperty {
     /// nothing it had not already lost. Either way there is no contract that this
     /// property alone condemns while the settled algebra would have acquitted it.
     ///
+    /// **Open since #5915: that last sentence no longer holds in full.** It
+    /// assumed "satisfies `StateAssociativity`" meant strict associativity. The
+    /// property now accepts groupings that converge in one exchange to a state
+    /// absorbing both, so a commutative, idempotent, non-associative merge can pass
+    /// all three laws without being a semilattice join, and the order above is not
+    /// defined for it. Precisely what differs from before #5915:
+    ///
+    /// - `CAPPED_SET` (content-indexed eviction) is again condemned by
+    ///   associativity, but only on triples whose converged state fails to absorb a
+    ///   grouping. Whether a given corpus contains such a triple is now a question
+    ///   of coverage, where before any strict failure sufficed.
+    /// - The partially-ordered cap below is condemned by this property ALONE: all
+    ///   532 of its strictly failing triples heal.
+    ///
+    /// This property is not self-verifying and is refused as evidence, so the
+    /// exposure is limited to shadow mode and `fdev`, but whether its severity
+    /// still stands is a decision for the same review that settles enforcement, not
+    /// one to make silently here.
+    ///
     /// Two guards keep it from firing on a contract that is merely doing bookkeeping
     /// rather than losing information:
     ///
@@ -366,7 +440,8 @@ pub enum ConformanceProperty {
     /// - A cap that evicts by something independent of that ordering — arrival
     ///   order, a hash, `CAPPED_SET` in the fixture contract — does fire, and that
     ///   contract is already removal-eligible under
-    ///   [`ConformanceProperty::StateAssociativity`] for the same underlying reason.
+    ///   [`ConformanceProperty::StateAssociativity`] for the same underlying reason,
+    ///   on the triples whose groupings do not converge to a state absorbing both.
     /// - The **partially-ordered** cap is the case the first version of this
     ///   property could not rule out: keep the at-most-N *maximal* elements under a
     ///   causal partial order, breaking ties among mutually incomparable survivors
@@ -377,11 +452,13 @@ pub enum ConformanceProperty {
     ///   idempotent with zero failures — and **not associative**, 532 failing
     ///   triples, the smallest being
     ///   `(({1} ⊔ {2}) ⊔ {3,5}) = {2,3}` against `({1} ⊔ ({2} ⊔ {3,5})) = {1,3}`.
-    ///   So it is already removal-eligible under `StateAssociativity` before this
-    ///   property is consulted, which closes the gap: the transition law condemns no
-    ///   contract the settled algebra acquits. It does also fire here — base
-    ///   `{2,5}`, an op reaching `{2,3}`, `merge(base, result) = {3,5}` — which is
-    ///   the consistency the algebra above predicts, not a second accusation.
+    ///   Before #5915 that made it removal-eligible under `StateAssociativity`
+    ///   before this property was consulted, which closed the gap. Under the heal
+    ///   guard every one of those groupings converges to a state absorbing both
+    ///   (smallest: `M = {2,3} ⊔ {1,3} = {2,3}`, which absorbs `{2,3}` and
+    ///   `{1,3}`), so the gap is open again, as noted above. It fires here —
+    ///   base `{2,5}`, an op reaching `{2,3}`, `merge(base, result) = {3,5}` — and
+    ///   is now the only removal-eligible property that does.
     ///
     /// All of these are pinned by tests.
     ///

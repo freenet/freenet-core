@@ -371,8 +371,23 @@ fn non_idempotent_merge_is_caught() {
 
 /// Commutative and idempotent, but not associative: integer averaging.
 ///
-/// `avg(avg(1,3),5) = 3` while `avg(1,avg(3,5)) = 2`. Worth having as a distinct
-/// case because a detector that only checks pairs would call this contract clean.
+/// Worth having as a distinct case because a detector that only checks pairs would
+/// call this contract clean. It is also the pin for the ABSORPTION half of the heal
+/// guard (#5915): the merge commutes, so the two groupings always converge on one
+/// exchange, `merge(L, R) == merge(R, L) == M`. What fails is that `M` does not
+/// absorb both groupings, so a peer that merges either one back in moves off `M`
+/// and the network keeps churning.
+///
+/// Two triples, one per absorption clause, so deleting either clause turns one of
+/// them green:
+///
+/// - `(0, 0, 8)`: `L = 4`, `R = 2`, `M = 3`. `M` absorbs `L` (`avg(3, 4) = 3`)
+///   but not `R` (`avg(3, 2) = 2`).
+/// - `(8, 0, 0)`: `L = 2`, `R = 4`, `M = 3`. `M` absorbs `R` but not `L`.
+///
+/// And one triple that is NOT reported, because it heals: `(1, 3, 5)` gives `L = 3`,
+/// `R = 2`, `M = 2`, and `M` absorbs both. Groupings one apart heal; two or more
+/// apart do not. This was the triple the test used before #5915.
 #[test]
 fn associativity_only_defect_needs_the_triple_check() {
     fn avg(a: &[u8], b: &[u8]) -> Vec<u8> {
@@ -405,13 +420,235 @@ fn associativity_only_defect_needs_the_triple_check() {
         &case(ConformanceProperty::StateIdempotence, &[&[1]]),
     ));
 
-    let mut fake = build();
+    // (triple, M absorbs L, M absorbs R). Each fact is asserted from the merge
+    // itself, so the triples cannot drift away from the clause they pin.
+    for (triple, absorbs_left, absorbs_right) in [
+        ([[0u8], [0], [8]], true, false),
+        ([[8u8], [0], [0]], false, true),
+    ] {
+        let [a, b, c] = triple;
+        let (left, right) = (avg(&avg(&a, &b), &c), avg(&a, &avg(&b, &c)));
+        let m = avg(&left, &right);
+        assert_ne!(left, right, "{triple:?} must fail strict associativity");
+        assert_eq!(m, avg(&right, &left), "{triple:?}: the groupings converge");
+        assert_eq!(avg(&m, &left) == m, absorbs_left, "{triple:?}: M vs L");
+        assert_eq!(avg(&m, &right) == m, absorbs_right, "{triple:?}: M vs R");
+
+        assert_violates(
+            verify_case(
+                &mut build(),
+                &case(ConformanceProperty::StateAssociativity, &[&a, &b, &c]),
+            ),
+            ConformanceProperty::StateAssociativity,
+        );
+    }
+
+    let (left, right) = (avg(&avg(&[1], &[3]), &[5]), avg(&[1], &avg(&[3], &[5])));
+    let m = avg(&left, &right);
+    assert_ne!(left, right, "(1, 3, 5) must fail strict associativity");
+    assert_eq!(
+        (avg(&m, &left), avg(&m, &right)),
+        (m.clone(), m),
+        "(1, 3, 5) must heal"
+    );
+    assert_holds(verify_case(
+        &mut build(),
+        &case(ConformanceProperty::StateAssociativity, &[&[1], &[3], &[5]]),
+    ));
+}
+
+// ------------------------------------- associativity heals or it is reported (#5915)
+
+/// Bytes below this are messages; the retained log is the largest ones.
+const LOG_BAN: u8 = 100;
+/// Bytes at or above this raise the cap to `byte - LOG_CAP`; the largest wins.
+const LOG_CAP: u8 = 200;
+/// How many messages are kept when no state has raised the cap.
+const LOG_DEFAULT_CAP: usize = 2;
+
+/// A bounded-retention log: the shape of a capped chat, feed or audit log.
+///
+/// One byte per entry, in three disjoint ranges so a sorted state is canonical:
+///
+/// - `0..LOG_BAN` — a message. Only the newest (largest) `cap` survive.
+/// - `LOG_BAN..LOG_CAP` — a ban on message `byte - LOG_BAN`, which removes it.
+/// - `LOG_CAP..` — a cap of `byte - LOG_CAP` messages. The largest cap wins.
+///
+/// The merge is a function of the union of its inputs, so it is commutative, and it
+/// is idempotent on its own output. It is NOT strictly associative, and cannot be:
+/// a message truncated away to make room is gone from that grouping, so when a
+/// later removal or a raised cap frees the slot, one grouping refills it and the
+/// other has nothing to refill it with (#5915). Both groupings still converge on the
+/// next exchange, which is why `StateAssociativity` must not report them.
+fn bounded_log(a: &[u8], b: &[u8]) -> Vec<u8> {
+    let all = union(a, b);
+    let banned: Vec<u8> = all
+        .iter()
+        .filter(|x| (LOG_BAN..LOG_CAP).contains(*x))
+        .map(|x| x - LOG_BAN)
+        .collect();
+    let cap_marker = all.iter().copied().filter(|x| *x >= LOG_CAP).max();
+    let cap = cap_marker.map_or(LOG_DEFAULT_CAP, |m| (m - LOG_CAP) as usize);
+    let mut messages: Vec<u8> = all
+        .iter()
+        .copied()
+        .filter(|x| *x < LOG_BAN && !banned.contains(x))
+        .collect();
+    while messages.len() > cap {
+        messages.remove(0);
+    }
+    messages.extend(
+        all.iter()
+            .copied()
+            .filter(|x| (LOG_BAN..LOG_CAP).contains(x)),
+    );
+    messages.extend(cap_marker);
+    messages
+}
+
+fn bounded_log_contract() -> Fake {
+    Fake::conforming()
+        .merging(|a, b| Ok(bounded_log(a, b)))
+        .applying(|a, b| Ok(bounded_log(a, b)))
+        .validating(|state| {
+            if bounded_log(state, &[]) == state {
+                Ok(ValidateResult::Valid)
+            } else {
+                Ok(ValidateResult::Invalid)
+            }
+        })
+}
+
+/// A bounded-retention triple that fails STRICT associativity but heals on one more
+/// exchange is not reported. Both minimal shapes from #5915 are covered: a removal
+/// arriving after truncation, and a cap raised after truncation with no removal.
+///
+/// Each triple's strict failure is asserted directly first, or a passing verdict
+/// would prove nothing: the test would hold just as well against a contract that
+/// happened to be associative on these inputs.
+#[test]
+fn a_bounded_retention_triple_that_heals_is_not_reported() {
+    let removal: [&[u8]; 3] = [&[1, 2], &[3], &[LOG_BAN + 3]];
+    let raised_cap: [&[u8]; 3] = [&[1, 2], &[3], &[LOG_CAP + 3]];
+
+    for (shape, [a, b, c]) in [
+        ("removal after truncation", removal),
+        ("cap raised", raised_cap),
+    ] {
+        let left = bounded_log(&bounded_log(a, b), c);
+        let right = bounded_log(a, &bounded_log(b, c));
+        assert_ne!(
+            left, right,
+            "{shape}: the triple must fail strict associativity, or this tests nothing"
+        );
+        let m = bounded_log(&left, &right);
+        assert_eq!(
+            m,
+            bounded_log(&right, &left),
+            "{shape}: the two groupings must converge on one more exchange, or this \
+             is not the healing shape #5915 describes"
+        );
+        assert_eq!(
+            (bounded_log(&m, &left), bounded_log(&m, &right)),
+            (m.clone(), m.clone()),
+            "{shape}: the converged state must absorb both groupings"
+        );
+
+        // The pairwise laws hold, so the triple is the only place this could fire.
+        let mut fake = bounded_log_contract();
+        assert_holds(verify_case(
+            &mut fake,
+            &case(ConformanceProperty::StateCommutativity, &[a, c]),
+        ));
+        assert_holds(verify_case(
+            &mut fake,
+            &case(ConformanceProperty::StateIdempotence, &[a]),
+        ));
+
+        assert_holds(verify_case(
+            &mut bounded_log_contract(),
+            &case(ConformanceProperty::StateAssociativity, &[a, b, c]),
+        ));
+    }
+}
+
+/// A merge whose two groupings do not reconcile on the next exchange is still
+/// reported, still minimizes, and still replays from evidence.
+///
+/// Saturating subtraction: `(5 - 3) - 2 = 0` against `5 - (3 - 2) = 4`, and then
+/// `0 - 4 = 0` against `4 - 0 = 4`, so the peer holding each grouping keeps it.
+#[test]
+fn groupings_that_never_reconcile_are_still_reported() {
+    use super::minimize::{MinimizeConfig, minimize};
+
+    let build = || {
+        Fake::conforming()
+            .merging(|a, b| {
+                let (x, y) = (
+                    a.first().copied().unwrap_or(0),
+                    b.first().copied().unwrap_or(0),
+                );
+                Ok(vec![x.saturating_sub(y)])
+            })
+            .validating(|state| {
+                if state.len() == 1 {
+                    Ok(ValidateResult::Valid)
+                } else {
+                    Ok(ValidateResult::Invalid)
+                }
+            })
+    };
+    let triple = case(ConformanceProperty::StateAssociativity, &[&[5], &[3], &[2]]);
+
     assert_violates(
+        verify_case(&mut build(), &triple),
+        ConformanceProperty::StateAssociativity,
+    );
+
+    let (minimized, _) = minimize(&mut build(), &triple, &[], &[], &MinimizeConfig::default());
+    assert_violates(
+        verify_case(&mut build(), &minimized),
+        ConformanceProperty::StateAssociativity,
+    );
+
+    let evidence = ConformanceEvidence::new(instance(5), vec![], &minimized, None);
+    evidence.check_bounds().expect("bounds");
+    assert_violates(
+        verify_case(&mut build(), &evidence.to_case().expect("to_case")),
+        ConformanceProperty::StateAssociativity,
+    );
+}
+
+/// The two groupings get the same validity precondition before the heal step that
+/// `path_agreement` gives its two paths: a state the contract rejects never reaches
+/// another peer, so asking whether it would reconcile asks about a history that
+/// cannot happen. A merge that EMITS an invalid state is `EmittedStateValidity`'s
+/// defect, not this one.
+#[test]
+fn an_invalid_grouping_is_inconclusive_rather_than_reconciled() {
+    // The saturating-subtraction merge above, except that it reports 0 as invalid.
+    // The left grouping of this triple is 0, and the inputs and intermediates are not.
+    let mut fake = Fake::conforming()
+        .merging(|a, b| {
+            let (x, y) = (
+                a.first().copied().unwrap_or(0),
+                b.first().copied().unwrap_or(0),
+            );
+            Ok(vec![x.saturating_sub(y)])
+        })
+        .validating(|state| {
+            if state.len() == 1 && state[0] != 0 {
+                Ok(ValidateResult::Valid)
+            } else {
+                Ok(ValidateResult::Invalid)
+            }
+        });
+    assert_inconclusive(
         verify_case(
             &mut fake,
-            &case(ConformanceProperty::StateAssociativity, &[&[1], &[3], &[5]]),
+            &case(ConformanceProperty::StateAssociativity, &[&[5], &[3], &[2]]),
         ),
-        ConformanceProperty::StateAssociativity,
+        Inconclusive::InputNotValid,
     );
 }
 
@@ -1881,7 +2118,9 @@ fn a_sound_bounded_collection_is_not_accused() {
 /// caught — and that is correct rather than a false positive: such a contract is
 /// already removal-eligible under `StateAssociativity`, for the same underlying
 /// reason (an entry dropped early destroys information a different merge order
-/// would have kept).
+/// would have kept). Under the #5915 heal guard that holds on triples whose
+/// converged state fails to absorb a grouping, such as `(1)`, `(2,3,4)`, `(5)`,
+/// asserted below, and not on every strictly failing triple.
 ///
 /// Asserted rather than left in prose, because it is the boundary the severity
 /// argument rests on: the property distinguishes the two caps, and does not simply
@@ -1905,6 +2144,16 @@ fn capped_collection_evicting_outside_the_merge_order_is_caught() {
     assert_violates(
         verify_case(&mut fake, &built),
         ConformanceProperty::TransitionPathAgreement,
+    );
+    assert_violates(
+        verify_case(
+            &mut fake,
+            &case(
+                ConformanceProperty::StateAssociativity,
+                &[&[1], &[2, 3, 4], &[5]],
+            ),
+        ),
+        ConformanceProperty::StateAssociativity,
     );
 
     // ...and the SOUND cap above really is a different answer from this one, so the
@@ -1942,16 +2191,20 @@ fn capped_collection_evicting_outside_the_merge_order_is_caught() {
 /// Brute-forced over its whole state space on 2026-08-23 (universe of five elements,
 /// `1` causally after `5`, N = 2, ties by keeping the largest: 15 valid states) it
 /// is commutative and idempotent with zero failures, and NOT associative — 532
-/// failing triples. So it is already removal-eligible under `StateAssociativity`
-/// before this property is consulted, which is what closes the gap: the transition
-/// law condemns no contract the settled algebra acquits. It fires here too, which is
-/// the consistency the semilattice argument in `TransitionPathAgreement`'s
-/// documentation predicts rather than a second, independent accusation.
+/// failing triples.
 ///
-/// Both halves are asserted. Asserting only the firing would leave the important
-/// half — that associativity already had it — as prose.
+/// Until #5915 that made it removal-eligible under `StateAssociativity` before the
+/// transition law was consulted, which is what this test was written to pin: the
+/// transition law condemned no contract the settled algebra acquitted. **That no
+/// longer holds, and the stronger converge-and-absorb guard does not restore it.**
+/// The merge is a function of the union, so every grouping converges in one
+/// exchange, and brute force over the same 15 states (2026-10-17) finds the
+/// converged state absorbs both groupings in ALL 532 strictly failing triples.
+/// Associativity is therefore silent on this contract, and `TransitionPathAgreement`
+/// condemns it ALONE. Both facts are asserted, so the gap in that property's
+/// severity argument is visible here rather than only in its documentation.
 #[test]
-fn a_partially_ordered_cap_is_already_caught_by_associativity() {
+fn a_partially_ordered_cap_heals_under_associativity_but_not_the_transition_law() {
     const N: usize = 2;
     // `1` is causally after `5`, so a set holding both keeps only `1`.
     fn dominates(after: u8, before: u8) -> bool {
@@ -1984,18 +2237,25 @@ fn a_partially_ordered_cap_is_already_caught_by_associativity() {
             })
     };
 
-    // The half that closes the gap: associativity already condemns it. The triple is
-    // the smallest of the 532 the brute force found.
-    assert_violates(
-        verify_case(
-            &mut fake(),
-            &case(
-                ConformanceProperty::StateAssociativity,
-                &[&[1], &[2], &[3, 5]],
-            ),
-        ),
-        ConformanceProperty::StateAssociativity,
+    // The smallest of the 532 strictly failing triples the brute force found. It
+    // still fails strictly, and it heals, so associativity is silent.
+    let strict = |a: &[u8], b: &[u8], c: &[u8]| {
+        let left = cap(&cap(a, b).unwrap(), c).unwrap();
+        let right = cap(a, &cap(b, c).unwrap()).unwrap();
+        (left, right)
+    };
+    let (left, right) = strict(&[1], &[2], &[3, 5]);
+    assert_eq!(
+        (left.as_slice(), right.as_slice()),
+        (&[2, 3][..], &[1, 3][..])
     );
+    assert_holds(verify_case(
+        &mut fake(),
+        &case(
+            ConformanceProperty::StateAssociativity,
+            &[&[1], &[2], &[3, 5]],
+        ),
+    ));
 
     // ...and the pairwise laws do NOT, which is why the shape looked plausible.
     for pairwise in [
@@ -2011,7 +2271,8 @@ fn a_partially_ordered_cap_is_already_caught_by_associativity() {
         );
     }
 
-    // The transition law fires too, on the step the brute force identified.
+    // The transition law fires, on the step the brute force identified, and is now
+    // the only removal-eligible property that does.
     let mut oracle = fake();
     let built = transition_case(&mut oracle, &[2, 5], &[1, 3]);
     assert_eq!(
