@@ -415,6 +415,195 @@ fn associativity_only_defect_needs_the_triple_check() {
     );
 }
 
+// ------------------------------------- associativity heals or it is reported (#5915)
+
+/// Bytes below this are messages; the retained log is the largest ones.
+const LOG_BAN: u8 = 100;
+/// Bytes at or above this raise the cap to `byte - LOG_CAP`; the largest wins.
+const LOG_CAP: u8 = 200;
+/// How many messages are kept when no state has raised the cap.
+const LOG_DEFAULT_CAP: usize = 2;
+
+/// A bounded-retention log: the shape of a capped chat, feed or audit log.
+///
+/// One byte per entry, in three disjoint ranges so a sorted state is canonical:
+///
+/// - `0..LOG_BAN` — a message. Only the newest (largest) `cap` survive.
+/// - `LOG_BAN..LOG_CAP` — a ban on message `byte - LOG_BAN`, which removes it.
+/// - `LOG_CAP..` — a cap of `byte - LOG_CAP` messages. The largest cap wins.
+///
+/// The merge is a function of the union of its inputs, so it is commutative, and it
+/// is idempotent on its own output. It is NOT strictly associative, and cannot be:
+/// a message truncated away to make room is gone from that grouping, so when a
+/// later removal or a raised cap frees the slot, one grouping refills it and the
+/// other has nothing to refill it with (#5915). Both groupings still converge on the
+/// next exchange, which is why `StateAssociativity` must not report them.
+fn bounded_log(a: &[u8], b: &[u8]) -> Vec<u8> {
+    let all = union(a, b);
+    let banned: Vec<u8> = all
+        .iter()
+        .filter(|x| (LOG_BAN..LOG_CAP).contains(*x))
+        .map(|x| x - LOG_BAN)
+        .collect();
+    let cap_marker = all.iter().copied().filter(|x| *x >= LOG_CAP).max();
+    let cap = cap_marker.map_or(LOG_DEFAULT_CAP, |m| (m - LOG_CAP) as usize);
+    let mut messages: Vec<u8> = all
+        .iter()
+        .copied()
+        .filter(|x| *x < LOG_BAN && !banned.contains(x))
+        .collect();
+    while messages.len() > cap {
+        messages.remove(0);
+    }
+    messages.extend(
+        all.iter()
+            .copied()
+            .filter(|x| (LOG_BAN..LOG_CAP).contains(x)),
+    );
+    messages.extend(cap_marker);
+    messages
+}
+
+fn bounded_log_contract() -> Fake {
+    Fake::conforming()
+        .merging(|a, b| Ok(bounded_log(a, b)))
+        .applying(|a, b| Ok(bounded_log(a, b)))
+        .validating(|state| {
+            if bounded_log(state, &[]) == state {
+                Ok(ValidateResult::Valid)
+            } else {
+                Ok(ValidateResult::Invalid)
+            }
+        })
+}
+
+/// A bounded-retention triple that fails STRICT associativity but heals on one more
+/// exchange is not reported. Both minimal shapes from #5915 are covered: a removal
+/// arriving after truncation, and a cap raised after truncation with no removal.
+///
+/// Each triple's strict failure is asserted directly first, or a passing verdict
+/// would prove nothing: the test would hold just as well against a contract that
+/// happened to be associative on these inputs.
+#[test]
+fn a_bounded_retention_triple_that_heals_is_not_reported() {
+    let removal: [&[u8]; 3] = [&[1, 2], &[3], &[LOG_BAN + 3]];
+    let raised_cap: [&[u8]; 3] = [&[1, 2], &[3], &[LOG_CAP + 3]];
+
+    for (shape, [a, b, c]) in [
+        ("removal after truncation", removal),
+        ("cap raised", raised_cap),
+    ] {
+        let left = bounded_log(&bounded_log(a, b), c);
+        let right = bounded_log(a, &bounded_log(b, c));
+        assert_ne!(
+            left, right,
+            "{shape}: the triple must fail strict associativity, or this tests nothing"
+        );
+        assert_eq!(
+            bounded_log(&left, &right),
+            bounded_log(&right, &left),
+            "{shape}: the two groupings must converge on one more exchange, or this \
+             is not the healing shape #5915 describes"
+        );
+
+        // The pairwise laws hold, so the triple is the only place this could fire.
+        let mut fake = bounded_log_contract();
+        assert_holds(verify_case(
+            &mut fake,
+            &case(ConformanceProperty::StateCommutativity, &[a, c]),
+        ));
+        assert_holds(verify_case(
+            &mut fake,
+            &case(ConformanceProperty::StateIdempotence, &[a]),
+        ));
+
+        assert_holds(verify_case(
+            &mut bounded_log_contract(),
+            &case(ConformanceProperty::StateAssociativity, &[a, b, c]),
+        ));
+    }
+}
+
+/// A merge whose two groupings do not reconcile on the next exchange is still
+/// reported, still minimizes, and still replays from evidence.
+///
+/// Saturating subtraction: `(5 - 3) - 2 = 0` against `5 - (3 - 2) = 4`, and then
+/// `0 - 4 = 0` against `4 - 0 = 4`, so the peer holding each grouping keeps it.
+#[test]
+fn groupings_that_never_reconcile_are_still_reported() {
+    use super::minimize::{MinimizeConfig, minimize};
+
+    let build = || {
+        Fake::conforming()
+            .merging(|a, b| {
+                let (x, y) = (
+                    a.first().copied().unwrap_or(0),
+                    b.first().copied().unwrap_or(0),
+                );
+                Ok(vec![x.saturating_sub(y)])
+            })
+            .validating(|state| {
+                if state.len() == 1 {
+                    Ok(ValidateResult::Valid)
+                } else {
+                    Ok(ValidateResult::Invalid)
+                }
+            })
+    };
+    let triple = case(ConformanceProperty::StateAssociativity, &[&[5], &[3], &[2]]);
+
+    assert_violates(
+        verify_case(&mut build(), &triple),
+        ConformanceProperty::StateAssociativity,
+    );
+
+    let (minimized, _) = minimize(&mut build(), &triple, &[], &[], &MinimizeConfig::default());
+    assert_violates(
+        verify_case(&mut build(), &minimized),
+        ConformanceProperty::StateAssociativity,
+    );
+
+    let evidence = ConformanceEvidence::new(instance(5), vec![], &minimized, None);
+    evidence.check_bounds().expect("bounds");
+    assert_violates(
+        verify_case(&mut build(), &evidence.to_case().expect("to_case")),
+        ConformanceProperty::StateAssociativity,
+    );
+}
+
+/// The two groupings get the same validity precondition before the heal step that
+/// `path_agreement` gives its two paths: a state the contract rejects never reaches
+/// another peer, so asking whether it would reconcile asks about a history that
+/// cannot happen. A merge that EMITS an invalid state is `EmittedStateValidity`'s
+/// defect, not this one.
+#[test]
+fn an_invalid_grouping_is_inconclusive_rather_than_reconciled() {
+    // The saturating-subtraction merge above, except that it reports 0 as invalid.
+    // The left grouping of this triple is 0, and the inputs and intermediates are not.
+    let mut fake = Fake::conforming()
+        .merging(|a, b| {
+            let (x, y) = (
+                a.first().copied().unwrap_or(0),
+                b.first().copied().unwrap_or(0),
+            );
+            Ok(vec![x.saturating_sub(y)])
+        })
+        .validating(|state| {
+            if state.len() == 1 && state[0] != 0 {
+                Ok(ValidateResult::Valid)
+            } else {
+                Ok(ValidateResult::Invalid)
+            }
+        });
+    assert_inconclusive(
+        verify_case(
+            &mut fake,
+            &case(ConformanceProperty::StateAssociativity, &[&[5], &[3], &[2]]),
+        ),
+        Inconclusive::InputNotValid,
+    );
+}
+
 #[test]
 fn non_idempotent_delta_is_caught() {
     // Append rather than union: re-delivering the same delta appends again.
