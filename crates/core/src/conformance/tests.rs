@@ -439,6 +439,12 @@ const LOG_DEFAULT_CAP: usize = 2;
 /// other has nothing to refill it with (#5915). Both groupings still converge on the
 /// next exchange, which is why `StateAssociativity` must not report them.
 fn bounded_log(a: &[u8], b: &[u8]) -> Vec<u8> {
+    bounded_log_keeping(a, b, false)
+}
+
+/// [`bounded_log`], or with `keep_oldest` the variant that truncates the NEWEST
+/// messages instead: a log that keeps its first `cap` entries.
+fn bounded_log_keeping(a: &[u8], b: &[u8], keep_oldest: bool) -> Vec<u8> {
     let all = union(a, b);
     let banned: Vec<u8> = all
         .iter()
@@ -453,7 +459,11 @@ fn bounded_log(a: &[u8], b: &[u8]) -> Vec<u8> {
         .filter(|x| *x < LOG_BAN && !banned.contains(x))
         .collect();
     while messages.len() > cap {
-        messages.remove(0);
+        if keep_oldest {
+            messages.pop();
+        } else {
+            messages.remove(0);
+        }
     }
     messages.extend(
         all.iter()
@@ -668,23 +678,41 @@ fn a_cyclic_pick_one_merge_is_reported() {
         (m.clone(), m.clone(), m)
     );
 
+    let triple = case(ConformanceProperty::StateAssociativity, &[a, b, c]);
     assert_violates(
-        verify_case(
-            &mut build(),
-            &case(ConformanceProperty::StateAssociativity, &[a, b, c]),
-        ),
+        verify_case(&mut build(), &triple),
+        ConformanceProperty::StateAssociativity,
+    );
+
+    // A cycle verdict must minimize and replay from evidence like any other: the
+    // receiving peer re-runs the heal step itself, so nothing about the cycle is
+    // taken on trust.
+    use super::minimize::{MinimizeConfig, minimize};
+    let (minimized, _) = minimize(&mut build(), &triple, &[], &[], &MinimizeConfig::default());
+    assert_violates(
+        verify_case(&mut build(), &minimized),
+        ConformanceProperty::StateAssociativity,
+    );
+    let evidence = ConformanceEvidence::new(instance(6), vec![], &minimized, None);
+    evidence.check_bounds().expect("bounds");
+    assert_violates(
+        verify_case(&mut build(), &evidence.to_case().expect("to_case")),
         ConformanceProperty::StateAssociativity,
     );
 }
 
-/// Every strictly failing bounded-log triple heals, over a whole small state space.
+/// Every strictly failing bounded-log triple heals, over a whole small state space,
+/// for both truncation orders.
 ///
-/// Messages 1..=4, bans on 3 and 4, caps 1 and 3: 80 valid states, 512,000 triples,
-/// 36,252 failing strict associativity (measured 2026-10-17). Exhaustive rather
-/// than two hand-picked shapes, because the review that proposed absorbing `A`,
-/// `B` and `C` without iterating measured that it wrongly reports 2 of these: a
-/// raised cap re-admits a truncated message, and the converged state needs one more
-/// merge, e.g. `A = [4, 103, 201]`, `B = [1, 2]`, `C = [3, 4, 203]`.
+/// Messages 1..=4, bans on 3 and 4, caps 1 and 3: 80 valid states and 512,000
+/// triples per variant. Keeping the newest messages, 36,252 fail strict
+/// associativity; keeping the oldest, 21,980 (measured 2026-10-17). Exhaustive
+/// rather than two hand-picked shapes, because the review that proposed absorbing
+/// `A`, `B` and `C` without iterating measured that it wrongly reports 2 of the
+/// first variant's: a raised cap re-admits a truncated message, and the converged
+/// state needs one more merge, e.g. `A = [4, 103, 201]`, `B = [1, 2]`,
+/// `C = [3, 4, 203]`. Every merge here is also absorbing on re-delivery, which is
+/// the property the heal step's re-delivery check relies on a join having.
 #[test]
 fn every_bounded_log_triple_heals() {
     let pool: Vec<u8> = vec![
@@ -697,38 +725,53 @@ fn every_bounded_log_triple_heals() {
         LOG_CAP + 1,
         LOG_CAP + 3,
     ];
-    let states: Vec<Vec<u8>> = (0u32..1 << pool.len())
-        .map(|mask| {
-            pool.iter()
-                .enumerate()
-                .filter(|(i, _)| mask & (1 << i) != 0)
-                .map(|(_, x)| *x)
-                .collect::<Vec<u8>>()
-        })
-        .filter(|s| bounded_log(s, &[]) == *s)
-        .collect();
-    assert_eq!(states.len(), 80, "the measured state space moved");
+    for (keep_oldest, expected_failures) in [(false, 36_252usize), (true, 21_980)] {
+        let log = move |a: &[u8], b: &[u8]| bounded_log_keeping(a, b, keep_oldest);
+        let states: Vec<Vec<u8>> = (0u32..1 << pool.len())
+            .map(|mask| {
+                pool.iter()
+                    .enumerate()
+                    .filter(|(i, _)| mask & (1 << i) != 0)
+                    .map(|(_, x)| *x)
+                    .collect::<Vec<u8>>()
+            })
+            .filter(|s| log(s, &[]) == *s)
+            .collect();
+        assert_eq!(states.len(), 80, "the measured state space moved");
 
-    let mut fake = bounded_log_contract();
-    let mut strict_failures = 0usize;
-    for a in &states {
-        for b in &states {
-            for c in &states {
-                if bounded_log(&bounded_log(a, b), c) != bounded_log(a, &bounded_log(b, c)) {
-                    strict_failures += 1;
+        let mut fake = Fake::conforming()
+            .merging(move |a, b| Ok(log(a, b)))
+            .validating(move |state| {
+                if log(state, &[]) == state {
+                    Ok(ValidateResult::Valid)
+                } else {
+                    Ok(ValidateResult::Invalid)
                 }
-                let outcome = verify_case(
-                    &mut fake,
-                    &case(ConformanceProperty::StateAssociativity, &[a, b, c]),
-                );
-                assert_eq!(outcome, PropertyOutcome::Holds, "{a:?} {b:?} {c:?}");
+            });
+        let mut strict_failures = 0usize;
+        for a in &states {
+            for b in &states {
+                for c in &states {
+                    if log(&log(a, b), c) != log(a, &log(b, c)) {
+                        strict_failures += 1;
+                    }
+                    let outcome = verify_case(
+                        &mut fake,
+                        &case(ConformanceProperty::StateAssociativity, &[a, b, c]),
+                    );
+                    assert_eq!(
+                        outcome,
+                        PropertyOutcome::Holds,
+                        "keep_oldest={keep_oldest} {a:?} {b:?} {c:?}"
+                    );
+                }
             }
         }
+        assert_eq!(
+            strict_failures, expected_failures,
+            "keep_oldest={keep_oldest}: the guard must actually be exercised"
+        );
     }
-    assert_eq!(
-        strict_failures, 36_252,
-        "the guard must actually be exercised"
-    );
 }
 
 /// After strict associativity has failed on valid inputs and valid groupings, the
@@ -794,34 +837,99 @@ fn a_runtime_failure_in_the_heal_step_is_inconclusive() {
     );
 }
 
-/// A merge that keeps climbing without repeating a state and without settling
-/// within the pass budget is inconclusive, not reported: running out of budget is
-/// not proof of a cycle, and the bias is away from a false removal.
+/// Wide-integer averaging and "max + 1" climbing are reported at any width.
 ///
-/// `merge(a, b) = max(a, b) + 1` for `a != b`: commutative and idempotent, and every
-/// merge of a differing state climbs by one, so no state repeats.
+/// Neither ever repeats a state inside the pass budget once the domain is wider
+/// than a byte, so cycle detection alone left both inconclusive, where strict
+/// associativity had caught them. What does catch them is re-delivery: merging the
+/// same input into the iterate twice moves it again (`avg(avg(m, x), x)` keeps
+/// approaching `x`; `max(m, x) + 1` keeps climbing), which a join never does.
+#[test]
+fn wide_averaging_and_climbing_are_reported_at_any_width() {
+    fn read(state: &[u8]) -> u128 {
+        let mut buf = [0u8; 16];
+        buf[..state.len()].copy_from_slice(state);
+        u128::from_le_bytes(buf)
+    }
+    fn write(value: u128, width: usize) -> Vec<u8> {
+        value.to_le_bytes()[..width].to_vec()
+    }
+    type Op = fn(u128, u128) -> u128;
+    let average: Op = |x, y| (x + y) / 2;
+    let climb: Op = |x, y| if x == y { x } else { x.max(y) + 1 };
+
+    for width in [4usize, 8] {
+        for (name, op, triple) in [
+            ("averaging", average, [0u128, 0, 8_000_000]),
+            ("climbing", climb, [0u128, 1, 5]),
+        ] {
+            let mut fake = Fake::conforming()
+                .merging(move |a, b| Ok(write(op(read(a), read(b)), width)))
+                .validating(move |state| {
+                    if state.len() == width {
+                        Ok(ValidateResult::Valid)
+                    } else {
+                        Ok(ValidateResult::Invalid)
+                    }
+                });
+            let states: Vec<Vec<u8>> = triple.iter().map(|v| write(*v, width)).collect();
+            let outcome = verify_case(
+                &mut fake,
+                &case(
+                    ConformanceProperty::StateAssociativity,
+                    &[&states[0], &states[1], &states[2]],
+                ),
+            );
+            assert!(
+                matches!(&outcome, PropertyOutcome::Violated(v)
+                    if v.property == ConformanceProperty::StateAssociativity),
+                "{name} at {}-bit must be reported, got {outcome:?}",
+                width * 8
+            );
+        }
+    }
+}
+
+/// A merge that keeps moving without repeating a state and without settling within
+/// the pass budget, while absorbing every re-delivery, is inconclusive rather than
+/// reported: running out of budget is not proof, and the bias is away from a false
+/// removal.
+///
+/// State `[counter, tag]`. Merging a state with a different tag bumps the counter
+/// past both and takes the incoming tag; merging one with the same tag keeps the
+/// larger counter. So re-delivering what was just merged changes nothing, but
+/// alternating inputs with different tags climbs forever. On `([0,1], [0,2], [0,1])`
+/// the groupings are `[2,1]` and `[1,1]`, which share a tag and converge on `[2,1]`.
 #[test]
 fn a_heal_that_outruns_the_pass_budget_is_inconclusive() {
+    fn tagged(a: &[u8], b: &[u8]) -> Vec<u8> {
+        if a == b {
+            a.to_vec()
+        } else if a[1] == b[1] {
+            vec![a[0].max(b[0]), a[1]]
+        } else {
+            vec![a[0].max(b[0]).saturating_add(1), b[1]]
+        }
+    }
     let mut fake = Fake::conforming()
-        .merging(|a, b| {
-            let (x, y) = (a[0], b[0]);
-            Ok(vec![if x == y {
-                x
-            } else {
-                x.max(y).saturating_add(1)
-            }])
-        })
+        .merging(|a, b| Ok(tagged(a, b)))
         .validating(|state| {
-            if state.len() == 1 {
+            if state.len() == 2 {
                 Ok(ValidateResult::Valid)
             } else {
                 Ok(ValidateResult::Invalid)
             }
         });
+    let (a, b, c): (&[u8], &[u8], &[u8]) = (&[0, 1], &[0, 2], &[0, 1]);
+    let (left, right) = (tagged(&tagged(a, b), c), tagged(a, &tagged(b, c)));
+    assert_eq!(
+        (left.as_slice(), right.as_slice()),
+        (&[2, 1][..], &[1, 1][..])
+    );
     assert_inconclusive(
         verify_case(
             &mut fake,
-            &case(ConformanceProperty::StateAssociativity, &[&[0], &[1], &[5]]),
+            &case(ConformanceProperty::StateAssociativity, &[a, b, c]),
         ),
         Inconclusive::RoundLimit,
     );
