@@ -237,6 +237,23 @@ struct TelemetryTestCounts {
     outbound_streams_failed: u32,
 }
 
+/// See [`PeerConnection::congestion_probe`].
+#[cfg(test)]
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CongestionProbe {
+    pub flightsize: usize,
+    pub cwnd: usize,
+    /// Smallest RTT sample the sent-packet tracker has taken (every sample
+    /// the controllers see passes through it); `None` before the first one.
+    pub min_rtt_sample: Option<Duration>,
+    pub srtt: Option<Duration>,
+    pub rto_expiries: u64,
+    /// Packets given up on after `MAX_PACKET_RETRANSMITS`.
+    pub abandoned_packets: u32,
+    /// Outbound streams whose send task failed (e.g. the cwnd-wait timeout).
+    pub outbound_streams_failed: u32,
+}
+
 /// The `PeerConnection` struct is responsible for managing the connection with a remote peer.
 /// It provides methods for sending and receiving messages to and from the remote peer.
 ///
@@ -257,23 +274,6 @@ struct TelemetryTestCounts {
 /// sending different types of messages.
 ///
 /// The `packet_sending` function is a helper function used to send packets to the remote peer.
-/// See [`PeerConnection::congestion_probe`].
-#[cfg(test)]
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct CongestionProbe {
-    pub flightsize: usize,
-    pub cwnd: usize,
-    /// Smallest RTT sample the sent-packet tracker has taken (every sample
-    /// the controllers see passes through it); `None` before the first one.
-    pub min_rtt_sample: Option<Duration>,
-    pub srtt: Option<Duration>,
-    pub rto_expiries: u64,
-    /// Packets given up on after `MAX_PACKET_RETRANSMITS`.
-    pub abandoned_packets: u32,
-    /// Outbound streams whose send task failed (e.g. the cwnd-wait timeout).
-    pub outbound_streams_failed: u32,
-}
-
 #[must_use = "call await on the `recv` function to start listening for incoming messages"]
 pub struct PeerConnection<S = super::UdpSocket, T: TimeSource = RealTime> {
     remote_conn: RemoteConnection<S, T>,
