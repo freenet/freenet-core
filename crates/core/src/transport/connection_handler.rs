@@ -3254,6 +3254,13 @@ pub mod mock_transport {
         /// Optional VirtualTime for instant delay simulation in benchmarks.
         /// When set, packet delivery waits until VirtualTime reaches available_at_nanos.
         virtual_time: Option<crate::simulation::VirtualTime>,
+        /// When set, the link model decides every packet's fate and replaces
+        /// the drop and delay policies. Requires `virtual_time`.
+        link: Option<Arc<crate::transport::link_model::LinkModel>>,
+        /// A packet taken off `inbound` whose arrival time has not come yet.
+        /// Kept here so a `recv_from` cancelled while waiting for it (the
+        /// listener polls it inside a `select!`) does not lose the packet.
+        pending_inbound: std::sync::Mutex<Option<(SocketAddr, Vec<u8>, u64)>>,
     }
 
     impl MockSocket {
@@ -3278,6 +3285,8 @@ pub mod mock_transport {
                 )),
                 channels,
                 virtual_time: None,
+                link: None,
+                pending_inbound: std::sync::Mutex::new(None),
             }
         }
 
@@ -3306,6 +3315,8 @@ pub mod mock_transport {
                 )),
                 channels,
                 virtual_time: time_source,
+                link: None,
+                pending_inbound: std::sync::Mutex::new(None),
             }
         }
     }
@@ -3316,12 +3327,30 @@ pub mod mock_transport {
         }
 
         async fn recv_from(&self, buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
-            // Wait for a packet from the channel
-            let Some((remote, packet, available_at_nanos)) =
-                self.inbound.try_lock().unwrap().recv().await
-            else {
-                tracing::error!(this = %self.this, "connection closed");
-                return Err(std::io::ErrorKind::ConnectionAborted.into());
+            // Cancel-safe: the listener polls this inside a `select!`, so it
+            // can be dropped while waiting for a packet's arrival time. The
+            // packet is parked in `pending_inbound` first, so a cancelled wait
+            // resumes on the next call instead of silently losing it.
+            let pending_at = self
+                .pending_inbound
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_ref()
+                .map(|(_, _, at)| *at);
+            let available_at_nanos = match pending_at {
+                Some(at) => at,
+                None => {
+                    let Some(next) = self.inbound.try_lock().unwrap().recv().await else {
+                        tracing::error!(this = %self.this, "connection closed");
+                        return Err(std::io::ErrorKind::ConnectionAborted.into());
+                    };
+                    let at = next.2;
+                    *self
+                        .pending_inbound
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner()) = Some(next);
+                    at
+                }
             };
 
             // Wait until the packet is available (simulates transit delay)
@@ -3333,11 +3362,26 @@ pub mod mock_transport {
             }
 
             // Deliver the packet
+            let Some((remote, packet, _)) = self
+                .pending_inbound
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take()
+            else {
+                // Only this socket's single listener calls recv_from, and the
+                // slot was filled above, so it cannot have been taken.
+                return Err(std::io::ErrorKind::ConnectionAborted.into());
+            };
             buf[..packet.len()].copy_from_slice(&packet[..]);
             Ok((packet.len(), remote))
         }
 
         async fn send_to(&self, buf: &[u8], target: SocketAddr) -> std::io::Result<usize> {
+            if self.link.is_some() {
+                let result = self.send_via_link(buf, target);
+                tokio::task::yield_now().await;
+                return result;
+            }
             let (delay, available_at_nanos) = self.compute_delay_and_timestamp();
 
             // Send packet with delivery timestamp (don't advance VirtualTime here)
@@ -3355,12 +3399,34 @@ pub mod mock_transport {
         }
 
         fn send_to_blocking(&self, buf: &[u8], target: SocketAddr) -> std::io::Result<usize> {
+            if self.link.is_some() {
+                return self.send_via_link(buf, target);
+            }
             let (_delay, available_at_nanos) = self.compute_delay_and_timestamp();
             self.send_packet_internal(buf, target, available_at_nanos)
         }
     }
 
     impl MockSocket {
+        /// Route a packet through the link model, which decides whether and
+        /// when it arrives. A dropped packet still reports success, like UDP.
+        fn send_via_link(&self, buf: &[u8], target: SocketAddr) -> std::io::Result<usize> {
+            let (Some(link), Some(vt)) = (&self.link, &self.virtual_time) else {
+                return Err(std::io::ErrorKind::Unsupported.into());
+            };
+            assert!(self.this != target, "cannot send to self");
+            let Some(arrives_at) = link.on_send(vt.now_nanos(), self.this, target, buf) else {
+                return Ok(buf.len());
+            };
+            let Some(sender) = self.channels.get(&target).map(|v| v.value().clone()) else {
+                return Ok(0);
+            };
+            sender
+                .send((self.this, buf.to_vec(), arrives_at))
+                .map_err(|_| std::io::ErrorKind::ConnectionAborted)?;
+            Ok(buf.len())
+        }
+
         /// Compute delay and delivery timestamp based on packet delay policy.
         fn compute_delay_and_timestamp(&self) -> (Duration, u64) {
             let delay = match &self.packet_delay_policy {
@@ -3699,6 +3765,7 @@ pub mod mock_transport {
             bandwidth_limit,
             time_source,
             None,
+            None,
         )
         .await
     }
@@ -3717,6 +3784,7 @@ pub mod mock_transport {
         bandwidth_limit: Option<usize>,
         time_source: Option<crate::simulation::VirtualTime>,
         congestion_config: Option<CongestionControlConfig>,
+        link: Option<Arc<crate::transport::link_model::LinkModel>>,
     ) -> Result<
         (
             TransportPublicKey,
@@ -3735,16 +3803,16 @@ pub mod mock_transport {
         // Use provided time source or create a new one
         let vt = time_source.unwrap_or_default();
 
-        let socket = Arc::new(
-            MockSocket::with_time_source(
-                packet_drop_policy,
-                packet_delay_policy,
-                (Ipv4Addr::LOCALHOST, port).into(),
-                channels,
-                Some(vt.clone()),
-            )
-            .await,
-        );
+        let mut socket = MockSocket::with_time_source(
+            packet_drop_policy,
+            packet_delay_policy,
+            (Ipv4Addr::LOCALHOST, port).into(),
+            channels,
+            Some(vt.clone()),
+        )
+        .await;
+        socket.link = link;
+        let socket = Arc::new(socket);
 
         // Use the same VirtualTime for both MockSocket and protocol layer
         let (peer_conn, inbound_conn) = OutboundConnectionHandler::new_test_with_congestion_config(
@@ -3789,6 +3857,35 @@ pub mod mock_transport {
             None,
             Some(time_source),
             congestion_config,
+            None,
+        )
+        .await
+        .map(|(pk, (o, _), s)| (pk, o, s))
+    }
+
+    /// Create a mock peer whose every packet goes through `link`, a shared
+    /// [`LinkModel`](crate::transport::link_model::LinkModel) that applies a
+    /// bottleneck queue, propagation delay, loss and scheduled spikes on
+    /// virtual time. The socket's own drop and delay policies are unused.
+    pub async fn create_mock_peer_with_link_model(
+        link: Arc<crate::transport::link_model::LinkModel>,
+        channels: Channels,
+        time_source: crate::simulation::VirtualTime,
+        congestion_config: Option<CongestionControlConfig>,
+    ) -> anyhow::Result<(
+        TransportPublicKey,
+        OutboundConnectionHandler<MockSocket, crate::simulation::VirtualTime>,
+        SocketAddr,
+    )> {
+        create_mock_peer_internal_vt_with_congestion(
+            PacketDropPolicy::ReceiveAll,
+            PacketDelayPolicy::NoDelay,
+            false,
+            channels,
+            None,
+            Some(time_source),
+            congestion_config,
+            Some(link),
         )
         .await
         .map(|(pk, (o, _), s)| (pk, o, s))
