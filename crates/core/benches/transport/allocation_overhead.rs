@@ -12,6 +12,10 @@ use std::sync::Arc;
 /// Maximum packet data size (same as transport layer MAX_PACKET_SIZE)
 const MAX_PACKET_SIZE: usize = 1200;
 
+/// Largest payload one packet carries: MAX_PACKET_SIZE minus the packet-type
+/// byte, the 12-byte nonce and the 16-byte tag (the transport's MAX_DATA_SIZE).
+const MAX_PAYLOAD_SIZE: usize = MAX_PACKET_SIZE - 1 - 12 - 16;
+
 /// Fragment size for stream tests (same as MAX_DATA_SIZE - overhead)
 const FRAGMENT_SIZE: usize = 1130;
 
@@ -25,7 +29,7 @@ pub fn bench_packet_allocation(c: &mut Criterion) {
 
     // Pre-allocate a buffer like PacketData does
     let buffer: [u8; MAX_PACKET_SIZE] = [0xAB; MAX_PACKET_SIZE];
-    let sizes = [64, 256, 1024, 1364, MAX_PACKET_SIZE];
+    let sizes = [64, 256, 1024, MAX_PACKET_SIZE];
 
     for &size in &sizes {
         group.throughput(Throughput::Elements(1));
@@ -157,7 +161,7 @@ pub fn bench_packet_preparation(c: &mut Criterion) {
     let cipher = Aes128Gcm::new(&key.into());
     let nonce: [u8; 12] = [0u8; 12];
 
-    let sizes = [64, 256, 1024, 1364];
+    let sizes = [64, 256, 1024, MAX_PAYLOAD_SIZE];
 
     for &size in &sizes {
         group.throughput(Throughput::Bytes(size as u64));
