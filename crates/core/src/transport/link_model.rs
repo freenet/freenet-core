@@ -33,6 +33,9 @@ use std::time::Duration;
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
 
+#[cfg(test)]
+mod r1_tests;
+
 const NANOS_PER_SEC: u128 = 1_000_000_000;
 
 /// One host's access link. Everything the host sends goes through it.

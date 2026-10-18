@@ -234,6 +234,7 @@ struct TelemetryTestCounts {
     retransmissions: u32,
     keepalive_rtt_samples: u32,
     standalone_ack_flushes: u32,
+    outbound_streams_failed: u32,
 }
 
 /// The `PeerConnection` struct is responsible for managing the connection with a remote peer.
@@ -256,6 +257,23 @@ struct TelemetryTestCounts {
 /// sending different types of messages.
 ///
 /// The `packet_sending` function is a helper function used to send packets to the remote peer.
+/// See [`PeerConnection::congestion_probe`].
+#[cfg(test)]
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CongestionProbe {
+    pub flightsize: usize,
+    pub cwnd: usize,
+    /// Smallest RTT sample the sent-packet tracker has taken (every sample
+    /// the controllers see passes through it); `None` before the first one.
+    pub min_rtt_sample: Option<Duration>,
+    pub srtt: Option<Duration>,
+    pub rto_expiries: u64,
+    /// Packets given up on after `MAX_PACKET_RETRANSMITS`.
+    pub abandoned_packets: u32,
+    /// Outbound streams whose send task failed (e.g. the cwnd-wait timeout).
+    pub outbound_streams_failed: u32,
+}
+
 #[must_use = "call await on the `recv` function to start listening for incoming messages"]
 pub struct PeerConnection<S = super::UdpSocket, T: TimeSource = RealTime> {
     remote_conn: RemoteConnection<S, T>,
@@ -1642,6 +1660,10 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                         //    the same gap.
                         Err(e) if e.is_transient_send_failure() => {
                             super::TRANSPORT_METRICS.record_transfer_failed();
+                            #[cfg(test)]
+                            {
+                                self.telemetry_test_counts.outbound_streams_failed += 1;
+                            }
                             tracing::warn!(
                                 peer_addr = %self.remote_conn.remote_addr,
                                 error = %e,
@@ -1650,6 +1672,10 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                         }
                         Err(e) => {
                             super::TRANSPORT_METRICS.record_transfer_failed();
+                            #[cfg(test)]
+                            {
+                                self.telemetry_test_counts.outbound_streams_failed += 1;
+                            }
                             return Err(e);
                         }
                     }
@@ -1988,6 +2014,22 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
     /// Remote peer's negotiated protocol version, if known (None on joiner->gateway connections).
     pub fn remote_version(&self) -> Option<(u8, u8, u16)> {
         self.remote_conn.remote_protoc_version
+    }
+
+    /// Test-only snapshot of the sender-side state the WAN bench asserts on.
+    #[cfg(test)]
+    pub(crate) fn congestion_probe(&self) -> CongestionProbe {
+        use super::congestion_control::CongestionControl;
+        let tracker = self.remote_conn.sent_tracker.lock();
+        CongestionProbe {
+            flightsize: self.remote_conn.congestion_controller.flightsize(),
+            cwnd: self.remote_conn.congestion_controller.current_cwnd(),
+            min_rtt_sample: tracker.smoothed_rtt().map(|_| tracker.min_rtt()),
+            srtt: tracker.smoothed_rtt(),
+            rto_expiries: tracker.rto_expiries(),
+            abandoned_packets: self.telemetry_test_counts.abandoned,
+            outbound_streams_failed: self.telemetry_test_counts.outbound_streams_failed,
+        }
     }
 
     /// Returns a handle for accessing an inbound stream incrementally.
