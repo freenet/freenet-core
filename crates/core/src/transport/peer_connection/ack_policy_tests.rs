@@ -1595,12 +1595,12 @@ async fn streamed_transfer_counts_final_ack() {
         );
     }
     assert!(fragments.len() > 1, "a 20 KB message must be streamed");
-    let before = crate::transport::TRANSPORT_METRICS.transfers_acked_count();
+    assert_eq!(e.conn.telemetry_test_counts.0, 0);
     e.deliver(1, SymmetricMessagePayload::NoOp, fragments).await;
     e.deliver(2, short(b"after-acks"), vec![]).await;
     assert!(e.pump(Duration::from_millis(50)).await.is_some());
-    assert!(
-        crate::transport::TRANSPORT_METRICS.transfers_acked_count() > before,
+    assert_eq!(
+        e.conn.telemetry_test_counts.0, 1,
         "acknowledging every fragment must count one fully acknowledged transfer"
     );
 }
@@ -1617,8 +1617,6 @@ async fn never_acked_packet_is_abandoned_and_counted() {
         .find(|m| matches!(m.payload, SymmetricMessagePayload::ShortMessage { .. }))
         .expect("data packet sent")
         .packet_id;
-    let [_, _, abandoned_before, _, _, _] = crate::transport::TRANSPORT_METRICS.loss_counts();
-
     let start = tokio::time::Instant::now();
     let mut next_ping = 1_000u32;
     while e
@@ -1648,9 +1646,59 @@ async fn never_acked_packet_is_abandoned_and_counted() {
             e.drain_sent();
         }
     }
-    let [_, _, abandoned_after, _, _, _] = crate::transport::TRANSPORT_METRICS.loss_counts();
-    assert!(
-        abandoned_after > abandoned_before,
-        "packets_abandoned must increase"
+    assert_eq!(
+        e.conn.telemetry_test_counts.1, 1,
+        "the recv loop's Abandon arm must record exactly one abandonment"
+    );
+}
+
+/// An ACK batch that yields no RTT sample (Karn's rule: it acks only a
+/// retransmitted packet) must not republish the old data-ACK SRTT as the
+/// freshest value over a newer keep-alive SRTT.
+#[tokio::test(start_paused = true)]
+async fn retransmit_only_ack_does_not_republish_stale_srtt() {
+    let mut e = single(CAPABLE);
+    let first_data_id = |sent: Vec<SymmetricMessage>| {
+        sent.into_iter()
+            .find(|m| matches!(m.payload, SymmetricMessagePayload::ShortMessage { .. }))
+            .expect("data packet sent")
+            .packet_id
+    };
+    // 1. A fresh data ACK: ack SRTT ~30 ms.
+    e.conn.send("first".to_string()).await.expect("send");
+    let a = first_data_id(e.drain_sent());
+    tokio::time::advance(Duration::from_millis(30)).await;
+    e.deliver(1, SymmetricMessagePayload::NoOp, vec![a]).await;
+    e.deliver(2, short(b"x"), vec![]).await;
+    assert!(e.pump(Duration::from_millis(5)).await.is_some());
+    // 2. A newer keep-alive sample: keep-alive SRTT ~80 ms, now the freshest.
+    let seq = 77;
+    let sent_at = e.conn.time_source.now_nanos();
+    e.conn.pending_pings.write().insert(seq, sent_at);
+    tokio::time::advance(Duration::from_millis(80)).await;
+    e.deliver(3, SymmetricMessagePayload::Pong { sequence: seq }, vec![])
+        .await;
+    e.deliver(4, short(b"y"), vec![]).await;
+    assert!(e.pump(Duration::from_millis(5)).await.is_some());
+    let (keepalive_srtt, _) = e.conn.remote_conn.rolling_rtt_stats.gauge().read();
+    let keepalive_srtt = keepalive_srtt.expect("keep-alive SRTT");
+    assert!(keepalive_srtt >= 80_000, "{keepalive_srtt}");
+    // 3. A packet that is retransmitted, then acked: no RTT sample.
+    e.conn.send("second".to_string()).await.expect("send");
+    let b = first_data_id(e.drain_sent());
+    let start = tokio::time::Instant::now();
+    let mut resent = false;
+    while start.elapsed() < Duration::from_secs(3) && !resent {
+        assert!(e.pump(Duration::from_millis(5)).await.is_none());
+        resent = e.drain_sent().iter().any(|m| m.packet_id == b);
+    }
+    assert!(resent, "packet must be retransmitted");
+    e.deliver(5, SymmetricMessagePayload::NoOp, vec![b]).await;
+    e.deliver(6, short(b"z"), vec![]).await;
+    assert!(e.pump(Duration::from_millis(5)).await.is_some());
+    assert_eq!(
+        e.conn.remote_conn.rolling_rtt_stats.gauge().read().0,
+        Some(keepalive_srtt),
+        "a sample-less ACK batch must not make the stale ack SRTT the freshest"
     );
 }

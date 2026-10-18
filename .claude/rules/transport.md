@@ -190,12 +190,15 @@ always-on; only reference-ping is gated.
 `TRANSPORT_METRICS` carries period counters for loss and ACK overhead
 (`packets_sent`, `packets_retransmitted`, `packets_abandoned`,
 `rto_expiries`, `tlp_probes`, `standalone_ack_*`), NAT failure causes
-(`nat_fail_*`, a partition of `nat_traversal_failed_error + _version`, plus
-one low-priority `nat_traversal_failed` event per failure with the
-sub-reason and what the attempt saw), an endpoint-dependent-mapping signal
+(`nat_fail_*`, which sum to `nat_traversal_failed_error + _version` with a
+different version/non-version split, plus up to 8 per-attempt
+`nat_fail_samples` per period with the sub-reason and what the attempt saw;
+OUTBOUND traversals only), an endpoint-dependent-mapping signal
 (`observed_addr_*`: each handshake ack's view of our address, compared only
-across DIFFERENT reporters in the same address family; counts only, never
-the address), final-ACK timing (`transfers_acked`, `*_transfer_ack_time_ms`) and
+across DIFFERENT reporters in the same address family, IPv4-mapped v6
+treated as v4; counts only, never the address; per period, so it resets; a
+NAT rebinding between two reporters' reports is indistinguishable from
+EDM), final-ACK timing (`transfers_acked`, `*_transfer_ack_time_ms`) and
 the listener-to-connection queue (`inbound_queue_depth_hwm`, `_drops`). Hot
 path writes are single relaxed atomics; `SentPacketTracker` keeps an
 `rto_expiries` count and a bounded per-stream final-ACK watch, both
@@ -203,7 +206,9 @@ observation only.
 
 `CONN_RTT_REGISTRY` (`rolling_rtt_stats.rs`) holds one `ConnRttGauge` per live
 connection (owned by `RollingRttStatsHandle`) for the snapshot's
-cross-connection SRTT / min-RTT percentiles. Same rule as the shadow
+cross-connection SRTT / min-RTT percentiles. A connection's snapshot SRTT may
+be an unloaded keep-alive value; for bufferbloat analysis use the per-transfer
+`final_srtt_ms` vs `min_rtt_ms` on `transfer_completed`. Same rule as the shadow
 registry: written from the recv loop, read only by telemetry, NEVER by the
 data path.
 

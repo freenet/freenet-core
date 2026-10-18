@@ -241,6 +241,14 @@ pub(super) struct SentPacketTracker<T: TimeSource> {
     /// completed, drained by the recv loop via
     /// [`Self::take_completed_stream_acks`].
     completed_stream_acks: Vec<u64>,
+
+    /// Streams that recently had a fragment abandoned, so a final-ACK watch
+    /// registered AFTER the abandonment (the watch starts only once the last
+    /// fragment is handed to the socket) cannot count the surviving
+    /// fragments as a complete transfer. Bounded FIFO of
+    /// [`MAX_STREAM_ACK_WATCHES`] ids; an abandonment that ages out of it
+    /// before its stream finishes sending is the residual gap.
+    abandoned_streams: VecDeque<StreamId>,
 }
 
 /// A stream waiting for the ACK of its last still-unacknowledged fragment.
@@ -322,6 +330,7 @@ impl<T: TimeSource> SentPacketTracker<T> {
             rto_expiries: 0,
             stream_ack_watches: Vec::new(),
             completed_stream_acks: Vec::new(),
+            abandoned_streams: VecDeque::new(),
         }
     }
 
@@ -350,6 +359,10 @@ impl<T: TimeSource> SentPacketTracker<T> {
         stream_id: StreamId,
         start_nanos: u64,
     ) -> Option<u64> {
+        if self.abandoned_streams.contains(&stream_id) {
+            // A fragment was already given up on: never fully acknowledged.
+            return None;
+        }
         let target = PacketStream::Stream(stream_id);
         let remaining = self
             .packet_streams
@@ -996,8 +1009,15 @@ impl<T: TimeSource> SentPacketTracker<T> {
                         self.packet_streams.remove(&entry.packet_id)
                     {
                         // An abandoned fragment is never acknowledged, so the
-                        // stream can no longer complete its final ACK.
+                        // stream can no longer complete its final ACK, now or
+                        // when its watch starts later.
                         self.forget_stream_ack_watch(stream_id);
+                        if !self.abandoned_streams.contains(&stream_id) {
+                            if self.abandoned_streams.len() >= MAX_STREAM_ACK_WATCHES {
+                                self.abandoned_streams.pop_front();
+                            }
+                            self.abandoned_streams.push_back(stream_id);
+                        }
                     }
                     tracing::debug!(
                         packet_id = entry.packet_id,
@@ -3123,6 +3143,39 @@ pub(in crate::transport) mod tests {
         assert!(abandoned, "packet 1 must eventually be abandoned");
         assert_eq!(resends, MAX_PACKET_RETRANSMITS as u64);
         assert_eq!(tracker.rto_expiries(), resends);
+        assert!(tracker.stream_ack_watches.is_empty());
+        assert!(tracker.take_completed_stream_acks().is_empty());
+    }
+
+    /// A fragment abandoned BEFORE the watch starts (the stream was still
+    /// sending) must not let the surviving fragments count as a complete
+    /// transfer.
+    #[test]
+    fn stream_ack_watch_ignores_stream_abandoned_before_watch() {
+        let mut tracker = mock_sent_packet_tracker();
+        let stream = StreamId::next();
+        send_stream_packets(&mut tracker, stream, 1..2);
+        let mut abandoned = false;
+        for _ in 0..1_000 {
+            match tracker.get_resend() {
+                ResendAction::Resend(id, packet) => {
+                    tracker.refresh_sent_packet(id, packet, None);
+                }
+                ResendAction::TlpProbe(..) => {}
+                ResendAction::Abandon { .. } => {
+                    abandoned = true;
+                    break;
+                }
+                ResendAction::WaitUntil(_) => {
+                    tracker.time_source.advance(Duration::from_secs(120));
+                }
+            }
+        }
+        assert!(abandoned);
+        // The rest of the stream is sent and fully acked afterwards.
+        send_stream_packets(&mut tracker, stream, 2..4);
+        tracker.report_received_receipts(&[2, 3]);
+        assert_eq!(tracker.watch_stream_ack(stream, 0), None);
         assert!(tracker.stream_ack_watches.is_empty());
         assert!(tracker.take_completed_stream_acks().is_empty());
     }

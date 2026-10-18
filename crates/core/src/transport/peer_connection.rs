@@ -299,6 +299,11 @@ pub struct PeerConnection<S = super::UdpSocket, T: TimeSource = RealTime> {
     /// the idle timeout, so the node can report the disconnect as a timeout
     /// rather than a generic transport closure (telemetry only).
     closed_by_idle_timeout: bool,
+    /// Test-only per-connection tallies of the telemetry events this
+    /// connection recorded, so tests need not read process-wide counters
+    /// that concurrent tests also move: `(transfers_acked, abandoned)`.
+    #[cfg(test)]
+    telemetry_test_counts: (u32, u32),
     /// Tracks pending ping probes awaiting pong responses.
     /// Maps ping sequence number -> send timestamp (nanoseconds since time_source epoch).
     /// Used for bidirectional liveness detection.
@@ -972,6 +977,8 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
             recv_timers,
             timeout_checks_run: 0,
             closed_by_idle_timeout: false,
+            #[cfg(test)]
+            telemetry_test_counts: (0, 0),
             receipts_flush_due: false,
             answered_connection_ack: false,
             stalled_fragment: None,
@@ -1394,13 +1401,27 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                         let mut tracker = self.remote_conn.sent_tracker.lock();
                         let (ack_info, _loss_rate) =
                             tracker.report_received_receipts(&confirm_receipt);
-                        (ack_info, tracker.smoothed_rtt(), tracker.take_completed_stream_acks())
+                        // Publish only when this batch gave the tracker a new
+                        // sample: a retransmit-only or duplicate batch (Karn's
+                        // rule: no sample) would otherwise republish a stale
+                        // SRTT as the freshest value, outranking a newer
+                        // keep-alive SRTT exactly during loss.
+                        let fresh_srtt = ack_info
+                            .iter()
+                            .any(|(rtt, _, _)| rtt.is_some())
+                            .then(|| tracker.smoothed_rtt())
+                            .flatten();
+                        (ack_info, fresh_srtt, tracker.take_completed_stream_acks())
                     };
                     if let Some(srtt) = srtt {
                         self.remote_conn.rolling_rtt_stats.publish_srtt(srtt);
                     }
                     for elapsed_nanos in completed_stream_acks {
                         super::TRANSPORT_METRICS.record_transfer_acked(elapsed_nanos / 1_000_000);
+                        #[cfg(test)]
+                        {
+                            self.telemetry_test_counts.0 += 1;
+                        }
                     }
 
                     // Feed ACK info to congestion controller for window adjustment
@@ -1747,6 +1768,10 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                                     .congestion_controller
                                     .release_flightsize(payload_len);
                                 super::TRANSPORT_METRICS.record_packet_abandoned();
+                                #[cfg(test)]
+                                {
+                                    self.telemetry_test_counts.1 += 1;
+                                }
                                 tracing::debug!(
                                     peer_addr = %self.remote_conn.remote_addr,
                                     packet_id,

@@ -212,14 +212,24 @@ struct NatDetailCounters {
     /// a handshake, never per packet, so a mutex is fine here. Never
     /// exported: only the change counts above leave the process.
     last_observed_addr: parking_lot::Mutex<[Option<(SocketAddr, SocketAddr)>; 2]>,
-    /// Sticky: some pair of different reporters has seen us at the same IP
-    /// with different ports since startup (endpoint-dependent mapping).
-    endpoint_dependent_mapping_seen: std::sync::atomic::AtomicBool,
+    /// Up to [`MAX_NAT_FAILURE_SAMPLES`] per-attempt failure records for the
+    /// period, and how many failures did not fit. Written once per failed
+    /// handshake (never per packet), so a mutex is fine.
+    samples: parking_lot::Mutex<Vec<NatFailureSample>>,
+    samples_dropped: AtomicU32,
+    /// Test-only log of `(remote, kind)` so handler-path tests can find
+    /// THEIR attempt among concurrent tests' (bounded).
+    #[cfg(test)]
+    failures_by_remote: parking_lot::Mutex<Vec<(SocketAddr, NatFailureKind)>>,
+    /// Test-only log of observed-address reporters (bounded).
+    #[cfg(test)]
+    observed_reporters: parking_lot::Mutex<Vec<SocketAddr>>,
 }
 
 /// Why an outbound NAT traversal attempt failed. Exactly one is recorded per
-/// failed attempt, so the six counters partition
-/// `nat_traversal_failed_error + nat_traversal_failed_version`.
+/// failed attempt, so the six counters sum to
+/// `nat_traversal_failed_error + nat_traversal_failed_version` (with a
+/// different split between version and non-version causes).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum NatFailureKind {
     /// Deadline expired and no packet at all arrived from the remote.
@@ -248,6 +258,29 @@ impl NatFailureKind {
             Self::Other => "other",
         }
     }
+}
+
+/// Per-period cap on [`NatFailureSample`]s carried by `transport_snapshot`.
+/// Failures beyond it are counted in `nat_fail_samples_dropped`; the
+/// `nat_fail_*` counters still count every failure.
+const MAX_NAT_FAILURE_SAMPLES: usize = 8;
+
+/// What one failed outbound NAT traversal saw. Carried in the periodic
+/// `transport_snapshot` (bounded per period) rather than as an event per
+/// failure, so a burst of failures costs no telemetry budget, and so the
+/// samples can be read alongside the same period's `observed_addr_*`
+/// mapping signal. No remote address is recorded.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[cfg_attr(test, derive(arbitrary::Arbitrary))]
+pub struct NatFailureSample {
+    /// [`NatFailureKind`] label, e.g. `no_response`.
+    pub sub_reason: String,
+    /// Any packet arrived from the remote.
+    pub received_any: bool,
+    /// A packet from the remote was decrypted.
+    pub decrypted_any: bool,
+    /// The attempt ran to its deadline.
+    pub deadline_reached: bool,
 }
 
 /// Nearest-rank percentile of an ascending slice; `None` when empty. These are
@@ -291,6 +324,15 @@ impl ConnRttDistribution {
             min_rtt_max_us: min_rtt.last().copied(),
         }
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only per-address byte totals returned by
+    /// [`TransportMetrics::connection_peer_bytes`] in place of the global table.
+    pub(crate) static PEER_BYTES_OVERRIDE: std::cell::RefCell<
+        std::collections::HashMap<SocketAddr, (u64, u64)>,
+    > = std::cell::RefCell::new(std::collections::HashMap::new());
 }
 
 /// Maximum number of peers tracked for per-peer transfer stats.
@@ -399,8 +441,63 @@ impl TransportMetrics {
             .fetch_add(bytes, Ordering::Relaxed);
     }
 
-    /// Classify one failed outbound NAT traversal.
-    pub(crate) fn record_nat_failure_kind(&self, kind: NatFailureKind) {
+    /// Record one failed outbound NAT traversal: its classification counter
+    /// and, while the period has room, a per-attempt sample.
+    pub(crate) fn record_nat_failure(
+        &self,
+        kind: NatFailureKind,
+        received_any: bool,
+        decrypted_any: bool,
+        deadline_reached: bool,
+    ) {
+        self.record_nat_failure_kind(kind);
+        let mut samples = self.nat_detail.samples.lock();
+        if samples.len() < MAX_NAT_FAILURE_SAMPLES {
+            samples.push(NatFailureSample {
+                sub_reason: kind.as_str().to_string(),
+                received_any,
+                decrypted_any,
+                deadline_reached,
+            });
+        } else {
+            self.nat_detail
+                .samples_dropped
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Test-only: note which remote a failure of `kind` was for.
+    #[cfg(test)]
+    pub(crate) fn note_nat_failure_remote(&self, remote: SocketAddr, kind: NatFailureKind) {
+        let mut log = self.nat_detail.failures_by_remote.lock();
+        if log.len() < 4096 {
+            log.push((remote, kind));
+        }
+    }
+
+    /// Test-only: the failure kinds recorded for `remote`.
+    #[cfg(test)]
+    pub(crate) fn nat_failures_for(&self, remote: SocketAddr) -> Vec<NatFailureKind> {
+        self.nat_detail
+            .failures_by_remote
+            .lock()
+            .iter()
+            .filter(|(addr, _)| *addr == remote)
+            .map(|(_, kind)| *kind)
+            .collect()
+    }
+
+    /// Test-only: whether `reporter` has reported our external address.
+    #[cfg(test)]
+    pub(crate) fn observed_addr_reported_by(&self, reporter: SocketAddr) -> bool {
+        self.nat_detail
+            .observed_reporters
+            .lock()
+            .contains(&reporter)
+    }
+
+    /// Classify one failed outbound NAT traversal (counter only).
+    fn record_nat_failure_kind(&self, kind: NatFailureKind) {
         let d = &self.nat_detail;
         let counter = match kind {
             NatFailureKind::NoResponse => &d.no_response,
@@ -424,10 +521,21 @@ impl TransportMetrics {
     /// separately (multi-homing, address change). Repeat reports from the
     /// same reporter, and reports in the other address family, are never
     /// counted as changes, so several gateways or a dual-stack host do not
-    /// produce false positives. Addresses are never exported.
+    /// produce false positives. An IPv4-mapped IPv6 address is treated as
+    /// IPv4. Residual false positive: a NAT that rebinds our mapping between
+    /// two different reporters' reports looks the same as an
+    /// endpoint-dependent mapping. Addresses are never exported.
     pub(crate) fn record_observed_external_addr(&self, reporter: SocketAddr, observed: SocketAddr) {
         let d = &self.nat_detail;
         d.observed_addr_reports.fetch_add(1, Ordering::Relaxed);
+        #[cfg(test)]
+        {
+            let mut log = d.observed_reporters.lock();
+            if log.len() < 4096 {
+                log.push(reporter);
+            }
+        }
+        let observed = SocketAddr::new(observed.ip().to_canonical(), observed.port());
         let family = usize::from(observed.is_ipv6());
         let previous = d.last_observed_addr.lock()[family].replace((reporter, observed));
         let Some((prev_reporter, prev_observed)) = previous else {
@@ -440,17 +548,7 @@ impl TransportMetrics {
             d.observed_addr_ip_changes.fetch_add(1, Ordering::Relaxed);
         } else if prev_observed.port() != observed.port() {
             d.observed_addr_port_changes.fetch_add(1, Ordering::Relaxed);
-            d.endpoint_dependent_mapping_seen
-                .store(true, Ordering::Relaxed);
         }
-    }
-
-    /// Whether an endpoint-dependent NAT mapping has been observed since
-    /// startup (see [`Self::record_observed_external_addr`]).
-    pub(crate) fn endpoint_dependent_mapping_seen(&self) -> bool {
-        self.nat_detail
-            .endpoint_dependent_mapping_seen
-            .load(Ordering::Relaxed)
     }
 
     /// Every fragment of an outbound stream was acknowledged `elapsed_ms`
@@ -475,6 +573,19 @@ impl TransportMetrics {
     /// channel was full.
     pub(crate) fn record_inbound_queue_drop(&self) {
         self.inbound_queue_drops.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Per-peer wire bytes as read by the ring's per-connection bookkeeping
+    /// (baseline at connect, totals at disconnect). Same as
+    /// [`Self::peer_bytes`]; tests can substitute values for an address via
+    /// [`PEER_BYTES_OVERRIDE`] so they do not depend on the shared, bounded
+    /// per-peer table.
+    pub(crate) fn connection_peer_bytes(&self, addr: SocketAddr) -> Option<(u64, u64)> {
+        #[cfg(test)]
+        if let Some(bytes) = PEER_BYTES_OVERRIDE.with(|o| o.borrow().get(&addr).copied()) {
+            return Some(bytes);
+        }
+        self.peer_bytes(addr)
     }
 
     /// Wire bytes `(sent, received)` recorded for `addr` while it has been
@@ -720,38 +831,6 @@ impl TransportMetrics {
         self.transfers_acked.load(Ordering::Relaxed)
     }
 
-    /// Current period NAT failure counters, without resetting (tests only):
-    /// `(failed_error + failed_version, sum of nat_fail_*, no_response)`.
-    #[cfg(test)]
-    pub(crate) fn nat_failure_counts(&self) -> (u32, u32, u32) {
-        let d = &self.nat_detail;
-        let kinds = [
-            &d.no_response,
-            &d.undecryptable,
-            &d.version_incompatible,
-            &d.incomplete,
-            &d.send_error,
-            &d.other,
-        ]
-        .iter()
-        .map(|a| a.load(Ordering::Relaxed))
-        .sum();
-        (
-            self.nat_traversal_failed_error.load(Ordering::Relaxed)
-                + self.nat_traversal_failed_version.load(Ordering::Relaxed),
-            kinds,
-            d.no_response.load(Ordering::Relaxed),
-        )
-    }
-
-    /// Current period count of observed-address reports (tests only).
-    #[cfg(test)]
-    pub(crate) fn observed_addr_report_count(&self) -> u32 {
-        self.nat_detail
-            .observed_addr_reports
-            .load(Ordering::Relaxed)
-    }
-
     /// Record a completed inbound stream transfer.
     ///
     /// Aggregates stream-payload bytes into the per-snapshot `bytes_received`
@@ -945,6 +1024,12 @@ impl TransportMetrics {
             max_transfer_ack_time_ms: (acked > 0).then_some(ack_max),
             inbound_queue_depth_hwm: get32(&self.inbound_queue_depth_hwm),
             inbound_queue_drops: get64(&self.inbound_queue_drops),
+            nat_fail_samples: if reset {
+                std::mem::take(&mut *d.samples.lock())
+            } else {
+                d.samples.lock().clone()
+            },
+            nat_fail_samples_dropped: get32(&d.samples_dropped),
         }
     }
 
@@ -1270,8 +1355,10 @@ pub struct TransportSnapshot {
     /// Standalone ack-only `NoOp` packets sent, and their on-wire bytes.
     pub standalone_ack_packets: u64,
     pub standalone_ack_bytes: u64,
-    /// Failed outbound NAT traversals by cause. Together these partition
-    /// `nat_traversal_failed_error + nat_traversal_failed_version`.
+    /// Failed outbound NAT traversals by cause. Together these sum to
+    /// `nat_traversal_failed_error + nat_traversal_failed_version`, but the
+    /// split differs: an incompatible version seen in the remote's intro is
+    /// `nat_fail_version_incompatible` here and `failed_error` there.
     pub nat_fail_no_response: u32,
     pub nat_fail_undecryptable: u32,
     pub nat_fail_version_incompatible: u32,
@@ -1299,6 +1386,12 @@ pub struct TransportSnapshot {
     pub inbound_queue_depth_hwm: u32,
     /// Inbound packets the listener dropped because that channel was full.
     pub inbound_queue_drops: u64,
+    /// Per-attempt records of failed outbound NAT traversals in the period,
+    /// at most 8; `nat_fail_samples_dropped` counts the rest. Read with the
+    /// same period's `observed_addr_port_changes` to relate failures to an
+    /// endpoint-dependent NAT mapping.
+    pub nat_fail_samples: Vec<NatFailureSample>,
+    pub nat_fail_samples_dropped: u32,
 }
 
 /// Per-connection RTT distribution fields of [`TransportSnapshot`]; see the
@@ -1350,6 +1443,8 @@ impl TransportSnapshot {
             max_transfer_ack_time_ms,
             inbound_queue_depth_hwm,
             inbound_queue_drops,
+            nat_fail_samples,
+            nat_fail_samples_dropped,
         } = extras;
         self.conn_rtt_connections = conn_rtt_connections;
         self.conn_srtt_p50_us = conn_srtt_p50_us;
@@ -1379,6 +1474,8 @@ impl TransportSnapshot {
         self.max_transfer_ack_time_ms = max_transfer_ack_time_ms;
         self.inbound_queue_depth_hwm = inbound_queue_depth_hwm;
         self.inbound_queue_drops = inbound_queue_drops;
+        self.nat_fail_samples = nat_fail_samples;
+        self.nat_fail_samples_dropped = nat_fail_samples_dropped;
         self
     }
 }
@@ -1415,8 +1512,10 @@ struct SnapshotExtras {
     /// Standalone ack-only `NoOp` packets sent, and their on-wire bytes.
     pub standalone_ack_packets: u64,
     pub standalone_ack_bytes: u64,
-    /// Failed outbound NAT traversals by cause. Together these partition
-    /// `nat_traversal_failed_error + nat_traversal_failed_version`.
+    /// Failed outbound NAT traversals by cause. Together these sum to
+    /// `nat_traversal_failed_error + nat_traversal_failed_version`, but the
+    /// split differs: an incompatible version seen in the remote's intro is
+    /// `nat_fail_version_incompatible` here and `failed_error` there.
     pub nat_fail_no_response: u32,
     pub nat_fail_undecryptable: u32,
     pub nat_fail_version_incompatible: u32,
@@ -1444,6 +1543,12 @@ struct SnapshotExtras {
     pub inbound_queue_depth_hwm: u32,
     /// Inbound packets the listener dropped because that channel was full.
     pub inbound_queue_drops: u64,
+    /// Per-attempt records of failed outbound NAT traversals in the period,
+    /// at most 8; `nat_fail_samples_dropped` counts the rest. Read with the
+    /// same period's `observed_addr_port_changes` to relate failures to an
+    /// endpoint-dependent NAT mapping.
+    pub nat_fail_samples: Vec<NatFailureSample>,
+    pub nat_fail_samples_dropped: u32,
 }
 
 impl SnapshotExtras {
@@ -1465,6 +1570,7 @@ impl SnapshotExtras {
             || self.observed_addr_reports != 0
             || self.transfers_acked != 0
             || self.inbound_queue_drops != 0
+            || !self.nat_fail_samples.is_empty()
     }
 }
 
@@ -2224,6 +2330,35 @@ mod tests {
         );
     }
 
+    /// Per-attempt NAT failure samples are bounded per period, the overflow
+    /// is counted, and both reset with the snapshot.
+    #[test]
+    fn nat_failure_samples_are_bounded_and_reset() {
+        let metrics = TransportMetrics::new();
+        for _ in 0..(MAX_NAT_FAILURE_SAMPLES + 3) {
+            metrics.record_nat_failure(NatFailureKind::Undecryptable, true, false, true);
+        }
+        let snap = metrics.take_snapshot().expect("failures are activity");
+        assert_eq!(
+            snap.nat_fail_undecryptable as usize,
+            MAX_NAT_FAILURE_SAMPLES + 3
+        );
+        assert_eq!(snap.nat_fail_samples.len(), MAX_NAT_FAILURE_SAMPLES);
+        assert_eq!(snap.nat_fail_samples_dropped, 3);
+        assert_eq!(
+            snap.nat_fail_samples[0],
+            NatFailureSample {
+                sub_reason: "undecryptable".into(),
+                received_any: true,
+                decrypted_any: false,
+                deadline_reached: true,
+            }
+        );
+        let json = serde_json::to_value(&snap).unwrap();
+        assert_eq!(json["nat_fail_samples"][0]["sub_reason"], "undecryptable");
+        assert!(metrics.take_snapshot().is_none(), "samples must reset");
+    }
+
     /// Same IP with a different port is the endpoint-dependent mapping
     /// signal; a different IP is counted separately; the first report and a
     /// repeat of the same address change nothing.
@@ -2241,19 +2376,16 @@ mod tests {
         metrics.record_observed_external_addr(v6_gw, "[2001:db8::5]:40000".parse().unwrap());
         // The same reporter seeing a new port later is a rebinding, not EDM.
         metrics.record_observed_external_addr(gw2, "203.0.113.5:40001".parse().unwrap());
-        assert!(!metrics.endpoint_dependent_mapping_seen());
+        // An IPv4-mapped IPv6 report is compared as IPv4 (same mapping: no change).
+        metrics.record_observed_external_addr(gw1, "[::ffff:203.0.113.5]:40001".parse().unwrap());
         // A different reporter, same IP, different port: EDM signal.
         metrics.record_observed_external_addr(peer, "203.0.113.5:40123".parse().unwrap());
         // A different reporter, different IP.
         metrics.record_observed_external_addr(gw1, "198.51.100.9:40123".parse().unwrap());
         let snap = metrics.take_snapshot().expect("reports are activity");
-        assert_eq!(snap.observed_addr_reports, 6);
+        assert_eq!(snap.observed_addr_reports, 7);
         assert_eq!(snap.observed_addr_port_changes, 1);
         assert_eq!(snap.observed_addr_ip_changes, 1);
-        assert!(
-            metrics.endpoint_dependent_mapping_seen(),
-            "sticky across snapshots"
-        );
     }
 
     /// Percentiles are nearest-rank over one value per connection.
@@ -2332,6 +2464,8 @@ mod tests {
             "max_transfer_ack_time_ms",
             "inbound_queue_depth_hwm",
             "inbound_queue_drops",
+            "nat_fail_samples",
+            "nat_fail_samples_dropped",
         ] {
             assert!(obj.contains_key(key), "missing key {key}");
         }

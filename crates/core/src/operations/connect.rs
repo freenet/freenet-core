@@ -3148,20 +3148,23 @@ mod tests {
                 crate::tracing::DynamicRegister::new(vec![Box::new(listener)]),
             )
             .await;
-            let metrics = &crate::transport::TRANSPORT_METRICS;
             let kp = TransportKeypair::new();
             let addr: SocketAddr = "127.0.0.9:25871".parse().unwrap();
-            metrics.remove_peer(addr);
+            // Injected per-address totals: the shared per-peer table is
+            // bounded (LRU) and moved by concurrent tests.
+            let set_bytes = |bytes: (u64, u64)| {
+                crate::transport::metrics::PEER_BYTES_OVERRIDE
+                    .with(|o| o.borrow_mut().insert(addr, bytes));
+            };
             // Bytes from before the connection existed.
-            metrics.record_packet_received(addr, 1_000);
+            set_bytes((0, 1_000));
             assert!(op_manager.ring.connection_manager.add_connection(
                 Location::from_address(&addr),
                 addr,
                 kp.public().clone(),
                 false
             ));
-            metrics.record_packet_sent(addr, 300);
-            metrics.record_packet_received(addr, 500);
+            set_bytes((300, 1_500));
             op_manager
                 .ring
                 .prune_connection(
@@ -3169,6 +3172,7 @@ mod tests {
                     crate::tracing::DisconnectReason::Timeout,
                 )
                 .await;
+            crate::transport::metrics::PEER_BYTES_OVERRIDE.with(|o| o.borrow_mut().remove(&addr));
             let logs = logs.lock().await;
             let event = logs
                 .iter()

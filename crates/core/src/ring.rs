@@ -6058,7 +6058,7 @@ impl Ring {
         // bounded per-peer table evicted this peer meanwhile.
         let connection_bytes = self.connection_manager.get_connection_bytes(
             peer.socket_addr(),
-            crate::transport::TRANSPORT_METRICS.peer_bytes(peer.socket_addr()),
+            crate::transport::TRANSPORT_METRICS.connection_peer_bytes(peer.socket_addr()),
         );
         crate::node::network_status::record_peer_disconnected(peer.socket_addr());
         let orphaned_transactions = self

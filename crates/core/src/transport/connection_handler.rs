@@ -1747,8 +1747,16 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                         Err((error, remote_addr, observed)) => {
                             let flags = observed.flags();
                             let kind = classify_nat_failure(&error, flags);
-                            crate::transport::TRANSPORT_METRICS.record_nat_failure_kind(kind);
-                            self.emit_nat_failure_event(kind, flags);
+                            type O = NatAttemptObservation;
+                            crate::transport::TRANSPORT_METRICS.record_nat_failure(
+                                kind,
+                                flags & O::RECEIVED != 0,
+                                flags & O::DECRYPTED != 0,
+                                flags & O::DEADLINE != 0,
+                            );
+                            #[cfg(test)]
+                            crate::transport::TRANSPORT_METRICS
+                                .note_nat_failure_remote(remote_addr, kind);
                             match &error {
                                 TransportError::ProtocolVersionMismatch { .. } => {
                                     tracing::warn!(%error);
@@ -2092,21 +2100,6 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
             Ok((remote_conn, inbound_conn, outbound_ack_packet))
         };
         (f.boxed(), inbound_from_remote)
-    }
-
-    /// One `nat_traversal_failed` telemetry event per failed outbound
-    /// traversal, so the cause can be joined with what the attempt saw and
-    /// with the NAT-mapping signal. Low priority (shadow budget), and it
-    /// carries no remote address.
-    fn emit_nat_failure_event(&self, kind: crate::transport::metrics::NatFailureKind, flags: u8) {
-        let local_peer_id =
-            crate::node::PeerId::new(self.this_peer_keypair.public.clone(), self.this_addr)
-                .to_string();
-        crate::tracing::telemetry::send_standalone_shadow_event_with_peer_id(
-            "nat_traversal_failed",
-            &local_peer_id,
-            nat_failure_event_json(kind, flags),
-        );
     }
 
     #[allow(clippy::type_complexity)]
@@ -2763,22 +2756,6 @@ impl NatAttemptObservation {
     }
 }
 
-/// Body of the `nat_traversal_failed` event. Pure, for testing.
-fn nat_failure_event_json(
-    kind: crate::transport::metrics::NatFailureKind,
-    flags: u8,
-) -> serde_json::Value {
-    type O = NatAttemptObservation;
-    serde_json::json!({
-        "sub_reason": kind.as_str(),
-        "received_any": flags & O::RECEIVED != 0,
-        "decrypted_any": flags & O::DECRYPTED != 0,
-        "deadline_reached": flags & O::DEADLINE != 0,
-        "endpoint_dependent_mapping_seen":
-            crate::transport::TRANSPORT_METRICS.endpoint_dependent_mapping_seen(),
-    })
-}
-
 /// Map a failed traversal to exactly one [`NatFailureKind`].
 fn classify_nat_failure(
     error: &TransportError,
@@ -2883,20 +2860,6 @@ mod nat_failure_classification_tests {
                 "{error:?} / {flags:#b}"
             );
         }
-    }
-
-    #[test]
-    fn failure_event_body() {
-        let body = nat_failure_event_json(NatFailureKind::Undecryptable, O::DEADLINE | O::RECEIVED);
-        assert_eq!(body["sub_reason"], "undecryptable");
-        assert_eq!(body["received_any"], true);
-        assert_eq!(body["decrypted_any"], false);
-        assert_eq!(body["deadline_reached"], true);
-        assert!(body["endpoint_dependent_mapping_seen"].is_boolean());
-        assert!(
-            body.get("peer_addr").is_none(),
-            "no remote address is exported"
-        );
     }
 
     #[test]
@@ -4231,6 +4194,63 @@ pub mod mock_transport {
         Ok(())
     }
 
+    /// The joiner learns its external address from the gateway's handshake
+    /// ack, and that report reaches the NAT-mapping telemetry. Asserted on
+    /// this test's gateway address, so concurrent tests cannot satisfy it.
+    #[tokio::test]
+    async fn gateway_ack_reports_observed_external_addr() -> anyhow::Result<()> {
+        let channels = Arc::new(DashMap::new());
+        let (_peer_pub, mut peer, _peer_addr) =
+            create_mock_peer(Default::default(), channels.clone()).await?;
+        let (gw_pub, (_oc, mut gw_conn), gw_addr) =
+            create_mock_gateway(Default::default(), channels).await?;
+        let gw = GlobalExecutor::spawn(async move {
+            tokio::time::timeout(Duration::from_secs(10), gw_conn.recv())
+                .await?
+                .ok_or(anyhow::anyhow!("no connection"))
+                .map(|_| ())
+        });
+        let joiner = GlobalExecutor::spawn(async move {
+            let conn = peer.connect(gw_pub, gw_addr).await;
+            let _connection = tokio::time::timeout(Duration::from_secs(60), conn).await??;
+            Ok::<_, anyhow::Error>(())
+        });
+        let (j, g) = tokio::try_join!(joiner, gw)?;
+        j?;
+        g?;
+        assert!(
+            crate::transport::TRANSPORT_METRICS.observed_addr_reported_by(gw_addr),
+            "the gateway ack's view of our address must be recorded, with the gateway as reporter"
+        );
+        Ok(())
+    }
+
+    /// Through the real handler path: a traversal to a peer that never
+    /// answers fails at its deadline and is classified as no-response.
+    /// Asserted on this test's (unique) remote address, so concurrent tests
+    /// cannot satisfy it; the classification itself is pinned by
+    /// `classification_table`.
+    #[tokio::test]
+    async fn unanswered_nat_traversal_is_classified_no_response() -> anyhow::Result<()> {
+        let channels = Arc::new(DashMap::new());
+        let (_peer_pub, mut peer, _peer_addr) =
+            create_mock_peer(Default::default(), channels).await?;
+        let silent_addr: SocketAddr = "10.255.0.9:9".parse().unwrap();
+        let silent_pub = TransportKeypair::new().public().clone();
+        let conn = peer.connect(silent_pub, silent_addr).await;
+        let result = tokio::time::timeout(Duration::from_secs(30), conn).await?;
+        assert!(
+            result.is_err(),
+            "nobody answers, so the traversal must fail"
+        );
+        assert_eq!(
+            crate::transport::TRANSPORT_METRICS.nat_failures_for(silent_addr),
+            vec![crate::transport::metrics::NatFailureKind::NoResponse],
+            "exactly one failure, classified as no-response"
+        );
+        Ok(())
+    }
+
     /// **The peer-to-peer half of #5161.** The version-carrying ack is not only
     /// a gateway mechanism: `traverse_nat`'s `RemoteInbound` arm sends an ack
     /// too, and the peer receiving it may have raced ahead to its own
@@ -4248,69 +4268,6 @@ pub mod mock_transport {
     /// The pre-existing `simulate_nat_traversal` cannot cover this either — it
     /// requires only that AT LEAST ONE side captured a version, precisely
     /// because the loser of the race captured nothing.
-    /// The joiner learns its external address from the gateway's handshake
-    /// ack, and that report reaches the NAT-mapping telemetry. The counter is
-    /// process-wide, so only an increase is asserted.
-    #[tokio::test]
-    async fn gateway_ack_reports_observed_external_addr() -> anyhow::Result<()> {
-        let channels = Arc::new(DashMap::new());
-        let (_peer_pub, mut peer, _peer_addr) =
-            create_mock_peer(Default::default(), channels.clone()).await?;
-        let (gw_pub, (_oc, mut gw_conn), gw_addr) =
-            create_mock_gateway(Default::default(), channels).await?;
-        let before = crate::transport::TRANSPORT_METRICS.observed_addr_report_count();
-        let gw = GlobalExecutor::spawn(async move {
-            tokio::time::timeout(Duration::from_secs(10), gw_conn.recv())
-                .await?
-                .ok_or(anyhow::anyhow!("no connection"))
-                .map(|_| ())
-        });
-        let joiner = GlobalExecutor::spawn(async move {
-            let conn = peer.connect(gw_pub, gw_addr).await;
-            let _connection = tokio::time::timeout(Duration::from_secs(60), conn).await??;
-            Ok::<_, anyhow::Error>(())
-        });
-        let (j, g) = tokio::try_join!(joiner, gw)?;
-        j?;
-        g?;
-        assert!(
-            crate::transport::TRANSPORT_METRICS.observed_addr_report_count() > before,
-            "the gateway ack's view of our address must be recorded"
-        );
-        Ok(())
-    }
-
-    /// Through the real handler path: a traversal to a peer that never
-    /// answers fails at its deadline, is counted as a failure, and is
-    /// classified (as no-response) in the sub-reason counters. Counters are
-    /// process-wide, so only increases are asserted; the exact partition is
-    /// pinned by `classification_table`.
-    #[tokio::test]
-    async fn unanswered_nat_traversal_is_classified_no_response() -> anyhow::Result<()> {
-        let channels = Arc::new(DashMap::new());
-        let (_peer_pub, mut peer, _peer_addr) =
-            create_mock_peer(Default::default(), channels).await?;
-        let silent_addr: SocketAddr = "10.255.0.9:9".parse().unwrap();
-        let silent_pub = TransportKeypair::new().public().clone();
-        let (failed_before, kinds_before, no_response_before) =
-            crate::transport::TRANSPORT_METRICS.nat_failure_counts();
-        let conn = peer.connect(silent_pub, silent_addr).await;
-        let result = tokio::time::timeout(Duration::from_secs(30), conn).await?;
-        assert!(
-            result.is_err(),
-            "nobody answers, so the traversal must fail"
-        );
-        let (failed_after, kinds_after, no_response_after) =
-            crate::transport::TRANSPORT_METRICS.nat_failure_counts();
-        assert!(failed_after > failed_before);
-        assert!(
-            kinds_after > kinds_before,
-            "every failure gets a sub-reason"
-        );
-        assert!(no_response_after > no_response_before);
-        Ok(())
-    }
-
     #[tokio::test]
     async fn nat_traversal_ack_racer_learns_version_from_the_ack() -> anyhow::Result<()> {
         // A floor every build clears, so this does not move with the crate

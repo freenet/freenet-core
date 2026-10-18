@@ -996,7 +996,10 @@ impl TelemetryWorker {
             peer_id: self.local_peer_id.clone(),
             transaction_id: String::new(), // Not tied to a transaction
             event_type: "transport_snapshot".to_string(),
-            event_data: serde_json::to_value(snapshot).unwrap_or_default(),
+            event_data: serde_json::to_value(snapshot).unwrap_or_else(|error| {
+                tracing::warn!(%error, "Failed to serialize transport snapshot");
+                serde_json::Value::Null
+            }),
             priority: EventPriority::Operational,
         }
     }
@@ -2773,6 +2776,14 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
             m.insert(
                 "inbound_queue_drops".into(),
                 serde_json::json!(snapshot.inbound_queue_drops),
+            );
+            m.insert(
+                "nat_fail_samples".into(),
+                serde_json::json!(snapshot.nat_fail_samples),
+            );
+            m.insert(
+                "nat_fail_samples_dropped".into(),
+                serde_json::json!(snapshot.nat_fail_samples_dropped),
             );
             serde_json::Value::Object(m)
         }

@@ -12,6 +12,13 @@ pub struct Connection {
     /// connection joined the ring, so the disconnect event can report this
     /// connection's bytes rather than the address's lifetime totals (which
     /// include earlier NAT attempts and previous connections).
+    ///
+    /// Known gaps (best effort): if the bounded per-peer table evicts and
+    /// recreates the entry mid-connection, the totals restart and the
+    /// reported bytes undercount (still positive) or are `None`; and a
+    /// connection moved to a new address by
+    /// `ConnectionManager::update_peer_identity` gets a fresh baseline for
+    /// the new address, so bytes sent before the move are not reported.
     pub(crate) bytes_at_connect: (u64, u64),
 }
 
@@ -20,7 +27,7 @@ impl Connection {
     pub fn new(location: PeerKeyLocation) -> Self {
         let bytes_at_connect = location
             .socket_addr()
-            .and_then(|addr| crate::transport::TRANSPORT_METRICS.peer_bytes(addr))
+            .and_then(|addr| crate::transport::TRANSPORT_METRICS.connection_peer_bytes(addr))
             .unwrap_or((0, 0));
         Self {
             location,
