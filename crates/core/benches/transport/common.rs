@@ -54,7 +54,7 @@ pub fn create_benchmark_runtime() -> tokio::runtime::Runtime {
 /// Get the congestion control algorithm from environment variable.
 ///
 /// Set `FREENET_CONGESTION_ALGO` to:
-/// - `fixedrate` or `fixed` - Use FixedRate (100 Mbps)
+/// - `fixedrate` or `fixed` - Use FixedRate (10 Mbps per connection)
 /// - `bbr` or `BBR` - Use BBR (Bottleneck Bandwidth and RTT)
 /// - `ledbat` or `LEDBAT` - Use LEDBAT++ (Low Extra Delay Background Transport)
 ///
@@ -402,13 +402,13 @@ pub fn spawn_auto_advance_task(time_source: VirtualTime) -> tokio::task::JoinHan
 /// ensuring consistent timing behavior for benchmarks.
 ///
 /// Uses the congestion control algorithm from `FREENET_CONGESTION_ALGO` environment variable
-/// (defaults to BBR for high-throughput benchmarks).
+/// (defaults to the production default, FixedRate).
 pub async fn create_peer_pair_with_virtual_time(
     channels: Channels,
     delay: Duration,
     time_source: VirtualTime,
 ) -> PeerPair<VirtualTime> {
-    // Use configurable congestion control (defaults to BBR for benchmarks)
+    // Use configurable congestion control (defaults to FixedRate)
     let config = Some(get_congestion_config());
 
     let (peer_a_pub, peer_a, peer_a_addr) = create_mock_peer_with_congestion_config(
@@ -529,12 +529,12 @@ pub async fn create_connected_peers_with_virtual_time_and_loss(
 /// Create a pair of mock peers with VirtualTime and configurable congestion control.
 ///
 /// This function uses the congestion control algorithm from the `FREENET_CONGESTION_ALGO`
-/// environment variable (defaults to BBR).
+/// environment variable (defaults to FixedRate).
 ///
 /// ## Example
 ///
 /// ```rust,ignore
-/// // Uses FREENET_CONGESTION_ALGO or defaults to BBR
+/// // Uses FREENET_CONGESTION_ALGO or defaults to FixedRate
 /// let time_source = VirtualTime::new();
 /// let peers = create_peer_pair_with_configurable_congestion(
 ///     channels,
@@ -583,7 +583,7 @@ pub async fn create_peer_pair_with_configurable_congestion(
 /// Create a connected peer pair with configurable congestion control.
 ///
 /// Uses `FREENET_CONGESTION_ALGO` environment variable to select algorithm.
-/// Defaults to BBR if not set.
+/// Defaults to FixedRate if not set.
 pub async fn create_connected_peers_with_configurable_congestion(
     delay: Duration,
     time_source: VirtualTime,

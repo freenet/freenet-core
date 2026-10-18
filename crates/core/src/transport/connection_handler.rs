@@ -2010,7 +2010,7 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                 SentPacketTracker::new_with_time_source(time_source.clone()),
             ));
 
-            // Initialize congestion controller (BBR by default, configurable for benchmarks)
+            // Initialize congestion controller (FixedRate by default, configurable for benchmarks)
             let congestion_controller = congestion_config
                 .clone()
                 .unwrap_or_default()
@@ -2447,7 +2447,7 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                                             let (inbound_sender, inbound_recv) =
                                                 mpsc::channel(INBOUND_CHANNEL_CAPACITY);
 
-                                            // Initialize congestion controller (BBR by default, configurable for benchmarks)
+                                            // Initialize congestion controller (FixedRate by default, configurable for benchmarks)
                                             let congestion_controller = congestion_config
                                                 .clone()
                                                 .unwrap_or_default()
@@ -2604,7 +2604,7 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                                 let (inbound_sender, inbound_recv) =
                                     mpsc::channel(INBOUND_CHANNEL_CAPACITY);
 
-                                // Initialize congestion controller (BBR by default, configurable for benchmarks)
+                                // Initialize congestion controller (FixedRate by default, configurable for benchmarks)
                                 let congestion_controller = congestion_config
                                     .clone()
                                     .unwrap_or_default()
@@ -3834,8 +3834,9 @@ pub mod mock_transport {
 
     /// Create a mock peer connection with VirtualTime and custom congestion control.
     ///
-    /// This function supports selecting the congestion control algorithm (BBR or LEDBAT)
-    /// for benchmarking purposes. Pass `None` for `congestion_config` to use the default (BBR).
+    /// This function supports selecting the congestion control algorithm
+    /// for benchmarking purposes. Pass `None` for `congestion_config` to use the
+    /// default (`CongestionControlAlgorithm::default()`, FixedRate).
     ///
     /// Returns the peer's public key, outbound connection handler, and socket address.
     pub async fn create_mock_peer_with_congestion_config(

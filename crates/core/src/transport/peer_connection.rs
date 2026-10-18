@@ -118,7 +118,7 @@ pub(crate) struct RemoteConnection<S = super::UdpSocket, T: TimeSource = RealTim
     /// version and the joiner never parses an intro packet from it.
     pub(super) remote_protoc_version: Option<(u8, u8, u16)>,
     pub(super) transport_secret_key: TransportSecretKey,
-    /// Congestion controller (BBR by default) - adapts to network conditions
+    /// Congestion controller (FixedRate by default; BBR and LEDBAT++ are selectable)
     pub(super) congestion_controller: Arc<CongestionController<T>>,
     /// Token bucket rate limiter - smooths packet pacing based on congestion controller rate
     pub(super) token_bucket: Arc<TokenBucket<T>>,
