@@ -126,6 +126,25 @@ jobs:
             --no-capture \
             --profile nightly
 
+      # WAN transport bench R1 (crates/core/src/transport/link_model/r1_tests.rs)
+      # on 20 seeds the PR gate does not run. PR CI runs the three fixed
+      # GATE_SEEDS through the ordinary unit suite; this explores new ones,
+      # rotating with the run number. The test is deterministic per seed, so a
+      # failure here reproduces locally with the seed it prints:
+      #   FREENET_WAN_BENCH_SEEDS=<seed> cargo test -p freenet --lib r1_spike_recovery_fixed_rate
+      # Once fixed, add that seed to GATE_SEEDS.
+      - name: WAN bench R1 (rotating seeds)
+        env:
+          RUN_NUMBER: ${{ github.run_number }}
+        run: |
+          SEEDS=$(seq -s, $((RUN_NUMBER * 20)) $((RUN_NUMBER * 20 + 19)))
+          echo "FREENET_WAN_BENCH_SEEDS=$SEEDS"
+          FREENET_WAN_BENCH_SEEDS="$SEEDS" cargo nextest run -p freenet --lib \
+            --features "simulation_tests,testing,nightly_tests" \
+            --profile nightly \
+            --no-capture \
+            -E 'test(/link_model::r1_tests::r1_spike_recovery_fixed_rate$/)'
+
       # Large scale test (500 nodes) - uses direct runner (no turmoil overhead).
       # Takes ~33-46 min on the CI runner (the "~4 min locally" figure this
       # comment used to cite was badly stale). The 60-min step cap below is the
