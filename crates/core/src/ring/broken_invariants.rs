@@ -85,9 +85,10 @@
 //!   (fewer expiry windows) rather than lowering it.
 //!
 //! This also satisfies the project rule that GC/suppression exemptions must
-//! be time-bounded (see `.claude/rules/ring.md` "Cleanup Exemptions Must Be
-//! Time-Bounded"). Expired entries are swept by [`BrokenInvariantsTracker::cleanup`],
-//! hooked into the same reaper tick as the UPDATE rate limiter.
+//! be bounded (see `.claude/rules/ring.md` "Cleanup Exemptions Must Be
+//! Bounded"); this one is bounded by a TTL. Expired entries are swept by
+//! [`BrokenInvariantsTracker::cleanup`], hooked into the same reaper tick as
+//! the UPDATE rate limiter.
 
 use std::sync::Arc;
 use std::time::Duration;

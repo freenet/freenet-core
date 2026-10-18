@@ -175,7 +175,7 @@ const MAX_PHANTOM_REPAIR_ATTEMPTS: u32 = 3;
 const PHANTOM_REPAIR_COOLDOWN: Duration = crate::config::OPERATION_TTL;
 
 /// Absolute-age bound for the exhausted-phantom exemption (review Fix C /
-/// ring.md "Cleanup Exemptions Must Be Time-Bounded"). A phantom whose
+/// ring.md "Cleanup Exemptions Must Be Bounded"). A phantom whose
 /// downstream keeps renewing (so the Fix-6 downstream-expiry prune never fires)
 /// but whose state stays unfetchable past this age is dropped, so it cannot be a
 /// permanent GC blind spot + advertised dead-end. Four subscription leases (~32
@@ -2156,7 +2156,7 @@ impl HostingManager {
     /// exists to stop, reintroduced through the back door; the exemption
     /// would also be effectively unbounded, blocking reclamation
     /// indefinitely, which violates the cleanup-exemption rule in `AGENTS.md`
-    /// (exemptions must be time-bounded). Local-client subscriptions and
+    /// (exemptions must be bounded). Local-client subscriptions and
     /// downstream subscribers represent real external demand: WebSocket client
     /// subscriptions expire on disconnect; downstream subscribers expire via
     /// `expire_stale_downstream_subscribers` after `SUBSCRIPTION_LEASE_DURATION`

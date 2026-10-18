@@ -46,9 +46,9 @@
 //! (`client_disconnect_drops_listeners_and_notifies_the_node`) and without one
 //! (`client_vanishing_without_close_frame_drops_listeners`).
 //!
-//! This deliberately departs from the literal AGENTS.md rule that cleanup be
-//! bounded by a TTL or an absolute age. The bound is the connection's lifetime,
-//! and that lifetime is NOT bounded in time by anything in the node:
+//! This is the lifecycle-event bound the AGENTS.md cleanup rule allows: the
+//! bound is the connection's lifetime, not a TTL. That lifetime is NOT bounded
+//! in time by anything in the node:
 //!
 //!  * A peer that vanished without closing is cut off by the kernel. The
 //!    connection task pings every 30 s, the ping goes unacknowledged, and the
