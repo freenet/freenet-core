@@ -856,8 +856,6 @@ async fn drive_client_connect(
                     .ring
                     .connection_manager
                     .update_location(Some(location));
-                // NAT-mapping signal for transport telemetry (counts only).
-                crate::transport::TRANSPORT_METRICS.record_observed_external_addr(address);
                 tracing::info!(
                     tx = %tx,
                     observed_address = %address,
@@ -2178,7 +2176,7 @@ mod tests {
             "every probe acceptor must be classified, for the probe's generation"
         );
         assert!(
-            !body.contains("NodeEvent::DropConnection(acceptor_addr)")
+            !body.contains("NodeEvent::DropConnection(acceptor_addr")
                 && !gate_block.contains("continue;"),
             "a probe acceptor must be kept (a dropped link stays dead on the far end)"
         );

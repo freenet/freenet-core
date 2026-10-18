@@ -277,6 +277,11 @@ pub struct TransferStats {
     /// while the transfer ran, counted by the connection's sent-packet
     /// tracker so it is populated whatever the congestion controller.
     /// High values indicate severe congestion or path issues.
+    ///
+    /// This is a per-CONNECTION delta, not a per-stream count: an RTO of any
+    /// packet on the connection during the transfer is included, so
+    /// concurrent transfers on one connection each count the same expiries
+    /// and summing across transfers double-counts.
     pub total_timeouts: u32,
     /// Bytes still in flight (sent but not yet ACKed) when transmission completed.
     /// High values relative to bytes_transferred indicate ACK lag.

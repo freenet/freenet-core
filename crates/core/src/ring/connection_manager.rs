@@ -2188,6 +2188,26 @@ impl ConnectionManager {
         None
     }
 
+    /// Bytes `(sent, received)` on the ring connection to `addr` since it
+    /// joined the ring (see [`super::Connection::bytes_since_connect`]). `None` if
+    /// there is no such connection.
+    pub fn get_connection_bytes(
+        &self,
+        addr: SocketAddr,
+        current: Option<(u64, u64)>,
+    ) -> Option<(Option<u64>, Option<u64>)> {
+        let loc = {
+            let locations_for_peer = self.location_for_peer.read();
+            locations_for_peer.get(&addr).cloned()?
+        };
+        let conns = self.connections_by_location.read();
+        conns
+            .get(&loc)?
+            .iter()
+            .find(|conn| conn.location.socket_addr() == Some(addr))
+            .map(|conn| conn.bytes_since_connect(current))
+    }
+
     /// Add a connection to the ring topology. Returns `true` if the connection
     /// was actually inserted, `false` if it was rejected (e.g., capacity cap).
     pub fn add_connection(

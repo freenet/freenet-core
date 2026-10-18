@@ -106,26 +106,49 @@ fn reported_cwnd(cwnd: usize) -> Option<u32> {
 /// Per-connection RTT and loss facts for a stream that has just handed its
 /// last fragment to the socket, read from the connection's sent-packet
 /// tracker (not the congestion controller, whose RTT/loss stats are zero
-/// under FixedRate). Also registers the stream for final-ACK timing.
-///
-/// Returns `(final_srtt_ms, rto_expiries_during_transfer)`. SRTT is `None`
-/// until the connection has a data-ACK RTT sample.
+/// under FixedRate).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StreamEndTelemetry {
+    /// Connection SRTT; `None` until it has a data-ACK RTT sample.
+    final_srtt_ms: Option<u32>,
+    /// Connection minimum RTT; `None` under the same condition. Together
+    /// with `final_srtt_ms` it exposes queueing delay (loaded vs base RTT).
+    min_rtt_ms: Option<u32>,
+    /// RTO expiries on the connection while the transfer ran.
+    rto_expiries: u32,
+}
+
+/// Collect [`StreamEndTelemetry`] and register the stream for final-ACK
+/// timing. A stream whose fragments are all already acknowledged is
+/// published to `TRANSPORT_METRICS` here, since no later receipt batch may
+/// ever come to drain it.
 fn finish_stream_telemetry<T: TimeSource>(
     sent_packet_tracker: &parking_lot::Mutex<SentPacketTracker<T>>,
     stream_id: StreamId,
     start_nanos: u64,
     rto_expiries_at_start: u64,
-) -> (Option<u32>, u32) {
-    let mut tracker = sent_packet_tracker.lock();
-    tracker.watch_stream_ack(stream_id, start_nanos);
-    let srtt_ms = tracker
-        .smoothed_rtt()
-        .map(|d| d.as_millis().min(u32::MAX as u128) as u32);
-    let timeouts = tracker
-        .rto_expiries()
-        .saturating_sub(rto_expiries_at_start)
-        .min(u32::MAX as u64) as u32;
-    (srtt_ms, timeouts)
+) -> StreamEndTelemetry {
+    let to_ms = |d: Duration| d.as_millis().min(u32::MAX as u128) as u32;
+    let (already_acked, telemetry) = {
+        let mut tracker = sent_packet_tracker.lock();
+        let already_acked = tracker.watch_stream_ack(stream_id, start_nanos);
+        let srtt = tracker.smoothed_rtt();
+        let telemetry = StreamEndTelemetry {
+            final_srtt_ms: srtt.map(to_ms),
+            // The tracker's min RTT holds a 100 ms placeholder until the
+            // first sample, which arrives together with the SRTT.
+            min_rtt_ms: srtt.map(|_| to_ms(tracker.min_rtt())),
+            rto_expiries: tracker
+                .rto_expiries()
+                .saturating_sub(rto_expiries_at_start)
+                .min(u32::MAX as u64) as u32,
+        };
+        (already_acked, telemetry)
+    };
+    if let Some(elapsed_nanos) = already_acked {
+        crate::transport::TRANSPORT_METRICS.record_transfer_acked(elapsed_nanos / 1_000_000);
+    }
+    telemetry
 }
 
 // TODO: unit test
@@ -153,6 +176,9 @@ pub(super) async fn send_stream<S: super::super::Socket, T: TimeSource>(
     let start_time = time_source.now();
     let start_nanos = time_source.now_nanos();
     let rto_expiries_at_start = sent_packet_tracker.lock().rto_expiries();
+    // Largest bytes-in-flight this stream saw when admitting a fragment
+    // (telemetry: queue build-up while it ran).
+    let mut peak_flightsize: usize = 0;
     let bytes_to_send = stream_to_send.len() as u64;
 
     // Emit transfer started telemetry event
@@ -214,6 +240,7 @@ pub(super) async fn send_stream<S: super::super::Socket, T: TimeSource>(
 
             // Check if we have space in the congestion window
             if flightsize + packet_size <= cwnd {
+                peak_flightsize = peak_flightsize.max(flightsize + packet_size);
                 break; // Space available, proceed to send
             }
 
@@ -445,7 +472,7 @@ pub(super) async fn send_stream<S: super::super::Socket, T: TimeSource>(
     let ledbat_stats = congestion_controller.ledbat_stats();
     let bbr_stats = congestion_controller.bbr_stats();
     let elapsed = time_source.now().saturating_sub(start_time);
-    let (final_srtt_ms, total_timeouts) = finish_stream_telemetry(
+    let end = finish_stream_telemetry(
         &sent_packet_tracker,
         stream_id,
         start_nanos,
@@ -480,10 +507,12 @@ pub(super) async fn send_stream<S: super::super::Socket, T: TimeSource>(
         peak_cwnd,
         final_cwnd,
         ledbat_stats.as_ref().map(|s| s.periodic_slowdowns as u32),
-        final_srtt_ms,
+        end.final_srtt_ms,
         Some(generic_stats.ssthresh as u32),
         ledbat_stats.as_ref().map(|s| s.min_ssthresh_floor as u32),
-        Some(total_timeouts),
+        Some(end.rto_expiries),
+        end.min_rtt_ms,
+        Some(peak_flightsize.min(u32::MAX as usize) as u32),
         TransferDirection::Send,
     );
 
@@ -512,7 +541,7 @@ pub(super) async fn send_stream<S: super::super::Socket, T: TimeSource>(
             .as_ref()
             .map(|s| s.min_ssthresh_floor as u32)
             .unwrap_or(0),
-        total_timeouts,
+        total_timeouts: end.rto_expiries,
         final_flightsize: generic_stats.flightsize as u32,
         configured_rate: congestion_controller.configured_rate() as u32,
     })
@@ -545,6 +574,8 @@ pub(super) async fn pipe_stream<S: super::super::Socket, T: TimeSource>(
     let start_time = time_source.now();
     let start_nanos = time_source.now_nanos();
     let rto_expiries_at_start = sent_packet_tracker.lock().rto_expiries();
+    // See `send_stream`.
+    let mut peak_flightsize: usize = 0;
     let total_bytes = inbound_handle.total_bytes();
 
     emit_transfer_started(
@@ -665,6 +696,7 @@ pub(super) async fn pipe_stream<S: super::super::Socket, T: TimeSource>(
             let cwnd = congestion_controller.current_cwnd();
 
             if flightsize + packet_size <= cwnd {
+                peak_flightsize = peak_flightsize.max(flightsize + packet_size);
                 break;
             }
 
@@ -837,7 +869,7 @@ pub(super) async fn pipe_stream<S: super::super::Socket, T: TimeSource>(
     let generic_stats = congestion_controller.stats();
     let ledbat_stats = congestion_controller.ledbat_stats();
     let elapsed = time_source.now().saturating_sub(start_time);
-    let (final_srtt_ms, total_timeouts) = finish_stream_telemetry(
+    let end = finish_stream_telemetry(
         &sent_packet_tracker,
         outbound_stream_id,
         start_nanos,
@@ -867,10 +899,12 @@ pub(super) async fn pipe_stream<S: super::super::Socket, T: TimeSource>(
         peak_cwnd,
         final_cwnd,
         ledbat_stats.as_ref().map(|s| s.periodic_slowdowns as u32),
-        final_srtt_ms,
+        end.final_srtt_ms,
         Some(generic_stats.ssthresh as u32),
         ledbat_stats.as_ref().map(|s| s.min_ssthresh_floor as u32),
-        Some(total_timeouts),
+        Some(end.rto_expiries),
+        end.min_rtt_ms,
+        Some(peak_flightsize.min(u32::MAX as usize) as u32),
         TransferDirection::Send,
     );
 
@@ -891,7 +925,7 @@ pub(super) async fn pipe_stream<S: super::super::Socket, T: TimeSource>(
             .as_ref()
             .map(|s| s.min_ssthresh_floor as u32)
             .unwrap_or(0),
-        total_timeouts,
+        total_timeouts: end.rto_expiries,
         final_flightsize: generic_stats.flightsize as u32,
         configured_rate: congestion_controller.configured_rate() as u32,
     })
@@ -920,10 +954,11 @@ mod telemetry_tests {
         let time = VirtualTime::new();
         let tracker =
             parking_lot::Mutex::new(SentPacketTracker::new_with_time_source(time.clone()));
+        let none = finish_stream_telemetry(&tracker, StreamId::next(), 0, 0);
         assert_eq!(
-            finish_stream_telemetry(&tracker, StreamId::next(), 0, 0),
-            (None, 0),
-            "no RTT sample yet: SRTT must be null, not 0"
+            (none.final_srtt_ms, none.min_rtt_ms, none.rto_expiries),
+            (None, None, 0),
+            "no RTT sample yet: SRTT and min RTT must be null, not 0 / placeholder"
         );
 
         {
@@ -955,12 +990,38 @@ mod telemetry_tests {
         let at_start = tracker.lock().rto_expiries();
         force_rto(4);
 
-        let (srtt_ms, timeouts) = finish_stream_telemetry(&tracker, StreamId::next(), 0, at_start);
-        assert_eq!(srtt_ms, Some(80));
-        assert_eq!(timeouts, 1);
+        let end = finish_stream_telemetry(&tracker, StreamId::next(), 0, at_start);
+        assert_eq!(end.final_srtt_ms, Some(80));
+        assert_eq!(end.min_rtt_ms, Some(80));
+        assert_eq!(end.rto_expiries, 1);
     }
 
     use crate::transport::sent_packet_tracker::ResendAction as ResendActionForTest;
+
+    /// A stream whose fragments were all acknowledged before it registered
+    /// its final-ACK watch is published at once, not left queued until a
+    /// receipt batch that a quiet connection may never get.
+    #[test]
+    fn already_acked_stream_is_published_immediately() {
+        let time = VirtualTime::new();
+        let tracker =
+            parking_lot::Mutex::new(SentPacketTracker::new_with_time_source(time.clone()));
+        let stream = StreamId::next();
+        {
+            let mut t = tracker.lock();
+            t.report_sent_stream_packet_with_size(1, vec![0u8; 8].into(), None, stream, 8);
+            t.report_sent_stream_packet_with_size(2, vec![0u8; 8].into(), None, stream, 8);
+        }
+        time.advance(Duration::from_millis(20));
+        tracker.lock().report_received_receipts(&[1, 2]);
+        let before = crate::transport::TRANSPORT_METRICS.transfers_acked_count();
+        finish_stream_telemetry(&tracker, stream, 0, 0);
+        assert!(
+            crate::transport::TRANSPORT_METRICS.transfers_acked_count() > before,
+            "the completion must reach TRANSPORT_METRICS immediately"
+        );
+        assert!(tracker.lock().take_completed_stream_acks().is_empty());
+    }
 }
 
 #[cfg(test)]

@@ -335,10 +335,21 @@ impl<T: TimeSource> SentPacketTracker<T> {
     /// (same time source as this tracker). Observation only: it changes no
     /// retransmission or flight-size bookkeeping.
     ///
-    /// If every fragment is already acknowledged the completion is recorded
-    /// at once. A stream with a fragment that is later abandoned or dropped
-    /// (`drop_stream`) is forgotten and never reported.
-    pub(super) fn watch_stream_ack(&mut self, stream_id: StreamId, start_nanos: u64) {
+    /// If every fragment is already acknowledged, returns the
+    /// stream-start-to-now duration (nanos) for the caller to publish
+    /// directly; it is NOT queued, because the queue is only drained when a
+    /// later receipt batch arrives, which a quiet connection may never get.
+    /// Otherwise returns `None` and the completion is queued for
+    /// [`Self::take_completed_stream_acks`] when the last fragment is acked
+    /// (drained under the same lock as that receipt batch, so the queue holds
+    /// at most [`MAX_STREAM_ACK_WATCHES`] entries). A stream with a fragment
+    /// that is later abandoned or dropped (`drop_stream`) is forgotten and
+    /// never reported.
+    pub(super) fn watch_stream_ack(
+        &mut self,
+        stream_id: StreamId,
+        start_nanos: u64,
+    ) -> Option<u64> {
         let target = PacketStream::Stream(stream_id);
         let remaining = self
             .packet_streams
@@ -346,15 +357,16 @@ impl<T: TimeSource> SentPacketTracker<T> {
             .filter(|(pid, stream)| **stream == target && self.pending_receipts.contains_key(pid))
             .count() as u32;
         if remaining == 0 {
-            self.completed_stream_acks
-                .push(self.time_source.now_nanos().saturating_sub(start_nanos));
-        } else if self.stream_ack_watches.len() < MAX_STREAM_ACK_WATCHES {
+            return Some(self.time_source.now_nanos().saturating_sub(start_nanos));
+        }
+        if self.stream_ack_watches.len() < MAX_STREAM_ACK_WATCHES {
             self.stream_ack_watches.push(StreamAckWatch {
                 stream_id,
                 start_nanos,
                 remaining,
             });
         }
+        None
     }
 
     /// Drain the stream-start-to-final-ACK durations (nanos) recorded since
@@ -3023,7 +3035,7 @@ pub(in crate::transport) mod tests {
         // An unrelated control packet acked alongside must not count.
         tracker.report_sent_packet(99, vec![0u8; 10].into());
         tracker.time_source.advance(Duration::from_millis(5));
-        tracker.watch_stream_ack(stream, start);
+        assert_eq!(tracker.watch_stream_ack(stream, start), None);
 
         tracker.time_source.advance(Duration::from_millis(10));
         tracker.report_received_receipts(&[1, 99]);
@@ -3054,10 +3066,14 @@ pub(in crate::transport) mod tests {
         send_stream_packets(&mut tracker, stream, 1..3);
         tracker.report_received_receipts(&[1, 2]);
         tracker.time_source.advance(Duration::from_millis(7));
-        tracker.watch_stream_ack(stream, start);
         assert_eq!(
-            tracker.take_completed_stream_acks(),
-            vec![Duration::from_millis(7).as_nanos() as u64]
+            tracker.watch_stream_ack(stream, start),
+            Some(Duration::from_millis(7).as_nanos() as u64),
+            "an already-acked stream completes at once, to the caller"
+        );
+        assert!(
+            tracker.take_completed_stream_acks().is_empty(),
+            "an immediate completion must not be queued (it could be stranded)"
         );
     }
 
@@ -3068,7 +3084,7 @@ pub(in crate::transport) mod tests {
         let start = tracker.time_source.now_nanos();
         let stream = StreamId::next();
         send_stream_packets(&mut tracker, stream, 1..3);
-        tracker.watch_stream_ack(stream, start);
+        assert_eq!(tracker.watch_stream_ack(stream, start), None);
         tracker.drop_stream(stream);
         assert!(tracker.stream_ack_watches.is_empty());
         tracker.report_received_receipts(&[1, 2]);
@@ -3083,7 +3099,7 @@ pub(in crate::transport) mod tests {
         let start = tracker.time_source.now_nanos();
         let stream = StreamId::next();
         send_stream_packets(&mut tracker, stream, 1..3);
-        tracker.watch_stream_ack(stream, start);
+        assert_eq!(tracker.watch_stream_ack(stream, start), None);
         tracker.report_received_receipts(&[2]);
 
         let mut resends = 0u64;
@@ -3118,7 +3134,7 @@ pub(in crate::transport) mod tests {
         for i in 0..(MAX_STREAM_ACK_WATCHES as u32 + 10) {
             let stream = StreamId::next();
             tracker.report_sent_stream_packet(i, vec![0u8; 4].into(), None, stream);
-            tracker.watch_stream_ack(stream, 0);
+            assert_eq!(tracker.watch_stream_ack(stream, 0), None);
         }
         assert_eq!(tracker.stream_ack_watches.len(), MAX_STREAM_ACK_WATCHES);
     }

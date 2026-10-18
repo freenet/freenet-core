@@ -207,11 +207,14 @@ struct NatDetailCounters {
     observed_addr_reports: AtomicU32,
     observed_addr_port_changes: AtomicU32,
     observed_addr_ip_changes: AtomicU32,
-    /// Most recent externally-observed address of this node. Only touched
-    /// when a remote reports our address (handshake / CONNECT), never per
-    /// packet, so a mutex is fine here. Never exported: only the change
-    /// counts above leave the process.
-    last_observed_addr: parking_lot::Mutex<Option<SocketAddr>>,
+    /// Most recent `(reporter, observed)` pair per address family (index 0 =
+    /// IPv4, 1 = IPv6). Only touched when a remote reports our address during
+    /// a handshake, never per packet, so a mutex is fine here. Never
+    /// exported: only the change counts above leave the process.
+    last_observed_addr: parking_lot::Mutex<[Option<(SocketAddr, SocketAddr)>; 2]>,
+    /// Sticky: some pair of different reporters has seen us at the same IP
+    /// with different ports since startup (endpoint-dependent mapping).
+    endpoint_dependent_mapping_seen: std::sync::atomic::AtomicBool,
 }
 
 /// Why an outbound NAT traversal attempt failed. Exactly one is recorded per
@@ -231,6 +234,20 @@ pub(crate) enum NatFailureKind {
     SendError,
     /// Anything else (channel closed, malformed ack, ...).
     Other,
+}
+
+impl NatFailureKind {
+    /// Stable telemetry label; matches the `nat_fail_*` snapshot field suffix.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::NoResponse => "no_response",
+            Self::Undecryptable => "undecryptable",
+            Self::VersionIncompatible => "version_incompatible",
+            Self::Incomplete => "incomplete",
+            Self::SendError => "send_error",
+            Self::Other => "other",
+        }
+    }
 }
 
 /// Nearest-rank percentile of an ascending slice; `None` when empty. These are
@@ -396,24 +413,44 @@ impl TransportMetrics {
         counter.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// A remote reported the external address it sees us at.
+    /// Remote `reporter` told us the external address it sees us at
+    /// (`observed`).
     ///
-    /// Compared with the previous report: a different port on the same IP is
-    /// the signature of an endpoint-dependent (symmetric) NAT mapping, since
-    /// every connection leaves through one local socket. A different IP is
-    /// counted separately (multi-homing, address change, IPv4 vs IPv6). The
-    /// address itself is never exported.
-    pub(crate) fn record_observed_external_addr(&self, addr: SocketAddr) {
+    /// Compared with the latest report from a DIFFERENT reporter in the same
+    /// address family. Every connection leaves through one local socket, so
+    /// with an endpoint-independent NAT mapping all reporters see the same
+    /// `ip:port`; a different port on the same IP is the signature of an
+    /// endpoint-dependent (symmetric) mapping. A different IP is counted
+    /// separately (multi-homing, address change). Repeat reports from the
+    /// same reporter, and reports in the other address family, are never
+    /// counted as changes, so several gateways or a dual-stack host do not
+    /// produce false positives. Addresses are never exported.
+    pub(crate) fn record_observed_external_addr(&self, reporter: SocketAddr, observed: SocketAddr) {
         let d = &self.nat_detail;
         d.observed_addr_reports.fetch_add(1, Ordering::Relaxed);
-        let previous = d.last_observed_addr.lock().replace(addr);
-        if let Some(prev) = previous {
-            if prev.ip() != addr.ip() {
-                d.observed_addr_ip_changes.fetch_add(1, Ordering::Relaxed);
-            } else if prev.port() != addr.port() {
-                d.observed_addr_port_changes.fetch_add(1, Ordering::Relaxed);
-            }
+        let family = usize::from(observed.is_ipv6());
+        let previous = d.last_observed_addr.lock()[family].replace((reporter, observed));
+        let Some((prev_reporter, prev_observed)) = previous else {
+            return;
+        };
+        if prev_reporter == reporter {
+            return;
         }
+        if prev_observed.ip() != observed.ip() {
+            d.observed_addr_ip_changes.fetch_add(1, Ordering::Relaxed);
+        } else if prev_observed.port() != observed.port() {
+            d.observed_addr_port_changes.fetch_add(1, Ordering::Relaxed);
+            d.endpoint_dependent_mapping_seen
+                .store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// Whether an endpoint-dependent NAT mapping has been observed since
+    /// startup (see [`Self::record_observed_external_addr`]).
+    pub(crate) fn endpoint_dependent_mapping_seen(&self) -> bool {
+        self.nat_detail
+            .endpoint_dependent_mapping_seen
+            .load(Ordering::Relaxed)
     }
 
     /// Every fragment of an outbound stream was acknowledged `elapsed_ms`
@@ -675,6 +712,44 @@ impl TransportMetrics {
             l.tlp_probes.load(Ordering::Relaxed),
             l.standalone_ack_packets.load(Ordering::Relaxed),
         ]
+    }
+
+    /// Current period count of fully acknowledged transfers (tests only).
+    #[cfg(test)]
+    pub(crate) fn transfers_acked_count(&self) -> u32 {
+        self.transfers_acked.load(Ordering::Relaxed)
+    }
+
+    /// Current period NAT failure counters, without resetting (tests only):
+    /// `(failed_error + failed_version, sum of nat_fail_*, no_response)`.
+    #[cfg(test)]
+    pub(crate) fn nat_failure_counts(&self) -> (u32, u32, u32) {
+        let d = &self.nat_detail;
+        let kinds = [
+            &d.no_response,
+            &d.undecryptable,
+            &d.version_incompatible,
+            &d.incomplete,
+            &d.send_error,
+            &d.other,
+        ]
+        .iter()
+        .map(|a| a.load(Ordering::Relaxed))
+        .sum();
+        (
+            self.nat_traversal_failed_error.load(Ordering::Relaxed)
+                + self.nat_traversal_failed_version.load(Ordering::Relaxed),
+            kinds,
+            d.no_response.load(Ordering::Relaxed),
+        )
+    }
+
+    /// Current period count of observed-address reports (tests only).
+    #[cfg(test)]
+    pub(crate) fn observed_addr_report_count(&self) -> u32 {
+        self.nat_detail
+            .observed_addr_reports
+            .load(Ordering::Relaxed)
     }
 
     /// Record a completed inbound stream transfer.
@@ -1137,6 +1212,10 @@ pub struct TransportSnapshot {
     /// Average congestion window size in bytes. `None` (JSON null) if no
     /// bounded cwnd was sampled, e.g. when every transfer ran under the
     /// FixedRate controller, which has no meaningful window.
+    ///
+    /// Type change: this was a `u32` that read `0` (or, under FixedRate,
+    /// a `u32::MAX`-derived sentinel) with no samples. A typed consumer must
+    /// now accept null.
     pub avg_cwnd_bytes: Option<u32>,
     /// Peak congestion window size (bytes).
     pub peak_cwnd_bytes: u32,
@@ -1199,13 +1278,17 @@ pub struct TransportSnapshot {
     pub nat_fail_incomplete: u32,
     pub nat_fail_send_error: u32,
     pub nat_fail_other: u32,
-    /// Reports of our external address received from remotes, and how many
-    /// differed from the previous report in port only (endpoint-dependent
-    /// NAT mapping signal) or in IP.
+    /// Reports of our external address received from remotes (each
+    /// handshake ack that carries it), and how many differed from the latest
+    /// report by a DIFFERENT reporter in the same address family, in port
+    /// only (endpoint-dependent NAT mapping signal) or in IP.
     pub observed_addr_reports: u32,
     pub observed_addr_port_changes: u32,
     pub observed_addr_ip_changes: u32,
     /// Outbound stream transfers whose every fragment was acknowledged.
+    /// At most 64 streams per connection are timed at once; on a connection
+    /// with more concurrent streams the excess is not counted, which biases
+    /// the timing toward less loaded connections.
     pub transfers_acked: u32,
     /// Mean / max time from stream start to the final ACK, in ms. Compare
     /// `avg_transfer_time_ms`, which stops at socket hand-off of the last
@@ -1340,13 +1423,17 @@ struct SnapshotExtras {
     pub nat_fail_incomplete: u32,
     pub nat_fail_send_error: u32,
     pub nat_fail_other: u32,
-    /// Reports of our external address received from remotes, and how many
-    /// differed from the previous report in port only (endpoint-dependent
-    /// NAT mapping signal) or in IP.
+    /// Reports of our external address received from remotes (each
+    /// handshake ack that carries it), and how many differed from the latest
+    /// report by a DIFFERENT reporter in the same address family, in port
+    /// only (endpoint-dependent NAT mapping signal) or in IP.
     pub observed_addr_reports: u32,
     pub observed_addr_port_changes: u32,
     pub observed_addr_ip_changes: u32,
     /// Outbound stream transfers whose every fragment was acknowledged.
+    /// At most 64 streams per connection are timed at once; on a connection
+    /// with more concurrent streams the excess is not counted, which biases
+    /// the timing toward less loaded connections.
     pub transfers_acked: u32,
     /// Mean / max time from stream start to the final ACK, in ms. Compare
     /// `avg_transfer_time_ms`, which stops at socket hand-off of the last
@@ -1439,6 +1526,8 @@ pub fn emit_transfer_completed(
     final_ssthresh_bytes: Option<u32>,
     min_ssthresh_floor_bytes: Option<u32>,
     total_timeouts: Option<u32>,
+    min_rtt_ms: Option<u32>,
+    peak_flightsize_bytes: Option<u32>,
     direction: TransferDirection,
 ) {
     let sender_guard = TRANSFER_EVENT_SENDER.read();
@@ -1456,6 +1545,8 @@ pub fn emit_transfer_completed(
             final_ssthresh_bytes,
             min_ssthresh_floor_bytes,
             total_timeouts,
+            min_rtt_ms,
+            peak_flightsize_bytes,
             direction,
             timestamp: crate::tracing::telemetry::current_timestamp_ms(),
         };
@@ -2139,14 +2230,30 @@ mod tests {
     #[test]
     fn observed_external_addr_change_classification() {
         let metrics = TransportMetrics::new();
-        metrics.record_observed_external_addr("203.0.113.5:40000".parse().unwrap());
-        metrics.record_observed_external_addr("203.0.113.5:40000".parse().unwrap());
-        metrics.record_observed_external_addr("203.0.113.5:40123".parse().unwrap());
-        metrics.record_observed_external_addr("198.51.100.9:40123".parse().unwrap());
+        let gw1: SocketAddr = "192.0.2.1:31337".parse().unwrap();
+        let gw2: SocketAddr = "192.0.2.2:31337".parse().unwrap();
+        let peer: SocketAddr = "192.0.2.3:5000".parse().unwrap();
+        let v6_gw: SocketAddr = "[2001:db8::1]:31337".parse().unwrap();
+        // Same mapping seen by two gateways: no change (no false positive).
+        metrics.record_observed_external_addr(gw1, "203.0.113.5:40000".parse().unwrap());
+        metrics.record_observed_external_addr(gw2, "203.0.113.5:40000".parse().unwrap());
+        // Dual-stack: a v6 report is never compared with v4 ones.
+        metrics.record_observed_external_addr(v6_gw, "[2001:db8::5]:40000".parse().unwrap());
+        // The same reporter seeing a new port later is a rebinding, not EDM.
+        metrics.record_observed_external_addr(gw2, "203.0.113.5:40001".parse().unwrap());
+        assert!(!metrics.endpoint_dependent_mapping_seen());
+        // A different reporter, same IP, different port: EDM signal.
+        metrics.record_observed_external_addr(peer, "203.0.113.5:40123".parse().unwrap());
+        // A different reporter, different IP.
+        metrics.record_observed_external_addr(gw1, "198.51.100.9:40123".parse().unwrap());
         let snap = metrics.take_snapshot().expect("reports are activity");
-        assert_eq!(snap.observed_addr_reports, 4);
+        assert_eq!(snap.observed_addr_reports, 6);
         assert_eq!(snap.observed_addr_port_changes, 1);
         assert_eq!(snap.observed_addr_ip_changes, 1);
+        assert!(
+            metrics.endpoint_dependent_mapping_seen(),
+            "sticky across snapshots"
+        );
     }
 
     /// Percentiles are nearest-rank over one value per connection.

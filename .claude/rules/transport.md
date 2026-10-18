@@ -190,9 +190,12 @@ always-on; only reference-ping is gated.
 `TRANSPORT_METRICS` carries period counters for loss and ACK overhead
 (`packets_sent`, `packets_retransmitted`, `packets_abandoned`,
 `rto_expiries`, `tlp_probes`, `standalone_ack_*`), NAT failure causes
-(`nat_fail_*`, a partition of `nat_traversal_failed_error + _version`), an
-endpoint-dependent-mapping signal (`observed_addr_*`, counts only, never the
-address), final-ACK timing (`transfers_acked`, `*_transfer_ack_time_ms`) and
+(`nat_fail_*`, a partition of `nat_traversal_failed_error + _version`, plus
+one low-priority `nat_traversal_failed` event per failure with the
+sub-reason and what the attempt saw), an endpoint-dependent-mapping signal
+(`observed_addr_*`: each handshake ack's view of our address, compared only
+across DIFFERENT reporters in the same address family; counts only, never
+the address), final-ACK timing (`transfers_acked`, `*_transfer_ack_time_ms`) and
 the listener-to-connection queue (`inbound_queue_depth_hwm`, `_drops`). Hot
 path writes are single relaxed atomics; `SentPacketTracker` keeps an
 `rto_expiries` count and a bounded per-stream final-ACK watch, both
@@ -206,10 +209,14 @@ data path.
 
 Transfer events take `final_srtt_ms` and `total_timeouts` from the
 connection's sent-packet tracker, not the congestion controller (FixedRate
-reports zero RTT/loss), and report cwnd as null when the controller has no
-bounded window. `Ring::prune_connection` takes a `DisconnectReason`: pass the
-real cause (`Timeout` for the idle timeout, `NetworkError` for transport
-failures, `Pruned` only for local topology management).
+reports zero RTT/loss), add `min_rtt_ms` and `peak_flightsize_bytes`
+(queueing delay), and report cwnd as null when the controller has no
+bounded window. `Ring::prune_connection` and `NodeEvent::DropConnection`
+take a `DisconnectReason`: pass the real cause (`Timeout` for the idle
+timeout, `NetworkError` for transport failures, `Pruned` only for local
+topology management; the full list is on `DisconnectReason`). Disconnect
+byte totals are this connection's: the ring `Connection` records the
+per-peer totals when it joins and the event reports the difference.
 
 ### Dashboard bandwidth sampler (#5152)
 

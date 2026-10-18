@@ -6052,10 +6052,14 @@ impl Ring {
         reason: crate::tracing::DisconnectReason,
     ) -> PruneConnectionResult {
         tracing::debug!(%peer, %reason, "Removing connection");
-        // Read the per-peer wire-byte totals before
-        // `record_peer_disconnected` frees the slot. Best effort: `None` if
-        // the bounded per-peer table already evicted this peer.
-        let peer_bytes = crate::transport::TRANSPORT_METRICS.peer_bytes(peer.socket_addr());
+        // This connection's wire bytes: the per-peer totals (read before
+        // `record_peer_disconnected` frees the slot) minus the baseline taken
+        // when the connection joined the ring. Best effort: `None` if the
+        // bounded per-peer table evicted this peer meanwhile.
+        let connection_bytes = self.connection_manager.get_connection_bytes(
+            peer.socket_addr(),
+            crate::transport::TRANSPORT_METRICS.peer_bytes(peer.socket_addr()),
+        );
         crate::node::network_status::record_peer_disconnected(peer.socket_addr());
         let orphaned_transactions = self
             .live_tx_tracker
@@ -6093,8 +6097,8 @@ impl Ring {
             &peer,
             reason,
             connection_duration_ms,
-            peer_bytes.map(|(sent, _)| sent),
-            peer_bytes.map(|(_, received)| received),
+            connection_bytes.and_then(|(sent, _)| sent),
+            connection_bytes.and_then(|(_, received)| received),
         ) {
             self.event_register
                 .register_events(Either::Left(event))
@@ -6611,6 +6615,7 @@ impl Ring {
                         .notifications_sender
                         .send(Either::Right(crate::message::NodeEvent::DropConnection(
                             addr,
+                            crate::tracing::DisconnectReason::Explicit("unhealthy_peer".into()),
                         )))
                         .await
                     {
@@ -6999,6 +7004,7 @@ impl Ring {
                                 .notifications_sender
                                 .send(Either::Right(crate::message::NodeEvent::DropConnection(
                                     addr,
+                                    crate::tracing::DisconnectReason::Pruned,
                                 )))
                                 .await
                                 .map_err(|error| {
@@ -7075,6 +7081,7 @@ impl Ring {
                             .notifications_sender
                             .send(Either::Right(crate::message::NodeEvent::DropConnection(
                                 addr,
+                                crate::tracing::DisconnectReason::Pruned,
                             )))
                             .await
                             .map_err(|error| {

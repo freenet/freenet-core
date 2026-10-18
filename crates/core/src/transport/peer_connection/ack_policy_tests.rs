@@ -1574,3 +1574,83 @@ async fn idle_timeout_is_reported_for_disconnect_reason() {
         "the idle-timeout exit must be flagged"
     );
 }
+
+/// End to end through `send_stream`: a streamed message whose fragments are
+/// all acknowledged after the stream handed them to the socket is counted as
+/// a fully acknowledged transfer once the recv loop processes the receipts.
+#[tokio::test(start_paused = true)]
+async fn streamed_transfer_counts_final_ack() {
+    let mut e = single(CAPABLE);
+    e.conn.send("s".repeat(20_000)).await.expect("send");
+    // Let the spawned stream task hand every fragment to the socket and
+    // register its final-ACK watch.
+    let mut fragments = Vec::new();
+    for _ in 0..50 {
+        assert!(e.pump(Duration::from_millis(2)).await.is_none());
+        fragments.extend(
+            e.drain_sent()
+                .into_iter()
+                .filter(|m| matches!(m.payload, SymmetricMessagePayload::StreamFragment { .. }))
+                .map(|m| m.packet_id),
+        );
+    }
+    assert!(fragments.len() > 1, "a 20 KB message must be streamed");
+    let before = crate::transport::TRANSPORT_METRICS.transfers_acked_count();
+    e.deliver(1, SymmetricMessagePayload::NoOp, fragments).await;
+    e.deliver(2, short(b"after-acks"), vec![]).await;
+    assert!(e.pump(Duration::from_millis(50)).await.is_some());
+    assert!(
+        crate::transport::TRANSPORT_METRICS.transfers_acked_count() > before,
+        "acknowledging every fragment must count one fully acknowledged transfer"
+    );
+}
+
+/// The Abandon arm of the recv loop: a packet that is never acknowledged is
+/// eventually abandoned, and the abandonment is counted.
+#[tokio::test(start_paused = true)]
+async fn never_acked_packet_is_abandoned_and_counted() {
+    let mut e = single(CAPABLE);
+    e.conn.send("never-acked".to_string()).await.expect("send");
+    let data_id = e
+        .drain_sent()
+        .iter()
+        .find(|m| matches!(m.payload, SymmetricMessagePayload::ShortMessage { .. }))
+        .expect("data packet sent")
+        .packet_id;
+    let [_, _, abandoned_before, _, _, _] = crate::transport::TRANSPORT_METRICS.loss_counts();
+
+    let start = tokio::time::Instant::now();
+    let mut next_ping = 1_000u32;
+    while e
+        .conn
+        .remote_conn
+        .sent_tracker
+        .lock()
+        .contains_packet(data_id)
+    {
+        assert!(
+            start.elapsed() < Duration::from_secs(1_200),
+            "the packet was never abandoned"
+        );
+        // Keep the connection alive (no ACK for our packet, so the backoff
+        // still escalates) by delivering a remote Ping now and then.
+        e.deliver(
+            next_ping,
+            SymmetricMessagePayload::Ping {
+                sequence: next_ping as u64,
+            },
+            vec![],
+        )
+        .await;
+        next_ping += 1;
+        for _ in 0..10 {
+            assert!(e.pump(Duration::from_secs(1)).await.is_none());
+            e.drain_sent();
+        }
+    }
+    let [_, _, abandoned_after, _, _, _] = crate::transport::TRANSPORT_METRICS.loss_counts();
+    assert!(
+        abandoned_after > abandoned_before,
+        "packets_abandoned must increase"
+    );
+}

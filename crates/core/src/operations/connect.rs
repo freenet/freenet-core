@@ -2411,6 +2411,21 @@ mod tests {
         own_addr: &str,
         is_gateway: bool,
     ) -> Arc<OpManager> {
+        bootstrap_test_op_manager_with_register(
+            id,
+            own_addr,
+            is_gateway,
+            crate::tracing::DynamicRegister::new(vec![]),
+        )
+        .await
+    }
+
+    async fn bootstrap_test_op_manager_with_register(
+        id: &str,
+        own_addr: &str,
+        is_gateway: bool,
+        event_register: crate::tracing::DynamicRegister,
+    ) -> Arc<OpManager> {
         let config_args = crate::config::ConfigArgs {
             id: Some(id.to_string()),
             mode: Some(crate::contract::OperationMode::Local),
@@ -2432,7 +2447,7 @@ mod tests {
                 notification_tx,
                 ops_ch_channel,
                 &node_config,
-                crate::tracing::DynamicRegister::new(vec![]),
+                event_register,
                 connection_manager,
                 result_router_tx,
                 &task_monitor,
@@ -3113,6 +3128,67 @@ mod tests {
                 first_conn_stats().connect_attempts_before_first_connection,
                 2,
                 "a refused join is not an attempt"
+            );
+        });
+    }
+
+    /// `Ring::prune_connection` emits the `disconnect` event with the reason
+    /// it was given and THIS connection's bytes: traffic to the address
+    /// before the connection joined the ring (e.g. an earlier NAT attempt) is
+    /// excluded.
+    #[test]
+    fn disconnect_event_reports_reason_and_connection_bytes() {
+        with_network_status_lock(async {
+            let listener = crate::tracing::TestEventListener::new().await;
+            let logs = listener.logs.clone();
+            let op_manager = bootstrap_test_op_manager_with_register(
+                "disconnect-reason-bytes",
+                "127.0.0.1:14871",
+                false,
+                crate::tracing::DynamicRegister::new(vec![Box::new(listener)]),
+            )
+            .await;
+            let metrics = &crate::transport::TRANSPORT_METRICS;
+            let kp = TransportKeypair::new();
+            let addr: SocketAddr = "127.0.0.9:25871".parse().unwrap();
+            metrics.remove_peer(addr);
+            // Bytes from before the connection existed.
+            metrics.record_packet_received(addr, 1_000);
+            assert!(op_manager.ring.connection_manager.add_connection(
+                Location::from_address(&addr),
+                addr,
+                kp.public().clone(),
+                false
+            ));
+            metrics.record_packet_sent(addr, 300);
+            metrics.record_packet_received(addr, 500);
+            op_manager
+                .ring
+                .prune_connection(
+                    crate::node::PeerId::new(kp.public().clone(), addr),
+                    crate::tracing::DisconnectReason::Timeout,
+                )
+                .await;
+            let logs = logs.lock().await;
+            let event = logs
+                .iter()
+                .find_map(|log| match &log.kind {
+                    crate::tracing::EventKind::Disconnected {
+                        reason,
+                        bytes_sent,
+                        bytes_received,
+                        ..
+                    } => Some((reason.clone(), *bytes_sent, *bytes_received)),
+                    _ => None,
+                })
+                .expect("prune_connection must emit a disconnect event");
+            assert_eq!(
+                event,
+                (
+                    crate::tracing::DisconnectReason::Timeout,
+                    Some(300),
+                    Some(500)
+                )
             );
         });
     }

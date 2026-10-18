@@ -297,6 +297,13 @@ pub(crate) struct ConnRttGauge {
     keepalive_srtt_us: std::sync::atomic::AtomicU64,
     /// Minimum over data-ACK and keep-alive samples, microseconds.
     min_rtt_us: std::sync::atomic::AtomicU64,
+    /// Update sequence: each SRTT write takes the next value, and the source
+    /// written last wins in [`Self::read`]. Without it a data-ACK SRTT from a
+    /// burst long ago would outrank the fresh keep-alive SRTT of a connection
+    /// that has since gone quiet.
+    seq: std::sync::atomic::AtomicU64,
+    ack_srtt_seq: std::sync::atomic::AtomicU64,
+    keepalive_srtt_seq: std::sync::atomic::AtomicU64,
 }
 
 impl ConnRttGauge {
@@ -317,9 +324,14 @@ impl ConnRttGauge {
             .ok();
     }
 
+    fn next_seq(&self) -> u64 {
+        self.seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
+    }
+
     fn publish_ack_srtt(&self, srtt: Duration) {
-        self.ack_srtt_us
-            .store(Self::to_us(srtt), std::sync::atomic::Ordering::Relaxed);
+        use std::sync::atomic::Ordering;
+        self.ack_srtt_us.store(Self::to_us(srtt), Ordering::Relaxed);
+        self.ack_srtt_seq.store(self.next_seq(), Ordering::Relaxed);
     }
 
     fn record_keepalive(&self, rtt: Duration) {
@@ -335,15 +347,29 @@ impl ConnRttGauge {
             (cur.saturating_mul(7).saturating_add(us) / 8).max(1)
         };
         self.keepalive_srtt_us.store(next, Ordering::Relaxed);
+        self.keepalive_srtt_seq
+            .store(self.next_seq(), Ordering::Relaxed);
     }
 
-    /// `(srtt_us, min_rtt_us)`, each `None` until sampled. Prefers the
-    /// data-ACK SRTT and falls back to the keep-alive SRTT.
+    /// `(srtt_us, min_rtt_us)`, each `None` until sampled. The SRTT is from
+    /// whichever source (data ACKs or keep-alives) was updated most recently.
     pub(crate) fn read(&self) -> (Option<u64>, Option<u64>) {
         use std::sync::atomic::Ordering;
         let nz = |v: u64| (v != 0).then_some(v);
-        let srtt = nz(self.ack_srtt_us.load(Ordering::Relaxed))
-            .or_else(|| nz(self.keepalive_srtt_us.load(Ordering::Relaxed)));
+        let ack = nz(self.ack_srtt_us.load(Ordering::Relaxed));
+        let keepalive = nz(self.keepalive_srtt_us.load(Ordering::Relaxed));
+        let srtt = match (ack, keepalive) {
+            (Some(a), Some(k)) => {
+                if self.ack_srtt_seq.load(Ordering::Relaxed)
+                    >= self.keepalive_srtt_seq.load(Ordering::Relaxed)
+                {
+                    Some(a)
+                } else {
+                    Some(k)
+                }
+            }
+            (a, k) => a.or(k),
+        };
         (srtt, nz(self.min_rtt_us.load(Ordering::Relaxed)))
     }
 }
@@ -1251,6 +1277,56 @@ mod tests {
              Re-promotion to INFO/WARN restores the #4251 / #4272 1Hz-heartbeat regression. \
              (The OTLP send_standalone_event call below is unaffected by the log level.)\n\
              Preceding source (last 200 bytes):\n{tail}"
+        );
+    }
+
+    /// The freshest SRTT source wins: a stale data-ACK SRTT must not outrank
+    /// a newer keep-alive SRTT, and vice versa.
+    #[test]
+    fn conn_rtt_gauge_prefers_most_recent_source() {
+        let g = ConnRttGauge::default();
+        assert_eq!(g.read(), (None, None));
+        g.publish_ack_srtt(Duration::from_millis(200));
+        assert_eq!(g.read().0, Some(200_000));
+        g.record_keepalive(Duration::from_millis(30));
+        assert_eq!(g.read().0, Some(30_000), "newer keep-alive SRTT wins");
+        g.publish_ack_srtt(Duration::from_millis(100));
+        assert_eq!(g.read().0, Some(100_000), "newer ack SRTT wins");
+        assert_eq!(g.read().1, Some(30_000), "min RTT spans both sources");
+    }
+
+    /// The per-connection gauge registry follows the connection: a newer
+    /// connection to the same address replaces the entry, dropping the old
+    /// handle leaves the new entry alone, and dropping the last one empties it.
+    #[test]
+    fn conn_rtt_registry_lifecycle() {
+        let addr: SocketAddr = "198.51.100.77:41234".parse().unwrap();
+        let ts = crate::simulation::VirtualTime::new();
+        let first = RollingRttStatsHandle::new(addr, ts.clone());
+        assert!(
+            CONN_RTT_REGISTRY
+                .get(&addr)
+                .is_some_and(|e| Arc::ptr_eq(e.value(), &first.gauge))
+        );
+        let second = RollingRttStatsHandle::new(addr, ts.clone());
+        assert!(
+            CONN_RTT_REGISTRY
+                .get(&addr)
+                .is_some_and(|e| Arc::ptr_eq(e.value(), &second.gauge))
+        );
+        drop(first);
+        assert!(
+            CONN_RTT_REGISTRY
+                .get(&addr)
+                .is_some_and(|e| Arc::ptr_eq(e.value(), &second.gauge)),
+            "dropping the replaced handle must not remove the live entry"
+        );
+        second.record_keepalive(Duration::from_millis(12));
+        assert_eq!(second.gauge().read(), (Some(12_000), Some(12_000)));
+        drop(second);
+        assert!(
+            CONN_RTT_REGISTRY.get(&addr).is_none(),
+            "entry must go with the connection"
         );
     }
 }

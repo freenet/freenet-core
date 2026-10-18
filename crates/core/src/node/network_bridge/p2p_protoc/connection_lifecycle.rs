@@ -59,7 +59,10 @@ impl P2pConnManager {
             .bridge
             .op_manager
             .ring
-            .prune_connection(PeerId::new(peer.pub_key().clone(), peer_addr), reason)
+            .prune_connection(
+                PeerId::new(peer.pub_key().clone(), peer_addr),
+                reason.clone(),
+            )
             .await;
 
         // Handle orphaned transactions immediately (retry via alternate routes).
@@ -86,7 +89,7 @@ impl P2pConnManager {
                 Duration::from_secs(1),
                 conn.sender
                     .send(Right(ConnEvent::NodeAction(NodeEvent::DropConnection(
-                        peer_addr,
+                        peer_addr, reason,
                     )))),
             )
             .await
@@ -188,6 +191,7 @@ impl P2pConnManager {
                 conn.sender
                     .send(Right(ConnEvent::NodeAction(NodeEvent::DropConnection(
                         peer_addr,
+                        crate::tracing::DisconnectReason::Explicit("unpromoted_transport".into()),
                     )))),
             )
             .await

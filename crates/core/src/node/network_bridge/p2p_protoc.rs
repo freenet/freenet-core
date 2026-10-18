@@ -389,6 +389,7 @@ impl NetworkBridge for P2pBridge {
             self.ev_listener_tx
                 .send(P2pBridgeEvent::NodeAction(NodeEvent::DropConnection(
                     peer_addr,
+                    crate::tracing::DisconnectReason::Pruned,
                 )))
                 .await
                 .map_err(|_| ConnectionError::SendNotCompleted(peer_addr))?;
@@ -2367,16 +2368,12 @@ impl P2pConnManager {
                             }
                         }
                         ConnEvent::NodeAction(action) => match action {
-                            NodeEvent::DropConnection(peer_addr) => {
-                                // Every `NodeEvent::DropConnection` sender is
-                                // local topology management (topology
-                                // adjustment, unhealthy-peer eviction,
-                                // deferred swap drop), hence "pruned".
+                            NodeEvent::DropConnection(peer_addr, reason) => {
                                 if !ctx
                                     .drop_connection_by_addr(
                                         peer_addr,
                                         &handshake_cmd_sender,
-                                        crate::tracing::DisconnectReason::Pruned,
+                                        reason,
                                     )
                                     .await
                                 {
@@ -3346,7 +3343,7 @@ async fn handle_peer_channel_message(
         Right(action) => {
             tracing::debug!(to=%conn.remote_addr(), "Received action from channel");
             match action {
-                ConnEvent::NodeAction(NodeEvent::DropConnection(peer)) => {
+                ConnEvent::NodeAction(NodeEvent::DropConnection(peer, _)) => {
                     tracing::info!(
                         to = %conn.remote_addr(),
                         peer = %peer,
@@ -3568,7 +3565,7 @@ async fn peer_connection_listener(
                                 error,
                                 connection_id,
                                 crate::tracing::DisconnectReason::NetworkError(
-                                    "send_failed".into(),
+                                    "outbound_command_failed".into(),
                                 ),
                             )
                             .await;
@@ -3627,7 +3624,7 @@ async fn peer_connection_listener(
                                     remote_addr,
                                     error,
                                     connection_id,
-                                    crate::tracing::DisconnectReason::NetworkError("send_failed".into()),
+                                    crate::tracing::DisconnectReason::NetworkError("outbound_command_failed".into()),
                                 )
                                 .await;
                                 return;
