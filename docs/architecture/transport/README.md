@@ -172,8 +172,10 @@ cargo bench --bench transport_perf -- slow_start
 `crates/core/src/transport/link_model.rs` is a size-aware link model
 (bottleneck queue, per-direction delay, loss, scheduled spikes and outages)
 that `MockSocket` can route through on virtual time. Regression scenarios
-built on it live beside it; `link_model/r1_tests.rs` (R1, recovery from an
-RTT spike) gates every PR through the unit suite:
+built on it live beside it; `link_model/r1_tests.rs` (R1 and R1b, recovery
+from a 3.4 s and a 2.4 s RTT spike) gates every PR through the unit suite.
+Each seed must pass binary checks (completes, no stream abort, recovers,
+flightsize back to 0, RTT floor); completion time is judged across seeds:
 
 ```bash
 cargo test -p freenet --lib link_model
