@@ -3172,14 +3172,18 @@ mod tests {
             let logs = logs.lock().await;
             let event = logs
                 .iter()
-                .find_map(|log| match &log.kind {
-                    crate::tracing::EventKind::Disconnected {
+                .find_map(|log| {
+                    if let crate::tracing::EventKind::Disconnected {
                         reason,
                         bytes_sent,
                         bytes_received,
                         ..
-                    } => Some((reason.clone(), *bytes_sent, *bytes_received)),
-                    _ => None,
+                    } = &log.kind
+                    {
+                        Some((reason.clone(), *bytes_sent, *bytes_received))
+                    } else {
+                        None
+                    }
                 })
                 .expect("prune_connection must emit a disconnect event");
             assert_eq!(
