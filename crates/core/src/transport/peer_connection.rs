@@ -246,6 +246,8 @@ pub(crate) struct CongestionProbe {
     /// Smallest RTT sample the sent-packet tracker has taken (every sample
     /// the controllers see passes through it); `None` before the first one.
     pub min_rtt_sample: Option<Duration>,
+    /// Largest RTT sample the tracker has taken (zero before the first).
+    pub max_rtt_sample: Duration,
     pub srtt: Option<Duration>,
     pub rto_expiries: u64,
     /// Packets given up on after `MAX_PACKET_RETRANSMITS`.
@@ -2025,6 +2027,7 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
             flightsize: self.remote_conn.congestion_controller.flightsize(),
             cwnd: self.remote_conn.congestion_controller.current_cwnd(),
             min_rtt_sample: tracker.smoothed_rtt().map(|_| tracker.min_rtt()),
+            max_rtt_sample: tracker.max_rtt_sample(),
             srtt: tracker.smoothed_rtt(),
             rto_expiries: tracker.rto_expiries(),
             abandoned_packets: self.telemetry_test_counts.abandoned,
