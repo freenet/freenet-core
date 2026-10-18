@@ -187,10 +187,11 @@ jobs:
   wan-bench-r1:
     name: WAN Bench R1
     runs-on: ubicloud-standard-16
-    # Steps carry their own timeouts, below this one: a step that times out
-    # concludes `failure`, which notifies, while a job timeout concludes
-    # `cancelled`, which the notify jobs skip.
-    timeout-minutes: 90
+    # Steps carry their own timeouts, and this cap is above their sum (5 + 40
+    # + 30 + 40 = 115 min, plus setup), so a hang always trips a step first: a
+    # step that times out concludes `failure`, which notifies, while a job
+    # timeout concludes `cancelled`, which the notify jobs skip.
+    timeout-minutes: 140
 
     env:
       RUST_LOG: error
@@ -311,7 +312,7 @@ jobs:
           check r1_spike_recovery_ledbat "$abort_early"
           # At the shorter stall BBR has never aborted; an abort would be new.
           check r1b_spike_recovery_bbr "$slow"
-          check r1b_spike_recovery_ledbat "$abort"
+          check r1b_spike_recovery_ledbat "$abort_early"
           exit "$status"
 
   # Notify the Freenet dev room on failure.

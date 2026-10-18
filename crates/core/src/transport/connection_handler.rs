@@ -3229,9 +3229,14 @@ pub mod mock_transport {
     /// Send order for sockets without a link model.
     static SEND_ORDER: AtomicU64 = AtomicU64::new(0);
 
-    /// How many queued packets `recv_from` moves off its channel before it
-    /// checks again for one that is already due, so a burst of sends cannot
-    /// hold back delivery (code-style.md, per-iteration caps).
+    /// How many queued packets `recv_from` moves off its channel per pass
+    /// (code-style.md, per-iteration caps). It bounds the work of one pass, so
+    /// a sender on another runtime thread cannot keep the loop draining
+    /// indefinitely. The cost: delivery is in arrival order among parked
+    /// packets only, so a due packet may be delivered ahead of one still in
+    /// the channel that was due earlier. On the current-thread runtime the
+    /// WAN bench uses, nothing is sent while the loop runs, so this cannot
+    /// happen there.
     const MAX_INBOUND_DRAIN: usize = 64;
 
     /// Policy for simulating packet loss in mock transport.
@@ -3300,6 +3305,10 @@ pub mod mock_transport {
         /// The sleep for the earliest parked packet, kept across calls so a
         /// re-entered or cancelled `recv_from` reuses it instead of
         /// registering another VirtualTime wakeup for the same deadline.
+        /// When an earlier packet arrives and the deadline changes, the old
+        /// sleep is dropped but its wakeup stays registered (VirtualTime has
+        /// no deregistration): it costs one extra driver step and a spurious
+        /// wake when its deadline passes, nothing else.
         wait: Option<(u64, PendingSleep)>,
     }
 
@@ -4106,6 +4115,37 @@ pub mod mock_transport {
                 assert!(b.recv_from(&mut buf).now_or_never().is_none());
             }
             assert_eq!(vt.pending_wakeup_count(), before + 1);
+        }
+
+        /// Equal arrival times are ordered by the link model's sequence
+        /// number, not by the order the packets reached the channel (two
+        /// concurrent `send_to` calls can enqueue in the opposite order to
+        /// the one the model decided).
+        #[tokio::test]
+        async fn equal_arrivals_follow_the_models_order_not_the_channels() {
+            let (vt, link, channels) = fixture();
+            let (_b, b_addr) = linked_socket(&channels, &vt, &link).await;
+            let b = &_b;
+            // A sorts after C by address, so neither address nor channel
+            // order can produce the expected result; only `order` can.
+            let a_addr: SocketAddr = (Ipv4Addr::LOCALHOST, 2).into();
+            let c_addr: SocketAddr = (Ipv4Addr::LOCALHOST, 1).into();
+            let tx = channels.get(&b_addr).unwrap().value().clone();
+            for (from, data, order) in [(c_addr, b"second", 8), (a_addr, b"first!", 7)] {
+                tx.send(InboundPacket {
+                    from,
+                    data: data.to_vec(),
+                    available_at_nanos: 100,
+                    order,
+                })
+                .unwrap();
+            }
+            vt.advance(Duration::from_nanos(100));
+            let mut buf = [0u8; 8];
+            for (want, from) in [(&b"first!"[..], a_addr), (&b"second"[..], c_addr)] {
+                let (n, got_from) = b.recv_from(&mut buf).now_or_never().expect("due").unwrap();
+                assert_eq!((&buf[..n], got_from), (want, from));
+            }
         }
 
         /// FIFO is per path: a packet from one peer must not wait behind a

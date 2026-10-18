@@ -461,10 +461,13 @@ fn fresh_bytes(deliveries: &[Delivery], departed_from: u64, from: u64, to: u64) 
 }
 
 /// Share of the first copies that left the bottleneck in `[from, to)` which
-/// the sender offered to the link again. These packets were delivered, so a
-/// second offer is a retransmission the sender made only because their ACK
-/// was late (or lost). Counted at the link's input, so a retransmission that
-/// the full queue then dropped still counts.
+/// the sender offered to the link more than once, counted at the link's
+/// input so a retransmission the full queue then dropped still counts. Most
+/// are retransmissions of a delivered packet whose ACK was late (or lost);
+/// the count also includes a packet whose first offer the queue dropped and
+/// whose retransmission is the delivered first copy. That part is bounded by
+/// the queue's drop rate, at most ~20% here (FixedRate offers 10 Mbit/s into
+/// an 8 Mbit/s bottleneck), so the 0.5 threshold still needs the spike.
 fn reoffered_share(deliveries: &[Delivery], offers: &[Offer], from: u64, to: u64) -> f64 {
     let mut offered: HashMap<u64, u32> = HashMap::new();
     for o in offers {
