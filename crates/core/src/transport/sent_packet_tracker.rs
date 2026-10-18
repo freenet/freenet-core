@@ -171,6 +171,9 @@ pub(super) struct SentPacketTracker<T: TimeSource> {
     rttvar: Duration,
     /// Minimum observed RTT (useful for BBR-style algorithms later)
     min_rtt: Duration,
+    /// Largest RTT sample taken (test-only ground truth for the WAN bench).
+    #[cfg(test)]
+    max_rtt_sample: Duration,
     /// Retransmission Timeout
     rto: Duration,
 
@@ -318,6 +321,8 @@ impl<T: TimeSource> SentPacketTracker<T> {
             srtt: None,
             rttvar: Duration::from_secs(0),
             min_rtt: Duration::from_millis(100), // Reasonable default until real RTT samples arrive
+            #[cfg(test)]
+            max_rtt_sample: Duration::ZERO,
             rto: Duration::from_secs(1),
             retransmitted_packets: HashSet::new(),
             total_packets_sent: 0,
@@ -789,6 +794,10 @@ impl<T: TimeSource> SentPacketTracker<T> {
 
     /// Updates RTT estimation based on a new sample using RFC 6298 algorithm
     fn update_rtt(&mut self, sample: Duration) {
+        #[cfg(test)]
+        {
+            self.max_rtt_sample = self.max_rtt_sample.max(sample);
+        }
         // RFC 6298 constants
         const ALPHA: f64 = 1.0 / 8.0; // Smoothing factor for SRTT
         const BETA: f64 = 1.0 / 4.0; // Smoothing factor for RTTVAR
@@ -840,6 +849,12 @@ impl<T: TimeSource> SentPacketTracker<T> {
     #[allow(dead_code)] // Used in tests, may be useful for debugging
     pub(super) fn smoothed_rtt(&self) -> Option<Duration> {
         self.srtt
+    }
+
+    /// Largest RTT sample taken so far (zero before the first).
+    #[cfg(test)]
+    pub(super) fn max_rtt_sample(&self) -> Duration {
+        self.max_rtt_sample
     }
 
     /// Get the minimum observed RTT
@@ -1404,6 +1419,35 @@ pub(in crate::transport) mod tests {
             }
             _ => panic!("Expected Resend or TlpProbe action"),
         }
+    }
+
+    /// Every resend (TLP probe and RTO) carries exactly the bytes first sent.
+    /// The WAN bench's link model counts goodput by recognising a
+    /// retransmission as a byte-identical copy (`link_model::Delivery::
+    /// first_copy`); re-encrypting a retransmission would silently make every
+    /// copy look new and inflate measured goodput.
+    #[test]
+    fn retransmissions_resend_the_original_bytes() {
+        let mut tracker = mock_sent_packet_tracker();
+        let original: Box<[u8]> = vec![7, 1, 9, 4, 2].into();
+        tracker.report_sent_packet(1, original.clone());
+        let mut resends = 0;
+        for _ in 0..4 {
+            tracker.time_source.advance(tracker.effective_rto());
+            match tracker.get_resend() {
+                ResendAction::Resend(id, bytes) | ResendAction::TlpProbe(id, bytes) => {
+                    assert_eq!(id, 1);
+                    assert_eq!(bytes, original);
+                    resends += 1;
+                }
+                ResendAction::WaitUntil(_) => {}
+                ResendAction::Abandon { .. } => panic!("abandoned after {resends} resends"),
+            }
+        }
+        assert!(
+            resends >= 2,
+            "expected the packet to be resent, got {resends}"
+        );
     }
 
     // RTO Exponential Backoff Tests (RFC 6298 Section 5.5)

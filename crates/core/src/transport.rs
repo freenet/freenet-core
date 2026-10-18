@@ -194,6 +194,10 @@ pub mod in_memory_socket;
 /// without real network I/O.
 #[cfg(any(test, feature = "bench"))]
 pub use connection_handler::mock_transport;
+/// Size-aware WAN link model (bottleneck queue, delay, loss, spikes) that
+/// `MockSocket` can route packets through.
+#[cfg(any(test, feature = "bench"))]
+pub mod link_model;
 mod packet_data;
 pub mod peer_connection;
 // todo: optimize trackers

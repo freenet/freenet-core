@@ -20,7 +20,7 @@ const PAYLOAD_SIZES: &[usize] = &[
     64,   // Tiny message
     256,  // Small message
     1024, // 1KB
-    1364, // Max single packet (after overhead)
+    1171, // Max single-packet payload: 1200 - type byte - nonce - tag
 ];
 
 /// AES-GCM encryption - the core crypto operation

@@ -557,7 +557,7 @@ criterion_main!(
     allocation_extended,
     level0_extended,
     level1_extended,
-    // TODO: Re-enable after fixing VirtualTime benchmark hangs:
+    // TODO(#5932): Re-enable after fixing VirtualTime benchmark hangs:
     // high_latency_extended,
     // packet_loss_extended,
     // large_files_extended,

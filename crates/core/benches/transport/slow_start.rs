@@ -34,7 +34,7 @@ use super::common::{
 /// Measures the actual slow start benefit by tracking virtual time elapsed.
 ///
 /// Congestion control algorithm is configurable via `FREENET_CONGESTION_ALGO` env var.
-/// Defaults to BBR.
+/// Defaults to the production default (FixedRate).
 pub fn bench_cold_start_throughput(c: &mut Criterion) {
     // Print which congestion control algorithm is being used
     print_congestion_config();
@@ -205,7 +205,7 @@ pub fn bench_cold_start_throughput(c: &mut Criterion) {
 /// Uses VirtualTime for instant execution.
 ///
 /// Congestion control algorithm is configurable via `FREENET_CONGESTION_ALGO` env var.
-/// Defaults to BBR.
+/// Defaults to the production default (FixedRate).
 pub fn bench_warm_connection_throughput(c: &mut Criterion) {
     // Get configurable congestion control
     let congestion_config = Some(get_congestion_config());

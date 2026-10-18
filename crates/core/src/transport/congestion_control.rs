@@ -28,8 +28,8 @@
 //!     CongestionController, CongestionControlConfig, CongestionControlAlgorithm,
 //! };
 //!
-//! // Create a BBR controller (default)
-//! let config = CongestionControlConfig::default();
+//! // Create a BBR controller (the default is FixedRate)
+//! let config = CongestionControlConfig::new(CongestionControlAlgorithm::Bbr);
 //! let controller = config.build();
 //!
 //! // Use the controller

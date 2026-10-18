@@ -125,15 +125,21 @@ jobs:
         run: |
           echo "## Extended Transport Performance" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "Comprehensive resilience and performance testing:" >> $GITHUB_STEP_SUMMARY
-          echo "- **High-latency paths**: 100ms, 200ms, 500ms RTT (detects ssthresh death spiral)" >> $GITHUB_STEP_SUMMARY
-          echo "- **Packet loss**: 1%, 5% loss rates (tests reliability layer)" >> $GITHUB_STEP_SUMMARY
-          echo "- **Large transfers**: 10MB, 50MB (sustained throughput)" >> $GITHUB_STEP_SUMMARY
-          echo "- **Micro-benchmarks**: Component-level validation" >> $GITHUB_STEP_SUMMARY
+          echo "Micro-benchmarks only (allocation, level0 crypto/serialization, level1 channels)." >> $GITHUB_STEP_SUMMARY
+          echo "The VirtualTime network groups (high latency, packet loss, large transfers, streaming," >> $GITHUB_STEP_SUMMARY
+          echo "slow start) are disabled in transport_extended.rs until #5932 is fixed." >> $GITHUB_STEP_SUMMARY
+          echo "WAN-condition regression gating lives in the unit suite (transport::link_model::r1_tests)." >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
 
           # Run pre-compiled benchmark binary directly (avoids cargo recompilation check)
-          "$BENCH_BIN" --bench --color never 2>&1 | tee bench_output.txt || true
+          #
+          # pipefail, and no `|| true`: the step must fail when the bench does.
+          # Without pipefail the pipeline's status is tee's, so this step
+          # passed while the binary panicked in its first group (a 1364-byte
+          # slice of a 1200-byte buffer, stale since #3619 cut the packet
+          # size), and nothing after that group ran.
+          set -o pipefail
+          "$BENCH_BIN" --bench --color never 2>&1 | tee bench_output.txt
 
       # Parse results with structured script
       - name: Parse Benchmark Results

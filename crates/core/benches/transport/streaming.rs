@@ -1,7 +1,7 @@
 //! Transport Streaming Benchmarks with VirtualTime - Large message transfers
 //!
 //! These benchmarks test stream fragmentation, reassembly, and rate limiting
-//! for messages larger than a single packet (>1364 bytes).
+//! for messages larger than a single packet (>1171 bytes of payload).
 //!
 //! Uses VirtualTime for instant execution of network operations.
 //! Expected runtime: ~30 seconds (vs ~5-10 minutes with real time)

@@ -152,7 +152,7 @@ freenet --bbr-startup-rate 50000000  # 50 MB/s
 bbr-startup-rate = 10000000  # 10 MB/s for moderate startup
 ```
 
-**Note:** This parameter only affects connections using BBR algorithm, not LEDBAT++ (the default).
+**Note:** This parameter only affects connections using the BBR algorithm. The default is FixedRate; LEDBAT++ and BBR are opt-in.
 
 **Reference:**
 - Code: `crates/core/src/config.rs:838-846`

@@ -168,6 +168,153 @@ jobs:
       #       echo "Skipping large_network test - riverctl not installed"
       #     fi
 
+
+  # WAN transport bench R1/R1b (crates/core/src/transport/link_model/r1_tests.rs),
+  # in its own job so a failure here cannot skip the 500-node step above and
+  # its build does not eat into that job's 195-minute cap. PR CI runs five
+  # fixed GATE_SEEDS through the ordinary unit suite; this explores 20 more,
+  # rotating with the run number.
+  #
+  # What a failure here means: each seed must pass the binary checks
+  # (completes within 3x ideal, no stream abort or abandoned packet, recovers,
+  # flightsize 0 when idle, RTT floor, the spike really happened). Those are
+  # collapse signals, so a single failing seed is a real regression or bug.
+  # The performance checks (median <= 2x ideal, p90 <= 2.2x) are over the 20
+  # seeds together, because small timing changes reshuffle individual seeds.
+  # Runs are deterministic per seed, so a failure reproduces locally:
+  #   FREENET_WAN_BENCH_SEEDS=<seed> cargo test -p freenet --lib r1_spike_recovery_fixed_rate
+  # Once the cause is fixed, add a seed that caught a real bug to GATE_SEEDS.
+  wan-bench-r1:
+    name: WAN Bench R1
+    runs-on: ubicloud-standard-16
+    # Steps carry their own timeouts, and this cap is above their sum (5 + 40
+    # + 30 + 40 = 115 min, plus setup), so a hang always trips a step first: a
+    # step that times out concludes `failure`, which notifies, while a job
+    # timeout concludes `cancelled`, which the notify jobs skip.
+    timeout-minutes: 140
+
+    env:
+      RUST_LOG: error
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target
+      CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
+      CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -C link-arg=-fuse-ld=mold
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.inputs.ref || github.ref }}
+
+      # A manual dispatch can name a ref older than the bench.
+      - name: Check the ref has the WAN bench
+        id: present
+        run: |
+          if [ -f crates/core/src/transport/link_model/r1_tests.rs ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::This ref predates the WAN bench; skipping."
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: dtolnay/rust-toolchain@stable
+        if: steps.present.outputs.run == 'true'
+        with:
+          toolchain: 1.93.0
+
+      - uses: Swatinem/rust-cache@v2
+        if: steps.present.outputs.run == 'true'
+        with:
+          prefix-key: wan-bench-r1
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Install mold linker
+        if: steps.present.outputs.run == 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mold
+
+      # Rationale for the action at the first of these in ci.yml; see #5296.
+      - name: Install nextest
+        if: steps.present.outputs.run == 'true'
+        uses: taiki-e/install-action@v2
+        timeout-minutes: 5
+        with:
+          tool: cargo-nextest
+          fallback: none
+
+      - name: Build lib tests
+        if: steps.present.outputs.run == 'true'
+        timeout-minutes: 40
+        run: cargo nextest run -p freenet --lib --no-run
+
+      - name: Pick seeds
+        if: steps.present.outputs.run == 'true'
+        id: seeds
+        env:
+          RUN_NUMBER: ${{ github.run_number }}
+        run: echo "list=$(seq -s, $((RUN_NUMBER * 20)) $((RUN_NUMBER * 20 + 19)))" >> "$GITHUB_OUTPUT"
+
+      # Measured locally: about 4 minutes for all six R1/R1b tests on 20 seeds
+      # with 7 test threads, on a loaded 16-core host.
+      - name: R1 and R1b, gating controller (FixedRate)
+        if: steps.present.outputs.run == 'true'
+        timeout-minutes: 30
+        env:
+          FREENET_WAN_BENCH_SEEDS: ${{ steps.seeds.outputs.list }}
+        run: |
+          echo "FREENET_WAN_BENCH_SEEDS=$FREENET_WAN_BENCH_SEEDS"
+          cargo nextest run -p freenet --lib --profile nightly --no-capture \
+            -E 'test(/link_model::r1_tests::r1(b)?_(spike_recovery_fixed_rate|runs_are_reproducible_from_the_seed)$/)'
+
+      # BBR and LEDBAT++ are #[ignore]d as known failures (#5929, #5930). Run
+      # them anyway so they keep running to their verdict. This step fails if
+      # one now PASSES on every seed (remove its #[ignore] and close the
+      # issue), or fails in a way its expected failure does not cover: every
+      # per-seed reason must match the test's allowed list below, so a new
+      # failure mode cannot hide behind a known one.
+      - name: R1 and R1b, known failures (BBR, LEDBAT++) still fail the known way
+        if: ${{ !cancelled() && steps.present.outputs.run == 'true' }}
+        timeout-minutes: 40
+        env:
+          FREENET_WAN_BENCH_SEEDS: ${{ steps.seeds.outputs.list }}
+        run: |
+          # Allowed per-seed reasons. A stream that aborts before the spiked
+          # ACKs return also leaves no evidence the spike drove its timers.
+          slow='^(did not complete within |goodput never reached )'
+          abort='^(did not complete within |goodput never reached |sender gave up on the stream )'
+          abort_early='^(did not complete within |goodput never reached |sender gave up on the stream |no evidence the spike drove)'
+          status=0
+          check() {
+            test_name=$1 allowed=$2
+            set +e
+            cargo nextest run -p freenet --lib --profile nightly --no-capture --run-ignored only \
+              -E "test(/link_model::r1_tests::${test_name}\$/)" > "${test_name}.log" 2>&1
+            rc=$?
+            set -e
+            tail -n 60 "${test_name}.log"
+            if [ "$rc" -eq 0 ]; then
+              echo "::error::${test_name} passed on every seed: remove its #[ignore] and close its issue"
+              status=1
+              return
+            fi
+            if ! grep -qE '^R1b? failed for' "${test_name}.log"; then
+              echo "::error::${test_name} failed without reaching its verdict (panic, hang or build error)"
+              status=1
+              return
+            fi
+            unexpected=$(sed -nE 's/^  seed 0x[0-9a-f]+: //p' "${test_name}.log" | grep -vE "$allowed" || true)
+            if [ -n "$unexpected" ]; then
+              echo "::error::${test_name} failed in a way its known failure does not cover:"
+              echo "$unexpected" | sort | uniq -c
+              status=1
+            fi
+          }
+          check r1_spike_recovery_bbr "$abort_early"
+          check r1_spike_recovery_ledbat "$abort_early"
+          # At the shorter stall BBR has never aborted; an abort would be new.
+          check r1b_spike_recovery_bbr "$slow"
+          check r1b_spike_recovery_ledbat "$abort_early"
+          exit "$status"
+
   # Notify the Freenet dev room on failure.
   #
   # This used to post to Matrix via a direct curl against the matrix.org REST
@@ -183,8 +330,8 @@ jobs:
     name: Notify River on Failure
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    needs: large-scale-simulation
-    if: failure() && needs.large-scale-simulation.result == 'failure'
+    needs: [large-scale-simulation, wan-bench-r1]
+    if: failure() && (needs.large-scale-simulation.result == 'failure' || needs.wan-bench-r1.result == 'failure')
     continue-on-error: true
     steps:
       - name: Install Rust
@@ -225,8 +372,8 @@ jobs:
   notify-dev-room-failure:
     name: Notify dev room on Failure
     runs-on: ubuntu-latest
-    needs: large-scale-simulation
-    if: failure() && needs.large-scale-simulation.result == 'failure'
+    needs: [large-scale-simulation, wan-bench-r1]
+    if: failure() && (needs.large-scale-simulation.result == 'failure' || needs.wan-bench-r1.result == 'failure')
     continue-on-error: true
     steps:
       - uses: actions/checkout@v7

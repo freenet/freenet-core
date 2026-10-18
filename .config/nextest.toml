@@ -122,6 +122,15 @@ filter = "test(/probation_(is_committed|survives)/)"
 slow-timeout = { period = "300s", terminate-after = 2 }
 retries = 0
 
+# WAN transport bench, regression scenario R1 (death spiral under an RTT
+# spike; crates/core/src/transport/link_model/r1_tests.rs). It runs on virtual
+# time from fixed seeds, so it is deterministic: a retry could only turn a
+# real regression into a green run, the laundering the flaky-tests rule
+# forbids. Each test runs three seeds of an 8 MiB transfer.
+[[profile.ci.overrides]]
+filter = "test(/link_model::r1_tests::/)"
+retries = 0
+
 [profile.nightly]
 # Nightly tests run longer by design; no retries since failures need investigation.
 retries = 0
