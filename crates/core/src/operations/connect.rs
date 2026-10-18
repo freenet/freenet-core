@@ -2411,6 +2411,21 @@ mod tests {
         own_addr: &str,
         is_gateway: bool,
     ) -> Arc<OpManager> {
+        bootstrap_test_op_manager_with_register(
+            id,
+            own_addr,
+            is_gateway,
+            crate::tracing::DynamicRegister::new(vec![]),
+        )
+        .await
+    }
+
+    async fn bootstrap_test_op_manager_with_register(
+        id: &str,
+        own_addr: &str,
+        is_gateway: bool,
+        event_register: crate::tracing::DynamicRegister,
+    ) -> Arc<OpManager> {
         let config_args = crate::config::ConfigArgs {
             id: Some(id.to_string()),
             mode: Some(crate::contract::OperationMode::Local),
@@ -2432,7 +2447,7 @@ mod tests {
                 notification_tx,
                 ops_ch_channel,
                 &node_config,
-                crate::tracing::DynamicRegister::new(vec![]),
+                event_register,
                 connection_manager,
                 result_router_tx,
                 &task_monitor,
@@ -3117,6 +3132,75 @@ mod tests {
         });
     }
 
+    /// `Ring::prune_connection` emits the `disconnect` event with the reason
+    /// it was given and THIS connection's bytes: traffic to the address
+    /// before the connection joined the ring (e.g. an earlier NAT attempt) is
+    /// excluded.
+    #[test]
+    fn disconnect_event_reports_reason_and_connection_bytes() {
+        with_network_status_lock(async {
+            let listener = crate::tracing::TestEventListener::new().await;
+            let logs = listener.logs.clone();
+            let op_manager = bootstrap_test_op_manager_with_register(
+                "disconnect-reason-bytes",
+                "127.0.0.1:14871",
+                false,
+                crate::tracing::DynamicRegister::new(vec![Box::new(listener)]),
+            )
+            .await;
+            let kp = TransportKeypair::new();
+            let addr: SocketAddr = "127.0.0.9:25871".parse().unwrap();
+            // Injected per-address totals: the shared per-peer table is
+            // bounded (LRU) and moved by concurrent tests.
+            let set_bytes = |bytes: (u64, u64)| {
+                crate::transport::metrics::PEER_BYTES_OVERRIDE
+                    .with(|o| o.borrow_mut().insert(addr, bytes));
+            };
+            // Bytes from before the connection existed.
+            set_bytes((0, 1_000));
+            assert!(op_manager.ring.connection_manager.add_connection(
+                Location::from_address(&addr),
+                addr,
+                kp.public().clone(),
+                false
+            ));
+            set_bytes((300, 1_500));
+            op_manager
+                .ring
+                .prune_connection(
+                    crate::node::PeerId::new(kp.public().clone(), addr),
+                    crate::tracing::DisconnectReason::Timeout,
+                )
+                .await;
+            crate::transport::metrics::PEER_BYTES_OVERRIDE.with(|o| o.borrow_mut().remove(&addr));
+            let logs = logs.lock().await;
+            let event = logs
+                .iter()
+                .find_map(|log| {
+                    if let crate::tracing::EventKind::Disconnected {
+                        reason,
+                        bytes_sent,
+                        bytes_received,
+                        ..
+                    } = &log.kind
+                    {
+                        Some((reason.clone(), *bytes_sent, *bytes_received))
+                    } else {
+                        None
+                    }
+                })
+                .expect("prune_connection must emit a disconnect event");
+            assert_eq!(
+                event,
+                (
+                    crate::tracing::DisconnectReason::Timeout,
+                    Some(300),
+                    Some(500)
+                )
+            );
+        });
+    }
+
     /// #5858 wiring through the REAL ring add path on a joiner: the first
     /// accepted `Ring::add_connection_reporting` records the latency and
     /// freezes the attempt count; dropping to zero connections and rejoining,
@@ -3154,7 +3238,10 @@ mod tests {
                 .expect("the first accepted ring add must record the latency");
 
             // Drop to zero connections, rejoin, dial again.
-            op_manager.ring.prune_connection(peer).await;
+            op_manager
+                .ring
+                .prune_connection(peer, crate::tracing::DisconnectReason::Pruned)
+                .await;
             assert_eq!(op_manager.ring.open_connections(), 0);
             let kp2 = TransportKeypair::new();
             let peer2 = crate::node::PeerId::new(

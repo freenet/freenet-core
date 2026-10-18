@@ -2176,7 +2176,7 @@ mod tests {
             "every probe acceptor must be classified, for the probe's generation"
         );
         assert!(
-            !body.contains("NodeEvent::DropConnection(acceptor_addr)")
+            !body.contains("NodeEvent::DropConnection(acceptor_addr")
                 && !gate_block.contains("continue;"),
             "a probe acceptor must be kept (a dropped link stays dead on the far end)"
         );

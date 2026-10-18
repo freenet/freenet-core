@@ -858,8 +858,9 @@ pub(crate) type ConnectResult = Result<(SocketAddr, RemainingChecks), ()>;
 /// Internal node events emitted to the event loop.
 #[derive(Debug, Clone)]
 pub(crate) enum NodeEvent {
-    /// Drop the given peer connection by socket address.
-    DropConnection(SocketAddr),
+    /// Drop the given peer connection by socket address. The reason is
+    /// reported on the `disconnect` telemetry event.
+    DropConnection(SocketAddr, crate::tracing::DisconnectReason),
     /// Drop a gateway link that bootstrapping CONNECTs found dead, unless
     /// the gateway is a ring connection by the time the event loop handles
     /// this. `done` is signalled either way, so the sender can hold its next
@@ -1033,8 +1034,8 @@ pub(crate) enum QueryResult {
 impl Display for NodeEvent {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            NodeEvent::DropConnection(peer) => {
-                write!(f, "DropConnection (from {peer})")
+            NodeEvent::DropConnection(peer, reason) => {
+                write!(f, "DropConnection (from {peer}, {reason})")
             }
             NodeEvent::DropStaleGatewayLink { addr, .. } => {
                 write!(f, "DropStaleGatewayLink (from {addr})")

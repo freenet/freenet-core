@@ -694,7 +694,10 @@ struct UdpPacketsListener<S = UdpSocket, T: TimeSource = RealTime> {
 
 type OngoingConnectionResult<S, T> = Option<
     Result<
-        Result<(RemoteConnection<S, T>, InboundRemoteConnection), (TransportError, SocketAddr)>,
+        Result<
+            (RemoteConnection<S, T>, InboundRemoteConnection),
+            (TransportError, SocketAddr, Arc<NatAttemptObservation>),
+        >,
         tokio::task::JoinError,
     >,
 >;
@@ -800,8 +803,20 @@ impl<S, T: TimeSource> ConnectionStateManager<S, T> {
         }) = self.states.get(addr)
         {
             match inbound_packet_sender.try_send(packet) {
-                Ok(()) => Ok(true),
-                Err(mpsc::error::TrySendError::Full(_)) => Ok(false),
+                Ok(()) => {
+                    // Queue gauge (telemetry): two relaxed atomic reads on
+                    // the channel's semaphore plus one fetch_max.
+                    let depth = inbound_packet_sender
+                        .max_capacity()
+                        .saturating_sub(inbound_packet_sender.capacity());
+                    super::TRANSPORT_METRICS
+                        .record_inbound_queue_depth(depth.min(u32::MAX as usize) as u32);
+                    Ok(true)
+                }
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    super::TRANSPORT_METRICS.record_inbound_queue_drop();
+                    Ok(false)
+                }
                 Err(mpsc::error::TrySendError::Closed(_)) => {
                     self.mark_closed(addr);
                     Err(())
@@ -1729,7 +1744,19 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                             }
                         }
                         // Failed NAT traversal
-                        Err((error, remote_addr)) => {
+                        Err((error, remote_addr, observed)) => {
+                            let flags = observed.flags();
+                            let kind = classify_nat_failure(&error, flags);
+                            type O = NatAttemptObservation;
+                            crate::transport::TRANSPORT_METRICS.record_nat_failure(
+                                kind,
+                                flags & O::RECEIVED != 0,
+                                flags & O::DECRYPTED != 0,
+                                flags & O::DEADLINE != 0,
+                            );
+                            #[cfg(test)]
+                            crate::transport::TRANSPORT_METRICS
+                                .note_nat_failure_remote(remote_addr, kind);
                             match &error {
                                 TransportError::ProtocolVersionMismatch { .. } => {
                                     tracing::warn!(%error);
@@ -1779,7 +1806,7 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                     }
 
                     tracing::info!(peer_addr = %remote_addr, "Starting NAT traversal");
-                    let (ongoing_connection, packets_sender) = self.traverse_nat(remote_addr, remote_public_key.clone());
+                    let (ongoing_connection, packets_sender, nat_observation) = self.traverse_nat(remote_addr, remote_public_key.clone());
 
                     if !self.connections.start_nat_traversal(remote_addr, packets_sender, open_connection) {
                         // Rejected AFTER the `has_nat_traversal` guard above: a
@@ -1798,7 +1825,7 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
 
                     self.expected_non_gateway.insert(remote_addr.ip());
                     let task = GlobalExecutor::spawn(ongoing_connection
-                        .map_err(move |err| (err, remote_addr))
+                        .map_err(move |err| (err, remote_addr, nat_observation))
                         .instrument(span!(tracing::Level::DEBUG, "traverse_nat"))
                     );
                     connection_tasks.push(task);
@@ -2083,12 +2110,15 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
     ) -> (
         TraverseNatFuture<S, T>,
         mpsc::Sender<PacketData<UnknownEncryption>>,
+        Arc<NatAttemptObservation>,
     ) {
         tracing::debug!(
             peer_addr = %remote_addr,
             direction = "outbound",
             "Starting NAT traversal"
         );
+        let observation = Arc::new(NatAttemptObservation::default());
+        let obs = observation.clone();
 
         #[allow(clippy::large_enum_variant)]
         enum HandshakePhase {
@@ -2106,8 +2136,10 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
             outbound_sym_key: &mut Option<Aes128Gcm>,
             state: &mut HandshakePhase,
             remote_protoc_version: &mut Option<(u8, u8, u16)>,
+            observation: &NatAttemptObservation,
         ) -> Result<(), ()> {
             if let Ok(decrypted_intro_packet) = packet.try_decrypt_asym(transport_secret_key) {
+                observation.set(NatAttemptObservation::DECRYPTED);
                 tracing::debug!(
                     peer_addr = %remote_addr,
                     direction = "outbound",
@@ -2132,6 +2164,7 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                         *remote_protoc_version = Some(remote_info.version);
                     }
                     Err(reason) => {
+                        observation.set(NatAttemptObservation::VERSION_INCOMPATIBLE);
                         // Track version even on incompatible peers — aids version discovery.
                         let remote_info = version_cmp::parse_version_bytes(&protoc_bytes);
                         crate::transport::report_peer_version(remote_info.version);
@@ -2282,6 +2315,7 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                 };
                 match next_inbound_result {
                     Some(Some(packet)) => {
+                        obs.set(NatAttemptObservation::RECEIVED);
                         tracing::trace!(
                             peer_addr = %remote_addr,
                             direction = "outbound",
@@ -2298,6 +2332,7 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                                 if let Ok(decrypted_packet) =
                                     packet.try_decrypt_sym(&inbound_sym_key)
                                 {
+                                    obs.set(NatAttemptObservation::DECRYPTED);
                                     // Authenticated handshake-completion ACK; meter
                                     // it just like any other authenticated inbound
                                     // packet (#3999).
@@ -2372,6 +2407,15 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                                             // ours. So the "we must update to
                                             // talk to this peer" branch is
                                             // unreachable here by construction.
+                                            // The acceptor's view of our
+                                            // external address (telemetry:
+                                            // NAT-mapping signal; the
+                                            // address itself is not exported).
+                                            crate::transport::TRANSPORT_METRICS
+                                                .record_observed_external_addr(
+                                                    remote_addr,
+                                                    my_address,
+                                                );
                                             if let Some(bytes) = acceptor_version_bytes {
                                                 let info = version_cmp::parse_version_bytes(&bytes);
                                                 crate::transport::report_peer_version(info.version);
@@ -2531,6 +2575,7 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                                     &mut outbound_sym_key,
                                     &mut state,
                                     &mut remote_protoc_version,
+                                    &obs,
                                 )
                                 .is_ok()
                                 {
@@ -2646,6 +2691,7 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                 time_source.sleep(INITIAL_INTERVAL).await;
             }
 
+            obs.set(NatAttemptObservation::DEADLINE);
             let elapsed_nanos = time_source.now_nanos().saturating_sub(start_time_nanos);
             let elapsed_ms = elapsed_nanos / 1_000_000;
             // The returned error follows the LAST send: if it failed, the
@@ -2682,7 +2728,155 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                 cause: "max connection attempts reached".into(),
             })
         };
-        (f.boxed(), inbound_from_remote)
+        (f.boxed(), inbound_from_remote, observation)
+    }
+}
+
+/// What one outbound NAT traversal attempt saw, for classifying its failure
+/// in telemetry. Set from the traversal task, read once the task has ended.
+#[derive(Default)]
+pub(super) struct NatAttemptObservation(std::sync::atomic::AtomicU8);
+
+impl NatAttemptObservation {
+    /// Any packet arrived from the remote.
+    const RECEIVED: u8 = 1;
+    /// A packet from the remote was decrypted (intro or symmetric).
+    const DECRYPTED: u8 = 1 << 1;
+    /// The remote's intro carried an incompatible protocol version.
+    const VERSION_INCOMPATIBLE: u8 = 1 << 2;
+    /// The attempt ran to its deadline.
+    const DEADLINE: u8 = 1 << 3;
+
+    fn set(&self, flag: u8) {
+        self.0.fetch_or(flag, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn flags(&self) -> u8 {
+        self.0.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+/// Map a failed traversal to exactly one [`NatFailureKind`].
+fn classify_nat_failure(
+    error: &TransportError,
+    flags: u8,
+) -> crate::transport::metrics::NatFailureKind {
+    use crate::transport::metrics::NatFailureKind;
+    type O = NatAttemptObservation;
+    // A known version mismatch is the actionable cause however the attempt
+    // ended (e.g. a later send failure), so it is checked first.
+    if flags & O::VERSION_INCOMPATIBLE != 0 {
+        return NatFailureKind::VersionIncompatible;
+    }
+    match error {
+        TransportError::ProtocolVersionMismatch { .. } => NatFailureKind::VersionIncompatible,
+        TransportError::SendFailed(..) => NatFailureKind::SendError,
+        TransportError::ChannelClosed
+        | TransportError::ConnectionClosed(_)
+        | TransportError::ConnectionEstablishmentFailure { .. }
+        | TransportError::OutboundStreamFailed(_)
+        | TransportError::IO(_)
+        | TransportError::Other(_)
+        | TransportError::PubKeyDecryptionError(_)
+        | TransportError::Serialization(_) => {
+            if flags & O::DEADLINE == 0 {
+                NatFailureKind::Other
+            } else if flags & O::RECEIVED == 0 {
+                NatFailureKind::NoResponse
+            } else if flags & O::DECRYPTED == 0 {
+                NatFailureKind::Undecryptable
+            } else {
+                NatFailureKind::Incomplete
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod nat_failure_classification_tests {
+    use super::*;
+    use crate::transport::metrics::NatFailureKind;
+
+    type O = NatAttemptObservation;
+
+    fn deadline() -> TransportError {
+        TransportError::ConnectionEstablishmentFailure {
+            cause: "max connection attempts reached".into(),
+        }
+    }
+
+    #[test]
+    fn classification_table() {
+        let addr: SocketAddr = "192.0.2.1:1".parse().unwrap();
+        let cases = [
+            (deadline(), O::DEADLINE, NatFailureKind::NoResponse),
+            (
+                deadline(),
+                O::DEADLINE | O::RECEIVED,
+                NatFailureKind::Undecryptable,
+            ),
+            (
+                deadline(),
+                O::DEADLINE | O::RECEIVED | O::DECRYPTED,
+                NatFailureKind::Incomplete,
+            ),
+            (
+                deadline(),
+                O::DEADLINE | O::RECEIVED | O::DECRYPTED | O::VERSION_INCOMPATIBLE,
+                NatFailureKind::VersionIncompatible,
+            ),
+            (
+                TransportError::ProtocolVersionMismatch {
+                    expected: "a".into(),
+                    actual: "b".into(),
+                },
+                0,
+                NatFailureKind::VersionIncompatible,
+            ),
+            (
+                TransportError::SendFailed(addr, std::io::ErrorKind::NetworkUnreachable),
+                O::DEADLINE,
+                NatFailureKind::SendError,
+            ),
+            // An error before the deadline (channel closed, bad ack) is not a
+            // reachability verdict, whatever was received.
+            (
+                TransportError::ConnectionClosed(addr),
+                O::RECEIVED,
+                NatFailureKind::Other,
+            ),
+            (deadline(), O::RECEIVED, NatFailureKind::Other),
+            // A version-incompatible remote is classified as such even when
+            // the attempt ended before its deadline.
+            (
+                TransportError::ConnectionClosed(addr),
+                O::RECEIVED | O::DECRYPTED | O::VERSION_INCOMPATIBLE,
+                NatFailureKind::VersionIncompatible,
+            ),
+            // ...and even when the attempt then ended on a failed send.
+            (
+                TransportError::SendFailed(addr, std::io::ErrorKind::NetworkUnreachable),
+                O::DEADLINE | O::RECEIVED | O::DECRYPTED | O::VERSION_INCOMPATIBLE,
+                NatFailureKind::VersionIncompatible,
+            ),
+        ];
+        for (error, flags, expected) in cases {
+            assert_eq!(
+                classify_nat_failure(&error, flags),
+                expected,
+                "{error:?} / {flags:#b}"
+            );
+        }
+    }
+
+    #[test]
+    fn observation_flags_accumulate() {
+        let o = NatAttemptObservation::default();
+        assert_eq!(o.flags(), 0);
+        o.set(O::RECEIVED);
+        o.set(O::DEADLINE);
+        o.set(O::RECEIVED);
+        assert_eq!(o.flags(), O::RECEIVED | O::DEADLINE);
     }
 }
 
@@ -3423,6 +3617,11 @@ pub mod mock_transport {
         .await
     }
 
+    /// One port allocator for every mock-peer constructor, so peers built by
+    /// different constructors never share an address (a collision could let
+    /// an address-keyed assertion pass on another test's traffic).
+    static MOCK_PEER_PORT: AtomicU16 = AtomicU16::new(25000);
+
     #[allow(clippy::too_many_arguments)]
     async fn create_mock_peer_internal(
         packet_drop_policy: PacketDropPolicy,
@@ -3442,11 +3641,9 @@ pub mod mock_transport {
         ),
         anyhow::Error,
     > {
-        static PORT: AtomicU16 = AtomicU16::new(25000);
-
         let peer_keypair = TransportKeypair::new();
         let peer_pub = peer_keypair.public.clone();
-        let port = PORT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let port = MOCK_PEER_PORT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let socket = Arc::new(
             MockSocket::new(
                 packet_drop_policy,
@@ -3531,11 +3728,9 @@ pub mod mock_transport {
         ),
         anyhow::Error,
     > {
-        static PORT: AtomicU16 = AtomicU16::new(25000);
-
         let peer_keypair = TransportKeypair::new();
         let peer_pub = peer_keypair.public.clone();
-        let port = PORT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let port = MOCK_PEER_PORT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
         // Use provided time source or create a new one
         let vt = time_source.unwrap_or_default();
@@ -4003,6 +4198,63 @@ pub mod mock_transport {
             joiner_view.is_some(),
             crate_at_or_above_floor,
             "joiner's view of the gateway version must follow the production floor exactly"
+        );
+        Ok(())
+    }
+
+    /// The joiner learns its external address from the gateway's handshake
+    /// ack, and that report reaches the NAT-mapping telemetry. Asserted on
+    /// this test's gateway address, so concurrent tests cannot satisfy it.
+    #[tokio::test]
+    async fn gateway_ack_reports_observed_external_addr() -> anyhow::Result<()> {
+        let channels = Arc::new(DashMap::new());
+        let (_peer_pub, mut peer, _peer_addr) =
+            create_mock_peer(Default::default(), channels.clone()).await?;
+        let (gw_pub, (_oc, mut gw_conn), gw_addr) =
+            create_mock_gateway(Default::default(), channels).await?;
+        let gw = GlobalExecutor::spawn(async move {
+            tokio::time::timeout(Duration::from_secs(10), gw_conn.recv())
+                .await?
+                .ok_or(anyhow::anyhow!("no connection"))
+                .map(|_| ())
+        });
+        let joiner = GlobalExecutor::spawn(async move {
+            let conn = peer.connect(gw_pub, gw_addr).await;
+            let _connection = tokio::time::timeout(Duration::from_secs(60), conn).await??;
+            Ok::<_, anyhow::Error>(())
+        });
+        let (j, g) = tokio::try_join!(joiner, gw)?;
+        j?;
+        g?;
+        assert!(
+            crate::transport::TRANSPORT_METRICS.observed_addr_reported_by(gw_addr),
+            "the gateway ack's view of our address must be recorded, with the gateway as reporter"
+        );
+        Ok(())
+    }
+
+    /// Through the real handler path: a traversal to a peer that never
+    /// answers fails at its deadline and is classified as no-response.
+    /// Asserted on this test's (unique) remote address, so concurrent tests
+    /// cannot satisfy it; the classification itself is pinned by
+    /// `classification_table`.
+    #[tokio::test]
+    async fn unanswered_nat_traversal_is_classified_no_response() -> anyhow::Result<()> {
+        let channels = Arc::new(DashMap::new());
+        let (_peer_pub, mut peer, _peer_addr) =
+            create_mock_peer(Default::default(), channels).await?;
+        let silent_addr: SocketAddr = "10.255.0.9:9".parse().unwrap();
+        let silent_pub = TransportKeypair::new().public().clone();
+        let conn = peer.connect(silent_pub, silent_addr).await;
+        let result = tokio::time::timeout(Duration::from_secs(30), conn).await?;
+        assert!(
+            result.is_err(),
+            "nobody answers, so the traversal must fail"
+        );
+        assert_eq!(
+            crate::transport::TRANSPORT_METRICS.nat_failures_for(silent_addr),
+            vec![crate::transport::metrics::NatFailureKind::NoResponse],
+            "exactly one failure, classified as no-response"
         );
         Ok(())
     }

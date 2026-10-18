@@ -611,6 +611,26 @@ pub enum ConnectionType {
 /// Reason for a peer disconnection.
 ///
 /// Understanding disconnect reasons is critical for debugging network stability.
+///
+/// What production emits (via `Ring::prune_connection`):
+/// - `Timeout`: nothing received for the transport idle timeout.
+/// - `NetworkError("transport_closed")`: any other transport `recv` failure.
+/// - `NetworkError("outbound_command_failed")`: a non-transient error while
+///   executing an outbound command (message send, stream send/pipe).
+/// - `NetworkError("undecodable_message")`: an inbound message failed to
+///   deserialize.
+/// - `Pruned`: local topology management (topology adjustment, deferred swap
+///   drop).
+/// - `Explicit(..)`: `unhealthy_peer`, `replaced_by_new_connection`,
+///   `stale_gateway_link`, `suspend_resume`, `shutdown`,
+///   `listener_channel_closed`, `unpromoted_transport`.
+///
+/// `ConnectionLimitReached` is passed for a connection refused at the cap,
+/// but that connection never joined the ring, so no `disconnect` event is
+/// emitted for it. `RemoteDropped` is only produced by
+/// `P2pBridge::drop_connection` (test callers), and `Unresponsive` is not
+/// produced at all: the transport has no close message, so a remote close
+/// surfaces as `Timeout`.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
 #[cfg_attr(test, derive(arbitrary::Arbitrary))]
 pub enum DisconnectReason {
@@ -1751,7 +1771,8 @@ pub enum TransferEvent {
         /// Number of LEDBAT slowdowns triggered during transfer.
         /// A high count indicates congestion or competing flows.
         slowdowns_triggered: Option<u32>,
-        /// Final smoothed RTT at completion (milliseconds).
+        /// Connection smoothed RTT at completion (milliseconds), from the
+        /// sent-packet tracker. `None` until the connection has an RTT sample.
         final_srtt_ms: Option<u32>,
         /// Final slow start threshold at completion (bytes).
         /// Key diagnostic for death spiral: if ssthresh collapses to min_cwnd,
@@ -1760,9 +1781,17 @@ pub enum TransferEvent {
         /// Effective minimum ssthresh floor (bytes).
         /// This floor prevents ssthresh from collapsing too low during timeouts.
         min_ssthresh_floor_bytes: Option<u32>,
-        /// Total retransmission timeouts (RTO events) during transfer.
-        /// High values indicate severe congestion or path issues.
+        /// RTO expiries on this connection while the transfer ran, from the
+        /// connection's sent-packet tracker. A per-connection delta:
+        /// concurrent transfers on one connection count the same expiries.
         total_timeouts: Option<u32>,
+        /// Connection minimum RTT at completion (milliseconds). With
+        /// `final_srtt_ms` this shows queueing delay (loaded vs base RTT).
+        /// `None` until the connection has an RTT sample.
+        min_rtt_ms: Option<u32>,
+        /// Largest bytes in flight on the connection when this stream
+        /// admitted a fragment.
+        peak_flightsize_bytes: Option<u32>,
         /// Whether we were sending or receiving.
         direction: TransferDirection,
         timestamp: u64,

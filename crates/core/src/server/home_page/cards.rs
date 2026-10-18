@@ -555,13 +555,15 @@ pub fn build_transfer_card(snap: &Option<network_status::NetworkStatusSnapshot>)
         String::new()
     };
 
-    let cwnd_str = if ts.avg_cwnd_bytes > 0 {
+    // `avg_cwnd_bytes` is `None` when no bounded window was sampled (e.g.
+    // FixedRate, which has no meaningful cwnd), so the row is hidden.
+    let cwnd_str = if let Some(avg_cwnd) = ts.avg_cwnd_bytes.filter(|v| *v > 0) {
         format!(
             r#"<div class="transfer-stat">
                 <span class="transfer-label">cwnd (avg/peak/min)</span>
                 <span class="transfer-value">{avg} / {peak} / {min}</span>
             </div>"#,
-            avg = format_bytes(ts.avg_cwnd_bytes as u64),
+            avg = format_bytes(avg_cwnd as u64),
             peak = format_bytes(ts.peak_cwnd_bytes as u64),
             min = format_bytes(ts.min_cwnd_bytes as u64),
         )

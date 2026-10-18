@@ -226,7 +226,42 @@ pub(super) struct SentPacketTracker<T: TimeSource> {
     /// Raised when a packet is registered while nothing was in flight, so the
     /// recv loop re-evaluates its resend deadline (see [`NewFlightSignal`]).
     new_flight: std::sync::Arc<NewFlightSignal>,
+
+    /// Per-packet RTO expiries over the connection's lifetime (telemetry
+    /// only; independent of the congestion controller, so it is populated
+    /// under FixedRate too).
+    rto_expiries: u64,
+
+    /// Outbound streams whose fragments have all been handed to the socket
+    /// and that are waiting for their final ACK (telemetry only, see
+    /// [`Self::watch_stream_ack`]). Bounded by [`MAX_STREAM_ACK_WATCHES`].
+    stream_ack_watches: Vec<StreamAckWatch>,
+
+    /// Stream-start-to-final-ACK durations (nanos) of watched streams that
+    /// completed, drained by the recv loop via
+    /// [`Self::take_completed_stream_acks`].
+    completed_stream_acks: Vec<u64>,
+
+    /// Streams that recently had a fragment abandoned, so a final-ACK watch
+    /// registered AFTER the abandonment (the watch starts only once the last
+    /// fragment is handed to the socket) cannot count the surviving
+    /// fragments as a complete transfer. Bounded FIFO of
+    /// [`MAX_STREAM_ACK_WATCHES`] ids; an abandonment that ages out of it
+    /// before its stream finishes sending is the residual gap.
+    abandoned_streams: VecDeque<StreamId>,
 }
+
+/// A stream waiting for the ACK of its last still-unacknowledged fragment.
+#[derive(Debug)]
+struct StreamAckWatch {
+    stream_id: StreamId,
+    start_nanos: u64,
+    remaining: u32,
+}
+
+/// Cap on concurrently watched streams per connection. A stream that cannot
+/// be watched is simply not counted in the final-ACK telemetry.
+const MAX_STREAM_ACK_WATCHES: usize = 64;
 
 /// Wakes the recv loop's resend check when the tracker goes from nothing in
 /// flight to something in flight (#5795 review).
@@ -292,7 +327,85 @@ impl<T: TimeSource> SentPacketTracker<T> {
             packet_streams: HashMap::new(),
             new_flight: std::sync::Arc::new(NewFlightSignal::default()),
             backoff_round_end_nanos: 0,
+            rto_expiries: 0,
+            stream_ack_watches: Vec::new(),
+            completed_stream_acks: Vec::new(),
+            abandoned_streams: VecDeque::new(),
         }
+    }
+
+    /// Per-packet RTO expiries on this connection so far (telemetry).
+    pub(super) fn rto_expiries(&self) -> u64 {
+        self.rto_expiries
+    }
+
+    /// Start waiting for the final ACK of `stream_id`, whose fragments have
+    /// all been handed to the socket. `start_nanos` is when the stream began
+    /// (same time source as this tracker). Observation only: it changes no
+    /// retransmission or flight-size bookkeeping.
+    ///
+    /// If every fragment is already acknowledged, returns the
+    /// stream-start-to-now duration (nanos) for the caller to publish
+    /// directly; it is NOT queued, because the queue is only drained when a
+    /// later receipt batch arrives, which a quiet connection may never get.
+    /// Otherwise returns `None` and the completion is queued for
+    /// [`Self::take_completed_stream_acks`] when the last fragment is acked
+    /// (drained under the same lock as that receipt batch, so the queue holds
+    /// at most [`MAX_STREAM_ACK_WATCHES`] entries). A stream with a fragment
+    /// that is later abandoned or dropped (`drop_stream`) is forgotten and
+    /// never reported.
+    pub(super) fn watch_stream_ack(
+        &mut self,
+        stream_id: StreamId,
+        start_nanos: u64,
+    ) -> Option<u64> {
+        if self.abandoned_streams.contains(&stream_id) {
+            // A fragment was already given up on: never fully acknowledged.
+            return None;
+        }
+        let target = PacketStream::Stream(stream_id);
+        let remaining = self
+            .packet_streams
+            .iter()
+            .filter(|(pid, stream)| **stream == target && self.pending_receipts.contains_key(pid))
+            .count() as u32;
+        if remaining == 0 {
+            return Some(self.time_source.now_nanos().saturating_sub(start_nanos));
+        }
+        if self.stream_ack_watches.len() < MAX_STREAM_ACK_WATCHES {
+            self.stream_ack_watches.push(StreamAckWatch {
+                stream_id,
+                start_nanos,
+                remaining,
+            });
+        }
+        None
+    }
+
+    /// Drain the stream-start-to-final-ACK durations (nanos) recorded since
+    /// the last call. Does not allocate when nothing completed.
+    pub(super) fn take_completed_stream_acks(&mut self) -> Vec<u64> {
+        std::mem::take(&mut self.completed_stream_acks)
+    }
+
+    fn on_stream_packet_acked(&mut self, stream_id: StreamId, now_nanos: u64) {
+        if let Some(idx) = self
+            .stream_ack_watches
+            .iter()
+            .position(|w| w.stream_id == stream_id)
+        {
+            let watch = &mut self.stream_ack_watches[idx];
+            watch.remaining = watch.remaining.saturating_sub(1);
+            if watch.remaining == 0 {
+                let watch = self.stream_ack_watches.swap_remove(idx);
+                self.completed_stream_acks
+                    .push(now_nanos.saturating_sub(watch.start_nanos));
+            }
+        }
+    }
+
+    fn forget_stream_ack_watch(&mut self, stream_id: StreamId) {
+        self.stream_ack_watches.retain(|w| w.stream_id != stream_id);
     }
 
     /// Calculate PTO (Probe Timeout) for TLP.
@@ -529,6 +642,7 @@ impl<T: TimeSource> SentPacketTracker<T> {
     /// `MAX_PACKET_RETRANSMITS`.
     pub(super) fn drop_stream(&mut self, stream_id: StreamId) -> u64 {
         let target = PacketStream::Stream(stream_id);
+        self.forget_stream_ack_watch(stream_id);
 
         // Identify the owned packet ids first (one pass over the small
         // per-connection stream map), then remove from every structure.
@@ -601,6 +715,7 @@ impl<T: TimeSource> SentPacketTracker<T> {
             // Get packet info before removing
             let is_retransmitted = self.retransmitted_packets.contains(packet_id);
 
+            let was_pending = self.pending_receipts.contains_key(packet_id);
             if let Some((_, sent_time_nanos, token, packet_size)) =
                 self.pending_receipts.get(packet_id)
             {
@@ -656,7 +771,11 @@ impl<T: TimeSource> SentPacketTracker<T> {
             self.retransmitted_packets.remove(packet_id);
             self.tlp_sent_packets.remove(packet_id);
             self.retransmit_counts.remove(packet_id);
-            self.packet_streams.remove(packet_id);
+            if let Some(PacketStream::Stream(stream_id)) = self.packet_streams.remove(packet_id) {
+                if was_pending && !self.stream_ack_watches.is_empty() {
+                    self.on_stream_packet_acked(stream_id, now_nanos);
+                }
+            }
         }
 
         let loss_rate = if self.total_packets_sent > 0 {
@@ -886,7 +1005,20 @@ impl<T: TimeSource> SentPacketTracker<T> {
                     self.retransmit_counts.remove(&entry.packet_id);
                     self.retransmitted_packets.remove(&entry.packet_id);
                     self.tlp_sent_packets.remove(&entry.packet_id);
-                    self.packet_streams.remove(&entry.packet_id);
+                    if let Some(PacketStream::Stream(stream_id)) =
+                        self.packet_streams.remove(&entry.packet_id)
+                    {
+                        // An abandoned fragment is never acknowledged, so the
+                        // stream can no longer complete its final ACK, now or
+                        // when its watch starts later.
+                        self.forget_stream_ack_watch(stream_id);
+                        if !self.abandoned_streams.contains(&stream_id) {
+                            if self.abandoned_streams.len() >= MAX_STREAM_ACK_WATCHES {
+                                self.abandoned_streams.pop_front();
+                            }
+                            self.abandoned_streams.push_back(stream_id);
+                        }
+                    }
                     tracing::debug!(
                         packet_id = entry.packet_id,
                         retransmits = MAX_PACKET_RETRANSMITS,
@@ -936,6 +1068,7 @@ impl<T: TimeSource> SentPacketTracker<T> {
 
                 // Clean up TLP tracking for this packet
                 self.tlp_sent_packets.remove(&entry.packet_id);
+                self.rto_expiries = self.rto_expiries.saturating_add(1);
 
                 return ResendAction::Resend(entry.packet_id, packet);
             }
@@ -2897,5 +3030,206 @@ pub(in crate::transport) mod tests {
             Some(&PacketStream::Control),
             "the resurrected packet is mis-tagged Control (the double-release footgun)"
         );
+    }
+
+    // ---- Telemetry-only bookkeeping (transport redesign baseline) ----
+
+    fn send_stream_packets(
+        tracker: &mut SentPacketTracker<VirtualTime>,
+        stream: StreamId,
+        ids: std::ops::Range<PacketId>,
+    ) {
+        for id in ids {
+            tracker.report_sent_stream_packet(id, vec![0u8; 10].into(), None, stream);
+        }
+    }
+
+    /// The final-ACK watch reports stream-start-to-last-ACK once, when the
+    /// last still-tracked fragment is acknowledged.
+    #[test]
+    fn stream_ack_watch_reports_time_to_final_ack() {
+        let mut tracker = mock_sent_packet_tracker();
+        let start = tracker.time_source.now_nanos();
+        let stream = StreamId::next();
+        send_stream_packets(&mut tracker, stream, 1..4);
+        // An unrelated control packet acked alongside must not count.
+        tracker.report_sent_packet(99, vec![0u8; 10].into());
+        tracker.time_source.advance(Duration::from_millis(5));
+        assert_eq!(tracker.watch_stream_ack(stream, start), None);
+
+        tracker.time_source.advance(Duration::from_millis(10));
+        tracker.report_received_receipts(&[1, 99]);
+        assert!(tracker.take_completed_stream_acks().is_empty());
+        // A duplicate receipt for an already-acked fragment must not count.
+        tracker.report_received_receipts(&[1]);
+        tracker.report_received_receipts(&[2]);
+        assert!(tracker.take_completed_stream_acks().is_empty());
+
+        tracker.time_source.advance(Duration::from_millis(20));
+        tracker.report_received_receipts(&[3]);
+        assert_eq!(
+            tracker.take_completed_stream_acks(),
+            vec![Duration::from_millis(35).as_nanos() as u64]
+        );
+        assert!(
+            tracker.stream_ack_watches.is_empty(),
+            "watch must be released"
+        );
+    }
+
+    /// A stream already fully acked when the watch starts completes at once.
+    #[test]
+    fn stream_ack_watch_completes_immediately_when_nothing_pending() {
+        let mut tracker = mock_sent_packet_tracker();
+        let start = tracker.time_source.now_nanos();
+        let stream = StreamId::next();
+        send_stream_packets(&mut tracker, stream, 1..3);
+        tracker.report_received_receipts(&[1, 2]);
+        tracker.time_source.advance(Duration::from_millis(7));
+        assert_eq!(
+            tracker.watch_stream_ack(stream, start),
+            Some(Duration::from_millis(7).as_nanos() as u64),
+            "an already-acked stream completes at once, to the caller"
+        );
+        assert!(
+            tracker.take_completed_stream_acks().is_empty(),
+            "an immediate completion must not be queued (it could be stranded)"
+        );
+    }
+
+    /// A dropped (aborted) stream never reports a final ACK.
+    #[test]
+    fn stream_ack_watch_forgets_dropped_stream() {
+        let mut tracker = mock_sent_packet_tracker();
+        let start = tracker.time_source.now_nanos();
+        let stream = StreamId::next();
+        send_stream_packets(&mut tracker, stream, 1..3);
+        assert_eq!(tracker.watch_stream_ack(stream, start), None);
+        tracker.drop_stream(stream);
+        assert!(tracker.stream_ack_watches.is_empty());
+        tracker.report_received_receipts(&[1, 2]);
+        assert!(tracker.take_completed_stream_acks().is_empty());
+    }
+
+    /// A stream with an abandoned fragment can never be fully acked, so its
+    /// watch is dropped; RTO expiries are counted per resend, not per abandon.
+    #[test]
+    fn stream_ack_watch_forgets_abandoned_stream_and_counts_rto_expiries() {
+        let mut tracker = mock_sent_packet_tracker();
+        let start = tracker.time_source.now_nanos();
+        let stream = StreamId::next();
+        send_stream_packets(&mut tracker, stream, 1..3);
+        assert_eq!(tracker.watch_stream_ack(stream, start), None);
+        tracker.report_received_receipts(&[2]);
+
+        let mut resends = 0u64;
+        let mut abandoned = false;
+        for _ in 0..1_000 {
+            match tracker.get_resend() {
+                ResendAction::Resend(id, packet) => {
+                    resends += 1;
+                    tracker.refresh_sent_packet(id, packet, None);
+                }
+                ResendAction::TlpProbe(..) => {}
+                ResendAction::Abandon { .. } => {
+                    abandoned = true;
+                    break;
+                }
+                ResendAction::WaitUntil(_) => {
+                    tracker.time_source.advance(Duration::from_secs(120));
+                }
+            }
+        }
+        assert!(abandoned, "packet 1 must eventually be abandoned");
+        assert_eq!(resends, MAX_PACKET_RETRANSMITS as u64);
+        assert_eq!(tracker.rto_expiries(), resends);
+        assert!(tracker.stream_ack_watches.is_empty());
+        assert!(tracker.take_completed_stream_acks().is_empty());
+    }
+
+    /// A fragment abandoned BEFORE the watch starts (the stream was still
+    /// sending) must not let the surviving fragments count as a complete
+    /// transfer.
+    #[test]
+    fn stream_ack_watch_ignores_stream_abandoned_before_watch() {
+        let mut tracker = mock_sent_packet_tracker();
+        let stream = StreamId::next();
+        send_stream_packets(&mut tracker, stream, 1..2);
+        let mut abandoned = false;
+        for _ in 0..1_000 {
+            match tracker.get_resend() {
+                ResendAction::Resend(id, packet) => {
+                    tracker.refresh_sent_packet(id, packet, None);
+                }
+                ResendAction::TlpProbe(..) => {}
+                ResendAction::Abandon { .. } => {
+                    abandoned = true;
+                    break;
+                }
+                ResendAction::WaitUntil(_) => {
+                    tracker.time_source.advance(Duration::from_secs(120));
+                }
+            }
+        }
+        assert!(abandoned);
+        // The rest of the stream is sent and fully acked afterwards.
+        send_stream_packets(&mut tracker, stream, 2..4);
+        tracker.report_received_receipts(&[2, 3]);
+        assert_eq!(tracker.watch_stream_ack(stream, 0), None);
+        assert!(tracker.stream_ack_watches.is_empty());
+        assert!(tracker.take_completed_stream_acks().is_empty());
+    }
+
+    /// The abandoned-streams FIFO holds each stream once and is bounded,
+    /// dropping the oldest id.
+    #[test]
+    fn abandoned_streams_fifo_is_bounded_and_deduplicated() {
+        let mut tracker = mock_sent_packet_tracker();
+        let abandon_all = |tracker: &mut SentPacketTracker<VirtualTime>| {
+            for _ in 0..100_000 {
+                match tracker.get_resend() {
+                    ResendAction::Resend(id, packet) => {
+                        tracker.refresh_sent_packet(id, packet, None);
+                    }
+                    ResendAction::TlpProbe(..) | ResendAction::Abandon { .. } => {}
+                    ResendAction::WaitUntil(_) => {
+                        if tracker.pending_receipts.is_empty() {
+                            return;
+                        }
+                        tracker.time_source.advance(Duration::from_secs(120));
+                    }
+                }
+            }
+            panic!("packets were never all abandoned");
+        };
+        // Two fragments of one stream abandoned: recorded once.
+        let first = StreamId::next();
+        send_stream_packets(&mut tracker, first, 1..3);
+        abandon_all(&mut tracker);
+        assert_eq!(tracker.abandoned_streams.len(), 1);
+        // Fill past the bound: the oldest id is evicted.
+        let mut id = 10;
+        for _ in 0..MAX_STREAM_ACK_WATCHES {
+            send_stream_packets(&mut tracker, StreamId::next(), id..id + 1);
+            id += 1;
+        }
+        abandon_all(&mut tracker);
+        assert_eq!(tracker.abandoned_streams.len(), MAX_STREAM_ACK_WATCHES);
+        assert!(
+            !tracker.abandoned_streams.contains(&first),
+            "oldest id evicted"
+        );
+    }
+
+    /// The watch list is bounded.
+    #[test]
+    fn stream_ack_watches_are_bounded() {
+        let mut tracker = mock_sent_packet_tracker();
+        for i in 0..(MAX_STREAM_ACK_WATCHES as u32 + 10) {
+            let stream = StreamId::next();
+            tracker.report_sent_stream_packet(i, vec![0u8; 4].into(), None, stream);
+            assert_eq!(tracker.watch_stream_ack(stream, 0), None);
+        }
+        assert_eq!(tracker.stream_ack_watches.len(), MAX_STREAM_ACK_WATCHES);
     }
 }

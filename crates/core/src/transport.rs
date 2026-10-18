@@ -255,10 +255,13 @@ pub struct TransferStats {
     /// Time elapsed from start to transmission completion.
     /// Note: This is when we finished SENDING, not when all ACKs arrived.
     pub elapsed: Duration,
-    /// Peak congestion window during transfer (bytes).
-    pub peak_cwnd_bytes: u32,
-    /// Final congestion window at completion (bytes).
-    pub final_cwnd_bytes: u32,
+    /// Peak congestion window during transfer (bytes). `None` when the
+    /// controller has no bounded window (FixedRate outside a loss pause
+    /// reports an effectively infinite cwnd, which is not a measurement).
+    pub peak_cwnd_bytes: Option<u32>,
+    /// Final congestion window at completion (bytes). `None` under the same
+    /// condition as `peak_cwnd_bytes`.
+    pub final_cwnd_bytes: Option<u32>,
     /// Number of LEDBAT slowdowns triggered during transfer.
     pub slowdowns_triggered: u32,
     /// Minimum observed RTT (base delay) at completion.
@@ -270,8 +273,15 @@ pub struct TransferStats {
     /// Effective minimum ssthresh floor (bytes).
     /// This floor prevents ssthresh from collapsing too low during timeouts.
     pub min_ssthresh_floor_bytes: u32,
-    /// Total retransmission timeouts (RTO events) during transfer.
+    /// Retransmission timeouts (per-packet RTO expiries) on this connection
+    /// while the transfer ran, counted by the connection's sent-packet
+    /// tracker so it is populated whatever the congestion controller.
     /// High values indicate severe congestion or path issues.
+    ///
+    /// This is a per-CONNECTION delta, not a per-stream count: an RTO of any
+    /// packet on the connection during the transfer is included, so
+    /// concurrent transfers on one connection each count the same expiries
+    /// and summing across transfers double-counts.
     pub total_timeouts: u32,
     /// Bytes still in flight (sent but not yet ACKed) when transmission completed.
     /// High values relative to bytes_transferred indicate ACK lag.
@@ -740,6 +750,13 @@ pub(crate) trait PeerConnectionApi: Send {
     /// path whose `AckConnection` carries no version). Callers must treat
     /// `None` as "unsupported" when gating version-dependent message types.
     fn remote_version(&self) -> Option<(u8, u8, u16)>;
+
+    /// Whether `recv` ended this connection because nothing arrived for the
+    /// idle timeout. Read after `recv` returns an error, to label the
+    /// disconnect in telemetry. Defaults to `false` for test doubles.
+    fn closed_by_idle_timeout(&self) -> bool {
+        false
+    }
 
     /// Sends a network message to the remote peer.
     ///

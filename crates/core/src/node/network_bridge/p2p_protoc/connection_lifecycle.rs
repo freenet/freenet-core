@@ -15,6 +15,7 @@ impl P2pConnManager {
         &mut self,
         peer_addr: SocketAddr,
         handshake_cmd_sender: &HandshakeCommandSender,
+        reason: crate::tracing::DisconnectReason,
     ) -> bool {
         let Some(entry) = self.connections.get(&peer_addr) else {
             return false;
@@ -58,7 +59,10 @@ impl P2pConnManager {
             .bridge
             .op_manager
             .ring
-            .prune_connection(PeerId::new(peer.pub_key().clone(), peer_addr))
+            .prune_connection(
+                PeerId::new(peer.pub_key().clone(), peer_addr),
+                reason.clone(),
+            )
             .await;
 
         // Handle orphaned transactions immediately (retry via alternate routes).
@@ -85,7 +89,7 @@ impl P2pConnManager {
                 Duration::from_secs(1),
                 conn.sender
                     .send(Right(ConnEvent::NodeAction(NodeEvent::DropConnection(
-                        peer_addr,
+                        peer_addr, reason,
                     )))),
             )
             .await
@@ -156,7 +160,10 @@ impl P2pConnManager {
             .bridge
             .op_manager
             .ring
-            .prune_connection(PeerId::new(peer.pub_key().clone(), peer_addr))
+            .prune_connection(
+                PeerId::new(peer.pub_key().clone(), peer_addr),
+                crate::tracing::DisconnectReason::Explicit("unpromoted_transport".into()),
+            )
             .await;
 
         // Handle orphaned transactions
@@ -184,6 +191,7 @@ impl P2pConnManager {
                 conn.sender
                     .send(Right(ConnEvent::NodeAction(NodeEvent::DropConnection(
                         peer_addr,
+                        crate::tracing::DisconnectReason::Explicit("unpromoted_transport".into()),
                     )))),
             )
             .await
@@ -987,7 +995,12 @@ impl P2pConnManager {
                     .bridge
                     .op_manager
                     .ring
-                    .prune_connection(PeerId::new(old_peer.pub_key().clone(), peer_addr))
+                    .prune_connection(
+                        PeerId::new(old_peer.pub_key().clone(), peer_addr),
+                        crate::tracing::DisconnectReason::Explicit(
+                            "replaced_by_new_connection".into(),
+                        ),
+                    )
                     .await;
                 self.bridge
                     .handle_orphaned_transactions(prune_result.orphaned_transactions, peer_addr)
@@ -1231,8 +1244,12 @@ impl P2pConnManager {
                     // Drop the connection immediately instead of letting it linger
                     // as a zombie for up to 5 minutes confusing the dashboard.
                     crate::node::network_status::record_peer_disconnected(peer_addr);
-                    self.drop_connection_by_addr(peer_addr, handshake_commands)
-                        .await;
+                    self.drop_connection_by_addr(
+                        peer_addr,
+                        handshake_commands,
+                        crate::tracing::DisconnectReason::ConnectionLimitReached,
+                    )
+                    .await;
                     return Ok(());
                 }
                 tracing::info!(%peer_addr, %loc, "handle_successful_connection: promoting connection into ring");
@@ -1480,11 +1497,13 @@ impl P2pConnManager {
                 remote_addr,
                 error,
                 connection_id,
+                reason,
             }) => {
                 tracing::debug!(
                     remote = %remote_addr,
                     ?error,
                     connection_id,
+                    %reason,
                     "peer_connection_listener reported transport closure"
                 );
                 // Ignore stale TransportClosed from replaced connections: the old
@@ -1520,7 +1539,7 @@ impl P2pConnManager {
                         .bridge
                         .op_manager
                         .ring
-                        .prune_connection(PeerId::new(peer.pub_key().clone(), remote_addr))
+                        .prune_connection(PeerId::new(peer.pub_key().clone(), remote_addr), reason)
                         .await;
 
                     // Handle orphaned transactions immediately (retry via alternate routes)

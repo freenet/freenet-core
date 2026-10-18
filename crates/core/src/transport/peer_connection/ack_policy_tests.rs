@@ -1420,3 +1420,279 @@ async fn legacy_fragment_survives_cancellation_during_a_blocked_handoff() {
     assert_eq!(delivered.0, 7);
     assert_eq!(&delivered.1[..], b"fragment-7");
 }
+
+// ---------------------------------------------------------------------------
+// Transport telemetry (redesign baseline)
+// ---------------------------------------------------------------------------
+
+/// A forced retransmission is counted: the connection's tracker counts the
+/// RTO expiry, and the recv loop records the retransmission (asserted per
+/// connection, not on the process-wide counters concurrent tests also move).
+#[tokio::test(start_paused = true)]
+async fn forced_retransmit_increments_loss_counters() {
+    let mut e = single(CAPABLE);
+    e.conn.send("needs-ack".to_string()).await.expect("send");
+    let data_id = e
+        .drain_sent()
+        .iter()
+        .find(|m| matches!(m.payload, SymmetricMessagePayload::ShortMessage { .. }))
+        .expect("data packet sent")
+        .packet_id;
+
+    let start = tokio::time::Instant::now();
+    let mut resent = false;
+    while start.elapsed() < Duration::from_secs(3) && !resent {
+        assert!(e.pump(Duration::from_millis(5)).await.is_none());
+        resent = e.drain_sent().iter().any(|m| m.packet_id == data_id);
+    }
+    assert!(resent, "the unacked packet must be retransmitted");
+
+    assert!(
+        e.conn.remote_conn.sent_tracker.lock().rto_expiries() >= 1,
+        "the connection's tracker must count the RTO expiry"
+    );
+    assert!(
+        e.conn.telemetry_test_counts.retransmissions >= 1,
+        "the retransmission must be recorded"
+    );
+}
+
+/// After a ping/pong round trip an otherwise idle connection has a
+/// non-zero per-connection SRTT (and min RTT) for the snapshot's
+/// cross-connection distribution.
+#[tokio::test(start_paused = true)]
+async fn ping_pong_gives_connection_nonzero_srtt() {
+    let mut e = single(CAPABLE);
+    assert_eq!(
+        e.conn.remote_conn.rolling_rtt_stats.gauge().read(),
+        (None, None)
+    );
+
+    let seq = 4242;
+    let sent_at = e.conn.time_source.now_nanos();
+    e.conn.pending_pings.write().insert(seq, sent_at);
+    tokio::time::advance(Duration::from_millis(40)).await;
+    e.deliver(1, SymmetricMessagePayload::Pong { sequence: seq }, vec![])
+        .await;
+    e.deliver(2, short(b"after-pong"), vec![]).await;
+    assert!(e.pump(Duration::from_millis(50)).await.is_some());
+
+    let (srtt, min_rtt) = e.conn.remote_conn.rolling_rtt_stats.gauge().read();
+    let srtt = srtt.expect("SRTT must be set after a ping/pong");
+    let min_rtt = min_rtt.expect("min RTT must be set after a ping/pong");
+    assert!(
+        (40_000..60_000).contains(&srtt),
+        "SRTT {srtt}us should reflect the 40 ms round trip"
+    );
+    assert_eq!(srtt, min_rtt, "one sample: SRTT == min RTT");
+}
+
+/// A data ACK publishes the sent-packet tracker's SRTT, which then takes
+/// precedence over the keep-alive estimate.
+#[tokio::test(start_paused = true)]
+async fn data_ack_publishes_tracker_srtt() {
+    let mut e = single(CAPABLE);
+    e.conn.send("needs-ack".to_string()).await.expect("send");
+    let data_id = e
+        .drain_sent()
+        .iter()
+        .find(|m| matches!(m.payload, SymmetricMessagePayload::ShortMessage { .. }))
+        .expect("data packet sent")
+        .packet_id;
+    tokio::time::advance(Duration::from_millis(30)).await;
+    e.deliver(1, SymmetricMessagePayload::NoOp, vec![data_id])
+        .await;
+    e.deliver(2, short(b"after-ack"), vec![]).await;
+    assert!(e.pump(Duration::from_millis(50)).await.is_some());
+
+    let tracker_srtt = e
+        .conn
+        .remote_conn
+        .sent_tracker
+        .lock()
+        .smoothed_rtt()
+        .expect("the ack must give the tracker an SRTT");
+    let (srtt, _) = e.conn.remote_conn.rolling_rtt_stats.gauge().read();
+    assert_eq!(srtt, Some(tracker_srtt.as_micros() as u64));
+    assert!(srtt.unwrap() >= 30_000);
+}
+
+/// Standalone ack-only NoOps are counted.
+#[tokio::test(start_paused = true)]
+async fn standalone_ack_noops_are_counted() {
+    let mut e = single(CAPABLE);
+    e.deliver(5, short(b"please-ack"), vec![]).await;
+    assert!(e.pump(Duration::from_millis(10)).await.is_some());
+    // Let the ack timer flush the receipt as a standalone NoOp.
+    let start = tokio::time::Instant::now();
+    let mut acked = false;
+    while start.elapsed() < Duration::from_millis(500) && !acked {
+        assert!(e.pump(Duration::from_millis(20)).await.is_none());
+        acked = receipts_for(&e.drain_sent(), 5) > 0;
+    }
+    assert!(acked, "the receipt must be sent in a standalone NoOp");
+    assert!(
+        e.conn.telemetry_test_counts.standalone_ack_flushes >= 1,
+        "the standalone ack-only NoOp must be recorded"
+    );
+}
+
+/// When nothing arrives for the idle timeout, `recv` errors and the
+/// connection reports that it closed on the idle timeout, so the node labels
+/// the disconnect "timeout".
+#[tokio::test(start_paused = true)]
+async fn idle_timeout_is_reported_for_disconnect_reason() {
+    let mut e = single(CAPABLE);
+    assert!(!e.conn.closed_by_idle_timeout);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(300);
+    let err = loop {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "idle timeout never fired"
+        );
+        match tokio::time::timeout(Duration::from_secs(1), e.conn.recv()).await {
+            Ok(Ok(_)) => panic!("no message was delivered"),
+            Ok(Err(err)) => break err,
+            Err(_) => {
+                // Keep the wire drained so keepalive sends never block.
+                e.drain_sent();
+            }
+        }
+    };
+    assert!(
+        matches!(err, TransportError::ConnectionClosed(_)),
+        "{err:?}"
+    );
+    assert!(
+        crate::transport::PeerConnectionApi::closed_by_idle_timeout(&e.conn),
+        "the idle-timeout exit must be flagged"
+    );
+}
+
+/// End to end through `send_stream`: a streamed message whose fragments are
+/// all acknowledged after the stream handed them to the socket is counted as
+/// a fully acknowledged transfer once the recv loop processes the receipts.
+#[tokio::test(start_paused = true)]
+async fn streamed_transfer_counts_final_ack() {
+    let mut e = single(CAPABLE);
+    e.conn.send("s".repeat(20_000)).await.expect("send");
+    // Let the spawned stream task hand every fragment to the socket and
+    // register its final-ACK watch.
+    let mut fragments = Vec::new();
+    for _ in 0..50 {
+        assert!(e.pump(Duration::from_millis(2)).await.is_none());
+        fragments.extend(
+            e.drain_sent()
+                .into_iter()
+                .filter(|m| matches!(m.payload, SymmetricMessagePayload::StreamFragment { .. }))
+                .map(|m| m.packet_id),
+        );
+    }
+    assert!(fragments.len() > 1, "a 20 KB message must be streamed");
+    assert_eq!(e.conn.telemetry_test_counts.transfers_acked, 0);
+    e.deliver(1, SymmetricMessagePayload::NoOp, fragments).await;
+    e.deliver(2, short(b"after-acks"), vec![]).await;
+    assert!(e.pump(Duration::from_millis(50)).await.is_some());
+    assert_eq!(
+        e.conn.telemetry_test_counts.transfers_acked, 1,
+        "acknowledging every fragment must count one fully acknowledged transfer"
+    );
+}
+
+/// The Abandon arm of the recv loop: a packet that is never acknowledged is
+/// eventually abandoned, and the abandonment is counted.
+#[tokio::test(start_paused = true)]
+async fn never_acked_packet_is_abandoned_and_counted() {
+    let mut e = single(CAPABLE);
+    e.conn.send("never-acked".to_string()).await.expect("send");
+    let data_id = e
+        .drain_sent()
+        .iter()
+        .find(|m| matches!(m.payload, SymmetricMessagePayload::ShortMessage { .. }))
+        .expect("data packet sent")
+        .packet_id;
+    let start = tokio::time::Instant::now();
+    let mut next_ping = 1_000u32;
+    while e
+        .conn
+        .remote_conn
+        .sent_tracker
+        .lock()
+        .contains_packet(data_id)
+    {
+        assert!(
+            start.elapsed() < Duration::from_secs(1_200),
+            "the packet was never abandoned"
+        );
+        // Keep the connection alive (no ACK for our packet, so the backoff
+        // still escalates) by delivering a remote Ping now and then.
+        e.deliver(
+            next_ping,
+            SymmetricMessagePayload::Ping {
+                sequence: next_ping as u64,
+            },
+            vec![],
+        )
+        .await;
+        next_ping += 1;
+        for _ in 0..10 {
+            assert!(e.pump(Duration::from_secs(1)).await.is_none());
+            e.drain_sent();
+        }
+    }
+    assert_eq!(
+        e.conn.telemetry_test_counts.abandoned, 1,
+        "the recv loop's Abandon arm must record exactly one abandonment"
+    );
+}
+
+/// An ACK batch that yields no RTT sample (Karn's rule: it acks only a
+/// retransmitted packet) must not republish the old data-ACK SRTT as the
+/// freshest value over a newer keep-alive SRTT.
+#[tokio::test(start_paused = true)]
+async fn retransmit_only_ack_does_not_republish_stale_srtt() {
+    let mut e = single(CAPABLE);
+    let first_data_id = |sent: Vec<SymmetricMessage>| {
+        sent.into_iter()
+            .find(|m| matches!(m.payload, SymmetricMessagePayload::ShortMessage { .. }))
+            .expect("data packet sent")
+            .packet_id
+    };
+    // 1. A fresh data ACK: ack SRTT ~30 ms.
+    e.conn.send("first".to_string()).await.expect("send");
+    let a = first_data_id(e.drain_sent());
+    tokio::time::advance(Duration::from_millis(30)).await;
+    e.deliver(1, SymmetricMessagePayload::NoOp, vec![a]).await;
+    e.deliver(2, short(b"x"), vec![]).await;
+    assert!(e.pump(Duration::from_millis(5)).await.is_some());
+    // 2. A newer keep-alive sample: keep-alive SRTT ~80 ms, now the freshest.
+    let seq = 77;
+    let sent_at = e.conn.time_source.now_nanos();
+    e.conn.pending_pings.write().insert(seq, sent_at);
+    tokio::time::advance(Duration::from_millis(80)).await;
+    e.deliver(3, SymmetricMessagePayload::Pong { sequence: seq }, vec![])
+        .await;
+    e.deliver(4, short(b"y"), vec![]).await;
+    assert!(e.pump(Duration::from_millis(5)).await.is_some());
+    let (keepalive_srtt, _) = e.conn.remote_conn.rolling_rtt_stats.gauge().read();
+    let keepalive_srtt = keepalive_srtt.expect("keep-alive SRTT");
+    assert!(keepalive_srtt >= 80_000, "{keepalive_srtt}");
+    // 3. A packet that is retransmitted, then acked: no RTT sample.
+    e.conn.send("second".to_string()).await.expect("send");
+    let b = first_data_id(e.drain_sent());
+    let start = tokio::time::Instant::now();
+    let mut resent = false;
+    while start.elapsed() < Duration::from_secs(3) && !resent {
+        assert!(e.pump(Duration::from_millis(5)).await.is_none());
+        resent = e.drain_sent().iter().any(|m| m.packet_id == b);
+    }
+    assert!(resent, "packet must be retransmitted");
+    e.deliver(5, SymmetricMessagePayload::NoOp, vec![b]).await;
+    e.deliver(6, short(b"z"), vec![]).await;
+    assert!(e.pump(Duration::from_millis(5)).await.is_some());
+    assert_eq!(
+        e.conn.remote_conn.rolling_rtt_stats.gauge().read().0,
+        Some(keepalive_srtt),
+        "a sample-less ACK batch must not make the stale ack SRTT the freshest"
+    );
+}

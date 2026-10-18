@@ -185,6 +185,44 @@ from CI runners (which would perturb timing-sensitive multi-node
 tests — see PR #4292 root-cause). The shadow aggregator is
 always-on; only reference-ping is gated.
 
+### Transport-redesign baseline telemetry (`transport_snapshot`)
+
+`TRANSPORT_METRICS` carries period counters for loss and ACK overhead
+(`packets_sent`, `packets_retransmitted`, `packets_abandoned`,
+`rto_expiries`, `tlp_probes`, `standalone_ack_*`), NAT failure causes
+(`nat_fail_*`, which sum to `nat_traversal_failed_error + _version` with a
+different version/non-version split, plus up to 8 per-attempt
+`nat_fail_samples` per period with the sub-reason and what the attempt saw;
+OUTBOUND traversals only), an endpoint-dependent-mapping signal
+(`observed_addr_*`: each handshake ack's view of our address, compared only
+across DIFFERENT reporters in the same address family, IPv4-mapped v6
+treated as v4; counts only, never the address; per period, so it resets; a
+NAT rebinding between two reporters' reports is indistinguishable from
+EDM), final-ACK timing (`transfers_acked`, `*_transfer_ack_time_ms`) and
+the listener-to-connection queue (`inbound_queue_depth_hwm`, `_drops`). Hot
+path writes are single relaxed atomics; `SentPacketTracker` keeps an
+`rto_expiries` count and a bounded per-stream final-ACK watch, both
+observation only.
+
+`CONN_RTT_REGISTRY` (`rolling_rtt_stats.rs`) holds one `ConnRttGauge` per live
+connection (owned by `RollingRttStatsHandle`) for the snapshot's
+cross-connection SRTT / min-RTT percentiles. A connection's snapshot SRTT may
+be an unloaded keep-alive value; for bufferbloat analysis use the per-transfer
+`final_srtt_ms` vs `min_rtt_ms` on `transfer_completed`. Same rule as the shadow
+registry: written from the recv loop, read only by telemetry, NEVER by the
+data path.
+
+Transfer events take `final_srtt_ms` and `total_timeouts` from the
+connection's sent-packet tracker, not the congestion controller (FixedRate
+reports zero RTT/loss), add `min_rtt_ms` and `peak_flightsize_bytes`
+(queueing delay), and report cwnd as null when the controller has no
+bounded window. `Ring::prune_connection` and `NodeEvent::DropConnection`
+take a `DisconnectReason`: pass the real cause (`Timeout` for the idle
+timeout, `NetworkError` for transport failures, `Pruned` only for local
+topology management; the full list is on `DisconnectReason`). Disconnect
+byte totals are this connection's: the ring `Connection` records the
+per-peer totals when it joins and the event reports the difference.
+
 ### Dashboard bandwidth sampler (#5152)
 
 `transport/bandwidth_history.rs` runs one more always-on 1 Hz task

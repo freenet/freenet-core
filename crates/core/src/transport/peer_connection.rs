@@ -224,6 +224,18 @@ impl<'a> arbitrary::Arbitrary<'a> for StreamId {
 
 type InboundStreamResult = Result<(StreamId, SerializedMessage), StreamId>;
 
+/// Test-only per-connection tallies of telemetry events (see
+/// `PeerConnection::telemetry_test_counts`).
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct TelemetryTestCounts {
+    transfers_acked: u32,
+    abandoned: u32,
+    retransmissions: u32,
+    keepalive_rtt_samples: u32,
+    standalone_ack_flushes: u32,
+}
+
 /// The `PeerConnection` struct is responsible for managing the connection with a remote peer.
 /// It provides methods for sending and receiving messages to and from the remote peer.
 ///
@@ -295,6 +307,15 @@ pub struct PeerConnection<S = super::UdpSocket, T: TimeSource = RealTime> {
     receipts_flush_due: bool,
     /// Number of timeout-check ticks handled (observability for tests).
     timeout_checks_run: u64,
+    /// Set when `recv` ends the connection because nothing was received for
+    /// the idle timeout, so the node can report the disconnect as a timeout
+    /// rather than a generic transport closure (telemetry only).
+    closed_by_idle_timeout: bool,
+    /// Test-only per-connection tallies of the telemetry events this
+    /// connection recorded, so tests need not read process-wide counters
+    /// that concurrent tests also move.
+    #[cfg(test)]
+    telemetry_test_counts: TelemetryTestCounts,
     /// Tracks pending ping probes awaiting pong responses.
     /// Maps ping sequence number -> send timestamp (nanoseconds since time_source epoch).
     /// Used for bidirectional liveness detection.
@@ -967,6 +988,9 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
             ack_remote_noops,
             recv_timers,
             timeout_checks_run: 0,
+            closed_by_idle_timeout: false,
+            #[cfg(test)]
+            telemetry_test_counts: TelemetryTestCounts::default(),
             receipts_flush_due: false,
             answered_connection_ack: false,
             stalled_fragment: None,
@@ -1344,6 +1368,15 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                                 let rtt_us = rtt_nanos / 1_000;
                                 if rtt_us > 0 {
                                     super::TRANSPORT_METRICS.record_rtt_sample(rtt_us);
+                                    #[cfg(test)]
+                                    {
+                                        self.telemetry_test_counts.keepalive_rtt_samples += 1;
+                                    }
+                                    // Per-connection RTT for the snapshot's
+                                    // cross-connection distribution.
+                                    self.remote_conn
+                                        .rolling_rtt_stats
+                                        .record_keepalive(Duration::from_nanos(rtt_nanos));
                                 }
                             }
                         }
@@ -1375,11 +1408,37 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                         false
                     };
 
-                    // Process ACKs and update BBR congestion controller
-                    let (ack_info, _loss_rate) = self.remote_conn
-                        .sent_tracker
-                        .lock()
-                        .report_received_receipts(&confirm_receipt);
+                    // Process ACKs and update BBR congestion controller.
+                    // The SRTT read and the final-ACK drain happen under the
+                    // same lock acquisition: telemetry only, no extra lock.
+                    let (ack_info, srtt, completed_stream_acks) = if confirm_receipt.is_empty() {
+                        (Vec::new(), None, Vec::new())
+                    } else {
+                        let mut tracker = self.remote_conn.sent_tracker.lock();
+                        let (ack_info, _loss_rate) =
+                            tracker.report_received_receipts(&confirm_receipt);
+                        // Publish only when this batch gave the tracker a new
+                        // sample: a retransmit-only or duplicate batch (Karn's
+                        // rule: no sample) would otherwise republish a stale
+                        // SRTT as the freshest value, outranking a newer
+                        // keep-alive SRTT exactly during loss.
+                        let fresh_srtt = ack_info
+                            .iter()
+                            .any(|(rtt, _, _)| rtt.is_some())
+                            .then(|| tracker.smoothed_rtt())
+                            .flatten();
+                        (ack_info, fresh_srtt, tracker.take_completed_stream_acks())
+                    };
+                    if let Some(srtt) = srtt {
+                        self.remote_conn.rolling_rtt_stats.publish_srtt(srtt);
+                    }
+                    for elapsed_nanos in completed_stream_acks {
+                        super::TRANSPORT_METRICS.record_transfer_acked(elapsed_nanos / 1_000_000);
+                        #[cfg(test)]
+                        {
+                            self.telemetry_test_counts.transfers_acked += 1;
+                        }
+                    }
 
                     // Feed ACK info to congestion controller for window adjustment
                     // All ACKs decrement flightsize, but only non-retransmitted packets
@@ -1627,6 +1686,7 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                             );
                         }
 
+                        self.closed_by_idle_timeout = true;
                         return Err(TransportError::ConnectionClosed(self.remote_addr()));
                     }
 
@@ -1723,6 +1783,11 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                                 self.remote_conn
                                     .congestion_controller
                                     .release_flightsize(payload_len);
+                                super::TRANSPORT_METRICS.record_packet_abandoned();
+                                #[cfg(test)]
+                                {
+                                    self.telemetry_test_counts.abandoned += 1;
+                                }
                                 tracing::debug!(
                                     peer_addr = %self.remote_conn.remote_addr,
                                     packet_id,
@@ -1742,6 +1807,7 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                                 // immediately re-sent and re-registered below — so flight size
                                 // is unchanged; on_timeout only applies the cwnd loss response.
                                 self.remote_conn.congestion_controller.on_timeout();
+                                super::TRANSPORT_METRICS.record_rto_expiry();
                                 (idx, packet)
                             }
                             ResendAction::TlpProbe(idx, packet) => {
@@ -1753,6 +1819,7 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                                     packet_id = idx,
                                     "Sending TLP probe"
                                 );
+                                super::TRANSPORT_METRICS.record_tlp_probe();
                                 (idx, packet)
                             }
                         };
@@ -1765,6 +1832,11 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                             .await
                         {
                             Ok(_) => {
+                                super::TRANSPORT_METRICS.record_retransmission_sent();
+                                #[cfg(test)]
+                                {
+                                    self.telemetry_test_counts.retransmissions += 1;
+                                }
                                 // Refresh the packet's send timestamp to the actual
                                 // post-send instant. Since #4345 get_resend KEEPS the
                                 // packet in the tracker across a resend, so this is an
@@ -2366,14 +2438,19 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
             )
             .await;
         }
-        send_untracked_receipts(
+        let result = send_untracked_receipts(
             self.remote_conn.remote_addr,
             &self.remote_conn.socket,
             &self.remote_conn.outbound_symmetric_key,
             &receipts,
             &self.remote_conn.last_packet_id,
         )
-        .await
+        .await;
+        #[cfg(test)]
+        if result.is_ok() {
+            self.telemetry_test_counts.standalone_ack_flushes += 1;
+        }
+        result
     }
 
     /// Send a Pong response to a received Ping.
@@ -2851,6 +2928,7 @@ async fn send_untracked_receipts<S: super::Socket>(
             super::shadow_demand::OutboundClass::MustFlow,
             packet.len(),
         );
+        super::TRANSPORT_METRICS.record_standalone_ack(packet.len() as u64);
     }
     Ok(())
 }
@@ -2866,6 +2944,10 @@ impl<S: super::Socket> super::PeerConnectionApi for PeerConnection<S> {
 
     fn remote_version(&self) -> Option<(u8, u8, u16)> {
         PeerConnection::remote_version(self)
+    }
+
+    fn closed_by_idle_timeout(&self) -> bool {
+        self.closed_by_idle_timeout
     }
 
     fn send_message(
@@ -5483,18 +5565,16 @@ mod tests {
         conn.pending_pings.write().insert(pong_seq, send_nanos);
         time_source.advance_time(Duration::from_millis(50));
 
-        let samples_before = crate::transport::TRANSPORT_METRICS.rtt_sample_count();
-
         inbound_tx.send(pong_packet).await.expect("send pong");
         inbound_tx.send(short_packet).await.expect("send short");
 
         let _msg = conn.recv().await.expect("recv");
 
-        let samples_after = crate::transport::TRANSPORT_METRICS.rtt_sample_count();
-        assert!(
-            samples_after > samples_before,
-            "Pong for a pending ping must record at least one RTT sample \
-             (before={samples_before}, after={samples_after}). \
+        // Per-connection: concurrent tests also record into the process-wide
+        // TRANSPORT_METRICS, so a delta there could not fail.
+        assert_eq!(
+            conn.telemetry_test_counts.keepalive_rtt_samples, 1,
+            "Pong for a pending ping must record exactly one RTT sample. \
              The keep-alive RTT path (#4000) is not wired up."
         );
 

@@ -6042,10 +6042,24 @@ impl Ring {
     /// Returns orphaned transactions that need to be retried or failed.
     /// In the new lease-based subscription model, subscriptions are not tied to specific
     /// peers, so no subscription pruning is needed when a peer disconnects.
-    pub async fn prune_connection(&self, peer: PeerId) -> PruneConnectionResult {
-        use crate::tracing::DisconnectReason;
-
-        tracing::debug!(%peer, "Removing connection");
+    ///
+    /// `reason` is reported on the `disconnect` telemetry event. It must
+    /// describe why THIS connection ended (timeout, transport error, topology
+    /// prune, ...); before it was a parameter every disconnect said "pruned".
+    pub async fn prune_connection(
+        &self,
+        peer: PeerId,
+        reason: crate::tracing::DisconnectReason,
+    ) -> PruneConnectionResult {
+        tracing::debug!(%peer, %reason, "Removing connection");
+        // This connection's wire bytes: the per-peer totals (read before
+        // `record_peer_disconnected` frees the slot) minus the baseline taken
+        // when the connection joined the ring. Best effort: `None` if the
+        // bounded per-peer table evicted this peer meanwhile.
+        let connection_bytes = self.connection_manager.get_connection_bytes(
+            peer.socket_addr(),
+            crate::transport::TRANSPORT_METRICS.connection_peer_bytes(peer.socket_addr()),
+        );
         crate::node::network_status::record_peer_disconnected(peer.socket_addr());
         let orphaned_transactions = self
             .live_tx_tracker
@@ -6081,10 +6095,10 @@ impl Ring {
         if let Some(event) = NetEventLog::disconnected_with_context(
             self,
             &peer,
-            DisconnectReason::Pruned,
+            reason,
             connection_duration_ms,
-            None, // bytes_sent not tracked yet
-            None, // bytes_received not tracked yet
+            connection_bytes.and_then(|(sent, _)| sent),
+            connection_bytes.and_then(|(_, received)| received),
         ) {
             self.event_register
                 .register_events(Either::Left(event))
@@ -6601,6 +6615,7 @@ impl Ring {
                         .notifications_sender
                         .send(Either::Right(crate::message::NodeEvent::DropConnection(
                             addr,
+                            crate::tracing::DisconnectReason::Explicit("unhealthy_peer".into()),
                         )))
                         .await
                     {
@@ -6989,6 +7004,7 @@ impl Ring {
                                 .notifications_sender
                                 .send(Either::Right(crate::message::NodeEvent::DropConnection(
                                     addr,
+                                    crate::tracing::DisconnectReason::Pruned,
                                 )))
                                 .await
                                 .map_err(|error| {
@@ -7065,6 +7081,7 @@ impl Ring {
                             .notifications_sender
                             .send(Either::Right(crate::message::NodeEvent::DropConnection(
                                 addr,
+                                crate::tracing::DisconnectReason::Pruned,
                             )))
                             .await
                             .map_err(|error| {
