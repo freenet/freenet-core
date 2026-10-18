@@ -176,8 +176,8 @@ pub(super) async fn send_stream<S: super::super::Socket, T: TimeSource>(
     let start_time = time_source.now();
     let start_nanos = time_source.now_nanos();
     let rto_expiries_at_start = sent_packet_tracker.lock().rto_expiries();
-    // Largest bytes-in-flight this stream saw when admitting a fragment
-    // (telemetry: queue build-up while it ran).
+    // Largest bytes-in-flight on the connection as this stream sent a
+    // fragment (telemetry: queue build-up while it ran).
     let mut peak_flightsize: usize = 0;
     let bytes_to_send = stream_to_send.len() as u64;
 
@@ -240,7 +240,6 @@ pub(super) async fn send_stream<S: super::super::Socket, T: TimeSource>(
 
             // Check if we have space in the congestion window
             if flightsize + packet_size <= cwnd {
-                peak_flightsize = peak_flightsize.max(flightsize + packet_size);
                 break; // Space available, proceed to send
             }
 
@@ -384,6 +383,9 @@ pub(super) async fn send_stream<S: super::super::Socket, T: TimeSource>(
         // Get token before sending (captures send-time state for BBR)
         // This also updates the congestion controller's flightsize
         let token = congestion_controller.on_send_with_token(packet_size);
+        // Sampled after cwnd admission, the token-bucket wait and `on_send`,
+        // so it is bytes actually in flight as this fragment goes out.
+        peak_flightsize = peak_flightsize.max(congestion_controller.flightsize());
 
         if let Err(e) = super::packet_sending(
             destination_addr,
@@ -696,7 +698,6 @@ pub(super) async fn pipe_stream<S: super::super::Socket, T: TimeSource>(
             let cwnd = congestion_controller.current_cwnd();
 
             if flightsize + packet_size <= cwnd {
-                peak_flightsize = peak_flightsize.max(flightsize + packet_size);
                 break;
             }
 
@@ -798,6 +799,9 @@ pub(super) async fn pipe_stream<S: super::super::Socket, T: TimeSource>(
 
         let packet_id = last_packet_id.fetch_add(1, std::sync::atomic::Ordering::Release);
         let token = congestion_controller.on_send_with_token(packet_size);
+        // Sampled after cwnd admission, the token-bucket wait and `on_send`,
+        // so it is bytes actually in flight as this fragment goes out.
+        peak_flightsize = peak_flightsize.max(congestion_controller.flightsize());
 
         if let Err(e) = super::packet_sending(
             destination_addr,

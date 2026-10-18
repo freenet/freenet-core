@@ -3180,6 +3180,47 @@ pub(in crate::transport) mod tests {
         assert!(tracker.take_completed_stream_acks().is_empty());
     }
 
+    /// The abandoned-streams FIFO holds each stream once and is bounded,
+    /// dropping the oldest id.
+    #[test]
+    fn abandoned_streams_fifo_is_bounded_and_deduplicated() {
+        let mut tracker = mock_sent_packet_tracker();
+        let abandon_all = |tracker: &mut SentPacketTracker<VirtualTime>| {
+            for _ in 0..100_000 {
+                match tracker.get_resend() {
+                    ResendAction::Resend(id, packet) => {
+                        tracker.refresh_sent_packet(id, packet, None);
+                    }
+                    ResendAction::TlpProbe(..) | ResendAction::Abandon { .. } => {}
+                    ResendAction::WaitUntil(_) => {
+                        if tracker.pending_receipts.is_empty() {
+                            return;
+                        }
+                        tracker.time_source.advance(Duration::from_secs(120));
+                    }
+                }
+            }
+            panic!("packets were never all abandoned");
+        };
+        // Two fragments of one stream abandoned: recorded once.
+        let first = StreamId::next();
+        send_stream_packets(&mut tracker, first, 1..3);
+        abandon_all(&mut tracker);
+        assert_eq!(tracker.abandoned_streams.len(), 1);
+        // Fill past the bound: the oldest id is evicted.
+        let mut id = 10;
+        for _ in 0..MAX_STREAM_ACK_WATCHES {
+            send_stream_packets(&mut tracker, StreamId::next(), id..id + 1);
+            id += 1;
+        }
+        abandon_all(&mut tracker);
+        assert_eq!(tracker.abandoned_streams.len(), MAX_STREAM_ACK_WATCHES);
+        assert!(
+            !tracker.abandoned_streams.contains(&first),
+            "oldest id evicted"
+        );
+    }
+
     /// The watch list is bounded.
     #[test]
     fn stream_ack_watches_are_bounded() {

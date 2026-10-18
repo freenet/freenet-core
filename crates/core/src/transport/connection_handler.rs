@@ -2763,6 +2763,11 @@ fn classify_nat_failure(
 ) -> crate::transport::metrics::NatFailureKind {
     use crate::transport::metrics::NatFailureKind;
     type O = NatAttemptObservation;
+    // A known version mismatch is the actionable cause however the attempt
+    // ended (e.g. a later send failure), so it is checked first.
+    if flags & O::VERSION_INCOMPATIBLE != 0 {
+        return NatFailureKind::VersionIncompatible;
+    }
     match error {
         TransportError::ProtocolVersionMismatch { .. } => NatFailureKind::VersionIncompatible,
         TransportError::SendFailed(..) => NatFailureKind::SendError,
@@ -2774,11 +2779,7 @@ fn classify_nat_failure(
         | TransportError::Other(_)
         | TransportError::PubKeyDecryptionError(_)
         | TransportError::Serialization(_) => {
-            if flags & O::VERSION_INCOMPATIBLE != 0 {
-                // Whenever the attempt ended: the remote speaks an
-                // incompatible version, which is the actionable cause.
-                NatFailureKind::VersionIncompatible
-            } else if flags & O::DEADLINE == 0 {
+            if flags & O::DEADLINE == 0 {
                 NatFailureKind::Other
             } else if flags & O::RECEIVED == 0 {
                 NatFailureKind::NoResponse
@@ -2850,6 +2851,12 @@ mod nat_failure_classification_tests {
             (
                 TransportError::ConnectionClosed(addr),
                 O::RECEIVED | O::DECRYPTED | O::VERSION_INCOMPATIBLE,
+                NatFailureKind::VersionIncompatible,
+            ),
+            // ...and even when the attempt then ended on a failed send.
+            (
+                TransportError::SendFailed(addr, std::io::ErrorKind::NetworkUnreachable),
+                O::DEADLINE | O::RECEIVED | O::DECRYPTED | O::VERSION_INCOMPATIBLE,
                 NatFailureKind::VersionIncompatible,
             ),
         ];
@@ -3610,6 +3617,11 @@ pub mod mock_transport {
         .await
     }
 
+    /// One port allocator for every mock-peer constructor, so peers built by
+    /// different constructors never share an address (a collision could let
+    /// an address-keyed assertion pass on another test's traffic).
+    static MOCK_PEER_PORT: AtomicU16 = AtomicU16::new(25000);
+
     #[allow(clippy::too_many_arguments)]
     async fn create_mock_peer_internal(
         packet_drop_policy: PacketDropPolicy,
@@ -3629,11 +3641,9 @@ pub mod mock_transport {
         ),
         anyhow::Error,
     > {
-        static PORT: AtomicU16 = AtomicU16::new(25000);
-
         let peer_keypair = TransportKeypair::new();
         let peer_pub = peer_keypair.public.clone();
-        let port = PORT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let port = MOCK_PEER_PORT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let socket = Arc::new(
             MockSocket::new(
                 packet_drop_policy,
@@ -3718,11 +3728,9 @@ pub mod mock_transport {
         ),
         anyhow::Error,
     > {
-        static PORT: AtomicU16 = AtomicU16::new(25000);
-
         let peer_keypair = TransportKeypair::new();
         let peer_pub = peer_keypair.public.clone();
-        let port = PORT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let port = MOCK_PEER_PORT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
         // Use provided time source or create a new one
         let vt = time_source.unwrap_or_default();

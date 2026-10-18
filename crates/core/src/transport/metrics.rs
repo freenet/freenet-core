@@ -220,10 +220,11 @@ struct NatDetailCounters {
     /// Test-only log of `(remote, kind)` so handler-path tests can find
     /// THEIR attempt among concurrent tests' (bounded).
     #[cfg(test)]
-    failures_by_remote: parking_lot::Mutex<Vec<(SocketAddr, NatFailureKind)>>,
+    failures_by_remote:
+        parking_lot::Mutex<std::collections::VecDeque<(SocketAddr, NatFailureKind)>>,
     /// Test-only log of observed-address reporters (bounded).
     #[cfg(test)]
-    observed_reporters: parking_lot::Mutex<Vec<SocketAddr>>,
+    observed_reporters: parking_lot::Mutex<std::collections::VecDeque<SocketAddr>>,
 }
 
 /// Why an outbound NAT traversal attempt failed. Exactly one is recorded per
@@ -470,9 +471,12 @@ impl TransportMetrics {
     #[cfg(test)]
     pub(crate) fn note_nat_failure_remote(&self, remote: SocketAddr, kind: NatFailureKind) {
         let mut log = self.nat_detail.failures_by_remote.lock();
-        if log.len() < 4096 {
-            log.push((remote, kind));
+        // Ring buffer: keep the newest entries, so a long single-process
+        // test run never stops recording.
+        if log.len() >= 4096 {
+            log.pop_front();
         }
+        log.push_back((remote, kind));
     }
 
     /// Test-only: the failure kinds recorded for `remote`.
@@ -531,9 +535,10 @@ impl TransportMetrics {
         #[cfg(test)]
         {
             let mut log = d.observed_reporters.lock();
-            if log.len() < 4096 {
-                log.push(reporter);
+            if log.len() >= 4096 {
+                log.pop_front();
             }
+            log.push_back(reporter);
         }
         let observed = SocketAddr::new(observed.ip().to_canonical(), observed.port());
         let family = usize::from(observed.is_ipv6());
@@ -797,32 +802,6 @@ impl TransportMetrics {
     /// without interfering with the periodic telemetry snapshots.
     pub fn cumulative_bytes_sent(&self) -> u64 {
         self.cumulative_bytes_sent.load(Ordering::Relaxed)
-    }
-
-    /// Number of RTT samples accumulated in the current snapshot window.
-    ///
-    /// Reset to 0 by `take_snapshot`. Exposed so tests can assert that a
-    /// code path (e.g. the ping/pong keep-alive cycle) actually recorded a
-    /// sample without consuming the snapshot.
-    #[cfg(test)]
-    pub(crate) fn rtt_sample_count(&self) -> u32 {
-        self.rtt_samples.load(Ordering::Relaxed)
-    }
-
-    /// Current period values of the loss counters, without resetting:
-    /// `(packets_sent, retransmitted, abandoned, rto_expiries, tlp_probes,
-    /// standalone_ack_packets)`. Tests only; see `rtt_sample_count`.
-    #[cfg(test)]
-    pub(crate) fn loss_counts(&self) -> [u64; 6] {
-        let l = &self.loss;
-        [
-            l.packets_sent.load(Ordering::Relaxed),
-            l.packets_retransmitted.load(Ordering::Relaxed),
-            l.packets_abandoned.load(Ordering::Relaxed),
-            l.rto_expiries.load(Ordering::Relaxed),
-            l.tlp_probes.load(Ordering::Relaxed),
-            l.standalone_ack_packets.load(Ordering::Relaxed),
-        ]
     }
 
     /// Current period count of fully acknowledged transfers (tests only).
@@ -1386,10 +1365,14 @@ pub struct TransportSnapshot {
     pub inbound_queue_depth_hwm: u32,
     /// Inbound packets the listener dropped because that channel was full.
     pub inbound_queue_drops: u64,
-    /// Per-attempt records of failed outbound NAT traversals in the period,
-    /// at most 8; `nat_fail_samples_dropped` counts the rest. Read with the
-    /// same period's `observed_addr_port_changes` to relate failures to an
-    /// endpoint-dependent NAT mapping.
+    /// Per-attempt records of the FIRST 8 failed outbound NAT traversals in
+    /// the period (not a representative sample of a busy period);
+    /// `nat_fail_samples_dropped` counts the rest. Read with the same
+    /// period's `observed_addr_port_changes` to relate failures to an
+    /// endpoint-dependent NAT mapping. Samples and counters are reset
+    /// separately, so a failure racing the snapshot can land its counter and
+    /// its sample in adjacent periods. Adding this `Vec` changes the bincode
+    /// layout of the local event log again (older records are skipped).
     pub nat_fail_samples: Vec<NatFailureSample>,
     pub nat_fail_samples_dropped: u32,
 }
@@ -1543,10 +1526,14 @@ struct SnapshotExtras {
     pub inbound_queue_depth_hwm: u32,
     /// Inbound packets the listener dropped because that channel was full.
     pub inbound_queue_drops: u64,
-    /// Per-attempt records of failed outbound NAT traversals in the period,
-    /// at most 8; `nat_fail_samples_dropped` counts the rest. Read with the
-    /// same period's `observed_addr_port_changes` to relate failures to an
-    /// endpoint-dependent NAT mapping.
+    /// Per-attempt records of the FIRST 8 failed outbound NAT traversals in
+    /// the period (not a representative sample of a busy period);
+    /// `nat_fail_samples_dropped` counts the rest. Read with the same
+    /// period's `observed_addr_port_changes` to relate failures to an
+    /// endpoint-dependent NAT mapping. Samples and counters are reset
+    /// separately, so a failure racing the snapshot can land its counter and
+    /// its sample in adjacent periods. Adding this `Vec` changes the bincode
+    /// layout of the local event log again (older records are skipped).
     pub nat_fail_samples: Vec<NatFailureSample>,
     pub nat_fail_samples_dropped: u32,
 }

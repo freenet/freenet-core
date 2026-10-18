@@ -1426,9 +1426,8 @@ async fn legacy_fragment_survives_cancellation_during_a_blocked_handoff() {
 // ---------------------------------------------------------------------------
 
 /// A forced retransmission is counted: the connection's tracker counts the
-/// RTO expiry, and the node-wide snapshot counters for RTO expiries and
-/// retransmissions move. The global counters are process-wide, so only an
-/// increase is asserted.
+/// RTO expiry, and the recv loop records the retransmission (asserted per
+/// connection, not on the process-wide counters concurrent tests also move).
 #[tokio::test(start_paused = true)]
 async fn forced_retransmit_increments_loss_counters() {
     let mut e = single(CAPABLE);
@@ -1439,7 +1438,6 @@ async fn forced_retransmit_increments_loss_counters() {
         .find(|m| matches!(m.payload, SymmetricMessagePayload::ShortMessage { .. }))
         .expect("data packet sent")
         .packet_id;
-    let [_, retx_before, _, rto_before, _, _] = crate::transport::TRANSPORT_METRICS.loss_counts();
 
     let start = tokio::time::Instant::now();
     let mut resent = false;
@@ -1453,11 +1451,9 @@ async fn forced_retransmit_increments_loss_counters() {
         e.conn.remote_conn.sent_tracker.lock().rto_expiries() >= 1,
         "the connection's tracker must count the RTO expiry"
     );
-    let [_, retx_after, _, rto_after, _, _] = crate::transport::TRANSPORT_METRICS.loss_counts();
-    assert!(rto_after > rto_before, "rto_expiries must increase");
     assert!(
-        retx_after > retx_before,
-        "packets_retransmitted must increase"
+        e.conn.telemetry_test_counts.retransmissions >= 1,
+        "the retransmission must be recorded"
     );
 }
 
@@ -1525,7 +1521,6 @@ async fn data_ack_publishes_tracker_srtt() {
 #[tokio::test(start_paused = true)]
 async fn standalone_ack_noops_are_counted() {
     let mut e = single(CAPABLE);
-    let [_, _, _, _, _, acks_before] = crate::transport::TRANSPORT_METRICS.loss_counts();
     e.deliver(5, short(b"please-ack"), vec![]).await;
     assert!(e.pump(Duration::from_millis(10)).await.is_some());
     // Let the ack timer flush the receipt as a standalone NoOp.
@@ -1536,10 +1531,9 @@ async fn standalone_ack_noops_are_counted() {
         acked = receipts_for(&e.drain_sent(), 5) > 0;
     }
     assert!(acked, "the receipt must be sent in a standalone NoOp");
-    let [_, _, _, _, _, acks_after] = crate::transport::TRANSPORT_METRICS.loss_counts();
     assert!(
-        acks_after > acks_before,
-        "standalone_ack_packets must increase"
+        e.conn.telemetry_test_counts.standalone_ack_flushes >= 1,
+        "the standalone ack-only NoOp must be recorded"
     );
 }
 
@@ -1595,12 +1589,12 @@ async fn streamed_transfer_counts_final_ack() {
         );
     }
     assert!(fragments.len() > 1, "a 20 KB message must be streamed");
-    assert_eq!(e.conn.telemetry_test_counts.0, 0);
+    assert_eq!(e.conn.telemetry_test_counts.transfers_acked, 0);
     e.deliver(1, SymmetricMessagePayload::NoOp, fragments).await;
     e.deliver(2, short(b"after-acks"), vec![]).await;
     assert!(e.pump(Duration::from_millis(50)).await.is_some());
     assert_eq!(
-        e.conn.telemetry_test_counts.0, 1,
+        e.conn.telemetry_test_counts.transfers_acked, 1,
         "acknowledging every fragment must count one fully acknowledged transfer"
     );
 }
@@ -1647,7 +1641,7 @@ async fn never_acked_packet_is_abandoned_and_counted() {
         }
     }
     assert_eq!(
-        e.conn.telemetry_test_counts.1, 1,
+        e.conn.telemetry_test_counts.abandoned, 1,
         "the recv loop's Abandon arm must record exactly one abandonment"
     );
 }
