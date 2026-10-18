@@ -495,7 +495,7 @@ SummaryRequest / ChangeInterests):
     10 §1c) — with register-after-state a genuine phantom is unrepresentable, so
     an immediate drop would only churn (an eviction teardown re-registers →
     register/drop cycling). BUT the exemption is time-bounded (see "Cleanup
-    Exemptions Must Be Time-Bounded" below): a phantom whose downstream keeps
+    Exemptions Must Be Bounded" below): a phantom whose downstream keeps
     RENEWING never hits the Fix-6 downstream-expiry prune, so once it is older
     than PHANTOM_ABSOLUTE_MAX_AGE (4 × SUBSCRIPTION_LEASE_DURATION ≈ 32 min) the
     sweep emits PhantomRepair::Drop (drop_phantom_downstream + interest decrement
@@ -515,13 +515,18 @@ SummaryRequest / ChangeInterests):
     repair-or-drop.
 ```
 
-### Cleanup Exemptions Must Be Time-Bounded
+### Cleanup Exemptions Must Be Bounded
 
 ```
 Any condition that exempts an entry from garbage collection
-(is_transient, has_pending, etc.) MUST:
-  1. Expire via TTL, OR
-  2. Be overridden by an absolute age threshold
+(is_transient, has_pending, etc.) MUST end by one of:
+  1. A TTL, or an absolute age threshold that overrides it, OR
+  2. A lifecycle event that always happens, such as the owning
+     connection closing (every way the owner can end must trigger it)
+
+A condition the entry can renew for itself does not bound it.
+Connections that never close are not yet bounded (#5922); an entry
+bounded only by connection close inherits that gap.
 
 Unbounded exemptions create permanent GC blind spots.
 

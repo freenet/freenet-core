@@ -136,12 +136,23 @@ See .claude/rules/bug-prevention-patterns.md — this has shipped twice.
 ### WHEN writing cleanup/GC logic
 
 ```
-Cleanup exemptions MUST be time-bounded.
+Cleanup exemptions MUST be bounded, by time or by a lifecycle event
+such as connection close.
 
 Any condition that exempts an entry from garbage collection
-(is_transient, has_pending, etc.) MUST either:
-  1. Expire via TTL, OR
-  2. Be overridden by an absolute age threshold
+(is_transient, has_pending, etc.) MUST end by one of:
+  1. A TTL, or an absolute age threshold that overrides it, OR
+  2. A lifecycle event that always happens, such as the owning
+     connection closing. Check that every way the owner can end
+     (clean close, error, dropped task) triggers it.
+
+A condition the entry can renew for itself (re-sending a request,
+refreshing a lease) does not bound it.
+
+A connection that stays open without ever closing, such as a peer that
+keeps TCP up but never reads, is not yet bounded at the connection
+level (#5922). An entry bounded only by connection close inherits that
+gap; say so where the entry is defined.
 
 WHY: Unbounded exemptions create permanent GC blind spots.
 This is a recurring meta-pattern where a fix introduces cleanup with
