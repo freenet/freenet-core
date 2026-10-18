@@ -126,25 +126,6 @@ jobs:
             --no-capture \
             --profile nightly
 
-      # WAN transport bench R1 (crates/core/src/transport/link_model/r1_tests.rs)
-      # on 20 seeds the PR gate does not run. PR CI runs the three fixed
-      # GATE_SEEDS through the ordinary unit suite; this explores new ones,
-      # rotating with the run number. The test is deterministic per seed, so a
-      # failure here reproduces locally with the seed it prints:
-      #   FREENET_WAN_BENCH_SEEDS=<seed> cargo test -p freenet --lib r1_spike_recovery_fixed_rate
-      # Once fixed, add that seed to GATE_SEEDS.
-      - name: WAN bench R1 (rotating seeds)
-        env:
-          RUN_NUMBER: ${{ github.run_number }}
-        run: |
-          SEEDS=$(seq -s, $((RUN_NUMBER * 20)) $((RUN_NUMBER * 20 + 19)))
-          echo "FREENET_WAN_BENCH_SEEDS=$SEEDS"
-          FREENET_WAN_BENCH_SEEDS="$SEEDS" cargo nextest run -p freenet --lib \
-            --features "simulation_tests,testing,nightly_tests" \
-            --profile nightly \
-            --no-capture \
-            -E 'test(/link_model::r1_tests::r1_spike_recovery_fixed_rate$/)'
-
       # Large scale test (500 nodes) - uses direct runner (no turmoil overhead).
       # Takes ~33-46 min on the CI runner (the "~4 min locally" figure this
       # comment used to cite was badly stale). The 60-min step cap below is the
@@ -187,6 +168,97 @@ jobs:
       #       echo "Skipping large_network test - riverctl not installed"
       #     fi
 
+
+  # WAN transport bench R1 (crates/core/src/transport/link_model/r1_tests.rs),
+  # in its own job so a failure here cannot skip the 500-node step above and
+  # its build does not eat into that job's 195-minute cap. PR CI runs the
+  # three fixed GATE_SEEDS through the ordinary unit suite; this explores 20
+  # more, rotating with the run number. Runs are deterministic per seed, so a
+  # failure reproduces locally from the seed it prints:
+  #   FREENET_WAN_BENCH_SEEDS=<seed> cargo test -p freenet --lib r1_spike_recovery_fixed_rate
+  # Once fixed, add that seed to GATE_SEEDS.
+  wan-bench-r1:
+    name: WAN Bench R1
+    runs-on: ubicloud-standard-16
+    # Measured locally: 4.7 min wall for the three controllers on 20 seeds
+    # (4 test threads, on a host at load ~35), plus a cold build of the lib
+    # tests.
+    timeout-minutes: 60
+
+    env:
+      RUST_LOG: error
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target
+      CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
+      CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -C link-arg=-fuse-ld=mold
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.inputs.ref || github.ref }}
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.93.0
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: wan-bench-r1
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Install mold linker
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mold
+
+      # Rationale for the action at the first of these in ci.yml; see #5296.
+      - name: Install nextest
+        uses: taiki-e/install-action@v2
+        timeout-minutes: 5
+        with:
+          tool: cargo-nextest
+          fallback: none
+
+      - name: Pick seeds
+        id: seeds
+        env:
+          RUN_NUMBER: ${{ github.run_number }}
+        run: echo "list=$(seq -s, $((RUN_NUMBER * 20)) $((RUN_NUMBER * 20 + 19)))" >> "$GITHUB_OUTPUT"
+
+      - name: R1, gating controller (FixedRate)
+        env:
+          FREENET_WAN_BENCH_SEEDS: ${{ steps.seeds.outputs.list }}
+        run: |
+          echo "FREENET_WAN_BENCH_SEEDS=$FREENET_WAN_BENCH_SEEDS"
+          cargo nextest run -p freenet --lib --profile nightly --no-capture \
+            -E 'test(/link_model::r1_tests::r1_(spike_recovery_fixed_rate|runs_are_reproducible_from_the_seed)$/)'
+
+      # BBR and LEDBAT++ are #[ignore]d as known failures (#5929, #5930).
+      # Run them anyway so they keep compiling and running to their verdict:
+      # this step fails if one now PASSES on every seed (remove its #[ignore]
+      # and close the issue) or fails some other way than the R1 assertion.
+      - name: R1, known failures (BBR, LEDBAT++) still fail the same way
+        if: ${{ !cancelled() }}
+        env:
+          FREENET_WAN_BENCH_SEEDS: ${{ steps.seeds.outputs.list }}
+        run: |
+          status=0
+          for t in bbr ledbat; do
+            set +e
+            cargo nextest run -p freenet --lib --profile nightly --no-capture --run-ignored only \
+              -E "test(/link_model::r1_tests::r1_spike_recovery_${t}\$/)" > "r1_${t}.log" 2>&1
+            rc=$?
+            set -e
+            tail -n 40 "r1_${t}.log"
+            if [ "$rc" -eq 0 ]; then
+              echo "::error::r1_spike_recovery_${t} passed on every seed: remove its #[ignore] and close its issue"
+              status=1
+            elif ! grep -q "R1 failed for" "r1_${t}.log"; then
+              echo "::error::r1_spike_recovery_${t} failed without reaching the R1 verdict (panic, hang or build error)"
+              status=1
+            fi
+          done
+          exit "$status"
+
   # Notify the Freenet dev room on failure.
   #
   # This used to post to Matrix via a direct curl against the matrix.org REST
@@ -202,8 +274,8 @@ jobs:
     name: Notify River on Failure
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    needs: large-scale-simulation
-    if: failure() && needs.large-scale-simulation.result == 'failure'
+    needs: [large-scale-simulation, wan-bench-r1]
+    if: failure() && (needs.large-scale-simulation.result == 'failure' || needs.wan-bench-r1.result == 'failure')
     continue-on-error: true
     steps:
       - name: Install Rust
@@ -244,8 +316,8 @@ jobs:
   notify-dev-room-failure:
     name: Notify dev room on Failure
     runs-on: ubuntu-latest
-    needs: large-scale-simulation
-    if: failure() && needs.large-scale-simulation.result == 'failure'
+    needs: [large-scale-simulation, wan-bench-r1]
+    if: failure() && (needs.large-scale-simulation.result == 'failure' || needs.wan-bench-r1.result == 'failure')
     continue-on-error: true
     steps:
       - uses: actions/checkout@v7
