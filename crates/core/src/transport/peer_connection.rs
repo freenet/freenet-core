@@ -224,6 +224,18 @@ impl<'a> arbitrary::Arbitrary<'a> for StreamId {
 
 type InboundStreamResult = Result<(StreamId, SerializedMessage), StreamId>;
 
+/// Test-only per-connection tallies of telemetry events (see
+/// `PeerConnection::telemetry_test_counts`).
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct TelemetryTestCounts {
+    transfers_acked: u32,
+    abandoned: u32,
+    retransmissions: u32,
+    keepalive_rtt_samples: u32,
+    standalone_ack_flushes: u32,
+}
+
 /// The `PeerConnection` struct is responsible for managing the connection with a remote peer.
 /// It provides methods for sending and receiving messages to and from the remote peer.
 ///
@@ -245,18 +257,6 @@ type InboundStreamResult = Result<(StreamId, SerializedMessage), StreamId>;
 ///
 /// The `packet_sending` function is a helper function used to send packets to the remote peer.
 #[must_use = "call await on the `recv` function to start listening for incoming messages"]
-/// Test-only per-connection tallies of telemetry events (see
-/// `PeerConnection::telemetry_test_counts`).
-#[cfg(test)]
-#[derive(Debug, Default)]
-struct TelemetryTestCounts {
-    transfers_acked: u32,
-    abandoned: u32,
-    retransmissions: u32,
-    keepalive_rtt_samples: u32,
-    standalone_ack_flushes: u32,
-}
-
 pub struct PeerConnection<S = super::UdpSocket, T: TimeSource = RealTime> {
     remote_conn: RemoteConnection<S, T>,
     received_tracker: ReceivedPacketTracker<InstantTimeSrc>,

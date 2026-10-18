@@ -386,6 +386,9 @@ impl P2pBridge {
 impl NetworkBridge for P2pBridge {
     async fn drop_connection(&mut self, peer_addr: SocketAddr) -> super::ConnResult<()> {
         if self.accepted_peers.remove(&peer_addr).is_some() {
+            // channel-safety: ok — pre-existing send (only the reason argument is
+            // new); `P2pBridge::drop_connection` is called only from test
+            // utilities, never from inside the network event loop.
             self.ev_listener_tx
                 .send(P2pBridgeEvent::NodeAction(NodeEvent::DropConnection(
                     peer_addr,
