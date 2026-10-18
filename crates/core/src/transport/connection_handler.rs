@@ -3213,9 +3213,26 @@ pub mod mock_transport {
     }
 
     /// Channel mapping for mock socket communication between peers.
-    /// Packet format: (source_addr, data, available_at_nanos)
-    /// available_at_nanos = VirtualTime when packet becomes available (0 = immediate)
-    pub type Channels = Arc<DashMap<SocketAddr, mpsc::UnboundedSender<(SocketAddr, Vec<u8>, u64)>>>;
+    pub type Channels = Arc<DashMap<SocketAddr, mpsc::UnboundedSender<InboundPacket>>>;
+
+    /// A datagram on its way to a `MockSocket`.
+    pub struct InboundPacket {
+        from: SocketAddr,
+        data: Vec<u8>,
+        /// VirtualTime at which the packet becomes available (0 = immediate).
+        available_at_nanos: u64,
+        /// Tie-break between equal arrival times: the link model's own
+        /// scheduling order, or the global send order without a link model.
+        order: u64,
+    }
+
+    /// Send order for sockets without a link model.
+    static SEND_ORDER: AtomicU64 = AtomicU64::new(0);
+
+    /// How many queued packets `recv_from` moves off its channel before it
+    /// checks again for one that is already due, so a burst of sends cannot
+    /// hold back delivery (code-style.md, per-iteration caps).
+    const MAX_INBOUND_DRAIN: usize = 64;
 
     /// Policy for simulating packet loss in mock transport.
     #[derive(Default, Clone)]
@@ -3244,7 +3261,7 @@ pub mod mock_transport {
     /// Mock socket implementation for testing transport without real network I/O.
     pub struct MockSocket {
         /// Inbound packets: (source_addr, data, available_at_nanos)
-        inbound: Mutex<mpsc::UnboundedReceiver<(SocketAddr, Vec<u8>, u64)>>,
+        inbound: Mutex<mpsc::UnboundedReceiver<InboundPacket>>,
         this: SocketAddr,
         packet_drop_policy: PacketDropPolicy,
         packet_delay_policy: PacketDelayPolicy,
@@ -3258,21 +3275,32 @@ pub mod mock_transport {
         /// the drop and delay policies. Requires `virtual_time`.
         link: Option<Arc<crate::transport::link_model::LinkModel>>,
         /// Packets taken off `inbound` whose arrival time has not come yet,
-        /// ordered by (arrival, receive order). Held on the socket so a
-        /// `recv_from` cancelled while waiting (the listener polls it inside
-        /// a `select!`) loses nothing, and ordered by arrival so a packet
-        /// from one peer never waits behind a later-arriving one from another.
+        /// ordered by (arrival, order). Held on the socket so a `recv_from`
+        /// cancelled while waiting (the listener polls it inside a
+        /// `select!`) loses nothing, and ordered by arrival so a packet from
+        /// one peer never waits behind a later-arriving one from another.
+        /// Packets from one source never reorder: each is held to no earlier
+        /// than the previous one from that source, which matters for
+        /// `PacketDelayPolicy::Uniform` (the link model is FIFO per path
+        /// already).
         pending_inbound: std::sync::Mutex<PendingInbound>,
     }
 
-    /// A parked inbound packet: (arrival nanos, receive order, source, bytes).
+    /// A VirtualTime sleep kept across `recv_from` calls.
+    type PendingSleep = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
+
+    /// A parked inbound packet: (arrival nanos, order, source, bytes).
     type ParkedPacket = std::cmp::Reverse<(u64, u64, SocketAddr, Vec<u8>)>;
 
     /// See `MockSocket::pending_inbound`.
     #[derive(Default)]
     struct PendingInbound {
-        next_seq: u64,
         heap: std::collections::BinaryHeap<ParkedPacket>,
+        last_arrival_from: std::collections::HashMap<SocketAddr, u64>,
+        /// The sleep for the earliest parked packet, kept across calls so a
+        /// re-entered or cancelled `recv_from` reuses it instead of
+        /// registering another VirtualTime wakeup for the same deadline.
+        wait: Option<(u64, PendingSleep)>,
     }
 
     impl MockSocket {
@@ -3344,7 +3372,10 @@ pub mod mock_transport {
             // is delivered. Only this socket's listener calls recv_from.
             let mut inbound = self.inbound.try_lock().unwrap();
             loop {
-                while let Ok(packet) = inbound.try_recv() {
+                for _ in 0..MAX_INBOUND_DRAIN {
+                    let Ok(packet) = inbound.try_recv() else {
+                        break;
+                    };
                     self.park_inbound(packet);
                 }
                 let next_at = self
@@ -3364,10 +3395,10 @@ pub mod mock_transport {
                                 Some(packet) => self.park_inbound(packet),
                                 None => closed = true,
                             },
-                            _ = vt.sleep_until(at) => {}
+                            _ = self.wait_until(vt, at) => {}
                         }
                         if closed {
-                            vt.sleep_until(at).await;
+                            self.wait_until(vt, at).await;
                         }
                     }
                     (Some(_), _) => {
@@ -3428,13 +3459,40 @@ pub mod mock_transport {
                 .unwrap_or_else(|e| e.into_inner())
         }
 
-        fn park_inbound(&self, (remote, packet, at): (SocketAddr, Vec<u8>, u64)) {
+        fn park_inbound(&self, packet: InboundPacket) {
             let mut pending = self.pending();
-            let seq = pending.next_seq;
-            pending.next_seq += 1;
-            pending
-                .heap
-                .push(std::cmp::Reverse((at, seq, remote, packet)));
+            let last = pending.last_arrival_from.entry(packet.from).or_insert(0);
+            let at = packet.available_at_nanos.max(*last);
+            *last = at;
+            pending.heap.push(std::cmp::Reverse((
+                at,
+                packet.order,
+                packet.from,
+                packet.data,
+            )));
+        }
+
+        /// Resolves once VirtualTime reaches `at`, reusing the sleep left by
+        /// an earlier call for the same deadline.
+        fn wait_until<'a>(
+            &'a self,
+            vt: &'a crate::simulation::VirtualTime,
+            at: u64,
+        ) -> impl std::future::Future<Output = ()> + 'a {
+            std::future::poll_fn(move |cx| {
+                let mut pending = self.pending();
+                if pending.wait.as_ref().map(|(deadline, _)| *deadline) != Some(at) {
+                    pending.wait = Some((at, vt.sleep_until(at)));
+                }
+                let Some((_, sleep)) = pending.wait.as_mut() else {
+                    return std::task::Poll::Pending;
+                };
+                let ready = sleep.as_mut().poll(cx);
+                if ready.is_ready() {
+                    pending.wait = None;
+                }
+                ready
+            })
         }
 
         /// Route a packet through the link model, which decides whether and
@@ -3449,9 +3507,14 @@ pub mod mock_transport {
             let Some(sender) = self.channels.get(&target).map(|v| v.value().clone()) else {
                 return Ok(0);
             };
-            for arrives_at in link.on_send(vt.now_nanos(), self.this, target, buf) {
+            for arrival in link.on_send(vt.now_nanos(), self.this, target, buf) {
                 sender
-                    .send((self.this, buf.to_vec(), arrives_at))
+                    .send(InboundPacket {
+                        from: self.this,
+                        data: buf.to_vec(),
+                        available_at_nanos: arrival.at_nanos,
+                        order: arrival.seq,
+                    })
                     .map_err(|_| std::io::ErrorKind::ConnectionAborted)?;
             }
             Ok(buf.len())
@@ -3515,7 +3578,12 @@ pub mod mock_transport {
                 return Ok(0);
             };
             sender
-                .send((self.this, buf.to_vec(), available_at_nanos))
+                .send(InboundPacket {
+                    from: self.this,
+                    data: buf.to_vec(),
+                    available_at_nanos,
+                    order: SEND_ORDER.fetch_add(1, Ordering::Relaxed),
+                })
                 .map_err(|_| std::io::ErrorKind::ConnectionAborted)?;
             Ok(buf.len())
         }
@@ -3982,6 +4050,62 @@ pub mod mock_transport {
                 .expect("due now, and must not have been lost by the cancelled call")
                 .unwrap();
             assert_eq!((&buf[..n], from), (&b"hello"[..], a_addr));
+        }
+
+        /// `PacketDelayPolicy::Uniform` draws an independent delay per packet,
+        /// but packets from one source must still arrive in the order sent.
+        #[tokio::test]
+        async fn uniform_delay_keeps_each_sources_order() {
+            let vt = VirtualTime::new();
+            let channels: Channels = Arc::new(DashMap::new());
+            let mut sockets = Vec::new();
+            for _ in 0..2 {
+                let port = MOCK_PEER_PORT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let addr: SocketAddr = (Ipv4Addr::LOCALHOST, port).into();
+                let socket = MockSocket::with_time_source(
+                    PacketDropPolicy::ReceiveAll,
+                    PacketDelayPolicy::Uniform {
+                        min: Duration::from_millis(1),
+                        max: Duration::from_millis(100),
+                    },
+                    addr,
+                    channels.clone(),
+                    Some(vt.clone()),
+                )
+                .await;
+                sockets.push((socket, addr));
+            }
+            let (a, _) = &sockets[0];
+            let (b, b_addr) = &sockets[1];
+            for i in 0..50u8 {
+                a.send_to(&[i], *b_addr).await.unwrap();
+            }
+            vt.advance(Duration::from_millis(200));
+            let mut buf = [0u8; 8];
+            let got: Vec<u8> = (0..50)
+                .map(|_| {
+                    let (n, _) = b.recv_from(&mut buf).now_or_never().expect("due").unwrap();
+                    assert_eq!(n, 1);
+                    buf[0]
+                })
+                .collect();
+            assert_eq!(got, (0..50).collect::<Vec<u8>>());
+        }
+
+        /// Re-entering `recv_from` for the same not-yet-due packet reuses one
+        /// VirtualTime wakeup instead of registering a new one each time.
+        #[tokio::test]
+        async fn waiting_recv_from_registers_one_wakeup_per_deadline() {
+            let (vt, link, channels) = fixture();
+            let (a, _) = linked_socket(&channels, &vt, &link).await;
+            let (b, b_addr) = linked_socket(&channels, &vt, &link).await;
+            a.send_to(b"x", b_addr).await.unwrap();
+            let mut buf = [0u8; 8];
+            let before = vt.pending_wakeup_count();
+            for _ in 0..10 {
+                assert!(b.recv_from(&mut buf).now_or_never().is_none());
+            }
+            assert_eq!(vt.pending_wakeup_count(), before + 1);
         }
 
         /// FIFO is per path: a packet from one peer must not wait behind a

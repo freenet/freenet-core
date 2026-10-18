@@ -94,6 +94,16 @@ pub enum LinkEvent {
     Outage { start: Duration, duration: Duration },
 }
 
+/// When a copy of a datagram reaches its receiver.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Arrival {
+    pub at_nanos: u64,
+    /// Model-wide order in which the link scheduled this delivery. Receivers
+    /// break ties between equal arrival times with it, so two concurrent
+    /// sends cannot reorder after the model has decided their order.
+    pub seq: u64,
+}
+
 /// One delivered datagram, as seen by the link.
 #[derive(Clone, Copy, Debug)]
 pub struct Delivery {
@@ -105,6 +115,15 @@ pub struct Delivery {
     /// The transport retransmits the stored ciphertext, so a retransmission
     /// of a packet that did arrive is byte-identical to it.
     pub first_copy: bool,
+    /// Hash of the datagram's bytes; a retransmission has the same one.
+    pub content_hash: u64,
+}
+
+/// One datagram handed to the link, whatever then became of it.
+#[derive(Clone, Copy, Debug)]
+pub struct Offer {
+    pub at_nanos: u64,
+    pub content_hash: u64,
 }
 
 /// Ground-truth counters for one host's uplink.
@@ -126,6 +145,7 @@ struct PathState {
     bad: bool,
     seen: HashSet<u64>,
     deliveries: Vec<Delivery>,
+    offers: Vec<Offer>,
 }
 
 #[derive(Default)]
@@ -141,6 +161,7 @@ struct State {
     // draws the transport happened to make. Owning the stream keeps the link
     // a function of its seed and the send sequence alone.
     rng: SmallRng,
+    next_seq: u64,
     overrides: HashMap<SocketAddr, HostLink>,
     events: Vec<LinkEvent>,
     hosts: HashMap<SocketAddr, HostState>,
@@ -161,6 +182,7 @@ impl LinkModel {
             default_link,
             state: Mutex::new(State {
                 rng: SmallRng::seed_from_u64(seed),
+                next_seq: 0,
                 overrides: HashMap::new(),
                 events: Vec::new(),
                 hosts: HashMap::new(),
@@ -193,19 +215,20 @@ impl LinkModel {
         self.host_link(a).one_way_delay + self.host_link(b).one_way_delay
     }
 
-    /// Decide the fate of one datagram sent at `now_nanos`. Returns the virtual
-    /// times at which copies of it arrive at `to`: empty if it is dropped, one
-    /// entry otherwise.
+    /// Decide the fate of one datagram sent at `now_nanos`. Returns when
+    /// copies of it arrive at `to`: empty if it is dropped, one entry
+    /// otherwise.
     pub fn on_send(
         &self,
         now_nanos: u64,
         from: SocketAddr,
         to: SocketAddr,
         packet: &[u8],
-    ) -> Vec<u64> {
+    ) -> Vec<Arrival> {
         let mut guard = self.lock();
         let State {
             rng,
+            next_seq,
             overrides,
             events,
             hosts,
@@ -214,6 +237,14 @@ impl LinkModel {
         let link = overrides.get(&from).unwrap_or(&self.default_link);
         let host = hosts.entry(from).or_default();
         host.stats.offered += 1;
+        let mut hasher = DefaultHasher::new();
+        packet.hash(&mut hasher);
+        let content_hash = hasher.finish();
+        let path = paths.entry((from, to)).or_default();
+        path.offers.push(Offer {
+            at_nanos: now_nanos,
+            content_hash,
+        });
 
         if events.iter().any(|e| match e {
             LinkEvent::Outage { start, duration } => in_window(now_nanos, *start, *duration),
@@ -245,7 +276,6 @@ impl LinkModel {
             host.stats.max_queueing_delay = waited;
         }
 
-        let path = paths.entry((from, to)).or_default();
         let lost = match link.loss {
             Loss::None => false,
             Loss::Bernoulli(p) => rng.random::<f64>() < p,
@@ -288,17 +318,21 @@ impl LinkModel {
         let arrives =
             (departs + (link.one_way_delay + spike).as_nanos() as u64).max(path.last_arrival_nanos);
         path.last_arrival_nanos = arrives;
-        let mut hasher = DefaultHasher::new();
-        packet.hash(&mut hasher);
-        let first_copy = path.seen.insert(hasher.finish());
+        let first_copy = path.seen.insert(content_hash);
         path.deliveries.push(Delivery {
             departed_at_nanos: departs,
             arrives_at_nanos: arrives,
             bytes: len,
             first_copy,
+            content_hash,
         });
         host.stats.delivered += 1;
-        vec![arrives]
+        let seq = *next_seq;
+        *next_seq += 1;
+        vec![Arrival {
+            at_nanos: arrives,
+            seq,
+        }]
     }
 
     pub fn host_stats(&self, host: SocketAddr) -> HostStats {
@@ -306,6 +340,16 @@ impl LinkModel {
             .hosts
             .get(&host)
             .map(|h| h.stats.clone())
+            .unwrap_or_default()
+    }
+
+    /// Every datagram offered on `from -> to`, in send order, including the
+    /// ones the link then dropped.
+    pub fn offers(&self, from: SocketAddr, to: SocketAddr) -> Vec<Offer> {
+        self.lock()
+            .paths
+            .get(&(from, to))
+            .map(|p| p.offers.clone())
             .unwrap_or_default()
     }
 
@@ -361,7 +405,7 @@ mod tests {
     fn arrival(m: &LinkModel, now: u64, from: u16, to: u16, packet: &[u8]) -> Option<u64> {
         m.on_send(now, addr(from), addr(to), packet)
             .first()
-            .copied()
+            .map(|a| a.at_nanos)
     }
 
     const MS: u64 = 1_000_000;
@@ -541,5 +585,7 @@ mod tests {
             [true, false]
         );
         assert_eq!(unique_bytes_between(&d, 0, u64::MAX), 1);
+        // Offers include the copy the outage dropped.
+        assert_eq!(m.offers(addr(1), addr(2)).len(), 3);
     }
 }
