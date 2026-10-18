@@ -127,7 +127,7 @@ jobs:
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "Micro-benchmarks only (allocation, level0 crypto/serialization, level1 channels)." >> $GITHUB_STEP_SUMMARY
           echo "The VirtualTime network groups (high latency, packet loss, large transfers, streaming," >> $GITHUB_STEP_SUMMARY
-          echo "slow start) are disabled in transport_extended.rs; see the TODO on its criterion_main!." >> $GITHUB_STEP_SUMMARY
+          echo "slow start) are disabled in transport_extended.rs until #5932 is fixed." >> $GITHUB_STEP_SUMMARY
           echo "WAN-condition regression gating lives in the unit suite (transport::link_model::r1_tests)." >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
 

@@ -167,6 +167,20 @@ cargo bench --bench transport_perf -- slow_start
 # See benchmarking/methodology.md for details
 ```
 
+### WAN-condition regression tests
+
+`crates/core/src/transport/link_model.rs` is a size-aware link model
+(bottleneck queue, per-direction delay, loss, scheduled spikes and outages)
+that `MockSocket` can route through on virtual time. Regression scenarios
+built on it live beside it; `link_model/r1_tests.rs` (R1, recovery from an
+RTT spike) gates every PR through the unit suite:
+
+```bash
+cargo test -p freenet --lib link_model
+# One seed, all three controllers (BBR and LEDBAT++ are known failures):
+FREENET_WAN_BENCH_SEEDS=0x5eed0001 cargo test -p freenet --lib r1_ -- --include-ignored --nocapture
+```
+
 ### Source Code Locations
 - **Transport module**: `crates/core/src/transport/`
 - **Congestion control**: `crates/core/src/transport/congestion_control.rs`
