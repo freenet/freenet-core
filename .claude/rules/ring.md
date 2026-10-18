@@ -521,12 +521,15 @@ SummaryRequest / ChangeInterests):
 Any condition that exempts an entry from garbage collection
 (is_transient, has_pending, etc.) MUST end by one of:
   1. A TTL, or an absolute age threshold that overrides it, OR
-  2. A lifecycle event that always happens, such as the owning
-     connection closing (every way the owner can end must trigger it)
+  2. A lifecycle event that always happens and that the entry cannot
+     trigger or postpone itself, such as the owning connection closing.
+     Check that every way the owner can end (clean close, error,
+     dropped task) triggers it.
 
 A condition the entry can renew for itself does not bound it.
-Connections that never close are not yet bounded (#5922); an entry
-bounded only by connection close inherits that gap.
+A connection held open indefinitely is not yet bounded (#5922); an
+entry bounded only by connection close inherits that gap, and should
+say so where it is defined.
 
 Unbounded exemptions create permanent GC blind spots.
 
@@ -542,7 +545,7 @@ CORRECT:
 
 **Audit targets:**
 - All `prune_connection` / `drop_connection` call sites — verify all related maps are cleaned up
-- All `retain()` / sweep loops — verify exemption conditions have TTL or absolute age bounds
+- All `retain()` / sweep loops: verify exemption conditions are bounded (TTL, absolute age, or a lifecycle event)
 - `ConnectionManager` fields — verify each map has a documented cleanup owner
 
 ### Cross-DashMap Lock Discipline (`significant_drop_tightening` exception)

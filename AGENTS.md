@@ -142,16 +142,16 @@ such as connection close.
 Any condition that exempts an entry from garbage collection
 (is_transient, has_pending, etc.) MUST end by one of:
   1. A TTL, or an absolute age threshold that overrides it, OR
-  2. A lifecycle event that always happens, such as the owning
-     connection closing. Check that every way the owner can end
-     (clean close, error, dropped task) triggers it.
+  2. A lifecycle event that always happens and that the entry cannot
+     trigger or postpone itself, such as the owning connection closing.
+     Check that every way the owner can end (clean close, error,
+     dropped task) triggers it.
 
 A condition the entry can renew for itself (re-sending a request,
 refreshing a lease) does not bound it.
 
-A connection that stays open without ever closing, such as a peer that
-keeps TCP up but never reads, is not yet bounded at the connection
-level (#5922). An entry bounded only by connection close inherits that
+A connection that is held open indefinitely is not yet bounded at the
+connection level (#5922). An entry bounded only by connection close inherits that
 gap; say so where the entry is defined.
 
 WHY: Unbounded exemptions create permanent GC blind spots.

@@ -2156,7 +2156,7 @@ impl HostingManager {
     /// exists to stop, reintroduced through the back door; the exemption
     /// would also be effectively unbounded, blocking reclamation
     /// indefinitely, which violates the cleanup-exemption rule in `AGENTS.md`
-    /// (exemptions must be time-bounded). Local-client subscriptions and
+    /// (exemptions must be bounded). Local-client subscriptions and
     /// downstream subscribers represent real external demand: WebSocket client
     /// subscriptions expire on disconnect; downstream subscribers expire via
     /// `expire_stale_downstream_subscribers` after `SUBSCRIPTION_LEASE_DURATION`
