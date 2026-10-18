@@ -856,6 +856,8 @@ async fn drive_client_connect(
                     .ring
                     .connection_manager
                     .update_location(Some(location));
+                // NAT-mapping signal for transport telemetry (counts only).
+                crate::transport::TRANSPORT_METRICS.record_observed_external_addr(address);
                 tracing::info!(
                     tx = %tx,
                     observed_address = %address,

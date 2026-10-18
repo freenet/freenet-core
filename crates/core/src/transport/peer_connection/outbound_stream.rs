@@ -93,6 +93,41 @@ pub(crate) type SerializedStream = Bytes;
 /// The extra byte vs. the original 40 comes from the Option discriminant of `metadata_bytes`.
 const MAX_DATA_SIZE: usize = packet_data::MAX_DATA_SIZE - 41;
 
+/// A congestion window as reported in transfer telemetry: `None` when the
+/// controller has no bounded window. FixedRate outside a loss pause reports
+/// `usize::MAX / 2`, which used to surface as `u32::MAX` after truncation.
+fn reported_cwnd(cwnd: usize) -> Option<u32> {
+    if cwnd >= usize::MAX / 2 {
+        return None;
+    }
+    u32::try_from(cwnd).ok()
+}
+
+/// Per-connection RTT and loss facts for a stream that has just handed its
+/// last fragment to the socket, read from the connection's sent-packet
+/// tracker (not the congestion controller, whose RTT/loss stats are zero
+/// under FixedRate). Also registers the stream for final-ACK timing.
+///
+/// Returns `(final_srtt_ms, rto_expiries_during_transfer)`. SRTT is `None`
+/// until the connection has a data-ACK RTT sample.
+fn finish_stream_telemetry<T: TimeSource>(
+    sent_packet_tracker: &parking_lot::Mutex<SentPacketTracker<T>>,
+    stream_id: StreamId,
+    start_nanos: u64,
+    rto_expiries_at_start: u64,
+) -> (Option<u32>, u32) {
+    let mut tracker = sent_packet_tracker.lock();
+    tracker.watch_stream_ack(stream_id, start_nanos);
+    let srtt_ms = tracker
+        .smoothed_rtt()
+        .map(|d| d.as_millis().min(u32::MAX as u128) as u32);
+    let timeouts = tracker
+        .rto_expiries()
+        .saturating_sub(rto_expiries_at_start)
+        .min(u32::MAX as u64) as u32;
+    (srtt_ms, timeouts)
+}
+
 // TODO: unit test
 /// Handles sending a stream that is *not piped*. In the future this will be replaced by
 /// piped streams which start forwarding before the stream has been received.
@@ -116,6 +151,8 @@ pub(super) async fn send_stream<S: super::super::Socket, T: TimeSource>(
     progress: Option<crate::operations::stream_progress::StreamProgressHandle>,
 ) -> Result<TransferStats, TransportError> {
     let start_time = time_source.now();
+    let start_nanos = time_source.now_nanos();
+    let rto_expiries_at_start = sent_packet_tracker.lock().rto_expiries();
     let bytes_to_send = stream_to_send.len() as u64;
 
     // Emit transfer started telemetry event
@@ -408,6 +445,14 @@ pub(super) async fn send_stream<S: super::super::Socket, T: TimeSource>(
     let ledbat_stats = congestion_controller.ledbat_stats();
     let bbr_stats = congestion_controller.bbr_stats();
     let elapsed = time_source.now().saturating_sub(start_time);
+    let (final_srtt_ms, total_timeouts) = finish_stream_telemetry(
+        &sent_packet_tracker,
+        stream_id,
+        start_nanos,
+        rto_expiries_at_start,
+    );
+    let peak_cwnd = reported_cwnd(generic_stats.peak_cwnd);
+    let final_cwnd = reported_cwnd(generic_stats.cwnd);
 
     tracing::debug!(
         stream_id = %stream_id.0,
@@ -432,13 +477,13 @@ pub(super) async fn send_stream<S: super::super::Socket, T: TimeSource>(
         } else {
             bytes_to_send * 1000 / elapsed.as_millis().max(1) as u64
         },
-        Some(generic_stats.peak_cwnd as u32),
-        Some(generic_stats.cwnd as u32),
+        peak_cwnd,
+        final_cwnd,
         ledbat_stats.as_ref().map(|s| s.periodic_slowdowns as u32),
-        Some(generic_stats.base_delay.as_millis() as u32),
+        final_srtt_ms,
         Some(generic_stats.ssthresh as u32),
         ledbat_stats.as_ref().map(|s| s.min_ssthresh_floor as u32),
-        Some(generic_stats.total_timeouts as u32),
+        Some(total_timeouts),
         TransferDirection::Send,
     );
 
@@ -455,8 +500,8 @@ pub(super) async fn send_stream<S: super::super::Socket, T: TimeSource>(
         remote_addr: destination_addr,
         bytes_transferred: bytes_to_send,
         elapsed,
-        peak_cwnd_bytes: generic_stats.peak_cwnd as u32,
-        final_cwnd_bytes: generic_stats.cwnd as u32,
+        peak_cwnd_bytes: peak_cwnd,
+        final_cwnd_bytes: final_cwnd,
         slowdowns_triggered: ledbat_stats
             .as_ref()
             .map(|s| s.periodic_slowdowns as u32)
@@ -467,7 +512,7 @@ pub(super) async fn send_stream<S: super::super::Socket, T: TimeSource>(
             .as_ref()
             .map(|s| s.min_ssthresh_floor as u32)
             .unwrap_or(0),
-        total_timeouts: generic_stats.total_timeouts as u32,
+        total_timeouts,
         final_flightsize: generic_stats.flightsize as u32,
         configured_rate: congestion_controller.configured_rate() as u32,
     })
@@ -498,6 +543,8 @@ pub(super) async fn pipe_stream<S: super::super::Socket, T: TimeSource>(
     progress: Option<crate::operations::stream_progress::StreamProgressHandle>,
 ) -> Result<TransferStats, TransportError> {
     let start_time = time_source.now();
+    let start_nanos = time_source.now_nanos();
+    let rto_expiries_at_start = sent_packet_tracker.lock().rto_expiries();
     let total_bytes = inbound_handle.total_bytes();
 
     emit_transfer_started(
@@ -790,6 +837,14 @@ pub(super) async fn pipe_stream<S: super::super::Socket, T: TimeSource>(
     let generic_stats = congestion_controller.stats();
     let ledbat_stats = congestion_controller.ledbat_stats();
     let elapsed = time_source.now().saturating_sub(start_time);
+    let (final_srtt_ms, total_timeouts) = finish_stream_telemetry(
+        &sent_packet_tracker,
+        outbound_stream_id,
+        start_nanos,
+        rto_expiries_at_start,
+    );
+    let peak_cwnd = reported_cwnd(generic_stats.peak_cwnd);
+    let final_cwnd = reported_cwnd(generic_stats.cwnd);
 
     tracing::debug!(
         stream_id = %outbound_stream_id.0,
@@ -809,13 +864,13 @@ pub(super) async fn pipe_stream<S: super::super::Socket, T: TimeSource>(
         } else {
             sent_so_far * 1000 / elapsed.as_millis().max(1) as u64
         },
-        Some(generic_stats.peak_cwnd as u32),
-        Some(generic_stats.cwnd as u32),
+        peak_cwnd,
+        final_cwnd,
         ledbat_stats.as_ref().map(|s| s.periodic_slowdowns as u32),
-        Some(generic_stats.base_delay.as_millis() as u32),
+        final_srtt_ms,
         Some(generic_stats.ssthresh as u32),
         ledbat_stats.as_ref().map(|s| s.min_ssthresh_floor as u32),
-        Some(generic_stats.total_timeouts as u32),
+        Some(total_timeouts),
         TransferDirection::Send,
     );
 
@@ -824,8 +879,8 @@ pub(super) async fn pipe_stream<S: super::super::Socket, T: TimeSource>(
         remote_addr: destination_addr,
         bytes_transferred: sent_so_far,
         elapsed,
-        peak_cwnd_bytes: generic_stats.peak_cwnd as u32,
-        final_cwnd_bytes: generic_stats.cwnd as u32,
+        peak_cwnd_bytes: peak_cwnd,
+        final_cwnd_bytes: final_cwnd,
         slowdowns_triggered: ledbat_stats
             .as_ref()
             .map(|s| s.periodic_slowdowns as u32)
@@ -836,10 +891,76 @@ pub(super) async fn pipe_stream<S: super::super::Socket, T: TimeSource>(
             .as_ref()
             .map(|s| s.min_ssthresh_floor as u32)
             .unwrap_or(0),
-        total_timeouts: generic_stats.total_timeouts as u32,
+        total_timeouts,
         final_flightsize: generic_stats.flightsize as u32,
         configured_rate: congestion_controller.configured_rate() as u32,
     })
+}
+
+#[cfg(test)]
+mod telemetry_tests {
+    use super::*;
+    use crate::simulation::VirtualTime;
+
+    /// FixedRate's unbounded window (`usize::MAX / 2`) is not a measurement
+    /// and must not surface as `u32::MAX`.
+    #[test]
+    fn reported_cwnd_hides_unbounded_window() {
+        assert_eq!(reported_cwnd(usize::MAX / 2), None);
+        assert_eq!(reported_cwnd(usize::MAX), None);
+        assert_eq!(reported_cwnd(64 * 1024), Some(64 * 1024));
+        assert_eq!(reported_cwnd(0), Some(0));
+    }
+
+    /// Final SRTT comes from the connection's sent-packet tracker (so it is
+    /// populated under FixedRate, whose controller reports zero RTT) and the
+    /// timeout count is the RTO expiries during this transfer only.
+    #[test]
+    fn finish_stream_telemetry_uses_tracker_srtt_and_rto_delta() {
+        let time = VirtualTime::new();
+        let tracker =
+            parking_lot::Mutex::new(SentPacketTracker::new_with_time_source(time.clone()));
+        assert_eq!(
+            finish_stream_telemetry(&tracker, StreamId::next(), 0, 0),
+            (None, 0),
+            "no RTT sample yet: SRTT must be null, not 0"
+        );
+
+        {
+            let mut t = tracker.lock();
+            t.report_sent_packet(1, vec![0u8; 8].into());
+        }
+        time.advance(Duration::from_millis(80));
+        tracker.lock().report_received_receipts(&[1]);
+
+        // Two RTO expiries before the transfer starts, one during it.
+        let force_rto = |id: u32| {
+            tracker.lock().report_sent_packet(id, vec![0u8; 8].into());
+            time.advance(Duration::from_secs(5));
+            loop {
+                let action = tracker.lock().get_resend();
+                match action {
+                    ResendActionForTest::Resend(..) => break,
+                    ResendActionForTest::TlpProbe(..) => continue,
+                    other @ (ResendActionForTest::WaitUntil(_)
+                    | ResendActionForTest::Abandon { .. }) => {
+                        panic!("expected a resend, got {other:?}")
+                    }
+                }
+            }
+            tracker.lock().report_received_receipts(&[id]);
+        };
+        force_rto(2);
+        force_rto(3);
+        let at_start = tracker.lock().rto_expiries();
+        force_rto(4);
+
+        let (srtt_ms, timeouts) = finish_stream_telemetry(&tracker, StreamId::next(), 0, at_start);
+        assert_eq!(srtt_ms, Some(80));
+        assert_eq!(timeouts, 1);
+    }
+
+    use crate::transport::sent_packet_tracker::ResendAction as ResendActionForTest;
 }
 
 #[cfg(test)]

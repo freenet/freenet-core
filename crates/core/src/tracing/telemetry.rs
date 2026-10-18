@@ -2599,22 +2599,14 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
             }
         }
         EventKind::TransportSnapshot(snapshot) => {
-            serde_json::json!({
-                "type": "transport_snapshot",
-                "transfers_completed": snapshot.transfers_completed,
-                "transfers_failed": snapshot.transfers_failed,
-                "bytes_sent": snapshot.bytes_sent,
-                "bytes_received": snapshot.bytes_received,
-                "avg_transfer_time_ms": snapshot.avg_transfer_time_ms,
-                "peak_throughput_bps": snapshot.peak_throughput_bps,
-                "avg_cwnd_bytes": snapshot.avg_cwnd_bytes,
-                "peak_cwnd_bytes": snapshot.peak_cwnd_bytes,
-                "min_cwnd_bytes": snapshot.min_cwnd_bytes,
-                "slowdowns_triggered": snapshot.slowdowns_triggered,
-                "avg_rtt_us": snapshot.avg_rtt_us,
-                "min_rtt_us": snapshot.min_rtt_us,
-                "max_rtt_us": snapshot.max_rtt_us,
-            })
+            // Serialize the whole struct so this path cannot drift from the
+            // worker's `snapshot_to_telemetry` (it had silently omitted the
+            // NAT fields), then tag it like every other event body.
+            let mut value = serde_json::to_value(snapshot).unwrap_or_default();
+            if let Some(map) = value.as_object_mut() {
+                map.insert("type".into(), serde_json::json!("transport_snapshot"));
+            }
+            value
         }
         EventKind::InterestSync(interest_sync_event) => {
             use crate::tracing::InterestSyncEvent;

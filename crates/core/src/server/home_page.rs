@@ -860,7 +860,7 @@ mod tests {
         snap.transport_snapshot.avg_rtt_us = 12500; // 12.5ms
         snap.transport_snapshot.min_rtt_us = 8000;
         snap.transport_snapshot.max_rtt_us = 45000;
-        snap.transport_snapshot.avg_cwnd_bytes = 32768;
+        snap.transport_snapshot.avg_cwnd_bytes = Some(32768);
         snap.transport_snapshot.peak_cwnd_bytes = 98304;
         snap.transport_snapshot.min_cwnd_bytes = 11264;
         snap.transport_snapshot.slowdowns_triggered = 23;

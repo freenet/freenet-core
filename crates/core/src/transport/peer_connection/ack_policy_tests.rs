@@ -1420,3 +1420,157 @@ async fn legacy_fragment_survives_cancellation_during_a_blocked_handoff() {
     assert_eq!(delivered.0, 7);
     assert_eq!(&delivered.1[..], b"fragment-7");
 }
+
+// ---------------------------------------------------------------------------
+// Transport telemetry (redesign baseline)
+// ---------------------------------------------------------------------------
+
+/// A forced retransmission is counted: the connection's tracker counts the
+/// RTO expiry, and the node-wide snapshot counters for RTO expiries and
+/// retransmissions move. The global counters are process-wide, so only an
+/// increase is asserted.
+#[tokio::test(start_paused = true)]
+async fn forced_retransmit_increments_loss_counters() {
+    let mut e = single(CAPABLE);
+    e.conn.send("needs-ack".to_string()).await.expect("send");
+    let data_id = e
+        .drain_sent()
+        .iter()
+        .find(|m| matches!(m.payload, SymmetricMessagePayload::ShortMessage { .. }))
+        .expect("data packet sent")
+        .packet_id;
+    let [_, retx_before, _, rto_before, _, _] = crate::transport::TRANSPORT_METRICS.loss_counts();
+
+    let start = tokio::time::Instant::now();
+    let mut resent = false;
+    while start.elapsed() < Duration::from_secs(3) && !resent {
+        assert!(e.pump(Duration::from_millis(5)).await.is_none());
+        resent = e.drain_sent().iter().any(|m| m.packet_id == data_id);
+    }
+    assert!(resent, "the unacked packet must be retransmitted");
+
+    assert!(
+        e.conn.remote_conn.sent_tracker.lock().rto_expiries() >= 1,
+        "the connection's tracker must count the RTO expiry"
+    );
+    let [_, retx_after, _, rto_after, _, _] = crate::transport::TRANSPORT_METRICS.loss_counts();
+    assert!(rto_after > rto_before, "rto_expiries must increase");
+    assert!(
+        retx_after > retx_before,
+        "packets_retransmitted must increase"
+    );
+}
+
+/// After a ping/pong round trip an otherwise idle connection has a
+/// non-zero per-connection SRTT (and min RTT) for the snapshot's
+/// cross-connection distribution.
+#[tokio::test(start_paused = true)]
+async fn ping_pong_gives_connection_nonzero_srtt() {
+    let mut e = single(CAPABLE);
+    assert_eq!(
+        e.conn.remote_conn.rolling_rtt_stats.gauge().read(),
+        (None, None)
+    );
+
+    let seq = 4242;
+    let sent_at = e.conn.time_source.now_nanos();
+    e.conn.pending_pings.write().insert(seq, sent_at);
+    tokio::time::advance(Duration::from_millis(40)).await;
+    e.deliver(1, SymmetricMessagePayload::Pong { sequence: seq }, vec![])
+        .await;
+    e.deliver(2, short(b"after-pong"), vec![]).await;
+    assert!(e.pump(Duration::from_millis(50)).await.is_some());
+
+    let (srtt, min_rtt) = e.conn.remote_conn.rolling_rtt_stats.gauge().read();
+    let srtt = srtt.expect("SRTT must be set after a ping/pong");
+    let min_rtt = min_rtt.expect("min RTT must be set after a ping/pong");
+    assert!(
+        (40_000..60_000).contains(&srtt),
+        "SRTT {srtt}us should reflect the 40 ms round trip"
+    );
+    assert_eq!(srtt, min_rtt, "one sample: SRTT == min RTT");
+}
+
+/// A data ACK publishes the sent-packet tracker's SRTT, which then takes
+/// precedence over the keep-alive estimate.
+#[tokio::test(start_paused = true)]
+async fn data_ack_publishes_tracker_srtt() {
+    let mut e = single(CAPABLE);
+    e.conn.send("needs-ack".to_string()).await.expect("send");
+    let data_id = e
+        .drain_sent()
+        .iter()
+        .find(|m| matches!(m.payload, SymmetricMessagePayload::ShortMessage { .. }))
+        .expect("data packet sent")
+        .packet_id;
+    tokio::time::advance(Duration::from_millis(30)).await;
+    e.deliver(1, SymmetricMessagePayload::NoOp, vec![data_id])
+        .await;
+    e.deliver(2, short(b"after-ack"), vec![]).await;
+    assert!(e.pump(Duration::from_millis(50)).await.is_some());
+
+    let tracker_srtt = e
+        .conn
+        .remote_conn
+        .sent_tracker
+        .lock()
+        .smoothed_rtt()
+        .expect("the ack must give the tracker an SRTT");
+    let (srtt, _) = e.conn.remote_conn.rolling_rtt_stats.gauge().read();
+    assert_eq!(srtt, Some(tracker_srtt.as_micros() as u64));
+    assert!(srtt.unwrap() >= 30_000);
+}
+
+/// Standalone ack-only NoOps are counted.
+#[tokio::test(start_paused = true)]
+async fn standalone_ack_noops_are_counted() {
+    let mut e = single(CAPABLE);
+    let [_, _, _, _, _, acks_before] = crate::transport::TRANSPORT_METRICS.loss_counts();
+    e.deliver(5, short(b"please-ack"), vec![]).await;
+    assert!(e.pump(Duration::from_millis(10)).await.is_some());
+    // Let the ack timer flush the receipt as a standalone NoOp.
+    let start = tokio::time::Instant::now();
+    let mut acked = false;
+    while start.elapsed() < Duration::from_millis(500) && !acked {
+        assert!(e.pump(Duration::from_millis(20)).await.is_none());
+        acked = receipts_for(&e.drain_sent(), 5) > 0;
+    }
+    assert!(acked, "the receipt must be sent in a standalone NoOp");
+    let [_, _, _, _, _, acks_after] = crate::transport::TRANSPORT_METRICS.loss_counts();
+    assert!(
+        acks_after > acks_before,
+        "standalone_ack_packets must increase"
+    );
+}
+
+/// When nothing arrives for the idle timeout, `recv` errors and the
+/// connection reports that it closed on the idle timeout, so the node labels
+/// the disconnect "timeout".
+#[tokio::test(start_paused = true)]
+async fn idle_timeout_is_reported_for_disconnect_reason() {
+    let mut e = single(CAPABLE);
+    assert!(!e.conn.closed_by_idle_timeout);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(300);
+    let err = loop {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "idle timeout never fired"
+        );
+        match tokio::time::timeout(Duration::from_secs(1), e.conn.recv()).await {
+            Ok(Ok(_)) => panic!("no message was delivered"),
+            Ok(Err(err)) => break err,
+            Err(_) => {
+                // Keep the wire drained so keepalive sends never block.
+                e.drain_sent();
+            }
+        }
+    };
+    assert!(
+        matches!(err, TransportError::ConnectionClosed(_)),
+        "{err:?}"
+    );
+    assert!(
+        crate::transport::PeerConnectionApi::closed_by_idle_timeout(&e.conn),
+        "the idle-timeout exit must be flagged"
+    );
+}

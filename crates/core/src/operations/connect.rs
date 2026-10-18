@@ -3154,7 +3154,10 @@ mod tests {
                 .expect("the first accepted ring add must record the latency");
 
             // Drop to zero connections, rejoin, dial again.
-            op_manager.ring.prune_connection(peer).await;
+            op_manager
+                .ring
+                .prune_connection(peer, crate::tracing::DisconnectReason::Pruned)
+                .await;
             assert_eq!(op_manager.ring.open_connections(), 0);
             let kp2 = TransportKeypair::new();
             let peer2 = crate::node::PeerId::new(

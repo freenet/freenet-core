@@ -226,6 +226,7 @@ pub(crate) static SHADOW_RTT_REGISTRY: LazyLock<RttRegistry> = LazyLock::new(Das
 pub(crate) struct RollingRttStatsHandle<T: TimeSource> {
     stats: Arc<RollingRttStats<T>>,
     erased: Arc<dyn RttSnapshotProvider>,
+    gauge: Arc<ConnRttGauge>,
     remote_addr: SocketAddr,
 }
 
@@ -234,15 +235,37 @@ impl<T: TimeSource> RollingRttStatsHandle<T> {
         let stats = Arc::new(RollingRttStats::new(time_source));
         let erased: Arc<dyn RttSnapshotProvider> = stats.clone();
         SHADOW_RTT_REGISTRY.insert(remote_addr, erased.clone());
+        let gauge = Arc::new(ConnRttGauge::default());
+        CONN_RTT_REGISTRY.insert(remote_addr, gauge.clone());
         Self {
             stats,
             erased,
+            gauge,
             remote_addr,
         }
     }
 
+    /// Record a data-ACK RTT sample (non-retransmitted packet).
     pub(crate) fn record(&self, rtt: Duration) {
         self.stats.record(rtt);
+        self.gauge.record_min(rtt);
+    }
+
+    /// Publish the connection's current smoothed RTT (the sent-packet
+    /// tracker's RFC 6298 SRTT) for the telemetry snapshot.
+    pub(crate) fn publish_srtt(&self, srtt: Duration) {
+        self.gauge.publish_ack_srtt(srtt);
+    }
+
+    /// Record a keep-alive ping/pong RTT sample.
+    pub(crate) fn record_keepalive(&self, rtt: Duration) {
+        self.gauge.record_keepalive(rtt);
+    }
+
+    /// This connection's per-connection RTT gauge (tests only).
+    #[cfg(test)]
+    pub(crate) fn gauge(&self) -> &ConnRttGauge {
+        &self.gauge
     }
 }
 
@@ -251,7 +274,97 @@ impl<T: TimeSource> Drop for RollingRttStatsHandle<T> {
         SHADOW_RTT_REGISTRY.remove_if(&self.remote_addr, |_, current| {
             Arc::ptr_eq(current, &self.erased)
         });
+        CONN_RTT_REGISTRY.remove_if(&self.remote_addr, |_, current| {
+            Arc::ptr_eq(current, &self.gauge)
+        });
     }
+}
+
+/// Per-connection RTT summary for the periodic `transport_snapshot`.
+///
+/// Holds one current value per connection so the snapshot can report a
+/// distribution ACROSS connections (p50/p90/max) rather than a node-wide
+/// average of samples, which a single chatty connection dominates.
+/// Observation only: written with relaxed atomics from the recv loop, read
+/// only by the telemetry snapshot, never by the data path. `0` means "no
+/// sample yet" for every field.
+#[derive(Debug, Default)]
+pub(crate) struct ConnRttGauge {
+    /// SRTT from the sent-packet tracker (data-ACK samples), microseconds.
+    ack_srtt_us: std::sync::atomic::AtomicU64,
+    /// SRTT smoothed from keep-alive ping/pong samples with the same RFC 6298
+    /// alpha (1/8), microseconds. Used when there is no data-ACK SRTT.
+    keepalive_srtt_us: std::sync::atomic::AtomicU64,
+    /// Minimum over data-ACK and keep-alive samples, microseconds.
+    min_rtt_us: std::sync::atomic::AtomicU64,
+}
+
+impl ConnRttGauge {
+    fn to_us(rtt: Duration) -> u64 {
+        // Clamp to >= 1us so a real sub-microsecond sample is not read back
+        // as the "no sample" 0.
+        (rtt.as_micros().min(u64::MAX as u128) as u64).max(1)
+    }
+
+    fn record_min(&self, rtt: Duration) {
+        use std::sync::atomic::Ordering;
+        let us = Self::to_us(rtt);
+        // 0 = unset, so fetch_min alone would never move off it.
+        self.min_rtt_us
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+                (cur == 0 || us < cur).then_some(us)
+            })
+            .ok();
+    }
+
+    fn publish_ack_srtt(&self, srtt: Duration) {
+        self.ack_srtt_us
+            .store(Self::to_us(srtt), std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn record_keepalive(&self, rtt: Duration) {
+        use std::sync::atomic::Ordering;
+        self.record_min(rtt);
+        let us = Self::to_us(rtt);
+        // Single writer (the connection's recv loop), so load+store is fine.
+        let cur = self.keepalive_srtt_us.load(Ordering::Relaxed);
+        let next = if cur == 0 {
+            us
+        } else {
+            // SRTT = 7/8 SRTT + 1/8 R (RFC 6298 alpha)
+            (cur.saturating_mul(7).saturating_add(us) / 8).max(1)
+        };
+        self.keepalive_srtt_us.store(next, Ordering::Relaxed);
+    }
+
+    /// `(srtt_us, min_rtt_us)`, each `None` until sampled. Prefers the
+    /// data-ACK SRTT and falls back to the keep-alive SRTT.
+    pub(crate) fn read(&self) -> (Option<u64>, Option<u64>) {
+        use std::sync::atomic::Ordering;
+        let nz = |v: u64| (v != 0).then_some(v);
+        let srtt = nz(self.ack_srtt_us.load(Ordering::Relaxed))
+            .or_else(|| nz(self.keepalive_srtt_us.load(Ordering::Relaxed)));
+        (srtt, nz(self.min_rtt_us.load(Ordering::Relaxed)))
+    }
+}
+
+/// Process-wide registry of live connections' [`ConnRttGauge`]s, maintained
+/// by `RollingRttStatsHandle` exactly like [`SHADOW_RTT_REGISTRY`]. Read only
+/// by the telemetry snapshot.
+pub(crate) static CONN_RTT_REGISTRY: LazyLock<DashMap<SocketAddr, Arc<ConnRttGauge>>> =
+    LazyLock::new(DashMap::new);
+
+/// Per-connection RTT distribution across every live connection. Allocates
+/// two small vectors; called once per telemetry snapshot / dashboard read.
+pub(crate) fn live_connection_rtt_distribution() -> super::metrics::ConnRttDistribution {
+    let mut srtt = Vec::with_capacity(CONN_RTT_REGISTRY.len());
+    let mut min_rtt = Vec::with_capacity(CONN_RTT_REGISTRY.len());
+    for entry in CONN_RTT_REGISTRY.iter() {
+        let (s, m) = entry.value().read();
+        srtt.extend(s);
+        min_rtt.extend(m);
+    }
+    super::metrics::ConnRttDistribution::from_samples(srtt, min_rtt)
 }
 
 /// Snapshot every live per-peer entry of `registry`. Skips peers whose

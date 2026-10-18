@@ -2050,6 +2050,7 @@ impl P2pConnManager {
                             remote_addr,
                             error,
                             connection_id,
+                            reason: _,
                         } => {
                             tracing::debug!(
                                 peer_addr = %remote_addr,
@@ -2252,10 +2253,12 @@ impl P2pConnManager {
                                             .bridge
                                             .op_manager
                                             .ring
-                                            .prune_connection(PeerId::new(
-                                                peer.pub_key().clone(),
-                                                peer_addr,
-                                            ))
+                                            .prune_connection(
+                                                PeerId::new(peer.pub_key().clone(), peer_addr),
+                                                crate::tracing::DisconnectReason::Explicit(
+                                                    "shutdown".into(),
+                                                ),
+                                            )
                                             .await;
 
                                         // Note: In the simplified architecture (2026-01), subscriptions are lease-based
@@ -2365,8 +2368,16 @@ impl P2pConnManager {
                         }
                         ConnEvent::NodeAction(action) => match action {
                             NodeEvent::DropConnection(peer_addr) => {
+                                // Every `NodeEvent::DropConnection` sender is
+                                // local topology management (topology
+                                // adjustment, unhealthy-peer eviction,
+                                // deferred swap drop), hence "pruned".
                                 if !ctx
-                                    .drop_connection_by_addr(peer_addr, &handshake_cmd_sender)
+                                    .drop_connection_by_addr(
+                                        peer_addr,
+                                        &handshake_cmd_sender,
+                                        crate::tracing::DisconnectReason::Pruned,
+                                    )
                                     .await
                                 {
                                     tracing::debug!(
@@ -2392,7 +2403,13 @@ impl P2pConnManager {
                                         "Stale gateway link is now a ring connection - keeping it"
                                     );
                                 } else if !ctx
-                                    .drop_connection_by_addr(addr, &handshake_cmd_sender)
+                                    .drop_connection_by_addr(
+                                        addr,
+                                        &handshake_cmd_sender,
+                                        crate::tracing::DisconnectReason::Explicit(
+                                            "stale_gateway_link".into(),
+                                        ),
+                                    )
                                     .await
                                 {
                                     tracing::debug!(
@@ -2422,8 +2439,14 @@ impl P2pConnManager {
                                 // during suspend/resume recovery (rare), and during resume
                                 // there are few inbound connections to fill the events channel.
                                 for peer_addr in all_addrs {
-                                    ctx.drop_connection_by_addr(peer_addr, &handshake_cmd_sender)
-                                        .await;
+                                    ctx.drop_connection_by_addr(
+                                        peer_addr,
+                                        &handshake_cmd_sender,
+                                        crate::tracing::DisconnectReason::Explicit(
+                                            "suspend_resume".into(),
+                                        ),
+                                    )
+                                    .await;
                                 }
                             }
                             NodeEvent::ConnectPeer {
@@ -3211,6 +3234,8 @@ pub(super) enum ConnEvent {
         /// ID of the connection entry that spawned the listener reporting this closure.
         /// Used to ignore stale events from replaced connections.
         connection_id: u64,
+        /// Why the connection ended, for the `disconnect` telemetry event.
+        reason: crate::tracing::DisconnectReason,
     },
     /// Send raw stream data to a peer via the transport's stream mechanism.
     /// Used by operations-level streaming to send large payloads as stream fragments.
@@ -3412,12 +3437,14 @@ async fn notify_transport_closed(
     remote_addr: SocketAddr,
     error: TransportError,
     connection_id: u64,
+    reason: crate::tracing::DisconnectReason,
 ) {
     if sender
         .send(ConnEvent::TransportClosed {
             remote_addr,
             error,
             connection_id,
+            reason,
         })
         .await
         .is_err()
@@ -3540,6 +3567,9 @@ async fn peer_connection_listener(
                                 remote_addr,
                                 error,
                                 connection_id,
+                                crate::tracing::DisconnectReason::NetworkError(
+                                    "send_failed".into(),
+                                ),
                             )
                             .await;
                             return;
@@ -3561,6 +3591,9 @@ async fn peer_connection_listener(
                         remote_addr,
                         TransportError::ConnectionClosed(remote_addr),
                         connection_id,
+                        crate::tracing::DisconnectReason::Explicit(
+                            "listener_channel_closed".into(),
+                        ),
                     )
                     .await;
                     return;
@@ -3589,7 +3622,14 @@ async fn peer_connection_listener(
                                 );
                                 // Drain any messages that arrived while we were processing this one
                                 drain_pending_before_shutdown(&mut rx, &mut conn, remote_addr, &outbound_mix).await;
-                                notify_transport_closed(&conn_events, remote_addr, error, connection_id).await;
+                                notify_transport_closed(
+                                    &conn_events,
+                                    remote_addr,
+                                    error,
+                                    connection_id,
+                                    crate::tracing::DisconnectReason::NetworkError("send_failed".into()),
+                                )
+                                .await;
                                 return;
                             }
                         }
@@ -3605,6 +3645,9 @@ async fn peer_connection_listener(
                             remote_addr,
                             TransportError::ConnectionClosed(remote_addr),
                             connection_id,
+                            crate::tracing::DisconnectReason::Explicit(
+                                "listener_channel_closed".into(),
+                            ),
                         )
                         .await;
                         return;
@@ -3656,7 +3699,14 @@ async fn peer_connection_listener(
                             let transport_error = TransportError::Other(anyhow!(
                                 "Failed to deserialize inbound message from {remote_addr}: {error:?}"
                             ));
-                            notify_transport_closed(&conn_events, remote_addr, transport_error, connection_id).await;
+                            notify_transport_closed(
+                                &conn_events,
+                                remote_addr,
+                                transport_error,
+                                connection_id,
+                                crate::tracing::DisconnectReason::NetworkError("undecodable_message".into()),
+                            )
+                            .await;
                             return;
                         }
                     },
@@ -3679,8 +3729,16 @@ async fn peer_connection_listener(
                         // CRITICAL: Drain pending outbound messages before exiting.
                         // Messages may have been queued to the channel while we were
                         // waiting in select!, and they would be lost without this drain.
+                        // Label the disconnect: the idle timeout is the
+                        // only liveness check, so it is the "timeout" case;
+                        // every other recv error is a transport closure.
+                        let reason = if conn.closed_by_idle_timeout() {
+                            crate::tracing::DisconnectReason::Timeout
+                        } else {
+                            crate::tracing::DisconnectReason::NetworkError("transport_closed".into())
+                        };
                         drain_pending_before_shutdown(&mut rx, &mut conn, remote_addr, &outbound_mix).await;
-                        notify_transport_closed(&conn_events, remote_addr, error, connection_id).await;
+                        notify_transport_closed(&conn_events, remote_addr, error, connection_id, reason).await;
                         return;
                     }
                 }

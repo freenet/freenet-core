@@ -6042,10 +6042,20 @@ impl Ring {
     /// Returns orphaned transactions that need to be retried or failed.
     /// In the new lease-based subscription model, subscriptions are not tied to specific
     /// peers, so no subscription pruning is needed when a peer disconnects.
-    pub async fn prune_connection(&self, peer: PeerId) -> PruneConnectionResult {
-        use crate::tracing::DisconnectReason;
-
-        tracing::debug!(%peer, "Removing connection");
+    ///
+    /// `reason` is reported on the `disconnect` telemetry event. It must
+    /// describe why THIS connection ended (timeout, transport error, topology
+    /// prune, ...); before it was a parameter every disconnect said "pruned".
+    pub async fn prune_connection(
+        &self,
+        peer: PeerId,
+        reason: crate::tracing::DisconnectReason,
+    ) -> PruneConnectionResult {
+        tracing::debug!(%peer, %reason, "Removing connection");
+        // Read the per-peer wire-byte totals before
+        // `record_peer_disconnected` frees the slot. Best effort: `None` if
+        // the bounded per-peer table already evicted this peer.
+        let peer_bytes = crate::transport::TRANSPORT_METRICS.peer_bytes(peer.socket_addr());
         crate::node::network_status::record_peer_disconnected(peer.socket_addr());
         let orphaned_transactions = self
             .live_tx_tracker
@@ -6081,10 +6091,10 @@ impl Ring {
         if let Some(event) = NetEventLog::disconnected_with_context(
             self,
             &peer,
-            DisconnectReason::Pruned,
+            reason,
             connection_duration_ms,
-            None, // bytes_sent not tracked yet
-            None, // bytes_received not tracked yet
+            peer_bytes.map(|(sent, _)| sent),
+            peer_bytes.map(|(_, received)| received),
         ) {
             self.event_register
                 .register_events(Either::Left(event))
