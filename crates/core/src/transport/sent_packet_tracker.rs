@@ -1406,6 +1406,35 @@ pub(in crate::transport) mod tests {
         }
     }
 
+    /// Every resend (TLP probe and RTO) carries exactly the bytes first sent.
+    /// The WAN bench's link model counts goodput by recognising a
+    /// retransmission as a byte-identical copy (`link_model::Delivery::
+    /// first_copy`); re-encrypting a retransmission would silently make every
+    /// copy look new and inflate measured goodput.
+    #[test]
+    fn retransmissions_resend_the_original_bytes() {
+        let mut tracker = mock_sent_packet_tracker();
+        let original: Box<[u8]> = vec![7, 1, 9, 4, 2].into();
+        tracker.report_sent_packet(1, original.clone());
+        let mut resends = 0;
+        for _ in 0..4 {
+            tracker.time_source.advance(tracker.effective_rto());
+            match tracker.get_resend() {
+                ResendAction::Resend(id, bytes) | ResendAction::TlpProbe(id, bytes) => {
+                    assert_eq!(id, 1);
+                    assert_eq!(bytes, original);
+                    resends += 1;
+                }
+                ResendAction::WaitUntil(_) => {}
+                ResendAction::Abandon { .. } => panic!("abandoned after {resends} resends"),
+            }
+        }
+        assert!(
+            resends >= 2,
+            "expected the packet to be resent, got {resends}"
+        );
+    }
+
     // RTO Exponential Backoff Tests (RFC 6298 Section 5.5)
 
     #[rstest]
