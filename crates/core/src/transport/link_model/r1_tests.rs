@@ -409,7 +409,7 @@ fn r1_spike_recovery_fixed_rate() {
 // 10. Not only the spike: with no loss and no spike BBR reaches ~4 Mbit/s, and
 // with 1% loss alone it does not finish within the no-spike bound either.
 #[test]
-#[ignore = "known failure: BBR does not recover after an RTT spike on a 250 ms / 1% loss / 10 Mbit path (and is loss-limited without one); WAN bench R1 report"]
+#[ignore = "known failure: BBR does not recover after an RTT spike on a 250 ms / 1% loss / 10 Mbit path (and is loss-limited without one); #5929"]
 fn r1_spike_recovery_bbr() {
     gate(CongestionControlAlgorithm::Bbr);
 }
@@ -419,7 +419,7 @@ fn r1_spike_recovery_bbr() {
 // third survives it at ~0.3 Mbit/s. 1% loss alone holds it to ~0.2-1.2 Mbit/s
 // at this RTT, and even the clean path does not finish within the bound.
 #[test]
-#[ignore = "known failure: LEDBAT++ aborts the stream (cwnd-wait timeout) during a 3.4 s RTT spike and is loss-limited far below the bottleneck at 250 ms RTT; WAN bench R1 report"]
+#[ignore = "known failure: LEDBAT++ aborts the stream (cwnd-wait timeout) during a 3.4 s RTT spike and is loss-limited far below the bottleneck at 250 ms RTT; #5930"]
 fn r1_spike_recovery_ledbat() {
     gate(CongestionControlAlgorithm::Ledbat);
 }
