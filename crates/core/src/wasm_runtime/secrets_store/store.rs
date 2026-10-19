@@ -5799,6 +5799,7 @@ mod test {
     #[tokio::test]
     async fn legacy_snapshot_survives_restore_and_get_secret()
     -> Result<(), Box<dyn std::error::Error>> {
+        use crate::config::kek::{FileKek, KekBackend};
         use crate::wasm_runtime::secret_snapshots::SNAPSHOT_NAME_WIDTH;
         // SAFETY: nextest per-process isolation. The env mutation is
         // confined to this test process and not restored because the
@@ -5810,8 +5811,20 @@ mod test {
         let temp_dir = tempfile::tempdir()?;
         let secrets_dir = temp_dir.path().join("secrets-store-test");
         std::fs::create_dir_all(&secrets_dir)?;
+        // Pin the node KEK. The legacy blob below is encrypted under the
+        // DEK derived from it with a fixed all-zero `legacy_nonce`, so its
+        // first byte is `plaintext[0] ^ keystream[0]`. With a random KEK
+        // that byte is uniformly random and equals `VERSION_V1` in 1/256
+        // runs, which made this test flaky. A fixed KEK makes the blob,
+        // and therefore the precondition asserted below, deterministic.
+        const FIXED_KEK: [u8; KEK_SIZE] = [0x42; KEK_SIZE];
+        FileKek::new(&secrets_dir).store(&Zeroizing::new(FIXED_KEK))?;
         let db = create_test_db(temp_dir.path()).await;
         let mut store = SecretsStore::new(secrets_dir.clone(), Default::default(), db)?;
+        assert_eq!(
+            *store.kek, FIXED_KEK,
+            "store must load the pre-seeded KEK, otherwise the legacy blob is random again"
+        );
 
         let delegate = Delegate::from((&vec![90].into(), &vec![].into()));
         // Post-#4146: use derived DEK rather than client-supplied cipher
@@ -5840,9 +5853,10 @@ mod test {
         std::fs::create_dir_all(&snap_dir)?;
         let stamp = 1_700_000_000_000u64;
         let snap_path = snap_dir.join(format!("{stamp:0width$}", width = SNAPSHOT_NAME_WIDTH));
-        // Force a plaintext whose legacy AEAD does NOT happen to start with
-        // VERSION_V1, so the read path takes the plain legacy branch (the
-        // 1/256 ambiguity branch has its own dedicated test).
+        // With the fixed KEK above, this plaintext's legacy AEAD does NOT
+        // start with VERSION_V1, so the read path takes the plain legacy
+        // branch (the 1/256 ambiguity branch has its own dedicated test,
+        // `legacy_blob_with_version_byte_falls_through_to_legacy_decrypt`).
         let plaintext = b"legacy-snapshot-payload".to_vec();
         let legacy_aead = cipher
             .encrypt(&registration_nonce, plaintext.as_ref())
@@ -5850,8 +5864,9 @@ mod test {
         assert_ne!(
             legacy_aead.first().copied(),
             Some(VERSION_V1),
-            "test setup unlucky: legacy AEAD happens to start with VERSION_V1; \
-             pick a different plaintext"
+            "precondition: with FIXED_KEK the legacy AEAD must not start with \
+             VERSION_V1; if this fires, the DEK derivation or AEAD changed, so \
+             pick a different FIXED_KEK"
         );
         std::fs::write(&snap_path, &legacy_aead)?;
 
