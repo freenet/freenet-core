@@ -2785,6 +2785,30 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                 "nat_fail_samples_dropped".into(),
                 serde_json::json!(snapshot.nat_fail_samples_dropped),
             );
+            m.insert(
+                "inbound_stream_refused_invalid_length".into(),
+                serde_json::json!(snapshot.inbound_stream_refused_invalid_length),
+            );
+            m.insert(
+                "inbound_stream_refused_connection_bytes".into(),
+                serde_json::json!(snapshot.inbound_stream_refused_connection_bytes),
+            );
+            m.insert(
+                "inbound_stream_refused_connection_streams".into(),
+                serde_json::json!(snapshot.inbound_stream_refused_connection_streams),
+            );
+            m.insert(
+                "inbound_stream_closed_too_many_refusals".into(),
+                serde_json::json!(snapshot.inbound_stream_closed_too_many_refusals),
+            );
+            m.insert(
+                "inbound_stream_evicted_idle".into(),
+                serde_json::json!(snapshot.inbound_stream_evicted_idle),
+            );
+            m.insert(
+                "inbound_stream_evicted_age".into(),
+                serde_json::json!(snapshot.inbound_stream_evicted_age),
+            );
             serde_json::Value::Object(m)
         }
         EventKind::InterestSync(interest_sync_event) => {
@@ -6424,5 +6448,34 @@ mod tests {
                 .cloned()
                 .collect();
         assert_eq!(actual, expected);
+    }
+
+    /// The key set is not enough: the event-log JSON must also carry each
+    /// field's VALUE under its own key. The six inbound-stream counts are
+    /// distinct and non-zero so a swapped or mis-keyed one is caught.
+    #[test]
+    fn transport_snapshot_json_carries_inbound_stream_values() {
+        let snapshot = crate::transport::metrics::TransportSnapshot {
+            inbound_stream_refused_invalid_length: 1,
+            inbound_stream_refused_connection_bytes: 2,
+            inbound_stream_refused_connection_streams: 3,
+            inbound_stream_closed_too_many_refusals: 4,
+            inbound_stream_evicted_idle: 5,
+            inbound_stream_evicted_age: 6,
+            ..Default::default()
+        };
+        let reference = serde_json::to_value(&snapshot).unwrap();
+        let json = event_kind_to_json(&super::super::EventKind::TransportSnapshot(snapshot));
+        for (key, expected) in [
+            ("inbound_stream_refused_invalid_length", 1),
+            ("inbound_stream_refused_connection_bytes", 2),
+            ("inbound_stream_refused_connection_streams", 3),
+            ("inbound_stream_closed_too_many_refusals", 4),
+            ("inbound_stream_evicted_idle", 5),
+            ("inbound_stream_evicted_age", 6),
+        ] {
+            assert_eq!(json[key], expected, "event-log value for {key}");
+            assert_eq!(json[key], reference[key], "serde value for {key}");
+        }
     }
 }

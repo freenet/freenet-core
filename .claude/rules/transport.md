@@ -199,7 +199,11 @@ across DIFFERENT reporters in the same address family, IPv4-mapped v6
 treated as v4; counts only, never the address; per period, so it resets; a
 NAT rebinding between two reporters' reports is indistinguishable from
 EDM), final-ACK timing (`transfers_acked`, `*_transfer_ack_time_ms`) and
-the listener-to-connection queue (`inbound_queue_depth_hwm`, `_drops`). Hot
+the listener-to-connection queue (`inbound_queue_depth_hwm`, `_drops`) and
+inbound stream refusals / evictions by reason (`inbound_stream_<label>`, one
+per `InboundStreamOutcome`; the never-reset twin feeds the opt-in OTel
+`freenet.transport.inbound_stream_limits`, which must not observe the period
+counters). Hot
 path writes are single relaxed atomics; `SentPacketTracker` keeps an
 `rto_expiries` count and a bounded per-stream final-ACK watch, both
 observation only.
@@ -597,7 +601,9 @@ created from its declared length.
     the orphan registry.
   - Every refusal, eviction and refusal-related close is counted by reason
     in TRANSPORT_METRICS (cumulative_inbound_stream_outcomes, OTel
-    freenet.transport.inbound_stream_limits).
+    freenet.transport.inbound_stream_limits) and per period in the
+    transport_snapshot inbound_stream_<label> fields. A new reason is added
+    once, in the inbound_stream_outcomes! list; it then needs a snapshot field.
   - A complete operations stream is retired from streaming_handles and the
     registry at once, so only its consumers hold the charge.
   - LockFreeStreamBuffer::insert claims the slot BEFORE reserving bytes, so
