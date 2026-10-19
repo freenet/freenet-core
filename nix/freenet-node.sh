@@ -491,13 +491,15 @@ terminate() {
     # `child=$!` runs this handler while `child` is still 0 (bash runs a trap
     # as soon as the `&` command returns, before the next assignment), so
     # relying on `$child` alone orphans a freshly forked restart-pause `sleep`
-    # -- or the node itself -- which then outlives the wrapper (#5942: such a
-    # `sleep` left behind by this wrapper's own test stalled a CI job's
-    # orphan-process cleanup past the job timeout).
+    # -- or the node itself -- which then outlives the wrapper. `jobs -p` also
+    # lists `child` when it IS recorded, so it is only added when it is not.
     local pids
     pids="$(jobs -p)"
     if [ "$child" -ne 0 ]; then
-        pids="$pids $child"
+        case " ${pids//$'\n'/ } " in
+            *" $child "*) ;;
+            *) pids="$pids $child" ;;
+        esac
     fi
     if [ -n "${pids// /}" ]; then
         # shellcheck disable=SC2086  # word splitting of a pid list is the point

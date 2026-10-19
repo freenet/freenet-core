@@ -921,8 +921,7 @@ assert_eq "$(starts_of)" "2" "the node is restarted after the hung updater is cu
 
 # Anything the wrapper leaves behind after it is stopped is found by process
 # group: `set -m` gives each background job its own, with the job's pid as the
-# group id. (A leaked restart-pause `sleep` outlives the wrapper by minutes and
-# stalls the CI runner's end-of-job orphan cleanup, #5942.)
+# group id. (A leaked restart-pause `sleep` outlives the wrapper by minutes.)
 leftovers_in_group() {
   # leftovers_in_group <pgid>: echoes (and kills, by pid) whatever still runs in
   # the group, so a leak can never outlive the test that found it.
