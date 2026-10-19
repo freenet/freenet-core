@@ -400,7 +400,8 @@ fn spawn_outbound(
 }
 
 /// How long the handshake stage of an outbound connect may take. It does not
-/// cover handing the attempt to the transport (see [`OutboundConnector`]).
+/// cover handing the attempt to the transport, as before (see
+/// [`OutboundConnector`]); that unbounded stage is #5947.
 const OUTBOUND_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Run one outbound connect to `peer` and report it as the event the driver
@@ -629,6 +630,10 @@ mod tests {
         let expected = ConnectionError::from(TransportError::ConnectionEstablishmentFailure {
             cause: "refused".into(),
         });
+        assert!(
+            matches!(error, ConnectionError::TransportError(_)),
+            "{error:?}"
+        );
         assert_eq!(error.to_string(), expected.to_string());
         assert!(!run.ready);
     }
@@ -646,10 +651,13 @@ mod tests {
         assert!(!run.ready);
     }
 
-    /// The timeout covers only the handshake stage: an attempt that waits
-    /// longer than the timeout to be queued still connects.
+    /// Pins CURRENT behaviour, not a requirement: the timeout covers only the
+    /// handshake stage, so an attempt that waits longer than the timeout to
+    /// be queued still connects. That leaves a stalled listener able to hang
+    /// the connect forever; when #5947 bounds the enqueue stage, change this
+    /// test to assert the bound.
     #[tokio::test(start_paused = true)]
-    async fn outbound_connect_timeout_does_not_cover_queueing() {
+    async fn outbound_connect_enqueue_stage_is_not_yet_under_the_timeout() {
         let run = run_connect(Duration::from_secs(15), Handshake::Succeeds).await;
         assert!(
             matches!(run.event, Event::OutboundEstablished { .. }),

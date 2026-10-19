@@ -382,6 +382,8 @@ impl<S: Socket> OutboundConnectionHandler<S> {
         Ok((handler, receiver))
     }
 
+    /// `OutboundConnector::connect` calls this on a clone, so it must only
+    /// touch `Arc`-shared state.
     pub async fn connect(
         &mut self,
         remote_public_key: TransportPublicKey,
