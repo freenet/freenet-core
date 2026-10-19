@@ -43,7 +43,7 @@ use freenet_stdlib::prelude::{ContractKey, WrappedState};
 
 use crate::node::OpManager;
 use crate::ring::PeerKeyLocation;
-use crate::transport::BroadcastDeliveryOutcome;
+use crate::transport::StreamSendOutcome;
 
 use super::broadcast_payload_mix::PayloadArm;
 use super::p2p_protoc::P2pBridge;
@@ -351,7 +351,7 @@ pub(super) struct QueueScheduling {
 /// exits is counted: the initial metadata send returning `Err` (the stream
 /// never landed), `send_stream_with_completion` returning `Err` (dispatch
 /// failed before any fragment), or a post-dispatch non-`Delivered`
-/// `BroadcastDeliveryOutcome` (explicit `Dropped`, a dropped completion oneshot,
+/// `StreamSendOutcome` (explicit `Dropped`, a dropped completion oneshot,
 /// or a `STREAM_COMPLETION_TIMEOUT`). All three are stream-assembly / transfer
 /// failures — the exact signal that flagged the v0.2.73 incident, where
 /// nova/vega saw ~1500-2300 broadcast stream-assembly failures/hr against a ~0
@@ -3794,7 +3794,7 @@ pub(crate) use queue::BroadcastQueue;
 /// The signal fires in *every* terminal case so the permit is never leaked —
 /// including drops (peer channel closed, congestion timeout per #4145, no
 /// connection, transport send error, cwnd-wait early return). Only a real
-/// [`BroadcastDeliveryOutcome::Delivered`] must be treated as a send; treating
+/// [`StreamSendOutcome::Delivered`] must be treated as a send; treating
 /// a drop as a delivery refreshes the peer's interest TTL on a transfer that
 /// never landed and caches its summary, suppressing the next summary-mismatch
 /// resend that should have detected the drop.
@@ -3806,7 +3806,7 @@ pub(crate) use queue::BroadcastQueue;
 ///   cwnd-wait early return in `outbound_stream.rs`).
 /// - `Err(_)`            → dropped (we timed out waiting for completion).
 fn streaming_completion_delivered(completion: StreamCompletionResult) -> bool {
-    matches!(completion, Ok(Ok(BroadcastDeliveryOutcome::Delivered)))
+    matches!(completion, Ok(Ok(StreamSendOutcome::Delivered)))
 }
 
 /// Result of awaiting the streaming completion oneshot under a timeout:
@@ -3814,7 +3814,7 @@ fn streaming_completion_delivered(completion: StreamCompletionResult) -> bool {
 /// delivered/dropped signal from a dropped oneshot; the outer `Err` is the
 /// wait timeout.
 type StreamCompletionResult = Result<
-    Result<BroadcastDeliveryOutcome, tokio::sync::oneshot::error::RecvError>,
+    Result<StreamSendOutcome, tokio::sync::oneshot::error::RecvError>,
     tokio::time::error::Elapsed,
 >;
 
@@ -3903,7 +3903,7 @@ fn record_delivery_to_interest<T: crate::util::time_source::TimeSource + Sync>(
     // full state forever. Under sustained fan-out that is the #4233 full-state
     // broadcast storm.
     //
-    // #4235 added a real-delivery signal (`BroadcastDeliveryOutcome::Delivered`).
+    // #4235 added a real-delivery signal (`StreamSendOutcome::Delivered`).
     // This helper runs only on a delivered broadcast: for the streaming
     // (full-state) path the caller gates it behind
     // `record_streaming_delivery` → `streaming_completion_delivered`, and for
@@ -4595,7 +4595,7 @@ pub(super) async fn broadcast_to_single_peer(
                 // Wait for the stream transfer to actually complete before
                 // releasing back to the queue worker (semaphore permit is held
                 // by our caller). Timeout prevents permanent stall. The
-                // completion signal carries a `BroadcastDeliveryOutcome` so we
+                // completion signal carries a `StreamSendOutcome` so we
                 // distinguish a real delivery from a drop (#4235); a drop still
                 // releases the permit but must NOT be recorded as a send.
                 let completion =
@@ -4769,7 +4769,7 @@ mod tests {
 
     use crate::ring::PeerKey;
     use crate::ring::interest::InterestManager;
-    use crate::transport::{BroadcastDeliveryOutcome, TransportKeypair};
+    use crate::transport::{StreamSendOutcome, TransportKeypair};
     use crate::util::time_source::SharedMockTimeSource;
 
     use super::{
@@ -4823,9 +4823,9 @@ mod tests {
     /// A `RecvError` modeling the oneshot being dropped without a signal — the
     /// path `outbound_stream.rs` takes on a cwnd-wait early return. Awaiting a
     /// oneshot whose sender was dropped resolves to `Err(RecvError)`.
-    async fn dropped_oneshot()
-    -> Result<BroadcastDeliveryOutcome, tokio::sync::oneshot::error::RecvError> {
-        let (tx, rx) = tokio::sync::oneshot::channel::<BroadcastDeliveryOutcome>();
+    async fn dropped_oneshot() -> Result<StreamSendOutcome, tokio::sync::oneshot::error::RecvError>
+    {
+        let (tx, rx) = tokio::sync::oneshot::channel::<StreamSendOutcome>();
         drop(tx);
         rx.await.map(|_| unreachable!("sender was dropped"))
     }
@@ -4833,7 +4833,7 @@ mod tests {
     /// An `Elapsed` modeling the broadcast queue timing out waiting for the
     /// completion signal.
     async fn elapsed_timeout() -> tokio::time::error::Elapsed {
-        let (tx, rx) = tokio::sync::oneshot::channel::<BroadcastDeliveryOutcome>();
+        let (tx, rx) = tokio::sync::oneshot::channel::<StreamSendOutcome>();
         // Keep tx alive so rx never resolves; force the timeout to elapse.
         let res = tokio::time::timeout(Duration::from_millis(1), rx).await;
         drop(tx);
@@ -4854,14 +4854,14 @@ mod tests {
     async fn streaming_completion_delivered_only_on_explicit_delivery() {
         // Real delivery → counts as delivered.
         assert!(
-            streaming_completion_delivered(Ok(Ok(BroadcastDeliveryOutcome::Delivered))),
+            streaming_completion_delivered(Ok(Ok(StreamSendOutcome::Delivered))),
             "an explicit Delivered outcome must be treated as a delivery"
         );
 
         // Explicit drop (peer channel closed / congestion timeout #4145 /
         // no connection / transport send error) → NOT a delivery.
         assert!(
-            !streaming_completion_delivered(Ok(Ok(BroadcastDeliveryOutcome::Dropped))),
+            !streaming_completion_delivered(Ok(Ok(StreamSendOutcome::Dropped))),
             "an explicit Dropped outcome must NOT be treated as a delivery (#4235)"
         );
 
@@ -4907,16 +4907,8 @@ mod tests {
         let dropped = dropped_oneshot().await;
         let timed_out = elapsed_timeout().await;
         let cases: Vec<(&str, super::StreamCompletionResult, bool)> = vec![
-            (
-                "delivered",
-                Ok(Ok(BroadcastDeliveryOutcome::Delivered)),
-                true,
-            ),
-            (
-                "explicit-drop",
-                Ok(Ok(BroadcastDeliveryOutcome::Dropped)),
-                false,
-            ),
+            ("delivered", Ok(Ok(StreamSendOutcome::Delivered)), true),
+            ("explicit-drop", Ok(Ok(StreamSendOutcome::Dropped)), false),
             ("dropped-oneshot", Ok(dropped), false),
             ("timeout", Err(timed_out), false),
         ];
@@ -5022,7 +5014,7 @@ mod tests {
         // A FULL-STATE broadcast (`sent_delta = false`) is really Delivered.
         let delivered = record_streaming_delivery(
             &manager,
-            Ok(Ok(BroadcastDeliveryOutcome::Delivered)),
+            Ok(Ok(StreamSendOutcome::Delivered)),
             /* sent_delta */ false,
             &contract,
             &peer,
@@ -5079,7 +5071,7 @@ mod tests {
 
         let delivered = record_streaming_delivery(
             &manager,
-            Ok(Ok(BroadcastDeliveryOutcome::Delivered)),
+            Ok(Ok(StreamSendOutcome::Delivered)),
             /* sent_delta */ false,
             &contract,
             &peer,
@@ -5109,7 +5101,7 @@ mod tests {
         let dropped = dropped_oneshot().await;
         let timed_out = elapsed_timeout().await;
         let cases: Vec<(&str, super::StreamCompletionResult)> = vec![
-            ("explicit-drop", Ok(Ok(BroadcastDeliveryOutcome::Dropped))),
+            ("explicit-drop", Ok(Ok(StreamSendOutcome::Dropped))),
             ("dropped-oneshot", Ok(dropped)),
             ("timeout", Err(timed_out)),
         ];
@@ -5158,7 +5150,7 @@ mod tests {
         // Every non-delivery completion for a FULL-STATE (`sent_delta = false`)
         // stream must leave the summary uncached.
         let cases: Vec<(&str, super::StreamCompletionResult)> = vec![
-            ("explicit-drop", Ok(Ok(BroadcastDeliveryOutcome::Dropped))),
+            ("explicit-drop", Ok(Ok(StreamSendOutcome::Dropped))),
             ("dropped-oneshot", Ok(dropped)),
             ("timeout", Err(timed_out)),
         ];

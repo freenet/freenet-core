@@ -71,7 +71,7 @@ stalling the entire event loop. This has caused 6+ production deadlocks:
   fan-out that meant every update re-sent full state to every
   subscriber, swamping the event loop. Fixed (#4442) by caching the
   summary on any *delivered* broadcast (delta OR full state): #4235's
-  real-delivery signal (`BroadcastDeliveryOutcome::Delivered`) makes
+  real-delivery signal (`StreamSendOutcome::Delivered`) makes
   caching on a full-state delivery safe, so the next broadcast to that
   peer collapses to a small delta. A wrongly-cached summary (e.g. a
   lost stream tail — `Delivered` is sender-side completion, not a

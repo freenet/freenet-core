@@ -30,8 +30,8 @@ use crate::operations::connect::ConnectMsg;
 use crate::ring::PeerKey;
 use crate::ring::{Distance, Location};
 use crate::transport::{
-    BroadcastDeliveryOutcome, CongestionControlConfig, ExpectedInboundTracker, PeerConnectionApi,
-    Socket, TransportError, TransportKeypair, TransportPublicKey, UdpTransportSocket,
+    CongestionControlConfig, ExpectedInboundTracker, PeerConnectionApi, Socket, StreamSendOutcome,
+    TransportError, TransportKeypair, TransportPublicKey, UdpTransportSocket,
     create_connection_handler, global_bandwidth::GlobalBandwidthManager, peer_connection::StreamId,
 };
 use crate::util::time_source::{DynTimeSource, InstantTimeSrc};
@@ -150,9 +150,9 @@ pub(crate) enum P2pBridgeEvent {
         metadata: Option<bytes::Bytes>,
         /// Optional completion signal for broadcast queue concurrency control.
         /// Signaled when the actual stream transfer finishes (not just enqueue),
-        /// carrying a [`BroadcastDeliveryOutcome`] so the queue distinguishes a
+        /// carrying a [`StreamSendOutcome`] so the queue distinguishes a
         /// real delivery from a drop (#4235).
-        completion_tx: Option<tokio::sync::oneshot::Sender<BroadcastDeliveryOutcome>>,
+        completion_tx: Option<tokio::sync::oneshot::Sender<StreamSendOutcome>>,
         /// Optional per-fragment progress handle for the streaming-PUT retry
         /// loop (#4001). Threaded through to `send_stream` so the originator's
         /// retry loop sees liveness ticks. `None` for every non-originator path.
@@ -281,7 +281,7 @@ impl P2pBridge {
         stream_id: StreamId,
         data: bytes::Bytes,
         metadata: Option<bytes::Bytes>,
-        completion_tx: Option<tokio::sync::oneshot::Sender<BroadcastDeliveryOutcome>>,
+        completion_tx: Option<tokio::sync::oneshot::Sender<StreamSendOutcome>>,
         progress: Option<crate::operations::stream_progress::StreamProgressHandle>,
     ) -> super::ConnResult<()> {
         // channel-safety: ok — sole caller is the broadcast-queue task
@@ -2111,8 +2111,7 @@ impl P2pConnManager {
                                              cannot route stream fragment"
                                         );
                                         if let Some(tx) = completion_tx {
-                                            let _ignored =
-                                                tx.send(BroadcastDeliveryOutcome::Dropped);
+                                            let _ignored = tx.send(StreamSendOutcome::Dropped);
                                         }
                                     }
                                     Err(_timeout) => {
@@ -2125,8 +2124,7 @@ impl P2pConnManager {
                                              to keep event loop responsive"
                                         );
                                         if let Some(tx) = completion_tx {
-                                            let _ignored =
-                                                tx.send(BroadcastDeliveryOutcome::Dropped);
+                                            let _ignored = tx.send(StreamSendOutcome::Dropped);
                                         }
                                     }
                                 }
@@ -2141,7 +2139,7 @@ impl P2pConnManager {
                                 // is released immediately. No connection means the
                                 // fragment was dropped, not delivered (#4235).
                                 if let Some(tx) = completion_tx {
-                                    let _ignored = tx.send(BroadcastDeliveryOutcome::Dropped);
+                                    let _ignored = tx.send(StreamSendOutcome::Dropped);
                                 }
                             }
                         }
@@ -3245,8 +3243,8 @@ pub(super) enum ConnEvent {
         data: bytes::Bytes,
         metadata: Option<bytes::Bytes>,
         /// Optional completion signal for broadcast queue concurrency control,
-        /// carrying a [`BroadcastDeliveryOutcome`] (#4235).
-        completion_tx: Option<tokio::sync::oneshot::Sender<BroadcastDeliveryOutcome>>,
+        /// carrying a [`StreamSendOutcome`] (#4235).
+        completion_tx: Option<tokio::sync::oneshot::Sender<StreamSendOutcome>>,
         /// Optional per-fragment progress handle for the streaming-PUT retry
         /// loop (#4001). `None` for every non-originator path.
         progress: Option<crate::operations::stream_progress::StreamProgressHandle>,
@@ -3319,11 +3317,21 @@ async fn handle_peer_channel_message(
             // nothing on this hot path.
             let class =
                 crate::node::network_bridge::outbound_message_mix::OutboundClass::classify(&msg);
-            match conn.send_message(msg).await {
+            // The transport moves bytes; serializing the message is this
+            // layer's job. A serialization failure is reported exactly as a
+            // failed send.
+            let sent = match bincode::serialize(&msg) {
+                Ok(data) => {
+                    let serialized_len = data.len();
+                    conn.send_bytes(data).await.map(|()| serialized_len)
+                }
+                Err(error) => Err(TransportError::from(error)),
+            };
+            match sent {
                 Ok(serialized_len) => {
                     // #4956: attribute the bytes to the message kind that
-                    // produced them. `send_message` returns the length it
-                    // already computed, so nothing is serialized twice.
+                    // produced them. The length is the one just serialized,
+                    // so nothing is serialized twice.
                     // Recorded only on a successful hand-off to the transport,
                     // matching the payload mix's real-delivery accounting rule
                     // so a failed send never inflates the census.
@@ -3377,6 +3385,8 @@ async fn handle_peer_channel_message(
                         has_metadata = metadata.is_some(),
                         "[CONN_LIFECYCLE] Sending operations stream data to peer"
                     );
+                    let progress = progress
+                        .map(|p| Arc::new(p) as Arc<dyn crate::transport::StreamProgressObserver>);
                     if let Err(error) = conn
                         .send_stream_data(stream_id, data, metadata, completion_tx, progress)
                         .await
@@ -3816,6 +3826,140 @@ pub(crate) mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::sync::mpsc;
     use tokio::time::{Duration, Instant, sleep, timeout};
+
+    /// A connection that records the bytes it is asked to send, and fails
+    /// every send when `fail` is set.
+    struct RecordingConnection {
+        sent: Arc<parking_lot::Mutex<Vec<Vec<u8>>>>,
+        fail: bool,
+    }
+
+    impl super::PeerConnectionApi for RecordingConnection {
+        fn remote_addr(&self) -> std::net::SocketAddr {
+            "192.0.2.1:4000".parse().unwrap()
+        }
+
+        fn remote_version(&self) -> Option<(u8, u8, u16)> {
+            None
+        }
+
+        fn send_bytes(
+            &mut self,
+            data: Vec<u8>,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<(), super::TransportError>> + Send + '_>,
+        > {
+            self.sent.lock().push(data);
+            let result = if self.fail {
+                Err(super::TransportError::ConnectionClosed(self.remote_addr()))
+            } else {
+                Ok(())
+            };
+            Box::pin(async move { result })
+        }
+
+        fn recv(
+            &mut self,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<Vec<u8>, super::TransportError>>
+                    + Send
+                    + '_,
+            >,
+        > {
+            Box::pin(std::future::pending())
+        }
+
+        fn set_inbound_stream_registry(
+            &mut self,
+            _registry: Arc<dyn crate::transport::InboundStreamRegistry>,
+        ) {
+        }
+
+        fn send_stream_data(
+            &mut self,
+            _stream_id: crate::transport::peer_connection::StreamId,
+            _data: bytes::Bytes,
+            _metadata: Option<bytes::Bytes>,
+            _completion_tx: Option<
+                tokio::sync::oneshot::Sender<crate::transport::StreamSendOutcome>,
+            >,
+            _progress: Option<Arc<dyn crate::transport::StreamProgressObserver>>,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<(), super::TransportError>> + Send + '_>,
+        > {
+            unreachable!("not used by these tests")
+        }
+
+        fn pipe_stream_data(
+            &mut self,
+            _outbound_stream_id: crate::transport::peer_connection::StreamId,
+            _inbound_handle: crate::transport::peer_connection::streaming::StreamHandle,
+            _metadata: Option<bytes::Bytes>,
+            _progress: Option<Arc<dyn crate::transport::StreamProgressObserver>>,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<(), super::TransportError>> + Send + '_>,
+        > {
+            unreachable!("not used by these tests")
+        }
+    }
+
+    fn hosting_announce() -> crate::message::NetMessage {
+        use crate::message::{NeighborHostingMessage, NetMessage, NetMessageV1};
+        NetMessage::V1(NetMessageV1::NeighborHosting {
+            message: NeighborHostingMessage::HostingAnnounce {
+                added: vec![freenet_stdlib::prelude::ContractInstanceId::new([1u8; 32])],
+                removed: vec![],
+                is_response: false,
+            },
+        })
+    }
+
+    /// The bridge serializes a message itself and hands the transport exactly
+    /// `bincode::serialize(&msg)`, once (the transport no longer serializes),
+    /// and attributes that many bytes to the outbound message mix.
+    #[tokio::test]
+    async fn bridge_sends_the_serialized_message_and_records_its_length() {
+        let sent = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let mut conn: Box<dyn super::PeerConnectionApi> = Box::new(RecordingConnection {
+            sent: sent.clone(),
+            fail: false,
+        });
+        let mix = crate::node::network_bridge::outbound_message_mix::OutboundMix::new();
+        let msg = hosting_announce();
+        let expected = bincode::serialize(&msg).unwrap();
+
+        super::handle_peer_channel_message(&mut conn, either::Left(msg), &mix)
+            .await
+            .expect("send succeeds");
+
+        assert_eq!(*sent.lock(), vec![expected.clone()]);
+        let rollup = mix.rollup_body_for_test();
+        assert_eq!(rollup["total_msgs"], 1);
+        assert_eq!(rollup["total_bytes"], expected.len() as u64);
+    }
+
+    /// A send the transport refuses is returned as an error and records
+    /// nothing in the outbound message mix.
+    #[tokio::test]
+    async fn bridge_records_nothing_for_a_failed_send() {
+        let sent = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let mut conn: Box<dyn super::PeerConnectionApi> = Box::new(RecordingConnection {
+            sent: sent.clone(),
+            fail: true,
+        });
+        let mix = crate::node::network_bridge::outbound_message_mix::OutboundMix::new();
+
+        let result =
+            super::handle_peer_channel_message(&mut conn, either::Left(hosting_announce()), &mix)
+                .await;
+
+        assert!(result.is_err(), "the transport's error is returned");
+        assert_eq!(sent.lock().len(), 1, "premise: the send was attempted");
+        let rollup = mix.rollup_body_for_test();
+        assert_eq!(rollup["total_msgs"], 0);
+        assert_eq!(rollup["total_bytes"], 0);
+    }
 
     /// Only this node's own CONNECT request as a joiner is ended at once
     /// when its target could not be connected (#5858); a relayed request and
@@ -4960,13 +5104,12 @@ pub(crate) mod tests {
     /// a 120 s production stall.
     #[tokio::test]
     async fn stream_send_pattern_fires_completion_tx_on_timeout() {
-        use crate::transport::BroadcastDeliveryOutcome;
+        use crate::transport::StreamSendOutcome;
         const SEND_TIMEOUT: Duration = Duration::from_millis(100);
         let (tx, _rx) = mpsc::channel::<u32>(1);
         tx.try_send(0).expect("first send must succeed");
 
-        let (completion_tx, completion_rx) =
-            tokio::sync::oneshot::channel::<BroadcastDeliveryOutcome>();
+        let (completion_tx, completion_rx) = tokio::sync::oneshot::channel::<StreamSendOutcome>();
 
         // Mirror the StreamSend dispatch pattern:
         //   reserve() → permit OR closed OR timeout
@@ -4981,16 +5124,16 @@ pub(crate) mod tests {
                 panic!("reserve unexpectedly succeeded on saturated channel");
             }
             Ok(Err(_closed)) => {
-                let _ignored = completion_tx.send(BroadcastDeliveryOutcome::Dropped);
+                let _ignored = completion_tx.send(StreamSendOutcome::Dropped);
             }
             Err(_timeout) => {
-                let _ignored = completion_tx.send(BroadcastDeliveryOutcome::Dropped);
+                let _ignored = completion_tx.send(StreamSendOutcome::Dropped);
             }
         }
 
         let signal = timeout(Duration::from_millis(50), completion_rx).await;
         assert!(
-            matches!(signal, Ok(Ok(BroadcastDeliveryOutcome::Dropped))),
+            matches!(signal, Ok(Ok(StreamSendOutcome::Dropped))),
             "completion_tx must be fired on the dispatch timeout path so the \
              broadcast queue releases its permit immediately (not after \
              120s STREAM_COMPLETION_TIMEOUT). Got {signal:?}"
@@ -5054,20 +5197,18 @@ pub(crate) mod tests {
         // would otherwise silently reintroduce the 120 s
         // STREAM_COMPLETION_TIMEOUT stall.
         //
-        // Post-#4235 the signal carries a `BroadcastDeliveryOutcome` instead
+        // Post-#4235 the signal carries a `StreamSendOutcome` instead
         // of `()`, and every drop arm reports `Dropped` so the broadcast queue
         // releases the permit WITHOUT treating the drop as a delivery. Counting
         // `Dropped` fires here pins both invariants at once: a regression that
         // dropped an arm OR that mislabeled a drop arm as `Delivered` (the
         // exact conflation #4235 fixed) trips this assertion. Tested
         // behaviourally by `stream_send_pattern_fires_completion_tx_on_timeout`.
-        let fire_count = body
-            .matches("tx.send(BroadcastDeliveryOutcome::Dropped)")
-            .count();
+        let fire_count = body.matches("tx.send(StreamSendOutcome::Dropped)").count();
         assert_eq!(
             fire_count, 3,
             "StreamSend dispatch must signal completion_tx with \
-             BroadcastDeliveryOutcome::Dropped in all three non-success arms \
+             StreamSendOutcome::Dropped in all three non-success arms \
              (closed / timeout / no-connection) — found {fire_count} such \
              occurrences, expected exactly 3. If you REMOVED one, a refactor \
              reintroduced the 120 s STREAM_COMPLETION_TIMEOUT stall (#4145). \

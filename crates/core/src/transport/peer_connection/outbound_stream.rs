@@ -170,8 +170,8 @@ pub(super) async fn send_stream<S: super::super::Socket, T: TimeSource>(
     congestion_controller: Arc<CongestionController<T>>,
     time_source: T,
     metadata: Option<Bytes>,
-    completion_tx: Option<oneshot::Sender<crate::transport::BroadcastDeliveryOutcome>>,
-    progress: Option<crate::operations::stream_progress::StreamProgressHandle>,
+    completion_tx: Option<oneshot::Sender<crate::transport::StreamSendOutcome>>,
+    progress: Option<Arc<dyn crate::transport::StreamProgressObserver>>,
 ) -> Result<TransferStats, TransportError> {
     let start_time = time_source.now();
     let start_nanos = time_source.now_nanos();
@@ -192,7 +192,7 @@ pub(super) async fn send_stream<S: super::super::Socket, T: TimeSource>(
             "Not sending stream: length outside the stream limits"
         );
         if let Some(tx) = completion_tx {
-            let _ignored = tx.send(crate::transport::BroadcastDeliveryOutcome::Dropped);
+            let _ignored = tx.send(crate::transport::StreamSendOutcome::Dropped);
         }
         return Err(TransportError::OutboundStreamInvalidLength(
             destination_addr,
@@ -475,7 +475,7 @@ pub(super) async fn send_stream<S: super::super::Socket, T: TimeSource>(
             // the queue must NOT treat this as a delivery.
             if let Some(tx) = completion_tx {
                 // Receiver may be dropped if queue timed out; ignore the error.
-                let _ignored = tx.send(crate::transport::BroadcastDeliveryOutcome::Dropped);
+                let _ignored = tx.send(crate::transport::StreamSendOutcome::Dropped);
             }
             return Err(e);
         }
@@ -483,11 +483,12 @@ pub(super) async fn send_stream<S: super::super::Socket, T: TimeSource>(
         next_fragment_number += 1;
         sent_so_far += 1;
         if let Some(p) = &progress {
-            // record() reads the handle's OWN clock (the originator's
-            // TimeSource), NOT this connection's time_source — the two have
-            // different epochs and mixing them defeats the inactivity timeout
-            // (#4001 single-epoch invariant; see stream_progress.rs).
-            p.record();
+            // No timestamp is passed: the observer reads its OWN clock (the
+            // originator's TimeSource), NOT this connection's time_source —
+            // the two have different epochs and mixing them defeats the
+            // inactivity timeout (#4001 single-epoch invariant; see
+            // StreamProgressObserver).
+            p.on_fragment_sent();
         }
     }
 
@@ -546,7 +547,7 @@ pub(super) async fn send_stream<S: super::super::Socket, T: TimeSource>(
     // (#4235) — only this case refreshes peer interest / caches the summary.
     if let Some(tx) = completion_tx {
         // Receiver may be dropped if queue timed out; ignore the error.
-        let _ignored = tx.send(crate::transport::BroadcastDeliveryOutcome::Delivered);
+        let _ignored = tx.send(crate::transport::StreamSendOutcome::Delivered);
     }
 
     Ok(TransferStats {
@@ -594,7 +595,7 @@ pub(super) async fn pipe_stream<S: super::super::Socket, T: TimeSource>(
     congestion_controller: Arc<CongestionController<T>>,
     time_source: T,
     metadata: Option<Bytes>,
-    progress: Option<crate::operations::stream_progress::StreamProgressHandle>,
+    progress: Option<Arc<dyn crate::transport::StreamProgressObserver>>,
 ) -> Result<TransferStats, TransportError> {
     let start_time = time_source.now();
     let start_nanos = time_source.now_nanos();
@@ -902,11 +903,12 @@ pub(super) async fn pipe_stream<S: super::super::Socket, T: TimeSource>(
         sent_so_far += packet_size as u64;
         fragment_number += 1;
         if let Some(p) = &progress {
-            // record() reads the handle's OWN clock (the originator's
-            // TimeSource), NOT this connection's time_source — the two have
-            // different epochs and mixing them defeats the inactivity timeout
-            // (#4001 single-epoch invariant; see stream_progress.rs).
-            p.record();
+            // No timestamp is passed: the observer reads its OWN clock (the
+            // originator's TimeSource), NOT this connection's time_source —
+            // the two have different epochs and mixing them defeats the
+            // inactivity timeout (#4001 single-epoch invariant; see
+            // StreamProgressObserver).
+            p.on_fragment_sent();
         }
     }
 
@@ -1673,7 +1675,7 @@ mod tests {
         );
         assert!(matches!(
             completion_rx.await,
-            Ok(crate::transport::BroadcastDeliveryOutcome::Dropped)
+            Ok(crate::transport::StreamSendOutcome::Dropped)
         ));
         Ok(())
     }
@@ -1967,7 +1969,7 @@ mod tests {
     }
 
     /// Issue #4235 — producer-side emission: a `send_stream` that runs to a
-    /// successful completion MUST signal `BroadcastDeliveryOutcome::Delivered`
+    /// successful completion MUST signal `StreamSendOutcome::Delivered`
     /// on its `completion_tx`.
     ///
     /// The broadcast queue gates interest-refresh / summary-cache on this exact
@@ -2029,14 +2031,14 @@ mod tests {
         assert!(result.is_ok(), "send_stream should succeed: {result:?}");
         assert_eq!(
             completion_rx.await,
-            Ok(crate::transport::BroadcastDeliveryOutcome::Delivered),
+            Ok(crate::transport::StreamSendOutcome::Delivered),
             "a successful stream MUST signal Delivered (#4235)"
         );
         Ok(())
     }
 
     /// Issue #4235 — producer-side emission: a `send_stream` that fails mid-flight
-    /// (a `packet_sending` error) MUST signal `BroadcastDeliveryOutcome::Dropped`
+    /// (a `packet_sending` error) MUST signal `StreamSendOutcome::Dropped`
     /// on its `completion_tx`, so the broadcast queue releases the permit WITHOUT
     /// refreshing interest or caching the summary.
     ///
@@ -2104,7 +2106,7 @@ mod tests {
         );
         assert_eq!(
             completion_rx.await,
-            Ok(crate::transport::BroadcastDeliveryOutcome::Dropped),
+            Ok(crate::transport::StreamSendOutcome::Dropped),
             "a mid-flight send failure MUST signal Dropped (#4235)"
         );
         // #4345 mid-send-failure release: the first fragment's on_send bytes were
@@ -2524,6 +2526,128 @@ mod tests {
             "pipe_stream inbound-error abort must leave flight size at 0"
         );
 
+        Ok(())
+    }
+
+    /// Counts `on_fragment_sent` calls.
+    #[derive(Default)]
+    struct CountingObserver(std::sync::atomic::AtomicUsize);
+
+    impl crate::transport::StreamProgressObserver for CountingObserver {
+        fn on_fragment_sent(&self) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    impl CountingObserver {
+        fn count(&self) -> usize {
+            self.0.load(std::sync::atomic::Ordering::Relaxed)
+        }
+    }
+
+    /// Congestion controller and token bucket large enough that a test stream
+    /// never waits on either.
+    fn unthrottled(
+        time_source: &VirtualTime,
+    ) -> (
+        Arc<CongestionController<VirtualTime>>,
+        Arc<TokenBucket<VirtualTime>>,
+    ) {
+        let congestion_controller = CongestionControlConfig::from_ledbat_config(LedbatConfig {
+            initial_cwnd: 1_000_000,
+            min_cwnd: 1_000_000,
+            max_cwnd: 1_000_000_000,
+            ..Default::default()
+        })
+        .build_arc_with_time_source(time_source.clone());
+        let token_bucket = Arc::new(TokenBucket::new_with_time_source(
+            1_000_000,
+            10_000_000,
+            time_source.clone(),
+        ));
+        (congestion_controller, token_bucket)
+    }
+
+    /// `send_stream` reports progress once per fragment it hands to the
+    /// socket: the operations layer's inactivity timeout relies on it.
+    #[tokio::test]
+    async fn send_stream_reports_progress_once_per_fragment()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (outbound_sender, mut outbound_receiver) = mpsc::channel(1);
+        let time_source = VirtualTime::new();
+        let (congestion_controller, token_bucket) = unthrottled(&time_source);
+        let observer = Arc::new(CountingObserver::default());
+        let task = GlobalExecutor::spawn(send_stream(
+            StreamId::next(),
+            Arc::new(AtomicU32::new(0)),
+            Arc::new(TestSocket::new(outbound_sender)),
+            SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 8080),
+            Bytes::from(vec![7u8; 20_000]),
+            random_cipher(),
+            Arc::new(parking_lot::Mutex::new(
+                SentPacketTracker::new_with_time_source(time_source.clone()),
+            )),
+            token_bucket,
+            congestion_controller,
+            time_source,
+            None,
+            None,
+            Some(observer.clone() as Arc<dyn crate::transport::StreamProgressObserver>),
+        ));
+        let mut packets = 0;
+        while outbound_receiver.recv().await.is_some() {
+            packets += 1;
+        }
+        task.await?.expect("send_stream succeeds");
+        assert!(
+            packets > 1,
+            "premise: a multi-fragment stream, got {packets}"
+        );
+        assert_eq!(observer.count(), packets);
+        Ok(())
+    }
+
+    /// `pipe_stream` reports progress once per fragment it forwards.
+    #[tokio::test]
+    async fn pipe_stream_reports_progress_once_per_fragment()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::transport::peer_connection::streaming::StreamHandle;
+        use crate::transport::peer_connection::streaming_buffer::FRAGMENT_PAYLOAD_SIZE;
+
+        const FRAGMENTS: usize = 4;
+        let handle =
+            StreamHandle::new(StreamId::next(), (FRAGMENTS * FRAGMENT_PAYLOAD_SIZE) as u64);
+        for n in 1..=FRAGMENTS {
+            handle.push_fragment(n as u32, Bytes::from(vec![7u8; FRAGMENT_PAYLOAD_SIZE]))?;
+        }
+
+        let (outbound_sender, mut outbound_receiver) = mpsc::channel(1);
+        let time_source = VirtualTime::new();
+        let (congestion_controller, token_bucket) = unthrottled(&time_source);
+        let observer = Arc::new(CountingObserver::default());
+        let task = GlobalExecutor::spawn(pipe_stream(
+            handle,
+            StreamId::next(),
+            Arc::new(AtomicU32::new(0)),
+            Arc::new(TestSocket::new(outbound_sender)),
+            SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 8080),
+            random_cipher(),
+            Arc::new(parking_lot::Mutex::new(
+                SentPacketTracker::new_with_time_source(time_source.clone()),
+            )),
+            token_bucket,
+            congestion_controller,
+            time_source,
+            None,
+            Some(observer.clone() as Arc<dyn crate::transport::StreamProgressObserver>),
+        ));
+        let mut packets = 0;
+        while outbound_receiver.recv().await.is_some() {
+            packets += 1;
+        }
+        task.await?.expect("pipe_stream succeeds");
+        assert_eq!(packets, FRAGMENTS, "premise: one packet per fragment");
+        assert_eq!(observer.count(), FRAGMENTS);
         Ok(())
     }
 }

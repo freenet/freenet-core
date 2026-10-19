@@ -1114,7 +1114,7 @@ impl P2pConnManager {
         // between stream fragments and metadata messages (RequestStreaming/ResponseStreaming).
         let mut connection = connection;
         connection
-            .set_orphan_stream_registry(self.bridge.op_manager.orphan_stream_registry().clone());
+            .set_inbound_stream_registry(self.bridge.op_manager.orphan_stream_registry().clone());
 
         // Use tokio::spawn directly instead of GlobalExecutor::spawn.
         // GlobalExecutor::spawn uses Handle::try_current().spawn() which doesn't
