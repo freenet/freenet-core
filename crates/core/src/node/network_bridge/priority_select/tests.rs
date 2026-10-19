@@ -2796,7 +2796,7 @@ impl crate::transport::PeerConnectionApi for MockPeerConnection {
         None
     }
 
-    fn send(
+    fn send_bytes(
         &mut self,
         _data: Vec<u8>,
     ) -> std::pin::Pin<

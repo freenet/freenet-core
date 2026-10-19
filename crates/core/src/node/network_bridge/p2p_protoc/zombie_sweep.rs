@@ -2426,7 +2426,7 @@ mod tests {
             None
         }
 
-        fn send(
+        fn send_bytes(
             &mut self,
             _data: Vec<u8>,
         ) -> Pin<Box<dyn Future<Output = Result<(), TransportError>> + Send + '_>> {

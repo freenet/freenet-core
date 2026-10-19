@@ -1,9 +1,23 @@
 //! The per-connection boundary between the transport and the node.
 //!
-//! Everything above the transport (the network bridge and, through it, the
-//! operations) talks to a connection only through [`PeerConnectionApi`] and
-//! the types in this module. A second transport implementation satisfies the
-//! boundary by implementing this trait.
+//! Once a connection is established, everything above the transport (the
+//! network bridge and, through it, the operations) talks to it only through
+//! [`PeerConnectionApi`] and the types in this module. The UDP transport is
+//! the only implementation. A second one could not yet implement this trait
+//! alone, because the boundary still carries UDP assumptions.
+//!
+//! # Known UDP assumptions still in the boundary
+//!
+//! - Connection setup is outside the trait (`create_connection_handler`,
+//!   `ExpectedInboundTracker`).
+//! - [`TransportError`] is UDP-shaped and drives control flow in the bridge
+//!   (`is_transient_send_failure` in `p2p_protoc.rs`).
+//! - The caller picks stream ids ([`StreamId`]: a `u32` with an operations
+//!   bit).
+//! - [`InboundStreamRegistry`] is fragment-based (`Weak<LockFreeStreamBuffer>`).
+//! - Why a connection closed is reported out of band, through the
+//!   `closed_by_*` flags read after `recv` fails.
+//! - Peers are identified by `SocketAddr`.
 
 use std::net::SocketAddr;
 
@@ -18,10 +32,9 @@ use super::peer_connection::streaming_buffer::LockFreeStreamBuffer;
 // Type-erased peer connection trait
 // =============================================================================
 //
-// This trait abstracts over `PeerConnection<S>` to allow the event loop to work
-// with connections without being generic over the socket type. This enables
-// using the same event loop code for both production (UdpTransportSocket) and testing
-// (InMemorySocket) without propagating generics through the entire codebase.
+// This trait abstracts over `PeerConnection<S>` so the event loop works with
+// connections without being generic over the socket type: the same event loop
+// code serves production (UdpTransportSocket) and testing (InMemorySocket).
 
 /// Outcome carried by the stream-completion oneshot of
 /// [`PeerConnectionApi::send_stream_data`].
@@ -29,7 +42,8 @@ use super::peer_connection::streaming_buffer::LockFreeStreamBuffer;
 /// The broadcast queue, its main user, holds a semaphore permit while a
 /// streaming broadcast is in flight and releases it when the completion signal
 /// fires. Historically the signal was a bare `()` and the queue treated *any*
-/// signal as a successful delivery (issue #4235). That conflated two unrelated facts:
+/// signal as a successful delivery (issue #4235). That conflated two unrelated
+/// facts:
 ///
 /// 1. **Permit release** — the permit MUST be released in every terminal case
 ///    (delivered, dropped, timed out) so concurrency slots are never leaked.
@@ -137,7 +151,11 @@ pub(crate) trait PeerConnectionApi: Send {
     /// counterpart of [`Self::recv`], which hands back the same bytes at the
     /// other end. The caller knows `data.len()`, so it can attribute outbound
     /// bytes by message kind without serializing twice.
-    fn send(
+    ///
+    /// Not named `send`: `PeerConnection::send<D: Serialize>` serializes its
+    /// argument, and on a concrete connection it would win method resolution
+    /// and serialize these bytes a second time.
+    fn send_bytes(
         &mut self,
         data: Vec<u8>,
     ) -> std::pin::Pin<Box<dyn Future<Output = Result<(), TransportError>> + Send + '_>>;

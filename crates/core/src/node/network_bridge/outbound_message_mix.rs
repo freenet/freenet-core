@@ -34,9 +34,10 @@
 //! ## What is counted
 //!
 //! Bytes are the **serialized `NetMessage` length**, recorded after the
-//! network bridge has serialized it and [`PeerConnectionApi::send`][send] has
-//! handed it to the transport. That is the payload the transport was asked to move, NOT the
-//! on-wire total: it excludes per-packet framing, ACKs and retransmits. The
+//! network bridge has serialized it and
+//! [`PeerConnectionApi::send_bytes`][send] has handed it to the transport.
+//! That is the payload the transport was asked to move, NOT the on-wire
+//! total: it excludes per-packet framing, ACKs and retransmits. The
 //! gap between this sum and `cumulative_bytes_sent` is exactly that overhead,
 //! which is the point — it is reported as a residual rather than silently
 //! folded into a message arm.
@@ -52,8 +53,9 @@
 //!   `transfer_completed`.
 //! * **Transport-level streams** are just a big `NetMessage`: anything over
 //!   `MAX_DATA_SIZE` (~1.2 KB) that goes through
-//!   [`PeerConnectionApi::send`][send] is fragmented by `outbound_stream`. Those messages DO pass through this
-//!   call site, so their bytes ARE counted here — deliberately, since that
+//!   [`PeerConnectionApi::send_bytes`][send] is fragmented by
+//!   `outbound_stream`. Those messages DO pass through this call site, so
+//!   their bytes ARE counted here — deliberately, since that
 //!   population includes the delta broadcasts. They ALSO emit
 //!   `transfer_completed`.
 //!
@@ -67,7 +69,7 @@
 //! against `cumulative_bytes_sent` relies on.
 //!
 //! [bpm]: super::broadcast_payload_mix
-//! [send]: crate::transport::PeerConnectionApi::send
+//! [send]: crate::transport::PeerConnectionApi::send_bytes
 
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;

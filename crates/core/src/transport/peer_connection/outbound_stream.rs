@@ -2528,4 +2528,126 @@ mod tests {
 
         Ok(())
     }
+
+    /// Counts `on_fragment_sent` calls.
+    #[derive(Default)]
+    struct CountingObserver(std::sync::atomic::AtomicUsize);
+
+    impl crate::transport::StreamProgressObserver for CountingObserver {
+        fn on_fragment_sent(&self) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    impl CountingObserver {
+        fn count(&self) -> usize {
+            self.0.load(std::sync::atomic::Ordering::Relaxed)
+        }
+    }
+
+    /// Congestion controller and token bucket large enough that a test stream
+    /// never waits on either.
+    fn unthrottled(
+        time_source: &VirtualTime,
+    ) -> (
+        Arc<CongestionController<VirtualTime>>,
+        Arc<TokenBucket<VirtualTime>>,
+    ) {
+        let congestion_controller = CongestionControlConfig::from_ledbat_config(LedbatConfig {
+            initial_cwnd: 1_000_000,
+            min_cwnd: 1_000_000,
+            max_cwnd: 1_000_000_000,
+            ..Default::default()
+        })
+        .build_arc_with_time_source(time_source.clone());
+        let token_bucket = Arc::new(TokenBucket::new_with_time_source(
+            1_000_000,
+            10_000_000,
+            time_source.clone(),
+        ));
+        (congestion_controller, token_bucket)
+    }
+
+    /// `send_stream` reports progress once per fragment it hands to the
+    /// socket: the operations layer's inactivity timeout relies on it.
+    #[tokio::test]
+    async fn send_stream_reports_progress_once_per_fragment()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (outbound_sender, mut outbound_receiver) = mpsc::channel(1);
+        let time_source = VirtualTime::new();
+        let (congestion_controller, token_bucket) = unthrottled(&time_source);
+        let observer = Arc::new(CountingObserver::default());
+        let task = GlobalExecutor::spawn(send_stream(
+            StreamId::next(),
+            Arc::new(AtomicU32::new(0)),
+            Arc::new(TestSocket::new(outbound_sender)),
+            SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 8080),
+            Bytes::from(vec![7u8; 20_000]),
+            random_cipher(),
+            Arc::new(parking_lot::Mutex::new(
+                SentPacketTracker::new_with_time_source(time_source.clone()),
+            )),
+            token_bucket,
+            congestion_controller,
+            time_source,
+            None,
+            None,
+            Some(observer.clone() as Arc<dyn crate::transport::StreamProgressObserver>),
+        ));
+        let mut packets = 0;
+        while outbound_receiver.recv().await.is_some() {
+            packets += 1;
+        }
+        task.await?.expect("send_stream succeeds");
+        assert!(
+            packets > 1,
+            "premise: a multi-fragment stream, got {packets}"
+        );
+        assert_eq!(observer.count(), packets);
+        Ok(())
+    }
+
+    /// `pipe_stream` reports progress once per fragment it forwards.
+    #[tokio::test]
+    async fn pipe_stream_reports_progress_once_per_fragment()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::transport::peer_connection::streaming::StreamHandle;
+        use crate::transport::peer_connection::streaming_buffer::FRAGMENT_PAYLOAD_SIZE;
+
+        const FRAGMENTS: usize = 4;
+        let handle =
+            StreamHandle::new(StreamId::next(), (FRAGMENTS * FRAGMENT_PAYLOAD_SIZE) as u64);
+        for n in 1..=FRAGMENTS {
+            handle.push_fragment(n as u32, Bytes::from(vec![7u8; FRAGMENT_PAYLOAD_SIZE]))?;
+        }
+
+        let (outbound_sender, mut outbound_receiver) = mpsc::channel(1);
+        let time_source = VirtualTime::new();
+        let (congestion_controller, token_bucket) = unthrottled(&time_source);
+        let observer = Arc::new(CountingObserver::default());
+        let task = GlobalExecutor::spawn(pipe_stream(
+            handle,
+            StreamId::next(),
+            Arc::new(AtomicU32::new(0)),
+            Arc::new(TestSocket::new(outbound_sender)),
+            SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 8080),
+            random_cipher(),
+            Arc::new(parking_lot::Mutex::new(
+                SentPacketTracker::new_with_time_source(time_source.clone()),
+            )),
+            token_bucket,
+            congestion_controller,
+            time_source,
+            None,
+            Some(observer.clone() as Arc<dyn crate::transport::StreamProgressObserver>),
+        ));
+        let mut packets = 0;
+        while outbound_receiver.recv().await.is_some() {
+            packets += 1;
+        }
+        task.await?.expect("pipe_stream succeeds");
+        assert_eq!(packets, FRAGMENTS, "premise: one packet per fragment");
+        assert_eq!(observer.count(), FRAGMENTS);
+        Ok(())
+    }
 }

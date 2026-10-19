@@ -3323,7 +3323,7 @@ async fn handle_peer_channel_message(
             let sent = match bincode::serialize(&msg) {
                 Ok(data) => {
                     let serialized_len = data.len();
-                    conn.send(data).await.map(|()| serialized_len)
+                    conn.send_bytes(data).await.map(|()| serialized_len)
                 }
                 Err(error) => Err(TransportError::from(error)),
             };
@@ -3826,6 +3826,140 @@ pub(crate) mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::sync::mpsc;
     use tokio::time::{Duration, Instant, sleep, timeout};
+
+    /// A connection that records the bytes it is asked to send, and fails
+    /// every send when `fail` is set.
+    struct RecordingConnection {
+        sent: Arc<parking_lot::Mutex<Vec<Vec<u8>>>>,
+        fail: bool,
+    }
+
+    impl super::PeerConnectionApi for RecordingConnection {
+        fn remote_addr(&self) -> std::net::SocketAddr {
+            "192.0.2.1:4000".parse().unwrap()
+        }
+
+        fn remote_version(&self) -> Option<(u8, u8, u16)> {
+            None
+        }
+
+        fn send_bytes(
+            &mut self,
+            data: Vec<u8>,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<(), super::TransportError>> + Send + '_>,
+        > {
+            self.sent.lock().push(data);
+            let result = if self.fail {
+                Err(super::TransportError::ConnectionClosed(self.remote_addr()))
+            } else {
+                Ok(())
+            };
+            Box::pin(async move { result })
+        }
+
+        fn recv(
+            &mut self,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<Vec<u8>, super::TransportError>>
+                    + Send
+                    + '_,
+            >,
+        > {
+            Box::pin(std::future::pending())
+        }
+
+        fn set_inbound_stream_registry(
+            &mut self,
+            _registry: Arc<dyn crate::transport::InboundStreamRegistry>,
+        ) {
+        }
+
+        fn send_stream_data(
+            &mut self,
+            _stream_id: crate::transport::peer_connection::StreamId,
+            _data: bytes::Bytes,
+            _metadata: Option<bytes::Bytes>,
+            _completion_tx: Option<
+                tokio::sync::oneshot::Sender<crate::transport::StreamSendOutcome>,
+            >,
+            _progress: Option<Arc<dyn crate::transport::StreamProgressObserver>>,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<(), super::TransportError>> + Send + '_>,
+        > {
+            unreachable!("not used by these tests")
+        }
+
+        fn pipe_stream_data(
+            &mut self,
+            _outbound_stream_id: crate::transport::peer_connection::StreamId,
+            _inbound_handle: crate::transport::peer_connection::streaming::StreamHandle,
+            _metadata: Option<bytes::Bytes>,
+            _progress: Option<Arc<dyn crate::transport::StreamProgressObserver>>,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<(), super::TransportError>> + Send + '_>,
+        > {
+            unreachable!("not used by these tests")
+        }
+    }
+
+    fn hosting_announce() -> crate::message::NetMessage {
+        use crate::message::{NeighborHostingMessage, NetMessage, NetMessageV1};
+        NetMessage::V1(NetMessageV1::NeighborHosting {
+            message: NeighborHostingMessage::HostingAnnounce {
+                added: vec![freenet_stdlib::prelude::ContractInstanceId::new([1u8; 32])],
+                removed: vec![],
+                is_response: false,
+            },
+        })
+    }
+
+    /// The bridge serializes a message itself and hands the transport exactly
+    /// `bincode::serialize(&msg)`, once (the transport no longer serializes),
+    /// and attributes that many bytes to the outbound message mix.
+    #[tokio::test]
+    async fn bridge_sends_the_serialized_message_and_records_its_length() {
+        let sent = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let mut conn: Box<dyn super::PeerConnectionApi> = Box::new(RecordingConnection {
+            sent: sent.clone(),
+            fail: false,
+        });
+        let mix = crate::node::network_bridge::outbound_message_mix::OutboundMix::new();
+        let msg = hosting_announce();
+        let expected = bincode::serialize(&msg).unwrap();
+
+        super::handle_peer_channel_message(&mut conn, either::Left(msg), &mix)
+            .await
+            .expect("send succeeds");
+
+        assert_eq!(*sent.lock(), vec![expected.clone()]);
+        let rollup = mix.rollup_body_for_test();
+        assert_eq!(rollup["total_msgs"], 1);
+        assert_eq!(rollup["total_bytes"], expected.len() as u64);
+    }
+
+    /// A send the transport refuses is returned as an error and records
+    /// nothing in the outbound message mix.
+    #[tokio::test]
+    async fn bridge_records_nothing_for_a_failed_send() {
+        let sent = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let mut conn: Box<dyn super::PeerConnectionApi> = Box::new(RecordingConnection {
+            sent: sent.clone(),
+            fail: true,
+        });
+        let mix = crate::node::network_bridge::outbound_message_mix::OutboundMix::new();
+
+        let result =
+            super::handle_peer_channel_message(&mut conn, either::Left(hosting_announce()), &mix)
+                .await;
+
+        assert!(result.is_err(), "the transport's error is returned");
+        assert_eq!(sent.lock().len(), 1, "premise: the send was attempted");
+        let rollup = mix.rollup_body_for_test();
+        assert_eq!(rollup["total_msgs"], 0);
+        assert_eq!(rollup["total_bytes"], 0);
+    }
 
     /// Only this node's own CONNECT request as a joiner is ended at once
     /// when its target could not be connected (#5858); a relayed request and

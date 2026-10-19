@@ -3396,7 +3396,7 @@ impl<S: super::Socket> super::PeerConnectionApi for PeerConnection<S> {
         self.closed_by_stream_refusals
     }
 
-    fn send(
+    fn send_bytes(
         &mut self,
         data: Vec<u8>,
     ) -> std::pin::Pin<
