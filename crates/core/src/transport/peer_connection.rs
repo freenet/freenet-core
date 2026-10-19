@@ -2995,7 +2995,7 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
         data: bytes::Bytes,
         metadata: Option<bytes::Bytes>,
         completion_tx: Option<tokio::sync::oneshot::Sender<super::BroadcastDeliveryOutcome>>,
-        progress: Option<crate::operations::stream_progress::StreamProgressHandle>,
+        progress: Option<std::sync::Arc<dyn super::StreamProgressObserver>>,
     ) {
         let task = GlobalExecutor::spawn(
             outbound_stream::send_stream(
@@ -3028,7 +3028,7 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
         outbound_stream_id: StreamId,
         inbound_handle: streaming::StreamHandle,
         metadata: Option<bytes::Bytes>,
-        progress: Option<crate::operations::stream_progress::StreamProgressHandle>,
+        progress: Option<std::sync::Arc<dyn super::StreamProgressObserver>>,
     ) {
         let task = GlobalExecutor::spawn(
             outbound_stream::pipe_stream(
@@ -3423,7 +3423,7 @@ impl<S: super::Socket> super::PeerConnectionApi for PeerConnection<S> {
         data: bytes::Bytes,
         metadata: Option<bytes::Bytes>,
         completion_tx: Option<tokio::sync::oneshot::Sender<super::BroadcastDeliveryOutcome>>,
-        progress: Option<crate::operations::stream_progress::StreamProgressHandle>,
+        progress: Option<std::sync::Arc<dyn super::StreamProgressObserver>>,
     ) -> std::pin::Pin<
         Box<dyn futures::Future<Output = Result<(), super::TransportError>> + Send + '_>,
     > {
@@ -3439,7 +3439,7 @@ impl<S: super::Socket> super::PeerConnectionApi for PeerConnection<S> {
         outbound_stream_id: StreamId,
         inbound_handle: streaming::StreamHandle,
         metadata: Option<bytes::Bytes>,
-        progress: Option<crate::operations::stream_progress::StreamProgressHandle>,
+        progress: Option<std::sync::Arc<dyn super::StreamProgressObserver>>,
     ) -> std::pin::Pin<
         Box<dyn futures::Future<Output = Result<(), super::TransportError>> + Send + '_>,
     > {

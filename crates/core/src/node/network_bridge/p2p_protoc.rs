@@ -3387,6 +3387,9 @@ async fn handle_peer_channel_message(
                         has_metadata = metadata.is_some(),
                         "[CONN_LIFECYCLE] Sending operations stream data to peer"
                     );
+                    let progress = progress.map(|p| {
+                        Arc::new(p) as Arc<dyn crate::transport::StreamProgressObserver>
+                    });
                     if let Err(error) = conn
                         .send_stream_data(stream_id, data, metadata, completion_tx, progress)
                         .await

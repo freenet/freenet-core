@@ -2458,7 +2458,7 @@ mod tests {
             _completion_tx: Option<
                 tokio::sync::oneshot::Sender<crate::transport::BroadcastDeliveryOutcome>,
             >,
-            _progress: Option<crate::operations::stream_progress::StreamProgressHandle>,
+            _progress: Option<std::sync::Arc<dyn crate::transport::StreamProgressObserver>>,
         ) -> Pin<Box<dyn Future<Output = Result<(), TransportError>> + Send + '_>> {
             Box::pin(async { Ok(()) })
         }
@@ -2468,7 +2468,7 @@ mod tests {
             _outbound_stream_id: StreamId,
             _inbound_handle: crate::transport::peer_connection::streaming::StreamHandle,
             _metadata: Option<bytes::Bytes>,
-            _progress: Option<crate::operations::stream_progress::StreamProgressHandle>,
+            _progress: Option<std::sync::Arc<dyn crate::transport::StreamProgressObserver>>,
         ) -> Pin<Box<dyn Future<Output = Result<(), TransportError>> + Send + '_>> {
             Box::pin(async { Ok(()) })
         }

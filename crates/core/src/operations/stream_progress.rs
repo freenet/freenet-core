@@ -187,6 +187,12 @@ impl StreamProgressHandle {
     }
 }
 
+impl crate::transport::StreamProgressObserver for StreamProgressHandle {
+    fn on_fragment_sent(&self) {
+        self.record();
+    }
+}
+
 /// Streaming-attempt liveness bundle returned by
 /// [`crate::operations::op_ctx::RetryDriver::stream_progress`].
 ///

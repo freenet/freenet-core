@@ -171,7 +171,7 @@ pub(super) async fn send_stream<S: super::super::Socket, T: TimeSource>(
     time_source: T,
     metadata: Option<Bytes>,
     completion_tx: Option<oneshot::Sender<crate::transport::BroadcastDeliveryOutcome>>,
-    progress: Option<crate::operations::stream_progress::StreamProgressHandle>,
+    progress: Option<Arc<dyn crate::transport::StreamProgressObserver>>,
 ) -> Result<TransferStats, TransportError> {
     let start_time = time_source.now();
     let start_nanos = time_source.now_nanos();
@@ -483,11 +483,12 @@ pub(super) async fn send_stream<S: super::super::Socket, T: TimeSource>(
         next_fragment_number += 1;
         sent_so_far += 1;
         if let Some(p) = &progress {
-            // record() reads the handle's OWN clock (the originator's
-            // TimeSource), NOT this connection's time_source — the two have
-            // different epochs and mixing them defeats the inactivity timeout
-            // (#4001 single-epoch invariant; see stream_progress.rs).
-            p.record();
+            // No timestamp is passed: the observer reads its OWN clock (the
+            // originator's TimeSource), NOT this connection's time_source —
+            // the two have different epochs and mixing them defeats the
+            // inactivity timeout (#4001 single-epoch invariant; see
+            // StreamProgressObserver).
+            p.on_fragment_sent();
         }
     }
 
@@ -594,7 +595,7 @@ pub(super) async fn pipe_stream<S: super::super::Socket, T: TimeSource>(
     congestion_controller: Arc<CongestionController<T>>,
     time_source: T,
     metadata: Option<Bytes>,
-    progress: Option<crate::operations::stream_progress::StreamProgressHandle>,
+    progress: Option<Arc<dyn crate::transport::StreamProgressObserver>>,
 ) -> Result<TransferStats, TransportError> {
     let start_time = time_source.now();
     let start_nanos = time_source.now_nanos();
@@ -902,11 +903,12 @@ pub(super) async fn pipe_stream<S: super::super::Socket, T: TimeSource>(
         sent_so_far += packet_size as u64;
         fragment_number += 1;
         if let Some(p) = &progress {
-            // record() reads the handle's OWN clock (the originator's
-            // TimeSource), NOT this connection's time_source — the two have
-            // different epochs and mixing them defeats the inactivity timeout
-            // (#4001 single-epoch invariant; see stream_progress.rs).
-            p.record();
+            // No timestamp is passed: the observer reads its OWN clock (the
+            // originator's TimeSource), NOT this connection's time_source —
+            // the two have different epochs and mixing them defeats the
+            // inactivity timeout (#4001 single-epoch invariant; see
+            // StreamProgressObserver).
+            p.on_fragment_sent();
         }
     }
 

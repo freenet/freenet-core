@@ -51,6 +51,21 @@ pub(crate) enum BroadcastDeliveryOutcome {
     Dropped,
 }
 
+/// Observer of an outbound stream's progress, passed into
+/// [`PeerConnectionApi::send_stream_data`] and
+/// [`PeerConnectionApi::pipe_stream_data`].
+///
+/// The transport calls [`Self::on_fragment_sent`] each time it hands one
+/// fragment of the stream to the packet sender; the caller treats that as a
+/// liveness signal. The call carries no timestamp: an observer that measures
+/// time reads its OWN clock, so the transport's clock (with its own epoch)
+/// never mixes with the observer's (#4001 single-epoch invariant). It runs on
+/// the send path once per fragment, so it must not block.
+pub(crate) trait StreamProgressObserver: Send + Sync {
+    /// One more fragment of the stream was handed to the packet sender.
+    fn on_fragment_sent(&self);
+}
+
 /// Type-erased interface for peer connections.
 ///
 /// This trait provides the minimal interface needed by `peer_connection_listener`
@@ -130,7 +145,7 @@ pub(crate) trait PeerConnectionApi: Send {
         data: bytes::Bytes,
         metadata: Option<bytes::Bytes>,
         completion_tx: Option<tokio::sync::oneshot::Sender<BroadcastDeliveryOutcome>>,
-        progress: Option<crate::operations::stream_progress::StreamProgressHandle>,
+        progress: Option<std::sync::Arc<dyn StreamProgressObserver>>,
     ) -> std::pin::Pin<Box<dyn Future<Output = Result<(), TransportError>> + Send + '_>>;
 
     /// Pipes an inbound stream to the remote peer, forwarding fragments as they arrive.
@@ -146,6 +161,6 @@ pub(crate) trait PeerConnectionApi: Send {
         outbound_stream_id: crate::transport::peer_connection::StreamId,
         inbound_handle: crate::transport::peer_connection::streaming::StreamHandle,
         metadata: Option<bytes::Bytes>,
-        progress: Option<crate::operations::stream_progress::StreamProgressHandle>,
+        progress: Option<std::sync::Arc<dyn StreamProgressObserver>>,
     ) -> std::pin::Pin<Box<dyn Future<Output = Result<(), TransportError>> + Send + '_>>;
 }
