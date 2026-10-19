@@ -927,6 +927,8 @@ leftovers_in_group() {
   # leftovers_in_group <pgid>: echoes (and kills, by pid) whatever still runs in
   # the group, so a leak can never outlive the test that found it.
   local pgid="$1" pids
+  # Fail closed: without pgrep an empty answer would mean "could not look".
+  command -v pgrep >/dev/null 2>&1 || { echo "pgrep-missing"; return 0; }
   pids="$(pgrep -g "$pgid" || true)"
   if [ -n "$pids" ]; then
     # shellcheck disable=SC2086  # a pid list, split on purpose
