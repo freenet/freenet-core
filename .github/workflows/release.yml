@@ -201,12 +201,14 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v7
         with:
-          token: ${{ secrets.RELEASE_PAT || secrets.GITHUB_TOKEN }}
-          # In a dry run no credential is written to .git/config, so even a
-          # `git push` that slipped past every guard below cannot authenticate.
-          # The token is still used for the fetch itself, and the job still
-          # holds the workflow-level write token; the guards below are what
-          # keep it from being used.
+          # Live: RELEASE_PAT when set (coalescing to GITHUB_TOKEN), exactly as
+          # before, so the push below fires downstream workflows. Dry run: the
+          # workflow token, used for the fetch only, because no credential is
+          # persisted to .git/config, so even a `git push` that slipped past
+          # every guard below cannot authenticate. The job still holds the
+          # workflow-level write token; Rule Lint forbids handing any token
+          # to a step that runs in a dry run here.
+          token: ${{ (needs.validate.outputs.live == 'true' && secrets.RELEASE_PAT) || secrets.GITHUB_TOKEN }}
           persist-credentials: ${{ needs.validate.outputs.live == 'true' }}
 
       - name: Configure git
@@ -386,6 +388,7 @@ jobs:
           path: ${{ runner.temp }}/release-bump.bundle
           retention-days: 1
           if-no-files-found: error
+          overwrite: true  # a re-run of the same run id re-uploads it
 
   # Dry run only. Everything a live run checks before its first irreversible
   # step, run against the unpushed bump commit, with a read-only token: the
@@ -448,7 +451,7 @@ jobs:
           LAUNCH_SHA: ${{ github.sha }}
         run: |
           set -o pipefail
-          if ! PREV=$(gh release list --limit 50 --json tagName --jq '.[0].tagName // empty'); then
+          if ! PREV=$(gh release list --exclude-drafts --limit 50 --json tagName --jq '.[0].tagName // empty'); then
             echo "::error::Could not list releases, so the changelog preview is unavailable."
             exit 1
           fi
@@ -696,7 +699,7 @@ jobs:
     name: Release summary
     runs-on: ubuntu-latest
     timeout-minutes: 5
-    needs: [validate, update_versions, dry_run_rehearsal, create_release]
+    needs: [validate, dry_run_rehearsal, create_release]
     if: always()
 
     steps:

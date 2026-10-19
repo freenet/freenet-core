@@ -24,10 +24,16 @@ that structure the only one that passes:
      first mutating command, unless `RELEASE_LIVE` (wired from the same
      output) is `true`. So deleting an `if:` turns a dry run red instead of
      letting it mutate.
-  5. In a job a dry run can reach: `actions/checkout` does not persist a
-     credential (a stray `git push` cannot authenticate); RELEASE_PAT reaches
-     only live-gated steps (step env/with, job env, or `run:` text); and a
-     dry-run-ONLY job declares read-only `permissions:`.
+  5. Credentials, the rule that makes any gap in the mutation detector below
+     harmless. In a job a dry run can reach: `actions/checkout` persists no
+     credential (a stray `git push` cannot authenticate) and gets RELEASE_PAT
+     only through the live-gated expression `DRY_SAFE_CHECKOUT_TOKEN`; no
+     step a dry run executes receives RELEASE_PAT at all; and if the job's
+     token can write, no such step receives ANY token or secret (workflow
+     env, job env, step env/with, or `${{ }}` in `run:`; a presence test like
+     `secrets.X != ''` is allowed). A dry-run-ONLY job declares read-only
+     `permissions:`, and may then use its read-only token. A job that pushes
+     when live must persist its credential when live, or the push fails.
   6. Every `needs.J.*` reference names a job in `needs:`, every
      `needs.J.outputs.Y` names an output J declares, and every
      `steps.S.outputs.Y` names a step `id: S` in the same job whose script
@@ -51,15 +57,21 @@ invokes `scripts/` or `.github/scripts/` files is scanned through them. A
 `uses:` step is mutating unless its action is on a short read-only allowlist,
 and a job-level `uses:` (reusable workflow) always is.
 
-Escape hatch, for a call that is POST-shaped but writes nothing (GitHub's
-`releases/generate-notes` renders text and creates nothing): a shell comment
-line containing `dry-run-safe: <reason>` immediately above a SINGLE command
-(a line chaining several with `;`, `&&` or `||` is not exempted). It is
-visible in review, which is the point.
+Escape hatch, for the one call that is POST-shaped but writes nothing
+(GitHub's `releases/generate-notes` renders text and creates nothing): a shell
+comment line containing `dry-run-safe: <reason>` immediately above it. It
+covers a single `gh api .../releases/generate-notes` command and nothing
+chained or piped with it. It is visible in review, which is the point.
+
+A false positive (a read-only step reported as mutating) is fixed by making
+the step's source unambiguous, not by loosening a pattern; if that is
+impossible, extend `_exemptable` deliberately, in review.
 
 Scope: every workflow that declares a `workflow_dispatch` input named
-`dry_run`. A lint run over a directory where NO workflow is in scope fails:
-renaming or removing the input must not silently switch the check off.
+`dry_run`, and every such workflow must have the `validate`/`mode` structure
+above. Today that is `release.yml` only. A lint run over a directory where NO
+workflow is in scope fails: renaming or removing the input must not silently
+switch the check off.
 
 Usage:
     check_release_dry_run.py [WORKFLOW_DIR]       # lint (default .github/workflows)
@@ -101,9 +113,19 @@ LIVE_ENV_RE = re.compile(
 ASSERT_RE = re.compile(
     r'^\[ "\$\{RELEASE_LIVE:-\}" = "true" \] \|\| \{ echo "[^"]*"; exit 1; \}$'
 )
-# RELEASE_PAT used AS a value (bare or in the `||` coalesce), as opposed to a
-# presence test such as `secrets.RELEASE_PAT != ''`, which hands over nothing.
-PAT_VALUE_RE = re.compile(r"secrets\.RELEASE_PAT\s*(\|\||\}\})")
+# Rule 5's credential test. Expression contexts are case-insensitive, and
+# `secrets['X']`, `format(..., secrets.X)` and `toJSON(secrets)` all hand over
+# a value, so match the context rather than one spelling. A presence test such
+# as `${{ secrets.RELEASE_PAT != '' }}` hands over nothing and is allowed.
+SECRET_RE = re.compile(r"\bsecrets\b|\bgithub\s*\.\s*token\b|\bgithub\s*\[\s*['\"]token", re.I)
+PAT_RE = re.compile(r"\brelease_pat\b|tojson\s*\(\s*secrets", re.I)
+PRESENCE_RE = re.compile(r"^\$\{\{\s*secrets\.[\w]+\s*(!=|==)\s*''\s*\}\}$", re.I)
+# A checkout in a job a dry run reaches: RELEASE_PAT when live (so the live
+# push authenticates exactly as before), the workflow token otherwise, which
+# with `persist-credentials` off is used for the fetch only.
+DRY_SAFE_CHECKOUT_TOKEN = (
+    "${{ (needs.validate.outputs.live == 'true' && secrets.RELEASE_PAT) || secrets.GITHUB_TOKEN }}"
+)
 # Expression property names are case-insensitive, and index syntax is valid.
 DRY_RUN_INPUT_RE = re.compile(
     r"inputs\s*(\.\s*dry[_-]run\b|\[\s*['\"]dry[_-]run['\"]\s*\])", re.I
@@ -111,57 +133,68 @@ DRY_RUN_INPUT_RE = re.compile(
 EXEMPT_MARKER = "dry-run-safe:"
 BLOCK_SCALAR_RE = re.compile(r"^[|>][1-9]?[-+]?[1-9]?\s*(#.*)?$")
 
-# `actions/cache` is deliberately absent: a cache SAVE is a shared write that a
-# later live run restores.
+# Only actions that write nothing outside the run. Cache actions (including
+# `Swatinem/rust-cache` and `actions/setup-*` with `cache:`) are deliberately
+# absent: a cache SAVE is a shared write that a later live run restores.
 READ_ONLY_ACTIONS = (
     "actions/checkout",
     "actions/upload-artifact",
     "actions/download-artifact",
-    "actions/setup-",
     "dtolnay/rust-toolchain",
-    "Swatinem/rust-cache",
 )
+
+# `gh [global flags] <group> [flags] <verb>`: gh accepts flags such as
+# `--repo o/r` / `-R o/r` before the verb.
+_GH = r"\bgh\s+(?:-{1,2}[\w-]+(?:[ =]\S+)?\s+)*"
+_FLAGS = r"(?:-{1,2}[\w-]+(?:[ =]\S+)?\s+)*"
 
 MUTATING_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     ("git push", re.compile(r"\bgit\b(\s+-\S+(\s+\S+)?)*\s+push\b")),
     (
         "gh pr write",
         re.compile(
-            r"\bgh\s+pr\s+(create|merge|edit|close|reopen|comment|review|ready|lock|unlock)\b"
+            _GH + r"pr\s+" + _FLAGS
+            + r"(create|merge|edit|close|reopen|comment|review|ready|lock|unlock|update-branch|revert)\b"
         ),
     ),
     (
         "gh release write",
-        re.compile(r"\bgh\s+release\s+(create|edit|upload|delete|delete-asset)\b"),
+        re.compile(_GH + r"release\s+" + _FLAGS + r"(create|edit|upload|delete|delete-asset)\b"),
     ),
-    ("gh workflow write", re.compile(r"\bgh\s+workflow\s+(run|enable|disable)\b")),
-    ("gh run write", re.compile(r"\bgh\s+run\s+(rerun|cancel|delete)\b")),
+    ("gh workflow write", re.compile(_GH + r"workflow\s+" + _FLAGS + r"(run|enable|disable)\b")),
+    ("gh run write", re.compile(_GH + r"run\s+" + _FLAGS + r"(rerun|cancel|delete)\b")),
     (
-        "gh issue/label/secret/variable/repo/cache write",
+        "gh issue/label/secret/variable/repo/cache/project write",
         re.compile(
-            r"\bgh\s+(issue\s+(create|edit|comment|close|reopen|delete|transfer|pin|unpin|lock|unlock)"
-            r"|label\s+(create|edit|delete|clone)|secret\s+(set|delete)|variable\s+(set|delete)"
-            r"|repo\s+(create|edit|delete|rename|archive|fork|sync)|cache\s+delete)\b"
+            _GH + r"(issue\s+" + _FLAGS + r"(create|edit|comment|close|reopen|delete|transfer|pin|unpin|lock|unlock|develop)"
+            r"|label\s+" + _FLAGS + r"(create|edit|delete|clone)|secret\s+" + _FLAGS + r"(set|delete)"
+            r"|variable\s+" + _FLAGS + r"(set|delete)"
+            r"|repo\s+" + _FLAGS + r"(create|edit|delete|rename|archive|fork|sync)|cache\s+" + _FLAGS + r"delete"
+            r"|project\s)\b"
         ),
     ),
-    ("cargo yank/owner", re.compile(r"\bcargo\s+(yank|owner)\b")),
+    ("cargo yank/owner", re.compile(r"\bcargo(\s+[-+]\S+)*\s+(yank|owner)\b")),
     ("container push", re.compile(r"\b(docker|podman)\s+(image\s+)?push\b")),
     ("npm publish", re.compile(r"\bnpm\s+publish\b")),
     (
         "curl write",
         re.compile(
-            r"\bcurl\b.*(\s(-X|--request)[\s=]*['\"]?(POST|PUT|PATCH|DELETE)"
-            r"|\s(-d|--data(-[a-z]+)?|--json|-F|--form|-T|--upload-file)(\s|=))"
+            r"\bcurl\b.*(\s-[A-Za-z]*X\s*['\"]?(POST|PUT|PATCH|DELETE)|\s--request[\s=]*['\"]?(POST|PUT|PATCH|DELETE)"
+            r"|\s(-d|--data(-[a-z]+)?|--json|-F|--form|-T|--upload-file)(\s|=|@)|\s-d\S)"
         ),
     ),
     ("python HTTP write", re.compile(r"\brequests\.(post|put|patch|delete)\s*\(")),
     ("python git push", re.compile(r"""["']git["']\s*,\s*(["'][^"']*["']\s*,\s*)*["']push["']""")),
+    ("python gh call", re.compile(r"""["']gh["']\s*,\s*["'](pr|release|workflow|run|api|issue|repo)["']""")),
+    ("piped into a shell", re.compile(r"\|\s*(sudo\s+)?(ba|z|da)?sh\b|\|\s*xargs\b")),
 ]
 
 SCRIPT_REF_RE = re.compile(
     r"""(?:^|[\s"'=(;&|])(?:\./|\$\{?GITHUB_WORKSPACE\}?/)?((?:\.github/)?scripts/[\w./-]+\.(?:sh|py))\b"""
 )
 CHAIN_RE = re.compile(r";|&&|\|\|")
+SEGMENT_RE = re.compile(r";|&&|\|\||\|")
+SHELLISH = ("sh", "bash", "eval", "xargs", "source", ".")
 
 
 # --- a deliberately small YAML reader --------------------------------------
@@ -462,9 +495,32 @@ def _drop_literals(text: str) -> str:
     return "".join(out)
 
 
+def _strip_trailing_comment(text: str) -> str:
+    """Drop a ` # comment` outside quotes (`${x#v}` has no space before `#`)."""
+    quote = None
+    for i, c in enumerate(text):
+        if quote:
+            if c == quote:
+                quote = None
+        elif c in "'\"":
+            quote = c
+        elif c == "#" and i > 0 and text[i - 1] in " \t":
+            return text[:i].rstrip()
+    return text
+
+
 def _scan_text(text: str) -> str:
+    """The text mutation patterns run over.
+
+    Raw, quotes included, so `bash -c '...'` and `eval "..."` are seen. The one
+    exception is a line that is a SINGLE `echo`/`printf` command: its quoted
+    text is a message. Anything chained or piped after it is scanned raw.
+    """
+    text = _strip_trailing_comment(text)
     first = text.split(None, 1)[0] if text.split() else ""
-    return _drop_literals(text) if first in ("echo", "printf") else text
+    if first in ("echo", "printf") and not SEGMENT_RE.search(_drop_literals(text)):
+        return _drop_literals(text)
+    return text
 
 
 def logical_lines(script: str) -> list[tuple[int, str, bool]]:
@@ -472,8 +528,15 @@ def logical_lines(script: str) -> list[tuple[int, str, bool]]:
     out: list[tuple[int, str, bool]] = []
     buf: list[str] = []
     exempt = False
+    heredoc_end: Optional[str] = None
     for idx, raw in enumerate(script.split("\n")):
         s = raw.strip()
+        if heredoc_end is not None:
+            # The body of a `cat <<TAG` heredoc is data, not commands. (A
+            # heredoc fed to a shell is not skipped: `bash <<TAG` executes it.)
+            if s == heredoc_end:
+                heredoc_end = None
+            continue
         if not buf:
             if s.startswith("#"):
                 if EXEMPT_MARKER in s:
@@ -485,7 +548,11 @@ def logical_lines(script: str) -> list[tuple[int, str, bool]]:
         buf.append(s)
         if s.endswith("\\"):
             continue
-        out.append((idx, " ".join(p.rstrip("\\").strip() for p in buf), exempt))
+        joined = " ".join(p.rstrip("\\").strip() for p in buf)
+        out.append((idx, joined, exempt))
+        m = re.match(r"^cat\b[^<]*<<-?\s*['\"]?(\w+)['\"]?\s*$", joined)
+        if m:
+            heredoc_end = m.group(1)
         buf, exempt = [], False
     if buf:
         out.append((len(script.split("\n")), " ".join(buf), exempt))
@@ -497,28 +564,51 @@ def _gh_api_mutates(segment: str) -> bool:
     if not m:
         return False
     args = m.group(1)
-    method = re.search(r"(?:-X|--method)[\s=]+['\"]?([A-Za-z]+)", args)
+    method = re.search(r"(?:-X|--method)[\s=]*['\"]?([A-Za-z]+)", args)
     if method:
         return method.group(1).upper() != "GET"
     if re.search(r"(?:^|\s)graphql\b", args):
-        # A query read from a file cannot be inspected here.
-        return "mutation" in args or re.search(r"query=@", args) is not None
+        # A query read from a file or a variable cannot be inspected here.
+        return "mutation" in args or re.search(r"query=['\"]?[@$]", args) is not None
     return re.search(r"(?:^|\s)(?:-f|-F|--field|--raw-field|--input)(?:\s|=)", args) is not None
 
 
 def line_mutation(text: str) -> Optional[str]:
     code = _scan_text(text)
-    for label, pat in MUTATING_PATTERNS:
-        if pat.search(code):
-            return label
-    # Per chained command, so `cargo publish --dry-run && cargo publish` and
+    if _match_patterns(code, ("piped into a shell",)):
+        return "piped into a shell"
+    # Per command, so `curl URL | grep -d` is not a curl write, while
+    # `cargo publish --dry-run && cargo publish` and
     # `gh api -X GET a; gh api -X DELETE b` are both seen.
-    for segment in CHAIN_RE.split(code):
-        if re.search(r"\bcargo\s+publish\b", segment) and "--dry-run" not in segment:
+    for segment in SEGMENT_RE.split(code):
+        label = _match_patterns(segment)
+        if label:
+            return label
+        if re.search(r"\bcargo(\s+[-+]\S+)*\s+publish\b", segment) and "--dry-run" not in segment:
             return "cargo publish"
         if _gh_api_mutates(segment):
             return "gh api write"
     return None
+
+
+def _match_patterns(text: str, only: tuple[str, ...] = ()) -> Optional[str]:
+    for label, pat in MUTATING_PATTERNS:
+        if only and label not in only:
+            continue
+        if pat.search(text):
+            return label
+    return None
+
+
+def _exemptable(text: str) -> bool:
+    """`dry-run-safe:` covers exactly one `gh api .../releases/generate-notes`
+    call and nothing else: it is the one POST-shaped call that writes nothing."""
+    code = _drop_literals(_strip_trailing_comment(text))
+    return (
+        len(re.findall(r"\bgh\s+api\b", text)) == 1
+        and "/releases/generate-notes" in text
+        and not SEGMENT_RE.search(code)
+    )
 
 
 def script_mutations(
@@ -528,13 +618,14 @@ def script_mutations(
     seen = set() if seen is None else seen
     found: list[tuple[int, str]] = []
     for idx, text, exempt in logical_lines(script):
-        if exempt and not CHAIN_RE.search(_drop_literals(text)):
+        if exempt and _exemptable(text):
             continue
         reason = line_mutation(text)
         if reason:
             found.append((idx, f"{reason}: {text[:100]}"))
             continue
-        for ref in SCRIPT_REF_RE.findall(text):
+        # Follow only scripts the line RUNS, not ones a message mentions.
+        for ref in SCRIPT_REF_RE.findall(_scan_text(text)):
             if ref in seen:
                 continue
             seen.add(ref)
@@ -575,6 +666,28 @@ def _with_scripts(run: str, repo_root: Path) -> str:
     return "\n".join(parts)
 
 
+def _credential_keys(values: dict[str, str], read_only: bool) -> list[str]:
+    """Keys whose values hand a dry-run step a credential.
+
+    RELEASE_PAT never; any token or secret when the job's token can write.
+    """
+    return [k for k, v in values.items() if _hands_credential(v, read_only)]
+
+
+def _hands_credential(text: str, read_only: bool) -> bool:
+    """Does any `${{ }}` expression in `text` inject a credential?
+
+    Only expressions inject values; a message that merely names RELEASE_PAT
+    does not. A presence test (`secrets.X != ''`) is allowed.
+    """
+    for expr in re.findall(r"\$\{\{(.*?)\}\}", text, re.S):
+        if PRESENCE_RE.match("${{" + expr + "}}"):
+            continue
+        if PAT_RE.search(expr) or (not read_only and SECRET_RE.search(expr)):
+            return True
+    return False
+
+
 def _references(job: Job) -> list[tuple[int, str]]:
     """(line, text) of the job's non-comment lines."""
     return [
@@ -590,6 +703,8 @@ def check_source(text: str, name: str, repo_root: Path) -> list[str]:
     jobs, lines = parse_workflow(text)
     errors: list[str] = []
     by_name = {j.name: j for j in jobs}
+    env_at = next((i for i, l in enumerate(lines) if re.match(r"^env:\s*(#.*)?$", l)), None)
+    workflow_env = _parse_map(lines, env_at, 2) if env_at is not None else {}
 
     def err(line: int, msg: str) -> None:
         errors.append(f"{name}:{line}: {msg}")
@@ -627,6 +742,10 @@ def check_source(text: str, name: str, repo_root: Path) -> list[str]:
             err(n, f"`inputs.dry_run` is read outside the mode step. Gate on `{GUARD}` instead; a second reader is how #5936's guards drifted apart.")
 
     for job in jobs:
+        for where_line, expr in [(job.line, job.keys.get("if", ""))] + [(st.line, st.keys.get("if", "")) for st in job.steps]:
+            if re.search(r"(==|!=)\s*(true|false)\b|\b(true|false)\s*(==|!=)", _unwrap(expr)):
+                err(where_line, f"`if: {expr}` compares with an unquoted boolean. Outputs are strings, and in Actions `'true' == true` is false; compare with `'true'`.")
+
         # Rule 7: nothing in a steps block goes unexamined.
         for ln in job.unparsed:
             err(ln, f"job `{job.name}`: cannot place this line in a step (steps must be `      - ` items); an unexamined step is not a passing one.")
@@ -640,10 +759,20 @@ def check_source(text: str, name: str, repo_root: Path) -> list[str]:
                     err(ln, f"job `{job.name}` reads `needs.{dep}.outputs.{out}`, which `{dep}` does not declare.")
             for sid, out in re.findall(r"\bsteps\.([\w-]+)\.outputs\.([\w-]+)\b", l):
                 src = next((s for s in job.steps if s.keys.get("id") == sid), None)
+                reader = next((st for st in reversed(job.steps) if st.line <= ln), None)
                 if src is None:
                     err(ln, f"job `{job.name}` reads `steps.{sid}.outputs.{out}` but has no step `id: {sid}`.")
+                elif reader is not None and job.steps.index(src) >= job.steps.index(reader):
+                    err(ln, f"job `{job.name}`, step `{reader.label}` reads `steps.{sid}.outputs.{out}` before step `{sid}` has run.")
                 elif src.run is not None and not re.search(rf"\b{re.escape(out)}=", _with_scripts(src.run, repo_root)):
                     err(ln, f"job `{job.name}` reads `steps.{sid}.outputs.{out}` but step `{sid}` never writes `{out}=`.")
+
+        pushes = any(
+            any(r.startswith("git push") for _, r in step_mutations(st, repo_root)) for st in job.steps
+        )
+        for st in job.steps:
+            if pushes and st.keys.get("uses", "").startswith("actions/checkout") and st.with_.get("persist-credentials") == "false":
+                err(st.line, f"job `{job.name}` pushes when live, but its checkout never persists a credential, so the live push cannot authenticate. Use `${{{{ {GUARD} }}}}`.")
 
         job_guarded = is_guarded(job, None)
         if "uses" in job.keys and not job_guarded:
@@ -655,10 +784,14 @@ def check_source(text: str, name: str, repo_root: Path) -> list[str]:
             if not perms or any(v not in ("read", "none", "read-all") for v in perms.values()):
                 err(job.line, f"job `{job.name}` runs only in a dry run, so it must declare read-only `permissions:` (got {perms or 'the workflow default'}).")
 
+        read_only = bool(job.permissions) and all(
+            v in ("read", "none", "read-all") for v in job.permissions.values()
+        )
         if not job_guarded:
-            pat_env = [k for k, v in job.env.items() if PAT_VALUE_RE.search(v)]
-            if pat_env:
-                err(job.line, f"job `{job.name}` runs in a dry run and puts RELEASE_PAT in its job-level env ({', '.join(pat_env)}).")
+            for scope, env in (("workflow-level", workflow_env), ("job-level", job.env)):
+                bad = _credential_keys(env, read_only)
+                if bad:
+                    err(job.line, f"job `{job.name}` runs in a dry run and receives a credential through its {scope} env ({', '.join(bad)}).")
 
         for step in job.steps:
             where = f"job `{job.name}`, step `{step.label}`"
@@ -683,11 +816,15 @@ def check_source(text: str, name: str, repo_root: Path) -> list[str]:
                 persist = step.with_.get("persist-credentials", "")
                 if persist != "false" and _unwrap(persist) != _guard_for(job.name):
                     err(step.line, f"job `{job.name}` runs in a dry run, so its checkout must set `persist-credentials: false` (or `${{{{ {GUARD} }}}}`); otherwise a stray `git push` can authenticate.")
-            pat = [k for k, v in {**step.env, **step.with_}.items() if PAT_VALUE_RE.search(v) and k != "token"]
-            if step.run and "secrets.RELEASE_PAT" in step.run:
-                pat.append("run:")
-            if pat:
-                err(step.line, f"{where} hands RELEASE_PAT to a step a dry run executes ({', '.join(pat)}). Gate it on `{_guard_for(job.name)}`.")
+                token = step.with_.get("token", "")
+                if token and SECRET_RE.search(token) and _unwrap(token) != _unwrap(DRY_SAFE_CHECKOUT_TOKEN):
+                    err(step.line, f"job `{job.name}` runs in a dry run, so its checkout token must be absent or exactly `{DRY_SAFE_CHECKOUT_TOKEN}` (RELEASE_PAT only when live).")
+            values = {k: v for k, v in {**step.env, **step.with_}.items() if not (uses.startswith("actions/checkout") and k == "token")}
+            bad = _credential_keys(values, read_only)
+            if step.run and _hands_credential(step.run, read_only):
+                bad.append("run:")
+            if bad:
+                err(step.line, f"{where} runs in a dry run and receives a credential ({', '.join(bad)}). In a job with write permissions a dry-run step gets no token at all, and RELEASE_PAT never; gate it on `{_guard_for(job.name)}`.")
     return errors
 
 
@@ -704,17 +841,27 @@ def check_dir(root: Path, repo_root: Path) -> list[str]:
     return errors
 
 
+def tokenize(text: str) -> str:
+    """Replace each `${{ expr }}` with `@@expr@@`, so a test can see WHICH
+    value feeds a command (a swapped output is otherwise invisible)."""
+    return re.sub(r"\$\{\{\s*(.*?)\s*\}\}", lambda m: "@@" + " ".join(m.group(1).split()) + "@@", text)
+
+
+def find_step(text: str, job_name: str, step_name: str) -> tuple[Job, Step]:
+    jobs, _ = parse_workflow(text)
+    job = next(j for j in jobs if j.name == job_name)
+    return job, next(st for st in job.steps if st.label == step_name)
+
+
 def mutating_runs(text: str, repo_root: Path) -> list[tuple[str, str, dict[str, str]]]:
     jobs, _ = parse_workflow(text)
     out = []
     for job in jobs:
         for step in job.steps:
             if step.run is not None and step_mutations(step, repo_root):
-                script = re.sub(r"\$\{\{.*?\}\}", "PLACEHOLDER", step.run)
+                script = tokenize(step.run)
                 env = {
-                    k: re.sub(r"\$\{\{.*?\}\}", "PLACEHOLDER", v)
-                    for k, v in {**job.env, **step.env}.items()
-                    if k != "RELEASE_LIVE"
+                    k: tokenize(v) for k, v in {**job.env, **step.env}.items() if k != "RELEASE_LIVE"
                 }
                 out.append((f"{job.name} / {step.label}", script, env))
     return out
@@ -785,9 +932,30 @@ class _Expr:
         if self.peek() in ("==", "!="):
             op = self.take()
             r = self.atom()
-            eq = str(v).lower() == str(r).lower()
+            eq = self.equal(v, r)
             return eq if op == "==" else not eq
         return v
+
+    @staticmethod
+    def _num(v) -> float:
+        if isinstance(v, bool):
+            return 1.0 if v else 0.0
+        if v is None or v == "":
+            return 0.0
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return float("nan")
+
+    @classmethod
+    def equal(cls, a, b) -> bool:
+        """GitHub Actions `==`: strings compare case-insensitively; mismatched
+        types are coerced to numbers, so `'true' == true` is FALSE (NaN vs 1)."""
+        if isinstance(a, str) and isinstance(b, str):
+            return a.lower() == b.lower()
+        if type(a) is type(b):
+            return a == b
+        return cls._num(a) == cls._num(b)
 
     def atom(self):
         t = self.take()
@@ -803,13 +971,20 @@ class _Expr:
 
     @staticmethod
     def truthy(v) -> bool:
-        return bool(v) and v != "false" if isinstance(v, str) else bool(v)
+        # As in Actions: false, 0, "" and null are falsy; the STRING 'false'
+        # is truthy.
+        if isinstance(v, str):
+            return v != ""
+        if isinstance(v, float) and v != v:
+            return False
+        return bool(v)
 
 
 STATUS_FUNCS = ("always()", "success()", "failure()", "cancelled()")
 
 
-def simulate(text: str, mode: str) -> list[str]:
+def simulate(text: str, mode: str, fail: Optional[str] = None) -> list[str]:
+    """What runs in `mode`; with `fail`, that job fails if it runs."""
     jobs, _ = parse_workflow(text)
     live = "true" if mode == "live" else "false"
     result: dict[str, str] = {}
@@ -829,7 +1004,9 @@ def simulate(text: str, mode: str) -> list[str]:
                     return True
                 if path == "success()":
                     return deps_ok
-                if path in ("failure()", "cancelled()"):
+                if path == "failure()":
+                    return any(result.get(d) == "failure" for d in job.needs)
+                if path == "cancelled()":
                     return False
                 m = re.match(r"needs\.([\w-]+)\.(result|outputs\.([\w-]+))$", path)
                 if m:
@@ -854,7 +1031,7 @@ def simulate(text: str, mode: str) -> list[str]:
                 return _Expr.truthy(v) and (deps_ok or not implicit)
 
             if runs(job.keys.get("if", "")):
-                result[job.name] = "success"
+                result[job.name] = "failure" if job.name == fail else "success"
                 ran.append(job.name)
                 for step in job.steps:
                     if runs(step.keys.get("if", ""), deps_ok=True):
@@ -899,7 +1076,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          token: ${{ secrets.RELEASE_PAT || secrets.GITHUB_TOKEN }}
+          token: ${{ (needs.validate.outputs.live == 'true' && secrets.RELEASE_PAT) || secrets.GITHUB_TOKEN }}
           persist-credentials: ${{ needs.validate.outputs.live == 'true' }}
       - name: Commit locally
         run: git commit -am bump
@@ -933,6 +1110,10 @@ jobs:
           persist-credentials: false
       - name: Package
         run: cargo publish -p freenet --dry-run
+      - name: Read releases
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release list
   tag:
     runs-on: ubuntu-latest
     needs: [validate, bump]
@@ -1048,6 +1229,73 @@ def self_test() -> int:
         run("eval \"...\" is seen", body('run: eval "git push origin HEAD"'), "git push")
         run("a command held in a variable is seen", body('run: CMD="gh pr merge 1 --auto"; $CMD'), "gh pr write")
         run("a YAML-quoted single-line run is seen", body('run: "gh pr merge 1 --auto"'), "gh pr write")
+        # Round-2 review: shapes that slipped past the first rewrite.
+        run("gh flags before the verb", body("run: gh pr --repo o/r merge 1 --auto"), "gh pr write")
+        run("gh -R before the verb", body("run: gh pr -R o/r merge 1"), "gh pr write")
+        run("gh pr update-branch is a write", body("run: gh pr update-branch 1"), "gh pr write")
+        run("gh api with an attached method", body("run: gh api -XPUT repos/o/r/pulls/1/merge"), "gh api write")
+        run("a GraphQL query from a variable is uninspectable", body('run: gh api graphql -f query="$Q"'), "gh api write")
+        run("cargo with a toolchain before publish", body("run: cargo +1.93.0 publish -p freenet"), "cargo publish")
+        run("curl -d@file is a write", body("run: curl -d@body.json https://x"), "curl write")
+        run("python calling gh", body("run: python3 -c \"import subprocess; subprocess.run(['gh', 'pr', 'merge'])\""), "python gh call")
+        run("echo piped into a shell", body('run: echo "gh pr merge 1 --auto" | bash'), "piped into a shell")
+        run("printf piped into a shell", body("run: printf 'git push\\n' | sh"), "piped into a shell")
+        run("a command chained after an echo is scanned raw", body("run: echo hi; bash -c 'git push origin x'"), "git push")
+        run("a script a message mentions is not followed", body('run: echo "for a local rehearsal use scripts/sneaky.sh"'), None)
+        run("a script a trailing comment mentions is not followed", body("run: true  # mirrors scripts/sneaky.sh"), None)
+        run("curl piped into grep is a read", body('run: curl -sS https://x | grep -d skip foo'), None)
+        run("a cat heredoc body is data",
+            body("run: |\n          cat > f <<'EOF'\n          then gh pr merge it\n          EOF\n          true"), None)
+        run("the marker covers only a gh api call",
+            _GOOD.replace("          gh api repos/:owner/:repo/releases/generate-notes \\\n            -f tag_name=v1\n", "          git push origin HEAD\n").replace(
+                "    if: always() && needs.validate.outputs.live == 'true'\n", "    if: always()\n"),
+            "git push")
+        run("the marker does not cover a pipe",
+            _GOOD.replace("-f tag_name=v1\n", "-f tag_name=v1 | xargs gh pr merge\n").replace(
+                "    if: always() && needs.validate.outputs.live == 'true'\n", "    if: always()\n"),
+            "piped into a shell")
+        run("Swatinem/rust-cache saves a shared cache", body("uses: Swatinem/rust-cache@v2"), "read-only action allowlist")
+        # One positive case per mutating pattern, so deleting any one of them
+        # fails this self-test.
+        for label, cmd in [
+            ("gh workflow write", "gh workflow run x.yml"),
+            ("gh run write", "gh run rerun 1 --failed"),
+            ("gh issue/label/secret/variable/repo/cache/project write", "gh issue create -t x"),
+            ("gh issue/label/secret/variable/repo/cache/project write", "gh label create x"),
+            ("gh issue/label/secret/variable/repo/cache/project write", "gh secret set X"),
+            ("gh issue/label/secret/variable/repo/cache/project write", "gh variable set X"),
+            ("gh issue/label/secret/variable/repo/cache/project write", "gh repo edit --visibility public"),
+            ("gh issue/label/secret/variable/repo/cache/project write", "gh cache delete --all"),
+            ("gh release write", "gh release upload v1 f"),
+            ("cargo yank/owner", "cargo yank --version 1.0.0"),
+            ("container push", "docker push img"),
+            ("container push", "podman push img"),
+            ("npm publish", "npm publish"),
+        ]:
+            run(f"positive case: {cmd}", body(f"run: {cmd}"), label)
+
+        # Structural rules, one case each.
+        run("a workflow without the mode job", _GOOD.replace("  validate:\n", "  check:\n", 1), "no `validate` job")
+        run("the mode step must read the input",
+            _GOOD.replace("DRY_RUN_INPUT: ${{ inputs.dry_run }}", "DRY_RUN_INPUT: 'false'"), "DRY_RUN_INPUT")
+        run("the mode step must come first",
+            _GOOD.replace("      - name: Resolve run mode\n", "      - name: a\n        run: true\n      - name: b\n        run: true\n      - name: Resolve run mode\n"),
+            "first two steps")
+        run("a reusable workflow in a dry-run job",
+            _GOOD.replace("  rehearse:\n", "  reuse:\n    needs: validate\n    uses: ./.github/workflows/x.yml\n  rehearse:\n"), "reusable workflow")
+        run("an unquoted boolean comparison",
+            _GOOD.replace("if: needs.validate.outputs.live != 'true'", "if: needs.validate.outputs.live != true"), "unquoted boolean")
+        run("a step output read before it is written",
+            _GOOD.replace('          gh pr create \\\n            --title x --body y\n          echo "pr=1" >> "$GITHUB_OUTPUT"\n',
+                          '          gh pr create --title ${{ steps.open.outputs.pr }}\n          echo "pr=1" >> "$GITHUB_OUTPUT"\n'),
+            "before step `open` has run")
+        run("a live push with no credential to push with",
+            _GOOD.replace("          persist-credentials: ${{ needs.validate.outputs.live == 'true' }}\n", "          persist-credentials: false\n"),
+            "cannot authenticate")
+        run("the marker covers only generate-notes",
+            _GOOD.replace("releases/generate-notes", "pulls/1/merge").replace(
+                "    if: always() && needs.validate.outputs.live == 'true'\n", "    if: always()\n"),
+            "gh api write")
         run("an unknown action is a mutation", body("uses: softprops/action-gh-release@v2"), "read-only action allowlist")
         run("actions/cache is not read-only", body("uses: actions/cache@v4"), "read-only action allowlist")
         run("cargo publish --dry-run is not a mutation", body("run: cargo publish -p freenet --dry-run"), None)
@@ -1061,14 +1309,25 @@ def self_test() -> int:
         # Rule 5.
         run("a persisted credential in a dry-run job is flagged",
             _GOOD.replace("          persist-credentials: ${{ needs.validate.outputs.live == 'true' }}\n", ""), "persist-credentials")
-        run("RELEASE_PAT on an unguarded step is flagged",
-            _GOOD.replace("      - name: Commit locally\n        run:", "      - name: Commit locally\n        env:\n          GH_TOKEN: ${{ secrets.RELEASE_PAT }}\n        run:"),
-            "hands RELEASE_PAT")
+        with_env = lambda v: _GOOD.replace("      - name: Commit locally\n        run:", "      - name: Commit locally\n        env:\n          GH_TOKEN: " + v + "\n        run:")
+        run("RELEASE_PAT on an unguarded step is flagged", with_env("${{ secrets.RELEASE_PAT }}"), "receives a credential")
+        run("the workflow token on an unguarded step of a write job is flagged", with_env("${{ github.token }}"), "receives a credential")
+        run("secrets.GITHUB_TOKEN likewise", with_env("${{ secrets.GITHUB_TOKEN }}"), "receives a credential")
+        run("a lower-case secret name is still a secret", with_env("${{ secrets.release_pat }}"), "receives a credential")
+        run("index syntax is still a secret", with_env("${{ secrets['RELEASE_PAT'] }}"), "receives a credential")
+        run("toJSON(secrets) is every secret", with_env("${{ toJSON(secrets) }}"), "receives a credential")
+        run("a presence test hands over nothing", with_env("${{ secrets.RELEASE_PAT != '' }}"), None)
+        run("a message naming RELEASE_PAT hands over nothing", body('run: echo "RELEASE_PAT not set"'), None)
         run("RELEASE_PAT inline in an unguarded run is flagged",
-            body("run: echo ${{ secrets.RELEASE_PAT }} > /tmp/t"), "hands RELEASE_PAT")
-        run("RELEASE_PAT in a dry-run job's env is flagged",
+            body("run: echo ${{ secrets.RELEASE_PAT }} > /tmp/t"), "receives a credential")
+        run("RELEASE_PAT in a dry-run job's env is flagged even when read-only",
             _GOOD.replace("    permissions:\n      contents: read\n", "    permissions:\n      contents: read\n    env:\n      GH_TOKEN: ${{ secrets.RELEASE_PAT || secrets.GITHUB_TOKEN }}\n"),
             "job-level env")
+        run("a workflow-level secret reaches every dry-run job",
+            _GOOD.replace("jobs:\n", "env:\n  GH_TOKEN: ${{ secrets.RELEASE_PAT }}\njobs:\n", 1), "workflow-level env")
+        run("a dry-run checkout may not carry RELEASE_PAT",
+            _GOOD.replace("token: ${{ (needs.validate.outputs.live == 'true' && secrets.RELEASE_PAT) || secrets.GITHUB_TOKEN }}",
+                          "token: ${{ secrets.RELEASE_PAT || secrets.GITHUB_TOKEN }}"), "checkout token")
         run("a dry-run-only job must stay read-only",
             _GOOD.replace("      contents: read\n", "      contents: write\n"), "read-only `permissions:`")
         run("a dry-run-only job must declare permissions",
@@ -1118,6 +1377,22 @@ def self_test() -> int:
         if "bump / Push" not in live or "bump / Push" in dry:
             failures.append("simulate: the push step must run live only")
 
+        # Evaluator semantics that differ from naive Python.
+        ev = lambda e: _Expr.truthy(_Expr(e, lambda p: "true").parse())
+        if ev("'true' == true"):
+            failures.append("evaluator: 'true' == true must be false, as in Actions")
+        if not ev("'false'"):
+            failures.append("evaluator: the string 'false' must be truthy, as in Actions")
+        # A failed `validate` leaves `live` empty, so even the `always()` tag
+        # job is skipped: the guard fails closed.
+        after = [j for j in simulate(_GOOD, "live", fail="validate") if "/" not in j]
+        if after != ["validate"]:
+            failures.append(f"simulate: a failed validate must stop every other job (got {after})")
+        # ...while a failed bump does NOT stop `tag`, whose `if:` has always():
+        # the simulator must model that, or it would vouch for gates it cannot see.
+        if "tag" not in simulate(_GOOD, "live", fail="bump"):
+            failures.append("simulate: always() must run after a failed dependency")
+
     if failures:
         for f in failures:
             print(f"SELF-TEST FAIL: {f}", file=sys.stderr)
@@ -1138,9 +1413,19 @@ def main(argv: list[str]) -> int:
             (out / f"{n:02d}.name").write_text(label + "\n")
             (out / f"{n:02d}.env").write_text("".join(f"{k}={v}\n" for k, v in env.items()))
         return 0
-    if argv[1:2] == ["--simulate"] and len(argv) == 4 and argv[3] in ("live", "dry"):
-        for line in simulate(Path(argv[2]).read_text(), argv[3]):
+    if argv[1:2] == ["--simulate"] and len(argv) in (4, 6) and argv[3] in ("live", "dry"):
+        fail = argv[5] if len(argv) == 6 and argv[4] == "--fail" else None
+        for line in simulate(Path(argv[2]).read_text(), argv[3], fail):
             print(line)
+        return 0
+    if argv[1:2] == ["--dump-step"] and len(argv) == 5:
+        # The step's script, then its job+step env as KEY=value lines, both
+        # tokenized; separated by a line `@@ENV@@`.
+        job, step = find_step(Path(argv[2]).read_text(), argv[3], argv[4])
+        print(tokenize(step.run or ""))
+        print("@@ENV@@")
+        for k, v in {**job.env, **step.env}.items():
+            print(f"{k}={tokenize(v)}")
         return 0
     root = Path(argv[1]) if len(argv) > 1 else repo_root / ".github/workflows"
     errors = check_dir(root, repo_root)

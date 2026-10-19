@@ -223,7 +223,7 @@ mutate_case "update_versions stops exporting pr_number" "does not declare" \
 
 # --- 4. topology of both modes -------------------------------------------------
 
-simulate() { python3 "$LINTER" --simulate "$RELEASE_YML" "$1"; }
+simulate() { python3 "$LINTER" --simulate "$RELEASE_YML" "$@"; }
 LIVE_RUN=$(simulate live)
 DRY_RUN=$(simulate dry)
 check "live: exactly these jobs run" \
@@ -244,6 +244,20 @@ for step in "update_versions / Dry run: report what a live run would push" \
     check "dry runs '$step'" "$(grep -cxF "$step" <<< "$DRY_RUN")" "1"
     check "live does not run '$step'" "$(grep -cxF "$step" <<< "$LIVE_RUN")" "0"
 done
+# ORDER, not just membership: the PR is composed before it is opened, the
+# branch is pushed before the PR names it, the PR exists before auto-merge.
+check "live: update_versions runs its steps in this order" \
+    "$(grep '^update_versions / ' <<< "$LIVE_RUN" | sed 's/^update_versions \/ //' | paste -sd'|' -)" \
+    "Checkout code|Configure git|Update freenet version|Update fdev version|Install Rust|Update Cargo.lock|Commit the version bump locally|Compose the release PR|Push the release branch|Create Pull Request|Enable auto-merge"
+# Failure paths: nothing irreversible may follow a failed gate.
+check "live: a failed wait_for_pr stops publishing and tagging" \
+    "$(simulate live --fail wait_for_pr | grep -cE '^(verify_publishable|create_release)$')" "0"
+check "live: a failed packaging check stops tagging" \
+    "$(simulate live --fail verify_publishable | grep -cxF create_release)" "0"
+check "live: a failed version bump stops everything after it" \
+    "$(simulate live --fail update_versions | grep -v ' / ' | paste -sd' ' -)" "validate update_versions summary"
+check "dry: a failed validate runs nothing but the summary" \
+    "$(simulate dry --fail validate | grep -v ' / ' | paste -sd' ' -)" "validate summary"
 
 # --- 5. execute every mutating step ------------------------------------------
 #
@@ -293,7 +307,8 @@ run_step() {
     local script="$1" live="$2" calls="$TEST_TMP/calls" out="$TEST_TMP/step.out" rc=0
     : > "$calls"
     local -a envs=()
-    mapfile -t envs < "${script%.sh}.env"
+    local line
+    while IFS= read -r line; do envs+=("$line"); done < "${script%.sh}.env"
     envs+=(PATH="$STUBS:$PATH" STUB_CALLS="$calls" GITHUB_OUTPUT="$TEST_TMP/gh_output"
            GITHUB_ENV="$TEST_TMP/gh_env" RUNNER_TEMP="$TEST_TMP")
     if [[ "$live" == "__unset__" ]]; then
@@ -320,15 +335,123 @@ for script in "$RUNS"/*.sh; do
         "$(grep -c EMPTYARG "$TEST_TMP/calls")" "0"
     LIVE_CALLS="$LIVE_CALLS$(cat "$TEST_TMP/calls")"$'\n'
 done
-# The commands a live release actually issues, with every value present.
-for call in "git push origin PLACEHOLDER" "gh pr merge PLACEHOLDER --auto" \
-            "git push origin vPLACEHOLDER"; do
+# The commands a live release actually issues, and WHICH value feeds each:
+# every `${{ expr }}` is extracted as `@@expr@@`, so tagging the fdev version
+# or pushing a branch built from the wrong output fails here.
+for call in "git push origin @@steps.bump.outputs.branch@@" \
+            "gh pr create --title @@steps.pr_text.outputs.title@@ --body-file @@steps.pr_text.outputs.body_file@@ --base main --head @@steps.bump.outputs.branch@@" \
+            "gh pr merge @@steps.create_pr.outputs.pr_number@@ --auto" \
+            "git push origin v@@needs.validate.outputs.version@@" \
+            "gh release create v@@needs.validate.outputs.version@@ --title v@@needs.validate.outputs.version@@ --notes-file @@steps.release_notes.outputs.notes_file@@ --draft"; do
     check "live issues '$call'" "$(grep -cxF "$call" <<< "$LIVE_CALLS")" "1"
 done
-check "live opens the PR from the composed title and body file" \
-    "$(grep -cE '^gh pr create --title PLACEHOLDER --body-file PLACEHOLDER --base main --head PLACEHOLDER$' <<< "$LIVE_CALLS")" "1"
+for step in "Wait for PR to be merged" "Resolve the release commit"; do
+    check "wait_for_pr / $step reads the bump PR's number" \
+        "$(python3 "$LINTER" --dump-step "$RELEASE_YML" wait_for_pr "$step" | grep -cxF 'PR_NUMBER=@@needs.update_versions.outputs.pr_number@@')" "1"
+done
 
-# --- 6. wiring ----------------------------------------------------------------
+# --- 6. run the real non-mutating steps end to end ---------------------------
+#
+# The live and dry paths both depend on steps nothing above executes: the bump
+# commit and its branch name, the composed PR title (ci.yml's merge-queue
+# release gate keys off its `build: release ` prefix), the dry-run report and
+# its git bundle, and the rehearsal's checkout of that bundle. Run them, as
+# extracted from release.yml, in throwaway local repos with no remote they
+# could push to.
+
+WF_VERSION="9.9.9"
+WF_FDEV="9.9.8"
+VALUES="$TEST_TMP/values"
+printf '%s\n' "needs.validate.outputs.version=$WF_VERSION" "needs.validate.outputs.fdev_version=$WF_FDEV" \
+    "needs.validate.outputs.live=false" > "$VALUES"
+
+run_wf_step() {
+    # run_wf_step <job> <step name> <step id or -> <dir>: runs that step from
+    # release.yml with every `@@expr@@` replaced from $VALUES, and records its
+    # outputs in $VALUES as steps.<id>.outputs.<key>.
+    local job="$1" name="$2" id="$3" workdir="$4" out="$TEST_TMP/step_output" rc=0
+    : > "$out"
+    if ! python3 - "$LINTER" "$RELEASE_YML" "$job" "$name" "$VALUES" "$TEST_TMP/step.sh" "$TEST_TMP/step.env" \
+        > "$TEST_TMP/step.log" 2>&1 <<'PY'
+import subprocess, sys
+linter, wf, job, name, values, script_out, env_out = sys.argv[1:]
+dump = subprocess.run([sys.executable, linter, "--dump-step", wf, job, name], check=True,
+                      capture_output=True, text=True).stdout
+script, env = dump.split("\n@@ENV@@\n")
+known = dict(l.split("=", 1) for l in open(values).read().splitlines() if l)
+def sub(t):
+    for k, v in known.items():
+        t = t.replace("@@" + k + "@@", v)
+    if "@@" in t:
+        sys.exit(f"unresolved expression in {name}: {t[t.index('@@'):][:80]}")
+    return t
+open(script_out, "w").write(sub(script))
+open(env_out, "w").write(sub(env))
+PY
+    then
+        echo "extract-failed"
+        return
+    fi
+    local -a envs=()
+    local line
+    while IFS= read -r line; do [[ -n "$line" ]] && envs+=("$line"); done < "$TEST_TMP/step.env"
+    (
+        builtin cd -- "$workdir" || exit 99
+        env "${envs[@]}" GITHUB_OUTPUT="$out" GITHUB_STEP_SUMMARY="$TEST_TMP/summary" \
+            RUNNER_TEMP="$TEST_TMP/runner" GITHUB_REPOSITORY=example/repo \
+            bash -e "$TEST_TMP/step.sh"
+    ) > "$TEST_TMP/step.log" 2>&1 || rc=$?
+    if [[ "$id" != "-" ]]; then
+        while IFS= read -r line; do
+            [[ "$line" == *=* ]] && echo "steps.$id.outputs.$line" >> "$VALUES"
+        done < "$out"
+    fi
+    echo "$rc"
+}
+
+mkdir -p "$TEST_TMP/runner" "$TEST_TMP/origin/crates/core" "$TEST_TMP/origin/crates/fdev" "$TEST_TMP/origin/scripts"
+cp "$REPO_ROOT/crates/core/Cargo.toml" "$TEST_TMP/origin/crates/core/"
+cp "$REPO_ROOT/crates/fdev/Cargo.toml" "$TEST_TMP/origin/crates/fdev/"
+cp "$REPO_ROOT/scripts/verify_release_checkout.sh" "$TEST_TMP/origin/scripts/"
+git -C "$TEST_TMP/origin" init -q -b main
+git -C "$TEST_TMP/origin" add -A
+git -C "$TEST_TMP/origin" -c user.email=t@example.invalid -c user.name=t commit -q -m base
+LAUNCH_SHA=$(git -C "$TEST_TMP/origin" rev-parse HEAD)
+echo "github.sha=$LAUNCH_SHA" >> "$VALUES"
+git clone -q --depth 1 "file://$TEST_TMP/origin" "$TEST_TMP/bump" 2>/dev/null
+
+for spec in "Configure git|-" "Update freenet version|-" "Update fdev version|-" \
+            "Commit the version bump locally|bump" "Compose the release PR|pr_text" \
+            "Dry run: report what a live run would push|dry_run_report"; do
+    rc=$(run_wf_step update_versions "${spec%|*}" "${spec#*|}" "$TEST_TMP/bump")
+    check "dry path: update_versions / ${spec%|*} runs" "$rc" "0"
+    [[ "$rc" == "0" ]] || cat "$TEST_TMP/step.log" >&2
+done
+value() { grep -m1 "^$1=" "$VALUES" | cut -d= -f2-; }
+check "the bump branch is release/v<version>" "$(value steps.bump.outputs.branch)" "release/v$WF_VERSION"
+check "the PR title keeps the 'build: release ' prefix ci.yml's release gate keys off" \
+    "$(value steps.pr_text.outputs.title)" "build: release $WF_VERSION"
+check "the PR body names both versions" \
+    "$(grep -cE "freenet: → \*\*$WF_VERSION\*\*|fdev: → \*\*$WF_FDEV\*\*" "$(value steps.pr_text.outputs.body_file)")" "2"
+check "the bump commit carries the new freenet version" \
+    "$(git -C "$TEST_TMP/bump" show HEAD:crates/core/Cargo.toml | grep -m1 '^version = ')" "version = \"$WF_VERSION\""
+check "the dry-run report hands over the bump commit" \
+    "$(value steps.dry_run_report.outputs.bump_sha)" "$(git -C "$TEST_TMP/bump" rev-parse HEAD)"
+check "the dry-run report says nothing was pushed" "$(grep -c 'nothing was pushed' "$TEST_TMP/summary")" "1"
+
+# The rehearsal, in a separate depth-1 clone of the launch commit, as the job sees it.
+echo "needs.update_versions.outputs.dry_run_bump_sha=$(value steps.dry_run_report.outputs.bump_sha)" >> "$VALUES"
+git clone -q --depth 1 "file://$TEST_TMP/origin" "$TEST_TMP/rehearse" 2>/dev/null
+mkdir -p "$TEST_TMP/runner/bump"
+check "the dry-run report wrote the bundle the rehearsal fetches" \
+    "$(cp "$TEST_TMP/runner/release-bump.bundle" "$TEST_TMP/runner/bump/" 2>/dev/null && echo present || echo missing)" "present"
+for step in "Check out the unpushed version-bump commit" "Verify the checkout is the bump commit"; do
+    rc=$(run_wf_step dry_run_rehearsal "$step" - "$TEST_TMP/rehearse")
+    check "rehearsal: $step" "$rc" "0"
+    [[ "$rc" == "0" ]] || cat "$TEST_TMP/step.log" >&2
+done
+
+# --- 7. wiring ----------------------------------------------------------------
 #
 # A guard nobody runs is not a guard. Executable lines only, so a commented-out
 # step does not count.
@@ -339,6 +462,30 @@ check "Rule Lint runs the linter over .github/workflows" \
     "$(grep -cE '^[[:space:]]*run: python3 \.github/scripts/check_release_dry_run\.py \.github/workflows[[:space:]]*$' "$CI_YML")" "1"
 check "CI runs this test" \
     "$(grep -cE '^[[:space:]]*run: bash scripts/release_dry_run_test\.sh[[:space:]]*$' "$CI_YML")" "1"
+# ...and not disabled in place: no `if:` or `continue-on-error` on those steps
+# or their jobs, and Rule Lint still runs on pull requests.
+check "the CI steps running this guard are not disabled in place" \
+    "$(python3 - "$LINTER" "$CI_YML" <<'PY'
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location("lint", sys.argv[1])
+m = importlib.util.module_from_spec(spec)
+sys.modules["lint"] = m  # dataclasses resolve annotations through sys.modules
+spec.loader.exec_module(m)
+jobs, _ = m.parse_workflow(open(sys.argv[2]).read())
+bad, seen = [], 0
+for j in jobs:
+    for st in j.steps:
+        if st.run and ("check_release_dry_run.py" in st.run or "release_dry_run_test.sh" in st.run):
+            seen += 1
+            if "if" in st.keys or "continue-on-error" in st.keys:
+                bad.append(st.label)
+            if "continue-on-error" in j.keys:
+                bad.append(j.name)
+            if j.name == "rule_lint" and j.keys.get("if", "").strip() != "github.event_name == 'pull_request'":
+                bad.append("rule_lint if:")
+print(("disabled: " + ",".join(bad)) if bad else f"enabled x{seen}")
+PY
+)" "enabled x4"  # Rule Lint self-test + lint, the Fmt-job test, shellcheck
 check "release.yml runs the tested resolver" \
     "$(grep -cE '^[[:space:]]*run: bash scripts/resolve_release_mode\.sh[[:space:]]*$' "$RELEASE_YML")" "1"
 

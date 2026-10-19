@@ -22,10 +22,6 @@ go wrong.
 
 ## Quickstart
 
-> **Before any trigger, run the pre-cut preconditions in the `freenet:release`
-> skill** (no concurrent cut, the auto-update canaries, and the real-NAT soak of
-> the exact SHA you will ship). The commands below are the trigger only.
-
 For a routine patch release, just run the workflow with no input — it
 auto-bumps the patch from the latest crates.io version:
 
@@ -42,29 +38,6 @@ gh workflow run release.yml \
 ```
 
 That's it. Watch progress at <https://github.com/freenet/freenet-core/actions/workflows/release.yml>.
-
-To rehearse a cut without making one, add `--field dry_run=true`. A dry run
-resolves the version, commits the bump on the runner, runs the checkout
-verifier and `cargo publish -p freenet --dry-run` against that commit, and
-prints the branch, PR title and body a live run would open, plus an
-approximate changelog. It pushes no branch, opens and merges no PR, and
-creates no tag or release, so `main` does not move. Every mutating step is
-gated on the single `needs.validate.outputs.live` value and refuses in its own
-script when that is not `true`; Rule Lint's
-`.github/scripts/check_release_dry_run.py` fails a PR that adds a mutating
-step without both (#5936).
-
-Caveats:
-
-- **Only from a ref that contains #5936's fix.** The workflow file comes from
-  the ref you dispatch. Before the fix, a "dry run" pushed the branch and
-  auto-merged the bump PR, so `--ref` pointing at an older tag or branch still
-  does that.
-- **It does not exercise the live-only half:** waiting for the bump PR's
-  merge queue (`wait_for_pr`, `resolve_release_sha.sh`), GitHub's generated
-  release notes, the tag push and the release creation.
-- Whether a dry run needs the pre-cut preconditions is decided by the
-  `freenet:release` skill, not here.
 
 The auto-bump reads `https://crates.io/api/v1/crates/freenet` to find the
 highest released version and increments the patch. So after `0.2.59` ships,
@@ -458,6 +431,34 @@ Current wire-gated floors:
 
 When a NEW wire-gated feature first ships (not this one), set its floor to
 **exactly that release version** and freeze it, as described above.
+
+## Dry run
+
+`gh workflow run release.yml --field dry_run=true` rehearses a cut without
+making one. It resolves the version, commits the bump on the runner, and runs
+the checkout verifier and `cargo publish -p freenet --dry-run` against that
+commit in a read-only `dry_run_rehearsal` job. It prints the branch, PR title
+and body a live run would open, and an approximate changelog. It pushes no
+branch, opens and merges no PR, and creates no tag or release, so `main` does
+not move.
+
+Every mutating step is gated on the single `needs.validate.outputs.live`
+value and refuses in its own script when that is not `true`. Steps that run in
+a dry run get no credential, and the bump job's checkout persists none. Rule
+Lint's `.github/scripts/check_release_dry_run.py` fails a PR that breaks any
+of that (#5936).
+
+Caveats:
+
+- **Only from a ref that contains #5939** (the fix for #5936). The workflow
+  file comes from the ref you dispatch. Before that fix a "dry run" pushed
+  the branch and auto-merged the bump PR, so `--ref` pointing at an older tag
+  or branch still does.
+- **It does not exercise the live-only half:** waiting for the bump PR's
+  merge queue (`wait_for_pr`, `resolve_release_sha.sh`), GitHub's generated
+  release notes, the tag push and the release creation.
+- Whether a dry run needs the pre-cut preconditions is decided by the
+  `freenet:release` skill, not here.
 
 ## What fires when
 
