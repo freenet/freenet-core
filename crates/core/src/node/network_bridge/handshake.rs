@@ -22,9 +22,7 @@ use crate::ring::{ConnectionManager, PeerKeyLocation};
 use crate::router::Router;
 use std::collections::HashMap;
 
-use crate::transport::{
-    InboundConnectionHandler, OutboundConnectionHandler, PeerConnection, PeerConnectionApi,
-};
+use crate::transport::{InboundConnectionHandler, OutboundConnector, PeerConnectionApi};
 
 /// Events emitted by the handshake driver.
 ///
@@ -149,7 +147,7 @@ impl HandshakeHandler {
     #[allow(clippy::too_many_arguments)]
     pub fn new<S: crate::transport::Socket>(
         inbound: InboundConnectionHandler<S>,
-        outbound: OutboundConnectionHandler<S>,
+        outbound: Arc<dyn OutboundConnector>,
         _connection_manager: ConnectionManager,
         _router: Arc<RwLock<Router>>,
         _this_location: Option<Location>,
@@ -252,7 +250,7 @@ impl ExpectedInboundTracker {
 
 async fn run_driver<S: crate::transport::Socket>(
     mut inbound: InboundConnectionHandler<S>,
-    outbound: OutboundConnectionHandler<S>,
+    outbound: Arc<dyn OutboundConnector>,
     mut commands_rx: mpsc::Receiver<Command>,
     events_tx: mpsc::Sender<Event>,
     peer_ready: Option<Arc<std::sync::atomic::AtomicBool>>,
@@ -372,8 +370,8 @@ async fn run_driver<S: crate::transport::Socket>(
     }
 }
 
-fn spawn_outbound<S: crate::transport::Socket>(
-    outbound: OutboundConnectionHandler<S>,
+fn spawn_outbound(
+    outbound: Arc<dyn OutboundConnector>,
     events_tx: mpsc::Sender<Event>,
     peer: PeerKeyLocation,
     transaction: Transaction,
@@ -381,41 +379,14 @@ fn spawn_outbound<S: crate::transport::Socket>(
     peer_ready: Option<Arc<std::sync::atomic::AtomicBool>>,
 ) {
     GlobalExecutor::spawn(async move {
-        let peer_for_connect = peer.clone();
-        let mut handler = outbound;
-        let addr = peer_for_connect
-            .socket_addr()
-            .expect("Connect requires known peer address");
-        let connect_future = handler
-            .connect(peer_for_connect.pub_key.clone(), addr)
-            .await;
-        let result: Result<PeerConnection<S>, ConnectionError> =
-            match tokio::time::timeout(Duration::from_secs(10), connect_future).await {
-                Ok(res) => res.map_err(|err| err.into()),
-                Err(_) => Err(ConnectionError::Timeout),
-            };
-
-        // Only mark peer as ready after a successful connection
-        if result.is_ok() {
-            if let Some(flag) = &peer_ready {
-                flag.store(true, std::sync::atomic::Ordering::SeqCst);
-            }
-        }
-
-        let event = match result {
-            Ok(connection) => Event::OutboundEstablished {
-                transaction,
-                peer: peer.clone(),
-                connection: Box::new(connection),
-                transient,
-            },
-            Err(error) => Event::OutboundFailed {
-                transaction,
-                peer: peer.clone(),
-                error,
-                transient,
-            },
-        };
+        let event = connect_outbound(
+            &*outbound,
+            peer,
+            transaction,
+            transient,
+            peer_ready.as_deref(),
+        )
+        .await;
 
         // channel-safety: ok — this runs in a detached per-connection task
         // (GlobalExecutor::spawn), NOT on the event loop or the run_driver
@@ -426,6 +397,52 @@ fn spawn_outbound<S: crate::transport::Socket>(
             tracing::warn!(error = %e, "failed to send handshake event");
         }
     });
+}
+
+/// How long the handshake stage of an outbound connect may take. It does not
+/// cover handing the attempt to the transport (see [`OutboundConnector`]).
+const OUTBOUND_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Run one outbound connect to `peer` and report it as the event the driver
+/// emits. Sets `peer_ready` only on success.
+async fn connect_outbound(
+    outbound: &dyn OutboundConnector,
+    peer: PeerKeyLocation,
+    transaction: Transaction,
+    transient: bool,
+    peer_ready: Option<&std::sync::atomic::AtomicBool>,
+) -> Event {
+    let addr = peer
+        .socket_addr()
+        .expect("Connect requires known peer address");
+    let connect_future = outbound.connect(peer.pub_key.clone(), addr).await;
+    let result: Result<Box<dyn PeerConnectionApi>, ConnectionError> =
+        match tokio::time::timeout(OUTBOUND_CONNECT_TIMEOUT, connect_future).await {
+            Ok(res) => res.map_err(|err| err.into()),
+            Err(_) => Err(ConnectionError::Timeout),
+        };
+
+    // Only mark peer as ready after a successful connection
+    if result.is_ok() {
+        if let Some(flag) = peer_ready {
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    match result {
+        Ok(connection) => Event::OutboundEstablished {
+            transaction,
+            peer,
+            connection,
+            transient,
+        },
+        Err(error) => Event::OutboundFailed {
+            transaction,
+            peer,
+            error,
+            transient,
+        },
+    }
 }
 
 #[cfg(test)]

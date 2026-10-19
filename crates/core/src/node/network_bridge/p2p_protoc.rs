@@ -1408,7 +1408,7 @@ impl P2pConnManager {
 
         let (handshake_handler, handshake_cmd_sender) = HandshakeHandler::new(
             inbound_conn_handler,
-            outbound_conn_handler.clone(),
+            Arc::new(outbound_conn_handler.clone()),
             bridge.op_manager.ring.connection_manager.clone(),
             bridge.op_manager.ring.router.clone(),
             this_location,

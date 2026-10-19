@@ -340,8 +340,8 @@ impl From<SocketAddr> for ObservedAddr {
 }
 
 pub(crate) use self::boundary::{
-    CloseReason, InboundStreamRegistry, PeerConnectionApi, StreamProgressObserver,
-    StreamSendOutcome,
+    CloseReason, InboundStreamRegistry, OutboundConnector, PeerConnectionApi, PendingConnection,
+    StreamProgressObserver, StreamSendOutcome,
 };
 pub(crate) use self::connection_handler::ExpectedInboundTracker;
 pub use self::connection_handler::create_connection_handler;
