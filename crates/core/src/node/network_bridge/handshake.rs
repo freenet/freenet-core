@@ -449,13 +449,215 @@ async fn connect_outbound(
 mod tests {
     use super::*;
     use crate::operations::connect::ConnectMsg;
-    use crate::transport::TransportKeypair;
+    use crate::transport::{TransportError, TransportKeypair};
     use std::net::{IpAddr, Ipv4Addr};
 
     fn make_peer(port: u16) -> PeerKeyLocation {
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
         let keypair = TransportKeypair::new();
         PeerKeyLocation::new(keypair.public().clone(), addr)
+    }
+
+    /// A connection that does nothing; only its identity as a
+    /// `Box<dyn PeerConnectionApi>` matters to these tests.
+    struct NullConnection(SocketAddr);
+
+    impl PeerConnectionApi for NullConnection {
+        fn remote_addr(&self) -> SocketAddr {
+            self.0
+        }
+
+        fn remote_version(&self) -> Option<(u8, u8, u16)> {
+            None
+        }
+
+        fn send_bytes(
+            &mut self,
+            _data: Vec<u8>,
+        ) -> Pin<Box<dyn std::future::Future<Output = Result<(), TransportError>> + Send + '_>>
+        {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn recv(
+            &mut self,
+        ) -> Pin<Box<dyn std::future::Future<Output = Result<Vec<u8>, TransportError>> + Send + '_>>
+        {
+            Box::pin(std::future::pending())
+        }
+
+        fn set_inbound_stream_registry(
+            &mut self,
+            _registry: Arc<dyn crate::transport::InboundStreamRegistry>,
+        ) {
+        }
+
+        fn send_stream_data(
+            &mut self,
+            _stream_id: crate::transport::peer_connection::StreamId,
+            _data: bytes::Bytes,
+            _metadata: Option<bytes::Bytes>,
+            _completion_tx: Option<
+                tokio::sync::oneshot::Sender<crate::transport::StreamSendOutcome>,
+            >,
+            _progress: Option<Arc<dyn crate::transport::StreamProgressObserver>>,
+        ) -> Pin<Box<dyn std::future::Future<Output = Result<(), TransportError>> + Send + '_>>
+        {
+            unreachable!("not used by these tests")
+        }
+
+        fn pipe_stream_data(
+            &mut self,
+            _outbound_stream_id: crate::transport::peer_connection::StreamId,
+            _inbound_handle: crate::transport::peer_connection::streaming::StreamHandle,
+            _metadata: Option<bytes::Bytes>,
+            _progress: Option<Arc<dyn crate::transport::StreamProgressObserver>>,
+        ) -> Pin<Box<dyn std::future::Future<Output = Result<(), TransportError>> + Send + '_>>
+        {
+            unreachable!("not used by these tests")
+        }
+    }
+
+    /// What a scripted connector's handshake stage does.
+    #[derive(Clone, Copy)]
+    enum Handshake {
+        Succeeds,
+        Fails,
+        Hangs,
+    }
+
+    /// An `OutboundConnector` whose two stages are scripted: the first
+    /// takes `enqueue` (virtual time), the second does `handshake`.
+    struct ScriptedConnector {
+        enqueue: Duration,
+        handshake: Handshake,
+    }
+
+    impl OutboundConnector for ScriptedConnector {
+        // Two stages by design: see `OutboundConnector::connect`.
+        #[allow(clippy::async_yields_async)]
+        fn connect(
+            &self,
+            _remote_public_key: crate::transport::TransportPublicKey,
+            remote_addr: SocketAddr,
+        ) -> Pin<
+            Box<dyn std::future::Future<Output = crate::transport::PendingConnection> + Send + '_>,
+        > {
+            let (enqueue, handshake) = (self.enqueue, self.handshake);
+            Box::pin(async move {
+                tokio::time::sleep(enqueue).await;
+                let pending: crate::transport::PendingConnection = match handshake {
+                    Handshake::Succeeds => Box::pin(async move {
+                        Ok(Box::new(NullConnection(remote_addr)) as Box<dyn PeerConnectionApi>)
+                    }),
+                    Handshake::Fails => Box::pin(async {
+                        Err(TransportError::ConnectionEstablishmentFailure {
+                            cause: "refused".into(),
+                        })
+                    }),
+                    Handshake::Hangs => Box::pin(std::future::pending()),
+                };
+                pending
+            })
+        }
+    }
+
+    struct ConnectRun {
+        event: Event,
+        peer: PeerKeyLocation,
+        transaction: Transaction,
+        ready: bool,
+        elapsed: Duration,
+    }
+
+    /// Run `connect_outbound` against a scripted connector.
+    async fn run_connect(enqueue: Duration, handshake: Handshake) -> ConnectRun {
+        let connector = ScriptedConnector { enqueue, handshake };
+        let ready = std::sync::atomic::AtomicBool::new(false);
+        let peer = make_peer(4200);
+        let transaction = Transaction::new::<ConnectMsg>();
+        let start = tokio::time::Instant::now();
+        let event =
+            connect_outbound(&connector, peer.clone(), transaction, true, Some(&ready)).await;
+        ConnectRun {
+            event,
+            peer,
+            transaction,
+            ready: ready.load(std::sync::atomic::Ordering::SeqCst),
+            elapsed: start.elapsed(),
+        }
+    }
+
+    /// A completed handshake becomes `OutboundEstablished` carrying the peer,
+    /// transaction and transient flag, and marks the peer ready.
+    #[tokio::test(start_paused = true)]
+    async fn outbound_connect_success_is_established_and_marks_ready() {
+        let run = run_connect(Duration::ZERO, Handshake::Succeeds).await;
+        let Event::OutboundEstablished {
+            transaction,
+            peer,
+            connection,
+            transient,
+        } = run.event
+        else {
+            panic!("expected OutboundEstablished, got {:?}", run.event);
+        };
+        assert_eq!(peer, run.peer);
+        assert_eq!(transaction, run.transaction);
+        assert_eq!(connection.remote_addr(), run.peer.socket_addr().unwrap());
+        assert!(transient);
+        assert!(run.ready, "a successful connect marks the peer ready");
+    }
+
+    /// A failed handshake becomes `OutboundFailed` with the transport error
+    /// converted as before, and does not mark the peer ready.
+    #[tokio::test(start_paused = true)]
+    async fn outbound_connect_failure_is_failed_and_leaves_ready_unset() {
+        let run = run_connect(Duration::ZERO, Handshake::Fails).await;
+        let Event::OutboundFailed {
+            transaction,
+            peer,
+            error,
+            transient,
+        } = run.event
+        else {
+            panic!("expected OutboundFailed, got {:?}", run.event);
+        };
+        assert_eq!(peer, run.peer);
+        assert_eq!(transaction, run.transaction);
+        assert!(transient);
+        let expected = ConnectionError::from(TransportError::ConnectionEstablishmentFailure {
+            cause: "refused".into(),
+        });
+        assert_eq!(error.to_string(), expected.to_string());
+        assert!(!run.ready);
+    }
+
+    /// A handshake that never finishes fails as `Timeout` after exactly the
+    /// connect timeout.
+    #[tokio::test(start_paused = true)]
+    async fn outbound_connect_that_hangs_times_out_after_ten_seconds() {
+        let run = run_connect(Duration::ZERO, Handshake::Hangs).await;
+        let Event::OutboundFailed { error, .. } = run.event else {
+            panic!("expected OutboundFailed, got {:?}", run.event);
+        };
+        assert!(matches!(error, ConnectionError::Timeout), "{error:?}");
+        assert_eq!(run.elapsed, Duration::from_secs(10));
+        assert!(!run.ready);
+    }
+
+    /// The timeout covers only the handshake stage: an attempt that waits
+    /// longer than the timeout to be queued still connects.
+    #[tokio::test(start_paused = true)]
+    async fn outbound_connect_timeout_does_not_cover_queueing() {
+        let run = run_connect(Duration::from_secs(15), Handshake::Succeeds).await;
+        assert!(
+            matches!(run.event, Event::OutboundEstablished { .. }),
+            "{:?}",
+            run.event
+        );
+        assert_eq!(run.elapsed, Duration::from_secs(15));
+        assert!(run.ready);
     }
 
     #[test]
