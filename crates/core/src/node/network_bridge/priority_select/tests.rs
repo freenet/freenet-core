@@ -2821,9 +2821,9 @@ impl crate::transport::PeerConnectionApi for MockPeerConnection {
         Box::pin(async { Ok(vec![]) })
     }
 
-    fn set_orphan_stream_registry(
+    fn set_inbound_stream_registry(
         &mut self,
-        _registry: std::sync::Arc<crate::operations::orphan_streams::OrphanStreamRegistry>,
+        _registry: std::sync::Arc<dyn crate::transport::InboundStreamRegistry>,
     ) {
     }
 

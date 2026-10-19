@@ -2582,7 +2582,7 @@ async fn the_periodic_sweep_counts_an_idle_eviction() {
 async fn unclaimed_streams_go_with_the_connection() {
     let registry = Arc::new(crate::operations::orphan_streams::OrphanStreamRegistry::new());
     let mut e = single(CAPABLE);
-    e.conn.set_orphan_stream_registry(Arc::clone(&registry));
+    e.conn.set_inbound_stream_registry(registry.clone());
     let one = bytes::Bytes::from_static(b"complete");
     let done = StreamId::next_operations();
     feed(&mut e, fragment_with(done, one.len() as u64, 1, one)).await;

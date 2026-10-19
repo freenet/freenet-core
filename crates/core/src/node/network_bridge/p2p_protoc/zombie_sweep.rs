@@ -2444,9 +2444,9 @@ mod tests {
             })
         }
 
-        fn set_orphan_stream_registry(
+        fn set_inbound_stream_registry(
             &mut self,
-            _registry: Arc<crate::operations::orphan_streams::OrphanStreamRegistry>,
+            _registry: Arc<dyn crate::transport::InboundStreamRegistry>,
         ) {
         }
 

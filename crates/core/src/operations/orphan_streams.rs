@@ -455,6 +455,25 @@ impl OrphanStreamRegistry {
     }
 }
 
+impl crate::transport::InboundStreamRegistry for OrphanStreamRegistry {
+    fn register_inbound_stream(
+        &self,
+        peer_addr: SocketAddr,
+        stream_id: StreamId,
+        handle: StreamHandle,
+    ) {
+        self.register_orphan(peer_addr, stream_id, handle);
+    }
+
+    fn cancel_unclaimed_streams(
+        &self,
+        peer_addr: SocketAddr,
+        streams: &mut dyn Iterator<Item = (StreamId, std::sync::Weak<LockFreeStreamBuffer>)>,
+    ) {
+        self.cancel_unclaimed(peer_addr, streams);
+    }
+}
+
 impl Default for OrphanStreamRegistry {
     fn default() -> Self {
         Self::new()

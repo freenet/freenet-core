@@ -10,6 +10,9 @@ use std::net::SocketAddr;
 use futures::Future;
 
 use super::TransportError;
+use super::peer_connection::StreamId;
+use super::peer_connection::streaming::StreamHandle;
+use super::peer_connection::streaming_buffer::LockFreeStreamBuffer;
 
 // =============================================================================
 // Type-erased peer connection trait
@@ -66,6 +69,35 @@ pub(crate) trait StreamProgressObserver: Send + Sync {
     fn on_fragment_sent(&self);
 }
 
+/// Where a connection delivers inbound operations-level streams, set with
+/// [`PeerConnectionApi::set_inbound_stream_registry`].
+///
+/// An operations stream's fragments can arrive before the message that
+/// announces it (RequestStreaming/ResponseStreaming). The connection
+/// therefore hands each new stream over as soon as its first fragment
+/// arrives, and the layer above claims it by `(peer address, stream id)`
+/// when it processes the announcing message.
+pub(crate) trait InboundStreamRegistry: Send + Sync {
+    /// A new operations stream `stream_id` from `peer_addr` has started
+    /// arriving; `handle` reads it as its fragments land.
+    fn register_inbound_stream(
+        &self,
+        peer_addr: SocketAddr,
+        stream_id: StreamId,
+        handle: StreamHandle,
+    );
+
+    /// The connection from `peer_addr` is gone: cancel the streams among
+    /// `streams` that nobody has claimed. Each stream is matched by its
+    /// buffer, so a stream with the same id from another connection, or one
+    /// already claimed, is left alone.
+    fn cancel_unclaimed_streams(
+        &self,
+        peer_addr: SocketAddr,
+        streams: &mut dyn Iterator<Item = (StreamId, std::sync::Weak<LockFreeStreamBuffer>)>,
+    );
+}
+
 /// Type-erased interface for peer connections.
 ///
 /// This trait provides the minimal interface needed by `peer_connection_listener`
@@ -117,15 +149,12 @@ pub(crate) trait PeerConnectionApi: Send {
         &mut self,
     ) -> std::pin::Pin<Box<dyn Future<Output = Result<Vec<u8>, TransportError>> + Send + '_>>;
 
-    /// Sets the orphan stream registry for handling race conditions between
-    /// stream fragments and metadata messages (RequestStreaming/ResponseStreaming).
+    /// Sets the registry that receives this connection's inbound
+    /// operations streams (see [`InboundStreamRegistry`]).
     ///
     /// This should be called by the node layer after connection establishment,
     /// before any messages are processed.
-    fn set_orphan_stream_registry(
-        &mut self,
-        registry: std::sync::Arc<crate::operations::orphan_streams::OrphanStreamRegistry>,
-    );
+    fn set_inbound_stream_registry(&mut self, registry: std::sync::Arc<dyn InboundStreamRegistry>);
 
     /// Sends raw stream data to the remote peer using the given operations-level StreamId.
     ///
@@ -141,7 +170,7 @@ pub(crate) trait PeerConnectionApi: Send {
     /// delivery as a successful send.
     fn send_stream_data(
         &mut self,
-        stream_id: crate::transport::peer_connection::StreamId,
+        stream_id: StreamId,
         data: bytes::Bytes,
         metadata: Option<bytes::Bytes>,
         completion_tx: Option<tokio::sync::oneshot::Sender<BroadcastDeliveryOutcome>>,
@@ -158,8 +187,8 @@ pub(crate) trait PeerConnectionApi: Send {
     /// operations-level routing at the receiver.
     fn pipe_stream_data(
         &mut self,
-        outbound_stream_id: crate::transport::peer_connection::StreamId,
-        inbound_handle: crate::transport::peer_connection::streaming::StreamHandle,
+        outbound_stream_id: StreamId,
+        inbound_handle: StreamHandle,
         metadata: Option<bytes::Bytes>,
         progress: Option<std::sync::Arc<dyn StreamProgressObserver>>,
     ) -> std::pin::Pin<Box<dyn Future<Output = Result<(), TransportError>> + Send + '_>>;

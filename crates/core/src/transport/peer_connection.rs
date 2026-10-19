@@ -52,7 +52,6 @@ use super::{
     symmetric_message::{self, SymmetricMessage, SymmetricMessagePayload},
     token_bucket::TokenBucket,
 };
-use crate::operations::orphan_streams::OrphanStreamRegistry;
 use crate::util::time_source::InstantTimeSrc;
 
 type Result<T = (), E = TransportError> = std::result::Result<T, E>;
@@ -363,11 +362,11 @@ pub struct PeerConnection<S = super::UdpSocket, T: TimeSource = RealTime> {
     streaming_handles: HashMap<StreamId, (streaming::StreamHandle, u64)>,
     /// Time source for deterministic simulation support
     time_source: T,
-    /// Optional orphan stream registry for handling race conditions between
-    /// stream fragments and metadata messages (RequestStreaming/ResponseStreaming).
+    /// Registry that receives inbound operations streams, handling the race
+    /// between stream fragments and metadata messages
+    /// (RequestStreaming/ResponseStreaming).
     /// Set by the node layer after connection establishment.
-    orphan_stream_registry:
-        Option<std::sync::Arc<crate::operations::orphan_streams::OrphanStreamRegistry>>,
+    inbound_stream_registry: Option<std::sync::Arc<dyn super::InboundStreamRegistry>>,
     /// LRU cache of recently dispatched metadata hashes (capacity 1000), used to dedup
     /// embedded-metadata-in-fragment-#1 against the separate ShortMessage.
     ///
@@ -419,10 +418,10 @@ impl<S, T: TimeSource> Drop for PeerConnection<S, T> {
         // Unclaimed buffers this connection charged (complete ones it already
         // retired, too) would otherwise wait out the orphan timeout with
         // nothing accounting for them.
-        if let Some(registry) = &self.orphan_stream_registry {
-            registry.cancel_unclaimed(
+        if let Some(registry) = &self.inbound_stream_registry {
+            registry.cancel_unclaimed_streams(
                 self.remote_conn.remote_addr,
-                self.inbound_budget.live_buffer_streams(),
+                &mut self.inbound_budget.live_buffer_streams(),
             );
         }
         // Cancel all active streaming handles so that any operation blocked on
@@ -1119,7 +1118,7 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
             streaming_registry: Arc::new(streaming::StreamRegistry::new()),
             streaming_handles: HashMap::new(),
             time_source,
-            orphan_stream_registry: None,
+            inbound_stream_registry: None,
             dispatched_msg_hashes: lru::LruCache::new(DEDUP_CACHE_CAPACITY),
             rejected_inbound_streams: inbound_budget::RefusedStreams::default(),
             closed_by_stream_refusals: false,
@@ -1151,16 +1150,17 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
             .is_some()
     }
 
-    /// Sets the orphan stream registry for handling race conditions between
-    /// stream fragments and metadata messages.
+    /// Sets the registry that receives this connection's inbound operations
+    /// streams, handling the race between stream fragments and metadata
+    /// messages.
     ///
     /// This should be called by the node layer after connection establishment,
     /// before any messages are processed.
-    pub fn set_orphan_stream_registry(
+    pub(crate) fn set_inbound_stream_registry(
         &mut self,
-        registry: std::sync::Arc<crate::operations::orphan_streams::OrphanStreamRegistry>,
+        registry: std::sync::Arc<dyn super::InboundStreamRegistry>,
     ) {
-        self.orphan_stream_registry = Some(registry);
+        self.inbound_stream_registry = Some(registry);
     }
 
     /// Sweep `streaming_handles` of entries that have not seen activity for
@@ -2466,8 +2466,8 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
         // Phase 4: Register with orphan stream registry for race condition handling.
         // This allows operations layer to claim the stream when metadata arrives,
         // even if the stream fragments arrived first.
-        if let Some(orphan_registry) = &self.orphan_stream_registry {
-            orphan_registry.register_orphan(
+        if let Some(registry) = &self.inbound_stream_registry {
+            registry.register_inbound_stream(
                 self.remote_conn.remote_addr,
                 stream_id,
                 streaming_handle.clone(),
@@ -2484,7 +2484,7 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
             tracing::error!(
                 peer_addr = %self.remote_conn.remote_addr,
                 stream_id = %stream_id,
-                "Operations stream fragment arrived but orphan_stream_registry is None! \
+                "Operations stream fragment arrived but inbound_stream_registry is None! \
                  This will cause claim_or_wait() to timeout. Check connection setup."
             );
         }
@@ -3413,8 +3413,11 @@ impl<S: super::Socket> super::PeerConnectionApi for PeerConnection<S> {
         Box::pin(async move { PeerConnection::recv(self).await })
     }
 
-    fn set_orphan_stream_registry(&mut self, registry: std::sync::Arc<OrphanStreamRegistry>) {
-        PeerConnection::set_orphan_stream_registry(self, registry);
+    fn set_inbound_stream_registry(
+        &mut self,
+        registry: std::sync::Arc<dyn super::InboundStreamRegistry>,
+    ) {
+        PeerConnection::set_inbound_stream_registry(self, registry);
     }
 
     fn send_stream_data(
