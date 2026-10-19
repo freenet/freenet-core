@@ -35,6 +35,51 @@ use crate::tracing::{TransferDirection, TransferEvent};
 /// metrics for periodic telemetry snapshots.
 pub static TRANSPORT_METRICS: LazyLock<TransportMetrics> = LazyLock::new(TransportMetrics::new);
 
+/// Why an inbound stream was refused or evicted. Each has its own counter
+/// because each has a different remedy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InboundStreamOutcome {
+    /// Refused: declared length 0 or above `MAX_STREAM_TOTAL_BYTES`.
+    RefusedInvalidLength,
+    /// Refused: the connection's byte allowance was full.
+    RefusedConnectionBytes,
+    /// Refused: the connection's stream count was full.
+    RefusedConnectionStreams,
+    /// Connection closed: a refused stream could not be remembered, because
+    /// the connection already had as many refused streams outstanding as are
+    /// remembered.
+    ClosedTooManyRefusals,
+    /// Evicted: no new data within the idle timeout.
+    EvictedIdle,
+    /// Evicted: past its age limit.
+    EvictedAge,
+}
+
+impl InboundStreamOutcome {
+    pub(crate) const COUNT: usize = 6;
+    /// Every outcome, in declaration order, so `ALL[i] as usize == i`.
+    pub(crate) const ALL: [Self; Self::COUNT] = [
+        Self::RefusedInvalidLength,
+        Self::RefusedConnectionBytes,
+        Self::RefusedConnectionStreams,
+        Self::ClosedTooManyRefusals,
+        Self::EvictedIdle,
+        Self::EvictedAge,
+    ];
+
+    /// Metric label.
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::RefusedInvalidLength => "refused_invalid_length",
+            Self::RefusedConnectionBytes => "refused_connection_bytes",
+            Self::RefusedConnectionStreams => "refused_connection_streams",
+            Self::ClosedTooManyRefusals => "closed_too_many_refusals",
+            Self::EvictedIdle => "evicted_idle",
+            Self::EvictedAge => "evicted_age",
+        }
+    }
+}
+
 /// Accumulates transport metrics for periodic reporting.
 ///
 /// All operations are lock-free using atomics. Metrics are accumulated
@@ -101,6 +146,9 @@ pub struct TransportMetrics {
     cumulative_nat_established: AtomicU64,
     cumulative_nat_failed_error: AtomicU64,
     cumulative_nat_failed_version: AtomicU64,
+    /// Inbound streams refused admission or evicted, by reason (never reset).
+    /// See [`InboundStreamOutcome`].
+    cumulative_inbound_stream_outcomes: [AtomicU64; InboundStreamOutcome::COUNT],
 
     // Timing accumulators (for computing averages)
     total_transfer_time_ms: AtomicU64,
@@ -383,6 +431,7 @@ impl TransportMetrics {
             cumulative_nat_established: AtomicU64::new(0),
             cumulative_nat_failed_error: AtomicU64::new(0),
             cumulative_nat_failed_version: AtomicU64::new(0),
+            cumulative_inbound_stream_outcomes: Default::default(),
             total_transfer_time_ms: AtomicU64::new(0),
             peak_throughput_bps: AtomicU64::new(0),
             peak_cwnd_bytes: AtomicU32::new(0),
@@ -886,6 +935,24 @@ impl TransportMetrics {
             self.cumulative_transfers_completed.load(Ordering::Relaxed),
             self.cumulative_transfers_failed.load(Ordering::Relaxed),
         )
+    }
+
+    /// Record an inbound stream refused or evicted.
+    pub(crate) fn record_inbound_stream_outcome(&self, outcome: InboundStreamOutcome) {
+        self.cumulative_inbound_stream_outcomes[outcome as usize].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Cumulative inbound stream outcomes (refusals and evictions), never
+    /// reset, one entry per [`InboundStreamOutcome`] in declaration order.
+    pub(crate) fn cumulative_inbound_stream_outcomes(
+        &self,
+    ) -> [(InboundStreamOutcome, u64); InboundStreamOutcome::COUNT] {
+        InboundStreamOutcome::ALL.map(|outcome| {
+            (
+                outcome,
+                self.cumulative_inbound_stream_outcomes[outcome as usize].load(Ordering::Relaxed),
+            )
+        })
     }
 
     /// Cumulative NAT traversal outcomes, never reset, in the order
@@ -1680,6 +1747,23 @@ pub fn emit_transfer_failed(
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    /// `cumulative_inbound_stream_outcomes` indexes its counters by
+    /// `outcome as usize`, which is only sound while `ALL` lists the
+    /// outcomes in declaration order, and labels are distinct.
+    #[test]
+    fn inbound_stream_outcomes_are_listed_in_declaration_order() {
+        for (i, outcome) in InboundStreamOutcome::ALL.iter().enumerate() {
+            assert_eq!(*outcome as usize, i, "{outcome:?}");
+        }
+        let mut labels: Vec<_> = InboundStreamOutcome::ALL
+            .iter()
+            .map(|o| o.label())
+            .collect();
+        labels.sort_unstable();
+        labels.dedup();
+        assert_eq!(labels.len(), InboundStreamOutcome::COUNT);
+    }
 
     #[test]
     fn test_empty_snapshot_returns_none() {

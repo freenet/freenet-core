@@ -15,6 +15,10 @@ pub(super) async fn recv_stream(
     mut stream: InboundStream,
 ) -> Result<(StreamId, Vec<u8>), StreamId> {
     while let Some((fragment_number, payload)) = receiver.recv().await {
+        // An evicted stream stops at once, even with fragments still queued.
+        if stream.is_cancelled() {
+            return Err(stream_id);
+        }
         if let Some(msg) = stream.push_fragment(fragment_number, payload) {
             return Ok((stream_id, msg));
         }
@@ -22,14 +26,26 @@ pub(super) async fn recv_stream(
     Err(stream_id)
 }
 
+/// Reassembles one legacy stream.
+///
+/// Fragments are held as received (each in its own `Bytes`) until the stream
+/// is complete, then copied once into a buffer of exactly the stream's
+/// length. The memory held is the fragments' own allocations plus
+/// per-fragment map overhead, both covered by the stream's charge (see
+/// `inbound_budget::ChargeOverhead`). The operations path
+/// (`LockFreeStreamBuffer`) holds its fragments the same way.
 pub(super) struct InboundStream {
     total_length_bytes: u64,
-    /// Fragment numbers are 1-indexed
+    /// Fragment numbers are 1-indexed. Every fragment up to this one is held.
     last_contiguous_fragment_idx: FragmentIdx,
-    /// Out-of-order fragments stored until they can be appended
-    non_contiguous_fragments: BTreeMap<FragmentIdx, Bytes>,
-    /// Accumulated payload bytes
-    payload: Vec<u8>,
+    /// Payload bytes in fragments `1..=last_contiguous_fragment_idx`.
+    contiguous_bytes: u64,
+    /// Every fragment received and not yet assembled.
+    fragments: BTreeMap<FragmentIdx, Bytes>,
+    /// Total length of `fragments`' values.
+    held_bytes: u64,
+    /// Accounting token: told the bytes received; carries cancellation.
+    token: Option<std::sync::Arc<super::inbound_budget::LegacyStreamToken>>,
 }
 
 impl InboundStream {
@@ -37,9 +53,25 @@ impl InboundStream {
         Self {
             total_length_bytes,
             last_contiguous_fragment_idx: 0,
-            non_contiguous_fragments: BTreeMap::new(),
-            payload: Vec::with_capacity(total_length_bytes as usize),
+            contiguous_bytes: 0,
+            fragments: BTreeMap::new(),
+            held_bytes: 0,
+            token: None,
         }
+    }
+
+    /// Whether the stream's token has been cancelled (it was evicted).
+    fn is_cancelled(&self) -> bool {
+        self.token.as_ref().is_some_and(|t| t.is_cancelled())
+    }
+
+    /// Report the bytes this stream holds to `token` as they arrive.
+    pub(super) fn with_token(
+        mut self,
+        token: std::sync::Arc<super::inbound_budget::LegacyStreamToken>,
+    ) -> Self {
+        self.token = Some(token);
+        self
     }
 
     /// Returns some if the message has been completely streamed, none otherwise.
@@ -48,27 +80,19 @@ impl InboundStream {
         fragment_number: FragmentIdx,
         fragment: SerializedStream,
     ) -> Option<Vec<u8>> {
-        // tracing::trace!(
-        //     %fragment_number,
-        //     last = %self.last_contiguous_fragment_idx,
-        //     non_contig = ?self.non_contiguous_fragments.keys().collect::<Vec<_>>(),
-        //     "received stream fragment"
-        // );
-
         // Reject an out-of-range fragment number outright. Without this, a
-        // fragment far past the end of the stream is inserted into
-        // `non_contiguous_fragments`, where nothing ever removes it: the drain
-        // loop below only pops keys that reach `frontier + 1`, so the entry -
-        // and this whole `InboundStream`, its spawned `recv_stream` task, its
-        // channel, and the partial payload - lives until the connection
-        // closes. Both sibling reassemblers already bound this
-        // (`streaming_buffer.rs::insert`, `piped_stream.rs::push_fragment`).
+        // fragment far past the end of the stream is held in `fragments`, where
+        // the stream can never complete past it, and the entry - and this
+        // whole `InboundStream`, its spawned `recv_stream` task and its channel
+        // - lives until the stream is evicted. Both sibling reassemblers
+        // already bound this (`streaming_buffer.rs::insert`,
+        // `piped_stream.rs::push_fragment`).
         //
         // The bound is the largest fragment number the sender could legitimately
         // emit: one per `MAX_DATA_SIZE` of payload, plus one, because embedded
         // metadata shortens fragment #1 and can push the tail into an extra
         // fragment (fix #2757 - the same `+1` `streaming_buffer.rs` allocates
-        // as its overflow slot).
+        // as its overflow slot). The per-fragment charge relies on this bound.
         let max_fragment_number = (self.total_length_bytes as usize)
             .div_ceil(super::MAX_DATA_SIZE)
             .saturating_add(1) as FragmentIdx;
@@ -76,69 +100,121 @@ impl InboundStream {
             return None;
         }
 
-        // Idempotency guard: a fragment at or below the contiguous frontier has
-        // already been appended to `payload`, so a replay of it carries no new
-        // bytes. Dropping it is not merely an optimisation: buffering it in
-        // `non_contiguous_fragments` WEDGES the drain loop below permanently,
-        // because that loop stops at the first key that is not
-        // `last_contiguous_fragment_idx + 1` and a stale key can never become
-        // that again (the frontier only grows). Every later out-of-order
-        // fragment then sits behind the stale key forever and the stream never
-        // completes, even once all its bytes have arrived.
+        // Idempotency guard: a fragment at or below the contiguous frontier is
+        // already held, so a replay of it carries no new bytes. Duplicate
+        // semantics differ by side of the frontier:
+        //   - at or below the frontier: FIRST writer wins (the replay is
+        //     dropped here), so the frontier's byte count stays exact;
+        //   - above the frontier: LAST writer wins (the `insert` below
+        //     overwrites the held entry).
+        // Either way the bytes held never exceed `total_length_bytes`: a
+        // fragment that would take them past it is dropped below.
         //
-        // Duplicate semantics differ by side of the frontier, and neither is
-        // "the payload is rebuilt from the newer copy":
-        //   - at or below the frontier: FIRST writer wins, because the bytes
-        //     are already in `payload` and the replay is dropped here;
-        //   - above the frontier: LAST writer wins, because the `insert` below
-        //     overwrites the pending entry.
-        // A replay above the frontier that carries a DIFFERENT length steps
-        // `payload.len()` past `total_length_bytes`, and `get_and_clear`
-        // compares with `==`, so the stream never completes. Only a broken or
-        // hostile sender produces that; an honest retransmit is byte-identical.
-        //
-        // Reachability: `ReceivedPacketTracker` (see
-        // `received_packet_tracker.rs:62`) dedups by `packet_id` only, and an
-        // honest retransmit reuses the original `packet_id`, so loss recovery
-        // never reaches here. A peer that replays the same `fragment_number`
-        // under fresh `packet_id`s does, which makes this a guard against a
-        // hostile or broken peer rather than defence-in-depth against a
-        // condition nothing can produce.
+        // Reachability: `ReceivedPacketTracker` dedups by `packet_id` only, and
+        // an honest retransmit reuses the original `packet_id`, so loss
+        // recovery never reaches here. A peer that replays the same
+        // `fragment_number` under fresh `packet_id`s does.
         if fragment_number <= self.last_contiguous_fragment_idx {
             return None;
         }
 
-        if fragment_number == self.last_contiguous_fragment_idx + 1 {
-            self.last_contiguous_fragment_idx = fragment_number;
-            self.payload.extend_from_slice(&fragment);
-        } else {
-            self.non_contiguous_fragments
-                .insert(fragment_number, fragment);
+        // Every fragment carries payload except possibly fragment #1 (older
+        // senders could leave it empty beside embedded metadata), and the
+        // payload of all fragments sums to exactly `total_length_bytes`.
+        let replaced = self
+            .fragments
+            .get(&fragment_number)
+            .map_or(0, |b| b.len() as u64);
+        let held = self.held_bytes - replaced;
+        if (fragment.is_empty() && fragment_number != 1)
+            || held + fragment.len() as u64 > self.total_length_bytes
+        {
+            return None;
         }
-        while let Some((idx, v)) = self.non_contiguous_fragments.pop_first() {
-            if idx == self.last_contiguous_fragment_idx + 1 {
-                self.last_contiguous_fragment_idx += 1;
-                self.payload.extend_from_slice(&v);
-            } else {
-                self.non_contiguous_fragments.insert(idx, v);
-                break;
-            }
-        }
-        self.get_and_clear()
-    }
+        self.held_bytes = held + fragment.len() as u64;
+        self.fragments.insert(fragment_number, fragment);
 
-    fn get_and_clear(&mut self) -> Option<Vec<u8>> {
-        if self.payload.len() as u64 == self.total_length_bytes {
-            Some(std::mem::take(&mut self.payload))
+        while let Some(next) = self.fragments.get(&(self.last_contiguous_fragment_idx + 1)) {
+            self.contiguous_bytes += next.len() as u64;
+            self.last_contiguous_fragment_idx += 1;
+        }
+        if let Some(token) = &self.token {
+            token.report(self.held_bytes);
+        }
+        if self.contiguous_bytes == self.total_length_bytes {
+            // Completion and eviction race; whichever is recorded first wins.
+            if self.token.as_ref().is_some_and(|t| !t.mark_complete()) {
+                return None;
+            }
+            Some(self.assemble())
         } else {
             None
         }
+    }
+
+    /// Copy the complete stream into one buffer of exactly its length,
+    /// releasing each fragment as it is copied.
+    fn assemble(&mut self) -> Vec<u8> {
+        // Contiguous bytes equal the total and held bytes cannot exceed it, so
+        // every held fragment is below the frontier.
+        debug_assert_eq!(self.held_bytes, self.total_length_bytes);
+        let mut payload = Vec::with_capacity(self.total_length_bytes as usize);
+        while let Some((_, fragment)) = self.fragments.pop_first() {
+            payload.extend_from_slice(&fragment);
+        }
+        self.held_bytes = 0;
+        payload
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::cell::Cell;
+
+    thread_local! {
+        /// Bytes allocated on this thread (never decremented).
+        static ALLOCATED: Cell<usize> = const { Cell::new(0) };
+    }
+
+    /// The system allocator, counting what each thread allocates, so a test
+    /// can see an allocation it did not expect. Tests on other threads are
+    /// unaffected.
+    struct CountingAllocator;
+
+    fn count(bytes: usize) {
+        // Unavailable only while the thread is being torn down.
+        if ALLOCATED.try_with(|n| n.set(n.get() + bytes)).is_err() {}
+    }
+
+    // SAFETY: delegates every call to `System` unchanged.
+    unsafe impl GlobalAlloc for CountingAllocator {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            count(layout.size());
+            // SAFETY: the caller upholds `GlobalAlloc::alloc`'s contract.
+            unsafe { System.alloc(layout) }
+        }
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            // SAFETY: `ptr` was allocated by `System` with `layout`.
+            unsafe { System.dealloc(ptr, layout) }
+        }
+        unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+            count(new_size);
+            // SAFETY: `ptr` was allocated by `System` with `layout`.
+            unsafe { System.realloc(ptr, layout, new_size) }
+        }
+    }
+
+    #[global_allocator]
+    static ALLOCATOR: CountingAllocator = CountingAllocator;
+
+    /// Bytes allocated on this thread while running `f`.
+    fn allocated_by<R>(f: impl FnOnce() -> R) -> (R, usize) {
+        let before = ALLOCATED.with(Cell::get);
+        let result = f();
+        (result, ALLOCATED.with(Cell::get) - before)
+    }
 
     /// A full fragment payload, matching what `send_stream` actually emits.
     ///
@@ -164,13 +240,178 @@ mod tests {
             .collect()
     }
 
+    /// The memory a stream holds is the fragments received, however they
+    /// arrive; constructing it allocates nothing, and the message is one
+    /// exact allocation, made once every byte has arrived.
+    #[test]
+    fn reassembly_holds_only_the_fragments_received() {
+        let declared = super::super::streaming::MAX_STREAM_TOTAL_BYTES;
+        let (mut stream, at_construction) = allocated_by(|| InboundStream::new(declared));
+        assert_eq!(at_construction, 0, "construction allocates nothing");
+        let first = frag(1);
+        let (_, at_first) = allocated_by(|| stream.push_fragment(1, first));
+        assert!(
+            at_first < 4096,
+            "a fragment costs a map entry: {at_first} B"
+        );
+
+        // In order up to past half, then the rest except one, out of order.
+        const N: usize = 40;
+        let total = N * FRAG;
+        let mut stream = InboundStream::new(total as u64);
+        let gap = N / 2 + 2;
+        let order: Vec<usize> = (1..gap).chain((gap + 1..=N).rev()).chain([gap]).collect();
+        for (step, &i) in order.iter().enumerate() {
+            let done = stream.push_fragment(i as u32, frag(i as u8));
+            let held: usize = stream.fragments.values().map(|b| b.len()).sum();
+            if step + 1 < order.len() {
+                assert!(done.is_none());
+                assert_eq!(held as u64, stream.held_bytes);
+                assert_eq!(held, (step + 1) * FRAG, "only the fragments received");
+            } else {
+                let msg = done.expect("complete");
+                assert_eq!(msg, joined(&(1..=N as u8).collect::<Vec<_>>()));
+                assert_eq!(msg.capacity(), total, "one exact allocation");
+                assert!(stream.fragments.is_empty(), "fragments released");
+                assert_eq!(stream.held_bytes, 0);
+            }
+        }
+    }
+
+    /// The bytes held never exceed the stream's total: an oversized fragment,
+    /// an empty one, and many short ones cannot complete or overfill it.
+    #[test]
+    fn fragments_cannot_exceed_or_shortcut_the_declared_total() {
+        let total = (3 * FRAG) as u64;
+        let mut stream = InboundStream::new(total);
+        assert_eq!(stream.push_fragment(2, Bytes::new()), None);
+        assert!(stream.fragments.is_empty(), "empty #2 is dropped");
+
+        // One-byte fragments up to the fragment-number bound never complete it.
+        for i in 1..=4 {
+            assert_eq!(stream.push_fragment(i, Bytes::from_static(b"x")), None);
+        }
+        assert_eq!(stream.held_bytes, 4);
+
+        // A pending fragment that would overfill the total is dropped...
+        let mut stream = InboundStream::new(total);
+        assert_eq!(stream.push_fragment(2, frag(2)), None);
+        assert_eq!(stream.push_fragment(3, frag(3)), None);
+        let too_big = Bytes::from(vec![9u8; FRAG + 1]);
+        assert_eq!(stream.push_fragment(4, too_big.clone()), None);
+        assert!(!stream.fragments.contains_key(&4));
+        // ...and so is a contiguous one.
+        assert_eq!(stream.push_fragment(1, too_big), None);
+        assert_eq!(stream.last_contiguous_fragment_idx, 0);
+        assert_eq!(stream.held_bytes, (2 * FRAG) as u64);
+
+        // The genuine fragment still completes it.
+        assert_eq!(stream.push_fragment(1, frag(1)), Some(joined(&[1, 2, 3])));
+    }
+
+    /// A stream completes only when its bytes are contiguous from fragment
+    /// #1: a sender that fills the total from #2 on (using the extra fragment
+    /// number) never completes it, and fragment #1 cannot then fit.
+    #[test]
+    fn bytes_past_a_gap_do_not_complete_a_stream() {
+        let mut stream = InboundStream::new((3 * FRAG) as u64);
+        for i in 2..=4 {
+            assert_eq!(stream.push_fragment(i, frag(i as u8)), None);
+        }
+        assert_eq!(
+            stream.held_bytes,
+            (3 * FRAG) as u64,
+            "premise: the total is held"
+        );
+        assert_eq!(stream.push_fragment(1, frag(1)), None);
+        assert_eq!(stream.last_contiguous_fragment_idx, 0);
+    }
+
+    /// A replay of a fragment at or below the contiguous frontier, even with
+    /// a different length, changes neither the bytes held nor the message.
+    #[test]
+    fn a_replay_below_the_frontier_cannot_change_the_message() {
+        let mut stream = InboundStream::new((3 * FRAG) as u64);
+        assert_eq!(stream.push_fragment(1, frag(1)), None);
+        assert_eq!(stream.push_fragment(2, frag(2)), None);
+        assert_eq!(stream.push_fragment(1, Bytes::from_static(b"short")), None);
+        assert_eq!(stream.held_bytes, (2 * FRAG) as u64);
+        assert_eq!(stream.push_fragment(3, frag(3)), Some(joined(&[1, 2, 3])));
+    }
+
+    /// The per-fragment charge covers what a legacy stream's fragment map
+    /// actually allocates per entry, however the fragments arrive.
+    #[test]
+    fn the_per_fragment_charge_covers_the_fragment_map() {
+        use super::super::inbound_budget::{PAYLOAD_SIZE_CLASS_SLACK, PER_FRAGMENT_OVERHEAD};
+        const N: u32 = 20_000;
+        let ascending: Vec<u32> = (1..=N).collect();
+        let descending: Vec<u32> = (1..=N).rev().collect();
+        // Every other one, then the gaps: splits leave nodes partly empty.
+        let interleaved: Vec<u32> = (1..=N).step_by(2).chain((2..=N).step_by(2)).collect();
+        let scrambled: Vec<u32> = (0..N).map(|i| (i * 7919) % N + 1).collect();
+        for (name, order) in [
+            ("ascending", ascending),
+            ("descending", descending),
+            ("interleaved", interleaved),
+            ("scrambled", scrambled),
+        ] {
+            let (map, bytes) = allocated_by(|| {
+                let mut map = BTreeMap::new();
+                for &i in &order {
+                    map.insert(i, Bytes::new());
+                }
+                map
+            });
+            let per_entry = (bytes as u64).div_ceil(map.len() as u64);
+            assert!(
+                per_entry + PAYLOAD_SIZE_CLASS_SLACK <= PER_FRAGMENT_OVERHEAD,
+                "{name}: {per_entry} B per entry"
+            );
+        }
+    }
+
+    /// Completion and cancellation exclude each other: a stream cancelled
+    /// before its last fragment is pushed is not delivered, and one that
+    /// completed first cannot then be cancelled.
+    #[test]
+    fn completion_and_cancellation_exclude_each_other() {
+        use super::super::inbound_budget::LegacyStreamToken;
+        let token = LegacyStreamToken::new();
+        let mut stream =
+            InboundStream::new((2 * FRAG) as u64).with_token(std::sync::Arc::clone(&token));
+        assert_eq!(stream.push_fragment(1, frag(1)), None);
+        assert!(token.cancel());
+        assert_eq!(stream.push_fragment(2, frag(2)), None, "cancelled first");
+
+        let token = LegacyStreamToken::new();
+        let mut stream =
+            InboundStream::new((2 * FRAG) as u64).with_token(std::sync::Arc::clone(&token));
+        assert_eq!(stream.push_fragment(1, frag(1)), None);
+        assert_eq!(stream.push_fragment(2, frag(2)), Some(joined(&[1, 2])));
+        assert!(!token.cancel(), "completed first");
+        assert!(!token.is_cancelled());
+    }
+
+    /// Older senders left fragment #1 empty when its embedded metadata used
+    /// the whole packet, and sent the payload from fragment #2 on (one more
+    /// fragment than usual). Such a stream still completes.
+    #[test]
+    fn an_empty_first_fragment_from_an_older_sender_is_accepted() {
+        let total = (2 * FRAG) as u64;
+        let mut stream = InboundStream::new(total);
+        assert_eq!(stream.push_fragment(1, Bytes::new()), None);
+        assert_eq!(stream.last_contiguous_fragment_idx, 1);
+        assert_eq!(stream.push_fragment(2, frag(2)), None);
+        assert_eq!(stream.push_fragment(3, frag(3)), Some(joined(&[2, 3])));
+    }
+
     #[test]
     fn test_simple_sequence() {
         let mut stream = InboundStream::new((2 * FRAG) as u64);
         assert_eq!(stream.push_fragment(1, frag(1)), None);
         assert_eq!(stream.push_fragment(2, frag(2)), Some(joined(&[1, 2])));
-        assert!(stream.non_contiguous_fragments.is_empty());
-        assert!(stream.payload.is_empty());
+        assert!(stream.fragments.is_empty());
     }
 
     #[test]
@@ -179,8 +420,7 @@ mod tests {
         assert_eq!(stream.push_fragment(1, frag(1)), None);
         assert_eq!(stream.push_fragment(3, frag(3)), None);
         assert_eq!(stream.push_fragment(2, frag(2)), Some(joined(&[1, 2, 3])));
-        assert!(stream.non_contiguous_fragments.is_empty());
-        assert!(stream.payload.is_empty());
+        assert!(stream.fragments.is_empty());
     }
 
     #[test]
@@ -189,18 +429,14 @@ mod tests {
         assert_eq!(stream.push_fragment(2, frag(2)), None);
         assert_eq!(stream.push_fragment(3, frag(3)), None);
         assert_eq!(stream.push_fragment(1, frag(1)), Some(joined(&[1, 2, 3])));
-        assert!(stream.non_contiguous_fragments.is_empty());
-        assert!(stream.payload.is_empty());
+        assert!(stream.fragments.is_empty());
     }
 
     /// A replay of an already-consumed fragment must not stall the stream.
     ///
     /// Without the idempotency guard in `push_fragment`, the replayed fragment
-    /// is buffered under a key at or below the contiguous frontier. The drain
-    /// loop pops the smallest pending key first, sees it is not
-    /// `frontier + 1`, puts it back and breaks, so that stale key blocks every
-    /// later out-of-order fragment forever and the stream never completes even
-    /// though all of its bytes have arrived.
+    /// would be counted again in the contiguous bytes, so the stream would
+    /// either complete short or be refused its genuine last fragment.
     ///
     /// The replay must also not corrupt the payload: the reassembled bytes are
     /// asserted byte-for-byte, not merely by length.
@@ -209,7 +445,7 @@ mod tests {
         let mut stream = InboundStream::new((5 * FRAG) as u64);
         assert_eq!(stream.push_fragment(1, frag(1)), None);
         assert_eq!(stream.push_fragment(2, frag(2)), None);
-        // Replay of a fragment already folded into `payload`.
+        // Replay of a fragment already below the contiguous frontier.
         assert_eq!(stream.push_fragment(1, frag(1)), None);
         // Remaining fragments arrive out of order behind the replay.
         assert_eq!(stream.push_fragment(5, frag(5)), None);
@@ -219,8 +455,7 @@ mod tests {
             Some(joined(&[1, 2, 3, 4, 5])),
             "replayed fragment must not strand the fragments queued behind it"
         );
-        assert!(stream.non_contiguous_fragments.is_empty());
-        assert!(stream.payload.is_empty());
+        assert!(stream.fragments.is_empty());
     }
 
     /// A replay of a fragment still sitting in the out-of-order buffer is a
@@ -232,16 +467,16 @@ mod tests {
         assert_eq!(stream.push_fragment(3, frag(3)), None);
         assert_eq!(stream.push_fragment(2, frag(2)), None);
         assert_eq!(stream.push_fragment(1, frag(1)), Some(joined(&[1, 2, 3])));
-        assert!(stream.non_contiguous_fragments.is_empty());
+        assert!(stream.fragments.is_empty());
     }
 
     /// A fragment number past anything the stream could need must be dropped,
-    /// not parked in `non_contiguous_fragments` for the life of the connection.
+    /// not held in `fragments`.
     ///
-    /// `non_contiguous_fragments` is only ever drained by the frontier reaching
-    /// a key, so an entry above the highest reachable fragment number is never
-    /// removed: it pins the `InboundStream`, its `recv_stream` task, its
-    /// channel, and the partial payload until the connection closes. An
+    /// The frontier can never reach an entry above the highest reachable
+    /// fragment number, so it would never be released: it pins the
+    /// `InboundStream`, its `recv_stream` task and its channel until the
+    /// stream is evicted, and is not covered by the per-fragment charge. An
     /// authenticated peer can send fragment 4,000,000,000 as often as it likes,
     /// because `ReceivedPacketTracker` dedups by `packet_id` rather than by
     /// fragment number, so a fresh `packet_id` per replay walks straight
@@ -257,7 +492,7 @@ mod tests {
         assert_eq!(stream.push_fragment(4, frag(9)), None);
         assert_eq!(stream.push_fragment(0, frag(9)), None);
         assert!(
-            stream.non_contiguous_fragments.is_empty(),
+            stream.fragments.is_empty(),
             "an unreachable fragment number must not occupy the reassembly buffer"
         );
 
@@ -281,6 +516,6 @@ mod tests {
             &assembled[2 * FRAG - metadata_overhead..],
             &vec![3u8; metadata_overhead][..]
         );
-        assert!(stream.non_contiguous_fragments.is_empty());
+        assert!(stream.fragments.is_empty());
     }
 }

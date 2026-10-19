@@ -48,6 +48,7 @@ Registered in `tracing/otel.rs::register_metrics`.
 | `freenet.transport.packets` | counter | `direction` | `cumulative_packets_{sent,received}` |
 | `freenet.transport.transfers` | counter | `result` | `cumulative_transfers` |
 | `freenet.transport.nat_traversal` | counter | `result` | `cumulative_nat_traversal` |
+| `freenet.transport.inbound_stream_limits` | counter | `reason` | `cumulative_inbound_stream_outcomes` |
 | `freenet.transport.rtt` | histogram | — | `record_rtt_sample` |
 | `freenet.transport.cwnd` | histogram | — | `record_cwnd_sample` |
 | `freenet.operation.results` | counter | `op`, `result` | `NetworkStatus::op_stats` |

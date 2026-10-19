@@ -862,6 +862,14 @@ Audit questions for any new byte budget:
 - **Can the guard on that aggregate FAIL for a budget nobody added to it?** If it
   validates a hardcoded list, it catches removal and not addition — see below.
 
+**Recorded exception: inbound stream reassembly.** `MAX_STREAM_TOTAL_BYTES` and
+`MAX_INBOUND_STREAM_BYTES_PER_CONNECTION` are flat and sit outside the
+aggregate (listed in `NOT_SUMMED` with the reason). They bound one stream and
+one connection, not the node: reassembly memory across the node is at most the
+number of connections times the per-connection allowance. A node-wide share
+and fairness between connections are deferred to the transport redesign. Do
+not copy this shape for memory the node holds on its own initiative.
+
 ```bash
 # Flat byte budgets, which should be rare:
 grep -rnE "^(pub(\([a-z]+\))? )?const [A-Z0-9_]+_BYTES: usize = [0-9]" crates/core/src/

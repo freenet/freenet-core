@@ -3734,6 +3734,10 @@ async fn peer_connection_listener(
                         // every other recv error is a transport closure.
                         let reason = if conn.closed_by_idle_timeout() {
                             crate::tracing::DisconnectReason::Timeout
+                        } else if conn.closed_by_stream_refusals() {
+                            crate::tracing::DisconnectReason::Explicit(
+                                "inbound_stream_refusals".into(),
+                            )
                         } else {
                             crate::tracing::DisconnectReason::NetworkError("transport_closed".into())
                         };

@@ -46,9 +46,11 @@ const WEBSOCKET_PING_INTERVAL: Duration = Duration::from_secs(30);
 /// reads into a buffer already reserved at their full length.
 const WEBSOCKET_READ_BUFFER_SIZE: usize = 16 * 1024;
 
-/// Largest client WebSocket message, and frame, the node accepts (see
-/// `configure_upgrade`).
-const WEBSOCKET_MAX_MESSAGE_SIZE: usize = 100 * 1024 * 1024;
+// Largest client WebSocket message, and frame, the node accepts (see
+// `configure_upgrade`). Defined in the parent module so it is available
+// without the `websocket` feature: the transport derives its stream-size cap
+// from it.
+use super::WEBSOCKET_MAX_MESSAGE_SIZE;
 
 /// Per-client rate limiter for delegate operations.
 ///

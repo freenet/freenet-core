@@ -38,6 +38,7 @@ use tokio::sync::oneshot;
 
 use crate::transport::peer_connection::StreamId;
 use crate::transport::peer_connection::streaming::StreamHandle;
+use crate::transport::peer_connection::streaming_buffer::LockFreeStreamBuffer;
 
 /// Timeout for unclaimed orphan streams.
 /// Orphan streams not claimed within this duration are garbage collected.
@@ -320,10 +321,34 @@ impl OrphanStreamRegistry {
         );
     }
 
-    /// Garbage collect expired orphan streams.
-    ///
+    /// Cancel the unclaimed orphans among `streams` from `peer_addr` when the
+    /// connection that received them is gone. Each is matched by buffer, so
+    /// a stream with the same key from another connection is left alone, as
+    /// are claimed streams and waiters. A cancelled orphan stays in place
+    /// until the next `gc_expired` (within its 5 s interval), so a claim in
+    /// that window gets it already cancelled instead of parking a waiter
+    /// until the claim timeout; its buffer is held, uncharged, for that
+    /// window.
+    pub fn cancel_unclaimed(
+        &self,
+        peer_addr: SocketAddr,
+        streams: impl IntoIterator<Item = (StreamId, std::sync::Weak<LockFreeStreamBuffer>)>,
+    ) {
+        for (stream_id, buffer) in streams {
+            if let Some(slot) = self.slots.get(&(peer_addr, stream_id)) {
+                if let Slot::Orphan(handle, _) = slot.value() {
+                    if handle.shares_buffer(&buffer) {
+                        handle.cancel();
+                    }
+                }
+            }
+        }
+    }
+
     /// Should be called periodically to clean up orphan streams that were
-    /// never claimed. Each expired stream's handle is cancelled.
+    /// never claimed. Each expired stream's handle is cancelled. A stream the
+    /// transport already cancelled (evicted) is dropped at once, so its
+    /// buffer, and the memory charged for it, is not kept until expiry.
     pub fn gc_expired(&self) {
         let now = Instant::now();
         let mut expired_count = 0;
@@ -331,7 +356,10 @@ impl OrphanStreamRegistry {
         self.slots
             .retain(|(peer_addr, stream_id), slot| match slot {
                 Slot::Orphan(handle, created) => {
-                    if now.duration_since(*created) > ORPHAN_STREAM_TIMEOUT {
+                    if handle.is_cancelled() {
+                        expired_count += 1;
+                        false
+                    } else if now.duration_since(*created) > ORPHAN_STREAM_TIMEOUT {
                         tracing::debug!(
                             %peer_addr,
                             stream_id = %stream_id,
@@ -607,6 +635,105 @@ mod tests {
         // GC should preserve fresh stream
         registry.gc_expired();
         assert_eq!(registry.orphan_count(), 1);
+    }
+
+    /// An orphan the transport has cancelled (evicted) is dropped on the next
+    /// GC, however fresh, so its buffer is not held until expiry.
+    #[test]
+    fn test_gc_drops_cancelled_orphans() {
+        let registry = OrphanStreamRegistry::new();
+        let stream_id = StreamId::next();
+        let handle = make_test_handle(stream_id);
+        registry.register_orphan(dummy_addr(), stream_id, handle.clone());
+        handle.cancel();
+        registry.gc_expired();
+        assert_eq!(registry.orphan_count(), 0);
+    }
+
+    /// `cancel_unclaimed` cancels only the closing connection's own
+    /// unclaimed orphans, matched by buffer: not another peer's stream, not a
+    /// replacement connection's stream under the same key, not a claimed
+    /// stream, and not a waiter. A claim after the cancel gets the stream
+    /// already cancelled at once, and GC then drops the slot.
+    #[tokio::test]
+    async fn test_cancel_unclaimed_cancels_only_that_connections_orphans() {
+        let registry = std::sync::Arc::new(OrphanStreamRegistry::new());
+        let timeout = Duration::from_secs(1);
+
+        let mine = StreamId::next();
+        let mine_handle = make_test_handle(mine);
+        registry.register_orphan(dummy_addr(), mine, mine_handle.clone());
+
+        let elsewhere = make_test_handle(mine);
+        registry.register_orphan(dummy_addr_2(), mine, elsewhere.clone());
+
+        // The old connection's stream was replaced under the same key.
+        let reused = StreamId::next();
+        let old_handle = make_test_handle(reused);
+        let replacement = make_test_handle(reused);
+        registry.register_orphan(dummy_addr(), reused, replacement.clone());
+
+        let claimed = StreamId::next();
+        let claimed_handle = make_test_handle(claimed);
+        registry.register_orphan(dummy_addr(), claimed, claimed_handle.clone());
+        registry
+            .claim_or_wait(dummy_addr(), claimed, timeout)
+            .await
+            .unwrap();
+
+        let awaited = StreamId::next();
+        let waiter = {
+            let registry = std::sync::Arc::clone(&registry);
+            tokio::spawn(
+                async move { registry.claim_or_wait(dummy_addr(), awaited, timeout).await },
+            )
+        };
+        tokio::task::yield_now().await;
+        assert_eq!(registry.waiter_count(), 1, "premise");
+
+        let awaited_handle = make_test_handle(awaited);
+        registry.cancel_unclaimed(
+            dummy_addr(),
+            [
+                (mine, mine_handle.buffer_weak()),
+                (reused, old_handle.buffer_weak()),
+                (claimed, claimed_handle.buffer_weak()),
+                (awaited, awaited_handle.buffer_weak()),
+            ],
+        );
+        assert!(mine_handle.is_cancelled());
+        assert!(!elsewhere.is_cancelled(), "another peer's stream");
+        assert!(
+            !replacement.is_cancelled(),
+            "a replacement connection's stream"
+        );
+        assert!(!claimed_handle.is_cancelled(), "a claimed stream");
+        assert_eq!(registry.waiter_count(), 1, "the waiter is left alone");
+
+        // A late claim gets the stream already cancelled, without waiting.
+        let late = tokio::time::timeout(
+            Duration::from_millis(10),
+            registry.claim_or_wait(dummy_addr(), mine, timeout),
+        )
+        .await
+        .expect("no wait")
+        .expect("claimed");
+        assert!(late.is_cancelled());
+
+        // GC drops cancelled orphans.
+        let gone = StreamId::next();
+        let gone_handle = make_test_handle(gone);
+        registry.register_orphan(dummy_addr(), gone, gone_handle.clone());
+        registry.cancel_unclaimed(dummy_addr(), [(gone, gone_handle.buffer_weak())]);
+        let before = registry.orphan_count();
+        registry.gc_expired();
+        assert_eq!(registry.orphan_count(), before - 1);
+
+        registry.register_orphan(dummy_addr(), awaited, awaited_handle);
+        assert!(
+            waiter.await.unwrap().is_ok(),
+            "the waiter still gets its stream"
+        );
     }
 
     /// Regression for #5731: `claim_or_wait` (operations layer, metadata

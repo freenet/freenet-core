@@ -181,6 +181,25 @@ pub(super) async fn send_stream<S: super::super::Socket, T: TimeSource>(
     let mut peak_flightsize: usize = 0;
     let bytes_to_send = stream_to_send.len() as u64;
 
+    // Receivers admit only lengths that pass `check_declared_stream_length`.
+    if let Err(rejection) = super::streaming::check_declared_stream_length(bytes_to_send) {
+        tracing::warn!(
+            stream_id = %stream_id.0,
+            peer_addr = %destination_addr,
+            length_bytes = bytes_to_send,
+            max_stream_bytes = super::streaming::MAX_STREAM_TOTAL_BYTES,
+            ?rejection,
+            "Not sending stream: length outside the stream limits"
+        );
+        if let Some(tx) = completion_tx {
+            let _ignored = tx.send(crate::transport::BroadcastDeliveryOutcome::Dropped);
+        }
+        return Err(TransportError::OutboundStreamInvalidLength(
+            destination_addr,
+            bytes_to_send,
+        ));
+    }
+
     // Emit transfer started telemetry event
     emit_transfer_started(
         stream_id.0 as u64,
@@ -196,7 +215,11 @@ pub(super) async fn send_stream<S: super::super::Socket, T: TimeSource>(
         cwnd = congestion_controller.current_cwnd(),
         "Sending stream"
     );
-    let total_length_bytes = stream_to_send.len() as u32;
+    // The full stream length, as a u64.
+    let total_length_bytes = bytes_to_send;
+    // Fragment #1 must carry at least one payload byte; metadata too large to
+    // leave room for one is not embedded (it is also sent separately).
+    let metadata = metadata.filter(|meta| 1 + 8 + meta.len() < MAX_DATA_SIZE);
     // Calculate total_packets accounting for fragment #1's reduced payload when
     // metadata is embedded. Without this adjustment, the loop terminates too early
     // and the final bytes of the stream are never sent.
@@ -395,7 +418,7 @@ pub(super) async fn send_stream<S: super::super::Socket, T: TimeSource>(
             vec![],
             symmetric_message::StreamFragment {
                 stream_id,
-                total_length_bytes: total_length_bytes as u64,
+                total_length_bytes,
                 fragment_number: next_fragment_number,
                 payload: fragment,
                 metadata_bytes,
@@ -579,6 +602,23 @@ pub(super) async fn pipe_stream<S: super::super::Socket, T: TimeSource>(
     // See `send_stream`.
     let mut peak_flightsize: usize = 0;
     let total_bytes = inbound_handle.total_bytes();
+
+    // Inbound admission applies the same check; repeated here so a forwarded
+    // stream's declared length is within the limits whatever its source.
+    if let Err(rejection) = super::streaming::check_declared_stream_length(total_bytes) {
+        tracing::warn!(
+            stream_id = %outbound_stream_id.0,
+            peer_addr = %destination_addr,
+            total_bytes,
+            max_stream_bytes = super::streaming::MAX_STREAM_TOTAL_BYTES,
+            ?rejection,
+            "Not piping stream: length outside the stream limits"
+        );
+        return Err(TransportError::OutboundStreamInvalidLength(
+            destination_addr,
+            total_bytes,
+        ));
+    }
 
     emit_transfer_started(
         outbound_stream_id.0 as u64,
@@ -1568,6 +1608,208 @@ mod tests {
         );
 
         Ok(())
+    }
+
+    fn big_cwnd() -> Arc<CongestionController<RealTime>> {
+        CongestionControlConfig::from_ledbat_config(LedbatConfig {
+            initial_cwnd: 1_000_000,
+            min_cwnd: 1_000_000,
+            max_cwnd: 1_000_000_000,
+            ..Default::default()
+        })
+        .build_arc()
+    }
+
+    fn random_cipher() -> Aes128Gcm {
+        let mut key = [0u8; 16];
+        crate::config::GlobalRng::fill_bytes(&mut key);
+        Aes128Gcm::new(&key.into())
+    }
+
+    /// A message longer than `MAX_STREAM_TOTAL_BYTES` is not started: no
+    /// fragment is sent, the broadcast queue is told it was dropped, and the
+    /// error is stream-scoped but NOT transient (a retry fails the same way).
+    #[tokio::test(start_paused = true)]
+    async fn send_stream_refuses_a_stream_above_the_length_cap()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use super::super::streaming::MAX_STREAM_TOTAL_BYTES;
+
+        let (outbound_sender, mut outbound_receiver) = mpsc::channel(100);
+        let remote_addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 8080);
+        // Zeroed and never written, so the pages are never touched.
+        let message = Bytes::from(vec![0u8; MAX_STREAM_TOTAL_BYTES as usize + 1]);
+        let (completion_tx, completion_rx) = oneshot::channel();
+
+        let result = send_stream(
+            StreamId::next(),
+            Arc::new(AtomicU32::new(0)),
+            Arc::new(TestSocket::new(outbound_sender)),
+            remote_addr,
+            message,
+            random_cipher(),
+            Arc::new(parking_lot::Mutex::new(SentPacketTracker::new())),
+            Arc::new(TokenBucket::new(1_000_000, 100_000_000)),
+            big_cwnd(),
+            RealTime::new(),
+            None,
+            Some(completion_tx),
+            None,
+        )
+        .await;
+
+        let err = result.expect_err("an over-cap stream must not be sent");
+        assert!(
+            matches!(
+                err,
+                TransportError::OutboundStreamInvalidLength(addr, len)
+                    if addr == remote_addr && len == MAX_STREAM_TOTAL_BYTES + 1
+            ),
+            "got: {err:?}"
+        );
+        assert!(!err.is_transient_send_failure());
+        assert!(
+            outbound_receiver.try_recv().is_err(),
+            "no fragment of a refused stream may be sent"
+        );
+        assert!(matches!(
+            completion_rx.await,
+            Ok(crate::transport::BroadcastDeliveryOutcome::Dropped)
+        ));
+        Ok(())
+    }
+
+    /// A message of exactly `MAX_STREAM_TOTAL_BYTES` is sent, and its
+    /// fragments declare the full length as a u64.
+    #[tokio::test(start_paused = true)]
+    async fn send_stream_sends_a_stream_at_the_length_cap() -> Result<(), Box<dyn std::error::Error>>
+    {
+        use super::super::streaming::MAX_STREAM_TOTAL_BYTES;
+
+        let (outbound_sender, mut outbound_receiver) = mpsc::channel(4);
+        let remote_addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 8080);
+        let message = Bytes::from(vec![0u8; MAX_STREAM_TOTAL_BYTES as usize]);
+        let cipher = random_cipher();
+
+        let task = GlobalExecutor::spawn(send_stream(
+            StreamId::next(),
+            Arc::new(AtomicU32::new(0)),
+            Arc::new(TestSocket::new(outbound_sender)),
+            remote_addr,
+            message,
+            cipher.clone(),
+            Arc::new(parking_lot::Mutex::new(SentPacketTracker::new())),
+            Arc::new(TokenBucket::new(1_000_000, 100_000_000)),
+            big_cwnd(),
+            RealTime::new(),
+            None,
+            None,
+            None,
+        ));
+
+        let (_, packet) = outbound_receiver
+            .recv()
+            .await
+            .expect("an at-cap stream is sent");
+        let decrypted = PacketData::<_, MAX_PACKET_SIZE>::from_buf(packet.as_ref())
+            .try_decrypt_sym(&cipher)
+            .map_err(|e| e.to_string())?;
+        let SymmetricMessagePayload::StreamFragment {
+            total_length_bytes,
+            fragment_number,
+            ..
+        } = SymmetricMessage::deser(decrypted.data())?.payload
+        else {
+            panic!("expected a stream fragment");
+        };
+        assert_eq!(fragment_number, 1);
+        assert_eq!(total_length_bytes, MAX_STREAM_TOTAL_BYTES);
+        task.abort();
+        Ok(())
+    }
+
+    /// Metadata that would leave fragment #1 no payload is not embedded, so
+    /// every fragment carries payload and the stream arrives intact.
+    #[tokio::test(start_paused = true)]
+    async fn send_stream_never_emits_an_empty_fragment() -> Result<(), Box<dyn std::error::Error>> {
+        for meta_len in [MAX_DATA_SIZE - 10, MAX_DATA_SIZE - 9, MAX_DATA_SIZE] {
+            let (outbound_sender, mut outbound_receiver) = mpsc::channel(100);
+            let remote_addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 8080);
+            let message: Vec<u8> = (0..3_000u32).map(|i| i as u8).collect();
+            let cipher = random_cipher();
+            let task = GlobalExecutor::spawn(send_stream(
+                StreamId::next_operations(),
+                Arc::new(AtomicU32::new(0)),
+                Arc::new(TestSocket::new(outbound_sender)),
+                remote_addr,
+                Bytes::from(message.clone()),
+                cipher.clone(),
+                Arc::new(parking_lot::Mutex::new(SentPacketTracker::new())),
+                Arc::new(TokenBucket::new(1_000_000, 100_000_000)),
+                big_cwnd(),
+                RealTime::new(),
+                Some(Bytes::from(vec![9u8; meta_len])),
+                None,
+                None,
+            ));
+            task.await??;
+            let mut received = Vec::new();
+            while let Ok((_, packet)) = outbound_receiver.try_recv() {
+                let decrypted = PacketData::<_, MAX_PACKET_SIZE>::from_buf(packet.as_ref())
+                    .try_decrypt_sym(&cipher)
+                    .map_err(|e| e.to_string())?;
+                let SymmetricMessagePayload::StreamFragment {
+                    payload,
+                    metadata_bytes,
+                    fragment_number,
+                    ..
+                } = SymmetricMessage::deser(decrypted.data())?.payload
+                else {
+                    panic!("expected a stream fragment");
+                };
+                assert!(
+                    !payload.is_empty(),
+                    "meta_len {meta_len}: fragment {fragment_number} is empty"
+                );
+                if let Some(meta) = metadata_bytes {
+                    assert_eq!(fragment_number, 1);
+                    assert!(1 + 8 + meta.len() < MAX_DATA_SIZE);
+                }
+                received.extend_from_slice(&payload);
+            }
+            assert_eq!(received, message, "meta_len {meta_len}");
+        }
+        Ok(())
+    }
+
+    /// `pipe_stream` applies the same length check to the stream it forwards.
+    #[tokio::test(start_paused = true)]
+    async fn pipe_stream_refuses_a_stream_with_an_invalid_length() {
+        use crate::transport::peer_connection::streaming::StreamHandle;
+
+        let (outbound_sender, mut outbound_receiver) = mpsc::channel(4);
+        let remote_addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 8080);
+        let result = pipe_stream(
+            StreamHandle::new(StreamId::next_operations(), 0),
+            StreamId::next_operations(),
+            Arc::new(AtomicU32::new(0)),
+            Arc::new(TestSocket::new(outbound_sender)),
+            remote_addr,
+            random_cipher(),
+            Arc::new(parking_lot::Mutex::new(SentPacketTracker::new())),
+            Arc::new(TokenBucket::new(1_000_000, 100_000_000)),
+            big_cwnd(),
+            RealTime::new(),
+            None,
+            None,
+        )
+        .await;
+        let err = result.expect_err("an empty stream must not be forwarded");
+        assert!(
+            matches!(err, TransportError::OutboundStreamInvalidLength(addr, 0) if addr == remote_addr),
+            "got: {err:?}"
+        );
+        assert!(!err.is_transient_send_failure());
+        assert!(outbound_receiver.try_recv().is_err());
     }
 
     /// Core regression for issue #4345: when an outbound stream aborts on a

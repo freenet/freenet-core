@@ -12,6 +12,17 @@ pub(crate) mod test;
 #[cfg(test)]
 mod test_correlation;
 pub(crate) mod types;
+
+/// Largest client WebSocket message, and frame, the node accepts (see
+/// `websocket::configure_upgrade`).
+///
+/// Lives here, outside the `websocket` feature gate, because it is also the
+/// only bound on the size of a contract's code: a client PUT carries code,
+/// parameters and state in one message of at most this many bytes. The
+/// transport's inbound stream cap (`streaming::MAX_STREAM_TOTAL_BYTES`) is
+/// derived from it, and that cap must not depend on which features this node
+/// was built with, since the peer sending the stream may differ.
+pub(crate) const WEBSOCKET_MAX_MESSAGE_SIZE: usize = 100 * 1024 * 1024;
 /// Per-user operation/export rate limiting for hosted mode (#4561, P5 of #4381).
 /// Not gated on the `websocket` feature: it has no axum dependency (just
 /// `DashMap` + `tokio::time` + `UserId`) and its `DEFAULT_*` constants are the

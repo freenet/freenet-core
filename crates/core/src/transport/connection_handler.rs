@@ -1763,7 +1763,7 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                                     crate::transport::TRANSPORT_METRICS
                                         .record_nat_traversal_failed_version();
                                 }
-                                TransportError::ChannelClosed | TransportError::ConnectionClosed(_) | TransportError::ConnectionEstablishmentFailure { .. } | TransportError::SendFailed(..) | TransportError::OutboundStreamFailed(_) | TransportError::IO(_) | TransportError::Other(_) | TransportError::PubKeyDecryptionError(_) | TransportError::Serialization(_) => {
+                                TransportError::ChannelClosed | TransportError::ConnectionClosed(_) | TransportError::ConnectionEstablishmentFailure { .. } | TransportError::SendFailed(..) | TransportError::OutboundStreamFailed(_) | TransportError::OutboundStreamInvalidLength(..) | TransportError::IO(_) | TransportError::Other(_) | TransportError::PubKeyDecryptionError(_) | TransportError::Serialization(_) => {
                                     tracing::error!(error = %error, peer_addr = %remote_addr, "Failed NAT traversal");
                                     crate::transport::TRANSPORT_METRICS
                                         .record_nat_traversal_failed_error();
@@ -2775,6 +2775,7 @@ fn classify_nat_failure(
         | TransportError::ConnectionClosed(_)
         | TransportError::ConnectionEstablishmentFailure { .. }
         | TransportError::OutboundStreamFailed(_)
+        | TransportError::OutboundStreamInvalidLength(..)
         | TransportError::IO(_)
         | TransportError::Other(_)
         | TransportError::PubKeyDecryptionError(_)
@@ -3187,6 +3188,7 @@ pub mod mock_transport {
             | TransportError::ConnectionEstablishmentFailure { .. }
             | TransportError::SendFailed(..)
             | TransportError::OutboundStreamFailed(_)
+            | TransportError::OutboundStreamInvalidLength(..)
             | TransportError::IO(_)
             | TransportError::Other(_)
             | TransportError::PubKeyDecryptionError(_)
@@ -3203,6 +3205,7 @@ pub mod mock_transport {
             | TransportError::ProtocolVersionMismatch { .. }
             | TransportError::SendFailed(..)
             | TransportError::OutboundStreamFailed(_)
+            | TransportError::OutboundStreamInvalidLength(..)
             | TransportError::IO(_)
             | TransportError::Other(_)
             | TransportError::PubKeyDecryptionError(_)

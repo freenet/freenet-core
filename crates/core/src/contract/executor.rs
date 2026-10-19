@@ -2495,6 +2495,22 @@ mod tests {
             // operation, so they are not memory the node holds resident.
             ("MAX_EVIDENCE_INPUT_BYTES", "per-request input limit"),
             ("MAX_IMPORT_BUNDLE_BYTES", "per-request import limit"),
+            // Inbound stream reassembly is bounded per connection (stream
+            // count, bytes, eviction), not by a node memory budget: an
+            // explicit exception to the rule that byte budgets join this
+            // aggregate (`.claude/rules/bug-prevention-patterns.md`, recorded
+            // there under "Recorded exception"). Node-wide it is at most the
+            // number of connections times the per-connection allowance;
+            // node-wide fairness is left to the transport redesign.
+            (
+                "MAX_STREAM_TOTAL_BYTES",
+                "per-stream wire length limit; reassembly memory is bounded per \
+                 connection, not by a node budget (see comment)",
+            ),
+            (
+                "STREAM_ENVELOPE_MARGIN_BYTES",
+                "term inside MAX_STREAM_TOTAL_BYTES",
+            ),
             ("MAX_PULL_IMPORT_REQUEST_BYTES", "per-request limit"),
             ("MAX_PULL_STORE_BYTES", "per-user on-DISK quota, not RAM"),
             (

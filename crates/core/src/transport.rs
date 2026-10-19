@@ -374,6 +374,12 @@ pub enum TransportError {
     SendFailed(SocketAddr, std::io::ErrorKind),
     #[error("outbound stream to {0} failed (stream-scoped, connection survives)")]
     OutboundStreamFailed(SocketAddr),
+    /// An outbound stream was not started because its length is outside
+    /// what a receiver admits (`streaming::check_declared_stream_length`).
+    /// Stream-scoped like [`Self::OutboundStreamFailed`], but not transient:
+    /// the same message fails the same way on every attempt.
+    #[error("outbound stream to {0} not sent: length {1} is outside the stream limits")]
+    OutboundStreamInvalidLength(SocketAddr, u64),
     #[error(transparent)]
     IO(#[from] std::io::Error),
     #[error(transparent)]
@@ -759,6 +765,13 @@ pub(crate) trait PeerConnectionApi: Send {
     /// idle timeout. Read after `recv` returns an error, to label the
     /// disconnect in telemetry. Defaults to `false` for test doubles.
     fn closed_by_idle_timeout(&self) -> bool {
+        false
+    }
+
+    /// Whether `recv` ended this connection because the peer had more
+    /// refused inbound streams outstanding than are remembered. Read after
+    /// `recv` returns an error, to label the disconnect. Defaults to `false`.
+    fn closed_by_stream_refusals(&self) -> bool {
         false
     }
 
