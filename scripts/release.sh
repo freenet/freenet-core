@@ -761,7 +761,11 @@ update_versions() {
 
     # Update Cargo.lock to match new versions
     echo -n "  Updating Cargo.lock... "
-    if cargo update --workspace --quiet 2>/dev/null; then
+    # apps/freenet-ping is a separate nested workspace whose Cargo.lock
+    # path-depends on crates/core, so re-sync it too (`cargo metadata` updates
+    # only the path-dep version, nothing else). CI checks it with --locked.
+    if cargo update --workspace --quiet 2>/dev/null \
+        && cargo metadata --format-version 1 --manifest-path "$PROJECT_ROOT/apps/freenet-ping/Cargo.toml" >/dev/null 2>&1; then
         echo "✓"
     else
         echo "✗"
@@ -887,7 +891,7 @@ create_release_pr() {
             echo "  ℹ️  No changes to commit (version bump already committed)"
         else
             # Stage only the files modified by the version bump — never git add -A
-            git add crates/core/Cargo.toml crates/fdev/Cargo.toml Cargo.lock
+            git add crates/core/Cargo.toml crates/fdev/Cargo.toml Cargo.lock apps/freenet-ping/Cargo.lock
             run_cmd "Committing version bump" git commit -m "build: bump versions to $VERSION
 
 - freenet: → $VERSION

@@ -15342,15 +15342,27 @@ fn run_subscription_mesh(
         ));
     }
 
-    // Generous settle (120s ≈ 4 renewal/expiry cycles at 30s each) so the
-    // expire-sweep + interest-gated non-renewal removes every lapsed lease
-    // before the final snapshot.
-    let result = sim.run_controlled_simulation(
-        seed,
-        ops,
-        Duration::from_secs(360),
-        Duration::from_secs(120),
-    );
+    // Post-operation settle, in virtual time. Wall-clock cost scales with
+    // virtual time (every node is stepped each turmoil tick), and this test runs
+    // six of these sims, so the settle is sized to what each phase needs rather
+    // than a blanket 120s (which made the test sit at ~1x the 240s CI cap on
+    // slower machines):
+    //
+    // * COLLAPSE: 60s = two `SUBSCRIPTION_RECOVERY_INTERVAL` (30s) renewal
+    //   cycles after the clock jump. A renewal that wrongly re-extends a lapsed
+    //   lease fires in the first cycle, and the snapshot (refreshed every 1s,
+    //   filtering on `expires_at > now`) would show it as a survivor.
+    // * FORMATION: 30s after the last subscribe is enough for the subscribes to
+    //   complete, and measures the mesh close to the moment the COLLAPSE run
+    //   starts disconnecting it. Leases are 8 minutes, so nothing lapses in
+    //   either window without the clock jump.
+    let post_operations_wait = if collapse {
+        Duration::from_secs(60)
+    } else {
+        Duration::from_secs(30)
+    };
+    let result =
+        sim.run_controlled_simulation(seed, ops, Duration::from_secs(360), post_operations_wait);
     assert!(
         result.turmoil_result.is_ok(),
         "seed={seed:x} collapse={collapse}: sim failed: {:?}",
