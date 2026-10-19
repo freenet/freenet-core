@@ -176,11 +176,13 @@ ANCHOR_RE = re.compile(
 EXEMPT_MARKER = "dry-run-safe:"
 BLOCK_SCALAR_RE = re.compile(r"^[|>][1-9]?[-+]?[1-9]?\s*(#.*)?$")
 
-# Only actions that write nothing outside the run. Cache actions (including
-# `Swatinem/rust-cache` and `actions/setup-*` with `cache:`) are deliberately
-# absent: a cache SAVE is a shared write that a later live run restores.
-# `permissions: {}` grants nothing and parses as {"*": "{}"}.
-READ_ONLY_PERMS = ("read", "none", "read-all", "{}")
+READ_ONLY_PERMS = ("read", "none", "read-all")
+
+
+def _read_only(perms: dict[str, str]) -> bool:
+    """`permissions: {}` grants nothing; it parses as {"*": "{}"}, and is
+    accepted only in that whole-block form."""
+    return perms == {"*": "{}"} or all(v in READ_ONLY_PERMS for v in perms.values())
 
 
 def _action(uses: str) -> str:
@@ -189,6 +191,9 @@ def _action(uses: str) -> str:
     return uses.split("@", 1)[0].strip().strip("\"'").lower()
 
 
+# Only actions that write nothing outside the run. Cache actions (including
+# `Swatinem/rust-cache` and `actions/setup-*` with `cache:`) are deliberately
+# absent: a cache SAVE is a shared write that a later live run restores.
 READ_ONLY_ACTIONS = (
     "actions/checkout",
     "actions/upload-artifact",
@@ -909,12 +914,10 @@ def check_source(text: str, name: str, repo_root: Path) -> list[str]:
         # Rule 5c: a dry-run-only job holds a read-only token.
         if DRY_ONLY in conjuncts(job.keys.get("if", "")):
             perms = job.permissions
-            if not perms or any(v not in READ_ONLY_PERMS for v in perms.values()):
+            if not perms or not _read_only(perms):
                 err(job.line, f"job `{job.name}` runs only in a dry run, so it must declare read-only `permissions:` (got {perms or 'the workflow default'}).")
 
-        read_only = bool(job.permissions) and all(
-            v in READ_ONLY_PERMS for v in job.permissions.values()
-        )
+        read_only = bool(job.permissions) and _read_only(job.permissions)
         # An OIDC token is a publish credential wherever trusted publishing is
         # configured, and it is not covered by the token rules above.
         effective = job.permissions or workflow_perms

@@ -35,6 +35,9 @@ set -euo pipefail
 # git environment out of it: an exported GIT_DIR would aim it at a real repo,
 # and global signing or hook settings would fail or prompt.
 unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY
+# An ambient token would satisfy the "every gh call has a GH_TOKEN" checks
+# vacuously; the steps must supply their own.
+unset GH_TOKEN GITHUB_TOKEN
 export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
