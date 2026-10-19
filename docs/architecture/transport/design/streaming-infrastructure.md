@@ -354,7 +354,7 @@ once. See [`.claude/rules/transport.md`](../../../../.claude/rules/transport.md)
 A stream abort returns `TransportError::OutboundStreamFailed(peer_addr)`, a
 **stream-scoped** error — NOT `ConnectionClosed`. The connection survives, so
 subsequent streams on it can proceed or retry. The operations layer classifies it
-as a transient send failure (`is_transient_send_failure()`): the idle timeout
+as a transient send failure (`is_transient()`): the idle timeout
 remains the sole authority on connection liveness, and the op layer times out and
 retries against another candidate (#4374).
 

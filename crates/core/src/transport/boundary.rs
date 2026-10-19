@@ -10,8 +10,9 @@
 //!
 //! - Connection setup is outside the trait (`create_connection_handler`,
 //!   `ExpectedInboundTracker`).
-//! - [`TransportError`] is UDP-shaped and drives control flow in the bridge
-//!   (`is_transient_send_failure` in `p2p_protoc.rs`).
+//! - [`TransportError`]'s variants are UDP-shaped. The bridge classifies
+//!   errors only through [`TransportError::scope`], but still constructs
+//!   `ConnectionClosed` and `Other` itself.
 //! - The caller picks stream ids ([`StreamId`]: a `u32` with an operations
 //!   bit).
 //! - [`InboundStreamRegistry`] is fragment-based (`Weak<LockFreeStreamBuffer>`).

@@ -2935,7 +2935,7 @@ impl HandshakeSendFailures {
 /// keeps only its `ErrorKind`, and some kinds (`Uncategorized`) name nothing.
 /// Before #5871 these sends mapped every error to `ChannelClosed` and the OS
 /// error was lost. No consumer of a handshake result classifies it with
-/// `is_transient_send_failure`; that predicate is for established connections.
+/// `is_transient`; that predicate is for established connections.
 ///
 /// Inbound (gateway) failures log at `info!`: an unauthenticated intro with a
 /// spoofed source address can trigger them, limited only by the per-IP intro

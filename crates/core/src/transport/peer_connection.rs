@@ -1775,7 +1775,7 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                         //    the counter does not). This concentrates at
                         //    teardown, and `record_transfer_completed` above has
                         //    the same gap.
-                        Err(e) if e.is_transient_send_failure() => {
+                        Err(e) if e.is_transient() => {
                             super::TRANSPORT_METRICS.record_transfer_failed();
                             #[cfg(test)]
                             {
@@ -2824,7 +2824,7 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
         }
         match self.noop(receipts).await {
             Ok(()) => Ok(()),
-            Err(e) if e.is_transient_send_failure() => {
+            Err(e) if e.is_transient() => {
                 tracing::warn!(
                     peer_addr = %self.remote_conn.remote_addr,
                     "ACK noop send failed; the remote's retransmission will be re-acked"
@@ -3596,10 +3596,7 @@ mod tests {
             .await;
 
             let err = result.expect_err("should fail");
-            assert!(
-                err.is_transient_send_failure(),
-                "expected SendFailed, got: {err:?}"
-            );
+            assert!(err.is_transient(), "expected SendFailed, got: {err:?}");
             assert!(
                 !matches!(err, TransportError::ConnectionClosed(_)),
                 "should NOT be ConnectionClosed"
@@ -3624,7 +3621,7 @@ mod tests {
     /// behind that blocks the next send on the same socket+key. It does NOT
     /// exercise connection teardown: the decision to keep or drop the
     /// connection lives in the callers that consume this error
-    /// (`is_transient_send_failure` dispatch sites), which this free function
+    /// (`is_transient` dispatch sites), which this free function
     /// does not drive. That residual caller-level gap is the #3321 follow-up.
     #[test]
     fn transient_send_failure_then_recovery_succeeds() {
@@ -3664,7 +3661,7 @@ mod tests {
             .await
             .expect_err("send during blip should fail");
             assert!(
-                err.is_transient_send_failure(),
+                err.is_transient(),
                 "blip must surface as a transient failure callers can swallow, got: {err:?}"
             );
             assert!(
@@ -3701,9 +3698,9 @@ mod tests {
     /// All transient send error kinds observed in production (the ENETUNREACH
     /// family and friends) must classify as transient so the p2p error
     /// handlers swallow them instead of closing the connection.  This locks
-    /// the `is_transient_send_failure` contract the #3321 fix relies on.
+    /// the `is_transient` contract the #3321 fix relies on.
     ///
-    /// Classification is deliberately kind-agnostic: `is_transient_send_failure`
+    /// Classification is deliberately kind-agnostic: `is_transient`
     /// matches `SendFailed(..)` on the *variant*, not the inner `ErrorKind`, so
     /// every send error is connection-local regardless of errno. The loop below
     /// therefore pins "every `SendFailed` is transient"; the explicit negative
@@ -3723,7 +3720,7 @@ mod tests {
         ] {
             let err = TransportError::SendFailed(remote_addr, kind);
             assert!(
-                err.is_transient_send_failure(),
+                err.is_transient(),
                 "SendFailed({kind:?}) must be transient so the connection survives — issue #3321"
             );
         }
@@ -3733,11 +3730,11 @@ mod tests {
         // closures. `ConnectionClosed` and `ChannelClosed` are the canonical
         // non-transient variants.
         assert!(
-            !TransportError::ConnectionClosed(remote_addr).is_transient_send_failure(),
+            !TransportError::ConnectionClosed(remote_addr).is_transient(),
             "ConnectionClosed must NOT be swallowed as a transient send failure — issue #3321"
         );
         assert!(
-            !TransportError::ChannelClosed.is_transient_send_failure(),
+            !TransportError::ChannelClosed.is_transient(),
             "ChannelClosed must NOT be swallowed as a transient send failure — issue #3321"
         );
     }
@@ -5542,7 +5539,7 @@ mod tests {
     ///
     /// What the test asserts:
     ///   1. Each failed send returns `Err` classified as transient
-    ///      (`is_transient_send_failure()`, NOT `ConnectionClosed`), and the
+    ///      (`is_transient()`, NOT `ConnectionClosed`), and the
     ///      `&mut PeerConnection` is neither consumed nor poisoned — we keep
     ///      calling `send` on the same object across the whole burst.
     ///   2. After flipping the failure flag off, the very same connection sends
@@ -5637,7 +5634,7 @@ mod tests {
                 .await
                 .expect_err("send must fail while the socket is failing");
             assert!(
-                err.is_transient_send_failure(),
+                err.is_transient(),
                 "burst send #{attempt} must be a transient send failure so the \
                  connection survives (#3321/#3367), got: {err:?}"
             );
@@ -5797,11 +5794,11 @@ mod tests {
         // `OutboundStreamFailed` is what send_stream/pipe_stream's stream-scoped
         // error sites return (cwnd-wait timeout, pipe inactivity stall,
         // inbound-feed error) — the dominant outbound-stream failure by far. It
-        // is `is_transient_send_failure()`, so it takes the connection-survives
+        // is `is_transient()`, so it takes the connection-survives
         // arm.
         let err = TransportError::OutboundStreamFailed(remote_addr);
         assert!(
-            err.is_transient_send_failure(),
+            err.is_transient(),
             "test premise: OutboundStreamFailed must be classified transient, \
              otherwise this test is silently exercising the other arm"
         );
@@ -5849,7 +5846,7 @@ mod tests {
     /// yields `ConnectionClosed` (see the `inbound.ok_or_else(..)` site in
     /// `recv`), so asserting on that variant could pass for the wrong reason.
     /// The sentinel proves the error came from OUR stream task. What the arm
-    /// actually keys off is the `!is_transient_send_failure()` predicate, which
+    /// actually keys off is the `!is_transient()` predicate, which
     /// the test asserts directly.
     #[tokio::test]
     async fn recv_records_transfer_failed_on_terminal_stream_failure() {
@@ -5867,7 +5864,7 @@ mod tests {
             cause: SENTINEL.into(),
         };
         assert!(
-            !err.is_transient_send_failure(),
+            !err.is_transient(),
             "test premise: the injected error must NOT be classified transient, \
              otherwise this test is silently exercising the other arm"
         );
