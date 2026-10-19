@@ -443,10 +443,14 @@ branch, opens and merges no PR, and creates no tag or release, so `main` does
 not move.
 
 Every mutating step is gated on the single `needs.validate.outputs.live`
-value and refuses in its own script when that is not `true`. Steps that run in
-a dry run get no credential, and the bump job's checkout persists none. Rule
-Lint's `.github/scripts/check_release_dry_run.py` fails a PR that breaks any
-of that (#5936).
+value and refuses in its own script when that is not `true`. `RELEASE_PAT` never
+reaches a step that runs in a dry run, and no other secret does either, except
+two: the bump job's checkout fetches with the workflow token and persists
+nothing, and the rehearsal job's changelog step uses its read-only token. (The
+bump job itself still holds the workflow's write token; nothing that runs in a
+dry run is handed it.) Rule Lint's
+`.github/scripts/check_release_dry_run.py` fails a PR that breaks any of that
+(#5936).
 
 Caveats:
 
@@ -454,9 +458,12 @@ Caveats:
   file comes from the ref you dispatch. Before that fix a "dry run" pushed
   the branch and auto-merged the bump PR, so `--ref` pointing at an older tag
   or branch still does.
-- **It does not exercise the live-only half:** waiting for the bump PR's
-  merge queue (`wait_for_pr`, `resolve_release_sha.sh`), GitHub's generated
-  release notes, the tag push and the release creation.
+- **It does not exercise the live-only half:** the `CARGO_REGISTRY_TOKEN`
+  presence check, waiting for the bump PR's merge queue (`wait_for_pr`,
+  `resolve_release_sha.sh`), GitHub's generated release notes, the tag push
+  and the release creation, and everything the tag triggers in
+  `cross-compile.yml` (binaries, Gate A, the crates.io publish). A green dry
+  run says the bump and the packaging are sound, not that a cut will ship.
 - Whether a dry run needs the pre-cut preconditions is decided by the
   `freenet:release` skill, not here.
 
@@ -467,8 +474,8 @@ gh workflow run release.yml
     └─→ release.yml: validate   (resolves dry_run → outputs.live)
     └─→ release.yml: update_versions
             └─→ dry run: commits the bump locally, prints what it would
-                push, then dry_run_rehearsal packages that commit; NOTHING
-                below this point runs
+                push and bundles the commit; dry_run_rehearsal then verifies
+                and packages it. Of what follows, only the summary runs
             └─→ (live only) creates "build: release X.Y.Z" PR
             └─→ (live only) ci.yml runs on PR (using RELEASE_PAT scope)
             └─→ (live only) PR auto-merges to main

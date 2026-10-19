@@ -21,13 +21,21 @@
 #      which would break a LIVE release -- fails here;
 #   5. every mutating step of the real release.yml, EXECUTED with stubbed
 #      git/gh and its real `env:`, refuses before calling anything when not
-#      live, and when live reaches its command with no empty argument (so the
-#      refusal is what stops it, and the live plumbing is intact);
-#   6. the linter and this test are wired into CI.
+#      live, and when live reaches its command with no empty argument and the
+#      right expression feeding each argument;
+#   6. the real non-mutating steps of the dry path (bump, compose, report,
+#      bundle, rehearsal checkout, verifier) run end to end in throwaway repos;
+#   7. the linter and this test are wired into CI, and not disabled in place.
 #
 # Run manually with: bash scripts/release_dry_run_test.sh
 
 set -euo pipefail
+
+# The end-to-end section runs real git in throwaway repos. Keep the caller's
+# git environment out of it: an exported GIT_DIR would aim it at a real repo,
+# and global signing or hook settings would fail or prompt.
+unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY
+export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -244,11 +252,26 @@ for step in "update_versions / Dry run: report what a live run would push" \
     check "dry runs '$step'" "$(grep -cxF "$step" <<< "$DRY_RUN")" "1"
     check "live does not run '$step'" "$(grep -cxF "$step" <<< "$LIVE_RUN")" "0"
 done
-# ORDER, not just membership: the PR is composed before it is opened, the
-# branch is pushed before the PR names it, the PR exists before auto-merge.
-check "live: update_versions runs its steps in this order" \
-    "$(grep '^update_versions / ' <<< "$LIVE_RUN" | sed 's/^update_versions \/ //' | paste -sd'|' -)" \
+# ORDER, not just membership, for every job in both modes: the PR is composed
+# before it is opened and the branch pushed before the PR names it; the
+# checkout verifier runs before the tag push and before each packaging check;
+# the bundle is fetched before it is checked out. A reordering that changes
+# behaviour must change this list deliberately.
+seq() { grep "^$2 / " <<< "$1" | sed "s|^$2 / ||" | paste -sd'|' -; }
+check "live: validate step order" "$(seq "$LIVE_RUN" validate)" \
+    "Checkout code|Resolve run mode (live or dry run)|Warn if RELEASE_PAT is not configured|Verify the crates.io token before anything is created|Resolve + validate version"
+check "live: update_versions step order" "$(seq "$LIVE_RUN" update_versions)" \
     "Checkout code|Configure git|Update freenet version|Update fdev version|Install Rust|Update Cargo.lock|Commit the version bump locally|Compose the release PR|Push the release branch|Create Pull Request|Enable auto-merge"
+check "live: wait_for_pr step order" "$(seq "$LIVE_RUN" wait_for_pr)" \
+    "Checkout code|Wait for PR to be merged|Resolve the release commit"
+check "live: verify_publishable step order" "$(seq "$LIVE_RUN" verify_publishable)" \
+    "Checkout the validated release commit|Verify the checkout is the validated release commit|Install Rust|Verify freenet packages cleanly (dry run)"
+check "live: create_release step order" "$(seq "$LIVE_RUN" create_release)" \
+    "Checkout the validated release commit|Verify the checkout is the validated release commit|Generate release notes|Create and push tag|Create GitHub release"
+check "dry: update_versions step order" "$(seq "$DRY_RUN" update_versions)" \
+    "Checkout code|Configure git|Update freenet version|Update fdev version|Install Rust|Update Cargo.lock|Commit the version bump locally|Compose the release PR|Dry run: report what a live run would push|Dry run: hand the bump commit to the rehearsal job"
+check "dry: dry_run_rehearsal step order" "$(seq "$DRY_RUN" dry_run_rehearsal)" \
+    "Checkout the launch commit|Fetch the bump bundle|Check out the unpushed version-bump commit|Verify the checkout is the bump commit|Install Rust|Verify freenet packages cleanly (dry run)|Changelog since the previous release"
 # Failure paths: nothing irreversible may follow a failed gate.
 check "live: a failed wait_for_pr stops publishing and tagging" \
     "$(simulate live --fail wait_for_pr | grep -cE '^(verify_publishable|create_release)$')" "0"
@@ -256,6 +279,8 @@ check "live: a failed packaging check stops tagging" \
     "$(simulate live --fail verify_publishable | grep -cxF create_release)" "0"
 check "live: a failed version bump stops everything after it" \
     "$(simulate live --fail update_versions | grep -v ' / ' | paste -sd' ' -)" "validate update_versions summary"
+check "live: a failed validate runs nothing but the summary" \
+    "$(simulate live --fail validate | grep -v ' / ' | paste -sd' ' -)" "validate summary"
 check "dry: a failed validate runs nothing but the summary" \
     "$(simulate dry --fail validate | grep -v ' / ' | paste -sd' ' -)" "validate summary"
 
@@ -270,7 +295,7 @@ check "dry: a failed validate runs nothing but the summary" \
 
 STUBS="$TEST_TMP/stubs"
 mkdir -p "$STUBS"
-for tool in git gh cargo curl docker npm; do
+for tool in git gh cargo curl docker npm wget ssh scp; do
     cat > "$STUBS/$tool" <<'SH'
 #!/usr/bin/env bash
 echo "$(basename "$0") $*" >> "$STUB_CALLS"
@@ -363,7 +388,7 @@ WF_VERSION="9.9.9"
 WF_FDEV="9.9.8"
 VALUES="$TEST_TMP/values"
 printf '%s\n' "needs.validate.outputs.version=$WF_VERSION" "needs.validate.outputs.fdev_version=$WF_FDEV" \
-    "needs.validate.outputs.live=false" > "$VALUES"
+    "needs.validate.outputs.live=false" "secrets.GITHUB_TOKEN=fake-read-only-token" > "$VALUES"
 
 run_wf_step() {
     # run_wf_step <job> <step name> <step id or -> <dir>: runs that step from
@@ -397,9 +422,9 @@ PY
     while IFS= read -r line; do [[ -n "$line" ]] && envs+=("$line"); done < "$TEST_TMP/step.env"
     (
         builtin cd -- "$workdir" || exit 99
-        env "${envs[@]}" GITHUB_OUTPUT="$out" GITHUB_STEP_SUMMARY="$TEST_TMP/summary" \
-            RUNNER_TEMP="$TEST_TMP/runner" GITHUB_REPOSITORY=example/repo \
-            bash -e "$TEST_TMP/step.sh"
+        env ${envs[@]+"${envs[@]}"} PATH="${STEP_PATH:-$PATH}" GITHUB_OUTPUT="$out" \
+            GITHUB_STEP_SUMMARY="$TEST_TMP/summary" RUNNER_TEMP="$TEST_TMP/runner" \
+            GITHUB_REPOSITORY=example/repo bash -e "$TEST_TMP/step.sh"
     ) > "$TEST_TMP/step.log" 2>&1 || rc=$?
     if [[ "$id" != "-" ]]; then
         while IFS= read -r line; do
@@ -418,7 +443,8 @@ git -C "$TEST_TMP/origin" add -A
 git -C "$TEST_TMP/origin" -c user.email=t@example.invalid -c user.name=t commit -q -m base
 LAUNCH_SHA=$(git -C "$TEST_TMP/origin" rev-parse HEAD)
 echo "github.sha=$LAUNCH_SHA" >> "$VALUES"
-git clone -q --depth 1 "file://$TEST_TMP/origin" "$TEST_TMP/bump" 2>/dev/null
+check "a depth-1 clone of the launch commit, as actions/checkout makes" \
+    "$(git clone -q --depth 1 "file://$TEST_TMP/origin" "$TEST_TMP/bump" 2>&1 && echo cloned)" "cloned"
 
 for spec in "Configure git|-" "Update freenet version|-" "Update fdev version|-" \
             "Commit the version bump locally|bump" "Compose the release PR|pr_text" \
@@ -435,21 +461,107 @@ check "the PR body names both versions" \
     "$(grep -cE "freenet: → \*\*$WF_VERSION\*\*|fdev: → \*\*$WF_FDEV\*\*" "$(value steps.pr_text.outputs.body_file)")" "2"
 check "the bump commit carries the new freenet version" \
     "$(git -C "$TEST_TMP/bump" show HEAD:crates/core/Cargo.toml | grep -m1 '^version = ')" "version = \"$WF_VERSION\""
+check "the bump commit carries the new fdev version" \
+    "$(git -C "$TEST_TMP/bump" show HEAD:crates/fdev/Cargo.toml | grep -m1 '^version = ')" "version = \"$WF_FDEV\""
+check "fdev's freenet dependency follows the release version" \
+    "$(git -C "$TEST_TMP/bump" show HEAD:crates/fdev/Cargo.toml | grep -cE "^freenet = \{ path = \"\.\./core\", version = \"$WF_VERSION\"")" "1"
+check "the bundle carries only the bump commit (the launch commit is its prerequisite)" \
+    "$(git -C "$TEST_TMP/bump" bundle verify "$TEST_TMP/runner/release-bump.bundle" 2>&1 | grep -c "$LAUNCH_SHA")" "1"
 check "the dry-run report hands over the bump commit" \
     "$(value steps.dry_run_report.outputs.bump_sha)" "$(git -C "$TEST_TMP/bump" rev-parse HEAD)"
 check "the dry-run report says nothing was pushed" "$(grep -c 'nothing was pushed' "$TEST_TMP/summary")" "1"
 
 # The rehearsal, in a separate depth-1 clone of the launch commit, as the job sees it.
 echo "needs.update_versions.outputs.dry_run_bump_sha=$(value steps.dry_run_report.outputs.bump_sha)" >> "$VALUES"
-git clone -q --depth 1 "file://$TEST_TMP/origin" "$TEST_TMP/rehearse" 2>/dev/null
-mkdir -p "$TEST_TMP/runner/bump"
-check "the dry-run report wrote the bundle the rehearsal fetches" \
-    "$(cp "$TEST_TMP/runner/release-bump.bundle" "$TEST_TMP/runner/bump/" 2>/dev/null && echo present || echo missing)" "present"
+check "a second depth-1 clone for the rehearsal job" \
+    "$(git clone -q --depth 1 "file://$TEST_TMP/origin" "$TEST_TMP/rehearse" 2>&1 && echo cloned)" "cloned"
+# The artifact hand-off, as declared in release.yml: the upload and download
+# must name the same artifact, and the file the upload takes must land where
+# the checkout step fetches it. Emulated from the declared paths, not placed
+# by hand, so a renamed name or path fails here instead of on every dry run.
+SEAM=$(python3 - "$LINTER" "$RELEASE_YML" "$TEST_TMP/runner" <<'PY'
+import importlib.util, os, sys
+spec = importlib.util.spec_from_file_location("lint", sys.argv[1]); m = importlib.util.module_from_spec(spec)
+sys.modules["lint"] = m
+spec.loader.exec_module(m)
+text, runner = open(sys.argv[2]).read(), sys.argv[3]
+_, up = m.find_step(text, "update_versions", "Dry run: hand the bump commit to the rehearsal job")
+_, down = m.find_step(text, "dry_run_rehearsal", "Fetch the bump bundle")
+t = lambda v: v.replace("${{ runner.temp }}", runner)
+src, dest = t(up.with_["path"]), t(down.with_["path"])
+print(up.with_.get("name") == down.with_.get("name"), src, os.path.join(dest, os.path.basename(src)))
+PY
+)
+read -r SEAM_NAMES SEAM_SRC SEAM_DEST <<< "$SEAM"
+check "upload and download name the same artifact" "$SEAM_NAMES" "True"
+check "the dry-run report wrote the file the upload takes" "$([ -f "$SEAM_SRC" ] && echo present || echo missing)" "present"
+mkdir -p "$(dirname "$SEAM_DEST")"
+cp "$SEAM_SRC" "$SEAM_DEST" 2>/dev/null || true
 for step in "Check out the unpushed version-bump commit" "Verify the checkout is the bump commit"; do
     rc=$(run_wf_step dry_run_rehearsal "$step" - "$TEST_TMP/rehearse")
     check "rehearsal: $step" "$rc" "0"
     [[ "$rc" == "0" ]] || cat "$TEST_TMP/step.log" >&2
 done
+
+# The changelog preview, against a `gh` that answers like GitHub. A failed
+# `gh release list` must fail the step, not read as "no previous release".
+GH_FAKE="$TEST_TMP/ghfake"
+mkdir -p "$GH_FAKE"
+cat > "$GH_FAKE/gh" <<'SH'
+#!/usr/bin/env bash
+echo "gh $*" >> "$GH_FAKE_LOG"
+case "$1 $2" in
+  "release list") [[ "${GH_FAKE_FAIL:-}" == 1 ]] && exit 1; echo "v9.9.8" ;;
+  "api repos/example/repo/compare/"*)
+    if [[ "$*" == *total_commits* ]]; then echo 2; else printf -- '- aaaaaaaaa one\n- bbbbbbbbb two\n'; fi ;;
+esac
+SH
+chmod +x "$GH_FAKE/gh"
+: > "$TEST_TMP/summary"
+rc=$(GH_FAKE_LOG="$TEST_TMP/ghfake.log" STEP_PATH="$GH_FAKE:$PATH" \
+    run_wf_step dry_run_rehearsal "Changelog since the previous release" - "$TEST_TMP/rehearse")
+check "rehearsal: the changelog preview runs" "$rc" "0"
+check "the changelog compares the previous release with the launch commit" \
+    "$(grep -c "compare/v9.9.8...$LAUNCH_SHA" "$TEST_TMP/ghfake.log")" "2"
+check "the changelog skips draft releases" "$(grep -c -- '--exclude-drafts' "$TEST_TMP/ghfake.log")" "1"
+check "the changelog preview lists the commits" "$(grep -c '^- [ab]\{9\} ' "$TEST_TMP/summary")" "2"
+rc=$(GH_FAKE_FAIL=1 GH_FAKE_LOG="$TEST_TMP/ghfake.log" STEP_PATH="$GH_FAKE:$PATH" \
+    run_wf_step dry_run_rehearsal "Changelog since the previous release" - "$TEST_TMP/rehearse")
+check "a failed release listing fails the changelog step" "$([ "$rc" != 0 ] && echo failed || echo passed)" "failed"
+
+# `set -o pipefail` in the report: a failed `git diff` must fail the step, not
+# hide behind `tee`. Only `git diff` fails here (a wrapper delegates every
+# other git command), in a copy of the real bump repo, so nothing else in the
+# step can be what fails it.
+GIT_FAKE="$TEST_TMP/gitfake"
+mkdir -p "$GIT_FAKE"
+REAL_GIT=$(command -v git)
+# The wrapper's $1/$@ are meant literally: they are expanded when it runs.
+# shellcheck disable=SC2016
+printf '#!/usr/bin/env bash\n[ "$1" = diff ] && exit 1\nexec "%s" "$@"\n' "$REAL_GIT" > "$GIT_FAKE/git"
+chmod +x "$GIT_FAKE/git"
+cp -R "$TEST_TMP/bump" "$TEST_TMP/bump-diff-fails"
+rc=$(STEP_PATH="$GIT_FAKE:$PATH" run_wf_step update_versions "Dry run: report what a live run would push" - "$TEST_TMP/bump-diff-fails")
+check "the dry-run report fails when its diff fails" "$([ "$rc" != 0 ] && echo failed || echo passed)" "failed"
+
+# The summary, which used to say "cut and tagged" for every outcome.
+summary_case() {
+    # summary_case <validate result> <live> <create_release result> <expected substring>
+    local base="$TEST_TMP/values.base"
+    [[ -f "$base" ]] || cp "$VALUES" "$base"
+    { grep -v '^needs\.validate\.outputs\.live=' "$base"
+      echo "needs.validate.result=$1"; echo "needs.validate.outputs.live=$2"
+      echo "needs.create_release.result=$3"; echo "needs.dry_run_rehearsal.result=success"
+      echo "github.repository=example/repo"; } > "$VALUES"
+    run_wf_step summary "Release summary" - "$TEST_TMP/rehearse" > /dev/null
+    check "summary for validate=$1 live=$2 create_release=$3" \
+        "$(grep -cF -- "$4" "$TEST_TMP/step.log")" "1"
+    cp "$base" "$VALUES"
+}
+summary_case failure "" skipped "validate did not succeed"
+summary_case success false skipped "DRY RUN for $WF_VERSION"
+summary_case success true failure "did NOT complete"
+summary_case success true success "is cut and tagged"
 
 # --- 7. wiring ----------------------------------------------------------------
 #
@@ -481,8 +593,11 @@ for j in jobs:
                 bad.append(st.label)
             if "continue-on-error" in j.keys:
                 bad.append(j.name)
-            if j.name == "rule_lint" and j.keys.get("if", "").strip() != "github.event_name == 'pull_request'":
-                bad.append("rule_lint if:")
+            # Any job-level `if:` can switch the guard off for PRs; Rule
+            # Lint's own (pull requests only) is the one expected value.
+            expected_if = "github.event_name == 'pull_request'" if j.name == "rule_lint" else ""
+            if j.keys.get("if", "").strip() != expected_if:
+                bad.append(f"{j.name} if:")
 print(("disabled: " + ",".join(bad)) if bad else f"enabled x{seen}")
 PY
 )" "enabled x4"  # Rule Lint self-test + lint, the Fmt-job test, shellcheck

@@ -206,8 +206,9 @@ jobs:
           # workflow token, used for the fetch only, because no credential is
           # persisted to .git/config, so even a `git push` that slipped past
           # every guard below cannot authenticate. The job still holds the
-          # workflow-level write token; Rule Lint forbids handing any token
-          # to a step that runs in a dry run here.
+          # workflow-level write token; Rule Lint forbids handing it, or any
+          # other secret, to a step that runs in a dry run here (this token
+          # line is the one exemption).
           token: ${{ (needs.validate.outputs.live == 'true' && secrets.RELEASE_PAT) || secrets.GITHUB_TOKEN }}
           persist-credentials: ${{ needs.validate.outputs.live == 'true' }}
 

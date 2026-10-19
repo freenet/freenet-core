@@ -14,15 +14,15 @@ that structure the only one that passes:
   1. The `validate` job resolves the input once, in its step `id: mode`
      (`scripts/resolve_release_mode.sh`), and exports `outputs.live`. Only the
      literal input `false` yields `live == 'true'`; anything else is a dry run.
-  2. `inputs.dry_run` is read NOWHERE else (in any spelling GitHub accepts).
+  2. `inputs.dry_run` is read NOWHERE else (dotted or indexed, any case, or
+     through the whole `inputs` object).
      A second reader is how the guards drifted apart in the first place.
   3. Every MUTATING step is gated on `needs.validate.outputs.live == 'true'`,
      as a top-level `&&` term of its own `if:` or its job's `if:`, in an
      expression with no top-level `||` (`&&` binds tighter, so `a || b && G`
      runs without G). A missing or empty output SKIPS the step: fail closed.
-  4. Every mutating `run:` step also refuses in its own script, before its
-     first mutating command, unless `RELEASE_LIVE` (wired from the same
-     output) is `true`. So deleting an `if:` turns a dry run red instead of
+  4. Every mutating `run:` step also refuses, as the FIRST command of its own
+     script, unless `RELEASE_LIVE` (wired from the same output) is `true`. So deleting an `if:` turns a dry run red instead of
      letting it mutate.
   5. Credentials, the rule that makes any gap in the mutation detector below
      harmless. In a job a dry run can reach: `actions/checkout` persists no
@@ -39,8 +39,13 @@ that structure the only one that passes:
      `steps.S.outputs.Y` names a step `id: S` in the same job whose script
      writes `Y=`. A broken reference is silently empty, which on the LIVE path
      skips a guarded step or passes an empty argument.
-  7. Steps the reader cannot place (a `steps:` block it cannot itemise) are an
-     error, not a pass.
+  7. Steps the reader cannot place (a `steps:` block it cannot itemise, a
+     flow-style `steps: [...]` or `- {...}` item, an item with neither `run:`
+     nor `uses:`) are an error, not a pass.
+
+Rule 5 is the guarantee; the mutation detector below is best-effort. Its
+known gaps (a command it does not recognise) cannot write, because a step
+that runs in a dry run holds no usable write credential.
 
 "Mutating" is decided from the step's source, not from its name: `git push`;
 `gh pr|release|workflow|run|issue|label|secret|variable|repo|cache` write
@@ -77,14 +82,18 @@ Usage:
     check_release_dry_run.py [WORKFLOW_DIR]       # lint (default .github/workflows)
     check_release_dry_run.py --self-test
     check_release_dry_run.py --extract-mutating-runs WORKFLOW OUTDIR
-        Writes each mutating `run:` script (expressions replaced by
-        `PLACEHOLDER`) to OUTDIR/NN.sh, its job+step `env:` to OUTDIR/NN.env
-        and its "job / step" label to OUTDIR/NN.name, so
+        Writes each mutating `run:` script (every `${{ expr }}` replaced by
+        `@@expr@@`) to OUTDIR/NN.sh, its job+step `env:` to OUTDIR/NN.env and
+        its "job / step" label to OUTDIR/NN.name, so
         scripts/release_dry_run_test.sh can EXECUTE them.
-    check_release_dry_run.py --simulate WORKFLOW live|dry
-        Evaluates every job and step `if:` for that mode and prints what would
-        run, one `job` or `job / step` per line. Lets the test pin the job
-        topology of BOTH paths, so a guard flipped the wrong way fails CI.
+    check_release_dry_run.py --simulate WORKFLOW live|dry [--fail JOB]
+        Evaluates every job and step `if:` for that mode, with Actions'
+        comparison and truthiness rules, and prints what would run, one `job`
+        or `job / step` per line. `--fail JOB` makes that job fail if it
+        runs. Lets the test pin the topology and failure paths of BOTH modes.
+    check_release_dry_run.py --dump-step WORKFLOW JOB STEP
+        Prints one step's script, a `@@ENV@@` line, then its job+step env,
+        tokenized as above, so the test can run non-mutating steps too.
 
 Tests: scripts/release_dry_run_test.sh (real files, mutations, execution).
 """
@@ -118,6 +127,7 @@ ASSERT_RE = re.compile(
 # a value, so match the context rather than one spelling. A presence test such
 # as `${{ secrets.RELEASE_PAT != '' }}` hands over nothing and is allowed.
 SECRET_RE = re.compile(r"\bsecrets\b|\bgithub\s*\.\s*token\b|\bgithub\s*\[\s*['\"]token", re.I)
+WORKFLOW_TOKEN_RE = re.compile(r"\bsecrets\s*\.\s*github_token\b|\bgithub\s*\.\s*token\b", re.I)
 PAT_RE = re.compile(r"\brelease_pat\b|tojson\s*\(\s*secrets", re.I)
 PRESENCE_RE = re.compile(r"^\$\{\{\s*secrets\.[\w]+\s*(!=|==)\s*''\s*\}\}$", re.I)
 # A checkout in a job a dry run reaches: RELEASE_PAT when live (so the live
@@ -130,6 +140,8 @@ DRY_SAFE_CHECKOUT_TOKEN = (
 DRY_RUN_INPUT_RE = re.compile(
     r"inputs\s*(\.\s*dry[_-]run\b|\[\s*['\"]dry[_-]run['\"]\s*\])", re.I
 )
+# The whole inputs object inside an expression (`toJSON(inputs)`) carries it too.
+INPUTS_OBJECT_RE = re.compile(r"\binputs\b(?!\s*[.\[])", re.I)
 EXEMPT_MARKER = "dry-run-safe:"
 BLOCK_SCALAR_RE = re.compile(r"^[|>][1-9]?[-+]?[1-9]?\s*(#.*)?$")
 
@@ -213,6 +225,7 @@ class Step:
     env: dict[str, str] = field(default_factory=dict)
     with_: dict[str, str] = field(default_factory=dict)
     run: Optional[str] = None
+    text: str = ""
 
     @property
     def label(self) -> str:
@@ -232,6 +245,7 @@ class Job:
     permissions: dict[str, str] = field(default_factory=dict)
     needs: list[str] = field(default_factory=list)
     text: str = ""
+    header: str = ""
     steps: list[Step] = field(default_factory=list)
     unparsed: list[int] = field(default_factory=list)
 
@@ -286,7 +300,7 @@ def _parse_map(lines: list[str], start: int, indent: int) -> dict[str, str]:
 
 
 def _parse_step(job: str, lines: list[str], first: int, last: int) -> Step:
-    step = Step(job=job, line=first + 1)
+    step = Step(job=job, line=first + 1, text="\n".join(lines[first:last]))
     seg = list(lines[first:last])
     seg[0] = seg[0].replace("      - ", "        ", 1)
     key_re = re.compile(r"^        ([A-Za-z_-]+):\s*(.*)$")
@@ -349,6 +363,9 @@ def parse_workflow(text: str) -> tuple[list[Job], list[str]]:
                 continue
             key, value = m.group(1), m.group(2)
             if key == "steps":
+                job.header = "\n".join(lines[begin:k])
+                if _strip_comment(value):
+                    job.unparsed.append(k + 1)  # flow-style `steps: [...]`
                 steps_from = k + 1
                 steps_to = next(
                     (j for j in range(k + 1, end) if re.match(r"^    [A-Za-z_-]+:", lines[j])),
@@ -385,14 +402,20 @@ def parse_workflow(text: str) -> tuple[list[Job], list[str]]:
         if steps_from is not None:
             items = [j for j in range(steps_from, steps_to) if re.match(r"^      - ", lines[j])]
             first_item = items[0] if items else steps_to
-            job.unparsed = [
+            job.unparsed += [
                 j + 1
                 for j in range(steps_from, first_item)
                 if lines[j].strip() and not lines[j].strip().startswith("#")
             ]
             for s, first in enumerate(items):
                 last = items[s + 1] if s + 1 < len(items) else steps_to
-                job.steps.append(_parse_step(name, lines, first, last))
+                step = _parse_step(name, lines, first, last)
+                # A flow-style item (`- { run: ... }`) or anything else that
+                # yields no `run:`/`uses:` cannot be examined, so it is
+                # reported (rule 7) rather than passed as an empty step.
+                if step.run is None and "uses" not in step.keys:
+                    job.unparsed.append(first + 1)
+                job.steps.append(step)
         jobs.append(job)
     return jobs, lines
 
@@ -550,9 +573,11 @@ def logical_lines(script: str) -> list[tuple[int, str, bool]]:
             continue
         joined = " ".join(p.rstrip("\\").strip() for p in buf)
         out.append((idx, joined, exempt))
-        m = re.match(r"^cat\b[^<]*<<-?\s*['\"]?(\w+)['\"]?\s*$", joined)
+        # Only a QUOTED delimiter makes the body data: `cat <<EOF` still runs
+        # every `$(...)` and backtick in it.
+        m = re.match(r"^cat\b[^<]*<<-?\s*(['\"])(\w+)\1\s*$", joined)
         if m:
-            heredoc_end = m.group(1)
+            heredoc_end = m.group(2)
         buf, exempt = [], False
     if buf:
         out.append((len(script.split("\n")), " ".join(buf), exempt))
@@ -569,7 +594,11 @@ def _gh_api_mutates(segment: str) -> bool:
         return method.group(1).upper() != "GET"
     if re.search(r"(?:^|\s)graphql\b", args):
         # A query read from a file or a variable cannot be inspected here.
-        return "mutation" in args or re.search(r"query=['\"]?[@$]", args) is not None
+        return (
+            "mutation" in args
+            or re.search(r"query=['\"]?[@$]", args) is not None
+            or re.search(r"(?:^|\s)--input\b", args) is not None
+        )
     return re.search(r"(?:^|\s)(?:-f|-F|--field|--raw-field|--input)(?:\s|=)", args) is not None
 
 
@@ -683,9 +712,18 @@ def _hands_credential(text: str, read_only: bool) -> bool:
     for expr in re.findall(r"\$\{\{(.*?)\}\}", text, re.S):
         if PRESENCE_RE.match("${{" + expr + "}}"):
             continue
-        if PAT_RE.search(expr) or (not read_only and SECRET_RE.search(expr)):
+        if PAT_RE.search(expr):
+            return True
+        # A read-only job may use its own (read-only) workflow token, and
+        # nothing else: a PAT or the crates.io token ignores `permissions:`.
+        rest = WORKFLOW_TOKEN_RE.sub("", expr) if read_only else expr
+        if SECRET_RE.search(rest):
             return True
     return False
+
+
+def _source_without_comments(text: str) -> str:
+    return "\n".join(l for l in text.split("\n") if not l.strip().startswith("#"))
 
 
 def _references(job: Job) -> list[tuple[int, str]]:
@@ -703,8 +741,8 @@ def check_source(text: str, name: str, repo_root: Path) -> list[str]:
     jobs, lines = parse_workflow(text)
     errors: list[str] = []
     by_name = {j.name: j for j in jobs}
-    env_at = next((i for i, l in enumerate(lines) if re.match(r"^env:\s*(#.*)?$", l)), None)
-    workflow_env = _parse_map(lines, env_at, 2) if env_at is not None else {}
+    jobs_at = next((i for i, l in enumerate(lines) if re.match(r"^jobs:\s*(#.*)?$", l)), len(lines))
+    workflow_head = _source_without_comments("\n".join(lines[:jobs_at]))
 
     def err(line: int, msg: str) -> None:
         errors.append(f"{name}:{line}: {msg}")
@@ -738,7 +776,9 @@ def check_source(text: str, name: str, repo_root: Path) -> list[str]:
     for n, raw in enumerate(lines, start=1):
         if raw.strip().startswith("#") or n in mode_range:
             continue
-        if DRY_RUN_INPUT_RE.search(raw):
+        if DRY_RUN_INPUT_RE.search(raw) or any(
+            INPUTS_OBJECT_RE.search(e) for e in re.findall(r"\$\{\{(.*?)\}\}", raw)
+        ):
             err(n, f"`inputs.dry_run` is read outside the mode step. Gate on `{GUARD}` instead; a second reader is how #5936's guards drifted apart.")
 
     for job in jobs:
@@ -788,10 +828,9 @@ def check_source(text: str, name: str, repo_root: Path) -> list[str]:
             v in ("read", "none", "read-all") for v in job.permissions.values()
         )
         if not job_guarded:
-            for scope, env in (("workflow-level", workflow_env), ("job-level", job.env)):
-                bad = _credential_keys(env, read_only)
-                if bad:
-                    err(job.line, f"job `{job.name}` runs in a dry run and receives a credential through its {scope} env ({', '.join(bad)}).")
+            for scope, src in (("workflow-level", workflow_head), ("job-level", _source_without_comments(job.header))):
+                if _hands_credential(src, read_only):
+                    err(job.line, f"job `{job.name}` runs in a dry run and receives a credential through its {scope} source (env or another key).")
 
         for step in job.steps:
             where = f"job `{job.name}`, step `{step.label}`"
@@ -803,10 +842,11 @@ def check_source(text: str, name: str, repo_root: Path) -> list[str]:
                     live_env = {**job.env, **step.env}.get("RELEASE_LIVE")
                     if live_env is None or not LIVE_ENV_RE.match(f"RELEASE_LIVE: {live_env}"):
                         err(step.line, f"{where} mutates but `RELEASE_LIVE` is not wired from `outputs.live` (step or job `env:`).")
-                    first_mut = min(i for i, _ in muts)
-                    asserted = [i for i, t, _ in logical_lines(step.run) if ASSERT_RE.match(t) and i < first_mut]
-                    if not asserted:
-                        err(step.line, f"{where} mutates but does not refuse in its own script first. Put this line before the first mutating command:\n      [ \"${{RELEASE_LIVE:-}}\" = \"true\" ] || {{ echo \"::error::...\"; exit 1; }}")
+                    # The FIRST command (after any `set -...`), so it cannot sit
+                    # inside an `if`/loop that skips it.
+                    cmds = [t for _, t, _ in logical_lines(step.run) if not re.match(r"^set\s+[-+]", t)]
+                    if not cmds or not ASSERT_RE.match(cmds[0]):
+                        err(step.line, f"{where} mutates but does not refuse in its own script first. Make this the script's first command:\n      [ \"${{RELEASE_LIVE:-}}\" = \"true\" ] || {{ echo \"::error::...\"; exit 1; }}")
 
             if job_guarded or is_guarded(job, step):
                 continue
@@ -816,15 +856,15 @@ def check_source(text: str, name: str, repo_root: Path) -> list[str]:
                 persist = step.with_.get("persist-credentials", "")
                 if persist != "false" and _unwrap(persist) != _guard_for(job.name):
                     err(step.line, f"job `{job.name}` runs in a dry run, so its checkout must set `persist-credentials: false` (or `${{{{ {GUARD} }}}}`); otherwise a stray `git push` can authenticate.")
-                token = step.with_.get("token", "")
-                if token and SECRET_RE.search(token) and _unwrap(token) != _unwrap(DRY_SAFE_CHECKOUT_TOKEN):
-                    err(step.line, f"job `{job.name}` runs in a dry run, so its checkout token must be absent or exactly `{DRY_SAFE_CHECKOUT_TOKEN}` (RELEASE_PAT only when live).")
-            values = {k: v for k, v in {**step.env, **step.with_}.items() if not (uses.startswith("actions/checkout") and k == "token")}
-            bad = _credential_keys(values, read_only)
-            if step.run and _hands_credential(step.run, read_only):
-                bad.append("run:")
-            if bad:
-                err(step.line, f"{where} runs in a dry run and receives a credential ({', '.join(bad)}). In a job with write permissions a dry-run step gets no token at all, and RELEASE_PAT never; gate it on `{_guard_for(job.name)}`.")
+            # The whole step source, so a folded or flow-style value cannot
+            # hide an expression. The one exemption is the exact, single-line
+            # live-gated checkout token.
+            src = [l for l in step.text.split("\n") if not l.strip().startswith("#")]
+            allowed = f"token: {DRY_SAFE_CHECKOUT_TOKEN}"
+            if uses.startswith("actions/checkout"):
+                src = [l for l in src if l.strip() != allowed]
+            if _hands_credential("\n".join(src), read_only):
+                err(step.line, f"{where} runs in a dry run and receives a credential. In a job whose token can write, a dry-run step gets no token at all; a read-only job may use only its workflow token; RELEASE_PAT never (a checkout may take exactly `{allowed}`). Gate it on `{_guard_for(job.name)}`.")
     return errors
 
 
@@ -1013,9 +1053,11 @@ def simulate(text: str, mode: str, fail: Optional[str] = None) -> list[str]:
                     dep, _, out = m.groups()
                     if out is None:
                         return result.get(dep, "")
+                    # Outputs written before a job failed are still available.
+                    ran_dep = result.get(dep) in ("success", "failure")
                     if dep == MODE_JOB and out == "live":
-                        return live if result.get(dep) == "success" else ""
-                    return "x" if result.get(dep) == "success" else ""
+                        return live if ran_dep else ""
+                    return "x" if ran_dep else ""
                 if path.startswith("inputs.dry_run"):
                     return "false" if mode == "live" else "true"
                 if path.startswith("steps.") and path.endswith(".outputs.live"):
@@ -1322,12 +1364,12 @@ def self_test() -> int:
             body("run: echo ${{ secrets.RELEASE_PAT }} > /tmp/t"), "receives a credential")
         run("RELEASE_PAT in a dry-run job's env is flagged even when read-only",
             _GOOD.replace("    permissions:\n      contents: read\n", "    permissions:\n      contents: read\n    env:\n      GH_TOKEN: ${{ secrets.RELEASE_PAT || secrets.GITHUB_TOKEN }}\n"),
-            "job-level env")
+            "job-level source")
         run("a workflow-level secret reaches every dry-run job",
-            _GOOD.replace("jobs:\n", "env:\n  GH_TOKEN: ${{ secrets.RELEASE_PAT }}\njobs:\n", 1), "workflow-level env")
+            _GOOD.replace("jobs:\n", "env:\n  GH_TOKEN: ${{ secrets.RELEASE_PAT }}\njobs:\n", 1), "workflow-level source")
         run("a dry-run checkout may not carry RELEASE_PAT",
             _GOOD.replace("token: ${{ (needs.validate.outputs.live == 'true' && secrets.RELEASE_PAT) || secrets.GITHUB_TOKEN }}",
-                          "token: ${{ secrets.RELEASE_PAT || secrets.GITHUB_TOKEN }}"), "checkout token")
+                          "token: ${{ secrets.RELEASE_PAT || secrets.GITHUB_TOKEN }}"), "a checkout may take exactly")
         run("a dry-run-only job must stay read-only",
             _GOOD.replace("      contents: read\n", "      contents: write\n"), "read-only `permissions:`")
         run("a dry-run-only job must declare permissions",
@@ -1338,6 +1380,23 @@ def self_test() -> int:
         run("a job output that is not declared", _GOOD.replace("      pr: ${{ steps.open.outputs.pr }}\n", ""), "does not declare")
         run("a step output that is never written", _GOOD.replace('          echo "pr=1" >> "$GITHUB_OUTPUT"\n', ""), "never writes `pr=`")
         run("a step output from a step that does not exist", _GOOD.replace("        id: open\n", ""), "has no step `id: open`")
+
+        # Round 3: credentials the parsed values hid, and read-only jobs.
+        run("a read-only job may not take another secret",
+            _GOOD.replace("          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}\n        run: gh release list",
+                          "          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}\n          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}\n        run: gh release list"),
+            "receives a credential")
+        run("a folded env value still hands over the secret",
+            with_env(">-\n            ${{ secrets.RELEASE_PAT }}"), "receives a credential")
+        run("a flow-style env still hands over the secret",
+            _GOOD.replace("      - name: Commit locally\n        run:", "      - name: Commit locally\n        env: { GH_TOKEN: \"${{ secrets.RELEASE_PAT }}\" }\n        run:"),
+            "receives a credential")
+        run("a folded checkout token is not the allowed one-liner",
+            _GOOD.replace("token: ${{ (needs.validate.outputs.live == 'true' && secrets.RELEASE_PAT) || secrets.GITHUB_TOKEN }}",
+                          "token: >-\n            ${{ secrets.RELEASE_PAT }}"),
+            "receives a credential")
+        run("an unquoted cat heredoc body is executed, so it is scanned",
+            body("run: |\n          cat > f <<EOF\n          $(gh pr merge 1 --auto)\n          EOF"), "gh pr write")
 
         # Rule 1.
         run("the mode step must exist", _GOOD.replace("        id: mode\n", ""), "no step with `id: mode`")
@@ -1351,6 +1410,16 @@ def self_test() -> int:
                           "    - name: Commit locally\n      run: git push origin x\n").replace(
                 "    steps:\n      - uses: actions/checkout@v7\n        with:\n          token:", "    steps:\n    - name: shifted\n      run: git push\n      - uses: actions/checkout@v7\n        with:\n          token:"),
             "cannot place this line")
+        run("a flow-style step is reported, not skipped",
+            body('run: true\n      - { name: Sneaky, run: "gh pr merge 1 --auto" }'), "cannot place this line")
+        run("flow-style steps: [...] is reported", _GOOD.replace(
+            "  rehearse:\n", "  inline:\n    needs: validate\n    steps: [{run: 'git push origin x'}]\n  rehearse:\n"), "cannot place this line")
+        run("toJSON(inputs) reads the input too", body("run: echo '${{ toJSON(inputs) }}'"), "read outside the mode step")
+        run("a GraphQL query from --input is uninspectable", body("run: gh api graphql --input q.json"), "gh api write")
+        run("a refusal inside an if-block is not a refusal",
+            _GOOD.replace('          [ "${RELEASE_LIVE:-}" = "true" ] || { echo "::error::refusing to push in a dry run"; exit 1; }\n',
+                          '          if false; then\n          [ "${RELEASE_LIVE:-}" = "true" ] || { echo "::error::refusing to push in a dry run"; exit 1; }\n          fi\n'),
+            "does not refuse in its own script")
         run("run: |2 is parsed", _GOOD.replace("run: |\n          [ \"${RELEASE_LIVE:-}\" = \"true\" ] || { echo \"::error::refusing to push", "run: |2\n          [ \"${RELEASE_LIVE:-}\" = \"true\" ] || { echo \"::error::refusing to push").replace("        if: needs.validate.outputs.live == 'true'\n        env:\n          RELEASE_LIVE: ${{ needs.validate.outputs.live }}\n        run: |2", "        env:\n          RELEASE_LIVE: ${{ needs.validate.outputs.live }}\n        run: |2"), "not gated")
 
         # Scope: a directory with nothing in scope is a failure, not a pass.
@@ -1383,13 +1452,24 @@ def self_test() -> int:
             failures.append("evaluator: 'true' == true must be false, as in Actions")
         if not ev("'false'"):
             failures.append("evaluator: the string 'false' must be truthy, as in Actions")
-        # A failed `validate` leaves `live` empty, so even the `always()` tag
-        # job is skipped: the guard fails closed.
+        # As in Actions, outputs a job set before failing are still visible,
+        # so an `always()` job gated only on `live` runs after a failed
+        # validate. release.yml's mutating jobs also need a SUCCESSFUL
+        # upstream job, which the release test pins; the simulator must not
+        # hide this case by modelling the outputs as gone.
         after = [j for j in simulate(_GOOD, "live", fail="validate") if "/" not in j]
-        if after != ["validate"]:
-            failures.append(f"simulate: a failed validate must stop every other job (got {after})")
+        if after != ["validate", "tag"]:
+            failures.append(f"simulate: a failed validate keeps its outputs (got {after})")
         # ...while a failed bump does NOT stop `tag`, whose `if:` has always():
         # the simulator must model that, or it would vouch for gates it cannot see.
+        # A dependent of a SKIPPED job is skipped too, unless it uses a status
+        # function. In dry mode `bump` runs but nothing depends on `rehearse`;
+        # add one that does and check it is skipped live.
+        chained = _GOOD + "  after:\n    needs: [rehearse]\n    steps:\n      - run: true\n"
+        if "after" in simulate(chained, "live"):
+            failures.append("simulate: a dependent of a skipped job must be skipped")
+        if "after" not in simulate(chained, "dry"):
+            failures.append("simulate: a dependent of a successful job must run")
         if "tag" not in simulate(_GOOD, "live", fail="bump"):
             failures.append("simulate: always() must run after a failed dependency")
 
