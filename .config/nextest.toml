@@ -75,6 +75,12 @@ retries = 0
 filter = "test(test_ping_blocked_peers)"
 retries = 0
 
+# Concurrent duplicate fragment inserts: a race the test exists to detect would
+# show up as an intermittent failure, which a retry would turn into a pass.
+[[profile.ci.overrides]]
+filter = "test(concurrent_duplicates_never_refuse_a_genuine_fragment)"
+retries = 0
+
 # #5227 graceful-shutdown exit code. The whole subject of this test is a signal
 # race (SIGTERM must reach an installed handler and the process must exit 0), so
 # a retry would be indistinguishable from the regression it exists to catch —

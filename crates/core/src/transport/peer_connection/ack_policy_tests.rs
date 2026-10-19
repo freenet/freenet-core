@@ -1696,3 +1696,1028 @@ async fn retransmit_only_ack_does_not_republish_stale_srtt() {
         "a sample-less ACK batch must not make the stale ack SRTT the freshest"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Inbound stream admission and accounting
+// ---------------------------------------------------------------------------
+
+fn fragment(
+    stream_id: StreamId,
+    total_length_bytes: u64,
+    fragment_number: u32,
+) -> SymmetricMessagePayload {
+    fragment_with(
+        stream_id,
+        total_length_bytes,
+        fragment_number,
+        bytes::Bytes::from_static(b"fragment"),
+    )
+}
+
+fn fragment_with(
+    stream_id: StreamId,
+    total_length_bytes: u64,
+    fragment_number: u32,
+    payload: bytes::Bytes,
+) -> SymmetricMessagePayload {
+    SymmetricMessagePayload::StreamFragment {
+        stream_id,
+        total_length_bytes,
+        fragment_number,
+        payload,
+        metadata_bytes: None,
+    }
+}
+
+/// What the connection's budget charges a stream declaring `declared` bytes.
+fn cost(declared: u64) -> u64 {
+    super::inbound_budget::ChargeOverhead::DEFAULT.cost(declared)
+}
+
+/// True if the connection holds no reassembly state at all for `stream_id`.
+fn holds_no_state(e: &End, stream_id: StreamId) -> bool {
+    !e.conn.streaming_handles.contains_key(&stream_id)
+        && e.conn.streaming_registry.get(stream_id).is_none()
+        && !e.conn.inbound_streams.contains_key(&stream_id)
+        && e.conn.inbound_stream_futures.is_empty()
+        && !e.conn.inbound_budget.contains(stream_id)
+}
+
+async fn feed(e: &mut End, payload: SymmetricMessagePayload) -> Option<Vec<u8>> {
+    e.conn
+        .process_inbound(payload)
+        .await
+        .expect("an inbound stream fragment must not fail the connection")
+}
+
+/// Let spawned reassembly tasks run to completion.
+async fn settle() {
+    for _ in 0..8 {
+        tokio::task::yield_now().await;
+    }
+}
+
+/// A fragment declaring an invalid stream length is dropped before anything
+/// is created for its stream, on either reassembly path.
+#[tokio::test(start_paused = true)]
+async fn fragment_declaring_an_invalid_length_creates_no_stream_state() {
+    use super::streaming::MAX_STREAM_TOTAL_BYTES;
+    for declared in [MAX_STREAM_TOTAL_BYTES + 1, 0, u64::MAX] {
+        for stream_id in [StreamId::next(), StreamId::next_operations()] {
+            let mut e = single(CAPABLE);
+            assert!(
+                feed(&mut e, fragment(stream_id, declared, 1))
+                    .await
+                    .is_none()
+            );
+            assert!(
+                holds_no_state(&e, stream_id),
+                "declared {declared} on {stream_id:?}: no state may be created"
+            );
+        }
+    }
+}
+
+/// A stream declaring exactly the cap is admitted on both paths and charged
+/// its declared length.
+#[tokio::test(start_paused = true)]
+async fn fragment_declaring_the_maximum_length_is_admitted() {
+    use super::streaming::MAX_STREAM_TOTAL_BYTES;
+    let mut e = single(CAPABLE);
+    let ops = StreamId::next_operations();
+    feed(&mut e, fragment(ops, MAX_STREAM_TOTAL_BYTES, 1)).await;
+    let (handle, _) = e.conn.streaming_handles.get(&ops).expect("registered");
+    assert_eq!(handle.total_bytes(), MAX_STREAM_TOTAL_BYTES);
+    assert_eq!(handle.received_fragments(), 1);
+    assert_eq!(
+        e.conn.inbound_budget.charged_bytes(),
+        cost(MAX_STREAM_TOTAL_BYTES)
+    );
+
+    let mut e = single(CAPABLE);
+    let legacy = StreamId::next();
+    feed(&mut e, fragment(legacy, MAX_STREAM_TOTAL_BYTES, 1)).await;
+    assert!(e.conn.inbound_streams.contains_key(&legacy));
+    assert!(
+        !e.conn.streaming_handles.contains_key(&legacy),
+        "a legacy stream is reassembled on one path only"
+    );
+    assert_eq!(e.conn.inbound_budget.stream_count(), 1);
+    assert_eq!(
+        e.conn.inbound_budget.charged_bytes(),
+        cost(MAX_STREAM_TOTAL_BYTES)
+    );
+}
+
+/// A refused stream stays refused: a later fragment declaring a valid length
+/// creates no state, since its earlier fragments were already dropped.
+#[tokio::test(start_paused = true)]
+async fn a_refused_stream_stays_refused() {
+    use super::streaming::MAX_STREAM_TOTAL_BYTES;
+    for stream_id in [StreamId::next(), StreamId::next_operations()] {
+        let mut e = single(CAPABLE);
+        feed(&mut e, fragment(stream_id, MAX_STREAM_TOTAL_BYTES + 1, 1)).await;
+        feed(&mut e, fragment(stream_id, 5_000, 2)).await;
+        assert!(holds_no_state(&e, stream_id));
+    }
+}
+
+/// A stream whose handle is gone but whose buffer a consumer still holds
+/// keeps its charge, and its later fragments neither recreate state nor
+/// slip past the allowance.
+#[tokio::test(start_paused = true)]
+async fn a_released_handle_cannot_restart_its_stream() {
+    let mut e = single(CAPABLE);
+    let id = StreamId::next_operations();
+    feed(&mut e, fragment(id, 50_000, 1)).await;
+    let consumer = e.conn.streaming_registry.get(id).expect("registered");
+    // As the idle sweep does.
+    e.conn.streaming_handles.remove(&id);
+    e.conn.streaming_registry.remove(id);
+
+    feed(&mut e, fragment(id, 50_000, 2)).await;
+    assert!(!e.conn.streaming_handles.contains_key(&id));
+    assert!(e.conn.streaming_registry.get(id).is_none());
+    assert_eq!(e.conn.inbound_budget.stream_count(), 1);
+    assert_eq!(e.conn.inbound_budget.charged_bytes(), cost(50_000));
+    drop(consumer);
+}
+
+/// A charge is released only when every holder of the stream's reassembly
+/// state has let go: for an operations stream, the handle map, the registry
+/// and any consumer clone; for a legacy stream, its reassembly task.
+#[tokio::test(start_paused = true)]
+async fn charges_are_released_only_when_all_reassembly_state_is_gone() {
+    let mut e = single(CAPABLE);
+
+    let ops = StreamId::next_operations();
+    feed(&mut e, fragment(ops, 50_000, 1)).await;
+    let consumer = e.conn.streaming_registry.get(ops).expect("registered");
+    e.conn.streaming_handles.remove(&ops);
+    e.conn.streaming_registry.remove(ops);
+    e.conn.sweep_inbound_streams();
+    assert_eq!(
+        e.conn.inbound_budget.charged_bytes(),
+        cost(50_000),
+        "a consumer clone still holds the buffer"
+    );
+    drop(consumer);
+    e.conn.sweep_inbound_streams();
+    assert_eq!(e.conn.inbound_budget.charged_bytes(), 0);
+
+    let legacy = StreamId::next();
+    feed(&mut e, fragment(legacy, 50_000, 1)).await;
+    // Dropping the map entry alone does not release it while the task runs.
+    let sender = e
+        .conn
+        .inbound_streams
+        .remove(&legacy)
+        .expect("legacy state");
+    settle().await;
+    e.conn.sweep_inbound_streams();
+    assert_eq!(
+        e.conn.inbound_budget.charged_bytes(),
+        cost(50_000),
+        "the reassembly task is still alive"
+    );
+    drop(sender);
+    settle().await;
+    e.conn.sweep_inbound_streams();
+    assert_eq!(
+        e.conn.inbound_budget.charged_bytes(),
+        cost(50_000),
+        "the task's output has not been taken by recv() yet"
+    );
+    // recv() takes the ended task's output, releasing the charge.
+    assert!(e.pump(Duration::from_millis(10)).await.is_none());
+    assert_eq!(e.conn.inbound_budget.charged_bytes(), 0);
+    assert_eq!(e.conn.inbound_budget.stream_count(), 0);
+}
+
+/// The bytes held per connection are bounded: beside one maximum-size
+/// stream there is room for ordinary streams up to the headroom, and no
+/// more, while the admitted ones keep receiving.
+#[tokio::test(start_paused = true)]
+async fn inbound_stream_bytes_are_bounded_per_connection() {
+    use super::streaming::{MAX_INBOUND_STREAM_BYTES_PER_CONNECTION, MAX_STREAM_TOTAL_BYTES};
+    let headroom = 16 * 1024 * 1024;
+    assert_eq!(
+        MAX_INBOUND_STREAM_BYTES_PER_CONNECTION,
+        cost(MAX_STREAM_TOTAL_BYTES) + headroom,
+        "premise"
+    );
+    let mut e = single(CAPABLE);
+    let first = StreamId::next_operations();
+    feed(&mut e, fragment(first, MAX_STREAM_TOTAL_BYTES, 1)).await;
+    // Ordinary streams fit beside it, up to the headroom.
+    let small = 1024 * 1024;
+    let fit = headroom / cost(small);
+    for i in 0..fit {
+        let id = if i % 2 == 0 {
+            StreamId::next_operations()
+        } else {
+            StreamId::next()
+        };
+        feed(&mut e, fragment(id, small, 1)).await;
+        assert!(e.conn.inbound_budget.contains(id), "stream {i} of {fit}");
+    }
+
+    for over in [StreamId::next_operations(), StreamId::next()] {
+        feed(&mut e, fragment(over, small, 1)).await;
+        assert!(holds_no_state_but_others(&e, over));
+    }
+
+    feed(&mut e, fragment(first, MAX_STREAM_TOTAL_BYTES, 2)).await;
+    let (handle, _) = e.conn.streaming_handles.get(&first).unwrap();
+    assert_eq!(handle.received_fragments(), 2);
+}
+
+fn holds_no_state_but_others(e: &End, stream_id: StreamId) -> bool {
+    !e.conn.streaming_handles.contains_key(&stream_id)
+        && e.conn.streaming_registry.get(stream_id).is_none()
+        && !e.conn.inbound_streams.contains_key(&stream_id)
+        && !e.conn.inbound_budget.contains(stream_id)
+}
+
+/// The number of streams per connection is bounded, so many small streams
+/// cannot accumulate per-stream state without limit.
+#[tokio::test(start_paused = true)]
+async fn inbound_stream_count_is_bounded_per_connection() {
+    use super::streaming::MAX_INBOUND_STREAMS_PER_CONNECTION;
+    let mut e = single(CAPABLE);
+    for _ in 0..MAX_INBOUND_STREAMS_PER_CONNECTION {
+        let id = StreamId::next_operations();
+        feed(&mut e, fragment(id, 10_000, 1)).await;
+        assert!(e.conn.streaming_handles.contains_key(&id));
+    }
+    let over = StreamId::next_operations();
+    feed(&mut e, fragment(over, 10_000, 1)).await;
+    assert!(holds_no_state_but_others(&e, over));
+    assert_eq!(
+        e.conn.inbound_budget.stream_count(),
+        MAX_INBOUND_STREAMS_PER_CONNECTION
+    );
+}
+
+/// A stream that keeps receiving data is still evicted at the absolute age
+/// limit, and a stream that stops receiving is evicted when idle, on either
+/// path; their charges are released once the state is gone.
+#[tokio::test(start_paused = true)]
+async fn inbound_streams_are_evicted_when_idle_or_too_old() {
+    use super::streaming::{STREAM_INACTIVITY_TIMEOUT, max_inbound_stream_age};
+    let mut e = single(CAPABLE);
+    // `busy` arrives at ~28 KiB/s, too slow to finish within its age limit
+    // (its length at 32 KiB/s); its progress keeps it from idling out.
+    let total = 10 * 1024 * 1024u64;
+    let age_limit = max_inbound_stream_age(total);
+    let full = bytes::Bytes::from(vec![5u8; super::MAX_DATA_SIZE]);
+    let per_step = 28 * 1024 * 5 / super::MAX_DATA_SIZE;
+    let busy = StreamId::next_operations();
+    let quiet = StreamId::next();
+    feed(&mut e, fragment(busy, total, 1)).await;
+    feed(&mut e, fragment(quiet, total, 1)).await;
+
+    let step = STREAM_INACTIVITY_TIMEOUT;
+    let mut elapsed = Duration::ZERO;
+    let mut fragment_number = 1;
+    let mut quiet_evicted_at = None;
+    while e.conn.streaming_handles.contains_key(&busy) {
+        tokio::time::advance(step).await;
+        elapsed += step;
+        for _ in 0..per_step {
+            fragment_number += 1;
+            feed(
+                &mut e,
+                fragment_with(busy, total, fragment_number, full.clone()),
+            )
+            .await;
+        }
+        e.conn.sweep_inbound_streams();
+        if quiet_evicted_at.is_none() && !e.conn.inbound_streams.contains_key(&quiet) {
+            quiet_evicted_at = Some(elapsed);
+        }
+        assert!(elapsed <= age_limit + 2 * step, "never evicted");
+    }
+    assert!(
+        elapsed > age_limit,
+        "progress keeps it until the age limit, evicted at {elapsed:?}"
+    );
+    let quiet_at = quiet_evicted_at.expect("the idle legacy stream is evicted");
+    assert!(quiet_at <= STREAM_INACTIVITY_TIMEOUT * 6 + 2 * step);
+
+    settle().await;
+    // Take the evicted legacy task's output (as recv() does; recv() itself
+    // would hit the connection idle timeout after this much quiet), which
+    // releases its token.
+    let (result, token) = e
+        .conn
+        .inbound_stream_futures
+        .next()
+        .await
+        .expect("the evicted task ended")
+        .expect("task did not panic");
+    assert_eq!(result.err(), Some(quiet), "ended without a message");
+    drop(token);
+    e.conn.sweep_inbound_streams();
+    assert_eq!(e.conn.inbound_budget.stream_count(), 0);
+    assert_eq!(e.conn.inbound_budget.charged_bytes(), 0);
+}
+
+/// A large stream arriving slowly but steadily (about 70 KB/s, a slow
+/// residential uplink) is not evicted: its age limit scales with its length.
+#[tokio::test(start_paused = true)]
+async fn a_slow_steady_stream_completes() {
+    let mut e = single(CAPABLE);
+    let id = StreamId::next_operations();
+    let f = super::MAX_DATA_SIZE;
+    let total: usize = 50 * 1024 * 1024;
+    let fragments = total.div_ceil(f);
+    let per_second = 70_000 / f;
+    let full = bytes::Bytes::from(vec![7u8; f]);
+    let mut consumer = None;
+    let mut next = 1usize;
+    let mut elapsed = Duration::ZERO;
+    while next <= fragments {
+        for _ in 0..per_second {
+            if next > fragments {
+                break;
+            }
+            let len = if next == fragments {
+                total - (fragments - 1) * f
+            } else {
+                f
+            };
+            feed(
+                &mut e,
+                fragment_with(id, total as u64, next as u32, full.slice(..len)),
+            )
+            .await;
+            if consumer.is_none() {
+                consumer = e.conn.streaming_registry.get(id);
+            }
+            next += 1;
+        }
+        tokio::time::advance(Duration::from_secs(1)).await;
+        elapsed += Duration::from_secs(1);
+        if elapsed.as_secs() % 5 == 0 {
+            e.conn.sweep_inbound_streams();
+        }
+        if next <= fragments {
+            assert!(
+                e.conn.streaming_handles.contains_key(&id),
+                "evicted after {elapsed:?} at fragment {next} of {fragments}"
+            );
+        }
+    }
+    assert!(
+        elapsed > Duration::from_secs(700),
+        "premise: slower than the old fixed age limit"
+    );
+    let consumer = consumer.expect("registered");
+    assert!(consumer.is_complete());
+    assert_eq!(consumer.received_bytes(), total as u64);
+}
+
+/// One-byte fragments cannot make a stream look complete: it completes only
+/// once its full declared length has arrived.
+#[tokio::test(start_paused = true)]
+async fn short_fragments_do_not_complete_a_stream() {
+    let mut e = single(CAPABLE);
+    let id = StreamId::next_operations();
+    let total = 3_000u64;
+    let max_fragment = total.div_ceil(super::MAX_DATA_SIZE as u64) as u32 + 1;
+    for n in 1..=max_fragment {
+        feed(
+            &mut e,
+            fragment_with(id, total, n, bytes::Bytes::from_static(b"x")),
+        )
+        .await;
+    }
+    let (handle, _) = e.conn.streaming_handles.get(&id).unwrap();
+    assert!(!handle.is_complete());
+    assert!(handle.try_assemble().is_none());
+    assert_eq!(handle.received_bytes(), u64::from(max_fragment));
+}
+
+/// Refusal warnings are rate-limited per connection however many distinct
+/// streams are refused.
+#[tokio::test(start_paused = true)]
+async fn refusals_are_logged_at_a_bounded_rate() {
+    use super::streaming::MAX_STREAM_TOTAL_BYTES;
+    let mut e = single(CAPABLE);
+    for _ in 0..500 {
+        feed(
+            &mut e,
+            fragment(StreamId::next(), MAX_STREAM_TOTAL_BYTES + 1, 1),
+        )
+        .await;
+    }
+    assert_eq!(e.conn.refusal_log.suppressed, 499);
+    tokio::time::advance(REFUSAL_WARN_INTERVAL).await;
+    feed(
+        &mut e,
+        fragment(StreamId::next(), MAX_STREAM_TOTAL_BYTES + 1, 1),
+    )
+    .await;
+    assert_eq!(
+        e.conn.refusal_log.suppressed, 0,
+        "warned again, counter reset"
+    );
+}
+
+/// Once an operations stream has all its bytes, the connection drops its own
+/// references, so the stream's charge is released as soon as its consumers
+/// let go, without waiting for the idle sweep. Holds in production and under
+/// the simulation idle-timeout accommodation alike.
+#[tokio::test(start_paused = true)]
+async fn a_completed_stream_is_released_when_its_consumers_are() {
+    /// Restores production behaviour even if an assertion below panics.
+    struct ResetSimulationIdleTimeout;
+    impl Drop for ResetSimulationIdleTimeout {
+        fn drop(&mut self) {
+            crate::config::SimulationIdleTimeout::disable();
+        }
+    }
+    let _reset = ResetSimulationIdleTimeout;
+    for simulation in [false, true] {
+        if simulation {
+            crate::config::SimulationIdleTimeout::enable();
+        } else {
+            crate::config::SimulationIdleTimeout::disable();
+        }
+        let mut e = single(CAPABLE);
+        let id = StreamId::next_operations();
+        let f = super::MAX_DATA_SIZE;
+        let total = (2 * f) as u64;
+        let full = bytes::Bytes::from(vec![3u8; f]);
+        feed(&mut e, fragment_with(id, total, 1, full.clone())).await;
+        let consumer = e.conn.streaming_registry.get(id).expect("registered");
+        feed(&mut e, fragment_with(id, total, 2, full)).await;
+
+        assert!(consumer.is_complete());
+        assert!(
+            !e.conn.streaming_handles.contains_key(&id),
+            "sim={simulation}"
+        );
+        assert!(
+            e.conn.streaming_registry.get(id).is_none(),
+            "sim={simulation}"
+        );
+        assert_eq!(
+            e.conn.inbound_budget.charged_bytes(),
+            cost(total),
+            "consumer holds it"
+        );
+        drop(consumer);
+        e.conn.sweep_inbound_streams();
+        assert_eq!(e.conn.inbound_budget.stream_count(), 0, "sim={simulation}");
+    }
+}
+
+/// A late retransmission of a stream that completed and was released does
+/// not start it again, on either path.
+#[tokio::test(start_paused = true)]
+async fn a_retransmission_does_not_restart_a_completed_stream() {
+    let mut e = single(CAPABLE);
+    let one = bytes::Bytes::from_static(b"complete");
+    let ops = StreamId::next_operations();
+    feed(&mut e, fragment_with(ops, one.len() as u64, 1, one.clone())).await;
+    e.conn.sweep_inbound_streams();
+    assert_eq!(e.conn.inbound_budget.stream_count(), 0, "released");
+    feed(&mut e, fragment_with(ops, one.len() as u64, 1, one.clone())).await;
+    assert!(holds_no_state(&e, ops), "not started again");
+
+    let legacy = StreamId::next();
+    assert!(
+        feed(
+            &mut e,
+            fragment_with(legacy, one.len() as u64, 1, one.clone())
+        )
+        .await
+        .is_some()
+    );
+    assert!(
+        feed(&mut e, fragment_with(legacy, one.len() as u64, 1, one))
+            .await
+            .is_none(),
+        "not delivered twice"
+    );
+    assert!(holds_no_state(&e, legacy));
+}
+
+/// A stream released without completing (here, evicted when idle) is
+/// admitted again if its id reappears.
+#[tokio::test(start_paused = true)]
+async fn an_evicted_stream_id_can_be_admitted_again() {
+    let mut e = single(CAPABLE);
+    let id = StreamId::next_operations();
+    feed(&mut e, fragment(id, 50_000, 1)).await;
+    tokio::time::advance(super::streaming_handle_idle_timeout() * 2).await;
+    e.conn.sweep_inbound_streams();
+    e.conn.sweep_inbound_streams();
+    assert_eq!(
+        e.conn.inbound_budget.stream_count(),
+        0,
+        "evicted and released"
+    );
+
+    feed(&mut e, fragment(id, 50_000, 1)).await;
+    assert!(e.conn.streaming_handles.contains_key(&id));
+    assert_eq!(e.conn.inbound_budget.charged_bytes(), cost(50_000));
+}
+
+/// An outbound stream refused for its length does not end the connection:
+/// `recv()` observes the stream's result and carries on.
+#[tokio::test(start_paused = true)]
+async fn an_outbound_stream_refused_for_length_keeps_the_connection() {
+    use super::streaming::MAX_STREAM_TOTAL_BYTES;
+    let mut e = single(CAPABLE);
+    e.conn
+        .send(vec![0u8; MAX_STREAM_TOTAL_BYTES as usize])
+        .await
+        .expect("send hands the stream off");
+    assert_eq!(
+        e.conn.outbound_stream_futures.len(),
+        1,
+        "premise: a stream task"
+    );
+    // `pump` panics if `recv()` returns an error.
+    assert!(e.pump(Duration::from_millis(200)).await.is_none());
+    assert!(
+        e.conn.outbound_stream_futures.is_empty(),
+        "recv() observed the refused stream's result"
+    );
+    // The connection still works.
+    e.deliver(1, short(b"after"), vec![]).await;
+    assert_eq!(
+        e.pump(Duration::from_millis(200)).await.as_deref(),
+        Some(&b"after"[..])
+    );
+}
+
+/// Senders before the empty-fragment fix (still allowed to connect) left
+/// fragment #1 empty when its embedded metadata used the whole packet, and
+/// sent the payload from fragment #2 on. Replays that fragmenting: the
+/// metadata is dispatched and the stream completes intact.
+#[tokio::test(start_paused = true)]
+async fn a_stream_from_an_older_sender_with_an_empty_first_fragment_completes() {
+    let mut e = single(CAPABLE);
+    let id = StreamId::next_operations();
+    let f = super::MAX_DATA_SIZE;
+    let data: Vec<u8> = (0..(3 * f + 100)).map(|i| i as u8).collect();
+    let total = data.len() as u64;
+    // The old sender: capacity of fragment #1 = MAX_DATA_SIZE - (1 + 8 + meta)
+    // saturating to 0, then `1 + ceil(len / MAX_DATA_SIZE)` fragments.
+    let metadata = bytes::Bytes::from(vec![0xAB; f - 9]);
+    let first = SymmetricMessagePayload::StreamFragment {
+        stream_id: id,
+        total_length_bytes: total,
+        fragment_number: 1,
+        payload: bytes::Bytes::new(),
+        metadata_bytes: Some(metadata.clone()),
+    };
+    assert_eq!(
+        feed(&mut e, first).await.as_deref(),
+        Some(&metadata[..]),
+        "the embedded metadata is dispatched"
+    );
+    let consumer = e.conn.streaming_registry.get(id).expect("admitted");
+    for (i, chunk) in data.chunks(f).enumerate() {
+        feed(
+            &mut e,
+            fragment_with(
+                id,
+                total,
+                i as u32 + 2,
+                bytes::Bytes::copy_from_slice(chunk),
+            ),
+        )
+        .await;
+    }
+    assert!(consumer.is_complete());
+    assert_eq!(consumer.try_assemble().expect("complete"), data);
+}
+
+/// Refusals held back by the warning rate limit are reported on the next
+/// sweep after the interval even if no further refusal arrives.
+#[tokio::test(start_paused = true)]
+async fn suppressed_refusals_are_flushed_without_a_further_refusal() {
+    use super::streaming::MAX_STREAM_TOTAL_BYTES;
+    let mut e = single(CAPABLE);
+    for _ in 0..3 {
+        feed(
+            &mut e,
+            fragment(StreamId::next(), MAX_STREAM_TOTAL_BYTES + 1, 1),
+        )
+        .await;
+    }
+    assert_eq!(e.conn.refusal_log.suppressed, 2);
+    e.conn.sweep_inbound_streams();
+    assert_eq!(e.conn.refusal_log.suppressed, 2, "not due yet");
+    tokio::time::advance(REFUSAL_WARN_INTERVAL).await;
+    e.conn.sweep_inbound_streams();
+    assert_eq!(e.conn.refusal_log.suppressed, 0, "flushed by the sweep");
+}
+
+/// Each refusal reason has its own counter, incremented exactly once per
+/// refused stream (per-connection counts, which no other test can touch):
+/// later fragments of a refused stream are dropped as previously refused,
+/// not counted again, whatever they declare.
+#[tokio::test(start_paused = true)]
+async fn refusals_are_counted_once_per_reason() {
+    use super::streaming::{MAX_INBOUND_STREAMS_PER_CONNECTION, MAX_STREAM_TOTAL_BYTES};
+    use crate::transport::metrics::InboundStreamOutcome as O;
+    let mut e = single(CAPABLE);
+    let too_long = StreamId::next();
+    feed(&mut e, fragment(too_long, MAX_STREAM_TOTAL_BYTES + 1, 1)).await;
+    feed(&mut e, fragment(StreamId::next(), 0, 1)).await;
+    feed(
+        &mut e,
+        fragment(StreamId::next_operations(), MAX_STREAM_TOTAL_BYTES, 1),
+    )
+    .await;
+    let over_bytes = StreamId::next_operations();
+    feed(&mut e, fragment(over_bytes, MAX_STREAM_TOTAL_BYTES, 1)).await;
+    let mut f = single(CAPABLE);
+    for _ in 0..MAX_INBOUND_STREAMS_PER_CONNECTION {
+        feed(&mut f, fragment(StreamId::next_operations(), 1_000, 1)).await;
+    }
+    let over_count = StreamId::next_operations();
+    feed(&mut f, fragment(over_count, 1_000, 1)).await;
+
+    // Further fragments of each refused stream, now declaring a valid length.
+    for (end, id) in [(0, too_long), (0, over_bytes), (1, over_count)] {
+        let end = if end == 0 { &mut e } else { &mut f };
+        assert_eq!(
+            end.conn.admit_inbound_stream(id, 1_000),
+            Err(InboundStreamRejection::PreviouslyRefused)
+        );
+        feed(end, fragment(id, 1_000, 2)).await;
+        assert!(holds_no_state_but_others(end, id));
+    }
+
+    let mut expected = [0u64; O::COUNT];
+    expected[O::RefusedInvalidLength as usize] = 2;
+    expected[O::RefusedConnectionBytes as usize] = 1;
+    assert_eq!(e.conn.inbound_outcomes, expected);
+    let mut expected = [0u64; O::COUNT];
+    expected[O::RefusedConnectionStreams as usize] = 1;
+    assert_eq!(f.conn.inbound_outcomes, expected);
+}
+
+/// A stream is charged an overhead for every fragment its declared length
+/// allows, so filling each of them with a one-byte payload (the most real
+/// memory per payload byte) stays within what was charged.
+#[tokio::test(start_paused = true)]
+async fn every_fragment_a_stream_may_hold_is_charged() {
+    use super::inbound_budget::ChargeOverhead;
+    let mut e = single(CAPABLE);
+    let id = StreamId::next_operations();
+    let f = super::MAX_DATA_SIZE as u64;
+    let total = 100 * f;
+    let fragments = total.div_ceil(f) + 1;
+    let overhead = ChargeOverhead::DEFAULT;
+    assert!(overhead.per_fragment > 0, "premise");
+    for n in 1..=fragments as u32 {
+        feed(
+            &mut e,
+            fragment_with(id, total, n, bytes::Bytes::from_static(b"x")),
+        )
+        .await;
+    }
+    let (handle, _) = e.conn.streaming_handles.get(&id).expect("admitted");
+    assert_eq!(handle.received_fragments() as u64, fragments);
+    let charged = e.conn.inbound_budget.charged_bytes();
+    assert_eq!(charged, cost(total));
+    assert!(
+        charged >= total + overhead.per_stream + fragments * overhead.per_fragment,
+        "{charged}"
+    );
+}
+
+/// The completed-stream memory is bounded: after more completions than it
+/// holds, the oldest id is forgotten (and may start a stream again) while the
+/// newest is still refused.
+#[tokio::test(start_paused = true)]
+async fn the_completed_stream_memory_is_bounded() {
+    let mut e = single(CAPABLE);
+    let one = bytes::Bytes::from_static(b"complete");
+    let len = one.len() as u64;
+    let ids: Vec<StreamId> = (0..COMPLETED_STREAM_MEMORY.get() + 1)
+        .map(|_| StreamId::next_operations())
+        .collect();
+    for id in &ids {
+        feed(&mut e, fragment_with(*id, len, 1, one.clone())).await;
+    }
+    e.conn.sweep_inbound_streams();
+    assert_eq!(e.conn.inbound_budget.stream_count(), 0, "all released");
+    let (oldest, newest) = (ids[0], *ids.last().unwrap());
+    assert_eq!(e.conn.admit_inbound_stream(oldest, len), Ok(()));
+    assert_eq!(
+        e.conn.admit_inbound_stream(newest, len),
+        Err(InboundStreamRejection::AlreadyCompleted)
+    );
+    // The second id is still remembered: only one was evicted.
+    assert_eq!(
+        e.conn.admit_inbound_stream(ids[1], len),
+        Err(InboundStreamRejection::AlreadyCompleted)
+    );
+}
+
+/// A legacy stream reassembled by its task is remembered once `recv()` takes
+/// its message, so a late retransmission does not start it again.
+#[tokio::test(start_paused = true)]
+async fn a_legacy_stream_completed_by_its_task_is_remembered() {
+    let mut e = single(CAPABLE);
+    let id = StreamId::next();
+    let f = super::MAX_DATA_SIZE;
+    let data: Vec<u8> = (0..(2 * f)).map(|i| i as u8).collect();
+    let total = data.len() as u64;
+    for (i, chunk) in data.chunks(f).enumerate() {
+        feed(
+            &mut e,
+            fragment_with(
+                id,
+                total,
+                i as u32 + 1,
+                bytes::Bytes::copy_from_slice(chunk),
+            ),
+        )
+        .await;
+    }
+    assert_eq!(
+        e.pump(Duration::from_millis(10)).await.as_deref(),
+        Some(&data[..])
+    );
+    assert!(holds_no_state(&e, id));
+    assert_eq!(
+        e.conn.admit_inbound_stream(id, total),
+        Err(InboundStreamRejection::AlreadyCompleted)
+    );
+    feed(
+        &mut e,
+        fragment_with(id, total, 1, bytes::Bytes::copy_from_slice(&data[..f])),
+    )
+    .await;
+    assert!(holds_no_state(&e, id), "not started again");
+}
+
+/// An evicted legacy stream delivers nothing even when the fragments that
+/// would complete it are already queued for its reassembly task.
+#[tokio::test(start_paused = true)]
+async fn an_evicted_legacy_stream_with_queued_fragments_delivers_nothing() {
+    use super::streaming::max_inbound_stream_age;
+    use crate::transport::metrics::InboundStreamOutcome as O;
+    let mut e = single(CAPABLE);
+    let id = StreamId::next();
+    let f = super::MAX_DATA_SIZE;
+    let total = (3 * f) as u64;
+    let full = bytes::Bytes::from(vec![4u8; f]);
+    feed(&mut e, fragment_with(id, total, 1, full.clone())).await;
+    settle().await;
+    // Past the age limit, then queue the rest without letting the task run
+    // (so they are not yet progress either).
+    tokio::time::advance(max_inbound_stream_age(total) + Duration::from_secs(1)).await;
+    for n in 2..=3 {
+        feed(&mut e, fragment_with(id, total, n, full.clone())).await;
+    }
+    e.conn.sweep_inbound_streams();
+    assert_eq!(
+        e.conn.inbound_outcomes[O::EvictedIdle as usize],
+        1,
+        "premise"
+    );
+    settle().await;
+    let (result, token) = e
+        .conn
+        .inbound_stream_futures
+        .next()
+        .await
+        .expect("the evicted task ended")
+        .expect("task did not panic");
+    assert_eq!(result.err(), Some(id), "ended without a message");
+    drop(token);
+    e.conn.sweep_inbound_streams();
+    assert_eq!(e.conn.inbound_budget.stream_count(), 0);
+}
+
+/// Refusals stay sticky however many there are: after many more refused
+/// streams than the old 64-entry memory held, a later fragment of the first
+/// refused stream still creates no state.
+#[tokio::test(start_paused = true)]
+async fn refusals_stay_sticky_beyond_many_refusals() {
+    use super::streaming::MAX_STREAM_TOTAL_BYTES;
+    for first in [StreamId::next(), StreamId::next_operations()] {
+        let mut e = single(CAPABLE);
+        feed(&mut e, fragment(first, MAX_STREAM_TOTAL_BYTES + 1, 1)).await;
+        // `first` is the oldest refusal: the first one a forgetting memory
+        // would drop.
+        tokio::time::advance(Duration::from_secs(1)).await;
+        for _ in 0..1_000 {
+            feed(
+                &mut e,
+                fragment(StreamId::next(), MAX_STREAM_TOTAL_BYTES + 1, 1),
+            )
+            .await;
+        }
+        assert_eq!(
+            e.conn.admit_inbound_stream(first, 5_000),
+            Err(InboundStreamRejection::PreviouslyRefused)
+        );
+        feed(&mut e, fragment(first, 5_000, 2)).await;
+        assert!(holds_no_state(&e, first));
+    }
+}
+
+/// A refusal that cannot be remembered (the connection already has as many
+/// refused streams outstanding as are remembered) closes the connection,
+/// counted and labelled, rather than letting that stream in part-way later.
+#[tokio::test(start_paused = true)]
+async fn a_refusal_that_cannot_be_remembered_closes_the_connection() {
+    use super::inbound_budget::MAX_REMEMBERED_REFUSALS;
+    use crate::transport::metrics::InboundStreamOutcome as O;
+    let mut e = single(CAPABLE);
+    for _ in 0..MAX_REMEMBERED_REFUSALS {
+        feed(&mut e, fragment(StreamId::next(), 0, 1)).await;
+    }
+    // Ordinary streams are still admitted.
+    let ok = StreamId::next_operations();
+    feed(&mut e, fragment(ok, 10_000, 1)).await;
+    assert!(e.conn.streaming_handles.contains_key(&ok));
+    assert!(!crate::transport::PeerConnectionApi::closed_by_stream_refusals(&e.conn));
+
+    let result = e
+        .conn
+        .process_inbound(fragment(StreamId::next(), 0, 1))
+        .await;
+    assert!(
+        matches!(result, Err(TransportError::ConnectionClosed(_))),
+        "{result:?}"
+    );
+    assert!(crate::transport::PeerConnectionApi::closed_by_stream_refusals(&e.conn));
+    assert_eq!(
+        e.conn.inbound_outcomes[O::ClosedTooManyRefusals as usize],
+        1
+    );
+}
+
+/// The periodic sweep counts an idle operations stream's eviction even
+/// though the idle-handle sweep would also drop it.
+#[tokio::test(start_paused = true)]
+async fn the_periodic_sweep_counts_an_idle_eviction() {
+    use crate::transport::metrics::InboundStreamOutcome as O;
+    let mut e = single(CAPABLE);
+    let id = StreamId::next_operations();
+    feed(&mut e, fragment(id, 50_000, 1)).await;
+    tokio::time::advance(super::streaming_handle_idle_timeout() + Duration::from_secs(1)).await;
+    e.conn.sweep_streams();
+    assert_eq!(e.conn.inbound_outcomes[O::EvictedIdle as usize], 1);
+    assert_eq!(e.conn.inbound_budget.stream_count(), 0, "released");
+}
+
+/// When the connection goes, its unclaimed streams are cancelled in the
+/// orphan registry, complete (already retired) ones included, so GC drops
+/// them rather than keeping them for the orphan timeout uncharged.
+#[tokio::test(start_paused = true)]
+async fn unclaimed_streams_go_with_the_connection() {
+    let registry = Arc::new(crate::operations::orphan_streams::OrphanStreamRegistry::new());
+    let mut e = single(CAPABLE);
+    e.conn.set_orphan_stream_registry(Arc::clone(&registry));
+    let one = bytes::Bytes::from_static(b"complete");
+    let done = StreamId::next_operations();
+    feed(&mut e, fragment_with(done, one.len() as u64, 1, one)).await;
+    assert!(
+        !e.conn.streaming_handles.contains_key(&done),
+        "premise: retired"
+    );
+    feed(&mut e, fragment(StreamId::next_operations(), 50_000, 1)).await;
+    assert_eq!(registry.orphan_count(), 2, "premise: both unclaimed");
+    drop(e);
+    registry.gc_expired();
+    assert_eq!(registry.orphan_count(), 0);
+}
+
+/// A stream whose bytes all arrive except fragment #1 (using the extra
+/// fragment number) holds its full length but is not complete, so it is
+/// still evicted, on either path.
+#[tokio::test(start_paused = true)]
+async fn a_stream_missing_its_first_fragment_is_evicted() {
+    use crate::transport::metrics::InboundStreamOutcome as O;
+    for id in [StreamId::next(), StreamId::next_operations()] {
+        let mut e = single(CAPABLE);
+        let f = super::MAX_DATA_SIZE;
+        let total = (4 * f) as u64;
+        let full = bytes::Bytes::from(vec![7u8; f]);
+        for n in 2..=5 {
+            feed(&mut e, fragment_with(id, total, n, full.clone())).await;
+        }
+        settle().await;
+        let step = Duration::from_secs(5);
+        let mut elapsed = Duration::ZERO;
+        while e.conn.inbound_budget.stream_count() > 0
+            && e.conn.inbound_outcomes[O::EvictedIdle as usize] == 0
+        {
+            tokio::time::advance(step).await;
+            elapsed += step;
+            e.conn.sweep_inbound_streams();
+            assert!(
+                elapsed <= super::streaming_handle_idle_timeout() + 2 * step,
+                "{id:?} never evicted"
+            );
+        }
+        assert_eq!(
+            e.conn.inbound_outcomes[O::EvictedIdle as usize],
+            1,
+            "{id:?}"
+        );
+    }
+}
+
+/// A legacy stream receiving a new fragment within every idle timeout stays
+/// alive: the sweep counts the bytes its task reports as progress.
+#[tokio::test(start_paused = true)]
+async fn a_legacy_stream_receiving_new_fragments_stays_alive() {
+    let mut e = single(CAPABLE);
+    let id = StreamId::next();
+    let f = super::MAX_DATA_SIZE;
+    let total = (40 * f) as u64;
+    let full = bytes::Bytes::from(vec![6u8; f]);
+    feed(&mut e, fragment_with(id, total, 1, full.clone())).await;
+    let step = Duration::from_secs(5);
+    let mut n = 1;
+    for s in 1..=36u64 {
+        tokio::time::advance(step).await;
+        if s % 4 == 0 {
+            n += 1;
+            feed(&mut e, fragment_with(id, total, n, full.clone())).await;
+            settle().await;
+        }
+        e.conn.sweep_inbound_streams();
+        assert!(
+            e.conn.inbound_streams.contains_key(&id),
+            "evicted after {} s while progressing",
+            s * 5
+        );
+    }
+}
+
+/// Replays do not keep a legacy stream alive: one that receives only
+/// already-held fragments (at or below its frontier, or a pending one
+/// again) is evicted when idle.
+#[tokio::test(start_paused = true)]
+async fn a_legacy_stream_receiving_only_replays_goes_idle() {
+    use crate::transport::metrics::InboundStreamOutcome as O;
+    let mut e = single(CAPABLE);
+    let id = StreamId::next();
+    let f = super::MAX_DATA_SIZE;
+    let total = (20 * f) as u64;
+    let full = bytes::Bytes::from(vec![3u8; f]);
+    for n in (1..=10).chain([15]) {
+        feed(&mut e, fragment_with(id, total, n, full.clone())).await;
+    }
+    settle().await;
+    e.conn.sweep_inbound_streams();
+    let step = Duration::from_secs(5);
+    let mut elapsed = Duration::ZERO;
+    while e.conn.inbound_streams.contains_key(&id) {
+        tokio::time::advance(step).await;
+        elapsed += step;
+        for n in [5, 15] {
+            feed(&mut e, fragment_with(id, total, n, full.clone())).await;
+        }
+        settle().await;
+        e.conn.sweep_inbound_streams();
+        assert!(
+            elapsed <= super::streaming_handle_idle_timeout() + 2 * step,
+            "kept alive by replays for {elapsed:?}"
+        );
+    }
+    assert_eq!(e.conn.inbound_outcomes[O::EvictedIdle as usize], 1);
+}
+
+/// A legacy stream delivered out of order, with its gap at the very end,
+/// completes intact and is charged at least what it held.
+#[tokio::test(start_paused = true)]
+async fn an_out_of_order_legacy_stream_completes_within_its_charge() {
+    let mut e = single(CAPABLE);
+    let id = StreamId::next();
+    let f = super::MAX_DATA_SIZE;
+    let n = 60usize;
+    let data: Vec<u8> = (0..n * f).map(|i| (i % 251) as u8).collect();
+    let total = data.len() as u64;
+    let chunk = |i: usize| bytes::Bytes::copy_from_slice(&data[(i - 1) * f..i * f]);
+    // In order to past half, the rest backwards, the gap last.
+    let gap = n / 2 + 2;
+    let order: Vec<usize> = (1..gap).chain((gap + 1..=n).rev()).chain([gap]).collect();
+    for &i in &order[..order.len() - 1] {
+        feed(&mut e, fragment_with(id, total, i as u32, chunk(i))).await;
+        settle().await;
+    }
+    assert!(e.conn.inbound_budget.charged_bytes() >= cost(total));
+    assert!(cost(total) >= total + (n as u64 + 1) * super::inbound_budget::PER_FRAGMENT_OVERHEAD);
+    feed(&mut e, fragment_with(id, total, gap as u32, chunk(gap))).await;
+    assert_eq!(
+        e.pump(Duration::from_millis(10)).await.as_deref(),
+        Some(&data[..])
+    );
+}

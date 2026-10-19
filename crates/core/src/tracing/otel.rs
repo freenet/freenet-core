@@ -1339,6 +1339,16 @@ fn register_transport_metrics(meter: &opentelemetry::metrics::Meter) {
             }
         })
         .build();
+
+    let _inbound_streams = meter
+        .u64_observable_counter("freenet.transport.inbound_stream_limits")
+        .with_description("Inbound streams refused or evicted, by reason")
+        .with_callback(|observer| {
+            for (outcome, count) in TRANSPORT_METRICS.cumulative_inbound_stream_outcomes() {
+                observer.observe(count, &[KeyValue::new("reason", outcome.label())]);
+            }
+        })
+        .build();
 }
 
 /// Ring / topology state, mirroring the dashboard's connection-status tiles.
@@ -3009,6 +3019,7 @@ mod tests {
             "freenet.transport.packets",
             "freenet.transport.transfers",
             "freenet.transport.nat_traversal",
+            "freenet.transport.inbound_stream_limits",
             "freenet.contract.queue.depth",
             "freenet.contract.queue.depth.high_water",
             "freenet.contract.queue.rejected",
@@ -3093,6 +3104,30 @@ mod tests {
             ("freenet.transport.packets", "direction=received"),
             ("freenet.transport.nat_traversal", "result=established"),
             ("freenet.transport.nat_traversal", "result=failed_error"),
+            (
+                "freenet.transport.inbound_stream_limits",
+                "reason=refused_invalid_length",
+            ),
+            (
+                "freenet.transport.inbound_stream_limits",
+                "reason=refused_connection_bytes",
+            ),
+            (
+                "freenet.transport.inbound_stream_limits",
+                "reason=refused_connection_streams",
+            ),
+            (
+                "freenet.transport.inbound_stream_limits",
+                "reason=closed_too_many_refusals",
+            ),
+            (
+                "freenet.transport.inbound_stream_limits",
+                "reason=evicted_idle",
+            ),
+            (
+                "freenet.transport.inbound_stream_limits",
+                "reason=evicted_age",
+            ),
             // Every `HostingReason::as_str` value: its own rustdoc calls these
             // a metrics contract where renaming one empties a panel.
             ("freenet.node.contracts.hosted", "reason=local_client"),

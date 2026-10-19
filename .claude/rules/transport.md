@@ -535,10 +535,80 @@ Streaming path:
 ### WHEN implementing fragment reassembly
 
 ```
-USE: LockFreeStreamBuffer (OnceLock<Bytes> array)
+USE: LockFreeStreamBuffer (AtomicPtr<Bytes> slots, 256-slot chunks
+     allocated on first insert; construction allocates only the chunk table)
   - contiguous_fragments: AtomicU32 for frontier tracking
+  - Completion is measured in BYTES: received == total_size and every
+    inserted fragment contiguous. Never use a fragment count.
+  - Inserts past total_size are rejected, and so are empty fragments
+    other than #1: older senders leave fragment #1 empty when
+    embedded metadata fills the packet, and those peers can still connect.
+  - A taken slot holds the TAKEN marker: empty to readers, a duplicate to
+    inserts, filled to the frontier.
   - Lock-free insertion
   - Ordered delivery to consumer
+
+Legacy (non-operations) streams use InboundStream only; operations streams
+use StreamHandle/StreamRegistry/orphan registry only. Never feed one stream
+to both.
+```
+
+### WHEN admitting or sending a stream
+
+```
+Stream length limits (streaming.rs):
+  MAX_STREAM_TOTAL_BYTES = MAX_STATE_SIZE + WEBSOCKET_MAX_MESSAGE_SIZE
+                           + envelope margin
+  check_declared_stream_length(): 0 and > MAX_STREAM_TOTAL_BYTES are invalid
+
+Receiver: every new stream passes check_declared_stream_length() and the
+per-connection InboundStreamBudget (inbound_budget.rs) BEFORE any state is
+created from its declared length.
+  - Limits: MAX_INBOUND_STREAMS_PER_CONNECTION streams and
+    MAX_INBOUND_STREAM_BYTES_PER_CONNECTION bytes (one maximum-size
+    stream's cost plus headroom for ordinary streams).
+  - A stream's cost is ChargeOverhead::cost(declared): its length, a fixed
+    per-stream amount, and PER_FRAGMENT_OVERHEAD for every fragment number
+    its length allows. Admission (check) and the charge use the same cost.
+  - Both reassembly paths hold fragments as received and assemble once on
+    completion: the memory held is the fragments received.
+  - The bound is per connection; node-wide fairness is deferred to the
+    transport redesign (exception recorded in bug-prevention-patterns.md;
+    the flat constants are in executor.rs NOT_SUMMED).
+  - A refused stream id is remembered (inbound_budget::RefusedStreams) until
+    the age limit for its length, and its later fragments are dropped
+    without being counted again. Do not use a forgetting cache. If a
+    refusal cannot be remembered, the connection is closed. Refusals do not
+    change ACK or dedup behaviour.
+  - Completed streams are remembered (completed_inbound_streams) so a late
+    retransmission does not start them again.
+  - A charge is released only when ALL reassembly state is gone (observed
+    via Weak: buffer clones for operations streams, the recv_stream task
+    for legacy ones). Do not release on a single map removal.
+  - Evicting a legacy stream cancels it through its LegacyStreamToken;
+    dropping the sender alone is not enough.
+  - Incomplete streams are evicted when idle or older than
+    max_inbound_stream_age(declared), which scales with the length and is
+    not refreshed by traffic; both paths, on the timeout_check tick, before
+    the idle streaming-handle sweep. Never make the age limit a flat
+    constant. "Complete" means all bytes contiguous, not a byte count. Only
+    newly stored bytes refresh idleness.
+  - On connection drop, its unclaimed operations streams are removed from
+    the orphan registry.
+  - Every refusal, eviction and refusal-related close is counted by reason
+    in TRANSPORT_METRICS (cumulative_inbound_stream_outcomes, OTel
+    freenet.transport.inbound_stream_limits).
+  - A complete operations stream is retired from streaming_handles and the
+    registry at once, so only its consumers hold the charge.
+  - LockFreeStreamBuffer::insert claims the slot BEFORE reserving bytes, so
+    concurrent duplicates return Ok(false) without touching the reservation;
+    a taken slot holds TAKEN, so fragments at or below the contiguous
+    frontier are duplicates even after a reader has taken them.
+
+Sender: send_stream / pipe_stream return OutboundStreamInvalidLength
+(stream-scoped, NOT transient) for a length the receiver would refuse.
+send_stream does not embed metadata in fragment #1 unless at least one
+payload byte still fits; no fragment is ever empty.
 ```
 
 ## Testing Checklist
