@@ -19,6 +19,8 @@
 //! - Why a connection closed is read out of band, through
 //!   [`PeerConnectionApi::close_reason`] after `recv` fails, rather than
 //!   carried by the error.
+//! - [`CloseReason::InboundStreamRefusals`] is a concept of the UDP
+//!   transport's fragment-based inbound stream registry.
 //! - Peers are identified by `SocketAddr`.
 
 use std::net::SocketAddr;

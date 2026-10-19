@@ -3551,7 +3551,7 @@ async fn peer_connection_listener(
                     if let Err(error) =
                         handle_peer_channel_message(&mut conn, msg, &outbound_mix).await
                     {
-                        if error.is_transient() {
+                        if !error.closes_connection() {
                             tracing::warn!(
                                 to = %remote_addr,
                                 ?error,
@@ -3618,7 +3618,7 @@ async fn peer_connection_listener(
                 match msg {
                     Some(msg) => {
                         if let Err(error) = handle_peer_channel_message(&mut conn, msg, &outbound_mix).await {
-                            if error.is_transient() {
+                            if !error.closes_connection() {
                                 tracing::warn!(
                                     to = %remote_addr,
                                     ?error,
@@ -3720,7 +3720,7 @@ async fn peer_connection_listener(
                             return;
                         }
                     },
-                    Err(error) if error.is_transient() => {
+                    Err(error) if !error.closes_connection() => {
                         // Transient send failure from internal sends (ACKs, etc.) that
                         // bubbled up through recv(). Don't kill the connection — the idle
                         // timeout is the sole authority on liveness.
