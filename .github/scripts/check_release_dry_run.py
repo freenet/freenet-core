@@ -21,8 +21,9 @@ that structure the only one that passes:
      as a top-level `&&` term of its own `if:` or its job's `if:`, in an
      expression with no top-level `||` (`&&` binds tighter, so `a || b && G`
      runs without G). A missing or empty output SKIPS the step: fail closed.
-  4. Every mutating `run:` step also refuses, as the FIRST command of its own
-     script, unless `RELEASE_LIVE` (wired from the same output) is `true`. So deleting an `if:` turns a dry run red instead of
+  4. Every mutating `run:` step also refuses, as the first command of its own
+     script (only `set -...` may precede it), unless `RELEASE_LIVE` (wired
+     from the same output) is `true`. So deleting an `if:` turns a dry run red instead of
      letting it mutate.
   5. Credentials, the rule that makes any gap in the mutation detector below
      harmless. In a job a dry run can reach: `actions/checkout` persists no
@@ -126,7 +127,14 @@ ASSERT_RE = re.compile(
 # `secrets['X']`, `format(..., secrets.X)` and `toJSON(secrets)` all hand over
 # a value, so match the context rather than one spelling. A presence test such
 # as `${{ secrets.RELEASE_PAT != '' }}` hands over nothing and is allowed.
-SECRET_RE = re.compile(r"\bsecrets\b|\bgithub\s*\.\s*token\b|\bgithub\s*\[\s*['\"]token", re.I)
+SECRET_RE = re.compile(
+    r"\bsecrets\b|\bgithub\s*\.\s*token\b|\bgithub\s*\[\s*['\"]token"
+    # The whole `github` context (`toJSON(github)`) or a computed index into
+    # it carries `github.token` too. A named property other than `token`
+    # (`github.sha`, `github.repository`) does not.
+    r"|\bgithub\b(?!\s*\.\s*[A-Za-z_])(?!\s*\[\s*['\"](?!token['\"])[\w-]+['\"]\s*\])",
+    re.I,
+)
 WORKFLOW_TOKEN_RE = re.compile(r"\bsecrets\s*\.\s*github_token\b|\bgithub\s*\.\s*token\b", re.I)
 PAT_RE = re.compile(r"\brelease_pat\b|tojson\s*\(\s*secrets", re.I)
 PRESENCE_RE = re.compile(r"^\$\{\{\s*secrets\.[\w]+\s*(!=|==)\s*''\s*\}\}$", re.I)
@@ -141,7 +149,17 @@ DRY_RUN_INPUT_RE = re.compile(
     r"inputs\s*(\.\s*dry[_-]run\b|\[\s*['\"]dry[_-]run['\"]\s*\])", re.I
 )
 # The whole inputs object inside an expression (`toJSON(inputs)`) carries it too.
-INPUTS_OBJECT_RE = re.compile(r"\binputs\b(?!\s*[.\[])", re.I)
+INPUTS_OBJECT_RE = re.compile(
+    r"\binputs\b(?!\s*[.\[])"
+    # ...as do `github.event` and the whole `github` context.
+    r"|\bgithub\s*\.\s*event\b(?!\s*\.\s*(?!inputs\b)[A-Za-z_])"
+    r"|\bgithub\b(?!\s*[.\[])",
+    re.I,
+)
+# YAML anchors and aliases (supported by Actions since 2025-09). An alias can
+# copy a live step's env or script into a dry-run step with no `${{` in the
+# step's own text, so in-scope workflows may not use them.
+ANCHOR_RE = re.compile(r"""^\s*(-\s+)?(["']?[\w.-]+["']?\s*:\s+)?[&*][A-Za-z0-9_-]+(\s|$)|^\s*<<\s*:""")
 EXEMPT_MARKER = "dry-run-safe:"
 BLOCK_SCALAR_RE = re.compile(r"^[|>][1-9]?[-+]?[1-9]?\s*(#.*)?$")
 
@@ -287,7 +305,7 @@ def _block_scalar(lines: list[str], start: int, min_indent: int) -> tuple[str, i
 def _parse_map(lines: list[str], start: int, indent: int) -> dict[str, str]:
     out: dict[str, str] = {}
     i = start + 1
-    key_re = re.compile(r"^" + " " * indent + r"([A-Za-z0-9_.-]+):\s*(.*)$")
+    key_re = re.compile(r"^" + " " * indent + r"""["']?([A-Za-z0-9_.-]+)["']?:\s*(.*)$""")
     while i < len(lines):
         raw = lines[i]
         if raw.strip() and _indent(raw) < indent:
@@ -363,7 +381,6 @@ def parse_workflow(text: str) -> tuple[list[Job], list[str]]:
                 continue
             key, value = m.group(1), m.group(2)
             if key == "steps":
-                job.header = "\n".join(lines[begin:k])
                 if _strip_comment(value):
                     job.unparsed.append(k + 1)  # flow-style `steps: [...]`
                 steps_from = k + 1
@@ -399,6 +416,12 @@ def parse_workflow(text: str) -> tuple[list[Job], list[str]]:
             else:
                 job.keys[key] = _strip_comment(value)
             k += 1
+        # Every job line outside the steps block, including keys written
+        # after `steps:` (YAML key order does not matter).
+        if steps_from is None:
+            job.header = job.text
+        else:
+            job.header = "\n".join(lines[begin:steps_from - 1] + lines[steps_to:end])
         if steps_from is not None:
             items = [j for j in range(steps_from, steps_to) if re.match(r"^      - ", lines[j])]
             first_item = items[0] if items else steps_to
@@ -742,7 +765,17 @@ def check_source(text: str, name: str, repo_root: Path) -> list[str]:
     errors: list[str] = []
     by_name = {j.name: j for j in jobs}
     jobs_at = next((i for i, l in enumerate(lines) if re.match(r"^jobs:\s*(#.*)?$", l)), len(lines))
-    workflow_head = _source_without_comments("\n".join(lines[:jobs_at]))
+    jobs_end = next((i for i in range(jobs_at + 1, len(lines)) if re.match(r"^[A-Za-z\"']", lines[i])), len(lines))
+    # Every top-level line outside `jobs:`, including keys written after it.
+    workflow_head = _source_without_comments("\n".join(lines[:jobs_at] + lines[jobs_end:]))
+    perms_at = next((i for i, l in enumerate(lines) if re.match(r"^permissions:", l)), None)
+    workflow_perms = {}
+    if perms_at is not None:
+        v = _strip_comment(lines[perms_at].split(":", 1)[1])
+        workflow_perms = {"*": v} if v else _parse_map(lines, perms_at, 2)
+    for n, raw in enumerate(lines, start=1):
+        if not raw.strip().startswith("#") and ANCHOR_RE.match(raw):
+            errors.append(f"{name}:{n}: YAML anchors and aliases are not allowed in a workflow with a dry_run input: an alias can copy a live step's credential or script into a dry-run step without it appearing in that step's text.")
 
     def err(line: int, msg: str) -> None:
         errors.append(f"{name}:{line}: {msg}")
@@ -757,7 +790,7 @@ def check_source(text: str, name: str, repo_root: Path) -> list[str]:
         if mode_step is None:
             err(mode_job.line, f"`{MODE_JOB}` has no step with `id: {MODE_STEP_ID}`.")
         else:
-            if MODE_SCRIPT not in (mode_step.run or ""):
+            if (mode_step.run or "").strip() != f"bash {MODE_SCRIPT}":
                 err(mode_step.line, f"the mode step must run `{MODE_SCRIPT}` (it is the tested resolver).")
             if not re.fullmatch(
                 r"\$\{\{\s*inputs\.dry_run\s*\}\}", mode_step.env.get("DRY_RUN_INPUT", "")
@@ -782,6 +815,11 @@ def check_source(text: str, name: str, repo_root: Path) -> list[str]:
             err(n, f"`inputs.dry_run` is read outside the mode step. Gate on `{GUARD}` instead; a second reader is how #5936's guards drifted apart.")
 
     for job in jobs:
+        # `continue-on-error` turns a failed gate (the checkout verifier, the
+        # packaging dry run) into a pass, and everything downstream proceeds.
+        for where_line, keys in [(job.line, job.keys)] + [(st.line, st.keys) for st in job.steps]:
+            if "continue-on-error" in keys:
+                err(where_line, "`continue-on-error` is not allowed in a workflow with a dry_run input: it lets a release proceed past a failed gate.")
         for where_line, expr in [(job.line, job.keys.get("if", ""))] + [(st.line, st.keys.get("if", "")) for st in job.steps]:
             if re.search(r"(==|!=)\s*(true|false)\b|\b(true|false)\s*(==|!=)", _unwrap(expr)):
                 err(where_line, f"`if: {expr}` compares with an unquoted boolean. Outputs are strings, and in Actions `'true' == true` is false; compare with `'true'`.")
@@ -827,6 +865,11 @@ def check_source(text: str, name: str, repo_root: Path) -> list[str]:
         read_only = bool(job.permissions) and all(
             v in ("read", "none", "read-all") for v in job.permissions.values()
         )
+        # An OIDC token is a publish credential wherever trusted publishing is
+        # configured, and it is not covered by the token rules above.
+        effective = job.permissions or workflow_perms
+        if not job_guarded and (effective.get("id-token") == "write" or "write-all" in effective.values()):
+            err(job.line, f"job `{job.name}` runs in a dry run with `id-token: write` (or write-all); an OIDC token can publish.")
         if not job_guarded:
             for scope, src in (("workflow-level", workflow_head), ("job-level", _source_without_comments(job.header))):
                 if _hands_credential(src, read_only):
@@ -1397,6 +1440,30 @@ def self_test() -> int:
             "receives a credential")
         run("an unquoted cat heredoc body is executed, so it is scanned",
             body("run: |\n          cat > f <<EOF\n          $(gh pr merge 1 --auto)\n          EOF"), "gh pr write")
+
+        # Round 4: credential routes that bypassed the scan.
+        run("a YAML alias copying a live step's env is refused",
+            _GOOD.replace("        env:\n          GH_TOKEN: ${{ secrets.RELEASE_PAT || secrets.GITHUB_TOKEN }}\n          RELEASE_LIVE:",
+                          "        env: &ghenv\n          GH_TOKEN: ${{ secrets.RELEASE_PAT || secrets.GITHUB_TOKEN }}\n          RELEASE_LIVE:"),
+            "anchors and aliases")
+        run("toJSON(github) carries the workflow token", with_env("${{ toJSON(github) }}"), "receives a credential")
+        run("github.sha is not a credential", with_env("${{ github.sha }}"), None)
+        run("a job-level env written after steps: is scanned",
+            _GOOD.replace("  rehearse:\n", "    env:\n      GH_TOKEN: ${{ secrets.RELEASE_PAT }}\n  rehearse:\n", 1),
+            "job-level source")
+        run("a workflow-level env written after jobs: is scanned",
+            _GOOD + "env:\n  GH_TOKEN: ${{ secrets.RELEASE_PAT }}\n", "workflow-level source")
+        run("a quoted permission key still counts",
+            _GOOD.replace("      contents: read\n", "      actions: read\n      \"contents\": write\n"), "read-only `permissions:`")
+        run("id-token: write in a dry-run job is refused",
+            _GOOD.replace("jobs:\n", "permissions:\n  id-token: write\njobs:\n", 1), "id-token")
+        run("the mode step runs exactly the resolver",
+            _GOOD.replace("run: bash scripts/resolve_release_mode.sh", "run: bash scripts/resolve_release_mode.sh; echo live=true >> $GITHUB_OUTPUT"),
+            "resolve_release_mode.sh")
+        run("continue-on-error on a step is refused", body("continue-on-error: true\n        run: true"), "continue-on-error")
+        run("continue-on-error on a job is refused",
+            _GOOD.replace("  rehearse:\n    runs-on: ubuntu-latest\n", "  rehearse:\n    runs-on: ubuntu-latest\n    continue-on-error: true\n"), "continue-on-error")
+        run("toJSON(github.event) reads the input", body("run: echo '${{ toJSON(github.event) }}'"), "read outside the mode step")
 
         # Rule 1.
         run("the mode step must exist", _GOOD.replace("        id: mode\n", ""), "no step with `id: mode`")

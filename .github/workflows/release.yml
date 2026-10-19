@@ -375,6 +375,10 @@ jobs:
             echo '```diff'
             git diff HEAD~1 HEAD -- crates/core/Cargo.toml crates/fdev/Cargo.toml
             echo '```'
+            echo
+            echo "Files in the bump commit (Cargo.lock comes from \`cargo update --workspace\`):"
+            echo
+            git show --stat --format= HEAD | sed 's/^/    /'
           } | tee -a "$GITHUB_STEP_SUMMARY"
           # The commit exists only on this runner. A bundle carries it, with its
           # SHA intact, to the rehearsal job, which packages exactly this tree.
@@ -649,6 +653,8 @@ jobs:
             # decides which commits the notes describe. Pin it to the commit
             # actually being released, not to `main` — otherwise the notes can
             # describe commits that are not in the release (#5233).
+            # This job runs live only. The marker is for the linter, which
+            # treats any POST-shaped `gh api` as mutating:
             # dry-run-safe: generate-notes is a POST that renders text and creates nothing.
             NOTES=$(gh api repos/:owner/:repo/releases/generate-notes \
               -f tag_name="v$VERSION" \
@@ -700,7 +706,7 @@ jobs:
     name: Release summary
     runs-on: ubuntu-latest
     timeout-minutes: 5
-    needs: [validate, dry_run_rehearsal, create_release]
+    needs: [validate, update_versions, wait_for_pr, verify_publishable, dry_run_rehearsal, create_release]
     if: always()
 
     steps:
@@ -712,6 +718,9 @@ jobs:
           LIVE: ${{ needs.validate.outputs.live }}
           VERSION: ${{ needs.validate.outputs.version }}
           FDEV_VERSION: ${{ needs.validate.outputs.fdev_version }}
+          BUMP: ${{ needs.update_versions.result }}
+          WAIT: ${{ needs.wait_for_pr.result }}
+          VERIFY: ${{ needs.verify_publishable.result }}
           REHEARSAL: ${{ needs.dry_run_rehearsal.result }}
           CREATE_RELEASE: ${{ needs.create_release.result }}
           REPO: ${{ github.repository }}
@@ -722,13 +731,15 @@ jobs:
           fi
           if [ "$LIVE" != "true" ]; then
             echo "🏃 DRY RUN for ${VERSION:-<unresolved version>}: nothing was pushed, merged, tagged or released."
-            echo "   Rehearsal on the unpushed bump commit: ${REHEARSAL:-not run}"
+            echo "   Version bump (local only): ${BUMP:-not run}; rehearsal on the unpushed bump commit: ${REHEARSAL:-not run}"
             echo "   What a live run would have created is in the update_versions and dry_run_rehearsal step summaries."
             exit 0
           fi
           if [ "$CREATE_RELEASE" != "success" ]; then
-            echo "❌ Release $VERSION did NOT complete: create_release is '$CREATE_RELEASE'. Check the failed job above;"
-            echo "   if the bump PR already merged, see scripts/RELEASE_RECOVERY.md before re-running."
+            echo "❌ Release $VERSION did NOT complete. Job results:"
+            echo "   update_versions=$BUMP wait_for_pr=$WAIT verify_publishable=$VERIFY create_release=$CREATE_RELEASE"
+            echo "   If update_versions failed, check whether it opened or merged the bump PR before re-running."
+            echo "   If the bump PR merged (wait_for_pr succeeded), see scripts/RELEASE_RECOVERY.md before re-running."
             exit 0
           fi
           echo "🎉 Release $VERSION is cut and tagged."

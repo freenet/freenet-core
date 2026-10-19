@@ -444,11 +444,11 @@ not move.
 
 Every mutating step is gated on the single `needs.validate.outputs.live`
 value and refuses in its own script when that is not `true`. `RELEASE_PAT` never
-reaches a step that runs in a dry run, and no other secret does either, except
-two: the bump job's checkout fetches with the workflow token and persists
-nothing, and the rehearsal job's changelog step uses its read-only token. (The
-bump job itself still holds the workflow's write token; nothing that runs in a
-dry run is handed it.) Rule Lint's
+reaches a step that runs in a dry run, and no other token does either, with
+two exceptions: the bump job's checkout fetches with the workflow token (which
+can write) and persists nothing, and the rehearsal job's changelog step uses
+that job's read-only token. A presence test such as
+`secrets.RELEASE_PAT != ''` passes no credential and is allowed. Rule Lint's
 `.github/scripts/check_release_dry_run.py` fails a PR that breaks any of that
 (#5936).
 
