@@ -705,8 +705,8 @@ check_prerequisites() {
 }
 
 # Bring both lockfiles in line with the current manifests. Idempotent, so
-# update_versions calls it on every run, including a resumed run whose
-# manifest edits already landed.
+# update_versions calls it on every run, including one where the version
+# bump is already on main.
 sync_lockfiles() {
     local err
 
@@ -748,9 +748,9 @@ update_versions() {
     # Check if version is already updated in Cargo.toml
     if grep -q "^version = \"$VERSION\"" "$PROJECT_ROOT/crates/core/Cargo.toml" 2>/dev/null; then
         echo "  ✓ Versions already updated (skipping)"
-        # A previous run may have edited the manifests and then failed before
-        # the lockfiles were synced. Re-sync them (idempotent) so a resumed
-        # run doesn't commit a stale lock.
+        # The version bump is already on main (a resume after the bump
+        # commit, or a main whose nested lock went stale). Re-sync the locks
+        # (idempotent); create_release_pr commits any repair.
         if [[ "$DRY_RUN" != "true" ]]; then
             sync_lockfiles
         fi
