@@ -16,8 +16,9 @@
 //! - The caller picks stream ids ([`StreamId`]: a `u32` with an operations
 //!   bit).
 //! - [`InboundStreamRegistry`] is fragment-based (`Weak<LockFreeStreamBuffer>`).
-//! - Why a connection closed is reported out of band, through the
-//!   `closed_by_*` flags read after `recv` fails.
+//! - Why a connection closed is read out of band, through
+//!   [`PeerConnectionApi::close_reason`] after `recv` fails, rather than
+//!   carried by the error.
 //! - Peers are identified by `SocketAddr`.
 
 use std::net::SocketAddr;
@@ -68,6 +69,17 @@ pub(crate) enum StreamSendOutcome {
     /// closed, congestion timeout, no connection, transport send error). The
     /// permit is released but the message was NOT delivered.
     Dropped,
+}
+
+/// Why a connection's `recv` ended it, as reported by
+/// [`PeerConnectionApi::close_reason`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CloseReason {
+    /// Nothing arrived for the idle timeout.
+    IdleTimeout,
+    /// The peer had more refused inbound streams outstanding than are
+    /// remembered.
+    InboundStreamRefusals,
 }
 
 /// Observer of an outbound stream's progress, passed into
@@ -131,18 +143,12 @@ pub(crate) trait PeerConnectionApi: Send {
     /// `None` as "unsupported" when gating version-dependent message types.
     fn remote_version(&self) -> Option<(u8, u8, u16)>;
 
-    /// Whether `recv` ended this connection because nothing arrived for the
-    /// idle timeout. Read after `recv` returns an error, to label the
-    /// disconnect in telemetry. Defaults to `false` for test doubles.
-    fn closed_by_idle_timeout(&self) -> bool {
-        false
-    }
-
-    /// Whether `recv` ended this connection because the peer had more
-    /// refused inbound streams outstanding than are remembered. Read after
-    /// `recv` returns an error, to label the disconnect. Defaults to `false`.
-    fn closed_by_stream_refusals(&self) -> bool {
-        false
+    /// Why `recv` ended this connection, when the transport knows. Read
+    /// after `recv` returns an error, to label the disconnect in telemetry.
+    /// `None` means an ordinary transport closure. Defaults to `None` for
+    /// test doubles.
+    fn close_reason(&self) -> Option<CloseReason> {
+        None
     }
 
     /// Sends one serialized message to the remote peer.

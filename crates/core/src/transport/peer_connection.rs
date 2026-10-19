@@ -3375,6 +3375,22 @@ async fn send_untracked_receipts<S: super::Socket>(
     Ok(())
 }
 
+/// The [`CloseReason`](super::CloseReason) a connection reports from its two
+/// close flags. If both are set, the idle timeout wins, as it did when the
+/// node read the flags itself.
+pub(crate) fn close_reason_from_flags(
+    closed_by_idle_timeout: bool,
+    closed_by_stream_refusals: bool,
+) -> Option<super::CloseReason> {
+    if closed_by_idle_timeout {
+        Some(super::CloseReason::IdleTimeout)
+    } else if closed_by_stream_refusals {
+        Some(super::CloseReason::InboundStreamRefusals)
+    } else {
+        None
+    }
+}
+
 // =============================================================================
 // PeerConnectionApi implementation for type erasure
 // =============================================================================
@@ -3388,12 +3404,8 @@ impl<S: super::Socket> super::PeerConnectionApi for PeerConnection<S> {
         PeerConnection::remote_version(self)
     }
 
-    fn closed_by_idle_timeout(&self) -> bool {
-        self.closed_by_idle_timeout
-    }
-
-    fn closed_by_stream_refusals(&self) -> bool {
-        self.closed_by_stream_refusals
+    fn close_reason(&self) -> Option<super::CloseReason> {
+        close_reason_from_flags(self.closed_by_idle_timeout, self.closed_by_stream_refusals)
     }
 
     fn send_bytes(

@@ -3739,18 +3739,8 @@ async fn peer_connection_listener(
                         // CRITICAL: Drain pending outbound messages before exiting.
                         // Messages may have been queued to the channel while we were
                         // waiting in select!, and they would be lost without this drain.
-                        // Label the disconnect: the idle timeout is the
-                        // only liveness check, so it is the "timeout" case;
-                        // every other recv error is a transport closure.
-                        let reason = if conn.closed_by_idle_timeout() {
-                            crate::tracing::DisconnectReason::Timeout
-                        } else if conn.closed_by_stream_refusals() {
-                            crate::tracing::DisconnectReason::Explicit(
-                                "inbound_stream_refusals".into(),
-                            )
-                        } else {
-                            crate::tracing::DisconnectReason::NetworkError("transport_closed".into())
-                        };
+                        // Label the disconnect (see disconnect_reason_for_close).
+                        let reason = disconnect_reason_for_close(conn.close_reason());
                         drain_pending_before_shutdown(&mut rx, &mut conn, remote_addr, &outbound_mix).await;
                         notify_transport_closed(&conn_events, remote_addr, error, connection_id, reason).await;
                         return;
@@ -3758,6 +3748,22 @@ async fn peer_connection_listener(
                 }
             },
         }
+    }
+}
+
+/// The telemetry label for a connection that `recv` ended: the idle timeout
+/// is the only liveness check, so it is the "timeout" case; every other recv
+/// error is a transport closure.
+fn disconnect_reason_for_close(
+    reason: Option<crate::transport::CloseReason>,
+) -> crate::tracing::DisconnectReason {
+    use crate::transport::CloseReason;
+    match reason {
+        Some(CloseReason::IdleTimeout) => crate::tracing::DisconnectReason::Timeout,
+        Some(CloseReason::InboundStreamRefusals) => {
+            crate::tracing::DisconnectReason::Explicit("inbound_stream_refusals".into())
+        }
+        None => crate::tracing::DisconnectReason::NetworkError("transport_closed".into()),
     }
 }
 
@@ -3901,6 +3907,30 @@ pub(crate) mod tests {
             Box<dyn std::future::Future<Output = Result<(), super::TransportError>> + Send + '_>,
         > {
             unreachable!("not used by these tests")
+        }
+    }
+
+    /// Every combination of the UDP connection's two close flags reaches the
+    /// same `DisconnectReason` through `close_reason()` as the node computed
+    /// when it read the flags itself. The expected column is that old
+    /// if-chain, written out inline.
+    #[test]
+    fn close_reason_preserves_the_disconnect_reason_for_every_flag_combination() {
+        use crate::tracing::DisconnectReason;
+        use crate::transport::peer_connection::close_reason_from_flags;
+        for idle in [false, true] {
+            for refusals in [false, true] {
+                let old = if idle {
+                    DisconnectReason::Timeout
+                } else if refusals {
+                    DisconnectReason::Explicit("inbound_stream_refusals".into())
+                } else {
+                    DisconnectReason::NetworkError("transport_closed".into())
+                };
+                let new =
+                    super::disconnect_reason_for_close(close_reason_from_flags(idle, refusals));
+                assert_eq!(new, old, "idle={idle} refusals={refusals}");
+            }
         }
     }
 
