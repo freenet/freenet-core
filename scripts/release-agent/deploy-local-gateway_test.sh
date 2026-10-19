@@ -83,6 +83,13 @@ chmod +x "$TMP/bin/sudo"
 # foreign process overwrite this.
 echo "0::/system.slice/freenet-gateway.service" > "$TMP/cgroup-content"
 
+# `sleep` stub: deploy-local-gateway.sh sleeps 1-3s between service-state polls
+# and its stubs answer instantly, so the real sleeps only add up (48s of the Fmt
+# job's ~4 min, which has a 5 min limit, #5942). Nothing here measures elapsed
+# time, only exit codes and output.
+printf '#!/bin/bash\nexit 0\n' > "$TMP/bin/sleep"
+chmod +x "$TMP/bin/sleep"
+
 # `lsof` stub: binary is never busy.
 printf '#!/bin/bash\nexit 1\n' > "$TMP/bin/lsof"
 chmod +x "$TMP/bin/lsof"

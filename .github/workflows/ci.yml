@@ -420,6 +420,41 @@ jobs:
             exit 1
           fi
 
+      # #5942: two Fmt jobs finished every step and then sat in the runner's
+      # post-job "Cleaning up orphan processes" for minutes (one ran into the
+      # job timeout, the other until it was cancelled). The runner cleans up by
+      # finding every process that carries this job's RUNNER_TRACKING_ID and
+      # waiting on it. The process it found was a restart-pause `sleep` that
+      # scripts/nix-node-wrapper_test.sh's wrapper had orphaned (fixed in
+      # nix/freenet-node.sh). This step is the backstop: it names and kills
+      # whatever a future step leaves behind, by PID, before the runner gets
+      # there, so a stray process costs a log line instead of a cancelled
+      # required check.
+      - name: Reap and report stray processes
+        if: always()
+        run: |
+          set -u
+          [ -n "${RUNNER_TRACKING_ID:-}" ] || { echo "no RUNNER_TRACKING_ID; nothing to do"; exit 0; }
+          # This shell and its ancestors carry the id too (the runner's own
+          # wrapper); only strays are killed.
+          keep=" $$ "
+          p=$$
+          while [ "$p" -gt 1 ]; do
+            p=$(awk '/^PPid:/ {print $2}' "/proc/$p/status" 2>/dev/null || echo 0)
+            keep="$keep$p "
+          done
+          found=0
+          for d in /proc/[0-9]*; do
+            pid=${d#/proc/}
+            case "$keep" in *" $pid "*) continue ;; esac
+            { tr '\0' '\n' <"$d/environ" | grep -qx "RUNNER_TRACKING_ID=$RUNNER_TRACKING_ID"; } 2>/dev/null || continue
+            found=1
+            echo "::warning::stray process left by a step: pid $pid: $(tr '\0' ' ' <"$d/cmdline" 2>/dev/null | cut -c1-200)"
+            kill -KILL "$pid" 2>/dev/null || true
+          done
+          [ "$found" -eq 0 ] && echo "no stray processes"
+          exit 0
+
   # Grep-based lint for banned patterns in crates/core/ (DST-breaking APIs).
   # Only checks added lines in the diff — pre-existing violations are grandfathered.
   # Fast (~2s on GitHub-hosted runner), no Rust toolchain needed.
