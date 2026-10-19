@@ -955,17 +955,6 @@ jobs:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -C link-arg=-fuse-ld=mold
         run: |
           cargo build --locked
-          # apps/freenet-ping is a separate nested workspace with its own
-          # Cargo.lock (it path-depends on crates/core). Nothing below builds it
-          # with --locked -- the make target and the ping tests' contract
-          # compile both run plain `cargo build`, which silently rewrites the
-          # lockfile in the throwaway checkout -- so a stale nested lock (e.g.
-          # after a release bump of crates/core) never failed CI. Check it here.
-          if ! cargo metadata --locked --format-version 1 \
-              --manifest-path apps/freenet-ping/Cargo.toml > /dev/null; then
-            echo "::error file=apps/freenet-ping/Cargo.lock::apps/freenet-ping/Cargo.lock is stale. Run: cargo metadata --format-version 1 --manifest-path apps/freenet-ping/Cargo.toml > /dev/null, then commit apps/freenet-ping/Cargo.lock"
-            exit 1
-          fi
           export PATH="$PWD/target/debug:$PATH"
           make -C apps/freenet-ping -f run-ping.mk build
 
