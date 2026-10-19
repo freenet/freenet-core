@@ -2785,6 +2785,30 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                 "nat_fail_samples_dropped".into(),
                 serde_json::json!(snapshot.nat_fail_samples_dropped),
             );
+            m.insert(
+                "inbound_stream_refused_invalid_length".into(),
+                serde_json::json!(snapshot.inbound_stream_refused_invalid_length),
+            );
+            m.insert(
+                "inbound_stream_refused_connection_bytes".into(),
+                serde_json::json!(snapshot.inbound_stream_refused_connection_bytes),
+            );
+            m.insert(
+                "inbound_stream_refused_connection_streams".into(),
+                serde_json::json!(snapshot.inbound_stream_refused_connection_streams),
+            );
+            m.insert(
+                "inbound_stream_closed_too_many_refusals".into(),
+                serde_json::json!(snapshot.inbound_stream_closed_too_many_refusals),
+            );
+            m.insert(
+                "inbound_stream_evicted_idle".into(),
+                serde_json::json!(snapshot.inbound_stream_evicted_idle),
+            );
+            m.insert(
+                "inbound_stream_evicted_age".into(),
+                serde_json::json!(snapshot.inbound_stream_evicted_age),
+            );
             serde_json::Value::Object(m)
         }
         EventKind::InterestSync(interest_sync_event) => {

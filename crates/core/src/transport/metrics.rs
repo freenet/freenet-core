@@ -218,6 +218,11 @@ pub struct TransportMetrics {
     /// and packets dropped because the channel was full (reset each snapshot).
     inbound_queue_depth_hwm: AtomicU32,
     inbound_queue_drops: AtomicU64,
+
+    /// Inbound streams refused or evicted this period, by reason (reset each
+    /// snapshot). The never-reset twin is `cumulative_inbound_stream_outcomes`,
+    /// which is what the OTel instrument observes.
+    inbound_stream_outcomes: [AtomicU32; InboundStreamOutcome::COUNT],
 }
 
 /// Period counters for packet loss, retransmission and standalone-ACK
@@ -456,6 +461,7 @@ impl TransportMetrics {
             transfer_ack_time_max_ms: AtomicU64::new(0),
             inbound_queue_depth_hwm: AtomicU32::new(0),
             inbound_queue_drops: AtomicU64::new(0),
+            inbound_stream_outcomes: Default::default(),
         }
     }
 
@@ -940,6 +946,7 @@ impl TransportMetrics {
     /// Record an inbound stream refused or evicted.
     pub(crate) fn record_inbound_stream_outcome(&self, outcome: InboundStreamOutcome) {
         self.cumulative_inbound_stream_outcomes[outcome as usize].fetch_add(1, Ordering::Relaxed);
+        self.inbound_stream_outcomes[outcome as usize].fetch_add(1, Ordering::Relaxed);
     }
 
     /// Cumulative inbound stream outcomes (refusals and evictions), never
@@ -1076,6 +1083,26 @@ impl TransportMetrics {
                 d.samples.lock().clone()
             },
             nat_fail_samples_dropped: get32(&d.samples_dropped),
+            inbound_stream_refused_invalid_length: get32(
+                &self.inbound_stream_outcomes[InboundStreamOutcome::RefusedInvalidLength as usize],
+            ),
+            inbound_stream_refused_connection_bytes: get32(
+                &self.inbound_stream_outcomes
+                    [InboundStreamOutcome::RefusedConnectionBytes as usize],
+            ),
+            inbound_stream_refused_connection_streams: get32(
+                &self.inbound_stream_outcomes
+                    [InboundStreamOutcome::RefusedConnectionStreams as usize],
+            ),
+            inbound_stream_closed_too_many_refusals: get32(
+                &self.inbound_stream_outcomes[InboundStreamOutcome::ClosedTooManyRefusals as usize],
+            ),
+            inbound_stream_evicted_idle: get32(
+                &self.inbound_stream_outcomes[InboundStreamOutcome::EvictedIdle as usize],
+            ),
+            inbound_stream_evicted_age: get32(
+                &self.inbound_stream_outcomes[InboundStreamOutcome::EvictedAge as usize],
+            ),
         }
     }
 
@@ -1442,6 +1469,15 @@ pub struct TransportSnapshot {
     /// layout of the local event log again (older records are skipped).
     pub nat_fail_samples: Vec<NatFailureSample>,
     pub nat_fail_samples_dropped: u32,
+    /// Inbound streams refused or evicted during the period, by reason
+    /// (see [`InboundStreamOutcome`]; the field suffix is its label). Counts
+    /// only, no addresses. The never-reset twin feeds the OTel metric.
+    pub inbound_stream_refused_invalid_length: u32,
+    pub inbound_stream_refused_connection_bytes: u32,
+    pub inbound_stream_refused_connection_streams: u32,
+    pub inbound_stream_closed_too_many_refusals: u32,
+    pub inbound_stream_evicted_idle: u32,
+    pub inbound_stream_evicted_age: u32,
 }
 
 /// Per-connection RTT distribution fields of [`TransportSnapshot`]; see the
@@ -1495,6 +1531,12 @@ impl TransportSnapshot {
             inbound_queue_drops,
             nat_fail_samples,
             nat_fail_samples_dropped,
+            inbound_stream_refused_invalid_length,
+            inbound_stream_refused_connection_bytes,
+            inbound_stream_refused_connection_streams,
+            inbound_stream_closed_too_many_refusals,
+            inbound_stream_evicted_idle,
+            inbound_stream_evicted_age,
         } = extras;
         self.conn_rtt_connections = conn_rtt_connections;
         self.conn_srtt_p50_us = conn_srtt_p50_us;
@@ -1526,6 +1568,12 @@ impl TransportSnapshot {
         self.inbound_queue_drops = inbound_queue_drops;
         self.nat_fail_samples = nat_fail_samples;
         self.nat_fail_samples_dropped = nat_fail_samples_dropped;
+        self.inbound_stream_refused_invalid_length = inbound_stream_refused_invalid_length;
+        self.inbound_stream_refused_connection_bytes = inbound_stream_refused_connection_bytes;
+        self.inbound_stream_refused_connection_streams = inbound_stream_refused_connection_streams;
+        self.inbound_stream_closed_too_many_refusals = inbound_stream_closed_too_many_refusals;
+        self.inbound_stream_evicted_idle = inbound_stream_evicted_idle;
+        self.inbound_stream_evicted_age = inbound_stream_evicted_age;
         self
     }
 }
@@ -1603,6 +1651,15 @@ struct SnapshotExtras {
     /// layout of the local event log again (older records are skipped).
     pub nat_fail_samples: Vec<NatFailureSample>,
     pub nat_fail_samples_dropped: u32,
+    /// Inbound streams refused or evicted during the period, by reason
+    /// (see [`InboundStreamOutcome`]; the field suffix is its label). Counts
+    /// only, no addresses. The never-reset twin feeds the OTel metric.
+    pub inbound_stream_refused_invalid_length: u32,
+    pub inbound_stream_refused_connection_bytes: u32,
+    pub inbound_stream_refused_connection_streams: u32,
+    pub inbound_stream_closed_too_many_refusals: u32,
+    pub inbound_stream_evicted_idle: u32,
+    pub inbound_stream_evicted_age: u32,
 }
 
 impl SnapshotExtras {
@@ -1625,6 +1682,12 @@ impl SnapshotExtras {
             || self.transfers_acked != 0
             || self.inbound_queue_drops != 0
             || !self.nat_fail_samples.is_empty()
+            || self.inbound_stream_refused_invalid_length != 0
+            || self.inbound_stream_refused_connection_bytes != 0
+            || self.inbound_stream_refused_connection_streams != 0
+            || self.inbound_stream_closed_too_many_refusals != 0
+            || self.inbound_stream_evicted_idle != 0
+            || self.inbound_stream_evicted_age != 0
     }
 }
 
@@ -2372,6 +2435,74 @@ mod tests {
         assert_eq!(snap.inbound_queue_drops, 1);
     }
 
+    /// The snapshot field that carries `outcome`'s period count. Exhaustive
+    /// on purpose: a new `InboundStreamOutcome` fails to compile here until it
+    /// is given a `TransportSnapshot` field.
+    fn snapshot_count(snap: &TransportSnapshot, outcome: InboundStreamOutcome) -> u32 {
+        match outcome {
+            InboundStreamOutcome::RefusedInvalidLength => {
+                snap.inbound_stream_refused_invalid_length
+            }
+            InboundStreamOutcome::RefusedConnectionBytes => {
+                snap.inbound_stream_refused_connection_bytes
+            }
+            InboundStreamOutcome::RefusedConnectionStreams => {
+                snap.inbound_stream_refused_connection_streams
+            }
+            InboundStreamOutcome::ClosedTooManyRefusals => {
+                snap.inbound_stream_closed_too_many_refusals
+            }
+            InboundStreamOutcome::EvictedIdle => snap.inbound_stream_evicted_idle,
+            InboundStreamOutcome::EvictedAge => snap.inbound_stream_evicted_age,
+        }
+    }
+
+    /// Recorded outcomes reach the snapshot per reason; `take_snapshot` resets
+    /// the period counts but never the cumulative ones the OTel instrument
+    /// reads.
+    #[test]
+    fn inbound_stream_outcomes_snapshot_and_reset() {
+        let metrics = TransportMetrics::new();
+        // Outcome `i` is recorded `i + 1` times so every reason has a
+        // distinct count and a swapped field is caught.
+        for (i, outcome) in InboundStreamOutcome::ALL.into_iter().enumerate() {
+            for _ in 0..=i {
+                metrics.record_inbound_stream_outcome(outcome);
+            }
+        }
+        let read = metrics.read_snapshot();
+        for (i, outcome) in InboundStreamOutcome::ALL.into_iter().enumerate() {
+            assert_eq!(snapshot_count(&read, outcome), i as u32 + 1, "{outcome:?}");
+        }
+        let snap = metrics.take_snapshot().expect("outcomes are activity");
+        for (i, outcome) in InboundStreamOutcome::ALL.into_iter().enumerate() {
+            assert_eq!(snapshot_count(&snap, outcome), i as u32 + 1, "{outcome:?}");
+        }
+
+        metrics.record_packet_sent("10.0.0.1:1".parse().unwrap(), 1);
+        let snap = metrics.take_snapshot().expect("activity");
+        for outcome in InboundStreamOutcome::ALL {
+            assert_eq!(snapshot_count(&snap, outcome), 0, "{outcome:?} must reset");
+        }
+        for (i, (outcome, total)) in metrics
+            .cumulative_inbound_stream_outcomes()
+            .into_iter()
+            .enumerate()
+        {
+            assert_eq!(total, i as u64 + 1, "{outcome:?} cumulative must not reset");
+        }
+    }
+
+    /// Every reason's snapshot field is uploaded as `inbound_stream_<label>`.
+    #[test]
+    fn inbound_stream_outcome_json_keys_match_labels() {
+        let json = serde_json::to_value(TransportSnapshot::default()).unwrap();
+        for outcome in InboundStreamOutcome::ALL {
+            let key = format!("inbound_stream_{}", outcome.label());
+            assert!(json.get(&key).is_some(), "missing snapshot key {key}");
+        }
+    }
+
     /// Each NAT failure kind lands in its own counter.
     #[test]
     fn nat_failure_kinds_are_partitioned() {
@@ -2537,6 +2668,12 @@ mod tests {
             "inbound_queue_drops",
             "nat_fail_samples",
             "nat_fail_samples_dropped",
+            "inbound_stream_refused_invalid_length",
+            "inbound_stream_refused_connection_bytes",
+            "inbound_stream_refused_connection_streams",
+            "inbound_stream_closed_too_many_refusals",
+            "inbound_stream_evicted_idle",
+            "inbound_stream_evicted_age",
         ] {
             assert!(obj.contains_key(key), "missing key {key}");
         }
