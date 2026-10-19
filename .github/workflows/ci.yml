@@ -286,6 +286,15 @@ jobs:
       - name: Self-test release canary wiring
         run: bash scripts/release_canary_wiring_test.sh
 
+      # Regression gate for #5936: a `dry_run=true` release run pushed the
+      # release branch, opened the `build: release` PR and auto-merged the
+      # version bump into main. Pins that the dry-run resolver fails closed,
+      # that the linter catches the pre-fix job and likely regressions of the
+      # real file, and EXECUTES every mutating step of release.yml against
+      # stubs to prove it refuses (and calls nothing) when not live.
+      - name: Self-test release dry run
+        run: bash scripts/release_dry_run_test.sh
+
       # Regression gate for #5221/#5222: auto-update was broken fleet-wide for
       # TWO releases (v0.2.120, v0.2.121) and nothing noticed, because every
       # signal was one-sided — the release built, published, installed and ran.
@@ -337,7 +346,7 @@ jobs:
       # clean when they landed but were not actually in this list, so nothing
       # held them to it. `-x` because the two test scripts `source` the canary.
       - name: Lint install/uninstall scripts (shellcheck)
-        run: shellcheck -x scripts/install.sh scripts/uninstall.sh scripts/test-install-sh.sh scripts/test-uninstall-sh.sh scripts/macos-url-scheme-e2e.sh scripts/auto-update-canary.sh scripts/auto-update-canary_test.sh scripts/auto-update-canary_lifecycle_test.sh scripts/release_wait_for_binaries_test.sh scripts/release_canary_wiring_test.sh scripts/rule_lint_shell_assertion_counter_test.sh scripts/release.sh scripts/pr-backlog-sweep.sh scripts/pr-backlog-sweep_test.sh scripts/release-rollback.sh scripts/release_rollback_test.sh nix/freenet-node.sh scripts/nix-node-wrapper_test.sh
+        run: shellcheck -x scripts/install.sh scripts/uninstall.sh scripts/test-install-sh.sh scripts/test-uninstall-sh.sh scripts/macos-url-scheme-e2e.sh scripts/auto-update-canary.sh scripts/auto-update-canary_test.sh scripts/auto-update-canary_lifecycle_test.sh scripts/release_wait_for_binaries_test.sh scripts/release_canary_wiring_test.sh scripts/rule_lint_shell_assertion_counter_test.sh scripts/release.sh scripts/pr-backlog-sweep.sh scripts/pr-backlog-sweep_test.sh scripts/release-rollback.sh scripts/release_rollback_test.sh scripts/resolve_release_mode.sh scripts/release_dry_run_test.sh nix/freenet-node.sh scripts/nix-node-wrapper_test.sh
       # The PR-backlog sweep reports stalled PRs (see
       # .github/workflows/pr-backlog-sweep.yml). Its self-test drives the ABORT
       # paths -- failed query, empty listing the REST probe contradicts,
@@ -456,6 +465,18 @@ jobs:
 
       - name: Check required-check workflows (no PR path filter, no needs on a required job)
         run: python3 .github/scripts/check_required_check_path_filters.py .github/workflows
+
+      # Self-test the release dry-run linter, then run it. Not diff-scoped, like
+      # the two above. Guards #5936: release.yml's `dry_run=true` pushed the
+      # release branch, opened the bump PR and auto-merged it into main, because
+      # each mutating step carried its own `!inputs.dry_run` guard and one job
+      # had none. The linter requires every mutating step to be gated on the one
+      # resolved `needs.validate.outputs.live` and to refuse in its own script.
+      - name: Release dry-run linter self-test
+        run: python3 .github/scripts/check_release_dry_run.py --self-test
+
+      - name: Check release dry_run cannot push, merge, tag or publish
+        run: python3 .github/scripts/check_release_dry_run.py .github/workflows
 
       - name: Check for banned patterns in new code
         env:

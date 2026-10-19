@@ -22,6 +22,10 @@ go wrong.
 
 ## Quickstart
 
+> **Before any trigger, run the pre-cut preconditions in the `freenet:release`
+> skill** (no concurrent cut, the auto-update canaries, and the real-NAT soak of
+> the exact SHA you will ship). The commands below are the trigger only.
+
 For a routine patch release, just run the workflow with no input — it
 auto-bumps the patch from the latest crates.io version:
 
@@ -38,6 +42,17 @@ gh workflow run release.yml \
 ```
 
 That's it. Watch progress at <https://github.com/freenet/freenet-core/actions/workflows/release.yml>.
+
+To rehearse a cut without making one, add `--field dry_run=true`. A dry run
+resolves the version, commits the bump on the runner, runs the checkout
+verifier and `cargo publish -p freenet --dry-run` against that commit, and
+prints the branch, PR title and body, and changelog a live run would produce.
+It pushes no branch, opens and merges no PR, and creates no tag or release, so
+`main` does not move. Every mutating step is gated on the single
+`needs.validate.outputs.live` value and refuses in its own script when that is
+not `true`; Rule Lint's `.github/scripts/check_release_dry_run.py` fails a PR
+that adds a mutating step without both (#5936). Before #5936 a "dry run" did
+push the branch and auto-merge the bump PR.
 
 The auto-bump reads `https://crates.io/api/v1/crates/freenet` to find the
 highest released version and increments the patch. So after `0.2.59` ships,
@@ -436,8 +451,11 @@ When a NEW wire-gated feature first ships (not this one), set its floor to
 
 ```
 gh workflow run release.yml
-    └─→ release.yml: validate
+    └─→ release.yml: validate   (resolves dry_run → outputs.live)
     └─→ release.yml: update_versions
+            └─→ (dry run: commits the bump locally, prints what it would
+                 push, then dry_run_rehearsal packages that commit; nothing
+                 below this point runs)
             └─→ creates "build: release X.Y.Z" PR
             └─→ ci.yml runs on PR (using RELEASE_PAT scope)
             └─→ PR auto-merges to main

@@ -14,7 +14,7 @@ on:
         type: boolean
         default: false
       dry_run:
-        description: 'Dry run - show what would be done without publishing'
+        description: 'Dry run - compute and package the release, print what would be created, push/merge/tag/publish nothing'
         required: false
         type: boolean
         default: false
@@ -31,10 +31,26 @@ jobs:
     outputs:
       version: ${{ steps.validate.outputs.version }}
       fdev_version: ${{ steps.validate.outputs.fdev_version }}
+      # 'true' ONLY for a live release. Every step that pushes, opens or merges
+      # a PR, tags or creates a release is gated on
+      # `needs.validate.outputs.live == 'true'`, so an empty or missing value
+      # skips it (fail closed). See scripts/resolve_release_mode.sh (#5936).
+      live: ${{ steps.mode.outputs.live }}
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      # The ONLY reader of `inputs.dry_run` in this workflow. Rule Lint's
+      # .github/scripts/check_release_dry_run.py fails a PR that reads it
+      # anywhere else, or that adds a mutating step without the `live` guard.
+      - name: Resolve run mode (live or dry run)
+        id: mode
+        env:
+          DRY_RUN_INPUT: ${{ inputs.dry_run }}
+        run: bash scripts/resolve_release_mode.sh
 
       - name: Warn if RELEASE_PAT is not configured
         env:
@@ -109,7 +125,7 @@ jobs:
       # Pinned by scripts/release_canary_wiring_test.sh (assertion 2b-quater),
       # which fails if a validity probe is re-added or the refusal is removed.
       - name: Verify the crates.io token before anything is created
-        if: ${{ !inputs.dry_run }}
+        if: steps.mode.outputs.live == 'true'
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: |
@@ -165,6 +181,9 @@ jobs:
           echo "  freenet: $VERSION"
           echo "  fdev: $FDEV_VERSION"
 
+  # Runs in BOTH modes: the bump is computed and committed locally either way.
+  # Only a live run pushes it, opens the PR and enables auto-merge (#5936: a
+  # dry run used to do all three, landing the version bump on main).
   update_versions:
     name: Update versions and create PR
     runs-on: ubuntu-latest
@@ -172,12 +191,20 @@ jobs:
     needs: validate
     outputs:
       pr_number: ${{ steps.create_pr.outputs.pr_number }}
+      # Set only in a dry run: the unpushed bump commit, shipped to
+      # `dry_run_rehearsal` as a git bundle artifact.
+      dry_run_bump_sha: ${{ steps.dry_run_report.outputs.bump_sha }}
+    env:
+      RELEASE_LIVE: ${{ needs.validate.outputs.live }}
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v7
         with:
           token: ${{ secrets.RELEASE_PAT || secrets.GITHUB_TOKEN }}
+          # In a dry run no credential is written to .git/config, so even a
+          # `git push` that slipped past every guard below cannot authenticate.
+          persist-credentials: ${{ needs.validate.outputs.live == 'true' }}
 
       - name: Configure git
         run: |
@@ -229,7 +256,8 @@ jobs:
       - name: Update Cargo.lock
         run: cargo update --workspace
 
-      - name: Create release branch
+      - name: Commit the version bump locally
+        id: bump
         run: |
           BRANCH="release/v${{ needs.validate.outputs.version }}"
           git checkout -b "$BRANCH"
@@ -240,47 +268,192 @@ jobs:
           - fdev: → ${{ needs.validate.outputs.fdev_version }}
 
           🤖 Automated release commit"
-          git push origin "$BRANCH"
-          echo "RELEASE_BRANCH=$BRANCH" >> $GITHUB_ENV
+          echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
 
-      - name: Create Pull Request
-        id: create_pr
-        env:
-          GH_TOKEN: ${{ secrets.RELEASE_PAT || secrets.GITHUB_TOKEN }}
-        # NOTE: The PR title MUST start with "build: release " — squash-merge
-        # propagates the title to the merge_group head_commit.message, where
-        # ci.yml's `skip_check` keys off it to decide whether the merge_group
-        # entry is the pre-publish gate. Renaming this prefix without
-        # updating ci.yml will silently disable the full-suite release gate.
+      # Composed once and used by both modes, so a dry run prints exactly the
+      # title and body a live run would open the PR with.
+      #
+      # NOTE: The PR title MUST start with "build: release " — squash-merge
+      # propagates the title to the merge_group head_commit.message, where
+      # ci.yml's `skip_check` keys off it to decide whether the merge_group
+      # entry is the pre-publish gate. Renaming this prefix without
+      # updating ci.yml will silently disable the full-suite release gate.
+      - name: Compose the release PR
+        id: pr_text
         run: |
-          PR_URL=$(gh pr create \
-            --title "build: release ${{ needs.validate.outputs.version }}" \
-            --body "**Automated release PR**
+          BODY_FILE="$RUNNER_TEMP/release_pr_body.md"
+          cat > "$BODY_FILE" <<'BODY'
+          **Automated release PR**
 
           - freenet: → **${{ needs.validate.outputs.version }}**
           - fdev: → **${{ needs.validate.outputs.fdev_version }}**
 
           This PR will auto-merge once GitHub CI passes.
-          Generated by: \`.github/workflows/release.yml\`" \
+          Generated by: `.github/workflows/release.yml`
+          BODY
+          echo "title=build: release ${{ needs.validate.outputs.version }}" >> "$GITHUB_OUTPUT"
+          echo "body_file=$BODY_FILE" >> "$GITHUB_OUTPUT"
+
+      - name: Push the release branch
+        if: needs.validate.outputs.live == 'true'
+        env:
+          RELEASE_BRANCH: ${{ steps.bump.outputs.branch }}
+        run: |
+          [ "${RELEASE_LIVE:-}" = "true" ] || { echo "::error title=Refusing in a dry run::Not pushing the release branch: this run is not live (#5936)."; exit 1; }
+          git push origin "$RELEASE_BRANCH"
+
+      - name: Create Pull Request
+        id: create_pr
+        if: needs.validate.outputs.live == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_PAT || secrets.GITHUB_TOKEN }}
+          RELEASE_BRANCH: ${{ steps.bump.outputs.branch }}
+          PR_TITLE: ${{ steps.pr_text.outputs.title }}
+          PR_BODY_FILE: ${{ steps.pr_text.outputs.body_file }}
+        run: |
+          [ "${RELEASE_LIVE:-}" = "true" ] || { echo "::error title=Refusing in a dry run::Not opening the release PR: this run is not live (#5936)."; exit 1; }
+          PR_URL=$(gh pr create \
+            --title "$PR_TITLE" \
+            --body-file "$PR_BODY_FILE" \
             --base main \
-            --head "release/v${{ needs.validate.outputs.version }}")
+            --head "$RELEASE_BRANCH")
 
           PR_NUMBER=$(echo "$PR_URL" | grep -o '[0-9]\+$')
-          echo "pr_number=$PR_NUMBER" >> $GITHUB_OUTPUT
+          echo "pr_number=$PR_NUMBER" >> "$GITHUB_OUTPUT"
           echo "✅ Created PR #$PR_NUMBER"
 
       - name: Enable auto-merge
+        if: needs.validate.outputs.live == 'true'
         env:
           GH_TOKEN: ${{ secrets.RELEASE_PAT || secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ steps.create_pr.outputs.pr_number }}
         run: |
+          [ "${RELEASE_LIVE:-}" = "true" ] || { echo "::error title=Refusing in a dry run::Not enabling auto-merge: this run is not live (#5936)."; exit 1; }
           # The merge queue owns the merge strategy, so do NOT pass --squash
           # here: it makes `gh pr merge` exit non-zero and, under `bash -e`,
           # fails this step and skips the whole publish cascade (this is what
           # broke the v0.2.93 release on 2026-07-07; the queue's strict-strategy
           # enforcement was enabled between v0.2.92 and v0.2.93). Just enable
           # auto-merge; the queue applies its configured strategy.
-          gh pr merge ${{ steps.create_pr.outputs.pr_number }} --auto
+          gh pr merge "$PR_NUMBER" --auto
           echo "✅ Auto-merge enabled"
+
+      # The dry-run counterpart of the three steps above: say what they would
+      # have done, then hand the unpushed commit to `dry_run_rehearsal`.
+      - name: "Dry run: report what a live run would push"
+        id: dry_run_report
+        if: needs.validate.outputs.live != 'true'
+        env:
+          RELEASE_BRANCH: ${{ steps.bump.outputs.branch }}
+          PR_TITLE: ${{ steps.pr_text.outputs.title }}
+          PR_BODY_FILE: ${{ steps.pr_text.outputs.body_file }}
+          LAUNCH_SHA: ${{ github.sha }}
+        run: |
+          BUMP_SHA=$(git rev-parse HEAD)
+          {
+            echo "## 🏃 Release dry run: nothing was pushed"
+            echo
+            echo "A live run would now:"
+            echo "1. push branch \`$RELEASE_BRANCH\` at \`$BUMP_SHA\`"
+            echo "2. open a PR into \`main\` titled \`$PR_TITLE\`"
+            echo "3. enable auto-merge on it, landing the bump on \`main\` via the merge queue"
+            echo "4. tag the merge commit, create a DRAFT release, and let cross-compile.yml build, run Gate A, publish to crates.io and un-draft"
+            echo
+            echo "PR body:"
+            echo
+            sed 's/^/> /' "$PR_BODY_FILE"
+            echo
+            echo "Version bump (\`$LAUNCH_SHA\` → \`$BUMP_SHA\`):"
+            echo
+            echo '```diff'
+            git diff HEAD~1 HEAD -- crates/core/Cargo.toml crates/fdev/Cargo.toml
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+          # The commit exists only on this runner. A bundle carries it, with its
+          # SHA intact, to the rehearsal job, which packages exactly this tree.
+          git bundle create "$RUNNER_TEMP/release-bump.bundle" "$RELEASE_BRANCH" "^$LAUNCH_SHA"
+          echo "bump_sha=$BUMP_SHA" >> "$GITHUB_OUTPUT"
+
+      - name: "Dry run: hand the bump commit to the rehearsal job"
+        if: needs.validate.outputs.live != 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-dry-run-bump
+          path: ${{ runner.temp }}/release-bump.bundle
+          retention-days: 1
+          if-no-files-found: error
+
+  # Dry run only. Everything a live run checks before its first irreversible
+  # step, run against the unpushed bump commit, with a read-only token: the
+  # checkout verifier, the crates.io packaging dry run, and the changelog the
+  # release notes would be generated from. In a live run `verify_publishable`
+  # and `create_release` do this against the merged commit instead.
+  dry_run_rehearsal:
+    name: "Dry run: rehearse on the unpushed bump"
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: [validate, update_versions]
+    if: needs.validate.outputs.live != 'true'
+    permissions:
+      contents: read
+    env:
+      RELEASE_SHA: ${{ needs.update_versions.outputs.dry_run_bump_sha }}
+      RELEASE_SHA_RESOLVED: ${{ needs.update_versions.outputs.dry_run_bump_sha }}
+      EXPECTED_VERSION: ${{ needs.validate.outputs.version }}
+
+    steps:
+      - name: Checkout the launch commit
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Fetch the bump bundle
+        uses: actions/download-artifact@v8
+        with:
+          name: release-dry-run-bump
+          path: ${{ runner.temp }}/bump
+
+      - name: Check out the unpushed version-bump commit
+        run: |
+          git fetch --no-tags "$RUNNER_TEMP/bump/release-bump.bundle" "refs/heads/release/v$EXPECTED_VERSION"
+          git checkout --detach "$RELEASE_SHA"
+
+      - name: Verify the checkout is the bump commit
+        run: bash scripts/verify_release_checkout.sh
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.93.0
+
+      - name: Verify freenet packages cleanly (dry run)
+        run: |
+          echo "📦 [DRY RUN] Verifying freenet $EXPECTED_VERSION can be published to crates.io..."
+          cargo publish -p freenet --dry-run
+          echo "✅ freenet dry-run successful"
+
+      # Read-only. GitHub's generate-notes endpoint needs write access, so the
+      # preview lists the commits it would summarise instead.
+      - name: Changelog since the previous release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }} # coalesce-exempt: read-only, contents:read job
+          LAUNCH_SHA: ${{ github.sha }}
+        run: |
+          PREV=$(gh release list --limit 50 --json tagName --jq '.[].tagName' | head -1 || true)
+          {
+            echo "## Changelog preview for v$EXPECTED_VERSION"
+            echo
+            if [ -z "$PREV" ]; then
+              echo "No previous release found."
+            else
+              echo "Commits on \`main\` since $PREV (the bump commit itself excluded):"
+              echo
+              gh api "repos/$GITHUB_REPOSITORY/compare/$PREV...$LAUNCH_SHA" \
+                --jq '.commits[] | "- \(.sha[0:9]) \(.commit.message | split("\n")[0])"'
+            fi
+            echo
+            echo "A live run would tag \`v$EXPECTED_VERSION\` and create a DRAFT release with GitHub-generated notes for this range."
+          } | tee -a "$GITHUB_STEP_SUMMARY"
 
   wait_for_pr:
     name: Wait for PR to merge
@@ -291,6 +464,10 @@ jobs:
     # 60 min when the release merge_group started running the full suite (#3973).
     timeout-minutes: 75
     needs: [validate, update_versions]
+    # Live only: a dry run opens no PR, so there is nothing to wait for. The
+    # dry-run counterpart of this job and the two after it is
+    # `dry_run_rehearsal`.
+    if: needs.validate.outputs.live == 'true'
     permissions:
       actions: read
       contents: read
@@ -352,14 +529,18 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     needs: [validate, wait_for_pr]
-    if: always() && (needs.wait_for_pr.result == 'success' || inputs.dry_run)
+    # Live only. This used to also run on `|| inputs.dry_run`, which is how a
+    # dry run came to depend on the bump PR having really merged (#5936).
+    if: always() && needs.wait_for_pr.result == 'success' && needs.validate.outputs.live == 'true'
     env:
       # NEVER `ref: main` here — see #5233. The `|| github.sha` fallback is not
       # a convenience: an empty `ref:` makes actions/checkout default to the
-      # branch, which would reinstate the bug. It is reachable only on the
-      # dry-run-with-failed-wait path, and it is NOT benign there — the launch
-      # commit predates the version bump, so the verifier below aborts on
-      # purpose rather than dry-running the wrong tree.
+      # branch, which would reinstate the bug. This job now runs only after
+      # `wait_for_pr` succeeded, and `resolve_release_sha.sh` fails closed
+      # rather than emit an empty SHA, so the fallback should be unreachable.
+      # If it ever engages it is NOT benign: the launch commit predates the
+      # version bump, so the verifier below aborts on purpose rather than
+      # dry-running the wrong tree.
       RELEASE_SHA: ${{ needs.wait_for_pr.outputs.release_sha || github.sha }}
       # Resolved independently of RELEASE_SHA, so the verifier has an oracle
       # that does not just restate the value that drove the checkout.
@@ -399,8 +580,10 @@ jobs:
     # `wait_for_pr` is in `needs` only to carry `release_sha` through; the
     # ordering it implies is already enforced via `verify_publishable`.
     needs: [validate, wait_for_pr, verify_publishable]
-    if: always() && (needs.verify_publishable.result == 'success' || inputs.dry_run)
+    # Live only, at job level AND on each mutating step below (#5936).
+    if: always() && needs.verify_publishable.result == 'success' && needs.validate.outputs.live == 'true'
     env:
+      RELEASE_LIVE: ${{ needs.validate.outputs.live }}
       # The tag MUST land on the same commit that was published to crates.io.
       # `ref: main` here meant the tag could point at a tree nobody validated
       # and that no published artifact was built from (#5233).
@@ -449,6 +632,7 @@ jobs:
             # decides which commits the notes describe. Pin it to the commit
             # actually being released, not to `main` — otherwise the notes can
             # describe commits that are not in the release (#5233).
+            # dry-run-safe: generate-notes is a POST that renders text and creates nothing.
             NOTES=$(gh api repos/:owner/:repo/releases/generate-notes \
               -f tag_name="v$VERSION" \
               -f target_commitish="$RELEASE_SHA" \
@@ -461,8 +645,9 @@ jobs:
           echo "notes_file=/tmp/release_notes.md" >> $GITHUB_OUTPUT
 
       - name: Create and push tag
-        if: ${{ !inputs.dry_run }}
+        if: needs.validate.outputs.live == 'true'
         run: |
+          [ "${RELEASE_LIVE:-}" = "true" ] || { echo "::error title=Refusing in a dry run::Not pushing the release tag: this run is not live (#5936)."; exit 1; }
           # `git tag -a` needs user.name/email. The `update_versions` job
           # set these in its runner, but this job runs on a fresh runner
           # where git config is empty — without these two lines the tag
@@ -475,7 +660,7 @@ jobs:
           echo "✅ Created and pushed tag v$VERSION"
 
       - name: Create GitHub release
-        if: ${{ !inputs.dry_run }}
+        if: needs.validate.outputs.live == 'true'
         env:
           # The release is created with `--draft`, so no `release.published`
           # event fires here. Coalescing for defense-in-depth: if `--draft`
@@ -483,6 +668,7 @@ jobs:
           # cascade silently breaks.
           GH_TOKEN: ${{ secrets.RELEASE_PAT || secrets.GITHUB_TOKEN }}
         run: |
+          [ "${RELEASE_LIVE:-}" = "true" ] || { echo "::error title=Refusing in a dry run::Not creating the GitHub release: this run is not live (#5936)."; exit 1; }
           VERSION="${{ needs.validate.outputs.version }}"
           gh release create "v$VERSION" \
             --title "v$VERSION" \
@@ -493,38 +679,47 @@ jobs:
           echo "   crates.io -> un-drafts. Nothing irreversible has happened yet; if Gate A"
           echo "   blocks, delete this tag and re-cut rather than burning the version."
 
-      - name: Dry run summary
-        if: ${{ inputs.dry_run }}
-        run: |
-          echo "🏃 DRY RUN - Would have created:"
-          echo "  - Tag: v${{ needs.validate.outputs.version }}"
-          echo "  - Release: v${{ needs.validate.outputs.version }}"
-          echo
-          echo "Release notes preview:"
-          cat "${{ steps.release_notes.outputs.notes_file }}"
-
   summary:
     name: Release summary
     runs-on: ubuntu-latest
     timeout-minutes: 5
-    needs: [validate, create_release]
+    needs: [validate, update_versions, dry_run_rehearsal, create_release]
     if: always()
 
     steps:
-      - name: Release completed
+      # Reports what actually happened. It used to print "is cut and tagged"
+      # unconditionally, including for dry runs and failed runs.
+      - name: Release summary
+        env:
+          LIVE: ${{ needs.validate.outputs.live }}
+          VERSION: ${{ needs.validate.outputs.version }}
+          FDEV_VERSION: ${{ needs.validate.outputs.fdev_version }}
+          REHEARSAL: ${{ needs.dry_run_rehearsal.result }}
+          CREATE_RELEASE: ${{ needs.create_release.result }}
+          REPO: ${{ github.repository }}
         run: |
-          echo "🎉 Release ${{ needs.validate.outputs.version }} is cut and tagged."
+          if [ "$LIVE" != "true" ]; then
+            echo "🏃 DRY RUN for ${VERSION:-<unresolved version>}: nothing was pushed, merged, tagged or released."
+            echo "   Rehearsal on the unpushed bump commit: ${REHEARSAL:-not run}"
+            echo "   What a live run would have created is in the update_versions and dry_run_rehearsal step summaries."
+            exit 0
+          fi
+          if [ "$CREATE_RELEASE" != "success" ]; then
+            echo "❌ Release $VERSION did NOT complete: create_release is '$CREATE_RELEASE'. Check the failed job above;"
+            echo "   if the bump PR already merged, see scripts/RELEASE_RECOVERY.md before re-running."
+            exit 0
+          fi
+          echo "🎉 Release $VERSION is cut and tagged."
           echo
           echo "Done here:"
-          echo "  - version bump merged, tag v${{ needs.validate.outputs.version }} pushed"
-          echo "  - DRAFT GitHub release created: https://github.com/${{ github.repository }}/releases/tag/v${{ needs.validate.outputs.version }}"
+          echo "  - version bump merged, tag v$VERSION pushed"
+          echo "  - DRAFT GitHub release created: https://github.com/$REPO/releases/tag/v$VERSION"
           echo
           echo "Still to happen, in cross-compile.yml (triggered by the tag):"
           echo "  - cross-compile + attach binaries"
           echo "  - Gate A: auto-update pre-flight on the binary about to ship (BLOCKING)"
-          echo "  - publish freenet ${{ needs.validate.outputs.version }} and fdev ${{ needs.validate.outputs.fdev_version }} to crates.io"
+          echo "  - publish freenet $VERSION and fdev $FDEV_VERSION to crates.io"
           echo "  - un-draft the release, which fires the downstream cascade"
           echo
           echo "The crates.io publish is deliberately downstream of Gate A: until it runs,"
           echo "nothing about this release is irreversible."
-          echo "  - Binaries will be attached when workflow completes"

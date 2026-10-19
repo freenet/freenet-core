@@ -208,8 +208,8 @@ v0.2.57 release, and they have DIFFERENT remedies:
 1. **Bump PR gets 0 check-runs.** No `pull_request` event fires, so `ci.yml`
    never runs and its required checks never turn green. `ci.yml` has no
    `workflow_dispatch`, so it cannot be started by hand. The old workaround,
-   closing and reopening the PR, breaks `wait_for_pr` polling
-   (`release.yml:285`), whose `release_sha` output `verify_publishable` and
+   closing and reopening the PR, breaks the polling in `release.yml`'s
+   `wait_for_pr` job, whose `release_sha` output `verify_publishable` and
    `create_release` depend on.
 2. **`release.published` does not fire downstream workflows.** Those DO expose
    `workflow_dispatch`, so they can be triggered per step by hand.
@@ -268,8 +268,11 @@ expired and the same rotation procedure applies.
 
 End-to-end procedure for any maintainer is in
 [`docs/RELEASING.md`](docs/RELEASING.md). One-line summary:
-`gh workflow run release.yml --field version=X.Y.Z`. The `RELEASE_PAT`
-section above is the prerequisite for the cascade to fire automatically.
+`gh workflow run release.yml --field version=X.Y.Z`, but only after the
+mandatory pre-cut preconditions in the `freenet:release` skill (soak,
+auto-update canaries) have passed. The `RELEASE_PAT` section above is the
+prerequisite for the cascade to fire automatically. `--field dry_run=true`
+rehearses the cut without pushing, merging, tagging or publishing anything.
 
 ## Release artifact signing (`FREENET_RELEASE_SIGNING_KEY`)
 
