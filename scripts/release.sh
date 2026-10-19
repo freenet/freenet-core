@@ -704,6 +704,38 @@ check_prerequisites() {
     fi
 }
 
+# Bring both lockfiles in line with the current manifests. Idempotent, so
+# update_versions calls it on every run, including one where the version
+# bump is already on main.
+sync_lockfiles() {
+    local err
+
+    echo -n "  Updating Cargo.lock... "
+    if err=$(cargo update --workspace --quiet 2>&1); then
+        echo "✓"
+    else
+        echo "✗"
+        echo "$err"
+        echo "Failed to update the root Cargo.lock. This may cause CI failures."
+        exit 1
+    fi
+
+    # apps/freenet-ping is a separate nested workspace with its own Cargo.lock
+    # that path-depends on crates/core, so the root update above leaves it
+    # stale. `cargo metadata` re-resolves it without upgrading anything that
+    # still satisfies its requirements: the freenet path-dep version changes,
+    # plus whatever crates/core's dependency changes force.
+    echo -n "  Updating apps/freenet-ping/Cargo.lock... "
+    if err=$(cargo metadata --format-version 1 --manifest-path "$PROJECT_ROOT/apps/freenet-ping/Cargo.toml" 2>&1 >/dev/null); then
+        echo "✓"
+    else
+        echo "✗"
+        echo "$err"
+        echo "Failed to update apps/freenet-ping/Cargo.lock."
+        exit 1
+    fi
+}
+
 update_versions() {
     echo "Updating versions:"
 
@@ -716,6 +748,12 @@ update_versions() {
     # Check if version is already updated in Cargo.toml
     if grep -q "^version = \"$VERSION\"" "$PROJECT_ROOT/crates/core/Cargo.toml" 2>/dev/null; then
         echo "  ✓ Versions already updated (skipping)"
+        # The version bump is already on main (a resume after the bump
+        # commit, or a main whose nested lock went stale). Re-sync the locks
+        # (idempotent); create_release_pr commits any repair.
+        if [[ "$DRY_RUN" != "true" ]]; then
+            sync_lockfiles
+        fi
         return 0
     fi
 
@@ -759,15 +797,7 @@ update_versions() {
     sed_inplace "s|releases/download/v[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*/fdev-|releases/download/v${VERSION}/fdev-|g" "$PROJECT_ROOT/crates/fdev/Cargo.toml"
     echo "✓"
 
-    # Update Cargo.lock to match new versions
-    echo -n "  Updating Cargo.lock... "
-    if cargo update --workspace --quiet 2>/dev/null; then
-        echo "✓"
-    else
-        echo "✗"
-        echo "Failed to update Cargo.lock. This may cause CI failures."
-        exit 1
-    fi
+    sync_lockfiles
 
     # Quick sanity check that the version-bumped workspace still type-checks.
     # This is intentionally `cargo check`, not `cargo build --release` or
@@ -887,7 +917,7 @@ create_release_pr() {
             echo "  ℹ️  No changes to commit (version bump already committed)"
         else
             # Stage only the files modified by the version bump — never git add -A
-            git add crates/core/Cargo.toml crates/fdev/Cargo.toml Cargo.lock
+            git add crates/core/Cargo.toml crates/fdev/Cargo.toml Cargo.lock apps/freenet-ping/Cargo.lock
             run_cmd "Committing version bump" git commit -m "build: bump versions to $VERSION
 
 - freenet: → $VERSION

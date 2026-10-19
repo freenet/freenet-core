@@ -227,7 +227,15 @@ jobs:
           toolchain: 1.93.0
 
       - name: Update Cargo.lock
-        run: cargo update --workspace
+        # apps/freenet-ping is a separate nested workspace with its own
+        # Cargo.lock that path-depends on crates/core, so the version bump
+        # leaves it stale too. `cargo metadata` re-resolves it without
+        # upgrading anything that still satisfies its requirements: the freenet
+        # path-dep version changes, plus whatever crates/core's dependency
+        # changes since the last sync force.
+        run: |
+          cargo update --workspace
+          cargo metadata --format-version 1 --manifest-path apps/freenet-ping/Cargo.toml > /dev/null
 
       - name: Create release branch
         run: |
