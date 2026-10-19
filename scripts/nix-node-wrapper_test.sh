@@ -919,12 +919,30 @@ assert_eq "$([ "$ELAPSED" -lt 30 ] && echo fast || echo "stuck(${ELAPSED}s)")" "
   "a hung 'freenet update' is bounded by a timeout instead of blocking the supervisor forever"
 assert_eq "$(starts_of)" "2" "the node is restarted after the hung updater is cut short"
 
+# Anything the wrapper leaves behind after it is stopped is found by process
+# group: `set -m` gives each background job its own, with the job's pid as the
+# group id. (A leaked restart-pause `sleep` outlives the wrapper by minutes.)
+leftovers_in_group() {
+  # leftovers_in_group <pgid>: echoes (and kills, by pid) whatever still runs in
+  # the group, so a leak can never outlive the test that found it.
+  local pgid="$1" pids
+  # Fail closed: without pgrep an empty answer would mean "could not look".
+  command -v pgrep >/dev/null 2>&1 || { echo "pgrep-missing"; return 0; }
+  pids="$(pgrep -g "$pgid" || true)"
+  if [ -n "$pids" ]; then
+    # shellcheck disable=SC2086  # a pid list, split on purpose
+    kill -KILL $pids 2>/dev/null || true
+    echo "$pids" | tr '\n' ' '
+  fi
+}
+
 WORK6="$(mktemp -d)"
 STATE6="$WORK6/state"
 SEED6="$WORK6/seed-freenet"
 write_fake_freenet "$SEED6"
 printf '101\n101\n101\n101\n0\n' >"$WORK6/plan"
 : >"$WORK6/log"
+set -m
 env -u XDG_STATE_HOME \
   HOME="$WORK6/home" \
   FAKE_LOG="$WORK6/log" \
@@ -935,6 +953,7 @@ env -u XDG_STATE_HOME \
   FREENET_NODE_RESTART_SECS=120 \
   bash "$WRAPPER" >"$WORK6/stdout" 2>&1 &
 WPID=$!
+set +m
 # Wait for the wrapper to enter its (120s) restart pause.
 PAUSED=no
 for _ in $(seq 1 100); do
@@ -957,6 +976,26 @@ done
 wait "$WPID" 2>/dev/null || true
 assert_eq "$STOPPED" "yes" \
   "SIGTERM to the WRAPPER stops it promptly mid-pause -- bash defers a trap across a foreground sleep, so the pause must be backgrounded and waited on"
+assert_eq "$(leftovers_in_group "$WPID")" "" \
+  "...and leaves nothing running behind it (no orphaned restart-pause sleep)"
+
+# The race that leaks it: a TERM landing between the wrapper forking the pause
+# (`"$@" &`) and recording its pid (`child=$!`) runs `terminate` while `child` is
+# still 0. The window is microseconds wide, so no signal-timing test can hit it
+# on demand (a 400-run stress loop leaked 5 times under load and 0 after the
+# fix, which is evidence, not a test). Put `terminate` in exactly that state
+# instead: a live background job the wrapper has not recorded in `child`.
+TERMINATE_FN="$(sed -n '/^terminate() {/,/^}/p' "$WRAPPER")"
+assert_eq "$([ -n "$TERMINATE_FN" ] && echo extracted || echo missing)" "extracted" \
+  "the test can extract terminate() from the wrapper (a rename must not turn the next case vacuous)"
+STRAY_PID="$(bash -c "$TERMINATE_FN"$'\nchild=0\nsleep 60 >/dev/null 2>&1 &\necho $!\nterminate')"
+STRAY_STATE=gone
+if kill -0 "$STRAY_PID" 2>/dev/null; then
+  STRAY_STATE=ORPHANED
+  kill -KILL "$STRAY_PID" 2>/dev/null || true
+fi
+assert_eq "$STRAY_STATE" "gone" \
+  "terminate() stops a background job even when its pid never reached \$child (a lost pid race orphans the restart-pause sleep for minutes)"
 
 echo
 echo "passed: $PASS, failed: $FAIL"

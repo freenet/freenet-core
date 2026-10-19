@@ -487,9 +487,25 @@ child=0
 
 terminate() {
     trap - TERM INT HUP
+    # Ask the job table, not `$child`. A signal that lands between `"$@" &` and
+    # `child=$!` runs this handler while `child` is still 0 (bash runs a trap
+    # as soon as the `&` command returns, before the next assignment), so
+    # relying on `$child` alone orphans a freshly forked restart-pause `sleep`
+    # -- or the node itself -- which then outlives the wrapper. `jobs -p` also
+    # lists `child` when it IS recorded, so it is only added when it is not.
+    local pids
+    pids="$(jobs -p)"
     if [ "$child" -ne 0 ]; then
-        kill -TERM "$child" 2>/dev/null || true
-        wait "$child" 2>/dev/null || true
+        case " ${pids//$'\n'/ } " in
+            *" $child "*) ;;
+            *) pids="$pids $child" ;;
+        esac
+    fi
+    if [ -n "${pids// /}" ]; then
+        # shellcheck disable=SC2086  # word splitting of a pid list is the point
+        kill -TERM $pids 2>/dev/null || true
+        # shellcheck disable=SC2086
+        wait $pids 2>/dev/null || true
     fi
     exit 0
 }
