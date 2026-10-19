@@ -35,49 +35,48 @@ use crate::tracing::{TransferDirection, TransferEvent};
 /// metrics for periodic telemetry snapshots.
 pub static TRANSPORT_METRICS: LazyLock<TransportMetrics> = LazyLock::new(TransportMetrics::new);
 
-/// Why an inbound stream was refused or evicted. Each has its own counter
-/// because each has a different remedy.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum InboundStreamOutcome {
+/// Declares [`InboundStreamOutcome`] with its `COUNT`, `ALL` and `label`
+/// generated from the one variant list, so a variant cannot be added without
+/// growing the per-reason counter arrays (indexed by `outcome as usize`).
+macro_rules! inbound_stream_outcomes {
+    ($($(#[$meta:meta])* $variant:ident => $label:literal,)+) => {
+        /// Why an inbound stream was refused or evicted. Each has its own
+        /// counter because each has a different remedy.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        pub(crate) enum InboundStreamOutcome {
+            $($(#[$meta])* $variant,)+
+        }
+
+        impl InboundStreamOutcome {
+            /// Every outcome, in declaration order, so `ALL[i] as usize == i`.
+            pub(crate) const ALL: [Self; Self::COUNT] = [$(Self::$variant),+];
+            pub(crate) const COUNT: usize = [$(Self::$variant),+].len();
+
+            /// Metric label.
+            pub(crate) fn label(self) -> &'static str {
+                match self {
+                    $(Self::$variant => $label,)+
+                }
+            }
+        }
+    };
+}
+
+inbound_stream_outcomes! {
     /// Refused: declared length 0 or above `MAX_STREAM_TOTAL_BYTES`.
-    RefusedInvalidLength,
+    RefusedInvalidLength => "refused_invalid_length",
     /// Refused: the connection's byte allowance was full.
-    RefusedConnectionBytes,
+    RefusedConnectionBytes => "refused_connection_bytes",
     /// Refused: the connection's stream count was full.
-    RefusedConnectionStreams,
+    RefusedConnectionStreams => "refused_connection_streams",
     /// Connection closed: a refused stream could not be remembered, because
     /// the connection already had as many refused streams outstanding as are
     /// remembered.
-    ClosedTooManyRefusals,
+    ClosedTooManyRefusals => "closed_too_many_refusals",
     /// Evicted: no new data within the idle timeout.
-    EvictedIdle,
+    EvictedIdle => "evicted_idle",
     /// Evicted: past its age limit.
-    EvictedAge,
-}
-
-impl InboundStreamOutcome {
-    pub(crate) const COUNT: usize = 6;
-    /// Every outcome, in declaration order, so `ALL[i] as usize == i`.
-    pub(crate) const ALL: [Self; Self::COUNT] = [
-        Self::RefusedInvalidLength,
-        Self::RefusedConnectionBytes,
-        Self::RefusedConnectionStreams,
-        Self::ClosedTooManyRefusals,
-        Self::EvictedIdle,
-        Self::EvictedAge,
-    ];
-
-    /// Metric label.
-    pub(crate) fn label(self) -> &'static str {
-        match self {
-            Self::RefusedInvalidLength => "refused_invalid_length",
-            Self::RefusedConnectionBytes => "refused_connection_bytes",
-            Self::RefusedConnectionStreams => "refused_connection_streams",
-            Self::ClosedTooManyRefusals => "closed_too_many_refusals",
-            Self::EvictedIdle => "evicted_idle",
-            Self::EvictedAge => "evicted_age",
-        }
-    }
+    EvictedAge => "evicted_age",
 }
 
 /// Accumulates transport metrics for periodic reporting.
@@ -2490,6 +2489,21 @@ mod tests {
             .enumerate()
         {
             assert_eq!(total, i as u64 + 1, "{outcome:?} cumulative must not reset");
+        }
+    }
+
+    /// Each reason alone, on a fresh collector, counts as activity: an
+    /// outcome missing from `has_activity` would be dropped whenever it is
+    /// the only thing that happened in a period.
+    #[test]
+    fn each_inbound_stream_outcome_alone_is_activity() {
+        for outcome in InboundStreamOutcome::ALL {
+            let metrics = TransportMetrics::new();
+            metrics.record_inbound_stream_outcome(outcome);
+            let snap = metrics
+                .take_snapshot()
+                .unwrap_or_else(|| panic!("{outcome:?} alone must be activity"));
+            assert_eq!(snapshot_count(&snap, outcome), 1, "{outcome:?}");
         }
     }
 

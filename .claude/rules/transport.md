@@ -601,7 +601,9 @@ created from its declared length.
     the orphan registry.
   - Every refusal, eviction and refusal-related close is counted by reason
     in TRANSPORT_METRICS (cumulative_inbound_stream_outcomes, OTel
-    freenet.transport.inbound_stream_limits).
+    freenet.transport.inbound_stream_limits) and per period in the
+    transport_snapshot inbound_stream_<label> fields. A new reason is added
+    once, in the inbound_stream_outcomes! list; it then needs a snapshot field.
   - A complete operations stream is retired from streaming_handles and the
     registry at once, so only its consumers hold the charge.
   - LockFreeStreamBuffer::insert claims the slot BEFORE reserving bytes, so
