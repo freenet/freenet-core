@@ -162,8 +162,13 @@ pub(crate) trait PeerConnectionApi: Send {
 
     /// Receives raw bytes from the remote peer.
     ///
-    /// Returns the deserialized message bytes. The caller is responsible for
-    /// deserializing into the appropriate message type.
+    /// Returns one message's bytes, exactly as the remote passed them to
+    /// [`Self::send_bytes`]. The caller deserializes them.
+    ///
+    /// Must be cancel-safe: the node polls a fresh `recv()` in a `select!`
+    /// on every loop pass and drops it whenever another branch wins, so an
+    /// implementation must not dequeue a message before its first `.await`
+    /// that can be lost when the future is dropped.
     fn recv(
         &mut self,
     ) -> std::pin::Pin<Box<dyn Future<Output = Result<Vec<u8>, TransportError>> + Send + '_>>;
