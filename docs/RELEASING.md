@@ -443,15 +443,15 @@ branch, opens and merges no PR, and creates no tag or release, so `main` does
 not move.
 
 Every mutating step is gated on the single `needs.validate.outputs.live`
-value and refuses in its own script when that is not `true`. `RELEASE_PAT` never
-reaches a step that runs in a dry run. The only job that runs in a dry run
+value and refuses in its own script when that is not `true`. No step that
+runs in a dry run is passed `RELEASE_PAT`. The only job that runs in a dry run
 holding a write-capable token is the bump job (`update_versions`), and the
 only step given that token is its checkout, which uses it to fetch and
 persists nothing. `validate` is read-only, `summary` has no permissions, and
 the rehearsal job is read-only. A presence test such as
 `secrets.RELEASE_PAT != ''` passes no credential and is allowed. Rule Lint's
-`.github/scripts/check_release_dry_run.py` fails a PR that breaks any of that
-(#5936).
+`.github/scripts/check_release_dry_run.py` and the CI self-test
+`scripts/release_dry_run_test.sh` fail a PR that breaks any of that (#5936).
 
 Caveats:
 

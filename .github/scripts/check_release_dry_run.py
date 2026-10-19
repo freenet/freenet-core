@@ -179,6 +179,16 @@ BLOCK_SCALAR_RE = re.compile(r"^[|>][1-9]?[-+]?[1-9]?\s*(#.*)?$")
 # Only actions that write nothing outside the run. Cache actions (including
 # `Swatinem/rust-cache` and `actions/setup-*` with `cache:`) are deliberately
 # absent: a cache SAVE is a shared write that a later live run restores.
+# `permissions: {}` grants nothing and parses as {"*": "{}"}.
+READ_ONLY_PERMS = ("read", "none", "read-all", "{}")
+
+
+def _action(uses: str) -> str:
+    """`owner/repo` of a `uses:` value, compared EXACTLY: a prefix match would
+    trust `actions/checkout-anything@v1`."""
+    return uses.split("@", 1)[0].strip().strip("\"'").lower()
+
+
 READ_ONLY_ACTIONS = (
     "actions/checkout",
     "actions/upload-artifact",
@@ -708,7 +718,7 @@ def script_mutations(
 
 def step_mutations(step: Step, repo_root: Path) -> list[tuple[int, str]]:
     uses = step.keys.get("uses", "")
-    if uses and not uses.startswith(READ_ONLY_ACTIONS):
+    if uses and _action(uses) not in READ_ONLY_ACTIONS:
         return [(-1, f"uses: {uses} (not on the read-only action allowlist)")]
     if step.run is None:
         return []
@@ -889,7 +899,7 @@ def check_source(text: str, name: str, repo_root: Path) -> list[str]:
             any(r.startswith("git push") for _, r in step_mutations(st, repo_root)) for st in job.steps
         )
         for st in job.steps:
-            if pushes and st.keys.get("uses", "").startswith("actions/checkout") and st.with_.get("persist-credentials") == "false":
+            if pushes and _action(st.keys.get("uses", "")) == "actions/checkout" and st.with_.get("persist-credentials") == "false":
                 err(st.line, f"job `{job.name}` pushes when live, but its checkout never persists a credential, so the live push cannot authenticate. Use `${{{{ {GUARD} }}}}`.")
 
         job_guarded = is_guarded(job, None)
@@ -899,11 +909,11 @@ def check_source(text: str, name: str, repo_root: Path) -> list[str]:
         # Rule 5c: a dry-run-only job holds a read-only token.
         if DRY_ONLY in conjuncts(job.keys.get("if", "")):
             perms = job.permissions
-            if not perms or any(v not in ("read", "none", "read-all") for v in perms.values()):
+            if not perms or any(v not in READ_ONLY_PERMS for v in perms.values()):
                 err(job.line, f"job `{job.name}` runs only in a dry run, so it must declare read-only `permissions:` (got {perms or 'the workflow default'}).")
 
         read_only = bool(job.permissions) and all(
-            v in ("read", "none", "read-all") for v in job.permissions.values()
+            v in READ_ONLY_PERMS for v in job.permissions.values()
         )
         # An OIDC token is a publish credential wherever trusted publishing is
         # configured, and it is not covered by the token rules above.
@@ -935,7 +945,7 @@ def check_source(text: str, name: str, repo_root: Path) -> list[str]:
                 continue
             # Rule 5: a step a dry run executes holds no persisted credential and no PAT.
             uses = step.keys.get("uses", "")
-            if uses.startswith("actions/checkout"):
+            if _action(uses) == "actions/checkout":
                 persist = step.with_.get("persist-credentials", "")
                 if persist != "false" and _unwrap(persist) != _guard_for(job.name):
                     err(step.line, f"job `{job.name}` runs in a dry run, so its checkout must set `persist-credentials: false` (or `${{{{ {GUARD} }}}}`); otherwise a stray `git push` can authenticate.")
@@ -944,7 +954,7 @@ def check_source(text: str, name: str, repo_root: Path) -> list[str]:
             # live-gated checkout token.
             src = [l for l in step.text.split("\n") if not l.strip().startswith("#")]
             allowed = f"token: {DRY_SAFE_CHECKOUT_TOKEN}"
-            if uses.startswith("actions/checkout"):
+            if _action(uses) == "actions/checkout":
                 src = [l for l in src if l.strip() != allowed]
             if _hands_credential("\n".join(src), read_only):
                 err(step.line, f"{where} runs in a dry run and receives a credential. In a job whose token can write, a dry-run step gets no token at all; a read-only job may use only its workflow token; RELEASE_PAT never (a checkout may take exactly `{allowed}`). Gate it on `{_guard_for(job.name)}`.")
@@ -1379,6 +1389,15 @@ def self_test() -> int:
             _GOOD.replace("-f tag_name=v1\n", "-f tag_name=v1 | xargs gh pr merge\n").replace(
                 "    if: always() && needs.validate.outputs.live == 'true'\n", "    if: always()\n"),
             "piped into a shell")
+        run("an action whose name only starts with an allowlisted one is not trusted",
+            body("uses: actions/checkout-helper@v1"), "read-only action allowlist")
+        run("a look-alike checkout does not get the checkout exemption",
+            _GOOD.replace("      - uses: actions/checkout@v7\n        with:\n          token: ${{ (needs",
+                          "      - uses: actions/checkout-helper@v7\n        with:\n          token: ${{ (needs"),
+            "read-only action allowlist")
+        run("permissions: {} is read-only",
+            _GOOD.replace("    permissions:\n      contents: read\n", "    permissions: {}\n").replace(
+                "      - name: Read releases\n        env:\n          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}\n        run: gh release list\n", ""), None)
         run("Swatinem/rust-cache saves a shared cache", body("uses: Swatinem/rust-cache@v2"), "read-only action allowlist")
         # One positive case per mutating pattern, so deleting any one of them
         # fails this self-test.

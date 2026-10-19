@@ -43,6 +43,7 @@ LINTER="$REPO_ROOT/.github/scripts/check_release_dry_run.py"
 RESOLVER="$REPO_ROOT/scripts/resolve_release_mode.sh"
 RELEASE_YML="$REPO_ROOT/.github/workflows/release.yml"
 CI_YML="$REPO_ROOT/.github/workflows/ci.yml"
+command -v jq > /dev/null || { echo "FAIL - this test needs jq (preinstalled on ubuntu-latest)" >&2; exit 2; }
 TEST_TMP=$(mktemp -d)
 trap 'rm -rf "$TEST_TMP"' EXIT
 
@@ -257,20 +258,20 @@ done
 # checkout verifier runs before the tag push and before each packaging check;
 # the bundle is fetched before it is checked out. A reordering that changes
 # behaviour must change this list deliberately.
-seq() { grep "^$2 / " <<< "$1" | sed "s|^$2 / ||" | paste -sd'|' -; }
-check "live: validate step order" "$(seq "$LIVE_RUN" validate)" \
+step_seq() { grep "^$2 / " <<< "$1" | sed "s|^$2 / ||" | paste -sd'|' -; }
+check "live: validate step order" "$(step_seq "$LIVE_RUN" validate)" \
     "Checkout code|Resolve run mode (live or dry run)|Warn if RELEASE_PAT is not configured|Verify the crates.io token before anything is created|Resolve + validate version"
-check "live: update_versions step order" "$(seq "$LIVE_RUN" update_versions)" \
+check "live: update_versions step order" "$(step_seq "$LIVE_RUN" update_versions)" \
     "Checkout code|Configure git|Update freenet version|Update fdev version|Install Rust|Update Cargo.lock|Commit the version bump locally|Compose the release PR|Push the release branch|Create Pull Request|Enable auto-merge"
-check "live: wait_for_pr step order" "$(seq "$LIVE_RUN" wait_for_pr)" \
+check "live: wait_for_pr step order" "$(step_seq "$LIVE_RUN" wait_for_pr)" \
     "Checkout code|Wait for PR to be merged|Resolve the release commit"
-check "live: verify_publishable step order" "$(seq "$LIVE_RUN" verify_publishable)" \
+check "live: verify_publishable step order" "$(step_seq "$LIVE_RUN" verify_publishable)" \
     "Checkout the validated release commit|Verify the checkout is the validated release commit|Install Rust|Verify freenet packages cleanly (dry run)"
-check "live: create_release step order" "$(seq "$LIVE_RUN" create_release)" \
+check "live: create_release step order" "$(step_seq "$LIVE_RUN" create_release)" \
     "Checkout the validated release commit|Verify the checkout is the validated release commit|Generate release notes|Create and push tag|Create GitHub release"
-check "dry: update_versions step order" "$(seq "$DRY_RUN" update_versions)" \
+check "dry: update_versions step order" "$(step_seq "$DRY_RUN" update_versions)" \
     "Checkout code|Configure git|Update freenet version|Update fdev version|Install Rust|Update Cargo.lock|Commit the version bump locally|Compose the release PR|Dry run: report what a live run would push|Dry run: hand the bump commit to the rehearsal job"
-check "dry: dry_run_rehearsal step order" "$(seq "$DRY_RUN" dry_run_rehearsal)" \
+check "dry: dry_run_rehearsal step order" "$(step_seq "$DRY_RUN" dry_run_rehearsal)" \
     "Checkout the launch commit|Fetch the bump bundle|Check out the unpushed version-bump commit|Verify the checkout is the bump commit|Install Rust|Verify freenet packages cleanly (dry run)|Changelog since the previous release"
 # Jobs that run in a dry run but need no write access hold none.
 PERMS=$(python3 - "$LINTER" "$RELEASE_YML" <<'PY'
@@ -278,14 +279,26 @@ import importlib.util, sys
 spec = importlib.util.spec_from_file_location("lint", sys.argv[1]); m = importlib.util.module_from_spec(spec)
 sys.modules["lint"] = m
 spec.loader.exec_module(m)
-jobs, _ = m.parse_workflow(open(sys.argv[2]).read())
+text = open(sys.argv[2]).read()
+jobs, lines = m.parse_workflow(text)
+at = next(i for i, l in enumerate(lines) if l.startswith("permissions:"))
+workflow = m._parse_map(lines, at, 2)
 for j in jobs:
     print(f"{j.name}={sorted(j.permissions.items())}")
+    print(f"effective:{j.name}={sorted((j.permissions or workflow).items())}")
 PY
 )
 check "validate is read-only" "$(grep '^validate=' <<< "$PERMS")" "validate=[('contents', 'read')]"
 check "summary holds no permissions" "$(grep '^summary=' <<< "$PERMS")" "summary=[('*', '{}')]"
 check "dry_run_rehearsal is read-only" "$(grep '^dry_run_rehearsal=' <<< "$PERMS")" "dry_run_rehearsal=[('contents', 'read')]"
+# ...and the live jobs keep what they need: push and PR in update_versions,
+# tag push and release in create_release, read access for the waiter.
+check "update_versions can push and open the PR" "$(grep '^effective:update_versions=' <<< "$PERMS")" \
+    "effective:update_versions=[('contents', 'write'), ('pull-requests', 'write')]"
+check "create_release can push the tag and create the release" "$(grep '^effective:create_release=' <<< "$PERMS")" \
+    "effective:create_release=[('contents', 'write'), ('pull-requests', 'write')]"
+check "wait_for_pr can read the PR, its checks and the repo" "$(grep '^effective:wait_for_pr=' <<< "$PERMS")" \
+    "effective:wait_for_pr=[('actions', 'read'), ('contents', 'read'), ('pull-requests', 'read')]"
 # Failure paths: nothing irreversible may follow a failed gate.
 check "live: a failed wait_for_pr stops publishing and tagging" \
     "$(simulate live --fail wait_for_pr | grep -cE '^(verify_publishable|create_release)$')" "0"
@@ -314,6 +327,7 @@ for tool in git gh cargo curl docker npm wget ssh scp; do
 #!/usr/bin/env bash
 echo "$(basename "$0") $*" >> "$STUB_CALLS"
 for a in "$@"; do [ -n "$a" ] || echo "EMPTYARG" >> "$STUB_CALLS"; done
+if [[ "$(basename "$0")" == gh && -z "${GH_TOKEN:-}" ]]; then echo "NOTOKEN" >> "$STUB_CALLS"; fi
 if [[ "$(basename "$0")" == gh && "$1 $2" == "pr create" ]]; then
     echo "https://github.com/example/repo/pull/123"
 fi
@@ -376,6 +390,8 @@ for script in "$RUNS"/*.sh; do
         "$(sed -E 's/^rc=0 calls=[1-9][0-9]*$/reached/' <<< "$result")" "reached"
     check "'$name' passes no empty argument when live" \
         "$(grep -c EMPTYARG "$TEST_TMP/calls")" "0"
+    check "'$name' gives every gh call a GH_TOKEN when live" \
+        "$(grep -c NOTOKEN "$TEST_TMP/calls")" "0"
     LIVE_CALLS="$LIVE_CALLS$(cat "$TEST_TMP/calls")"$'\n'
 done
 # The commands a live release actually issues, and WHICH value feeds each:
@@ -403,6 +419,8 @@ check "Create Pull Request writes the PR number from gh's URL" \
     "$(grep -cxF 'pr_number=123' "$TEST_TMP/gh_output")" "1"
 # The packaging dry run checks freenet, the crate that is publishable before
 # the release exists (fdev resolves freenet from the registry).
+check "update_versions refreshes the lockfile for the new versions" \
+    "$(python3 "$LINTER" --dump-step "$RELEASE_YML" update_versions "Update Cargo.lock" | grep -cxF 'cargo update --workspace')" "1"
 for job in verify_publishable dry_run_rehearsal; do
     check "$job packages exactly 'cargo publish -p freenet --dry-run'" \
         "$(python3 "$LINTER" --dump-step "$RELEASE_YML" "$job" "Verify freenet packages cleanly (dry run)" | grep -c '^cargo publish ')" "1"
@@ -565,6 +583,7 @@ mkdir -p "$GH_FAKE"
 cat > "$GH_FAKE/gh" <<'SH'
 #!/usr/bin/env bash
 echo "gh $*" >> "$GH_FAKE_LOG"
+[[ -n "${GH_TOKEN:-}" ]] || { echo "gh: set GH_TOKEN" >&2; exit 4; }
 jqarg=""
 args=("$@")
 for ((i = 0; i < ${#args[@]}; i++)); do
