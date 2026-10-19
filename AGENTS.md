@@ -272,7 +272,9 @@ End-to-end procedure for any maintainer is in
 mandatory pre-cut preconditions in the `freenet:release` skill (soak,
 auto-update canaries) have passed. The `RELEASE_PAT` section above is the
 prerequisite for the cascade to fire automatically. `--field dry_run=true`
-rehearses the cut without pushing, merging, tagging or publishing anything.
+rehearses the cut without pushing, merging, tagging or publishing anything,
+but only when dispatched from a ref that contains #5936's fix; see
+`docs/RELEASING.md` for what it does and does not cover.
 
 ## Release artifact signing (`FREENET_RELEASE_SIGNING_KEY`)
 

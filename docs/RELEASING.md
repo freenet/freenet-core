@@ -46,13 +46,25 @@ That's it. Watch progress at <https://github.com/freenet/freenet-core/actions/wo
 To rehearse a cut without making one, add `--field dry_run=true`. A dry run
 resolves the version, commits the bump on the runner, runs the checkout
 verifier and `cargo publish -p freenet --dry-run` against that commit, and
-prints the branch, PR title and body, and changelog a live run would produce.
-It pushes no branch, opens and merges no PR, and creates no tag or release, so
-`main` does not move. Every mutating step is gated on the single
-`needs.validate.outputs.live` value and refuses in its own script when that is
-not `true`; Rule Lint's `.github/scripts/check_release_dry_run.py` fails a PR
-that adds a mutating step without both (#5936). Before #5936 a "dry run" did
-push the branch and auto-merge the bump PR.
+prints the branch, PR title and body a live run would open, plus an
+approximate changelog. It pushes no branch, opens and merges no PR, and
+creates no tag or release, so `main` does not move. Every mutating step is
+gated on the single `needs.validate.outputs.live` value and refuses in its own
+script when that is not `true`; Rule Lint's
+`.github/scripts/check_release_dry_run.py` fails a PR that adds a mutating
+step without both (#5936).
+
+Caveats:
+
+- **Only from a ref that contains #5936's fix.** The workflow file comes from
+  the ref you dispatch. Before the fix, a "dry run" pushed the branch and
+  auto-merged the bump PR, so `--ref` pointing at an older tag or branch still
+  does that.
+- **It does not exercise the live-only half:** waiting for the bump PR's
+  merge queue (`wait_for_pr`, `resolve_release_sha.sh`), GitHub's generated
+  release notes, the tag push and the release creation.
+- Whether a dry run needs the pre-cut preconditions is decided by the
+  `freenet:release` skill, not here.
 
 The auto-bump reads `https://crates.io/api/v1/crates/freenet` to find the
 highest released version and increments the patch. So after `0.2.59` ships,
@@ -453,13 +465,13 @@ When a NEW wire-gated feature first ships (not this one), set its floor to
 gh workflow run release.yml
     └─→ release.yml: validate   (resolves dry_run → outputs.live)
     └─→ release.yml: update_versions
-            └─→ (dry run: commits the bump locally, prints what it would
-                 push, then dry_run_rehearsal packages that commit; nothing
-                 below this point runs)
-            └─→ creates "build: release X.Y.Z" PR
-            └─→ ci.yml runs on PR (using RELEASE_PAT scope)
-            └─→ PR auto-merges to main
-    └─→ release.yml: wait_for_pr
+            └─→ dry run: commits the bump locally, prints what it would
+                push, then dry_run_rehearsal packages that commit; NOTHING
+                below this point runs
+            └─→ (live only) creates "build: release X.Y.Z" PR
+            └─→ (live only) ci.yml runs on PR (using RELEASE_PAT scope)
+            └─→ (live only) PR auto-merges to main
+    └─→ release.yml: wait_for_pr   (this and everything below: live only)
             └─→ resolves the bump PR's merge commit -> RELEASE_SHA
                 (everything below checks out that exact commit; see #5233)
     └─→ release.yml: verify_publishable

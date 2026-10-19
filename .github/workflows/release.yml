@@ -204,6 +204,9 @@ jobs:
           token: ${{ secrets.RELEASE_PAT || secrets.GITHUB_TOKEN }}
           # In a dry run no credential is written to .git/config, so even a
           # `git push` that slipped past every guard below cannot authenticate.
+          # The token is still used for the fetch itself, and the job still
+          # holds the workflow-level write token; the guards below are what
+          # keep it from being used.
           persist-credentials: ${{ needs.validate.outputs.live == 'true' }}
 
       - name: Configure git
@@ -349,6 +352,7 @@ jobs:
           PR_BODY_FILE: ${{ steps.pr_text.outputs.body_file }}
           LAUNCH_SHA: ${{ github.sha }}
         run: |
+          set -o pipefail  # a failed `git diff` must not hide behind `tee`
           BUMP_SHA=$(git rev-parse HEAD)
           {
             echo "## 🏃 Release dry run: nothing was pushed"
@@ -398,6 +402,9 @@ jobs:
       contents: read
     env:
       RELEASE_SHA: ${{ needs.update_versions.outputs.dry_run_bump_sha }}
+      # Same value as RELEASE_SHA on purpose: there is no `|| github.sha`
+      # fallback here, so "was a SHA resolved" is just "is it non-empty". The
+      # independent oracle is EXPECTED_VERSION, read from `validate`.
       RELEASE_SHA_RESOLVED: ${{ needs.update_versions.outputs.dry_run_bump_sha }}
       EXPECTED_VERSION: ${{ needs.validate.outputs.version }}
 
@@ -433,20 +440,26 @@ jobs:
           echo "✅ freenet dry-run successful"
 
       # Read-only. GitHub's generate-notes endpoint needs write access, so the
-      # preview lists the commits it would summarise instead.
+      # preview lists the commits it would summarise instead. It is an
+      # approximation: the live notes pick their own previous tag.
       - name: Changelog since the previous release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }} # coalesce-exempt: read-only, contents:read job
           LAUNCH_SHA: ${{ github.sha }}
         run: |
-          PREV=$(gh release list --limit 50 --json tagName --jq '.[].tagName' | head -1 || true)
+          set -o pipefail
+          if ! PREV=$(gh release list --limit 50 --json tagName --jq '.[0].tagName // empty'); then
+            echo "::error::Could not list releases, so the changelog preview is unavailable."
+            exit 1
+          fi
           {
-            echo "## Changelog preview for v$EXPECTED_VERSION"
+            echo "## Changelog preview for v$EXPECTED_VERSION (approximate)"
             echo
             if [ -z "$PREV" ]; then
               echo "No previous release found."
             else
-              echo "Commits on \`main\` since $PREV (the bump commit itself excluded):"
+              TOTAL=$(gh api "repos/$GITHUB_REPOSITORY/compare/$PREV...$LAUNCH_SHA" --jq '.total_commits')
+              echo "$TOTAL commit(s) on \`main\` since $PREV (the bump commit itself excluded; at most 250 listed):"
               echo
               gh api "repos/$GITHUB_REPOSITORY/compare/$PREV...$LAUNCH_SHA" \
                 --jq '.commits[] | "- \(.sha[0:9]) \(.commit.message | split("\n")[0])"'
@@ -691,6 +704,7 @@ jobs:
       # unconditionally, including for dry runs and failed runs.
       - name: Release summary
         env:
+          VALIDATE: ${{ needs.validate.result }}
           LIVE: ${{ needs.validate.outputs.live }}
           VERSION: ${{ needs.validate.outputs.version }}
           FDEV_VERSION: ${{ needs.validate.outputs.fdev_version }}
@@ -698,6 +712,10 @@ jobs:
           CREATE_RELEASE: ${{ needs.create_release.result }}
           REPO: ${{ github.repository }}
         run: |
+          if [ "$VALIDATE" != "success" ]; then
+            echo "❌ validate did not succeed ($VALIDATE), so nothing ran: no version was resolved and nothing was pushed."
+            exit 0
+          fi
           if [ "$LIVE" != "true" ]; then
             echo "🏃 DRY RUN for ${VERSION:-<unresolved version>}: nothing was pushed, merged, tagged or released."
             echo "   Rehearsal on the unpushed bump commit: ${REHEARSAL:-not run}"

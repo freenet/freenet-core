@@ -16,11 +16,14 @@
 #   2. the linter fires on the REAL pre-fix job, and passes the repo today;
 #   3. the obvious future regressions of the real file are caught: each is
 #      applied to a copy of release.yml and the linter must go red;
-#   4. every mutating step of the real release.yml, EXECUTED with stubbed
-#      git/gh, refuses before calling anything when not live, and does reach
-#      its mutating command when live (so the refusal is what stops it, not a
-#      broken extraction);
-#   5. the linter and this test are wired into CI.
+#   4. the job/step topology of BOTH modes, by evaluating every `if:` for
+#      live and for dry (`--simulate`), so a guard flipped the wrong way --
+#      which would break a LIVE release -- fails here;
+#   5. every mutating step of the real release.yml, EXECUTED with stubbed
+#      git/gh and its real `env:`, refuses before calling anything when not
+#      live, and when live reaches its command with no empty argument (so the
+#      refusal is what stops it, and the live plumbing is intact);
+#   6. the linter and this test are wired into CI.
 #
 # Run manually with: bash scripts/release_dry_run_test.sh
 
@@ -82,8 +85,9 @@ python3 "$LINTER" "$REPO_ROOT/.github/workflows" > "$TEST_TMP/repo.out" 2>&1 || 
 check "linter passes the repo's workflows" "$REPO_RC" "0"
 [[ "$REPO_RC" -eq 0 ]] || cat "$TEST_TMP/repo.out" >&2
 
-# The pre-fix shape, verbatim from origin/main 9c09d2dbf: the guarded tag
-# steps and the UNGUARDED version-bump job. If the linter does not flag this,
+# The pre-fix shape, abbreviated from origin/main 9c09d2dbf (the three
+# mutating steps of the version-bump job are as they were; the rest is cut to
+# the minimum): guarded tag steps and the UNGUARDED version-bump job. If the linter does not flag this,
 # it would not have caught the bug it exists for.
 mkdir -p "$TEST_TMP/prefix"
 cat > "$TEST_TMP/prefix/release.yml" <<'YAML'
@@ -163,8 +167,8 @@ check "pre-fix: names the per-step inputs.dry_run reads" \
 # nothing about the linter (it is how earlier pins in this repo went vacuous).
 
 mutate_case() {
-    # mutate_case <description> <python-expression-over-s>
-    local desc="$1" expr="$2" dir="$TEST_TMP/mut" rc=0
+    # mutate_case <description> <expected diagnostic substring> <python-expression-over-s>
+    local desc="$1" needle="$2" expr="$3" dir="$TEST_TMP/mut" rc=0
     rm -rf "$dir" && mkdir -p "$dir"
     if ! python3 - "$RELEASE_YML" "$dir/release.yml" "$expr" <<'PY'
 import sys
@@ -181,30 +185,74 @@ PY
         return
     fi
     python3 "$LINTER" "$dir" > "$dir/out" 2>&1 || rc=$?
-    check "linter catches: $desc" "$rc" "1"
+    # The specific diagnostic, not just a non-zero exit: a mutation that also
+    # trips an unrelated rule must not keep this green after the intended
+    # rule breaks.
+    check "linter catches: $desc" \
+        "$rc:$(grep -cF -- "$needle" "$dir/out" | sed 's/^[1-9][0-9]*$/named/')" "1:named"
 }
 
-mutate_case "the push step loses its if: guard" \
+mutate_case "the push step loses its if: guard" "step \`Push the release branch\` mutates" \
     "s.replace(\"      - name: Push the release branch\n        if: needs.validate.outputs.live == 'true'\n\", \"      - name: Push the release branch\n\", 1)"
-mutate_case "the auto-merge step loses its in-script refusal" \
+mutate_case "the push step's guard is ORed away" "step \`Push the release branch\` mutates" \
+    "s.replace(\"      - name: Push the release branch\n        if: needs.validate.outputs.live == 'true'\n\", \"      - name: Push the release branch\n        if: always() || needs.validate.outputs.live == 'true'\n\", 1)"
+mutate_case "the auto-merge step loses its in-script refusal" "does not refuse in its own script" \
     "s.replace('          [ \"\${RELEASE_LIVE:-}\" = \"true\" ] || { echo \"::error title=Refusing in a dry run::Not enabling auto-merge: this run is not live (#5936).\"; exit 1; }\n', '', 1)"
-mutate_case "create_release loses its job-level live guard and the tag step its own" \
+mutate_case "create_release loses its job-level live guard and the tag step its own" "step \`Create and push tag\` mutates" \
     "s.replace(\" && needs.validate.outputs.live == 'true'\n    env:\n      RELEASE_LIVE\", \"\n    env:\n      RELEASE_LIVE\", 1).replace(\"      - name: Create and push tag\n        if: needs.validate.outputs.live == 'true'\n\", \"      - name: Create and push tag\n\", 1)"
-mutate_case "a step goes back to reading inputs.dry_run" \
+mutate_case "a step goes back to reading inputs.dry_run" "read outside the mode step" \
     "s.replace(\"      - name: Create GitHub release\n        if: needs.validate.outputs.live == 'true'\", \"      - name: Create GitHub release\n        if: \${{ !inputs.dry_run }}\", 1)"
-mutate_case "a new unguarded step edits a release in a dry-run job" \
+mutate_case "a new unguarded step edits a release in a dry-run job" "step \`Sneaky\` mutates" \
     "s.replace('      - name: Compose the release PR\n', '      - name: Sneaky\n        run: gh release edit v1 --draft=false\n\n      - name: Compose the release PR\n', 1)"
-mutate_case "update_versions persists its push credential in a dry run" \
+mutate_case "a new unguarded step hides a merge in bash -c" "step \`Sneaky\` mutates" \
+    "s.replace('      - name: Compose the release PR\n', '      - name: Sneaky\n        run: bash -c \"gh pr merge 1 --auto\"\n\n      - name: Compose the release PR\n', 1)"
+mutate_case "update_versions persists its push credential in a dry run" "persist-credentials" \
     "s.replace(\"          persist-credentials: \${{ needs.validate.outputs.live == 'true' }}\n\", '', 1)"
-mutate_case "the mode step stops using the tested resolver" \
+mutate_case "the mode step stops using the tested resolver" "resolve_release_mode.sh" \
     "s.replace('run: bash scripts/resolve_release_mode.sh', 'run: echo live=true >> \"\$GITHUB_OUTPUT\"', 1)"
+mutate_case "the dry_run input is renamed, taking release.yml out of scope" "nothing was checked" \
+    "s.replace('      dry_run:\n', '      rehearse:\n', 1)"
+mutate_case "the rehearsal job gets a write token" "read-only \`permissions:\`" \
+    "s.replace('    permissions:\n      contents: read\n    env:\n      RELEASE_SHA:', '    permissions:\n      contents: write\n    env:\n      RELEASE_SHA:', 1)"
+# Live-path plumbing: each of these left a live release broken while every
+# dry-run check stayed green.
+mutate_case "Create Pull Request stops writing pr_number" "never writes \`pr_number=\`" \
+    "s.replace('          echo \"pr_number=\$PR_NUMBER\" >> \"\$GITHUB_OUTPUT\"\n', '', 1)"
+mutate_case "update_versions stops exporting pr_number" "does not declare" \
+    "s.replace('      pr_number: \${{ steps.create_pr.outputs.pr_number }}\n', '', 1)"
 
-# --- 4. execute every mutating step ------------------------------------------
+# --- 4. topology of both modes -------------------------------------------------
+
+simulate() { python3 "$LINTER" --simulate "$RELEASE_YML" "$1"; }
+LIVE_RUN=$(simulate live)
+DRY_RUN=$(simulate dry)
+check "live: exactly these jobs run" \
+    "$(grep -v ' / ' <<< "$LIVE_RUN" | paste -sd' ' -)" \
+    "validate update_versions wait_for_pr verify_publishable create_release summary"
+check "dry: exactly these jobs run" \
+    "$(grep -v ' / ' <<< "$DRY_RUN" | paste -sd' ' -)" \
+    "validate update_versions dry_run_rehearsal summary"
+for step in "update_versions / Push the release branch" "update_versions / Create Pull Request" \
+            "update_versions / Enable auto-merge" "create_release / Create and push tag" \
+            "create_release / Create GitHub release" \
+            "validate / Verify the crates.io token before anything is created"; do
+    check "live runs '$step'" "$(grep -cxF "$step" <<< "$LIVE_RUN")" "1"
+    check "dry does not run '$step'" "$(grep -cxF "$step" <<< "$DRY_RUN")" "0"
+done
+for step in "update_versions / Dry run: report what a live run would push" \
+            "update_versions / Dry run: hand the bump commit to the rehearsal job"; do
+    check "dry runs '$step'" "$(grep -cxF "$step" <<< "$DRY_RUN")" "1"
+    check "live does not run '$step'" "$(grep -cxF "$step" <<< "$LIVE_RUN")" "0"
+done
+
+# --- 5. execute every mutating step ------------------------------------------
 #
 # Stubs record every call. In a dry run each step must exit non-zero with the
 # refusal and record NOTHING. Live, each must reach a stubbed command -- the
 # control that shows the extraction is the real script, so the dry-run half
-# is not passing because the script was empty or broke early.
+# is not passing because the script was empty or broke early -- and with the
+# step's real `env:` exported, no argument may be empty: a renamed env key
+# would otherwise push `git push origin ""` on a live release.
 
 STUBS="$TEST_TMP/stubs"
 mkdir -p "$STUBS"
@@ -212,6 +260,7 @@ for tool in git gh cargo curl docker npm; do
     cat > "$STUBS/$tool" <<'SH'
 #!/usr/bin/env bash
 echo "$(basename "$0") $*" >> "$STUB_CALLS"
+for a in "$@"; do [ -n "$a" ] || echo "EMPTYARG" >> "$STUB_CALLS"; done
 if [[ "$(basename "$0")" == gh && "$1 $2" == "pr create" ]]; then
     echo "https://github.com/example/repo/pull/123"
 fi
@@ -221,6 +270,7 @@ SH
 done
 
 RUNS="$TEST_TMP/runs"
+LIVE_CALLS=""
 python3 "$LINTER" --extract-mutating-runs "$RELEASE_YML" "$RUNS"
 EXTRACTED=$(cat "$RUNS"/*.name 2>/dev/null || true)
 for expected in \
@@ -232,13 +282,20 @@ for expected in \
     check "extractor finds mutating step '$expected'" \
         "$(grep -cxF "$expected" <<< "$EXTRACTED")" "1"
 done
+# Exactly those five. The extractor shares the linter's detector, so a step it
+# misses is neither guarded nor executed here; a new mutating step must be
+# added to the list above deliberately.
+check "extractor finds exactly the five known mutating steps" \
+    "$(grep -c . <<< "$EXTRACTED")" "5"
 
 run_step() {
     # run_step <script> <RELEASE_LIVE value|__unset__> -> "rc=<n> calls=<n>"
     local script="$1" live="$2" calls="$TEST_TMP/calls" out="$TEST_TMP/step.out" rc=0
     : > "$calls"
-    local -a envs=(PATH="$STUBS:$PATH" STUB_CALLS="$calls" GITHUB_OUTPUT="$TEST_TMP/gh_output"
-                   GITHUB_ENV="$TEST_TMP/gh_env" RUNNER_TEMP="$TEST_TMP")
+    local -a envs=()
+    mapfile -t envs < "${script%.sh}.env"
+    envs+=(PATH="$STUBS:$PATH" STUB_CALLS="$calls" GITHUB_OUTPUT="$TEST_TMP/gh_output"
+           GITHUB_ENV="$TEST_TMP/gh_env" RUNNER_TEMP="$TEST_TMP")
     if [[ "$live" == "__unset__" ]]; then
         env -u RELEASE_LIVE "${envs[@]}" bash -e "$script" > "$out" 2>&1 || rc=$?
     else
@@ -258,10 +315,20 @@ for script in "$RUNS"/*.sh; do
     done
     result=$(run_step "$script" true)
     check "'$name' reaches its command when live (control)" \
-        "$(sed -E 's/^rc=[0-9]+ calls=[1-9][0-9]*$/reached/' <<< "$result")" "reached"
+        "$(sed -E 's/^rc=0 calls=[1-9][0-9]*$/reached/' <<< "$result")" "reached"
+    check "'$name' passes no empty argument when live" \
+        "$(grep -c EMPTYARG "$TEST_TMP/calls")" "0"
+    LIVE_CALLS="$LIVE_CALLS$(cat "$TEST_TMP/calls")"$'\n'
 done
+# The commands a live release actually issues, with every value present.
+for call in "git push origin PLACEHOLDER" "gh pr merge PLACEHOLDER --auto" \
+            "git push origin vPLACEHOLDER"; do
+    check "live issues '$call'" "$(grep -cxF "$call" <<< "$LIVE_CALLS")" "1"
+done
+check "live opens the PR from the composed title and body file" \
+    "$(grep -cE '^gh pr create --title PLACEHOLDER --body-file PLACEHOLDER --base main --head PLACEHOLDER$' <<< "$LIVE_CALLS")" "1"
 
-# --- 5. wiring ----------------------------------------------------------------
+# --- 6. wiring ----------------------------------------------------------------
 #
 # A guard nobody runs is not a guard. Executable lines only, so a commented-out
 # step does not count.
