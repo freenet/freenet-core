@@ -14,27 +14,32 @@ that structure the only one that passes:
   1. The `validate` job resolves the input once, in its step `id: mode`
      (`scripts/resolve_release_mode.sh`), and exports `outputs.live`. Only the
      literal input `false` yields `live == 'true'`; anything else is a dry run.
-  2. `inputs.dry_run` is read NOWHERE else (dotted or indexed, any case, or
-     through the whole `inputs` object).
-     A second reader is how the guards drifted apart in the first place.
+  2. `inputs.dry_run` is read NOWHERE else: dotted or indexed, any case, or
+     through a whole object that carries it (`inputs`, `github.event`,
+     `github`). A second reader is how the guards drifted apart.
   3. Every MUTATING step is gated on `needs.validate.outputs.live == 'true'`,
      as a top-level `&&` term of its own `if:` or its job's `if:`, in an
      expression with no top-level `||` (`&&` binds tighter, so `a || b && G`
      runs without G). A missing or empty output SKIPS the step: fail closed.
-  4. Every mutating `run:` step also refuses, as the first command of its own
-     script (only `set -...` may precede it), unless `RELEASE_LIVE` (wired
-     from the same output) is `true`. So deleting an `if:` turns a dry run red instead of
-     letting it mutate.
+  4. Every mutating `run:` step also refuses, as the first command of its
+     own script (only `set -...` may precede it), unless `RELEASE_LIVE`
+     (wired from the same output) is `true`. So deleting an `if:` turns a dry
+     run red instead of letting it mutate.
   5. Credentials, the rule that makes any gap in the mutation detector below
      harmless. In a job a dry run can reach: `actions/checkout` persists no
      credential (a stray `git push` cannot authenticate) and gets RELEASE_PAT
      only through the live-gated expression `DRY_SAFE_CHECKOUT_TOKEN`; no
      step a dry run executes receives RELEASE_PAT at all; and if the job's
-     token can write, no such step receives ANY token or secret (workflow
-     env, job env, step env/with, or `${{ }}` in `run:`; a presence test like
-     `secrets.X != ''` is allowed). A dry-run-ONLY job declares read-only
-     `permissions:`, and may then use its read-only token. A job that pushes
-     when live must persist its credential when live, or the push fails.
+     token can write, no such step is passed ANY token or secret through an
+     expression (workflow env, job env, step env/with, or `${{ }}` in `run:`,
+     in the raw source; a presence test like `secrets.X != ''` is allowed).
+     Actions' implicit default token for `actions/*` steps is not an
+     expression and is not counted; with persistence off it stays inside the
+     action. A dry-run-ONLY job declares read-only `permissions:`, and may
+     then use its own read-only token. No dry-run job gets `id-token: write`.
+     A job that pushes when live must persist its credential when live, or
+     the push fails. YAML anchors and aliases are refused, since an alias can
+     copy a live step's env into a dry-run step invisibly.
   6. Every `needs.J.*` reference names a job in `needs:`, every
      `needs.J.outputs.Y` names an output J declares, and every
      `steps.S.outputs.Y` names a step `id: S` in the same job whose script
@@ -43,6 +48,12 @@ that structure the only one that passes:
   7. Steps the reader cannot place (a `steps:` block it cannot itemise, a
      flow-style `steps: [...]` or `- {...}` item, an item with neither `run:`
      nor `uses:`) are an error, not a pass.
+  8. `continue-on-error` is refused (it lets a release pass a failed gate),
+     and so is comparing with an unquoted boolean (`'true' == true` is false
+     in Actions).
+
+To extend this guard, extend rule 5 (what credential a dry-run step can
+hold), not the mutation detector: the detector can never be complete.
 
 Rule 5 is the guarantee; the mutation detector below is best-effort. Its
 known gaps (a command it does not recognise) cannot write, because a step
@@ -152,14 +163,16 @@ DRY_RUN_INPUT_RE = re.compile(
 INPUTS_OBJECT_RE = re.compile(
     r"\binputs\b(?!\s*[.\[])"
     # ...as do `github.event` and the whole `github` context.
-    r"|\bgithub\s*\.\s*event\b(?!\s*\.\s*(?!inputs\b)[A-Za-z_])"
+    r"|\bgithub\s*\.\s*event\b(?!\s*\.\s*[A-Za-z_])"
     r"|\bgithub\b(?!\s*[.\[])",
     re.I,
 )
 # YAML anchors and aliases (supported by Actions since 2025-09). An alias can
 # copy a live step's env or script into a dry-run step with no `${{` in the
 # step's own text, so in-scope workflows may not use them.
-ANCHOR_RE = re.compile(r"""^\s*(-\s+)?(["']?[\w.-]+["']?\s*:\s+)?[&*][A-Za-z0-9_-]+(\s|$)|^\s*<<\s*:""")
+ANCHOR_RE = re.compile(
+    r"""^\s*(-\s+)?["']?[\w.-]+["']?\s*:\s+[&*][A-Za-z0-9_-]+(\s|$)|^\s*-\s+[&*][A-Za-z0-9_-]+(\s|$)|^\s*<<\s*:"""
+)
 EXEMPT_MARKER = "dry-run-safe:"
 BLOCK_SCALAR_RE = re.compile(r"^[|>][1-9]?[-+]?[1-9]?\s*(#.*)?$")
 
@@ -244,6 +257,7 @@ class Step:
     with_: dict[str, str] = field(default_factory=dict)
     run: Optional[str] = None
     text: str = ""
+    run_lines: range = range(0)
 
     @property
     def label(self) -> str:
@@ -331,7 +345,9 @@ def _parse_step(job: str, lines: list[str], first: int, last: int) -> Step:
             continue
         key, value = m.group(1), m.group(2)
         if key == "run" and BLOCK_SCALAR_RE.match(value):
+            start = i
             step.run, i = _block_scalar(seg, i, 8)
+            step.run_lines = range(first + start + 2, first + i + 1)
             continue
         if key == "run":
             # A quoted single-line `run:` must be scanned as the command it
@@ -739,10 +755,19 @@ def _hands_credential(text: str, read_only: bool) -> bool:
             return True
         # A read-only job may use its own (read-only) workflow token, and
         # nothing else: a PAT or the crates.io token ignores `permissions:`.
-        rest = WORKFLOW_TOKEN_RE.sub("", expr) if read_only else expr
+        # `github['token']` is matched before literals are dropped; after
+        # that, a literal such as hashFiles('.github/x') is not a reference.
+        if re.search(r"\bgithub\s*\[\s*['\"]token", expr, re.I):
+            return True
+        rest = _drop_expr_literals(expr)
+        rest = WORKFLOW_TOKEN_RE.sub("", rest) if read_only else rest
         if SECRET_RE.search(rest):
             return True
     return False
+
+
+def _drop_expr_literals(expr: str) -> str:
+    return re.sub(r"'(?:[^']|'')*'", "''", expr)
 
 
 def _source_without_comments(text: str) -> str:
@@ -773,7 +798,10 @@ def check_source(text: str, name: str, repo_root: Path) -> list[str]:
     if perms_at is not None:
         v = _strip_comment(lines[perms_at].split(":", 1)[1])
         workflow_perms = {"*": v} if v else _parse_map(lines, perms_at, 2)
+    script_lines = {n for j in jobs for st in j.steps for n in st.run_lines}
     for n, raw in enumerate(lines, start=1):
+        if n in script_lines:
+            continue  # shell text: `*emphasis*` in a heredoc is not YAML
         if not raw.strip().startswith("#") and ANCHOR_RE.match(raw):
             errors.append(f"{name}:{n}: YAML anchors and aliases are not allowed in a workflow with a dry_run input: an alias can copy a live step's credential or script into a dry-run step without it appearing in that step's text.")
 
@@ -810,9 +838,21 @@ def check_source(text: str, name: str, repo_root: Path) -> list[str]:
         if raw.strip().startswith("#") or n in mode_range:
             continue
         if DRY_RUN_INPUT_RE.search(raw) or any(
-            INPUTS_OBJECT_RE.search(e) for e in re.findall(r"\$\{\{(.*?)\}\}", raw)
+            INPUTS_OBJECT_RE.search(_drop_expr_literals(e)) for e in re.findall(r"\$\{\{(.*?)\}\}", raw)
         ):
             err(n, f"`inputs.dry_run` is read outside the mode step. Gate on `{GUARD}` instead; a second reader is how #5936's guards drifted apart.")
+
+    # Rule 7, job level: every line at the job-id indent must start a job,
+    # and every job must yield steps or a reusable `uses:`. Otherwise a job
+    # in an unexpected layout (flow style, keys at 3 or 6 spaces) would get
+    # no checks at all.
+    for n in range(jobs_at + 2, jobs_end + 1):
+        raw = lines[n - 1]
+        if raw.strip() and not raw.strip().startswith("#") and _indent(raw) == 2 and not re.match(r"^  [A-Za-z0-9_-]+:\s*(#.*)?$", raw):
+            err(n, "cannot place this line as a job (jobs must be `  <id>:` blocks with keys at 4 spaces); an unexamined job is not a passing one.")
+    for job in jobs:
+        if not job.steps and "uses" not in job.keys:
+            err(job.line, f"job `{job.name}`: no steps or `uses:` could be parsed (keys must sit at 4 spaces, steps at `      - `); an unexamined job is not a passing one.")
 
     for job in jobs:
         # `continue-on-error` turns a failed gate (the checkout verifier, the
@@ -1464,6 +1504,19 @@ def self_test() -> int:
         run("continue-on-error on a job is refused",
             _GOOD.replace("  rehearse:\n    runs-on: ubuntu-latest\n", "  rehearse:\n    runs-on: ubuntu-latest\n    continue-on-error: true\n"), "continue-on-error")
         run("toJSON(github.event) reads the input", body("run: echo '${{ toJSON(github.event) }}'"), "read outside the mode step")
+
+        # Round 5.
+        run("a flow-style job is reported",
+            _GOOD + "  sync: {runs-on: ubuntu-latest, needs: validate, steps: [{run: git push}]}\n", "cannot place this line as a job")
+        run("a job with keys at 6 spaces is reported",
+            _GOOD + "  sync:\n      runs-on: ubuntu-latest\n      steps:\n        - run: git push\n", "no steps or `uses:` could be parsed")
+        run("a string literal naming .github is not the github context",
+            with_env("${{ hashFiles('.github/workflows/release.yml') }}"), None)
+        run("github.event.inputs.version is not dry_run",
+            body("run: echo '${{ github.event.inputs.version }}'"), None)
+        run("github['token'] is still the token", with_env("${{ github['token'] }}"), "receives a credential")
+        run("markdown italics in a script are not an alias",
+            body("run: |\n          cat > f <<'EOF'\n          *Do not edit by hand.*\n          EOF"), None)
 
         # Rule 1.
         run("the mode step must exist", _GOOD.replace("        id: mode\n", ""), "no step with `id: mode`")

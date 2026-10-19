@@ -272,6 +272,20 @@ check "dry: update_versions step order" "$(seq "$DRY_RUN" update_versions)" \
     "Checkout code|Configure git|Update freenet version|Update fdev version|Install Rust|Update Cargo.lock|Commit the version bump locally|Compose the release PR|Dry run: report what a live run would push|Dry run: hand the bump commit to the rehearsal job"
 check "dry: dry_run_rehearsal step order" "$(seq "$DRY_RUN" dry_run_rehearsal)" \
     "Checkout the launch commit|Fetch the bump bundle|Check out the unpushed version-bump commit|Verify the checkout is the bump commit|Install Rust|Verify freenet packages cleanly (dry run)|Changelog since the previous release"
+# Jobs that run in a dry run but need no write access hold none.
+PERMS=$(python3 - "$LINTER" "$RELEASE_YML" <<'PY'
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location("lint", sys.argv[1]); m = importlib.util.module_from_spec(spec)
+sys.modules["lint"] = m
+spec.loader.exec_module(m)
+jobs, _ = m.parse_workflow(open(sys.argv[2]).read())
+for j in jobs:
+    print(f"{j.name}={sorted(j.permissions.items())}")
+PY
+)
+check "validate is read-only" "$(grep '^validate=' <<< "$PERMS")" "validate=[('contents', 'read')]"
+check "summary holds no permissions" "$(grep '^summary=' <<< "$PERMS")" "summary=[('*', '{}')]"
+check "dry_run_rehearsal is read-only" "$(grep '^dry_run_rehearsal=' <<< "$PERMS")" "dry_run_rehearsal=[('contents', 'read')]"
 # Failure paths: nothing irreversible may follow a failed gate.
 check "live: a failed wait_for_pr stops publishing and tagging" \
     "$(simulate live --fail wait_for_pr | grep -cE '^(verify_publishable|create_release)$')" "0"
@@ -377,11 +391,24 @@ done
 # The tag step in order: identity, annotated tag, push. The first two have
 # each been the thing that broke a release (an empty ident fails `git tag -a`).
 tag_line() { { grep -nxF "$1" <<< "$LIVE_CALLS" || true; } | head -1 | cut -d: -f1; }
+TAG_NAME=$(tag_line "git config user.name github-actions[bot]")
 TAG_IDENT=$(tag_line "git config user.email github-actions[bot]@users.noreply.github.com")
 TAG_MAKE=$(tag_line "git tag -a v@@needs.validate.outputs.version@@ -m Release v@@needs.validate.outputs.version@@")
 TAG_PUSH=$(tag_line "git push origin v@@needs.validate.outputs.version@@")
 check "live tags in order: identity, annotated tag, push" \
-    "$([ -n "$TAG_IDENT" ] && [ -n "$TAG_MAKE" ] && [ -n "$TAG_PUSH" ] && [ "$TAG_IDENT" -lt "$TAG_MAKE" ] && [ "$TAG_MAKE" -lt "$TAG_PUSH" ] && echo ordered || echo "ident=$TAG_IDENT tag=$TAG_MAKE push=$TAG_PUSH")" "ordered"
+    "$([ -n "$TAG_NAME" ] && [ -n "$TAG_IDENT" ] && [ -n "$TAG_MAKE" ] && [ -n "$TAG_PUSH" ] && [ "$TAG_NAME" -lt "$TAG_MAKE" ] && [ "$TAG_IDENT" -lt "$TAG_MAKE" ] && [ "$TAG_MAKE" -lt "$TAG_PUSH" ] && echo ordered || echo "name=$TAG_NAME email=$TAG_IDENT tag=$TAG_MAKE push=$TAG_PUSH")" "ordered"
+# The PR number a live run hands to auto-merge and wait_for_pr is the one in
+# the URL `gh pr create` printed (the stub prints .../pull/123).
+check "Create Pull Request writes the PR number from gh's URL" \
+    "$(grep -cxF 'pr_number=123' "$TEST_TMP/gh_output")" "1"
+# The packaging dry run checks freenet, the crate that is publishable before
+# the release exists (fdev resolves freenet from the registry).
+for job in verify_publishable dry_run_rehearsal; do
+    check "$job packages exactly 'cargo publish -p freenet --dry-run'" \
+        "$(python3 "$LINTER" --dump-step "$RELEASE_YML" "$job" "Verify freenet packages cleanly (dry run)" | grep -c '^cargo publish ')" "1"
+    check "$job's publish line is the freenet dry run" \
+        "$(python3 "$LINTER" --dump-step "$RELEASE_YML" "$job" "Verify freenet packages cleanly (dry run)" | grep -cxF 'cargo publish -p freenet --dry-run')" "1"
+done
 for step in "Wait for PR to be merged" "Resolve the release commit"; do
     check "wait_for_pr / $step reads the bump PR's number" \
         "$(python3 "$LINTER" --dump-step "$RELEASE_YML" wait_for_pr "$step" | grep -cxF 'PR_NUMBER=@@needs.update_versions.outputs.pr_number@@')" "1"
@@ -520,20 +547,39 @@ for step in "Check out the unpushed version-bump commit" "Verify the checkout is
     check "rehearsal: $step" "$rc" "0"
     [[ "$rc" == "0" ]] || cat "$TEST_TMP/step.log" >&2
 done
+# ...and the verifier is a real check: the same step refuses the bump commit
+# when the expected version is not the one it carries.
+cp "$VALUES" "$TEST_TMP/values.keep"
+sed -i "s/^needs.validate.outputs.version=.*/needs.validate.outputs.version=0.0.1/" "$VALUES"
+rc=$(run_wf_step dry_run_rehearsal "Verify the checkout is the bump commit" - "$TEST_TMP/rehearse")
+check "rehearsal: the verifier refuses a tree that is not the release version" \
+    "$([ "$rc" != 0 ] && echo refused || echo accepted)" "refused"
+cp "$TEST_TMP/values.keep" "$VALUES"
 
 # The changelog preview, against a `gh` that answers like GitHub. A failed
 # `gh release list` must fail the step, not read as "no previous release".
 GH_FAKE="$TEST_TMP/ghfake"
 mkdir -p "$GH_FAKE"
+# It answers with JSON shaped like GitHub's and applies the step's own `--jq`
+# filter with real jq, so a wrong field name in the filter fails here.
 cat > "$GH_FAKE/gh" <<'SH'
 #!/usr/bin/env bash
 echo "gh $*" >> "$GH_FAKE_LOG"
+jqarg=""
+args=("$@")
+for ((i = 0; i < ${#args[@]}; i++)); do
+    [[ "${args[i]}" == --jq ]] && jqarg="${args[i+1]}"
+done
 case "$1 $2" in
-  "release list") [[ "${GH_FAKE_FAIL:-}" == 1 ]] && exit 1; echo "v9.9.8" ;;
+  "release list")
+    [[ "${GH_FAKE_FAIL:-}" == 1 ]] && exit 1
+    json='[{"tagName":"v9.9.8","name":"Release v9.9.8"},{"tagName":"v9.9.7","name":"Release v9.9.7"}]' ;;
   "api repos/example/repo/compare/"*)
-    [[ "${GH_FAKE_FAIL:-}" == api && "$*" != *total_commits* ]] && exit 1
-    if [[ "$*" == *total_commits* ]]; then echo 2; else printf -- '- aaaaaaaaa one\n- bbbbbbbbb two\n'; fi ;;
+    [[ "${GH_FAKE_FAIL:-}" == api && "$jqarg" != *total_commits* ]] && exit 1
+    json='{"total_commits":2,"commits":[{"sha":"aaaaaaaaa1111","commit":{"message":"one\n\nbody"}},{"sha":"bbbbbbbbb2222","commit":{"message":"two"}}]}' ;;
+  *) echo "fake gh: unexpected call: $*" >&2; exit 2 ;;
 esac
+jq -r "${jqarg:-.}" <<< "$json"
 SH
 chmod +x "$GH_FAKE/gh"
 : > "$TEST_TMP/summary"
@@ -543,7 +589,9 @@ check "rehearsal: the changelog preview runs" "$rc" "0"
 check "the changelog compares the previous release with the launch commit" \
     "$(grep -c "compare/v9.9.8...$LAUNCH_SHA" "$TEST_TMP/ghfake.log")" "2"
 check "the changelog skips draft releases" "$(grep -c -- '--exclude-drafts' "$TEST_TMP/ghfake.log")" "1"
-check "the changelog preview lists the commits" "$(grep -c '^- [ab]\{9\} ' "$TEST_TMP/summary")" "2"
+check "the changelog preview lists each commit's subject line" \
+    "$(grep -cxE -- '- aaaaaaaaa one|- bbbbbbbbb two' "$TEST_TMP/summary")" "2"
+check "the changelog preview reports the commit count" "$(grep -c '^2 commit(s) on ' "$TEST_TMP/summary")" "1"
 rc=$(GH_FAKE_FAIL=1 GH_FAKE_LOG="$TEST_TMP/ghfake.log" STEP_PATH="$GH_FAKE:$PATH" \
     run_wf_step dry_run_rehearsal "Changelog since the previous release" - "$TEST_TMP/rehearse")
 check "a failed release listing fails the changelog step" "$([ "$rc" != 0 ] && echo failed || echo passed)" "failed"
@@ -583,13 +631,18 @@ summary_case() {
         "$(grep -cF -- "$4" "$TEST_TMP/step.log")" "1"
     # ...and says nothing belonging to another outcome.
     check "summary for validate=$1 live=$2 create_release=$3 reports one outcome" \
-        "$(grep -cE 'validate did not succeed|DRY RUN for|did NOT complete|is cut and tagged' "$TEST_TMP/step.log")" "1"
+        "$(grep -oE 'validate did not succeed|DRY RUN for|did NOT complete|is cut and tagged' "$TEST_TMP/step.log" | wc -l | tr -d ' ')" "1"
     cp "$base" "$VALUES"
 }
 summary_case failure "" skipped "validate did not succeed"
 summary_case success false skipped "DRY RUN for $WF_VERSION"
 summary_case success true failure "did NOT complete"
 summary_case success true success "is cut and tagged"
+# The common live failure: a gate fails, so create_release is SKIPPED.
+summary_case success true skipped "did NOT complete"
+summary_case success true cancelled "did NOT complete"
+# A missing `live` output is a dry run (fail closed), never "cut and tagged".
+summary_case success "" skipped "DRY RUN for"
 
 # --- 7. wiring ----------------------------------------------------------------
 #

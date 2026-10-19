@@ -28,6 +28,10 @@ jobs:
     name: Validate release inputs
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    # Reads only. Without this the job would hold the workflow's write token,
+    # in a dry run as much as a live one.
+    permissions:
+      contents: read
     outputs:
       version: ${{ steps.validate.outputs.version }}
       fdev_version: ${{ steps.validate.outputs.fdev_version }}
@@ -708,6 +712,7 @@ jobs:
     timeout-minutes: 5
     needs: [validate, update_versions, wait_for_pr, verify_publishable, dry_run_rehearsal, create_release]
     if: always()
+    permissions: {}  # it only prints
 
     steps:
       # Reports what actually happened. It used to print "is cut and tagged"
