@@ -1564,7 +1564,8 @@ async fn idle_timeout_is_reported_for_disconnect_reason() {
         "{err:?}"
     );
     assert!(
-        crate::transport::PeerConnectionApi::closed_by_idle_timeout(&e.conn),
+        crate::transport::PeerConnectionApi::close_reason(&e.conn)
+            == Some(crate::transport::CloseReason::IdleTimeout),
         "the idle-timeout exit must be flagged"
     );
 }
@@ -2544,7 +2545,10 @@ async fn a_refusal_that_cannot_be_remembered_closes_the_connection() {
     let ok = StreamId::next_operations();
     feed(&mut e, fragment(ok, 10_000, 1)).await;
     assert!(e.conn.streaming_handles.contains_key(&ok));
-    assert!(!crate::transport::PeerConnectionApi::closed_by_stream_refusals(&e.conn));
+    assert_eq!(
+        crate::transport::PeerConnectionApi::close_reason(&e.conn),
+        None
+    );
 
     let result = e
         .conn
@@ -2554,7 +2558,10 @@ async fn a_refusal_that_cannot_be_remembered_closes_the_connection() {
         matches!(result, Err(TransportError::ConnectionClosed(_))),
         "{result:?}"
     );
-    assert!(crate::transport::PeerConnectionApi::closed_by_stream_refusals(&e.conn));
+    assert_eq!(
+        crate::transport::PeerConnectionApi::close_reason(&e.conn),
+        Some(crate::transport::CloseReason::InboundStreamRefusals)
+    );
     assert_eq!(
         e.conn.inbound_outcomes[O::ClosedTooManyRefusals as usize],
         1

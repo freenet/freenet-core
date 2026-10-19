@@ -1518,7 +1518,7 @@ mod tests {
     /// `peer_connection.rs` treats as fatal — tearing the whole connection down
     /// and killing every other operation multiplexed on it, forcing a
     /// re-handshake. The fix returns `TransportError::OutboundStreamFailed`,
-    /// which `is_transient_send_failure()` classifies as non-fatal, so the recv
+    /// which `is_transient()` classifies as non-fatal, so the recv
     /// loop logs and lets the op layer retry while the connection survives (the
     /// idle timeout remains the sole authority on connection liveness).
     ///
@@ -1526,12 +1526,12 @@ mod tests {
     /// 1-byte cwnd (no packet ever fits, so the wait loop never breaks) and
     /// asserts:
     ///   1. the error IS `OutboundStreamFailed` (not `ConnectionClosed`), and
-    ///   2. `is_transient_send_failure()` is `true`, i.e. the recv loop takes
+    ///   2. `is_transient()` is `true`, i.e. the recv loop takes
     ///      the connection-survival arm.
     ///
-    /// Asserting on `is_transient_send_failure()` is the load-bearing check:
+    /// Asserting on `is_transient()` is the load-bearing check:
     /// the recv-loop classification (`peer_connection.rs`) is exactly
-    /// `Err(e) if e.is_transient_send_failure() => /* connection survives */`
+    /// `Err(e) if e.is_transient() => /* connection survives */`
     /// vs the catch-all `Err(e) => return Err(e) /* connection torn down */`.
     /// `send_failure_returns_transient_error` in `peer_connection.rs` exercises
     /// the symmetric SendFailed case the same way. A full `PeerConnection::recv`
@@ -1602,10 +1602,10 @@ mod tests {
             "cwnd timeout must NOT be ConnectionClosed (would kill the connection): {err:?}"
         );
 
-        // (3) The recv loop branches on is_transient_send_failure(); true means
+        // (3) The recv loop branches on is_transient(); true means
         // it logs and lets the op layer retry while the connection survives.
         assert!(
-            err.is_transient_send_failure(),
+            err.is_transient(),
             "cwnd timeout must be classified transient so the connection survives: {err:?}"
         );
 
@@ -1668,7 +1668,7 @@ mod tests {
             ),
             "got: {err:?}"
         );
-        assert!(!err.is_transient_send_failure());
+        assert!(!err.is_transient());
         assert!(
             outbound_receiver.try_recv().is_err(),
             "no fragment of a refused stream may be sent"
@@ -1810,7 +1810,7 @@ mod tests {
             matches!(err, TransportError::OutboundStreamInvalidLength(addr, 0) if addr == remote_addr),
             "got: {err:?}"
         );
-        assert!(!err.is_transient_send_failure());
+        assert!(!err.is_transient());
         assert!(outbound_receiver.try_recv().is_err());
     }
 
@@ -2370,12 +2370,12 @@ mod tests {
     /// fragment within STREAM_INACTIVITY_TIMEOUT, pipe_stream must fail only
     /// THIS stream — not tear down the DOWNSTREAM connection that carries other
     /// multiplexed ops. Before this PR the site returned ConnectionClosed
-    /// (is_transient_send_failure() == false → recv loop's fatal arm).
+    /// (is_transient() == false → recv loop's fatal arm).
     ///
     /// Drives the stall by registering a StreamHandle with NO fragment ever
     /// pushed, so `stream.next()` stays Pending and the select!'s
     /// inactivity-timeout arm fires. Asserts the error is OutboundStreamFailed,
-    /// is_transient_send_failure() is true, and it is NOT ConnectionClosed.
+    /// is_transient() is true, and it is NOT ConnectionClosed.
     #[tokio::test(start_paused = true)]
     async fn pipe_stream_inactivity_stall_fails_stream_not_connection()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -2432,7 +2432,7 @@ mod tests {
             "inactivity stall must NOT be ConnectionClosed (would kill the connection): {err:?}"
         );
         assert!(
-            err.is_transient_send_failure(),
+            err.is_transient(),
             "inactivity stall must be classified transient so the connection survives: {err:?}"
         );
         // #4345: the stall fires before any fragment is sent, so the abort's
@@ -2450,11 +2450,11 @@ mod tests {
     /// outbound_stream.rs:471): when the UPSTREAM inbound stream yields an
     /// error, pipe_stream must fail only THIS stream — not the DOWNSTREAM
     /// connection. Before this PR the site returned ConnectionClosed
-    /// (is_transient_send_failure() == false → recv loop's fatal arm).
+    /// (is_transient() == false → recv loop's fatal arm).
     ///
     /// Drives the error by cancelling the StreamHandle so the inbound stream
     /// yields Err(StreamError::Cancelled). Asserts the error is
-    /// OutboundStreamFailed, is_transient_send_failure() is true, and it is NOT
+    /// OutboundStreamFailed, is_transient() is true, and it is NOT
     /// ConnectionClosed.
     #[tokio::test(start_paused = true)]
     async fn pipe_stream_inbound_error_fails_stream_not_connection()
@@ -2515,7 +2515,7 @@ mod tests {
             "inbound error must NOT be ConnectionClosed (would kill the connection): {err:?}"
         );
         assert!(
-            err.is_transient_send_failure(),
+            err.is_transient(),
             "inbound error must be classified transient so the connection survives: {err:?}"
         );
         // #4345: the inbound error fires before any fragment is sent, so the

@@ -340,7 +340,8 @@ impl From<SocketAddr> for ObservedAddr {
 }
 
 pub(crate) use self::boundary::{
-    InboundStreamRegistry, PeerConnectionApi, StreamProgressObserver, StreamSendOutcome,
+    CloseReason, InboundStreamRegistry, PeerConnectionApi, StreamProgressObserver,
+    StreamSendOutcome,
 };
 pub(crate) use self::connection_handler::ExpectedInboundTracker;
 pub use self::connection_handler::create_connection_handler;
@@ -371,7 +372,7 @@ pub enum TransportError {
     ProtocolVersionMismatch { expected: String, actual: String },
     /// A UDP `send_to` to this address failed with this error kind. On an
     /// established connection it is transient: one packet failed and the
-    /// connection survives (see [`Self::is_transient_send_failure`]). When
+    /// connection survives (see [`Self::is_transient`]). When
     /// a handshake returns it, it is fatal: the connection attempt is over
     /// (#5871).
     #[error("send to {0} failed: {1}")]
@@ -394,12 +395,68 @@ pub enum TransportError {
     Serialization(#[from] bincode::Error),
 }
 
+/// What a [`TransportError`] ends, as seen from above the transport.
+///
+/// The node classifies transport errors only through
+/// [`TransportError::closes_connection`] (and [`TransportError::scope`]),
+/// never by matching variants, so a transport with different error variants
+/// needs only to classify its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ErrorScope {
+    /// One send or one stream failed, and a retry may succeed. The connection
+    /// survives: the idle timeout remains the sole authority on its liveness.
+    Transient,
+    /// One stream cannot be sent, and a retry fails the same way. A
+    /// transport must handle these itself (the UDP transport does, in its
+    /// recv loop); if one reaches the node, the node treats it as non-fatal
+    /// and keeps the connection.
+    Stream,
+    /// The connection (or the attempt to make one) is over.
+    Connection,
+}
+
 impl TransportError {
-    /// Returns true if this error is a stream-scoped failure that must NOT
-    /// kill the connection. The idle timeout remains the sole authority on
-    /// connection liveness; a single stalled or failed stream only fails
-    /// that stream, and the operation layer times out and retries against
-    /// another candidate.
+    /// Classify this error. See [`ErrorScope`].
+    ///
+    /// The match is exhaustive on purpose: a new variant must be classified
+    /// here, not fall into a default.
+    pub fn scope(&self) -> ErrorScope {
+        match self {
+            TransportError::SendFailed(..) | TransportError::OutboundStreamFailed(..) => {
+                ErrorScope::Transient
+            }
+            TransportError::OutboundStreamInvalidLength(..) => ErrorScope::Stream,
+            TransportError::ChannelClosed
+            | TransportError::ConnectionClosed(_)
+            | TransportError::ConnectionEstablishmentFailure { .. }
+            | TransportError::ProtocolVersionMismatch { .. }
+            | TransportError::IO(_)
+            | TransportError::Other(_)
+            | TransportError::PubKeyDecryptionError(_)
+            | TransportError::Serialization(_) => ErrorScope::Connection,
+        }
+    }
+
+    /// Whether this error ends the connection ([`ErrorScope::Connection`]).
+    /// This is the node's only decision on a transport error: anything
+    /// else, transient or stream-scoped, leaves the connection up.
+    pub fn closes_connection(&self) -> bool {
+        self.scope() == ErrorScope::Connection
+    }
+
+    /// Former name of the transient check, kept for one release.
+    #[deprecated(note = "use closes_connection()/scope()")]
+    pub fn is_transient_send_failure(&self) -> bool {
+        self.scope() == ErrorScope::Transient
+    }
+
+    /// Returns true if this error is a transient failure that must NOT
+    /// kill the connection ([`ErrorScope::Transient`]). The transport's own
+    /// recv loop uses it to tell transient failures from stream-scoped ones
+    /// ([`ErrorScope::Stream`]), which it accounts for differently. The idle timeout
+    /// remains the sole authority on connection liveness; a single stalled
+    /// or failed stream only fails that stream, and the operation layer
+    /// times out and retries against another candidate.
     ///
     /// Covers:
     /// - [`TransportError::SendFailed`]: a transient UDP send error (e.g.
@@ -418,11 +475,8 @@ impl TransportError {
     ///   re-handshake (#4345). The connection stays up and the idle timeout
     ///   decides liveness instead; the op layer times out and retries against
     ///   another candidate.
-    pub fn is_transient_send_failure(&self) -> bool {
-        matches!(
-            self,
-            TransportError::SendFailed(..) | TransportError::OutboundStreamFailed(..)
-        )
+    pub(crate) fn is_transient(&self) -> bool {
+        self.scope() == ErrorScope::Transient
     }
 }
 
@@ -711,6 +765,66 @@ mod tests {
     use super::*;
     use crate::transport::received_packet_tracker::ReportResult;
     use crate::transport::sent_packet_tracker::ResendAction;
+
+    /// Every variant keeps the decision the node made before errors were
+    /// classified through `scope()`: the node continued on `SendFailed` and
+    /// `OutboundStreamFailed` and closed the connection on everything else.
+    ///
+    /// `expected` is written independently of `scope()`, one row per variant.
+    /// Its match has no wildcard, so adding a variant without a row here does
+    /// not compile.
+    #[test]
+    fn error_scope_preserves_the_transient_decision_for_every_variant() {
+        /// (scope, old `is_transient_send_failure`, closes the connection)
+        fn expected(err: &TransportError) -> (ErrorScope, bool, bool) {
+            match err {
+                TransportError::ChannelClosed => (ErrorScope::Connection, false, true),
+                TransportError::ConnectionClosed(_) => (ErrorScope::Connection, false, true),
+                TransportError::ConnectionEstablishmentFailure { .. } => {
+                    (ErrorScope::Connection, false, true)
+                }
+                TransportError::ProtocolVersionMismatch { .. } => {
+                    (ErrorScope::Connection, false, true)
+                }
+                TransportError::SendFailed(..) => (ErrorScope::Transient, true, false),
+                TransportError::OutboundStreamFailed(_) => (ErrorScope::Transient, true, false),
+                TransportError::OutboundStreamInvalidLength(..) => {
+                    (ErrorScope::Stream, false, false)
+                }
+                TransportError::IO(_) => (ErrorScope::Connection, false, true),
+                TransportError::Other(_) => (ErrorScope::Connection, false, true),
+                TransportError::PubKeyDecryptionError(_) => (ErrorScope::Connection, false, true),
+                TransportError::Serialization(_) => (ErrorScope::Connection, false, true),
+            }
+        }
+
+        let addr: SocketAddr = "192.0.2.1:4000".parse().unwrap();
+        let cases = [
+            TransportError::ChannelClosed,
+            TransportError::ConnectionClosed(addr),
+            TransportError::ConnectionEstablishmentFailure { cause: "x".into() },
+            TransportError::ProtocolVersionMismatch {
+                expected: "1".into(),
+                actual: "2".into(),
+            },
+            TransportError::SendFailed(addr, io::ErrorKind::NetworkUnreachable),
+            TransportError::OutboundStreamFailed(addr),
+            TransportError::OutboundStreamInvalidLength(addr, 0),
+            TransportError::IO(io::Error::other("x")),
+            TransportError::Other(anyhow::anyhow!("x")),
+            TransportError::PubKeyDecryptionError(crypto::DecryptionError::DecryptionFailed),
+            TransportError::Serialization(bincode::deserialize::<u64>(&[]).unwrap_err()),
+        ];
+        for err in &cases {
+            let (scope, old_transient, closes) = expected(err);
+            assert_eq!(err.scope(), scope, "{err:?}");
+            assert_eq!(err.is_transient(), old_transient, "{err:?}");
+            #[allow(deprecated)]
+            let alias = err.is_transient_send_failure();
+            assert_eq!(alias, old_transient, "{err:?}");
+            assert_eq!(err.closes_connection(), closes, "{err:?}");
+        }
+    }
 
     #[test]
     fn test_packet_send_receive_acknowledge_flow() {
