@@ -1191,8 +1191,8 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
         );
     }
 
-    /// Serialize `data` and hand it to the transport (see
-    /// [`Self::send_serialized`]). Returns the SERIALIZED byte length.
+    /// Serialize `data` and hand it to the transport (see `send_serialized`).
+    /// Returns the SERIALIZED byte length.
     pub async fn send<D>(&mut self, data: D) -> Result<usize>
     where
         D: Serialize + Send + std::fmt::Debug,
