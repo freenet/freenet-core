@@ -208,8 +208,8 @@ v0.2.57 release, and they have DIFFERENT remedies:
 1. **Bump PR gets 0 check-runs.** No `pull_request` event fires, so `ci.yml`
    never runs and its required checks never turn green. `ci.yml` has no
    `workflow_dispatch`, so it cannot be started by hand. The old workaround,
-   closing and reopening the PR, breaks `wait_for_pr` polling
-   (`release.yml:285`), whose `release_sha` output `verify_publishable` and
+   closing and reopening the PR, breaks the polling in `release.yml`'s
+   `wait_for_pr` job, whose `release_sha` output `verify_publishable` and
    `create_release` depend on.
 2. **`release.published` does not fire downstream workflows.** Those DO expose
    `workflow_dispatch`, so they can be triggered per step by hand.

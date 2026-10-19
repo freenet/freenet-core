@@ -432,16 +432,55 @@ Current wire-gated floors:
 When a NEW wire-gated feature first ships (not this one), set its floor to
 **exactly that release version** and freeze it, as described above.
 
+## Dry run
+
+`gh workflow run release.yml --field dry_run=true` rehearses a cut without
+making one. It resolves the version, commits the bump on the runner, and runs
+the checkout verifier and `cargo publish -p freenet --dry-run` against that
+commit in a read-only `dry_run_rehearsal` job. It prints the branch, PR title
+and body a live run would open, and an approximate changelog. It pushes no
+branch, opens and merges no PR, and creates no tag or release, so `main` does
+not move.
+
+Every mutating step is gated on the single `needs.validate.outputs.live`
+value and refuses in its own script when that is not `true`. No step that
+runs in a dry run is passed `RELEASE_PAT`. The only job that runs in a dry run
+holding a write-capable token is the bump job (`update_versions`), and the
+only step given that token is its checkout, which uses it to fetch and
+persists nothing. `validate` is read-only, `summary` has no permissions, and
+the rehearsal job is read-only. A presence test such as
+`secrets.RELEASE_PAT != ''` passes no credential and is allowed. Rule Lint's
+`.github/scripts/check_release_dry_run.py` and the CI self-test
+`scripts/release_dry_run_test.sh` fail a PR that breaks any of that (#5936).
+
+Caveats:
+
+- **Only from a ref that contains #5939** (the fix for #5936). The workflow
+  file comes from the ref you dispatch. Before that fix a "dry run" pushed
+  the branch and auto-merged the bump PR, so `--ref` pointing at an older tag
+  or branch still does.
+- **It does not exercise the live-only half:** the `CARGO_REGISTRY_TOKEN`
+  presence check, waiting for the bump PR's merge queue (`wait_for_pr`,
+  `resolve_release_sha.sh`), GitHub's generated release notes, the tag push
+  and the release creation, and everything the tag triggers in
+  `cross-compile.yml` (binaries, Gate A, the crates.io publish). A green dry
+  run says the bump and the packaging are sound, not that a cut will ship.
+- Whether a dry run needs the pre-cut preconditions is decided by the
+  `freenet:release` skill, not here.
+
 ## What fires when
 
 ```
 gh workflow run release.yml
-    └─→ release.yml: validate
+    └─→ release.yml: validate   (resolves dry_run → outputs.live)
     └─→ release.yml: update_versions
-            └─→ creates "build: release X.Y.Z" PR
-            └─→ ci.yml runs on PR (using RELEASE_PAT scope)
-            └─→ PR auto-merges to main
-    └─→ release.yml: wait_for_pr
+            └─→ dry run: commits the bump locally, prints what it would
+                push and bundles the commit; dry_run_rehearsal then verifies
+                and packages it. Of what follows, only the summary runs
+            └─→ (live only) creates "build: release X.Y.Z" PR
+            └─→ (live only) ci.yml runs on PR (using RELEASE_PAT scope)
+            └─→ (live only) PR auto-merges to main
+    └─→ release.yml: wait_for_pr   (this and everything below: live only)
             └─→ resolves the bump PR's merge commit -> RELEASE_SHA
                 (everything below checks out that exact commit; see #5233)
     └─→ release.yml: verify_publishable
