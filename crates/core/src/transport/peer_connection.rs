@@ -1191,14 +1191,8 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
         );
     }
 
-    /// Serialize `data` and hand it to the transport.
-    ///
-    /// Returns the SERIALIZED byte length, so callers that already know the
-    /// message kind can attribute outbound bytes without a second
-    /// serialization pass just to measure it (see
-    /// [`outbound_message_mix`][omm]).
-    ///
-    /// [omm]: crate::node::network_bridge::outbound_message_mix
+    /// Serialize `data` and hand it to the transport (see
+    /// [`Self::send_serialized`]). Returns the SERIALIZED byte length.
     pub async fn send<D>(&mut self, data: D) -> Result<usize>
     where
         D: Serialize + Send + std::fmt::Debug,
@@ -1207,23 +1201,28 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
         // that spawn_blocking overhead isn't worth it. Using spawn_blocking here caused chronic
         // blocking pool thread churn under load (see issue #2310).
         let data = bincode::serialize(&data)?;
+        let len = data.len();
+        self.send_serialized(data).await?;
+        Ok(len)
+    }
+
+    /// Hand an already-serialized message to the transport: as one short
+    /// message when it fits in a packet, otherwise as a stream.
+    pub(crate) async fn send_serialized(&mut self, data: SerializedMessage) -> Result<()> {
         if data.len() + SymmetricMessage::short_message_overhead() > MAX_DATA_SIZE {
             tracing::trace!(
                 peer_addr = %self.remote_conn.remote_addr,
                 total_size_bytes = data.len(),
                 "Sending as stream"
             );
-            let len = data.len();
             self.outbound_stream(data).await;
-            Ok(len)
+            Ok(())
         } else {
             tracing::trace!(
                 peer_addr = %self.remote_conn.remote_addr,
                 "Sending as short message"
             );
-            let len = data.len();
-            self.outbound_short_message(data).await?;
-            Ok(len)
+            self.outbound_short_message(data).await
         }
     }
 
@@ -3397,13 +3396,13 @@ impl<S: super::Socket> super::PeerConnectionApi for PeerConnection<S> {
         self.closed_by_stream_refusals
     }
 
-    fn send_message(
+    fn send(
         &mut self,
-        msg: crate::message::NetMessage,
+        data: Vec<u8>,
     ) -> std::pin::Pin<
-        Box<dyn futures::Future<Output = Result<usize, super::TransportError>> + Send + '_>,
+        Box<dyn futures::Future<Output = Result<(), super::TransportError>> + Send + '_>,
     > {
-        Box::pin(async move { self.send(msg).await })
+        Box::pin(async move { self.send_serialized(data).await })
     }
 
     fn recv(

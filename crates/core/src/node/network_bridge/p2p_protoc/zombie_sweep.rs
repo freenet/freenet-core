@@ -2426,11 +2426,11 @@ mod tests {
             None
         }
 
-        fn send_message(
+        fn send(
             &mut self,
-            _msg: NetMessage,
-        ) -> Pin<Box<dyn Future<Output = Result<usize, TransportError>> + Send + '_>> {
-            Box::pin(async { Ok(0) })
+            _data: Vec<u8>,
+        ) -> Pin<Box<dyn Future<Output = Result<(), TransportError>> + Send + '_>> {
+            Box::pin(async { Ok(()) })
         }
 
         fn recv(

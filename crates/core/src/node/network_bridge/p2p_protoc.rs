@@ -3319,11 +3319,21 @@ async fn handle_peer_channel_message(
             // nothing on this hot path.
             let class =
                 crate::node::network_bridge::outbound_message_mix::OutboundClass::classify(&msg);
-            match conn.send_message(msg).await {
+            // The transport moves bytes; serializing the message is this
+            // layer's job. A serialization failure is reported exactly as a
+            // failed send.
+            let sent = match bincode::serialize(&msg) {
+                Ok(data) => {
+                    let serialized_len = data.len();
+                    conn.send(data).await.map(|()| serialized_len)
+                }
+                Err(error) => Err(TransportError::from(error)),
+            };
+            match sent {
                 Ok(serialized_len) => {
                     // #4956: attribute the bytes to the message kind that
-                    // produced them. `send_message` returns the length it
-                    // already computed, so nothing is serialized twice.
+                    // produced them. The length is the one just serialized,
+                    // so nothing is serialized twice.
                     // Recorded only on a successful hand-off to the transport,
                     // matching the payload mix's real-delivery accounting rule
                     // so a failed send never inflates the census.

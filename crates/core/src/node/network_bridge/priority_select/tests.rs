@@ -2796,17 +2796,17 @@ impl crate::transport::PeerConnectionApi for MockPeerConnection {
         None
     }
 
-    fn send_message(
+    fn send(
         &mut self,
-        _msg: crate::message::NetMessage,
+        _data: Vec<u8>,
     ) -> std::pin::Pin<
         Box<
-            dyn std::future::Future<Output = Result<usize, crate::transport::TransportError>>
+            dyn std::future::Future<Output = Result<(), crate::transport::TransportError>>
                 + Send
                 + '_,
         >,
     > {
-        Box::pin(async { Ok(0) })
+        Box::pin(async { Ok(()) })
     }
 
     fn recv(
