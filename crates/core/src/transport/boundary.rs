@@ -23,12 +23,13 @@ use super::peer_connection::streaming_buffer::LockFreeStreamBuffer;
 // using the same event loop code for both production (UdpTransportSocket) and testing
 // (InMemorySocket) without propagating generics through the entire codebase.
 
-/// Outcome carried by the broadcast-queue stream-completion oneshot.
+/// Outcome carried by the stream-completion oneshot of
+/// [`PeerConnectionApi::send_stream_data`].
 ///
-/// The broadcast queue holds a semaphore permit while a streaming broadcast is
-/// in flight and releases it when the completion signal fires. Historically the
-/// signal was a bare `()` and the queue treated *any* signal as a successful
-/// delivery (issue #4235). That conflated two unrelated facts:
+/// The broadcast queue, its main user, holds a semaphore permit while a
+/// streaming broadcast is in flight and releases it when the completion signal
+/// fires. Historically the signal was a bare `()` and the queue treated *any*
+/// signal as a successful delivery (issue #4235). That conflated two unrelated facts:
 ///
 /// 1. **Permit release** — the permit MUST be released in every terminal case
 ///    (delivered, dropped, timed out) so concurrency slots are never leaked.
@@ -40,7 +41,7 @@ use super::peer_connection::streaming_buffer::LockFreeStreamBuffer;
 /// permit. Carrying an explicit outcome lets the queue release the permit in
 /// all cases while only treating `Delivered` as a real send.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum BroadcastDeliveryOutcome {
+pub(crate) enum StreamSendOutcome {
     /// All stream fragments were transmitted (the last fragment was handed to
     /// the packet sender). Signaled after the final fragment leaves the sender,
     /// NOT after a receiver ACK — this path has no end-to-end delivery
@@ -164,7 +165,7 @@ pub(crate) trait PeerConnectionApi: Send {
     /// the legacy InboundStream decode path.
     ///
     /// If `completion_tx` is provided, it will be signaled when the stream transfer
-    /// completes, carrying a [`BroadcastDeliveryOutcome`] that distinguishes an
+    /// completes, carrying a [`StreamSendOutcome`] that distinguishes an
     /// actual delivery from a drop (see #4235). Used by the broadcast queue to
     /// release its semaphore permit in all cases while only treating a real
     /// delivery as a successful send.
@@ -173,7 +174,7 @@ pub(crate) trait PeerConnectionApi: Send {
         stream_id: StreamId,
         data: bytes::Bytes,
         metadata: Option<bytes::Bytes>,
-        completion_tx: Option<tokio::sync::oneshot::Sender<BroadcastDeliveryOutcome>>,
+        completion_tx: Option<tokio::sync::oneshot::Sender<StreamSendOutcome>>,
         progress: Option<std::sync::Arc<dyn StreamProgressObserver>>,
     ) -> std::pin::Pin<Box<dyn Future<Output = Result<(), TransportError>> + Send + '_>>;
 

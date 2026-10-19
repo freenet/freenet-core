@@ -2456,7 +2456,7 @@ mod tests {
             _data: bytes::Bytes,
             _metadata: Option<bytes::Bytes>,
             _completion_tx: Option<
-                tokio::sync::oneshot::Sender<crate::transport::BroadcastDeliveryOutcome>,
+                tokio::sync::oneshot::Sender<crate::transport::StreamSendOutcome>,
             >,
             _progress: Option<std::sync::Arc<dyn crate::transport::StreamProgressObserver>>,
         ) -> Pin<Box<dyn Future<Output = Result<(), TransportError>> + Send + '_>> {

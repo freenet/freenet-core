@@ -170,7 +170,7 @@ pub(super) async fn send_stream<S: super::super::Socket, T: TimeSource>(
     congestion_controller: Arc<CongestionController<T>>,
     time_source: T,
     metadata: Option<Bytes>,
-    completion_tx: Option<oneshot::Sender<crate::transport::BroadcastDeliveryOutcome>>,
+    completion_tx: Option<oneshot::Sender<crate::transport::StreamSendOutcome>>,
     progress: Option<Arc<dyn crate::transport::StreamProgressObserver>>,
 ) -> Result<TransferStats, TransportError> {
     let start_time = time_source.now();
@@ -192,7 +192,7 @@ pub(super) async fn send_stream<S: super::super::Socket, T: TimeSource>(
             "Not sending stream: length outside the stream limits"
         );
         if let Some(tx) = completion_tx {
-            let _ignored = tx.send(crate::transport::BroadcastDeliveryOutcome::Dropped);
+            let _ignored = tx.send(crate::transport::StreamSendOutcome::Dropped);
         }
         return Err(TransportError::OutboundStreamInvalidLength(
             destination_addr,
@@ -475,7 +475,7 @@ pub(super) async fn send_stream<S: super::super::Socket, T: TimeSource>(
             // the queue must NOT treat this as a delivery.
             if let Some(tx) = completion_tx {
                 // Receiver may be dropped if queue timed out; ignore the error.
-                let _ignored = tx.send(crate::transport::BroadcastDeliveryOutcome::Dropped);
+                let _ignored = tx.send(crate::transport::StreamSendOutcome::Dropped);
             }
             return Err(e);
         }
@@ -547,7 +547,7 @@ pub(super) async fn send_stream<S: super::super::Socket, T: TimeSource>(
     // (#4235) — only this case refreshes peer interest / caches the summary.
     if let Some(tx) = completion_tx {
         // Receiver may be dropped if queue timed out; ignore the error.
-        let _ignored = tx.send(crate::transport::BroadcastDeliveryOutcome::Delivered);
+        let _ignored = tx.send(crate::transport::StreamSendOutcome::Delivered);
     }
 
     Ok(TransferStats {
@@ -1675,7 +1675,7 @@ mod tests {
         );
         assert!(matches!(
             completion_rx.await,
-            Ok(crate::transport::BroadcastDeliveryOutcome::Dropped)
+            Ok(crate::transport::StreamSendOutcome::Dropped)
         ));
         Ok(())
     }
@@ -1969,7 +1969,7 @@ mod tests {
     }
 
     /// Issue #4235 — producer-side emission: a `send_stream` that runs to a
-    /// successful completion MUST signal `BroadcastDeliveryOutcome::Delivered`
+    /// successful completion MUST signal `StreamSendOutcome::Delivered`
     /// on its `completion_tx`.
     ///
     /// The broadcast queue gates interest-refresh / summary-cache on this exact
@@ -2031,14 +2031,14 @@ mod tests {
         assert!(result.is_ok(), "send_stream should succeed: {result:?}");
         assert_eq!(
             completion_rx.await,
-            Ok(crate::transport::BroadcastDeliveryOutcome::Delivered),
+            Ok(crate::transport::StreamSendOutcome::Delivered),
             "a successful stream MUST signal Delivered (#4235)"
         );
         Ok(())
     }
 
     /// Issue #4235 — producer-side emission: a `send_stream` that fails mid-flight
-    /// (a `packet_sending` error) MUST signal `BroadcastDeliveryOutcome::Dropped`
+    /// (a `packet_sending` error) MUST signal `StreamSendOutcome::Dropped`
     /// on its `completion_tx`, so the broadcast queue releases the permit WITHOUT
     /// refreshing interest or caching the summary.
     ///
@@ -2106,7 +2106,7 @@ mod tests {
         );
         assert_eq!(
             completion_rx.await,
-            Ok(crate::transport::BroadcastDeliveryOutcome::Dropped),
+            Ok(crate::transport::StreamSendOutcome::Dropped),
             "a mid-flight send failure MUST signal Dropped (#4235)"
         );
         // #4345 mid-send-failure release: the first fragment's on_send bytes were

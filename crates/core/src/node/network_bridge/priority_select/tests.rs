@@ -2832,9 +2832,7 @@ impl crate::transport::PeerConnectionApi for MockPeerConnection {
         _stream_id: crate::transport::peer_connection::StreamId,
         _data: bytes::Bytes,
         _metadata: Option<bytes::Bytes>,
-        _completion_tx: Option<
-            tokio::sync::oneshot::Sender<crate::transport::BroadcastDeliveryOutcome>,
-        >,
+        _completion_tx: Option<tokio::sync::oneshot::Sender<crate::transport::StreamSendOutcome>>,
         _progress: Option<std::sync::Arc<dyn crate::transport::StreamProgressObserver>>,
     ) -> std::pin::Pin<
         Box<
@@ -2846,7 +2844,7 @@ impl crate::transport::PeerConnectionApi for MockPeerConnection {
         // Signal completion so callers awaiting the oneshot don't hang. The mock
         // stands in for a successful transfer, so report a delivery (#4235).
         if let Some(tx) = _completion_tx {
-            let _ignored = tx.send(crate::transport::BroadcastDeliveryOutcome::Delivered);
+            let _ignored = tx.send(crate::transport::StreamSendOutcome::Delivered);
         }
         Box::pin(async { Ok(()) })
     }

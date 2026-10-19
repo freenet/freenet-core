@@ -2986,7 +2986,7 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
     /// in the metadata message and must match the data stream.
     ///
     /// If `completion_tx` is provided, it will be signaled when the stream
-    /// transfer completes, carrying a [`BroadcastDeliveryOutcome`] that
+    /// transfer completes, carrying a [`StreamSendOutcome`] that
     /// distinguishes delivery from a drop (#4235). Used by the broadcast queue
     /// to hold a semaphore permit until the actual transfer finishes.
     async fn outbound_stream_with_id(
@@ -2994,7 +2994,7 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
         stream_id: StreamId,
         data: bytes::Bytes,
         metadata: Option<bytes::Bytes>,
-        completion_tx: Option<tokio::sync::oneshot::Sender<super::BroadcastDeliveryOutcome>>,
+        completion_tx: Option<tokio::sync::oneshot::Sender<super::StreamSendOutcome>>,
         progress: Option<std::sync::Arc<dyn super::StreamProgressObserver>>,
     ) {
         let task = GlobalExecutor::spawn(
@@ -3425,7 +3425,7 @@ impl<S: super::Socket> super::PeerConnectionApi for PeerConnection<S> {
         stream_id: StreamId,
         data: bytes::Bytes,
         metadata: Option<bytes::Bytes>,
-        completion_tx: Option<tokio::sync::oneshot::Sender<super::BroadcastDeliveryOutcome>>,
+        completion_tx: Option<tokio::sync::oneshot::Sender<super::StreamSendOutcome>>,
         progress: Option<std::sync::Arc<dyn super::StreamProgressObserver>>,
     ) -> std::pin::Pin<
         Box<dyn futures::Future<Output = Result<(), super::TransportError>> + Send + '_>,
