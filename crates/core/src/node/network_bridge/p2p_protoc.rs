@@ -30,9 +30,10 @@ use crate::operations::connect::ConnectMsg;
 use crate::ring::PeerKey;
 use crate::ring::{Distance, Location};
 use crate::transport::{
-    CongestionControlConfig, ExpectedInboundTracker, PeerConnectionApi, Socket, StreamSendOutcome,
-    TransportError, TransportKeypair, TransportPublicKey, UdpTransportSocket,
-    create_connection_handler, global_bandwidth::GlobalBandwidthManager, peer_connection::StreamId,
+    CongestionControlConfig, ExpectedInboundTracker, ListenerExit, PeerConnectionApi, Socket,
+    StreamSendOutcome, TransportError, TransportHandle, TransportKeypair, TransportPublicKey,
+    UdpTransportSocket, global_bandwidth::GlobalBandwidthManager, open_udp_transport,
+    peer_connection::StreamId,
 };
 use crate::util::time_source::{DynTimeSource, InstantTimeSrc};
 use crate::{
@@ -1341,6 +1342,38 @@ impl P2pConnManager {
         notification_channel: EventLoopNotificationsReceiver,
         node_controller: Receiver<NodeEvent>,
     ) -> anyhow::Result<Infallible> {
+        let transport = open_udp_transport::<S>(
+            self.key_pair.clone(),
+            self.listening_ip,
+            self.listening_port,
+            self.is_gateway,
+            self.bandwidth_limit,
+            self.global_bandwidth.clone(),
+            self.ledbat_min_ssthresh,
+            Some(self.congestion_config.clone()),
+            self.ack_version_floor_override,
+        )
+        .await?;
+        self.run_event_listener_with_transport(
+            transport,
+            op_manager,
+            client_wait_for_transaction,
+            notification_channel,
+            node_controller,
+        )
+        .await
+    }
+
+    /// Runs the event loop over an open transport. Not generic over the socket
+    /// type: the transport is reached only through [`TransportHandle`].
+    async fn run_event_listener_with_transport(
+        self,
+        transport: TransportHandle,
+        op_manager: Arc<OpManager>,
+        client_wait_for_transaction: ContractHandlerChannel<WaitingResolution>,
+        notification_channel: EventLoopNotificationsReceiver,
+        node_controller: Receiver<NodeEvent>,
+    ) -> anyhow::Result<Infallible> {
         // Destructure self to avoid partial move issues
         let P2pConnManager {
             gateways,
@@ -1359,7 +1392,7 @@ impl P2pConnManager {
             this_location,
             check_version,
             bandwidth_limit,
-            global_bandwidth,
+            global_bandwidth: _,
             ledbat_min_ssthresh,
             congestion_config,
             ack_version_floor_override,
@@ -1370,19 +1403,12 @@ impl P2pConnManager {
             broadcast_queue,
         } = self;
 
-        let (outbound_conn_handler, inbound_conn_handler, mut listen_task_handle) =
-            create_connection_handler::<S>(
-                key_pair.clone(),
-                listening_ip,
-                listening_port,
-                is_gateway,
-                bandwidth_limit,
-                global_bandwidth,
-                ledbat_min_ssthresh,
-                Some(congestion_config.clone()),
-                ack_version_floor_override,
-            )
-            .await?;
+        let TransportHandle {
+            connector,
+            acceptor,
+            expected_inbound,
+            listener: mut listener_liveness,
+        } = transport;
 
         tracing::info!(
             listening_port,
@@ -1393,7 +1419,6 @@ impl P2pConnManager {
             "Network listener opened - ready to receive connections"
         );
 
-        let expected_inbound = outbound_conn_handler.expected_inbound_tracker();
         let mut state = EventListenerState::new(expected_inbound);
 
         let (conn_event_tx, conn_event_rx) = mpsc::channel(1024);
@@ -1407,8 +1432,8 @@ impl P2pConnManager {
         };
 
         let (handshake_handler, handshake_cmd_sender) = HandshakeHandler::new(
-            Box::new(inbound_conn_handler),
-            Arc::new(outbound_conn_handler.clone()),
+            acceptor,
+            connector,
             bridge.op_manager.ring.connection_manager.clone(),
             bridge.op_manager.ring.router.clone(),
             this_location,
@@ -1490,19 +1515,19 @@ impl P2pConnManager {
             let result = tokio::select! {
                 biased;
 
-                listen_result = &mut listen_task_handle => {
+                exit = &mut listener_liveness => {
                     // The UDP listener task has exited — this is fatal.
                     // Without the listener, no UDP packets are read from the socket,
                     // connections will time out, and the node becomes unresponsive.
-                    match listen_result {
-                        Ok(e) => {
+                    match &exit {
+                        ListenerExit::Error(e) => {
                             tracing::error!(
                                 error = %e,
                                 "CRITICAL: UDP listen task exited with transport error"
                             );
                         }
-                        Err(join_err) => {
-                            let cause = if join_err.is_panic() { "panicked" } else { "cancelled" };
+                        ListenerExit::Panicked(join_err) | ListenerExit::Cancelled(join_err) => {
+                            let cause = listener_failure_cause(&exit);
                             tracing::error!(
                                 cause,
                                 "CRITICAL: UDP listen task failed: {join_err}"
@@ -3767,6 +3792,16 @@ fn disconnect_reason_for_close(
     }
 }
 
+/// The `cause` a failed listener is logged with, as it was when the node read
+/// the listener task's `JoinError` itself.
+fn listener_failure_cause(exit: &ListenerExit) -> &'static str {
+    match exit {
+        ListenerExit::Panicked(_) => "panicked",
+        ListenerExit::Cancelled(_) => "cancelled",
+        ListenerExit::Error(_) => "error",
+    }
+}
+
 #[inline(always)]
 fn decode_msg(data: &[u8]) -> Result<NetMessage, ConnectionError> {
     bincode::deserialize(data).map_err(|err| ConnectionError::Serialization(Some(err)))
@@ -3832,6 +3867,21 @@ pub(crate) mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::sync::mpsc;
     use tokio::time::{Duration, Instant, sleep, timeout};
+
+    /// A failed listener is logged with the same `cause` the node used when it
+    /// read the listener task's `JoinError` itself.
+    #[test]
+    fn listener_failure_cause_matches_the_join_error_kind() {
+        use crate::transport::ListenerExit;
+        assert_eq!(
+            super::listener_failure_cause(&ListenerExit::Panicked("x".into())),
+            "panicked"
+        );
+        assert_eq!(
+            super::listener_failure_cause(&ListenerExit::Cancelled("x".into())),
+            "cancelled"
+        );
+    }
 
     /// A connection that records the bytes it is asked to send, and fails
     /// every send when `fail` is set.
@@ -4047,7 +4097,7 @@ pub(crate) mod tests {
         const SOURCE: &str = include_str!("p2p_protoc.rs");
         // Scoped to the event-loop function that holds both drop sites: a
         // whole-file scrape could match these literals anywhere.
-        let signature = "pub async fn run_event_listener_with_socket<S: Socket>(";
+        let signature = "async fn run_event_listener_with_transport(";
         let start = SOURCE.find(signature).expect("event-loop function renamed");
         let tests_at = SOURCE
             .find("\n#[cfg(test)]\npub(crate) mod tests")
@@ -6405,7 +6455,7 @@ pub(crate) mod tests {
     /// Source pin: the `ctx` rebuild at event-loop entry must CARRY the start
     /// instant across, never re-read it from the clock.
     ///
-    /// `run_event_listener_with_socket` destructures `self` and rebuilds a
+    /// `run_event_listener_with_transport` destructures `self` and rebuilds a
     /// `P2pConnManager` for the loop. Writing `started_at: uptime_clock.now()`
     /// there instead of the `started_at` shorthand would restart the
     /// measurement at event-loop entry, silently under-reporting uptime by the
@@ -6419,9 +6469,9 @@ pub(crate) mod tests {
     fn event_loop_ctx_carries_start_instant_rather_than_re_reading_it() {
         let src = production_src();
         const ANCHOR: &str = "let mut ctx = P2pConnManager {";
-        let start = src
-            .find(ANCHOR)
-            .expect("run_event_listener_with_socket must rebuild `let mut ctx = P2pConnManager {`");
+        let start = src.find(ANCHOR).expect(
+            "run_event_listener_with_transport must rebuild `let mut ctx = P2pConnManager {`",
+        );
         let rest = &src[start + ANCHOR.len()..];
         let end = rest
             .find("\n        };")

@@ -199,6 +199,52 @@ pub async fn create_connection_handler<S: Socket>(
     ))
 }
 
+/// Open the UDP transport and return it as the node's [`TransportHandle`]
+/// (`super::TransportHandle`). Same arguments and binding as
+/// [`create_connection_handler`].
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn open_udp_transport<S: Socket>(
+    keypair: TransportKeypair,
+    listen_host: IpAddr,
+    listen_port: u16,
+    is_gateway: bool,
+    bandwidth_limit: Option<usize>,
+    global_bandwidth: Option<Arc<GlobalBandwidthManager>>,
+    ledbat_min_ssthresh: Option<usize>,
+    congestion_config: Option<CongestionControlConfig>,
+    ack_version_floor_override: Option<(u8, u8, u16)>,
+) -> Result<super::TransportHandle, TransportError> {
+    let (outbound, inbound, listen_task) = create_connection_handler::<S>(
+        keypair,
+        listen_host,
+        listen_port,
+        is_gateway,
+        bandwidth_limit,
+        global_bandwidth,
+        ledbat_min_ssthresh,
+        congestion_config,
+        ack_version_floor_override,
+    )
+    .await?;
+    Ok(udp_transport_handle(outbound, inbound, listen_task))
+}
+
+/// Assemble the handle from the UDP transport's parts. Outbound connect and
+/// expected-inbound registration share one expected-IP set: the tracker is a
+/// view of the connector's set.
+pub(crate) fn udp_transport_handle<S: Socket>(
+    outbound: OutboundConnectionHandler<S>,
+    inbound: InboundConnectionHandler<S>,
+    listen_task: tokio::task::JoinHandle<TransportError>,
+) -> super::TransportHandle {
+    super::TransportHandle {
+        expected_inbound: outbound.expected_inbound_tracker(),
+        connector: Arc::new(outbound),
+        acceptor: Box::new(inbound),
+        listener: Box::pin(async move { super::ListenerExit::from_join(listen_task.await) }),
+    }
+}
+
 /// Bind a socket with retry logic for transient "Address in use" errors.
 ///
 /// In test environments with parallel tests, there can be a brief window between
