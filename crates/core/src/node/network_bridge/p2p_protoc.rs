@@ -2318,7 +2318,7 @@ impl P2pConnManager {
                                         // cleanup: the connection has already been removed from
                                         // ctx.connections / addr_by_pub_key and pruned from the
                                         // ring above. The only residue is the handshake driver's
-                                        // ExpectedInboundTracker entry (if any). That tracker is
+                                        // InboundMatcher entry (if any). That tracker is
                                         // a per-SocketAddr HashMap with no TTL sweep, but the
                                         // entry is benign and bounded: it is overwritten on the
                                         // next register() for the same addr and consumed when a
