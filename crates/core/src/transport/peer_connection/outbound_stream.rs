@@ -1196,148 +1196,40 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
-    async fn test_send_stream_with_bandwidth_limit() -> Result<(), Box<dyn std::error::Error>> {
-        let (outbound_sender, mut outbound_receiver) = mpsc::channel(100);
-        let destination_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, 1234));
-        let key = Aes128Gcm::new_from_slice(&[0u8; 16])?;
-        let last_packet_id = Arc::new(AtomicU32::new(0));
-        let stream_id = StreamId::next();
-
-        // Create a large message (10KB)
-        let message = vec![0u8; 10_000];
-
-        // Set bandwidth limit to 100KB/s (100,000 bytes/second)
-        let bandwidth_limit = 100_000;
-
-        // Use real time for integration testing with bandwidth limiting
-        let time_source = RealTime::new();
-        let sent_tracker = Arc::new(parking_lot::Mutex::new(
-            SentPacketTracker::new_with_time_source(time_source.clone()),
-        ));
-
-        // Initialize congestion controller and TokenBucket for test
-        // Use large cwnd since unit tests don't simulate ACKs to reduce flightsize
-        // Use small burst capacity (1KB) to ensure rate limiting is observable
-        let congestion_controller = CongestionControlConfig::from_ledbat_config(LedbatConfig {
-            initial_cwnd: 1_000_000,
-            min_cwnd: 1_000_000,
-            max_cwnd: 1_000_000_000,
-            ..Default::default()
-        })
-        .build_arc();
-        let token_bucket = Arc::new(TokenBucket::new_with_time_source(
-            1_000, // 1KB burst - ensures rate limiting kicks in
-            bandwidth_limit,
-            time_source.clone(),
-        ));
-
-        // Expected: 100KB/s with token bucket rate limiting
-        // Should throttle appropriately
-
-        let start_time = tokio::time::Instant::now();
-
-        // Clone sender for receiver task termination
-        let sender_clone: mpsc::Sender<(SocketAddr, Arc<[u8]>)> = outbound_sender.clone();
-        let key_clone = key.clone();
-
-        // Spawn receiver task to collect packets
-        let receiver_task = GlobalExecutor::spawn(async move {
-            let mut packet_count = 0;
-            let mut total_bytes = 0;
-            while let Some((addr, packet)) = outbound_receiver.recv().await {
-                assert_eq!(addr, destination_addr);
-                packet_count += 1;
-                total_bytes += packet.len();
-
-                // Decrypt and verify it's a stream fragment
-                let packet_data = PacketData::<_, MAX_PACKET_SIZE>::from_buf(&packet);
-                let decrypted = packet_data.try_decrypt_sym(&key_clone).unwrap();
-                let msg = SymmetricMessage::deser(decrypted.data()).unwrap();
-                match msg.payload {
-                    SymmetricMessagePayload::StreamFragment { .. } => {
-                        // Expected
-                    }
-                    SymmetricMessagePayload::AckConnection { .. }
-                    | SymmetricMessagePayload::AckConnectionV2 { .. }
-                    | SymmetricMessagePayload::ShortMessage { .. }
-                    | SymmetricMessagePayload::NoOp
-                    | SymmetricMessagePayload::Ping { .. }
-                    | SymmetricMessagePayload::Pong { .. } => panic!("Expected stream fragment"),
-                }
-            }
-            (packet_count, total_bytes)
-        });
-
-        // Spawn the send_stream task
-        let send_task = GlobalExecutor::spawn(send_stream(
-            stream_id,
-            last_packet_id.clone(),
-            Arc::new(TestSocket::new(outbound_sender)),
-            destination_addr,
-            Bytes::from(message.clone()),
-            key.clone(),
-            sent_tracker.clone(),
-            token_bucket,
-            congestion_controller,
-            time_source,
-            None,
-            None,
-            None,
-        ));
-
-        // Wait for send task to complete
-        send_task.await??;
-        let elapsed = start_time.elapsed();
-
-        // Drop the cloned sender to close the channel
-        drop(sender_clone);
-
-        // Get receiver results
-        let (packet_count, _total_bytes) = receiver_task.await?;
-
-        // Verify we sent the expected number of packets
-        let expected_packets = message.len().div_ceil(MAX_DATA_SIZE);
-        assert_eq!(packet_count, expected_packets);
-
-        // Verify that rate limiting occurred
-        // For 10KB at 100KB/s with 1KB burst:
-        // - First 1KB sent immediately (burst)
-        // - Remaining 9KB at 100KB/s = ~90ms
-        // - Actual timing: ~50-60ms due to concurrent token refill
-        debug!(
-            "Transfer took: {elapsed:?}, packets sent: {packet_count}, expected: {expected_packets}"
-        );
-        debug!("Bytes per packet: ~{MAX_DATA_SIZE}");
-        assert!(
-            elapsed.as_millis() >= 50,
-            "Transfer completed too quickly: {elapsed:?}"
-        );
-
-        Ok(())
+    /// Outcome of one [`run_virtual_stream_transfer`] run.
+    struct VirtualTransfer {
+        /// Raw packets the receiver observed, in order.
+        packets: Vec<Arc<[u8]>>,
+        /// Virtual time that elapsed. Time only moves when the driver
+        /// advances it, and the driver only does so when `send_stream` is
+        /// parked on a `time_source.sleep`, so this is exactly the sum of
+        /// the token-bucket waits and independent of host load.
+        virtual_elapsed: Duration,
+        /// Number of times `send_stream` parked on the clock (each is one
+        /// token-bucket or cwnd wait).
+        sleeps: usize,
     }
 
-    /// Run a single 10KB stream transfer with the given token-bucket
-    /// (burst capacity, rate bytes/s) and return the wall-clock duration plus
-    /// the number of packets the receiver observed.
+    /// Payload size used by [`run_virtual_stream_transfer`].
+    const TRANSFER_LEN: usize = 10_000;
+
+    /// Run a single 10KB stream transfer under [`VirtualTime`] with the given
+    /// token bucket (burst capacity, rate bytes/s).
     ///
-    /// Shared between the rate-limited and unlimited measurements in
-    /// [`test_send_stream_without_bandwidth_limit`] so both paths run through
-    /// identical setup; only the token-bucket parameters differ.
-    async fn measure_stream_transfer(
+    /// Nothing here reads the wall clock: the driver advances virtual time
+    /// to the next pending wakeup whenever the sender is waiting on it, so
+    /// the result depends only on the token-bucket arithmetic (#4163).
+    async fn run_virtual_stream_transfer(
         burst_capacity: usize,
         rate_bytes_per_sec: usize,
-    ) -> Result<(Duration, usize), Box<dyn std::error::Error>> {
+    ) -> Result<VirtualTransfer, Box<dyn std::error::Error>> {
         let (outbound_sender, mut outbound_receiver) = mpsc::channel(100);
         let destination_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, 1234));
         let key = Aes128Gcm::new_from_slice(&[0u8; 16])?;
-        let last_packet_id = Arc::new(AtomicU32::new(0));
-        let stream_id = StreamId::next();
 
-        // Create a large message (10KB)
-        let message = vec![0u8; 10_000];
+        let message = vec![0u8; TRANSFER_LEN];
 
-        let time_source = RealTime::new();
+        let time_source = VirtualTime::new();
         let sent_tracker = Arc::new(parking_lot::Mutex::new(
             SentPacketTracker::new_with_time_source(time_source.clone()),
         ));
@@ -1349,98 +1241,166 @@ mod tests {
             max_cwnd: 1_000_000_000,
             ..Default::default()
         })
-        .build_arc();
+        .build_arc_with_time_source(time_source.clone());
         let token_bucket = Arc::new(TokenBucket::new_with_time_source(
             burst_capacity,
             rate_bytes_per_sec,
             time_source.clone(),
         ));
 
-        let start_time = tokio::time::Instant::now();
-
-        // Clone sender for receiver task termination
-        let sender_clone: mpsc::Sender<(SocketAddr, Arc<[u8]>)> = outbound_sender.clone();
-
         // Spawn receiver task to collect packets
         let receiver_task = GlobalExecutor::spawn(async move {
-            let mut packet_count = 0;
-            while let Some((addr, _packet)) = outbound_receiver.recv().await {
+            let mut packets = Vec::new();
+            while let Some((addr, packet)) = outbound_receiver.recv().await {
                 assert_eq!(addr, destination_addr);
-                packet_count += 1;
+                packets.push(packet);
             }
-            packet_count
+            packets
         });
 
-        // Spawn the send_stream task
+        let start_nanos = time_source.now_nanos();
         let send_task = GlobalExecutor::spawn(send_stream(
-            stream_id,
-            last_packet_id.clone(),
+            StreamId::next(),
+            Arc::new(AtomicU32::new(0)),
             Arc::new(TestSocket::new(outbound_sender)),
             destination_addr,
             Bytes::from(message.clone()),
-            key.clone(),
-            sent_tracker.clone(),
+            key,
+            sent_tracker,
             token_bucket,
             congestion_controller,
-            time_source,
+            time_source.clone(),
             None,
             None,
             None,
         ));
 
-        // Wait for send task to complete
+        // Drive virtual time: only advance when the sender is parked on a
+        // sleep, otherwise yield so the sender and receiver can make progress.
+        //
+        // This is deterministic because `VirtualTime::sleep` registers its
+        // wakeup with a fixed deadline when the sleep future is created (not
+        // when it is first polled), and this test runs on tokio's
+        // `current_thread` runtime, so the sender only runs while the driver
+        // is yielding. Whether the driver observes a pending wakeup before or
+        // after the sender has parked, the deadline is the same, so the
+        // virtual elapsed time is the same.
+        //
+        // Guard against a stalled sender: a healthy transfer needs a handful
+        // of iterations per fragment, so exceeding the cap means the sender is
+        // stuck, and should fail loudly instead of hanging CI.
+        const MAX_DRIVER_ITERATIONS: usize = 100_000;
+        let mut sleeps = 0;
+        let mut iterations = 0;
+        while !send_task.is_finished() {
+            iterations += 1;
+            assert!(
+                iterations <= MAX_DRIVER_ITERATIONS,
+                "send_stream did not finish after {MAX_DRIVER_ITERATIONS} driver iterations \
+                 ({sleeps} virtual sleeps, virtual time {:?}): the sender is stalled",
+                Duration::from_nanos(time_source.now_nanos() - start_nanos),
+            );
+            if time_source.advance_to_next_wakeup().is_some() {
+                sleeps += 1;
+            }
+            tokio::task::yield_now().await;
+        }
         send_task.await??;
-        let elapsed = start_time.elapsed();
+        let virtual_elapsed = Duration::from_nanos(time_source.now_nanos() - start_nanos);
 
-        // Drop the cloned sender to close the channel
-        drop(sender_clone);
-
-        // Get receiver results
-        let packet_count = receiver_task.await?;
-
-        // Verify we sent the expected number of packets
+        // The sender (and its socket's channel sender) is dropped, so the
+        // receiver task ends.
+        let packets = receiver_task.await?;
         let expected_packets = message.len().div_ceil(MAX_DATA_SIZE);
-        assert_eq!(packet_count, expected_packets);
+        assert_eq!(packets.len(), expected_packets);
 
-        Ok((elapsed, packet_count))
+        Ok(VirtualTransfer {
+            packets,
+            virtual_elapsed,
+            sleeps,
+        })
+    }
+
+    /// Assert `elapsed` matches the token-bucket pacing of `TRANSFER_LEN`
+    /// bytes after the initial `burst`, within +/-5%. Virtual time is exact, so
+    /// the window only absorbs fragment granularity; a limiter that is 1.5x too
+    /// fast or too slow fails.
+    fn assert_throttled_duration(elapsed: Duration, burst: usize, rate: usize) {
+        let expected = Duration::from_secs_f64((TRANSFER_LEN - burst) as f64 / rate as f64);
+        let (lo, hi) = (expected.mul_f64(0.95), expected.mul_f64(1.05));
+        assert!(
+            (lo..=hi).contains(&elapsed),
+            "throttled transfer took {elapsed:?}, expected {expected:?} (window {lo:?}..={hi:?})"
+        );
     }
 
     #[tokio::test]
-    async fn test_send_stream_without_bandwidth_limit() -> Result<(), Box<dyn std::error::Error>> {
-        // The unlimited path is bounded ABOVE by the rate-limited path, so we
-        // co-measure both transfers and assert a RATIO rather than an absolute
-        // wall-clock cap. An absolute cap (the old `< 50ms`) is inherently
-        // flaky: under CI/CPU pressure the same unthrottled transfer can take
-        // 60-70ms+ even though it is still far faster than a throttled one.
-        // Comparing the two measurements in the same process cancels out that
-        // shared scheduling noise.
+    async fn test_send_stream_with_bandwidth_limit() -> Result<(), Box<dyn std::error::Error>> {
+        // The bucket starts with `burst` tokens and every payload byte is
+        // reserved against it, so the remaining (TRANSFER_LEN - burst) bytes
+        // are paced at `rate`: 9000 B at 100 KB/s = 90 ms of virtual time.
+        let (burst, rate) = (1_000, 100_000);
+        let transfer = run_virtual_stream_transfer(burst, rate).await?;
 
-        // Rate-limited: 10KB over 100KB/s with a 1KB burst. The first 1KB goes
-        // out immediately, the remaining 9KB is paced at 100KB/s (~90ms).
-        let (limited_elapsed, _) = measure_stream_transfer(1_000, 100_000).await?;
+        let key = Aes128Gcm::new_from_slice(&[0u8; 16])?;
+        for packet in &transfer.packets {
+            // Decrypt and verify it's a stream fragment
+            let packet_data = PacketData::<_, MAX_PACKET_SIZE>::from_buf(packet);
+            let decrypted = packet_data.try_decrypt_sym(&key).unwrap();
+            let msg = SymmetricMessage::deser(decrypted.data()).unwrap();
+            match msg.payload {
+                SymmetricMessagePayload::StreamFragment { .. } => {
+                    // Expected
+                }
+                SymmetricMessagePayload::AckConnection { .. }
+                | SymmetricMessagePayload::AckConnectionV2 { .. }
+                | SymmetricMessagePayload::ShortMessage { .. }
+                | SymmetricMessagePayload::NoOp
+                | SymmetricMessagePayload::Ping { .. }
+                | SymmetricMessagePayload::Pong { .. } => panic!("Expected stream fragment"),
+            }
+        }
 
-        // Unlimited: 100KB burst + 1GB/s rate means the token bucket never
-        // throttles; the transfer is bounded only by per-packet processing.
-        let (unlimited_elapsed, _) = measure_stream_transfer(100_000, 1_000_000_000).await?;
-
-        // Sanity floor: rate limiting must actually have an observable effect.
-        // Without this, a regression that silently disabled throttling could
-        // make both timings ~0 and still satisfy the ratio below.
-        assert!(
-            limited_elapsed.as_millis() >= 50,
-            "Rate-limited transfer completed too quickly to be a meaningful \
-             baseline: {limited_elapsed:?}"
+        debug!(
+            "Transfer took (virtual): {:?}, packets sent: {}, sleeps: {}",
+            transfer.virtual_elapsed,
+            transfer.packets.len(),
+            transfer.sleeps
         );
-
-        // Core invariant: the unlimited transfer must be dramatically faster
-        // than the rate-limited one. Use a 4x safety margin so the assertion
-        // tolerates wide platform/scheduling variance while still failing if
-        // the unlimited path ever approaches rate-limited timings.
         assert!(
-            unlimited_elapsed * 4 < limited_elapsed,
-            "Unlimited transfer ({unlimited_elapsed:?}) was not meaningfully \
-             faster than the rate-limited transfer ({limited_elapsed:?}); \
-             expected unlimited * 4 < rate-limited"
+            transfer.sleeps > 0,
+            "rate limiting must have parked the sender on the token bucket"
+        );
+        assert_throttled_duration(transfer.virtual_elapsed, burst, rate);
+
+        Ok(())
+    }
+
+    /// With a bucket that never throttles (100KB burst, 1GB/s) the sender must
+    /// never wait on the clock at all. This asserts the mechanism (no
+    /// token-bucket wait, zero virtual time) rather than comparing wall-clock
+    /// durations, which flaked under CPU load (#4163). The rate-limited run is
+    /// the control: the same harness must observe waits when throttled, so a
+    /// harness that cannot see sleeps cannot pass this test vacuously.
+    #[tokio::test]
+    async fn test_send_stream_without_bandwidth_limit() -> Result<(), Box<dyn std::error::Error>> {
+        let (burst, rate) = (1_000, 100_000);
+        let limited = run_virtual_stream_transfer(burst, rate).await?;
+        assert!(
+            limited.sleeps > 0,
+            "control: the rate-limited run must wait on the token bucket"
+        );
+        assert_throttled_duration(limited.virtual_elapsed, burst, rate);
+
+        let unlimited = run_virtual_stream_transfer(100_000, 1_000_000_000).await?;
+        assert_eq!(
+            unlimited.sleeps, 0,
+            "an unlimited token bucket must never make the sender wait"
+        );
+        assert_eq!(
+            unlimited.virtual_elapsed,
+            Duration::ZERO,
+            "an unlimited transfer must consume no virtual time"
         );
 
         Ok(())
