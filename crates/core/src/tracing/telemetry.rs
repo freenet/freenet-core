@@ -2822,12 +2822,8 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                 serde_json::json!(snapshot.nat_attempts_gateway),
             );
             m.insert(
-                "nat_attempts_cached_peer".into(),
-                serde_json::json!(snapshot.nat_attempts_cached_peer),
-            );
-            m.insert(
-                "nat_attempts_redial".into(),
-                serde_json::json!(snapshot.nat_attempts_redial),
+                "nat_attempts_ring_peer_no_transport".into(),
+                serde_json::json!(snapshot.nat_attempts_ring_peer_no_transport),
             );
             m.insert(
                 "nat_established_connect_joiner".into(),
@@ -2842,12 +2838,8 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                 serde_json::json!(snapshot.nat_established_gateway),
             );
             m.insert(
-                "nat_established_cached_peer".into(),
-                serde_json::json!(snapshot.nat_established_cached_peer),
-            );
-            m.insert(
-                "nat_established_redial".into(),
-                serde_json::json!(snapshot.nat_established_redial),
+                "nat_established_ring_peer_no_transport".into(),
+                serde_json::json!(snapshot.nat_established_ring_peer_no_transport),
             );
             m.insert(
                 "stray_intro_after_deadline".into(),
@@ -2860,6 +2852,10 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
             m.insert(
                 "stray_intro_other".into(),
                 serde_json::json!(snapshot.stray_intro_other),
+            );
+            m.insert(
+                "stray_intro_failures_evicted".into(),
+                serde_json::json!(snapshot.stray_intro_failures_evicted),
             );
             m.insert(
                 "dial_queue_wait_lt_100ms".into(),
@@ -6526,16 +6522,15 @@ mod tests {
             nat_attempts_connect_joiner: 1,
             nat_attempts_connect_acceptor: 2,
             nat_attempts_gateway: 3,
-            nat_attempts_cached_peer: 4,
-            nat_attempts_redial: 5,
+            nat_attempts_ring_peer_no_transport: 5,
             nat_established_connect_joiner: 6,
             nat_established_connect_acceptor: 7,
             nat_established_gateway: 8,
-            nat_established_cached_peer: 9,
-            nat_established_redial: 10,
+            nat_established_ring_peer_no_transport: 10,
             stray_intro_after_deadline: 11,
             stray_intro_same_ip_other_port: 12,
             stray_intro_other: 13,
+            stray_intro_failures_evicted: 18,
             dial_queue_wait_lt_100ms: 14,
             dial_queue_wait_lt_1s: 15,
             dial_queue_wait_lt_3s: 16,
@@ -6548,16 +6543,15 @@ mod tests {
             ("nat_attempts_connect_joiner", 1),
             ("nat_attempts_connect_acceptor", 2),
             ("nat_attempts_gateway", 3),
-            ("nat_attempts_cached_peer", 4),
-            ("nat_attempts_redial", 5),
+            ("nat_attempts_ring_peer_no_transport", 5),
             ("nat_established_connect_joiner", 6),
             ("nat_established_connect_acceptor", 7),
             ("nat_established_gateway", 8),
-            ("nat_established_cached_peer", 9),
-            ("nat_established_redial", 10),
+            ("nat_established_ring_peer_no_transport", 10),
             ("stray_intro_after_deadline", 11),
             ("stray_intro_same_ip_other_port", 12),
             ("stray_intro_other", 13),
+            ("stray_intro_failures_evicted", 18),
             ("dial_queue_wait_lt_100ms", 14),
             ("dial_queue_wait_lt_1s", 15),
             ("dial_queue_wait_lt_3s", 16),

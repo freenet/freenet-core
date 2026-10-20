@@ -75,7 +75,9 @@ async fn connect_reports_an_abandoned_attempt_as_an_establishment_failure() {
     let (key, addr) = remote();
     let connector: &dyn OutboundConnector = &handler;
 
-    let pending = connector.connect(key, addr, NatAttemptOrigin::Redial).await;
+    let pending = connector
+        .connect(key, addr, NatAttemptOrigin::RingPeerNoTransport)
+        .await;
     drop(queue.recv().await.expect("a start is queued"));
 
     let Err(err) = pending.await else {
@@ -96,7 +98,7 @@ async fn connect_reports_a_closed_transport_as_channel_closed() {
     let connector: &dyn OutboundConnector = &handler;
 
     let Err(err) = connector
-        .connect(key, addr, NatAttemptOrigin::Redial)
+        .connect(key, addr, NatAttemptOrigin::RingPeerNoTransport)
         .await
         .await
     else {

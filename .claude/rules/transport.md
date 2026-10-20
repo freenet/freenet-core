@@ -207,11 +207,15 @@ counters), NAT traversals by why they were started (`nat_attempts_<label>`,
 `nat_established_<label>`, one per `NatAttemptOrigin`, and `origin` on each
 `nat_fail_samples` entry; the origin is threaded internally from each
 `NodeEvent::ConnectPeer` through `OutboundConnector::connect` and
-`ConnectionStart`, never on the wire, and a dial to a configured gateway is
-always `gateway`), intro packets a non-gateway drops as unknown
-(`stray_intro_<label>`: the exact address's traversal failed in the last 10 s,
-a traversal to another port of the IP is running, or neither; the recent
-failures are a listener-owned table bounded by count and TTL) and CONNECT
+`ConnectionStart`, never on the wire; a dial to a configured gateway is
+always `gateway`, and `ring_peer_no_transport` is the event loop's dial to a
+ring peer whose transport was lost, since cached-peer joins never dial
+(#5954)), intro packets a non-gateway drops as unknown (`stray_intro_<label>`:
+the exact address's traversal ran to its deadline and failed in the last 10 s,
+a traversal to another port of the IP is running (endpoint-dependent mapping
+OR another peer behind the same IP, e.g. CGNAT; it cannot tell them apart), or
+neither; the recent failures are a listener-owned table bounded by count and
+TTL, and early evictions are counted in `stray_intro_failures_evicted`) and CONNECT
 joiner dial-queue waits (`dial_queue_wait_<label>`, coarse buckets around the
 3 s punch window). Each label set is declared once in a `labelled_counters!`
 list, so a new variant needs a snapshot field. Hot

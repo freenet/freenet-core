@@ -940,10 +940,6 @@ async fn begin_acceptor_dial(
 ) -> Result<impl std::future::Future<Output = AcceptorDial> + Send + 'static, OpError> {
     // The Response arm only queues acceptors that have a socket address.
     let acceptor_addr = acceptor.socket_addr().ok_or(OpError::UnexpectedOpState)?;
-    // The acceptor started punching when it accepted, before its Response
-    // reached us; time spent queued here comes out of its 3 s window.
-    let queued_for = answered_at.elapsed();
-    crate::transport::TRANSPORT_METRICS.record_dial_queue_wait(acceptor_addr, queued_for);
     op_manager
         .notify_node_event(NodeEvent::ExpectPeerConnection {
             addr: acceptor_addr,
@@ -960,6 +956,13 @@ async fn begin_acceptor_dial(
             origin: crate::transport::NatAttemptOrigin::ConnectJoiner,
         })
         .await?;
+    // The acceptor started punching when it accepted, before its Response
+    // reached us; time spent queued here comes out of its 3 s window. Taken
+    // only once the dial is handed to the event loop, so the wait includes
+    // any time the two sends above were blocked, and a dial that was never
+    // sent is not counted.
+    crate::transport::TRANSPORT_METRICS
+        .record_dial_queue_wait(acceptor_addr, answered_at.elapsed());
     Ok(async move {
         let result = rx.recv().await;
         AcceptorDial {
@@ -2948,6 +2951,59 @@ mod driver_timing_tests {
             0,
             "the jitter failure count must be reset"
         );
+    }
+
+    /// The dial-queue wait is recorded only once `ConnectPeer` is handed to
+    /// the event loop: a dial whose send fails records nothing, and a dial
+    /// whose sends were held up counts the time they were held.
+    #[tokio::test(start_paused = true)]
+    async fn the_dial_queue_wait_is_recorded_only_after_the_dial_is_sent() {
+        use crate::transport::metrics::DialQueueWait;
+        let waits = |p: &PeerKeyLocation| {
+            crate::transport::TRANSPORT_METRICS.dial_queue_waits_for(p.socket_addr().unwrap())
+        };
+        let tx = Transaction::new::<ConnectMsg>();
+
+        // The event loop is gone: the dial is never sent.
+        let (op_manager, events) = op_manager_with_events("dial-wait-unsent").await;
+        drop(events);
+        let unsent = peer(24890);
+        assert!(
+            super::begin_acceptor_dial(&op_manager, tx, unsent.clone(), Instant::now())
+                .await
+                .is_err(),
+            "premise: the dial cannot be sent"
+        );
+        assert!(waits(&unsent).is_empty(), "an unsent dial records no wait");
+
+        // The event loop's channel is full and is not drained for 4 s, so the
+        // sends block that long: the recorded wait must span it.
+        let (op_manager, mut events) = op_manager_with_events("dial-wait-held").await;
+        let mut filler = 0usize;
+        while op_manager
+            .try_notify_node_event(NodeEvent::TransactionCompleted(tx))
+            .is_ok()
+        {
+            filler += 1;
+        }
+        assert!(filler > 0, "premise: the channel filled");
+        let held = peer(24891);
+        let answered_at = Instant::now();
+        let slow_loop = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(4)).await;
+            while let Some(event) = events.recv().await {
+                if let Either::Right(NodeEvent::ConnectPeer { callback, .. }) = event {
+                    return callback;
+                }
+            }
+            panic!("no ConnectPeer");
+        });
+        let dial = super::begin_acceptor_dial(&op_manager, tx, held.clone(), answered_at)
+            .await
+            .expect("sent");
+        assert_eq!(waits(&held), vec![DialQueueWait::Ge3S]);
+        drop(slow_loop.await.expect("event loop"));
+        drop(dial);
     }
 
     /// An acceptor's punch towards the joiner it accepted is tagged

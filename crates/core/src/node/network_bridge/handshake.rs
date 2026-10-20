@@ -728,7 +728,7 @@ mod tests {
     /// The origin `run_connect` dials with; any variant would do, as long as
     /// the connector sees exactly it.
     const RUN_ORIGIN: crate::transport::NatAttemptOrigin =
-        crate::transport::NatAttemptOrigin::CachedPeer;
+        crate::transport::NatAttemptOrigin::RingPeerNoTransport;
 
     /// Run `connect_outbound` against a scripted connector.
     async fn run_connect(enqueue: Duration, handshake: Handshake) -> ConnectRun {

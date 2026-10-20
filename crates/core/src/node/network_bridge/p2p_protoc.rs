@@ -1896,15 +1896,7 @@ impl P2pConnManager {
                                             tx,
                                             callback,
                                             is_gw,
-                                            origin: unconnected_dial_origin(
-                                                is_gw,
-                                                &msg,
-                                                &ctx.bridge
-                                                    .op_manager
-                                                    .ring
-                                                    .connection_manager
-                                                    .pub_key,
-                                            ),
+                                            origin: unconnected_dial_origin(is_gw),
                                         }),
                                     ) {
                                         // `err` owns the ConnectPeer event (and thus the
@@ -3093,6 +3085,21 @@ fn orphan_transaction(
     live_tx_tracker.remove_finished_transaction(tx);
 }
 
+/// The origin of the event loop's dial for a message to a peer it has no
+/// transport to. The target is a configured gateway or a peer the ring still
+/// lists (`peek_target_peer` always returns `None` since #4110, so nothing
+/// else reaches the dial), so a non-gateway target is a ring peer whose
+/// transport was lost. The message may be from any op: a relayed request, a
+/// reply, or our own CONNECT request routed through that peer (for example
+/// by `acquire_new`). Cached-peer joins never reach this dial (#5954).
+fn unconnected_dial_origin(is_gw: bool) -> crate::transport::NatAttemptOrigin {
+    if is_gw {
+        crate::transport::NatAttemptOrigin::Gateway
+    } else {
+        crate::transport::NatAttemptOrigin::RingPeerNoTransport
+    }
+}
+
 /// What to tell the event loop when `msg`, waiting for a connection to
 /// `target_addr`, was dropped because the connection failed. Only this
 /// node's own CONNECT request as a joiner (`own`) is reported (#5858): its
@@ -3100,27 +3107,6 @@ fn orphan_transaction(
 /// peer pruned mid-flight) frees the bootstrap round instead of holding it
 /// for the transaction TTL. A relayed request and every other message keep
 /// their ops' own retry handling.
-/// Why a message to a peer with no connection opens one. A gateway is
-/// `Gateway`. Our own CONNECT request to anyone else is the cached-peer
-/// reconnect (`join_ring_request` to a cached peer; its other callers target
-/// gateways). Anything else re-dials a peer we are no longer connected to.
-fn unconnected_dial_origin(
-    is_gw: bool,
-    msg: &NetMessage,
-    own: &TransportPublicKey,
-) -> crate::transport::NatAttemptOrigin {
-    use crate::transport::NatAttemptOrigin;
-    if is_gw {
-        return NatAttemptOrigin::Gateway;
-    }
-    match msg {
-        NetMessage::V1(NetMessageV1::Connect(
-            crate::operations::connect::ConnectMsg::Request { payload, .. },
-        )) if payload.joiner.pub_key() == own => NatAttemptOrigin::CachedPeer,
-        _ => NatAttemptOrigin::Redial,
-    }
-}
-
 fn unsent_message_notice(
     msg: &NetMessage,
     tx: Transaction,
@@ -4232,52 +4218,19 @@ pub(crate) mod tests {
         SOURCE[open..end].split_whitespace().collect()
     }
 
-    /// A message to a peer with no connection dials it as: a gateway, our
-    /// own CONNECT request (the cached-peer reconnect), or a re-dial.
+    /// The event loop's dial for a message with no transport is `Gateway`
+    /// for a gateway and `RingPeerNoTransport` otherwise.
     #[test]
-    fn an_unconnected_dial_is_tagged_by_what_it_carries() {
-        use crate::message::{NetMessage, NetMessageV1, Transaction};
-        use crate::operations::connect::{ConnectMsg, prepare_join_request};
-        use crate::ring::{Location, PeerKeyLocation};
-        use crate::transport::{NatAttemptOrigin, TransportKeypair};
-
-        let peer = |port: u16| {
-            PeerKeyLocation::new(
-                TransportKeypair::new().public().clone(),
-                std::net::SocketAddr::from(([127, 0, 0, 1], port)),
-            )
-        };
-        let (me, other) = (peer(1), peer(4));
-        let tx = Transaction::new::<ConnectMsg>();
-        let wrap = |msg: ConnectMsg| NetMessage::V1(NetMessageV1::Connect(msg));
-        let own_request = wrap(prepare_join_request(
-            tx,
-            &me,
-            &peer(2),
-            Location::new(0.5),
-            10,
-            &[],
-        ));
-        let relayed = wrap(prepare_join_request(
-            tx,
-            &other,
-            &peer(2),
-            Location::new(0.5),
-            10,
-            &[],
-        ));
-        let observed = wrap(ConnectMsg::ObservedAddress {
-            id: tx,
-            address: std::net::SocketAddr::from(([127, 0, 0, 1], 3)),
-        });
-        let origin =
-            |is_gw, msg: &NetMessage| super::unconnected_dial_origin(is_gw, msg, me.pub_key());
-        assert_eq!(origin(false, &own_request), NatAttemptOrigin::CachedPeer);
-        assert_eq!(origin(false, &relayed), NatAttemptOrigin::Redial);
-        assert_eq!(origin(false, &observed), NatAttemptOrigin::Redial);
-        for msg in [&own_request, &relayed, &observed] {
-            assert_eq!(origin(true, msg), NatAttemptOrigin::Gateway);
-        }
+    fn an_unconnected_dial_is_tagged_by_its_target() {
+        use crate::transport::NatAttemptOrigin;
+        assert_eq!(
+            super::unconnected_dial_origin(true),
+            NatAttemptOrigin::Gateway
+        );
+        assert_eq!(
+            super::unconnected_dial_origin(false),
+            NatAttemptOrigin::RingPeerNoTransport
+        );
     }
 
     /// Source pin: the event loop's dial for a message with no connection
@@ -4291,7 +4244,7 @@ pub(crate) mod tests {
             .expect("the unconnected-dial ConnectPeer");
         assert!(
             code[dispatch..].starts_with(
-                "P2pBridgeEvent::NodeAction(NodeEvent::ConnectPeer{peer:target_peer.clone(),tx,callback,is_gw,origin:unconnected_dial_origin(is_gw,&msg,&ctx.bridge.op_manager.ring.connection_manager.pub_key,),}),"
+                "P2pBridgeEvent::NodeAction(NodeEvent::ConnectPeer{peer:target_peer.clone(),tx,callback,is_gw,origin:unconnected_dial_origin(is_gw),}),"
             ),
             "the dial's origin must come from unconnected_dial_origin"
         );

@@ -102,14 +102,14 @@ labelled_counters! {
         ConnectAcceptor => "connect_acceptor",
         /// A dial to a configured gateway (bootstrap, or any other path).
         Gateway => "gateway",
-        /// Our own CONNECT request to a cached, non-gateway peer we have no
-        /// connection to (fast reconnect at startup). The remote is not expecting
-        /// us, so this only works if it still holds our session.
-        CachedPeer => "cached_peer",
-        /// Any other message to a non-gateway peer we are no longer connected to.
-        /// The remote is not expecting us either. Also the tag for callers that
-        /// use the transport directly (tests, benchmarks), which have no origin.
-        Redial => "redial",
+        /// The event loop had a message for a non-gateway peer that the ring
+        /// still lists but has no transport to (the connection was lost), and
+        /// dialled it to send the message. The remote is usually not
+        /// expecting us, so this works only if it still holds our session.
+        /// Cached-peer joins never dial at all (#5954), so they are not here.
+        /// Also the tag for callers that use the transport directly (tests,
+        /// benchmarks), which have no origin.
+        RingPeerNoTransport => "ring_peer_no_transport",
     }
 }
 
@@ -118,13 +118,21 @@ labelled_counters! {
     /// traversal exists for its exact address. Exactly one per dropped intro;
     /// exported per period as `stray_intro_<label>`.
     pub(crate) enum StrayIntro {
-        /// The same address had an outbound traversal that FAILED in the last
-        /// `STRAY_INTRO_WINDOW` (10 s): the remote punched after we gave up.
-        /// Checked first, as the more specific match.
+        /// The same address had an outbound traversal that ran to its deadline
+        /// and failed in the last `STRAY_INTRO_WINDOW` (10 s): the remote
+        /// punched after we gave up. Failures that ended before the deadline
+        /// (version mismatch, send error, ...) are not remembered. Checked
+        /// first, as the more specific match. If more than
+        /// `MAX_RECENT_TRAVERSAL_FAILURES` failed within the window, the
+        /// oldest were forgotten early and their late intros count as another
+        /// kind; `stray_intro_failures_evicted` counts how often.
         AfterDeadline => "after_deadline",
-        /// A traversal to the same IP on another port is running: the remote's
-        /// NAT mapped it to a port we are not punching (endpoint-dependent
-        /// mapping), and our NAT let the packet through.
+        /// A traversal to the same IP on another port is running. Either the
+        /// remote's NAT mapped it to a port we are not punching
+        /// (endpoint-dependent mapping) and our NAT let the packet through, or
+        /// a DIFFERENT peer shares that IP (CGNAT, several peers behind one
+        /// NAT). This counter cannot tell the two apart, so it is not direct
+        /// evidence of endpoint-dependent mapping on its own.
         SameIpOtherPort => "same_ip_other_port",
         /// Neither.
         Other => "other",
@@ -314,6 +322,10 @@ pub struct TransportMetrics {
     /// Intro packets a non-gateway dropped as unknown, by [`StrayIntro`]
     /// (reset each snapshot).
     stray_intros: [AtomicU32; StrayIntro::COUNT],
+    /// Recent traversal failures forgotten early because the listener's
+    /// table was full (reset each snapshot). Each can turn a later
+    /// `AfterDeadline` intro into another kind.
+    stray_intro_failures_evicted: AtomicU32,
 
     /// CONNECT joiner acceptor dials by time spent queued, by
     /// [`DialQueueWait`] (reset each snapshot).
@@ -603,6 +615,7 @@ impl TransportMetrics {
             nat_attempts_by_origin: Default::default(),
             nat_established_by_origin: Default::default(),
             stray_intros: Default::default(),
+            stray_intro_failures_evicted: AtomicU32::new(0),
             dial_queue_wait: Default::default(),
         }
     }
@@ -1005,6 +1018,15 @@ impl TransportMetrics {
         self.stray_intros[kind as usize].fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Record `n` recent traversal failures the listener forgot early
+    /// because its table was full.
+    pub(crate) fn record_stray_intro_failures_evicted(&self, n: u32) {
+        if n > 0 {
+            self.stray_intro_failures_evicted
+                .fetch_add(n, Ordering::Relaxed);
+        }
+    }
+
     /// Record how long a CONNECT joiner held `acceptor` before dialling it
     /// (`acceptor` is never exported).
     pub(crate) fn record_dial_queue_wait(&self, acceptor: SocketAddr, wait: std::time::Duration) {
@@ -1359,8 +1381,9 @@ impl TransportMetrics {
                 &attempts[NatAttemptOrigin::ConnectAcceptor as usize],
             ),
             nat_attempts_gateway: get32(&attempts[NatAttemptOrigin::Gateway as usize]),
-            nat_attempts_cached_peer: get32(&attempts[NatAttemptOrigin::CachedPeer as usize]),
-            nat_attempts_redial: get32(&attempts[NatAttemptOrigin::Redial as usize]),
+            nat_attempts_ring_peer_no_transport: get32(
+                &attempts[NatAttemptOrigin::RingPeerNoTransport as usize],
+            ),
             nat_established_connect_joiner: get32(
                 &established[NatAttemptOrigin::ConnectJoiner as usize],
             ),
@@ -1368,11 +1391,13 @@ impl TransportMetrics {
                 &established[NatAttemptOrigin::ConnectAcceptor as usize],
             ),
             nat_established_gateway: get32(&established[NatAttemptOrigin::Gateway as usize]),
-            nat_established_cached_peer: get32(&established[NatAttemptOrigin::CachedPeer as usize]),
-            nat_established_redial: get32(&established[NatAttemptOrigin::Redial as usize]),
+            nat_established_ring_peer_no_transport: get32(
+                &established[NatAttemptOrigin::RingPeerNoTransport as usize],
+            ),
             stray_intro_after_deadline: get32(&stray[StrayIntro::AfterDeadline as usize]),
             stray_intro_same_ip_other_port: get32(&stray[StrayIntro::SameIpOtherPort as usize]),
             stray_intro_other: get32(&stray[StrayIntro::Other as usize]),
+            stray_intro_failures_evicted: get32(&self.stray_intro_failures_evicted),
             dial_queue_wait_lt_100ms: get32(&wait[DialQueueWait::Lt100Ms as usize]),
             dial_queue_wait_lt_1s: get32(&wait[DialQueueWait::Lt1S as usize]),
             dial_queue_wait_lt_3s: get32(&wait[DialQueueWait::Lt3S as usize]),
@@ -1758,21 +1783,24 @@ pub struct TransportSnapshot {
     pub nat_attempts_connect_joiner: u32,
     pub nat_attempts_connect_acceptor: u32,
     pub nat_attempts_gateway: u32,
-    pub nat_attempts_cached_peer: u32,
-    pub nat_attempts_redial: u32,
+    pub nat_attempts_ring_peer_no_transport: u32,
     /// Outbound NAT traversals established during the period, by origin.
     /// They sum to `nat_traversal_established`, up to a snapshot race.
     pub nat_established_connect_joiner: u32,
     pub nat_established_connect_acceptor: u32,
     pub nat_established_gateway: u32,
-    pub nat_established_cached_peer: u32,
-    pub nat_established_redial: u32,
+    pub nat_established_ring_peer_no_transport: u32,
     /// Intro packets a non-gateway dropped during the period because no
     /// connection or traversal exists for their exact address, by
     /// [`StrayIntro`]. Counts only, no addresses.
     pub stray_intro_after_deadline: u32,
     pub stray_intro_same_ip_other_port: u32,
     pub stray_intro_other: u32,
+    /// Recent traversal failures the listener forgot before the 10 s window
+    /// because its table (256 entries) was full; a later intro from one of
+    /// them is counted as another kind. Non-zero means the
+    /// `stray_intro_*` split under-counts `after_deadline`.
+    pub stray_intro_failures_evicted: u32,
     /// CONNECT joiner acceptor dials during the period by how long the
     /// acceptor waited in the joiner's dial queue, by [`DialQueueWait`].
     pub dial_queue_wait_lt_100ms: u32,
@@ -1841,16 +1869,15 @@ impl TransportSnapshot {
             nat_attempts_connect_joiner,
             nat_attempts_connect_acceptor,
             nat_attempts_gateway,
-            nat_attempts_cached_peer,
-            nat_attempts_redial,
+            nat_attempts_ring_peer_no_transport,
             nat_established_connect_joiner,
             nat_established_connect_acceptor,
             nat_established_gateway,
-            nat_established_cached_peer,
-            nat_established_redial,
+            nat_established_ring_peer_no_transport,
             stray_intro_after_deadline,
             stray_intro_same_ip_other_port,
             stray_intro_other,
+            stray_intro_failures_evicted,
             dial_queue_wait_lt_100ms,
             dial_queue_wait_lt_1s,
             dial_queue_wait_lt_3s,
@@ -1895,16 +1922,15 @@ impl TransportSnapshot {
         self.nat_attempts_connect_joiner = nat_attempts_connect_joiner;
         self.nat_attempts_connect_acceptor = nat_attempts_connect_acceptor;
         self.nat_attempts_gateway = nat_attempts_gateway;
-        self.nat_attempts_cached_peer = nat_attempts_cached_peer;
-        self.nat_attempts_redial = nat_attempts_redial;
+        self.nat_attempts_ring_peer_no_transport = nat_attempts_ring_peer_no_transport;
         self.nat_established_connect_joiner = nat_established_connect_joiner;
         self.nat_established_connect_acceptor = nat_established_connect_acceptor;
         self.nat_established_gateway = nat_established_gateway;
-        self.nat_established_cached_peer = nat_established_cached_peer;
-        self.nat_established_redial = nat_established_redial;
+        self.nat_established_ring_peer_no_transport = nat_established_ring_peer_no_transport;
         self.stray_intro_after_deadline = stray_intro_after_deadline;
         self.stray_intro_same_ip_other_port = stray_intro_same_ip_other_port;
         self.stray_intro_other = stray_intro_other;
+        self.stray_intro_failures_evicted = stray_intro_failures_evicted;
         self.dial_queue_wait_lt_100ms = dial_queue_wait_lt_100ms;
         self.dial_queue_wait_lt_1s = dial_queue_wait_lt_1s;
         self.dial_queue_wait_lt_3s = dial_queue_wait_lt_3s;
@@ -2001,21 +2027,24 @@ struct SnapshotExtras {
     pub nat_attempts_connect_joiner: u32,
     pub nat_attempts_connect_acceptor: u32,
     pub nat_attempts_gateway: u32,
-    pub nat_attempts_cached_peer: u32,
-    pub nat_attempts_redial: u32,
+    pub nat_attempts_ring_peer_no_transport: u32,
     /// Outbound NAT traversals established during the period, by origin.
     /// They sum to `nat_traversal_established`, up to a snapshot race.
     pub nat_established_connect_joiner: u32,
     pub nat_established_connect_acceptor: u32,
     pub nat_established_gateway: u32,
-    pub nat_established_cached_peer: u32,
-    pub nat_established_redial: u32,
+    pub nat_established_ring_peer_no_transport: u32,
     /// Intro packets a non-gateway dropped during the period because no
     /// connection or traversal exists for their exact address, by
     /// [`StrayIntro`]. Counts only, no addresses.
     pub stray_intro_after_deadline: u32,
     pub stray_intro_same_ip_other_port: u32,
     pub stray_intro_other: u32,
+    /// Recent traversal failures the listener forgot before the 10 s window
+    /// because its table (256 entries) was full; a later intro from one of
+    /// them is counted as another kind. Non-zero means the
+    /// `stray_intro_*` split under-counts `after_deadline`.
+    pub stray_intro_failures_evicted: u32,
     /// CONNECT joiner acceptor dials during the period by how long the
     /// acceptor waited in the joiner's dial queue, by [`DialQueueWait`].
     pub dial_queue_wait_lt_100ms: u32,
@@ -2053,16 +2082,15 @@ impl SnapshotExtras {
             || self.nat_attempts_connect_joiner != 0
             || self.nat_attempts_connect_acceptor != 0
             || self.nat_attempts_gateway != 0
-            || self.nat_attempts_cached_peer != 0
-            || self.nat_attempts_redial != 0
+            || self.nat_attempts_ring_peer_no_transport != 0
             || self.nat_established_connect_joiner != 0
             || self.nat_established_connect_acceptor != 0
             || self.nat_established_gateway != 0
-            || self.nat_established_cached_peer != 0
-            || self.nat_established_redial != 0
+            || self.nat_established_ring_peer_no_transport != 0
             || self.stray_intro_after_deadline != 0
             || self.stray_intro_same_ip_other_port != 0
             || self.stray_intro_other != 0
+            || self.stray_intro_failures_evicted != 0
             || self.dial_queue_wait_lt_100ms != 0
             || self.dial_queue_wait_lt_1s != 0
             || self.dial_queue_wait_lt_3s != 0
@@ -2944,11 +2972,10 @@ mod tests {
                 snap.nat_established_connect_acceptor,
             ),
             NatAttemptOrigin::Gateway => (snap.nat_attempts_gateway, snap.nat_established_gateway),
-            NatAttemptOrigin::CachedPeer => (
-                snap.nat_attempts_cached_peer,
-                snap.nat_established_cached_peer,
+            NatAttemptOrigin::RingPeerNoTransport => (
+                snap.nat_attempts_ring_peer_no_transport,
+                snap.nat_established_ring_peer_no_transport,
             ),
-            NatAttemptOrigin::Redial => (snap.nat_attempts_redial, snap.nat_established_redial),
         }
     }
 
@@ -3038,6 +3065,21 @@ mod tests {
             }
         }
         assert!(metrics.take_snapshot().is_none(), "stray intros must reset");
+    }
+
+    /// Evictions from the recent-failure table reach the snapshot, count as
+    /// activity on their own, and reset.
+    #[test]
+    fn stray_intro_failures_evicted_snapshot_and_reset() {
+        let metrics = TransportMetrics::new();
+        metrics.record_stray_intro_failures_evicted(0);
+        assert!(metrics.take_snapshot().is_none(), "zero is not activity");
+        metrics.record_stray_intro_failures_evicted(2);
+        metrics.record_stray_intro_failures_evicted(1);
+        assert_eq!(metrics.read_snapshot().stray_intro_failures_evicted, 3);
+        let snap = metrics.take_snapshot().expect("evictions are activity");
+        assert_eq!(snap.stray_intro_failures_evicted, 3);
+        assert!(metrics.take_snapshot().is_none(), "evictions must reset");
     }
 
     /// Bucket boundaries: each bound belongs to the bucket above it.
@@ -3315,16 +3357,15 @@ mod tests {
             "nat_attempts_connect_joiner",
             "nat_attempts_connect_acceptor",
             "nat_attempts_gateway",
-            "nat_attempts_cached_peer",
-            "nat_attempts_redial",
+            "nat_attempts_ring_peer_no_transport",
             "nat_established_connect_joiner",
             "nat_established_connect_acceptor",
             "nat_established_gateway",
-            "nat_established_cached_peer",
-            "nat_established_redial",
+            "nat_established_ring_peer_no_transport",
             "stray_intro_after_deadline",
             "stray_intro_same_ip_other_port",
             "stray_intro_other",
+            "stray_intro_failures_evicted",
             "dial_queue_wait_lt_100ms",
             "dial_queue_wait_lt_1s",
             "dial_queue_wait_lt_3s",

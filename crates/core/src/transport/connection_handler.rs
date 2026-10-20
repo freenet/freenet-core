@@ -489,15 +489,19 @@ impl<S: Socket> OutboundConnectionHandler<S> {
     }
 
     /// Connect with no node-level origin (tests, benchmarks); the attempt
-    /// is tagged [`NatAttemptOrigin::Redial`]. The node connects through
+    /// is tagged [`NatAttemptOrigin::RingPeerNoTransport`]. The node connects through
     /// [`super::OutboundConnector::connect`], which carries the real origin.
     pub async fn connect(
         &mut self,
         remote_public_key: TransportPublicKey,
         remote_addr: SocketAddr,
     ) -> Pin<Box<dyn Future<Output = Result<PeerConnection<S>, TransportError>> + Send>> {
-        self.connect_with_origin(remote_public_key, remote_addr, NatAttemptOrigin::Redial)
-            .await
+        self.connect_with_origin(
+            remote_public_key,
+            remote_addr,
+            NatAttemptOrigin::RingPeerNoTransport,
+        )
+        .await
     }
 
     /// `OutboundConnector::connect` calls this on a clone, so it must only
@@ -735,7 +739,7 @@ impl<S: Socket> OutboundConnectionHandler<S, crate::simulation::VirtualTime> {
     }
 
     /// Connect to a remote peer using VirtualTime. Tagged
-    /// [`NatAttemptOrigin::Redial`], like the real-time inherent `connect`.
+    /// [`NatAttemptOrigin::RingPeerNoTransport`], like the real-time inherent `connect`.
     pub async fn connect(
         &mut self,
         remote_public_key: TransportPublicKey,
@@ -765,7 +769,7 @@ impl<S: Socket> OutboundConnectionHandler<S, crate::simulation::VirtualTime> {
                 ConnectionEvent::ConnectionStart {
                     remote_public_key,
                     open_connection,
-                    origin: NatAttemptOrigin::Redial,
+                    origin: NatAttemptOrigin::RingPeerNoTransport,
                 },
             ))
             .await
@@ -1944,18 +1948,23 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                             let flags = observed.flags();
                             let kind = classify_nat_failure(&error, flags);
                             type O = NatAttemptObservation;
+                            let seen = crate::transport::metrics::NatAttemptSeen {
+                                received_any: flags & O::RECEIVED != 0,
+                                decrypted_any: flags & O::DECRYPTED != 0,
+                                deadline_reached: flags & O::DEADLINE != 0,
+                            };
                             crate::transport::TRANSPORT_METRICS.record_nat_failure(
                                 remote_addr,
                                 kind,
-                                crate::transport::metrics::NatAttemptSeen {
-                                    received_any: flags & O::RECEIVED != 0,
-                                    decrypted_any: flags & O::DECRYPTED != 0,
-                                    deadline_reached: flags & O::DEADLINE != 0,
-                                },
+                                seen,
                                 origin,
                             );
-                            self.recent_traversal_failures
-                                .record(remote_addr, self.time_source.now_nanos());
+                            self.recent_traversal_failures.record_failure(
+                                remote_addr,
+                                seen,
+                                self.time_source.now_nanos(),
+                                &crate::transport::TRANSPORT_METRICS,
+                            );
                             match &error {
                                 TransportError::ProtocolVersionMismatch { .. } => {
                                     tracing::warn!(%error);
@@ -4987,7 +4996,7 @@ pub mod mock_transport {
             .connect_with_origin(
                 TransportKeypair::new().public().clone(),
                 target,
-                NatAttemptOrigin::Redial,
+                NatAttemptOrigin::RingPeerNoTransport,
             )
             .await;
         wait_until("the traversal is admitted", || {

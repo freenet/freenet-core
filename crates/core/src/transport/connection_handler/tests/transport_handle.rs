@@ -73,7 +73,7 @@ async fn udp_handle_shares_one_expected_ip_set_and_reports_the_listener() {
         .connect(
             TransportKeypair::new().public().clone(),
             outbound_addr,
-            NatAttemptOrigin::Redial,
+            NatAttemptOrigin::RingPeerNoTransport,
         )
         .await;
     assert!(expected.contains(&outbound_addr.ip()), "connect");

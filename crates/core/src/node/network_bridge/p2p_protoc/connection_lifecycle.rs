@@ -1657,7 +1657,7 @@ mod dial_origin_tests {
     fn a_marked_gateway_dial_is_a_gateway_dial() {
         let addr: SocketAddr = "198.51.100.4:9".parse().unwrap();
         assert_eq!(
-            dial_origin(NatAttemptOrigin::Redial, true, addr, &[]),
+            dial_origin(NatAttemptOrigin::RingPeerNoTransport, true, addr, &[]),
             NatAttemptOrigin::Gateway
         );
     }
