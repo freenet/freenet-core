@@ -347,56 +347,8 @@ impl ReportCommand {
     }
 
     fn print_summary(&self, report: &DiagnosticReport) {
-        println!(
-            "  - Version: {} ({}{})",
-            report.version_info.version,
-            report.version_info.git_commit,
-            if report.version_info.git_dirty {
-                " dirty"
-            } else {
-                ""
-            }
-        );
-        println!(
-            "  - OS: {} {}",
-            report.system_info.os, report.system_info.arch
-        );
-
-        let filtered_size = report.logs.main_log_size_bytes + report.logs.error_log_size_bytes;
-        let original_size =
-            report.logs.main_log_original_size_bytes + report.logs.error_log_original_size_bytes;
-        if original_size > filtered_size && filtered_size > 0 {
-            println!(
-                "  - Logs: {} (last {} min, {} total on disk)",
-                format_bytes(filtered_size),
-                LOG_RETENTION_MINUTES,
-                format_bytes(original_size)
-            );
-        } else {
-            println!("  - Logs: {}", format_bytes(original_size));
-        }
-        if let Some(wrapper) = &report.logs.wrapper_log {
-            println!(
-                "  - Service wrapper log: {}",
-                format_bytes(wrapper.len() as u64)
-            );
-        }
-
-        println!(
-            "  - Config: {}",
-            if report.config.is_some() {
-                "found"
-            } else {
-                "not found"
-            }
-        );
-        match (&report.network_status, &report.network_status_error) {
-            (Some(_), _) => println!("  - Node status: running"),
-            (None, Some(err)) => println!("  - Node status: unreachable ({err})"),
-            (None, None) => println!("  - Node status: not running or unreachable"),
-        }
-        if let Some(status) = &report.auto_update_status {
-            println!("  - Auto-update: {status}");
+        for line in summary_lines(report) {
+            println!("{line}");
         }
     }
 
@@ -490,6 +442,63 @@ impl ReportCommand {
 
 /// Context for a failed send, with the trust summary only when it explains the
 /// failure (see `OsTrustSummary::explaining`).
+/// The summary `freenet service report` prints before uploading.
+fn summary_lines(report: &DiagnosticReport) -> Vec<String> {
+    let mut lines = Vec::new();
+    lines.push(format!(
+        "  - Version: {} ({}{})",
+        report.version_info.version,
+        report.version_info.git_commit,
+        if report.version_info.git_dirty {
+            " dirty"
+        } else {
+            ""
+        }
+    ));
+    lines.push(format!(
+        "  - OS: {} {}",
+        report.system_info.os, report.system_info.arch
+    ));
+
+    let filtered_size = report.logs.main_log_size_bytes + report.logs.error_log_size_bytes;
+    let original_size =
+        report.logs.main_log_original_size_bytes + report.logs.error_log_original_size_bytes;
+    if original_size > filtered_size && filtered_size > 0 {
+        lines.push(format!(
+            "  - Logs: {} (last {} min, {} total on disk)",
+            format_bytes(filtered_size),
+            LOG_RETENTION_MINUTES,
+            format_bytes(original_size)
+        ));
+    } else {
+        lines.push(format!("  - Logs: {}", format_bytes(original_size)));
+    }
+    if let Some(wrapper) = &report.logs.wrapper_log {
+        lines.push(format!(
+            "  - Service wrapper log: {}",
+            format_bytes(wrapper.len() as u64)
+        ));
+    }
+
+    lines.push(format!(
+        "  - Config: {}",
+        if report.config.is_some() {
+            "found"
+        } else {
+            "not found"
+        }
+    ));
+    match (&report.network_status, &report.network_status_error) {
+        (Some(_), _) => lines.push("  - Node status: running".to_string()),
+        (None, Some(err)) => lines.push(format!("  - Node status: unreachable ({err})")),
+        (None, None) => lines.push("  - Node status: not running or unreachable".to_string()),
+    }
+    if let Some(status) = &report.auto_update_status {
+        lines.push(format!("  - Auto-update: {status}"));
+    }
+    lines
+}
+
 fn upload_send_error(error: reqwest::Error, os_trust: &OsTrustSummary) -> anyhow::Error {
     let message = upload_failure_message(os_trust.explaining(&error));
     anyhow::Error::new(error).context(message)
@@ -1953,22 +1962,37 @@ stack backtrace:
     /// none, and printed in the summary.
     #[test]
     fn the_report_carries_the_auto_update_status() {
+        // Gathered by collect_report from the record for this binary's
+        // version, and put in the report. Bounded to that method, so a match
+        // elsewhere in the file (this test's own text included) cannot count.
         let src = include_str!("report.rs").replace("\r\n", "\n");
-        let production = src
-            .split_once(concat!("#[cfg(test)]\n", "mod tests {"))
-            .unwrap()
-            .0;
-        let flat: String = production.split_whitespace().collect();
+        let collect = item_code(&src, "    fn collect_report(", "\n    }\n");
         assert!(
-            flat.contains(
+            collect.contains(
                 "letauto_update_status=super::rollback::update_cooldown_summary(version);"
-            )
+            ),
+            "{collect}"
         );
-        assert!(flat.contains("network_status_error,auto_update_status,user_message,})"));
-        assert!(flat.contains(
-            "ifletSome(status)=&report.auto_update_status{println!(\"-Auto-update:{status}\");}"
-        ));
+        assert!(collect.contains("network_status_error,auto_update_status,user_message,})"));
+        // Printed in the summary: behaviour, not source.
         let mut report = sample_report();
+        assert!(
+            !summary_lines(&report)
+                .iter()
+                .any(|line| line.contains("Auto-update"))
+        );
+        report.auto_update_status = Some("Update to 0.2.141 failed 1 time(s)".into());
+        assert_eq!(
+            summary_lines(&report).last().map(String::as_str),
+            Some("  - Auto-update: Update to 0.2.141 failed 1 time(s)")
+        );
+        report.auto_update_status = None;
+        let src = include_str!("report.rs").replace("\r\n", "\n");
+        let print = item_code(&src, "    fn print_summary(", "\n    }\n");
+        assert!(
+            print.contains("forlineinsummary_lines(report){println!(\"{line}\");}"),
+            "{print}"
+        );
         assert!(
             !serde_json::to_string(&report)
                 .unwrap()

@@ -2552,8 +2552,8 @@ fi
 # must directly follow `tracing::info!(` -- below INFO they are compiled out of
 # release builds -- and INSTALLED_STAGED is an unconditional stderr write in
 # update.rs. RATE_LIMITED is GithubRateLimitedError's Display. STAGE_FAILED is
-# pinned once per arm that emits it (the permanent failure that exits and the
-# transient one that stays, #5799), each by its own suffix: a single pin on the
+# pinned once per arm that emits it (the permanent failure that exits, and the
+# three causes of a transient one that stays, #5799), each by its own suffix: a single pin on the
 # shared prefix was satisfied by either arm, so rewording one went unnoticed. Gate B arms on
 # STARTED and then requires the others; rewording one in the source silently
 # disarms it or fails every release. When rewording, keep the OLD string
@@ -2570,6 +2570,8 @@ for pin in \
     "staged|tracing::warn!(error=%e,\"${MARKER_STAGE_UNRESOLVED//[[:space:]]/}" \
     "staged|error=%format!(\"{e:#}\"),\"${MARKER_STAGE_FAILED//[[:space:]]/};exitinganyway,theupdaterwilldownloadwhatismissing" \
     "staged|error=%format!(\"{e:#}\"),\"${MARKER_STAGE_FAILED//[[:space:]]/};GitHubcouldnotbereachedforit(#5799)" \
+    "staged|error=%format!(\"{e:#}\"),\"${MARKER_STAGE_FAILED//[[:space:]]/};GitHubrate-limitedthedownload(#5799)" \
+    "staged|error=%format!(\"{e:#}\"),\"${MARKER_STAGE_FAILED//[[:space:]]/};today'sdownloadbudgetforitisspent(#5799)" \
     "update|writeln!(io::stderr(),\"Installing{}${MARKER_INSTALLED_STAGED//[[:space:]]/}" \
     "auto_update|\"${MARKER_RATE_LIMITED//[[:space:]]/}"; do
     file="${pin%%|*}" needle="${pin#*|}"

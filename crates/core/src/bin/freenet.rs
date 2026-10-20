@@ -2836,6 +2836,39 @@ mod tests {
     /// searched token (addresses the "passes with commented-out code" brittleness
     /// the Codex review flagged). Crude but sufficient: we only feed it our own
     /// source and never have `//` inside a string literal on the matched lines.
+    /// The body of the column-0 free function whose definition starts with
+    /// `signature`, ending at its closing brace (the first `\n}\n`). Refuses,
+    /// rather than widening silently, a signature matched inside the test
+    /// module (where a pin's own literal would satisfy it), an indented one
+    /// (a method, whose `\n}\n` is the enclosing impl's), and a region that
+    /// escaped into the test module. The pattern of `commands::auto_update`'s
+    /// tests, as AGENTS.md asks of every source-scrape pin.
+    fn fn_body<'a>(src: &'a str, signature: &str) -> &'a str {
+        let at = src
+            .find(signature)
+            .unwrap_or_else(|| panic!("definition not found: {signature}"));
+        let tests_at = src
+            .find("\n#[cfg(test)]\nmod ")
+            .map(|i| i + 1)
+            .expect("test module not located; this guard cannot verify anything");
+        assert!(
+            at < tests_at,
+            "`{signature}` matched inside the test module"
+        );
+        assert!(
+            at == 0 || src.as_bytes()[at - 1] == b'\n',
+            "fn_body only supports column-0 free functions; `{signature}` is indented"
+        );
+        let (body, _) = src[at + signature.len()..]
+            .split_once("\n}\n")
+            .unwrap_or_else(|| panic!("could not locate end of: {signature}"));
+        assert!(
+            !body.contains("\n#[cfg(test)]\nmod "),
+            "region for `{signature}` escaped into the test module"
+        );
+        body
+    }
+
     fn strip_line_comments(src: &str) -> String {
         src.lines()
             .map(|line| line.split_once("//").map(|(code, _)| code).unwrap_or(line))
@@ -2959,19 +2992,22 @@ mod tests {
             "expected the 7 update trigger sites in freenet.rs"
         );
         // Stale staged releases are cleared once auto-update is known to be on,
-        // before the startup check can stage a new one.
-        let cleanup = production
+        // before the startup check can stage a new one. Bounded to the
+        // function that runs the update task, so these anchors cannot be
+        // satisfied anywhere else in the file.
+        let task = fn_body(&src, "async fn run_network_node_with_signals(");
+        let cleanup = task
             .find("commands::update::discard_stale_staged(build_info::VERSION);")
             .expect("the update task must clear stale staged releases (#5790)");
-        let disabled_return = production
+        let disabled_return = task
             .find("std::future::pending::<()>().await;")
             .expect("auto-update-disabled branch not found");
-        let startup_check = production
+        let startup_check = task
             .find("let cooling = commands::rollback::update_cooldown_pending(build_info::VERSION);")
             .expect("startup update check not found");
         // The temp sweep (#5799) runs whether or not auto-update is on: the
         // crash-loop rollback records it cleans up are written either way.
-        let sweep = production
+        let sweep = task
             .find("commands::rollback::sweep_stale_atomic_temps();")
             .expect("the update task must sweep stale atomic-write temporaries");
         assert!(sweep < disabled_return);

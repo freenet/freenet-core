@@ -844,7 +844,7 @@ expect_rc "$rc" 1 "Gate B does not excuse a failed staging because of an unrelat
 # #5799: a previous release that contains it stays on its version when staging
 # cannot reach GitHub, so the canary's timeout stops it (exit 124) instead of
 # it exiting 42. Wording as the new release logs it.
-STAGE_LIMITED_STAYED='WARN freenet::commands::update::staged: Could not download the update in advance; GitHub could not be reached for it (#5799) tag=v0.2.122 error=GitHub rate-limited this IP'
+STAGE_LIMITED_STAYED='WARN freenet::commands::update::staged: Could not download the update in advance; GitHub rate-limited the download (#5799) tag=v0.2.122 error=GitHub rate-limited this IP'
 STAGE_FAILED_STAYED='WARN freenet::commands::update::staged: Could not download the update in advance; GitHub could not be reached for it (#5799) tag=v0.2.122 error=Download failed: 500'
 STAGE_TAG_LIMITED_STAYED='WARN freenet::commands::update::staged: Could not resolve the release to download in advance; staying on the current version (#5799) error=GitHub rate-limited this IP; retrying in 900s'
 

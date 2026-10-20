@@ -158,6 +158,23 @@ impl std::fmt::Display for BudgetSpent {
 
 impl std::error::Error for BudgetSpent {}
 
+/// A staging run did not finish within its deadline ([`STAGE_DEADLINE`]). A
+/// partial download survives it, so the next attempt resumes.
+#[derive(Debug)]
+struct StageTimedOut(Duration);
+
+impl std::fmt::Display for StageTimedOut {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the download did not finish within {} minutes",
+            self.0.as_secs() / 60
+        )
+    }
+}
+
+impl std::error::Error for StageTimedOut {}
+
 /// Counts the archive bytes a staging run receives against what is left of
 /// the release's daily budget (`rollback::STAGED_DOWNLOAD_BYTES_PER_DAY`).
 struct ByteMeter {
@@ -807,11 +824,26 @@ where
     }
 }
 
-/// Whether the freenet archive of `tag` is in the cache with its manifest,
-/// which is written only once that archive has verified.
-fn freenet_archive_staged(root: &Path, tag: &str) -> bool {
-    tag_dir(root, tag)
-        .is_ok_and(|dir| dir.join(MANIFEST).is_file() && dir.join(freenet_asset_name()).is_file())
+/// Whether the freenet archive of `tag` is in the cache and matches the
+/// checksum its cached manifest lists. Existence is not enough: a power loss
+/// can leave a zero-length or truncated file behind a rename that reached the
+/// disk before its data did. (The installer still verifies the manifest's
+/// signature before it installs anything; this decides only whether to skip
+/// the download budget and whether an fdev failure may still exit to install.)
+async fn freenet_archive_staged(root: &Path, tag: &str) -> bool {
+    let Ok(dir) = tag_dir(root, tag) else {
+        return false;
+    };
+    let Ok(manifest) = fs::read(dir.join(MANIFEST)) else {
+        return false;
+    };
+    let checksums = Checksums::parse(&String::from_utf8_lossy(&manifest));
+    let freenet = freenet_asset_name();
+    let Ok(expected) = super::required_checksum(Some(&checksums), &freenet) else {
+        return false;
+    };
+    let expected = expected.to_string();
+    verify_file(&dir.join(&freenet), &expected).await.is_ok()
 }
 
 /// Everything environmental [`stage_into`] depends on besides the cache root
@@ -891,7 +923,7 @@ where
         super::super::rollback::staged_download_bytes_at(dir, version, clock())
     });
     let meter = ByteMeter::new(env.byte_budget.saturating_sub(spent));
-    if meter.check().is_err() && !freenet_archive_staged(root, &tag) {
+    if meter.check().is_err() && !freenet_archive_staged(root, &tag).await {
         tracing::warn!(
             tag = %tag,
             spent_mib = spent / (1024 * 1024),
@@ -940,37 +972,72 @@ where
                 clock(),
             );
         }
-        StageOutcome::Failed(e) => {
-            // A rate limit on the asset downloads is NOT recorded as a GitHub
-            // cooldown: the updater would honour that and refuse to install at
-            // all. It is a failure of THIS release instead, which only the
-            // node's own triggers consult.
-            tracing::warn!(
-                tag = %tag,
-                error = %format!("{e:#}"),
-                "Could not download the update in advance; GitHub could not be reached for it (#5799)"
-            );
-            e
-        }
-        StageOutcome::TimedOut => {
-            tracing::warn!(
-                tag = %tag,
-                deadline_secs = env.deadline.as_secs(),
-                "Downloading the update in advance timed out; a later attempt resumes the partial download (#5799)"
-            );
-            anyhow::anyhow!(
-                "the download did not finish within {} minutes",
-                env.deadline.as_secs() / 60
-            )
-        }
+        // A rate limit on the asset downloads is NOT recorded as a GitHub
+        // cooldown: the updater would honour that and refuse to install at
+        // all. It is a failure of THIS release instead, which only the node's
+        // own triggers consult.
+        StageOutcome::Failed(e) => e,
+        StageOutcome::TimedOut => StageTimedOut(env.deadline).into(),
     };
     // #5791's rule: an fdev failure never costs the freenet archive. When
     // freenet is staged, exit to install it; the updater downloads fdev.
-    if freenet_archive_staged(root, &tag) {
-        tracing::info!(tag = %tag, "The freenet archive is downloaded and verified; exiting to install it, fdev will be downloaded by the updater");
+    // Checked before anything is logged, so this path never reports a
+    // download failure for a release it is about to install.
+    if freenet_archive_staged(root, &tag).await {
+        tracing::info!(tag = %tag, error = %format!("{error:#}"), "The freenet archive is downloaded and verified; exiting to install it, fdev will be downloaded by the updater");
         return exit_after_recording(root, version, INSTALL_PENDING, Staging::Staged, clock());
     }
+    log_transient_failure(&tag, &error);
     after_transient_failure(root, version, &format!("{error:#}"), clock())
+}
+
+/// Why a staging run that stays failed, for its log line.
+#[derive(Debug, PartialEq, Eq)]
+enum FailureCause {
+    TimedOut(Duration),
+    BudgetSpent,
+    RateLimited,
+    Unreachable,
+}
+
+fn failure_cause(e: &anyhow::Error) -> FailureCause {
+    if let Some(StageTimedOut(deadline)) = e.downcast_ref::<StageTimedOut>() {
+        FailureCause::TimedOut(*deadline)
+    } else if e.downcast_ref::<BudgetSpent>().is_some() {
+        FailureCause::BudgetSpent
+    } else if e.downcast_ref::<GithubRateLimitedError>().is_some() {
+        FailureCause::RateLimited
+    } else {
+        FailureCause::Unreachable
+    }
+}
+
+/// Say why a staging run that stays failed. Every download line starts with
+/// the same phrase, which the release canary (Gate B) reads, and names its
+/// cause after it; the canary's source pins check each literal.
+fn log_transient_failure(tag: &str, e: &anyhow::Error) {
+    match failure_cause(e) {
+        FailureCause::TimedOut(deadline) => tracing::warn!(
+            tag = %tag,
+            deadline_secs = deadline.as_secs(),
+            "Downloading the update in advance timed out; a later attempt resumes the partial download (#5799)"
+        ),
+        FailureCause::BudgetSpent => tracing::warn!(
+            tag = %tag,
+            error = %format!("{e:#}"),
+            "Could not download the update in advance; today's download budget for it is spent (#5799)"
+        ),
+        FailureCause::RateLimited => tracing::warn!(
+            tag = %tag,
+            error = %format!("{e:#}"),
+            "Could not download the update in advance; GitHub rate-limited the download (#5799)"
+        ),
+        FailureCause::Unreachable => tracing::warn!(
+            tag = %tag,
+            error = %format!("{e:#}"),
+            "Could not download the update in advance; GitHub could not be reached for it (#5799)"
+        ),
+    }
 }
 
 /// Whether `tag` is a release worth downloading: newer than this binary, and
@@ -3002,6 +3069,67 @@ mod tests {
             stage_once(&root, &server.url_str("/"), STAGE_DEADLINE).await,
             Staging::Staged
         );
+    }
+
+    /// #5799 review: a staging run that stays names the real cause, not
+    /// "GitHub could not be reached" for all of them, and the fdev-only path
+    /// (which exits to install) checks for the staged freenet archive before
+    /// anything is logged, so it never reports a failure.
+    #[test]
+    fn a_failed_run_names_its_cause() {
+        let hour = Duration::from_secs(3600);
+        let limited = anyhow::Error::new(GithubRateLimitedError { retry_after: None })
+            .context("Failed to download file");
+        for (e, cause) in [
+            (StageTimedOut(hour).into(), FailureCause::TimedOut(hour)),
+            (
+                anyhow::Error::new(BudgetSpent).context("Failed to download fdev"),
+                FailureCause::BudgetSpent,
+            ),
+            (limited, FailureCause::RateLimited),
+            (
+                anyhow::anyhow!("Download failed: 500"),
+                FailureCause::Unreachable,
+            ),
+        ] {
+            assert_eq!(failure_cause(&e), cause, "{e:#}");
+        }
+        let src = include_str!("staged.rs").replace("\r\n", "\n");
+        let production = src
+            .split_once(concat!("#[cfg(test)]\n", "mod tests {"))
+            .unwrap()
+            .0;
+        let start = production.find("\nasync fn stage_into<").unwrap();
+        let body = &production[start..];
+        let body = &body[..body.find("\n}\n").unwrap()];
+        let staged = body
+            .rfind("if freenet_archive_staged(root, &tag).await {")
+            .expect("the fdev-only exit");
+        let logged = body
+            .find("log_transient_failure(&tag, &error);")
+            .expect("the failure line");
+        assert!(
+            staged < logged,
+            "checked for a staged archive before logging"
+        );
+    }
+
+    /// #5799 review: a staged archive is one whose bytes match the cached
+    /// manifest, not merely a file that exists.
+    #[tokio::test]
+    async fn a_staged_archive_must_match_its_manifest() {
+        let freenet = freenet_asset_name();
+        let manifest = manifest_for(&[(&freenet, b"archive")]);
+        let (_tmp, root) = test_root();
+        for (case, bytes, manifest, staged) in [
+            ("zero-length", &b""[..], manifest.as_bytes(), false),
+            ("truncated", &b"arch"[..], manifest.as_bytes(), false),
+            ("empty manifest", &b"archive"[..], &b""[..], false),
+            ("complete", &b"archive"[..], manifest.as_bytes(), true),
+        ] {
+            write_staged(&root, &[(MANIFEST, manifest), (&freenet, bytes)]);
+            assert_eq!(freenet_archive_staged(&root, TAG).await, staged, "{case}");
+        }
     }
 
     /// The install that stages nothing (a macOS app bundle) records before its
