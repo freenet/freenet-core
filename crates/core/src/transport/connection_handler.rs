@@ -1931,7 +1931,7 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                             ) {
                                 tracing::info!(peer_addr = %remote_addr, "NAT traversal connection established");
                                 crate::transport::TRANSPORT_METRICS
-                                    .record_nat_traversal_established(origin);
+                                    .record_nat_traversal_established(remote_addr, origin);
                                 if result_sender.send(Ok(outbound_remote_conn)).is_err() {
                                     tracing::debug!(peer_addr = %remote_addr, "NAT traversal result receiver already dropped");
                                 }
@@ -1945,15 +1945,15 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                             let kind = classify_nat_failure(&error, flags);
                             type O = NatAttemptObservation;
                             crate::transport::TRANSPORT_METRICS.record_nat_failure(
+                                remote_addr,
                                 kind,
-                                flags & O::RECEIVED != 0,
-                                flags & O::DECRYPTED != 0,
-                                flags & O::DEADLINE != 0,
+                                crate::transport::metrics::NatAttemptSeen {
+                                    received_any: flags & O::RECEIVED != 0,
+                                    decrypted_any: flags & O::DECRYPTED != 0,
+                                    deadline_reached: flags & O::DEADLINE != 0,
+                                },
                                 origin,
                             );
-                            #[cfg(test)]
-                            crate::transport::TRANSPORT_METRICS
-                                .note_nat_failure_remote(remote_addr, kind, origin);
                             self.recent_traversal_failures
                                 .record(remote_addr, self.time_source.now_nanos());
                             match &error {
@@ -2020,9 +2020,7 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                     // Admitted: a traversal task is now spawned and will emit
                     // exactly one established/failed outcome. Count the attempt
                     // here so the denominator matches the outcomes.
-                    crate::transport::TRANSPORT_METRICS.record_nat_traversal_attempt(origin);
-                    #[cfg(test)]
-                    crate::transport::TRANSPORT_METRICS.note_nat_attempt_remote(remote_addr, origin);
+                    crate::transport::TRANSPORT_METRICS.record_nat_traversal_attempt(remote_addr, origin);
 
                     self.expected_non_gateway.insert(remote_addr.ip());
                     let task = GlobalExecutor::spawn(ongoing_connection
@@ -2058,9 +2056,7 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                 .failed_recently(remote_addr, now_nanos),
             self.connections.has_nat_traversal_to_ip(remote_addr.ip()),
         );
-        crate::transport::TRANSPORT_METRICS.record_stray_intro(kind);
-        #[cfg(test)]
-        crate::transport::TRANSPORT_METRICS.note_stray_intro_remote(remote_addr, kind);
+        crate::transport::TRANSPORT_METRICS.record_stray_intro(remote_addr, kind);
     }
 
     /// Effective floor for emitting the version-carrying ack (#5161): the
@@ -4896,6 +4892,52 @@ pub mod mock_transport {
         assert_eq!(
             metrics.nat_failure_origins_for(silent_addr),
             vec![NatAttemptOrigin::ConnectAcceptor]
+        );
+        Ok(())
+    }
+
+    /// Through the real handler path: when both sides punch, each records
+    /// the attempt and its establishment under the origin it dialled with.
+    #[tokio::test]
+    async fn established_traversal_is_recorded_under_its_origin() -> anyhow::Result<()> {
+        use crate::transport::metrics::NatAttemptOrigin;
+        let channels = Arc::new(DashMap::new());
+        let (a_pub, mut a, a_addr) = create_mock_peer(Default::default(), channels.clone()).await?;
+        let (b_pub, mut b, b_addr) = create_mock_peer(Default::default(), channels).await?;
+        let to_a = GlobalExecutor::spawn(async move {
+            let conn = b
+                .connect_with_origin(a_pub, a_addr, NatAttemptOrigin::ConnectAcceptor)
+                .await;
+            let conn = tokio::time::timeout(Duration::from_secs(30), conn).await??;
+            Ok::<_, anyhow::Error>(conn)
+        });
+        let to_b = GlobalExecutor::spawn(async move {
+            let conn = a
+                .connect_with_origin(b_pub, b_addr, NatAttemptOrigin::ConnectJoiner)
+                .await;
+            let conn = tokio::time::timeout(Duration::from_secs(30), conn).await??;
+            Ok::<_, anyhow::Error>(conn)
+        });
+        let (x, y) = tokio::try_join!(to_a, to_b)?;
+        // Held until both sides have established.
+        let (_x, _y) = (x?, y?);
+        let metrics = &crate::transport::TRANSPORT_METRICS;
+        // Each attempt is logged under its remote: B dialled A, A dialled B.
+        assert_eq!(
+            metrics.nat_attempt_origins_for(a_addr),
+            vec![NatAttemptOrigin::ConnectAcceptor]
+        );
+        assert_eq!(
+            metrics.nat_established_origins_for(a_addr),
+            vec![NatAttemptOrigin::ConnectAcceptor]
+        );
+        assert_eq!(
+            metrics.nat_attempt_origins_for(b_addr),
+            vec![NatAttemptOrigin::ConnectJoiner]
+        );
+        assert_eq!(
+            metrics.nat_established_origins_for(b_addr),
+            vec![NatAttemptOrigin::ConnectJoiner]
         );
         Ok(())
     }

@@ -943,9 +943,7 @@ async fn begin_acceptor_dial(
     // The acceptor started punching when it accepted, before its Response
     // reached us; time spent queued here comes out of its 3 s window.
     let queued_for = answered_at.elapsed();
-    crate::transport::TRANSPORT_METRICS.record_dial_queue_wait(queued_for);
-    #[cfg(test)]
-    crate::transport::TRANSPORT_METRICS.note_dial_queue_wait(acceptor_addr, queued_for);
+    crate::transport::TRANSPORT_METRICS.record_dial_queue_wait(acceptor_addr, queued_for);
     op_manager
         .notify_node_event(NodeEvent::ExpectPeerConnection {
             addr: acceptor_addr,
