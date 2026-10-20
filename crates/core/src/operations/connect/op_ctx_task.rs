@@ -2839,6 +2839,8 @@ mod driver_timing_tests {
         max_in_flight: usize,
         /// Acceptors the driver reported to the gateway as failed.
         connect_failed: Vec<SocketAddr>,
+        /// The origin each dial was tagged with.
+        origins: Vec<crate::transport::NatAttemptOrigin>,
     }
 
     /// Plays the event loop: every dial takes the NAT traversal deadline and
@@ -2855,12 +2857,18 @@ mod driver_timing_tests {
             use std::sync::atomic::Ordering::SeqCst;
             while let Some(event) = events.recv().await {
                 match event {
-                    Either::Right(NodeEvent::ConnectPeer { peer, callback, .. }) => {
+                    Either::Right(NodeEvent::ConnectPeer {
+                        peer,
+                        callback,
+                        origin,
+                        ..
+                    }) => {
                         let addr = peer.socket_addr().expect("acceptor address");
                         let now_in_flight = in_flight.fetch_add(1, SeqCst) + 1;
                         {
                             let mut log = shared.lock();
                             log.dials.push((addr, t0.elapsed()));
+                            log.origins.push(origin);
                             log.max_in_flight = log.max_in_flight.max(now_in_flight);
                         }
                         let ok = !unreachable.contains(&addr);
@@ -2944,6 +2952,29 @@ mod driver_timing_tests {
         );
     }
 
+    /// An acceptor's punch towards the joiner it accepted is tagged
+    /// `ConnectAcceptor`.
+    #[tokio::test]
+    async fn an_acceptors_dial_to_its_joiner_is_tagged_connect_acceptor() {
+        let (op_manager, mut events) = op_manager_with_events("acceptor-origin").await;
+        let joiner = peer(24880);
+        let tx = Transaction::new::<ConnectMsg>();
+        super::super::dispatch_expect_connection_from(&op_manager, tx, joiner.clone())
+            .await
+            .expect("dispatch");
+        loop {
+            let event = tokio::time::timeout(Duration::from_secs(5), events.recv())
+                .await
+                .expect("a ConnectPeer is sent")
+                .expect("events open");
+            if let Either::Right(NodeEvent::ConnectPeer { peer, origin, .. }) = event {
+                assert_eq!(peer, joiner);
+                assert_eq!(origin, crate::transport::NatAttemptOrigin::ConnectAcceptor);
+                break;
+            }
+        }
+    }
+
     /// A peer that already has a connection (#5858 leaves it unchanged):
     /// acceptors are dialled one at a time, a failed one is reported to the
     /// gateway, and the CONNECT ends when `target_connections` acceptors have
@@ -3001,6 +3032,23 @@ mod driver_timing_tests {
         );
         assert_eq!(log.max_in_flight, 1, "a connected peer dials one at a time");
         assert_eq!(log.connect_failed, vec![bad.socket_addr().unwrap()]);
+        assert_eq!(
+            log.origins,
+            vec![crate::transport::NatAttemptOrigin::ConnectJoiner; 3],
+            "a joiner's acceptor dials are tagged ConnectJoiner"
+        );
+        // Each waited in the queue from its Response until the dial before
+        // it ended: `bad` at once, the others for one or two hole-punch
+        // deadlines (3 s each).
+        {
+            use crate::transport::metrics::DialQueueWait;
+            let waits = |p: &PeerKeyLocation| {
+                crate::transport::TRANSPORT_METRICS.dial_queue_waits_for(p.socket_addr().unwrap())
+            };
+            assert_eq!(waits(&bad), vec![DialQueueWait::Lt100Ms]);
+            assert_eq!(waits(&good), vec![DialQueueWait::Ge3S]);
+            assert_eq!(waits(&other), vec![DialQueueWait::Ge3S]);
+        }
         assert_success_recorded(&op_manager, gateway_addr, desired);
         drop(replies_tx);
     }

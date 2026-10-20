@@ -1659,6 +1659,49 @@ mod dial_origin_tests {
         );
     }
 
+    /// Source pin: `handle_connect_peer` applies `dial_origin` to the
+    /// origin it hands to the handshake driver (the event loop has no
+    /// harness here).
+    #[test]
+    fn handle_connect_peer_applies_dial_origin() {
+        const SOURCE: &str = include_str!("connection_lifecycle.rs");
+        let tests_at = SOURCE
+            .find("\n#[cfg(test)]\nmod dial_origin_tests")
+            .expect("test module");
+        let start = SOURCE
+            .find("pub(super) async fn handle_connect_peer(")
+            .expect("handle_connect_peer renamed");
+        assert!(start < tests_at, "the anchor must be production code");
+        let open = start
+            + SOURCE[start..]
+                .find(") -> anyhow::Result<()> {")
+                .expect("body")
+            + 24;
+        let (mut depth, mut end) = (0i32, open);
+        for (i, b) in SOURCE.bytes().enumerate().skip(open) {
+            match b {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = i;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        assert!(end > open && end < tests_at, "unbalanced body slice");
+        let code: String = SOURCE[open..end].split_whitespace().collect();
+        let applied = code
+            .find("letorigin=dial_origin(origin,transient,peer_addr,&self.gateways);")
+            .expect("handle_connect_peer must apply dial_origin");
+        let sent = code
+            .find("HandshakeCommand::Connect{peer:peer.clone(),transaction:tx,transient,origin,}")
+            .expect("the handshake command carries the origin");
+        assert!(applied < sent, "applied before it is sent");
+    }
+
     /// Any other dial keeps its origin, including one to another port of a
     /// gateway's IP.
     #[test]

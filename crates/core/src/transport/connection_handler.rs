@@ -4864,6 +4864,123 @@ pub mod mock_transport {
         Ok(())
     }
 
+    /// Polls `done` every 10 ms until it holds, failing after 10 s.
+    async fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while !done() {
+            assert!(tokio::time::Instant::now() < deadline, "timed out: {what}");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// Through the real handler path: the origin given to the connector is
+    /// the one the admitted attempt and its failure are recorded under.
+    #[tokio::test]
+    async fn nat_attempt_is_recorded_under_its_origin() -> anyhow::Result<()> {
+        use crate::transport::metrics::NatAttemptOrigin;
+        let channels = Arc::new(DashMap::new());
+        let (_peer_pub, mut peer, _peer_addr) =
+            create_mock_peer(Default::default(), channels).await?;
+        let silent_addr: SocketAddr = "10.255.0.10:9".parse().unwrap();
+        let silent_pub = TransportKeypair::new().public().clone();
+        let conn = peer
+            .connect_with_origin(silent_pub, silent_addr, NatAttemptOrigin::ConnectAcceptor)
+            .await;
+        let result = tokio::time::timeout(Duration::from_secs(30), conn).await?;
+        assert!(result.is_err(), "nobody answers");
+        let metrics = &crate::transport::TRANSPORT_METRICS;
+        assert_eq!(
+            metrics.nat_attempt_origins_for(silent_addr),
+            vec![NatAttemptOrigin::ConnectAcceptor]
+        );
+        assert_eq!(
+            metrics.nat_failure_origins_for(silent_addr),
+            vec![NatAttemptOrigin::ConnectAcceptor]
+        );
+        Ok(())
+    }
+
+    /// Through the real handler path at a non-gateway: an intro from an
+    /// unknown address is `Other`; one from another port of an IP being
+    /// punched is `SameIpOtherPort`; one from an address whose traversal
+    /// just failed is `AfterDeadline`. A non-intro packet is not counted.
+    /// Asserted per (unique) source address, so concurrent tests cannot
+    /// satisfy it.
+    #[tokio::test]
+    async fn stray_intros_at_a_non_gateway_are_classified() -> anyhow::Result<()> {
+        use crate::transport::crypto::PACKET_TYPE_INTRO;
+        use crate::transport::metrics::{NatAttemptOrigin, StrayIntro};
+        let channels: Channels = Arc::new(DashMap::new());
+        let (_peer_pub, mut peer, peer_addr) =
+            create_mock_peer(Default::default(), channels.clone()).await?;
+        let inject = |from: SocketAddr, first_byte: u8| {
+            let mut data = vec![0u8; 64];
+            data[0] = first_byte;
+            channels
+                .get(&peer_addr)
+                .expect("the peer's inbound channel")
+                .send(InboundPacket {
+                    from,
+                    data,
+                    available_at_nanos: 0,
+                    order: SEND_ORDER.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+                })
+                .expect("the peer is listening");
+        };
+        let metrics = &crate::transport::TRANSPORT_METRICS;
+        let unknown: SocketAddr = "10.255.1.1:7".parse().unwrap();
+        let not_intro: SocketAddr = "10.255.1.3:7".parse().unwrap();
+        let target: SocketAddr = "10.255.1.2:9".parse().unwrap();
+        let sibling: SocketAddr = "10.255.1.2:10".parse().unwrap();
+
+        inject(not_intro, 0x7f);
+        inject(unknown, PACKET_TYPE_INTRO);
+        wait_until("the unknown intro is counted", || {
+            !metrics.stray_intros_from(unknown).is_empty()
+        })
+        .await;
+
+        let conn = peer
+            .connect_with_origin(
+                TransportKeypair::new().public().clone(),
+                target,
+                NatAttemptOrigin::Redial,
+            )
+            .await;
+        wait_until("the traversal is admitted", || {
+            !metrics.nat_attempt_origins_for(target).is_empty()
+        })
+        .await;
+        inject(sibling, PACKET_TYPE_INTRO);
+        wait_until("the sibling intro is counted", || {
+            !metrics.stray_intros_from(sibling).is_empty()
+        })
+        .await;
+        let result = tokio::time::timeout(Duration::from_secs(30), conn).await?;
+        assert!(result.is_err(), "nobody answers, so the traversal fails");
+
+        inject(target, PACKET_TYPE_INTRO);
+        wait_until("the late intro is counted", || {
+            !metrics.stray_intros_from(target).is_empty()
+        })
+        .await;
+
+        assert_eq!(metrics.stray_intros_from(unknown), vec![StrayIntro::Other]);
+        assert_eq!(
+            metrics.stray_intros_from(sibling),
+            vec![StrayIntro::SameIpOtherPort]
+        );
+        assert_eq!(
+            metrics.stray_intros_from(target),
+            vec![StrayIntro::AfterDeadline]
+        );
+        assert!(
+            metrics.stray_intros_from(not_intro).is_empty(),
+            "only intro packets are counted"
+        );
+        Ok(())
+    }
+
     /// **The peer-to-peer half of #5161.** The version-carrying ack is not only
     /// a gateway mechanism: `traverse_nat`'s `RemoteInbound` arm sends an ack
     /// too, and the peer receiving it may have raced ahead to its own

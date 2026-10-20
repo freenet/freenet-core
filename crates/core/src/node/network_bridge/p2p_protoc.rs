@@ -4175,33 +4175,7 @@ pub(crate) mod tests {
     /// event loop, which has no harness here.
     #[test]
     fn the_resend_waiter_reports_only_a_message_it_did_not_send() {
-        const SOURCE: &str = include_str!("p2p_protoc.rs");
-        // Scoped to the event-loop function that holds both drop sites: a
-        // whole-file scrape could match these literals anywhere.
-        let signature = "async fn run_event_listener_with_transport(";
-        let start = SOURCE.find(signature).expect("event-loop function renamed");
-        let tests_at = SOURCE
-            .find("\n#[cfg(test)]\npub(crate) mod tests")
-            .expect("tests");
-        assert!(start < tests_at, "the anchor must be production code");
-        let open = start + SOURCE[start..].find('{').expect("function body");
-        let bytes = SOURCE.as_bytes();
-        let (mut depth, mut end) = (0i32, open);
-        for (i, b) in bytes.iter().enumerate().skip(open) {
-            match b {
-                b'{' => depth += 1,
-                b'}' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        end = i;
-                        break;
-                    }
-                }
-                _ => {}
-            }
-        }
-        assert!(end > open && end < tests_at, "unbalanced body slice");
-        let code: String = SOURCE[open..end].split_whitespace().collect();
+        let code = event_loop_code();
         let own = "&ctx.bridge.op_manager.ring.connection_manager.pub_key,";
         let notice = code
             .find(&format!(
@@ -4225,6 +4199,102 @@ pub(crate) mod tests {
             .expect("the full/closed branch must end an unsent CONNECT's driver");
         let cont = code[dropped..].find("continue;").expect("the branch ends");
         assert!(inline < cont, "before the branch moves on");
+    }
+
+    /// The event-loop function `run_event_listener_with_transport`, with all
+    /// whitespace removed. Scoped to that function: a whole-file scrape could
+    /// match a literal anywhere, including in these tests.
+    fn event_loop_code() -> String {
+        const SOURCE: &str = include_str!("p2p_protoc.rs");
+        let signature = "async fn run_event_listener_with_transport(";
+        let start = SOURCE.find(signature).expect("event-loop function renamed");
+        let tests_at = SOURCE
+            .find("\n#[cfg(test)]\npub(crate) mod tests")
+            .expect("tests");
+        assert!(start < tests_at, "the anchor must be production code");
+        let open = start + SOURCE[start..].find('{').expect("function body");
+        let bytes = SOURCE.as_bytes();
+        let (mut depth, mut end) = (0i32, open);
+        for (i, b) in bytes.iter().enumerate().skip(open) {
+            match b {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = i;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        assert!(end > open && end < tests_at, "unbalanced body slice");
+        SOURCE[open..end].split_whitespace().collect()
+    }
+
+    /// A message to a peer with no connection dials it as: a gateway, our
+    /// own CONNECT request (the cached-peer reconnect), or a re-dial.
+    #[test]
+    fn an_unconnected_dial_is_tagged_by_what_it_carries() {
+        use crate::message::{NetMessage, NetMessageV1, Transaction};
+        use crate::operations::connect::{ConnectMsg, prepare_join_request};
+        use crate::ring::{Location, PeerKeyLocation};
+        use crate::transport::{NatAttemptOrigin, TransportKeypair};
+
+        let peer = |port: u16| {
+            PeerKeyLocation::new(
+                TransportKeypair::new().public().clone(),
+                std::net::SocketAddr::from(([127, 0, 0, 1], port)),
+            )
+        };
+        let (me, other) = (peer(1), peer(4));
+        let tx = Transaction::new::<ConnectMsg>();
+        let wrap = |msg: ConnectMsg| NetMessage::V1(NetMessageV1::Connect(msg));
+        let own_request = wrap(prepare_join_request(
+            tx,
+            &me,
+            &peer(2),
+            Location::new(0.5),
+            10,
+            &[],
+        ));
+        let relayed = wrap(prepare_join_request(
+            tx,
+            &other,
+            &peer(2),
+            Location::new(0.5),
+            10,
+            &[],
+        ));
+        let observed = wrap(ConnectMsg::ObservedAddress {
+            id: tx,
+            address: std::net::SocketAddr::from(([127, 0, 0, 1], 3)),
+        });
+        let origin =
+            |is_gw, msg: &NetMessage| super::unconnected_dial_origin(is_gw, msg, me.pub_key());
+        assert_eq!(origin(false, &own_request), NatAttemptOrigin::CachedPeer);
+        assert_eq!(origin(false, &relayed), NatAttemptOrigin::Redial);
+        assert_eq!(origin(false, &observed), NatAttemptOrigin::Redial);
+        for msg in [&own_request, &relayed, &observed] {
+            assert_eq!(origin(true, msg), NatAttemptOrigin::Gateway);
+        }
+    }
+
+    /// Source pin: the event loop's dial for a message with no connection
+    /// is tagged by `unconnected_dial_origin` (the event loop has no harness
+    /// here). The call must be the `origin:` field of that `ConnectPeer`.
+    #[test]
+    fn the_unconnected_dial_uses_unconnected_dial_origin() {
+        let code = event_loop_code();
+        let dispatch = code
+            .find("P2pBridgeEvent::NodeAction(NodeEvent::ConnectPeer{peer:target_peer.clone(),tx,callback,is_gw,")
+            .expect("the unconnected-dial ConnectPeer");
+        assert!(
+            code[dispatch..].starts_with(
+                "P2pBridgeEvent::NodeAction(NodeEvent::ConnectPeer{peer:target_peer.clone(),tx,callback,is_gw,origin:unconnected_dial_origin(is_gw,&msg,&ctx.bridge.op_manager.ring.connection_manager.pub_key,),}),"
+            ),
+            "the dial's origin must come from unconnected_dial_origin"
+        );
     }
 
     /// A fake [`super::ContractPresenceOracle`] for testing

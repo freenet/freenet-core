@@ -17,3 +17,7 @@ mod inbound_acceptor;
 
 /// The UDP transport's `TransportHandle` and its listener liveness.
 mod transport_handle;
+
+/// `ConnectionStateManager::has_nat_traversal_to_ip`, which classifies stray
+/// intros.
+mod nat_traversal_by_ip;
