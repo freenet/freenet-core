@@ -37,10 +37,11 @@
 //! prevent one.
 //!
 //! Staging's GitHub traffic has a hard ceiling that does not depend on any of
-//! that: every request round spends a token from the node's persisted poll
-//! bucket (#4073), and a node starts at most
-//! `rollback::ARCHIVE_DOWNLOADS_PER_DAY` staging runs that download the
-//! release archive, per release per day.
+//! that: every staging run spends one token from the node's persisted poll
+//! bucket (#4073), and staging receives at most
+//! `rollback::STAGED_DOWNLOAD_BYTES_PER_DAY` bytes of one release's archives
+//! per day. A run the budget refuses counts as a failure, so the fallback
+//! still fires.
 
 use std::fs;
 use std::io::Write as _;
@@ -144,25 +145,71 @@ impl std::fmt::Display for AssetMissing {
 
 impl std::error::Error for AssetMissing {}
 
-/// The node's GitHub poll bucket is empty (#4073). Not retried: the bucket is
-/// what bounds staging's traffic.
+/// Today's download budget for the release is spent (#5799). Not retried: the
+/// budget is what bounds staging's bytes.
 #[derive(Debug)]
-struct PollBucketEmpty;
+struct BudgetSpent;
 
-impl std::fmt::Display for PollBucketEmpty {
+impl std::fmt::Display for BudgetSpent {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("the node's GitHub poll budget is spent; waiting for it to refill (#4073)")
+        f.write_str("today's download budget for this release is spent (#5799)")
     }
 }
 
-impl std::error::Error for PollBucketEmpty {}
+impl std::error::Error for BudgetSpent {}
 
-/// Whether another attempt could succeed. Everything is retried except three
+/// Counts the archive bytes a staging run receives against what is left of
+/// the release's daily budget (`rollback::STAGED_DOWNLOAD_BYTES_PER_DAY`).
+struct ByteMeter {
+    allowance: u64,
+    received: std::sync::atomic::AtomicU64,
+}
+
+impl ByteMeter {
+    fn new(allowance: u64) -> Self {
+        Self {
+            allowance,
+            received: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    #[cfg(test)]
+    fn unlimited() -> Self {
+        Self::new(u64::MAX)
+    }
+
+    fn received(&self) -> u64 {
+        self.received.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Refuse before a request when nothing is left.
+    fn check(&self) -> Result<()> {
+        if self.received() >= self.allowance {
+            return Err(BudgetSpent.into());
+        }
+        Ok(())
+    }
+
+    /// Count `n` bytes just received; an error once they pass the allowance.
+    fn spend(&self, n: usize) -> Result<()> {
+        let n = u64::try_from(n).unwrap_or(u64::MAX);
+        let total = self
+            .received
+            .fetch_add(n, std::sync::atomic::Ordering::Relaxed)
+            .saturating_add(n);
+        if total > self.allowance {
+            return Err(BudgetSpent.into());
+        }
+        Ok(())
+    }
+}
+
+/// Whether another attempt could succeed. Everything is retried except four
 /// failures that come back the same every time: a rate limit (retrying into it
-/// is what escalates it), a release that fails verification, and a cache that
-/// cannot be written.
+/// is what escalates it), a release that fails verification, a cache that
+/// cannot be written, and a spent download budget.
 fn worth_retrying(e: &anyhow::Error) -> bool {
-    e.downcast_ref::<PollBucketEmpty>().is_none()
+    e.downcast_ref::<BudgetSpent>().is_none()
         && e.downcast_ref::<GithubRateLimitedError>().is_none()
         && e.downcast_ref::<ReleaseVerificationError>().is_none()
         && e.downcast_ref::<CacheIoError>().is_none()
@@ -531,6 +578,7 @@ async fn stage_latest_release_inner(
         delays: &STAGE_RETRY_DELAYS,
         deadline: STAGE_DEADLINE,
         clock: &SystemTime::now,
+        byte_budget: super::super::rollback::STAGED_DOWNLOAD_BYTES_PER_DAY,
     };
     stage_into(
         &root,
@@ -560,8 +608,8 @@ enum Staging {
     Deferred,
     /// The release is cooling down; nothing was attempted. The node stays.
     CoolingDown,
-    /// The poll bucket or the daily download ceiling refused the attempt.
-    /// The node stays; no failure is counted.
+    /// The node's poll bucket was empty, so the run never reached the network.
+    /// The node stays, holding the release without counting a failure.
     Throttled,
     /// A failure after `FALLBACK_AFTER_FAILURES` in a row, or one that could
     /// not be recorded: exit so the updater tries its own download.
@@ -761,6 +809,9 @@ struct StageEnv<'a> {
     delays: &'a [Duration],
     deadline: Duration,
     clock: Clock<'a>,
+    /// Archive bytes per release per day; production passes
+    /// `rollback::STAGED_DOWNLOAD_BYTES_PER_DAY`.
+    byte_budget: u64,
 }
 
 /// Decide whether to stage and do it.
@@ -817,35 +868,40 @@ where
             );
         }
     };
-    // The hard ceiling (#5799): at most a few runs that download the archive,
-    // per release per day, whatever the cooldown decided.
-    let ceiling_allows = freenet_archive_staged(root, &tag)
-        || root.parent().is_none_or(|dir| {
-            super::super::rollback::take_archive_download_at(dir, version, clock())
-        });
-    if !ceiling_allows {
-        return throttled(
-            root,
-            Some(version),
-            "the daily ceiling on staged downloads is reached",
-            clock(),
+    // The hard ceiling on bytes (#5799), whatever the cooldown decided. A run
+    // it refuses counts as a failure, so the fallback keeps firing. The poll
+    // token this run spent above bounds its requests, retries included.
+    let spent = root.parent().map_or(0, |dir| {
+        super::super::rollback::staged_download_bytes_at(dir, version, clock())
+    });
+    let meter = ByteMeter::new(env.byte_budget.saturating_sub(spent));
+    if meter.check().is_err() && !freenet_archive_staged(root, &tag) {
+        tracing::warn!(
+            tag = %tag,
+            spent_mib = spent / (1024 * 1024),
+            "Not downloading the update in advance: today's download budget for it is spent (#5799)"
         );
+        return after_transient_failure(root, version, &BudgetSpent.to_string(), clock());
     }
 
     tracing::info!(tag = %tag, "Downloading the update before exiting, so the restart only has to install it");
     let started = tokio::time::Instant::now();
     let outcome = stage_within(
-        || async {
-            // Every request round spends a token, retries included.
-            if !spend_poll_token(root, clock()) {
-                return Err(PollBucketEmpty.into());
-            }
-            stage_release_at(root, env.download_prefix, &tag, env.verify).await
-        },
+        || stage_release_at(root, env.download_prefix, &tag, env.verify, &meter),
         env.delays,
         env.deadline,
     )
     .await;
+    // Whatever the outcome. A run killed before this line loses its count,
+    // at most one run's worth, since the meter stops a run at the budget.
+    if let Some(dir) = root.parent() {
+        super::super::rollback::add_staged_download_bytes_at(
+            dir,
+            version,
+            meter.received(),
+            clock(),
+        );
+    }
     let error = match outcome {
         StageOutcome::Staged => {
             tracing::info!(
@@ -897,14 +953,6 @@ where
     if freenet_archive_staged(root, &tag) {
         tracing::info!(tag = %tag, "The freenet archive is downloaded and verified; exiting to install it, fdev will be downloaded by the updater");
         return exit_after_recording(root, version, INSTALL_PENDING, Staging::Staged, clock());
-    }
-    if error.downcast_ref::<PollBucketEmpty>().is_some() {
-        return throttled(
-            root,
-            Some(version),
-            "the node's GitHub poll budget is spent (#4073)",
-            clock(),
-        );
     }
     after_transient_failure(root, version, &format!("{error:#}"), clock())
 }
@@ -984,6 +1032,7 @@ async fn stage_release_at(
     download_prefix: &str,
     tag: &str,
     verify: ManifestVerifier<'_>,
+    meter: &ByteMeter,
 ) -> Result<()> {
     let dir = tag_dir(root, tag)?;
     remove_other_tags(root, tag);
@@ -1001,7 +1050,7 @@ async fn stage_release_at(
     let checksums = Checksums::parse(&String::from_utf8_lossy(&manifest));
 
     let freenet = freenet_asset_name();
-    fetch_verified(&checksums, &url(&freenet), &dir, &freenet).await?;
+    fetch_verified(&checksums, &url(&freenet), &dir, &freenet, meter).await?;
 
     write_atomic(&dir.join(MANIFEST), &manifest)?;
     match signature {
@@ -1019,7 +1068,7 @@ async fn stage_release_at(
     // for, the updater's own fdev download can be killed by `TimeoutStopSec`.
     let fdev = fdev_asset_name();
     if checksums.get(&fdev).is_some() {
-        if let Err(e) = fetch_verified(&checksums, &url(&fdev), &dir, &fdev).await {
+        if let Err(e) = fetch_verified(&checksums, &url(&fdev), &dir, &fdev, meter).await {
             if worth_retrying(&e) && e.downcast_ref::<AssetMissing>().is_none() {
                 return Err(e.context("Failed to download fdev"));
             }
@@ -1029,14 +1078,20 @@ async fn stage_release_at(
     Ok(())
 }
 
-async fn fetch_verified(checksums: &Checksums, url: &str, dir: &Path, name: &str) -> Result<()> {
+async fn fetch_verified(
+    checksums: &Checksums,
+    url: &str,
+    dir: &Path,
+    name: &str,
+    meter: &ByteMeter,
+) -> Result<()> {
     let expected = super::required_checksum(Some(checksums), name)?.to_string();
     let dest = dir.join(name);
     if dest.exists() && verify_file(&dest, &expected).await.is_ok() {
         return Ok(());
     }
     let part = dir.join(format!("{name}.part"));
-    let resumed = download_resumable(url, &part).await?;
+    let resumed = download_resumable(url, &part, meter).await?;
     if let Err(e) = verify_file(&part, &expected).await {
         // Never keep bytes that cannot be right.
         remove_quietly(&part);
@@ -1045,7 +1100,7 @@ async fn fetch_verified(checksums: &Checksums, url: &str, dir: &Path, name: &str
         }
         // The bytes kept from an earlier attempt may belong to a different
         // upload of the asset. Start over once before calling the release bad.
-        download_resumable(url, &part).await?;
+        download_resumable(url, &part, meter).await?;
         if let Err(e) = verify_file(&part, &expected).await {
             remove_quietly(&part);
             return Err(e);
@@ -1071,14 +1126,17 @@ fn remove_quietly(path: &Path) {
 
 /// Download `url` into `part`, continuing from the bytes already there when
 /// the server honours a range request. Returns whether the result builds on
-/// bytes from an earlier attempt. Bounded by a stall timeout only: a slow
-/// transfer that keeps making progress is allowed to finish.
-async fn download_resumable(url: &str, part: &Path) -> Result<bool> {
+/// bytes from an earlier attempt. Bounded by a stall timeout and by `meter`,
+/// the release's download budget: a slow transfer that keeps making progress
+/// is allowed to finish, one that passes the budget is stopped (the bytes
+/// kept, so a later attempt resumes them).
+async fn download_resumable(url: &str, part: &Path, meter: &ByteMeter) -> Result<bool> {
     use futures::StreamExt;
     use reqwest::StatusCode;
     use reqwest::header::{CONTENT_RANGE, RANGE};
     use tokio::io::AsyncWriteExt;
 
+    meter.check()?;
     let have = fs::metadata(part).map(|m| m.len()).unwrap_or(0);
     let client = reqwest::Client::builder()
         .user_agent(super::super::auto_update::GITHUB_USER_AGENT)
@@ -1132,10 +1190,15 @@ async fn download_resumable(url: &str, part: &Path) -> Result<bool> {
     // keeps it, so the next attempt resumes.
     let mut stream = response.bytes_stream();
     let mut write_failure = None;
+    let mut over_budget = None;
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.context("Error while downloading")?;
         if let Err(e) = file.write_all(&chunk).await {
             write_failure = Some(("writing the download", e));
+            break;
+        }
+        if let Err(e) = meter.spend(chunk.len()) {
+            over_budget = Some(e);
             break;
         }
     }
@@ -1153,6 +1216,9 @@ async fn download_resumable(url: &str, part: &Path) -> Result<bool> {
     if let Some((what, e)) = write_failure {
         remove_quietly(part);
         return Err(cache_io(what)(e));
+    }
+    if let Some(e) = over_budget {
+        return Err(e);
     }
     Ok(resumed)
 }
@@ -1416,9 +1482,15 @@ mod tests {
         let (_tmp, root) = test_root();
         // A previously staged release must not linger next to the new one.
         fs::create_dir_all(root.as_path().join("v0.0.1")).unwrap();
-        stage_release_at(root.as_path(), &server.url_str("/"), TAG, &verify)
-            .await
-            .expect("staging should succeed");
+        stage_release_at(
+            root.as_path(),
+            &server.url_str("/"),
+            TAG,
+            &verify,
+            &ByteMeter::unlimited(),
+        )
+        .await
+        .expect("staging should succeed");
         assert!(!root.as_path().join("v0.0.1").exists());
 
         let signed = release_listing(&[MANIFEST, SIGNATURE, &freenet, &fdev]);
@@ -1449,9 +1521,15 @@ mod tests {
         let server = serve_release(manifest.as_bytes(), None, &[(&freenet, b"archive")]);
         let (_tmp, root) = test_root();
         for _ in 0..2 {
-            stage_release_at(root.as_path(), &server.url_str("/"), TAG, &unsigned)
-                .await
-                .unwrap();
+            stage_release_at(
+                root.as_path(),
+                &server.url_str("/"),
+                TAG,
+                &unsigned,
+                &ByteMeter::unlimited(),
+            )
+            .await
+            .unwrap();
         }
     }
 
@@ -1461,9 +1539,15 @@ mod tests {
         let manifest = manifest_for(&[(&freenet, b"archive")]);
         let server = serve_release(manifest.as_bytes(), None, &[(&freenet, b"archive")]);
         let (_tmp, root) = test_root();
-        stage_release_at(root.as_path(), &server.url_str("/"), TAG, &unsigned)
-            .await
-            .unwrap();
+        stage_release_at(
+            root.as_path(),
+            &server.url_str("/"),
+            TAG,
+            &unsigned,
+            &ByteMeter::unlimited(),
+        )
+        .await
+        .unwrap();
         let release = release_listing(&[MANIFEST, &freenet]);
         let staged = load_at(root.as_path(), &release, &unsigned).await.unwrap();
         assert!(staged.fdev_archive.is_none());
@@ -1480,9 +1564,15 @@ mod tests {
                 .respond_with(status_code(503)),
         );
         let (_tmp, root) = test_root();
-        let err = stage_release_at(root.as_path(), &server.url_str("/"), TAG, &unsigned)
-            .await
-            .expect_err("a transient fdev failure should fail the attempt");
+        let err = stage_release_at(
+            root.as_path(),
+            &server.url_str("/"),
+            TAG,
+            &unsigned,
+            &ByteMeter::unlimited(),
+        )
+        .await
+        .expect_err("a transient fdev failure should fail the attempt");
         assert!(worth_retrying(&err), "a 503 should be retried, got {err:#}");
         // ...but the freenet archive is already usable by the updater.
         let release = release_listing(&[MANIFEST, &freenet]);
@@ -1517,7 +1607,7 @@ mod tests {
         let part = dir.path().join("asset.part");
         fs::write(&part, &body[..10]).unwrap();
 
-        let resumed = download_resumable(&server.url_str("/asset"), &part)
+        let resumed = download_resumable(&server.url_str("/asset"), &part, &ByteMeter::unlimited())
             .await
             .unwrap();
         assert!(resumed);
@@ -1539,7 +1629,7 @@ mod tests {
         fs::write(&part, b"0123456789").unwrap();
 
         assert!(
-            download_resumable(&server.url_str("/asset"), &part)
+            download_resumable(&server.url_str("/asset"), &part, &ByteMeter::unlimited())
                 .await
                 .is_err()
         );
@@ -1560,7 +1650,7 @@ mod tests {
         let part = dir.path().join("asset.part");
         fs::write(&part, b"whole file").unwrap();
 
-        let resumed = download_resumable(&server.url_str("/asset"), &part)
+        let resumed = download_resumable(&server.url_str("/asset"), &part, &ByteMeter::unlimited())
             .await
             .unwrap();
         assert!(resumed);
@@ -1579,7 +1669,7 @@ mod tests {
         let part = dir.path().join("asset.part");
         fs::write(&part, b"stale prefix that must not survive").unwrap();
 
-        let resumed = download_resumable(&server.url_str("/asset"), &part)
+        let resumed = download_resumable(&server.url_str("/asset"), &part, &ByteMeter::unlimited())
             .await
             .unwrap();
         assert!(!resumed);
@@ -1594,9 +1684,15 @@ mod tests {
                 .respond_with(status_code(429).append_header("retry-after", "120")),
         );
         let (_tmp, root) = test_root();
-        let err = stage_release_at(root.as_path(), &server.url_str("/"), TAG, &unsigned)
-            .await
-            .unwrap_err();
+        let err = stage_release_at(
+            root.as_path(),
+            &server.url_str("/"),
+            TAG,
+            &unsigned,
+            &ByteMeter::unlimited(),
+        )
+        .await
+        .unwrap_err();
         let limited = err
             .downcast_ref::<GithubRateLimitedError>()
             .unwrap_or_else(|| panic!("a 429 must surface as a rate limit, got {err:#}"));
@@ -1608,9 +1704,13 @@ mod tests {
             Expectation::matching(request::method_path("GET", "/asset"))
                 .respond_with(status_code(403)),
         );
-        let err = download_resumable(&archive.url_str("/asset"), &root.as_path().join("a.part"))
-            .await
-            .unwrap_err();
+        let err = download_resumable(
+            &archive.url_str("/asset"),
+            &root.as_path().join("a.part"),
+            &ByteMeter::unlimited(),
+        )
+        .await
+        .unwrap_err();
         assert!(err.downcast_ref::<GithubRateLimitedError>().is_some());
     }
 
@@ -1621,9 +1721,15 @@ mod tests {
         let server = serve_release(manifest.as_bytes(), None, &[(&freenet, b"tampered!!")]);
 
         let (_tmp, root) = test_root();
-        let err = stage_release_at(root.as_path(), &server.url_str("/"), TAG, &unsigned)
-            .await
-            .expect_err("a checksum mismatch must fail staging");
+        let err = stage_release_at(
+            root.as_path(),
+            &server.url_str("/"),
+            TAG,
+            &unsigned,
+            &ByteMeter::unlimited(),
+        )
+        .await
+        .expect_err("a checksum mismatch must fail staging");
         assert!(
             err.downcast_ref::<ReleaseVerificationError>().is_some(),
             "got: {err:#}"
@@ -1672,9 +1778,15 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join(format!("{freenet}.part")), b"old").unwrap();
 
-        stage_release_at(root.as_path(), &server.url_str("/"), TAG, &unsigned)
-            .await
-            .unwrap();
+        stage_release_at(
+            root.as_path(),
+            &server.url_str("/"),
+            TAG,
+            &unsigned,
+            &ByteMeter::unlimited(),
+        )
+        .await
+        .unwrap();
         assert_eq!(fs::read(dir.join(&freenet)).unwrap(), b"current upload");
     }
 
@@ -1687,9 +1799,15 @@ mod tests {
         // A file where the tag directory should be.
         fs::create_dir_all(&root).unwrap();
         fs::write(root.as_path().join(TAG), b"").unwrap();
-        let err = stage_release_at(root.as_path(), &server.url_str("/"), TAG, &unsigned)
-            .await
-            .unwrap_err();
+        let err = stage_release_at(
+            root.as_path(),
+            &server.url_str("/"),
+            TAG,
+            &unsigned,
+            &ByteMeter::unlimited(),
+        )
+        .await
+        .unwrap_err();
         assert!(err.downcast_ref::<CacheIoError>().is_some(), "got: {err:#}");
         assert!(!worth_retrying(&err));
     }
@@ -1702,9 +1820,15 @@ mod tests {
                 .respond_with(status_code(404)),
         );
         let (_tmp, root) = test_root();
-        let err = stage_release_at(root.as_path(), &server.url_str("/"), TAG, &unsigned)
-            .await
-            .unwrap_err();
+        let err = stage_release_at(
+            root.as_path(),
+            &server.url_str("/"),
+            TAG,
+            &unsigned,
+            &ByteMeter::unlimited(),
+        )
+        .await
+        .unwrap_err();
         assert!(err.downcast_ref::<AssetMissing>().is_some(), "got: {err:#}");
         assert!(worth_retrying(&err), "a release's assets can lag its tag");
     }
@@ -1721,9 +1845,15 @@ mod tests {
                     .respond_with(fdev_response),
             );
             let (_tmp, root) = test_root();
-            stage_release_at(root.as_path(), &server.url_str("/"), TAG, &unsigned)
-                .await
-                .expect("fdev that cannot be staged is left to the updater");
+            stage_release_at(
+                root.as_path(),
+                &server.url_str("/"),
+                TAG,
+                &unsigned,
+                &ByteMeter::unlimited(),
+            )
+            .await
+            .expect("fdev that cannot be staged is left to the updater");
         }
     }
 
@@ -1917,6 +2047,7 @@ mod tests {
             delays: &[],
             deadline: STAGE_DEADLINE,
             clock: &SystemTime::now,
+            byte_budget: super::super::super::rollback::STAGED_DOWNLOAD_BYTES_PER_DAY,
         }
     }
 
@@ -2392,67 +2523,371 @@ mod tests {
         assert_eq!(cooldown(&root).map(|r| r.failures), Some(1));
     }
 
-    /// The hard ceiling (#5799): even if the cooldown never held anything,
-    /// a node starts at most `ARCHIVE_DOWNLOADS_PER_DAY` archive-downloading
-    /// runs per release per day, and every request round spends a token from
-    /// the poll bucket, so neither bound depends on the cooldown being right.
+    /// Stage `TAG` at the fixed time `now` against `prefix`, for a trigger
+    /// that knew the release, as the update loop's triggers do.
+    async fn stage_at(root: &Path, prefix: &str, now: SystemTime) -> Staging {
+        let clock = move || now;
+        let env = StageEnv {
+            clock: &clock,
+            ..test_env(prefix)
+        };
+        stage_into(
+            root,
+            "9.9.8",
+            || async { Ok(TAG.to_string()) },
+            Some("9.9.9"),
+            |_: &str| false,
+            &env,
+        )
+        .await
+    }
+
+    /// When the node stages next after a run at `after`: once the record's
+    /// cooldown ends, on the next 60 s tick. The re-poll is pulled in to the
+    /// cooldown's end (#5799), so a node no peer prompts follows the same
+    /// schedule.
+    fn next_run(root: &Path, after: SystemTime) -> SystemTime {
+        let record = cooldown(root).expect("every outcome here records");
+        let retry = std::time::UNIX_EPOCH + Duration::from_secs(record.retry_at_unix);
+        retry.max(after) + Duration::from_secs(60)
+    }
+
+    fn hours(from: SystemTime, to: SystemTime) -> f64 {
+        to.duration_since(from).unwrap().as_secs_f64() / 3600.0
+    }
+
+    /// #5799 review: a day of persistent failures on the real schedule. The
+    /// waits are 1 h and 2 h, the third failure exits for the updater, and
+    /// every attempt after that exits again, about 4 h apart (the updater fails
+    /// the same download and records it too). A download ceiling that counted
+    /// runs used to stop the exits after the third run, leaving the update
+    /// waiting until the next day.
     #[tokio::test]
-    async fn the_download_ceiling_holds_with_no_cooldown_at_all() {
-        use super::super::super::rollback::ARCHIVE_DOWNLOADS_PER_DAY;
+    async fn a_day_of_persistent_failures_keeps_falling_back_every_four_hours() {
+        let (_tmp, root) = test_root();
+        let state_dir = root.parent().unwrap().to_path_buf();
+        let server = failing_release();
+        let t0 = SystemTime::now();
+        let mut now = t0;
+        let mut exits = Vec::new();
+        while now < t0 + Duration::from_secs(24 * 3600) {
+            let outcome = stage_at(&root, &server.url_str("/"), now).await;
+            match outcome {
+                Staging::FallingBack => {
+                    exits.push(now);
+                    super::super::super::rollback::record_update_failure_at(
+                        &state_dir,
+                        "9.9.9",
+                        "the updater could not download it either",
+                        now,
+                        0.5,
+                    );
+                }
+                Staging::Deferred => {}
+                Staging::Skipped
+                | Staging::Staged
+                | Staging::Failed
+                | Staging::CoolingDown
+                | Staging::Throttled => panic!("{outcome:?} at t0+{:.1} h", hours(t0, now)),
+            }
+            now = next_run(&root, now);
+        }
+        let first = hours(t0, exits[0]);
+        assert!((2.4..=3.7).contains(&first), "first exit at {first:.1} h");
+        assert!(exits.len() >= 5, "{} exits in a day", exits.len());
+        for pair in exits.windows(2) {
+            let gap = hours(pair[0], pair[1]);
+            assert!((3.2..=4.9).contains(&gap), "exits {gap:.1} h apart");
+        }
+    }
+
+    /// #5799 review: the network heals at t0+4 h, after the third failure
+    /// exited. The next scheduled run stages the release; nothing left over
+    /// from the outage holds it back.
+    #[tokio::test]
+    async fn after_a_long_outage_the_next_scheduled_run_stages() {
+        let (_tmp, root) = test_root();
+        let state_dir = root.parent().unwrap().to_path_buf();
+        let failing = failing_release();
+        let freenet = freenet_asset_name();
+        let manifest = manifest_for(&[(&freenet, b"archive")]);
+        let healed = serve_release(manifest.as_bytes(), None, &[(&freenet, b"archive")]);
+        let t0 = SystemTime::now();
+        let heal = t0 + Duration::from_secs(4 * 3600);
+        let mut now = t0;
+        while now < heal {
+            if stage_at(&root, &failing.url_str("/"), now).await == Staging::FallingBack {
+                super::super::super::rollback::record_update_failure_at(
+                    &state_dir, "9.9.9", "updater", now, 0.5,
+                );
+            }
+            now = next_run(&root, now);
+        }
+        assert!(
+            hours(heal, now) < 4.9,
+            "next run {:.1} h after",
+            hours(heal, now)
+        );
+        assert_eq!(
+            stage_at(&root, &healed.url_str("/"), now).await,
+            Staging::Staged
+        );
+    }
+
+    /// A server that answers the manifest in full and every archive request
+    /// with a 200 that ignores any Range and stops after `sent` of its
+    /// declared `declared` bytes: a download that starts over every time and
+    /// never finishes, the pathological case the byte budget exists for.
+    /// Returns its URL prefix, the number of manifest requests (one per
+    /// attempt that reached it) and the archive bytes it sent.
+    async fn restarting_server(
+        manifest: Vec<u8>,
+        declared: usize,
+        sent: usize,
+    ) -> (
+        String,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        use std::sync::atomic::Ordering::SeqCst;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let prefix = format!("http://{}/", listener.local_addr().unwrap());
+        let runs = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let bytes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (counted_runs, counted_bytes) = (runs.clone(), bytes.clone());
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut conn, _)) = listener.accept().await else {
+                    return;
+                };
+                let (manifest, runs, bytes) = (
+                    manifest.clone(),
+                    counted_runs.clone(),
+                    counted_bytes.clone(),
+                );
+                tokio::spawn(async move {
+                    let mut request = Vec::new();
+                    let mut buf = [0u8; 1024];
+                    while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match conn.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => request.extend_from_slice(&buf[..n]),
+                        }
+                    }
+                    let line = String::from_utf8_lossy(&request);
+                    let path = line.split_whitespace().nth(1).unwrap_or("").to_string();
+                    let reply = if path.ends_with(&format!("/{MANIFEST}")) {
+                        runs.fetch_add(1, SeqCst);
+                        let mut r = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            manifest.len()
+                        )
+                        .into_bytes();
+                        r.extend_from_slice(&manifest);
+                        r
+                    } else if path.ends_with(&format!("/{SIGNATURE}")) {
+                        b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                            .to_vec()
+                    } else {
+                        bytes.fetch_add(sent, SeqCst);
+                        let mut r = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {declared}\r\nConnection: close\r\n\r\n"
+                        )
+                        .into_bytes();
+                        r.extend(std::iter::repeat_n(b'x', sent));
+                        r
+                    };
+                    let _sent = conn.write_all(&reply).await;
+                    let _done = conn.shutdown().await;
+                });
+            }
+        });
+        (prefix, runs, bytes)
+    }
+
+    /// #5799 review: the byte budget binds when downloads keep starting over,
+    /// stops the run that reaches it mid-download, and from then on refuses
+    /// runs before any request. Each refusal COUNTS as a failure, so the
+    /// fallback still fires on the third.
+    #[tokio::test]
+    async fn the_byte_budget_stops_downloads_that_keep_starting_over() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let freenet = freenet_asset_name();
+        let manifest = manifest_for(&[(&freenet, b"the real archive")]);
+        let (prefix, runs, bytes) =
+            restarting_server(manifest.into_bytes(), 1_000_000, 10_000).await;
+        let (_tmp, root) = test_root();
+        let delays = [Duration::from_millis(1); 5];
+        let env = StageEnv {
+            delays: &delays,
+            byte_budget: 25_000,
+            ..test_env(&prefix)
+        };
+        let run = || {
+            stage_into(
+                &root,
+                "9.9.8",
+                || async { Ok(TAG.to_string()) },
+                Some("9.9.9"),
+                |_: &str| false,
+                &env,
+            )
+        };
+        // Two attempts restart from zero, the third passes the budget and is
+        // stopped: no more retries.
+        assert_eq!(run().await, Staging::Deferred);
+        assert_eq!(bytes.load(SeqCst), 30_000);
+        let state_dir = root.parent().unwrap();
+        let spent = super::super::super::rollback::staged_download_bytes_at(
+            state_dir,
+            "9.9.9",
+            SystemTime::now(),
+        );
+        assert!((25_000..=30_000).contains(&spent), "{spent}");
+        // With the cooldown out of the way, the next runs never reach the
+        // server, and still count toward the fallback.
+        let expired = || {
+            let rand = 0.5;
+            let long_ago = SystemTime::now() - Duration::from_secs(5 * 3600);
+            super::super::super::rollback::record_update_failure_at(
+                state_dir, "9.9.9", "earlier", long_ago, rand,
+            );
+        };
+        super::super::super::rollback::clear_update_cooldown_at(state_dir);
+        expired();
+        assert_eq!(run().await, Staging::Deferred);
+        assert_eq!(cooldown(&root).unwrap().failures, 2);
+        expired();
+        assert_eq!(run().await, Staging::FallingBack);
+        assert_eq!(runs.load(SeqCst), 3, "a refused run makes no request");
+        assert!(cooldown(&root).unwrap().last_error.contains("budget"));
+    }
+
+    /// #5799 review: with the cooldown taken out of the picture before every
+    /// run, the poll bucket still bounds staging's requests (one token per run,
+    /// 8 then one per 10 minutes) and the byte budget its bytes.
+    #[tokio::test]
+    async fn with_the_cooldown_gone_the_bucket_and_budget_still_bound_staging() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let freenet = freenet_asset_name();
+        let manifest = manifest_for(&[(&freenet, b"the real archive")]);
+        let (prefix, runs, bytes) =
+            restarting_server(manifest.into_bytes(), 1_000_000, 10_000).await;
+        let (_tmp, root) = test_root();
+        let state_dir = root.parent().unwrap().to_path_buf();
+        let t0 = SystemTime::now();
+        // Requests: a run a minute for 50 minutes (one attempt each, no
+        // retries here) reaches GitHub at most 8 + 5 times.
+        for minute in 0..50 {
+            super::super::super::rollback::clear_update_cooldown_at(&state_dir);
+            let now = t0 + Duration::from_secs(60 * minute);
+            let clock = move || now;
+            let env = StageEnv {
+                clock: &clock,
+                ..test_env(&prefix)
+            };
+            stage_into(
+                &root,
+                "9.9.8",
+                || async { Ok(TAG.to_string()) },
+                Some("9.9.9"),
+                |_: &str| false,
+                &env,
+            )
+            .await;
+        }
+        let reached = runs.load(SeqCst);
+        assert!((8..=13).contains(&reached), "{reached} runs reached GitHub");
+        // Bytes: with the bucket refilled too, only the budget is left, and it
+        // holds the archive bytes to the budget plus at most one response.
+        runs.store(0, SeqCst);
+        bytes.store(0, SeqCst);
+        fs::remove_file(state_dir.join("staged_downloads.json")).unwrap();
+        let delays = [Duration::from_millis(1); 5];
+        for _ in 0..20 {
+            super::super::super::rollback::clear_update_cooldown_at(&state_dir);
+            fs::remove_file(state_dir.join("github_poll_bucket_node")).ok();
+            let env = StageEnv {
+                delays: &delays,
+                byte_budget: 45_000,
+                ..test_env(&prefix)
+            };
+            stage_into(
+                &root,
+                "9.9.8",
+                || async { Ok(TAG.to_string()) },
+                Some("9.9.9"),
+                |_: &str| false,
+                &env,
+            )
+            .await;
+        }
+        // One run, stopped on its fifth attempt; every later run refused.
+        assert_eq!(bytes.load(SeqCst), 50_000);
+        assert_eq!(runs.load(SeqCst), 5);
+    }
+
+    /// #5799 review: a run spends ONE token from the poll bucket, however many
+    /// attempts it makes, so a fully failing run cannot drain the bucket that
+    /// detection shares, and running short mid-run never turns a real network
+    /// failure into a "throttled" run that counts nothing.
+    #[tokio::test]
+    async fn a_failing_run_spends_one_poll_token_and_counts_its_failure() {
         let freenet = freenet_asset_name();
         let manifest = manifest_for(&[(&freenet, b"archive")]);
         let server = serve_release(manifest.as_bytes(), None, &[]);
         server.expect(
             Expectation::matching(request::method_path("GET", asset_path(&freenet)))
-                .times(ARCHIVE_DOWNLOADS_PER_DAY as usize)
+                .times(6)
                 .respond_with(status_code(500)),
         );
         let (_tmp, root) = test_root();
-        let state_dir = root.parent().unwrap().to_path_buf();
-        for _ in 0..20 {
-            // As if the cooldown were broken: forget it, and refill the poll
-            // bucket, before every run.
-            super::super::super::rollback::clear_update_cooldown_at(&state_dir);
-            fs::remove_file(state_dir.join("github_poll_bucket_node")).ok();
-            let outcome = stage_once(&root, &server.url_str("/"), STAGE_DEADLINE).await;
-            assert!(!outcome.preparation().should_exit() || outcome == Staging::FallingBack);
-        }
-        // `times(ARCHIVE_DOWNLOADS_PER_DAY)` fails the test on one more.
+        let state_dir = root.parent().unwrap();
+        fs::create_dir_all(state_dir).unwrap();
+        let now = SystemTime::now();
+        let now_unix = now.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        fs::write(
+            state_dir.join("github_poll_bucket_node"),
+            format!("1 {now_unix}"),
+        )
+        .unwrap();
+        let clock = move || now;
+        let delays = [Duration::from_millis(1); 5];
+        let prefix = server.url_str("/");
+        let env = StageEnv {
+            clock: &clock,
+            delays: &delays,
+            ..test_env(&prefix)
+        };
+        let outcome = stage_into(
+            &root,
+            "9.9.8",
+            || async { Ok(TAG.to_string()) },
+            Some("9.9.9"),
+            |_: &str| false,
+            &env,
+        )
+        .await;
+        assert_eq!(outcome, Staging::Deferred);
+        assert_eq!(cooldown(&root).unwrap().failures, 1);
+        let bucket = fs::read_to_string(state_dir.join("github_poll_bucket_node")).unwrap();
+        assert!(bucket.starts_with("0 "), "{bucket}");
     }
 
-    /// The poll bucket alone bounds staging's requests too: with the ceiling
-    /// and the cooldown both forgotten before every run, the bucket stops the
-    /// runs after its capacity.
+    /// The budget fails open: a record that cannot be written does not stop
+    /// a download.
     #[tokio::test]
-    async fn the_poll_bucket_bounds_staging_requests() {
+    async fn an_unwritable_budget_record_still_stages() {
         let freenet = freenet_asset_name();
         let manifest = manifest_for(&[(&freenet, b"archive")]);
-        let server = serve_release(manifest.as_bytes(), None, &[]);
-        let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let counted = hits.clone();
-        server.expect(
-            Expectation::matching(request::method_path("GET", asset_path(&freenet)))
-                .times(..)
-                .respond_with(move || {
-                    counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    status_code(500)
-                }),
+        let server = serve_release(manifest.as_bytes(), None, &[(&freenet, b"archive")]);
+        let (tmp, root) = test_root();
+        fs::create_dir_all(tmp.path().join("staged_downloads.json")).unwrap();
+        assert_eq!(
+            stage_once(&root, &server.url_str("/"), STAGE_DEADLINE).await,
+            Staging::Staged
         );
-        let (_tmp, root) = test_root();
-        let state_dir = root.parent().unwrap().to_path_buf();
-        let mut throttled = 0;
-        for _ in 0..20 {
-            super::super::super::rollback::clear_update_cooldown_at(&state_dir);
-            fs::remove_file(state_dir.join("staged_downloads.json")).ok();
-            if stage_once(&root, &server.url_str("/"), STAGE_DEADLINE).await == Staging::Throttled {
-                throttled += 1;
-            }
-        }
-        // Each run spends two tokens (the lookup, one attempt); the bucket
-        // holds eight, so at most four runs reach GitHub.
-        let reached = hits.load(std::sync::atomic::Ordering::SeqCst);
-        assert!(reached <= 4, "{reached} runs reached GitHub");
-        assert!(throttled >= 16, "{throttled}");
     }
 
     /// The install that stages nothing (a macOS app bundle) records before its
@@ -2522,7 +2957,7 @@ mod tests {
         let part = root.join("asset.part");
         // Every write to /dev/full fails with ENOSPC, as a full disk would.
         std::os::unix::fs::symlink("/dev/full", &part).unwrap();
-        let err = download_resumable(&server.url_str("/asset"), &part)
+        let err = download_resumable(&server.url_str("/asset"), &part, &ByteMeter::unlimited())
             .await
             .unwrap_err();
         assert!(err.downcast_ref::<CacheIoError>().is_some(), "got: {err:#}");
@@ -2560,7 +2995,7 @@ mod tests {
         let part = root.join("asset.part");
         fs::write(&part, &body[..10]).unwrap();
         assert!(
-            download_resumable(&github.url_str("/asset"), &part)
+            download_resumable(&github.url_str("/asset"), &part, &ByteMeter::unlimited())
                 .await
                 .unwrap()
         );
