@@ -45,7 +45,7 @@
 use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result};
 
@@ -99,6 +99,11 @@ const LIVE_MANIFEST_TIMEOUT: Duration = Duration::from_secs(10);
 /// Production passes [`super::verify_release_manifest_signature`]; tests pass a
 /// throwaway key.
 type ManifestVerifier<'a> = &'a (dyn Fn(&[u8], Option<&[u8]>) -> Result<()> + Sync);
+
+/// The wall clock staging records against. Production passes
+/// `SystemTime::now`; tests pass a fixed time, so they can walk a whole day of
+/// cooldowns without waiting for it.
+type Clock<'a> = &'a (dyn Fn() -> SystemTime + Sync);
 
 /// A failure to read or write the cache itself, not the network. Another
 /// attempt would fail the same way, so it is not retried.
@@ -349,11 +354,11 @@ fn discard_stale_at(root: &Path, current_version: &str, blocked: impl Fn(&str) -
 pub(super) fn hold_staged_release(reason: &str) {
     if let Some(root) = cache_root() {
         let rand_unit = freenet::config::GlobalRng::random_range(0.0_f64..1.0);
-        hold_staged_release_at(&root, reason, std::time::SystemTime::now(), rand_unit);
+        hold_staged_release_at(&root, reason, SystemTime::now(), rand_unit);
     }
 }
 
-fn hold_staged_release_at(root: &Path, reason: &str, now: std::time::SystemTime, rand_unit: f64) {
+fn hold_staged_release_at(root: &Path, reason: &str, now: SystemTime, rand_unit: f64) {
     if let (Some(tag), Some(state_dir)) = (staged_tag_at(root), root.parent()) {
         super::super::rollback::hold_update_without_counting_at(
             state_dir,
@@ -473,7 +478,12 @@ fn record_panic(target: Option<&str>) {
 
 fn record_panic_at(root: &Path, target: Option<&str>) {
     if let Some(version) = target {
-        record_failure(root, version, "preparing the update panicked");
+        record_failure(
+            root,
+            version,
+            "preparing the update panicked",
+            SystemTime::now(),
+        );
     }
 }
 
@@ -499,26 +509,36 @@ async fn stage_latest_release_inner(
             .and_then(|exe| super::super::service::macos_app_bundle_path(&exe))
             .is_some();
         if in_bundle {
-            return decide_without_staging(&root, current_version, target, lookup)
-                .await
-                .preparation();
+            return decide_without_staging(
+                &root,
+                current_version,
+                target,
+                lookup,
+                &SystemTime::now,
+            )
+            .await
+            .preparation();
         }
     }
     let verify = |manifest: &[u8], signature: Option<&[u8]>| {
         super::verify_release_manifest_signature(manifest, signature, true)
     };
+    let env = StageEnv {
+        download_prefix: RELEASE_DOWNLOAD_PREFIX,
+        // Unknown off unix, where the check is skipped.
+        free: root.parent().and_then(free_bytes),
+        verify: &verify,
+        delays: &STAGE_RETRY_DELAYS,
+        deadline: STAGE_DEADLINE,
+        clock: &SystemTime::now,
+    };
     stage_into(
         &root,
-        RELEASE_DOWNLOAD_PREFIX,
         current_version,
-        // Unknown off unix, where the check is skipped.
-        root.parent().and_then(free_bytes),
         lookup,
         target,
         version_blocked,
-        &verify,
-        &STAGE_RETRY_DELAYS,
-        STAGE_DEADLINE,
+        &env,
     )
     .await
     .preparation()
@@ -567,37 +587,30 @@ fn is_permanent(e: &anyhow::Error) -> bool {
         || e.downcast_ref::<CacheIoError>().is_some()
 }
 
-fn now_unix() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
-
 /// Record a failure of `version` in the state directory beside `root`. `None`
 /// when it could not be recorded.
-fn record_failure(root: &Path, version: &str, error: &str) -> Option<u32> {
+fn record_failure(root: &Path, version: &str, error: &str, now: SystemTime) -> Option<u32> {
     let rand_unit = freenet::config::GlobalRng::random_range(0.0_f64..1.0);
-    super::super::rollback::record_update_failure_at(
-        root.parent()?,
-        version,
-        error,
-        std::time::SystemTime::now(),
-        rand_unit,
-    )
+    super::super::rollback::record_update_failure_at(root.parent()?, version, error, now, rand_unit)
 }
 
 /// Record a failure before an exit that leaves the download (or the install)
 /// to the updater, which systemd may kill before it records anything.
-fn exit_after_recording(root: &Path, version: &str, reason: &str, staging: Staging) -> Staging {
-    record_failure(root, version, reason);
+fn exit_after_recording(
+    root: &Path,
+    version: &str,
+    reason: &str,
+    staging: Staging,
+    now: SystemTime,
+) -> Staging {
+    record_failure(root, version, reason, now);
     staging
 }
 
 /// Record a failure to fetch `version` and decide what the node does next:
 /// stay, unless this is the third in a row or it could not be recorded.
-fn after_transient_failure(root: &Path, version: &str, error: &str) -> Staging {
-    match record_failure(root, version, error) {
+fn after_transient_failure(root: &Path, version: &str, error: &str, now: SystemTime) -> Staging {
+    match record_failure(root, version, error, now) {
         Some(failures) if failures < FALLBACK_AFTER_FAILURES => {
             tracing::warn!(
                 version,
@@ -620,16 +633,12 @@ fn after_transient_failure(root: &Path, version: &str, error: &str) -> Staging {
 
 /// Hold `version` without counting a failure (the bucket or the ceiling said
 /// no, so nothing was attempted) and stay.
-fn throttled(root: &Path, version: Option<&str>, why: &str) -> Staging {
+fn throttled(root: &Path, version: Option<&str>, why: &str, now: SystemTime) -> Staging {
     tracing::info!(why, "Not downloading the update in advance now (#5799)");
     if let (Some(version), Some(state_dir)) = (version, root.parent()) {
         let rand_unit = freenet::config::GlobalRng::random_range(0.0_f64..1.0);
         super::super::rollback::hold_update_without_counting_at(
-            state_dir,
-            version,
-            why,
-            std::time::SystemTime::now(),
-            rand_unit,
+            state_dir, version, why, now, rand_unit,
         );
     }
     Staging::Throttled
@@ -638,9 +647,12 @@ fn throttled(root: &Path, version: Option<&str>, why: &str) -> Staging {
 /// Spend a token from the node's GitHub poll bucket beside `root`. Without a
 /// state directory there is nothing to spend from, and staging could not
 /// record anything either; allowed, as before #5799.
-fn spend_poll_token(root: &Path) -> bool {
+fn spend_poll_token(root: &Path, now: SystemTime) -> bool {
+    let now_unix = now
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
     root.parent()
-        .is_none_or(|dir| super::super::auto_update::try_consume_node_poll_at(dir, now_unix()))
+        .is_none_or(|dir| super::super::auto_update::try_consume_node_poll_at(dir, now_unix))
 }
 
 /// Everything staging decides before it downloads: the poll budget, the tag
@@ -651,16 +663,18 @@ async fn decide_before_download<F, Fut>(
     lookup: F,
     target: Option<&str>,
     blocked: impl Fn(&str) -> bool,
+    clock: Clock<'_>,
 ) -> std::result::Result<String, Staging>
 where
     F: FnOnce() -> Fut,
     Fut: std::future::Future<Output = Result<String>>,
 {
-    if !spend_poll_token(root) {
+    if !spend_poll_token(root, clock()) {
         return Err(throttled(
             root,
             target,
             "the node's GitHub poll budget is spent (#4073)",
+            clock(),
         ));
     }
     // Resolved first: the updater's first step is the same lookup, so when it
@@ -670,7 +684,7 @@ where
         Err(e) => {
             tracing::warn!(error = %e, "Could not resolve the release to download in advance; staying on the current version (#5799)");
             return Err(match target {
-                Some(version) => after_transient_failure(root, version, &format!("{e:#}")),
+                Some(version) => after_transient_failure(root, version, &format!("{e:#}"), clock()),
                 None => Staging::Deferred,
             });
         }
@@ -683,11 +697,7 @@ where
     }
     let version = super::super::auto_update::version_from_tag(&tag);
     let cooling = root.parent().and_then(|dir| {
-        super::super::rollback::update_cooldown_remaining_at(
-            dir,
-            version,
-            std::time::SystemTime::now(),
-        )
+        super::super::rollback::update_cooldown_remaining_at(dir, version, clock())
     });
     if let Some(left) = cooling {
         tracing::info!(tag = %tag, retry_in_min = left.as_secs().div_ceil(60), "Update is cooling down after failed attempts; staying on the current version (#5799)");
@@ -706,17 +716,28 @@ async fn decide_without_staging<F, Fut>(
     current_version: &str,
     target: Option<&str>,
     lookup: F,
+    clock: Clock<'_>,
 ) -> Staging
 where
     F: FnOnce() -> Fut,
     Fut: std::future::Future<Output = Result<String>>,
 {
-    match decide_before_download(root, current_version, lookup, target, version_blocked).await {
+    match decide_before_download(
+        root,
+        current_version,
+        lookup,
+        target,
+        version_blocked,
+        clock,
+    )
+    .await
+    {
         Ok(tag) => exit_after_recording(
             root,
             super::super::auto_update::version_from_tag(&tag),
             INSTALL_PENDING,
             Staging::Skipped,
+            clock(),
         ),
         Err(staging) => staging,
     }
@@ -729,39 +750,52 @@ fn freenet_archive_staged(root: &Path, tag: &str) -> bool {
         .is_ok_and(|dir| dir.join(MANIFEST).is_file() && dir.join(freenet_asset_name()).is_file())
 }
 
-/// Decide whether to stage and do it. Everything environmental (cache root
-/// and the state directory beside it, download host, free space, tag lookup,
-/// the #4073 block list, signature key, retry schedule) is a parameter, so
-/// tests can drive every branch without the real state directory or GitHub.
-#[allow(clippy::too_many_arguments)]
+/// Everything environmental [`stage_into`] depends on besides the cache root
+/// (and the state directory beside it), the tag lookup and the #4073 block
+/// list, so tests can drive every branch without the real state directory,
+/// GitHub, or the wall clock.
+struct StageEnv<'a> {
+    download_prefix: &'a str,
+    free: Option<u64>,
+    verify: ManifestVerifier<'a>,
+    delays: &'a [Duration],
+    deadline: Duration,
+    clock: Clock<'a>,
+}
+
+/// Decide whether to stage and do it.
 async fn stage_into<F, Fut>(
     root: &Path,
-    download_prefix: &str,
     current_version: &str,
-    free: Option<u64>,
     lookup: F,
     target: Option<&str>,
     blocked: impl Fn(&str) -> bool,
-    verify: ManifestVerifier<'_>,
-    delays: &[Duration],
-    deadline: Duration,
+    env: &StageEnv<'_>,
 ) -> Staging
 where
     F: FnOnce() -> Fut,
     Fut: std::future::Future<Output = Result<String>>,
 {
-    let tag = match decide_before_download(root, current_version, lookup, target, blocked).await {
-        Ok(tag) => tag,
-        Err(staging) => return staging,
-    };
+    let clock = env.clock;
+    let tag =
+        match decide_before_download(root, current_version, lookup, target, blocked, clock).await {
+            Ok(tag) => tag,
+            Err(staging) => return staging,
+        };
     let version = super::super::auto_update::version_from_tag(&tag);
-    if let Some(free) = free {
+    if let Some(free) = env.free {
         if free < MIN_FREE_BYTES {
             tracing::warn!(
                 free_mib = free / (1024 * 1024),
                 "Too little free space to download the update in advance; it will be downloaded after exit"
             );
-            return exit_after_recording(root, version, "too little free space", Staging::Skipped);
+            return exit_after_recording(
+                root,
+                version,
+                "too little free space",
+                Staging::Skipped,
+                clock(),
+            );
         }
     }
     let _lock = match try_lock(root) {
@@ -770,28 +804,31 @@ where
             tracing::info!(
                 "Another process is downloading the update in advance; leaving it to that"
             );
-            return exit_after_recording(root, version, "cache busy", Staging::Skipped);
+            return exit_after_recording(root, version, "cache busy", Staging::Skipped, clock());
         }
         Err(e) => {
             tracing::warn!(error = %e, "Cannot lock the update cache; the update will be downloaded after exit");
-            return exit_after_recording(root, version, "cache lock failed", Staging::Skipped);
+            return exit_after_recording(
+                root,
+                version,
+                "cache lock failed",
+                Staging::Skipped,
+                clock(),
+            );
         }
     };
     // The hard ceiling (#5799): at most a few runs that download the archive,
     // per release per day, whatever the cooldown decided.
     let ceiling_allows = freenet_archive_staged(root, &tag)
         || root.parent().is_none_or(|dir| {
-            super::super::rollback::take_archive_download_at(
-                dir,
-                version,
-                std::time::SystemTime::now(),
-            )
+            super::super::rollback::take_archive_download_at(dir, version, clock())
         });
     if !ceiling_allows {
         return throttled(
             root,
             Some(version),
             "the daily ceiling on staged downloads is reached",
+            clock(),
         );
     }
 
@@ -800,13 +837,13 @@ where
     let outcome = stage_within(
         || async {
             // Every request round spends a token, retries included.
-            if !spend_poll_token(root) {
+            if !spend_poll_token(root, clock()) {
                 return Err(PollBucketEmpty.into());
             }
-            stage_release_at(root, download_prefix, &tag, verify).await
+            stage_release_at(root, env.download_prefix, &tag, env.verify).await
         },
-        delays,
-        deadline,
+        env.delays,
+        env.deadline,
     )
     .await;
     let error = match outcome {
@@ -815,7 +852,7 @@ where
                 "Update downloaded and verified; exiting to install it ({tag}, {}s)",
                 started.elapsed().as_secs()
             );
-            return exit_after_recording(root, version, INSTALL_PENDING, Staging::Staged);
+            return exit_after_recording(root, version, INSTALL_PENDING, Staging::Staged, clock());
         }
         StageOutcome::Failed(e) if is_permanent(&e) => {
             tracing::warn!(
@@ -823,7 +860,13 @@ where
                 error = %format!("{e:#}"),
                 "Could not download the update in advance; exiting anyway, the updater will download what is missing"
             );
-            return exit_after_recording(root, version, &format!("{e:#}"), Staging::Failed);
+            return exit_after_recording(
+                root,
+                version,
+                &format!("{e:#}"),
+                Staging::Failed,
+                clock(),
+            );
         }
         StageOutcome::Failed(e) => {
             // A rate limit on the asset downloads is NOT recorded as a GitHub
@@ -840,12 +883,12 @@ where
         StageOutcome::TimedOut => {
             tracing::warn!(
                 tag = %tag,
-                deadline_secs = deadline.as_secs(),
+                deadline_secs = env.deadline.as_secs(),
                 "Downloading the update in advance timed out; a later attempt resumes the partial download (#5799)"
             );
             anyhow::anyhow!(
                 "the download did not finish within {} minutes",
-                deadline.as_secs() / 60
+                env.deadline.as_secs() / 60
             )
         }
     };
@@ -853,16 +896,17 @@ where
     // freenet is staged, exit to install it; the updater downloads fdev.
     if freenet_archive_staged(root, &tag) {
         tracing::info!(tag = %tag, "The freenet archive is downloaded and verified; exiting to install it, fdev will be downloaded by the updater");
-        return exit_after_recording(root, version, INSTALL_PENDING, Staging::Staged);
+        return exit_after_recording(root, version, INSTALL_PENDING, Staging::Staged, clock());
     }
     if error.downcast_ref::<PollBucketEmpty>().is_some() {
         return throttled(
             root,
             Some(version),
             "the node's GitHub poll budget is spent (#4073)",
+            clock(),
         );
     }
-    after_transient_failure(root, version, &format!("{error:#}"))
+    after_transient_failure(root, version, &format!("{error:#}"), clock())
 }
 
 /// Whether `tag` is a release worth downloading: newer than this binary, and
@@ -1862,6 +1906,20 @@ mod tests {
         assert!(LIVE_MANIFEST_TIMEOUT <= Duration::from_secs(10));
     }
 
+    /// The environment the tests stage in: `prefix` as the download host, no
+    /// free-space figure, unsigned releases, no retries, the real deadline
+    /// and the real clock.
+    fn test_env(prefix: &str) -> StageEnv<'_> {
+        StageEnv {
+            download_prefix: prefix,
+            free: None,
+            verify: &unsigned,
+            delays: &[],
+            deadline: STAGE_DEADLINE,
+            clock: &SystemTime::now,
+        }
+    }
+
     /// Drive `stage_into` with everything environmental fixed by the test.
     async fn stage_into_with(
         root: &Path,
@@ -1870,34 +1928,35 @@ mod tests {
         free: Option<u64>,
         blocked: &dyn Fn(&str) -> bool,
     ) -> Staging {
+        let prefix = server.url_str("/");
+        let env = StageEnv {
+            free,
+            ..test_env(&prefix)
+        };
         stage_into(
             root,
-            &server.url_str("/"),
             "9.9.8",
-            free,
             move || async move { tag },
             None,
             blocked,
-            &unsigned,
-            &[],
-            STAGE_DEADLINE,
+            &env,
         )
         .await
     }
 
     /// Drive `stage_into` for `TAG` against `prefix`, no retries.
     async fn stage_once(root: &Path, prefix: &str, deadline: Duration) -> Staging {
+        let env = StageEnv {
+            deadline,
+            ..test_env(prefix)
+        };
         stage_into(
             root,
-            prefix,
             "9.9.8",
-            None,
             || async { Ok(TAG.to_string()) },
             None,
             |_: &str| false,
-            &unsigned,
-            &[],
-            deadline,
+            &env,
         )
         .await
     }
@@ -2205,7 +2264,7 @@ mod tests {
         // Expire it and fail again: still staying at two.
         let state_dir = root.parent().unwrap();
         super::super::super::rollback::clear_update_cooldown_at(state_dir);
-        let long_ago = std::time::SystemTime::now() - Duration::from_secs(7 * 24 * 3600);
+        let long_ago = SystemTime::now() - Duration::from_secs(7 * 24 * 3600);
         for _ in 0..FALLBACK_AFTER_FAILURES - 2 {
             super::super::super::rollback::record_update_failure_at(
                 state_dir, "9.9.9", "earlier", long_ago, 0.5,
@@ -2318,15 +2377,11 @@ mod tests {
             async move {
                 stage_into(
                     &root,
-                    &prefix,
                     "9.9.8",
-                    None,
                     || async { Err::<String, _>(anyhow::anyhow!("offline")) },
                     target,
                     |_: &str| false,
-                    &unsigned,
-                    &[],
-                    STAGE_DEADLINE,
+                    &test_env(&prefix),
                 )
                 .await
             }
@@ -2407,12 +2462,12 @@ mod tests {
         let (_tmp, root) = test_root();
         let ok = || async { Ok(TAG.to_string()) };
         assert_eq!(
-            decide_without_staging(&root, "9.9.8", None, ok).await,
+            decide_without_staging(&root, "9.9.8", None, ok, &SystemTime::now).await,
             Staging::Skipped
         );
         assert_eq!(cooldown(&root).unwrap().last_error, INSTALL_PENDING);
         assert_eq!(
-            decide_without_staging(&root, "9.9.8", None, ok).await,
+            decide_without_staging(&root, "9.9.8", None, ok, &SystemTime::now).await,
             Staging::CoolingDown
         );
     }
@@ -2420,7 +2475,7 @@ mod tests {
     #[test]
     fn an_updater_skip_holds_the_staged_release_without_counting() {
         let (_tmp, root) = test_root();
-        let now = std::time::SystemTime::now();
+        let now = SystemTime::now();
         hold_staged_release_at(&root, "skipped", now, 0.5);
         assert!(cooldown(&root).is_none(), "nothing staged, nothing held");
         write_staged(&root, &[(MANIFEST, b"m")]);
