@@ -44,7 +44,7 @@ impl P2pConnManager {
         // redundant teardown — we remove the connection from ctx.connections /
         // addr_by_pub_key and prune the ring below regardless. A missed
         // DropConnection leaves at most one stale per-SocketAddr
-        // ExpectedInboundTracker entry (no TTL sweep, but overwritten on the
+        // InboundMatcher entry (no TTL sweep, but overwritten on the
         // next register() and consumed on a matching inbound — bounded, benign).
         if !handshake_cmd_sender.try_send(HandshakeCommand::DropConnection { peer: peer.clone() }) {
             tracing::warn!(
@@ -1019,7 +1019,7 @@ impl P2pConnManager {
                 // connection is redundant cleanup — we've already pruned the old
                 // peer from the ring above and are about to install the new
                 // connection entry. A missed DropConnection leaves at most one
-                // stale per-SocketAddr ExpectedInboundTracker entry (no TTL sweep,
+                // stale per-SocketAddr InboundMatcher entry (no TTL sweep,
                 // but overwritten on the next register() and consumed on a
                 // matching inbound — bounded, benign).
                 if !handshake_commands.try_send(HandshakeCommand::DropConnection {
@@ -1571,7 +1571,7 @@ impl P2pConnManager {
                     // The DropConnection is redundant teardown — the connection is
                     // already removed from ctx.connections and pruned from the ring
                     // above. A missed DropConnection leaves at most one stale
-                    // per-SocketAddr ExpectedInboundTracker entry (no TTL sweep, but
+                    // per-SocketAddr InboundMatcher entry (no TTL sweep, but
                     // overwritten on the next register() and consumed on a matching
                     // inbound — bounded, benign).
                     if !handshake_commands

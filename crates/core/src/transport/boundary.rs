@@ -8,10 +8,18 @@
 //!
 //! # Known UDP assumptions still in the boundary
 //!
-//! - Outbound connections go through [`OutboundConnector`], but the rest of
-//!   connection setup is still outside the boundary: binding and the listen
-//!   task (`create_connection_handler`), accepting inbound connections
-//!   (`InboundConnectionHandler`) and `ExpectedInboundTracker`.
+//! - The node opens a transport as a [`TransportHandle`], but only the UDP
+//!   transport can be opened (`open_udp_transport`), and its tuning
+//!   (`UdpTransportConfig`: bandwidth limits, LEDBAT slow-start threshold,
+//!   congestion control) is UDP-specific.
+//! - [`InboundExpectations::expect_incoming`] takes a `SocketAddr` but keeps
+//!   only its IP, not a peer identity, and shares its set with outbound
+//!   connect.
+//! - The node matches an accepted connection to its pending expectations by
+//!   `SocketAddr` (`InboundMatcher` in `handshake.rs`).
+//! - [`ListenerExit::Error`] carries a UDP-shaped [`TransportError`], and the
+//!   event loop's log lines for a stopped listener still say "UDP listen
+//!   task".
 //! - [`OutboundConnector::connect`] carries UDP shape: it registers the
 //!   remote IP as an expected handshake source (overlapping the inbound
 //!   `expect_incoming`), it is split into enqueue and handshake stages
@@ -33,6 +41,7 @@
 //! - Peers are identified by `SocketAddr`.
 
 use std::net::SocketAddr;
+use std::sync::Arc;
 
 use futures::Future;
 
@@ -81,6 +90,66 @@ pub(crate) enum StreamSendOutcome {
     /// permit is released but the message was NOT delivered.
     Dropped,
 }
+
+/// Everything the node holds of an open transport.
+pub(crate) struct TransportHandle {
+    /// Opens outbound connections.
+    pub(crate) connector: Arc<dyn OutboundConnector>,
+    /// Yields inbound connections.
+    pub(crate) acceptor: Box<dyn InboundAcceptor>,
+    /// Registers peers expected to connect in.
+    pub(crate) expected_inbound: Arc<dyn InboundExpectations>,
+    /// Resolves when the transport's listener stops. The node treats that as
+    /// fatal.
+    pub(crate) listener: ListenerLiveness,
+}
+
+/// Registers peers the node expects to connect in, so the transport accepts
+/// their handshake. It shares its state with [`OutboundConnector::connect`],
+/// which registers the remote the same way when the node dials out.
+pub(crate) trait InboundExpectations: Send + Sync {
+    /// Expect a connection from `remote_addr`. The UDP transport keeps only
+    /// the IP: the port is discarded, so any port on that IP is expected.
+    fn expect_incoming(&self, remote_addr: SocketAddr);
+}
+
+/// Resolves, once, when the transport's listener stops.
+pub(crate) type ListenerLiveness = std::pin::Pin<Box<dyn Future<Output = ListenerExit> + Send>>;
+
+/// How a transport's listener stopped.
+#[derive(Debug)]
+pub(crate) enum ListenerExit {
+    /// It returned this error.
+    Error(TransportError),
+    /// It panicked; the message is the join error's text.
+    Panicked(String),
+    /// It was cancelled; the message is the join error's text.
+    Cancelled(String),
+}
+
+impl ListenerExit {
+    /// Classify a listener task's join result.
+    pub(crate) fn from_join(result: Result<TransportError, tokio::task::JoinError>) -> Self {
+        match result {
+            Ok(error) => ListenerExit::Error(error),
+            Err(join_err) if join_err.is_panic() => ListenerExit::Panicked(join_err.to_string()),
+            Err(join_err) => ListenerExit::Cancelled(join_err.to_string()),
+        }
+    }
+}
+
+/// Yields connections that remote peers opened to this node. The node owns
+/// one as `Box<dyn InboundAcceptor>`.
+pub(crate) trait InboundAcceptor: Send {
+    /// The next inbound connection, or `None` once the transport has stopped
+    /// accepting. Cancel-safe: dropping the future before it completes loses
+    /// no connection, so it may be polled inside `select!`.
+    fn next_connection(&mut self) -> NextConnection<'_>;
+}
+
+/// What [`InboundAcceptor::next_connection`] returns.
+pub(crate) type NextConnection<'a> =
+    std::pin::Pin<Box<dyn Future<Output = Option<Box<dyn PeerConnectionApi>>> + Send + 'a>>;
 
 /// The second stage of [`OutboundConnector::connect`]: resolves when the
 /// handshake completes or fails.

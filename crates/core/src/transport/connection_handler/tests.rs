@@ -11,3 +11,9 @@ mod mpsc_invariants;
 /// The UDP transport's implementation of the `OutboundConnector` boundary
 /// trait forwards each stage of a connect to `OutboundConnectionHandler`.
 mod outbound_connector;
+
+/// The UDP transport's implementation of the `InboundAcceptor` boundary trait.
+mod inbound_acceptor;
+
+/// The UDP transport's `TransportHandle` and its listener liveness.
+mod transport_handle;

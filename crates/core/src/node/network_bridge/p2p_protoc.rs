@@ -30,9 +30,10 @@ use crate::operations::connect::ConnectMsg;
 use crate::ring::PeerKey;
 use crate::ring::{Distance, Location};
 use crate::transport::{
-    CongestionControlConfig, ExpectedInboundTracker, PeerConnectionApi, Socket, StreamSendOutcome,
-    TransportError, TransportKeypair, TransportPublicKey, UdpTransportSocket,
-    create_connection_handler, global_bandwidth::GlobalBandwidthManager, peer_connection::StreamId,
+    CongestionControlConfig, InboundExpectations, ListenerExit, OutboundConnector,
+    PeerConnectionApi, Socket, StreamSendOutcome, TransportError, TransportHandle,
+    TransportKeypair, TransportPublicKey, UdpTransportConfig, UdpTransportSocket,
+    global_bandwidth::GlobalBandwidthManager, open_udp_transport, peer_connection::StreamId,
 };
 use crate::util::time_source::{DynTimeSource, InstantTimeSrc};
 use crate::{
@@ -1341,6 +1342,40 @@ impl P2pConnManager {
         notification_channel: EventLoopNotificationsReceiver,
         node_controller: Receiver<NodeEvent>,
     ) -> anyhow::Result<Infallible> {
+        let transport = open_udp_transport::<S>(
+            self.key_pair.clone(),
+            self.listening_ip,
+            self.listening_port,
+            self.is_gateway,
+            UdpTransportConfig {
+                bandwidth_limit: self.bandwidth_limit,
+                global_bandwidth: self.global_bandwidth.clone(),
+                ledbat_min_ssthresh: self.ledbat_min_ssthresh,
+                congestion_config: Some(self.congestion_config.clone()),
+                ack_version_floor_override: self.ack_version_floor_override,
+            },
+        )
+        .await?;
+        self.run_event_listener_with_transport(
+            transport,
+            op_manager,
+            client_wait_for_transaction,
+            notification_channel,
+            node_controller,
+        )
+        .await
+    }
+
+    /// Runs the event loop over an open transport. Not generic over the socket
+    /// type: the transport is reached only through [`TransportHandle`].
+    async fn run_event_listener_with_transport(
+        self,
+        transport: TransportHandle,
+        op_manager: Arc<OpManager>,
+        client_wait_for_transaction: ContractHandlerChannel<WaitingResolution>,
+        notification_channel: EventLoopNotificationsReceiver,
+        node_controller: Receiver<NodeEvent>,
+    ) -> anyhow::Result<Infallible> {
         // Destructure self to avoid partial move issues
         let P2pConnManager {
             gateways,
@@ -1359,7 +1394,7 @@ impl P2pConnManager {
             this_location,
             check_version,
             bandwidth_limit,
-            global_bandwidth,
+            global_bandwidth: _,
             ledbat_min_ssthresh,
             congestion_config,
             ack_version_floor_override,
@@ -1370,19 +1405,12 @@ impl P2pConnManager {
             broadcast_queue,
         } = self;
 
-        let (outbound_conn_handler, inbound_conn_handler, mut listen_task_handle) =
-            create_connection_handler::<S>(
-                key_pair.clone(),
-                listening_ip,
-                listening_port,
-                is_gateway,
-                bandwidth_limit,
-                global_bandwidth,
-                ledbat_min_ssthresh,
-                Some(congestion_config.clone()),
-                ack_version_floor_override,
-            )
-            .await?;
+        let TransportHandle {
+            connector,
+            acceptor,
+            expected_inbound,
+            listener: mut listener_liveness,
+        } = transport;
 
         tracing::info!(
             listening_port,
@@ -1393,7 +1421,6 @@ impl P2pConnManager {
             "Network listener opened - ready to receive connections"
         );
 
-        let expected_inbound = outbound_conn_handler.expected_inbound_tracker();
         let mut state = EventListenerState::new(expected_inbound);
 
         let (conn_event_tx, conn_event_rx) = mpsc::channel(1024);
@@ -1406,9 +1433,16 @@ impl P2pConnManager {
             None
         };
 
+        // Hold a connector for as long as the event loop runs, as the event loop
+        // held the outbound handler before the transport handle existed. The
+        // UDP listener exits once every connector (every queue sender) is
+        // gone, so without this a dead handshake driver would take the
+        // listener down with it and restart the node, where before it only
+        // closed the handshake stream.
+        let _outbound_keepalive: Arc<dyn OutboundConnector> = Arc::clone(&connector);
         let (handshake_handler, handshake_cmd_sender) = HandshakeHandler::new(
-            inbound_conn_handler,
-            Arc::new(outbound_conn_handler.clone()),
+            acceptor,
+            connector,
             bridge.op_manager.ring.connection_manager.clone(),
             bridge.op_manager.ring.router.clone(),
             this_location,
@@ -1452,11 +1486,11 @@ impl P2pConnManager {
             this_location,
             check_version,
             bandwidth_limit,
-            global_bandwidth: None, // Already used for connection handler, not needed in ctx
+            global_bandwidth: None, // Already used to open the transport, not needed in ctx
             ledbat_min_ssthresh,
-            congestion_config, // Already used for connection handler, kept for struct completeness
-            // Already consumed by create_connection_handler above; kept for
-            // struct completeness, same as the two fields around it.
+            congestion_config, // Already used to open the transport, kept for struct completeness
+            // Already used by open_udp_transport in run_event_listener_with_socket;
+            // kept for struct completeness, same as the two fields around it.
             ack_version_floor_override,
             blocked_addresses,
             broadcast_retries,
@@ -1490,29 +1524,11 @@ impl P2pConnManager {
             let result = tokio::select! {
                 biased;
 
-                listen_result = &mut listen_task_handle => {
+                exit = &mut listener_liveness => {
                     // The UDP listener task has exited — this is fatal.
                     // Without the listener, no UDP packets are read from the socket,
                     // connections will time out, and the node becomes unresponsive.
-                    match listen_result {
-                        Ok(e) => {
-                            tracing::error!(
-                                error = %e,
-                                "CRITICAL: UDP listen task exited with transport error"
-                            );
-                        }
-                        Err(join_err) => {
-                            let cause = if join_err.is_panic() { "panicked" } else { "cancelled" };
-                            tracing::error!(
-                                cause,
-                                "CRITICAL: UDP listen task failed: {join_err}"
-                            );
-                        }
-                    }
-                    return Err(anyhow!(
-                        "UDP listen task exited unexpectedly — \
-                         transport layer is dead, node must restart"
-                    ));
+                    return Err(listener_exit_error(&exit));
                 },
 
                 // Also wakes for a zombie sweep backlog deadline, so a backlog
@@ -2302,7 +2318,7 @@ impl P2pConnManager {
                                         // cleanup: the connection has already been removed from
                                         // ctx.connections / addr_by_pub_key and pruned from the
                                         // ring above. The only residue is the handshake driver's
-                                        // ExpectedInboundTracker entry (if any). That tracker is
+                                        // InboundMatcher entry (if any). That tracker is
                                         // a per-SocketAddr HashMap with no TTL sweep, but the
                                         // entry is benign and bounded: it is overwritten on the
                                         // next register() for the same addr and consumed when a
@@ -3155,7 +3171,7 @@ async fn fail_awaiting_connection(
 }
 
 struct EventListenerState {
-    expected_inbound: ExpectedInboundTracker,
+    expected_inbound: Arc<dyn InboundExpectations>,
     pending_from_executor: HashSet<Transaction>,
     /// Maps transactions to the set of clients waiting for their results.
     /// Cleaned up via `TransactionTimedOut` and `TransactionCompleted` handlers.
@@ -3174,7 +3190,7 @@ struct EventListenerState {
 }
 
 impl EventListenerState {
-    fn new(expected_inbound: ExpectedInboundTracker) -> Self {
+    fn new(expected_inbound: Arc<dyn InboundExpectations>) -> Self {
         Self {
             expected_inbound,
             pending_from_executor: HashSet::new(),
@@ -3767,6 +3783,37 @@ fn disconnect_reason_for_close(
     }
 }
 
+/// Log a stopped transport listener and return the error that ends the event
+/// loop. The log lines are the ones the node wrote when it read the listener
+/// task's `JoinHandle` itself: a returned error is logged with `error`, a
+/// panic or cancellation with `cause` and the join error's text.
+fn listener_exit_error(exit: &ListenerExit) -> anyhow::Error {
+    match exit {
+        ListenerExit::Error(e) => {
+            tracing::error!(
+                error = %e,
+                "CRITICAL: UDP listen task exited with transport error"
+            );
+        }
+        ListenerExit::Panicked(join_err) => {
+            tracing::error!(
+                cause = "panicked",
+                "CRITICAL: UDP listen task failed: {join_err}"
+            );
+        }
+        ListenerExit::Cancelled(join_err) => {
+            tracing::error!(
+                cause = "cancelled",
+                "CRITICAL: UDP listen task failed: {join_err}"
+            );
+        }
+    }
+    anyhow!(
+        "UDP listen task exited unexpectedly — \
+         transport layer is dead, node must restart"
+    )
+}
+
 #[inline(always)]
 fn decode_msg(data: &[u8]) -> Result<NetMessage, ConnectionError> {
     bincode::deserialize(data).map_err(|err| ConnectionError::Serialization(Some(err)))
@@ -3832,6 +3879,58 @@ pub(crate) mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::sync::mpsc;
     use tokio::time::{Duration, Instant, sleep, timeout};
+
+    /// Each way the transport listener can stop is logged as the event loop
+    /// logged it when it read the listener task's `JoinHandle` itself, and ends
+    /// the loop with the same error.
+    #[test]
+    fn listener_exit_is_logged_as_before_and_ends_the_loop() {
+        use crate::transport::{ListenerExit, TransportError};
+        let (logs, _guard) = crate::util::test_log_capture::install();
+        let returned = TransportError::ChannelClosed.to_string();
+        let cases = [
+            (
+                ListenerExit::Error(TransportError::ChannelClosed),
+                vec![
+                    "CRITICAL: UDP listen task exited with transport error".to_string(),
+                    format!("error={returned}"),
+                ],
+            ),
+            (
+                ListenerExit::Panicked("task 7 panicked".into()),
+                vec![
+                    "CRITICAL: UDP listen task failed: task 7 panicked".to_string(),
+                    "cause=\"panicked\"".to_string(),
+                ],
+            ),
+            (
+                ListenerExit::Cancelled("task 8 was cancelled".into()),
+                vec![
+                    "CRITICAL: UDP listen task failed: task 8 was cancelled".to_string(),
+                    "cause=\"cancelled\"".to_string(),
+                ],
+            ),
+        ];
+        for (exit, expected) in cases {
+            logs.lock().unwrap().clear();
+            let err = super::listener_exit_error(&exit);
+            assert_eq!(
+                err.to_string(),
+                "UDP listen task exited unexpectedly — transport layer is dead, node must restart"
+            );
+            let captured = logs.lock().unwrap().clone();
+            let line = captured
+                .iter()
+                .find(|l| l.starts_with("ERROR") && l.contains("CRITICAL: UDP listen task"))
+                .unwrap_or_else(|| panic!("{exit:?} was not logged: {captured:?}"));
+            for part in expected {
+                assert!(
+                    line.contains(&part),
+                    "{exit:?}: {part:?} missing from {line:?}"
+                );
+            }
+        }
+    }
 
     /// A connection that records the bytes it is asked to send, and fails
     /// every send when `fail` is set.
@@ -4047,7 +4146,7 @@ pub(crate) mod tests {
         const SOURCE: &str = include_str!("p2p_protoc.rs");
         // Scoped to the event-loop function that holds both drop sites: a
         // whole-file scrape could match these literals anywhere.
-        let signature = "pub async fn run_event_listener_with_socket<S: Socket>(";
+        let signature = "async fn run_event_listener_with_transport(";
         let start = SOURCE.find(signature).expect("event-loop function renamed");
         let tests_at = SOURCE
             .find("\n#[cfg(test)]\npub(crate) mod tests")
@@ -4776,7 +4875,8 @@ pub(crate) mod tests {
 
         let removes_before = GlobalTestMetrics::pending_op_removes();
 
-        let mut state = super::EventListenerState::new(ExpectedInboundTracker::empty_for_test());
+        let mut state =
+            super::EventListenerState::new(Arc::new(ExpectedInboundTracker::empty_for_test()));
         for _ in 0..3 {
             let (callback, _rx) = mpsc::channel(1);
             state
@@ -4823,9 +4923,9 @@ pub(crate) mod tests {
         use crate::transport::ExpectedInboundTracker;
 
         let removes_before = GlobalTestMetrics::pending_op_removes();
-        drop(super::EventListenerState::new(
+        drop(super::EventListenerState::new(Arc::new(
             ExpectedInboundTracker::empty_for_test(),
-        ));
+        )));
         assert_eq!(GlobalTestMetrics::pending_op_removes(), removes_before);
     }
 
@@ -6405,7 +6505,7 @@ pub(crate) mod tests {
     /// Source pin: the `ctx` rebuild at event-loop entry must CARRY the start
     /// instant across, never re-read it from the clock.
     ///
-    /// `run_event_listener_with_socket` destructures `self` and rebuilds a
+    /// `run_event_listener_with_transport` destructures `self` and rebuilds a
     /// `P2pConnManager` for the loop. Writing `started_at: uptime_clock.now()`
     /// there instead of the `started_at` shorthand would restart the
     /// measurement at event-loop entry, silently under-reporting uptime by the
@@ -6417,15 +6517,20 @@ pub(crate) mod tests {
     /// is the check that makes the documentation load-bearing.
     #[test]
     fn event_loop_ctx_carries_start_instant_rather_than_re_reading_it() {
-        let src = production_src();
+        let body = event_loop_body();
         const ANCHOR: &str = "let mut ctx = P2pConnManager {";
-        let start = src
-            .find(ANCHOR)
-            .expect("run_event_listener_with_socket must rebuild `let mut ctx = P2pConnManager {`");
-        let rest = &src[start + ANCHOR.len()..];
+        let start = body.find(ANCHOR).expect(
+            "run_event_listener_with_transport must rebuild `let mut ctx = P2pConnManager {`",
+        );
+        assert_eq!(
+            body.matches(ANCHOR).count(),
+            1,
+            "exactly one ctx rebuild in the event-loop body"
+        );
+        let rest = &body[start + ANCHOR.len()..];
         let end = rest
             .find("\n        };")
-            .expect("the ctx rebuild literal must be closed by `};`");
+            .expect("the ctx rebuild literal must be closed by `};` inside the event loop");
         let ctx_literal = &rest[..end];
 
         assert!(
@@ -6439,6 +6544,62 @@ pub(crate) mod tests {
              the clock here restarts the uptime measurement at event-loop \
              entry. Found:\n{ctx_literal}"
         );
+    }
+
+    /// Source pin: the event loop holds a connector for its whole lifetime,
+    /// declared before the handshake driver takes its own. The UDP listener
+    /// exits when every connector is gone (see the transport test
+    /// `listener_outlives_a_dropped_connector_while_a_clone_remains`), so
+    /// without this a dead handshake driver would restart the node.
+    #[test]
+    fn event_loop_keeps_a_connector_alive() {
+        let body = event_loop_body();
+        const KEEPALIVE: &str =
+            "let _outbound_keepalive: Arc<dyn OutboundConnector> = Arc::clone(&connector);";
+        let at = body
+            .match_indices(KEEPALIVE)
+            .find(|(i, _)| {
+                let line_start = body[..*i].rfind('\n').map_or(0, |n| n + 1);
+                body[line_start..*i].trim().is_empty()
+            })
+            .map(|(i, _)| i)
+            .expect("the event loop must bind a connector clone at statement position");
+        let driver = body
+            .find("HandshakeHandler::new(")
+            .expect("the event loop starts the handshake driver");
+        assert!(
+            at < driver,
+            "the clone must be taken before the driver gets the connector"
+        );
+    }
+
+    /// The body of `run_event_listener_with_transport`, from its opening brace
+    /// to the matching closing one. Panics if the signature is missing, sits
+    /// in the test module, or the braces do not balance before it.
+    fn event_loop_body() -> String {
+        let full = include_str!("p2p_protoc.rs");
+        let tests_at = full
+            .find("\npub(crate) mod tests {")
+            .expect("p2p_protoc.rs must have a `pub(crate) mod tests {` block");
+        let signature = "\n    async fn run_event_listener_with_transport(";
+        let start = full.find(signature).expect("event-loop function renamed");
+        assert!(start < tests_at, "the anchor must be production code");
+        let open = start + full[start..].find('{').expect("function body");
+        let mut depth = 0i32;
+        for (i, b) in full.bytes().enumerate().skip(open) {
+            match b {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        assert!(i < tests_at, "unbalanced body slice");
+                        return full[open..=i].to_string();
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("unbalanced body slice");
     }
 
     /// Production source ONLY (everything before the `mod tests` block).
@@ -6714,7 +6875,8 @@ pub(crate) mod tests {
         use crate::transport::ExpectedInboundTracker;
         use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
-        let mut state = super::EventListenerState::new(ExpectedInboundTracker::empty_for_test());
+        let mut state =
+            super::EventListenerState::new(Arc::new(ExpectedInboundTracker::empty_for_test()));
         let peer_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 45678);
         let tx = Transaction::new::<crate::operations::connect::ConnectMsg>();
 
@@ -6883,7 +7045,8 @@ pub(crate) mod tests {
         use crate::transport::ExpectedInboundTracker;
         use tokio::sync::mpsc::error::TryRecvError;
 
-        let mut state = super::EventListenerState::new(ExpectedInboundTracker::empty_for_test());
+        let mut state =
+            super::EventListenerState::new(Arc::new(ExpectedInboundTracker::empty_for_test()));
         let tx = crate::dev_tool::Transaction::new::<crate::operations::put::PutMsg>();
 
         // Step 1: the originator's live waiter (send_and_await's callback).
@@ -6950,7 +7113,8 @@ pub(crate) mod tests {
     async fn install_pending_op_callback_drops_a_refused_newcomer() {
         use crate::transport::ExpectedInboundTracker;
 
-        let mut state = super::EventListenerState::new(ExpectedInboundTracker::empty_for_test());
+        let mut state =
+            super::EventListenerState::new(Arc::new(ExpectedInboundTracker::empty_for_test()));
         let tx = crate::dev_tool::Transaction::new::<crate::operations::put::PutMsg>();
 
         // A live incumbent holds the slot.
@@ -6995,7 +7159,8 @@ pub(crate) mod tests {
     async fn install_pending_op_callback_skips_a_closed_incoming_callback() {
         use crate::transport::ExpectedInboundTracker;
 
-        let mut state = super::EventListenerState::new(ExpectedInboundTracker::empty_for_test());
+        let mut state =
+            super::EventListenerState::new(Arc::new(ExpectedInboundTracker::empty_for_test()));
         let tx = crate::dev_tool::Transaction::new::<crate::operations::put::PutMsg>();
 
         let (sender, receiver) = mpsc::channel::<crate::node::WaiterReply>(1);
@@ -7028,7 +7193,8 @@ pub(crate) mod tests {
     async fn install_pending_op_callback_replaces_a_closed_incumbent() {
         use crate::transport::ExpectedInboundTracker;
 
-        let mut state = super::EventListenerState::new(ExpectedInboundTracker::empty_for_test());
+        let mut state =
+            super::EventListenerState::new(Arc::new(ExpectedInboundTracker::empty_for_test()));
         let tx = crate::dev_tool::Transaction::new::<crate::operations::put::PutMsg>();
 
         // A stale incumbent whose receiver is already gone.
@@ -7082,7 +7248,8 @@ pub(crate) mod tests {
     async fn install_pending_op_callback_inserts_when_the_slot_is_empty() {
         use crate::transport::ExpectedInboundTracker;
 
-        let mut state = super::EventListenerState::new(ExpectedInboundTracker::empty_for_test());
+        let mut state =
+            super::EventListenerState::new(Arc::new(ExpectedInboundTracker::empty_for_test()));
         let tx = crate::dev_tool::Transaction::new::<crate::operations::put::PutMsg>();
 
         let (sender, _rx) = mpsc::channel::<crate::node::WaiterReply>(1);

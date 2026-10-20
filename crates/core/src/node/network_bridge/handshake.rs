@@ -22,7 +22,7 @@ use crate::ring::{ConnectionManager, PeerKeyLocation};
 use crate::router::Router;
 use std::collections::HashMap;
 
-use crate::transport::{InboundConnectionHandler, OutboundConnector, PeerConnectionApi};
+use crate::transport::{InboundAcceptor, OutboundConnector, PeerConnectionApi};
 
 /// Events emitted by the handshake driver.
 ///
@@ -145,8 +145,8 @@ pub(crate) struct HandshakeHandler {
 
 impl HandshakeHandler {
     #[allow(clippy::too_many_arguments)]
-    pub fn new<S: crate::transport::Socket>(
-        inbound: InboundConnectionHandler<S>,
+    pub fn new(
+        inbound: Box<dyn InboundAcceptor>,
         outbound: Arc<dyn OutboundConnector>,
         _connection_manager: ConnectionManager,
         _router: Arc<RwLock<Router>>,
@@ -185,12 +185,15 @@ struct ExpectedInbound {
     transient: bool, // TODO: rename to transient in protocol once we migrate terminology
 }
 
+/// Matches accepted connections to the connect operations that expect them,
+/// by socket address. Node-side bookkeeping, distinct from the transport's
+/// expected-IP set (`InboundExpectations`).
 #[derive(Default)]
-struct ExpectedInboundTracker {
+struct InboundMatcher {
     entries: HashMap<SocketAddr, ExpectedInbound>,
 }
 
-impl ExpectedInboundTracker {
+impl InboundMatcher {
     fn register(
         &mut self,
         peer: PeerKeyLocation,
@@ -248,8 +251,8 @@ impl ExpectedInboundTracker {
     }
 }
 
-async fn run_driver<S: crate::transport::Socket>(
-    mut inbound: InboundConnectionHandler<S>,
+async fn run_driver(
+    mut inbound: Box<dyn InboundAcceptor>,
     outbound: Arc<dyn OutboundConnector>,
     mut commands_rx: mpsc::Receiver<Command>,
     events_tx: mpsc::Sender<Event>,
@@ -257,7 +260,7 @@ async fn run_driver<S: crate::transport::Socket>(
 ) {
     use tokio::select;
 
-    let mut expected_inbound = ExpectedInboundTracker::default();
+    let mut expected_inbound = InboundMatcher::default();
 
     loop {
         select! {
@@ -336,7 +339,7 @@ async fn run_driver<S: crate::transport::Socket>(
                                 Event::InboundConnection {
                                     transaction,
                                     peer,
-                                    connection: Box::new(conn),
+                                    connection: conn,
                                     transient,
                                 },
                                 INBOUND_FORWARD_TIMEOUT,
@@ -519,6 +522,108 @@ mod tests {
         }
     }
 
+    /// An `InboundAcceptor` that yields whatever the test sends it, and
+    /// `None` once the test drops the sender.
+    struct ChannelAcceptor(mpsc::Receiver<Box<dyn PeerConnectionApi>>);
+
+    impl InboundAcceptor for ChannelAcceptor {
+        fn next_connection(&mut self) -> crate::transport::NextConnection<'_> {
+            Box::pin(self.0.recv())
+        }
+    }
+
+    /// The accept loop, driven through `Box<dyn InboundAcceptor>`: an
+    /// expected connection is reported with its peer, transaction and
+    /// transient flag; an unexpected one with none of them; each accept marks
+    /// the peer ready; and the driver stops when the acceptor yields `None`.
+    #[tokio::test(start_paused = true)]
+    async fn run_driver_reports_accepted_connections_and_stops_with_the_acceptor() {
+        let (conn_tx, conn_rx) = mpsc::channel(4);
+        let (cmd_tx, cmd_rx) = mpsc::channel(4);
+        let (event_tx, mut event_rx) = mpsc::channel(4);
+        let ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let driver = GlobalExecutor::spawn(run_driver(
+            Box::new(ChannelAcceptor(conn_rx)),
+            Arc::new(ScriptedConnector {
+                enqueue: Duration::ZERO,
+                handshake: Handshake::Hangs,
+            }),
+            cmd_rx,
+            event_tx,
+            Some(ready.clone()),
+        ));
+
+        let expected = make_peer(4300);
+        let expected_addr = expected.socket_addr().unwrap();
+        let tx = Transaction::new::<ConnectMsg>();
+        cmd_tx
+            .send(Command::ExpectInbound {
+                peer: expected.clone(),
+                transaction: Some(tx),
+                transient: true,
+            })
+            .await
+            .unwrap();
+        // Let the driver register the expectation before anything arrives.
+        tokio::time::sleep(Duration::from_millis(1)).await;
+
+        conn_tx
+            .send(Box::new(NullConnection(expected_addr)))
+            .await
+            .ok()
+            .unwrap();
+        let Some(Event::InboundConnection {
+            transaction,
+            peer,
+            connection,
+            transient,
+        }) = event_rx.recv().await
+        else {
+            panic!("expected an InboundConnection");
+        };
+        assert_eq!(peer, Some(expected));
+        assert_eq!(transaction, Some(tx));
+        assert!(transient);
+        assert_eq!(connection.remote_addr(), expected_addr);
+        assert!(ready.load(std::sync::atomic::Ordering::SeqCst));
+
+        let stranger: SocketAddr = "192.0.2.9:4301".parse().unwrap();
+        conn_tx
+            .send(Box::new(NullConnection(stranger)))
+            .await
+            .ok()
+            .unwrap();
+        let Some(Event::InboundConnection {
+            transaction,
+            peer,
+            connection,
+            transient,
+        }) = event_rx.recv().await
+        else {
+            panic!("expected an InboundConnection");
+        };
+        assert_eq!(peer, None);
+        assert_eq!(transaction, None);
+        assert!(!transient);
+        assert_eq!(connection.remote_addr(), stranger);
+        ready.store(false, std::sync::atomic::Ordering::SeqCst);
+        // Read only after the event, which the driver sends after setting it.
+        conn_tx
+            .send(Box::new(NullConnection(stranger)))
+            .await
+            .ok()
+            .unwrap();
+        assert!(event_rx.recv().await.is_some());
+        assert!(
+            ready.load(std::sync::atomic::Ordering::SeqCst),
+            "every accept marks the peer ready, not only the first"
+        );
+
+        drop(conn_tx);
+        driver.await.expect("the driver ends cleanly");
+        assert!(event_rx.recv().await.is_none(), "the driver has stopped");
+    }
+
     /// What a scripted connector's handshake stage does.
     #[derive(Clone, Copy)]
     enum Handshake {
@@ -670,7 +775,7 @@ mod tests {
 
     #[test]
     fn tracker_returns_registered_entry_exactly_once() {
-        let mut tracker = ExpectedInboundTracker::default();
+        let mut tracker = InboundMatcher::default();
         let peer = make_peer(4100);
         let addr = peer.socket_addr().unwrap();
         let tx = Transaction::new::<ConnectMsg>();
@@ -687,7 +792,7 @@ mod tests {
 
     #[test]
     fn tracker_drop_removes_entry() {
-        let mut tracker = ExpectedInboundTracker::default();
+        let mut tracker = InboundMatcher::default();
         let peer = make_peer(4200);
         let addr = peer.socket_addr().unwrap();
         tracker.register(peer.clone(), None, false);
@@ -700,7 +805,7 @@ mod tests {
 
     #[test]
     fn tracker_overwrites_existing_expectation() {
-        let mut tracker = ExpectedInboundTracker::default();
+        let mut tracker = InboundMatcher::default();
         let peer = make_peer(4300);
         let addr = peer.socket_addr().unwrap();
         tracker.register(peer.clone(), None, false);
@@ -718,7 +823,7 @@ mod tests {
 
     #[test]
     fn tracker_keeps_peers_separate_on_same_ip() {
-        let mut tracker = ExpectedInboundTracker::default();
+        let mut tracker = InboundMatcher::default();
         let peer_a = make_peer(4400);
         let peer_b = make_peer(4401);
         let addr_a = peer_a.socket_addr().unwrap();

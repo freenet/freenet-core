@@ -162,6 +162,52 @@ pub async fn create_connection_handler<S: Socket>(
     ),
     TransportError,
 > {
+    bind_udp_listener::<S>(
+        keypair,
+        listen_host,
+        listen_port,
+        is_gateway,
+        UdpTransportConfig {
+            bandwidth_limit,
+            global_bandwidth,
+            ledbat_min_ssthresh,
+            congestion_config,
+            ack_version_floor_override,
+        },
+    )
+    .await
+}
+
+/// The UDP transport's tuning knobs, passed by name so that two knobs of the
+/// same type cannot be swapped by position.
+#[derive(Default)]
+pub(crate) struct UdpTransportConfig {
+    /// Per-connection bandwidth limit in bytes/sec.
+    pub(crate) bandwidth_limit: Option<usize>,
+    /// Shared bandwidth manager.
+    pub(crate) global_bandwidth: Option<Arc<GlobalBandwidthManager>>,
+    /// Minimum slow-start threshold for LEDBAT.
+    pub(crate) ledbat_min_ssthresh: Option<usize>,
+    /// Congestion control config (defaults to FixedRate).
+    pub(crate) congestion_config: Option<CongestionControlConfig>,
+    /// The #5161 version-carrying-ack floor override; `None` in production.
+    pub(crate) ack_version_floor_override: Option<(u8, u8, u16)>,
+}
+
+type UdpListenerParts<S> = (
+    OutboundConnectionHandler<S>,
+    InboundConnectionHandler<S>,
+    tokio::task::JoinHandle<TransportError>,
+);
+
+/// Bind the UDP socket and start its listener.
+async fn bind_udp_listener<S: Socket>(
+    keypair: TransportKeypair,
+    listen_host: IpAddr,
+    listen_port: u16,
+    is_gateway: bool,
+    config: UdpTransportConfig,
+) -> Result<UdpListenerParts<S>, TransportError> {
     // Bind the UDP socket to the specified port with retry for transient failures
     let bind_addr: SocketAddr = (listen_host, listen_port).into();
     tracing::debug!(
@@ -184,11 +230,7 @@ pub async fn create_connection_handler<S: Socket>(
         keypair,
         is_gateway,
         (listen_host, listen_port).into(),
-        bandwidth_limit,
-        global_bandwidth,
-        ledbat_min_ssthresh,
-        congestion_config,
-        ack_version_floor_override,
+        config,
     )?;
     Ok((
         och,
@@ -197,6 +239,37 @@ pub async fn create_connection_handler<S: Socket>(
         },
         listen_handle,
     ))
+}
+
+/// Open the UDP transport and return it as the node's [`TransportHandle`]
+/// (`super::TransportHandle`). Binds the same way as
+/// [`create_connection_handler`].
+pub(crate) async fn open_udp_transport<S: Socket>(
+    keypair: TransportKeypair,
+    listen_host: IpAddr,
+    listen_port: u16,
+    is_gateway: bool,
+    config: UdpTransportConfig,
+) -> Result<super::TransportHandle, TransportError> {
+    let (outbound, inbound, listen_task) =
+        bind_udp_listener::<S>(keypair, listen_host, listen_port, is_gateway, config).await?;
+    Ok(udp_transport_handle(outbound, inbound, listen_task))
+}
+
+/// Assemble the handle from the UDP transport's parts. Outbound connect and
+/// expected-inbound registration share one expected-IP set: the tracker is a
+/// view of the connector's set.
+pub(crate) fn udp_transport_handle<S: Socket>(
+    outbound: OutboundConnectionHandler<S>,
+    inbound: InboundConnectionHandler<S>,
+    listen_task: tokio::task::JoinHandle<TransportError>,
+) -> super::TransportHandle {
+    super::TransportHandle {
+        expected_inbound: Arc::new(outbound.expected_inbound_tracker()),
+        connector: Arc::new(outbound),
+        acceptor: Box::new(inbound),
+        listener: Box::pin(async move { super::ListenerExit::from_join(listen_task.await) }),
+    }
 }
 
 /// Bind a socket with retry logic for transient "Address in use" errors.
@@ -245,6 +318,17 @@ impl<S: Send + Sync, TS: TimeSource> InboundConnectionHandler<S, TS> {
     }
 }
 
+impl<S: Socket> super::InboundAcceptor for InboundConnectionHandler<S> {
+    fn next_connection(&mut self) -> super::NextConnection<'_> {
+        // `mpsc::Receiver::recv` is cancel-safe, so the boxed future is too.
+        Box::pin(async move {
+            InboundConnectionHandler::<S>::next_connection(self)
+                .await
+                .map(|conn| Box::new(conn) as Box<dyn super::PeerConnectionApi>)
+        })
+    }
+}
+
 /// Requests a new outbound connection to a remote peer.
 pub struct OutboundConnectionHandler<S = UdpSocket, TS: TimeSource = RealTime> {
     send_queue: mpsc::Sender<(SocketAddr, ConnectionEvent<S, TS>)>,
@@ -270,18 +354,51 @@ type ListenerSetup<S> = (
 
 #[allow(private_bounds)]
 impl<S: Socket> OutboundConnectionHandler<S> {
-    #[allow(clippy::too_many_arguments)]
     fn config_listener(
         socket: Arc<S>,
         keypair: TransportKeypair,
         is_gateway: bool,
         socket_addr: SocketAddr,
-        bandwidth_limit: Option<usize>,
-        global_bandwidth: Option<Arc<GlobalBandwidthManager>>,
-        ledbat_min_ssthresh: Option<usize>,
-        congestion_config: Option<CongestionControlConfig>,
-        ack_version_floor_override: Option<(u8, u8, u16)>,
+        config: UdpTransportConfig,
     ) -> Result<ListenerSetup<S>, TransportError> {
+        let (transport, connection_handler, new_connection_notifier) =
+            Self::new_listener(socket, keypair, is_gateway, socket_addr, config);
+        // Packets are now sent directly to socket from each connection,
+        // bypassing the centralized rate limiter that was causing serialization bottlenecks.
+        // Per-connection rate limiting is handled by TokenBucket and LEDBAT in RemoteConnection.
+        let listen_handle = GlobalExecutor::spawn(RANDOM_U64.scope(
+            {
+                // Use GlobalRng for deterministic simulation
+                let seed = GlobalRng::random_u64();
+                let mut rng = StdRng::seed_from_u64(seed);
+                rng.random()
+            },
+            transport.listen(),
+        ));
+
+        Ok((connection_handler, new_connection_notifier, listen_handle))
+    }
+
+    /// Build the listener (not yet running) and the handles onto it.
+    #[allow(clippy::type_complexity)]
+    fn new_listener(
+        socket: Arc<S>,
+        keypair: TransportKeypair,
+        is_gateway: bool,
+        socket_addr: SocketAddr,
+        config: UdpTransportConfig,
+    ) -> (
+        UdpPacketsListener<S>,
+        OutboundConnectionHandler<S>,
+        mpsc::Receiver<PeerConnection<S>>,
+    ) {
+        let UdpTransportConfig {
+            bandwidth_limit,
+            global_bandwidth,
+            ledbat_min_ssthresh,
+            congestion_config,
+            ack_version_floor_override,
+        } = config;
         let (conn_handler_sender, conn_handler_receiver) = mpsc::channel(100);
         let (new_connection_sender, new_connection_notifier) = mpsc::channel(10);
         let expected_non_gateway = Arc::new(DashSet::new());
@@ -319,21 +436,7 @@ impl<S: Socket> OutboundConnectionHandler<S> {
             send_queue: conn_handler_sender,
             expected_non_gateway,
         };
-
-        // Packets are now sent directly to socket from each connection,
-        // bypassing the centralized rate limiter that was causing serialization bottlenecks.
-        // Per-connection rate limiting is handled by TokenBucket and LEDBAT in RemoteConnection.
-        let listen_handle = GlobalExecutor::spawn(RANDOM_U64.scope(
-            {
-                // Use GlobalRng for deterministic simulation
-                let seed = GlobalRng::random_u64();
-                let mut rng = StdRng::seed_from_u64(seed);
-                rng.random()
-            },
-            transport.listen(),
-        ));
-
-        Ok((connection_handler, new_connection_notifier, listen_handle))
+        (transport, connection_handler, new_connection_notifier)
     }
 
     #[cfg(any(test, feature = "bench"))]
@@ -373,11 +476,11 @@ impl<S: Socket> OutboundConnectionHandler<S> {
             keypair,
             is_gateway,
             socket_addr,
-            bandwidth_limit,
-            None,
-            None,
-            None,
-            ack_version_floor_override,
+            UdpTransportConfig {
+                bandwidth_limit,
+                ack_version_floor_override,
+                ..UdpTransportConfig::default()
+            },
         )?;
         Ok((handler, receiver))
     }
@@ -468,11 +571,9 @@ impl<S: Socket> super::OutboundConnector for OutboundConnectionHandler<S> {
     }
 }
 
-/// A handle for registering expected inbound connections.
-///
-/// This is a type-erased wrapper around the expected inbound IP set, allowing
-/// `EventListenerState` to register expected connections without being generic
-/// over the socket type.
+/// The UDP transport's expected-inbound IP set, shared with the outbound
+/// handler that registers dialled IPs in the same set. The node reaches it
+/// as `Arc<dyn InboundExpectations>`.
 #[derive(Clone)]
 pub struct ExpectedInboundTracker(Arc<DashSet<IpAddr>>);
 
@@ -493,6 +594,12 @@ impl ExpectedInboundTracker {
                 "Registered expected inbound handshake from remote IP"
             );
         }
+    }
+}
+
+impl super::InboundExpectations for ExpectedInboundTracker {
+    fn expect_incoming(&self, remote_addr: SocketAddr) {
+        ExpectedInboundTracker::expect_incoming(self, remote_addr);
     }
 }
 
@@ -5781,11 +5888,7 @@ pub mod mock_transport {
                 keypair,
                 false,
                 addr,
-                None,
-                None,
-                None,
-                None,
-                None,
+                UdpTransportConfig::default(),
             )
             .expect("listener setup");
         (public, handler, listen_handle, addr)
@@ -6132,11 +6235,7 @@ pub mod mock_transport {
                 keypair,
                 is_gateway,
                 addr,
-                None,
-                None,
-                None,
-                None,
-                None,
+                UdpTransportConfig::default(),
             )
             .expect("listener setup");
         (public, handler, addr, failures)
