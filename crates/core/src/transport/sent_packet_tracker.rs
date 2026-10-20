@@ -2548,7 +2548,7 @@ pub(in crate::transport) mod tests {
     fn test_issue_4402_plaintext_flightsize_releases_balance_all_paths() {
         // Fully ACKed stream.
         let mut tracker = mock_sent_packet_tracker();
-        let stream = StreamId::next();
+        let stream = StreamId::next_transport_internal();
         let mut flight_size = 0isize;
         report_sent_stream_packets_with_accounting(
             &mut tracker,
@@ -2566,7 +2566,7 @@ pub(in crate::transport) mod tests {
 
         // Fully abandoned stream.
         let mut tracker = mock_sent_packet_tracker();
-        let stream = StreamId::next();
+        let stream = StreamId::next_transport_internal();
         let mut flight_size = 0isize;
         report_sent_stream_packets_with_accounting(
             &mut tracker,
@@ -2586,7 +2586,7 @@ pub(in crate::transport) mod tests {
 
         // Fully dropped stream.
         let mut tracker = mock_sent_packet_tracker();
-        let stream = StreamId::next();
+        let stream = StreamId::next_transport_internal();
         let mut flight_size = 0isize;
         report_sent_stream_packets_with_accounting(
             &mut tracker,
@@ -2604,7 +2604,7 @@ pub(in crate::transport) mod tests {
 
         // Mixed stream: one packet ACKed, remainder dropped.
         let mut tracker = mock_sent_packet_tracker();
-        let stream = StreamId::next();
+        let stream = StreamId::next_transport_internal();
         let mut flight_size = 0isize;
         report_sent_stream_packets_with_accounting(
             &mut tracker,
@@ -2628,7 +2628,7 @@ pub(in crate::transport) mod tests {
     #[test]
     fn test_drop_stream_returns_exact_byte_total() {
         let mut tracker = mock_sent_packet_tracker();
-        let stream = StreamId::next();
+        let stream = StreamId::next_transport_internal();
 
         // Three fragments of distinct sizes: 3 + 5 + 7 = 15 bytes.
         tracker.report_sent_stream_packet(1, vec![0u8; 3].into(), None, stream);
@@ -2658,7 +2658,7 @@ pub(in crate::transport) mod tests {
     #[test]
     fn test_drop_stream_then_ack_is_noop() {
         let mut tracker = mock_sent_packet_tracker();
-        let stream = StreamId::next();
+        let stream = StreamId::next_transport_internal();
 
         tracker.report_sent_stream_packet(10, vec![1, 2, 3, 4].into(), None, stream);
         tracker.report_sent_stream_packet(11, vec![5, 6].into(), None, stream);
@@ -2681,7 +2681,7 @@ pub(in crate::transport) mod tests {
     #[test]
     fn test_drop_stream_then_abandon_path_is_noop() {
         let mut tracker = mock_sent_packet_tracker();
-        let stream = StreamId::next();
+        let stream = StreamId::next_transport_internal();
 
         tracker.report_sent_stream_packet(20, vec![0u8; 8].into(), None, stream);
 
@@ -2707,8 +2707,8 @@ pub(in crate::transport) mod tests {
     #[test]
     fn test_drop_stream_leaves_other_stream_intact() {
         let mut tracker = mock_sent_packet_tracker();
-        let stream_a = StreamId::next();
-        let stream_b = StreamId::next();
+        let stream_a = StreamId::next_transport_internal();
+        let stream_b = StreamId::next_transport_internal();
 
         // Interleave A and B packets in send order.
         tracker.report_sent_stream_packet(1, vec![0u8; 3].into(), None, stream_a);
@@ -2755,7 +2755,7 @@ pub(in crate::transport) mod tests {
     #[test]
     fn test_drop_stream_leaves_control_packets_intact() {
         let mut tracker = mock_sent_packet_tracker();
-        let stream = StreamId::next();
+        let stream = StreamId::next_transport_internal();
 
         // A control packet (e.g. a NoOp/handshake) and a stream fragment.
         tracker.report_sent_packet(1, vec![0u8; 50].into()); // Control (default)
@@ -2778,10 +2778,10 @@ pub(in crate::transport) mod tests {
         let mut tracker = mock_sent_packet_tracker();
 
         // Never-seen stream → 0.
-        assert_eq!(tracker.drop_stream(StreamId::next()), 0);
+        assert_eq!(tracker.drop_stream(StreamId::next_transport_internal()), 0);
 
         // A stream whose only packet was already ACKed → 0 (already drained).
-        let stream = StreamId::next();
+        let stream = StreamId::next_transport_internal();
         tracker.report_sent_stream_packet(1, vec![0u8; 5].into(), None, stream);
         tracker.report_received_receipts(&[1]);
         assert_eq!(
@@ -2798,7 +2798,7 @@ pub(in crate::transport) mod tests {
     #[test]
     fn test_drop_stream_single_packet() {
         let mut tracker = mock_sent_packet_tracker();
-        let stream = StreamId::next();
+        let stream = StreamId::next_transport_internal();
         tracker.report_sent_stream_packet(1, vec![0u8; 42].into(), None, stream);
         assert_eq!(tracker.drop_stream(stream), 42);
         assert!(tracker.pending_receipts.is_empty());
@@ -2809,7 +2809,7 @@ pub(in crate::transport) mod tests {
     #[test]
     fn test_drop_stream_many_packets() {
         let mut tracker = mock_sent_packet_tracker();
-        let stream = StreamId::next();
+        let stream = StreamId::next_transport_internal();
         let n = 500u32;
         let per_packet = 4usize;
         for id in 0..n {
@@ -2831,7 +2831,7 @@ pub(in crate::transport) mod tests {
     #[test]
     fn test_drop_stream_sweeps_retransmitted_and_pending() {
         let mut tracker = mock_sent_packet_tracker();
-        let stream = StreamId::next();
+        let stream = StreamId::next_transport_internal();
 
         // Packet 1: send, let it RTO once, and re-register (as the recv loop
         // does). The resend re-registration goes through report_sent_packet,
@@ -2876,7 +2876,7 @@ pub(in crate::transport) mod tests {
     #[test]
     fn test_drop_stream_does_not_double_release_abandoned_packet() {
         let mut tracker = mock_sent_packet_tracker();
-        let stream = StreamId::next();
+        let stream = StreamId::next_transport_internal();
 
         // Abandon packet 1 first (its 4 bytes are released by the Abandon
         // action). Sending packet 2 only AFTER abandonment keeps it out of the
@@ -2905,7 +2905,7 @@ pub(in crate::transport) mod tests {
     #[test]
     fn test_drop_stream_zero_length_packet() {
         let mut tracker = mock_sent_packet_tracker();
-        let stream = StreamId::next();
+        let stream = StreamId::next_transport_internal();
         tracker.report_sent_stream_packet(1, Box::from(&[][..]), None, stream);
         assert_eq!(tracker.drop_stream(stream), 0);
         assert!(tracker.pending_receipts.is_empty());
@@ -2932,7 +2932,7 @@ pub(in crate::transport) mod tests {
     #[test]
     fn test_drop_stream_releases_packet_out_for_resend() {
         let mut tracker = mock_sent_packet_tracker();
-        let stream = StreamId::next();
+        let stream = StreamId::next_transport_internal();
 
         tracker.report_sent_stream_packet(1, vec![0u8; 13].into(), None, stream);
 
@@ -2990,7 +2990,7 @@ pub(in crate::transport) mod tests {
     #[test]
     fn test_refresh_after_drop_stream_does_not_resurrect() {
         let mut tracker = mock_sent_packet_tracker();
-        let stream = StreamId::next();
+        let stream = StreamId::next_transport_internal();
 
         tracker.report_sent_stream_packet(1, vec![0u8; 13].into(), None, stream);
 
@@ -3056,7 +3056,7 @@ pub(in crate::transport) mod tests {
     #[test]
     fn test_report_sent_packet_resurrects_dropped_packet_footgun() {
         let mut tracker = mock_sent_packet_tracker();
-        let stream = StreamId::next();
+        let stream = StreamId::next_transport_internal();
         tracker.report_sent_stream_packet(1, vec![0u8; 13].into(), None, stream);
         assert_eq!(tracker.drop_stream(stream), 13);
 
@@ -3094,7 +3094,7 @@ pub(in crate::transport) mod tests {
     fn stream_ack_watch_reports_time_to_final_ack() {
         let mut tracker = mock_sent_packet_tracker();
         let start = tracker.time_source.now_nanos();
-        let stream = StreamId::next();
+        let stream = StreamId::next_transport_internal();
         send_stream_packets(&mut tracker, stream, 1..4);
         // An unrelated control packet acked alongside must not count.
         tracker.report_sent_packet(99, vec![0u8; 10].into());
@@ -3126,7 +3126,7 @@ pub(in crate::transport) mod tests {
     fn stream_ack_watch_completes_immediately_when_nothing_pending() {
         let mut tracker = mock_sent_packet_tracker();
         let start = tracker.time_source.now_nanos();
-        let stream = StreamId::next();
+        let stream = StreamId::next_transport_internal();
         send_stream_packets(&mut tracker, stream, 1..3);
         tracker.report_received_receipts(&[1, 2]);
         tracker.time_source.advance(Duration::from_millis(7));
@@ -3146,7 +3146,7 @@ pub(in crate::transport) mod tests {
     fn stream_ack_watch_forgets_dropped_stream() {
         let mut tracker = mock_sent_packet_tracker();
         let start = tracker.time_source.now_nanos();
-        let stream = StreamId::next();
+        let stream = StreamId::next_transport_internal();
         send_stream_packets(&mut tracker, stream, 1..3);
         assert_eq!(tracker.watch_stream_ack(stream, start), None);
         tracker.drop_stream(stream);
@@ -3161,7 +3161,7 @@ pub(in crate::transport) mod tests {
     fn stream_ack_watch_forgets_abandoned_stream_and_counts_rto_expiries() {
         let mut tracker = mock_sent_packet_tracker();
         let start = tracker.time_source.now_nanos();
-        let stream = StreamId::next();
+        let stream = StreamId::next_transport_internal();
         send_stream_packets(&mut tracker, stream, 1..3);
         assert_eq!(tracker.watch_stream_ack(stream, start), None);
         tracker.report_received_receipts(&[2]);
@@ -3197,7 +3197,7 @@ pub(in crate::transport) mod tests {
     #[test]
     fn stream_ack_watch_ignores_stream_abandoned_before_watch() {
         let mut tracker = mock_sent_packet_tracker();
-        let stream = StreamId::next();
+        let stream = StreamId::next_transport_internal();
         send_stream_packets(&mut tracker, stream, 1..2);
         let mut abandoned = false;
         for _ in 0..1_000 {
@@ -3247,14 +3247,18 @@ pub(in crate::transport) mod tests {
             panic!("packets were never all abandoned");
         };
         // Two fragments of one stream abandoned: recorded once.
-        let first = StreamId::next();
+        let first = StreamId::next_transport_internal();
         send_stream_packets(&mut tracker, first, 1..3);
         abandon_all(&mut tracker);
         assert_eq!(tracker.abandoned_streams.len(), 1);
         // Fill past the bound: the oldest id is evicted.
         let mut id = 10;
         for _ in 0..MAX_STREAM_ACK_WATCHES {
-            send_stream_packets(&mut tracker, StreamId::next(), id..id + 1);
+            send_stream_packets(
+                &mut tracker,
+                StreamId::next_transport_internal(),
+                id..id + 1,
+            );
             id += 1;
         }
         abandon_all(&mut tracker);
@@ -3270,7 +3274,7 @@ pub(in crate::transport) mod tests {
     fn stream_ack_watches_are_bounded() {
         let mut tracker = mock_sent_packet_tracker();
         for i in 0..(MAX_STREAM_ACK_WATCHES as u32 + 10) {
-            let stream = StreamId::next();
+            let stream = StreamId::next_transport_internal();
             tracker.report_sent_stream_packet(i, vec![0u8; 4].into(), None, stream);
             assert_eq!(tracker.watch_stream_ack(stream, 0), None);
         }

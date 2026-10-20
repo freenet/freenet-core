@@ -39,7 +39,7 @@ mod messages {
     use serde::{Deserialize, Serialize};
 
     use super::*;
-    use crate::transport::peer_connection::StreamId;
+    use crate::transport::StreamId;
 
     /// Payload for streaming GET responses.
     /// Contains the result of a GET operation, serialized for streaming transfer.

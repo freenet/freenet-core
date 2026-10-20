@@ -1000,7 +1000,7 @@ mod telemetry_tests {
         let time = VirtualTime::new();
         let tracker =
             parking_lot::Mutex::new(SentPacketTracker::new_with_time_source(time.clone()));
-        let none = finish_stream_telemetry(&tracker, StreamId::next(), 0, 0);
+        let none = finish_stream_telemetry(&tracker, StreamId::next_transport_internal(), 0, 0);
         assert_eq!(
             (none.final_srtt_ms, none.min_rtt_ms, none.rto_expiries),
             (None, None, 0),
@@ -1036,7 +1036,8 @@ mod telemetry_tests {
         let at_start = tracker.lock().rto_expiries();
         force_rto(4);
 
-        let end = finish_stream_telemetry(&tracker, StreamId::next(), 0, at_start);
+        let end =
+            finish_stream_telemetry(&tracker, StreamId::next_transport_internal(), 0, at_start);
         assert_eq!(end.final_srtt_ms, Some(80));
         assert_eq!(end.min_rtt_ms, Some(80));
         assert_eq!(end.rto_expiries, 1);
@@ -1052,7 +1053,7 @@ mod telemetry_tests {
         let time = VirtualTime::new();
         let tracker =
             parking_lot::Mutex::new(SentPacketTracker::new_with_time_source(time.clone()));
-        let stream = StreamId::next();
+        let stream = StreamId::next_transport_internal();
         {
             let mut t = tracker.lock();
             t.report_sent_stream_packet_with_size(1, vec![0u8; 8].into(), None, stream, 8);
@@ -1160,7 +1161,7 @@ mod tests {
         ));
 
         let background_task = GlobalExecutor::spawn(send_stream(
-            StreamId::next(),
+            StreamId::next_transport_internal(),
             Arc::new(AtomicU32::new(0)),
             Arc::new(TestSocket::new(outbound_sender)),
             remote_addr,
@@ -1260,7 +1261,7 @@ mod tests {
 
         let start_nanos = time_source.now_nanos();
         let send_task = GlobalExecutor::spawn(send_stream(
-            StreamId::next(),
+            StreamId::next_transport_internal(),
             Arc::new(AtomicU32::new(0)),
             Arc::new(TestSocket::new(outbound_sender)),
             destination_addr,
@@ -1441,7 +1442,7 @@ mod tests {
         let token_bucket = Arc::new(TokenBucket::new(1_000_000, 100_000_000));
 
         let send_task = GlobalExecutor::spawn(send_stream(
-            StreamId::next(),
+            StreamId::next_transport_internal(),
             Arc::new(AtomicU32::new(0)),
             Arc::new(TestSocket::new(outbound_sender)),
             remote_addr,
@@ -1529,7 +1530,7 @@ mod tests {
         let token_bucket = Arc::new(TokenBucket::new(1_000_000, 100_000_000));
 
         let send_task = GlobalExecutor::spawn(send_stream(
-            StreamId::next(),
+            StreamId::next_transport_internal(),
             Arc::new(AtomicU32::new(0)),
             Arc::new(TestSocket::new(outbound_sender)),
             remote_addr,
@@ -1603,7 +1604,7 @@ mod tests {
         let (completion_tx, completion_rx) = oneshot::channel();
 
         let result = send_stream(
-            StreamId::next(),
+            StreamId::next_transport_internal(),
             Arc::new(AtomicU32::new(0)),
             Arc::new(TestSocket::new(outbound_sender)),
             remote_addr,
@@ -1653,7 +1654,7 @@ mod tests {
         let cipher = random_cipher();
 
         let task = GlobalExecutor::spawn(send_stream(
-            StreamId::next(),
+            StreamId::next_transport_internal(),
             Arc::new(AtomicU32::new(0)),
             Arc::new(TestSocket::new(outbound_sender)),
             remote_addr,
@@ -1699,7 +1700,7 @@ mod tests {
             let message: Vec<u8> = (0..3_000u32).map(|i| i as u8).collect();
             let cipher = random_cipher();
             let task = GlobalExecutor::spawn(send_stream(
-                StreamId::next_operations(),
+                StreamId::next(),
                 Arc::new(AtomicU32::new(0)),
                 Arc::new(TestSocket::new(outbound_sender)),
                 remote_addr,
@@ -1751,8 +1752,8 @@ mod tests {
         let (outbound_sender, mut outbound_receiver) = mpsc::channel(4);
         let remote_addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 8080);
         let result = pipe_stream(
-            StreamHandle::new(StreamId::next_operations(), 0),
-            StreamId::next_operations(),
+            StreamHandle::new(StreamId::next(), 0),
+            StreamId::next(),
             Arc::new(AtomicU32::new(0)),
             Arc::new(TestSocket::new(outbound_sender)),
             remote_addr,
@@ -1825,7 +1826,7 @@ mod tests {
 
         let cc_for_send = congestion_controller.clone();
         let send_task = GlobalExecutor::spawn(send_stream(
-            StreamId::next(),
+            StreamId::next_transport_internal(),
             Arc::new(AtomicU32::new(0)),
             Arc::new(TestSocket::new(outbound_sender)),
             remote_addr,
@@ -1897,7 +1898,7 @@ mod tests {
 
         let cc_for_send = congestion_controller.clone();
         let send_task = GlobalExecutor::spawn(send_stream(
-            StreamId::next(),
+            StreamId::next_transport_internal(),
             Arc::new(AtomicU32::new(0)),
             Arc::new(TestSocket::new(outbound_sender)),
             remote_addr,
@@ -1969,7 +1970,7 @@ mod tests {
 
         let (completion_tx, completion_rx) = oneshot::channel();
         let background_task = GlobalExecutor::spawn(send_stream(
-            StreamId::next(),
+            StreamId::next_transport_internal(),
             Arc::new(AtomicU32::new(0)),
             Arc::new(TestSocket::new(outbound_sender)),
             remote_addr,
@@ -2044,7 +2045,7 @@ mod tests {
         let (completion_tx, completion_rx) = oneshot::channel();
         let cc_handle = congestion_controller.clone();
         let background_task = GlobalExecutor::spawn(send_stream(
-            StreamId::next(),
+            StreamId::next_transport_internal(),
             Arc::new(AtomicU32::new(0)),
             Arc::new(TestSocket::new(outbound_sender)),
             remote_addr,
@@ -2110,7 +2111,7 @@ mod tests {
         let time_source = RealTime::new();
 
         // One buffered fragment (<= FRAGMENT_PAYLOAD_SIZE, 1130 bytes).
-        let stream_id = StreamId::next();
+        let stream_id = StreamId::next_transport_internal();
         let handle = StreamHandle::new(stream_id, 1000);
         handle
             .push_fragment(1, Bytes::from(vec![0u8; 1000]))
@@ -2131,7 +2132,7 @@ mod tests {
         let cc_handle = congestion_controller.clone();
         let pipe_task = GlobalExecutor::spawn(pipe_stream(
             handle,
-            StreamId::next(),
+            StreamId::next_transport_internal(),
             Arc::new(AtomicU32::new(0)),
             Arc::new(TestSocket::new(outbound_sender)),
             remote_addr,
@@ -2169,7 +2170,7 @@ mod tests {
         let available_payload = MAX_DATA_SIZE.saturating_sub(meta_overhead);
 
         let fragment_with_typical_meta = StreamFragment {
-            stream_id: StreamId::next_operations(),
+            stream_id: StreamId::next(),
             total_length_bytes: 10000,
             fragment_number: 1,
             payload: bytes::Bytes::from(vec![0u8; available_payload]),
@@ -2197,7 +2198,7 @@ mod tests {
         let available_payload_large = MAX_DATA_SIZE.saturating_sub(large_meta_overhead);
 
         let fragment_with_large_meta = StreamFragment {
-            stream_id: StreamId::next_operations(),
+            stream_id: StreamId::next(),
             total_length_bytes: 10000,
             fragment_number: 1,
             payload: bytes::Bytes::from(vec![0u8; available_payload_large]),
@@ -2222,7 +2223,7 @@ mod tests {
 
         // Test Case 3: Fragment #2 (no metadata) should use full MAX_DATA_SIZE
         let fragment_2 = StreamFragment {
-            stream_id: StreamId::next_operations(),
+            stream_id: StreamId::next(),
             total_length_bytes: 10000,
             fragment_number: 2,
             payload: bytes::Bytes::from(vec![0u8; MAX_DATA_SIZE]),
@@ -2268,7 +2269,7 @@ mod tests {
         // so the cwnd wait (CWND_WAIT_TIMEOUT = 3s) fires before the inactivity
         // timeout (STREAM_INACTIVITY_TIMEOUT = 5s).
         // Fragment must be <= FRAGMENT_PAYLOAD_SIZE (1130 bytes).
-        let stream_id = StreamId::next();
+        let stream_id = StreamId::next_transport_internal();
         let handle = StreamHandle::new(stream_id, 10_000);
         handle
             .push_fragment(1, Bytes::from(vec![0u8; 1000]))
@@ -2294,7 +2295,7 @@ mod tests {
         let cc_handle = congestion_controller.clone();
         let pipe_task = GlobalExecutor::spawn(pipe_stream(
             handle,
-            StreamId::next(),
+            StreamId::next_transport_internal(),
             Arc::new(AtomicU32::new(0)),
             Arc::new(TestSocket::new(outbound_sender)),
             remote_addr,
@@ -2355,7 +2356,7 @@ mod tests {
         // the inactivity timeout (STREAM_INACTIVITY_TIMEOUT) fires before any
         // fragment can be sent. The stall is reached before the cwnd loop, so
         // the congestion-control config is irrelevant; use the default.
-        let stream_id = StreamId::next();
+        let stream_id = StreamId::next_transport_internal();
         let handle = StreamHandle::new(stream_id, 10_000);
 
         let congestion_controller = CongestionControlConfig::default().build_arc();
@@ -2365,7 +2366,7 @@ mod tests {
         let cc_handle = congestion_controller.clone();
         let pipe_task = GlobalExecutor::spawn(pipe_stream(
             handle,
-            StreamId::next(),
+            StreamId::next_transport_internal(),
             Arc::new(AtomicU32::new(0)),
             Arc::new(TestSocket::new(outbound_sender)),
             remote_addr,
@@ -2434,7 +2435,7 @@ mod tests {
         // Cancel the handle so the inbound stream yields Err(Cancelled). The
         // poll_next cancelled-check fires before any cwnd wait, so the
         // congestion-control config is irrelevant; use the default.
-        let stream_id = StreamId::next();
+        let stream_id = StreamId::next_transport_internal();
         let handle = StreamHandle::new(stream_id, 10_000);
         handle
             .push_fragment(1, Bytes::from(vec![0u8; 1000]))
@@ -2448,7 +2449,7 @@ mod tests {
         let cc_handle = congestion_controller.clone();
         let pipe_task = GlobalExecutor::spawn(pipe_stream(
             handle,
-            StreamId::next(),
+            StreamId::next_transport_internal(),
             Arc::new(AtomicU32::new(0)),
             Arc::new(TestSocket::new(outbound_sender)),
             remote_addr,
@@ -2538,7 +2539,7 @@ mod tests {
         let (congestion_controller, token_bucket) = unthrottled(&time_source);
         let observer = Arc::new(CountingObserver::default());
         let task = GlobalExecutor::spawn(send_stream(
-            StreamId::next(),
+            StreamId::next_transport_internal(),
             Arc::new(AtomicU32::new(0)),
             Arc::new(TestSocket::new(outbound_sender)),
             SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 8080),
@@ -2575,8 +2576,10 @@ mod tests {
         use crate::transport::peer_connection::streaming_buffer::FRAGMENT_PAYLOAD_SIZE;
 
         const FRAGMENTS: usize = 4;
-        let handle =
-            StreamHandle::new(StreamId::next(), (FRAGMENTS * FRAGMENT_PAYLOAD_SIZE) as u64);
+        let handle = StreamHandle::new(
+            StreamId::next_transport_internal(),
+            (FRAGMENTS * FRAGMENT_PAYLOAD_SIZE) as u64,
+        );
         for n in 1..=FRAGMENTS {
             handle.push_fragment(n as u32, Bytes::from(vec![7u8; FRAGMENT_PAYLOAD_SIZE]))?;
         }
@@ -2587,7 +2590,7 @@ mod tests {
         let observer = Arc::new(CountingObserver::default());
         let task = GlobalExecutor::spawn(pipe_stream(
             handle,
-            StreamId::next(),
+            StreamId::next_transport_internal(),
             Arc::new(AtomicU32::new(0)),
             Arc::new(TestSocket::new(outbound_sender)),
             SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 8080),

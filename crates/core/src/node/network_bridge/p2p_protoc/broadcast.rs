@@ -1107,7 +1107,7 @@ impl P2pConnManager {
                         continue;
                     }
                 };
-                let sid = StreamId::next_operations();
+                let sid = StreamId::next();
                 tracing::debug!(
                     tx = %update_tx,
                     contract = %key,

@@ -2829,7 +2829,7 @@ impl crate::transport::PeerConnectionApi for MockPeerConnection {
 
     fn send_stream_data(
         &mut self,
-        _stream_id: crate::transport::peer_connection::StreamId,
+        _stream_id: crate::transport::StreamId,
         _data: bytes::Bytes,
         _metadata: Option<bytes::Bytes>,
         _completion_tx: Option<tokio::sync::oneshot::Sender<crate::transport::StreamSendOutcome>>,
@@ -2851,7 +2851,7 @@ impl crate::transport::PeerConnectionApi for MockPeerConnection {
 
     fn pipe_stream_data(
         &mut self,
-        _outbound_stream_id: crate::transport::peer_connection::StreamId,
+        _outbound_stream_id: crate::transport::StreamId,
         _inbound_handle: crate::transport::peer_connection::streaming::StreamHandle,
         _metadata: Option<bytes::Bytes>,
         _progress: Option<std::sync::Arc<dyn crate::transport::StreamProgressObserver>>,

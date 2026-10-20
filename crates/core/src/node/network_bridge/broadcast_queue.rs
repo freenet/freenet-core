@@ -4045,7 +4045,7 @@ pub(super) async fn broadcast_to_single_peer(
     use crate::node::network_bridge::NetworkBridge;
     use crate::operations::update::{BroadcastStreamingPayload, UpdateMsg};
     use crate::ring::PeerKey;
-    use crate::transport::peer_connection::StreamId;
+    use crate::transport::StreamId;
 
     let Some(peer_addr) = target.socket_addr() else {
         return;
@@ -4510,7 +4510,7 @@ pub(super) async fn broadcast_to_single_peer(
                 return;
             }
         };
-        let sid = StreamId::next_operations();
+        let sid = StreamId::next();
         tracing::debug!(
             tx = %update_tx,
             contract = %key,

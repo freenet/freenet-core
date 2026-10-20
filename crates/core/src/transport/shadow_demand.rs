@@ -542,7 +542,7 @@ mod tests {
 
     fn stream_fragment() -> SymmetricMessagePayload {
         SymmetricMessagePayload::StreamFragment {
-            stream_id: crate::transport::peer_connection::StreamId::next(),
+            stream_id: crate::transport::peer_connection::StreamId::next_transport_internal(),
             total_length_bytes: 1000,
             fragment_number: 0,
             payload: bytes::Bytes::new(),

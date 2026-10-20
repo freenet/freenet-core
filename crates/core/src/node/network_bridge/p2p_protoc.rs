@@ -31,9 +31,9 @@ use crate::ring::PeerKey;
 use crate::ring::{Distance, Location};
 use crate::transport::{
     CongestionControlConfig, InboundExpectations, ListenerExit, OutboundConnector,
-    PeerConnectionApi, Socket, StreamSendOutcome, TransportError, TransportHandle,
+    PeerConnectionApi, Socket, StreamId, StreamSendOutcome, TransportError, TransportHandle,
     TransportKeypair, TransportPublicKey, UdpTransportConfig, UdpTransportSocket,
-    global_bandwidth::GlobalBandwidthManager, open_udp_transport, peer_connection::StreamId,
+    global_bandwidth::GlobalBandwidthManager, open_udp_transport,
 };
 use crate::util::time_source::{DynTimeSource, InstantTimeSrc};
 use crate::{
@@ -3983,7 +3983,7 @@ pub(crate) mod tests {
 
         fn send_stream_data(
             &mut self,
-            _stream_id: crate::transport::peer_connection::StreamId,
+            _stream_id: crate::transport::StreamId,
             _data: bytes::Bytes,
             _metadata: Option<bytes::Bytes>,
             _completion_tx: Option<
@@ -3998,7 +3998,7 @@ pub(crate) mod tests {
 
         fn pipe_stream_data(
             &mut self,
-            _outbound_stream_id: crate::transport::peer_connection::StreamId,
+            _outbound_stream_id: crate::transport::StreamId,
             _inbound_handle: crate::transport::peer_connection::streaming::StreamHandle,
             _metadata: Option<bytes::Bytes>,
             _progress: Option<Arc<dyn crate::transport::StreamProgressObserver>>,

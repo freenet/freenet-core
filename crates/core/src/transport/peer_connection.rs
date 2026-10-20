@@ -1,4 +1,3 @@
-use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -18,7 +17,7 @@ use crate::transport::sent_packet_tracker::MESSAGE_CONFIRMATION_TIMEOUT;
 use aes_gcm::Aes128Gcm;
 use futures::StreamExt;
 use futures::stream::FuturesUnordered;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tracing::{Instrument, span};
@@ -151,76 +150,7 @@ impl<S, T: TimeSource> Drop for RemoteConnection<S, T> {
     }
 }
 
-/// Unique identifier for a streaming transfer.
-///
-/// Used to correlate streaming metadata messages with their data streams.
-/// StreamIds are unique within a node's lifetime and are generated atomically.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[repr(transparent)]
-#[serde(transparent)]
-pub struct StreamId(u32);
-
-const STREAM_ID_BLOCK: u32 = 100_000;
-
-thread_local! {
-    static STREAM_ID_COUNTER: Cell<u32> = {
-        let idx = crate::config::GlobalRng::thread_index();
-        Cell::new((idx as u32) * STREAM_ID_BLOCK)
-    };
-}
-
-impl StreamId {
-    /// Marker bit that distinguishes operations-level streams from transport-level streams.
-    /// When set, the receiver skips the legacy `InboundStream` reassembly path and only
-    /// routes fragments through the orphan registry / streaming handles.
-    const OPS_STREAM_BIT: u32 = 0x8000_0000;
-
-    pub fn next() -> Self {
-        Self(STREAM_ID_COUNTER.with(|c| {
-            let v = c.get();
-            c.set(v + 1);
-            v
-        }))
-    }
-
-    /// Generate a new StreamId for operations-level streaming.
-    /// The high bit is set so the receiver can distinguish these from transport-level streams
-    /// and skip the legacy `InboundStream` decode path (which would fail because the bytes
-    /// are a streaming payload, not a `NetMessage`).
-    pub fn next_operations() -> Self {
-        let id = STREAM_ID_COUNTER.with(|c| {
-            let v = c.get();
-            c.set(v + 1);
-            v
-        });
-        Self(id | Self::OPS_STREAM_BIT)
-    }
-
-    /// Returns true if this stream was created for operations-level streaming.
-    pub fn is_operations_stream(&self) -> bool {
-        self.0 & Self::OPS_STREAM_BIT != 0
-    }
-
-    /// Reset the stream ID counter to initial state for this thread.
-    /// Thread-local, so safe for parallel test execution.
-    pub fn reset_counter() {
-        let idx = crate::config::GlobalRng::thread_index();
-        STREAM_ID_COUNTER.with(|c| c.set((idx as u32) * STREAM_ID_BLOCK));
-    }
-}
-
-impl std::fmt::Display for StreamId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.0.fmt(f)
-    }
-}
-
-#[cfg(test)]
-impl<'a> arbitrary::Arbitrary<'a> for StreamId {
-    fn arbitrary(u: &mut arbitrary::Unstructured<'a>) -> arbitrary::Result<Self> {
-        Ok(Self(u.arbitrary()?))
-    }
-}
+pub use super::boundary::StreamId;
 
 type InboundStreamResult = Result<(StreamId, SerializedMessage), StreamId>;
 
@@ -2639,7 +2569,7 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                 metadata_bytes,
             } => {
                 let now_nanos = self.time_source.now_nanos();
-                if stream_id.is_operations_stream() {
+                if stream_id.is_caller_named() {
                     let accepted = self.process_operations_fragment(
                         stream_id,
                         total_length_bytes,
@@ -2976,7 +2906,7 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
     }
 
     async fn outbound_stream(&mut self, data: SerializedMessage) {
-        let stream_id = StreamId::next();
+        let stream_id = StreamId::next_transport_internal();
         self.outbound_stream_with_id(stream_id, data.into(), None, None, None)
             .await;
     }
@@ -3770,7 +3700,7 @@ mod tests {
             let ok_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let (tx, _rx) = mpsc::channel(16);
             let socket = Arc::new(FailableTestSocket::new(tx, ok_flag));
-            let stream_id = StreamId::next();
+            let stream_id = StreamId::next_transport_internal();
             let packet_size = 128;
 
             packet_sending(
@@ -3862,7 +3792,7 @@ mod tests {
             );
 
             // ---- success: StreamFragment advances `bulk` ----
-            let frag_stream_id = StreamId::next();
+            let frag_stream_id = StreamId::next_transport_internal();
             packet_sending(
                 remote_addr,
                 &socket,
@@ -4002,7 +3932,7 @@ mod tests {
             time_source.clone(),
         ));
 
-        let stream_id = StreamId::next();
+        let stream_id = StreamId::next_transport_internal();
         // Send a long message using the outbound stream
         let outbound = GlobalExecutor::spawn(send_stream(
             stream_id,
@@ -4080,7 +4010,7 @@ mod tests {
     // SCOPE: `InboundStream` carries large NetMessage sends. It is NOT the
     // reassembler a contract state travels through - operations-level streams
     // bypass it entirely (see `process_inbound`'s
-    // `if stream_id.is_operations_stream() { return Ok(None) }`) in favour of
+    // `if stream_id.is_caller_named() { return Ok(None) }`) in favour of
     // `LockFreeStreamBuffer`. The equivalent coverage for that buffer is the
     // `streaming_buffer_*` block further down; neither block's result carries
     // over to the other.
@@ -4155,7 +4085,7 @@ mod tests {
             time_source.clone(),
         ));
 
-        let stream_id = StreamId::next();
+        let stream_id = StreamId::next_transport_internal();
         let outbound = GlobalExecutor::spawn(send_stream(
             stream_id,
             Arc::new(AtomicU32::new(0)),
@@ -4249,9 +4179,13 @@ mod tests {
             tx.send(fragment).await.expect("receiver is alive");
         }
         drop(tx);
-        recv_stream(StreamId::next(), rx, InboundStream::new(total_length_bytes))
-            .await
-            .map(|(_, msg)| msg)
+        recv_stream(
+            StreamId::next_transport_internal(),
+            rx,
+            InboundStream::new(total_length_bytes),
+        )
+        .await
+        .map(|(_, msg)| msg)
     }
 
     /// Strict reverse arrival: fragment #1, the one that may carry metadata and
@@ -4440,7 +4374,7 @@ mod tests {
     //
     // `assert_multi_fragment_roundtrip` above exercises `InboundStream`, which
     // is NOT the reassembler a contract state travels through. Operations-level
-    // streams (`StreamId::next_operations()` - every GET/PUT/broadcast payload)
+    // streams (`StreamId::next()` - every GET/PUT/broadcast payload)
     // return from `PeerConnection::process_inbound` BEFORE the legacy
     // `InboundStream` path is reached, and are reassembled instead by
     // `LockFreeStreamBuffer` behind `streaming::StreamHandle`, which
@@ -4465,7 +4399,7 @@ mod tests {
         total_length_bytes: u64,
         delivery: Vec<(u32, bytes::Bytes)>,
     ) -> std::result::Result<Vec<u8>, streaming::StreamError> {
-        let handle = streaming::StreamHandle::new(StreamId::next_operations(), total_length_bytes);
+        let handle = streaming::StreamHandle::new(StreamId::next(), total_length_bytes);
         for (number, fragment) in delivery {
             handle.push_fragment(number, fragment)?;
         }
@@ -4576,7 +4510,7 @@ mod tests {
         crate::config::GlobalRng::fill_bytes(&mut payload);
         let captured = capture_stream_fragments(&payload, None).await;
 
-        let handle = streaming::StreamHandle::new(StreamId::next_operations(), 24_832);
+        let handle = streaming::StreamHandle::new(StreamId::next(), 24_832);
         let mut consumer = handle.stream_with_reclaim();
         let mut received = Vec::with_capacity(payload.len());
 
@@ -4615,8 +4549,7 @@ mod tests {
         let captured = capture_stream_fragments(&payload, None).await;
         assert_eq!(captured.fragments.len(), 4);
 
-        let handle =
-            streaming::StreamHandle::new(StreamId::next_operations(), payload.len() as u64);
+        let handle = streaming::StreamHandle::new(StreamId::next(), payload.len() as u64);
         for (number, fragment) in &captured.fragments {
             handle.push_fragment(*number, fragment.clone()).unwrap();
         }
@@ -6072,8 +6005,8 @@ mod tests {
         let fresh_nanos = now_nanos.saturating_sub(Duration::from_secs(1).as_nanos() as u64);
 
         let registry = StreamRegistry::new();
-        let stale_id = StreamId::next();
-        let fresh_id = StreamId::next();
+        let stale_id = StreamId::next_transport_internal();
+        let fresh_id = StreamId::next_transport_internal();
         // `register` returns a fresh handle and also stores a clone inside
         // the registry — mirroring the production code path at
         // `process_inbound` line 1383.
@@ -6136,7 +6069,7 @@ mod tests {
     fn sweep_streaming_handles_inner_keeps_recent_entries() {
         use streaming::StreamRegistry;
         let registry = StreamRegistry::new();
-        let id = StreamId::next();
+        let id = StreamId::next_transport_internal();
         let handle = registry.register(id, 64 * 1024);
 
         let now_nanos = Duration::from_secs(3600).as_nanos() as u64;
@@ -6182,8 +6115,8 @@ mod tests {
     fn sweep_streaming_handles_inner_threshold_boundary_is_strict_greater_than() {
         use streaming::StreamRegistry;
         let registry = StreamRegistry::new();
-        let exact_id = StreamId::next();
-        let past_id = StreamId::next();
+        let exact_id = StreamId::next_transport_internal();
+        let past_id = StreamId::next_transport_internal();
         let exact_handle = registry.register(exact_id, 64 * 1024);
         let past_handle = registry.register(past_id, 64 * 1024);
 
@@ -6226,7 +6159,7 @@ mod tests {
     fn sweep_streaming_handles_inner_is_idempotent_on_repeat() {
         use streaming::StreamRegistry;
         let registry = StreamRegistry::new();
-        let id = StreamId::next();
+        let id = StreamId::next_transport_internal();
         let handle = registry.register(id, 64 * 1024);
         let now_nanos = STREAMING_HANDLE_IDLE_TIMEOUT_PROD.as_nanos() as u64 * 4;
 
@@ -6270,7 +6203,7 @@ mod tests {
     fn sweep_streaming_handles_inner_releases_buffer_arc() {
         use streaming::StreamRegistry;
         let registry = StreamRegistry::new();
-        let id = StreamId::next();
+        let id = StreamId::next_transport_internal();
         let handle = registry.register(id, 64 * 1024);
 
         // After register: registry holds 1 clone, our local `handle` holds 1.
@@ -6325,7 +6258,7 @@ mod tests {
         let mut expected_to_keep = Vec::new();
         let mut expected_to_drop = Vec::new();
         for i in 0..10u64 {
-            let id = StreamId::next();
+            let id = StreamId::next_transport_internal();
             let handle = registry.register(id, 64 * 1024);
             // i = 0..5 -> within window (kept); i = 5..10 -> outside (dropped).
             let last_activity_nanos = if i < 5 {
@@ -6440,7 +6373,7 @@ mod tests {
 
         // --- Part 1: behavioral pin on push_fragment's return values ---
         let registry = StreamRegistry::new();
-        let id = StreamId::next();
+        let id = StreamId::next_transport_internal();
         // 2 fragments + 1 overflow slot = 3 valid indices; index 99 is OOB.
         let handle = registry.register(id, (FRAGMENT_PAYLOAD_SIZE * 2) as u64);
 

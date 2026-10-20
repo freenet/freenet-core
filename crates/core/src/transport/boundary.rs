@@ -30,8 +30,8 @@
 //! - [`TransportError`]'s variants are UDP-shaped. The bridge classifies
 //!   errors only through [`TransportError::scope`], but still constructs
 //!   `ConnectionClosed` and `Other` itself.
-//! - The caller picks stream ids ([`StreamId`]: a `u32` with an operations
-//!   bit).
+//! - Stream ids are chosen by the SENDER ([`StreamId::next`]), not by the
+//!   transport: this is deliberate and stays (see [`StreamId`]).
 //! - [`InboundStreamRegistry`] is fragment-based (`Weak<LockFreeStreamBuffer>`).
 //! - Why a connection closed is read out of band, through
 //!   [`PeerConnectionApi::close_reason`] after `recv` fails, rather than
@@ -45,10 +45,102 @@ use std::sync::Arc;
 
 use futures::Future;
 
-use super::peer_connection::StreamId;
 use super::peer_connection::streaming::StreamHandle;
 use super::peer_connection::streaming_buffer::LockFreeStreamBuffer;
 use super::{TransportError, TransportPublicKey};
+
+/// Names one stream sent with [`PeerConnectionApi::send_stream_data`] or
+/// [`PeerConnectionApi::pipe_stream_data`].
+///
+/// The SENDER chooses it ([`StreamId::next`]) and announces it in an
+/// operations message (e.g. `GetMsg::ResponseStreaming`); the receiver
+/// claims the stream from its [`InboundStreamRegistry`] by (sender address,
+/// `StreamId`). So **every transport must deliver the sender's `StreamId`
+/// with the stream**: the UDP transport puts it in every fragment, and a QUIC
+/// transport would write it in a per-stream header ahead of the payload,
+/// since QUIC's own stream ids are assigned by the transport and cannot be
+/// chosen by the sender.
+///
+/// On the wire it is a `u32`, serialized transparently, and its values are
+/// part of the protocol with existing peers. Ids from [`StreamId::next`] have
+/// the top bit set; ids without it belong to a transport's own streams
+/// ([`StreamId::next_transport_internal`]). The UDP transport relies on that
+/// split to route a stream (see [`StreamId::is_caller_named`]).
+///
+/// The split is a convention, not a guarantee: both allocators share one
+/// per-thread counter, so once it passes 2^31 an internal id also has the top
+/// bit, and each thread's 100,000-id block overlaps the next thread's after
+/// 100,000 allocations. Receivers key streams by (peer, id), so a collision
+/// needs both within one connection's live streams.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[repr(transparent)]
+#[serde(transparent)]
+pub struct StreamId(pub(in crate::transport) u32);
+
+/// Each thread's counter starts at its own block, so ids from parallel
+/// simulation threads start apart (they overlap after `STREAM_ID_BLOCK`
+/// allocations on one thread).
+const STREAM_ID_BLOCK: u32 = 100_000;
+
+/// Top bit of ids from [`StreamId::next`].
+const CALLER_NAMED_BIT: u32 = 0x8000_0000;
+
+thread_local! {
+    static STREAM_ID_COUNTER: std::cell::Cell<u32> = {
+        let idx = crate::config::GlobalRng::thread_index();
+        std::cell::Cell::new((idx as u32) * STREAM_ID_BLOCK)
+    };
+}
+
+fn next_stream_counter() -> u32 {
+    STREAM_ID_COUNTER.with(|c| {
+        let v = c.get();
+        c.set(v + 1);
+        v
+    })
+}
+
+impl StreamId {
+    /// A fresh id for a stream this node sends with `send_stream_data` or
+    /// `pipe_stream_data`.
+    pub fn next() -> Self {
+        Self(next_stream_counter() | CALLER_NAMED_BIT)
+    }
+
+    /// A fresh id for a stream a transport opens for its own purposes (the
+    /// UDP transport's oversized messages). Distinct from ids from
+    /// [`Self::next`] until the shared counter passes 2^31 (see the type
+    /// docs).
+    pub(crate) fn next_transport_internal() -> Self {
+        Self(next_stream_counter())
+    }
+
+    /// Whether this id came from [`Self::next`]: a stream named by the
+    /// sender's caller rather than by its transport.
+    pub(crate) fn is_caller_named(&self) -> bool {
+        self.0 & CALLER_NAMED_BIT != 0
+    }
+
+    /// Reset the stream ID counter to initial state for this thread.
+    /// Thread-local, so safe for parallel test execution.
+    pub fn reset_counter() {
+        let idx = crate::config::GlobalRng::thread_index();
+        STREAM_ID_COUNTER.with(|c| c.set((idx as u32) * STREAM_ID_BLOCK));
+    }
+}
+
+impl std::fmt::Display for StreamId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+#[cfg(test)]
+impl<'a> arbitrary::Arbitrary<'a> for StreamId {
+    fn arbitrary(u: &mut arbitrary::Unstructured<'a>) -> arbitrary::Result<Self> {
+        Ok(Self(u.arbitrary()?))
+    }
+}
 
 // =============================================================================
 // Type-erased peer connection trait
@@ -298,12 +390,11 @@ pub(crate) trait PeerConnectionApi: Send {
     /// before any messages are processed.
     fn set_inbound_stream_registry(&mut self, registry: std::sync::Arc<dyn InboundStreamRegistry>);
 
-    /// Sends raw stream data to the remote peer using the given operations-level StreamId.
-    ///
-    /// The data is fragmented and sent via the transport's outbound stream mechanism,
-    /// using the provided `stream_id` (which should have the operations marker bit set)
-    /// so that the receiver routes fragments through the orphan registry instead of
-    /// the legacy InboundStream decode path.
+    /// Sends raw stream data to the remote peer as the stream `stream_id`
+    /// (from [`StreamId::next`]), which the transport delivers with the
+    /// stream so the receiver's [`InboundStreamRegistry`] gets it under that
+    /// id. The UDP transport fragments the data, and its receiver routes the
+    /// fragments to the registry because the id is caller-named.
     ///
     /// If `completion_tx` is provided, it will be signaled when the stream transfer
     /// completes, carrying a [`StreamSendOutcome`] that distinguishes an
@@ -325,7 +416,7 @@ pub(crate) trait PeerConnectionApi: Send {
     /// from an existing `StreamHandle` and forwards each fragment incrementally without
     /// waiting for full reassembly. This enables low-latency forwarding at intermediate nodes.
     ///
-    /// The `outbound_stream_id` should be created via `StreamId::next_operations()` for
+    /// The `outbound_stream_id` should be created via `StreamId::next()` for
     /// operations-level routing at the receiver.
     fn pipe_stream_data(
         &mut self,
@@ -334,4 +425,44 @@ pub(crate) trait PeerConnectionApi: Send {
         metadata: Option<bytes::Bytes>,
         progress: Option<std::sync::Arc<dyn StreamProgressObserver>>,
     ) -> std::pin::Pin<Box<dyn Future<Output = Result<(), TransportError>> + Send + '_>>;
+}
+
+#[cfg(test)]
+mod stream_id_tests {
+    use super::StreamId;
+
+    /// The values are part of the wire protocol with existing peers: the two
+    /// allocators share one per-thread counter starting at the thread's
+    /// block, ids from `next` carry the top bit, and transport-internal ids
+    /// do not. These are exactly the values `next_operations` and `next`
+    /// produced before `StreamId` moved into the boundary.
+    #[test]
+    fn stream_id_values_are_unchanged() {
+        StreamId::reset_counter();
+        let base = (crate::config::GlobalRng::thread_index() as u32) * 100_000;
+        let internal = StreamId::next_transport_internal();
+        let named = StreamId::next();
+        let internal_again = StreamId::next_transport_internal();
+        assert_eq!(internal.0, base);
+        assert_eq!(named.0, (base + 1) | 0x8000_0000);
+        assert_eq!(internal_again.0, base + 2);
+        assert!(named.is_caller_named());
+        assert!(!internal.is_caller_named());
+        assert!(!internal_again.is_caller_named());
+    }
+
+    /// A `StreamId` is serialized as its bare `u32`, as before.
+    #[test]
+    fn stream_id_serializes_as_a_bare_u32() {
+        let id = StreamId(0x8000_0007);
+        assert_eq!(
+            bincode::serialize(&id).unwrap(),
+            bincode::serialize(&0x8000_0007u32).unwrap()
+        );
+        assert_eq!(
+            bincode::deserialize::<StreamId>(&bincode::serialize(&0x8000_0007u32).unwrap())
+                .unwrap(),
+            id
+        );
+    }
 }
