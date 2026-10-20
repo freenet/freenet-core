@@ -245,6 +245,19 @@ impl<S: Send + Sync, TS: TimeSource> InboundConnectionHandler<S, TS> {
     }
 }
 
+impl<S: Socket> super::InboundAcceptor for InboundConnectionHandler<S> {
+    fn next_connection(
+        &mut self,
+    ) -> Pin<Box<dyn Future<Output = Option<Box<dyn super::PeerConnectionApi>>> + Send + '_>> {
+        // `mpsc::Receiver::recv` is cancel-safe, so the boxed future is too.
+        Box::pin(async move {
+            InboundConnectionHandler::<S>::next_connection(self)
+                .await
+                .map(|conn| Box::new(conn) as Box<dyn super::PeerConnectionApi>)
+        })
+    }
+}
+
 /// Requests a new outbound connection to a remote peer.
 pub struct OutboundConnectionHandler<S = UdpSocket, TS: TimeSource = RealTime> {
     send_queue: mpsc::Sender<(SocketAddr, ConnectionEvent<S, TS>)>,

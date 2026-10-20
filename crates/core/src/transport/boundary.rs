@@ -8,10 +8,10 @@
 //!
 //! # Known UDP assumptions still in the boundary
 //!
-//! - Outbound connections go through [`OutboundConnector`], but the rest of
-//!   connection setup is still outside the boundary: binding and the listen
-//!   task (`create_connection_handler`), accepting inbound connections
-//!   (`InboundConnectionHandler`) and `ExpectedInboundTracker`.
+//! - Outbound and inbound connections go through [`OutboundConnector`] and
+//!   [`InboundAcceptor`], but the rest of connection setup is still outside
+//!   the boundary: binding and the listen task (`create_connection_handler`)
+//!   and `ExpectedInboundTracker`.
 //! - [`OutboundConnector::connect`] carries UDP shape: it registers the
 //!   remote IP as an expected handshake source (overlapping the inbound
 //!   `expect_incoming`), it is split into enqueue and handshake stages
@@ -80,6 +80,17 @@ pub(crate) enum StreamSendOutcome {
     /// closed, congestion timeout, no connection, transport send error). The
     /// permit is released but the message was NOT delivered.
     Dropped,
+}
+
+/// Yields connections that remote peers opened to this node. The node owns
+/// one as `Box<dyn InboundAcceptor>`.
+pub(crate) trait InboundAcceptor: Send {
+    /// The next inbound connection, or `None` once the transport has stopped
+    /// accepting. Cancel-safe: dropping the future before it completes loses
+    /// no connection, so it may be polled inside `select!`.
+    fn next_connection(
+        &mut self,
+    ) -> std::pin::Pin<Box<dyn Future<Output = Option<Box<dyn PeerConnectionApi>>> + Send + '_>>;
 }
 
 /// The second stage of [`OutboundConnector::connect`]: resolves when the

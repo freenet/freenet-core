@@ -1407,7 +1407,7 @@ impl P2pConnManager {
         };
 
         let (handshake_handler, handshake_cmd_sender) = HandshakeHandler::new(
-            inbound_conn_handler,
+            Box::new(inbound_conn_handler),
             Arc::new(outbound_conn_handler.clone()),
             bridge.op_manager.ring.connection_manager.clone(),
             bridge.op_manager.ring.router.clone(),
