@@ -204,6 +204,9 @@ impl P2pConnManager {
         }
     }
 
+    // `origin` is telemetry carried alongside the dial; bundling it with the
+    // other arguments would only move them into a one-use struct.
+    #[allow(clippy::too_many_arguments)]
     pub(super) async fn handle_connect_peer(
         &mut self,
         peer: PeerKeyLocation,

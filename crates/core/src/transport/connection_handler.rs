@@ -4861,6 +4861,7 @@ pub mod mock_transport {
     }
 
     /// Polls `done` every 10 ms until it holds, failing after 10 s.
+    #[cfg(test)]
     async fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
         while !done() {
