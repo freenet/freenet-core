@@ -21,8 +21,9 @@ the Matrix/River announcements.
 > soak of the exact SHA, and a telemetry baseline. CI exercises neither a real
 > NATed peer nor the shipping binary's own updater. The trigger commands below
 > are the step that skill runs after its gates pass; they are not a standalone
-> procedure. A `dry_run=true` dispatch is **not** safe either: it still pushes,
-> opens and auto-merges the version-bump PR (#5936), so it needs the same gates.
+> procedure. A `dry_run=true` dispatch is safe only from a ref that contains
+> #5939. From an older ref it still pushes, opens and auto-merges the
+> version-bump PR (#5936), so it needs the same gates there.
 
 This doc covers how the pipeline works once triggered, and the few places
 things can go wrong.

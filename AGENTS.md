@@ -269,8 +269,9 @@ expired and the same rotation procedure applies.
 Cut releases only via the `freenet:release` skill. Its mandatory
 preconditions come first: the auto-update canaries, a 30-minute real-NAT
 soak of the exact SHA, and a telemetry baseline. Do not dispatch
-`release.yml` directly. A `dry_run=true` dispatch is **not** safe either:
-it still pushes, opens and auto-merges the version-bump PR (#5936).
+`release.yml` directly. A `dry_run=true` dispatch is safe only from a ref that
+contains #5939; from an older ref it still pushes, opens and auto-merges
+the version-bump PR (#5936).
 [`docs/RELEASING.md`](docs/RELEASING.md) describes how the pipeline works
 once triggered. The `RELEASE_PAT` section above is the prerequisite for the
 cascade to fire automatically.
