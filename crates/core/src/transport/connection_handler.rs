@@ -292,9 +292,7 @@ impl<S: Send + Sync, TS: TimeSource> InboundConnectionHandler<S, TS> {
 }
 
 impl<S: Socket> super::InboundAcceptor for InboundConnectionHandler<S> {
-    fn next_connection(
-        &mut self,
-    ) -> Pin<Box<dyn Future<Output = Option<Box<dyn super::PeerConnectionApi>>> + Send + '_>> {
+    fn next_connection(&mut self) -> super::NextConnection<'_> {
         // `mpsc::Receiver::recv` is cancel-safe, so the boxed future is too.
         Box::pin(async move {
             InboundConnectionHandler::<S>::next_connection(self)

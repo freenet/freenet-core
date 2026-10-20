@@ -135,10 +135,12 @@ pub(crate) trait InboundAcceptor: Send {
     /// The next inbound connection, or `None` once the transport has stopped
     /// accepting. Cancel-safe: dropping the future before it completes loses
     /// no connection, so it may be polled inside `select!`.
-    fn next_connection(
-        &mut self,
-    ) -> std::pin::Pin<Box<dyn Future<Output = Option<Box<dyn PeerConnectionApi>>> + Send + '_>>;
+    fn next_connection(&mut self) -> NextConnection<'_>;
 }
+
+/// What [`InboundAcceptor::next_connection`] returns.
+pub(crate) type NextConnection<'a> =
+    std::pin::Pin<Box<dyn Future<Output = Option<Box<dyn PeerConnectionApi>>> + Send + 'a>>;
 
 /// The second stage of [`OutboundConnector::connect`]: resolves when the
 /// handshake completes or fails.

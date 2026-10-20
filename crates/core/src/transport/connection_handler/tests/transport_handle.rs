@@ -53,7 +53,7 @@ async fn udp_handle_shares_one_expected_ip_set_and_reports_the_listener() {
     };
     let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
     let listen_task = tokio::spawn(async move {
-        let _ = stop_rx.await;
+        drop(stop_rx.await);
         TransportError::ChannelClosed
     });
 

@@ -524,11 +524,7 @@ mod tests {
     struct ChannelAcceptor(mpsc::Receiver<Box<dyn PeerConnectionApi>>);
 
     impl InboundAcceptor for ChannelAcceptor {
-        fn next_connection(
-            &mut self,
-        ) -> Pin<
-            Box<dyn std::future::Future<Output = Option<Box<dyn PeerConnectionApi>>> + Send + '_>,
-        > {
+        fn next_connection(&mut self) -> crate::transport::NextConnection<'_> {
             Box::pin(self.0.recv())
         }
     }
