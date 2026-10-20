@@ -341,9 +341,11 @@ impl From<SocketAddr> for ObservedAddr {
 
 pub(crate) use self::boundary::TransportHandle;
 pub(crate) use self::boundary::{
-    CloseReason, InboundAcceptor, InboundStreamRegistry, ListenerExit, OutboundConnector,
-    PeerConnectionApi, PendingConnection, StreamProgressObserver, StreamSendOutcome,
+    CloseReason, InboundAcceptor, InboundExpectations, InboundStreamRegistry, ListenerExit,
+    OutboundConnector, PeerConnectionApi, PendingConnection, StreamProgressObserver,
+    StreamSendOutcome,
 };
+#[cfg(test)]
 pub(crate) use self::connection_handler::ExpectedInboundTracker;
 pub use self::connection_handler::create_connection_handler;
 pub(crate) use self::connection_handler::open_udp_transport;

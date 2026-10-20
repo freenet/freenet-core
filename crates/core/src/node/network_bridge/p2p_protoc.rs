@@ -30,7 +30,7 @@ use crate::operations::connect::ConnectMsg;
 use crate::ring::PeerKey;
 use crate::ring::{Distance, Location};
 use crate::transport::{
-    CongestionControlConfig, ExpectedInboundTracker, ListenerExit, PeerConnectionApi, Socket,
+    CongestionControlConfig, InboundExpectations, ListenerExit, PeerConnectionApi, Socket,
     StreamSendOutcome, TransportError, TransportHandle, TransportKeypair, TransportPublicKey,
     UdpTransportSocket, global_bandwidth::GlobalBandwidthManager, open_udp_transport,
     peer_connection::StreamId,
@@ -3180,7 +3180,7 @@ async fn fail_awaiting_connection(
 }
 
 struct EventListenerState {
-    expected_inbound: ExpectedInboundTracker,
+    expected_inbound: Arc<dyn InboundExpectations>,
     pending_from_executor: HashSet<Transaction>,
     /// Maps transactions to the set of clients waiting for their results.
     /// Cleaned up via `TransactionTimedOut` and `TransactionCompleted` handlers.
@@ -3199,7 +3199,7 @@ struct EventListenerState {
 }
 
 impl EventListenerState {
-    fn new(expected_inbound: ExpectedInboundTracker) -> Self {
+    fn new(expected_inbound: Arc<dyn InboundExpectations>) -> Self {
         Self {
             expected_inbound,
             pending_from_executor: HashSet::new(),
@@ -4826,7 +4826,8 @@ pub(crate) mod tests {
 
         let removes_before = GlobalTestMetrics::pending_op_removes();
 
-        let mut state = super::EventListenerState::new(ExpectedInboundTracker::empty_for_test());
+        let mut state =
+            super::EventListenerState::new(Arc::new(ExpectedInboundTracker::empty_for_test()));
         for _ in 0..3 {
             let (callback, _rx) = mpsc::channel(1);
             state
@@ -4873,9 +4874,9 @@ pub(crate) mod tests {
         use crate::transport::ExpectedInboundTracker;
 
         let removes_before = GlobalTestMetrics::pending_op_removes();
-        drop(super::EventListenerState::new(
+        drop(super::EventListenerState::new(Arc::new(
             ExpectedInboundTracker::empty_for_test(),
-        ));
+        )));
         assert_eq!(GlobalTestMetrics::pending_op_removes(), removes_before);
     }
 
@@ -6764,7 +6765,8 @@ pub(crate) mod tests {
         use crate::transport::ExpectedInboundTracker;
         use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
-        let mut state = super::EventListenerState::new(ExpectedInboundTracker::empty_for_test());
+        let mut state =
+            super::EventListenerState::new(Arc::new(ExpectedInboundTracker::empty_for_test()));
         let peer_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 45678);
         let tx = Transaction::new::<crate::operations::connect::ConnectMsg>();
 
@@ -6933,7 +6935,8 @@ pub(crate) mod tests {
         use crate::transport::ExpectedInboundTracker;
         use tokio::sync::mpsc::error::TryRecvError;
 
-        let mut state = super::EventListenerState::new(ExpectedInboundTracker::empty_for_test());
+        let mut state =
+            super::EventListenerState::new(Arc::new(ExpectedInboundTracker::empty_for_test()));
         let tx = crate::dev_tool::Transaction::new::<crate::operations::put::PutMsg>();
 
         // Step 1: the originator's live waiter (send_and_await's callback).
@@ -7000,7 +7003,8 @@ pub(crate) mod tests {
     async fn install_pending_op_callback_drops_a_refused_newcomer() {
         use crate::transport::ExpectedInboundTracker;
 
-        let mut state = super::EventListenerState::new(ExpectedInboundTracker::empty_for_test());
+        let mut state =
+            super::EventListenerState::new(Arc::new(ExpectedInboundTracker::empty_for_test()));
         let tx = crate::dev_tool::Transaction::new::<crate::operations::put::PutMsg>();
 
         // A live incumbent holds the slot.
@@ -7045,7 +7049,8 @@ pub(crate) mod tests {
     async fn install_pending_op_callback_skips_a_closed_incoming_callback() {
         use crate::transport::ExpectedInboundTracker;
 
-        let mut state = super::EventListenerState::new(ExpectedInboundTracker::empty_for_test());
+        let mut state =
+            super::EventListenerState::new(Arc::new(ExpectedInboundTracker::empty_for_test()));
         let tx = crate::dev_tool::Transaction::new::<crate::operations::put::PutMsg>();
 
         let (sender, receiver) = mpsc::channel::<crate::node::WaiterReply>(1);
@@ -7078,7 +7083,8 @@ pub(crate) mod tests {
     async fn install_pending_op_callback_replaces_a_closed_incumbent() {
         use crate::transport::ExpectedInboundTracker;
 
-        let mut state = super::EventListenerState::new(ExpectedInboundTracker::empty_for_test());
+        let mut state =
+            super::EventListenerState::new(Arc::new(ExpectedInboundTracker::empty_for_test()));
         let tx = crate::dev_tool::Transaction::new::<crate::operations::put::PutMsg>();
 
         // A stale incumbent whose receiver is already gone.
@@ -7132,7 +7138,8 @@ pub(crate) mod tests {
     async fn install_pending_op_callback_inserts_when_the_slot_is_empty() {
         use crate::transport::ExpectedInboundTracker;
 
-        let mut state = super::EventListenerState::new(ExpectedInboundTracker::empty_for_test());
+        let mut state =
+            super::EventListenerState::new(Arc::new(ExpectedInboundTracker::empty_for_test()));
         let tx = crate::dev_tool::Transaction::new::<crate::operations::put::PutMsg>();
 
         let (sender, _rx) = mpsc::channel::<crate::node::WaiterReply>(1);

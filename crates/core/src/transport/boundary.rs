@@ -9,8 +9,9 @@
 //! # Known UDP assumptions still in the boundary
 //!
 //! - The node opens a transport as a [`TransportHandle`], but only the UDP
-//!   transport can be opened (`open_udp_transport`), and
-//!   `ExpectedInboundTracker` is the UDP transport's expected-IP set.
+//!   transport can be opened (`open_udp_transport`).
+//! - [`InboundExpectations`] registers an IP, not a peer identity, and shares
+//!   its set with outbound connect.
 //! - [`OutboundConnector::connect`] carries UDP shape: it registers the
 //!   remote IP as an expected handshake source (overlapping the inbound
 //!   `expect_incoming`), it is split into enqueue and handshake stages
@@ -89,10 +90,18 @@ pub(crate) struct TransportHandle {
     /// Yields inbound connections.
     pub(crate) acceptor: Box<dyn InboundAcceptor>,
     /// Registers peers expected to connect in.
-    pub(crate) expected_inbound: super::ExpectedInboundTracker,
+    pub(crate) expected_inbound: Arc<dyn InboundExpectations>,
     /// Resolves when the transport's listener stops. The node treats that as
     /// fatal.
     pub(crate) listener: ListenerLiveness,
+}
+
+/// Registers peers the node expects to connect in, so the transport accepts
+/// their handshake. It shares its state with [`OutboundConnector::connect`],
+/// which registers the remote the same way when the node dials out.
+pub(crate) trait InboundExpectations: Send + Sync {
+    /// Expect a connection from `remote_addr`.
+    fn expect_incoming(&self, remote_addr: SocketAddr);
 }
 
 /// Resolves, once, when the transport's listener stops.

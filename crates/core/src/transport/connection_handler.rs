@@ -238,7 +238,7 @@ pub(crate) fn udp_transport_handle<S: Socket>(
     listen_task: tokio::task::JoinHandle<TransportError>,
 ) -> super::TransportHandle {
     super::TransportHandle {
-        expected_inbound: outbound.expected_inbound_tracker(),
+        expected_inbound: Arc::new(outbound.expected_inbound_tracker()),
         connector: Arc::new(outbound),
         acceptor: Box::new(inbound),
         listener: Box::pin(async move { super::ListenerExit::from_join(listen_task.await) }),
@@ -552,6 +552,12 @@ impl ExpectedInboundTracker {
                 "Registered expected inbound handshake from remote IP"
             );
         }
+    }
+}
+
+impl super::InboundExpectations for ExpectedInboundTracker {
+    fn expect_incoming(&self, remote_addr: SocketAddr) {
+        ExpectedInboundTracker::expect_incoming(self, remote_addr);
     }
 }
 
