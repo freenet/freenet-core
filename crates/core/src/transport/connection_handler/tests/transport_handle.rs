@@ -86,3 +86,92 @@ async fn udp_handle_shares_one_expected_ip_set_and_reports_the_listener() {
         "{exit:?}"
     );
 }
+
+/// The listener runs while ANY connector is alive, and exits with
+/// `ConnectionClosed` once the last is dropped. This is why the event loop
+/// keeps its own connector (`event_loop_keeps_a_connector_alive`): dropping
+/// the handshake driver's copy alone must not stop the listener.
+#[tokio::test]
+async fn listener_outlives_a_dropped_connector_while_a_clone_remains() {
+    let channels = Arc::new(dashmap::DashMap::new());
+    let addr: SocketAddr = (std::net::Ipv4Addr::LOCALHOST, 47_510).into();
+    let socket = MockSocket::new(Default::default(), Default::default(), addr, channels).await;
+    let (outbound, inbound, listen_task) = OutboundConnectionHandler::config_listener(
+        Arc::new(socket),
+        TransportKeypair::new(),
+        false,
+        addr,
+        UdpTransportConfig::default(),
+    )
+    .map(|(o, rx, task)| {
+        (
+            o,
+            InboundConnectionHandler {
+                new_connection_notifier: rx,
+            },
+            task,
+        )
+    })
+    .expect("listener setup");
+    let TransportHandle {
+        connector,
+        acceptor: _acceptor,
+        expected_inbound: _expected,
+        mut listener,
+    } = udp_transport_handle(outbound, inbound, listen_task);
+    let keepalive = Arc::clone(&connector);
+
+    drop(connector);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), &mut listener)
+            .await
+            .is_err(),
+        "the listener must keep running while a connector remains"
+    );
+
+    drop(keepalive);
+    let exit = tokio::time::timeout(Duration::from_secs(5), listener)
+        .await
+        .expect("the listener stops once every connector is gone");
+    assert!(
+        matches!(exit, ListenerExit::Error(TransportError::ConnectionClosed(a)) if a == addr),
+        "{exit:?}"
+    );
+}
+
+/// `new_listener` puts each `UdpTransportConfig` knob into the listener field
+/// of the same name: a swap of the two `Option<usize>` knobs is caught here.
+#[tokio::test]
+async fn udp_transport_config_reaches_the_listener_by_name() {
+    let channels = Arc::new(dashmap::DashMap::new());
+    let addr: SocketAddr = (std::net::Ipv4Addr::LOCALHOST, 47_511).into();
+    let socket = MockSocket::new(Default::default(), Default::default(), addr, channels).await;
+    let global = Arc::new(GlobalBandwidthManager::new(1_000_000, None));
+    let (listener, _outbound, _inbound) = OutboundConnectionHandler::new_listener(
+        Arc::new(socket),
+        TransportKeypair::new(),
+        false,
+        addr,
+        UdpTransportConfig {
+            bandwidth_limit: Some(1_111),
+            global_bandwidth: Some(global.clone()),
+            ledbat_min_ssthresh: Some(2_222),
+            congestion_config: None,
+            ack_version_floor_override: Some((9, 8, 7)),
+        },
+    );
+    assert_eq!(listener.bandwidth_limit, Some(1_111));
+    assert_eq!(listener.ledbat_min_ssthresh, Some(2_222));
+    assert!(Arc::ptr_eq(
+        listener
+            .global_bandwidth
+            .as_ref()
+            .expect("global bandwidth"),
+        &global
+    ));
+    assert_eq!(listener.ack_version_floor_override, Some((9, 8, 7)));
+    assert!(
+        listener.congestion_config.is_some(),
+        "an unset congestion config defaults, as before"
+    );
+}

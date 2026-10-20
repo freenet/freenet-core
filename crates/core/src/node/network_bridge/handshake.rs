@@ -185,12 +185,15 @@ struct ExpectedInbound {
     transient: bool, // TODO: rename to transient in protocol once we migrate terminology
 }
 
+/// Matches accepted connections to the connect operations that expect them,
+/// by socket address. Node-side bookkeeping, distinct from the transport's
+/// expected-IP set (`InboundExpectations`).
 #[derive(Default)]
-struct ExpectedInboundTracker {
+struct InboundMatcher {
     entries: HashMap<SocketAddr, ExpectedInbound>,
 }
 
-impl ExpectedInboundTracker {
+impl InboundMatcher {
     fn register(
         &mut self,
         peer: PeerKeyLocation,
@@ -257,7 +260,7 @@ async fn run_driver(
 ) {
     use tokio::select;
 
-    let mut expected_inbound = ExpectedInboundTracker::default();
+    let mut expected_inbound = InboundMatcher::default();
 
     loop {
         select! {
@@ -603,6 +606,18 @@ mod tests {
         assert_eq!(transaction, None);
         assert!(!transient);
         assert_eq!(connection.remote_addr(), stranger);
+        ready.store(false, std::sync::atomic::Ordering::SeqCst);
+        // Read only after the event, which the driver sends after setting it.
+        conn_tx
+            .send(Box::new(NullConnection(stranger)))
+            .await
+            .ok()
+            .unwrap();
+        assert!(event_rx.recv().await.is_some());
+        assert!(
+            ready.load(std::sync::atomic::Ordering::SeqCst),
+            "every accept marks the peer ready, not only the first"
+        );
 
         drop(conn_tx);
         driver.await.expect("the driver ends cleanly");
@@ -760,7 +775,7 @@ mod tests {
 
     #[test]
     fn tracker_returns_registered_entry_exactly_once() {
-        let mut tracker = ExpectedInboundTracker::default();
+        let mut tracker = InboundMatcher::default();
         let peer = make_peer(4100);
         let addr = peer.socket_addr().unwrap();
         let tx = Transaction::new::<ConnectMsg>();
@@ -777,7 +792,7 @@ mod tests {
 
     #[test]
     fn tracker_drop_removes_entry() {
-        let mut tracker = ExpectedInboundTracker::default();
+        let mut tracker = InboundMatcher::default();
         let peer = make_peer(4200);
         let addr = peer.socket_addr().unwrap();
         tracker.register(peer.clone(), None, false);
@@ -790,7 +805,7 @@ mod tests {
 
     #[test]
     fn tracker_overwrites_existing_expectation() {
-        let mut tracker = ExpectedInboundTracker::default();
+        let mut tracker = InboundMatcher::default();
         let peer = make_peer(4300);
         let addr = peer.socket_addr().unwrap();
         tracker.register(peer.clone(), None, false);
@@ -808,7 +823,7 @@ mod tests {
 
     #[test]
     fn tracker_keeps_peers_separate_on_same_ip() {
-        let mut tracker = ExpectedInboundTracker::default();
+        let mut tracker = InboundMatcher::default();
         let peer_a = make_peer(4400);
         let peer_b = make_peer(4401);
         let addr_a = peer_a.socket_addr().unwrap();

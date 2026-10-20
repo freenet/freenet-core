@@ -162,6 +162,52 @@ pub async fn create_connection_handler<S: Socket>(
     ),
     TransportError,
 > {
+    bind_udp_listener::<S>(
+        keypair,
+        listen_host,
+        listen_port,
+        is_gateway,
+        UdpTransportConfig {
+            bandwidth_limit,
+            global_bandwidth,
+            ledbat_min_ssthresh,
+            congestion_config,
+            ack_version_floor_override,
+        },
+    )
+    .await
+}
+
+/// The UDP transport's tuning knobs, passed by name so that two knobs of the
+/// same type cannot be swapped by position.
+#[derive(Default)]
+pub(crate) struct UdpTransportConfig {
+    /// Per-connection bandwidth limit in bytes/sec.
+    pub(crate) bandwidth_limit: Option<usize>,
+    /// Shared bandwidth manager.
+    pub(crate) global_bandwidth: Option<Arc<GlobalBandwidthManager>>,
+    /// Minimum slow-start threshold for LEDBAT.
+    pub(crate) ledbat_min_ssthresh: Option<usize>,
+    /// Congestion control config (defaults to FixedRate).
+    pub(crate) congestion_config: Option<CongestionControlConfig>,
+    /// The #5161 version-carrying-ack floor override; `None` in production.
+    pub(crate) ack_version_floor_override: Option<(u8, u8, u16)>,
+}
+
+type UdpListenerParts<S> = (
+    OutboundConnectionHandler<S>,
+    InboundConnectionHandler<S>,
+    tokio::task::JoinHandle<TransportError>,
+);
+
+/// Bind the UDP socket and start its listener.
+async fn bind_udp_listener<S: Socket>(
+    keypair: TransportKeypair,
+    listen_host: IpAddr,
+    listen_port: u16,
+    is_gateway: bool,
+    config: UdpTransportConfig,
+) -> Result<UdpListenerParts<S>, TransportError> {
     // Bind the UDP socket to the specified port with retry for transient failures
     let bind_addr: SocketAddr = (listen_host, listen_port).into();
     tracing::debug!(
@@ -184,11 +230,7 @@ pub async fn create_connection_handler<S: Socket>(
         keypair,
         is_gateway,
         (listen_host, listen_port).into(),
-        bandwidth_limit,
-        global_bandwidth,
-        ledbat_min_ssthresh,
-        congestion_config,
-        ack_version_floor_override,
+        config,
     )?;
     Ok((
         och,
@@ -200,32 +242,17 @@ pub async fn create_connection_handler<S: Socket>(
 }
 
 /// Open the UDP transport and return it as the node's [`TransportHandle`]
-/// (`super::TransportHandle`). Same arguments and binding as
+/// (`super::TransportHandle`). Binds the same way as
 /// [`create_connection_handler`].
-#[allow(clippy::too_many_arguments)]
 pub(crate) async fn open_udp_transport<S: Socket>(
     keypair: TransportKeypair,
     listen_host: IpAddr,
     listen_port: u16,
     is_gateway: bool,
-    bandwidth_limit: Option<usize>,
-    global_bandwidth: Option<Arc<GlobalBandwidthManager>>,
-    ledbat_min_ssthresh: Option<usize>,
-    congestion_config: Option<CongestionControlConfig>,
-    ack_version_floor_override: Option<(u8, u8, u16)>,
+    config: UdpTransportConfig,
 ) -> Result<super::TransportHandle, TransportError> {
-    let (outbound, inbound, listen_task) = create_connection_handler::<S>(
-        keypair,
-        listen_host,
-        listen_port,
-        is_gateway,
-        bandwidth_limit,
-        global_bandwidth,
-        ledbat_min_ssthresh,
-        congestion_config,
-        ack_version_floor_override,
-    )
-    .await?;
+    let (outbound, inbound, listen_task) =
+        bind_udp_listener::<S>(keypair, listen_host, listen_port, is_gateway, config).await?;
     Ok(udp_transport_handle(outbound, inbound, listen_task))
 }
 
@@ -327,18 +354,51 @@ type ListenerSetup<S> = (
 
 #[allow(private_bounds)]
 impl<S: Socket> OutboundConnectionHandler<S> {
-    #[allow(clippy::too_many_arguments)]
     fn config_listener(
         socket: Arc<S>,
         keypair: TransportKeypair,
         is_gateway: bool,
         socket_addr: SocketAddr,
-        bandwidth_limit: Option<usize>,
-        global_bandwidth: Option<Arc<GlobalBandwidthManager>>,
-        ledbat_min_ssthresh: Option<usize>,
-        congestion_config: Option<CongestionControlConfig>,
-        ack_version_floor_override: Option<(u8, u8, u16)>,
+        config: UdpTransportConfig,
     ) -> Result<ListenerSetup<S>, TransportError> {
+        let (transport, connection_handler, new_connection_notifier) =
+            Self::new_listener(socket, keypair, is_gateway, socket_addr, config);
+        // Packets are now sent directly to socket from each connection,
+        // bypassing the centralized rate limiter that was causing serialization bottlenecks.
+        // Per-connection rate limiting is handled by TokenBucket and LEDBAT in RemoteConnection.
+        let listen_handle = GlobalExecutor::spawn(RANDOM_U64.scope(
+            {
+                // Use GlobalRng for deterministic simulation
+                let seed = GlobalRng::random_u64();
+                let mut rng = StdRng::seed_from_u64(seed);
+                rng.random()
+            },
+            transport.listen(),
+        ));
+
+        Ok((connection_handler, new_connection_notifier, listen_handle))
+    }
+
+    /// Build the listener (not yet running) and the handles onto it.
+    #[allow(clippy::type_complexity)]
+    fn new_listener(
+        socket: Arc<S>,
+        keypair: TransportKeypair,
+        is_gateway: bool,
+        socket_addr: SocketAddr,
+        config: UdpTransportConfig,
+    ) -> (
+        UdpPacketsListener<S>,
+        OutboundConnectionHandler<S>,
+        mpsc::Receiver<PeerConnection<S>>,
+    ) {
+        let UdpTransportConfig {
+            bandwidth_limit,
+            global_bandwidth,
+            ledbat_min_ssthresh,
+            congestion_config,
+            ack_version_floor_override,
+        } = config;
         let (conn_handler_sender, conn_handler_receiver) = mpsc::channel(100);
         let (new_connection_sender, new_connection_notifier) = mpsc::channel(10);
         let expected_non_gateway = Arc::new(DashSet::new());
@@ -376,21 +436,7 @@ impl<S: Socket> OutboundConnectionHandler<S> {
             send_queue: conn_handler_sender,
             expected_non_gateway,
         };
-
-        // Packets are now sent directly to socket from each connection,
-        // bypassing the centralized rate limiter that was causing serialization bottlenecks.
-        // Per-connection rate limiting is handled by TokenBucket and LEDBAT in RemoteConnection.
-        let listen_handle = GlobalExecutor::spawn(RANDOM_U64.scope(
-            {
-                // Use GlobalRng for deterministic simulation
-                let seed = GlobalRng::random_u64();
-                let mut rng = StdRng::seed_from_u64(seed);
-                rng.random()
-            },
-            transport.listen(),
-        ));
-
-        Ok((connection_handler, new_connection_notifier, listen_handle))
+        (transport, connection_handler, new_connection_notifier)
     }
 
     #[cfg(any(test, feature = "bench"))]
@@ -430,11 +476,11 @@ impl<S: Socket> OutboundConnectionHandler<S> {
             keypair,
             is_gateway,
             socket_addr,
-            bandwidth_limit,
-            None,
-            None,
-            None,
-            ack_version_floor_override,
+            UdpTransportConfig {
+                bandwidth_limit,
+                ack_version_floor_override,
+                ..UdpTransportConfig::default()
+            },
         )?;
         Ok((handler, receiver))
     }
@@ -525,11 +571,9 @@ impl<S: Socket> super::OutboundConnector for OutboundConnectionHandler<S> {
     }
 }
 
-/// A handle for registering expected inbound connections.
-///
-/// This is a type-erased wrapper around the expected inbound IP set, allowing
-/// `EventListenerState` to register expected connections without being generic
-/// over the socket type.
+/// The UDP transport's expected-inbound IP set, shared with the outbound
+/// handler that registers dialled IPs in the same set. The node reaches it
+/// as `Arc<dyn InboundExpectations>`.
 #[derive(Clone)]
 pub struct ExpectedInboundTracker(Arc<DashSet<IpAddr>>);
 
@@ -5844,11 +5888,7 @@ pub mod mock_transport {
                 keypair,
                 false,
                 addr,
-                None,
-                None,
-                None,
-                None,
-                None,
+                UdpTransportConfig::default(),
             )
             .expect("listener setup");
         (public, handler, listen_handle, addr)
@@ -6195,11 +6235,7 @@ pub mod mock_transport {
                 keypair,
                 is_gateway,
                 addr,
-                None,
-                None,
-                None,
-                None,
-                None,
+                UdpTransportConfig::default(),
             )
             .expect("listener setup");
         (public, handler, addr, failures)

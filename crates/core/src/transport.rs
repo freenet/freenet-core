@@ -348,7 +348,7 @@ pub(crate) use self::boundary::{
 #[cfg(test)]
 pub(crate) use self::connection_handler::ExpectedInboundTracker;
 pub use self::connection_handler::create_connection_handler;
-pub(crate) use self::connection_handler::open_udp_transport;
+pub(crate) use self::connection_handler::{UdpTransportConfig, open_udp_transport};
 pub use self::crypto::{TransportKeypair, TransportPublicKey};
 pub use self::{
     connection_handler::{InboundConnectionHandler, OutboundConnectionHandler},

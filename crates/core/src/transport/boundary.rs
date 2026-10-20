@@ -9,9 +9,17 @@
 //! # Known UDP assumptions still in the boundary
 //!
 //! - The node opens a transport as a [`TransportHandle`], but only the UDP
-//!   transport can be opened (`open_udp_transport`).
-//! - [`InboundExpectations`] registers an IP, not a peer identity, and shares
-//!   its set with outbound connect.
+//!   transport can be opened (`open_udp_transport`), and its tuning
+//!   (`UdpTransportConfig`: bandwidth limits, LEDBAT slow-start threshold,
+//!   congestion control) is UDP-specific.
+//! - [`InboundExpectations::expect_incoming`] takes a `SocketAddr` but keeps
+//!   only its IP, not a peer identity, and shares its set with outbound
+//!   connect.
+//! - The node matches an accepted connection to its pending expectations by
+//!   `SocketAddr` (`InboundMatcher` in `handshake.rs`).
+//! - [`ListenerExit::Error`] carries a UDP-shaped [`TransportError`], and the
+//!   event loop's log lines for a stopped listener still say "UDP listen
+//!   task".
 //! - [`OutboundConnector::connect`] carries UDP shape: it registers the
 //!   remote IP as an expected handshake source (overlapping the inbound
 //!   `expect_incoming`), it is split into enqueue and handshake stages
@@ -100,7 +108,8 @@ pub(crate) struct TransportHandle {
 /// their handshake. It shares its state with [`OutboundConnector::connect`],
 /// which registers the remote the same way when the node dials out.
 pub(crate) trait InboundExpectations: Send + Sync {
-    /// Expect a connection from `remote_addr`.
+    /// Expect a connection from `remote_addr`. The UDP transport keeps only
+    /// the IP: the port is discarded, so any port on that IP is expected.
     fn expect_incoming(&self, remote_addr: SocketAddr);
 }
 
