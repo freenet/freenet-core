@@ -8,8 +8,17 @@
 //!
 //! # Known UDP assumptions still in the boundary
 //!
-//! - Connection setup is outside the trait (`create_connection_handler`,
-//!   `ExpectedInboundTracker`).
+//! - Outbound connections go through [`OutboundConnector`], but the rest of
+//!   connection setup is still outside the boundary: binding and the listen
+//!   task (`create_connection_handler`), accepting inbound connections
+//!   (`InboundConnectionHandler`) and `ExpectedInboundTracker`.
+//! - [`OutboundConnector::connect`] carries UDP shape: it registers the
+//!   remote IP as an expected handshake source (overlapping the inbound
+//!   `expect_incoming`), it is split into enqueue and handshake stages
+//!   because the UDP listener takes requests through a bounded queue (a
+//!   QUIC transport would be a single `connect().await`), and it dials by
+//!   the X25519 [`TransportPublicKey`] where QUIC identifies a peer by its
+//!   certificate.
 //! - [`TransportError`]'s variants are UDP-shaped. The bridge classifies
 //!   errors only through [`TransportError::scope`], but still constructs
 //!   `ConnectionClosed` and `Other` itself.
@@ -27,10 +36,10 @@ use std::net::SocketAddr;
 
 use futures::Future;
 
-use super::TransportError;
 use super::peer_connection::StreamId;
 use super::peer_connection::streaming::StreamHandle;
 use super::peer_connection::streaming_buffer::LockFreeStreamBuffer;
+use super::{TransportError, TransportPublicKey};
 
 // =============================================================================
 // Type-erased peer connection trait
@@ -71,6 +80,37 @@ pub(crate) enum StreamSendOutcome {
     /// closed, congestion timeout, no connection, transport send error). The
     /// permit is released but the message was NOT delivered.
     Dropped,
+}
+
+/// The second stage of [`OutboundConnector::connect`]: resolves when the
+/// handshake completes or fails.
+pub(crate) type PendingConnection = std::pin::Pin<
+    Box<dyn Future<Output = Result<Box<dyn PeerConnectionApi>, TransportError>> + Send>,
+>;
+
+/// Opens outbound connections. The node holds one as
+/// `Arc<dyn OutboundConnector>`.
+pub(crate) trait OutboundConnector: Send + Sync {
+    /// Ask the transport to connect to `remote_addr`, whose transport key is
+    /// `remote_public_key`.
+    ///
+    /// Contract: the first stage registers `remote_addr`'s IP as an expected
+    /// handshake source, so the transport accepts the peer's reply; this
+    /// overlaps with registering an expected inbound connection.
+    ///
+    /// There are two stages. The returned future hands the attempt to the
+    /// transport, which may mean waiting for room in the UDP listener's
+    /// bounded queue. The [`PendingConnection`] it yields resolves when the
+    /// handshake completes or fails. The node's connect timeout covers only
+    /// the second stage; the enqueue stage is deliberately left unbounded to
+    /// match the behaviour before this trait existed. That is a known gap: a
+    /// stalled listener with a full queue makes the connect wait forever
+    /// (#5947).
+    fn connect(
+        &self,
+        remote_public_key: TransportPublicKey,
+        remote_addr: SocketAddr,
+    ) -> std::pin::Pin<Box<dyn Future<Output = PendingConnection> + Send + '_>>;
 }
 
 /// Why a connection's `recv` ended it, as reported by

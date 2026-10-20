@@ -382,6 +382,8 @@ impl<S: Socket> OutboundConnectionHandler<S> {
         Ok((handler, receiver))
     }
 
+    /// `OutboundConnector::connect` calls this on a clone, so it must only
+    /// touch `Arc`-shared state.
     pub async fn connect(
         &mut self,
         remote_public_key: TransportPublicKey,
@@ -436,6 +438,33 @@ impl<S: Socket> OutboundConnectionHandler<S> {
     /// without holding a reference to the entire `OutboundConnectionHandler`.
     pub fn expected_inbound_tracker(&self) -> ExpectedInboundTracker {
         ExpectedInboundTracker(self.expected_non_gateway.clone())
+    }
+}
+
+impl<S: Socket> super::OutboundConnector for OutboundConnectionHandler<S> {
+    // Yielding a future from an async block is the point: the first stage
+    // queues the attempt and the second awaits the handshake (see the trait).
+    #[allow(clippy::async_yields_async)]
+    fn connect(
+        &self,
+        remote_public_key: TransportPublicKey,
+        remote_addr: SocketAddr,
+    ) -> Pin<Box<dyn Future<Output = super::PendingConnection> + Send + '_>> {
+        // The inherent `connect` takes `&mut self` but mutates nothing; a
+        // clone shares the queue and the expected-IP set.
+        let mut handler = self.clone();
+        Box::pin(async move {
+            let pending = OutboundConnectionHandler::<S>::connect(
+                &mut handler,
+                remote_public_key,
+                remote_addr,
+            )
+            .await;
+            let pending: super::PendingConnection = Box::pin(pending.map(|result| {
+                result.map(|conn| Box::new(conn) as Box<dyn super::PeerConnectionApi>)
+            }));
+            pending
+        })
     }
 }
 

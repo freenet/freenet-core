@@ -7,3 +7,7 @@
 /// against the primitive the transport now uses, so any future regression
 /// (e.g. swapping back to a wrapper that wedges) trips a clear unit test.
 mod mpsc_invariants;
+
+/// The UDP transport's implementation of the `OutboundConnector` boundary
+/// trait forwards each stage of a connect to `OutboundConnectionHandler`.
+mod outbound_connector;
