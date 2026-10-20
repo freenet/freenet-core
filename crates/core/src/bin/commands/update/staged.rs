@@ -608,6 +608,10 @@ enum Staging {
     Deferred,
     /// The release is cooling down; nothing was attempted. The node stays.
     CoolingDown,
+    /// The tag lookup found nothing newer to install, or only a release this
+    /// node has blocked (#4073), for a trigger that named no release. The
+    /// node stays: the updater would find nothing to do.
+    NothingToInstall,
     /// The node's poll bucket was empty, so the run never reached the network.
     /// The node stays, holding the release without counting a failure.
     Throttled,
@@ -619,9 +623,10 @@ enum Staging {
 impl Staging {
     fn preparation(&self) -> UpdatePreparation {
         match self {
-            Staging::Deferred | Staging::CoolingDown | Staging::Throttled => {
-                UpdatePreparation::Stay
-            }
+            Staging::Deferred
+            | Staging::CoolingDown
+            | Staging::NothingToInstall
+            | Staging::Throttled => UpdatePreparation::Stay,
             Staging::Skipped | Staging::Staged | Staging::Failed | Staging::FallingBack => {
                 UpdatePreparation::Exit
             }
@@ -717,6 +722,14 @@ where
     F: FnOnce() -> Fut,
     Fut: std::future::Future<Output = Result<String>>,
 {
+    // #5799 review: before the poll token and the lookup. While any newer
+    // release cools down the triggers wait, and the lookup would only find it.
+    if let Some((version, left)) = root.parent().and_then(|dir| {
+        super::super::rollback::update_cooldown_pending_at(dir, current_version, clock())
+    }) {
+        tracing::info!(version = %version, retry_in_min = left.as_secs().div_ceil(60), "Update is cooling down after failed attempts; staying on the current version (#5799)");
+        return Err(Staging::CoolingDown);
+    }
     if !spend_poll_token(root, clock()) {
         return Err(throttled(
             root,
@@ -731,27 +744,46 @@ where
         Ok(tag) => tag,
         Err(e) => {
             tracing::warn!(error = %e, "Could not resolve the release to download in advance; staying on the current version (#5799)");
-            return Err(match target {
-                Some(version) => after_transient_failure(root, version, &format!("{e:#}"), clock()),
-                None => Staging::Deferred,
-            });
+            // Counted even when the trigger knew no version, so a node that
+            // cannot reach GitHub still walks to the fallback.
+            let version = lookup_failure_target(root, current_version, target);
+            return Err(after_transient_failure(
+                root,
+                &version,
+                &format!("{e:#}"),
+                clock(),
+            ));
         }
     };
     // A tag that passes this is a semver version, so `tag_dir` will accept it;
     // `stage_release_at` checks again regardless.
     if !should_stage(&tag, current_version, blocked) {
         tracing::info!(tag = %tag, "No newer installable release to download in advance");
-        return Err(Staging::Skipped);
-    }
-    let version = super::super::auto_update::version_from_tag(&tag);
-    let cooling = root.parent().and_then(|dir| {
-        super::super::rollback::update_cooldown_remaining_at(dir, version, clock())
-    });
-    if let Some(left) = cooling {
-        tracing::info!(tag = %tag, retry_in_min = left.as_secs().div_ceil(60), "Update is cooling down after failed attempts; staying on the current version (#5799)");
-        return Err(Staging::CoolingDown);
+        // A trigger that named a release exits as before; the updater decides.
+        // One that did not (the isolation timeout, the max-backoff fallback)
+        // would only exit for an updater that finds nothing to do, so it
+        // stays (#5799); both restart their own wait on a stay.
+        return Err(match target {
+            Some(_) => Staging::Skipped,
+            None => Staging::NothingToInstall,
+        });
     }
     Ok(tag)
+}
+
+/// The release a failed tag lookup counts against: the one the trigger named,
+/// else the newer release already on record, else a sentinel standing for
+/// "whatever is latest" (`rollback::UNKNOWN_RELEASE`), which every trigger
+/// treats as pending like any newer release.
+fn lookup_failure_target(root: &Path, current_version: &str, target: Option<&str>) -> String {
+    target
+        .map(str::to_string)
+        .or_else(|| {
+            root.parent().and_then(|dir| {
+                super::super::rollback::recorded_newer_release_at(dir, current_version)
+            })
+        })
+        .unwrap_or_else(|| super::super::rollback::UNKNOWN_RELEASE.to_string())
 }
 
 /// The decision for an install that stages nothing (a macOS app bundle, which
@@ -2146,19 +2178,49 @@ mod tests {
             Option<u64>,
             &'a dyn Fn(&str) -> bool,
         );
-        let cases: [Case<'_>; 3] = [
-            ("not newer", Ok("v9.9.8".into()), None, &none),
-            ("blocked", Ok(TAG.into()), None, &|v| v == "9.9.9"),
-            ("low disk", Ok(TAG.into()), Some(MIN_FREE_BYTES - 1), &none),
+        // `stage_into_with` names no target, as the version-less triggers do:
+        // with nothing to install they stay (#5799 review), since the updater
+        // would find nothing to do.
+        let cases: [(Case<'_>, Staging); 3] = [
+            (
+                ("not newer", Ok("v9.9.8".into()), None, &none),
+                Staging::NothingToInstall,
+            ),
+            (
+                ("blocked", Ok(TAG.into()), None, &|v| v == "9.9.9"),
+                Staging::NothingToInstall,
+            ),
+            (
+                ("low disk", Ok(TAG.into()), Some(MIN_FREE_BYTES - 1), &none),
+                Staging::Skipped,
+            ),
         ];
-        for (case, tag, free, blocked) in cases {
+        for ((case, tag, free, blocked), expected) in cases {
             let outcome = stage_into_with(root.as_path(), &server, tag, free, blocked).await;
-            assert_eq!(outcome, Staging::Skipped, "{case}");
-            assert!(outcome.preparation().should_exit(), "{case}");
+            assert_eq!(outcome, expected, "{case}");
+            assert_eq!(
+                outcome.preparation().should_exit(),
+                expected == Staging::Skipped,
+                "{case}"
+            );
         }
         // Only the low-disk exit had a release to install, and it records
         // first, in case the updater is killed before it can (#5799).
         assert_eq!(cooldown(&root).map(|r| r.failures), Some(1));
+        // A trigger that named a release still exits when there is nothing
+        // newer: the updater decides.
+        let (_tmp, root) = test_root();
+        let prefix = server.url_str("/");
+        let outcome = stage_into(
+            &root,
+            "9.9.8",
+            || async { Ok("v9.9.8".to_string()) },
+            Some("9.9.9"),
+            |_: &str| false,
+            &test_env(&prefix),
+        )
+        .await;
+        assert_eq!(outcome, Staging::Skipped);
     }
 
     /// `stage_latest_release` is the only entry point the node calls; the
@@ -2497,30 +2559,97 @@ mod tests {
     }
 
     /// A failed tag lookup stays: the updater's first step is the same lookup.
-    /// It counts only against a release the trigger knew.
+    /// It counts toward the fallback whether or not the trigger knew a
+    /// release (#5799 review): against the named one, else the newer one on
+    /// record, else a sentinel that every trigger treats as pending.
     #[tokio::test]
-    async fn a_failed_tag_lookup_stays_and_counts_only_a_known_release() {
+    async fn a_failed_tag_lookup_stays_and_counts_toward_the_fallback() {
+        use super::super::super::rollback::{UNKNOWN_RELEASE, record_update_failure_at};
         let server = Server::run();
-        let (_tmp, root) = test_root();
-        let run = |target| {
-            let root = root.clone();
-            let prefix = server.url_str("/");
+        let prefix = server.url_str("/");
+        let run = |root: PathBuf, target: Option<&'static str>, now: SystemTime| {
+            let prefix = prefix.clone();
             async move {
+                let clock = move || now;
+                let env = StageEnv {
+                    clock: &clock,
+                    ..test_env(&prefix)
+                };
                 stage_into(
                     &root,
                     "9.9.8",
                     || async { Err::<String, _>(anyhow::anyhow!("offline")) },
                     target,
                     |_: &str| false,
-                    &test_env(&prefix),
+                    &env,
                 )
                 .await
             }
         };
-        assert_eq!(run(None).await, Staging::Deferred);
-        assert!(cooldown(&root).is_none());
-        assert_eq!(run(Some("9.9.9")).await, Staging::Deferred);
+        let (_tmp, root) = test_root();
+        let t0 = SystemTime::now();
+        let hour = Duration::from_secs(3600);
+        assert_eq!(run(root.clone(), None, t0).await, Staging::Deferred);
+        let record = cooldown(&root).unwrap();
+        assert_eq!(
+            (record.version.as_str(), record.failures),
+            (UNKNOWN_RELEASE, 1)
+        );
+        // Pending like any newer release, so the next trigger holds.
+        assert_eq!(run(root.clone(), None, t0).await, Staging::CoolingDown);
+        assert_eq!(
+            run(root.clone(), None, t0 + hour * 2).await,
+            Staging::Deferred
+        );
+        assert_eq!(
+            run(root.clone(), None, t0 + hour * 5).await,
+            Staging::FallingBack
+        );
+        // A newer release already on record is the one it counts against.
+        let (_tmp, root) = test_root();
+        let state_dir = root.parent().unwrap();
+        fs::create_dir_all(state_dir).unwrap();
+        record_update_failure_at(state_dir, "9.9.9", "earlier", t0 - hour * 5, 0.5);
+        assert_eq!(run(root.clone(), None, t0).await, Staging::Deferred);
+        let record = cooldown(&root).unwrap();
+        assert_eq!((record.version.as_str(), record.failures), ("9.9.9", 2));
+        // A named release is counted directly.
+        let (_tmp, root) = test_root();
+        assert_eq!(
+            run(root.clone(), Some("9.9.9"), t0).await,
+            Staging::Deferred
+        );
         assert_eq!(cooldown(&root).map(|r| r.failures), Some(1));
+    }
+
+    /// #5799 review: while any newer release cools down, staging stops
+    /// before it spends a poll token or looks the tag up, whether or not the
+    /// trigger named a release.
+    #[tokio::test]
+    async fn a_cooling_release_spends_no_token_and_no_lookup() {
+        let server = Server::run();
+        let prefix = server.url_str("/");
+        let (_tmp, root) = test_root();
+        let state_dir = root.parent().unwrap();
+        fs::create_dir_all(state_dir).unwrap();
+        let now = SystemTime::now();
+        super::super::super::rollback::record_update_failure_at(state_dir, "9.9.9", "x", now, 0.5);
+        for target in [None, Some("9.9.9"), Some("9.9.10")] {
+            let outcome = stage_into(
+                &root,
+                "9.9.8",
+                || async { panic!("looked the tag up while a release cools down") },
+                target,
+                |_: &str| false,
+                &test_env(&prefix),
+            )
+            .await;
+            assert_eq!(outcome, Staging::CoolingDown, "{target:?}");
+        }
+        assert!(
+            !state_dir.join("github_poll_bucket_node").exists(),
+            "no poll token was spent"
+        );
     }
 
     /// Stage `TAG` at the fixed time `now` against `prefix`, for a trigger
@@ -2588,6 +2717,7 @@ mod tests {
                 | Staging::Staged
                 | Staging::Failed
                 | Staging::CoolingDown
+                | Staging::NothingToInstall
                 | Staging::Throttled => panic!("{outcome:?} at t0+{:.1} h", hours(t0, now)),
             }
             now = next_run(&root, now);

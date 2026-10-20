@@ -1825,6 +1825,24 @@ pub fn claim_update_attempt() -> Result<UpdateAttempt, ClaimRefused> {
     }
 }
 
+/// Whether [`claim_update_attempt`] would allow an attempt now, without
+/// spending anything. The version-less triggers check this before staging and
+/// claim only once staging decides to exit (#5799), so a stay does not spend a
+/// locked-out node's daily retry.
+pub fn update_attempt_claimable() -> bool {
+    state_dir().is_some_and(|dir| {
+        update_attempt_claimable_at(&dir, env!("CARGO_PKG_VERSION"), SystemTime::now())
+    })
+}
+
+pub(crate) fn update_attempt_claimable_at(
+    dir: &std::path::Path,
+    current_version: &str,
+    now: SystemTime,
+) -> bool {
+    claim_decision_at(dir, current_version, now).is_ok()
+}
+
 /// [`claim_update_attempt_at`], refusing first, and writing nothing, when
 /// locked out and a newer release is cooling down.
 pub(crate) fn claim_update_attempt_unless_cooling_at(
@@ -1832,18 +1850,40 @@ pub(crate) fn claim_update_attempt_unless_cooling_at(
     current_version: &str,
     now: SystemTime,
 ) -> Result<UpdateAttempt, ClaimRefused> {
-    if get_update_failure_count_at(dir) >= MAX_UPDATE_FAILURES
+    if claim_decision_at(dir, current_version, now)? == ClaimNeeds::Nothing {
+        return Ok(UpdateAttempt(()));
+    }
+    record_lockout_retry(dir, now)
+}
+
+/// What a claim needs, decided without writing anything.
+#[derive(Debug, PartialEq, Eq)]
+enum ClaimNeeds {
+    /// Not locked out: nothing to spend.
+    Nothing,
+    /// Locked out with this cooldown's retry available: spending it means
+    /// recording it first.
+    RecordedRetry,
+}
+
+fn claim_decision_at(
+    dir: &std::path::Path,
+    current_version: &str,
+    now: SystemTime,
+) -> Result<ClaimNeeds, ClaimRefused> {
+    let needs = lockout_claim_decision_at(dir, now)?;
+    if needs == ClaimNeeds::RecordedRetry
         && super::rollback::update_cooldown_pending_at(dir, current_version, now).is_some()
     {
         return Err(ClaimRefused::ReleaseCoolingDown);
     }
-    claim_update_attempt_at(dir, now)
+    Ok(needs)
 }
 
-pub(crate) fn claim_update_attempt_at(
+fn lockout_claim_decision_at(
     dir: &std::path::Path,
     now: SystemTime,
-) -> Result<UpdateAttempt, ClaimRefused> {
+) -> Result<ClaimNeeds, ClaimRefused> {
     match fs::read_to_string(dir.join("update_failures")) {
         Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
             return Err(ClaimRefused::CounterUnreadable);
@@ -1851,11 +1891,31 @@ pub(crate) fn claim_update_attempt_at(
         _ => {}
     }
     if get_update_failure_count_at(dir) < MAX_UPDATE_FAILURES {
-        return Ok(UpdateAttempt(()));
+        return Ok(ClaimNeeds::Nothing);
     }
     if !should_attempt_update_at_time(dir, now) {
         return Err(ClaimRefused::CoolingDown);
     }
+    Ok(ClaimNeeds::RecordedRetry)
+}
+
+/// [`claim_update_attempt_unless_cooling_at`] without the release cooldown.
+#[cfg(test)]
+pub(crate) fn claim_update_attempt_at(
+    dir: &std::path::Path,
+    now: SystemTime,
+) -> Result<UpdateAttempt, ClaimRefused> {
+    if lockout_claim_decision_at(dir, now)? == ClaimNeeds::Nothing {
+        return Ok(UpdateAttempt(()));
+    }
+    record_lockout_retry(dir, now)
+}
+
+/// Spend a locked-out node's retry: record it, then allow the attempt.
+fn record_lockout_retry(
+    dir: &std::path::Path,
+    now: SystemTime,
+) -> Result<UpdateAttempt, ClaimRefused> {
     let Ok(since_epoch) = now.duration_since(SystemTime::UNIX_EPOCH) else {
         return Err(ClaimRefused::NotRecordable);
     };
@@ -2039,6 +2099,33 @@ pub fn jittered_repoll_interval(base: Duration, jitter_fraction: f64, rand_unit:
     let rand_unit = rand_unit.clamp(0.0, 1.0);
     let factor = 1.0 - jitter_fraction + 2.0 * jitter_fraction * rand_unit;
     base.mul_f64(factor)
+}
+
+/// The longest the periodic re-poll waits past the end of a release's
+/// cooldown (#5799), so nodes whose cooldowns ended together do not all ask
+/// GitHub in the same minute.
+pub const REPOLL_AFTER_COOLDOWN_JITTER: Duration = Duration::from_secs(5 * 60);
+
+/// The re-poll deadline while a release cools down for `remaining` more:
+/// `next_repoll`, or the cooldown's end plus up to
+/// [`REPOLL_AFTER_COOLDOWN_JITTER`] (`rand_unit` in `[0, 1]`) when that is
+/// sooner. Without it, a re-poll or startup that stays (or finds the release
+/// cooling) waits out a whole re-poll interval, 4.5-7.5 h, instead of the 1-4
+/// h cooldown, on a node no peer prompts.
+///
+/// Idempotent once applied: the deadline it sets is never later than the
+/// cooldown's end plus the jitter, so calling it every tick leaves it alone.
+pub fn repoll_deadline_while_cooling(
+    next_repoll: std::time::Instant,
+    now: std::time::Instant,
+    remaining: Duration,
+    rand_unit: f64,
+) -> std::time::Instant {
+    let cooldown_end = now + remaining;
+    if next_repoll <= cooldown_end + REPOLL_AFTER_COOLDOWN_JITTER {
+        return next_repoll;
+    }
+    cooldown_end + REPOLL_AFTER_COOLDOWN_JITTER.mul_f64(rand_unit.clamp(0.0, 1.0))
 }
 
 #[cfg(test)]
@@ -2782,6 +2869,74 @@ mod tests {
             .split_whitespace()
             .collect();
         assert!(flat.contains("claim_update_attempt_unless_cooling_at(&dir,env!(\"CARGO_PKG_VERSION\"),SystemTime::now(),)"));
+    }
+
+    /// #5799 review: the check the version-less triggers make before staging
+    /// agrees with the claim and spends nothing, so a stay keeps a locked-out
+    /// node's daily retry for the next real exit.
+    #[test]
+    fn checking_a_claim_spends_nothing_and_agrees_with_claiming() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let now = SystemTime::now();
+        // Not locked out: claimable, nothing written.
+        assert!(update_attempt_claimable_at(dir, "0.2.140", now));
+        let now = lock_out(dir) + UPDATE_LOCKOUT_COOLDOWN;
+        for _ in 0..3 {
+            assert!(update_attempt_claimable_at(dir, "0.2.140", now));
+        }
+        assert!(
+            !dir.join(LOCKOUT_RETRY_FILE).exists(),
+            "checking spends nothing"
+        );
+        assert!(claim_update_attempt_unless_cooling_at(dir, "0.2.140", now).is_ok());
+        assert!(dir.join(LOCKOUT_RETRY_FILE).exists());
+        // Spent: both now refuse.
+        assert!(!update_attempt_claimable_at(dir, "0.2.140", now));
+        assert!(claim_update_attempt_unless_cooling_at(dir, "0.2.140", now).is_err());
+        // A cooling release makes a locked-out node's retry wait, for both.
+        let later = now + UPDATE_LOCKOUT_COOLDOWN;
+        super::super::rollback::record_update_failure_at(dir, "0.2.141", "x", later, 0.5);
+        assert!(!update_attempt_claimable_at(dir, "0.2.140", later));
+        assert_eq!(
+            claim_update_attempt_unless_cooling_at(dir, "0.2.140", later).err(),
+            Some(ClaimRefused::ReleaseCoolingDown)
+        );
+    }
+
+    /// #5799 review: while a release cools down the re-poll is pulled in to
+    /// the cooldown's end plus up to 5 minutes, never pushed out, and calling
+    /// it again changes nothing.
+    #[test]
+    fn the_repoll_waits_for_the_cooldown_not_a_whole_interval() {
+        let now = std::time::Instant::now();
+        let hour = Duration::from_secs(3600);
+        let five = REPOLL_AFTER_COOLDOWN_JITTER;
+        assert_eq!(five, Duration::from_secs(300));
+        // 6 h away, cooldown ends in 1 h: pulled in to 1 h + jitter.
+        for (rand, want) in [(0.0, hour), (0.5, hour + five / 2), (1.0, hour + five)] {
+            assert_eq!(
+                repoll_deadline_while_cooling(now + hour * 6, now, hour, rand),
+                now + want
+            );
+        }
+        // Already sooner than the cooldown's end (plus jitter): left alone.
+        assert_eq!(
+            repoll_deadline_while_cooling(now + hour / 2, now, hour, 0.0),
+            now + hour / 2
+        );
+        assert_eq!(
+            repoll_deadline_while_cooling(now + hour + five, now, hour, 0.0),
+            now + hour + five
+        );
+        // Idempotent: a minute later, with a minute less left, a fresh sample
+        // does not move it.
+        let set = repoll_deadline_while_cooling(now + hour * 6, now, hour, 0.3);
+        let minute = Duration::from_secs(60);
+        assert_eq!(
+            repoll_deadline_while_cooling(set, now + minute, hour - minute, 0.9),
+            set
+        );
     }
 
     #[test]

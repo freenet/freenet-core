@@ -1124,6 +1124,20 @@ pub(crate) fn update_cooldown_pending_at(
     Some((state.version, remaining))
 }
 
+/// The release a failed tag lookup that named no version counts against when
+/// nothing newer is on record (#5799). Not a version, so it counts as newer
+/// than any (see [`is_not_newer`]): every trigger holds while it cools down.
+/// Any real release's record replaces it.
+pub(crate) const UNKNOWN_RELEASE: &str = "the latest release";
+
+/// The release on record, cooling down or not, if it is newer than
+/// `current_version` (the sentinel [`UNKNOWN_RELEASE`] included).
+pub(crate) fn recorded_newer_release_at(dir: &Path, current_version: &str) -> Option<String> {
+    read_update_cooldown_at(dir)
+        .filter(|state| !is_not_newer(&state.version, current_version))
+        .map(|state| state.version)
+}
+
 /// [`update_cooldown_pending_at`] against the shared state directory.
 pub fn update_cooldown_pending(current_version: &str) -> Option<(String, std::time::Duration)> {
     state_dir().and_then(|dir| update_cooldown_pending_at(&dir, current_version, SystemTime::now()))

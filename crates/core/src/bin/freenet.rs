@@ -334,7 +334,8 @@ async fn run_network_node_with_signals(
         UPDATE_REPOLL_INTERVAL, UPDATE_REPOLL_JITTER_FRACTION, UpdateCheckResult,
         UpdateNeededError, check_if_update_available, claim_update_attempt, clear_version_mismatch,
         get_open_connection_count, has_reached_max_backoff, has_version_mismatch,
-        jittered_repoll_interval, reset_backoff, should_attempt_update, startup_update_check,
+        jittered_repoll_interval, repoll_deadline_while_cooling, reset_backoff,
+        should_attempt_update, startup_update_check, update_attempt_claimable,
         version_mismatch_generation,
     };
     use commands::update::stage_latest_release;
@@ -702,18 +703,17 @@ async fn run_network_node_with_signals(
         // startup_update_check above already covered "right now".
         let mut next_repoll = Instant::now() + repoll_delay();
         let our_version = parse_our_version();
+        // #5799: while a newer release cools down after failed attempts,
+        // nothing asks GitHub or claims a retry; the signals are kept and act
+        // once it ends. A cheap file read, re-read at every gate, so a trigger
+        // that stays partway through a tick holds every later one in it too.
+        let cooling = || commands::rollback::update_cooldown_pending(build_info::VERSION).is_some();
 
         loop {
             interval.tick().await;
 
-            // #5799: while a newer release cools down after failed attempts,
-            // nothing asks GitHub or claims a retry; the signals are kept and
-            // act once it ends. A cheap file read, every tick.
-            let cooling =
-                commands::rollback::update_cooldown_pending(build_info::VERSION).is_some();
-
             // --- Priority 1: Urgent update (breaking change) ---
-            if is_urgent_update() && !cooling {
+            if is_urgent_update() && !cooling() {
                 tracing::warn!("Urgent update needed (remote's min_compatible > our version)");
                 match check_if_update_available(build_info::VERSION).await {
                     UpdateCheckResult::UpdateAvailable(new_version) => {
@@ -781,7 +781,7 @@ async fn run_network_node_with_signals(
                     }
 
                     if let Some(deadline) = stagger_deadline {
-                        if Instant::now() >= deadline && !cooling {
+                        if Instant::now() >= deadline && !cooling() {
                             tracing::info!("Stagger timer expired, checking GitHub for updates");
                             match check_if_update_available(build_info::VERSION).await {
                                 UpdateCheckResult::UpdateAvailable(new_version) => {
@@ -859,35 +859,34 @@ async fn run_network_node_with_signals(
                 // Hard timeout: force exit if isolated with mismatch for too long.
                 if let Some(since) = isolated_mismatch_since {
                     // A locked-out node (#3934) that cannot claim its retry
-                    // must not exit 42 here either; it restarts the 6h window
-                    // instead, so this is not re-evaluated every tick.
-                    if since.elapsed() > HARD_EXIT_TIMEOUT
-                        && !cooling
-                        && claim_update_attempt()
-                            .inspect_err(|_| isolated_mismatch_since = Some(Instant::now()))
-                            .is_ok()
-                    {
-                        tracing::error!(
-                            isolated_secs = since.elapsed().as_secs(),
-                            "Isolated with version mismatch >6h — forcing exit for auto-update"
-                        );
-                        if stage_latest_release(build_info::VERSION, None)
-                            .await
-                            .should_exit()
-                        {
-                            #[allow(clippy::let_underscore_must_use)]
-                            let _ = update_tx.send("unknown (hard timeout)".to_string());
-                            return;
+                    // must not exit 42 here either. The claim is spent only on
+                    // an actual exit, after staging decides (#5799), so a stay
+                    // keeps a locked-out node's daily retry. Either way the 6h
+                    // window restarts, so this is not re-evaluated every tick.
+                    if since.elapsed() > HARD_EXIT_TIMEOUT && !cooling() {
+                        if update_attempt_claimable() {
+                            tracing::error!(
+                                isolated_secs = since.elapsed().as_secs(),
+                                "Isolated with version mismatch >6h — forcing exit for auto-update"
+                            );
+                            if stage_latest_release(build_info::VERSION, None)
+                                .await
+                                .should_exit()
+                                && claim_update_attempt().is_ok()
+                            {
+                                #[allow(clippy::let_underscore_must_use)]
+                                let _ = update_tx.send("unknown (hard timeout)".to_string());
+                                return;
+                            }
                         }
-                        // Staying (#5799): restart the isolation window rather
-                        // than retrying every tick; the mismatch is kept.
+                        // Staying, or no retry to spend: the mismatch is kept.
                         isolated_mismatch_since = Some(Instant::now());
                     }
                 }
 
                 // A locked-out node does not check GitHub here, so saying it
                 // does every 60s tick would be both noise and false.
-                if cooling {
+                if cooling() {
                     tracing::debug!("Version mismatch detected; the release is cooling down");
                 } else if should_attempt_update() {
                     tracing::info!("Version mismatch detected, checking GitHub for updates...");
@@ -896,7 +895,7 @@ async fn run_network_node_with_signals(
                 }
 
                 // Cooling down (#5799): no check, so no max-backoff fallback.
-                let checked = if cooling {
+                let checked = if cooling() {
                     UpdateCheckResult::CoolingDown
                 } else {
                     check_if_update_available(build_info::VERSION).await
@@ -921,12 +920,14 @@ async fn run_network_node_with_signals(
                         if open_connections == 0 {
                             // Claimed like every other self-initiated exit 42,
                             // so a locked-out node (#3934) cannot loop through
-                            // here. On refusal the mismatch is KEPT rather than
+                            // here, and claimed only on an actual exit, after
+                            // staging decides (#5799), so a stay keeps the
+                            // retry. On refusal the mismatch is KEPT rather than
                             // cleared: the node still knows it is isolated on an
                             // old version, so its next allowed retry (usually the
                             // peer-signal check above, once the cooldown passes)
                             // happens promptly instead of waiting for a re-poll.
-                            if claim_update_attempt().is_ok() {
+                            if update_attempt_claimable() {
                                 tracing::warn!(
                                     "Max backoff + 0 connections — \
                                      trusting gateway version signal, exiting for auto-update"
@@ -934,6 +935,7 @@ async fn run_network_node_with_signals(
                                 if stage_latest_release(build_info::VERSION, None)
                                     .await
                                     .should_exit()
+                                    && claim_update_attempt().is_ok()
                                 {
                                     #[allow(clippy::let_underscore_must_use)]
                                     let _ = update_tx.send(GATEWAY_MISMATCH.to_string());
@@ -1014,9 +1016,9 @@ async fn run_network_node_with_signals(
             // 60s tick advances `next_repoll`, so only one re-poll runs per
             // interval and (being sequential in this single task) it never
             // overlaps an in-flight check.
-            // Not advanced while cooling down, so it runs on the first tick
-            // after the cooldown ends (#5799).
-            if Instant::now() >= next_repoll && !cooling {
+            // Not run while cooling down; the deadline is pulled in to the
+            // cooldown's end below (#5799).
+            if Instant::now() >= next_repoll && !cooling() {
                 next_repoll = Instant::now() + repoll_delay();
                 // Respect the persistent auto-update failure lockout (#3934).
                 // When installs keep failing (e.g. a non-writable binary path)
@@ -1120,6 +1122,23 @@ async fn run_network_node_with_signals(
                         );
                     }
                 }
+            }
+
+            // #5799: while a release cools down, the next re-poll is at the
+            // cooldown's end (plus up to 5 min), not a whole re-poll interval
+            // away, so a node no peer prompts retries on the cooldown's
+            // schedule. Last in the tick, so it covers boot (the first tick
+            // runs at once), a trigger or re-poll that stayed in this tick, and
+            // a cooldown recorded by another process.
+            if let Some((_, left)) =
+                commands::rollback::update_cooldown_pending(build_info::VERSION)
+            {
+                next_repoll = repoll_deadline_while_cooling(
+                    next_repoll,
+                    Instant::now(),
+                    left,
+                    freenet::config::GlobalRng::random_range(0.0_f64..1.0),
+                );
             }
         }
     });
@@ -2897,9 +2916,15 @@ mod tests {
                 .rfind("ifstage_latest_release(build_info::VERSION,")
                 .unwrap_or_else(|| panic!("`{stmt}` must call stage_latest_release first"));
             let between = &flat[decision..at];
+            // The two version-less triggers also spend their lockout claim
+            // there, only once staging has said to exit.
+            let exit_only = [
+                ").await.should_exit(){#[allow(clippy::let_underscore_must_use)]",
+                ").await.should_exit()&&claim_update_attempt().is_ok()\
+                 {#[allow(clippy::let_underscore_must_use)]",
+            ];
             assert!(
-                between
-                    .ends_with(").await.should_exit(){#[allow(clippy::let_underscore_must_use)]")
+                exit_only.iter().any(|end| between.ends_with(end))
                     && between.matches(';').count() == 0,
                 "update trigger `{stmt}` must send only when staging says to exit: {between}"
             );
@@ -2912,6 +2937,7 @@ mod tests {
             let since = [
                 "UpdateCheckResult::UpdateAvailable(new_version)=>{",
                 "claim_update_attempt()",
+                "ifupdate_attempt_claimable(){",
                 "ifletSome(new_version)=latest{",
                 "ifletSome(new_version)=startup_update_check(attempt,build_info::VERSION).await{",
             ]
@@ -2952,8 +2978,10 @@ mod tests {
 
     /// #5799: while a newer release cools down, no trigger asks GitHub or
     /// claims a lockout retry, and every CoolingDown arm keeps its signal and
-    /// does not send. The two triggers that know no version restart their own
-    /// wait when staging stays, rather than firing every tick.
+    /// does not send. Every gate re-reads the record, so a stay early in a tick
+    /// holds the later triggers in it. The two triggers that know no version
+    /// restart their own wait when staging stays, rather than firing every
+    /// tick. The re-poll is pulled in to the cooldown's end, last in the tick.
     #[test]
     fn update_triggers_wait_out_a_cooling_release() {
         let src = strip_line_comments(include_str!("freenet.rs"));
@@ -2966,41 +2994,54 @@ mod tests {
                 "the startup check, before its claim",
             ),
             (
-                "letcooling=commands::rollback::update_cooldown_pending(build_info::VERSION).is_some();",
-                "the loop's per-tick check",
+                "letcooling=||commands::rollback::update_cooldown_pending(build_info::VERSION).is_some();",
+                "the loop's check, a closure so every gate re-reads it",
             ),
-            ("ifis_urgent_update()&&!cooling{", "the urgent check"),
-            ("ifInstant::now()>=deadline&&!cooling{", "the stagger"),
+            ("ifis_urgent_update()&&!cooling(){", "the urgent check"),
+            ("ifInstant::now()>=deadline&&!cooling(){", "the stagger"),
             (
-                "&&!cooling&&claim_update_attempt()",
+                "ifsince.elapsed()>HARD_EXIT_TIMEOUT&&!cooling(){ifupdate_attempt_claimable(){",
                 "the isolation hard timeout, before its claim",
             ),
             (
-                "letchecked=ifcooling{UpdateCheckResult::CoolingDown}else{\
+                "letchecked=ifcooling(){UpdateCheckResult::CoolingDown}else{\
                  check_if_update_available(build_info::VERSION).await};",
                 "the mismatch check and its max-backoff fallback",
             ),
-            ("ifInstant::now()>=next_repoll&&!cooling{", "the re-poll"),
+            ("ifInstant::now()>=next_repoll&&!cooling(){", "the re-poll"),
             // Split with concat! so this file's own text does not add to the
             // canary's count of `update_tx` sends.
             (
                 concat!(
-                    ".should_exit(){#[allow(clippy::let_underscore_must_use)]let_=update_tx",
-                    ".send(\"unknown(hardtimeout)\".to_string());return;}",
-                    "isolated_mismatch_since=Some(Instant::now());"
+                    ".should_exit()&&claim_update_attempt().is_ok()",
+                    "{#[allow(clippy::let_underscore_must_use)]let_=update_tx",
+                    ".send(\"unknown(hardtimeout)\".to_string());return;}}",
+                    "isolated_mismatch_since=Some(Instant::now());}"
                 ),
                 "the hard timeout's stay, which restarts its window",
             ),
             (
                 concat!(
-                    ".should_exit(){#[allow(clippy::let_underscore_must_use)]let_=update_tx",
+                    ".should_exit()&&claim_update_attempt().is_ok()",
+                    "{#[allow(clippy::let_underscore_must_use)]let_=update_tx",
                     ".send(GATEWAY_MISMATCH.to_string());return;}reset_backoff();"
                 ),
                 "the max-backoff fallback's stay, which restarts the backoff",
             ),
+            (
+                // Ends the loop body (`}}`), then the task (`});`).
+                "ifletSome((_,left))=commands::rollback::update_cooldown_pending(build_info::VERSION)\
+                 {next_repoll=repoll_deadline_while_cooling(next_repoll,Instant::now(),left,\
+                 freenet::config::GlobalRng::random_range(0.0_f64..1.0),);}}});",
+                "the re-poll pulled in to the cooldown's end, last in every tick",
+            ),
         ] {
             assert_eq!(flat.matches(gate).count(), 1, "{what} (#5799): `{gate}`");
         }
+        assert!(
+            !flat.contains("!cooling{") && !flat.contains("ifcooling{"),
+            "a gate reads a cooling flag captured earlier in the tick"
+        );
         let arms: Vec<&str> = flat
             .split("UpdateCheckResult::CoolingDown=>{")
             .skip(1)
@@ -3477,14 +3518,18 @@ mod tests {
         let prod = squeeze(production_region(&strip_line_comments(include_str!(
             "freenet.rs"
         ))));
-        for (opener, send) in [
+        let max_backoff_arm = braced_block(
+            &prod,
+            "UpdateCheckResult::Skippedifhas_reached_max_backoff()=>{",
+        );
+        let isolated = braced_block(max_backoff_arm, "ifopen_connections==0{");
+        for (region, send) in [
             (
-                "ifsince.elapsed()>HARD_EXIT_TIMEOUT&&!cooling&&claim_update_attempt()\
-                 .inspect_err(|_|isolated_mismatch_since=Some(Instant::now())).is_ok(){",
+                braced_block(&prod, "ifsince.elapsed()>HARD_EXIT_TIMEOUT&&!cooling(){"),
                 concat!("update_tx", ".send(\"unknown(hardtimeout)\".to_string())"),
             ),
             (
-                "ifclaim_update_attempt().is_ok(){",
+                isolated,
                 concat!("update_tx", ".send(GATEWAY_MISMATCH.to_string())"),
             ),
         ] {
@@ -3493,23 +3538,25 @@ mod tests {
                 1,
                 "expected exactly one `{send}`; a second one would bypass the claim"
             );
+            // Staging is attempted only when a claim would be granted, and the
+            // claim (a locked-out node's daily retry) is spent only on the
+            // exit itself (#3934, #5799).
+            let gated = format!(
+                ".should_exit()&&claim_update_attempt().is_ok()\
+                 {{#[allow(clippy::let_underscore_must_use)]let_={send}"
+            );
             assert!(
-                braced_block(&prod, opener).contains(send),
-                "`{send}` must be inside the block gated by claim_update_attempt() (#3934)"
+                braced_block(region, "ifupdate_attempt_claimable(){").contains(&gated),
+                "`{send}` must be gated by update_attempt_claimable() and spend the claim \
+                 only on exit"
             );
         }
         // ...and with no connections at max backoff the version mismatch is
-        // KEPT, whether the claim is refused (#3934) or granted and staging
-        // stays on this binary (#5799); a stay restarts the backoff instead.
-        let max_backoff_arm = braced_block(
-            &prod,
-            "UpdateCheckResult::Skippedifhas_reached_max_backoff()=>{",
-        );
-        let isolated = braced_block(max_backoff_arm, "ifopen_connections==0{");
+        // KEPT, whether no claim is available (#3934) or staging stays on this
+        // binary (#5799); a stay restarts the backoff instead.
         assert_eq!(isolated.matches("clear_version_mismatch()").count(), 0);
         assert!(
-            braced_block(isolated, "ifclaim_update_attempt().is_ok(){")
-                .contains("reset_backoff();")
+            braced_block(isolated, "ifupdate_attempt_claimable(){").contains("reset_backoff();")
         );
     }
 }
