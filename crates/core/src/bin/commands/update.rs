@@ -10,6 +10,18 @@ use std::process::Command;
 
 use super::rollback;
 
+/// `eprintln!` without the panic. The updater's stderr goes to a log file
+/// under every supervisor (the journal, the Windows wrapper's log, the macOS
+/// wrapper's `logger`, #5799), and `eprintln!` panics when the write fails, as
+/// it does on a full disk: a line about a failed update must never be what
+/// aborts the update.
+macro_rules! stderr_line {
+    ($($arg:tt)*) => {{
+        #[allow(clippy::let_underscore_must_use)]
+        let _ = writeln!(io::stderr(), $($arg)*);
+    }};
+}
+
 mod staged;
 pub(crate) use staged::{discard_stale as discard_stale_staged, stage_latest_release};
 
@@ -370,7 +382,7 @@ impl UpdateCommand {
                 rollback::PostStopOutcome::CrashRecorded { crash_count } => {
                     // Critical brick-safety signal: emit on stderr even under
                     // --quiet (the supervisor routes it to the journal/log).
-                    eprintln!(
+                    stderr_line!(
                         "Freenet {current_version}: crash {crash_count}/{} during post-update \
                          probation (node stop status {status}); not updating, will auto-roll-back \
                          if it keeps crashing.",
@@ -392,7 +404,7 @@ impl UpdateCommand {
                     restored_version,
                     bad_version,
                 } => {
-                    eprintln!(
+                    stderr_line!(
                         "Freenet auto-rollback (#4073): version {bad_version} crash-looped after \
                          an update; restored known-good {restored_version} and pinned {bad_version} \
                          as known-bad on this node so it will not be re-applied automatically."
@@ -406,7 +418,7 @@ impl UpdateCommand {
                     std::process::exit(0);
                 }
                 rollback::PostStopOutcome::RollbackUnavailable { reason } => {
-                    eprintln!(
+                    stderr_line!(
                         "Freenet auto-rollback (#4073) could not run ({reason}); leaving the node \
                          to the supervisor's own crash limiter / operator. Run `freenet update \
                          --force` once a fixed release is available."
@@ -675,7 +687,7 @@ impl UpdateCommand {
                         e
                     );
                     if !self.quiet {
-                        eprintln!(
+                        stderr_line!(
                             "Bundle update failed: {e}. Skipping update to avoid corrupting the signed bundle. Next attempt will retry."
                         );
                     }
@@ -694,7 +706,7 @@ impl UpdateCommand {
                     // replace. Log the bundle-attempt failure for
                     // diagnosability; continue with the standard path.
                     if !self.quiet {
-                        eprintln!(
+                        stderr_line!(
                             "Bundle update check failed ({e}); continuing with in-place binary replacement."
                         );
                     }
@@ -824,7 +836,7 @@ impl UpdateCommand {
                 // Belt-and-braces alongside the subscriber installed in
                 // `freenet_main`, so this survives a later refactor that drops
                 // the subscriber. Matches `handle_post_stop`'s precedent above.
-                eprintln!(
+                stderr_line!(
                     "Freenet: failed to snapshot the known-good binary for crash-loop \
                      rollback: {e}. PROCEEDING WITHOUT ROLLBACK PROTECTION for this update — if \
                      this version crash-loops it will NOT be auto-reverted. Check the \
@@ -871,7 +883,7 @@ impl UpdateCommand {
                 // The update HAS landed and the probation marker is absent, so
                 // the post-stop hook will find nothing to count and this
                 // version can crash-loop indefinitely without being reverted.
-                eprintln!(
+                stderr_line!(
                     "Freenet: installed the update but FAILED TO ARM crash-loop rollback \
                      protection: {e}. If this version crash-loops it will NOT be auto-reverted. \
                      Check the permissions and free space on the Freenet state directory."
@@ -893,7 +905,7 @@ impl UpdateCommand {
         // must not depend on it finishing.
         if let Err(e) = ensure_service_file_updated(&current_exe, self.quiet) {
             if !self.quiet {
-                eprintln!(
+                stderr_line!(
                     "Warning: Failed to update service file: {}. \
                      Run 'freenet service install' to update manually.",
                     e
@@ -918,7 +930,7 @@ impl UpdateCommand {
             )
             .await;
         } else if !self.quiet {
-            eprintln!("Warning: fdev not found in release assets. Skipping fdev update.");
+            stderr_line!("Warning: fdev not found in release assets. Skipping fdev update.");
         }
 
         // Automatically restart service if running
@@ -935,10 +947,10 @@ impl UpdateCommand {
                         .status();
                     match status {
                         Ok(s) if s.success() => println!("Service restarted successfully."),
-                        Ok(_) => eprintln!(
+                        Ok(_) => stderr_line!(
                             "Warning: Failed to restart service. Run 'freenet service restart' manually."
                         ),
-                        Err(e) => eprintln!(
+                        Err(e) => stderr_line!(
                             "Warning: Failed to restart service: {}. Run 'freenet service restart' manually.",
                             e
                         ),
@@ -955,17 +967,17 @@ impl UpdateCommand {
                         .args(["stop", "org.freenet.node"])
                         .status()
                     {
-                        eprintln!("Warning: failed to stop service: {e}");
+                        stderr_line!("Warning: failed to stop service: {e}");
                     }
                     let status = Command::new("launchctl")
                         .args(["start", "org.freenet.node"])
                         .status();
                     match status {
                         Ok(s) if s.success() => println!("Service restarted successfully."),
-                        Ok(_) => eprintln!(
+                        Ok(_) => stderr_line!(
                             "Warning: Failed to restart service. Run 'freenet service restart' manually."
                         ),
-                        Err(e) => eprintln!(
+                        Err(e) => stderr_line!(
                             "Warning: Failed to restart service: {}. Run 'freenet service restart' manually.",
                             e
                         ),
@@ -989,10 +1001,10 @@ impl UpdateCommand {
                         .status();
                     match status {
                         Ok(s) if s.success() => println!("Service restarted successfully."),
-                        Ok(_) => eprintln!(
+                        Ok(_) => stderr_line!(
                             "Warning: Failed to restart service. Run 'freenet service start' manually."
                         ),
-                        Err(e) => eprintln!(
+                        Err(e) => stderr_line!(
                             "Warning: Failed to restart service: {}. Run 'freenet service start' manually.",
                             e
                         ),
@@ -1039,7 +1051,7 @@ impl UpdateCommand {
             Ok(bytes) => bytes,
             Err(e) => {
                 if !self.quiet {
-                    eprintln!("Warning: Failed to download checksums: {}.", e);
+                    stderr_line!("Warning: Failed to download checksums: {}.", e);
                 }
                 return Ok(None);
             }
@@ -1088,7 +1100,7 @@ impl UpdateCommand {
                 if let Err(e) = download_file(&asset.browser_download_url, &path, self.quiet).await
                 {
                     if !self.quiet {
-                        eprintln!(
+                        stderr_line!(
                             "Warning: Failed to download fdev: {}. Skipping fdev update.",
                             e
                         );
@@ -1111,7 +1123,7 @@ impl UpdateCommand {
                 }
                 if let Err(e) = verify_checksum(&archive_path, expected_hash) {
                     if !self.quiet {
-                        eprintln!(
+                        stderr_line!(
                             "Warning: fdev checksum verification failed: {}. Skipping fdev update.",
                             e
                         );
@@ -1121,7 +1133,7 @@ impl UpdateCommand {
             }
             Err(e) => {
                 if !self.quiet {
-                    eprintln!("Warning: {} Skipping fdev update.", e);
+                    stderr_line!("Warning: {} Skipping fdev update.", e);
                 }
                 return;
             }
@@ -1130,7 +1142,7 @@ impl UpdateCommand {
         let extract_dir = temp_dir.join("fdev");
         if let Err(e) = fs::create_dir_all(&extract_dir) {
             if !self.quiet {
-                eprintln!(
+                stderr_line!(
                     "Warning: Failed to create fdev extract directory: {}. Skipping fdev update.",
                     e
                 );
@@ -1142,7 +1154,7 @@ impl UpdateCommand {
             Ok(path) => path,
             Err(e) => {
                 if !self.quiet {
-                    eprintln!(
+                    stderr_line!(
                         "Warning: Failed to extract fdev: {}. Skipping fdev update.",
                         e
                     );
@@ -1154,7 +1166,7 @@ impl UpdateCommand {
         // Install fdev next to the freenet binary
         let Some(install_dir) = freenet_exe.parent() else {
             if !self.quiet {
-                eprintln!("Warning: Cannot determine install directory. Skipping fdev update.");
+                stderr_line!("Warning: Cannot determine install directory. Skipping fdev update.");
             }
             return;
         };
@@ -1166,7 +1178,7 @@ impl UpdateCommand {
 
         if let Err(e) = replace_binary(&extracted_fdev, &fdev_dest) {
             if !self.quiet {
-                eprintln!(
+                stderr_line!(
                     "Warning: Failed to update fdev: {}. You can update it manually with: curl -fsSL https://freenet.org/install.sh | sh",
                     e
                 );
@@ -1376,7 +1388,7 @@ async fn probe_latest_tag(force: bool, quiet: bool, hold_on_skip: bool) -> Resul
                 retry_after: Some(remaining),
             };
             if !quiet {
-                eprintln!("{}", rate_limited.user_message());
+                stderr_line!("{}", rate_limited.user_message());
             }
             tracing::warn!("Update check deferred: {}", rate_limited.user_message());
             if hold_on_skip {
@@ -1388,7 +1400,7 @@ async fn probe_latest_tag(force: bool, quiet: bool, hold_on_skip: bool) -> Resul
 
     if !force && !super::auto_update::try_consume_install_poll() {
         if !quiet {
-            eprintln!(
+            stderr_line!(
                 "Update check rate-limited (too many recent GitHub polls); skipping this cycle. \
                  Run `freenet update --force` to override."
             );
@@ -1430,7 +1442,7 @@ async fn probe_latest_tag(force: bool, quiet: bool, hold_on_skip: bool) -> Resul
                 e.downcast_ref::<super::auto_update::GithubRateLimitedError>()
             {
                 if !quiet {
-                    eprintln!("{}", rate_limited.user_message());
+                    stderr_line!("{}", rate_limited.user_message());
                 }
                 tracing::warn!("Update check deferred: {}", rate_limited.user_message());
                 if hold_on_skip {
@@ -1502,7 +1514,7 @@ async fn fetch_release_assets(tag: &str, quiet: bool) -> Result<Release> {
         // It also previously flattened the typed `GithubRateLimitedError` into a
         // string, so no caller could tell it from a genuine install failure.
         if !quiet {
-            eprintln!("{}", rate_limited.user_message());
+            stderr_line!("{}", rate_limited.user_message());
         }
         tracing::warn!("Update deferred: {}", rate_limited.user_message());
         // The release is known here: hold it without counting a failure (no
@@ -1669,7 +1681,7 @@ fn verify_manifest_signature_with(
             );
         }
         if !quiet {
-            eprintln!(
+            stderr_line!(
                 "Warning: release did not publish SHA256SUMS.txt.sig; \
                  installing without release-signature verification."
             );
@@ -2150,7 +2162,7 @@ fn update_service_file(
     match &action {
         WrapperAction::UserModified { on_disk_hash } => {
             if !quiet {
-                eprintln!(
+                stderr_line!(
                     "Warning: systemd unit at {} differs from the current Freenet \
                      template AND from the hash recorded in {}, suggesting it has \
                      been hand-edited. Leaving it alone. To accept the bundled \
@@ -2172,7 +2184,7 @@ fn update_service_file(
             // the unit text didn't change.
             if let Err(e) = write_wrapper_hash_sidecar(&hash_path, h) {
                 if !quiet {
-                    eprintln!(
+                    stderr_line!(
                         "Warning: failed to backfill service hash sidecar at {}: {}. \
                          User-modification detection on the next `freenet update` \
                          will fall back to treating the unit as ours.",
@@ -2205,7 +2217,7 @@ fn update_service_file(
     let backup_path = service_path.with_extension("service.bak");
     if let Err(e) = fs::copy(service_path, &backup_path) {
         if !quiet {
-            eprintln!(
+            stderr_line!(
                 "Warning: Failed to backup service file: {}. Continuing anyway.",
                 e
             );
@@ -2222,7 +2234,7 @@ fn update_service_file(
     // treating the unit as ours), so warn but continue.
     if let Err(e) = write_wrapper_hash_sidecar(&hash_path, new_hash) {
         if !quiet {
-            eprintln!(
+            stderr_line!(
                 "Warning: failed to write service hash sidecar at {}: {}. \
                  User-modification detection on the next `freenet update` \
                  will fall back to treating the unit as ours.",
@@ -2242,11 +2254,11 @@ fn update_service_file(
 
     if !status.success() && !quiet {
         if system_mode {
-            eprintln!(
+            stderr_line!(
                 "Warning: Failed to reload systemd daemon. Run 'systemctl daemon-reload' manually."
             );
         } else {
-            eprintln!(
+            stderr_line!(
                 "Warning: Failed to reload systemd daemon. Run 'systemctl --user daemon-reload' manually."
             );
         }
@@ -2464,7 +2476,7 @@ fn ensure_service_file_updated(binary_path: &Path, quiet: bool) -> Result<()> {
         Ok(content) => launchd_plist_needs_regen(&content),
         Err(e) => {
             if !quiet {
-                eprintln!(
+                stderr_line!(
                     "Warning: failed to read launchd plist at {} for migration check: {}. \
                      Skipping plist regen.",
                     plist_path.display(),
@@ -2483,7 +2495,7 @@ fn ensure_service_file_updated(binary_path: &Path, quiet: bool) -> Result<()> {
     match &action {
         WrapperAction::UserModified { on_disk_hash } => {
             if !quiet {
-                eprintln!(
+                stderr_line!(
                     "Warning: wrapper script at {} differs from the current Freenet \
                      template AND from the hash recorded in {}, suggesting it has \
                      been hand-edited. Leaving it alone. To accept the bundled \
@@ -2500,7 +2512,7 @@ fn ensure_service_file_updated(binary_path: &Path, quiet: bool) -> Result<()> {
         } => {
             if let Err(e) = write_wrapper_hash_sidecar(&wrapper_hash_path, h) {
                 if !quiet {
-                    eprintln!(
+                    stderr_line!(
                         "Warning: failed to backfill wrapper hash sidecar at {}: {}.",
                         wrapper_hash_path.display(),
                         e
@@ -2524,7 +2536,7 @@ fn ensure_service_file_updated(binary_path: &Path, quiet: bool) -> Result<()> {
                 let backup_path = wrapper_path.with_extension("sh.bak");
                 if let Err(e) = fs::copy(&wrapper_path, &backup_path) {
                     if !quiet {
-                        eprintln!(
+                        stderr_line!(
                             "Warning: Failed to backup wrapper script: {}. Continuing anyway.",
                             e
                         );
@@ -2542,7 +2554,7 @@ fn ensure_service_file_updated(binary_path: &Path, quiet: bool) -> Result<()> {
             // just wrote, so warn but continue.
             if let Err(e) = write_wrapper_hash_sidecar(&wrapper_hash_path, new_hash) {
                 if !quiet {
-                    eprintln!(
+                    stderr_line!(
                         "Warning: failed to write wrapper hash sidecar at {}: {}. \
                          User-modification detection on the next `freenet update` \
                          will fall back to treating the wrapper as ours.",
@@ -2580,7 +2592,7 @@ fn ensure_service_file_updated(binary_path: &Path, quiet: bool) -> Result<()> {
         let backup_path = plist_path.with_extension("plist.bak");
         if let Err(e) = fs::copy(&plist_path, &backup_path) {
             if !quiet {
-                eprintln!(
+                stderr_line!(
                     "Warning: failed to back up plist: {}. Continuing anyway.",
                     e
                 );
@@ -2722,12 +2734,12 @@ fn replace_binary(new_binary: &Path, dest: &Path) -> Result<()> {
         // Try to restore backup
         if backup_path.exists() {
             if let Err(restore_err) = fs::rename(&backup_path, dest) {
-                eprintln!(
+                stderr_line!(
                     "CRITICAL: Failed to restore backup after update failure. \
                      Original binary may be at: {}",
                     backup_path.display()
                 );
-                eprintln!("Restore error: {}", restore_err);
+                stderr_line!("Restore error: {}", restore_err);
             }
         }
         // Clean up temp file (best-effort, failure is non-fatal during error recovery)
@@ -2739,7 +2751,7 @@ fn replace_binary(new_binary: &Path, dest: &Path) -> Result<()> {
     if backup_path.exists() {
         if let Err(e) = fs::remove_file(&backup_path) {
             // Non-fatal: warn but don't fail
-            eprintln!(
+            stderr_line!(
                 "Warning: Failed to remove backup file {}: {}",
                 backup_path.display(),
                 e
@@ -4223,6 +4235,27 @@ done
                 && !catch_body.contains("clear_install_failures"),
             "the transient Err arm must neither record nor clear the gate"
         );
+    }
+
+    /// #5799 review: the updater's stderr goes to a log file under every
+    /// supervisor, and `eprintln!` panics when that write fails (a full disk),
+    /// so no production code in this file uses it; `stderr_line!` ignores the
+    /// error instead.
+    #[test]
+    fn the_updater_never_writes_stderr_with_eprintln() {
+        let src = include_str!("update.rs").replace("\r\n", "\n");
+        let production = src
+            .split_once(concat!("#[cfg(test)]\n", "mod tests {"))
+            .expect("test module")
+            .0;
+        let code: String = production
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(code.matches(concat!("eprintln", "!(")).count(), 0);
+        assert!(code.matches("stderr_line!(").count() >= 40);
+        assert!(code.contains("let _ = writeln!(io::stderr(), $($arg)*);"));
     }
 
     /// #5799: the updater records a failed install, holds (without counting)

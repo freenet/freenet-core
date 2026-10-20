@@ -253,7 +253,8 @@ fn tag_dir(root: &Path, tag: &str) -> Result<PathBuf> {
 /// Kept beside the cache rather than in it, because discarding the cache
 /// removes the directory. `Ok(None)` when another process holds it.
 ///
-/// A POSIX record lock (`fcntl`), not `flock`: a `flock` is shared with every
+/// A POSIX record lock (`fcntl`, `rollback::try_lock_file`), not `flock`: a
+/// `flock` is shared with every
 /// child forked while it is held, until that child execs, so a process that
 /// spawns children could keep it held after releasing it. Record locks belong
 /// to the process and are never inherited. They do not exclude other callers
@@ -302,25 +303,8 @@ fn try_lock(root: &Path) -> std::io::Result<Option<CacheLock>> {
         .truncate(false)
         .write(true)
         .open(&path)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::io::AsRawFd;
-        // SAFETY: an all-zero `flock` is a valid value; the fields that
-        // matter are set below. Whole file (`l_start` = `l_len` = 0).
-        let mut request: libc::flock = unsafe { std::mem::zeroed() };
-        request.l_type = libc::F_WRLCK as _;
-        request.l_whence = libc::SEEK_SET as _;
-        // SAFETY: `file` owns an open descriptor for the duration of the call,
-        // and `request` is a valid `flock` that fcntl only reads.
-        if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETLK, &request) } != 0 {
-            let e = std::io::Error::last_os_error();
-            // POSIX allows either errno for "held by another process".
-            return if matches!(e.raw_os_error(), Some(libc::EAGAIN | libc::EACCES)) {
-                Ok(None)
-            } else {
-                Err(e)
-            };
-        }
+    if !super::super::rollback::try_lock_file(&file)? {
+        return Ok(None);
     }
     held.push(path.clone());
     Ok(Some(CacheLock {
@@ -3048,7 +3032,7 @@ mod tests {
             hold_staged_release_at(&root, "skipped", now, 0.5);
         }
         let record = cooldown(&root).unwrap();
-        assert_eq!((record.version.as_str(), record.failures), ("9.9.9", 1));
+        assert_eq!((record.version.as_str(), record.failures), ("9.9.9", 0));
     }
 
     #[test]

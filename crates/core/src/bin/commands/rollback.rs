@@ -313,6 +313,109 @@ fn atomic_write_with(
     Ok(())
 }
 
+/// Every file [`atomic_write`] writes in the state directory. Only their
+/// temporaries are swept; `atomic_writes_name_only_swept_files` keeps this
+/// list complete.
+const ATOMIC_FILES: [&str; 5] = [
+    PROBATION_FILE,
+    KNOWN_BAD_FILE,
+    INSTALL_FAILURES_FILE,
+    UPDATE_COOLDOWN_FILE,
+    STAGED_DOWNLOADS_FILE,
+];
+/// How old a temporary must be before the sweep removes it: far longer than
+/// any write takes, so a write in progress in another process is never hit.
+const STALE_TEMP_AGE: std::time::Duration = std::time::Duration::from_secs(3600);
+
+/// Whether `name` is a temporary [`atomic_write`] makes for one of
+/// [`ATOMIC_FILES`]: `.{file}.{pid}.{seq}.tmp`, or `.{file}.tmp` as releases
+/// before #5799 named it.
+fn is_atomic_temp(name: &str) -> bool {
+    ATOMIC_FILES.iter().any(|file| {
+        name.strip_prefix('.')
+            .and_then(|rest| rest.strip_prefix(*file))
+            .and_then(|rest| rest.strip_suffix(".tmp"))
+            .is_some_and(|middle| {
+                middle.is_empty()
+                    || middle.strip_prefix('.').is_some_and(|ids| {
+                        ids.split_once('.').is_some_and(|(pid, seq)| {
+                            [pid, seq]
+                                .iter()
+                                .all(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+                        })
+                    })
+            })
+    })
+}
+
+/// Remove [`atomic_write`] temporaries in `dir` older than [`STALE_TEMP_AGE`]
+/// and return how many. A unique name is never reused, so a temporary left by
+/// a SIGKILL or a power loss mid-write would otherwise stay for good.
+pub(crate) fn sweep_stale_atomic_temps_at(dir: &Path, now: SystemTime) -> usize {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .filter(|entry| entry.file_name().to_str().is_some_and(is_atomic_temp))
+        .filter(|entry| {
+            entry
+                .metadata()
+                .and_then(|m| m.modified())
+                .is_ok_and(|mtime| {
+                    now.duration_since(mtime)
+                        .is_ok_and(|age| age >= STALE_TEMP_AGE)
+                })
+        })
+        .filter(|entry| std::fs::remove_file(entry.path()).is_ok())
+        .count()
+}
+
+/// [`sweep_stale_atomic_temps_at`] on the shared state directory, at startup.
+pub fn sweep_stale_atomic_temps() {
+    if let Some(dir) = state_dir() {
+        let removed = sweep_stale_atomic_temps_at(&dir, SystemTime::now());
+        if removed > 0 {
+            tracing::info!(
+                removed,
+                "Removed stale temporary files from the state directory"
+            );
+        }
+    }
+}
+
+/// Try to take an exclusive POSIX record lock (`fcntl(F_SETLK)`) on the whole
+/// of `file` without blocking: `Ok(false)` when another process holds it.
+/// Record locks belong to the process, are not inherited across fork, and do
+/// NOT exclude other callers in the same process; closing any descriptor of
+/// the file in this process releases them. Callers add their own in-process
+/// exclusion. Off unix this always succeeds.
+pub(crate) fn try_lock_file(file: &std::fs::File) -> std::io::Result<bool> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        // SAFETY: an all-zero `flock` is a valid value; the fields that matter
+        // are set below. Whole file (`l_start` = `l_len` = 0).
+        let mut request: libc::flock = unsafe { std::mem::zeroed() };
+        request.l_type = libc::F_WRLCK as _;
+        request.l_whence = libc::SEEK_SET as _;
+        // SAFETY: `file` owns an open descriptor for the duration of the call,
+        // and `request` is a valid `flock` that fcntl only reads.
+        if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETLK, &request) } != 0 {
+            let e = std::io::Error::last_os_error();
+            // POSIX allows either errno for "held by another process".
+            return if matches!(e.raw_os_error(), Some(libc::EAGAIN | libc::EACCES)) {
+                Ok(false)
+            } else {
+                Err(e)
+            };
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = file;
+    Ok(true)
+}
+
 /// SHA-256 + byte length of a file, streamed in chunks.
 fn sha256_file(path: &Path) -> Result<(u64, String)> {
     use sha2::{Digest, Sha256};
@@ -971,8 +1074,13 @@ pub(crate) struct UpdateCooldownState {
     /// Unix seconds before which nothing asks GitHub about, or exits for,
     /// `version`. Stored rather than derived so its jitter is stable.
     pub retry_at_unix: u64,
-    /// The last failure, for `freenet service report`.
+    /// The last failure, for `freenet service report`. A hold keeps it.
     pub last_error: String,
+    /// Why the release was last held without a failure being counted (an
+    /// updater run that attempted no download, an empty poll bucket), if the
+    /// latest write was such a hold.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hold_reason: Option<String>,
 }
 
 /// The wait after the `failures`-th consecutive failure, given a uniform
@@ -1004,21 +1112,21 @@ fn write_update_cooldown_at(
     dir: &Path,
     version: &str,
     failures: u32,
-    error: &str,
+    (error, hold_reason): (&str, Option<&str>),
     now: SystemTime,
     rand_unit: f64,
 ) -> bool {
     let now_unix = unix_secs(now);
+    let bounded =
+        |text: &str| -> String { text.chars().take(UPDATE_COOLDOWN_ERROR_MAX_CHARS).collect() };
     let state = UpdateCooldownState {
         version: version.to_string(),
         failures,
         failed_at_unix: now_unix,
         retry_at_unix: now_unix
             .saturating_add(update_cooldown_delay(failures, rand_unit).as_secs()),
-        last_error: error
-            .chars()
-            .take(UPDATE_COOLDOWN_ERROR_MAX_CHARS)
-            .collect(),
+        last_error: bounded(error),
+        hold_reason: hold_reason.map(bounded),
     };
     let written = serde_json::to_vec(&state)
         .context("serialize update cooldown")
@@ -1030,7 +1138,11 @@ fn write_update_cooldown_at(
 }
 
 /// Record a failure to fetch `version` and return the consecutive failure
-/// count, this one included. A record for another release is replaced.
+/// count, this one included. A record for an older release (or the
+/// [`UNKNOWN_RELEASE`] sentinel) is replaced; one for a NEWER release is kept
+/// and its count returned, since that release is what the triggers act on
+/// (an older writer, such as a node that staged before a newer release was
+/// published, must not reset it).
 ///
 /// `None` when it could not be written. Callers then exit for the update (fail
 /// open): an unrecorded failure would never count toward the fallback, and the
@@ -1042,11 +1154,75 @@ pub(crate) fn record_update_failure_at(
     now: SystemTime,
     rand_unit: f64,
 ) -> Option<u32> {
-    let failures = match read_update_cooldown_at(dir) {
-        Some(prev) if prev.version == version => prev.failures.saturating_add(1),
-        _ => 1,
-    };
-    write_update_cooldown_at(dir, version, failures, error, now, rand_unit).then_some(failures)
+    with_record_lock(dir, || {
+        let failures = match read_update_cooldown_at(dir) {
+            Some(prev) if prev.version == version => prev.failures.saturating_add(1),
+            Some(prev) if supersedes(&prev.version, version) => return Some(prev.failures),
+            _ => 1,
+        };
+        write_update_cooldown_at(dir, version, failures, (error, None), now, rand_unit)
+            .then_some(failures)
+    })
+}
+
+/// Whether a record for `recorded` must not be replaced by one for `version`:
+/// both are versions and `recorded` is the newer. The sentinel
+/// [`UNKNOWN_RELEASE`] supersedes nothing, so any real release replaces it.
+fn supersedes(recorded: &str, version: &str) -> bool {
+    semver::Version::parse(recorded)
+        .ok()
+        .zip(semver::Version::parse(version).ok())
+        .is_some_and(|(recorded, version)| recorded > version)
+}
+
+/// Where the record lock lives, beside the records it guards.
+const RECORD_LOCK_FILE: &str = "update_records.lock";
+/// How long a writer waits for the record lock before going ahead without
+/// it. Holders only read and rewrite a small file, so this is only reached if
+/// one is wedged; losing one update to a race then costs one attempt.
+const RECORD_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Run `f`, a read-modify-write of the records in `dir`, with them locked
+/// against every other writer: other threads by a mutex, other processes (the
+/// node, the updater, a tray "Check for Updates") by a POSIX record lock on
+/// [`RECORD_LOCK_FILE`]. Unlocked, concurrent writers lose each other's
+/// increments. Fails open: if the lock cannot be taken within
+/// [`RECORD_LOCK_WAIT`], or at all, `f` runs anyway.
+fn with_record_lock<T>(dir: &Path, f: impl FnOnce() -> T) -> T {
+    // Serialises this process's writers, which a record lock cannot, and
+    // keeps at most one descriptor of the lock file open here: closing a
+    // second one would release the lock.
+    static IN_PROCESS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _thread = IN_PROCESS.lock().unwrap_or_else(|e| e.into_inner());
+    let _process = lock_records(dir);
+    f()
+}
+
+fn lock_records(dir: &Path) -> Option<std::fs::File> {
+    std::fs::create_dir_all(dir).ok()?;
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(dir.join(RECORD_LOCK_FILE))
+        .ok()?;
+    let deadline = std::time::Instant::now() + RECORD_LOCK_WAIT;
+    loop {
+        match try_lock_file(&file) {
+            Ok(true) => return Some(file),
+            Ok(false) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Ok(false) => {
+                tracing::warn!("Update records stayed locked by another process; writing anyway");
+                return None;
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "Cannot lock the update records; writing anyway");
+                return None;
+            }
+        }
+    }
 }
 
 /// [`record_update_failure_at`] against the shared state directory.
@@ -1063,26 +1239,36 @@ pub fn record_update_failure(version: &str, error: &str) -> Option<u32> {
 /// `freenet update` after every non-clean exit, crashes included, so counting
 /// these would walk a crash-looping node to the fallback without a single
 /// download. A live record is left alone; an expired one gets a fresh wait at
-/// its count; with none, or one for an older release, a hold at one failure is
-/// written; a newer release's record is never overwritten.
+/// its count, keeping its last real error; with none, or one for an older
+/// release, a hold at zero failures is written; a newer release's record is
+/// never overwritten.
 pub(crate) fn hold_update_without_counting_at(
     dir: &Path,
     version: &str,
-    error: &str,
+    reason: &str,
     now: SystemTime,
     rand_unit: f64,
 ) {
-    let failures = match read_update_cooldown_at(dir) {
-        Some(prev) if prev.version == version => {
-            if update_cooldown_remaining_at(dir, version, now).is_some() {
-                return;
+    with_record_lock(dir, || {
+        let (failures, last_error) = match read_update_cooldown_at(dir) {
+            Some(prev) if prev.version == version => {
+                if update_cooldown_remaining_at(dir, version, now).is_some() {
+                    return;
+                }
+                (prev.failures, prev.last_error)
             }
-            prev.failures.max(1)
-        }
-        Some(prev) if !is_not_newer(&prev.version, version) => return,
-        _ => 1,
-    };
-    write_update_cooldown_at(dir, version, failures, error, now, rand_unit);
+            Some(prev) if supersedes(&prev.version, version) => return,
+            _ => (0, String::new()),
+        };
+        write_update_cooldown_at(
+            dir,
+            version,
+            failures,
+            (&last_error, Some(reason)),
+            now,
+            rand_unit,
+        );
+    });
 }
 
 /// [`hold_update_without_counting_at`] against the shared state directory.
@@ -1153,7 +1339,9 @@ fn is_not_newer(version: &str, current: &str) -> bool {
 }
 
 pub(crate) fn clear_update_cooldown_at(dir: &Path) {
-    let _rm = std::fs::remove_file(dir.join(UPDATE_COOLDOWN_FILE));
+    with_record_lock(dir, || {
+        let _rm = std::fs::remove_file(dir.join(UPDATE_COOLDOWN_FILE));
+    });
 }
 
 /// Clear the cooldown (after a successful install, or when already up to date).
@@ -1185,10 +1373,22 @@ pub(crate) fn update_cooldown_summary_at(
             None => "cooldown over, the next update check may try again".to_string(),
         }
     };
-    Some(format!(
-        "Update to {} failed {} time(s) in a row ({wait}). Last error: {}",
-        state.version, state.failures, state.last_error
-    ))
+    let held = state
+        .hold_reason
+        .as_deref()
+        .map(|reason| format!(" Then held without counting: {reason}"))
+        .unwrap_or_default();
+    Some(if state.failures == 0 {
+        format!(
+            "Update to {} is on hold, with no failed download yet ({wait}).{held}",
+            state.version
+        )
+    } else {
+        format!(
+            "Update to {} failed {} time(s) in a row ({wait}). Last error: {}{held}",
+            state.version, state.failures, state.last_error
+        )
+    })
 }
 
 /// [`update_cooldown_summary_at`] against the shared state directory.
@@ -1252,6 +1452,12 @@ pub(crate) fn add_staged_download_bytes_at(dir: &Path, version: &str, bytes: u64
     if bytes == 0 {
         return;
     }
+    with_record_lock(dir, || {
+        add_staged_download_bytes_locked(dir, version, bytes, now)
+    });
+}
+
+fn add_staged_download_bytes_locked(dir: &Path, version: &str, bytes: u64, now: SystemTime) {
     let now_unix = unix_secs(now);
     let next = match staged_downloads_at(dir, version, now_unix) {
         Some(d) => StagedDownloads {
@@ -2575,8 +2781,120 @@ mod tests {
         for w in writers {
             w.join().unwrap();
         }
-        assert_eq!(read_update_cooldown_at(&dir).unwrap().version, "0.2.141");
+        let record = read_update_cooldown_at(&dir).unwrap();
+        assert_eq!(record.version, "0.2.141");
+        // Every increment survived: the read-modify-write is locked (#5799).
+        assert_eq!(record.failures, 8 * 50);
         assert_eq!(temp_files(&dir), Vec::<String>::new());
+    }
+
+    /// Whether a forked child process can take the record lock in `dir`
+    /// right now. Between fork and _exit the child makes only
+    /// async-signal-safe calls, as a fork of a threaded process must.
+    #[cfg(unix)]
+    fn another_process_can_lock(dir: &Path) -> bool {
+        use std::os::unix::ffi::OsStrExt;
+        let path =
+            std::ffi::CString::new(dir.join(RECORD_LOCK_FILE).as_os_str().as_bytes()).unwrap();
+        let mut pipe = [0i32; 2];
+        // SAFETY: a valid two-element array for pipe(2) to fill.
+        assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
+        for fd in pipe {
+            // SAFETY: setting a flag on a descriptor we just created.
+            unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
+        }
+        // SAFETY: the child only calls async-signal-safe functions on data
+        // prepared before the fork, then _exits without unwinding.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed");
+        if pid == 0 {
+            // SAFETY: as above.
+            unsafe {
+                libc::alarm(30);
+                libc::close(pipe[0]);
+                let fd = libc::open(path.as_ptr(), libc::O_RDWR | libc::O_CREAT, 0o600);
+                let mut request: libc::flock = std::mem::zeroed();
+                request.l_type = libc::F_WRLCK as _;
+                request.l_whence = libc::SEEK_SET as _;
+                let got = [u8::from(
+                    fd >= 0 && libc::fcntl(fd, libc::F_SETLK, &request) == 0,
+                )];
+                libc::write(pipe[1], got.as_ptr().cast(), 1);
+                libc::_exit(0);
+            }
+        }
+        // SAFETY: closing the end only the child uses.
+        unsafe { libc::close(pipe[1]) };
+        let mut got = [2u8];
+        // SAFETY: reading one byte into a one-byte buffer.
+        let n = unsafe { libc::read(pipe[0], got.as_mut_ptr().cast(), 1) };
+        let mut status = 0;
+        // SAFETY: closing our end and reaping our own child.
+        unsafe {
+            libc::close(pipe[0]);
+            libc::waitpid(pid, &mut status, 0);
+        }
+        assert_eq!(n, 1, "the child exited without reporting");
+        got[0] == 1
+    }
+
+    /// #5799 review (Codex P2): while a record is being rewritten, another
+    /// process (the updater, a tray "Check for Updates") cannot take the
+    /// record lock, so it waits instead of losing the increment. Checked from
+    /// a forked child at that moment, not by timing, which contention from
+    /// other tests in this process could satisfy by itself.
+    #[test]
+    #[cfg(unix)]
+    fn the_record_lock_excludes_another_process() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let mut probes = Vec::new();
+        with_record_lock(dir, || probes.push(another_process_can_lock(dir)));
+        probes.push(another_process_can_lock(dir));
+        assert_eq!(probes, [false, true], "locked while held, free after");
+    }
+
+    /// #5799 review (Codex P2): an older release's failure, written by a
+    /// slower process, never replaces a newer release's record; the sentinel
+    /// for an unknown release is replaced by any real one.
+    #[test]
+    fn an_older_release_never_overwrites_a_newer_ones_record() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let now = SystemTime::now();
+        record_update_failure_at(dir, "0.2.142", "newer", now, 0.5);
+        record_update_failure_at(dir, "0.2.142", "newer", now, 0.5);
+        assert_eq!(
+            record_update_failure_at(dir, "0.2.141", "stale", now, 0.5),
+            Some(2),
+            "the newer record's count governs"
+        );
+        hold_update_without_counting_at(
+            dir,
+            "0.2.141",
+            "stale",
+            now + std::time::Duration::from_secs(9 * 3600),
+            0.5,
+        );
+        let record = read_update_cooldown_at(dir).unwrap();
+        assert_eq!(
+            (
+                record.version.as_str(),
+                record.failures,
+                record.last_error.as_str()
+            ),
+            ("0.2.142", 2, "newer")
+        );
+        // The sentinel gives way to a real release, and a real release is
+        // never replaced by the sentinel's hold.
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        record_update_failure_at(dir, UNKNOWN_RELEASE, "offline", now, 0.5);
+        assert_eq!(
+            record_update_failure_at(dir, "0.2.141", "download", now, 0.5),
+            Some(1)
+        );
+        assert_eq!(read_update_cooldown_at(dir).unwrap().version, "0.2.141");
     }
 
     #[test]
@@ -2692,7 +3010,15 @@ mod tests {
         let hour = std::time::Duration::from_secs(3600);
         hold_update_without_counting_at(dir, "0.2.141", "skipped", now, 0.5);
         let first = read_update_cooldown_at(dir).unwrap();
-        assert_eq!((first.version.as_str(), first.failures), ("0.2.141", 1));
+        // #5799 review: a hold on a fresh record counts nothing.
+        assert_eq!((first.version.as_str(), first.failures), ("0.2.141", 0));
+        assert_eq!(first.hold_reason.as_deref(), Some("skipped"));
+        assert!(update_cooldown_remaining_at(dir, "0.2.141", now).is_some());
+        assert_eq!(
+            record_update_failure_at(dir, "0.2.141", "real", now, 0.5),
+            Some(1),
+            "the first real failure is the first counted"
+        );
         record_update_failure_at(dir, "0.2.141", "real", now, 0.5);
         let live = read_update_cooldown_at(dir).unwrap();
         for _ in 0..10 {
@@ -2705,14 +3031,114 @@ mod tests {
         );
         let later = now + hour * 3;
         hold_update_without_counting_at(dir, "0.2.141", "skipped", later, 0.5);
-        assert_eq!(
-            read_update_cooldown_at(dir).unwrap().failures,
-            live.failures
-        );
+        let held = read_update_cooldown_at(dir).unwrap();
+        assert_eq!(held.failures, live.failures);
+        // #5799 review: the real error survives the hold, for the report.
+        assert_eq!(held.last_error, "real");
+        assert_eq!(held.hold_reason.as_deref(), Some("skipped"));
         assert!(update_cooldown_remaining_at(dir, "0.2.141", later).is_some());
+        let summary = update_cooldown_summary_at(dir, "0.2.140", later).unwrap();
+        assert!(
+            summary.contains("Last error: real")
+                && summary.contains("held without counting: skipped"),
+            "{summary}"
+        );
+        // A real failure clears the hold reason.
+        record_update_failure_at(dir, "0.2.141", "again", later, 0.5);
+        assert_eq!(read_update_cooldown_at(dir).unwrap().hold_reason, None);
         record_update_failure_at(dir, "0.2.150", "newer", now, 0.5);
         hold_update_without_counting_at(dir, "0.2.141", "stale", now, 0.5);
         assert_eq!(read_update_cooldown_at(dir).unwrap().version, "0.2.150");
+    }
+
+    /// A hold with nothing failed yet says so rather than "failed 0 times".
+    #[test]
+    fn the_summary_of_a_hold_says_nothing_has_failed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let now = SystemTime::now();
+        hold_update_without_counting_at(dir, "0.2.141", "the install bucket is empty", now, 0.5);
+        let summary = update_cooldown_summary_at(dir, "0.2.140", now).unwrap();
+        assert!(
+            summary.starts_with("Update to 0.2.141 is on hold, with no failed download yet")
+                && summary.contains("the install bucket is empty")
+                && !summary.contains("0 time(s)"),
+            "{summary}"
+        );
+    }
+
+    /// #5799 review: temporaries a killed write left behind are swept at
+    /// startup once an hour old, and only `atomic_write`'s own.
+    #[test]
+    fn stale_atomic_write_temporaries_are_swept() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let swept = [
+            format!(".{UPDATE_COOLDOWN_FILE}.123.0.tmp"),
+            format!(".{INSTALL_FAILURES_FILE}.9.41.tmp"),
+            format!(".{KNOWN_BAD_FILE}.tmp"),
+        ];
+        let kept = [
+            ".unrelated.json.123.0.tmp".to_string(),
+            format!(".{UPDATE_COOLDOWN_FILE}.12x.0.tmp"),
+            format!(".{UPDATE_COOLDOWN_FILE}.1.2.3.tmp"),
+            UPDATE_COOLDOWN_FILE.to_string(),
+        ];
+        for name in swept.iter().chain(&kept) {
+            std::fs::write(dir.join(name), b"x").unwrap();
+        }
+        let now = SystemTime::now();
+        assert_eq!(sweep_stale_atomic_temps_at(dir, now), 0, "too recent");
+        assert_eq!(
+            sweep_stale_atomic_temps_at(
+                dir,
+                now + STALE_TEMP_AGE + std::time::Duration::from_secs(5)
+            ),
+            swept.len()
+        );
+        let mut left: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        left.sort();
+        let mut expected = kept.to_vec();
+        expected.sort();
+        assert_eq!(left, expected);
+    }
+
+    /// The sweep's list of `atomic_write` files is discovered from the source,
+    /// not trusted: every file this module writes through `atomic_write` must
+    /// be in it, so a new record cannot leak temporaries.
+    #[test]
+    fn atomic_writes_name_only_swept_files() {
+        let src = include_str!("rollback.rs").replace("\r\n", "\n");
+        let production = src
+            .split_once(concat!("#[cfg(test)]\n", "mod tests {"))
+            .unwrap()
+            .0;
+        let flat: String = production.split_whitespace().collect();
+        let needle = concat!("atomic_write", "(&dir.join(");
+        let mut seen = 0;
+        for (at, _) in flat.match_indices(needle) {
+            let name = &flat[at + needle.len()..];
+            let name = &name[..name.find(')').unwrap()];
+            seen += 1;
+            assert!(
+                ATOMIC_FILES.iter().any(|f| {
+                    // The constant's identifier, matched against its value.
+                    name == match *f {
+                        PROBATION_FILE => "PROBATION_FILE",
+                        KNOWN_BAD_FILE => "KNOWN_BAD_FILE",
+                        INSTALL_FAILURES_FILE => "INSTALL_FAILURES_FILE",
+                        UPDATE_COOLDOWN_FILE => "UPDATE_COOLDOWN_FILE",
+                        STAGED_DOWNLOADS_FILE => "STAGED_DOWNLOADS_FILE",
+                        _ => "",
+                    }
+                }),
+                "`atomic_write` writes {name}, which the temp sweep does not know"
+            );
+        }
+        assert_eq!(seen, ATOMIC_FILES.len(), "each swept file is written once");
     }
 
     #[test]

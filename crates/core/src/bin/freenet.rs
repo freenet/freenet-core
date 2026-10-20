@@ -501,6 +501,10 @@ async fn run_network_node_with_signals(
     let update_check_task = GlobalExecutor::spawn(async move {
         use std::time::Instant;
 
+        // Temporaries a killed write left behind never heal on their own,
+        // since each write uses a new name (#5799).
+        commands::rollback::sweep_stale_atomic_temps();
+
         if auto_update_disabled {
             // Loud, operator-visible (issue #4580): this node never even checks
             // for updates, so it will stay on its current version indefinitely
@@ -2965,6 +2969,12 @@ mod tests {
         let startup_check = production
             .find("let cooling = commands::rollback::update_cooldown_pending(build_info::VERSION);")
             .expect("startup update check not found");
+        // The temp sweep (#5799) runs whether or not auto-update is on: the
+        // crash-loop rollback records it cleans up are written either way.
+        let sweep = production
+            .find("commands::rollback::sweep_stale_atomic_temps();")
+            .expect("the update task must sweep stale atomic-write temporaries");
+        assert!(sweep < disabled_return);
         assert!(
             disabled_return < cleanup && cleanup < startup_check,
             "discard_stale_staged must run after the auto-update-disabled return and \
