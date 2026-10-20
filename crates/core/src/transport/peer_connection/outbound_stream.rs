@@ -1210,6 +1210,9 @@ mod tests {
         sleeps: usize,
     }
 
+    /// Payload size used by [`run_virtual_stream_transfer`].
+    const TRANSFER_LEN: usize = 10_000;
+
     /// Run a single 10KB stream transfer under [`VirtualTime`] with the given
     /// token bucket (burst capacity, rate bytes/s).
     ///
@@ -1224,8 +1227,7 @@ mod tests {
         let destination_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, 1234));
         let key = Aes128Gcm::new_from_slice(&[0u8; 16])?;
 
-        // Create a large message (10KB)
-        let message = vec![0u8; 10_000];
+        let message = vec![0u8; TRANSFER_LEN];
 
         let time_source = VirtualTime::new();
         let sent_tracker = Arc::new(parking_lot::Mutex::new(
@@ -1275,8 +1277,29 @@ mod tests {
 
         // Drive virtual time: only advance when the sender is parked on a
         // sleep, otherwise yield so the sender and receiver can make progress.
+        //
+        // This is deterministic because `VirtualTime::sleep` registers its
+        // wakeup with a fixed deadline when the sleep future is created (not
+        // when it is first polled), and this test runs on tokio's
+        // `current_thread` runtime, so the sender only runs while the driver
+        // is yielding. Whether the driver observes a pending wakeup before or
+        // after the sender has parked, the deadline is the same, so the
+        // virtual elapsed time is the same.
+        //
+        // Guard against a stalled sender: a healthy transfer needs a handful
+        // of iterations per fragment, so exceeding the cap means the sender is
+        // stuck, and should fail loudly instead of hanging CI.
+        const MAX_DRIVER_ITERATIONS: usize = 100_000;
         let mut sleeps = 0;
+        let mut iterations = 0;
         while !send_task.is_finished() {
+            iterations += 1;
+            assert!(
+                iterations <= MAX_DRIVER_ITERATIONS,
+                "send_stream did not finish after {MAX_DRIVER_ITERATIONS} driver iterations \
+                 ({sleeps} virtual sleeps, virtual time {:?}): the sender is stalled",
+                Duration::from_nanos(time_source.now_nanos() - start_nanos),
+            );
             if time_source.advance_to_next_wakeup().is_some() {
                 sleeps += 1;
             }
@@ -1298,13 +1321,26 @@ mod tests {
         })
     }
 
+    /// Assert `elapsed` matches the token-bucket pacing of `TRANSFER_LEN`
+    /// bytes after the initial `burst`, within +/-5%. Virtual time is exact, so
+    /// the window only absorbs fragment granularity; a limiter that is 1.5x too
+    /// fast or too slow fails.
+    fn assert_throttled_duration(elapsed: Duration, burst: usize, rate: usize) {
+        let expected = Duration::from_secs_f64((TRANSFER_LEN - burst) as f64 / rate as f64);
+        let (lo, hi) = (expected.mul_f64(0.95), expected.mul_f64(1.05));
+        assert!(
+            (lo..=hi).contains(&elapsed),
+            "throttled transfer took {elapsed:?}, expected {expected:?} (window {lo:?}..={hi:?})"
+        );
+    }
+
     #[tokio::test]
     async fn test_send_stream_with_bandwidth_limit() -> Result<(), Box<dyn std::error::Error>> {
-        // 10KB at 100KB/s with a 1KB burst: the burst covers at most the first
-        // 1KB, the remaining >= 9KB is paced at 100KB/s, i.e. >= 90ms of
-        // virtual time. (The old wall-clock assertion used >= 50ms because
-        // real-time refill ran concurrently with the sends.)
-        let transfer = run_virtual_stream_transfer(1_000, 100_000).await?;
+        // The bucket starts with `burst` tokens and every payload byte is
+        // reserved against it, so the remaining (TRANSFER_LEN - burst) bytes
+        // are paced at `rate`: 9000 B at 100 KB/s = 90 ms of virtual time.
+        let (burst, rate) = (1_000, 100_000);
+        let transfer = run_virtual_stream_transfer(burst, rate).await?;
 
         let key = Aes128Gcm::new_from_slice(&[0u8; 16])?;
         for packet in &transfer.packets {
@@ -1335,11 +1371,7 @@ mod tests {
             transfer.sleeps > 0,
             "rate limiting must have parked the sender on the token bucket"
         );
-        assert!(
-            transfer.virtual_elapsed >= Duration::from_millis(50),
-            "Transfer completed too quickly: {:?}",
-            transfer.virtual_elapsed
-        );
+        assert_throttled_duration(transfer.virtual_elapsed, burst, rate);
 
         Ok(())
     }
@@ -1352,14 +1384,13 @@ mod tests {
     /// harness that cannot see sleeps cannot pass this test vacuously.
     #[tokio::test]
     async fn test_send_stream_without_bandwidth_limit() -> Result<(), Box<dyn std::error::Error>> {
-        let limited = run_virtual_stream_transfer(1_000, 100_000).await?;
+        let (burst, rate) = (1_000, 100_000);
+        let limited = run_virtual_stream_transfer(burst, rate).await?;
         assert!(
-            limited.sleeps > 0 && limited.virtual_elapsed >= Duration::from_millis(50),
-            "control: the rate-limited run must wait on the token bucket \
-             (sleeps={}, virtual_elapsed={:?})",
-            limited.sleeps,
-            limited.virtual_elapsed
+            limited.sleeps > 0,
+            "control: the rate-limited run must wait on the token bucket"
         );
+        assert_throttled_duration(limited.virtual_elapsed, burst, rate);
 
         let unlimited = run_virtual_stream_transfer(100_000, 1_000_000_000).await?;
         assert_eq!(
