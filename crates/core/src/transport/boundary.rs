@@ -64,16 +64,22 @@ use super::{TransportError, TransportPublicKey};
 /// On the wire it is a `u32`, serialized transparently, and its values are
 /// part of the protocol with existing peers. Ids from [`StreamId::next`] have
 /// the top bit set; ids without it belong to a transport's own streams
-/// ([`StreamId::next_transport_internal`]), so the two never collide. The UDP
-/// transport relies on that split to route a stream (see
-/// [`StreamId::is_caller_named`]).
+/// ([`StreamId::next_transport_internal`]). The UDP transport relies on that
+/// split to route a stream (see [`StreamId::is_caller_named`]).
+///
+/// The split is a convention, not a guarantee: both allocators share one
+/// per-thread counter, so once it passes 2^31 an internal id also has the top
+/// bit, and each thread's 100,000-id block overlaps the next thread's after
+/// 100,000 allocations. Receivers key streams by (peer, id), so a collision
+/// needs both within one connection's live streams.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[repr(transparent)]
 #[serde(transparent)]
 pub struct StreamId(pub(in crate::transport) u32);
 
 /// Each thread's counter starts at its own block, so ids from parallel
-/// simulation threads do not collide.
+/// simulation threads start apart (they overlap after `STREAM_ID_BLOCK`
+/// allocations on one thread).
 const STREAM_ID_BLOCK: u32 = 100_000;
 
 /// Top bit of ids from [`StreamId::next`].
@@ -102,8 +108,9 @@ impl StreamId {
     }
 
     /// A fresh id for a stream a transport opens for its own purposes (the
-    /// UDP transport's oversized messages). Never equal to an id from
-    /// [`Self::next`].
+    /// UDP transport's oversized messages). Distinct from ids from
+    /// [`Self::next`] until the shared counter passes 2^31 (see the type
+    /// docs).
     pub(crate) fn next_transport_internal() -> Self {
         Self(next_stream_counter())
     }
