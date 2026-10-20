@@ -537,6 +537,43 @@ mod tests {
         }
     }
 
+    /// A `Connect` command reaches the connector with its origin.
+    #[tokio::test(start_paused = true)]
+    async fn run_driver_passes_the_connect_commands_origin_to_the_connector() {
+        let (_conn_tx, conn_rx) = mpsc::channel(4);
+        let (cmd_tx, cmd_rx) = mpsc::channel(4);
+        let (event_tx, mut event_rx) = mpsc::channel(4);
+        let connector = Arc::new(ScriptedConnector {
+            enqueue: Duration::ZERO,
+            handshake: Handshake::Succeeds,
+            origins: Default::default(),
+        });
+        let driver = GlobalExecutor::spawn(run_driver(
+            Box::new(ChannelAcceptor(conn_rx)),
+            connector.clone(),
+            cmd_rx,
+            event_tx,
+            None,
+        ));
+        cmd_tx
+            .send(Command::Connect {
+                peer: make_peer(4310),
+                transaction: Transaction::new::<ConnectMsg>(),
+                transient: false,
+                origin: crate::transport::NatAttemptOrigin::Gateway,
+            })
+            .await
+            .unwrap();
+        let Some(Event::OutboundEstablished { .. }) = event_rx.recv().await else {
+            panic!("expected OutboundEstablished");
+        };
+        assert_eq!(
+            *connector.origins.lock(),
+            vec![crate::transport::NatAttemptOrigin::Gateway]
+        );
+        driver.abort();
+    }
+
     /// The accept loop, driven through `Box<dyn InboundAcceptor>`: an
     /// expected connection is reported with its peer, transaction and
     /// transient flag; an unexpected one with none of them; each accept marks
