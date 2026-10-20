@@ -1459,6 +1459,7 @@ pub(super) async fn dispatch_expect_connection_from(
             tx,
             callback,
             is_gw: false,
+            origin: crate::transport::NatAttemptOrigin::ConnectAcceptor,
         })
         .await?;
 

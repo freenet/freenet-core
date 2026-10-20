@@ -1896,6 +1896,15 @@ impl P2pConnManager {
                                             tx,
                                             callback,
                                             is_gw,
+                                            origin: unconnected_dial_origin(
+                                                is_gw,
+                                                &msg,
+                                                &ctx.bridge
+                                                    .op_manager
+                                                    .ring
+                                                    .connection_manager
+                                                    .pub_key,
+                                            ),
                                         }),
                                     ) {
                                         // `err` owns the ConnectPeer event (and thus the
@@ -2468,6 +2477,7 @@ impl P2pConnManager {
                                 tx,
                                 callback,
                                 is_gw: transient,
+                                origin,
                             } => {
                                 tracing::debug!(
                                     tx = %tx,
@@ -2484,6 +2494,7 @@ impl P2pConnManager {
                                     &handshake_cmd_sender,
                                     &mut state,
                                     transient,
+                                    origin,
                                 )
                                 .await?;
                             }
@@ -3089,6 +3100,27 @@ fn orphan_transaction(
 /// peer pruned mid-flight) frees the bootstrap round instead of holding it
 /// for the transaction TTL. A relayed request and every other message keep
 /// their ops' own retry handling.
+/// Why a message to a peer with no connection opens one. A gateway is
+/// `Gateway`. Our own CONNECT request to anyone else is the cached-peer
+/// reconnect (`join_ring_request` to a cached peer; its other callers target
+/// gateways). Anything else re-dials a peer we are no longer connected to.
+fn unconnected_dial_origin(
+    is_gw: bool,
+    msg: &NetMessage,
+    own: &TransportPublicKey,
+) -> crate::transport::NatAttemptOrigin {
+    use crate::transport::NatAttemptOrigin;
+    if is_gw {
+        return NatAttemptOrigin::Gateway;
+    }
+    match msg {
+        NetMessage::V1(NetMessageV1::Connect(
+            crate::operations::connect::ConnectMsg::Request { payload, .. },
+        )) if payload.joiner.pub_key() == own => NatAttemptOrigin::CachedPeer,
+        _ => NatAttemptOrigin::Redial,
+    }
+}
+
 fn unsent_message_notice(
     msg: &NetMessage,
     tx: Transaction,

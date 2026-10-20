@@ -212,6 +212,7 @@ impl P2pConnManager {
         handshake_commands: &HandshakeCommandSender,
         state: &mut EventListenerState,
         transient: bool,
+        origin: crate::transport::NatAttemptOrigin,
     ) -> anyhow::Result<()> {
         // Periodic cleanup of expired backoff entries (every 60 seconds)
         const BACKOFF_CLEANUP_INTERVAL: Duration = Duration::from_secs(60);
@@ -602,10 +603,12 @@ impl P2pConnManager {
         // parking. The connect op can retry on a later attempt; this failure is
         // LOCAL channel contention, not a remote connection failure, so we do
         // NOT record peer backoff.
+        let origin = dial_origin(origin, transient, peer_addr, &self.gateways);
         if !handshake_commands.try_send(HandshakeCommand::Connect {
             peer: peer.clone(),
             transaction: tx,
             transient,
+            origin,
         }) {
             tracing::warn!(
                 tx = %tx,
@@ -1594,6 +1597,80 @@ impl P2pConnManager {
                 tracing::error!("All peer connection event channels closed");
                 Ok(EventResult::Continue)
             }
+        }
+    }
+}
+
+/// The origin a dial is reported under: `Gateway` for any dial to a
+/// configured gateway (or one the caller marked as a gateway dial), whichever
+/// path started it, otherwise the caller's `origin`. A CONNECT joiner whose
+/// acceptor is a gateway, for example, is still a gateway dial.
+fn dial_origin(
+    origin: crate::transport::NatAttemptOrigin,
+    is_gw: bool,
+    peer_addr: SocketAddr,
+    gateways: &[PeerKeyLocation],
+) -> crate::transport::NatAttemptOrigin {
+    if is_gw
+        || gateways
+            .iter()
+            .any(|gw| gw.socket_addr() == Some(peer_addr))
+    {
+        crate::transport::NatAttemptOrigin::Gateway
+    } else {
+        origin
+    }
+}
+
+#[cfg(test)]
+mod dial_origin_tests {
+    use super::*;
+    use crate::transport::NatAttemptOrigin;
+
+    fn gateway() -> PeerKeyLocation {
+        PeerKeyLocation::new(
+            crate::transport::TransportKeypair::new().public().clone(),
+            "192.0.2.1:31337".parse().unwrap(),
+        )
+    }
+
+    /// A dial to a configured gateway is `Gateway` whatever path started it.
+    #[test]
+    fn a_configured_gateway_is_always_a_gateway_dial() {
+        let gw = gateway();
+        let addr = gw.socket_addr().unwrap();
+        for origin in NatAttemptOrigin::ALL {
+            assert_eq!(
+                dial_origin(origin, false, addr, std::slice::from_ref(&gw)),
+                NatAttemptOrigin::Gateway,
+                "{origin:?}"
+            );
+        }
+    }
+
+    /// A dial the caller marked as a gateway dial is `Gateway` even before
+    /// the gateway list knows the address.
+    #[test]
+    fn a_marked_gateway_dial_is_a_gateway_dial() {
+        let addr: SocketAddr = "198.51.100.4:9".parse().unwrap();
+        assert_eq!(
+            dial_origin(NatAttemptOrigin::Redial, true, addr, &[]),
+            NatAttemptOrigin::Gateway
+        );
+    }
+
+    /// Any other dial keeps its origin, including one to another port of a
+    /// gateway's IP.
+    #[test]
+    fn a_non_gateway_dial_keeps_its_origin() {
+        let gw = gateway();
+        let other_port: SocketAddr = "192.0.2.1:31338".parse().unwrap();
+        for origin in NatAttemptOrigin::ALL {
+            assert_eq!(
+                dial_origin(origin, false, other_port, std::slice::from_ref(&gw)),
+                origin,
+                "{origin:?}"
+            );
         }
     }
 }

@@ -104,6 +104,8 @@ pub(crate) enum Command {
         peer: PeerKeyLocation,
         transaction: Transaction,
         transient: bool,
+        /// Why this dial is made (telemetry only).
+        origin: crate::transport::NatAttemptOrigin,
     },
     /// Register expectation for an inbound connection from `peer`.
     ExpectInbound {
@@ -265,8 +267,8 @@ async fn run_driver(
     loop {
         select! {
             command = commands_rx.recv() => match command {
-                Some(Command::Connect { peer, transaction, transient }) => {
-                    spawn_outbound(outbound.clone(), events_tx.clone(), peer, transaction, transient, peer_ready.clone());
+                Some(Command::Connect { peer, transaction, transient, origin }) => {
+                    spawn_outbound(outbound.clone(), events_tx.clone(), peer, transaction, transient, origin, peer_ready.clone());
                 }
             Some(Command::ExpectInbound { peer, transaction, transient }) => {
                     expected_inbound.register(peer, transaction, transient /* transient */);
@@ -379,6 +381,7 @@ fn spawn_outbound(
     peer: PeerKeyLocation,
     transaction: Transaction,
     transient: bool,
+    origin: crate::transport::NatAttemptOrigin,
     peer_ready: Option<Arc<std::sync::atomic::AtomicBool>>,
 ) {
     GlobalExecutor::spawn(async move {
@@ -387,6 +390,7 @@ fn spawn_outbound(
             peer,
             transaction,
             transient,
+            origin,
             peer_ready.as_deref(),
         )
         .await;
@@ -414,12 +418,13 @@ async fn connect_outbound(
     peer: PeerKeyLocation,
     transaction: Transaction,
     transient: bool,
+    origin: crate::transport::NatAttemptOrigin,
     peer_ready: Option<&std::sync::atomic::AtomicBool>,
 ) -> Event {
     let addr = peer
         .socket_addr()
         .expect("Connect requires known peer address");
-    let connect_future = outbound.connect(peer.pub_key.clone(), addr).await;
+    let connect_future = outbound.connect(peer.pub_key.clone(), addr, origin).await;
     let result: Result<Box<dyn PeerConnectionApi>, ConnectionError> =
         match tokio::time::timeout(OUTBOUND_CONNECT_TIMEOUT, connect_future).await {
             Ok(res) => res.map_err(|err| err.into()),
@@ -547,6 +552,7 @@ mod tests {
             Arc::new(ScriptedConnector {
                 enqueue: Duration::ZERO,
                 handshake: Handshake::Hangs,
+                origins: Default::default(),
             }),
             cmd_rx,
             event_tx,
@@ -637,6 +643,8 @@ mod tests {
     struct ScriptedConnector {
         enqueue: Duration,
         handshake: Handshake,
+        /// The origin each `connect` was called with.
+        origins: parking_lot::Mutex<Vec<crate::transport::NatAttemptOrigin>>,
     }
 
     impl OutboundConnector for ScriptedConnector {
@@ -646,9 +654,11 @@ mod tests {
             &self,
             _remote_public_key: crate::transport::TransportPublicKey,
             remote_addr: SocketAddr,
+            origin: crate::transport::NatAttemptOrigin,
         ) -> Pin<
             Box<dyn std::future::Future<Output = crate::transport::PendingConnection> + Send + '_>,
         > {
+            self.origins.lock().push(origin);
             let (enqueue, handshake) = (self.enqueue, self.handshake);
             Box::pin(async move {
                 tokio::time::sleep(enqueue).await;
@@ -674,23 +684,42 @@ mod tests {
         transaction: Transaction,
         ready: bool,
         elapsed: Duration,
+        /// The origins the connector was called with.
+        origins: Vec<crate::transport::NatAttemptOrigin>,
     }
+
+    /// The origin `run_connect` dials with; any variant would do, as long as
+    /// the connector sees exactly it.
+    const RUN_ORIGIN: crate::transport::NatAttemptOrigin =
+        crate::transport::NatAttemptOrigin::CachedPeer;
 
     /// Run `connect_outbound` against a scripted connector.
     async fn run_connect(enqueue: Duration, handshake: Handshake) -> ConnectRun {
-        let connector = ScriptedConnector { enqueue, handshake };
+        let connector = ScriptedConnector {
+            enqueue,
+            handshake,
+            origins: Default::default(),
+        };
         let ready = std::sync::atomic::AtomicBool::new(false);
         let peer = make_peer(4200);
         let transaction = Transaction::new::<ConnectMsg>();
         let start = tokio::time::Instant::now();
-        let event =
-            connect_outbound(&connector, peer.clone(), transaction, true, Some(&ready)).await;
+        let event = connect_outbound(
+            &connector,
+            peer.clone(),
+            transaction,
+            true,
+            RUN_ORIGIN,
+            Some(&ready),
+        )
+        .await;
         ConnectRun {
             event,
             peer,
             transaction,
             ready: ready.load(std::sync::atomic::Ordering::SeqCst),
             elapsed: start.elapsed(),
+            origins: connector.origins.into_inner(),
         }
     }
 
@@ -713,6 +742,11 @@ mod tests {
         assert_eq!(connection.remote_addr(), run.peer.socket_addr().unwrap());
         assert!(transient);
         assert!(run.ready, "a successful connect marks the peer ready");
+        assert_eq!(
+            run.origins,
+            vec![RUN_ORIGIN],
+            "the connector gets the dial's origin, once"
+        );
     }
 
     /// A failed handshake becomes `OutboundFailed` with the transport error

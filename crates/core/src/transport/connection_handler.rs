@@ -44,6 +44,8 @@ use super::{
 };
 use crate::simulation::{RealTime, TimeSource, VirtualTime};
 use crate::transport::in_memory_socket::get_socket_virtual_time;
+use crate::transport::metrics::NatAttemptOrigin;
+use stray_intro::RecentTraversalFailures;
 
 // Constants for interval increase
 const INITIAL_INTERVAL: Duration = Duration::from_millis(50);
@@ -418,6 +420,7 @@ impl<S: Socket> OutboundConnectionHandler<S> {
             global_bandwidth,
             ledbat_min_ssthresh,
             expected_non_gateway: expected_non_gateway.clone(),
+            recent_traversal_failures: RecentTraversalFailures::default(),
             // In simulation the admission ramp must advance with the network's
             // VirtualTime, not only the RealTime source this handler is built with
             // (see `GatewayConnectionRateLimiter::effective_elapsed_nanos`).
@@ -485,12 +488,25 @@ impl<S: Socket> OutboundConnectionHandler<S> {
         Ok((handler, receiver))
     }
 
-    /// `OutboundConnector::connect` calls this on a clone, so it must only
-    /// touch `Arc`-shared state.
+    /// Connect with no node-level origin (tests, benchmarks); the attempt
+    /// is tagged [`NatAttemptOrigin::Redial`]. The node connects through
+    /// [`super::OutboundConnector::connect`], which carries the real origin.
     pub async fn connect(
         &mut self,
         remote_public_key: TransportPublicKey,
         remote_addr: SocketAddr,
+    ) -> Pin<Box<dyn Future<Output = Result<PeerConnection<S>, TransportError>> + Send>> {
+        self.connect_with_origin(remote_public_key, remote_addr, NatAttemptOrigin::Redial)
+            .await
+    }
+
+    /// `OutboundConnector::connect` calls this on a clone, so it must only
+    /// touch `Arc`-shared state.
+    pub(crate) async fn connect_with_origin(
+        &mut self,
+        remote_public_key: TransportPublicKey,
+        remote_addr: SocketAddr,
+        origin: NatAttemptOrigin,
     ) -> Pin<Box<dyn Future<Output = Result<PeerConnection<S>, TransportError>> + Send>> {
         if self.expected_non_gateway.insert(remote_addr.ip()) {
             tracing::debug!(
@@ -507,6 +523,7 @@ impl<S: Socket> OutboundConnectionHandler<S> {
                 ConnectionEvent::ConnectionStart {
                     remote_public_key,
                     open_connection,
+                    origin,
                 },
             ))
             .await
@@ -552,15 +569,17 @@ impl<S: Socket> super::OutboundConnector for OutboundConnectionHandler<S> {
         &self,
         remote_public_key: TransportPublicKey,
         remote_addr: SocketAddr,
+        origin: NatAttemptOrigin,
     ) -> Pin<Box<dyn Future<Output = super::PendingConnection> + Send + '_>> {
         // The inherent `connect` takes `&mut self` but mutates nothing; a
         // clone shares the queue and the expected-IP set.
         let mut handler = self.clone();
         Box::pin(async move {
-            let pending = OutboundConnectionHandler::<S>::connect(
+            let pending = OutboundConnectionHandler::<S>::connect_with_origin(
                 &mut handler,
                 remote_public_key,
                 remote_addr,
+                origin,
             )
             .await;
             let pending: super::PendingConnection = Box::pin(pending.map(|result| {
@@ -651,6 +670,7 @@ impl<S: Socket> OutboundConnectionHandler<S, crate::simulation::VirtualTime> {
             global_bandwidth,
             ledbat_min_ssthresh,
             expected_non_gateway: expected_non_gateway.clone(),
+            recent_traversal_failures: RecentTraversalFailures::default(),
             // This listener's `time_source` is already VirtualTime, so the admission
             // clock needs no override.
             gw_rate_limiter: GatewayConnectionRateLimiter::new(time_source.clone(), None),
@@ -714,7 +734,8 @@ impl<S: Socket> OutboundConnectionHandler<S, crate::simulation::VirtualTime> {
         )
     }
 
-    /// Connect to a remote peer using VirtualTime.
+    /// Connect to a remote peer using VirtualTime. Tagged
+    /// [`NatAttemptOrigin::Redial`], like the real-time inherent `connect`.
     pub async fn connect(
         &mut self,
         remote_public_key: TransportPublicKey,
@@ -744,6 +765,7 @@ impl<S: Socket> OutboundConnectionHandler<S, crate::simulation::VirtualTime> {
                 ConnectionEvent::ConnectionStart {
                     remote_public_key,
                     open_connection,
+                    origin: NatAttemptOrigin::Redial,
                 },
             ))
             .await
@@ -807,6 +829,9 @@ struct UdpPacketsListener<S = UdpSocket, T: TimeSource = RealTime> {
     /// IPs expected to connect as regular peers (not gateways).
     /// Used to validate connection attempts and prevent gateway impersonation.
     expected_non_gateway: Arc<DashSet<IpAddr>>,
+    /// Outbound traversals that failed recently, to classify stray intros
+    /// (telemetry only). Bounded by size and TTL.
+    recent_traversal_failures: RecentTraversalFailures,
     time_source: T,
     /// Congestion control configuration for new connections.
     /// When None, uses the default configuration (BBR).
@@ -831,8 +856,17 @@ struct UdpPacketsListener<S = UdpSocket, T: TimeSource = RealTime> {
 type OngoingConnectionResult<S, T> = Option<
     Result<
         Result<
-            (RemoteConnection<S, T>, InboundRemoteConnection),
-            (TransportError, SocketAddr, Arc<NatAttemptObservation>),
+            (
+                RemoteConnection<S, T>,
+                InboundRemoteConnection,
+                NatAttemptOrigin,
+            ),
+            (
+                TransportError,
+                SocketAddr,
+                Arc<NatAttemptObservation>,
+                NatAttemptOrigin,
+            ),
         >,
         tokio::task::JoinError,
     >,
@@ -925,6 +959,29 @@ impl<S, T: TimeSource> ConnectionStateManager<S, T> {
             self.get_state(addr),
             Some(ConnectionState::NatTraversal { .. })
         )
+    }
+
+    /// Whether an outbound NAT traversal to any port of `ip` is in progress.
+    /// A range scan over `ip`'s entries only (`SocketAddr` orders by IP
+    /// first, then port), so cheap enough for the listener's drop path.
+    fn has_nat_traversal_to_ip(&self, ip: IpAddr) -> bool {
+        let (low, high) = match ip {
+            IpAddr::V4(v4) => (SocketAddr::from((v4, 0)), SocketAddr::from((v4, u16::MAX))),
+            // Bounds cover every flowinfo / scope id, whether or not the
+            // ordering compares them.
+            IpAddr::V6(v6) => (
+                SocketAddr::V6(std::net::SocketAddrV6::new(v6, 0, 0, 0)),
+                SocketAddr::V6(std::net::SocketAddrV6::new(
+                    v6,
+                    u16::MAX,
+                    u32::MAX,
+                    u32::MAX,
+                )),
+            ),
+        };
+        self.states
+            .range(low..=high)
+            .any(|(_, state)| matches!(state, ConnectionState::NatTraversal { .. }))
     }
 
     /// Try to send a packet to an established connection.
@@ -1720,6 +1777,9 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                                 gw_connection_tasks.push(task);
                                 continue;
                             } else {
+                                if packet_data.is_intro_packet() {
+                                    self.count_stray_intro(remote_addr);
+                                }
                                 // Non-gateway peers: mark as expected and wait for the normal peer handshake flow.
                                 self.expected_non_gateway.insert(remote_addr.ip());
                                 tracing::trace!(
@@ -1860,7 +1920,7 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                     };
                     match task_result {
                         // Successful NAT traversal
-                        Ok((outbound_remote_conn, inbound_remote_connection)) => {
+                        Ok((outbound_remote_conn, inbound_remote_connection, origin)) => {
                             let remote_addr = outbound_remote_conn.remote_addr;
                             self.expected_non_gateway.remove(&remote_addr.ip());
 
@@ -1871,7 +1931,7 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                             ) {
                                 tracing::info!(peer_addr = %remote_addr, "NAT traversal connection established");
                                 crate::transport::TRANSPORT_METRICS
-                                    .record_nat_traversal_established();
+                                    .record_nat_traversal_established(origin);
                                 if result_sender.send(Ok(outbound_remote_conn)).is_err() {
                                     tracing::debug!(peer_addr = %remote_addr, "NAT traversal result receiver already dropped");
                                 }
@@ -1880,7 +1940,7 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                             }
                         }
                         // Failed NAT traversal
-                        Err((error, remote_addr, observed)) => {
+                        Err((error, remote_addr, observed, origin)) => {
                             let flags = observed.flags();
                             let kind = classify_nat_failure(&error, flags);
                             type O = NatAttemptObservation;
@@ -1889,10 +1949,13 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                                 flags & O::RECEIVED != 0,
                                 flags & O::DECRYPTED != 0,
                                 flags & O::DEADLINE != 0,
+                                origin,
                             );
                             #[cfg(test)]
                             crate::transport::TRANSPORT_METRICS
-                                .note_nat_failure_remote(remote_addr, kind);
+                                .note_nat_failure_remote(remote_addr, kind, origin);
+                            self.recent_traversal_failures
+                                .record(remote_addr, self.time_source.now_nanos());
                             match &error {
                                 TransportError::ProtocolVersionMismatch { .. } => {
                                     tracing::warn!(%error);
@@ -1928,7 +1991,7 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                         return TransportError::ConnectionClosed(self.this_addr);
                     };
                     tracing::debug!(peer_addr = %remote_addr, "Received connection event");
-                    let ConnectionEvent::ConnectionStart { remote_public_key, open_connection } = event;
+                    let ConnectionEvent::ConnectionStart { remote_public_key, open_connection, origin } = event;
 
                     // Check for existing NAT traversal in progress
                     if self.connections.has_nat_traversal(&remote_addr) {
@@ -1957,11 +2020,14 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                     // Admitted: a traversal task is now spawned and will emit
                     // exactly one established/failed outcome. Count the attempt
                     // here so the denominator matches the outcomes.
-                    crate::transport::TRANSPORT_METRICS.record_nat_traversal_attempt();
+                    crate::transport::TRANSPORT_METRICS.record_nat_traversal_attempt(origin);
+                    #[cfg(test)]
+                    crate::transport::TRANSPORT_METRICS.note_nat_attempt_remote(remote_addr, origin);
 
                     self.expected_non_gateway.insert(remote_addr.ip());
                     let task = GlobalExecutor::spawn(ongoing_connection
-                        .map_err(move |err| (err, remote_addr, nat_observation))
+                        .map_ok(move |(conn, inbound)| (conn, inbound, origin))
+                        .map_err(move |err| (err, remote_addr, nat_observation, origin))
                         .instrument(span!(tracing::Level::DEBUG, "traverse_nat"))
                     );
                     connection_tasks.push(task);
@@ -1972,6 +2038,7 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                 } => {
                     self.connections.cleanup_expired();
                     let now_nanos = self.time_source.now_nanos();
+                    self.recent_traversal_failures.prune(now_nanos);
                     last_cleanup_nanos = now_nanos;
 
                     let outdated_cutoff = now_nanos.saturating_sub(OUTDATED_PEER_EXPIRY.as_nanos() as u64);
@@ -1979,6 +2046,21 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                 }
             }
         }
+    }
+
+    /// Count an intro packet dropped because nothing exists for its exact
+    /// address (non-gateways only; telemetry). Bounded cost: a hash lookup
+    /// and a range scan over this IP's entries, no allocation.
+    fn count_stray_intro(&mut self, remote_addr: SocketAddr) {
+        let now_nanos = self.time_source.now_nanos();
+        let kind = stray_intro::classify(
+            self.recent_traversal_failures
+                .failed_recently(remote_addr, now_nanos),
+            self.connections.has_nat_traversal_to_ip(remote_addr.ip()),
+        );
+        crate::transport::TRANSPORT_METRICS.record_stray_intro(kind);
+        #[cfg(test)]
+        crate::transport::TRANSPORT_METRICS.note_stray_intro_remote(remote_addr, kind);
     }
 
     /// Effective floor for emitting the version-carrying ack (#5161): the
@@ -3267,6 +3349,8 @@ pub(crate) enum ConnectionEvent<S = UdpSocket, TS: TimeSource = RealTime> {
     ConnectionStart {
         remote_public_key: TransportPublicKey,
         open_connection: oneshot::Sender<Result<RemoteConnection<S, TS>, TransportError>>,
+        /// Why the node started this attempt (telemetry only).
+        origin: NatAttemptOrigin,
     },
 }
 
@@ -3275,6 +3359,7 @@ struct InboundRemoteConnection {
 }
 
 mod recv_errors;
+mod stray_intro;
 mod version_cmp;
 
 /// Smoke tests pinning the contract the transport layer relies on from

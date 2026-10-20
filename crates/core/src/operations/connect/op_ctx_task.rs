@@ -424,7 +424,9 @@ async fn drive_client_connect(
     // one unreachable acceptor cannot hold the next one past its hole-punch
     // window (#5858). A peer that already has a connection keeps dialling
     // one at a time, as before.
-    let mut dial_queue: AcceptorDialQueue<PeerKeyLocation> = AcceptorDialQueue::new(
+    // Each acceptor carries when its Response arrived, so the dial can
+    // report how long it waited in the queue (telemetry).
+    let mut dial_queue: AcceptorDialQueue<(PeerKeyLocation, Instant)> = AcceptorDialQueue::new(
         if bootstrapping {
             MAX_CONCURRENT_ACCEPTOR_DIALS
         } else {
@@ -522,8 +524,8 @@ async fn drive_client_connect(
                 acceptor_addr,
                 result,
             })) => {
-                if let Some(next) = dial_queue.finish() {
-                    dials.push(begin_acceptor_dial(op_manager, tx, next).await?);
+                if let Some((next, answered_at)) = dial_queue.finish() {
+                    dials.push(begin_acceptor_dial(op_manager, tx, next, answered_at).await?);
                 }
                 // The address the connection was made to, which can differ from
                 // the advertised one when an existing transport is reused.
@@ -766,10 +768,12 @@ async fn drive_client_connect(
 
                 // `accepted` only grows with what the queue takes, so both
                 // stay within `acceptor_limit`.
-                match dial_queue.offer(payload.acceptor.clone()) {
-                    Offer::Dial(acceptor) => {
+                match dial_queue.offer((payload.acceptor.clone(), Instant::now())) {
+                    Offer::Dial((acceptor, answered_at)) => {
                         accepted.insert(acceptor.clone());
-                        dials.push(begin_acceptor_dial(op_manager, tx, acceptor).await?);
+                        dials.push(
+                            begin_acceptor_dial(op_manager, tx, acceptor, answered_at).await?,
+                        );
                     }
                     Offer::Queued => {
                         accepted.insert(payload.acceptor.clone());
@@ -925,15 +929,23 @@ struct AcceptorDial {
     result: Option<crate::message::ConnectResult>,
 }
 
-/// Starts the hole punch to `acceptor` and returns a future that resolves
-/// with its outcome, so several acceptors can be dialled at once.
+/// Starts the hole punch to `acceptor`, whose Response arrived at
+/// `answered_at`, and returns a future that resolves with its outcome, so
+/// several acceptors can be dialled at once.
 async fn begin_acceptor_dial(
     op_manager: &OpManager,
     tx: Transaction,
     acceptor: PeerKeyLocation,
+    answered_at: Instant,
 ) -> Result<impl std::future::Future<Output = AcceptorDial> + Send + 'static, OpError> {
     // The Response arm only queues acceptors that have a socket address.
     let acceptor_addr = acceptor.socket_addr().ok_or(OpError::UnexpectedOpState)?;
+    // The acceptor started punching when it accepted, before its Response
+    // reached us; time spent queued here comes out of its 3 s window.
+    let queued_for = answered_at.elapsed();
+    crate::transport::TRANSPORT_METRICS.record_dial_queue_wait(queued_for);
+    #[cfg(test)]
+    crate::transport::TRANSPORT_METRICS.note_dial_queue_wait(acceptor_addr, queued_for);
     op_manager
         .notify_node_event(NodeEvent::ExpectPeerConnection {
             addr: acceptor_addr,
@@ -947,6 +959,7 @@ async fn begin_acceptor_dial(
             tx,
             callback,
             is_gw: false,
+            origin: crate::transport::NatAttemptOrigin::ConnectJoiner,
         })
         .await?;
     Ok(async move {

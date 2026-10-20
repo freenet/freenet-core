@@ -35,25 +35,32 @@ use crate::tracing::{TransferDirection, TransferEvent};
 /// metrics for periodic telemetry snapshots.
 pub static TRANSPORT_METRICS: LazyLock<TransportMetrics> = LazyLock::new(TransportMetrics::new);
 
-/// Declares [`InboundStreamOutcome`] with its `COUNT`, `ALL` and `label`
-/// generated from the one variant list, so a variant cannot be added without
-/// growing the per-reason counter arrays (indexed by `outcome as usize`).
-macro_rules! inbound_stream_outcomes {
-    ($($(#[$meta:meta])* $variant:ident => $label:literal,)+) => {
-        /// Why an inbound stream was refused or evicted. Each has its own
-        /// counter because each has a different remedy.
+/// Declares a telemetry label enum with `COUNT`, `ALL` and `label` generated
+/// from the one variant list, so a variant cannot be added without growing the
+/// per-variant counter arrays (indexed by `variant as usize`). Each enum's
+/// tests then fail to compile until the new variant has a snapshot field.
+macro_rules! labelled_counters {
+    (
+        $(#[$emeta:meta])*
+        $vis:vis enum $name:ident {
+            $($(#[$meta:meta])* $variant:ident => $label:literal,)+
+        }
+    ) => {
+        $(#[$emeta])*
         #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-        pub(crate) enum InboundStreamOutcome {
+        $vis enum $name {
             $($(#[$meta])* $variant,)+
         }
 
-        impl InboundStreamOutcome {
-            /// Every outcome, in declaration order, so `ALL[i] as usize == i`.
-            pub(crate) const ALL: [Self; Self::COUNT] = [$(Self::$variant),+];
-            pub(crate) const COUNT: usize = [$(Self::$variant),+].len();
+        // Not every enum reads every item outside tests.
+        #[allow(dead_code)]
+        impl $name {
+            /// Every variant, in declaration order, so `ALL[i] as usize == i`.
+            $vis const ALL: [Self; Self::COUNT] = [$(Self::$variant),+];
+            $vis const COUNT: usize = [$(Self::$variant),+].len();
 
             /// Metric label.
-            pub(crate) fn label(self) -> &'static str {
+            $vis fn label(self) -> &'static str {
                 match self {
                     $(Self::$variant => $label,)+
                 }
@@ -62,21 +69,96 @@ macro_rules! inbound_stream_outcomes {
     };
 }
 
-inbound_stream_outcomes! {
-    /// Refused: declared length 0 or above `MAX_STREAM_TOTAL_BYTES`.
-    RefusedInvalidLength => "refused_invalid_length",
-    /// Refused: the connection's byte allowance was full.
-    RefusedConnectionBytes => "refused_connection_bytes",
-    /// Refused: the connection's stream count was full.
-    RefusedConnectionStreams => "refused_connection_streams",
-    /// Connection closed: a refused stream could not be remembered, because
-    /// the connection already had as many refused streams outstanding as are
-    /// remembered.
-    ClosedTooManyRefusals => "closed_too_many_refusals",
-    /// Evicted: no new data within the idle timeout.
-    EvictedIdle => "evicted_idle",
-    /// Evicted: past its age limit.
-    EvictedAge => "evicted_age",
+labelled_counters! {
+    /// Why an inbound stream was refused or evicted. Each has its own
+    /// counter because each has a different remedy.
+    pub(crate) enum InboundStreamOutcome {
+        /// Refused: declared length 0 or above `MAX_STREAM_TOTAL_BYTES`.
+        RefusedInvalidLength => "refused_invalid_length",
+        /// Refused: the connection's byte allowance was full.
+        RefusedConnectionBytes => "refused_connection_bytes",
+        /// Refused: the connection's stream count was full.
+        RefusedConnectionStreams => "refused_connection_streams",
+        /// Connection closed: a refused stream could not be remembered, because
+        /// the connection already had as many refused streams outstanding as are
+        /// remembered.
+        ClosedTooManyRefusals => "closed_too_many_refusals",
+        /// Evicted: no new data within the idle timeout.
+        EvictedIdle => "evicted_idle",
+        /// Evicted: past its age limit.
+        EvictedAge => "evicted_age",
+    }
+}
+
+labelled_counters! {
+    /// Why an outbound NAT traversal was started. Internal only (never on the
+    /// wire). Exported per period as `nat_attempts_<label>` and
+    /// `nat_established_<label>`, and on each `NatFailureSample`. A dial to a
+    /// configured gateway is `Gateway` whichever path started it.
+    pub(crate) enum NatAttemptOrigin {
+        /// A CONNECT joiner dialling an acceptor that already started punching.
+        ConnectJoiner => "connect_joiner",
+        /// A CONNECT acceptor punching towards the joiner it just accepted.
+        ConnectAcceptor => "connect_acceptor",
+        /// A dial to a configured gateway (bootstrap, or any other path).
+        Gateway => "gateway",
+        /// Our own CONNECT request to a cached, non-gateway peer we have no
+        /// connection to (fast reconnect at startup). The remote is not expecting
+        /// us, so this only works if it still holds our session.
+        CachedPeer => "cached_peer",
+        /// Any other message to a non-gateway peer we are no longer connected to.
+        /// The remote is not expecting us either. Also the tag for callers that
+        /// use the transport directly (tests, benchmarks), which have no origin.
+        Redial => "redial",
+    }
+}
+
+labelled_counters! {
+    /// An intro packet a non-gateway dropped because no connection or
+    /// traversal exists for its exact address. Exactly one per dropped intro;
+    /// exported per period as `stray_intro_<label>`.
+    pub(crate) enum StrayIntro {
+        /// The same address had an outbound traversal that FAILED in the last
+        /// `STRAY_INTRO_WINDOW` (10 s): the remote punched after we gave up.
+        /// Checked first, as the more specific match.
+        AfterDeadline => "after_deadline",
+        /// A traversal to the same IP on another port is running: the remote's
+        /// NAT mapped it to a port we are not punching (endpoint-dependent
+        /// mapping), and our NAT let the packet through.
+        SameIpOtherPort => "same_ip_other_port",
+        /// Neither.
+        Other => "other",
+    }
+}
+
+labelled_counters! {
+    /// How long a CONNECT joiner held an acceptor in its dial queue between
+    /// the acceptor's Response arriving and the dial being dispatched. The
+    /// acceptor starts punching when it accepts and gives up after
+    /// `NAT_TRAVERSAL_DEADLINE` (3 s), so a wait past that is a missed window.
+    /// Exported per period as `dial_queue_wait_<label>`.
+    pub(crate) enum DialQueueWait {
+        /// Under 100 ms (dialled at once).
+        Lt100Ms => "lt_100ms",
+        /// 100 ms to under 1 s.
+        Lt1S => "lt_1s",
+        /// 1 s to under 3 s.
+        Lt3S => "lt_3s",
+        /// 3 s or more.
+        Ge3S => "ge_3s",
+    }
+}
+
+impl DialQueueWait {
+    /// The bucket for a wait of `wait`.
+    pub(crate) fn bucket(wait: std::time::Duration) -> Self {
+        match wait.as_millis() {
+            0..100 => Self::Lt100Ms,
+            100..1000 => Self::Lt1S,
+            1000..3000 => Self::Lt3S,
+            _ => Self::Ge3S,
+        }
+    }
 }
 
 /// Accumulates transport metrics for periodic reporting.
@@ -222,6 +304,20 @@ pub struct TransportMetrics {
     /// snapshot). The never-reset twin is `cumulative_inbound_stream_outcomes`,
     /// which is what the OTel instrument observes.
     inbound_stream_outcomes: [AtomicU32; InboundStreamOutcome::COUNT],
+
+    /// Outbound NAT traversals started / established this period, by
+    /// [`NatAttemptOrigin`] (reset each snapshot). Each sums to its untagged
+    /// `nat_traversal_*` twin; the cumulative totals are untagged.
+    nat_attempts_by_origin: [AtomicU32; NatAttemptOrigin::COUNT],
+    nat_established_by_origin: [AtomicU32; NatAttemptOrigin::COUNT],
+
+    /// Intro packets a non-gateway dropped as unknown, by [`StrayIntro`]
+    /// (reset each snapshot).
+    stray_intros: [AtomicU32; StrayIntro::COUNT],
+
+    /// CONNECT joiner acceptor dials by time spent queued, by
+    /// [`DialQueueWait`] (reset each snapshot).
+    dial_queue_wait: [AtomicU32; DialQueueWait::COUNT],
 }
 
 /// Period counters for packet loss, retransmission and standalone-ACK
@@ -269,11 +365,25 @@ struct NatDetailCounters {
     /// handshake (never per packet), so a mutex is fine.
     samples: parking_lot::Mutex<Vec<NatFailureSample>>,
     samples_dropped: AtomicU32,
-    /// Test-only log of `(remote, kind)` so handler-path tests can find
-    /// THEIR attempt among concurrent tests' (bounded).
+    /// Test-only log of `(remote, kind, origin)` so handler-path tests can
+    /// find THEIR attempt among concurrent tests' (bounded).
     #[cfg(test)]
-    failures_by_remote:
-        parking_lot::Mutex<std::collections::VecDeque<(SocketAddr, NatFailureKind)>>,
+    failures_by_remote: parking_lot::Mutex<
+        std::collections::VecDeque<(SocketAddr, NatFailureKind, NatAttemptOrigin)>,
+    >,
+    /// Test-only log of admitted attempts `(remote, origin)` (bounded).
+    #[cfg(test)]
+    attempts_by_remote:
+        parking_lot::Mutex<std::collections::VecDeque<(SocketAddr, NatAttemptOrigin)>>,
+    /// Test-only log of joiner dial queue waits `(acceptor, bucket)`
+    /// (bounded).
+    #[cfg(test)]
+    dial_queue_waits_by_remote:
+        parking_lot::Mutex<std::collections::VecDeque<(SocketAddr, DialQueueWait)>>,
+    /// Test-only log of dropped stray intros `(remote, kind)` (bounded).
+    #[cfg(test)]
+    stray_intros_by_remote:
+        parking_lot::Mutex<std::collections::VecDeque<(SocketAddr, StrayIntro)>>,
     /// Test-only log of observed-address reporters (bounded).
     #[cfg(test)]
     observed_reporters: parking_lot::Mutex<std::collections::VecDeque<SocketAddr>>,
@@ -313,6 +423,17 @@ impl NatFailureKind {
     }
 }
 
+/// Test-only: append to a bounded log, dropping the oldest entry when full,
+/// so a long single-process test run never stops recording.
+#[cfg(test)]
+fn push_test_log<T>(log: &parking_lot::Mutex<std::collections::VecDeque<T>>, entry: T) {
+    let mut log = log.lock();
+    if log.len() >= 4096 {
+        log.pop_front();
+    }
+    log.push_back(entry);
+}
+
 /// Per-period cap on [`NatFailureSample`]s carried by `transport_snapshot`.
 /// Failures beyond it are counted in `nat_fail_samples_dropped`; the
 /// `nat_fail_*` counters still count every failure.
@@ -334,6 +455,8 @@ pub struct NatFailureSample {
     pub decrypted_any: bool,
     /// The attempt ran to its deadline.
     pub deadline_reached: bool,
+    /// [`NatAttemptOrigin`] label, e.g. `connect_joiner`.
+    pub origin: String,
 }
 
 /// Nearest-rank percentile of an ascending slice; `None` when empty. These are
@@ -461,6 +584,10 @@ impl TransportMetrics {
             inbound_queue_depth_hwm: AtomicU32::new(0),
             inbound_queue_drops: AtomicU64::new(0),
             inbound_stream_outcomes: Default::default(),
+            nat_attempts_by_origin: Default::default(),
+            nat_established_by_origin: Default::default(),
+            stray_intros: Default::default(),
+            dial_queue_wait: Default::default(),
         }
     }
 
@@ -504,6 +631,7 @@ impl TransportMetrics {
         received_any: bool,
         decrypted_any: bool,
         deadline_reached: bool,
+        origin: NatAttemptOrigin,
     ) {
         self.record_nat_failure_kind(kind);
         let mut samples = self.nat_detail.samples.lock();
@@ -513,6 +641,7 @@ impl TransportMetrics {
                 received_any,
                 decrypted_any,
                 deadline_reached,
+                origin: origin.label().to_string(),
             });
         } else {
             self.nat_detail
@@ -523,14 +652,13 @@ impl TransportMetrics {
 
     /// Test-only: note which remote a failure of `kind` was for.
     #[cfg(test)]
-    pub(crate) fn note_nat_failure_remote(&self, remote: SocketAddr, kind: NatFailureKind) {
-        let mut log = self.nat_detail.failures_by_remote.lock();
-        // Ring buffer: keep the newest entries, so a long single-process
-        // test run never stops recording.
-        if log.len() >= 4096 {
-            log.pop_front();
-        }
-        log.push_back((remote, kind));
+    pub(crate) fn note_nat_failure_remote(
+        &self,
+        remote: SocketAddr,
+        kind: NatFailureKind,
+        origin: NatAttemptOrigin,
+    ) {
+        push_test_log(&self.nat_detail.failures_by_remote, (remote, kind, origin));
     }
 
     /// Test-only: the failure kinds recorded for `remote`.
@@ -538,6 +666,75 @@ impl TransportMetrics {
     pub(crate) fn nat_failures_for(&self, remote: SocketAddr) -> Vec<NatFailureKind> {
         self.nat_detail
             .failures_by_remote
+            .lock()
+            .iter()
+            .filter(|(addr, _, _)| *addr == remote)
+            .map(|(_, kind, _)| *kind)
+            .collect()
+    }
+
+    /// Test-only: the origins of the failures recorded for `remote`.
+    #[cfg(test)]
+    pub(crate) fn nat_failure_origins_for(&self, remote: SocketAddr) -> Vec<NatAttemptOrigin> {
+        self.nat_detail
+            .failures_by_remote
+            .lock()
+            .iter()
+            .filter(|(addr, _, _)| *addr == remote)
+            .map(|(_, _, origin)| *origin)
+            .collect()
+    }
+
+    /// Test-only: note that an attempt to `remote` was admitted.
+    #[cfg(test)]
+    pub(crate) fn note_nat_attempt_remote(&self, remote: SocketAddr, origin: NatAttemptOrigin) {
+        push_test_log(&self.nat_detail.attempts_by_remote, (remote, origin));
+    }
+
+    /// Test-only: the origins of the attempts admitted to `remote`.
+    #[cfg(test)]
+    pub(crate) fn nat_attempt_origins_for(&self, remote: SocketAddr) -> Vec<NatAttemptOrigin> {
+        self.nat_detail
+            .attempts_by_remote
+            .lock()
+            .iter()
+            .filter(|(addr, _)| *addr == remote)
+            .map(|(_, origin)| *origin)
+            .collect()
+    }
+
+    /// Test-only: note how long the dial to `acceptor` waited.
+    #[cfg(test)]
+    pub(crate) fn note_dial_queue_wait(&self, acceptor: SocketAddr, wait: std::time::Duration) {
+        push_test_log(
+            &self.nat_detail.dial_queue_waits_by_remote,
+            (acceptor, DialQueueWait::bucket(wait)),
+        );
+    }
+
+    /// Test-only: the dial queue wait buckets recorded for `acceptor`.
+    #[cfg(test)]
+    pub(crate) fn dial_queue_waits_for(&self, acceptor: SocketAddr) -> Vec<DialQueueWait> {
+        self.nat_detail
+            .dial_queue_waits_by_remote
+            .lock()
+            .iter()
+            .filter(|(addr, _)| *addr == acceptor)
+            .map(|(_, bucket)| *bucket)
+            .collect()
+    }
+
+    /// Test-only: note a stray intro from `remote`.
+    #[cfg(test)]
+    pub(crate) fn note_stray_intro_remote(&self, remote: SocketAddr, kind: StrayIntro) {
+        push_test_log(&self.nat_detail.stray_intros_by_remote, (remote, kind));
+    }
+
+    /// Test-only: the stray intros recorded from `remote`.
+    #[cfg(test)]
+    pub(crate) fn stray_intros_from(&self, remote: SocketAddr) -> Vec<StrayIntro> {
+        self.nat_detail
+            .stray_intros_by_remote
             .lock()
             .iter()
             .filter(|(addr, _)| *addr == remote)
@@ -758,17 +955,29 @@ impl TransportMetrics {
     }
 
     /// Record the start of an outbound NAT traversal attempt.
-    pub fn record_nat_traversal_attempt(&self) {
+    pub(crate) fn record_nat_traversal_attempt(&self, origin: NatAttemptOrigin) {
         self.cumulative_nat_attempts.fetch_add(1, Ordering::Relaxed);
         self.nat_traversal_attempts.fetch_add(1, Ordering::Relaxed);
+        self.nat_attempts_by_origin[origin as usize].fetch_add(1, Ordering::Relaxed);
     }
 
     /// Record a NAT traversal attempt that established a connection.
-    pub fn record_nat_traversal_established(&self) {
+    pub(crate) fn record_nat_traversal_established(&self, origin: NatAttemptOrigin) {
         self.cumulative_nat_established
             .fetch_add(1, Ordering::Relaxed);
         self.nat_traversal_established
             .fetch_add(1, Ordering::Relaxed);
+        self.nat_established_by_origin[origin as usize].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record an intro packet a non-gateway dropped as unknown.
+    pub(crate) fn record_stray_intro(&self, kind: StrayIntro) {
+        self.stray_intros[kind as usize].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record how long a CONNECT joiner held an acceptor before dialling it.
+    pub(crate) fn record_dial_queue_wait(&self, wait: std::time::Duration) {
+        self.dial_queue_wait[DialQueueWait::bucket(wait) as usize].fetch_add(1, Ordering::Relaxed);
     }
 
     /// Record a NAT traversal attempt that failed for a non-version reason
@@ -1054,6 +1263,10 @@ impl TransportMetrics {
         let ack_sum = get64(&self.transfer_ack_time_sum_ms);
         let ack_max = get64(&self.transfer_ack_time_max_ms);
         let acked = get32(&self.transfers_acked);
+        let attempts = &self.nat_attempts_by_origin;
+        let established = &self.nat_established_by_origin;
+        let stray = &self.stray_intros;
+        let wait = &self.dial_queue_wait;
         SnapshotExtras {
             packets_sent: get64(&l.packets_sent),
             packets_retransmitted: get64(&l.packets_retransmitted),
@@ -1102,6 +1315,29 @@ impl TransportMetrics {
             inbound_stream_evicted_age: get32(
                 &self.inbound_stream_outcomes[InboundStreamOutcome::EvictedAge as usize],
             ),
+            nat_attempts_connect_joiner: get32(&attempts[NatAttemptOrigin::ConnectJoiner as usize]),
+            nat_attempts_connect_acceptor: get32(
+                &attempts[NatAttemptOrigin::ConnectAcceptor as usize],
+            ),
+            nat_attempts_gateway: get32(&attempts[NatAttemptOrigin::Gateway as usize]),
+            nat_attempts_cached_peer: get32(&attempts[NatAttemptOrigin::CachedPeer as usize]),
+            nat_attempts_redial: get32(&attempts[NatAttemptOrigin::Redial as usize]),
+            nat_established_connect_joiner: get32(
+                &established[NatAttemptOrigin::ConnectJoiner as usize],
+            ),
+            nat_established_connect_acceptor: get32(
+                &established[NatAttemptOrigin::ConnectAcceptor as usize],
+            ),
+            nat_established_gateway: get32(&established[NatAttemptOrigin::Gateway as usize]),
+            nat_established_cached_peer: get32(&established[NatAttemptOrigin::CachedPeer as usize]),
+            nat_established_redial: get32(&established[NatAttemptOrigin::Redial as usize]),
+            stray_intro_after_deadline: get32(&stray[StrayIntro::AfterDeadline as usize]),
+            stray_intro_same_ip_other_port: get32(&stray[StrayIntro::SameIpOtherPort as usize]),
+            stray_intro_other: get32(&stray[StrayIntro::Other as usize]),
+            dial_queue_wait_lt_100ms: get32(&wait[DialQueueWait::Lt100Ms as usize]),
+            dial_queue_wait_lt_1s: get32(&wait[DialQueueWait::Lt1S as usize]),
+            dial_queue_wait_lt_3s: get32(&wait[DialQueueWait::Lt3S as usize]),
+            dial_queue_wait_ge_3s: get32(&wait[DialQueueWait::Ge3S as usize]),
         }
     }
 
@@ -1477,6 +1713,33 @@ pub struct TransportSnapshot {
     pub inbound_stream_closed_too_many_refusals: u32,
     pub inbound_stream_evicted_idle: u32,
     pub inbound_stream_evicted_age: u32,
+    /// Outbound NAT traversals started during the period, by
+    /// [`NatAttemptOrigin`] (the field suffix is its label). They sum to
+    /// `nat_traversal_attempts`, up to a snapshot race.
+    pub nat_attempts_connect_joiner: u32,
+    pub nat_attempts_connect_acceptor: u32,
+    pub nat_attempts_gateway: u32,
+    pub nat_attempts_cached_peer: u32,
+    pub nat_attempts_redial: u32,
+    /// Outbound NAT traversals established during the period, by origin.
+    /// They sum to `nat_traversal_established`, up to a snapshot race.
+    pub nat_established_connect_joiner: u32,
+    pub nat_established_connect_acceptor: u32,
+    pub nat_established_gateway: u32,
+    pub nat_established_cached_peer: u32,
+    pub nat_established_redial: u32,
+    /// Intro packets a non-gateway dropped during the period because no
+    /// connection or traversal exists for their exact address, by
+    /// [`StrayIntro`]. Counts only, no addresses.
+    pub stray_intro_after_deadline: u32,
+    pub stray_intro_same_ip_other_port: u32,
+    pub stray_intro_other: u32,
+    /// CONNECT joiner acceptor dials during the period by how long the
+    /// acceptor waited in the joiner's dial queue, by [`DialQueueWait`].
+    pub dial_queue_wait_lt_100ms: u32,
+    pub dial_queue_wait_lt_1s: u32,
+    pub dial_queue_wait_lt_3s: u32,
+    pub dial_queue_wait_ge_3s: u32,
 }
 
 /// Per-connection RTT distribution fields of [`TransportSnapshot`]; see the
@@ -1536,6 +1799,23 @@ impl TransportSnapshot {
             inbound_stream_closed_too_many_refusals,
             inbound_stream_evicted_idle,
             inbound_stream_evicted_age,
+            nat_attempts_connect_joiner,
+            nat_attempts_connect_acceptor,
+            nat_attempts_gateway,
+            nat_attempts_cached_peer,
+            nat_attempts_redial,
+            nat_established_connect_joiner,
+            nat_established_connect_acceptor,
+            nat_established_gateway,
+            nat_established_cached_peer,
+            nat_established_redial,
+            stray_intro_after_deadline,
+            stray_intro_same_ip_other_port,
+            stray_intro_other,
+            dial_queue_wait_lt_100ms,
+            dial_queue_wait_lt_1s,
+            dial_queue_wait_lt_3s,
+            dial_queue_wait_ge_3s,
         } = extras;
         self.conn_rtt_connections = conn_rtt_connections;
         self.conn_srtt_p50_us = conn_srtt_p50_us;
@@ -1573,6 +1853,23 @@ impl TransportSnapshot {
         self.inbound_stream_closed_too_many_refusals = inbound_stream_closed_too_many_refusals;
         self.inbound_stream_evicted_idle = inbound_stream_evicted_idle;
         self.inbound_stream_evicted_age = inbound_stream_evicted_age;
+        self.nat_attempts_connect_joiner = nat_attempts_connect_joiner;
+        self.nat_attempts_connect_acceptor = nat_attempts_connect_acceptor;
+        self.nat_attempts_gateway = nat_attempts_gateway;
+        self.nat_attempts_cached_peer = nat_attempts_cached_peer;
+        self.nat_attempts_redial = nat_attempts_redial;
+        self.nat_established_connect_joiner = nat_established_connect_joiner;
+        self.nat_established_connect_acceptor = nat_established_connect_acceptor;
+        self.nat_established_gateway = nat_established_gateway;
+        self.nat_established_cached_peer = nat_established_cached_peer;
+        self.nat_established_redial = nat_established_redial;
+        self.stray_intro_after_deadline = stray_intro_after_deadline;
+        self.stray_intro_same_ip_other_port = stray_intro_same_ip_other_port;
+        self.stray_intro_other = stray_intro_other;
+        self.dial_queue_wait_lt_100ms = dial_queue_wait_lt_100ms;
+        self.dial_queue_wait_lt_1s = dial_queue_wait_lt_1s;
+        self.dial_queue_wait_lt_3s = dial_queue_wait_lt_3s;
+        self.dial_queue_wait_ge_3s = dial_queue_wait_ge_3s;
         self
     }
 }
@@ -1659,6 +1956,33 @@ struct SnapshotExtras {
     pub inbound_stream_closed_too_many_refusals: u32,
     pub inbound_stream_evicted_idle: u32,
     pub inbound_stream_evicted_age: u32,
+    /// Outbound NAT traversals started during the period, by
+    /// [`NatAttemptOrigin`] (the field suffix is its label). They sum to
+    /// `nat_traversal_attempts`, up to a snapshot race.
+    pub nat_attempts_connect_joiner: u32,
+    pub nat_attempts_connect_acceptor: u32,
+    pub nat_attempts_gateway: u32,
+    pub nat_attempts_cached_peer: u32,
+    pub nat_attempts_redial: u32,
+    /// Outbound NAT traversals established during the period, by origin.
+    /// They sum to `nat_traversal_established`, up to a snapshot race.
+    pub nat_established_connect_joiner: u32,
+    pub nat_established_connect_acceptor: u32,
+    pub nat_established_gateway: u32,
+    pub nat_established_cached_peer: u32,
+    pub nat_established_redial: u32,
+    /// Intro packets a non-gateway dropped during the period because no
+    /// connection or traversal exists for their exact address, by
+    /// [`StrayIntro`]. Counts only, no addresses.
+    pub stray_intro_after_deadline: u32,
+    pub stray_intro_same_ip_other_port: u32,
+    pub stray_intro_other: u32,
+    /// CONNECT joiner acceptor dials during the period by how long the
+    /// acceptor waited in the joiner's dial queue, by [`DialQueueWait`].
+    pub dial_queue_wait_lt_100ms: u32,
+    pub dial_queue_wait_lt_1s: u32,
+    pub dial_queue_wait_lt_3s: u32,
+    pub dial_queue_wait_ge_3s: u32,
 }
 
 impl SnapshotExtras {
@@ -1687,6 +2011,23 @@ impl SnapshotExtras {
             || self.inbound_stream_closed_too_many_refusals != 0
             || self.inbound_stream_evicted_idle != 0
             || self.inbound_stream_evicted_age != 0
+            || self.nat_attempts_connect_joiner != 0
+            || self.nat_attempts_connect_acceptor != 0
+            || self.nat_attempts_gateway != 0
+            || self.nat_attempts_cached_peer != 0
+            || self.nat_attempts_redial != 0
+            || self.nat_established_connect_joiner != 0
+            || self.nat_established_connect_acceptor != 0
+            || self.nat_established_gateway != 0
+            || self.nat_established_cached_peer != 0
+            || self.nat_established_redial != 0
+            || self.stray_intro_after_deadline != 0
+            || self.stray_intro_same_ip_other_port != 0
+            || self.stray_intro_other != 0
+            || self.dial_queue_wait_lt_100ms != 0
+            || self.dial_queue_wait_lt_1s != 0
+            || self.dial_queue_wait_lt_3s != 0
+            || self.dial_queue_wait_ge_3s != 0
     }
 }
 
@@ -1898,8 +2239,8 @@ mod tests {
     fn test_snapshot_emitted_for_nat_only_activity() {
         let metrics = TransportMetrics::new();
 
-        metrics.record_nat_traversal_attempt();
-        metrics.record_nat_traversal_established();
+        metrics.record_nat_traversal_attempt(NatAttemptOrigin::Gateway);
+        metrics.record_nat_traversal_established(NatAttemptOrigin::Gateway);
         metrics.record_nat_traversal_failed_error();
         metrics.record_nat_traversal_failed_version();
 
@@ -1962,8 +2303,8 @@ mod tests {
     #[test]
     fn read_snapshot_reflects_nat_counters() {
         let metrics = TransportMetrics::new();
-        metrics.record_nat_traversal_attempt();
-        metrics.record_nat_traversal_attempt();
+        metrics.record_nat_traversal_attempt(NatAttemptOrigin::Gateway);
+        metrics.record_nat_traversal_attempt(NatAttemptOrigin::Gateway);
         metrics.record_nat_traversal_failed_version();
 
         let snap = metrics.read_snapshot();
@@ -2091,8 +2432,8 @@ mod tests {
     fn cumulative_outcome_counters_survive_a_snapshot_reset() {
         let metrics = TransportMetrics::new();
         metrics.record_transfer_failed();
-        metrics.record_nat_traversal_attempt();
-        metrics.record_nat_traversal_established();
+        metrics.record_nat_traversal_attempt(NatAttemptOrigin::Gateway);
+        metrics.record_nat_traversal_established(NatAttemptOrigin::Gateway);
         metrics.record_nat_traversal_failed_error();
         metrics.record_nat_traversal_failed_version();
 
@@ -2111,7 +2452,7 @@ mod tests {
 
         // ...and they keep climbing across the reset boundary.
         metrics.record_transfer_failed();
-        metrics.record_nat_traversal_attempt();
+        metrics.record_nat_traversal_attempt(NatAttemptOrigin::Gateway);
         assert_eq!(metrics.cumulative_transfers(), (0, 2));
         assert_eq!(metrics.cumulative_nat_traversal(), (2, 1, 1, 1));
     }
@@ -2517,6 +2858,233 @@ mod tests {
         }
     }
 
+    /// Every labelled enum's `ALL` lists its variants in declaration order
+    /// (the counter arrays are indexed by `variant as usize`), and its labels
+    /// are distinct (each is a snapshot field suffix).
+    #[test]
+    fn labelled_counter_enums_are_in_declaration_order_with_distinct_labels() {
+        fn check<T: Copy + std::fmt::Debug>(
+            all: &[T],
+            index: fn(T) -> usize,
+            label: fn(T) -> &'static str,
+        ) {
+            for (i, v) in all.iter().enumerate() {
+                assert_eq!(index(*v), i, "{v:?}");
+            }
+            let mut labels: Vec<_> = all.iter().map(|v| label(*v)).collect();
+            labels.sort_unstable();
+            labels.dedup();
+            assert_eq!(labels.len(), all.len());
+        }
+        check(
+            &NatAttemptOrigin::ALL,
+            |v| v as usize,
+            NatAttemptOrigin::label,
+        );
+        check(&StrayIntro::ALL, |v| v as usize, StrayIntro::label);
+        check(&DialQueueWait::ALL, |v| v as usize, DialQueueWait::label);
+    }
+
+    /// The snapshot fields carrying an origin's period attempts and
+    /// establishments. Exhaustive on purpose: a new `NatAttemptOrigin` fails
+    /// to compile here until it is given `TransportSnapshot` fields.
+    fn origin_counts(snap: &TransportSnapshot, origin: NatAttemptOrigin) -> (u32, u32) {
+        match origin {
+            NatAttemptOrigin::ConnectJoiner => (
+                snap.nat_attempts_connect_joiner,
+                snap.nat_established_connect_joiner,
+            ),
+            NatAttemptOrigin::ConnectAcceptor => (
+                snap.nat_attempts_connect_acceptor,
+                snap.nat_established_connect_acceptor,
+            ),
+            NatAttemptOrigin::Gateway => (snap.nat_attempts_gateway, snap.nat_established_gateway),
+            NatAttemptOrigin::CachedPeer => (
+                snap.nat_attempts_cached_peer,
+                snap.nat_established_cached_peer,
+            ),
+            NatAttemptOrigin::Redial => (snap.nat_attempts_redial, snap.nat_established_redial),
+        }
+    }
+
+    /// The snapshot field carrying a stray-intro kind (exhaustive, as above).
+    fn stray_count(snap: &TransportSnapshot, kind: StrayIntro) -> u32 {
+        match kind {
+            StrayIntro::AfterDeadline => snap.stray_intro_after_deadline,
+            StrayIntro::SameIpOtherPort => snap.stray_intro_same_ip_other_port,
+            StrayIntro::Other => snap.stray_intro_other,
+        }
+    }
+
+    /// The snapshot field carrying a dial-queue-wait bucket (exhaustive).
+    fn wait_count(snap: &TransportSnapshot, bucket: DialQueueWait) -> u32 {
+        match bucket {
+            DialQueueWait::Lt100Ms => snap.dial_queue_wait_lt_100ms,
+            DialQueueWait::Lt1S => snap.dial_queue_wait_lt_1s,
+            DialQueueWait::Lt3S => snap.dial_queue_wait_lt_3s,
+            DialQueueWait::Ge3S => snap.dial_queue_wait_ge_3s,
+        }
+    }
+
+    /// Attempts and establishments reach the snapshot per origin, summing to
+    /// the untagged counters; `take_snapshot` resets them, but never the
+    /// cumulative totals the OTel instrument reads.
+    #[test]
+    fn nat_origin_counts_snapshot_and_reset() {
+        let metrics = TransportMetrics::new();
+        // Origin `i` is attempted `i + 1` times and established once fewer,
+        // so every field has a distinct count and a swapped one is caught.
+        for (i, origin) in NatAttemptOrigin::ALL.into_iter().enumerate() {
+            for _ in 0..=i {
+                metrics.record_nat_traversal_attempt(origin);
+            }
+            for _ in 0..i {
+                metrics.record_nat_traversal_established(origin);
+            }
+        }
+        let n = NatAttemptOrigin::COUNT as u32;
+        let attempts = n * (n + 1) / 2;
+        let established = n * (n - 1) / 2;
+        let read = metrics.read_snapshot();
+        let snap = metrics.take_snapshot().expect("attempts are activity");
+        for s in [&read, &snap] {
+            for (i, origin) in NatAttemptOrigin::ALL.into_iter().enumerate() {
+                assert_eq!(
+                    origin_counts(s, origin),
+                    (i as u32 + 1, i as u32),
+                    "{origin:?}"
+                );
+            }
+            assert_eq!(s.nat_traversal_attempts, attempts);
+            assert_eq!(s.nat_traversal_established, established);
+        }
+
+        metrics.record_packet_sent("10.0.0.1:1".parse().unwrap(), 1);
+        let snap = metrics.take_snapshot().expect("activity");
+        for origin in NatAttemptOrigin::ALL {
+            assert_eq!(
+                origin_counts(&snap, origin),
+                (0, 0),
+                "{origin:?} must reset"
+            );
+        }
+        let (cum_attempts, cum_established, _, _) = metrics.cumulative_nat_traversal();
+        assert_eq!(
+            (cum_attempts, cum_established),
+            (u64::from(attempts), u64::from(established)),
+            "cumulative totals must not reset"
+        );
+    }
+
+    /// Stray intros reach the snapshot per kind and reset with it.
+    #[test]
+    fn stray_intro_counts_snapshot_and_reset() {
+        let metrics = TransportMetrics::new();
+        for (i, kind) in StrayIntro::ALL.into_iter().enumerate() {
+            for _ in 0..=i {
+                metrics.record_stray_intro(kind);
+            }
+        }
+        let read = metrics.read_snapshot();
+        let snap = metrics.take_snapshot().expect("stray intros are activity");
+        for s in [&read, &snap] {
+            for (i, kind) in StrayIntro::ALL.into_iter().enumerate() {
+                assert_eq!(stray_count(s, kind), i as u32 + 1, "{kind:?}");
+            }
+        }
+        assert!(metrics.take_snapshot().is_none(), "stray intros must reset");
+    }
+
+    /// Bucket boundaries: each bound belongs to the bucket above it.
+    #[test]
+    fn dial_queue_wait_bucket_boundaries() {
+        let ms = Duration::from_millis;
+        for (wait, bucket) in [
+            (ms(0), DialQueueWait::Lt100Ms),
+            (ms(99), DialQueueWait::Lt100Ms),
+            (ms(100), DialQueueWait::Lt1S),
+            (ms(999), DialQueueWait::Lt1S),
+            (ms(1000), DialQueueWait::Lt3S),
+            (ms(2999), DialQueueWait::Lt3S),
+            (ms(3000), DialQueueWait::Ge3S),
+            (Duration::MAX, DialQueueWait::Ge3S),
+        ] {
+            assert_eq!(DialQueueWait::bucket(wait), bucket, "{wait:?}");
+        }
+    }
+
+    /// Dial queue waits reach the snapshot per bucket and reset with it.
+    #[test]
+    fn dial_queue_wait_counts_snapshot_and_reset() {
+        let metrics = TransportMetrics::new();
+        let waits = [0, 150, 150, 1500, 1500, 1500, 4000, 4000, 4000, 4000];
+        for wait in waits {
+            metrics.record_dial_queue_wait(Duration::from_millis(wait));
+        }
+        let snap = metrics.take_snapshot().expect("waits are activity");
+        for (i, bucket) in DialQueueWait::ALL.into_iter().enumerate() {
+            assert_eq!(wait_count(&snap, bucket), i as u32 + 1, "{bucket:?}");
+        }
+        assert!(metrics.take_snapshot().is_none(), "waits must reset");
+    }
+
+    /// Each new counter alone, on a fresh collector, is activity: one
+    /// missing from `has_activity` would be dropped whenever it is the only
+    /// thing that happened in a period.
+    #[test]
+    fn each_new_counter_alone_is_activity() {
+        for origin in NatAttemptOrigin::ALL {
+            let metrics = TransportMetrics::new();
+            metrics.nat_established_by_origin[origin as usize].fetch_add(1, Ordering::Relaxed);
+            let snap = metrics
+                .take_snapshot()
+                .unwrap_or_else(|| panic!("established {origin:?} alone must be activity"));
+            assert_eq!(origin_counts(&snap, origin), (0, 1), "{origin:?}");
+            let metrics = TransportMetrics::new();
+            metrics.nat_attempts_by_origin[origin as usize].fetch_add(1, Ordering::Relaxed);
+            let snap = metrics
+                .take_snapshot()
+                .unwrap_or_else(|| panic!("attempt {origin:?} alone must be activity"));
+            assert_eq!(origin_counts(&snap, origin), (1, 0), "{origin:?}");
+        }
+        for kind in StrayIntro::ALL {
+            let metrics = TransportMetrics::new();
+            metrics.record_stray_intro(kind);
+            let snap = metrics
+                .take_snapshot()
+                .unwrap_or_else(|| panic!("{kind:?} alone must be activity"));
+            assert_eq!(stray_count(&snap, kind), 1, "{kind:?}");
+        }
+        for bucket in DialQueueWait::ALL {
+            let metrics = TransportMetrics::new();
+            metrics.dial_queue_wait[bucket as usize].fetch_add(1, Ordering::Relaxed);
+            let snap = metrics
+                .take_snapshot()
+                .unwrap_or_else(|| panic!("{bucket:?} alone must be activity"));
+            assert_eq!(wait_count(&snap, bucket), 1, "{bucket:?}");
+        }
+    }
+
+    /// Every new field is uploaded under `<prefix>_<label>`.
+    #[test]
+    fn new_counter_json_keys_match_labels() {
+        let json = serde_json::to_value(TransportSnapshot::default()).unwrap();
+        let mut keys = Vec::new();
+        for origin in NatAttemptOrigin::ALL {
+            keys.push(format!("nat_attempts_{}", origin.label()));
+            keys.push(format!("nat_established_{}", origin.label()));
+        }
+        for kind in StrayIntro::ALL {
+            keys.push(format!("stray_intro_{}", kind.label()));
+        }
+        for bucket in DialQueueWait::ALL {
+            keys.push(format!("dial_queue_wait_{}", bucket.label()));
+        }
+        for key in keys {
+            assert!(json.get(&key).is_some(), "missing snapshot key {key}");
+        }
+    }
+
     /// Each NAT failure kind lands in its own counter.
     #[test]
     fn nat_failure_kinds_are_partitioned() {
@@ -2552,7 +3120,13 @@ mod tests {
     fn nat_failure_samples_are_bounded_and_reset() {
         let metrics = TransportMetrics::new();
         for _ in 0..(MAX_NAT_FAILURE_SAMPLES + 3) {
-            metrics.record_nat_failure(NatFailureKind::Undecryptable, true, false, true);
+            metrics.record_nat_failure(
+                NatFailureKind::Undecryptable,
+                true,
+                false,
+                true,
+                NatAttemptOrigin::ConnectJoiner,
+            );
         }
         let snap = metrics.take_snapshot().expect("failures are activity");
         assert_eq!(
@@ -2568,10 +3142,12 @@ mod tests {
                 received_any: true,
                 decrypted_any: false,
                 deadline_reached: true,
+                origin: "connect_joiner".into(),
             }
         );
         let json = serde_json::to_value(&snap).unwrap();
         assert_eq!(json["nat_fail_samples"][0]["sub_reason"], "undecryptable");
+        assert_eq!(json["nat_fail_samples"][0]["origin"], "connect_joiner");
         assert!(metrics.take_snapshot().is_none(), "samples must reset");
     }
 
@@ -2688,6 +3264,23 @@ mod tests {
             "inbound_stream_closed_too_many_refusals",
             "inbound_stream_evicted_idle",
             "inbound_stream_evicted_age",
+            "nat_attempts_connect_joiner",
+            "nat_attempts_connect_acceptor",
+            "nat_attempts_gateway",
+            "nat_attempts_cached_peer",
+            "nat_attempts_redial",
+            "nat_established_connect_joiner",
+            "nat_established_connect_acceptor",
+            "nat_established_gateway",
+            "nat_established_cached_peer",
+            "nat_established_redial",
+            "stray_intro_after_deadline",
+            "stray_intro_same_ip_other_port",
+            "stray_intro_other",
+            "dial_queue_wait_lt_100ms",
+            "dial_queue_wait_lt_1s",
+            "dial_queue_wait_lt_3s",
+            "dial_queue_wait_ge_3s",
         ] {
             assert!(obj.contains_key(key), "missing key {key}");
         }

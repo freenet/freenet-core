@@ -161,7 +161,7 @@ pub(crate) type PendingConnection = std::pin::Pin<
 /// `Arc<dyn OutboundConnector>`.
 pub(crate) trait OutboundConnector: Send + Sync {
     /// Ask the transport to connect to `remote_addr`, whose transport key is
-    /// `remote_public_key`.
+    /// `remote_public_key`. `origin` says why, for telemetry only.
     ///
     /// Contract: the first stage registers `remote_addr`'s IP as an expected
     /// handshake source, so the transport accepts the peer's reply; this
@@ -179,6 +179,7 @@ pub(crate) trait OutboundConnector: Send + Sync {
         &self,
         remote_public_key: TransportPublicKey,
         remote_addr: SocketAddr,
+        origin: super::NatAttemptOrigin,
     ) -> std::pin::Pin<Box<dyn Future<Output = PendingConnection> + Send + '_>>;
 }
 
