@@ -54,13 +54,13 @@ pub(crate) trait NetworkBridge: Send + Sync {
 
     /// Send raw stream data to a peer using operations-level streaming.
     ///
-    /// The `stream_id` should be created via `StreamId::next_operations()` so the
+    /// The `stream_id` should be created via `StreamId::next()` so the
     /// receiver skips legacy InboundStream decoding. The data is fragmented and
     /// sent via the transport's streaming mechanism.
     fn send_stream(
         &self,
         target_addr: SocketAddr,
-        stream_id: crate::transport::peer_connection::StreamId,
+        stream_id: crate::transport::StreamId,
         data: bytes::Bytes,
         metadata: Option<bytes::Bytes>,
     ) -> impl Future<Output = ConnResult<()>> + Send;
@@ -74,7 +74,7 @@ pub(crate) trait NetworkBridge: Send + Sync {
     fn send_stream_with_progress(
         &self,
         target_addr: SocketAddr,
-        stream_id: crate::transport::peer_connection::StreamId,
+        stream_id: crate::transport::StreamId,
         data: bytes::Bytes,
         metadata: Option<bytes::Bytes>,
         _progress: Option<crate::operations::stream_progress::StreamProgressHandle>,
@@ -88,11 +88,11 @@ pub(crate) trait NetworkBridge: Send + Sync {
     /// fragments from an existing `StreamHandle` incrementally without waiting for
     /// full reassembly. This enables low-latency forwarding at intermediate nodes.
     ///
-    /// The `outbound_stream_id` should be created via `StreamId::next_operations()`.
+    /// The `outbound_stream_id` should be created via `StreamId::next()`.
     fn pipe_stream(
         &self,
         target_addr: SocketAddr,
-        outbound_stream_id: crate::transport::peer_connection::StreamId,
+        outbound_stream_id: crate::transport::StreamId,
         inbound_handle: crate::transport::peer_connection::streaming::StreamHandle,
         metadata: Option<bytes::Bytes>,
     ) -> impl Future<Output = ConnResult<()>> + Send;

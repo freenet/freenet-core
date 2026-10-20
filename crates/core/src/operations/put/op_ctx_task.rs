@@ -43,7 +43,7 @@ use crate::operations::orphan_streams::{OrphanStreamError, STREAM_CLAIM_TIMEOUT}
 use crate::ring::{Location, PeerKeyLocation};
 use crate::router::{RouteEvent, RouteOutcome};
 use crate::tracing::{NetEventLog, OperationFailure, state_hash_full};
-use crate::transport::peer_connection::StreamId;
+use crate::transport::StreamId;
 
 use super::{PutFinalizationData, PutMsg, PutStreamingPayload, PutTerminalError, bound_cause};
 
@@ -2357,7 +2357,7 @@ where
             .attempt_hop_registry()
             .record_hop(&incoming_tx, &next_peer);
         if upgrade_to_streaming {
-            let stream_id = StreamId::next_operations();
+            let stream_id = StreamId::next();
             let metadata_msg = NetMessage::from(PutMsg::RequestStreaming {
                 id: incoming_tx,
                 stream_id,
@@ -2472,7 +2472,7 @@ where
     }
 
     let round_trip = if upgrade_to_streaming {
-        let stream_id = StreamId::next_operations();
+        let stream_id = StreamId::next();
         tracing::info!(
             tx = %incoming_tx,
             contract = %key,
@@ -3805,7 +3805,7 @@ where
             op_manager.streaming_threshold,
             total_size as usize,
         ) {
-            let outbound_sid = StreamId::next_operations();
+            let outbound_sid = StreamId::next();
             let forked_handle = stream_handle.fork();
             let new_htl = htl.saturating_sub(1);
 
@@ -9191,7 +9191,7 @@ mod streaming_relay_failure_tests {
             op_manager_with_peers_and_store(label, 3).await;
         let upstream = peers[0].socket_addr().expect("peer address");
         let sent = record_sends(rx, None);
-        let stream_id = StreamId::next_operations();
+        let stream_id = StreamId::next();
         let announced = contract(label.as_bytes());
         let registry = op_manager.orphan_stream_registry();
         let register = |bytes: Vec<u8>| {
@@ -9312,7 +9312,7 @@ mod streaming_relay_failure_tests {
             op_manager_with_peers_and_store(label, 3).await;
         let upstream = peers[0].socket_addr().expect("peer address");
         let sent = record_sends(rx, None);
-        let stream_id = StreamId::next_operations();
+        let stream_id = StreamId::next();
         let announced = contract(label.as_bytes());
         let bytes = payload(&announced, 64);
         let registry = op_manager.orphan_stream_registry();
@@ -9355,7 +9355,7 @@ mod streaming_relay_failure_tests {
                 })
             }),
         );
-        let stream_id = StreamId::next_operations();
+        let stream_id = StreamId::next();
         let announced = contract(label.as_bytes());
         let bytes = payload(&announced, op_manager.streaming_threshold + 4096);
         op_manager.orphan_stream_registry().register_orphan(
@@ -9407,7 +9407,7 @@ mod streaming_relay_failure_tests {
         // No event loop: every message the relay tries to send fails.
         drop(rx);
         let upstream = peers[0].socket_addr().expect("peer address");
-        let stream_id = StreamId::next_operations();
+        let stream_id = StreamId::next();
         let announced = contract(label.as_bytes());
         let bytes = payload(&announced, 64);
         op_manager.orphan_stream_registry().register_orphan(

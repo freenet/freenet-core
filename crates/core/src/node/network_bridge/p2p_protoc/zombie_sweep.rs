@@ -884,7 +884,7 @@ mod tests {
     use crate::operations::get::GetMsgResult;
     use crate::operations::subscribe::SubscribeMsgResult;
     use crate::operations::test_utils::{make_contract_key, make_test_contract};
-    use crate::transport::peer_connection::StreamId;
+    use crate::transport::StreamId;
     use freenet_stdlib::prelude::{RelatedContracts, StateDelta, StateSummary, WrappedState};
 
     const TTL: Duration = Duration::from_secs(30);

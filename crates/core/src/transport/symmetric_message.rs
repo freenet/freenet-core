@@ -84,7 +84,7 @@ impl SymmetricMessage {
                 packet_id: u32::MAX,
                 confirm_receipt: vec![],
                 payload: SymmetricMessagePayload::StreamFragment {
-                    stream_id: StreamId::next(),
+                    stream_id: StreamId::next_transport_internal(),
                     total_length_bytes: u64::MAX,
                     fragment_number: u32::MAX,
                     payload: Bytes::new(),
@@ -460,7 +460,7 @@ mod test {
                 }),
             },
             SymmetricMessagePayload::StreamFragment {
-                stream_id: StreamId::next(),
+                stream_id: StreamId::next_transport_internal(),
                 total_length_bytes: 100,
                 fragment_number: 1,
                 payload: Bytes::from({
@@ -471,7 +471,7 @@ mod test {
                 metadata_bytes: None,
             },
             SymmetricMessagePayload::StreamFragment {
-                stream_id: StreamId::next(),
+                stream_id: StreamId::next_transport_internal(),
                 total_length_bytes: 200,
                 fragment_number: 1,
                 payload: Bytes::from({
@@ -633,7 +633,7 @@ mod test {
             (
                 2,
                 SymmetricMessagePayload::StreamFragment {
-                    stream_id: StreamId::next(),
+                    stream_id: StreamId::next_transport_internal(),
                     total_length_bytes: 1,
                     fragment_number: 0,
                     payload: Bytes::new(),
@@ -748,7 +748,7 @@ mod test {
             packet_id: u32::MAX,
             confirm_receipt: vec![],
             payload: SymmetricMessagePayload::StreamFragment {
-                stream_id: StreamId::next(),
+                stream_id: StreamId::next_transport_internal(),
                 total_length_bytes: u64::MAX,
                 fragment_number: u32::MAX,
                 payload: Bytes::from(vec![0u8; MAX_DATA_SIZE - overhead]),

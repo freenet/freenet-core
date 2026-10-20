@@ -61,7 +61,7 @@ use crate::ring::{Location, PeerKeyLocation};
 use crate::router::dataset::RouteSource;
 use crate::router::{RouteEvent, RouteOutcome};
 use crate::tracing::{GetTerminalOutcome, StreamAbortCause};
-use crate::transport::peer_connection::StreamId;
+use crate::transport::StreamId;
 use crate::transport::peer_connection::streaming::StreamError;
 
 use super::{GetMsg, GetMsgResult, GetStreamingPayload};
@@ -3841,7 +3841,7 @@ where
 
     if crate::operations::should_use_streaming(op_manager.streaming_threshold, payload_bytes.len())
     {
-        let sid = StreamId::next_operations();
+        let sid = StreamId::next();
         tracing::info!(
             tx = %tx,
             contract = %key,
@@ -4905,7 +4905,7 @@ where
                 // ── Step 3: Forward path (remote upstream). Fork, send
                 //    metadata header, pipe — BEFORE any local assemble/cache.
                 //    Re-key with a FRESH outbound stream_id per hop.
-                let outbound_sid = StreamId::next_operations();
+                let outbound_sid = StreamId::next();
                 let forked = handle.fork();
                 let header = GetMsg::ResponseStreaming {
                     id: incoming_tx,
@@ -5426,7 +5426,7 @@ mod tests {
         let msg = NetMessage::V1(NetMessageV1::Get(GetMsg::ResponseStreaming {
             id: tx,
             instance_id: *key.id(),
-            stream_id: crate::transport::peer_connection::StreamId::next(),
+            stream_id: crate::transport::StreamId::next(),
             key,
             total_size: 1024,
             includes_contract: true,
@@ -5456,7 +5456,7 @@ mod tests {
         let tx = dummy_tx();
         let msg = NetMessage::V1(NetMessageV1::Get(GetMsg::ResponseStreamingAck {
             id: tx,
-            stream_id: crate::transport::peer_connection::StreamId::next(),
+            stream_id: crate::transport::StreamId::next(),
         }));
         assert!(matches!(classify(msg), AttemptOutcome::Unexpected));
     }
@@ -7890,7 +7890,7 @@ mod tests {
     }
 
     /// The relay `Terminal::Streaming` arm must re-key the outbound stream
-    /// with a FRESH `StreamId::next_operations()` and `fork()` the inbound
+    /// with a FRESH `StreamId::next()` and `fork()` the inbound
     /// handle so it can both pipe and cache. Never reuse the inbound id.
     #[test]
     fn relay_streaming_arm_uses_fresh_outbound_stream_id() {
@@ -7906,9 +7906,9 @@ mod tests {
             .unwrap_or(tail.len());
         let arm = &tail[..clip];
         assert!(
-            arm.contains("let outbound_sid = StreamId::next_operations()"),
+            arm.contains("let outbound_sid = StreamId::next()"),
             "Streaming arm must mint a fresh outbound stream id via \
-             `let outbound_sid = StreamId::next_operations()` per hop (#4307)."
+             `let outbound_sid = StreamId::next()` per hop (#4307)."
         );
         assert!(
             arm.contains(".fork()"),
@@ -9357,7 +9357,7 @@ mod route_attempt_driver_tests {
             let (op_manager, rx, peers, _guards) =
                 op_manager_with_peers(&format!("get-stream-claim-{mode:?}"), 3).await;
             let instance_id = ContractInstanceId::new([50u8; 32]);
-            let stream_id = StreamId::next_operations();
+            let stream_id = StreamId::next();
             let payload = bincode::serialize(&GetStreamingPayload {
                 key: key_for(instance_id),
                 value: StoreResponse {
@@ -9440,7 +9440,7 @@ mod route_attempt_driver_tests {
             .cloned()
             .collect();
         let header_hop = initial.clone();
-        let stream_id = StreamId::next_operations();
+        let stream_id = StreamId::next();
         serve_attempts(
             op_manager.clone(),
             rx,
@@ -9804,7 +9804,7 @@ mod route_attempt_driver_tests {
             op_manager_with_peers_and_store("get-evict", 5).await;
         let own = op_manager.ring.connection_manager.get_own_addr().unwrap();
         let view = op_manager.clone();
-        let stream_id = StreamId::next_operations();
+        let stream_id = StreamId::next();
         let all_peers = peers.clone();
         serve_attempts(
             op_manager.clone(),
@@ -10310,7 +10310,7 @@ mod route_attempt_driver_tests {
             let instance_id = ContractInstanceId::new([seed; 32]);
             assembly_fault_injection::inject_stream_failures(key_for(instance_id), 1, failure);
             let header_hop = peers[0].clone();
-            let stream_id = StreamId::next_operations();
+            let stream_id = StreamId::next();
             serve_attempts(
                 op_manager.clone(),
                 rx,
@@ -10356,7 +10356,7 @@ mod route_attempt_driver_tests {
         let (op_manager, rx, peers, _guards) =
             op_manager_with_peers("get-stream-really-cancelled", 3).await;
         let instance_id = ContractInstanceId::new([75u8; 32]);
-        let stream_id = StreamId::next_operations();
+        let stream_id = StreamId::next();
         let handle =
             crate::transport::peer_connection::streaming::StreamHandle::new(stream_id, 4096);
         handle.cancel();
@@ -10403,7 +10403,7 @@ mod route_attempt_driver_tests {
                 reject_stores(label);
             }
             let instance_id = ContractInstanceId::new([seed; 32]);
-            let stream_id = StreamId::next_operations();
+            let stream_id = StreamId::next();
             // The stream is claimed from the driver's `current_target` after
             // its advance; offer it from every peer so the pick does not matter.
             for peer in &peers {
@@ -10472,7 +10472,7 @@ mod route_attempt_driver_tests {
             }
             let instance_id = ContractInstanceId::new([53u8; 32]);
             let (greedy_addr, host_addr) = (addr(&greedy), addr(&host));
-            let stream_id = StreamId::next_operations();
+            let stream_id = StreamId::next();
             register_stream(&op_manager, host_addr, stream_id, instance_id);
             serve_attempts(
                 op_manager.clone(),
@@ -10701,7 +10701,7 @@ mod route_attempt_driver_tests {
                 relay_fixture(label, true).await;
             let instance_id = ContractInstanceId::new([53u8; 32]);
             let (greedy_addr, host_addr) = (addr(&greedy), addr(&host));
-            let stream_id = StreamId::next_operations();
+            let stream_id = StreamId::next();
             serve_attempts(
                 op_manager.clone(),
                 rx,
@@ -12641,7 +12641,7 @@ mod route_attempt_driver_tests {
         let (op_manager, rx, peers, _guards) =
             op_manager_with_peers("get-stream-claim-fallback", 3).await;
         let instance_id = ContractInstanceId::new([77u8; 32]);
-        let stream_id = StreamId::next_operations();
+        let stream_id = StreamId::next();
         let payload = bincode::serialize(&GetStreamingPayload {
             key: key_for(instance_id),
             value: StoreResponse {

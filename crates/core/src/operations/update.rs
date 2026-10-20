@@ -1605,7 +1605,7 @@ mod messages {
     use crate::{
         message::{InnerMessage, Transaction},
         ring::Location,
-        transport::peer_connection::StreamId,
+        transport::StreamId,
     };
 
     /// Payload for streaming UPDATE requests.
@@ -1846,7 +1846,7 @@ mod tests {
 
         use crate::message::DeltaOrFullState;
         use crate::ring::broadcast_coverage::CoveredPeers;
-        use crate::transport::peer_connection::StreamId;
+        use crate::transport::StreamId;
 
         fn variant_index(msg: &UpdateMsg) -> u32 {
             let bytes = bincode::serialize(msg).expect("serialize UpdateMsg");

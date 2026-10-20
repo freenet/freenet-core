@@ -518,14 +518,20 @@ mod tests {
         );
         let mut budget = InboundStreamBudget::new(4, u64::MAX);
         let (_token, liveness) = task();
-        budget.charge(StreamId::next(), 10 * f, 0, AGE, liveness);
+        budget.charge(
+            StreamId::next_transport_internal(),
+            10 * f,
+            0,
+            AGE,
+            liveness,
+        );
         assert_eq!(budget.charged_bytes(), overhead.cost(10 * f));
     }
 
     #[test]
     fn charges_are_held_until_the_state_is_gone() {
         let mut budget = budget(4, 1_000);
-        let id = StreamId::next();
+        let id = StreamId::next_transport_internal();
         let (token, liveness) = task();
         budget.check(600).unwrap();
         budget.charge(id, 600, 0, AGE, liveness);
@@ -548,7 +554,7 @@ mod tests {
     #[test]
     fn a_buffer_charge_lasts_while_any_clone_of_the_buffer_does() {
         let mut budget = budget(4, 1_000);
-        let id = StreamId::next_operations();
+        let id = StreamId::next();
         let buffer = Arc::new(LockFreeStreamBuffer::new(100));
         let consumer_clone = Arc::clone(&buffer);
         budget.charge(id, 100, 0, AGE, Liveness::Buffer(Arc::downgrade(&buffer)));
@@ -566,7 +572,7 @@ mod tests {
         for _ in 0..2 {
             let (token, liveness) = task();
             budget.check(1).unwrap();
-            budget.charge(StreamId::next(), 1, 0, AGE, liveness);
+            budget.charge(StreamId::next_transport_internal(), 1, 0, AGE, liveness);
             tokens.push(token);
         }
         assert_eq!(budget.check(1), Err(BudgetRejection::Streams { open: 2 }));
@@ -582,8 +588,8 @@ mod tests {
         let max_age = Duration::from_secs(600);
         let (_t1, l1) = task();
         let (_t2, l2) = task();
-        let quiet = StreamId::next();
-        let busy = StreamId::next();
+        let quiet = StreamId::next_transport_internal();
+        let busy = StreamId::next_transport_internal();
         budget.charge(quiet, 1, 0, max_age, l1);
         budget.charge(busy, 1, 0, max_age, l2);
 
@@ -617,7 +623,7 @@ mod tests {
     #[test]
     fn complete_streams_are_not_evicted() {
         let mut budget = budget(8, u64::MAX);
-        let done = StreamId::next();
+        let done = StreamId::next_transport_internal();
         let (token, liveness) = task();
         budget.charge(done, 10, 0, Duration::from_secs(60), liveness);
         token.report(10);
@@ -683,26 +689,34 @@ mod tests {
     fn refused_ids_are_remembered_until_they_expire() {
         // Expiry applies even while the memory has room (nothing is pruned).
         let mut refused = RefusedStreams::default();
-        let id = StreamId::next();
+        let id = StreamId::next_transport_internal();
         assert!(refused.remember(id, 10 * SECS, 0));
         assert!(refused.contains(id, 9 * SECS));
         assert!(!refused.contains(id, 10 * SECS), "expired");
 
         let mut refused = RefusedStreams::default();
-        let first = StreamId::next();
+        let first = StreamId::next_transport_internal();
         assert!(refused.remember(first, 100 * SECS, 0));
         for i in 1..MAX_REMEMBERED_REFUSALS {
-            assert!(refused.remember(StreamId::next(), (200 + i as u64) * SECS, 0));
+            assert!(refused.remember(
+                StreamId::next_transport_internal(),
+                (200 + i as u64) * SECS,
+                0
+            ));
         }
         assert!(refused.is_full(0));
         assert!(refused.contains(first, 99 * SECS), "not displaced");
         // Once `first` has expired there is room again.
         assert!(!refused.is_full(100 * SECS));
         assert!(!refused.contains(first, 100 * SECS));
-        assert!(refused.remember(StreamId::next(), 500 * SECS, 100 * SECS));
+        assert!(refused.remember(StreamId::next_transport_internal(), 500 * SECS, 100 * SECS));
         assert!(refused.is_full(100 * SECS));
         assert!(
-            !refused.remember(StreamId::next(), 9_000 * SECS, 100 * SECS),
+            !refused.remember(
+                StreamId::next_transport_internal(),
+                9_000 * SECS,
+                100 * SECS
+            ),
             "no room"
         );
     }

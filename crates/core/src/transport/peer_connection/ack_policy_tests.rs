@@ -1387,8 +1387,8 @@ async fn force_noop_gate_api_applies_to_new_connections() {
 #[tokio::test(start_paused = true)]
 async fn legacy_fragment_survives_cancellation_during_a_blocked_handoff() {
     let mut e = single(CAPABLE);
-    let stream_id = StreamId::next();
-    assert!(!stream_id.is_operations_stream(), "premise: legacy stream");
+    let stream_id = StreamId::next_transport_internal();
+    assert!(!stream_id.is_caller_named(), "premise: legacy stream");
     // A full one-slot channel stands in for a backed-up recv_stream task.
     let (tx, mut rx) = mpsc::channel(1);
     tx.try_send((99u32, bytes::Bytes::from_static(b"filler")))
@@ -1764,7 +1764,7 @@ async fn settle() {
 async fn fragment_declaring_an_invalid_length_creates_no_stream_state() {
     use super::streaming::MAX_STREAM_TOTAL_BYTES;
     for declared in [MAX_STREAM_TOTAL_BYTES + 1, 0, u64::MAX] {
-        for stream_id in [StreamId::next(), StreamId::next_operations()] {
+        for stream_id in [StreamId::next_transport_internal(), StreamId::next()] {
             let mut e = single(CAPABLE);
             assert!(
                 feed(&mut e, fragment(stream_id, declared, 1))
@@ -1785,7 +1785,7 @@ async fn fragment_declaring_an_invalid_length_creates_no_stream_state() {
 async fn fragment_declaring_the_maximum_length_is_admitted() {
     use super::streaming::MAX_STREAM_TOTAL_BYTES;
     let mut e = single(CAPABLE);
-    let ops = StreamId::next_operations();
+    let ops = StreamId::next();
     feed(&mut e, fragment(ops, MAX_STREAM_TOTAL_BYTES, 1)).await;
     let (handle, _) = e.conn.streaming_handles.get(&ops).expect("registered");
     assert_eq!(handle.total_bytes(), MAX_STREAM_TOTAL_BYTES);
@@ -1796,7 +1796,7 @@ async fn fragment_declaring_the_maximum_length_is_admitted() {
     );
 
     let mut e = single(CAPABLE);
-    let legacy = StreamId::next();
+    let legacy = StreamId::next_transport_internal();
     feed(&mut e, fragment(legacy, MAX_STREAM_TOTAL_BYTES, 1)).await;
     assert!(e.conn.inbound_streams.contains_key(&legacy));
     assert!(
@@ -1815,7 +1815,7 @@ async fn fragment_declaring_the_maximum_length_is_admitted() {
 #[tokio::test(start_paused = true)]
 async fn a_refused_stream_stays_refused() {
     use super::streaming::MAX_STREAM_TOTAL_BYTES;
-    for stream_id in [StreamId::next(), StreamId::next_operations()] {
+    for stream_id in [StreamId::next_transport_internal(), StreamId::next()] {
         let mut e = single(CAPABLE);
         feed(&mut e, fragment(stream_id, MAX_STREAM_TOTAL_BYTES + 1, 1)).await;
         feed(&mut e, fragment(stream_id, 5_000, 2)).await;
@@ -1829,7 +1829,7 @@ async fn a_refused_stream_stays_refused() {
 #[tokio::test(start_paused = true)]
 async fn a_released_handle_cannot_restart_its_stream() {
     let mut e = single(CAPABLE);
-    let id = StreamId::next_operations();
+    let id = StreamId::next();
     feed(&mut e, fragment(id, 50_000, 1)).await;
     let consumer = e.conn.streaming_registry.get(id).expect("registered");
     // As the idle sweep does.
@@ -1851,7 +1851,7 @@ async fn a_released_handle_cannot_restart_its_stream() {
 async fn charges_are_released_only_when_all_reassembly_state_is_gone() {
     let mut e = single(CAPABLE);
 
-    let ops = StreamId::next_operations();
+    let ops = StreamId::next();
     feed(&mut e, fragment(ops, 50_000, 1)).await;
     let consumer = e.conn.streaming_registry.get(ops).expect("registered");
     e.conn.streaming_handles.remove(&ops);
@@ -1866,7 +1866,7 @@ async fn charges_are_released_only_when_all_reassembly_state_is_gone() {
     e.conn.sweep_inbound_streams();
     assert_eq!(e.conn.inbound_budget.charged_bytes(), 0);
 
-    let legacy = StreamId::next();
+    let legacy = StreamId::next_transport_internal();
     feed(&mut e, fragment(legacy, 50_000, 1)).await;
     // Dropping the map entry alone does not release it while the task runs.
     let sender = e
@@ -1908,22 +1908,22 @@ async fn inbound_stream_bytes_are_bounded_per_connection() {
         "premise"
     );
     let mut e = single(CAPABLE);
-    let first = StreamId::next_operations();
+    let first = StreamId::next();
     feed(&mut e, fragment(first, MAX_STREAM_TOTAL_BYTES, 1)).await;
     // Ordinary streams fit beside it, up to the headroom.
     let small = 1024 * 1024;
     let fit = headroom / cost(small);
     for i in 0..fit {
         let id = if i % 2 == 0 {
-            StreamId::next_operations()
-        } else {
             StreamId::next()
+        } else {
+            StreamId::next_transport_internal()
         };
         feed(&mut e, fragment(id, small, 1)).await;
         assert!(e.conn.inbound_budget.contains(id), "stream {i} of {fit}");
     }
 
-    for over in [StreamId::next_operations(), StreamId::next()] {
+    for over in [StreamId::next(), StreamId::next_transport_internal()] {
         feed(&mut e, fragment(over, small, 1)).await;
         assert!(holds_no_state_but_others(&e, over));
     }
@@ -1947,11 +1947,11 @@ async fn inbound_stream_count_is_bounded_per_connection() {
     use super::streaming::MAX_INBOUND_STREAMS_PER_CONNECTION;
     let mut e = single(CAPABLE);
     for _ in 0..MAX_INBOUND_STREAMS_PER_CONNECTION {
-        let id = StreamId::next_operations();
+        let id = StreamId::next();
         feed(&mut e, fragment(id, 10_000, 1)).await;
         assert!(e.conn.streaming_handles.contains_key(&id));
     }
-    let over = StreamId::next_operations();
+    let over = StreamId::next();
     feed(&mut e, fragment(over, 10_000, 1)).await;
     assert!(holds_no_state_but_others(&e, over));
     assert_eq!(
@@ -1973,8 +1973,8 @@ async fn inbound_streams_are_evicted_when_idle_or_too_old() {
     let age_limit = max_inbound_stream_age(total);
     let full = bytes::Bytes::from(vec![5u8; super::MAX_DATA_SIZE]);
     let per_step = 28 * 1024 * 5 / super::MAX_DATA_SIZE;
-    let busy = StreamId::next_operations();
-    let quiet = StreamId::next();
+    let busy = StreamId::next();
+    let quiet = StreamId::next_transport_internal();
     feed(&mut e, fragment(busy, total, 1)).await;
     feed(&mut e, fragment(quiet, total, 1)).await;
 
@@ -2029,7 +2029,7 @@ async fn inbound_streams_are_evicted_when_idle_or_too_old() {
 #[tokio::test(start_paused = true)]
 async fn a_slow_steady_stream_completes() {
     let mut e = single(CAPABLE);
-    let id = StreamId::next_operations();
+    let id = StreamId::next();
     let f = super::MAX_DATA_SIZE;
     let total: usize = 50 * 1024 * 1024;
     let fragments = total.div_ceil(f);
@@ -2084,7 +2084,7 @@ async fn a_slow_steady_stream_completes() {
 #[tokio::test(start_paused = true)]
 async fn short_fragments_do_not_complete_a_stream() {
     let mut e = single(CAPABLE);
-    let id = StreamId::next_operations();
+    let id = StreamId::next();
     let total = 3_000u64;
     let max_fragment = total.div_ceil(super::MAX_DATA_SIZE as u64) as u32 + 1;
     for n in 1..=max_fragment {
@@ -2109,7 +2109,11 @@ async fn refusals_are_logged_at_a_bounded_rate() {
     for _ in 0..500 {
         feed(
             &mut e,
-            fragment(StreamId::next(), MAX_STREAM_TOTAL_BYTES + 1, 1),
+            fragment(
+                StreamId::next_transport_internal(),
+                MAX_STREAM_TOTAL_BYTES + 1,
+                1,
+            ),
         )
         .await;
     }
@@ -2117,7 +2121,11 @@ async fn refusals_are_logged_at_a_bounded_rate() {
     tokio::time::advance(REFUSAL_WARN_INTERVAL).await;
     feed(
         &mut e,
-        fragment(StreamId::next(), MAX_STREAM_TOTAL_BYTES + 1, 1),
+        fragment(
+            StreamId::next_transport_internal(),
+            MAX_STREAM_TOTAL_BYTES + 1,
+            1,
+        ),
     )
     .await;
     assert_eq!(
@@ -2147,7 +2155,7 @@ async fn a_completed_stream_is_released_when_its_consumers_are() {
             crate::config::SimulationIdleTimeout::disable();
         }
         let mut e = single(CAPABLE);
-        let id = StreamId::next_operations();
+        let id = StreamId::next();
         let f = super::MAX_DATA_SIZE;
         let total = (2 * f) as u64;
         let full = bytes::Bytes::from(vec![3u8; f]);
@@ -2181,14 +2189,14 @@ async fn a_completed_stream_is_released_when_its_consumers_are() {
 async fn a_retransmission_does_not_restart_a_completed_stream() {
     let mut e = single(CAPABLE);
     let one = bytes::Bytes::from_static(b"complete");
-    let ops = StreamId::next_operations();
+    let ops = StreamId::next();
     feed(&mut e, fragment_with(ops, one.len() as u64, 1, one.clone())).await;
     e.conn.sweep_inbound_streams();
     assert_eq!(e.conn.inbound_budget.stream_count(), 0, "released");
     feed(&mut e, fragment_with(ops, one.len() as u64, 1, one.clone())).await;
     assert!(holds_no_state(&e, ops), "not started again");
 
-    let legacy = StreamId::next();
+    let legacy = StreamId::next_transport_internal();
     assert!(
         feed(
             &mut e,
@@ -2211,7 +2219,7 @@ async fn a_retransmission_does_not_restart_a_completed_stream() {
 #[tokio::test(start_paused = true)]
 async fn an_evicted_stream_id_can_be_admitted_again() {
     let mut e = single(CAPABLE);
-    let id = StreamId::next_operations();
+    let id = StreamId::next();
     feed(&mut e, fragment(id, 50_000, 1)).await;
     tokio::time::advance(super::streaming_handle_idle_timeout() * 2).await;
     e.conn.sweep_inbound_streams();
@@ -2263,7 +2271,7 @@ async fn an_outbound_stream_refused_for_length_keeps_the_connection() {
 #[tokio::test(start_paused = true)]
 async fn a_stream_from_an_older_sender_with_an_empty_first_fragment_completes() {
     let mut e = single(CAPABLE);
-    let id = StreamId::next_operations();
+    let id = StreamId::next();
     let f = super::MAX_DATA_SIZE;
     let data: Vec<u8> = (0..(3 * f + 100)).map(|i| i as u8).collect();
     let total = data.len() as u64;
@@ -2308,7 +2316,11 @@ async fn suppressed_refusals_are_flushed_without_a_further_refusal() {
     for _ in 0..3 {
         feed(
             &mut e,
-            fragment(StreamId::next(), MAX_STREAM_TOTAL_BYTES + 1, 1),
+            fragment(
+                StreamId::next_transport_internal(),
+                MAX_STREAM_TOTAL_BYTES + 1,
+                1,
+            ),
         )
         .await;
     }
@@ -2329,21 +2341,21 @@ async fn refusals_are_counted_once_per_reason() {
     use super::streaming::{MAX_INBOUND_STREAMS_PER_CONNECTION, MAX_STREAM_TOTAL_BYTES};
     use crate::transport::metrics::InboundStreamOutcome as O;
     let mut e = single(CAPABLE);
-    let too_long = StreamId::next();
+    let too_long = StreamId::next_transport_internal();
     feed(&mut e, fragment(too_long, MAX_STREAM_TOTAL_BYTES + 1, 1)).await;
-    feed(&mut e, fragment(StreamId::next(), 0, 1)).await;
+    feed(&mut e, fragment(StreamId::next_transport_internal(), 0, 1)).await;
     feed(
         &mut e,
-        fragment(StreamId::next_operations(), MAX_STREAM_TOTAL_BYTES, 1),
+        fragment(StreamId::next(), MAX_STREAM_TOTAL_BYTES, 1),
     )
     .await;
-    let over_bytes = StreamId::next_operations();
+    let over_bytes = StreamId::next();
     feed(&mut e, fragment(over_bytes, MAX_STREAM_TOTAL_BYTES, 1)).await;
     let mut f = single(CAPABLE);
     for _ in 0..MAX_INBOUND_STREAMS_PER_CONNECTION {
-        feed(&mut f, fragment(StreamId::next_operations(), 1_000, 1)).await;
+        feed(&mut f, fragment(StreamId::next(), 1_000, 1)).await;
     }
-    let over_count = StreamId::next_operations();
+    let over_count = StreamId::next();
     feed(&mut f, fragment(over_count, 1_000, 1)).await;
 
     // Further fragments of each refused stream, now declaring a valid length.
@@ -2373,7 +2385,7 @@ async fn refusals_are_counted_once_per_reason() {
 async fn every_fragment_a_stream_may_hold_is_charged() {
     use super::inbound_budget::ChargeOverhead;
     let mut e = single(CAPABLE);
-    let id = StreamId::next_operations();
+    let id = StreamId::next();
     let f = super::MAX_DATA_SIZE as u64;
     let total = 100 * f;
     let fragments = total.div_ceil(f) + 1;
@@ -2405,7 +2417,7 @@ async fn the_completed_stream_memory_is_bounded() {
     let one = bytes::Bytes::from_static(b"complete");
     let len = one.len() as u64;
     let ids: Vec<StreamId> = (0..COMPLETED_STREAM_MEMORY.get() + 1)
-        .map(|_| StreamId::next_operations())
+        .map(|_| StreamId::next())
         .collect();
     for id in &ids {
         feed(&mut e, fragment_with(*id, len, 1, one.clone())).await;
@@ -2430,7 +2442,7 @@ async fn the_completed_stream_memory_is_bounded() {
 #[tokio::test(start_paused = true)]
 async fn a_legacy_stream_completed_by_its_task_is_remembered() {
     let mut e = single(CAPABLE);
-    let id = StreamId::next();
+    let id = StreamId::next_transport_internal();
     let f = super::MAX_DATA_SIZE;
     let data: Vec<u8> = (0..(2 * f)).map(|i| i as u8).collect();
     let total = data.len() as u64;
@@ -2470,7 +2482,7 @@ async fn an_evicted_legacy_stream_with_queued_fragments_delivers_nothing() {
     use super::streaming::max_inbound_stream_age;
     use crate::transport::metrics::InboundStreamOutcome as O;
     let mut e = single(CAPABLE);
-    let id = StreamId::next();
+    let id = StreamId::next_transport_internal();
     let f = super::MAX_DATA_SIZE;
     let total = (3 * f) as u64;
     let full = bytes::Bytes::from(vec![4u8; f]);
@@ -2508,7 +2520,7 @@ async fn an_evicted_legacy_stream_with_queued_fragments_delivers_nothing() {
 #[tokio::test(start_paused = true)]
 async fn refusals_stay_sticky_beyond_many_refusals() {
     use super::streaming::MAX_STREAM_TOTAL_BYTES;
-    for first in [StreamId::next(), StreamId::next_operations()] {
+    for first in [StreamId::next_transport_internal(), StreamId::next()] {
         let mut e = single(CAPABLE);
         feed(&mut e, fragment(first, MAX_STREAM_TOTAL_BYTES + 1, 1)).await;
         // `first` is the oldest refusal: the first one a forgetting memory
@@ -2517,7 +2529,11 @@ async fn refusals_stay_sticky_beyond_many_refusals() {
         for _ in 0..1_000 {
             feed(
                 &mut e,
-                fragment(StreamId::next(), MAX_STREAM_TOTAL_BYTES + 1, 1),
+                fragment(
+                    StreamId::next_transport_internal(),
+                    MAX_STREAM_TOTAL_BYTES + 1,
+                    1,
+                ),
             )
             .await;
         }
@@ -2539,10 +2555,10 @@ async fn a_refusal_that_cannot_be_remembered_closes_the_connection() {
     use crate::transport::metrics::InboundStreamOutcome as O;
     let mut e = single(CAPABLE);
     for _ in 0..MAX_REMEMBERED_REFUSALS {
-        feed(&mut e, fragment(StreamId::next(), 0, 1)).await;
+        feed(&mut e, fragment(StreamId::next_transport_internal(), 0, 1)).await;
     }
     // Ordinary streams are still admitted.
-    let ok = StreamId::next_operations();
+    let ok = StreamId::next();
     feed(&mut e, fragment(ok, 10_000, 1)).await;
     assert!(e.conn.streaming_handles.contains_key(&ok));
     assert_eq!(
@@ -2552,7 +2568,7 @@ async fn a_refusal_that_cannot_be_remembered_closes_the_connection() {
 
     let result = e
         .conn
-        .process_inbound(fragment(StreamId::next(), 0, 1))
+        .process_inbound(fragment(StreamId::next_transport_internal(), 0, 1))
         .await;
     assert!(
         matches!(result, Err(TransportError::ConnectionClosed(_))),
@@ -2574,7 +2590,7 @@ async fn a_refusal_that_cannot_be_remembered_closes_the_connection() {
 async fn the_periodic_sweep_counts_an_idle_eviction() {
     use crate::transport::metrics::InboundStreamOutcome as O;
     let mut e = single(CAPABLE);
-    let id = StreamId::next_operations();
+    let id = StreamId::next();
     feed(&mut e, fragment(id, 50_000, 1)).await;
     tokio::time::advance(super::streaming_handle_idle_timeout() + Duration::from_secs(1)).await;
     e.conn.sweep_streams();
@@ -2591,13 +2607,13 @@ async fn unclaimed_streams_go_with_the_connection() {
     let mut e = single(CAPABLE);
     e.conn.set_inbound_stream_registry(registry.clone());
     let one = bytes::Bytes::from_static(b"complete");
-    let done = StreamId::next_operations();
+    let done = StreamId::next();
     feed(&mut e, fragment_with(done, one.len() as u64, 1, one)).await;
     assert!(
         !e.conn.streaming_handles.contains_key(&done),
         "premise: retired"
     );
-    feed(&mut e, fragment(StreamId::next_operations(), 50_000, 1)).await;
+    feed(&mut e, fragment(StreamId::next(), 50_000, 1)).await;
     assert_eq!(registry.orphan_count(), 2, "premise: both unclaimed");
     drop(e);
     registry.gc_expired();
@@ -2610,7 +2626,7 @@ async fn unclaimed_streams_go_with_the_connection() {
 #[tokio::test(start_paused = true)]
 async fn a_stream_missing_its_first_fragment_is_evicted() {
     use crate::transport::metrics::InboundStreamOutcome as O;
-    for id in [StreamId::next(), StreamId::next_operations()] {
+    for id in [StreamId::next_transport_internal(), StreamId::next()] {
         let mut e = single(CAPABLE);
         let f = super::MAX_DATA_SIZE;
         let total = (4 * f) as u64;
@@ -2645,7 +2661,7 @@ async fn a_stream_missing_its_first_fragment_is_evicted() {
 #[tokio::test(start_paused = true)]
 async fn a_legacy_stream_receiving_new_fragments_stays_alive() {
     let mut e = single(CAPABLE);
-    let id = StreamId::next();
+    let id = StreamId::next_transport_internal();
     let f = super::MAX_DATA_SIZE;
     let total = (40 * f) as u64;
     let full = bytes::Bytes::from(vec![6u8; f]);
@@ -2675,7 +2691,7 @@ async fn a_legacy_stream_receiving_new_fragments_stays_alive() {
 async fn a_legacy_stream_receiving_only_replays_goes_idle() {
     use crate::transport::metrics::InboundStreamOutcome as O;
     let mut e = single(CAPABLE);
-    let id = StreamId::next();
+    let id = StreamId::next_transport_internal();
     let f = super::MAX_DATA_SIZE;
     let total = (20 * f) as u64;
     let full = bytes::Bytes::from(vec![3u8; f]);
@@ -2707,7 +2723,7 @@ async fn a_legacy_stream_receiving_only_replays_goes_idle() {
 #[tokio::test(start_paused = true)]
 async fn an_out_of_order_legacy_stream_completes_within_its_charge() {
     let mut e = single(CAPABLE);
-    let id = StreamId::next();
+    let id = StreamId::next_transport_internal();
     let f = super::MAX_DATA_SIZE;
     let n = 60usize;
     let data: Vec<u8> = (0..n * f).map(|i| (i % 251) as u8).collect();

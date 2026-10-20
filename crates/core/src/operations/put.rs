@@ -258,7 +258,7 @@ mod messages {
 
     use crate::message::{InnerMessage, Transaction};
     use crate::ring::Location;
-    use crate::transport::peer_connection::StreamId;
+    use crate::transport::StreamId;
 
     /// Payload for streaming PUT requests.
     /// This struct is serialized and sent via the stream, while the metadata

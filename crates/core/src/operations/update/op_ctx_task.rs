@@ -34,7 +34,7 @@ use crate::tracing::{NetEventLog, OperationFailure, state_hash_full};
 use super::{
     AutoFetchReason, BroadcastStreamingPayload, UpdateExecution, UpdateMsg, UpdateStreamingPayload,
 };
-use crate::transport::peer_connection::StreamId;
+use crate::transport::StreamId;
 
 /// Counter: number of times `start_relay_request_update` or
 /// `start_relay_broadcast_to` was invoked. Incremented under

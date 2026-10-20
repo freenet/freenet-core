@@ -47,7 +47,7 @@
 //! There are two different kinds of "stream" here and conflating them
 //! produces a double count:
 //!
-//! * **Operations-level streams** (`send_stream` / `StreamId::next_operations`,
+//! * **Operations-level streams** (`send_stream` / `StreamId::next`,
 //!   used for full-state broadcast and large op payloads) do NOT reach this
 //!   call site and are NOT counted here. They are covered by
 //!   `transfer_completed`.
