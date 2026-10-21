@@ -161,7 +161,7 @@ pub(super) struct BudgetSpent;
 
 impl std::fmt::Display for BudgetSpent {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("today's download budget for this release is spent (#5799)")
+        f.write_str("today's download budget is spent (#5799)")
     }
 }
 
@@ -1071,7 +1071,7 @@ struct StageEnv<'a> {
     lookup_delays: &'a [Duration],
     deadline: Duration,
     clock: Clock<'a>,
-    /// Archive bytes per release per day; production passes
+    /// Archive bytes per node per day; production passes
     /// `rollback::DOWNLOAD_BYTES_PER_DAY`.
     byte_budget: u64,
 }

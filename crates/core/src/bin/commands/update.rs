@@ -677,8 +677,8 @@ impl UpdateCommand {
             std::process::exit(EXIT_CODE_ALREADY_UP_TO_DATE);
         }
 
-        // #5799: staging and the updater share one byte budget per release
-        // per day. Checked before the asset list is requested, unless a
+        // #5799: staging and the updater share one byte budget per node per
+        // day. Checked before the asset list is requested, unless a
         // staged copy can be installed without downloading the archive.
         let meter = match updater_meter_at(
             super::auto_update::state_dir().as_deref(),
