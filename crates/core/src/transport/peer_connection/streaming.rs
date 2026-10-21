@@ -747,8 +747,10 @@ impl Stream for StreamingInboundStream {
         // Every fragment slot has been read. That is the end only if every
         // declared byte was read too: a sender that filled the slots with
         // short payloads leaves the stream short, and ending cleanly here
-        // would report a truncated stream as complete (#5445). It is a
-        // stream-scoped failure, as `assemble()` treats it.
+        // would report a truncated stream as complete (#5445). Fail the
+        // stream instead. (`assemble()` never completes such a stream
+        // either: it waits for the missing bytes and ends in
+        // `InactivityTimeout`.)
         if next_idx > total_fragments {
             let declared = self.handle.buffer.total_bytes();
             if self.bytes_read < declared {

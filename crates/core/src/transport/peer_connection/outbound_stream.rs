@@ -962,8 +962,6 @@ where
         // embedding and rely on the separate metadata message instead.
         let metadata_bytes = if fragment_number == 1 {
             if let Some(meta) = pending_metadata.take() {
-                // Note: The 41-byte overhead already includes Option discriminant (1 byte)
-                // and length prefix (8 bytes). Only add the metadata data length.
                 // The size of the fragment as it would be serialized with the
                 // metadata embedded, not an estimate: the old
                 // `payload + 41 + meta` left out the metadata's 8-byte length
