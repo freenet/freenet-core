@@ -1059,6 +1059,35 @@ where
         }
     }
 
+    // The inbound stream has ended. Forwarding fewer bytes than the stream
+    // declared is a failed pipe, however cleanly the input ended: the
+    // receiver would wait for the rest until its inactivity timeout. Like the
+    // other input failures above, it fails only this stream (#4345).
+    if sent_so_far != total_bytes {
+        let elapsed = time_source.now().saturating_sub(start_time);
+        tracing::warn!(
+            stream_id = %outbound_stream_id.0,
+            destination = %destination_addr,
+            sent_so_far,
+            total_bytes,
+            "pipe_stream input ended short of its declared total"
+        );
+        emit_transfer_failed(
+            outbound_stream_id.0 as u64,
+            destination_addr,
+            sent_so_far,
+            format!("inbound stream ended short: forwarded {sent_so_far}/{total_bytes} bytes"),
+            elapsed.as_millis() as u64,
+            TransferDirection::Send,
+        );
+        release_aborted_stream_flightsize(
+            outbound_stream_id,
+            sent_packet_tracker.as_ref(),
+            congestion_controller.as_ref(),
+        );
+        return Err(TransportError::OutboundStreamFailed(destination_addr));
+    }
+
     let generic_stats = congestion_controller.stats();
     let ledbat_stats = congestion_controller.ledbat_stats();
     let elapsed = time_source.now().saturating_sub(start_time);
@@ -1237,6 +1266,23 @@ mod tests {
     use crate::transport::token_bucket::TokenBucket;
     use tokio::sync::mpsc;
 
+    /// A stream that ends before reaching its declared total is a failed
+    /// pipe, not a successful one: the receiver would wait for the rest.
+    #[tokio::test]
+    async fn pipe_fails_a_stream_that_ends_short_of_its_total() {
+        use super::super::streaming_buffer::FRAGMENT_PAYLOAD_SIZE as F;
+        let chunks = futures::stream::iter(vec![
+            Ok(Bytes::from(vec![1u8; F])),
+            Ok(Bytes::from(vec![2u8; F])),
+        ]);
+        let (fragments, result) = pipe_and_capture_result(3 * F as u64, chunks, None).await;
+        assert_eq!(fragments.len(), 2, "premise: what arrived was forwarded");
+        assert!(
+            matches!(result, Err(TransportError::OutboundStreamFailed(_))),
+            "a short stream must fail the pipe: {result:?}"
+        );
+    }
+
     /// Yields its chunks with a `Pending` before each one (waking itself),
     /// so a reader that drops `next()` on `Pending` drops it often.
     struct HesitantChunks {
@@ -1324,6 +1370,24 @@ mod tests {
             + Send
             + 'static,
     {
+        let (fragments, result) = pipe_and_capture_result(total, chunks, metadata).await;
+        result.expect("pipe succeeds");
+        fragments
+    }
+
+    /// [`pipe_and_capture`], returning the pipe's result instead of
+    /// requiring success.
+    async fn pipe_and_capture_result<C>(
+        total: u64,
+        chunks: C,
+        metadata: Option<Bytes>,
+    ) -> (Vec<WireFragment>, Result<TransferStats, TransportError>)
+    where
+        C: futures::Stream<Item = Result<Bytes, super::super::streaming::StreamError>>
+            + Unpin
+            + Send
+            + 'static,
+    {
         let (outbound_sender, mut outbound_receiver) = mpsc::channel(1);
         let time_source = VirtualTime::new();
         let (congestion_controller, token_bucket) = unthrottled(&time_source);
@@ -1368,8 +1432,8 @@ mod tests {
                 has_metadata: metadata_bytes.is_some(),
             });
         }
-        task.await.expect("join").expect("pipe succeeds");
-        fragments
+        let result = task.await.expect("join");
+        (fragments, result)
     }
 
     /// What a receiver accepts: numbered from 1, within

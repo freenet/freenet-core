@@ -744,8 +744,21 @@ impl Stream for StreamingInboundStream {
         // Lock-free access to buffer
         let total_fragments = self.handle.buffer.total_fragments() as u32;
 
-        // Check if we've read all fragments
+        // Every fragment slot has been read. That is the end only if every
+        // declared byte was read too: a sender that filled the slots with
+        // short payloads leaves the stream short, and ending cleanly here
+        // would report a truncated stream as complete (#5445). It is a
+        // stream-scoped failure, as `assemble()` treats it.
         if next_idx > total_fragments {
+            let declared = self.handle.buffer.total_bytes();
+            if self.bytes_read < declared {
+                return Poll::Ready(Some(Err(StreamError::InvalidFragment {
+                    message: format!(
+                        "stream ended after {} of its {declared} declared bytes",
+                        self.bytes_read
+                    ),
+                })));
+            }
             return Poll::Ready(None); // Stream complete
         }
 
@@ -768,17 +781,10 @@ impl Stream for StreamingInboundStream {
         // short). They consume the same buffer and must reach the same
         // conclusion about when a stream has ended.
         //
-        // Scope, precisely: this brings the two paths into agreement at THIS
-        // exit. The `next_idx > total_fragments` exit above is still unguarded,
-        // and a sender that filled every `base + 1` slot with short payloads
-        // would leave through it with `bytes_read < total_bytes` — where
-        // `assemble()` returns `None` (a failure) but this returns
-        // `Ready(None)` (a success), and `pipe_stream` reports a successful
-        // transfer with a short byte count. No conforming sender does that:
-        // `send_stream` fragments `stream_to_send` exactly. Tracked as #5445,
-        // which is where the guard that would make the agreement universal
-        // belongs — it is a production behaviour change and wants its own
-        // review rather than a late addition here.
+        // Both exits end on the byte count: the `next_idx > total_fragments`
+        // exit above returns an error when the slots ran out before the
+        // bytes did (#5445), so neither can report a truncated stream as
+        // complete.
         if self.reached_end(next_idx) {
             return Poll::Ready(None);
         }
@@ -1085,6 +1091,39 @@ mod tests {
         for auto_reclaim in [false, true] {
             check_rearmed_listener_arrival(true, auto_reclaim);
         }
+    }
+
+    /// A sender that fills every fragment slot with short payloads leaves
+    /// the stream short of its declared total. Reading it must end in an
+    /// error, not a clean end that looks like a complete stream (#5445).
+    #[tokio::test]
+    async fn stream_filled_short_ends_in_an_error_not_a_clean_end() {
+        use futures::StreamExt;
+        let total = 2 * super::super::streaming_buffer::FRAGMENT_PAYLOAD_SIZE;
+        let handle = StreamHandle::new(make_stream_id(), total as u64);
+        let slots = handle.total_fragments();
+        for n in 1..=slots {
+            handle
+                .push_fragment(n as u32, Bytes::from(vec![n as u8; 100]))
+                .unwrap();
+        }
+        let items: Vec<_> = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            handle.stream().take(slots + 2).collect::<Vec<_>>(),
+        )
+        .await
+        .expect("the stream ends");
+        let read: usize = items
+            .iter()
+            .filter_map(|i| i.as_ref().ok())
+            .map(|b| b.len())
+            .sum();
+        assert!(read < total, "premise: the stream is short");
+        assert!(
+            items.iter().any(|i| i.is_err()),
+            "a short stream must end in an error, got {} chunks and a clean end",
+            items.len()
+        );
     }
 
     #[test]
