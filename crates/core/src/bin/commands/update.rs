@@ -307,41 +307,73 @@ fn install_record(result: &Result<InstallOutcome>) -> InstallRecord {
 
 /// The meter an updater run's downloads charge to the node's daily byte
 /// budget, which staging shares (#5799), or `None` when that budget is
-/// already spent. `--force`, the operator's escape hatch, is charged but never
-/// limited. Without a state directory nothing can be charged, and the run is
-/// not limited either.
+/// already spent and the run is `limited`. Only a run the supervisor started
+/// after the node exited for an update is limited: `--force`, a manual
+/// `freenet update` and a tray "Check for Updates" are charged but never
+/// refused. Without a state directory nothing can be charged, and nothing is
+/// refused either: refusing there would stop updates altogether.
 fn updater_meter_at(
     dir: Option<&Path>,
-    force: bool,
+    limited: bool,
     now: std::time::SystemTime,
 ) -> Option<staged::ByteMeter<'static>> {
     let Some(dir) = dir else {
         return Some(staged::ByteMeter::new(u64::MAX));
     };
-    let left = if force {
-        u64::MAX
-    } else {
+    let left = if limited {
         rollback::DOWNLOAD_BYTES_PER_DAY.saturating_sub(rollback::download_bytes_at(dir, now))
+    } else {
+        u64::MAX
     };
     (left > 0).then(|| staged::ByteMeter::charged_to(left, dir, &std::time::SystemTime::now))
 }
 
-/// Hold `version` without counting a failure because today's download budget
-/// for it is spent (#5799), say so even under `--quiet`, and exit as "already
+/// Whether this run's downloads are limited by the byte budget: a run the
+/// supervisor started after the node stopped (it passes the node's stop
+/// status), without `--force`.
+fn budget_limits(force: bool, supervised: bool) -> bool {
+    supervised && !force
+}
+
+/// Hold `version` without counting a failure because the node's download
+/// budget is spent (#5799), say so even under `--quiet`, and exit as "already
 /// up to date": the supervisor restarts the current binary, whose triggers
 /// wait out the hold.
 fn exit_for_spent_budget(version: &str, reason: &str) -> ! {
-    rollback::hold_update_without_counting(version, reason);
-    stderr_line!(
+    std::process::exit(spent_budget_exit_at(
+        super::auto_update::state_dir().as_deref(),
+        version,
+        reason,
+        std::time::SystemTime::now(),
+        &mut io::stderr(),
+    ));
+}
+
+/// [`exit_for_spent_budget`] against the state directory `dir`, writing its
+/// line to `out`; returns the exit code.
+fn spent_budget_exit_at(
+    dir: Option<&Path>,
+    version: &str,
+    reason: &str,
+    now: std::time::SystemTime,
+    out: &mut impl Write,
+) -> i32 {
+    if let Some(dir) = dir {
+        let until = rollback::download_window_end_at(dir, now).unwrap_or(now);
+        rollback::hold_update_until_at(dir, version, reason, until, now);
+    }
+    #[allow(clippy::let_underscore_must_use)]
+    let _ = writeln!(
+        out,
         "Freenet update to {version} not downloaded: {reason}. Auto-update holds this release \
-         for a cooldown before trying it again (#5799)."
+         until the budget resets (#5799). Run `freenet update --force` to override it."
     );
     tracing::warn!(
         version,
         reason,
         "Update deferred: the download budget is spent (#5799)"
     );
-    std::process::exit(EXIT_CODE_ALREADY_UP_TO_DATE);
+    EXIT_CODE_ALREADY_UP_TO_DATE
 }
 
 /// Whether a run that gives up before any download holds the staged release.
@@ -650,15 +682,12 @@ impl UpdateCommand {
         // staged copy can be installed without downloading the archive.
         let meter = match updater_meter_at(
             super::auto_update::state_dir().as_deref(),
-            self.force,
+            budget_limits(self.force, rollback::post_stop_status_from_env().is_some()),
             std::time::SystemTime::now(),
         ) {
             Some(meter) => meter,
             None if staged::is_staged(&latest_tag) => staged::ByteMeter::new(0),
-            None => exit_for_spent_budget(
-                latest_version,
-                "today's download budget for this release is spent",
-            ),
+            None => exit_for_spent_budget(latest_version, "today's download budget is spent"),
         };
         if !self.quiet {
             println!("Downloading update...");
@@ -4447,7 +4476,7 @@ done
         let dir = tmp.path();
         let now = std::time::SystemTime::now();
         let prefix = stalling_server(3_000_000, 100).await;
-        let meter = updater_meter_at(Some(dir), false, now).unwrap();
+        let meter = updater_meter_at(Some(dir), true, now).unwrap();
         let abandoned = tokio::time::timeout(
             std::time::Duration::from_millis(500),
             download_file(&format!("{prefix}dmg"), &dir.join("dmg"), true, &meter),
@@ -4466,17 +4495,150 @@ done
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path();
         let now = std::time::SystemTime::now();
-        assert!(updater_meter_at(Some(dir), false, now).is_some());
-        charge_download_bytes_at(dir, DOWNLOAD_BYTES_PER_DAY, now);
-        assert!(updater_meter_at(Some(dir), false, now).is_none());
         assert!(updater_meter_at(Some(dir), true, now).is_some());
-        assert!(updater_meter_at(None, false, now).is_some());
+        charge_download_bytes_at(dir, DOWNLOAD_BYTES_PER_DAY, now);
+        assert!(updater_meter_at(Some(dir), true, now).is_none());
+        assert!(updater_meter_at(Some(dir), false, now).is_some());
+        assert!(updater_meter_at(None, true, now).is_some());
         // Consulted before the asset list is requested.
         let src = include_str!("update.rs");
         let run = &src[src.find("\n    async fn run_async(").unwrap()..];
         let meter = run.find("let meter = match updater_meter_at(").unwrap();
         let assets = run.find("match fetch_release_assets(&latest_tag").unwrap();
         assert!(meter < assets);
+    }
+
+    /// Only a run the supervisor started after the node stopped, without
+    /// `--force`, is refused by a spent budget. A manual `freenet update` or
+    /// a tray "Check for Updates" (no stop status passed) is charged but never
+    /// refused.
+    #[tokio::test]
+    async fn manual_runs_are_charged_but_never_refused() {
+        use rollback::{DOWNLOAD_BYTES_PER_DAY, charge_download_bytes_at, download_bytes_at};
+        assert!(budget_limits(false, true), "supervised");
+        assert!(!budget_limits(false, false), "manual or tray");
+        assert!(!budget_limits(true, true), "--force");
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let now = std::time::SystemTime::now();
+        charge_download_bytes_at(dir, DOWNLOAD_BYTES_PER_DAY, now);
+        assert!(updater_meter_at(Some(dir), budget_limits(false, true), now).is_none());
+        let meter = updater_meter_at(Some(dir), budget_limits(false, false), now)
+            .expect("a manual run is not refused");
+        let server = httptest::Server::run();
+        server.expect(
+            httptest::Expectation::matching(httptest::matchers::request::method_path(
+                "GET", "/asset",
+            ))
+            .respond_with(httptest::responders::status_code(200).body(vec![1u8; 700])),
+        );
+        download_file(&server.url_str("/asset"), &dir.join("asset"), true, &meter)
+            .await
+            .unwrap();
+        assert_eq!(
+            download_bytes_at(dir, now),
+            DOWNLOAD_BYTES_PER_DAY + 700,
+            "but it is charged"
+        );
+    }
+
+    /// A supervised run the spent budget refuses exits as "already up to
+    /// date" (2), holds the release without counting a failure, and says how
+    /// to override it.
+    #[test]
+    fn a_refused_updater_run_holds_and_says_how_to_override() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let now = std::time::SystemTime::now();
+        rollback::record_update_failure_at(
+            dir,
+            "9.9.9",
+            "earlier",
+            now - std::time::Duration::from_secs(5 * 3600),
+            0.5,
+        );
+        rollback::charge_download_bytes_at(dir, 1, now);
+        let mut out = Vec::new();
+        let code = spent_budget_exit_at(Some(dir), "9.9.9", "the budget is spent", now, &mut out);
+        assert_eq!(code, EXIT_CODE_ALREADY_UP_TO_DATE);
+        assert_eq!(EXIT_CODE_ALREADY_UP_TO_DATE, 2);
+        let record = rollback::read_update_cooldown_at(dir).unwrap();
+        assert_eq!(
+            (record.version.as_str(), record.failures),
+            ("9.9.9", 1),
+            "not counted"
+        );
+        assert_eq!(record.hold_reason.as_deref(), Some("the budget is spent"));
+        assert!(rollback::update_cooldown_remaining_at(dir, "9.9.9", now).is_some());
+        let line = String::from_utf8(out).unwrap();
+        assert!(
+            line.contains("the budget is spent") && line.contains("freenet update --force"),
+            "{line}"
+        );
+        // The real exit goes through it.
+        let src = include_str!("update.rs");
+        let exit = &src[src.find("\nfn exit_for_spent_budget(").unwrap()..];
+        let exit: String = exit[..exit.find("\n}\n").unwrap()]
+            .split_whitespace()
+            .collect();
+        assert!(
+            exit.contains("std::process::exit(spent_budget_exit_at("),
+            "{exit}"
+        );
+    }
+
+    /// Without a state directory nothing can be charged, and the meter must
+    /// not refuse either: that would stop updates altogether.
+    #[test]
+    fn no_state_dir_gives_an_unlimited_meter() {
+        let meter = updater_meter_at(None, true, std::time::SystemTime::now()).unwrap();
+        assert!(meter.check().is_ok());
+        assert!(meter.spend(1 << 30).is_ok());
+        assert!(meter.check().is_ok());
+    }
+
+    /// Every updater download (the freenet archive, fdev, the macOS DMG)
+    /// charges the run's shared meter, never one of its own.
+    #[test]
+    fn every_updater_download_uses_the_shared_meter() {
+        let src = include_str!("update.rs");
+        let production = src
+            .split_once(concat!("#[cfg(test)]\n", "mod tests {"))
+            .unwrap()
+            .0;
+        let flat: String = production.split_whitespace().collect();
+        let calls: Vec<&str> = flat
+            .match_indices("download_file(")
+            .map(|(at, _)| {
+                let rest = &flat[at..];
+                &rest[..rest.find(".await").unwrap()]
+            })
+            .filter(|call| !call.starts_with("download_file(url"))
+            .collect();
+        assert_eq!(calls.len(), 3, "{calls:?}");
+        for call in calls {
+            assert!(
+                call.replace(",)", ")").ends_with(",self.quiet,meter)"),
+                "{call}"
+            );
+        }
+        for method in [
+            "asyncfndownload_and_install(",
+            "asyncfntry_update_fdev(",
+            "asyncfnmaybe_perform_bundle_update(",
+        ] {
+            let body = &flat[flat.find(method).unwrap()..];
+            let body = &body[..body[1..].find("asyncfn").map_or(body.len(), |e| e + 1)];
+            assert!(
+                !body.contains("ByteMeter::new("),
+                "{method} makes its own meter"
+            );
+            let signature = &body[..body.find('{').unwrap()];
+            assert!(
+                signature.contains("&staged::ByteMeter<'_>"),
+                "{method} takes the meter"
+            );
+        }
     }
 
     /// #5799: an updater download charges what it receives to the release's
@@ -4498,14 +4660,14 @@ done
         let dir = tmp.path();
         let now = std::time::SystemTime::now();
         let dest = dir.join("asset");
-        let meter = updater_meter_at(Some(dir), false, now).unwrap();
+        let meter = updater_meter_at(Some(dir), true, now).unwrap();
         download_file(&server.url_str("/asset"), &dest, true, &meter)
             .await
             .unwrap();
         assert_eq!(download_bytes_at(dir, now), 1000);
         // 500 bytes left: the download is stopped and the budget is spent.
         charge_download_bytes_at(dir, DOWNLOAD_BYTES_PER_DAY - 1500, now);
-        let meter = updater_meter_at(Some(dir), false, now).unwrap();
+        let meter = updater_meter_at(Some(dir), true, now).unwrap();
         let err = download_file(&server.url_str("/asset"), &dest, true, &meter)
             .await
             .unwrap_err();
@@ -4647,7 +4809,8 @@ done
             // #5799: the shared byte budget is consulted before the asset
             // list is requested, and a staged copy still installs.
             "letmeter=matchupdater_meter_at(super::auto_update::state_dir().as_deref(),\
-             self.force,std::time::SystemTime::now(),){Some(meter)=>meter,\
+             budget_limits(self.force,rollback::post_stop_status_from_env().is_some()),\
+             std::time::SystemTime::now(),){Some(meter)=>meter,\
              Noneifstaged::is_staged(&latest_tag)=>staged::ByteMeter::new(0),\
              None=>exit_for_spent_budget(",
         ] {
