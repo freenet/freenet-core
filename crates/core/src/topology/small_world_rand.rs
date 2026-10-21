@@ -566,6 +566,9 @@ mod tests {
 
     #[test]
     fn chi_squared_test() {
+        // Seeded: the 0.001 significance threshold below rejects ~1 in 1000 unseeded runs
+        // by design, which made this test flaky.
+        let _guard = crate::config::GlobalRng::seed_guard(0xC41_5EED);
         let d_min = D_MIN_TARGET;
         let n = 10000;
         let num_bins = 20;
