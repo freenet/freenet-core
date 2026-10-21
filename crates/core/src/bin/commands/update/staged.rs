@@ -39,10 +39,11 @@
 //!
 //! Staging's GitHub traffic has a hard ceiling that does not depend on any of
 //! that: every staging run spends one token from the node's persisted poll
-//! bucket (#4073), and staging receives at most
+//! bucket (#4073), and staging and the updater together receive at most
 //! `rollback::STAGED_DOWNLOAD_BYTES_PER_DAY` bytes of one release's archives
-//! per day. A run the budget refuses counts as a failure, so the fallback
-//! still fires.
+//! per day (the updater charges the same record through [`ByteMeter`]). A
+//! staging run the budget refuses counts as a failure, so the fallback still
+//! fires; an updater run it refuses holds the release without counting.
 
 use std::fs;
 use std::io::Write as _;
@@ -206,7 +207,7 @@ struct Ledger<'a> {
 }
 
 impl<'a> ByteMeter<'a> {
-    fn new(allowance: u64) -> Self {
+    pub(super) fn new(allowance: u64) -> Self {
         Self {
             allowance,
             received: std::sync::atomic::AtomicU64::new(0),
@@ -239,7 +240,7 @@ impl<'a> ByteMeter<'a> {
     }
 
     /// Refuse before a request when nothing is left.
-    fn check(&self) -> Result<()> {
+    pub(super) fn check(&self) -> Result<()> {
         if self.received() >= self.allowance {
             return Err(BudgetSpent.into());
         }
@@ -247,7 +248,7 @@ impl<'a> ByteMeter<'a> {
     }
 
     /// Count `n` bytes just received; an error once they pass the allowance.
-    fn spend(&self, n: usize) -> Result<()> {
+    pub(super) fn spend(&self, n: usize) -> Result<()> {
         use std::sync::atomic::Ordering::Relaxed;
         let n = u64::try_from(n).unwrap_or(u64::MAX);
         let total = self.received.fetch_add(n, Relaxed).saturating_add(n);
@@ -473,6 +474,12 @@ fn hold_staged_release_at(root: &Path, reason: &str, now: SystemTime, rand_unit:
             rand_unit,
         );
     }
+}
+
+/// Whether a complete copy of `tag` is staged, so installing it needs no
+/// download of the freenet archive.
+pub(super) fn is_staged(tag: &str) -> bool {
+    cache_root().is_some_and(|root| staged_tag_at(&root).as_deref() == Some(tag))
 }
 
 /// The tag of the release staged under `root`, if a complete one is there (its

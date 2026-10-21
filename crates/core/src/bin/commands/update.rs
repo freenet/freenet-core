@@ -261,6 +261,10 @@ enum InstallRecord {
     /// (#5799). Deliberately includes a missing manifest or asset, which is
     /// usually a release still propagating.
     CoolDown(String),
+    /// Today's download budget for the release ran out mid-download (#5799):
+    /// hold it without counting a failure, as a run the budget refuses up
+    /// front does.
+    Hold(String),
 }
 
 fn install_record(result: &Result<InstallOutcome>) -> InstallRecord {
@@ -273,8 +277,53 @@ fn install_record(result: &Result<InstallOutcome>) -> InstallRecord {
             verification_failure: false,
         }) => InstallRecord::CoolDown("the app bundle update could not be downloaded".to_string()),
         Err(e) if is_release_verification_failure(e) => InstallRecord::Gate,
+        Err(e) if e.downcast_ref::<staged::BudgetSpent>().is_some() => {
+            InstallRecord::Hold(format!("{e:#}"))
+        }
         Err(e) => InstallRecord::CoolDown(format!("{e:#}")),
     }
+}
+
+/// The meter an updater run's downloads of `version` charge to the release's
+/// daily byte budget, which staging shares (#5799), or `None` when that
+/// budget is already spent. `--force`, the operator's escape hatch, is
+/// charged but never limited. Without a state directory nothing can be
+/// charged, and the run is not limited either.
+fn updater_meter_at(
+    dir: Option<&Path>,
+    version: &str,
+    force: bool,
+    now: std::time::SystemTime,
+) -> Option<staged::ByteMeter<'static>> {
+    let Some(dir) = dir else {
+        return Some(staged::ByteMeter::new(u64::MAX));
+    };
+    let left = if force {
+        u64::MAX
+    } else {
+        rollback::STAGED_DOWNLOAD_BYTES_PER_DAY
+            .saturating_sub(rollback::staged_download_bytes_at(dir, version, now))
+    };
+    (left > 0)
+        .then(|| staged::ByteMeter::charged_to(left, dir, version, &std::time::SystemTime::now))
+}
+
+/// Hold `version` without counting a failure because today's download budget
+/// for it is spent (#5799), say so even under `--quiet`, and exit as "already
+/// up to date": the supervisor restarts the current binary, whose triggers
+/// wait out the hold.
+fn exit_for_spent_budget(version: &str, reason: &str) -> ! {
+    rollback::hold_update_without_counting(version, reason);
+    stderr_line!(
+        "Freenet update to {version} not downloaded: {reason}. Auto-update holds this release \
+         for a cooldown before trying it again (#5799)."
+    );
+    tracing::warn!(
+        version,
+        reason,
+        "Update deferred: the download budget is spent (#5799)"
+    );
+    std::process::exit(EXIT_CODE_ALREADY_UP_TO_DATE);
 }
 
 /// Whether a run that gives up before any download holds the staged release.
@@ -578,6 +627,22 @@ impl UpdateCommand {
             std::process::exit(EXIT_CODE_ALREADY_UP_TO_DATE);
         }
 
+        // #5799: staging and the updater share one byte budget per release
+        // per day. Checked before the asset list is requested, unless a
+        // staged copy can be installed without downloading the archive.
+        let meter = match updater_meter_at(
+            super::auto_update::state_dir().as_deref(),
+            latest_version,
+            self.force,
+            std::time::SystemTime::now(),
+        ) {
+            Some(meter) => meter,
+            None if staged::is_staged(&latest_tag) => staged::ByteMeter::new(0),
+            None => exit_for_spent_budget(
+                latest_version,
+                "today's download budget for this release is spent",
+            ),
+        };
         if !self.quiet {
             println!("Downloading update...");
         }
@@ -612,7 +677,9 @@ impl UpdateCommand {
         // success and never returns here; a swallowed bundle FAILURE returns
         // `BundleSkipped { verification_failure }`, which carries the same
         // deterministic-vs-transient distinction.
-        let install_result = self.download_and_install(&latest, current_version).await;
+        let install_result = self
+            .download_and_install(&latest, current_version, &meter)
+            .await;
         // Transient failures cool the release down rather than gating it.
         // That DELIBERATELY includes the fail-closed "missing artifact"
         // refusals (absent SHA256SUMS.txt, no manifest entry for our asset,
@@ -633,6 +700,7 @@ impl UpdateCommand {
             }
             InstallRecord::Gate => super::rollback::record_install_failure(latest_version),
             InstallRecord::CoolDown(error) => note_install_failure(latest_version, &error),
+            InstallRecord::Hold(error) => exit_for_spent_budget(latest_version, &error),
         }
         install_result.map(|_| ())
     }
@@ -641,6 +709,7 @@ impl UpdateCommand {
         &self,
         release: &Release,
         current_version: &str,
+        meter: &staged::ByteMeter<'_>,
     ) -> Result<InstallOutcome> {
         // macOS DMG-swap path: when running from inside a .app bundle,
         // in-place binary replacement would invalidate the bundle's code
@@ -663,7 +732,7 @@ impl UpdateCommand {
                 .and_then(|exe| super::service::macos_app_bundle_path(&exe))
                 .is_some();
 
-            match self.maybe_perform_bundle_update(release).await {
+            match self.maybe_perform_bundle_update(release, meter).await {
                 Ok(true) => {
                     tracing::info!("DMG-swap update staged for release {}", release.tag_name);
                     if !self.quiet {
@@ -797,7 +866,13 @@ impl UpdateCommand {
                 None => {
                     let checksums = self.download_and_verify_checksums(release).await?;
                     let path = temp_dir.path().join(&freenet_asset_name);
-                    download_file(&freenet_asset.browser_download_url, &path, self.quiet).await?;
+                    download_file(
+                        &freenet_asset.browser_download_url,
+                        &path,
+                        self.quiet,
+                        meter,
+                    )
+                    .await?;
                     (checksums, path, None)
                 }
             };
@@ -941,6 +1016,7 @@ impl UpdateCommand {
                 temp_dir.path(),
                 staged_fdev,
                 &current_exe,
+                meter,
             )
             .await;
         } else if !self.quiet {
@@ -1106,12 +1182,14 @@ impl UpdateCommand {
         temp_dir: &Path,
         staged_archive: Option<PathBuf>,
         freenet_exe: &Path,
+        meter: &staged::ByteMeter<'_>,
     ) {
         let archive_path = match staged_archive {
             Some(path) => path,
             None => {
                 let path = temp_dir.join(asset_name);
-                if let Err(e) = download_file(&asset.browser_download_url, &path, self.quiet).await
+                if let Err(e) =
+                    download_file(&asset.browser_download_url, &path, self.quiet, meter).await
                 {
                     if !self.quiet {
                         stderr_line!(
@@ -1217,7 +1295,11 @@ impl UpdateCommand {
     ///             standard binary-replacement flow instead
     ///   Err       failed; caller may fall back to binary replacement
     #[cfg(target_os = "macos")]
-    async fn maybe_perform_bundle_update(&self, release: &Release) -> Result<bool> {
+    async fn maybe_perform_bundle_update(
+        &self,
+        release: &Release,
+        meter: &staged::ByteMeter<'_>,
+    ) -> Result<bool> {
         let current_exe = std::env::current_exe()
             .context("Failed to resolve current executable for bundle-update check")?;
         let Some(bundle_path) = super::service::macos_app_bundle_path(&current_exe) else {
@@ -1251,7 +1333,13 @@ impl UpdateCommand {
 
         let scratch = tempfile::tempdir().context("Failed to create temp directory")?;
         let dmg_path = scratch.path().join(&dmg_asset_name);
-        download_file(&dmg_asset.browser_download_url, &dmg_path, self.quiet).await?;
+        download_file(
+            &dmg_asset.browser_download_url,
+            &dmg_path,
+            self.quiet,
+            meter,
+        )
+        .await?;
 
         // Require checksum verification for bundle updates. Unverified
         // DMG install is a supply-chain risk that macOS Gatekeeper alone
@@ -1859,7 +1947,28 @@ fn get_archive_extension() -> &'static str {
     }
 }
 
-async fn download_file(url: &str, dest: &Path, quiet: bool) -> Result<()> {
+/// Download `url` to `dest`, charging the bytes received to `meter`, the
+/// release's daily download budget (#5799): refused before the request when
+/// the budget is spent, stopped once it runs out, and written to the budget
+/// record whatever the outcome.
+async fn download_file(
+    url: &str,
+    dest: &Path,
+    quiet: bool,
+    meter: &staged::ByteMeter<'_>,
+) -> Result<()> {
+    let result = download_file_counted(url, dest, quiet, meter).await;
+    meter.flush();
+    result
+}
+
+async fn download_file_counted(
+    url: &str,
+    dest: &Path,
+    quiet: bool,
+    meter: &staged::ByteMeter<'_>,
+) -> Result<()> {
+    meter.check()?;
     let client = reqwest::Client::builder()
         .user_agent(super::auto_update::GITHUB_USER_AGENT)
         // A READ timeout, deliberately NOT a total one: this is the release
@@ -1892,6 +2001,7 @@ async fn download_file(url: &str, dest: &Path, quiet: bool) -> Result<()> {
         let chunk = chunk.context("Error while downloading")?;
         file.write_all(&chunk)?;
         downloaded += chunk.len() as u64;
+        meter.spend(chunk.len())?;
 
         if !quiet && total_size > 0 {
             let progress = (downloaded as f64 / total_size as f64 * 100.0) as u32;
@@ -4215,7 +4325,7 @@ done
         // match (the macOS path isn't exercised on Linux CI).
         const SRC: &str = include_str!("update.rs");
         let (_, run_async) = SRC
-            .split_once("let install_result = self.download_and_install(")
+            .split_once(".download_and_install(&latest, current_version, &meter)")
             .expect("download_and_install call site not found");
         let (matchbody, _) = run_async
             .split_once("install_result.map(|_| ())")
@@ -4277,6 +4387,73 @@ done
     /// behaviour rather than source. A verification failure goes to the #4073
     /// gate and never to the cooldown; every other failure cools the release
     /// down carrying its full error chain; an install clears.
+    /// #5799: the updater draws on the byte budget staging uses, per release
+    /// per day. A spent budget refuses an updater run before it requests the
+    /// asset list; `--force` is never refused; another release has its own
+    /// budget.
+    #[test]
+    fn the_updater_shares_the_staging_byte_budget() {
+        use rollback::{STAGED_DOWNLOAD_BYTES_PER_DAY, add_staged_download_bytes_at};
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let now = std::time::SystemTime::now();
+        assert!(updater_meter_at(Some(dir), "9.9.9", false, now).is_some());
+        add_staged_download_bytes_at(dir, "9.9.9", STAGED_DOWNLOAD_BYTES_PER_DAY, now);
+        assert!(updater_meter_at(Some(dir), "9.9.9", false, now).is_none());
+        assert!(updater_meter_at(Some(dir), "9.9.9", true, now).is_some());
+        assert!(updater_meter_at(Some(dir), "9.9.10", false, now).is_some());
+        assert!(updater_meter_at(None, "9.9.9", false, now).is_some());
+        // Consulted before the asset list is requested.
+        let src = include_str!("update.rs");
+        let run = &src[src.find("\n    async fn run_async(").unwrap()..];
+        let meter = run.find("let meter = match updater_meter_at(").unwrap();
+        let assets = run.find("match fetch_release_assets(&latest_tag").unwrap();
+        assert!(meter < assets);
+    }
+
+    /// #5799: an updater download charges what it receives to the release's
+    /// budget record, and one that runs out of budget mid-download stops and
+    /// is held, not counted.
+    #[tokio::test]
+    async fn updater_downloads_charge_the_byte_budget() {
+        use rollback::{
+            STAGED_DOWNLOAD_BYTES_PER_DAY, add_staged_download_bytes_at, staged_download_bytes_at,
+        };
+        let body = vec![7u8; 1000];
+        let server = httptest::Server::run();
+        server.expect(
+            httptest::Expectation::matching(httptest::matchers::request::method_path(
+                "GET", "/asset",
+            ))
+            .times(2)
+            .respond_with(httptest::responders::status_code(200).body(body.clone())),
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let now = std::time::SystemTime::now();
+        let dest = dir.join("asset");
+        let meter = updater_meter_at(Some(dir), "9.9.9", false, now).unwrap();
+        download_file(&server.url_str("/asset"), &dest, true, &meter)
+            .await
+            .unwrap();
+        assert_eq!(staged_download_bytes_at(dir, "9.9.9", now), 1000);
+        // 500 bytes left: the download is stopped and the budget is spent.
+        add_staged_download_bytes_at(dir, "9.9.9", STAGED_DOWNLOAD_BYTES_PER_DAY - 1500, now);
+        let meter = updater_meter_at(Some(dir), "9.9.9", false, now).unwrap();
+        let err = download_file(&server.url_str("/asset"), &dest, true, &meter)
+            .await
+            .unwrap_err();
+        assert!(staged_download_bytes_at(dir, "9.9.9", now) >= STAGED_DOWNLOAD_BYTES_PER_DAY);
+        assert!(matches!(install_record(&Err(err)), InstallRecord::Hold(_)));
+        // Spent: refused before any request (the server expects only two).
+        let spent = staged::ByteMeter::new(0);
+        assert!(
+            download_file(&server.url_str("/asset"), &dest, true, &spent)
+                .await
+                .is_err()
+        );
+    }
+
     #[test]
     fn each_install_outcome_records_the_right_thing() {
         assert_eq!(
@@ -4362,7 +4539,14 @@ done
             "Err(e)=>{note_install_failure(latest_version,&format!(\"{e:#}\"));returnErr(e);}",
             "matchinstall_record(&install_result){",
             "InstallRecord::Gate=>super::rollback::record_install_failure(latest_version),",
-            "InstallRecord::CoolDown(error)=>note_install_failure(latest_version,&error),}install_result",
+            "InstallRecord::CoolDown(error)=>note_install_failure(latest_version,&error),\
+             InstallRecord::Hold(error)=>exit_for_spent_budget(latest_version,&error),}install_result",
+            // #5799: the shared byte budget is consulted before the asset
+            // list is requested, and a staged copy still installs.
+            "letmeter=matchupdater_meter_at(super::auto_update::state_dir().as_deref(),\
+             latest_version,self.force,std::time::SystemTime::now(),){Some(meter)=>meter,\
+             Noneifstaged::is_staged(&latest_tag)=>staged::ByteMeter::new(0),\
+             None=>exit_for_spent_budget(",
         ] {
             assert!(run_async.contains(needle), "run_async: `{needle}`");
         }

@@ -1405,23 +1405,27 @@ pub fn update_cooldown_summary(current_version: &str) -> Option<String> {
 // ── Hard ceiling on staged release downloads (#5799) ───────────────────────
 //
 // Independent of the cooldown above, so a bug in it cannot turn the fleet's
-// download-in-advance into a flood that GitHub throttles. Staging receives at
-// most `STAGED_DOWNLOAD_BYTES_PER_DAY` bytes of one release's archives per day
-// per node. It counts bytes actually received, not runs: an attempt that fails
-// early costs next to nothing, and a partial download is resumed rather than
-// fetched again, so the normal schedule (runs at 0, 1 h and 3 h, then about
-// every 4 h) stays far below it, however long an outage lasts. It binds only
-// when downloads keep starting over (a server ignoring the resume, connections
-// dropping after most of an archive). Every staging run also spends one token
-// from the node's GitHub poll bucket (#4073), which bounds the requests.
+// downloads into a flood that GitHub throttles. Staging and the updater
+// together receive at most `STAGED_DOWNLOAD_BYTES_PER_DAY` bytes of one
+// release's archives per day per node (only `freenet update --force` is not
+// limited, though it is still counted). It counts bytes actually received,
+// written as they arrive, not runs: an attempt that fails early costs next to
+// nothing, and staging resumes a partial download rather than fetching it
+// again, so the normal schedule (runs at 0, 1 h and 3 h, then about every 4 h)
+// stays far below it, however long an outage lasts. It binds only when
+// downloads keep starting over: a server ignoring the resume, or connections
+// dropping after most of an archive, including the updater's downloads, which
+// always start from zero. Every staging run also spends one token from the
+// node's GitHub poll bucket (#4073), which bounds the requests.
 //
 // Both reads and writes fail OPEN: an unreadable record counts as nothing
 // spent, and a spend that cannot be written is lost. The poll bucket still
 // bounds the requests, and a budget that failed closed could hold an update
 // back indefinitely.
 
-/// Bytes of one release's archives staging may receive per node per day:
-/// about four times the ~41 MiB the freenet and fdev archives take today.
+/// Bytes of one release's archives staging and the updater together may
+/// receive per node per day: about four times the ~41 MiB the freenet and fdev
+/// archives take today.
 pub(crate) const STAGED_DOWNLOAD_BYTES_PER_DAY: u64 = 160 * 1024 * 1024;
 const STAGED_DOWNLOAD_WINDOW: std::time::Duration = std::time::Duration::from_secs(24 * 3600);
 const STAGED_DOWNLOADS_FILE: &str = "staged_downloads.json";
