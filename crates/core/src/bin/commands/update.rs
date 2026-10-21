@@ -4362,7 +4362,7 @@ done
         );
     }
 
-    /// #5799 review: the updater's stderr goes to a log file under every
+    /// #5799: the updater's stderr goes to a log file under every
     /// supervisor, and `eprintln!` panics when that write fails (a full disk),
     /// so no production code in this file uses it; `stderr_line!` ignores the
     /// error instead.
@@ -4383,7 +4383,7 @@ done
         assert!(code.contains("let _ = writeln!(io::stderr(), $($arg)*);"));
     }
 
-    /// Testing lens: what the updater records for each install outcome, by
+    /// What the updater records for each install outcome, by
     /// behaviour rather than source. A verification failure goes to the #4073
     /// gate and never to the cooldown; every other failure cools the release
     /// down carrying its full error chain; an install clears.
@@ -4486,7 +4486,7 @@ done
         assert!(holds_on_skip(false));
     }
 
-    /// Testing lens: the line the supervisor's log shows names the release,
+    /// The line the supervisor's log shows names the release,
     /// the streak when it was recorded, and the whole error.
     #[test]
     fn the_install_failure_line_carries_the_error() {

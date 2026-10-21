@@ -440,8 +440,6 @@ impl ReportCommand {
     }
 }
 
-/// Context for a failed send, with the trust summary only when it explains the
-/// failure (see `OsTrustSummary::explaining`).
 /// The summary `freenet service report` prints before uploading.
 fn summary_lines(report: &DiagnosticReport) -> Vec<String> {
     let mut lines = Vec::new();
@@ -499,6 +497,8 @@ fn summary_lines(report: &DiagnosticReport) -> Vec<String> {
     lines
 }
 
+/// Context for a failed send, with the trust summary only when it explains the
+/// failure (see `OsTrustSummary::explaining`).
 fn upload_send_error(error: reqwest::Error, os_trust: &OsTrustSummary) -> anyhow::Error {
     let message = upload_failure_message(os_trust.explaining(&error));
     anyhow::Error::new(error).context(message)
@@ -1922,7 +1922,7 @@ stack backtrace:
         );
     }
 
-    /// Testing lens: of several wrapper logs the newest (by modification
+    /// Of several wrapper logs the newest (by modification
     /// time) is the one carried, cut to the size cap.
     #[test]
     fn the_report_carries_the_newest_wrapper_log() {
@@ -1956,7 +1956,7 @@ stack backtrace:
         assert!(tail.lines().all(|line| line == "newest"), "{tail}");
     }
 
-    /// Round-3 review, item 5: the Windows wrapper writes `freenet update`'s
+    /// The Windows wrapper writes `freenet update`'s
     /// output to `freenet-wrapper.YYYY-MM-DD.log`, which the node-log pattern
     /// never matched. The report carries the newest one's end, cut at a line.
     #[test]

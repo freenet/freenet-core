@@ -2884,7 +2884,7 @@ mod tests {
         assert!(flat.contains("claim_update_attempt_unless_cooling_at(&dir,env!(\"CARGO_PKG_VERSION\"),SystemTime::now(),)"));
     }
 
-    /// #5799 review: the check the version-less triggers make before staging
+    /// #5799: the check the version-less triggers make before staging
     /// agrees with the claim and spends nothing, so a stay keeps a locked-out
     /// node's daily retry for the next real exit.
     #[test]
@@ -2917,7 +2917,7 @@ mod tests {
         );
     }
 
-    /// #5799 review: while a release cools down the re-poll is pulled in to
+    /// #5799: while a release cools down the re-poll is pulled in to
     /// the cooldown's end plus up to 5 minutes, never pushed out, and calling
     /// it again changes nothing.
     #[test]

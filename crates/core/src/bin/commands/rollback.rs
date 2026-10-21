@@ -2887,7 +2887,7 @@ mod tests {
         got[0] == 1
     }
 
-    /// #5799 review (Codex P2): while a record is being rewritten, another
+    /// #5799: while a record is being rewritten, another
     /// process (the updater, a tray "Check for Updates") cannot take the
     /// record lock, so it waits instead of losing the increment. Checked from
     /// a forked child at that moment, not by timing, which contention from
@@ -3127,7 +3127,7 @@ mod tests {
         let hour = std::time::Duration::from_secs(3600);
         hold_update_without_counting_at(dir, "0.2.141", "skipped", now, 0.5);
         let first = read_update_cooldown_at(dir).unwrap();
-        // #5799 review: a hold on a fresh record counts nothing.
+        // #5799: a hold on a fresh record counts nothing.
         assert_eq!((first.version.as_str(), first.failures), ("0.2.141", 0));
         assert_eq!(first.hold_reason.as_deref(), Some("skipped"));
         assert!(update_cooldown_remaining_at(dir, "0.2.141", now).is_some());
@@ -3150,7 +3150,7 @@ mod tests {
         hold_update_without_counting_at(dir, "0.2.141", "skipped", later, 0.5);
         let held = read_update_cooldown_at(dir).unwrap();
         assert_eq!(held.failures, live.failures);
-        // #5799 review: the real error survives the hold, for the report.
+        // #5799: the real error survives the hold, for the report.
         assert_eq!(held.last_error, "real");
         assert_eq!(held.hold_reason.as_deref(), Some("skipped"));
         assert!(update_cooldown_remaining_at(dir, "0.2.141", later).is_some());
@@ -3186,7 +3186,7 @@ mod tests {
         );
     }
 
-    /// #5799 review: temporaries a killed write left behind are swept at
+    /// #5799: temporaries a killed write left behind are swept at
     /// startup once an hour old, and only `atomic_write`'s own.
     /// The startup sweep removes only stale temporaries of the update
     /// records; the crash-loop rollback files' temporaries, and everything
@@ -3313,7 +3313,7 @@ mod tests {
     /// The download budget counts bytes per release per day, and fails open
     /// both ways: an unreadable record is nothing spent, an unwritable one
     /// loses the spend rather than blocking downloads.
-    /// Testing lens: the longest wait (4 h + 20%) is honoured to its end, and
+    /// The longest wait (4 h + 20%) is honoured to its end, and
     /// only a retry time beyond it reads as a bogus record. The window is
     /// pinned too.
     #[test]

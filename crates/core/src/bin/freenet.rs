@@ -1117,7 +1117,12 @@ async fn run_network_node_with_signals(
                             || "the Freenet state directory".to_string(),
                             |d| d.display().to_string(),
                         );
-                        eprintln!(
+                        // Not `eprintln!`, which panics when stderr cannot be
+                        // written (a full disk under the supervisor's log).
+                        use std::io::Write as _;
+                        #[allow(clippy::let_underscore_must_use)]
+                        let _ = writeln!(
+                            std::io::stderr(),
                             "Freenet: auto-update is LOCKED OUT on this node (repeated failed \
                          installs, #3934, or an unreadable failure counter). After failed installs it \
                          retries at most once a day; an unreadable counter stays locked until it can be read. Run `freenet \
@@ -3023,6 +3028,29 @@ mod tests {
         assert_eq!(
             all_sends, sends,
             "every send on update_tx must use the checked `let _ =` trigger form"
+        );
+    }
+
+    /// The update-check task writes to stderr only through calls that cannot
+    /// panic: `eprintln!` panics when stderr cannot be written (a full disk
+    /// under the supervisor's log), which would end the task, and with it
+    /// every later update check.
+    #[test]
+    fn the_update_task_never_panics_writing_stderr() {
+        let src = strip_line_comments(include_str!("freenet.rs"));
+        let task = fn_body(&src, "async fn run_network_node_with_signals(");
+        let start = task
+            .find("let update_check_task = GlobalExecutor::spawn(async move {")
+            .expect("update task");
+        let end = start
+            + task[start..]
+                .find("let result = tokio::select!")
+                .expect("end of the update task");
+        let region = &task[start..end];
+        assert!(region.contains("auto-update is LOCKED OUT"));
+        assert!(
+            !region.contains(concat!("eprint", "ln!(")),
+            "the update task must not use eprintln!"
         );
     }
 

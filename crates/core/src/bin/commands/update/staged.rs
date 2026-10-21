@@ -791,7 +791,7 @@ where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Result<String>>,
 {
-    // #5799 review: before the poll token and the lookup. While any newer
+    // Checked before the poll token and the lookup (#5799): while any newer
     // release cools down the triggers wait, and the lookup would only find it.
     if let Some((version, left)) = root.parent().and_then(|dir| {
         super::super::rollback::update_cooldown_pending_at(dir, current_version, clock())
@@ -2357,7 +2357,7 @@ mod tests {
             &'a dyn Fn(&str) -> bool,
         );
         // `stage_into_with` names no target, as the version-less triggers do:
-        // with nothing to install they stay (#5799 review), since the updater
+        // with nothing to install they stay (#5799), since the updater
         // would find nothing to do.
         let cases: [(Case<'_>, Staging); 3] = [
             (
@@ -2752,7 +2752,7 @@ mod tests {
 
     /// A failed tag lookup stays: the updater's first step is the same lookup.
     /// It counts toward the fallback whether or not the trigger knew a
-    /// release (#5799 review): against the named one, else the newer one on
+    /// release (#5799): against the named one, else the newer one on
     /// record, else a sentinel that every trigger treats as pending.
     #[tokio::test]
     async fn a_failed_tag_lookup_stays_and_counts_toward_the_fallback() {
@@ -2878,7 +2878,7 @@ mod tests {
         assert!(flat.contains("Some(dir)=>claim_update_attempt_at(&dir,SystemTime::now()),"));
     }
 
-    /// #5799 review: while any newer release cools down, staging stops
+    /// #5799: while any newer release cools down, staging stops
     /// before it spends a poll token or looks the tag up, whether or not the
     /// trigger named a release.
     #[tokio::test]
@@ -3067,7 +3067,7 @@ mod tests {
         to.duration_since(from).unwrap().as_secs_f64() / 3600.0
     }
 
-    /// #5799 review: a day of persistent failures on the real schedule. The
+    /// #5799: a day of persistent failures on the real schedule. The
     /// waits are 1 h and 2 h, the third failure exits for the updater, and
     /// every attempt after that exits again, about 4 h apart (the updater fails
     /// the same download and records it too). A download ceiling that counted
@@ -3113,7 +3113,7 @@ mod tests {
         }
     }
 
-    /// #5799 review: the network heals at t0+4 h, after the third failure
+    /// #5799: the network heals at t0+4 h, after the third failure
     /// exited. The next scheduled run stages the release; nothing left over
     /// from the outage holds it back.
     #[tokio::test]
@@ -3218,7 +3218,7 @@ mod tests {
         (prefix, runs, bytes)
     }
 
-    /// #5799 review: the byte budget binds when downloads keep starting over,
+    /// #5799: the byte budget binds when downloads keep starting over,
     /// stops the run that reaches it mid-download, and from then on refuses
     /// runs before any request. Each refusal COUNTS as a failure, so the
     /// fallback still fires on the third.
@@ -3276,7 +3276,7 @@ mod tests {
         assert!(cooldown(&root).unwrap().last_error.contains("budget"));
     }
 
-    /// #5799 review: with the cooldown taken out of the picture before every
+    /// #5799: with the cooldown taken out of the picture before every
     /// run, the poll bucket still bounds staging's requests (one token per run,
     /// 8 then one per 10 minutes) and the byte budget its bytes.
     #[tokio::test]
@@ -3340,7 +3340,7 @@ mod tests {
         assert_eq!(runs.load(SeqCst), 5);
     }
 
-    /// #5799 review: a run spends ONE token from the poll bucket, however many
+    /// #5799: a run spends ONE token from the poll bucket, however many
     /// attempts it makes, so a fully failing run cannot drain the bucket that
     /// detection shares, and running short mid-run never turns a real network
     /// failure into a "throttled" run that counts nothing.
@@ -3402,7 +3402,7 @@ mod tests {
         );
     }
 
-    /// #5799 review: a staging run that stays names the real cause, not
+    /// #5799: a staging run that stays names the real cause, not
     /// "GitHub could not be reached" for all of them, and the fdev-only path
     /// (which exits to install) checks for the staged freenet archive before
     /// anything is logged, so it never reports a failure.
@@ -3445,7 +3445,7 @@ mod tests {
         );
     }
 
-    /// #5799 review: a staged archive is one whose bytes match the cached
+    /// #5799: a staged archive is one whose bytes match the cached
     /// manifest, not merely a file that exists.
     #[tokio::test]
     async fn a_staged_archive_must_match_its_manifest() {
@@ -3538,7 +3538,7 @@ mod tests {
         }
     }
 
-    /// Testing lens: the exits that leave the download to the updater
+    /// The exits that leave the download to the updater
     /// because the cache is busy or cannot be locked record first, like every
     /// other exit.
     #[tokio::test]
@@ -3566,7 +3566,7 @@ mod tests {
         );
     }
 
-    /// Testing lens: a run the empty poll bucket stops holds the release and
+    /// A run the empty poll bucket stops holds the release and
     /// counts nothing, however often it happens; only a run that reached the
     /// network (or that the byte budget refused) counts.
     #[tokio::test]
@@ -3605,7 +3605,7 @@ mod tests {
         }
     }
 
-    /// Testing lens: the budget's size and window are pinned, and a release
+    /// The budget's size and window are pinned, and a release
     /// whose freenet archive is already staged is not refused by a spent
     /// budget: there is nothing left to download, so it exits to install.
     #[tokio::test]
