@@ -1264,8 +1264,9 @@ pub(crate) enum ConnectionAcquisitionStrategy {
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn test_topology() {
+    /// Runs the clustered-requests scenario and returns
+    /// `(best_candidate_location, best_density_location)`.
+    fn run_topology_scenario() -> (Location, Location) {
         const NUM_REQUESTS: usize = 5_000;
         let mut topology_manager = TopologyManager::new(Limits {
             max_upstream_bandwidth: Rate::new_per_second(1000.0),
@@ -1304,8 +1305,6 @@ mod tests {
         let best_candidate_location = topology_manager
             .get_best_candidate_location(&this_peer_location)
             .unwrap();
-        // Should be half way between 0.3 and 0.4 as that is where the most requests were.
-        assert_eq!(best_candidate_location, Location::new(0.35));
 
         // Find the location with the highest density score across 0.0 to 1.0
         let mut best_score = 0.0;
@@ -1323,10 +1322,52 @@ mod tests {
                 best_location = candidate_location;
             }
         }
+        (best_candidate_location, best_location)
+    }
+
+    /// Seed for `test_topology`. The scenario below is a statistical test over random
+    /// request locations, so it must run from a fixed seed to be deterministic.
+    const TOPOLOGY_TEST_SEED: u64 = 0x70B0_0001;
+
+    /// Seed that makes the unseeded version of `test_topology` fail (found by sweeping
+    /// seeds 0..40_000; 14 of them fail, ~0.035%).
+    const TOPOLOGY_TIE_BREAK_SEED: u64 = 4069;
+
+    #[test]
+    fn test_topology() {
+        // The requests are centred on 0.39, just below the 0.4 neighbor. A sample is
+        // attributed to its nearest neighbor, so the neighbors at 0.3, 0.4 and 0.5 get
+        // counts c3, c4, c5 and the two candidate midpoints score c3 + c4 (0.35) and
+        // c4 + c5 (0.45). 0.35 wins exactly when c3 > c5, i.e. when more samples fall
+        // more than 0.04 below the peer than more than 0.06 above it. That holds in
+        // expectation but not for every draw, so the RNG has to be seeded.
+        let _guard = GlobalRng::seed_guard(TOPOLOGY_TEST_SEED);
+        let (best_candidate_location, best_location) = run_topology_scenario();
+
+        // Should be half way between 0.3 and 0.4, the pair of neighbors that attracted
+        // the most requests.
+        assert_eq!(best_candidate_location, Location::new(0.35));
 
         // Best location should be 0.4 as that is closest to 0.39 which is the peer's location and
         // the request epicenter
         assert_eq!(best_location, Location::new(0.4));
+    }
+
+    /// Regression test for the `test_topology` flake: the scenario must be a pure function
+    /// of the seed, and the tail draw that used to fail (c5 > c3, so the 0.45 midpoint
+    /// wins) must reproduce exactly instead of appearing at random.
+    #[test]
+    fn test_topology_scenario_is_deterministic_for_a_fixed_seed() {
+        for seed in [TOPOLOGY_TEST_SEED, TOPOLOGY_TIE_BREAK_SEED] {
+            let first = GlobalRng::scoped_seed(seed, run_topology_scenario);
+            let second = GlobalRng::scoped_seed(seed, run_topology_scenario);
+            assert_eq!(first, second, "scenario diverged for seed {seed}");
+        }
+        assert_eq!(
+            GlobalRng::scoped_seed(TOPOLOGY_TIE_BREAK_SEED, run_topology_scenario),
+            (Location::new(0.45), Location::new(0.4)),
+            "the seed that reproduces the original flake no longer does"
+        );
     }
 
     /// Generates a random location that is close to the current peer location with a small
@@ -1345,6 +1386,7 @@ mod tests {
     }
 
     use super::*;
+    use crate::config::GlobalRng;
     use crate::ring::Distance;
     use std::time::Duration;
 
