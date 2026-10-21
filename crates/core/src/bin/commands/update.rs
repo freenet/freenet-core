@@ -1013,10 +1013,9 @@ impl UpdateCommand {
                 fdev_asset,
                 &fdev_asset_name,
                 &checksums,
-                temp_dir.path(),
+                (temp_dir.path(), meter),
                 staged_fdev,
                 &current_exe,
-                meter,
             )
             .await;
         } else if !self.quiet {
@@ -1179,10 +1178,9 @@ impl UpdateCommand {
         asset: &Asset,
         asset_name: &str,
         checksums: &Option<Checksums>,
-        temp_dir: &Path,
+        (temp_dir, meter): (&Path, &staged::ByteMeter<'_>),
         staged_archive: Option<PathBuf>,
         freenet_exe: &Path,
-        meter: &staged::ByteMeter<'_>,
     ) {
         let archive_path = match staged_archive {
             Some(path) => path,
