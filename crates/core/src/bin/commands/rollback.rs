@@ -3534,7 +3534,9 @@ mod tests {
     fn the_longest_cooldown_is_honoured_to_its_edge() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path();
-        let now = SystemTime::now();
+        // A whole second, so the first moment's remaining wait is exactly the
+        // longest one.
+        let now = UNIX_EPOCH + std::time::Duration::from_secs(unix_secs(SystemTime::now()));
         let minutes = |m: u64| std::time::Duration::from_secs(m * 60);
         for _ in 0..3 {
             record_update_failure_at(dir, "0.2.141", "x", now, 1.0);
