@@ -273,11 +273,39 @@ fn fsync_dir(dir: &Path) {
 /// half-written marker/pin that mis-drives the rollback decision.
 fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     use std::io::Write;
-    atomic_write_with(path, bytes, |file, bytes| file.write_all(bytes))
+    let dir = path.parent().context("path has no parent directory")?;
+    std::fs::create_dir_all(dir).ok();
+    let file_name = path
+        .file_name()
+        .context("path has no file name")?
+        .to_string_lossy();
+    let tmp = dir.join(format!(".{file_name}.tmp"));
+    {
+        let mut f = std::fs::File::create(&tmp).context("create temp for atomic write")?;
+        f.write_all(bytes).context("write temp for atomic write")?;
+        f.sync_all().context("fsync temp for atomic write")?;
+    }
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        let _rm = std::fs::remove_file(&tmp);
+        return Err(e).context("rename temp into place");
+    }
+    fsync_dir(dir);
+    Ok(())
 }
 
-/// [`atomic_write`] with the write injected, so the cleanup is testable.
-fn atomic_write_with(
+/// [`atomic_write`] for the update records (#5799), which the node, the
+/// updater and a tray "Check for Updates" can write at once: each write uses
+/// its own temporary name, so one never renames another's half-written bytes
+/// into place. The crash-loop rollback files keep [`atomic_write`]'s fixed
+/// name, which their writers never share.
+fn atomic_write_record(path: &Path, bytes: &[u8]) -> Result<()> {
+    use std::io::Write;
+    atomic_write_record_with(path, bytes, |file, bytes| file.write_all(bytes))
+}
+
+/// [`atomic_write_record`] with the write injected, so the cleanup is
+/// testable.
+fn atomic_write_record_with(
     path: &Path,
     bytes: &[u8],
     write: impl FnOnce(&mut std::fs::File, &[u8]) -> std::io::Result<()>,
@@ -288,9 +316,6 @@ fn atomic_write_with(
         .file_name()
         .context("path has no file name")?
         .to_string_lossy();
-    // Unique per process and call: the node, the updater and a tray "Check
-    // for Updates" can write the same file at once, and a shared temporary
-    // name would let one rename another's half-written bytes into place.
     static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let tmp = dir.join(format!(".{file_name}.{}.{seq}.tmp", std::process::id()));
@@ -313,51 +338,42 @@ fn atomic_write_with(
     Ok(())
 }
 
-/// Every file [`atomic_write`] writes in the state directory. Only their
-/// temporaries are swept; `atomic_writes_name_only_swept_files` keeps this
-/// list complete.
-const ATOMIC_FILES: [&str; 5] = [
-    PROBATION_FILE,
-    KNOWN_BAD_FILE,
-    INSTALL_FAILURES_FILE,
-    UPDATE_COOLDOWN_FILE,
-    STAGED_DOWNLOADS_FILE,
-];
+/// Every file [`atomic_write_record`] writes in the state directory. Only
+/// their temporaries are swept; `record_writes_name_only_swept_files` keeps
+/// this list complete.
+const RECORD_FILES: [&str; 2] = [UPDATE_COOLDOWN_FILE, STAGED_DOWNLOADS_FILE];
 /// How old a temporary must be before the sweep removes it: far longer than
 /// any write takes, so a write in progress in another process is never hit.
 const STALE_TEMP_AGE: std::time::Duration = std::time::Duration::from_secs(3600);
 
-/// Whether `name` is a temporary [`atomic_write`] makes for one of
-/// [`ATOMIC_FILES`]: `.{file}.{pid}.{seq}.tmp`, or `.{file}.tmp` as releases
-/// before #5799 named it.
-fn is_atomic_temp(name: &str) -> bool {
-    ATOMIC_FILES.iter().any(|file| {
+/// Whether `name` is a temporary [`atomic_write_record`] makes for one of
+/// [`RECORD_FILES`]: `.{file}.{pid}.{seq}.tmp`.
+fn is_record_temp(name: &str) -> bool {
+    RECORD_FILES.iter().any(|file| {
         name.strip_prefix('.')
             .and_then(|rest| rest.strip_prefix(*file))
             .and_then(|rest| rest.strip_suffix(".tmp"))
-            .is_some_and(|middle| {
-                middle.is_empty()
-                    || middle.strip_prefix('.').is_some_and(|ids| {
-                        ids.split_once('.').is_some_and(|(pid, seq)| {
-                            [pid, seq]
-                                .iter()
-                                .all(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
-                        })
-                    })
+            .and_then(|middle| middle.strip_prefix('.'))
+            .and_then(|ids| ids.split_once('.'))
+            .is_some_and(|(pid, seq)| {
+                [pid, seq]
+                    .iter()
+                    .all(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
             })
     })
 }
 
-/// Remove [`atomic_write`] temporaries in `dir` older than [`STALE_TEMP_AGE`]
-/// and return how many. A unique name is never reused, so a temporary left by
-/// a SIGKILL or a power loss mid-write would otherwise stay for good.
+/// Remove [`atomic_write_record`] temporaries in `dir` older than
+/// [`STALE_TEMP_AGE`] and return how many. A unique name is never reused, so
+/// a temporary left by a SIGKILL or a power loss mid-write would otherwise
+/// stay for good. Nothing else in the directory is touched.
 pub(crate) fn sweep_stale_atomic_temps_at(dir: &Path, now: SystemTime) -> usize {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return 0;
     };
     entries
         .flatten()
-        .filter(|entry| entry.file_name().to_str().is_some_and(is_atomic_temp))
+        .filter(|entry| entry.file_name().to_str().is_some_and(is_record_temp))
         .filter(|entry| {
             entry
                 .metadata()
@@ -1145,7 +1161,7 @@ fn write_update_cooldown_at(
     };
     let written = serde_json::to_vec(&state)
         .context("serialize update cooldown")
-        .and_then(|raw| atomic_write(&dir.join(UPDATE_COOLDOWN_FILE), &raw));
+        .and_then(|raw| atomic_write_record(&dir.join(UPDATE_COOLDOWN_FILE), &raw));
     if let Err(e) = &written {
         tracing::warn!(version, error = %e, "Failed to persist the update cooldown (#5799)");
     }
@@ -1186,8 +1202,9 @@ pub(crate) fn record_update_failure_at(
 const RECORD_LOCK_FILE: &str = "update_records.lock";
 /// How long a writer waits for the record lock before going ahead without
 /// it. Holders only read and rewrite a small file, so this is only reached if
-/// one is wedged; losing one update to a race then costs one attempt.
-const RECORD_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
+/// one is wedged; losing one update to a race then costs one attempt. Short,
+/// because the wait blocks its thread and staging writes from async code.
+const RECORD_LOCK_WAIT: std::time::Duration = std::time::Duration::from_millis(100);
 
 /// Run `f`, a read-modify-write of the records in `dir`, with them locked
 /// against every other writer: other threads by a mutex, other processes (the
@@ -1499,7 +1516,7 @@ fn add_staged_download_bytes_locked(dir: &Path, version: &str, bytes: u64, now: 
     };
     let written = serde_json::to_vec(&next)
         .context("serialize staged downloads")
-        .and_then(|raw| atomic_write(&dir.join(STAGED_DOWNLOADS_FILE), &raw));
+        .and_then(|raw| atomic_write_record(&dir.join(STAGED_DOWNLOADS_FILE), &raw));
     if let Err(e) = written {
         tracing::warn!(version, error = %e, "Failed to record staged download bytes (#5799)");
     }
@@ -2757,8 +2774,11 @@ mod tests {
         let dir = tmp.path();
         record_install_failure_at(dir, "0.2.90");
         assert!(read_install_failures_at(dir).is_some());
-        // Any temp name: since #5799 the name is unique per call, so checking
-        // one fixed spelling could never fail.
+        let leftover_tmp = dir.join(format!(".{INSTALL_FAILURES_FILE}.tmp"));
+        assert!(
+            !leftover_tmp.exists(),
+            "atomic_write must not leave a temp file behind"
+        );
         assert_eq!(temp_files(dir), Vec::<String>::new());
     }
 
@@ -2774,7 +2794,7 @@ mod tests {
     fn a_failed_atomic_write_leaves_no_temp_file() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path();
-        let failed = atomic_write_with(&dir.join(UPDATE_COOLDOWN_FILE), b"x", |_, _| {
+        let failed = atomic_write_record_with(&dir.join(UPDATE_COOLDOWN_FILE), b"x", |_, _| {
             Err(std::io::Error::other("disk full"))
         });
         assert!(failed.is_err());
@@ -2783,6 +2803,8 @@ mod tests {
         let target = dir.join("occupied");
         std::fs::create_dir(&target).unwrap();
         std::fs::write(target.join("x"), b"x").unwrap();
+        assert!(atomic_write_record(&target, b"x").is_err());
+        assert_eq!(temp_files(dir), Vec::<String>::new());
         assert!(atomic_write(&target, b"x").is_err());
         assert_eq!(temp_files(dir), Vec::<String>::new());
     }
@@ -2879,6 +2901,9 @@ mod tests {
         with_record_lock(dir, || probes.push(another_process_can_lock(dir)));
         probes.push(another_process_can_lock(dir));
         assert_eq!(probes, [false, true], "locked while held, free after");
+        // The wait for the lock blocks its thread, and staging writes from
+        // async code, so it stays short.
+        assert!(RECORD_LOCK_WAIT <= std::time::Duration::from_millis(100));
     }
 
     /// Every failure writes a cooldown for the release that failed, whatever
@@ -3163,19 +3188,26 @@ mod tests {
 
     /// #5799 review: temporaries a killed write left behind are swept at
     /// startup once an hour old, and only `atomic_write`'s own.
+    /// The startup sweep removes only stale temporaries of the update
+    /// records; the crash-loop rollback files' temporaries, and everything
+    /// else in the state directory, are left alone.
     #[test]
-    fn stale_atomic_write_temporaries_are_swept() {
+    fn stale_record_temporaries_are_swept_and_nothing_else() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path();
         let swept = [
             format!(".{UPDATE_COOLDOWN_FILE}.123.0.tmp"),
-            format!(".{INSTALL_FAILURES_FILE}.9.41.tmp"),
-            format!(".{KNOWN_BAD_FILE}.tmp"),
+            format!(".{STAGED_DOWNLOADS_FILE}.9.41.tmp"),
         ];
         let kept = [
             ".unrelated.json.123.0.tmp".to_string(),
             format!(".{UPDATE_COOLDOWN_FILE}.12x.0.tmp"),
             format!(".{UPDATE_COOLDOWN_FILE}.1.2.3.tmp"),
+            format!(".{UPDATE_COOLDOWN_FILE}.tmp"),
+            format!(".{INSTALL_FAILURES_FILE}.9.41.tmp"),
+            format!(".{INSTALL_FAILURES_FILE}.tmp"),
+            format!(".{KNOWN_BAD_FILE}.tmp"),
+            format!(".{PROBATION_FILE}.tmp"),
             UPDATE_COOLDOWN_FILE.to_string(),
         ];
         for name in swept.iter().chain(&kept) {
@@ -3200,39 +3232,37 @@ mod tests {
         assert_eq!(left, expected);
     }
 
-    /// The sweep's list of `atomic_write` files is discovered from the source,
-    /// not trusted: every file this module writes through `atomic_write` must
-    /// be in it, so a new record cannot leak temporaries.
+    /// Which writer each file uses is discovered from the source, not
+    /// trusted: the update records go through `atomic_write_record`, whose
+    /// temporaries the sweep knows, and the crash-loop rollback files through
+    /// the original `atomic_write`, which the sweep never touches.
     #[test]
-    fn atomic_writes_name_only_swept_files() {
+    fn record_writes_name_only_swept_files() {
         let src = include_str!("rollback.rs").replace("\r\n", "\n");
         let production = src
             .split_once(concat!("#[cfg(test)]\n", "mod tests {"))
             .unwrap()
             .0;
         let flat: String = production.split_whitespace().collect();
-        let needle = concat!("atomic_write", "(&dir.join(");
-        let mut seen = 0;
-        for (at, _) in flat.match_indices(needle) {
-            let name = &flat[at + needle.len()..];
-            let name = &name[..name.find(')').unwrap()];
-            seen += 1;
-            assert!(
-                ATOMIC_FILES.iter().any(|f| {
-                    // The constant's identifier, matched against its value.
-                    name == match *f {
-                        PROBATION_FILE => "PROBATION_FILE",
-                        KNOWN_BAD_FILE => "KNOWN_BAD_FILE",
-                        INSTALL_FAILURES_FILE => "INSTALL_FAILURES_FILE",
-                        UPDATE_COOLDOWN_FILE => "UPDATE_COOLDOWN_FILE",
-                        STAGED_DOWNLOADS_FILE => "STAGED_DOWNLOADS_FILE",
-                        _ => "",
-                    }
-                }),
-                "`atomic_write` writes {name}, which the temp sweep does not know"
-            );
-        }
-        assert_eq!(seen, ATOMIC_FILES.len(), "each swept file is written once");
+        let written = |writer: &str| -> Vec<String> {
+            let needle = format!("{writer}(&dir.join(");
+            flat.match_indices(&needle)
+                .map(|(at, _)| {
+                    let name = &flat[at + needle.len()..];
+                    name[..name.find(')').unwrap()].to_string()
+                })
+                .collect()
+        };
+        let mut records = written(concat!("atomic_write", "_record"));
+        records.sort();
+        assert_eq!(records, ["STAGED_DOWNLOADS_FILE", "UPDATE_COOLDOWN_FILE"]);
+        assert_eq!(RECORD_FILES, [UPDATE_COOLDOWN_FILE, STAGED_DOWNLOADS_FILE]);
+        let mut rollback_files = written(concat!("atomic", "_write"));
+        rollback_files.sort();
+        assert_eq!(
+            rollback_files,
+            ["INSTALL_FAILURES_FILE", "KNOWN_BAD_FILE", "PROBATION_FILE"]
+        );
     }
 
     #[test]
