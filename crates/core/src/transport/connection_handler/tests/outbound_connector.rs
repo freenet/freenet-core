@@ -30,7 +30,9 @@ async fn connect_queues_the_start_and_passes_the_transport_error_through() {
     let (key, addr) = remote();
     let connector: &dyn OutboundConnector = &handler;
 
-    let pending = connector.connect(key.clone(), addr).await;
+    let pending = connector
+        .connect(key.clone(), addr, NatAttemptOrigin::ConnectAcceptor)
+        .await;
 
     assert!(handler.expected_non_gateway.contains(&addr.ip()));
     let (
@@ -38,10 +40,16 @@ async fn connect_queues_the_start_and_passes_the_transport_error_through() {
         ConnectionEvent::ConnectionStart {
             remote_public_key,
             open_connection,
+            origin,
         },
     ) = queue.recv().await.expect("a start is queued");
     assert_eq!(queued_addr, addr);
     assert_eq!(remote_public_key, key);
+    assert_eq!(
+        origin,
+        NatAttemptOrigin::ConnectAcceptor,
+        "origin passes through"
+    );
 
     open_connection
         .send(Err(TransportError::ProtocolVersionMismatch {
@@ -67,7 +75,9 @@ async fn connect_reports_an_abandoned_attempt_as_an_establishment_failure() {
     let (key, addr) = remote();
     let connector: &dyn OutboundConnector = &handler;
 
-    let pending = connector.connect(key, addr).await;
+    let pending = connector
+        .connect(key, addr, NatAttemptOrigin::RingPeerNoTransport)
+        .await;
     drop(queue.recv().await.expect("a start is queued"));
 
     let Err(err) = pending.await else {
@@ -87,7 +97,11 @@ async fn connect_reports_a_closed_transport_as_channel_closed() {
     let (key, addr) = remote();
     let connector: &dyn OutboundConnector = &handler;
 
-    let Err(err) = connector.connect(key, addr).await.await else {
+    let Err(err) = connector
+        .connect(key, addr, NatAttemptOrigin::RingPeerNoTransport)
+        .await
+        .await
+    else {
         panic!("expected a failure");
     };
     assert!(matches!(err, TransportError::ChannelClosed), "{err:?}");

@@ -70,7 +70,11 @@ async fn udp_handle_shares_one_expected_ip_set_and_reports_the_listener() {
 
     let outbound_addr: SocketAddr = "192.0.2.11:1000".parse().unwrap();
     let _pending = connector
-        .connect(TransportKeypair::new().public().clone(), outbound_addr)
+        .connect(
+            TransportKeypair::new().public().clone(),
+            outbound_addr,
+            NatAttemptOrigin::RingPeerNoTransport,
+        )
         .await;
     assert!(expected.contains(&outbound_addr.ip()), "connect");
 

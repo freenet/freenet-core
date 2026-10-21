@@ -203,7 +203,23 @@ the listener-to-connection queue (`inbound_queue_depth_hwm`, `_drops`) and
 inbound stream refusals / evictions by reason (`inbound_stream_<label>`, one
 per `InboundStreamOutcome`; the never-reset twin feeds the opt-in OTel
 `freenet.transport.inbound_stream_limits`, which must not observe the period
-counters). Hot
+counters), NAT traversals by why they were started (`nat_attempts_<label>`,
+`nat_established_<label>`, one per `NatAttemptOrigin`, and `origin` on each
+`nat_fail_samples` entry; the origin is threaded internally from each
+`NodeEvent::ConnectPeer` through `OutboundConnector::connect` and
+`ConnectionStart`, never on the wire; a dial to a configured gateway is
+always `gateway`, and `ring_peer_no_transport` is the event loop's dial to a
+ring peer whose transport was lost, since cached-peer joins never dial
+(#5954)), intro packets a non-gateway drops as unknown (`stray_intro_<label>`:
+the exact address's traversal timed out (no_response, undecryptable or
+incomplete; not other failures) in the last 10 s,
+a traversal to another port of the IP is running (endpoint-dependent mapping
+OR another peer behind the same IP, e.g. CGNAT; it cannot tell them apart), or
+neither; the recent failures are a listener-owned table bounded by count and
+TTL, and early evictions are counted in `stray_intro_failures_evicted`) and CONNECT
+joiner dial-queue waits (`dial_queue_wait_<label>`, coarse buckets around the
+3 s punch window). Each label set is declared once in a `labelled_counters!`
+list, so a new variant needs a snapshot field. Hot
 path writes are single relaxed atomics; `SentPacketTracker` keeps an
 `rto_expiries` count and a bounded per-stream final-ACK watch, both
 observation only.
@@ -609,7 +625,8 @@ created from its declared length.
     in TRANSPORT_METRICS (cumulative_inbound_stream_outcomes, OTel
     freenet.transport.inbound_stream_limits) and per period in the
     transport_snapshot inbound_stream_<label> fields. A new reason is added
-    once, in the inbound_stream_outcomes! list; it then needs a snapshot field.
+    once, in the InboundStreamOutcome labelled_counters! list; it then needs a
+    snapshot field.
   - A complete operations stream is retired from streaming_handles and the
     registry at once, so only its consumers hold the charge.
   - LockFreeStreamBuffer::insert claims the slot BEFORE reserving bytes, so

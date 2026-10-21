@@ -878,6 +878,9 @@ pub(crate) enum NodeEvent {
         tx: Transaction,
         callback: tokio::sync::mpsc::Sender<ConnectResult>,
         is_gw: bool,
+        /// Why this dial is made (telemetry only; a configured gateway is
+        /// tagged `Gateway` whatever is passed here).
+        origin: crate::transport::NatAttemptOrigin,
     },
     Disconnect {
         cause: Option<Cow<'static, str>>,

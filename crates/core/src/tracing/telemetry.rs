@@ -2809,6 +2809,70 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                 "inbound_stream_evicted_age".into(),
                 serde_json::json!(snapshot.inbound_stream_evicted_age),
             );
+            m.insert(
+                "nat_attempts_connect_joiner".into(),
+                serde_json::json!(snapshot.nat_attempts_connect_joiner),
+            );
+            m.insert(
+                "nat_attempts_connect_acceptor".into(),
+                serde_json::json!(snapshot.nat_attempts_connect_acceptor),
+            );
+            m.insert(
+                "nat_attempts_gateway".into(),
+                serde_json::json!(snapshot.nat_attempts_gateway),
+            );
+            m.insert(
+                "nat_attempts_ring_peer_no_transport".into(),
+                serde_json::json!(snapshot.nat_attempts_ring_peer_no_transport),
+            );
+            m.insert(
+                "nat_established_connect_joiner".into(),
+                serde_json::json!(snapshot.nat_established_connect_joiner),
+            );
+            m.insert(
+                "nat_established_connect_acceptor".into(),
+                serde_json::json!(snapshot.nat_established_connect_acceptor),
+            );
+            m.insert(
+                "nat_established_gateway".into(),
+                serde_json::json!(snapshot.nat_established_gateway),
+            );
+            m.insert(
+                "nat_established_ring_peer_no_transport".into(),
+                serde_json::json!(snapshot.nat_established_ring_peer_no_transport),
+            );
+            m.insert(
+                "stray_intro_after_deadline".into(),
+                serde_json::json!(snapshot.stray_intro_after_deadline),
+            );
+            m.insert(
+                "stray_intro_same_ip_other_port".into(),
+                serde_json::json!(snapshot.stray_intro_same_ip_other_port),
+            );
+            m.insert(
+                "stray_intro_other".into(),
+                serde_json::json!(snapshot.stray_intro_other),
+            );
+            m.insert(
+                "stray_intro_failures_evicted".into(),
+                serde_json::json!(snapshot.stray_intro_failures_evicted),
+            );
+            m.insert(
+                "dial_queue_wait_lt_100ms".into(),
+                serde_json::json!(snapshot.dial_queue_wait_lt_100ms),
+            );
+            m.insert(
+                "dial_queue_wait_lt_1s".into(),
+                serde_json::json!(snapshot.dial_queue_wait_lt_1s),
+            );
+            m.insert(
+                "dial_queue_wait_lt_3s".into(),
+                serde_json::json!(snapshot.dial_queue_wait_lt_3s),
+            );
+            m.insert(
+                "dial_queue_wait_ge_3s".into(),
+                serde_json::json!(snapshot.dial_queue_wait_ge_3s),
+            );
             serde_json::Value::Object(m)
         }
         EventKind::InterestSync(interest_sync_event) => {
@@ -6448,6 +6512,54 @@ mod tests {
                 .cloned()
                 .collect();
         assert_eq!(actual, expected);
+    }
+
+    /// As below, for the NAT-origin, stray-intro and dial-queue counts:
+    /// each is distinct and non-zero, so a swapped or mis-keyed one is caught.
+    #[test]
+    fn transport_snapshot_json_carries_nat_origin_values() {
+        let snapshot = crate::transport::metrics::TransportSnapshot {
+            nat_attempts_connect_joiner: 1,
+            nat_attempts_connect_acceptor: 2,
+            nat_attempts_gateway: 3,
+            nat_attempts_ring_peer_no_transport: 5,
+            nat_established_connect_joiner: 6,
+            nat_established_connect_acceptor: 7,
+            nat_established_gateway: 8,
+            nat_established_ring_peer_no_transport: 10,
+            stray_intro_after_deadline: 11,
+            stray_intro_same_ip_other_port: 12,
+            stray_intro_other: 13,
+            stray_intro_failures_evicted: 18,
+            dial_queue_wait_lt_100ms: 14,
+            dial_queue_wait_lt_1s: 15,
+            dial_queue_wait_lt_3s: 16,
+            dial_queue_wait_ge_3s: 17,
+            ..Default::default()
+        };
+        let reference = serde_json::to_value(&snapshot).unwrap();
+        let json = event_kind_to_json(&super::super::EventKind::TransportSnapshot(snapshot));
+        for (key, expected) in [
+            ("nat_attempts_connect_joiner", 1),
+            ("nat_attempts_connect_acceptor", 2),
+            ("nat_attempts_gateway", 3),
+            ("nat_attempts_ring_peer_no_transport", 5),
+            ("nat_established_connect_joiner", 6),
+            ("nat_established_connect_acceptor", 7),
+            ("nat_established_gateway", 8),
+            ("nat_established_ring_peer_no_transport", 10),
+            ("stray_intro_after_deadline", 11),
+            ("stray_intro_same_ip_other_port", 12),
+            ("stray_intro_other", 13),
+            ("stray_intro_failures_evicted", 18),
+            ("dial_queue_wait_lt_100ms", 14),
+            ("dial_queue_wait_lt_1s", 15),
+            ("dial_queue_wait_lt_3s", 16),
+            ("dial_queue_wait_ge_3s", 17),
+        ] {
+            assert_eq!(json[key], expected, "event-log value for {key}");
+            assert_eq!(json[key], reference[key], "serde value for {key}");
+        }
     }
 
     /// The key set is not enough: the event-log JSON must also carry each

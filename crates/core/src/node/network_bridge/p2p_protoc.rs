@@ -1896,6 +1896,7 @@ impl P2pConnManager {
                                             tx,
                                             callback,
                                             is_gw,
+                                            origin: unconnected_dial_origin(is_gw),
                                         }),
                                     ) {
                                         // `err` owns the ConnectPeer event (and thus the
@@ -2468,6 +2469,7 @@ impl P2pConnManager {
                                 tx,
                                 callback,
                                 is_gw: transient,
+                                origin,
                             } => {
                                 tracing::debug!(
                                     tx = %tx,
@@ -2484,6 +2486,7 @@ impl P2pConnManager {
                                     &handshake_cmd_sender,
                                     &mut state,
                                     transient,
+                                    origin,
                                 )
                                 .await?;
                             }
@@ -3080,6 +3083,21 @@ fn orphan_transaction(
         crate::config::GlobalTestMetrics::record_pending_op_remove();
     }
     live_tx_tracker.remove_finished_transaction(tx);
+}
+
+/// The origin of the event loop's dial for a message to a peer it has no
+/// transport to. The target is a configured gateway or a peer the ring still
+/// lists (`peek_target_peer` always returns `None` since #4110, so nothing
+/// else reaches the dial), so a non-gateway target is a ring peer whose
+/// transport was lost. The message may be from any op: a relayed request, a
+/// reply, or our own CONNECT request routed through that peer (for example
+/// by `acquire_new`). Cached-peer joins never reach this dial (#5954).
+fn unconnected_dial_origin(is_gw: bool) -> crate::transport::NatAttemptOrigin {
+    if is_gw {
+        crate::transport::NatAttemptOrigin::Gateway
+    } else {
+        crate::transport::NatAttemptOrigin::RingPeerNoTransport
+    }
 }
 
 /// What to tell the event loop when `msg`, waiting for a connection to
@@ -4143,33 +4161,7 @@ pub(crate) mod tests {
     /// event loop, which has no harness here.
     #[test]
     fn the_resend_waiter_reports_only_a_message_it_did_not_send() {
-        const SOURCE: &str = include_str!("p2p_protoc.rs");
-        // Scoped to the event-loop function that holds both drop sites: a
-        // whole-file scrape could match these literals anywhere.
-        let signature = "async fn run_event_listener_with_transport(";
-        let start = SOURCE.find(signature).expect("event-loop function renamed");
-        let tests_at = SOURCE
-            .find("\n#[cfg(test)]\npub(crate) mod tests")
-            .expect("tests");
-        assert!(start < tests_at, "the anchor must be production code");
-        let open = start + SOURCE[start..].find('{').expect("function body");
-        let bytes = SOURCE.as_bytes();
-        let (mut depth, mut end) = (0i32, open);
-        for (i, b) in bytes.iter().enumerate().skip(open) {
-            match b {
-                b'{' => depth += 1,
-                b'}' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        end = i;
-                        break;
-                    }
-                }
-                _ => {}
-            }
-        }
-        assert!(end > open && end < tests_at, "unbalanced body slice");
-        let code: String = SOURCE[open..end].split_whitespace().collect();
+        let code = event_loop_code();
         let own = "&ctx.bridge.op_manager.ring.connection_manager.pub_key,";
         let notice = code
             .find(&format!(
@@ -4193,6 +4185,69 @@ pub(crate) mod tests {
             .expect("the full/closed branch must end an unsent CONNECT's driver");
         let cont = code[dropped..].find("continue;").expect("the branch ends");
         assert!(inline < cont, "before the branch moves on");
+    }
+
+    /// The event-loop function `run_event_listener_with_transport`, with all
+    /// whitespace removed. Scoped to that function: a whole-file scrape could
+    /// match a literal anywhere, including in these tests.
+    fn event_loop_code() -> String {
+        const SOURCE: &str = include_str!("p2p_protoc.rs");
+        let signature = "async fn run_event_listener_with_transport(";
+        let start = SOURCE.find(signature).expect("event-loop function renamed");
+        let tests_at = SOURCE
+            .find("\n#[cfg(test)]\npub(crate) mod tests")
+            .expect("tests");
+        assert!(start < tests_at, "the anchor must be production code");
+        let open = start + SOURCE[start..].find('{').expect("function body");
+        let bytes = SOURCE.as_bytes();
+        let (mut depth, mut end) = (0i32, open);
+        for (i, b) in bytes.iter().enumerate().skip(open) {
+            match b {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = i;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        assert!(end > open && end < tests_at, "unbalanced body slice");
+        SOURCE[open..end].split_whitespace().collect()
+    }
+
+    /// The event loop's dial for a message with no transport is `Gateway`
+    /// for a gateway and `RingPeerNoTransport` otherwise.
+    #[test]
+    fn an_unconnected_dial_is_tagged_by_its_target() {
+        use crate::transport::NatAttemptOrigin;
+        assert_eq!(
+            super::unconnected_dial_origin(true),
+            NatAttemptOrigin::Gateway
+        );
+        assert_eq!(
+            super::unconnected_dial_origin(false),
+            NatAttemptOrigin::RingPeerNoTransport
+        );
+    }
+
+    /// Source pin: the event loop's dial for a message with no connection
+    /// is tagged by `unconnected_dial_origin` (the event loop has no harness
+    /// here). The call must be the `origin:` field of that `ConnectPeer`.
+    #[test]
+    fn the_unconnected_dial_uses_unconnected_dial_origin() {
+        let code = event_loop_code();
+        let dispatch = code
+            .find("P2pBridgeEvent::NodeAction(NodeEvent::ConnectPeer{peer:target_peer.clone(),tx,callback,is_gw,")
+            .expect("the unconnected-dial ConnectPeer");
+        assert!(
+            code[dispatch..].starts_with(
+                "P2pBridgeEvent::NodeAction(NodeEvent::ConnectPeer{peer:target_peer.clone(),tx,callback,is_gw,origin:unconnected_dial_origin(is_gw),}),"
+            ),
+            "the dial's origin must come from unconnected_dial_origin"
+        );
     }
 
     /// A fake [`super::ContractPresenceOracle`] for testing
