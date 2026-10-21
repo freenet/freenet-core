@@ -3451,6 +3451,30 @@ mod tests {
         assert_eq!(runs.load(SeqCst), requests, "a held run makes no request");
     }
 
+    /// A staged copy that fails its checksum does not get past a spent
+    /// budget either: the run holds without counting, and makes no archive
+    /// request.
+    #[tokio::test]
+    async fn a_spent_budget_holds_when_the_staged_copy_is_damaged() {
+        let freenet = freenet_asset_name();
+        let manifest = manifest_for(&[(&freenet, b"archive")]);
+        let server = serve_release(manifest.as_bytes(), None, &[]);
+        let (_tmp, root) = test_root();
+        write_staged(
+            &root,
+            &[(MANIFEST, manifest.as_bytes()), (&freenet, b"damaged")],
+        );
+        let now = SystemTime::now();
+        super::super::super::rollback::charge_download_bytes_at(
+            root.parent().unwrap(),
+            u64::MAX,
+            now,
+        );
+        let outcome = stage_at(&root, &server.url_str("/"), now).await;
+        assert_eq!(outcome, Staging::Throttled);
+        assert_eq!(cooldown(&root).unwrap().failures, 0);
+    }
+
     /// A spent budget holds an install that stages nothing (a macOS app
     /// bundle) too, before the lookup.
     #[tokio::test]
