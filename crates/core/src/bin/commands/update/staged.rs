@@ -32,9 +32,10 @@
 //! every update trigger checks before it asks GitHub anything. Every exit
 //! records first too, including the exit to install a staged release (a
 //! successful install clears it), because systemd may kill the updater before
-//! it records anything. Three failures of one release in a row, or one that
-//! cannot be recorded, exit anyway: a fault here can delay an update but never
-//! prevent one.
+//! it records anything. A lookup that finds nothing newer to install never
+//! exits: the updater would find nothing either. Three failures of one release
+//! in a row, or one that cannot be recorded, exit anyway: a fault here can
+//! delay an update but never prevent one.
 //!
 //! Staging's GitHub traffic has a hard ceiling that does not depend on any of
 //! that: every staging run spends one token from the node's persisted poll
@@ -598,7 +599,8 @@ async fn stage_latest_release_inner(
 #[derive(Debug, PartialEq)]
 enum Staging {
     /// Nothing downloaded, for a reason that leaves the download to the
-    /// updater (low disk, cache locked, nothing newer to install).
+    /// updater (low disk, cache locked, an install that stages nothing).
+    /// Recorded before the exit, like every exit.
     Skipped,
     Staged,
     /// Failed in a way another attempt would repeat: the release fails
@@ -610,8 +612,8 @@ enum Staging {
     /// The release is cooling down; nothing was attempted. The node stays.
     CoolingDown,
     /// The tag lookup found nothing newer to install, or only a release this
-    /// node has blocked (#4073), for a trigger that named no release. The
-    /// node stays: the updater would find nothing to do.
+    /// node has blocked (#4073). The node stays: the updater would find
+    /// nothing to do. A release the trigger named is held without counting.
     NothingToInstall,
     /// The node's poll bucket was empty, so the run never reached the network.
     /// The node stays, holding the release without counting a failure.
@@ -759,15 +761,23 @@ where
     // A tag that passes this is a semver version, so `tag_dir` will accept it;
     // `stage_release_at` checks again regardless.
     if !should_stage(&tag, current_version, blocked) {
-        tracing::info!(tag = %tag, "No newer installable release to download in advance");
-        // A trigger that named a release exits as before; the updater decides.
-        // One that did not (the isolation timeout, the max-backoff fallback)
-        // would only exit for an updater that finds nothing to do, so it
-        // stays (#5799); both restart their own wait on a stay.
-        return Err(match target {
-            Some(_) => Staging::Skipped,
-            None => Staging::NothingToInstall,
-        });
+        tracing::info!(tag = %tag, "No newer installable release to download in advance; staying on the current version");
+        // An exit would only reach an updater that finds nothing to install,
+        // so the node stays (#5799). A trigger that named a release holds it
+        // without counting: when the lookup and the trigger's check disagree
+        // (the API and the redirect can briefly report different releases),
+        // the next trigger would otherwise name it again at once. The two
+        // version-less triggers restart their own wait on a stay.
+        if let (Some(version), Some(dir)) = (target, root.parent()) {
+            super::super::rollback::hold_update_without_counting_at(
+                dir,
+                version,
+                "the release lookup found no newer installable release",
+                clock(),
+                freenet::config::GlobalRng::random_range(0.0_f64..1.0),
+            );
+        }
+        return Err(Staging::NothingToInstall);
     }
     Ok(tag)
 }
@@ -2258,8 +2268,9 @@ mod tests {
         // Only the low-disk exit had a release to install, and it records
         // first, in case the updater is killed before it can (#5799).
         assert_eq!(cooldown(&root).map(|r| r.failures), Some(1));
-        // A trigger that named a release still exits when there is nothing
-        // newer: the updater decides.
+        // A trigger that named a release stays too, and holds that release
+        // without counting, so the next trigger does not name it again at
+        // once.
         let (_tmp, root) = test_root();
         let prefix = server.url_str("/");
         let outcome = stage_into(
@@ -2271,7 +2282,20 @@ mod tests {
             &test_env(&prefix),
         )
         .await;
-        assert_eq!(outcome, Staging::Skipped);
+        assert_eq!(outcome, Staging::NothingToInstall);
+        assert!(!outcome.preparation().should_exit());
+        let record = cooldown(&root).expect("held");
+        assert_eq!((record.version.as_str(), record.failures), ("9.9.9", 0));
+        assert!(record.hold_reason.is_some());
+        assert!(
+            super::super::super::rollback::update_cooldown_pending_at(
+                root.parent().unwrap(),
+                "9.9.8",
+                SystemTime::now()
+            )
+            .is_some(),
+            "the triggers hold"
+        );
     }
 
     /// `stage_latest_release` is the only entry point the node calls; the
