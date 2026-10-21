@@ -552,9 +552,15 @@ USE: LockFreeStreamBuffer (AtomicPtr<Bytes> slots, 256-slot chunks
   - Lock-free insertion
   - Ordered delivery to consumer
 
-Legacy (non-operations) streams use InboundStream only; operations streams
-use StreamHandle/StreamRegistry/orphan registry only. Never feed one stream
-to both.
+Three stream types, never mixed:
+  - inbound_stream::InboundStream: the UDP transport's reassembler for its
+    OWN streams (oversized messages, StreamId::next_transport_internal).
+    Transport-internal.
+  - StreamHandle (with StreamRegistry): the UDP transport's handle for
+    caller-named streams (StreamId::next). Transport-internal.
+  - boundary::IncomingStream: what the registry, operations and node see.
+    Above the transport, use only this; it wraps a StreamHandle today.
+Never feed one stream to both reassembly paths.
 ```
 
 ### WHEN admitting or sending a stream

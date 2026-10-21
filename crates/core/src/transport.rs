@@ -339,7 +339,7 @@ impl From<SocketAddr> for ObservedAddr {
     }
 }
 
-pub use self::boundary::InboundStream;
+pub use self::boundary::IncomingStream;
 pub(crate) use self::boundary::TransportHandle;
 pub(crate) use self::boundary::{
     CloseReason, InboundAcceptor, InboundExpectations, InboundStreamRegistry, ListenerExit,

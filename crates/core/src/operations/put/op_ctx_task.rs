@@ -9195,14 +9195,18 @@ mod streaming_relay_failure_tests {
         let announced = contract(label.as_bytes());
         let registry = op_manager.orphan_stream_registry();
         let register = |bytes: Vec<u8>| {
-            registry.register_orphan(upstream, stream_id, complete_stream(stream_id, &bytes));
+            registry.register_test_orphan(upstream, stream_id, complete_stream(stream_id, &bytes));
             bytes.len() as u64
         };
         let total_size = match fault {
             Fault::ClaimTimeout => 4096,
             Fault::AssemblyStall => {
                 let size = op_manager.streaming_threshold as u64 + 4096;
-                registry.register_orphan(upstream, stream_id, StreamHandle::new(stream_id, size));
+                registry.register_test_orphan(
+                    upstream,
+                    stream_id,
+                    StreamHandle::new(stream_id, size),
+                );
                 size
             }
             Fault::UndecodablePayload => register(vec![0xAB; 64]),
@@ -9316,7 +9320,7 @@ mod streaming_relay_failure_tests {
         let announced = contract(label.as_bytes());
         let bytes = payload(&announced, 64);
         let registry = op_manager.orphan_stream_registry();
-        registry.register_orphan(upstream, stream_id, complete_stream(stream_id, &bytes));
+        registry.register_test_orphan(upstream, stream_id, complete_stream(stream_id, &bytes));
         let _claimed = registry
             .claim_or_wait(upstream, stream_id, Duration::from_secs(1))
             .await
@@ -9358,7 +9362,7 @@ mod streaming_relay_failure_tests {
         let stream_id = StreamId::next();
         let announced = contract(label.as_bytes());
         let bytes = payload(&announced, op_manager.streaming_threshold + 4096);
-        op_manager.orphan_stream_registry().register_orphan(
+        op_manager.orphan_stream_registry().register_test_orphan(
             upstream,
             stream_id,
             complete_stream(stream_id, &bytes),
@@ -9410,7 +9414,7 @@ mod streaming_relay_failure_tests {
         let stream_id = StreamId::next();
         let announced = contract(label.as_bytes());
         let bytes = payload(&announced, 64);
-        op_manager.orphan_stream_registry().register_orphan(
+        op_manager.orphan_stream_registry().register_test_orphan(
             upstream,
             stream_id,
             complete_stream(stream_id, &bytes),

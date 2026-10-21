@@ -33,9 +33,17 @@
 //! - Stream ids are chosen by the SENDER ([`StreamId::next`]), not by the
 //!   transport: this is deliberate and stays (see [`StreamId`]).
 //! - [`InboundStreamRegistry`] is fragment-based (`Weak<LockFreeStreamBuffer>`).
-//! - [`InboundStream`] reports progress in fragments
-//!   ([`InboundStream::received_fragments`]), and its errors are
+//! - [`IncomingStream`] reports progress in fragments
+//!   ([`IncomingStream::received_fragments`]), and its errors are
 //!   `StreamError`.
+//! - [`IncomingStream::total_bytes`] assumes a length declared up front. UDP
+//!   carries it in every fragment; under QUIC the per-stream header that
+//!   carries the [`StreamId`] would carry it too.
+//! - [`IncomingStream::fork`] promises an independent reader that replays the
+//!   stream from its start, so a QUIC transport would need a tee buffer.
+//! - There is no transport-neutral incremental read: a stream can only be
+//!   piped onward through `into_udp`, so a relay that receives on one
+//!   transport and forwards on another cannot be written yet.
 //! - Why a connection closed is read out of band, through
 //!   [`PeerConnectionApi::close_reason`] after `recv` fails, rather than
 //!   carried by the error.
@@ -297,9 +305,9 @@ pub(crate) enum CloseReason {
 /// transport's reassembly handle, and a second transport would turn it into
 /// an enum or a trait object without changing this API.
 #[derive(Clone, Debug)]
-pub struct InboundStream(StreamHandle);
+pub struct IncomingStream(StreamHandle);
 
-impl InboundStream {
+impl IncomingStream {
     /// Total length the sender declared for the stream, in bytes.
     pub fn total_bytes(&self) -> u64 {
         self.0.total_bytes()
@@ -350,7 +358,7 @@ impl InboundStream {
     }
 }
 
-impl From<StreamHandle> for InboundStream {
+impl From<StreamHandle> for IncomingStream {
     fn from(handle: StreamHandle) -> Self {
         Self(handle)
     }
@@ -386,7 +394,7 @@ pub(crate) trait InboundStreamRegistry: Send + Sync {
         &self,
         peer_addr: SocketAddr,
         stream_id: StreamId,
-        stream: InboundStream,
+        stream: IncomingStream,
     );
 
     /// The connection from `peer_addr` is gone: cancel the streams among
@@ -485,7 +493,7 @@ pub(crate) trait PeerConnectionApi: Send {
     /// arrives.
     ///
     /// Unlike `send_stream_data`, which takes complete data, this reads from an
-    /// [`InboundStream`] and forwards it incrementally without waiting for full
+    /// [`IncomingStream`] and forwards it incrementally without waiting for full
     /// reassembly. This enables low-latency forwarding at intermediate nodes.
     ///
     /// The `outbound_stream_id` should be created via `StreamId::next()` for
@@ -493,7 +501,7 @@ pub(crate) trait PeerConnectionApi: Send {
     fn pipe_stream_data(
         &mut self,
         outbound_stream_id: StreamId,
-        inbound_handle: InboundStream,
+        inbound_handle: IncomingStream,
         metadata: Option<bytes::Bytes>,
         progress: Option<std::sync::Arc<dyn StreamProgressObserver>>,
     ) -> std::pin::Pin<Box<dyn Future<Output = Result<(), TransportError>> + Send + '_>>;
@@ -540,8 +548,8 @@ mod stream_id_tests {
 }
 
 #[cfg(test)]
-mod inbound_stream_tests {
-    use super::{InboundStream, StreamId};
+mod incoming_stream_tests {
+    use super::{IncomingStream, StreamId};
     use crate::transport::StreamError;
     use crate::transport::peer_connection::streaming::StreamHandle;
     use crate::transport::peer_connection::streaming_buffer::FRAGMENT_PAYLOAD_SIZE;
@@ -558,12 +566,12 @@ mod inbound_stream_tests {
         (handle, payload)
     }
 
-    /// Each `InboundStream` method reports what the UDP handle it wraps
+    /// Each `IncomingStream` method reports what the UDP handle it wraps
     /// reports.
     #[tokio::test]
-    async fn inbound_stream_reads_the_udp_handle_it_wraps() {
+    async fn incoming_stream_reads_the_udp_handle_it_wraps() {
         let (handle, payload) = handle_with(3);
-        let stream = InboundStream::from(handle.clone());
+        let stream = IncomingStream::from(handle.clone());
 
         assert_eq!(stream.total_bytes(), handle.total_bytes());
         assert_eq!(stream.received_fragments(), handle.received_fragments());
@@ -586,11 +594,39 @@ mod inbound_stream_tests {
         );
     }
 
+    /// On a stream still arriving, the declared length, the units received
+    /// and the units expected are three different numbers, so none of them
+    /// can stand in for another.
+    #[test]
+    fn incoming_stream_reports_a_partial_stream_as_partial() {
+        let total = 3 * FRAGMENT_PAYLOAD_SIZE;
+        let handle = StreamHandle::new(StreamId::next(), total as u64);
+        handle
+            .push_fragment(1, bytes::Bytes::from(vec![7u8; FRAGMENT_PAYLOAD_SIZE]))
+            .unwrap();
+        let stream = IncomingStream::from(handle.clone());
+
+        assert_eq!(stream.total_bytes(), total as u64, "declared, not received");
+        assert_eq!(handle.received_bytes(), FRAGMENT_PAYLOAD_SIZE as u64);
+        assert_eq!(stream.received_fragments(), 1);
+        assert_eq!(stream.total_fragments(), handle.total_fragments());
+        assert!(stream.total_fragments() >= 3, "premise: more than received");
+    }
+
+    /// A stream does not claim another stream's buffer.
+    #[test]
+    fn incoming_stream_does_not_share_an_unrelated_buffer() {
+        let (handle, _) = handle_with(1);
+        let (other, _) = handle_with(1);
+        let stream = IncomingStream::from(handle);
+        assert!(!stream.shares_buffer(&other.buffer_weak()));
+    }
+
     /// Cancelling through the boundary type cancels the stream itself.
     #[tokio::test]
-    async fn inbound_stream_cancel_reaches_the_stream() {
+    async fn incoming_stream_cancel_reaches_the_stream() {
         let handle = StreamHandle::new(StreamId::next(), 10_000);
-        let stream = InboundStream::from(handle.clone());
+        let stream = IncomingStream::from(handle.clone());
         let forked = stream.fork();
         assert!(!stream.is_cancelled());
         stream.cancel();

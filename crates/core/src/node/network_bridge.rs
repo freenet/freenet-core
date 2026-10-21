@@ -85,7 +85,7 @@ pub(crate) trait NetworkBridge: Send + Sync {
     /// Pipe an inbound stream to a peer, forwarding fragments as they arrive.
     ///
     /// Unlike `send_stream` which takes complete data and fragments it, this forwards
-    /// data from an existing `InboundStream` incrementally without waiting for
+    /// data from an existing `IncomingStream` incrementally without waiting for
     /// full reassembly. This enables low-latency forwarding at intermediate nodes.
     ///
     /// The `outbound_stream_id` should be created via `StreamId::next()`.
@@ -93,7 +93,7 @@ pub(crate) trait NetworkBridge: Send + Sync {
         &self,
         target_addr: SocketAddr,
         outbound_stream_id: crate::transport::StreamId,
-        inbound_handle: crate::transport::InboundStream,
+        inbound_handle: crate::transport::IncomingStream,
         metadata: Option<bytes::Bytes>,
     ) -> impl Future<Output = ConnResult<()>> + Send;
 }

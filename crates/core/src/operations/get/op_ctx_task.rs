@@ -9104,7 +9104,7 @@ mod route_attempt_driver_tests {
             .expect("the fragment is accepted");
         op_manager
             .orphan_stream_registry()
-            .register_orphan(from, stream_id, handle);
+            .register_test_orphan(from, stream_id, handle);
     }
 
     fn streaming_header(
@@ -9372,9 +9372,11 @@ mod route_attempt_driver_tests {
             handle
                 .push_fragment(1, bytes::Bytes::from(payload))
                 .expect("fragment accepted");
-            op_manager
-                .orphan_stream_registry()
-                .register_orphan(addr(&peers[2]), stream_id, handle);
+            op_manager.orphan_stream_registry().register_test_orphan(
+                addr(&peers[2]),
+                stream_id,
+                handle,
+            );
 
             let hop = peers[2].clone();
             serve_attempts(
@@ -10360,9 +10362,11 @@ mod route_attempt_driver_tests {
         let handle =
             crate::transport::peer_connection::streaming::StreamHandle::new(stream_id, 4096);
         handle.cancel();
-        op_manager
-            .orphan_stream_registry()
-            .register_orphan(addr(&peers[0]), stream_id, handle);
+        op_manager.orphan_stream_registry().register_test_orphan(
+            addr(&peers[0]),
+            stream_id,
+            handle,
+        );
         let header_hop = peers[0].clone();
         serve_attempts(
             op_manager.clone(),
@@ -12656,9 +12660,11 @@ mod route_attempt_driver_tests {
         handle
             .push_fragment(1, bytes::Bytes::from(payload))
             .expect("fragment accepted");
-        op_manager
-            .orphan_stream_registry()
-            .register_orphan(addr(&peers[0]), stream_id, handle);
+        op_manager.orphan_stream_registry().register_test_orphan(
+            addr(&peers[0]),
+            stream_id,
+            handle,
+        );
         serve_attempts(
             op_manager.clone(),
             rx,
