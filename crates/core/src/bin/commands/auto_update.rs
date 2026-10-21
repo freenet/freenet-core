@@ -1052,6 +1052,10 @@ async fn get_latest_version() -> Result<String> {
 /// every write, which is rollback off for good; switching loses that stale
 /// state once and has working rollback from the next update on.
 pub(crate) fn state_dir() -> Option<PathBuf> {
+    #[cfg(test)]
+    if let Some(dir) = TEST_STATE_DIR.with(|dir| dir.borrow().clone()) {
+        return Some(dir);
+    }
     static RESOLVED: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
     RESOLVED
         .get_or_init(|| {
@@ -1061,6 +1065,42 @@ pub(crate) fn state_dir() -> Option<PathBuf> {
             )
         })
         .clone()
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The state directory [`state_dir`] returns on this test thread, set by
+    /// [`TestStateDir`]. Per thread, so a test that drives the wrappers over
+    /// the shared state directory never touches the developer's real one, nor
+    /// another test's.
+    static TEST_STATE_DIR: std::cell::RefCell<Option<PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Points [`state_dir`] at a fresh temporary directory on this thread until
+/// dropped. Async tests that use it must run on the test's own thread (the
+/// default current-thread `#[tokio::test]` runtime).
+#[cfg(test)]
+pub(crate) struct TestStateDir(tempfile::TempDir);
+
+#[cfg(test)]
+impl TestStateDir {
+    pub(crate) fn new() -> Self {
+        let tmp = tempfile::tempdir().expect("temporary state directory");
+        TEST_STATE_DIR.with(|dir| *dir.borrow_mut() = Some(tmp.path().to_path_buf()));
+        Self(tmp)
+    }
+
+    pub(crate) fn path(&self) -> &std::path::Path {
+        self.0.path()
+    }
+}
+
+#[cfg(test)]
+impl Drop for TestStateDir {
+    fn drop(&mut self) {
+        TEST_STATE_DIR.with(|dir| *dir.borrow_mut() = None);
+    }
 }
 
 /// Testable core of [`state_dir`]: `home` is the user's home directory and
@@ -2882,6 +2922,35 @@ mod tests {
             .split_whitespace()
             .collect();
         assert!(flat.contains("claim_update_attempt_unless_cooling_at(&dir,env!(\"CARGO_PKG_VERSION\"),SystemTime::now(),)"));
+    }
+
+    /// The shared-state-directory wrappers for the claim act on it (here a
+    /// per-thread temporary one, never the developer's real directory).
+    #[test]
+    fn the_claim_wrappers_act_on_the_state_dir() {
+        let state = TestStateDir::new();
+        assert!(update_attempt_claimable());
+        let now = lock_out(state.path()) + UPDATE_LOCKOUT_COOLDOWN;
+        assert!(
+            !update_attempt_claimable(),
+            "locked out, within the cooldown"
+        );
+        // Expire the lockout by its stamp: claimable, and the claim after
+        // staging spends the retry in that directory.
+        let stamp = (now - UPDATE_LOCKOUT_COOLDOWN * 2)
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        std::fs::File::options()
+            .write(true)
+            .open(state.path().join("update_failures"))
+            .unwrap()
+            .set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(stamp))
+            .unwrap();
+        assert!(update_attempt_claimable());
+        assert!(claim_update_attempt_after_staging().is_ok());
+        assert!(state.path().join(LOCKOUT_RETRY_FILE).exists());
+        assert!(claim_update_attempt_after_staging().is_err(), "spent");
     }
 
     /// #5799: the check the version-less triggers make before staging

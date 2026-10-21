@@ -2820,7 +2820,9 @@ mod tests {
             .map(|i| {
                 let dir = dir.clone();
                 std::thread::spawn(move || {
-                    for _ in 0..50 {
+                    // Few rounds: each write fsyncs under the process-wide
+                    // mutex, which other tests' writers queue behind.
+                    for _ in 0..10 {
                         record_update_failure_at(&dir, "0.2.141", &"e".repeat(i * 40), now, 0.5)
                             .expect("write");
                     }
@@ -2833,7 +2835,7 @@ mod tests {
         let record = read_update_cooldown_at(&dir).unwrap();
         assert_eq!(record.version, "0.2.141");
         // Every increment survived: the read-modify-write is locked (#5799).
-        assert_eq!(record.failures, 8 * 50);
+        assert_eq!(record.failures, 8 * 10);
         assert_eq!(temp_files(&dir), Vec::<String>::new());
     }
 
@@ -2904,6 +2906,221 @@ mod tests {
         // The wait for the lock blocks its thread, and staging writes from
         // async code, so it stays short.
         assert!(RECORD_LOCK_WAIT <= std::time::Duration::from_millis(100));
+    }
+
+    /// Concurrent byte counts all land: the read-modify-write of the budget
+    /// record is locked like the cooldown's.
+    #[test]
+    fn concurrent_byte_counts_all_land() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
+        let now = SystemTime::now();
+        let writers: Vec<_> = (0..8)
+            .map(|_| {
+                let dir = dir.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..10 {
+                        add_staged_download_bytes_at(&dir, "0.2.141", 1, now);
+                    }
+                })
+            })
+            .collect();
+        for w in writers {
+            w.join().unwrap();
+        }
+        assert_eq!(staged_download_bytes_at(&dir, "0.2.141", now), 80);
+    }
+
+    /// Concurrent record writes, each through its own temporary, never
+    /// publish a torn file and leave no temporary behind. (The rollback
+    /// files' `atomic_write` keeps its fixed temporary name; their writers
+    /// never run at once.)
+    #[test]
+    fn concurrent_record_writes_never_publish_a_torn_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join(UPDATE_COOLDOWN_FILE);
+        let writers: Vec<_> = (0..8u8)
+            .map(|i| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    let body = vec![b'a' + i; 64 * 1024];
+                    for _ in 0..5 {
+                        atomic_write_record(&path, &body).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for w in writers {
+            w.join().unwrap();
+        }
+        let got = std::fs::read(&path).unwrap();
+        assert_eq!(got.len(), 64 * 1024);
+        assert!(got.iter().all(|b| *b == got[0]), "torn file");
+        assert_eq!(temp_files(tmp.path()), Vec::<String>::new());
+    }
+
+    /// A forked child that takes the record lock in `dir`, holds it for
+    /// `hold_ms`, then writes one byte to the returned pipe and exits
+    /// (releasing the lock). The byte is written BEFORE the release, so a
+    /// writer that finds it readable once it holds the lock waited for the
+    /// child. Between fork and _exit the child makes only async-signal-safe
+    /// calls, as a fork of a threaded process must.
+    #[cfg(unix)]
+    fn child_holding_record_lock(dir: &Path, hold_ms: i64) -> (libc::pid_t, libc::c_int) {
+        use std::os::unix::ffi::OsStrExt;
+        let path =
+            std::ffi::CString::new(dir.join(RECORD_LOCK_FILE).as_os_str().as_bytes()).unwrap();
+        let (mut locked, mut released) = ([0i32; 2], [0i32; 2]);
+        // SAFETY: valid two-element arrays for pipe(2) to fill.
+        assert_eq!(unsafe { libc::pipe(locked.as_mut_ptr()) }, 0);
+        // SAFETY: as above.
+        assert_eq!(unsafe { libc::pipe(released.as_mut_ptr()) }, 0);
+        for fd in locked.into_iter().chain(released) {
+            // SAFETY: setting a flag on a descriptor we just created.
+            unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
+        }
+        // SAFETY: the child only calls async-signal-safe functions on data
+        // prepared before the fork, then _exits without unwinding.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed");
+        if pid == 0 {
+            // SAFETY: as above.
+            unsafe {
+                libc::alarm(30);
+                libc::close(locked[0]);
+                libc::close(released[0]);
+                let fd = libc::open(path.as_ptr(), libc::O_RDWR | libc::O_CREAT, 0o600);
+                let mut request: libc::flock = std::mem::zeroed();
+                request.l_type = libc::F_WRLCK as _;
+                request.l_whence = libc::SEEK_SET as _;
+                let got = [u8::from(
+                    fd >= 0 && libc::fcntl(fd, libc::F_SETLK, &request) == 0,
+                )];
+                libc::write(locked[1], got.as_ptr().cast(), 1);
+                let ts = libc::timespec {
+                    tv_sec: (hold_ms / 1000) as _,
+                    tv_nsec: ((hold_ms % 1000) * 1_000_000) as _,
+                };
+                libc::nanosleep(&ts, std::ptr::null_mut());
+                libc::write(released[1], got.as_ptr().cast(), 1);
+                libc::_exit(0);
+            }
+        }
+        let mut got = [0u8];
+        // SAFETY: closing the ends only the child uses, reading one byte, and
+        // making our read end of `released` non-blocking.
+        unsafe {
+            libc::close(locked[1]);
+            libc::close(released[1]);
+            let n = libc::read(locked[0], got.as_mut_ptr().cast(), 1);
+            libc::close(locked[0]);
+            assert!(n == 1 && got[0] == 1, "the child did not take the lock");
+            let flags = libc::fcntl(released[0], libc::F_GETFL);
+            libc::fcntl(released[0], libc::F_SETFL, flags | libc::O_NONBLOCK);
+        }
+        (pid, released[0])
+    }
+
+    /// Whether the child has signalled that it is releasing the lock.
+    #[cfg(unix)]
+    fn released(fd: libc::c_int) -> bool {
+        let mut byte = [0u8];
+        // SAFETY: a non-blocking one-byte read into a one-byte buffer.
+        unsafe { libc::read(fd, byte.as_mut_ptr().cast(), 1) == 1 }
+    }
+
+    /// Kill and reap the child, and close its pipe.
+    #[cfg(unix)]
+    fn reap(pid: libc::pid_t, fd: libc::c_int) {
+        let mut status = 0;
+        // SAFETY: killing and reaping our own child, closing our descriptor.
+        unsafe {
+            libc::kill(pid, libc::SIGKILL);
+            libc::waitpid(pid, &mut status, 0);
+            libc::close(fd);
+        }
+    }
+
+    /// Every record writer waits for a lock another process holds: each
+    /// finds the holder's "releasing" byte once it is let in. The holder lets
+    /// go after 20 ms, well inside the writer's 100 ms wait.
+    #[test]
+    #[cfg(unix)]
+    fn every_record_writer_waits_for_a_lock_another_process_holds() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let now = SystemTime::now();
+        let writers: [(&str, &dyn Fn()); 5] = [
+            ("failure", &|| {
+                record_update_failure_at(dir, "0.2.141", "x", now, 0.5);
+            }),
+            ("hold", &|| {
+                hold_update_without_counting_at(dir, "0.2.142", "held", now, 0.5)
+            }),
+            ("clear", &|| clear_update_cooldown_at(dir)),
+            ("clear sentinel", &|| clear_unknown_release_at(dir)),
+            ("bytes", &|| {
+                add_staged_download_bytes_at(dir, "0.2.141", 1, now)
+            }),
+        ];
+        for (what, write) in writers {
+            let (child, fd) = child_holding_record_lock(dir, 20);
+            write();
+            let waited = released(fd);
+            reap(child, fd);
+            assert!(waited, "the {what} writer waited for the holder");
+        }
+    }
+
+    /// A holder that never lets go does not block a writer for good: it
+    /// writes anyway (fail open) while the holder still holds the lock.
+    #[test]
+    #[cfg(unix)]
+    fn a_wedged_lock_holder_does_not_block_a_writer() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let (child, fd) = child_holding_record_lock(dir, 20_000);
+        let now = SystemTime::now();
+        let written = record_update_failure_at(dir, "0.2.141", "x", now, 0.5);
+        let still_held = !released(fd);
+        reap(child, fd);
+        assert_eq!(written, Some(1));
+        assert!(still_held, "written while the holder still held the lock");
+    }
+
+    /// The wrappers over the shared state directory act on it (here a
+    /// per-thread temporary one, never the developer's real directory).
+    #[test]
+    fn the_state_dir_wrappers_act_on_the_state_dir() {
+        let state = super::super::auto_update::TestStateDir::new();
+        let dir = state.path();
+        assert_eq!(update_cooldown_pending("0.2.140"), None);
+        assert_eq!(record_update_failure("0.2.141", "offline"), Some(1));
+        assert_eq!(read_update_cooldown_at(dir).unwrap().last_error, "offline");
+        let (version, _) = update_cooldown_pending("0.2.140").expect("pending");
+        assert_eq!(version, "0.2.141");
+        assert!(
+            update_cooldown_summary("0.2.140")
+                .unwrap()
+                .contains("offline")
+        );
+        hold_update_without_counting("0.2.142", "held");
+        assert_eq!(read_update_cooldown_at(dir).unwrap().version, "0.2.142");
+        clear_update_cooldown();
+        assert!(read_update_cooldown_at(dir).is_none());
+        // The startup sweep removes a stale record temporary there.
+        let stale = dir.join(format!(".{UPDATE_COOLDOWN_FILE}.1.2.tmp"));
+        std::fs::write(&stale, b"x").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&stale)
+            .unwrap()
+            .set_modified(SystemTime::now() - STALE_TEMP_AGE * 2)
+            .unwrap();
+        sweep_stale_atomic_temps();
+        assert!(!stale.exists());
+        // Never so short that a write in progress elsewhere could be hit.
+        assert!(STALE_TEMP_AGE >= std::time::Duration::from_secs(3600));
     }
 
     /// Every failure writes a cooldown for the release that failed, whatever
@@ -3310,9 +3527,6 @@ mod tests {
         );
     }
 
-    /// The download budget counts bytes per release per day, and fails open
-    /// both ways: an unreadable record is nothing spent, an unwritable one
-    /// loses the spend rather than blocking downloads.
     /// The longest wait (4 h + 20%) is honoured to its end, and
     /// only a retry time beyond it reads as a bogus record. The window is
     /// pinned too.
@@ -3326,6 +3540,10 @@ mod tests {
             record_update_failure_at(dir, "0.2.141", "x", now, 1.0);
         }
         assert_eq!(read_update_cooldown_at(dir).unwrap().failures, 3);
+        assert!(
+            update_cooldown_remaining_at(dir, "0.2.141", now).is_some(),
+            "the full 4.8 h is honoured from the first moment"
+        );
         assert!(update_cooldown_remaining_at(dir, "0.2.141", now + minutes(282)).is_some());
         assert!(update_cooldown_remaining_at(dir, "0.2.141", now + minutes(289)).is_none());
         assert_eq!(
@@ -3334,6 +3552,9 @@ mod tests {
         );
     }
 
+    /// The download budget counts bytes per release per day, and fails open
+    /// both ways: an unreadable record is nothing spent, an unwritable one
+    /// loses the spend rather than blocking downloads.
     #[test]
     fn staged_download_bytes_are_counted_per_release_per_day() {
         let tmp = tempfile::tempdir().unwrap();

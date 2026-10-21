@@ -633,30 +633,37 @@ async fn stage_latest_release_inner(
             .preparation();
         }
     }
-    let verify = |manifest: &[u8], signature: Option<&[u8]>| {
-        super::verify_release_manifest_signature(manifest, signature, true)
-    };
-    let env = StageEnv {
-        download_prefix: RELEASE_DOWNLOAD_PREFIX,
-        // Unknown off unix, where the check is skipped.
-        free: root.parent().and_then(free_bytes),
-        verify: &verify,
-        delays: &STAGE_RETRY_DELAYS,
-        lookup_delays: &LOOKUP_RETRY_DELAYS,
-        deadline: STAGE_DEADLINE,
-        clock: &SystemTime::now,
-        byte_budget: super::super::rollback::STAGED_DOWNLOAD_BYTES_PER_DAY,
-    };
     stage_into(
         &root,
         current_version,
         lookup,
         target,
         version_blocked,
-        &env,
+        &production_env(&root),
     )
     .await
     .preparation()
+}
+
+/// The release signature check staging runs over a downloaded manifest: the
+/// installer's own, quietly.
+fn verify_production(manifest: &[u8], signature: Option<&[u8]>) -> Result<()> {
+    super::verify_release_manifest_signature(manifest, signature, true)
+}
+
+/// The environment the node stages in, for the cache at `root`.
+fn production_env(root: &Path) -> StageEnv<'static> {
+    StageEnv {
+        download_prefix: RELEASE_DOWNLOAD_PREFIX,
+        // Unknown off unix, where the check is skipped.
+        free: root.parent().and_then(free_bytes),
+        verify: &verify_production,
+        delays: &STAGE_RETRY_DELAYS,
+        lookup_delays: &LOOKUP_RETRY_DELAYS,
+        deadline: STAGE_DEADLINE,
+        clock: &SystemTime::now,
+        byte_budget: super::super::rollback::STAGED_DOWNLOAD_BYTES_PER_DAY,
+    }
 }
 
 /// What [`stage_into`] did. Tests assert on it; production acts on
@@ -2448,6 +2455,127 @@ mod tests {
         );
     }
 
+    /// The environment the node really stages in, field by field, and the
+    /// wrappers that find the cache through the shared state directory (here
+    /// a per-thread temporary one, never the developer's real directory).
+    #[test]
+    fn the_node_stages_in_the_production_environment() {
+        use super::super::super::auto_update::TestStateDir;
+        use super::super::super::rollback::{
+            STAGED_DOWNLOAD_BYTES_PER_DAY, pin_known_bad_at, read_update_cooldown_at,
+        };
+        let state = TestStateDir::new();
+        let root = cache_root().expect("the cache sits in the state directory");
+        assert_eq!(root, state.path().join(CACHE_DIR));
+        let env = production_env(&root);
+        assert_eq!(env.download_prefix, RELEASE_DOWNLOAD_PREFIX);
+        assert_eq!(env.free, free_bytes(state.path()));
+        assert_eq!(env.delays, STAGE_RETRY_DELAYS);
+        assert_eq!(env.lookup_delays, LOOKUP_RETRY_DELAYS);
+        assert_eq!(env.deadline, STAGE_DEADLINE);
+        assert_eq!(env.byte_budget, STAGED_DOWNLOAD_BYTES_PER_DAY);
+        let wall = SystemTime::now();
+        let clock = (env.clock)();
+        let skew = clock.duration_since(wall).unwrap_or_else(|e| e.duration());
+        assert!(skew < Duration::from_secs(60), "the wall clock");
+        // The real signature check: a forged signature is refused.
+        assert!((env.verify)(b"manifest", Some(&[0u8; 64])).is_err());
+        // The #4073 block list the node passes reads the state directory.
+        assert!(!version_blocked("9.9.9"));
+        pin_known_bad_at(state.path(), "9.9.9").unwrap();
+        assert!(version_blocked("9.9.9"));
+        // A contained panic records against the state directory.
+        record_panic(Some("9.9.10"));
+        let record = read_update_cooldown_at(state.path()).unwrap();
+        assert!(record.last_error.contains("panicked"));
+        // An updater skip holds the staged release there.
+        write_staged(&root, &[(MANIFEST, b"m")]);
+        assert!(is_staged(TAG));
+        assert!(!is_staged("v9.9.10"));
+        hold_staged_release("skipped");
+        let record = read_update_cooldown_at(state.path()).unwrap();
+        assert_eq!((record.version.as_str(), record.failures), ("9.9.9", 0));
+    }
+
+    /// The byte budget covers every download in a staging run: fdev's, and
+    /// the from-zero re-download after a resumed archive fails its checksum.
+    #[tokio::test]
+    async fn the_byte_budget_covers_fdev_and_the_restarted_download() {
+        use super::super::super::rollback::staged_download_bytes_at;
+        let freenet = freenet_asset_name();
+        let fdev = fdev_asset_name();
+        let good = b"the freenet archive".to_vec();
+        let fdev_body = vec![b'f'; 5000];
+        // fdev's listed checksum never matches, so it is fetched once, counted
+        // and left to the updater.
+        let manifest = manifest_for(&[(&freenet, &good), (&fdev, b"the real fdev")]);
+        let server = serve_release(manifest.as_bytes(), None, &[(&fdev, &fdev_body)]);
+        // The freenet archive: a partial from an earlier upload is resumed
+        // (wrong bytes), then downloaded again from zero.
+        server.expect(
+            Expectation::matching(all_of![
+                request::method_path("GET", asset_path(&freenet)),
+                request::headers(contains(("range", "bytes=4-"))),
+            ])
+            .times(1)
+            .respond_with(
+                status_code(206)
+                    .append_header(
+                        "content-range",
+                        format!("bytes 4-{}/{}", good.len() - 1, good.len()),
+                    )
+                    .body(vec![b'x'; good.len() - 4]),
+            ),
+        );
+        server.expect(
+            Expectation::matching(all_of![
+                request::method_path("GET", asset_path(&freenet)),
+                not(request::headers(contains(key("range")))),
+            ])
+            .times(1)
+            .respond_with(status_code(200).body(good.clone())),
+        );
+        let (_tmp, root) = test_root();
+        let dir = root.parent().unwrap();
+        fs::create_dir_all(root.join(TAG)).unwrap();
+        fs::write(root.join(TAG).join(format!("{freenet}.part")), b"old!").unwrap();
+        let now = SystemTime::now();
+        let clock = move || now;
+        let meter = ByteMeter::charged_to(u64::MAX, dir, "9.9.9", &clock);
+        stage_release_at(&root, &server.url_str("/"), TAG, &unsigned, &meter)
+            .await
+            .expect("staged, fdev left to the updater");
+        meter.flush();
+        let resumed = (good.len() - 4) as u64;
+        assert_eq!(
+            staged_download_bytes_at(dir, "9.9.9", now),
+            resumed + good.len() as u64 + fdev_body.len() as u64
+        );
+    }
+
+    /// With today's budget spent and the freenet archive already staged, the
+    /// run exits to install it without requesting fdev either.
+    #[tokio::test]
+    async fn a_spent_budget_requests_no_fdev_and_still_installs() {
+        use super::super::super::rollback::add_staged_download_bytes_at;
+        let freenet = freenet_asset_name();
+        let fdev = fdev_asset_name();
+        let manifest = manifest_for(&[(&freenet, b"archive"), (&fdev, b"fdev")]);
+        // Manifest and signature only: an archive request fails the test.
+        let server = serve_release(manifest.as_bytes(), None, &[]);
+        let (_tmp, root) = test_root();
+        write_staged(
+            &root,
+            &[(MANIFEST, manifest.as_bytes()), (&freenet, b"archive")],
+        );
+        let now = SystemTime::now();
+        add_staged_download_bytes_at(root.parent().unwrap(), "9.9.9", u64::MAX, now);
+        assert_eq!(
+            stage_at(&root, &server.url_str("/"), now).await,
+            Staging::Staged
+        );
+    }
+
     #[test]
     fn tags_that_are_not_plain_path_components_are_refused() {
         let root = Path::new("/cache");
@@ -2679,6 +2807,8 @@ mod tests {
         let outcome = stage_once(&root, &never.url_str("/"), Duration::from_millis(1)).await;
         assert_eq!(outcome, Staging::Deferred);
         assert_eq!(cooldown(&root).map(|r| r.failures), Some(1));
+        let error = cooldown(&root).unwrap().last_error;
+        assert!(error.contains("did not finish"), "{error}");
     }
 
     /// A failure that cannot be recorded would never reach the fallback, so
@@ -3430,6 +3560,29 @@ mod tests {
             .split_once(concat!("#[cfg(test)]\n", "mod tests {"))
             .unwrap()
             .0;
+        // Each cause logs its own line. Behavioural log capture is avoided
+        // here: tracing caches callsite interest process-wide (#5314), so it
+        // can be blinded by other tests. Each arm is bounded by the next one.
+        let log = &production[production.find("\nfn log_transient_failure(").unwrap()..];
+        let log: String = log[..log.find("\n}\n").unwrap()]
+            .split_whitespace()
+            .collect();
+        let arms: Vec<&str> = log.split("FailureCause::").skip(1).collect();
+        for (arm, line) in [
+            (
+                "TimedOut(deadline)=>",
+                "timedout;alaterattemptresumesthepartialdownload",
+            ),
+            ("BudgetSpent=>", "today'sdownloadbudgetforitisspent"),
+            ("RateLimited=>", "GitHubrate-limitedthedownload"),
+            ("Unreachable=>", "GitHubcouldnotbereachedforit"),
+        ] {
+            let body = arms
+                .iter()
+                .find(|a| a.starts_with(arm))
+                .unwrap_or_else(|| panic!("no `{arm}` arm"));
+            assert!(body.contains(line), "`{arm}` must log `{line}`: {body}");
+        }
         let start = production.find("\nasync fn stage_into<").unwrap();
         let body = &production[start..];
         let body = &body[..body.find("\n}\n").unwrap()];
@@ -3601,8 +3754,32 @@ mod tests {
             )
             .await;
             assert_eq!(outcome, Staging::Throttled, "hour {hour}");
+            assert!(!outcome.preparation().should_exit(), "hour {hour}");
             assert_eq!(cooldown(&root).unwrap().failures, 0, "hour {hour}");
         }
+        // A trigger that names no release stays too, and has nothing to hold.
+        let (_tmp, root) = test_root();
+        let state_dir = root.parent().unwrap();
+        fs::create_dir_all(state_dir).unwrap();
+        let now = SystemTime::now();
+        let now_unix = now.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        fs::write(
+            state_dir.join("github_poll_bucket_node"),
+            format!("0 {now_unix}"),
+        )
+        .unwrap();
+        let outcome = stage_into(
+            &root,
+            "9.9.8",
+            || async { panic!("looked the tag up with an empty bucket") },
+            None,
+            |_: &str| false,
+            &test_env(&prefix),
+        )
+        .await;
+        assert_eq!(outcome, Staging::Throttled);
+        assert!(!outcome.preparation().should_exit());
+        assert!(cooldown(&root).is_none());
     }
 
     /// The budget's size and window are pinned, and a release

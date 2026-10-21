@@ -234,8 +234,29 @@ pub fn update_counter_action(outcome: UpdateSubprocessOutcome) -> UpdateCounterA
 /// supervisor's log (the journal, the Windows wrapper's log, the macOS
 /// wrapper's log) needs to show why an update did not happen.
 fn note_install_failure(version: &str, error: &str) {
-    let streak = super::rollback::record_update_failure(version, error);
-    stderr_line!("{}", install_failure_line(version, error, streak));
+    note_install_failure_at(
+        super::auto_update::state_dir().as_deref(),
+        version,
+        error,
+        std::time::SystemTime::now(),
+        &mut io::stderr(),
+    );
+}
+
+/// [`note_install_failure`] against the state directory `dir` (none: nothing
+/// recorded), writing its line to `out`.
+fn note_install_failure_at(
+    dir: Option<&Path>,
+    version: &str,
+    error: &str,
+    now: std::time::SystemTime,
+    out: &mut impl Write,
+) {
+    let rand_unit = freenet::config::GlobalRng::random_range(0.0_f64..1.0);
+    let streak =
+        dir.and_then(|dir| rollback::record_update_failure_at(dir, version, error, now, rand_unit));
+    #[allow(clippy::let_underscore_must_use)]
+    let _ = writeln!(out, "{}", install_failure_line(version, error, streak));
 }
 
 /// The stderr line for a failed install: the release, the streak when it
@@ -4484,6 +4505,43 @@ done
         assert!(holds_on_skip(false));
     }
 
+    /// A failed install records its error against the release and writes
+    /// the line the supervisor's log shows; without a state directory it
+    /// still writes the line, with no streak.
+    #[test]
+    fn a_noted_install_failure_records_and_reports_its_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let now = std::time::SystemTime::now();
+        let mut out = Vec::new();
+        for _ in 0..2 {
+            note_install_failure_at(Some(tmp.path()), "0.2.141", "disk full", now, &mut out);
+        }
+        let record = rollback::read_update_cooldown_at(tmp.path()).unwrap();
+        assert_eq!(
+            (
+                record.version.as_str(),
+                record.failures,
+                record.last_error.as_str()
+            ),
+            ("0.2.141", 2, "disk full")
+        );
+        let text = String::from_utf8(out).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 2);
+        assert!(
+            lines[1]
+                .starts_with("Freenet update to 0.2.141 failed (failure 2 in a row): disk full."),
+            "{text}"
+        );
+        let mut out = Vec::new();
+        note_install_failure_at(None, "0.2.141", "boom", now, &mut out);
+        assert!(
+            String::from_utf8(out)
+                .unwrap()
+                .starts_with("Freenet update to 0.2.141 failed: boom.")
+        );
+    }
+
     /// The line the supervisor's log shows names the release,
     /// the streak when it was recorded, and the whole error.
     #[test]
@@ -4569,7 +4627,10 @@ done
         let assets = region("\nasync fn fetch_release_assets(", "\n}\n");
         assert!(assets.contains("super::rollback::hold_update_without_counting("));
         let note = region("\nfn note_install_failure(", "\n}\n");
-        assert!(note.contains("super::rollback::record_update_failure(version,"));
+        assert!(note.contains(
+            "note_install_failure_at(super::auto_update::state_dir().as_deref(),version,error,\
+             std::time::SystemTime::now(),&mutio::stderr(),);"
+        ));
         let hold = region("\nfn hold_staged_release(", "\n}\n");
         assert!(hold.contains("staged::hold_staged_release(&format!(\"{error:#}\"));"));
     }

@@ -1954,6 +1954,8 @@ stack backtrace:
         let tail = read_wrapper_log_tail(&dir, 64).unwrap();
         assert!(tail.len() <= 64, "{}", tail.len());
         assert!(tail.lines().all(|line| line == "newest"), "{tail}");
+        // The report carries at most this much of it.
+        assert_eq!(MAX_WRAPPER_LOG_SIZE, 64 * 1024);
     }
 
     /// The Windows wrapper writes `freenet update`'s
