@@ -419,9 +419,12 @@ struct NatDetailCounters {
     #[cfg(test)]
     dial_queue_waits_by_remote:
         parking_lot::Mutex<std::collections::VecDeque<(SocketAddr, DialQueueWait)>>,
-    /// Test-only log of demultiplexed datagrams `(remote, class)` (bounded).
+    /// Test-only record of demultiplexed datagrams, kept only for the
+    /// remotes a test registered with `watch_demux`. Unwatched traffic costs
+    /// one lookup, so busy parallel tests cannot evict a watching test's
+    /// entries.
     #[cfg(test)]
-    demux_by_remote: parking_lot::Mutex<std::collections::VecDeque<(SocketAddr, DemuxClass)>>,
+    demux_watched: DashMap<SocketAddr, Vec<DemuxClass>>,
     /// Test-only log of dropped stray intros `(remote, kind)` (bounded).
     #[cfg(test)]
     stray_intros_by_remote:
@@ -789,17 +792,22 @@ impl TransportMetrics {
             .collect()
     }
 
-    /// Test-only: the demultiplexer classes recorded for datagrams from
-    /// `remote`.
+    /// Test-only: start recording the demultiplexer class of every datagram
+    /// from `remote`. Call before the datagrams are sent.
+    #[cfg(test)]
+    pub(crate) fn watch_demux(&self, remote: SocketAddr) {
+        self.nat_detail.demux_watched.entry(remote).or_default();
+    }
+
+    /// Test-only: the demultiplexer classes recorded, in order, for datagrams
+    /// from a `remote` registered with `watch_demux`.
     #[cfg(test)]
     pub(crate) fn demux_from(&self, remote: SocketAddr) -> Vec<DemuxClass> {
         self.nat_detail
-            .demux_by_remote
-            .lock()
-            .iter()
-            .filter(|(addr, _)| *addr == remote)
-            .map(|(_, class)| *class)
-            .collect()
+            .demux_watched
+            .get(&remote)
+            .map(|classes| classes.clone())
+            .unwrap_or_default()
     }
 
     /// Test-only: whether `reporter` has reported our external address.
@@ -1062,7 +1070,9 @@ impl TransportMetrics {
     /// classified it (`remote` is never exported).
     pub(crate) fn record_demux(&self, remote: SocketAddr, class: DemuxClass) {
         #[cfg(test)]
-        push_test_log(&self.nat_detail.demux_by_remote, (remote, class));
+        if let Some(mut watched) = self.nat_detail.demux_watched.get_mut(&remote) {
+            watched.push(class);
+        }
         #[cfg(not(test))]
         let _ = remote;
         self.demux_packets[class as usize].fetch_add(1, Ordering::Relaxed);

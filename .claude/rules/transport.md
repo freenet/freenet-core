@@ -220,8 +220,8 @@ TTL, and early evictions are counted in `stray_intro_failures_evicted`) and CONN
 joiner dial-queue waits (`dial_queue_wait_<label>`, coarse buckets around the
 3 s punch window) and inbound datagrams by first byte (`demux_<label>`, one per
 `DemuxClass`: `legacy` passes through, `quic` and `other` are counted and
-dropped; see "Socket Abstraction Rules"). Each label set is declared once in a `labelled_counters!`
-list, so a new variant needs a snapshot field. Hot
+dropped; see "Socket Abstraction Rules"). Each label set is declared once in a
+`labelled_counters!` list, so a new variant needs a snapshot field. Hot
 path writes are single relaxed atomics; `SentPacketTracker` keeps an
 `rto_expiries` count and a bounded per-stream final-ACK watch, both
 observation only.

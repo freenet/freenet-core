@@ -353,6 +353,8 @@ pub(crate) use self::connection_handler::ExpectedInboundTracker;
 pub use self::connection_handler::create_connection_handler;
 pub(crate) use self::connection_handler::{UdpTransportConfig, open_udp_transport};
 pub use self::crypto::{TransportKeypair, TransportPublicKey};
+/// Returned (wrapped around the socket type) by [`create_connection_handler`].
+pub use self::demux::DemuxSocket;
 pub use self::{
     connection_handler::{InboundConnectionHandler, OutboundConnectionHandler},
     peer_connection::PeerConnection,

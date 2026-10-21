@@ -44,6 +44,9 @@ pub(crate) fn classify(packet: &[u8]) -> DemuxClass {
 /// A [`Socket`] that hands the listener only the datagrams of the UDP
 /// transport and counts the rest.
 ///
+/// It is public because [`create_connection_handler`] returns handlers over
+/// `DemuxSocket<S>`; callers do not construct it.
+///
 /// It exists so a QUIC endpoint can use the same UDP port as the UDP
 /// transport (#5940). Until that endpoint exists, QUIC-shaped datagrams are
 /// dropped here and counted as `demux_quic`; datagrams that are neither are
@@ -53,6 +56,8 @@ pub(crate) fn classify(packet: &[u8]) -> DemuxClass {
 /// It wraps the socket below the [`Socket`] trait, so every implementation of
 /// the trait (the real UDP sockets and `SimulationSocket`) gets the same
 /// behaviour.
+///
+/// [`create_connection_handler`]: super::create_connection_handler
 pub struct DemuxSocket<S> {
     inner: S,
 }
@@ -66,6 +71,10 @@ impl<S: Socket> Socket for DemuxSocket<S> {
 
     /// Errors from the inner socket are returned unchanged, because the
     /// listener's receive error tracking depends on them.
+    ///
+    /// This returns only on a legacy datagram or an error. A dropped
+    /// datagram is therefore not seen by the listener at all, and no longer
+    /// counts as a successful read for its `RecvErrorTracker`.
     async fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
         let mut dropped_in_a_row: u32 = 0;
         loop {
@@ -76,7 +85,8 @@ impl<S: Socket> Socket for DemuxSocket<S> {
                 return Ok((len, from));
             }
             dropped_in_a_row += 1;
-            if dropped_in_a_row % DROPS_BETWEEN_YIELDS == 0 {
+            if dropped_in_a_row == DROPS_BETWEEN_YIELDS {
+                dropped_in_a_row = 0;
                 tokio::task::yield_now().await;
             }
         }
@@ -193,6 +203,7 @@ mod tests {
     #[tokio::test]
     async fn recv_returns_only_legacy_and_counts_every_datagram() {
         let from: SocketAddr = "10.254.1.1:4001".parse().unwrap();
+        TRANSPORT_METRICS.watch_demux(from);
         let legacy = vec![PACKET_TYPE_SYMMETRIC, 9, 8, 7];
         let socket = DemuxSocket {
             inner: ScriptedSocket::new(vec![
@@ -218,12 +229,13 @@ mod tests {
     }
 
     /// A long run of dropped datagrams ends at the next legacy one, and the
-    /// loop lets other tasks run on the way. The test runtime has one thread
-    /// and the inner socket is always ready, so the other task can only run
-    /// if the receive loop yields.
+    /// loop lets other tasks run on the way, once per yield period. The test
+    /// runtime has one thread and the inner socket is always ready, so the
+    /// other task only runs when the receive loop yields.
     #[tokio::test]
     async fn recv_survives_a_flood_of_dropped_datagrams() {
         let from: SocketAddr = "10.254.1.2:4002".parse().unwrap();
+        TRANSPORT_METRICS.watch_demux(from);
         let flood = 3 * DROPS_BETWEEN_YIELDS as usize + 1;
         let mut script: Vec<Step> = (0..flood)
             .map(|_| Step::Packet(from, vec![0x40, 0]))
@@ -232,15 +244,23 @@ mod tests {
         let socket = DemuxSocket {
             inner: ScriptedSocket::new(script),
         };
-        let other_task_ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let flag = other_task_ran.clone();
-        tokio::spawn(async move { flag.store(true, std::sync::atomic::Ordering::SeqCst) });
+        let turns = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = turns.clone();
+        let other_task = tokio::spawn(async move {
+            loop {
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                tokio::task::yield_now().await;
+            }
+        });
         let mut buf = [0u8; 8];
         let (len, _) = recv_within_timeout(&socket, &mut buf).await;
         assert_eq!(&buf[..len], &[PACKET_TYPE_INTRO]);
+        other_task.abort();
+        // The flood is three full yield periods plus one datagram, and each
+        // yield gives the other task one turn.
         assert!(
-            other_task_ran.load(std::sync::atomic::Ordering::SeqCst),
-            "the receive loop must yield during a flood of dropped datagrams"
+            turns.load(std::sync::atomic::Ordering::SeqCst) >= 3,
+            "the receive loop must yield once per {DROPS_BETWEEN_YIELDS} dropped datagrams"
         );
         let log = TRANSPORT_METRICS.demux_from(from);
         assert_eq!(log.len(), flood + 1);
@@ -286,13 +306,6 @@ mod tests {
         use std::net::{IpAddr, Ipv4Addr};
         use std::time::Duration;
 
-        fn free_udp_port() -> u16 {
-            std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
-                .unwrap()
-                .local_addr()
-                .unwrap()
-                .port()
-        }
         async fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
             let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
             while !done() {
@@ -302,10 +315,15 @@ mod tests {
         }
 
         let host = IpAddr::V4(Ipv4Addr::LOCALHOST);
-        let gateway_port = free_udp_port();
-        let joiner_port = free_udp_port();
+        // Ports come from the crate's test port registry, which hands each
+        // test a distinct port and holds it until released just before bind.
+        let gateway_port = crate::test_utils::reserve_local_port()?;
+        let joiner_port = crate::test_utils::reserve_local_port()?;
+        crate::test_utils::release_local_port(gateway_port);
+        crate::test_utils::release_local_port(joiner_port);
         let gateway_addr = SocketAddr::new(host, gateway_port);
         let joiner_addr = SocketAddr::new(host, joiner_port);
+        TRANSPORT_METRICS.watch_demux(joiner_addr);
         let gateway_keypair = TransportKeypair::new();
         let gateway_pub = gateway_keypair.public().clone();
 
@@ -339,6 +357,7 @@ mod tests {
         // A QUIC-shaped datagram and a stray one, from a unique address.
         let injector = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))?;
         let injector_addr = injector.local_addr()?;
+        TRANSPORT_METRICS.watch_demux(injector_addr);
         injector.send_to(&[0xC1, 0, 0, 0], gateway_addr)?;
         injector.send_to(&[0x00, 0, 0, 0], gateway_addr)?;
         wait_until("the injected datagrams are counted", || {
