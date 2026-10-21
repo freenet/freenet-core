@@ -40,10 +40,11 @@
 //! Staging's GitHub traffic has a hard ceiling that does not depend on any of
 //! that: every staging run spends one token from the node's persisted poll
 //! bucket (#4073), and staging and the updater together receive at most
-//! `rollback::DOWNLOAD_BYTES_PER_DAY` bytes of one release's archives
-//! per day (the updater charges the same record through [`ByteMeter`]). A
-//! staging run the budget refuses counts as a failure, so the fallback still
-//! fires; an updater run it refuses holds the release without counting.
+//! `rollback::DOWNLOAD_BYTES_PER_DAY` bytes of release archives per node per
+//! day (the updater charges the same record through [`ByteMeter`]). While the
+//! budget is spent, staging and the updater both hold the release without
+//! counting a failure: an exit would only reach an updater the same budget
+//! refuses.
 
 use std::fs;
 use std::io::Write as _;
@@ -642,7 +643,10 @@ async fn stage_latest_release_inner(
                 current_version,
                 target,
                 lookup,
-                &LOOKUP_RETRY_DELAYS,
+                (
+                    &LOOKUP_RETRY_DELAYS,
+                    super::super::rollback::DOWNLOAD_BYTES_PER_DAY,
+                ),
                 &SystemTime::now,
             )
             .await
@@ -777,6 +781,34 @@ fn after_transient_failure(root: &Path, version: &str, error: &str, now: SystemT
 
 /// Hold `version` without counting a failure (the bucket or the ceiling said
 /// no, so nothing was attempted) and stay.
+/// Hold `version` without counting a failure until the node's download
+/// budget is whole again, and stay. Exiting would hand the download to an
+/// updater the same budget refuses: a restart for nothing. Nothing counts
+/// toward the fallback while the budget is spent.
+fn budget_spent(root: &Path, version: &str, now: SystemTime) -> Staging {
+    let Some(dir) = root.parent() else {
+        return Staging::Throttled;
+    };
+    let until = super::super::rollback::download_window_end_at(dir, now).unwrap_or(now);
+    tracing::warn!(
+        version,
+        resets_in_min = until
+            .duration_since(now)
+            .unwrap_or_default()
+            .as_secs()
+            .div_ceil(60),
+        "Today's download budget is spent; holding the update until it resets (#5799)"
+    );
+    super::super::rollback::hold_update_until_at(
+        dir,
+        version,
+        "today's download budget is spent (#5799)",
+        until,
+        now,
+    );
+    Staging::Throttled
+}
+
 fn throttled(root: &Path, version: Option<&str>, why: &str, now: SystemTime) -> Staging {
     tracing::info!(why, "Not downloading the update in advance now (#5799)");
     if let (Some(version), Some(state_dir)) = (version, root.parent()) {
@@ -808,7 +840,7 @@ async fn decide_before_download<F, Fut>(
     lookup: F,
     target: Option<&str>,
     blocked: impl Fn(&str) -> bool,
-    (lookup_delays, clock): (&[Duration], Clock<'_>),
+    (lookup_delays, byte_budget, clock): (&[Duration], u64, Clock<'_>),
 ) -> std::result::Result<String, Staging>
 where
     F: FnMut() -> Fut,
@@ -821,6 +853,16 @@ where
     }) {
         tracing::info!(version = %version, retry_in_min = left.as_secs().div_ceil(60), "Update is cooling down after failed attempts; staying on the current version (#5799)");
         return Err(Staging::CoolingDown);
+    }
+    // A spent download budget holds before any request too, unless a release
+    // is already staged and could be installed without downloading it.
+    if let Some(dir) = root.parent() {
+        if super::super::rollback::download_bytes_at(dir, clock()) >= byte_budget
+            && staged_tag_at(root).is_none()
+        {
+            let version = lookup_failure_target(root, current_version, target);
+            return Err(budget_spent(root, &version, clock()));
+        }
     }
     if !spend_poll_token(root, clock()) {
         return Err(throttled(
@@ -926,7 +968,7 @@ async fn decide_without_staging<F, Fut>(
     current_version: &str,
     target: Option<&str>,
     lookup: F,
-    lookup_delays: &[Duration],
+    (lookup_delays, byte_budget): (&[Duration], u64),
     clock: Clock<'_>,
 ) -> Staging
 where
@@ -939,7 +981,7 @@ where
         lookup,
         target,
         version_blocked,
-        (lookup_delays, clock),
+        (lookup_delays, byte_budget, clock),
     )
     .await
     {
@@ -1015,7 +1057,7 @@ where
         lookup,
         target,
         blocked,
-        (env.lookup_delays, clock),
+        (env.lookup_delays, env.byte_budget, clock),
     )
     .await
     {
@@ -1057,9 +1099,9 @@ where
             );
         }
     };
-    // The hard ceiling on bytes (#5799), whatever the cooldown decided. A run
-    // it refuses counts as a failure, so the fallback keeps firing. The poll
-    // token this run spent above bounds its requests, retries included.
+    // The hard ceiling on bytes (#5799), whatever the cooldown decided; a run
+    // it refuses holds (see `budget_spent`). The poll token this run spent
+    // above bounds its requests, retries included.
     let spent = root.parent().map_or(0, |dir| {
         super::super::rollback::download_bytes_at(dir, clock())
     });
@@ -1074,7 +1116,7 @@ where
             spent_mib = spent / (1024 * 1024),
             "Not downloading the update in advance: today's download budget for it is spent (#5799)"
         );
-        return after_transient_failure(root, version, &BudgetSpent.to_string(), clock());
+        return budget_spent(root, version, clock());
     }
 
     tracing::info!(tag = %tag, "Downloading the update before exiting, so the restart only has to install it");
@@ -1127,6 +1169,9 @@ where
         return exit_after_recording(root, version, INSTALL_PENDING, Staging::Staged, clock());
     }
     log_transient_failure(&tag, &error);
+    if failure_cause(&error) == FailureCause::BudgetSpent {
+        return budget_spent(root, version, clock());
+    }
     after_transient_failure(root, version, &format!("{error:#}"), clock())
 }
 
@@ -3334,10 +3379,11 @@ mod tests {
         (prefix, runs, bytes)
     }
 
-    /// #5799: the byte budget binds when downloads keep starting over,
-    /// stops the run that reaches it mid-download, and from then on refuses
-    /// runs before any request. Each refusal COUNTS as a failure, so the
-    /// fallback still fires on the third.
+    /// #5799: the byte budget binds when downloads keep starting over, and
+    /// stops the run that reaches it mid-download. From then on the node
+    /// holds, without counting a failure and without a request, until the
+    /// budget's window resets: an exit would hand the download to an updater
+    /// the same budget refuses, so no fallback exit happens meanwhile.
     #[tokio::test]
     async fn the_byte_budget_stops_downloads_that_keep_starting_over() {
         use std::sync::atomic::Ordering::SeqCst;
@@ -3363,29 +3409,78 @@ mod tests {
             )
         };
         // Two attempts restart from zero, the third passes the budget and is
-        // stopped: no more retries.
-        assert_eq!(run().await, Staging::Deferred);
+        // stopped: no more retries, and the node holds.
+        let outcome = run().await;
+        assert_eq!(outcome, Staging::Throttled);
+        assert!(!outcome.preparation().should_exit());
         assert_eq!(bytes.load(SeqCst), 30_000);
+        let requests = runs.load(SeqCst);
         let state_dir = root.parent().unwrap();
         let spent = super::super::super::rollback::download_bytes_at(state_dir, SystemTime::now());
         assert!((25_000..=30_000).contains(&spent), "{spent}");
-        // With the cooldown out of the way, the next runs never reach the
-        // server, and still count toward the fallback.
-        let expired = || {
-            let rand = 0.5;
-            let long_ago = SystemTime::now() - Duration::from_secs(5 * 3600);
-            super::super::super::rollback::record_update_failure_at(
-                state_dir, "9.9.9", "earlier", long_ago, rand,
-            );
-        };
+        let held = cooldown(&root).unwrap();
+        assert_eq!(held.failures, 0);
+        assert!(held.hold_reason.unwrap().contains("budget"));
+        // Even with two failures on record and the cooldown out of the way,
+        // later runs hold without a request and never fall back.
+        let long_ago = SystemTime::now() - Duration::from_secs(5 * 3600);
         super::super::super::rollback::clear_update_cooldown_at(state_dir);
-        expired();
-        assert_eq!(run().await, Staging::Deferred);
-        assert_eq!(cooldown(&root).unwrap().failures, 2);
-        expired();
-        assert_eq!(run().await, Staging::FallingBack);
-        assert_eq!(runs.load(SeqCst), 3, "a refused run makes no request");
-        assert!(cooldown(&root).unwrap().last_error.contains("budget"));
+        for _ in 0..2 {
+            super::super::super::rollback::record_update_failure_at(
+                state_dir, "9.9.9", "earlier", long_ago, 0.5,
+            );
+        }
+        for _ in 0..3 {
+            let outcome = run().await;
+            assert_eq!(outcome, Staging::Throttled);
+            assert!(!outcome.preparation().should_exit());
+            assert_eq!(cooldown(&root).unwrap().failures, 2);
+            // Out of the way again, as if each hold had ended.
+            let mut record = cooldown(&root).unwrap();
+            record.retry_at_unix = SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+                - 1;
+            fs::write(
+                state_dir.join("update_cooldown.json"),
+                serde_json::to_vec(&record).unwrap(),
+            )
+            .unwrap();
+        }
+        assert_eq!(runs.load(SeqCst), requests, "a held run makes no request");
+    }
+
+    /// A spent budget holds an install that stages nothing (a macOS app
+    /// bundle) too, before the lookup.
+    #[tokio::test]
+    async fn a_spent_budget_holds_an_install_that_stages_nothing() {
+        let (_tmp, root) = test_root();
+        let dir = root.parent().unwrap();
+        fs::create_dir_all(dir).unwrap();
+        let now = SystemTime::now();
+        super::super::super::rollback::charge_download_bytes_at(dir, 1000, now);
+        let lookup = || async { panic!("looked the tag up with the budget spent") };
+        let outcome = decide_without_staging(
+            &root,
+            "9.9.8",
+            Some("9.9.9"),
+            lookup,
+            (&[], 1000),
+            &SystemTime::now,
+        )
+        .await;
+        assert_eq!(outcome, Staging::Throttled);
+        assert!(!outcome.preparation().should_exit());
+        let held = cooldown(&root).unwrap();
+        assert_eq!((held.version.as_str(), held.failures), ("9.9.9", 0));
+        // Held until the window resets, within the longest plausible wait.
+        let retry = std::time::UNIX_EPOCH + Duration::from_secs(held.retry_at_unix);
+        let wait = retry.duration_since(now).unwrap();
+        assert!(
+            wait > Duration::from_secs(3 * 3600) && wait <= Duration::from_secs(4 * 3600),
+            "{wait:?}"
+        );
     }
 
     /// The budget is the node's, not a release's: after one release has
@@ -3835,12 +3930,14 @@ mod tests {
         let (_tmp, root) = test_root();
         let ok = || async { Ok(TAG.to_string()) };
         assert_eq!(
-            decide_without_staging(&root, "9.9.8", None, ok, &[], &SystemTime::now).await,
+            decide_without_staging(&root, "9.9.8", None, ok, (&[], u64::MAX), &SystemTime::now)
+                .await,
             Staging::Skipped
         );
         assert_eq!(cooldown(&root).unwrap().last_error, INSTALL_PENDING);
         assert_eq!(
-            decide_without_staging(&root, "9.9.8", None, ok, &[], &SystemTime::now).await,
+            decide_without_staging(&root, "9.9.8", None, ok, (&[], u64::MAX), &SystemTime::now)
+                .await,
             Staging::CoolingDown
         );
     }

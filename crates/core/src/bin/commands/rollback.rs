@@ -1150,20 +1150,27 @@ fn write_update_cooldown_at(
     let now_unix = unix_secs(now);
     let bounded =
         |text: &str| -> String { text.chars().take(UPDATE_COOLDOWN_ERROR_MAX_CHARS).collect() };
-    let state = UpdateCooldownState {
-        version: version.to_string(),
-        failures,
-        failed_at_unix: now_unix,
-        retry_at_unix: now_unix
-            .saturating_add(update_cooldown_delay(failures, rand_unit).as_secs()),
-        last_error: bounded(error),
-        hold_reason: hold_reason.map(bounded),
-    };
-    let written = serde_json::to_vec(&state)
+    store_update_cooldown_at(
+        dir,
+        &UpdateCooldownState {
+            version: version.to_string(),
+            failures,
+            failed_at_unix: now_unix,
+            retry_at_unix: now_unix
+                .saturating_add(update_cooldown_delay(failures, rand_unit).as_secs()),
+            last_error: bounded(error),
+            hold_reason: hold_reason.map(bounded),
+        },
+    )
+}
+
+/// Write `state` as the record. `false` when it could not be written.
+fn store_update_cooldown_at(dir: &Path, state: &UpdateCooldownState) -> bool {
+    let written = serde_json::to_vec(state)
         .context("serialize update cooldown")
         .and_then(|raw| atomic_write_record(&dir.join(UPDATE_COOLDOWN_FILE), &raw));
     if let Err(e) = &written {
-        tracing::warn!(version, error = %e, "Failed to persist the update cooldown (#5799)");
+        tracing::warn!(version = %state.version, error = %e, "Failed to persist the update cooldown (#5799)");
     }
     written.is_ok()
 }
@@ -1308,6 +1315,50 @@ pub(crate) fn hold_update_without_counting_at(
             (&last_error, Some(reason)),
             now,
             rand_unit,
+        );
+    });
+}
+
+/// Hold `version` without counting a failure until `until` (when the node's
+/// download budget is whole again), though never more than the longest
+/// cooldown from `now`: a retry time beyond that reads as a bogus record. A
+/// trigger that wakes before `until` finds the budget still spent and holds
+/// again, without a request. A live record for the release keeps the later
+/// retry time; its count and last real error are kept.
+pub(crate) fn hold_update_until_at(
+    dir: &Path,
+    version: &str,
+    reason: &str,
+    until: SystemTime,
+    now: SystemTime,
+) {
+    with_record_lock(dir, || {
+        let latest = now.checked_add(UPDATE_COOLDOWN_MAX).unwrap_or(now);
+        let mut retry_at_unix = unix_secs(until.clamp(now, latest));
+        let (failures, last_error) = match read_update_cooldown_at(dir) {
+            Some(prev) if prev.version == version => {
+                if update_cooldown_remaining_at(dir, version, now).is_some() {
+                    retry_at_unix = retry_at_unix.max(prev.retry_at_unix);
+                }
+                (live_failures(&prev, now), prev.last_error)
+            }
+            _ => (0, String::new()),
+        };
+        store_update_cooldown_at(
+            dir,
+            &UpdateCooldownState {
+                version: version.to_string(),
+                failures,
+                failed_at_unix: unix_secs(now),
+                retry_at_unix,
+                last_error,
+                hold_reason: Some(
+                    reason
+                        .chars()
+                        .take(UPDATE_COOLDOWN_ERROR_MAX_CHARS)
+                        .collect(),
+                ),
+            },
         );
     });
 }
