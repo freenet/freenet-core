@@ -2469,7 +2469,14 @@ mod tests {
         assert_eq!(root, state.path().join(CACHE_DIR));
         let env = production_env(&root);
         assert_eq!(env.download_prefix, RELEASE_DOWNLOAD_PREFIX);
-        assert_eq!(env.free, free_bytes(state.path()));
+        // The state directory's free space. Other tests write to the same
+        // filesystem meanwhile, so the two readings are compared loosely.
+        let close = |a: Option<u64>, b: Option<u64>| match (a, b) {
+            (Some(a), Some(b)) => a.abs_diff(b) < 1 << 30,
+            (a, b) => a == b,
+        };
+        assert!(close(env.free, free_bytes(state.path())));
+        assert_eq!(env.free.is_some(), cfg!(unix));
         assert_eq!(env.delays, STAGE_RETRY_DELAYS);
         assert_eq!(env.lookup_delays, LOOKUP_RETRY_DELAYS);
         assert_eq!(env.deadline, STAGE_DEADLINE);

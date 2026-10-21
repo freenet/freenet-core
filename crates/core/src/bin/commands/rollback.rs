@@ -2987,8 +2987,13 @@ mod tests {
             // SAFETY: as above.
             unsafe {
                 libc::alarm(30);
-                libc::close(locked[0]);
-                libc::close(released[0]);
+                // Every inherited descriptor but our two pipe ends, so this
+                // child cannot hold another test's pipe open while it sleeps.
+                for fd in 3..1024 {
+                    if fd != locked[1] && fd != released[1] {
+                        libc::close(fd);
+                    }
+                }
                 let fd = libc::open(path.as_ptr(), libc::O_RDWR | libc::O_CREAT, 0o600);
                 let mut request: libc::flock = std::mem::zeroed();
                 request.l_type = libc::F_WRLCK as _;
@@ -3079,7 +3084,7 @@ mod tests {
     fn a_wedged_lock_holder_does_not_block_a_writer() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path();
-        let (child, fd) = child_holding_record_lock(dir, 20_000);
+        let (child, fd) = child_holding_record_lock(dir, 2_000);
         let now = SystemTime::now();
         let written = record_update_failure_at(dir, "0.2.141", "x", now, 0.5);
         let still_held = !released(fd);
