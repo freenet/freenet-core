@@ -2959,6 +2959,10 @@ mod driver_timing_tests {
     #[tokio::test(start_paused = true)]
     async fn the_dial_queue_wait_is_recorded_only_after_the_dial_is_sent() {
         use crate::transport::metrics::DialQueueWait;
+        // The wait log is process-global and keyed only by address, so these
+        // ports (24920..=24922) must not be used by any other test in the
+        // crate: under plain `cargo test`, a test that dials one of them
+        // leaves a wait this test then reads as its own.
         let waits = |p: &PeerKeyLocation| {
             crate::transport::TRANSPORT_METRICS.dial_queue_waits_for(p.socket_addr().unwrap())
         };
@@ -2967,7 +2971,7 @@ mod driver_timing_tests {
         // The event loop is gone: the dial is never sent.
         let (op_manager, events) = op_manager_with_events("dial-wait-unsent").await;
         drop(events);
-        let unsent = peer(24890);
+        let unsent = peer(24920);
         assert!(
             super::begin_acceptor_dial(&op_manager, tx, unsent.clone(), Instant::now())
                 .await
@@ -2985,7 +2989,7 @@ mod driver_timing_tests {
             .is_ok()
         {}
         drop(events.recv().await.expect("a filler event"));
-        let half = peer(24892);
+        let half = peer(24922);
         let half_addr = half.socket_addr().unwrap();
         let closing_loop = tokio::spawn(async move {
             tokio::time::sleep(Duration::from_secs(1)).await;
@@ -3030,7 +3034,7 @@ mod driver_timing_tests {
             filler += 1;
         }
         assert!(filler > 0, "premise: the channel filled");
-        let held = peer(24891);
+        let held = peer(24921);
         let answered_at = Instant::now();
         let slow_loop = tokio::spawn(async move {
             tokio::time::sleep(Duration::from_secs(4)).await;
