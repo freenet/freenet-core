@@ -233,17 +233,54 @@ pub fn update_counter_action(outcome: UpdateSubprocessOutcome) -> UpdateCounterA
 /// at once (#5799). Says so on stderr even under `--quiet`: the line a
 /// supervisor's log (the journal, the Windows wrapper's log, the macOS
 /// wrapper's log) needs to show why an update did not happen.
-fn note_install_failure(version: &str, error: &anyhow::Error) {
-    let streak = match super::rollback::record_update_failure(version, &format!("{error:#}")) {
-        Some(n) => format!(" (failure {n} in a row)"),
-        None => String::new(),
-    };
-    #[allow(clippy::let_underscore_must_use)]
-    let _ = writeln!(
-        io::stderr(),
-        "Freenet update to {version} failed{streak}: {error:#}. Auto-update holds this release \
+fn note_install_failure(version: &str, error: &str) {
+    let streak = super::rollback::record_update_failure(version, error);
+    stderr_line!("{}", install_failure_line(version, error, streak));
+}
+
+/// The stderr line for a failed install: the release, the streak when it
+/// was recorded, and the full error.
+fn install_failure_line(version: &str, error: &str, streak: Option<u32>) -> String {
+    let streak = streak.map_or_else(String::new, |n| format!(" (failure {n} in a row)"));
+    format!(
+        "Freenet update to {version} failed{streak}: {error}. Auto-update holds this release \
          for a cooldown before trying it again (#5799)."
-    );
+    )
+}
+
+/// What the updater records for the outcome of an install attempt.
+#[derive(Debug, PartialEq, Eq)]
+enum InstallRecord {
+    /// Installed: clear the #4073 install gate, the #5799 cooldown, and the
+    /// staged copy.
+    Clear,
+    /// A present-but-wrong release (checksum or signature): count it toward
+    /// the #4073 install gate.
+    Gate,
+    /// Any other failure: cool the release down, recording this error
+    /// (#5799). Deliberately includes a missing manifest or asset, which is
+    /// usually a release still propagating.
+    CoolDown(String),
+}
+
+fn install_record(result: &Result<InstallOutcome>) -> InstallRecord {
+    match result {
+        Ok(InstallOutcome::Installed) => InstallRecord::Clear,
+        Ok(InstallOutcome::BundleSkipped {
+            verification_failure: true,
+        }) => InstallRecord::Gate,
+        Ok(InstallOutcome::BundleSkipped {
+            verification_failure: false,
+        }) => InstallRecord::CoolDown("the app bundle update could not be downloaded".to_string()),
+        Err(e) if is_release_verification_failure(e) => InstallRecord::Gate,
+        Err(e) => InstallRecord::CoolDown(format!("{e:#}")),
+    }
+}
+
+/// Whether a run that gives up before any download holds the staged release.
+/// `--check` installs nothing, so it never touches the cooldown.
+fn holds_on_skip(check: bool) -> bool {
+    !check
 }
 
 /// Hold the release the node staged before it exited, without counting a
@@ -443,7 +480,7 @@ impl UpdateCommand {
         //     REST quota once per crash), and
         //   * `--check`, which never installs by definition.
         // `--check` installs nothing, so it never touches the cooldown.
-        let hold_on_skip = !self.check;
+        let hold_on_skip = holds_on_skip(self.check);
         let latest_tag = match probe_latest_tag(self.force, self.quiet, hold_on_skip).await {
             Ok(tag) => tag,
             Err(e) => {
@@ -552,7 +589,7 @@ impl UpdateCommand {
         let latest = match fetch_release_assets(&latest_tag, self.quiet).await {
             Ok(latest) => latest,
             Err(e) => {
-                note_install_failure(latest_version, &e);
+                note_install_failure(latest_version, &format!("{e:#}"));
                 return Err(e);
             }
         };
@@ -576,49 +613,26 @@ impl UpdateCommand {
         // `BundleSkipped { verification_failure }`, which carries the same
         // deterministic-vs-transient distinction.
         let install_result = self.download_and_install(&latest, current_version).await;
-        match &install_result {
-            Ok(InstallOutcome::Installed) => {
+        // Transient failures cool the release down rather than gating it.
+        // That DELIBERATELY includes the fail-closed "missing artifact"
+        // refusals (absent SHA256SUMS.txt, no manifest entry for our asset,
+        // absent .sig when required): a MISSING manifest/entry is the canonical
+        // release-PROPAGATION race (assets upload after the tag is live), so
+        // gating it could permanently suppress a good release polled seconds
+        // early. Only a PRESENT-but-WRONG artifact is an unambiguous
+        // bad-release signal, gated via ReleaseVerificationError. The cooldown
+        // (#5799) always expires; without it a node that cannot download the
+        // release restarts, detects it and exits for it again within minutes.
+        match install_record(&install_result) {
+            InstallRecord::Clear => {
                 super::rollback::clear_install_failures();
                 super::rollback::clear_update_cooldown();
                 // The staged copy (#5790) has served its purpose. Kept on any
                 // failure, so the next attempt need not download it again.
                 staged::discard();
             }
-            Ok(InstallOutcome::BundleSkipped {
-                verification_failure,
-            }) => {
-                if *verification_failure {
-                    super::rollback::record_install_failure(latest_version);
-                } else {
-                    // transient bundle failure: leave the gate unchanged, but
-                    // cool the release down (#5799).
-                    note_install_failure(
-                        latest_version,
-                        &anyhow::anyhow!("the app bundle update could not be downloaded"),
-                    );
-                }
-            }
-            Err(e) if is_release_verification_failure(e) => {
-                super::rollback::record_install_failure(latest_version)
-            }
-            // Transient install error: neither record nor clear the gate — retry
-            // later, after a cooldown (below).
-            //
-            // DELIBERATELY includes the fail-closed "missing artifact" refusals
-            // (absent SHA256SUMS.txt, no manifest entry for our asset, absent
-            // .sig when required) as well as download/network/extraction errors.
-            // A MISSING manifest/entry is the canonical release-PROPAGATION race
-            // (assets upload after the tag is live), so it self-resolves — gating
-            // it would risk permanently suppressing a good release that the node
-            // happened to poll seconds early, which is a worse regression than the
-            // already rate-limit-bounded retry cadence. Only a PRESENT-but-WRONG
-            // artifact (checksum mismatch / invalid signature) is an unambiguous
-            // bad-release signal and is gated above via ReleaseVerificationError.
-            //
-            // What IS recorded is a time-bounded cooldown (#5799): without it a
-            // node that cannot download the release restarts, detects it again
-            // and exits for it again within minutes. It always expires.
-            Err(e) => note_install_failure(latest_version, e),
+            InstallRecord::Gate => super::rollback::record_install_failure(latest_version),
+            InstallRecord::CoolDown(error) => note_install_failure(latest_version, &error),
         }
         install_result.map(|_| ())
     }
@@ -4207,33 +4221,34 @@ done
             .split_once("install_result.map(|_| ())")
             .expect("end of install-result match not found");
 
-        // The Installed outcome clears the gate.
-        let (_, installed_arm) = matchbody
-            .split_once("Ok(InstallOutcome::Installed) => {")
-            .expect("Installed arm not found");
-        let installed_arm =
-            &installed_arm[..installed_arm.find('}').unwrap_or(installed_arm.len())];
+        // Which outcome is which is decided by `install_record`, tested by
+        // behaviour in `each_install_outcome_records_the_right_thing`; this
+        // pins what run_async does with each.
+        let (_, clear_arm) = matchbody
+            .split_once("InstallRecord::Clear => {")
+            .expect("Clear arm not found");
+        let clear_arm = &clear_arm[..clear_arm.find('}').unwrap_or(clear_arm.len())];
         assert!(
-            installed_arm.lines().any(|l| l
+            clear_arm.lines().any(|l| l
                 .trim()
                 .starts_with("super::rollback::clear_install_failures();")),
             "the Installed outcome must clear the install-failure gate"
         );
-        // The deterministic-verification Err arm records a failure.
         assert!(
-            matchbody.contains("Err(e) if is_release_verification_failure(e) =>")
-                && matchbody.contains("record_install_failure"),
-            "a verification-failure Err must record toward the gate"
+            matchbody.contains(
+                "InstallRecord::Gate => super::rollback::record_install_failure(latest_version),"
+            ),
+            "a verification failure must record toward the gate"
         );
-        // The catch-all transient Err arm must NOT record (it is a no-op).
-        let (_, after_catch) = matchbody
-            .split_once("// Transient install error: neither record nor clear")
-            .expect("transient Err arm must be present and documented");
-        let catch_body = &after_catch[..after_catch.find('}').unwrap_or(after_catch.len())];
+        // The transient arm cools the release down and leaves the gate alone.
+        let (_, cool_arm) = matchbody
+            .split_once("InstallRecord::CoolDown(error) =>")
+            .expect("CoolDown arm not found");
+        let cool_arm = &cool_arm[..cool_arm.find('\n').unwrap_or(cool_arm.len())];
         assert!(
-            !catch_body.contains("record_install_failure")
-                && !catch_body.contains("clear_install_failures"),
-            "the transient Err arm must neither record nor clear the gate"
+            !cool_arm.contains("record_install_failure")
+                && !cool_arm.contains("clear_install_failures"),
+            "the transient arm must neither record nor clear the gate: {cool_arm}"
         );
     }
 
@@ -4256,6 +4271,61 @@ done
         assert_eq!(code.matches(concat!("eprintln", "!(")).count(), 0);
         assert!(code.matches("stderr_line!(").count() >= 40);
         assert!(code.contains("let _ = writeln!(io::stderr(), $($arg)*);"));
+    }
+
+    /// Testing lens: what the updater records for each install outcome, by
+    /// behaviour rather than source. A verification failure goes to the #4073
+    /// gate and never to the cooldown; every other failure cools the release
+    /// down carrying its full error chain; an install clears.
+    #[test]
+    fn each_install_outcome_records_the_right_thing() {
+        assert_eq!(
+            install_record(&Ok(InstallOutcome::Installed)),
+            InstallRecord::Clear
+        );
+        assert_eq!(
+            install_record(&Ok(InstallOutcome::BundleSkipped {
+                verification_failure: true
+            })),
+            InstallRecord::Gate
+        );
+        assert!(matches!(
+            install_record(&Ok(InstallOutcome::BundleSkipped {
+                verification_failure: false
+            })),
+            InstallRecord::CoolDown(e) if e.contains("app bundle")
+        ));
+        let bad = anyhow::Error::new(ReleaseVerificationError("checksum mismatch".into()))
+            .context("installing");
+        assert_eq!(install_record(&Err(bad)), InstallRecord::Gate);
+        let network =
+            anyhow::anyhow!("connection reset by peer").context("Failed to download file");
+        assert_eq!(
+            install_record(&Err(network)),
+            InstallRecord::CoolDown("Failed to download file: connection reset by peer".into())
+        );
+        // `--check` never touches the cooldown; a real run holds.
+        assert!(!holds_on_skip(true));
+        assert!(holds_on_skip(false));
+    }
+
+    /// Testing lens: the line the supervisor's log shows names the release,
+    /// the streak when it was recorded, and the whole error.
+    #[test]
+    fn the_install_failure_line_carries_the_error() {
+        let line = install_failure_line("0.2.141", "Failed to download file: timed out", Some(2));
+        assert!(
+            line.starts_with(
+                "Freenet update to 0.2.141 failed (failure 2 in a row): \
+                 Failed to download file: timed out."
+            ),
+            "{line}"
+        );
+        let line = install_failure_line("0.2.141", "boom", None);
+        assert!(
+            line.starts_with("Freenet update to 0.2.141 failed: boom."),
+            "{line}"
+        );
     }
 
     /// #5799: the updater records a failed install, holds (without counting)
@@ -4286,12 +4356,13 @@ done
         };
         let run_async = region("\n    async fn run_async(", "\n    }\n");
         for needle in [
-            "lethold_on_skip=!self.check;",
+            "lethold_on_skip=holds_on_skip(self.check);",
             "letlatest_tag=matchprobe_latest_tag(self.force,self.quiet,hold_on_skip).await{",
             "Err(e)=>{ifhold_on_skip{hold_staged_release(&e);}returnErr(e);}",
-            "Err(e)=>{note_install_failure(latest_version,&e);returnErr(e);}",
-            "Err(e)=>note_install_failure(latest_version,e),}install_result",
-            "}else{note_install_failure(latest_version,",
+            "Err(e)=>{note_install_failure(latest_version,&format!(\"{e:#}\"));returnErr(e);}",
+            "matchinstall_record(&install_result){",
+            "InstallRecord::Gate=>super::rollback::record_install_failure(latest_version),",
+            "InstallRecord::CoolDown(error)=>note_install_failure(latest_version,&error),}install_result",
         ] {
             assert!(run_async.contains(needle), "run_async: `{needle}`");
         }
@@ -4300,15 +4371,6 @@ done
                 .matches("super::rollback::clear_update_cooldown();")
                 .count(),
             2
-        );
-        let verification = run_async
-            .split_once("Err(e)ifis_release_verification_failure(e)=>")
-            .unwrap()
-            .1;
-        let verification = &verification[..verification.find("Err(e)=>").unwrap()];
-        assert!(
-            !verification.contains("note_install_failure"),
-            "{verification}"
         );
         let probe = region("\nasync fn probe_latest_tag(", "\n}\n");
         assert_eq!(

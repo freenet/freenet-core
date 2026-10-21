@@ -4407,9 +4407,16 @@ echo "RC=$?"
             .status()
             .unwrap();
         assert!(!status.success());
-        let logs: String = std::fs::read_dir(log_dir)
+        // In date order: the file is named for the day, so a run that
+        // crosses midnight writes two, and `read_dir` order is arbitrary.
+        let mut files: Vec<_> = std::fs::read_dir(log_dir)
             .unwrap()
-            .map(|e| std::fs::read_to_string(e.unwrap().path()).unwrap())
+            .map(|e| e.unwrap().path())
+            .collect();
+        files.sort();
+        let logs: String = files
+            .iter()
+            .map(|path| std::fs::read_to_string(path).unwrap())
             .collect();
         for line in [
             "Update needed, running freenet update...",
@@ -4554,19 +4561,35 @@ echo "RC=$?"
 
     #[test]
     fn in_process_wrapper_only_passes_exit_code_on_post_crash_update() {
-        let src = include_str!("service/wrapper.rs");
-        // The post-crash auto-update path passes the node's exit code.
-        assert!(
-            src.contains("spawn_update_command(&exe_path, log_dir, Some(exit_code))"),
-            "the wrapper's post-stop auto-update must pass Some(exit_code) so \
+        // Code only: a `//` mention must not count as a call site.
+        let src: String = include_str!("service/wrapper.rs")
+            .lines()
+            .map(|line| line.split_once("//").map_or(line, |(code, _)| code))
+            .collect::<Vec<_>>()
+            .join("\n");
+        // Counts, not presence: with two sites of each kind, a presence check
+        // is satisfied by either one, so one regressing would go unnoticed.
+        // The post-stop auto-update paths pass the node's exit code.
+        assert_eq!(
+            src.matches("spawn_update_command(&exe_path, log_dir, Some(exit_code))")
+                .count(),
+            2,
+            "the wrapper's post-stop auto-updates must pass Some(exit_code) so \
              `freenet update` can drive crash-loop auto-rollback (#4073)"
         );
         // Manual / tray "Check for Updates" paths must NOT pass an exit code —
         // they are not crashes and must never be counted toward a rollback.
-        assert!(
-            src.contains("spawn_update_command(&exe_path, log_dir, None)"),
+        assert_eq!(
+            src.matches("spawn_update_command(&exe_path, log_dir, None)")
+                .count(),
+            3,
             "manual tray update paths must pass None so they are not counted as \
              probation crashes (#4073)"
+        );
+        assert_eq!(
+            src.matches("spawn_update_command(").count(),
+            2 + 3 + 1,
+            "every call site is one of the two forms above (plus the definition)"
         );
         assert!(
             src.contains("POST_STOP_EXIT_CODE_ENV_VAR"),

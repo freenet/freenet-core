@@ -1206,12 +1206,17 @@ fn lock_records(dir: &Path) -> Option<std::fs::File> {
         .write(true)
         .open(dir.join(RECORD_LOCK_FILE))
         .ok()?;
-    let deadline = std::time::Instant::now() + RECORD_LOCK_WAIT;
+    // Bounded by time slept rather than a clock reading: crates/core may not
+    // read `Instant::now()` outside a TimeSource (DST rule lint), and this
+    // bound needs no precision.
+    const POLL: std::time::Duration = std::time::Duration::from_millis(10);
+    let mut slept = std::time::Duration::ZERO;
     loop {
         match try_lock_file(&file) {
             Ok(true) => return Some(file),
-            Ok(false) if std::time::Instant::now() < deadline => {
-                std::thread::sleep(std::time::Duration::from_millis(10));
+            Ok(false) if slept < RECORD_LOCK_WAIT => {
+                std::thread::sleep(POLL);
+                slept += POLL;
             }
             Ok(false) => {
                 tracing::warn!("Update records stayed locked by another process; writing anyway");
@@ -3189,6 +3194,27 @@ mod tests {
     /// The download budget counts bytes per release per day, and fails open
     /// both ways: an unreadable record is nothing spent, an unwritable one
     /// loses the spend rather than blocking downloads.
+    /// Testing lens: the longest wait (4 h + 20%) is honoured to its end, and
+    /// only a retry time beyond it reads as a bogus record. The window is
+    /// pinned too.
+    #[test]
+    fn the_longest_cooldown_is_honoured_to_its_edge() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let now = SystemTime::now();
+        let minutes = |m: u64| std::time::Duration::from_secs(m * 60);
+        for _ in 0..3 {
+            record_update_failure_at(dir, "0.2.141", "x", now, 1.0);
+        }
+        assert_eq!(read_update_cooldown_at(dir).unwrap().failures, 3);
+        assert!(update_cooldown_remaining_at(dir, "0.2.141", now + minutes(282)).is_some());
+        assert!(update_cooldown_remaining_at(dir, "0.2.141", now + minutes(289)).is_none());
+        assert_eq!(
+            STAGED_DOWNLOAD_WINDOW,
+            std::time::Duration::from_secs(24 * 3600)
+        );
+    }
+
     #[test]
     fn staged_download_bytes_are_counted_per_release_per_day() {
         let tmp = tempfile::tempdir().unwrap();

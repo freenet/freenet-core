@@ -3132,6 +3132,130 @@ mod tests {
         }
     }
 
+    /// Testing lens: the fallback fires at EXACTLY the third failure in a
+    /// row, not the fourth. Failure counts never age out: three failures of
+    /// one release, however far apart, still exit for the updater, which then
+    /// tries once per cooldown. Ageing them out could postpone the fallback
+    /// indefinitely on a node that only attempts now and then; the count
+    /// resets only on an install or a newer release.
+    #[tokio::test]
+    async fn the_third_failure_falls_back_however_far_apart() {
+        let (_tmp, root) = test_root();
+        let state_dir = root.parent().unwrap();
+        fs::create_dir_all(state_dir).unwrap();
+        let server = failing_release();
+        let now = SystemTime::now();
+        let days_ago = |days: u64| now - Duration::from_secs(days * 24 * 3600);
+        for days in [9, 4] {
+            super::super::super::rollback::record_update_failure_at(
+                state_dir,
+                "9.9.9",
+                "earlier",
+                days_ago(days),
+                0.5,
+            );
+        }
+        assert_eq!(cooldown(&root).unwrap().failures, 2);
+        assert_eq!(
+            stage_at(&root, &server.url_str("/"), now).await,
+            Staging::FallingBack
+        );
+        assert_eq!(cooldown(&root).unwrap().failures, 3);
+    }
+
+    /// Testing lens: the exits that leave the download to the updater
+    /// because the cache is busy or cannot be locked record first, like every
+    /// other exit.
+    #[tokio::test]
+    async fn a_busy_or_unlockable_cache_records_before_exiting() {
+        let server = Server::run(); // no expectations: nothing is downloaded
+        let (_tmp, root) = test_root();
+        let held = try_lock(&root).unwrap().expect("lock");
+        let outcome = stage_into_with(&root, &server, Ok(TAG.into()), None, &|_| false).await;
+        drop(held);
+        assert_eq!(outcome, Staging::Skipped);
+        let record = cooldown(&root).unwrap();
+        assert_eq!(
+            (record.failures, record.last_error.as_str()),
+            (1, "cache busy")
+        );
+
+        let (_tmp, root) = test_root();
+        fs::create_dir_all(root.with_extension("lock")).unwrap();
+        let outcome = stage_into_with(&root, &server, Ok(TAG.into()), None, &|_| false).await;
+        assert_eq!(outcome, Staging::Skipped);
+        let record = cooldown(&root).unwrap();
+        assert_eq!(
+            (record.failures, record.last_error.as_str()),
+            (1, "cache lock failed")
+        );
+    }
+
+    /// Testing lens: a run the empty poll bucket stops holds the release and
+    /// counts nothing, however often it happens; only a run that reached the
+    /// network (or that the byte budget refused) counts.
+    #[tokio::test]
+    async fn runs_the_empty_bucket_stops_never_count() {
+        let server = Server::run(); // no expectations: nothing is requested
+        let prefix = server.url_str("/");
+        let (_tmp, root) = test_root();
+        let state_dir = root.parent().unwrap().to_path_buf();
+        fs::create_dir_all(&state_dir).unwrap();
+        let t0 = SystemTime::now();
+        // Two hours apart, past each hold's (at most 1.2 h) wait.
+        for hour in (0..10u64).step_by(2) {
+            let now = t0 + Duration::from_secs(hour * 3600 + 60);
+            let now_unix = now.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+            fs::write(
+                state_dir.join("github_poll_bucket_node"),
+                format!("0 {now_unix}"),
+            )
+            .unwrap();
+            let clock = move || now;
+            let env = StageEnv {
+                clock: &clock,
+                ..test_env(&prefix)
+            };
+            let outcome = stage_into(
+                &root,
+                "9.9.8",
+                || async { panic!("looked the tag up with an empty bucket") },
+                Some("9.9.9"),
+                |_: &str| false,
+                &env,
+            )
+            .await;
+            assert_eq!(outcome, Staging::Throttled, "hour {hour}");
+            assert_eq!(cooldown(&root).unwrap().failures, 0, "hour {hour}");
+        }
+    }
+
+    /// Testing lens: the budget's size and window are pinned, and a release
+    /// whose freenet archive is already staged is not refused by a spent
+    /// budget: there is nothing left to download, so it exits to install.
+    #[tokio::test]
+    async fn a_spent_budget_still_installs_a_staged_release() {
+        use super::super::super::rollback::{
+            STAGED_DOWNLOAD_BYTES_PER_DAY, add_staged_download_bytes_at,
+        };
+        assert_eq!(STAGED_DOWNLOAD_BYTES_PER_DAY, 160 * 1024 * 1024);
+        let freenet = freenet_asset_name();
+        let manifest = manifest_for(&[(&freenet, b"archive")]);
+        // The manifest is fetched again; the archive is not.
+        let server = serve_release(manifest.as_bytes(), None, &[]);
+        let (_tmp, root) = test_root();
+        write_staged(
+            &root,
+            &[(MANIFEST, manifest.as_bytes()), (&freenet, b"archive")],
+        );
+        let now = SystemTime::now();
+        add_staged_download_bytes_at(root.parent().unwrap(), "9.9.9", u64::MAX, now);
+        assert_eq!(
+            stage_at(&root, &server.url_str("/"), now).await,
+            Staging::Staged
+        );
+    }
+
     /// The install that stages nothing (a macOS app bundle) records before its
     /// exit and honours the cooldown. Platform-independent, so tested here.
     #[tokio::test]
@@ -3405,7 +3529,7 @@ mod tests {
 
         let run = method("    async fn run_async(");
         let (_, installed) = run
-            .split_once("Ok(InstallOutcome::Installed) => {")
+            .split_once("InstallRecord::Clear => {")
             .expect("Installed arm not found");
         let installed = &installed[..installed
             .find("\n            }")

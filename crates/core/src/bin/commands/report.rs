@@ -1922,6 +1922,40 @@ stack backtrace:
         );
     }
 
+    /// Testing lens: of several wrapper logs the newest (by modification
+    /// time) is the one carried, cut to the size cap.
+    #[test]
+    fn the_report_carries_the_newest_wrapper_log() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
+        let now = std::time::SystemTime::now();
+        let day = std::time::Duration::from_secs(24 * 3600);
+        for (name, body, age) in [
+            ("freenet-wrapper.2026-10-18.log", "old day\n", day * 2),
+            (
+                "freenet-wrapper.2026-10-19.log",
+                "newest\n",
+                std::time::Duration::ZERO,
+            ),
+            (
+                "freenet-wrapper.2026-10-20.log",
+                "stale despite its name\n",
+                day,
+            ),
+        ] {
+            fs::write(dir.join(name), body.repeat(100)).unwrap();
+            fs::File::options()
+                .write(true)
+                .open(dir.join(name))
+                .unwrap()
+                .set_modified(now - age)
+                .unwrap();
+        }
+        let tail = read_wrapper_log_tail(&dir, 64).unwrap();
+        assert!(tail.len() <= 64, "{}", tail.len());
+        assert!(tail.lines().all(|line| line == "newest"), "{tail}");
+    }
+
     /// Round-3 review, item 5: the Windows wrapper writes `freenet update`'s
     /// output to `freenet-wrapper.YYYY-MM-DD.log`, which the node-log pattern
     /// never matched. The report carries the newest one's end, cut at a line.

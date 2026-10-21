@@ -1521,11 +1521,12 @@ const WRAPPER_LOG_RETENTION_DAYS: usize = 7;
 pub(super) fn log_wrapper_event(log_dir: &Path, message: &str) {
     use std::io::Write;
 
+    // One clock read, so the line's time and the file's date agree.
     let now = chrono::Local::now();
     if let Ok(mut file) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(wrapper_log_path(log_dir))
+        .open(wrapper_log_path_on(log_dir, now))
     {
         let timestamp = now.format("%H:%M:%S");
         drop(writeln!(file, "{timestamp}: {message}"));
@@ -1539,8 +1540,12 @@ pub(super) fn log_wrapper_event(log_dir: &Path, message: &str) {
 
 /// Today's wrapper log file.
 fn wrapper_log_path(log_dir: &Path) -> std::path::PathBuf {
-    let date_str = chrono::Local::now().format("%Y-%m-%d");
-    log_dir.join(format!("freenet-wrapper.{date_str}.log"))
+    wrapper_log_path_on(log_dir, chrono::Local::now())
+}
+
+/// The wrapper log file for the day `now` falls on.
+fn wrapper_log_path_on(log_dir: &Path, now: chrono::DateTime<chrono::Local>) -> std::path::PathBuf {
+    log_dir.join(format!("freenet-wrapper.{}.log", now.format("%Y-%m-%d")))
 }
 
 /// Status the wrapper writes to `STUCK_STATUS_FILE_NAME` once a repeated,
