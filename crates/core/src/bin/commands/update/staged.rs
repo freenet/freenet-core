@@ -2617,6 +2617,39 @@ mod tests {
         assert_eq!((record.version.as_str(), record.failures), ("9.9.9", 0));
     }
 
+    /// The node passes its real #4073 block list to both staging paths: the
+    /// archives (`stage_into`) and the app bundle (`decide_without_staging`).
+    /// `version_blocked` itself is checked against the state directory above.
+    #[test]
+    fn the_node_stages_with_its_block_list() {
+        let src = include_str!("staged.rs").replace("\r\n", "\n");
+        let production = src
+            .split_once(concat!("#[cfg(test)]\n", "mod tests {"))
+            .unwrap()
+            .0;
+        let body = |signature: &str| -> String {
+            let start = production
+                .find(signature)
+                .unwrap_or_else(|| panic!("{signature}"));
+            let rest = &production[start..];
+            rest[..rest.find("\n}\n").unwrap()]
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .collect::<String>()
+                .split_whitespace()
+                .collect()
+        };
+        let inner = body("\nasync fn stage_latest_release_inner(");
+        assert!(
+            inner.contains(
+                "stage_into(&root,current_version,lookup,target,version_blocked,&production_env(&root),)"
+            ),
+            "{inner}"
+        );
+        let bundle = body("\nasync fn decide_without_staging<");
+        assert!(bundle.contains("target,version_blocked,("), "{bundle}");
+    }
+
     /// The byte budget covers every download in a staging run: fdev's, and
     /// the from-zero re-download after a resumed archive fails its checksum.
     #[tokio::test]
