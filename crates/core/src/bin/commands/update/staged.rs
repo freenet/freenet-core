@@ -181,19 +181,23 @@ impl std::fmt::Display for StageTimedOut {
 
 impl std::error::Error for StageTimedOut {}
 
-/// How many received bytes a [`ByteMeter`] lets accumulate before it writes
-/// them to the budget record, so a run killed mid-download still leaves all
-/// but the last few counted.
+/// How many received bytes beyond what a [`ByteMeter`] has charged it lets
+/// accumulate before it writes them to the budget record (a download longer
+/// than its Content-Length said).
 const METER_PERSIST_EVERY: u64 = 16 * 1024 * 1024;
 
 /// Counts the archive bytes a run receives (staging's or the updater's)
-/// against what is left of the release's daily budget
-/// (`rollback::DOWNLOAD_BYTES_PER_DAY`, per node), and, when it has a ledger,
-/// writes them to that budget's record as it goes.
+/// against what is left of the node's daily budget
+/// (`rollback::DOWNLOAD_BYTES_PER_DAY`), and, when it has a ledger, charges
+/// that budget's record: BEFORE each download's body, for the bytes it is
+/// expected to bring, then reconciled to what actually arrived when it ends.
+/// A run killed mid-download (systemd's `TimeoutStopSec` on the updater) has
+/// therefore already paid for it.
 pub(super) struct ByteMeter<'a> {
     allowance: u64,
     received: std::sync::atomic::AtomicU64,
-    /// Bytes of `received` already written to the ledger.
+    /// Bytes charged to the ledger for this meter: `received`, plus what has
+    /// been charged ahead of a download in progress.
     recorded: std::sync::atomic::AtomicU64,
     ledger: Option<Ledger<'a>>,
 }
@@ -216,8 +220,8 @@ impl<'a> ByteMeter<'a> {
     }
 
     /// A meter allowing `allowance` bytes that charges them to the budget
-    /// record in `dir`, every [`METER_PERSIST_EVERY`] bytes and on
-    /// [`ByteMeter::flush`].
+    /// record in `dir` (see [`ByteMeter::precharge`] and
+    /// [`ByteMeter::flush`]).
     pub(super) fn charged_to(allowance: u64, dir: &Path, clock: Clock<'a>) -> Self {
         Self {
             ledger: Some(Ledger {
@@ -245,13 +249,22 @@ impl<'a> ByteMeter<'a> {
         Ok(())
     }
 
+    /// Charge the ledger, before a download's body arrives, for the
+    /// `expected` bytes it will bring (its Content-Length), never more than
+    /// is left of the allowance, and all of that when the size is unknown.
+    pub(super) fn precharge(&self, expected: Option<u64>) {
+        let received = self.received();
+        let left = self.allowance.saturating_sub(received);
+        self.record(received.saturating_add(expected.map_or(left, |n| n.min(left))));
+    }
+
     /// Count `n` bytes just received; an error once they pass the allowance.
     pub(super) fn spend(&self, n: usize) -> Result<()> {
         use std::sync::atomic::Ordering::Relaxed;
         let n = u64::try_from(n).unwrap_or(u64::MAX);
         let total = self.received.fetch_add(n, Relaxed).saturating_add(n);
         if total.saturating_sub(self.recorded.load(Relaxed)) >= METER_PERSIST_EVERY {
-            self.flush();
+            self.record(total);
         }
         if total > self.allowance {
             return Err(BudgetSpent.into());
@@ -259,20 +272,26 @@ impl<'a> ByteMeter<'a> {
         Ok(())
     }
 
-    /// Write the bytes counted since the last write to the ledger, if any.
-    /// Fails open like the record itself.
+    /// Reconcile the ledger to the bytes actually received: refund what was
+    /// charged ahead and did not arrive, charge what arrived uncharged.
     pub(super) fn flush(&self) {
+        self.record(self.received());
+    }
+
+    /// Bring this meter's charge on the ledger to `total`. Fails open like
+    /// the record itself.
+    fn record(&self, total: u64) {
         use std::sync::atomic::Ordering::Relaxed;
         let Some(ledger) = &self.ledger else {
             return;
         };
-        let received = self.received();
-        let before = self.recorded.swap(received, Relaxed);
-        super::super::rollback::charge_download_bytes_at(
-            &ledger.dir,
-            received.saturating_sub(before),
-            (ledger.clock)(),
-        );
+        let before = self.recorded.swap(total, Relaxed);
+        let now = (ledger.clock)();
+        if total > before {
+            super::super::rollback::charge_download_bytes_at(&ledger.dir, total - before, now);
+        } else {
+            super::super::rollback::refund_download_bytes_at(&ledger.dir, before - total, now);
+        }
     }
 }
 
@@ -1340,10 +1359,8 @@ fn remove_quietly(path: &Path) {
 /// is allowed to finish, one that passes the budget is stopped (the bytes
 /// kept, so a later attempt resumes them).
 async fn download_resumable(url: &str, part: &Path, meter: &ByteMeter<'_>) -> Result<bool> {
-    use futures::StreamExt;
     use reqwest::StatusCode;
     use reqwest::header::{CONTENT_RANGE, RANGE};
-    use tokio::io::AsyncWriteExt;
 
     meter.check()?;
     let have = fs::metadata(part).map(|m| m.len()).unwrap_or(0);
@@ -1362,7 +1379,7 @@ async fn download_resumable(url: &str, part: &Path, meter: &ByteMeter<'_>) -> Re
     }
 
     let resumed;
-    let mut file = if have > 0 && status == StatusCode::PARTIAL_CONTENT {
+    let file = if have > 0 && status == StatusCode::PARTIAL_CONTENT {
         // Append only if the server is continuing from exactly where we are.
         let resumes_here = response
             .headers()
@@ -1394,9 +1411,26 @@ async fn download_resumable(url: &str, part: &Path, meter: &ByteMeter<'_>) -> Re
         anyhow::bail!("Download failed: {status}");
     };
 
-    // A local write failure (most likely a full disk) gives the space back
-    // rather than keep a partial file nobody can finish. A network failure
-    // keeps it, so the next attempt resumes.
+    // Charged before the body, so a run killed mid-download has paid for it;
+    // reconciled to what arrived once the download ends, however it ends.
+    meter.precharge(response.content_length());
+    let received = receive_into(response, file, part, meter).await;
+    meter.flush();
+    received.map(|()| resumed)
+}
+
+/// Write `response`'s body to `file` (the partial download at `part`),
+/// counting it against `meter`. A local write failure (most likely a full
+/// disk) gives the space back rather than keep a partial file nobody can
+/// finish. A network failure keeps it, so the next attempt resumes.
+async fn receive_into(
+    response: reqwest::Response,
+    mut file: tokio::fs::File,
+    part: &Path,
+    meter: &ByteMeter<'_>,
+) -> Result<()> {
+    use futures::StreamExt;
+    use tokio::io::AsyncWriteExt;
     let mut stream = response.bytes_stream();
     let mut write_failure = None;
     let mut over_budget = None;
@@ -1429,7 +1463,7 @@ async fn download_resumable(url: &str, part: &Path, meter: &ByteMeter<'_>) -> Re
     if let Some(e) = over_budget {
         return Err(e);
     }
-    Ok(resumed)
+    Ok(())
 }
 
 fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
@@ -3074,20 +3108,50 @@ mod tests {
         }
     }
 
-    /// The meter writes what a download receives to the budget record as it
-    /// arrives, every METER_PERSIST_EVERY bytes, so a run killed mid-download
-    /// (here: one that ends without the run's final flush) leaves its bytes
-    /// counted; the flush adds the rest.
+    /// A staging download is charged for its Content-Length before its body
+    /// arrives, so one abandoned mid-way (the run killed) leaves that charge
+    /// on the ledger; one that ends, here cut short by the server, is
+    /// reconciled to the bytes that actually arrived.
     #[tokio::test]
-    async fn a_killed_download_leaves_its_bytes_counted() {
+    async fn a_download_is_charged_before_its_body_and_reconciled_after() {
         use super::super::super::rollback::download_bytes_at;
+        use super::super::tests::stalling_server;
         const MIB: u64 = 1024 * 1024;
+        let now = SystemTime::now();
+        let clock = move || now;
+        // Abandoned: the server sends 100 bytes of 5 MiB and stalls.
+        let (_tmp, root) = test_root();
+        let dir = root.parent().unwrap();
+        fs::create_dir_all(&root).unwrap();
+        let prefix = stalling_server(5 << 20, 100).await;
+        let meter = ByteMeter::charged_to(u64::MAX, dir, &clock);
+        let part = root.join("asset.part");
+        let abandoned = tokio::time::timeout(
+            Duration::from_millis(500),
+            download_resumable(&format!("{prefix}asset"), &part, &meter),
+        )
+        .await;
+        assert!(abandoned.is_err(), "the download was still running");
+        assert_eq!(download_bytes_at(dir, now), 5 * MIB, "charged up front");
+        // Never more than the allowance left.
+        let (_tmp, root) = test_root();
+        let dir = root.parent().unwrap();
+        fs::create_dir_all(&root).unwrap();
+        let meter = ByteMeter::charged_to(MIB, dir, &clock);
+        let part = root.join("asset.part");
+        drop(
+            tokio::time::timeout(
+                Duration::from_millis(500),
+                download_resumable(&format!("{prefix}asset"), &part, &meter),
+            )
+            .await,
+        );
+        assert_eq!(download_bytes_at(dir, now), MIB);
+        // Ended: 40 MiB declared, 20 MiB sent, then the connection closes.
         let (prefix, _, _) = restarting_server(Vec::new(), 40 << 20, 20 << 20).await;
         let (_tmp, root) = test_root();
         let dir = root.parent().unwrap();
         fs::create_dir_all(&root).unwrap();
-        let now = SystemTime::now();
-        let clock = move || now;
         let meter = ByteMeter::charged_to(u64::MAX, dir, &clock);
         let part = root.join("asset.part");
         assert!(
@@ -3096,19 +3160,12 @@ mod tests {
                 .is_err(),
             "the server stops half way"
         );
-        assert_eq!(METER_PERSIST_EVERY, 16 * MIB);
-        let counted = download_bytes_at(dir, now);
-        assert!(
-            (METER_PERSIST_EVERY..20 * MIB).contains(&counted),
-            "{counted} counted before the flush"
-        );
-        meter.flush();
-        assert_eq!(download_bytes_at(dir, now), 20 * MIB);
+        assert_eq!(download_bytes_at(dir, now), 20 * MIB, "reconciled");
         meter.flush();
         assert_eq!(
             download_bytes_at(dir, now),
             20 * MIB,
-            "a second flush adds nothing"
+            "a second reconcile changes nothing"
         );
     }
 

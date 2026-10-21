@@ -1962,10 +1962,11 @@ fn get_archive_extension() -> &'static str {
     }
 }
 
-/// Download `url` to `dest`, charging the bytes received to `meter`, the
-/// release's daily download budget (#5799): refused before the request when
-/// the budget is spent, stopped once it runs out, and written to the budget
-/// record whatever the outcome.
+/// Download `url` to `dest`, charging it to `meter`, the node's daily
+/// download budget (#5799): refused before the request when the budget is
+/// spent, charged for its Content-Length before the body arrives, stopped
+/// once the budget runs out, and reconciled to the bytes received whatever
+/// the outcome.
 async fn download_file(
     url: &str,
     dest: &Path,
@@ -2004,6 +2005,9 @@ async fn download_file_counted(
     if !response.status().is_success() {
         anyhow::bail!("Download failed: {}", response.status());
     }
+    // Charged before the body, so a run that systemd kills mid-download has
+    // paid for it; `download_file` reconciles to what arrived.
+    meter.precharge(response.content_length());
 
     let total_size = response.content_length().unwrap_or(0);
     let mut downloaded: u64 = 0;
@@ -4402,6 +4406,57 @@ done
     /// behaviour rather than source. A verification failure goes to the #4073
     /// gate and never to the cooldown; every other failure cools the release
     /// down carrying its full error chain; an install clears.
+    /// A server that answers every request with `declared` bytes of
+    /// Content-Length, sends `sent` of them, and then stalls with the
+    /// connection open: a download a run is killed in the middle of.
+    pub(crate) async fn stalling_server(declared: usize, sent: usize) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let prefix = format!("http://{}/", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            while let Ok((mut conn, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut request = Vec::new();
+                    let mut buf = [0u8; 1024];
+                    while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match conn.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => request.extend_from_slice(&buf[..n]),
+                        }
+                    }
+                    let mut reply =
+                        format!("HTTP/1.1 200 OK\r\nContent-Length: {declared}\r\n\r\n")
+                            .into_bytes();
+                    reply.extend(std::iter::repeat_n(b'x', sent));
+                    #[allow(clippy::let_underscore_must_use)]
+                    let _ = conn.write_all(&reply).await;
+                    tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                });
+            }
+        });
+        prefix
+    }
+
+    /// #5799: an updater download systemd kills mid-way (here: abandoned)
+    /// leaves its Content-Length charged; one that completes is reconciled
+    /// to what arrived.
+    #[tokio::test]
+    async fn an_abandoned_updater_download_leaves_its_precharge() {
+        use rollback::download_bytes_at;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let now = std::time::SystemTime::now();
+        let prefix = stalling_server(3_000_000, 100).await;
+        let meter = updater_meter_at(Some(dir), false, now).unwrap();
+        let abandoned = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            download_file(&format!("{prefix}dmg"), &dir.join("dmg"), true, &meter),
+        )
+        .await;
+        assert!(abandoned.is_err(), "the download was still running");
+        assert_eq!(download_bytes_at(dir, now), 3_000_000);
+    }
+
     /// #5799: the updater draws on the byte budget staging uses, per node
     /// per day. A spent budget refuses an updater run before it requests the
     /// asset list; `--force` is never refused.
