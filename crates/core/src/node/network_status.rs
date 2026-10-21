@@ -2737,6 +2737,26 @@ mod tests {
         }
     }
 
+    /// The classifier parses the real Display text of a transport version
+    /// mismatch, not a copy of it, so rewording that text fails here.
+    #[test]
+    fn test_classify_the_real_version_mismatch_text() {
+        let error = crate::transport::TransportError::ProtocolVersionMismatch {
+            expected: "0.2.150".into(),
+            actual: "0.2.149".into(),
+        };
+        let message = crate::node::network_bridge::ConnectionError::from(error).to_string();
+        match classify_transport_error(&message) {
+            FailureReason::VersionMismatch { local, gateway } => {
+                assert_eq!(local, "0.2.149");
+                assert_eq!(gateway, "0.2.150");
+            }
+            FailureReason::NatTraversalFailed
+            | FailureReason::Timeout
+            | FailureReason::Other(_) => panic!("expected VersionMismatch from {message:?}"),
+        }
+    }
+
     #[test]
     fn test_classify_nat_traversal() {
         let msg = "failed while establishing connection, reason: max connection attempts reached";

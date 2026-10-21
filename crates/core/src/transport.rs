@@ -376,13 +376,6 @@ pub enum TransportError {
         "Version incompatibility with gateway\n  Your client version: {actual}\n  Gateway version: {expected}\n  \n  To fix this, update your Freenet client:\n    cargo install --force freenet --version {expected}\n  \n  Or if building from source:\n    git pull && cargo install --path crates/core"
     )]
     ProtocolVersionMismatch { expected: String, actual: String },
-    /// A UDP `send_to` to this address failed with this error kind. On an
-    /// established connection it is transient: one packet failed and the
-    /// connection survives (see [`Self::is_transient`]). When
-    /// a handshake returns it, it is fatal: the connection attempt is over
-    /// (#5871).
-    #[error("send to {0} failed: {1}")]
-    SendFailed(SocketAddr, std::io::ErrorKind),
     #[error("outbound stream to {0} failed (stream-scoped, connection survives)")]
     OutboundStreamFailed(SocketAddr),
     /// An outbound stream was not started because its length is outside
@@ -392,13 +385,74 @@ pub enum TransportError {
     #[error("outbound stream to {0} not sent: length {1} is outside the stream limits")]
     OutboundStreamInvalidLength(SocketAddr, u64),
     #[error(transparent)]
-    IO(#[from] std::io::Error),
-    #[error(transparent)]
     Other(#[from] anyhow::Error),
+    /// An error only the UDP transport produces (a socket send or I/O
+    /// failure, a handshake decryption failure, its own wire encoding).
+    /// Opaque above the transport: classify it with [`Self::scope`].
     #[error(transparent)]
-    PubKeyDecryptionError(#[from] crypto::DecryptionError),
+    Udp(UdpError),
+}
+
+/// An error only the UDP transport produces, inside [`TransportError::Udp`].
+/// Its kind is private to the transport; its Display is the kind's, exactly
+/// as the variants it replaced displayed.
+#[derive(thiserror::Error)]
+#[error(transparent)]
+pub struct UdpError(pub(in crate::transport) UdpErrorKind);
+
+impl std::fmt::Debug for UdpError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(&self.0, f)
+    }
+}
+
+/// What went wrong in a [`UdpError`].
+#[derive(Debug, thiserror::Error)]
+pub(in crate::transport) enum UdpErrorKind {
+    /// A UDP `send_to` to this address failed with this error kind. On an
+    /// established connection it is transient: one packet failed and the
+    /// connection survives (see [`TransportError::is_transient`]). When a
+    /// handshake returns it, it is fatal: the connection attempt is over
+    /// (#5871).
+    #[error("send to {0} failed: {1}")]
+    SendFailed(SocketAddr, std::io::ErrorKind),
     #[error(transparent)]
-    Serialization(#[from] bincode::Error),
+    IO(std::io::Error),
+    #[error(transparent)]
+    PubKeyDecryptionError(crypto::DecryptionError),
+    #[error(transparent)]
+    Serialization(bincode::Error),
+}
+
+impl From<UdpErrorKind> for TransportError {
+    fn from(kind: UdpErrorKind) -> Self {
+        TransportError::Udp(UdpError(kind))
+    }
+}
+
+impl From<std::io::Error> for TransportError {
+    fn from(error: std::io::Error) -> Self {
+        UdpErrorKind::IO(error).into()
+    }
+}
+
+impl From<crypto::DecryptionError> for TransportError {
+    fn from(error: crypto::DecryptionError) -> Self {
+        UdpErrorKind::PubKeyDecryptionError(error).into()
+    }
+}
+
+impl From<bincode::Error> for TransportError {
+    fn from(error: bincode::Error) -> Self {
+        UdpErrorKind::Serialization(error).into()
+    }
+}
+
+impl TransportError {
+    /// A UDP `send_to` to `addr` failed with `kind`.
+    pub(in crate::transport) fn send_failed(addr: SocketAddr, kind: std::io::ErrorKind) -> Self {
+        UdpErrorKind::SendFailed(addr, kind).into()
+    }
 }
 
 /// What a [`TransportError`] ends, as seen from above the transport.
@@ -428,18 +482,19 @@ impl TransportError {
     /// here, not fall into a default.
     pub fn scope(&self) -> ErrorScope {
         match self {
-            TransportError::SendFailed(..) | TransportError::OutboundStreamFailed(..) => {
-                ErrorScope::Transient
-            }
+            TransportError::OutboundStreamFailed(..)
+            | TransportError::Udp(UdpError(UdpErrorKind::SendFailed(..))) => ErrorScope::Transient,
             TransportError::OutboundStreamInvalidLength(..) => ErrorScope::Stream,
             TransportError::ChannelClosed
             | TransportError::ConnectionClosed(_)
             | TransportError::ConnectionEstablishmentFailure { .. }
             | TransportError::ProtocolVersionMismatch { .. }
-            | TransportError::IO(_)
             | TransportError::Other(_)
-            | TransportError::PubKeyDecryptionError(_)
-            | TransportError::Serialization(_) => ErrorScope::Connection,
+            | TransportError::Udp(UdpError(
+                UdpErrorKind::IO(_)
+                | UdpErrorKind::PubKeyDecryptionError(_)
+                | UdpErrorKind::Serialization(_),
+            )) => ErrorScope::Connection,
         }
     }
 
@@ -465,7 +520,7 @@ impl TransportError {
     /// times out and retries against another candidate.
     ///
     /// Covers:
-    /// - [`TransportError::SendFailed`]: a transient UDP send error (e.g.
+    /// - `UdpErrorKind::SendFailed`: a transient UDP send error (e.g.
     ///   ENETUNREACH) on a single packet of an established connection.
     ///   The handshake also returns `SendFailed` (#5871), and there it is
     ///   FATAL: it ends the connection attempt. Do not apply this predicate
@@ -772,6 +827,38 @@ mod tests {
     use crate::transport::received_packet_tracker::ReportResult;
     use crate::transport::sent_packet_tracker::ResendAction;
 
+    /// Each UDP-only error displays exactly as the `TransportError` variant
+    /// it replaced did, and classifies the same way.
+    #[test]
+    fn udp_errors_display_and_classify_as_before() {
+        let addr: SocketAddr = "192.0.2.1:4000".parse().unwrap();
+        let kind = io::ErrorKind::NetworkUnreachable;
+        let send = TransportError::send_failed(addr, kind);
+        assert_eq!(send.to_string(), format!("send to {addr} failed: {kind}"));
+        assert_eq!(send.scope(), ErrorScope::Transient);
+
+        let io_error = TransportError::from(io::Error::other("socket gone"));
+        assert_eq!(io_error.to_string(), "socket gone");
+        assert_eq!(io_error.scope(), ErrorScope::Connection);
+
+        let decrypt = TransportError::from(crypto::DecryptionError::DecryptionFailed);
+        assert_eq!(
+            decrypt.to_string(),
+            crypto::DecryptionError::DecryptionFailed.to_string()
+        );
+        assert_eq!(decrypt.scope(), ErrorScope::Connection);
+
+        let serialization = bincode::deserialize::<u64>(&[]).unwrap_err();
+        let expected = serialization.to_string();
+        let encoded = TransportError::from(serialization);
+        assert_eq!(encoded.to_string(), expected);
+        assert_eq!(encoded.scope(), ErrorScope::Connection);
+
+        for error in [&send, &io_error, &decrypt, &encoded] {
+            assert!(matches!(error, TransportError::Udp(_)), "{error:?}");
+        }
+    }
+
     /// Every variant keeps the decision the node made before errors were
     /// classified through `scope()`: the node continued on `SendFailed` and
     /// `OutboundStreamFailed` and closed the connection on everything else.
@@ -792,15 +879,23 @@ mod tests {
                 TransportError::ProtocolVersionMismatch { .. } => {
                     (ErrorScope::Connection, false, true)
                 }
-                TransportError::SendFailed(..) => (ErrorScope::Transient, true, false),
+                TransportError::Udp(UdpError(UdpErrorKind::SendFailed(..))) => {
+                    (ErrorScope::Transient, true, false)
+                }
                 TransportError::OutboundStreamFailed(_) => (ErrorScope::Transient, true, false),
                 TransportError::OutboundStreamInvalidLength(..) => {
                     (ErrorScope::Stream, false, false)
                 }
-                TransportError::IO(_) => (ErrorScope::Connection, false, true),
+                TransportError::Udp(UdpError(UdpErrorKind::IO(_))) => {
+                    (ErrorScope::Connection, false, true)
+                }
                 TransportError::Other(_) => (ErrorScope::Connection, false, true),
-                TransportError::PubKeyDecryptionError(_) => (ErrorScope::Connection, false, true),
-                TransportError::Serialization(_) => (ErrorScope::Connection, false, true),
+                TransportError::Udp(UdpError(UdpErrorKind::PubKeyDecryptionError(_))) => {
+                    (ErrorScope::Connection, false, true)
+                }
+                TransportError::Udp(UdpError(UdpErrorKind::Serialization(_))) => {
+                    (ErrorScope::Connection, false, true)
+                }
             }
         }
 
@@ -813,13 +908,13 @@ mod tests {
                 expected: "1".into(),
                 actual: "2".into(),
             },
-            TransportError::SendFailed(addr, io::ErrorKind::NetworkUnreachable),
+            TransportError::send_failed(addr, io::ErrorKind::NetworkUnreachable),
             TransportError::OutboundStreamFailed(addr),
             TransportError::OutboundStreamInvalidLength(addr, 0),
-            TransportError::IO(io::Error::other("x")),
+            TransportError::from(io::Error::other("x")),
             TransportError::Other(anyhow::anyhow!("x")),
-            TransportError::PubKeyDecryptionError(crypto::DecryptionError::DecryptionFailed),
-            TransportError::Serialization(bincode::deserialize::<u64>(&[]).unwrap_err()),
+            TransportError::from(crypto::DecryptionError::DecryptionFailed),
+            TransportError::from(bincode::deserialize::<u64>(&[]).unwrap_err()),
         ];
         for err in &cases {
             let (scope, old_transient, closes) = expected(err);

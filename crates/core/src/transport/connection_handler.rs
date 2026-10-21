@@ -30,7 +30,7 @@ use tracing::{Instrument, span};
 use version_cmp::PROTOC_VERSION;
 
 use super::{
-    Socket, TransportError,
+    Socket, TransportError, UdpError, UdpErrorKind,
     congestion_control::{CongestionControl, CongestionControlConfig},
     crypto::{TransportKeypair, TransportPublicKey},
     global_bandwidth::GlobalBandwidthManager,
@@ -304,9 +304,9 @@ async fn bind_socket_with_retry<S: Socket>(
         }
     }
 
-    Err(last_err
-        .map(TransportError::from)
-        .unwrap_or_else(|| TransportError::IO(std::io::ErrorKind::AddrInUse.into())))
+    Err(last_err.map(TransportError::from).unwrap_or_else(|| {
+        TransportError::from(std::io::Error::from(std::io::ErrorKind::AddrInUse))
+    }))
 }
 
 /// Receives  new inbound connections from the network.
@@ -1972,7 +1972,7 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                                     crate::transport::TRANSPORT_METRICS
                                         .record_nat_traversal_failed_version();
                                 }
-                                TransportError::ChannelClosed | TransportError::ConnectionClosed(_) | TransportError::ConnectionEstablishmentFailure { .. } | TransportError::SendFailed(..) | TransportError::OutboundStreamFailed(_) | TransportError::OutboundStreamInvalidLength(..) | TransportError::IO(_) | TransportError::Other(_) | TransportError::PubKeyDecryptionError(_) | TransportError::Serialization(_) => {
+                                TransportError::ChannelClosed | TransportError::ConnectionClosed(_) | TransportError::ConnectionEstablishmentFailure { .. } | TransportError::Udp(UdpError(UdpErrorKind::SendFailed(..))) | TransportError::OutboundStreamFailed(_) | TransportError::OutboundStreamInvalidLength(..) | TransportError::Udp(UdpError(UdpErrorKind::IO(_))) | TransportError::Other(_) | TransportError::Udp(UdpError(UdpErrorKind::PubKeyDecryptionError(_))) | TransportError::Udp(UdpError(UdpErrorKind::Serialization(_))) => {
                                     tracing::error!(error = %error, peer_addr = %remote_addr, "Failed NAT traversal");
                                     crate::transport::TRANSPORT_METRICS
                                         .record_nat_traversal_failed_error();
@@ -2937,7 +2937,7 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                     error = %err,
                     "Outbound handshake failed: sends to the remote are failing"
                 );
-                return Err(TransportError::SendFailed(remote_addr, err.kind()));
+                return Err(TransportError::send_failed(remote_addr, err.kind()));
             }
             tracing::warn!(
                 peer_addr = %remote_addr,
@@ -2994,16 +2994,16 @@ fn classify_nat_failure(
     }
     match error {
         TransportError::ProtocolVersionMismatch { .. } => NatFailureKind::VersionIncompatible,
-        TransportError::SendFailed(..) => NatFailureKind::SendError,
+        TransportError::Udp(UdpError(UdpErrorKind::SendFailed(..))) => NatFailureKind::SendError,
         TransportError::ChannelClosed
         | TransportError::ConnectionClosed(_)
         | TransportError::ConnectionEstablishmentFailure { .. }
         | TransportError::OutboundStreamFailed(_)
         | TransportError::OutboundStreamInvalidLength(..)
-        | TransportError::IO(_)
+        | TransportError::Udp(UdpError(UdpErrorKind::IO(_)))
         | TransportError::Other(_)
-        | TransportError::PubKeyDecryptionError(_)
-        | TransportError::Serialization(_) => {
+        | TransportError::Udp(UdpError(UdpErrorKind::PubKeyDecryptionError(_)))
+        | TransportError::Udp(UdpError(UdpErrorKind::Serialization(_))) => {
             if flags & O::DEADLINE == 0 {
                 NatFailureKind::Other
             } else if flags & O::RECEIVED == 0 {
@@ -3059,7 +3059,7 @@ mod nat_failure_classification_tests {
                 NatFailureKind::VersionIncompatible,
             ),
             (
-                TransportError::SendFailed(addr, std::io::ErrorKind::NetworkUnreachable),
+                TransportError::send_failed(addr, std::io::ErrorKind::NetworkUnreachable),
                 O::DEADLINE,
                 NatFailureKind::SendError,
             ),
@@ -3080,7 +3080,7 @@ mod nat_failure_classification_tests {
             ),
             // ...and even when the attempt then ended on a failed send.
             (
-                TransportError::SendFailed(addr, std::io::ErrorKind::NetworkUnreachable),
+                TransportError::send_failed(addr, std::io::ErrorKind::NetworkUnreachable),
                 O::DEADLINE | O::RECEIVED | O::DECRYPTED | O::VERSION_INCOMPATIBLE,
                 NatFailureKind::VersionIncompatible,
             ),
@@ -3184,7 +3184,7 @@ fn handshake_send_failed(
             "Handshake send failed"
         );
     }
-    TransportError::SendFailed(remote_addr, err.kind())
+    TransportError::send_failed(remote_addr, err.kind())
 }
 
 /// Build the success ack for a peer whose protocol version we have just parsed
@@ -3413,13 +3413,15 @@ pub mod mock_transport {
             TransportError::ChannelClosed
             | TransportError::ConnectionClosed(_)
             | TransportError::ConnectionEstablishmentFailure { .. }
-            | TransportError::SendFailed(..)
+            | TransportError::Udp(UdpError(UdpErrorKind::SendFailed(..)))
             | TransportError::OutboundStreamFailed(_)
             | TransportError::OutboundStreamInvalidLength(..)
-            | TransportError::IO(_)
+            | TransportError::Udp(UdpError(UdpErrorKind::IO(_)))
             | TransportError::Other(_)
-            | TransportError::PubKeyDecryptionError(_)
-            | TransportError::Serialization(_) => panic!("Expected ProtocolVersionMismatch error"),
+            | TransportError::Udp(UdpError(UdpErrorKind::PubKeyDecryptionError(_)))
+            | TransportError::Udp(UdpError(UdpErrorKind::Serialization(_))) => {
+                panic!("Expected ProtocolVersionMismatch error")
+            }
         }
 
         let err_msg_no_version = "remote is using a different protocol version".to_string();
@@ -3430,13 +3432,13 @@ pub mod mock_transport {
             TransportError::ChannelClosed
             | TransportError::ConnectionClosed(_)
             | TransportError::ProtocolVersionMismatch { .. }
-            | TransportError::SendFailed(..)
+            | TransportError::Udp(UdpError(UdpErrorKind::SendFailed(..)))
             | TransportError::OutboundStreamFailed(_)
             | TransportError::OutboundStreamInvalidLength(..)
-            | TransportError::IO(_)
+            | TransportError::Udp(UdpError(UdpErrorKind::IO(_)))
             | TransportError::Other(_)
-            | TransportError::PubKeyDecryptionError(_)
-            | TransportError::Serialization(_) => {
+            | TransportError::Udp(UdpError(UdpErrorKind::PubKeyDecryptionError(_)))
+            | TransportError::Udp(UdpError(UdpErrorKind::Serialization(_))) => {
                 panic!("Expected ConnectionEstablishmentFailure error")
             }
         }
@@ -6214,7 +6216,10 @@ pub mod mock_transport {
                 spawn_listener_with_recv_errors(47_200 + i as u16, channels, vec![err]).await;
             let exited = tokio::time::timeout(Duration::from_secs(5), listen).await;
             assert!(
-                matches!(exited, Ok(Ok(TransportError::IO(_)))),
+                matches!(
+                    exited,
+                    Ok(Ok(TransportError::Udp(UdpError(UdpErrorKind::IO(_)))))
+                ),
                 "{name}: listener must exit with the IO error, got {exited:?}"
             );
         }
@@ -6544,7 +6549,7 @@ pub mod mock_transport {
         assert!(
             matches!(
                 err,
-                TransportError::SendFailed(addr, std::io::ErrorKind::NetworkUnreachable)
+                TransportError::Udp(UdpError(UdpErrorKind::SendFailed(addr, std::io::ErrorKind::NetworkUnreachable)))
                     if addr == remote_addr
             ),
             "expected SendFailed({remote_addr}, NetworkUnreachable), got {err:?}"
@@ -6680,7 +6685,10 @@ pub mod mock_transport {
         assert!(
             matches!(
                 err,
-                TransportError::SendFailed(_, std::io::ErrorKind::NetworkUnreachable)
+                TransportError::Udp(UdpError(UdpErrorKind::SendFailed(
+                    _,
+                    std::io::ErrorKind::NetworkUnreachable
+                )))
             ),
             "the last send failed, so the attempt reports it; got {err:?}"
         );
@@ -6714,7 +6722,7 @@ pub mod mock_transport {
         assert!(
             matches!(
                 err,
-                TransportError::SendFailed(addr, std::io::ErrorKind::NetworkUnreachable)
+                TransportError::Udp(UdpError(UdpErrorKind::SendFailed(addr, std::io::ErrorKind::NetworkUnreachable)))
                     if addr == gw_addr
             ),
             "expected SendFailed({gw_addr}, NetworkUnreachable), got {err:?}"
