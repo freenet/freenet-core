@@ -3222,7 +3222,7 @@ async fn packet_sending<S: super::Socket, T: crate::simulation::TimeSource>(
                         error = %e,
                         "Failed to send packet (transient)"
                     );
-                    Err(TransportError::SendFailed(remote_addr, e.kind()))
+                    Err(TransportError::send_failed(remote_addr, e.kind()))
                 }
             }
         }
@@ -3253,7 +3253,7 @@ async fn packet_sending<S: super::Socket, T: crate::simulation::TimeSource>(
             socket
                 .send_to(&packet, remote_addr)
                 .await
-                .map_err(|e| TransportError::SendFailed(remote_addr, e.kind()))?;
+                .map_err(|e| TransportError::send_failed(remote_addr, e.kind()))?;
             super::shadow_demand::record_outbound(outbound_class, packet.len());
             report_sent_tagged(
                 &mut sent_tracker.lock(),
@@ -3297,7 +3297,7 @@ async fn send_untracked_receipts<S: super::Socket>(
         socket
             .send_to(&packet, remote_addr)
             .await
-            .map_err(|e| TransportError::SendFailed(remote_addr, e.kind()))?;
+            .map_err(|e| TransportError::send_failed(remote_addr, e.kind()))?;
         // Phase 1.6 (#4074): ack-only NoOps are must-flow.
         super::shadow_demand::record_outbound(
             super::shadow_demand::OutboundClass::MustFlow,
@@ -3663,7 +3663,7 @@ mod tests {
             ErrorKind::WouldBlock,
             ErrorKind::TimedOut,
         ] {
-            let err = TransportError::SendFailed(remote_addr, kind);
+            let err = TransportError::send_failed(remote_addr, kind);
             assert!(
                 err.is_transient(),
                 "SendFailed({kind:?}) must be transient so the connection survives — issue #3321"
@@ -5782,8 +5782,8 @@ mod tests {
     /// counter must move before the error propagates.
     ///
     /// Reachability note: from an outbound stream this arm is only reachable
-    /// via `TransportError::Serialization` — the sole non-transient error
-    /// `packet_sending` can produce (a bincode failure from
+    /// via a serialization error (`UdpErrorKind::Serialization`) — the sole
+    /// non-transient error `packet_sending` can produce (a bincode failure from
     /// `try_serialize_msg_to_packet_data`); every other outbound-stream error
     /// is `OutboundStreamFailed` or `SendFailed`, both transient. That is
     /// exactly why instrumenting ONLY this arm would have left the counter

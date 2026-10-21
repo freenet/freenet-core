@@ -27,9 +27,17 @@
 //!   QUIC transport would be a single `connect().await`), and it dials by
 //!   the X25519 [`TransportPublicKey`] where QUIC identifies a peer by its
 //!   certificate.
-//! - [`TransportError`]'s variants are UDP-shaped. The bridge classifies
-//!   errors only through [`TransportError::scope`], but still constructs
-//!   `ConnectionClosed` and `Other` itself.
+//! - [`TransportError`]: the UDP transport's own errors (socket send and
+//!   I/O failures, handshake decryption, its wire encoding) sit inside the
+//!   opaque [`TransportError::Udp`], which nothing above the transport can
+//!   look into; the bridge classifies errors only through
+//!   [`TransportError::scope`] and constructs only neutral variants. That
+//!   last part is a convention nothing enforces: the public `From` impls for
+//!   `io::Error`, `bincode::Error` and `DecryptionError` still turn a plain
+//!   `?` anywhere into `Udp(..)`, and node code must not rely on them. The
+//!   other variants are transport-neutral, including `ProtocolVersionMismatch`
+//!   (version negotiation exists under any transport), whose Display text is
+//!   parsed by `network_status::classify_transport_error`.
 //! - Stream ids are chosen by the SENDER ([`StreamId::next`]), not by the
 //!   transport: this is deliberate and stays (see [`StreamId`]).
 //! - [`IncomingStream`] reports progress in fragments

@@ -3359,7 +3359,7 @@ async fn handle_peer_channel_message(
                     let serialized_len = data.len();
                     conn.send_bytes(data).await.map(|()| serialized_len)
                 }
-                Err(error) => Err(TransportError::from(error)),
+                Err(error) => Err(serialization_failure(error)),
             };
             match sent {
                 Ok(serialized_len) => {
@@ -3374,7 +3374,7 @@ async fn handle_peer_channel_message(
                 Err(error) => {
                     tracing::error!(
                         to = %conn.remote_addr(),
-                        ?error,
+                        error = %error,
                         "[CONN_LIFECYCLE] Failed to send message to peer"
                     );
                     return Err(error);
@@ -3594,7 +3594,7 @@ async fn peer_connection_listener(
                         } else {
                             tracing::debug!(
                                 to = %remote_addr,
-                                ?error,
+                                error = %error,
                                 "[CONN_LIFECYCLE] Connection closed after channel command"
                             );
                             // Drain any messages that arrived after our try_recv() but before
@@ -3661,7 +3661,7 @@ async fn peer_connection_listener(
                             } else {
                                 tracing::debug!(
                                     to = %remote_addr,
-                                    ?error,
+                                    error = %error,
                                     "[CONN_LIFECYCLE] Connection closed after channel command"
                                 );
                                 // Drain any messages that arrived while we were processing this one
@@ -3832,6 +3832,17 @@ fn listener_exit_error(exit: &ListenerExit) -> anyhow::Error {
     )
 }
 
+/// The send error for a message this node could not serialize. It is the
+/// node's failure, not the transport's, so it is reported as
+/// `TransportError::Other`, with the same text and the same classification
+/// (it closes the connection) as the transport's own serialization error.
+/// The send path logs errors with Display (`%error`), so the `anyhow`
+/// wrapper's Debug form, and any backtrace it captured under
+/// `RUST_BACKTRACE`, never reaches the log.
+fn serialization_failure(error: bincode::Error) -> TransportError {
+    TransportError::Other(anyhow::Error::from(error))
+}
+
 #[inline(always)]
 fn decode_msg(data: &[u8]) -> Result<NetMessage, ConnectionError> {
     bincode::deserialize(data).map_err(|err| ConnectionError::Serialization(Some(err)))
@@ -3948,6 +3959,20 @@ pub(crate) mod tests {
                 );
             }
         }
+    }
+
+    /// A message the node cannot serialize fails its send as an `Other`
+    /// error with exactly the text and classification the transport's own
+    /// serialization error had.
+    #[test]
+    fn a_node_serialization_failure_reads_as_before() {
+        let error = || bincode::deserialize::<u64>(&[]).unwrap_err();
+        let node = super::serialization_failure(error());
+        let transport = super::TransportError::from(error());
+        assert!(matches!(node, super::TransportError::Other(_)), "{node:?}");
+        assert_eq!(node.to_string(), transport.to_string());
+        assert_eq!(node.scope(), transport.scope());
+        assert!(node.closes_connection());
     }
 
     /// A connection that records the bytes it is asked to send, and fails
