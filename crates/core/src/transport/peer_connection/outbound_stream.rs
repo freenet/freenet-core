@@ -964,8 +964,18 @@ where
             if let Some(meta) = pending_metadata.take() {
                 // Note: The 41-byte overhead already includes Option discriminant (1 byte)
                 // and length prefix (8 bytes). Only add the metadata data length.
-                let required_size = payload.len() + 41 + meta.len();
-                if required_size <= packet_data::MAX_DATA_SIZE {
+                // The size of the fragment as it would be serialized with the
+                // metadata embedded, not an estimate: the old
+                // `payload + 41 + meta` left out the metadata's 8-byte length
+                // and could approve an embed that then failed to serialize.
+                let required_size = symmetric_message::SymmetricMessage::stream_fragment_size(
+                    outbound_stream_id,
+                    total_bytes,
+                    fragment_number,
+                    &payload,
+                    Some(&meta),
+                );
+                if required_size <= packet_data::MAX_DATA_SIZE as u64 {
                     Some(meta)
                 } else {
                     tracing::debug!(
@@ -1281,6 +1291,30 @@ mod tests {
             matches!(result, Err(TransportError::OutboundStreamFailed(_))),
             "a short stream must fail the pipe: {result:?}"
         );
+    }
+
+    /// Metadata is embedded in a forwarded fragment #1 only when the real
+    /// serialized fragment fits. Here payload + metadata leaves 5 bytes by
+    /// the old `payload + 41 + meta` estimate, but the metadata's 8-byte
+    /// length prefix does not fit: the pipe must skip the embed, not fail.
+    #[tokio::test]
+    async fn pipe_skips_metadata_that_would_overflow_fragment_one() {
+        use super::super::streaming_buffer::FRAGMENT_PAYLOAD_SIZE as F;
+        let meta = Bytes::from(vec![9u8; 40]);
+        let first = F - meta.len() - 5;
+        let expected = payload_of(first + F);
+        let chunks = futures::stream::iter(vec![
+            Ok(Bytes::copy_from_slice(&expected[..first])),
+            Ok(Bytes::copy_from_slice(&expected[first..])),
+        ]);
+        let (fragments, result) =
+            pipe_and_capture_result(expected.len() as u64, chunks, Some(meta)).await;
+        assert!(result.is_ok(), "the pipe must not fail: {result:?}");
+        assert!(
+            !fragments[0].has_metadata,
+            "metadata that does not fit is skipped"
+        );
+        assert_receiver_accepts(&fragments, &expected);
     }
 
     /// Yields its chunks with a `Pending` before each one (waking itself),
