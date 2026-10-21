@@ -35,6 +35,12 @@
 //! - [`IncomingStream`] reports progress in fragments
 //!   ([`IncomingStream::received_fragments`]), and its errors are
 //!   `StreamError`.
+//! - [`IncomingStream`] and [`IncomingChunks`] still wrap concrete UDP types
+//!   (`StreamHandle`, `StreamingInboundStream`); a second transport turns
+//!   them into an enum or a trait object.
+//! - A pipe must forward fragments the receiver accepts: every fragment but
+//!   #1 and the last exactly full, within `ceil(total / F) + 1` slots. The
+//!   UDP pipe re-chunks its input to that (`Rechunk` in `outbound_stream.rs`).
 //! - [`IncomingStream::total_bytes`] assumes a length declared up front. UDP
 //!   carries it in every fragment; under QUIC the per-stream header that
 //!   carries the [`StreamId`] would carry it too.
@@ -355,20 +361,36 @@ impl IncomingStream {
     }
 
     /// The stream's data, chunk by chunk, in order, as it arrives. Chunk
-    /// sizes are the receiving transport's (UDP: one per fragment); the
-    /// chunks of a complete stream add up to [`Self::total_bytes`]. Reading
+    /// sizes are the receiving transport's (UDP: one per fragment). Reading
     /// does not consume the stream: [`Self::assemble`] and other readers
-    /// still see all of it.
+    /// still see all of it. See [`IncomingChunks`] for what the consumer
+    /// must check itself.
     pub fn chunks(&self) -> IncomingChunks {
-        IncomingChunks(self.0.stream())
+        IncomingChunks {
+            inner: self.0.stream(),
+            done: false,
+        }
     }
 }
 
-/// The data of an [`IncomingStream`], from [`IncomingStream::chunks`]. Ends
-/// when the stream is complete; yields `Err` if it is cancelled or stalls.
-/// Polling it again after dropping a `next()` future loses nothing, so it
-/// may be read inside `select!`.
-pub struct IncomingChunks(super::StreamingInboundStream);
+/// The data of an [`IncomingStream`], from [`IncomingStream::chunks`].
+///
+/// - It yields `Err` once, if the stream is cancelled or fails, and then ends.
+/// - It has **no inactivity timer**: if the sender stalls, it waits forever.
+///   A consumer must bring its own timeout (the UDP pipe uses
+///   `STREAM_INACTIVITY_TIMEOUT`).
+/// - Its end does **not** guarantee the chunks add up to
+///   [`IncomingStream::total_bytes`]. Under UDP one exit, taken once every
+///   fragment slot has been read, is a fragment-count proxy that does not
+///   check the byte total, so a sender that filled the slots short would end
+///   it early with no error (#5445). A consumer that needs the whole stream
+///   must count the bytes itself.
+/// - Polling it again after dropping a `next()` future loses nothing, so it
+///   may be read inside `select!`.
+pub struct IncomingChunks {
+    inner: super::StreamingInboundStream,
+    done: bool,
+}
 
 impl futures::Stream for IncomingChunks {
     type Item = Result<bytes::Bytes, super::StreamError>;
@@ -377,7 +399,14 @@ impl futures::Stream for IncomingChunks {
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Self::Item>> {
-        std::pin::Pin::new(&mut self.0).poll_next(cx)
+        if self.done {
+            return std::task::Poll::Ready(None);
+        }
+        let item = std::pin::Pin::new(&mut self.inner).poll_next(cx);
+        if matches!(item, std::task::Poll::Ready(Some(Err(_)) | None)) {
+            self.done = true;
+        }
+        item
     }
 }
 
@@ -654,6 +683,23 @@ mod incoming_stream_tests {
             .await
             .concat();
         assert_eq!(again, payload);
+    }
+
+    /// After a cancel, `chunks` yields the error once and then ends, so a
+    /// consumer that skips errors cannot spin on it.
+    #[tokio::test]
+    async fn incoming_chunks_end_after_an_error() {
+        use futures::StreamExt;
+        let handle = StreamHandle::new(StreamId::next(), 10_000);
+        let stream = IncomingStream::from(handle);
+        stream.cancel();
+        let mut chunks = stream.chunks();
+        assert!(matches!(
+            chunks.next().await,
+            Some(Err(StreamError::Cancelled))
+        ));
+        assert!(chunks.next().await.is_none());
+        assert!(chunks.next().await.is_none());
     }
 
     /// On a stream still arriving, the declared length, the units received

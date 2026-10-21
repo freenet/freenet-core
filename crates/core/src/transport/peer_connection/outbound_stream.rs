@@ -572,46 +572,116 @@ pub(super) async fn send_stream<S: super::super::Socket, T: TimeSource>(
     })
 }
 
+/// Capacity of the pipe's outgoing fragment #1 when the first chunk is longer
+/// than a fragment: room for this hop's own metadata header (#2757) when there
+/// is any and at least one payload byte still fits, reserving exactly what
+/// `send_stream` reserves (the metadata plus its 1-byte option tag and 8-byte
+/// length); otherwise a full fragment.
+fn first_fragment_capacity(metadata: Option<&Bytes>) -> usize {
+    match metadata {
+        Some(meta) if 1 + 8 + meta.len() < MAX_DATA_SIZE => MAX_DATA_SIZE - (1 + 8 + meta.len()),
+        _ => MAX_DATA_SIZE,
+    }
+}
+
+/// Re-chunks an inbound stream into the pipe's outgoing fragment payloads,
+/// whatever chunk sizes the receiving transport delivered.
+///
+/// The receiver gives a stream `ceil(total / FRAGMENT_PAYLOAD_SIZE) + 1`
+/// fragment slots and rejects empty fragments other than #1, so:
+/// - fragment #1 is the first chunk as received if it fits in a fragment
+///   (that keeps a UDP-received stream's boundaries exactly as they were,
+///   including an empty #1 from an older sender); a longer first chunk is
+///   cut at `first_capacity` (see [`first_fragment_capacity`]);
+/// - every later fragment is exactly `FRAGMENT_PAYLOAD_SIZE` bytes except the
+///   last, filled from as many chunks as it takes; empty chunks are dropped.
+///
+/// A UDP-received stream arrives as one chunk per fragment, full except
+/// possibly #1 and the last, so its outgoing fragments are its incoming ones.
+/// State lives in the struct, so dropping a `next()` future loses nothing.
+/// After an `Err` the stream ends.
+struct Rechunk<St> {
+    inner: St,
+    first_capacity: usize,
+    first_sent: bool,
+    buf: bytes::BytesMut,
+    done: bool,
+}
+
+impl<St> Rechunk<St> {
+    fn new(inner: St, first_capacity: usize) -> Self {
+        Self {
+            inner,
+            first_capacity,
+            first_sent: false,
+            buf: bytes::BytesMut::new(),
+            done: false,
+        }
+    }
+}
+
+impl<St> futures::Stream for Rechunk<St>
+where
+    St: futures::Stream<Item = Result<Bytes, super::streaming::StreamError>> + Unpin,
+{
+    type Item = Result<Bytes, super::streaming::StreamError>;
+
+    fn poll_next(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        use super::streaming_buffer::FRAGMENT_PAYLOAD_SIZE;
+        use std::task::Poll;
+        let this = self.get_mut();
+        loop {
+            if this.done {
+                return Poll::Ready(None);
+            }
+            if this.first_sent && this.buf.len() >= FRAGMENT_PAYLOAD_SIZE {
+                return Poll::Ready(Some(Ok(this.buf.split_to(FRAGMENT_PAYLOAD_SIZE).freeze())));
+            }
+            match std::pin::Pin::new(&mut this.inner).poll_next(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Some(Err(e))) => {
+                    this.done = true;
+                    return Poll::Ready(Some(Err(e)));
+                }
+                Poll::Ready(Some(Ok(chunk))) if !this.first_sent => {
+                    this.first_sent = true;
+                    if chunk.len() <= FRAGMENT_PAYLOAD_SIZE {
+                        return Poll::Ready(Some(Ok(chunk)));
+                    }
+                    let mut chunk = chunk;
+                    let first = chunk.split_to(this.first_capacity);
+                    this.buf.extend_from_slice(&chunk);
+                    return Poll::Ready(Some(Ok(first)));
+                }
+                Poll::Ready(Some(Ok(chunk))) => {
+                    // Empty chunks are dropped: an empty fragment other
+                    // than #1 is refused by the receiver.
+                    this.buf.extend_from_slice(&chunk);
+                }
+                Poll::Ready(None) => {
+                    this.done = true;
+                    if !this.buf.is_empty() {
+                        return Poll::Ready(Some(Ok(this.buf.split().freeze())));
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Pipes an inbound stream to an outbound connection, forwarding fragments as they arrive.
 ///
 /// Unlike `send_stream` which takes complete data and fragments it, this reads
-/// from a `StreamHandle` and forwards each fragment incrementally. This avoids
-/// full reassembly at intermediate nodes, reducing latency.
+/// an [`IncomingStream`](crate::transport::IncomingStream) chunk by chunk and
+/// forwards it incrementally, re-chunked into fragments by [`Rechunk`]. This
+/// avoids full reassembly at intermediate nodes, reducing latency.
 ///
 /// The outbound stream uses a new `outbound_stream_id` so the receiver sees
 /// a fresh stream. Fragments are sent with the same BBR congestion control
 /// and token bucket rate limiting as `send_stream`.
-/// Split each chunk of `chunks` into pieces of at most
-/// `FRAGMENT_PAYLOAD_SIZE` bytes, in order. Chunks already that small pass
-/// through unchanged.
-fn fragment_sized<St>(chunks: St) -> impl futures::Stream<Item = St::Item> + Unpin
-where
-    St: futures::Stream<Item = Result<Bytes, super::streaming::StreamError>> + Unpin,
-{
-    split_chunks(chunks, super::streaming_buffer::FRAGMENT_PAYLOAD_SIZE)
-}
-
-fn split_chunks<St>(chunks: St, max: usize) -> impl futures::Stream<Item = St::Item> + Unpin
-where
-    St: futures::Stream<Item = Result<Bytes, super::streaming::StreamError>> + Unpin,
-{
-    use futures::StreamExt;
-    chunks.flat_map(move |item| {
-        let pieces: Vec<_> = match item {
-            Ok(mut chunk) if chunk.len() > max => {
-                let mut pieces = Vec::with_capacity(chunk.len().div_ceil(max));
-                while !chunk.is_empty() {
-                    let take = chunk.len().min(max);
-                    pieces.push(Ok(chunk.split_to(take)));
-                }
-                pieces
-            }
-            other => vec![other],
-        };
-        futures::stream::iter(pieces)
-    })
-}
-
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn pipe_stream<S: super::super::Socket, T: TimeSource>(
     inbound_handle: crate::transport::IncomingStream,
@@ -627,12 +697,52 @@ pub(super) async fn pipe_stream<S: super::super::Socket, T: TimeSource>(
     metadata: Option<Bytes>,
     progress: Option<Arc<dyn crate::transport::StreamProgressObserver>>,
 ) -> Result<TransferStats, TransportError> {
+    pipe_chunks(
+        inbound_handle.total_bytes(),
+        inbound_handle.chunks(),
+        outbound_stream_id,
+        last_packet_id,
+        socket,
+        destination_addr,
+        outbound_symmetric_key,
+        sent_packet_tracker,
+        token_bucket,
+        congestion_controller,
+        time_source,
+        metadata,
+        progress,
+    )
+    .await
+}
+
+/// [`pipe_stream`] over any chunk stream of `total_bytes` bytes, re-chunked
+/// into fragments by [`Rechunk`].
+#[allow(clippy::too_many_arguments)]
+async fn pipe_chunks<S, T, C>(
+    total_bytes: u64,
+    chunks: C,
+    outbound_stream_id: StreamId,
+    last_packet_id: Arc<AtomicU32>,
+    socket: Arc<S>,
+    destination_addr: SocketAddr,
+    outbound_symmetric_key: Aes128Gcm,
+    sent_packet_tracker: Arc<parking_lot::Mutex<SentPacketTracker<T>>>,
+    token_bucket: Arc<super::super::token_bucket::TokenBucket<T>>,
+    congestion_controller: Arc<CongestionController<T>>,
+    time_source: T,
+    metadata: Option<Bytes>,
+    progress: Option<Arc<dyn crate::transport::StreamProgressObserver>>,
+) -> Result<TransferStats, TransportError>
+where
+    S: super::super::Socket,
+    T: TimeSource,
+    C: futures::Stream<Item = Result<Bytes, super::streaming::StreamError>> + Unpin,
+{
     let start_time = time_source.now();
     let start_nanos = time_source.now_nanos();
     let rto_expiries_at_start = sent_packet_tracker.lock().rto_expiries();
     // See `send_stream`.
     let mut peak_flightsize: usize = 0;
-    let total_bytes = inbound_handle.total_bytes();
 
     // Inbound admission applies the same check; repeated here so a forwarded
     // stream's declared length is within the limits whatever its source.
@@ -664,9 +774,9 @@ pub(super) async fn pipe_stream<S: super::super::Socket, T: TimeSource>(
         "Piping stream to next hop"
     );
 
-    // Whatever transport received the stream, forward it in pieces that fit
-    // one fragment. A UDP-received stream already arrives in such pieces.
-    let mut stream = fragment_sized(inbound_handle.chunks());
+    // Whatever transport received the stream, forward it as fragments the
+    // receiver accepts (see `Rechunk`).
+    let mut stream = Rechunk::new(chunks, first_fragment_capacity(metadata.as_ref()));
     let mut sent_so_far = 0u64;
     let mut fragment_number = 1u32;
     let mut pending_metadata = metadata;
@@ -1122,59 +1232,211 @@ mod tests {
     use crate::transport::token_bucket::TokenBucket;
     use tokio::sync::mpsc;
 
-    /// `split_chunks` cuts every chunk longer than `max` into pieces of at
-    /// most `max` bytes, in order, and passes shorter chunks and errors
-    /// through unchanged.
-    #[tokio::test]
-    async fn split_chunks_cuts_long_chunks_and_passes_the_rest() {
-        use futures::StreamExt;
-        let max = 4;
-        let long = Bytes::from_static(b"abcdefghij");
-        let short = Bytes::from_static(b"xy");
-        let input = futures::stream::iter(vec![
-            Ok(long.clone()),
-            Ok(short.clone()),
-            Err(super::super::streaming::StreamError::Cancelled),
-        ]);
-        let out: Vec<_> = super::split_chunks(input, max).collect().await;
-        let sizes: Vec<_> = out
-            .iter()
-            .map(|r| r.as_ref().map(|b| b.len()).unwrap_or(0))
-            .collect();
-        assert_eq!(sizes, vec![4, 4, 2, 2, 0]);
-        let joined: Vec<u8> = out[..4]
-            .iter()
-            .flat_map(|r| r.as_ref().unwrap().to_vec())
-            .collect();
-        assert_eq!(joined, [&long[..], &short[..]].concat());
-        assert!(matches!(
-            out[4],
-            Err(super::super::streaming::StreamError::Cancelled)
-        ));
+    /// One outgoing fragment as decoded off the wire.
+    #[derive(Debug)]
+    struct WireFragment {
+        number: u32,
+        total: u64,
+        payload: Bytes,
+        has_metadata: bool,
     }
 
-    /// Source pin: `pipe_stream` reads its input through `fragment_sized`.
-    /// A stream received on another transport can arrive in chunks larger
-    /// than a fragment, and no test can build one until such a transport
-    /// exists, so the wiring is pinned here and the splitting itself is
-    /// tested by `split_chunks_cuts_long_chunks_and_passes_the_rest`.
-    #[test]
-    fn pipe_stream_reads_its_input_in_fragment_sized_pieces() {
-        let src = include_str!("outbound_stream.rs");
-        let tests_at = src.find("\nmod tests {").expect("test module");
-        let start = src
-            .find("\npub(super) async fn pipe_stream<")
-            .expect("pipe_stream signature");
-        assert!(start < tests_at, "the anchor must be production code");
-        let end = start + src[start..].find("\n}\n").expect("end of pipe_stream");
-        let body = &src[start..end];
-        let wired = body
-            .lines()
-            .any(|line| line.trim() == "let mut stream = fragment_sized(inbound_handle.chunks());");
+    /// Pipe `chunks` (declared `total` bytes) through `pipe_chunks` and decode
+    /// every packet it sends.
+    async fn pipe_and_capture<C>(
+        total: u64,
+        chunks: C,
+        metadata: Option<Bytes>,
+    ) -> Vec<WireFragment>
+    where
+        C: futures::Stream<Item = Result<Bytes, super::super::streaming::StreamError>>
+            + Unpin
+            + Send
+            + 'static,
+    {
+        let (outbound_sender, mut outbound_receiver) = mpsc::channel(1);
+        let time_source = VirtualTime::new();
+        let (congestion_controller, token_bucket) = unthrottled(&time_source);
+        let cipher = random_cipher();
+        let task = GlobalExecutor::spawn(super::pipe_chunks(
+            total,
+            chunks,
+            StreamId::next(),
+            Arc::new(AtomicU32::new(0)),
+            Arc::new(TestSocket::new(outbound_sender)),
+            SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 8080),
+            cipher.clone(),
+            Arc::new(parking_lot::Mutex::new(
+                SentPacketTracker::new_with_time_source(time_source.clone()),
+            )),
+            token_bucket,
+            congestion_controller,
+            time_source,
+            metadata,
+            None,
+        ));
+        let mut fragments = Vec::new();
+        while let Some((_, packet)) = outbound_receiver.recv().await {
+            let decrypted = PacketData::<_, MAX_PACKET_SIZE>::from_buf(packet.as_ref())
+                .try_decrypt_sym(&cipher)
+                .expect("decrypt");
+            let message = SymmetricMessage::deser(decrypted.data()).expect("deser");
+            let SymmetricMessagePayload::StreamFragment {
+                fragment_number,
+                total_length_bytes,
+                payload,
+                metadata_bytes,
+                ..
+            } = message.payload
+            else {
+                panic!("expected a StreamFragment");
+            };
+            fragments.push(WireFragment {
+                number: fragment_number,
+                total: total_length_bytes,
+                payload,
+                has_metadata: metadata_bytes.is_some(),
+            });
+        }
+        task.await.expect("join").expect("pipe succeeds");
+        fragments
+    }
+
+    /// What a receiver accepts: numbered from 1, within
+    /// `ceil(total / F) + 1` slots, no empty fragment but #1, every fragment
+    /// but #1 and the last exactly full, and the bytes in order equal to
+    /// `expected`.
+    fn assert_receiver_accepts(fragments: &[WireFragment], expected: &[u8]) {
+        use super::super::streaming_buffer::FRAGMENT_PAYLOAD_SIZE as F;
+        let total = expected.len() as u64;
+        let slots = expected.len().div_ceil(F) + 1;
         assert!(
-            wired,
-            "pipe_stream must read `fragment_sized(inbound_handle.chunks())`"
+            fragments.len() <= slots,
+            "{} fragments for {slots} slots",
+            fragments.len()
         );
+        for (i, f) in fragments.iter().enumerate() {
+            assert_eq!(f.number as usize, i + 1, "fragment numbering");
+            assert_eq!(f.total, total, "declared total on every fragment");
+            assert!(f.payload.len() <= F, "fragment {} over capacity", f.number);
+            if f.number > 1 {
+                assert!(!f.payload.is_empty(), "empty fragment {}", f.number);
+            }
+            if f.number > 1 && i + 1 < fragments.len() {
+                assert_eq!(
+                    f.payload.len(),
+                    F,
+                    "non-final fragment {} not full",
+                    f.number
+                );
+            }
+        }
+        let bytes: Vec<u8> = fragments.iter().flat_map(|f| f.payload.to_vec()).collect();
+        assert_eq!(bytes.len() as u64, total, "byte total");
+        assert_eq!(bytes, expected, "bytes in order");
+    }
+
+    fn payload_of(len: usize) -> Vec<u8> {
+        (0..len).map(|i| (i % 251) as u8).collect()
+    }
+
+    /// A UDP-received stream is forwarded with exactly its incoming fragment
+    /// boundaries, which is what the pipe did before it re-chunked: a short
+    /// #1 (the origin embedded its metadata), full middles, a short last.
+    #[tokio::test]
+    async fn pipe_forwards_a_udp_received_stream_with_its_own_boundaries() {
+        use super::super::streaming_buffer::FRAGMENT_PAYLOAD_SIZE as F;
+        let sizes = [F - 50, F, F, 300];
+        let expected = payload_of(sizes.iter().sum());
+        let handle =
+            super::super::streaming::StreamHandle::new(StreamId::next(), expected.len() as u64);
+        let mut at = 0;
+        for (n, len) in sizes.iter().enumerate() {
+            handle
+                .push_fragment(
+                    n as u32 + 1,
+                    Bytes::copy_from_slice(&expected[at..at + len]),
+                )
+                .unwrap();
+            at += len;
+        }
+        let stream = crate::transport::IncomingStream::from(handle);
+        let fragments = pipe_and_capture(
+            stream.total_bytes(),
+            stream.chunks(),
+            Some(Bytes::from(vec![1u8; 40])),
+        )
+        .await;
+        let out: Vec<_> = fragments.iter().map(|f| f.payload.len()).collect();
+        assert_eq!(out, sizes, "outgoing boundaries equal the incoming ones");
+        assert_receiver_accepts(&fragments, &expected);
+    }
+
+    /// An older sender's empty fragment #1 is forwarded as an empty #1, as
+    /// before.
+    #[tokio::test]
+    async fn pipe_keeps_an_empty_first_fragment_from_an_older_sender() {
+        use super::super::streaming_buffer::FRAGMENT_PAYLOAD_SIZE as F;
+        let expected = payload_of(2 * F);
+        let handle =
+            super::super::streaming::StreamHandle::new(StreamId::next(), expected.len() as u64);
+        handle.push_fragment(1, Bytes::new()).unwrap();
+        handle
+            .push_fragment(2, Bytes::copy_from_slice(&expected[..F]))
+            .unwrap();
+        handle
+            .push_fragment(3, Bytes::copy_from_slice(&expected[F..]))
+            .unwrap();
+        let stream = crate::transport::IncomingStream::from(handle);
+        let fragments = pipe_and_capture(stream.total_bytes(), stream.chunks(), None).await;
+        let out: Vec<_> = fragments.iter().map(|f| f.payload.len()).collect();
+        assert_eq!(out, [0, F, F]);
+        assert_receiver_accepts(&fragments, &expected);
+    }
+
+    /// A stream received in chunks longer than a fragment (as another
+    /// transport would deliver it) goes out as fragments the receiver
+    /// accepts, with fragment #1 sized to carry this hop's metadata.
+    #[tokio::test]
+    async fn pipe_rechunks_long_chunks_into_full_fragments() {
+        use super::super::streaming_buffer::FRAGMENT_PAYLOAD_SIZE as F;
+        let expected = payload_of(3 * F);
+        let handle =
+            super::super::streaming::StreamHandle::new(StreamId::next(), expected.len() as u64);
+        handle
+            .push_fragment(1, Bytes::copy_from_slice(&expected[..2 * F]))
+            .unwrap();
+        handle
+            .push_fragment(2, Bytes::copy_from_slice(&expected[2 * F..]))
+            .unwrap();
+        let stream = crate::transport::IncomingStream::from(handle);
+        let metadata = Bytes::from(vec![1u8; 40]);
+        let fragments =
+            pipe_and_capture(stream.total_bytes(), stream.chunks(), Some(metadata)).await;
+        assert_eq!(
+            fragments[0].payload.len(),
+            F - (1 + 8 + 40),
+            "#1 leaves room for the metadata, as send_stream does"
+        );
+        assert!(fragments[0].has_metadata, "and carries it");
+        assert_receiver_accepts(&fragments, &expected);
+    }
+
+    /// Many short chunks, some empty, are packed into full fragments.
+    #[tokio::test]
+    async fn pipe_packs_short_and_empty_chunks_into_full_fragments() {
+        use super::super::streaming_buffer::FRAGMENT_PAYLOAD_SIZE as F;
+        let expected = payload_of(2 * F + 77);
+        let mut chunks = Vec::new();
+        for (i, piece) in expected.chunks(100).enumerate() {
+            chunks.push(Ok(Bytes::copy_from_slice(piece)));
+            if i % 3 == 0 {
+                chunks.push(Ok(Bytes::new()));
+            }
+        }
+        let fragments =
+            pipe_and_capture(expected.len() as u64, futures::stream::iter(chunks), None).await;
+        assert_receiver_accepts(&fragments, &expected);
     }
 
     /// Simple test socket that writes to a channel
