@@ -32,18 +32,20 @@
 //!   `ConnectionClosed` and `Other` itself.
 //! - Stream ids are chosen by the SENDER ([`StreamId::next`]), not by the
 //!   transport: this is deliberate and stays (see [`StreamId`]).
-//! - [`InboundStreamRegistry`] is fragment-based (`Weak<LockFreeStreamBuffer>`).
 //! - [`IncomingStream`] reports progress in fragments
 //!   ([`IncomingStream::received_fragments`]), and its errors are
 //!   `StreamError`.
+//! - [`IncomingStream`] and [`IncomingChunks`] still wrap concrete UDP types
+//!   (`StreamHandle`, `StreamingInboundStream`); a second transport turns
+//!   them into an enum or a trait object.
+//! - A pipe must forward fragments the receiver accepts: every fragment but
+//!   #1 and the last exactly full, within `ceil(total / F) + 1` slots. The
+//!   UDP pipe re-chunks its input to that (`Rechunk` in `outbound_stream.rs`).
 //! - [`IncomingStream::total_bytes`] assumes a length declared up front. UDP
 //!   carries it in every fragment; under QUIC the per-stream header that
 //!   carries the [`StreamId`] would carry it too.
 //! - [`IncomingStream::fork`] promises an independent reader that replays the
 //!   stream from its start, so a QUIC transport would need a tee buffer.
-//! - There is no transport-neutral incremental read: a stream can only be
-//!   piped onward through `into_udp`, so a relay that receives on one
-//!   transport and forwards on another cannot be written yet.
 //! - Why a connection closed is read out of band, through
 //!   [`PeerConnectionApi::close_reason`] after `recv` fails, rather than
 //!   carried by the error.
@@ -347,15 +349,84 @@ impl IncomingStream {
         self.0.is_cancelled()
     }
 
-    /// Whether this stream reads the given UDP reassembly buffer. Used by the
-    /// registry to match a stream to the connection that received it.
-    pub(crate) fn shares_buffer(&self, buffer: &std::sync::Weak<LockFreeStreamBuffer>) -> bool {
-        self.0.shares_buffer(buffer)
+    /// Whether this is the stream `identity` names. The registry uses it to
+    /// match an orphan to the connection that received it.
+    pub(crate) fn is(&self, identity: &StreamIdentity) -> bool {
+        self.0.shares_buffer(&identity.0)
     }
 
-    /// The UDP transport's handle, for the UDP transport to pipe.
-    pub(in crate::transport) fn into_udp(self) -> StreamHandle {
-        self.0
+    /// A [`StreamIdentity`] naming this stream.
+    #[cfg(test)]
+    pub(crate) fn identity(&self) -> StreamIdentity {
+        StreamIdentity(self.0.buffer_weak())
+    }
+
+    /// The stream's data, chunk by chunk, in order, as it arrives. Chunk
+    /// sizes are the receiving transport's (UDP: one per fragment). Reading
+    /// does not consume the stream: [`Self::assemble`] and other readers
+    /// still see all of it. See [`IncomingChunks`] for what the consumer
+    /// must check itself.
+    pub fn chunks(&self) -> IncomingChunks {
+        IncomingChunks {
+            inner: self.0.stream(),
+            done: false,
+        }
+    }
+}
+
+/// The data of an [`IncomingStream`], from [`IncomingStream::chunks`].
+///
+/// - It yields `Err` once, if the stream is cancelled or fails, and then ends.
+/// - It has **no inactivity timer**: if the sender stalls, it waits forever.
+///   A consumer must bring its own timeout (the UDP pipe uses
+///   `STREAM_INACTIVITY_TIMEOUT`).
+/// - Its end does **not** guarantee the chunks add up to
+///   [`IncomingStream::total_bytes`]. Under UDP one exit, taken once every
+///   fragment slot has been read, is a fragment-count proxy that does not
+///   check the byte total, so a sender that filled the slots short would end
+///   it early with no error (#5445). A consumer that needs the whole stream
+///   must count the bytes itself.
+/// - Polling it again after dropping a `next()` future loses nothing, so it
+///   may be read inside `select!`.
+pub struct IncomingChunks {
+    inner: super::StreamingInboundStream,
+    done: bool,
+}
+
+impl futures::Stream for IncomingChunks {
+    type Item = Result<bytes::Bytes, super::StreamError>;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        if self.done {
+            return std::task::Poll::Ready(None);
+        }
+        let item = std::pin::Pin::new(&mut self.inner).poll_next(cx);
+        if matches!(item, std::task::Poll::Ready(Some(Err(_)) | None)) {
+            self.done = true;
+        }
+        item
+    }
+}
+
+/// Names one inbound stream without keeping it alive, so a transport can say
+/// which streams a connection received after it has let go of them. Two
+/// [`IncomingStream`]s that are the same stream (clones or forks) both match
+/// its identity; any other stream does not.
+///
+/// The representation is private: today it is a weak reference to the UDP
+/// transport's reassembly buffer.
+#[derive(Clone, Debug)]
+pub struct StreamIdentity(std::sync::Weak<LockFreeStreamBuffer>);
+
+impl StreamIdentity {
+    /// The identity of the UDP stream reassembled into `buffer`.
+    pub(in crate::transport) fn from_udp_buffer(
+        buffer: std::sync::Weak<LockFreeStreamBuffer>,
+    ) -> Self {
+        Self(buffer)
     }
 }
 
@@ -400,12 +471,12 @@ pub(crate) trait InboundStreamRegistry: Send + Sync {
 
     /// The connection from `peer_addr` is gone: cancel the streams among
     /// `streams` that nobody has claimed. Each stream is matched by its
-    /// buffer, so a stream with the same id from another connection, or one
-    /// already claimed, is left alone.
+    /// [`StreamIdentity`], so a stream with the same id from another
+    /// connection, or one already claimed, is left alone.
     fn cancel_unclaimed_streams(
         &self,
         peer_addr: SocketAddr,
-        streams: &mut dyn Iterator<Item = (StreamId, std::sync::Weak<LockFreeStreamBuffer>)>,
+        streams: &mut dyn Iterator<Item = (StreamId, StreamIdentity)>,
     );
 }
 
@@ -577,7 +648,7 @@ mod incoming_stream_tests {
         assert_eq!(stream.total_bytes(), handle.total_bytes());
         assert_eq!(stream.received_fragments(), handle.received_fragments());
         assert_eq!(stream.total_fragments(), handle.total_fragments());
-        assert!(stream.shares_buffer(&handle.buffer_weak()));
+        assert!(stream.is(&IncomingStream::from(handle.clone()).identity()));
         assert_eq!(stream.assemble().await.unwrap(), payload);
 
         let forked = stream.fork();
@@ -586,13 +657,50 @@ mod incoming_stream_tests {
             payload,
             "fork reads it too"
         );
+    }
 
-        assert!(
-            stream
-                .clone()
-                .into_udp()
-                .shares_buffer(&handle.buffer_weak())
-        );
+    /// `chunks` yields the whole stream in order, one chunk per UDP
+    /// fragment, and reading it consumes nothing: `assemble` and a second
+    /// `chunks` still see all of it.
+    #[tokio::test]
+    async fn incoming_stream_chunks_read_the_stream_without_consuming_it() {
+        use futures::StreamExt;
+        let (handle, payload) = handle_with(3);
+        let stream = IncomingStream::from(handle.clone());
+
+        let chunks: Vec<_> = stream.chunks().collect().await;
+        assert_eq!(chunks.len(), handle.received_fragments());
+        let read: Vec<u8> = chunks
+            .into_iter()
+            .flat_map(|c| c.expect("chunk").to_vec())
+            .collect();
+        assert_eq!(read, payload);
+
+        assert_eq!(stream.assemble().await.unwrap(), payload);
+        let again: Vec<u8> = stream
+            .chunks()
+            .map(|c| c.expect("chunk").to_vec())
+            .collect::<Vec<_>>()
+            .await
+            .concat();
+        assert_eq!(again, payload);
+    }
+
+    /// After a cancel, `chunks` yields the error once and then ends, so a
+    /// consumer that skips errors cannot spin on it.
+    #[tokio::test]
+    async fn incoming_chunks_end_after_an_error() {
+        use futures::StreamExt;
+        let handle = StreamHandle::new(StreamId::next(), 10_000);
+        let stream = IncomingStream::from(handle);
+        stream.cancel();
+        let mut chunks = stream.chunks();
+        assert!(matches!(
+            chunks.next().await,
+            Some(Err(StreamError::Cancelled))
+        ));
+        assert!(chunks.next().await.is_none());
+        assert!(chunks.next().await.is_none());
     }
 
     /// On a stream still arriving, the declared length, the units received
@@ -614,13 +722,33 @@ mod incoming_stream_tests {
         assert!(stream.total_fragments() >= 3, "premise: more than received");
     }
 
+    /// A stream's identity matches every handle on that stream, clones and
+    /// forks included, and holding it does not keep the stream alive.
+    #[test]
+    fn stream_identity_names_one_stream_without_holding_it() {
+        let (handle, _) = handle_with(1);
+        let stream = IncomingStream::from(handle);
+        let strong_before = stream.0.buffer_strong_count();
+        let identity = stream.identity();
+        assert_eq!(
+            stream.0.buffer_strong_count(),
+            strong_before,
+            "an identity is not a reference to the stream"
+        );
+        assert!(stream.is(&identity));
+        assert!(stream.clone().is(&identity));
+        assert!(stream.fork().is(&identity), "a fork reads the same stream");
+        let (other, _) = handle_with(1);
+        assert!(!IncomingStream::from(other).is(&identity));
+    }
+
     /// A stream does not claim another stream's buffer.
     #[test]
     fn incoming_stream_does_not_share_an_unrelated_buffer() {
         let (handle, _) = handle_with(1);
         let (other, _) = handle_with(1);
         let stream = IncomingStream::from(handle);
-        assert!(!stream.shares_buffer(&other.buffer_weak()));
+        assert!(!stream.is(&IncomingStream::from(other).identity()));
     }
 
     /// Cancelling through the boundary type cancels the stream itself.

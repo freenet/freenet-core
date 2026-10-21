@@ -577,6 +577,21 @@ Three stream types, never mixed:
   - boundary::IncomingStream: what the registry, operations and node see.
     Above the transport, use only this; it wraps a StreamHandle today.
 Never feed one stream to both reassembly paths.
+
+Above the transport:
+  - Match a stream to the connection that received it by its opaque
+    boundary::StreamIdentity (IncomingStream::is), never by its buffer.
+  - Read a stream incrementally with IncomingStream::chunks(). It has NO
+    inactivity timer (bring your own), ends after its first Err, and its end
+    does not prove the byte total was reached (#5445): count bytes yourself.
+
+WHEN piping a stream onward (pipe_stream):
+  Re-chunk the input (Rechunk in outbound_stream.rs). The receiver gives a
+  stream ceil(total / FRAGMENT_PAYLOAD_SIZE) + 1 slots and refuses empty
+  fragments other than #1, so every fragment but #1 and the last must be
+  exactly full. Fragment #1 is the first chunk as received when it fits (a
+  UDP-received stream keeps its exact boundaries); a longer first chunk is
+  cut to leave room for this hop's metadata, as send_stream does.
 ```
 
 ### WHEN admitting or sending a stream

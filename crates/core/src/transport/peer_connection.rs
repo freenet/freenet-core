@@ -351,7 +351,10 @@ impl<S, T: TimeSource> Drop for PeerConnection<S, T> {
         if let Some(registry) = &self.inbound_stream_registry {
             registry.cancel_unclaimed_streams(
                 self.remote_conn.remote_addr,
-                &mut self.inbound_budget.live_buffer_streams(),
+                &mut self
+                    .inbound_budget
+                    .live_buffer_streams()
+                    .map(|(id, buffer)| (id, super::StreamIdentity::from_udp_buffer(buffer))),
             );
         }
         // Cancel all active streaming handles so that any operation blocked on
@@ -2956,7 +2959,7 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
     async fn pipe_stream_to_remote(
         &mut self,
         outbound_stream_id: StreamId,
-        inbound_handle: streaming::StreamHandle,
+        inbound_handle: super::IncomingStream,
         metadata: Option<bytes::Bytes>,
         progress: Option<std::sync::Arc<dyn super::StreamProgressObserver>>,
     ) {
@@ -3389,13 +3392,8 @@ impl<S: super::Socket> super::PeerConnectionApi for PeerConnection<S> {
         Box<dyn futures::Future<Output = Result<(), super::TransportError>> + Send + '_>,
     > {
         Box::pin(async move {
-            self.pipe_stream_to_remote(
-                outbound_stream_id,
-                inbound_handle.into_udp(),
-                metadata,
-                progress,
-            )
-            .await;
+            self.pipe_stream_to_remote(outbound_stream_id, inbound_handle, metadata, progress)
+                .await;
             Ok(())
         })
     }
