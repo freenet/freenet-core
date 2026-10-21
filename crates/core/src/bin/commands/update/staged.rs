@@ -831,6 +831,17 @@ where
             // Counted even when the trigger knew no version, so a node that
             // cannot reach GitHub still walks to the fallback.
             let version = lookup_failure_target(root, current_version, target);
+            // A rate limit (a cooldown GitHub asked for, cached or live) is
+            // not a failure of the release: hold it without counting, as the
+            // updater does.
+            if e.downcast_ref::<GithubRateLimitedError>().is_some() {
+                return Err(throttled(
+                    root,
+                    Some(&version),
+                    "GitHub rate-limited the release lookup",
+                    clock(),
+                ));
+            }
             return Err(after_transient_failure(
                 root,
                 &version,
@@ -2638,7 +2649,7 @@ mod tests {
         // Expire it and fail again: still staying at two.
         let state_dir = root.parent().unwrap();
         super::super::super::rollback::clear_update_cooldown_at(state_dir);
-        let long_ago = SystemTime::now() - Duration::from_secs(7 * 24 * 3600);
+        let long_ago = SystemTime::now() - Duration::from_secs(5 * 3600);
         for _ in 0..FALLBACK_AFTER_FAILURES - 2 {
             super::super::super::rollback::record_update_failure_at(
                 state_dir, "9.9.9", "earlier", long_ago, 0.5,
@@ -3452,35 +3463,79 @@ mod tests {
         }
     }
 
-    /// Testing lens: the fallback fires at EXACTLY the third failure in a
-    /// row, not the fourth. Failure counts never age out: three failures of
-    /// one release, however far apart, still exit for the updater, which then
-    /// tries once per cooldown. Ageing them out could postpone the fallback
-    /// indefinitely on a node that only attempts now and then; the count
-    /// resets only on an install or a newer release.
+    /// The fallback fires at exactly the third failure in a row, not the
+    /// fourth, when the failures are recent. Failures whose retry time is more
+    /// than a day past no longer count: a node that tries only now and then
+    /// starts afresh rather than falling back on its first new failure.
     #[tokio::test]
-    async fn the_third_failure_falls_back_however_far_apart() {
-        let (_tmp, root) = test_root();
-        let state_dir = root.parent().unwrap();
-        fs::create_dir_all(state_dir).unwrap();
+    async fn old_failures_stop_counting_toward_the_fallback() {
+        use super::super::super::rollback::record_update_failure_at;
         let server = failing_release();
         let now = SystemTime::now();
-        let days_ago = |days: u64| now - Duration::from_secs(days * 24 * 3600);
-        for days in [9, 4] {
-            super::super::super::rollback::record_update_failure_at(
-                state_dir,
-                "9.9.9",
-                "earlier",
-                days_ago(days),
-                0.5,
+        let hour = Duration::from_secs(3600);
+        let ago = |hours: u32| now - hour * hours;
+        for (case, times, expected, failures) in [
+            ("recent", [ago(9), ago(5)], Staging::FallingBack, 3),
+            ("old", [ago(9 * 24), ago(9 * 24 - 1)], Staging::Deferred, 1),
+            // The second retry time (+2 h) is just over a day past.
+            ("a day past", [ago(28), ago(27)], Staging::Deferred, 1),
+            (
+                "under a day past",
+                [ago(26), ago(25)],
+                Staging::FallingBack,
+                3,
+            ),
+        ] {
+            let (_tmp, root) = test_root();
+            let state_dir = root.parent().unwrap();
+            fs::create_dir_all(state_dir).unwrap();
+            for at in times {
+                record_update_failure_at(state_dir, "9.9.9", "earlier", at, 0.5);
+            }
+            assert_eq!(cooldown(&root).unwrap().failures, 2, "{case}");
+            assert_eq!(
+                stage_at(&root, &server.url_str("/"), now).await,
+                expected,
+                "{case}"
+            );
+            assert_eq!(cooldown(&root).unwrap().failures, failures, "{case}");
+        }
+    }
+
+    /// A tag lookup refused by a GitHub rate limit holds the release it would
+    /// count against, without counting, whether or not the trigger named one.
+    #[tokio::test]
+    async fn a_rate_limited_lookup_holds_without_counting() {
+        use super::super::super::rollback::UNKNOWN_RELEASE;
+        let server = Server::run();
+        let prefix = server.url_str("/");
+        for (target, held) in [(None, UNKNOWN_RELEASE), (Some("9.9.9"), "9.9.9")] {
+            let (_tmp, root) = test_root();
+            let outcome = stage_into(
+                &root,
+                "9.9.8",
+                || async {
+                    Err::<String, _>(
+                        GithubRateLimitedError {
+                            retry_after: Some(Duration::from_secs(600)),
+                        }
+                        .into(),
+                    )
+                },
+                target,
+                |_: &str| false,
+                &test_env(&prefix),
+            )
+            .await;
+            assert_eq!(outcome, Staging::Throttled, "{target:?}");
+            assert!(!outcome.preparation().should_exit());
+            let record = cooldown(&root).unwrap();
+            assert_eq!(
+                (record.version.as_str(), record.failures),
+                (held, 0),
+                "{target:?}"
             );
         }
-        assert_eq!(cooldown(&root).unwrap().failures, 2);
-        assert_eq!(
-            stage_at(&root, &server.url_str("/"), now).await,
-            Staging::FallingBack
-        );
-        assert_eq!(cooldown(&root).unwrap().failures, 3);
     }
 
     /// Testing lens: the exits that leave the download to the updater

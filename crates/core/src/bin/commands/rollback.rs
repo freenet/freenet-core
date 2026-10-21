@@ -1058,6 +1058,11 @@ pub(crate) const UPDATE_COOLDOWN_MAX: std::time::Duration =
     std::time::Duration::from_secs(4 * 3600);
 /// Fraction by which each wait is randomly shortened or lengthened.
 const UPDATE_COOLDOWN_JITTER: f64 = 0.2;
+/// How long after its retry time a record's failures stop counting toward
+/// the fallback. A failure that old says nothing about the network now, and
+/// counting it could send a node that tries only now and then straight to
+/// the fallback on its first new failure.
+const UPDATE_FAILURES_EXPIRE_AFTER: std::time::Duration = std::time::Duration::from_secs(24 * 3600);
 const UPDATE_COOLDOWN_FILE: &str = "update_cooldown.json";
 /// Longest error text kept, so the record `freenet service report` reads
 /// stays small.
@@ -1106,6 +1111,16 @@ fn unix_secs(time: SystemTime) -> u64 {
         .unwrap_or(0)
 }
 
+/// The failures of `prev` that still count at `now`: none once its retry time
+/// is more than [`UPDATE_FAILURES_EXPIRE_AFTER`] in the past.
+fn live_failures(prev: &UpdateCooldownState, now: SystemTime) -> u32 {
+    let expired = unix_secs(now)
+        > prev
+            .retry_at_unix
+            .saturating_add(UPDATE_FAILURES_EXPIRE_AFTER.as_secs());
+    if expired { 0 } else { prev.failures }
+}
+
 /// Write a record for `version` at `failures`, waiting from `now`. `false`
 /// when it could not be written.
 fn write_update_cooldown_at(
@@ -1138,7 +1153,8 @@ fn write_update_cooldown_at(
 }
 
 /// Record a failure to fetch `version` and return the consecutive failure
-/// count, this one included. Every failure writes a cooldown for the release
+/// count, this one included (failures whose retry time is more than a day
+/// past no longer count). Every failure writes a cooldown for the release
 /// that actually failed: a record for any other release (or the
 /// [`UNKNOWN_RELEASE`] sentinel) is replaced, starting the count at 1. Keeping
 /// another release's record instead would leave the failing one with no
@@ -1158,7 +1174,7 @@ pub(crate) fn record_update_failure_at(
 ) -> Option<u32> {
     with_record_lock(dir, || {
         let failures = match read_update_cooldown_at(dir) {
-            Some(prev) if prev.version == version => prev.failures.saturating_add(1),
+            Some(prev) if prev.version == version => live_failures(&prev, now).saturating_add(1),
             _ => 1,
         };
         write_update_cooldown_at(dir, version, failures, (error, None), now, rand_unit)
@@ -1235,7 +1251,8 @@ pub fn record_update_failure(version: &str, error: &str) -> Option<u32> {
 /// `freenet update` after every non-clean exit, crashes included, so counting
 /// these would walk a crash-looping node to the fallback without a single
 /// download. A live record is left alone; an expired one gets a fresh wait at
-/// its count, keeping its last real error; with none, or one for another
+/// its count (zero once its failures no longer count), keeping its last real
+/// error; with none, or one for another
 /// release, a hold at zero failures is written for `version`, so the release
 /// held is always the one on record.
 pub(crate) fn hold_update_without_counting_at(
@@ -1251,7 +1268,7 @@ pub(crate) fn hold_update_without_counting_at(
                 if update_cooldown_remaining_at(dir, version, now).is_some() {
                     return;
                 }
-                (prev.failures, prev.last_error)
+                (live_failures(&prev, now), prev.last_error)
             }
             _ => (0, String::new()),
         };
@@ -2908,6 +2925,44 @@ mod tests {
             Some(1)
         );
         assert_eq!(read_update_cooldown_at(dir).unwrap().version, "0.2.141");
+    }
+
+    /// Failures whose retry time is more than a day past no longer count,
+    /// for a failure or a hold; a day or less past, they still do.
+    #[test]
+    fn failures_a_day_past_their_retry_time_stop_counting() {
+        let hour = std::time::Duration::from_secs(3600);
+        let now = SystemTime::now();
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        // Two failures; the second's retry time is (t + 2 h).
+        let t = now - hour * 27;
+        record_update_failure_at(dir, "0.2.141", "earlier", t - hour, 0.5);
+        record_update_failure_at(dir, "0.2.141", "earlier", t, 0.5);
+        assert_eq!(read_update_cooldown_at(dir).unwrap().failures, 2);
+        // At t + 26 h, a day past the retry time: still counted.
+        let mut edge = read_update_cooldown_at(dir).unwrap();
+        hold_update_without_counting_at(dir, "0.2.141", "held", t + hour * 26, 0.5);
+        assert_eq!(read_update_cooldown_at(dir).unwrap().failures, 2);
+        // Just over a day past: a hold keeps none, a failure starts at 1.
+        edge.retry_at_unix = unix_secs(now) - 24 * 3600 - 1;
+        std::fs::write(
+            dir.join(UPDATE_COOLDOWN_FILE),
+            serde_json::to_vec(&edge).unwrap(),
+        )
+        .unwrap();
+        hold_update_without_counting_at(dir, "0.2.141", "held", now, 0.5);
+        let held = read_update_cooldown_at(dir).unwrap();
+        assert_eq!((held.failures, held.last_error.as_str()), (0, "earlier"));
+        std::fs::write(
+            dir.join(UPDATE_COOLDOWN_FILE),
+            serde_json::to_vec(&edge).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            record_update_failure_at(dir, "0.2.141", "now", now, 0.5),
+            Some(1)
+        );
     }
 
     /// Two writers for different releases, interleaved as the node and the
