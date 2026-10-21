@@ -2786,6 +2786,38 @@ mod tests {
         .await
     }
 
+    /// A release on record is withdrawn after three failures, and the latest
+    /// is an older one that fails too. Its failure writes its own cooldown,
+    /// with a fresh count, instead of reusing the withdrawn release's count:
+    /// otherwise nothing would space the attempts, and every one would exit.
+    #[tokio::test]
+    async fn a_withdrawn_release_on_record_does_not_suppress_the_cooldown() {
+        use super::super::super::rollback::{
+            record_update_failure_at, update_cooldown_remaining_at,
+        };
+        let (_tmp, root) = test_root();
+        let state_dir = root.parent().unwrap();
+        fs::create_dir_all(state_dir).unwrap();
+        let t0 = SystemTime::now();
+        let hour = Duration::from_secs(3600);
+        for _ in 0..FALLBACK_AFTER_FAILURES {
+            record_update_failure_at(state_dir, "9.9.10", "earlier", t0 - hour * 6, 0.5);
+        }
+        let server = failing_release();
+        assert_eq!(
+            stage_at(&root, &server.url_str("/"), t0).await,
+            Staging::Deferred
+        );
+        let record = cooldown(&root).unwrap();
+        assert_eq!((record.version.as_str(), record.failures), ("9.9.9", 1));
+        assert!(update_cooldown_remaining_at(state_dir, "9.9.9", t0).is_some());
+        let quiet = Server::run();
+        assert_eq!(
+            stage_at(&root, &quiet.url_str("/"), t0).await,
+            Staging::CoolingDown
+        );
+    }
+
     /// When the node stages next after a run at `after`: once the record's
     /// cooldown ends, on the next 60 s tick. The re-poll is pulled in to the
     /// cooldown's end (#5799), so a node no peer prompts follows the same

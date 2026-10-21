@@ -1047,8 +1047,8 @@ pub fn is_version_install_gated(version: &str) -> bool {
 // This record is the time-bounded answer. A failure to fetch X, by the node or
 // by the updater, records X with a retry time; until then nothing asks GitHub
 // about X or exits for it. The wait is 1 h, then 2 h, then 4 h at most, each
-// ±20%. It always expires, a different (newer) release starts afresh, and a
-// successful install clears it. A missing, corrupt or implausible record reads
+// ±20%. It always expires, a failure of a different release replaces it with
+// a fresh count, and a successful install clears it. A missing, corrupt or implausible record reads
 // as no cooldown: the worst that costs is one attempt, the behaviour before.
 
 /// The wait after the first failure to fetch a release.
@@ -1138,11 +1138,13 @@ fn write_update_cooldown_at(
 }
 
 /// Record a failure to fetch `version` and return the consecutive failure
-/// count, this one included. A record for an older release (or the
-/// [`UNKNOWN_RELEASE`] sentinel) is replaced; one for a NEWER release is kept
-/// and its count returned, since that release is what the triggers act on
-/// (an older writer, such as a node that staged before a newer release was
-/// published, must not reset it).
+/// count, this one included. Every failure writes a cooldown for the release
+/// that actually failed: a record for any other release (or the
+/// [`UNKNOWN_RELEASE`] sentinel) is replaced, starting the count at 1. Keeping
+/// another release's record instead would leave the failing one with no
+/// cooldown at all: after a recorded release is withdrawn, the older latest
+/// release would be retried back to back, and with the withdrawn release's
+/// count at the fallback every failure would exit (#5799).
 ///
 /// `None` when it could not be written. Callers then exit for the update (fail
 /// open): an unrecorded failure would never count toward the fallback, and the
@@ -1157,22 +1159,11 @@ pub(crate) fn record_update_failure_at(
     with_record_lock(dir, || {
         let failures = match read_update_cooldown_at(dir) {
             Some(prev) if prev.version == version => prev.failures.saturating_add(1),
-            Some(prev) if supersedes(&prev.version, version) => return Some(prev.failures),
             _ => 1,
         };
         write_update_cooldown_at(dir, version, failures, (error, None), now, rand_unit)
             .then_some(failures)
     })
-}
-
-/// Whether a record for `recorded` must not be replaced by one for `version`:
-/// both are versions and `recorded` is the newer. The sentinel
-/// [`UNKNOWN_RELEASE`] supersedes nothing, so any real release replaces it.
-fn supersedes(recorded: &str, version: &str) -> bool {
-    semver::Version::parse(recorded)
-        .ok()
-        .zip(semver::Version::parse(version).ok())
-        .is_some_and(|(recorded, version)| recorded > version)
 }
 
 /// Where the record lock lives, beside the records it guards.
@@ -1244,9 +1235,9 @@ pub fn record_update_failure(version: &str, error: &str) -> Option<u32> {
 /// `freenet update` after every non-clean exit, crashes included, so counting
 /// these would walk a crash-looping node to the fallback without a single
 /// download. A live record is left alone; an expired one gets a fresh wait at
-/// its count, keeping its last real error; with none, or one for an older
-/// release, a hold at zero failures is written; a newer release's record is
-/// never overwritten.
+/// its count, keeping its last real error; with none, or one for another
+/// release, a hold at zero failures is written for `version`, so the release
+/// held is always the one on record.
 pub(crate) fn hold_update_without_counting_at(
     dir: &Path,
     version: &str,
@@ -1262,7 +1253,6 @@ pub(crate) fn hold_update_without_counting_at(
                 }
                 (prev.failures, prev.last_error)
             }
-            Some(prev) if supersedes(&prev.version, version) => return,
             _ => (0, String::new()),
         };
         write_update_cooldown_at(
@@ -2859,39 +2849,42 @@ mod tests {
         assert_eq!(probes, [false, true], "locked while held, free after");
     }
 
-    /// #5799 review (Codex P2): an older release's failure, written by a
-    /// slower process, never replaces a newer release's record; the sentinel
-    /// for an unknown release is replaced by any real one.
+    /// Every failure writes a cooldown for the release that failed, whatever
+    /// release was on record, starting its count afresh; the sentinel for an
+    /// unknown release is replaced by any real one; and a hold writes for the
+    /// release it holds.
     #[test]
-    fn an_older_release_never_overwrites_a_newer_ones_record() {
+    fn every_failure_cools_down_the_release_that_failed() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path();
         let now = SystemTime::now();
-        record_update_failure_at(dir, "0.2.142", "newer", now, 0.5);
-        record_update_failure_at(dir, "0.2.142", "newer", now, 0.5);
+        let hour = std::time::Duration::from_secs(3600);
+        for _ in 0..3 {
+            record_update_failure_at(dir, "0.2.142", "newer", now - hour * 9, 0.5);
+        }
+        // The newer release is withdrawn; the older latest one fails.
         assert_eq!(
-            record_update_failure_at(dir, "0.2.141", "stale", now, 0.5),
-            Some(2),
-            "the newer record's count governs"
-        );
-        hold_update_without_counting_at(
-            dir,
-            "0.2.141",
-            "stale",
-            now + std::time::Duration::from_secs(9 * 3600),
-            0.5,
+            record_update_failure_at(dir, "0.2.141", "older", now, 0.5),
+            Some(1),
+            "a fresh count for the release that failed"
         );
         let record = read_update_cooldown_at(dir).unwrap();
         assert_eq!(
-            (
-                record.version.as_str(),
-                record.failures,
-                record.last_error.as_str()
-            ),
-            ("0.2.142", 2, "newer")
+            (record.version.as_str(), record.last_error.as_str()),
+            ("0.2.141", "older")
         );
-        // The sentinel gives way to a real release, and a real release is
-        // never replaced by the sentinel's hold.
+        assert!(update_cooldown_remaining_at(dir, "0.2.141", now).is_some());
+        // Back to the newer one: it starts afresh too.
+        assert_eq!(
+            record_update_failure_at(dir, "0.2.142", "newer", now, 0.5),
+            Some(1)
+        );
+        // A hold writes for the release it holds, at zero failures.
+        hold_update_without_counting_at(dir, "0.2.141", "held", now, 0.5);
+        let record = read_update_cooldown_at(dir).unwrap();
+        assert_eq!((record.version.as_str(), record.failures), ("0.2.141", 0));
+        assert!(update_cooldown_remaining_at(dir, "0.2.141", now).is_some());
+        // The sentinel gives way to a real release.
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path();
         record_update_failure_at(dir, UNKNOWN_RELEASE, "offline", now, 0.5);
@@ -2900,6 +2893,36 @@ mod tests {
             Some(1)
         );
         assert_eq!(read_update_cooldown_at(dir).unwrap().version, "0.2.141");
+    }
+
+    /// Concurrent writers for different releases never skip a write: every
+    /// one returns a count, and the record left behind is a cooldown in force
+    /// for the release named in it.
+    #[test]
+    fn concurrent_writers_for_different_releases_never_lose_a_cooldown() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
+        let now = SystemTime::now();
+        let writers: Vec<_> = ["0.2.141", "0.2.142"]
+            .into_iter()
+            .map(|version| {
+                let dir = dir.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..50 {
+                        let n = record_update_failure_at(&dir, version, version, now, 0.5)
+                            .expect("written");
+                        assert!(n >= 1);
+                        assert!(update_cooldown_pending_at(&dir, "0.2.140", now).is_some());
+                    }
+                })
+            })
+            .collect();
+        for w in writers {
+            w.join().unwrap();
+        }
+        let record = read_update_cooldown_at(&dir).unwrap();
+        assert_eq!(record.last_error, record.version);
+        assert!(update_cooldown_remaining_at(&dir, &record.version, now).is_some());
     }
 
     #[test]
@@ -3051,9 +3074,11 @@ mod tests {
         // A real failure clears the hold reason.
         record_update_failure_at(dir, "0.2.141", "again", later, 0.5);
         assert_eq!(read_update_cooldown_at(dir).unwrap().hold_reason, None);
+        // A hold for another release replaces the record with its own.
         record_update_failure_at(dir, "0.2.150", "newer", now, 0.5);
-        hold_update_without_counting_at(dir, "0.2.141", "stale", now, 0.5);
-        assert_eq!(read_update_cooldown_at(dir).unwrap().version, "0.2.150");
+        hold_update_without_counting_at(dir, "0.2.141", "held", now, 0.5);
+        let held = read_update_cooldown_at(dir).unwrap();
+        assert_eq!((held.version.as_str(), held.failures), ("0.2.141", 0));
     }
 
     /// A hold with nothing failed yet says so rather than "failed 0 times".
