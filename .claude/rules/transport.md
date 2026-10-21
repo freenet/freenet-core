@@ -218,7 +218,9 @@ OR another peer behind the same IP, e.g. CGNAT; it cannot tell them apart), or
 neither; the recent failures are a listener-owned table bounded by count and
 TTL, and early evictions are counted in `stray_intro_failures_evicted`) and CONNECT
 joiner dial-queue waits (`dial_queue_wait_<label>`, coarse buckets around the
-3 s punch window). Each label set is declared once in a `labelled_counters!`
+3 s punch window) and inbound datagrams by first byte (`demux_<label>`, one per
+`DemuxClass`: `legacy` passes through, `quic` and `other` are counted and
+dropped; see "Socket Abstraction Rules"). Each label set is declared once in a `labelled_counters!`
 list, so a new variant needs a snapshot field. Hot
 path writes are single relaxed atomics; `SentPacketTracker` keeps an
 `rto_expiries` count and a bounded per-stream final-ACK watch, both
@@ -526,6 +528,18 @@ For ALL peer-to-peer transport code paths, continue using the
 `SimulationSocket`. If you are tempted to add another `DefaultSocket`
 use site, justify it in a load-bearing comment at the call site and
 update this section.
+
+#### Inbound packets pass through `DemuxSocket`
+
+`bind_udp_listener` (`connection_handler.rs`) binds `DemuxSocket<S>`
+(`transport/demux.rs`), so every socket the listener reads, real or
+`SimulationSocket`, splits inbound datagrams by first byte: `0x01` / `0x02`
+(the UDP transport's own type bytes) pass through unchanged, a byte with a
+`0xC0` bit set is QUIC-shaped, anything else (including an empty datagram) is
+other. QUIC-shaped and other datagrams are counted (`demux_<label>`) and
+dropped until a QUIC endpoint exists on the same port (#5940). The QUIC rule
+is exact only with QUIC bit greasing (RFC 9287) disabled. Tests that inject a
+hand-written socket straight into the listener bypass the wrapper.
 
 ### WHEN testing transport code
 

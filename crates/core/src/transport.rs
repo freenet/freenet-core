@@ -188,6 +188,7 @@ pub fn get_open_connection_count() -> usize {
 mod boundary;
 pub mod connection_handler;
 mod crypto;
+pub(crate) mod demux;
 pub mod in_memory_socket;
 
 /// Mock transport infrastructure for testing and benchmarking.
