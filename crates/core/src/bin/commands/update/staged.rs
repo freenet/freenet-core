@@ -3654,28 +3654,29 @@ mod tests {
         let (_tmp, root) = test_root();
         let dir = root.parent().unwrap();
         fs::create_dir_all(dir).unwrap();
-        let now = SystemTime::now();
+        // A whole second, read once, so the expected retry time is exact.
+        let now = std::time::UNIX_EPOCH
+            + Duration::from_secs(
+                SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs(),
+            );
+        let clock = move || now;
         super::super::super::rollback::charge_download_bytes_at(dir, 1000, now);
         let lookup = || async { panic!("looked the tag up with the budget spent") };
-        let outcome = decide_without_staging(
-            &root,
-            "9.9.8",
-            Some("9.9.9"),
-            lookup,
-            (&[], 1000),
-            &SystemTime::now,
-        )
-        .await;
+        let outcome =
+            decide_without_staging(&root, "9.9.8", Some("9.9.9"), lookup, (&[], 1000), &clock)
+                .await;
         assert_eq!(outcome, Staging::Throttled);
         assert!(!outcome.preparation().should_exit());
         let held = cooldown(&root).unwrap();
         assert_eq!((held.version.as_str(), held.failures), ("9.9.9", 0));
         // Held until the window resets, within the longest plausible wait.
         let retry = std::time::UNIX_EPOCH + Duration::from_secs(held.retry_at_unix);
-        let wait = retry.duration_since(now).unwrap();
-        assert!(
-            wait > Duration::from_secs(3 * 3600) && wait <= Duration::from_secs(4 * 3600),
-            "{wait:?}"
+        assert_eq!(
+            retry.duration_since(now).unwrap(),
+            Duration::from_secs(4 * 3600)
         );
     }
 
