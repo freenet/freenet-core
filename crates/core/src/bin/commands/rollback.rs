@@ -1254,14 +1254,6 @@ fn lock_records(dir: &Path) -> Option<std::fs::File> {
     }
 }
 
-/// [`record_update_failure_at`] against the shared state directory.
-pub fn record_update_failure(version: &str, error: &str) -> Option<u32> {
-    let rand_unit = freenet::config::GlobalRng::random_range(0.0_f64..1.0);
-    state_dir().and_then(|dir| {
-        record_update_failure_at(&dir, version, error, SystemTime::now(), rand_unit)
-    })
-}
-
 /// Make sure `version` is held WITHOUT counting a failure, for updater runs
 /// that gave up before attempting a download (a cached GitHub cooldown, an
 /// empty install bucket, a rate limit, a failed tag probe). The supervisor runs
@@ -3100,7 +3092,7 @@ mod tests {
         let state = super::super::auto_update::TestStateDir::new();
         let dir = state.path();
         assert_eq!(update_cooldown_pending("0.2.140"), None);
-        assert_eq!(record_update_failure("0.2.141", "offline"), Some(1));
+        record_update_failure_at(dir, "0.2.141", "offline", SystemTime::now(), 0.5);
         assert_eq!(read_update_cooldown_at(dir).unwrap().last_error, "offline");
         let (version, _) = update_cooldown_pending("0.2.140").expect("pending");
         assert_eq!(version, "0.2.141");
