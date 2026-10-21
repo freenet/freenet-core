@@ -163,7 +163,7 @@ pub(crate) enum P2pBridgeEvent {
     PipeStream {
         target_addr: SocketAddr,
         outbound_stream_id: StreamId,
-        inbound_handle: crate::transport::peer_connection::streaming::StreamHandle,
+        inbound_handle: crate::transport::InboundStream,
         metadata: Option<bytes::Bytes>,
     },
 }
@@ -507,7 +507,7 @@ impl NetworkBridge for P2pBridge {
         &self,
         target_addr: SocketAddr,
         outbound_stream_id: StreamId,
-        inbound_handle: crate::transport::peer_connection::streaming::StreamHandle,
+        inbound_handle: crate::transport::InboundStream,
         metadata: Option<bytes::Bytes>,
     ) -> super::ConnResult<()> {
         self.ev_listener_tx
@@ -3270,7 +3270,7 @@ pub(super) enum ConnEvent {
     PipeStream {
         target_addr: SocketAddr,
         outbound_stream_id: StreamId,
-        inbound_handle: crate::transport::peer_connection::streaming::StreamHandle,
+        inbound_handle: crate::transport::InboundStream,
         metadata: Option<bytes::Bytes>,
     },
 }
@@ -3999,7 +3999,7 @@ pub(crate) mod tests {
         fn pipe_stream_data(
             &mut self,
             _outbound_stream_id: crate::transport::StreamId,
-            _inbound_handle: crate::transport::peer_connection::streaming::StreamHandle,
+            _inbound_handle: crate::transport::InboundStream,
             _metadata: Option<bytes::Bytes>,
             _progress: Option<Arc<dyn crate::transport::StreamProgressObserver>>,
         ) -> std::pin::Pin<

@@ -36,7 +36,9 @@ use tokio::time::Instant;
 use dashmap::DashMap;
 use tokio::sync::oneshot;
 
+use crate::transport::InboundStream;
 use crate::transport::StreamId;
+#[cfg(test)]
 use crate::transport::peer_connection::streaming::StreamHandle;
 use crate::transport::peer_connection::streaming_buffer::LockFreeStreamBuffer;
 
@@ -71,9 +73,9 @@ type StreamKey = (SocketAddr, StreamId);
 enum Slot {
     /// The stream arrived before its metadata (RequestStreaming /
     /// ResponseStreaming): the handle and when it was registered.
-    Orphan(StreamHandle, Instant),
+    Orphan(InboundStream, Instant),
     /// The metadata arrived first: the claimant waiting for the stream.
-    Waiter(oneshot::Sender<StreamHandle>),
+    Waiter(oneshot::Sender<InboundStream>),
 }
 
 pub struct OrphanStreamRegistry {
@@ -113,9 +115,10 @@ impl OrphanStreamRegistry {
         &self,
         peer_addr: SocketAddr,
         stream_id: StreamId,
-        handle: StreamHandle,
+        handle: impl Into<InboundStream>,
     ) {
         use dashmap::mapref::entry::Entry;
+        let handle = handle.into();
         let key = (peer_addr, stream_id);
         // Check and act under the key's entry lock, so a concurrent
         // `claim_or_wait` has either already parked the waiter we deliver to,
@@ -188,7 +191,7 @@ impl OrphanStreamRegistry {
         peer_addr: SocketAddr,
         stream_id: StreamId,
         timeout: Duration,
-    ) -> Result<StreamHandle, OrphanStreamError> {
+    ) -> Result<InboundStream, OrphanStreamError> {
         use dashmap::mapref::entry::Entry;
         let key = (peer_addr, stream_id);
         // Atomic dedup: try to insert into claimed_streams. If already present,
@@ -460,9 +463,9 @@ impl crate::transport::InboundStreamRegistry for OrphanStreamRegistry {
         &self,
         peer_addr: SocketAddr,
         stream_id: StreamId,
-        handle: StreamHandle,
+        stream: InboundStream,
     ) {
-        self.register_orphan(peer_addr, stream_id, handle);
+        self.register_orphan(peer_addr, stream_id, stream);
     }
 
     fn cancel_unclaimed_streams(
@@ -630,7 +633,7 @@ mod tests {
         // Insert with fake old timestamp by directly manipulating
         registry.slots.insert(
             (addr, stream_id),
-            Slot::Orphan(handle, Instant::now() - EXPIRED_ORPHAN_AGE),
+            Slot::Orphan(handle.into(), Instant::now() - EXPIRED_ORPHAN_AGE),
         );
 
         assert_eq!(registry.orphan_count(), 1);
@@ -881,7 +884,7 @@ mod tests {
         let orphan_id = StreamId::next();
         registry.slots.insert(
             (addr, orphan_id),
-            Slot::Orphan(make_test_handle(orphan_id), Instant::now()),
+            Slot::Orphan(make_test_handle(orphan_id).into(), Instant::now()),
         );
         registry.remove_waiter(&(addr, orphan_id));
         assert_eq!(registry.orphan_count(), 1);

@@ -2852,7 +2852,7 @@ impl crate::transport::PeerConnectionApi for MockPeerConnection {
     fn pipe_stream_data(
         &mut self,
         _outbound_stream_id: crate::transport::StreamId,
-        _inbound_handle: crate::transport::peer_connection::streaming::StreamHandle,
+        _inbound_handle: crate::transport::InboundStream,
         _metadata: Option<bytes::Bytes>,
         _progress: Option<std::sync::Arc<dyn crate::transport::StreamProgressObserver>>,
     ) -> std::pin::Pin<

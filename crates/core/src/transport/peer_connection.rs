@@ -2400,7 +2400,7 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
             registry.register_inbound_stream(
                 self.remote_conn.remote_addr,
                 stream_id,
-                streaming_handle.clone(),
+                super::InboundStream::from(streaming_handle.clone()),
             );
             tracing::trace!(
                 peer_addr = %self.remote_conn.remote_addr,
@@ -3382,15 +3382,20 @@ impl<S: super::Socket> super::PeerConnectionApi for PeerConnection<S> {
     fn pipe_stream_data(
         &mut self,
         outbound_stream_id: StreamId,
-        inbound_handle: streaming::StreamHandle,
+        inbound_handle: super::InboundStream,
         metadata: Option<bytes::Bytes>,
         progress: Option<std::sync::Arc<dyn super::StreamProgressObserver>>,
     ) -> std::pin::Pin<
         Box<dyn futures::Future<Output = Result<(), super::TransportError>> + Send + '_>,
     > {
         Box::pin(async move {
-            self.pipe_stream_to_remote(outbound_stream_id, inbound_handle, metadata, progress)
-                .await;
+            self.pipe_stream_to_remote(
+                outbound_stream_id,
+                inbound_handle.into_udp(),
+                metadata,
+                progress,
+            )
+            .await;
             Ok(())
         })
     }
