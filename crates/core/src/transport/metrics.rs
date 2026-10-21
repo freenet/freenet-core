@@ -793,10 +793,13 @@ impl TransportMetrics {
     }
 
     /// Test-only: start recording the demultiplexer class of every datagram
-    /// from `remote`. Call before the datagrams are sent.
+    /// from `remote`. Call before the datagrams are sent. Starts an empty
+    /// record, discarding one left by an earlier watcher of the same address;
+    /// two tests watching one address at the same time still interfere, so
+    /// each test must use addresses no other test uses.
     #[cfg(test)]
     pub(crate) fn watch_demux(&self, remote: SocketAddr) {
-        self.nat_detail.demux_watched.entry(remote).or_default();
+        self.nat_detail.demux_watched.insert(remote, Vec::new());
     }
 
     /// Test-only: the demultiplexer classes recorded, in order, for datagrams

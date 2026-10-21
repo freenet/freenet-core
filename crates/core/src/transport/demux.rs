@@ -45,7 +45,8 @@ pub(crate) fn classify(packet: &[u8]) -> DemuxClass {
 /// transport and counts the rest.
 ///
 /// It is public because [`create_connection_handler`] returns handlers over
-/// `DemuxSocket<S>`; callers do not construct it.
+/// `DemuxSocket<S>`; the transport binds it itself, so callers do not need
+/// to construct it.
 ///
 /// It exists so a QUIC endpoint can use the same UDP port as the UDP
 /// transport (#5940). Until that endpoint exists, QUIC-shaped datagrams are
@@ -315,18 +316,19 @@ mod tests {
         }
 
         let host = IpAddr::V4(Ipv4Addr::LOCALHOST);
-        // Ports come from the crate's test port registry, which hands each
-        // test a distinct port and holds it until released just before bind.
+        // Ports come from the crate's test port registry, which keeps each
+        // one bound until it is released. Each is released immediately before
+        // the handler that binds it, so the window in which another process
+        // could take it is only that call.
         let gateway_port = crate::test_utils::reserve_local_port()?;
         let joiner_port = crate::test_utils::reserve_local_port()?;
-        crate::test_utils::release_local_port(gateway_port);
-        crate::test_utils::release_local_port(joiner_port);
         let gateway_addr = SocketAddr::new(host, gateway_port);
         let joiner_addr = SocketAddr::new(host, joiner_port);
         TRANSPORT_METRICS.watch_demux(joiner_addr);
         let gateway_keypair = TransportKeypair::new();
         let gateway_pub = gateway_keypair.public().clone();
 
+        crate::test_utils::release_local_port(gateway_port);
         let (_gateway_out, mut gateway_in, _gateway_task) =
             create_connection_handler::<UdpTransportSocket>(
                 gateway_keypair,
@@ -340,6 +342,7 @@ mod tests {
                 None,
             )
             .await?;
+        crate::test_utils::release_local_port(joiner_port);
         let (mut joiner_out, _joiner_in, _joiner_task) =
             create_connection_handler::<UdpTransportSocket>(
                 TransportKeypair::new(),
