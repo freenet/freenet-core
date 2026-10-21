@@ -1219,7 +1219,21 @@ fn with_record_lock<T>(dir: &Path, f: impl FnOnce() -> T) -> T {
     static IN_PROCESS: std::sync::Mutex<()> = std::sync::Mutex::new(());
     let _thread = IN_PROCESS.lock().unwrap_or_else(|e| e.into_inner());
     let _process = lock_records(dir);
+    #[cfg(test)]
+    LAST_RECORD_LOCK_TAKEN.with(|taken| taken.set(Some(_process.is_some())));
     f()
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Run on this thread each time a record writer finds the lock busy, so a
+    /// test can release the holder at that moment, whatever else delayed
+    /// the writer.
+    static ON_BUSY_RECORD_LOCK: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
+        std::cell::RefCell::new(None);
+    /// Whether this thread's last record writer got the lock.
+    static LAST_RECORD_LOCK_TAKEN: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
 }
 
 fn lock_records(dir: &Path) -> Option<std::fs::File> {
@@ -1239,6 +1253,12 @@ fn lock_records(dir: &Path) -> Option<std::fs::File> {
         match try_lock_file(&file) {
             Ok(true) => return Some(file),
             Ok(false) if slept < RECORD_LOCK_WAIT => {
+                #[cfg(test)]
+                ON_BUSY_RECORD_LOCK.with(|hook| {
+                    if let Some(hook) = hook.borrow_mut().as_mut() {
+                        hook();
+                    }
+                });
                 std::thread::sleep(POLL);
                 slept += POLL;
             }
@@ -1798,7 +1818,7 @@ fn now_unix() -> u64 {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn write_dummy_binary(path: &Path, contents: &[u8]) {
@@ -2831,60 +2851,183 @@ mod tests {
         assert_eq!(temp_files(&dir), Vec::<String>::new());
     }
 
-    /// Whether a forked child process can take the record lock in `dir`
-    /// right now. Between fork and _exit the child makes only
-    /// async-signal-safe calls, as a fork of a threaded process must.
+    /// Turns [`lock_helper_subprocess`] from a no-op test into a helper
+    /// process: `probe:<path>` or `hold:<ms>:<path>` (`ms` empty: until
+    /// stdin closes).
+    const LOCK_HELPER_ENV: &str = "FREENET_TEST_LOCK_HELPER";
+
+    /// Not a test of its own: a no-op unless [`LockHelper`] re-executes this
+    /// binary filtered to it, with [`LOCK_HELPER_ENV`] set. A re-executed
+    /// helper, unlike a fork, inherits none of this process's descriptors
+    /// (all are close-on-exec), so it can never keep another test's lock
+    /// alive the way a forked child did.
+    #[test]
     #[cfg(unix)]
-    fn another_process_can_lock(dir: &Path) -> bool {
-        use std::os::unix::ffi::OsStrExt;
-        let path =
-            std::ffi::CString::new(dir.join(RECORD_LOCK_FILE).as_os_str().as_bytes()).unwrap();
-        let mut pipe = [0i32; 2];
-        // SAFETY: a valid two-element array for pipe(2) to fill.
-        assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
-        for fd in pipe {
-            // SAFETY: setting a flag on a descriptor we just created.
-            unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
+    fn lock_helper_subprocess() {
+        use std::io::{Read, Write};
+        let Ok(spec) = std::env::var(LOCK_HELPER_ENV) else {
+            return;
+        };
+        let say = |line: &str| {
+            let mut out = std::io::stdout();
+            #[allow(clippy::let_underscore_must_use)]
+            let _ = writeln!(out, "{line}").and_then(|()| out.flush());
+        };
+        let open = |path: &str| {
+            std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .write(true)
+                .open(path)
+                .expect("open the lock file")
+        };
+        if let Some(path) = spec.strip_prefix("probe:") {
+            let got = try_lock_file(&open(path)).unwrap_or(false);
+            say(if got { "LOCK=1" } else { "LOCK=0" });
+            std::process::exit(0);
         }
-        // SAFETY: the child only calls async-signal-safe functions on data
-        // prepared before the fork, then _exits without unwinding.
-        let pid = unsafe { libc::fork() };
-        assert!(pid >= 0, "fork failed");
-        if pid == 0 {
-            // SAFETY: as above.
-            unsafe {
-                libc::alarm(30);
-                libc::close(pipe[0]);
-                let fd = libc::open(path.as_ptr(), libc::O_RDWR | libc::O_CREAT, 0o600);
-                let mut request: libc::flock = std::mem::zeroed();
-                request.l_type = libc::F_WRLCK as _;
-                request.l_whence = libc::SEEK_SET as _;
-                let got = [u8::from(
-                    fd >= 0 && libc::fcntl(fd, libc::F_SETLK, &request) == 0,
-                )];
-                libc::write(pipe[1], got.as_ptr().cast(), 1);
-                libc::_exit(0);
+        let (ms, path) = spec
+            .strip_prefix("hold:")
+            .and_then(|rest| rest.split_once(':'))
+            .expect("hold:<ms>:<path>");
+        let file = open(path);
+        if !try_lock_file(&file).unwrap_or(false) {
+            say("LOCK=0");
+            std::process::exit(0);
+        }
+        say("LOCKED");
+        match ms.parse::<u64>() {
+            Ok(ms) => std::thread::sleep(std::time::Duration::from_millis(ms)),
+            Err(_) => {
+                let mut sink = Vec::new();
+                #[allow(clippy::let_underscore_must_use)]
+                let _ = std::io::stdin().read_to_end(&mut sink);
             }
         }
-        // SAFETY: closing the end only the child uses.
-        unsafe { libc::close(pipe[1]) };
-        let mut got = [2u8];
-        // SAFETY: reading one byte into a one-byte buffer.
-        let n = unsafe { libc::read(pipe[0], got.as_mut_ptr().cast(), 1) };
-        let mut status = 0;
-        // SAFETY: closing our end and reaping our own child.
-        unsafe {
-            libc::close(pipe[0]);
-            libc::waitpid(pid, &mut status, 0);
+        // Written BEFORE the lock is released (at exit), so a writer that
+        // finds it once it holds the lock waited for this holder.
+        say("RELEASING");
+        std::process::exit(0);
+    }
+
+    /// This test binary re-executed as [`lock_helper_subprocess`].
+    #[cfg(unix)]
+    pub(crate) struct LockHelper {
+        child: std::process::Child,
+        out: std::process::ChildStdout,
+        seen: String,
+    }
+
+    #[cfg(unix)]
+    impl LockHelper {
+        pub(crate) fn spawn(spec: &str) -> Self {
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "commands::rollback::tests::lock_helper_subprocess",
+                    "--exact",
+                    "--nocapture",
+                    "--test-threads",
+                    "1",
+                ])
+                .env(LOCK_HELPER_ENV, spec)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .expect("re-execute the test binary");
+            let out = child.stdout.take().unwrap();
+            Self {
+                child,
+                out,
+                seen: String::new(),
+            }
         }
-        assert_eq!(n, 1, "the child exited without reporting");
-        got[0] == 1
+
+        /// Read until `marker` appears; `false` at end of output first.
+        pub(crate) fn wait_for(&mut self, marker: &str) -> bool {
+            use std::io::Read;
+            let mut buf = [0u8; 256];
+            while !self.seen.contains(marker) {
+                match self.out.read(&mut buf) {
+                    Ok(0) | Err(_) => return false,
+                    Ok(n) => self.seen.push_str(&String::from_utf8_lossy(&buf[..n])),
+                }
+            }
+            true
+        }
+
+        /// Hold `path`'s lock for `hold_ms` (until [`Self::release`] when
+        /// `None`); returns once the helper holds it.
+        pub(crate) fn hold(path: &Path, hold_ms: Option<u64>) -> Self {
+            let ms = hold_ms.map_or_else(String::new, |ms| ms.to_string());
+            let mut helper = Self::spawn(&format!("hold:{ms}:{}", path.display()));
+            assert!(
+                helper.wait_for("LOCKED"),
+                "the helper did not take the lock: {}",
+                helper.seen
+            );
+            helper
+        }
+
+        /// Whether the helper has said it is releasing, without blocking.
+        pub(crate) fn released(&mut self) -> bool {
+            use std::io::Read;
+            use std::os::unix::io::AsRawFd;
+            let fd = self.out.as_raw_fd();
+            // SAFETY: flag changes on a descriptor this struct owns.
+            unsafe {
+                let flags = libc::fcntl(fd, libc::F_GETFL);
+                libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+            }
+            let mut buf = [0u8; 256];
+            while let Ok(n) = self.out.read(&mut buf) {
+                if n == 0 {
+                    break;
+                }
+                self.seen.push_str(&String::from_utf8_lossy(&buf[..n]));
+            }
+            self.seen.contains("RELEASING")
+        }
+
+        /// Let a helper started with no hold time go, and wait for it.
+        pub(crate) fn release(mut self) {
+            drop(self.child.stdin.take());
+            #[allow(clippy::let_underscore_must_use)]
+            let _ = self.child.wait();
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for LockHelper {
+        fn drop(&mut self) {
+            #[allow(clippy::let_underscore_must_use)]
+            let _ = self.child.kill();
+            #[allow(clippy::let_underscore_must_use)]
+            let _ = self.child.wait();
+        }
+    }
+
+    /// Whether another process can take the lock on `path` right now.
+    #[cfg(unix)]
+    pub(crate) fn another_process_can_lock_file(path: &Path) -> bool {
+        let mut helper = LockHelper::spawn(&format!("probe:{}", path.display()));
+        assert!(
+            helper.wait_for("LOCK="),
+            "the helper exited without reporting"
+        );
+        helper.seen.contains("LOCK=1")
+    }
+
+    /// Whether another process can take the record lock in `dir` right now.
+    #[cfg(unix)]
+    fn another_process_can_lock(dir: &Path) -> bool {
+        another_process_can_lock_file(&dir.join(RECORD_LOCK_FILE))
     }
 
     /// #5799: while a record is being rewritten, another
     /// process (the updater, a tray "Check for Updates") cannot take the
     /// record lock, so it waits instead of losing the increment. Checked from
-    /// a forked child at that moment, not by timing, which contention from
+    /// another process at that moment, not by timing, which contention from
     /// other tests in this process could satisfy by itself.
     #[test]
     #[cfg(unix)]
@@ -2951,96 +3094,13 @@ mod tests {
         assert_eq!(temp_files(tmp.path()), Vec::<String>::new());
     }
 
-    /// A forked child that takes the record lock in `dir`, holds it for
-    /// `hold_ms`, then writes one byte to the returned pipe and exits
-    /// (releasing the lock). The byte is written BEFORE the release, so a
-    /// writer that finds it readable once it holds the lock waited for the
-    /// child. Between fork and _exit the child makes only async-signal-safe
-    /// calls, as a fork of a threaded process must.
-    #[cfg(unix)]
-    fn child_holding_record_lock(dir: &Path, hold_ms: i64) -> (libc::pid_t, libc::c_int) {
-        use std::os::unix::ffi::OsStrExt;
-        let path =
-            std::ffi::CString::new(dir.join(RECORD_LOCK_FILE).as_os_str().as_bytes()).unwrap();
-        let (mut locked, mut released) = ([0i32; 2], [0i32; 2]);
-        // SAFETY: valid two-element arrays for pipe(2) to fill.
-        assert_eq!(unsafe { libc::pipe(locked.as_mut_ptr()) }, 0);
-        // SAFETY: as above.
-        assert_eq!(unsafe { libc::pipe(released.as_mut_ptr()) }, 0);
-        for fd in locked.into_iter().chain(released) {
-            // SAFETY: setting a flag on a descriptor we just created.
-            unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
-        }
-        // SAFETY: the child only calls async-signal-safe functions on data
-        // prepared before the fork, then _exits without unwinding.
-        let pid = unsafe { libc::fork() };
-        assert!(pid >= 0, "fork failed");
-        if pid == 0 {
-            // SAFETY: as above.
-            unsafe {
-                libc::alarm(30);
-                // Every inherited descriptor but our two pipe ends, so this
-                // child cannot hold another test's pipe open while it sleeps.
-                for fd in 3..1024 {
-                    if fd != locked[1] && fd != released[1] {
-                        libc::close(fd);
-                    }
-                }
-                let fd = libc::open(path.as_ptr(), libc::O_RDWR | libc::O_CREAT, 0o600);
-                let mut request: libc::flock = std::mem::zeroed();
-                request.l_type = libc::F_WRLCK as _;
-                request.l_whence = libc::SEEK_SET as _;
-                let got = [u8::from(
-                    fd >= 0 && libc::fcntl(fd, libc::F_SETLK, &request) == 0,
-                )];
-                libc::write(locked[1], got.as_ptr().cast(), 1);
-                let ts = libc::timespec {
-                    tv_sec: (hold_ms / 1000) as _,
-                    tv_nsec: ((hold_ms % 1000) * 1_000_000) as _,
-                };
-                libc::nanosleep(&ts, std::ptr::null_mut());
-                libc::write(released[1], got.as_ptr().cast(), 1);
-                libc::_exit(0);
-            }
-        }
-        let mut got = [0u8];
-        // SAFETY: closing the ends only the child uses, reading one byte, and
-        // making our read end of `released` non-blocking.
-        unsafe {
-            libc::close(locked[1]);
-            libc::close(released[1]);
-            let n = libc::read(locked[0], got.as_mut_ptr().cast(), 1);
-            libc::close(locked[0]);
-            assert!(n == 1 && got[0] == 1, "the child did not take the lock");
-            let flags = libc::fcntl(released[0], libc::F_GETFL);
-            libc::fcntl(released[0], libc::F_SETFL, flags | libc::O_NONBLOCK);
-        }
-        (pid, released[0])
-    }
-
-    /// Whether the child has signalled that it is releasing the lock.
-    #[cfg(unix)]
-    fn released(fd: libc::c_int) -> bool {
-        let mut byte = [0u8];
-        // SAFETY: a non-blocking one-byte read into a one-byte buffer.
-        unsafe { libc::read(fd, byte.as_mut_ptr().cast(), 1) == 1 }
-    }
-
-    /// Kill and reap the child, and close its pipe.
-    #[cfg(unix)]
-    fn reap(pid: libc::pid_t, fd: libc::c_int) {
-        let mut status = 0;
-        // SAFETY: killing and reaping our own child, closing our descriptor.
-        unsafe {
-            libc::kill(pid, libc::SIGKILL);
-            libc::waitpid(pid, &mut status, 0);
-            libc::close(fd);
-        }
-    }
-
-    /// Every record writer waits for a lock another process holds: each
-    /// finds the holder's "releasing" byte once it is let in. The holder lets
-    /// go after 20 ms, well inside the writer's 100 ms wait.
+    /// Every record writer waits for a lock another process holds. The holder
+    /// keeps it until the writer has found it busy, then a hook on the
+    /// writer's thread lets it go and waits for it to exit, so the writer
+    /// must then get the lock. No timing is involved: under plain `cargo
+    /// test` a writer can wait on the in-process mutex for any length of
+    /// time first, and a writer that never took the lock never fires the
+    /// hook.
     #[test]
     #[cfg(unix)]
     fn every_record_writer_waits_for_a_lock_another_process_holds() {
@@ -3061,28 +3121,56 @@ mod tests {
             }),
         ];
         for (what, write) in writers {
-            let (child, fd) = child_holding_record_lock(dir, 20);
+            let holder = std::rc::Rc::new(std::cell::RefCell::new(Some(LockHelper::hold(
+                &dir.join(RECORD_LOCK_FILE),
+                None,
+            ))));
+            let fired = std::rc::Rc::new(std::cell::Cell::new(false));
+            let (hook_holder, hook_fired) = (holder.clone(), fired.clone());
+            ON_BUSY_RECORD_LOCK.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move || {
+                    if let Some(holder) = hook_holder.borrow_mut().take() {
+                        holder.release();
+                        hook_fired.set(true);
+                    }
+                }))
+            });
+            LAST_RECORD_LOCK_TAKEN.with(|taken| taken.set(None));
             write();
-            let waited = released(fd);
-            reap(child, fd);
-            assert!(waited, "the {what} writer waited for the holder");
+            ON_BUSY_RECORD_LOCK.with(|hook| *hook.borrow_mut() = None);
+            assert!(fired.get(), "the {what} writer found the lock busy");
+            assert_eq!(
+                LAST_RECORD_LOCK_TAKEN.with(|taken| taken.get()),
+                Some(true),
+                "the {what} writer got the lock once it was free"
+            );
+            drop(holder);
         }
     }
 
     /// A holder that never lets go does not block a writer for good: it
-    /// writes anyway (fail open) while the holder still holds the lock.
+    /// writes anyway (fail open) while the holder still holds the lock, and
+    /// gives up within half a second of real time.
     #[test]
     #[cfg(unix)]
     fn a_wedged_lock_holder_does_not_block_a_writer() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path();
-        let (child, fd) = child_holding_record_lock(dir, 2_000);
+        let mut holder = LockHelper::hold(&dir.join(RECORD_LOCK_FILE), Some(5_000));
+        let started = std::time::Instant::now();
+        assert!(lock_records(dir).is_none(), "the lock stayed busy");
+        let waited = started.elapsed();
+        assert!(
+            waited < std::time::Duration::from_millis(500),
+            "gave up after {waited:?}"
+        );
         let now = SystemTime::now();
         let written = record_update_failure_at(dir, "0.2.141", "x", now, 0.5);
-        let still_held = !released(fd);
-        reap(child, fd);
         assert_eq!(written, Some(1));
-        assert!(still_held, "written while the holder still held the lock");
+        assert!(
+            !holder.released(),
+            "written while the holder still held the lock"
+        );
     }
 
     /// The wrappers over the shared state directory act on it (here a
@@ -3454,7 +3542,7 @@ mod tests {
     fn record_writes_name_only_swept_files() {
         let src = include_str!("rollback.rs").replace("\r\n", "\n");
         let production = src
-            .split_once(concat!("#[cfg(test)]\n", "mod tests {"))
+            .split_once(concat!("#[cfg(test)]\n", "pub(crate) mod tests {"))
             .unwrap()
             .0;
         let flat: String = production.split_whitespace().collect();

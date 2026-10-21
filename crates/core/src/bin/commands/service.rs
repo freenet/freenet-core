@@ -899,6 +899,35 @@ mod tests {
         // This is the invariant the dup-tray fix relies on. If a future
         // refactor turns the lock into a shared lock, or swaps LOCK_NB
         // for blocking, this test fails.
+        //
+        // Run in a child process (this binary re-executed, filtered to this
+        // test): any test in this process that spawns a program holds a
+        // copy of our descriptor between its fork and its exec, which keeps
+        // the flock past the drop below. Under plain `cargo test` that made
+        // the last assertion fail about once in a hundred full runs.
+        const CHILD: &str = "FREENET_TEST_WRAPPER_LOCK_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "commands::service::tests::wrapper_lock_is_exclusive",
+                    "--exact",
+                    "--test-threads",
+                    "1",
+                ])
+                .env(CHILD, "1")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .output()
+                .expect("re-execute the test binary");
+            let out = String::from_utf8_lossy(&status.stdout);
+            assert!(
+                status.status.success() && out.contains("1 passed"),
+                "the child run failed or ran nothing: {out}{}",
+                String::from_utf8_lossy(&status.stderr)
+            );
+            return;
+        }
         let tmp = tempfile::tempdir().unwrap();
         let lock_path = tmp.path().join("wrapper.lock");
 

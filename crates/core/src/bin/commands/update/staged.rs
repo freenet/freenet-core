@@ -2620,91 +2620,16 @@ mod tests {
 
     /// Another process holds the cache lock: staging must skip without
     /// downloading, and the lock must be free once that process exits. The
-    /// holder is a forked child that, between fork and _exit, makes only
-    /// async-signal-safe calls (as a fork of a threaded process must), and
-    /// kills itself with alarm(2) if this test dies before releasing it.
+    /// holder is this test binary re-executed (see
+    /// `rollback::tests::LockHelper`), which inherits none of this process's
+    /// descriptors, unlike a forked child.
     #[tokio::test]
     #[cfg(unix)]
     async fn cache_lock_excludes_another_process() {
-        use std::os::unix::ffi::OsStrExt;
-
-        /// Releases and reaps the child however the test ends.
-        struct Child {
-            pid: libc::pid_t,
-            release: libc::c_int,
-        }
-        impl Drop for Child {
-            fn drop(&mut self) {
-                // SAFETY: closing our write end lets the child's read return,
-                // and we reap only our own child.
-                unsafe {
-                    libc::close(self.release);
-                    let mut status = 0;
-                    libc::waitpid(self.pid, &mut status, 0);
-                }
-            }
-        }
-
+        use super::super::super::rollback::tests::LockHelper;
         let (_tmp, root) = test_root();
         fs::create_dir_all(root.parent().unwrap()).unwrap();
-        let path =
-            std::ffi::CString::new(root.with_extension("lock").as_os_str().as_bytes()).unwrap();
-        let (mut ready, mut release) = ([0i32; 2], [0i32; 2]);
-        // SAFETY: a valid two-element array for pipe(2) to fill.
-        assert_eq!(unsafe { libc::pipe(ready.as_mut_ptr()) }, 0);
-        // SAFETY: as above.
-        assert_eq!(unsafe { libc::pipe(release.as_mut_ptr()) }, 0);
-        // Close-on-exec, so a process another test spawns meanwhile cannot
-        // keep the release pipe open and stall the child until its alarm.
-        for fd in ready.into_iter().chain(release) {
-            // SAFETY: setting a flag on a descriptor we just created.
-            unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
-        }
-
-        // SAFETY: the child only calls async-signal-safe functions on data
-        // prepared before the fork, then _exits without unwinding.
-        let pid = unsafe { libc::fork() };
-        assert!(pid >= 0, "fork failed");
-        if pid == 0 {
-            // SAFETY: async-signal-safe calls only, on a NUL-terminated path
-            // and descriptors created before the fork; `_exit` never returns.
-            unsafe {
-                libc::alarm(60);
-                libc::close(ready[0]);
-                libc::close(release[1]);
-                let fd = libc::open(path.as_ptr(), libc::O_RDWR | libc::O_CREAT, 0o600);
-                let mut request: libc::flock = std::mem::zeroed();
-                request.l_type = libc::F_WRLCK as _;
-                request.l_whence = libc::SEEK_SET as _;
-                let locked = [u8::from(
-                    fd >= 0 && libc::fcntl(fd, libc::F_SETLK, &request) == 0,
-                )];
-                libc::write(ready[1], locked.as_ptr().cast(), 1);
-                // Returns on the parent's write or close (EOF).
-                let mut go = [0u8];
-                libc::read(release[0], go.as_mut_ptr().cast(), 1);
-                libc::_exit(0);
-            }
-        }
-        // SAFETY: closing the ends only the child uses.
-        unsafe {
-            libc::close(ready[1]);
-            libc::close(release[0]);
-        }
-        let child = Child {
-            pid,
-            release: release[1],
-        };
-        let mut locked = [0u8];
-        assert_eq!(
-            // SAFETY: reading one byte into a one-byte buffer.
-            unsafe { libc::read(ready[0], locked.as_mut_ptr().cast(), 1) },
-            1,
-            "the child exited without reporting"
-        );
-        // SAFETY: our read end, no longer needed.
-        unsafe { libc::close(ready[0]) };
-        assert_eq!(locked[0], 1, "the child could not take the lock");
+        let child = LockHelper::hold(&root.with_extension("lock"), None);
 
         assert!(
             try_lock(&root).unwrap().is_none(),
@@ -2714,7 +2639,7 @@ mod tests {
         let outcome = stage_into_with(&root, &server, Ok(TAG.into()), None, &|_| false).await;
         assert_eq!(outcome, Staging::Skipped);
 
-        drop(child);
+        child.release();
         assert!(
             try_lock(&root).unwrap().is_some(),
             "the lock must be free once its holder exits"
