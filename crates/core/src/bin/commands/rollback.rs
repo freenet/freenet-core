@@ -2895,34 +2895,28 @@ mod tests {
         assert_eq!(read_update_cooldown_at(dir).unwrap().version, "0.2.141");
     }
 
-    /// Concurrent writers for different releases never skip a write: every
-    /// one returns a count, and the record left behind is a cooldown in force
-    /// for the release named in it.
+    /// Two writers for different releases, interleaved as the node and the
+    /// updater can be when they see different latest releases: neither's
+    /// failure is ever dropped. After every write the record is a cooldown in
+    /// force for the release that writer failed. (The lock that keeps truly
+    /// simultaneous writes whole is `concurrent_cooldown_writes_leave_a_valid_record`.)
     #[test]
-    fn concurrent_writers_for_different_releases_never_lose_a_cooldown() {
+    fn interleaved_writers_for_different_releases_never_lose_a_cooldown() {
         let tmp = tempfile::tempdir().unwrap();
-        let dir = tmp.path().to_path_buf();
+        let dir = tmp.path();
         let now = SystemTime::now();
-        let writers: Vec<_> = ["0.2.141", "0.2.142"]
-            .into_iter()
-            .map(|version| {
-                let dir = dir.clone();
-                std::thread::spawn(move || {
-                    for _ in 0..50 {
-                        let n = record_update_failure_at(&dir, version, version, now, 0.5)
-                            .expect("written");
-                        assert!(n >= 1);
-                        assert!(update_cooldown_pending_at(&dir, "0.2.140", now).is_some());
-                    }
-                })
-            })
-            .collect();
-        for w in writers {
-            w.join().unwrap();
+        for round in 0..10 {
+            for version in ["0.2.142", "0.2.141"] {
+                assert_eq!(
+                    record_update_failure_at(dir, version, version, now, 0.5),
+                    Some(1),
+                    "round {round}"
+                );
+                let record = read_update_cooldown_at(dir).unwrap();
+                assert_eq!(record.version, version, "round {round}");
+                assert!(update_cooldown_remaining_at(dir, version, now).is_some());
+            }
         }
-        let record = read_update_cooldown_at(&dir).unwrap();
-        assert_eq!(record.last_error, record.version);
-        assert!(update_cooldown_remaining_at(&dir, &record.version, now).is_some());
     }
 
     #[test]
