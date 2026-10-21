@@ -833,8 +833,9 @@ struct UdpPacketsListener<S = UdpSocket, T: TimeSource = RealTime> {
     /// IPs expected to connect as regular peers (not gateways).
     /// Used to validate connection attempts and prevent gateway impersonation.
     expected_non_gateway: Arc<DashSet<IpAddr>>,
-    /// Outbound traversals that failed recently, to classify stray intros
-    /// (telemetry only). Bounded by size and TTL.
+    /// Outbound traversals that timed out (failure kind `NoResponse`,
+    /// `Undecryptable` or `Incomplete`) in the last 10 s, to classify stray
+    /// intros (telemetry only). Bounded by size and TTL.
     recent_traversal_failures: RecentTraversalFailures,
     time_source: T,
     /// Congestion control configuration for new connections.
@@ -1961,7 +1962,7 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                             );
                             self.recent_traversal_failures.record_failure(
                                 remote_addr,
-                                seen,
+                                kind,
                                 self.time_source.now_nanos(),
                                 &crate::transport::TRANSPORT_METRICS,
                             );

@@ -118,10 +118,11 @@ labelled_counters! {
     /// traversal exists for its exact address. Exactly one per dropped intro;
     /// exported per period as `stray_intro_<label>`.
     pub(crate) enum StrayIntro {
-        /// The same address had an outbound traversal that ran to its deadline
-        /// and failed in the last `STRAY_INTRO_WINDOW` (10 s): the remote
-        /// punched after we gave up. Failures that ended before the deadline
-        /// (version mismatch, send error, ...) are not remembered. Checked
+        /// The same address had an outbound traversal time out (failure kind
+        /// `no_response`, `undecryptable` or `incomplete`) in the last
+        /// `STRAY_INTRO_WINDOW` (10 s): the remote punched after we gave up.
+        /// Other failures (version mismatch, send error, ...) are not
+        /// remembered, even when their attempt ran to the deadline. Checked
         /// first, as the more specific match. If more than
         /// `MAX_RECENT_TRAVERSAL_FAILURES` failed within the window, the
         /// oldest were forgotten early and their late intros count as another

@@ -2976,6 +2976,49 @@ mod driver_timing_tests {
         );
         assert!(waits(&unsent).is_empty(), "an unsent dial records no wait");
 
+        // `ExpectPeerConnection` goes out but `ConnectPeer` cannot: the
+        // channel has room for exactly one event, and the event loop stops
+        // accepting before taking more.
+        let (op_manager, mut events) = op_manager_with_events("dial-wait-half-sent").await;
+        while op_manager
+            .try_notify_node_event(NodeEvent::TransactionCompleted(tx))
+            .is_ok()
+        {}
+        drop(events.recv().await.expect("a filler event"));
+        let half = peer(24892);
+        let half_addr = half.socket_addr().unwrap();
+        let closing_loop = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            events.close();
+            let mut expected = false;
+            while let Some(event) = events.recv().await {
+                match event {
+                    Either::Right(NodeEvent::ExpectPeerConnection { addr })
+                        if addr == half_addr =>
+                    {
+                        expected = true;
+                    }
+                    Either::Right(NodeEvent::ConnectPeer { .. }) => panic!("ConnectPeer was sent"),
+                    Either::Left(_) | Either::Right(_) => {}
+                }
+            }
+            expected
+        });
+        assert!(
+            super::begin_acceptor_dial(&op_manager, tx, half.clone(), Instant::now())
+                .await
+                .is_err(),
+            "premise: ConnectPeer cannot be sent"
+        );
+        assert!(
+            closing_loop.await.expect("event loop"),
+            "premise: ExpectPeerConnection was sent"
+        );
+        assert!(
+            waits(&half).is_empty(),
+            "a dial whose ConnectPeer was not sent records no wait"
+        );
+
         // The event loop's channel is full and is not drained for 4 s, so the
         // sends block that long: the recorded wait must span it.
         let (op_manager, mut events) = op_manager_with_events("dial-wait-held").await;

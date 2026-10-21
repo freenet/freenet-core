@@ -211,7 +211,8 @@ counters), NAT traversals by why they were started (`nat_attempts_<label>`,
 always `gateway`, and `ring_peer_no_transport` is the event loop's dial to a
 ring peer whose transport was lost, since cached-peer joins never dial
 (#5954)), intro packets a non-gateway drops as unknown (`stray_intro_<label>`:
-the exact address's traversal ran to its deadline and failed in the last 10 s,
+the exact address's traversal timed out (no_response, undecryptable or
+incomplete; not other failures) in the last 10 s,
 a traversal to another port of the IP is running (endpoint-dependent mapping
 OR another peer behind the same IP, e.g. CGNAT; it cannot tell them apart), or
 neither; the recent failures are a listener-owned table bounded by count and

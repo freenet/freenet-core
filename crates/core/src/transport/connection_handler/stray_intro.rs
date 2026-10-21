@@ -9,10 +9,10 @@ use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use crate::transport::metrics::{NatAttemptSeen, StrayIntro, TransportMetrics};
+use crate::transport::metrics::{NatFailureKind, StrayIntro, TransportMetrics};
 
-/// How long after an outbound traversal fails at its deadline an intro from
-/// the same address still counts as [`StrayIntro::AfterDeadline`].
+/// How long after an outbound traversal times out an intro from the same
+/// address still counts as [`StrayIntro::AfterDeadline`].
 pub(super) const STRAY_INTRO_WINDOW: Duration = Duration::from_secs(10);
 
 /// At most this many recent failures are remembered. When more fail within
@@ -33,8 +33,9 @@ pub(super) fn classify(failed_recently: bool, traversal_to_same_ip: bool) -> Str
     }
 }
 
-/// Addresses whose outbound traversal ran to its deadline and failed in the
-/// last [`STRAY_INTRO_WINDOW`], owned by the listener task (no locks).
+/// Addresses whose outbound traversal timed out (failure kind `NoResponse`,
+/// `Undecryptable` or `Incomplete`) in the last [`STRAY_INTRO_WINDOW`], owned
+/// by the listener task (no locks).
 ///
 /// Bounded twice: an entry expires after the window (by time, which nothing
 /// can renew: only a new failure adds an entry), and the table holds at most
@@ -51,26 +52,35 @@ pub(super) struct RecentTraversalFailures {
 }
 
 impl RecentTraversalFailures {
-    /// An outbound traversal to `addr` failed at `now_nanos`, having seen
-    /// `seen` (the same value its failure sample records). Only a failure
-    /// that ran to its deadline is remembered: an intro after one that ended
-    /// early (version mismatch, send error, ...) is not a timing miss.
-    /// Unexpired entries evicted to make room are counted in `metrics`.
+    /// An outbound traversal to `addr` failed at `now_nanos` with `kind`
+    /// (the same value its failure is counted under). Only a timeout is
+    /// remembered (`NoResponse`, `Undecryptable`, `Incomplete`): an intro
+    /// after a version mismatch, a send error or another early end is not a
+    /// timing miss, even when that attempt also ran to its deadline.
+    /// Addresses forgotten early to make room are counted in `metrics`.
     pub(super) fn record_failure(
         &mut self,
         addr: SocketAddr,
-        seen: NatAttemptSeen,
+        kind: NatFailureKind,
         now_nanos: u64,
         metrics: &TransportMetrics,
     ) {
-        if !seen.deadline_reached {
-            return;
+        match kind {
+            NatFailureKind::NoResponse
+            | NatFailureKind::Undecryptable
+            | NatFailureKind::Incomplete => {}
+            NatFailureKind::VersionIncompatible
+            | NatFailureKind::SendError
+            | NatFailureKind::Other => return,
         }
         self.prune(now_nanos);
         let mut evicted = 0;
         while self.order.len() >= MAX_RECENT_TRAVERSAL_FAILURES {
-            self.pop_oldest();
-            evicted += 1;
+            // An older duplicate of an address that failed again forgets
+            // nothing, so it is not counted.
+            if self.pop_oldest() {
+                evicted += 1;
+            }
         }
         metrics.record_stray_intro_failures_evicted(evicted);
         self.order.push_back((addr, now_nanos));
@@ -95,11 +105,17 @@ impl RecentTraversalFailures {
         }
     }
 
-    fn pop_oldest(&mut self) {
-        if let Some((addr, at)) = self.order.pop_front() {
-            if self.latest.get(&addr) == Some(&at) {
-                self.latest.remove(&addr);
-            }
+    /// Drop the oldest entry. Returns whether that forgot an address (it
+    /// was the address's latest failure), rather than an older duplicate.
+    fn pop_oldest(&mut self) -> bool {
+        let Some((addr, at)) = self.order.pop_front() else {
+            return false;
+        };
+        if self.latest.get(&addr) == Some(&at) {
+            self.latest.remove(&addr);
+            true
+        } else {
+            false
         }
     }
 
@@ -116,12 +132,7 @@ mod tests {
 
     const SEC: u64 = 1_000_000_000;
 
-    fn seen(deadline_reached: bool) -> NatAttemptSeen {
-        NatAttemptSeen {
-            deadline_reached,
-            ..Default::default()
-        }
-    }
+    const TIMEOUT: NatFailureKind = NatFailureKind::NoResponse;
 
     fn evictions(metrics: &TransportMetrics) -> u32 {
         metrics.read_snapshot().stray_intro_failures_evicted
@@ -146,7 +157,7 @@ mod tests {
         let mut recent = RecentTraversalFailures::default();
         let m = TransportMetrics::new();
         let start = 100 * SEC;
-        recent.record_failure(addr(1), seen(true), start, &m);
+        recent.record_failure(addr(1), TIMEOUT, start, &m);
         assert!(recent.failed_recently(addr(1), start));
         assert!(!recent.failed_recently(addr(2), start), "other port");
         let window = STRAY_INTRO_WINDOW.as_nanos() as u64;
@@ -161,8 +172,8 @@ mod tests {
     fn repeat_failure_extends_only_by_its_own_time() {
         let mut recent = RecentTraversalFailures::default();
         let m = TransportMetrics::new();
-        recent.record_failure(addr(1), seen(true), 0, &m);
-        recent.record_failure(addr(1), seen(true), 5 * SEC, &m);
+        recent.record_failure(addr(1), TIMEOUT, 0, &m);
+        recent.record_failure(addr(1), TIMEOUT, 5 * SEC, &m);
         assert!(recent.failed_recently(addr(1), 12 * SEC));
         assert!(!recent.failed_recently(addr(1), 15 * SEC));
     }
@@ -175,7 +186,7 @@ mod tests {
         let m = TransportMetrics::new();
         let n = MAX_RECENT_TRAVERSAL_FAILURES as u16 + 10;
         for port in 0..n {
-            recent.record_failure(addr(port), seen(true), 0, &m);
+            recent.record_failure(addr(port), TIMEOUT, 0, &m);
             assert!(recent.len() <= MAX_RECENT_TRAVERSAL_FAILURES);
             let expected = (usize::from(port) + 1).saturating_sub(MAX_RECENT_TRAVERSAL_FAILURES);
             assert_eq!(evictions(&m) as usize, expected, "after port {port}");
@@ -188,19 +199,53 @@ mod tests {
             assert!(recent.failed_recently(addr(port), 0), "{port} kept");
         }
         let window = STRAY_INTRO_WINDOW.as_nanos() as u64;
-        recent.record_failure(addr(n), seen(true), window, &m);
+        recent.record_failure(addr(n), TIMEOUT, window, &m);
         assert_eq!(evictions(&m), 10, "expired entries are pruned, not evicted");
         assert_eq!(recent.len(), 1);
     }
 
-    /// A failure that ended before its deadline is not remembered.
+    /// Only timeouts are remembered; a version mismatch, send error or other
+    /// failure is not, even when its attempt ran to the deadline.
     #[test]
-    fn an_early_failure_is_not_remembered() {
+    fn only_a_timeout_is_remembered() {
+        for (kind, remembered) in [
+            (NatFailureKind::NoResponse, true),
+            (NatFailureKind::Undecryptable, true),
+            (NatFailureKind::Incomplete, true),
+            (NatFailureKind::VersionIncompatible, false),
+            (NatFailureKind::SendError, false),
+            (NatFailureKind::Other, false),
+        ] {
+            let mut recent = RecentTraversalFailures::default();
+            let m = TransportMetrics::new();
+            recent.record_failure(addr(1), kind, 0, &m);
+            assert_eq!(recent.failed_recently(addr(1), 0), remembered, "{kind:?}");
+        }
+    }
+
+    /// Evicting an older duplicate of an address that failed again forgets
+    /// nothing, so it is not counted; evicting an address's only entry is.
+    #[test]
+    fn evicting_an_older_duplicate_is_not_counted() {
         let mut recent = RecentTraversalFailures::default();
         let m = TransportMetrics::new();
-        recent.record_failure(addr(1), seen(false), 0, &m);
-        assert!(!recent.failed_recently(addr(1), 0));
-        assert_eq!(recent.len(), 0);
+        let full = MAX_RECENT_TRAVERSAL_FAILURES as u16;
+        // [1 (old), 2.., 1 (new)]: full, with addr(1)'s old entry oldest.
+        recent.record_failure(addr(1), TIMEOUT, 0, &m);
+        for port in 2..full {
+            recent.record_failure(addr(port), TIMEOUT, 0, &m);
+        }
+        recent.record_failure(addr(1), TIMEOUT, SEC, &m);
+        assert_eq!(recent.len(), MAX_RECENT_TRAVERSAL_FAILURES);
+        assert_eq!(evictions(&m), 0);
+        // Pops addr(1)'s old entry: addr(1) is still remembered.
+        recent.record_failure(addr(full), TIMEOUT, SEC, &m);
+        assert_eq!(evictions(&m), 0, "an older duplicate is not counted");
+        assert!(recent.failed_recently(addr(1), SEC));
+        // Pops addr(2), its only entry: forgotten and counted.
+        recent.record_failure(addr(full + 1), TIMEOUT, SEC, &m);
+        assert_eq!(evictions(&m), 1);
+        assert!(!recent.failed_recently(addr(2), SEC));
     }
 
     /// Periodic pruning empties the table once the window has passed, with
@@ -209,8 +254,8 @@ mod tests {
     fn prune_empties_expired_entries() {
         let mut recent = RecentTraversalFailures::default();
         let m = TransportMetrics::new();
-        recent.record_failure(addr(1), seen(true), 0, &m);
-        recent.record_failure(addr(2), seen(true), SEC, &m);
+        recent.record_failure(addr(1), TIMEOUT, 0, &m);
+        recent.record_failure(addr(2), TIMEOUT, SEC, &m);
         recent.prune(10 * SEC);
         assert_eq!(recent.len(), 1);
         recent.prune(11 * SEC);
