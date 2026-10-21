@@ -345,7 +345,7 @@ pub(crate) use self::boundary::{
     NextConnection, OutboundConnector, PeerConnectionApi, PendingConnection,
     StreamProgressObserver, StreamSendOutcome,
 };
-pub use self::boundary::{IncomingStream, StreamIdentity};
+pub use self::boundary::{IncomingChunks, IncomingStream, StreamIdentity};
 #[cfg(test)]
 pub(crate) use self::connection_handler::ExpectedInboundTracker;
 pub use self::connection_handler::create_connection_handler;

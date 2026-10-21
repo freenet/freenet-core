@@ -24,7 +24,6 @@ use crate::{
 use futures::StreamExt;
 
 use super::StreamId;
-use super::streaming::StreamHandle;
 
 /// Maximum time to wait for congestion window space *per fragment* before aborting a stream
 /// transfer. Resets for each fragment, so a slow-but-progressing transfer won't time out.
@@ -582,9 +581,40 @@ pub(super) async fn send_stream<S: super::super::Socket, T: TimeSource>(
 /// The outbound stream uses a new `outbound_stream_id` so the receiver sees
 /// a fresh stream. Fragments are sent with the same BBR congestion control
 /// and token bucket rate limiting as `send_stream`.
+/// Split each chunk of `chunks` into pieces of at most
+/// `FRAGMENT_PAYLOAD_SIZE` bytes, in order. Chunks already that small pass
+/// through unchanged.
+fn fragment_sized<St>(chunks: St) -> impl futures::Stream<Item = St::Item> + Unpin
+where
+    St: futures::Stream<Item = Result<Bytes, super::streaming::StreamError>> + Unpin,
+{
+    split_chunks(chunks, super::streaming_buffer::FRAGMENT_PAYLOAD_SIZE)
+}
+
+fn split_chunks<St>(chunks: St, max: usize) -> impl futures::Stream<Item = St::Item> + Unpin
+where
+    St: futures::Stream<Item = Result<Bytes, super::streaming::StreamError>> + Unpin,
+{
+    use futures::StreamExt;
+    chunks.flat_map(move |item| {
+        let pieces: Vec<_> = match item {
+            Ok(mut chunk) if chunk.len() > max => {
+                let mut pieces = Vec::with_capacity(chunk.len().div_ceil(max));
+                while !chunk.is_empty() {
+                    let take = chunk.len().min(max);
+                    pieces.push(Ok(chunk.split_to(take)));
+                }
+                pieces
+            }
+            other => vec![other],
+        };
+        futures::stream::iter(pieces)
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn pipe_stream<S: super::super::Socket, T: TimeSource>(
-    inbound_handle: StreamHandle,
+    inbound_handle: crate::transport::IncomingStream,
     outbound_stream_id: StreamId,
     last_packet_id: Arc<AtomicU32>,
     socket: Arc<S>,
@@ -634,7 +664,9 @@ pub(super) async fn pipe_stream<S: super::super::Socket, T: TimeSource>(
         "Piping stream to next hop"
     );
 
-    let mut stream = inbound_handle.stream();
+    // Whatever transport received the stream, forward it in pieces that fit
+    // one fragment. A UDP-received stream already arrives in such pieces.
+    let mut stream = fragment_sized(inbound_handle.chunks());
     let mut sent_so_far = 0u64;
     let mut fragment_number = 1u32;
     let mut pending_metadata = metadata;
@@ -1089,6 +1121,61 @@ mod tests {
     use crate::transport::packet_data::PacketData;
     use crate::transport::token_bucket::TokenBucket;
     use tokio::sync::mpsc;
+
+    /// `split_chunks` cuts every chunk longer than `max` into pieces of at
+    /// most `max` bytes, in order, and passes shorter chunks and errors
+    /// through unchanged.
+    #[tokio::test]
+    async fn split_chunks_cuts_long_chunks_and_passes_the_rest() {
+        use futures::StreamExt;
+        let max = 4;
+        let long = Bytes::from_static(b"abcdefghij");
+        let short = Bytes::from_static(b"xy");
+        let input = futures::stream::iter(vec![
+            Ok(long.clone()),
+            Ok(short.clone()),
+            Err(super::super::streaming::StreamError::Cancelled),
+        ]);
+        let out: Vec<_> = super::split_chunks(input, max).collect().await;
+        let sizes: Vec<_> = out
+            .iter()
+            .map(|r| r.as_ref().map(|b| b.len()).unwrap_or(0))
+            .collect();
+        assert_eq!(sizes, vec![4, 4, 2, 2, 0]);
+        let joined: Vec<u8> = out[..4]
+            .iter()
+            .flat_map(|r| r.as_ref().unwrap().to_vec())
+            .collect();
+        assert_eq!(joined, [&long[..], &short[..]].concat());
+        assert!(matches!(
+            out[4],
+            Err(super::super::streaming::StreamError::Cancelled)
+        ));
+    }
+
+    /// Source pin: `pipe_stream` reads its input through `fragment_sized`.
+    /// A stream received on another transport can arrive in chunks larger
+    /// than a fragment, and no test can build one until such a transport
+    /// exists, so the wiring is pinned here and the splitting itself is
+    /// tested by `split_chunks_cuts_long_chunks_and_passes_the_rest`.
+    #[test]
+    fn pipe_stream_reads_its_input_in_fragment_sized_pieces() {
+        let src = include_str!("outbound_stream.rs");
+        let tests_at = src.find("\nmod tests {").expect("test module");
+        let start = src
+            .find("\npub(super) async fn pipe_stream<")
+            .expect("pipe_stream signature");
+        assert!(start < tests_at, "the anchor must be production code");
+        let end = start + src[start..].find("\n}\n").expect("end of pipe_stream");
+        let body = &src[start..end];
+        let wired = body
+            .lines()
+            .any(|line| line.trim() == "let mut stream = fragment_sized(inbound_handle.chunks());");
+        assert!(
+            wired,
+            "pipe_stream must read `fragment_sized(inbound_handle.chunks())`"
+        );
+    }
 
     /// Simple test socket that writes to a channel
     struct TestSocket {
@@ -1752,7 +1839,7 @@ mod tests {
         let (outbound_sender, mut outbound_receiver) = mpsc::channel(4);
         let remote_addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 8080);
         let result = pipe_stream(
-            StreamHandle::new(StreamId::next(), 0),
+            StreamHandle::new(StreamId::next(), 0).into(),
             StreamId::next(),
             Arc::new(AtomicU32::new(0)),
             Arc::new(TestSocket::new(outbound_sender)),
@@ -2131,7 +2218,7 @@ mod tests {
 
         let cc_handle = congestion_controller.clone();
         let pipe_task = GlobalExecutor::spawn(pipe_stream(
-            handle,
+            handle.into(),
             StreamId::next_transport_internal(),
             Arc::new(AtomicU32::new(0)),
             Arc::new(TestSocket::new(outbound_sender)),
@@ -2294,7 +2381,7 @@ mod tests {
 
         let cc_handle = congestion_controller.clone();
         let pipe_task = GlobalExecutor::spawn(pipe_stream(
-            handle,
+            handle.into(),
             StreamId::next_transport_internal(),
             Arc::new(AtomicU32::new(0)),
             Arc::new(TestSocket::new(outbound_sender)),
@@ -2365,7 +2452,7 @@ mod tests {
 
         let cc_handle = congestion_controller.clone();
         let pipe_task = GlobalExecutor::spawn(pipe_stream(
-            handle,
+            handle.into(),
             StreamId::next_transport_internal(),
             Arc::new(AtomicU32::new(0)),
             Arc::new(TestSocket::new(outbound_sender)),
@@ -2448,7 +2535,7 @@ mod tests {
 
         let cc_handle = congestion_controller.clone();
         let pipe_task = GlobalExecutor::spawn(pipe_stream(
-            handle,
+            handle.into(),
             StreamId::next_transport_internal(),
             Arc::new(AtomicU32::new(0)),
             Arc::new(TestSocket::new(outbound_sender)),
@@ -2589,7 +2676,7 @@ mod tests {
         let (congestion_controller, token_bucket) = unthrottled(&time_source);
         let observer = Arc::new(CountingObserver::default());
         let task = GlobalExecutor::spawn(pipe_stream(
-            handle,
+            handle.into(),
             StreamId::next_transport_internal(),
             Arc::new(AtomicU32::new(0)),
             Arc::new(TestSocket::new(outbound_sender)),

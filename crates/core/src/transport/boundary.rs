@@ -40,9 +40,6 @@
 //!   carries the [`StreamId`] would carry it too.
 //! - [`IncomingStream::fork`] promises an independent reader that replays the
 //!   stream from its start, so a QUIC transport would need a tee buffer.
-//! - There is no transport-neutral incremental read: a stream can only be
-//!   piped onward through `into_udp`, so a relay that receives on one
-//!   transport and forwards on another cannot be written yet.
 //! - Why a connection closed is read out of band, through
 //!   [`PeerConnectionApi::close_reason`] after `recv` fails, rather than
 //!   carried by the error.
@@ -357,9 +354,30 @@ impl IncomingStream {
         StreamIdentity(self.0.buffer_weak())
     }
 
-    /// The UDP transport's handle, for the UDP transport to pipe.
-    pub(in crate::transport) fn into_udp(self) -> StreamHandle {
-        self.0
+    /// The stream's data, chunk by chunk, in order, as it arrives. Chunk
+    /// sizes are the receiving transport's (UDP: one per fragment); the
+    /// chunks of a complete stream add up to [`Self::total_bytes`]. Reading
+    /// does not consume the stream: [`Self::assemble`] and other readers
+    /// still see all of it.
+    pub fn chunks(&self) -> IncomingChunks {
+        IncomingChunks(self.0.stream())
+    }
+}
+
+/// The data of an [`IncomingStream`], from [`IncomingStream::chunks`]. Ends
+/// when the stream is complete; yields `Err` if it is cancelled or stalls.
+/// Polling it again after dropping a `next()` future loses nothing, so it
+/// may be read inside `select!`.
+pub struct IncomingChunks(super::StreamingInboundStream);
+
+impl futures::Stream for IncomingChunks {
+    type Item = Result<bytes::Bytes, super::StreamError>;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        std::pin::Pin::new(&mut self.0).poll_next(cx)
     }
 }
 
@@ -609,13 +627,33 @@ mod incoming_stream_tests {
             payload,
             "fork reads it too"
         );
+    }
 
-        assert!(
-            stream
-                .clone()
-                .into_udp()
-                .shares_buffer(&handle.buffer_weak())
-        );
+    /// `chunks` yields the whole stream in order, one chunk per UDP
+    /// fragment, and reading it consumes nothing: `assemble` and a second
+    /// `chunks` still see all of it.
+    #[tokio::test]
+    async fn incoming_stream_chunks_read_the_stream_without_consuming_it() {
+        use futures::StreamExt;
+        let (handle, payload) = handle_with(3);
+        let stream = IncomingStream::from(handle.clone());
+
+        let chunks: Vec<_> = stream.chunks().collect().await;
+        assert_eq!(chunks.len(), handle.received_fragments());
+        let read: Vec<u8> = chunks
+            .into_iter()
+            .flat_map(|c| c.expect("chunk").to_vec())
+            .collect();
+        assert_eq!(read, payload);
+
+        assert_eq!(stream.assemble().await.unwrap(), payload);
+        let again: Vec<u8> = stream
+            .chunks()
+            .map(|c| c.expect("chunk").to_vec())
+            .collect::<Vec<_>>()
+            .await
+            .concat();
+        assert_eq!(again, payload);
     }
 
     /// On a stream still arriving, the declared length, the units received
