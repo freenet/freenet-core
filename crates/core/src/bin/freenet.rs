@@ -332,11 +332,11 @@ async fn run_network_node_with_signals(
 ) -> anyhow::Result<()> {
     use commands::auto_update::{
         UPDATE_REPOLL_INTERVAL, UPDATE_REPOLL_JITTER_FRACTION, UpdateCheckResult,
-        UpdateNeededError, check_if_update_available, claim_update_attempt, clear_version_mismatch,
-        get_open_connection_count, has_reached_max_backoff, has_version_mismatch,
-        jittered_repoll_interval, repoll_deadline_while_cooling, reset_backoff,
-        should_attempt_update, startup_update_check, update_attempt_claimable,
-        version_mismatch_generation,
+        UpdateNeededError, check_if_update_available, claim_update_attempt,
+        claim_update_attempt_after_staging, clear_version_mismatch, get_open_connection_count,
+        has_reached_max_backoff, has_version_mismatch, jittered_repoll_interval,
+        repoll_deadline_while_cooling, reset_backoff, should_attempt_update, startup_update_check,
+        update_attempt_claimable, version_mismatch_generation,
     };
     use commands::update::stage_latest_release;
     use freenet::transport::{clear_urgent_update, get_highest_seen_version, is_urgent_update};
@@ -865,8 +865,11 @@ async fn run_network_node_with_signals(
                     // A locked-out node (#3934) that cannot claim its retry
                     // must not exit 42 here either. The claim is spent only on
                     // an actual exit, after staging decides (#5799), so a stay
-                    // keeps a locked-out node's daily retry. Either way the 6h
-                    // window restarts, so this is not re-evaluated every tick.
+                    // keeps a locked-out node's daily retry. That claim skips
+                    // the release cooldown, which staging records before it
+                    // says to exit; the check before staging honoured it.
+                    // Either way the 6h window restarts, so this is not
+                    // re-evaluated every tick.
                     if since.elapsed() > HARD_EXIT_TIMEOUT && !cooling() {
                         if update_attempt_claimable() {
                             tracing::error!(
@@ -876,7 +879,7 @@ async fn run_network_node_with_signals(
                             if stage_latest_release(build_info::VERSION, None)
                                 .await
                                 .should_exit()
-                                && claim_update_attempt().is_ok()
+                                && claim_update_attempt_after_staging().is_ok()
                             {
                                 #[allow(clippy::let_underscore_must_use)]
                                 let _ = update_tx.send("unknown (hard timeout)".to_string());
@@ -926,7 +929,8 @@ async fn run_network_node_with_signals(
                             // so a locked-out node (#3934) cannot loop through
                             // here, and claimed only on an actual exit, after
                             // staging decides (#5799), so a stay keeps the
-                            // retry. On refusal the mismatch is KEPT rather than
+                            // retry; as for the hard timeout, that claim skips
+                            // the cooldown staging records. On refusal the mismatch is KEPT rather than
                             // cleared: the node still knows it is isolated on an
                             // old version, so its next allowed retry (usually the
                             // peer-signal check above, once the cooldown passes)
@@ -939,7 +943,7 @@ async fn run_network_node_with_signals(
                                 if stage_latest_release(build_info::VERSION, None)
                                     .await
                                     .should_exit()
-                                    && claim_update_attempt().is_ok()
+                                    && claim_update_attempt_after_staging().is_ok()
                                 {
                                     #[allow(clippy::let_underscore_must_use)]
                                     let _ = update_tx.send(GATEWAY_MISMATCH.to_string());
@@ -2957,7 +2961,7 @@ mod tests {
             // there, only once staging has said to exit.
             let exit_only = [
                 ").await.should_exit(){#[allow(clippy::let_underscore_must_use)]",
-                ").await.should_exit()&&claim_update_attempt().is_ok()\
+                ").await.should_exit()&&claim_update_attempt_after_staging().is_ok()\
                  {#[allow(clippy::let_underscore_must_use)]",
             ];
             assert!(
@@ -3059,7 +3063,7 @@ mod tests {
             // canary's count of `update_tx` sends.
             (
                 concat!(
-                    ".should_exit()&&claim_update_attempt().is_ok()",
+                    ".should_exit()&&claim_update_attempt_after_staging().is_ok()",
                     "{#[allow(clippy::let_underscore_must_use)]let_=update_tx",
                     ".send(\"unknown(hardtimeout)\".to_string());return;}}",
                     "isolated_mismatch_since=Some(Instant::now());}"
@@ -3068,7 +3072,7 @@ mod tests {
             ),
             (
                 concat!(
-                    ".should_exit()&&claim_update_attempt().is_ok()",
+                    ".should_exit()&&claim_update_attempt_after_staging().is_ok()",
                     "{#[allow(clippy::let_underscore_must_use)]let_=update_tx",
                     ".send(GATEWAY_MISMATCH.to_string());return;}reset_backoff();"
                 ),
@@ -3084,6 +3088,13 @@ mod tests {
         ] {
             assert_eq!(flat.matches(gate).count(), 1, "{what} (#5799): `{gate}`");
         }
+        // The claims after staging are the two that skip the release
+        // cooldown; every claim before staging honours it.
+        assert_eq!(
+            flat.matches("claim_update_attempt_after_staging()").count(),
+            2,
+            "only the version-less triggers claim after staging"
+        );
         assert!(
             !flat.contains("!cooling{") && !flat.contains("ifcooling{"),
             "a gate reads a cooling flag captured earlier in the tick"
@@ -3586,9 +3597,10 @@ mod tests {
             );
             // Staging is attempted only when a claim would be granted, and the
             // claim (a locked-out node's daily retry) is spent only on the
-            // exit itself (#3934, #5799).
+            // exit itself (#3934, #5799), by the claim that does not consult
+            // the release cooldown staging has just recorded.
             let gated = format!(
-                ".should_exit()&&claim_update_attempt().is_ok()\
+                ".should_exit()&&claim_update_attempt_after_staging().is_ok()\
                  {{#[allow(clippy::let_underscore_must_use)]let_={send}"
             );
             assert!(

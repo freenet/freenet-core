@@ -1899,8 +1899,21 @@ fn lockout_claim_decision_at(
     Ok(ClaimNeeds::RecordedRetry)
 }
 
-/// [`claim_update_attempt_unless_cooling_at`] without the release cooldown.
-#[cfg(test)]
+/// Spend a locked-out node's retry for an exit that staging has already
+/// decided on. The version-less triggers check [`update_attempt_claimable`],
+/// which honours the release cooldown, BEFORE staging; staging then records
+/// the release before it says to exit, so the cooldown that record starts
+/// must not refuse this claim, or a locked-out node would download, record an
+/// extra failure and stay (#5799). The #3934 lockout itself still applies.
+pub fn claim_update_attempt_after_staging() -> Result<UpdateAttempt, ClaimRefused> {
+    match state_dir() {
+        Some(dir) => claim_update_attempt_at(&dir, SystemTime::now()),
+        None => Err(ClaimRefused::NoStateDir),
+    }
+}
+
+/// [`claim_update_attempt_unless_cooling_at`] without the release cooldown:
+/// the claim [`claim_update_attempt_after_staging`] makes.
 pub(crate) fn claim_update_attempt_at(
     dir: &std::path::Path,
     now: SystemTime,

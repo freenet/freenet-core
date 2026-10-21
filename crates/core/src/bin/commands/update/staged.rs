@@ -2673,6 +2673,70 @@ mod tests {
         assert_eq!(cooldown(&root).map(|r| r.failures), Some(1));
     }
 
+    /// A locked-out node (#3934) whose version-less trigger may claim, and
+    /// whose staging then decides to exit, can spend its claim. Staging
+    /// records the release before it says to exit, so a claim that consulted
+    /// the release cooldown would be refused by that very record: the node
+    /// would download, record an extra failure, and stay.
+    #[tokio::test]
+    async fn a_locked_out_node_can_claim_the_exit_staging_decided_on() {
+        use super::super::super::auto_update as au;
+        let freenet = freenet_asset_name();
+        let manifest = manifest_for(&[(&freenet, b"archive")]);
+        let server = serve_release(manifest.as_bytes(), None, &[(&freenet, b"archive")]);
+        let (_tmp, root) = test_root();
+        let state_dir = root.parent().unwrap();
+        fs::create_dir_all(state_dir).unwrap();
+        // MAX_UPDATE_FAILURES failed installs lock the node out; the claimable
+        // check below fails if that number changes.
+        for _ in 0..3 {
+            au::record_update_failure_at(state_dir);
+        }
+        let stamp = fs::metadata(state_dir.join("update_failures"))
+            .unwrap()
+            .modified()
+            .unwrap();
+        let now = stamp + Duration::from_secs(24 * 3600);
+        assert!(au::update_attempt_claimable_at(state_dir, "9.9.8", now));
+        let clock = move || now;
+        let prefix = server.url_str("/");
+        let env = StageEnv {
+            clock: &clock,
+            ..test_env(&prefix)
+        };
+        let outcome = stage_into(
+            &root,
+            "9.9.8",
+            || async { Ok(TAG.to_string()) },
+            None,
+            |_: &str| false,
+            &env,
+        )
+        .await;
+        assert_eq!(outcome, Staging::Staged);
+        assert!(outcome.preparation().should_exit());
+        assert_eq!(
+            au::claim_update_attempt_unless_cooling_at(state_dir, "9.9.8", now).err(),
+            Some(au::ClaimRefused::ReleaseCoolingDown),
+            "the record staging wrote starts a cooldown"
+        );
+        assert!(au::claim_update_attempt_at(state_dir, now).is_ok());
+        assert!(
+            au::claim_update_attempt_at(state_dir, now).is_err(),
+            "the retry is spent"
+        );
+        // The node's post-staging claim is that one.
+        let src = include_str!("../auto_update.rs").replace("\r\n", "\n");
+        let start = src
+            .find("pub fn claim_update_attempt_after_staging(")
+            .unwrap();
+        let body = &src[start..];
+        let flat: String = body[..body.find("\n}\n").unwrap()]
+            .split_whitespace()
+            .collect();
+        assert!(flat.contains("Some(dir)=>claim_update_attempt_at(&dir,SystemTime::now()),"));
+    }
+
     /// #5799 review: while any newer release cools down, staging stops
     /// before it spends a poll token or looks the tag up, whether or not the
     /// trigger named a release.
