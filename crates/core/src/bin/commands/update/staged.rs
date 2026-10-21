@@ -860,7 +860,7 @@ where
         if super::super::rollback::download_bytes_at(dir, clock()) >= byte_budget
             && staged_tag_at(root).is_none()
         {
-            let version = lookup_failure_target(root, current_version, target);
+            let version = lookup_failure_target(root, current_version, target, &blocked);
             return Err(budget_spent(root, &version, clock()));
         }
     }
@@ -879,7 +879,7 @@ where
     if let Some(dir) = root.parent() {
         super::super::rollback::hold_update_without_counting_at(
             dir,
-            &lookup_failure_target(root, current_version, target),
+            &lookup_failure_target(root, current_version, target, &blocked),
             "a download in advance started and did not report how it ended",
             clock(),
             freenet::config::GlobalRng::random_range(0.0_f64..1.0),
@@ -895,7 +895,7 @@ where
             tracing::warn!(error = %e, "Could not resolve the release to download in advance; staying on the current version (#5799)");
             // Counted even when the trigger knew no version, so a node that
             // cannot reach GitHub still walks to the fallback.
-            let version = lookup_failure_target(root, current_version, target);
+            let version = lookup_failure_target(root, current_version, target, &blocked);
             // A rate limit (a cooldown GitHub asked for, cached or live) is
             // not a failure of the release: hold it without counting, as the
             // updater does.
@@ -917,42 +917,79 @@ where
     };
     // A tag that passes this is a semver version, so `tag_dir` will accept it;
     // `stage_release_at` checks again regardless.
-    if !should_stage(&tag, current_version, blocked) {
+    // The lookup answered: forget a record for a release it shows cannot be
+    // installed, which would otherwise hold every trigger for its cooldown.
+    if let Some(dir) = root.parent() {
+        let latest = super::super::auto_update::version_from_tag(&tag);
+        super::super::rollback::clear_stale_update_record_at(dir, |recorded| {
+            is_stale_record(recorded, current_version, latest, &blocked)
+        });
+    }
+    if !should_stage(&tag, current_version, &blocked) {
         tracing::info!(tag = %tag, "No newer installable release to download in advance; staying on the current version");
         // An exit would only reach an updater that finds nothing to install,
         // so the node stays (#5799). A trigger that named a release holds it
         // without counting: when the lookup and the trigger's check disagree
         // (the API and the redirect can briefly report different releases),
         // the next trigger would otherwise name it again at once. The two
-        // version-less triggers restart their own wait on a stay; the lookup
-        // having answered, the sentinel for an unknown release is cleared.
-        if let Some(dir) = root.parent() {
-            match target {
-                Some(version) => super::super::rollback::hold_update_without_counting_at(
-                    dir,
-                    version,
-                    "the release lookup found no newer installable release",
-                    clock(),
-                    freenet::config::GlobalRng::random_range(0.0_f64..1.0),
-                ),
-                None => super::super::rollback::clear_unknown_release_at(dir),
-            }
+        // version-less triggers restart their own wait on a stay. (A stale
+        // record, the sentinel included, was cleared above; the hold for a
+        // named release is written after that on purpose, since it is what
+        // spaces the next trigger.)
+        if let (Some(version), Some(dir)) = (target, root.parent()) {
+            super::super::rollback::hold_update_without_counting_at(
+                dir,
+                version,
+                "the release lookup found no newer installable release",
+                clock(),
+                freenet::config::GlobalRng::random_range(0.0_f64..1.0),
+            );
         }
         return Err(Staging::NothingToInstall);
     }
     Ok(tag)
 }
 
+/// Whether a record for `recorded` is stale once a lookup has found `latest`:
+/// the unknown release has become known, or the release is at or below the
+/// current version, blocked by #4073, or newer than the latest (withdrawn).
+/// An unparseable record is kept, as everywhere else.
+fn is_stale_record(
+    recorded: &str,
+    current_version: &str,
+    latest: &str,
+    blocked: &impl Fn(&str) -> bool,
+) -> bool {
+    if recorded == super::super::rollback::UNKNOWN_RELEASE {
+        return true;
+    }
+    let (Ok(release), Ok(current)) = (
+        semver::Version::parse(recorded),
+        semver::Version::parse(current_version),
+    ) else {
+        return false;
+    };
+    release <= current
+        || blocked(recorded)
+        || semver::Version::parse(latest).is_ok_and(|latest| release > latest)
+}
+
 /// The release a failed tag lookup counts against: the one the trigger named,
-/// else the newer release already on record, else a sentinel standing for
+/// else the newer release already on record unless it is blocked (#4073),
+/// else a sentinel standing for
 /// "whatever is latest" (`rollback::UNKNOWN_RELEASE`), which every trigger
 /// treats as pending like any newer release.
-fn lookup_failure_target(root: &Path, current_version: &str, target: Option<&str>) -> String {
+fn lookup_failure_target(
+    root: &Path,
+    current_version: &str,
+    target: Option<&str>,
+    blocked: &impl Fn(&str) -> bool,
+) -> String {
     target
         .map(str::to_string)
         .or_else(|| {
             root.parent().and_then(|dir| {
-                super::super::rollback::recorded_newer_release_at(dir, current_version)
+                super::super::rollback::recorded_newer_release_at(dir, current_version, blocked)
             })
         })
         .unwrap_or_else(|| super::super::rollback::UNKNOWN_RELEASE.to_string())
@@ -3133,15 +3170,20 @@ mod tests {
     }
 
     /// A version-less lookup that succeeds and finds nothing to install
-    /// clears the sentinel for an unknown release, so the triggers stop
-    /// waiting for it; a real release's record is left alone.
+    /// clears a record the triggers would otherwise wait out: the sentinel for
+    /// an unknown release, or a release newer than the latest (withdrawn). An
+    /// unparseable record is kept.
     #[tokio::test]
-    async fn a_lookup_that_finds_nothing_clears_the_unknown_release() {
+    async fn a_lookup_that_finds_nothing_clears_stale_records() {
         use super::super::super::rollback::{UNKNOWN_RELEASE, record_update_failure_at};
         let server = Server::run();
         let t0 = SystemTime::now();
         let long_ago = t0 - Duration::from_secs(5 * 3600);
-        for (recorded, kept) in [(UNKNOWN_RELEASE, false), ("9.9.9", true)] {
+        for (recorded, kept) in [
+            (UNKNOWN_RELEASE, false),
+            ("9.9.9", false),
+            ("not-a-version", true),
+        ] {
             let (_tmp, root) = test_root();
             let dir = root.parent().unwrap();
             fs::create_dir_all(dir).unwrap();
@@ -3151,6 +3193,98 @@ mod tests {
             assert_eq!(outcome, Staging::NothingToInstall);
             assert_eq!(cooldown(&root).is_some(), kept, "{recorded}");
         }
+    }
+
+    /// What a successful lookup counts as stale, clause by clause.
+    #[test]
+    fn stale_records_after_a_successful_lookup() {
+        use super::super::super::rollback::UNKNOWN_RELEASE;
+        let none = |_: &str| false;
+        let blocked = |v: &str| v == "9.9.9";
+        for (recorded, latest, blocked, stale) in [
+            (
+                UNKNOWN_RELEASE,
+                "9.9.9",
+                &none as &dyn Fn(&str) -> bool,
+                true,
+            ),
+            ("9.9.7", "9.9.9", &none, true),
+            ("9.9.8", "9.9.9", &none, true),
+            ("9.9.9", "9.9.9", &blocked, true),
+            ("9.9.10", "9.9.9", &none, true),
+            ("9.9.9", "9.9.9", &none, false),
+            ("9.9.9", "9.9.10", &none, false),
+            ("not-a-version", "9.9.9", &none, false),
+        ] {
+            assert_eq!(
+                is_stale_record(recorded, "9.9.8", latest, &blocked),
+                stale,
+                "{recorded} with {latest} latest"
+            );
+        }
+    }
+
+    /// A failed lookup never counts against a release this node has blocked
+    /// (#4073); it counts against the sentinel instead.
+    #[tokio::test]
+    async fn a_failed_lookup_skips_a_blocked_release_on_record() {
+        use super::super::super::rollback::{UNKNOWN_RELEASE, record_update_failure_at};
+        let (_tmp, root) = test_root();
+        let dir = root.parent().unwrap();
+        fs::create_dir_all(dir).unwrap();
+        let long_ago = SystemTime::now() - Duration::from_secs(5 * 3600);
+        record_update_failure_at(dir, "9.9.9", "earlier", long_ago, 0.5);
+        let server = Server::run();
+        let outcome = stage_into_with(
+            &root,
+            &server,
+            Err(anyhow::anyhow!("offline")),
+            None,
+            &|v| v == "9.9.9",
+        )
+        .await;
+        assert_eq!(outcome, Staging::Deferred);
+        let record = cooldown(&root).unwrap();
+        assert_eq!(
+            (record.version.as_str(), record.failures),
+            (UNKNOWN_RELEASE, 1)
+        );
+    }
+
+    /// The hold a run writes before it reaches the network says why it is
+    /// held once the run knows: a rate-limited lookup replaces the reason,
+    /// keeping the retry time and the count.
+    #[tokio::test]
+    async fn a_live_hold_takes_the_reason_its_run_ends_with() {
+        let server = Server::run();
+        let prefix = server.url_str("/");
+        let (_tmp, root) = test_root();
+        let dir = root.parent().unwrap().to_path_buf();
+        let mut first = None;
+        let outcome = stage_into(
+            &root,
+            "9.9.8",
+            || {
+                first = super::super::super::rollback::read_update_cooldown_at(&dir);
+                async { Err::<String, _>(GithubRateLimitedError { retry_after: None }.into()) }
+            },
+            Some("9.9.9"),
+            |_: &str| false,
+            &test_env(&prefix),
+        )
+        .await;
+        assert_eq!(outcome, Staging::Throttled);
+        let first = first.expect("the hold before the lookup");
+        let last = cooldown(&root).unwrap();
+        assert_eq!(
+            (last.retry_at_unix, last.failures),
+            (first.retry_at_unix, first.failures)
+        );
+        assert_ne!(first.hold_reason, last.hold_reason);
+        assert_eq!(
+            last.hold_reason.as_deref(),
+            Some("GitHub rate-limited the release lookup")
+        );
     }
 
     /// A staging download is charged for its Content-Length before its body

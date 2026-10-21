@@ -1286,7 +1286,8 @@ fn lock_records(dir: &Path) -> Option<std::fs::File> {
 /// empty install bucket, a rate limit, a failed tag probe). The supervisor runs
 /// `freenet update` after every non-clean exit, crashes included, so counting
 /// these would walk a crash-looping node to the fallback without a single
-/// download. A live record is left alone; an expired one gets a fresh wait at
+/// download. A live record keeps its retry time and count and takes the new
+/// reason; an expired one gets a fresh wait at
 /// its count (zero once its failures no longer count), keeping its last real
 /// error; with none, or one for another
 /// release, a hold at zero failures is written for `version`, so the release
@@ -1302,6 +1303,21 @@ pub(crate) fn hold_update_without_counting_at(
         let (failures, last_error) = match read_update_cooldown_at(dir) {
             Some(prev) if prev.version == version => {
                 if update_cooldown_remaining_at(dir, version, now).is_some() {
+                    // Live: keep its retry time and count, but say why it
+                    // is held now (the reason a run's first hold gave is
+                    // replaced by the one its outcome gives).
+                    store_update_cooldown_at(
+                        dir,
+                        &UpdateCooldownState {
+                            hold_reason: Some(
+                                reason
+                                    .chars()
+                                    .take(UPDATE_COOLDOWN_ERROR_MAX_CHARS)
+                                    .collect(),
+                            ),
+                            ..prev
+                        },
+                    );
                     return;
                 }
                 (live_failures(&prev, now), prev.last_error)
@@ -1408,22 +1424,29 @@ pub(crate) fn update_cooldown_pending_at(
 /// Any real release's record replaces it.
 pub(crate) const UNKNOWN_RELEASE: &str = "the latest release";
 
-/// Remove the record if it is for [`UNKNOWN_RELEASE`]: a version-less lookup
-/// has since succeeded and found nothing to install, so there is no unknown
-/// release left to wait for. A real release's record is left alone.
-pub(crate) fn clear_unknown_release_at(dir: &Path) {
+/// Remove the record if `stale` says its release can no longer be installed:
+/// a tag lookup has just succeeded, so there is no unknown release
+/// ([`UNKNOWN_RELEASE`]) left to wait for, and a release at or below the
+/// current version, blocked by #4073, or newer than the latest (withdrawn) is
+/// not worth waiting for either.
+pub(crate) fn clear_stale_update_record_at(dir: &Path, stale: impl Fn(&str) -> bool) {
     with_record_lock(dir, || {
-        if read_update_cooldown_at(dir).is_some_and(|state| state.version == UNKNOWN_RELEASE) {
+        if read_update_cooldown_at(dir).is_some_and(|state| stale(&state.version)) {
             let _rm = std::fs::remove_file(dir.join(UPDATE_COOLDOWN_FILE));
         }
     });
 }
 
 /// The release on record, cooling down or not, if it is newer than
-/// `current_version` (the sentinel [`UNKNOWN_RELEASE`] included).
-pub(crate) fn recorded_newer_release_at(dir: &Path, current_version: &str) -> Option<String> {
+/// `current_version` (the sentinel [`UNKNOWN_RELEASE`] included) and not
+/// `blocked`.
+pub(crate) fn recorded_newer_release_at(
+    dir: &Path,
+    current_version: &str,
+    blocked: impl Fn(&str) -> bool,
+) -> Option<String> {
     read_update_cooldown_at(dir)
-        .filter(|state| !is_not_newer(&state.version, current_version))
+        .filter(|state| !is_not_newer(&state.version, current_version) && !blocked(&state.version))
         .map(|state| state.version)
 }
 
@@ -3179,7 +3202,9 @@ pub(crate) mod tests {
                 hold_update_without_counting_at(dir, "0.2.142", "held", now, 0.5)
             }),
             ("clear", &|| clear_update_cooldown_at(dir)),
-            ("clear sentinel", &|| clear_unknown_release_at(dir)),
+            ("clear stale", &|| {
+                clear_stale_update_record_at(dir, |_| true)
+            }),
             ("bytes", &|| charge_download_bytes_at(dir, 1, now)),
         ];
         for (what, write) in writers {
@@ -3507,8 +3532,11 @@ pub(crate) mod tests {
         }
         assert_eq!(
             read_update_cooldown_at(dir).unwrap(),
-            live,
-            "a live record is untouched"
+            UpdateCooldownState {
+                hold_reason: Some("skipped".to_string()),
+                ..live.clone()
+            },
+            "a live record keeps its retry time, count and error, and takes the reason"
         );
         let later = now + hour * 3;
         hold_update_without_counting_at(dir, "0.2.141", "skipped", later, 0.5);
