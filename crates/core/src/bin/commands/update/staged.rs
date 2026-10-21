@@ -3926,8 +3926,8 @@ mod tests {
 
     /// The fallback fires at exactly the third failure in a row, not the
     /// fourth, when the failures are recent. Failures whose retry time is more
-    /// than a day past no longer count: a node that tries only now and then
-    /// starts afresh rather than falling back on its first new failure.
+    /// than two days past no longer count: a node that tries only now and
+    /// then starts afresh rather than falling back on its first new failure.
     #[tokio::test]
     async fn old_failures_stop_counting_toward_the_fallback() {
         use super::super::super::rollback::record_update_failure_at;
@@ -3938,11 +3938,17 @@ mod tests {
         for (case, times, expected, failures) in [
             ("recent", [ago(9), ago(5)], Staging::FallingBack, 3),
             ("old", [ago(9 * 24), ago(9 * 24 - 1)], Staging::Deferred, 1),
-            // The second retry time (+2 h) is just over a day past.
-            ("a day past", [ago(28), ago(27)], Staging::Deferred, 1),
+            // The second retry time (+2 h) is just over two days past.
+            ("two days past", [ago(52), ago(51)], Staging::Deferred, 1),
             (
-                "under a day past",
-                [ago(26), ago(25)],
+                "under two days past",
+                [ago(50), ago(49)],
+                Staging::FallingBack,
+                3,
+            ),
+            (
+                "a day and more past",
+                [ago(30), ago(29)],
                 Staging::FallingBack,
                 3,
             ),
