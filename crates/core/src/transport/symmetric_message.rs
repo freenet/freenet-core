@@ -97,6 +97,31 @@ impl SymmetricMessage {
         *OVERHEAD
     }
 
+    /// Serialized size of a stream fragment as `packet_sending` sends it
+    /// (no piggybacked receipts), computed from the real serialization.
+    pub(crate) fn stream_fragment_size(
+        stream_id: StreamId,
+        total_length_bytes: u64,
+        fragment_number: u32,
+        payload: &Bytes,
+        metadata_bytes: Option<&Bytes>,
+    ) -> u64 {
+        let message = SymmetricMessage {
+            packet_id: 0,
+            confirm_receipt: vec![],
+            payload: SymmetricMessagePayload::StreamFragment {
+                stream_id,
+                total_length_bytes,
+                fragment_number,
+                payload: payload.clone(),
+                metadata_bytes: metadata_bytes.cloned(),
+            },
+        };
+        // Serializing a fixed in-memory value cannot fail; treat a failure
+        // as "does not fit".
+        bincode::serialized_size(&message).unwrap_or(u64::MAX)
+    }
+
     pub(crate) fn max_num_of_confirm_receipts_of_noop_message() -> usize {
         static MAX_NUM_CONFIRM_RECEIPTS: LazyLock<usize> = LazyLock::new(|| {
             let overhead = SymmetricMessage::noop_message_overhead() as u64;

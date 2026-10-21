@@ -380,12 +380,11 @@ impl IncomingStream {
 /// - It has **no inactivity timer**: if the sender stalls, it waits forever.
 ///   A consumer must bring its own timeout (the UDP pipe uses
 ///   `STREAM_INACTIVITY_TIMEOUT`).
-/// - Its end does **not** guarantee the chunks add up to
-///   [`IncomingStream::total_bytes`]. Under UDP one exit, taken once every
-///   fragment slot has been read, is a fragment-count proxy that does not
-///   check the byte total, so a sender that filled the slots short would end
-///   it early with no error (#5445). A consumer that needs the whole stream
-///   must count the bytes itself.
+/// - Under UDP it ends cleanly only once every declared byte was yielded: a
+///   sender that filled every fragment slot short gets an `Err` instead
+///   (#5445). A consumer should still count bytes against
+///   [`IncomingStream::total_bytes`] (the UDP pipe does), since that is the
+///   contract a second transport must also meet.
 /// - Polling it again after dropping a `next()` future loses nothing, so it
 ///   may be read inside `select!`.
 pub struct IncomingChunks {
