@@ -2466,7 +2466,7 @@ mod tests {
         fn pipe_stream_data(
             &mut self,
             _outbound_stream_id: StreamId,
-            _inbound_handle: crate::transport::peer_connection::streaming::StreamHandle,
+            _inbound_handle: crate::transport::IncomingStream,
             _metadata: Option<bytes::Bytes>,
             _progress: Option<std::sync::Arc<dyn crate::transport::StreamProgressObserver>>,
         ) -> Pin<Box<dyn Future<Output = Result<(), TransportError>> + Send + '_>> {

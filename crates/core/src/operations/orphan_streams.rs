@@ -36,7 +36,9 @@ use tokio::time::Instant;
 use dashmap::DashMap;
 use tokio::sync::oneshot;
 
+use crate::transport::IncomingStream;
 use crate::transport::StreamId;
+#[cfg(test)]
 use crate::transport::peer_connection::streaming::StreamHandle;
 use crate::transport::peer_connection::streaming_buffer::LockFreeStreamBuffer;
 
@@ -71,9 +73,9 @@ type StreamKey = (SocketAddr, StreamId);
 enum Slot {
     /// The stream arrived before its metadata (RequestStreaming /
     /// ResponseStreaming): the handle and when it was registered.
-    Orphan(StreamHandle, Instant),
+    Orphan(IncomingStream, Instant),
     /// The metadata arrived first: the claimant waiting for the stream.
-    Waiter(oneshot::Sender<StreamHandle>),
+    Waiter(oneshot::Sender<IncomingStream>),
 }
 
 pub struct OrphanStreamRegistry {
@@ -113,7 +115,7 @@ impl OrphanStreamRegistry {
         &self,
         peer_addr: SocketAddr,
         stream_id: StreamId,
-        handle: StreamHandle,
+        handle: IncomingStream,
     ) {
         use dashmap::mapref::entry::Entry;
         let key = (peer_addr, stream_id);
@@ -188,7 +190,7 @@ impl OrphanStreamRegistry {
         peer_addr: SocketAddr,
         stream_id: StreamId,
         timeout: Duration,
-    ) -> Result<StreamHandle, OrphanStreamError> {
+    ) -> Result<IncomingStream, OrphanStreamError> {
         use dashmap::mapref::entry::Entry;
         let key = (peer_addr, stream_id);
         // Atomic dedup: try to insert into claimed_streams. If already present,
@@ -319,6 +321,18 @@ impl OrphanStreamRegistry {
             key,
             |_, slot| matches!(slot, Slot::Waiter(tx) if tx.is_closed()),
         );
+    }
+
+    /// [`Self::register_orphan`] for tests that build a UDP `StreamHandle`
+    /// directly.
+    #[cfg(test)]
+    pub(crate) fn register_test_orphan(
+        &self,
+        peer_addr: SocketAddr,
+        stream_id: StreamId,
+        handle: impl Into<IncomingStream>,
+    ) {
+        self.register_orphan(peer_addr, stream_id, handle.into());
     }
 
     /// Cancel the unclaimed orphans among `streams` from `peer_addr` when the
@@ -460,9 +474,9 @@ impl crate::transport::InboundStreamRegistry for OrphanStreamRegistry {
         &self,
         peer_addr: SocketAddr,
         stream_id: StreamId,
-        handle: StreamHandle,
+        stream: IncomingStream,
     ) {
-        self.register_orphan(peer_addr, stream_id, handle);
+        self.register_orphan(peer_addr, stream_id, stream);
     }
 
     fn cancel_unclaimed_streams(
@@ -542,7 +556,7 @@ mod tests {
         let addr = dummy_addr();
 
         // Register orphan
-        registry.register_orphan(addr, stream_id, handle);
+        registry.register_test_orphan(addr, stream_id, handle);
         assert_eq!(registry.orphan_count(), 1);
 
         // Claim immediately
@@ -573,7 +587,7 @@ mod tests {
 
         // Register orphan (should deliver to waiter)
         let handle = make_test_handle(stream_id);
-        registry.register_orphan(addr, stream_id, handle);
+        registry.register_test_orphan(addr, stream_id, handle);
 
         // Waiter should succeed
         let result = waiter.await.unwrap();
@@ -589,7 +603,7 @@ mod tests {
         let addr = dummy_addr();
 
         // Register and claim once
-        registry.register_orphan(addr, stream_id, handle);
+        registry.register_test_orphan(addr, stream_id, handle);
         let result = registry
             .claim_or_wait(addr, stream_id, Duration::from_secs(1))
             .await;
@@ -630,7 +644,7 @@ mod tests {
         // Insert with fake old timestamp by directly manipulating
         registry.slots.insert(
             (addr, stream_id),
-            Slot::Orphan(handle, Instant::now() - EXPIRED_ORPHAN_AGE),
+            Slot::Orphan(handle.into(), Instant::now() - EXPIRED_ORPHAN_AGE),
         );
 
         assert_eq!(registry.orphan_count(), 1);
@@ -648,7 +662,7 @@ mod tests {
         let addr = dummy_addr();
 
         // Register fresh orphan
-        registry.register_orphan(addr, stream_id, handle);
+        registry.register_test_orphan(addr, stream_id, handle);
         assert_eq!(registry.orphan_count(), 1);
 
         // GC should preserve fresh stream
@@ -663,7 +677,7 @@ mod tests {
         let registry = OrphanStreamRegistry::new();
         let stream_id = StreamId::next();
         let handle = make_test_handle(stream_id);
-        registry.register_orphan(dummy_addr(), stream_id, handle.clone());
+        registry.register_test_orphan(dummy_addr(), stream_id, handle.clone());
         handle.cancel();
         registry.gc_expired();
         assert_eq!(registry.orphan_count(), 0);
@@ -681,20 +695,20 @@ mod tests {
 
         let mine = StreamId::next();
         let mine_handle = make_test_handle(mine);
-        registry.register_orphan(dummy_addr(), mine, mine_handle.clone());
+        registry.register_test_orphan(dummy_addr(), mine, mine_handle.clone());
 
         let elsewhere = make_test_handle(mine);
-        registry.register_orphan(dummy_addr_2(), mine, elsewhere.clone());
+        registry.register_test_orphan(dummy_addr_2(), mine, elsewhere.clone());
 
         // The old connection's stream was replaced under the same key.
         let reused = StreamId::next();
         let old_handle = make_test_handle(reused);
         let replacement = make_test_handle(reused);
-        registry.register_orphan(dummy_addr(), reused, replacement.clone());
+        registry.register_test_orphan(dummy_addr(), reused, replacement.clone());
 
         let claimed = StreamId::next();
         let claimed_handle = make_test_handle(claimed);
-        registry.register_orphan(dummy_addr(), claimed, claimed_handle.clone());
+        registry.register_test_orphan(dummy_addr(), claimed, claimed_handle.clone());
         registry
             .claim_or_wait(dummy_addr(), claimed, timeout)
             .await
@@ -742,13 +756,13 @@ mod tests {
         // GC drops cancelled orphans.
         let gone = StreamId::next();
         let gone_handle = make_test_handle(gone);
-        registry.register_orphan(dummy_addr(), gone, gone_handle.clone());
+        registry.register_test_orphan(dummy_addr(), gone, gone_handle.clone());
         registry.cancel_unclaimed(dummy_addr(), [(gone, gone_handle.buffer_weak())]);
         let before = registry.orphan_count();
         registry.gc_expired();
         assert_eq!(registry.orphan_count(), before - 1);
 
-        registry.register_orphan(dummy_addr(), awaited, awaited_handle);
+        registry.register_test_orphan(dummy_addr(), awaited, awaited_handle);
         assert!(
             waiter.await.unwrap().is_ok(),
             "the waiter still gets its stream"
@@ -784,7 +798,7 @@ mod tests {
                 let barrier = barrier.clone();
                 std::thread::spawn(move || {
                     barrier.wait();
-                    registry.register_orphan(addr, stream_id, make_test_handle(stream_id));
+                    registry.register_test_orphan(addr, stream_id, make_test_handle(stream_id));
                 })
             };
             let claimed = rt.block_on(async {
@@ -841,7 +855,7 @@ mod tests {
         assert!(matches!(duplicate, Err(OrphanStreamError::AlreadyClaimed)));
         assert_eq!(registry.waiter_count(), 1, "live waiter must survive");
 
-        registry.register_orphan(addr, stream_id, make_test_handle(stream_id));
+        registry.register_test_orphan(addr, stream_id, make_test_handle(stream_id));
         assert!(first.await.unwrap().is_ok());
         assert_eq!(registry.waiter_count(), 0);
         assert_eq!(registry.orphan_count(), 0);
@@ -860,7 +874,7 @@ mod tests {
         drop(rx);
         registry.slots.insert((addr, stream_id), Slot::Waiter(tx));
 
-        registry.register_orphan(addr, stream_id, make_test_handle(stream_id));
+        registry.register_test_orphan(addr, stream_id, make_test_handle(stream_id));
         assert_eq!(registry.waiter_count(), 0);
         assert_eq!(registry.orphan_count(), 1);
 
@@ -881,7 +895,7 @@ mod tests {
         let orphan_id = StreamId::next();
         registry.slots.insert(
             (addr, orphan_id),
-            Slot::Orphan(make_test_handle(orphan_id), Instant::now()),
+            Slot::Orphan(make_test_handle(orphan_id).into(), Instant::now()),
         );
         registry.remove_waiter(&(addr, orphan_id));
         assert_eq!(registry.orphan_count(), 1);
@@ -927,8 +941,8 @@ mod tests {
         let handle_b = make_test_handle(stream_id);
 
         // Two different peers register orphans with the SAME StreamId
-        registry.register_orphan(addr_a, stream_id, handle_a);
-        registry.register_orphan(addr_b, stream_id, handle_b);
+        registry.register_test_orphan(addr_a, stream_id, handle_a);
+        registry.register_test_orphan(addr_b, stream_id, handle_b);
         assert_eq!(registry.orphan_count(), 2);
 
         // Claiming from peer A should succeed

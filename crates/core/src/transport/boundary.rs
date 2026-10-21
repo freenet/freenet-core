@@ -33,6 +33,17 @@
 //! - Stream ids are chosen by the SENDER ([`StreamId::next`]), not by the
 //!   transport: this is deliberate and stays (see [`StreamId`]).
 //! - [`InboundStreamRegistry`] is fragment-based (`Weak<LockFreeStreamBuffer>`).
+//! - [`IncomingStream`] reports progress in fragments
+//!   ([`IncomingStream::received_fragments`]), and its errors are
+//!   `StreamError`.
+//! - [`IncomingStream::total_bytes`] assumes a length declared up front. UDP
+//!   carries it in every fragment; under QUIC the per-stream header that
+//!   carries the [`StreamId`] would carry it too.
+//! - [`IncomingStream::fork`] promises an independent reader that replays the
+//!   stream from its start, so a QUIC transport would need a tee buffer.
+//! - There is no transport-neutral incremental read: a stream can only be
+//!   piped onward through `into_udp`, so a relay that receives on one
+//!   transport and forwards on another cannot be written yet.
 //! - Why a connection closed is read out of band, through
 //!   [`PeerConnectionApi::close_reason`] after `recv` fails, rather than
 //!   carried by the error.
@@ -285,6 +296,74 @@ pub(crate) enum CloseReason {
     InboundStreamRefusals,
 }
 
+/// An inbound stream, as the layers above the transport see it: claimed from
+/// the [`InboundStreamRegistry`], read whole with [`Self::assemble`], or handed
+/// back to a transport to forward with [`PeerConnectionApi::pipe_stream_data`].
+///
+/// Cloning gives another handle on the same stream; [`Self::fork`] gives an
+/// independent reader. The representation is private: today it is the UDP
+/// transport's reassembly handle, and a second transport would turn it into
+/// an enum or a trait object without changing this API.
+#[derive(Clone, Debug)]
+pub struct IncomingStream(StreamHandle);
+
+impl IncomingStream {
+    /// Total length the sender declared for the stream, in bytes.
+    pub fn total_bytes(&self) -> u64 {
+        self.0.total_bytes()
+    }
+
+    /// Wait for the whole stream and return its bytes.
+    pub async fn assemble(&self) -> Result<Vec<u8>, super::StreamError> {
+        self.0.assemble().await
+    }
+
+    /// An independent reader of the same stream, e.g. to pipe it onward while
+    /// also assembling it locally.
+    pub fn fork(&self) -> Self {
+        Self(self.0.fork())
+    }
+
+    /// Units of the stream received so far, as the transport counts them
+    /// (UDP: fragments). For progress reporting only.
+    pub fn received_fragments(&self) -> usize {
+        self.0.received_fragments()
+    }
+
+    /// Units the whole stream takes, as the transport counts them (UDP:
+    /// fragments). For progress reporting only.
+    pub fn total_fragments(&self) -> usize {
+        self.0.total_fragments()
+    }
+
+    /// Abandon the stream: anyone waiting on it gets `StreamError::Cancelled`.
+    pub(crate) fn cancel(&self) {
+        self.0.cancel()
+    }
+
+    /// Whether the stream has been abandoned.
+    pub(crate) fn is_cancelled(&self) -> bool {
+        self.0.is_cancelled()
+    }
+
+    /// Whether this stream reads the given UDP reassembly buffer. Used by the
+    /// registry to match a stream to the connection that received it.
+    pub(crate) fn shares_buffer(&self, buffer: &std::sync::Weak<LockFreeStreamBuffer>) -> bool {
+        self.0.shares_buffer(buffer)
+    }
+
+    /// The UDP transport's handle, for the UDP transport to pipe.
+    pub(in crate::transport) fn into_udp(self) -> StreamHandle {
+        self.0
+    }
+}
+
+impl From<StreamHandle> for IncomingStream {
+    fn from(handle: StreamHandle) -> Self {
+        Self(handle)
+    }
+}
+
 /// Observer of an outbound stream's progress, passed into
 /// [`PeerConnectionApi::send_stream_data`] and
 /// [`PeerConnectionApi::pipe_stream_data`].
@@ -310,12 +389,12 @@ pub(crate) trait StreamProgressObserver: Send + Sync {
 /// when it processes the announcing message.
 pub(crate) trait InboundStreamRegistry: Send + Sync {
     /// A new operations stream `stream_id` from `peer_addr` has started
-    /// arriving; `handle` reads it as its fragments land.
+    /// arriving; `stream` reads it as its data lands.
     fn register_inbound_stream(
         &self,
         peer_addr: SocketAddr,
         stream_id: StreamId,
-        handle: StreamHandle,
+        stream: IncomingStream,
     );
 
     /// The connection from `peer_addr` is gone: cancel the streams among
@@ -410,18 +489,19 @@ pub(crate) trait PeerConnectionApi: Send {
         progress: Option<std::sync::Arc<dyn StreamProgressObserver>>,
     ) -> std::pin::Pin<Box<dyn Future<Output = Result<(), TransportError>> + Send + '_>>;
 
-    /// Pipes an inbound stream to the remote peer, forwarding fragments as they arrive.
+    /// Pipes an inbound stream to the remote peer, forwarding its data as it
+    /// arrives.
     ///
-    /// Unlike `send_stream_data` which takes complete data and fragments it, this reads
-    /// from an existing `StreamHandle` and forwards each fragment incrementally without
-    /// waiting for full reassembly. This enables low-latency forwarding at intermediate nodes.
+    /// Unlike `send_stream_data`, which takes complete data, this reads from an
+    /// [`IncomingStream`] and forwards it incrementally without waiting for full
+    /// reassembly. This enables low-latency forwarding at intermediate nodes.
     ///
     /// The `outbound_stream_id` should be created via `StreamId::next()` for
     /// operations-level routing at the receiver.
     fn pipe_stream_data(
         &mut self,
         outbound_stream_id: StreamId,
-        inbound_handle: StreamHandle,
+        inbound_handle: IncomingStream,
         metadata: Option<bytes::Bytes>,
         progress: Option<std::sync::Arc<dyn StreamProgressObserver>>,
     ) -> std::pin::Pin<Box<dyn Future<Output = Result<(), TransportError>> + Send + '_>>;
@@ -464,5 +544,101 @@ mod stream_id_tests {
                 .unwrap(),
             id
         );
+    }
+}
+
+#[cfg(test)]
+mod incoming_stream_tests {
+    use super::{IncomingStream, StreamId};
+    use crate::transport::StreamError;
+    use crate::transport::peer_connection::streaming::StreamHandle;
+    use crate::transport::peer_connection::streaming_buffer::FRAGMENT_PAYLOAD_SIZE;
+
+    fn handle_with(fragments: usize) -> (StreamHandle, Vec<u8>) {
+        let total = fragments * FRAGMENT_PAYLOAD_SIZE;
+        let payload: Vec<u8> = (0..total).map(|i| i as u8).collect();
+        let handle = StreamHandle::new(StreamId::next(), total as u64);
+        for (n, chunk) in payload.chunks(FRAGMENT_PAYLOAD_SIZE).enumerate() {
+            handle
+                .push_fragment(n as u32 + 1, bytes::Bytes::copy_from_slice(chunk))
+                .unwrap();
+        }
+        (handle, payload)
+    }
+
+    /// Each `IncomingStream` method reports what the UDP handle it wraps
+    /// reports.
+    #[tokio::test]
+    async fn incoming_stream_reads_the_udp_handle_it_wraps() {
+        let (handle, payload) = handle_with(3);
+        let stream = IncomingStream::from(handle.clone());
+
+        assert_eq!(stream.total_bytes(), handle.total_bytes());
+        assert_eq!(stream.received_fragments(), handle.received_fragments());
+        assert_eq!(stream.total_fragments(), handle.total_fragments());
+        assert!(stream.shares_buffer(&handle.buffer_weak()));
+        assert_eq!(stream.assemble().await.unwrap(), payload);
+
+        let forked = stream.fork();
+        assert_eq!(
+            forked.assemble().await.unwrap(),
+            payload,
+            "fork reads it too"
+        );
+
+        assert!(
+            stream
+                .clone()
+                .into_udp()
+                .shares_buffer(&handle.buffer_weak())
+        );
+    }
+
+    /// On a stream still arriving, the declared length, the units received
+    /// and the units expected are three different numbers, so none of them
+    /// can stand in for another.
+    #[test]
+    fn incoming_stream_reports_a_partial_stream_as_partial() {
+        let total = 3 * FRAGMENT_PAYLOAD_SIZE;
+        let handle = StreamHandle::new(StreamId::next(), total as u64);
+        handle
+            .push_fragment(1, bytes::Bytes::from(vec![7u8; FRAGMENT_PAYLOAD_SIZE]))
+            .unwrap();
+        let stream = IncomingStream::from(handle.clone());
+
+        assert_eq!(stream.total_bytes(), total as u64, "declared, not received");
+        assert_eq!(handle.received_bytes(), FRAGMENT_PAYLOAD_SIZE as u64);
+        assert_eq!(stream.received_fragments(), 1);
+        assert_eq!(stream.total_fragments(), handle.total_fragments());
+        assert!(stream.total_fragments() >= 3, "premise: more than received");
+    }
+
+    /// A stream does not claim another stream's buffer.
+    #[test]
+    fn incoming_stream_does_not_share_an_unrelated_buffer() {
+        let (handle, _) = handle_with(1);
+        let (other, _) = handle_with(1);
+        let stream = IncomingStream::from(handle);
+        assert!(!stream.shares_buffer(&other.buffer_weak()));
+    }
+
+    /// Cancelling through the boundary type cancels the stream itself.
+    #[tokio::test]
+    async fn incoming_stream_cancel_reaches_the_stream() {
+        let handle = StreamHandle::new(StreamId::next(), 10_000);
+        let stream = IncomingStream::from(handle.clone());
+        let forked = stream.fork();
+        assert!(!stream.is_cancelled());
+        stream.cancel();
+        assert!(handle.is_cancelled());
+        assert!(stream.is_cancelled());
+        assert!(
+            !forked.is_cancelled(),
+            "a fork is an independent reader: cancelling the original leaves it"
+        );
+        assert!(matches!(
+            stream.assemble().await,
+            Err(StreamError::Cancelled)
+        ));
     }
 }

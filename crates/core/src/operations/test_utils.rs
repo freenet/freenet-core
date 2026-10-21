@@ -113,7 +113,7 @@ impl NetworkBridge for MockNetworkBridge {
         &self,
         _target_addr: SocketAddr,
         _outbound_stream_id: crate::transport::StreamId,
-        _inbound_handle: crate::transport::peer_connection::streaming::StreamHandle,
+        _inbound_handle: crate::transport::IncomingStream,
         _metadata: Option<bytes::Bytes>,
     ) -> ConnResult<()> {
         // Mock implementation - just succeed without doing anything
