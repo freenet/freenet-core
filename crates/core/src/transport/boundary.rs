@@ -31,8 +31,11 @@
 //!   I/O failures, handshake decryption, its wire encoding) sit inside the
 //!   opaque [`TransportError::Udp`], which nothing above the transport can
 //!   look into; the bridge classifies errors only through
-//!   [`TransportError::scope`] and constructs only neutral variants. The
-//!   rest are transport-neutral, including `ProtocolVersionMismatch`
+//!   [`TransportError::scope`] and constructs only neutral variants. That
+//!   last part is a convention nothing enforces: the public `From` impls for
+//!   `io::Error`, `bincode::Error` and `DecryptionError` still turn a plain
+//!   `?` anywhere into `Udp(..)`, and node code must not rely on them. The
+//!   other variants are transport-neutral, including `ProtocolVersionMismatch`
 //!   (version negotiation exists under any transport), whose Display text is
 //!   parsed by `network_status::classify_transport_error`.
 //! - Stream ids are chosen by the SENDER ([`StreamId::next`]), not by the

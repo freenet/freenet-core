@@ -3374,7 +3374,7 @@ async fn handle_peer_channel_message(
                 Err(error) => {
                     tracing::error!(
                         to = %conn.remote_addr(),
-                        ?error,
+                        error = %error,
                         "[CONN_LIFECYCLE] Failed to send message to peer"
                     );
                     return Err(error);
@@ -3594,7 +3594,7 @@ async fn peer_connection_listener(
                         } else {
                             tracing::debug!(
                                 to = %remote_addr,
-                                ?error,
+                                error = %error,
                                 "[CONN_LIFECYCLE] Connection closed after channel command"
                             );
                             // Drain any messages that arrived after our try_recv() but before
@@ -3661,7 +3661,7 @@ async fn peer_connection_listener(
                             } else {
                                 tracing::debug!(
                                     to = %remote_addr,
-                                    ?error,
+                                    error = %error,
                                     "[CONN_LIFECYCLE] Connection closed after channel command"
                                 );
                                 // Drain any messages that arrived while we were processing this one
@@ -3836,6 +3836,9 @@ fn listener_exit_error(exit: &ListenerExit) -> anyhow::Error {
 /// node's failure, not the transport's, so it is reported as
 /// `TransportError::Other`, with the same text and the same classification
 /// (it closes the connection) as the transport's own serialization error.
+/// The send path logs errors with Display (`%error`), so the `anyhow`
+/// wrapper's Debug form, and any backtrace it captured under
+/// `RUST_BACKTRACE`, never reaches the log.
 fn serialization_failure(error: bincode::Error) -> TransportError {
     TransportError::Other(anyhow::Error::from(error))
 }
