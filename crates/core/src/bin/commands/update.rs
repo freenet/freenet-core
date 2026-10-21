@@ -797,6 +797,11 @@ impl UpdateCommand {
                     // crash-looping DMG release is still bounded by the wrapper's
                     // own consecutive-failure cap, unchanged. Bundle rollback is
                     // tracked as future work.
+                    //
+                    // This exit also skips run_async's clear of the #5799
+                    // cooldown record. Harmless: the record is for the
+                    // version now installed, which no trigger waits for, and
+                    // the next successful tag lookup removes it as stale.
                     std::process::exit(EXIT_CODE_BUNDLE_UPDATE_STAGED);
                 }
                 Ok(false) => {

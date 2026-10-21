@@ -65,11 +65,13 @@ const SIGNATURE: &str = "SHA256SUMS.txt.sig";
 /// is not an `api.github.com` request, so staging spends no REST quota (#5102).
 const RELEASE_DOWNLOAD_PREFIX: &str = "https://github.com/freenet/freenet-core/releases/download/";
 
-/// How long the node keeps trying before it gives up and exits 42 anyway,
-/// leaving the download to the post-stop updater as before. Until then the
-/// node keeps serving on its current version, including after an urgent or
-/// isolation trigger that used to exit at once. A partial download survives in
-/// the cache, so the next attempt (after the restart) resumes it.
+/// How long one staging run may take, retries included. The node keeps
+/// serving on its current version meanwhile, including after an urgent or
+/// isolation trigger that used to exit at once. A run that runs out of time
+/// counts as a failed attempt like any other (#5799): the node stays and
+/// retries after a cooldown, and only the third such failure in a row exits
+/// for the updater. A partial download survives in the cache, so the next
+/// run resumes it.
 const STAGE_DEADLINE: Duration = Duration::from_secs(2 * 3600);
 /// Consecutive failures of one release after which a failed attempt exits 42
 /// anyway, so the updater tries its own download (#5799).
@@ -1233,9 +1235,12 @@ fn failure_cause(e: &anyhow::Error) -> FailureCause {
     }
 }
 
-/// Say why a staging run that stays failed. Every download line starts with
-/// the same phrase, which the release canary (Gate B) reads, and names its
-/// cause after it; the canary's source pins check each literal.
+/// Say why a staging run that stays failed. The download lines start with the
+/// phrase the release canary (Gate B) reads, `Could not download the update
+/// in advance`, and name their cause after it; the timeout's line instead
+/// starts `Downloading the update in advance timed out`; the canary catches
+/// a timeout through its "download started but never finished" check
+/// instead. The canary's source pins check each literal.
 fn log_transient_failure(tag: &str, e: &anyhow::Error) {
     match failure_cause(e) {
         FailureCause::TimedOut(deadline) => tracing::warn!(
