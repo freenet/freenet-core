@@ -86,6 +86,10 @@ const STAGE_RETRY_DELAYS: [Duration; 5] = [
     Duration::from_secs(300),
     Duration::from_secs(600),
 ];
+/// Waits between failed tag lookups within one staging run, so a blip of a
+/// few seconds does not cost a whole cooldown. A rate limit is never retried
+/// (see [`worth_retrying`]).
+const LOOKUP_RETRY_DELAYS: [Duration; 2] = [Duration::from_secs(5), Duration::from_secs(15)];
 /// Free space the state directory must have before the node stages. The
 /// archives take ~45 MB, and at install time the crash-loop rollback snapshot of
 /// the running binary is written to the same directory (#4073). Staging on a
@@ -563,6 +567,7 @@ async fn stage_latest_release_inner(
                 current_version,
                 target,
                 lookup,
+                &LOOKUP_RETRY_DELAYS,
                 &SystemTime::now,
             )
             .await
@@ -578,6 +583,7 @@ async fn stage_latest_release_inner(
         free: root.parent().and_then(free_bytes),
         verify: &verify,
         delays: &STAGE_RETRY_DELAYS,
+        lookup_delays: &LOOKUP_RETRY_DELAYS,
         deadline: STAGE_DEADLINE,
         clock: &SystemTime::now,
         byte_budget: super::super::rollback::STAGED_DOWNLOAD_BYTES_PER_DAY,
@@ -712,17 +718,18 @@ fn spend_poll_token(root: &Path, now: SystemTime) -> bool {
 }
 
 /// Everything staging decides before it downloads: the poll budget, the tag
-/// lookup, the #4073 block list and the cooldown. `Ok` carries the tag.
+/// lookup (retried after each of `lookup_delays`), the #4073 block list and
+/// the cooldown. `Ok` carries the tag.
 async fn decide_before_download<F, Fut>(
     root: &Path,
     current_version: &str,
     lookup: F,
     target: Option<&str>,
     blocked: impl Fn(&str) -> bool,
-    clock: Clock<'_>,
+    (lookup_delays, clock): (&[Duration], Clock<'_>),
 ) -> std::result::Result<String, Staging>
 where
-    F: FnOnce() -> Fut,
+    F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Result<String>>,
 {
     // #5799 review: before the poll token and the lookup. While any newer
@@ -743,7 +750,9 @@ where
     }
     // Resolved first: the updater's first step is the same lookup, so when it
     // fails here an exit would only restart the node on the same binary.
-    let tag = match lookup().await {
+    let tag = match stage_with_retries(lookup, lookup_delays, "Looking up the release to download")
+        .await
+    {
         Ok(tag) => tag,
         Err(e) => {
             tracing::warn!(error = %e, "Could not resolve the release to download in advance; staying on the current version (#5799)");
@@ -807,10 +816,11 @@ async fn decide_without_staging<F, Fut>(
     current_version: &str,
     target: Option<&str>,
     lookup: F,
+    lookup_delays: &[Duration],
     clock: Clock<'_>,
 ) -> Staging
 where
-    F: FnOnce() -> Fut,
+    F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Result<String>>,
 {
     match decide_before_download(
@@ -819,7 +829,7 @@ where
         lookup,
         target,
         version_blocked,
-        clock,
+        (lookup_delays, clock),
     )
     .await
     {
@@ -865,6 +875,9 @@ struct StageEnv<'a> {
     free: Option<u64>,
     verify: ManifestVerifier<'a>,
     delays: &'a [Duration],
+    /// Waits between failed tag lookups; production passes
+    /// [`LOOKUP_RETRY_DELAYS`].
+    lookup_delays: &'a [Duration],
     deadline: Duration,
     clock: Clock<'a>,
     /// Archive bytes per release per day; production passes
@@ -882,15 +895,23 @@ async fn stage_into<F, Fut>(
     env: &StageEnv<'_>,
 ) -> Staging
 where
-    F: FnOnce() -> Fut,
+    F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Result<String>>,
 {
     let clock = env.clock;
-    let tag =
-        match decide_before_download(root, current_version, lookup, target, blocked, clock).await {
-            Ok(tag) => tag,
-            Err(staging) => return staging,
-        };
+    let tag = match decide_before_download(
+        root,
+        current_version,
+        lookup,
+        target,
+        blocked,
+        (env.lookup_delays, clock),
+    )
+    .await
+    {
+        Ok(tag) => tag,
+        Err(staging) => return staging,
+    };
     let version = super::super::auto_update::version_from_tag(&tag);
     if let Some(free) = env.free {
         if free < MIN_FREE_BYTES {
@@ -1073,7 +1094,12 @@ where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Result<()>>,
 {
-    match tokio::time::timeout(deadline, stage_with_retries(attempt, delays)).await {
+    match tokio::time::timeout(
+        deadline,
+        stage_with_retries(attempt, delays, "Downloading the update in advance"),
+    )
+    .await
+    {
         Ok(Ok(())) => StageOutcome::Staged,
         Ok(Err(e)) => StageOutcome::Failed(e),
         Err(_) => StageOutcome::TimedOut,
@@ -1082,16 +1108,17 @@ where
 
 /// Run `attempt` until it succeeds, waiting about `delays[i]` (±20%) after the
 /// i-th failure, and stopping early on a failure that is not
-/// [`worth_retrying`]. Returns the last error when it gives up.
-async fn stage_with_retries<F, Fut>(mut attempt: F, delays: &[Duration]) -> Result<()>
+/// [`worth_retrying`]. Returns the last error when it gives up. `what` names
+/// the attempt in the retry line.
+async fn stage_with_retries<T, F, Fut>(mut attempt: F, delays: &[Duration], what: &str) -> Result<T>
 where
     F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = Result<()>>,
+    Fut: std::future::Future<Output = Result<T>>,
 {
     let mut delays = delays.iter();
     loop {
         let e = match attempt().await {
-            Ok(()) => return Ok(()),
+            Ok(value) => return Ok(value),
             Err(e) => e,
         };
         if !worth_retrying(&e) {
@@ -1105,7 +1132,7 @@ where
         tracing::warn!(
             error = %format!("{e:#}"),
             retry_in_secs = delay.as_secs(),
-            "Downloading the update in advance failed; will retry"
+            "{what} failed; will retry"
         );
         // Cancelled with the update-check task when the node shuts down.
         tokio::time::sleep(delay).await;
@@ -2138,6 +2165,7 @@ mod tests {
             free: None,
             verify: &unsigned,
             delays: &[],
+            lookup_delays: &[],
             deadline: STAGE_DEADLINE,
             clock: &SystemTime::now,
             byte_budget: super::super::super::rollback::STAGED_DOWNLOAD_BYTES_PER_DAY,
@@ -2157,10 +2185,14 @@ mod tests {
             free,
             ..test_env(&prefix)
         };
+        let tag = tag.map_err(|e| format!("{e:#}"));
         stage_into(
             root,
             "9.9.8",
-            move || async move { tag },
+            move || {
+                let tag = tag.clone();
+                async move { tag.map_err(anyhow::Error::msg) }
+            },
             None,
             blocked,
             &env,
@@ -3383,12 +3415,12 @@ mod tests {
         let (_tmp, root) = test_root();
         let ok = || async { Ok(TAG.to_string()) };
         assert_eq!(
-            decide_without_staging(&root, "9.9.8", None, ok, &SystemTime::now).await,
+            decide_without_staging(&root, "9.9.8", None, ok, &[], &SystemTime::now).await,
             Staging::Skipped
         );
         assert_eq!(cooldown(&root).unwrap().last_error, INSTALL_PENDING);
         assert_eq!(
-            decide_without_staging(&root, "9.9.8", None, ok, &SystemTime::now).await,
+            decide_without_staging(&root, "9.9.8", None, ok, &[], &SystemTime::now).await,
             Staging::CoolingDown
         );
     }
@@ -3509,6 +3541,64 @@ mod tests {
         );
     }
 
+    /// A tag lookup that fails is retried twice within the run, about 5 s and
+    /// 15 s later, so a blip of a few seconds does not cost a whole cooldown;
+    /// a run whose lookups all fail counts ONE failure. A rate limit is never
+    /// retried. Paused clock: the waits are asserted, not slept.
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_tag_lookup_is_retried_twice_within_the_run() {
+        assert_eq!(
+            LOOKUP_RETRY_DELAYS,
+            [Duration::from_secs(5), Duration::from_secs(15)]
+        );
+        let run = |root: PathBuf, error: fn() -> anyhow::Error, succeed_on: usize| async move {
+            let mut calls = 0;
+            let env = StageEnv {
+                lookup_delays: &LOOKUP_RETRY_DELAYS,
+                ..test_env("http://127.0.0.1:0/")
+            };
+            let started = tokio::time::Instant::now();
+            let outcome = stage_into(
+                &root,
+                "9.9.8",
+                || {
+                    calls += 1;
+                    let ok = calls == succeed_on;
+                    async move {
+                        if ok {
+                            Ok("v9.9.8".to_string())
+                        } else {
+                            Err(error())
+                        }
+                    }
+                },
+                Some("9.9.9"),
+                |_: &str| false,
+                &env,
+            )
+            .await;
+            (outcome, calls, started.elapsed())
+        };
+        let secs = |d: Duration| d.as_secs_f64();
+        // Every lookup fails: three of them, 5 s and 15 s apart (±20%), one
+        // failure counted.
+        let (_tmp, root) = test_root();
+        let (outcome, calls, took) = run(root.clone(), || anyhow::anyhow!("offline"), 0).await;
+        assert_eq!((outcome, calls), (Staging::Deferred, 3));
+        assert!((16.0..=24.0).contains(&secs(took)), "{took:?}");
+        assert_eq!(cooldown(&root).map(|r| r.failures), Some(1));
+        // The second lookup answers: the run goes on, 5 s (±20%) later.
+        let (_tmp, root) = test_root();
+        let (outcome, calls, took) = run(root.clone(), || anyhow::anyhow!("offline"), 2).await;
+        assert_eq!((outcome, calls), (Staging::NothingToInstall, 2));
+        assert!((4.0..=6.0).contains(&secs(took)), "{took:?}");
+        // A rate limit is never retried into.
+        let (_tmp, root) = test_root();
+        let limited = || GithubRateLimitedError { retry_after: None }.into();
+        let (_, calls, took) = run(root.clone(), limited, 0).await;
+        assert_eq!((calls, took), (1, Duration::ZERO));
+    }
+
     #[tokio::test(start_paused = true)]
     async fn retries_until_success_then_stops() {
         let mut calls = 0;
@@ -3525,6 +3615,7 @@ mod tests {
                 }
             },
             &STAGE_RETRY_DELAYS,
+            "test",
         )
         .await;
         assert!(result.is_ok());
@@ -3534,12 +3625,13 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn gives_up_after_the_last_retry_with_jittered_waits() {
         let mut attempts = Vec::new();
-        let result = stage_with_retries(
+        let result: Result<()> = stage_with_retries(
             || {
                 attempts.push(tokio::time::Instant::now());
                 async { anyhow::bail!("down") }
             },
             &STAGE_RETRY_DELAYS,
+            "test",
         )
         .await;
         assert!(result.is_err());
@@ -3569,9 +3661,10 @@ mod tests {
             let result = stage_with_retries(
                 || {
                     calls += 1;
-                    async move { Err(make()) }
+                    async move { Err::<(), _>(make()) }
                 },
                 &STAGE_RETRY_DELAYS,
+                "test",
             )
             .await;
             assert!(result.is_err());
