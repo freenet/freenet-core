@@ -1311,6 +1311,17 @@ pub(crate) fn update_cooldown_pending_at(
 /// Any real release's record replaces it.
 pub(crate) const UNKNOWN_RELEASE: &str = "the latest release";
 
+/// Remove the record if it is for [`UNKNOWN_RELEASE`]: a version-less lookup
+/// has since succeeded and found nothing to install, so there is no unknown
+/// release left to wait for. A real release's record is left alone.
+pub(crate) fn clear_unknown_release_at(dir: &Path) {
+    with_record_lock(dir, || {
+        if read_update_cooldown_at(dir).is_some_and(|state| state.version == UNKNOWN_RELEASE) {
+            let _rm = std::fs::remove_file(dir.join(UPDATE_COOLDOWN_FILE));
+        }
+    });
+}
+
 /// The release on record, cooling down or not, if it is newer than
 /// `current_version` (the sentinel [`UNKNOWN_RELEASE`] included).
 pub(crate) fn recorded_newer_release_at(dir: &Path, current_version: &str) -> Option<String> {

@@ -151,9 +151,9 @@ impl std::fmt::Display for AssetMissing {
 impl std::error::Error for AssetMissing {}
 
 /// Today's download budget for the release is spent (#5799). Not retried: the
-/// budget is what bounds staging's bytes.
+/// budget is what bounds the release's download bytes.
 #[derive(Debug)]
-struct BudgetSpent;
+pub(super) struct BudgetSpent;
 
 impl std::fmt::Display for BudgetSpent {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -180,18 +180,52 @@ impl std::fmt::Display for StageTimedOut {
 
 impl std::error::Error for StageTimedOut {}
 
-/// Counts the archive bytes a staging run receives against what is left of
-/// the release's daily budget (`rollback::STAGED_DOWNLOAD_BYTES_PER_DAY`).
-struct ByteMeter {
+/// How many received bytes a [`ByteMeter`] lets accumulate before it writes
+/// them to the budget record, so a run killed mid-download still leaves all
+/// but the last few counted.
+const METER_PERSIST_EVERY: u64 = 16 * 1024 * 1024;
+
+/// Counts the archive bytes a run receives (staging's or the updater's)
+/// against what is left of the release's daily budget
+/// (`rollback::STAGED_DOWNLOAD_BYTES_PER_DAY`), and, when it has a ledger,
+/// writes them to that budget's record as it goes.
+pub(super) struct ByteMeter<'a> {
     allowance: u64,
     received: std::sync::atomic::AtomicU64,
+    /// Bytes of `received` already written to the ledger.
+    recorded: std::sync::atomic::AtomicU64,
+    ledger: Option<Ledger<'a>>,
 }
 
-impl ByteMeter {
+/// Where a [`ByteMeter`] writes what it counts: the state directory's budget
+/// record for one release.
+struct Ledger<'a> {
+    dir: PathBuf,
+    version: String,
+    clock: Clock<'a>,
+}
+
+impl<'a> ByteMeter<'a> {
     fn new(allowance: u64) -> Self {
         Self {
             allowance,
             received: std::sync::atomic::AtomicU64::new(0),
+            recorded: std::sync::atomic::AtomicU64::new(0),
+            ledger: None,
+        }
+    }
+
+    /// A meter allowing `allowance` bytes that charges them to `version`'s
+    /// budget record in `dir`, every [`METER_PERSIST_EVERY`] bytes and on
+    /// [`ByteMeter::flush`].
+    pub(super) fn charged_to(allowance: u64, dir: &Path, version: &str, clock: Clock<'a>) -> Self {
+        Self {
+            ledger: Some(Ledger {
+                dir: dir.to_path_buf(),
+                version: version.to_string(),
+                clock,
+            }),
+            ..Self::new(allowance)
         }
     }
 
@@ -214,15 +248,33 @@ impl ByteMeter {
 
     /// Count `n` bytes just received; an error once they pass the allowance.
     fn spend(&self, n: usize) -> Result<()> {
+        use std::sync::atomic::Ordering::Relaxed;
         let n = u64::try_from(n).unwrap_or(u64::MAX);
-        let total = self
-            .received
-            .fetch_add(n, std::sync::atomic::Ordering::Relaxed)
-            .saturating_add(n);
+        let total = self.received.fetch_add(n, Relaxed).saturating_add(n);
+        if total.saturating_sub(self.recorded.load(Relaxed)) >= METER_PERSIST_EVERY {
+            self.flush();
+        }
         if total > self.allowance {
             return Err(BudgetSpent.into());
         }
         Ok(())
+    }
+
+    /// Write the bytes counted since the last write to the ledger, if any.
+    /// Fails open like the record itself.
+    pub(super) fn flush(&self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let Some(ledger) = &self.ledger else {
+            return;
+        };
+        let received = self.received();
+        let before = self.recorded.swap(received, Relaxed);
+        super::super::rollback::add_staged_download_bytes_at(
+            &ledger.dir,
+            &ledger.version,
+            received.saturating_sub(before),
+            (ledger.clock)(),
+        );
     }
 }
 
@@ -748,6 +800,19 @@ where
             clock(),
         ));
     }
+    // Before the run first reaches the network: a run killed from here on (a
+    // crash, a stop mid-download) leaves a hold, so the restart waits out a
+    // cooldown instead of starting over at once. Every outcome below replaces
+    // it with its own record.
+    if let Some(dir) = root.parent() {
+        super::super::rollback::hold_update_without_counting_at(
+            dir,
+            &lookup_failure_target(root, current_version, target),
+            "a download in advance started and did not report how it ended",
+            clock(),
+            freenet::config::GlobalRng::random_range(0.0_f64..1.0),
+        );
+    }
     // Resolved first: the updater's first step is the same lookup, so when it
     // fails here an exit would only restart the node on the same binary.
     let tag = match stage_with_retries(lookup, lookup_delays, "Looking up the release to download")
@@ -776,15 +841,19 @@ where
         // without counting: when the lookup and the trigger's check disagree
         // (the API and the redirect can briefly report different releases),
         // the next trigger would otherwise name it again at once. The two
-        // version-less triggers restart their own wait on a stay.
-        if let (Some(version), Some(dir)) = (target, root.parent()) {
-            super::super::rollback::hold_update_without_counting_at(
-                dir,
-                version,
-                "the release lookup found no newer installable release",
-                clock(),
-                freenet::config::GlobalRng::random_range(0.0_f64..1.0),
-            );
+        // version-less triggers restart their own wait on a stay; the lookup
+        // having answered, the sentinel for an unknown release is cleared.
+        if let Some(dir) = root.parent() {
+            match target {
+                Some(version) => super::super::rollback::hold_update_without_counting_at(
+                    dir,
+                    version,
+                    "the release lookup found no newer installable release",
+                    clock(),
+                    freenet::config::GlobalRng::random_range(0.0_f64..1.0),
+                ),
+                None => super::super::rollback::clear_unknown_release_at(dir),
+            }
         }
         return Err(Staging::NothingToInstall);
     }
@@ -953,7 +1022,11 @@ where
     let spent = root.parent().map_or(0, |dir| {
         super::super::rollback::staged_download_bytes_at(dir, version, clock())
     });
-    let meter = ByteMeter::new(env.byte_budget.saturating_sub(spent));
+    let allowance = env.byte_budget.saturating_sub(spent);
+    let meter = match root.parent() {
+        Some(dir) => ByteMeter::charged_to(allowance, dir, version, clock),
+        None => ByteMeter::new(allowance),
+    };
     if meter.check().is_err() && !freenet_archive_staged(root, &tag).await {
         tracing::warn!(
             tag = %tag,
@@ -971,16 +1044,10 @@ where
         env.deadline,
     )
     .await;
-    // Whatever the outcome. A run killed before this line loses its count,
-    // at most one run's worth, since the meter stops a run at the budget.
-    if let Some(dir) = root.parent() {
-        super::super::rollback::add_staged_download_bytes_at(
-            dir,
-            version,
-            meter.received(),
-            clock(),
-        );
-    }
+    // Whatever the outcome. The meter has written all but the last
+    // METER_PERSIST_EVERY bytes as they arrived, so a run killed before this
+    // line loses at most that much of its count.
+    meter.flush();
     let error = match outcome {
         StageOutcome::Staged => {
             tracing::info!(
@@ -1152,7 +1219,7 @@ async fn stage_release_at(
     download_prefix: &str,
     tag: &str,
     verify: ManifestVerifier<'_>,
-    meter: &ByteMeter,
+    meter: &ByteMeter<'_>,
 ) -> Result<()> {
     let dir = tag_dir(root, tag)?;
     remove_other_tags(root, tag);
@@ -1203,7 +1270,7 @@ async fn fetch_verified(
     url: &str,
     dir: &Path,
     name: &str,
-    meter: &ByteMeter,
+    meter: &ByteMeter<'_>,
 ) -> Result<()> {
     let expected = super::required_checksum(Some(checksums), name)?.to_string();
     let dest = dir.join(name);
@@ -1250,7 +1317,7 @@ fn remove_quietly(path: &Path) {
 /// the release's download budget: a slow transfer that keeps making progress
 /// is allowed to finish, one that passes the budget is stopped (the bytes
 /// kept, so a later attempt resumes them).
-async fn download_resumable(url: &str, part: &Path, meter: &ByteMeter) -> Result<bool> {
+async fn download_resumable(url: &str, part: &Path, meter: &ByteMeter<'_>) -> Result<bool> {
     use futures::StreamExt;
     use reqwest::StatusCode;
     use reqwest::header::{CONTENT_RANGE, RANGE};
@@ -2871,6 +2938,100 @@ mod tests {
         assert_eq!(
             stage_at(&root, &quiet.url_str("/"), t0).await,
             Staging::CoolingDown
+        );
+    }
+
+    /// A run writes a hold before it first reaches the network, so a node
+    /// killed mid-run (a crash, a stop mid-download) restarts into a cooldown
+    /// instead of starting the download over at once. The hold counts nothing.
+    #[tokio::test]
+    async fn a_run_holds_the_release_before_it_reaches_the_network() {
+        use super::super::super::rollback::{UNKNOWN_RELEASE, read_update_cooldown_at};
+        let server = Server::run(); // no expectations: nothing is downloaded
+        let prefix = server.url_str("/");
+        for (target, held) in [(Some("9.9.9"), "9.9.9"), (None, UNKNOWN_RELEASE)] {
+            let (_tmp, root) = test_root();
+            let dir = root.parent().unwrap().to_path_buf();
+            let mut seen = None;
+            let outcome = stage_into(
+                &root,
+                "9.9.8",
+                || {
+                    seen = Some(read_update_cooldown_at(&dir));
+                    async { Err::<String, _>(anyhow::anyhow!("killed here")) }
+                },
+                target,
+                |_: &str| false,
+                &test_env(&prefix),
+            )
+            .await;
+            assert_eq!(outcome, Staging::Deferred, "{target:?}");
+            let record = seen.flatten().expect("held before the lookup");
+            assert_eq!(
+                (record.version.as_str(), record.failures),
+                (held, 0),
+                "{target:?}"
+            );
+            assert!(record.hold_reason.is_some());
+        }
+    }
+
+    /// A version-less lookup that succeeds and finds nothing to install
+    /// clears the sentinel for an unknown release, so the triggers stop
+    /// waiting for it; a real release's record is left alone.
+    #[tokio::test]
+    async fn a_lookup_that_finds_nothing_clears_the_unknown_release() {
+        use super::super::super::rollback::{UNKNOWN_RELEASE, record_update_failure_at};
+        let server = Server::run();
+        let t0 = SystemTime::now();
+        let long_ago = t0 - Duration::from_secs(5 * 3600);
+        for (recorded, kept) in [(UNKNOWN_RELEASE, false), ("9.9.9", true)] {
+            let (_tmp, root) = test_root();
+            let dir = root.parent().unwrap();
+            fs::create_dir_all(dir).unwrap();
+            record_update_failure_at(dir, recorded, "offline", long_ago, 0.5);
+            let outcome =
+                stage_into_with(&root, &server, Ok("v9.9.8".into()), None, &|_| false).await;
+            assert_eq!(outcome, Staging::NothingToInstall);
+            assert_eq!(cooldown(&root).is_some(), kept, "{recorded}");
+        }
+    }
+
+    /// The meter writes what a download receives to the budget record as it
+    /// arrives, every METER_PERSIST_EVERY bytes, so a run killed mid-download
+    /// (here: one that ends without the run's final flush) leaves its bytes
+    /// counted; the flush adds the rest.
+    #[tokio::test]
+    async fn a_killed_download_leaves_its_bytes_counted() {
+        use super::super::super::rollback::staged_download_bytes_at;
+        const MIB: u64 = 1024 * 1024;
+        let (prefix, _, _) = restarting_server(Vec::new(), 40 << 20, 20 << 20).await;
+        let (_tmp, root) = test_root();
+        let dir = root.parent().unwrap();
+        fs::create_dir_all(&root).unwrap();
+        let now = SystemTime::now();
+        let clock = move || now;
+        let meter = ByteMeter::charged_to(u64::MAX, dir, "9.9.9", &clock);
+        let part = root.join("asset.part");
+        assert!(
+            download_resumable(&format!("{prefix}asset"), &part, &meter)
+                .await
+                .is_err(),
+            "the server stops half way"
+        );
+        assert_eq!(METER_PERSIST_EVERY, 16 * MIB);
+        let counted = staged_download_bytes_at(dir, "9.9.9", now);
+        assert!(
+            (METER_PERSIST_EVERY..20 * MIB).contains(&counted),
+            "{counted} counted before the flush"
+        );
+        meter.flush();
+        assert_eq!(staged_download_bytes_at(dir, "9.9.9", now), 20 * MIB);
+        meter.flush();
+        assert_eq!(
+            staged_download_bytes_at(dir, "9.9.9", now),
+            20 * MIB,
+            "a second flush adds nothing"
         );
     }
 
