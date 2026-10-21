@@ -32,7 +32,6 @@
 //!   `ConnectionClosed` and `Other` itself.
 //! - Stream ids are chosen by the SENDER ([`StreamId::next`]), not by the
 //!   transport: this is deliberate and stays (see [`StreamId`]).
-//! - [`InboundStreamRegistry`] is fragment-based (`Weak<LockFreeStreamBuffer>`).
 //! - [`IncomingStream`] reports progress in fragments
 //!   ([`IncomingStream::received_fragments`]), and its errors are
 //!   `StreamError`.
@@ -346,15 +345,40 @@ impl IncomingStream {
         self.0.is_cancelled()
     }
 
-    /// Whether this stream reads the given UDP reassembly buffer. Used by the
-    /// registry to match a stream to the connection that received it.
-    pub(crate) fn shares_buffer(&self, buffer: &std::sync::Weak<LockFreeStreamBuffer>) -> bool {
-        self.0.shares_buffer(buffer)
+    /// Whether this is the stream `identity` names. The registry uses it to
+    /// match an orphan to the connection that received it.
+    pub(crate) fn is(&self, identity: &StreamIdentity) -> bool {
+        self.0.shares_buffer(&identity.0)
+    }
+
+    /// A [`StreamIdentity`] naming this stream.
+    #[cfg(test)]
+    pub(crate) fn identity(&self) -> StreamIdentity {
+        StreamIdentity(self.0.buffer_weak())
     }
 
     /// The UDP transport's handle, for the UDP transport to pipe.
     pub(in crate::transport) fn into_udp(self) -> StreamHandle {
         self.0
+    }
+}
+
+/// Names one inbound stream without keeping it alive, so a transport can say
+/// which streams a connection received after it has let go of them. Two
+/// [`IncomingStream`]s that are the same stream (clones or forks) both match
+/// its identity; any other stream does not.
+///
+/// The representation is private: today it is a weak reference to the UDP
+/// transport's reassembly buffer.
+#[derive(Clone, Debug)]
+pub struct StreamIdentity(std::sync::Weak<LockFreeStreamBuffer>);
+
+impl StreamIdentity {
+    /// The identity of the UDP stream reassembled into `buffer`.
+    pub(in crate::transport) fn from_udp_buffer(
+        buffer: std::sync::Weak<LockFreeStreamBuffer>,
+    ) -> Self {
+        Self(buffer)
     }
 }
 
@@ -399,12 +423,12 @@ pub(crate) trait InboundStreamRegistry: Send + Sync {
 
     /// The connection from `peer_addr` is gone: cancel the streams among
     /// `streams` that nobody has claimed. Each stream is matched by its
-    /// buffer, so a stream with the same id from another connection, or one
-    /// already claimed, is left alone.
+    /// [`StreamIdentity`], so a stream with the same id from another
+    /// connection, or one already claimed, is left alone.
     fn cancel_unclaimed_streams(
         &self,
         peer_addr: SocketAddr,
-        streams: &mut dyn Iterator<Item = (StreamId, std::sync::Weak<LockFreeStreamBuffer>)>,
+        streams: &mut dyn Iterator<Item = (StreamId, StreamIdentity)>,
     );
 }
 
@@ -576,7 +600,7 @@ mod incoming_stream_tests {
         assert_eq!(stream.total_bytes(), handle.total_bytes());
         assert_eq!(stream.received_fragments(), handle.received_fragments());
         assert_eq!(stream.total_fragments(), handle.total_fragments());
-        assert!(stream.shares_buffer(&handle.buffer_weak()));
+        assert!(stream.is(&IncomingStream::from(handle.clone()).identity()));
         assert_eq!(stream.assemble().await.unwrap(), payload);
 
         let forked = stream.fork();
@@ -613,13 +637,33 @@ mod incoming_stream_tests {
         assert!(stream.total_fragments() >= 3, "premise: more than received");
     }
 
+    /// A stream's identity matches every handle on that stream, clones and
+    /// forks included, and holding it does not keep the stream alive.
+    #[test]
+    fn stream_identity_names_one_stream_without_holding_it() {
+        let (handle, _) = handle_with(1);
+        let stream = IncomingStream::from(handle);
+        let strong_before = stream.0.buffer_strong_count();
+        let identity = stream.identity();
+        assert_eq!(
+            stream.0.buffer_strong_count(),
+            strong_before,
+            "an identity is not a reference to the stream"
+        );
+        assert!(stream.is(&identity));
+        assert!(stream.clone().is(&identity));
+        assert!(stream.fork().is(&identity), "a fork reads the same stream");
+        let (other, _) = handle_with(1);
+        assert!(!IncomingStream::from(other).is(&identity));
+    }
+
     /// A stream does not claim another stream's buffer.
     #[test]
     fn incoming_stream_does_not_share_an_unrelated_buffer() {
         let (handle, _) = handle_with(1);
         let (other, _) = handle_with(1);
         let stream = IncomingStream::from(handle);
-        assert!(!stream.shares_buffer(&other.buffer_weak()));
+        assert!(!stream.is(&IncomingStream::from(other).identity()));
     }
 
     /// Cancelling through the boundary type cancels the stream itself.

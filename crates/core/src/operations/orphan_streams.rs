@@ -36,11 +36,10 @@ use tokio::time::Instant;
 use dashmap::DashMap;
 use tokio::sync::oneshot;
 
-use crate::transport::IncomingStream;
 use crate::transport::StreamId;
 #[cfg(test)]
 use crate::transport::peer_connection::streaming::StreamHandle;
-use crate::transport::peer_connection::streaming_buffer::LockFreeStreamBuffer;
+use crate::transport::{IncomingStream, StreamIdentity};
 
 /// Timeout for unclaimed orphan streams.
 /// Orphan streams not claimed within this duration are garbage collected.
@@ -346,12 +345,12 @@ impl OrphanStreamRegistry {
     pub fn cancel_unclaimed(
         &self,
         peer_addr: SocketAddr,
-        streams: impl IntoIterator<Item = (StreamId, std::sync::Weak<LockFreeStreamBuffer>)>,
+        streams: impl IntoIterator<Item = (StreamId, StreamIdentity)>,
     ) {
-        for (stream_id, buffer) in streams {
+        for (stream_id, identity) in streams {
             if let Some(slot) = self.slots.get(&(peer_addr, stream_id)) {
                 if let Slot::Orphan(handle, _) = slot.value() {
-                    if handle.shares_buffer(&buffer) {
+                    if handle.is(&identity) {
                         handle.cancel();
                     }
                 }
@@ -482,7 +481,7 @@ impl crate::transport::InboundStreamRegistry for OrphanStreamRegistry {
     fn cancel_unclaimed_streams(
         &self,
         peer_addr: SocketAddr,
-        streams: &mut dyn Iterator<Item = (StreamId, std::sync::Weak<LockFreeStreamBuffer>)>,
+        streams: &mut dyn Iterator<Item = (StreamId, StreamIdentity)>,
     ) {
         self.cancel_unclaimed(peer_addr, streams);
     }
@@ -728,10 +727,16 @@ mod tests {
         registry.cancel_unclaimed(
             dummy_addr(),
             [
-                (mine, mine_handle.buffer_weak()),
-                (reused, old_handle.buffer_weak()),
-                (claimed, claimed_handle.buffer_weak()),
-                (awaited, awaited_handle.buffer_weak()),
+                (mine, IncomingStream::from(mine_handle.clone()).identity()),
+                (reused, IncomingStream::from(old_handle.clone()).identity()),
+                (
+                    claimed,
+                    IncomingStream::from(claimed_handle.clone()).identity(),
+                ),
+                (
+                    awaited,
+                    IncomingStream::from(awaited_handle.clone()).identity(),
+                ),
             ],
         );
         assert!(mine_handle.is_cancelled());
@@ -757,7 +762,10 @@ mod tests {
         let gone = StreamId::next();
         let gone_handle = make_test_handle(gone);
         registry.register_test_orphan(dummy_addr(), gone, gone_handle.clone());
-        registry.cancel_unclaimed(dummy_addr(), [(gone, gone_handle.buffer_weak())]);
+        registry.cancel_unclaimed(
+            dummy_addr(),
+            [(gone, IncomingStream::from(gone_handle.clone()).identity())],
+        );
         let before = registry.orphan_count();
         registry.gc_expired();
         assert_eq!(registry.orphan_count(), before - 1);

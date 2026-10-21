@@ -351,7 +351,10 @@ impl<S, T: TimeSource> Drop for PeerConnection<S, T> {
         if let Some(registry) = &self.inbound_stream_registry {
             registry.cancel_unclaimed_streams(
                 self.remote_conn.remote_addr,
-                &mut self.inbound_budget.live_buffer_streams(),
+                &mut self
+                    .inbound_budget
+                    .live_buffer_streams()
+                    .map(|(id, buffer)| (id, super::StreamIdentity::from_udp_buffer(buffer))),
             );
         }
         // Cancel all active streaming handles so that any operation blocked on
