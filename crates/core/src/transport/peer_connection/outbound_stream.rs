@@ -657,6 +657,11 @@ where
                     return Poll::Ready(Some(Ok(first)));
                 }
                 Poll::Ready(Some(Ok(chunk))) => {
+                    // A full chunk with nothing buffered is already a
+                    // fragment (the common UDP case): pass it on uncopied.
+                    if this.buf.is_empty() && chunk.len() == FRAGMENT_PAYLOAD_SIZE {
+                        return Poll::Ready(Some(Ok(chunk)));
+                    }
                     // Empty chunks are dropped: an empty fragment other
                     // than #1 is refused by the receiver.
                     this.buf.extend_from_slice(&chunk);
@@ -1232,6 +1237,71 @@ mod tests {
     use crate::transport::token_bucket::TokenBucket;
     use tokio::sync::mpsc;
 
+    /// Yields its chunks with a `Pending` before each one (waking itself),
+    /// so a reader that drops `next()` on `Pending` drops it often.
+    struct HesitantChunks {
+        chunks: std::collections::VecDeque<Bytes>,
+        ready: bool,
+    }
+
+    impl futures::Stream for HesitantChunks {
+        type Item = Result<Bytes, super::super::streaming::StreamError>;
+
+        fn poll_next(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Self::Item>> {
+            if !self.ready {
+                self.ready = true;
+                cx.waker().wake_by_ref();
+                return std::task::Poll::Pending;
+            }
+            self.ready = false;
+            std::task::Poll::Ready(self.chunks.pop_front().map(Ok))
+        }
+    }
+
+    /// `Rechunk` read inside `select!`, with `next()` dropped every time its
+    /// input is `Pending`, loses and duplicates nothing.
+    #[tokio::test]
+    async fn rechunk_survives_dropped_next_futures() {
+        use super::super::streaming_buffer::FRAGMENT_PAYLOAD_SIZE as F;
+        use futures::StreamExt;
+        let sizes = [300, 2 * F + 5, 0, F, 100, F - 1, 7];
+        let expected = payload_of(sizes.iter().sum());
+        let mut at = 0;
+        let mut chunks = std::collections::VecDeque::new();
+        for len in sizes {
+            chunks.push_back(Bytes::copy_from_slice(&expected[at..at + len]));
+            at += len;
+        }
+        let mut rechunk = super::Rechunk::new(
+            HesitantChunks {
+                chunks,
+                ready: false,
+            },
+            F,
+        );
+        let (mut out, mut dropped) = (Vec::new(), 0);
+        loop {
+            tokio::select! {
+                biased;
+                item = rechunk.next() => match item {
+                    Some(chunk) => out.push(chunk.expect("no error")),
+                    None => break,
+                },
+                _ = std::future::ready(()) => dropped += 1,
+            }
+        }
+        assert!(dropped > 0, "premise: next() was dropped mid-read");
+        let bytes: Vec<u8> = out.iter().flat_map(|b| b.to_vec()).collect();
+        assert_eq!(bytes, expected, "nothing lost or duplicated");
+        assert_eq!(out[0].len(), 300, "#1 is the first chunk");
+        for piece in &out[1..out.len() - 1] {
+            assert_eq!(piece.len(), F, "middle fragments are full");
+        }
+    }
+
     /// One outgoing fragment as decoded off the wire.
     #[derive(Debug)]
     struct WireFragment {
@@ -1336,6 +1406,23 @@ mod tests {
         assert_eq!(bytes, expected, "bytes in order");
     }
 
+    /// An independent check: a real receiver-side `StreamHandle` for the
+    /// declared total accepts every fragment and assembles `expected`.
+    async fn assert_real_receiver_assembles(fragments: &[WireFragment], expected: &[u8]) {
+        let receiver =
+            super::super::streaming::StreamHandle::new(StreamId::next(), expected.len() as u64);
+        for f in fragments {
+            receiver
+                .push_fragment(f.number, f.payload.clone())
+                .unwrap_or_else(|e| panic!("receiver refused fragment {}: {e:?}", f.number));
+        }
+        let assembled = tokio::time::timeout(Duration::from_secs(5), receiver.assemble())
+            .await
+            .expect("receiver completes")
+            .expect("receiver assembles");
+        assert_eq!(assembled, expected, "receiver assembled the stream");
+    }
+
     fn payload_of(len: usize) -> Vec<u8> {
         (0..len).map(|i| (i % 251) as u8).collect()
     }
@@ -1369,7 +1456,9 @@ mod tests {
         .await;
         let out: Vec<_> = fragments.iter().map(|f| f.payload.len()).collect();
         assert_eq!(out, sizes, "outgoing boundaries equal the incoming ones");
+        assert!(fragments[0].has_metadata, "#1 carries this hop's metadata");
         assert_receiver_accepts(&fragments, &expected);
+        assert_real_receiver_assembles(&fragments, &expected).await;
     }
 
     /// An older sender's empty fragment #1 is forwarded as an empty #1, as
@@ -1392,6 +1481,7 @@ mod tests {
         let out: Vec<_> = fragments.iter().map(|f| f.payload.len()).collect();
         assert_eq!(out, [0, F, F]);
         assert_receiver_accepts(&fragments, &expected);
+        assert_real_receiver_assembles(&fragments, &expected).await;
     }
 
     /// A stream received in chunks longer than a fragment (as another
@@ -1420,6 +1510,7 @@ mod tests {
         );
         assert!(fragments[0].has_metadata, "and carries it");
         assert_receiver_accepts(&fragments, &expected);
+        assert_real_receiver_assembles(&fragments, &expected).await;
     }
 
     /// Many short chunks, some empty, are packed into full fragments.
@@ -1437,6 +1528,7 @@ mod tests {
         let fragments =
             pipe_and_capture(expected.len() as u64, futures::stream::iter(chunks), None).await;
         assert_receiver_accepts(&fragments, &expected);
+        assert_real_receiver_assembles(&fragments, &expected).await;
     }
 
     /// Simple test socket that writes to a channel
