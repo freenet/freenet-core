@@ -341,7 +341,7 @@ fn atomic_write_record_with(
 /// Every file [`atomic_write_record`] writes in the state directory. Only
 /// their temporaries are swept; `record_writes_name_only_swept_files` keeps
 /// this list complete.
-const RECORD_FILES: [&str; 2] = [UPDATE_COOLDOWN_FILE, STAGED_DOWNLOADS_FILE];
+const RECORD_FILES: [&str; 2] = [UPDATE_COOLDOWN_FILE, DOWNLOAD_BUDGET_FILE];
 /// How old a temporary must be before the sweep removes it: far longer than
 /// any write takes, so a write in progress in another process is never hit.
 const STALE_TEMP_AGE: std::time::Duration = std::time::Duration::from_secs(3600);
@@ -1448,89 +1448,102 @@ pub fn update_cooldown_summary(current_version: &str) -> Option<String> {
     state_dir().and_then(|dir| update_cooldown_summary_at(&dir, current_version, SystemTime::now()))
 }
 
-// ── Hard ceiling on staged release downloads (#5799) ───────────────────────
+// ── Hard ceiling on release downloads (#5799) ──────────────────────────────
 //
 // Independent of the cooldown above, so a bug in it cannot turn the fleet's
 // downloads into a flood that GitHub throttles. Staging and the updater
-// together receive at most `STAGED_DOWNLOAD_BYTES_PER_DAY` bytes of one
-// release's archives per day per node (only `freenet update --force` is not
-// limited, though it is still counted). It counts bytes actually received,
-// written as they arrive, not runs: an attempt that fails early costs next to
-// nothing, and staging resumes a partial download rather than fetching it
-// again, so the normal schedule (runs at 0, 1 h and 3 h, then about every 4 h)
-// stays far below it, however long an outage lasts. It binds only when
-// downloads keep starting over: a server ignoring the resume, or connections
-// dropping after most of an archive, including the updater's downloads, which
-// always start from zero. Every staging run also spends one token from the
-// node's GitHub poll bucket (#4073), which bounds the requests.
+// together receive at most `DOWNLOAD_BYTES_PER_DAY` bytes of release archives
+// per node in a fixed window of `DOWNLOAD_WINDOW` from the first byte charged,
+// whichever releases they are for: a per-release allowance would start afresh
+// each time the target release changed. It counts bytes received, not runs:
+// an attempt that fails early costs next to nothing, and staging resumes a
+// partial download rather than fetching it again, so the normal schedule
+// (runs at 0, 1 h and 3 h, then about every 4 h) stays far below it, however
+// long an outage lasts. It binds only when downloads keep starting over: a
+// server ignoring the resume, or connections dropping after most of an
+// archive, including the updater's downloads, which always start from zero.
+// Every staging run also spends one token from the node's GitHub poll bucket
+// (#4073), which bounds the requests.
 //
 // Both reads and writes fail OPEN: an unreadable record counts as nothing
 // spent, and a spend that cannot be written is lost. The poll bucket still
 // bounds the requests, and a budget that failed closed could hold an update
 // back indefinitely.
 
-/// Bytes of one release's archives staging and the updater together may
-/// receive per node per day: about four times the ~41 MiB the freenet and fdev
-/// archives take today.
-pub(crate) const STAGED_DOWNLOAD_BYTES_PER_DAY: u64 = 160 * 1024 * 1024;
-const STAGED_DOWNLOAD_WINDOW: std::time::Duration = std::time::Duration::from_secs(24 * 3600);
-const STAGED_DOWNLOADS_FILE: &str = "staged_downloads.json";
+/// Bytes of release archives staging and the updater together may receive
+/// per node per window: room for the macOS app bundle's DMG, the largest
+/// download, several times over, and for about eight of the ~41 MiB freenet
+/// and fdev archive sets.
+pub(crate) const DOWNLOAD_BYTES_PER_DAY: u64 = 320 * 1024 * 1024;
+const DOWNLOAD_WINDOW: std::time::Duration = std::time::Duration::from_secs(24 * 3600);
+const DOWNLOAD_BUDGET_FILE: &str = "download_budget.json";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct StagedDownloads {
-    version: String,
+struct DownloadBudget {
     window_start_unix: u64,
     bytes: u64,
 }
 
-/// The current window's record for `version`, if there is a readable one.
-fn staged_downloads_at(dir: &Path, version: &str, now_unix: u64) -> Option<StagedDownloads> {
-    std::fs::read_to_string(dir.join(STAGED_DOWNLOADS_FILE))
+/// The current window's record, if there is a readable one.
+fn download_budget_at(dir: &Path, now_unix: u64) -> Option<DownloadBudget> {
+    std::fs::read_to_string(dir.join(DOWNLOAD_BUDGET_FILE))
         .ok()
-        .and_then(|raw| serde_json::from_str::<StagedDownloads>(&raw).ok())
+        .and_then(|raw| serde_json::from_str::<DownloadBudget>(&raw).ok())
         .filter(|d| {
-            d.version == version
-                && d.window_start_unix <= now_unix
-                && now_unix - d.window_start_unix < STAGED_DOWNLOAD_WINDOW.as_secs()
+            d.window_start_unix <= now_unix
+                && now_unix - d.window_start_unix < DOWNLOAD_WINDOW.as_secs()
         })
 }
 
-/// Bytes of `version`'s archives staging has received in the current window.
-/// Zero when the record is missing, unreadable, for another release, or from
-/// another window (including one dated in the future, after a clock step).
-pub(crate) fn staged_download_bytes_at(dir: &Path, version: &str, now: SystemTime) -> u64 {
-    staged_downloads_at(dir, version, unix_secs(now)).map_or(0, |d| d.bytes)
+/// Bytes of release archives charged in the current window. Zero when the
+/// record is missing, unreadable, or from another window (including one dated
+/// in the future, after a clock step).
+pub(crate) fn download_bytes_at(dir: &Path, now: SystemTime) -> u64 {
+    download_budget_at(dir, unix_secs(now)).map_or(0, |d| d.bytes)
 }
 
-/// Add `bytes` received for `version` to the current window. A failure to
-/// write is logged and otherwise ignored (fail open, see above).
-pub(crate) fn add_staged_download_bytes_at(dir: &Path, version: &str, bytes: u64, now: SystemTime) {
-    if bytes == 0 {
-        return;
+/// When the current window ends and the allowance is whole again, if bytes
+/// have been charged in it.
+pub(crate) fn download_window_end_at(dir: &Path, now: SystemTime) -> Option<SystemTime> {
+    download_budget_at(dir, unix_secs(now))
+        .map(|d| UNIX_EPOCH + std::time::Duration::from_secs(d.window_start_unix) + DOWNLOAD_WINDOW)
+}
+
+/// Charge `bytes` to the current window, starting a window when there is
+/// none. A failure to write is logged and otherwise ignored (fail open).
+pub(crate) fn charge_download_bytes_at(dir: &Path, bytes: u64, now: SystemTime) {
+    if bytes > 0 {
+        with_record_lock(dir, || adjust_download_bytes_locked(dir, bytes, 0, now));
     }
-    with_record_lock(dir, || {
-        add_staged_download_bytes_locked(dir, version, bytes, now)
-    });
 }
 
-fn add_staged_download_bytes_locked(dir: &Path, version: &str, bytes: u64, now: SystemTime) {
+/// Give back `bytes` charged earlier in the current window, never below
+/// zero: a download that received less than was charged for it.
+pub(crate) fn refund_download_bytes_at(dir: &Path, bytes: u64, now: SystemTime) {
+    if bytes > 0 {
+        with_record_lock(dir, || adjust_download_bytes_locked(dir, 0, bytes, now));
+    }
+}
+
+fn adjust_download_bytes_locked(dir: &Path, add: u64, remove: u64, now: SystemTime) {
     let now_unix = unix_secs(now);
-    let next = match staged_downloads_at(dir, version, now_unix) {
-        Some(d) => StagedDownloads {
-            bytes: d.bytes.saturating_add(bytes),
+    let next = match download_budget_at(dir, now_unix) {
+        Some(d) => DownloadBudget {
+            bytes: d.bytes.saturating_add(add).saturating_sub(remove),
             ..d
         },
-        None => StagedDownloads {
-            version: version.to_string(),
+        // A refund with no window open has nothing to give back to.
+        None if add == 0 => return,
+        None => DownloadBudget {
             window_start_unix: now_unix,
-            bytes,
+            bytes: add,
         },
     };
     let written = serde_json::to_vec(&next)
-        .context("serialize staged downloads")
-        .and_then(|raw| atomic_write_record(&dir.join(STAGED_DOWNLOADS_FILE), &raw));
+        .context("serialize the download budget")
+        .and_then(|raw| atomic_write_record(&dir.join(DOWNLOAD_BUDGET_FILE), &raw));
     if let Err(e) = written {
-        tracing::warn!(version, error = %e, "Failed to record staged download bytes (#5799)");
+        tracing::warn!(error = %e, "Failed to record downloaded bytes (#5799)");
     }
 }
 
@@ -3055,7 +3068,7 @@ pub(crate) mod tests {
                 let dir = dir.clone();
                 std::thread::spawn(move || {
                     for _ in 0..10 {
-                        add_staged_download_bytes_at(&dir, "0.2.141", 1, now);
+                        charge_download_bytes_at(&dir, 1, now);
                     }
                 })
             })
@@ -3063,7 +3076,7 @@ pub(crate) mod tests {
         for w in writers {
             w.join().unwrap();
         }
-        assert_eq!(staged_download_bytes_at(&dir, "0.2.141", now), 80);
+        assert_eq!(download_bytes_at(&dir, now), 80);
     }
 
     /// Concurrent record writes, each through its own temporary, never
@@ -3116,9 +3129,7 @@ pub(crate) mod tests {
             }),
             ("clear", &|| clear_update_cooldown_at(dir)),
             ("clear sentinel", &|| clear_unknown_release_at(dir)),
-            ("bytes", &|| {
-                add_staged_download_bytes_at(dir, "0.2.141", 1, now)
-            }),
+            ("bytes", &|| charge_download_bytes_at(dir, 1, now)),
         ];
         for (what, write) in writers {
             let holder = std::rc::Rc::new(std::cell::RefCell::new(Some(LockHelper::hold(
@@ -3499,7 +3510,7 @@ pub(crate) mod tests {
         let dir = tmp.path();
         let swept = [
             format!(".{UPDATE_COOLDOWN_FILE}.123.0.tmp"),
-            format!(".{STAGED_DOWNLOADS_FILE}.9.41.tmp"),
+            format!(".{DOWNLOAD_BUDGET_FILE}.9.41.tmp"),
         ];
         let kept = [
             ".unrelated.json.123.0.tmp".to_string(),
@@ -3557,8 +3568,8 @@ pub(crate) mod tests {
         };
         let mut records = written(concat!("atomic_write", "_record"));
         records.sort();
-        assert_eq!(records, ["STAGED_DOWNLOADS_FILE", "UPDATE_COOLDOWN_FILE"]);
-        assert_eq!(RECORD_FILES, [UPDATE_COOLDOWN_FILE, STAGED_DOWNLOADS_FILE]);
+        assert_eq!(records, ["DOWNLOAD_BUDGET_FILE", "UPDATE_COOLDOWN_FILE"]);
+        assert_eq!(RECORD_FILES, [UPDATE_COOLDOWN_FILE, DOWNLOAD_BUDGET_FILE]);
         let mut rollback_files = written(concat!("atomic", "_write"));
         rollback_files.sort();
         assert_eq!(
@@ -3633,52 +3644,59 @@ pub(crate) mod tests {
         );
         assert!(update_cooldown_remaining_at(dir, "0.2.141", now + minutes(282)).is_some());
         assert!(update_cooldown_remaining_at(dir, "0.2.141", now + minutes(289)).is_none());
-        assert_eq!(
-            STAGED_DOWNLOAD_WINDOW,
-            std::time::Duration::from_secs(24 * 3600)
-        );
+        assert_eq!(DOWNLOAD_WINDOW, std::time::Duration::from_secs(24 * 3600));
     }
 
-    /// The download budget counts bytes per release per day, and fails open
+    /// The download budget counts a node's bytes in a fixed window from the
+    /// first byte charged, refunds never go below zero, and it fails open
     /// both ways: an unreadable record is nothing spent, an unwritable one
     /// loses the spend rather than blocking downloads.
     #[test]
-    fn staged_download_bytes_are_counted_per_release_per_day() {
+    fn download_bytes_are_counted_per_node_in_a_fixed_window() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path();
         let now = SystemTime::now();
-        assert_eq!(staged_download_bytes_at(dir, "0.2.141", now), 0);
-        add_staged_download_bytes_at(dir, "0.2.141", 1000, now);
-        add_staged_download_bytes_at(dir, "0.2.141", 0, now);
-        add_staged_download_bytes_at(dir, "0.2.141", 500, now);
-        assert_eq!(staged_download_bytes_at(dir, "0.2.141", now), 1500);
-        assert_eq!(
-            staged_download_bytes_at(dir, "0.2.142", now),
-            0,
-            "per release"
+        let hour = std::time::Duration::from_secs(3600);
+        assert_eq!(download_bytes_at(dir, now), 0);
+        assert_eq!(download_window_end_at(dir, now), None);
+        refund_download_bytes_at(dir, 10, now);
+        assert!(
+            !dir.join(DOWNLOAD_BUDGET_FILE).exists(),
+            "a refund opens no window"
         );
-        let next_day = now + STAGED_DOWNLOAD_WINDOW;
+        charge_download_bytes_at(dir, 1000, now);
+        charge_download_bytes_at(dir, 0, now);
+        // Later charges do not move the window.
+        charge_download_bytes_at(dir, 500, now + hour * 23);
+        assert_eq!(download_bytes_at(dir, now + hour * 23), 1500);
+        let end = download_window_end_at(dir, now).unwrap();
         assert_eq!(
-            staged_download_bytes_at(dir, "0.2.141", next_day),
-            0,
-            "a new day"
+            end.duration_since(UNIX_EPOCH).unwrap().as_secs(),
+            unix_secs(now) + DOWNLOAD_WINDOW.as_secs()
         );
-        add_staged_download_bytes_at(dir, "0.2.141", 7, next_day);
-        assert_eq!(staged_download_bytes_at(dir, "0.2.141", next_day), 7);
+        refund_download_bytes_at(dir, 400, now);
+        assert_eq!(download_bytes_at(dir, now), 1100);
+        refund_download_bytes_at(dir, u64::MAX, now);
+        assert_eq!(download_bytes_at(dir, now), 0, "never below zero");
+        charge_download_bytes_at(dir, 1500, now);
+        let next_day = now + DOWNLOAD_WINDOW;
+        assert_eq!(download_bytes_at(dir, next_day), 0, "a new window");
+        charge_download_bytes_at(dir, 7, next_day);
+        assert_eq!(download_bytes_at(dir, next_day), 7);
         // A record from the future (a clock stepped back) is a new window
         // rather than one that blocks until then.
-        assert_eq!(staged_download_bytes_at(dir, "0.2.141", now), 0);
+        assert_eq!(download_bytes_at(dir, now), 0);
         // Corrupt: nothing spent.
-        std::fs::write(dir.join(STAGED_DOWNLOADS_FILE), "{bad").unwrap();
-        assert_eq!(staged_download_bytes_at(dir, "0.2.141", now), 0);
-        add_staged_download_bytes_at(dir, "0.2.141", 3, now);
-        assert_eq!(staged_download_bytes_at(dir, "0.2.141", now), 3);
+        std::fs::write(dir.join(DOWNLOAD_BUDGET_FILE), "{bad").unwrap();
+        assert_eq!(download_bytes_at(dir, now), 0);
+        charge_download_bytes_at(dir, 3, now);
+        assert_eq!(download_bytes_at(dir, now), 3);
         // Unwritable (a directory in the way): the spend is lost, no panic,
         // and reads still say nothing is spent.
-        std::fs::remove_file(dir.join(STAGED_DOWNLOADS_FILE)).unwrap();
-        std::fs::create_dir(dir.join(STAGED_DOWNLOADS_FILE)).unwrap();
-        add_staged_download_bytes_at(dir, "0.2.141", u64::MAX, now);
-        assert_eq!(staged_download_bytes_at(dir, "0.2.141", now), 0);
+        std::fs::remove_file(dir.join(DOWNLOAD_BUDGET_FILE)).unwrap();
+        std::fs::create_dir(dir.join(DOWNLOAD_BUDGET_FILE)).unwrap();
+        charge_download_bytes_at(dir, u64::MAX, now);
+        assert_eq!(download_bytes_at(dir, now), 0);
     }
 
     #[test]

@@ -40,7 +40,7 @@
 //! Staging's GitHub traffic has a hard ceiling that does not depend on any of
 //! that: every staging run spends one token from the node's persisted poll
 //! bucket (#4073), and staging and the updater together receive at most
-//! `rollback::STAGED_DOWNLOAD_BYTES_PER_DAY` bytes of one release's archives
+//! `rollback::DOWNLOAD_BYTES_PER_DAY` bytes of one release's archives
 //! per day (the updater charges the same record through [`ByteMeter`]). A
 //! staging run the budget refuses counts as a failure, so the fallback still
 //! fires; an updater run it refuses holds the release without counting.
@@ -188,7 +188,7 @@ const METER_PERSIST_EVERY: u64 = 16 * 1024 * 1024;
 
 /// Counts the archive bytes a run receives (staging's or the updater's)
 /// against what is left of the release's daily budget
-/// (`rollback::STAGED_DOWNLOAD_BYTES_PER_DAY`), and, when it has a ledger,
+/// (`rollback::DOWNLOAD_BYTES_PER_DAY`, per node), and, when it has a ledger,
 /// writes them to that budget's record as it goes.
 pub(super) struct ByteMeter<'a> {
     allowance: u64,
@@ -198,11 +198,10 @@ pub(super) struct ByteMeter<'a> {
     ledger: Option<Ledger<'a>>,
 }
 
-/// Where a [`ByteMeter`] writes what it counts: the state directory's budget
-/// record for one release.
+/// Where a [`ByteMeter`] writes what it counts: the state directory's
+/// per-node budget record.
 struct Ledger<'a> {
     dir: PathBuf,
-    version: String,
     clock: Clock<'a>,
 }
 
@@ -216,14 +215,13 @@ impl<'a> ByteMeter<'a> {
         }
     }
 
-    /// A meter allowing `allowance` bytes that charges them to `version`'s
-    /// budget record in `dir`, every [`METER_PERSIST_EVERY`] bytes and on
+    /// A meter allowing `allowance` bytes that charges them to the budget
+    /// record in `dir`, every [`METER_PERSIST_EVERY`] bytes and on
     /// [`ByteMeter::flush`].
-    pub(super) fn charged_to(allowance: u64, dir: &Path, version: &str, clock: Clock<'a>) -> Self {
+    pub(super) fn charged_to(allowance: u64, dir: &Path, clock: Clock<'a>) -> Self {
         Self {
             ledger: Some(Ledger {
                 dir: dir.to_path_buf(),
-                version: version.to_string(),
                 clock,
             }),
             ..Self::new(allowance)
@@ -270,9 +268,8 @@ impl<'a> ByteMeter<'a> {
         };
         let received = self.received();
         let before = self.recorded.swap(received, Relaxed);
-        super::super::rollback::add_staged_download_bytes_at(
+        super::super::rollback::charge_download_bytes_at(
             &ledger.dir,
-            &ledger.version,
             received.saturating_sub(before),
             (ledger.clock)(),
         );
@@ -662,7 +659,7 @@ fn production_env(root: &Path) -> StageEnv<'static> {
         lookup_delays: &LOOKUP_RETRY_DELAYS,
         deadline: STAGE_DEADLINE,
         clock: &SystemTime::now,
-        byte_budget: super::super::rollback::STAGED_DOWNLOAD_BYTES_PER_DAY,
+        byte_budget: super::super::rollback::DOWNLOAD_BYTES_PER_DAY,
     }
 }
 
@@ -975,7 +972,7 @@ struct StageEnv<'a> {
     deadline: Duration,
     clock: Clock<'a>,
     /// Archive bytes per release per day; production passes
-    /// `rollback::STAGED_DOWNLOAD_BYTES_PER_DAY`.
+    /// `rollback::DOWNLOAD_BYTES_PER_DAY`.
     byte_budget: u64,
 }
 
@@ -1045,11 +1042,11 @@ where
     // it refuses counts as a failure, so the fallback keeps firing. The poll
     // token this run spent above bounds its requests, retries included.
     let spent = root.parent().map_or(0, |dir| {
-        super::super::rollback::staged_download_bytes_at(dir, version, clock())
+        super::super::rollback::download_bytes_at(dir, clock())
     });
     let allowance = env.byte_budget.saturating_sub(spent);
     let meter = match root.parent() {
-        Some(dir) => ByteMeter::charged_to(allowance, dir, version, clock),
+        Some(dir) => ByteMeter::charged_to(allowance, dir, clock),
         None => ByteMeter::new(allowance),
     };
     if meter.check().is_err() && !freenet_archive_staged(root, &tag).await {
@@ -2260,7 +2257,7 @@ mod tests {
             lookup_delays: &[],
             deadline: STAGE_DEADLINE,
             clock: &SystemTime::now,
-            byte_budget: super::super::super::rollback::STAGED_DOWNLOAD_BYTES_PER_DAY,
+            byte_budget: super::super::super::rollback::DOWNLOAD_BYTES_PER_DAY,
         }
     }
 
@@ -2462,7 +2459,7 @@ mod tests {
     fn the_node_stages_in_the_production_environment() {
         use super::super::super::auto_update::TestStateDir;
         use super::super::super::rollback::{
-            STAGED_DOWNLOAD_BYTES_PER_DAY, pin_known_bad_at, read_update_cooldown_at,
+            DOWNLOAD_BYTES_PER_DAY, pin_known_bad_at, read_update_cooldown_at,
         };
         let state = TestStateDir::new();
         let root = cache_root().expect("the cache sits in the state directory");
@@ -2480,7 +2477,7 @@ mod tests {
         assert_eq!(env.delays, STAGE_RETRY_DELAYS);
         assert_eq!(env.lookup_delays, LOOKUP_RETRY_DELAYS);
         assert_eq!(env.deadline, STAGE_DEADLINE);
-        assert_eq!(env.byte_budget, STAGED_DOWNLOAD_BYTES_PER_DAY);
+        assert_eq!(env.byte_budget, DOWNLOAD_BYTES_PER_DAY);
         let wall = SystemTime::now();
         let clock = (env.clock)();
         let skew = clock.duration_since(wall).unwrap_or_else(|e| e.duration());
@@ -2508,7 +2505,7 @@ mod tests {
     /// the from-zero re-download after a resumed archive fails its checksum.
     #[tokio::test]
     async fn the_byte_budget_covers_fdev_and_the_restarted_download() {
-        use super::super::super::rollback::staged_download_bytes_at;
+        use super::super::super::rollback::download_bytes_at;
         let freenet = freenet_asset_name();
         let fdev = fdev_asset_name();
         let good = b"the freenet archive".to_vec();
@@ -2548,14 +2545,14 @@ mod tests {
         fs::write(root.join(TAG).join(format!("{freenet}.part")), b"old!").unwrap();
         let now = SystemTime::now();
         let clock = move || now;
-        let meter = ByteMeter::charged_to(u64::MAX, dir, "9.9.9", &clock);
+        let meter = ByteMeter::charged_to(u64::MAX, dir, &clock);
         stage_release_at(&root, &server.url_str("/"), TAG, &unsigned, &meter)
             .await
             .expect("staged, fdev left to the updater");
         meter.flush();
         let resumed = (good.len() - 4) as u64;
         assert_eq!(
-            staged_download_bytes_at(dir, "9.9.9", now),
+            download_bytes_at(dir, now),
             resumed + good.len() as u64 + fdev_body.len() as u64
         );
     }
@@ -2564,7 +2561,7 @@ mod tests {
     /// run exits to install it without requesting fdev either.
     #[tokio::test]
     async fn a_spent_budget_requests_no_fdev_and_still_installs() {
-        use super::super::super::rollback::add_staged_download_bytes_at;
+        use super::super::super::rollback::charge_download_bytes_at;
         let freenet = freenet_asset_name();
         let fdev = fdev_asset_name();
         let manifest = manifest_for(&[(&freenet, b"archive"), (&fdev, b"fdev")]);
@@ -2576,7 +2573,7 @@ mod tests {
             &[(MANIFEST, manifest.as_bytes()), (&freenet, b"archive")],
         );
         let now = SystemTime::now();
-        add_staged_download_bytes_at(root.parent().unwrap(), "9.9.9", u64::MAX, now);
+        charge_download_bytes_at(root.parent().unwrap(), u64::MAX, now);
         assert_eq!(
             stage_at(&root, &server.url_str("/"), now).await,
             Staging::Staged
@@ -3083,7 +3080,7 @@ mod tests {
     /// counted; the flush adds the rest.
     #[tokio::test]
     async fn a_killed_download_leaves_its_bytes_counted() {
-        use super::super::super::rollback::staged_download_bytes_at;
+        use super::super::super::rollback::download_bytes_at;
         const MIB: u64 = 1024 * 1024;
         let (prefix, _, _) = restarting_server(Vec::new(), 40 << 20, 20 << 20).await;
         let (_tmp, root) = test_root();
@@ -3091,7 +3088,7 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         let now = SystemTime::now();
         let clock = move || now;
-        let meter = ByteMeter::charged_to(u64::MAX, dir, "9.9.9", &clock);
+        let meter = ByteMeter::charged_to(u64::MAX, dir, &clock);
         let part = root.join("asset.part");
         assert!(
             download_resumable(&format!("{prefix}asset"), &part, &meter)
@@ -3100,16 +3097,16 @@ mod tests {
             "the server stops half way"
         );
         assert_eq!(METER_PERSIST_EVERY, 16 * MIB);
-        let counted = staged_download_bytes_at(dir, "9.9.9", now);
+        let counted = download_bytes_at(dir, now);
         assert!(
             (METER_PERSIST_EVERY..20 * MIB).contains(&counted),
             "{counted} counted before the flush"
         );
         meter.flush();
-        assert_eq!(staged_download_bytes_at(dir, "9.9.9", now), 20 * MIB);
+        assert_eq!(download_bytes_at(dir, now), 20 * MIB);
         meter.flush();
         assert_eq!(
-            staged_download_bytes_at(dir, "9.9.9", now),
+            download_bytes_at(dir, now),
             20 * MIB,
             "a second flush adds nothing"
         );
@@ -3313,11 +3310,7 @@ mod tests {
         assert_eq!(run().await, Staging::Deferred);
         assert_eq!(bytes.load(SeqCst), 30_000);
         let state_dir = root.parent().unwrap();
-        let spent = super::super::super::rollback::staged_download_bytes_at(
-            state_dir,
-            "9.9.9",
-            SystemTime::now(),
-        );
+        let spent = super::super::super::rollback::download_bytes_at(state_dir, SystemTime::now());
         assert!((25_000..=30_000).contains(&spent), "{spent}");
         // With the cooldown out of the way, the next runs never reach the
         // server, and still count toward the fallback.
@@ -3336,6 +3329,46 @@ mod tests {
         assert_eq!(run().await, Staging::FallingBack);
         assert_eq!(runs.load(SeqCst), 3, "a refused run makes no request");
         assert!(cooldown(&root).unwrap().last_error.contains("budget"));
+    }
+
+    /// The budget is the node's, not a release's: after one release has
+    /// spent it, another release gets no fresh allowance.
+    #[tokio::test]
+    async fn alternating_releases_share_one_allowance() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let freenet = freenet_asset_name();
+        let manifest = manifest_for(&[(&freenet, b"the real archive")]);
+        let (prefix, _, bytes) = restarting_server(manifest.into_bytes(), 1_000_000, 10_000).await;
+        let (_tmp, root) = test_root();
+        let state_dir = root.parent().unwrap().to_path_buf();
+        let delays = [Duration::from_millis(1); 5];
+        let env = StageEnv {
+            delays: &delays,
+            byte_budget: 25_000,
+            ..test_env(&prefix)
+        };
+        for (tag, version) in [
+            ("v9.9.9", "9.9.9"),
+            ("v9.9.10", "9.9.10"),
+            ("v9.9.9", "9.9.9"),
+        ] {
+            super::super::super::rollback::clear_update_cooldown_at(&state_dir);
+            fs::remove_file(state_dir.join("github_poll_bucket_node")).ok();
+            stage_into(
+                &root,
+                "9.9.8",
+                || async move { Ok(tag.to_string()) },
+                Some(version),
+                |_: &str| false,
+                &env,
+            )
+            .await;
+        }
+        assert_eq!(
+            bytes.load(SeqCst),
+            30_000,
+            "only the first release's run downloaded anything"
+        );
     }
 
     /// #5799: with the cooldown taken out of the picture before every
@@ -3377,7 +3410,7 @@ mod tests {
         // holds the archive bytes to the budget plus at most one response.
         runs.store(0, SeqCst);
         bytes.store(0, SeqCst);
-        fs::remove_file(state_dir.join("staged_downloads.json")).unwrap();
+        fs::remove_file(state_dir.join("download_budget.json")).unwrap();
         let delays = [Duration::from_millis(1); 5];
         for _ in 0..20 {
             super::super::super::rollback::clear_update_cooldown_at(&state_dir);
@@ -3457,7 +3490,7 @@ mod tests {
         let manifest = manifest_for(&[(&freenet, b"archive")]);
         let server = serve_release(manifest.as_bytes(), None, &[(&freenet, b"archive")]);
         let (tmp, root) = test_root();
-        fs::create_dir_all(tmp.path().join("staged_downloads.json")).unwrap();
+        fs::create_dir_all(tmp.path().join("download_budget.json")).unwrap();
         assert_eq!(
             stage_once(&root, &server.url_str("/"), STAGE_DEADLINE).await,
             Staging::Staged
@@ -3719,10 +3752,8 @@ mod tests {
     /// budget: there is nothing left to download, so it exits to install.
     #[tokio::test]
     async fn a_spent_budget_still_installs_a_staged_release() {
-        use super::super::super::rollback::{
-            STAGED_DOWNLOAD_BYTES_PER_DAY, add_staged_download_bytes_at,
-        };
-        assert_eq!(STAGED_DOWNLOAD_BYTES_PER_DAY, 160 * 1024 * 1024);
+        use super::super::super::rollback::{DOWNLOAD_BYTES_PER_DAY, charge_download_bytes_at};
+        assert_eq!(DOWNLOAD_BYTES_PER_DAY, 320 * 1024 * 1024);
         let freenet = freenet_asset_name();
         let manifest = manifest_for(&[(&freenet, b"archive")]);
         // The manifest is fetched again; the archive is not.
@@ -3733,7 +3764,7 @@ mod tests {
             &[(MANIFEST, manifest.as_bytes()), (&freenet, b"archive")],
         );
         let now = SystemTime::now();
-        add_staged_download_bytes_at(root.parent().unwrap(), "9.9.9", u64::MAX, now);
+        charge_download_bytes_at(root.parent().unwrap(), u64::MAX, now);
         assert_eq!(
             stage_at(&root, &server.url_str("/"), now).await,
             Staging::Staged

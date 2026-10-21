@@ -305,14 +305,13 @@ fn install_record(result: &Result<InstallOutcome>) -> InstallRecord {
     }
 }
 
-/// The meter an updater run's downloads of `version` charge to the release's
-/// daily byte budget, which staging shares (#5799), or `None` when that
-/// budget is already spent. `--force`, the operator's escape hatch, is
-/// charged but never limited. Without a state directory nothing can be
-/// charged, and the run is not limited either.
+/// The meter an updater run's downloads charge to the node's daily byte
+/// budget, which staging shares (#5799), or `None` when that budget is
+/// already spent. `--force`, the operator's escape hatch, is charged but never
+/// limited. Without a state directory nothing can be charged, and the run is
+/// not limited either.
 fn updater_meter_at(
     dir: Option<&Path>,
-    version: &str,
     force: bool,
     now: std::time::SystemTime,
 ) -> Option<staged::ByteMeter<'static>> {
@@ -322,11 +321,9 @@ fn updater_meter_at(
     let left = if force {
         u64::MAX
     } else {
-        rollback::STAGED_DOWNLOAD_BYTES_PER_DAY
-            .saturating_sub(rollback::staged_download_bytes_at(dir, version, now))
+        rollback::DOWNLOAD_BYTES_PER_DAY.saturating_sub(rollback::download_bytes_at(dir, now))
     };
-    (left > 0)
-        .then(|| staged::ByteMeter::charged_to(left, dir, version, &std::time::SystemTime::now))
+    (left > 0).then(|| staged::ByteMeter::charged_to(left, dir, &std::time::SystemTime::now))
 }
 
 /// Hold `version` without counting a failure because today's download budget
@@ -653,7 +650,6 @@ impl UpdateCommand {
         // staged copy can be installed without downloading the archive.
         let meter = match updater_meter_at(
             super::auto_update::state_dir().as_deref(),
-            latest_version,
             self.force,
             std::time::SystemTime::now(),
         ) {
@@ -4406,22 +4402,20 @@ done
     /// behaviour rather than source. A verification failure goes to the #4073
     /// gate and never to the cooldown; every other failure cools the release
     /// down carrying its full error chain; an install clears.
-    /// #5799: the updater draws on the byte budget staging uses, per release
+    /// #5799: the updater draws on the byte budget staging uses, per node
     /// per day. A spent budget refuses an updater run before it requests the
-    /// asset list; `--force` is never refused; another release has its own
-    /// budget.
+    /// asset list; `--force` is never refused.
     #[test]
     fn the_updater_shares_the_staging_byte_budget() {
-        use rollback::{STAGED_DOWNLOAD_BYTES_PER_DAY, add_staged_download_bytes_at};
+        use rollback::{DOWNLOAD_BYTES_PER_DAY, charge_download_bytes_at};
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path();
         let now = std::time::SystemTime::now();
-        assert!(updater_meter_at(Some(dir), "9.9.9", false, now).is_some());
-        add_staged_download_bytes_at(dir, "9.9.9", STAGED_DOWNLOAD_BYTES_PER_DAY, now);
-        assert!(updater_meter_at(Some(dir), "9.9.9", false, now).is_none());
-        assert!(updater_meter_at(Some(dir), "9.9.9", true, now).is_some());
-        assert!(updater_meter_at(Some(dir), "9.9.10", false, now).is_some());
-        assert!(updater_meter_at(None, "9.9.9", false, now).is_some());
+        assert!(updater_meter_at(Some(dir), false, now).is_some());
+        charge_download_bytes_at(dir, DOWNLOAD_BYTES_PER_DAY, now);
+        assert!(updater_meter_at(Some(dir), false, now).is_none());
+        assert!(updater_meter_at(Some(dir), true, now).is_some());
+        assert!(updater_meter_at(None, false, now).is_some());
         // Consulted before the asset list is requested.
         let src = include_str!("update.rs");
         let run = &src[src.find("\n    async fn run_async(").unwrap()..];
@@ -4435,9 +4429,7 @@ done
     /// is held, not counted.
     #[tokio::test]
     async fn updater_downloads_charge_the_byte_budget() {
-        use rollback::{
-            STAGED_DOWNLOAD_BYTES_PER_DAY, add_staged_download_bytes_at, staged_download_bytes_at,
-        };
+        use rollback::{DOWNLOAD_BYTES_PER_DAY, charge_download_bytes_at, download_bytes_at};
         let body = vec![7u8; 1000];
         let server = httptest::Server::run();
         server.expect(
@@ -4451,18 +4443,18 @@ done
         let dir = tmp.path();
         let now = std::time::SystemTime::now();
         let dest = dir.join("asset");
-        let meter = updater_meter_at(Some(dir), "9.9.9", false, now).unwrap();
+        let meter = updater_meter_at(Some(dir), false, now).unwrap();
         download_file(&server.url_str("/asset"), &dest, true, &meter)
             .await
             .unwrap();
-        assert_eq!(staged_download_bytes_at(dir, "9.9.9", now), 1000);
+        assert_eq!(download_bytes_at(dir, now), 1000);
         // 500 bytes left: the download is stopped and the budget is spent.
-        add_staged_download_bytes_at(dir, "9.9.9", STAGED_DOWNLOAD_BYTES_PER_DAY - 1500, now);
-        let meter = updater_meter_at(Some(dir), "9.9.9", false, now).unwrap();
+        charge_download_bytes_at(dir, DOWNLOAD_BYTES_PER_DAY - 1500, now);
+        let meter = updater_meter_at(Some(dir), false, now).unwrap();
         let err = download_file(&server.url_str("/asset"), &dest, true, &meter)
             .await
             .unwrap_err();
-        assert!(staged_download_bytes_at(dir, "9.9.9", now) >= STAGED_DOWNLOAD_BYTES_PER_DAY);
+        assert!(download_bytes_at(dir, now) >= DOWNLOAD_BYTES_PER_DAY);
         assert!(matches!(install_record(&Err(err)), InstallRecord::Hold(_)));
         // Spent: refused before any request (the server expects only two).
         let spent = staged::ByteMeter::new(0);
@@ -4600,7 +4592,7 @@ done
             // #5799: the shared byte budget is consulted before the asset
             // list is requested, and a staged copy still installs.
             "letmeter=matchupdater_meter_at(super::auto_update::state_dir().as_deref(),\
-             latest_version,self.force,std::time::SystemTime::now(),){Some(meter)=>meter,\
+             self.force,std::time::SystemTime::now(),){Some(meter)=>meter,\
              Noneifstaged::is_staged(&latest_tag)=>staged::ByteMeter::new(0),\
              None=>exit_for_spent_budget(",
         ] {
