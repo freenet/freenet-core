@@ -68,7 +68,9 @@
 
 use std::fmt;
 use std::mem::ManuallyDrop;
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+#[cfg(test)]
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::Duration;
 
 use super::Socket;
