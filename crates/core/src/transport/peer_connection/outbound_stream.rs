@@ -3916,12 +3916,12 @@ mod egress_cap_tests {
     }
 
     /// When the node-wide cap refuses, a fragment gives its per-connection
-    /// bytes back. Without that, every refused attempt would also spend the
-    /// connection's bucket: four connections at 40 KB/s each sharing a
-    /// 100 KB/s cap (25 KB/s each) attempt about every 15 ms, which would
-    /// spend about 75 KB/s of a 40 KB/s bucket on refusals, and the node
-    /// would fall well short of the cap. With it, they fill the cap: at
-    /// least 95% of the refill over the run, the burst subtracted.
+    /// bytes back. Eight streams on one connection whose own bucket allows
+    /// 110 KB/s share a 100 KB/s cap: the cap refuses most attempts, and
+    /// without the give-back each refusal would also spend the connection's
+    /// bucket, which would then bind and leave the node well short of the
+    /// cap. With it, the node fills the cap: at least 95% of the refill over
+    /// the run, the burst subtracted.
     #[tokio::test(flavor = "current_thread")]
     async fn per_connection_bytes_are_returned_when_the_cap_refuses() {
         const RATE: u64 = 100_000;
@@ -3933,19 +3933,21 @@ mod egress_cap_tests {
             RecordingSocket::new(&time, None),
             Some(cap),
         ));
-        let tasks = (0..4)
+        let congestion = window(1_000_000_000, &time);
+        let bucket = Arc::new(TokenBucket::new_with_time_source(
+            PER_CONNECTION_BURST,
+            110_000,
+            time.clone(),
+        ));
+        let tasks = (0..8)
             .map(|i| {
                 spawn_stream(
                     StreamSpec {
                         sender: Sender::Send,
-                        fragments: 100,
+                        fragments: 50,
                         port: 20_000 + i,
-                        congestion: window(1_000_000_000, &time),
-                        bucket: Arc::new(TokenBucket::new_with_time_source(
-                            PER_CONNECTION_BURST,
-                            40_000,
-                            time.clone(),
-                        )),
+                        congestion: congestion.clone(),
+                        bucket: bucket.clone(),
                     },
                     &socket,
                     &time,

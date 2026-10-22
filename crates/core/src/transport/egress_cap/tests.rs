@@ -268,6 +268,7 @@ async fn a_long_wait_is_reported_once_per_fragment() {
             let mut paced = PacedWait::default();
             // 200 ms deficits for 4 s: about seven sleeps past LONG_WAIT.
             while paced.waited(&time) < Duration::from_secs(4) {
+                assert!(time.now_nanos() < 10_000_000_000, "waits are not measured");
                 paced
                     .sleep(&time, Some(&cap), Duration::from_millis(200))
                     .await
