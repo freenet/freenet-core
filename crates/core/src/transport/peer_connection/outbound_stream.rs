@@ -309,6 +309,14 @@ pub(super) async fn send_stream<S: super::super::Socket, T: TimeSource>(
             // loop will block forever.
             //
             // Safety: the loop is bounded by CWND_WAIT_TIMEOUT (#3608).
+            // With a cap, the gap since the previous fragment also bounds the
+            // cwnd wait below: the stream fails at `PACED_WAIT_DEADLINE`, not
+            // only at `CWND_WAIT_TIMEOUT` after time spent on the cap.
+            if socket.egress_cap().is_some() {
+                pacing.get_or_insert_with(|| {
+                    super::super::egress_cap::StreamPacing::new(&time_source)
+                });
+            }
             let cwnd_wait_start = time_source.now();
             let mut cwnd_wait_iterations = 0;
             loop {
@@ -329,6 +337,23 @@ pub(super) async fn send_stream<S: super::super::Socket, T: TimeSource>(
                         packet_size,
                         "Waiting for cwnd space (ensure recv() is being called to process ACKs)"
                     );
+                }
+
+                // Under the node-wide cap, the deadline holds while waiting for
+                // cwnd too (this wait polls every millisecond at most, so it
+                // is noticed at the deadline). The time counts as `other`.
+                if let (Some(cap), Some(pacing)) = (socket.egress_cap(), pacing.as_mut()) {
+                    if let Err(gap) = pacing.check(&time_source, cap) {
+                        return Err(abandon_for_egress_wait(
+                            stream_id,
+                            destination_addr,
+                            ((sent_so_far * MAX_DATA_SIZE) as u64).min(bytes_to_send),
+                            time_source.now().saturating_sub(start_time),
+                            gap,
+                            sent_packet_tracker.as_ref(),
+                            congestion_controller.as_ref(),
+                        ));
+                    }
                 }
 
                 // Timeout: if cwnd space never opens (ACKs stopped arriving),
@@ -986,6 +1011,14 @@ where
             // open within the timeout, the pipe fails with OutboundStreamFailed
             // (stream-scoped, connection survives — #4345) rather than hanging
             // indefinitely.
+            // With a cap, the gap since the previous fragment also bounds the
+            // cwnd wait below: the stream fails at `PACED_WAIT_DEADLINE`, not
+            // only at `CWND_WAIT_TIMEOUT` after time spent on the cap.
+            if socket.egress_cap().is_some() {
+                pacing.get_or_insert_with(|| {
+                    super::super::egress_cap::StreamPacing::new(&time_source)
+                });
+            }
             let cwnd_wait_start = time_source.now();
             let mut cwnd_wait_iterations = 0;
             loop {
@@ -1005,6 +1038,23 @@ where
                         cwnd_kb = cwnd / 1024,
                         "Waiting for cwnd space in pipe_stream"
                     );
+                }
+
+                // Under the node-wide cap, the deadline holds while waiting for
+                // cwnd too (this wait polls every millisecond at most, so it
+                // is noticed at the deadline). The time counts as `other`.
+                if let (Some(cap), Some(pacing)) = (socket.egress_cap(), pacing.as_mut()) {
+                    if let Err(gap) = pacing.check(&time_source, cap) {
+                        return Err(abandon_for_egress_wait(
+                            outbound_stream_id,
+                            destination_addr,
+                            sent_so_far,
+                            time_source.now().saturating_sub(start_time),
+                            gap,
+                            sent_packet_tracker.as_ref(),
+                            congestion_controller.as_ref(),
+                        ));
+                    }
                 }
 
                 // Timeout: if cwnd space never opens (ACKs stopped arriving),
@@ -4035,9 +4085,12 @@ mod egress_cap_tests {
     ///
     /// Fragment 1 takes the last datagram in the cap's bucket at 0 s.
     /// Fragment 2 passes cwnd, is refused by the 500 B/s cap and sleeps
-    /// 2.4 to 3.4 s; meanwhile, at 1 s, other traffic fills the window, so
-    /// fragment 2 then waits for cwnd until 5.2 s (less than
-    /// `CWND_WAIT_TIMEOUT`), when the window frees and the cap has refilled.
+    /// until it is woken at `LONG_WAIT` (the first sleep is cut there, so it
+    /// wakes at 2.4 to 2.5 s); meanwhile, at 1 s, other traffic fills the window, so
+    /// fragment 2 then waits for cwnd, which would free at 5.2 s (less than
+    /// `CWND_WAIT_TIMEOUT` after the sleep) when the cap has refilled. The
+    /// deadline is also checked inside the cwnd wait, so the stream already
+    /// fails at 5 s (see the test below for that timing).
     #[tokio::test(flavor = "current_thread")]
     async fn a_fragment_past_the_deadline_after_a_cwnd_wait_is_not_sent() {
         let _seed = GlobalRng::seed_guard(14);
@@ -4082,5 +4135,69 @@ mod egress_cap_tests {
         let stats = socket.egress_cap().expect("cap").stats();
         assert_eq!(stats.streams_abandoned.iter().sum::<u64>(), 1);
         assert!(stats.refusals >= 1, "premise: fragment 2 slept for the cap");
+    }
+
+    /// The deadline holds inside the cwnd wait too: a capped stream that
+    /// spent 2.4 to 2.5 s on the cap and is then blocked on cwnd is failed
+    /// when its gap reaches `PACED_WAIT_DEADLINE` (5 s) and counted as
+    /// abandoned, not at `CWND_WAIT_TIMEOUT` after the cwnd wait began
+    /// (about 5.5 s) by the generic cwnd path, which counts nothing.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_cwnd_wait_after_a_cap_wait_is_abandoned_at_the_deadline() {
+        const DEADLINE: Duration = crate::transport::egress_cap::PACED_WAIT_DEADLINE;
+        for (seed, sender) in [(15, Sender::Send), (16, Sender::Pipe)] {
+            let _seed = GlobalRng::seed_guard(seed);
+            let time = VirtualTime::new();
+            let cap = EgressCap::new(500, time.clone());
+            cap.charge_unpaced(cap.burst_bytes() as usize - 1_200);
+            let socket = Arc::new(DemuxSocket::wrap(
+                RecordingSocket::new(&time, None),
+                Some(cap),
+            ));
+            let congestion = window(20 * MAX_DATA_SIZE, &time);
+            // Other traffic fills the window at 1 s and does not free it
+            // before either deadline (10 s).
+            let filler = {
+                let (congestion, time) = (congestion.clone(), time.clone());
+                GlobalExecutor::spawn(async move {
+                    time.sleep(Duration::from_secs(1)).await;
+                    let filled = 20 * MAX_DATA_SIZE;
+                    let _token = congestion.on_send_with_token(filled);
+                    // Ticks every millisecond so that the clock steps while
+                    // the stream polls its cwnd wait.
+                    for _ in 0..10_000 {
+                        time.sleep(Duration::from_millis(1)).await;
+                    }
+                    congestion.release_flightsize(filled);
+                    Err::<TransferStats, _>(TransportError::ChannelClosed)
+                })
+            };
+            let stream = spawn_stream(
+                StreamSpec {
+                    sender,
+                    fragments: 3,
+                    port: 20_000,
+                    congestion,
+                    bucket: own_connection(&time).1,
+                },
+                &socket,
+                &time,
+            );
+            let start = time.now_nanos();
+            let results = drive_results(&time, vec![stream]).await;
+            let elapsed = Duration::from_nanos(time.now_nanos() - start);
+            filler.abort();
+            assert!(
+                matches!(results[0], Err(TransportError::OutboundStreamFailed(_))),
+                "{:?}",
+                results[0]
+            );
+            assert!(
+                elapsed >= DEADLINE && elapsed < DEADLINE + Duration::from_millis(100),
+                "failed at {elapsed:?}, expected the 5 s deadline"
+            );
+            let stats = socket.egress_cap().expect("cap").stats();
+            assert_eq!(stats.streams_abandoned.iter().sum::<u64>(), 1);
+        }
     }
 }
