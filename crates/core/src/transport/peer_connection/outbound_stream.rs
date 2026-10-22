@@ -4077,8 +4077,7 @@ mod egress_cap_tests {
         task.abort();
     }
 
-    /// The deadline is checked before every take, not only after a sleep: a
-    /// fragment that sleeps for the cap, then waits for cwnd until the gap
+    /// A fragment that sleeps for the cap, then waits for cwnd until the gap
     /// since the stream's previous fragment passes `PACED_WAIT_DEADLINE`, is
     /// not sent although both buckets would admit it then; the stream fails.
     ///
@@ -4194,6 +4193,136 @@ mod egress_cap_tests {
             assert!(
                 elapsed >= DEADLINE && elapsed < DEADLINE + Duration::from_millis(100),
                 "failed at {elapsed:?}, expected the 5 s deadline"
+            );
+            let stats = socket.egress_cap().expect("cap").stats();
+            assert_eq!(stats.streams_abandoned.iter().sum::<u64>(), 1);
+        }
+    }
+
+    /// The check before the take is the one that fires when the window is
+    /// free again on the iteration where the gap has just passed the
+    /// deadline: the cwnd loop checks only while it is blocked, and nothing
+    /// slept for the cap since. The window is full from 1 s and frees at
+    /// 100 ns before the deadline, after the stream's last 1 ms poll that
+    /// saw it full, so the next poll finds cwnd free just past 5 s, when
+    /// both buckets would admit the fragment, and must not send it. Both
+    /// `send_stream` and `pipe_stream` reach the check this way. (Upstream
+    /// waits in `pipe_stream` end at the same check, but its own 5 s upstream
+    /// inactivity select fires first for a wait of 5 s from the loop top, so
+    /// this scenario is the one that isolates the check.)
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_free_window_at_the_deadline_does_not_send_the_fragment() {
+        const DEADLINE: Duration = crate::transport::egress_cap::PACED_WAIT_DEADLINE;
+        for (seed, sender) in [(17, Sender::Send), (18, Sender::Pipe)] {
+            let _seed = GlobalRng::seed_guard(seed);
+            let time = VirtualTime::new();
+            let cap = EgressCap::new(500, time.clone());
+            cap.charge_unpaced(cap.burst_bytes() as usize - 1_200);
+            let socket = Arc::new(DemuxSocket::wrap(
+                RecordingSocket::new(&time, None),
+                Some(cap),
+            ));
+            let congestion = window(20 * MAX_DATA_SIZE, &time);
+            let filler = {
+                let (congestion, time) = (congestion.clone(), time.clone());
+                GlobalExecutor::spawn(async move {
+                    time.sleep(Duration::from_secs(1)).await;
+                    let filled = 20 * MAX_DATA_SIZE;
+                    let _token = congestion.on_send_with_token(filled);
+                    // Ticks every millisecond so that the clock steps while
+                    // the stream polls its cwnd wait.
+                    for _ in 0..3_998 {
+                        time.sleep(Duration::from_millis(1)).await;
+                    }
+                    // 100 ns before the deadline, after the stream's last
+                    // poll that sees the window full.
+                    time.sleep(Duration::from_nanos(1_999_900)).await;
+                    congestion.release_flightsize(filled);
+                    Err::<TransferStats, _>(TransportError::ChannelClosed)
+                })
+            };
+            let stream = spawn_stream(
+                StreamSpec {
+                    sender,
+                    fragments: 3,
+                    port: 20_000,
+                    congestion,
+                    bucket: own_connection(&time).1,
+                },
+                &socket,
+                &time,
+            );
+            let results = drive_results(&time, vec![stream]).await;
+            let elapsed = Duration::from_nanos(time.now_nanos());
+            filler.abort();
+            assert!(
+                matches!(results[0], Err(TransportError::OutboundStreamFailed(_))),
+                "{:?}",
+                results[0]
+            );
+            assert_eq!(sent(&socket).len(), 1, "fragment 2 was not sent");
+            assert!(
+                elapsed >= DEADLINE && elapsed < DEADLINE + Duration::from_millis(2),
+                "failed at {elapsed:?}"
+            );
+            let stats = socket.egress_cap().expect("cap").stats();
+            assert_eq!(stats.streams_abandoned.iter().sum::<u64>(), 1);
+        }
+    }
+
+    /// The gap of fragment 1 starts when the stream starts, so a cwnd wait
+    /// before the first fragment counts toward its deadline. The window is
+    /// full until 2.9 s (less than `CWND_WAIT_TIMEOUT`), then the empty
+    /// 100 B/s cap refuses the fragment; the stream fails at 5 s, not 5 s
+    /// after the window freed.
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_first_fragments_cwnd_wait_counts_toward_its_deadline() {
+        const DEADLINE: Duration = crate::transport::egress_cap::PACED_WAIT_DEADLINE;
+        for (seed, sender) in [(19, Sender::Send), (20, Sender::Pipe)] {
+            let _seed = GlobalRng::seed_guard(seed);
+            let time = VirtualTime::new();
+            let cap = EgressCap::new(100, time.clone());
+            cap.charge_unpaced(cap.burst_bytes() as usize);
+            let socket = Arc::new(DemuxSocket::wrap(
+                RecordingSocket::new(&time, None),
+                Some(cap),
+            ));
+            let congestion = window(20 * MAX_DATA_SIZE, &time);
+            let filled = 20 * MAX_DATA_SIZE;
+            let _token = congestion.on_send_with_token(filled);
+            let releaser = {
+                let (congestion, time) = (congestion.clone(), time.clone());
+                GlobalExecutor::spawn(async move {
+                    for _ in 0..2_900 {
+                        time.sleep(Duration::from_millis(1)).await;
+                    }
+                    congestion.release_flightsize(filled);
+                    Err::<TransferStats, _>(TransportError::ChannelClosed)
+                })
+            };
+            let stream = spawn_stream(
+                StreamSpec {
+                    sender,
+                    fragments: 2,
+                    port: 20_000,
+                    congestion,
+                    bucket: own_connection(&time).1,
+                },
+                &socket,
+                &time,
+            );
+            let results = drive_results(&time, vec![stream]).await;
+            let elapsed = Duration::from_nanos(time.now_nanos());
+            releaser.abort();
+            assert!(
+                matches!(results[0], Err(TransportError::OutboundStreamFailed(_))),
+                "{:?}",
+                results[0]
+            );
+            assert_eq!(sent(&socket).len(), 0, "nothing was sent");
+            assert!(
+                elapsed >= DEADLINE && elapsed < DEADLINE + Duration::from_millis(5),
+                "failed at {elapsed:?}, expected the deadline from the start"
             );
             let stats = socket.egress_cap().expect("cap").stats();
             assert_eq!(stats.streams_abandoned.iter().sum::<u64>(), 1);
