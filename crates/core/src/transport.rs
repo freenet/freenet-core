@@ -356,10 +356,10 @@ pub(crate) use self::connection_handler::{UdpTransportConfig, open_udp_transport
 pub use self::crypto::{TransportKeypair, TransportPublicKey};
 /// Returned (wrapped around the socket type) by [`create_connection_handler`].
 pub use self::demux::DemuxSocket;
-/// Named by [`Socket::egress_cap`] and [`Socket::send_to_reserved`]; only the
+/// Named by [`Socket::egress_cap`] and [`Socket::send_to_paced`]; only the
 /// transport itself can construct or use them.
 #[doc(hidden)]
-pub use self::egress_cap::{EgressCap, EgressHold};
+pub use self::egress_cap::{EgressCap, EgressTake};
 pub use self::{
     connection_handler::{InboundConnectionHandler, OutboundConnectionHandler},
     peer_connection::PeerConnection,
@@ -573,27 +573,27 @@ pub trait Socket: Sized + Send + Sync + 'static {
 
     /// The node-wide egress cap this socket charges, if any. Only
     /// [`DemuxSocket`] can have one (when `total-bandwidth-limit` is set);
-    /// every other socket returns `None`. Pacing points read it through
-    /// `egress_cap::pace`.
+    /// every other socket returns `None`. Pacing points take from it through
+    /// `egress_cap::try_take`.
     #[doc(hidden)]
     fn egress_cap(&self) -> Option<&EgressCap> {
         None
     }
 
-    /// Send a datagram whose bytes a pacing point already reserved from
-    /// [`Self::egress_cap`]. The socket replaces the reservation with the
-    /// datagram's real size instead of charging it a second time.
+    /// Send a datagram whose bytes a pacing point already took from
+    /// [`Self::egress_cap`]. The socket returns what the datagram did not use
+    /// instead of charging it a second time.
     ///
-    /// A hold exists only for a socket with a cap, so the default (for
-    /// sockets without one) just returns the reservation and sends.
+    /// A take exists only for a socket with a cap, so the default (for
+    /// sockets without one) just returns the take and sends.
     #[doc(hidden)]
-    fn send_to_reserved(
+    fn send_to_paced(
         &self,
         buf: &[u8],
         target: SocketAddr,
-        hold: EgressHold<'_>,
+        take: EgressTake<'_>,
     ) -> impl Future<Output = io::Result<usize>> + Send {
-        drop(hold);
+        drop(take);
         self.send_to(buf, target)
     }
 }

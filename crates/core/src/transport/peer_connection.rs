@@ -3231,12 +3231,12 @@ async fn packet_sending<S: super::Socket, T: crate::simulation::TimeSource>(
 
 /// [`packet_sending`] for a payload a pacing point has already waited for.
 ///
-/// `egress_hold` is the reservation the pacing point made with
-/// `egress_cap::pace` (`None` when the socket has no cap). The payload's
-/// datagram is sent with it, so it is charged once at its real size;
-/// receipts that do not fit beside the payload go in separate datagrams that
-/// are charged unpaced. If the payload is not sent (serialization fails),
-/// dropping the hold returns the reservation.
+/// `egress_take` is what the pacing point took with `egress_cap::try_take`
+/// (`None` when the socket has no cap). The payload's datagram is sent with
+/// it, so it is charged once at its real size; receipts that do not fit
+/// beside the payload go in separate datagrams that are charged unpaced. If
+/// the payload is not sent (serialization fails), dropping the take returns
+/// it.
 #[allow(clippy::too_many_arguments)]
 async fn packet_sending_paced<S: super::Socket, T: crate::simulation::TimeSource>(
     remote_addr: SocketAddr,
@@ -3250,7 +3250,7 @@ async fn packet_sending_paced<S: super::Socket, T: crate::simulation::TimeSource
     delivery_token: Option<DeliveryRateToken>,
     stream: PacketStream,
     next_packet_id: &AtomicU32,
-    egress_hold: Option<super::egress_cap::EgressHold<'_>>,
+    egress_take: Option<super::egress_cap::EgressTake<'_>>,
 ) -> Result<()> {
     let start_time = tokio::time::Instant::now();
     tracing::trace!(
@@ -3285,12 +3285,8 @@ async fn packet_sending_paced<S: super::Socket, T: crate::simulation::TimeSource
                 "Sending single packet"
             );
             let packet_data = packet.prepared_send();
-            let sent = match egress_hold {
-                Some(hold) => {
-                    socket
-                        .send_to_reserved(&packet_data, remote_addr, hold)
-                        .await
-                }
+            let sent = match egress_take {
+                Some(take) => socket.send_to_paced(&packet_data, remote_addr, take).await,
                 None => socket.send_to(&packet_data, remote_addr).await,
             };
             match sent {
@@ -3350,8 +3346,8 @@ async fn packet_sending_paced<S: super::Socket, T: crate::simulation::TimeSource
                 vec![],
             )?
             .prepared_send();
-            match egress_hold {
-                Some(hold) => socket.send_to_reserved(&packet, remote_addr, hold).await,
+            match egress_take {
+                Some(take) => socket.send_to_paced(&packet, remote_addr, take).await,
                 None => socket.send_to(&packet, remote_addr).await,
             }
             .map_err(|e| TransportError::send_failed(remote_addr, e.kind()))?;

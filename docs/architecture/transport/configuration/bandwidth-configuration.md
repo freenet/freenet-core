@@ -188,7 +188,7 @@ Only one kind of send waits for the bucket:
 
 | Send | Behaviour when the bucket is empty |
 |------|------------------------------------|
-| Stream fragments (`send_stream`, `pipe_stream`) | Wait for their turn after cwnd admission and the per-connection token bucket, then re-check cwnd; a fragment the window no longer admits gives its turn back and waits for cwnd again. Concurrent streams are served in the order they asked. |
+| Stream fragments (`send_stream`, `pipe_stream`) | After cwnd admission, take the datagram from the per-connection bucket and the node-wide bucket at the same moment, and send at once. If either is short, take nothing, sleep for the deficit (with ±20% jitter) and start again from the cwnd check. Nothing is held while waiting, and there is no order among waiting streams. |
 | Everything else (handshakes, short messages, ACKs, receipts, keepalives, Pongs, retransmissions) | Sent at once and charged once sent. The bucket goes into debt, and the next stream fragments wait longer to pay it. |
 
 The sends that never wait are sent from places that must not block: the receive path
@@ -198,22 +198,18 @@ handshake tasks, and the keepalive task. A failed send is not charged.
 
 What this guarantees:
 
-- Stream fragments alone never exceed the bucket: in any window, at most the burst
-  plus the cap times the window.
-- Unpaced sends are added on top as debt, up to one second of the cap ahead of now. An
-  unpaced send beyond that is still sent but not charged ("forgiven"). So the total
-  holds on average only while less than one second of stream data is queued, and even
-  then can exceed the cap over a short window by the unpaced bytes in it. With more
-  than one second of stream data queued, control traffic is not charged at all: the
-  node sends the cap plus all of its control traffic.
-- Forgiven bytes are counted by cause: `egress_forgiven_debt_over_limit_bytes` (unpaced
-  traffic alone exceeded the cap for over a second) and
-  `egress_forgiven_queue_past_limit_bytes` (more than a second of stream data was
-  queued, so control traffic went out uncharged).
-- A stream fragment waits for everything queued before it, and nothing bounds that
-  queue except the number of streams in flight. With `N` concurrent streams and a cap
-  of `C` bytes/s, each stream gets one 1200-byte fragment about every `N * 1200 / C`
-  seconds, plus the time to pay off any unpaced debt (up to one second).
+- Over any interval ending at a stream fragment's send, the node sends at most the
+  burst plus the cap times the interval, control traffic included: a fragment is sent
+  only when the bucket is not in debt.
+- Over other intervals the node can send more, by the control-traffic debt not yet
+  paid off. That debt is limited to one second of the cap; a control datagram beyond
+  it is still sent but not charged ("forgiven", counted as
+  `egress_debt_forgiven_bytes`). So the cap holds on average, and forgiven bytes mean
+  control traffic alone exceeded the cap for over a second.
+- There is no order among waiting streams. Each gets a fragment about every
+  `N * 1200 / C` seconds on average with `N` concurrent streams at a cap of `C`
+  bytes/s, with occasional longer gaps (several times that), since the stream that
+  wakes when the bucket has room takes it.
 
 Without `total-bandwidth-limit` no bucket exists and nothing changes. A
 `total-bandwidth-limit` of 0 is ignored with a warning.
@@ -227,9 +223,8 @@ The `transport_snapshot` telemetry event carries, per period: `egress_immediate`
 `egress_waited` and `egress_unpaced` (datagrams by how they were paced),
 `egress_bytes`, `egress_bytes_waited`, `egress_wait_us_sum`, `egress_wait_us_max`,
 `egress_long_waits` (stream fragments that waited at least 2.5 s, half the receiver's
-5 s stream inactivity timeout), `egress_backlog_hwm_bytes` (the largest amount
-charged or reserved ahead of the rate: unpaced debt plus queued stream fragments) and
-the two `egress_forgiven_*_bytes` fields above. All are zero without a cap. A wait of 2.5 s or more is
+5 s stream inactivity timeout), `egress_debt_hwm_bytes` (the largest control-traffic
+debt) and `egress_debt_forgiven_bytes`. All are zero without a cap. A wait of 2.5 s or more is
 also logged at WARN, at most once a minute.
 
 ### Example: 1 Gbps Connection
@@ -444,18 +439,12 @@ freenet --total-bandwidth-limit 50000000 --min-bandwidth-per-connection 2000000
 
 ### Total bandwidth exceeding limit
 
-The egress cap holds the average at `total-bandwidth-limit` while less than a second
-of stream data is queued. Short bursts above it are the unpaced sends (ACKs,
-retransmissions, handshakes, keepalives, short messages); check `egress_unpaced` and
-the forgiven-bytes fields in the `transport_snapshot` telemetry:
-
-- `egress_forgiven_debt_over_limit_bytes` above zero: unpaced traffic alone exceeded
-  the cap for more than a second. Raise the total, or lower
-  `max-number-of-connections`.
-- `egress_forgiven_queue_past_limit_bytes` above zero: more than a second of stream
-  data was queued behind the cap, and the node sent its control traffic on top of the
-  cap. The cap is too low for the number of concurrent streams; raise it (see below).
-  `egress_backlog_hwm_bytes` above one second of the cap confirms it.
+The egress cap holds the average at `total-bandwidth-limit`. Short bursts above it
+are the unpaced sends (ACKs, retransmissions, handshakes, keepalives, short
+messages); check `egress_unpaced`, `egress_debt_hwm_bytes` and
+`egress_debt_forgiven_bytes` in the `transport_snapshot` telemetry. Forgiven bytes
+mean unpaced traffic alone exceeded the cap for more than a second: raise the total,
+or lower `max-number-of-connections`.
 
 ### Transfers slow or failing under a low total
 

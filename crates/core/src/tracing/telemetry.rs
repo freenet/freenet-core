@@ -2915,16 +2915,12 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                 serde_json::json!(snapshot.egress_long_waits),
             );
             m.insert(
-                "egress_backlog_hwm_bytes".into(),
-                serde_json::json!(snapshot.egress_backlog_hwm_bytes),
+                "egress_debt_hwm_bytes".into(),
+                serde_json::json!(snapshot.egress_debt_hwm_bytes),
             );
             m.insert(
-                "egress_forgiven_debt_over_limit_bytes".into(),
-                serde_json::json!(snapshot.egress_forgiven_debt_over_limit_bytes),
-            );
-            m.insert(
-                "egress_forgiven_queue_past_limit_bytes".into(),
-                serde_json::json!(snapshot.egress_forgiven_queue_past_limit_bytes),
+                "egress_debt_forgiven_bytes".into(),
+                serde_json::json!(snapshot.egress_debt_forgiven_bytes),
             );
             serde_json::Value::Object(m)
         }
@@ -6600,9 +6596,8 @@ mod tests {
             egress_wait_us_sum: 28,
             egress_wait_us_max: 29,
             egress_long_waits: 24,
-            egress_backlog_hwm_bytes: 30,
-            egress_forgiven_debt_over_limit_bytes: 31,
-            egress_forgiven_queue_past_limit_bytes: 32,
+            egress_debt_hwm_bytes: 30,
+            egress_debt_forgiven_bytes: 31,
             ..Default::default()
         };
         let reference = serde_json::to_value(&snapshot).unwrap();
@@ -6637,9 +6632,8 @@ mod tests {
             ("egress_wait_us_sum", 28),
             ("egress_wait_us_max", 29),
             ("egress_long_waits", 24),
-            ("egress_backlog_hwm_bytes", 30),
-            ("egress_forgiven_debt_over_limit_bytes", 31),
-            ("egress_forgiven_queue_past_limit_bytes", 32),
+            ("egress_debt_hwm_bytes", 30),
+            ("egress_debt_forgiven_bytes", 31),
         ] {
             assert_eq!(json[key], expected, "event-log value for {key}");
             assert_eq!(json[key], reference[key], "serde value for {key}");

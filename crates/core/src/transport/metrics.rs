@@ -158,21 +158,6 @@ labelled_counters! {
 }
 
 labelled_counters! {
-    /// Why the node-wide egress cap did not charge some unpaced bytes
-    /// (`transport::egress_cap`). Exported per period as
-    /// `egress_forgiven_<label>_bytes`.
-    pub(crate) enum ForgivenCause {
-        /// Unpaced debt alone reached the debt limit (one second of the
-        /// cap): unpaced traffic exceeded the cap for over a second.
-        DebtOverLimit => "debt_over_limit",
-        /// Queued stream fragments already reached past the debt limit, so
-        /// no unpaced byte could be charged: while this lasts, control
-        /// traffic is sent on top of the cap.
-        QueuePastLimit => "queue_past_limit",
-    }
-}
-
-labelled_counters! {
     /// How a datagram the node sent was paced by the node-wide egress cap
     /// (`transport::egress_cap`). Exactly one per datagram sent while a cap
     /// is configured, recorded when it is charged after a successful send;
@@ -406,11 +391,10 @@ struct EgressCounters {
     wait_us_max: AtomicU64,
     /// Paced datagrams that waited at least `egress_cap::LONG_WAIT`.
     long_waits: AtomicU64,
-    /// Largest backlog after a charge, in bytes: unpaced debt plus queued
-    /// paced reservations.
-    backlog_hwm_bytes: AtomicU64,
-    /// Unpaced bytes not charged, by [`ForgivenCause`].
-    forgiven_bytes: [AtomicU64; ForgivenCause::COUNT],
+    /// Largest unpaced debt after a charge, in bytes.
+    debt_hwm_bytes: AtomicU64,
+    /// Unpaced bytes forgiven because the debt reached the debt limit.
+    debt_forgiven_bytes: AtomicU64,
 }
 
 /// Period counters for packet loss, retransmission and standalone-ACK
@@ -1162,16 +1146,18 @@ impl TransportMetrics {
         }
     }
 
-    /// Record the egress cap's backlog after a charge, in bytes.
-    pub(crate) fn record_egress_backlog(&self, backlog_bytes: u64) {
+    /// Record the egress cap's unpaced debt after a charge, in bytes.
+    pub(crate) fn record_egress_debt(&self, debt_bytes: u64) {
         self.egress
-            .backlog_hwm_bytes
-            .fetch_max(backlog_bytes, Ordering::Relaxed);
+            .debt_hwm_bytes
+            .fetch_max(debt_bytes, Ordering::Relaxed);
     }
 
-    /// Record unpaced bytes the egress cap sent without charging, by cause.
-    pub(crate) fn record_egress_forgiven(&self, cause: ForgivenCause, bytes: u64) {
-        self.egress.forgiven_bytes[cause as usize].fetch_add(bytes, Ordering::Relaxed);
+    /// Record egress debt forgiven because it exceeded the debt limit.
+    pub(crate) fn record_egress_forgiven(&self, bytes: u64) {
+        self.egress
+            .debt_forgiven_bytes
+            .fetch_add(bytes, Ordering::Relaxed);
     }
 
     /// Record `n` recent traversal failures the listener forgot early
@@ -1571,13 +1557,8 @@ impl TransportMetrics {
             egress_wait_us_sum: get64(&egress.wait_us_sum),
             egress_wait_us_max: get64(&egress.wait_us_max),
             egress_long_waits: get64(&egress.long_waits),
-            egress_backlog_hwm_bytes: get64(&egress.backlog_hwm_bytes),
-            egress_forgiven_debt_over_limit_bytes: get64(
-                &egress.forgiven_bytes[ForgivenCause::DebtOverLimit as usize],
-            ),
-            egress_forgiven_queue_past_limit_bytes: get64(
-                &egress.forgiven_bytes[ForgivenCause::QueuePastLimit as usize],
-            ),
+            egress_debt_hwm_bytes: get64(&egress.debt_hwm_bytes),
+            egress_debt_forgiven_bytes: get64(&egress.debt_forgiven_bytes),
         }
     }
 
@@ -1993,9 +1974,9 @@ pub struct TransportSnapshot {
     /// paced them, by [`EgressDecision`], with their bytes, the bytes and
     /// total and longest wait (microseconds) of those that waited, the
     /// number of waits of at least `egress_cap::LONG_WAIT` (2.5 s), the
-    /// largest backlog in bytes (unpaced debt plus queued paced
-    /// reservations), and the unpaced bytes sent but not charged, by
-    /// [`ForgivenCause`]. All zero unless `total-bandwidth-limit` is set.
+    /// largest unpaced debt in bytes, and the unpaced bytes forgiven
+    /// (sent, not charged) at the debt limit.
+    /// All zero unless `total-bandwidth-limit` is set.
     pub egress_immediate: u64,
     pub egress_waited: u64,
     pub egress_unpaced: u64,
@@ -2004,9 +1985,8 @@ pub struct TransportSnapshot {
     pub egress_wait_us_sum: u64,
     pub egress_wait_us_max: u64,
     pub egress_long_waits: u64,
-    pub egress_backlog_hwm_bytes: u64,
-    pub egress_forgiven_debt_over_limit_bytes: u64,
-    pub egress_forgiven_queue_past_limit_bytes: u64,
+    pub egress_debt_hwm_bytes: u64,
+    pub egress_debt_forgiven_bytes: u64,
 }
 
 /// Per-connection RTT distribution fields of [`TransportSnapshot`]; see the
@@ -2093,9 +2073,8 @@ impl TransportSnapshot {
             egress_wait_us_sum,
             egress_wait_us_max,
             egress_long_waits,
-            egress_backlog_hwm_bytes,
-            egress_forgiven_debt_over_limit_bytes,
-            egress_forgiven_queue_past_limit_bytes,
+            egress_debt_hwm_bytes,
+            egress_debt_forgiven_bytes,
         } = extras;
         self.conn_rtt_connections = conn_rtt_connections;
         self.conn_srtt_p50_us = conn_srtt_p50_us;
@@ -2160,9 +2139,8 @@ impl TransportSnapshot {
         self.egress_wait_us_sum = egress_wait_us_sum;
         self.egress_wait_us_max = egress_wait_us_max;
         self.egress_long_waits = egress_long_waits;
-        self.egress_backlog_hwm_bytes = egress_backlog_hwm_bytes;
-        self.egress_forgiven_debt_over_limit_bytes = egress_forgiven_debt_over_limit_bytes;
-        self.egress_forgiven_queue_past_limit_bytes = egress_forgiven_queue_past_limit_bytes;
+        self.egress_debt_hwm_bytes = egress_debt_hwm_bytes;
+        self.egress_debt_forgiven_bytes = egress_debt_forgiven_bytes;
         self
     }
 }
@@ -2289,9 +2267,8 @@ struct SnapshotExtras {
     /// paced them, by [`EgressDecision`], with their bytes, the bytes and
     /// total and longest wait (microseconds) of those that waited, the
     /// number of waits of at least `egress_cap::LONG_WAIT` (2.5 s), the
-    /// largest backlog in bytes (unpaced debt plus queued paced
-    /// reservations), and the unpaced bytes sent but not charged, by
-    /// [`ForgivenCause`].
+    /// largest unpaced debt in bytes, and the unpaced bytes forgiven
+    /// (sent, not charged) at the debt limit.
     /// All zero unless `total-bandwidth-limit` is set.
     pub egress_immediate: u64,
     pub egress_waited: u64,
@@ -2301,9 +2278,8 @@ struct SnapshotExtras {
     pub egress_wait_us_sum: u64,
     pub egress_wait_us_max: u64,
     pub egress_long_waits: u64,
-    pub egress_backlog_hwm_bytes: u64,
-    pub egress_forgiven_debt_over_limit_bytes: u64,
-    pub egress_forgiven_queue_past_limit_bytes: u64,
+    pub egress_debt_hwm_bytes: u64,
+    pub egress_debt_forgiven_bytes: u64,
 }
 
 impl SnapshotExtras {
@@ -2351,14 +2327,13 @@ impl SnapshotExtras {
             || self.demux_legacy != 0
             || self.demux_quic != 0
             || self.demux_other != 0
-            // The backlog high-water mark and the long-wait count alone are
+            // The debt high-water mark and the long-wait count alone are
             // not activity: both are only set by a charge, which also counts
             // a packet.
             || self.egress_immediate != 0
             || self.egress_waited != 0
             || self.egress_unpaced != 0
-            || self.egress_forgiven_debt_over_limit_bytes != 0
-            || self.egress_forgiven_queue_past_limit_bytes != 0
+            || self.egress_debt_forgiven_bytes != 0
     }
 }
 
@@ -3222,7 +3197,6 @@ mod tests {
         check(&DialQueueWait::ALL, |v| v as usize, DialQueueWait::label);
         check(&DemuxClass::ALL, |v| v as usize, DemuxClass::label);
         check(&EgressDecision::ALL, |v| v as usize, EgressDecision::label);
-        check(&ForgivenCause::ALL, |v| v as usize, ForgivenCause::label);
     }
 
     /// The snapshot fields carrying an origin's period attempts and
@@ -3372,7 +3346,7 @@ mod tests {
     }
 
     /// Egress cap counts reach the snapshot per decision, with bytes, waits,
-    /// long waits, backlog and forgiveness, and all reset with it.
+    /// long waits, debt and forgiveness, and all reset with it.
     #[test]
     fn egress_counts_snapshot_and_reset() {
         let metrics = TransportMetrics::new();
@@ -3386,10 +3360,9 @@ mod tests {
             }
         }
         metrics.record_egress(EgressDecision::Waited, 100, 3_000_000, true);
-        metrics.record_egress_backlog(5_000);
-        metrics.record_egress_backlog(2_000);
-        metrics.record_egress_forgiven(ForgivenCause::DebtOverLimit, 7);
-        metrics.record_egress_forgiven(ForgivenCause::QueuePastLimit, 9);
+        metrics.record_egress_debt(5_000);
+        metrics.record_egress_debt(2_000);
+        metrics.record_egress_forgiven(7);
         let read = metrics.read_snapshot();
         let snap = metrics.take_snapshot().expect("egress counts are activity");
         for s in [&read, &snap] {
@@ -3402,19 +3375,15 @@ mod tests {
             assert_eq!(s.egress_wait_us_sum, 2 * 300 + 3_000_000);
             assert_eq!(s.egress_wait_us_max, 3_000_000);
             assert_eq!(s.egress_long_waits, 1);
-            assert_eq!(s.egress_backlog_hwm_bytes, 5_000);
-            assert_eq!(s.egress_forgiven_debt_over_limit_bytes, 7);
-            assert_eq!(s.egress_forgiven_queue_past_limit_bytes, 9);
+            assert_eq!(s.egress_debt_hwm_bytes, 5_000);
+            assert_eq!(s.egress_debt_forgiven_bytes, 7);
         }
         assert!(
             metrics.take_snapshot().is_none(),
             "egress counts must reset"
         );
         let after = metrics.read_snapshot();
-        assert_eq!(
-            after.egress_backlog_hwm_bytes, 0,
-            "the high-water mark resets"
-        );
+        assert_eq!(after.egress_debt_hwm_bytes, 0, "the high-water mark resets");
     }
 
     /// Evictions from the recent-failure table reach the snapshot, count as
@@ -3500,12 +3469,12 @@ mod tests {
                 .unwrap_or_else(|| panic!("{decision:?} alone must be activity"));
             assert_eq!(egress_count(&snap, decision), 1, "{decision:?}");
         }
-        for cause in ForgivenCause::ALL {
+        {
             let metrics = TransportMetrics::new();
-            metrics.record_egress_forgiven(cause, 1);
+            metrics.record_egress_forgiven(1);
             assert!(
                 metrics.take_snapshot().is_some(),
-                "{cause:?} forgiveness alone must be activity"
+                "forgiven debt alone must be activity"
             );
         }
         for class in DemuxClass::ALL {
@@ -3543,9 +3512,6 @@ mod tests {
         }
         for decision in EgressDecision::ALL {
             keys.push(format!("egress_{}", decision.label()));
-        }
-        for cause in ForgivenCause::ALL {
-            keys.push(format!("egress_forgiven_{}_bytes", cause.label()));
         }
         for bucket in DialQueueWait::ALL {
             keys.push(format!("dial_queue_wait_{}", bucket.label()));
@@ -3764,9 +3730,8 @@ mod tests {
             "egress_wait_us_sum",
             "egress_wait_us_max",
             "egress_long_waits",
-            "egress_backlog_hwm_bytes",
-            "egress_forgiven_debt_over_limit_bytes",
-            "egress_forgiven_queue_past_limit_bytes",
+            "egress_debt_hwm_bytes",
+            "egress_debt_forgiven_bytes",
         ] {
             assert!(obj.contains_key(key), "missing key {key}");
         }

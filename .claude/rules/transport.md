@@ -81,12 +81,17 @@ DemuxSocket owns one EgressCap (token bucket, allowed to go into debt) when
 total-bandwidth-limit is set, and charges EVERY datagram it sends. No setting
 → no cap → one Option check per send.
 
-Only stream fragment tasks WAIT for the bucket (send_stream, pipe_stream:
-egress_cap::pace, sleeping on the caller's TimeSource, then
-Socket::send_to_reserved), after cwnd admission and the per-connection
-bucket, and cwnd is re-checked after the wait (see below). Everything else
-goes through plain send_to and is charged once sent (a failed send is not
-charged), into debt.
+Only stream fragment tasks WAIT for the bucket (send_stream, pipe_stream).
+With a cap, each admission attempt is: cwnd check, per-connection
+TokenBucket::try_take, node-wide egress_cap::try_take, back to back with no
+await before the send; if either bucket is short, take nothing (give the
+per-connection bytes back), sleep the jittered deficit, and start again from
+the cwnd check. Nothing is held while waiting: no reservations, no order
+among waiters. The take is PACED_TAKE_BYTES (MAX_PACKET_SIZE); the socket
+returns what the datagram did not use (Socket::send_to_paced), and all of it
+on a failed send. Without a cap the per-connection bucket keeps its old
+reserve-and-sleep path. Everything else goes through plain send_to and is
+charged once sent (a failed send is not charged), into debt.
 
 NEVER add a wait to: the listener loop, the handshake tasks
 (gateway_connection / traverse_nat), the keepalive task, outbound_short_message
@@ -95,25 +100,15 @@ polling recv), or anything inside PeerConnection::recv (ACKs, Pong, receipts,
 retransmits, ack_ok). recv is a cancellable select! branch that changes state
 before it sends (answered_connection_ack, receipts taken before the NoOp).
 
-A pacing point reserves PACED_RESERVATION_BYTES (MAX_PACKET_SIZE), an upper
-bound: an under-estimate lets every queued sender go early by the shortfall
-(seen: 20 streams x 41 bytes over the bound). An unpaced charge adds debt only
-up to now + DEBT_LIMIT (1 s at the cap) and never moves the queue end back
-(that erased queued reservations and let paced traffic exceed the cap); the
-rest is forgiven (sent uncharged) and counted by cause. So with more than
-DEBT_LIMIT of paced data queued, control traffic is not charged at all
-(egress_forgiven_queue_past_limit_bytes); the cap holds on average only while
-less is queued. A hold returns only the part of its slot not yet passed
-(release and settle), and a send after its slot ended is charged for the
-lateness: never hold a reservation through another wait (cwnd), since the
-bucket refills over it. Admission order: cwnd, per-connection bucket, egress
-pace, then RE-CHECK cwnd; on a miss release the hold and wait for cwnd again.
-Paced waits are NOT bounded by DEBT_LIMIT: a
-fragment waits for every reservation before it, about N streams x 1200 / cap;
-waits >= LONG_WAIT (2.5 s, half STREAM_INACTIVITY_TIMEOUT) are counted
-(egress_long_waits) and logged at WARN once a minute. A quinn endpoint will
-need a poll-based admission (poll_ready + try_admit over reserve's
-predicate); not built yet.
+Unpaced debt is capped at DEBT_LIMIT (1 s at the cap); the rest is forgiven
+(sent uncharged) and counted. Over any interval ending at a paced send the
+node sends at most burst + rate x interval. Earlier designs with
+reservations (holds, settle, release, refunds) were removed after three
+review rounds each found the new reservation code to be the bug: do not
+bring reservations back. Waits >= LONG_WAIT (2.5 s, half
+STREAM_INACTIVITY_TIMEOUT) are counted (egress_long_waits) and logged at WARN
+once a minute. A quinn endpoint will need a poll-based admission (poll_ready
++ try_admit over try_take's predicate); not built yet.
 Tests assert on per-cap EgressCap::stats(), never the global counters.
 ```
 
@@ -267,8 +262,8 @@ joiner dial-queue waits (`dial_queue_wait_<label>`, coarse buckets around the
 dropped; see "Socket Abstraction Rules") and outbound datagrams by how the
 node-wide egress cap paced them (`egress_<label>`, one per `EgressDecision`,
 plus `egress_bytes`, `egress_bytes_waited`, `egress_wait_us_sum` / `_max`,
-`egress_long_waits`, `egress_backlog_hwm_bytes` (unpaced debt plus queued
-reservations), `egress_forgiven_<cause>_bytes`; all zero without
+`egress_long_waits`, `egress_debt_hwm_bytes`, `egress_debt_forgiven_bytes`;
+all zero without
 `total-bandwidth-limit`). Each label set is declared once in a
 `labelled_counters!` list, so a new variant needs a snapshot field. Hot
 path writes are single relaxed atomics; `SentPacketTracker` keeps an

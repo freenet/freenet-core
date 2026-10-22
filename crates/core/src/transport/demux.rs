@@ -12,7 +12,7 @@ use std::net::SocketAddr;
 
 use super::Socket;
 use super::crypto::{PACKET_TYPE_INTRO, PACKET_TYPE_SYMMETRIC};
-use super::egress_cap::{EgressCap, EgressHold};
+use super::egress_cap::{EgressCap, EgressTake};
 use super::metrics::{DemuxClass, TRANSPORT_METRICS};
 
 /// Bits of a QUIC packet's first byte of which at least one is always set.
@@ -144,21 +144,21 @@ impl<S: Socket> Socket for DemuxSocket<S> {
         self.egress.as_ref()
     }
 
-    /// Sends, then replaces the hold's reservation with the bytes sent. On a
-    /// failed send the hold is dropped, which returns the reservation.
-    async fn send_to_reserved(
+    /// Sends, then returns what the datagram did not use of the take. On a
+    /// failed send the take is dropped, which returns all of it.
+    async fn send_to_paced(
         &self,
         buf: &[u8],
         target: SocketAddr,
-        hold: EgressHold<'_>,
+        take: EgressTake<'_>,
     ) -> io::Result<usize> {
         match self.inner.send_to(buf, target).await {
             Ok(sent) => {
-                hold.settle(sent);
+                take.sent(sent);
                 Ok(sent)
             }
             Err(e) => {
-                drop(hold);
+                drop(take);
                 Err(e)
             }
         }
