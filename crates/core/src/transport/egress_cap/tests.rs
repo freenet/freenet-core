@@ -360,10 +360,7 @@ fn the_warnings_are_rate_limited_separately() {
     // Abandoned streams inside the interval are counted for the next WARN.
     cap.record_abandoned(WaitCause::Cap, PACED_WAIT_DEADLINE);
     cap.record_abandoned(WaitCause::Cap, PACED_WAIT_DEADLINE);
-    assert_eq!(
-        cap.abandoned_since_warn.count[WaitCause::Cap as usize].load(Ordering::Relaxed),
-        2
-    );
+    assert_eq!(cap.abandoned_since_warn.pending(WaitCause::Cap).0, 2);
     time.advance(LONG_WAIT_WARN_INTERVAL - Duration::from_millis(1));
     assert!(!cap.warn_due(&cap.last_long_wait_warn_ns));
     time.advance(Duration::from_millis(1));
@@ -373,10 +370,7 @@ fn the_warnings_are_rate_limited_separately() {
     );
     // The next abandoned stream logs, with the count, and resets it.
     cap.record_abandoned(WaitCause::Cap, PACED_WAIT_DEADLINE);
-    assert_eq!(
-        cap.abandoned_since_warn.count[WaitCause::Cap as usize].load(Ordering::Relaxed),
-        0
-    );
+    assert_eq!(cap.abandoned_since_warn.pending(WaitCause::Cap).0, 0);
 }
 
 #[test]
@@ -760,4 +754,53 @@ fn the_warnings_report_each_cause_with_its_own_count_and_remedy() {
             assert!(line.contains(remedy(*cause_enum)), "{line}");
         }
     }
+}
+
+/// A drain returns each cause's count with the longest gap of exactly those
+/// events, and starts both afresh.
+#[test]
+fn a_warn_window_drains_count_and_longest_gap_together() {
+    let window = WarnWindow::default();
+    window.add(WaitCause::Cap, Duration::from_secs(3));
+    window.add(WaitCause::Cap, Duration::from_secs(1));
+    window.add(WaitCause::Other, Duration::from_secs(2));
+    assert_eq!(window.drain(), [(2, 3_000), (0, 0), (1, 2_000)]);
+    window.add(WaitCause::Cap, Duration::from_secs(1));
+    assert_eq!(window.drain(), [(1, 1_000), (0, 0), (0, 0)], "max reset");
+    assert_eq!(window.drain(), [(0, 0); WaitCause::COUNT]);
+}
+
+/// Adds racing a drain are never lost or split: every drained pair with a
+/// count has the gap of an event, and the counts add up.
+#[test]
+fn a_warn_window_does_not_tear_under_concurrent_adds() {
+    const THREADS: u64 = 4;
+    const EACH: u64 = 20_000;
+    let window = std::sync::Arc::new(WarnWindow::default());
+    let done = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let adders: Vec<_> = (1..=THREADS)
+        .map(|n| {
+            let (window, done) = (window.clone(), done.clone());
+            std::thread::spawn(move || {
+                for _ in 0..EACH {
+                    window.add(WaitCause::Cap, Duration::from_millis(n));
+                }
+                done.fetch_add(1, Ordering::SeqCst);
+            })
+        })
+        .collect();
+    let mut total = 0;
+    let drain = |total: &mut u64| {
+        let (count, longest) = window.drain()[WaitCause::Cap as usize];
+        assert_eq!(count > 0, longest > 0, "torn: {count} events, {longest} ms");
+        *total += count;
+    };
+    while done.load(Ordering::SeqCst) < THREADS {
+        drain(&mut total);
+    }
+    drain(&mut total);
+    for adder in adders {
+        adder.join().unwrap();
+    }
+    assert_eq!(total, THREADS * EACH);
 }

@@ -173,27 +173,31 @@ struct StatCounters {
 
 /// What a rate-limited WARN reports: per [`WaitCause`], how many events
 /// happened since it was last logged and the longest gap among them. Each
-/// cause has its own remedy, so the counts are not pooled.
+/// cause has its own remedy, so the counts are not pooled. Each cause's
+/// `(count, longest gap in ms)` pair is behind one lock so a drain cannot
+/// pair one event's gap with another window's count; this path is rare (a
+/// gap of at least [`LONG_WAIT`]), never per packet.
 #[derive(Default)]
 struct WarnWindow {
-    count: [AtomicU64; WaitCause::COUNT],
-    longest_gap_ms: [AtomicU64; WaitCause::COUNT],
+    pairs: [parking_lot::Mutex<(u64, u64)>; WaitCause::COUNT],
 }
 
 impl WarnWindow {
     fn add(&self, cause: WaitCause, gap: Duration) {
-        self.count[cause as usize].fetch_add(1, Ordering::Relaxed);
-        self.longest_gap_ms[cause as usize].fetch_max(gap.as_millis() as u64, Ordering::Relaxed);
+        let mut pair = self.pairs[cause as usize].lock();
+        pair.0 += 1;
+        pair.1 = pair.1.max(gap.as_millis() as u64);
     }
 
     /// Take and reset each cause's `(count, longest gap in ms)`.
     fn drain(&self) -> [(u64, u64); WaitCause::COUNT] {
-        WaitCause::ALL.map(|cause| {
-            (
-                self.count[cause as usize].swap(0, Ordering::Relaxed),
-                self.longest_gap_ms[cause as usize].swap(0, Ordering::Relaxed),
-            )
-        })
+        WaitCause::ALL.map(|cause| std::mem::take(&mut *self.pairs[cause as usize].lock()))
+    }
+
+    /// The `(count, longest gap in ms)` pending for `cause`.
+    #[cfg(test)]
+    fn pending(&self, cause: WaitCause) -> (u64, u64) {
+        *self.pairs[cause as usize].lock()
     }
 }
 
