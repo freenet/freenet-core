@@ -85,9 +85,13 @@ Only stream fragment tasks WAIT for the bucket (send_stream, pipe_stream).
 With a cap, each admission attempt is: cwnd check, per-connection
 TokenBucket::try_take, node-wide egress_cap::try_take, back to back with no
 await before the send; if either bucket is short, take nothing (give the
-per-connection bytes back), sleep the jittered deficit, and start again from
-the cwnd check. Nothing is held while waiting: no reservations, no order
-among waiters. The take is PACED_TAKE_BYTES (MAX_PACKET_SIZE); the socket
+per-connection bytes back), sleep through PacedWait (deficit x U[1.0, 1.4)
++ U[0, 2 ms)), and start again from the cwnd check. Nothing is held while
+waiting; the order among waiters is random, so connections share the cap by
+their number of waiting streams (no isolation between connections). A
+fragment that has waited PACED_WAIT_DEADLINE (5 s, the receiver's
+STREAM_INACTIVITY_TIMEOUT) in total fails its stream, stream-scoped, with
+its flight released (egress_streams_abandoned). The take is PACED_TAKE_BYTES (MAX_PACKET_SIZE); the socket
 returns what the datagram did not use (Socket::send_to_paced), and all of it
 on a failed send. Without a cap the per-connection bucket keeps its old
 reserve-and-sleep path. Everything else goes through plain send_to and is
@@ -102,12 +106,12 @@ before it sends (answered_connection_ack, receipts taken before the NoOp).
 
 Unpaced debt is capped at DEBT_LIMIT (1 s at the cap); the rest is forgiven
 (sent uncharged) and counted. Over any interval ending at a paced send the
-node sends at most burst + rate x interval. Earlier designs with
-reservations (holds, settle, release, refunds) were removed after three
-review rounds each found the new reservation code to be the bug: do not
-bring reservations back. Waits >= LONG_WAIT (2.5 s, half
-STREAM_INACTIVITY_TIMEOUT) are counted (egress_long_waits) and logged at WARN
-once a minute. A quinn endpoint will need a poll-based admission (poll_ready
+node sends at most burst + rate x interval + bytes forgiven in the
+interval. Invariant: nothing is reserved; a paced sender holds no capacity
+while it waits, and is charged only at its send. Fragments whose waits
+reach LONG_WAIT (2.5 s) are counted (egress_long_waits), from the waiting
+loop, once per fragment; both counts are logged at WARN once a minute. The
+cap counts UDP payload, not IP/UDP headers. A quinn endpoint will need a poll-based admission (poll_ready
 + try_admit over try_take's predicate); not built yet.
 Tests assert on per-cap EgressCap::stats(), never the global counters.
 ```
@@ -262,8 +266,8 @@ joiner dial-queue waits (`dial_queue_wait_<label>`, coarse buckets around the
 dropped; see "Socket Abstraction Rules") and outbound datagrams by how the
 node-wide egress cap paced them (`egress_<label>`, one per `EgressDecision`,
 plus `egress_bytes`, `egress_bytes_waited`, `egress_wait_us_sum` / `_max`,
-`egress_long_waits`, `egress_debt_hwm_bytes`, `egress_debt_forgiven_bytes`;
-all zero without
+`egress_long_waits`, `egress_streams_abandoned`, `egress_debt_hwm_bytes`,
+`egress_debt_forgiven_bytes`; all zero without
 `total-bandwidth-limit`). Each label set is declared once in a
 `labelled_counters!` list, so a new variant needs a snapshot field. Hot
 path writes are single relaxed atomics; `SentPacketTracker` keeps an
@@ -495,6 +499,9 @@ Token reservation:
   → Reserve BEFORE sending
   → Block if insufficient tokens
   → RTT-adaptive update interval
+  → With the node-wide egress cap, capped stream senders use
+    TokenBucket::try_take instead (take only if enough, else take nothing
+    and sleep), next to the node-wide take; see "Node-wide egress cap"
 ```
 
 ## Backoff, Jitter, and Recovery Rules

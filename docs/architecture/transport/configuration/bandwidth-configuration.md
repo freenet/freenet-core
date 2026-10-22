@@ -179,7 +179,8 @@ whatever the per-connection rates add up to (see below).
 
 Every datagram the node sends on its UDP socket is charged to one token bucket of
 `total_limit` bytes per second: handshakes, ACKs, receipts, keepalive Pings, Pongs,
-retransmissions, short messages and stream fragments. The bucket holds 25 ms of the
+retransmissions, short messages and stream fragments. The bucket holds 25 ms of the The cap counts UDP payload bytes; IP and UDP headers (28 to
+48 bytes per datagram) are not counted.
 rate (at least four 1200-byte packets), so after an idle period the node may send that
 much at once before pacing starts. It lives in `DemuxSocket`
 (`crates/core/src/transport/demux.rs`) and `crates/core/src/transport/egress_cap.rs`.
@@ -188,7 +189,7 @@ Only one kind of send waits for the bucket:
 
 | Send | Behaviour when the bucket is empty |
 |------|------------------------------------|
-| Stream fragments (`send_stream`, `pipe_stream`) | After cwnd admission, take the datagram from the per-connection bucket and the node-wide bucket at the same moment, and send at once. If either is short, take nothing, sleep for the deficit (with ±20% jitter) and start again from the cwnd check. Nothing is held while waiting, and there is no order among waiting streams. |
+| Stream fragments (`send_stream`, `pipe_stream`) | After cwnd admission, take the datagram from the per-connection bucket and the node-wide bucket at the same moment, and send at once. If either is short, take nothing, sleep for the deficit times 1.0 to 1.4 plus 0 to 2 ms (random), and start again from the cwnd check. Nothing is held while waiting, the order among waiting streams is random, and a fragment that has waited 5 s in total fails its stream. |
 | Everything else (handshakes, short messages, ACKs, receipts, keepalives, Pongs, retransmissions) | Sent at once and charged once sent. The bucket goes into debt, and the next stream fragments wait longer to pay it. |
 
 The sends that never wait are sent from places that must not block: the receive path
@@ -199,17 +200,21 @@ handshake tasks, and the keepalive task. A failed send is not charged.
 What this guarantees:
 
 - Over any interval ending at a stream fragment's send, the node sends at most the
-  burst plus the cap times the interval, control traffic included: a fragment is sent
-  only when the bucket is not in debt.
+  burst plus the cap times the interval, control traffic included, plus the control
+  bytes forgiven in that interval: a fragment is sent only when the bucket is not in
+  debt.
 - Over other intervals the node can send more, by the control-traffic debt not yet
   paid off. That debt is limited to one second of the cap; a control datagram beyond
   it is still sent but not charged ("forgiven", counted as
   `egress_debt_forgiven_bytes`). So the cap holds on average, and forgiven bytes mean
   control traffic alone exceeded the cap for over a second.
-- There is no order among waiting streams. Each gets a fragment about every
-  `N * 1200 / C` seconds on average with `N` concurrent streams at a cap of `C`
-  bytes/s, with occasional longer gaps (several times that), since the stream that
-  wakes when the bucket has room takes it.
+- The order among waiting streams is random: a stream that wakes when the bucket has
+  room takes it. Each of `N` concurrent streams gets a fragment about every
+  `N * 1200 / C` seconds on average at a cap of `C` bytes/s, and the gaps have a
+  geometric tail (see the troubleshooting section). Connections share the cap in
+  proportion to their number of waiting streams.
+- Known limitation: there is no isolation between connections inside the cap. A peer
+  that drives many streams through this node gets a proportional share of it.
 
 Without `total-bandwidth-limit` no bucket exists and nothing changes. A
 `total-bandwidth-limit` of 0 is ignored with a warning.
@@ -223,8 +228,9 @@ The `transport_snapshot` telemetry event carries, per period: `egress_immediate`
 `egress_waited` and `egress_unpaced` (datagrams by how they were paced),
 `egress_bytes`, `egress_bytes_waited`, `egress_wait_us_sum`, `egress_wait_us_max`,
 `egress_long_waits` (stream fragments that waited at least 2.5 s, half the receiver's
-5 s stream inactivity timeout), `egress_debt_hwm_bytes` (the largest control-traffic
-debt) and `egress_debt_forgiven_bytes`. All are zero without a cap. A wait of 2.5 s or more is
+5 s stream inactivity timeout), `egress_streams_abandoned` (streams failed because a
+fragment waited 5 s), `egress_debt_hwm_bytes` (the largest control-traffic debt) and
+`egress_debt_forgiven_bytes`. All are zero without a cap. A wait of 2.5 s or more is
 also logged at WARN, at most once a minute.
 
 ### Example: 1 Gbps Connection
@@ -454,12 +460,21 @@ cap, which is the cap working. If `egress_unpaced` bytes are a large share of
 
 Streams fail when the cap is too low for the number of streams in flight. A receiver
 abandons a stream when 5 s pass between two of its fragments
-(`STREAM_INACTIVITY_TIMEOUT`). With `N` concurrent streams each stream gets a fragment
-about every `N * 1200 / C` seconds at a cap of `C` bytes/s, so streams start failing
-when `C` falls below about `N * 1200 / 5` bytes/s, and are at risk from half that
-gap: keep `C` above `N * 1200 / 2.5` bytes/s (for 100 concurrent streams, 48 KB/s).
-`egress_long_waits` above zero and the WARN line "A stream fragment waited this long
-for the node-wide egress cap" are the signal. The fix is a higher
+(`STREAM_INACTIVITY_TIMEOUT`), and the sender fails a stream whose next fragment has
+waited 5 s for the cap (`egress_streams_abandoned`). With `N` streams waiting at a cap
+of `C` bytes/s, each waiting stream wins a 1200-byte slot with probability about
+`1/N`, so a gap longer than `g` seconds has probability about
+`exp(-g * C / (1200 * N))`:
+
+- at `C = N * 1200 / 2.5` (a mean gap of 2.5 s) a gap exceeds 5 s about
+  `exp(-2)`, 13.5% of the time, and long streams fail often;
+- at `C = N * 2800` a gap exceeds 5 s about `exp(-11.7)`, once in about 100 000
+  fragments, so a stream of a few hundred fragments rarely fails.
+
+Keep `C` at or above about `N * 2800` bytes/s for long streams (for 100 concurrent
+streams, 280 KB/s). `egress_long_waits` (fragments that waited 2.5 s) and
+`egress_streams_abandoned` above zero, and the WARN line "A stream fragment waited
+this long for the node-wide egress cap", are the signal. The fix is a higher
 `total-bandwidth-limit`; there is no per-stream admission control.
 
 A slow stream also holds broadcast capacity: the broadcast queue keeps a send's slot
