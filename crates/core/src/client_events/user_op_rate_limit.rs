@@ -11,10 +11,11 @@
 //!
 //! The limiter is consulted ONLY when a connection carries a
 //! [`UserSecretContext`](crate::wasm_runtime::UserSecretContext) — i.e. hosted
-//! mode is on AND the connection presented a user token. Local / non-hosted /
-//! tokenless connections derive no context, so they are NEVER rate-limited:
-//! the single-user node behaves byte-for-byte as before (#4381's "never break
-//! single-user default" invariant).
+//! mode is on AND the connection presented a user token. Non-hosted
+//! connections derive no context, so they are NEVER rate-limited: the
+//! single-user node behaves byte-for-byte as before (#4381's "never break
+//! single-user default" invariant). A hosted node serves its client API only
+//! to connections that present a token, so every such connection is limited.
 //!
 //! # Server-level shared state, not a process global
 //!

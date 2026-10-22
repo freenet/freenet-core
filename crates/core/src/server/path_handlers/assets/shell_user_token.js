@@ -8,7 +8,8 @@ var __freenet_user_token = (function () {
   // an http page never reads a previously-minted token either, so the stored
   // value is never put on a ws:// URL. The TLS proxy serves the shell over
   // https in the intended hosted deployment; a direct http://localhost dev hit
-  // simply gets no token (Local), which is the correct/expected behavior.
+  // simply gets no token; on a hosted node the client API then refuses its
+  // connection, which is the expected behavior.
   if (location.protocol !== 'https:') {
     return undefined;
   }

@@ -293,9 +293,30 @@ pub struct ExecutorError {
     /// is unforgeable through contract return text.
     host_timeout: Option<HostTimeoutClass>,
     /// Set ONLY by [`ExecutorError::execution`] from the typed
-    /// `RuntimeInnerError::DelegateParamsMismatch`, so a delegate cannot set
-    /// it through the text of its own error. See [`Self::is_params_mismatch`].
-    params_mismatch: bool,
+    /// `RuntimeInnerError::DelegateParamsMismatch`,
+    /// `RuntimeInnerError::DelegateUnregisterNotLocal`,
+    /// `RuntimeInnerError::DelegateUnregisterHosted` or
+    /// `RuntimeInnerError::DelegateHostedRunWithoutUser`, so a delegate cannot
+    /// set it through the text of its own error. See
+    /// [`Self::is_params_mismatch`], [`Self::is_unregister_not_local`],
+    /// [`Self::is_unregister_hosted`] and
+    /// [`Self::is_hosted_run_without_user`].
+    refusal: Option<DelegateRefusal>,
+}
+
+/// A delegate request the node refused because of the request itself, before
+/// running or changing anything. See [`ExecutorError::refusal`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DelegateRefusal {
+    /// The request's params do not derive the delegate key.
+    ParamsMismatch,
+    /// An `UnregisterDelegate` from a connection that is not local.
+    UnregisterNotLocal,
+    /// An `UnregisterDelegate` from a client of a node in hosted mode that
+    /// presented no user token.
+    UnregisterHosted,
+    /// An `ApplicationMessages` run with no user on a node in hosted mode.
+    HostedRunWithoutUser,
 }
 
 /// Provenance class for a host-originated execution timeout (#4864 round-9). See
@@ -353,7 +374,7 @@ impl ExecutorError {
             inner: Either::Right(error.into()),
             fatal: false,
             host_timeout: None,
-            params_mismatch: false,
+            refusal: None,
         }
     }
 
@@ -363,7 +384,7 @@ impl ExecutorError {
             inner: Either::Right(anyhow::anyhow!("internal error")),
             fatal: false,
             host_timeout: None,
-            params_mismatch: false,
+            refusal: None,
         }
     }
 
@@ -372,7 +393,7 @@ impl ExecutorError {
             inner: Either::Left(Box::new(error.into())),
             fatal: false,
             host_timeout: None,
-            params_mismatch: false,
+            refusal: None,
         }
     }
 
@@ -402,13 +423,23 @@ impl ExecutorError {
         } else {
             None
         };
-        let params_mismatch = matches!(
-            outer_error.deref(),
-            RuntimeInnerError::DelegateParamsMismatch(_)
-        );
+        #[allow(clippy::wildcard_enum_match_arm)] // every other error is not a refusal
+        let refusal = match outer_error.deref() {
+            RuntimeInnerError::DelegateParamsMismatch(_) => Some(DelegateRefusal::ParamsMismatch),
+            RuntimeInnerError::DelegateUnregisterNotLocal(_) => {
+                Some(DelegateRefusal::UnregisterNotLocal)
+            }
+            RuntimeInnerError::DelegateUnregisterHosted(_) => {
+                Some(DelegateRefusal::UnregisterHosted)
+            }
+            RuntimeInnerError::DelegateHostedRunWithoutUser(_) => {
+                Some(DelegateRefusal::HostedRunWithoutUser)
+            }
+            _ => None,
+        };
         let mut err = Self::execution_classified(outer_error, op);
         err.host_timeout = host_timeout;
-        err.params_mismatch = params_mismatch;
+        err.refusal = refusal;
         err
     }
 
@@ -450,7 +481,11 @@ impl ExecutorError {
 
         // An existing stdlib variant on purpose: adding one to the protocol
         // enum would break clients built against older stdlib releases.
-        if let RuntimeInnerError::DelegateParamsMismatch(_) = error {
+        if let RuntimeInnerError::DelegateParamsMismatch(_)
+        | RuntimeInnerError::DelegateUnregisterNotLocal(_)
+        | RuntimeInnerError::DelegateUnregisterHosted(_)
+        | RuntimeInnerError::DelegateHostedRunWithoutUser(_) = error
+        {
             return ExecutorError::request(StdDelegateError::ExecutionError(
                 // The runtime error's own text, the single source of the message.
                 format!("{error}").into(),
@@ -719,7 +754,7 @@ impl ExecutorError {
             inner: Either::Right(anyhow::Error::new(DeferRelatedFetch { missing })),
             fatal: false,
             host_timeout: None,
-            params_mismatch: false,
+            refusal: None,
         }
     }
 
@@ -734,14 +769,14 @@ impl ExecutorError {
                     inner: Either::Right(err),
                     fatal: self.fatal,
                     host_timeout: self.host_timeout,
-                    params_mismatch: self.params_mismatch,
+                    refusal: self.refusal,
                 }),
             },
             inner @ Either::Left(_) => Err(Self {
                 inner,
                 fatal: self.fatal,
                 host_timeout: self.host_timeout,
-                params_mismatch: self.params_mismatch,
+                refusal: self.refusal,
             }),
         }
     }
@@ -774,7 +809,33 @@ impl ExecutorError {
     /// typed flag, not from the message, which a delegate's own error text
     /// could reproduce.
     pub(crate) fn is_params_mismatch(&self) -> bool {
-        self.params_mismatch
+        self.refusal == Some(DelegateRefusal::ParamsMismatch)
+    }
+
+    /// Whether this is the refusal of an `UnregisterDelegate` sent over a
+    /// connection that is not local. Read from a typed flag, not from the
+    /// message.
+    pub(crate) fn is_unregister_not_local(&self) -> bool {
+        self.refusal == Some(DelegateRefusal::UnregisterNotLocal)
+    }
+
+    /// Whether this is the refusal of an `UnregisterDelegate` sent by a client
+    /// of a node running in hosted mode without a user token. Read from a
+    /// typed flag, not from the message.
+    pub(crate) fn is_unregister_hosted(&self) -> bool {
+        self.refusal == Some(DelegateRefusal::UnregisterHosted)
+    }
+
+    /// Whether this is the refusal of a delegate run with no user on a node in
+    /// hosted mode. Read from a typed flag, not from the message.
+    pub(crate) fn is_hosted_run_without_user(&self) -> bool {
+        self.refusal == Some(DelegateRefusal::HostedRunWithoutUser)
+    }
+
+    /// Whether the node refused this delegate request because of the request
+    /// itself, before running or changing anything: any refusal above.
+    pub(crate) fn is_delegate_refusal(&self) -> bool {
+        self.refusal.is_some()
     }
 
     pub fn unwrap_request(self) -> RequestError {
@@ -808,6 +869,30 @@ impl ExecutorError {
         Self::execution(ce, Some(InnerOpError::Delegate(key)))
     }
 
+    /// The refusal of a non-local `UnregisterDelegate`, built the way the
+    /// executor builds it.
+    pub(crate) fn unregister_not_local(key: DelegateKey) -> Self {
+        use crate::wasm_runtime::{ContractError, RuntimeInnerError};
+        let ce: ContractError = RuntimeInnerError::DelegateUnregisterNotLocal(key.clone()).into();
+        Self::execution(ce, Some(InnerOpError::Delegate(key)))
+    }
+
+    /// The refusal of an `UnregisterDelegate` from a client of a hosted node,
+    /// built the way the executor builds it.
+    pub(crate) fn unregister_hosted(key: DelegateKey) -> Self {
+        use crate::wasm_runtime::{ContractError, RuntimeInnerError};
+        let ce: ContractError = RuntimeInnerError::DelegateUnregisterHosted(key.clone()).into();
+        Self::execution(ce, Some(InnerOpError::Delegate(key)))
+    }
+
+    /// The refusal of a delegate run with no user on a hosted node, built the
+    /// way the executor builds it.
+    pub(crate) fn hosted_run_without_user(key: DelegateKey) -> Self {
+        use crate::wasm_runtime::{ContractError, RuntimeInnerError};
+        let ce: ContractError = RuntimeInnerError::DelegateHostedRunWithoutUser(key.clone()).into();
+        Self::execution(ce, Some(InnerOpError::Delegate(key)))
+    }
+
     /// Test-only faithful constructor for a HOST scheduler-overload timeout
     /// (#4864 round-9). See [`ExecutorError::test_host_compute_timeout`].
     #[cfg(test)]
@@ -825,7 +910,7 @@ impl From<RequestError> for ExecutorError {
             inner: Either::Left(Box::new(value)),
             fatal: false,
             host_timeout: None,
-            params_mismatch: false,
+            refusal: None,
         }
     }
 }
@@ -845,7 +930,7 @@ impl From<Box<RequestError>> for ExecutorError {
             inner: Either::Left(value),
             fatal: false,
             host_timeout: None,
-            params_mismatch: false,
+            refusal: None,
         }
     }
 }
@@ -1001,15 +1086,16 @@ pub(crate) trait ContractExecutor: Send + 'static {
     /// mode or when no token was presented. When `Some`, the delegate's secret
     /// host functions operate on that user's namespace; when `None` they use
     /// the single-user [`crate::wasm_runtime::SecretScope::Local`] path,
-    /// byte-for-byte today's behavior. Crucially this is a SEPARATE channel
-    /// from `origin_contract`/`caller_delegate` and the request body: nothing
-    /// the delegate or client can put in a message can set or forge it. The
-    /// inter-delegate dispatch path passes `None` (a delegate-to-delegate hop
-    /// does not inherit the originating connection's user namespace).
+    /// byte-for-byte today's behavior. Its user also selects the run's
+    /// delegate context (one per delegate and hosted user). Crucially this is
+    /// a SEPARATE channel from `origin_contract`/`caller_delegate` and the
+    /// request body: nothing the delegate or client can put in a message can
+    /// set or forge it. On a hosted node every delegate run belongs to a user,
+    /// so an `ApplicationMessages` run with `None` is refused there
+    /// ([`ExecutorError::is_hosted_run_without_user`]).
     /// `connection_scope` says whether the client connection this request
-    /// descends from is entitled to an ATTESTED application identity
-    /// (GHSA-824h-7x5x-wfmf). When it is
-    /// [`crate::client_events::ConnectionScope::Remote`] the executor resolves
+    /// descends from is entitled to an ATTESTED application identity. When it
+    /// is [`crate::client_events::ConnectionScope::Remote`] the executor resolves
     /// NO `MessageOrigin` at all — not from `origin_contract`, not from
     /// `caller_delegate`, not from the node's inherited-origins map — so an
     /// off-host caller sees exactly what a tokenless local caller has always
@@ -1024,6 +1110,55 @@ pub(crate) trait ContractExecutor: Send + 'static {
         connection_scope: crate::client_events::ConnectionScope,
         user_context: Option<&UserSecretContext>,
     ) -> impl Future<Output = Response> + Send;
+
+    /// Run an inter-delegate hop: `req` is sent to its target by
+    /// `caller_delegate`. The target runs under `user_context`, the user whose
+    /// request led to the hop: that user's secrets and delegate context, like
+    /// any run for that user (see `user_context` on
+    /// [`Self::execute_delegate_request`]). On a hosted node every delegate run
+    /// belongs to a user, a hop included; on a node that is not hosted
+    /// `user_context` is `None` and the target uses the node-local secrets.
+    ///
+    /// No default: an executor that ignored `user_context` would run every
+    /// hop under the node-local secrets.
+    fn execute_delegate_hop(
+        &mut self,
+        req: DelegateRequest<'_>,
+        caller_delegate: &DelegateKey,
+        connection_scope: crate::client_events::ConnectionScope,
+        user_context: Option<&UserSecretContext>,
+    ) -> impl Future<Output = Response> + Send;
+
+    /// Whether this node serves clients in hosted mode (`ws_api.hosted_mode`).
+    ///
+    /// On a hosted node every delegate run belongs to a user, and the node
+    /// runs no delegate on its own. The contract loop reads this to run no
+    /// contract notification on a hosted node, and to route a run's output
+    /// only to its own user there. No default, so an executor cannot report
+    /// "not hosted" by omission.
+    fn hosted_mode(&self) -> bool;
+
+    /// Remove `user`'s delegate context for `delegate` from the context cache
+    /// and return it. The contract loop calls this when a run parks, so the
+    /// park holds the context (counted against the park byte budget) while the
+    /// run waits, and the cache cannot drop it under pressure from other runs.
+    ///
+    /// No default: an executor that kept the context in its cache would let a
+    /// parked run lose it.
+    fn take_delegate_context(
+        &mut self,
+        delegate: &DelegateKey,
+        user: Option<&crate::wasm_runtime::UserId>,
+    ) -> Option<Vec<u8>>;
+
+    /// Put back a context taken by [`Self::take_delegate_context`], before the
+    /// run that parked resumes (or runs inline when its park was refused).
+    fn restore_delegate_context(
+        &mut self,
+        delegate: &DelegateKey,
+        user: Option<&crate::wasm_runtime::UserId>,
+        context: Vec<u8>,
+    );
 
     /// Export the per-user delegate secrets named by `user_context` into an
     /// encrypted bundle, sealed under the user's `token` (hosted-mode export,
@@ -1673,6 +1808,9 @@ pub(crate) fn declared_cache_ceiling_terms(
     // account a node's QUIC connections; see `NOT_SUMMED` and
     // `quic::config::connection_window_bytes`.
     let quic_incoming = crate::transport::quic::config::INCOMING_BUFFER_TOTAL_BYTES as usize;
+    // The delegate context cache (`ctx.write()` bytes). One per node, shared
+    // by every executor, so NOT multiplied by the pool.
+    let delegate_contexts = crate::wasm_runtime::delegate_context_budget_for(memory_limit);
 
     vec![
         // The pool multiplication IS #5268's defect 3.
@@ -1707,6 +1845,7 @@ pub(crate) fn declared_cache_ceiling_terms(
         ("parked_budget_for", parked),
         ("QUIC_INGRESS_QUEUE_BYTES", quic_ingress),
         ("INCOMING_BUFFER_TOTAL_BYTES", quic_incoming),
+        ("delegate_context_budget_for", delegate_contexts),
     ]
 }
 
@@ -1769,6 +1908,12 @@ pub struct Executor<R = Runtime, S: StateStorage = Storage> {
         HashMap<ContractInstanceId, HashMap<ClientId, Option<StateSummary<'static>>>>,
     /// Origin contract instances for a given delegate.
     delegate_origin_ids: HashMap<DelegateKey, Vec<ContractInstanceId>>,
+    /// Whether this node serves clients in hosted mode (`ws_api.hosted_mode`).
+    /// A hosted node's delegates are shared by all of its users, so on such a
+    /// node `UnregisterDelegate` removes only the requesting user's own push
+    /// registrations, and is refused for a client with no user token. Set by the
+    /// constructors that read the node config.
+    hosted_mode: bool,
     /// Tracks contracts that are being initialized and operations queued for them
     init_tracker: ContractInitTracker,
 
@@ -1818,6 +1963,13 @@ where
     S: StateStorage + Send + Sync + 'static,
     <S as StateStorage>::Error: Into<anyhow::Error>,
 {
+    /// Set whether this executor serves a hosted node, for tests that drive a
+    /// hosted node's contract loop over a mock executor.
+    #[cfg(test)]
+    pub(crate) fn set_hosted_mode_for_test(&mut self, hosted: bool) {
+        self.hosted_mode = hosted;
+    }
+
     /// Create a new Executor with optional network operation support.
     /// This is `pub(crate)` because the parameters involve crate-internal types.
     pub(crate) async fn new(
@@ -1857,6 +2009,7 @@ where
             client_subscription_counts: HashMap::default(),
             subscriber_summaries: HashMap::default(),
             delegate_origin_ids: HashMap::default(),
+            hosted_mode: false,
             init_tracker: ContractInitTracker::new(),
             op_manager,
             shared_notifications: None,
@@ -2167,6 +2320,7 @@ mod tests {
             "parked_budget_for",
             "QUIC_INGRESS_QUEUE_BYTES",
             "INCOMING_BUFFER_TOTAL_BYTES",
+            "delegate_context_budget_for",
         ] {
             assert!(
                 labels.contains(&required),
@@ -2287,6 +2441,10 @@ mod tests {
             (
                 "INCOMING_BUFFER_TOTAL_BYTES",
                 crate::transport::quic::config::INCOMING_BUFFER_TOTAL_BYTES as usize,
+            ),
+            (
+                "delegate_context_budget_for",
+                crate::wasm_runtime::delegate_context_budget_for(ONE_GIB),
             ),
         ] {
             assert_eq!(
@@ -2501,6 +2659,18 @@ mod tests {
             (
                 "PARKED_FALLBACK_TOTAL_RAM_BYTES",
                 "RAM fallback for parked_budget_for",
+            ),
+            (
+                "DELEGATE_CONTEXT_FALLBACK_TOTAL_RAM_BYTES",
+                "RAM fallback for delegate_context_budget_for",
+            ),
+            (
+                "MIN_DELEGATE_CONTEXT_BYTES",
+                "clamp inside delegate_context_budget_for",
+            ),
+            (
+                "MAX_DELEGATE_CONTEXT_BYTES",
+                "clamp inside delegate_context_budget_for",
             ),
             (
                 "CGROUP_UNLIMITED_THRESHOLD_BYTES",

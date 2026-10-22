@@ -6,6 +6,8 @@ use dashmap::DashMap;
 use freenet_stdlib::prelude::{ClientResponse, UserInputRequest};
 use tokio::sync::{broadcast, oneshot};
 
+use crate::wasm_runtime::UserId;
+
 /// Timeout for user input prompts. After this duration, the request is auto-denied.
 pub(crate) const USER_INPUT_TIMEOUT: Duration = Duration::from_secs(60);
 
@@ -94,11 +96,20 @@ impl PromptAuthor {
 /// runtime context, never from the delegate's own message payload — a rogue
 /// delegate must not be able to spoof another delegate's or app's identity.
 pub trait UserInputPrompter: Send + Sync {
+    ///
+    /// `owner` is the hosted user whose delegate run raised the prompt, taken
+    /// from that run's user context. `None` on a node that is not hosted. On a
+    /// hosted node every delegate run belongs to a user (a client request
+    /// runs under its connection's user, a hop under the originating user, and
+    /// the node runs no delegate on its own), so every prompt there has an
+    /// owner. A hosted node shows a prompt
+    /// only to its owner and refuses a prompt that has none.
     fn prompt(
         &self,
         request: &UserInputRequest<'static>,
         delegate_key: &str,
         caller: CallerIdentity,
+        owner: Option<UserId>,
     ) -> impl std::future::Future<Output = Option<(usize, ClientResponse<'static>)>> + Send;
 
     /// Ask the user, in the node's own voice, whether an app may use a
@@ -123,6 +134,10 @@ pub(crate) struct PendingPrompt {
     pub labels: Vec<String>,
     pub delegate_key: String,
     pub caller: CallerIdentity,
+    /// The hosted user this prompt belongs to (see
+    /// [`UserInputPrompter::prompt`]). Never serialized: the permission routes
+    /// use it only to decide who may see and answer the prompt.
+    pub owner: Option<UserId>,
     pub response_tx: oneshot::Sender<usize>,
 }
 
@@ -133,6 +148,13 @@ pub(crate) type PendingPrompts = Arc<DashMap<String, PendingPrompt>>;
 /// and the DashboardPrompter (producer).
 static PENDING_PROMPTS: std::sync::OnceLock<PendingPrompts> = std::sync::OnceLock::new();
 
+/// Held across the cap checks and the insert in `show_and_wait`, so that
+/// concurrent prompts cannot all pass the counts before any of them is
+/// registered. Process-wide like [`PENDING_PROMPTS`], so every prompter
+/// serialises its admissions against every other, whichever map it uses.
+/// Never held across an `.await`.
+static PROMPT_ADMISSION: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Get or initialize the global pending prompts registry.
 pub(crate) fn pending_prompts() -> PendingPrompts {
     PENDING_PROMPTS
@@ -142,6 +164,12 @@ pub(crate) fn pending_prompts() -> PendingPrompts {
 
 /// Maximum concurrent pending prompts to prevent memory exhaustion.
 const MAX_PENDING_PROMPTS: usize = 32;
+
+/// Maximum pending prompts one hosted user token may hold at once. Applies
+/// only on a hosted node. It bounds one token, not one person: tokens cost
+/// nothing to mint, so prompts raised under several tokens can together reach
+/// [`MAX_PENDING_PROMPTS`], which all users share.
+const MAX_PENDING_PROMPTS_PER_USER: usize = 8;
 
 /// Snapshot of a prompt's display fields, sufficient for the event handlers to
 /// render an `Added` event without holding the DashMap entry. Cloned out of
@@ -154,6 +182,8 @@ pub(crate) struct PromptSnapshot {
     pub labels: Vec<String>,
     pub delegate_key: String,
     pub caller: CallerIdentity,
+    /// Copied from [`PendingPrompt::owner`]; never serialized.
+    pub owner: Option<UserId>,
 }
 
 /// Lifecycle event for a permission prompt. Consumed by the permission-event
@@ -164,7 +194,12 @@ pub(crate) struct PromptSnapshot {
 #[derive(Clone, Debug)]
 pub(crate) enum PromptEvent {
     Added(PromptSnapshot),
-    Removed { nonce: String },
+    /// `owner` lets an event route forward the removal only to the user the
+    /// prompt belonged to.
+    Removed {
+        nonce: String,
+        owner: Option<UserId>,
+    },
 }
 
 /// Broadcast capacity. Each lifecycle is two events (Added + Removed), and
@@ -197,8 +232,9 @@ pub(crate) fn prompt_events() -> broadcast::Sender<PromptEvent> {
 /// arbitrarily large string to every connected tab.
 pub(crate) fn emit_prompt_event(event: PromptEvent) {
     let event = match event {
-        PromptEvent::Removed { nonce } => PromptEvent::Removed {
+        PromptEvent::Removed { nonce, owner } => PromptEvent::Removed {
             nonce: cap_identity_chars(&nonce),
+            owner,
         },
         other => other,
     };
@@ -235,18 +271,32 @@ pub struct DashboardPrompter {
     /// Timestamp of the last no-tab browser-open, for the
     /// [`NO_TAB_OPEN_COOLDOWN`] rate limit. `None` until the first open.
     last_no_tab_open: std::sync::Mutex<Option<tokio::time::Instant>>,
+    /// Whether this node runs in hosted mode (`ws_api.hosted_mode`). A hosted
+    /// node refuses a prompt with no owner, caps each user's pending prompts
+    /// at [`MAX_PENDING_PROMPTS_PER_USER`], and never opens a browser on the
+    /// node's host.
+    hosted_mode: bool,
+    /// Test-only pause inside the admission section, which makes a missing
+    /// lock observable: without it every concurrent prompt passes the counts
+    /// during the pause.
+    #[cfg(test)]
+    admission_pause: Duration,
 }
 
 impl DashboardPrompter {
     /// Build a prompter that opens the user's browser when no dashboard tab is
     /// connected. `ws_api_addr` is the address the local HTTP/WS API dashboard
     /// is served on (`config.ws_api.address` + `config.ws_api.port`).
-    pub fn new(pending: PendingPrompts, ws_api_addr: SocketAddr) -> Self {
+    /// `hosted_mode` is `config.ws_api.hosted_mode`.
+    pub fn new(pending: PendingPrompts, ws_api_addr: SocketAddr, hosted_mode: bool) -> Self {
         Self {
             pending,
             dashboard_authority: dashboard_authority(ws_api_addr),
             notify_no_tab: Arc::new(open_permission_page_in_browser),
             last_no_tab_open: std::sync::Mutex::new(None),
+            hosted_mode,
+            #[cfg(test)]
+            admission_pause: Duration::ZERO,
         }
     }
 
@@ -260,7 +310,13 @@ impl DashboardPrompter {
     ///
     /// Rate-limited by [`NO_TAB_OPEN_COOLDOWN`] so a burst of no-tab prompts
     /// opens one tab per window rather than one per prompt.
+    ///
+    /// Never on a hosted node: its users are not at the node's host, and the
+    /// standalone page is not served there.
     fn maybe_alert_no_tab(&self, nonce: &str, subscriber_count: usize) {
+        if self.hosted_mode {
+            return;
+        }
         if subscriber_count != 0 || !self.no_tab_cooldown_elapsed() {
             return;
         }
@@ -285,6 +341,19 @@ impl DashboardPrompter {
             }
         }
     }
+}
+
+/// The node's prompter, built from its client-API config: the dashboard
+/// address and the hosted-mode flag both come from `ws_api`, and it uses the
+/// process-wide registry the permission routes read.
+pub(crate) fn dashboard_prompter_for(
+    ws_api: &crate::config::WebsocketApiConfig,
+) -> DashboardPrompter {
+    DashboardPrompter::new(
+        pending_prompts(),
+        SocketAddr::new(ws_api.address, ws_api.port),
+        ws_api.hosted_mode,
+    )
 }
 
 /// Build the HTTP authority (`host:port`) for the local dashboard URL from the
@@ -383,12 +452,16 @@ impl DashboardPrompter {
         pending: PendingPrompts,
         ws_api_addr: SocketAddr,
         notify_no_tab: NoTabNotifier,
+        hosted_mode: bool,
     ) -> Self {
         Self {
             pending,
             dashboard_authority: dashboard_authority(ws_api_addr),
             notify_no_tab,
             last_no_tab_open: std::sync::Mutex::new(None),
+            hosted_mode,
+            #[cfg(test)]
+            admission_pause: Duration::ZERO,
         }
     }
 }
@@ -399,17 +472,10 @@ impl UserInputPrompter for DashboardPrompter {
         request: &UserInputRequest<'static>,
         delegate_key: &str,
         caller: CallerIdentity,
+        owner: Option<UserId>,
     ) -> Option<(usize, ClientResponse<'static>)> {
         if request.responses.is_empty() {
             tracing::warn!("RequestUserInput has no response options");
-            return None;
-        }
-
-        if self.pending.len() >= MAX_PENDING_PROMPTS {
-            tracing::warn!(
-                max = MAX_PENDING_PROMPTS,
-                "Too many pending permission prompts, auto-denying"
-            );
             return None;
         }
 
@@ -423,6 +489,7 @@ impl UserInputPrompter for DashboardPrompter {
                 delegate_key,
                 caller,
                 request.request_id,
+                owner,
             )
             .await?;
         if idx < request.responses.len() {
@@ -440,16 +507,20 @@ impl UserInputPrompter for DashboardPrompter {
         delegate_key: &str,
         caller: CallerIdentity,
     ) -> Option<usize> {
-        if self.pending.len() >= MAX_PENDING_PROMPTS {
-            tracing::warn!(
-                max = MAX_PENDING_PROMPTS,
-                "Too many pending permission prompts; not asking for a capability grant now"
-            );
-            return None;
-        }
         let count = labels.len();
         let idx = self
-            .show_and_wait(PromptAuthor::Node, message, labels, delegate_key, caller, 0)
+            // A capability prompt carries no owner. Capability grants are not
+            // offered on a hosted node, and `show_and_wait` refuses an
+            // ownerless prompt there.
+            .show_and_wait(
+                PromptAuthor::Node,
+                message,
+                labels,
+                delegate_key,
+                caller,
+                0,
+                None,
+            )
             .await?;
         (idx < count).then_some(idx)
     }
@@ -459,6 +530,7 @@ impl DashboardPrompter {
     /// Register a prompt, surface it, and wait for the user's click. Shared by
     /// delegate-authored and node-authored prompts so the two cannot drift in
     /// how they are shown, capped, cancelled or timed out.
+    #[allow(clippy::too_many_arguments)]
     async fn show_and_wait(
         &self,
         author: PromptAuthor,
@@ -467,7 +539,22 @@ impl DashboardPrompter {
         delegate_key: &str,
         caller: CallerIdentity,
         request_id: u32,
+        owner: Option<UserId>,
     ) -> Option<usize> {
+        if self.hosted_mode {
+            // A hosted node shows a prompt only to the user it belongs to, so a
+            // prompt with no owner has nobody to be shown to. Refused at once
+            // rather than left to time out.
+            if owner.is_none() {
+                tracing::warn!(
+                    request_id,
+                    author = author.as_str(),
+                    "Hosted node refused a permission prompt with no owning user"
+                );
+                return None;
+            }
+        }
+
         // Generate a 128-bit cryptographic nonce for the permission URL
         let nonce = generate_nonce();
 
@@ -483,17 +570,57 @@ impl DashboardPrompter {
             CallerIdentity::WebApp(hash) => CallerIdentity::WebApp(cap_identity_chars(&hash)),
         };
 
-        self.pending.insert(
-            nonce.clone(),
-            PendingPrompt {
-                author,
-                message: message.clone(),
-                labels: labels.clone(),
-                delegate_key: stored_delegate_key.clone(),
-                caller: stored_caller.clone(),
-                response_tx: tx,
-            },
-        );
+        // Admission. The cap checks and the insert are one critical section
+        // under the process-wide `PROMPT_ADMISSION`: counted separately,
+        // concurrent prompts (parked runs prompt off the contract loop) could
+        // all pass the counts before any of them is inserted. Only
+        // `show_and_wait` inserts into a pending map, and removals only lower
+        // the counts.
+        {
+            let _admission = PROMPT_ADMISSION.lock().unwrap_or_else(|e| e.into_inner());
+            if self.pending.len() >= MAX_PENDING_PROMPTS {
+                tracing::warn!(
+                    request_id,
+                    author = author.as_str(),
+                    max = MAX_PENDING_PROMPTS,
+                    "Too many pending permission prompts, auto-denying"
+                );
+                return None;
+            }
+            if self.hosted_mode
+                && let Some(user) = owner
+            {
+                let held = self
+                    .pending
+                    .iter()
+                    .filter(|e| e.value().owner == Some(user))
+                    .count();
+                if held >= MAX_PENDING_PROMPTS_PER_USER {
+                    tracing::warn!(
+                        request_id,
+                        max = MAX_PENDING_PROMPTS_PER_USER,
+                        "Too many pending permission prompts for one hosted user token, auto-denying"
+                    );
+                    return None;
+                }
+            }
+            #[cfg(test)]
+            if !self.admission_pause.is_zero() {
+                std::thread::sleep(self.admission_pause);
+            }
+            self.pending.insert(
+                nonce.clone(),
+                PendingPrompt {
+                    author,
+                    message: message.clone(),
+                    labels: labels.clone(),
+                    delegate_key: stored_delegate_key.clone(),
+                    caller: stored_caller.clone(),
+                    owner,
+                    response_tx: tx,
+                },
+            );
+        }
         // CANCELLATION SAFETY (#5544 P1b). The removal below runs only if this
         // future is polled to completion. #5544 wraps a delegate's prompts in a
         // PARK_WORK_BUDGET timeout, so a second prompt can be DROPPED here —
@@ -520,6 +647,7 @@ impl DashboardPrompter {
             labels,
             delegate_key: stored_delegate_key,
             caller: stored_caller,
+            owner,
         }));
 
         // #3820: if no dashboard tab is connected to display this prompt, the
@@ -550,10 +678,10 @@ impl DashboardPrompter {
         // regardless of which path retired the prompt; a duplicate Removed
         // (when both the HTTP handler and this cleanup fire) is harmless,
         // because the shell client's hide is idempotent on nonce.
-        let was_present = self.pending.remove(&nonce).is_some();
-        if was_present {
+        if let Some((_, removed)) = self.pending.remove(&nonce) {
             emit_prompt_event(PromptEvent::Removed {
                 nonce: nonce.clone(),
+                owner: removed.owner,
             });
         }
 
@@ -586,7 +714,7 @@ struct PromptEntryGuard {
 
 impl Drop for PromptEntryGuard {
     fn drop(&mut self) {
-        if self.pending.remove(&self.nonce).is_some() {
+        if let Some((_, removed)) = self.pending.remove(&self.nonce) {
             // Only reachable on the cancelled path: the normal path removes the
             // entry before this guard drops, so a hit here means the future was
             // dropped mid-await.
@@ -597,6 +725,7 @@ impl Drop for PromptEntryGuard {
             );
             emit_prompt_event(PromptEvent::Removed {
                 nonce: self.nonce.clone(),
+                owner: removed.owner,
             });
         }
     }
@@ -659,6 +788,7 @@ impl UserInputPrompter for AutoApprovePrompter {
         request: &UserInputRequest<'static>,
         _delegate_key: &str,
         _caller: CallerIdentity,
+        _owner: Option<UserId>,
     ) -> Option<(usize, ClientResponse<'static>)> {
         request
             .responses
@@ -688,6 +818,7 @@ impl UserInputPrompter for AutoDenyPrompter {
         _request: &UserInputRequest<'static>,
         _delegate_key: &str,
         _caller: CallerIdentity,
+        _owner: Option<UserId>,
     ) -> Option<(usize, ClientResponse<'static>)> {
         None
     }
@@ -723,7 +854,7 @@ mod tests {
     /// that exercise the no-tab decision itself use
     /// [`DashboardPrompter::with_notifier`] with a recording stub instead.
     fn noop_prompter(pending: PendingPrompts) -> DashboardPrompter {
-        DashboardPrompter::with_notifier(pending, test_ws_addr(), Arc::new(|_| {}))
+        DashboardPrompter::with_notifier(pending, test_ws_addr(), Arc::new(|_| {}), false)
     }
 
     /// Default ws-api bind address used by the prompter tests (loopback:7509),
@@ -736,7 +867,7 @@ mod tests {
     async fn test_auto_approve_returns_first_response() {
         let req = make_test_request("Allow this?", vec!["Allow", "Deny"]);
         let result = AutoApprovePrompter
-            .prompt(&req, "dkey", webapp("cid"))
+            .prompt(&req, "dkey", webapp("cid"), None)
             .await;
         let (idx, response) = result.unwrap();
         assert_eq!(idx, 0);
@@ -747,7 +878,7 @@ mod tests {
     async fn test_auto_approve_empty_responses() {
         let req = make_test_request("Allow this?", vec![]);
         let result = AutoApprovePrompter
-            .prompt(&req, "dkey", webapp("cid"))
+            .prompt(&req, "dkey", webapp("cid"), None)
             .await;
         assert!(result.is_none());
     }
@@ -755,7 +886,9 @@ mod tests {
     #[tokio::test]
     async fn test_auto_deny_always_returns_none() {
         let req = make_test_request("Allow this?", vec!["Allow", "Deny"]);
-        let result = AutoDenyPrompter.prompt(&req, "dkey", webapp("cid")).await;
+        let result = AutoDenyPrompter
+            .prompt(&req, "dkey", webapp("cid"), None)
+            .await;
         assert!(result.is_none());
     }
 
@@ -802,13 +935,14 @@ mod tests {
                     labels: vec!["OK".to_string()],
                     delegate_key: String::new(),
                     caller: CallerIdentity::None,
+                    owner: None,
                     response_tx: tx,
                 },
             );
         }
 
         let req = make_test_request("Over limit", vec!["Allow"]);
-        let result = prompter.prompt(&req, "dkey", webapp("cid")).await;
+        let result = prompter.prompt(&req, "dkey", webapp("cid"), None).await;
         assert!(result.is_none());
     }
 
@@ -839,7 +973,7 @@ mod tests {
         let prompter = noop_prompter(pending.clone());
         let req = make_test_request("Allow this?", vec!["Allow", "Deny"]);
 
-        let mut prompting = Box::pin(prompter.prompt(&req, "dkey", webapp("cid")));
+        let mut prompting = Box::pin(prompter.prompt(&req, "dkey", webapp("cid"), None));
         assert!(
             futures::poll!(prompting.as_mut()).is_pending(),
             "the prompt must be waiting for a human, not resolved"
@@ -889,7 +1023,7 @@ mod tests {
         loop {
             match events.try_recv() {
                 Ok(event) => {
-                    if matches!(&event, PromptEvent::Removed { nonce: n } if *n == nonce) {
+                    if matches!(&event, PromptEvent::Removed { nonce: n, .. } if *n == nonce) {
                         removed = true;
                         break;
                     }
@@ -909,6 +1043,427 @@ mod tests {
              between the subscribe above and this drain, and the failure is \
              the shared channel rather than the guard.)"
         );
+    }
+
+    // ----- Hosted nodes: each prompt belongs to the user whose run raised it -----
+
+    fn hosted_prompter(pending: PendingPrompts) -> DashboardPrompter {
+        DashboardPrompter::with_notifier(pending, test_ws_addr(), Arc::new(|_| {}), true)
+    }
+
+    fn user(tag: u8) -> UserId {
+        UserId::new([tag; 32])
+    }
+
+    fn insert_owned(pending: &PendingPrompts, nonce: &str, owner: Option<UserId>) {
+        let (tx, _rx) = oneshot::channel();
+        pending.insert(
+            nonce.to_string(),
+            PendingPrompt {
+                author: PromptAuthor::Delegate,
+                message: "held".to_string(),
+                labels: vec!["OK".to_string()],
+                delegate_key: String::new(),
+                caller: CallerIdentity::None,
+                owner,
+                response_tx: tx,
+            },
+        );
+    }
+
+    /// The owner passed to `prompt` is stored on the pending entry and carried
+    /// by the `Added` event, and the `Removed` event a cancelled prompt emits
+    /// names the same owner. The permission routes decide who may see and
+    /// answer a prompt from exactly these three places.
+    ///
+    /// FALSIFY: store `owner: None` in `show_and_wait`'s insert, its `Added`
+    /// snapshot, or emit `owner: None` from `PromptEntryGuard::drop`; the
+    /// matching assertion fails.
+    #[tokio::test]
+    #[serial_test::serial(prompt_events)]
+    async fn a_prompt_records_its_owner_in_the_entry_and_its_events() {
+        let pending: PendingPrompts = Arc::new(DashMap::new());
+        let prompter = hosted_prompter(pending.clone());
+        let req = make_test_request("Allow this?", vec!["Allow", "Deny"]);
+        let mut events = prompt_events().subscribe();
+
+        let mut prompting =
+            Box::pin(prompter.prompt(&req, "dkey-owner", webapp("cid"), Some(user(1))));
+        assert!(
+            futures::poll!(prompting.as_mut()).is_pending(),
+            "a hosted prompt with an owner must be shown and wait for an answer"
+        );
+        let nonce = {
+            let entry = pending
+                .iter()
+                .next()
+                .expect("the prompt must have registered a pending entry");
+            assert_eq!(
+                entry.value().owner,
+                Some(user(1)),
+                "the pending entry must record the run's user"
+            );
+            entry.key().clone()
+        };
+
+        let mut added_owner = None;
+        let mut removed_owner = None;
+        let mut lagged = 0u64;
+        drop(prompting);
+        loop {
+            match events.try_recv() {
+                Ok(PromptEvent::Added(snap)) if snap.nonce == nonce => {
+                    added_owner = Some(snap.owner);
+                }
+                Ok(PromptEvent::Removed { nonce: n, owner }) if n == nonce => {
+                    removed_owner = Some(owner);
+                    break;
+                }
+                Ok(_) => {}
+                Err(broadcast::error::TryRecvError::Lagged(n)) => lagged += n,
+                Err(_) => break,
+            }
+        }
+        // The broadcast is process-global; a lag means another test published
+        // more than its capacity meanwhile, and is reported as that.
+        assert_eq!(
+            lagged, 0,
+            "the shared prompt-event channel lagged by {lagged}"
+        );
+        assert_eq!(
+            added_owner,
+            Some(Some(user(1))),
+            "the Added event must carry the owner"
+        );
+        assert_eq!(
+            removed_owner,
+            Some(Some(user(1))),
+            "the Removed event of a cancelled prompt must carry the owner"
+        );
+    }
+
+    /// A prompt that times out emits `Removed` with its owner too: that is the
+    /// path through `show_and_wait`'s own cleanup rather than the guard.
+    ///
+    /// FALSIFY: emit `owner: None` from the timeout cleanup in `show_and_wait`.
+    #[tokio::test(start_paused = true)]
+    #[serial_test::serial(prompt_events)]
+    async fn a_timed_out_prompt_names_its_owner_when_it_is_removed() {
+        let mut events = prompt_events().subscribe();
+        let pending: PendingPrompts = Arc::new(DashMap::new());
+        let prompter = hosted_prompter(pending.clone());
+        let req = make_test_request("timeout?", vec!["Allow"]);
+        let handle = tokio::spawn(async move {
+            prompter
+                .prompt(&req, "dkey-owner-timeout", webapp("cid"), Some(user(2)))
+                .await
+        });
+        let mut nonce = None;
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+            if let Some(entry) = pending.iter().next() {
+                nonce = Some(entry.key().clone());
+                break;
+            }
+        }
+        let nonce = nonce.expect("the prompt must register");
+        tokio::time::advance(USER_INPUT_TIMEOUT + Duration::from_secs(1)).await;
+        assert!(
+            handle.await.unwrap().is_none(),
+            "a timed-out prompt answers None"
+        );
+        let mut removed_owner = None;
+        let mut lagged = 0u64;
+        loop {
+            match events.try_recv() {
+                Ok(PromptEvent::Removed { nonce: n, owner }) if n == nonce => {
+                    removed_owner = Some(owner);
+                    break;
+                }
+                Ok(_) => {}
+                Err(broadcast::error::TryRecvError::Lagged(n)) => lagged += n,
+                Err(_) => break,
+            }
+        }
+        assert_eq!(
+            lagged, 0,
+            "the shared prompt-event channel lagged by {lagged}"
+        );
+        assert_eq!(removed_owner, Some(Some(user(2))));
+    }
+
+    /// A hosted node refuses a prompt with no owner at once: there is no user
+    /// it could be shown to, and showing it to every user is what the hosted
+    /// rule forbids. Nothing is registered and the caller gets `None` without
+    /// waiting for the timeout. Capability prompts carry no owner, so they are
+    /// refused the same way.
+    ///
+    /// FALSIFY: delete the hosted ownerless refusal at the top of
+    /// `show_and_wait`; the prompt registers and stays pending.
+    #[tokio::test]
+    async fn a_hosted_node_refuses_a_prompt_with_no_owner() {
+        let pending: PendingPrompts = Arc::new(DashMap::new());
+        let prompter = hosted_prompter(pending.clone());
+        let req = make_test_request("Allow this?", vec!["Allow"]);
+
+        let mut prompting = Box::pin(prompter.prompt(&req, "dkey", webapp("cid"), None));
+        assert!(
+            matches!(
+                futures::poll!(prompting.as_mut()),
+                std::task::Poll::Ready(None)
+            ),
+            "an ownerless prompt on a hosted node must be refused at once"
+        );
+        assert!(
+            pending.is_empty(),
+            "a refused prompt must not be registered"
+        );
+
+        let mut asking = Box::pin(prompter.prompt_capability(
+            "Allow background?".to_string(),
+            vec!["Allow".to_string()],
+            "dkey",
+            webapp("cid"),
+        ));
+        assert!(
+            matches!(
+                futures::poll!(asking.as_mut()),
+                std::task::Poll::Ready(None)
+            ),
+            "a capability prompt has no owner, so a hosted node refuses it"
+        );
+        assert!(pending.is_empty());
+    }
+
+    /// On a node that is not hosted an ownerless prompt is shown as before.
+    #[tokio::test]
+    async fn a_node_that_is_not_hosted_shows_a_prompt_with_no_owner() {
+        let pending: PendingPrompts = Arc::new(DashMap::new());
+        let prompter = noop_prompter(pending.clone());
+        let req = make_test_request("Allow this?", vec!["Allow"]);
+        let mut prompting = Box::pin(prompter.prompt(&req, "dkey", webapp("cid"), None));
+        assert!(futures::poll!(prompting.as_mut()).is_pending());
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending.iter().next().unwrap().value().owner, None);
+    }
+
+    /// A hosted node never opens a browser on the node's own host: the users
+    /// are elsewhere, and the standalone page is not served on a hosted node.
+    ///
+    /// FALSIFY: delete the hosted early return in `maybe_alert_no_tab`.
+    #[test]
+    fn a_hosted_node_never_opens_a_browser_for_a_prompt() {
+        use std::sync::Mutex;
+        let opened: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let recorder: NoTabNotifier = {
+            let opened = opened.clone();
+            Arc::new(move |url: &str| opened.lock().unwrap().push(url.to_string()))
+        };
+        let prompter = DashboardPrompter::with_notifier(
+            Arc::new(DashMap::new()),
+            test_ws_addr(),
+            recorder,
+            true,
+        );
+        prompter.maybe_alert_no_tab("nonce-hosted", 0);
+        assert!(
+            opened.lock().unwrap().is_empty(),
+            "a hosted node must not open a browser for a prompt"
+        );
+    }
+
+    /// One hosted user token holds at most `MAX_PENDING_PROMPTS_PER_USER`
+    /// prompts, and a token at that cap does not stop a prompt under another
+    /// token while the node-wide cap has room. The node-wide cap is shared:
+    /// several tokens at their cap can fill it, and this test does not claim
+    /// otherwise.
+    ///
+    /// FALSIFY: delete the per-user cap in `show_and_wait`; user A's prompt
+    /// past the cap registers. Count every pending prompt instead of A's
+    /// own; user B's prompt is refused.
+    #[tokio::test]
+    async fn one_hosted_user_at_the_prompt_cap_does_not_block_another_user() {
+        let pending: PendingPrompts = Arc::new(DashMap::new());
+        let prompter = hosted_prompter(pending.clone());
+        let req = make_test_request("Allow this?", vec!["Allow"]);
+
+        // One below the cap: A's next prompt is still shown.
+        for i in 0..MAX_PENDING_PROMPTS_PER_USER - 1 {
+            insert_owned(&pending, &format!("a-{i}"), Some(user(0xA)));
+        }
+        let mut below = Box::pin(prompter.prompt(&req, "dkey", webapp("cid"), Some(user(0xA))));
+        assert!(
+            futures::poll!(below.as_mut()).is_pending(),
+            "a user below the cap must get the prompt"
+        );
+        assert_eq!(pending.len(), MAX_PENDING_PROMPTS_PER_USER);
+
+        // At the cap: A's next prompt is refused at once.
+        let mut over = Box::pin(prompter.prompt(&req, "dkey", webapp("cid"), Some(user(0xA))));
+        assert!(
+            matches!(futures::poll!(over.as_mut()), std::task::Poll::Ready(None)),
+            "a user at the cap must be refused"
+        );
+        assert_eq!(pending.len(), MAX_PENDING_PROMPTS_PER_USER);
+
+        // Another user is not blocked by A.
+        let mut other = Box::pin(prompter.prompt(&req, "dkey", webapp("cid"), Some(user(0xB))));
+        assert!(
+            futures::poll!(other.as_mut()).is_pending(),
+            "a user at the cap must not block another user's prompt"
+        );
+        assert_eq!(
+            pending
+                .iter()
+                .filter(|e| e.value().owner == Some(user(0xB)))
+                .count(),
+            1
+        );
+    }
+
+    /// Concurrent prompts cannot together pass the caps: the counts and the
+    /// insert are one critical section, shared by every prompter in the
+    /// process. With a pause inside that section, every prompt would pass the
+    /// counts during the pause if they were not. The prompts alternate between
+    /// three prompters over one map. One user's 24 concurrent prompts leave at
+    /// most `MAX_PENDING_PROMPTS_PER_USER` registered, and 64 users'
+    /// concurrent prompts leave at most `MAX_PENDING_PROMPTS`.
+    ///
+    /// Serial with the other users of the shared prompt-event channel, which
+    /// these prompts publish to. Every wait is bounded, so a panicking thread
+    /// fails the test instead of hanging it.
+    ///
+    /// FALSIFY: in `show_and_wait`, drop the admission guard before the pause
+    /// (`drop(_admission)`), or give each prompter its own lock; far more
+    /// prompts than the caps register.
+    #[test]
+    #[serial_test::serial(prompt_events)]
+    fn concurrent_hosted_prompts_cannot_pass_the_caps_together() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        const WAIT_LIMIT: Duration = Duration::from_secs(60);
+
+        fn wait_until(what: &str, cond: impl Fn() -> bool) {
+            let deadline = std::time::Instant::now() + WAIT_LIMIT;
+            while !cond() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "timed out waiting for {what}"
+                );
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+
+        fn registered_after_concurrent_prompts(owners: Vec<UserId>) -> PendingPrompts {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .unwrap();
+            let pending: PendingPrompts = Arc::new(DashMap::new());
+            // Three, not two: a lock per prompter would then admit in rounds of
+            // three, which overshoots both caps (9 and 33) rather than landing
+            // on them.
+            let prompters: Vec<Arc<DashboardPrompter>> = (0..3)
+                .map(|_| {
+                    let mut p = hosted_prompter(pending.clone());
+                    // Long enough that, without the lock, every thread released
+                    // by the start gate reaches the counts inside one pause even
+                    // on a loaded machine.
+                    p.admission_pause = Duration::from_millis(100);
+                    Arc::new(p)
+                })
+                .collect();
+            let n = owners.len();
+            let ready = Arc::new(AtomicUsize::new(0));
+            let polled = Arc::new(AtomicUsize::new(0));
+            let release = Arc::new(AtomicBool::new(false));
+            let threads: Vec<_> = owners
+                .into_iter()
+                .enumerate()
+                .map(|(i, owner)| {
+                    let (prompter, handle) = (prompters[i % 3].clone(), rt.handle().clone());
+                    let (ready, polled, release) = (ready.clone(), polled.clone(), release.clone());
+                    std::thread::spawn(move || {
+                        let req = make_test_request("Allow this?", vec!["Allow"]);
+                        let mut fut = Box::pin(prompter.prompt(
+                            &req,
+                            "dkey",
+                            CallerIdentity::None,
+                            Some(owner),
+                        ));
+                        ready.fetch_add(1, Ordering::SeqCst);
+                        wait_until("every thread to be ready", || {
+                            ready.load(Ordering::SeqCst) == n
+                        });
+                        handle.block_on(async {
+                            drop(futures::poll!(fut.as_mut()));
+                        });
+                        polled.fetch_add(1, Ordering::SeqCst);
+                        wait_until("the release", || release.load(Ordering::SeqCst));
+                        drop(fut);
+                    })
+                })
+                .collect();
+            wait_until("every prompt to be polled", || {
+                polled.load(Ordering::SeqCst) == n
+            });
+            let snapshot: PendingPrompts = Arc::new(DashMap::new());
+            for e in pending.iter() {
+                insert_owned(&snapshot, e.key(), e.value().owner);
+            }
+            release.store(true, Ordering::SeqCst);
+            for t in threads {
+                t.join().unwrap();
+            }
+            snapshot
+        }
+
+        let one_user = registered_after_concurrent_prompts(vec![user(7); 24]);
+        assert_eq!(
+            one_user.len(),
+            MAX_PENDING_PROMPTS_PER_USER,
+            "one user token's concurrent prompts must stop at the per-user cap"
+        );
+
+        let many_users = registered_after_concurrent_prompts((0..64u8).map(user).collect());
+        assert_eq!(
+            many_users.len(),
+            MAX_PENDING_PROMPTS,
+            "concurrent prompts must stop at the node-wide cap"
+        );
+    }
+
+    /// The node builds its prompter from its client-API config, hosted flag
+    /// included.
+    ///
+    /// FALSIFY: pass `false` instead of `ws_api.hosted_mode` in
+    /// `dashboard_prompter_for`.
+    #[test]
+    fn the_node_prompter_takes_the_hosted_flag_from_the_config() {
+        let mut ws_api = crate::config::WebsocketApiConfig::from(test_ws_addr());
+        ws_api.hosted_mode = true;
+        let hosted = dashboard_prompter_for(&ws_api);
+        assert!(
+            hosted.hosted_mode,
+            "a hosted config must build a hosted prompter"
+        );
+        assert_eq!(hosted.dashboard_authority, "127.0.0.1:7509");
+        ws_api.hosted_mode = false;
+        assert!(!dashboard_prompter_for(&ws_api).hosted_mode);
+    }
+
+    /// On a node that is not hosted the per-user cap does not apply; only the
+    /// node-wide cap does, as before.
+    #[tokio::test]
+    async fn the_per_user_cap_applies_only_on_a_hosted_node() {
+        let pending: PendingPrompts = Arc::new(DashMap::new());
+        let prompter = noop_prompter(pending.clone());
+        let req = make_test_request("Allow this?", vec!["Allow"]);
+        for i in 0..MAX_PENDING_PROMPTS_PER_USER {
+            insert_owned(&pending, &format!("n-{i}"), None);
+        }
+        let mut more = Box::pin(prompter.prompt(&req, "dkey", webapp("cid"), None));
+        assert!(futures::poll!(more.as_mut()).is_pending());
     }
 
     #[test]
@@ -1050,7 +1605,7 @@ mod tests {
     async fn test_auto_approve_with_three_responses() {
         let req = make_test_request("Allow?", vec!["Allow Once", "Always Allow", "Deny"]);
         let result = AutoApprovePrompter
-            .prompt(&req, "dkey", webapp("cid"))
+            .prompt(&req, "dkey", webapp("cid"), None)
             .await;
         let (idx, response) = result.unwrap();
         assert_eq!(idx, 0);
@@ -1060,7 +1615,9 @@ mod tests {
     #[tokio::test]
     async fn test_auto_deny_with_multiple_responses() {
         let req = make_test_request("Allow?", vec!["Allow Once", "Always Allow", "Deny"]);
-        let result = AutoDenyPrompter.prompt(&req, "dkey", webapp("cid")).await;
+        let result = AutoDenyPrompter
+            .prompt(&req, "dkey", webapp("cid"), None)
+            .await;
         assert!(result.is_none());
     }
 
@@ -1079,7 +1636,7 @@ mod tests {
         let pending_clone = pending.clone();
         let handle = tokio::spawn(async move {
             prompter
-                .prompt(&req, "DLGKEY123", webapp("CONTRACT456"))
+                .prompt(&req, "DLGKEY123", webapp("CONTRACT456"), None)
                 .await
         });
 
@@ -1113,10 +1670,11 @@ mod tests {
 
         let req = make_test_request("Approve?", vec!["Allow"]);
         let pending_clone = pending.clone();
-        let handle =
-            tokio::spawn(
-                async move { prompter.prompt(&req, "DLGKEY", CallerIdentity::None).await },
-            );
+        let handle = tokio::spawn(async move {
+            prompter
+                .prompt(&req, "DLGKEY", CallerIdentity::None, None)
+                .await
+        });
 
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
@@ -1144,7 +1702,7 @@ mod tests {
         // Spawn the prompt in a task
         let pending_clone = pending.clone();
         let handle =
-            tokio::spawn(async move { prompter.prompt(&req, "dkey", webapp("cid")).await });
+            tokio::spawn(async move { prompter.prompt(&req, "dkey", webapp("cid"), None).await });
 
         // Wait briefly for the prompt to be inserted
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -1186,8 +1744,11 @@ mod tests {
         let req = make_test_request("lifecycle?", vec!["Allow", "Deny"]);
 
         let pending_clone = pending.clone();
-        let handle =
-            tokio::spawn(async move { prompter.prompt(&req, "dkey-lc", webapp("cid-lc")).await });
+        let handle = tokio::spawn(async move {
+            prompter
+                .prompt(&req, "dkey-lc", webapp("cid-lc"), None)
+                .await
+        });
 
         // Drain events until we see our specific Added (other tests in the
         // same process may fire concurrently against the global broadcast).
@@ -1214,7 +1775,7 @@ mod tests {
         let mut saw_removed = false;
         for _ in 0..50 {
             match tokio::time::timeout(Duration::from_millis(200), rx.recv()).await {
-                Ok(Ok(PromptEvent::Removed { nonce: n })) if n == nonce => {
+                Ok(Ok(PromptEvent::Removed { nonce: n, .. })) if n == nonce => {
                     saw_removed = true;
                     break;
                 }
@@ -1252,7 +1813,7 @@ mod tests {
 
         let handle = tokio::spawn(async move {
             prompter
-                .prompt(&req, "dkey-timeout", webapp("cid-timeout"))
+                .prompt(&req, "dkey-timeout", webapp("cid-timeout"), None)
                 .await
         });
 
@@ -1281,7 +1842,7 @@ mod tests {
         let mut saw_removed = false;
         for _ in 0..50 {
             match rx.try_recv() {
-                Ok(PromptEvent::Removed { nonce: n }) if n == nonce => {
+                Ok(PromptEvent::Removed { nonce: n, .. }) if n == nonce => {
                     saw_removed = true;
                     break;
                 }
@@ -1316,8 +1877,12 @@ mod tests {
             let opened = opened.clone();
             Arc::new(move |url: &str| opened.lock().unwrap().push(url.to_string()))
         };
-        let prompter =
-            DashboardPrompter::with_notifier(Arc::new(DashMap::new()), test_ws_addr(), recorder);
+        let prompter = DashboardPrompter::with_notifier(
+            Arc::new(DashMap::new()),
+            test_ws_addr(),
+            recorder,
+            false,
+        );
 
         // A tab is connected (>= 1 subscriber): do not open the browser.
         prompter.maybe_alert_no_tab("nonce-with-tab", 1);
@@ -1350,6 +1915,7 @@ mod tests {
             Arc::new(DashMap::new()),
             SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 41234),
             recorder,
+            false,
         );
 
         prompter.maybe_alert_no_tab("abc", 0);
@@ -1373,8 +1939,12 @@ mod tests {
             let opened = opened.clone();
             Arc::new(move |url: &str| opened.lock().unwrap().push(url.to_string()))
         };
-        let prompter =
-            DashboardPrompter::with_notifier(Arc::new(DashMap::new()), test_ws_addr(), recorder);
+        let prompter = DashboardPrompter::with_notifier(
+            Arc::new(DashMap::new()),
+            test_ws_addr(),
+            recorder,
+            false,
+        );
 
         // First no-tab prompt opens a tab; the burst that follows (no virtual
         // time elapsed) is suppressed.

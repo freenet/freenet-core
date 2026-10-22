@@ -1321,6 +1321,9 @@ async fn run_user_input_prompts<P>(
     delegate_key: &DelegateKey,
     delegate_key_str: &str,
     caller: CallerIdentity,
+    // The hosted user the prompts belong to: the run's own user. A hosted
+    // node shows each prompt only to its owner (`user_input::UserInputPrompter`).
+    owner: Option<crate::wasm_runtime::UserId>,
     // Answers are appended AS THEY ARRIVE rather than returned at the end, so a
     // caller whose overall budget expires mid-sequence still keeps the ones a
     // human already answered (#5544 S6).
@@ -1331,7 +1334,7 @@ async fn run_user_input_prompts<P>(
     for req in requests {
         let request_id = req.request_id;
         let response = match prompter
-            .prompt(&req, delegate_key_str, caller.clone())
+            .prompt(&req, delegate_key_str, caller.clone(), owner)
             .await
         {
             Some((_, response)) => response,
@@ -1624,6 +1627,24 @@ where
                     tracing::debug!(
                         delegate_key = %delegate_key,
                         "Delegate request refused: parameters do not match the delegate key"
+                    );
+                    return DelegateRunOutcome::Failed(err);
+                }
+                if err.is_unregister_not_local() || err.is_unregister_hosted() {
+                    tracing::debug!(
+                        delegate_key = %delegate_key,
+                        error = %err,
+                        "Delegate request refused: UnregisterDelegate not allowed for this client"
+                    );
+                    return DelegateRunOutcome::Failed(err);
+                }
+                // A node path that did not supply the run's user; the executor
+                // already logged it with the key (at warn the first time).
+                if err.is_hosted_run_without_user() {
+                    tracing::debug!(
+                        delegate_key = %delegate_key,
+                        "Delegate run refused: a hosted node runs a delegate only on \
+                         behalf of a user"
                     );
                     return DelegateRunOutcome::Failed(err);
                 }
@@ -2517,7 +2538,7 @@ where
         // Design notes:
         // - Delivery is intentionally single-hop: if target delegate B emits its own
         //   SendDelegateMessage in response, it is filtered out (not delivered). This
-        //   prevents infinite recursion between delegates. We use execute_delegate_request
+        //   prevents infinite recursion between delegates. We use execute_delegate_hop
         //   (not the full delivery loop) for the same reason.
         // - Target delegate runs with the params IT was registered with on this node
         //   (`registered_delegate_params`, #5616), never the caller's and never empty
@@ -2547,7 +2568,7 @@ where
                 let target_key = msg.target.clone();
                 // PER-DELEGATE EXCLUSION, second door (#5544 B2).
                 //
-                // This is the SECOND call site of `execute_delegate_request`,
+                // This is the second executor call (`execute_delegate_hop`),
                 // and it invokes the TARGET delegate, not the calling one — so
                 // `dispatch_delegate_request`'s check upstream says nothing
                 // about it. Delivering here while the target is parked would
@@ -2612,14 +2633,18 @@ where
 
                 match contract_handler
                     .executor()
-                    // Inter-delegate hop: `user_context = None`. A
-                    // delegate-to-delegate message does NOT carry the
-                    // originating connection's per-user secret namespace — the
-                    // target delegate's secrets are its own, scoped to whatever
-                    // (if any) user context its own connections present. This
-                    // keeps the per-user namespace bound to the connection
-                    // boundary, not propagated transitively through delegate
-                    // messages (part of the #4381 unforgeability invariant).
+                    // Inter-delegate hop: the target runs under the ORIGINATING
+                    // user, the one whose request led to the hop. On a hosted
+                    // node every delegate run belongs to a user, so the hop
+                    // gets that user's secrets and that user's delegate
+                    // context, and nothing else. The user comes from the
+                    // connection boundary through `user_context`, never from
+                    // the message. So a delegate that calls another delegate
+                    // makes that target run as the same user, as on a node that
+                    // is not hosted, where `user_context` is `None` and both
+                    // run under the node-local secrets. The target sees the
+                    // caller as the attested origin and decides what to allow.
+                    //
                     // The ORIGINATING connection's scope rides along, never a
                     // literal `Local`: a hop driven by an off-host caller must
                     // not manufacture an attested `MessageOrigin::Delegate` that
@@ -2636,13 +2661,8 @@ where
                     // of the delegate that actually ran) and is a hash of that
                     // delegate's own code, so it is self-authenticating rather
                     // than borrowed authority.
-                    .execute_delegate_request(
-                        target_req,
-                        None,
-                        Some(delegate_key),
-                        connection_scope,
-                        None,
-                    )
+                    //
+                    .execute_delegate_hop(target_req, delegate_key, connection_scope, user_context)
                     .await
                 {
                     Ok(freenet_stdlib::client_api::HostResponse::DelegateResponse {
@@ -2768,8 +2788,22 @@ where
             // (GHSA-824h-7x5x-wfmf). See `caller_identity_from_origin`.
             let caller = caller_identity_from_origin(origin_contract);
             let delegate_key_str = delegate_key.to_string();
+            // The prompts belong to the run's user. A hosted node shows each
+            // prompt only to that user. On a hosted node every delegate run
+            // belongs to a user (a client request's or, for a hop, the
+            // originating user's), so only a node that is not hosted raises
+            // prompts with no owner.
+            let prompt_owner = user_context.map(|u| *u.user_id());
 
             if let Some(ctx) = parking.as_mut() {
+                // The park holds the run's delegate context while it waits:
+                // the context cache drops its oldest entries when it is over
+                // budget, and this entry is older than anything written while
+                // the run waits. `handle_delegate_resume` puts it back. The
+                // context belongs to the run's user, as `prompt_owner` does.
+                let parked_context = contract_handler
+                    .executor()
+                    .take_delegate_context(delegate_key, prompt_owner.as_ref());
                 let continuation = delegate_park::Continuation {
                     params: current_params.clone(),
                     origin_contract: origin_contract.copied(),
@@ -2789,6 +2823,7 @@ where
                     responder: ctx.carried_responder.take(),
                     delivery: ctx.delivery,
                     node_wide_duty: ctx.node_wide_duty,
+                    context: parked_context,
                 };
                 // Charge what the OFF-LOOP TASK will retain, not just what the
                 // continuation points at: the prompts and the deferred upserts
@@ -2971,6 +3006,7 @@ where
                                         &key,
                                         &delegate_key_str,
                                         caller,
+                                        prompt_owner,
                                         &answers_sink,
                                     )
                                     .await;
@@ -3020,6 +3056,15 @@ where
                         iterations = continuation.iterations;
                         self_heal_fetches_started = continuation.self_heal_fetches_started;
                         *ctx.carried_responder = continuation.responder;
+                        // The run continues inline on this loop, so its
+                        // context goes back to the cache now.
+                        if let Some(context) = continuation.context {
+                            contract_handler.executor().restore_delegate_context(
+                                delegate_key,
+                                prompt_owner.as_ref(),
+                                context,
+                            );
+                        }
                     }
                 }
             }
@@ -3062,6 +3107,7 @@ where
                     delegate_key,
                     &delegate_key_str,
                     caller,
+                    prompt_owner,
                     &sink,
                 )
                 .await;
@@ -4491,8 +4537,24 @@ async fn handle_delegate_notification<CH, P>(
     // On the resume path, where this frame is long gone,
     // `route_notification_outbound` prunes closed registrations only for the
     // delegate it routes for, and only when the run produced an
-    // `ApplicationMessage` to route, because that is when `route_to_apps` runs.
+    // `ApplicationMessage` to route, because that is when `route_to_apps_for` runs.
     delegate_app_registry::sweep_closed();
+
+    // ON A HOSTED NODE THE NODE RUNS NO DELEGATE ON ITS OWN.
+    //
+    // On a hosted node every delegate run belongs to a user: a client request
+    // runs under its connection's user, and a hop under the originating
+    // user's. A contract notification is a run the node starts, not one a user
+    // asked for, so a hosted node does not run it. Nothing is run, queued or
+    // delivered. The sweep above still runs, because it reaps registrations
+    // for every delegate. This is the second guard: the executor builds and
+    // sends no notification on a hosted node in the first place
+    // (`send_delegate_contract_notifications`).
+    let hosted = contract_handler.executor().hosted_mode();
+    if hosted {
+        report_hosted_notification_skipped(&delegate_key, &contract_id);
+        return;
+    }
 
     // THE DELEGATE'S REGISTERED PARAMETERS, NOT EMPTY ONES (#5616).
     //
@@ -4616,11 +4678,11 @@ async fn handle_delegate_notification<CH, P>(
         // this hardcodes `Local` to keep the delegate's own inherited
         // attestation intact exactly as before.
         //
-        // That hardcoded `Local` is precisely why the inter-delegate hop must be
-        // SUPPRESSED below: a non-local caller can steer WHICH delegate runs here
-        // (drive it once, have it subscribe, then trigger a state change), so a
-        // hop under this scope would hand back the attestation the caller was
-        // refused. See the guard in `handle_delegate_with_contract_requests`.
+        // That hardcoded `Local` is why the inter-delegate hop is SUPPRESSED
+        // for this run: which delegate runs here is not tied to the scope of
+        // any caller, so a hop from it may not carry a scope at all. A hop
+        // carries only the originating connection's scope. See the guard in
+        // `handle_delegate_with_contract_requests`.
         crate::client_events::ConnectionScope::Local,
         InterDelegateDispatch::Suppressed,
         // Contract-state-change notification: not driven by a client
@@ -4658,8 +4720,40 @@ async fn handle_delegate_notification<CH, P>(
         // logged inside `handle_delegate_with_contract_requests` (#5263).
         DelegateRunOutcome::Failed(_) => {}
         DelegateRunOutcome::Completed(outbound) => {
-            route_notification_outbound(&delegate_key, outbound);
+            route_notification_outbound(&delegate_key, hosted, None, outbound);
         }
+    }
+}
+
+/// Contract notifications a hosted node did not run, since start.
+static HOSTED_NOTIFICATIONS_SKIPPED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Record a contract notification a hosted node did not run: once per process
+/// at info, so an operator can see the rule apply, then at debug with the
+/// running count, since a busy delegate is notified many times a minute.
+fn report_hosted_notification_skipped(
+    delegate_key: &DelegateKey,
+    contract_id: &ContractInstanceId,
+) {
+    let total = HOSTED_NOTIFICATIONS_SKIPPED
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        .saturating_add(1);
+    if total == 1 {
+        tracing::info!(
+            delegate = %delegate_key,
+            contract = %contract_id,
+            "Contract notification not run: on a hosted node every delegate run \
+             belongs to a user, so the node runs no delegate on its own. Logged \
+             once; later ones are counted at debug"
+        );
+    } else {
+        tracing::debug!(
+            delegate = %delegate_key,
+            contract = %contract_id,
+            total,
+            "Contract notification not run on a hosted node"
+        );
     }
 }
 
@@ -4669,7 +4763,17 @@ async fn handle_delegate_notification<CH, P>(
 /// Split out of `handle_delegate_notification` because a run that PARKS
 /// finishes on a later loop iteration inside `handle_delegate_resume`, by which
 /// point the original call frame is gone — both paths must route identically.
-fn route_notification_outbound(delegate_key: &DelegateKey, outbound: Vec<OutboundDelegateMsg>) {
+///
+/// On a hosted node every delegate run belongs to a user, and its output
+/// reaches only that user's registrations. A hosted run with no user delivers
+/// nothing. On a node that is not hosted the output reaches every local
+/// registration, as it always has. See [`notification_recipients`].
+fn route_notification_outbound(
+    delegate_key: &DelegateKey,
+    hosted: bool,
+    user: Option<&UserSecretContext>,
+    outbound: Vec<OutboundDelegateMsg>,
+) {
     // Route outbound ApplicationMessages to the apps registered with this
     // delegate (#3275). handle_delegate_with_contract_requests already
     // processed the contract requests (GET/PUT/UPDATE/SUBSCRIBE) internally;
@@ -4704,6 +4808,15 @@ fn route_notification_outbound(delegate_key: &DelegateKey, outbound: Vec<Outboun
         return;
     }
 
+    let Some(recipients) = notification_recipients(hosted, user) else {
+        tracing::debug!(
+            delegate = %delegate_key,
+            "Delegate output not delivered: on a hosted node a run's output goes \
+             only to the user the run belongs to, and this run has no user"
+        );
+        return;
+    };
+
     // One HostResponse per ApplicationMessage so an app sees each reply as a
     // distinct DelegateResponse, exactly as it would for a client-initiated
     // ApplicationMessages request.
@@ -4713,7 +4826,8 @@ fn route_notification_outbound(delegate_key: &DelegateKey, outbound: Vec<Outboun
                 key: delegate_key.clone(),
                 values: vec![app_msg],
             });
-        let delivered = delegate_app_registry::route_to_apps(delegate_key, response);
+        let delivered =
+            delegate_app_registry::route_to_apps_for(delegate_key, recipients, response);
         if delivered == 0 {
             // `debug!` on purpose. This fires once per notification, so at
             // `release_max_level_info` it would ship one line per contract-state
@@ -4725,13 +4839,27 @@ fn route_notification_outbound(delegate_key: &DelegateKey, outbound: Vec<Outboun
             //
             // The case that IS a security event — a registration that exists but
             // is withheld from delivery — is reported at INFO by
-            // `route_to_apps`, once per registration.
+            // `route_to_apps_for`, once per registration.
             tracing::debug!(
                 delegate = %delegate_key,
                 "Delegate notification produced an ApplicationMessage but no \
                  local app is registered with this delegate — nothing to route to"
             );
         }
+    }
+}
+
+/// Who a delegate run's output may reach: on a hosted node only the run's own
+/// user, and nobody when the run has no user; on a node that is not hosted
+/// every local registration.
+fn notification_recipients(
+    hosted: bool,
+    user: Option<&UserSecretContext>,
+) -> Option<delegate_app_registry::Recipients<'_>> {
+    match (hosted, user) {
+        (true, Some(user)) => Some(delegate_app_registry::Recipients::User(user.user_id())),
+        (true, None) => None,
+        (false, _) => Some(delegate_app_registry::Recipients::EveryLocal),
     }
 }
 
@@ -4858,6 +4986,7 @@ fn capability_hook(
     req: &DelegateRequest<'_>,
     origin_contract: Option<&ContractInstanceId>,
     connection_scope: crate::client_events::ConnectionScope,
+    hosted_user: bool,
 ) -> Option<CapabilityHook> {
     if !capabilities_enabled {
         return None;
@@ -4891,10 +5020,19 @@ fn capability_hook(
                 app,
             })
         }
-        // Only a local connection may drop the record: a remote caller could
-        // otherwise unregister a delegate to reset its Installed flag and its
-        // app bindings (UnregisterDelegate itself is not gated, pre-existing).
-        DelegateRequest::UnregisterDelegate(key) if connection_scope.is_local() => {
+        // Only a local connection may drop the record. The executor already
+        // refuses a non-local UnregisterDelegate before removing anything, and
+        // this hook runs only after the unregister succeeded, so with the real
+        // executor a non-local one never reaches it. The scope check stays so
+        // the record does not depend on that: it is also what a `ContractExecutor`
+        // that does not apply the refusal (the test mock) is held to.
+        //
+        // A hosted user's unregister removes only that user's own push
+        // registrations, so it must not drop a record every user of the
+        // delegate shares.
+        // Capabilities are disabled on hosted nodes today; this keeps the
+        // record safe if that ever changes.
+        DelegateRequest::UnregisterDelegate(key) if connection_scope.is_local() && !hosted_user => {
             Some(CapabilityHook::Unregistered {
                 key: key.clone(),
                 app: origin_contract.map(|id| delegate_capabilities::AppIdentity::WebApp(*id)),
@@ -5014,7 +5152,11 @@ enum LifecycleOutcome {
 /// Runs like a notification run: no origin, no client, `Local` scope with the
 /// inter-delegate hop SUPPRESSED (the node, not a caller, chose to run it, so
 /// there is no caller scope to forward), residual `ApplicationMessage`s fanned
-/// out to registered apps. Unlike a notification run it gets the delegate's
+/// out to registered apps. Unlike a notification run it has no user, which is
+/// why only a node that is not hosted starts one: a hosted node has no
+/// delegate capabilities, and on a hosted node every delegate run belongs to a
+/// user (the executor refuses one without, and its output would reach
+/// nobody). Unlike a notification run it gets the delegate's
 /// REGISTERED parameters, and it is admitted by the duty budget: the same one
 /// for both kinds.
 ///
@@ -5233,7 +5375,11 @@ where
             } else {
                 tracing::info!(delegate = %key, event = ?run.event, "Delivered lifecycle event to delegate");
             }
-            route_notification_outbound(&key, outbound);
+            // A lifecycle run has no user. A hosted node does not start one
+            // (it has no capabilities), and if it ever did the output would
+            // reach nobody rather than every local app.
+            let hosted = contract_handler.executor().hosted_mode();
+            route_notification_outbound(&key, hosted, None, outbound);
         }
     }
     LifecycleOutcome::Ran
@@ -5293,6 +5439,7 @@ async fn dispatch_delegate_request<CH, P>(
         &req,
         origin_contract.as_ref(),
         connection_scope,
+        user_context.is_some(),
     );
 
     // INVARIANT this function is the chokepoint for, load-bearing for TWO
@@ -5306,10 +5453,11 @@ async fn dispatch_delegate_request<CH, P>(
     // it is RUNNING. So the window parking opens is one in which a DIFFERENT
     // delegate may START, not one in which two may RUN:
     //
-    //   * `execute_delegate_request` is reached only via
-    //     `handle_delegate_with_contract_requests`, whose every caller — this
-    //     function, `handle_delegate_notification` and `handle_delegate_resume`
-    //     — is awaited from `contract_handling`, one task per node.
+    //   * `execute_delegate_request` and `execute_delegate_hop` are reached
+    //     only via `handle_delegate_with_contract_requests`, whose every caller
+    //     (this function, `handle_delegate_notification` and
+    //     `handle_delegate_resume`) is awaited from `contract_handling`, one
+    //     task per node.
     //   * The off-loop task #5544 spawns captures no `ContractHandler` and no
     //     executor, so it cannot invoke a delegate. It waits on a human and
     //     drives a sub-op GET; neither needs one.
@@ -5369,7 +5517,7 @@ async fn dispatch_delegate_request<CH, P>(
 
     // PER-DELEGATE EXCLUSION (#5544). While this delegate has a parked
     // continuation we must NOT run `process()` for it again: the context cache
-    // is keyed by delegate and last-write-wins, so a second run would overwrite
+    // is keyed by delegate and hosted user and each entry is last-write-wins, so a second run would overwrite
     // the parked continuation and it would resume reading the wrong bytes.
     // Queue instead, and drain on resume.
     if park.is_parked(&delegate_key) {
@@ -5754,7 +5902,19 @@ where
         responder,
         delivery,
         node_wide_duty,
+        context,
     } = continuation;
+    // Put back the context the run left when it parked, before anything below
+    // can run the delegate. Every end of a park comes through here (a resume
+    // and a TTL force-resume alike), so the context is put back whether or not
+    // the delegate is re-entered.
+    if let Some(context) = context {
+        contract_handler.executor().restore_delegate_context(
+            &delegate_key,
+            user_context.as_ref().map(|u| u.user_id()),
+            context,
+        );
+    }
     // The resumed leg is loop time like the first one: charge it to the same
     // duty buckets (#5748). Without this a background run that parks (every
     // off-loop contract fetch or network op does, not only prompts) spends
@@ -5908,7 +6068,13 @@ where
                     }
                 }
             }
-            delegate_park::Delivery::Apps => route_notification_outbound(&delegate_key, messages),
+            // A resumed run that fans out to apps delivers to the user it
+            // belongs to, carried in its continuation: on a hosted node only
+            // that user's registrations, and nobody when it has no user.
+            delegate_park::Delivery::Apps => {
+                let hosted = contract_handler.executor().hosted_mode();
+                route_notification_outbound(&delegate_key, hosted, user_context.as_ref(), messages)
+            }
         },
         // #5263 propagation from a RESUMED run: the client behind the park
         // still learns the execution failed, rather than getting an empty
@@ -6053,7 +6219,9 @@ async fn run_queued_notification<CH, P>(
         // logged inside `handle_delegate_with_contract_requests` (#5263).
         DelegateRunOutcome::Failed(_) => {}
         DelegateRunOutcome::Completed(outbound) => {
-            route_notification_outbound(delegate_key, outbound);
+            // Notifications are queued only on a node that is not hosted.
+            let hosted = contract_handler.executor().hosted_mode();
+            route_notification_outbound(delegate_key, hosted, None, outbound);
         }
     }
 }
@@ -7762,23 +7930,29 @@ mod tests {
         // counted those would report a true fact about the wrong text (#5450).
         let code = production_code();
 
-        // 1. The executor call is reached through ONE chokepoint.
+        // 1. The executor calls are reached through ONE chokepoint. There are
+        //    two entry points: the main call and the inter-delegate hop, which
+        //    has its own method so it can name the run's context user.
         let chokepoint = "handle_delegate_with_contract_requests";
-        for (idx, _) in code.match_indices(".execute_delegate_request(") {
-            let owner = enclosing_fn(&code, idx);
+        let executor_calls = [".execute_delegate_request(", ".execute_delegate_hop("];
+        for needle in executor_calls {
+            for (idx, _) in code.match_indices(needle) {
+                let owner = enclosing_fn(&code, idx);
+                assert_eq!(
+                    owner, chokepoint,
+                    "`{needle}` must be reached only from `{chokepoint}`, \
+                     which is what makes the node-wide serialization argument checkable. \
+                     Found a call in `{owner}`. If that function is genuinely awaited \
+                     from `contract_handling`, widen this pin deliberately and say why."
+                );
+            }
             assert_eq!(
-                owner, chokepoint,
-                "`execute_delegate_request` must be reached only from `{chokepoint}`, \
-                 which is what makes the node-wide serialization argument checkable. \
-                 Found a call in `{owner}`. If that function is genuinely awaited \
-                 from `contract_handling`, widen this pin deliberately and say why."
+                code.matches(needle).count(),
+                1,
+                "expected exactly one `{needle}` call: the main call and the \
+                 inter-delegate hop each have one"
             );
         }
-        assert_eq!(
-            code.matches(".execute_delegate_request(").count(),
-            2,
-            "expected exactly the main call and the inter-delegate hop"
-        );
 
         // 2. Only the documented on-loop functions enter the chokepoint.
         //    Every one of these is awaited from `contract_handling`.
@@ -7826,8 +8000,8 @@ mod tests {
         //    thing, which is the defect this workstream keeps finding.
         //
         //    The "does it exist to be absent from" half is carried by the two
-        //    assertions above: `.execute_delegate_request(` is pinned at
-        //    exactly 2 occurrences and `callers` is pinned non-empty, so
+        //    assertions above: each executor call is pinned at exactly one
+        //    occurrence and `callers` is pinned non-empty, so
         //    neither needle can be renamed away while this check reports a
         //    clean zero. `spawned_bodies` panics on an unrecognised spawn form
         //    rather than skipping it, and the assertion below pins that it
@@ -7852,8 +8026,9 @@ mod tests {
         // shortcuts; it does not prove the property on its own.
         let allowed_calls: Vec<String> = allowed.iter().map(|a| format!("{a}(")).collect();
         for body in &spawned {
-            for needle in [chokepoint, ".execute_delegate_request("]
+            for needle in [chokepoint]
                 .into_iter()
+                .chain(executor_calls)
                 .chain(allowed_calls.iter().map(String::as_str))
             {
                 assert!(
@@ -8090,11 +8265,11 @@ mod tests {
 
         // Isolate the hop's own executor call.
         let hop = body
-            .split(".execute_delegate_request(")
-            .nth(2)
-            .expect("the inter-delegate hop is the SECOND execute_delegate_request call");
-        // Bound on `.await`, not on the first `)` — the argument list itself
-        // contains parentheses (`Some(delegate_key)`).
+            .split(".execute_delegate_hop(")
+            .nth(1)
+            .expect("the inter-delegate hop calls execute_delegate_hop");
+        // Bound on `.await`, not on the first `)`: the argument list itself
+        // contains parentheses (`user_context.map(..)`).
         let hop_args = hop
             .split(".await")
             .next()
@@ -8107,6 +8282,14 @@ mod tests {
             !hop_args.contains("ConnectionScope::Local"),
             "the hop must NOT hardcode a scope — that is the laundering bug this \
              replaced the removed registration-record gate to avoid; got args: {hop_args}"
+        );
+        // The whole argument list, in order: the target request, the calling
+        // delegate, the originating scope, and the originating user, under
+        // whose secrets and delegate context the target runs.
+        let args: String = hop_args.chars().filter(|c| !c.is_whitespace()).collect();
+        assert_eq!(
+            args, "target_req,delegate_key,connection_scope,user_context)",
+            "the hop's arguments; got: {hop_args}"
         );
 
         // And the scopeless caller must not be able to reach it at all.
@@ -10560,6 +10743,7 @@ mod hol_4391_tests {
             _request: &UserInputRequest<'static>,
             _delegate_key: &str,
             _caller: user_input::CallerIdentity,
+            _owner: Option<crate::wasm_runtime::UserId>,
         ) -> Option<(usize, ClientResponse<'static>)> {
             self.gate
                 .acquire()
@@ -10572,6 +10756,253 @@ mod hol_4391_tests {
 
     fn test_delegate_key() -> DelegateKey {
         DelegateKey::new([7u8; 32], freenet_stdlib::prelude::CodeHash::new([7u8; 32]))
+    }
+
+    /// A prompter that answers at once and records the owner of every prompt
+    /// it is asked to show.
+    #[derive(Default)]
+    struct OwnerRecordingPrompter {
+        owners: Arc<std::sync::Mutex<Vec<Option<crate::wasm_runtime::UserId>>>>,
+    }
+
+    impl user_input::UserInputPrompter for OwnerRecordingPrompter {
+        async fn prompt(
+            &self,
+            _request: &UserInputRequest<'static>,
+            _delegate_key: &str,
+            _caller: user_input::CallerIdentity,
+            owner: Option<crate::wasm_runtime::UserId>,
+        ) -> Option<(usize, ClientResponse<'static>)> {
+            self.owners.lock().unwrap().push(owner);
+            Some((0, ClientResponse::new(b"approved".to_vec())))
+        }
+    }
+
+    fn delegate_event_for(
+        key: &DelegateKey,
+        user_context: Option<UserSecretContext>,
+    ) -> ContractHandlerEvent {
+        match delegate_event(key) {
+            ContractHandlerEvent::DelegateRequest {
+                req,
+                origin_contract,
+                connection_scope,
+                ..
+            } => ContractHandlerEvent::DelegateRequest {
+                req,
+                origin_contract,
+                connection_scope,
+                user_context,
+            },
+            other => panic!("delegate_event built {other}"),
+        }
+    }
+
+    /// A prompt raised by a parked delegate run belongs to the run's user, on
+    /// the first leg and on the resumed leg that prompts again. A run with no
+    /// user raises a prompt with no owner.
+    ///
+    /// FALSIFY: pass `None` instead of `prompt_owner` to
+    /// `run_user_input_prompts` at the parked call site in
+    /// `handle_delegate_with_contract_requests`, or derive `prompt_owner` as
+    /// `None`; the recorded owners are `None`.
+    #[tokio::test]
+    async fn a_parked_delegate_prompt_belongs_to_the_runs_user() {
+        let _guard = TEST_GUARD.lock().await;
+        let (mut handler, send) = build_handler(vec![]).await;
+        let script = handler.runtime_mut().delegate_script.clone();
+        // First leg prompts and parks; the resumed leg prompts again; the
+        // third leg finishes. Then a run with no user prompts once.
+        script.lock().unwrap().push_back(prompt_outbound().into());
+        script.lock().unwrap().push_back(prompt_outbound().into());
+        script.lock().unwrap().push_back(Vec::new().into());
+        script.lock().unwrap().push_back(prompt_outbound().into());
+        script.lock().unwrap().push_back(Vec::new().into());
+
+        let prompter = OwnerRecordingPrompter::default();
+        let owners = prompter.owners.clone();
+        let handle = GlobalExecutor::spawn(contract_handling(handler, prompter));
+
+        let user = UserSecretContext::from_token(b"prompt-owner-user");
+        let key = test_delegate_key();
+        let resp = tokio::time::timeout(
+            Duration::from_secs(10),
+            send.send_to_handler(delegate_event_for(&key, Some(user.clone()))),
+        )
+        .await
+        .expect("the user's delegate run must complete")
+        .expect("the run must be answered");
+        assert!(matches!(resp, ContractHandlerEvent::DelegateResponse(_)));
+        assert_eq!(
+            owners.lock().unwrap().as_slice(),
+            &[Some(*user.user_id()), Some(*user.user_id())],
+            "both prompts of the user's run, before and after the resume, must \
+             belong to that user"
+        );
+
+        let resp = tokio::time::timeout(
+            Duration::from_secs(10),
+            send.send_to_handler(delegate_event_for(&key, None)),
+        )
+        .await
+        .expect("the run with no user must complete")
+        .expect("the run must be answered");
+        assert!(matches!(resp, ContractHandlerEvent::DelegateResponse(_)));
+        assert_eq!(
+            owners.lock().unwrap().last().copied(),
+            Some(None),
+            "a run with no user raises a prompt with no owner"
+        );
+        handle.abort();
+    }
+
+    /// The inline path (no parking context, or the park cap reached) gives a
+    /// prompt the run's user too.
+    ///
+    /// FALSIFY: pass `None` instead of `prompt_owner` to
+    /// `run_user_input_prompts` at the inline call site.
+    #[tokio::test]
+    async fn an_inline_delegate_prompt_belongs_to_the_runs_user() {
+        let _guard = TEST_GUARD.lock().await;
+        let (mut handler, _send) = build_handler(vec![]).await;
+        let script = handler.runtime_mut().delegate_script.clone();
+        script.lock().unwrap().push_back(prompt_outbound().into());
+        script.lock().unwrap().push_back(Vec::new().into());
+
+        let prompter = Arc::new(OwnerRecordingPrompter::default());
+        let owners = prompter.owners.clone();
+        let user = UserSecretContext::from_token(b"inline-prompt-owner-user");
+        let key = test_delegate_key();
+        let ContractHandlerEvent::DelegateRequest { req, .. } = delegate_event(&key) else {
+            panic!("delegate_event builds a DelegateRequest");
+        };
+        let outcome = handle_delegate_with_contract_requests(
+            &mut handler,
+            req,
+            None,
+            crate::client_events::ConnectionScope::Local,
+            InterDelegateDispatch::Allowed,
+            Some(&user),
+            &key,
+            &prompter,
+            None,
+            RunSeed::default(),
+        )
+        .await;
+        assert!(
+            matches!(outcome, DelegateRunOutcome::Completed(_)),
+            "with no parking context the prompt runs inline and the run completes"
+        );
+        assert_eq!(owners.lock().unwrap().as_slice(), &[Some(*user.user_id())]);
+    }
+
+    /// When the park cap is reached the run continues inline, and the context
+    /// taken out for the refused park is put back first, so the next leg reads
+    /// what the first leg wrote.
+    ///
+    /// FALSIFY: drop the `restore_delegate_context` call in the
+    /// `ParkAdmission::Refused` arm: the second leg reads no context.
+    #[tokio::test]
+    async fn a_refused_park_puts_the_context_back_before_the_inline_leg() {
+        let _guard = TEST_GUARD.lock().await;
+        let (mut handler, _send) = build_handler(vec![]).await;
+        let script = handler.runtime_mut().delegate_script.clone();
+        let observations = handler.runtime_mut().delegate_observations.clone();
+        script.lock().unwrap().push_back(ScriptedRun {
+            outbound: prompt_outbound(),
+            writes_context: Some(b"written-before-the-refused-park".to_vec()),
+        });
+        script.lock().unwrap().push_back(Vec::new().into());
+
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut park = delegate_park::DelegateParkCtx::new(tx);
+        for n in 0..delegate_park::MAX_PARKED_DELEGATES {
+            let filler = DelegateKey::new(
+                [0xE0; 32],
+                freenet_stdlib::prelude::CodeHash::new([n as u8; 32]),
+            );
+            assert!(
+                matches!(
+                    park.park(
+                        filler,
+                        parked_continuation(),
+                        delegate_park::ByteCount::default()
+                    ),
+                    delegate_park::ParkAdmission::Admitted { .. }
+                ),
+                "filling the park registry to its cap"
+            );
+        }
+
+        let key = test_delegate_key();
+        let ContractHandlerEvent::DelegateRequest { req, .. } = delegate_event(&key) else {
+            panic!("delegate_event builds a DelegateRequest");
+        };
+        let mut carried = None;
+        let outcome = handle_delegate_with_contract_requests(
+            &mut handler,
+            req,
+            None,
+            crate::client_events::ConnectionScope::Local,
+            InterDelegateDispatch::Allowed,
+            None,
+            &key,
+            &Arc::new(crate::contract::user_input::AutoApprovePrompter),
+            Some(ParkingCtx {
+                park: &mut park,
+                delivery: delegate_park::Delivery::Client,
+                carried_responder: &mut carried,
+                node_wide_duty: false,
+            }),
+            RunSeed::default(),
+        )
+        .await;
+        assert!(
+            matches!(outcome, DelegateRunOutcome::Completed(_)),
+            "with the park cap reached the prompt runs inline and the run completes"
+        );
+        let seen: Vec<Option<Vec<u8>>> = observations
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|o| o.observed_context.clone())
+            .collect();
+        assert_eq!(
+            seen,
+            vec![None, Some(b"written-before-the-refused-park".to_vec())],
+            "the inline leg must read the context the first leg wrote"
+        );
+    }
+
+    /// `run_user_input_prompts` hands every prompt the owner it was given.
+    ///
+    /// FALSIFY: pass `None` instead of `owner` to `prompter.prompt` in
+    /// `run_user_input_prompts`.
+    #[tokio::test]
+    async fn run_user_input_prompts_forwards_the_owner_to_every_prompt() {
+        let prompter = OwnerRecordingPrompter::default();
+        let owner = Some(*UserSecretContext::from_token(b"forwarded-owner").user_id());
+        let requests = [prompt_outbound(), prompt_outbound()]
+            .into_iter()
+            .flatten()
+            .map(|m| match m {
+                OutboundDelegateMsg::RequestUserInput(r) => r,
+                other => panic!("prompt_outbound built {other:?}"),
+            })
+            .collect();
+        let sink = std::sync::Mutex::new(Vec::new());
+        run_user_input_prompts(
+            &prompter,
+            requests,
+            &test_delegate_key(),
+            "dkey",
+            user_input::CallerIdentity::None,
+            owner,
+            &sink,
+        )
+        .await;
+        assert_eq!(prompter.owners.lock().unwrap().as_slice(), &[owner, owner]);
+        assert_eq!(sink.into_inner().unwrap().len(), 2);
     }
 
     /// An `ApplicationMessage` carrying `payload`, followed by the prompt that
@@ -12258,7 +12689,73 @@ mod hol_4391_tests {
             delivery: delegate_park::Delivery::Client,
             node_wide_duty: false,
             self_heal_fetches_started: 0,
+            context: None,
         }
+    }
+
+    /// A park ended by the TTL sweep puts the parked run's context back, even
+    /// though the force-resume has nothing to feed back and does not re-enter
+    /// the delegate.
+    ///
+    /// FALSIFY: in `handle_delegate_resume`, move the context restore into the
+    /// branch that re-runs the delegate: the force-resume here takes the other
+    /// branch and the context is not put back.
+    #[tokio::test]
+    async fn a_force_resumed_park_puts_the_context_back() {
+        let _guard = TEST_GUARD.lock().await;
+        let (mut handler, _send) = build_handler(vec![]).await;
+        let contexts = handler.runtime_mut().delegate_contexts.clone();
+        let calls = handler.runtime_mut().delegate_calls.clone();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut park_ctx = delegate_park::DelegateParkCtx::new(tx);
+        let mut buffered = std::collections::VecDeque::new();
+        let prompter = Arc::new(crate::contract::user_input::AutoApprovePrompter);
+
+        let key = DelegateKey::new(
+            [0x6e; 32],
+            freenet_stdlib::prelude::CodeHash::new([0x6e; 32]),
+        );
+        let user = UserSecretContext::from_token(b"force-resumed-park-user");
+        let mut continuation = park_continuation();
+        continuation.user_context = Some(user.clone());
+        continuation.context = Some(b"left-when-the-run-parked".to_vec());
+        assert!(matches!(
+            park_ctx.park(
+                key.clone(),
+                continuation,
+                delegate_park::ByteCount::default()
+            ),
+            delegate_park::ParkAdmission::Admitted { .. }
+        ));
+
+        let past_due =
+            tokio::time::Instant::now() + delegate_park::PARK_TTL + Duration::from_secs(1);
+        let spent = sweep_expired_parks(
+            &mut handler,
+            &mut park_ctx,
+            &prompter,
+            &mut rx,
+            &mut buffered,
+            past_due,
+            MAX_RESUME_DRAIN_BATCH,
+        )
+        .await;
+        assert_eq!(spent, 1, "the sweep must force-resume the one park");
+        assert!(!park_ctx.is_parked(&key), "the park must have ended");
+        assert!(
+            calls.lock().unwrap().is_empty(),
+            "with nothing to feed back the force-resume must not re-enter the \
+             delegate, which is the branch this test is about"
+        );
+        assert_eq!(
+            contexts
+                .lock()
+                .unwrap()
+                .get(&(key.clone(), Some(*user.user_id())))
+                .cloned(),
+            Some(b"left-when-the-run-parked".to_vec()),
+            "the parked run's context must be back in the cache under its user"
+        );
     }
 
     /// THE BOUNDARY the sibling test cannot reach: a maximal-cost victim
@@ -13026,7 +13523,7 @@ mod hol_4391_tests {
         contexts
             .lock()
             .unwrap()
-            .insert(key.clone(), b"parked-continuation".to_vec());
+            .insert((key.clone(), None), b"parked-continuation".to_vec());
         assert!(
             matches!(
                 park.park(
@@ -13060,7 +13557,11 @@ mod hol_4391_tests {
         // (#5544 S7): the parked continuation's context must be untouched. An
         // extra `process()` is only a problem because it clobbers this.
         assert_eq!(
-            contexts.lock().unwrap().get(&key).map(Vec::as_slice),
+            contexts
+                .lock()
+                .unwrap()
+                .get(&(key.clone(), None))
+                .map(Vec::as_slice),
             Some(b"parked-continuation".as_slice()),
             "the parked continuation's context must be intact; a notification \
              that ran would have overwritten it and the delegate would resume \
@@ -13154,6 +13655,7 @@ mod hol_4391_tests {
         let (mut handler, send) = build_handler(vec![]).await;
         let script = handler.runtime_mut().delegate_script.clone();
         let contexts = handler.runtime_mut().delegate_contexts.clone();
+        let calls = handler.runtime_mut().delegate_calls.clone();
 
         let key_b = test_delegate_key();
         let key_a = DelegateKey::new([8u8; 32], freenet_stdlib::prelude::CodeHash::new([8u8; 32]));
@@ -13192,13 +13694,10 @@ mod hol_4391_tests {
         let kb = key_b.clone();
         let parked: tokio::task::JoinHandle<Result<ContractHandlerEvent, ContractError>> =
             GlobalExecutor::spawn(async move { send_b.send_to_handler(delegate_event(&kb)).await });
-        let probe = contexts.clone();
-        let kb_probe = key_b.clone();
-        wait_until("B to park with its continuation written", || {
-            probe.lock().unwrap().get(&kb_probe).map(Vec::as_slice)
-                == Some(b"b-parked-continuation".as_slice())
-        })
-        .await;
+        // B's first leg has run once its call is logged. The loop is serial,
+        // so A's request below is handled only after B has parked.
+        let probe = calls.clone();
+        wait_until("B's first leg to run", || probe.lock().unwrap().len() == 1).await;
 
         // Now drive A, which messages the parked B.
         let _ = tokio::time::timeout(
@@ -13208,11 +13707,27 @@ mod hol_4391_tests {
         .await
         .expect("A's own request must complete; only the hop to B is dropped");
 
+        // The park holds B's context while B waits, so the cache has no entry
+        // for B. A run of B now would write one.
         assert_eq!(
-            contexts.lock().unwrap().get(&key_b).map(Vec::as_slice),
-            Some(b"b-parked-continuation".as_slice()),
-            "an inter-delegate message must NOT re-enter a parked target; B's \
-             parked continuation was overwritten (#5544 B2)"
+            contexts
+                .lock()
+                .unwrap()
+                .get(&(key_b.clone(), None))
+                .map(Vec::as_slice),
+            None,
+            "an inter-delegate message must NOT re-enter a parked target; a run \
+             of B wrote B's context while B was parked (#5544 B2)"
+        );
+        assert_eq!(
+            calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|k| **k == key_b)
+                .count(),
+            1,
+            "B must have run only its first leg while parked"
         );
 
         gate.add_permits(1);
@@ -13438,6 +13953,7 @@ mod hol_4391_tests {
             responder: None,
             delivery: delegate_park::Delivery::Client,
             node_wide_duty: false,
+            context: None,
         }
     }
 
@@ -13753,8 +14269,8 @@ mod hol_4391_tests {
 
     /// THE EXCLUSION TEST. Pins the invariant that makes parking sound.
     ///
-    /// `DelegateContextCache` is keyed by `DelegateKey` and last-write-wins, so
-    /// it is only correct while at most one `process()` per delegate is in
+    /// `DelegateContextCache` has one entry per delegate and hosted user, each
+    /// last-write-wins, so it is only correct while at most one `process()` per delegate is in
     /// flight. Before #5544 the serial loop supplied that for free; parking
     /// removes it, so `DelegateParkCtx` has to supply it instead. If it did
     /// not, a second request would run `process()` and overwrite the parked
@@ -13849,5 +14365,694 @@ mod hol_4391_tests {
         );
 
         handle.abort();
+    }
+
+    /// A park, its resume and a request queued behind it each use the context
+    /// of their own hosted user. There is one context per delegate and hosted
+    /// user, so user A's resumed run reads the bytes A's first leg wrote, and
+    /// user B's request, queued behind A's park and drained after it, reads
+    /// and writes B's own entry.
+    ///
+    /// FALSIFY: (a) in `handle_delegate_resume`, pass `None` instead of the
+    /// continuation's `user_context.as_ref()` to
+    /// `handle_delegate_with_contract_requests`: the resumed run reads the
+    /// no-user entry and the first observation assertion fails. (b) where a
+    /// queued `PendingRun::Client` drains, pass `None` instead of its
+    /// `user_context`: B's run writes the no-user entry and the final-state
+    /// assertion fails. Mutation (b) failing is also the evidence that B
+    /// really was queued behind the park rather than run after it. (c) at the
+    /// park site, take the context with `None` instead of the run's user: A's
+    /// context stays in the cache, the cache drop removes it, and A's resumed
+    /// run reads no context.
+    #[tokio::test]
+    async fn park_resume_and_the_pending_queue_keep_each_hosted_users_context() {
+        let _guard = TEST_GUARD.lock().await;
+        let (mut handler, send) = build_handler(vec![]).await;
+        let script = handler.runtime_mut().delegate_script.clone();
+        let contexts = handler.runtime_mut().delegate_contexts.clone();
+        let observations = handler.runtime_mut().delegate_observations.clone();
+
+        let key = test_delegate_key();
+        // Counted per delegate; this module's tests share the key but run one at
+        // a time under `TEST_GUARD`, so start this test's count from zero.
+        super::delegate_park::QUEUED_CLIENT_RUNS.remove(&key);
+        let a = UserSecretContext::from_token(b"park-queue-context-user-a");
+        let b = UserSecretContext::from_token(b"park-queue-context-user-b");
+        let (uid_a, uid_b) = (*a.user_id(), *b.user_id());
+
+        // Run 1: A's first leg writes its context and parks on a prompt.
+        script.lock().unwrap().push_back(ScriptedRun {
+            outbound: prompt_outbound(),
+            writes_context: Some(b"a-before-park".to_vec()),
+        });
+        // Run 2: A's resumed leg.
+        script.lock().unwrap().push_back(ScriptedRun {
+            outbound: Vec::new(),
+            writes_context: Some(b"a-after-resume".to_vec()),
+        });
+        // Run 3: B's request, drained from the queue after A completes.
+        script.lock().unwrap().push_back(ScriptedRun {
+            outbound: Vec::new(),
+            writes_context: Some(b"b-drained".to_vec()),
+        });
+
+        let event_for = |user: &UserSecretContext| match delegate_event(&key) {
+            ContractHandlerEvent::DelegateRequest {
+                req,
+                origin_contract,
+                connection_scope,
+                ..
+            } => ContractHandlerEvent::DelegateRequest {
+                req,
+                origin_contract,
+                connection_scope,
+                user_context: Some(user.clone()),
+            },
+            other => panic!("delegate_event built {other}"),
+        };
+        let (event_a, event_b) = (event_for(&a), event_for(&b));
+
+        let send = Arc::new(send);
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let handle = GlobalExecutor::spawn(contract_handling(
+            handler,
+            GatedPrompter { gate: gate.clone() },
+        ));
+
+        // A parks.
+        let send_a = send.clone();
+        let first: tokio::task::JoinHandle<Result<ContractHandlerEvent, ContractError>> =
+            GlobalExecutor::spawn(async move { send_a.send_to_handler(event_a).await });
+        // A's first leg has run once it is observed. The loop is serial, so
+        // B's request below is handled only after A has parked.
+        let probe = observations.clone();
+        wait_until("A's first leg to run", || probe.lock().unwrap().len() == 1).await;
+
+        // B arrives while A is parked and is queued behind the park. Wait for
+        // the queueing itself, so B is known to drain from the queue and not
+        // to run directly after A.
+        let send_b = send.clone();
+        let second: tokio::task::JoinHandle<Result<ContractHandlerEvent, ContractError>> =
+            GlobalExecutor::spawn(async move { send_b.send_to_handler(event_b).await });
+        let queued_key = key.clone();
+        wait_until("B to be queued behind A's park", || {
+            super::delegate_park::QUEUED_CLIENT_RUNS
+                .get(&queued_key)
+                .is_some_and(|n| *n == 1)
+        })
+        .await;
+        assert_eq!(
+            observations.lock().unwrap().len(),
+            1,
+            "B must not run while A is parked"
+        );
+        // The cache drops everything it holds while A is parked, as eviction
+        // under pressure may. A's context is held by A's park under A's user,
+        // so A's resumed run still reads it.
+        contexts.lock().unwrap().clear();
+
+        gate.add_permits(1);
+        for (label, task) in [("A", first), ("B", second)] {
+            let resp = tokio::time::timeout(Duration::from_secs(5), task)
+                .await
+                .unwrap_or_else(|_| panic!("{label}'s request must resolve"))
+                .expect("join")
+                .unwrap_or_else(|e| panic!("{label} must be answered: {e}"));
+            assert!(
+                matches!(resp, ContractHandlerEvent::DelegateResponse(Ok(_))),
+                "{label} must get a successful delegate response, got {resp}"
+            );
+        }
+
+        let seen: Vec<(Vec<&'static str>, Option<Vec<u8>>)> = observations
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|o| (o.inbound_kinds.clone(), o.observed_context.clone()))
+            .collect();
+        assert_eq!(
+            seen,
+            vec![
+                (vec!["ApplicationMessage"], None),
+                (vec!["UserResponse"], Some(b"a-before-park".to_vec())),
+                (vec!["ApplicationMessage"], None),
+            ],
+            "A's resumed run must read A's context, and B's drained run B's own \
+             (empty) context"
+        );
+        let stored: Vec<_> = contexts
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|((k, user), bytes)| (k.clone(), *user, bytes.clone()))
+            .collect();
+        let expected_a = (key.clone(), Some(uid_a), b"a-after-resume".to_vec());
+        let expected_b = (key.clone(), Some(uid_b), b"b-drained".to_vec());
+        assert!(
+            stored.len() == 2 && stored.contains(&expected_a) && stored.contains(&expected_b),
+            "each run must write its own user's entry and nothing else; got {} \
+             entries, A's present: {}, B's present: {}, no-user entry present: {}",
+            stored.len(),
+            stored.contains(&expected_a),
+            stored.contains(&expected_b),
+            stored.iter().any(|(_, user, _)| user.is_none()),
+        );
+
+        handle.abort();
+    }
+
+    /// A run parked on a prompt resumes with the context it wrote before it
+    /// parked, whatever the context cache drops while the prompt is open.
+    ///
+    /// The cache is shared by every delegate and user and drops its oldest
+    /// entries when it is over budget, and a parked run's entry is older than
+    /// anything written while the user reads the prompt. So the park holds the
+    /// parked run's context itself and puts it back when the run resumes.
+    ///
+    /// The modelled store has no budget, so the cache dropping every entry
+    /// stands in for budget eviction; for the parked run's entry the effect is
+    /// the same. Another delegate's run writes a context while the prompt is
+    /// open, and waiting for it to finish also shows the park has completed
+    /// (the loop is serial).
+    ///
+    /// FALSIFY: (a) in `handle_delegate_resume`, do not restore the
+    /// continuation's context: the resumed run reads no context. (b) at the
+    /// park site, leave the context in the cache instead of moving it into the
+    /// continuation: the cache drop removes it and the resumed run reads no
+    /// context.
+    #[tokio::test]
+    async fn a_parked_run_resumes_with_its_context_after_the_cache_drops_it() {
+        let _guard = TEST_GUARD.lock().await;
+        let (mut handler, send) = build_handler(vec![]).await;
+        let script = handler.runtime_mut().delegate_script.clone();
+        let contexts = handler.runtime_mut().delegate_contexts.clone();
+        let observations = handler.runtime_mut().delegate_observations.clone();
+
+        let parked_key = test_delegate_key();
+        let other_key = DelegateKey::new(
+            [0x3c; 32],
+            freenet_stdlib::prelude::CodeHash::new([0x3c; 32]),
+        );
+
+        // Run 1: the parked run's first leg writes its context and prompts.
+        script.lock().unwrap().push_back(ScriptedRun {
+            outbound: prompt_outbound(),
+            writes_context: Some(b"written-before-the-prompt".to_vec()),
+        });
+        // Run 2: another delegate's run while the prompt is open.
+        script.lock().unwrap().push_back(ScriptedRun {
+            outbound: Vec::new(),
+            writes_context: Some(b"another-delegates-context".to_vec()),
+        });
+        // Run 3: the resumed leg.
+        script.lock().unwrap().push_back(ScriptedRun {
+            outbound: Vec::new(),
+            writes_context: None,
+        });
+
+        let send = Arc::new(send);
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let handle = GlobalExecutor::spawn(contract_handling(
+            handler,
+            GatedPrompter { gate: gate.clone() },
+        ));
+
+        let send_parked = send.clone();
+        let kp = parked_key.clone();
+        let parked: tokio::task::JoinHandle<Result<ContractHandlerEvent, ContractError>> =
+            GlobalExecutor::spawn(
+                async move { send_parked.send_to_handler(delegate_event(&kp)).await },
+            );
+        let probe = observations.clone();
+        wait_until("the first leg to run", || probe.lock().unwrap().len() == 1).await;
+
+        let other = tokio::time::timeout(
+            Duration::from_secs(5),
+            send.send_to_handler(delegate_event(&other_key)),
+        )
+        .await
+        .expect("the other delegate's request must complete while the prompt is open")
+        .expect("the other delegate's request must be answered");
+        assert!(
+            matches!(other, ContractHandlerEvent::DelegateResponse(Ok(_))),
+            "the other delegate's run must succeed, got {other}"
+        );
+
+        // The cache drops everything it holds, as eviction under pressure may.
+        contexts.lock().unwrap().clear();
+
+        gate.add_permits(1);
+        let resp = tokio::time::timeout(Duration::from_secs(5), parked)
+            .await
+            .expect("the parked request must resolve")
+            .expect("join")
+            .expect("the parked request must be answered");
+        assert!(
+            matches!(resp, ContractHandlerEvent::DelegateResponse(Ok(_))),
+            "the parked request must get a successful delegate response, got {resp}"
+        );
+
+        let seen: Vec<(Vec<&'static str>, Option<Vec<u8>>)> = observations
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|o| (o.inbound_kinds.clone(), o.observed_context.clone()))
+            .collect();
+        assert_eq!(
+            seen,
+            vec![
+                (vec!["ApplicationMessage"], None),
+                (vec!["ApplicationMessage"], None),
+                (
+                    vec!["UserResponse"],
+                    Some(b"written-before-the-prompt".to_vec())
+                ),
+            ],
+            "the resumed leg must read the context its first leg wrote"
+        );
+
+        handle.abort();
+    }
+
+    /// An inter-delegate hop runs its target under the hosted user who
+    /// originated the request: that user's secrets and that user's context.
+    /// The target's context is stored under `(target, Some(user))`, nothing is
+    /// written to the no-user entry, and the target's run is given the user's
+    /// secrets.
+    ///
+    /// FALSIFY: in `handle_delegate_with_contract_requests`, pass `None`
+    /// instead of `user_context` to `execute_delegate_hop`: the target's
+    /// context lands under `(target, None)`, it runs with no user's secrets,
+    /// and all three assertions fail.
+    #[tokio::test]
+    async fn a_hop_runs_its_target_with_the_originating_users_context() {
+        let _guard = TEST_GUARD.lock().await;
+        let (mut handler, send) = build_handler(vec![]).await;
+        let script = handler.runtime_mut().delegate_script.clone();
+        let contexts = handler.runtime_mut().delegate_contexts.clone();
+        let observations = handler.runtime_mut().delegate_observations.clone();
+
+        let key_a = DelegateKey::new(
+            [0x4a; 32],
+            freenet_stdlib::prelude::CodeHash::new([0x4a; 32]),
+        );
+        let key_b = DelegateKey::new(
+            [0x4b; 32],
+            freenet_stdlib::prelude::CodeHash::new([0x4b; 32]),
+        );
+        let user = UserSecretContext::from_token(b"hop-keeps-originating-user-context");
+        let uid = *user.user_id();
+
+        // Run 1 is A's: it messages B.
+        script.lock().unwrap().push_back(ScriptedRun {
+            outbound: vec![OutboundDelegateMsg::SendDelegateMessage(
+                freenet_stdlib::prelude::DelegateMessage::new(
+                    key_b.clone(),
+                    key_a.clone(),
+                    b"hop".to_vec(),
+                ),
+            )],
+            writes_context: None,
+        });
+        // Run 2 is B's, delivered by the hop: it writes its context.
+        script.lock().unwrap().push_back(ScriptedRun {
+            outbound: Vec::new(),
+            writes_context: Some(b"b-hop-context".to_vec()),
+        });
+
+        let event = match delegate_event(&key_a) {
+            ContractHandlerEvent::DelegateRequest {
+                req,
+                origin_contract,
+                connection_scope,
+                ..
+            } => ContractHandlerEvent::DelegateRequest {
+                req,
+                origin_contract,
+                connection_scope,
+                user_context: Some(user),
+            },
+            other => panic!("delegate_event built {other}"),
+        };
+
+        let handle = GlobalExecutor::spawn(contract_handling(
+            handler,
+            crate::contract::user_input::AutoApprovePrompter,
+        ));
+        let resp = tokio::time::timeout(Duration::from_secs(5), send.send_to_handler(event))
+            .await
+            .expect("A's request must resolve")
+            .expect("A's request must be answered");
+        assert!(
+            matches!(resp, ContractHandlerEvent::DelegateResponse(Ok(_))),
+            "A must get a successful delegate response, got {resp}"
+        );
+
+        let stored = contexts.lock().unwrap();
+        assert_eq!(
+            stored.get(&(key_b.clone(), Some(uid))).map(Vec::as_slice),
+            Some(b"b-hop-context".as_slice()),
+            "the hop must run B with the originating user's context"
+        );
+        assert!(
+            !stored.contains_key(&(key_b.clone(), None)),
+            "the hop must not write B's no-user context"
+        );
+        drop(stored);
+        let secret_users: Vec<(DelegateKey, Option<crate::wasm_runtime::UserId>)> = observations
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|o| (o.delegate_key.clone(), o.secret_user))
+            .collect();
+        assert!(
+            secret_users.iter().any(|(k, _)| *k == key_b),
+            "the hop must have run B, or this measures nothing: {secret_users:?}"
+        );
+        assert!(
+            secret_users.iter().all(|(_, user)| *user == Some(uid)),
+            "every run, the hop to B included, must be under the originating \
+             user's secrets: {secret_users:?}"
+        );
+        handle.abort();
+    }
+
+    // ---------------------------------------------------------------------
+    // On a hosted node every delegate run belongs to a user, and the node
+    // runs no delegate on its own: no contract notifications.
+    // ---------------------------------------------------------------------
+
+    /// Payload of the single `ApplicationMessage` an app channel received.
+    fn app_payload(msg: crate::client_events::HostResult) -> Vec<u8> {
+        match msg {
+            Ok(freenet_stdlib::client_api::HostResponse::DelegateResponse { values, .. }) => {
+                match values.as_slice() {
+                    [OutboundDelegateMsg::ApplicationMessage(m)] => m.payload.clone(),
+                    other => panic!("expected one ApplicationMessage, got {other:?}"),
+                }
+            }
+            other => panic!("expected a DelegateResponse, got {other:?}"),
+        }
+    }
+
+    /// Everything an app channel has received so far, as payloads.
+    fn drain_payloads(
+        rx: &mut tokio::sync::mpsc::Receiver<crate::client_events::HostResult>,
+    ) -> Vec<Vec<u8>> {
+        let mut out = Vec::new();
+        while let Ok(msg) = rx.try_recv() {
+            out.push(app_payload(msg));
+        }
+        out
+    }
+
+    /// A scripted delegate run that emits one `ApplicationMessage`.
+    fn emits(payload: &[u8]) -> ScriptedRun {
+        ScriptedRun {
+            outbound: vec![OutboundDelegateMsg::ApplicationMessage(
+                freenet_stdlib::prelude::ApplicationMessage::new(payload.to_vec()),
+            )],
+            writes_context: None,
+        }
+    }
+
+    fn hosted_notification(key: &DelegateKey, contract: u8) -> executor::DelegateNotification {
+        executor::DelegateNotification {
+            delegate_key: key.clone(),
+            contract_id: ContractInstanceId::new([contract; 32]),
+            new_state: Arc::new(WrappedState::new(vec![contract])),
+        }
+    }
+
+    /// One app registration with the delegate; returns its client id and the
+    /// receiving end of its channel.
+    fn register(
+        key: &DelegateKey,
+        identity: delegate_app_registry::AppIdentity,
+        user: Option<&UserSecretContext>,
+    ) -> (
+        crate::client_events::ClientId,
+        tokio::sync::mpsc::Receiver<crate::client_events::HostResult>,
+    ) {
+        let client = crate::client_events::ClientId::next();
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        assert!(
+            delegate_app_registry::register_app_for_user(
+                key,
+                client,
+                identity,
+                user.map(|u| *u.user_id()),
+                tx,
+            ),
+            "the registration must be accepted, or this measures nothing"
+        );
+        (client, rx)
+    }
+
+    /// On a node that is not hosted a notification runs once, with no user,
+    /// and its output reaches every local registration, as it always has. A
+    /// non-local registration still receives nothing.
+    ///
+    /// FALSIFY by taking the hosted per-user path on every node: no
+    /// registration has a user, so nothing runs and both local apps miss the
+    /// output.
+    #[tokio::test]
+    async fn on_a_node_that_is_not_hosted_a_notification_runs_once_and_reaches_every_local_app() {
+        let _guard = TEST_GUARD.lock().await;
+        let (mut handler, _send) = build_handler(vec![]).await;
+        let script = handler.runtime_mut().delegate_script.clone();
+        let observations = handler.runtime_mut().delegate_observations.clone();
+        script
+            .lock()
+            .unwrap()
+            .push_back(emits(b"for-every-local-app"));
+
+        let key = DelegateKey::new(
+            [0x63; 32],
+            freenet_stdlib::prelude::CodeHash::new([0x63; 32]),
+        );
+        use delegate_app_registry::AppIdentity::{Local, Remote};
+        let (c1, mut rx1) = register(&key, Local, None);
+        let (c2, mut rx2) = register(&key, Local, None);
+        let (c3, mut remote_rx) = register(&key, Remote, None);
+
+        let prompter = Arc::new(crate::contract::user_input::AutoApprovePrompter);
+        handle_delegate_notification(
+            &mut handler,
+            hosted_notification(&key, 0x63),
+            &prompter,
+            None,
+        )
+        .await;
+
+        let runs: Vec<Option<crate::wasm_runtime::UserId>> = observations
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|o| o.secret_user)
+            .collect();
+        assert_eq!(runs, vec![None], "one run, with no user");
+        assert_eq!(
+            drain_payloads(&mut rx1),
+            vec![b"for-every-local-app".to_vec()]
+        );
+        assert_eq!(
+            drain_payloads(&mut rx2),
+            vec![b"for-every-local-app".to_vec()]
+        );
+        assert!(drain_payloads(&mut remote_rx).is_empty());
+        for c in [c1, c2, c3] {
+            delegate_app_registry::remove_client(c);
+        }
+    }
+
+    /// On a hosted node a run's output with no user to route to is delivered
+    /// to nobody, rather than to every local app. Every notification run on a
+    /// hosted node has a user, so this is the fail-closed answer for a run
+    /// that somehow has none (a lifecycle run, which a hosted node does not
+    /// start today, is the one node-started run without a user).
+    ///
+    /// FALSIFY by routing a hosted run with no user to every local
+    /// registration: the user's registration receives the message.
+    #[tokio::test]
+    async fn on_a_hosted_node_output_of_a_run_with_no_user_reaches_nobody() {
+        let _guard = TEST_GUARD.lock().await;
+        let key = DelegateKey::new(
+            [0x65; 32],
+            freenet_stdlib::prelude::CodeHash::new([0x65; 32]),
+        );
+        let a = UserSecretContext::from_token(b"hosted-no-user-route-a");
+        let (c_a, mut a_rx) = register(&key, delegate_app_registry::AppIdentity::Local, Some(&a));
+        let (c_none, mut none_rx) = register(&key, delegate_app_registry::AppIdentity::Local, None);
+        let outbound = || {
+            vec![OutboundDelegateMsg::ApplicationMessage(
+                freenet_stdlib::prelude::ApplicationMessage::new(b"no-user".to_vec()),
+            )]
+        };
+
+        route_notification_outbound(&key, true, None, outbound());
+        assert!(
+            drain_payloads(&mut a_rx).is_empty(),
+            "a hosted user must not receive it"
+        );
+        assert!(
+            drain_payloads(&mut none_rx).is_empty(),
+            "nor a user-less registration"
+        );
+
+        // Control: the same output with the user's context reaches that user.
+        route_notification_outbound(&key, true, Some(&a), outbound());
+        assert_eq!(drain_payloads(&mut a_rx), vec![b"no-user".to_vec()]);
+        assert!(drain_payloads(&mut none_rx).is_empty());
+
+        delegate_app_registry::remove_client(c_a);
+        delegate_app_registry::remove_client(c_none);
+    }
+
+    /// On a hosted node the node runs no delegate on its own, so a contract
+    /// notification runs nothing and delivers nothing, however many users are
+    /// registered with the delegate.
+    ///
+    /// Drives `handle_delegate_notification` directly, the entry the
+    /// subscription pipeline calls for each subscribed delegate on a contract
+    /// change.
+    ///
+    /// FALSIFY by removing the hosted check from `handle_delegate_notification`:
+    /// the delegate runs.
+    #[tokio::test]
+    async fn on_a_hosted_node_a_contract_notification_runs_no_delegate() {
+        let _guard = TEST_GUARD.lock().await;
+        let (mut handler, _send) = build_handler(vec![]).await;
+        handler.executor().set_hosted_mode_for_test(true);
+        let script = handler.runtime_mut().delegate_script.clone();
+        let observations = handler.runtime_mut().delegate_observations.clone();
+        script.lock().unwrap().push_back(emits(b"must-not-run"));
+        script.lock().unwrap().push_back(emits(b"must-not-run"));
+
+        let key = DelegateKey::new(
+            [0x67; 32],
+            freenet_stdlib::prelude::CodeHash::new([0x67; 32]),
+        );
+        use delegate_app_registry::AppIdentity::Local;
+        let a = UserSecretContext::from_token(b"hosted-no-notification-user-a");
+        let b = UserSecretContext::from_token(b"hosted-no-notification-user-b");
+        let (c_a, mut a_rx) = register(&key, Local, Some(&a));
+        let (c_b, mut b_rx) = register(&key, Local, Some(&b));
+
+        let prompter = Arc::new(crate::contract::user_input::AutoApprovePrompter);
+        handle_delegate_notification(
+            &mut handler,
+            hosted_notification(&key, 0x67),
+            &prompter,
+            None,
+        )
+        .await;
+
+        assert!(
+            observations.lock().unwrap().is_empty(),
+            "a hosted node must not run a delegate for a contract notification"
+        );
+        assert!(drain_payloads(&mut a_rx).is_empty());
+        assert!(drain_payloads(&mut b_rx).is_empty());
+        delegate_app_registry::remove_client(c_a);
+        delegate_app_registry::remove_client(c_b);
+    }
+
+    /// A notification for a parked delegate is queued behind the park on a
+    /// node that is not hosted, and not queued at all on a hosted node, which
+    /// runs no delegate on its own.
+    ///
+    /// FALSIFY by removing the hosted check from `handle_delegate_notification`:
+    /// the hosted node queues it.
+    #[tokio::test]
+    async fn on_a_hosted_node_a_notification_for_a_parked_delegate_is_not_queued() {
+        let _guard = TEST_GUARD.lock().await;
+        for hosted in [true, false] {
+            let (mut handler, _send) = build_handler(vec![]).await;
+            handler.executor().set_hosted_mode_for_test(hosted);
+            let key = DelegateKey::new(
+                [0x68; 32],
+                freenet_stdlib::prelude::CodeHash::new([0x68; 32]),
+            );
+            let user = UserSecretContext::from_token(b"hosted-parked-notification-user");
+            let (client, _rx) =
+                register(&key, delegate_app_registry::AppIdentity::Local, Some(&user));
+
+            let (tx, _resumes) = tokio::sync::mpsc::unbounded_channel();
+            let mut park = delegate_park::DelegateParkCtx::new(tx);
+            assert!(matches!(
+                park.park(
+                    key.clone(),
+                    parked_continuation(),
+                    delegate_park::ByteCount::default()
+                ),
+                delegate_park::ParkAdmission::Admitted { .. }
+            ));
+            let prompter = Arc::new(crate::contract::user_input::AutoApprovePrompter);
+            handle_delegate_notification(
+                &mut handler,
+                hosted_notification(&key, 0x68),
+                &prompter,
+                Some(&mut park),
+            )
+            .await;
+
+            let epoch = park.epoch_of(&key).expect("still parked");
+            let (_cont, pending) = park.take_matching(&key, epoch).expect("park present");
+            assert_eq!(
+                pending.len(),
+                usize::from(!hosted),
+                "hosted={hosted}: a hosted node queues nothing; a node that is not \
+                 hosted queues the notification behind the park"
+            );
+            delegate_app_registry::remove_client(client);
+        }
+    }
+
+    /// The closed-registration sweep at the top of the notification path runs
+    /// on a hosted node too, before it returns without running the delegate:
+    /// the sweep reaps registrations for every delegate, not only the one
+    /// notified.
+    ///
+    /// FALSIFY by moving `sweep_closed()` below the hosted early return in
+    /// `handle_delegate_notification`: the closed registration survives.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn on_a_hosted_node_the_notification_path_still_sweeps_closed_registrations() {
+        let _guard = TEST_GUARD.lock().await;
+        let (mut handler, _send) = build_handler(vec![]).await;
+        handler.executor().set_hosted_mode_for_test(true);
+        let notified = DelegateKey::new(
+            [0x69; 32],
+            freenet_stdlib::prelude::CodeHash::new([0x69; 32]),
+        );
+        let other = DelegateKey::new(
+            [0x6A; 32],
+            freenet_stdlib::prelude::CodeHash::new([0x6A; 32]),
+        );
+        let user = UserSecretContext::from_token(b"hosted-sweep-user");
+        let (client, rx) = register(
+            &other,
+            delegate_app_registry::AppIdentity::Local,
+            Some(&user),
+        );
+        drop(rx);
+        assert_eq!(delegate_app_registry::registration_count(&other), 1);
+
+        let prompter = Arc::new(crate::contract::user_input::AutoApprovePrompter);
+        handle_delegate_notification(
+            &mut handler,
+            hosted_notification(&notified, 0x69),
+            &prompter,
+            None,
+        )
+        .await;
+
+        assert_eq!(
+            delegate_app_registry::registration_count(&other),
+            0,
+            "the sweep must reap another delegate's closed registration on a hosted node"
+        );
+        delegate_app_registry::remove_client(client);
     }
 }

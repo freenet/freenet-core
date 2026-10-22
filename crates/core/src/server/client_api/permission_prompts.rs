@@ -25,6 +25,20 @@
 //! standalone `/permission/{nonce}` HTML page is retained as a fallback
 //! (e.g. if JS is disabled in the shell, or for debugging / manual testing).
 //!
+//! # Hosted nodes
+//!
+//! A hosted node requires a user token on the permission routes and shows
+//! each user only their own prompts. Every prompt records the user whose
+//! delegate run raised it (`PendingPrompt::owner`). `pending`, `events/ws` and
+//! `{nonce}/respond` resolve the requester from the token under the same rule
+//! as the client API ([`resolve_prompt_viewer`]) and list, replay, send and
+//! accept answers only for that user's prompts. A request without a valid
+//! token is refused with 403, and another user's prompt answers 404 like an
+//! unknown nonce. The routes whose content is not scoped to one user (the
+//! legacy SSE stream, the standalone page, and the capability-grant routes)
+//! are not served on a hosted node. A node that is not hosted ignores any
+//! token and behaves as before.
+//!
 //! # Trust model and UI rationale (#3857)
 //!
 //! The user installed the delegate. It is their agent; its per-key storage is
@@ -102,15 +116,18 @@ use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
 
 use crate::client_events::websocket::{
-    host_header_ip_in_cidrs, is_allowed_host, is_localhost_origin, is_loopback_source,
+    UserTokenDecision, decide_user_token, derive_user_context, host_header_ip_in_cidrs,
+    is_allowed_host, is_localhost_origin, is_loopback_source,
 };
 use crate::contract::delegate_capabilities::{AppIdentity, Grant, capability_description};
 use crate::contract::user_input::{
     CallerIdentity, PendingPrompts, PromptEvent, PromptSnapshot, emit_prompt_event, prompt_events,
 };
 use crate::server::client_api::hosted_export::ExportOpManagerHandle;
-use crate::server::{AllowedHosts, AllowedSourceCidrs};
+use crate::server::{AllowedHosts, AllowedSourceCidrs, HostedMode};
+use crate::wasm_runtime::UserId;
 use freenet_stdlib::prelude::{Capability, ContractInstanceId};
+use zeroize::Zeroizing;
 
 /// Register permission prompt routes.
 ///
@@ -122,16 +139,232 @@ use freenet_stdlib::prelude::{Capability, ContractInstanceId};
 /// deleting the route degrades those tabs to that fallback (a prompt takes up
 /// to ~3s to appear) rather than breaking them. Latency for pre-upgrade tabs,
 /// not correctness.
+///
+/// On a hosted node the routes that show or answer prompts (`pending`,
+/// `events/ws`, `{nonce}/respond`) require the user's token and show each user
+/// only their own prompts ([`viewer_gate`]); the others are not served there
+/// at all ([`refuse_when_hosted`]).
 pub(super) fn routes() -> Router {
+    let viewer = || axum::middleware::from_fn(viewer_gate);
+    let viewer_ws = || axum::middleware::from_fn(viewer_gate_ws);
+    let refused = || axum::middleware::from_fn(refuse_when_hosted);
     Router::new()
-        .route("/permission/pending", get(pending_prompts))
-        .route("/permission/events", get(permission_events))
-        .route("/permission/events/ws", get(permission_events_ws))
-        .route("/permission/grants", get(list_grants))
-        .route("/permission/grants/revoke", post(revoke_grant))
-        .route("/permission/apps", get(apps_page))
-        .route("/permission/{nonce}", get(permission_page))
-        .route("/permission/{nonce}/respond", post(permission_respond))
+        .route("/permission/pending", get(pending_prompts).layer(viewer()))
+        .route(
+            "/permission/events",
+            get(permission_events).layer(refused()),
+        )
+        .route(
+            "/permission/events/ws",
+            get(permission_events_ws).layer(viewer_ws()),
+        )
+        .route("/permission/grants", get(list_grants).layer(refused()))
+        .route(
+            "/permission/grants/revoke",
+            post(revoke_grant).layer(refused()),
+        )
+        .route("/permission/apps", get(apps_page).layer(refused()))
+        .route("/permission/{nonce}", get(permission_page).layer(refused()))
+        .route(
+            "/permission/{nonce}/respond",
+            post(permission_respond).layer(viewer()),
+        )
+}
+
+/// Who is asking to see or answer prompts.
+///
+/// On a node that is not hosted the requester is the node's own user and may
+/// see every prompt ([`PromptViewer::Node`]). On a hosted node it is the user
+/// named by the token the request presents ([`PromptViewer::User`]), who may
+/// see only the prompts their own delegate runs raised.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PromptViewer {
+    Node,
+    User(UserId),
+}
+
+impl PromptViewer {
+    /// Whether this viewer may see, and answer, a prompt with this owner.
+    fn may_see(self, owner: Option<UserId>) -> bool {
+        match self {
+            PromptViewer::Node => true,
+            PromptViewer::User(id) => owner == Some(id),
+        }
+    }
+}
+
+/// Header carrying the hosted user's token on the permission routes. The same
+/// header the client API and the hosted export accept.
+const USER_TOKEN_HEADER: &str = "x-freenet-user-token";
+
+/// Decide the [`PromptViewer`] for a request.
+///
+/// Not hosted: always [`PromptViewer::Node`]; any token is ignored, so a node
+/// that is not hosted behaves exactly as before. Hosted: the token is taken
+/// from the header first and from the query (`?userToken=`, WebSocket route
+/// only) otherwise, and is honoured only under the same rule as the client
+/// API ([`decide_user_token`]): a loopback source carrying
+/// `X-Forwarded-Proto: https`. No token, an empty token, or an insecure
+/// connection is refused with 403. The token is never logged.
+pub(crate) fn resolve_prompt_viewer(
+    hosted: bool,
+    header_token: Option<&str>,
+    query_token: Option<&str>,
+    source_ip: Option<std::net::IpAddr>,
+    xfp_https: bool,
+) -> Result<PromptViewer, (axum::http::StatusCode, &'static str)> {
+    use axum::http::StatusCode;
+    if !hosted {
+        return Ok(PromptViewer::Node);
+    }
+    // The header wins when present, as in `connection_info`.
+    let token = header_token.or(query_token);
+    let has_token = token.is_some_and(|t| !t.is_empty());
+    match decide_user_token(hosted, has_token, source_ip, xfp_https) {
+        UserTokenDecision::Honor => match derive_user_context(hosted, token) {
+            Some(ctx) => Ok(PromptViewer::User(*ctx.user_id())),
+            // Unreachable: `Honor` implies a non-empty token on a hosted node,
+            // for which `derive_user_context` returns `Some`. Refused rather
+            // than assumed.
+            None => Err((
+                StatusCode::FORBIDDEN,
+                "a hosted node requires a user token on the permission routes",
+            )),
+        },
+        UserTokenDecision::RejectInsecure => Err((
+            StatusCode::FORBIDDEN,
+            "hosted user token requires a secure (TLS/loopback) connection",
+        )),
+        UserTokenDecision::Local => Err((
+            StatusCode::FORBIDDEN,
+            "a hosted node requires a user token on the permission routes",
+        )),
+    }
+}
+
+/// The query form of the token, accepted on the WebSocket route only, since a
+/// browser cannot set a header on a WebSocket handshake.
+#[derive(Deserialize)]
+struct PermTokenQuery {
+    #[serde(rename = "userToken")]
+    user_token: Option<Zeroizing<String>>,
+}
+
+/// The hosted-mode flag for a permission-route request, or `None` (logged as
+/// an error) when it is missing; the caller then refuses. Every composition injects `HostedMode` (the node's
+/// in `serve_client_api_in_impl`, the standalone one in
+/// `HttpClientApi::as_router`). A missing flag is a misconfiguration and is
+/// refused rather than read as "not hosted", which on these routes would show
+/// every prompt to every requester.
+fn hosted_flag(req: &axum::extract::Request) -> Option<bool> {
+    let flag = req.extensions().get::<HostedMode>().map(|h| h.0);
+    if flag.is_none() {
+        tracing::error!(
+            path = req.uri().path(),
+            "Permission route reached without the HostedMode extension; \
+             refusing. The router composition must inject HostedMode."
+        );
+    }
+    flag
+}
+
+/// The refusal for a permission-route request with no hosted-mode flag.
+fn misconfigured() -> axum::response::Response {
+    (
+        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+        "permission routes are misconfigured",
+    )
+        .into_response()
+}
+
+/// Middleware for `pending` and `{nonce}/respond`: resolve the viewer from the
+/// header token and hand it to the handler.
+async fn viewer_gate(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    resolve_and_run(req, next, false).await
+}
+
+/// Middleware for `events/ws`: as [`viewer_gate`], also accepting the token in
+/// the query.
+async fn viewer_gate_ws(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    resolve_and_run(req, next, true).await
+}
+
+async fn resolve_and_run(
+    mut req: axum::extract::Request,
+    next: axum::middleware::Next,
+    accept_query_token: bool,
+) -> axum::response::Response {
+    let hosted = match hosted_flag(&req) {
+        Some(hosted) => hosted,
+        None => return misconfigured(),
+    };
+    let source_ip = req
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|ci| ci.0.ip());
+    let xfp_https = req
+        .headers()
+        .get("x-forwarded-proto")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.eq_ignore_ascii_case("https"));
+    // Owned copies of the token are held in `Zeroizing` so they are wiped on
+    // drop, as `connection_info` does.
+    let header_token: Option<Zeroizing<String>> = req
+        .headers()
+        .get(USER_TOKEN_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| Zeroizing::new(s.to_owned()));
+    let query_token: Option<Zeroizing<String>> = if accept_query_token {
+        axum::extract::Query::<PermTokenQuery>::try_from_uri(req.uri())
+            .ok()
+            .and_then(|q| q.0.user_token)
+    } else {
+        None
+    };
+    match resolve_prompt_viewer(
+        hosted,
+        header_token.as_deref().map(String::as_str),
+        query_token.as_deref().map(String::as_str),
+        source_ip,
+        xfp_https,
+    ) {
+        Ok(viewer) => {
+            req.extensions_mut().insert(viewer);
+            next.run(req).await
+        }
+        Err((status, reason)) => {
+            tracing::debug!(source_ip = ?source_ip, reason, "Refused a permission route request");
+            (status, reason).into_response()
+        }
+    }
+}
+
+/// Middleware for the permission routes a hosted node does not serve: the
+/// legacy SSE stream, the standalone prompt page, and the capability-grant
+/// list, revoke and page. Each shows or changes state that is not scoped to
+/// one hosted user.
+async fn refuse_when_hosted(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let hosted = match hosted_flag(&req) {
+        Some(hosted) => hosted,
+        None => return misconfigured(),
+    };
+    if hosted {
+        return (
+            axum::http::StatusCode::FORBIDDEN,
+            "a hosted node does not serve this permission route",
+        )
+            .into_response();
+    }
+    next.run(req).await
 }
 
 /// The permission-prompt surface (`/permission/pending`, `/permission/events`,
@@ -150,15 +383,12 @@ pub(super) fn routes() -> Router {
 /// (see `server.rs`) injects the `ConnectInfo<SocketAddr>` extension for every
 /// connection, so it is present on the production serve path.
 ///
-/// SCOPE — this is a boundary against a DIRECT off-box connection, and only
-/// that. Behind a reverse proxy on the same host (a deployment `config.rs`
-/// documents as supported) every remote client's `ConnectInfo` is the proxy's
-/// own loopback address, so this check passes for the entire internet and a
-/// non-browser client can then set `Host` and `Origin` freely. That makes the
-/// whole permission surface remotely reachable in that deployment. It is
-/// PRE-EXISTING and tracked in #5264 — this surface has no authentication of
-/// any kind — but do not read the paragraph above as "these endpoints are
-/// local-only"; it means "a direct LAN peer cannot reach them".
+/// Scope: this check identifies the direct peer only. Behind a reverse proxy on
+/// the same host (a deployment `config.rs` documents as supported) every
+/// client appears as the proxy's loopback address, so the check does not
+/// distinguish clients there. Hosted nodes additionally require the user's
+/// token on the routes they serve, and scope those routes to that user (see
+/// the module docs). Client API authentication in general is tracked in #5264.
 ///
 /// Fail closed: a MISSING `ConnectInfo` cannot prove loopback and is rejected.
 /// (It is absent only in unit tests that build a request without connect-info;
@@ -388,6 +618,7 @@ async fn pending_prompts(
     allowed_hosts: Option<Extension<AllowedHosts>>,
     allowed_source_cidrs: Option<Extension<AllowedSourceCidrs>>,
     Extension(pending): Extension<PendingPrompts>,
+    Extension(viewer): Extension<PromptViewer>,
 ) -> axum::response::Response {
     // Loopback-only boundary (#3819): this endpoint discloses raw nonces, so a
     // LAN peer must not reach it even when the main listener binds 0.0.0.0.
@@ -421,6 +652,8 @@ async fn pending_prompts(
 
     let prompts: Vec<serde_json::Value> = pending
         .iter()
+        // A hosted user sees only their own prompts.
+        .filter(|entry| viewer.may_see(entry.value().owner))
         .map(|entry| {
             let prompt = entry.value();
             let message = sanitize_display(&prompt.message, OVERLAY_MESSAGE_MAX);
@@ -769,6 +1002,9 @@ struct PermissionResponse {
 }
 
 /// Handle the user's response to a permission prompt.
+///
+/// The arguments are axum extractors, one per request part this handler reads.
+#[allow(clippy::too_many_arguments)]
 async fn permission_respond(
     connect_info: Option<Extension<ConnectInfo<SocketAddr>>>,
     Path(nonce): Path<String>,
@@ -776,6 +1012,7 @@ async fn permission_respond(
     allowed_hosts: Option<Extension<AllowedHosts>>,
     allowed_source_cidrs: Option<Extension<AllowedSourceCidrs>>,
     Extension(pending): Extension<PendingPrompts>,
+    Extension(viewer): Extension<PromptViewer>,
     Json(body): Json<PermissionResponse>,
 ) -> (axum::http::StatusCode, Json<serde_json::Value>) {
     // Loopback-only boundary (#3819): approving a prompt is a capability, so a
@@ -809,7 +1046,13 @@ async fn permission_respond(
 
     // Validate index BEFORE removing from DashMap. Removing first would
     // consume the nonce on invalid input, leaving the user unable to retry.
-    let label_count = pending.get(&nonce).map(|e| e.labels.len());
+    //
+    // A hosted user may answer only their own prompts. Another user's prompt
+    // answers 404 for any index, as an unknown nonce does.
+    let label_count = pending
+        .get(&nonce)
+        .filter(|e| viewer.may_see(e.owner))
+        .map(|e| e.labels.len());
     match label_count {
         None => (
             axum::http::StatusCode::NOT_FOUND,
@@ -820,8 +1063,10 @@ async fn permission_respond(
             Json(serde_json::json!({"error": "invalid index"})),
         ),
         Some(_) => {
-            // Index is valid -- now atomically remove and send response
-            if let Some((_, prompt)) = pending.remove(&nonce) {
+            // Index is valid -- now atomically remove and send response. The
+            // ownership check is repeated inside the removal so that it holds
+            // for the entry actually removed.
+            if let Some((_, prompt)) = pending.remove_if(&nonce, |_, p| viewer.may_see(p.owner)) {
                 if prompt.response_tx.send(body.index).is_err() {
                     tracing::debug!(nonce = %nonce, "Permission response channel already closed");
                 }
@@ -830,6 +1075,7 @@ async fn permission_respond(
                 // fallback (#3836 follow-up).
                 emit_prompt_event(PromptEvent::Removed {
                     nonce: nonce.clone(),
+                    owner: prompt.owner,
                 });
                 (
                     axum::http::StatusCode::OK,
@@ -1318,6 +1564,7 @@ async fn permission_events(
                 labels: entry.value().labels.clone(),
                 delegate_key: entry.value().delegate_key.clone(),
                 caller: entry.value().caller.clone(),
+                owner: entry.value().owner,
             };
             Ok(Event::default()
                 .event("prompt_added")
@@ -1330,7 +1577,7 @@ async fn permission_events(
             Ok(PromptEvent::Added(snapshot)) => Some(Ok(Event::default()
                 .event("prompt_added")
                 .data(snapshot_to_json(&snapshot).to_string()))),
-            Ok(PromptEvent::Removed { nonce }) => Some(Ok(Event::default()
+            Ok(PromptEvent::Removed { nonce, .. }) => Some(Ok(Event::default()
                 .event("prompt_removed")
                 .data(serde_json::json!({ "nonce": nonce }).to_string()))),
             // Lag means our subscriber was slow and missed events. The shell
@@ -1416,6 +1663,7 @@ async fn permission_events_ws(
     allowed_hosts: Option<Extension<AllowedHosts>>,
     allowed_source_cidrs: Option<Extension<AllowedSourceCidrs>>,
     Extension(pending): Extension<PendingPrompts>,
+    Extension(viewer): Extension<PromptViewer>,
 ) -> axum::response::Response {
     // Loopback-only boundary (#3819), identical to the SSE path: the stream
     // emits raw nonces, so a LAN peer must not reach it even when the main
@@ -1463,6 +1711,8 @@ async fn permission_events_ws(
     let rx = prompt_events().subscribe();
     let initial: Vec<String> = pending
         .iter()
+        // A hosted user is replayed only their own prompts.
+        .filter(|entry| viewer.may_see(entry.value().owner))
         .map(|entry| {
             let snapshot = PromptSnapshot {
                 nonce: entry.key().clone(),
@@ -1471,6 +1721,7 @@ async fn permission_events_ws(
                 labels: entry.value().labels.clone(),
                 delegate_key: entry.value().delegate_key.clone(),
                 caller: entry.value().caller.clone(),
+                owner: entry.value().owner,
             };
             ws_envelope("prompt_added", snapshot_to_json(&snapshot))
         })
@@ -1490,7 +1741,7 @@ async fn permission_events_ws(
         .read_buffer_size(1024)
         .on_upgrade(move |socket| async move {
             let (sink, stream) = socket.split();
-            pump_permission_events(sink, stream, rx, initial, guard).await;
+            pump_permission_events(sink, stream, rx, initial, guard, viewer).await;
         })
 }
 
@@ -1527,6 +1778,9 @@ async fn pump_permission_events<Si, St, E>(
     mut rx: tokio::sync::broadcast::Receiver<PromptEvent>,
     initial: Vec<String>,
     _guard: PermissionSubscriberGuard,
+    // Events for prompts this viewer may not see are skipped, so a hosted user
+    // is sent only their own prompts' events.
+    viewer: PromptViewer,
 ) where
     Si: futures::Sink<Message> + Unpin,
     St: futures::Stream<Item = Result<Message, E>> + Unpin,
@@ -1573,9 +1827,15 @@ async fn pump_permission_events<Si, St, E>(
             event = rx.recv() => {
                 let payload = match event {
                     Ok(PromptEvent::Added(snapshot)) => {
+                        if !viewer.may_see(snapshot.owner) {
+                            continue;
+                        }
                         ws_envelope("prompt_added", snapshot_to_json(&snapshot))
                     }
-                    Ok(PromptEvent::Removed { nonce }) => {
+                    Ok(PromptEvent::Removed { nonce, owner }) => {
+                        if !viewer.may_see(owner) {
+                            continue;
+                        }
                         ws_envelope("prompt_removed", serde_json::json!({ "nonce": nonce }))
                     }
                     // Lag means this subscriber was slow and missed events;
@@ -1727,6 +1987,7 @@ mod tests {
                 labels: labels.into_iter().map(String::from).collect(),
                 delegate_key: delegate_key.to_string(),
                 caller,
+                owner: None,
                 response_tx: tx,
             },
         );
@@ -1795,6 +2056,7 @@ mod tests {
             allowed_hosts.map(Extension),
             allowed_source_cidrs.map(Extension),
             Extension(pending),
+            Extension(PromptViewer::Node),
         )
         .await
         .into_response();
@@ -1909,6 +2171,7 @@ mod tests {
                     labels,
                     delegate_key: "d".to_string(),
                     caller: webapp_caller("c"),
+                    owner: None,
                     response_tx: tx,
                 },
             );
@@ -2082,6 +2345,7 @@ mod tests {
                 None,
                 None,
                 Extension(pending.clone()),
+                Extension(PromptViewer::Node),
                 Json(PermissionResponse { index: 0 }),
             )
             .await
@@ -2113,6 +2377,7 @@ mod tests {
             None,
             None,
             Extension(pending),
+            Extension(PromptViewer::Node),
             Json(PermissionResponse { index: 0 }),
         )
         .await
@@ -2146,6 +2411,7 @@ mod tests {
             None,
             None,
             Extension(pending.clone()),
+            Extension(PromptViewer::Node),
             Json(PermissionResponse { index: 2 }),
         )
         .await
@@ -2454,6 +2720,7 @@ mod tests {
             labels: vec!["Allow".into(), "Deny".into()],
             delegate_key: "dkey-added-001".into(),
             caller: webapp_caller("cid-added-001"),
+            owner: None,
         };
         wait_subscribers_then_send(initial_subs + 1, PromptEvent::Added(snapshot)).await;
 
@@ -2481,6 +2748,7 @@ mod tests {
             initial_subs + 1,
             PromptEvent::Removed {
                 nonce: nonce.clone(),
+                owner: None,
             },
         )
         .await;
@@ -2640,6 +2908,7 @@ mod tests {
             labels: vec!["OK".into()],
             delegate_key: "dkey-order-live".into(),
             caller: webapp_caller("cid-order-live"),
+            owner: None,
         };
         wait_subscribers_then_send(initial_subs + 1, PromptEvent::Added(snapshot)).await;
 
@@ -2678,6 +2947,7 @@ mod tests {
         for i in 0..5 {
             drop(tx.send(PromptEvent::Removed {
                 nonce: format!("lag-{i}"),
+                owner: None,
             }));
         }
 
@@ -2687,7 +2957,7 @@ mod tests {
         let stream = BroadcastStream::new(rx).filter_map(|incoming| async move {
             match incoming {
                 Ok(PromptEvent::Added(s)) => Some(format!("added:{}", s.nonce)),
-                Ok(PromptEvent::Removed { nonce }) => Some(format!("removed:{nonce}")),
+                Ok(PromptEvent::Removed { nonce, .. }) => Some(format!("removed:{nonce}")),
                 Err(BroadcastStreamRecvError::Lagged(_)) => Some("resync".to_string()),
             }
         });
@@ -2814,6 +3084,7 @@ mod tests {
             None,
             None,
             Extension(pending.clone()),
+            Extension(PromptViewer::Node),
             Json(PermissionResponse { index: 0 }),
         )
         .await
@@ -2826,7 +3097,7 @@ mod tests {
         let mut saw = false;
         while tokio::time::Instant::now() < deadline {
             match tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv()).await {
-                Ok(Ok(PromptEvent::Removed { nonce: n })) if n == nonce => {
+                Ok(Ok(PromptEvent::Removed { nonce: n, .. })) if n == nonce => {
                     saw = true;
                     break;
                 }
@@ -2888,6 +3159,7 @@ mod tests {
             None,
             None,
             Extension(pending),
+            Extension(PromptViewer::Node),
             Json(PermissionResponse { index: 0 }),
         )
         .await
@@ -2916,6 +3188,7 @@ mod tests {
             None,
             Some(Extension(cidrs)),
             Extension(pending),
+            Extension(PromptViewer::Node),
             Json(PermissionResponse { index: 0 }),
         )
         .await
@@ -2942,6 +3215,7 @@ mod tests {
             None,
             None,
             Extension(pending),
+            Extension(PromptViewer::Node),
             Json(PermissionResponse { index: 0 }),
         )
         .await
@@ -2967,6 +3241,7 @@ mod tests {
             None,
             None,
             Extension(pending),
+            Extension(PromptViewer::Node),
             Json(PermissionResponse { index: 0 }),
         )
         .await
@@ -2992,6 +3267,7 @@ mod tests {
             Some(Extension(hosts)),
             None,
             Extension(pending),
+            Extension(PromptViewer::Node),
             Json(PermissionResponse { index: 0 }),
         )
         .await
@@ -3021,6 +3297,7 @@ mod tests {
             Some(Extension(hosts)),
             None,
             Extension(pending),
+            Extension(PromptViewer::Node),
             Json(PermissionResponse { index: 0 }),
         )
         .await
@@ -3045,6 +3322,7 @@ mod tests {
             None,
             None,
             Extension(pending),
+            Extension(PromptViewer::Node),
             Json(PermissionResponse { index: 0 }),
         )
         .await
@@ -3266,6 +3544,7 @@ mod tests {
             None,
             Some(Extension(cidrs)),
             Extension(pending),
+            Extension(PromptViewer::Node),
             Json(PermissionResponse { index: 0 }),
         )
         .await
@@ -3421,6 +3700,7 @@ mod tests {
         let hosts = allowed_hosts_with(&["127.0.0.1"], 7509);
         let cidrs = AllowedSourceCidrs::default();
         let app = super::routes()
+            .layer(Extension(HostedMode(false)))
             .layer(Extension(pending))
             .layer(Extension(hosts))
             .layer(Extension(cidrs));
@@ -3460,6 +3740,7 @@ mod tests {
         let hosts: AllowedHosts = Arc::new(HashSet::new());
         let cidrs = AllowedSourceCidrs::default();
         let app = super::routes()
+            .layer(Extension(HostedMode(false)))
             .layer(Extension(pending))
             .layer(Extension(hosts))
             .layer(Extension(cidrs));
@@ -3548,6 +3829,7 @@ mod tests {
         let _rx = insert_prompt(&pending, "leak", "m", vec!["OK"], "d", webapp_caller("c"));
         let build_app = || {
             super::routes()
+                .layer(Extension(HostedMode(false)))
                 .layer(Extension(pending.clone()))
                 .layer(Extension::<AllowedHosts>(Arc::new(HashSet::new())))
                 .layer(Extension(AllowedSourceCidrs::default()))
@@ -3598,6 +3880,7 @@ mod tests {
         let pending = empty_pending();
         let rx = insert_prompt(&pending, "forge", "m", vec!["OK"], "d", webapp_caller("c"));
         let app = super::routes()
+            .layer(Extension(HostedMode(false)))
             .layer(Extension(pending.clone()))
             .layer(Extension::<AllowedHosts>(Arc::new(HashSet::new())))
             .layer(Extension(AllowedSourceCidrs::default()));
@@ -3624,6 +3907,7 @@ mod tests {
         let pending = empty_pending();
         let rx = insert_prompt(&pending, "ok", "m", vec!["OK"], "d", webapp_caller("c"));
         let app = super::routes()
+            .layer(Extension(HostedMode(false)))
             .layer(Extension(pending.clone()))
             .layer(Extension(allowed_hosts_with(&["127.0.0.1"], 7509)))
             .layer(Extension(AllowedSourceCidrs::default()));
@@ -3661,6 +3945,7 @@ mod tests {
             webapp_caller("c"),
         );
         let app = super::routes()
+            .layer(Extension(HostedMode(false)))
             .layer(Extension(pending.clone()))
             .layer(Extension::<AllowedHosts>(Arc::new(HashSet::new())))
             .layer(Extension(AllowedSourceCidrs::default()));
@@ -3690,6 +3975,7 @@ mod tests {
         let pending = empty_pending();
         let _rx = insert_prompt(&pending, "rt3", "m", vec!["OK"], "d", webapp_caller("c"));
         let app = super::routes()
+            .layer(Extension(HostedMode(false)))
             .layer(Extension(pending))
             .layer(Extension(allowed_hosts_with(&["192.168.1.42"], 7509)))
             .layer(Extension(AllowedSourceCidrs::default()));
@@ -3735,6 +4021,7 @@ mod tests {
         use std::collections::HashSet;
         use std::sync::Arc;
         let app = super::routes()
+            .layer(Extension(HostedMode(false)))
             .layer(Extension(pending))
             .layer(Extension::<AllowedHosts>(Arc::new(HashSet::new())))
             .layer(Extension(AllowedSourceCidrs::default()));
@@ -3816,6 +4103,7 @@ mod tests {
         use std::sync::Arc;
         let set: HashSet<String> = hosts.iter().map(|h| h.to_string()).collect();
         let app = super::routes()
+            .layer(Extension(HostedMode(false)))
             .layer(Extension(pending))
             .layer(Extension::<AllowedHosts>(Arc::new(set)))
             .layer(Extension(AllowedSourceCidrs::default()));
@@ -4297,6 +4585,7 @@ mod tests {
                 labels: vec!["Allow".into(), "Deny".into()],
                 delegate_key: "dkey-ws-001".into(),
                 caller: webapp_caller("cid-ws-001"),
+                owner: None,
             }),
         )
         .await;
@@ -4313,6 +4602,7 @@ mod tests {
 
         drop(prompt_events().send(PromptEvent::Removed {
             nonce: nonce.clone(),
+            owner: None,
         }));
         let removed = next_ws_event(
             &mut sock,
@@ -4375,6 +4665,7 @@ mod tests {
             labels: vec!["OK".into()],
             delegate_key: "dk".into(),
             caller: webapp_caller("c1"),
+            owner: None,
         };
         let added: serde_json::Value =
             serde_json::from_str(&ws_envelope("prompt_added", snapshot_to_json(&snapshot)))
@@ -4489,6 +4780,7 @@ mod tests {
         for i in 0..5 {
             drop(tx.send(PromptEvent::Removed {
                 nonce: format!("lag-{i}"),
+                owner: None,
             }));
         }
 
@@ -4501,6 +4793,7 @@ mod tests {
             rx,
             Vec::new(),
             guard,
+            PromptViewer::Node,
         ));
 
         let msg = tokio::time::timeout(Duration::from_secs(5), out.next())
@@ -4596,6 +4889,7 @@ mod tests {
             rx,
             Vec::new(),
             guard,
+            PromptViewer::Node,
         ));
 
         tokio::time::timeout(Duration::from_secs(120), pump)
@@ -4647,6 +4941,7 @@ mod tests {
             rx,
             initial,
             guard,
+            PromptViewer::Node,
         ));
         tokio::time::timeout(Duration::from_secs(120), pump)
             .await
@@ -4689,6 +4984,7 @@ mod tests {
             rx,
             vec![ws_envelope("resync", serde_json::json!({}))],
             guard,
+            PromptViewer::Node,
         ));
 
         tokio::time::timeout(Duration::from_secs(120), pump)
@@ -4700,6 +4996,958 @@ mod tests {
             PERMISSION_SUBSCRIBERS.load(Ordering::Relaxed),
             baseline,
             "the slot must be released when replay gives up too"
+        );
+    }
+    // ----- Hosted node: a user token is required and each user sees only
+    // ----- their own prompts.
+
+    const TOKEN_A: &str = "hosted-perm-user-a";
+    const TOKEN_B: &str = "hosted-perm-user-b";
+
+    fn uid(token: &str) -> UserId {
+        *derive_user_context(true, Some(token))
+            .expect("a non-empty token derives a context")
+            .user_id()
+    }
+
+    fn insert_owned(
+        pending: &PendingPrompts,
+        nonce: &str,
+        owner: Option<UserId>,
+    ) -> tokio::sync::oneshot::Receiver<usize> {
+        use crate::contract::user_input::PendingPrompt;
+        let (tx, rx) = tokio::sync::oneshot::channel::<usize>();
+        pending.insert(
+            nonce.to_string(),
+            PendingPrompt {
+                author: crate::contract::user_input::PromptAuthor::Delegate,
+                message: format!("message for {nonce}"),
+                labels: vec!["Allow".to_string(), "Deny".to_string()],
+                delegate_key: "dkey".to_string(),
+                caller: CallerIdentity::None,
+                owner,
+                response_tx: tx,
+            },
+        );
+        rx
+    }
+
+    /// Permission routes with the hosted-mode flag set as given, a loopback
+    /// peer, and permissive host policy, as the production composition builds
+    /// them behind a same-host TLS proxy.
+    fn hosted_app(pending: PendingPrompts, hosted: bool) -> Router {
+        super::routes()
+            .layer(Extension(pending))
+            .layer(Extension(HostedMode(hosted)))
+            .layer(Extension::<AllowedHosts>(Arc::new(HashSet::new())))
+            .layer(Extension(AllowedSourceCidrs::default()))
+    }
+
+    /// A request as the TLS proxy forwards it: loopback source, the proxy's
+    /// `X-Forwarded-Proto` when `xfp_https`, and the user's token header when
+    /// given. POSTs carry the shell's own https Origin.
+    fn proxied_request(
+        method: &str,
+        uri: &str,
+        token: Option<&str>,
+        xfp_https: bool,
+        body: &'static str,
+    ) -> axum::http::Request<axum::body::Body> {
+        let mut b = axum::http::Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("host", "localhost:7509")
+            .header("content-type", "application/json");
+        if method == "POST" {
+            b = b.header("origin", "https://localhost:7509");
+        }
+        if xfp_https {
+            b = b.header("x-forwarded-proto", "https");
+        }
+        if let Some(t) = token {
+            b = b.header("x-freenet-user-token", t);
+        }
+        let mut req = b.body(axum::body::Body::from(body)).unwrap();
+        req.extensions_mut()
+            .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 55001))));
+        req
+    }
+
+    async fn body_json(resp: axum::response::Response) -> serde_json::Value {
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null)
+    }
+
+    fn listed_nonces(value: &serde_json::Value) -> Vec<String> {
+        value
+            .as_array()
+            .expect("pending returns a JSON array")
+            .iter()
+            .map(|p| p["nonce"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    /// A hosted node lists for a user only the prompts their own runs raised:
+    /// not another user's, and not one without an owner.
+    ///
+    /// FALSIFY: drop the `may_see` filter in `pending_prompts`, or make
+    /// `PromptViewer::may_see` return `true`; the other users' nonces appear.
+    #[tokio::test]
+    async fn a_hosted_node_lists_only_the_requesting_users_prompts() {
+        use tower::ServiceExt;
+        let pending = empty_pending();
+        let _a = insert_owned(&pending, "nonce-of-a", Some(uid(TOKEN_A)));
+        let _b = insert_owned(&pending, "nonce-of-b", Some(uid(TOKEN_B)));
+        let _n = insert_owned(&pending, "nonce-ownerless", None);
+
+        let resp = hosted_app(pending.clone(), true)
+            .oneshot(proxied_request(
+                "GET",
+                "/permission/pending",
+                Some(TOKEN_A),
+                true,
+                "",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let listed = body_json(resp).await;
+        assert_eq!(
+            listed_nonces(&listed),
+            vec!["nonce-of-a".to_string()],
+            "user A must see exactly their own prompt"
+        );
+        assert!(
+            listed
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|p| p.get("owner").is_none()),
+            "the prompt's owner is never sent to a client"
+        );
+    }
+
+    /// Without a valid token a hosted node refuses the routes that show or
+    /// answer prompts: no token, an empty token, and a token on a connection
+    /// that is not known to be TLS (no `X-Forwarded-Proto: https`) are each
+    /// refused with 403, and a refused answer leaves the prompt pending.
+    ///
+    /// FALSIFY: make `resolve_prompt_viewer` return `PromptViewer::Node` for a
+    /// hosted request; every case below is served.
+    #[tokio::test]
+    async fn a_hosted_node_refuses_the_permission_routes_without_a_valid_token() {
+        use axum::http::StatusCode;
+        use tower::ServiceExt;
+        let pending = empty_pending();
+        let _a = insert_owned(&pending, "nonce-of-a", Some(uid(TOKEN_A)));
+
+        let cases: [(Option<&str>, bool, &str); 4] = [
+            (None, true, "no token"),
+            (Some(""), true, "an empty token"),
+            (
+                Some(TOKEN_A),
+                false,
+                "a token without X-Forwarded-Proto: https",
+            ),
+            (None, false, "no token and no TLS"),
+        ];
+        for (token, xfp, what) in cases {
+            let resp = hosted_app(pending.clone(), true)
+                .oneshot(proxied_request(
+                    "GET",
+                    "/permission/pending",
+                    token,
+                    xfp,
+                    "",
+                ))
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::FORBIDDEN,
+                "pending with {what} must be refused"
+            );
+            let resp = hosted_app(pending.clone(), true)
+                .oneshot(proxied_request(
+                    "POST",
+                    "/permission/nonce-of-a/respond",
+                    token,
+                    xfp,
+                    r#"{"index":0}"#,
+                ))
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::FORBIDDEN,
+                "respond with {what} must be refused"
+            );
+            assert!(
+                pending.contains_key("nonce-of-a"),
+                "a refused answer must leave the prompt pending ({what})"
+            );
+        }
+    }
+
+    /// The token gate also covers the permission WebSocket, including its
+    /// query form of the token. Driven over a real socket because axum
+    /// answers a `oneshot` upgrade with 426 before any gate runs.
+    #[tokio::test]
+    #[serial_test::serial(permission_subscriber_counter)]
+    async fn a_hosted_node_refuses_the_permission_socket_without_a_valid_token() {
+        let addr = spawn_ws_server(hosted_ws_app(empty_pending(), true)).await;
+        let origin = format!("https://{addr}");
+        for (query, xfp, what) in [
+            ("", true, "no token"),
+            ("?userToken=", true, "an empty token"),
+            (
+                "?userToken=hosted-perm-user-a",
+                false,
+                "a token without X-Forwarded-Proto: https",
+            ),
+        ] {
+            let extra: &[(&str, &str)] = if xfp {
+                &[("x-forwarded-proto", "https")]
+            } else {
+                &[]
+            };
+            let got = try_ws_connect_path(addr, query, Some(&origin), extra).await;
+            assert_eq!(
+                got.err(),
+                Some(403),
+                "the permission socket with {what} must be refused"
+            );
+        }
+    }
+
+    fn hosted_ws_app(pending: PendingPrompts, hosted: bool) -> Router {
+        hosted_app(pending, hosted).layer(Extension(ConnectInfo(loopback_peer())))
+    }
+
+    async fn try_ws_connect_path(
+        addr: SocketAddr,
+        query: &str,
+        origin: Option<&str>,
+        extra: &[(&str, &str)],
+    ) -> Result<TestWsStream, u16> {
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+        let mut req = format!("ws://{addr}/permission/events/ws{query}")
+            .into_client_request()
+            .unwrap();
+        if let Some(o) = origin {
+            req.headers_mut().insert("origin", o.parse().unwrap());
+        }
+        for (k, v) in extra {
+            req.headers_mut().insert(
+                axum::http::HeaderName::from_bytes(k.as_bytes()).unwrap(),
+                v.parse().unwrap(),
+            );
+        }
+        match tokio_tungstenite::connect_async(req).await {
+            Ok((stream, _resp)) => Ok(stream),
+            Err(tokio_tungstenite::tungstenite::Error::Http(resp)) => Err(resp.status().as_u16()),
+            Err(other) => panic!("unexpected handshake failure: {other}"),
+        }
+    }
+
+    /// A hosted user cannot answer another user's prompt: the answer gets the
+    /// same 404 as an unknown nonce, and the prompt stays pending and
+    /// unanswered. Its owner can still answer it.
+    ///
+    /// FALSIFY: drop the `may_see` filter on the lookup in
+    /// `permission_respond`; user A's answer is accepted. The check inside the
+    /// removal is pinned by `a_hosted_users_answer_is_checked_at_removal`.
+    #[tokio::test]
+    async fn a_hosted_user_cannot_answer_another_users_prompt() {
+        use axum::http::StatusCode;
+        use tower::ServiceExt;
+        let pending = empty_pending();
+        let mut rx_b = insert_owned(&pending, "nonce-of-b", Some(uid(TOKEN_B)));
+
+        let resp = hosted_app(pending.clone(), true)
+            .oneshot(proxied_request(
+                "POST",
+                "/permission/nonce-of-b/respond",
+                Some(TOKEN_A),
+                true,
+                r#"{"index":0}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "another user's prompt must look like an unknown nonce"
+        );
+        assert!(
+            pending.contains_key("nonce-of-b"),
+            "the prompt must stay pending"
+        );
+        assert!(
+            rx_b.try_recv().is_err(),
+            "the prompt must not have been answered"
+        );
+
+        let resp = hosted_app(pending.clone(), true)
+            .oneshot(proxied_request(
+                "POST",
+                "/permission/nonce-of-b/respond",
+                Some(TOKEN_B),
+                true,
+                r#"{"index":1}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "the owner can answer");
+        assert_eq!(rx_b.await.unwrap(), 1);
+    }
+
+    /// Another user's prompt answers 404 for any index, as an unknown nonce
+    /// does.
+    ///
+    /// FALSIFY: drop the `may_see` filter on the lookup in
+    /// `permission_respond`; the answer is 400.
+    #[tokio::test]
+    async fn another_users_prompt_answers_404_even_for_a_bad_index() {
+        use axum::http::StatusCode;
+        use tower::ServiceExt;
+        let pending = empty_pending();
+        let _b = insert_owned(&pending, "nonce-of-b", Some(uid(TOKEN_B)));
+        let resp = hosted_app(pending.clone(), true)
+            .oneshot(proxied_request(
+                "POST",
+                "/permission/nonce-of-b/respond",
+                Some(TOKEN_A),
+                true,
+                r#"{"index":99}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "another user's prompt must answer like an unknown nonce"
+        );
+        assert!(pending.contains_key("nonce-of-b"));
+    }
+
+    /// The removal in `permission_respond` checks the owner itself, so the
+    /// rule holds for the entry actually removed and not only for the one the
+    /// earlier lookup saw. The two can differ only if the registry changes
+    /// between them, which no test can arrange, so this pins the source: the
+    /// removal is a `remove_if` on the owner, in code rather than a comment,
+    /// and there is no unchecked `remove`.
+    ///
+    /// FALSIFY: replace the `remove_if(..)` in `permission_respond` with
+    /// `remove(&nonce)`, or comment the line out; this test fails.
+    #[test]
+    fn a_hosted_users_answer_is_checked_at_removal() {
+        let src = include_str!("permission_prompts.rs");
+        let start = src
+            .find("\nasync fn permission_respond(")
+            .expect("permission_respond must exist");
+        let tests_at = src
+            .find("\n#[cfg(test)]\nmod tests {")
+            .expect("the test module must exist");
+        assert!(
+            start < tests_at,
+            "permission_respond must be production code"
+        );
+        let body = &src[start..];
+        let end = body
+            .find("\n}\n")
+            .expect("permission_respond must end with a top-level brace");
+        let body = &body[..end];
+        let needle = "pending.remove_if(&nonce, |_, p| viewer.may_see(p.owner))";
+        assert!(
+            body.lines()
+                .any(|l| !l.trim_start().starts_with("//") && l.contains(needle)),
+            "the removal in permission_respond must check the prompt's owner"
+        );
+        assert!(
+            !body.contains("pending.remove(&nonce)"),
+            "permission_respond must not remove a prompt without checking its owner"
+        );
+    }
+
+    /// The pump forwards to a hosted user only their own prompts' events,
+    /// both additions and removals.
+    ///
+    /// FALSIFY: delete the `may_see` check on the `Added` arm of
+    /// `pump_permission_events`, or on the `Removed` arm; a frame for user
+    /// B's prompt is sent.
+    #[tokio::test]
+    #[serial_test::serial(permission_subscriber_counter)]
+    async fn the_permission_pump_sends_a_hosted_user_only_their_own_events() {
+        let (tx, rx) = tokio::sync::broadcast::channel::<PromptEvent>(16);
+        let snap = |nonce: &str, owner: Option<UserId>| PromptSnapshot {
+            nonce: nonce.into(),
+            author: crate::contract::user_input::PromptAuthor::Delegate,
+            message: "m".into(),
+            labels: vec!["OK".into()],
+            delegate_key: "dk".into(),
+            caller: CallerIdentity::None,
+            owner,
+        };
+        let a = Some(uid(TOKEN_A));
+        let b = Some(uid(TOKEN_B));
+        drop(tx.send(PromptEvent::Added(snap("b-added", b))));
+        drop(tx.send(PromptEvent::Added(snap("none-added", None))));
+        drop(tx.send(PromptEvent::Added(snap("a-added", a))));
+        drop(tx.send(PromptEvent::Removed {
+            nonce: "b-removed".into(),
+            owner: b,
+        }));
+        drop(tx.send(PromptEvent::Removed {
+            nonce: "none-removed".into(),
+            owner: None,
+        }));
+        drop(tx.send(PromptEvent::Removed {
+            nonce: "a-removed".into(),
+            owner: a,
+        }));
+
+        let (sink, mut out) = futures::channel::mpsc::unbounded::<Message>();
+        let guard =
+            try_claim_subscriber_slot(SubscriberTransport::WebSocket).expect("a slot must be free");
+        let pump = tokio::spawn(pump_permission_events(
+            sink,
+            never_inbound(),
+            rx,
+            Vec::new(),
+            guard,
+            PromptViewer::User(uid(TOKEN_A)),
+        ));
+
+        let mut seen = Vec::new();
+        for _ in 0..2 {
+            let msg = tokio::time::timeout(Duration::from_secs(5), out.next())
+                .await
+                .expect("the pump must forward the viewer's own events")
+                .expect("the sink must receive a frame");
+            let Message::Text(text) = msg else {
+                panic!("expected a text frame");
+            };
+            let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+            seen.push(format!(
+                "{}:{}",
+                v["event"].as_str().unwrap(),
+                v["data"]["nonce"].as_str().unwrap()
+            ));
+        }
+        // Every event was queued before the pump started and in this order,
+        // so a forwarded event for B or for no owner would arrive before
+        // A's own event of the same kind.
+        assert_eq!(
+            seen,
+            vec![
+                "prompt_added:a-added".to_string(),
+                "prompt_removed:a-removed".to_string()
+            ],
+            "user A must be sent only their own prompts' events"
+        );
+        pump.abort();
+        drop(pump.await);
+    }
+
+    /// The pump on a node that is not hosted forwards every event, as before.
+    #[tokio::test]
+    #[serial_test::serial(permission_subscriber_counter)]
+    async fn the_permission_pump_on_a_node_that_is_not_hosted_sends_every_event() {
+        let (tx, rx) = tokio::sync::broadcast::channel::<PromptEvent>(16);
+        drop(tx.send(PromptEvent::Removed {
+            nonce: "owned".into(),
+            owner: Some(uid(TOKEN_B)),
+        }));
+        drop(tx.send(PromptEvent::Removed {
+            nonce: "ownerless".into(),
+            owner: None,
+        }));
+        let (sink, mut out) = futures::channel::mpsc::unbounded::<Message>();
+        let guard =
+            try_claim_subscriber_slot(SubscriberTransport::WebSocket).expect("a slot must be free");
+        let pump = tokio::spawn(pump_permission_events(
+            sink,
+            never_inbound(),
+            rx,
+            Vec::new(),
+            guard,
+            PromptViewer::Node,
+        ));
+        for expected in ["owned", "ownerless"] {
+            let msg = tokio::time::timeout(Duration::from_secs(5), out.next())
+                .await
+                .expect("frame")
+                .expect("frame");
+            let Message::Text(text) = msg else {
+                panic!("expected a text frame");
+            };
+            let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(v["data"]["nonce"], expected);
+        }
+        pump.abort();
+        drop(pump.await);
+    }
+
+    /// Over a real socket a hosted user is replayed only their own pending
+    /// prompts on connect.
+    ///
+    /// FALSIFY: drop the `may_see` filter on the replay snapshot in
+    /// `permission_events_ws`; user B's prompt is replayed to A.
+    #[tokio::test]
+    #[serial_test::serial(permission_subscriber_counter)]
+    async fn the_permission_socket_replays_to_a_hosted_user_only_their_own_prompts() {
+        let pending = empty_pending();
+        let _b = insert_owned(&pending, "replay-of-b", Some(uid(TOKEN_B)));
+        let _n = insert_owned(&pending, "replay-ownerless", None);
+        let _a = insert_owned(&pending, "replay-of-a", Some(uid(TOKEN_A)));
+        let addr = spawn_ws_server(hosted_ws_app(pending, true)).await;
+        let origin = format!("https://{addr}");
+        let mut sock = try_ws_connect_path(
+            addr,
+            "?userToken=hosted-perm-user-a",
+            Some(&origin),
+            &[("x-forwarded-proto", "https")],
+        )
+        .await
+        .expect("a valid token over TLS must be accepted");
+
+        // A live event for A after connecting marks the end of the replay: the
+        // pump sends every replay frame before any live one, so the frames
+        // before it are exactly the replay.
+        drop(prompt_events().send(PromptEvent::Added(PromptSnapshot {
+            nonce: "replay-end-of-a".into(),
+            author: crate::contract::user_input::PromptAuthor::Delegate,
+            message: "m".into(),
+            labels: vec!["OK".into()],
+            delegate_key: "dk".into(),
+            caller: CallerIdentity::None,
+            owner: Some(uid(TOKEN_A)),
+        })));
+        let mut replayed = Vec::new();
+        loop {
+            let v = next_ws_event(&mut sock, |v| v["event"] == "prompt_added", 64)
+                .await
+                .expect("the live event for A must arrive after the replay");
+            assert!(
+                v["data"].get("owner").is_none(),
+                "the prompt's owner is never sent to a client"
+            );
+            let nonce = v["data"]["nonce"].as_str().unwrap().to_string();
+            if nonce == "replay-end-of-a" {
+                break;
+            }
+            replayed.push(nonce);
+        }
+        assert_eq!(
+            replayed,
+            vec!["replay-of-a".to_string()],
+            "user A must be replayed only their own prompt"
+        );
+    }
+
+    /// A hosted node does not serve the permission routes whose content is
+    /// not scoped to one user: the legacy SSE stream, the standalone prompt
+    /// page, and the capability-grant list, revoke and page. A valid token
+    /// does not change that.
+    ///
+    /// FALSIFY: remove `refuse_when_hosted` from any one of these routes in
+    /// `routes()`; that route is served.
+    #[tokio::test]
+    async fn a_hosted_node_does_not_serve_the_other_permission_routes() {
+        use axum::http::StatusCode;
+        use tower::ServiceExt;
+        let pending = empty_pending();
+        let _a = insert_owned(&pending, "nonce-of-a", Some(uid(TOKEN_A)));
+        for (method, uri, body) in [
+            ("GET", "/permission/events", ""),
+            ("GET", "/permission/nonce-of-a", ""),
+            ("GET", "/permission/grants", ""),
+            (
+                "POST",
+                "/permission/grants/revoke",
+                r#"{"app":"x","capability":"background"}"#,
+            ),
+            ("GET", "/permission/apps", ""),
+        ] {
+            let resp = hosted_app(pending.clone(), true)
+                .oneshot(proxied_request(method, uri, Some(TOKEN_A), true, body))
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::FORBIDDEN,
+                "{method} {uri} must not be served on a hosted node"
+            );
+        }
+    }
+
+    /// A node that is not hosted ignores any token and behaves as before: it
+    /// lists every prompt and answers any prompt, whatever token a request
+    /// carries, and the routes a hosted node refuses are served.
+    #[tokio::test]
+    async fn a_node_that_is_not_hosted_ignores_a_token_and_lists_every_prompt() {
+        use axum::http::StatusCode;
+        use tower::ServiceExt;
+        let pending = empty_pending();
+        let _a = insert_owned(&pending, "nonce-of-a", Some(uid(TOKEN_A)));
+        let rx_b = insert_owned(&pending, "nonce-of-b", Some(uid(TOKEN_B)));
+        let _n = insert_owned(&pending, "nonce-ownerless", None);
+
+        for token in [None, Some(TOKEN_A)] {
+            let resp = hosted_app(pending.clone(), false)
+                .oneshot(proxied_request(
+                    "GET",
+                    "/permission/pending",
+                    token,
+                    false,
+                    "",
+                ))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let mut nonces = listed_nonces(&body_json(resp).await);
+            nonces.sort();
+            assert_eq!(nonces, vec!["nonce-of-a", "nonce-of-b", "nonce-ownerless"]);
+        }
+
+        let resp = hosted_app(pending.clone(), false)
+            .oneshot(proxied_request(
+                "POST",
+                "/permission/nonce-of-b/respond",
+                Some(TOKEN_A),
+                false,
+                r#"{"index":0}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(rx_b.await.unwrap(), 0);
+
+        for uri in ["/permission/nonce-of-a", "/permission/apps"] {
+            let resp = hosted_app(pending.clone(), false)
+                .oneshot(proxied_request("GET", uri, None, false, ""))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "{uri} must be served");
+        }
+    }
+
+    /// `resolve_prompt_viewer`'s decisions, each case named.
+    #[test]
+    fn resolve_prompt_viewer_decisions() {
+        use axum::http::StatusCode;
+        let lo = Some(std::net::IpAddr::from([127, 0, 0, 1]));
+        let lan = Some(std::net::IpAddr::from([192, 168, 1, 9]));
+        let a = PromptViewer::User(uid(TOKEN_A));
+
+        // Not hosted: always the node's own user, whatever is presented.
+        for (h, q, ip, xfp) in [
+            (None, None, lo, false),
+            (Some(TOKEN_A), None, lo, true),
+            (None, Some(TOKEN_A), lan, true),
+            (Some(""), None, None, false),
+        ] {
+            assert_eq!(
+                resolve_prompt_viewer(false, h, q, ip, xfp),
+                Ok(PromptViewer::Node)
+            );
+        }
+
+        // Hosted, honoured: header or query token, loopback, XFP https.
+        assert_eq!(
+            resolve_prompt_viewer(true, Some(TOKEN_A), None, lo, true),
+            Ok(a)
+        );
+        assert_eq!(
+            resolve_prompt_viewer(true, None, Some(TOKEN_A), lo, true),
+            Ok(a)
+        );
+        // The header wins over the query.
+        assert_eq!(
+            resolve_prompt_viewer(true, Some(TOKEN_A), Some(TOKEN_B), lo, true),
+            Ok(a)
+        );
+
+        // Hosted, refused.
+        let refused = |r: Result<PromptViewer, (StatusCode, &'static str)>| {
+            matches!(r, Err((StatusCode::FORBIDDEN, _)))
+        };
+        assert!(
+            refused(resolve_prompt_viewer(true, None, None, lo, true)),
+            "no token"
+        );
+        assert!(
+            refused(resolve_prompt_viewer(true, Some(""), None, lo, true)),
+            "empty header"
+        );
+        assert!(
+            refused(resolve_prompt_viewer(true, None, Some(""), lo, true)),
+            "empty query"
+        );
+        assert!(
+            refused(resolve_prompt_viewer(true, Some(TOKEN_A), None, lo, false)),
+            "no XFP https"
+        );
+        assert!(
+            refused(resolve_prompt_viewer(true, Some(TOKEN_A), None, lan, true)),
+            "non-loopback source"
+        );
+        assert!(
+            refused(resolve_prompt_viewer(true, Some(TOKEN_A), None, None, true)),
+            "unknown source"
+        );
+    }
+
+    /// A permission route reached without the hosted-mode flag is refused,
+    /// not served as on a node that is not hosted.
+    ///
+    /// FALSIFY: make `hosted_flag` return `Some(false)` for a missing extension.
+    #[tokio::test]
+    async fn a_permission_route_without_the_hosted_flag_is_refused() {
+        use axum::http::StatusCode;
+        use tower::ServiceExt;
+        let pending = empty_pending();
+        let _a = insert_owned(&pending, "nonce-of-a", Some(uid(TOKEN_A)));
+        let unflagged = || {
+            super::routes()
+                .layer(Extension(pending.clone()))
+                .layer(Extension::<AllowedHosts>(Arc::new(HashSet::new())))
+                .layer(Extension(AllowedSourceCidrs::default()))
+        };
+        for (method, uri, body) in [
+            ("GET", "/permission/pending", ""),
+            ("POST", "/permission/nonce-of-a/respond", r#"{"index":0}"#),
+            ("GET", "/permission/apps", ""),
+            ("GET", "/permission/nonce-of-a", ""),
+        ] {
+            let resp = unflagged()
+                .oneshot(proxied_request(method, uri, None, false, body))
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "{method} {uri} without the hosted flag must be refused"
+            );
+        }
+        assert!(pending.contains_key("nonce-of-a"));
+    }
+
+    /// The standalone `as_router` composition says it is not hosted, so its
+    /// permission routes are served as on a node that is not hosted.
+    #[tokio::test]
+    async fn the_standalone_router_serves_the_permission_routes() {
+        use tower::ServiceExt;
+        let (api, router) =
+            crate::server::client_api::HttpClientApi::as_router(&"127.0.0.1:0".parse().unwrap());
+        drop(api);
+        let resp = router
+            .oneshot(proxied_request(
+                "GET",
+                "/permission/pending",
+                None,
+                false,
+                "",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+    }
+
+    /// `as_router` keeps a hosted flag set by an outer layer: wrapped in
+    /// `HostedMode(true)`, its permission routes require a token.
+    ///
+    /// FALSIFY: make `default_not_hosted` insert `HostedMode(false)` whatever
+    /// the request carries.
+    #[tokio::test]
+    async fn the_standalone_router_keeps_an_outer_hosted_flag() {
+        use tower::ServiceExt;
+        let (api, router) =
+            crate::server::client_api::HttpClientApi::as_router(&"127.0.0.1:0".parse().unwrap());
+        drop(api);
+        let resp = router
+            .layer(Extension(HostedMode(true)))
+            .oneshot(proxied_request(
+                "GET",
+                "/permission/pending",
+                None,
+                true,
+                "",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            axum::http::StatusCode::FORBIDDEN,
+            "an outer HostedMode(true) must not be replaced"
+        );
+    }
+
+    /// On a hosted node `pending` and `respond` take the token from the
+    /// header only; a `?userToken=` query is not a token there and is refused.
+    ///
+    /// FALSIFY: pass `true` for `accept_query_token` in `viewer_gate`.
+    #[tokio::test]
+    async fn a_hosted_node_takes_no_query_token_on_pending_or_respond() {
+        use axum::http::StatusCode;
+        use tower::ServiceExt;
+        let pending = empty_pending();
+        let _a = insert_owned(&pending, "nonce-of-a", Some(uid(TOKEN_A)));
+        for (method, uri, body) in [
+            (
+                "GET",
+                "/permission/pending?userToken=hosted-perm-user-a",
+                "",
+            ),
+            (
+                "POST",
+                "/permission/nonce-of-a/respond?userToken=hosted-perm-user-a",
+                r#"{"index":0}"#,
+            ),
+        ] {
+            let resp = hosted_app(pending.clone(), true)
+                .oneshot(proxied_request(method, uri, None, true, body))
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::FORBIDDEN,
+                "{method} {uri} must not accept a query token"
+            );
+        }
+        assert!(pending.contains_key("nonce-of-a"));
+    }
+
+    /// An answer from the owner emits `Removed` naming the owner, so the
+    /// owner's other tabs are sent the removal.
+    ///
+    /// FALSIFY: emit `owner: None` from `permission_respond`.
+    #[tokio::test]
+    #[serial_test::serial(prompt_events)]
+    async fn an_answer_emits_removed_with_the_prompts_owner() {
+        use tower::ServiceExt;
+        let pending = empty_pending();
+        let _b = insert_owned(&pending, "nonce-answered-by-b", Some(uid(TOKEN_B)));
+        let mut events = prompt_events().subscribe();
+        let resp = hosted_app(pending.clone(), true)
+            .oneshot(proxied_request(
+                "POST",
+                "/permission/nonce-answered-by-b/respond",
+                Some(TOKEN_B),
+                true,
+                r#"{"index":0}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let mut owner = None;
+        let mut lagged = 0u64;
+        loop {
+            match events.try_recv() {
+                Ok(PromptEvent::Removed { nonce, owner: o }) if nonce == "nonce-answered-by-b" => {
+                    owner = Some(o);
+                    break;
+                }
+                Ok(_) => {}
+                Err(tokio::sync::broadcast::error::TryRecvError::Lagged(n)) => lagged += n,
+                Err(_) => break,
+            }
+        }
+        assert_eq!(
+            lagged, 0,
+            "the shared prompt-event channel lagged by {lagged}"
+        );
+        assert_eq!(owner, Some(Some(uid(TOKEN_B))));
+    }
+
+    /// The production composition (`serve_client_api_with_listener`) gives the
+    /// permission routes the hosted-mode flag on both of its branches: a
+    /// loopback bind and a wildcard bind (which adds the private-network
+    /// filter). A missing flag is refused with 500 rather than read as "not
+    /// hosted", so this checks for the hosted 403 and 200 specifically.
+    ///
+    /// FALSIFY: remove the `Extension(hosted_mode)` layer from either branch of
+    /// `serve_client_api_in_impl`; that branch answers 500.
+    #[tokio::test]
+    async fn a_hosted_node_composition_requires_a_token_on_the_permission_routes() {
+        async fn serve(hosted: bool) -> (SocketAddr, impl Drop) {
+            serve_on("127.0.0.1:0", hosted).await
+        }
+        async fn serve_on(bind: &str, hosted: bool) -> (SocketAddr, impl Drop) {
+            let listener = std::net::TcpListener::bind(bind).unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let addr = listener.local_addr().unwrap();
+            let mut cfg = crate::config::WebsocketApiConfig::from(addr);
+            cfg.hosted_mode = hosted;
+            let clients = crate::server::serve_client_api_with_listener(cfg, listener)
+                .await
+                .expect("serve the client API");
+            struct Keep(#[allow(dead_code)] [crate::client_events::BoxedClient; 2]);
+            impl Drop for Keep {
+                fn drop(&mut self) {}
+            }
+            (addr, Keep(clients))
+        }
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .unwrap();
+
+        let (hosted_addr, _keep_hosted) = serve(true).await;
+        let url = format!("http://{hosted_addr}/permission/pending");
+        let tokenless = client.get(&url).send().await.unwrap();
+        assert_eq!(
+            tokenless.status().as_u16(),
+            403,
+            "a hosted node must refuse the permission routes without a token"
+        );
+        let tokened = client
+            .get(&url)
+            .header("x-freenet-user-token", TOKEN_A)
+            .header("x-forwarded-proto", "https")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(tokened.status().as_u16(), 200);
+        let listed: serde_json::Value = tokened.json().await.unwrap();
+        assert!(
+            listed.as_array().is_some_and(|l| l
+                .iter()
+                .all(|p| p["nonce"].as_str().is_some_and(|n| !n.is_empty()))),
+            "the hosted listing must be a JSON array"
+        );
+
+        // The wildcard-bind branch, reached over loopback.
+        let (lan_addr, _keep_lan) = serve_on("0.0.0.0:0", true).await;
+        let lan_url = format!("http://127.0.0.1:{}/permission/pending", lan_addr.port());
+        let tokenless = client.get(&lan_url).send().await.unwrap();
+        assert_eq!(
+            tokenless.status().as_u16(),
+            403,
+            "a hosted node on a wildcard bind must refuse the permission routes without a token"
+        );
+        let tokened = client
+            .get(&lan_url)
+            .header("x-freenet-user-token", TOKEN_A)
+            .header("x-forwarded-proto", "https")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(tokened.status().as_u16(), 200);
+
+        let (plain_addr, _keep_plain) = serve(false).await;
+        let plain = client
+            .get(format!("http://{plain_addr}/permission/pending"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            plain.status().as_u16(),
+            200,
+            "a node that is not hosted serves the route without a token"
         );
     }
 }

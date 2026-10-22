@@ -2470,8 +2470,8 @@ async fn sandbox_content_body(
 /// `localStorage` access is wrapped in try/catch so that a browser with storage
 /// disabled (private mode quirks, embedded webviews) degrades to an undefined
 /// token rather than throwing before the bridge starts; an undefined token means
-/// the bridge omits the `userToken` param and the backend treats the connection
-/// as a local/anonymous one (see `decide_user_token`).
+/// the bridge omits the `userToken` param, and the client API refuses a
+/// tokenless connection on a hosted node (see `websocket_commands`).
 const SHELL_USER_TOKEN_JS: &str = include_str!("path_handlers/assets/shell_user_token.js");
 
 /// Styles for the hosted-mode "shell chrome" bar (see `shell_page`). Rendered

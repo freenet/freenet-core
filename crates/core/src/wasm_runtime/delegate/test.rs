@@ -876,8 +876,141 @@ async fn test_context_persists_between_calls() -> Result<(), Box<dyn std::error:
     let cache = runtime.delegate_contexts.clone();
     runtime.unregister_delegate(delegate.key())?;
     assert!(
-        !cache.contains_key(delegate.key()),
+        !cache.contains_delegate(delegate.key()),
         "unregister_delegate should clear delegate_contexts entry"
+    );
+
+    std::mem::drop(temp_dir);
+    Ok(())
+}
+
+/// A delegate's context is kept per delegate and hosted user: each user, and
+/// a run with no user (any request on a node that is not hosted), has its own.
+/// `IncrementCounter` keeps a counter in the context, so each (delegate, user)
+/// pair counts from 1 independently.
+///
+/// FALSIFY by dropping the user from `DelegateContextStore::key`: the counter
+/// assertions fail.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_context_is_kept_per_hosted_user() -> Result<(), Box<dyn std::error::Error>> {
+    use crate::wasm_runtime::UserSecretContext;
+    use delegate2_messages::{InboundAppMessage, OutboundAppMessage};
+
+    let (delegate, mut runtime, temp_dir) = setup_runtime(TEST_DELEGATE_2).await?;
+    let a = UserSecretContext::from_token(b"context-per-user-a");
+    let b = UserSecretContext::from_token(b"context-per-user-b");
+
+    let mut increment = |user: Option<&UserSecretContext>| -> u64 {
+        let payload = bincode::serialize(&InboundAppMessage::IncrementCounter).unwrap();
+        let outbound = runtime
+            .inbound_app_message(
+                delegate.key(),
+                &vec![].into(),
+                None,
+                user,
+                vec![InboundDelegateMsg::ApplicationMessage(
+                    ApplicationMessage::new(payload),
+                )],
+            )
+            .expect("the delegate runs");
+        #[allow(clippy::wildcard_enum_match_arm)]
+        let response: OutboundAppMessage = match &outbound[0] {
+            OutboundDelegateMsg::ApplicationMessage(m) => {
+                bincode::deserialize(&m.payload).expect("decode")
+            }
+            other => panic!("expected an ApplicationMessage, got {other:?}"),
+        };
+        #[allow(clippy::wildcard_enum_match_arm)]
+        match response {
+            OutboundAppMessage::CounterValue(n) => n as u64,
+            other => panic!("expected CounterValue, got {other:?}"),
+        }
+    };
+
+    assert_eq!(increment(Some(&a)), 1);
+    assert_eq!(increment(Some(&a)), 2);
+    assert_eq!(
+        increment(Some(&b)),
+        1,
+        "user B starts from their own context"
+    );
+    assert_eq!(
+        increment(Some(&a)),
+        3,
+        "user A's context is unaffected by B's"
+    );
+    assert_eq!(increment(None), 1, "a run with no user has its own context");
+    assert_eq!(increment(Some(&b)), 2);
+
+    std::mem::drop(temp_dir);
+    Ok(())
+}
+
+/// `unregister_delegate` drops the delegate's context for every hosted user,
+/// on both of its paths: a registered delegate (the store has indexed its
+/// key) and a key the store never indexed.
+///
+/// `test_context_persists_between_calls` checks unregister only for the
+/// entry with no user, so it stays green if unregister removes only that
+/// entry. This test stores the entry under a hosted user.
+///
+/// FALSIFY: in `Runtime::unregister_delegate`, change the indexed-path
+/// `remove_delegate(key)` to `remove(key, None)`: the first assertion
+/// block fails. Change the unindexed-path one the same way: the second
+/// fails.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_unregister_drops_every_hosted_users_context() -> Result<(), Box<dyn std::error::Error>>
+{
+    use crate::wasm_runtime::UserSecretContext;
+    use delegate2_messages::InboundAppMessage;
+
+    let (delegate, mut runtime, temp_dir) = setup_runtime(TEST_DELEGATE_2).await?;
+    let user = UserSecretContext::from_token(b"unregister-hosted-user");
+    let uid = *user.user_id();
+
+    // Registered delegate: a hosted user's run leaves a context entry.
+    let payload = bincode::serialize(&InboundAppMessage::IncrementCounter)?;
+    runtime.inbound_app_message(
+        delegate.key(),
+        &vec![].into(),
+        None,
+        Some(&user),
+        vec![InboundDelegateMsg::ApplicationMessage(
+            ApplicationMessage::new(payload),
+        )],
+    )?;
+    assert!(
+        runtime
+            .delegate_contexts
+            .contains(delegate.key(), Some(&uid)),
+        "the hosted user's run stores a context under that user"
+    );
+    assert!(
+        !runtime.delegate_contexts.contains(delegate.key(), None),
+        "the run stored nothing under the no-user entry"
+    );
+    runtime.unregister_delegate(delegate.key())?;
+    assert!(
+        !runtime.delegate_contexts.contains_delegate(delegate.key()),
+        "unregister must drop the hosted user's context of a registered delegate"
+    );
+
+    // A key the store never indexed: unregister takes its early-return path,
+    // which must also drop every user's entry.
+    let other_key = DelegateKey::new([0x5Au8; 32], CodeHash::new([0x5Bu8; 32]));
+    runtime.delegate_contexts.insert_for_test(
+        &other_key,
+        Some(&uid),
+        super::super::native_api::DelegateContextEntry {
+            bytes: vec![1, 2, 3],
+            last_write: tokio::time::Instant::now(),
+        },
+    );
+    assert!(runtime.delegate_contexts.contains(&other_key, Some(&uid)));
+    runtime.unregister_delegate(&other_key)?;
+    assert!(
+        !runtime.delegate_contexts.contains_delegate(&other_key),
+        "unregister of an unindexed key must drop the hosted user's context"
     );
 
     std::mem::drop(temp_dir);
@@ -1261,7 +1394,7 @@ async fn test_context_oversize_is_dropped_not_crashed() -> Result<(), Box<dyn st
     // The persisted entry must be dropped — readers don't get to see
     // bytes that would crash on the next round-trip.
     assert!(
-        !runtime.delegate_contexts.contains_key(delegate.key()),
+        !runtime.delegate_contexts.contains_delegate(delegate.key()),
         "oversize ctx.write should be dropped from the persisted cache"
     );
 
@@ -1332,14 +1465,15 @@ async fn test_context_ttl_evicts_stale_entry() -> Result<(), Box<dyn std::error:
         .expect("Instant arithmetic on test platform")
         .checked_sub(std::time::Duration::from_secs(1))
         .expect("Instant arithmetic on test platform");
-    runtime.delegate_contexts.insert(
-        delegate.key().clone(),
+    runtime.delegate_contexts.insert_for_test(
+        delegate.key(),
+        None,
         super::super::native_api::DelegateContextEntry {
             bytes: vec![0xAA; 64],
             last_write: stale_at,
         },
     );
-    assert!(runtime.delegate_contexts.contains_key(delegate.key()));
+    assert!(runtime.delegate_contexts.contains_delegate(delegate.key()));
 
     // Drive any inbound — the loader's prune sweep runs first.
     let payload = bincode::serialize(&InboundAppMessage::ReadContext)?;
@@ -1356,7 +1490,7 @@ async fn test_context_ttl_evicts_stale_entry() -> Result<(), Box<dyn std::error:
     // The stale entry must be gone. The ReadContext call wrote nothing,
     // so no fresh entry was inserted in its place.
     assert!(
-        !runtime.delegate_contexts.contains_key(delegate.key()),
+        !runtime.delegate_contexts.contains_delegate(delegate.key()),
         "TTL sweep should evict an entry older than DELEGATE_CONTEXT_TTL"
     );
 
@@ -1369,22 +1503,42 @@ async fn test_context_ttl_evicts_stale_entry() -> Result<(), Box<dyn std::error:
 /// logic on its own, so without this one nobody would notice if those two
 /// calls were removed or swapped — and the #3492 leak would come back. Reads
 /// the source and asserts both calls are present and in that order.
+///
+/// FALSIFY by commenting out the `touch_inherited_origin` call in
+/// `inbound_app_message_as` (the touch assertion fails), or by swapping the
+/// two calls (the order assertion fails).
 #[test]
 fn inbound_app_message_wires_inherited_origins_ttl_in_order() {
     let src = include_str!("interface.rs");
-    // The impl is the LAST occurrence; the first is the trait method signature.
-    let body = src
-        .rsplit("fn inbound_app_message(")
-        .next()
-        .expect("inbound_app_message impl must exist");
+    // The body of the method every run goes through, `inbound_app_message_as`
+    // in the `Runtime` impl, bounded by its closing brace. (`inbound_app_message`
+    // is now a test-only wrapper on the trait; anchoring on it scanned the rest
+    // of the file and passed whatever the impl did.)
+    let imp = &src[src
+        .find("impl DelegateRuntimeInterface for Runtime {")
+        .expect("the Runtime impl")..];
+    let body = &imp[imp
+        .find("    fn inbound_app_message_as(")
+        .expect("Runtime implements inbound_app_message_as")..];
+    let body = &body[..body
+        .find("\n    }\n")
+        .expect("the method is bounded by its closing brace")];
+    // A call counts only at statement position, so a commented-out call does
+    // not satisfy the pin.
+    let call_at = |call: &str| {
+        body.match_indices(call)
+            .find(|(i, _)| {
+                let line_start = body[..*i].rfind('\n').map_or(0, |n| n + 1);
+                body[line_start..*i].trim().is_empty()
+            })
+            .map(|(i, _)| i)
+    };
     // Anchor on the call, not its arguments: the map these take is injected
     // state now (#4813), and pinning the argument list would have failed that
     // refactor for no reason. What must not regress is that both run, in order.
-    let touch = body
-        .find("touch_inherited_origin(")
+    let touch = call_at("native_api::touch_inherited_origin(")
         .expect("inbound_app_message must refresh inherited-origin liveness (touch)");
-    let prune = body
-        .find("prune_expired_inherited_origins(")
+    let prune = call_at("native_api::prune_expired_inherited_origins(")
         .expect("inbound_app_message must run the inherited-origins TTL sweep (prune)");
     assert!(
         touch < prune,
@@ -4536,48 +4690,40 @@ mod hosted_user_secrets {
         );
     }
 
-    /// The per-user namespace does NOT propagate across a delegate-to-delegate
-    /// hop. When delegate A (running under user X's connection) sends a
-    /// `SendDelegateMessage` to delegate B, the executor delivers it to B with
-    /// `user_context = None` and `origin = Some(MessageOrigin::Delegate(A))`
+    /// A delegate-to-delegate hop runs its target under the user whose request
+    /// led to the hop. When delegate A (running under user X's connection)
+    /// sends a `SendDelegateMessage` to delegate B, the executor delivers it to
+    /// B with `user_context = Some(X)` and `origin = Some(MessageOrigin::Delegate(A))`
     /// (see `contract.rs::handle_delegate_with_contract_requests`, the
-    /// `execute_delegate_request(target_req, None, Some(delegate_key), None)`
-    /// call). So B's secret op MUST land in B's `Local` namespace, never under
-    /// user X — the user namespace is bound to the originating connection, not
-    /// transitively inherited through the inter-delegate hop.
+    /// `execute_delegate_hop` call). So B's secret op lands in X's namespace
+    /// for B, and the node-local namespace is untouched. On a hosted node every
+    /// delegate run belongs to a user, and a hop is no exception.
     ///
     /// This test drives B exactly the way the executor drives it for that hop:
-    /// `origin = Delegate(A)`, `user_context = None`. It is parameterised over
-    /// the user X whose namespace must stay untouched.
+    /// `origin = Delegate(A)`, `user_context = Some(X)`.
     #[tokio::test(flavor = "multi_thread")]
-    async fn user_namespace_does_not_propagate_across_inter_delegate_hop()
+    async fn inter_delegate_hop_runs_under_the_originating_users_namespace()
     -> Result<(), Box<dyn std::error::Error>> {
         // Register two distinct delegates (A the sender, B the target). Only B
         // performs the secret op; A's key is used solely to attest the
         // inter-delegate origin the executor would inject.
         let (delegate_b, mut runtime, temp_dir) = setup_runtime(TEST_DELEGATE_2).await?;
         let key_b = delegate_b.key().clone();
-        // Synthetic sender delegate A (key only — its WASM is irrelevant here;
+        // Synthetic sender delegate A (key only; its WASM is irrelevant here:
         // we are testing what B's secrets bind to, given the hop's arguments).
         let key_a = DelegateKey::new([0xA1u8; 32], CodeHash::new([0xA2u8; 32]));
 
-        // User X's connection: a secret B stores DIRECTLY under X's context.
         let ctx_x = UserSecretContext::from_token(b"user-X");
         let sk = vec![0xEE, 0xEE];
-        let x_value = vec![0x58; 8]; // 'X'
-        store(
-            &mut runtime,
-            &key_b,
-            Some(&ctx_x),
-            sk.clone(),
-            x_value.clone(),
-        );
+        // A secret B holds in the node-local namespace, which the hop must not
+        // touch.
+        let local_value = vec![0x4C; 8]; // 'L'
+        store(&mut runtime, &key_b, None, sk.clone(), local_value.clone());
 
-        // Now deliver to B the way the executor delivers an inter-delegate hop
-        // that originated from A (which was itself invoked under user X):
-        //   origin = Some(MessageOrigin::Delegate(A)),  user_context = None.
-        // B stores under the SAME secret key but a different value.
-        let hop_value = vec![0x42; 8]; // 'B' — the inter-delegate write
+        // Deliver to B the way the executor delivers an inter-delegate hop that
+        // originated from A, itself invoked under user X:
+        //   origin = Some(MessageOrigin::Delegate(A)),  user_context = Some(X).
+        let hop_value = vec![0x42; 8]; // 'B', the inter-delegate write
         let origin = MessageOrigin::Delegate(key_a.clone());
         let payload = bincode::serialize(&InboundAppMessage::StoreSecret {
             key: sk.clone(),
@@ -4590,7 +4736,7 @@ mod hosted_user_secrets {
                 &key_b,
                 &vec![].into(),
                 Some(&origin), // attested inter-delegate origin (A)
-                None,          // user_context = None: the hop does NOT carry X
+                Some(&ctx_x),  // the hop runs under the originating user X
                 vec![InboundDelegateMsg::ApplicationMessage(app_msg)],
             )
             .expect("inbound_app_message");
@@ -4603,19 +4749,17 @@ mod hosted_user_secrets {
             "inter-delegate-hop store should succeed, got {resp:?}"
         );
 
-        // The hop's write landed in B's Local namespace...
+        // The hop's write landed in X's namespace for B...
         assert_eq!(
-            get(&mut runtime, &key_b, None, sk.clone()),
+            get(&mut runtime, &key_b, Some(&ctx_x), sk.clone()),
             Some(hop_value),
-            "inter-delegate-hop secret must be in B's Local namespace"
+            "the hop's secret must be in the originating user's namespace"
         );
-        // ...and user X's namespace is UNTOUCHED — it still holds X's value,
-        // NOT the value written during the A->B hop. This is the property:
-        // the hop did not write into (or read from) X's namespace.
+        // ...and the node-local namespace still holds its own value.
         assert_eq!(
-            get(&mut runtime, &key_b, Some(&ctx_x), sk),
-            Some(x_value),
-            "user X's secret must be unchanged by the inter-delegate hop"
+            get(&mut runtime, &key_b, None, sk),
+            Some(local_value),
+            "the node-local secret must be unchanged by the hop"
         );
 
         std::mem::drop(temp_dir);

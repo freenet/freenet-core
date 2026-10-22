@@ -196,6 +196,18 @@ async fn wait_ws_ready(port: u16, within: Duration) -> anyhow::Result<()> {
                 drop(stream);
                 return Ok(());
             }
+            // A hosted node refuses a client-API connection without a user
+            // token; that refusal is the node answering, so the API is up.
+            // Only that refusal counts: any other 403 keeps waiting.
+            Err(tokio_tungstenite::tungstenite::Error::Http(response))
+                if response.status()
+                    == tokio_tungstenite::tungstenite::http::StatusCode::FORBIDDEN
+                    && response.body().as_deref().is_some_and(|b| {
+                        String::from_utf8_lossy(b).contains("requires a user token")
+                    }) =>
+            {
+                return Ok(());
+            }
             Err(e) => {
                 if Instant::now() >= deadline {
                     anyhow::bail!("WS API on port {port} did not come up within {within:?}: {e}");

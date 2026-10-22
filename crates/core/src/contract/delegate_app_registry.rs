@@ -40,7 +40,7 @@
 //! eagerly. The backstop for a connection that ended
 //! without that event (a cancelled or panicked task) is the channel itself: the
 //! receiving end lives in the connection task's listener map, so once the task
-//! is gone the sender reports closed, and [`sweep_closed`] and [`route_to_apps`]
+//! is gone the sender reports closed, and [`sweep_closed`] and [`route_to_apps_for`]
 //! prune it. Two tests in `client_events::websocket` pin that the task drops
 //! those receivers when the client goes away, with a close frame
 //! (`client_disconnect_drops_listeners_and_notifies_the_node`) and without one
@@ -105,6 +105,7 @@ use freenet_stdlib::prelude::DelegateKey;
 use tokio::sync::mpsc;
 
 use crate::client_events::{ClientId, HostResult};
+use crate::wasm_runtime::UserId;
 
 /// Maximum number of distinct client connections that may register with a
 /// single delegate. Caps notification fan-out cost per delegate.
@@ -117,7 +118,7 @@ pub(crate) const MAX_APPS_PER_DELEGATE: usize = 128;
 /// and needs no unclean disconnect: an off-host caller simply HOLDS
 /// `MAX_APPS_PER_DELEGATE` connections open, sends one `ApplicationMessages` on
 /// each, and every slot is filled by live `Remote` registrations that
-/// [`route_to_apps`] will never deliver to. The legitimate LOCAL app is then
+/// [`route_to_apps_for`] will never deliver to. The legitimate LOCAL app is then
 /// refused at the cap indefinitely. The dead-channel prune does not help,
 /// because nothing here is dead.
 ///
@@ -140,7 +141,7 @@ pub(crate) const MAX_DELEGATES_PER_CLIENT: usize = 256;
 ///
 /// Registrations are a push channel for a delegate's output, and that output is
 /// the delegate's app's data. Before GHSA-824h-7x5x-wfmf there was no such
-/// distinction and [`route_to_apps`] fanned every notification to EVERY
+/// distinction and [`route_to_apps_for`] fanned every notification to EVERY
 /// registration, so any client that sent one `ApplicationMessages` request to a
 /// delegate received its subsequent output.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -152,7 +153,7 @@ pub(crate) enum AppIdentity {
     /// connection's attested app identity here "for diagnostics", but nothing
     /// read it — a field justified as diagnostic that nothing diagnoses is dead
     /// weight that also invites the next reader to gate on it, which is exactly
-    /// what [`route_to_apps`] explains must not happen.
+    /// what [`route_to_apps_for`] explains must not happen.
     Local,
     /// Not provably local. Recorded so the caps and pruning stay identical,
     /// but never a delivery target.
@@ -174,13 +175,22 @@ struct AppRegistration {
     /// delivery. Read and set ONLY through
     /// [`AppRegistration::latch_withhold_report`], so the report stays
     /// once-per-registration rather than once-per-notification. See
-    /// [`route_to_apps`].
+    /// [`route_to_apps_for`].
     withhold_logged: bool,
     /// Whether this registration has already reported a full channel since its
     /// last successful delivery. Set ONLY through
     /// [`AppRegistration::latch_full_report`] and cleared on delivery. See
-    /// [`route_to_apps`].
+    /// [`route_to_apps_for`].
     full_logged: bool,
+    /// The hosted user whose connection registered, or `None` outside hosted
+    /// mode (a hosted node's client API serves only connections with a user
+    /// token). A hosted user's `UnregisterDelegate` removes only that user's
+    /// registrations ([`remove_user_registrations`]); a `None` registration
+    /// goes only when its connection does.
+    ///
+    /// Only the user's id, never the user's secret: routing needs to know whose
+    /// registration this is, and nothing here runs a delegate.
+    user: Option<UserId>,
     sender: mpsc::Sender<HostResult>,
 }
 
@@ -235,10 +245,22 @@ static CLIENT_REGISTRATION_COUNTS: LazyLock<DashMap<ClientId, usize>> =
 /// per-client cap would be exceeded, so the caller can log the rejection. Re-registering an
 /// existing `(delegate, client)` pair always succeeds and replaces the sender:
 /// each request carries a fresh channel, and the one it replaces is dropped.
+#[cfg(test)]
 pub(crate) fn register_app(
     delegate_key: &DelegateKey,
     client_id: ClientId,
     identity: AppIdentity,
+    sender: mpsc::Sender<HostResult>,
+) -> bool {
+    register_app_for_user(delegate_key, client_id, identity, None, sender)
+}
+
+/// [`register_app`], recording the hosted user whose connection registered.
+pub(crate) fn register_app_for_user(
+    delegate_key: &DelegateKey,
+    client_id: ClientId,
+    identity: AppIdentity,
+    user: Option<UserId>,
     sender: mpsc::Sender<HostResult>,
 ) -> bool {
     let mut apps = DELEGATE_APPS.entry(delegate_key.clone()).or_default();
@@ -247,6 +269,7 @@ pub(crate) fn register_app(
     if let Some(existing) = apps.iter_mut().find(|a| a.client_id == client_id) {
         existing.sender = sender;
         existing.identity = identity;
+        existing.user = user;
         // `full_logged` is left alone: the fresh channel has room (it holds at
         // most the request's own reply), so the next delivery succeeds and
         // clears it, and the next stall on the new channel is reported.
@@ -333,6 +356,7 @@ pub(crate) fn register_app(
         identity,
         withhold_logged: false,
         full_logged: false,
+        user,
         sender,
     });
     *count += 1;
@@ -340,7 +364,13 @@ pub(crate) fn register_app(
 }
 
 /// Route a notification-driven `ApplicationMessage` (already wrapped in a
-/// [`HostResult`]) to every LOCAL registration for `delegate_key`.
+/// [`HostResult`]) to the LOCAL registrations for `delegate_key` that
+/// `recipients` names: every local one on a node that is not hosted
+/// ([`Recipients::EveryLocal`]), only the run's own user's on a hosted node
+/// ([`Recipients::User`]), since there every delegate run belongs to a user.
+/// A registration that is not a recipient is skipped after the same
+/// closed-channel prune every registration gets, so a user filter never
+/// leaves a dead registration holding a slot.
 ///
 /// A registration from a connection the node could not prove is local is
 /// skipped: before GHSA-824h-7x5x-wfmf, sending a delegate one
@@ -370,13 +400,21 @@ pub(crate) fn register_app(
 /// always has. "Local" means this HOST, not this USER — closing that needs a
 /// real per-client authorization model, not a routing filter.
 ///
+/// That is the rule on a node that is not hosted. On a hosted node each
+/// connection carries a user, every delegate run belongs to one, and the
+/// run's output is routed to that user alone ([`Recipients::User`]).
+///
 /// Uses `try_send` (never `.await`) so it is safe to call from the
 /// single-threaded contract-handling loop: a message to a full channel is
 /// dropped (the registration is kept, and the stall is logged once per run of
 /// full sends), never blocking the loop (see `.claude/rules/channel-safety.md`).
 /// Returns the number of apps the message was delivered to. Closed channels are
 /// pruned as a side effect (the client is gone).
-pub(crate) fn route_to_apps(delegate_key: &DelegateKey, message: HostResult) -> usize {
+pub(crate) fn route_to_apps_for(
+    delegate_key: &DelegateKey,
+    recipients: Recipients<'_>,
+    message: HostResult,
+) -> usize {
     let Some(mut apps) = DELEGATE_APPS.get_mut(delegate_key) else {
         return 0;
     };
@@ -420,6 +458,15 @@ pub(crate) fn route_to_apps(delegate_key: &DelegateKey, message: HostResult) -> 
                      registration (GHSA-824h-7x5x-wfmf); the client is connected \
                      but off-host. Logged once per registration."
                 );
+            }
+            return true;
+        }
+        if !recipients.includes(app.user.as_ref()) {
+            // Another user's registration (or a user-less one when routing to a
+            // user). Same prune as above, then skip without delivering.
+            if app.sender.is_closed() {
+                closed_clients.push(app.client_id);
+                return false;
             }
             return true;
         }
@@ -467,6 +514,37 @@ pub(crate) fn route_to_apps(delegate_key: &DelegateKey, message: HostResult) -> 
     delivered
 }
 
+/// Which registrations a delegate's output may go to.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum Recipients<'a> {
+    /// Every local registration. The rule on a node that is not hosted, where
+    /// no registration carries a user.
+    EveryLocal,
+    /// Only the local registrations of this hosted user. The rule for a run on
+    /// a hosted node: a run belongs to one user, and its output reaches only
+    /// that user.
+    User(&'a UserId),
+}
+
+impl Recipients<'_> {
+    /// Whether a registration made by `user` is one of these recipients.
+    /// Locality is checked separately, before this.
+    fn includes(self, user: Option<&UserId>) -> bool {
+        match self {
+            Self::EveryLocal => true,
+            Self::User(wanted) => user == Some(wanted),
+        }
+    }
+}
+
+/// [`route_to_apps_for`] with [`Recipients::EveryLocal`], the rule on a node
+/// that is not hosted. Test-only: production routing always names its
+/// recipients, so a hosted run cannot reach every local app by omission.
+#[cfg(test)]
+pub(crate) fn route_to_apps(delegate_key: &DelegateKey, message: HostResult) -> usize {
+    route_to_apps_for(delegate_key, Recipients::EveryLocal, message)
+}
+
 /// Remove every registration for `client_id` (clean disconnect).
 pub(crate) fn remove_client(client_id: ClientId) {
     let mut removed_any = false;
@@ -490,10 +568,34 @@ pub(crate) fn remove_delegate(delegate_key: &DelegateKey) {
     }
 }
 
+/// Remove `user`'s registrations for `delegate_key`, leaving every other
+/// user's (a hosted user unregistered the delegate for themselves).
+pub(crate) fn remove_user_registrations(delegate_key: &DelegateKey, user: &UserId) {
+    let Some(mut apps) = DELEGATE_APPS.get_mut(delegate_key) else {
+        return;
+    };
+    let mut removed: Vec<ClientId> = Vec::new();
+    apps.retain(|a| {
+        let keep = a.user.as_ref() != Some(user);
+        if !keep {
+            removed.push(a.client_id);
+        }
+        keep
+    });
+    let now_empty = apps.is_empty();
+    drop(apps);
+    if now_empty {
+        DELEGATE_APPS.remove_if(delegate_key, |_, v| v.is_empty());
+    }
+    for client in removed {
+        decrement_client_count(client);
+    }
+}
+
 /// Prune every registration whose channel is closed, across all delegates.
 ///
 /// The backstop for connections that ended without a clean disconnect event.
-/// [`route_to_apps`] prunes the same way, but only for the delegate it is
+/// [`route_to_apps_for`] prunes the same way, but only for the delegate it is
 /// delivering for; this covers delegates that are not being routed to. An open
 /// channel is never pruned, however long it has been idle: see the module docs.
 pub(crate) fn sweep_closed() {
@@ -514,7 +616,7 @@ pub(crate) fn sweep_closed() {
 }
 
 /// Number of registrations for `delegate_key`, without pruning anything (unlike
-/// [`route_to_apps`], which would reap a closed registration itself and so
+/// [`route_to_apps_for`], which would reap a closed registration itself and so
 /// cannot observe whether something else did).
 #[cfg(test)]
 pub(crate) fn registration_count(delegate_key: &DelegateKey) -> usize {
@@ -534,6 +636,7 @@ fn decrement_client_count(client_id: ClientId) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::wasm_runtime::UserSecretContext;
     use freenet_stdlib::prelude::CodeHash;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -586,6 +689,137 @@ mod tests {
         let delivered = route_to_apps(&dk, host_msg());
         assert_eq!(delivered, 1);
         assert!(rx.try_recv().is_ok(), "app must receive the message");
+    }
+
+    /// `remove_user_registrations` removes one user's registrations for a
+    /// delegate and keeps every other one (another user's, and one with no
+    /// user), frees the removed clients' per-client counts, and drops the
+    /// delegate's entry once it is empty.
+    ///
+    /// FALSIFY by making `remove_user_registrations` keep or drop everything:
+    /// one of the count assertions fails.
+    #[tokio::test(start_paused = true)]
+    #[serial_test::serial]
+    async fn remove_user_registrations_removes_only_that_users() {
+        let ns = Namespace::new();
+        let dk = ns.key(0);
+        let ctx_a = UserSecretContext::from_token(b"registry-remove-user-a");
+        let ctx_b = UserSecretContext::from_token(b"registry-remove-user-b");
+        let (user_a, user_b) = (*ctx_a.user_id(), *ctx_b.user_id());
+        let (tx_a, _rx_a) = mpsc::channel::<HostResult>(4);
+        let (tx_b, mut rx_b) = mpsc::channel::<HostResult>(4);
+        let (tx_none, mut rx_none) = mpsc::channel::<HostResult>(4);
+        assert!(register_app_for_user(
+            &dk,
+            ns.client(0),
+            AppIdentity::Local,
+            Some(*ctx_a.user_id()),
+            tx_a
+        ));
+        assert!(register_app_for_user(
+            &dk,
+            ns.client(1),
+            AppIdentity::Local,
+            Some(*ctx_b.user_id()),
+            tx_b
+        ));
+        assert!(register_app(&dk, ns.client(2), AppIdentity::Local, tx_none));
+        assert_eq!(registration_count(&dk), 3);
+
+        remove_user_registrations(&dk, &user_a);
+        assert_eq!(
+            registration_count(&dk),
+            2,
+            "only user A's registration goes"
+        );
+        assert!(
+            CLIENT_REGISTRATION_COUNTS.get(&ns.client(0)).is_none(),
+            "the removed client's per-client count is freed"
+        );
+        assert_eq!(route_to_apps(&dk, host_msg()), 2);
+        assert!(rx_b.try_recv().is_ok(), "user B still receives pushes");
+        assert!(rx_none.try_recv().is_ok(), "a user-less registration stays");
+
+        assert_eq!(
+            CLIENT_REGISTRATION_COUNTS.get(&ns.client(1)).map(|c| *c),
+            Some(1),
+            "user B's per-client count is untouched"
+        );
+
+        remove_user_registrations(&dk, &user_b);
+        remove_client(ns.client(2));
+        assert!(
+            DELEGATE_APPS.get(&dk).is_none(),
+            "an emptied delegate entry is dropped"
+        );
+    }
+
+    /// A user's removal for one delegate takes every one of that user's
+    /// registrations for it (one per connection), leaves the same user's
+    /// registration with another delegate, and does not stop the user
+    /// registering again.
+    ///
+    /// FALSIFY by removing only the first match, or by matching on the user
+    /// alone across delegates: one of the count assertions fails.
+    #[tokio::test(start_paused = true)]
+    #[serial_test::serial]
+    async fn remove_user_registrations_takes_all_of_that_users_and_only_for_that_delegate() {
+        let ns = Namespace::new();
+        let dk = ns.key(0);
+        let other = ns.key(1);
+        let ctx = UserSecretContext::from_token(b"registry-remove-user-c");
+        let user = *ctx.user_id();
+        let (tx0, _rx0) = mpsc::channel::<HostResult>(4);
+        let (tx1, _rx1) = mpsc::channel::<HostResult>(4);
+        let (tx2, mut rx2) = mpsc::channel::<HostResult>(4);
+        assert!(register_app_for_user(
+            &dk,
+            ns.client(0),
+            AppIdentity::Local,
+            Some(*ctx.user_id()),
+            tx0
+        ));
+        assert!(register_app_for_user(
+            &dk,
+            ns.client(1),
+            AppIdentity::Local,
+            Some(*ctx.user_id()),
+            tx1
+        ));
+        assert!(register_app_for_user(
+            &other,
+            ns.client(2),
+            AppIdentity::Local,
+            Some(*ctx.user_id()),
+            tx2
+        ));
+
+        remove_user_registrations(&dk, &user);
+        assert_eq!(
+            registration_count(&dk),
+            0,
+            "both of the user's connections go"
+        );
+        assert_eq!(registration_count(&other), 1, "the other delegate's stays");
+        assert_eq!(route_to_apps(&other, host_msg()), 1);
+        assert!(rx2.try_recv().is_ok());
+
+        let (tx3, mut rx3) = mpsc::channel::<HostResult>(4);
+        assert!(
+            register_app_for_user(
+                &dk,
+                ns.client(0),
+                AppIdentity::Local,
+                Some(*ctx.user_id()),
+                tx3
+            ),
+            "the user can register again"
+        );
+        assert_eq!(route_to_apps(&dk, host_msg()), 1);
+        assert!(rx3.try_recv().is_ok());
+
+        remove_client(ns.client(0));
+        remove_client(ns.client(2));
     }
 
     #[tokio::test(start_paused = true)]
@@ -1157,5 +1391,138 @@ mod tests {
         assert_eq!(route_to_apps(&dk, host_msg()), 2);
         assert!(a_rx.try_recv().is_ok());
         assert!(b_rx.try_recv().is_ok());
+    }
+
+    /// Payload of the single `ApplicationMessage` in a routed message.
+    fn payload_of(msg: HostResult) -> Vec<u8> {
+        use freenet_stdlib::client_api::HostResponse;
+        use freenet_stdlib::prelude::OutboundDelegateMsg;
+        match msg {
+            Ok(HostResponse::DelegateResponse { values, .. }) => match values.as_slice() {
+                [OutboundDelegateMsg::ApplicationMessage(m)] => m.payload.clone(),
+                other => panic!("expected one ApplicationMessage, got {other:?}"),
+            },
+            other => panic!("expected a DelegateResponse, got {other:?}"),
+        }
+    }
+
+    fn msg_with(payload: &[u8]) -> HostResult {
+        use freenet_stdlib::client_api::HostResponse;
+        use freenet_stdlib::prelude::{ApplicationMessage, OutboundDelegateMsg};
+        Ok(HostResponse::DelegateResponse {
+            key: DelegateKey::new([0u8; 32], CodeHash::new([0u8; 32])),
+            values: vec![OutboundDelegateMsg::ApplicationMessage(
+                ApplicationMessage::new(payload.to_vec()),
+            )],
+        })
+    }
+
+    /// On a hosted node a run's output reaches only the registrations of the
+    /// user the run belongs to: every one of that user's local connections,
+    /// and no other user's, no user-less registration and no non-local one.
+    ///
+    /// FALSIFY by making `route_to_apps_for` ignore `Recipients::User` (route
+    /// to every local registration): user B's and the user-less channels
+    /// receive the message and their assertions fail.
+    #[tokio::test(start_paused = true)]
+    #[serial_test::serial]
+    async fn routing_to_a_user_reaches_only_that_users_local_registrations() {
+        let ns = Namespace::new();
+        let dk = ns.key(0);
+        let a = UserSecretContext::from_token(b"registry-route-user-a");
+        let b = UserSecretContext::from_token(b"registry-route-user-b");
+        let (a1_tx, mut a1_rx) = mpsc::channel::<HostResult>(4);
+        let (a2_tx, mut a2_rx) = mpsc::channel::<HostResult>(4);
+        let (a_remote_tx, mut a_remote_rx) = mpsc::channel::<HostResult>(4);
+        let (b_tx, mut b_rx) = mpsc::channel::<HostResult>(4);
+        let (none_tx, mut none_rx) = mpsc::channel::<HostResult>(4);
+        for (n, identity, user, tx) in [
+            (0, AppIdentity::Local, Some(*a.user_id()), a1_tx),
+            (1, AppIdentity::Local, Some(*a.user_id()), a2_tx),
+            (2, AppIdentity::Remote, Some(*a.user_id()), a_remote_tx),
+            (3, AppIdentity::Local, Some(*b.user_id()), b_tx),
+            (4, AppIdentity::Local, None, none_tx),
+        ] {
+            assert!(register_app_for_user(&dk, ns.client(n), identity, user, tx));
+        }
+
+        let delivered = route_to_apps_for(&dk, Recipients::User(a.user_id()), msg_with(b"for-a"));
+        assert_eq!(delivered, 2, "both of A's local connections, nothing else");
+        assert_eq!(
+            payload_of(a1_rx.try_recv().expect("A's first tab")),
+            b"for-a"
+        );
+        assert_eq!(
+            payload_of(a2_rx.try_recv().expect("A's second tab")),
+            b"for-a"
+        );
+        assert!(
+            a_remote_rx.try_recv().is_err(),
+            "a non-local registration never receives"
+        );
+        assert!(
+            b_rx.try_recv().is_err(),
+            "another user's registration must not receive"
+        );
+        assert!(
+            none_rx.try_recv().is_err(),
+            "a user-less registration must not receive"
+        );
+
+        // Control: the every-local route, the rule on a node that is not hosted,
+        // reaches every local registration.
+        assert_eq!(route_to_apps(&dk, msg_with(b"every-local")), 4);
+
+        for n in 0..5 {
+            remove_client(ns.client(n));
+        }
+    }
+
+    /// Routing to a user still prunes a closed registration of ANOTHER user,
+    /// as every-local routing does, so a user filter does not leave dead
+    /// registrations holding slots.
+    ///
+    /// FALSIFY by skipping registrations of other users before the closed
+    /// check: the count stays at 2.
+    #[tokio::test(start_paused = true)]
+    #[serial_test::serial]
+    async fn routing_to_a_user_prunes_closed_registrations_of_other_users() {
+        let ns = Namespace::new();
+        let dk = ns.key(0);
+        let a = UserSecretContext::from_token(b"registry-prune-user-a");
+        let b = UserSecretContext::from_token(b"registry-prune-user-b");
+        let (a_tx, mut a_rx) = mpsc::channel::<HostResult>(4);
+        let (b_tx, b_rx) = mpsc::channel::<HostResult>(4);
+        assert!(register_app_for_user(
+            &dk,
+            ns.client(0),
+            AppIdentity::Local,
+            Some(*a.user_id()),
+            a_tx
+        ));
+        assert!(register_app_for_user(
+            &dk,
+            ns.client(1),
+            AppIdentity::Local,
+            Some(*b.user_id()),
+            b_tx
+        ));
+        drop(b_rx);
+
+        assert_eq!(
+            route_to_apps_for(&dk, Recipients::User(a.user_id()), msg_with(b"x")),
+            1
+        );
+        assert!(a_rx.try_recv().is_ok());
+        assert_eq!(
+            registration_count(&dk),
+            1,
+            "B's closed registration is pruned"
+        );
+        assert!(
+            CLIENT_REGISTRATION_COUNTS.get(&ns.client(1)).is_none(),
+            "and its per-client count freed"
+        );
+        remove_client(ns.client(0));
     }
 }

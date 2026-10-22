@@ -288,10 +288,19 @@ fn playwright_enabled() -> bool {
     )
 }
 
+/// Which specs a Playwright pass runs. Specs tagged `@hosted` need a hosted
+/// node behind TLS and run only in [`hosted_shell_permission_token_via_playwright`];
+/// every other spec runs against the ordinary node.
+#[derive(Clone, Copy)]
+enum SpecSet {
+    NotHosted,
+    Hosted,
+}
+
 /// Run `npx playwright test` against the shell URL. Assumes deps + browsers are
 /// already installed (the CI workflow / local README handle that). Returns an
 /// error if the suite fails so the Rust test fails too.
-fn run_playwright(shell_url: &str) -> anyhow::Result<()> {
+fn run_playwright(shell_url: &str, specs: SpecSet) -> anyhow::Result<()> {
     let dir = playwright_dir();
     anyhow::ensure!(
         dir.join("node_modules").exists(),
@@ -302,6 +311,10 @@ fn run_playwright(shell_url: &str) -> anyhow::Result<()> {
         .current_dir(&dir)
         .env("FREENET_SHELL_URL", shell_url)
         .args(["playwright", "test"])
+        .args(match specs {
+            SpecSet::NotHosted => ["--grep-invert", "@hosted"],
+            SpecSet::Hosted => ["--grep", "@hosted"],
+        })
         .status()
         .map_err(|e| anyhow::anyhow!("failed to spawn `npx playwright test` in {dir:?}: {e}"))?;
     anyhow::ensure!(
@@ -378,7 +391,290 @@ async fn shell_smoke_via_playwright(ctx: &mut TestContext) -> TestResult {
     // tokio is multi-threaded here; the blocking `npx` child is fine on a
     // worker thread for a one-shot suite run.
     let shell_url_for_pw = shell_url.clone();
-    tokio::task::spawn_blocking(move || run_playwright(&shell_url_for_pw)).await??;
+    tokio::task::spawn_blocking(move || run_playwright(&shell_url_for_pw, SpecSet::NotHosted))
+        .await??;
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Hosted-mode pass
+// ---------------------------------------------------------------------------
+
+/// Reserve an ephemeral TCP port by binding then freeing it.
+fn reserve_port() -> anyhow::Result<u16> {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+    Ok(listener.local_addr()?.port())
+}
+
+/// A single self-contained gateway rooted at `dir`, its client API on
+/// loopback `ws_port`. `hosted_mode` is the only difference between the two
+/// boots of [`hosted_shell_permission_token_via_playwright`].
+fn standalone_node_config(
+    dir: &Path,
+    ws_port: u16,
+    network_port: u16,
+    keypair_path: &Path,
+    hosted_mode: bool,
+) -> freenet::config::ConfigArgs {
+    use std::net::Ipv4Addr;
+    freenet::config::ConfigArgs {
+        ws_api: freenet::config::WebsocketApiArgs {
+            address: Some(Ipv4Addr::LOCALHOST.into()),
+            ws_api_port: Some(ws_port),
+            hosted_mode: Some(hosted_mode),
+            ..Default::default()
+        },
+        network_api: freenet::config::NetworkArgs {
+            public_address: Some(Ipv4Addr::LOCALHOST.into()),
+            public_port: Some(network_port),
+            is_gateway: true,
+            skip_load_from_network: true,
+            gateways: Some(vec![]),
+            location: Some(0.5),
+            ignore_protocol_checking: true,
+            address: Some(Ipv4Addr::LOCALHOST.into()),
+            network_port: Some(network_port),
+            ..Default::default()
+        },
+        config_paths: freenet::config::ConfigPathsArgs {
+            config_dir: Some(dir.to_path_buf()),
+            data_dir: Some(dir.to_path_buf()),
+            log_dir: Some(dir.to_path_buf()),
+        },
+        secrets: freenet::config::SecretArgs {
+            transport_keypair: Some(keypair_path.to_path_buf()),
+            ..Default::default()
+        },
+        ..Default::default()
+    }
+}
+
+/// A running standalone node.
+struct StandaloneNode {
+    ws_port: u16,
+    shutdown: freenet::ShutdownHandle,
+    run: tokio::task::JoinHandle<Result<std::convert::Infallible, anyhow::Error>>,
+}
+
+impl StandaloneNode {
+    async fn start(dir: &Path, keypair_path: &Path, hosted_mode: bool) -> anyhow::Result<Self> {
+        let ws_port = reserve_port()?;
+        let net_port = reserve_port()?;
+        let cfg = standalone_node_config(dir, ws_port, net_port, keypair_path, hosted_mode)
+            .build()
+            .await?;
+        let node = freenet::local_node::NodeConfig::new(cfg.clone())
+            .await?
+            .build(freenet::server::serve_client_api(cfg.ws_api.clone()).await?)
+            .await?;
+        let shutdown = node.shutdown_handle();
+        let run = tokio::spawn(async move { node.run().await });
+        Ok(Self {
+            ws_port,
+            shutdown,
+            run,
+        })
+    }
+
+    async fn stop(self) {
+        self.shutdown.shutdown().await;
+        if tokio::time::timeout(Duration::from_secs(30), self.run)
+            .await
+            .is_err()
+        {
+            tracing::info!("node run loop did not exit within 30s of shutdown");
+        }
+    }
+}
+
+/// How long the TLS proxy has to report the port it listens on.
+const TLS_PROXY_START_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The TLS proxy child (`hosted-tls-proxy.mjs`), killed on drop.
+struct TlsProxy {
+    child: std::process::Child,
+    port: u16,
+}
+
+impl TlsProxy {
+    fn start(node_port: u16) -> anyhow::Result<Self> {
+        use std::io::BufRead;
+        let mut child = Command::new("node")
+            .arg(playwright_dir().join("hosted-tls-proxy.mjs"))
+            .arg(node_port.to_string())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| {
+                anyhow::anyhow!("failed to spawn the TLS proxy (is node on PATH?): {e}")
+            })?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("TLS proxy has no stdout"))?;
+        // Read the port line on a separate thread so a proxy that never
+        // writes it cannot hang the test. Killing the child ends that read.
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut line = String::new();
+            let read = std::io::BufReader::new(stdout)
+                .read_line(&mut line)
+                .map(|_| line);
+            drop(tx.send(read));
+        });
+        let line = match rx.recv_timeout(TLS_PROXY_START_TIMEOUT) {
+            Ok(Ok(line)) => line,
+            Ok(Err(e)) => {
+                drop(child.kill());
+                drop(child.wait());
+                anyhow::bail!("reading the TLS proxy's port failed: {e}")
+            }
+            Err(_) => {
+                drop(child.kill());
+                drop(child.wait());
+                anyhow::bail!(
+                    "TLS proxy did not report its port within {TLS_PROXY_START_TIMEOUT:?}"
+                )
+            }
+        };
+        let port = line
+            .trim()
+            .strip_prefix("LISTENING ")
+            .and_then(|p| p.parse::<u16>().ok());
+        match port {
+            Some(port) => Ok(Self { child, port }),
+            None => {
+                drop(child.kill());
+                drop(child.wait());
+                anyhow::bail!("TLS proxy did not report its port, got {line:?}")
+            }
+        }
+    }
+}
+
+impl Drop for TlsProxy {
+    fn drop(&mut self) {
+        drop(self.child.kill());
+        drop(self.child.wait());
+    }
+}
+
+/// The shell's permission routes on a HOSTED node, in a real browser.
+///
+/// A hosted node requires the user's token on the permission routes and
+/// shows each user only their own prompts; the `@hosted` specs in
+/// `tests/permission-user-token.spec.ts` check that the shell sends that
+/// token. Such a node cannot be prepared through `#[freenet_test]`, and a
+/// hosted node refuses the tokenless client-API connection `fdev website
+/// publish` would use, so this test:
+///
+/// 1. boots a standalone node that is NOT hosted and publishes the fixture,
+/// 2. restarts the same data directory in hosted mode,
+/// 3. puts `hosted-tls-proxy.mjs` in front of it, which serves https and adds
+///    `X-Forwarded-Proto: https` as a same-host TLS proxy does, and
+/// 4. runs `npx playwright test --grep @hosted` against the proxied shell.
+///
+/// Without `FREENET_PLAYWRIGHT=1` it returns before booting any node, so an
+/// ordinary test run pays nothing for it and a checkout with no Node or
+/// browsers never fails. Each node is shut down on every return path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn hosted_shell_permission_token_via_playwright() -> anyhow::Result<()> {
+    if !playwright_enabled() {
+        tracing::warn!(
+            "{PLAYWRIGHT_ENV} not set: skipping the hosted pass without booting \
+             a node. Set {PLAYWRIGHT_ENV}=1 (and install Playwright deps) to run it."
+        );
+        return Ok(());
+    }
+    let data_dir = tempfile::tempdir()?;
+    let key = freenet::dev_tool::TransportKeypair::new();
+    let keypair_path = data_dir.path().join("private.pem");
+    key.save(&keypair_path)?;
+    key.public().save(data_dir.path().join("public.pem"))?;
+
+    // 1. Publish on a node that is not hosted.
+    let config_home = tempfile::tempdir()?;
+    let contract_key = website_init(config_home.path())?;
+    let node = StandaloneNode::start(data_dir.path(), &keypair_path, false).await?;
+    let ws_url = format!(
+        "ws://127.0.0.1:{}/v1/contract/command?encodingProtocol=native",
+        node.ws_port
+    );
+    // The node's API may still be coming up; retry the publish until the
+    // shell serves.
+    let first_shell = format!(
+        "http://127.0.0.1:{}/v1/contract/web/{contract_key}/",
+        node.ws_port
+    );
+    let published = async {
+        let deadline = std::time::Instant::now() + Duration::from_secs(120);
+        loop {
+            website_publish_observed(config_home.path(), &ws_url);
+            if wait_for_shell(&first_shell, Duration::from_secs(20)).await? {
+                return Ok(());
+            }
+            anyhow::ensure!(
+                std::time::Instant::now() < deadline,
+                "the fixture never published on the node that is not hosted"
+            );
+        }
+    }
+    .await;
+    node.stop().await;
+    published?;
+
+    // 2. Same data directory, hosted mode. The first node's store is released
+    // a little after its run loop exits, so the reopen is retried while the
+    // database is still locked, for a bounded time.
+    let reopen_deadline = std::time::Instant::now() + Duration::from_secs(60);
+    let node = loop {
+        match StandaloneNode::start(data_dir.path(), &keypair_path, true).await {
+            Ok(node) => break node,
+            Err(e)
+                if e.to_string().contains("already open")
+                    && std::time::Instant::now() < reopen_deadline =>
+            {
+                tracing::info!("data directory still locked by the first node, retrying: {e}");
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+            Err(e) => return Err(e),
+        }
+    };
+    let hosted_shell = format!(
+        "http://127.0.0.1:{}/v1/contract/web/{contract_key}/",
+        node.ws_port
+    );
+
+    let result = async {
+        let served = wait_for_shell(&hosted_shell, Duration::from_secs(120)).await;
+        anyhow::ensure!(
+            matches!(served, Ok(true)),
+            "the hosted node never served the published shell: {served:?}"
+        );
+
+        // 3. The TLS proxy, and a check that the shell is reachable through it.
+        let proxy = TlsProxy::start(node.ws_port)?;
+        let shell_url = format!(
+            "https://127.0.0.1:{}/v1/contract/web/{contract_key}/",
+            proxy.port
+        );
+        let client = reqwest::Client::builder()
+            .danger_accept_invalid_certs(true)
+            .timeout(Duration::from_secs(10))
+            .build()?;
+        let body = client.get(&shell_url).send().await?.text().await?;
+        anyhow::ensure!(
+            body.contains("freenetBridge") && body.contains("__freenet_user_token"),
+            "the hosted shell is not served through the TLS proxy"
+        );
+
+        // 4. The hosted specs.
+        let url = shell_url.clone();
+        tokio::task::spawn_blocking(move || run_playwright(&url, SpecSet::Hosted)).await??;
+        drop(proxy);
+        Ok(())
+    }
+    .await;
+    node.stop().await;
+    result
 }

@@ -223,11 +223,30 @@ pub struct HttpClientApi {
     export_op_manager: hosted_export::ExportOpManagerHandle,
 }
 
+/// Set `HostedMode(false)` on a request that has no `HostedMode`; keep one set
+/// by an outer layer.
+async fn default_not_hosted(mut req: axum::extract::Request) -> axum::extract::Request {
+    if req
+        .extensions()
+        .get::<crate::server::HostedMode>()
+        .is_none()
+    {
+        req.extensions_mut()
+            .insert(crate::server::HostedMode(false));
+    }
+    req
+}
+
 impl HttpClientApi {
     /// Returns the uninitialized axum router to compose with other routing handling or websockets.
+    ///
+    /// This standalone composition is not a hosted node unless a caller says
+    /// so: it sets `HostedMode(false)` on a request that carries no
+    /// `HostedMode`, because the permission routes refuse a request without
+    /// one, and it leaves a flag set by an outer layer as it is.
     pub fn as_router(socket: &SocketAddr) -> (Self, Router) {
         let origin_contracts = Arc::new(DashMap::new());
-        Self::as_router_with_origin_contracts(
+        let (api, router) = Self::as_router_with_origin_contracts(
             socket,
             origin_contracts,
             crate::contract::user_input::pending_prompts(),
@@ -235,6 +254,10 @@ impl HttpClientApi {
             // mode, tests). Falls back to the same directory `build()` would
             // have derived.
             crate::config::default_webapp_cache_dir(),
+        );
+        (
+            api,
+            router.layer(axum::middleware::map_request(default_not_hosted)),
         )
     }
 
@@ -1341,13 +1364,13 @@ mod tests {
     }
 
     /// Regression (Codex re-review of #4513): the contract-web shell route must
-    /// NOT require an `Extension<HostedMode>`. Only `serve_client_api_in_impl`
-    /// installs that layer; the public `HttpClientApi::as_router` composition
-    /// path does not. A required extractor here made `/v{1,2}/contract/web/...`
+    /// NOT require an `Extension<HostedMode>`. A composition without that layer
+    /// (`as_router_with_origin_contracts`, before a caller adds it) must still
+    /// serve the shell. A required extractor here made `/v{1,2}/contract/web/...`
     /// reject with axum's missing-extension 500 even for plain requests — a
     /// regression for that supported standalone composition mode.
     ///
-    /// We drive the REAL `as_router` router (the one lacking the layer). The
+    /// We drive the REAL `as_router_with_origin_contracts` router (no layer). The
     /// returned `HttpClientApi` owns the proxy receiver; we drop it so the
     /// shell render's `NewConnection` send fails fast (closed channel) instead
     /// of blocking. The point is only that the request reaches the handler body
@@ -1366,14 +1389,19 @@ mod tests {
             format!("/v1/contract/web/{key}/"),
             format!("/v2/contract/web/{key}/"),
         ] {
-            // `as_router` is the standalone composition path with NO HostedMode
-            // layer. EXPLICITLY drop the returned `HttpClientApi` (it owns the
+            // `as_router_with_origin_contracts` has NO HostedMode layer
+            // (`as_router` adds one). EXPLICITLY drop the returned `HttpClientApi` (it owns the
             // proxy receiver) so the handler's `NewConnection` send hits a
             // closed channel and fails fast — otherwise the shell render would
             // block awaiting a `NewId` reply that nothing services. A bare
             // `_api` binding would keep the receiver alive to end-of-scope, so
             // we `drop` it by name.
-            let (api, router) = HttpClientApi::as_router(&"127.0.0.1:0".parse().unwrap());
+            let (api, router) = HttpClientApi::as_router_with_origin_contracts(
+                &"127.0.0.1:0".parse().unwrap(),
+                Arc::new(DashMap::new()),
+                crate::contract::user_input::pending_prompts(),
+                crate::config::default_webapp_cache_dir(),
+            );
             drop(api);
 
             let req = axum::http::Request::builder()

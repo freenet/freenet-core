@@ -7,12 +7,14 @@ use freenet_stdlib::prelude::{
 
 use std::sync::Arc;
 use std::sync::LazyLock;
-use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 
 use super::contract_store::ContractStore;
 use super::delegate_store::DelegateStore;
 use super::runtime::InstanceInfo;
-use super::secrets_store::{SecretScope, SecretStoreError, SecretsStore, UserSecretContext};
+use super::secrets_store::{
+    SecretScope, SecretStoreError, SecretsStore, UserId, UserSecretContext,
+};
 use crate::contract::storages::Storage;
 
 /// This is a map of starting addresses of the instance memory space.
@@ -75,7 +77,8 @@ pub(super) static DELEGATE_ENV: LazyLock<DashMap<InstanceId, DelegateEnvSlot>> =
 pub(super) static LIVE_DELEGATE_GUESTS: LazyLock<dashmap::DashSet<InstanceId>> =
     LazyLock::new(dashmap::DashSet::default);
 
-/// Shared, in-memory cache of `DelegateContext` bytes keyed by `DelegateKey`.
+/// Shared, in-memory cache of `DelegateContext` bytes, one entry per delegate
+/// and hosted user (see [`DelegateContextStore`]).
 ///
 /// The delegate ABI exposes `ctx.write(...)` and `ctx.read()` as a way for a
 /// delegate to stash state across `process()` calls — the canonical use is a
@@ -84,16 +87,17 @@ pub(super) static LIVE_DELEGATE_GUESTS: LazyLock<dashmap::DashSet<InstanceId>> =
 /// re-enters with the user's `UserResponse`.
 ///
 /// The runtime's per-call context `Vec` lives only for the duration of one
-/// `inbound_app_message` invocation, so without persistence between calls
+/// `inbound_app_message_as` invocation, so without persistence between calls
 /// every prompt round-trip would lose its pending state and the delegate
 /// would hit "received UserResponse with no pending context". This cache
-/// closes that gap: `inbound_app_message` seeds its local `Vec` from here on
+/// closes that gap: `inbound_app_message_as` seeds its local `Vec` from here on
 /// entry and stores the (possibly-mutated) `Vec` back on exit. Cleared on
 /// `UnregisterDelegate` so an unregistered delegate can't accumulate state.
 ///
-/// Concurrency — READ THIS BEFORE RELYING ON IT. Because the map is keyed by
-/// `DelegateKey` alone and is last-write-wins, it is only safe while at most
-/// ONE `process()` per delegate is in flight. That property holds today, but
+/// Concurrency — READ THIS BEFORE RELYING ON IT. An entry is last-write-wins
+/// and every run of a delegate for the same user uses it (on a node that is
+/// not hosted, that is every run), so it is only safe while at most ONE
+/// `process()` per delegate is in flight. That property holds today, but
 /// **the runtime does not provide it**: `prepare_delegate_call` takes no
 /// per-delegate lock (its mutex guards the module cache, keyed by code hash),
 /// `RuntimePool::execute_delegate_request` pops an arbitrary pooled executor
@@ -101,7 +105,8 @@ pub(super) static LIVE_DELEGATE_GUESTS: LazyLock<dashmap::DashSet<InstanceId>> =
 /// in `wasm_runtime::delegate`.
 ///
 /// It is supplied entirely by the SERIAL `contract::contract_handling` loop:
-/// both call sites of `execute_delegate_request` sit inside
+/// both executor calls (`execute_delegate_request`, and `execute_delegate_hop`
+/// for inter-delegate hops) sit inside
 /// `handle_delegate_with_contract_requests`, which runs on that one loop, so a
 /// second call for the same delegate cannot begin until the first returns.
 ///
@@ -110,8 +115,9 @@ pub(super) static LIVE_DELEGATE_GUESTS: LazyLock<dashmap::DashSet<InstanceId>> =
 /// believing it was redundant: anything that lets a delegate's round-trip span
 /// two loop iterations — parking it mid-prompt, deferring a contract op —
 /// breaks this invariant and must bring its own per-delegate exclusion. A
-/// second run would otherwise overwrite the parked continuation's context, and
-/// the delegate would resume reading someone else's bytes. Silent state
+/// parked run's entry is held by its park until it resumes, so a second run
+/// started meanwhile would read no context, and whatever it wrote would be
+/// overwritten when the parked run's context is put back. Silent state
 /// corruption, not a crash.
 ///
 /// Wrapped in `Arc` so a `RuntimePool` of `Runtime`s shares one cache: a
@@ -120,13 +126,366 @@ pub(super) static LIVE_DELEGATE_GUESTS: LazyLock<dashmap::DashSet<InstanceId>> =
 /// locality bug as the per-call `Vec`.
 ///
 /// TTL: each entry stores the `Instant` it was last written. On every
-/// `inbound_app_message` call the loader prunes entries older than
+/// `inbound_app_message_as` call the loader prunes entries older than
 /// `DELEGATE_CONTEXT_TTL`. Without this, a `RequestUserInput` whose
 /// `UserResponse` never arrives (user dismisses the prompt, app crashes,
 /// network partition) leaves bytes pinned until the matching
 /// `UnregisterDelegate` — which may be never for long-lived delegates. The
 /// AGENTS.md GC rule requires that any cleanup-exemption be time-bounded.
-pub(crate) type DelegateContextCache = Arc<DashMap<DelegateKey, DelegateContextEntry>>;
+pub(crate) type DelegateContextCache = Arc<DelegateContextStore>;
+
+/// The entries of a [`DelegateContextCache`] and the byte budget that bounds
+/// them.
+///
+/// One entry per delegate and hosted user. The user is the one the run belongs
+/// to: the user whose request ran the delegate, including a delegate reached
+/// by a message from another delegate during that request. It is `None` on
+/// a node that is not hosted, where every run shares one entry per delegate,
+/// as it shares the node's `Local` secret scope. On a hosted node every
+/// delegate run belongs to a user, so no run there uses the `None` entry.
+///
+/// Bounded in bytes, not only by the per-entry `DelegateContext::MAX_SIZE`:
+/// the number of entries grows with delegates times users, and both are
+/// chosen by clients. Each entry is charged its bytes plus
+/// [`CACHE_ENTRY_OVERHEAD_BYTES`], so an empty-ish entry still counts and the
+/// entry count is bounded by `budget / CACHE_ENTRY_OVERHEAD_BYTES`. Over budget,
+/// the oldest entries are dropped until the total is at most the budget less
+/// one part in [`DELEGATE_CONTEXT_LOW_WATER_DIVISOR`]. The entry being stored is
+/// the newest, so it is dropped last, and always fits on its own (checked at
+/// compile time next to the budget floor). Every drop is counted and reported
+/// (see [`Self::evictions`]); a dropped entry reaches its delegate as a missing
+/// context. A run that parks (on a user prompt, a related fetch or a network
+/// contract operation) is not exposed to this: the contract loop takes its
+/// entry out of the cache for the wait ([`Self::take`]) and the park holds it,
+/// counted against the park byte budget, until the run resumes. The budget is
+/// shared by all users: eviction affects only whether a context is present,
+/// never whose bytes a run reads.
+///
+/// Not [`crate::util::byte_bounded_lru::ByteBoundedLruCache`], which this
+/// shares its overhead floor with: this cache also expires entries by age and
+/// removes every user's entry for one delegate at once, which that cache does
+/// not provide.
+///
+/// One mutex over the whole map. Delegate runs are serial node-wide (see
+/// [`DelegateContextCache`]), so it is not contended, and it keeps the byte
+/// total exact.
+pub(crate) struct DelegateContextStore {
+    inner: std::sync::Mutex<ContextEntries>,
+    budget: usize,
+    evictions: AtomicU64,
+    /// Restores that replaced an entry already present (see [`Self::restore`]).
+    restore_overwrites: AtomicU64,
+    /// When eviction was last reported, so a cache under sustained pressure
+    /// logs once a minute rather than once per store.
+    last_eviction_report: std::sync::Mutex<Option<tokio::time::Instant>>,
+}
+
+#[derive(Default)]
+struct ContextEntries {
+    slots: std::collections::HashMap<(DelegateKey, Option<UserId>), ContextSlot>,
+    /// Sum of [`ContextSlot::charge`] over `slots`.
+    charged: usize,
+    /// Orders slots by store, oldest first. Timestamps can tie.
+    next_seq: u64,
+}
+
+struct ContextSlot {
+    entry: DelegateContextEntry,
+    seq: u64,
+}
+
+impl ContextSlot {
+    fn charge(&self) -> usize {
+        self.entry.bytes.len() + crate::util::byte_bounded_lru::CACHE_ENTRY_OVERHEAD_BYTES
+    }
+}
+
+/// Fallback total-RAM estimate (1 GiB) when the OS query fails, as the park
+/// registry's budget uses.
+const DELEGATE_CONTEXT_FALLBACK_TOTAL_RAM_BYTES: usize = 1024 * 1024 * 1024;
+/// Fraction of host RAM the context cache may hold. Small on purpose: on a
+/// 1 GiB host the floor applies, and the floor is sized to fit what the
+/// node-wide cache ceiling (`cache_byte_budgets_are_aggregate_safe`) leaves
+/// room for there. A parked run's context is held in its park entry, under
+/// the park budget, so this cache does not need room for parked runs.
+const DELEGATE_CONTEXT_RAM_DIVISOR: usize = 1024;
+/// Floor of the budget: room for up to three maximum-size contexts on any host.
+const MIN_DELEGATE_CONTEXT_BYTES: usize = 1280 * 1024;
+const _: () = assert!(
+    MIN_DELEGATE_CONTEXT_BYTES
+        >= 3 * (freenet_stdlib::prelude::DelegateContext::MAX_SIZE
+            + crate::util::byte_bounded_lru::CACHE_ENTRY_OVERHEAD_BYTES),
+    "the floor must hold three maximum-size contexts"
+);
+/// Ceiling of the budget.
+const MAX_DELEGATE_CONTEXT_BYTES: usize = 32 * 1024 * 1024;
+/// Over budget, entries are dropped until the total is at most the budget less
+/// one part in this many, so a full cache is not sorted on every store.
+const DELEGATE_CONTEXT_LOW_WATER_DIVISOR: usize = 8;
+const _: () = assert!(
+    freenet_stdlib::prelude::DelegateContext::MAX_SIZE
+        + crate::util::byte_bounded_lru::CACHE_ENTRY_OVERHEAD_BYTES
+        <= MIN_DELEGATE_CONTEXT_BYTES
+            - MIN_DELEGATE_CONTEXT_BYTES / DELEGATE_CONTEXT_LOW_WATER_DIVISOR,
+    "the entry being stored must fit under the low-water mark on its own"
+);
+/// The context-cache budget a node with `total_ram` bytes gets.
+pub(crate) fn delegate_context_budget_for(total_ram: usize) -> usize {
+    (total_ram / DELEGATE_CONTEXT_RAM_DIVISOR)
+        .clamp(MIN_DELEGATE_CONTEXT_BYTES, MAX_DELEGATE_CONTEXT_BYTES)
+}
+
+impl DelegateContextStore {
+    pub(crate) fn with_budget(budget: usize) -> Self {
+        Self {
+            inner: std::sync::Mutex::new(ContextEntries::default()),
+            budget,
+            evictions: AtomicU64::new(0),
+            restore_overwrites: AtomicU64::new(0),
+            last_eviction_report: std::sync::Mutex::new(None),
+        }
+    }
+
+    fn entries(&self) -> std::sync::MutexGuard<'_, ContextEntries> {
+        // A poisoned lock means a holder panicked mid-update; the map is still
+        // a valid map, and losing a context is the worst outcome of using it.
+        self.inner.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    fn key(delegate: &DelegateKey, user: Option<&UserId>) -> (DelegateKey, Option<UserId>) {
+        (delegate.clone(), user.copied())
+    }
+
+    /// The context bytes `user`'s last run of `delegate` left, if any.
+    pub(crate) fn get(&self, delegate: &DelegateKey, user: Option<&UserId>) -> Option<Vec<u8>> {
+        self.entries()
+            .slots
+            .get(&Self::key(delegate, user))
+            .map(|slot| slot.entry.bytes.clone())
+    }
+
+    /// Store `bytes` as `user`'s context for `delegate`, then keep the cache
+    /// within its budget.
+    pub(crate) fn store(&self, delegate: &DelegateKey, user: Option<&UserId>, bytes: Vec<u8>) {
+        // Charged by length, so hold no spare capacity beyond it.
+        let mut bytes = bytes;
+        bytes.shrink_to_fit();
+        let entry = DelegateContextEntry {
+            bytes,
+            last_write: tokio::time::Instant::now(),
+        };
+        let evicted = {
+            let mut entries = self.entries();
+            let seq = entries.next_seq;
+            entries.next_seq += 1;
+            Self::insert_slot(
+                &mut entries,
+                Self::key(delegate, user),
+                ContextSlot { entry, seq },
+            );
+            self.enforce_budget(&mut entries)
+        };
+        self.report_evictions(evicted);
+    }
+
+    fn insert_slot(
+        entries: &mut ContextEntries,
+        key: (DelegateKey, Option<UserId>),
+        slot: ContextSlot,
+    ) {
+        entries.charged += slot.charge();
+        if let Some(old) = entries.slots.insert(key, slot) {
+            entries.charged -= old.charge();
+        }
+    }
+
+    fn remove_slot(entries: &mut ContextEntries, key: &(DelegateKey, Option<UserId>)) {
+        if let Some(old) = entries.slots.remove(key) {
+            entries.charged -= old.charge();
+        }
+    }
+
+    /// Remove `user`'s context for `delegate` and return its bytes. A run
+    /// that parks takes its context out this way, so the park holds it while
+    /// the run waits; see [`Self::store`] for putting it back.
+    pub(crate) fn take(&self, delegate: &DelegateKey, user: Option<&UserId>) -> Option<Vec<u8>> {
+        let mut entries = self.entries();
+        let slot = entries.slots.remove(&Self::key(delegate, user))?;
+        entries.charged -= slot.charge();
+        Some(slot.entry.bytes)
+    }
+
+    /// Put back a context a parked run left (see [`Self::take`]), as
+    /// [`Self::store`] does: it becomes `user`'s context for `delegate`,
+    /// replacing any entry already there, so the resumed run reads the
+    /// context it left. Returns whether an entry was already there.
+    ///
+    /// The park exclusion should make that impossible: no run of a parked
+    /// delegate starts until its park ends, so nothing writes the key in
+    /// between. A replaced entry therefore means a path ran the delegate
+    /// during its park. It is logged at warn the first time and at debug after
+    /// that, and counted.
+    pub(crate) fn restore(
+        &self,
+        delegate: &DelegateKey,
+        user: Option<&UserId>,
+        bytes: Vec<u8>,
+    ) -> bool {
+        let present = self
+            .entries()
+            .slots
+            .contains_key(&Self::key(delegate, user));
+        if present {
+            let total = self
+                .restore_overwrites
+                .fetch_add(1, Ordering::Relaxed)
+                .saturating_add(1);
+            if total == 1 {
+                tracing::warn!(
+                    delegate_key = %delegate,
+                    "A parked run's delegate context replaced an entry written \
+                     during its park. Logged once at warn; later ones at debug"
+                );
+            } else {
+                tracing::debug!(
+                    delegate_key = %delegate,
+                    total,
+                    "A parked run's delegate context replaced an entry written \
+                     during its park"
+                );
+            }
+        }
+        self.store(delegate, user, bytes);
+        present
+    }
+
+    /// Drop `user`'s context for `delegate`.
+    pub(crate) fn remove(&self, delegate: &DelegateKey, user: Option<&UserId>) {
+        Self::remove_slot(&mut self.entries(), &Self::key(delegate, user));
+    }
+
+    /// Drop every user's context for `delegate` (the delegate was unregistered).
+    pub(crate) fn remove_delegate(&self, delegate: &DelegateKey) {
+        let mut entries = self.entries();
+        let keys: Vec<_> = entries
+            .slots
+            .keys()
+            .filter(|(key, _)| key == delegate)
+            .cloned()
+            .collect();
+        for key in keys {
+            Self::remove_slot(&mut entries, &key);
+        }
+    }
+
+    /// Drop entries older than `DELEGATE_CONTEXT_TTL`. Dropping only shrinks
+    /// the cache, so the budget needs no enforcing here.
+    pub(crate) fn prune_expired(&self) {
+        let now = tokio::time::Instant::now();
+        let mut entries = self.entries();
+        let expired: Vec<_> = entries
+            .slots
+            .iter()
+            .filter(|(_, slot)| now.duration_since(slot.entry.last_write) >= DELEGATE_CONTEXT_TTL)
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in expired {
+            Self::remove_slot(&mut entries, &key);
+        }
+    }
+
+    /// Bytes charged across all entries (payload plus per-entry overhead).
+    #[cfg(test)]
+    pub(crate) fn total_bytes(&self) -> usize {
+        self.entries().charged
+    }
+
+    /// Entries dropped for the budget since start.
+    pub(crate) fn evictions(&self) -> u64 {
+        self.evictions.load(Ordering::Relaxed)
+    }
+
+    /// Over budget, drop the oldest entries down to the low-water mark.
+    /// Returns how many were dropped.
+    fn enforce_budget(&self, entries: &mut ContextEntries) -> usize {
+        if entries.charged <= self.budget {
+            return 0;
+        }
+        let target = self.budget - self.budget / DELEGATE_CONTEXT_LOW_WATER_DIVISOR;
+        let mut by_age: Vec<_> = entries
+            .slots
+            .iter()
+            .map(|(key, slot)| (slot.seq, key.clone()))
+            .collect();
+        by_age.sort_unstable_by_key(|(seq, _)| *seq);
+        let mut dropped = 0;
+        for (_, key) in by_age {
+            if entries.charged <= target {
+                break;
+            }
+            Self::remove_slot(entries, &key);
+            dropped += 1;
+        }
+        self.evictions.fetch_add(dropped as u64, Ordering::Relaxed);
+        dropped
+    }
+
+    /// Report evictions visibly in release builds, at most once a minute.
+    fn report_evictions(&self, dropped: usize) {
+        if dropped == 0 {
+            return;
+        }
+        let now = tokio::time::Instant::now();
+        let mut last = self
+            .last_eviction_report
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if last.is_some_and(|at| now.duration_since(at) < std::time::Duration::from_secs(60)) {
+            return;
+        }
+        *last = Some(now);
+        tracing::info!(
+            dropped,
+            total_evictions = self.evictions(),
+            budget = self.budget,
+            "Delegate context cache over budget: dropped contexts"
+        );
+    }
+
+    /// Whether `user` has a context for `delegate`.
+    #[cfg(test)]
+    pub(crate) fn contains(&self, delegate: &DelegateKey, user: Option<&UserId>) -> bool {
+        self.entries()
+            .slots
+            .contains_key(&Self::key(delegate, user))
+    }
+
+    /// Whether any user has a context for `delegate`.
+    #[cfg(test)]
+    pub(crate) fn contains_delegate(&self, delegate: &DelegateKey) -> bool {
+        self.entries().slots.keys().any(|(key, _)| key == delegate)
+    }
+
+    /// Insert an entry as-is (its own `last_write`), for tests.
+    #[cfg(test)]
+    pub(crate) fn insert_for_test(
+        &self,
+        delegate: &DelegateKey,
+        user: Option<&UserId>,
+        entry: DelegateContextEntry,
+    ) {
+        let mut entries = self.entries();
+        let seq = entries.next_seq;
+        entries.next_seq += 1;
+        let slot = ContextSlot { entry, seq };
+        Self::insert_slot(&mut entries, Self::key(delegate, user), slot);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.entries().slots.len()
+    }
+}
 
 #[derive(Clone)]
 pub(crate) struct DelegateContextEntry {
@@ -151,18 +510,23 @@ pub(crate) struct DelegateContextEntry {
 pub(crate) const DELEGATE_CONTEXT_TTL: std::time::Duration =
     std::time::Duration::from_secs(10 * 60);
 
+/// A context cache whose budget is sized from this host's RAM. Read once, at
+/// construction, as the park registry's budget is.
 pub(crate) fn new_delegate_context_cache() -> DelegateContextCache {
-    Arc::new(DashMap::default())
+    let host_ram =
+        super::read_total_ram_bytes().unwrap_or(DELEGATE_CONTEXT_FALLBACK_TOTAL_RAM_BYTES);
+    Arc::new(DelegateContextStore::with_budget(
+        delegate_context_budget_for(host_ram),
+    ))
 }
 
 /// Drop entries whose last write is older than `DELEGATE_CONTEXT_TTL`.
 ///
-/// Called from `inbound_app_message` so eviction is amortised across normal
+/// Called from `inbound_app_message_as` so eviction is amortised across normal
 /// delegate activity — no background sweep task and no extra lock contention
 /// when the node is idle.
 pub(crate) fn prune_expired_contexts(cache: &DelegateContextCache) {
-    let now = tokio::time::Instant::now();
-    cache.retain(|_, entry| now.duration_since(entry.last_write) < DELEGATE_CONTEXT_TTL);
+    cache.prune_expired();
 }
 
 /// One entry in a node's [`SharedInheritedOrigins`]: a child delegate's
@@ -262,7 +626,7 @@ pub(crate) fn prune_inherited_origins_at(
     });
 }
 
-/// Sweep this node's map. Called amortised from `inbound_app_message` (no
+/// Sweep this node's map. Called amortised from `inbound_app_message_as` (no
 /// background task). O(n) per call, but n ≤ `MAX_CREATED_DELEGATES_PER_NODE`.
 pub(crate) fn prune_expired_inherited_origins(map: &SharedInheritedOrigins) {
     prune_inherited_origins_at(map, tokio::time::Instant::now());
@@ -282,7 +646,7 @@ pub(crate) fn touch_inherited_origin_at(
 }
 
 /// Refresh a delegate's inherited-origin liveness. Called from
-/// `inbound_app_message` for every delivered message — including inter-delegate
+/// `inbound_app_message_as` for every delivered message — including inter-delegate
 /// calls that never read the inherited origin — so any still-alive child keeps
 /// its origin. No-op if the delegate has no entry; still bounded by the MAX_AGE
 /// cap.
@@ -290,14 +654,23 @@ pub(crate) fn touch_inherited_origin(map: &SharedInheritedOrigins, delegate_key:
     touch_inherited_origin_at(map, delegate_key, tokio::time::Instant::now());
 }
 
-/// Per-node counter of all delegates created via the `create_delegate` host
-/// function. Used to enforce `MAX_CREATED_DELEGATES_PER_NODE` regardless of
-/// attestation status. Decremented on `UnregisterDelegate` to allow reuse of
-/// slots.
+/// Per-node record of the delegates created via the `create_delegate` host
+/// function. Its size enforces `MAX_CREATED_DELEGATES_PER_NODE` regardless of
+/// attestation status. `UnregisterDelegate` releases a key's slot so it can be
+/// reused.
+///
+/// It holds the keys, not a bare count, so a slot is released only for a key
+/// that holds one.
+///
+/// Bounded by the cap: a key is recorded only after the cap check in
+/// `create_delegate_sync`, so the set holds at most
+/// `MAX_CREATED_DELEGATES_PER_NODE` keys plus the bounded overshoot that check
+/// documents. It is not persisted: after a restart nothing is counted, exactly
+/// as the count it replaces started at zero.
 ///
 /// This is injected state, not a process-global: `Runtime` owns one and
 /// `RuntimePool` clones the `Arc` into every executor, so the executors of a
-/// single node share one count while separate nodes in the same process (today,
+/// single node share one record while separate nodes in the same process (today,
 /// only the test suite) each get their own. A `static` here would make the
 /// "per-node" limit a per-*process* limit, so concurrent tests observed each
 /// other's creations.
@@ -305,32 +678,50 @@ pub(crate) fn touch_inherited_origin(map: &SharedInheritedOrigins, delegate_key:
 /// In production the two coincide — a node is a process — so this scoping is a
 /// no-op there; it is the correct shape for per-node state rather than a fix for
 /// a live production limit bug.
-pub(crate) type SharedDelegateCounter = Arc<AtomicUsize>;
+pub(crate) type SharedDelegateCounter = Arc<CreatedDelegates>;
 
 pub(crate) fn new_delegate_counter() -> SharedDelegateCounter {
-    Arc::new(AtomicUsize::new(0))
+    Arc::new(CreatedDelegates::default())
 }
 
-/// Release one slot from a node's created-delegate count, saturating at zero.
+/// See [`SharedDelegateCounter`].
+#[derive(Debug, Default)]
+pub(crate) struct CreatedDelegates {
+    keys: dashmap::DashSet<DelegateKey>,
+}
+
+impl CreatedDelegates {
+    /// How many created delegates currently hold a slot.
+    pub(crate) fn count(&self) -> usize {
+        self.keys.len()
+    }
+
+    /// Record that `key` was created. A key already recorded keeps its one
+    /// slot: creating the same child twice stores one delegate.
+    pub(crate) fn record(&self, key: DelegateKey) {
+        self.keys.insert(key);
+    }
+
+    /// Whether `key` holds a slot.
+    #[cfg(test)]
+    pub(crate) fn contains(&self, key: &DelegateKey) -> bool {
+        self.keys.contains(key)
+    }
+}
+
+/// Release the slot `key` holds in a node's created-delegate record.
 ///
-/// Saturating rather than wrapping is required: not every unregistered delegate
-/// was created via the `create_delegate` host function (an app can register one
-/// directly), so the count can legitimately already be zero here.
+/// Returns whether a slot was released. `false` means `key` was not a
+/// delegate this node counted: one an app registered directly, one created
+/// before the last restart, or a key that was never registered.
 ///
-/// The load and the subtract are one atomic step. A `load`-then-`fetch_sub`
-/// pair is not equivalent: two concurrent unregisters (pool executors share
-/// this counter) could both observe `1` and both subtract, wrapping the count
-/// to `usize::MAX` — which reads as permanently over
-/// `MAX_CREATED_DELEGATES_PER_NODE` and would wedge the node into rejecting
-/// every subsequent delegate creation.
-/// Returns whether a slot was actually released — `false` means the count was
-/// already zero.
-pub(crate) fn release_created_delegate_slot(counter: &SharedDelegateCounter) -> bool {
-    counter
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |prev| {
-            prev.checked_sub(1)
-        })
-        .is_ok()
+/// The removal is one atomic step on the set, so two concurrent unregisters of
+/// the same key (pool executors share this record) release its slot once.
+pub(crate) fn release_created_delegate_slot(
+    counter: &SharedDelegateCounter,
+    key: &DelegateKey,
+) -> bool {
+    counter.keys.remove(key).is_some()
 }
 
 // Thread-local tracking of the currently-executing delegate instance ID.
@@ -1069,25 +1460,19 @@ impl DelegateCallEnv {
 
         // Check per-node creation limit (counts ALL created delegates, not just origin)
         //
-        // Deliberately check-then-act, unlike the decrement in
-        // `release_created_delegate_slot`, which is one atomic `fetch_update`.
-        // The asymmetry is intentional, not an oversight: the two sides have
-        // very different failure modes when a race is lost.
-        //
-        // Here, concurrent creators can all pass this check and each `fetch_add`
-        // below, overshooting by at most one per creator — bounded by the pool's
-        // executor count, against a limit of 1024, and it drains back as slots
-        // are released. On the decrement, a lost race instead wraps the count
-        // past zero to `usize::MAX`: permanently over the limit, wedging the node
-        // into rejecting every later creation. Bounded overshoot versus permanent
-        // wedge is why that side is CAS'd and this one is not.
+        // Deliberately check-then-act: concurrent creators can all pass this
+        // check and each record a key below, overshooting by at most one per
+        // creator, bounded by the pool's executor count against a limit of
+        // 1024, and it drains back as slots are released. A release cannot
+        // under-count in return: it removes one key from a set, so it frees a
+        // slot only for a key that holds one (`release_created_delegate_slot`).
         //
         // Reserving the slot here would mean releasing it again on each of the
-        // three fallible paths between this check and the `fetch_add` (oversized
+        // three fallible paths between this check and the record (oversized
         // WASM, and the two store failures). Worth doing, but it reworks the
         // error paths of a limit-enforcing function and belongs in its own
         // change.
-        if self.created_delegates_count.load(Ordering::Relaxed) >= MAX_CREATED_DELEGATES_PER_NODE {
+        if self.created_delegates_count.count() >= MAX_CREATED_DELEGATES_PER_NODE {
             return Err(DelegateCreateError::NodeLimitExceeded);
         }
 
@@ -1125,9 +1510,10 @@ impl DelegateCallEnv {
             return Err(DelegateCreateError::StoreFailed(e.to_string()));
         }
 
-        // Increment per-call counter and global node counter
+        // Increment the per-call counter and record the key in the node's
+        // created-delegate set
         self.creations_this_call.set(current + 1);
-        self.created_delegates_count.fetch_add(1, Ordering::Relaxed);
+        self.created_delegates_count.record(child_key.clone());
 
         // Propagate app attestation to child
         if !self.origin_contracts.is_empty() {
@@ -2545,6 +2931,233 @@ pub(super) mod delegate_management {
                 delegate_mgmt_error_codes::ERR_STORE_FAILED
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod delegate_context_store_tests {
+    use super::*;
+    use crate::util::byte_bounded_lru::CACHE_ENTRY_OVERHEAD_BYTES;
+    use freenet_stdlib::prelude::CodeHash;
+
+    fn delegate(n: u8) -> DelegateKey {
+        DelegateKey::new([n; 32], CodeHash::new([n; 32]))
+    }
+
+    /// Entries are kept per (delegate, user), and unregistering a delegate
+    /// drops every user's entry for it and nobody else's.
+    ///
+    /// FALSIFY by making `remove_delegate` remove only the `None` user's
+    /// entry: user A's entry survives.
+    #[test]
+    fn remove_delegate_drops_every_users_entry_for_that_delegate() {
+        let store = DelegateContextStore::with_budget(MAX_DELEGATE_CONTEXT_BYTES);
+        let a = UserId::new([0xA1; 32]);
+        store.store(&delegate(1), None, vec![1]);
+        store.store(&delegate(1), Some(&a), vec![2]);
+        store.store(&delegate(2), Some(&a), vec![3]);
+
+        assert_eq!(store.get(&delegate(1), None), Some(vec![1]));
+        assert_eq!(store.get(&delegate(1), Some(&a)), Some(vec![2]));
+
+        store.remove_delegate(&delegate(1));
+        assert!(!store.contains_delegate(&delegate(1)));
+        assert_eq!(store.get(&delegate(2), Some(&a)), Some(vec![3]));
+        assert_eq!(store.len(), 1);
+        assert_eq!(store.total_bytes(), 1 + CACHE_ENTRY_OVERHEAD_BYTES);
+    }
+
+    /// Every entry is charged its bytes plus the per-entry overhead, so even
+    /// one-byte entries count: the entry count is bounded by the budget.
+    ///
+    /// FALSIFY by charging `bytes.len()` alone: every entry fits and the count
+    /// assertion fails.
+    #[test]
+    fn tiny_entries_are_charged_their_overhead() {
+        let budget = 10 * CACHE_ENTRY_OVERHEAD_BYTES;
+        let store = DelegateContextStore::with_budget(budget);
+        for n in 0..100u8 {
+            store.store(&delegate(n), None, vec![n]);
+        }
+        assert!(
+            store.total_bytes() <= budget,
+            "total {}",
+            store.total_bytes()
+        );
+        assert!(
+            store.len() <= 10,
+            "{} entries in a 10-entry budget",
+            store.len()
+        );
+        assert_eq!(store.evictions(), 100 - store.len() as u64);
+    }
+
+    /// Over budget the store drops the oldest entries first, down to the
+    /// low-water mark, and counts what it dropped.
+    ///
+    /// FALSIFY by removing the `enforce_budget` call from `store`: the total
+    /// exceeds the budget.
+    #[test]
+    fn over_budget_the_oldest_entries_go_first() {
+        let entry = 1000;
+        let charge = entry + CACHE_ENTRY_OVERHEAD_BYTES;
+        let store = DelegateContextStore::with_budget(4 * charge);
+        for n in 0..5u8 {
+            store.store(&delegate(n), None, vec![n; entry]);
+        }
+        assert_eq!(
+            store.total_bytes(),
+            3 * charge,
+            "dropped to the low-water mark"
+        );
+        assert!(store.contains(&delegate(4), None), "the newest stays");
+        assert!(!store.contains(&delegate(0), None), "the oldest goes");
+        assert!(
+            !store.contains(&delegate(1), None),
+            "dropped down to low water"
+        );
+        assert_eq!(store.evictions(), 2);
+    }
+
+    /// A context taken out for a park is out of the cache's reach: writes past
+    /// the budget by other delegates cannot drop it, and putting it back gives
+    /// the run its bytes. Taking it also releases its charge.
+    ///
+    /// FALSIFY by leaving the entry in place in `take` (return a clone): the
+    /// writes below evict it and the restored entry is missing, or the charge
+    /// assertion fails.
+    #[test]
+    fn a_taken_context_survives_writes_past_the_budget_and_is_put_back() {
+        let entry = 1000;
+        let charge = entry + CACHE_ENTRY_OVERHEAD_BYTES;
+        let store = DelegateContextStore::with_budget(4 * charge);
+        let user = UserId::new([0xB7; 32]);
+        store.store(&delegate(0), Some(&user), vec![0xAA; entry]);
+        let held = store
+            .take(&delegate(0), Some(&user))
+            .expect("the entry is present");
+        assert_eq!(
+            store.total_bytes(),
+            0,
+            "taking an entry releases its charge"
+        );
+        assert!(store.take(&delegate(0), Some(&user)).is_none());
+
+        for n in 1..=12u8 {
+            store.store(&delegate(n), None, vec![n; entry]);
+        }
+        assert!(
+            store.evictions() > 0,
+            "the other writes went past the budget"
+        );
+
+        store.store(&delegate(0), Some(&user), held);
+        assert_eq!(
+            store.get(&delegate(0), Some(&user)),
+            Some(vec![0xAA; entry]),
+            "the run gets back the context it left"
+        );
+    }
+
+    /// Restoring over an entry that is already present replaces it, so the
+    /// resumed run reads the context it left, and reports that it replaced
+    /// one. Restoring into an empty slot reports nothing.
+    ///
+    /// FALSIFY by making `restore` return `false` unconditionally: the first
+    /// assertion fails. By dropping its `store` call: the context assertion
+    /// fails.
+    #[test]
+    fn a_restore_over_a_present_entry_replaces_it_and_reports_it() {
+        let store = DelegateContextStore::with_budget(MAX_DELEGATE_CONTEXT_BYTES);
+        let user = UserId::new([0xB8; 32]);
+        assert!(
+            !store.restore(&delegate(1), Some(&user), b"left-at-park".to_vec()),
+            "an empty slot is not a replacement"
+        );
+        store.store(&delegate(1), Some(&user), b"written-during-park".to_vec());
+        assert!(
+            store.restore(&delegate(1), Some(&user), b"left-at-park".to_vec()),
+            "a present entry must be reported"
+        );
+        assert_eq!(
+            store.get(&delegate(1), Some(&user)),
+            Some(b"left-at-park".to_vec()),
+            "the parked run's context replaces the entry"
+        );
+    }
+
+    /// Replacing an entry makes it the newest, so a delegate that rewrites its
+    /// context on every run is not dropped as the oldest by its own store.
+    ///
+    /// FALSIFY by keeping the replaced entry's sequence number in `store`: the
+    /// replaced entry is dropped first and the survivor assertion fails.
+    #[test]
+    fn a_replaced_entry_becomes_the_newest() {
+        let entry = 1000;
+        let charge = entry + CACHE_ENTRY_OVERHEAD_BYTES;
+        let store = DelegateContextStore::with_budget(3 * charge);
+        for n in 0..3u8 {
+            store.store(&delegate(n), None, vec![n; entry]);
+        }
+        store.store(&delegate(0), None, vec![0; entry]);
+        store.store(&delegate(3), None, vec![3; entry]);
+        assert!(
+            store.contains(&delegate(0), None),
+            "the replaced entry stays"
+        );
+        assert!(
+            !store.contains(&delegate(1), None),
+            "the oldest unreplaced entry goes"
+        );
+    }
+
+    /// Replacing an entry, and removing one, keep the byte total exact.
+    ///
+    /// FALSIFY by not subtracting the replaced entry's charge in `insert_slot`:
+    /// the total counts both.
+    #[test]
+    fn replacing_and_removing_keep_the_total_exact() {
+        let store = DelegateContextStore::with_budget(MAX_DELEGATE_CONTEXT_BYTES);
+        let a = UserId::new([0xD4; 32]);
+        store.store(&delegate(1), Some(&a), vec![1; 100]);
+        store.store(&delegate(1), Some(&a), vec![1; 40]);
+        assert_eq!(store.total_bytes(), 40 + CACHE_ENTRY_OVERHEAD_BYTES);
+        store.store(&delegate(2), None, vec![2; 10]);
+        store.remove(&delegate(1), Some(&a));
+        assert_eq!(store.total_bytes(), 10 + CACHE_ENTRY_OVERHEAD_BYTES);
+        store.remove(&delegate(1), Some(&a));
+        assert_eq!(store.total_bytes(), 10 + CACHE_ENTRY_OVERHEAD_BYTES);
+    }
+
+    /// Expiry drops entries older than the TTL and keeps the byte total exact.
+    #[tokio::test(start_paused = true)]
+    async fn expiry_drops_old_entries_and_their_charge() {
+        let store = DelegateContextStore::with_budget(MAX_DELEGATE_CONTEXT_BYTES);
+        let a = UserId::new([0xC3; 32]);
+        store.store(&delegate(1), Some(&a), vec![1; 10]);
+        tokio::time::advance(DELEGATE_CONTEXT_TTL).await;
+        store.store(&delegate(2), Some(&a), vec![2; 10]);
+        store.prune_expired();
+        assert!(!store.contains(&delegate(1), Some(&a)));
+        assert!(store.contains(&delegate(2), Some(&a)));
+        assert_eq!(store.total_bytes(), 10 + CACHE_ENTRY_OVERHEAD_BYTES);
+    }
+
+    /// The budget scales with host RAM between its floor and ceiling. (That
+    /// the floor holds three maximum-size contexts is a compile-time check
+    /// next to the constant.)
+    #[test]
+    fn the_budget_is_ram_derived_and_clamped() {
+        assert_eq!(delegate_context_budget_for(0), MIN_DELEGATE_CONTEXT_BYTES);
+        assert_eq!(
+            delegate_context_budget_for(usize::MAX),
+            MAX_DELEGATE_CONTEXT_BYTES
+        );
+        let four_gib = 4 * 1024 * 1024 * 1024;
+        assert_eq!(
+            delegate_context_budget_for(four_gib),
+            four_gib / DELEGATE_CONTEXT_RAM_DIVISOR
+        );
     }
 }
 

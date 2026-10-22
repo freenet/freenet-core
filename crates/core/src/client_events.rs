@@ -12,6 +12,8 @@ pub(crate) mod test;
 #[cfg(test)]
 mod test_correlation;
 pub(crate) mod types;
+#[cfg(test)]
+mod unregister_dispatch_tests;
 
 /// Largest client WebSocket message, and frame, the node accepts (see
 /// `websocket::configure_upgrade`).
@@ -549,6 +551,38 @@ fn delegate_request_outcome(
             );
             Err(Error::Executor(exec_err))
         }
+        // Refused: an UnregisterDelegate from a connection that is not local,
+        // or from a hosted node's client without a user token. Caused by the
+        // request, and already logged once at debug by the executor.
+        Ok(ContractHandlerEvent::DelegateResponse(Err(exec_err)))
+            if exec_err.is_unregister_not_local() || exec_err.is_unregister_hosted() =>
+        {
+            tracing::debug!(
+                client_id = %client_id,
+                request_id = %request_id,
+                delegate = %delegate_key,
+                outcome = "unregister_refused",
+                error = %exec_err,
+                "DelegateRequest refused: UnregisterDelegate not allowed for this client"
+            );
+            Err(Error::Executor(exec_err))
+        }
+        // Refused: a delegate run with no user on a hosted node. No client can
+        // send one (a hosted node refuses a connection with no user token), so
+        // this means a node path did not supply the run's user; the executor
+        // already logged it (at warn the first time, then at debug).
+        Ok(ContractHandlerEvent::DelegateResponse(Err(exec_err)))
+            if exec_err.is_hosted_run_without_user() =>
+        {
+            tracing::debug!(
+                client_id = %client_id,
+                request_id = %request_id,
+                delegate = %delegate_key,
+                outcome = "hosted_run_without_user",
+                "DelegateRequest refused: a hosted node runs a delegate only on behalf of a user"
+            );
+            Err(Error::Executor(exec_err))
+        }
         // Genuine delegate execution failure (#5263). Previously this arm
         // didn't exist: a failure was indistinguishable from
         // `Ok(ContractHandlerEvent::DelegateResponse(Ok(vec![])))`, so the
@@ -590,15 +624,15 @@ fn delegate_request_outcome(
 }
 
 /// Keeps a missing-delegate failure (#5727), and the refusal of a request
-/// whose params do not derive the delegate key, TYPED on their way to the
-/// client.
+/// whose params do not derive the delegate key or of a non-local
+/// `UnregisterDelegate`, TYPED on their way to the client.
 ///
 /// Returns the client error `freenet local` sends for the same request —
 /// `RequestError::DelegateError(DelegateError::Missing(key))`, or
-/// `RequestError::DelegateError(DelegateError::ExecutionError(..))` for the
+/// `RequestError::DelegateError(DelegateError::ExecutionError(..))` for a
 /// refusal — when `err` is one of those failures, and hands every other error
-/// back unchanged for the generic `OperationError { cause }` flattening. The
-/// refusal is identified by `ExecutorError::is_params_mismatch`, a typed flag,
+/// back unchanged for the generic `OperationError { cause }` flattening. A
+/// refusal is identified by `ExecutorError::is_delegate_refusal`, a typed flag,
 /// never by its text.
 ///
 /// Without this the missing-delegate answer would reach a network-mode client
@@ -611,7 +645,7 @@ fn typed_delegate_client_error(err: Error) -> Result<ClientError, Error> {
     match err {
         Error::Executor(exec_err)
             if exec_err.is_missing_delegate()
-                || (exec_err.is_request() && exec_err.is_params_mismatch()) =>
+                || (exec_err.is_request() && exec_err.is_delegate_refusal()) =>
         {
             Ok(ErrorKind::RequestError(exec_err.unwrap_request()).into())
         }
@@ -624,7 +658,7 @@ fn typed_delegate_client_error(err: Error) -> Result<ClientError, Error> {
 }
 
 /// True for the typed client errors `typed_delegate_client_error` produces —
-/// a missing delegate (#5727) or a params-mismatch refusal — so the send path
+/// a missing delegate (#5727) or a refusal — so the send path
 /// keeps them out of the error log; both were already logged once upstream.
 ///
 /// The refusal is matched by variant AND message here because the flag that
@@ -639,7 +673,12 @@ fn is_routine_delegate_client_error(err: &ClientError) -> bool {
         ErrorKind::RequestError(RequestError::DelegateError(DelegateError::Missing(_))) => true,
         ErrorKind::RequestError(RequestError::DelegateError(DelegateError::ExecutionError(
             msg,
-        ))) => msg.starts_with(crate::wasm_runtime::DELEGATE_PARAMS_MISMATCH),
+        ))) => {
+            msg.starts_with(crate::wasm_runtime::DELEGATE_PARAMS_MISMATCH)
+                || msg.starts_with(crate::wasm_runtime::DELEGATE_UNREGISTER_NOT_LOCAL)
+                || msg.starts_with(crate::wasm_runtime::DELEGATE_UNREGISTER_HOSTED)
+                || msg.starts_with(crate::wasm_runtime::DELEGATE_HOSTED_RUN_WITHOUT_USER)
+        }
         _ => false,
     }
 }
@@ -1704,7 +1743,7 @@ async fn process_open_request(
                 // the node proved is local may receive a delegate's output.
                 // Locality is the WHOLE of the identity here — no contract id is
                 // carried, because keying delivery on one is unsafe (see
-                // `route_to_apps`).
+                // `route_to_apps_for`).
                 //
                 // The executor dispatch further down is NOT handed this value —
                 // it receives the raw `origin_contract` alongside
@@ -1724,21 +1763,29 @@ async fn process_open_request(
                 // (#3275). An app "registers with a delegate" by talking to it
                 // over a connection that carries an async notification channel;
                 // any ApplicationMessages request with such a channel establishes
-                // the path. UnregisterDelegate tears it down. RegisterDelegate
+                // the path. UnregisterDelegate tears it down, once the executor
+                // has unregistered the delegate (below). RegisterDelegate
                 // (installing the delegate binary) does NOT register an app —
                 // it's an admin op, not an app conversation.
                 //
                 // The registration records `app_identity`: registering stays open
                 // to anyone (it is how a client asks to be pushed to), but only a
                 // LOCAL registration is ever a delivery target — see
-                // `delegate_app_registry::route_to_apps`.
+                // `delegate_app_registry::route_to_apps_for`.
+                //
+                // `unregistered` is the key whose registrations an
+                // UnregisterDelegate clears. They are cleared only after the
+                // executor answers `Ok`, so a refused or failed unregister
+                // leaves them.
+                let mut unregistered = None;
                 match &req {
                     freenet_stdlib::client_api::DelegateRequest::ApplicationMessages { .. } => {
                         if let Some(sender) = &subscription_listener {
-                            if !crate::contract::delegate_app_registry::register_app(
+                            if !crate::contract::delegate_app_registry::register_app_for_user(
                                 &delegate_key,
                                 client_id,
                                 app_identity,
+                                request.user_context.as_ref().map(|u| *u.user_id()),
                                 sender.clone(),
                             ) {
                                 tracing::warn!(
@@ -1750,7 +1797,7 @@ async fn process_open_request(
                         }
                     }
                     freenet_stdlib::client_api::DelegateRequest::UnregisterDelegate(key) => {
-                        crate::contract::delegate_app_registry::remove_delegate(key);
+                        unregistered = Some(key.clone());
                     }
                     // RegisterDelegate INSTALLS a delegate binary (an admin
                     // op), not an app conversation, so it registers no routing
@@ -1857,6 +1904,7 @@ async fn process_open_request(
                 // NOT from anything inside `req`. Moving it into the event keeps
                 // it on a channel the delegate/client cannot reach.
                 let user_context = request.user_context;
+                let user_unregistering = user_context.as_ref().map(|u| *u.user_id());
 
                 let handler_res = op_manager
                     .notify_contract_handler_prioritized(
@@ -1876,6 +1924,20 @@ async fn process_open_request(
                     &delegate_key,
                     msg_type.as_deref(),
                 )?;
+                // A hosted user unregisters a delegate only for themselves (the
+                // executor removed nothing), so only their own registrations
+                // go. `user_unregistering` is read from the same
+                // `user_context` the executor's branch is keyed on.
+                if let Some(key) = &unregistered {
+                    match &user_unregistering {
+                        Some(user) => {
+                            crate::contract::delegate_app_registry::remove_user_registrations(
+                                key, user,
+                            )
+                        }
+                        None => crate::contract::delegate_app_registry::remove_delegate(key),
+                    }
+                }
 
                 let host_response = Ok(HostResponse::DelegateResponse {
                     key: delegate_key.clone(),
@@ -2238,7 +2300,7 @@ mod serve_during_gate_tests {
     /// is constructible unconditionally, so a version that classified every
     /// registration as `Local` would compile and would re-open the hole for
     /// every off-host caller. This pins that the identity handed to
-    /// `register_app` is derived through `connection_scope.is_local()`, and that
+    /// `register_app_for_user` is derived through `connection_scope.is_local()`, and that
     /// the connection scope also reaches the executor.
     #[test]
     fn delegate_registration_binds_to_the_connection_scope() {
@@ -2262,7 +2324,7 @@ mod serve_during_gate_tests {
                  `connection_scope.is_local()`",
             );
         let registration = arm
-            .find("register_app(")
+            .find("register_app_for_user(")
             .expect("the DelegateOp arm must register the app routing path");
         assert!(
             derivation < registration,

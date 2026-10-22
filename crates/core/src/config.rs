@@ -2257,9 +2257,9 @@ impl Config {
                 %address,
                 allowed_hosts = ?self.ws_api.allowed_hosts,
                 hosted_mode = self.ws_api.hosted_mode,
-                "Client API exposure: {reason}. A connection that presents no per-user \
-                 token drives this node's SHARED namespace and can read and modify its \
-                 contract state, identities and keys. Bind loopback \
+                "Client API exposure: {reason}. On a node that is not in hosted mode, a \
+                 connection drives this node's SHARED namespace and can read and modify \
+                 its contract state, identities and keys. Bind loopback \
                  (--ws-api-address ::1) unless you intend this."
             );
         }
@@ -3361,10 +3361,18 @@ pub struct WebsocketApiConfig {
     /// gets a per-user delegate-secret namespace derived from that token; when
     /// `false` (the default), the `userToken` parameter is ignored entirely and
     /// every connection is single-user — byte-for-byte the pre-#4381 behavior.
+    /// A hosted node serves its client API only to a connection that presents a
+    /// user token.
     ///
-    /// This flag ONLY governs whether the WS boundary derives a per-user
-    /// context; everything downstream is driven by whether a context was
-    /// derived, so with the flag off the entire feature is inert.
+    /// The flag also governs the rest of hosted mode:
+    /// - the permission routes require a user token, show each user only their
+    ///   own prompts, and the permission routes a hosted node does not serve
+    ///   are refused;
+    /// - imports into the node-local secret scope are refused;
+    /// - the node sends no contract notifications to delegates;
+    /// - the executor refuses a delegate run that has no user.
+    ///
+    /// With the flag off none of these apply.
     #[serde(default, rename = "hosted-mode")]
     pub hosted_mode: bool,
 
@@ -3796,33 +3804,24 @@ fn resolve_ws_api_address(
 /// machine while connections can land in ONE shared secret namespace, and if
 /// so, why. `None` means stay quiet.
 ///
-/// The shared namespace is the danger. `decide_user_token` hands a connection
-/// the node's single-user context whenever hosted mode is off **or the
-/// connection simply omits `userToken`** — so hosted mode ADDS a per-user
-/// namespace for well-behaved clients, it does not remove the shared one.
+/// The shared namespace is the danger. A node that is not in hosted mode hands
+/// every connection its single-user context. A hosted node serves its client
+/// API only to a connection that presents a user token, so it hands none of
+/// them that context.
 ///
 /// Two triggers:
-/// - a **non-loopback bind** warns regardless of hosted mode, because any host
-///   that can route to the address can omit a token and land in the shared
-///   namespace;
+/// - a **non-loopback bind** warns regardless of hosted mode: without hosted
+///   mode any host that can route to the address lands in the shared
+///   namespace, and with it a user token is honoured only from a loopback
+///   source, so a wide bind is not the deployment hosted mode expects;
 /// - **`--allowed-host` on a loopback bind with hosted mode OFF** warns. That
 ///   flag names a reverse proxy, and a proxy terminates the connection itself,
 ///   so every visitor arrives wearing the proxy's source address and the node's
 ///   own source-IP filters cannot tell them apart.
 ///
-/// **Loopback + hosted mode stays quiet, and that is a known gap, not an
-/// assertion of safety.** A connection that omits `userToken` reads the shared
-/// namespace there too, and behind a public proxy that is any visitor;
-/// containment on the flagship deployment today is that the shared namespace is
-/// empty (measured: zero files outside `*/users/*`), which is a fact about
-/// current state rather than a structural guarantee. Making this branch fire
-/// only when the shared namespace actually holds something needs a probe of the
-/// secrets tree, which is a separate change with its own failure modes — it is
-/// tracked in advisory GHSA-824h-7x5x-wfmf §8, with the measured tree shape and
-/// the requirements, rather than bolted onto a default-hardening PR, because a
-/// probe that is wrong in either direction is worse than no warning: too eager
-/// and it fires on every boot of the flagship and trains operators to ignore the
-/// one signal there is.
+/// **Loopback + hosted mode stays quiet.** A hosted node serves its client API
+/// only to a connection that presents a user token, and each token has its own
+/// namespace, including behind a public proxy.
 fn ws_api_shares_one_namespace_with_remote_clients(
     hosted_mode: bool,
     address: IpAddr,
@@ -3831,8 +3830,9 @@ fn ws_api_shares_one_namespace_with_remote_clients(
     if !address.is_loopback() {
         return Some(if hosted_mode {
             "the client API is bound to a non-loopback address, and hosted mode does \
-             not close that: a connection which simply omits `userToken` still lands \
-             in this node's shared single-user namespace"
+             not serve remote clients that way: it serves the client API only to a \
+             connection that presents a user token, and honours a token only from a \
+             loopback source behind a TLS proxy, so bind loopback behind the proxy"
         } else {
             "the client API is bound to a non-loopback address, so any host that can \
              route to it can drive this node"
@@ -11544,9 +11544,9 @@ shutdown-drain-secs = 42
     }
 
     /// The exposure warning fires on a non-loopback bind REGARDLESS of hosted
-    /// mode (an untokened connection reaches the shared namespace either way),
-    /// and additionally on (non-loopback bind OR
-    /// an `--allowed-host` reverse-proxy grant). Both triggers matter: a proxy
+    /// mode (hosted mode does not expect a wide bind), and additionally on
+    /// (non-loopback bind OR an `--allowed-host` reverse-proxy grant with hosted
+    /// mode off). Both triggers matter: a proxy
     /// terminates the connection itself, so every visitor looks local to the
     /// node's own source-IP filters even when the bind is `127.0.0.1`.
     #[test]
@@ -11560,12 +11560,8 @@ shutdown-drain-secs = 42
             ws_api_shares_one_namespace_with_remote_clients(false, loopback, &[]),
             None
         );
-        // Quiet: try.freenet.org's shape. A KNOWN GAP rather than a safety
-        // claim — an untokened connection reads the shared namespace here too.
-        // Containment today is that the namespace is empty; making the warning
-        // conditional on that needs a probe of the secrets tree, tracked
-        // separately so a probe that is wrong in either direction cannot ride
-        // in on a default-hardening change.
+        // Quiet: try.freenet.org's shape. A hosted node serves its client API
+        // only to a connection that presents a user token.
         assert_eq!(
             ws_api_shares_one_namespace_with_remote_clients(true, loopback, &proxy),
             None
@@ -11577,8 +11573,8 @@ shutdown-drain-secs = 42
             .expect("a wildcard bind with hosted mode off must warn");
         assert!(bind_reason.contains("non-loopback"), "{bind_reason}");
 
-        // Fires: hosted mode does NOT make a wide bind safe. `decide_user_token`
-        // returns the shared context whenever a connection omits `userToken`.
+        // Fires: hosted mode does NOT make a wide bind safe. It honours a
+        // token only from a loopback source behind a TLS proxy.
         let hosted_wide = ws_api_shares_one_namespace_with_remote_clients(true, wildcard, &proxy)
             .expect("a wildcard bind must warn even in hosted mode");
         assert!(hosted_wide.contains("hosted mode does"), "{hosted_wide}");

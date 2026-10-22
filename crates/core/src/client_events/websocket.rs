@@ -819,12 +819,14 @@ struct ConnectionInfo {
 /// - hosted mode OFF => always `None` (token ignored entirely; single-user).
 /// - hosted mode ON, non-empty token => `Some` context derived solely from the
 ///   token bytes.
-/// - hosted mode ON, no token or empty token => `None` (this connection is
-///   single-user, just like a non-hosted node).
+/// - hosted mode ON, no token or empty token => `None`. This helper also serves
+///   routes that need no token (the shell and other HTTP routes); the client
+///   API refuses such a connection on a hosted node before the upgrade (see
+///   `websocket_commands`).
 ///
-/// `None` everywhere means [`crate::wasm_runtime::SecretScope::Local`]
-/// downstream — byte-for-byte the pre-#4381 behavior — so the flag-off path is
-/// provably inert.
+/// `None` means [`crate::wasm_runtime::SecretScope::Local`] downstream. On a
+/// hosted node no client-API connection reaches that scope, and with hosted
+/// mode off the path is byte-for-byte the pre-#4381 behavior.
 pub(crate) fn derive_user_context(
     hosted_mode: bool,
     user_token: Option<&str>,
@@ -833,7 +835,8 @@ pub(crate) fn derive_user_context(
         (true, Some(token)) if !token.is_empty() => {
             Some(UserSecretContext::from_token(token.as_bytes()))
         }
-        // hosted on but no/empty token, or hosted off (token ignored): Local.
+        // hosted on but no/empty token (the client API refuses such a
+        // connection before this matters), or hosted off (token ignored).
         (true, _) | (false, _) => None,
     }
 }
@@ -851,18 +854,21 @@ pub(crate) enum UserTokenDecision {
     /// demonstrably secure (not a loopback source carrying
     /// `X-Forwarded-Proto: https`). Reject the upgrade rather than silently
     /// dropping the token — silently falling back to `Local` would put the user
-    /// on the WRONG (shared) namespace under a public plaintext deployment.
+    /// on the WRONG namespace under a public plaintext deployment.
     RejectInsecure,
-    /// No per-user scoping: treat as single-user (`SecretScope::Local`). Reached
-    /// for the flag-off path and the no-token path (`has_token == false`) — both
-    /// byte-for-byte the pre-#4381 behavior, so no rejection fires.
+    /// No per-user scoping (`SecretScope::Local`). Reached for the flag-off
+    /// path and for `has_token == false`. On a node that is not hosted this is
+    /// the normal single-user path. On a hosted node the client API refuses a
+    /// connection with no token before the upgrade (`websocket_commands`), so
+    /// only routes that need no token (the shell, other HTTP routes) see this
+    /// outcome there.
     ///
-    /// NOTE: an EMPTY token (`?userToken=` with no value) is mapped to `Local`
-    /// too, but that happens at the CALL SITE, which passes `has_token = false`
-    /// for an empty token (matching `derive_user_context`'s empty-is-absent
-    /// rule). This pure fn keys only on the `has_token` bool and never inspects
-    /// token contents — so an empty token must NOT reach here as `has_token ==
-    /// true`, or it would be wrongly rejected as insecure.
+    /// NOTE: an EMPTY token (`?userToken=` with no value) counts as no token.
+    /// The CALL SITE passes `has_token = false` for it (matching
+    /// `derive_user_context`'s empty-is-absent rule). This pure fn keys only on
+    /// the `has_token` bool and never inspects token contents, so an empty
+    /// token must NOT reach here as `has_token == true`, or it would be wrongly
+    /// rejected as insecure.
     Local,
 }
 
@@ -922,9 +928,10 @@ pub(crate) fn decide_user_token(
     source_ip: Option<std::net::IpAddr>,
     xfp_https: bool,
 ) -> UserTokenDecision {
-    // Flag off, or no token presented: single-user, no rejection. This is the
-    // ONLY path when hosted mode is off, so the whole invariant is hosted-gated
-    // and the flag-off behavior is byte-for-byte unchanged.
+    // Flag off, or no token presented: no rejection here. This is the ONLY
+    // path when hosted mode is off, so the whole invariant is hosted-gated and
+    // the flag-off behavior is byte-for-byte unchanged. A hosted node's client
+    // API refuses a tokenless connection separately (`websocket_commands`).
     if !hosted_mode || !has_token {
         return UserTokenDecision::Local;
     }
@@ -1131,11 +1138,11 @@ async fn connection_info(
     let token_str: Option<&str> = user_token.as_deref().map(String::as_str);
 
     // `has_token` is a NON-EMPTY check, matching `derive_user_context`'s
-    // empty-is-absent semantics. The browser shell sends `?userToken=` (empty)
-    // for a brand-new user who has no token yet; that connection must fall
-    // through to Local (single-user) so the client can connect and GET a token,
-    // NOT be locked out with a 403. Both helpers must agree on "empty": an empty
-    // token is treated as no token, so it is never gated.
+    // empty-is-absent semantics: an empty `?userToken=` is treated as no token,
+    // so it is never gated as insecure here. On a hosted node a client-API
+    // connection with no token is then refused by `websocket_commands`; this
+    // middleware also runs for the shell and other HTTP routes, which need no
+    // token.
     let user_context = match decide_user_token(
         hosted_mode.0,
         token_str.is_some_and(|t| !t.is_empty()),
@@ -1228,7 +1235,27 @@ async fn websocket_commands(
     // (#4561). OPTIONAL: only `serve_client_api_in_impl` installs it; the
     // standalone test paths install nothing, so absence ⇒ no activity stamping.
     activity_secrets_dir: Option<Extension<crate::server::ActivitySecretsDir>>,
+    Extension(hosted_mode): Extension<crate::server::HostedMode>,
 ) -> Response {
+    // A hosted node serves its client API only to a connection that presented
+    // a user token: every request on it runs under that user's namespace, and
+    // a connection without one would run under the node's own `Local` scope,
+    // which no visitor of a hosted node may use. The hosted shell always
+    // presents a token (its bridge refuses to connect without one), so this
+    // refuses only clients that left it out. Refused before the upgrade, so
+    // nothing reaches the node. Other routes (the shell, `/v1/version`) are not
+    // client-API connections and are unaffected.
+    if hosted_mode.0 && user_context.is_none() {
+        tracing::debug!(
+            ?connection_scope,
+            "Refused a client-API connection to a hosted node without a user token"
+        );
+        return (
+            StatusCode::FORBIDDEN,
+            "this hosted Freenet node requires a user token (userToken) on the client API",
+        )
+            .into_response();
+    }
     let op_rate_limiter = op_rate_limiter.map(|Extension(l)| l);
     let activity_secrets_dir = activity_secrets_dir.map(|Extension(d)| d);
     let on_upgrade = move |ws: WebSocket| async move {
@@ -2541,8 +2568,8 @@ mod tests {
         assert!(derive_user_context(false, Some("")).is_none());
     }
 
-    /// With hosted mode ON, a non-empty token yields a context; absent/empty
-    /// token still means single-user (no context).
+    /// With hosted mode ON, a non-empty token yields a context; an absent or
+    /// empty token yields no context.
     #[test]
     fn hosted_mode_on_honors_only_a_nonempty_token() {
         assert!(
@@ -2551,11 +2578,11 @@ mod tests {
         );
         assert!(
             derive_user_context(true, None).is_none(),
-            "flag on + no token => single-user"
+            "flag on + no token => no context"
         );
         assert!(
             derive_user_context(true, Some("")).is_none(),
-            "flag on + empty token => single-user (not an empty-token namespace)"
+            "flag on + empty token => no context (not an empty-token namespace)"
         );
     }
 
@@ -2705,12 +2732,11 @@ mod tests {
 
     /// Regression: an EMPTY `userToken` (`?userToken=` => `Some("")`) must be
     /// treated as no token (Local), NOT rejected as insecure. The call site
-    /// computes `has_token` as a NON-EMPTY check, so an empty token over a
-    /// remote/non-loopback hosted connection falls through to Local — a
-    /// brand-new remote user whose client sends an empty `userToken=` connects
-    /// as single-user to GET a token, instead of being locked out with a 403.
-    /// This mirrors `derive_user_context`'s empty-is-absent semantics so the two
-    /// helpers agree on "empty".
+    /// computes `has_token` as a NON-EMPTY check, so this gate reports `Local`
+    /// for an empty token. The client API still refuses a tokenless connection
+    /// on a hosted node (`websocket_commands`); this gate decides only whether
+    /// a presented token is honored. It mirrors `derive_user_context`'s
+    /// empty-is-absent semantics so the two helpers agree on "empty".
     #[test]
     fn gate_empty_token_is_local_not_rejected() {
         // Replicate the call-site computation of `has_token`.
@@ -2741,6 +2767,128 @@ mod tests {
             UserTokenDecision::RejectInsecure,
             "whitespace token is non-empty => treated as a real token"
         );
+    }
+
+    /// A hosted node serves its client API only to a connection that presents
+    /// a user token. Drives real WebSocket upgrades through the production
+    /// router (`connection_info` plus `websocket_commands`) over loopback, as
+    /// the hosted reverse proxy reaches the node.
+    ///
+    /// FALSIFY by removing the hosted-mode check at the top of
+    /// `websocket_commands`: the tokenless upgrades succeed.
+    #[tokio::test]
+    async fn a_hosted_node_refuses_client_api_connections_without_a_user_token() {
+        use axum::{Extension, Router};
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+        async fn serve(hosted: bool) -> std::net::SocketAddr {
+            // An ordinary HTTP route beside the client API, standing in for
+            // the shell and `/v1/version`: it shares the middleware and must
+            // stay reachable without a token.
+            let (_proxy, router) = WebSocketProxy::create_router_with_origin_contracts(
+                Router::new().route("/v1/version", axum::routing::get(|| async { "version" })),
+                crate::server::client_api::OriginContractMap::default(),
+            );
+            let app = router
+                .layer(Extension(crate::server::HostedMode(hosted)))
+                .layer(Extension(crate::server::AllowedHosts::default()))
+                .layer(Extension(crate::server::AllowedSourceCidrs::default()));
+            let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+                .await
+                .unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move {
+                // Serving ends when the test runtime shuts down; its result is
+                // teardown, not a signal.
+                drop(
+                    axum::serve(
+                        listener,
+                        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+                    )
+                    .await,
+                );
+            });
+            addr
+        }
+
+        // `xfp_https` adds the header the hosted TLS proxy sets, which the node
+        // requires before it honours a token from loopback.
+        async fn upgrade_at(
+            addr: std::net::SocketAddr,
+            version: &str,
+            query: &str,
+            xfp_https: bool,
+        ) -> Result<u16, (u16, String)> {
+            let mut request = format!("ws://{addr}/{version}/contract/command{query}")
+                .into_client_request()
+                .unwrap();
+            if xfp_https {
+                request
+                    .headers_mut()
+                    .insert("x-forwarded-proto", "https".parse().unwrap());
+            }
+            match tokio_tungstenite::connect_async(request).await {
+                Ok((_socket, response)) => Ok(response.status().as_u16()),
+                Err(tokio_tungstenite::tungstenite::Error::Http(response)) => Err((
+                    response.status().as_u16(),
+                    String::from_utf8_lossy(response.body().as_deref().unwrap_or_default())
+                        .into_owned(),
+                )),
+                Err(other) => panic!("unexpected upgrade error: {other}"),
+            }
+        }
+
+        async fn upgrade(
+            addr: std::net::SocketAddr,
+            query: &str,
+            xfp_https: bool,
+        ) -> Result<u16, (u16, String)> {
+            upgrade_at(addr, "v1", query, xfp_https).await
+        }
+
+        let hosted = serve(true).await;
+        for version in ["v1", "v2"] {
+            for query in ["", "?userToken="] {
+                let refused = upgrade_at(hosted, version, query, true).await.expect_err(
+                    "a hosted node must refuse a client-API connection without a token",
+                );
+                assert_eq!(refused.0, 403, "{version} query {query:?}");
+                assert!(
+                    refused.1.contains("requires a user token"),
+                    "refused by the token rule, not another check; got {:?}",
+                    refused.1
+                );
+            }
+        }
+        // A token without the TLS proxy's header is refused by the
+        // insecure-token check, which this rule leaves as it was.
+        let insecure = upgrade(hosted, "?userToken=hosted-client-api-user", false)
+            .await
+            .expect_err("a token without X-Forwarded-Proto: https is refused");
+        assert_eq!(insecure.0, 403);
+        assert!(
+            insecure.1.contains("requires a secure"),
+            "refused by the insecure-token check; got {:?}",
+            insecure.1
+        );
+        // Other routes behind the same middleware still answer without a token.
+        let version = reqwest::get(format!("http://{hosted}/v1/version"))
+            .await
+            .expect("the HTTP route answers");
+        assert_eq!(
+            version.status().as_u16(),
+            200,
+            "a tokenless HTTP route is served"
+        );
+        assert_eq!(
+            upgrade(hosted, "?userToken=hosted-client-api-user", true).await,
+            Ok(101),
+            "a connection with a user token is served"
+        );
+
+        // A node that is not hosted serves a tokenless connection as before.
+        let local = serve(false).await;
+        assert_eq!(upgrade(local, "", false).await, Ok(101));
     }
 
     /// Integration-level check that the `connection_info` middleware actually
@@ -2874,9 +3022,10 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
 
-        // Hosted ON + EMPTY token (`/?userToken=`) + remote => 200, NOT 403.
-        // A brand-new remote user whose client sends an empty userToken must be
-        // able to connect (as Local) to GET a real token, not be locked out.
+        // Hosted ON + EMPTY token (`/?userToken=`) + remote => 200, NOT 403:
+        // an empty token is no token, so the middleware does not gate it as
+        // insecure. (A client-API connection without a token is refused
+        // separately, by `websocket_commands`; this router has no such route.)
         let resp = router(true)
             .oneshot(req(Some(""), Some(public), false))
             .await

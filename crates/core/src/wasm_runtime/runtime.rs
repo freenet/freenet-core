@@ -968,7 +968,7 @@ pub struct Runtime {
     /// keyed by the CODE hash rather than the delegate key — see
     /// [`SharedModuleCache`] and `prepare_delegate_call`.
     pub(super) delegate_modules: SharedModuleCache<CodeHash>,
-    /// Persisted `ctx.write()` bytes per delegate, shared across pool
+    /// Persisted `ctx.write()` bytes per delegate and hosted user, shared across pool
     /// executors so a prompt round-trip routed to a different `Runtime` still
     /// sees the pending state. See `native_api::DelegateContextCache`.
     pub(super) delegate_contexts: super::native_api::DelegateContextCache,
@@ -1011,6 +1011,46 @@ impl Runtime {
         key: &DelegateKey,
     ) -> Result<Parameters<'static>, super::ParamsUnavailable> {
         self.delegate_store.registered_params(key)
+    }
+
+    /// Store a secret for `delegate` under `scope`, for tests.
+    #[cfg(test)]
+    pub(crate) fn store_secret_for_test(
+        &mut self,
+        delegate: &DelegateKey,
+        id: &freenet_stdlib::prelude::SecretsId,
+        scope: super::SecretScope<'_>,
+        plaintext: Vec<u8>,
+    ) -> RuntimeResult<()> {
+        self.secret_store
+            .store_secret(delegate, id, scope, zeroize::Zeroizing::new(plaintext))
+    }
+
+    /// Read a secret for `delegate` under `scope`, for tests.
+    #[cfg(test)]
+    pub(crate) fn get_secret_for_test(
+        &self,
+        delegate: &DelegateKey,
+        id: &freenet_stdlib::prelude::SecretsId,
+        scope: super::SecretScope<'_>,
+    ) -> Option<Vec<u8>> {
+        self.secret_store
+            .get_secret(delegate, id, scope)
+            .ok()
+            .map(|s| s.to_vec())
+    }
+
+    /// The delegate context cache. The contract loop moves a parked run's
+    /// context out of it and back through the executor.
+    pub(crate) fn delegate_contexts(&self) -> &super::native_api::DelegateContextCache {
+        &self.delegate_contexts
+    }
+
+    /// The delegate context cache, for tests that seed or inspect a
+    /// delegate's `ctx.write()` bytes.
+    #[cfg(test)]
+    pub(crate) fn delegate_contexts_for_test(&self) -> &super::native_api::DelegateContextCache {
+        &self.delegate_contexts
     }
 
     /// Check if the runtime is in a healthy state and can execute WASM.

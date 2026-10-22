@@ -6,17 +6,39 @@ use freenet_stdlib::prelude::{
     MessageOrigin, OutboundDelegateMsg, Parameters,
 };
 
-use super::super::native_api::{self, DelegateContextEntry};
-use super::super::secrets_store::UserSecretContext;
+use super::super::native_api;
+use super::super::secrets_store::{UserId, UserSecretContext};
 use super::super::{Runtime, RuntimeResult};
 
 pub(crate) trait DelegateRuntimeInterface {
+    /// Run `key` on `inbound`. Its context is the one kept for `user_context`'s
+    /// user; see [`Self::inbound_app_message_as`] to name that user separately.
+    /// Production calls go through the executor, which always names the user.
+    #[cfg(test)]
     fn inbound_app_message(
         &mut self,
         key: &DelegateKey,
         params: &Parameters,
         origin: Option<&MessageOrigin>,
         user_context: Option<&UserSecretContext>,
+        inbound: Vec<InboundDelegateMsg>,
+    ) -> RuntimeResult<Vec<OutboundDelegateMsg>> {
+        let context_user = user_context.map(|u| *u.user_id());
+        self.inbound_app_message_as(key, params, origin, user_context, context_user, inbound)
+    }
+
+    /// Run `key` on `inbound`, with the user whose context the run uses
+    /// given apart from `user_context`, which scopes the run's secrets.
+    /// Production runs pass the same user for both: every run, a delegate
+    /// reached by a message from another delegate included, runs under the
+    /// user whose request led to it.
+    fn inbound_app_message_as(
+        &mut self,
+        key: &DelegateKey,
+        params: &Parameters,
+        origin: Option<&MessageOrigin>,
+        user_context: Option<&UserSecretContext>,
+        context_user: Option<UserId>,
         inbound: Vec<InboundDelegateMsg>,
     ) -> RuntimeResult<Vec<OutboundDelegateMsg>>;
 
@@ -47,12 +69,13 @@ pub(crate) trait DelegateRuntimeInterface {
 }
 
 impl DelegateRuntimeInterface for Runtime {
-    fn inbound_app_message(
+    fn inbound_app_message_as(
         &mut self,
         delegate_key: &DelegateKey,
         params: &Parameters,
         origin: Option<&MessageOrigin>,
         user_context: Option<&UserSecretContext>,
+        context_user: Option<UserId>,
         inbound: Vec<InboundDelegateMsg>,
     ) -> RuntimeResult<Vec<OutboundDelegateMsg>> {
         let mut results = Vec::with_capacity(inbound.len());
@@ -78,12 +101,12 @@ impl DelegateRuntimeInterface for Runtime {
         // Context state maintained across process() calls.
         //
         // `self.delegate_contexts` persists the delegate's `ctx.write()` bytes
-        // across separate `inbound_app_message` invocations so that, e.g., the
+        // across separate `inbound_app_message_as` invocations so that, e.g., the
         // bytes a delegate writes when emitting `RequestUserInput` are still
         // readable via `ctx.read()` when the executor re-enters with the
         // matching `UserResponse`. Without this, the delegate hits "received
         // UserResponse with no pending context" because the Vec only used to
-        // live for one `inbound_app_message` call. See
+        // live for one `inbound_app_message_as` call. See
         // `native_api::DelegateContextCache`.
         //
         // Amortised TTL sweep on every entry prevents the cache from holding
@@ -95,10 +118,11 @@ impl DelegateRuntimeInterface for Runtime {
         // have gone unused long enough. See `InheritedOriginsEntry`.
         native_api::touch_inherited_origin(&self.inherited_origins, delegate_key);
         native_api::prune_expired_inherited_origins(&self.inherited_origins);
+        // One context per delegate and hosted user.
+        let context_user = context_user.as_ref();
         let mut context: Vec<u8> = self
             .delegate_contexts
-            .get(delegate_key)
-            .map(|entry| entry.bytes.clone())
+            .get(delegate_key, context_user)
             .unwrap_or_default();
 
         // Process all messages, collecting the result.
@@ -282,15 +306,10 @@ impl DelegateRuntimeInterface for Runtime {
         // value that would crash on the very next call. Treat oversize as
         // "delegate misbehavior, forget it" rather than "crash the node."
         if context.is_empty() {
-            self.delegate_contexts.remove(delegate_key);
+            self.delegate_contexts.remove(delegate_key, context_user);
         } else if context.len() < freenet_stdlib::prelude::DelegateContext::MAX_SIZE {
-            self.delegate_contexts.insert(
-                delegate_key.clone(),
-                DelegateContextEntry {
-                    bytes: context,
-                    last_write: tokio::time::Instant::now(),
-                },
-            );
+            self.delegate_contexts
+                .store(delegate_key, context_user, context);
         } else {
             tracing::warn!(
                 delegate_key = %delegate_key,
@@ -299,7 +318,7 @@ impl DelegateRuntimeInterface for Runtime {
                 "Delegate ctx.write() exceeded DelegateContext::MAX_SIZE; \
                  dropping the persisted context to avoid a crash on the next call"
             );
-            self.delegate_contexts.remove(delegate_key);
+            self.delegate_contexts.remove(delegate_key, context_user);
         }
 
         tracing::debug!(
@@ -340,21 +359,27 @@ impl DelegateRuntimeInterface for Runtime {
 
     #[inline]
     fn unregister_delegate(&mut self, key: &DelegateKey) -> RuntimeResult<()> {
-        let code_hash = self.delegate_store.code_hash_from_key(key);
-        // Drop persisted ctx.write() bytes so an unregistered delegate can't
-        // hold onto stale state if it's later re-registered.
-        self.delegate_contexts.remove(key);
+        // A key the store has not indexed is not registered here, so there is
+        // nothing stored to remove, and the store is asked to remove only the
+        // exact key it indexed.
+        let Some(code_hash) = self.delegate_store.code_hash_from_key(key) else {
+            self.delegate_contexts.remove_delegate(key);
+            return Ok(());
+        };
         self.delegate_store.remove_delegate(key)?;
+        // Drop persisted ctx.write() bytes so an unregistered delegate can't
+        // hold onto stale state if it's later re-registered. After the store
+        // removal, so a failed removal leaves the still-registered delegate
+        // its context.
+        self.delegate_contexts.remove_delegate(key);
         // Drop the compiled module only once NO remaining delegate runs that
         // code. The cache is keyed by code hash now (#5268), so one delegate's
         // removal must not evict the module its still-registered siblings —
         // other parameterizations of the same WASM — share. Mirrors the
         // reference check `remove_delegate` already applies to the `.wasm` blob,
         // and runs after it so the removed key is out of the index.
-        if let Some(code_hash) = code_hash {
-            if !self.delegate_store.code_still_referenced(&code_hash) {
-                self.delegate_modules.lock().unwrap().remove(&code_hash);
-            }
+        if !self.delegate_store.code_still_referenced(&code_hash) {
+            self.delegate_modules.lock().unwrap().remove(&code_hash);
         }
         Ok(())
     }
