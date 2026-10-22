@@ -2744,3 +2744,33 @@ async fn an_out_of_order_legacy_stream_completes_within_its_charge() {
         Some(&data[..])
     );
 }
+
+/// A packet that decrypts under the session key but whose plaintext does not
+/// decode as a `SymmetricMessage` (for example a payload variant from a newer
+/// release) is dropped. `recv()` keeps running, delivers the next valid
+/// message, and does not count the dropped packet as a decryption failure.
+#[tokio::test(start_paused = true)]
+async fn undecodable_authenticated_packet_is_dropped_not_fatal() {
+    let mut e = single(CAPABLE);
+    // Three bytes cannot hold the leading `u32` packet id, so this fails to
+    // decode whatever the payload layout is.
+    let undecodable =
+        PacketData::<_, { crate::transport::packet_data::MAX_PACKET_SIZE }>::from_buf_plain([
+            0xFF, 0xFF, 0xFF,
+        ])
+        .encrypt_symmetric(&e.inbound_key);
+    assert!(SymmetricMessage::deser(&[0xFF, 0xFF, 0xFF]).is_err());
+    e.inbound
+        .send(PacketData::<UnknownEncryption>::from_buf(
+            undecodable.data(),
+        ))
+        .await
+        .expect("deliver");
+    e.deliver(0, short(b"after"), vec![]).await;
+
+    assert_eq!(
+        e.pump(Duration::from_millis(10)).await.as_deref(),
+        Some(&b"after"[..])
+    );
+    assert_eq!(e.conn.failure_count, 0);
+}

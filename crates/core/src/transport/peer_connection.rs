@@ -1334,7 +1334,23 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                     );
                     self.last_inbound_nanos
                         .store(self.last_received_nanos, std::sync::atomic::Ordering::Release);
-                    let msg = SymmetricMessage::deser(decrypted.data()).unwrap();
+                    // The remote holds the session key, but it can still send
+                    // bytes this node cannot decode: a payload variant from a
+                    // newer release, or a faulty or hostile peer. Drop such a
+                    // packet. It is not a decryption failure, so it does not
+                    // count toward closing the connection.
+                    let msg = match SymmetricMessage::deser(decrypted.data()) {
+                        Ok(msg) => msg,
+                        Err(error) => {
+                            tracing::debug!(
+                                peer_addr = %self.remote_conn.remote_addr,
+                                error = %error,
+                                payload_len = decrypted.data().len(),
+                                "Dropping authenticated packet that does not decode"
+                            );
+                            continue;
+                        }
+                    };
                     let SymmetricMessage {
                         packet_id,
                         confirm_receipt,

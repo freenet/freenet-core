@@ -157,7 +157,8 @@ fn internal_sym_decryption<const N: usize>(
 ) -> Result<([u8; N], usize), aes_gcm::Error> {
     // `size` is the received length; `data` is the whole fixed-size buffer, so
     // only `size` says whether the type byte, nonce and tag are all present.
-    // Slicing by `size` below would panic on a shorter packet.
+    // Slicing by `size` below would panic on a shorter packet. `size` above
+    // `data.len()` cannot come from `from_buf`; that half is defensive.
     if size < PACKET_TYPE_SIZE + NONCE_SIZE + TAG_SIZE || size > data.len() {
         return Err(aes_gcm::Error);
     }
@@ -374,8 +375,8 @@ mod tests {
 
     /// A symmetric-type packet too short to hold the type byte, nonce and tag
     /// is rejected with an error at every length, rather than panicking while
-    /// slicing out the tag. One byte longer than that, with no payload, is the
-    /// shortest packet that can decrypt, and it still does.
+    /// slicing out the tag. A packet of exactly that length (an empty payload)
+    /// is the shortest that can decrypt, and it still does.
     #[test]
     fn short_symmetric_packets_are_rejected_without_panicking() {
         let cipher = Aes128Gcm::new(&[7u8; 16].into());
