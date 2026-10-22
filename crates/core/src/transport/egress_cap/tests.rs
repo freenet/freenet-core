@@ -488,3 +488,74 @@ fn unpaced_debt_is_accounted_and_paid_by_paced_sends() {
         });
     }
 }
+
+/// Regression: an unpaced charge must never move `empty_at` backwards. With
+/// more paced reservations queued than `DEBT_LIMIT` covers, the old
+/// `min(refilled + cost, now + limit)` pulled the queue end back to
+/// `now + limit` on every ACK, erasing queued reservations; their holders
+/// still sent at their given times while new reservations reused the same
+/// slots, so paced traffic alone ran above the cap.
+///
+/// The bound checked here is on PACED bytes only, with no allowance for
+/// forgiven bytes: forgiveness may only ever drop unpaced charges, never
+/// paced ones.
+#[test]
+fn unpaced_charges_never_erase_queued_paced_reservations() {
+    for seed in [5u64, 17, 2024] {
+        GlobalRng::scoped_seed(seed, || {
+            // 100 KB/s and 150 streams each keeping one reservation queued:
+            // 150 x 1 200 bytes is 1.8 s of the rate, beyond the 1 s limit.
+            let rate = 100_000u64;
+            let (cap, time) = cap_at(rate);
+            let burst = cap.burst_bytes() as u128;
+            let streams = 150usize;
+            let per_stream = 6usize;
+            // (due ns, stream, hold); each stream reserves its next datagram
+            // when the previous one is sent.
+            let mut pending: Vec<(u64, usize, EgressHold<'_>)> = (0..streams)
+                .map(|i| {
+                    let hold = cap.reserve(PACKET, None);
+                    (hold.wait().as_nanos() as u64, i, hold)
+                })
+                .collect();
+            let mut remaining = vec![per_stream - 1; streams];
+            let mut paced_sends: Vec<(u64, u64)> = Vec::new();
+            let mut next_unpaced = 0u64;
+            while !pending.is_empty() {
+                let next_due = pending.iter().map(|p| p.0).min().unwrap();
+                if next_unpaced <= next_due {
+                    time.advance_to(next_unpaced);
+                    // ACKs and Pongs, unpaced, every 2 ms.
+                    cap.charge_unpaced(GlobalRng::random_range(40..200));
+                    next_unpaced += 2_000_000;
+                    continue;
+                }
+                time.advance_to(next_due);
+                pending.sort_by_key(|p| (p.0, p.1));
+                while pending.first().is_some_and(|p| p.0 <= next_due) {
+                    let (_, stream, hold) = pending.remove(0);
+                    hold.settle(PACKET);
+                    paced_sends.push((next_due, PACKET as u64));
+                    if remaining[stream] > 0 {
+                        remaining[stream] -= 1;
+                        let hold = cap.reserve(PACKET, None);
+                        pending.push((next_due + hold.wait().as_nanos() as u64, stream, hold));
+                    }
+                }
+            }
+            assert_eq!(paced_sends.len(), streams * per_stream);
+            for i in 0..paced_sends.len() {
+                let mut bytes = 0u128;
+                for &(t, size) in &paced_sends[i..] {
+                    bytes += size as u128;
+                    let window_ns = (t - paced_sends[i].0) as u128;
+                    let allowed = burst + (window_ns * rate as u128).div_ceil(1_000_000_000);
+                    assert!(
+                        bytes <= allowed,
+                        "seed {seed}: {bytes} paced bytes in {window_ns} ns, allowed {allowed}"
+                    );
+                }
+            }
+        });
+    }
+}

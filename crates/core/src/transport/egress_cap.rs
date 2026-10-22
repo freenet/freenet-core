@@ -241,13 +241,24 @@ impl EgressCap {
         empty_at.max(now.saturating_sub(self.burst_ns))
     }
 
-    /// Charge a datagram sent without pacing. The bucket may go into debt;
-    /// debt beyond [`DEBT_LIMIT`] is forgiven.
+    /// Charge a datagram sent without pacing. The bucket may go into debt,
+    /// but an unpaced charge never takes `empty_at_ns` past
+    /// `now + DEBT_LIMIT`; whatever it cannot add is forgiven.
+    ///
+    /// It also never moves `empty_at_ns` earlier. Paced reservations may
+    /// already reach past `now + DEBT_LIMIT` (many queued streams), and their
+    /// holders still send at the times they were given; moving the value back
+    /// would hand the same times to new reservations and let the node send
+    /// one datagram per queued stream per slot, above the cap.
     pub(crate) fn charge_unpaced(&self, bytes: usize) {
         let cost = self.cost_ns(bytes as u64);
         let (old, new, now) = self.update(|empty_at, now| {
-            let charged = self.refilled(empty_at, now).saturating_add(cost);
-            charged.min(now.saturating_add(self.debt_limit_ns))
+            let refilled = self.refilled(empty_at, now);
+            refilled.max(
+                refilled
+                    .saturating_add(cost)
+                    .min(now.saturating_add(self.debt_limit_ns)),
+            )
         });
         // Recomputed from the value the committed update started from, since
         // the closure may run more than once.
