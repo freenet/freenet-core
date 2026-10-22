@@ -188,6 +188,7 @@ pub fn get_open_connection_count() -> usize {
 mod boundary;
 pub mod connection_handler;
 mod crypto;
+pub(crate) mod demux;
 pub mod in_memory_socket;
 
 /// Mock transport infrastructure for testing and benchmarking.
@@ -352,6 +353,8 @@ pub(crate) use self::connection_handler::ExpectedInboundTracker;
 pub use self::connection_handler::create_connection_handler;
 pub(crate) use self::connection_handler::{UdpTransportConfig, open_udp_transport};
 pub use self::crypto::{TransportKeypair, TransportPublicKey};
+/// Returned (wrapped around the socket type) by [`create_connection_handler`].
+pub use self::demux::DemuxSocket;
 pub use self::{
     connection_handler::{InboundConnectionHandler, OutboundConnectionHandler},
     peer_connection::PeerConnection,

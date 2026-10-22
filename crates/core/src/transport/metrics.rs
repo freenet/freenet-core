@@ -141,6 +141,23 @@ labelled_counters! {
 }
 
 labelled_counters! {
+    /// How the demultiplexer classified an inbound datagram by its first
+    /// byte. Exactly one per datagram received; exported per period as
+    /// `demux_<label>`.
+    pub(crate) enum DemuxClass {
+        /// First byte is a type byte the UDP transport uses (`0x01` or
+        /// `0x02`). Passed on to the listener unchanged.
+        Legacy => "legacy",
+        /// First byte has the QUIC fixed bit or long-header bit set (mask
+        /// `0xC0`) and is not a UDP transport type byte. Dropped until the
+        /// QUIC endpoint exists.
+        Quic => "quic",
+        /// Anything else, including an empty datagram. Dropped.
+        Other => "other",
+    }
+}
+
+labelled_counters! {
     /// How long a CONNECT joiner held an acceptor in its dial queue between
     /// the acceptor's Response arriving and the dial being dispatched. The
     /// acceptor starts punching when it accepts and gives up after
@@ -331,6 +348,11 @@ pub struct TransportMetrics {
     /// CONNECT joiner acceptor dials by time spent queued, by
     /// [`DialQueueWait`] (reset each snapshot).
     dial_queue_wait: [AtomicU32; DialQueueWait::COUNT],
+
+    /// Inbound datagrams by [`DemuxClass`] (reset each snapshot). Counts
+    /// every datagram the socket wrapper receives, legacy ones included, so
+    /// the legacy share is visible.
+    demux_packets: [AtomicU64; DemuxClass::COUNT],
 }
 
 /// Period counters for packet loss, retransmission and standalone-ACK
@@ -397,6 +419,12 @@ struct NatDetailCounters {
     #[cfg(test)]
     dial_queue_waits_by_remote:
         parking_lot::Mutex<std::collections::VecDeque<(SocketAddr, DialQueueWait)>>,
+    /// Test-only record of demultiplexed datagrams, kept only for the
+    /// remotes a test registered with `watch_demux`. Unwatched traffic costs
+    /// one lookup, so busy parallel tests cannot evict a watching test's
+    /// entries.
+    #[cfg(test)]
+    demux_watched: DashMap<SocketAddr, Vec<DemuxClass>>,
     /// Test-only log of dropped stray intros `(remote, kind)` (bounded).
     #[cfg(test)]
     stray_intros_by_remote:
@@ -618,6 +646,7 @@ impl TransportMetrics {
             stray_intros: Default::default(),
             stray_intro_failures_evicted: AtomicU32::new(0),
             dial_queue_wait: Default::default(),
+            demux_packets: Default::default(),
         }
     }
 
@@ -761,6 +790,27 @@ impl TransportMetrics {
             .filter(|(addr, _)| *addr == remote)
             .map(|(_, kind)| *kind)
             .collect()
+    }
+
+    /// Test-only: start recording the demultiplexer class of every datagram
+    /// from `remote`. Call before the datagrams are sent. Starts an empty
+    /// record, discarding one left by an earlier watcher of the same address;
+    /// two tests watching one address at the same time still interfere, so
+    /// each test must use addresses no other test uses.
+    #[cfg(test)]
+    pub(crate) fn watch_demux(&self, remote: SocketAddr) {
+        self.nat_detail.demux_watched.insert(remote, Vec::new());
+    }
+
+    /// Test-only: the demultiplexer classes recorded, in order, for datagrams
+    /// from a `remote` registered with `watch_demux`.
+    #[cfg(test)]
+    pub(crate) fn demux_from(&self, remote: SocketAddr) -> Vec<DemuxClass> {
+        self.nat_detail
+            .demux_watched
+            .get(&remote)
+            .map(|classes| classes.clone())
+            .unwrap_or_default()
     }
 
     /// Test-only: whether `reporter` has reported our external address.
@@ -1017,6 +1067,18 @@ impl TransportMetrics {
         #[cfg(not(test))]
         let _ = remote;
         self.stray_intros[kind as usize].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record one inbound datagram from `remote` and how the demultiplexer
+    /// classified it (`remote` is never exported).
+    pub(crate) fn record_demux(&self, remote: SocketAddr, class: DemuxClass) {
+        #[cfg(test)]
+        if let Some(mut watched) = self.nat_detail.demux_watched.get_mut(&remote) {
+            watched.push(class);
+        }
+        #[cfg(not(test))]
+        let _ = remote;
+        self.demux_packets[class as usize].fetch_add(1, Ordering::Relaxed);
     }
 
     /// Record `n` recent traversal failures the listener forgot early
@@ -1329,6 +1391,7 @@ impl TransportMetrics {
         let established = &self.nat_established_by_origin;
         let stray = &self.stray_intros;
         let wait = &self.dial_queue_wait;
+        let demux = &self.demux_packets;
         SnapshotExtras {
             packets_sent: get64(&l.packets_sent),
             packets_retransmitted: get64(&l.packets_retransmitted),
@@ -1403,6 +1466,9 @@ impl TransportMetrics {
             dial_queue_wait_lt_1s: get32(&wait[DialQueueWait::Lt1S as usize]),
             dial_queue_wait_lt_3s: get32(&wait[DialQueueWait::Lt3S as usize]),
             dial_queue_wait_ge_3s: get32(&wait[DialQueueWait::Ge3S as usize]),
+            demux_legacy: get64(&demux[DemuxClass::Legacy as usize]),
+            demux_quic: get64(&demux[DemuxClass::Quic as usize]),
+            demux_other: get64(&demux[DemuxClass::Other as usize]),
         }
     }
 
@@ -1808,6 +1874,12 @@ pub struct TransportSnapshot {
     pub dial_queue_wait_lt_1s: u32,
     pub dial_queue_wait_lt_3s: u32,
     pub dial_queue_wait_ge_3s: u32,
+    /// Inbound datagrams during the period by how the demultiplexer
+    /// classified their first byte, by [`DemuxClass`]. Quic and other
+    /// datagrams are dropped; legacy ones are passed on.
+    pub demux_legacy: u64,
+    pub demux_quic: u64,
+    pub demux_other: u64,
 }
 
 /// Per-connection RTT distribution fields of [`TransportSnapshot`]; see the
@@ -1883,6 +1955,9 @@ impl TransportSnapshot {
             dial_queue_wait_lt_1s,
             dial_queue_wait_lt_3s,
             dial_queue_wait_ge_3s,
+            demux_legacy,
+            demux_quic,
+            demux_other,
         } = extras;
         self.conn_rtt_connections = conn_rtt_connections;
         self.conn_srtt_p50_us = conn_srtt_p50_us;
@@ -1936,6 +2011,9 @@ impl TransportSnapshot {
         self.dial_queue_wait_lt_1s = dial_queue_wait_lt_1s;
         self.dial_queue_wait_lt_3s = dial_queue_wait_lt_3s;
         self.dial_queue_wait_ge_3s = dial_queue_wait_ge_3s;
+        self.demux_legacy = demux_legacy;
+        self.demux_quic = demux_quic;
+        self.demux_other = demux_other;
         self
     }
 }
@@ -2052,6 +2130,12 @@ struct SnapshotExtras {
     pub dial_queue_wait_lt_1s: u32,
     pub dial_queue_wait_lt_3s: u32,
     pub dial_queue_wait_ge_3s: u32,
+    /// Inbound datagrams during the period by how the demultiplexer
+    /// classified their first byte, by [`DemuxClass`]. Quic and other
+    /// datagrams are dropped; legacy ones are passed on.
+    pub demux_legacy: u64,
+    pub demux_quic: u64,
+    pub demux_other: u64,
 }
 
 impl SnapshotExtras {
@@ -2096,6 +2180,9 @@ impl SnapshotExtras {
             || self.dial_queue_wait_lt_1s != 0
             || self.dial_queue_wait_lt_3s != 0
             || self.dial_queue_wait_ge_3s != 0
+            || self.demux_legacy != 0
+            || self.demux_quic != 0
+            || self.demux_other != 0
     }
 }
 
@@ -2957,6 +3044,7 @@ mod tests {
         );
         check(&StrayIntro::ALL, |v| v as usize, StrayIntro::label);
         check(&DialQueueWait::ALL, |v| v as usize, DialQueueWait::label);
+        check(&DemuxClass::ALL, |v| v as usize, DemuxClass::label);
     }
 
     /// The snapshot fields carrying an origin's period attempts and
@@ -2986,6 +3074,15 @@ mod tests {
             StrayIntro::AfterDeadline => snap.stray_intro_after_deadline,
             StrayIntro::SameIpOtherPort => snap.stray_intro_same_ip_other_port,
             StrayIntro::Other => snap.stray_intro_other,
+        }
+    }
+
+    /// The snapshot field carrying a demultiplexer class (exhaustive).
+    fn demux_count(snap: &TransportSnapshot, class: DemuxClass) -> u64 {
+        match class {
+            DemuxClass::Legacy => snap.demux_legacy,
+            DemuxClass::Quic => snap.demux_quic,
+            DemuxClass::Other => snap.demux_other,
         }
     }
 
@@ -3068,6 +3165,25 @@ mod tests {
         assert!(metrics.take_snapshot().is_none(), "stray intros must reset");
     }
 
+    /// Demultiplexer counts reach the snapshot per class and reset with it.
+    #[test]
+    fn demux_counts_snapshot_and_reset() {
+        let metrics = TransportMetrics::new();
+        for (i, class) in DemuxClass::ALL.into_iter().enumerate() {
+            for _ in 0..=i {
+                metrics.record_demux(TEST_REMOTE, class);
+            }
+        }
+        let read = metrics.read_snapshot();
+        let snap = metrics.take_snapshot().expect("demux counts are activity");
+        for s in [&read, &snap] {
+            for (i, class) in DemuxClass::ALL.into_iter().enumerate() {
+                assert_eq!(demux_count(s, class), i as u64 + 1, "{class:?}");
+            }
+        }
+        assert!(metrics.take_snapshot().is_none(), "demux counts must reset");
+    }
+
     /// Evictions from the recent-failure table reach the snapshot, count as
     /// activity on their own, and reset.
     #[test]
@@ -3143,6 +3259,14 @@ mod tests {
                 .unwrap_or_else(|| panic!("{kind:?} alone must be activity"));
             assert_eq!(stray_count(&snap, kind), 1, "{kind:?}");
         }
+        for class in DemuxClass::ALL {
+            let metrics = TransportMetrics::new();
+            metrics.record_demux(TEST_REMOTE, class);
+            let snap = metrics
+                .take_snapshot()
+                .unwrap_or_else(|| panic!("{class:?} alone must be activity"));
+            assert_eq!(demux_count(&snap, class), 1, "{class:?}");
+        }
         for bucket in DialQueueWait::ALL {
             let metrics = TransportMetrics::new();
             metrics.dial_queue_wait[bucket as usize].fetch_add(1, Ordering::Relaxed);
@@ -3164,6 +3288,9 @@ mod tests {
         }
         for kind in StrayIntro::ALL {
             keys.push(format!("stray_intro_{}", kind.label()));
+        }
+        for class in DemuxClass::ALL {
+            keys.push(format!("demux_{}", class.label()));
         }
         for bucket in DialQueueWait::ALL {
             keys.push(format!("dial_queue_wait_{}", bucket.label()));
@@ -3371,6 +3498,9 @@ mod tests {
             "dial_queue_wait_lt_1s",
             "dial_queue_wait_lt_3s",
             "dial_queue_wait_ge_3s",
+            "demux_legacy",
+            "demux_quic",
+            "demux_other",
         ] {
             assert!(obj.contains_key(key), "missing key {key}");
         }

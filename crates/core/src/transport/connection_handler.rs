@@ -33,6 +33,7 @@ use super::{
     Socket, TransportError, UdpError, UdpErrorKind,
     congestion_control::{CongestionControl, CongestionControlConfig},
     crypto::{TransportKeypair, TransportPublicKey},
+    demux::DemuxSocket,
     global_bandwidth::GlobalBandwidthManager,
     packet_data::{
         MAX_PACKET_SIZE, MAX_RECV_PACKET_SIZE as RECV_BUF_SIZE, PacketData, SymmetricAES,
@@ -158,8 +159,8 @@ pub async fn create_connection_handler<S: Socket>(
     ack_version_floor_override: Option<(u8, u8, u16)>,
 ) -> Result<
     (
-        OutboundConnectionHandler<S>,
-        InboundConnectionHandler<S>,
+        OutboundConnectionHandler<DemuxSocket<S>>,
+        InboundConnectionHandler<DemuxSocket<S>>,
         tokio::task::JoinHandle<TransportError>,
     ),
     TransportError,
@@ -203,13 +204,18 @@ type UdpListenerParts<S> = (
 );
 
 /// Bind the UDP socket and start its listener.
+///
+/// This is the one place the transport binds its socket, for the real UDP
+/// sockets and `SimulationSocket` alike, so it is where the socket is wrapped
+/// in [`DemuxSocket`]: everything the listener receives has passed through the
+/// first-byte split.
 async fn bind_udp_listener<S: Socket>(
     keypair: TransportKeypair,
     listen_host: IpAddr,
     listen_port: u16,
     is_gateway: bool,
     config: UdpTransportConfig,
-) -> Result<UdpListenerParts<S>, TransportError> {
+) -> Result<UdpListenerParts<DemuxSocket<S>>, TransportError> {
     // Bind the UDP socket to the specified port with retry for transient failures
     let bind_addr: SocketAddr = (listen_host, listen_port).into();
     tracing::debug!(
@@ -219,7 +225,8 @@ async fn bind_udp_listener<S: Socket>(
         "Binding UDP socket"
     );
 
-    let socket = bind_socket_with_retry::<S>(bind_addr, SOCKET_BIND_MAX_RETRIES).await?;
+    let socket =
+        bind_socket_with_retry::<DemuxSocket<S>>(bind_addr, SOCKET_BIND_MAX_RETRIES).await?;
 
     tracing::info!(
         target: "freenet_core::transport::send_debug",

@@ -2873,6 +2873,15 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                 "dial_queue_wait_ge_3s".into(),
                 serde_json::json!(snapshot.dial_queue_wait_ge_3s),
             );
+            m.insert(
+                "demux_legacy".into(),
+                serde_json::json!(snapshot.demux_legacy),
+            );
+            m.insert("demux_quic".into(), serde_json::json!(snapshot.demux_quic));
+            m.insert(
+                "demux_other".into(),
+                serde_json::json!(snapshot.demux_other),
+            );
             serde_json::Value::Object(m)
         }
         EventKind::InterestSync(interest_sync_event) => {
@@ -6535,6 +6544,9 @@ mod tests {
             dial_queue_wait_lt_1s: 15,
             dial_queue_wait_lt_3s: 16,
             dial_queue_wait_ge_3s: 17,
+            demux_legacy: 19,
+            demux_quic: 20,
+            demux_other: 21,
             ..Default::default()
         };
         let reference = serde_json::to_value(&snapshot).unwrap();
@@ -6556,6 +6568,9 @@ mod tests {
             ("dial_queue_wait_lt_1s", 15),
             ("dial_queue_wait_lt_3s", 16),
             ("dial_queue_wait_ge_3s", 17),
+            ("demux_legacy", 19),
+            ("demux_quic", 20),
+            ("demux_other", 21),
         ] {
             assert_eq!(json[key], expected, "event-log value for {key}");
             assert_eq!(json[key], reference[key], "serde value for {key}");
