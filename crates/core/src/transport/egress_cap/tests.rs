@@ -685,48 +685,35 @@ fn a_release_returns_only_the_slot_not_yet_passed() {
 
 /// Regression for a slot the bucket has refilled over. Holds whose slots
 /// passed while their senders were held up (say, waiting for cwnd) must not
-/// all go out free when they are finally sent together: each late datagram
-/// is charged for its lateness, so the sends that follow wait, and the
-/// window bound holds over everything sent.
+/// go out free when they are finally sent together: each late datagram is
+/// charged again, at its real size, so the next paced sender waits for all
+/// of them. (The late datagrams themselves leave at once: settling cannot
+/// delay a send. That is why a hold must never be kept through another
+/// wait; this test pins only that the accounting does not lose them.)
 #[test]
-fn late_settles_are_charged_and_keep_the_window_bound() {
+fn late_settles_are_charged_in_full() {
     let rate = 100_000u64;
     let (cap, time) = cap_at(rate);
-    let burst = cap.burst_bytes() as u128;
-    cap.charge_unpaced(burst as usize);
+    // 48 ms at 100 KB/s is below the floor, so the burst is 4 800 bytes.
+    const BURST: i64 = 4_800;
+    cap.charge_unpaced(BURST as usize);
     let holds: Vec<_> = (0..10).map(|_| cap.reserve(PACKET)).collect();
     // All ten slots (120 ms) pass while the senders are held up, and the
-    // bucket refills past them.
+    // bucket refills to its burst past them.
     time.advance(Duration::from_millis(500));
-    let mut sent: Vec<(u64, u64)> = Vec::new();
+    assert_eq!(cap.level_bytes(), BURST, "premise: the bucket refilled");
     for hold in holds {
         hold.settle(PACKET);
-        sent.push((time.now_nanos(), PACKET as u64));
     }
-    // Paced senders after them wait for what the late sends were charged.
-    for _ in 0..10 {
-        let hold = cap.reserve(PACKET);
-        time.advance(hold.wait());
-        hold.settle(PACKET);
-        sent.push((time.now_nanos(), PACKET as u64));
-    }
-    for i in 0..sent.len() {
-        let mut bytes = 0u128;
-        for &(t, size) in &sent[i..] {
-            bytes += size as u128;
-            let window_ns = (t - sent[i].0) as u128;
-            let allowed = burst + (window_ns * rate as u128).div_ceil(1_000_000_000);
-            assert!(
-                bytes <= allowed + 10 * PACKET as u128,
-                "{bytes} in {window_ns} ns"
-            );
-        }
-    }
-    // The ten late datagrams were charged, not absorbed by the refill.
-    assert!(
-        cap.level_bytes() <= 0,
-        "the late sends must be charged: level {}",
-        cap.level_bytes()
+    // Ten late datagrams charged against the refilled bucket.
+    assert_eq!(cap.level_bytes(), BURST - 10 * PACKET as i64);
+    let next = cap.reserve(PACKET);
+    assert_eq!(
+        next.wait(),
+        Duration::from_millis(
+            ((10 * PACKET as i64 - BURST + PACKET as i64) * 1_000 / rate as i64) as u64
+        ),
+        "the next paced send waits for all ten"
     );
 }
 
