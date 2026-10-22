@@ -3915,15 +3915,11 @@ mod egress_cap_tests {
         a_stream_fails_when_a_fragment_waits_past_the_deadline(Sender::Pipe).await;
     }
 
-    /// When the node-wide cap refuses, a fragment gives its per-connection
-    /// bytes back. Eight streams on one connection whose own bucket allows
-    /// 110 KB/s share a 100 KB/s cap: the cap refuses most attempts, and
-    /// without the give-back each refusal would also spend the connection's
-    /// bucket, which would then bind and leave the node well short of the
-    /// cap. With it, the node fills the cap: at least 95% of the refill over
-    /// the run, the burst subtracted.
+    /// Eight streams on one connection whose own bucket allows 110 KB/s
+    /// fill a 100 KB/s cap: at least 95% of the refill over the run, the
+    /// burst subtracted.
     #[tokio::test(flavor = "current_thread")]
-    async fn per_connection_bytes_are_returned_when_the_cap_refuses() {
+    async fn streams_on_one_connection_fill_the_cap() {
         const RATE: u64 = 100_000;
         let _seed = GlobalRng::seed_guard(12);
         let time = VirtualTime::new();
@@ -3960,5 +3956,46 @@ mod egress_cap_tests {
         let bytes = datagrams.iter().map(|d| d.1 as u64).sum::<u64>() - burst;
         let share = bytes as f64 / (RATE as f64 * elapsed);
         assert!(share >= 0.95, "{:.1}% of the cap's refill", share * 100.0);
+    }
+
+    /// A connection is never charged for a datagram the node-wide cap
+    /// refused: while a fragment sleeps on a refusal, its connection's
+    /// bucket is as full as before the attempt.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_refused_fragment_leaves_its_connections_bucket_untouched() {
+        let _seed = GlobalRng::seed_guard(13);
+        let time = VirtualTime::new();
+        let cap = EgressCap::new(1_000_000, time.clone());
+        // A second of debt: the first fragment is refused for about 1 s.
+        cap.charge_unpaced(2_000_000);
+        let socket = Arc::new(DemuxSocket::wrap(
+            RecordingSocket::new(&time, None),
+            Some(cap),
+        ));
+        let bucket = Arc::new(TokenBucket::new_with_time_source(
+            PER_CONNECTION_BURST,
+            PER_CONNECTION,
+            time.clone(),
+        ));
+        let task = spawn_stream(
+            StreamSpec {
+                sender: Sender::Send,
+                fragments: 2,
+                port: 20_000,
+                congestion: window(1_000_000_000, &time),
+                bucket: bucket.clone(),
+            },
+            &socket,
+            &time,
+        );
+        // Let the stream reach its first refusal and park on it, without
+        // moving the clock.
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+        }
+        assert!(sent(&socket).is_empty(), "premise: the cap refused");
+        assert!(!task.is_finished(), "premise: the stream is waiting");
+        assert_eq!(bucket.available_tokens(), PER_CONNECTION_BURST);
+        task.abort();
     }
 }
