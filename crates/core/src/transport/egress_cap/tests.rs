@@ -369,6 +369,16 @@ fn simulate(
             Ok(take) => {
                 take.sent(PACKET);
                 sends.push((at, PACKET as u64, Some(stream)));
+                // A cap that admits more than the bucket can give would
+                // otherwise make the simulation spin at one instant.
+                let admissible = (cap.burst_bytes() as u128
+                    + at as u128 * rate as u128 / 1_000_000_000)
+                    / PACKET as u128
+                    + 1;
+                assert!(
+                    (sends.iter().filter(|s| s.2.is_some()).count() as u128) <= admissible,
+                    "more paced sends than the cap admits by {at} ns"
+                );
                 next[i] = (at, stream, Duration::ZERO);
             }
             Err(wait) => {
