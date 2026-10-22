@@ -98,8 +98,13 @@ not sent. The deadline also applies to the first fragment, which the receiver
 does not time (its 5 s timer starts when fragment #1 arrives; before that it
 waits up to STREAM_CLAIM_TIMEOUT, 60 s). That is deliberate admission control:
 a stream that cannot get one slot in 5 s fails fast and the operation retries.
-In pipe_stream, time waiting on the upstream stream counts toward the gap and
-is attributed to `other`. The take is PACED_TAKE_BYTES (MAX_PACKET_SIZE); the socket
+In pipe_stream the first gap starts when the first upstream chunk arrives
+(pipe_stream's own 5 s upstream inactivity select bounds that wait), and
+from fragment #2 on, time waiting on the upstream stream counts toward the
+gap and is attributed to `other`. On capped nodes a stream that hits the
+paced deadline while cwnd-limited is counted in egress_streams_abandoned_*,
+not in the cwnd-abort counter (stream_send_abort_cwnd); a cwnd timeout
+(CWND_WAIT_TIMEOUT, 3 s) that comes first is still counted there. The take is PACED_TAKE_BYTES (MAX_PACKET_SIZE); the socket
 returns what the datagram did not use (Socket::send_to_paced), and all of it
 on a failed send. Without a cap the per-connection bucket keeps its old
 reserve-and-sleep path. Everything else goes through plain send_to and is

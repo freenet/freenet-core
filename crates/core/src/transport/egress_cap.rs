@@ -52,7 +52,7 @@
 //! control. Gaps that reach [`LONG_WAIT`] and failed streams are counted by
 //! what took most of the gap: the cap, the connection's own bucket (whose
 //! rate is the cap divided among the connections), or something else such
-//! as cwnd or the upstream stream of a relayed stream
+//! as cwnd or, from a relayed stream's second fragment on, the upstream stream
 //! (`egress_long_waits_<cause>`, `egress_streams_abandoned_<cause>`), and
 //! each kind is logged at WARN with its remedy, at most once per
 //! [`LONG_WAIT_WARN_INTERVAL`].
@@ -98,11 +98,12 @@ pub(crate) const LONG_WAIT: Duration =
     Duration::from_millis(STREAM_INACTIVITY_TIMEOUT.as_millis() as u64 / 2);
 
 /// With a cap, a stream whose next fragment has not been sent this long
-/// after its previous one (or after the stream started) fails: the receiver
+/// after its previous one (or after the stream started; for a relayed stream, after its first upstream chunk arrived) fails: the receiver
 /// gives up a stream after the same gap between fragments and is never told
 /// the sender is still trying, so waiting longer only spends the shared cap
 /// on a stream nobody will finish. The gap counts every wait (the cap, the
-/// connection's bucket, cwnd, and for a relayed stream the upstream stream),
+/// connection's bucket, cwnd, and for a relayed stream, from its second
+/// fragment on, the upstream stream),
 /// as the receiver's does.
 ///
 /// For a stream's first fragment this is stricter than the receiver: it
@@ -459,7 +460,8 @@ impl EgressCap {
                     stream_inactivity_timeout_ms = STREAM_INACTIVITY_TIMEOUT.as_millis() as u64,
                     remedy = remedy(cause),
                     "Stream fragments have waited this long since the stream's previous \
-                     fragment; at stream_inactivity_timeout_ms the stream fails"
+                     fragment; the stream fails at stream_inactivity_timeout_ms or at the \
+                     cwnd wait timeout, whichever comes first"
                 );
             }
         }
