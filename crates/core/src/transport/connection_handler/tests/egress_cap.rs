@@ -171,6 +171,8 @@ async fn handshake_completes_promptly_with_the_egress_bucket_in_full_debt() {
 /// happened cannot pass by saying nothing about it. The joiner drops its own
 /// sends 10..40 so some of its short messages are lost and retransmitted.
 #[tokio::test(start_paused = true)]
+// `PacketDropPolicy::Ranges` takes a list of ranges; one range is meant.
+#[allow(clippy::single_range_in_vec_init)]
 async fn control_traffic_never_waits_for_the_egress_cap() {
     let channels: Channels = Arc::new(DashMap::new());
     let Pair {
