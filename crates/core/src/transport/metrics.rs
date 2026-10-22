@@ -389,8 +389,11 @@ struct EgressCounters {
     /// Sum and maximum of the waits, in microseconds.
     wait_us_sum: AtomicU64,
     wait_us_max: AtomicU64,
-    /// Paced datagrams that waited at least `egress_cap::LONG_WAIT`.
+    /// Paced fragments whose waits reached `egress_cap::LONG_WAIT`.
     long_waits: AtomicU64,
+    /// Streams failed because one fragment waited
+    /// `egress_cap::PACED_WAIT_DEADLINE`.
+    streams_abandoned: AtomicU64,
     /// Largest unpaced debt after a charge, in bytes.
     debt_hwm_bytes: AtomicU64,
     /// Unpaced bytes forgiven because the debt reached the debt limit.
@@ -1126,17 +1129,8 @@ impl TransportMetrics {
 
     /// Record one datagram charged to the node-wide egress cap, how it was
     /// paced, its size and how long it waited (microseconds).
-    pub(crate) fn record_egress(
-        &self,
-        decision: EgressDecision,
-        bytes: u64,
-        wait_us: u64,
-        long_wait: bool,
-    ) {
+    pub(crate) fn record_egress(&self, decision: EgressDecision, bytes: u64, wait_us: u64) {
         let e = &self.egress;
-        if long_wait {
-            e.long_waits.fetch_add(1, Ordering::Relaxed);
-        }
         e.packets[decision as usize].fetch_add(1, Ordering::Relaxed);
         e.bytes.fetch_add(bytes, Ordering::Relaxed);
         if wait_us > 0 {
@@ -1144,6 +1138,19 @@ impl TransportMetrics {
             e.wait_us_sum.fetch_add(wait_us, Ordering::Relaxed);
             e.wait_us_max.fetch_max(wait_us, Ordering::Relaxed);
         }
+    }
+
+    /// Record a paced fragment whose waits reached `egress_cap::LONG_WAIT`.
+    pub(crate) fn record_egress_long_wait(&self) {
+        self.egress.long_waits.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record a stream failed because a fragment waited
+    /// `egress_cap::PACED_WAIT_DEADLINE` for the egress cap.
+    pub(crate) fn record_egress_stream_abandoned(&self) {
+        self.egress
+            .streams_abandoned
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     /// Record the egress cap's unpaced debt after a charge, in bytes.
@@ -1557,6 +1564,7 @@ impl TransportMetrics {
             egress_wait_us_sum: get64(&egress.wait_us_sum),
             egress_wait_us_max: get64(&egress.wait_us_max),
             egress_long_waits: get64(&egress.long_waits),
+            egress_streams_abandoned: get64(&egress.streams_abandoned),
             egress_debt_hwm_bytes: get64(&egress.debt_hwm_bytes),
             egress_debt_forgiven_bytes: get64(&egress.debt_forgiven_bytes),
         }
@@ -1973,7 +1981,8 @@ pub struct TransportSnapshot {
     /// Datagrams sent during the period by how the node-wide egress cap
     /// paced them, by [`EgressDecision`], with their bytes, the bytes and
     /// total and longest wait (microseconds) of those that waited, the
-    /// number of waits of at least `egress_cap::LONG_WAIT` (2.5 s), the
+    /// number of fragments whose waits reached `egress_cap::LONG_WAIT`
+    /// (2.5 s), the streams failed because a fragment waited 5 s, the
     /// largest unpaced debt in bytes, and the unpaced bytes forgiven
     /// (sent, not charged) at the debt limit.
     /// All zero unless `total-bandwidth-limit` is set.
@@ -1985,6 +1994,7 @@ pub struct TransportSnapshot {
     pub egress_wait_us_sum: u64,
     pub egress_wait_us_max: u64,
     pub egress_long_waits: u64,
+    pub egress_streams_abandoned: u64,
     pub egress_debt_hwm_bytes: u64,
     pub egress_debt_forgiven_bytes: u64,
 }
@@ -2073,6 +2083,7 @@ impl TransportSnapshot {
             egress_wait_us_sum,
             egress_wait_us_max,
             egress_long_waits,
+            egress_streams_abandoned,
             egress_debt_hwm_bytes,
             egress_debt_forgiven_bytes,
         } = extras;
@@ -2139,6 +2150,7 @@ impl TransportSnapshot {
         self.egress_wait_us_sum = egress_wait_us_sum;
         self.egress_wait_us_max = egress_wait_us_max;
         self.egress_long_waits = egress_long_waits;
+        self.egress_streams_abandoned = egress_streams_abandoned;
         self.egress_debt_hwm_bytes = egress_debt_hwm_bytes;
         self.egress_debt_forgiven_bytes = egress_debt_forgiven_bytes;
         self
@@ -2266,7 +2278,8 @@ struct SnapshotExtras {
     /// Datagrams sent during the period by how the node-wide egress cap
     /// paced them, by [`EgressDecision`], with their bytes, the bytes and
     /// total and longest wait (microseconds) of those that waited, the
-    /// number of waits of at least `egress_cap::LONG_WAIT` (2.5 s), the
+    /// number of fragments whose waits reached `egress_cap::LONG_WAIT`
+    /// (2.5 s), the streams failed because a fragment waited 5 s, the
     /// largest unpaced debt in bytes, and the unpaced bytes forgiven
     /// (sent, not charged) at the debt limit.
     /// All zero unless `total-bandwidth-limit` is set.
@@ -2278,6 +2291,7 @@ struct SnapshotExtras {
     pub egress_wait_us_sum: u64,
     pub egress_wait_us_max: u64,
     pub egress_long_waits: u64,
+    pub egress_streams_abandoned: u64,
     pub egress_debt_hwm_bytes: u64,
     pub egress_debt_forgiven_bytes: u64,
 }
@@ -2327,12 +2341,13 @@ impl SnapshotExtras {
             || self.demux_legacy != 0
             || self.demux_quic != 0
             || self.demux_other != 0
-            // The debt high-water mark and the long-wait count alone are
-            // not activity: both are only set by a charge, which also counts
-            // a packet.
+            // The debt high-water mark alone is not activity: it is only set
+            // by a charge, which also counts a packet.
             || self.egress_immediate != 0
             || self.egress_waited != 0
             || self.egress_unpaced != 0
+            || self.egress_long_waits != 0
+            || self.egress_streams_abandoned != 0
             || self.egress_debt_forgiven_bytes != 0
     }
 }
@@ -3356,10 +3371,13 @@ mod tests {
                     EgressDecision::Waited => 300,
                     EgressDecision::Immediate | EgressDecision::Unpaced => 0,
                 };
-                metrics.record_egress(decision, 100, wait_us, false);
+                metrics.record_egress(decision, 100, wait_us);
             }
         }
-        metrics.record_egress(EgressDecision::Waited, 100, 3_000_000, true);
+        metrics.record_egress(EgressDecision::Waited, 100, 3_000_000);
+        metrics.record_egress_long_wait();
+        metrics.record_egress_stream_abandoned();
+        metrics.record_egress_stream_abandoned();
         metrics.record_egress_debt(5_000);
         metrics.record_egress_debt(2_000);
         metrics.record_egress_forgiven(7);
@@ -3375,6 +3393,7 @@ mod tests {
             assert_eq!(s.egress_wait_us_sum, 2 * 300 + 3_000_000);
             assert_eq!(s.egress_wait_us_max, 3_000_000);
             assert_eq!(s.egress_long_waits, 1);
+            assert_eq!(s.egress_streams_abandoned, 2);
             assert_eq!(s.egress_debt_hwm_bytes, 5_000);
             assert_eq!(s.egress_debt_forgiven_bytes, 7);
         }
@@ -3463,7 +3482,7 @@ mod tests {
         }
         for decision in EgressDecision::ALL {
             let metrics = TransportMetrics::new();
-            metrics.record_egress(decision, 1, 0, false);
+            metrics.record_egress(decision, 1, 0);
             let snap = metrics
                 .take_snapshot()
                 .unwrap_or_else(|| panic!("{decision:?} alone must be activity"));
@@ -3730,6 +3749,7 @@ mod tests {
             "egress_wait_us_sum",
             "egress_wait_us_max",
             "egress_long_waits",
+            "egress_streams_abandoned",
             "egress_debt_hwm_bytes",
             "egress_debt_forgiven_bytes",
         ] {

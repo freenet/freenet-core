@@ -4,7 +4,8 @@
 //! When `total-bandwidth-limit` is set, [`DemuxSocket`](super::DemuxSocket)
 //! owns one [`EgressCap`] and charges it for every datagram it sends:
 //! handshakes, ACKs, keepalives, retransmissions, short messages and stream
-//! fragments. Without the setting there is no cap and no cost beyond one
+//! fragments. It counts UDP payload bytes; IP and UDP headers are not
+//! counted. Without the setting there is no cap and no cost beyond one
 //! `Option` check per send.
 //!
 //! # Who waits and who does not
@@ -13,10 +14,13 @@
 //! bucket. After cwnd admission and the per-connection bucket they call
 //! [`try_take`]: if the bucket holds a datagram's worth, the bytes are taken
 //! and the fragment is sent at once; otherwise the task sleeps for the
-//! deficit at the cap rate (with jitter) and starts admission again from the
-//! cwnd check. Nothing is reserved while it sleeps, so a waiting stream holds
-//! no capacity, and there is no order among waiting streams: whichever wakes
-//! when the bucket has enough takes it.
+//! deficit at the cap rate (see [`jittered`]) and starts admission again from
+//! the cwnd check. Nothing is reserved while it sleeps, so a waiting stream
+//! holds no capacity. The order among waiting streams is random: whichever
+//! wakes when the bucket has enough takes it. So connections share the cap
+//! in proportion to their number of waiting streams; there is no isolation
+//! between connections, and a peer driving many streams gets a
+//! proportional share.
 //!
 //! Every other send is sent at once and charged after it is sent, even when
 //! the bucket is empty, which puts the bucket into debt. Paced senders then
@@ -31,19 +35,21 @@
 //! # What the cap guarantees
 //!
 //! Over any interval of length `t` ending at a paced send, the node sends at
-//! most `B + R * t` bytes (burst `B`, rate `R`), unpaced bytes included: a
-//! paced send needs a non-negative level. Over other intervals it may send
-//! more by the unpaced debt not yet paid off, which is at most [`DEBT_LIMIT`]
-//! of the rate; an unpaced send beyond that is sent but not charged
-//! (forgiven, and counted).
+//! most `B + R * t` bytes (burst `B`, rate `R`), unpaced bytes included, plus
+//! the unpaced bytes forgiven in the interval: a paced send needs a
+//! non-negative level. Over other intervals it may also send the unpaced debt
+//! not yet paid off, at most [`DEBT_LIMIT`] of the rate; an unpaced send
+//! beyond that is sent but not charged (forgiven, and counted).
 //!
 //! A waiting stream gets a datagram when it wakes and finds enough in the
-//! bucket. With `n` streams at a cap of `r` bytes per second, each gets one
-//! datagram about every `n * 1200 / r` seconds on average. When that gap
-//! exceeds the receiver's `STREAM_INACTIVITY_TIMEOUT` (5 s), the receiver
-//! abandons the stream. Waits of at least [`LONG_WAIT`] are counted
-//! (`egress_long_waits`) and logged at WARN, at most once per
-//! [`LONG_WAIT_WARN_INTERVAL`].
+//! bucket, with probability about `1/n` among `n` waiting streams, so each
+//! gets one every `n * 1200 / r` seconds on average at a cap of `r` bytes per
+//! second, and longer gaps have a geometric tail. A fragment that has waited
+//! [`PACED_WAIT_DEADLINE`] (the receiver's 5 s stream inactivity timeout) in
+//! total fails its stream. Fragments whose waits reach [`LONG_WAIT`] are
+//! counted (`egress_long_waits`), failed streams too
+//! (`egress_streams_abandoned`), and both are logged at WARN, at most once
+//! per [`LONG_WAIT_WARN_INTERVAL`].
 //!
 //! # The bucket
 //!
@@ -88,6 +94,13 @@ pub(crate) const DEBT_LIMIT: Duration = Duration::from_secs(1);
 pub(crate) const LONG_WAIT: Duration =
     Duration::from_millis(STREAM_INACTIVITY_TIMEOUT.as_millis() as u64 / 2);
 
+/// A fragment that has waited this long in total for the node-wide cap and
+/// its connection's bucket fails its stream: the receiver gives up a stream
+/// after the same gap between fragments, and is never told the sender is
+/// still trying, so waiting longer only spends the shared cap on a stream
+/// nobody will finish.
+pub(crate) const PACED_WAIT_DEADLINE: Duration = STREAM_INACTIVITY_TIMEOUT;
+
 /// The long-wait warning is logged at most once per this interval.
 const LONG_WAIT_WARN_INTERVAL: Duration = Duration::from_secs(60);
 
@@ -120,8 +133,10 @@ pub(crate) struct EgressStats {
     pub wait_us_sum: u64,
     /// Longest single wait, in microseconds.
     pub wait_us_max: u64,
-    /// Paced datagrams that waited at least [`LONG_WAIT`].
+    /// Paced fragments whose waits reached [`LONG_WAIT`].
     pub long_waits: u64,
+    /// Streams failed because one fragment waited [`PACED_WAIT_DEADLINE`].
+    pub streams_abandoned: u64,
     /// Largest unpaced debt seen after a charge, in bytes.
     pub debt_hwm_bytes: u64,
     /// Unpaced bytes sent but not charged because the debt was at the limit.
@@ -137,6 +152,7 @@ struct StatCounters {
     wait_us_sum: AtomicU64,
     wait_us_max: AtomicU64,
     long_waits: AtomicU64,
+    streams_abandoned: AtomicU64,
     debt_hwm_bytes: AtomicU64,
     forgiven_bytes: AtomicU64,
 }
@@ -298,7 +314,7 @@ impl EgressCap {
                 .fetch_add(forgiven, Ordering::Relaxed);
             TRANSPORT_METRICS.record_egress_forgiven(forgiven);
         }
-        self.record_sent(EgressDecision::Unpaced, bytes as u64, Duration::ZERO, now);
+        self.record_sent(EgressDecision::Unpaced, bytes as u64, Duration::ZERO);
         let debt = self.bytes_for(new.saturating_sub(now));
         if debt > 0 {
             #[cfg(test)]
@@ -345,13 +361,12 @@ impl EgressCap {
         self.update(|empty_at, now| Some(self.refilled(empty_at.saturating_sub(cost), now)));
     }
 
-    /// Record one sent datagram, and a long wait if it had one. Production
-    /// writes only the `TRANSPORT_METRICS` period counters; the per-cap
-    /// counters exist only in tests.
-    fn record_sent(&self, decision: EgressDecision, bytes: u64, wait: Duration, now: i64) {
+    /// Record one sent datagram. Production writes only the
+    /// `TRANSPORT_METRICS` period counters; the per-cap counters exist only
+    /// in tests.
+    fn record_sent(&self, decision: EgressDecision, bytes: u64, wait: Duration) {
         let wait_us = u64::try_from(wait.as_micros()).unwrap_or(u64::MAX);
-        let long = wait >= LONG_WAIT;
-        TRANSPORT_METRICS.record_egress(decision, bytes, wait_us, long);
+        TRANSPORT_METRICS.record_egress(decision, bytes, wait_us);
         #[cfg(test)]
         {
             let s = &self.stats;
@@ -362,18 +377,32 @@ impl EgressCap {
                 s.wait_us_sum.fetch_add(wait_us, Ordering::Relaxed);
                 s.wait_us_max.fetch_max(wait_us, Ordering::Relaxed);
             }
-            if long {
-                s.long_waits.fetch_add(1, Ordering::Relaxed);
-            }
-        }
-        if long {
-            self.warn_long_wait(wait, now);
         }
     }
 
-    /// Log a long paced wait at WARN, at most once per
+    /// Record a fragment whose waits reached [`LONG_WAIT`] (once per
+    /// fragment), or that waited [`PACED_WAIT_DEADLINE`] and whose stream is
+    /// failed (`abandoned`), and log it at WARN, at most once per
     /// [`LONG_WAIT_WARN_INTERVAL`].
-    fn warn_long_wait(&self, wait: Duration, now: i64) {
+    fn record_long_wait(&self, waited: Duration, abandoned: bool) {
+        if abandoned {
+            TRANSPORT_METRICS.record_egress_stream_abandoned();
+        } else {
+            TRANSPORT_METRICS.record_egress_long_wait();
+        }
+        #[cfg(test)]
+        {
+            let counter = if abandoned {
+                &self.stats.streams_abandoned
+            } else {
+                &self.stats.long_waits
+            };
+            counter.fetch_add(1, Ordering::Relaxed);
+        }
+        self.warn_long_wait(waited, abandoned, self.now());
+    }
+
+    fn warn_long_wait(&self, waited: Duration, abandoned: bool, now: i64) {
         let interval = i64::try_from(LONG_WAIT_WARN_INTERVAL.as_nanos()).unwrap_or(i64::MAX);
         let last = self.last_long_wait_warn_ns.load(Ordering::Relaxed);
         if last != i64::MIN && now.saturating_sub(last) < interval {
@@ -387,13 +416,15 @@ impl EgressCap {
             return;
         }
         tracing::warn!(
-            wait_ms = wait.as_millis() as u64,
+            waited_ms = waited.as_millis() as u64,
+            stream_abandoned = abandoned,
             total_bandwidth_limit = self.rate_bytes_per_sec,
             stream_inactivity_timeout_ms = STREAM_INACTIVITY_TIMEOUT.as_millis() as u64,
             "A stream fragment waited this long for the node-wide egress cap \
              (total-bandwidth-limit): too many concurrent streams for the cap. \
-             Receivers abandon a stream after a gap of stream_inactivity_timeout_ms \
-             between its fragments; raise total-bandwidth-limit if transfers fail"
+             A fragment that waits stream_inactivity_timeout_ms fails its stream \
+             (stream_abandoned), as the receiver would give it up anyway; raise \
+             total-bandwidth-limit if transfers fail"
         );
     }
 
@@ -418,6 +449,7 @@ impl EgressCap {
             wait_us_sum: load(&s.wait_us_sum),
             wait_us_max: load(&s.wait_us_max),
             long_waits: load(&s.long_waits),
+            streams_abandoned: load(&s.streams_abandoned),
             debt_hwm_bytes: load(&s.debt_hwm_bytes),
             forgiven_bytes: load(&s.forgiven_bytes),
         }
@@ -437,8 +469,7 @@ impl EgressTake<'_> {
         } else {
             EgressDecision::Waited
         };
-        this.cap
-            .record_sent(decision, sent, this.waited, this.cap.now());
+        this.cap.record_sent(decision, sent, this.waited);
     }
 }
 
@@ -461,9 +492,9 @@ impl fmt::Debug for EgressTake<'_> {
 ///
 /// `Ok(None)`: the socket has no cap, send. `Ok(Some(take))`: the bytes were
 /// taken, send at once with [`Socket::send_to_paced`] (no await before it
-/// but the send itself). `Err(wait)`: sleep `wait` on the caller's
-/// `TimeSource`, then start admission again from the cwnd check. `waited` is
-/// how long this datagram has already slept for the cap.
+/// but the send itself). `Err(deficit)`: pass it to [`PacedWait::sleep`],
+/// then start admission again from the cwnd check. `waited` is how long this
+/// datagram has already waited.
 pub(crate) fn try_take<S: Socket>(
     socket: &S,
     waited: Duration,
@@ -471,16 +502,68 @@ pub(crate) fn try_take<S: Socket>(
     let Some(cap) = socket.egress_cap() else {
         return Ok(None);
     };
-    match cap.try_take(PACED_TAKE_BYTES, waited) {
-        Ok(take) => Ok(Some(take)),
-        Err(deficit) => Err(jittered(deficit)),
-    }
+    cap.try_take(PACED_TAKE_BYTES, waited).map(Some)
 }
 
-/// `wait` scaled by a random factor in [0.8, 1.2), so streams that found the
-/// bucket empty at the same moment do not all wake at the same moment.
-pub(crate) fn jittered(wait: Duration) -> Duration {
-    wait.mul_f64(GlobalRng::random_range(0.8f64..1.2))
+/// How long to sleep for a refused take's `deficit`: the deficit times a
+/// random factor in [1.0, 1.4), plus a random 0 to 2 ms. Never shorter than
+/// the deficit, so a lone waiter wakes when the bucket has room rather than
+/// half the time before it. The added 0 to 2 ms spreads waiters over at
+/// least two ticks of tokio's 1 ms timer, so which of them wakes first is
+/// decided by the random draw, not by the timer wheel, at any rate.
+pub(crate) fn jittered(deficit: Duration) -> Duration {
+    deficit
+        .mul_f64(GlobalRng::random_range(1.0f64..1.4))
+        .saturating_add(Duration::from_micros(GlobalRng::random_range(0..2_000)))
+}
+
+/// One paced fragment's waits: when it started waiting, whether its long
+/// wait was reported, and its deadline.
+#[derive(Default)]
+pub(crate) struct PacedWait {
+    started_ns: Option<u64>,
+    long_reported: bool,
+}
+
+impl PacedWait {
+    /// Time since this fragment first waited (zero if it has not).
+    pub(crate) fn waited<T: TimeSource>(&self, time_source: &T) -> Duration {
+        self.started_ns.map_or(Duration::ZERO, |start| {
+            Duration::from_nanos(time_source.now_nanos().saturating_sub(start))
+        })
+    }
+
+    /// Sleep for a refused take's `deficit` (jittered), on the caller's
+    /// `TimeSource`. Reports the fragment once when its waits reach
+    /// [`LONG_WAIT`]. Returns `Err(waited)` when they reach
+    /// [`PACED_WAIT_DEADLINE`]: the caller fails the stream.
+    pub(crate) async fn sleep<T: TimeSource>(
+        &mut self,
+        time_source: &T,
+        cap: Option<&EgressCap>,
+        deficit: Duration,
+    ) -> Result<(), Duration> {
+        let start = *self.started_ns.get_or_insert(time_source.now_nanos());
+        let elapsed = Duration::from_nanos(time_source.now_nanos().saturating_sub(start));
+        // Wake at the deadline, and at LONG_WAIT the first time, so both are
+        // reported when they happen even under one long deficit.
+        let mut left = PACED_WAIT_DEADLINE.saturating_sub(elapsed);
+        if !self.long_reported && elapsed < LONG_WAIT {
+            left = left.min(LONG_WAIT - elapsed);
+        }
+        time_source.sleep(jittered(deficit).min(left)).await;
+        let waited = self.waited(time_source);
+        let Some(cap) = cap else { return Ok(()) };
+        if waited >= PACED_WAIT_DEADLINE {
+            cap.record_long_wait(waited, true);
+            return Err(waited);
+        }
+        if waited >= LONG_WAIT && !self.long_reported {
+            self.long_reported = true;
+            cap.record_long_wait(waited, false);
+        }
+        Ok(())
+    }
 }
 
 /// The startup floor for a cap: [`MIN_CAP_PER_CONNECTION`] for each of

@@ -2915,6 +2915,10 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                 serde_json::json!(snapshot.egress_long_waits),
             );
             m.insert(
+                "egress_streams_abandoned".into(),
+                serde_json::json!(snapshot.egress_streams_abandoned),
+            );
+            m.insert(
                 "egress_debt_hwm_bytes".into(),
                 serde_json::json!(snapshot.egress_debt_hwm_bytes),
             );
@@ -6596,6 +6600,7 @@ mod tests {
             egress_wait_us_sum: 28,
             egress_wait_us_max: 29,
             egress_long_waits: 24,
+            egress_streams_abandoned: 33,
             egress_debt_hwm_bytes: 30,
             egress_debt_forgiven_bytes: 31,
             ..Default::default()
@@ -6632,6 +6637,7 @@ mod tests {
             ("egress_wait_us_sum", 28),
             ("egress_wait_us_max", 29),
             ("egress_long_waits", 24),
+            ("egress_streams_abandoned", 33),
             ("egress_debt_hwm_bytes", 30),
             ("egress_debt_forgiven_bytes", 31),
         ] {
