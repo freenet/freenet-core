@@ -218,6 +218,9 @@ pub struct PeerConnection<S = super::UdpSocket, T: TimeSource = RealTime> {
         FuturesUnordered<JoinHandle<(InboundStreamResult, Arc<inbound_budget::LegacyStreamToken>)>>,
     outbound_stream_futures: FuturesUnordered<JoinHandle<OutboundStreamResult>>,
     failure_count: usize,
+    /// Packets that decrypted but did not decode, over this connection's life.
+    /// The first one is logged at WARN so it is visible in release builds.
+    undecodable_count: u64,
     /// First failure time as nanoseconds since time_source epoch
     first_failure_time_nanos: Option<u64>,
     /// Last packet report time as nanoseconds since time_source epoch
@@ -1042,6 +1045,7 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
             inbound_stream_futures: FuturesUnordered::new(),
             outbound_stream_futures: FuturesUnordered::new(),
             failure_count: 0,
+            undecodable_count: 0,
             first_failure_time_nanos: None,
             last_packet_report_time_nanos: now_nanos,
             last_rate_update_nanos: None,
@@ -1342,12 +1346,24 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                     let msg = match SymmetricMessage::deser(decrypted.data()) {
                         Ok(msg) => msg,
                         Err(error) => {
-                            tracing::debug!(
-                                peer_addr = %self.remote_conn.remote_addr,
-                                error = %error,
-                                payload_len = decrypted.data().len(),
-                                "Dropping authenticated packet that does not decode"
-                            );
+                            self.undecodable_count += 1;
+                            if self.undecodable_count == 1 {
+                                tracing::warn!(
+                                    peer_addr = %self.remote_conn.remote_addr,
+                                    remote_version = ?self.remote_conn.remote_protoc_version,
+                                    error = %error,
+                                    payload_len = decrypted.data().len(),
+                                    "Dropping authenticated packet that does not decode; later ones on this connection log at debug"
+                                );
+                            } else {
+                                tracing::debug!(
+                                    peer_addr = %self.remote_conn.remote_addr,
+                                    error = %error,
+                                    payload_len = decrypted.data().len(),
+                                    undecodable_count = self.undecodable_count,
+                                    "Dropping authenticated packet that does not decode"
+                                );
+                            }
                             continue;
                         }
                     };

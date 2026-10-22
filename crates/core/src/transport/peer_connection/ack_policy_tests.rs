@@ -2753,7 +2753,8 @@ async fn an_out_of_order_legacy_stream_completes_within_its_charge() {
 async fn undecodable_authenticated_packet_is_dropped_not_fatal() {
     let mut e = single(CAPABLE);
     // Three bytes cannot hold the leading `u32` packet id, so this fails to
-    // decode whatever the payload layout is.
+    // decode whatever the payload layout is. A payload variant from a newer
+    // release fails later in decoding but takes the same error arm.
     let undecodable =
         PacketData::<_, { crate::transport::packet_data::MAX_PACKET_SIZE }>::from_buf_plain([
             0xFF, 0xFF, 0xFF,
@@ -2773,4 +2774,5 @@ async fn undecodable_authenticated_packet_is_dropped_not_fatal() {
         Some(&b"after"[..])
     );
     assert_eq!(e.conn.failure_count, 0);
+    assert_eq!(e.conn.undecodable_count, 1);
 }
