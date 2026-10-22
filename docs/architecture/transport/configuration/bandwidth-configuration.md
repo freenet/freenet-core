@@ -5,7 +5,8 @@
 The Freenet transport layer supports two bandwidth configuration modes:
 
 1. **Per-connection mode** (default): Each connection gets an independent bandwidth limit
-2. **Global pool mode**: Total bandwidth is shared fairly across all connections
+2. **Global pool mode**: Total bandwidth is shared fairly across all connections, and
+   `total-bandwidth-limit` is a node-wide cap on everything the node sends
 
 ## Quick Start
 
@@ -33,8 +34,8 @@ freenet --total-bandwidth-limit 50000000 --min-bandwidth-per-connection 1000000
 | Argument | Description | Default |
 |----------|-------------|---------|
 | `--bandwidth-limit <bytes/sec>` | Per-connection bandwidth limit | 10,000,000 (10 MB/s) |
-| `--total-bandwidth-limit <bytes/sec>` | Total bandwidth across ALL connections | None (disabled) |
-| `--min-bandwidth-per-connection <bytes/sec>` | Minimum per-connection rate (prevents starvation) | 1,000,000 (1 MB/s) |
+| `--total-bandwidth-limit <bytes/sec>` | Cap on everything the node sends over UDP, across ALL connections | None (disabled) |
+| `--min-bandwidth-per-connection <bytes/sec>` | Minimum per-connection pacing rate inside the total (clamped to the total) | 1,000,000 (1 MB/s) |
 | `--congestion-control <algorithm>` | Congestion control algorithm (`fixedrate`, `ledbat`, `bbr`) | `fixedrate` |
 | `--ledbat-min-ssthresh <bytes>` | Minimum LEDBAT ssthresh floor (for high-latency paths) | None (~5.7KB algorithm default) |
 | `--bbr-startup-rate <bytes/sec>` | BBR initial sending rate (BBR algorithm only) | 25,000,000 (25 MB/s) |
@@ -162,11 +163,56 @@ bbr-startup-rate = 10000000  # 10 MB/s for moderate startup
 
 ## Global Pool Mode Details
 
-When `total-bandwidth-limit` is configured, bandwidth is distributed using this formula:
+When `total-bandwidth-limit` is configured, two things happen.
+
+Each connection is paced at:
 
 ```
+min_per_connection = min(min-bandwidth-per-connection, total_limit)
 per_connection_rate = max(total_limit / active_connections, min_per_connection)
 ```
+
+And the node-wide egress cap holds the node's total sending rate at `total_limit`,
+whatever the per-connection rates add up to (see below).
+
+### Node-wide egress cap
+
+Every datagram the node sends on its UDP socket is charged to one token bucket of
+`total_limit` bytes per second: handshakes, ACKs, receipts, keepalive Pings, Pongs,
+retransmissions, short messages and stream fragments. The bucket holds 25 ms of the
+rate (at least four 1200-byte packets), so after an idle period the node may send that
+much at once before pacing starts. It lives in `DemuxSocket`
+(`crates/core/src/transport/demux.rs`) and `crates/core/src/transport/egress_cap.rs`.
+
+Only two kinds of send wait for the bucket:
+
+| Send | Behaviour when the bucket is empty |
+|------|------------------------------------|
+| Stream fragments (`send_stream`, `pipe_stream`) | Wait for their turn, after the per-connection token bucket. Concurrent streams are served in the order they asked. |
+| Short messages | Wait at most 20 ms, then are sent anyway. |
+| Everything else (handshakes, ACKs, receipts, keepalives, Pongs, retransmissions) | Sent at once. The bucket goes into debt, and the next stream fragments wait longer to pay it. |
+
+The sends that never wait are sent from places that must not block: the receive path
+of a connection, which runs inside a `select!` that can be cancelled, the handshake
+tasks, and the keepalive task. So the cap holds on average: over a short window the
+node can send more than the cap by the bytes of those sends in the window. Debt older
+than one second at the cap rate is forgiven (and counted as
+`egress_debt_forgiven_bytes`), so control traffic that alone exceeds the cap cannot
+stop data transfers for longer than that.
+
+Without `total-bandwidth-limit` no bucket exists and nothing changes. A
+`total-bandwidth-limit` of 0 is ignored with a warning.
+
+At startup the node logs the cap, warns if `min-bandwidth-per-connection` was above
+the total (it is clamped), and warns if the total is below 4,800 bytes/s (four
+packets) per allowed connection (`max-number-of-connections`), because the control
+traffic of a full set of connections can then use most of the cap.
+
+The `transport_snapshot` telemetry event carries, per period: `egress_immediate`,
+`egress_waited`, `egress_wait_capped` and `egress_unpaced` (datagrams by how they were
+paced), `egress_bytes`, `egress_bytes_waited`, `egress_wait_us_sum`,
+`egress_wait_us_max`, `egress_debt_hwm_bytes` and `egress_debt_forgiven_bytes`. All
+are zero without a cap.
 
 ### Example: 1 Gbps Connection
 
@@ -185,9 +231,11 @@ min-bandwidth-per-connection = 2000000     # 2 MB/s minimum
 | 10 | 10 MB/s | 100 MB/s |
 | 25 | 4 MB/s | 100 MB/s |
 | 50 | 2 MB/s (min enforced) | 100 MB/s |
-| 100 | 2 MB/s (min enforced) | 200 MB/s* |
+| 100 | 2 MB/s (min enforced) | 100 MB/s* |
 
-*When `min × connections > total`, the minimum is honored to prevent connection starvation.
+*When `min × connections > total`, each connection may still be paced at the minimum,
+but the egress cap holds the node at the total; connections then share it in the
+order they send.
 
 ### Example: Home DSL Connection
 
@@ -210,6 +258,7 @@ final_rate = min(ledbat_rate, global_pool_rate)
 - **LEDBAT** measures network conditions and adjusts rate to avoid congestion
 - **Global pool** enforces your bandwidth budget across all connections
 - The **minimum** of both rates is used
+- The **egress cap** then holds the sum over all connections at the total
 
 This means:
 - If the network is congested, LEDBAT will reduce the rate below the global limit
@@ -273,6 +322,11 @@ Rates are recalculated on an RTT-adaptive schedule:
 The default behavior (no `total-bandwidth-limit`) is unchanged:
 - Each connection gets an independent 10 MB/s limit
 - N connections can use up to N × 10 MB/s total
+- No egress cap exists
+
+Before the egress cap, `total-bandwidth-limit` only divided a per-connection rate:
+`min-bandwidth-per-connection` could take the node above it, and control traffic was
+never counted against it.
 
 ## Recommendations
 
@@ -372,14 +426,23 @@ freenet --total-bandwidth-limit 50000000 --min-bandwidth-per-connection 2000000
 
 ### Total bandwidth exceeding limit
 
-This happens when `min × connections > total`. Either:
-- Reduce `min-bandwidth-per-connection`
-- Increase `total-bandwidth-limit`
-- Accept the overage (connections won't starve)
+The egress cap holds the average at `total-bandwidth-limit`. Short bursts above it
+are the unpaced sends (ACKs, retransmissions, handshakes, keepalives); check
+`egress_unpaced`, `egress_debt_hwm_bytes` and `egress_debt_forgiven_bytes` in the
+`transport_snapshot` telemetry. Forgiven debt means control traffic alone exceeded
+the cap for more than a second: raise the total, or lower
+`max-number-of-connections`.
+
+### Transfers slow under a low total
+
+If `egress_waited` and `egress_wait_us_sum` are high, streams are waiting for the
+cap, which is the cap working. If `egress_unpaced` bytes are a large share of
+`egress_bytes`, control traffic is using most of the cap; see the startup warning.
 
 ## Source Code
 
 - **GlobalBandwidthManager**: `crates/core/src/transport/global_bandwidth.rs`
+- **Egress cap**: `crates/core/src/transport/egress_cap.rs`, charged in `crates/core/src/transport/demux.rs`
 - **TokenBucket**: `crates/core/src/transport/token_bucket.rs`
 - **LEDBAT**: `crates/core/src/transport/ledbat.rs`
 - **Configuration**: `crates/core/src/config.rs`

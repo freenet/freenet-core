@@ -2329,9 +2329,11 @@ pub struct NetworkArgs {
     #[arg(long)]
     pub bandwidth_limit: Option<usize>,
 
-    /// Total bandwidth limit across all connections, in bytes per second. Each
-    /// connection is allowed total / active_connections. Overrides the
-    /// per-connection `--bandwidth-limit`.
+    /// Cap on everything this node sends over UDP, in bytes per second,
+    /// across all connections: data, handshakes, ACKs, keepalives and
+    /// retransmissions. Each connection is also paced at
+    /// total / active_connections (at least --min-bandwidth-per-connection).
+    /// Overrides the per-connection `--bandwidth-limit`.
     #[arg(long)]
     #[serde(
         rename = "total-bandwidth-limit",
@@ -2339,9 +2341,10 @@ pub struct NetworkArgs {
     )]
     pub total_bandwidth_limit: Option<usize>,
 
-    /// Minimum bandwidth per connection when using total_bandwidth_limit (bytes/sec).
-    /// Prevents connection starvation when many connections are active.
-    /// Default: 1 MB/s (1,000,000 bytes/second)
+    /// Minimum pacing rate per connection when using total_bandwidth_limit
+    /// (bytes/sec). Prevents connection starvation when many connections are
+    /// active. Never takes the node above total_bandwidth_limit, and is
+    /// clamped to it. Default: 1 MB/s (1,000,000 bytes/second)
     #[arg(long)]
     #[serde(
         rename = "min-bandwidth-per-connection",
@@ -2585,12 +2588,18 @@ pub struct NetworkApiConfig {
     #[serde(alias = "bandwidth-limit", skip_serializing_if = "Option::is_none")]
     pub bandwidth_limit: Option<usize>,
 
-    /// Total bandwidth limit across ALL connections (in bytes per second).
-    /// When set, individual connection rates are computed as: `total / active_connections`.
+    /// Cap on everything the node sends over UDP, across ALL connections (in
+    /// bytes per second): stream data, short messages, handshakes, ACKs,
+    /// keepalives and retransmissions. Every datagram is charged to one
+    /// node-wide token bucket (`transport::egress_cap`); stream fragments and
+    /// short messages wait for it, and the rest is sent at once and paid back
+    /// by later waits, so the cap holds on average. When set, individual
+    /// connection rates are also computed as: `total / active_connections`.
     /// This overrides the per-connection `bandwidth_limit`.
     ///
     /// Example: With 50 MB/s total and 5 connections, each gets 10 MB/s.
-    /// Default: None (use per-connection `bandwidth_limit` instead)
+    /// A value of 0 is ignored (with a warning) rather than taken as a cap.
+    /// Default: None (use per-connection `bandwidth_limit` instead; no cap)
     #[serde(
         alias = "total-bandwidth-limit",
         skip_serializing_if = "Option::is_none"
@@ -2600,7 +2609,10 @@ pub struct NetworkApiConfig {
     /// Minimum bandwidth per connection when using `total_bandwidth_limit` (bytes/sec).
     /// Prevents connection starvation when many connections are active.
     ///
-    /// If `total / N < min`, each connection gets `min` (exceeding total is possible).
+    /// If `total / N < min`, each connection is paced at `min`, but the
+    /// node-wide cap still holds the node at `total`: the minimum is a pacing
+    /// floor inside the total, not an allowance above it. A minimum above the
+    /// total is clamped to the total.
     /// Default: 1 MB/s (1,000,000 bytes/second)
     #[serde(
         alias = "min-bandwidth-per-connection",

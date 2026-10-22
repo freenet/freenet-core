@@ -70,7 +70,37 @@ Per-connection mode (default):
 Global pool mode:
   → total-bandwidth-limit enables this
   → Formula: rate = max(total/connections, min_per_connection)
-  → min_per_connection prevents starvation
+  → min_per_connection prevents starvation; clamped to the total
+  → total-bandwidth-limit is ALSO a node-wide egress cap (egress_cap.rs)
+```
+
+### Node-wide egress cap (#5940 decision 3)
+
+```
+DemuxSocket owns one EgressCap (token bucket, allowed to go into debt) when
+total-bandwidth-limit is set, and charges EVERY datagram it sends. No setting
+→ no cap → one Option check per send.
+
+Only these WAIT for the bucket (egress_cap::pace, sleeping on the caller's
+TimeSource, then Socket::send_to_reserved):
+  → stream fragment tasks (send_stream, pipe_stream), after the
+    per-connection token bucket and before on_send_with_token
+  → outbound_short_message, at most SHORT_MESSAGE_MAX_WAIT (20 ms), then
+    sent into debt
+Everything else goes through plain send_to: charged at once, into debt.
+
+NEVER add a wait to: the listener loop, the handshake tasks
+(gateway_connection / traverse_nat), the keepalive task, or anything inside
+PeerConnection::recv (ACKs, Pong, receipts, retransmits, ack_ok). recv is a
+cancellable select! branch that changes state before it sends
+(answered_connection_ack, receipts taken before the NoOp).
+
+A pacing point reserves PACED_RESERVATION_BYTES (MAX_PACKET_SIZE), an upper
+bound: an under-estimate lets every queued sender go early by the shortfall
+(seen: 20 streams x 41 bytes over the bound). Debt beyond DEBT_LIMIT (1 s at
+the cap) is forgiven and counted. A quinn endpoint will need a poll-based
+admission (poll_ready + try_admit over reserve's predicate); not built yet.
+Tests assert on per-cap EgressCap::stats(), never the global counters.
 ```
 
 ### WHEN modifying congestion control
@@ -220,7 +250,11 @@ TTL, and early evictions are counted in `stray_intro_failures_evicted`) and CONN
 joiner dial-queue waits (`dial_queue_wait_<label>`, coarse buckets around the
 3 s punch window) and inbound datagrams by first byte (`demux_<label>`, one per
 `DemuxClass`: `legacy` passes through, `quic` and `other` are counted and
-dropped; see "Socket Abstraction Rules"). Each label set is declared once in a
+dropped; see "Socket Abstraction Rules") and outbound datagrams by how the
+node-wide egress cap paced them (`egress_<label>`, one per `EgressDecision`,
+plus `egress_bytes`, `egress_bytes_waited`, `egress_wait_us_sum` / `_max`,
+`egress_debt_hwm_bytes`, `egress_debt_forgiven_bytes`; all zero without
+`total-bandwidth-limit`). Each label set is declared once in a
 `labelled_counters!` list, so a new variant needs a snapshot field. Hot
 path writes are single relaxed atomics; `SentPacketTracker` keeps an
 `rto_expiries` count and a bounded per-stream final-ACK watch, both
@@ -540,6 +574,10 @@ other. QUIC-shaped and other datagrams are counted (`demux_<label>`) and
 dropped until a QUIC endpoint exists on the same port (#5940). The QUIC rule
 is exact only with QUIC bit greasing (RFC 9287) disabled. Tests that inject a
 hand-written socket straight into the listener bypass the wrapper.
+
+The same wrapper charges outbound datagrams to the node-wide egress cap (see
+"Node-wide egress cap" above). A new send site needs nothing to be charged;
+it must not wait unless it is a pacing point.
 
 ### WHEN testing transport code
 
