@@ -1,6 +1,7 @@
 use super::*;
 use crate::config::GlobalRng;
 use crate::simulation::VirtualTime;
+use crate::transport::metrics::ForgivenCause;
 
 /// 1 MB/s: one byte per microsecond, a 25 000 byte burst, 1 200 bytes take
 /// 1.2 ms. Round numbers so expected values can be written out.
@@ -94,13 +95,16 @@ fn debt_beyond_the_limit_is_forgiven_and_counted() {
     cap.charge_unpaced(BURST as usize);
     // The limit is one second at the rate: 1 000 000 bytes.
     cap.charge_unpaced(900_000);
-    assert_eq!(cap.stats().forgiven_bytes, 0);
+    let debt = ForgivenCause::DebtOverLimit as usize;
+    let queue = ForgivenCause::QueuePastLimit as usize;
+    assert_eq!(cap.stats().forgiven_bytes, [0, 0]);
     cap.charge_unpaced(300_000);
     assert_eq!(cap.level_bytes(), -1_000_000, "debt stops at the limit");
-    assert_eq!(cap.stats().forgiven_bytes, 200_000);
-    // At the limit already, the whole charge is forgiven.
+    assert_eq!(cap.stats().forgiven_bytes[debt], 200_000);
+    // At the limit already, the whole charge is forgiven, still as debt.
     cap.charge_unpaced(5_000);
-    assert_eq!(cap.stats().forgiven_bytes, 205_000);
+    assert_eq!(cap.stats().forgiven_bytes[debt], 205_000);
+    assert_eq!(cap.stats().forgiven_bytes[queue], 0);
     // Every byte is still counted as sent.
     assert_eq!(cap.stats().bytes, BURST + 1_205_000);
 
@@ -149,12 +153,15 @@ fn a_dropped_hold_returns_its_reservation() {
     assert_eq!(cap.stats().packets.iter().sum::<u64>(), 1);
 }
 
+/// Settled on time, a datagram is counted at its real size, and the bucket
+/// keeps the whole reservation: the unused part of a slot that has ended is
+/// not returned.
 #[test]
-fn settle_charges_the_real_size_once() {
+fn settle_counts_the_real_size_and_keeps_the_reservation() {
     let (cap, _) = cap_at(RATE);
     let hold = cap.reserve(PACKET);
     hold.settle(1_000);
-    assert_eq!(cap.level_bytes(), BURST as i64 - 1_000);
+    assert_eq!(cap.level_bytes(), BURST as i64 - PACKET as i64);
     let stats = cap.stats();
     assert_eq!(stats.bytes, 1_000);
     assert_eq!(count(&cap, EgressDecision::Immediate), 1);
@@ -231,31 +238,20 @@ fn a_zero_total_limit_builds_no_cap() {
     assert_eq!(cap.burst_bytes(), 4 * MAX_PACKET_SIZE as u64);
 }
 
-/// A settled datagram smaller than its reservation returns the difference,
-/// which moves the next sender earlier, never later than the cap allows.
+/// A datagram smaller than its reservation, settled when its slot ends,
+/// returns nothing: the slot has passed, so its unused part cannot be given
+/// to anyone (see `release`). The next sender waits as if the full
+/// reservation had been sent.
 #[test]
-fn settling_a_smaller_datagram_returns_the_difference() {
+fn settling_a_smaller_datagram_on_time_returns_nothing() {
     let (cap, time) = cap_at(RATE);
     cap.charge_unpaced(BURST as usize);
     let small = cap.reserve(PACED_RESERVATION_BYTES);
-    let next = cap.reserve(PACED_RESERVATION_BYTES);
-    assert_eq!(next.wait(), Duration::from_micros(2 * 1_200));
     time.advance(small.wait());
     small.settle(200);
-    // Without the refund the next reservation would be due at 3.6 ms; the
-    // 1 000 bytes returned make it 2.6 ms, which is 1.4 ms from now.
     let after = cap.reserve(PACED_RESERVATION_BYTES);
-    assert_eq!(after.wait(), Duration::from_micros(1_400));
-    drop(next);
-}
-
-#[test]
-fn the_startup_floor_scales_with_max_connections() {
-    let per = MIN_CAP_PER_CONNECTION;
-    assert_eq!(cap_below_floor(per * 100 - 1, 100), Some(per * 100));
-    assert_eq!(cap_below_floor(per * 100, 100), None);
-    assert_eq!(cap_below_floor(per * 10, 100), Some(per * 100));
-    assert_eq!(cap_below_floor(1, 0), None, "no connections, no floor");
+    assert_eq!(after.wait(), Duration::from_micros(1_200));
+    drop(after);
 }
 
 /// A socket with no cap paces nothing: `pace` returns at once with no hold.
@@ -384,7 +380,8 @@ async fn the_socket_charges_every_datagram_once() {
     let cap = socket.egress_cap().expect("cap");
     let stats = cap.stats();
     assert_eq!(stats.bytes, 850);
-    assert_eq!(cap.level_bytes(), BURST as i64 - 850);
+    // 100 + 50 unpaced, and the whole 1 200-byte reservation for the paced one.
+    assert_eq!(cap.level_bytes(), BURST as i64 - 1_350);
     assert_eq!(count(cap, EgressDecision::Unpaced), 2);
     assert_eq!(count(cap, EgressDecision::Immediate), 1);
 }
@@ -489,7 +486,12 @@ fn unpaced_debt_is_accounted_and_paid_by_paced_sends() {
                 let refilled = elapsed * rate as i128 / 1_000_000_000;
                 let owed = (-cap.level_bytes()).max(0) as i128;
                 assert!(
-                    total as i128 <= burst + refilled + stats.forgiven_bytes as i128 + owed + 3,
+                    total as i128
+                        <= burst
+                            + refilled
+                            + stats.forgiven_bytes.iter().sum::<u64>() as i128
+                            + owed
+                            + 3,
                     "seed {seed}: {total} sent after {elapsed} ns"
                 );
             }
@@ -623,7 +625,7 @@ async fn a_failed_unpaced_send_is_not_charged() {
 /// A failed paced send returns its reservation: the next paced sender is
 /// not delayed by a datagram that never left.
 #[tokio::test]
-async fn a_failed_paced_send_returns_its_reservation() {
+async fn a_failed_paced_send_is_not_counted_and_returns_no_passed_slot() {
     use super::super::DemuxSocket;
     let target: std::net::SocketAddr = "192.0.2.1:9".parse().unwrap();
     let time = VirtualTime::new();
@@ -644,12 +646,106 @@ async fn a_failed_paced_send_returns_its_reservation() {
             .await
             .is_err()
     );
-    // 1.2 ms of refill from an empty bucket, as if nothing was reserved.
-    assert_eq!(
-        cap.level_bytes(),
-        PACED_RESERVATION_BYTES as i64,
-        "the reservation was returned"
-    );
+    // It failed at the end of its slot: the slot has passed, so nothing is
+    // returned (the bucket is where the reservation left it), and the
+    // datagram is not counted as sent.
+    assert_eq!(cap.level_bytes(), 0, "a passed slot is not returned");
     assert_eq!(cap.stats().packets[EgressDecision::Immediate as usize], 0);
     assert_eq!(cap.stats().packets[EgressDecision::Waited as usize], 0);
+}
+
+/// `release` returns only the part of a slot not yet passed: all of it
+/// before the slot starts, the remainder inside it, nothing after it.
+#[test]
+fn a_release_returns_only_the_slot_not_yet_passed() {
+    let (cap, time) = cap_at(RATE);
+    cap.charge_unpaced(BURST as usize);
+    // Slot of the first hold: 0..1.2 ms; second: 1.2..2.4 ms.
+    let first = cap.reserve(PACKET);
+    let second = cap.reserve(PACKET);
+    // Released before its slot starts: all 1 200 bytes come back.
+    drop(second);
+    assert_eq!(cap.level_bytes(), -(PACKET as i64));
+    // 0.4 ms into its slot: 800 bytes of it remain and come back.
+    time.advance(Duration::from_micros(400));
+    drop(first);
+    assert_eq!(
+        cap.level_bytes(),
+        400 - 400,
+        "level 0: 400 refilled, 800 returned"
+    );
+    let next = cap.reserve(PACKET);
+    assert_eq!(next.wait(), Duration::from_micros(1_200));
+    // After its slot has passed: nothing comes back.
+    time.advance(next.wait() + Duration::from_micros(500));
+    let before = cap.level_bytes();
+    drop(next);
+    assert_eq!(cap.level_bytes(), before, "a passed slot is not returned");
+}
+
+/// Regression for a slot the bucket has refilled over. Holds whose slots
+/// passed while their senders were held up (say, waiting for cwnd) must not
+/// all go out free when they are finally sent together: each late datagram
+/// is charged for its lateness, so the sends that follow wait, and the
+/// window bound holds over everything sent.
+#[test]
+fn late_settles_are_charged_and_keep_the_window_bound() {
+    let rate = 100_000u64;
+    let (cap, time) = cap_at(rate);
+    let burst = cap.burst_bytes() as u128;
+    cap.charge_unpaced(burst as usize);
+    let holds: Vec<_> = (0..10).map(|_| cap.reserve(PACKET)).collect();
+    // All ten slots (120 ms) pass while the senders are held up, and the
+    // bucket refills past them.
+    time.advance(Duration::from_millis(500));
+    let mut sent: Vec<(u64, u64)> = Vec::new();
+    for hold in holds {
+        hold.settle(PACKET);
+        sent.push((time.now_nanos(), PACKET as u64));
+    }
+    // Paced senders after them wait for what the late sends were charged.
+    for _ in 0..10 {
+        let hold = cap.reserve(PACKET);
+        time.advance(hold.wait());
+        hold.settle(PACKET);
+        sent.push((time.now_nanos(), PACKET as u64));
+    }
+    for i in 0..sent.len() {
+        let mut bytes = 0u128;
+        for &(t, size) in &sent[i..] {
+            bytes += size as u128;
+            let window_ns = (t - sent[i].0) as u128;
+            let allowed = burst + (window_ns * rate as u128).div_ceil(1_000_000_000);
+            assert!(
+                bytes <= allowed + 10 * PACKET as u128,
+                "{bytes} in {window_ns} ns"
+            );
+        }
+    }
+    // The ten late datagrams were charged, not absorbed by the refill.
+    assert!(
+        cap.level_bytes() <= 0,
+        "the late sends must be charged: level {}",
+        cap.level_bytes()
+    );
+}
+
+/// An unpaced charge while queued reservations already reach past the debt
+/// limit is forgiven in full, and counted under its own cause.
+#[test]
+fn unpaced_bytes_behind_a_long_queue_are_counted_as_queue_forgiven() {
+    let (cap, _) = cap_at(RATE);
+    cap.charge_unpaced(BURST as usize);
+    // 1.2 s of reservations: past the 1 s limit.
+    let _queued: Vec<_> = (0..1_000).map(|_| cap.reserve(PACKET)).collect();
+    cap.charge_unpaced(500);
+    let stats = cap.stats();
+    assert_eq!(
+        stats.forgiven_bytes[ForgivenCause::QueuePastLimit as usize],
+        500
+    );
+    assert_eq!(
+        stats.forgiven_bytes[ForgivenCause::DebtOverLimit as usize],
+        0
+    );
 }

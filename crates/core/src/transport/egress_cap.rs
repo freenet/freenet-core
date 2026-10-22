@@ -26,12 +26,19 @@
 //! # What the cap guarantees
 //!
 //! Paced bytes never exceed the bucket bound: in any window, the burst plus
-//! the rate times the window. Unpaced bytes are added on top of that as debt,
-//! so the total holds on average and can exceed the cap over a short window
-//! by the unpaced bytes sent in it. An unpaced charge never takes the debt
-//! past [`DEBT_LIMIT`] of the rate; whatever it cannot add is forgiven (and
-//! counted), so control traffic that alone exceeds the cap does not grow the
-//! debt without bound.
+//! the rate times the window. A reservation is only given back for the part
+//! of its slot not yet passed, and a datagram sent after its slot ended is
+//! charged again for its lateness, so neither a released nor a late hold
+//! makes bytes free.
+//!
+//! Unpaced bytes are added on top of that as debt, up to [`DEBT_LIMIT`] of
+//! the rate ahead of now; whatever an unpaced charge cannot add is forgiven
+//! (sent, but not charged) and counted by cause. So the total holds on
+//! average only while less than `DEBT_LIMIT` of paced data is queued, and
+//! even then can exceed the cap over a short window by the unpaced bytes
+//! sent in it. With more than `DEBT_LIMIT` queued, control traffic is not
+//! charged at all and the node sends the cap plus its whole control traffic
+//! (`egress_forgiven_queue_past_limit_bytes` counts it).
 //!
 //! A paced datagram waits for everything reserved before it. With many
 //! concurrent streams the wait is the queue depth divided by the rate, which
@@ -64,7 +71,7 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::Duration;
 
 use super::Socket;
-use super::metrics::{EgressDecision, TRANSPORT_METRICS};
+use super::metrics::{EgressDecision, ForgivenCause, TRANSPORT_METRICS};
 use super::packet_data::MAX_PACKET_SIZE;
 use super::peer_connection::streaming::STREAM_INACTIVITY_TIMEOUT;
 use crate::simulation::TimeSource;
@@ -123,8 +130,9 @@ pub(crate) struct EgressStats {
     /// Largest backlog seen after a charge, in bytes: everything charged or
     /// reserved ahead of the rate (unpaced debt plus queued reservations).
     pub backlog_hwm_bytes: u64,
-    /// Unpaced bytes forgiven because the debt reached [`DEBT_LIMIT`].
-    pub forgiven_bytes: u64,
+    /// Unpaced bytes not charged, by [`ForgivenCause`] (index = `cause as
+    /// usize`).
+    pub forgiven_bytes: [u64; ForgivenCause::COUNT],
 }
 
 #[cfg(test)]
@@ -137,7 +145,7 @@ struct StatCounters {
     wait_us_max: AtomicU64,
     long_waits: AtomicU64,
     backlog_hwm_bytes: AtomicU64,
-    forgiven_bytes: AtomicU64,
+    forgiven_bytes: [AtomicU64; ForgivenCause::COUNT],
 }
 
 /// The node-wide egress token bucket. See the module docs.
@@ -178,6 +186,11 @@ pub struct EgressHold<'a> {
     cap: &'a EgressCap,
     reserved_bytes: u64,
     wait: Duration,
+    /// End of this reservation's slot (ns, on the cap's clock): when it was
+    /// made, the later of `empty_at_ns` after it and the time it was made
+    /// (with tokens to spare the slot ends at once). This is when the
+    /// datagram may be sent.
+    due_ns: i64,
 }
 
 impl EgressCap {
@@ -293,14 +306,23 @@ impl EgressCap {
         });
         // Recomputed from the value the committed update started from, since
         // the closure may run more than once.
-        let unclamped = self.refilled(old, now).saturating_add(cost);
+        let refilled = self.refilled(old, now);
+        let unclamped = refilled.saturating_add(cost);
         let forgiven = self.bytes_for(unclamped.saturating_sub(new));
         if forgiven > 0 {
+            // Two causes, told apart for operators: unpaced debt reached the
+            // limit, or paced reservations already reached PAST it (so
+            // nothing unpaced can be charged at all). An unpaced charge never
+            // takes `empty_at_ns` past the limit, only to it, so a value
+            // strictly past it was put there by reservations.
+            let cause = if refilled > now.saturating_add(self.debt_limit_ns) {
+                ForgivenCause::QueuePastLimit
+            } else {
+                ForgivenCause::DebtOverLimit
+            };
             #[cfg(test)]
-            self.stats
-                .forgiven_bytes
-                .fetch_add(forgiven, Ordering::Relaxed);
-            TRANSPORT_METRICS.record_egress_forgiven(forgiven);
+            self.stats.forgiven_bytes[cause as usize].fetch_add(forgiven, Ordering::Relaxed);
+            TRANSPORT_METRICS.record_egress_forgiven(cause, forgiven);
         }
         self.record_sent(EgressDecision::Unpaced, bytes as u64, Duration::ZERO, now);
         self.record_backlog(new, now);
@@ -318,18 +340,28 @@ impl EgressCap {
             cap: self,
             reserved_bytes: bytes as u64,
             wait: Duration::from_nanos(wait_ns),
+            due_ns: new.max(now),
         }
     }
 
-    fn release(&self, reserved_bytes: u64) {
-        if reserved_bytes == 0 {
-            return;
-        }
-        let cost = self.cost_ns(reserved_bytes);
-        self.update(|empty_at, _| empty_at.saturating_sub(cost));
+    /// Return the part of an unsent hold's slot that has not passed yet:
+    /// `clamp(due - now, 0, cost)`. A slot that has passed is not returned:
+    /// the bucket may have refilled over it, and returning it then would
+    /// let later sends go out uncharged.
+    fn release(&self, hold: &EgressHold<'_>) {
+        let cost = self.cost_ns(hold.reserved_bytes);
+        let due = hold.due_ns;
+        self.update(|empty_at, now| {
+            let refund = due.saturating_sub(now).clamp(0, cost);
+            empty_at.saturating_sub(refund)
+        });
     }
 
-    /// Replace a reservation with the `sent_bytes` the socket really sent.
+    /// Replace a reservation with the `sent_bytes` the socket really sent,
+    /// by the same rule as [`Self::release`]: only the not-yet-passed part
+    /// of the unused slot is returned, and a datagram sent after its slot
+    /// ended is charged for the time it is late (up to its own cost), so a
+    /// late send is never free.
     fn settle(&self, hold: &EgressHold<'_>, sent_bytes: usize) {
         debug_assert!(
             sent_bytes as u64 <= hold.reserved_bytes,
@@ -339,9 +371,13 @@ impl EgressCap {
         );
         let reserved = self.cost_ns(hold.reserved_bytes);
         let sent = self.cost_ns(sent_bytes as u64);
+        let unused = reserved.saturating_sub(sent);
+        let due = hold.due_ns;
         let (_, new, now) = self.update(|empty_at, now| {
-            self.refilled(empty_at.saturating_sub(reserved), now)
-                .saturating_add(sent)
+            let refund = due.saturating_sub(now).clamp(0, unused);
+            let late = now.saturating_sub(due).clamp(0, sent);
+            self.refilled(empty_at.saturating_sub(refund), now)
+                .saturating_add(late)
         });
         let decision = if hold.wait.is_zero() {
             EgressDecision::Immediate
@@ -439,7 +475,7 @@ impl EgressCap {
             wait_us_max: load(&s.wait_us_max),
             long_waits: load(&s.long_waits),
             backlog_hwm_bytes: load(&s.backlog_hwm_bytes),
-            forgiven_bytes: load(&s.forgiven_bytes),
+            forgiven_bytes: std::array::from_fn(|i| load(&s.forgiven_bytes[i])),
         }
     }
 }
@@ -462,7 +498,7 @@ impl EgressHold<'_> {
 
 impl Drop for EgressHold<'_> {
     fn drop(&mut self) {
-        self.cap.release(self.reserved_bytes);
+        self.cap.release(self);
     }
 }
 
@@ -480,7 +516,8 @@ impl fmt::Debug for EgressHold<'_> {
 /// because every sender queued behind it computed its wait from it; an
 /// estimate short by `d` bytes lets each of `n` queued senders go `d` bytes
 /// early, so a window holds `n * d` bytes more than the cap allows. With an
-/// upper bound, settling the real size only returns bytes, which delays the
+/// upper bound, a datagram smaller than its reservation wastes the rest of
+/// the slot (settling returns only a part not yet passed), which delays the
 /// queued senders slightly instead.
 pub(crate) const PACED_RESERVATION_BYTES: usize = MAX_PACKET_SIZE;
 

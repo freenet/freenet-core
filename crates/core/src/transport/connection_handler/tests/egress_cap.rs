@@ -10,7 +10,47 @@ use dashmap::DashMap;
 /// that waited for it would wait about a second.
 const RATE: u64 = 10_000;
 
-type CappedSocket = DemuxSocket<MockSocket>;
+/// A mock socket that, once armed, silently drops its next `n` sends
+/// (reporting them sent, as a lossy link would).
+struct Lossy {
+    inner: MockSocket,
+    drops_left: std::sync::atomic::AtomicUsize,
+}
+
+impl Lossy {
+    fn take_drop(&self) -> bool {
+        self.drops_left
+            .fetch_update(
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+                |n| n.checked_sub(1),
+            )
+            .is_ok()
+    }
+}
+
+impl Socket for Lossy {
+    async fn bind(_addr: SocketAddr) -> std::io::Result<Self> {
+        unimplemented!()
+    }
+    async fn recv_from(&self, buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
+        self.inner.recv_from(buf).await
+    }
+    async fn send_to(&self, buf: &[u8], target: SocketAddr) -> std::io::Result<usize> {
+        if self.take_drop() {
+            return Ok(buf.len());
+        }
+        self.inner.send_to(buf, target).await
+    }
+    fn send_to_blocking(&self, buf: &[u8], target: SocketAddr) -> std::io::Result<usize> {
+        if self.take_drop() {
+            return Ok(buf.len());
+        }
+        self.inner.send_to_blocking(buf, target)
+    }
+}
+
+type CappedSocket = DemuxSocket<Lossy>;
 
 /// A peer whose egress cap runs on its own `VirtualTime` that the test never
 /// advances: the bucket is drained to the debt limit once and stays there,
@@ -20,7 +60,6 @@ async fn capped_peer(
     port: u16,
     channels: &Channels,
     is_gateway: bool,
-    drop_policy: PacketDropPolicy,
 ) -> (
     TransportPublicKey,
     OutboundConnectionHandler<CappedSocket>,
@@ -29,13 +68,16 @@ async fn capped_peer(
     SocketAddr,
 ) {
     let addr: SocketAddr = (std::net::Ipv4Addr::LOCALHOST, port).into();
-    let inner = MockSocket::new(
-        drop_policy,
-        PacketDelayPolicy::NoDelay,
-        addr,
-        channels.clone(),
-    )
-    .await;
+    let inner = Lossy {
+        inner: MockSocket::new(
+            PacketDropPolicy::ReceiveAll,
+            PacketDelayPolicy::NoDelay,
+            addr,
+            channels.clone(),
+        )
+        .await,
+        drops_left: std::sync::atomic::AtomicUsize::new(0),
+    };
     let cap = EgressCap::new(RATE, VirtualTime::new());
     cap.charge_unpaced(10 * RATE as usize);
     assert_eq!(cap.level_bytes(), -(RATE as i64), "premise: full debt");
@@ -84,15 +126,11 @@ struct Pair {
     _keep: Box<dyn std::any::Any + Send>,
 }
 
-async fn connect_pair(
-    channels: &Channels,
-    ports: (u16, u16),
-    joiner_drops: PacketDropPolicy,
-) -> Pair {
+async fn connect_pair(channels: &Channels, ports: (u16, u16)) -> Pair {
     let (gw_pub, gw_out, mut gw_inbound, gw_socket, gw_addr) =
-        capped_peer(ports.0, channels, true, PacketDropPolicy::ReceiveAll).await;
+        capped_peer(ports.0, channels, true).await;
     let (_, mut joiner, joiner_inbound, joiner_socket, _) =
-        capped_peer(ports.1, channels, false, joiner_drops).await;
+        capped_peer(ports.1, channels, false).await;
     let start = tokio::time::Instant::now();
     let connecting = joiner.connect(gw_pub, gw_addr).await;
     let (joiner_conn, gw_conn) = tokio::time::timeout(Duration::from_secs(30), async {
@@ -133,7 +171,7 @@ async fn handshake_completes_promptly_with_the_egress_bucket_in_full_debt() {
         gateway_socket: gw_socket,
         handshake_elapsed,
         _keep,
-    } = connect_pair(&channels, (47_621, 47_622), PacketDropPolicy::ReceiveAll).await;
+    } = connect_pair(&channels, (47_621, 47_622)).await;
     assert!(
         handshake_elapsed < DEBT_LIMIT / 4,
         "the handshake took {handshake_elapsed:?} with the bucket in debt; a send \
@@ -168,11 +206,10 @@ async fn handshake_completes_promptly_with_the_egress_bucket_in_full_debt() {
 ///
 /// The test first checks that each kind of datagram really was sent, from
 /// the connections' own counters, so a run in which, say, no retransmission
-/// happened cannot pass by saying nothing about it. The joiner drops its own
-/// sends 10..40 so some of its short messages are lost and retransmitted.
+/// happened cannot pass by saying nothing about it. Once connected, the
+/// joiner drops 30 of its sends (the handshake is not affected), so some of
+/// its short messages are lost and retransmitted.
 #[tokio::test(start_paused = true)]
-// `PacketDropPolicy::Ranges` takes a list of ranges; one range is meant.
-#[allow(clippy::single_range_in_vec_init)]
 async fn control_traffic_never_waits_for_the_egress_cap() {
     let channels: Channels = Arc::new(DashMap::new());
     let Pair {
@@ -182,12 +219,11 @@ async fn control_traffic_never_waits_for_the_egress_cap() {
         gateway_socket: gw_socket,
         _keep,
         ..
-    } = connect_pair(
-        &channels,
-        (47_623, 47_624),
-        PacketDropPolicy::Ranges(vec![10..40]),
-    )
-    .await;
+    } = connect_pair(&channels, (47_623, 47_624)).await;
+    joiner_socket
+        .inner_for_test()
+        .drops_left
+        .store(30, std::sync::atomic::Ordering::Release);
     let before_joiner = stats(&joiner_socket);
     let before_gw = stats(&gw_socket);
 
