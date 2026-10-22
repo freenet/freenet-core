@@ -12,6 +12,7 @@ use std::net::SocketAddr;
 
 use super::Socket;
 use super::crypto::{PACKET_TYPE_INTRO, PACKET_TYPE_SYMMETRIC};
+use super::egress_cap::{EgressCap, EgressHold};
 use super::metrics::{DemuxClass, TRANSPORT_METRICS};
 
 /// Bits of a QUIC packet's first byte of which at least one is always set.
@@ -58,15 +59,36 @@ pub(crate) fn classify(packet: &[u8]) -> DemuxClass {
 /// the trait (the real UDP sockets and `SimulationSocket`) gets the same
 /// behaviour.
 ///
+/// It is also where outbound datagrams are charged to the node-wide egress
+/// cap, when `total-bandwidth-limit` is set (see `transport::egress_cap`):
+/// every datagram the transport sends goes through this socket.
+///
 /// [`create_connection_handler`]: super::create_connection_handler
 pub struct DemuxSocket<S> {
     inner: S,
+    egress: Option<EgressCap>,
+}
+
+impl<S> DemuxSocket<S> {
+    /// Charge every datagram sent through this socket to `cap`.
+    pub(crate) fn with_egress_cap(mut self, cap: Option<EgressCap>) -> Self {
+        self.egress = cap;
+        self
+    }
+
+    /// Wrap an already-bound socket. Test-only: the transport binds through
+    /// [`Socket::bind`].
+    #[cfg(test)]
+    pub(crate) fn wrap(inner: S, egress: Option<EgressCap>) -> Self {
+        Self { inner, egress }
+    }
 }
 
 impl<S: Socket> Socket for DemuxSocket<S> {
     async fn bind(addr: SocketAddr) -> io::Result<Self> {
         Ok(Self {
             inner: S::bind(addr).await?,
+            egress: None,
         })
     }
 
@@ -93,12 +115,36 @@ impl<S: Socket> Socket for DemuxSocket<S> {
         }
     }
 
+    /// Charges the datagram to the egress cap, if there is one, and sends it
+    /// at once: a send that reaches this method is never paced. The charge
+    /// may put the cap into debt, which paced senders then wait for.
     async fn send_to(&self, buf: &[u8], target: SocketAddr) -> io::Result<usize> {
+        if let Some(cap) = &self.egress {
+            cap.charge_unpaced(buf.len());
+        }
         self.inner.send_to(buf, target).await
     }
 
     fn send_to_blocking(&self, buf: &[u8], target: SocketAddr) -> io::Result<usize> {
+        if let Some(cap) = &self.egress {
+            cap.charge_unpaced(buf.len());
+        }
         self.inner.send_to_blocking(buf, target)
+    }
+
+    fn egress_cap(&self) -> Option<&EgressCap> {
+        self.egress.as_ref()
+    }
+
+    /// Replaces the hold's reservation with the datagram's size, then sends.
+    async fn send_to_reserved(
+        &self,
+        buf: &[u8],
+        target: SocketAddr,
+        hold: EgressHold<'_>,
+    ) -> io::Result<usize> {
+        hold.settle(buf.len());
+        self.inner.send_to(buf, target).await
     }
 }
 
@@ -207,6 +253,7 @@ mod tests {
         TRANSPORT_METRICS.watch_demux(from);
         let legacy = vec![PACKET_TYPE_SYMMETRIC, 9, 8, 7];
         let socket = DemuxSocket {
+            egress: None,
             inner: ScriptedSocket::new(vec![
                 Step::Packet(from, vec![0xC3, 1, 2, 3]),
                 Step::Packet(from, vec![0x00, 1, 2, 3]),
@@ -243,6 +290,7 @@ mod tests {
             .collect();
         script.push(Step::Packet(from, vec![PACKET_TYPE_INTRO]));
         let socket = DemuxSocket {
+            egress: None,
             inner: ScriptedSocket::new(script),
         };
         let turns = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -274,6 +322,7 @@ mod tests {
     #[tokio::test]
     async fn recv_returns_inner_errors_unchanged() {
         let socket = DemuxSocket {
+            egress: None,
             inner: ScriptedSocket::new(vec![Step::Error(io::ErrorKind::ConnectionReset)]),
         };
         let mut buf = [0u8; 8];
@@ -286,6 +335,7 @@ mod tests {
     async fn send_passes_through() {
         let target: SocketAddr = "10.254.1.3:4003".parse().unwrap();
         let socket = DemuxSocket {
+            egress: None,
             inner: ScriptedSocket::new(Vec::new()),
         };
         assert_eq!(socket.send_to(&[0xC0, 1], target).await.unwrap(), 2);

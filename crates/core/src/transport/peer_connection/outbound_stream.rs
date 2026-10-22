@@ -366,6 +366,18 @@ pub(super) async fn send_stream<S: super::super::Socket, T: TimeSource>(
             time_source.sleep(wait_time).await;
         }
 
+        // Node-wide egress cap (`total-bandwidth-limit`): wait for this
+        // fragment's turn in the node's bucket, after the per-connection
+        // bucket and before `on_send_with_token`, so the wait is not counted
+        // as time in flight. Dropping the task here returns the reservation.
+        let egress_hold = super::super::egress_cap::pace(
+            socket.as_ref(),
+            super::super::egress_cap::reservation_for_payload(packet_size),
+            None,
+            &time_source,
+        )
+        .await;
+
         // Embed metadata in fragment #1 for reliability (fix #2757).
         // If the separate metadata message is lost over UDP, the receiver
         // can reconstruct it from the embedded bytes.
@@ -409,7 +421,7 @@ pub(super) async fn send_stream<S: super::super::Socket, T: TimeSource>(
         // so it is bytes actually in flight as this fragment goes out.
         peak_flightsize = peak_flightsize.max(congestion_controller.flightsize());
 
-        if let Err(e) = super::packet_sending(
+        if let Err(e) = super::packet_sending_paced(
             destination_addr,
             &socket,
             packet_id,
@@ -427,6 +439,7 @@ pub(super) async fn send_stream<S: super::super::Socket, T: TimeSource>(
             token,
             PacketStream::Stream(stream_id),
             &last_packet_id,
+            egress_hold,
         )
         .await
         {
@@ -956,6 +969,15 @@ where
             time_source.sleep(wait_time).await;
         }
 
+        // Node-wide egress cap; see the matching site in `send_stream`.
+        let egress_hold = super::super::egress_cap::pace(
+            socket.as_ref(),
+            super::super::egress_cap::reservation_for_payload(packet_size),
+            None,
+            &time_source,
+        )
+        .await;
+
         // Embed metadata in fragment #1 for reliability (fix #2757).
         // For piped streams, only embed if it fits within MAX_DATA_SIZE without
         // exceeding the limit. If the fragment #1 payload is too large, skip
@@ -999,7 +1021,7 @@ where
         // so it is bytes actually in flight as this fragment goes out.
         peak_flightsize = peak_flightsize.max(congestion_controller.flightsize());
 
-        if let Err(e) = super::packet_sending(
+        if let Err(e) = super::packet_sending_paced(
             destination_addr,
             &socket,
             packet_id,
@@ -1017,6 +1039,7 @@ where
             token,
             PacketStream::Stream(outbound_stream_id),
             &last_packet_id,
+            egress_hold,
         )
         .await
         {

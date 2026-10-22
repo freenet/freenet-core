@@ -2911,19 +2911,31 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
 
     #[inline]
     pub(crate) async fn outbound_short_message(&mut self, data: SerializedMessage) -> Result<()> {
+        // Use actual data length plus overhead estimate
+        let packet_size = data.len() + 40; // ShortMessage header overhead
+        // Node-wide egress cap: wait a short, bounded time (this task also
+        // receives for the connection), then send into debt if the bucket is
+        // still behind. The wait comes before the receipts are taken and the
+        // packet id is allocated, so a cancelled wait loses neither, and
+        // before `on_send_with_token`, so it is not counted as time in flight.
+        let egress_hold = super::egress_cap::pace(
+            self.remote_conn.socket.as_ref(),
+            super::egress_cap::reservation_for_payload(packet_size),
+            Some(super::egress_cap::SHORT_MESSAGE_MAX_WAIT),
+            &self.time_source,
+        )
+        .await;
         let receipts = self.received_tracker.get_receipts();
         let packet_id = self
             .remote_conn
             .last_packet_id
             .fetch_add(1, std::sync::atomic::Ordering::Release);
         // Get token before sending (captures send-time state for BBR)
-        // Use actual data length plus overhead estimate
-        let packet_size = data.len() + 40; // ShortMessage header overhead
         let token = self
             .remote_conn
             .congestion_controller
             .on_send_with_token(packet_size);
-        packet_sending(
+        packet_sending_paced(
             self.remote_conn.remote_addr,
             &self.remote_conn.socket,
             packet_id,
@@ -2935,6 +2947,7 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
             token,
             PacketStream::Control,
             &self.remote_conn.last_packet_id,
+            egress_hold,
         )
         .await?;
         Ok(())
@@ -3172,6 +3185,8 @@ fn report_sent_tagged<T: crate::simulation::TimeSource>(
     }
 }
 
+/// Send one payload, unpaced by the node-wide egress cap (it is charged at
+/// the socket; see `packet_sending_paced`).
 #[allow(clippy::too_many_arguments)]
 async fn packet_sending<S: super::Socket, T: crate::simulation::TimeSource>(
     remote_addr: SocketAddr,
@@ -3191,6 +3206,46 @@ async fn packet_sending<S: super::Socket, T: crate::simulation::TimeSource>(
     // Source of fresh packet ids for receipts that do not fit alongside the
     // payload (the connection's `last_packet_id`).
     next_packet_id: &AtomicU32,
+) -> Result<()> {
+    packet_sending_paced(
+        remote_addr,
+        socket,
+        packet_id,
+        outbound_sym_key,
+        confirm_receipt,
+        payload,
+        sent_tracker,
+        packet_size,
+        delivery_token,
+        stream,
+        next_packet_id,
+        None,
+    )
+    .await
+}
+
+/// [`packet_sending`] for a payload a pacing point has already waited for.
+///
+/// `egress_hold` is the reservation the pacing point made with
+/// `egress_cap::pace` (`None` when the socket has no cap). The payload's
+/// datagram is sent with it, so it is charged once at its real size;
+/// receipts that do not fit beside the payload go in separate datagrams that
+/// are charged unpaced. If the payload is not sent (serialization fails),
+/// dropping the hold returns the reservation.
+#[allow(clippy::too_many_arguments)]
+async fn packet_sending_paced<S: super::Socket, T: crate::simulation::TimeSource>(
+    remote_addr: SocketAddr,
+    socket: &Arc<S>,
+    packet_id: u32,
+    outbound_sym_key: &Aes128Gcm,
+    confirm_receipt: Vec<u32>,
+    payload: impl Into<SymmetricMessagePayload>,
+    sent_tracker: &parking_lot::Mutex<SentPacketTracker<T>>,
+    packet_size: usize,
+    delivery_token: Option<DeliveryRateToken>,
+    stream: PacketStream,
+    next_packet_id: &AtomicU32,
+    egress_hold: Option<super::egress_cap::EgressHold<'_>>,
 ) -> Result<()> {
     let start_time = tokio::time::Instant::now();
     tracing::trace!(
@@ -3225,7 +3280,15 @@ async fn packet_sending<S: super::Socket, T: crate::simulation::TimeSource>(
                 "Sending single packet"
             );
             let packet_data = packet.prepared_send();
-            match socket.send_to(&packet_data, remote_addr).await {
+            let sent = match egress_hold {
+                Some(hold) => {
+                    socket
+                        .send_to_reserved(&packet_data, remote_addr, hold)
+                        .await
+                }
+                None => socket.send_to(&packet_data, remote_addr).await,
+            };
+            match sent {
                 Ok(_) => {
                     let elapsed = start_time.elapsed();
                     tracing::trace!(
@@ -3282,10 +3345,11 @@ async fn packet_sending<S: super::Socket, T: crate::simulation::TimeSource>(
                 vec![],
             )?
             .prepared_send();
-            socket
-                .send_to(&packet, remote_addr)
-                .await
-                .map_err(|e| TransportError::send_failed(remote_addr, e.kind()))?;
+            match egress_hold {
+                Some(hold) => socket.send_to_reserved(&packet, remote_addr, hold).await,
+                None => socket.send_to(&packet, remote_addr).await,
+            }
+            .map_err(|e| TransportError::send_failed(remote_addr, e.kind()))?;
             super::shadow_demand::record_outbound(outbound_class, packet.len());
             report_sent_tagged(
                 &mut sent_tracker.lock(),

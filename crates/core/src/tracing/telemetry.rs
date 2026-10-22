@@ -2882,6 +2882,46 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                 "demux_other".into(),
                 serde_json::json!(snapshot.demux_other),
             );
+            m.insert(
+                "egress_immediate".into(),
+                serde_json::json!(snapshot.egress_immediate),
+            );
+            m.insert(
+                "egress_waited".into(),
+                serde_json::json!(snapshot.egress_waited),
+            );
+            m.insert(
+                "egress_wait_capped".into(),
+                serde_json::json!(snapshot.egress_wait_capped),
+            );
+            m.insert(
+                "egress_unpaced".into(),
+                serde_json::json!(snapshot.egress_unpaced),
+            );
+            m.insert(
+                "egress_bytes".into(),
+                serde_json::json!(snapshot.egress_bytes),
+            );
+            m.insert(
+                "egress_bytes_waited".into(),
+                serde_json::json!(snapshot.egress_bytes_waited),
+            );
+            m.insert(
+                "egress_wait_us_sum".into(),
+                serde_json::json!(snapshot.egress_wait_us_sum),
+            );
+            m.insert(
+                "egress_wait_us_max".into(),
+                serde_json::json!(snapshot.egress_wait_us_max),
+            );
+            m.insert(
+                "egress_debt_hwm_bytes".into(),
+                serde_json::json!(snapshot.egress_debt_hwm_bytes),
+            );
+            m.insert(
+                "egress_debt_forgiven_bytes".into(),
+                serde_json::json!(snapshot.egress_debt_forgiven_bytes),
+            );
             serde_json::Value::Object(m)
         }
         EventKind::InterestSync(interest_sync_event) => {
@@ -6547,6 +6587,16 @@ mod tests {
             demux_legacy: 19,
             demux_quic: 20,
             demux_other: 21,
+            egress_immediate: 22,
+            egress_waited: 23,
+            egress_wait_capped: 24,
+            egress_unpaced: 25,
+            egress_bytes: 26,
+            egress_bytes_waited: 27,
+            egress_wait_us_sum: 28,
+            egress_wait_us_max: 29,
+            egress_debt_hwm_bytes: 30,
+            egress_debt_forgiven_bytes: 31,
             ..Default::default()
         };
         let reference = serde_json::to_value(&snapshot).unwrap();
@@ -6571,6 +6621,16 @@ mod tests {
             ("demux_legacy", 19),
             ("demux_quic", 20),
             ("demux_other", 21),
+            ("egress_immediate", 22),
+            ("egress_waited", 23),
+            ("egress_wait_capped", 24),
+            ("egress_unpaced", 25),
+            ("egress_bytes", 26),
+            ("egress_bytes_waited", 27),
+            ("egress_wait_us_sum", 28),
+            ("egress_wait_us_max", 29),
+            ("egress_debt_hwm_bytes", 30),
+            ("egress_debt_forgiven_bytes", 31),
         ] {
             assert_eq!(json[key], expected, "event-log value for {key}");
             assert_eq!(json[key], reference[key], "serde value for {key}");

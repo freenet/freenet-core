@@ -1,0 +1,486 @@
+use super::*;
+use crate::config::GlobalRng;
+use crate::simulation::VirtualTime;
+
+/// 1 MB/s: one byte per microsecond, a 25 000 byte burst, 1 200 bytes take
+/// 1.2 ms. Round numbers so expected values can be written out.
+const RATE: u64 = 1_000_000;
+const BURST: u64 = 25_000;
+const PACKET: usize = 1_200;
+
+fn cap_at(rate: u64) -> (EgressCap, VirtualTime) {
+    let time = VirtualTime::new();
+    (EgressCap::new(rate, time.clone()), time)
+}
+
+fn decisions(cap: &EgressCap) -> [u64; EgressDecision::COUNT] {
+    cap.stats().packets
+}
+
+fn count(cap: &EgressCap, decision: EgressDecision) -> u64 {
+    decisions(cap)[decision as usize]
+}
+
+#[test]
+fn burst_is_a_window_of_the_rate_with_a_floor_of_four_packets() {
+    let (cap, _) = cap_at(RATE);
+    assert_eq!(cap.burst_bytes(), BURST);
+    assert_eq!(cap.level_bytes(), BURST as i64, "a new cap starts full");
+
+    // 10 KB/s would give a 250 byte burst; the floor keeps four packets.
+    let (small, _) = cap_at(10_000);
+    assert_eq!(small.burst_bytes(), 4 * MAX_PACKET_SIZE as u64);
+}
+
+#[test]
+fn a_full_bucket_admits_the_burst_then_paces_at_the_rate() {
+    let (cap, _) = cap_at(RATE);
+    let mut waits = Vec::new();
+    for _ in 0..30 {
+        let hold = cap.reserve(PACKET, None);
+        waits.push(hold.wait());
+        // Keep the reservation: the next one queues behind it.
+        std::mem::forget(hold);
+    }
+    // 25 000 / 1 200 = 20 whole packets fit in the burst.
+    assert!(waits[..20].iter().all(|w| w.is_zero()), "{waits:?}");
+    // Packet 21 needs 21 * 1200 - 25 000 = 200 bytes more: 200 us. Each
+    // later one waits one more packet time (1.2 ms).
+    for (i, wait) in waits[20..].iter().enumerate() {
+        let expected = Duration::from_micros(200 + 1_200 * i as u64);
+        assert_eq!(*wait, expected, "packet {}", 21 + i);
+    }
+}
+
+#[test]
+fn refill_is_linear_in_time_and_stops_at_the_burst() {
+    let (cap, time) = cap_at(RATE);
+    cap.charge_unpaced(BURST as usize);
+    assert_eq!(cap.level_bytes(), 0);
+    time.advance(Duration::from_millis(10));
+    assert_eq!(cap.level_bytes(), 10_000, "10 ms at 1 MB/s");
+    time.advance(Duration::from_secs(60));
+    assert_eq!(cap.level_bytes(), BURST as i64, "never above the burst");
+}
+
+#[test]
+fn unpaced_sends_go_into_debt_and_paced_sends_wait_for_it() {
+    let (cap, time) = cap_at(RATE);
+    // An empty bucket, then 100 KB of unpaced sends (ACKs, retransmissions).
+    cap.charge_unpaced(BURST as usize);
+    for _ in 0..100 {
+        cap.charge_unpaced(1_000);
+    }
+    assert_eq!(cap.level_bytes(), -100_000);
+    assert_eq!(count(&cap, EgressDecision::Unpaced), 101);
+    assert_eq!(cap.stats().debt_hwm_bytes, 100_000);
+
+    // A paced fragment now waits for the debt plus its own bytes.
+    let hold = cap.reserve(PACKET, None);
+    assert_eq!(hold.wait(), Duration::from_micros(101_200));
+    assert_eq!(hold.decision, EgressDecision::Waited);
+
+    // After the wait it is due exactly: the level is zero.
+    time.advance(hold.wait());
+    assert_eq!(cap.level_bytes(), 0);
+    hold.settle(PACKET);
+    assert_eq!(count(&cap, EgressDecision::Waited), 1);
+    assert_eq!(cap.stats().bytes_waited, PACKET as u64);
+    assert_eq!(cap.stats().wait_us_max, 101_200);
+}
+
+#[test]
+fn debt_beyond_the_limit_is_forgiven_and_counted() {
+    let (cap, _) = cap_at(RATE);
+    cap.charge_unpaced(BURST as usize);
+    // The limit is one second at the rate: 1 000 000 bytes.
+    cap.charge_unpaced(900_000);
+    assert_eq!(cap.stats().forgiven_bytes, 0);
+    cap.charge_unpaced(300_000);
+    assert_eq!(cap.level_bytes(), -1_000_000, "debt stops at the limit");
+    assert_eq!(cap.stats().forgiven_bytes, 200_000);
+    // At the limit already, the whole charge is forgiven.
+    cap.charge_unpaced(5_000);
+    assert_eq!(cap.stats().forgiven_bytes, 205_000);
+    // Every byte is still counted as sent.
+    assert_eq!(cap.stats().bytes, BURST + 1_205_000);
+
+    // So a paced sender's wait is bounded by the limit plus its own bytes.
+    let hold = cap.reserve(PACKET, None);
+    assert_eq!(hold.wait(), DEBT_LIMIT + Duration::from_micros(1_200));
+}
+
+#[test]
+fn reservations_are_served_in_the_order_they_were_made() {
+    let (cap, time) = cap_at(RATE);
+    cap.charge_unpaced(BURST as usize);
+    let first = cap.reserve(PACKET, None);
+    let second = cap.reserve(300, None);
+    let third = cap.reserve(PACKET, None);
+    assert_eq!(first.wait(), Duration::from_micros(1_200));
+    assert_eq!(second.wait(), Duration::from_micros(1_500));
+    assert_eq!(third.wait(), Duration::from_micros(2_700));
+    // Sending them as they come due keeps the level at zero each time.
+    time.advance(Duration::from_micros(1_200));
+    first.settle(PACKET);
+    time.advance(Duration::from_micros(300));
+    second.settle(300);
+    time.advance(Duration::from_micros(1_200));
+    assert_eq!(cap.level_bytes(), 0);
+    third.settle(PACKET);
+    assert_eq!(cap.level_bytes(), 0);
+}
+
+#[test]
+fn a_dropped_hold_returns_its_reservation() {
+    let (cap, _) = cap_at(RATE);
+    cap.charge_unpaced(BURST as usize);
+    let before = cap.level_bytes();
+    let abandoned = cap.reserve(PACKET, None);
+    assert_eq!(cap.level_bytes(), before - PACKET as i64);
+    drop(abandoned);
+    assert_eq!(cap.level_bytes(), before);
+    // The next sender is not delayed by the abandoned one.
+    let next = cap.reserve(PACKET, None);
+    assert_eq!(next.wait(), Duration::from_micros(1_200));
+    // An abandoned reservation was never sent, so it is not counted.
+    assert_eq!(cap.stats().packets.iter().sum::<u64>(), 1);
+}
+
+#[test]
+fn settle_charges_the_real_size_once() {
+    let (cap, _) = cap_at(RATE);
+    let hold = cap.reserve(PACKET, None);
+    assert_eq!(hold.decision, EgressDecision::Immediate);
+    hold.settle(1_000);
+    assert_eq!(cap.level_bytes(), BURST as i64 - 1_000);
+    let stats = cap.stats();
+    assert_eq!(stats.bytes, 1_000);
+    assert_eq!(count(&cap, EgressDecision::Immediate), 1);
+    assert_eq!(stats.bytes_waited, 0);
+    assert_eq!(stats.wait_us_sum, 0);
+}
+
+#[test]
+fn a_short_message_wait_is_capped_and_reserves_nothing() {
+    let (cap, time) = cap_at(RATE);
+    cap.charge_unpaced(BURST as usize + 100_000);
+    let before = cap.level_bytes();
+    let hold = cap.reserve(PACKET, Some(SHORT_MESSAGE_MAX_WAIT));
+    assert_eq!(hold.decision, EgressDecision::WaitCapped);
+    assert_eq!(hold.wait(), SHORT_MESSAGE_MAX_WAIT);
+    assert_eq!(
+        cap.level_bytes(),
+        before,
+        "a capped wait must not hold a place in the queue"
+    );
+    time.advance(SHORT_MESSAGE_MAX_WAIT);
+    hold.settle(PACKET);
+    // Sent into debt: 100 000 - 20 000 refilled + 1 200.
+    assert_eq!(cap.level_bytes(), -81_200);
+    assert_eq!(count(&cap, EgressDecision::WaitCapped), 1);
+    assert_eq!(cap.stats().wait_us_sum, 20_000);
+}
+
+#[test]
+fn a_short_message_wait_at_exactly_the_limit_is_not_capped() {
+    let (cap, _) = cap_at(RATE);
+    // Leave 18 800 bytes of debt, so a 1 200 byte message waits 20 ms.
+    cap.charge_unpaced(BURST as usize + 18_800);
+    let hold = cap.reserve(PACKET, Some(SHORT_MESSAGE_MAX_WAIT));
+    assert_eq!(hold.decision, EgressDecision::Waited);
+    assert_eq!(hold.wait(), SHORT_MESSAGE_MAX_WAIT);
+    drop(hold);
+    // One byte more debt and it is capped.
+    cap.charge_unpaced(1);
+    let hold = cap.reserve(PACKET, Some(SHORT_MESSAGE_MAX_WAIT));
+    assert_eq!(hold.decision, EgressDecision::WaitCapped);
+}
+
+#[test]
+fn rounding_never_admits_more_than_the_rate() {
+    // 3 B/s: one byte costs 333 333 333.33 ns, rounded up.
+    let (cap, time) = cap_at(3);
+    cap.charge_unpaced(cap.burst_bytes() as usize);
+    let mut sent = 0u64;
+    let mut ns = 0u64;
+    for _ in 0..30 {
+        let hold = cap.reserve(1, None);
+        ns += hold.wait().as_nanos() as u64;
+        time.advance(hold.wait());
+        hold.settle(1);
+        sent += 1;
+    }
+    // 30 bytes at 3 B/s take at least 10 s.
+    assert_eq!(sent, 30);
+    assert!(ns >= 10_000_000_000, "{ns} ns");
+}
+
+#[test]
+fn a_zero_total_limit_builds_no_cap() {
+    assert!(EgressCap::from_total_limit(0, VirtualTime::new()).is_none());
+    let cap = EgressCap::from_total_limit(1, VirtualTime::new()).expect("1 B/s is a cap");
+    assert_eq!(cap.burst_bytes(), 4 * MAX_PACKET_SIZE as u64);
+}
+
+#[test]
+fn reservation_estimate_is_the_on_wire_size_up_to_one_packet() {
+    assert_eq!(
+        reservation_for_payload(MAX_DATA_SIZE),
+        MAX_PACKET_SIZE,
+        "a full fragment"
+    );
+    assert_eq!(
+        reservation_for_payload(100),
+        100 + MAX_PACKET_SIZE - MAX_DATA_SIZE
+    );
+    assert_eq!(reservation_for_payload(usize::MAX), MAX_PACKET_SIZE);
+}
+
+#[test]
+fn the_startup_floor_scales_with_max_connections() {
+    let per = MIN_CAP_PER_CONNECTION;
+    assert_eq!(cap_below_floor(per * 100 - 1, 100), Some(per * 100));
+    assert_eq!(cap_below_floor(per * 100, 100), None);
+    assert_eq!(cap_below_floor(per * 10, 100), Some(per * 100));
+    assert_eq!(cap_below_floor(1, 0), None, "no connections, no floor");
+}
+
+/// A socket with no cap paces nothing: `pace` returns at once with no hold.
+#[tokio::test]
+async fn pace_without_a_cap_returns_no_hold() {
+    struct NoCap;
+    impl Socket for NoCap {
+        async fn bind(_addr: std::net::SocketAddr) -> std::io::Result<Self> {
+            Ok(NoCap)
+        }
+        async fn recv_from(
+            &self,
+            _buf: &mut [u8],
+        ) -> std::io::Result<(usize, std::net::SocketAddr)> {
+            std::future::pending().await
+        }
+        async fn send_to(
+            &self,
+            buf: &[u8],
+            _target: std::net::SocketAddr,
+        ) -> std::io::Result<usize> {
+            Ok(buf.len())
+        }
+        fn send_to_blocking(
+            &self,
+            buf: &[u8],
+            _target: std::net::SocketAddr,
+        ) -> std::io::Result<usize> {
+            Ok(buf.len())
+        }
+    }
+    let time = VirtualTime::new();
+    assert!(pace(&NoCap, PACKET, None, &time).await.is_none());
+    assert_eq!(time.pending_wakeup_count(), 0, "it never slept");
+}
+
+/// Cancelling a paced sender while it sleeps returns its reservation.
+#[tokio::test]
+async fn a_cancelled_pace_returns_its_reservation() {
+    use super::super::DemuxSocket;
+    struct Sink;
+    impl Socket for Sink {
+        async fn bind(_addr: std::net::SocketAddr) -> std::io::Result<Self> {
+            Ok(Sink)
+        }
+        async fn recv_from(
+            &self,
+            _buf: &mut [u8],
+        ) -> std::io::Result<(usize, std::net::SocketAddr)> {
+            std::future::pending().await
+        }
+        async fn send_to(
+            &self,
+            buf: &[u8],
+            _target: std::net::SocketAddr,
+        ) -> std::io::Result<usize> {
+            Ok(buf.len())
+        }
+        fn send_to_blocking(
+            &self,
+            buf: &[u8],
+            _target: std::net::SocketAddr,
+        ) -> std::io::Result<usize> {
+            Ok(buf.len())
+        }
+    }
+    let time = VirtualTime::new();
+    let socket = DemuxSocket::wrap(Sink, Some(EgressCap::new(RATE, time.clone())));
+    let cap = socket.egress_cap().expect("cap");
+    cap.charge_unpaced(BURST as usize);
+    {
+        let pacing = pace(&socket, PACKET, None, &time);
+        tokio::pin!(pacing);
+        // Polled once: it reserves and parks on the clock.
+        assert!(futures::poll!(pacing.as_mut()).is_pending());
+        assert_eq!(cap.level_bytes(), -(PACKET as i64));
+    }
+    assert_eq!(
+        cap.level_bytes(),
+        0,
+        "dropping the sleeping pace returned it"
+    );
+}
+
+/// The socket charges every datagram exactly once: unpaced sends at
+/// `send_to`, paced ones at `send_to_reserved`, at their real sizes.
+#[tokio::test]
+async fn the_socket_charges_every_datagram_once() {
+    use super::super::DemuxSocket;
+    struct Sink;
+    impl Socket for Sink {
+        async fn bind(_addr: std::net::SocketAddr) -> std::io::Result<Self> {
+            Ok(Sink)
+        }
+        async fn recv_from(
+            &self,
+            _buf: &mut [u8],
+        ) -> std::io::Result<(usize, std::net::SocketAddr)> {
+            std::future::pending().await
+        }
+        async fn send_to(
+            &self,
+            buf: &[u8],
+            _target: std::net::SocketAddr,
+        ) -> std::io::Result<usize> {
+            Ok(buf.len())
+        }
+        fn send_to_blocking(
+            &self,
+            buf: &[u8],
+            _target: std::net::SocketAddr,
+        ) -> std::io::Result<usize> {
+            Ok(buf.len())
+        }
+    }
+    let target: std::net::SocketAddr = "192.0.2.1:9".parse().unwrap();
+    let time = VirtualTime::new();
+    let socket = DemuxSocket::wrap(Sink, Some(EgressCap::new(RATE, time.clone())));
+    socket.send_to(&[1; 100], target).await.unwrap();
+    socket.send_to_blocking(&[1; 50], target).unwrap();
+    let hold = pace(&socket, PACKET, None, &time).await.expect("hold");
+    socket
+        .send_to_reserved(&[2; 700], target, hold)
+        .await
+        .unwrap();
+    let cap = socket.egress_cap().expect("cap");
+    let stats = cap.stats();
+    assert_eq!(stats.bytes, 850);
+    assert_eq!(cap.level_bytes(), BURST as i64 - 850);
+    assert_eq!(count(cap, EgressDecision::Unpaced), 2);
+    assert_eq!(count(cap, EgressDecision::Immediate), 1);
+}
+
+/// Seeded property over many concurrent paced senders with random sizes and
+/// arrival times: in every window between two sends, the bytes sent are at
+/// most the burst plus the rate times the window. This is the token-bucket
+/// bound, and the property the cap exists for.
+#[test]
+fn paced_sends_never_exceed_the_bucket_bound_in_any_window() {
+    for seed in [1u64, 7, 42, 0xC0FFEE] {
+        GlobalRng::scoped_seed(seed, || check_window_bound(seed));
+    }
+}
+
+fn check_window_bound(seed: u64) {
+    let rate = 200_000 + GlobalRng::random_range(0..2_000_000u64);
+    let (cap, time) = cap_at(rate);
+    let burst = cap.burst_bytes();
+    // Senders arrive over one simulated second; each reserves and is sent
+    // when its wait ends. Pending sends are (due time, arrival order, hold).
+    let mut arrivals: Vec<(u64, usize)> = (0..400)
+        .map(|_| {
+            (
+                GlobalRng::random_range(0..1_000_000_000u64),
+                GlobalRng::random_range(40..=MAX_PACKET_SIZE),
+            )
+        })
+        .collect();
+    arrivals.sort_unstable();
+    let mut pending: Vec<(u64, usize, EgressHold<'_>, usize)> = Vec::new();
+    let mut sent: Vec<(u64, u64)> = Vec::new();
+    let mut next_arrival = 0;
+    loop {
+        let next_due = pending.iter().map(|p| p.0).min();
+        let arrival_at = arrivals.get(next_arrival).map(|a| a.0);
+        let step = match (next_due, arrival_at) {
+            (None, None) => break,
+            (Some(d), Some(a)) => d.min(a),
+            (Some(d), None) => d,
+            (None, Some(a)) => a,
+        };
+        time.advance_to(step);
+        // Sends due now go first, in reservation order.
+        pending.sort_by_key(|p| (p.0, p.1));
+        while pending.first().is_some_and(|p| p.0 <= step) {
+            let (_, _, hold, size) = pending.remove(0);
+            hold.settle(size);
+            sent.push((step, size as u64));
+        }
+        while arrivals.get(next_arrival).is_some_and(|a| a.0 <= step) {
+            let size = arrivals[next_arrival].1;
+            let hold = cap.reserve(size, None);
+            let due = step + hold.wait().as_nanos() as u64;
+            pending.push((due, next_arrival, hold, size));
+            next_arrival += 1;
+        }
+    }
+    assert_eq!(sent.len(), 400, "seed {seed}");
+    for i in 0..sent.len() {
+        let mut bytes = 0u64;
+        for &(t, size) in &sent[i..] {
+            bytes += size;
+            let window_ns = (t - sent[i].0) as u128;
+            let allowed = burst as u128 + (window_ns * rate as u128).div_ceil(1_000_000_000);
+            assert!(
+                bytes as u128 <= allowed,
+                "seed {seed}: {bytes} bytes in {window_ns} ns, allowed {allowed} \
+                 (rate {rate}, burst {burst})"
+            );
+        }
+    }
+}
+
+/// Seeded property with unpaced sends mixed in: whatever the order, every
+/// byte is charged, and the bytes sent stay within the burst plus the rate
+/// times the elapsed time plus the forgiven debt plus the debt still owed.
+/// That is the "holds on average" guarantee: unpaced bytes are not lost
+/// from the account, they delay later paced sends.
+#[test]
+fn unpaced_debt_is_accounted_and_paid_by_paced_sends() {
+    for seed in [3u64, 99, 1234] {
+        GlobalRng::scoped_seed(seed, || {
+            let rate = 500_000u64;
+            let (cap, time) = cap_at(rate);
+            let burst = cap.burst_bytes() as i128;
+            let mut total = 0u64;
+            for _ in 0..2_000 {
+                time.advance(Duration::from_micros(GlobalRng::random_range(0..2_000u64)));
+                let size = GlobalRng::random_range(40..=MAX_PACKET_SIZE);
+                if GlobalRng::random_range(0..4u32) == 0 {
+                    cap.charge_unpaced(size);
+                } else {
+                    let hold = cap.reserve(size, None);
+                    time.advance(hold.wait());
+                    hold.settle(size);
+                }
+                total += size as u64;
+                let stats = cap.stats();
+                assert_eq!(stats.bytes, total, "seed {seed}: every byte is charged");
+                let elapsed = time.now_nanos() as i128;
+                let refilled = elapsed * rate as i128 / 1_000_000_000;
+                let owed = (-cap.level_bytes()).max(0) as i128;
+                assert!(
+                    total as i128 <= burst + refilled + stats.forgiven_bytes as i128 + owed + 3,
+                    "seed {seed}: {total} sent after {elapsed} ns"
+                );
+            }
+        });
+    }
+}
