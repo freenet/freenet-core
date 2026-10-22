@@ -50,7 +50,7 @@ use std::time::Duration;
 
 use super::Socket;
 use super::metrics::{EgressDecision, TRANSPORT_METRICS};
-use super::packet_data::{MAX_DATA_SIZE, MAX_PACKET_SIZE};
+use super::packet_data::MAX_PACKET_SIZE;
 use crate::simulation::TimeSource;
 
 /// The bucket holds at most this much time at the cap rate, so after an idle
@@ -316,6 +316,12 @@ impl EgressCap {
     /// Replace a reservation of `reserved_bytes` with the `sent_bytes` the
     /// datagram really had.
     fn settle(&self, hold: &EgressHold<'_>, sent_bytes: usize) {
+        debug_assert!(
+            hold.reserved_bytes == 0 || sent_bytes as u64 <= hold.reserved_bytes,
+            "a {sent_bytes} byte datagram was sent on a {} byte reservation; \
+             reservations must be an upper bound (see PACED_RESERVATION_BYTES)",
+            hold.reserved_bytes
+        );
         let reserved = self.cost_ns(hold.reserved_bytes);
         let sent = self.cost_ns(sent_bytes as u64);
         let (_, new, now) = self.update(|empty_at, now| {
@@ -404,17 +410,17 @@ impl fmt::Debug for EgressHold<'_> {
     }
 }
 
-/// The on-wire size to reserve for a datagram carrying `payload_bytes` of
-/// data. The reservation is replaced by the real size when the datagram is
-/// sent, so this only has to be close.
-pub(crate) fn reservation_for_payload(payload_bytes: usize) -> usize {
-    payload_bytes
-        .saturating_add(MAX_PACKET_SIZE - MAX_DATA_SIZE)
-        .min(MAX_PACKET_SIZE)
-}
+/// What a pacing point reserves for its datagram: the largest datagram the
+/// transport sends. The reservation must not be smaller than the datagram,
+/// because every sender queued behind it computed its wait from it; an
+/// estimate short by `d` bytes lets each of `n` queued senders go `d` bytes
+/// early, so a window holds `n * d` bytes more than the cap allows. With an
+/// upper bound, settling the real size only returns bytes, which delays the
+/// queued senders slightly instead.
+pub(crate) const PACED_RESERVATION_BYTES: usize = MAX_PACKET_SIZE;
 
-/// Wait at a pacing point until a datagram of `bytes` may be sent through
-/// `socket`, sleeping on `time_source`.
+/// Wait at a pacing point until a datagram may be sent through `socket`,
+/// sleeping on `time_source`. Reserves [`PACED_RESERVATION_BYTES`].
 ///
 /// Returns `None` when the socket has no cap. Otherwise returns the hold to
 /// pass to [`Socket::send_to_reserved`]. With `max_wait`, the wait is at most
@@ -424,12 +430,11 @@ pub(crate) fn reservation_for_payload(payload_bytes: usize) -> usize {
 /// is dropped with it and the reservation is returned.
 pub(crate) async fn pace<'a, S: Socket, T: TimeSource>(
     socket: &'a S,
-    bytes: usize,
     max_wait: Option<Duration>,
     time_source: &T,
 ) -> Option<EgressHold<'a>> {
     let cap = socket.egress_cap()?;
-    let hold = cap.reserve(bytes, max_wait);
+    let hold = cap.reserve(PACED_RESERVATION_BYTES, max_wait);
     if !hold.wait.is_zero() {
         time_source.sleep(hold.wait).await;
     }

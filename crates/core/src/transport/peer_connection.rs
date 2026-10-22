@@ -2920,7 +2920,6 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
         // before `on_send_with_token`, so it is not counted as time in flight.
         let egress_hold = super::egress_cap::pace(
             self.remote_conn.socket.as_ref(),
-            super::egress_cap::reservation_for_payload(packet_size),
             Some(super::egress_cap::SHORT_MESSAGE_MAX_WAIT),
             &self.time_source,
         )

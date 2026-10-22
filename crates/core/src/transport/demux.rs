@@ -82,6 +82,11 @@ impl<S> DemuxSocket<S> {
     pub(crate) fn wrap(inner: S, egress: Option<EgressCap>) -> Self {
         Self { inner, egress }
     }
+
+    #[cfg(test)]
+    pub(crate) fn inner_for_test(&self) -> &S {
+        &self.inner
+    }
 }
 
 impl<S: Socket> Socket for DemuxSocket<S> {

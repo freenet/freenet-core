@@ -370,13 +370,7 @@ pub(super) async fn send_stream<S: super::super::Socket, T: TimeSource>(
         // fragment's turn in the node's bucket, after the per-connection
         // bucket and before `on_send_with_token`, so the wait is not counted
         // as time in flight. Dropping the task here returns the reservation.
-        let egress_hold = super::super::egress_cap::pace(
-            socket.as_ref(),
-            super::super::egress_cap::reservation_for_payload(packet_size),
-            None,
-            &time_source,
-        )
-        .await;
+        let egress_hold = super::super::egress_cap::pace(socket.as_ref(), None, &time_source).await;
 
         // Embed metadata in fragment #1 for reliability (fix #2757).
         // If the separate metadata message is lost over UDP, the receiver
@@ -970,13 +964,7 @@ where
         }
 
         // Node-wide egress cap; see the matching site in `send_stream`.
-        let egress_hold = super::super::egress_cap::pace(
-            socket.as_ref(),
-            super::super::egress_cap::reservation_for_payload(packet_size),
-            None,
-            &time_source,
-        )
-        .await;
+        let egress_hold = super::super::egress_cap::pace(socket.as_ref(), None, &time_source).await;
 
         // Embed metadata in fragment #1 for reliability (fix #2757).
         // For piped streams, only embed if it fits within MAX_DATA_SIZE without
@@ -3172,5 +3160,185 @@ mod tests {
         assert_eq!(packets, FRAGMENTS, "premise: one packet per fragment");
         assert_eq!(observer.count(), FRAGMENTS);
         Ok(())
+    }
+}
+
+/// The node-wide egress cap seen through the real stream sender.
+#[cfg(test)]
+mod egress_cap_tests {
+    use std::net::Ipv4Addr;
+
+    use aes_gcm::KeyInit;
+
+    use super::*;
+    use crate::config::GlobalExecutor;
+    use crate::simulation::VirtualTime;
+    use crate::transport::congestion_control::CongestionControlConfig;
+    use crate::transport::demux::DemuxSocket;
+    use crate::transport::egress_cap::EgressCap;
+    use crate::transport::ledbat::LedbatConfig;
+    use crate::transport::metrics::EgressDecision;
+    use crate::transport::token_bucket::TokenBucket;
+
+    /// Records the virtual send time and size of every datagram.
+    struct RecordingSocket {
+        time: VirtualTime,
+        sent: parking_lot::Mutex<Vec<(u64, usize)>>,
+    }
+
+    impl crate::transport::Socket for RecordingSocket {
+        async fn bind(_addr: SocketAddr) -> std::io::Result<Self> {
+            unimplemented!()
+        }
+
+        async fn recv_from(&self, _buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
+            std::future::pending().await
+        }
+
+        async fn send_to(&self, buf: &[u8], _target: SocketAddr) -> std::io::Result<usize> {
+            self.sent.lock().push((self.time.now_nanos(), buf.len()));
+            Ok(buf.len())
+        }
+
+        fn send_to_blocking(&self, buf: &[u8], _target: SocketAddr) -> std::io::Result<usize> {
+            self.sent.lock().push((self.time.now_nanos(), buf.len()));
+            Ok(buf.len())
+        }
+    }
+
+    const STREAMS: usize = 20;
+    const STREAM_LEN: usize = 100_000;
+    /// The per-connection rate: `min-bandwidth-per-connection`'s default.
+    const PER_CONNECTION: usize = 1_000_000;
+    const CAP: u64 = 2_000_000;
+
+    /// Send `STREAMS` streams at once, each on its own connection paced at
+    /// `PER_CONNECTION`, through one socket with an optional node-wide cap.
+    /// Returns every datagram's (virtual send time, size) and the socket.
+    async fn send_concurrent_streams(
+        cap: Option<u64>,
+    ) -> (Vec<(u64, usize)>, Arc<DemuxSocket<RecordingSocket>>) {
+        let time = VirtualTime::new();
+        let socket = Arc::new(DemuxSocket::wrap(
+            RecordingSocket {
+                time: time.clone(),
+                sent: parking_lot::Mutex::new(Vec::new()),
+            },
+            cap.map(|rate| EgressCap::new(rate, time.clone())),
+        ));
+        let key = Aes128Gcm::new_from_slice(&[7u8; 16]).unwrap();
+        let mut tasks = Vec::new();
+        for i in 0..STREAMS {
+            let destination = SocketAddr::from((Ipv4Addr::LOCALHOST, 20_000 + i as u16));
+            // No ACKs arrive here, so the window is large enough never to
+            // bind: only the token buckets pace.
+            let congestion = CongestionControlConfig::from_ledbat_config(LedbatConfig {
+                initial_cwnd: 1_000_000_000,
+                min_cwnd: 1_000_000_000,
+                max_cwnd: 1_000_000_000,
+                ..Default::default()
+            })
+            .build_arc_with_time_source(time.clone());
+            tasks.push(GlobalExecutor::spawn(send_stream(
+                StreamId::next_transport_internal(),
+                Arc::new(AtomicU32::new(0)),
+                socket.clone(),
+                destination,
+                Bytes::from(vec![0u8; STREAM_LEN]),
+                key.clone(),
+                Arc::new(parking_lot::Mutex::new(
+                    SentPacketTracker::new_with_time_source(time.clone()),
+                )),
+                Arc::new(TokenBucket::new_with_time_source(
+                    10_000,
+                    PER_CONNECTION,
+                    time.clone(),
+                )),
+                congestion,
+                time.clone(),
+                None,
+                None,
+                None,
+            )));
+        }
+        // Run every sender until it parks on the clock, then move the clock
+        // to the next wakeup. The senders only ever wait on the clock.
+        let mut steps = 0;
+        while !tasks.iter().all(|t| t.is_finished()) {
+            steps += 1;
+            assert!(steps < 1_000_000, "the senders stalled");
+            for _ in 0..4 {
+                tokio::task::yield_now().await;
+            }
+            time.advance_to_next_wakeup();
+        }
+        for task in tasks {
+            task.await.unwrap().expect("stream sent");
+        }
+        let sent = socket_sent(&socket);
+        (sent, socket)
+    }
+
+    fn socket_sent(socket: &DemuxSocket<RecordingSocket>) -> Vec<(u64, usize)> {
+        socket.inner_for_test().sent.lock().clone()
+    }
+
+    /// The largest number of bytes sent in any window that starts at a send,
+    /// beyond what `rate` allows for that window; 0 when the bound holds.
+    fn worst_excess(sent: &[(u64, usize)], rate: u64) -> i128 {
+        let mut worst = i128::MIN;
+        for i in 0..sent.len() {
+            let mut bytes = 0i128;
+            for &(t, size) in &sent[i..] {
+                bytes += size as i128;
+                let window_ns = (t - sent[i].0) as i128;
+                let allowed = window_ns * rate as i128 / 1_000_000_000;
+                worst = worst.max(bytes - allowed);
+            }
+        }
+        worst
+    }
+
+    /// Twenty streams, each allowed 1 MB/s by its own connection, share a
+    /// 2 MB/s cap: in every window the node sends at most the cap's burst
+    /// plus the cap's rate times the window. Without the cap the same senders
+    /// reach 20 MB/s, which breaks the bound by about two megabytes; that run
+    /// is the control, so a harness that could not exceed the cap cannot
+    /// pass this vacuously.
+    #[tokio::test(flavor = "current_thread")]
+    async fn twenty_streams_under_a_two_megabyte_cap_never_exceed_it() {
+        let (sent, socket) = send_concurrent_streams(Some(CAP)).await;
+        let cap = crate::transport::Socket::egress_cap(socket.as_ref()).expect("cap");
+        let burst = cap.burst_bytes() as i128;
+        let total: usize = sent.iter().map(|s| s.1).sum();
+        assert!(total >= STREAMS * STREAM_LEN, "every stream was sent");
+
+        let excess = worst_excess(&sent, CAP);
+        assert!(
+            excess <= burst,
+            "{excess} bytes above the rate in one window, burst is {burst}"
+        );
+        // The whole transfer took as long as the cap requires.
+        let elapsed_ns = sent.last().unwrap().0 - sent.first().unwrap().0;
+        let needed_ns = ((total as i128 - burst) * 1_000_000_000 / CAP as i128) as u64;
+        assert!(
+            elapsed_ns >= needed_ns,
+            "{elapsed_ns} ns for {total} bytes, the cap needs {needed_ns} ns"
+        );
+        // Every datagram went through a pacing decision and was charged once.
+        let stats = cap.stats();
+        assert_eq!(stats.bytes as usize, total);
+        assert_eq!(stats.packets.iter().sum::<u64>() as usize, sent.len());
+        assert_eq!(stats.packets[EgressDecision::Unpaced as usize], 0);
+        assert!(stats.packets[EgressDecision::Waited as usize] > 0);
+
+        // Control: no cap.
+        let (uncapped, _) = send_concurrent_streams(None).await;
+        let uncapped_excess = worst_excess(&uncapped, CAP);
+        assert!(
+            uncapped_excess > 1_000_000,
+            "control: without the cap the streams must exceed 2 MB/s by far \
+             (excess {uncapped_excess})"
+        );
     }
 }

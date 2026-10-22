@@ -223,18 +223,22 @@ fn a_zero_total_limit_builds_no_cap() {
     assert_eq!(cap.burst_bytes(), 4 * MAX_PACKET_SIZE as u64);
 }
 
+/// A settled datagram smaller than its reservation returns the difference,
+/// which moves the next sender earlier, never later than the cap allows.
 #[test]
-fn reservation_estimate_is_the_on_wire_size_up_to_one_packet() {
-    assert_eq!(
-        reservation_for_payload(MAX_DATA_SIZE),
-        MAX_PACKET_SIZE,
-        "a full fragment"
-    );
-    assert_eq!(
-        reservation_for_payload(100),
-        100 + MAX_PACKET_SIZE - MAX_DATA_SIZE
-    );
-    assert_eq!(reservation_for_payload(usize::MAX), MAX_PACKET_SIZE);
+fn settling_a_smaller_datagram_returns_the_difference() {
+    let (cap, time) = cap_at(RATE);
+    cap.charge_unpaced(BURST as usize);
+    let small = cap.reserve(PACED_RESERVATION_BYTES, None);
+    let next = cap.reserve(PACED_RESERVATION_BYTES, None);
+    assert_eq!(next.wait(), Duration::from_micros(2 * 1_200));
+    time.advance(small.wait());
+    small.settle(200);
+    // Without the refund the next reservation would be due at 3.6 ms; the
+    // 1 000 bytes returned make it 2.6 ms, which is 1.4 ms from now.
+    let after = cap.reserve(PACED_RESERVATION_BYTES, None);
+    assert_eq!(after.wait(), Duration::from_micros(1_400));
+    drop(next);
 }
 
 #[test]
@@ -276,7 +280,7 @@ async fn pace_without_a_cap_returns_no_hold() {
         }
     }
     let time = VirtualTime::new();
-    assert!(pace(&NoCap, PACKET, None, &time).await.is_none());
+    assert!(pace(&NoCap, None, &time).await.is_none());
     assert_eq!(time.pending_wakeup_count(), 0, "it never slept");
 }
 
@@ -315,7 +319,7 @@ async fn a_cancelled_pace_returns_its_reservation() {
     let cap = socket.egress_cap().expect("cap");
     cap.charge_unpaced(BURST as usize);
     {
-        let pacing = pace(&socket, PACKET, None, &time);
+        let pacing = pace(&socket, None, &time);
         tokio::pin!(pacing);
         // Polled once: it reserves and parks on the clock.
         assert!(futures::poll!(pacing.as_mut()).is_pending());
@@ -364,7 +368,7 @@ async fn the_socket_charges_every_datagram_once() {
     let socket = DemuxSocket::wrap(Sink, Some(EgressCap::new(RATE, time.clone())));
     socket.send_to(&[1; 100], target).await.unwrap();
     socket.send_to_blocking(&[1; 50], target).unwrap();
-    let hold = pace(&socket, PACKET, None, &time).await.expect("hold");
+    let hold = pace(&socket, None, &time).await.expect("hold");
     socket
         .send_to_reserved(&[2; 700], target, hold)
         .await
