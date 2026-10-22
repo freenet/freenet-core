@@ -514,7 +514,7 @@ impl fmt::Debug for EgressTake<'_> {
 ///
 /// `Ok(None)`: the socket has no cap, send. `Ok(Some(take))`: the bytes were
 /// taken, send at once with [`Socket::send_to_paced`] (no await before it
-/// but the send itself). `Err(deficit)`: pass it to [`PacedWait::sleep`],
+/// but the send itself). `Err(deficit)`: pass it to [`StreamPacing::sleep`],
 /// then start admission again from the cwnd check. `waited` is how long this
 /// datagram has already waited.
 pub(crate) fn try_take<S: Socket>(

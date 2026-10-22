@@ -85,13 +85,15 @@ Only stream fragment tasks WAIT for the bucket (send_stream, pipe_stream).
 With a cap, each admission attempt is: cwnd check, per-connection
 TokenBucket::try_take, node-wide egress_cap::try_take, back to back with no
 await before the send; if either bucket is short, take nothing (give the
-per-connection bytes back), sleep through PacedWait (deficit x U[1.0, 1.4)
-+ U[0, 2 ms)), and start again from the cwnd check. Nothing is held while
-waiting; the order among waiters is random, so connections share the cap by
-their number of waiting streams (no isolation between connections). A
-fragment that has waited PACED_WAIT_DEADLINE (5 s, the receiver's
-STREAM_INACTIVITY_TIMEOUT) in total fails its stream, stream-scoped, with
-its flight released (egress_streams_abandoned). The take is PACED_TAKE_BYTES (MAX_PACKET_SIZE); the socket
+per-connection bytes back), sleep through StreamPacing (deficit x
+U[1.0, 1.4) + U[0, 2 ms)), and start again from the cwnd check. Nothing is
+held while waiting; the order among waiters is random, so connections share
+the cap by their number of waiting streams (no isolation between
+connections). StreamPacing (one per stream, only with a cap) measures the
+gap since the stream's previous fragment was sent, the gap the receiver's
+STREAM_INACTIVITY_TIMEOUT times, and is checked BEFORE every take and after
+every sleep: at PACED_WAIT_DEADLINE (5 s) the stream fails, stream-scoped,
+with its flight released, and the fragment is not sent. The take is PACED_TAKE_BYTES (MAX_PACKET_SIZE); the socket
 returns what the datagram did not use (Socket::send_to_paced), and all of it
 on a failed send. Without a cap the per-connection bucket keeps its old
 reserve-and-sleep path. Everything else goes through plain send_to and is
@@ -108,9 +110,12 @@ Unpaced debt is capped at DEBT_LIMIT (1 s at the cap); the rest is forgiven
 (sent uncharged) and counted. Over any interval ending at a paced send the
 node sends at most burst + rate x interval + bytes forgiven in the
 interval. Invariant: nothing is reserved; a paced sender holds no capacity
-while it waits, and is charged only at its send. Fragments whose waits
-reach LONG_WAIT (2.5 s) are counted (egress_long_waits), from the waiting
-loop, once per fragment; both counts are logged at WARN once a minute. The
+while it waits, and is charged only at its send. Gaps that reach LONG_WAIT
+(2.5 s) and abandoned streams are counted by what took most of the gap
+(WaitCause: cap, connection = the connection's own bucket, other = cwnd and
+the rest): egress_long_waits_<cause>, egress_streams_abandoned_<cause>.
+Each has its own rate-limited WARN naming the cause and its remedy; the
+per-stream abandonment line is at debug. The
 cap counts UDP payload, not IP/UDP headers. A quinn endpoint will need a poll-based admission (poll_ready
 + try_admit over try_take's predicate); not built yet.
 Tests assert on per-cap EgressCap::stats(), never the global counters.
@@ -266,7 +271,7 @@ joiner dial-queue waits (`dial_queue_wait_<label>`, coarse buckets around the
 dropped; see "Socket Abstraction Rules") and outbound datagrams by how the
 node-wide egress cap paced them (`egress_<label>`, one per `EgressDecision`,
 plus `egress_bytes`, `egress_bytes_waited`, `egress_wait_us_sum` / `_max`,
-`egress_long_waits`, `egress_streams_abandoned`, `egress_debt_hwm_bytes`,
+`egress_long_waits_<cause>`, `egress_streams_abandoned_<cause>`, `egress_debt_hwm_bytes`,
 `egress_debt_forgiven_bytes`; all zero without
 `total-bandwidth-limit`). Each label set is declared once in a
 `labelled_counters!` list, so a new variant needs a snapshot field. Hot
