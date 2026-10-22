@@ -543,8 +543,8 @@ impl PacedWait {
         cap: Option<&EgressCap>,
         deficit: Duration,
     ) -> Result<(), Duration> {
-        let start = *self.started_ns.get_or_insert(time_source.now_nanos());
-        let elapsed = Duration::from_nanos(time_source.now_nanos().saturating_sub(start));
+        self.started_ns.get_or_insert(time_source.now_nanos());
+        let elapsed = self.waited(time_source);
         // Wake at the deadline, and at LONG_WAIT the first time, so both are
         // reported when they happen even under one long deficit.
         let mut left = PACED_WAIT_DEADLINE.saturating_sub(elapsed);
