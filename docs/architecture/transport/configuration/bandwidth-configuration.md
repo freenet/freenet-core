@@ -232,9 +232,11 @@ half the receiver's 5 s stream inactivity timeout), `egress_streams_abandoned_<c
 (streams failed at a 5 s gap), `egress_debt_hwm_bytes` (the largest control-traffic
 debt) and `egress_debt_forgiven_bytes`. `<cause>` is what took most of the gap: `cap`
 (sleeping for the node-wide cap), `connection` (sleeping for the connection's own
-bucket) or `other` (mostly waiting for the congestion window). `egress_waited` and the
-wait times count sleeps for either bucket. All are zero without a cap. A wait of 2.5 s or more is
-also logged at WARN, at most once a minute.
+bucket) or `other` (mostly waiting for the congestion window, or for the upstream stream when the stream is relayed). `egress_waited` and the
+wait times count sleeps for either bucket. All are zero without a cap. A gap of 2.5 s or
+more between one stream's fragments, and a stream failed at the 5 s deadline, are each
+logged at WARN, with separate rate limits (at most once a minute each). A WARN has one
+line for each cause that happened since the last one, with its count and remedy.
 
 ### Example: 1 Gbps Connection
 
@@ -464,7 +466,8 @@ of `egress_bytes`, control traffic is using most of the cap; see the startup war
 Streams fail when a limit is too low for the number of streams waiting on it. A receiver
 abandons a stream when 5 s pass between two of its fragments
 (`STREAM_INACTIVITY_TIMEOUT`), and with a cap the sender fails a stream whose next
-fragment has not been sent 5 s after its previous one (`egress_streams_abandoned_*`).
+fragment has not been sent 5 s after its previous one (`egress_streams_abandoned_*`; for a
+relayed stream the time spent waiting for the upstream stream counts toward the gap).
 Two limits can cause it, and the counters and WARN lines say which:
 
 - `cap`: too many streams for the node-wide cap. Raise `total-bandwidth-limit`.
@@ -473,8 +476,15 @@ Two limits can cause it, and the counters and WARN lines say which:
   `min-bandwidth-per-connection`). This is often the tighter limit: at 1 MB/s with 50
   connections, a connection gets 20 KB/s, and 30 streams on it fail far more often than
   the node-wide numbers suggest. Raise `min-bandwidth-per-connection` (or the total).
-- `other`: the time went to the congestion window (slow ACKs) or elsewhere; the egress
-  settings are not the cause.
+- `other`: the time went to the congestion window (slow ACKs), to the upstream stream
+  (for relayed streams) or elsewhere; the egress settings are not the cause.
+
+The 5 s limit also applies to a stream's first fragment, measured from when the stream
+started sending. The receiver only starts its 5 s timer after the first fragment arrives
+(before that it waits up to 60 s for the stream to be claimed), so for the first fragment
+the sender's limit is stricter than the receiver's. This is deliberate admission control:
+a stream that cannot get one slot within 5 s fails at once and the operation retries,
+instead of holding a stream open on a saturated cap.
 
 The risk is per fragment. With `N` streams waiting on a limit of `C` bytes/s, each
 wins a 1200-byte slot with probability about `1/N`, so a gap of more than 5 s has

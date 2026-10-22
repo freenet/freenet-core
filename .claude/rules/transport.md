@@ -92,8 +92,14 @@ the cap by their number of waiting streams (no isolation between
 connections). StreamPacing (one per stream, only with a cap) measures the
 gap since the stream's previous fragment was sent, the gap the receiver's
 STREAM_INACTIVITY_TIMEOUT times, and is checked BEFORE every take and after
-every sleep: at PACED_WAIT_DEADLINE (5 s) the stream fails, stream-scoped,
-with its flight released, and the fragment is not sent. The take is PACED_TAKE_BYTES (MAX_PACKET_SIZE); the socket
+every sleep, and on every poll of the cwnd wait: at PACED_WAIT_DEADLINE (5 s)
+the stream fails, stream-scoped, with its flight released, and the fragment is
+not sent. The deadline also applies to the first fragment, which the receiver
+does not time (its 5 s timer starts when fragment #1 arrives; before that it
+waits up to STREAM_CLAIM_TIMEOUT, 60 s). That is deliberate admission control:
+a stream that cannot get one slot in 5 s fails fast and the operation retries.
+In pipe_stream, time waiting on the upstream stream counts toward the gap and
+is attributed to `other`. The take is PACED_TAKE_BYTES (MAX_PACKET_SIZE); the socket
 returns what the datagram did not use (Socket::send_to_paced), and all of it
 on a failed send. Without a cap the per-connection bucket keeps its old
 reserve-and-sleep path. Everything else goes through plain send_to and is
@@ -112,9 +118,9 @@ node sends at most burst + rate x interval + bytes forgiven in the
 interval. Invariant: nothing is reserved; a paced sender holds no capacity
 while it waits, and is charged only at its send. Gaps that reach LONG_WAIT
 (2.5 s) and abandoned streams are counted by what took most of the gap
-(WaitCause: cap, connection = the connection's own bucket, other = cwnd and
-the rest): egress_long_waits_<cause>, egress_streams_abandoned_<cause>.
-Each has its own rate-limited WARN naming the cause and its remedy; the
+(WaitCause: cap, connection = the connection's own bucket, other = cwnd, the
+upstream stream for relayed streams, and the rest): egress_long_waits_<cause>, egress_streams_abandoned_<cause>.
+Each has its own rate-limited WARN with one line per cause seen since the last, each with its count and remedy; the
 per-stream abandonment line is at debug. The
 cap counts UDP payload, not IP/UDP headers. A quinn endpoint will need a poll-based admission (poll_ready
 + try_admit over try_take's predicate); not built yet.

@@ -47,10 +47,12 @@
 //! second, and longer gaps have a geometric tail. A stream whose next
 //! fragment has not been sent [`PACED_WAIT_DEADLINE`] (the receiver's 5 s
 //! stream inactivity timeout) after its previous one fails, measured as the
-//! receiver measures it ([`StreamPacing`]). Gaps that reach [`LONG_WAIT`]
-//! and failed streams are counted by what took most of the gap: the cap,
-//! the connection's own bucket (whose rate is the cap divided among the
-//! connections), or something else such as cwnd
+//! receiver measures it ([`StreamPacing`]), except for the first fragment,
+//! where the receiver waits longer and the limit is deliberate admission
+//! control. Gaps that reach [`LONG_WAIT`] and failed streams are counted by
+//! what took most of the gap: the cap, the connection's own bucket (whose
+//! rate is the cap divided among the connections), or something else such
+//! as cwnd or the upstream stream of a relayed stream
 //! (`egress_long_waits_<cause>`, `egress_streams_abandoned_<cause>`), and
 //! each kind is logged at WARN with its remedy, at most once per
 //! [`LONG_WAIT_WARN_INTERVAL`].
@@ -100,7 +102,14 @@ pub(crate) const LONG_WAIT: Duration =
 /// gives up a stream after the same gap between fragments and is never told
 /// the sender is still trying, so waiting longer only spends the shared cap
 /// on a stream nobody will finish. The gap counts every wait (the cap, the
-/// connection's bucket, cwnd), as the receiver's does.
+/// connection's bucket, cwnd, and for a relayed stream the upstream stream),
+/// as the receiver's does.
+///
+/// For a stream's first fragment this is stricter than the receiver: it
+/// starts its 5 s timer after fragment #1 arrives and before that waits up
+/// to `STREAM_CLAIM_TIMEOUT` (60 s). The sender's limit applies there on
+/// purpose, as admission control: a stream that cannot get one slot within
+/// 5 s fails fast and the operation retries.
 pub(crate) const PACED_WAIT_DEADLINE: Duration = STREAM_INACTIVITY_TIMEOUT;
 
 /// The long-wait warning is logged at most once per this interval.
