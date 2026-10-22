@@ -195,9 +195,20 @@ where
     F::Output: Send + 'static,
 {
     let task = tokio::spawn(fut);
+    let mut stuck = 0u32;
     while !task.is_finished() {
         tokio::task::yield_now().await;
+        let before = time.now_nanos();
         time.advance_to_next_wakeup();
+        stuck = if time.now_nanos() == before {
+            stuck + 1
+        } else {
+            0
+        };
+        assert!(
+            stuck < 100_000,
+            "virtual time stopped advancing at {before} ns"
+        );
     }
     task.await.unwrap()
 }
@@ -217,6 +228,10 @@ async fn a_fragment_fails_its_stream_at_the_wait_deadline() {
         drive_virtual(&time.clone(), async move {
             let mut paced = PacedWait::default();
             loop {
+                assert!(
+                    time.now_nanos() < 2 * PACED_WAIT_DEADLINE.as_nanos() as u64,
+                    "no deadline"
+                );
                 match cap.try_take(PACKET, paced.waited(&time)) {
                     Ok(_) => panic!("admitted"),
                     Err(deficit) => {
@@ -239,6 +254,30 @@ async fn a_fragment_fails_its_stream_at_the_wait_deadline() {
         1,
         "only the unpaced drain"
     );
+}
+
+/// A fragment that keeps sleeping past `LONG_WAIT` is reported once, not
+/// once per sleep.
+#[tokio::test(flavor = "current_thread")]
+async fn a_long_wait_is_reported_once_per_fragment() {
+    let time = VirtualTime::new();
+    let cap = std::sync::Arc::new(EgressCap::new(RATE, time.clone()));
+    {
+        let (cap, time) = (cap.clone(), time.clone());
+        drive_virtual(&time.clone(), async move {
+            let mut paced = PacedWait::default();
+            // 200 ms deficits for 4 s: about seven sleeps past LONG_WAIT.
+            while paced.waited(&time) < Duration::from_secs(4) {
+                paced
+                    .sleep(&time, Some(&cap), Duration::from_millis(200))
+                    .await
+                    .unwrap();
+            }
+        })
+        .await;
+    }
+    assert_eq!(cap.stats().long_waits, 1);
+    assert_eq!(cap.stats().streams_abandoned, 0);
 }
 
 /// A datagram held back only by its connection's bucket still counts as

@@ -3502,13 +3502,24 @@ mod egress_cap_tests {
         tasks: Vec<tokio::task::JoinHandle<Result<TransferStats, TransportError>>>,
     ) -> Vec<Result<TransferStats, TransportError>> {
         let mut steps = 0;
+        let mut stuck = 0u32;
         while !tasks.iter().all(|t| t.is_finished()) {
             steps += 1;
             assert!(steps < 5_000_000, "the senders stalled");
             for _ in 0..4 {
                 tokio::task::yield_now().await;
             }
+            let before = time.now_nanos();
             time.advance_to_next_wakeup();
+            stuck = if time.now_nanos() == before {
+                stuck + 1
+            } else {
+                0
+            };
+            assert!(
+                stuck < 100_000,
+                "virtual time stopped advancing at {before} ns"
+            );
         }
         let mut results = Vec::new();
         for task in tasks {
@@ -3906,10 +3917,11 @@ mod egress_cap_tests {
 
     /// When the node-wide cap refuses, a fragment gives its per-connection
     /// bytes back. Without that, every refused attempt would also spend the
-    /// connection's bucket: four connections at 60 KB/s each sharing a
-    /// 100 KB/s cap would then lose much of their share to refusals and the
-    /// node would fall well short of the cap. With it, they fill the cap:
-    /// at least 95% of the refill over the run, the burst subtracted.
+    /// connection's bucket: four connections at 40 KB/s each sharing a
+    /// 100 KB/s cap (25 KB/s each) attempt about every 15 ms, which would
+    /// spend about 75 KB/s of a 40 KB/s bucket on refusals, and the node
+    /// would fall well short of the cap. With it, they fill the cap: at
+    /// least 95% of the refill over the run, the burst subtracted.
     #[tokio::test(flavor = "current_thread")]
     async fn per_connection_bytes_are_returned_when_the_cap_refuses() {
         const RATE: u64 = 100_000;
@@ -3931,7 +3943,7 @@ mod egress_cap_tests {
                         congestion: window(1_000_000_000, &time),
                         bucket: Arc::new(TokenBucket::new_with_time_source(
                             PER_CONNECTION_BURST,
-                            60_000,
+                            40_000,
                             time.clone(),
                         )),
                     },
