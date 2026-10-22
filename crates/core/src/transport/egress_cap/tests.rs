@@ -240,7 +240,8 @@ async fn a_fragment_fails_its_stream_at_the_wait_deadline() {
                 match cap.try_take(PACKET, pacing.slept()) {
                     Ok(_) => panic!("admitted"),
                     Err(deficit) => {
-                        if let Err(gap) = pacing.sleep(&time, &cap, WaitCause::Cap, deficit).await {
+                        if let Err(gap) = pacing.sleep(&time, &cap, PacedBucket::Cap, deficit).await
+                        {
                             break gap;
                         }
                     }
@@ -283,7 +284,7 @@ async fn a_long_gap_is_reported_once_per_fragment() {
                     .sleep(
                         &time,
                         &cap,
-                        WaitCause::Connection,
+                        PacedBucket::Connection,
                         Duration::from_millis(200),
                     )
                     .await
@@ -325,7 +326,12 @@ async fn a_wait_on_the_connection_bucket_alone_counts_as_waited() {
             let mut pacing = StreamPacing::new(&time);
             // The connection's bucket refused, with a 5 ms deficit.
             pacing
-                .sleep(&time, &cap, WaitCause::Connection, Duration::from_millis(5))
+                .sleep(
+                    &time,
+                    &cap,
+                    PacedBucket::Connection,
+                    Duration::from_millis(5),
+                )
                 .await
                 .unwrap();
             let slept = pacing.slept();
@@ -354,7 +360,10 @@ fn the_warnings_are_rate_limited_separately() {
     // Abandoned streams inside the interval are counted for the next WARN.
     cap.record_abandoned(WaitCause::Cap, PACED_WAIT_DEADLINE);
     cap.record_abandoned(WaitCause::Cap, PACED_WAIT_DEADLINE);
-    assert_eq!(cap.abandoned_since_warn.load(Ordering::Relaxed), 2);
+    assert_eq!(
+        cap.abandoned_since_warn.count[WaitCause::Cap as usize].load(Ordering::Relaxed),
+        2
+    );
     time.advance(LONG_WAIT_WARN_INTERVAL - Duration::from_millis(1));
     assert!(!cap.warn_due(&cap.last_long_wait_warn_ns));
     time.advance(Duration::from_millis(1));
@@ -364,7 +373,10 @@ fn the_warnings_are_rate_limited_separately() {
     );
     // The next abandoned stream logs, with the count, and resets it.
     cap.record_abandoned(WaitCause::Cap, PACED_WAIT_DEADLINE);
-    assert_eq!(cap.abandoned_since_warn.load(Ordering::Relaxed), 0);
+    assert_eq!(
+        cap.abandoned_since_warn.count[WaitCause::Cap as usize].load(Ordering::Relaxed),
+        0
+    );
 }
 
 #[test]
@@ -684,4 +696,68 @@ fn no_stream_starves() {
         times.len() < 2 || times.windows(2).any(|w| w[1] - w[0] > 12 * fair_gap_ns)
     });
     assert!(starved, "control: without jitter some stream must starve");
+}
+
+/// A gap that goes from below `LONG_WAIT` to the deadline in one step (a long
+/// cwnd or upstream wait between two checks) is still counted as a long gap
+/// before the stream is abandoned, once.
+#[test]
+fn a_jump_straight_to_the_deadline_records_the_long_gap() {
+    let (cap, time) = cap_at(RATE);
+    let mut pacing = StreamPacing::new(&time);
+    time.advance(Duration::from_secs(1));
+    assert_eq!(pacing.check(&time, &cap), Ok(()));
+    assert_eq!(
+        cap.stats().long_waits,
+        [0, 0, 0],
+        "premise: below LONG_WAIT"
+    );
+    time.advance(PACED_WAIT_DEADLINE);
+    assert_eq!(
+        pacing.check(&time, &cap),
+        Err(PACED_WAIT_DEADLINE + Duration::from_secs(1))
+    );
+    let stats = cap.stats();
+    assert_eq!(stats.long_waits, [0, 0, 1], "all of it was not egress time");
+    assert_eq!(stats.streams_abandoned, [0, 0, 1]);
+}
+
+/// Each WARN names every cause that happened since the last one, with that
+/// cause's count and remedy, not the triggering cause's alone.
+#[test]
+fn the_warnings_report_each_cause_with_its_own_count_and_remedy() {
+    let (cap, time) = cap_at(RATE);
+    // Use up the first, immediate WARN of each kind, so later events pool.
+    assert!(cap.warn_due(&cap.last_long_wait_warn_ns));
+    assert!(cap.warn_due(&cap.last_abandon_warn_ns));
+    let (logs, guard) = crate::util::test_log_capture::install();
+    for _ in 0..3 {
+        cap.record_abandoned(WaitCause::Connection, PACED_WAIT_DEADLINE);
+        cap.record_long_wait(WaitCause::Connection, LONG_WAIT);
+    }
+    cap.record_abandoned(WaitCause::Other, PACED_WAIT_DEADLINE);
+    cap.record_long_wait(WaitCause::Other, LONG_WAIT);
+    assert!(logs.lock().unwrap().is_empty(), "premise: rate limited");
+    time.advance(LONG_WAIT_WARN_INTERVAL);
+    // The triggering event is a cap one; the other causes are still named.
+    cap.record_abandoned(WaitCause::Cap, PACED_WAIT_DEADLINE);
+    cap.record_long_wait(WaitCause::Cap, LONG_WAIT);
+    drop(guard);
+    let logs = logs.lock().unwrap().clone();
+    for (field, text) in [
+        ("streams_abandoned", "Outbound streams failed"),
+        ("long_waits", "Stream fragments have waited"),
+    ] {
+        let lines: Vec<_> = logs.iter().filter(|l| l.contains(text)).collect();
+        assert_eq!(lines.len(), 3, "one line per cause; captured: {logs:?}");
+        for (cause, count) in [("cap", 1), ("connection", 3), ("other", 1)] {
+            let line = lines
+                .iter()
+                .find(|l| l.contains(&format!("cause=\"{cause}\"")))
+                .unwrap_or_else(|| panic!("no {field} line for {cause}: {logs:?}"));
+            assert!(line.contains(&format!("{field}={count}")), "{line}");
+            let cause_enum = WaitCause::ALL.iter().find(|c| c.label() == cause).unwrap();
+            assert!(line.contains(remedy(*cause_enum)), "{line}");
+        }
+    }
 }

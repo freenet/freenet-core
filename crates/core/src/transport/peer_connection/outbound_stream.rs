@@ -14,9 +14,8 @@ use crate::{
     transport::{
         TransferStats, TransportError,
         congestion_control::{CongestionControl, CongestionController},
-        metrics::{
-            WaitCause, emit_transfer_completed, emit_transfer_failed, emit_transfer_started,
-        },
+        egress_cap::PacedBucket,
+        metrics::{emit_transfer_completed, emit_transfer_failed, emit_transfer_started},
         packet_data,
         sent_packet_tracker::{PacketStream, SentPacketTracker},
         symmetric_message::{self},
@@ -460,8 +459,8 @@ pub(super) async fn send_stream<S: super::super::Socket, T: TimeSource>(
             let checked = match pacing.check(&time_source, cap) {
                 Err(gap) => Err(gap),
                 Ok(()) => {
-                    let (deficit, cause) = match token_bucket.try_take(packet_size) {
-                        Err(wait) => (wait, WaitCause::Connection),
+                    let (deficit, bucket) = match token_bucket.try_take(packet_size) {
+                        Err(wait) => (wait, PacedBucket::Connection),
                         Ok(()) => match super::super::egress_cap::try_take(
                             socket.as_ref(),
                             pacing.slept(),
@@ -469,11 +468,11 @@ pub(super) async fn send_stream<S: super::super::Socket, T: TimeSource>(
                             Ok(take) => break take,
                             Err(wait) => {
                                 token_bucket.give_back(packet_size);
-                                (wait, WaitCause::Cap)
+                                (wait, PacedBucket::Cap)
                             }
                         },
                     };
-                    pacing.sleep(&time_source, cap, cause, deficit).await
+                    pacing.sleep(&time_source, cap, bucket, deficit).await
                 }
             };
             if let Err(gap) = checked {
@@ -1128,8 +1127,8 @@ where
             let checked = match pacing.check(&time_source, cap) {
                 Err(gap) => Err(gap),
                 Ok(()) => {
-                    let (deficit, cause) = match token_bucket.try_take(packet_size) {
-                        Err(wait) => (wait, WaitCause::Connection),
+                    let (deficit, bucket) = match token_bucket.try_take(packet_size) {
+                        Err(wait) => (wait, PacedBucket::Connection),
                         Ok(()) => match super::super::egress_cap::try_take(
                             socket.as_ref(),
                             pacing.slept(),
@@ -1137,11 +1136,11 @@ where
                             Ok(take) => break take,
                             Err(wait) => {
                                 token_bucket.give_back(packet_size);
-                                (wait, WaitCause::Cap)
+                                (wait, PacedBucket::Cap)
                             }
                         },
                     };
-                    pacing.sleep(&time_source, cap, cause, deficit).await
+                    pacing.sleep(&time_source, cap, bucket, deficit).await
                 }
             };
             if let Err(gap) = checked {
