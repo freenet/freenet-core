@@ -155,7 +155,13 @@ fn internal_sym_decryption<const N: usize>(
     size: usize,
     inbound_sym_key: &Aes128Gcm,
 ) -> Result<([u8; N], usize), aes_gcm::Error> {
-    debug_assert!(data.len() >= PACKET_TYPE_SIZE + NONCE_SIZE + TAG_SIZE);
+    // `size` is the received length; `data` is the whole fixed-size buffer, so
+    // only `size` says whether the type byte, nonce and tag are all present.
+    // Slicing by `size` below would panic on a shorter packet. `size` above
+    // `data.len()` cannot come from `from_buf`; that half is defensive.
+    if size < PACKET_TYPE_SIZE + NONCE_SIZE + TAG_SIZE || size > data.len() {
+        return Err(aes_gcm::Error);
+    }
 
     // Check packet type (first byte should be PACKET_TYPE_SYMMETRIC)
     if data[0] != PACKET_TYPE_SYMMETRIC {
@@ -365,6 +371,32 @@ mod tests {
         let _overlap = longest_common_subsequence(&encrypted_packet.data, data.as_slice());
 
         test_decryption(encrypted_packet, &cipher, unencrypted_packet);
+    }
+
+    /// A symmetric-type packet too short to hold the type byte, nonce and tag
+    /// is rejected with an error at every length, rather than panicking while
+    /// slicing out the tag. A packet of exactly that length (an empty payload)
+    /// is the shortest that can decrypt, and it still does.
+    #[test]
+    fn short_symmetric_packets_are_rejected_without_panicking() {
+        let cipher = Aes128Gcm::new(&[7u8; 16].into());
+        let min = PACKET_TYPE_SIZE + NONCE_SIZE + TAG_SIZE;
+        for len in 0..min {
+            let mut buf = vec![0xAAu8; len];
+            if let Some(first) = buf.first_mut() {
+                *first = PACKET_TYPE_SYMMETRIC;
+            }
+            let packet = PacketData::<UnknownEncryption, MAX_PACKET_SIZE>::from_buf(&buf);
+            assert!(packet.try_decrypt_sym(&cipher).is_err(), "length {len}");
+        }
+
+        let empty = PacketData::<_, MAX_PACKET_SIZE>::from_buf_plain([]).encrypt_symmetric(&cipher);
+        assert_eq!(empty.data().len(), min);
+        let received = PacketData::<UnknownEncryption, MAX_PACKET_SIZE>::from_buf(empty.data());
+        let decrypted = received
+            .try_decrypt_sym(&cipher)
+            .expect("an empty payload decrypts");
+        assert!(decrypted.data().is_empty());
     }
 
     // Test detection of packet corruption
