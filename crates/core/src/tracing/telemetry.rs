@@ -2911,12 +2911,28 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                 serde_json::json!(snapshot.egress_wait_us_max),
             );
             m.insert(
-                "egress_long_waits".into(),
-                serde_json::json!(snapshot.egress_long_waits),
+                "egress_long_waits_cap".into(),
+                serde_json::json!(snapshot.egress_long_waits_cap),
             );
             m.insert(
-                "egress_streams_abandoned".into(),
-                serde_json::json!(snapshot.egress_streams_abandoned),
+                "egress_long_waits_connection".into(),
+                serde_json::json!(snapshot.egress_long_waits_connection),
+            );
+            m.insert(
+                "egress_long_waits_other".into(),
+                serde_json::json!(snapshot.egress_long_waits_other),
+            );
+            m.insert(
+                "egress_streams_abandoned_cap".into(),
+                serde_json::json!(snapshot.egress_streams_abandoned_cap),
+            );
+            m.insert(
+                "egress_streams_abandoned_connection".into(),
+                serde_json::json!(snapshot.egress_streams_abandoned_connection),
+            );
+            m.insert(
+                "egress_streams_abandoned_other".into(),
+                serde_json::json!(snapshot.egress_streams_abandoned_other),
             );
             m.insert(
                 "egress_debt_hwm_bytes".into(),
@@ -6599,8 +6615,12 @@ mod tests {
             egress_bytes_waited: 27,
             egress_wait_us_sum: 28,
             egress_wait_us_max: 29,
-            egress_long_waits: 24,
-            egress_streams_abandoned: 33,
+            egress_long_waits_cap: 40,
+            egress_long_waits_connection: 41,
+            egress_long_waits_other: 42,
+            egress_streams_abandoned_cap: 43,
+            egress_streams_abandoned_connection: 44,
+            egress_streams_abandoned_other: 45,
             egress_debt_hwm_bytes: 30,
             egress_debt_forgiven_bytes: 31,
             ..Default::default()
@@ -6636,8 +6656,12 @@ mod tests {
             ("egress_bytes_waited", 27),
             ("egress_wait_us_sum", 28),
             ("egress_wait_us_max", 29),
-            ("egress_long_waits", 24),
-            ("egress_streams_abandoned", 33),
+            ("egress_long_waits_cap", 40),
+            ("egress_long_waits_connection", 41),
+            ("egress_long_waits_other", 42),
+            ("egress_streams_abandoned_cap", 43),
+            ("egress_streams_abandoned_connection", 44),
+            ("egress_streams_abandoned_other", 45),
             ("egress_debt_hwm_bytes", 30),
             ("egress_debt_forgiven_bytes", 31),
         ] {

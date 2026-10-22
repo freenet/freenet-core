@@ -14,7 +14,9 @@ use crate::{
     transport::{
         TransferStats, TransportError,
         congestion_control::{CongestionControl, CongestionController},
-        metrics::{emit_transfer_completed, emit_transfer_failed, emit_transfer_started},
+        metrics::{
+            WaitCause, emit_transfer_completed, emit_transfer_failed, emit_transfer_started,
+        },
         packet_data,
         sent_packet_tracker::{PacketStream, SentPacketTracker},
         symmetric_message::{self},
@@ -76,9 +78,9 @@ fn release_aborted_stream_flightsize<T: TimeSource>(
     }
 }
 
-/// Fail a stream one of whose fragments waited
-/// `egress_cap::PACED_WAIT_DEADLINE` for the node-wide cap and its
-/// connection's bucket. Stream-scoped, like a cwnd-wait timeout: the
+/// Fail a stream whose next fragment was not sent within
+/// `egress_cap::PACED_WAIT_DEADLINE` of its previous one, under the
+/// node-wide cap. Stream-scoped, like a cwnd-wait timeout: the
 /// connection stays up, and the stream's in-flight bytes are released
 /// (#4345). The receiver gives the stream up after the same gap, so waiting
 /// longer would only spend the shared cap on a stream nobody will finish.
@@ -87,23 +89,24 @@ fn abandon_for_egress_wait<T: TimeSource>(
     destination_addr: SocketAddr,
     sent_bytes: u64,
     elapsed: Duration,
-    waited: Duration,
+    gap: Duration,
     sent_packet_tracker: &parking_lot::Mutex<SentPacketTracker<T>>,
     congestion_controller: &CongestionController<T>,
 ) -> TransportError {
-    tracing::warn!(
+    // Per stream at debug: the cap logs a rate-limited WARN with a count.
+    tracing::debug!(
         stream_id = %stream_id.0,
         destination = %destination_addr,
-        waited_ms = waited.as_millis() as u64,
-        "Stream failed: a fragment waited too long for the node-wide egress cap"
+        gap_ms = gap.as_millis() as u64,
+        "Stream failed: its next fragment was not sent within the egress deadline"
     );
     emit_transfer_failed(
         stream_id.0 as u64,
         destination_addr,
         sent_bytes,
         format!(
-            "egress cap wait of {}ms (total-bandwidth-limit too low for the streams in flight)",
-            waited.as_millis()
+            "no fragment sent for {}ms under the egress cap (see egress_streams_abandoned_*)",
+            gap.as_millis()
         ),
         elapsed.as_millis() as u64,
         TransferDirection::Send,
@@ -271,6 +274,8 @@ pub(super) async fn send_stream<S: super::super::Socket, T: TimeSource>(
         stream_to_send.len().div_ceil(MAX_DATA_SIZE)
     };
     let mut sent_so_far = 0;
+    // With a node-wide cap: the gaps between this stream's fragments.
+    let mut pacing: Option<super::super::egress_cap::StreamPacing> = None;
     let mut next_fragment_number = 1; // Fragment numbers are 1-indexed
     let mut pending_metadata = metadata;
 
@@ -294,7 +299,6 @@ pub(super) async fn send_stream<S: super::super::Socket, T: TimeSource>(
         // fragment holds no capacity. `CWND_WAIT_TIMEOUT` counts only time
         // spent waiting for cwnd, summed over the attempts.
         let mut cwnd_waited = Duration::ZERO;
-        let mut paced = super::super::egress_cap::PacedWait::default();
         let egress_take = loop {
             // BBR congestion control - wait until cwnd has space for this packet.
             // This enforces the congestion window calculated by BBR's state machine.
@@ -407,7 +411,7 @@ pub(super) async fn send_stream<S: super::super::Socket, T: TimeSource>(
             cwnd_waited += time_source.now().saturating_sub(cwnd_wait_start);
 
             // Token bucket rate limiting - reserve tokens and wait if needed
-            if socket.egress_cap().is_none() {
+            let Some(cap) = socket.egress_cap() else {
                 let wait_time = token_bucket.reserve(packet_size);
                 if !wait_time.is_zero() {
                     tracing::trace!(
@@ -419,34 +423,41 @@ pub(super) async fn send_stream<S: super::super::Socket, T: TimeSource>(
                     time_source.sleep(wait_time).await;
                 }
                 break None;
-            }
+            };
 
             // With the node-wide cap: both buckets back to back, or neither.
-            // Every wait goes through `paced`, which fails the stream once
-            // this fragment has waited `PACED_WAIT_DEADLINE` in total.
-            let deficit = match token_bucket.try_take(packet_size) {
-                Err(wait) => wait,
-                Ok(()) => match super::super::egress_cap::try_take(
-                    socket.as_ref(),
-                    paced.waited(&time_source),
-                ) {
-                    Ok(take) => break take,
-                    Err(wait) => {
-                        token_bucket.give_back(packet_size);
-                        wait
-                    }
-                },
+            // `pacing` measures the gap since this stream's previous fragment
+            // (the gap the receiver times) and fails the stream when it
+            // reaches `PACED_WAIT_DEADLINE`: checked before taking, so a late
+            // fragment is never sent, and after every sleep.
+            let pacing = pacing
+                .get_or_insert_with(|| super::super::egress_cap::StreamPacing::new(&time_source));
+            let checked = match pacing.check(&time_source, cap) {
+                Err(gap) => Err(gap),
+                Ok(()) => {
+                    let (deficit, cause) = match token_bucket.try_take(packet_size) {
+                        Err(wait) => (wait, WaitCause::Connection),
+                        Ok(()) => match super::super::egress_cap::try_take(
+                            socket.as_ref(),
+                            pacing.slept(),
+                        ) {
+                            Ok(take) => break take,
+                            Err(wait) => {
+                                token_bucket.give_back(packet_size);
+                                (wait, WaitCause::Cap)
+                            }
+                        },
+                    };
+                    pacing.sleep(&time_source, cap, cause, deficit).await
+                }
             };
-            if let Err(waited) = paced
-                .sleep(&time_source, socket.egress_cap(), deficit)
-                .await
-            {
+            if let Err(gap) = checked {
                 return Err(abandon_for_egress_wait(
                     stream_id,
                     destination_addr,
                     ((sent_so_far * MAX_DATA_SIZE) as u64).min(bytes_to_send),
                     time_source.now().saturating_sub(start_time),
-                    waited,
+                    gap,
                     sent_packet_tracker.as_ref(),
                     congestion_controller.as_ref(),
                 ));
@@ -569,6 +580,9 @@ pub(super) async fn send_stream<S: super::super::Socket, T: TimeSource>(
 
         next_fragment_number += 1;
         sent_so_far += 1;
+        if let Some(pacing) = pacing.as_mut() {
+            pacing.sent(&time_source);
+        }
         if let Some(p) = &progress {
             // No timestamp is passed: the observer reads its OWN clock (the
             // originator's TimeSource), NOT this connection's time_source —
@@ -871,6 +885,8 @@ where
     // receiver accepts (see `Rechunk`).
     let mut stream = Rechunk::new(chunks, first_fragment_capacity(metadata.as_ref()));
     let mut sent_so_far = 0u64;
+    // With a node-wide cap: the gaps between this stream's fragments.
+    let mut pacing: Option<super::super::egress_cap::StreamPacing> = None;
     let mut fragment_number = 1u32;
     let mut pending_metadata = metadata;
 
@@ -957,7 +973,6 @@ where
 
         // Admission as in `send_stream`; see there.
         let mut cwnd_waited = Duration::ZERO;
-        let mut paced = super::super::egress_cap::PacedWait::default();
         let egress_take = loop {
             // BBR congestion control - wait until cwnd has space for this packet.
             //
@@ -1045,40 +1060,47 @@ where
             cwnd_waited += time_source.now().saturating_sub(cwnd_wait_start);
 
             // Token bucket rate limiting
-            if socket.egress_cap().is_none() {
+            let Some(cap) = socket.egress_cap() else {
                 let wait_time = token_bucket.reserve(packet_size);
                 if !wait_time.is_zero() {
                     time_source.sleep(wait_time).await;
                 }
                 break None;
-            }
+            };
 
             // With the node-wide cap: both buckets back to back, or neither.
-            // Every wait goes through `paced`, which fails the stream once
-            // this fragment has waited `PACED_WAIT_DEADLINE` in total.
-            let deficit = match token_bucket.try_take(packet_size) {
-                Err(wait) => wait,
-                Ok(()) => match super::super::egress_cap::try_take(
-                    socket.as_ref(),
-                    paced.waited(&time_source),
-                ) {
-                    Ok(take) => break take,
-                    Err(wait) => {
-                        token_bucket.give_back(packet_size);
-                        wait
-                    }
-                },
+            // `pacing` measures the gap since this stream's previous fragment
+            // (the gap the receiver times) and fails the stream when it
+            // reaches `PACED_WAIT_DEADLINE`: checked before taking, so a late
+            // fragment is never sent, and after every sleep.
+            let pacing = pacing
+                .get_or_insert_with(|| super::super::egress_cap::StreamPacing::new(&time_source));
+            let checked = match pacing.check(&time_source, cap) {
+                Err(gap) => Err(gap),
+                Ok(()) => {
+                    let (deficit, cause) = match token_bucket.try_take(packet_size) {
+                        Err(wait) => (wait, WaitCause::Connection),
+                        Ok(()) => match super::super::egress_cap::try_take(
+                            socket.as_ref(),
+                            pacing.slept(),
+                        ) {
+                            Ok(take) => break take,
+                            Err(wait) => {
+                                token_bucket.give_back(packet_size);
+                                (wait, WaitCause::Cap)
+                            }
+                        },
+                    };
+                    pacing.sleep(&time_source, cap, cause, deficit).await
+                }
             };
-            if let Err(waited) = paced
-                .sleep(&time_source, socket.egress_cap(), deficit)
-                .await
-            {
+            if let Err(gap) = checked {
                 return Err(abandon_for_egress_wait(
                     outbound_stream_id,
                     destination_addr,
                     sent_so_far,
                     time_source.now().saturating_sub(start_time),
-                    waited,
+                    gap,
                     sent_packet_tracker.as_ref(),
                     congestion_controller.as_ref(),
                 ));
@@ -1187,6 +1209,9 @@ where
 
         sent_so_far += packet_size as u64;
         fragment_number += 1;
+        if let Some(pacing) = pacing.as_mut() {
+            pacing.sent(&time_source);
+        }
         if let Some(p) = &progress {
             // No timestamp is passed: the observer reads its OWN clock (the
             // originator's TimeSource), NOT this connection's time_source —
@@ -3891,7 +3916,7 @@ mod egress_cap_tests {
             "the burst's four fragments were sent"
         );
         let stats = socket.egress_cap().expect("cap").stats();
-        assert_eq!(stats.streams_abandoned, 1);
+        assert_eq!(stats.streams_abandoned, [1, 0, 0], "blamed on the cap");
         let deadline = crate::transport::egress_cap::PACED_WAIT_DEADLINE.as_nanos() as u64;
         assert!(
             time.now_nanos() >= deadline && time.now_nanos() < deadline + 100_000_000,
@@ -3993,9 +4018,69 @@ mod egress_cap_tests {
         for _ in 0..50 {
             tokio::task::yield_now().await;
         }
-        assert!(sent(&socket).is_empty(), "premise: the cap refused");
+        assert!(sent(&socket).is_empty(), "premise: nothing was sent");
+        assert!(
+            socket.egress_cap().expect("cap").stats().refusals >= 1,
+            "premise: the stream reached the cap and was refused"
+        );
         assert!(!task.is_finished(), "premise: the stream is waiting");
         assert_eq!(bucket.available_tokens(), PER_CONNECTION_BURST);
         task.abort();
+    }
+
+    /// The deadline is checked before every take, not only after a sleep: a
+    /// fragment that sleeps for the cap, then waits for cwnd until the gap
+    /// since the stream's previous fragment passes `PACED_WAIT_DEADLINE`, is
+    /// not sent although both buckets would admit it then; the stream fails.
+    ///
+    /// Fragment 1 takes the last datagram in the cap's bucket at 0 s.
+    /// Fragment 2 passes cwnd, is refused by the 500 B/s cap and sleeps
+    /// 2.4 to 3.4 s; meanwhile, at 1 s, other traffic fills the window, so
+    /// fragment 2 then waits for cwnd until 5.2 s (less than
+    /// `CWND_WAIT_TIMEOUT`), when the window frees and the cap has refilled.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_fragment_past_the_deadline_after_a_cwnd_wait_is_not_sent() {
+        let _seed = GlobalRng::seed_guard(14);
+        let time = VirtualTime::new();
+        let cap = EgressCap::new(500, time.clone());
+        cap.charge_unpaced(cap.burst_bytes() as usize - 1_200);
+        let socket = Arc::new(DemuxSocket::wrap(
+            RecordingSocket::new(&time, None),
+            Some(cap),
+        ));
+        let congestion = window(20 * MAX_DATA_SIZE, &time);
+        let filler = {
+            let (congestion, time) = (congestion.clone(), time.clone());
+            GlobalExecutor::spawn(async move {
+                time.sleep(Duration::from_secs(1)).await;
+                let filled = 20 * MAX_DATA_SIZE;
+                let _token = congestion.on_send_with_token(filled);
+                time.sleep(Duration::from_millis(4_200)).await;
+                congestion.release_flightsize(filled);
+                // Not a stream; its result is not looked at.
+                Err(TransportError::ChannelClosed)
+            })
+        };
+        let stream = spawn_stream(
+            StreamSpec {
+                sender: Sender::Send,
+                fragments: 3,
+                port: 20_000,
+                congestion,
+                bucket: own_connection(&time).1,
+            },
+            &socket,
+            &time,
+        );
+        let results = drive_results(&time, vec![stream, filler]).await;
+        assert!(
+            matches!(results[0], Err(TransportError::OutboundStreamFailed(_))),
+            "{:?}",
+            results[0]
+        );
+        assert_eq!(sent(&socket).len(), 1, "fragment 2 was not sent");
+        let stats = socket.egress_cap().expect("cap").stats();
+        assert_eq!(stats.streams_abandoned.iter().sum::<u64>(), 1);
+        assert!(stats.refusals >= 1, "premise: fragment 2 slept for the cap");
     }
 }

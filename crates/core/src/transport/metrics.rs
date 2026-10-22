@@ -158,6 +158,21 @@ labelled_counters! {
 }
 
 labelled_counters! {
+    /// What took most of a paced stream's gap between fragments, for a gap
+    /// that reached the egress cap's long-wait threshold or its deadline.
+    /// Exported per period as `egress_long_waits_<label>` and
+    /// `egress_streams_abandoned_<label>`.
+    pub(crate) enum WaitCause {
+        /// Sleeping for the node-wide cap.
+        Cap => "cap",
+        /// Sleeping for the connection's own bucket.
+        Connection => "connection",
+        /// Anything else, such as waiting for the congestion window.
+        Other => "other",
+    }
+}
+
+labelled_counters! {
     /// How a datagram the node sent was paced by the node-wide egress cap
     /// (`transport::egress_cap`). Exactly one per datagram sent while a cap
     /// is configured, recorded when it is charged after a successful send;
@@ -389,11 +404,10 @@ struct EgressCounters {
     /// Sum and maximum of the waits, in microseconds.
     wait_us_sum: AtomicU64,
     wait_us_max: AtomicU64,
-    /// Paced fragments whose waits reached `egress_cap::LONG_WAIT`.
-    long_waits: AtomicU64,
-    /// Streams failed because one fragment waited
-    /// `egress_cap::PACED_WAIT_DEADLINE`.
-    streams_abandoned: AtomicU64,
+    /// Paced gaps that reached `egress_cap::LONG_WAIT`, by [`WaitCause`].
+    long_waits: [AtomicU64; WaitCause::COUNT],
+    /// Streams failed at `egress_cap::PACED_WAIT_DEADLINE`, by [`WaitCause`].
+    streams_abandoned: [AtomicU64; WaitCause::COUNT],
     /// Largest unpaced debt after a charge, in bytes.
     debt_hwm_bytes: AtomicU64,
     /// Unpaced bytes forgiven because the debt reached the debt limit.
@@ -1140,17 +1154,14 @@ impl TransportMetrics {
         }
     }
 
-    /// Record a paced fragment whose waits reached `egress_cap::LONG_WAIT`.
-    pub(crate) fn record_egress_long_wait(&self) {
-        self.egress.long_waits.fetch_add(1, Ordering::Relaxed);
+    /// Record a paced gap that reached `egress_cap::LONG_WAIT`.
+    pub(crate) fn record_egress_long_wait(&self, cause: WaitCause) {
+        self.egress.long_waits[cause as usize].fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Record a stream failed because a fragment waited
-    /// `egress_cap::PACED_WAIT_DEADLINE` for the egress cap.
-    pub(crate) fn record_egress_stream_abandoned(&self) {
-        self.egress
-            .streams_abandoned
-            .fetch_add(1, Ordering::Relaxed);
+    /// Record a stream failed at `egress_cap::PACED_WAIT_DEADLINE`.
+    pub(crate) fn record_egress_stream_abandoned(&self, cause: WaitCause) {
+        self.egress.streams_abandoned[cause as usize].fetch_add(1, Ordering::Relaxed);
     }
 
     /// Record the egress cap's unpaced debt after a charge, in bytes.
@@ -1563,8 +1574,16 @@ impl TransportMetrics {
             egress_bytes_waited: get64(&egress.bytes_waited),
             egress_wait_us_sum: get64(&egress.wait_us_sum),
             egress_wait_us_max: get64(&egress.wait_us_max),
-            egress_long_waits: get64(&egress.long_waits),
-            egress_streams_abandoned: get64(&egress.streams_abandoned),
+            egress_long_waits_cap: get64(&egress.long_waits[WaitCause::Cap as usize]),
+            egress_long_waits_connection: get64(&egress.long_waits[WaitCause::Connection as usize]),
+            egress_long_waits_other: get64(&egress.long_waits[WaitCause::Other as usize]),
+            egress_streams_abandoned_cap: get64(&egress.streams_abandoned[WaitCause::Cap as usize]),
+            egress_streams_abandoned_connection: get64(
+                &egress.streams_abandoned[WaitCause::Connection as usize],
+            ),
+            egress_streams_abandoned_other: get64(
+                &egress.streams_abandoned[WaitCause::Other as usize],
+            ),
             egress_debt_hwm_bytes: get64(&egress.debt_hwm_bytes),
             egress_debt_forgiven_bytes: get64(&egress.debt_forgiven_bytes),
         }
@@ -1981,8 +2000,9 @@ pub struct TransportSnapshot {
     /// Datagrams sent during the period by how the node-wide egress cap
     /// paced them, by [`EgressDecision`], with their bytes, the bytes and
     /// total and longest wait (microseconds) of those that waited, the
-    /// number of fragments whose waits reached `egress_cap::LONG_WAIT`
-    /// (2.5 s), the streams failed because a fragment waited 5 s, the
+    /// gaps between one stream's fragments that reached
+    /// `egress_cap::LONG_WAIT` (2.5 s) and the streams failed at 5 s, both
+    /// by [`WaitCause`], the
     /// largest unpaced debt in bytes, and the unpaced bytes forgiven
     /// (sent, not charged) at the debt limit.
     /// All zero unless `total-bandwidth-limit` is set.
@@ -1993,8 +2013,12 @@ pub struct TransportSnapshot {
     pub egress_bytes_waited: u64,
     pub egress_wait_us_sum: u64,
     pub egress_wait_us_max: u64,
-    pub egress_long_waits: u64,
-    pub egress_streams_abandoned: u64,
+    pub egress_long_waits_cap: u64,
+    pub egress_long_waits_connection: u64,
+    pub egress_long_waits_other: u64,
+    pub egress_streams_abandoned_cap: u64,
+    pub egress_streams_abandoned_connection: u64,
+    pub egress_streams_abandoned_other: u64,
     pub egress_debt_hwm_bytes: u64,
     pub egress_debt_forgiven_bytes: u64,
 }
@@ -2082,8 +2106,12 @@ impl TransportSnapshot {
             egress_bytes_waited,
             egress_wait_us_sum,
             egress_wait_us_max,
-            egress_long_waits,
-            egress_streams_abandoned,
+            egress_long_waits_cap,
+            egress_long_waits_connection,
+            egress_long_waits_other,
+            egress_streams_abandoned_cap,
+            egress_streams_abandoned_connection,
+            egress_streams_abandoned_other,
             egress_debt_hwm_bytes,
             egress_debt_forgiven_bytes,
         } = extras;
@@ -2149,8 +2177,12 @@ impl TransportSnapshot {
         self.egress_bytes_waited = egress_bytes_waited;
         self.egress_wait_us_sum = egress_wait_us_sum;
         self.egress_wait_us_max = egress_wait_us_max;
-        self.egress_long_waits = egress_long_waits;
-        self.egress_streams_abandoned = egress_streams_abandoned;
+        self.egress_long_waits_cap = egress_long_waits_cap;
+        self.egress_long_waits_connection = egress_long_waits_connection;
+        self.egress_long_waits_other = egress_long_waits_other;
+        self.egress_streams_abandoned_cap = egress_streams_abandoned_cap;
+        self.egress_streams_abandoned_connection = egress_streams_abandoned_connection;
+        self.egress_streams_abandoned_other = egress_streams_abandoned_other;
         self.egress_debt_hwm_bytes = egress_debt_hwm_bytes;
         self.egress_debt_forgiven_bytes = egress_debt_forgiven_bytes;
         self
@@ -2278,8 +2310,9 @@ struct SnapshotExtras {
     /// Datagrams sent during the period by how the node-wide egress cap
     /// paced them, by [`EgressDecision`], with their bytes, the bytes and
     /// total and longest wait (microseconds) of those that waited, the
-    /// number of fragments whose waits reached `egress_cap::LONG_WAIT`
-    /// (2.5 s), the streams failed because a fragment waited 5 s, the
+    /// gaps between one stream's fragments that reached
+    /// `egress_cap::LONG_WAIT` (2.5 s) and the streams failed at 5 s, both
+    /// by [`WaitCause`], the
     /// largest unpaced debt in bytes, and the unpaced bytes forgiven
     /// (sent, not charged) at the debt limit.
     /// All zero unless `total-bandwidth-limit` is set.
@@ -2290,8 +2323,12 @@ struct SnapshotExtras {
     pub egress_bytes_waited: u64,
     pub egress_wait_us_sum: u64,
     pub egress_wait_us_max: u64,
-    pub egress_long_waits: u64,
-    pub egress_streams_abandoned: u64,
+    pub egress_long_waits_cap: u64,
+    pub egress_long_waits_connection: u64,
+    pub egress_long_waits_other: u64,
+    pub egress_streams_abandoned_cap: u64,
+    pub egress_streams_abandoned_connection: u64,
+    pub egress_streams_abandoned_other: u64,
     pub egress_debt_hwm_bytes: u64,
     pub egress_debt_forgiven_bytes: u64,
 }
@@ -2346,8 +2383,12 @@ impl SnapshotExtras {
             || self.egress_immediate != 0
             || self.egress_waited != 0
             || self.egress_unpaced != 0
-            || self.egress_long_waits != 0
-            || self.egress_streams_abandoned != 0
+            || self.egress_long_waits_cap != 0
+            || self.egress_long_waits_connection != 0
+            || self.egress_long_waits_other != 0
+            || self.egress_streams_abandoned_cap != 0
+            || self.egress_streams_abandoned_connection != 0
+            || self.egress_streams_abandoned_other != 0
             || self.egress_debt_forgiven_bytes != 0
     }
 }
@@ -3212,6 +3253,7 @@ mod tests {
         check(&DialQueueWait::ALL, |v| v as usize, DialQueueWait::label);
         check(&DemuxClass::ALL, |v| v as usize, DemuxClass::label);
         check(&EgressDecision::ALL, |v| v as usize, EgressDecision::label);
+        check(&WaitCause::ALL, |v| v as usize, WaitCause::label);
     }
 
     /// The snapshot fields carrying an origin's period attempts and
@@ -3375,9 +3417,10 @@ mod tests {
             }
         }
         metrics.record_egress(EgressDecision::Waited, 100, 3_000_000);
-        metrics.record_egress_long_wait();
-        metrics.record_egress_stream_abandoned();
-        metrics.record_egress_stream_abandoned();
+        metrics.record_egress_long_wait(WaitCause::Connection);
+        metrics.record_egress_stream_abandoned(WaitCause::Cap);
+        metrics.record_egress_stream_abandoned(WaitCause::Cap);
+        metrics.record_egress_stream_abandoned(WaitCause::Other);
         metrics.record_egress_debt(5_000);
         metrics.record_egress_debt(2_000);
         metrics.record_egress_forgiven(7);
@@ -3392,8 +3435,12 @@ mod tests {
             assert_eq!(s.egress_bytes_waited, 300);
             assert_eq!(s.egress_wait_us_sum, 2 * 300 + 3_000_000);
             assert_eq!(s.egress_wait_us_max, 3_000_000);
-            assert_eq!(s.egress_long_waits, 1);
-            assert_eq!(s.egress_streams_abandoned, 2);
+            assert_eq!(s.egress_long_waits_cap, 0);
+            assert_eq!(s.egress_long_waits_connection, 1);
+            assert_eq!(s.egress_long_waits_other, 0);
+            assert_eq!(s.egress_streams_abandoned_cap, 2);
+            assert_eq!(s.egress_streams_abandoned_connection, 0);
+            assert_eq!(s.egress_streams_abandoned_other, 1);
             assert_eq!(s.egress_debt_hwm_bytes, 5_000);
             assert_eq!(s.egress_debt_forgiven_bytes, 7);
         }
@@ -3531,6 +3578,10 @@ mod tests {
         }
         for decision in EgressDecision::ALL {
             keys.push(format!("egress_{}", decision.label()));
+        }
+        for cause in WaitCause::ALL {
+            keys.push(format!("egress_long_waits_{}", cause.label()));
+            keys.push(format!("egress_streams_abandoned_{}", cause.label()));
         }
         for bucket in DialQueueWait::ALL {
             keys.push(format!("dial_queue_wait_{}", bucket.label()));
@@ -3748,8 +3799,12 @@ mod tests {
             "egress_bytes_waited",
             "egress_wait_us_sum",
             "egress_wait_us_max",
-            "egress_long_waits",
-            "egress_streams_abandoned",
+            "egress_long_waits_cap",
+            "egress_long_waits_connection",
+            "egress_long_waits_other",
+            "egress_streams_abandoned_cap",
+            "egress_streams_abandoned_connection",
+            "egress_streams_abandoned_other",
             "egress_debt_hwm_bytes",
             "egress_debt_forgiven_bytes",
         ] {

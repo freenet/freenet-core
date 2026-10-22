@@ -44,12 +44,16 @@
 //! A waiting stream gets a datagram when it wakes and finds enough in the
 //! bucket, with probability about `1/n` among `n` waiting streams, so each
 //! gets one every `n * 1200 / r` seconds on average at a cap of `r` bytes per
-//! second, and longer gaps have a geometric tail. A fragment that has waited
-//! [`PACED_WAIT_DEADLINE`] (the receiver's 5 s stream inactivity timeout) in
-//! total fails its stream. Fragments whose waits reach [`LONG_WAIT`] are
-//! counted (`egress_long_waits`), failed streams too
-//! (`egress_streams_abandoned`), and both are logged at WARN, at most once
-//! per [`LONG_WAIT_WARN_INTERVAL`].
+//! second, and longer gaps have a geometric tail. A stream whose next
+//! fragment has not been sent [`PACED_WAIT_DEADLINE`] (the receiver's 5 s
+//! stream inactivity timeout) after its previous one fails, measured as the
+//! receiver measures it ([`StreamPacing`]). Gaps that reach [`LONG_WAIT`]
+//! and failed streams are counted by what took most of the gap: the cap,
+//! the connection's own bucket (whose rate is the cap divided among the
+//! connections), or something else such as cwnd
+//! (`egress_long_waits_<cause>`, `egress_streams_abandoned_<cause>`), and
+//! each kind is logged at WARN with its remedy, at most once per
+//! [`LONG_WAIT_WARN_INTERVAL`].
 //!
 //! # The bucket
 //!
@@ -62,13 +66,11 @@
 
 use std::fmt;
 use std::mem::ManuallyDrop;
-#[cfg(test)]
-use std::sync::atomic::AtomicU64;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::time::Duration;
 
 use super::Socket;
-use super::metrics::{EgressDecision, TRANSPORT_METRICS};
+use super::metrics::{EgressDecision, TRANSPORT_METRICS, WaitCause};
 use super::packet_data::MAX_PACKET_SIZE;
 use super::peer_connection::streaming::STREAM_INACTIVITY_TIMEOUT;
 use crate::config::GlobalRng;
@@ -87,18 +89,18 @@ const MIN_BURST_PACKETS: u64 = 4;
 /// charge beyond it is forgiven.
 pub(crate) const DEBT_LIMIT: Duration = Duration::from_secs(1);
 
-/// A paced wait at least this long is counted and logged: half the
-/// receiver's stream inactivity timeout, so it is reported before gaps
-/// between one stream's fragments reach the point where the receiver gives
-/// the stream up.
+/// A gap between one stream's fragments at least this long is counted and
+/// logged: half the receiver's stream inactivity timeout, so it is reported
+/// before the receiver would give the stream up.
 pub(crate) const LONG_WAIT: Duration =
     Duration::from_millis(STREAM_INACTIVITY_TIMEOUT.as_millis() as u64 / 2);
 
-/// A fragment that has waited this long in total for the node-wide cap and
-/// its connection's bucket fails its stream: the receiver gives up a stream
-/// after the same gap between fragments, and is never told the sender is
-/// still trying, so waiting longer only spends the shared cap on a stream
-/// nobody will finish.
+/// With a cap, a stream whose next fragment has not been sent this long
+/// after its previous one (or after the stream started) fails: the receiver
+/// gives up a stream after the same gap between fragments and is never told
+/// the sender is still trying, so waiting longer only spends the shared cap
+/// on a stream nobody will finish. The gap counts every wait (the cap, the
+/// connection's bucket, cwnd), as the receiver's does.
 pub(crate) const PACED_WAIT_DEADLINE: Duration = STREAM_INACTIVITY_TIMEOUT;
 
 /// The long-wait warning is logged at most once per this interval.
@@ -133,10 +135,12 @@ pub(crate) struct EgressStats {
     pub wait_us_sum: u64,
     /// Longest single wait, in microseconds.
     pub wait_us_max: u64,
-    /// Paced fragments whose waits reached [`LONG_WAIT`].
-    pub long_waits: u64,
-    /// Streams failed because one fragment waited [`PACED_WAIT_DEADLINE`].
-    pub streams_abandoned: u64,
+    /// Paced fragments whose gap reached [`LONG_WAIT`], by [`WaitCause`].
+    pub long_waits: [u64; WaitCause::COUNT],
+    /// Streams failed at [`PACED_WAIT_DEADLINE`], by [`WaitCause`].
+    pub streams_abandoned: [u64; WaitCause::COUNT],
+    /// Takes refused because the bucket was short.
+    pub refusals: u64,
     /// Largest unpaced debt seen after a charge, in bytes.
     pub debt_hwm_bytes: u64,
     /// Unpaced bytes sent but not charged because the debt was at the limit.
@@ -151,8 +155,9 @@ struct StatCounters {
     bytes_waited: AtomicU64,
     wait_us_sum: AtomicU64,
     wait_us_max: AtomicU64,
-    long_waits: AtomicU64,
-    streams_abandoned: AtomicU64,
+    long_waits: [AtomicU64; WaitCause::COUNT],
+    streams_abandoned: [AtomicU64; WaitCause::COUNT],
+    refusals: AtomicU64,
     debt_hwm_bytes: AtomicU64,
     forgiven_bytes: AtomicU64,
 }
@@ -170,6 +175,10 @@ pub struct EgressCap {
     empty_at_ns: AtomicI64,
     /// When the long-wait warning was last logged (ns, on `clock`).
     last_long_wait_warn_ns: AtomicI64,
+    /// When the abandoned-stream warning was last logged, and how many
+    /// streams were abandoned since.
+    last_abandon_warn_ns: AtomicI64,
+    abandoned_since_warn: AtomicU64,
     #[cfg(test)]
     stats: StatCounters,
 }
@@ -215,6 +224,8 @@ impl EgressCap {
             clock,
             empty_at_ns: AtomicI64::new(now.saturating_sub(burst_ns)),
             last_long_wait_warn_ns: AtomicI64::new(i64::MIN),
+            last_abandon_warn_ns: AtomicI64::new(i64::MIN),
+            abandoned_since_warn: AtomicU64::new(0),
             #[cfg(test)]
             stats: StatCounters::default(),
         }
@@ -343,6 +354,8 @@ impl EgressCap {
         // The same predicate on the value the last attempt saw.
         let after = self.refilled(old, now).saturating_add(cost);
         if after > now {
+            #[cfg(test)]
+            self.stats.refusals.fetch_add(1, Ordering::Relaxed);
             return Err(Duration::from_nanos((after - now) as u64));
         }
         Ok(EgressTake {
@@ -380,52 +393,60 @@ impl EgressCap {
         }
     }
 
-    /// Record a fragment whose waits reached [`LONG_WAIT`] (once per
-    /// fragment), or that waited [`PACED_WAIT_DEADLINE`] and whose stream is
-    /// failed (`abandoned`), and log it at WARN, at most once per
+    /// Record a fragment whose gap reached [`LONG_WAIT`], attributed to
+    /// `cause`, and log it at WARN at most once per
     /// [`LONG_WAIT_WARN_INTERVAL`].
-    fn record_long_wait(&self, waited: Duration, abandoned: bool) {
-        if abandoned {
-            TRANSPORT_METRICS.record_egress_stream_abandoned();
-        } else {
-            TRANSPORT_METRICS.record_egress_long_wait();
-        }
+    fn record_long_wait(&self, cause: WaitCause, gap: Duration) {
+        TRANSPORT_METRICS.record_egress_long_wait(cause);
         #[cfg(test)]
-        {
-            let counter = if abandoned {
-                &self.stats.streams_abandoned
-            } else {
-                &self.stats.long_waits
-            };
-            counter.fetch_add(1, Ordering::Relaxed);
+        self.stats.long_waits[cause as usize].fetch_add(1, Ordering::Relaxed);
+        if self.warn_due(&self.last_long_wait_warn_ns) {
+            tracing::warn!(
+                gap_ms = gap.as_millis() as u64,
+                cause = cause.label(),
+                total_bandwidth_limit = self.rate_bytes_per_sec,
+                stream_inactivity_timeout_ms = STREAM_INACTIVITY_TIMEOUT.as_millis() as u64,
+                remedy = remedy(cause),
+                "A stream fragment has waited this long since the stream's previous \
+                 fragment; at stream_inactivity_timeout_ms the stream fails"
+            );
         }
-        self.warn_long_wait(waited, abandoned, self.now());
     }
 
-    fn warn_long_wait(&self, waited: Duration, abandoned: bool, now: i64) {
+    /// Record a stream failed at [`PACED_WAIT_DEADLINE`], attributed to
+    /// `cause`, and log the number failed since the last WARN, at most once
+    /// per [`LONG_WAIT_WARN_INTERVAL`].
+    fn record_abandoned(&self, cause: WaitCause, gap: Duration) {
+        TRANSPORT_METRICS.record_egress_stream_abandoned(cause);
+        #[cfg(test)]
+        self.stats.streams_abandoned[cause as usize].fetch_add(1, Ordering::Relaxed);
+        let since = self.abandoned_since_warn.fetch_add(1, Ordering::Relaxed) + 1;
+        if self.warn_due(&self.last_abandon_warn_ns) {
+            self.abandoned_since_warn
+                .fetch_sub(since, Ordering::Relaxed);
+            tracing::warn!(
+                streams_abandoned = since,
+                gap_ms = gap.as_millis() as u64,
+                cause = cause.label(),
+                total_bandwidth_limit = self.rate_bytes_per_sec,
+                remedy = remedy(cause),
+                "Outbound streams failed: a fragment could not be sent within the \
+                 receiver's stream inactivity timeout"
+            );
+        }
+    }
+
+    /// Whether a rate-limited WARN whose last time is in `last` may be
+    /// logged now; if so, records now as its last time.
+    fn warn_due(&self, last: &AtomicI64) -> bool {
+        let now = self.now();
         let interval = i64::try_from(LONG_WAIT_WARN_INTERVAL.as_nanos()).unwrap_or(i64::MAX);
-        let last = self.last_long_wait_warn_ns.load(Ordering::Relaxed);
-        if last != i64::MIN && now.saturating_sub(last) < interval {
-            return;
+        let previous = last.load(Ordering::Relaxed);
+        if previous != i64::MIN && now.saturating_sub(previous) < interval {
+            return false;
         }
-        if self
-            .last_long_wait_warn_ns
-            .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
-            .is_err()
-        {
-            return;
-        }
-        tracing::warn!(
-            waited_ms = waited.as_millis() as u64,
-            stream_abandoned = abandoned,
-            total_bandwidth_limit = self.rate_bytes_per_sec,
-            stream_inactivity_timeout_ms = STREAM_INACTIVITY_TIMEOUT.as_millis() as u64,
-            "A stream fragment waited this long for the node-wide egress cap \
-             (total-bandwidth-limit): too many concurrent streams for the cap. \
-             A fragment that waits stream_inactivity_timeout_ms fails its stream \
-             (stream_abandoned), as the receiver would give it up anyway; raise \
-             total-bandwidth-limit if transfers fail"
-        );
+        last.compare_exchange(previous, now, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
     }
 
     /// The bucket level in bytes now; negative while in debt.
@@ -448,8 +469,9 @@ impl EgressCap {
             bytes_waited: load(&s.bytes_waited),
             wait_us_sum: load(&s.wait_us_sum),
             wait_us_max: load(&s.wait_us_max),
-            long_waits: load(&s.long_waits),
-            streams_abandoned: load(&s.streams_abandoned),
+            long_waits: std::array::from_fn(|i| load(&s.long_waits[i])),
+            streams_abandoned: std::array::from_fn(|i| load(&s.streams_abandoned[i])),
+            refusals: load(&s.refusals),
             debt_hwm_bytes: load(&s.debt_hwm_bytes),
             forgiven_bytes: load(&s.forgiven_bytes),
         }
@@ -517,52 +539,122 @@ pub(crate) fn jittered(deficit: Duration) -> Duration {
         .saturating_add(Duration::from_micros(GlobalRng::random_range(0..2_000)))
 }
 
-/// One paced fragment's waits: when it started waiting, whether its long
-/// wait was reported, and its deadline.
-#[derive(Default)]
-pub(crate) struct PacedWait {
-    started_ns: Option<u64>,
+/// What a long gap or a failed stream is blamed on, for its telemetry and
+/// WARN.
+fn remedy(cause: WaitCause) -> &'static str {
+    match cause {
+        WaitCause::Cap => {
+            "too many concurrent streams for the node-wide cap: raise total-bandwidth-limit"
+        }
+        WaitCause::Connection => {
+            "too many streams for this connection's share of the cap \
+             (total-bandwidth-limit / active connections, at least \
+             min-bandwidth-per-connection): raise min-bandwidth-per-connection \
+             or total-bandwidth-limit"
+        }
+        WaitCause::Other => {
+            "the time went to the congestion window (slow ACKs) or elsewhere, \
+             not to the egress limits"
+        }
+    }
+}
+
+/// One paced stream's gaps: the time since its previous fragment was sent
+/// (or since it started, before its first), which is the gap the receiver's
+/// `STREAM_INACTIVITY_TIMEOUT` measures, and how much of the current gap was
+/// spent sleeping on the node-wide cap and on the connection's bucket. Used
+/// only when the node has a cap.
+pub(crate) struct StreamPacing {
+    gap_start_ns: u64,
+    cap_slept: Duration,
+    connection_slept: Duration,
     long_reported: bool,
 }
 
-impl PacedWait {
-    /// Time since this fragment first waited (zero if it has not).
-    pub(crate) fn waited<T: TimeSource>(&self, time_source: &T) -> Duration {
-        self.started_ns.map_or(Duration::ZERO, |start| {
-            Duration::from_nanos(time_source.now_nanos().saturating_sub(start))
-        })
+impl StreamPacing {
+    pub(crate) fn new<T: TimeSource>(time_source: &T) -> Self {
+        Self {
+            gap_start_ns: time_source.now_nanos(),
+            cap_slept: Duration::ZERO,
+            connection_slept: Duration::ZERO,
+            long_reported: false,
+        }
     }
 
-    /// Sleep for a refused take's `deficit` (jittered), on the caller's
-    /// `TimeSource`. Reports the fragment once when its waits reach
-    /// [`LONG_WAIT`]. Returns `Err(waited)` when they reach
-    /// [`PACED_WAIT_DEADLINE`]: the caller fails the stream.
+    /// Time since the stream's previous fragment was sent.
+    pub(crate) fn gap<T: TimeSource>(&self, time_source: &T) -> Duration {
+        Duration::from_nanos(time_source.now_nanos().saturating_sub(self.gap_start_ns))
+    }
+
+    /// How long the current fragment has slept for the cap and its
+    /// connection's bucket: what `egress_waited` and the wait times count.
+    pub(crate) fn slept(&self) -> Duration {
+        self.cap_slept.saturating_add(self.connection_slept)
+    }
+
+    /// The limit that took most of the current gap.
+    fn cause<T: TimeSource>(&self, time_source: &T) -> WaitCause {
+        let other = self.gap(time_source).saturating_sub(self.slept());
+        if self.cap_slept >= self.connection_slept && self.cap_slept >= other {
+            WaitCause::Cap
+        } else if self.connection_slept >= other {
+            WaitCause::Connection
+        } else {
+            WaitCause::Other
+        }
+    }
+
+    /// Check the current gap: report it once when it reaches [`LONG_WAIT`],
+    /// and return `Err(gap)` when it reaches [`PACED_WAIT_DEADLINE`]: the
+    /// caller must not send the fragment and fails the stream. Called before
+    /// every attempt to take, and after every sleep.
+    pub(crate) fn check<T: TimeSource>(
+        &mut self,
+        time_source: &T,
+        cap: &EgressCap,
+    ) -> Result<(), Duration> {
+        let gap = self.gap(time_source);
+        if gap >= PACED_WAIT_DEADLINE {
+            cap.record_abandoned(self.cause(time_source), gap);
+            return Err(gap);
+        }
+        if gap >= LONG_WAIT && !self.long_reported {
+            self.long_reported = true;
+            cap.record_long_wait(self.cause(time_source), gap);
+        }
+        Ok(())
+    }
+
+    /// Sleep for a refused take's `deficit` (jittered) on the caller's
+    /// `TimeSource`, crediting the time to `cause` (the cap or the
+    /// connection's bucket), then [`Self::check`]. The sleep stops at
+    /// [`LONG_WAIT`] the first time and at the deadline, so both are reported
+    /// when they happen.
     pub(crate) async fn sleep<T: TimeSource>(
         &mut self,
         time_source: &T,
-        cap: Option<&EgressCap>,
+        cap: &EgressCap,
+        cause: WaitCause,
         deficit: Duration,
     ) -> Result<(), Duration> {
-        self.started_ns.get_or_insert(time_source.now_nanos());
-        let elapsed = self.waited(time_source);
-        // Wake at the deadline, and at LONG_WAIT the first time, so both are
-        // reported when they happen even under one long deficit.
-        let mut left = PACED_WAIT_DEADLINE.saturating_sub(elapsed);
-        if !self.long_reported && elapsed < LONG_WAIT {
-            left = left.min(LONG_WAIT - elapsed);
+        let gap = self.gap(time_source);
+        let mut left = PACED_WAIT_DEADLINE.saturating_sub(gap);
+        if !self.long_reported && gap < LONG_WAIT {
+            left = left.min(LONG_WAIT - gap);
         }
+        let before = time_source.now_nanos();
         time_source.sleep(jittered(deficit).min(left)).await;
-        let waited = self.waited(time_source);
-        let Some(cap) = cap else { return Ok(()) };
-        if waited >= PACED_WAIT_DEADLINE {
-            cap.record_long_wait(waited, true);
-            return Err(waited);
+        let slept = Duration::from_nanos(time_source.now_nanos().saturating_sub(before));
+        match cause {
+            WaitCause::Connection => self.connection_slept += slept,
+            WaitCause::Cap | WaitCause::Other => self.cap_slept += slept,
         }
-        if waited >= LONG_WAIT && !self.long_reported {
-            self.long_reported = true;
-            cap.record_long_wait(waited, false);
-        }
-        Ok(())
+        self.check(time_source, cap)
+    }
+
+    /// The fragment was sent: the next gap starts now.
+    pub(crate) fn sent<T: TimeSource>(&mut self, time_source: &T) {
+        *self = Self::new(time_source);
     }
 }
 

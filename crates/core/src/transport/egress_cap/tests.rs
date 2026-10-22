@@ -1,5 +1,6 @@
 use super::*;
 use crate::simulation::VirtualTime;
+use crate::transport::metrics::WaitCause;
 
 /// 1 MB/s: one byte per microsecond, a 25 000 byte burst, 1 200 bytes take
 /// 1.2 ms. Round numbers so expected values can be written out.
@@ -213,30 +214,34 @@ where
     task.await.unwrap()
 }
 
-/// A fragment that cannot be admitted fails its stream once it has waited
-/// `PACED_WAIT_DEADLINE` in total, no later (the last sleep is cut to the
-/// deadline), and its long wait is reported once on the way, from the
-/// waiting loop, although nothing was ever sent.
+/// A fragment that cannot be admitted fails its stream once the gap since
+/// the stream's previous fragment reaches `PACED_WAIT_DEADLINE`, no later
+/// (the last sleep is cut to the deadline), and the gap is reported once at
+/// `LONG_WAIT` on the way, from the waiting loop, although nothing was sent.
+/// Both are blamed on the cap, which took all the time.
 #[tokio::test(flavor = "current_thread")]
 async fn a_fragment_fails_its_stream_at_the_wait_deadline() {
     let time = VirtualTime::new();
     // 100 B/s with the bucket drained: a datagram needs 12 s, past the deadline.
     let cap = std::sync::Arc::new(EgressCap::new(100, time.clone()));
     cap.charge_unpaced(cap.burst_bytes() as usize);
-    let waited = {
+    let gap = {
         let (cap, time) = (cap.clone(), time.clone());
         drive_virtual(&time.clone(), async move {
-            let mut paced = PacedWait::default();
+            let mut pacing = StreamPacing::new(&time);
             loop {
                 assert!(
                     time.now_nanos() < 2 * PACED_WAIT_DEADLINE.as_nanos() as u64,
                     "no deadline"
                 );
-                match cap.try_take(PACKET, paced.waited(&time)) {
+                if let Err(gap) = pacing.check(&time, &cap) {
+                    break gap;
+                }
+                match cap.try_take(PACKET, pacing.slept()) {
                     Ok(_) => panic!("admitted"),
                     Err(deficit) => {
-                        if let Err(waited) = paced.sleep(&time, Some(&cap), deficit).await {
-                            break waited;
+                        if let Err(gap) = pacing.sleep(&time, &cap, WaitCause::Cap, deficit).await {
+                            break gap;
                         }
                     }
                 }
@@ -244,11 +249,15 @@ async fn a_fragment_fails_its_stream_at_the_wait_deadline() {
         })
         .await
     };
-    assert_eq!(waited, PACED_WAIT_DEADLINE);
+    assert_eq!(gap, PACED_WAIT_DEADLINE);
     assert_eq!(time.now_nanos(), PACED_WAIT_DEADLINE.as_nanos() as u64);
     let stats = cap.stats();
-    assert_eq!(stats.streams_abandoned, 1);
-    assert_eq!(stats.long_waits, 1, "reported once, before the deadline");
+    assert_eq!(stats.streams_abandoned, [1, 0, 0], "blamed on the cap");
+    assert_eq!(
+        stats.long_waits,
+        [1, 0, 0],
+        "reported once, before the deadline"
+    );
     assert_eq!(
         stats.packets.iter().sum::<u64>(),
         1,
@@ -256,74 +265,106 @@ async fn a_fragment_fails_its_stream_at_the_wait_deadline() {
     );
 }
 
-/// A fragment that keeps sleeping past `LONG_WAIT` is reported once, not
-/// once per sleep.
+/// A gap that keeps growing past `LONG_WAIT` is reported once per fragment,
+/// not once per sleep, and blamed on the limit that took the time (here the
+/// connection's bucket).
 #[tokio::test(flavor = "current_thread")]
-async fn a_long_wait_is_reported_once_per_fragment() {
+async fn a_long_gap_is_reported_once_per_fragment() {
     let time = VirtualTime::new();
     let cap = std::sync::Arc::new(EgressCap::new(RATE, time.clone()));
     {
         let (cap, time) = (cap.clone(), time.clone());
         drive_virtual(&time.clone(), async move {
-            let mut paced = PacedWait::default();
+            let mut pacing = StreamPacing::new(&time);
             // 200 ms deficits for 4 s: about seven sleeps past LONG_WAIT.
-            while paced.waited(&time) < Duration::from_secs(4) {
-                assert!(time.now_nanos() < 10_000_000_000, "waits are not measured");
-                paced
-                    .sleep(&time, Some(&cap), Duration::from_millis(200))
+            while pacing.gap(&time) < Duration::from_secs(4) {
+                assert!(time.now_nanos() < 10_000_000_000, "gaps are not measured");
+                pacing
+                    .sleep(
+                        &time,
+                        &cap,
+                        WaitCause::Connection,
+                        Duration::from_millis(200),
+                    )
                     .await
                     .unwrap();
             }
         })
         .await;
     }
-    assert_eq!(cap.stats().long_waits, 1);
-    assert_eq!(cap.stats().streams_abandoned, 0);
+    assert_eq!(cap.stats().long_waits, [0, 1, 0]);
+    assert_eq!(cap.stats().streams_abandoned, [0, 0, 0]);
+}
+
+/// The gap is the time since the stream's previous fragment was sent, as
+/// the receiver measures it: time spent outside the egress sleeps (waiting
+/// for cwnd, for instance) counts, and blamed on "other"; a send starts a
+/// new gap.
+#[test]
+fn the_gap_runs_from_the_previous_send_and_counts_all_time() {
+    let (cap, time) = cap_at(RATE);
+    let mut pacing = StreamPacing::new(&time);
+    time.advance(Duration::from_secs(4));
+    pacing.sent(&time);
+    assert_eq!(pacing.gap(&time), Duration::ZERO, "a send starts a new gap");
+    // Six seconds with no egress sleep, as in a cwnd wait.
+    time.advance(Duration::from_secs(6));
+    assert_eq!(pacing.check(&time, &cap), Err(Duration::from_secs(6)));
+    assert_eq!(cap.stats().streams_abandoned, [0, 0, 1], "blamed on other");
 }
 
 /// A datagram held back only by its connection's bucket still counts as
-/// waited, by elapsed time: every wait goes through `PacedWait`.
+/// waited: every egress sleep is counted, whichever bucket it was for.
 #[tokio::test(flavor = "current_thread")]
 async fn a_wait_on_the_connection_bucket_alone_counts_as_waited() {
     let time = VirtualTime::new();
     let cap = std::sync::Arc::new(EgressCap::new(RATE, time.clone()));
-    let waited = {
+    let slept = {
         let (cap, time) = (cap.clone(), time.clone());
         drive_virtual(&time.clone(), async move {
-            let mut paced = PacedWait::default();
+            let mut pacing = StreamPacing::new(&time);
             // The connection's bucket refused, with a 5 ms deficit.
-            paced
-                .sleep(&time, Some(&cap), Duration::from_millis(5))
+            pacing
+                .sleep(&time, &cap, WaitCause::Connection, Duration::from_millis(5))
                 .await
                 .unwrap();
-            let waited = paced.waited(&time);
-            cap.try_take(PACKET, waited).unwrap().sent(PACKET);
-            waited
+            let slept = pacing.slept();
+            cap.try_take(PACKET, slept).unwrap().sent(PACKET);
+            slept
         })
         .await
     };
-    assert!(waited >= Duration::from_millis(5), "{waited:?}");
+    assert!(slept >= Duration::from_millis(5), "{slept:?}");
     assert_eq!(count(&cap, EgressDecision::Waited), 1);
     assert_eq!(count(&cap, EgressDecision::Immediate), 0);
-    assert_eq!(cap.stats().wait_us_sum, waited.as_micros() as u64);
+    assert_eq!(cap.stats().wait_us_sum, slept.as_micros() as u64);
 }
 
-/// The long-wait warning is rate-limited on the cap's clock.
+/// Long gaps and abandoned streams have separate rate-limited warnings, so
+/// one cannot suppress the other.
 #[test]
-fn the_long_wait_warning_is_rate_limited() {
+fn the_warnings_are_rate_limited_separately() {
     let (cap, time) = cap_at(RATE);
-    let now = |t: &VirtualTime| t.now_nanos() as i64;
-    let warned = |cap: &EgressCap| cap.last_long_wait_warn_ns.load(Ordering::Relaxed);
-    assert_eq!(warned(&cap), i64::MIN, "nothing logged yet");
-    cap.warn_long_wait(LONG_WAIT, false, now(&time));
-    let first = warned(&cap);
-    assert_eq!(first, now(&time));
+    assert!(cap.warn_due(&cap.last_long_wait_warn_ns));
+    assert!(!cap.warn_due(&cap.last_long_wait_warn_ns), "suppressed");
+    assert!(
+        cap.warn_due(&cap.last_abandon_warn_ns),
+        "a long-gap warning does not suppress the abandoned one"
+    );
+    // Abandoned streams inside the interval are counted for the next WARN.
+    cap.record_abandoned(WaitCause::Cap, PACED_WAIT_DEADLINE);
+    cap.record_abandoned(WaitCause::Cap, PACED_WAIT_DEADLINE);
+    assert_eq!(cap.abandoned_since_warn.load(Ordering::Relaxed), 2);
     time.advance(LONG_WAIT_WARN_INTERVAL - Duration::from_millis(1));
-    cap.warn_long_wait(LONG_WAIT, false, now(&time));
-    assert_eq!(warned(&cap), first, "suppressed inside the interval");
+    assert!(!cap.warn_due(&cap.last_long_wait_warn_ns));
     time.advance(Duration::from_millis(1));
-    cap.warn_long_wait(LONG_WAIT, false, now(&time));
-    assert_eq!(warned(&cap), now(&time), "logged again after it");
+    assert!(
+        cap.warn_due(&cap.last_long_wait_warn_ns),
+        "logged again after it"
+    );
+    // The next abandoned stream logs, with the count, and resets it.
+    cap.record_abandoned(WaitCause::Cap, PACED_WAIT_DEADLINE);
+    assert_eq!(cap.abandoned_since_warn.load(Ordering::Relaxed), 0);
 }
 
 #[test]
