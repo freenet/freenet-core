@@ -134,6 +134,31 @@ impl<T: TimeSource> TokenBucket<T> {
         wait_time
     }
 
+    /// Take `bytes` only if the bucket holds that many now; otherwise take
+    /// nothing and say how long the rate needs to make up the deficit. Used
+    /// with the node-wide egress cap, so that the per-connection payment and
+    /// the node-wide take are made at the same moment for the same datagram
+    /// (see `transport::egress_cap`).
+    pub fn try_take(&self, bytes: usize) -> Result<(), Duration> {
+        let mut state = self.state.lock();
+        self.refill_state(&mut state);
+        let bytes_isize = bytes as isize;
+        if state.tokens >= bytes_isize || state.rate == 0 {
+            state.tokens -= bytes_isize;
+            return Ok(());
+        }
+        let deficit = bytes_isize - state.tokens;
+        Err(Duration::from_secs_f64(deficit as f64 / state.rate as f64))
+    }
+
+    /// Return `bytes` taken by [`Self::try_take`] for a datagram that will
+    /// not be sent now, never above the capacity.
+    pub fn give_back(&self, bytes: usize) {
+        let mut state = self.state.lock();
+        let capacity = state.capacity as isize;
+        state.tokens = state.tokens.saturating_add(bytes as isize).min(capacity);
+    }
+
     /// Refill tokens based on virtual time elapsed.
     fn refill_state(&self, state: &mut BucketState) {
         let now_nanos = self.time_source.now_nanos();

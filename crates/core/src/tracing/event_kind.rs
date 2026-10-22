@@ -80,7 +80,12 @@ pub enum EventKind {
     ///
     /// Emitted every N seconds (default 30s) with aggregate transport statistics.
     /// This is more efficient than per-transfer events and provides trend data.
-    TransportSnapshot(crate::transport::TransportSnapshot),
+    ///
+    /// Boxed for the same reason as `RouterSnapshot`: the snapshot is a few
+    /// hundred bytes of counters, and inlining it makes every `EventKind` that
+    /// large (`clippy::large_enum_variant`). `Box` serializes transparently, so
+    /// the AOF/OTLP wire format is unchanged.
+    TransportSnapshot(Box<crate::transport::TransportSnapshot>),
     /// Interest sync events for delta-based state synchronization.
     ///
     /// Tracks ResyncRequests and ResyncResponses which indicate delta application

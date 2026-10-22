@@ -2530,6 +2530,10 @@ mod tests {
                 "MIN_BUCKET_CAPACITY_BYTES",
                 "token-bucket floor, not a cache",
             ),
+            (
+                "PACED_TAKE_BYTES",
+                "egress-cap take per datagram (a rate charge), not memory",
+            ),
             ("BLOOM_BYTES", "fixed size of one bloom filter"),
             (
                 "CACHE_ENTRY_OVERHEAD_BYTES",

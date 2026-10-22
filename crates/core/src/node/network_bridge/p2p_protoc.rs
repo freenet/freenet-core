@@ -1285,6 +1285,22 @@ impl P2pConnManager {
                         total,
                         config.config.network_api.min_bandwidth_per_connection,
                     ));
+                    // The transport builds a node-wide egress cap from the
+                    // same total (`transport::egress_cap`); say so at startup,
+                    // and warn when it is low for the allowed connections.
+                    if total > 0 {
+                        crate::transport::egress_cap::log_startup_cap(
+                            total,
+                            config
+                                .config
+                                .network_api
+                                .min_bandwidth_per_connection
+                                .unwrap_or(
+                                    crate::transport::global_bandwidth::DEFAULT_MIN_PER_CONNECTION,
+                                ),
+                            config.config.network_api.max_connections,
+                        );
+                    }
                     // Phase 1.6 shadow telemetry (#4074): expose the
                     // effective aggregate rate R to the demand aggregator.
                     // Observation only — the manager is read, never written,

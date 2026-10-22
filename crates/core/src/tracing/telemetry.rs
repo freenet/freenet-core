@@ -2882,6 +2882,66 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                 "demux_other".into(),
                 serde_json::json!(snapshot.demux_other),
             );
+            m.insert(
+                "egress_immediate".into(),
+                serde_json::json!(snapshot.egress_immediate),
+            );
+            m.insert(
+                "egress_waited".into(),
+                serde_json::json!(snapshot.egress_waited),
+            );
+            m.insert(
+                "egress_unpaced".into(),
+                serde_json::json!(snapshot.egress_unpaced),
+            );
+            m.insert(
+                "egress_bytes".into(),
+                serde_json::json!(snapshot.egress_bytes),
+            );
+            m.insert(
+                "egress_bytes_waited".into(),
+                serde_json::json!(snapshot.egress_bytes_waited),
+            );
+            m.insert(
+                "egress_wait_us_sum".into(),
+                serde_json::json!(snapshot.egress_wait_us_sum),
+            );
+            m.insert(
+                "egress_wait_us_max".into(),
+                serde_json::json!(snapshot.egress_wait_us_max),
+            );
+            m.insert(
+                "egress_long_waits_cap".into(),
+                serde_json::json!(snapshot.egress_long_waits_cap),
+            );
+            m.insert(
+                "egress_long_waits_connection".into(),
+                serde_json::json!(snapshot.egress_long_waits_connection),
+            );
+            m.insert(
+                "egress_long_waits_other".into(),
+                serde_json::json!(snapshot.egress_long_waits_other),
+            );
+            m.insert(
+                "egress_streams_abandoned_cap".into(),
+                serde_json::json!(snapshot.egress_streams_abandoned_cap),
+            );
+            m.insert(
+                "egress_streams_abandoned_connection".into(),
+                serde_json::json!(snapshot.egress_streams_abandoned_connection),
+            );
+            m.insert(
+                "egress_streams_abandoned_other".into(),
+                serde_json::json!(snapshot.egress_streams_abandoned_other),
+            );
+            m.insert(
+                "egress_debt_hwm_bytes".into(),
+                serde_json::json!(snapshot.egress_debt_hwm_bytes),
+            );
+            m.insert(
+                "egress_debt_forgiven_bytes".into(),
+                serde_json::json!(snapshot.egress_debt_forgiven_bytes),
+            );
             serde_json::Value::Object(m)
         }
         EventKind::InterestSync(interest_sync_event) => {
@@ -6513,13 +6573,14 @@ mod tests {
             .cloned()
             .collect();
         expected.insert("type".to_string());
-        let actual: std::collections::BTreeSet<String> =
-            event_kind_to_json(&super::super::EventKind::TransportSnapshot(snapshot))
-                .as_object()
-                .unwrap()
-                .keys()
-                .cloned()
-                .collect();
+        let actual: std::collections::BTreeSet<String> = event_kind_to_json(
+            &super::super::EventKind::TransportSnapshot(Box::new(snapshot)),
+        )
+        .as_object()
+        .unwrap()
+        .keys()
+        .cloned()
+        .collect();
         assert_eq!(actual, expected);
     }
 
@@ -6547,10 +6608,27 @@ mod tests {
             demux_legacy: 19,
             demux_quic: 20,
             demux_other: 21,
+            egress_immediate: 22,
+            egress_waited: 23,
+            egress_unpaced: 25,
+            egress_bytes: 26,
+            egress_bytes_waited: 27,
+            egress_wait_us_sum: 28,
+            egress_wait_us_max: 29,
+            egress_long_waits_cap: 40,
+            egress_long_waits_connection: 41,
+            egress_long_waits_other: 42,
+            egress_streams_abandoned_cap: 43,
+            egress_streams_abandoned_connection: 44,
+            egress_streams_abandoned_other: 45,
+            egress_debt_hwm_bytes: 30,
+            egress_debt_forgiven_bytes: 31,
             ..Default::default()
         };
         let reference = serde_json::to_value(&snapshot).unwrap();
-        let json = event_kind_to_json(&super::super::EventKind::TransportSnapshot(snapshot));
+        let json = event_kind_to_json(&super::super::EventKind::TransportSnapshot(Box::new(
+            snapshot,
+        )));
         for (key, expected) in [
             ("nat_attempts_connect_joiner", 1),
             ("nat_attempts_connect_acceptor", 2),
@@ -6571,6 +6649,21 @@ mod tests {
             ("demux_legacy", 19),
             ("demux_quic", 20),
             ("demux_other", 21),
+            ("egress_immediate", 22),
+            ("egress_waited", 23),
+            ("egress_unpaced", 25),
+            ("egress_bytes", 26),
+            ("egress_bytes_waited", 27),
+            ("egress_wait_us_sum", 28),
+            ("egress_wait_us_max", 29),
+            ("egress_long_waits_cap", 40),
+            ("egress_long_waits_connection", 41),
+            ("egress_long_waits_other", 42),
+            ("egress_streams_abandoned_cap", 43),
+            ("egress_streams_abandoned_connection", 44),
+            ("egress_streams_abandoned_other", 45),
+            ("egress_debt_hwm_bytes", 30),
+            ("egress_debt_forgiven_bytes", 31),
         ] {
             assert_eq!(json[key], expected, "event-log value for {key}");
             assert_eq!(json[key], reference[key], "serde value for {key}");
@@ -6592,7 +6685,9 @@ mod tests {
             ..Default::default()
         };
         let reference = serde_json::to_value(&snapshot).unwrap();
-        let json = event_kind_to_json(&super::super::EventKind::TransportSnapshot(snapshot));
+        let json = event_kind_to_json(&super::super::EventKind::TransportSnapshot(Box::new(
+            snapshot,
+        )));
         for (key, expected) in [
             ("inbound_stream_refused_invalid_length", 1),
             ("inbound_stream_refused_connection_bytes", 2),

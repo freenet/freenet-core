@@ -5,7 +5,8 @@
 The Freenet transport layer supports two bandwidth configuration modes:
 
 1. **Per-connection mode** (default): Each connection gets an independent bandwidth limit
-2. **Global pool mode**: Total bandwidth is shared fairly across all connections
+2. **Global pool mode**: Total bandwidth is shared fairly across all connections, and
+   `total-bandwidth-limit` is a node-wide cap on everything the node sends
 
 ## Quick Start
 
@@ -33,8 +34,8 @@ freenet --total-bandwidth-limit 50000000 --min-bandwidth-per-connection 1000000
 | Argument | Description | Default |
 |----------|-------------|---------|
 | `--bandwidth-limit <bytes/sec>` | Per-connection bandwidth limit | 10,000,000 (10 MB/s) |
-| `--total-bandwidth-limit <bytes/sec>` | Total bandwidth across ALL connections | None (disabled) |
-| `--min-bandwidth-per-connection <bytes/sec>` | Minimum per-connection rate (prevents starvation) | 1,000,000 (1 MB/s) |
+| `--total-bandwidth-limit <bytes/sec>` | Cap on everything the node sends over UDP, across ALL connections | None (disabled) |
+| `--min-bandwidth-per-connection <bytes/sec>` | Minimum per-connection pacing rate inside the total (clamped to the total) | 1,000,000 (1 MB/s) |
 | `--congestion-control <algorithm>` | Congestion control algorithm (`fixedrate`, `ledbat`, `bbr`) | `fixedrate` |
 | `--ledbat-min-ssthresh <bytes>` | Minimum LEDBAT ssthresh floor (for high-latency paths) | None (~5.7KB algorithm default) |
 | `--bbr-startup-rate <bytes/sec>` | BBR initial sending rate (BBR algorithm only) | 25,000,000 (25 MB/s) |
@@ -162,11 +163,80 @@ bbr-startup-rate = 10000000  # 10 MB/s for moderate startup
 
 ## Global Pool Mode Details
 
-When `total-bandwidth-limit` is configured, bandwidth is distributed using this formula:
+When `total-bandwidth-limit` is configured, two things happen.
+
+Each connection is paced at:
 
 ```
+min_per_connection = min(min-bandwidth-per-connection, total_limit)
 per_connection_rate = max(total_limit / active_connections, min_per_connection)
 ```
+
+And the node-wide egress cap holds the node's total sending rate at `total_limit`,
+whatever the per-connection rates add up to (see below).
+
+### Node-wide egress cap
+
+Every datagram the node sends on its UDP socket is charged to one token bucket of
+`total_limit` bytes per second: handshakes, ACKs, receipts, keepalive Pings, Pongs,
+retransmissions, short messages and stream fragments. The cap counts UDP payload
+bytes; IP and UDP headers (28 to 48 bytes per datagram) are not counted. The bucket
+holds 25 ms of the rate (at least four 1200-byte packets), so after an idle period the
+node may send that much at once before pacing starts. It lives in `DemuxSocket`
+(`crates/core/src/transport/demux.rs`) and `crates/core/src/transport/egress_cap.rs`.
+
+Only one kind of send waits for the bucket:
+
+| Send | Behaviour when the bucket is empty |
+|------|------------------------------------|
+| Stream fragments (`send_stream`, `pipe_stream`) | After cwnd admission, take the datagram from the per-connection bucket and the node-wide bucket at the same moment, and send at once. If either is short, take nothing, sleep for the deficit times 1.0 to 1.4 plus 0 to 2 ms (random), and start again from the cwnd check. Nothing is held while waiting, and the order among waiting streams is random. A stream whose next fragment has not been sent 5 s after its previous one (the gap the receiver times, whatever the wait was for) fails. |
+| Everything else (handshakes, short messages, ACKs, receipts, keepalives, Pongs, retransmissions) | Sent at once and charged once sent. The bucket goes into debt, and the next stream fragments wait longer to pay it. |
+
+The sends that never wait are sent from places that must not block: the receive path
+of a connection, which runs inside a `select!` that can be cancelled, the connection's
+own task (which sends short messages and also receives for the connection), the
+handshake tasks, and the keepalive task. A failed send is not charged.
+
+What this guarantees:
+
+- Over any interval ending at a stream fragment's send, the node sends at most the
+  burst plus the cap times the interval, control traffic included, plus the control
+  bytes forgiven in that interval: a fragment is sent only when the bucket is not in
+  debt.
+- Over other intervals the node can send more, by the control-traffic debt not yet
+  paid off. That debt is limited to one second of the cap; a control datagram beyond
+  it is still sent but not charged ("forgiven", counted as
+  `egress_debt_forgiven_bytes`). So the cap holds on average, and forgiven bytes mean
+  control traffic alone exceeded the cap for over a second.
+- The order among waiting streams is random: a stream that wakes when the bucket has
+  room takes it. Each of `N` concurrent streams gets a fragment about every
+  `N * 1200 / C` seconds on average at a cap of `C` bytes/s, and the gaps have a
+  geometric tail (see the troubleshooting section). Connections share the cap in
+  proportion to their number of waiting streams.
+- Known limitation: there is no isolation between connections inside the cap. A peer
+  that drives many streams through this node gets a proportional share of it.
+
+Without `total-bandwidth-limit` no bucket exists and nothing changes. A
+`total-bandwidth-limit` of 0 is ignored with a warning.
+
+At startup the node logs the cap, warns if `min-bandwidth-per-connection` was above
+the total (it is clamped), and warns if the total is below 4,800 bytes/s (four
+packets) per allowed connection (`max-number-of-connections`), because the control
+traffic of a full set of connections can then use most of the cap.
+
+The `transport_snapshot` telemetry event carries, per period: `egress_immediate`,
+`egress_waited` and `egress_unpaced` (datagrams by how they were paced),
+`egress_bytes`, `egress_bytes_waited`, `egress_wait_us_sum`, `egress_wait_us_max`,
+`egress_long_waits_<cause>` (gaps of at least 2.5 s between one stream's fragments,
+half the receiver's 5 s stream inactivity timeout), `egress_streams_abandoned_<cause>`
+(streams failed at a 5 s gap), `egress_debt_hwm_bytes` (the largest control-traffic
+debt) and `egress_debt_forgiven_bytes`. `<cause>` is what took most of the gap: `cap`
+(sleeping for the node-wide cap), `connection` (sleeping for the connection's own
+bucket) or `other` (mostly waiting for the congestion window, or for the upstream stream when the stream is relayed). `egress_waited` and the
+wait times count sleeps for either bucket. All are zero without a cap. A gap of 2.5 s or
+more between one stream's fragments, and a stream failed at the 5 s deadline, are each
+logged at WARN, with separate rate limits (at most once a minute each). A WARN has one
+line for each cause that happened since the last one, with its count and remedy.
 
 ### Example: 1 Gbps Connection
 
@@ -185,9 +255,11 @@ min-bandwidth-per-connection = 2000000     # 2 MB/s minimum
 | 10 | 10 MB/s | 100 MB/s |
 | 25 | 4 MB/s | 100 MB/s |
 | 50 | 2 MB/s (min enforced) | 100 MB/s |
-| 100 | 2 MB/s (min enforced) | 200 MB/s* |
+| 100 | 2 MB/s (min enforced) | 100 MB/s* |
 
-*When `min × connections > total`, the minimum is honored to prevent connection starvation.
+*When `min × connections > total`, each connection may still be paced at the minimum,
+but the egress cap holds the node at the total; connections then share it in the
+order they send.
 
 ### Example: Home DSL Connection
 
@@ -210,6 +282,7 @@ final_rate = min(ledbat_rate, global_pool_rate)
 - **LEDBAT** measures network conditions and adjusts rate to avoid congestion
 - **Global pool** enforces your bandwidth budget across all connections
 - The **minimum** of both rates is used
+- The **egress cap** then holds the sum over all connections at the total
 
 This means:
 - If the network is congested, LEDBAT will reduce the rate below the global limit
@@ -273,6 +346,11 @@ Rates are recalculated on an RTT-adaptive schedule:
 The default behavior (no `total-bandwidth-limit`) is unchanged:
 - Each connection gets an independent 10 MB/s limit
 - N connections can use up to N × 10 MB/s total
+- No egress cap exists
+
+Before the egress cap, `total-bandwidth-limit` only divided a per-connection rate:
+`min-bandwidth-per-connection` could take the node above it, and control traffic was
+never counted against it.
 
 ## Recommendations
 
@@ -372,14 +450,78 @@ freenet --total-bandwidth-limit 50000000 --min-bandwidth-per-connection 2000000
 
 ### Total bandwidth exceeding limit
 
-This happens when `min × connections > total`. Either:
-- Reduce `min-bandwidth-per-connection`
-- Increase `total-bandwidth-limit`
-- Accept the overage (connections won't starve)
+The egress cap holds the average at `total-bandwidth-limit`. Short bursts above it
+are the unpaced sends (ACKs, retransmissions, handshakes, keepalives, short
+messages); check `egress_unpaced`, `egress_debt_hwm_bytes` and
+`egress_debt_forgiven_bytes` in the `transport_snapshot` telemetry. Forgiven bytes
+mean unpaced traffic alone exceeded the cap for more than a second: raise the total,
+or lower `max-number-of-connections`.
+
+### Transfers slow or failing under a low total
+
+If `egress_waited` and `egress_wait_us_sum` are high, streams are waiting for the
+egress limits, which is the limits working. If `egress_unpaced` bytes are a large share
+of `egress_bytes`, control traffic is using most of the cap; see the startup warning.
+
+Streams fail when a limit is too low for the number of streams waiting on it. A receiver
+abandons a stream when 5 s pass between two of its fragments
+(`STREAM_INACTIVITY_TIMEOUT`), and with a cap the sender fails a stream whose next
+fragment has not been sent 5 s after its previous one (`egress_streams_abandoned_*`; for a
+relayed stream the time spent waiting for the upstream stream counts toward the gap from
+its second fragment on; the first gap starts when the first upstream chunk arrives).
+Two limits can cause it, and the counters and WARN lines say which:
+
+- `cap`: too many streams for the node-wide cap. Raise `total-bandwidth-limit`.
+- `connection`: too many streams on one connection for that connection's own bucket,
+  which runs at `total-bandwidth-limit / active connections` (at least
+  `min-bandwidth-per-connection`). This is often the tighter limit: at 1 MB/s with 50
+  connections, a connection gets 20 KB/s, and 30 streams on it fail far more often than
+  the node-wide numbers suggest. Raise `min-bandwidth-per-connection` (or the total).
+- `other`: the time went to the congestion window (slow ACKs), to the upstream stream
+  (for relayed streams, from the second fragment on) or elsewhere; the egress settings
+  are not the cause.
+
+On a capped node, a stream that reaches the 5 s deadline while it is limited by the
+congestion window is counted under `egress_streams_abandoned_*`, not under the existing
+cwnd-abort counter (`stream_send_abort_cwnd` in `network_status`). A stream that hits the
+3 s cwnd timeout before the deadline is still counted there. `egress_long_waits_other`
+also rises with congestion-window waits of 2.5 s or more, whatever the egress limits do.
+
+The 5 s limit also applies to a stream's first fragment, measured from when the stream
+started sending (for a relayed stream, from when its first upstream chunk arrived). The receiver only starts its 5 s timer after the first fragment arrives
+(before that it waits up to 60 s for the stream to be claimed), so for the first fragment
+the sender's limit is stricter than the receiver's. This is deliberate admission control:
+a stream that cannot get one slot within 5 s fails at once and the operation retries,
+instead of holding a stream open on a saturated cap.
+
+The risk is per fragment. With `N` streams waiting on a limit of `C` bytes/s, each
+wins a 1200-byte slot with probability about `1/N`, so a gap of more than 5 s has
+probability about `p = exp(-5 * C / (1200 * N))` per fragment, and a stream of `k`
+fragments fails with probability about `1 - exp(-k * p)`. For the node-wide cap, `C`
+is `total-bandwidth-limit` and `N` all waiting streams; for one connection, `C` is that
+connection's rate and `N` its waiting streams.
+
+| `C / N` (bytes/s per waiting stream) | `p` per fragment | 1 000 fragments (1.2 MB) | 10 000 (12 MB) | 47 000 (56 MB) |
+|---|---|---|---|---|
+| 480 (mean gap 2.5 s) | 0.14 | almost certain | almost certain | almost certain |
+| 2 400 | 4.5e-5 | 4.4% | 36% | 88% |
+| 2 800 | 8.6e-6 | 0.85% | 8.2% | 33% |
+| 3 600 | 3.1e-7 | 0.03% | 0.3% | 1.4% |
+| 4 800 | 2.1e-9 | under 0.001% | under 0.01% | 0.01% |
+
+So keep at least about 2 800 bytes/s per waiting stream for streams of up to a few
+hundred fragments, and about 4 000 bytes/s per waiting stream for streams of tens of
+megabytes. These are estimates from the slot-lottery model, not guarantees. The fix
+is a higher limit; there is no per-stream admission control.
+
+A slow stream also holds broadcast capacity: the broadcast queue keeps a send's slot
+until its stream completes, up to `STREAM_COMPLETION_TIMEOUT` (120 s), so a cap that
+makes streams slow also slows contract update fan-out.
 
 ## Source Code
 
 - **GlobalBandwidthManager**: `crates/core/src/transport/global_bandwidth.rs`
+- **Egress cap**: `crates/core/src/transport/egress_cap.rs`, charged in `crates/core/src/transport/demux.rs`
 - **TokenBucket**: `crates/core/src/transport/token_bucket.rs`
 - **LEDBAT**: `crates/core/src/transport/ledbat.rs`
 - **Configuration**: `crates/core/src/config.rs`

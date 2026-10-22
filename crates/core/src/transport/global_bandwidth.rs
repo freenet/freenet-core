@@ -56,7 +56,8 @@ pub struct GlobalBandwidthManager {
     /// Active connection count (lock-free)
     connection_count: AtomicUsize,
 
-    /// Minimum rate per connection (prevents starvation)
+    /// Minimum rate per connection (prevents starvation). Never above
+    /// `total_limit` when that is non-zero (see [`Self::new`]).
     min_per_connection: usize,
 }
 
@@ -67,11 +68,24 @@ impl GlobalBandwidthManager {
     ///
     /// * `total_limit` - Total bandwidth in bytes/sec to distribute across connections
     /// * `min_per_connection` - Optional minimum rate per connection to prevent starvation
+    ///
+    /// The minimum is clamped to `total_limit`. `total_limit` is a node-wide
+    /// cap on everything the node sends (`transport::egress_cap`), so a
+    /// minimum above it could never be delivered; above it, a connection's
+    /// pacing would only build a queue in front of the cap. A `total_limit`
+    /// of 0 is not a cap (the transport builds none for it) and leaves the
+    /// minimum as configured.
     pub fn new(total_limit: usize, min_per_connection: Option<usize>) -> Self {
+        let min_per_connection = min_per_connection.unwrap_or(DEFAULT_MIN_PER_CONNECTION);
+        let min_per_connection = if total_limit > 0 {
+            min_per_connection.min(total_limit)
+        } else {
+            min_per_connection
+        };
         Self {
             total_limit,
             connection_count: AtomicUsize::new(0),
-            min_per_connection: min_per_connection.unwrap_or(DEFAULT_MIN_PER_CONNECTION),
+            min_per_connection,
         }
     }
 
@@ -450,11 +464,35 @@ mod tests {
         );
     }
 
+    /// A minimum above the total is clamped to the total: with the node-wide
+    /// egress cap, no connection can be paced faster than the whole node.
+    #[test]
+    fn min_per_connection_is_clamped_to_the_total() {
+        let manager = GlobalBandwidthManager::new(500_000, Some(1_000_000));
+        assert_eq!(manager.min_per_connection(), 500_000);
+        assert_eq!(manager.register_connection(), 500_000);
+        for _ in 0..9 {
+            manager.register_connection();
+        }
+        // 10 connections: fair share 50 KB/s, raised to the clamped minimum.
+        assert_eq!(manager.current_per_connection_rate(), 500_000);
+
+        // At or below the total, the minimum is kept as configured.
+        let equal = GlobalBandwidthManager::new(1_000_000, Some(1_000_000));
+        assert_eq!(equal.min_per_connection(), 1_000_000);
+        let below = GlobalBandwidthManager::new(2_000_000, Some(1_000_000));
+        assert_eq!(below.min_per_connection(), 1_000_000);
+        // The default minimum (1 MB/s) is clamped too.
+        let default_min = GlobalBandwidthManager::new(300_000, None);
+        assert_eq!(default_min.min_per_connection(), 300_000);
+    }
+
     #[test]
     fn test_zero_total_limit() {
         let manager = GlobalBandwidthManager::new(0, Some(1_000_000));
         let rate = manager.register_connection();
-        // Should return minimum even with 0 total (0 / 1 = 0, max with 1M = 1M)
+        // Should return minimum even with 0 total (0 / 1 = 0, max with 1M = 1M).
+        // A total of 0 is not a cap, so the minimum is not clamped to it.
         assert_eq!(rate, 1_000_000);
     }
 }

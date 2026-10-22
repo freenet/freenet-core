@@ -165,6 +165,7 @@ struct TelemetryTestCounts {
     keepalive_rtt_samples: u32,
     standalone_ack_flushes: u32,
     outbound_streams_failed: u32,
+    pongs_sent: u32,
 }
 
 /// See [`PeerConnection::congestion_probe`].
@@ -2104,6 +2105,15 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
         self.remote_conn.remote_protoc_version
     }
 
+    /// Test-only counts of the control traffic this connection has sent:
+    /// `(retransmissions, Pongs answering the remote's keepalive Pings,
+    /// standalone ACK NoOps)`.
+    #[cfg(test)]
+    pub(crate) fn control_traffic_counts(&self) -> (u32, u32, u32) {
+        let c = &self.telemetry_test_counts;
+        (c.retransmissions, c.pongs_sent, c.standalone_ack_flushes)
+    }
+
     /// Test-only snapshot of the sender-side state the WAN bench asserts on.
     #[cfg(test)]
     pub(crate) fn congestion_probe(&self) -> CongestionProbe {
@@ -2889,6 +2899,10 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                     super::shadow_demand::OutboundClass::MustFlow,
                     pong_packet.len(),
                 );
+                #[cfg(test)]
+                {
+                    self.telemetry_test_counts.pongs_sent += 1;
+                }
                 tracing::trace!(
                     peer_addr = %self.remote_conn.remote_addr,
                     packet_id,
@@ -2909,6 +2923,10 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
         Ok(())
     }
 
+    /// Send one short message. Never paced by the node-wide egress cap: this
+    /// runs inline in the connection's task, which also receives for the
+    /// connection, so a wait here would delay its ACK processing (see
+    /// `transport::egress_cap`). The socket charges it as unpaced.
     #[inline]
     pub(crate) async fn outbound_short_message(&mut self, data: SerializedMessage) -> Result<()> {
         let receipts = self.received_tracker.get_receipts();
@@ -3014,125 +3032,6 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
         );
         self.outbound_stream_futures.push(task);
     }
-
-    /// Sends a single stream fragment to the remote peer.
-    ///
-    /// This is the low-level API for piped forwarding. Unlike `send()` which
-    /// serializes and fragments automatically, this sends a pre-existing fragment
-    /// directly. Used by intermediate nodes to forward fragments immediately.
-    ///
-    /// # Arguments
-    ///
-    /// * `fragment` - The fragment to send (from `PipedStream::push_fragment()`)
-    ///
-    /// # Congestion Control
-    ///
-    /// This method applies both BBR congestion control (cwnd) and token bucket
-    /// rate limiting, ensuring forwarded fragments don't overwhelm the network.
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// // Forward fragments as they become ready
-    /// for fragment in piped_stream.push_fragment(num, payload)? {
-    ///     peer_connection.send_fragment(fragment).await?;
-    /// }
-    /// ```
-    #[allow(dead_code)] // Phase 2 infrastructure - not yet integrated
-    pub(crate) async fn send_fragment(
-        &mut self,
-        fragment: piped_stream::ForwardFragment,
-    ) -> Result<()> {
-        let packet_size = fragment.payload.len();
-
-        // BBR congestion control - wait for cwnd space
-        let mut cwnd_wait_iterations = 0;
-        loop {
-            let flightsize = self.remote_conn.congestion_controller.flightsize();
-            let cwnd = self.remote_conn.congestion_controller.current_cwnd();
-
-            if flightsize + packet_size <= cwnd {
-                break;
-            }
-
-            cwnd_wait_iterations += 1;
-            if cwnd_wait_iterations == 1 {
-                tracing::trace!(
-                    stream_id = %fragment.stream_id.0,
-                    fragment_number = fragment.fragment_number,
-                    flightsize_kb = flightsize / 1024,
-                    cwnd_kb = cwnd / 1024,
-                    "Waiting for cwnd space in send_fragment"
-                );
-            }
-
-            // Exponential backoff
-            if cwnd_wait_iterations <= 10 {
-                tokio::task::yield_now().await;
-            } else if cwnd_wait_iterations <= 100 {
-                tokio::time::sleep(Duration::from_micros(100)).await;
-            } else {
-                tokio::time::sleep(Duration::from_millis(1)).await;
-            }
-        }
-
-        // Token bucket rate limiting
-        let wait_time = self.remote_conn.token_bucket.reserve(packet_size);
-        if !wait_time.is_zero() {
-            tracing::trace!(
-                stream_id = %fragment.stream_id.0,
-                fragment_number = fragment.fragment_number,
-                wait_time_ms = wait_time.as_millis(),
-                "Rate limiting fragment send"
-            );
-            tokio::time::sleep(wait_time).await;
-        }
-
-        // Get receipts and packet ID
-        let receipts = self.received_tracker.get_receipts();
-        let packet_id = self
-            .remote_conn
-            .last_packet_id
-            .fetch_add(1, std::sync::atomic::Ordering::Release);
-
-        // Get token before sending (captures send-time state for BBR)
-        // This also updates the congestion controller's flightsize
-        let token = self
-            .remote_conn
-            .congestion_controller
-            .on_send_with_token(packet_size);
-
-        // Send the fragment
-        packet_sending(
-            self.remote_conn.remote_addr,
-            &self.remote_conn.socket,
-            packet_id,
-            &self.remote_conn.outbound_symmetric_key,
-            receipts,
-            symmetric_message::StreamFragment {
-                stream_id: fragment.stream_id,
-                total_length_bytes: fragment.total_bytes,
-                fragment_number: fragment.fragment_number,
-                payload: fragment.payload,
-                metadata_bytes: None,
-            },
-            &self.remote_conn.sent_tracker,
-            packet_size,
-            token,
-            PacketStream::Stream(fragment.stream_id),
-            &self.remote_conn.last_packet_id,
-        )
-        .await?;
-
-        tracing::trace!(
-            stream_id = %fragment.stream_id.0,
-            fragment_number = fragment.fragment_number,
-            packet_id,
-            "Fragment sent"
-        );
-
-        Ok(())
-    }
 }
 
 /// Register a freshly-sent packet with the tracker, tagging it with its owning
@@ -3172,6 +3071,8 @@ fn report_sent_tagged<T: crate::simulation::TimeSource>(
     }
 }
 
+/// Send one payload, unpaced by the node-wide egress cap (it is charged at
+/// the socket; see `packet_sending_paced`).
 #[allow(clippy::too_many_arguments)]
 async fn packet_sending<S: super::Socket, T: crate::simulation::TimeSource>(
     remote_addr: SocketAddr,
@@ -3191,6 +3092,46 @@ async fn packet_sending<S: super::Socket, T: crate::simulation::TimeSource>(
     // Source of fresh packet ids for receipts that do not fit alongside the
     // payload (the connection's `last_packet_id`).
     next_packet_id: &AtomicU32,
+) -> Result<()> {
+    packet_sending_paced(
+        remote_addr,
+        socket,
+        packet_id,
+        outbound_sym_key,
+        confirm_receipt,
+        payload,
+        sent_tracker,
+        packet_size,
+        delivery_token,
+        stream,
+        next_packet_id,
+        None,
+    )
+    .await
+}
+
+/// [`packet_sending`] for a payload a pacing point has already waited for.
+///
+/// `egress_take` is what the pacing point took with `egress_cap::try_take`
+/// (`None` when the socket has no cap). The payload's datagram is sent with
+/// it, so it is charged once at its real size; receipts that do not fit
+/// beside the payload go in separate datagrams that are charged unpaced. If
+/// the payload is not sent (serialization fails), dropping the take returns
+/// it.
+#[allow(clippy::too_many_arguments)]
+async fn packet_sending_paced<S: super::Socket, T: crate::simulation::TimeSource>(
+    remote_addr: SocketAddr,
+    socket: &Arc<S>,
+    packet_id: u32,
+    outbound_sym_key: &Aes128Gcm,
+    confirm_receipt: Vec<u32>,
+    payload: impl Into<SymmetricMessagePayload>,
+    sent_tracker: &parking_lot::Mutex<SentPacketTracker<T>>,
+    packet_size: usize,
+    delivery_token: Option<DeliveryRateToken>,
+    stream: PacketStream,
+    next_packet_id: &AtomicU32,
+    egress_take: Option<super::egress_cap::EgressTake<'_>>,
 ) -> Result<()> {
     let start_time = tokio::time::Instant::now();
     tracing::trace!(
@@ -3225,7 +3166,11 @@ async fn packet_sending<S: super::Socket, T: crate::simulation::TimeSource>(
                 "Sending single packet"
             );
             let packet_data = packet.prepared_send();
-            match socket.send_to(&packet_data, remote_addr).await {
+            let sent = match egress_take {
+                Some(take) => socket.send_to_paced(&packet_data, remote_addr, take).await,
+                None => socket.send_to(&packet_data, remote_addr).await,
+            };
+            match sent {
                 Ok(_) => {
                     let elapsed = start_time.elapsed();
                     tracing::trace!(
@@ -3282,10 +3227,11 @@ async fn packet_sending<S: super::Socket, T: crate::simulation::TimeSource>(
                 vec![],
             )?
             .prepared_send();
-            socket
-                .send_to(&packet, remote_addr)
-                .await
-                .map_err(|e| TransportError::send_failed(remote_addr, e.kind()))?;
+            match egress_take {
+                Some(take) => socket.send_to_paced(&packet, remote_addr, take).await,
+                None => socket.send_to(&packet, remote_addr).await,
+            }
+            .map_err(|e| TransportError::send_failed(remote_addr, e.kind()))?;
             super::shadow_demand::record_outbound(outbound_class, packet.len());
             report_sent_tagged(
                 &mut sent_tracker.lock(),

@@ -70,7 +70,66 @@ Per-connection mode (default):
 Global pool mode:
   → total-bandwidth-limit enables this
   → Formula: rate = max(total/connections, min_per_connection)
-  → min_per_connection prevents starvation
+  → min_per_connection prevents starvation; clamped to the total
+  → total-bandwidth-limit is ALSO a node-wide egress cap (egress_cap.rs)
+```
+
+### Node-wide egress cap (#5940 decision 3)
+
+```
+DemuxSocket owns one EgressCap (token bucket, allowed to go into debt) when
+total-bandwidth-limit is set, and charges EVERY datagram it sends. No setting
+→ no cap → one Option check per send.
+
+Only stream fragment tasks WAIT for the bucket (send_stream, pipe_stream).
+With a cap, each admission attempt is: cwnd check, per-connection
+TokenBucket::try_take, node-wide egress_cap::try_take, back to back with no
+await before the send; if either bucket is short, take nothing (give the
+per-connection bytes back), sleep through StreamPacing (deficit x
+U[1.0, 1.4) + U[0, 2 ms)), and start again from the cwnd check. Nothing is
+held while waiting; the order among waiters is random, so connections share
+the cap by their number of waiting streams (no isolation between
+connections). StreamPacing (one per stream, only with a cap) measures the
+gap since the stream's previous fragment was sent, the gap the receiver's
+STREAM_INACTIVITY_TIMEOUT times, and is checked BEFORE every take and after
+every sleep, and on every poll of the cwnd wait: at PACED_WAIT_DEADLINE (5 s)
+the stream fails, stream-scoped, with its flight released, and the fragment is
+not sent. The deadline also applies to the first fragment, which the receiver
+does not time (its 5 s timer starts when fragment #1 arrives; before that it
+waits up to STREAM_CLAIM_TIMEOUT, 60 s). That is deliberate admission control:
+a stream that cannot get one slot in 5 s fails fast and the operation retries.
+In pipe_stream the first gap starts when the first upstream chunk arrives
+(pipe_stream's own 5 s upstream inactivity select bounds that wait), and
+from fragment #2 on, time waiting on the upstream stream counts toward the
+gap and is attributed to `other`. On capped nodes a stream that hits the
+paced deadline while cwnd-limited is counted in egress_streams_abandoned_*,
+not in the cwnd-abort counter (stream_send_abort_cwnd); a cwnd timeout
+(CWND_WAIT_TIMEOUT, 3 s) that comes first is still counted there. The take is PACED_TAKE_BYTES (MAX_PACKET_SIZE); the socket
+returns what the datagram did not use (Socket::send_to_paced), and all of it
+on a failed send. Without a cap the per-connection bucket keeps its old
+reserve-and-sleep path. Everything else goes through plain send_to and is
+charged once sent (a failed send is not charged), into debt.
+
+NEVER add a wait to: the listener loop, the handshake tasks
+(gateway_connection / traverse_nat), the keepalive task, outbound_short_message
+(it runs inline in peer_connection_listener, whose drain loop would stop
+polling recv), or anything inside PeerConnection::recv (ACKs, Pong, receipts,
+retransmits, ack_ok). recv is a cancellable select! branch that changes state
+before it sends (answered_connection_ack, receipts taken before the NoOp).
+
+Unpaced debt is capped at DEBT_LIMIT (1 s at the cap); the rest is forgiven
+(sent uncharged) and counted. Over any interval ending at a paced send the
+node sends at most burst + rate x interval + bytes forgiven in the
+interval. Invariant: nothing is reserved; a paced sender holds no capacity
+while it waits, and is charged only at its send. Gaps that reach LONG_WAIT
+(2.5 s) and abandoned streams are counted by what took most of the gap
+(WaitCause: cap, connection = the connection's own bucket, other = cwnd, the
+upstream stream for relayed streams, and the rest): egress_long_waits_<cause>, egress_streams_abandoned_<cause>.
+Each has its own rate-limited WARN with one line per cause seen since the last, each with its count and remedy; the
+per-stream abandonment line is at debug. The
+cap counts UDP payload, not IP/UDP headers. A quinn endpoint will need a poll-based admission (poll_ready
++ try_admit over try_take's predicate); not built yet.
+Tests assert on per-cap EgressCap::stats(), never the global counters.
 ```
 
 ### WHEN modifying congestion control
@@ -220,7 +279,12 @@ TTL, and early evictions are counted in `stray_intro_failures_evicted`) and CONN
 joiner dial-queue waits (`dial_queue_wait_<label>`, coarse buckets around the
 3 s punch window) and inbound datagrams by first byte (`demux_<label>`, one per
 `DemuxClass`: `legacy` passes through, `quic` and `other` are counted and
-dropped; see "Socket Abstraction Rules"). Each label set is declared once in a
+dropped; see "Socket Abstraction Rules") and outbound datagrams by how the
+node-wide egress cap paced them (`egress_<label>`, one per `EgressDecision`,
+plus `egress_bytes`, `egress_bytes_waited`, `egress_wait_us_sum` / `_max`,
+`egress_long_waits_<cause>`, `egress_streams_abandoned_<cause>`, `egress_debt_hwm_bytes`,
+`egress_debt_forgiven_bytes`; all zero without
+`total-bandwidth-limit`). Each label set is declared once in a
 `labelled_counters!` list, so a new variant needs a snapshot field. Hot
 path writes are single relaxed atomics; `SentPacketTracker` keeps an
 `rto_expiries` count and a bounded per-stream final-ACK watch, both
@@ -451,6 +515,9 @@ Token reservation:
   → Reserve BEFORE sending
   → Block if insufficient tokens
   → RTT-adaptive update interval
+  → With the node-wide egress cap, capped stream senders use
+    TokenBucket::try_take instead (take only if enough, else take nothing
+    and sleep), next to the node-wide take; see "Node-wide egress cap"
 ```
 
 ## Backoff, Jitter, and Recovery Rules
@@ -540,6 +607,10 @@ other. QUIC-shaped and other datagrams are counted (`demux_<label>`) and
 dropped until a QUIC endpoint exists on the same port (#5940). The QUIC rule
 is exact only with QUIC bit greasing (RFC 9287) disabled. Tests that inject a
 hand-written socket straight into the listener bypass the wrapper.
+
+The same wrapper charges outbound datagrams to the node-wide egress cap (see
+"Node-wide egress cap" above). A new send site needs nothing to be charged;
+it must not wait unless it is a pacing point.
 
 ### WHEN testing transport code
 

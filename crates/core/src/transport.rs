@@ -189,6 +189,7 @@ mod boundary;
 pub mod connection_handler;
 mod crypto;
 pub(crate) mod demux;
+pub(crate) mod egress_cap;
 pub mod in_memory_socket;
 
 /// Mock transport infrastructure for testing and benchmarking.
@@ -355,6 +356,10 @@ pub(crate) use self::connection_handler::{UdpTransportConfig, open_udp_transport
 pub use self::crypto::{TransportKeypair, TransportPublicKey};
 /// Returned (wrapped around the socket type) by [`create_connection_handler`].
 pub use self::demux::DemuxSocket;
+/// Named by [`Socket::egress_cap`] and [`Socket::send_to_paced`]; only the
+/// transport itself can construct or use them.
+#[doc(hidden)]
+pub use self::egress_cap::{EgressCap, EgressTake};
 pub use self::{
     connection_handler::{InboundConnectionHandler, OutboundConnectionHandler},
     peer_connection::PeerConnection,
@@ -565,6 +570,32 @@ pub trait Socket: Sized + Send + Sync + 'static {
     /// Used by MockSocket implementations in tests.
     #[allow(dead_code)]
     fn send_to_blocking(&self, buf: &[u8], target: SocketAddr) -> io::Result<usize>;
+
+    /// The node-wide egress cap this socket charges, if any. Only
+    /// [`DemuxSocket`] can have one (when `total-bandwidth-limit` is set);
+    /// every other socket returns `None`. Pacing points take from it through
+    /// `egress_cap::try_take`.
+    #[doc(hidden)]
+    fn egress_cap(&self) -> Option<&EgressCap> {
+        None
+    }
+
+    /// Send a datagram whose bytes a pacing point already took from
+    /// [`Self::egress_cap`]. The socket returns what the datagram did not use
+    /// instead of charging it a second time.
+    ///
+    /// A take exists only for a socket with a cap, so the default (for
+    /// sockets without one) just returns the take and sends.
+    #[doc(hidden)]
+    fn send_to_paced(
+        &self,
+        buf: &[u8],
+        target: SocketAddr,
+        take: EgressTake<'_>,
+    ) -> impl Future<Output = io::Result<usize>> + Send {
+        drop(take);
+        self.send_to(buf, target)
+    }
 }
 
 /// Normalize an IPv4-mapped IPv6 address (`::ffff:x.x.x.x`) to plain IPv4.

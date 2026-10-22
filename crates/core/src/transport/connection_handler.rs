@@ -225,8 +225,16 @@ async fn bind_udp_listener<S: Socket>(
         "Binding UDP socket"
     );
 
-    let socket =
-        bind_socket_with_retry::<DemuxSocket<S>>(bind_addr, SOCKET_BIND_MAX_RETRIES).await?;
+    // The node-wide egress cap exists only when `total-bandwidth-limit` is
+    // set (which is when `global_bandwidth` is), so a node without it pays
+    // nothing. The cap uses the same clock kind as the listener built below
+    // (`RealTime`); waiters sleep on their own connection's time source.
+    let egress_cap = config.global_bandwidth.as_ref().and_then(|manager| {
+        super::egress_cap::EgressCap::from_total_limit(manager.total_limit(), RealTime::new())
+    });
+    let socket = bind_socket_with_retry::<DemuxSocket<S>>(bind_addr, SOCKET_BIND_MAX_RETRIES)
+        .await?
+        .with_egress_cap(egress_cap);
 
     tracing::info!(
         target: "freenet_core::transport::send_debug",
