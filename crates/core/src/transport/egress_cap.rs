@@ -57,9 +57,10 @@ use crate::simulation::TimeSource;
 /// period the node can send this long at line rate before pacing starts.
 const BURST_WINDOW: Duration = Duration::from_millis(25);
 
-/// The burst is never smaller than this, so a cap far below a packet per
-/// burst window still admits a few full datagrams at once.
-const MIN_BURST_BYTES: u64 = 4 * MAX_PACKET_SIZE as u64;
+/// The burst is never smaller than this many full datagrams, so a cap far
+/// below a packet per burst window still admits a few at once. (A count of
+/// datagrams on purpose: this sizes a rate bucket and holds no memory.)
+const MIN_BURST_PACKETS: u64 = 4;
 
 /// Debt beyond this much time at the cap rate is forgiven. Bounds how long a
 /// paced sender waits for one datagram (about this long plus its own
@@ -158,7 +159,7 @@ impl EgressCap {
         // dividing by zero.
         let rate = rate_bytes_per_sec.max(1);
         let burst_bytes = (rate as u128 * BURST_WINDOW.as_nanos() / NANOS_PER_SEC) as u64;
-        let burst_bytes = burst_bytes.max(MIN_BURST_BYTES);
+        let burst_bytes = burst_bytes.max(MIN_BURST_PACKETS * MAX_PACKET_SIZE as u64);
         let burst_ns = Self::nanos_for(rate, burst_bytes);
         let debt_limit_ns = i64::try_from(DEBT_LIMIT.as_nanos()).unwrap_or(i64::MAX);
         let clock = Box::new(move || time_source.now_nanos());
