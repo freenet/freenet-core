@@ -21,3 +21,7 @@ mod transport_handle;
 /// `ConnectionStateManager::has_nat_traversal_to_ip`, which classifies stray
 /// intros.
 mod nat_traversal_by_ip;
+
+/// The node-wide egress cap never makes the listener, a handshake or the
+/// receive path wait.
+mod egress_cap;
