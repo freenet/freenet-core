@@ -6553,13 +6553,14 @@ mod tests {
             .cloned()
             .collect();
         expected.insert("type".to_string());
-        let actual: std::collections::BTreeSet<String> =
-            event_kind_to_json(&super::super::EventKind::TransportSnapshot(snapshot))
-                .as_object()
-                .unwrap()
-                .keys()
-                .cloned()
-                .collect();
+        let actual: std::collections::BTreeSet<String> = event_kind_to_json(
+            &super::super::EventKind::TransportSnapshot(Box::new(snapshot)),
+        )
+        .as_object()
+        .unwrap()
+        .keys()
+        .cloned()
+        .collect();
         assert_eq!(actual, expected);
     }
 
@@ -6600,7 +6601,9 @@ mod tests {
             ..Default::default()
         };
         let reference = serde_json::to_value(&snapshot).unwrap();
-        let json = event_kind_to_json(&super::super::EventKind::TransportSnapshot(snapshot));
+        let json = event_kind_to_json(&super::super::EventKind::TransportSnapshot(Box::new(
+            snapshot,
+        )));
         for (key, expected) in [
             ("nat_attempts_connect_joiner", 1),
             ("nat_attempts_connect_acceptor", 2),
@@ -6652,7 +6655,9 @@ mod tests {
             ..Default::default()
         };
         let reference = serde_json::to_value(&snapshot).unwrap();
-        let json = event_kind_to_json(&super::super::EventKind::TransportSnapshot(snapshot));
+        let json = event_kind_to_json(&super::super::EventKind::TransportSnapshot(Box::new(
+            snapshot,
+        )));
         for (key, expected) in [
             ("inbound_stream_refused_invalid_length", 1),
             ("inbound_stream_refused_connection_bytes", 2),
