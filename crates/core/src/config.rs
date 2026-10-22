@@ -2591,9 +2591,12 @@ pub struct NetworkApiConfig {
     /// Cap on everything the node sends over UDP, across ALL connections (in
     /// bytes per second): stream data, short messages, handshakes, ACKs,
     /// keepalives and retransmissions. Every datagram is charged to one
-    /// node-wide token bucket (`transport::egress_cap`); stream fragments and
-    /// short messages wait for it, and the rest is sent at once and paid back
-    /// by later waits, so the cap holds on average. When set, individual
+    /// node-wide token bucket (`transport::egress_cap`); stream fragments
+    /// wait for it, and the rest is sent at once and paid back by later
+    /// waits, so the cap holds on average. A cap too low for the number of
+    /// concurrent streams makes each stream's fragments so far apart that
+    /// receivers abandon them (see the bandwidth configuration guide). When
+    /// set, individual
     /// connection rates are also computed as: `total / active_connections`.
     /// This overrides the per-connection `bandwidth_limit`.
     ///

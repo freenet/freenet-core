@@ -139,7 +139,7 @@ congestion-control = "ledbat"  # or "bbr" or "fixedrate"
 ### Default Configuration
 - **Per-connection bandwidth limit**: 10 MB/s (configurable)
 - **Global bandwidth pool**: Disabled by default (enable with `--total-bandwidth-limit`)
-- **Min per-connection rate**: 1 MB/s (when global pool enabled)
+- **Min per-connection rate**: 1 MB/s (when global pool enabled), clamped to the total; `total-bandwidth-limit` is also a node-wide cap on everything the node sends (see [bandwidth configuration](configuration/bandwidth-configuration.md))
 - **Initial window (IW26)**: 38 KB (26 × 1,464-byte MSS)
 - **Slow start threshold**: 100 KB
 - **Maximum cwnd**: 1 GB

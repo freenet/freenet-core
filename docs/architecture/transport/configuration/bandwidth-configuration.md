@@ -184,21 +184,30 @@ rate (at least four 1200-byte packets), so after an idle period the node may sen
 much at once before pacing starts. It lives in `DemuxSocket`
 (`crates/core/src/transport/demux.rs`) and `crates/core/src/transport/egress_cap.rs`.
 
-Only two kinds of send wait for the bucket:
+Only one kind of send waits for the bucket:
 
 | Send | Behaviour when the bucket is empty |
 |------|------------------------------------|
-| Stream fragments (`send_stream`, `pipe_stream`) | Wait for their turn, after the per-connection token bucket. Concurrent streams are served in the order they asked. |
-| Short messages | Wait at most 20 ms, then are sent anyway. |
-| Everything else (handshakes, ACKs, receipts, keepalives, Pongs, retransmissions) | Sent at once. The bucket goes into debt, and the next stream fragments wait longer to pay it. |
+| Stream fragments (`send_stream`, `pipe_stream`) | Wait for their turn, before cwnd admission and the per-connection token bucket. Concurrent streams are served in the order they asked. |
+| Everything else (handshakes, short messages, ACKs, receipts, keepalives, Pongs, retransmissions) | Sent at once and charged once sent. The bucket goes into debt, and the next stream fragments wait longer to pay it. |
 
 The sends that never wait are sent from places that must not block: the receive path
-of a connection, which runs inside a `select!` that can be cancelled, the handshake
-tasks, and the keepalive task. So the cap holds on average: over a short window the
-node can send more than the cap by the bytes of those sends in the window. Debt older
-than one second at the cap rate is forgiven (and counted as
-`egress_debt_forgiven_bytes`), so control traffic that alone exceeds the cap cannot
-stop data transfers for longer than that.
+of a connection, which runs inside a `select!` that can be cancelled, the connection's
+own task (which sends short messages and also receives for the connection), the
+handshake tasks, and the keepalive task. A failed send is not charged.
+
+What this guarantees:
+
+- Stream fragments alone never exceed the bucket: in any window, at most the burst
+  plus the cap times the window.
+- Unpaced sends are added on top as debt, so the total holds on average and can exceed
+  the cap over a short window by the unpaced bytes in it. Debt from unpaced sends is
+  limited to one second of the cap; an unpaced send beyond that is still sent but not
+  added, and its bytes are counted as `egress_debt_forgiven_bytes`.
+- A stream fragment waits for everything queued before it, and nothing bounds that
+  queue except the number of streams in flight. With `N` concurrent streams and a cap
+  of `C` bytes/s, each stream gets one 1200-byte fragment about every `N * 1200 / C`
+  seconds, plus the time to pay off any unpaced debt (up to one second).
 
 Without `total-bandwidth-limit` no bucket exists and nothing changes. A
 `total-bandwidth-limit` of 0 is ignored with a warning.
@@ -209,10 +218,13 @@ packets) per allowed connection (`max-number-of-connections`), because the contr
 traffic of a full set of connections can then use most of the cap.
 
 The `transport_snapshot` telemetry event carries, per period: `egress_immediate`,
-`egress_waited`, `egress_wait_capped` and `egress_unpaced` (datagrams by how they were
-paced), `egress_bytes`, `egress_bytes_waited`, `egress_wait_us_sum`,
-`egress_wait_us_max`, `egress_debt_hwm_bytes` and `egress_debt_forgiven_bytes`. All
-are zero without a cap.
+`egress_waited` and `egress_unpaced` (datagrams by how they were paced),
+`egress_bytes`, `egress_bytes_waited`, `egress_wait_us_sum`, `egress_wait_us_max`,
+`egress_long_waits` (stream fragments that waited at least 2.5 s, half the receiver's
+5 s stream inactivity timeout), `egress_backlog_hwm_bytes` (the largest amount
+charged or reserved ahead of the rate: unpaced debt plus queued stream fragments) and
+`egress_debt_forgiven_bytes`. All are zero without a cap. A wait of 2.5 s or more is
+also logged at WARN, at most once a minute.
 
 ### Example: 1 Gbps Connection
 
@@ -427,17 +439,31 @@ freenet --total-bandwidth-limit 50000000 --min-bandwidth-per-connection 2000000
 ### Total bandwidth exceeding limit
 
 The egress cap holds the average at `total-bandwidth-limit`. Short bursts above it
-are the unpaced sends (ACKs, retransmissions, handshakes, keepalives); check
-`egress_unpaced`, `egress_debt_hwm_bytes` and `egress_debt_forgiven_bytes` in the
-`transport_snapshot` telemetry. Forgiven debt means control traffic alone exceeded
+are the unpaced sends (ACKs, retransmissions, handshakes, keepalives, short
+messages); check `egress_unpaced` and `egress_debt_forgiven_bytes` in the
+`transport_snapshot` telemetry. Forgiven debt means unpaced traffic alone exceeded
 the cap for more than a second: raise the total, or lower
 `max-number-of-connections`.
 
-### Transfers slow under a low total
+### Transfers slow or failing under a low total
 
 If `egress_waited` and `egress_wait_us_sum` are high, streams are waiting for the
 cap, which is the cap working. If `egress_unpaced` bytes are a large share of
 `egress_bytes`, control traffic is using most of the cap; see the startup warning.
+
+Streams fail when the cap is too low for the number of streams in flight. A receiver
+abandons a stream when 5 s pass between two of its fragments
+(`STREAM_INACTIVITY_TIMEOUT`). With `N` concurrent streams each stream gets a fragment
+about every `N * 1200 / C` seconds at a cap of `C` bytes/s, so streams start failing
+when `C` falls below about `N * 1200 / 5` bytes/s, and are at risk from half that
+gap: keep `C` above `N * 1200 / 2.5` bytes/s (for 100 concurrent streams, 48 KB/s).
+`egress_long_waits` above zero and the WARN line "A stream fragment waited this long
+for the node-wide egress cap" are the signal. The fix is a higher
+`total-bandwidth-limit`; there is no per-stream admission control.
+
+A slow stream also holds broadcast capacity: the broadcast queue keeps a send's slot
+until its stream completes, up to `STREAM_COMPLETION_TIMEOUT` (120 s), so a cap that
+makes streams slow also slows contract update fan-out.
 
 ## Source Code
 
