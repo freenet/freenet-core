@@ -9,48 +9,64 @@
 //!
 //! # Who waits and who does not
 //!
-//! Only the places that already pace their sends wait for the bucket:
+//! Only stream fragment tasks (`send_stream`, `pipe_stream`) wait for the
+//! bucket. They already wait on the per-connection token bucket; here they
+//! reserve their datagram and sleep until it is due.
 //!
-//! - stream fragment tasks (`send_stream`, `pipe_stream`), which already wait
-//!   on the per-connection token bucket, reserve their datagram here and
-//!   sleep until it is due;
-//! - short messages wait at most [`SHORT_MESSAGE_MAX_WAIT`] and are then sent
-//!   anyway.
+//! Every other send is sent at once and charged after it is sent, even when
+//! the bucket is empty, which puts the bucket into debt. Paced senders then
+//! wait longer until the debt is paid. That covers the handshake tasks, the
+//! keepalive task, short messages (sent from the connection's own task, which
+//! also receives for the connection, so a wait there would delay its ACKs),
+//! and everything `PeerConnection::recv` sends: ACKs, Pongs, receipts,
+//! retransmissions. `recv` must never wait here: it runs as a branch of a
+//! `select!` that can be cancelled, and it changes connection state before
+//! some of its sends.
 //!
-//! Every other send (the handshake tasks, the keepalive task, and everything
-//! `PeerConnection::recv` sends: ACKs, Pongs, receipts, retransmissions) is
-//! sent at once and charged even when the bucket is empty, which puts the
-//! bucket into debt. Paced senders then wait longer until the debt is paid.
-//! `recv` must never wait here: it runs as a branch of a `select!` that can be
-//! cancelled, and it changes connection state before some of its sends.
+//! # What the cap guarantees
 //!
-//! The cap therefore holds on average. Over a short window the node can send
-//! more than the cap by the bytes of unpaced sends in that window. Debt older
-//! than [`DEBT_LIMIT`] is forgiven (and counted), so a period in which unpaced
-//! traffic alone exceeds the cap cannot stop paced traffic for longer than
-//! that.
+//! Paced bytes never exceed the bucket bound: in any window, the burst plus
+//! the rate times the window. Unpaced bytes are added on top of that as debt,
+//! so the total holds on average and can exceed the cap over a short window
+//! by the unpaced bytes sent in it. An unpaced charge never takes the debt
+//! past [`DEBT_LIMIT`] of the rate; whatever it cannot add is forgiven (and
+//! counted), so control traffic that alone exceeds the cap does not grow the
+//! debt without bound.
+//!
+//! A paced datagram waits for everything reserved before it. With many
+//! concurrent streams the wait is the queue depth divided by the rate, which
+//! has no fixed bound: `n` streams at a cap of `r` bytes per second give each
+//! stream one datagram every `n * 1200 / r` seconds. When that gap exceeds the
+//! receiver's `STREAM_INACTIVITY_TIMEOUT` (5 s), the receiver abandons the
+//! stream. Waits of at least [`LONG_WAIT`] are counted
+//! (`egress_long_waits`) and logged at WARN, at most once per
+//! [`LONG_WAIT_WARN_INTERVAL`].
 //!
 //! # The bucket
 //!
 //! The state is one atomic: `empty_at_ns`, the time at which the bucket level
 //! is zero. At time `now` the level is `(now - empty_at_ns) * rate`, at most
-//! the burst size, and negative while `empty_at_ns` is in the future (debt).
-//! Charging `n` bytes moves `empty_at_ns` later by the time the rate needs to
-//! send `n` bytes. A paced sender charges first (a reservation) and then
-//! sleeps until `empty_at_ns` as it was after its own charge, so concurrent
-//! paced senders are served in the order they reserved.
+//! the burst size, and negative while `empty_at_ns` is in the future (debt,
+//! or queued reservations). Charging `n` bytes moves `empty_at_ns` later by
+//! the time the rate needs to send `n` bytes. A paced sender charges first (a
+//! reservation) and then sleeps until `empty_at_ns` as it was after its own
+//! charge, so concurrent paced senders are served in the order they
+//! reserved.
 //!
 //! All arithmetic is in integer nanoseconds of the [`TimeSource`] the cap was
 //! built with; waiters sleep on their own `TimeSource`.
 
 use std::fmt;
 use std::mem::ManuallyDrop;
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+#[cfg(test)]
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::Duration;
 
 use super::Socket;
 use super::metrics::{EgressDecision, TRANSPORT_METRICS};
 use super::packet_data::MAX_PACKET_SIZE;
+use super::peer_connection::streaming::STREAM_INACTIVITY_TIMEOUT;
 use crate::simulation::TimeSource;
 
 /// The bucket holds at most this much time at the cap rate, so after an idle
@@ -62,16 +78,21 @@ const BURST_WINDOW: Duration = Duration::from_millis(25);
 /// datagrams on purpose: this sizes a rate bucket and holds no memory.)
 const MIN_BURST_PACKETS: u64 = 4;
 
-/// Debt beyond this much time at the cap rate is forgiven. Bounds how long a
-/// paced sender waits for one datagram (about this long plus its own
-/// transmission time).
+/// An unpaced charge never takes the debt past this much time at the cap
+/// rate; the rest of the charge is forgiven. This bounds debt, not waits:
+/// queued paced reservations are never forgiven, so a paced wait can be
+/// longer than this (see the module docs).
 pub(crate) const DEBT_LIMIT: Duration = Duration::from_secs(1);
 
-/// The longest a short message waits for the bucket. A short message that
-/// would wait longer waits this long and is then sent into debt. Short
-/// messages are sent from the connection's own task, which also receives
-/// for the connection, so the wait must stay short.
-pub(crate) const SHORT_MESSAGE_MAX_WAIT: Duration = Duration::from_millis(20);
+/// A paced wait at least this long is counted and logged: half the
+/// receiver's stream inactivity timeout, so it is reported before gaps
+/// between one stream's fragments reach the point where the receiver gives
+/// the stream up.
+pub(crate) const LONG_WAIT: Duration =
+    Duration::from_millis(STREAM_INACTIVITY_TIMEOUT.as_millis() as u64 / 2);
+
+/// The long-wait warning is logged at most once per this interval.
+const LONG_WAIT_WARN_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Egress below this many bytes per second per allowed connection is too low
 /// for a full set of connections: their ACKs, keepalives and handshakes alone
@@ -82,8 +103,8 @@ pub(crate) const MIN_CAP_PER_CONNECTION: usize = 4 * MAX_PACKET_SIZE;
 const NANOS_PER_SEC: u128 = 1_000_000_000;
 
 /// The cap's own counters, so tests can assert on one cap without reading
-/// process-global state. The node-wide period counters are in
-/// `TRANSPORT_METRICS` (`egress_*`).
+/// process-global state. Test-only: production records only the
+/// `TRANSPORT_METRICS` period counters (`egress_*`).
 #[cfg(test)]
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct EgressStats {
@@ -97,12 +118,16 @@ pub(crate) struct EgressStats {
     pub wait_us_sum: u64,
     /// Longest single wait, in microseconds.
     pub wait_us_max: u64,
-    /// Largest debt seen after a charge, in bytes.
-    pub debt_hwm_bytes: u64,
-    /// Debt forgiven because it exceeded [`DEBT_LIMIT`], in bytes.
+    /// Paced datagrams that waited at least [`LONG_WAIT`].
+    pub long_waits: u64,
+    /// Largest backlog seen after a charge, in bytes: everything charged or
+    /// reserved ahead of the rate (unpaced debt plus queued reservations).
+    pub backlog_hwm_bytes: u64,
+    /// Unpaced bytes forgiven because the debt reached [`DEBT_LIMIT`].
     pub forgiven_bytes: u64,
 }
 
+#[cfg(test)]
 #[derive(Default)]
 struct StatCounters {
     packets: [AtomicU64; EgressDecision::COUNT],
@@ -110,7 +135,8 @@ struct StatCounters {
     bytes_waited: AtomicU64,
     wait_us_sum: AtomicU64,
     wait_us_max: AtomicU64,
-    debt_hwm_bytes: AtomicU64,
+    long_waits: AtomicU64,
+    backlog_hwm_bytes: AtomicU64,
     forgiven_bytes: AtomicU64,
 }
 
@@ -125,6 +151,9 @@ pub struct EgressCap {
     clock: Box<dyn Fn() -> u64 + Send + Sync>,
     /// Time (ns, on `clock`) at which the bucket level is zero.
     empty_at_ns: AtomicI64,
+    /// When the long-wait warning was last logged (ns, on `clock`).
+    last_long_wait_warn_ns: AtomicI64,
+    #[cfg(test)]
     stats: StatCounters,
 }
 
@@ -141,13 +170,13 @@ impl fmt::Debug for EgressCap {
 /// bucket for a datagram not sent yet.
 ///
 /// Pass it to [`Socket::send_to_reserved`] with the datagram, which replaces
-/// the reserved bytes with the datagram's real size. Dropping it instead (the
-/// send was abandoned or the task cancelled) returns the reserved bytes.
+/// the reserved bytes with the bytes really sent. Dropping it instead (the
+/// send was abandoned or failed, or the task cancelled) returns the reserved
+/// bytes.
 #[must_use = "dropping a hold returns its reservation; send with Socket::send_to_reserved"]
 pub struct EgressHold<'a> {
     cap: &'a EgressCap,
     reserved_bytes: u64,
-    decision: EgressDecision,
     wait: Duration,
 }
 
@@ -170,6 +199,8 @@ impl EgressCap {
             debt_limit_ns,
             clock,
             empty_at_ns: AtomicI64::new(now.saturating_sub(burst_ns)),
+            last_long_wait_warn_ns: AtomicI64::new(i64::MIN),
+            #[cfg(test)]
             stats: StatCounters::default(),
         }
     }
@@ -265,55 +296,28 @@ impl EgressCap {
         let unclamped = self.refilled(old, now).saturating_add(cost);
         let forgiven = self.bytes_for(unclamped.saturating_sub(new));
         if forgiven > 0 {
+            #[cfg(test)]
             self.stats
                 .forgiven_bytes
                 .fetch_add(forgiven, Ordering::Relaxed);
             TRANSPORT_METRICS.record_egress_forgiven(forgiven);
         }
-        self.record_sent(EgressDecision::Unpaced, bytes as u64, Duration::ZERO);
-        self.record_debt(new, now);
+        self.record_sent(EgressDecision::Unpaced, bytes as u64, Duration::ZERO, now);
+        self.record_backlog(new, now);
     }
 
     /// Reserve `bytes` for a datagram a pacing point is about to send, and
-    /// say how long to wait before sending it.
-    ///
-    /// With `max_wait`, a datagram that would wait longer reserves nothing
-    /// and waits `max_wait` instead; it is then sent into debt.
-    pub(crate) fn reserve(&self, bytes: usize, max_wait: Option<Duration>) -> EgressHold<'_> {
+    /// say how long to wait before sending it: until everything reserved or
+    /// charged before it has been paid at the rate.
+    pub(crate) fn reserve(&self, bytes: usize) -> EgressHold<'_> {
         let cost = self.cost_ns(bytes as u64);
-        let max_wait_ns = max_wait.map(|w| i64::try_from(w.as_nanos()).unwrap_or(i64::MAX));
-        let (old, new, now) = self.update(|empty_at, now| {
-            let charged = self.refilled(empty_at, now).saturating_add(cost);
-            let wait = charged.saturating_sub(now);
-            match max_wait_ns {
-                Some(limit) if wait > limit => empty_at,
-                _ => charged,
-            }
-        });
-        // Recomputed from the value the committed update started from, since
-        // the closure may run more than once.
-        let charged = self.refilled(old, now).saturating_add(cost);
-        if new != charged {
-            // Nothing was committed: the wait would have exceeded `max_wait`,
-            // which is therefore `Some`.
-            return EgressHold {
-                cap: self,
-                reserved_bytes: 0,
-                decision: EgressDecision::WaitCapped,
-                wait: max_wait.unwrap_or_default(),
-            };
-        }
+        let (_, new, now) =
+            self.update(|empty_at, now| self.refilled(empty_at, now).saturating_add(cost));
         let wait_ns = new.saturating_sub(now).max(0) as u64;
-        let wait = Duration::from_nanos(wait_ns);
         EgressHold {
             cap: self,
             reserved_bytes: bytes as u64,
-            decision: if wait.is_zero() {
-                EgressDecision::Immediate
-            } else {
-                EgressDecision::Waited
-            },
-            wait,
+            wait: Duration::from_nanos(wait_ns),
         }
     }
 
@@ -325,11 +329,10 @@ impl EgressCap {
         self.update(|empty_at, _| empty_at.saturating_sub(cost));
     }
 
-    /// Replace a reservation of `reserved_bytes` with the `sent_bytes` the
-    /// datagram really had.
+    /// Replace a reservation with the `sent_bytes` the socket really sent.
     fn settle(&self, hold: &EgressHold<'_>, sent_bytes: usize) {
         debug_assert!(
-            hold.reserved_bytes == 0 || sent_bytes as u64 <= hold.reserved_bytes,
+            sent_bytes as u64 <= hold.reserved_bytes,
             "a {sent_bytes} byte datagram was sent on a {} byte reservation; \
              reservations must be an upper bound (see PACED_RESERVATION_BYTES)",
             hold.reserved_bytes
@@ -340,28 +343,77 @@ impl EgressCap {
             self.refilled(empty_at.saturating_sub(reserved), now)
                 .saturating_add(sent)
         });
-        self.record_sent(hold.decision, sent_bytes as u64, hold.wait);
-        self.record_debt(new, now);
+        let decision = if hold.wait.is_zero() {
+            EgressDecision::Immediate
+        } else {
+            EgressDecision::Waited
+        };
+        self.record_sent(decision, sent_bytes as u64, hold.wait, now);
+        self.record_backlog(new, now);
     }
 
-    fn record_sent(&self, decision: EgressDecision, bytes: u64, wait: Duration) {
-        let s = &self.stats;
-        s.packets[decision as usize].fetch_add(1, Ordering::Relaxed);
-        s.bytes.fetch_add(bytes, Ordering::Relaxed);
+    /// Record one sent datagram, and a long wait if it had one. Production
+    /// writes only the `TRANSPORT_METRICS` period counters; the per-cap
+    /// counters exist only in tests.
+    fn record_sent(&self, decision: EgressDecision, bytes: u64, wait: Duration, now: i64) {
         let wait_us = u64::try_from(wait.as_micros()).unwrap_or(u64::MAX);
-        if !wait.is_zero() {
-            s.bytes_waited.fetch_add(bytes, Ordering::Relaxed);
-            s.wait_us_sum.fetch_add(wait_us, Ordering::Relaxed);
-            s.wait_us_max.fetch_max(wait_us, Ordering::Relaxed);
+        let long = wait >= LONG_WAIT;
+        TRANSPORT_METRICS.record_egress(decision, bytes, wait_us, long);
+        #[cfg(test)]
+        {
+            let s = &self.stats;
+            s.packets[decision as usize].fetch_add(1, Ordering::Relaxed);
+            s.bytes.fetch_add(bytes, Ordering::Relaxed);
+            if !wait.is_zero() {
+                s.bytes_waited.fetch_add(bytes, Ordering::Relaxed);
+                s.wait_us_sum.fetch_add(wait_us, Ordering::Relaxed);
+                s.wait_us_max.fetch_max(wait_us, Ordering::Relaxed);
+            }
+            if long {
+                s.long_waits.fetch_add(1, Ordering::Relaxed);
+            }
         }
-        TRANSPORT_METRICS.record_egress(decision, bytes, wait_us);
+        if long {
+            self.warn_long_wait(wait, now);
+        }
     }
 
-    fn record_debt(&self, empty_at: i64, now: i64) {
-        let debt = self.bytes_for(empty_at.saturating_sub(now));
-        if debt > 0 {
-            self.stats.debt_hwm_bytes.fetch_max(debt, Ordering::Relaxed);
-            TRANSPORT_METRICS.record_egress_debt(debt);
+    /// Log a long paced wait at WARN, at most once per
+    /// [`LONG_WAIT_WARN_INTERVAL`].
+    fn warn_long_wait(&self, wait: Duration, now: i64) {
+        let interval = i64::try_from(LONG_WAIT_WARN_INTERVAL.as_nanos()).unwrap_or(i64::MAX);
+        let last = self.last_long_wait_warn_ns.load(Ordering::Relaxed);
+        if last != i64::MIN && now.saturating_sub(last) < interval {
+            return;
+        }
+        if self
+            .last_long_wait_warn_ns
+            .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
+        {
+            return;
+        }
+        tracing::warn!(
+            wait_ms = wait.as_millis() as u64,
+            total_bandwidth_limit = self.rate_bytes_per_sec,
+            stream_inactivity_timeout_ms = STREAM_INACTIVITY_TIMEOUT.as_millis() as u64,
+            "A stream fragment waited this long for the node-wide egress cap \
+             (total-bandwidth-limit): too many concurrent streams for the cap. \
+             Receivers abandon a stream after a gap of stream_inactivity_timeout_ms \
+             between its fragments; raise total-bandwidth-limit if transfers fail"
+        );
+    }
+
+    /// Record the backlog after a charge: everything charged or reserved
+    /// ahead of the rate, i.e. unpaced debt plus queued reservations.
+    fn record_backlog(&self, empty_at: i64, now: i64) {
+        let backlog = self.bytes_for(empty_at.saturating_sub(now));
+        if backlog > 0 {
+            #[cfg(test)]
+            self.stats
+                .backlog_hwm_bytes
+                .fetch_max(backlog, Ordering::Relaxed);
+            TRANSPORT_METRICS.record_egress_backlog(backlog);
         }
     }
 
@@ -385,7 +437,8 @@ impl EgressCap {
             bytes_waited: load(&s.bytes_waited),
             wait_us_sum: load(&s.wait_us_sum),
             wait_us_max: load(&s.wait_us_max),
-            debt_hwm_bytes: load(&s.debt_hwm_bytes),
+            long_waits: load(&s.long_waits),
+            backlog_hwm_bytes: load(&s.backlog_hwm_bytes),
             forgiven_bytes: load(&s.forgiven_bytes),
         }
     }
@@ -399,7 +452,8 @@ impl EgressHold<'_> {
     }
 
     /// Account for the datagram as sent with `sent_bytes` bytes. Called by
-    /// the socket immediately before it sends.
+    /// the socket after the send succeeded; on a failed send the socket drops
+    /// the hold instead, which returns the reservation.
     pub(crate) fn settle(self, sent_bytes: usize) {
         let this = ManuallyDrop::new(self);
         this.cap.settle(&this, sent_bytes);
@@ -416,7 +470,6 @@ impl fmt::Debug for EgressHold<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("EgressHold")
             .field("reserved_bytes", &self.reserved_bytes)
-            .field("decision", &self.decision)
             .field("wait", &self.wait)
             .finish()
     }
@@ -435,18 +488,17 @@ pub(crate) const PACED_RESERVATION_BYTES: usize = MAX_PACKET_SIZE;
 /// sleeping on `time_source`. Reserves [`PACED_RESERVATION_BYTES`].
 ///
 /// Returns `None` when the socket has no cap. Otherwise returns the hold to
-/// pass to [`Socket::send_to_reserved`]. With `max_wait`, the wait is at most
-/// that long (see [`EgressCap::reserve`]).
+/// pass to [`Socket::send_to_reserved`]. Only stream fragment tasks call this
+/// (see the module docs for who must never wait).
 ///
 /// Cancel-safe: if the returned future is dropped while it sleeps, the hold
 /// is dropped with it and the reservation is returned.
 pub(crate) async fn pace<'a, S: Socket, T: TimeSource>(
     socket: &'a S,
-    max_wait: Option<Duration>,
     time_source: &T,
 ) -> Option<EgressHold<'a>> {
     let cap = socket.egress_cap()?;
-    let hold = cap.reserve(PACED_RESERVATION_BYTES, max_wait);
+    let hold = cap.reserve(PACED_RESERVATION_BYTES);
     if !hold.wait.is_zero() {
         time_source.sleep(hold.wait).await;
     }

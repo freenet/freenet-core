@@ -120,36 +120,48 @@ impl<S: Socket> Socket for DemuxSocket<S> {
         }
     }
 
-    /// Charges the datagram to the egress cap, if there is one, and sends it
-    /// at once: a send that reaches this method is never paced. The charge
-    /// may put the cap into debt, which paced senders then wait for.
+    /// Sends the datagram at once and, when it was sent, charges the bytes
+    /// sent to the egress cap, if there is one: a send that reaches this
+    /// method is never paced. The charge may put the cap into debt, which
+    /// paced senders then wait for. A failed send is not charged.
     async fn send_to(&self, buf: &[u8], target: SocketAddr) -> io::Result<usize> {
+        let sent = self.inner.send_to(buf, target).await?;
         if let Some(cap) = &self.egress {
-            cap.charge_unpaced(buf.len());
+            cap.charge_unpaced(sent);
         }
-        self.inner.send_to(buf, target).await
+        Ok(sent)
     }
 
     fn send_to_blocking(&self, buf: &[u8], target: SocketAddr) -> io::Result<usize> {
+        let sent = self.inner.send_to_blocking(buf, target)?;
         if let Some(cap) = &self.egress {
-            cap.charge_unpaced(buf.len());
+            cap.charge_unpaced(sent);
         }
-        self.inner.send_to_blocking(buf, target)
+        Ok(sent)
     }
 
     fn egress_cap(&self) -> Option<&EgressCap> {
         self.egress.as_ref()
     }
 
-    /// Replaces the hold's reservation with the datagram's size, then sends.
+    /// Sends, then replaces the hold's reservation with the bytes sent. On a
+    /// failed send the hold is dropped, which returns the reservation.
     async fn send_to_reserved(
         &self,
         buf: &[u8],
         target: SocketAddr,
         hold: EgressHold<'_>,
     ) -> io::Result<usize> {
-        hold.settle(buf.len());
-        self.inner.send_to(buf, target).await
+        match self.inner.send_to(buf, target).await {
+            Ok(sent) => {
+                hold.settle(sent);
+                Ok(sent)
+            }
+            Err(e) => {
+                drop(hold);
+                Err(e)
+            }
+        }
     }
 }
 

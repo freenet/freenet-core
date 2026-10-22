@@ -165,6 +165,7 @@ struct TelemetryTestCounts {
     keepalive_rtt_samples: u32,
     standalone_ack_flushes: u32,
     outbound_streams_failed: u32,
+    pongs_sent: u32,
 }
 
 /// See [`PeerConnection::congestion_probe`].
@@ -2104,6 +2105,15 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
         self.remote_conn.remote_protoc_version
     }
 
+    /// Test-only counts of the control traffic this connection has sent:
+    /// `(retransmissions, Pongs answering the remote's keepalive Pings,
+    /// standalone ACK NoOps)`.
+    #[cfg(test)]
+    pub(crate) fn control_traffic_counts(&self) -> (u32, u32, u32) {
+        let c = &self.telemetry_test_counts;
+        (c.retransmissions, c.pongs_sent, c.standalone_ack_flushes)
+    }
+
     /// Test-only snapshot of the sender-side state the WAN bench asserts on.
     #[cfg(test)]
     pub(crate) fn congestion_probe(&self) -> CongestionProbe {
@@ -2889,6 +2899,10 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                     super::shadow_demand::OutboundClass::MustFlow,
                     pong_packet.len(),
                 );
+                #[cfg(test)]
+                {
+                    self.telemetry_test_counts.pongs_sent += 1;
+                }
                 tracing::trace!(
                     peer_addr = %self.remote_conn.remote_addr,
                     packet_id,
@@ -2909,32 +2923,25 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
         Ok(())
     }
 
+    /// Send one short message. Never paced by the node-wide egress cap: this
+    /// runs inline in the connection's task, which also receives for the
+    /// connection, so a wait here would delay its ACK processing (see
+    /// `transport::egress_cap`). The socket charges it as unpaced.
     #[inline]
     pub(crate) async fn outbound_short_message(&mut self, data: SerializedMessage) -> Result<()> {
-        // Use actual data length plus overhead estimate
-        let packet_size = data.len() + 40; // ShortMessage header overhead
-        // Node-wide egress cap: wait a short, bounded time (this task also
-        // receives for the connection), then send into debt if the bucket is
-        // still behind. The wait comes before the receipts are taken and the
-        // packet id is allocated, so a cancelled wait loses neither, and
-        // before `on_send_with_token`, so it is not counted as time in flight.
-        let egress_hold = super::egress_cap::pace(
-            self.remote_conn.socket.as_ref(),
-            Some(super::egress_cap::SHORT_MESSAGE_MAX_WAIT),
-            &self.time_source,
-        )
-        .await;
         let receipts = self.received_tracker.get_receipts();
         let packet_id = self
             .remote_conn
             .last_packet_id
             .fetch_add(1, std::sync::atomic::Ordering::Release);
         // Get token before sending (captures send-time state for BBR)
+        // Use actual data length plus overhead estimate
+        let packet_size = data.len() + 40; // ShortMessage header overhead
         let token = self
             .remote_conn
             .congestion_controller
             .on_send_with_token(packet_size);
-        packet_sending_paced(
+        packet_sending(
             self.remote_conn.remote_addr,
             &self.remote_conn.socket,
             packet_id,
@@ -2946,7 +2953,6 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
             token,
             PacketStream::Control,
             &self.remote_conn.last_packet_id,
-            egress_hold,
         )
         .await?;
         Ok(())

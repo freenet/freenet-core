@@ -245,6 +245,18 @@ pub(super) async fn send_stream<S: super::super::Socket, T: TimeSource>(
 
         let packet_size = stream_to_send.len().min(MAX_DATA_SIZE);
 
+        // Node-wide egress cap (`total-bandwidth-limit`): wait for this
+        // fragment's turn in the node's bucket FIRST, before cwnd admission.
+        // The wait can last seconds when many streams share a low cap; had
+        // it come after the cwnd check, several streams on one connection
+        // could each pass the check, sleep, and then all send, overshooting
+        // cwnd. Admission (cwnd, then the per-connection bucket, then
+        // `on_send_with_token`) happens after the wait, as it did before the
+        // cap existed, so flight size is still added only for a datagram
+        // about to be sent. The reservation is held through the cwnd wait; a
+        // cwnd timeout or a dropped task returns it.
+        let egress_hold = super::super::egress_cap::pace(socket.as_ref(), &time_source).await;
+
         // BBR congestion control - wait until cwnd has space for this packet.
         // This enforces the congestion window calculated by BBR's state machine.
         //
@@ -365,12 +377,6 @@ pub(super) async fn send_stream<S: super::super::Socket, T: TimeSource>(
             );
             time_source.sleep(wait_time).await;
         }
-
-        // Node-wide egress cap (`total-bandwidth-limit`): wait for this
-        // fragment's turn in the node's bucket, after the per-connection
-        // bucket and before `on_send_with_token`, so the wait is not counted
-        // as time in flight. Dropping the task here returns the reservation.
-        let egress_hold = super::super::egress_cap::pace(socket.as_ref(), None, &time_source).await;
 
         // Embed metadata in fragment #1 for reliability (fix #2757).
         // If the separate metadata message is lost over UDP, the receiver
@@ -874,6 +880,10 @@ where
 
         let packet_size = payload.len();
 
+        // Node-wide egress cap first, then cwnd admission; see the matching
+        // site in `send_stream` for why the order matters.
+        let egress_hold = super::super::egress_cap::pace(socket.as_ref(), &time_source).await;
+
         // BBR congestion control - wait until cwnd has space for this packet.
         //
         // IMPORTANT: This loop requires that recv() is being called on this connection
@@ -962,9 +972,6 @@ where
         if !wait_time.is_zero() {
             time_source.sleep(wait_time).await;
         }
-
-        // Node-wide egress cap; see the matching site in `send_stream`.
-        let egress_hold = super::super::egress_cap::pace(socket.as_ref(), None, &time_source).await;
 
         // Embed metadata in fragment #1 for reliability (fix #2757).
         // For piped streams, only embed if it fits within MAX_DATA_SIZE without

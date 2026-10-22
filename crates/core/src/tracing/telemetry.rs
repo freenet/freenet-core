@@ -2891,10 +2891,6 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                 serde_json::json!(snapshot.egress_waited),
             );
             m.insert(
-                "egress_wait_capped".into(),
-                serde_json::json!(snapshot.egress_wait_capped),
-            );
-            m.insert(
                 "egress_unpaced".into(),
                 serde_json::json!(snapshot.egress_unpaced),
             );
@@ -2915,8 +2911,12 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                 serde_json::json!(snapshot.egress_wait_us_max),
             );
             m.insert(
-                "egress_debt_hwm_bytes".into(),
-                serde_json::json!(snapshot.egress_debt_hwm_bytes),
+                "egress_long_waits".into(),
+                serde_json::json!(snapshot.egress_long_waits),
+            );
+            m.insert(
+                "egress_backlog_hwm_bytes".into(),
+                serde_json::json!(snapshot.egress_backlog_hwm_bytes),
             );
             m.insert(
                 "egress_debt_forgiven_bytes".into(),
@@ -6590,13 +6590,13 @@ mod tests {
             demux_other: 21,
             egress_immediate: 22,
             egress_waited: 23,
-            egress_wait_capped: 24,
             egress_unpaced: 25,
             egress_bytes: 26,
             egress_bytes_waited: 27,
             egress_wait_us_sum: 28,
             egress_wait_us_max: 29,
-            egress_debt_hwm_bytes: 30,
+            egress_long_waits: 24,
+            egress_backlog_hwm_bytes: 30,
             egress_debt_forgiven_bytes: 31,
             ..Default::default()
         };
@@ -6626,13 +6626,13 @@ mod tests {
             ("demux_other", 21),
             ("egress_immediate", 22),
             ("egress_waited", 23),
-            ("egress_wait_capped", 24),
             ("egress_unpaced", 25),
             ("egress_bytes", 26),
             ("egress_bytes_waited", 27),
             ("egress_wait_us_sum", 28),
             ("egress_wait_us_max", 29),
-            ("egress_debt_hwm_bytes", 30),
+            ("egress_long_waits", 24),
+            ("egress_backlog_hwm_bytes", 30),
             ("egress_debt_forgiven_bytes", 31),
         ] {
             assert_eq!(json[key], expected, "event-log value for {key}");
