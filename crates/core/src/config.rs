@@ -2593,7 +2593,9 @@ pub struct NetworkApiConfig {
     /// keepalives and retransmissions. Every datagram is charged to one
     /// node-wide token bucket (`transport::egress_cap`); stream fragments
     /// wait for it, and the rest is sent at once and paid back by later
-    /// waits, so the cap holds on average. A cap too low for the number of
+    /// waits, so the cap holds on average while less than one second of
+    /// stream data is queued; with more queued, control traffic is sent
+    /// uncharged on top of the cap. A cap too low for the number of
     /// concurrent streams makes each stream's fragments so far apart that
     /// receivers abandon them (see the bandwidth configuration guide). When
     /// set, individual
