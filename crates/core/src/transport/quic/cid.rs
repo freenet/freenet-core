@@ -40,10 +40,10 @@ impl MacConnectionIdGenerator {
     /// A new key, from the OS entropy pool (key material never comes from
     /// `GlobalRng`; see `config::os_random`). The nonces stay on
     /// [`GlobalRng`], so a seeded run makes the same nonces.
-    pub(crate) fn new_key() -> [u8; 32] {
+    pub(crate) fn new_key() -> std::io::Result<[u8; 32]> {
         let mut key = [0u8; 32];
-        super::config::os_random(&mut key);
-        key
+        super::config::os_random(&mut key)?;
+        Ok(key)
     }
 
     pub(crate) fn new(key: [u8; 32]) -> Self {

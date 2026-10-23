@@ -254,7 +254,7 @@ impl QuicEndpoint {
             time,
             settings,
             keypair,
-            config::endpoint_config(),
+            config::endpoint_config()?,
         )
     }
 
@@ -302,7 +302,7 @@ impl QuicEndpoint {
             Arc::new(refusing),
             transport.clone(),
             clock,
-        ));
+        )?);
         // If quinn refuses the socket after the ingress is enabled, the
         // ingress is disabled again, so the node is left as with QUIC off.
         let endpoint = socket

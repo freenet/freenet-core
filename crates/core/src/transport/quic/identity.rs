@@ -56,11 +56,47 @@ pub(crate) const ED25519_SPKI_LEN: usize = ED25519_SPKI_PREFIX.len() + 32;
 /// has sign bit 1 (`xeddsa::xed25519::PrivateKey::calculate_key_pair`).
 const XEDDSA_SIGN_BIT: u8 = 0;
 
-/// A transport public key that has no Edwards form (the Montgomery point
-/// u = -1). No key made from a secret is one; a peer could only claim one.
+/// A transport public key no node can hold, refused as an identity:
+///
+/// - a non-canonical encoding (bit 255 set, or u >= p). X25519 reads such a
+///   key as the canonical one it reduces to, so accepting it would let one
+///   secret authenticate as several byte-distinct transport keys;
+/// - a key whose Edwards form is a small-order point (u = 0, u = 1 and the
+///   two order-8 points). Ed25519 verification (ring's included) does not
+///   check the order of the public key, so for such a key a CertificateVerify
+///   can be forged without any secret;
+/// - u = -1, which has no Edwards form.
+///
+/// A key made from a secret by x25519-dalek is canonical and of prime order,
+/// so only a key a peer claims can be any of these.
 #[derive(Debug, thiserror::Error)]
-#[error("the transport public key has no Ed25519 form")]
+#[error(
+    "the transport public key is not a usable identity (non-canonical, small-order, or no Ed25519 form)"
+)]
 pub(crate) struct UnusableKey;
+
+/// p = 2^255 - 19, little-endian.
+const FIELD_PRIME: [u8; 32] = {
+    let mut p = [0xffu8; 32];
+    p[0] = 0xed;
+    p[31] = 0x7f;
+    p
+};
+
+/// Whether `u` is the canonical encoding of a field element: bit 255 clear
+/// and u < p.
+fn is_canonical(u: &[u8; 32]) -> bool {
+    if u[31] & 0x80 != 0 {
+        return false;
+    }
+    // Compare little-endian numbers from the most significant byte.
+    for i in (0..32).rev() {
+        if u[i] != FIELD_PRIME[i] {
+            return u[i] < FIELD_PRIME[i];
+        }
+    }
+    false
+}
 
 /// The Ed25519 public key (sign bit 0) of an X25519 transport public key:
 /// the key XEdDSA signatures by its holder verify under.
@@ -79,14 +115,16 @@ fn spki_of(ed25519: &[u8; 32]) -> [u8; ED25519_SPKI_LEN] {
 }
 
 /// The raw public key a peer is expected to present: the Edwards form of its
-/// transport key.
+/// transport key, kept with that transport key.
 #[derive(Clone)]
 pub(crate) struct PeerKey {
+    transport: TransportPublicKey,
     ed25519: [u8; 32],
     spki: [u8; ED25519_SPKI_LEN],
 }
 
-/// Compared in constant time, as every key comparison here is.
+/// Keys are public, so equality need not hide anything; it uses the same
+/// constant-time comparison as the rest of this module only for uniformity.
 impl PartialEq for PeerKey {
     fn eq(&self, other: &Self) -> bool {
         bool::from(self.ed25519.ct_eq(&other.ed25519))
@@ -95,24 +133,37 @@ impl PartialEq for PeerKey {
 
 impl Eq for PeerKey {}
 
+/// Printed as the transport key's fingerprint (`TransportPublicKey`'s
+/// `Display`), so logs name a peer the same way everywhere.
 impl std::fmt::Debug for PeerKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "PeerKey({})",
-            bs58::encode(&self.ed25519[..12]).into_string()
-        )
+        write!(f, "PeerKey({})", self.transport)
     }
 }
 
 impl PeerKey {
-    /// The key the holder of `key` presents.
+    /// The key the holder of `key` presents. Refuses a key no node can hold
+    /// (see [`UnusableKey`]).
     pub(crate) fn of(key: &TransportPublicKey) -> Result<Self, UnusableKey> {
+        if !is_canonical(key.as_bytes()) {
+            return Err(UnusableKey);
+        }
         let ed25519 = ed25519_public_key(key)?;
+        let point = ed25519_dalek::VerifyingKey::from_bytes(&ed25519).map_err(|_| UnusableKey)?;
+        if point.is_weak() {
+            return Err(UnusableKey);
+        }
         Ok(Self {
+            transport: key.clone(),
             ed25519,
             spki: spki_of(&ed25519),
         })
+    }
+
+    /// The transport key this is the Edwards form of.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn transport_key(&self) -> &TransportPublicKey {
+        &self.transport
     }
 
     /// The SubjectPublicKeyInfo DER this key is presented as.
@@ -127,8 +178,8 @@ impl PeerKey {
         &self.ed25519
     }
 
-    /// Whether `presented` is exactly this key's SubjectPublicKeyInfo. The
-    /// bytes are compared in constant time; the length is public.
+    /// Whether `presented` is exactly this key's SubjectPublicKeyInfo. Both
+    /// are public; the comparison is constant-time only for uniformity.
     fn matches(&self, presented: &CertificateDer<'_>) -> bool {
         let presented = presented.as_ref();
         presented.len() == ED25519_SPKI_LEN && bool::from(presented.ct_eq(&self.spki))
@@ -304,7 +355,7 @@ impl std::fmt::Debug for XeddsaSigner {
 
 impl Signer for XeddsaSigner {
     fn sign(&self, message: &[u8]) -> Result<Vec<u8>, Error> {
-        Ok(xeddsa_sign(&self.secret, message).to_vec())
+        Ok(xeddsa_sign(&self.secret, message)?.to_vec())
     }
 
     fn scheme(&self) -> SignatureScheme {
@@ -312,15 +363,76 @@ impl Signer for XeddsaSigner {
     }
 }
 
-/// XEdDSA-sign `message`. The nonce randomness is from the OS (SysRng), not
-/// `GlobalRng`: it is secret input to the signature nonce, and a seeded
-/// `GlobalRng` is known to anyone who reads a test's seed (code-style.md,
-/// the OsRng exception). Signing happens once per handshake, never in a
-/// per-packet path.
-fn xeddsa_sign(secret: &xeddsa::xed25519::PrivateKey, message: &[u8]) -> [u8; 64] {
+/// XEdDSA-sign `message`. The 64 bytes of nonce randomness come from the OS
+/// (ring's SystemRandom), not `GlobalRng`: they are secret input to the
+/// signature nonce, and a seeded `GlobalRng` is known to anyone who reads a
+/// test's seed (code-style.md, the OsRng exception). They are drawn before
+/// signing, so an OS entropy failure is a handshake error rather than a
+/// panic. Signing happens once per handshake, never in a per-packet path.
+fn xeddsa_sign(secret: &xeddsa::xed25519::PrivateKey, message: &[u8]) -> Result<[u8; 64], Error> {
+    use ring_crypto::rand::SecureRandom;
     use xeddsa::xeddsa::Sign;
-    secret.sign(message, rand_core10::UnwrapErr(rand10::rngs::SysRng))
+    let mut random = [0u8; XEDDSA_RANDOM_BYTES];
+    ring_crypto::rand::SystemRandom::new()
+        .fill(&mut random)
+        .map_err(|_| Error::General("the OS entropy source failed".into()))?;
+    Ok(secret.sign(message, DrawnRandom::new(random)))
 }
+
+/// The randomness XEdDSA draws per signature (its Z, 64 bytes).
+const XEDDSA_RANDOM_BYTES: usize = 64;
+
+/// Bytes already drawn from the OS, handed to `xeddsa` as its RNG (its RNG
+/// bound is infallible). It yields each byte once. `xeddsa` 1.1 draws exactly
+/// [`XEDDSA_RANDOM_BYTES`] per signature; asking for more is a broken
+/// assumption about that crate, and panics rather than repeat or invent
+/// randomness (`a_signature_draws_exactly_the_drawn_randomness` pins it).
+struct DrawnRandom {
+    bytes: [u8; XEDDSA_RANDOM_BYTES],
+    used: usize,
+}
+
+impl DrawnRandom {
+    fn new(bytes: [u8; XEDDSA_RANDOM_BYTES]) -> Self {
+        Self { bytes, used: 0 }
+    }
+}
+
+impl Drop for DrawnRandom {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.bytes.zeroize();
+    }
+}
+
+impl rand_core10::TryRng for DrawnRandom {
+    type Error = std::convert::Infallible;
+
+    fn try_next_u32(&mut self) -> Result<u32, Self::Error> {
+        let mut out = [0u8; 4];
+        self.try_fill_bytes(&mut out)?;
+        Ok(u32::from_le_bytes(out))
+    }
+
+    fn try_next_u64(&mut self) -> Result<u64, Self::Error> {
+        let mut out = [0u8; 8];
+        self.try_fill_bytes(&mut out)?;
+        Ok(u64::from_le_bytes(out))
+    }
+
+    fn try_fill_bytes(&mut self, dst: &mut [u8]) -> Result<(), Self::Error> {
+        let end = self.used + dst.len();
+        assert!(
+            end <= XEDDSA_RANDOM_BYTES,
+            "xeddsa asked for more than the {XEDDSA_RANDOM_BYTES} random bytes drawn for one signature"
+        );
+        dst.copy_from_slice(&self.bytes[self.used..end]);
+        self.used = end;
+        Ok(())
+    }
+}
+
+impl rand_core10::TryCryptoRng for DrawnRandom {}
 
 /// A client's check of the server: it must present exactly the expected key.
 #[derive(Debug)]

@@ -39,8 +39,11 @@ fn cert(bytes: &[u8]) -> CertificateDer<'static> {
 
 /// The conversion agrees with an independent implementation for random
 /// u-coordinates, half of them with bit 255 set (X25519 ignores that bit,
-/// RFC 7748 section 5, and so must the conversion), and refuses u = -1,
-/// the one value with no Edwards form, as the independent one does.
+/// RFC 7748 section 5, and so does the bare conversion), and refuses u = -1,
+/// the one value with no Edwards form, as the independent one does. As an
+/// IDENTITY (`PeerKey::of`) an encoding with bit 255 set is refused, so one
+/// secret cannot authenticate as two byte-distinct transport keys; its
+/// canonical twin is accepted.
 #[test]
 fn the_conversion_matches_an_independent_implementation() {
     let _seed = GlobalRng::seed_guard(SEED);
@@ -59,7 +62,12 @@ fn the_conversion_matches_an_independent_implementation() {
         assert_eq!(
             ed25519_public_key(&TransportPublicKey::from_bytes(flipped)).ok(),
             ours,
-            "bit 255 of u is ignored"
+            "bit 255 of u is ignored by the conversion"
+        );
+        let with_high_bit = if u[31] & 0x80 != 0 { u } else { flipped };
+        assert!(
+            PeerKey::of(&TransportPublicKey::from_bytes(with_high_bit)).is_err(),
+            "an encoding with bit 255 set is not an identity"
         );
         if let Some(edwards) = ours {
             assert_eq!(edwards[31] & 0x80, 0, "sign bit 0");
@@ -346,4 +354,130 @@ fn the_signing_key_offers_ed25519_and_hides_the_secret() {
         }
         assert!(!text.contains(&bs58::encode(secret).into_string()));
     }
+}
+
+/// The little-endian 256-bit sum of `a` and `b`, or `None` past 2^256.
+fn add_le(a: &[u8; 32], b: &[u8; 32]) -> Option<[u8; 32]> {
+    let mut out = [0u8; 32];
+    let mut carry = 0u16;
+    for i in 0..32 {
+        let sum = u16::from(a[i]) + u16::from(b[i]) + carry;
+        out[i] = sum as u8;
+        carry = sum >> 8;
+    }
+    (carry == 0).then_some(out)
+}
+
+/// Transport keys whose Edwards form has small order are refused: u = 0,
+/// u = 1, and the two order-8 points, which an attacker could claim and
+/// then forge a CertificateVerify for without a secret (Ed25519 verification
+/// does not check the order of the key). So are their non-canonical
+/// encodings u + p that still fit in 255 bits, and u = p - 1, which has no
+/// Edwards form. Each listed point is checked to really be small-order by
+/// curve25519-dalek 5, so the list cannot rot into ordinary points.
+#[test]
+fn small_order_and_non_canonical_keys_are_refused() {
+    fn le(hex: &str) -> [u8; 32] {
+        hex::decode(hex).unwrap().try_into().unwrap()
+    }
+    let zero = [0u8; 32];
+    let mut one = [0u8; 32];
+    one[0] = 1;
+    let small_order = [
+        ("u = 0", zero),
+        ("u = 1", one),
+        (
+            "order 8, first",
+            le("e0eb7a7c3b41b8ae1656e3faf19fc46ada098deb9c32b1fd866205165f49b800"),
+        ),
+        (
+            "order 8, second",
+            le("5f9c95bca3508c24b1d0b1559c83ef5b04445cc4581c8e86d8224eddd09f1157"),
+        ),
+    ];
+    let p = super::FIELD_PRIME;
+    for (what, u) in small_order {
+        let edwards = curve25519_dalek::montgomery::MontgomeryPoint(u)
+            .to_edwards(0)
+            .expect("small-order points have an Edwards form");
+        assert!(edwards.is_small_order(), "{what} is small-order");
+        assert!(super::is_canonical(&u), "{what} is canonical");
+        assert!(
+            PeerKey::of(&TransportPublicKey::from_bytes(u)).is_err(),
+            "{what} accepted as an identity"
+        );
+        // u + p, when it still fits in 255 bits: the same point, encoded
+        // non-canonically.
+        if let Some(alias) = add_le(&u, &p).filter(|a| a[31] & 0x80 == 0) {
+            assert!(!super::is_canonical(&alias));
+            assert!(
+                PeerKey::of(&TransportPublicKey::from_bytes(alias)).is_err(),
+                "{what} + p accepted as an identity"
+            );
+        }
+    }
+    let mut minus_one = p;
+    minus_one[0] = 0xec;
+    for (what, u) in [
+        ("p - 1", minus_one),
+        ("p", p),
+        ("2^255 - 1", {
+            let mut m = [0xffu8; 32];
+            m[31] = 0x7f;
+            m
+        }),
+    ] {
+        assert!(
+            PeerKey::of(&TransportPublicKey::from_bytes(u)).is_err(),
+            "{what} accepted as an identity"
+        );
+    }
+    // Ordinary keys from secrets are canonical and accepted.
+    let _seed = GlobalRng::seed_guard(SEED);
+    for _ in 0..64 {
+        let keys = TransportKeypair::new();
+        assert!(super::is_canonical(keys.public().as_bytes()));
+        assert!(PeerKey::of(keys.public()).is_ok());
+    }
+}
+
+/// A signature draws exactly the 64 random bytes taken from the OS before
+/// signing: `DrawnRandom` panics if `xeddsa` asks for more, so this pins the
+/// assumption that bytes are never repeated or invented.
+#[test]
+fn a_signature_draws_exactly_the_drawn_randomness() {
+    let _seed = GlobalRng::seed_guard(SEED);
+    let keys = TransportKeypair::new();
+    let signature = super::xeddsa_sign(&keys.auth_token_signer(), b"transcript").unwrap();
+    let peer = PeerKey::of(keys.public()).unwrap();
+    assert!(
+        peer.verify_signature(
+            b"transcript",
+            &cert(peer.spki()),
+            SignatureScheme::ED25519,
+            &signature
+        )
+        .is_ok()
+    );
+    let mut random = super::DrawnRandom::new([7u8; super::XEDDSA_RANDOM_BYTES]);
+    let mut first = [0u8; 40];
+    rand_core10::TryRng::try_fill_bytes(&mut random, &mut first).unwrap();
+    let mut rest = [0u8; 24];
+    rand_core10::TryRng::try_fill_bytes(&mut random, &mut rest).unwrap();
+    let more = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut one = [0u8; 1];
+        let _ = rand_core10::TryRng::try_fill_bytes(&mut random, &mut one);
+    }));
+    assert!(more.is_err(), "a 65th byte is refused, not repeated");
+}
+
+/// A peer key prints as its transport key's fingerprint, as
+/// `TransportPublicKey` itself does, not as Edwards bytes.
+#[test]
+fn a_peer_key_prints_as_its_transport_key() {
+    let _seed = GlobalRng::seed_guard(SEED);
+    let keys = TransportKeypair::new();
+    let peer = PeerKey::of(keys.public()).unwrap();
+    assert_eq!(format!("{peer:?}"), format!("PeerKey({})", keys.public()));
+    assert_eq!(peer.transport_key(), keys.public());
 }

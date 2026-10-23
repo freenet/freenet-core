@@ -130,30 +130,29 @@ const PER_CONNECTION_INBOUND_CAP: u64 =
 /// and would make the keys predictable to anyone who reads the seed
 /// (`.claude/rules/code-style.md`, OsRng exception). They do not affect the
 /// order or timing of what the endpoint sends, so a seeded run still
-/// repeats its event trace.
-pub(crate) fn os_random(out: &mut [u8]) {
+/// repeats its event trace. ring's SystemRandom reads getrandom(2) (or the
+/// platform equivalent); a failure is returned, so the endpoint is not built
+/// and the node runs with QUIC off instead of panicking.
+pub(crate) fn os_random(out: &mut [u8]) -> std::io::Result<()> {
     use ring_crypto::rand::SecureRandom;
-    // ring's SystemRandom reads getrandom(2) (or the platform equivalent);
-    // it fails only if the OS has no entropy source at all, where nothing
-    // cryptographic can run.
     ring_crypto::rand::SystemRandom::new()
         .fill(out)
-        .unwrap_or_else(|_| panic!("the OS entropy source failed"));
+        .map_err(|_| std::io::Error::other("the OS entropy source failed"))
 }
 
 /// The endpoint configuration: version, payload size, greasing, the
 /// stateless-reset key, the connection-ID generator and quinn's RNG seed.
 /// Keys come from the OS ([`os_random`]); quinn's RNG seed comes from
 /// [`GlobalRng`], so a seeded run is repeatable.
-pub(crate) fn endpoint_config() -> EndpointConfig {
-    endpoint_config_with_cid_key(MacConnectionIdGenerator::new_key())
+pub(crate) fn endpoint_config() -> std::io::Result<EndpointConfig> {
+    endpoint_config_with_cid_key(MacConnectionIdGenerator::new_key()?)
 }
 
 /// [`endpoint_config`] with a given connection-ID MAC key, so a test can
 /// make IDs the endpoint accepts.
-pub(crate) fn endpoint_config_with_cid_key(cid_key: [u8; 32]) -> EndpointConfig {
+pub(crate) fn endpoint_config_with_cid_key(cid_key: [u8; 32]) -> std::io::Result<EndpointConfig> {
     let mut reset_key = [0u8; 64];
-    os_random(&mut reset_key);
+    os_random(&mut reset_key)?;
     let mut config = EndpointConfig::new(Arc::new(hmac::Key::new(hmac::HMAC_SHA256, &reset_key)));
     config.cid_generator(move || Box::new(MacConnectionIdGenerator::new(cid_key)));
     let mut seed = [0u8; 32];
@@ -169,7 +168,7 @@ pub(crate) fn endpoint_config_with_cid_key(cid_key: [u8; 32]) -> EndpointConfig 
         .grease_quic_bit(false)
         .min_reset_interval(Duration::from_millis(20))
         .rng_seed(Some(seed));
-    config
+    Ok(config)
 }
 
 /// The transport configuration shared by both directions of a connection.
@@ -225,9 +224,9 @@ pub(crate) fn server_config(
     crypto: Arc<dyn quinn::crypto::ServerConfig>,
     transport: Arc<TransportConfig>,
     clock: Arc<dyn quinn::TimeSource>,
-) -> ServerConfig {
+) -> std::io::Result<ServerConfig> {
     let mut master_key = [0u8; 64];
-    os_random(&mut master_key);
+    os_random(&mut master_key)?;
     let token_key = hkdf::Salt::new(hkdf::HKDF_SHA256, &[]).extract(&master_key);
     let mut tokens = ValidationTokenConfig::default();
     tokens.sent(0).log(Arc::new(NoneTokenLog));
@@ -245,7 +244,7 @@ pub(crate) fn server_config(
         .incoming_buffer_size(INCOMING_BUFFER_BYTES)
         .incoming_buffer_size_total(INCOMING_BUFFER_TOTAL_BYTES)
         .time_source(clock);
-    config
+    Ok(config)
 }
 
 /// A client configuration over `crypto`: version 1, no stored tokens, and

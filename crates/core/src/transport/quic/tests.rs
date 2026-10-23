@@ -1218,9 +1218,9 @@ fn connection_ids_validate_only_with_the_key_that_made_them() {
     use super::cid::{CID_LEN, MacConnectionIdGenerator};
     use quinn::ConnectionIdGenerator;
     let _seed = GlobalRng::seed_guard(SEED);
-    let key = MacConnectionIdGenerator::new_key();
+    let key = MacConnectionIdGenerator::new_key().unwrap();
     let mut generator = MacConnectionIdGenerator::new(key);
-    let other = MacConnectionIdGenerator::new(MacConnectionIdGenerator::new_key());
+    let other = MacConnectionIdGenerator::new(MacConnectionIdGenerator::new_key().unwrap());
     assert_eq!(generator.cid_len(), CID_LEN);
     assert_eq!(generator.cid_lifetime(), None);
     for _ in 0..100 {
@@ -1255,7 +1255,7 @@ fn connection_ids_validate_only_with_the_key_that_made_them() {
 #[test]
 fn endpoint_config_pins_every_value() {
     let _seed = GlobalRng::seed_guard(SEED);
-    let config = config::endpoint_config();
+    let config = config::endpoint_config().unwrap();
     let debug = format!("{config:?}");
     assert_eq!(
         config.get_max_udp_payload_size(),
@@ -1275,7 +1275,7 @@ fn endpoint_config_pins_every_value() {
     // quinn's RNG seed follows GlobalRng: the same seed, the same quinn seed.
     let again = format!("{:?}", {
         let _seed = GlobalRng::seed_guard(SEED);
-        config::endpoint_config()
+        config::endpoint_config().unwrap()
     });
     assert_eq!(debug, again, "the rng seed follows GlobalRng");
 }
@@ -1388,7 +1388,8 @@ fn server_config_pins_every_value() {
         crypto,
         Arc::new(config::transport_config(&settings(), &VirtualTime::new())),
         config::system_clock(VirtualTime::new()),
-    );
+    )
+    .unwrap();
     let debug = format!("{server:?}");
     for (field, expected) in [
         ("migration", "false".to_string()),
@@ -1966,7 +1967,7 @@ fn a_short_header_packet_with_a_forged_id_gets_no_reply() {
     use quinn::ConnectionIdGenerator;
     bounded(|| async move {
         let _seed = GlobalRng::seed_guard(SEED);
-        let key = super::cid::MacConnectionIdGenerator::new_key();
+        let key = super::cid::MacConnectionIdGenerator::new_key().unwrap();
         let mut valid = super::cid::MacConnectionIdGenerator::new(key)
             .generate_cid()
             .to_vec();
@@ -1990,7 +1991,7 @@ fn a_short_header_packet_with_a_forged_id_gets_no_reply() {
                 time.clone(),
                 &settings(),
                 &TransportKeypair::new(),
-                config::endpoint_config_with_cid_key(key),
+                config::endpoint_config_with_cid_key(key).unwrap(),
             )
             .unwrap();
             let _permit = endpoint
