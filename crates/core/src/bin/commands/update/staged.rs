@@ -189,6 +189,10 @@ impl std::error::Error for StageTimedOut {}
 /// than its Content-Length said).
 const METER_PERSIST_EVERY: u64 = 16 * 1024 * 1024;
 
+/// What a download of unknown size is charged for before its body arrives:
+/// more than the largest release asset, the macOS DMG, with room to spare.
+const MAX_UNKNOWN_DOWNLOAD: u64 = 128 * 1024 * 1024;
+
 /// Counts the archive bytes a run receives (staging's or the updater's)
 /// against what is left of the node's daily budget
 /// (`rollback::DOWNLOAD_BYTES_PER_DAY`), and, when it has a ledger, charges
@@ -253,12 +257,18 @@ impl<'a> ByteMeter<'a> {
     }
 
     /// Charge the ledger, before a download's body arrives, for the
-    /// `expected` bytes it will bring (its Content-Length), never more than
-    /// is left of the allowance, and all of that when the size is unknown.
+    /// `expected` bytes it will bring (its Content-Length), or
+    /// [`MAX_UNKNOWN_DOWNLOAD`] when the size is unknown; never more than is
+    /// left of the allowance, nor more than a whole day's budget (an
+    /// unlimited meter's allowance is unbounded).
     pub(super) fn precharge(&self, expected: Option<u64>) {
         let received = self.received();
         let left = self.allowance.saturating_sub(received);
-        self.record(received.saturating_add(expected.map_or(left, |n| n.min(left))));
+        let charge = expected
+            .unwrap_or(MAX_UNKNOWN_DOWNLOAD)
+            .min(left)
+            .min(super::super::rollback::DOWNLOAD_BYTES_PER_DAY);
+        self.record(received.saturating_add(charge));
     }
 
     /// Count `n` bytes just received; an error once they pass the allowance.
@@ -3371,6 +3381,48 @@ mod tests {
             last.hold_reason.as_deref(),
             Some("GitHub rate-limited the release lookup")
         );
+    }
+
+    /// A download of unknown size (chunked) killed mid-way leaves at most
+    /// MAX_UNKNOWN_DOWNLOAD charged, or what is left of a limited allowance,
+    /// and a huge declared size is capped at a day's budget: an unlimited
+    /// meter (a manual run, `--force`) can never pin the ledger, nor erase
+    /// what was charged before it.
+    #[tokio::test]
+    async fn an_unknown_size_precharge_is_capped() {
+        use super::super::super::rollback::{
+            DOWNLOAD_BYTES_PER_DAY, charge_download_bytes_at, download_bytes_at,
+        };
+        use super::super::tests::{partial_server, run_until};
+        const MIB: u64 = 1024 * 1024;
+        assert_eq!(MAX_UNKNOWN_DOWNLOAD, 128 * MIB);
+        let chunked = partial_server(None, 100, true).await;
+        let huge = partial_server(Some(1 << 40), 100, true).await;
+        let now = SystemTime::now();
+        let clock = move || now;
+        for (case, prefix, allowance, expected) in [
+            ("unlimited, chunked", &chunked.prefix, u64::MAX, 128 * MIB),
+            ("limited, chunked", &chunked.prefix, 10 * MIB, 10 * MIB),
+            (
+                "unlimited, huge",
+                &huge.prefix,
+                u64::MAX,
+                DOWNLOAD_BYTES_PER_DAY,
+            ),
+        ] {
+            let (_tmp, root) = test_root();
+            let dir = root.parent().unwrap();
+            fs::create_dir_all(&root).unwrap();
+            charge_download_bytes_at(dir, 1000, now);
+            let meter = ByteMeter::charged_to(allowance, dir, &clock);
+            let part = root.join("asset.part");
+            run_until(
+                download_resumable(&format!("{prefix}asset"), &part, &meter),
+                || download_bytes_at(dir, now) > 1000,
+            )
+            .await;
+            assert_eq!(download_bytes_at(dir, now), 1000 + expected, "{case}");
+        }
     }
 
     /// A staging download is charged for its Content-Length before its body
