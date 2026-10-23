@@ -949,6 +949,18 @@ where
         }
         return Err(Staging::NothingToInstall);
     }
+    // The clear above can remove the run's own hold (the sentinel's, or a
+    // withdrawn named release's), so hold the release about to be downloaded:
+    // a run killed mid-download then restarts into a cooldown.
+    if let Some(dir) = root.parent() {
+        super::super::rollback::hold_update_without_counting_at(
+            dir,
+            super::super::auto_update::version_from_tag(&tag),
+            "a download in advance started and did not report how it ended",
+            clock(),
+            freenet::config::GlobalRng::random_range(0.0_f64..1.0),
+        );
+    }
     Ok(tag)
 }
 
@@ -3201,6 +3213,42 @@ mod tests {
             assert_eq!(
                 (record.version.as_str(), record.failures),
                 (held, 0),
+                "{target:?}"
+            );
+            assert!(record.hold_reason.is_some());
+        }
+    }
+
+    /// While a download is in progress the release being downloaded is held,
+    /// even when the lookup's clear removed the run's first hold (the
+    /// sentinel's, or a withdrawn named release's), so a run killed then
+    /// restarts into a cooldown.
+    #[tokio::test]
+    async fn a_download_in_progress_is_held_for_the_resolved_release() {
+        use super::super::tests::{partial_server, run_until};
+        for target in [None, Some("9.9.10")] {
+            // Small, so the manifest download (the first request) stalls
+            // rather than being refused for its size.
+            let server = partial_server(Some(2000), 100, true).await;
+            let (_tmp, root) = test_root();
+            let env = test_env(&server.prefix);
+            let requests = server.requests.clone();
+            run_until(
+                stage_into(
+                    &root,
+                    "9.9.8",
+                    || async { Ok(TAG.to_string()) },
+                    target,
+                    |_: &str| false,
+                    &env,
+                ),
+                || requests.load(std::sync::atomic::Ordering::SeqCst) > 0,
+            )
+            .await;
+            let record = cooldown(&root).expect("held while downloading");
+            assert_eq!(
+                (record.version.as_str(), record.failures),
+                ("9.9.9", 0),
                 "{target:?}"
             );
             assert!(record.hold_reason.is_some());

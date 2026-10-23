@@ -4440,15 +4440,30 @@ done
     /// behaviour rather than source. A verification failure goes to the #4073
     /// gate and never to the cooldown; every other failure cools the release
     /// down carrying its full error chain; an install clears.
-    /// A server that answers every request with `declared` bytes of
-    /// Content-Length, sends `sent` of them, and then stalls with the
-    /// connection open: a download a run is killed in the middle of.
-    pub(crate) async fn stalling_server(declared: usize, sent: usize) -> String {
+    /// A local HTTP server for download tests, and how many requests it
+    /// has received.
+    pub(crate) struct PartialServer {
+        pub(crate) prefix: String,
+        pub(crate) requests: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    /// A server that answers every request with a body of `declared` bytes
+    /// (chunked, with no size, when `None`) but sends only `sent` of them,
+    /// then either stalls with the connection open (`stall`: a download a
+    /// run is killed in the middle of) or closes it (a body cut short).
+    pub(crate) async fn partial_server(
+        declared: Option<usize>,
+        sent: usize,
+        stall: bool,
+    ) -> PartialServer {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let prefix = format!("http://{}/", listener.local_addr().unwrap());
+        let requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = requests.clone();
         tokio::spawn(async move {
             while let Ok((mut conn, _)) = listener.accept().await {
+                let counted = counted.clone();
                 tokio::spawn(async move {
                     let mut request = Vec::new();
                     let mut buf = [0u8; 1024];
@@ -4458,17 +4473,62 @@ done
                             Ok(n) => request.extend_from_slice(&buf[..n]),
                         }
                     }
-                    let mut reply =
-                        format!("HTTP/1.1 200 OK\r\nContent-Length: {declared}\r\n\r\n")
-                            .into_bytes();
-                    reply.extend(std::iter::repeat_n(b'x', sent));
+                    counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let body = vec![b'x'; sent];
+                    let mut reply = match declared {
+                        Some(n) => format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {n}\r\nConnection: close\r\n\r\n"
+                        )
+                        .into_bytes(),
+                        None => b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec(),
+                    };
+                    if declared.is_none() && sent > 0 {
+                        reply.extend(format!("{sent:x}\r\n").into_bytes());
+                        reply.extend(&body);
+                        reply.extend(b"\r\n");
+                    } else {
+                        reply.extend(&body);
+                    }
                     #[allow(clippy::let_underscore_must_use)]
                     let _ = conn.write_all(&reply).await;
-                    tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                    if stall {
+                        tokio::time::sleep(std::time::Duration::from_secs(120)).await;
+                    } else {
+                        #[allow(clippy::let_underscore_must_use)]
+                        let _ = conn.shutdown().await;
+                    }
                 });
             }
         });
-        prefix
+        PartialServer { prefix, requests }
+    }
+
+    /// A server whose responses declare `declared` bytes, send `sent`, and
+    /// stall.
+    pub(crate) async fn stalling_server(declared: usize, sent: usize) -> String {
+        partial_server(Some(declared), sent, true).await.prefix
+    }
+
+    /// Run `work` until `done` holds (checked every 10 ms, for at most a
+    /// minute), then drop it, as a kill would. Panics if `work` finishes
+    /// first or `done` never holds.
+    pub(crate) async fn run_until<T>(
+        work: impl std::future::Future<Output = T>,
+        mut done: impl FnMut() -> bool,
+    ) {
+        let wait = async {
+            for _ in 0..6000 {
+                if done() {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            panic!("the condition never held");
+        };
+        tokio::select! {
+            _ = work => panic!("the work finished before the condition held"),
+            () = wait => {}
+        }
     }
 
     /// #5799: an updater download systemd kills mid-way (here: abandoned)
