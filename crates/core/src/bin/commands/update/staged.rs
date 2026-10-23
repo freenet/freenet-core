@@ -3341,6 +3341,74 @@ mod tests {
         }
     }
 
+    /// What a failed lookup counts against: the release the trigger named,
+    /// whatever is on record; else a newer, unblocked release on record;
+    /// else the sentinel.
+    #[test]
+    fn a_named_target_takes_precedence_over_the_record() {
+        use super::super::super::rollback::{UNKNOWN_RELEASE, record_update_failure_at};
+        let now = SystemTime::now();
+        let blocked = |v: &str| v == "9.9.12";
+        for (recorded, target, expected) in [
+            (Some("9.9.10"), Some("9.9.11"), "9.9.11"),
+            (None, Some("9.9.11"), "9.9.11"),
+            (Some("9.9.10"), None, "9.9.10"),
+            (Some("9.9.8"), None, UNKNOWN_RELEASE),
+            (Some("9.9.12"), None, UNKNOWN_RELEASE),
+            (None, None, UNKNOWN_RELEASE),
+        ] {
+            let (_tmp, root) = test_root();
+            let dir = root.parent().unwrap();
+            fs::create_dir_all(dir).unwrap();
+            if let Some(recorded) = recorded {
+                record_update_failure_at(dir, recorded, "earlier", now, 0.5);
+            }
+            assert_eq!(
+                lookup_failure_target(&root, "9.9.8", target, &blocked),
+                expected,
+                "{recorded:?} on record, {target:?} named"
+            );
+        }
+    }
+
+    /// A trigger names a release with two failures on record, and the lookup
+    /// finds nothing newer than this binary (the release was withdrawn). The
+    /// record is cleared as stale, then the named release is held again from
+    /// a count of zero: the hold spaces the next trigger, and the withdrawn
+    /// release's count must not carry into it.
+    #[tokio::test]
+    async fn a_withdrawn_named_release_is_cleared_then_held_from_zero() {
+        use super::super::super::rollback::record_update_failure_at;
+        let server = Server::run(); // no expectations: nothing is downloaded
+        let (_tmp, root) = test_root();
+        let dir = root.parent().unwrap();
+        fs::create_dir_all(dir).unwrap();
+        let long_ago = SystemTime::now() - Duration::from_secs(5 * 3600);
+        for _ in 0..2 {
+            record_update_failure_at(dir, "9.9.9", "earlier", long_ago, 0.5);
+        }
+        assert_eq!(cooldown(&root).unwrap().failures, 2);
+        let prefix = server.url_str("/");
+        let env = test_env(&prefix);
+        let outcome = stage_into(
+            &root,
+            "9.9.8",
+            || async { Ok("v9.9.8".to_string()) },
+            Some("9.9.9"),
+            |_: &str| false,
+            &env,
+        )
+        .await;
+        assert_eq!(outcome, Staging::NothingToInstall);
+        let record = cooldown(&root).expect("the named release is held");
+        assert_eq!((record.version.as_str(), record.failures), ("9.9.9", 0));
+        assert_eq!(record.last_error, "", "nothing carried from the old record");
+        assert_eq!(
+            record.hold_reason.as_deref(),
+            Some("the release lookup found no newer installable release")
+        );
+    }
+
     /// What a successful lookup counts as stale, clause by clause.
     #[test]
     fn stale_records_after_a_successful_lookup() {
