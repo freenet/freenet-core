@@ -466,7 +466,7 @@ fn a_signature_draws_exactly_the_drawn_randomness() {
     rand_core10::TryRng::try_fill_bytes(&mut random, &mut rest).unwrap();
     let more = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let mut one = [0u8; 1];
-        let _ = rand_core10::TryRng::try_fill_bytes(&mut random, &mut one);
+        rand_core10::TryRng::try_fill_bytes(&mut random, &mut one).unwrap();
     }));
     assert!(more.is_err(), "a 65th byte is refused, not repeated");
 }

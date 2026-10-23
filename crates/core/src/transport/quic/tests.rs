@@ -507,7 +507,11 @@ fn a_client_with_another_alpn_is_refused() {
         let b_addr = pair.b_addr;
         let (client, server) = drive(&pair.time, Duration::from_secs(60), async move {
             tokio::join!(
-                async { a.connect_with(b_addr, client_config).await.map(|_| ()) },
+                async {
+                    a.connect_with(b_addr, client_config, b_peer)
+                        .await
+                        .map(|_| ())
+                },
                 async {
                     b.accept()
                         .await
@@ -559,25 +563,34 @@ async fn attempt(
     client: &QuicEndpoint,
     server: &QuicEndpoint,
     server_addr: SocketAddr,
-    client_config: quinn::ClientConfig,
+    (client_config, expected_server): (quinn::ClientConfig, PeerKey),
     server_tls: ServerTls,
 ) -> Outcome {
     let (client, server) = (client.clone(), server.clone());
     drive(time, Duration::from_secs(60), async move {
-        tokio::join!(client.connect_with(server_addr, client_config), async {
-            let incoming = server.accept().await.expect("an incoming attempt");
-            match server_tls {
-                ServerTls::Pinned => incoming.establish().await,
-                ServerTls::Custom(tls) => {
-                    let mut config = (*server.server).clone();
-                    config.crypto = Arc::new(
-                        quinn::crypto::rustls::QuicServerConfig::try_from(Arc::new(*tls)).unwrap(),
-                    );
-                    let connection = incoming.incoming.accept_with(Arc::new(config))?.await?;
-                    Ok(QuicConnection::new(connection, incoming.permit))
+        tokio::join!(
+            client.connect_with(server_addr, client_config, expected_server),
+            async {
+                let incoming = server.accept().await.expect("an incoming attempt");
+                match server_tls {
+                    ServerTls::Pinned => incoming.establish().await,
+                    ServerTls::Custom(tls) => {
+                        let mut config = (*server.server).clone();
+                        config.crypto = Arc::new(
+                            quinn::crypto::rustls::QuicServerConfig::try_from(Arc::new(*tls))
+                                .unwrap(),
+                        );
+                        let connection = incoming.incoming.accept_with(Arc::new(config))?.await?;
+                        Ok(QuicConnection::new(
+                            connection,
+                            incoming.permit,
+                            Some(incoming.hold),
+                            incoming.peer,
+                        ))
+                    }
                 }
             }
-        })
+        )
     })
     .await
 }
@@ -587,12 +600,10 @@ async fn attempt(
 fn pinned_client_config(
     endpoint: &QuicEndpoint,
     server_key: &TransportPublicKey,
-) -> quinn::ClientConfig {
-    let tls = endpoint
-        .identity
-        .client_tls(&PeerKey::of(server_key).unwrap())
-        .unwrap();
-    endpoint.client_config(Arc::new(tls))
+) -> (quinn::ClientConfig, PeerKey) {
+    let peer = PeerKey::of(server_key).unwrap();
+    let tls = endpoint.identity.client_tls(&peer).unwrap();
+    (endpoint.client_config(Arc::new(tls)), peer)
 }
 
 /// A client configuration that presents `key` (any raw public key and
@@ -601,13 +612,10 @@ fn client_config_presenting(
     endpoint: &QuicEndpoint,
     key: Arc<rustls::sign::CertifiedKey>,
     server_key: &TransportPublicKey,
-) -> quinn::ClientConfig {
-    let tls = config::tls_client_config(
-        key,
-        Arc::new(PinnedServerKey::new(&PeerKey::of(server_key).unwrap())),
-    )
-    .unwrap();
-    endpoint.client_config(Arc::new(tls))
+) -> (quinn::ClientConfig, PeerKey) {
+    let peer = PeerKey::of(server_key).unwrap();
+    let tls = config::tls_client_config(key, Arc::new(PinnedServerKey::new(&peer))).unwrap();
+    (endpoint.client_config(Arc::new(tls)), peer)
 }
 
 /// A server configuration that presents `key` and expects the client to
@@ -635,44 +643,77 @@ fn claimed_key(
     ))
 }
 
-/// The handshake was refused. The server's side always fails. The client's
-/// fails too when it refused the server; when the SERVER refused the
-/// client, TLS 1.3 lets the client finish its side first (it sends its
-/// Finished without waiting for a verdict on its key), so `connect` may
-/// return a connection, which the server's CONNECTION_CLOSE then ends
-/// before any stream: the test drives it until it closes and requires that
-/// the peer closed it.
-/// `client_refused_server` says which side refused: when the client did,
-/// its side must fail outright.
+/// TLS alert `access_denied`: the presented key is not the expected one
+/// (rustls's `ApplicationVerificationFailure`).
+const ACCESS_DENIED: u8 = 49;
+/// TLS alert `decrypt_error`: the CertificateVerify signature does not
+/// verify under the expected key (rustls's `BadSignature`).
+const DECRYPT_ERROR: u8 = 51;
+
+/// The TLS alert a connection error carries (QUIC crypto error 0x100 +
+/// alert), from either side: raised locally, or received in the peer's
+/// CONNECTION_CLOSE.
+fn tls_alert(error: &quinn::ConnectionError) -> Option<u8> {
+    let code = match error {
+        quinn::ConnectionError::TransportError(e) => e.code,
+        quinn::ConnectionError::ConnectionClosed(close) => close.error_code,
+        quinn::ConnectionError::VersionMismatch
+        | quinn::ConnectionError::ApplicationClosed(_)
+        | quinn::ConnectionError::Reset
+        | quinn::ConnectionError::TimedOut
+        | quinn::ConnectionError::LocallyClosed
+        | quinn::ConnectionError::CidsExhausted => return None,
+    };
+    let code = u64::from(code);
+    (0x100..0x200)
+        .contains(&code)
+        .then_some((code - 0x100) as u8)
+}
+
+/// The handshake was refused, with TLS alert `alert` on BOTH sides, so a
+/// refusal test cannot pass for an unrelated failure (a timeout, a version
+/// mismatch, another alert). The client's side fails outright when it
+/// refused the server; when the SERVER refused the client, TLS 1.3 lets the
+/// client finish its side first (it sends its Finished without waiting for
+/// a verdict on its key), so `connect` may return a connection, which the
+/// server's CONNECTION_CLOSE then ends before any stream: the test drives
+/// it until it closes and reads the alert from that close.
+/// `client_refused_server` says which side refused.
 async fn assert_refused(
     time: &VirtualTime,
     outcome: Outcome,
     client_refused_server: bool,
+    alert: u8,
     what: &str,
 ) {
     let (client, server) = outcome;
-    assert!(
-        server.is_err(),
-        "{what}: the server side completed: {server:?}"
-    );
-    match client {
-        Err(QuicConnectError::Connection(_)) => {}
+    match &server {
+        Err(error) => assert_eq!(
+            tls_alert(error),
+            Some(alert),
+            "{what}: the server side failed with {error:?}"
+        ),
+        Ok(_) => panic!("{what}: the server side completed: {server:?}"),
+    }
+    let client_error = match client {
+        Err(QuicConnectError::Connection(error)) => error,
         Ok(_) if client_refused_server => {
             panic!("{what}: the client accepted the server's key")
         }
         Err(other) => panic!("{what}: the client failed before the handshake: {other:?}"),
         Ok(connection) => {
             let inner = connection.inner().clone();
-            let reason = drive(time, Duration::from_secs(60), async move {
+            drive(time, Duration::from_secs(60), async move {
                 inner.closed().await
             })
-            .await;
-            assert!(
-                matches!(reason, quinn::ConnectionError::ConnectionClosed(_)),
-                "{what}: the client's connection ended by {reason:?}, not by the server"
-            );
+            .await
         }
-    }
+    };
+    assert_eq!(
+        tls_alert(&client_error),
+        Some(alert),
+        "{what}: the client side ended by {client_error:?}"
+    );
 }
 
 /// With the keys each side expects, the handshake completes in both
@@ -721,6 +762,15 @@ fn handshakes_with_the_expected_keys_succeed_both_ways() {
             )
             .await;
             let (client_conn, server_conn) = (client_conn.unwrap(), server_conn.unwrap());
+            assert_eq!(
+                client_conn.peer_key(),
+                &PeerKey::of(server_keys.public()).unwrap()
+            );
+            assert_eq!(
+                server_conn.peer_key(),
+                &PeerKey::of(client_keys.public()).unwrap()
+            );
+            assert_eq!(server_conn.peer_key().transport_key(), client_keys.public());
             let presented = |conn: &QuicConnection| {
                 conn.inner()
                     .peer_identity()
@@ -759,7 +809,14 @@ fn a_server_without_the_expected_key_is_refused() {
             ServerTls::Pinned,
         )
         .await;
-        assert_refused(&pair.time, outcome, true, "wrong expected server key").await;
+        assert_refused(
+            &pair.time,
+            outcome,
+            true,
+            ACCESS_DENIED,
+            "wrong expected server key",
+        )
+        .await;
         // `connect`, the node's path, refuses it the same way.
         let (a, b, b_addr) = (pair.a.clone(), pair.b.clone(), pair.b_addr);
         let key = someone_else.public().clone();
@@ -773,6 +830,7 @@ fn a_server_without_the_expected_key_is_refused() {
             &pair.time,
             outcome,
             true,
+            ACCESS_DENIED,
             "connect with a wrong expected server key",
         )
         .await;
@@ -806,7 +864,14 @@ fn a_client_without_the_expected_key_is_refused() {
             ServerTls::Pinned,
         )
         .await;
-        assert_refused(&pair.time, outcome, false, "wrong client key").await;
+        assert_refused(
+            &pair.time,
+            outcome,
+            false,
+            ACCESS_DENIED,
+            "wrong client key",
+        )
+        .await;
     })
 }
 
@@ -837,7 +902,14 @@ fn a_foreign_ed25519_key_is_refused_on_either_side() {
             ))),
         )
         .await;
-        assert_refused(&pair.time, outcome, true, "server with a foreign key").await;
+        assert_refused(
+            &pair.time,
+            outcome,
+            true,
+            ACCESS_DENIED,
+            "server with a foreign key",
+        )
+        .await;
         let outcome = attempt(
             &pair.time,
             &pair.a,
@@ -847,7 +919,14 @@ fn a_foreign_ed25519_key_is_refused_on_either_side() {
             ServerTls::Pinned,
         )
         .await;
-        assert_refused(&pair.time, outcome, false, "client with a foreign key").await;
+        assert_refused(
+            &pair.time,
+            outcome,
+            false,
+            ACCESS_DENIED,
+            "client with a foreign key",
+        )
+        .await;
     })
 }
 
@@ -889,7 +968,14 @@ fn a_man_in_the_middle_with_its_own_key_fails_both_legs() {
             ServerTls::Pinned,
         )
         .await;
-        assert_refused(&pair.time, outcome, true, "M toward a with its own key").await;
+        assert_refused(
+            &pair.time,
+            outcome,
+            true,
+            ACCESS_DENIED,
+            "M toward a with its own key",
+        )
+        .await;
         let outcome = attempt(
             &pair.time,
             &pair.a,
@@ -902,7 +988,14 @@ fn a_man_in_the_middle_with_its_own_key_fails_both_legs() {
             ))),
         )
         .await;
-        assert_refused(&pair.time, outcome, true, "M toward a claiming b's key").await;
+        assert_refused(
+            &pair.time,
+            outcome,
+            true,
+            DECRYPT_ERROR,
+            "M toward a claiming b's key",
+        )
+        .await;
 
         // Leg to b: b expects a's key from M's address.
         let _permit = pair.b.allow_peer(m_addr, &pair.a_key()).unwrap();
@@ -915,7 +1008,14 @@ fn a_man_in_the_middle_with_its_own_key_fails_both_legs() {
             ServerTls::Pinned,
         )
         .await;
-        assert_refused(&pair.time, outcome, false, "M toward b with its own key").await;
+        assert_refused(
+            &pair.time,
+            outcome,
+            false,
+            ACCESS_DENIED,
+            "M toward b with its own key",
+        )
+        .await;
         let outcome = attempt(
             &pair.time,
             &m,
@@ -929,7 +1029,85 @@ fn a_man_in_the_middle_with_its_own_key_fails_both_legs() {
             ServerTls::Pinned,
         )
         .await;
-        assert_refused(&pair.time, outcome, false, "M toward b claiming a's key").await;
+        assert_refused(
+            &pair.time,
+            outcome,
+            false,
+            DECRYPT_ERROR,
+            "M toward b claiming a's key",
+        )
+        .await;
+    })
+}
+
+/// An address stays bound to the key an attempt or connection from it was
+/// authenticated against, even after the permit that allowed it is gone:
+/// while the attempt, then the connection, is alive, allowing the address
+/// for another key is a `KeyConflict`, and new attempts from it are not
+/// accepted (no permit). Once the connection has closed the address takes
+/// a new key.
+#[test]
+fn a_live_attempt_or_connection_keeps_its_address_bound_to_its_key() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let pair = pair(
+            "quic-identity-hold",
+            "10.201.27.1:5000".parse().unwrap(),
+            "10.201.27.2:5000".parse().unwrap(),
+            None,
+        )
+        .await;
+        let other = TransportKeypair::new();
+        let permit = pair.b.allow_peer(pair.a_addr, &pair.a_key()).unwrap();
+        let (a, b, b_addr, b_key) = (pair.a.clone(), pair.b.clone(), pair.b_addr, pair.b_key());
+        let client = tokio::spawn(async move { a.connect(b_addr, &b_key).await });
+        let incoming = drive(&pair.time, Duration::from_secs(60), async move {
+            b.accept().await.expect("an attempt")
+        })
+        .await;
+        assert_eq!(incoming.peer, PeerKey::of(pair.a_keys.public()).unwrap());
+
+        // The attempt holds the binding after the permit is gone.
+        drop(permit);
+        assert!(matches!(
+            pair.b.allow_peer(pair.a_addr, other.public()),
+            Err(QuicAllowError::KeyConflict)
+        ));
+        assert!(
+            pair.b.expected_clients.get(pair.a_addr).is_none(),
+            "no permit"
+        );
+
+        // So does the connection it becomes.
+        let server = drive(&pair.time, Duration::from_secs(60), async move {
+            incoming.establish().await
+        })
+        .await
+        .expect("handshake");
+        let client = client.await.unwrap().expect("client handshake");
+        assert_eq!(server.peer_key().transport_key(), pair.a_keys.public());
+        assert!(matches!(
+            pair.b.allow_peer(pair.a_addr, other.public()),
+            Err(QuicAllowError::KeyConflict)
+        ));
+        // The same key may be allowed again meanwhile.
+        drop(pair.b.allow_peer(pair.a_addr, &pair.a_key()).unwrap());
+
+        // Closed: the binding goes, and another key may take the address.
+        drop(client);
+        let server_conn = server.inner().clone();
+        drive(&pair.time, Duration::from_secs(60), async move {
+            server_conn.closed().await;
+        })
+        .await;
+        for _ in 0..64 {
+            tokio::task::yield_now().await;
+        }
+        let _moved = pair
+            .b
+            .allow_peer(pair.a_addr, other.public())
+            .expect("the address takes a new key once nothing uses the old one");
+        drop(server);
     })
 }
 

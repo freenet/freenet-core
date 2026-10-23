@@ -123,17 +123,76 @@ pub(crate) struct QuicEndpoint {
     expected_clients: Arc<ExpectedClients>,
 }
 
-/// The key each allowed client address must present, with the number of
-/// [`QuicPeerPermit`]s holding it. An address leaves when its last permit is
-/// dropped.
+/// The key each allowed client address must present. An entry counts the
+/// [`QuicPeerPermit`]s that allow the address and, separately, the attempts
+/// and connections authenticated (or being authenticated) against that key
+/// ([`KeyHold`]). It leaves when both counts reach zero, so while an attempt
+/// or connection for a key is alive the address cannot be allowed for
+/// another key ([`QuicAllowError::KeyConflict`]). New attempts are accepted
+/// only while a permit is alive.
 #[derive(Default)]
 struct ExpectedClients {
-    by_addr: Mutex<HashMap<SocketAddr, (PeerKey, usize)>>,
+    by_addr: Mutex<HashMap<SocketAddr, ExpectedEntry>>,
+}
+
+struct ExpectedEntry {
+    key: PeerKey,
+    permits: usize,
+    holds: usize,
 }
 
 impl ExpectedClients {
+    /// The key `addr` was allowed with, if a permit for it is alive.
+    #[cfg(test)]
     fn get(&self, addr: SocketAddr) -> Option<PeerKey> {
-        self.by_addr.lock().get(&addr).map(|(key, _)| key.clone())
+        self.by_addr
+            .lock()
+            .get(&addr)
+            .filter(|entry| entry.permits > 0)
+            .map(|entry| entry.key.clone())
+    }
+
+    /// The key `addr` was allowed with and a hold on it, in one step, if a
+    /// permit for it is alive.
+    fn hold(self: &Arc<Self>, addr: SocketAddr) -> Option<(PeerKey, KeyHold)> {
+        let mut by_addr = self.by_addr.lock();
+        let entry = by_addr.get_mut(&addr).filter(|entry| entry.permits > 0)?;
+        entry.holds += 1;
+        Some((
+            entry.key.clone(),
+            KeyHold {
+                expected: self.clone(),
+                addr,
+            },
+        ))
+    }
+
+    /// Count one release of `addr`'s entry, a permit or a hold.
+    fn release(&self, addr: SocketAddr, permit: bool) {
+        let mut by_addr = self.by_addr.lock();
+        if let Some(entry) = by_addr.get_mut(&addr) {
+            if permit {
+                entry.permits = entry.permits.saturating_sub(1);
+            } else {
+                entry.holds = entry.holds.saturating_sub(1);
+            }
+            if entry.permits == 0 && entry.holds == 0 {
+                by_addr.remove(&addr);
+            }
+        }
+    }
+}
+
+/// Keeps an address bound to the key an attempt or connection from it is
+/// authenticated against, while alive.
+struct KeyHold {
+    expected: Arc<ExpectedClients>,
+    addr: SocketAddr,
+}
+
+impl Drop for KeyHold {
+    fn drop(&mut self) {
+        self.expected.release(self.addr, false);
     }
 }
 
@@ -158,13 +217,7 @@ impl std::fmt::Debug for QuicPeerPermit {
 
 impl Drop for QuicPeerPermit {
     fn drop(&mut self) {
-        let mut by_addr = self.expected.by_addr.lock();
-        if let Some((_, permits)) = by_addr.get_mut(&self.addr) {
-            *permits = permits.saturating_sub(1);
-            if *permits == 0 {
-                by_addr.remove(&self.addr);
-            }
-        }
+        self.expected.release(self.addr, true);
     }
 }
 
@@ -174,10 +227,10 @@ pub(crate) enum QuicAllowError {
     /// The demux socket's allow-set is full.
     #[error("the QUIC allow-set is full")]
     AllowSetFull,
-    /// The address is already allowed for a peer with another key. The
-    /// earlier permit wins until it is dropped, so an address cannot be
-    /// moved to a new key while a connection or attempt for the old one
-    /// may still be using it.
+    /// The address is already bound to another key: a permit for it, or an
+    /// attempt or connection authenticated against it, is alive. The earlier
+    /// key wins until all of those are gone, so an address cannot be moved to
+    /// a new key while anything for the old one is using it.
     #[error("the address is already allowed for another key")]
     KeyConflict,
     #[error(transparent)]
@@ -362,10 +415,17 @@ impl QuicEndpoint {
         {
             let mut by_addr = self.expected_clients.by_addr.lock();
             match by_addr.get_mut(&addr) {
-                Some((held, permits)) if *held == key => *permits += 1,
+                Some(entry) if entry.key == key => entry.permits += 1,
                 Some(_) => return Err(QuicAllowError::KeyConflict),
                 None => {
-                    by_addr.insert(addr, (key, 1));
+                    by_addr.insert(
+                        addr,
+                        ExpectedEntry {
+                            key,
+                            permits: 1,
+                            holds: 0,
+                        },
+                    );
                 }
             }
         }
@@ -392,16 +452,19 @@ impl QuicEndpoint {
         addr: SocketAddr,
         expected: &TransportPublicKey,
     ) -> Result<QuicConnection, QuicConnectError> {
-        let tls = self.identity.client_tls(&PeerKey::of(expected)?)?;
+        let peer = PeerKey::of(expected)?;
+        let tls = self.identity.client_tls(&peer)?;
         let config = self.client_config(Arc::new(tls));
-        self.connect_with(addr, config).await
+        self.connect_with(addr, config, peer).await
     }
 
-    /// [`Self::connect`] with a given client configuration.
+    /// [`Self::connect`] with a given client configuration, which must pin
+    /// the server to `peer`.
     async fn connect_with(
         &self,
         addr: SocketAddr,
         config: quinn::ClientConfig,
+        peer: PeerKey,
     ) -> Result<QuicConnection, QuicConnectError> {
         let permit = self
             .sources
@@ -411,7 +474,7 @@ impl QuicEndpoint {
             .endpoint
             .connect_with(config, addr, config::SERVER_NAME)?;
         let connection = connecting.await?;
-        Ok(QuicConnection::new(connection, permit))
+        Ok(QuicConnection::new(connection, permit, None, peer))
     }
 
     /// The next incoming connection attempt from an allowed source, with its
@@ -435,7 +498,7 @@ impl QuicEndpoint {
                 incoming.ignore();
                 continue;
             };
-            let Some(expected) = self.expected_clients.get(permit.addr()) else {
+            let Some((expected, hold)) = self.expected_clients.hold(permit.addr()) else {
                 tracing::debug!(%remote, "Ignoring a QUIC connection attempt from a source with no expected key");
                 incoming.ignore();
                 continue;
@@ -454,6 +517,8 @@ impl QuicEndpoint {
                 incoming,
                 permit,
                 config: Arc::new(config),
+                peer: expected,
+                hold,
             });
         }
     }
@@ -467,6 +532,10 @@ pub(crate) struct QuicIncoming {
     /// The endpoint's server settings with TLS pinned to the key the
     /// source was allowed with.
     config: Arc<quinn::ServerConfig>,
+    /// That key, which the handshake must prove.
+    peer: PeerKey,
+    /// Keeps the address bound to `peer` while the attempt lives.
+    hold: KeyHold,
 }
 
 impl QuicIncoming {
@@ -474,7 +543,12 @@ impl QuicIncoming {
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) async fn establish(self) -> Result<QuicConnection, quinn::ConnectionError> {
         let connection = self.incoming.accept_with(self.config)?.await?;
-        Ok(QuicConnection::new(connection, self.permit))
+        Ok(QuicConnection::new(
+            connection,
+            self.permit,
+            Some(self.hold),
+            self.peer,
+        ))
     }
 }
 
@@ -483,6 +557,8 @@ impl QuicIncoming {
 /// timed out, failed, or dropped here (dropping closes it).
 pub(crate) struct QuicConnection {
     connection: quinn::Connection,
+    /// The key the peer proved in the handshake.
+    peer: PeerKey,
 }
 
 impl std::fmt::Debug for QuicConnection {
@@ -494,18 +570,33 @@ impl std::fmt::Debug for QuicConnection {
 }
 
 impl QuicConnection {
-    fn new(connection: quinn::Connection, permit: QuicSourcePermit) -> Self {
-        // The watcher holds the permit until quinn reports the connection
-        // closed, however it ends. Dropping this handle closes it explicitly
-        // (see Drop), because the watcher's clone keeps quinn from closing
-        // it implicitly.
+    fn new(
+        connection: quinn::Connection,
+        permit: QuicSourcePermit,
+        hold: Option<KeyHold>,
+        peer: PeerKey,
+    ) -> Self {
+        // The watcher holds the permit, and on the server side the hold
+        // binding the address to the client's key, until quinn reports the
+        // connection closed, however it ends. Dropping this handle closes it
+        // explicitly (see Drop), because the watcher's clone keeps quinn from
+        // closing it implicitly.
         let watched = connection.clone();
         GlobalExecutor::spawn(async move {
             let reason = watched.closed().await;
             tracing::debug!(%reason, remote = %watched.remote_address(), "QUIC connection ended");
+            drop(hold);
             drop(permit);
         });
-        Self { connection }
+        Self { connection, peer }
+    }
+
+    /// The key the peer proved in the handshake: as client, the server's
+    /// expected key; as server, the key the client's address was allowed
+    /// with. Attribute the connection to this key, not to its address.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn peer_key(&self) -> &PeerKey {
+        &self.peer
     }
 
     /// The quinn connection.
