@@ -295,14 +295,7 @@ impl QuicEndpoint {
         };
         let identity = Arc::new(QuicIdentity::new(keypair).map_err(|e| invalid(&e))?);
         let refusing = identity.refusing_server_tls().map_err(|e| invalid(&e))?;
-        let ingress = socket.enable_quic_ingress().ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                "the socket's QUIC ingress is already enabled",
-            )
-        })?;
         let sources: Arc<dyn QuicSources> = socket.clone();
-        let quic_socket = Arc::new(socket::QuicSocket::new(socket, ingress, local_addr));
         let transport = Arc::new(config::transport_config(settings, &time));
         let clock = config::system_clock(time.clone());
         let server = Arc::new(config::server_config(
@@ -310,17 +303,30 @@ impl QuicEndpoint {
             transport.clone(),
             clock,
         ));
-        let runtime = Arc::new(runtime::QuicRuntime::new(time));
-        // The server configuration is set so quinn hands every Initial from
-        // an allowed source to `accept` (without one it answers with a
-        // stateless reset); its TLS refuses every client, and `accept`
-        // replaces it per attempt.
-        let endpoint = quinn::Endpoint::new_with_abstract_socket(
-            endpoint_config,
-            Some((*server).clone()),
-            quic_socket,
-            runtime,
-        )?;
+        // If quinn refuses the socket after the ingress is enabled, the
+        // ingress is disabled again, so the node is left as with QUIC off.
+        let endpoint = socket
+            .with_quic_ingress(|ingress| {
+                let quic_socket =
+                    Arc::new(socket::QuicSocket::new(socket.clone(), ingress, local_addr));
+                let runtime = Arc::new(runtime::QuicRuntime::new(time));
+                // The server configuration is set so quinn hands every
+                // Initial from an allowed source to `accept` (without one it
+                // answers with a stateless reset); its TLS refuses every
+                // client, and `accept` replaces it per attempt.
+                quinn::Endpoint::new_with_abstract_socket(
+                    endpoint_config,
+                    Some((*server).clone()),
+                    quic_socket,
+                    runtime,
+                )
+            })
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "the socket's QUIC ingress is already enabled",
+                )
+            })??;
         tracing::info!(
             %local_addr,
             window_bytes = settings.window_bytes(),

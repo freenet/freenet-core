@@ -15,7 +15,7 @@ use std::io;
 use std::net::SocketAddr;
 #[cfg(test)]
 use std::sync::atomic::AtomicU64;
-use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll};
 
@@ -95,6 +95,9 @@ struct IngressShared {
     /// while its count is above zero, so this holds at most
     /// [`QUIC_INGRESS_QUEUE_DATAGRAMS`] entries.
     queued: DashMap<SocketAddr, usize>,
+    /// Set by [`DemuxSocket::disable_quic_ingress`]: nothing is allowed or
+    /// queued any more, and every QUIC-class datagram is `no_ingress`.
+    disabled: AtomicBool,
 }
 
 /// The QUIC ingress of one [`DemuxSocket`]: the queue's sending half and the
@@ -280,13 +283,49 @@ impl<S> DemuxSocket<S> {
         })
     }
 
+    /// [`Self::enable_quic_ingress`] and hand the receiver to `build`; if
+    /// `build` fails (the QUIC endpoint could not be built), disable the
+    /// ingress again, so the socket is left as with QUIC off instead of
+    /// holding an allow-set and a queue whose receiver is gone. `None` if an
+    /// ingress was already enabled.
+    pub(crate) fn with_quic_ingress<R, E>(
+        &self,
+        build: impl FnOnce(QuicIngressReceiver) -> Result<R, E>,
+    ) -> Option<Result<R, E>> {
+        let receiver = self.enable_quic_ingress()?;
+        let built = build(receiver);
+        if built.is_err() {
+            self.disable_quic_ingress();
+        }
+        Some(built)
+    }
+
+    /// Stop the QUIC ingress for good: refuse new permits, empty the
+    /// allow-set, and count every QUIC-class datagram as `no_ingress`.
+    /// Permits still held release nothing (their entries are gone).
+    fn disable_quic_ingress(&self) {
+        if let Some(ingress) = self.quic.get() {
+            let shared = &ingress.shared;
+            shared.disabled.store(true, Ordering::Release);
+            shared.allowed.clear();
+            shared.allowed_count.store(0, Ordering::Release);
+        }
+    }
+
+    /// The enabled ingress, unless it was disabled.
+    fn live_quic_ingress(&self) -> Option<&QuicIngress> {
+        self.quic
+            .get()
+            .filter(|ingress| !ingress.shared.disabled.load(Ordering::Acquire))
+    }
+
     /// Let QUIC-class datagrams from `addr` reach the ingress queue while
     /// the returned permit is alive. `None` if no ingress is enabled, or if
     /// the allow-set already holds [`QUIC_ALLOWED_SOURCES_MAX`] other
     /// addresses. Several permits for one address keep it allowed until the
     /// last is dropped.
     pub(crate) fn allow_quic_source(&self, addr: SocketAddr) -> Option<QuicSourcePermit> {
-        let ingress = self.quic.get()?;
+        let ingress = self.live_quic_ingress()?;
         let addr = normalize_mapped_addr(addr);
         let shared = &ingress.shared;
         match shared.allowed.entry(addr) {
@@ -313,7 +352,7 @@ impl<S> DemuxSocket<S> {
     /// under the entry's lock, so a permit dropped concurrently cannot be
     /// brought back. `None` if it is not allowed.
     pub(crate) fn allow_existing_quic_source(&self, addr: SocketAddr) -> Option<QuicSourcePermit> {
-        let ingress = self.quic.get()?;
+        let ingress = self.live_quic_ingress()?;
         let addr = normalize_mapped_addr(addr);
         let mut held = ingress.shared.allowed.get_mut(&addr)?;
         *held += 1;
@@ -340,7 +379,7 @@ impl<S> DemuxSocket<S> {
     /// count what happened to it. Never waits, and copies the bytes only
     /// when they are queued.
     fn divert_quic(&self, datagram: &[u8], from: SocketAddr) {
-        let outcome = match self.quic.get() {
+        let outcome = match self.live_quic_ingress() {
             None => QuicIngressOutcome::NoIngress,
             Some(ingress) if !ingress.shared.allowed.contains_key(&from) => {
                 QuicIngressOutcome::NotAllowed
@@ -1057,6 +1096,47 @@ mod tests {
             [0, 0, 0, 0, 2],
             "a closed queue is no ingress"
         );
+    }
+
+    /// When the QUIC endpoint cannot be built after the ingress was enabled
+    /// (`with_quic_ingress` with a failing build), the ingress is disabled:
+    /// the allow-set is emptied and refuses new entries, every QUIC-class
+    /// datagram counts as `no_ingress`, and the ingress cannot be enabled a
+    /// second time. A build that succeeds leaves it working.
+    #[tokio::test]
+    async fn a_failed_endpoint_build_disables_the_ingress() {
+        let from: SocketAddr = "10.254.2.7:4107".parse().unwrap();
+        let socket =
+            DemuxSocket::wrap(ScriptedSocket::new(vec![Step::Packet(from, quic(1))]), None);
+        let mut held = None;
+        let built: Result<(), &str> = socket
+            .with_quic_ingress(|receiver| {
+                held = Some(
+                    socket
+                        .allow_quic_source(from)
+                        .expect("allowed while building"),
+                );
+                drop(receiver);
+                Err("the endpoint failed")
+            })
+            .expect("first enable");
+        assert!(built.is_err());
+        assert!(!socket.is_quic_source_allowed(from), "allow-set emptied");
+        assert!(socket.allow_quic_source(from).is_none(), "and closed");
+        assert!(socket.allow_existing_quic_source(from).is_none());
+        drop(held);
+        let mut buf = [0u8; 2048];
+        socket.recv_classified(&mut buf).await.unwrap();
+        assert_eq!(outcomes(&socket), [0, 0, 0, 0, 1], "no ingress");
+        assert!(socket.with_quic_ingress(|_| Ok::<(), ()>(())).is_none());
+
+        let working = DemuxSocket::wrap(ScriptedSocket::new(Vec::new()), None);
+        let receiver = working
+            .with_quic_ingress(Ok::<_, ()>)
+            .expect("first enable")
+            .expect("built");
+        assert!(working.allow_quic_source(from).is_some());
+        drop(receiver);
     }
 
     /// `try_send_to` returns the inner socket's `WouldBlock` unchanged and

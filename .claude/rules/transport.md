@@ -131,19 +131,21 @@ cap counts UDP payload, not IP/UDP headers.
 EgressCap::poll_admit is the poll form for a sender that is polled (the QUIC
 endpoint's UdpPoller, #5940): Ready exactly when try_take would succeed at
 that instant (one shared predicate, `admits`), else Pending with a timer on
-the cap's TimeSource at the refill time, kept in the caller's
-AdmissionWaiter. While Pending the cap also holds the caller's waker (at most
-MAX_ADMISSION_WAKERS; past it an entry is dropped WITHOUT waking, its waiter
-keeps its timer). Bytes given back (a take that sent less, or a failed send)
+the cap's TimeSource, kept in the caller's AdmissionWaiter. The timer is
+STAGGERED: deficit plus one WAKE_DATAGRAM_BYTES of refill per waiter queued
+ahead, so N waiters with one deficit wake one per datagram of refill, oldest
+first, not all N at once. While Pending the cap also holds the caller's
+waker (at most MAX_ADMISSION_WAKERS; past it an entry is dropped WITHOUT
+waking, its waiter keeps its timer); a waiter keeps its queue place across
+polls, and dropping an AdmissionWaiter removes its entry, so a closed
+connection cannot absorb a wake. Bytes given back (a take that sent less, or a failed send)
 wake one held waker per WAKE_DATAGRAM_BYTES (1200, the QUIC datagram) the
 bucket then holds, and none if it holds less, so legacy give-backs cost N
 waiting QUIC connections nothing until a datagram fits; wakers are woken
-after the lock is released, oldest registration first (a FIFO; a waiter
-that registers again moves to the back, and overflow drops the oldest).
-Remaining herd, to settle before c3 opens connections: waiters whose TIMERS
-expire together all wake (about N wakeups per datagram's worth of refill
-with N waiting connections); only give-backs are limited to one per
-datagram. It takes nothing; the QUIC socket takes with
+after the lock is released, oldest registration first (a FIFO; overflow
+drops the oldest). A waiter ahead that leaves without taking delays the
+ones behind by up to one datagram's time, never wakes them early. It takes
+nothing; the QUIC socket takes with
 try_take and sends with DemuxSocket::try_send_to_paced, so its datagram is
 charged once, by the take. Every take is at most one datagram, within the
 burst (QUIC: one segment per transmit, debug-asserted), so the bound above
@@ -660,8 +662,11 @@ connection closed, whatever closed it, and dropping its connection handle
 closes it; an address on the set is bounded by its connection's life, which
 inherits the #5922 gap for a connection held open indefinitely. Each
 QUIC-class datagram is counted as `quic_ingress_forwarded`, `_not_allowed`,
-`_queue_full`, `_source_full` or `_no_ingress` (no ingress enabled or its
-receiver gone; every node with `transport-quic` off).
+`_queue_full`, `_source_full` or `_no_ingress` (no ingress enabled, its
+receiver gone, or disabled; every node with `transport-quic` off). The QUIC
+endpoint enables the ingress through `with_quic_ingress`, which disables it
+again (allow-set emptied and closed) if the endpoint cannot be built, so a
+failed `prefer` bind leaves the socket as with QUIC off.
 
 Socket-health signal: the listener reads through `Socket::recv_classified`,
 which `DemuxSocket` answers with `Datagram` for a legacy datagram and
