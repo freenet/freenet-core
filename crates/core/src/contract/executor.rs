@@ -2776,6 +2776,11 @@ mod tests {
                  INCOMING_BUFFER_TOTAL_BYTES",
             ),
             (
+                "XEDDSA_RANDOM_BYTES",
+                "the 64 random bytes one QUIC handshake signature draws, on the stack, \
+                 not memory the node holds",
+            ),
+            (
                 "MIN_FREE_BYTES",
                 "free-DISK threshold the state directory must have before the node stages \
                  a release (#5791), not memory",
