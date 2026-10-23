@@ -1172,9 +1172,16 @@ fn a_dropped_waiter_leaves_no_entry_behind() {
     assert_eq!(cap.admission_waker_count(), 2);
     drop(gone);
     assert_eq!(cap.admission_waker_count(), 1, "the dropped waiter's entry");
+    // The drop woke the live waiter once, to move up a place.
+    let moved_up = woken(&live_counter);
+    assert_eq!(moved_up, 1);
     drop(take);
     assert_eq!(woken(&gone_counter), 0);
-    assert_eq!(woken(&live_counter), 1, "the live waiter got the wake");
+    assert_eq!(
+        woken(&live_counter),
+        moved_up + 1,
+        "the live waiter got the give-back's wake"
+    );
 
     assert!(
         cap.poll_admit(PACKET * 2, &mut live, &mut Context::from_waker(&live_waker))
@@ -1182,4 +1189,49 @@ fn a_dropped_waiter_leaves_no_entry_behind() {
     );
     drop(cap);
     drop(live);
+}
+
+/// Dropping queued waiters wakes those behind them, so each moves its
+/// staggered timer to its new place instead of keeping one datagram of
+/// delay per waiter that left: with 5 waiters queued, dropping the first 3
+/// wakes the survivors, the first survivor re-polls to a timer at one
+/// datagram (where the first waiter's was), fires there and is admitted.
+#[test]
+fn dropping_queued_waiters_moves_the_followers_up() {
+    let (cap, time) = cap_at(RATE);
+    cap.charge_unpaced(BURST as usize);
+    let mut waiters: Vec<_> = (0..5)
+        .map(|_| {
+            let (waker, counter) = counting_waker();
+            (AdmissionWaiter::default(), waker, counter)
+        })
+        .collect();
+    for (waiter, waker, _) in waiters.iter_mut() {
+        let mut cx = Context::from_waker(waker);
+        assert!(cap.poll_admit(PACKET, waiter, &mut cx).is_pending());
+    }
+    let start = time.now_nanos();
+    let datagram = Duration::from_micros(1_200).as_nanos() as u64;
+    assert_eq!(waiters[3].0.wake_at_ns(), Some(start + 4 * datagram));
+    let mut survivors = waiters.split_off(3);
+    drop(waiters);
+    assert_eq!(cap.admission_waker_count(), 2);
+    for (i, (waiter, waker, counter)) in survivors.iter_mut().enumerate() {
+        assert!(woken(counter) > 0, "survivor {i} was woken to move up");
+        let mut cx = Context::from_waker(waker);
+        assert!(cap.poll_admit(PACKET, waiter, &mut cx).is_pending());
+        assert_eq!(
+            waiter.wake_at_ns(),
+            Some(start + (i as u64 + 1) * datagram),
+            "survivor {i} is now staggered by its new place"
+        );
+    }
+    let before = woken(&survivors[0].2);
+    time.advance(Duration::from_nanos(datagram));
+    assert_eq!(woken(&survivors[0].2), before + 1, "its timer fired");
+    let (waiter, waker, _) = &mut survivors[0];
+    assert!(
+        cap.poll_admit(PACKET, waiter, &mut Context::from_waker(waker))
+            .is_ready()
+    );
 }

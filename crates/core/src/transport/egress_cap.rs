@@ -309,6 +309,35 @@ impl AdmissionQueue {
         }
         self.waiting.store(wakers.len(), Ordering::Release);
     }
+
+    /// Remove a waiter that is gone without taking its slot (its connection
+    /// closed) and wake every waiter queued behind it, so each re-polls and
+    /// moves its staggered timer one datagram earlier, to its new place.
+    /// Without this, each departure ahead would leave every follower one
+    /// datagram late, adding up with the number gone. At most
+    /// [`MAX_ADMISSION_WAKERS`] wakes, only when a queued waiter is dropped.
+    /// The wakers are woken after the lock is released.
+    fn leave(&self, id: u64) {
+        if self.waiting.load(Ordering::Acquire) == 0 {
+            return;
+        }
+        let followers: Vec<std::task::Waker> = {
+            let mut wakers = self.wakers.lock();
+            let Some(at) = wakers.iter().position(|(held, _)| *held == id) else {
+                return;
+            };
+            wakers.remove(at);
+            self.waiting.store(wakers.len(), Ordering::Release);
+            wakers
+                .iter()
+                .skip(at)
+                .map(|(_, waker)| waker.clone())
+                .collect()
+        };
+        for waker in followers {
+            waker.wake();
+        }
+    }
 }
 
 /// The wakeup a sender polling [`EgressCap::poll_admit`] keeps between
@@ -339,7 +368,7 @@ impl Default for AdmissionWaiter {
 impl Drop for AdmissionWaiter {
     fn drop(&mut self) {
         if let Some(queue) = self.queue.take().and_then(|queue| queue.upgrade()) {
-            queue.forget(self.id);
+            queue.leave(self.id);
         }
     }
 }
@@ -570,10 +599,13 @@ impl EgressCap {
     /// of refill for every waiter registered ahead of it, so when N waiters
     /// share one deficit, each datagram's worth of refill wakes one of them,
     /// oldest first, instead of all N. A waiter keeps its place in the queue
-    /// across polls. When a waiter ahead leaves without taking (dropped, or
-    /// admitted by a later take), the ones behind wake up to one datagram
-    /// later than they could have; never earlier than the bucket can admit
-    /// them.
+    /// across polls. An admitted waiter takes the slot the stagger reserved
+    /// for it, so nobody behind it moves. A waiter dropped while queued
+    /// (its connection closed) wakes every waiter behind it, and each
+    /// re-polls and moves its timer to its new place. An entry evicted at
+    /// [`MAX_ADMISSION_WAKERS`] wakes nobody, so the waiters behind it keep
+    /// timers one datagram late per eviction. No waiter is woken before the
+    /// bucket can admit it.
     ///
     /// The timer is replaced only when the waiter now needs an earlier
     /// wakeup than the one armed; a later need (more debt arrived) keeps the

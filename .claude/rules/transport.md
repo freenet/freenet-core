@@ -143,8 +143,11 @@ wake one held waker per WAKE_DATAGRAM_BYTES (1200, the QUIC datagram) the
 bucket then holds, and none if it holds less, so legacy give-backs cost N
 waiting QUIC connections nothing until a datagram fits; wakers are woken
 after the lock is released, oldest registration first (a FIFO; overflow
-drops the oldest). A waiter ahead that leaves without taking delays the
-ones behind by up to one datagram's time, never wakes them early. It takes
+drops the oldest). An admitted waiter took the slot reserved for it, so
+nobody behind it moves; a waiter dropped while queued wakes every waiter
+behind it so each re-polls to its new place (AdmissionQueue::leave). An
+entry evicted at MAX_ADMISSION_WAKERS wakes nobody. No waiter wakes before
+the bucket can admit it. It takes
 nothing; the QUIC socket takes with
 try_take and sends with DemuxSocket::try_send_to_paced, so its datagram is
 charged once, by the take. Every take is at most one datagram, within the
@@ -739,7 +742,8 @@ pending attempts) and `QUIC_INGRESS_QUEUE_BYTES`. Pinned by
 The cap's `poll_admit` and `give_back` publish through Release/Acquire
 atomics, not SeqCst, so a give-back racing a waiter's registration can miss
 its wake (the store-buffer pattern); the waiter's own timer bounds the delay
-to its deficit. Known and accepted.
+to its deficit plus its stagger (one datagram's refill per waiter ahead of
+it). Known and accepted.
 
 The dual-stack test skips (printing SKIPPED) on a host without dual-stack
 IPv6; set REQUIRE_DUAL_STACK=1 to make that a failure.
