@@ -1480,17 +1480,22 @@ async fn received_within(time: &VirtualTime, socket: &SimulationSocket, wait: Du
     count
 }
 
-/// The endpoint really uses the keyed connection-ID generator: a
-/// short-header packet with a random 16-byte ID, from an allowed source,
-/// gets no reply. The control is the same endpoint built with quinn's
-/// random-ID generator (which validates every ID), which answers the same
-/// packet with a stateless reset, so the silence is the generator's doing
-/// and not a lost packet.
+/// The endpoint really uses the keyed connection-ID generator. A
+/// short-header packet, from an allowed source, for an unknown connection
+/// whose ID carries a valid MAC under the endpoint's key gets a stateless
+/// reset (quinn treats the ID as one of its own); the same packet with one
+/// MAC bit flipped gets no reply. Any other generator (quinn's default
+/// hashed one, or none installed) fails one of the two.
 #[test]
 fn a_short_header_packet_with_a_forged_id_gets_no_reply() {
+    use quinn::ConnectionIdGenerator;
     bounded(|| async move {
         let _seed = GlobalRng::seed_guard(SEED);
-        for (subnet, keyed) in [(14u8, true), (15, false)] {
+        let key = super::cid::MacConnectionIdGenerator::new_key();
+        let mut valid = super::cid::MacConnectionIdGenerator::new(key)
+            .generate_cid()
+            .to_vec();
+        for (subnet, forged) in [(14u8, false), (15, true)] {
             let network = format!("quic-forged-cid-{subnet}");
             let time = VirtualTime::new();
             register_network_time_source(&network, time.clone());
@@ -1504,41 +1509,32 @@ fn a_short_header_packet_with_a_forged_id_gets_no_reply() {
             ));
             let prober = SimulationSocket::bind(prober_addr).await.unwrap();
             let _pump = pump(socket.clone());
-            let mut endpoint_config = config::endpoint_config();
-            if !keyed {
-                endpoint_config.cid_generator(|| {
-                    Box::new(quinn_proto::RandomConnectionIdGenerator::new(
-                        super::cid::CID_LEN,
-                    ))
-                });
-            }
             let endpoint = QuicEndpoint::bind_with(
                 socket,
                 endpoint_addr,
                 time.clone(),
                 &settings(),
-                endpoint_config,
+                config::endpoint_config_with_cid_key(key),
             )
             .unwrap();
             let _permit = endpoint.allow_peer(prober_addr).unwrap();
-            // Short header (fixed bit set), a random destination ID of the
-            // endpoint's ID length, and enough payload for a reset.
+            if forged {
+                let last = valid.len() - 1;
+                valid[last] ^= 1;
+            }
+            // Short header (fixed bit set), the destination ID, and enough
+            // payload for a reset.
             let mut packet = vec![0x41];
-            let mut cid = [0u8; super::cid::CID_LEN];
-            GlobalRng::fill_bytes(&mut cid);
-            packet.extend_from_slice(&cid);
+            packet.extend_from_slice(&valid);
             packet.resize(100, 0x5A);
             Socket::send_to(&prober, &packet, endpoint_addr)
                 .await
                 .unwrap();
             let replies = received_within(&time, &prober, Duration::from_millis(200)).await;
-            if keyed {
+            if forged {
                 assert_eq!(replies, 0, "a forged ID gets no reply");
             } else {
-                assert!(
-                    replies > 0,
-                    "control: quinn's generator answers with a reset"
-                );
+                assert!(replies > 0, "a valid but unknown ID gets a stateless reset");
             }
             unregister_network_time_source(&network);
         }

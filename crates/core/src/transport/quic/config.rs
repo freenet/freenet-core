@@ -161,10 +161,15 @@ pub(crate) fn os_random(out: &mut [u8]) {
 /// Keys come from the OS ([`os_random`]); quinn's RNG seed comes from
 /// [`GlobalRng`], so a seeded run is repeatable.
 pub(crate) fn endpoint_config() -> EndpointConfig {
+    endpoint_config_with_cid_key(MacConnectionIdGenerator::new_key())
+}
+
+/// [`endpoint_config`] with a given connection-ID MAC key, so a test can
+/// make IDs the endpoint accepts.
+pub(crate) fn endpoint_config_with_cid_key(cid_key: [u8; 32]) -> EndpointConfig {
     let mut reset_key = [0u8; 64];
     os_random(&mut reset_key);
     let mut config = EndpointConfig::new(Arc::new(hmac::Key::new(hmac::HMAC_SHA256, &reset_key)));
-    let cid_key = MacConnectionIdGenerator::new_key();
     config.cid_generator(move || Box::new(MacConnectionIdGenerator::new(cid_key)));
     let mut seed = [0u8; 32];
     GlobalRng::fill_bytes(&mut seed);
