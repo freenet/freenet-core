@@ -1666,6 +1666,23 @@ pub(crate) fn declared_cache_ceiling_terms(
     // The transport's QUIC ingress queue (#5940): one per node, flat, since it
     // holds at most a fixed number of datagrams of at most one MTU each.
     let quic_ingress = crate::transport::demux::QUIC_INGRESS_QUEUE_BYTES;
+    // The QUIC endpoint's flow-control windows and pending-connection
+    // buffers (#5940): one endpoint per node, and none at the shipped default
+    // `transport-quic = off`, so this term is zero there.
+    //
+    // TODO(#5940 c3): this term is evaluated for the DEFAULT mode and the
+    // DEFAULT connection limit, so it cannot reflect `prefer` or a raised
+    // `max-number-of-connections`. Before c3 (the first step in which a QUIC
+    // connection can exist) merges, it must use the configured mode and
+    // max_connections. `quic_endpoint_term_is_default_only_until_c3` fails
+    // only if the default flips; it does not check that c3 did this. With
+    // QUIC on the term does not fit a 1 GiB host (see
+    // `quic_endpoint_budget_for`).
+    let quic_endpoint = crate::transport::quic::config::quic_endpoint_budget_for(
+        memory_limit,
+        crate::transport::quic::QuicMode::default(),
+        crate::config::DEFAULT_MAX_CONNECTIONS,
+    );
 
     vec![
         // The pool multiplication IS #5268's defect 3.
@@ -1699,6 +1716,9 @@ pub(crate) fn declared_cache_ceiling_terms(
         ("page_cache_size_for", page_cache),
         ("parked_budget_for", parked),
         ("QUIC_INGRESS_QUEUE_BYTES", quic_ingress),
+        // Zero at the shipped default; LEGITIMATELY_ZERO in the discovery
+        // guard says why.
+        ("quic_endpoint_budget_for", quic_endpoint),
     ]
 }
 
@@ -2158,6 +2178,7 @@ mod tests {
             "page_cache_size_for",
             "parked_budget_for",
             "QUIC_INGRESS_QUEUE_BYTES",
+            "quic_endpoint_budget_for",
         ] {
             assert!(
                 labels.contains(&required),
@@ -2275,6 +2296,14 @@ mod tests {
                 "QUIC_INGRESS_QUEUE_BYTES",
                 crate::transport::demux::QUIC_INGRESS_QUEUE_BYTES,
             ),
+            (
+                "quic_endpoint_budget_for",
+                crate::transport::quic::config::quic_endpoint_budget_for(
+                    ONE_GIB,
+                    crate::transport::quic::QuicMode::default(),
+                    crate::config::DEFAULT_MAX_CONNECTIONS,
+                ),
+            ),
         ] {
             assert_eq!(
                 value(&terms, label),
@@ -2283,6 +2312,29 @@ mod tests {
                  executor, so the aggregate must count it once"
             );
         }
+    }
+
+    /// Catches a change of the `transport-quic` default, nothing more. The
+    /// QUIC endpoint term is evaluated for the default mode (off), so it is
+    /// zero and the aggregate never sees QUIC memory. This test does NOT
+    /// gate c3: c3 (#5940, the first step that opens QUIC connections) must
+    /// itself make the term use the configured mode and
+    /// `max-number-of-connections`, and nothing here fails if it does not.
+    #[test]
+    fn quic_endpoint_term_is_default_only_until_c3() {
+        const ONE_GIB: usize = 1024 * 1024 * 1024;
+        assert_eq!(
+            crate::transport::quic::QuicMode::default(),
+            crate::transport::quic::QuicMode::Off,
+            "the QUIC default changed: make the quic_endpoint_budget_for term in \
+             declared_cache_ceiling_terms use the configured mode and max_connections \
+             (#5940 c3) before shipping this"
+        );
+        let term = declared_cache_ceiling_terms(ONE_GIB, 4)
+            .into_iter()
+            .find(|(label, _)| *label == "quic_endpoint_budget_for")
+            .map(|(_, bytes)| bytes);
+        assert_eq!(term, Some(0), "zero only because QUIC is off by default");
     }
 
     /// The margin the aggregate passes by, asserted rather than assumed.
@@ -2732,6 +2784,32 @@ mod tests {
                 "compile-time size bound on one hierarchical-router struct",
             ),
             (
+                "WAKE_DATAGRAM_BYTES",
+                "egress-cap wake threshold for a QUIC datagram (a rate quantity), not memory",
+            ),
+            (
+                "connection_window_bytes",
+                "one QUIC connection's window, the per-connection share inside \
+                 quic_endpoint_budget_for, which is the summed term",
+            ),
+            (
+                "MIN_WINDOW_BYTES",
+                "clamp inside connection_window_bytes (quic_endpoint_budget_for)",
+            ),
+            (
+                "MAX_WINDOW_BYTES",
+                "clamp inside connection_window_bytes (quic_endpoint_budget_for)",
+            ),
+            (
+                "INCOMING_BUFFER_TOTAL_BYTES",
+                "term inside quic_endpoint_budget_for",
+            ),
+            (
+                "INCOMING_BUFFER_BYTES",
+                "quinn's buffer for ONE pending QUIC connection attempt, inside \
+                 INCOMING_BUFFER_TOTAL_BYTES",
+            ),
+            (
                 "MIN_FREE_BYTES",
                 "free-DISK threshold the state directory must have before the node stages \
                  a release (#5791), not memory",
@@ -2763,12 +2841,21 @@ mod tests {
         // tests compare against memory, so require each term to be non-zero on a
         // representative host. The one legitimate zero is written down rather
         // than tolerated by a `>= 0`.
-        const LEGITIMATELY_ZERO: &[(&str, &str)] = &[(
-            "page_cache_size_for",
-            "zero when the `redb` feature is off; the label stays so the \
-             discovery check below does not demand a NOT_SUMMED entry that \
-             would be wrong in the default build",
-        )];
+        const LEGITIMATELY_ZERO: &[(&str, &str)] = &[
+            (
+                "page_cache_size_for",
+                "zero when the `redb` feature is off; the label stays so the \
+                 discovery check below does not demand a NOT_SUMMED entry that \
+                 would be wrong in the default build",
+            ),
+            (
+                "quic_endpoint_budget_for",
+                "zero at the shipped default `transport-quic = off`, where no QUIC \
+                 endpoint exists. With QUIC on the term is not zero and does not fit \
+                 a 1 GiB host's aggregate; that is to be settled before QUIC is \
+                 offered (#5940), see the function's doc",
+            ),
+        ];
         for (label, bytes) in &terms {
             if *bytes > 0 {
                 continue;

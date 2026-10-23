@@ -184,6 +184,7 @@ pub async fn base_node_test_config_with_rng<R: Rng>(
             ledbat_min_ssthresh: None,
             congestion_control: None,
             bbr_startup_rate: None,
+            transport_quic: None,
         },
         config_paths: freenet::config::ConfigPathsArgs {
             config_dir: Some(temp_dir.path().to_path_buf()),

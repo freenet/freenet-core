@@ -170,6 +170,10 @@ labelled_counters! {
         NotAllowed => "not_allowed",
         /// Dropped: the ingress queue was full.
         QueueFull => "queue_full",
+        /// Dropped: the datagrams already queued from this source address
+        /// filled its share of the queue (`demux::QUIC_INGRESS_PER_SOURCE_DATAGRAMS`),
+        /// so one source cannot take the whole queue from the others.
+        SourceFull => "source_full",
         /// Dropped: no QUIC ingress is enabled, or its receiver is gone.
         NoIngress => "no_ingress",
     }
@@ -505,6 +509,10 @@ struct NatDetailCounters {
     /// entries.
     #[cfg(test)]
     demux_watched: DashMap<SocketAddr, Vec<DemuxClass>>,
+    /// Test-only record of QUIC ingress outcomes, for the remotes a test
+    /// registered with `watch_quic_ingress`; same rules as `demux_watched`.
+    #[cfg(test)]
+    quic_ingress_watched: DashMap<SocketAddr, Vec<QuicIngressOutcome>>,
     /// Test-only log of dropped stray intros `(remote, kind)` (bounded).
     #[cfg(test)]
     stray_intros_by_remote:
@@ -882,6 +890,35 @@ impl TransportMetrics {
     #[cfg(test)]
     pub(crate) fn watch_demux(&self, remote: SocketAddr) {
         self.nat_detail.demux_watched.insert(remote, Vec::new());
+    }
+
+    /// Test-only: start recording what the demultiplexer's QUIC ingress did
+    /// with each QUIC-class datagram from `remote`. Same rules as
+    /// [`Self::watch_demux`].
+    #[cfg(test)]
+    pub(crate) fn watch_quic_ingress(&self, remote: SocketAddr) {
+        self.nat_detail
+            .quic_ingress_watched
+            .insert(remote, Vec::new());
+    }
+
+    /// Test-only: the QUIC ingress outcomes recorded, in order, for
+    /// datagrams from a `remote` registered with `watch_quic_ingress`.
+    #[cfg(test)]
+    pub(crate) fn quic_ingress_from(&self, remote: SocketAddr) -> Vec<QuicIngressOutcome> {
+        self.nat_detail
+            .quic_ingress_watched
+            .get(&remote)
+            .map(|outcomes| outcomes.clone())
+            .unwrap_or_default()
+    }
+
+    /// Test-only: add `outcome` to `remote`'s record if it is watched.
+    #[cfg(test)]
+    pub(crate) fn note_quic_ingress_from(&self, remote: SocketAddr, outcome: QuicIngressOutcome) {
+        if let Some(mut watched) = self.nat_detail.quic_ingress_watched.get_mut(&remote) {
+            watched.push(outcome);
+        }
     }
 
     /// Test-only: the demultiplexer classes recorded, in order, for datagrams
@@ -1598,6 +1635,7 @@ impl TransportMetrics {
             quic_ingress_forwarded: get64(&quic[QuicIngressOutcome::Forwarded as usize]),
             quic_ingress_not_allowed: get64(&quic[QuicIngressOutcome::NotAllowed as usize]),
             quic_ingress_queue_full: get64(&quic[QuicIngressOutcome::QueueFull as usize]),
+            quic_ingress_source_full: get64(&quic[QuicIngressOutcome::SourceFull as usize]),
             quic_ingress_no_ingress: get64(&quic[QuicIngressOutcome::NoIngress as usize]),
             egress_immediate: get64(&egress.packets[EgressDecision::Immediate as usize]),
             egress_waited: get64(&egress.packets[EgressDecision::Waited as usize]),
@@ -2034,6 +2072,7 @@ pub struct TransportSnapshot {
     pub quic_ingress_forwarded: u64,
     pub quic_ingress_not_allowed: u64,
     pub quic_ingress_queue_full: u64,
+    pub quic_ingress_source_full: u64,
     pub quic_ingress_no_ingress: u64,
     /// Datagrams sent during the period by how the node-wide egress cap
     /// paced them, by [`EgressDecision`], with their bytes, the bytes and
@@ -2140,6 +2179,7 @@ impl TransportSnapshot {
             quic_ingress_forwarded,
             quic_ingress_not_allowed,
             quic_ingress_queue_full,
+            quic_ingress_source_full,
             quic_ingress_no_ingress,
             egress_immediate,
             egress_waited,
@@ -2215,6 +2255,7 @@ impl TransportSnapshot {
         self.quic_ingress_forwarded = quic_ingress_forwarded;
         self.quic_ingress_not_allowed = quic_ingress_not_allowed;
         self.quic_ingress_queue_full = quic_ingress_queue_full;
+        self.quic_ingress_source_full = quic_ingress_source_full;
         self.quic_ingress_no_ingress = quic_ingress_no_ingress;
         self.egress_immediate = egress_immediate;
         self.egress_waited = egress_waited;
@@ -2358,6 +2399,7 @@ struct SnapshotExtras {
     pub quic_ingress_forwarded: u64,
     pub quic_ingress_not_allowed: u64,
     pub quic_ingress_queue_full: u64,
+    pub quic_ingress_source_full: u64,
     pub quic_ingress_no_ingress: u64,
     /// Datagrams sent during the period by how the node-wide egress cap
     /// paced them, by [`EgressDecision`], with their bytes, the bytes and
@@ -2433,6 +2475,7 @@ impl SnapshotExtras {
             || self.quic_ingress_forwarded != 0
             || self.quic_ingress_not_allowed != 0
             || self.quic_ingress_queue_full != 0
+            || self.quic_ingress_source_full != 0
             || self.quic_ingress_no_ingress != 0
             // The debt high-water mark alone is not activity: it is only set
             // by a charge, which also counts a packet.
@@ -3362,6 +3405,7 @@ mod tests {
             QuicIngressOutcome::Forwarded => snap.quic_ingress_forwarded,
             QuicIngressOutcome::NotAllowed => snap.quic_ingress_not_allowed,
             QuicIngressOutcome::QueueFull => snap.quic_ingress_queue_full,
+            QuicIngressOutcome::SourceFull => snap.quic_ingress_source_full,
             QuicIngressOutcome::NoIngress => snap.quic_ingress_no_ingress,
         }
     }
@@ -3901,6 +3945,7 @@ mod tests {
             "quic_ingress_forwarded",
             "quic_ingress_not_allowed",
             "quic_ingress_queue_full",
+            "quic_ingress_source_full",
             "quic_ingress_no_ingress",
             "egress_immediate",
             "egress_waited",

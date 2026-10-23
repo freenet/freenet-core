@@ -13,13 +13,13 @@
 
 use std::io;
 use std::net::SocketAddr;
-use std::sync::OnceLock;
 #[cfg(test)]
 use std::sync::atomic::AtomicU64;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll};
 
-use dashmap::DashSet;
+use dashmap::DashMap;
 use tokio::sync::mpsc;
 
 use super::crypto::{PACKET_TYPE_INTRO, PACKET_TYPE_SYMMETRIC};
@@ -48,6 +48,19 @@ const DROPS_BETWEEN_YIELDS: u32 = 64;
 /// How many datagrams the QUIC ingress queue holds before it drops.
 pub(crate) const QUIC_INGRESS_QUEUE_DATAGRAMS: usize = 1024;
 
+/// How many datagrams from one source address the QUIC ingress queue holds
+/// at once: a quarter of it, so one allowed source (or a sender spoofing an
+/// allowed address) that fills its share leaves the rest of the queue to the
+/// other connections. Datagrams over the share are dropped and counted as
+/// `quic_ingress_source_full`.
+pub(crate) const QUIC_INGRESS_PER_SOURCE_DATAGRAMS: usize = QUIC_INGRESS_QUEUE_DATAGRAMS / 4;
+
+/// How many distinct source addresses the QUIC ingress allow-set holds. One
+/// entry per peer with a QUIC connection (or one being set up), so this is
+/// far above any `max-number-of-connections` in use; past it,
+/// [`DemuxSocket::allow_quic_source`] refuses.
+pub(crate) const QUIC_ALLOWED_SOURCES_MAX: usize = 4096;
+
 /// The most memory the QUIC ingress queue can hold: every slot holding a
 /// datagram of the largest size the listener receives (its read buffer is
 /// `MAX_RECV_PACKET_SIZE`, so no read is longer), plus the slot itself.
@@ -68,11 +81,104 @@ pub(crate) struct QuicDatagram {
     pub from: SocketAddr,
 }
 
+/// The state of a QUIC ingress shared by the socket (the sending side), the
+/// receiving side and the allow-set permits.
+#[derive(Default)]
+struct IngressShared {
+    /// Allowed source addresses, each with the number of live
+    /// [`QuicSourcePermit`]s for it. At most [`QUIC_ALLOWED_SOURCES_MAX`].
+    allowed: DashMap<SocketAddr, usize>,
+    /// `allowed.len()`, kept separately so a new address reserves its place
+    /// atomically (see [`DemuxSocket::allow_quic_source`]).
+    allowed_count: AtomicUsize,
+    /// Datagrams queued and not yet received, by source. An entry exists only
+    /// while its count is above zero, so this holds at most
+    /// [`QUIC_INGRESS_QUEUE_DATAGRAMS`] entries.
+    queued: DashMap<SocketAddr, usize>,
+}
+
 /// The QUIC ingress of one [`DemuxSocket`]: the queue's sending half and the
-/// source addresses allowed to reach it.
+/// state it shares with the receiving half.
 struct QuicIngress {
     queue: mpsc::Sender<QuicDatagram>,
-    allowed: DashSet<SocketAddr>,
+    shared: Arc<IngressShared>,
+}
+
+/// The receiving half of a QUIC ingress queue (see
+/// [`DemuxSocket::enable_quic_ingress`]). Receiving a datagram frees its slot
+/// in its source's share of the queue.
+pub(crate) struct QuicIngressReceiver {
+    queue: mpsc::Receiver<QuicDatagram>,
+    shared: Arc<IngressShared>,
+}
+
+impl QuicIngressReceiver {
+    /// Poll for the next queued datagram. `Ready(None)` once the socket that
+    /// fills the queue is gone.
+    pub(crate) fn poll_recv(&mut self, cx: &mut Context<'_>) -> Poll<Option<QuicDatagram>> {
+        let polled = self.queue.poll_recv(cx);
+        if let Poll::Ready(Some(datagram)) = &polled {
+            self.release(datagram.from);
+        }
+        polled
+    }
+
+    fn release(&self, from: SocketAddr) {
+        self.shared.queued.remove_if_mut(&from, |_, queued| {
+            *queued = queued.saturating_sub(1);
+            *queued == 0
+        });
+    }
+
+    #[cfg(test)]
+    pub(crate) fn try_recv(&mut self) -> Result<QuicDatagram, mpsc::error::TryRecvError> {
+        let datagram = self.queue.try_recv()?;
+        self.release(datagram.from);
+        Ok(datagram)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.queue.len()
+    }
+}
+
+/// Keeps one source address on a QUIC ingress allow-set: the address is
+/// allowed while at least one permit for it is alive. Returned by
+/// [`DemuxSocket::allow_quic_source`]; the QUIC endpoint holds one for each
+/// connection and drops it when the connection ends.
+#[must_use = "the source is allowed only while the permit is alive"]
+pub(crate) struct QuicSourcePermit {
+    shared: Arc<IngressShared>,
+    addr: SocketAddr,
+}
+
+impl std::fmt::Debug for QuicSourcePermit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("QuicSourcePermit")
+            .field("addr", &self.addr)
+            .finish()
+    }
+}
+
+impl QuicSourcePermit {
+    /// The (normalized) address this permit allows.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn addr(&self) -> SocketAddr {
+        self.addr
+    }
+}
+
+impl Drop for QuicSourcePermit {
+    fn drop(&mut self) {
+        let removed = self.shared.allowed.remove_if_mut(&self.addr, |_, permits| {
+            *permits = permits.saturating_sub(1);
+            *permits == 0
+        });
+        if removed.is_some() {
+            self.shared.allowed_count.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
 }
 
 /// Classify a datagram by its first byte. An empty datagram is
@@ -159,65 +265,94 @@ impl<S> DemuxSocket<S> {
     /// Start passing allowed QUIC-class datagrams to a queue of
     /// [`QUIC_INGRESS_QUEUE_DATAGRAMS`], and return its receiving half.
     /// The allow-set starts empty. `None` if an ingress was already enabled.
-    // Called by the QUIC endpoint (#5940); only tests call it until then.
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) fn enable_quic_ingress(&self) -> Option<mpsc::Receiver<QuicDatagram>> {
+    pub(crate) fn enable_quic_ingress(&self) -> Option<QuicIngressReceiver> {
         let (queue, receiver) = mpsc::channel(QUIC_INGRESS_QUEUE_DATAGRAMS);
+        let shared = Arc::new(IngressShared::default());
         self.quic
             .set(QuicIngress {
                 queue,
-                allowed: DashSet::new(),
+                shared: shared.clone(),
             })
             .ok()?;
-        Some(receiver)
+        Some(QuicIngressReceiver {
+            queue: receiver,
+            shared,
+        })
     }
 
-    /// Let QUIC-class datagrams from `addr` reach the ingress queue. `false`
-    /// if no ingress is enabled. The caller owns the set's size: it adds an
-    /// address for each QUIC connection it expects and removes it after.
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) fn allow_quic_source(&self, addr: SocketAddr) -> bool {
-        let Some(ingress) = self.quic.get() else {
-            return false;
-        };
-        ingress.allowed.insert(normalize_mapped_addr(addr));
-        true
+    /// Let QUIC-class datagrams from `addr` reach the ingress queue while
+    /// the returned permit is alive. `None` if no ingress is enabled, or if
+    /// the allow-set already holds [`QUIC_ALLOWED_SOURCES_MAX`] other
+    /// addresses. Several permits for one address keep it allowed until the
+    /// last is dropped.
+    pub(crate) fn allow_quic_source(&self, addr: SocketAddr) -> Option<QuicSourcePermit> {
+        let ingress = self.quic.get()?;
+        let addr = normalize_mapped_addr(addr);
+        let shared = &ingress.shared;
+        match shared.allowed.entry(addr) {
+            dashmap::Entry::Occupied(mut held) => *held.get_mut() += 1,
+            dashmap::Entry::Vacant(free) => {
+                // Reserve a place before inserting, while the entry's shard
+                // is locked: concurrent callers cannot both take the last.
+                shared
+                    .allowed_count
+                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                        (count < QUIC_ALLOWED_SOURCES_MAX).then_some(count + 1)
+                    })
+                    .ok()?;
+                free.insert(1);
+            }
+        }
+        Some(QuicSourcePermit {
+            shared: shared.clone(),
+            addr,
+        })
     }
 
-    /// Stop QUIC-class datagrams from `addr` reaching the ingress queue.
-    /// `false` if the address was not allowed.
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) fn disallow_quic_source(&self, addr: SocketAddr) -> bool {
+    /// Another permit for `addr` if it is on the allow-set now, in one step
+    /// under the entry's lock, so a permit dropped concurrently cannot be
+    /// brought back. `None` if it is not allowed.
+    pub(crate) fn allow_existing_quic_source(&self, addr: SocketAddr) -> Option<QuicSourcePermit> {
+        let ingress = self.quic.get()?;
+        let addr = normalize_mapped_addr(addr);
+        let mut held = ingress.shared.allowed.get_mut(&addr)?;
+        *held += 1;
+        drop(held);
+        Some(QuicSourcePermit {
+            shared: ingress.shared.clone(),
+            addr,
+        })
+    }
+
+    /// Whether QUIC-class datagrams from `addr` currently reach the ingress.
+    #[cfg(test)]
+    pub(crate) fn is_quic_source_allowed(&self, addr: SocketAddr) -> bool {
         self.quic.get().is_some_and(|ingress| {
             ingress
+                .shared
                 .allowed
-                .remove(&normalize_mapped_addr(addr))
-                .is_some()
+                .contains_key(&normalize_mapped_addr(addr))
         })
     }
 
     /// Queue a QUIC-class datagram if an ingress is enabled, its source is
-    /// allowed and the queue has room; count what happened to it. Never
-    /// waits, and copies the bytes only when they are queued.
+    /// allowed and both the queue and the source's share of it have room;
+    /// count what happened to it. Never waits, and copies the bytes only
+    /// when they are queued.
     fn divert_quic(&self, datagram: &[u8], from: SocketAddr) {
         let outcome = match self.quic.get() {
             None => QuicIngressOutcome::NoIngress,
-            Some(ingress) if !ingress.allowed.contains(&from) => QuicIngressOutcome::NotAllowed,
-            Some(ingress) => match ingress.queue.try_reserve() {
-                Ok(permit) => {
-                    permit.send(QuicDatagram {
-                        bytes: datagram.to_vec(),
-                        from,
-                    });
-                    QuicIngressOutcome::Forwarded
-                }
-                Err(mpsc::error::TrySendError::Full(())) => QuicIngressOutcome::QueueFull,
-                Err(mpsc::error::TrySendError::Closed(())) => QuicIngressOutcome::NoIngress,
-            },
+            Some(ingress) if !ingress.shared.allowed.contains_key(&from) => {
+                QuicIngressOutcome::NotAllowed
+            }
+            Some(ingress) => ingress.queue_from(datagram, from),
         };
         TRANSPORT_METRICS.record_quic_ingress(outcome);
         #[cfg(test)]
-        self.quic_outcomes[outcome as usize].fetch_add(1, Ordering::Relaxed);
+        {
+            self.quic_outcomes[outcome as usize].fetch_add(1, Ordering::Relaxed);
+            TRANSPORT_METRICS.note_quic_ingress_from(from, outcome);
+        }
     }
 
     /// This socket's count of QUIC-class datagrams with `outcome`.
@@ -229,6 +364,61 @@ impl<S> DemuxSocket<S> {
     #[cfg(test)]
     pub(crate) fn inner_for_test(&self) -> &S {
         &self.inner
+    }
+}
+
+impl QuicIngress {
+    /// Queue a datagram from an allowed source, within the source's share.
+    /// The share is counted before the slot is taken and given back if the
+    /// queue refuses, so a datagram that is not queued never holds a share.
+    fn queue_from(&self, datagram: &[u8], from: SocketAddr) -> QuicIngressOutcome {
+        {
+            let mut queued = self.shared.queued.entry(from).or_insert(0);
+            if *queued >= QUIC_INGRESS_PER_SOURCE_DATAGRAMS {
+                return QuicIngressOutcome::SourceFull;
+            }
+            *queued += 1;
+        }
+        let refused = match self.queue.try_reserve() {
+            Ok(permit) => {
+                permit.send(QuicDatagram {
+                    bytes: datagram.to_vec(),
+                    from,
+                });
+                return QuicIngressOutcome::Forwarded;
+            }
+            Err(mpsc::error::TrySendError::Full(())) => QuicIngressOutcome::QueueFull,
+            Err(mpsc::error::TrySendError::Closed(())) => QuicIngressOutcome::NoIngress,
+        };
+        self.shared.queued.remove_if_mut(&from, |_, queued| {
+            *queued = queued.saturating_sub(1);
+            *queued == 0
+        });
+        refused
+    }
+}
+
+impl<S: Socket> DemuxSocket<S> {
+    /// Sends without waiting a datagram whose bytes a sender already took
+    /// from the egress cap (the QUIC endpoint), and returns what the
+    /// datagram did not use; on any error, `WouldBlock` included, all of the
+    /// take is returned. Charged once, by the take, never again here.
+    pub(crate) fn try_send_to_paced(
+        &self,
+        buf: &[u8],
+        target: SocketAddr,
+        take: EgressTake<'_>,
+    ) -> io::Result<usize> {
+        match self.inner.try_send_to(buf, target) {
+            Ok(sent) => {
+                take.sent(sent);
+                Ok(sent)
+            }
+            Err(e) => {
+                drop(take);
+                Err(e)
+            }
+        }
     }
 }
 
@@ -569,7 +759,7 @@ mod tests {
             None,
         );
         let mut queue = socket.enable_quic_ingress().expect("first enable");
-        assert!(socket.allow_quic_source(from));
+        let _permit = socket.allow_quic_source(from).expect("allowed");
 
         let mut buf = [0u8; 64];
         let mut reads = Vec::new();
@@ -595,40 +785,102 @@ mod tests {
             );
         }
         assert!(queue.try_recv().is_err(), "nothing else was queued");
-        assert_eq!(outcomes(&socket), [3, 0, 0, 0]);
+        assert_eq!(outcomes(&socket), [3, 0, 0, 0, 0]);
     }
 
     /// With the queue full and nobody reading it, QUIC-class datagrams are
     /// dropped and counted, and a legacy datagram behind them is still
-    /// returned at once. The test runs on a paused clock, so if the listener
-    /// waited for room in the queue the runtime would go idle, the clock
-    /// would jump to the 5 s timeout and the test would fail at once rather
-    /// than after 5 real seconds.
+    /// returned at once. Four sources fill the queue with their shares, so a
+    /// fifth one's datagrams find the queue itself full. The test runs on a
+    /// paused clock, so if the listener waited for room in the queue the
+    /// runtime would go idle, the clock would jump to the 5 s timeout and the
+    /// test would fail at once rather than after 5 real seconds.
     #[tokio::test(start_paused = true)]
     async fn quic_ingress_queue_full_drops_and_counts_without_stalling_legacy() {
-        let from: SocketAddr = "10.254.2.2:4102".parse().unwrap();
-        let overflow = 5;
-        let mut script: Vec<Step> = (0..QUIC_INGRESS_QUEUE_DATAGRAMS + overflow)
-            .map(|i| Step::Packet(from, quic(i as u8)))
+        let sources: Vec<SocketAddr> = (0..5u16)
+            .map(|i| SocketAddr::from(([10, 254, 2, 2], 4102 + i)))
             .collect();
-        script.push(Step::Packet(from, vec![PACKET_TYPE_INTRO, 7]));
+        let overflow = 5;
+        let shares = QUIC_INGRESS_QUEUE_DATAGRAMS / QUIC_INGRESS_PER_SOURCE_DATAGRAMS;
+        assert_eq!(shares, 4, "the test fills the queue with four shares");
+        let mut script: Vec<Step> = Vec::new();
+        for from in &sources[..shares] {
+            for i in 0..QUIC_INGRESS_PER_SOURCE_DATAGRAMS {
+                script.push(Step::Packet(*from, quic(i as u8)));
+            }
+        }
+        for i in 0..overflow {
+            script.push(Step::Packet(sources[shares], quic(i as u8)));
+        }
+        script.push(Step::Packet(sources[0], vec![PACKET_TYPE_INTRO, 7]));
         let socket = DemuxSocket::wrap(ScriptedSocket::new(script), None);
         let queue = socket.enable_quic_ingress().expect("first enable");
-        assert!(socket.allow_quic_source(from));
+        let _permits: Vec<_> = sources
+            .iter()
+            .map(|a| socket.allow_quic_source(*a).expect("allowed"))
+            .collect();
 
         let mut buf = [0u8; 64];
         let (len, got_from) = recv_within_timeout(&socket, &mut buf).await;
-        assert_eq!((&buf[..len], got_from), (&[PACKET_TYPE_INTRO, 7][..], from));
+        assert_eq!(
+            (&buf[..len], got_from),
+            (&[PACKET_TYPE_INTRO, 7][..], sources[0])
+        );
         assert_eq!(
             outcomes(&socket),
-            [QUIC_INGRESS_QUEUE_DATAGRAMS as u64, 0, overflow as u64, 0]
+            [
+                QUIC_INGRESS_QUEUE_DATAGRAMS as u64,
+                0,
+                overflow as u64,
+                0,
+                0
+            ]
         );
         assert_eq!(queue.len(), QUIC_INGRESS_QUEUE_DATAGRAMS);
     }
 
+    /// One source cannot take more than its share of the queue: past
+    /// `QUIC_INGRESS_PER_SOURCE_DATAGRAMS` queued and unread datagrams its
+    /// next ones are dropped as `source_full` while another source still
+    /// gets in, and reading one of its datagrams frees one slot of its share.
+    #[tokio::test]
+    async fn quic_ingress_limits_each_source_to_its_share() {
+        let flooder: SocketAddr = "10.254.2.8:4108".parse().unwrap();
+        let other: SocketAddr = "10.254.2.9:4109".parse().unwrap();
+        let mut script: Vec<Step> = (0..QUIC_INGRESS_PER_SOURCE_DATAGRAMS + 3)
+            .map(|i| Step::Packet(flooder, quic(i as u8)))
+            .collect();
+        script.push(Step::Packet(other, quic(0xEE)));
+        script.push(Step::Packet(flooder, quic(0xF0)));
+        script.push(Step::Packet(flooder, quic(0xF1)));
+        let socket = DemuxSocket::wrap(ScriptedSocket::new(script), None);
+        let mut queue = socket.enable_quic_ingress().expect("first enable");
+        let _a = socket.allow_quic_source(flooder).expect("allowed");
+        let _b = socket.allow_quic_source(other).expect("allowed");
+        let mut buf = [0u8; 64];
+        for _ in 0..QUIC_INGRESS_PER_SOURCE_DATAGRAMS + 4 {
+            socket.recv_classified(&mut buf).await.unwrap();
+        }
+        assert_eq!(
+            outcomes(&socket),
+            [QUIC_INGRESS_PER_SOURCE_DATAGRAMS as u64 + 1, 0, 0, 3, 0],
+            "the flooder's share filled; the other source still got in"
+        );
+        // Reading one of the flooder's datagrams frees one slot of its share.
+        assert_eq!(queue.try_recv().unwrap().from, flooder);
+        socket.recv_classified(&mut buf).await.unwrap();
+        socket.recv_classified(&mut buf).await.unwrap();
+        assert_eq!(
+            outcomes(&socket),
+            [QUIC_INGRESS_PER_SOURCE_DATAGRAMS as u64 + 2, 0, 0, 4, 0],
+            "one freed slot admits exactly one more"
+        );
+    }
+
     /// A QUIC-class datagram from a source not on the allow-set is dropped
-    /// and counted, including after its address was removed again. The
-    /// allow-set compares normalized addresses, as the UDP sockets report.
+    /// and counted, including after its last permit was dropped. The
+    /// allow-set compares normalized addresses, as the UDP sockets report,
+    /// and an address stays allowed until its last permit is gone.
     #[tokio::test]
     async fn quic_ingress_drops_and_counts_sources_not_allowed() {
         let allowed: SocketAddr = "10.254.2.3:4103".parse().unwrap();
@@ -638,12 +890,21 @@ mod tests {
                 Step::Packet(stranger, quic(1)),
                 Step::Packet(allowed, quic(2)),
                 Step::Packet(allowed, quic(3)),
+                Step::Packet(allowed, quic(4)),
             ]),
             None,
         );
         let mut queue = socket.enable_quic_ingress().expect("first enable");
-        // Allowed in its IPv4-mapped IPv6 form.
-        assert!(socket.allow_quic_source("[::ffff:10.254.2.3]:4103".parse().unwrap()));
+        // Allowed in its IPv4-mapped IPv6 form, twice.
+        let first = socket
+            .allow_quic_source("[::ffff:10.254.2.3]:4103".parse().unwrap())
+            .expect("allowed");
+        assert_eq!(
+            first.addr(),
+            allowed,
+            "the permit holds the normalized form"
+        );
+        let second = socket.allow_quic_source(allowed).expect("allowed");
         let mut buf = [0u8; 64];
 
         assert_eq!(
@@ -654,16 +915,112 @@ mod tests {
             queue.try_recv().is_err(),
             "a stranger's datagram is not queued"
         );
-        assert_eq!(outcomes(&socket), [0, 1, 0, 0]);
+        assert_eq!(outcomes(&socket), [0, 1, 0, 0, 0]);
 
         socket.recv_classified(&mut buf).await.unwrap();
         assert_eq!(queue.try_recv().unwrap().bytes, quic(2));
 
-        assert!(socket.disallow_quic_source(allowed));
-        assert!(!socket.disallow_quic_source(allowed), "already removed");
+        drop(first);
+        assert!(socket.is_quic_source_allowed(allowed), "one permit is left");
+        socket.recv_classified(&mut buf).await.unwrap();
+        assert_eq!(queue.try_recv().unwrap().bytes, quic(3));
+
+        drop(second);
+        assert!(
+            !socket.is_quic_source_allowed(allowed),
+            "the last permit is gone"
+        );
         socket.recv_classified(&mut buf).await.unwrap();
         assert!(queue.try_recv().is_err(), "a removed source is not queued");
-        assert_eq!(outcomes(&socket), [1, 2, 0, 0]);
+        assert_eq!(outcomes(&socket), [2, 2, 0, 0, 0]);
+    }
+
+    /// The allow-set holds at most `QUIC_ALLOWED_SOURCES_MAX` addresses: past
+    /// it a new address is refused while one already allowed can take another
+    /// permit, and dropping permits makes room again.
+    #[test]
+    fn quic_allow_set_is_bounded() {
+        let socket = DemuxSocket::wrap(ScriptedSocket::new(Vec::new()), None);
+        let _queue = socket.enable_quic_ingress().expect("first enable");
+        let addr = |i: usize| SocketAddr::from(([10, 253, (i >> 8) as u8, i as u8], 5000));
+        let mut permits: Vec<_> = (0..QUIC_ALLOWED_SOURCES_MAX)
+            .map(|i| socket.allow_quic_source(addr(i)).expect("room"))
+            .collect();
+        assert!(
+            socket
+                .allow_quic_source(addr(QUIC_ALLOWED_SOURCES_MAX))
+                .is_none(),
+            "a new address past the bound is refused"
+        );
+        let again = socket.allow_quic_source(addr(0));
+        assert!(
+            again.is_some(),
+            "an allowed address can take another permit"
+        );
+        drop(again);
+        permits.pop();
+        assert!(
+            socket
+                .allow_quic_source(addr(QUIC_ALLOWED_SOURCES_MAX))
+                .is_some(),
+            "a dropped permit makes room"
+        );
+    }
+
+    /// Callers racing for the last places of the allow-set never take more
+    /// than `QUIC_ALLOWED_SOURCES_MAX` between them: a new address reserves
+    /// its place atomically. And a permit for an address already allowed is
+    /// granted only while it is allowed.
+    #[test]
+    fn quic_allow_set_bound_holds_under_concurrent_callers() {
+        let socket = Arc::new(DemuxSocket::wrap(ScriptedSocket::new(Vec::new()), None));
+        let _queue = socket.enable_quic_ingress().expect("first enable");
+        const THREADS: usize = 8;
+        let per_thread = QUIC_ALLOWED_SOURCES_MAX / THREADS + 64;
+        let barrier = Arc::new(std::sync::Barrier::new(THREADS));
+        let granted: Vec<Vec<QuicSourcePermit>> = (0..THREADS)
+            .map(|t| {
+                let socket = socket.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    (0..per_thread)
+                        .filter_map(|i| {
+                            let n = t * per_thread + i;
+                            socket.allow_quic_source(SocketAddr::from((
+                                [10, 252, (n >> 8) as u8, n as u8],
+                                5000,
+                            )))
+                        })
+                        .collect()
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|h| h.join().unwrap())
+            .collect();
+        let total: usize = granted.iter().map(Vec::len).sum();
+        assert_eq!(
+            total, QUIC_ALLOWED_SOURCES_MAX,
+            "exactly the bound, never more"
+        );
+
+        let addr: SocketAddr = "10.252.255.254:6000".parse().unwrap();
+        assert!(
+            socket.allow_existing_quic_source(addr).is_none(),
+            "not allowed, so no permit"
+        );
+        drop(granted);
+        let first = socket.allow_quic_source(addr).expect("room again");
+        let second = socket
+            .allow_existing_quic_source(addr)
+            .expect("allowed now");
+        drop(first);
+        drop(second);
+        assert!(
+            socket.allow_existing_quic_source(addr).is_none(),
+            "a released address is not brought back"
+        );
     }
 
     /// Without an ingress (every node until a QUIC endpoint runs) every
@@ -681,20 +1038,23 @@ mod tests {
             ]),
             None,
         );
-        assert!(!socket.allow_quic_source(from), "no ingress, no allow-set");
+        assert!(
+            socket.allow_quic_source(from).is_none(),
+            "no ingress, no allow-set"
+        );
         let mut buf = [0u8; 64];
         socket.recv_classified(&mut buf).await.unwrap();
         socket.recv_classified(&mut buf).await.unwrap();
-        assert_eq!(outcomes(&socket), [0, 0, 0, 1]);
+        assert_eq!(outcomes(&socket), [0, 0, 0, 0, 1]);
 
         let queue = socket.enable_quic_ingress().expect("first enable");
         assert!(socket.enable_quic_ingress().is_none(), "enabled only once");
-        assert!(socket.allow_quic_source(from));
+        let _permit = socket.allow_quic_source(from).expect("allowed");
         drop(queue);
         socket.recv_classified(&mut buf).await.unwrap();
         assert_eq!(
             outcomes(&socket),
-            [0, 0, 0, 2],
+            [0, 0, 0, 0, 2],
             "a closed queue is no ingress"
         );
     }

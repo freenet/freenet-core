@@ -176,6 +176,9 @@ pub async fn create_connection_handler<S: Socket>(
             ledbat_min_ssthresh,
             congestion_config,
             ack_version_floor_override,
+            // `create_connection_handler` is the test and tool entry point;
+            // the node opens the transport through `open_udp_transport`.
+            quic: None,
         },
     )
     .await
@@ -195,6 +198,9 @@ pub(crate) struct UdpTransportConfig {
     pub(crate) congestion_config: Option<CongestionControlConfig>,
     /// The #5161 version-carrying-ack floor override; `None` in production.
     pub(crate) ack_version_floor_override: Option<(u8, u8, u16)>,
+    /// QUIC endpoint settings when `transport-quic` is on, `None` (no
+    /// endpoint, no QUIC ingress) when it is off. See `transport::quic`.
+    pub(crate) quic: Option<super::quic::QuicSettings>,
 }
 
 type UdpListenerParts<S> = (
@@ -237,9 +243,24 @@ async fn bind_udp_listener<S: Socket>(
     let egress_cap = config.global_bandwidth.as_ref().and_then(|manager| {
         super::egress_cap::EgressCap::from_total_limit(manager.total_limit(), RealTime::new())
     });
-    let socket = bind_socket_with_retry::<DemuxSocket<S>>(bind_addr, SOCKET_BIND_MAX_RETRIES)
-        .await?
-        .with_egress_cap(egress_cap);
+    let socket = Arc::new(
+        bind_socket_with_retry::<DemuxSocket<S>>(bind_addr, SOCKET_BIND_MAX_RETRIES)
+            .await?
+            .with_egress_cap(egress_cap),
+    );
+    // With `transport-quic` off nothing is built and no QUIC ingress is
+    // enabled, so QUIC-class datagrams stay `quic_ingress_no_ingress`. With
+    // it on the endpoint runs on the egress cap's clock (`RealTime`, see
+    // above), has no server configuration and an empty allow-set: nothing
+    // reaches it until an upgrade path allows a peer.
+    let quic_endpoint = config.quic.as_ref().and_then(|settings| {
+        super::quic::QuicEndpoint::bind_or_warn(
+            socket.clone(),
+            bind_addr,
+            RealTime::new(),
+            settings,
+        )
+    });
 
     tracing::info!(
         target: "freenet_core::transport::send_debug",
@@ -248,11 +269,12 @@ async fn bind_udp_listener<S: Socket>(
         "UDP socket bound successfully"
     );
     let (och, new_connection_notifier, listen_handle) = OutboundConnectionHandler::config_listener(
-        Arc::new(socket),
+        socket,
         keypair,
         is_gateway,
         (listen_host, listen_port).into(),
         config,
+        quic_endpoint,
     )?;
     Ok((
         och,
@@ -382,9 +404,16 @@ impl<S: Socket> OutboundConnectionHandler<S> {
         is_gateway: bool,
         socket_addr: SocketAddr,
         config: UdpTransportConfig,
+        quic_endpoint: Option<super::quic::QuicEndpoint>,
     ) -> Result<ListenerSetup<S>, TransportError> {
-        let (transport, connection_handler, new_connection_notifier) =
-            Self::new_listener(socket, keypair, is_gateway, socket_addr, config);
+        let (transport, connection_handler, new_connection_notifier) = Self::new_listener(
+            socket,
+            keypair,
+            is_gateway,
+            socket_addr,
+            config,
+            quic_endpoint,
+        );
         // Packets are now sent directly to socket from each connection,
         // bypassing the centralized rate limiter that was causing serialization bottlenecks.
         // Per-connection rate limiting is handled by TokenBucket and LEDBAT in RemoteConnection.
@@ -409,6 +438,7 @@ impl<S: Socket> OutboundConnectionHandler<S> {
         is_gateway: bool,
         socket_addr: SocketAddr,
         config: UdpTransportConfig,
+        quic_endpoint: Option<super::quic::QuicEndpoint>,
     ) -> (
         UdpPacketsListener<S>,
         OutboundConnectionHandler<S>,
@@ -420,6 +450,8 @@ impl<S: Socket> OutboundConnectionHandler<S> {
             ledbat_min_ssthresh,
             congestion_config,
             ack_version_floor_override,
+            // Used by `bind_udp_listener`, which built `quic_endpoint` from it.
+            quic: _,
         } = config;
         let (conn_handler_sender, conn_handler_receiver) = mpsc::channel(100);
         let (new_connection_sender, new_connection_notifier) = mpsc::channel(10);
@@ -454,6 +486,7 @@ impl<S: Socket> OutboundConnectionHandler<S> {
             time_source,
             congestion_config: Some(congestion_config.unwrap_or_default()),
             ack_version_floor_override,
+            _quic_endpoint: quic_endpoint,
         };
         let connection_handler = OutboundConnectionHandler {
             send_queue: conn_handler_sender,
@@ -504,6 +537,7 @@ impl<S: Socket> OutboundConnectionHandler<S> {
                 ack_version_floor_override,
                 ..UdpTransportConfig::default()
             },
+            None,
         )?;
         Ok((handler, receiver))
     }
@@ -698,6 +732,7 @@ impl<S: Socket> OutboundConnectionHandler<S, crate::simulation::VirtualTime> {
             // This listener's `time_source` is already VirtualTime, so the admission
             // clock needs no override.
             gw_rate_limiter: GatewayConnectionRateLimiter::new(time_source.clone(), None),
+            _quic_endpoint: None,
             time_source,
             congestion_config,
             // Benchmarks measure throughput, not handshake encoding; the real
@@ -876,6 +911,11 @@ struct UdpPacketsListener<S = UdpSocket, T: TimeSource = RealTime> {
     /// itself, where a red sim could not be attributed between the feature and
     /// the version bump.
     ack_version_floor_override: Option<(u8, u8, u16)>,
+    /// The QUIC endpoint on this listener's socket, when `transport-quic`
+    /// is on. Held here so it lives as long as the listener reading the
+    /// socket that feeds it. Nothing uses it yet (#5940): it accepts no
+    /// connections and its allow-set is empty.
+    _quic_endpoint: Option<super::quic::QuicEndpoint>,
 }
 
 type OngoingConnectionResult<S, T> = Option<
@@ -6174,6 +6214,7 @@ pub mod mock_transport {
                 false,
                 addr,
                 UdpTransportConfig::default(),
+                None,
             )
             .expect("listener setup");
         (public, handler, listen_handle, addr)
@@ -6570,6 +6611,7 @@ pub mod mock_transport {
                 is_gateway,
                 addr,
                 UdpTransportConfig::default(),
+                None,
             )
             .expect("listener setup");
         (public, handler, addr, failures)

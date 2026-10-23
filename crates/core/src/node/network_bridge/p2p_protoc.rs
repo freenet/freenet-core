@@ -716,6 +716,9 @@ pub(in crate::node) struct P2pConnManager {
     ledbat_min_ssthresh: Option<usize>,
     /// Congestion control configuration.
     congestion_config: CongestionControlConfig,
+    /// QUIC endpoint settings when `transport-quic` is on (#5940), `None`
+    /// when it is off. Only used to open the transport.
+    quic: Option<crate::transport::quic::QuicSettings>,
     /// Test-only override for the #5161 version-carrying-ack floor, threaded
     /// into the transport handler. `None` in production.
     /// See `NodeConfig::ack_version_floor_override`.
@@ -1310,6 +1313,7 @@ impl P2pConnManager {
                 }),
             ledbat_min_ssthresh: config.config.network_api.ledbat_min_ssthresh,
             congestion_config: config.config.network_api.build_congestion_config(),
+            quic: config.config.network_api.quic_settings(),
             blocked_addresses: config.blocked_addresses.clone(),
             broadcast_retries: HashMap::new(),
             broadcast_no_target_streak: HashMap::new(),
@@ -1369,6 +1373,7 @@ impl P2pConnManager {
                 ledbat_min_ssthresh: self.ledbat_min_ssthresh,
                 congestion_config: Some(self.congestion_config.clone()),
                 ack_version_floor_override: self.ack_version_floor_override,
+                quic: self.quic,
             },
         )
         .await?;
@@ -1414,6 +1419,7 @@ impl P2pConnManager {
             ledbat_min_ssthresh,
             congestion_config,
             ack_version_floor_override,
+            quic,
             blocked_addresses,
             broadcast_retries,
             broadcast_no_target_streak,
@@ -1508,6 +1514,8 @@ impl P2pConnManager {
             // Already used by open_udp_transport in run_event_listener_with_socket;
             // kept for struct completeness, same as the two fields around it.
             ack_version_floor_override,
+            // Used by open_udp_transport like the fields above.
+            quic,
             blocked_addresses,
             broadcast_retries,
             broadcast_no_target_streak,

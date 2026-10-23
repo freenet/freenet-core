@@ -134,6 +134,21 @@ pub(crate) const PACED_TAKE_BYTES: usize = MAX_PACKET_SIZE;
 
 const NANOS_PER_SEC: u128 = 1_000_000_000;
 
+/// The most [`EgressCap::poll_admit`] wakers the cap holds. A waiter's entry
+/// is removed when it is woken or next admitted; a waiter dropped while
+/// `Pending` leaves its entry behind. At this many entries the oldest is
+/// dropped, without waking it, before a new one is added, so abandoned entries cannot
+/// accumulate; a live waiter whose entry was dropped still has its timer. The
+/// QUIC endpoint has one waiter per connection that is short of bytes, far
+/// fewer than this.
+const MAX_ADMISSION_WAKERS: usize = 1024;
+
+/// The datagram size a `poll_admit` waiter waits for: the QUIC endpoint's
+/// (`quic::config::MAX_UDP_PAYLOAD`, the same 1200 bytes as the UDP
+/// transport's packets). A give-back wakes one waiter per this many bytes the
+/// bucket then holds.
+pub(crate) const WAKE_DATAGRAM_BYTES: usize = MAX_PACKET_SIZE;
+
 /// The cap's own counters, so tests can assert on one cap without reading
 /// process-global state. Test-only: production records only the
 /// `TRANSPORT_METRICS` period counters (`egress_*`).
@@ -218,10 +233,16 @@ pub struct EgressCap {
     clock: Box<dyn Fn() -> u64 + Send + Sync>,
     /// `TimeSource::sleep_until` of the same time source as `clock`, for
     /// [`Self::poll_admit`]'s wakeups.
-    #[cfg_attr(not(test), allow(dead_code))]
     sleep_until: Box<dyn Fn(u64) -> SleepFuture + Send + Sync>,
     /// Time (ns, on `clock`) at which the bucket level is zero.
     empty_at_ns: AtomicI64,
+    /// Wakers of [`Self::poll_admit`] callers that are `Pending`, by
+    /// [`AdmissionWaiter`] id, woken when bytes are given back. At most
+    /// [`MAX_ADMISSION_WAKERS`]; see [`Self::register_waker`].
+    admission_wakers: parking_lot::Mutex<std::collections::VecDeque<(u64, std::task::Waker)>>,
+    /// `admission_wakers.len()`, so [`Self::give_back`] skips the lock when
+    /// nobody waits (every node without a QUIC endpoint).
+    admission_waiting: std::sync::atomic::AtomicUsize,
     /// When the long-wait warning was last logged (ns, on `clock`).
     last_long_wait_warn_ns: AtomicI64,
     /// Long gaps recorded since the long-wait warning was last logged.
@@ -246,13 +267,23 @@ impl fmt::Debug for EgressCap {
 type SleepFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
 
 /// The wakeup a sender polling [`EgressCap::poll_admit`] keeps between
-/// polls: one timer on the cap's time source and the time it fires at.
-/// Owned by the sender, so the cap holds nothing per waiter.
-#[derive(Default)]
-// Used by the QUIC endpoint (#5940); only tests use it until then.
-#[cfg_attr(not(test), allow(dead_code))]
+/// polls: one timer on the cap's time source and the time it fires at, and
+/// the id under which the cap holds its waker while it waits (see
+/// [`EgressCap::poll_admit`]: bytes given back wake it before the timer).
+// Used by the QUIC endpoint (#5940).
 pub(crate) struct AdmissionWaiter {
+    id: u64,
     timer: Option<(u64, SleepFuture)>,
+}
+
+impl Default for AdmissionWaiter {
+    fn default() -> Self {
+        static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        Self {
+            id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
+            timer: None,
+        }
+    }
 }
 
 impl AdmissionWaiter {
@@ -305,6 +336,8 @@ impl EgressCap {
             clock,
             sleep_until,
             empty_at_ns: AtomicI64::new(now.saturating_sub(burst_ns)),
+            admission_wakers: parking_lot::Mutex::new(std::collections::VecDeque::new()),
+            admission_waiting: std::sync::atomic::AtomicUsize::new(0),
             last_long_wait_warn_ns: AtomicI64::new(i64::MIN),
             last_abandon_warn_ns: AtomicI64::new(i64::MIN),
             long_waits_since_warn: WarnWindow::default(),
@@ -467,23 +500,35 @@ impl EgressCap {
     /// sender may take the bytes first, in which case the next poll is
     /// `Pending` again.
     ///
+    /// While `Pending`, the cap also holds `cx`'s waker. When bytes given back
+    /// to the bucket (a paced sender that used less than it took, or whose
+    /// send failed) leave it holding at least one [`WAKE_DATAGRAM_BYTES`],
+    /// one held waker is woken per such datagram's worth, so a waiter is not
+    /// left asleep until its original deficit after capacity returned early,
+    /// and a give-back too small for anyone wakes nobody. A waiter not woken
+    /// keeps its timer.
+    ///
     /// The timer is replaced only when the bucket now needs an earlier
     /// wakeup than the one armed; a later need (more debt arrived) keeps the
     /// armed timer, which wakes early and re-checks. So repeated polls do not
     /// register a new timer each.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn poll_admit(
         &self,
         bytes: usize,
         waiter: &mut AdmissionWaiter,
         cx: &mut Context<'_>,
     ) -> Poll<()> {
+        debug_assert!(
+            bytes as u64 <= self.burst_bytes(),
+            "an admission of {bytes} bytes is larger than the burst and could never be Ready"
+        );
         let cost = self.cost_ns(bytes as u64);
         loop {
             let now = self.now();
             let deficit = match self.admits(self.empty_at_ns.load(Ordering::Acquire), now, cost) {
                 Ok(_) => {
                     waiter.timer = None;
+                    self.forget_waker(waiter.id);
                     return Poll::Ready(());
                 }
                 Err(deficit) => deficit,
@@ -496,11 +541,88 @@ impl EgressCap {
                 .timer
                 .get_or_insert_with(|| (wake_at, (self.sleep_until)(wake_at)));
             match timer.as_mut().poll(cx) {
-                Poll::Pending => return Poll::Pending,
+                Poll::Pending => {
+                    self.register_waker(waiter.id, cx.waker());
+                    // Bytes given back between the check above and the
+                    // registration woke nobody; check once more so they are
+                    // not missed.
+                    if self
+                        .admits(self.empty_at_ns.load(Ordering::Acquire), self.now(), cost)
+                        .is_ok()
+                    {
+                        continue;
+                    }
+                    return Poll::Pending;
+                }
                 // The timer fired: check the bucket again.
                 Poll::Ready(()) => waiter.timer = None,
             }
         }
+    }
+
+    /// Hold `waker` under `id` until bytes are given back, at the back of
+    /// the queue (a waiter that registers again moves to the back). At
+    /// [`MAX_ADMISSION_WAKERS`] entries the OLDEST is dropped WITHOUT being
+    /// woken: its waiter still has its timer. A linear scan, over at most
+    /// that many entries, only while someone is short of bytes.
+    fn register_waker(&self, id: u64, waker: &std::task::Waker) {
+        let mut wakers = self.admission_wakers.lock();
+        if let Some(at) = wakers.iter().position(|(held, _)| *held == id) {
+            wakers.remove(at);
+        } else if wakers.len() >= MAX_ADMISSION_WAKERS {
+            wakers.pop_front();
+        }
+        wakers.push_back((id, waker.clone()));
+        self.admission_waiting
+            .store(wakers.len(), Ordering::Release);
+    }
+
+    fn forget_waker(&self, id: u64) {
+        if self.admission_waiting.load(Ordering::Acquire) == 0 {
+            return;
+        }
+        let mut wakers = self.admission_wakers.lock();
+        if let Some(at) = wakers.iter().position(|(held, _)| *held == id) {
+            wakers.remove(at);
+        }
+        self.admission_waiting
+            .store(wakers.len(), Ordering::Release);
+    }
+
+    /// After bytes came back to the bucket: wake one `Pending`
+    /// [`Self::poll_admit`] caller per [`WAKE_DATAGRAM_BYTES`] the bucket now
+    /// holds, and none if it holds less, oldest registration first. Costs one
+    /// atomic load when nobody waits, which is every give-back on a node
+    /// without a QUIC endpoint. The wakers are woken after the lock is
+    /// released.
+    fn wake_admission_waiters(&self) {
+        if self.admission_waiting.load(Ordering::Acquire) == 0 {
+            return;
+        }
+        let now = self.now();
+        let level_ns =
+            now.saturating_sub(self.refilled(self.empty_at_ns.load(Ordering::Acquire), now));
+        let datagrams = (self.bytes_for(level_ns) / WAKE_DATAGRAM_BYTES as u64) as usize;
+        if datagrams == 0 {
+            return;
+        }
+        let woken: Vec<std::task::Waker> = {
+            let mut wakers = self.admission_wakers.lock();
+            let take = datagrams.min(wakers.len());
+            let woken = wakers.drain(..take).map(|(_, waker)| waker).collect();
+            self.admission_waiting
+                .store(wakers.len(), Ordering::Release);
+            woken
+        };
+        for waker in woken {
+            waker.wake();
+        }
+    }
+
+    /// How many `Pending` [`Self::poll_admit`] wakers the cap holds.
+    #[cfg(test)]
+    pub(crate) fn admission_waker_count(&self) -> usize {
+        self.admission_wakers.lock().len()
     }
 
     /// Return `bytes` to the bucket, never above the burst.
@@ -510,6 +632,7 @@ impl EgressCap {
         }
         let cost = self.cost_ns(bytes);
         self.update(|empty_at, now| Some(self.refilled(empty_at.saturating_sub(cost), now)));
+        self.wake_admission_waiters();
     }
 
     /// Record one sent datagram. Production writes only the
