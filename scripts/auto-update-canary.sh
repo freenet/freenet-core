@@ -111,9 +111,17 @@ MARKER_DISABLED='Auto-update is DISABLED'
 # can decide anything, so a previous release that logs it HAS staging, and from
 # then on Gate B requires DONE (INFO) from the node and INSTALLED_STAGED (an
 # unconditional stderr line) from `freenet update`. A staging that silently
-# skips, fails, or is ignored by the installer falls back to downloading inside
+# skips, or is ignored by the installer, falls back to downloading inside
 # systemd's TimeoutStopSec -- the #5790 restart loop on a slow link, which CI's
 # fast network would never show. Releases that predate staging pass unchanged.
+#
+# #5799 changed what a FAILED staging does. A previous release that contains it
+# no longer exits 42 when it cannot fetch the release: it stays on its version,
+# holds for a cooldown, and the canary's deadline stops it (exit 124). So Gate
+# B reads the staging failure lines (UNRESOLVED, FAILED) on the non-42 path as
+# well: a rate limit there is environmental (EXIT_UNVERIFIED_ENVIRONMENTAL),
+# anything else is a staging failure. A previous release from before #5799
+# still exits 42 after a failed staging and is handled by the exit-42 branch.
 #
 # These are matched against the PREVIOUS release's output by THIS script, so a
 # reword in the source cannot simply be mirrored here: keep accepting the old
@@ -2037,7 +2045,28 @@ cmd_selfupdate() {
     return 1
   fi
 
+  # The two WARN lines a staging failure ends in (the tag lookup, the
+  # download), read once for both exit paths below. log_lines greps the files
+  # directly; no pipe (SIGPIPE).
+  local staging_failure
+  staging_failure="$(log_lines "$work/logs" "$MARKER_STAGE_UNRESOLVED"; log_lines "$work/logs" "$MARKER_STAGE_FAILED")"
+
   if [ "$NODE_EXIT" != "42" ]; then
+    # #5799: a release that contains it no longer exits 42 when staging cannot
+    # reach GitHub; it stays on its current version and retries after a
+    # cooldown. So a rate-limited runner shows up HERE, not at the exit-42
+    # staging check below, and must still be called environmental. Only a rate
+    # limit on a staging failure line itself counts, not one anywhere in the log.
+    if [[ "$staging_failure" == *"$MARKER_RATE_LIMITED"* ]]; then
+      fail "UNVERIFIED: v$prev_version could not download v$expected_version (#5790) because GitHub rate-limited this runner's IP, so it stayed on its current version instead of exiting 42 (#5799). That is environmental, not a staging bug; re-run the job. The node's staging lines follow."
+      log_lines "$work/logs" "the update" | head -8 >&2
+      return "$EXIT_UNVERIFIED_ENVIRONMENTAL"
+    fi
+    if [ -n "$staging_failure" ]; then
+      fail "v$prev_version decided to update but could not download v$expected_version (#5790), so it stayed on its current version (#5799) instead of exiting 42. On a runner that can reach GitHub this is a staging bug. The node's staging lines follow."
+      log_lines "$work/logs" "the update" | head -8 >&2
+      return 1
+    fi
     # Only when the download actually began: STARTED alone is logged before
     # staging decides anything. Still a hard failure, because a staging hang
     # is a real bug and a slow runner looks the same from here.
@@ -2059,10 +2088,7 @@ cmd_selfupdate() {
     staging_armed=1
     if ! log_has "$work/logs" "$MARKER_STAGE_DONE"; then
       # Only a rate limit on a staging failure line itself (the tag lookup or
-      # the download), not one anywhere in the log. log_lines greps the files
-      # directly; no pipe (SIGPIPE).
-      local staging_failure
-      staging_failure="$(log_lines "$work/logs" "$MARKER_STAGE_UNRESOLVED"; log_lines "$work/logs" "$MARKER_STAGE_FAILED")"
+      # the download), not one anywhere in the log.
       if [[ "$staging_failure" == *"$MARKER_RATE_LIMITED"* ]]; then
         fail "UNVERIFIED: v$prev_version could not download v$expected_version before exiting 42 (#5790) because GitHub rate-limited this runner's IP. That is environmental, not a staging bug; re-run the job. The node's staging lines follow."
         log_lines "$work/logs" "the update" | head -8 >&2

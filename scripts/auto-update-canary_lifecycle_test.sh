@@ -718,9 +718,11 @@ fi
 #    version it reports.
 # ---------------------------------------------------------------------------
 make_fake_prev() {
-    # make_fake_prev <path> <node-log-lines> <install-from-cache:0|1|2>
+    # make_fake_prev <path> <node-log-lines> <install-from-cache:0|1|2> [node-exit]
     #   2 = installs only from a staged download; its own download path fails
-    local path="$1" lines="$2" use_cache="$3" stages=0
+    #   node-exit defaults to 42; 124 is the canary's `timeout` stopping a
+    #   node that stayed up (#5799: a failed staging no longer exits)
+    local path="$1" lines="$2" use_cache="$3" node_exit="${4:-42}" stages=0
     [[ "$lines" == *"Update downloaded and verified"* ]] && stages=1
     cat > "$path" <<FAKE
 #!/usr/bin/env bash
@@ -750,7 +752,7 @@ printf '%s\n' "2026-08-08T02:00:00.000000Z  $CHECK_LINE" "$lines" >> "\$logdir/f
 if [ "$stages" = 1 ]; then
     mkdir -p "\$HOME/.local/state/freenet/staged_update/v0.2.122"
 fi
-exit 42
+exit $node_exit
 FAKE
     chmod +x "$path"
 }
@@ -761,11 +763,12 @@ expect_rc() {
 }
 
 gate_b_rc_for() {
-    # gate_b_rc_for <node-log-lines> <install-from-cache:0|1> -- echoes Gate B's rc.
+    # gate_b_rc_for <node-log-lines> <install-from-cache:0|1> [node-exit]
+    #   -- echoes Gate B's rc.
     local work="$CANARY_WORKDIR/selfupdate" rc=0
     rm -rf "$work"
     mkdir -p "$work/bin"
-    make_fake_prev "$work/bin/freenet" "$1" "$2"
+    make_fake_prev "$work/bin/freenet" "$1" "$2" "${3:-42}"
     (
         curl() { :; }
         tar()  { :; }
@@ -837,6 +840,41 @@ $STAGE_DL
 $STAGE_FAILED" 1)"
 expect_rc "$rc" 1 "Gate B does not excuse a failed staging because of an unrelated rate-limit line" \
     "a staging that failed for another reason must not be called environmental."
+
+# #5799: a previous release that contains it stays on its version when staging
+# cannot reach GitHub, so the canary's timeout stops it (exit 124) instead of
+# it exiting 42. Wording as the new release logs it.
+STAGE_LIMITED_STAYED='WARN freenet::commands::update::staged: Could not download the update in advance; GitHub rate-limited the download (#5799) tag=v0.2.122 error=GitHub rate-limited this IP'
+STAGE_FAILED_STAYED='WARN freenet::commands::update::staged: Could not download the update in advance; GitHub could not be reached for it (#5799) tag=v0.2.122 error=Download failed: 500'
+STAGE_TAG_LIMITED_STAYED='WARN freenet::commands::update::staged: Could not resolve the release to download in advance; staying on the current version (#5799) error=GitHub rate-limited this IP; retrying in 900s'
+
+rc="$(gate_b_rc_for "$TRIGGER_LINE
+$STAGE_PREP
+$STAGE_DL
+$STAGE_LIMITED_STAYED" 1 124)"
+expect_rc "$rc" "$EXIT_UNVERIFIED_ENVIRONMENTAL" "Gate B calls a rate-limited staging environmental when the node stayed up (#5799)" \
+    "a release that stays up after a rate-limited staging must still be environmental, not a fault."
+
+rc="$(gate_b_rc_for "$TRIGGER_LINE
+$STAGE_PREP
+$STAGE_TAG_LIMITED_STAYED" 1 124)"
+expect_rc "$rc" "$EXIT_UNVERIFIED_ENVIRONMENTAL" "Gate B calls a rate-limited tag lookup environmental when the node stayed up (#5799)" \
+    "a rate limit on staging's tag lookup is environmental whether or not the node exits."
+
+rc="$(gate_b_rc_for "$TRIGGER_LINE
+$STAGE_PREP
+$STAGE_DL
+$STAGE_FAILED_STAYED" 1 124)"
+expect_rc "$rc" 1 "Gate B fails a staging that could not download and stayed up (#5799)" \
+    "a staging that failed for another reason must fail Gate B, exit 42 or not."
+
+rc="$(gate_b_rc_for "$UNRELATED_LIMIT
+$TRIGGER_LINE
+$STAGE_PREP
+$STAGE_DL
+$STAGE_FAILED_STAYED" 1 124)"
+expect_rc "$rc" 1 "Gate B does not excuse a stayed-up failed staging because of an unrelated rate-limit line" \
+    "only a rate limit on the staging failure line itself is environmental."
 
 rc="$(gate_b_rc_for "$TRIGGER_LINE" 1)"
 expect_rc "$rc" 0 "Gate B still passes a previous release that predates staging" \

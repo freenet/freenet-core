@@ -10,8 +10,22 @@ use std::process::Command;
 
 use super::rollback;
 
+/// `eprintln!` without the panic. The updater's stderr goes to a log file
+/// under every supervisor (the journal, the Windows wrapper's log, the macOS
+/// wrapper's `logger`, #5799), and `eprintln!` panics when the write fails, as
+/// it does on a full disk: a line about a failed update must never be what
+/// aborts the update.
+macro_rules! stderr_line {
+    ($($arg:tt)*) => {{
+        #[allow(clippy::let_underscore_must_use)]
+        let _ = writeln!(io::stderr(), $($arg)*);
+    }};
+}
+
 mod staged;
-pub(crate) use staged::{discard_stale as discard_stale_staged, stage_latest_release};
+pub(crate) use staged::{
+    discard_stale as discard_stale_staged, download_budget_blocks_at, stage_latest_release,
+};
 
 #[cfg(target_os = "macos")]
 use super::service::generate_wrapper_script;
@@ -215,6 +229,171 @@ pub fn update_counter_action(outcome: UpdateSubprocessOutcome) -> UpdateCounterA
     }
 }
 
+/// Record that installing `version` failed for a reason other than a bad
+/// release (a verification failure counts toward the #4073 gate instead), so
+/// the node's triggers hold it for a cooldown instead of exiting for it again
+/// at once (#5799). Says so on stderr even under `--quiet`: the line a
+/// supervisor's log (the journal, the Windows wrapper's log, the macOS
+/// wrapper's log) needs to show why an update did not happen.
+fn note_install_failure(version: &str, error: &str) {
+    note_install_failure_at(
+        super::auto_update::state_dir().as_deref(),
+        version,
+        error,
+        std::time::SystemTime::now(),
+        &mut io::stderr(),
+    );
+}
+
+/// [`note_install_failure`] against the state directory `dir` (none: nothing
+/// recorded), writing its line to `out`.
+fn note_install_failure_at(
+    dir: Option<&Path>,
+    version: &str,
+    error: &str,
+    now: std::time::SystemTime,
+    out: &mut impl Write,
+) {
+    let rand_unit = freenet::config::GlobalRng::random_range(0.0_f64..1.0);
+    let streak =
+        dir.and_then(|dir| rollback::record_update_failure_at(dir, version, error, now, rand_unit));
+    #[allow(clippy::let_underscore_must_use)]
+    let _ = writeln!(out, "{}", install_failure_line(version, error, streak));
+}
+
+/// The stderr line for a failed install: the release, the streak when it
+/// was recorded, and the full error.
+fn install_failure_line(version: &str, error: &str, streak: Option<u32>) -> String {
+    let streak = streak.map_or_else(String::new, |n| format!(" (failure {n} in a row)"));
+    format!(
+        "Freenet update to {version} failed{streak}: {error}. Auto-update holds this release \
+         for a cooldown before trying it again (#5799)."
+    )
+}
+
+/// What the updater records for the outcome of an install attempt.
+#[derive(Debug, PartialEq, Eq)]
+enum InstallRecord {
+    /// Installed: clear the #4073 install gate, the #5799 cooldown, and the
+    /// staged copy.
+    Clear,
+    /// A present-but-wrong release (checksum or signature): count it toward
+    /// the #4073 install gate.
+    Gate,
+    /// Any other failure: cool the release down, recording this error
+    /// (#5799). Deliberately includes a missing manifest or asset, which is
+    /// usually a release still propagating.
+    CoolDown(String),
+    /// Today's download budget for this node ran out mid-download (#5799):
+    /// hold it without counting a failure, as a run the budget refuses up
+    /// front does.
+    Hold(String),
+}
+
+fn install_record(result: &Result<InstallOutcome>) -> InstallRecord {
+    match result {
+        Ok(InstallOutcome::Installed) => InstallRecord::Clear,
+        Ok(InstallOutcome::BundleSkipped {
+            verification_failure: true,
+        }) => InstallRecord::Gate,
+        Ok(InstallOutcome::BundleSkipped {
+            verification_failure: false,
+        }) => InstallRecord::CoolDown("the app bundle update could not be downloaded".to_string()),
+        Err(e) if is_release_verification_failure(e) => InstallRecord::Gate,
+        Err(e) if e.downcast_ref::<staged::BudgetSpent>().is_some() => {
+            InstallRecord::Hold(format!("{e:#}"))
+        }
+        Err(e) => InstallRecord::CoolDown(format!("{e:#}")),
+    }
+}
+
+/// The meter an updater run's downloads charge to the node's daily byte
+/// budget, which staging shares (#5799), or `None` when that budget is
+/// already spent and the run is `limited`. Only a run the supervisor started
+/// after the node exited for an update is limited: `--force`, a manual
+/// `freenet update` and a tray "Check for Updates" are charged but never
+/// refused. Without a state directory nothing can be charged, and nothing is
+/// refused either: refusing there would stop updates altogether.
+fn updater_meter_at<'a>(
+    dir: Option<&Path>,
+    limited: bool,
+    clock: staged::Clock<'a>,
+) -> Option<staged::ByteMeter<'a>> {
+    let Some(dir) = dir else {
+        return Some(staged::ByteMeter::new(u64::MAX));
+    };
+    let left = if limited {
+        rollback::DOWNLOAD_BYTES_PER_DAY.saturating_sub(rollback::download_bytes_at(dir, clock()))
+    } else {
+        u64::MAX
+    };
+    (left > 0).then(|| staged::ByteMeter::charged_to(left, dir, clock))
+}
+
+/// Whether this run's downloads are limited by the byte budget: a run the
+/// supervisor started after the node stopped (it passes the node's stop
+/// status variable, even empty), without `--force`.
+fn budget_limits(force: bool, supervised: bool) -> bool {
+    supervised && !force
+}
+
+/// Hold `version` without counting a failure because the node's download
+/// budget is spent (#5799), say so even under `--quiet`, and exit as "already
+/// up to date": the supervisor restarts the current binary, whose triggers
+/// wait out the hold.
+fn exit_for_spent_budget(version: &str, reason: &str) -> ! {
+    std::process::exit(spent_budget_exit_at(
+        super::auto_update::state_dir().as_deref(),
+        version,
+        reason,
+        std::time::SystemTime::now(),
+        &mut io::stderr(),
+    ));
+}
+
+/// [`exit_for_spent_budget`] against the state directory `dir`, writing its
+/// line to `out`; returns the exit code.
+fn spent_budget_exit_at(
+    dir: Option<&Path>,
+    version: &str,
+    reason: &str,
+    now: std::time::SystemTime,
+    out: &mut impl Write,
+) -> i32 {
+    if let Some(dir) = dir {
+        let until = rollback::download_window_end_at(dir, now).unwrap_or(now);
+        rollback::hold_update_until_at(dir, version, reason, until, now);
+    }
+    #[allow(clippy::let_underscore_must_use)]
+    let _ = writeln!(
+        out,
+        "Freenet update to {version} not downloaded: {reason}. Auto-update holds this release \
+         until the budget resets (#5799). Run `freenet update --force` to override it."
+    );
+    tracing::warn!(
+        version,
+        reason,
+        "Update deferred: the download budget is spent (#5799)"
+    );
+    EXIT_CODE_ALREADY_UP_TO_DATE
+}
+
+/// Whether a run that gives up before any download holds the staged release.
+/// `--check` installs nothing, so it never touches the cooldown.
+fn holds_on_skip(check: bool) -> bool {
+    !check
+}
+
+/// Hold the release the node staged before it exited, without counting a
+/// failure, when this run gives up before attempting a download (a failed tag
+/// probe, a rate-limit or empty-bucket exit). Without the hold the restart
+/// would find no cooldown and the staged cache still valid, and exit again at
+/// once; counting it would let a crash-looping node, whose every exit runs
+/// this updater, reach the fallback without a single download (#5799).
+fn hold_staged_release(error: &anyhow::Error) {
+    staged::hold_staged_release(&format!("{error:#}"));
+}
+
 /// Classify the exit status of a `freenet update` subprocess invocation.
 /// Pure over just the `io::Result<ExitStatus>` so it can be unit-tested
 /// with synthetic inputs.
@@ -341,7 +520,7 @@ impl UpdateCommand {
                 rollback::PostStopOutcome::CrashRecorded { crash_count } => {
                     // Critical brick-safety signal: emit on stderr even under
                     // --quiet (the supervisor routes it to the journal/log).
-                    eprintln!(
+                    stderr_line!(
                         "Freenet {current_version}: crash {crash_count}/{} during post-update \
                          probation (node stop status {status}); not updating, will auto-roll-back \
                          if it keeps crashing.",
@@ -363,7 +542,7 @@ impl UpdateCommand {
                     restored_version,
                     bad_version,
                 } => {
-                    eprintln!(
+                    stderr_line!(
                         "Freenet auto-rollback (#4073): version {bad_version} crash-looped after \
                          an update; restored known-good {restored_version} and pinned {bad_version} \
                          as known-bad on this node so it will not be re-applied automatically."
@@ -377,7 +556,7 @@ impl UpdateCommand {
                     std::process::exit(0);
                 }
                 rollback::PostStopOutcome::RollbackUnavailable { reason } => {
-                    eprintln!(
+                    stderr_line!(
                         "Freenet auto-rollback (#4073) could not run ({reason}); leaving the node \
                          to the supervisor's own crash limiter / operator. Run `freenet update \
                          --force` once a fixed release is available."
@@ -401,7 +580,21 @@ impl UpdateCommand {
         //     on EVERY non-clean node exit (so a crash-looping node used to burn
         //     REST quota once per crash), and
         //   * `--check`, which never installs by definition.
-        let latest_tag = probe_latest_tag(self.force, self.quiet).await?;
+        // `--check` installs nothing, so it never touches the cooldown.
+        let hold_on_skip = holds_on_skip(self.check);
+        let latest_tag = match probe_latest_tag(self.force, self.quiet, hold_on_skip).await {
+            Ok(tag) => tag,
+            Err(e) => {
+                // The tag could not be learned. If the node staged a release
+                // before exiting, that is the one this run was for: hold it,
+                // without counting a failure, since nothing was attempted
+                // (#5799).
+                if hold_on_skip {
+                    hold_staged_release(&e);
+                }
+                return Err(e);
+            }
+        };
         // `latest_tag` is the tag verbatim (`v0.2.118`); `latest_version` is its
         // semver part. Both are kept: the version is what we compare and what
         // the rollback/pin bookkeeping keys on, while the RAW tag is what
@@ -436,6 +629,8 @@ impl UpdateCommand {
             // target install to gate anymore — clear the per-version
             // install-failure counter too (#4073).
             super::rollback::clear_install_failures();
+            // Nor is any release cooling down after failed attempts (#5799).
+            super::rollback::clear_update_cooldown();
             // Nothing to install, so nothing staged in advance (#5790) is useful.
             staged::discard();
             // Exit with a distinct code so the service wrapper knows no update
@@ -484,6 +679,18 @@ impl UpdateCommand {
             std::process::exit(EXIT_CODE_ALREADY_UP_TO_DATE);
         }
 
+        // #5799: staging and the updater share one byte budget per node per
+        // day. Checked before the asset list is requested, unless a
+        // staged copy can be installed without downloading the archive.
+        let meter = match updater_meter_at(
+            super::auto_update::state_dir().as_deref(),
+            budget_limits(self.force, rollback::post_stop_status_present()),
+            &std::time::SystemTime::now,
+        ) {
+            Some(meter) => meter,
+            None if staged::is_staged(&latest_tag) => staged::ByteMeter::new(0),
+            None => exit_for_spent_budget(latest_version, "today's download budget is spent"),
+        };
         if !self.quiet {
             println!("Downloading update...");
         }
@@ -492,7 +699,13 @@ impl UpdateCommand {
         // gnu→musl fallback search and the macOS DMG lookup). Requested by exact
         // tag rather than `/releases/latest` so we install the release we just
         // decided about, even if a newer one is published in between.
-        let latest = fetch_release_assets(&latest_tag, self.quiet).await?;
+        let latest = match fetch_release_assets(&latest_tag, self.quiet).await {
+            Ok(latest) => latest,
+            Err(e) => {
+                note_install_failure(latest_version, &format!("{e:#}"));
+                return Err(e);
+            }
+        };
         // #4073 per-target-version install-failure gate. Count a DETERMINISTIC
         // install failure of this version — a checksum mismatch or invalid
         // release signature (`ReleaseVerificationError`) — toward the gate. After
@@ -512,38 +725,30 @@ impl UpdateCommand {
         // success and never returns here; a swallowed bundle FAILURE returns
         // `BundleSkipped { verification_failure }`, which carries the same
         // deterministic-vs-transient distinction.
-        let install_result = self.download_and_install(&latest, current_version).await;
-        match &install_result {
-            Ok(InstallOutcome::Installed) => {
+        let install_result = self
+            .download_and_install(&latest, current_version, &meter)
+            .await;
+        // Transient failures cool the release down rather than gating it.
+        // That DELIBERATELY includes the fail-closed "missing artifact"
+        // refusals (absent SHA256SUMS.txt, no manifest entry for our asset,
+        // absent .sig when required): a MISSING manifest/entry is the canonical
+        // release-PROPAGATION race (assets upload after the tag is live), so
+        // gating it could permanently suppress a good release polled seconds
+        // early. Only a PRESENT-but-WRONG artifact is an unambiguous
+        // bad-release signal, gated via ReleaseVerificationError. The cooldown
+        // (#5799) always expires; without it a node that cannot download the
+        // release restarts, detects it and exits for it again within minutes.
+        match install_record(&install_result) {
+            InstallRecord::Clear => {
                 super::rollback::clear_install_failures();
+                super::rollback::clear_update_cooldown();
                 // The staged copy (#5790) has served its purpose. Kept on any
                 // failure, so the next attempt need not download it again.
                 staged::discard();
             }
-            Ok(InstallOutcome::BundleSkipped {
-                verification_failure,
-            }) => {
-                if *verification_failure {
-                    super::rollback::record_install_failure(latest_version);
-                }
-                // transient bundle failure: leave the gate unchanged.
-            }
-            Err(e) if is_release_verification_failure(e) => {
-                super::rollback::record_install_failure(latest_version)
-            }
-            // Transient install error: neither record nor clear — retry later.
-            //
-            // DELIBERATELY includes the fail-closed "missing artifact" refusals
-            // (absent SHA256SUMS.txt, no manifest entry for our asset, absent
-            // .sig when required) as well as download/network/extraction errors.
-            // A MISSING manifest/entry is the canonical release-PROPAGATION race
-            // (assets upload after the tag is live), so it self-resolves — gating
-            // it would risk permanently suppressing a good release that the node
-            // happened to poll seconds early, which is a worse regression than the
-            // already rate-limit-bounded retry cadence. Only a PRESENT-but-WRONG
-            // artifact (checksum mismatch / invalid signature) is an unambiguous
-            // bad-release signal and is gated above via ReleaseVerificationError.
-            Err(_) => {}
+            InstallRecord::Gate => super::rollback::record_install_failure(latest_version),
+            InstallRecord::CoolDown(error) => note_install_failure(latest_version, &error),
+            InstallRecord::Hold(error) => exit_for_spent_budget(latest_version, &error),
         }
         install_result.map(|_| ())
     }
@@ -552,6 +757,7 @@ impl UpdateCommand {
         &self,
         release: &Release,
         current_version: &str,
+        meter: &staged::ByteMeter<'_>,
     ) -> Result<InstallOutcome> {
         // macOS DMG-swap path: when running from inside a .app bundle,
         // in-place binary replacement would invalidate the bundle's code
@@ -574,7 +780,7 @@ impl UpdateCommand {
                 .and_then(|exe| super::service::macos_app_bundle_path(&exe))
                 .is_some();
 
-            match self.maybe_perform_bundle_update(release).await {
+            match self.maybe_perform_bundle_update(release, meter).await {
                 Ok(true) => {
                     tracing::info!("DMG-swap update staged for release {}", release.tag_name);
                     if !self.quiet {
@@ -593,6 +799,11 @@ impl UpdateCommand {
                     // crash-looping DMG release is still bounded by the wrapper's
                     // own consecutive-failure cap, unchanged. Bundle rollback is
                     // tracked as future work.
+                    //
+                    // This exit also skips run_async's clear of the #5799
+                    // cooldown record. Harmless: the record is for the
+                    // version now installed, which no trigger waits for, and
+                    // the next successful tag lookup removes it as stale.
                     std::process::exit(EXIT_CODE_BUNDLE_UPDATE_STAGED);
                 }
                 Ok(false) => {
@@ -612,7 +823,7 @@ impl UpdateCommand {
                         e
                     );
                     if !self.quiet {
-                        eprintln!(
+                        stderr_line!(
                             "Bundle update failed: {e}. Skipping update to avoid corrupting the signed bundle. Next attempt will retry."
                         );
                     }
@@ -631,7 +842,7 @@ impl UpdateCommand {
                     // replace. Log the bundle-attempt failure for
                     // diagnosability; continue with the standard path.
                     if !self.quiet {
-                        eprintln!(
+                        stderr_line!(
                             "Bundle update check failed ({e}); continuing with in-place binary replacement."
                         );
                     }
@@ -708,7 +919,13 @@ impl UpdateCommand {
                 None => {
                     let checksums = self.download_and_verify_checksums(release).await?;
                     let path = temp_dir.path().join(&freenet_asset_name);
-                    download_file(&freenet_asset.browser_download_url, &path, self.quiet).await?;
+                    download_file(
+                        &freenet_asset.browser_download_url,
+                        &path,
+                        self.quiet,
+                        meter,
+                    )
+                    .await?;
                     (checksums, path, None)
                 }
             };
@@ -761,7 +978,7 @@ impl UpdateCommand {
                 // Belt-and-braces alongside the subscriber installed in
                 // `freenet_main`, so this survives a later refactor that drops
                 // the subscriber. Matches `handle_post_stop`'s precedent above.
-                eprintln!(
+                stderr_line!(
                     "Freenet: failed to snapshot the known-good binary for crash-loop \
                      rollback: {e}. PROCEEDING WITHOUT ROLLBACK PROTECTION for this update — if \
                      this version crash-loops it will NOT be auto-reverted. Check the \
@@ -808,7 +1025,7 @@ impl UpdateCommand {
                 // The update HAS landed and the probation marker is absent, so
                 // the post-stop hook will find nothing to count and this
                 // version can crash-loop indefinitely without being reverted.
-                eprintln!(
+                stderr_line!(
                     "Freenet: installed the update but FAILED TO ARM crash-loop rollback \
                      protection: {e}. If this version crash-loops it will NOT be auto-reverted. \
                      Check the permissions and free space on the Freenet state directory."
@@ -830,7 +1047,7 @@ impl UpdateCommand {
         // must not depend on it finishing.
         if let Err(e) = ensure_service_file_updated(&current_exe, self.quiet) {
             if !self.quiet {
-                eprintln!(
+                stderr_line!(
                     "Warning: Failed to update service file: {}. \
                      Run 'freenet service install' to update manually.",
                     e
@@ -849,13 +1066,13 @@ impl UpdateCommand {
                 fdev_asset,
                 &fdev_asset_name,
                 &checksums,
-                temp_dir.path(),
+                (temp_dir.path(), meter),
                 staged_fdev,
                 &current_exe,
             )
             .await;
         } else if !self.quiet {
-            eprintln!("Warning: fdev not found in release assets. Skipping fdev update.");
+            stderr_line!("Warning: fdev not found in release assets. Skipping fdev update.");
         }
 
         // Automatically restart service if running
@@ -872,10 +1089,10 @@ impl UpdateCommand {
                         .status();
                     match status {
                         Ok(s) if s.success() => println!("Service restarted successfully."),
-                        Ok(_) => eprintln!(
+                        Ok(_) => stderr_line!(
                             "Warning: Failed to restart service. Run 'freenet service restart' manually."
                         ),
-                        Err(e) => eprintln!(
+                        Err(e) => stderr_line!(
                             "Warning: Failed to restart service: {}. Run 'freenet service restart' manually.",
                             e
                         ),
@@ -892,17 +1109,17 @@ impl UpdateCommand {
                         .args(["stop", "org.freenet.node"])
                         .status()
                     {
-                        eprintln!("Warning: failed to stop service: {e}");
+                        stderr_line!("Warning: failed to stop service: {e}");
                     }
                     let status = Command::new("launchctl")
                         .args(["start", "org.freenet.node"])
                         .status();
                     match status {
                         Ok(s) if s.success() => println!("Service restarted successfully."),
-                        Ok(_) => eprintln!(
+                        Ok(_) => stderr_line!(
                             "Warning: Failed to restart service. Run 'freenet service restart' manually."
                         ),
-                        Err(e) => eprintln!(
+                        Err(e) => stderr_line!(
                             "Warning: Failed to restart service: {}. Run 'freenet service restart' manually.",
                             e
                         ),
@@ -926,10 +1143,10 @@ impl UpdateCommand {
                         .status();
                     match status {
                         Ok(s) if s.success() => println!("Service restarted successfully."),
-                        Ok(_) => eprintln!(
+                        Ok(_) => stderr_line!(
                             "Warning: Failed to restart service. Run 'freenet service start' manually."
                         ),
-                        Err(e) => eprintln!(
+                        Err(e) => stderr_line!(
                             "Warning: Failed to restart service: {}. Run 'freenet service start' manually.",
                             e
                         ),
@@ -976,7 +1193,7 @@ impl UpdateCommand {
             Ok(bytes) => bytes,
             Err(e) => {
                 if !self.quiet {
-                    eprintln!("Warning: Failed to download checksums: {}.", e);
+                    stderr_line!("Warning: Failed to download checksums: {}.", e);
                 }
                 return Ok(None);
             }
@@ -1014,7 +1231,7 @@ impl UpdateCommand {
         asset: &Asset,
         asset_name: &str,
         checksums: &Option<Checksums>,
-        temp_dir: &Path,
+        (temp_dir, meter): (&Path, &staged::ByteMeter<'_>),
         staged_archive: Option<PathBuf>,
         freenet_exe: &Path,
     ) {
@@ -1022,10 +1239,11 @@ impl UpdateCommand {
             Some(path) => path,
             None => {
                 let path = temp_dir.join(asset_name);
-                if let Err(e) = download_file(&asset.browser_download_url, &path, self.quiet).await
+                if let Err(e) =
+                    download_file(&asset.browser_download_url, &path, self.quiet, meter).await
                 {
                     if !self.quiet {
-                        eprintln!(
+                        stderr_line!(
                             "Warning: Failed to download fdev: {}. Skipping fdev update.",
                             e
                         );
@@ -1048,7 +1266,7 @@ impl UpdateCommand {
                 }
                 if let Err(e) = verify_checksum(&archive_path, expected_hash) {
                     if !self.quiet {
-                        eprintln!(
+                        stderr_line!(
                             "Warning: fdev checksum verification failed: {}. Skipping fdev update.",
                             e
                         );
@@ -1058,7 +1276,7 @@ impl UpdateCommand {
             }
             Err(e) => {
                 if !self.quiet {
-                    eprintln!("Warning: {} Skipping fdev update.", e);
+                    stderr_line!("Warning: {} Skipping fdev update.", e);
                 }
                 return;
             }
@@ -1067,7 +1285,7 @@ impl UpdateCommand {
         let extract_dir = temp_dir.join("fdev");
         if let Err(e) = fs::create_dir_all(&extract_dir) {
             if !self.quiet {
-                eprintln!(
+                stderr_line!(
                     "Warning: Failed to create fdev extract directory: {}. Skipping fdev update.",
                     e
                 );
@@ -1079,7 +1297,7 @@ impl UpdateCommand {
             Ok(path) => path,
             Err(e) => {
                 if !self.quiet {
-                    eprintln!(
+                    stderr_line!(
                         "Warning: Failed to extract fdev: {}. Skipping fdev update.",
                         e
                     );
@@ -1091,7 +1309,7 @@ impl UpdateCommand {
         // Install fdev next to the freenet binary
         let Some(install_dir) = freenet_exe.parent() else {
             if !self.quiet {
-                eprintln!("Warning: Cannot determine install directory. Skipping fdev update.");
+                stderr_line!("Warning: Cannot determine install directory. Skipping fdev update.");
             }
             return;
         };
@@ -1103,7 +1321,7 @@ impl UpdateCommand {
 
         if let Err(e) = replace_binary(&extracted_fdev, &fdev_dest) {
             if !self.quiet {
-                eprintln!(
+                stderr_line!(
                     "Warning: Failed to update fdev: {}. You can update it manually with: curl -fsSL https://freenet.org/install.sh | sh",
                     e
                 );
@@ -1128,7 +1346,11 @@ impl UpdateCommand {
     ///             standard binary-replacement flow instead
     ///   Err       failed; caller may fall back to binary replacement
     #[cfg(target_os = "macos")]
-    async fn maybe_perform_bundle_update(&self, release: &Release) -> Result<bool> {
+    async fn maybe_perform_bundle_update(
+        &self,
+        release: &Release,
+        meter: &staged::ByteMeter<'_>,
+    ) -> Result<bool> {
         let current_exe = std::env::current_exe()
             .context("Failed to resolve current executable for bundle-update check")?;
         let Some(bundle_path) = super::service::macos_app_bundle_path(&current_exe) else {
@@ -1162,7 +1384,13 @@ impl UpdateCommand {
 
         let scratch = tempfile::tempdir().context("Failed to create temp directory")?;
         let dmg_path = scratch.path().join(&dmg_asset_name);
-        download_file(&dmg_asset.browser_download_url, &dmg_path, self.quiet).await?;
+        download_file(
+            &dmg_asset.browser_download_url,
+            &dmg_path,
+            self.quiet,
+            meter,
+        )
+        .await?;
 
         // Require checksum verification for bundle updates. Unverified
         // DMG install is a supply-chain risk that macOS Gatekeeper alone
@@ -1286,7 +1514,7 @@ impl Checksums {
 /// used instead of `api.github.com`.
 ///
 /// [`auto_update::GITHUB_LATEST_REDIRECT_URL`]: super::auto_update
-async fn probe_latest_tag(force: bool, quiet: bool) -> Result<String> {
+async fn probe_latest_tag(force: bool, quiet: bool, hold_on_skip: bool) -> Result<String> {
     // Persistent local rate limit (#4073): this is the supervisor-side choke
     // point — the on-crash / on-update `freenet update` one-shot reaches GitHub
     // through here. It uses its OWN on-disk token bucket (the INSTALL bucket),
@@ -1313,16 +1541,19 @@ async fn probe_latest_tag(force: bool, quiet: bool) -> Result<String> {
                 retry_after: Some(remaining),
             };
             if !quiet {
-                eprintln!("{}", rate_limited.user_message());
+                stderr_line!("{}", rate_limited.user_message());
             }
             tracing::warn!("Update check deferred: {}", rate_limited.user_message());
+            if hold_on_skip {
+                hold_staged_release(&anyhow::anyhow!("{}", rate_limited.user_message()));
+            }
             std::process::exit(EXIT_CODE_ALREADY_UP_TO_DATE);
         }
     }
 
     if !force && !super::auto_update::try_consume_install_poll() {
         if !quiet {
-            eprintln!(
+            stderr_line!(
                 "Update check rate-limited (too many recent GitHub polls); skipping this cycle. \
                  Run `freenet update --force` to override."
             );
@@ -1330,6 +1561,11 @@ async fn probe_latest_tag(force: bool, quiet: bool) -> Result<String> {
         tracing::warn!(
             "GitHub update poll rate-limited (token bucket empty); exiting as up-to-date (#4073)"
         );
+        if hold_on_skip {
+            hold_staged_release(&anyhow::anyhow!(
+                "skipped: too many recent GitHub polls (#4073 token bucket)"
+            ));
+        }
         std::process::exit(EXIT_CODE_ALREADY_UP_TO_DATE);
     }
 
@@ -1359,9 +1595,12 @@ async fn probe_latest_tag(force: bool, quiet: bool) -> Result<String> {
                 e.downcast_ref::<super::auto_update::GithubRateLimitedError>()
             {
                 if !quiet {
-                    eprintln!("{}", rate_limited.user_message());
+                    stderr_line!("{}", rate_limited.user_message());
                 }
                 tracing::warn!("Update check deferred: {}", rate_limited.user_message());
+                if hold_on_skip {
+                    hold_staged_release(&anyhow::anyhow!("{}", rate_limited.user_message()));
+                }
                 std::process::exit(EXIT_CODE_ALREADY_UP_TO_DATE);
             }
             Err(e).context("Failed to determine the latest Freenet release")
@@ -1428,9 +1667,15 @@ async fn fetch_release_assets(tag: &str, quiet: bool) -> Result<Release> {
         // It also previously flattened the typed `GithubRateLimitedError` into a
         // string, so no caller could tell it from a genuine install failure.
         if !quiet {
-            eprintln!("{}", rate_limited.user_message());
+            stderr_line!("{}", rate_limited.user_message());
         }
         tracing::warn!("Update deferred: {}", rate_limited.user_message());
+        // The release is known here: hold it without counting a failure (no
+        // download was attempted), so the restart does not exit again (#5799).
+        super::rollback::hold_update_without_counting(
+            super::auto_update::version_from_tag(tag),
+            &rate_limited.user_message(),
+        );
         std::process::exit(EXIT_CODE_ALREADY_UP_TO_DATE);
     }
 
@@ -1589,7 +1834,7 @@ fn verify_manifest_signature_with(
             );
         }
         if !quiet {
-            eprintln!(
+            stderr_line!(
                 "Warning: release did not publish SHA256SUMS.txt.sig; \
                  installing without release-signature verification."
             );
@@ -1753,7 +1998,29 @@ fn get_archive_extension() -> &'static str {
     }
 }
 
-async fn download_file(url: &str, dest: &Path, quiet: bool) -> Result<()> {
+/// Download `url` to `dest`, charging it to `meter`, the node's daily
+/// download budget (#5799): refused before the request when the budget is
+/// spent, charged for its Content-Length before the body arrives, stopped
+/// once the budget runs out, and reconciled to the bytes received whatever
+/// the outcome.
+async fn download_file(
+    url: &str,
+    dest: &Path,
+    quiet: bool,
+    meter: &staged::ByteMeter<'_>,
+) -> Result<()> {
+    let result = download_file_counted(url, dest, quiet, meter).await;
+    meter.flush();
+    result
+}
+
+async fn download_file_counted(
+    url: &str,
+    dest: &Path,
+    quiet: bool,
+    meter: &staged::ByteMeter<'_>,
+) -> Result<()> {
+    meter.check()?;
     let client = reqwest::Client::builder()
         .user_agent(super::auto_update::GITHUB_USER_AGENT)
         // A READ timeout, deliberately NOT a total one: this is the release
@@ -1774,6 +2041,9 @@ async fn download_file(url: &str, dest: &Path, quiet: bool) -> Result<()> {
     if !response.status().is_success() {
         anyhow::bail!("Download failed: {}", response.status());
     }
+    // Charged before the body, so a run that systemd kills mid-download has
+    // paid for it; `download_file` reconciles to what arrived.
+    meter.precharge(response.content_length());
 
     let total_size = response.content_length().unwrap_or(0);
     let mut downloaded: u64 = 0;
@@ -1786,6 +2056,7 @@ async fn download_file(url: &str, dest: &Path, quiet: bool) -> Result<()> {
         let chunk = chunk.context("Error while downloading")?;
         file.write_all(&chunk)?;
         downloaded += chunk.len() as u64;
+        meter.spend(chunk.len())?;
 
         if !quiet && total_size > 0 {
             let progress = (downloaded as f64 / total_size as f64 * 100.0) as u32;
@@ -2070,7 +2341,7 @@ fn update_service_file(
     match &action {
         WrapperAction::UserModified { on_disk_hash } => {
             if !quiet {
-                eprintln!(
+                stderr_line!(
                     "Warning: systemd unit at {} differs from the current Freenet \
                      template AND from the hash recorded in {}, suggesting it has \
                      been hand-edited. Leaving it alone. To accept the bundled \
@@ -2092,7 +2363,7 @@ fn update_service_file(
             // the unit text didn't change.
             if let Err(e) = write_wrapper_hash_sidecar(&hash_path, h) {
                 if !quiet {
-                    eprintln!(
+                    stderr_line!(
                         "Warning: failed to backfill service hash sidecar at {}: {}. \
                          User-modification detection on the next `freenet update` \
                          will fall back to treating the unit as ours.",
@@ -2125,7 +2396,7 @@ fn update_service_file(
     let backup_path = service_path.with_extension("service.bak");
     if let Err(e) = fs::copy(service_path, &backup_path) {
         if !quiet {
-            eprintln!(
+            stderr_line!(
                 "Warning: Failed to backup service file: {}. Continuing anyway.",
                 e
             );
@@ -2142,7 +2413,7 @@ fn update_service_file(
     // treating the unit as ours), so warn but continue.
     if let Err(e) = write_wrapper_hash_sidecar(&hash_path, new_hash) {
         if !quiet {
-            eprintln!(
+            stderr_line!(
                 "Warning: failed to write service hash sidecar at {}: {}. \
                  User-modification detection on the next `freenet update` \
                  will fall back to treating the unit as ours.",
@@ -2162,11 +2433,11 @@ fn update_service_file(
 
     if !status.success() && !quiet {
         if system_mode {
-            eprintln!(
+            stderr_line!(
                 "Warning: Failed to reload systemd daemon. Run 'systemctl daemon-reload' manually."
             );
         } else {
-            eprintln!(
+            stderr_line!(
                 "Warning: Failed to reload systemd daemon. Run 'systemctl --user daemon-reload' manually."
             );
         }
@@ -2384,7 +2655,7 @@ fn ensure_service_file_updated(binary_path: &Path, quiet: bool) -> Result<()> {
         Ok(content) => launchd_plist_needs_regen(&content),
         Err(e) => {
             if !quiet {
-                eprintln!(
+                stderr_line!(
                     "Warning: failed to read launchd plist at {} for migration check: {}. \
                      Skipping plist regen.",
                     plist_path.display(),
@@ -2403,7 +2674,7 @@ fn ensure_service_file_updated(binary_path: &Path, quiet: bool) -> Result<()> {
     match &action {
         WrapperAction::UserModified { on_disk_hash } => {
             if !quiet {
-                eprintln!(
+                stderr_line!(
                     "Warning: wrapper script at {} differs from the current Freenet \
                      template AND from the hash recorded in {}, suggesting it has \
                      been hand-edited. Leaving it alone. To accept the bundled \
@@ -2420,7 +2691,7 @@ fn ensure_service_file_updated(binary_path: &Path, quiet: bool) -> Result<()> {
         } => {
             if let Err(e) = write_wrapper_hash_sidecar(&wrapper_hash_path, h) {
                 if !quiet {
-                    eprintln!(
+                    stderr_line!(
                         "Warning: failed to backfill wrapper hash sidecar at {}: {}.",
                         wrapper_hash_path.display(),
                         e
@@ -2444,7 +2715,7 @@ fn ensure_service_file_updated(binary_path: &Path, quiet: bool) -> Result<()> {
                 let backup_path = wrapper_path.with_extension("sh.bak");
                 if let Err(e) = fs::copy(&wrapper_path, &backup_path) {
                     if !quiet {
-                        eprintln!(
+                        stderr_line!(
                             "Warning: Failed to backup wrapper script: {}. Continuing anyway.",
                             e
                         );
@@ -2462,7 +2733,7 @@ fn ensure_service_file_updated(binary_path: &Path, quiet: bool) -> Result<()> {
             // just wrote, so warn but continue.
             if let Err(e) = write_wrapper_hash_sidecar(&wrapper_hash_path, new_hash) {
                 if !quiet {
-                    eprintln!(
+                    stderr_line!(
                         "Warning: failed to write wrapper hash sidecar at {}: {}. \
                          User-modification detection on the next `freenet update` \
                          will fall back to treating the wrapper as ours.",
@@ -2500,7 +2771,7 @@ fn ensure_service_file_updated(binary_path: &Path, quiet: bool) -> Result<()> {
         let backup_path = plist_path.with_extension("plist.bak");
         if let Err(e) = fs::copy(&plist_path, &backup_path) {
             if !quiet {
-                eprintln!(
+                stderr_line!(
                     "Warning: failed to back up plist: {}. Continuing anyway.",
                     e
                 );
@@ -2642,12 +2913,12 @@ fn replace_binary(new_binary: &Path, dest: &Path) -> Result<()> {
         // Try to restore backup
         if backup_path.exists() {
             if let Err(restore_err) = fs::rename(&backup_path, dest) {
-                eprintln!(
+                stderr_line!(
                     "CRITICAL: Failed to restore backup after update failure. \
                      Original binary may be at: {}",
                     backup_path.display()
                 );
-                eprintln!("Restore error: {}", restore_err);
+                stderr_line!("Restore error: {}", restore_err);
             }
         }
         // Clean up temp file (best-effort, failure is non-fatal during error recovery)
@@ -2659,7 +2930,7 @@ fn replace_binary(new_binary: &Path, dest: &Path) -> Result<()> {
     if backup_path.exists() {
         if let Err(e) = fs::remove_file(&backup_path) {
             // Non-fatal: warn but don't fail
-            eprintln!(
+            stderr_line!(
                 "Warning: Failed to remove backup file {}: {}",
                 backup_path.display(),
                 e
@@ -4109,40 +4380,670 @@ done
         // match (the macOS path isn't exercised on Linux CI).
         const SRC: &str = include_str!("update.rs");
         let (_, run_async) = SRC
-            .split_once("let install_result = self.download_and_install(")
+            .split_once(".download_and_install(&latest, current_version, &meter)")
             .expect("download_and_install call site not found");
         let (matchbody, _) = run_async
             .split_once("install_result.map(|_| ())")
             .expect("end of install-result match not found");
 
-        // The Installed outcome clears the gate.
-        let (_, installed_arm) = matchbody
-            .split_once("Ok(InstallOutcome::Installed) => {")
-            .expect("Installed arm not found");
-        let installed_arm =
-            &installed_arm[..installed_arm.find('}').unwrap_or(installed_arm.len())];
+        // Which outcome is which is decided by `install_record`, tested by
+        // behaviour in `each_install_outcome_records_the_right_thing`; this
+        // pins what run_async does with each.
+        let (_, clear_arm) = matchbody
+            .split_once("InstallRecord::Clear => {")
+            .expect("Clear arm not found");
+        let clear_arm = &clear_arm[..clear_arm.find('}').unwrap_or(clear_arm.len())];
         assert!(
-            installed_arm.lines().any(|l| l
+            clear_arm.lines().any(|l| l
                 .trim()
                 .starts_with("super::rollback::clear_install_failures();")),
             "the Installed outcome must clear the install-failure gate"
         );
-        // The deterministic-verification Err arm records a failure.
         assert!(
-            matchbody.contains("Err(e) if is_release_verification_failure(e) =>")
-                && matchbody.contains("record_install_failure"),
-            "a verification-failure Err must record toward the gate"
+            matchbody.contains(
+                "InstallRecord::Gate => super::rollback::record_install_failure(latest_version),"
+            ),
+            "a verification failure must record toward the gate"
         );
-        // The catch-all transient Err arm must NOT record (it is a no-op).
-        let (_, after_catch) = matchbody
-            .split_once("// Transient install error: neither record nor clear")
-            .expect("transient Err arm must be present and documented");
-        let catch_body = &after_catch[..after_catch.find('}').unwrap_or(after_catch.len())];
+        // The transient arm cools the release down and leaves the gate alone.
+        let (_, cool_arm) = matchbody
+            .split_once("InstallRecord::CoolDown(error) =>")
+            .expect("CoolDown arm not found");
+        let cool_arm = &cool_arm[..cool_arm.find('\n').unwrap_or(cool_arm.len())];
         assert!(
-            !catch_body.contains("record_install_failure")
-                && !catch_body.contains("clear_install_failures"),
-            "the transient Err arm must neither record nor clear the gate"
+            !cool_arm.contains("record_install_failure")
+                && !cool_arm.contains("clear_install_failures"),
+            "the transient arm must neither record nor clear the gate: {cool_arm}"
         );
+    }
+
+    /// #5799: the updater's stderr goes to a log file under every
+    /// supervisor, and `eprintln!` panics when that write fails (a full disk),
+    /// so no production code in this file uses it; `stderr_line!` ignores the
+    /// error instead.
+    #[test]
+    fn the_updater_never_writes_stderr_with_eprintln() {
+        let src = include_str!("update.rs").replace("\r\n", "\n");
+        let production = src
+            .split_once(concat!("#[cfg(test)]\n", "mod tests {"))
+            .expect("test module")
+            .0;
+        let code: String = production
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(code.matches(concat!("eprintln", "!(")).count(), 0);
+        assert!(code.matches("stderr_line!(").count() >= 40);
+        assert!(code.contains("let _ = writeln!(io::stderr(), $($arg)*);"));
+    }
+
+    /// The wall clock at a whole second, read once: tests that compare a
+    /// record's times with their own `now` drive the code with this, so no
+    /// second boundary can fall between two readings.
+    pub(crate) fn fixed_now() -> std::time::SystemTime {
+        let secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs)
+    }
+
+    /// A local HTTP server for download tests, and how many requests it
+    /// has received.
+    pub(crate) struct PartialServer {
+        pub(crate) prefix: String,
+        pub(crate) requests: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    /// A server that answers every request with a body of `declared` bytes
+    /// (chunked, with no size, when `None`) but sends only `sent` of them,
+    /// then either stalls with the connection open (`stall`: a download a
+    /// run is killed in the middle of) or closes it (a body cut short).
+    pub(crate) async fn partial_server(
+        declared: Option<usize>,
+        sent: usize,
+        stall: bool,
+    ) -> PartialServer {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let prefix = format!("http://{}/", listener.local_addr().unwrap());
+        let requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = requests.clone();
+        tokio::spawn(async move {
+            while let Ok((mut conn, _)) = listener.accept().await {
+                let counted = counted.clone();
+                tokio::spawn(async move {
+                    let mut request = Vec::new();
+                    let mut buf = [0u8; 1024];
+                    while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match conn.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => request.extend_from_slice(&buf[..n]),
+                        }
+                    }
+                    counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let body = vec![b'x'; sent];
+                    let mut reply = match declared {
+                        Some(n) => format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {n}\r\nConnection: close\r\n\r\n"
+                        )
+                        .into_bytes(),
+                        None => b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec(),
+                    };
+                    if declared.is_none() && sent > 0 {
+                        reply.extend(format!("{sent:x}\r\n").into_bytes());
+                        reply.extend(&body);
+                        reply.extend(b"\r\n");
+                    } else {
+                        reply.extend(&body);
+                    }
+                    #[allow(clippy::let_underscore_must_use)]
+                    let _ = conn.write_all(&reply).await;
+                    if stall {
+                        tokio::time::sleep(std::time::Duration::from_secs(120)).await;
+                    } else {
+                        #[allow(clippy::let_underscore_must_use)]
+                        let _ = conn.shutdown().await;
+                    }
+                });
+            }
+        });
+        PartialServer { prefix, requests }
+    }
+
+    /// A server whose responses declare `declared` bytes, send `sent`, and
+    /// stall.
+    pub(crate) async fn stalling_server(declared: usize, sent: usize) -> String {
+        partial_server(Some(declared), sent, true).await.prefix
+    }
+
+    /// Run `work` until `done` holds (checked every 10 ms, for at most a
+    /// minute), then drop it, as a kill would. Panics if `work` finishes
+    /// first or `done` never holds.
+    pub(crate) async fn run_until<T>(
+        work: impl std::future::Future<Output = T>,
+        mut done: impl FnMut() -> bool,
+    ) {
+        let wait = async {
+            for _ in 0..6000 {
+                if done() {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            panic!("the condition never held");
+        };
+        tokio::select! {
+            _ = work => panic!("the work finished before the condition held"),
+            () = wait => {}
+        }
+    }
+
+    /// #5799: an updater download systemd kills mid-way (here: abandoned)
+    /// leaves its Content-Length charged; one that completes is reconciled
+    /// to what arrived.
+    #[tokio::test]
+    async fn an_abandoned_updater_download_leaves_its_precharge() {
+        use rollback::download_bytes_at;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let now = fixed_now();
+        let clock = move || now;
+        let prefix = stalling_server(3_000_000, 100).await;
+        let meter = updater_meter_at(Some(dir), true, &clock).unwrap();
+        // Killed once the charge lands (it must, before any body byte is
+        // counted); the download is dropped unfinished.
+        run_until(
+            download_file(&format!("{prefix}dmg"), &dir.join("dmg"), true, &meter),
+            || download_bytes_at(dir, now) > 0,
+        )
+        .await;
+        assert_eq!(download_bytes_at(dir, now), 3_000_000);
+    }
+
+    /// #5799: an updater download whose body the server ends short of its
+    /// Content-Length fails, and is still reconciled: the ledger ends at
+    /// the bytes that arrived, not at the pre-charge.
+    #[tokio::test]
+    async fn a_short_updater_download_is_reconciled_to_what_arrived() {
+        use rollback::download_bytes_at;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let now = fixed_now();
+        let clock = move || now;
+        let server = partial_server(Some(3_000_000), 1_000_000, false).await;
+        let meter = updater_meter_at(Some(dir), true, &clock).unwrap();
+        let result = download_file(
+            &format!("{}asset", server.prefix),
+            &dir.join("asset"),
+            true,
+            &meter,
+        )
+        .await;
+        assert!(result.is_err(), "the body ends short");
+        assert_eq!(download_bytes_at(dir, now), 1_000_000);
+    }
+
+    /// #5799: the updater draws on the byte budget staging uses, per node
+    /// per day. A spent budget refuses an updater run before it requests the
+    /// asset list; `--force` is never refused.
+    #[test]
+    fn the_updater_shares_the_staging_byte_budget() {
+        use rollback::{DOWNLOAD_BYTES_PER_DAY, charge_download_bytes_at};
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let now = fixed_now();
+        let clock = move || now;
+        assert!(updater_meter_at(Some(dir), true, &clock).is_some());
+        charge_download_bytes_at(dir, DOWNLOAD_BYTES_PER_DAY, now);
+        assert!(updater_meter_at(Some(dir), true, &clock).is_none());
+        assert!(updater_meter_at(Some(dir), false, &clock).is_some());
+        assert!(updater_meter_at(None, true, &clock).is_some());
+        // Consulted before the asset list is requested.
+        let src = include_str!("update.rs");
+        let run = &src[src.find("\n    async fn run_async(").unwrap()..];
+        let meter = run.find("let meter = match updater_meter_at(").unwrap();
+        let assets = run.find("match fetch_release_assets(&latest_tag").unwrap();
+        assert!(meter < assets);
+    }
+
+    /// Only a run the supervisor started after the node stopped, without
+    /// `--force`, is refused by a spent budget. A manual `freenet update` or
+    /// a tray "Check for Updates" (no stop status passed) is charged but never
+    /// refused.
+    #[tokio::test]
+    async fn manual_runs_are_charged_but_never_refused() {
+        use rollback::{DOWNLOAD_BYTES_PER_DAY, charge_download_bytes_at, download_bytes_at};
+        assert!(budget_limits(false, true), "supervised");
+        assert!(!budget_limits(false, false), "manual or tray");
+        assert!(!budget_limits(true, true), "--force");
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let now = fixed_now();
+        let clock = move || now;
+        charge_download_bytes_at(dir, DOWNLOAD_BYTES_PER_DAY, now);
+        assert!(updater_meter_at(Some(dir), budget_limits(false, true), &clock).is_none());
+        let meter = updater_meter_at(Some(dir), budget_limits(false, false), &clock)
+            .expect("a manual run is not refused");
+        let server = httptest::Server::run();
+        server.expect(
+            httptest::Expectation::matching(httptest::matchers::request::method_path(
+                "GET", "/asset",
+            ))
+            .respond_with(httptest::responders::status_code(200).body(vec![1u8; 700])),
+        );
+        download_file(&server.url_str("/asset"), &dir.join("asset"), true, &meter)
+            .await
+            .unwrap();
+        assert_eq!(
+            download_bytes_at(dir, now),
+            DOWNLOAD_BYTES_PER_DAY + 700,
+            "but it is charged"
+        );
+    }
+
+    /// A supervised run the spent budget refuses exits as "already up to
+    /// date" (2), holds the release without counting a failure, and says how
+    /// to override it.
+    #[test]
+    fn a_refused_updater_run_holds_and_says_how_to_override() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let now = fixed_now();
+        rollback::record_update_failure_at(
+            dir,
+            "9.9.9",
+            "earlier",
+            now - std::time::Duration::from_secs(5 * 3600),
+            0.5,
+        );
+        rollback::charge_download_bytes_at(dir, 1, now);
+        let mut out = Vec::new();
+        let code = spent_budget_exit_at(Some(dir), "9.9.9", "the budget is spent", now, &mut out);
+        assert_eq!(code, EXIT_CODE_ALREADY_UP_TO_DATE);
+        assert_eq!(EXIT_CODE_ALREADY_UP_TO_DATE, 2);
+        let record = rollback::read_update_cooldown_at(dir).unwrap();
+        assert_eq!(
+            (record.version.as_str(), record.failures),
+            ("9.9.9", 1),
+            "not counted"
+        );
+        assert_eq!(record.hold_reason.as_deref(), Some("the budget is spent"));
+        assert!(rollback::update_cooldown_remaining_at(dir, "9.9.9", now).is_some());
+        let line = String::from_utf8(out).unwrap();
+        assert!(
+            line.contains("the budget is spent") && line.contains("freenet update --force"),
+            "{line}"
+        );
+        // The real exit goes through it.
+        let src = include_str!("update.rs");
+        let exit = &src[src.find("\nfn exit_for_spent_budget(").unwrap()..];
+        let exit: String = exit[..exit.find("\n}\n").unwrap()]
+            .split_whitespace()
+            .collect();
+        assert!(
+            exit.contains("std::process::exit(spent_budget_exit_at("),
+            "{exit}"
+        );
+    }
+
+    /// Turns [`spent_budget_exit_subprocess`] from a no-op test into the real
+    /// spent-budget exit, holding in the state directory this names.
+    const SPENT_BUDGET_EXIT_ENV: &str = "FREENET_TEST_SPENT_BUDGET_EXIT";
+
+    /// Not a test of its own: a no-op unless
+    /// [`the_spent_budget_exit_holds_the_release_being_installed`]
+    /// re-executes this binary filtered to it, since the exit ends the
+    /// process.
+    #[test]
+    fn spent_budget_exit_subprocess() {
+        let Some(dir) = std::env::var_os(SPENT_BUDGET_EXIT_ENV) else {
+            return;
+        };
+        super::super::auto_update::TestStateDir::point_this_thread_at(dir.into());
+        exit_for_spent_budget("9.9.9", "today's download budget is spent");
+    }
+
+    /// #5799: the real spent-budget exit, in a process of its own: it finds
+    /// the state directory itself, holds the release being installed there
+    /// until the budget resets (at most the longest cooldown) without
+    /// counting a failure, says so on stderr, and exits as "already up to
+    /// date". Both of `run_async`'s refusals pass that release, the one
+    /// whose asset list the run would fetch, never the current version.
+    #[test]
+    fn the_spent_budget_exit_holds_the_release_being_installed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let now = std::time::SystemTime::now();
+        let unix =
+            |t: std::time::SystemTime| t.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        let long_ago = now - std::time::Duration::from_secs(5 * 3600);
+        for _ in 0..2 {
+            rollback::record_update_failure_at(dir, "9.9.9", "earlier", long_ago, 0.5);
+        }
+        rollback::charge_download_bytes_at(dir, rollback::DOWNLOAD_BYTES_PER_DAY, now);
+        let before = unix(std::time::SystemTime::now());
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "commands::update::tests::spent_budget_exit_subprocess",
+                "--exact",
+                "--nocapture",
+                "--test-threads",
+                "1",
+            ])
+            .env(SPENT_BUDGET_EXIT_ENV, dir)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .expect("re-execute the test binary");
+        let after = unix(std::time::SystemTime::now());
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        // Also proves the child ran the helper: a renamed helper runs no
+        // test and exits 0 without this line.
+        assert!(
+            stderr.contains("Freenet update to 9.9.9 not downloaded")
+                && stderr.contains("freenet update --force"),
+            "{stderr}"
+        );
+        assert_eq!(out.status.code(), Some(EXIT_CODE_ALREADY_UP_TO_DATE));
+        let record = rollback::read_update_cooldown_at(dir).expect("held in the state directory");
+        assert_eq!(
+            (record.version.as_str(), record.failures),
+            ("9.9.9", 2),
+            "the release being installed, not counted"
+        );
+        assert_eq!(
+            record.hold_reason.as_deref(),
+            Some("today's download budget is spent")
+        );
+        let cap = rollback::UPDATE_COOLDOWN_MAX.as_secs();
+        assert!(
+            (before + cap..=after + cap).contains(&record.retry_at_unix),
+            "the budget resets in a day, so the hold runs to the cap: {record:?}"
+        );
+        // The release `run_async` holds at both refusals.
+        let src = include_str!("update.rs");
+        let production = src
+            .split_once(concat!("#[cfg(test)]\n", "mod tests {"))
+            .unwrap()
+            .0;
+        let run = &production[production.find("\n    async fn run_async(").unwrap()..];
+        let run: String = run[..run.find("\n    }\n").unwrap()]
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<String>()
+            .split_whitespace()
+            .collect();
+        assert_eq!(run.matches("exit_for_spent_budget(").count(), 2, "{run}");
+        for call in [
+            "None=>exit_for_spent_budget(latest_version,\"today'sdownloadbudgetisspent\"),};",
+            "InstallRecord::Hold(error)=>exit_for_spent_budget(latest_version,&error),",
+        ] {
+            assert!(run.contains(call), "run_async: `{call}`");
+        }
+    }
+
+    /// Without a state directory nothing can be charged, and the meter must
+    /// not refuse either: that would stop updates altogether.
+    #[test]
+    fn no_state_dir_gives_an_unlimited_meter() {
+        let meter = updater_meter_at(None, true, &std::time::SystemTime::now).unwrap();
+        assert!(meter.check().is_ok());
+        assert!(meter.spend(1 << 30).is_ok());
+        assert!(meter.check().is_ok());
+    }
+
+    /// Every updater download (the freenet archive, fdev, the macOS DMG)
+    /// charges the run's shared meter, never one of its own.
+    #[test]
+    fn every_updater_download_uses_the_shared_meter() {
+        let src = include_str!("update.rs");
+        let production = src
+            .split_once(concat!("#[cfg(test)]\n", "mod tests {"))
+            .unwrap()
+            .0;
+        let flat: String = production.split_whitespace().collect();
+        let calls: Vec<&str> = flat
+            .match_indices("download_file(")
+            .map(|(at, _)| {
+                let rest = &flat[at..];
+                &rest[..rest.find(".await").unwrap()]
+            })
+            .filter(|call| !call.starts_with("download_file(url"))
+            .collect();
+        assert_eq!(calls.len(), 3, "{calls:?}");
+        for call in calls {
+            assert!(
+                call.replace(",)", ")").ends_with(",self.quiet,meter)"),
+                "{call}"
+            );
+        }
+        for method in [
+            "asyncfndownload_and_install(",
+            "asyncfntry_update_fdev(",
+            "asyncfnmaybe_perform_bundle_update(",
+        ] {
+            let body = &flat[flat.find(method).unwrap()..];
+            let body = &body[..body[1..].find("asyncfn").map_or(body.len(), |e| e + 1)];
+            assert!(
+                !body.contains("ByteMeter::new("),
+                "{method} makes its own meter"
+            );
+            let signature = &body[..body.find('{').unwrap()];
+            assert!(
+                signature.contains("&staged::ByteMeter<'_>"),
+                "{method} takes the meter"
+            );
+        }
+    }
+
+    /// #5799: an updater download charges what it receives to the release's
+    /// budget record, and one that runs out of budget mid-download stops and
+    /// is held, not counted.
+    #[tokio::test]
+    async fn updater_downloads_charge_the_byte_budget() {
+        use rollback::{DOWNLOAD_BYTES_PER_DAY, charge_download_bytes_at, download_bytes_at};
+        let body = vec![7u8; 1000];
+        let server = httptest::Server::run();
+        server.expect(
+            httptest::Expectation::matching(httptest::matchers::request::method_path(
+                "GET", "/asset",
+            ))
+            .times(2)
+            .respond_with(httptest::responders::status_code(200).body(body.clone())),
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let now = fixed_now();
+        let clock = move || now;
+        let dest = dir.join("asset");
+        let meter = updater_meter_at(Some(dir), true, &clock).unwrap();
+        download_file(&server.url_str("/asset"), &dest, true, &meter)
+            .await
+            .unwrap();
+        assert_eq!(download_bytes_at(dir, now), 1000);
+        // 500 bytes left: the download is stopped and the budget is spent.
+        charge_download_bytes_at(dir, DOWNLOAD_BYTES_PER_DAY - 1500, now);
+        let meter = updater_meter_at(Some(dir), true, &clock).unwrap();
+        let err = download_file(&server.url_str("/asset"), &dest, true, &meter)
+            .await
+            .unwrap_err();
+        assert!(download_bytes_at(dir, now) >= DOWNLOAD_BYTES_PER_DAY);
+        assert!(matches!(install_record(&Err(err)), InstallRecord::Hold(_)));
+        // Spent: refused before any request (the server expects only two).
+        let spent = staged::ByteMeter::new(0);
+        assert!(
+            download_file(&server.url_str("/asset"), &dest, true, &spent)
+                .await
+                .is_err()
+        );
+    }
+
+    /// What the updater records for each install outcome, by
+    /// behaviour rather than source. A verification failure goes to the #4073
+    /// gate and never to the cooldown; every other failure cools the release
+    /// down carrying its full error chain; an install clears.
+    #[test]
+    fn each_install_outcome_records_the_right_thing() {
+        assert_eq!(
+            install_record(&Ok(InstallOutcome::Installed)),
+            InstallRecord::Clear
+        );
+        assert_eq!(
+            install_record(&Ok(InstallOutcome::BundleSkipped {
+                verification_failure: true
+            })),
+            InstallRecord::Gate
+        );
+        assert!(matches!(
+            install_record(&Ok(InstallOutcome::BundleSkipped {
+                verification_failure: false
+            })),
+            InstallRecord::CoolDown(e) if e.contains("app bundle")
+        ));
+        let bad = anyhow::Error::new(ReleaseVerificationError("checksum mismatch".into()))
+            .context("installing");
+        assert_eq!(install_record(&Err(bad)), InstallRecord::Gate);
+        let network =
+            anyhow::anyhow!("connection reset by peer").context("Failed to download file");
+        assert_eq!(
+            install_record(&Err(network)),
+            InstallRecord::CoolDown("Failed to download file: connection reset by peer".into())
+        );
+        // `--check` never touches the cooldown; a real run holds.
+        assert!(!holds_on_skip(true));
+        assert!(holds_on_skip(false));
+    }
+
+    /// A failed install records its error against the release and writes
+    /// the line the supervisor's log shows; without a state directory it
+    /// still writes the line, with no streak.
+    #[test]
+    fn a_noted_install_failure_records_and_reports_its_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let now = std::time::SystemTime::now();
+        let mut out = Vec::new();
+        for _ in 0..2 {
+            note_install_failure_at(Some(tmp.path()), "0.2.141", "disk full", now, &mut out);
+        }
+        let record = rollback::read_update_cooldown_at(tmp.path()).unwrap();
+        assert_eq!(
+            (
+                record.version.as_str(),
+                record.failures,
+                record.last_error.as_str()
+            ),
+            ("0.2.141", 2, "disk full")
+        );
+        let text = String::from_utf8(out).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 2);
+        assert!(
+            lines[1]
+                .starts_with("Freenet update to 0.2.141 failed (failure 2 in a row): disk full."),
+            "{text}"
+        );
+        let mut out = Vec::new();
+        note_install_failure_at(None, "0.2.141", "boom", now, &mut out);
+        assert!(
+            String::from_utf8(out)
+                .unwrap()
+                .starts_with("Freenet update to 0.2.141 failed: boom.")
+        );
+    }
+
+    /// The line the supervisor's log shows names the release,
+    /// the streak when it was recorded, and the whole error.
+    #[test]
+    fn the_install_failure_line_carries_the_error() {
+        let line = install_failure_line("0.2.141", "Failed to download file: timed out", Some(2));
+        assert!(
+            line.starts_with(
+                "Freenet update to 0.2.141 failed (failure 2 in a row): \
+                 Failed to download file: timed out."
+            ),
+            "{line}"
+        );
+        let line = install_failure_line("0.2.141", "boom", None);
+        assert!(
+            line.starts_with("Freenet update to 0.2.141 failed: boom."),
+            "{line}"
+        );
+    }
+
+    /// #5799: the updater records a failed install, holds (without counting)
+    /// on every exit that attempted no download, never touches the cooldown
+    /// under `--check`, sends verification failures to the #4073 gate, and
+    /// clears the record on an install or an up-to-date node. Function-bounded
+    /// scrapes, since `run_async` needs GitHub and the real state directory.
+    #[test]
+    fn the_updater_keeps_the_cooldown_record() {
+        let src = include_str!("update.rs").replace("\r\n", "\n");
+        let production = src
+            .split_once(concat!("#[cfg(test)]\n", "mod tests {"))
+            .expect("test module")
+            .0;
+        let region = |signature: &str, end: &str| -> String {
+            let at = production
+                .find(signature)
+                .unwrap_or_else(|| panic!("{signature}"));
+            let body = &production[at..];
+            body[..body
+                .find(end)
+                .unwrap_or_else(|| panic!("end of {signature}"))]
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .collect::<String>()
+                .split_whitespace()
+                .collect()
+        };
+        let run_async = region("\n    async fn run_async(", "\n    }\n");
+        for needle in [
+            "lethold_on_skip=holds_on_skip(self.check);",
+            "letlatest_tag=matchprobe_latest_tag(self.force,self.quiet,hold_on_skip).await{",
+            "Err(e)=>{ifhold_on_skip{hold_staged_release(&e);}returnErr(e);}",
+            "Err(e)=>{note_install_failure(latest_version,&format!(\"{e:#}\"));returnErr(e);}",
+            "matchinstall_record(&install_result){",
+            "InstallRecord::Gate=>super::rollback::record_install_failure(latest_version),",
+            "InstallRecord::CoolDown(error)=>note_install_failure(latest_version,&error),\
+             InstallRecord::Hold(error)=>exit_for_spent_budget(latest_version,&error),}install_result",
+            // #5799: the shared byte budget is consulted before the asset
+            // list is requested, and a staged copy still installs.
+            "letmeter=matchupdater_meter_at(super::auto_update::state_dir().as_deref(),\
+             budget_limits(self.force,rollback::post_stop_status_present()),\
+             &std::time::SystemTime::now,){Some(meter)=>meter,\
+             Noneifstaged::is_staged(&latest_tag)=>staged::ByteMeter::new(0),\
+             None=>exit_for_spent_budget(",
+        ] {
+            assert!(run_async.contains(needle), "run_async: `{needle}`");
+        }
+        assert_eq!(
+            run_async
+                .matches("super::rollback::clear_update_cooldown();")
+                .count(),
+            2
+        );
+        let probe = region("\nasync fn probe_latest_tag(", "\n}\n");
+        assert_eq!(
+            probe.matches("ifhold_on_skip{hold_staged_release(").count(),
+            3
+        );
+        assert_eq!(
+            probe
+                .matches("std::process::exit(EXIT_CODE_ALREADY_UP_TO_DATE)")
+                .count(),
+            3
+        );
+        assert!(!probe.contains("note_install_failure"));
+        let assets = region("\nasync fn fetch_release_assets(", "\n}\n");
+        assert!(assets.contains("super::rollback::hold_update_without_counting("));
+        let note = region("\nfn note_install_failure(", "\n}\n");
+        assert!(note.contains(
+            "note_install_failure_at(super::auto_update::state_dir().as_deref(),version,error,\
+             std::time::SystemTime::now(),&mutio::stderr(),);"
+        ));
+        let hold = region("\nfn hold_staged_release(", "\n}\n");
+        assert!(hold.contains("staged::hold_staged_release(&format!(\"{error:#}\"));"));
     }
 
     // ---- Ed25519 release-manifest signing + verification (auto-update). ----

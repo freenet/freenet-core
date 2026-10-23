@@ -31,6 +31,8 @@ const LOG_RETENTION_MINUTES: i64 = 30;
 /// Maximum size of each log stream in the report (2 MB for the main log and
 /// 2 MB for the error log)
 const MAX_TOTAL_LOG_SIZE: usize = 2 * 1024 * 1024;
+/// How much of the service wrapper's log a report carries, from its end.
+const MAX_WRAPPER_LOG_SIZE: usize = 64 * 1024;
 /// Maximum length for a single log line (10 KB) - longer lines are truncated
 const MAX_LINE_LENGTH: usize = 10 * 1024;
 /// Default WebSocket API port
@@ -90,6 +92,11 @@ pub struct DiagnosticReport {
     /// silently drops the field without telling us why.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub network_status_error: Option<String>,
+    /// Why auto-update is holding off, when an update recently failed to
+    /// download (#5799). Read from the state directory, so it is present even
+    /// when the failure is older than the log window.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_update_status: Option<String>,
     /// User's problem description
     pub user_message: Option<String>,
 }
@@ -123,6 +130,12 @@ pub struct LogContents {
     /// Original size of the error log file on disk
     #[serde(default)]
     pub error_log_original_size_bytes: u64,
+    /// The end of the service wrapper's log (Windows, and the macOS tray
+    /// path), which holds `freenet update`'s output, so a failed auto-update
+    /// shows why (#5799). Its lines carry no date, so it is cut by size
+    /// rather than by the time window the node's logs use.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wrapper_log: Option<String>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -193,6 +206,7 @@ impl ReportCommand {
             Ok(diag) => (Some(diag), None),
             Err(e) => (None, Some(e)),
         };
+        let auto_update_status = super::rollback::update_cooldown_summary(version);
         let user_message = self.get_user_message()?;
 
         let client_timestamp = chrono::Utc::now().to_rfc3339();
@@ -205,6 +219,7 @@ impl ReportCommand {
             config,
             network_status,
             network_status_error,
+            auto_update_status,
             user_message,
         })
     }
@@ -232,6 +247,7 @@ impl ReportCommand {
             error_log_size_bytes: error_log_size,
             main_log_original_size_bytes: main_log_original_size,
             error_log_original_size_bytes: error_log_original_size,
+            wrapper_log: read_wrapper_log_tail(&log_dir, MAX_WRAPPER_LOG_SIZE),
         })
     }
 
@@ -331,47 +347,8 @@ impl ReportCommand {
     }
 
     fn print_summary(&self, report: &DiagnosticReport) {
-        println!(
-            "  - Version: {} ({}{})",
-            report.version_info.version,
-            report.version_info.git_commit,
-            if report.version_info.git_dirty {
-                " dirty"
-            } else {
-                ""
-            }
-        );
-        println!(
-            "  - OS: {} {}",
-            report.system_info.os, report.system_info.arch
-        );
-
-        let filtered_size = report.logs.main_log_size_bytes + report.logs.error_log_size_bytes;
-        let original_size =
-            report.logs.main_log_original_size_bytes + report.logs.error_log_original_size_bytes;
-        if original_size > filtered_size && filtered_size > 0 {
-            println!(
-                "  - Logs: {} (last {} min, {} total on disk)",
-                format_bytes(filtered_size),
-                LOG_RETENTION_MINUTES,
-                format_bytes(original_size)
-            );
-        } else {
-            println!("  - Logs: {}", format_bytes(original_size));
-        }
-
-        println!(
-            "  - Config: {}",
-            if report.config.is_some() {
-                "found"
-            } else {
-                "not found"
-            }
-        );
-        match (&report.network_status, &report.network_status_error) {
-            (Some(_), _) => println!("  - Node status: running"),
-            (None, Some(err)) => println!("  - Node status: unreachable ({err})"),
-            (None, None) => println!("  - Node status: not running or unreachable"),
+        for line in summary_lines(report) {
+            println!("{line}");
         }
     }
 
@@ -461,6 +438,63 @@ impl ReportCommand {
 
         Ok(())
     }
+}
+
+/// The summary `freenet service report` prints before uploading.
+fn summary_lines(report: &DiagnosticReport) -> Vec<String> {
+    let mut lines = Vec::new();
+    lines.push(format!(
+        "  - Version: {} ({}{})",
+        report.version_info.version,
+        report.version_info.git_commit,
+        if report.version_info.git_dirty {
+            " dirty"
+        } else {
+            ""
+        }
+    ));
+    lines.push(format!(
+        "  - OS: {} {}",
+        report.system_info.os, report.system_info.arch
+    ));
+
+    let filtered_size = report.logs.main_log_size_bytes + report.logs.error_log_size_bytes;
+    let original_size =
+        report.logs.main_log_original_size_bytes + report.logs.error_log_original_size_bytes;
+    if original_size > filtered_size && filtered_size > 0 {
+        lines.push(format!(
+            "  - Logs: {} (last {} min, {} total on disk)",
+            format_bytes(filtered_size),
+            LOG_RETENTION_MINUTES,
+            format_bytes(original_size)
+        ));
+    } else {
+        lines.push(format!("  - Logs: {}", format_bytes(original_size)));
+    }
+    if let Some(wrapper) = &report.logs.wrapper_log {
+        lines.push(format!(
+            "  - Service wrapper log: {}",
+            format_bytes(wrapper.len() as u64)
+        ));
+    }
+
+    lines.push(format!(
+        "  - Config: {}",
+        if report.config.is_some() {
+            "found"
+        } else {
+            "not found"
+        }
+    ));
+    match (&report.network_status, &report.network_status_error) {
+        (Some(_), _) => lines.push("  - Node status: running".to_string()),
+        (None, Some(err)) => lines.push(format!("  - Node status: unreachable ({err})")),
+        (None, None) => lines.push("  - Node status: not running or unreachable".to_string()),
+    }
+    if let Some(status) = &report.auto_update_status {
+        lines.push(format!("  - Auto-update: {status}"));
+    }
+    lines
 }
 
 /// Context for a failed send, with the trust summary only when it explains the
@@ -590,6 +624,23 @@ fn find_log_files(log_dir: &PathBuf, prefix: &str) -> Vec<PathBuf> {
     });
 
     files
+}
+
+/// The last `max_bytes` of the newest service wrapper log
+/// (`freenet-wrapper.YYYY-MM-DD.log`), starting at a line boundary, or `None`
+/// when there is none.
+fn read_wrapper_log_tail(log_dir: &PathBuf, max_bytes: usize) -> Option<String> {
+    let newest = find_log_files(log_dir, "freenet-wrapper")
+        .into_iter()
+        .next()?;
+    let bytes = fs::read(newest).ok()?;
+    let start = bytes.len().saturating_sub(max_bytes);
+    let tail = &bytes[start..];
+    let tail = match (start > 0, tail.iter().position(|&b| b == b'\n')) {
+        (true, Some(newline)) => &tail[newline + 1..],
+        _ => tail,
+    };
+    (!tail.is_empty()).then(|| String::from_utf8_lossy(tail).into_owned())
 }
 
 /// Read and merge multiple log files, filtering to the last 30 minutes.
@@ -931,7 +982,8 @@ mod tests {
     /// behind such proxies with `UnknownIssuer` and those tests stay green.
     #[test]
     fn upload_client_is_built_with_os_root_certificates() {
-        let src = include_str!("report.rs");
+        // CRLF-normalised for a Windows checkout, so the `\n` anchors match.
+        let src = &include_str!("report.rs").replace("\r\n", "\n");
         // Production hands the upload a fresh builder (tests pass one that
         // ignores proxy settings)...
         let entry = item_code(src, "    async fn upload_report(", "\n    }\n");
@@ -1009,10 +1061,12 @@ mod tests {
                 error_log_size_bytes: 0,
                 main_log_original_size_bytes: 0,
                 error_log_original_size_bytes: 0,
+                wrapper_log: None,
             },
             config: None,
             network_status: None,
             network_status_error: None,
+            auto_update_status: None,
             user_message: None,
         }
     }
@@ -1359,10 +1413,12 @@ mod tests {
                 error_log_size_bytes: 0,
                 main_log_original_size_bytes: 100,
                 error_log_original_size_bytes: 0,
+                wrapper_log: None,
             },
             config: None,
             network_status: None,
             network_status_error: None,
+            auto_update_status: None,
             user_message: Some("Test message".to_string()),
         };
 
@@ -1866,6 +1922,123 @@ stack backtrace:
         );
     }
 
+    /// Of several wrapper logs the newest (by modification
+    /// time) is the one carried, cut to the size cap.
+    #[test]
+    fn the_report_carries_the_newest_wrapper_log() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
+        let now = std::time::SystemTime::now();
+        let day = std::time::Duration::from_secs(24 * 3600);
+        for (name, body, age) in [
+            ("freenet-wrapper.2026-10-18.log", "old day\n", day * 2),
+            (
+                "freenet-wrapper.2026-10-19.log",
+                "newest\n",
+                std::time::Duration::ZERO,
+            ),
+            (
+                "freenet-wrapper.2026-10-20.log",
+                "stale despite its name\n",
+                day,
+            ),
+        ] {
+            fs::write(dir.join(name), body.repeat(100)).unwrap();
+            fs::File::options()
+                .write(true)
+                .open(dir.join(name))
+                .unwrap()
+                .set_modified(now - age)
+                .unwrap();
+        }
+        let tail = read_wrapper_log_tail(&dir, 64).unwrap();
+        assert!(tail.len() <= 64, "{}", tail.len());
+        assert!(tail.lines().all(|line| line == "newest"), "{tail}");
+        // The report carries at most this much of it.
+        assert_eq!(MAX_WRAPPER_LOG_SIZE, 64 * 1024);
+    }
+
+    /// The Windows wrapper writes `freenet update`'s
+    /// output to `freenet-wrapper.YYYY-MM-DD.log`, which the node-log pattern
+    /// never matched. The report carries the newest one's end, cut at a line.
+    #[test]
+    fn the_report_carries_the_end_of_the_wrapper_log() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
+        assert_eq!(read_wrapper_log_tail(&dir, 64), None);
+        fs::write(dir.join("freenet.2026-10-15.log"), "node line\n").unwrap();
+        assert_eq!(read_wrapper_log_tail(&dir, 64), None, "not a wrapper log");
+        let mut log = String::new();
+        for i in 0..20 {
+            log.push_str(&format!("12:00:{i:02}: line {i}\n"));
+        }
+        log.push_str("Freenet update to 0.2.141 failed: connection reset\n");
+        fs::write(dir.join("freenet-wrapper.2026-10-15.log"), &log).unwrap();
+        let tail = read_wrapper_log_tail(&dir, 80).unwrap();
+        assert!(tail.ends_with("connection reset\n"), "{tail}");
+        assert!(tail.len() <= 80);
+        assert!(
+            tail.starts_with("12:") || tail.starts_with("Freenet"),
+            "starts at a line: {tail}"
+        );
+        let whole = read_wrapper_log_tail(&dir, 64 * 1024).unwrap();
+        assert_eq!(whole, log);
+        let report = ReportCommand {
+            local: None,
+            message: None,
+            no_message: true,
+            server: String::new(),
+        };
+        let logs = report.collect_logs(Some(dir)).unwrap();
+        assert!(logs.wrapper_log.unwrap().contains("connection reset"));
+    }
+
+    /// #5799: the report carries why auto-update is holding off, taken from
+    /// the cooldown record for this binary's version, omitted when there is
+    /// none, and printed in the summary.
+    #[test]
+    fn the_report_carries_the_auto_update_status() {
+        // Gathered by collect_report from the record for this binary's
+        // version, and put in the report. Bounded to that method, so a match
+        // elsewhere in the file (this test's own text included) cannot count.
+        let src = include_str!("report.rs").replace("\r\n", "\n");
+        let collect = item_code(&src, "    fn collect_report(", "\n    }\n");
+        assert!(
+            collect.contains(
+                "letauto_update_status=super::rollback::update_cooldown_summary(version);"
+            ),
+            "{collect}"
+        );
+        assert!(collect.contains("network_status_error,auto_update_status,user_message,})"));
+        // Printed in the summary: behaviour, not source.
+        let mut report = sample_report();
+        assert!(
+            !summary_lines(&report)
+                .iter()
+                .any(|line| line.contains("Auto-update"))
+        );
+        report.auto_update_status = Some("Update to 0.2.141 failed 1 time(s)".into());
+        assert_eq!(
+            summary_lines(&report).last().map(String::as_str),
+            Some("  - Auto-update: Update to 0.2.141 failed 1 time(s)")
+        );
+        report.auto_update_status = None;
+        let src = include_str!("report.rs").replace("\r\n", "\n");
+        let print = item_code(&src, "    fn print_summary(", "\n    }\n");
+        assert!(
+            print.contains("forlineinsummary_lines(report){println!(\"{line}\");}"),
+            "{print}"
+        );
+        assert!(
+            !serde_json::to_string(&report)
+                .unwrap()
+                .contains("auto_update_status")
+        );
+        report.auto_update_status = Some("Update to 0.2.141 failed 1 time(s)".into());
+        let json = serde_json::to_string(&report).unwrap();
+        assert!(json.contains("\"auto_update_status\":\"Update to 0.2.141 failed"));
+    }
+
     /// Serialization must round-trip the new `network_status_error` field
     /// and omit it from JSON when `None` so existing report schemas stay
     /// unchanged on the server side.
@@ -1891,10 +2064,12 @@ stack backtrace:
                 error_log_size_bytes: 0,
                 main_log_original_size_bytes: 0,
                 error_log_original_size_bytes: 0,
+                wrapper_log: None,
             },
             config: None,
             network_status: None,
             network_status_error: None,
+            auto_update_status: None,
             user_message: None,
         };
 

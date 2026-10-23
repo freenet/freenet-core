@@ -103,8 +103,14 @@ file in the node's own state directory, not a property of the binary. It does no
 gate the wrapper's own `freenet update` (which clears the counter on a successful
 install), so it only stops the node's in-process update re-poll. The node lets
 that lockout expire a day after the last failure, so a locked-out peer that
-never crashes still gets one attempt a day; the wrapper needs no update logic of
-its own for that.
+never crashes still gets one attempt a day, deferred while the newer release is
+cooling down after failed downloads (#5799); the wrapper needs no update logic
+of its own for that.
+
+The download cooldown itself (#5799) is likewise node-side and needs nothing
+from this supervisor: when the node cannot fetch a release it stays on its
+current binary instead of exiting 42, and `freenet update` records its own
+failures in the same state directory.
 
 The supervisor itself (`nix/freenet-node.sh`) is a faithful port of the systemd
 unit the node generates for itself (`generate_user_service_file`,

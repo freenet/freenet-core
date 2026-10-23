@@ -450,10 +450,12 @@ pub(super) fn run_wrapper(version: &str) -> Result<()> {
     // was launched by Windows autostart and never had a console at all),
     // the inherited standard handles are invalid. ANY `Command::spawn()`
     // reachable from this function MUST explicitly set
-    // `.stdin/.stdout/.stderr(Stdio::null())` — otherwise `spawn()` fails
-    // with "The handle is invalid" (os error 6) and the child silently
-    // never starts. Known spawn sites downstream of here:
-    //   - `spawn_update_command`                   (this file)
+    // `.stdin/.stdout/.stderr` (to `Stdio::null()`, or to a file it opened)
+    // — otherwise `spawn()` fails with "The handle is invalid" (os error 6)
+    // and the child silently never starts. Known spawn sites downstream of
+    // here:
+    //   - `spawn_update_command`                   (this file; stdout/stderr
+    //     to the wrapper log, #5799)
     //   - network child in `run_wrapper_loop`      (this file, ~line 1452)
     //   - `spawn_new_wrapper`                      (this file)
     //   - `open_log_file` notepad/open/xdg-open    (tray.rs)
@@ -665,27 +667,17 @@ pub(super) fn run_wrapper(version: &str) -> Result<()> {
 /// On Windows, uses `CREATE_NO_WINDOW` to avoid flashing a console window
 /// (the wrapper has already detached from the console via `FreeConsole`).
 ///
-/// stdin/stdout/stderr are nulled on every platform. On Windows this is
-/// load-bearing: the wrapper has already called `FreeConsole()` (and may
-/// never have had a console at all when launched by autostart), so
-/// inheriting the parent's invalid standard handles makes `spawn()` fail
-/// with "The handle is invalid" (os error 6). Without these nulls, the
-/// update subprocess silently fails to start and the wrapper falls into
-/// the exit-42 / update-failed / backoff-relaunch loop documented in
-/// #3934 (which was also the root cause of "Check for Updates" being
-/// broken in #3933).
-///
-/// KNOWN GAP (#5244): nulling stderr also discards everything `freenet update`
-/// now reports about brick-safety — the WARN subscriber installed for the
-/// subcommand, and the two unconditional messages saying crash-loop rollback
-/// failed to arm. Under systemd those reach the journal; under this wrapper
-/// (Windows, and the macOS tray path) they go nowhere. `--quiet` no longer
-/// suppresses them, so the previous claim that nulling was harmless because
-/// "--quiet already suppresses all output" is no longer true. Fixing it means
-/// pointing stderr at the wrapper log (`log_wrapper_event`'s file) rather than
-/// at null — the Windows constraint above is about INHERITED invalid handles,
-/// not about needing null specifically — and threading a log dir through all
-/// five call sites.
+/// No standard handle is ever inherited. On Windows this is load-bearing:
+/// the wrapper has already called `FreeConsole()` (and may never have had a
+/// console at all when launched by autostart), so inheriting the parent's
+/// invalid standard handles makes `spawn()` fail with "The handle is invalid"
+/// (os error 6). The update subprocess then silently fails to start and the
+/// wrapper falls into the exit-42 / update-failed / backoff-relaunch loop
+/// documented in #3934 (which was also the root cause of "Check for Updates"
+/// being broken in #3933). stdin is null; stdout and stderr are appended to
+/// the wrapper log (see [`update_output_stdio`]), so the reason an update
+/// failed is in that log instead of nowhere (#5244, #5799). Under systemd the
+/// same output reaches the journal.
 ///
 /// `post_stop_exit_code` is `Some(code)` ONLY when this update runs as part of
 /// the node's restart cycle (the node exited `code` and the wrapper is applying
@@ -696,13 +688,15 @@ pub(super) fn run_wrapper(version: &str) -> Result<()> {
 /// counted toward a rollback.
 pub(super) fn spawn_update_command(
     exe_path: &Path,
+    log_dir: &Path,
     post_stop_exit_code: Option<i32>,
 ) -> std::io::Result<std::process::ExitStatus> {
+    let (stdout, stderr) = update_output_stdio(log_dir);
     let mut cmd = std::process::Command::new(exe_path);
     cmd.args(["update", "--quiet"])
         .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
+        .stdout(stdout)
+        .stderr(stderr);
 
     if let Some(code) = post_stop_exit_code {
         cmd.env(
@@ -719,6 +713,22 @@ pub(super) fn spawn_update_command(
     }
 
     cmd.status()
+}
+
+/// The stdout and stderr for a `freenet update` child: today's wrapper log,
+/// opened for append, or null when it cannot be opened. Never inherited (see
+/// [`spawn_update_command`]): a file handle is as valid a standard handle for
+/// a console-less child as null is.
+pub(super) fn update_output_stdio(log_dir: &Path) -> (std::process::Stdio, std::process::Stdio) {
+    let opened = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(wrapper_log_path(log_dir))
+        .and_then(|file| Ok((file.try_clone()?, file)));
+    match opened {
+        Ok((stdout, stderr)) => (stdout.into(), stderr.into()),
+        Err(_) => (std::process::Stdio::null(), std::process::Stdio::null()),
+    }
 }
 
 /// Spawn a new wrapper process from the (possibly updated) binary on disk.
@@ -1012,7 +1022,7 @@ fn run_wrapper_loop(
                             // Exit 2 means already up to date — no restart needed.
                             status_tx.send(WrapperStatus::Updating).ok();
                             // Manual tray check: not a crash, so no post-stop code.
-                            let result = spawn_update_command(&exe_path, None);
+                            let result = spawn_update_command(&exe_path, log_dir, None);
                             match result {
                                 Ok(s) if s.success() => {
                                     log_wrapper_event(
@@ -1110,7 +1120,7 @@ fn run_wrapper_loop(
                                 // Allow checking for updates even while stopped
                                 status_tx.send(WrapperStatus::Updating).ok();
                                 // Manual tray check: not a crash, so no post-stop code.
-                                let result = spawn_update_command(&exe_path, None);
+                                let result = spawn_update_command(&exe_path, log_dir, None);
                                 match result {
                                     Ok(s) if s.success() => {
                                         log_wrapper_event(
@@ -1197,7 +1207,7 @@ fn run_wrapper_loop(
                     "Crash (exit {exit_code}) during update probation; checking crash-loop rollback..."
                 ),
             );
-            let result = spawn_update_command(&exe_path, Some(exit_code));
+            let result = spawn_update_command(&exe_path, log_dir, Some(exit_code));
             if matches!(
                 super::super::update::classify_update_subprocess(&result),
                 super::super::update::UpdateSubprocessOutcome::BinaryReplaced
@@ -1233,7 +1243,7 @@ fn run_wrapper_loop(
 
             // Post-stop auto-update: pass the node's exit code so `freenet
             // update` can drive crash-loop auto-rollback (#4073).
-            let result = spawn_update_command(&exe_path, Some(exit_code));
+            let result = spawn_update_command(&exe_path, log_dir, Some(exit_code));
             let outcome = super::super::update::classify_update_subprocess(&result);
 
             // Drive the persistent auto-update failure counter used by
@@ -1416,7 +1426,7 @@ fn run_wrapper_loop(
                                 status_tx.send(WrapperStatus::Updating).ok();
                                 // Manual "Check for Updates" during backoff: not
                                 // a crash, so no post-stop code (#4073).
-                                let result = spawn_update_command(&exe_path, None);
+                                let result = spawn_update_command(&exe_path, log_dir, None);
                                 let outcome =
                                     super::super::update::classify_update_subprocess(&result);
 
@@ -1511,14 +1521,12 @@ const WRAPPER_LOG_RETENTION_DAYS: usize = 7;
 pub(super) fn log_wrapper_event(log_dir: &Path, message: &str) {
     use std::io::Write;
 
+    // One clock read, so the line's time and the file's date agree.
     let now = chrono::Local::now();
-    let date_str = now.format("%Y-%m-%d");
-    let log_path = log_dir.join(format!("freenet-wrapper.{date_str}.log"));
-
     if let Ok(mut file) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(&log_path)
+        .open(wrapper_log_path_on(log_dir, now))
     {
         let timestamp = now.format("%H:%M:%S");
         drop(writeln!(file, "{timestamp}: {message}"));
@@ -1528,6 +1536,16 @@ pub(super) fn log_wrapper_event(log_dir: &Path, message: &str) {
 
     // Clean up old log files (best-effort, don't let cleanup failure block anything)
     cleanup_old_wrapper_logs(log_dir);
+}
+
+/// Today's wrapper log file.
+fn wrapper_log_path(log_dir: &Path) -> std::path::PathBuf {
+    wrapper_log_path_on(log_dir, chrono::Local::now())
+}
+
+/// The wrapper log file for the day `now` falls on.
+fn wrapper_log_path_on(log_dir: &Path, now: chrono::DateTime<chrono::Local>) -> std::path::PathBuf {
+    log_dir.join(format!("freenet-wrapper.{}.log", now.format("%Y-%m-%d")))
 }
 
 /// Status the wrapper writes to `STUCK_STATUS_FILE_NAME` once a repeated,
