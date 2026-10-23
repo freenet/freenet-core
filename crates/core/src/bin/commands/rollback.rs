@@ -1406,14 +1406,19 @@ pub(crate) fn update_cooldown_remaining_at(
 
 /// The release cooling down, and for how long, if it is newer than
 /// `current_version`. This is what the update triggers check before they ask
-/// GitHub anything: they would find that same release.
+/// GitHub anything: they would find that same release. A release this node
+/// has blocked (#4073: pinned known-bad, or install-gated) holds nothing:
+/// no trigger acts on it, and a fixed release must be found promptly.
 pub(crate) fn update_cooldown_pending_at(
     dir: &Path,
     current_version: &str,
     now: SystemTime,
 ) -> Option<(String, std::time::Duration)> {
     let state = read_update_cooldown_at(dir)?;
-    if is_not_newer(&state.version, current_version) {
+    if is_not_newer(&state.version, current_version)
+        || is_version_pinned_bad_at(dir, &state.version)
+        || is_version_install_gated_at(dir, &state.version)
+    {
         return None;
     }
     let remaining = update_cooldown_remaining_at(dir, &state.version, now)?;
@@ -3309,6 +3314,38 @@ pub(crate) mod tests {
         assert!(!stale.exists());
         // Never so short that a write in progress elsewhere could be hit.
         assert!(STALE_TEMP_AGE >= std::time::Duration::from_secs(3600));
+    }
+
+    /// A cooldown for a release this node has blocked (#4073) holds no
+    /// trigger, so a fixed release is found promptly.
+    #[test]
+    fn a_blocked_release_s_cooldown_holds_nothing() {
+        let now = SystemTime::now();
+        for block in ["pin", "gate"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let dir = tmp.path();
+            record_update_failure_at(dir, "0.2.141", "x", now, 0.5);
+            assert!(update_cooldown_pending_at(dir, "0.2.140", now).is_some());
+            match block {
+                "pin" => pin_known_bad_at(dir, "0.2.141").unwrap(),
+                _ => {
+                    for _ in 0..INSTALL_FAILURE_GATE_THRESHOLD {
+                        record_install_failure_at(dir, "0.2.141");
+                    }
+                }
+            }
+            assert_eq!(
+                update_cooldown_pending_at(dir, "0.2.140", now),
+                None,
+                "{block}"
+            );
+            // Another release's block changes nothing.
+            record_update_failure_at(dir, "0.2.142", "x", now, 0.5);
+            assert!(
+                update_cooldown_pending_at(dir, "0.2.140", now).is_some(),
+                "{block}"
+            );
+        }
     }
 
     /// A supervisor that passes an empty stop status (systemd after a start
