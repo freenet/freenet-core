@@ -14,6 +14,7 @@ use quinn::ConnectionId;
 use quinn::ConnectionIdGenerator;
 // quinn does not re-export it; `validate` cannot be implemented without it.
 use quinn_proto::InvalidCid;
+use subtle::ConstantTimeEq;
 
 use crate::config::GlobalRng;
 
@@ -36,10 +37,12 @@ pub(crate) struct MacConnectionIdGenerator {
 }
 
 impl MacConnectionIdGenerator {
-    /// A new key, from [`GlobalRng`].
+    /// A new key, from the OS entropy pool (key material never comes from
+    /// `GlobalRng`; see `config::os_random`). The nonces stay on
+    /// [`GlobalRng`], so a seeded run makes the same nonces.
     pub(crate) fn new_key() -> [u8; 32] {
         let mut key = [0u8; 32];
-        GlobalRng::fill_bytes(&mut key);
+        super::config::os_random(&mut key);
         key
     }
 
@@ -69,14 +72,9 @@ impl ConnectionIdGenerator for MacConnectionIdGenerator {
             return Err(InvalidCid);
         }
         let (nonce, mac) = cid.split_at(NONCE_LEN);
-        // Compared without an early exit, so the time taken does not say how
-        // many leading bytes of a guess were right.
-        let difference = self
-            .mac(nonce)
-            .iter()
-            .zip(mac)
-            .fold(0u8, |acc, (a, b)| acc | (a ^ b));
-        if difference == 0 {
+        // Constant-time comparison (subtle), so the time taken does not say
+        // how many leading bytes of a guess were right.
+        if bool::from(self.mac(nonce)[..].ct_eq(mac)) {
             Ok(())
         } else {
             Err(InvalidCid)

@@ -133,14 +133,16 @@ endpoint's UdpPoller, #5940): Ready exactly when try_take would succeed at
 that instant (one shared predicate, `admits`), else Pending with a timer on
 the cap's TimeSource at the refill time, kept in the caller's
 AdmissionWaiter. While Pending the cap also holds the caller's waker (at most
-MAX_ADMISSION_WAKERS; a full map is woken and cleared before a new entry), and
-bytes given back (a take that sent less, or a failed send) wake every held
-waker, so a waiter is not left asleep to its old deficit. It takes nothing;
-the QUIC socket takes with try_take and sends with
-DemuxSocket::try_send_to_paced, so its datagram is charged once, by the take.
-A take larger than the burst (none today: QUIC sends one datagram per
-transmit) is admitted with a full bucket and leaves debt for the excess,
-instead of never being admitted.
+MAX_ADMISSION_WAKERS; past it an entry is dropped WITHOUT waking, its waiter
+keeps its timer). Bytes given back (a take that sent less, or a failed send)
+wake one held waker per WAKE_DATAGRAM_BYTES (1200, the QUIC datagram) the
+bucket then holds, and none if it holds less, so legacy give-backs cost N
+waiting QUIC connections nothing until a datagram fits; wakers are woken
+after the lock is released. It takes nothing; the QUIC socket takes with
+try_take and sends with DemuxSocket::try_send_to_paced, so its datagram is
+charged once, by the take. Every take is at most one datagram, within the
+burst (QUIC: one segment per transmit, debug-asserted), so the bound above
+holds exactly.
 The cap is built on RealTime even in simulation, because the listener and
 its connections run on RealTime there: a VirtualTime cap would compute
 deficits on another clock than its waiters sleep and time out on. The QUIC
@@ -637,9 +639,17 @@ sources on the allow-set (`allow_quic_source`, normalized addresses) are
 queued; the rest are dropped, so a prober gets no QUIC reply. One source
 holds at most QUIC_INGRESS_PER_SOURCE_DATAGRAMS (a quarter) of the queue, so
 one allowed or spoofed-allowed source cannot starve the other connections.
+The trade-off: a lone bulk peer, with no other connection competing, still
+gets only a quarter of the queue, so a burst larger than 256 datagrams that
+the endpoint has not yet drained is dropped (`_source_full`) even when the
+rest of the queue is empty.
 `allow_quic_source` returns a QuicSourcePermit: the address stays allowed
 while a permit for it is alive, and the set holds at most
-QUIC_ALLOWED_SOURCES_MAX addresses (past it, `allow_quic_source` refuses).
+QUIC_ALLOWED_SOURCES_MAX addresses (past it, `allow_quic_source` refuses; a
+new address reserves its place atomically). `allow_existing_quic_source`
+grants another permit only for an address allowed at that moment, in one
+step, so `accept` cannot bring back an address whose last permit was just
+dropped.
 The QUIC endpoint holds one permit per connection until quinn reports the
 connection closed, whatever closed it, and dropping its connection handle
 closes it; an address on the set is bounded by its connection's life, which
@@ -686,7 +696,8 @@ QuicSocket (quic/socket.rs) is quinn's AsyncUdpSocket:
 QuicRuntime (quic/runtime.rs): now/new_timer on the TimeSource, spawn on
   GlobalExecutor. A timer reset to a later deadline keeps its armed sleep
   (VirtualSleep has no Drop deregistration) and re-arms when it fires.
-config.rs pins every quinn and rustls value; tests pin each:
+config.rs sets every quinn and rustls value; tests pin each one quinn
+exposes (its module doc lists the few it does not):
   grease_quic_bit(false) (the demux rule depends on it), versions [1],
   max_udp_payload / initial and min MTU 1200, no MTU discovery, no GSO,
   keepalive 15 s (None when the TimeSource disables keepalive), idle = the
@@ -696,16 +707,30 @@ config.rs pins every quinn and rustls value; tests pin each:
   spin bit, migration off, max_incoming 64, incoming buffers 64 KiB / 1 MiB,
   no validation tokens, rustls ring, TLS 1.3, fixed ALPN, no SNI, no
   resumption, no early data. Keys and seeds (reset key, token key, CID key,
-  quinn's rng_seed, initial destination CIDs) come from GlobalRng.
+  quinn's rng_seed, initial destination CIDs): keys from the OS, seeds and
+  CIDs from GlobalRng (see below).
 Connection IDs (quic/cid.rs) carry a keyed BLAKE3 MAC, so quinn drops a
   short-header packet with a forged ID silently; quinn's own hashed
   generator can be spoofed and would answer it with a stateless reset.
 ```
 
 The endpoint's memory (`quic_endpoint_budget_for`) is a term in
-`declared_cache_ceiling`, zero at the shipped default (off). With QUIC on it
+`declared_cache_ceiling`, zero at the shipped default (off). The term is
+evaluated for the DEFAULT mode and connection limit, so it cannot reflect
+`prefer` or a raised `max-number-of-connections`: before c3 (the first step
+that opens QUIC connections) merges, it must use the configured values
+(TODO guard: `quic_endpoint_term_is_default_only_until_c3`). With QUIC on it
 is at least 50 MiB at the default connection count, which a 1 GiB host's
 declared caches have no room for; settle that before QUIC is offered.
+
+Key material (stateless-reset key, token key, CID MAC key) comes from the OS
+entropy pool, never GlobalRng; quinn's rng_seed and the CID nonces stay on
+GlobalRng. With `prefer`, a failed endpoint build logs a WARN and the node
+runs with QUIC off. `accept` returns the attempt without awaiting its
+handshake (QuicIncoming::establish), so one stalled handshake does not hold
+back the next. QUIC integration tests run under a watchdog thread
+(`bounded`), so a quinn driver that spins fails the test instead of hanging
+`cargo test`.
 
 In tests, two endpoints on SimulationSocket with one VirtualTime and a
 seeded GlobalRng repeat the same event trace; the bytes differ, because

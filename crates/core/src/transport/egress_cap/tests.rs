@@ -924,57 +924,65 @@ fn poll_admit_and_try_take_agree_at_the_same_instant() {
     );
 }
 
-/// Bytes given back to the bucket wake a `Pending` `poll_admit` caller at
-/// once, before its timer: a paced sender that took a full datagram's worth
-/// and sent less returns the rest, and a waiter short by less than that is
-/// admitted then instead of sleeping to its original deficit.
+/// Bytes given back to the bucket wake a `Pending` `poll_admit` caller
+/// before its timer once the bucket holds a full datagram again: a failed
+/// paced send returns its whole take. A give-back that leaves less than a
+/// datagram (a take that used most of its bytes) wakes nobody.
 #[test]
-fn bytes_given_back_wake_a_pending_poll_admit_before_its_timer() {
+fn a_give_back_wakes_a_waiter_only_when_a_datagram_fits() {
     let (cap, time) = cap_at(RATE);
-    // Leave exactly one paced take in the bucket.
-    cap.charge_unpaced(BURST as usize - PACKET);
-    let take = cap
-        .try_take(PACKET, Duration::ZERO)
-        .expect("one datagram fits");
+    cap.charge_unpaced(BURST as usize - 2 * PACKET);
+    let first = cap.try_take(PACKET, Duration::ZERO).expect("fits");
+    let second = cap.try_take(PACKET, Duration::ZERO).expect("fits");
     assert_eq!(cap.level_bytes(), 0);
 
     let (waker, counter) = counting_waker();
     let mut cx = Context::from_waker(&waker);
     let mut waiter = AdmissionWaiter::default();
-    assert!(
-        cap.poll_admit(PACKET / 2, &mut waiter, &mut cx)
-            .is_pending()
-    );
-    assert_eq!(cap.admission_waker_count(), 1);
+    assert!(cap.poll_admit(PACKET, &mut waiter, &mut cx).is_pending());
     let timer_at = waiter.wake_at_ns().expect("a timer is armed");
 
-    // The datagram used a third of the take; two thirds come back.
-    take.sent(PACKET / 3);
+    // Used 1000 of 1200: 200 come back, not a datagram's worth.
+    first.sent(1000);
+    assert_eq!(woken(&counter), 0, "too little came back to wake anyone");
+    assert_eq!(cap.admission_waker_count(), 1);
+
+    // A failed send returns all 1200: now 1400, a datagram fits.
+    drop(second);
     assert_eq!(woken(&counter), 1, "the give-back woke the waiter");
     assert!(time.now_nanos() < timer_at, "before its timer would have");
     assert_eq!(cap.admission_waker_count(), 0, "a woken waker is dropped");
-    assert!(cap.poll_admit(PACKET / 2, &mut waiter, &mut cx).is_ready());
-
-    // A dropped take (a failed send) gives everything back, and wakes too.
-    let (cap, _time) = cap_at(RATE);
-    cap.charge_unpaced(BURST as usize - PACKET);
-    let take = cap
-        .try_take(PACKET, Duration::ZERO)
-        .expect("one datagram fits");
-    let (waker, counter) = counting_waker();
-    let mut cx = Context::from_waker(&waker);
-    let mut waiter = AdmissionWaiter::default();
-    assert!(cap.poll_admit(PACKET, &mut waiter, &mut cx).is_pending());
-    drop(take);
-    assert_eq!(woken(&counter), 1, "a dropped take woke the waiter");
     assert!(cap.poll_admit(PACKET, &mut waiter, &mut cx).is_ready());
 }
 
-/// The cap never holds more than `MAX_ADMISSION_WAKERS` wakers: waiters that
-/// went away while `Pending` are woken and dropped when the map is full,
-/// rather than kept forever.
+/// A give-back wakes one waiter per datagram's worth the bucket then holds,
+/// not every waiter: N waiting QUIC connections do not cost N wakeups per
+/// legacy datagram.
 #[test]
-fn abandoned_admission_wakers_are_bounded() {
+fn a_give_back_wakes_one_waiter_per_datagram_that_fits() {
+    let (cap, _time) = cap_at(RATE);
+    cap.charge_unpaced(BURST as usize - PACKET);
+    let take = cap.try_take(PACKET, Duration::ZERO).expect("fits");
+    let counters: Vec<_> = (0..5)
+        .map(|_| {
+            let (waker, counter) = counting_waker();
+            let mut cx = Context::from_waker(&waker);
+            let mut waiter = AdmissionWaiter::default();
+            assert!(cap.poll_admit(PACKET, &mut waiter, &mut cx).is_pending());
+            counter
+        })
+        .collect();
+    assert_eq!(cap.admission_waker_count(), 5);
+    drop(take);
+    let total: usize = counters.iter().map(|c| woken(c)).sum();
+    assert_eq!(total, 1, "one datagram came back, one waiter woken");
+    assert_eq!(cap.admission_waker_count(), 4);
+}
+
+/// The cap never holds more than `MAX_ADMISSION_WAKERS` wakers: past it an
+/// entry is dropped WITHOUT being woken (its waiter still has its timer).
+#[test]
+fn abandoned_admission_wakers_are_bounded_without_waking() {
     let (cap, _time) = cap_at(RATE);
     cap.charge_unpaced(BURST as usize);
     let (waker, counter) = counting_waker();
@@ -982,53 +990,49 @@ fn abandoned_admission_wakers_are_bounded() {
     for _ in 0..MAX_ADMISSION_WAKERS {
         let mut waiter = AdmissionWaiter::default();
         assert!(cap.poll_admit(PACKET, &mut waiter, &mut cx).is_pending());
-        // Dropped while Pending: its waker stays behind.
     }
     assert_eq!(cap.admission_waker_count(), MAX_ADMISSION_WAKERS);
-    assert_eq!(woken(&counter), 0);
     let mut waiter = AdmissionWaiter::default();
     assert!(cap.poll_admit(PACKET, &mut waiter, &mut cx).is_pending());
-    assert_eq!(
-        cap.admission_waker_count(),
-        1,
-        "the full map was cleared before the new waker was added"
-    );
-    assert_eq!(
-        woken(&counter),
-        MAX_ADMISSION_WAKERS,
-        "each cleared one was woken"
-    );
+    assert_eq!(cap.admission_waker_count(), MAX_ADMISSION_WAKERS, "bounded");
+    assert_eq!(woken(&counter), 0, "an evicted entry is not woken");
     // The same waiter polling again holds one entry, not two.
     assert!(cap.poll_admit(PACKET, &mut waiter, &mut cx).is_pending());
-    assert_eq!(cap.admission_waker_count(), 1);
+    assert_eq!(cap.admission_waker_count(), MAX_ADMISSION_WAKERS);
 }
 
-/// A take larger than the burst is admitted once the bucket is full and
-/// puts it into debt by the excess, instead of staying refused forever (the
-/// bucket can never hold more than the burst). `poll_admit` agrees.
+/// `poll_admit` of a full datagram being `Ready` means a `try_take` of any
+/// size up to it succeeds at the same instant, which is what the QUIC socket
+/// relies on: its poller asks for `WAKE_DATAGRAM_BYTES`, then takes the
+/// datagram's real size.
 #[test]
-fn a_take_larger_than_the_burst_is_admitted_with_a_full_bucket() {
-    let (cap, time) = cap_at(RATE);
-    let big = BURST as usize + 3 * PACKET;
-    cap.charge_unpaced(PACKET);
+fn a_ready_poll_for_a_datagram_admits_any_smaller_take() {
     let (waker, _) = counting_waker();
     let mut cx = Context::from_waker(&waker);
-    let mut waiter = AdmissionWaiter::default();
-    assert!(cap.poll_admit(big, &mut waiter, &mut cx).is_pending());
-    assert_eq!(
-        cap.try_take(big, Duration::ZERO).unwrap_err(),
-        Duration::from_micros(PACKET as u64),
-        "short by what the full burst is missing, not by the whole take"
-    );
-    time.advance(Duration::from_micros(PACKET as u64));
-    assert!(cap.poll_admit(big, &mut waiter, &mut cx).is_ready());
-    let take = cap
-        .try_take(big, Duration::ZERO)
-        .expect("a full bucket admits it");
-    take.sent(big);
-    assert_eq!(
-        cap.level_bytes(),
-        -(3 * PACKET as i64),
-        "in debt by the excess"
-    );
+    let mut ready = 0u32;
+    for seed in 0..32u64 {
+        GlobalRng::scoped_seed(seed, || {
+            let (cap, time) = cap_at(RATE);
+            for _ in 0..300 {
+                if GlobalRng::random_bool(0.5) {
+                    cap.charge_unpaced(GlobalRng::random_range(1..3 * PACKET));
+                } else {
+                    time.advance(Duration::from_nanos(GlobalRng::random_range(0..2_000_000)));
+                }
+                let mut waiter = AdmissionWaiter::default();
+                if cap
+                    .poll_admit(WAKE_DATAGRAM_BYTES, &mut waiter, &mut cx)
+                    .is_ready()
+                {
+                    ready += 1;
+                    let n = GlobalRng::random_range(1..=WAKE_DATAGRAM_BYTES);
+                    let take = cap
+                        .try_take(n, Duration::ZERO)
+                        .unwrap_or_else(|_| panic!("seed {seed}: Ready for 1200, refused {n}"));
+                    drop(take);
+                }
+            }
+        });
+    }
+    assert!(ready > 500, "the Ready branch ran {ready} times");
 }

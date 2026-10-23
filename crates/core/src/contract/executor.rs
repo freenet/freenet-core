@@ -1668,12 +1668,19 @@ pub(crate) fn declared_cache_ceiling_terms(
     let quic_ingress = crate::transport::demux::QUIC_INGRESS_QUEUE_BYTES;
     // The QUIC endpoint's flow-control windows and pending-connection
     // buffers (#5940): one endpoint per node, and none at the shipped default
-    // `transport-quic = off`, so this term is zero there. With QUIC on it is
-    // `quic_endpoint_budget_for(memory_limit, Prefer)`, which this aggregate
-    // has no room for on a 1 GiB host (see that function's doc).
+    // `transport-quic = off`, so this term is zero there.
+    //
+    // TODO(#5940 c3): this term is evaluated for the DEFAULT mode and the
+    // DEFAULT connection limit, so it cannot reflect `prefer` or a raised
+    // `max-number-of-connections`. Before c3 (the first step in which a QUIC
+    // connection can exist) merges, it must use the configured mode and
+    // max_connections; `quic_endpoint_term_is_default_only_until_c3` fails to
+    // remind whoever changes the default. With QUIC on the term does not fit
+    // a 1 GiB host (see `quic_endpoint_budget_for`).
     let quic_endpoint = crate::transport::quic::config::quic_endpoint_budget_for(
         memory_limit,
         crate::transport::quic::QuicMode::default(),
+        crate::config::DEFAULT_MAX_CONNECTIONS,
     );
 
     vec![
@@ -2293,6 +2300,7 @@ mod tests {
                 crate::transport::quic::config::quic_endpoint_budget_for(
                     ONE_GIB,
                     crate::transport::quic::QuicMode::default(),
+                    crate::config::DEFAULT_MAX_CONNECTIONS,
                 ),
             ),
         ] {
@@ -2303,6 +2311,30 @@ mod tests {
                  executor, so the aggregate must count it once"
             );
         }
+    }
+
+    /// TODO(#5940 c3) guard. The QUIC endpoint term is evaluated for the
+    /// default `transport-quic` mode, which is off, so it is zero and the
+    /// aggregate never sees QUIC memory. That is true only while no QUIC
+    /// connection can exist. This fails when the default changes, and c3 (the
+    /// first step that opens QUIC connections) must replace the term with one
+    /// computed from the configured mode and `max-number-of-connections`,
+    /// and replace this test with one that checks it.
+    #[test]
+    fn quic_endpoint_term_is_default_only_until_c3() {
+        const ONE_GIB: usize = 1024 * 1024 * 1024;
+        assert_eq!(
+            crate::transport::quic::QuicMode::default(),
+            crate::transport::quic::QuicMode::Off,
+            "the QUIC default changed: make the quic_endpoint_budget_for term in \
+             declared_cache_ceiling_terms use the configured mode and max_connections \
+             (#5940 c3) before shipping this"
+        );
+        let term = declared_cache_ceiling_terms(ONE_GIB, 4)
+            .into_iter()
+            .find(|(label, _)| *label == "quic_endpoint_budget_for")
+            .map(|(_, bytes)| bytes);
+        assert_eq!(term, Some(0), "zero only because QUIC is off by default");
     }
 
     /// The margin the aggregate passes by, asserted rather than assumed.
@@ -2750,6 +2782,10 @@ mod tests {
             (
                 "CONTRACT_NODE_BYTES",
                 "compile-time size bound on one hierarchical-router struct",
+            ),
+            (
+                "WAKE_DATAGRAM_BYTES",
+                "egress-cap wake threshold for a QUIC datagram (a rate quantity), not memory",
             ),
             (
                 "connection_window_bytes",

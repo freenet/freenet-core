@@ -136,6 +136,9 @@ quinn-proto = { version = "0.11.18", default-features = false }
 # own `ring` module (the DHT ring), and an extern crate of the same name makes
 # every `ring` path under a glob import ambiguous.
 ring-crypto = { package = "ring", version = "0.17" }
+# Constant-time MAC comparison for the QUIC connection-ID generator
+# (transport/quic/cid.rs). Already in the graph (rustls, ed25519-dalek).
+subtle = "2.6"
 # Hidden (no-echo) prompt for the `freenet secrets export/import` passphrase, so
 # secrets don't have to be passed on argv (where they leak via `ps`/history).
 rpassword = "7"

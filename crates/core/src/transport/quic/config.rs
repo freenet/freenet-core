@@ -6,7 +6,17 @@
 //! transport's, migration would change a connection's address (which the node
 //! uses as the peer's identity), and the flow-control windows allow far more
 //! memory per connection than a node can give. So nothing is left to a
-//! default: each value is set here, and `quic::tests` pins each one.
+//! default: each value is set here.
+//!
+//! What `quic::tests` pins, and how: values quinn's `Debug` shows are pinned
+//! field by field (endpoint, transport, server and client configurations);
+//! the rustls settings are read off the rustls configs; Cubic is checked on
+//! a live connection (`congestion_state`); the connection-ID generator is
+//! checked by sending an endpoint a short-header packet with a random ID and
+//! seeing no reply. NOT pinned, because quinn exposes them neither in `Debug`
+//! nor in behaviour a test can observe cheaply: the token store
+//! (`NoneTokenStore`), the initial destination CID provider, the
+//! stateless-reset key, `min_reset_interval` and the server's system clock.
 
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -101,38 +111,58 @@ pub(crate) fn connection_window_bytes(memory_limit: usize, max_connections: usiz
 }
 
 /// The most memory the QUIC endpoint can hold on a node with `memory_limit`
-/// at the default `max-number-of-connections`: every connection's receive
-/// and send windows full, plus quinn's buffer for pending connection
-/// attempts. Zero with QUIC off, because then no endpoint exists; the
-/// declared ceiling sums it for the shipped default (off).
+/// and `max_connections`: every connection's receive and send windows full,
+/// plus quinn's buffer for pending connection attempts. Zero with QUIC off,
+/// because then no endpoint exists.
 ///
 /// With QUIC on, the windows' floor alone makes this at least
-/// `2 * 200 * 128 KiB` (50 MiB), and a 1 GiB host's declared caches had a
-/// margin of 2.6 MB under their half-of-memory limit when this was written,
-/// so the two do not fit together. That has to be settled before QUIC is
-/// offered to operators (#5940, opt-in stage).
+/// `2 * 200 * 128 KiB` (50 MiB) at the default 200 connections, and a 1 GiB
+/// host's declared caches had a margin of 2.6 MB under their half-of-memory
+/// limit when this was written, so the two do not fit together. That has to
+/// be settled before QUIC is offered to operators (#5940).
 // Read by the declared memory ceiling, which only tests evaluate.
 #[cfg_attr(not(test), allow(dead_code))]
-pub(crate) fn quic_endpoint_budget_for(memory_limit: usize, mode: QuicMode) -> usize {
+pub(crate) fn quic_endpoint_budget_for(
+    memory_limit: usize,
+    mode: QuicMode,
+    max_connections: usize,
+) -> usize {
     match mode {
         QuicMode::Off => 0,
         QuicMode::Prefer => {
-            let connections = crate::config::DEFAULT_MAX_CONNECTIONS;
-            let window = connection_window_bytes(memory_limit, connections);
+            let window = connection_window_bytes(memory_limit, max_connections);
             usize::try_from(window)
                 .unwrap_or(usize::MAX)
-                .saturating_mul(2 * connections)
+                .saturating_mul(2 * max_connections.max(1))
                 .saturating_add(INCOMING_BUFFER_TOTAL_BYTES as usize)
         }
     }
 }
 
+/// Fill `out` from the OS entropy pool, for key material: the
+/// stateless-reset key, the handshake-token key and the connection-ID MAC
+/// key. These must not come from `GlobalRng`, whose seed is fixed in tests
+/// and would make the keys predictable to anyone who reads the seed
+/// (`.claude/rules/code-style.md`, OsRng exception). They do not affect the
+/// order or timing of what the endpoint sends, so a seeded run still
+/// repeats its event trace.
+pub(crate) fn os_random(out: &mut [u8]) {
+    use ring_crypto::rand::SecureRandom;
+    // ring's SystemRandom reads getrandom(2) (or the platform equivalent);
+    // it fails only if the OS has no entropy source at all, where nothing
+    // cryptographic can run.
+    ring_crypto::rand::SystemRandom::new()
+        .fill(out)
+        .unwrap_or_else(|_| panic!("the OS entropy source failed"));
+}
+
 /// The endpoint configuration: version, payload size, greasing, the
-/// stateless-reset key, the connection-ID generator and quinn's RNG seed,
-/// all keys and seeds drawn from [`GlobalRng`] so a seeded run is repeatable.
+/// stateless-reset key, the connection-ID generator and quinn's RNG seed.
+/// Keys come from the OS ([`os_random`]); quinn's RNG seed comes from
+/// [`GlobalRng`], so a seeded run is repeatable.
 pub(crate) fn endpoint_config() -> EndpointConfig {
     let mut reset_key = [0u8; 64];
-    GlobalRng::fill_bytes(&mut reset_key);
+    os_random(&mut reset_key);
     let mut config = EndpointConfig::new(Arc::new(hmac::Key::new(hmac::HMAC_SHA256, &reset_key)));
     let cid_key = MacConnectionIdGenerator::new_key();
     config.cid_generator(move || Box::new(MacConnectionIdGenerator::new(cid_key)));
@@ -207,7 +237,7 @@ pub(crate) fn server_config(
     clock: Arc<dyn quinn::TimeSource>,
 ) -> ServerConfig {
     let mut master_key = [0u8; 64];
-    GlobalRng::fill_bytes(&mut master_key);
+    os_random(&mut master_key);
     let token_key = hkdf::Salt::new(hkdf::HKDF_SHA256, &[]).extract(&master_key);
     let mut tokens = ValidationTokenConfig::default();
     tokens.sent(0).log(Arc::new(NoneTokenLog));

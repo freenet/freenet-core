@@ -13,6 +13,8 @@ multiple-versions = "allow"
 # `ring`). aws-lc-sys needs cmake and a C toolchain on every release target,
 # and two providers in one rustls make `CryptoProvider::get_default` ambiguous.
 # A dependency that turns on a default feature pulling it in fails here.
+# Enforced only where cargo-deny runs, which is scripts/static-checks.sh; no CI
+# job runs cargo-deny, so CI does not enforce this ban.
 deny = [
     { name = "aws-lc-rs" },
     { name = "aws-lc-sys" },

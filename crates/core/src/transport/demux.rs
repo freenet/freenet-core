@@ -15,7 +15,7 @@ use std::io;
 use std::net::SocketAddr;
 #[cfg(test)]
 use std::sync::atomic::AtomicU64;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll};
 
@@ -88,6 +88,9 @@ struct IngressShared {
     /// Allowed source addresses, each with the number of live
     /// [`QuicSourcePermit`]s for it. At most [`QUIC_ALLOWED_SOURCES_MAX`].
     allowed: DashMap<SocketAddr, usize>,
+    /// `allowed.len()`, kept separately so a new address reserves its place
+    /// atomically (see [`DemuxSocket::allow_quic_source`]).
+    allowed_count: AtomicUsize,
     /// Datagrams queued and not yet received, by source. An entry exists only
     /// while its count is above zero, so this holds at most
     /// [`QUIC_INGRESS_QUEUE_DATAGRAMS`] entries.
@@ -168,10 +171,13 @@ impl QuicSourcePermit {
 
 impl Drop for QuicSourcePermit {
     fn drop(&mut self) {
-        self.shared.allowed.remove_if_mut(&self.addr, |_, permits| {
+        let removed = self.shared.allowed.remove_if_mut(&self.addr, |_, permits| {
             *permits = permits.saturating_sub(1);
             *permits == 0
         });
+        if removed.is_some() {
+            self.shared.allowed_count.fetch_sub(1, Ordering::AcqRel);
+        }
     }
 }
 
@@ -283,16 +289,37 @@ impl<S> DemuxSocket<S> {
         let ingress = self.quic.get()?;
         let addr = normalize_mapped_addr(addr);
         let shared = &ingress.shared;
-        // Checked before the entry is taken: `len` locks every shard, which
-        // would deadlock against the entry's own shard lock. Two callers
-        // racing past the check can exceed the bound by one each, which
-        // keeps it a bound.
-        if !shared.allowed.contains_key(&addr) && shared.allowed.len() >= QUIC_ALLOWED_SOURCES_MAX {
-            return None;
+        match shared.allowed.entry(addr) {
+            dashmap::Entry::Occupied(mut held) => *held.get_mut() += 1,
+            dashmap::Entry::Vacant(free) => {
+                // Reserve a place before inserting, while the entry's shard
+                // is locked: concurrent callers cannot both take the last.
+                shared
+                    .allowed_count
+                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                        (count < QUIC_ALLOWED_SOURCES_MAX).then_some(count + 1)
+                    })
+                    .ok()?;
+                free.insert(1);
+            }
         }
-        *shared.allowed.entry(addr).or_insert(0) += 1;
         Some(QuicSourcePermit {
             shared: shared.clone(),
+            addr,
+        })
+    }
+
+    /// Another permit for `addr` if it is on the allow-set now, in one step
+    /// under the entry's lock, so a permit dropped concurrently cannot be
+    /// brought back. `None` if it is not allowed.
+    pub(crate) fn allow_existing_quic_source(&self, addr: SocketAddr) -> Option<QuicSourcePermit> {
+        let ingress = self.quic.get()?;
+        let addr = normalize_mapped_addr(addr);
+        let mut held = ingress.shared.allowed.get_mut(&addr)?;
+        *held += 1;
+        drop(held);
+        Some(QuicSourcePermit {
+            shared: ingress.shared.clone(),
             addr,
         })
     }
@@ -936,6 +963,62 @@ mod tests {
                 .allow_quic_source(addr(QUIC_ALLOWED_SOURCES_MAX))
                 .is_some(),
             "a dropped permit makes room"
+        );
+    }
+
+    /// Callers racing for the last places of the allow-set never take more
+    /// than `QUIC_ALLOWED_SOURCES_MAX` between them: a new address reserves
+    /// its place atomically. And a permit for an address already allowed is
+    /// granted only while it is allowed.
+    #[test]
+    fn quic_allow_set_bound_holds_under_concurrent_callers() {
+        let socket = Arc::new(DemuxSocket::wrap(ScriptedSocket::new(Vec::new()), None));
+        let _queue = socket.enable_quic_ingress().expect("first enable");
+        const THREADS: usize = 8;
+        let per_thread = QUIC_ALLOWED_SOURCES_MAX / THREADS + 64;
+        let barrier = Arc::new(std::sync::Barrier::new(THREADS));
+        let granted: Vec<Vec<QuicSourcePermit>> = (0..THREADS)
+            .map(|t| {
+                let socket = socket.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    (0..per_thread)
+                        .filter_map(|i| {
+                            let n = t * per_thread + i;
+                            socket.allow_quic_source(SocketAddr::from((
+                                [10, 252, (n >> 8) as u8, n as u8],
+                                5000,
+                            )))
+                        })
+                        .collect()
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|h| h.join().unwrap())
+            .collect();
+        let total: usize = granted.iter().map(Vec::len).sum();
+        assert_eq!(
+            total, QUIC_ALLOWED_SOURCES_MAX,
+            "exactly the bound, never more"
+        );
+
+        let addr: SocketAddr = "10.252.255.254:6000".parse().unwrap();
+        assert!(
+            socket.allow_existing_quic_source(addr).is_none(),
+            "not allowed, so no permit"
+        );
+        drop(granted);
+        let first = socket.allow_quic_source(addr).expect("room again");
+        let second = socket
+            .allow_existing_quic_source(addr)
+            .expect("allowed now");
+        drop(first);
+        drop(second);
+        assert!(
+            socket.allow_existing_quic_source(addr).is_none(),
+            "a released address is not brought back"
         );
     }
 

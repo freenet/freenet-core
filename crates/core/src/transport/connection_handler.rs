@@ -253,13 +253,14 @@ async fn bind_udp_listener<S: Socket>(
     // it on the endpoint runs on the egress cap's clock (`RealTime`, see
     // above), has no server configuration and an empty allow-set: nothing
     // reaches it until an upgrade path allows a peer.
-    let quic_endpoint = match &config.quic {
-        None => None,
-        Some(settings) => Some(
-            super::quic::QuicEndpoint::bind(socket.clone(), bind_addr, RealTime::new(), settings)
-                .map_err(TransportError::from)?,
-        ),
-    };
+    let quic_endpoint = config.quic.as_ref().and_then(|settings| {
+        super::quic::QuicEndpoint::bind_or_warn(
+            socket.clone(),
+            bind_addr,
+            RealTime::new(),
+            settings,
+        )
+    });
 
     tracing::info!(
         target: "freenet_core::transport::send_debug",

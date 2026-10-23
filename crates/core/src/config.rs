@@ -1014,19 +1014,13 @@ impl ConfigArgs {
             if self.network_api.bbr_startup_rate.is_none() {
                 self.network_api.bbr_startup_rate = cfg.network_api.bbr_startup_rate;
             }
-            // Merged only when the file holds something other than the
-            // default, like `congestion-control`. A value this binary does
-            // not know is kept (and treated as off when used), so a later
-            // release's setting survives a rollback's rewrite of the file.
+            // Any value in the file is merged, "off" included: an operator
+            // who wrote "off" must keep it even if a later release changes
+            // the default. A value this binary does not know is kept as well
+            // (and treated as off when used), so a later release's setting
+            // survives a rollback's rewrite of the file.
             if self.network_api.transport_quic.is_none() {
-                if let Some(value) = cfg
-                    .network_api
-                    .transport_quic
-                    .as_ref()
-                    .filter(|v| crate::transport::quic::QuicMode::is_non_default_value(v))
-                {
-                    self.network_api.transport_quic = Some(value.clone());
-                }
+                self.network_api.transport_quic = cfg.network_api.transport_quic.clone();
             }
             if let Some(limit) = cfg.network_api.total_bandwidth_limit {
                 self.network_api.total_bandwidth_limit.get_or_insert(limit);
@@ -8437,12 +8431,13 @@ shutdown-drain-secs = 42
     }
 
     /// `transport-quic` survives a bare restart through `build()`'s merge,
-    /// including a value this binary does not know (a rollback must keep a
-    /// later release's setting), and a value on the command line wins over
-    /// the file.
+    /// including an explicit "off" (an operator's opt-out must outlive a
+    /// later change of the default) and a value this binary does not know (a
+    /// rollback must keep a later release's setting), and a value on the
+    /// command line wins over the file.
     #[tokio::test]
     async fn transport_quic_survives_a_bare_build_and_cli_overrides_it() {
-        for value in ["prefer", "a-later-mode"] {
+        for value in ["prefer", "off", "a-later-mode"] {
             let temp_dir = tempfile::tempdir().unwrap();
             let mut first = local_args(temp_dir.path());
             first.network_api.transport_quic = Some(value.to_string());
@@ -8455,15 +8450,16 @@ shutdown-drain-secs = 42
                 "transport-quic = {value:?} must survive a bare build"
             );
 
+            let other = if value == "prefer" { "off" } else { "prefer" };
             let mut cli = local_args(temp_dir.path());
-            cli.network_api.transport_quic = Some("off".to_string());
+            cli.network_api.transport_quic = Some(other.to_string());
             let cfg = cli.build().await.unwrap();
             assert_eq!(
                 cfg.network_api.transport_quic.as_deref(),
-                Some("off"),
+                Some(other),
                 "the command line overrides the file"
             );
-            assert!(cfg.network_api.quic_settings().is_none());
+            assert_eq!(cfg.network_api.quic_settings().is_some(), other == "prefer");
         }
     }
 

@@ -50,8 +50,13 @@ pub enum QuicMode {
     #[default]
     Off,
     /// The node builds a QUIC endpoint on its UDP port. In this release it
-    /// accepts nothing and connects to nobody, so the node behaves as with
-    /// `Off` apart from the endpoint's memory.
+    /// accepts nothing and connects to nobody. It still differs from `Off`
+    /// in three ways: the demux socket has a QUIC ingress, so a QUIC-class
+    /// datagram is counted `quic_ingress_not_allowed` instead of
+    /// `quic_ingress_no_ingress`; quinn's endpoint driver runs as a task
+    /// (idle, waiting on the empty ingress queue); and the endpoint's memory.
+    /// If the endpoint cannot be built the node logs a warning and runs with
+    /// QUIC off.
     Prefer,
 }
 
@@ -79,14 +84,6 @@ impl QuicMode {
             }
         }
     }
-
-    /// Whether `value` is anything other than the default (`off` or unset),
-    /// so `ConfigArgs::build` merges it from `config.toml`. An unknown value
-    /// counts as non-default, so it survives a rewrite of the file and a
-    /// later binary that knows it still sees it.
-    pub(crate) fn is_non_default_value(value: &str) -> bool {
-        !value.trim().eq_ignore_ascii_case(Self::OFF)
-    }
 }
 
 /// The node's QUIC endpoint. Built only when `transport-quic` is not `off`.
@@ -108,7 +105,7 @@ pub(crate) struct QuicEndpoint {
 /// The demux socket's QUIC allow-set, without its socket type.
 trait QuicSources: Send + Sync {
     fn allow(&self, addr: SocketAddr) -> Option<QuicSourcePermit>;
-    fn is_allowed(&self, addr: SocketAddr) -> bool;
+    fn allow_existing(&self, addr: SocketAddr) -> Option<QuicSourcePermit>;
 }
 
 impl<S: Socket> QuicSources for DemuxSocket<S> {
@@ -116,8 +113,8 @@ impl<S: Socket> QuicSources for DemuxSocket<S> {
         self.allow_quic_source(addr)
     }
 
-    fn is_allowed(&self, addr: SocketAddr) -> bool {
-        self.is_quic_source_allowed(addr)
+    fn allow_existing(&self, addr: SocketAddr) -> Option<QuicSourcePermit> {
+        self.allow_existing_quic_source(addr)
     }
 }
 
@@ -164,6 +161,45 @@ impl QuicEndpoint {
         time: T,
         settings: &QuicSettings,
     ) -> io::Result<Self> {
+        Self::bind_with(
+            socket,
+            local_addr,
+            time,
+            settings,
+            config::endpoint_config(),
+        )
+    }
+
+    /// [`Self::bind`], or `None` with a WARN when it fails, so a node with
+    /// `transport-quic = "prefer"` still starts, with QUIC off.
+    pub(crate) fn bind_or_warn<S: Socket, T: TimeSource>(
+        socket: Arc<DemuxSocket<S>>,
+        local_addr: SocketAddr,
+        time: T,
+        settings: &QuicSettings,
+    ) -> Option<Self> {
+        match Self::bind(socket, local_addr, time, settings) {
+            Ok(endpoint) => Some(endpoint),
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    %local_addr,
+                    "Could not build the QUIC endpoint (transport-quic = prefer); running with QUIC off"
+                );
+                None
+            }
+        }
+    }
+
+    /// [`Self::bind`] with a given endpoint configuration; tests build an
+    /// endpoint with quinn's own connection-ID generator through it.
+    fn bind_with<S: Socket, T: TimeSource>(
+        socket: Arc<DemuxSocket<S>>,
+        local_addr: SocketAddr,
+        time: T,
+        settings: &QuicSettings,
+        endpoint_config: quinn::EndpointConfig,
+    ) -> io::Result<Self> {
         let ingress = socket.enable_quic_ingress().ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::AlreadyExists,
@@ -175,12 +211,8 @@ impl QuicEndpoint {
         let transport = Arc::new(config::transport_config(settings, &time));
         let clock = config::system_clock(time.clone());
         let runtime = Arc::new(runtime::QuicRuntime::new(time));
-        let endpoint = quinn::Endpoint::new_with_abstract_socket(
-            config::endpoint_config(),
-            None,
-            quic_socket,
-            runtime,
-        )?;
+        let endpoint =
+            quinn::Endpoint::new_with_abstract_socket(endpoint_config, None, quic_socket, runtime)?;
         tracing::info!(
             %local_addr,
             window_bytes = settings.window_bytes(),
@@ -247,34 +279,43 @@ impl QuicEndpoint {
         Ok(QuicConnection::new(connection, permit))
     }
 
-    /// The next incoming connection, once its handshake completes. An
-    /// attempt from an address that is not on the allow-set (which the demux
-    /// socket should never pass on) is ignored, and so is one whose handshake
-    /// fails. `None` once the endpoint is closed.
+    /// The next incoming connection attempt from an allowed source, with its
+    /// handshake NOT awaited: the caller drives it with
+    /// [`QuicIncoming::establish`], so one stalled handshake does not hold
+    /// back the next attempt. An attempt from an address that is not on the
+    /// allow-set (which the demux socket should not pass on; it can happen
+    /// when the permit was dropped after the datagram was queued) is ignored.
+    /// `None` once the endpoint is closed.
     #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) async fn accept(&self) -> Option<QuicConnection> {
+    pub(crate) async fn accept(&self) -> Option<QuicIncoming> {
         loop {
             let incoming = self.endpoint.accept().await?;
             let remote = incoming.remote_address();
-            // The demux socket passes on only allowed sources, so this is a
-            // second check on the same set, not the filter itself.
-            let permit = if self.sources.is_allowed(remote) {
-                self.allow_peer(remote)
-            } else {
-                None
-            };
-            let Some(permit) = permit else {
+            // One step under the allow-set entry's lock, so a permit dropped
+            // concurrently is not brought back.
+            let Some(permit) = self.sources.allow_existing(remote) else {
                 tracing::debug!(%remote, "Ignoring a QUIC connection attempt from a source not allowed");
                 incoming.ignore();
                 continue;
             };
-            match incoming.await {
-                Ok(connection) => return Some(QuicConnection::new(connection, permit)),
-                Err(error) => {
-                    tracing::debug!(%error, "Incoming QUIC handshake failed");
-                }
-            }
+            return Some(QuicIncoming { incoming, permit });
         }
+    }
+}
+
+/// An incoming connection attempt from an allowed source, holding a permit
+/// for its address until the handshake ends.
+pub(crate) struct QuicIncoming {
+    incoming: quinn::Incoming,
+    permit: QuicSourcePermit,
+}
+
+impl QuicIncoming {
+    /// Complete the handshake. On failure the permit is dropped with it.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) async fn establish(self) -> Result<QuicConnection, quinn::ConnectionError> {
+        let connection = self.incoming.await?;
+        Ok(QuicConnection::new(connection, self.permit))
     }
 }
 
@@ -283,6 +324,14 @@ impl QuicEndpoint {
 /// timed out, failed, or dropped here (dropping closes it).
 pub(crate) struct QuicConnection {
     connection: quinn::Connection,
+}
+
+impl std::fmt::Debug for QuicConnection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("QuicConnection")
+            .field("remote", &self.connection.remote_address())
+            .finish_non_exhaustive()
+    }
 }
 
 impl QuicConnection {
