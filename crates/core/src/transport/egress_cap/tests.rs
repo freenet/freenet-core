@@ -963,26 +963,27 @@ fn a_give_back_wakes_one_waiter_per_datagram_that_fits() {
     let (cap, _time) = cap_at(RATE);
     cap.charge_unpaced(BURST as usize - PACKET);
     let take = cap.try_take(PACKET, Duration::ZERO).expect("fits");
-    let counters: Vec<_> = (0..5)
+    // The waiters stay alive: dropping one removes its entry.
+    let waiters: Vec<_> = (0..5)
         .map(|_| {
             let (waker, counter) = counting_waker();
             let mut cx = Context::from_waker(&waker);
             let mut waiter = AdmissionWaiter::default();
             assert!(cap.poll_admit(PACKET, &mut waiter, &mut cx).is_pending());
-            counter
+            (waiter, counter)
         })
         .collect();
     assert_eq!(cap.admission_waker_count(), 5);
     drop(take);
-    let total: usize = counters.iter().map(|c| woken(c)).sum();
+    let total: usize = waiters.iter().map(|(_, c)| woken(c)).sum();
     assert_eq!(total, 1, "one datagram came back, one waiter woken");
     assert_eq!(cap.admission_waker_count(), 4);
 }
 
 /// Waiters are woken in the order they registered: with more waiters than
 /// datagrams given back, the first to register is woken first, and a waiter
-/// that registers again moves to the back. On overflow the oldest entry is
-/// the one dropped.
+/// that polls again keeps its place (its staggered timer depends on it).
+/// On overflow the oldest entry is the one dropped.
 #[test]
 fn give_backs_wake_waiters_oldest_first() {
     let (cap, _time) = cap_at(RATE);
@@ -999,7 +1000,7 @@ fn give_backs_wake_waiters_oldest_first() {
         let mut cx = Context::from_waker(waker);
         assert!(cap.poll_admit(PACKET, waiter, &mut cx).is_pending());
     }
-    // Waiter 0 polls again: it moves behind 1 and 2.
+    // Waiter 0 polls again: it keeps its place ahead of 1 and 2.
     {
         let (waiter, waker, _) = &mut waiters[0];
         let mut cx = Context::from_waker(waker);
@@ -1013,11 +1014,11 @@ fn give_backs_wake_waiters_oldest_first() {
     )]| { w.iter().map(|(_, _, c)| woken(c)).collect::<Vec<_>>() };
     assert_eq!(
         woken_now(&waiters),
-        vec![0, 1, 0],
+        vec![1, 0, 0],
         "the oldest registration first"
     );
-    // Waiter 1 took nothing, so the bucket now holds two datagrams' worth:
-    // the two remaining waiters, 2 then 0.
+    // Waiter 0 took nothing, so the bucket now holds two datagrams' worth:
+    // the two remaining waiters, 1 then 2.
     drop(second_take);
     assert_eq!(
         woken_now(&waiters),
@@ -1028,21 +1029,24 @@ fn give_backs_wake_waiters_oldest_first() {
 
 /// The cap never holds more than `MAX_ADMISSION_WAKERS` wakers: past it an
 /// entry is dropped WITHOUT being woken (its waiter still has its timer).
+/// The waiters are kept alive, since dropping one removes its entry.
 #[test]
-fn abandoned_admission_wakers_are_bounded_without_waking() {
+fn admission_wakers_are_bounded_without_waking() {
     let (cap, _time) = cap_at(RATE);
     cap.charge_unpaced(BURST as usize);
     let (waker, counter) = counting_waker();
     let mut cx = Context::from_waker(&waker);
     let mut first_id = None;
+    let mut held = Vec::with_capacity(MAX_ADMISSION_WAKERS);
     for _ in 0..MAX_ADMISSION_WAKERS {
         let mut waiter = AdmissionWaiter::default();
         first_id.get_or_insert(waiter.id);
         assert!(cap.poll_admit(PACKET, &mut waiter, &mut cx).is_pending());
+        held.push(waiter);
     }
     let first_id = first_id.unwrap();
     assert_eq!(
-        cap.admission_wakers.lock().front().map(|(id, _)| *id),
+        cap.admission.wakers.lock().front().map(|(id, _)| *id),
         Some(first_id)
     );
     assert_eq!(cap.admission_waker_count(), MAX_ADMISSION_WAKERS);
@@ -1050,7 +1054,7 @@ fn abandoned_admission_wakers_are_bounded_without_waking() {
     assert!(cap.poll_admit(PACKET, &mut waiter, &mut cx).is_pending());
     assert_eq!(cap.admission_waker_count(), MAX_ADMISSION_WAKERS, "bounded");
     assert_ne!(
-        cap.admission_wakers.lock().front().map(|(id, _)| *id),
+        cap.admission.wakers.lock().front().map(|(id, _)| *id),
         Some(first_id),
         "the oldest entry was the one dropped"
     );
@@ -1094,4 +1098,88 @@ fn a_ready_poll_for_a_datagram_admits_any_smaller_take() {
         });
     }
     assert!(ready > 500, "the Ready branch ran {ready} times");
+}
+
+/// Waiters whose deficits are equal are staggered by one datagram of refill
+/// each, so the cap does not wake them as a herd: with N waiters on an
+/// empty bucket, each datagram's worth of refill wakes exactly one of them,
+/// oldest first, and that one is admitted.
+#[test]
+fn waiting_connections_wake_one_per_datagram_of_refill() {
+    const N: usize = 8;
+    let (cap, time) = cap_at(RATE);
+    cap.charge_unpaced(BURST as usize);
+    let mut waiters: Vec<_> = (0..N)
+        .map(|_| {
+            let (waker, counter) = counting_waker();
+            (AdmissionWaiter::default(), waker, counter)
+        })
+        .collect();
+    for (waiter, waker, _) in waiters.iter_mut() {
+        let mut cx = Context::from_waker(waker);
+        assert!(cap.poll_admit(PACKET, waiter, &mut cx).is_pending());
+    }
+    let start = time.now_nanos();
+    // One 1 200-byte datagram of refill at 1 MB/s.
+    let datagram = Duration::from_micros(1_200);
+    for (i, (waiter, _, _)) in waiters.iter().enumerate() {
+        assert_eq!(
+            waiter.wake_at_ns(),
+            Some(start + (i as u64 + 1) * datagram.as_nanos() as u64),
+            "waiter {i} is staggered by its place in the queue"
+        );
+    }
+    for k in 0..N {
+        time.advance(datagram);
+        let woken_now: Vec<usize> = waiters.iter().map(|(_, _, c)| woken(c)).collect();
+        assert_eq!(
+            woken_now.iter().sum::<usize>(),
+            k + 1,
+            "after {} datagrams of refill: {woken_now:?}",
+            k + 1
+        );
+        assert_eq!(woken_now[k], 1, "waiter {k} is the one woken");
+        let (waiter, waker, _) = &mut waiters[k];
+        let mut cx = Context::from_waker(waker);
+        assert!(cap.poll_admit(PACKET, waiter, &mut cx).is_ready());
+        cap.try_take(PACKET, Duration::ZERO)
+            .expect("the woken waiter is admitted")
+            .sent(PACKET);
+    }
+    assert_eq!(cap.admission_waker_count(), 0);
+}
+
+/// Dropping a `Pending` waiter (its connection closed) removes its entry,
+/// so a give-back wakes a live waiter instead of being absorbed by the dead
+/// one, and a waiter that outlives its cap drops cleanly.
+#[test]
+fn a_dropped_waiter_leaves_no_entry_behind() {
+    let (cap, _time) = cap_at(RATE);
+    cap.charge_unpaced(BURST as usize - PACKET);
+    let take = cap.try_take(PACKET, Duration::ZERO).expect("fits");
+    let (gone_waker, gone_counter) = counting_waker();
+    let (live_waker, live_counter) = counting_waker();
+    let mut gone = AdmissionWaiter::default();
+    let mut live = AdmissionWaiter::default();
+    assert!(
+        cap.poll_admit(PACKET, &mut gone, &mut Context::from_waker(&gone_waker))
+            .is_pending()
+    );
+    assert!(
+        cap.poll_admit(PACKET, &mut live, &mut Context::from_waker(&live_waker))
+            .is_pending()
+    );
+    assert_eq!(cap.admission_waker_count(), 2);
+    drop(gone);
+    assert_eq!(cap.admission_waker_count(), 1, "the dropped waiter's entry");
+    drop(take);
+    assert_eq!(woken(&gone_counter), 0);
+    assert_eq!(woken(&live_counter), 1, "the live waiter got the wake");
+
+    assert!(
+        cap.poll_admit(PACKET * 2, &mut live, &mut Context::from_waker(&live_waker))
+            .is_pending()
+    );
+    drop(cap);
+    drop(live);
 }

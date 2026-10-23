@@ -70,6 +70,7 @@ use std::fmt;
 use std::future::Future;
 use std::mem::ManuallyDrop;
 use std::pin::Pin;
+use std::sync::Arc;
 #[cfg(test)]
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -135,10 +136,9 @@ pub(crate) const PACED_TAKE_BYTES: usize = MAX_PACKET_SIZE;
 const NANOS_PER_SEC: u128 = 1_000_000_000;
 
 /// The most [`EgressCap::poll_admit`] wakers the cap holds. A waiter's entry
-/// is removed when it is woken or next admitted; a waiter dropped while
-/// `Pending` leaves its entry behind. At this many entries the oldest is
-/// dropped, without waking it, before a new one is added, so abandoned entries cannot
-/// accumulate; a live waiter whose entry was dropped still has its timer. The
+/// is removed when it is woken, next admitted, or dropped. At this many
+/// entries the oldest is dropped, without waking it, before a new one is
+/// added; a live waiter whose entry was dropped still has its timer. The
 /// QUIC endpoint has one waiter per connection that is short of bytes, far
 /// fewer than this.
 const MAX_ADMISSION_WAKERS: usize = 1024;
@@ -236,13 +236,10 @@ pub struct EgressCap {
     sleep_until: Box<dyn Fn(u64) -> SleepFuture + Send + Sync>,
     /// Time (ns, on `clock`) at which the bucket level is zero.
     empty_at_ns: AtomicI64,
-    /// Wakers of [`Self::poll_admit`] callers that are `Pending`, by
-    /// [`AdmissionWaiter`] id, woken when bytes are given back. At most
-    /// [`MAX_ADMISSION_WAKERS`]; see [`Self::register_waker`].
-    admission_wakers: parking_lot::Mutex<std::collections::VecDeque<(u64, std::task::Waker)>>,
-    /// `admission_wakers.len()`, so [`Self::give_back`] skips the lock when
-    /// nobody waits (every node without a QUIC endpoint).
-    admission_waiting: std::sync::atomic::AtomicUsize,
+    /// Wakers of [`Self::poll_admit`] callers that are `Pending`, in the
+    /// order they first registered. Shared with each registered
+    /// [`AdmissionWaiter`] so dropping one removes its entry.
+    admission: Arc<AdmissionQueue>,
     /// When the long-wait warning was last logged (ns, on `clock`).
     last_long_wait_warn_ns: AtomicI64,
     /// Long gaps recorded since the long-wait warning was last logged.
@@ -266,6 +263,54 @@ impl fmt::Debug for EgressCap {
 
 type SleepFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
 
+/// The `Pending` [`EgressCap::poll_admit`] callers, by [`AdmissionWaiter`]
+/// id, oldest registration first. At most [`MAX_ADMISSION_WAKERS`].
+#[derive(Default)]
+struct AdmissionQueue {
+    wakers: parking_lot::Mutex<std::collections::VecDeque<(u64, std::task::Waker)>>,
+    /// `wakers.len()`, so a give-back skips the lock when nobody waits
+    /// (every node without a QUIC endpoint).
+    waiting: std::sync::atomic::AtomicUsize,
+}
+
+impl AdmissionQueue {
+    /// Hold `waker` under `id` and return how many entries are ahead of it.
+    /// A waiter already held keeps its place (its waker is replaced), so its
+    /// staggered timer stays consistent with its position. A new waiter
+    /// goes to the back; at [`MAX_ADMISSION_WAKERS`] entries the OLDEST is
+    /// dropped first, WITHOUT being woken (its waiter still has its timer).
+    /// A linear scan, over at most that many entries, only while someone is
+    /// short of bytes.
+    fn register(&self, id: u64, waker: &std::task::Waker) -> usize {
+        let mut wakers = self.wakers.lock();
+        let ahead = if let Some(at) = wakers.iter().position(|(held, _)| *held == id) {
+            if !wakers[at].1.will_wake(waker) {
+                wakers[at].1 = waker.clone();
+            }
+            at
+        } else {
+            if wakers.len() >= MAX_ADMISSION_WAKERS {
+                wakers.pop_front();
+            }
+            wakers.push_back((id, waker.clone()));
+            wakers.len() - 1
+        };
+        self.waiting.store(wakers.len(), Ordering::Release);
+        ahead
+    }
+
+    fn forget(&self, id: u64) {
+        if self.waiting.load(Ordering::Acquire) == 0 {
+            return;
+        }
+        let mut wakers = self.wakers.lock();
+        if let Some(at) = wakers.iter().position(|(held, _)| *held == id) {
+            wakers.remove(at);
+        }
+        self.waiting.store(wakers.len(), Ordering::Release);
+    }
+}
+
 /// The wakeup a sender polling [`EgressCap::poll_admit`] keeps between
 /// polls: one timer on the cap's time source and the time it fires at, and
 /// the id under which the cap holds its waker while it waits (see
@@ -274,6 +319,10 @@ type SleepFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
 pub(crate) struct AdmissionWaiter {
     id: u64,
     timer: Option<(u64, SleepFuture)>,
+    /// The queue of the cap this waiter last registered with, so dropping
+    /// the waiter removes its entry: a closed connection's entry must not
+    /// absorb a wake meant for a live one.
+    queue: Option<std::sync::Weak<AdmissionQueue>>,
 }
 
 impl Default for AdmissionWaiter {
@@ -282,6 +331,15 @@ impl Default for AdmissionWaiter {
         Self {
             id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
             timer: None,
+            queue: None,
+        }
+    }
+}
+
+impl Drop for AdmissionWaiter {
+    fn drop(&mut self) {
+        if let Some(queue) = self.queue.take().and_then(|queue| queue.upgrade()) {
+            queue.forget(self.id);
         }
     }
 }
@@ -336,8 +394,7 @@ impl EgressCap {
             clock,
             sleep_until,
             empty_at_ns: AtomicI64::new(now.saturating_sub(burst_ns)),
-            admission_wakers: parking_lot::Mutex::new(std::collections::VecDeque::new()),
-            admission_waiting: std::sync::atomic::AtomicUsize::new(0),
+            admission: Arc::new(AdmissionQueue::default()),
             last_long_wait_warn_ns: AtomicI64::new(i64::MIN),
             last_abandon_warn_ns: AtomicI64::new(i64::MIN),
             long_waits_since_warn: WarnWindow::default(),
@@ -508,7 +565,17 @@ impl EgressCap {
     /// and a give-back too small for anyone wakes nobody. A waiter not woken
     /// keeps its timer.
     ///
-    /// The timer is replaced only when the bucket now needs an earlier
+    /// Waiters are staggered so the cap does not wake them as a herd: a
+    /// waiter's timer is set for its deficit plus one [`WAKE_DATAGRAM_BYTES`]
+    /// of refill for every waiter registered ahead of it, so when N waiters
+    /// share one deficit, each datagram's worth of refill wakes one of them,
+    /// oldest first, instead of all N. A waiter keeps its place in the queue
+    /// across polls. When a waiter ahead leaves without taking (dropped, or
+    /// admitted by a later take), the ones behind wake up to one datagram
+    /// later than they could have; never earlier than the bucket can admit
+    /// them.
+    ///
+    /// The timer is replaced only when the waiter now needs an earlier
     /// wakeup than the one armed; a later need (more debt arrived) keeps the
     /// armed timer, which wakes early and re-checks. So repeated polls do not
     /// register a new timer each.
@@ -528,12 +595,26 @@ impl EgressCap {
             let deficit = match self.admits(self.empty_at_ns.load(Ordering::Acquire), now, cost) {
                 Ok(_) => {
                     waiter.timer = None;
-                    self.forget_waker(waiter.id);
+                    self.admission.forget(waiter.id);
                     return Poll::Ready(());
                 }
                 Err(deficit) => deficit,
             };
-            let wake_at = u64::try_from(now.saturating_add(deficit)).unwrap_or(u64::MAX);
+            let ahead = self.admission.register(waiter.id, cx.waker());
+            waiter.queue = Some(Arc::downgrade(&self.admission));
+            // Bytes given back between the check above and the registration
+            // woke nobody; check once more so they are not missed.
+            if self
+                .admits(self.empty_at_ns.load(Ordering::Acquire), self.now(), cost)
+                .is_ok()
+            {
+                continue;
+            }
+            let stagger = i64::try_from(ahead)
+                .unwrap_or(i64::MAX)
+                .saturating_mul(self.cost_ns(WAKE_DATAGRAM_BYTES as u64));
+            let wake_at = u64::try_from(now.saturating_add(deficit).saturating_add(stagger))
+                .unwrap_or(u64::MAX);
             if !matches!(&waiter.timer, Some((at, _)) if *at <= wake_at) {
                 waiter.timer = None;
             }
@@ -541,52 +622,11 @@ impl EgressCap {
                 .timer
                 .get_or_insert_with(|| (wake_at, (self.sleep_until)(wake_at)));
             match timer.as_mut().poll(cx) {
-                Poll::Pending => {
-                    self.register_waker(waiter.id, cx.waker());
-                    // Bytes given back between the check above and the
-                    // registration woke nobody; check once more so they are
-                    // not missed.
-                    if self
-                        .admits(self.empty_at_ns.load(Ordering::Acquire), self.now(), cost)
-                        .is_ok()
-                    {
-                        continue;
-                    }
-                    return Poll::Pending;
-                }
+                Poll::Pending => return Poll::Pending,
                 // The timer fired: check the bucket again.
                 Poll::Ready(()) => waiter.timer = None,
             }
         }
-    }
-
-    /// Hold `waker` under `id` until bytes are given back, at the back of
-    /// the queue (a waiter that registers again moves to the back). At
-    /// [`MAX_ADMISSION_WAKERS`] entries the OLDEST is dropped WITHOUT being
-    /// woken: its waiter still has its timer. A linear scan, over at most
-    /// that many entries, only while someone is short of bytes.
-    fn register_waker(&self, id: u64, waker: &std::task::Waker) {
-        let mut wakers = self.admission_wakers.lock();
-        if let Some(at) = wakers.iter().position(|(held, _)| *held == id) {
-            wakers.remove(at);
-        } else if wakers.len() >= MAX_ADMISSION_WAKERS {
-            wakers.pop_front();
-        }
-        wakers.push_back((id, waker.clone()));
-        self.admission_waiting
-            .store(wakers.len(), Ordering::Release);
-    }
-
-    fn forget_waker(&self, id: u64) {
-        if self.admission_waiting.load(Ordering::Acquire) == 0 {
-            return;
-        }
-        let mut wakers = self.admission_wakers.lock();
-        if let Some(at) = wakers.iter().position(|(held, _)| *held == id) {
-            wakers.remove(at);
-        }
-        self.admission_waiting
-            .store(wakers.len(), Ordering::Release);
     }
 
     /// After bytes came back to the bucket: wake one `Pending`
@@ -596,7 +636,7 @@ impl EgressCap {
     /// without a QUIC endpoint. The wakers are woken after the lock is
     /// released.
     fn wake_admission_waiters(&self) {
-        if self.admission_waiting.load(Ordering::Acquire) == 0 {
+        if self.admission.waiting.load(Ordering::Acquire) == 0 {
             return;
         }
         let now = self.now();
@@ -607,10 +647,11 @@ impl EgressCap {
             return;
         }
         let woken: Vec<std::task::Waker> = {
-            let mut wakers = self.admission_wakers.lock();
+            let mut wakers = self.admission.wakers.lock();
             let take = datagrams.min(wakers.len());
             let woken = wakers.drain(..take).map(|(_, waker)| waker).collect();
-            self.admission_waiting
+            self.admission
+                .waiting
                 .store(wakers.len(), Ordering::Release);
             woken
         };
@@ -622,7 +663,7 @@ impl EgressCap {
     /// How many `Pending` [`Self::poll_admit`] wakers the cap holds.
     #[cfg(test)]
     pub(crate) fn admission_waker_count(&self) -> usize {
-        self.admission_wakers.lock().len()
+        self.admission.wakers.lock().len()
     }
 
     /// Return `bytes` to the bucket, never above the burst.
