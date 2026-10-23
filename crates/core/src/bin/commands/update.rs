@@ -284,7 +284,7 @@ enum InstallRecord {
     /// (#5799). Deliberately includes a missing manifest or asset, which is
     /// usually a release still propagating.
     CoolDown(String),
-    /// Today's download budget for the release ran out mid-download (#5799):
+    /// Today's download budget for this node ran out mid-download (#5799):
     /// hold it without counting a failure, as a run the budget refuses up
     /// front does.
     Hold(String),

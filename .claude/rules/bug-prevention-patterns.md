@@ -268,7 +268,14 @@ while the test is holding a path to it, and the child fails to spawn with
 `NotFound` — nothing to do with the code under test. In `crates/core` this is
 `wasm_runtime::engine::wasmtime_engine::tests::{test_instance_virtual_memory_reservation_bounded_3986,
 test_store_refresh_reduces_vm_maps}`, which re-run themselves as subprocesses to
-measure VM maps in isolation.
+measure VM maps in isolation. The binary crate has more since #5799, which
+re-exec the test binary instead of forking so a child inherits no other test's
+file lock: `commands::service::tests::wrapper_lock_is_exclusive` (runs its
+assertions in a re-executed child), the `commands::rollback::tests::LockHelper`
+users (`the_record_lock_excludes_another_process`,
+`every_record_writer_waits_for_a_lock_another_process_holds`,
+`a_wedged_lock_holder_does_not_block_a_writer`) and
+`commands::update::staged::tests::cache_lock_excludes_another_process`.
 
 The symptom to recognise, so nobody bisects it:
 

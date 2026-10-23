@@ -1599,6 +1599,18 @@ pub fn update_cooldown_summary(current_version: &str) -> Option<String> {
 // spent, and a spend that cannot be written is lost. The poll bucket still
 // bounds the requests, and a budget that failed closed could hold an update
 // back indefinitely.
+//
+// Accounting caveats, all bounded:
+// - Each download is charged its expected size before its body, then
+//   reconciled to the bytes received. A killed run keeps its pre-charge, and
+//   a resumed download is charged again for what it re-fetches, so the
+//   ledger over-counts rather than under-counts.
+// - A download of unknown size is charged at most `MAX_UNKNOWN_DOWNLOAD`.
+// - A refund that lands after the window rolled over is taken from the new
+//   window, under-counting it by at most one download.
+// - Manual and `--force` updater runs are charged but never refused.
+// - The record lock is cross-process on unix only; on Windows a concurrent
+//   tray and node write can lose one adjustment.
 
 /// Bytes of release archives staging and the updater together may receive
 /// per node per window: room for the macOS app bundle's DMG, the largest

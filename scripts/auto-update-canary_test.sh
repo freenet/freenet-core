@@ -2571,7 +2571,7 @@ for pin in \
     "staged|error=%format!(\"{e:#}\"),\"${MARKER_STAGE_FAILED//[[:space:]]/};exitinganyway,theupdaterwilldownloadwhatismissing" \
     "staged|error=%format!(\"{e:#}\"),\"${MARKER_STAGE_FAILED//[[:space:]]/};GitHubcouldnotbereachedforit(#5799)" \
     "staged|error=%format!(\"{e:#}\"),\"${MARKER_STAGE_FAILED//[[:space:]]/};GitHubrate-limitedthedownload(#5799)" \
-    "staged|error=%format!(\"{e:#}\"),\"${MARKER_STAGE_FAILED//[[:space:]]/};today'sdownloadbudgetforitisspent(#5799)" \
+    "staged|error=%format!(\"{e:#}\"),\"${MARKER_STAGE_FAILED//[[:space:]]/};today'sdownloadbudgetisspent(#5799)" \
     "update|writeln!(io::stderr(),\"Installing{}${MARKER_INSTALLED_STAGED//[[:space:]]/}" \
     "auto_update|\"${MARKER_RATE_LIMITED//[[:space:]]/}"; do
     file="${pin%%|*}" needle="${pin#*|}"

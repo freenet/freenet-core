@@ -154,7 +154,7 @@ impl std::fmt::Display for AssetMissing {
 
 impl std::error::Error for AssetMissing {}
 
-/// Today's download budget for the release is spent (#5799). Not retried: the
+/// Today's download budget for this node is spent (#5799). Not retried: the
 /// budget is what bounds the release's download bytes.
 #[derive(Debug)]
 pub(super) struct BudgetSpent;
@@ -796,8 +796,6 @@ fn after_transient_failure(root: &Path, version: &str, error: &str, now: SystemT
     }
 }
 
-/// Hold `version` without counting a failure (the bucket or the ceiling said
-/// no, so nothing was attempted) and stay.
 /// Hold `version` without counting a failure until the node's download
 /// budget is whole again, and stay. Exiting would hand the download to an
 /// updater the same budget refuses: a restart for nothing. Nothing counts
@@ -826,6 +824,8 @@ fn budget_spent(root: &Path, version: &str, now: SystemTime) -> Staging {
     Staging::Throttled
 }
 
+/// Hold `version` without counting a failure (the poll bucket or a GitHub
+/// rate limit said no, so nothing was attempted) and stay.
 fn throttled(root: &Path, version: Option<&str>, why: &str, now: SystemTime) -> Staging {
     tracing::info!(why, "Not downloading the update in advance now (#5799)");
     if let (Some(version), Some(state_dir)) = (version, root.parent()) {
@@ -1204,7 +1204,7 @@ where
         tracing::warn!(
             tag = %tag,
             spent_mib = spent / (1024 * 1024),
-            "Not downloading the update in advance: today's download budget for it is spent (#5799)"
+            "Not downloading the update in advance: today's download budget is spent (#5799)"
         );
         return budget_spent(root, version, clock());
     }
@@ -1217,9 +1217,10 @@ where
         env.deadline,
     )
     .await;
-    // Whatever the outcome. The meter has written all but the last
-    // METER_PERSIST_EVERY bytes as they arrived, so a run killed before this
-    // line loses at most that much of its count.
+    // Whatever the outcome. Each download was charged its expected size
+    // before its body arrived, and this flush reconciles that charge to the
+    // bytes actually received. A run killed before this line keeps its
+    // pre-charge, so it over-counts rather than under-counts.
     meter.flush();
     let error = match outcome {
         StageOutcome::Staged => {
@@ -1302,7 +1303,7 @@ fn log_transient_failure(tag: &str, e: &anyhow::Error) {
         FailureCause::BudgetSpent => tracing::warn!(
             tag = %tag,
             error = %format!("{e:#}"),
-            "Could not download the update in advance; today's download budget for it is spent (#5799)"
+            "Could not download the update in advance; today's download budget is spent (#5799)"
         ),
         FailureCause::RateLimited => tracing::warn!(
             tag = %tag,
@@ -1493,7 +1494,7 @@ fn remove_quietly(path: &Path) {
 /// Download `url` into `part`, continuing from the bytes already there when
 /// the server honours a range request. Returns whether the result builds on
 /// bytes from an earlier attempt. Bounded by a stall timeout and by `meter`,
-/// the release's download budget: a slow transfer that keeps making progress
+/// the node's download budget: a slow transfer that keeps making progress
 /// is allowed to finish, one that passes the budget is stopped (the bytes
 /// kept, so a later attempt resumes them).
 async fn download_resumable(url: &str, part: &Path, meter: &ByteMeter<'_>) -> Result<bool> {
@@ -4055,7 +4056,7 @@ mod tests {
                 "TimedOut(deadline)=>",
                 "timedout;alaterattemptresumesthepartialdownload",
             ),
-            ("BudgetSpent=>", "today'sdownloadbudgetforitisspent"),
+            ("BudgetSpent=>", "today'sdownloadbudgetisspent"),
             ("RateLimited=>", "GitHubrate-limitedthedownload"),
             ("Unreachable=>", "GitHubcouldnotbereachedforit"),
         ] {
