@@ -1151,8 +1151,8 @@ fn write_update_cooldown_at(
     version: &str,
     failures: u32,
     (error, hold_reason): (&str, Option<&str>),
-    now: SystemTime,
-    rand_unit: f64,
+    (now, rand_unit): (SystemTime, f64),
+    provisional: bool,
 ) -> bool {
     let now_unix = unix_secs(now);
     let bounded =
@@ -1167,7 +1167,7 @@ fn write_update_cooldown_at(
                 .saturating_add(update_cooldown_delay(failures, rand_unit).as_secs()),
             last_error: bounded(error),
             hold_reason: hold_reason.map(bounded),
-            provisional: false,
+            provisional,
         },
     )
 }
@@ -1239,19 +1239,18 @@ fn record_failure_with(
             Some(prev) if prev.version == version => live_failures(&prev, now).saturating_add(1),
             _ => 1,
         };
-        let written =
-            write_update_cooldown_at(dir, version, failures, (error, None), now, rand_unit)
-                && (!provisional
-                    || read_update_cooldown_at(dir).is_some_and(|state| {
-                        store_update_cooldown_at(
-                            dir,
-                            &UpdateCooldownState {
-                                provisional: true,
-                                ..state
-                            },
-                        )
-                    }));
-        written.then_some(failures)
+        // One write, flag included: a second write setting the flag could fail
+        // after the first succeeded, leaving a counted record the updater's
+        // outcome would count again.
+        write_update_cooldown_at(
+            dir,
+            version,
+            failures,
+            (error, None),
+            (now, rand_unit),
+            provisional,
+        )
+        .then_some(failures)
     })
 }
 
@@ -1355,10 +1354,14 @@ pub(crate) fn hold_update_without_counting_at(
                 if update_cooldown_remaining_at(dir, version, now).is_some() {
                     // Live: keep its retry time and count, but say why it
                     // is held now (the reason a run's first hold gave is
-                    // replaced by the one its outcome gives).
+                    // replaced by the one its outcome gives). A hold is a
+                    // report on the attempt, so a provisional record is
+                    // provisional no longer: the next failure is a new
+                    // attempt and counts.
                     store_update_cooldown_at(
                         dir,
                         &UpdateCooldownState {
+                            provisional: false,
                             hold_reason: Some(
                                 reason
                                     .chars()
@@ -1379,8 +1382,8 @@ pub(crate) fn hold_update_without_counting_at(
             version,
             failures,
             (&last_error, Some(reason)),
-            now,
-            rand_unit,
+            (now, rand_unit),
+            false,
         );
     });
 }
@@ -3429,6 +3432,35 @@ pub(crate) mod tests {
         assert_eq!(
             record_update_failure_at(dir, "0.2.141", "updater failed", now, 0.5),
             Some(1)
+        );
+    }
+
+    /// A hold is a report on the attempt the node exited for: it ends the
+    /// record's provisional status, so the next failure is a new attempt and
+    /// counts, whether the hold met a live record or an expired one.
+    #[test]
+    fn a_hold_ends_a_provisional_record() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let now = SystemTime::now();
+        record_provisional_failure_at(dir, "0.2.141", "exited", now, 0.5);
+        hold_update_without_counting_at(dir, "0.2.141", "rate limited", now, 0.5);
+        let record = read_update_cooldown_at(dir).unwrap();
+        assert!(!record.provisional, "a live hold ends it");
+        assert_eq!(record.failures, 1);
+        assert_eq!(
+            record_update_failure_at(dir, "0.2.141", "updater failed", now, 0.5),
+            Some(2),
+            "the next failure counts"
+        );
+
+        let later = now + UPDATE_COOLDOWN_MAX * 2;
+        record_provisional_failure_at(dir, "0.2.141", "exited", later, 0.5);
+        let expired = later + UPDATE_COOLDOWN_MAX * 2;
+        hold_update_without_counting_at(dir, "0.2.141", "rate limited", expired, 0.5);
+        assert!(
+            !read_update_cooldown_at(dir).unwrap().provisional,
+            "an expired-record hold ends it"
         );
     }
 

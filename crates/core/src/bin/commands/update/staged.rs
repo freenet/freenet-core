@@ -190,7 +190,8 @@ impl std::error::Error for StageTimedOut {}
 const METER_PERSIST_EVERY: u64 = 16 * 1024 * 1024;
 
 /// What a download of unknown size is charged for before its body arrives:
-/// more than the largest release asset, the macOS DMG, with room to spare.
+/// more than the largest release asset, the macOS DMG (about 78 MiB for
+/// 0.2.148), with room to spare.
 const MAX_UNKNOWN_DOWNLOAD: u64 = 128 * 1024 * 1024;
 
 /// Counts the archive bytes a run receives (staging's or the updater's)
@@ -873,7 +874,9 @@ where
     }
     // A spent download budget holds before any request too, unless a
     // complete release is already staged and could be installed without
-    // downloading it (a manifest alone, left by a partial download, is not).
+    // downloading it. A manifest is written only after its archive
+    // verifies, so one whose archive no longer verifies (truncated or
+    // corrupted since, e.g. by a power loss) is not.
     if let Some(dir) = root.parent() {
         if super::super::rollback::download_bytes_at(dir, clock()) >= byte_budget {
             let staged = match staged_tag_at(root) {
@@ -1097,15 +1100,26 @@ fn freenet_archive_staged_blocking(root: &Path, tag: &str) -> bool {
     super::verify_checksum(&dir.join(&freenet), expected).is_ok()
 }
 
-/// Whether the node's download budget in `state_dir` is spent and no complete
-/// staged release could be installed without downloading: whether an attempt
-/// now could only be refused. Lets a #3934 locked-out node keep its daily
-/// retry rather than spend it on such an attempt.
+/// Whether the node's download budget in `state_dir` is spent and no staged
+/// release could be installed without downloading: whether an attempt now
+/// could only be refused. Lets a #3934 locked-out node keep its daily retry
+/// rather than spend it on such an attempt.
+///
+/// The claim runs on the async runtime, up to once a minute, so this checks
+/// only that a staged archive is present and non-empty, never its checksum.
+/// A non-empty archive that no longer verifies, or a staged release older
+/// than the one about to be fetched, lets the claim through; staging then
+/// verifies the archive and holds, so the cost is one daily retry, never a
+/// download.
 pub(crate) fn download_budget_blocks_at(state_dir: &Path, now: SystemTime) -> bool {
     let root = state_dir.join(CACHE_DIR);
     super::super::rollback::download_bytes_at(state_dir, now)
         >= super::super::rollback::DOWNLOAD_BYTES_PER_DAY
-        && !staged_tag_at(&root).is_some_and(|tag| freenet_archive_staged_blocking(&root, &tag))
+        && !staged_tag_at(&root).is_some_and(|tag| {
+            tag_dir(&root, &tag).is_ok_and(|dir| {
+                fs::metadata(dir.join(freenet_asset_name())).is_ok_and(|m| m.len() > 0)
+            })
+        })
 }
 
 /// Everything environmental [`stage_into`] depends on besides the cache root
@@ -3503,9 +3517,9 @@ mod tests {
 
     /// A download of unknown size (chunked) killed mid-way leaves at most
     /// MAX_UNKNOWN_DOWNLOAD charged, or what is left of a limited allowance,
-    /// and a huge declared size is capped at a day's budget: an unlimited
-    /// meter (a manual run, `--force`) can never pin the ledger, nor erase
-    /// what was charged before it.
+    /// and a huge declared size is capped at a day's budget: a killed
+    /// unlimited meter (a manual run, `--force`) charges at most a day's
+    /// budget, never `u64::MAX`, and never erases what was charged before it.
     #[tokio::test]
     async fn an_unknown_size_precharge_is_capped() {
         use super::super::super::rollback::{
@@ -4034,8 +4048,8 @@ mod tests {
         assert_eq!(runs.load(SeqCst), requests, "a held run makes no request");
     }
 
-    /// A staged manifest whose archive is incomplete (a partial download)
-    /// does not get past a spent budget: the run holds, without counting,
+    /// A staged manifest whose archive no longer verifies (truncated or
+    /// corrupted after it was staged) does not get past a spent budget: the run holds, without counting,
     /// before the poll token and the lookup. A complete staged copy does.
     #[tokio::test]
     async fn a_spent_budget_holds_when_the_staged_copy_is_incomplete() {
@@ -4050,7 +4064,9 @@ mod tests {
         );
         let now = SystemTime::now();
         super::super::super::rollback::charge_download_bytes_at(&dir, u64::MAX, now);
-        assert!(download_budget_blocks_at(&dir, now));
+        // The claim's cheap check sees a non-empty archive and lets a
+        // locked-out node's claim through; staging below still holds.
+        assert!(!download_budget_blocks_at(&dir, now));
         let clock = move || now;
         let prefix = server.url_str("/");
         let env = StageEnv {
@@ -4072,7 +4088,10 @@ mod tests {
             !dir.join("github_poll_bucket_node").exists(),
             "no poll token was spent"
         );
-        // Complete: the budget no longer blocks.
+        // An empty archive (a torn write) blocks the claim; a complete one
+        // does not.
+        write_staged(&root, &[(MANIFEST, manifest.as_bytes()), (&freenet, b"")]);
+        assert!(download_budget_blocks_at(&dir, now));
         write_staged(
             &root,
             &[(MANIFEST, manifest.as_bytes()), (&freenet, b"archive")],

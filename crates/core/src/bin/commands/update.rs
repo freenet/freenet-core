@@ -4438,10 +4438,6 @@ done
         assert!(code.contains("let _ = writeln!(io::stderr(), $($arg)*);"));
     }
 
-    /// What the updater records for each install outcome, by
-    /// behaviour rather than source. A verification failure goes to the #4073
-    /// gate and never to the cooldown; every other failure cools the release
-    /// down carrying its full error chain; an install clears.
     /// The wall clock at a whole second, read once: tests that compare a
     /// record's times with their own `now` drive the code with this, so no
     /// second boundary can fall between two readings.
@@ -4883,6 +4879,10 @@ done
         );
     }
 
+    /// What the updater records for each install outcome, by
+    /// behaviour rather than source. A verification failure goes to the #4073
+    /// gate and never to the cooldown; every other failure cools the release
+    /// down carrying its full error chain; an install clears.
     #[test]
     fn each_install_outcome_records_the_right_thing() {
         assert_eq!(
