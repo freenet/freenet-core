@@ -576,6 +576,15 @@ mod tests {
             }),
             OutboundClass::MustFlow
         );
+        assert_eq!(
+            classify(&SymmetricMessagePayload::Upgrade(
+                crate::transport::symmetric_message::UpgradeControl::Offer {
+                    attempt: 1,
+                    caps: 0,
+                }
+            )),
+            OutboundClass::MustFlow
+        );
     }
 
     #[test]

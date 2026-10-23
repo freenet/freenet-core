@@ -385,6 +385,8 @@ pub struct TransportMetrics {
     /// snapshot). Nothing sends them yet, so a non-zero value means a newer
     /// peer is offering upgrades this node only decodes and ignores.
     upgrade_control_received: AtomicU64,
+    /// Never-reset twin of `upgrade_control_received`.
+    cumulative_upgrade_control_received: AtomicU64,
 
     /// Inbound streams refused or evicted this period, by reason (reset each
     /// snapshot). The never-reset twin is `cumulative_inbound_stream_outcomes`,
@@ -734,6 +736,7 @@ impl TransportMetrics {
             inbound_queue_depth_hwm: AtomicU32::new(0),
             inbound_queue_drops: AtomicU64::new(0),
             upgrade_control_received: AtomicU64::new(0),
+            cumulative_upgrade_control_received: AtomicU64::new(0),
             inbound_stream_outcomes: Default::default(),
             nat_attempts_by_origin: Default::default(),
             nat_established_by_origin: Default::default(),
@@ -1030,8 +1033,18 @@ impl TransportMetrics {
     /// A QUIC upgrade control message arrived on an established connection
     /// and was ignored (#5940 e1). Counted once per distinct packet.
     pub(crate) fn record_upgrade_control_received(&self) {
+        self.cumulative_upgrade_control_received
+            .fetch_add(1, Ordering::Relaxed);
         self.upgrade_control_received
             .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// QUIC upgrade control messages received since process start, never
+    /// reset (tests only).
+    #[cfg(test)]
+    pub(crate) fn cumulative_upgrade_control_received(&self) -> u64 {
+        self.cumulative_upgrade_control_received
+            .load(Ordering::Relaxed)
     }
 
     /// Per-peer wire bytes as read by the ring's per-connection bookkeeping
@@ -3274,9 +3287,15 @@ mod tests {
             .take_snapshot()
             .expect("a received upgrade message is activity");
         assert_eq!(snap.upgrade_control_received, 2);
+        assert_eq!(metrics.cumulative_upgrade_control_received(), 2);
         let json = serde_json::to_value(&snap).unwrap();
         assert_eq!(json["upgrade_control_received"], 2);
         assert!(metrics.take_snapshot().is_none(), "the counter must reset");
+        assert_eq!(
+            metrics.cumulative_upgrade_control_received(),
+            2,
+            "the cumulative twin is never reset"
+        );
     }
 
     /// The snapshot field that carries `outcome`'s period count. Exhaustive

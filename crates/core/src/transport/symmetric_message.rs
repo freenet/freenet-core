@@ -431,7 +431,13 @@ pub(crate) enum SymmetricMessagePayload {
 ///   first release with it cannot decode a variant appended later: the whole
 ///   packet fails to decode and is dropped. The new variant may be sent only
 ///   to a peer that announced the bit saying it can decode it.
-/// - Existing variants and fields are never reordered or changed.
+/// - Existing variants and fields are never reordered or changed, and a
+///   field is never APPENDED to an existing variant. Bincode (1.3, as used
+///   here) accepts trailing bytes, and `payload` is the last field of
+///   [`SymmetricMessage`], so a decoder from this release reads the known
+///   fields and silently ignores the appended one rather than rejecting the
+///   packet. New data rides in a new caps-gated variant, or in an explicitly
+///   optional field that is itself caps-gated and documented as such.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum UpgradeControl {
     /// The QUIC server proposes the upgrade. `caps` is a bit set of optional
@@ -1077,6 +1083,18 @@ mod test {
         assert!(SymmetricMessage::deser(&bytes).is_err());
         // Truncated inside the inner payload.
         assert!(SymmetricMessage::deser(&known[..known.len() - 1]).is_err());
+
+        // The opposite hazard: bytes APPENDED after a known variant (a field
+        // a later release added to it) are not rejected. Bincode accepts
+        // trailing bytes, so this release reads the known fields and drops
+        // the rest. This is why fields are never appended to an existing
+        // variant (see `UpgradeControl`).
+        let mut extended = known.clone();
+        extended.extend_from_slice(&[0xAA; 5]);
+        assert_eq!(
+            SymmetricMessage::deser(&extended).unwrap().payload,
+            SymmetricMessagePayload::Upgrade(UpgradeControl::Accept { attempt: 1 })
+        );
     }
 
     /// The send gate fails closed: unknown and below-floor versions are

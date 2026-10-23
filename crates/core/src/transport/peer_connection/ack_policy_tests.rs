@@ -2814,6 +2814,10 @@ fn replies(sent: &[SymmetricMessage]) -> Vec<&SymmetricMessage> {
 async fn upgrade_control_is_counted_and_ignored_without_reply() {
     for version in [CAPABLE, OLD, None] {
         let mut e = single(version);
+        // Never reset, so another test's `take_snapshot` cannot disturb it;
+        // other tests may only add to it, hence `>=`.
+        let cumulative_before =
+            crate::transport::TRANSPORT_METRICS.cumulative_upgrade_control_received();
         let controls = [
             UpgradeControl::Offer {
                 attempt: 1,
@@ -2835,6 +2839,12 @@ async fn upgrade_control_is_counted_and_ignored_without_reply() {
             "{version:?}: the upgrade messages are not delivered and the next message is"
         );
         assert_eq!(e.conn.telemetry_test_counts.upgrade_controls_ignored, 3);
+        assert!(
+            crate::transport::TRANSPORT_METRICS.cumulative_upgrade_control_received()
+                - cumulative_before
+                >= 3,
+            "{version:?}: each upgrade message must reach TRANSPORT_METRICS"
+        );
         assert_eq!(e.conn.failure_count, 0);
         assert_eq!(e.conn.undecodable_count, 0);
 

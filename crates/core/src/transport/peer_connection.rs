@@ -2578,6 +2578,9 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
             // peer may offer an upgrade this node does not perform, and the
             // UDP session must carry on exactly as before. Reached only once
             // per packet id, after dedup, so the count is of distinct messages.
+            // The global counter is checked by
+            // `upgrade_control_is_counted_and_ignored_without_reply` through
+            // the delta of its never-reset twin.
             Upgrade(control) => {
                 super::TRANSPORT_METRICS.record_upgrade_control_received();
                 #[cfg(test)]

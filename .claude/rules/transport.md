@@ -541,6 +541,14 @@ after the last one, and existing variants keep their bytes
 (pre_upgrade_variants_keep_their_wire_bytes). A new UpgradeControl variant
 cannot be decoded by an e1 node, so it may be sent only behind a caps bit
 the receiver advertised; receivers ignore caps bits they do not know.
+Never append a field to an existing variant: bincode accepts trailing
+bytes, so an e1 decoder silently ignores it. New data goes in a new
+caps-gated variant.
+
+Not on the handshake path: in traverse_nat (connection_handler.rs) the
+joiner decodes with `?`, so an undecodable packet there still aborts the
+traversal. A sender must not send Upgrade, or any other new payload, before
+the connection is acknowledged (a constraint for e5).
 ```
 
 ### WHEN closing connections
