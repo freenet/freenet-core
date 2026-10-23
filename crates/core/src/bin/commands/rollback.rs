@@ -1107,6 +1107,8 @@ pub(crate) struct UpdateCooldownState {
     /// Written by the node as it exits for the updater: the attempt is
     /// counted in case the updater never reports, and the updater's own
     /// outcome for the same attempt replaces it rather than counting again.
+    /// Every other write clears it, a hold included: a hold is a report on
+    /// the attempt, so the next failure is a new attempt and counts.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub provisional: bool,
 }
@@ -1336,7 +1338,7 @@ fn lock_records(dir: &Path) -> Option<std::fs::File> {
 /// `freenet update` after every non-clean exit, crashes included, so counting
 /// these would walk a crash-looping node to the fallback without a single
 /// download. A live record keeps its retry time and count and takes the new
-/// reason; an expired one gets a fresh wait at
+/// reason, and stops being provisional; an expired one gets a fresh wait at
 /// its count (zero once its failures no longer count), keeping its last real
 /// error; with none, or one for another
 /// release, a hold at zero failures is written for `version`, so the release

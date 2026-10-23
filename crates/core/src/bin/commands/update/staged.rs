@@ -1109,8 +1109,9 @@ fn freenet_archive_staged_blocking(root: &Path, tag: &str) -> bool {
 /// only that a staged archive is present and non-empty, never its checksum.
 /// A non-empty archive that no longer verifies, or a staged release older
 /// than the one about to be fetched, lets the claim through; staging then
-/// verifies the archive and holds, so the cost is one daily retry, never a
-/// download.
+/// verifies the archive and holds. The cost is one daily retry, plus the one
+/// tag lookup a claiming trigger (startup, the re-poll) makes before staging,
+/// never a download.
 pub(crate) fn download_budget_blocks_at(state_dir: &Path, now: SystemTime) -> bool {
     let root = state_dir.join(CACHE_DIR);
     super::super::rollback::download_bytes_at(state_dir, now)
@@ -4049,8 +4050,9 @@ mod tests {
     }
 
     /// A staged manifest whose archive no longer verifies (truncated or
-    /// corrupted after it was staged) does not get past a spent budget: the run holds, without counting,
-    /// before the poll token and the lookup. A complete staged copy does.
+    /// corrupted after it was staged) does not get past a spent budget: the
+    /// run holds, without counting, before the poll token and the lookup. A
+    /// complete staged copy does.
     #[tokio::test]
     async fn a_spent_budget_holds_when_the_staged_copy_is_incomplete() {
         let freenet = freenet_asset_name();
