@@ -429,6 +429,24 @@ Current wire-gated floors:
   wrongly-suppressed peer waits for the ~5-minute interest heartbeat. Bias
   high, but understand that neither direction is free.
 
+- `QUIC_UPGRADE_MIN_VERSION` in
+  `crates/core/src/transport/symmetric_message.rs` (the QUIC upgrade control
+  message `SymmetricMessagePayload::Upgrade`, #5940 step e1).
+
+  Set to **`(0, 2, 149)`**, the release intended to first ship the decoder.
+  Nothing sends the message yet; a later step sends it only to peers that pass
+  `may_send_upgrade`, which reads this floor. Guarded by
+  `QUIC_UPGRADE_SHIPPED_IN`, now `None`, checked by
+  `symmetric_message.rs::upgrade_floor_tracks_the_shipping_release`: the bump
+  PR that lifts the crate to 0.2.149 goes red until the releaser either sets
+  `QUIC_UPGRADE_SHIPPED_IN = Some(QUIC_UPGRADE_MIN_VERSION)` (the decoder is in
+  that tag) or raises the floor (it is not). Bias HIGH: a peer at or below
+  0.2.147 panics on a payload it cannot decode and 0.2.148 drops it, so a floor
+  set too low lets a later sender crash old peers. The decoder MUST ship in a
+  release before any release that sends the message.
+  `upgrade_floor_stays_above_every_release_without_the_decoder` catches the
+  floor being lowered.
+
 When a NEW wire-gated feature first ships (not this one), set its floor to
 **exactly that release version** and freeze it, as described above.
 

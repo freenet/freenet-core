@@ -2099,7 +2099,8 @@ mod tests {
                 | SymmetricMessagePayload::ShortMessage { .. }
                 | SymmetricMessagePayload::NoOp
                 | SymmetricMessagePayload::Ping { .. }
-                | SymmetricMessagePayload::Pong { .. } => panic!("Expected stream fragment"),
+                | SymmetricMessagePayload::Pong { .. }
+                | SymmetricMessagePayload::Upgrade(_) => panic!("Expected stream fragment"),
             }
         }
 

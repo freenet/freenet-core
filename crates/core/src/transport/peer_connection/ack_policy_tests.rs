@@ -12,6 +12,7 @@ use bytes::Bytes;
 use super::*;
 use crate::transport::crypto::TransportKeypair;
 use crate::transport::packet_data::{PacketData, UnknownEncryption};
+use crate::transport::symmetric_message::UpgradeControl;
 
 type WireRx = mpsc::Receiver<(SocketAddr, Arc<[u8]>)>;
 
@@ -191,6 +192,10 @@ fn short(bytes: &'static [u8]) -> SymmetricMessagePayload {
     }
 }
 
+fn upgrade(control: UpgradeControl) -> SymmetricMessagePayload {
+    SymmetricMessagePayload::Upgrade(control)
+}
+
 fn receipts_for(sent: &[SymmetricMessage], id: u32) -> usize {
     sent.iter()
         .filter(|m| m.confirm_receipt.contains(&id))
@@ -263,6 +268,13 @@ fn receipt_policy_table() {
             "the handshake ack is tracked at id 0: ack it, never dedup id 0"
         );
         assert_eq!(receipt_policy(&ack_v2, ack_noops), AckWithoutDedup);
+        assert_eq!(
+            receipt_policy(&upgrade(UpgradeControl::Accept { attempt: 1 }), ack_noops),
+            Ack {
+                reack_duplicate: true
+            },
+            "an upgrade message is tracked by its sender: ack it, dedup it, re-ack duplicates"
+        );
     }
 }
 
@@ -2775,4 +2787,150 @@ async fn undecodable_authenticated_packet_is_dropped_not_fatal() {
     );
     assert_eq!(e.conn.failure_count, 0);
     assert_eq!(e.conn.undecodable_count, 1);
+}
+
+// ---------------------------------------------------------------------------
+// QUIC upgrade control message (#5940 e1): decoded, counted, ignored
+// ---------------------------------------------------------------------------
+
+/// Anything this end sent other than receipt carriers and keepalive probes.
+fn replies(sent: &[SymmetricMessage]) -> Vec<&SymmetricMessage> {
+    sent.iter()
+        .filter(|m| {
+            !matches!(
+                m.payload,
+                SymmetricMessagePayload::NoOp | SymmetricMessagePayload::Ping { .. }
+            )
+        })
+        .collect()
+}
+
+/// Every form of the upgrade message, received on an established connection,
+/// is counted and ignored: nothing is delivered to the application, nothing
+/// but a receipt is sent back, and the connection carries on and delivers the
+/// next message. This holds whatever version the remote reports, because the
+/// receiver never answers.
+#[tokio::test(start_paused = true)]
+async fn upgrade_control_is_counted_and_ignored_without_reply() {
+    for version in [CAPABLE, OLD, None] {
+        let mut e = single(version);
+        let controls = [
+            UpgradeControl::Offer {
+                attempt: 1,
+                caps: u32::MAX,
+            },
+            UpgradeControl::Accept { attempt: 1 },
+            UpgradeControl::Decline {
+                attempt: 1,
+                reason: u8::MAX,
+            },
+        ];
+        for (id, control) in (1u32..).zip(controls) {
+            e.deliver(id, upgrade(control), vec![]).await;
+        }
+        e.deliver(4, short(b"after"), vec![]).await;
+        assert_eq!(
+            e.pump(Duration::from_secs(1)).await.as_deref(),
+            Some(&b"after"[..]),
+            "{version:?}: the upgrade messages are not delivered and the next message is"
+        );
+        assert_eq!(e.conn.telemetry_test_counts.upgrade_controls_ignored, 3);
+        assert_eq!(e.conn.failure_count, 0);
+        assert_eq!(e.conn.undecodable_count, 0);
+
+        assert!(e.pump(Duration::from_secs(2)).await.is_none());
+        let sent = e.drain_sent();
+        assert!(
+            replies(&sent).is_empty(),
+            "{version:?}: the receiver must never answer an upgrade message, got {:?}",
+            replies(&sent)
+                .iter()
+                .map(|m| m.payload.to_string())
+                .collect::<Vec<_>>()
+        );
+        for id in 1..=3 {
+            assert_eq!(
+                receipts_for(&sent, id),
+                1,
+                "{version:?}: upgrade packet {id} is acked exactly once"
+            );
+        }
+    }
+}
+
+/// A retransmitted upgrade message (our receipt was lost) is re-acked, as a
+/// `ShortMessage` is, and not processed a second time.
+#[tokio::test(start_paused = true)]
+async fn duplicate_upgrade_control_is_reacked_and_not_recounted() {
+    let mut e = single(CAPABLE);
+    let offer = UpgradeControl::Offer {
+        attempt: 7,
+        caps: 0,
+    };
+    e.deliver(5, upgrade(offer), vec![]).await;
+    assert!(e.pump(Duration::from_millis(300)).await.is_none());
+    assert_eq!(receipts_for(&e.drain_sent(), 5), 1, "first ack");
+    assert_eq!(e.conn.telemetry_test_counts.upgrade_controls_ignored, 1);
+
+    tokio::time::advance(Duration::from_millis(700)).await;
+    e.deliver(5, upgrade(offer), vec![]).await;
+    e.deliver(6, short(b"next"), vec![]).await;
+    assert_eq!(
+        e.pump(Duration::from_secs(1)).await.as_deref(),
+        Some(&b"next"[..])
+    );
+    assert!(e.pump(Duration::from_millis(300)).await.is_none());
+    let sent = e.drain_sent();
+    assert_eq!(
+        receipts_for(&sent, 5),
+        1,
+        "the duplicate must be re-acked so the sender stops retransmitting"
+    );
+    assert!(replies(&sent).is_empty());
+    assert_eq!(
+        e.conn.telemetry_test_counts.upgrade_controls_ignored, 1,
+        "a duplicate is not processed again"
+    );
+}
+
+/// A newer peer's upgrade message with an inner variant this release does not
+/// know fails to decode and is dropped like any undecodable packet: no panic,
+/// no reply, not counted as an upgrade message, and the connection delivers
+/// the next message.
+#[tokio::test(start_paused = true)]
+async fn upgrade_control_with_unknown_inner_variant_is_dropped() {
+    const INNER_VARIANT_OFFSET: usize = 4 + 8 + 4;
+    let mut e = single(CAPABLE);
+    let mut bytes = bincode::serialize(&SymmetricMessage {
+        packet_id: 3,
+        confirm_receipt: vec![],
+        payload: upgrade(UpgradeControl::Accept { attempt: 1 }),
+    })
+    .unwrap();
+    bytes[INNER_VARIANT_OFFSET..INNER_VARIANT_OFFSET + 4].copy_from_slice(&3u32.to_le_bytes());
+    assert!(SymmetricMessage::deser(&bytes).is_err());
+    let packet =
+        PacketData::<_, { crate::transport::packet_data::MAX_PACKET_SIZE }>::from_buf_plain(&bytes)
+            .encrypt_symmetric(&e.inbound_key);
+    e.inbound
+        .send(PacketData::<UnknownEncryption>::from_buf(packet.data()))
+        .await
+        .expect("deliver");
+    e.deliver(4, short(b"after"), vec![]).await;
+
+    assert_eq!(
+        e.pump(Duration::from_millis(10)).await.as_deref(),
+        Some(&b"after"[..])
+    );
+    assert_eq!(e.conn.undecodable_count, 1);
+    assert_eq!(e.conn.failure_count, 0);
+    assert_eq!(e.conn.telemetry_test_counts.upgrade_controls_ignored, 0);
+    assert!(e.pump(Duration::from_millis(300)).await.is_none());
+    let sent = e.drain_sent();
+    assert!(replies(&sent).is_empty());
+    assert_eq!(
+        receipts_for(&sent, 3),
+        0,
+        "an undecodable packet earns no receipt"
+    );
 }
