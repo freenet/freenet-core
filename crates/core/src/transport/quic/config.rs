@@ -27,7 +27,6 @@ use quinn::{
 };
 use ring_crypto::{hkdf, hmac};
 
-use super::QuicMode;
 use super::cid::MacConnectionIdGenerator;
 use crate::config::GlobalRng;
 use crate::simulation::TimeSource;
@@ -42,9 +41,6 @@ pub(crate) const QUIC_VERSION: u32 = 1;
 
 /// The ALPN protocol both sides must offer. A peer offering anything else
 /// fails the handshake.
-// The TLS builders that use it are called by tests until peers have QUIC
-// identities (#5940 step c3).
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const ALPN: &[u8] = b"freenet-quic/1";
 
 /// The server name quinn requires for a connection attempt. With SNI off it
@@ -102,42 +98,42 @@ impl QuicSettings {
 
 /// The flow-control window for one connection in one direction: 5% of the
 /// memory split over every connection's receive and send windows, clamped
-/// to [`MIN_WINDOW_BYTES`], [`MAX_WINDOW_BYTES`]. The same value is the
-/// connection receive window, the per-stream receive window and the send
-/// window, so a connection holds at most twice this.
+/// to [`MIN_WINDOW_BYTES`], [`MAX_WINDOW_BYTES`], and never more than
+/// [`MAX_INBOUND_STREAM_BYTES_PER_CONNECTION`] (that cap wins over the
+/// floor). The same value is the connection receive window, the per-stream
+/// receive window (so a stream's window is never above its connection's)
+/// and the send window.
+///
+/// The cap does not bind today (the 2 MiB clamp is far below it); it only
+/// stops a future constant change from raising the windows past it. It does
+/// NOT mean a QUIC connection holds no more memory than a UDP-transport one:
+/// QUIC windows come on top of whatever the application reassembles, the
+/// send window is outbound memory the reassembly exception never covered,
+/// and quinn keeps per-connection state the windows do not bound (up to 256
+/// unidirectional streams, sent-packet and ACK bookkeeping, the assembler,
+/// crypto buffers).
+///
+/// The windows are the same class of per-connection exception as inbound
+/// stream reassembly and are in the `NOT_SUMMED` table of
+/// `contract::executor::declared_cache_ceiling` (see the "Recorded
+/// exception: inbound stream reassembly" note in
+/// `.claude/rules/bug-prevention-patterns.md`). That memory, roughly twice
+/// the window per connection plus quinn's own state, is NOT accounted in the
+/// node aggregate, and must be before QUIC is on by default (the rollout
+/// plan records that gate).
+///
+/// [`MAX_INBOUND_STREAM_BYTES_PER_CONNECTION`]: crate::transport::peer_connection::streaming::MAX_INBOUND_STREAM_BYTES_PER_CONNECTION
 pub(crate) fn connection_window_bytes(memory_limit: usize, max_connections: usize) -> u64 {
     let share = memory_limit / WINDOW_MEMORY_DIVISOR / (2 * max_connections.max(1));
-    (share as u64).clamp(MIN_WINDOW_BYTES, MAX_WINDOW_BYTES)
+    (share as u64)
+        .clamp(MIN_WINDOW_BYTES, MAX_WINDOW_BYTES)
+        .min(PER_CONNECTION_INBOUND_CAP)
 }
 
-/// The most memory the QUIC endpoint can hold on a node with `memory_limit`
-/// and `max_connections`: every connection's receive and send windows full,
-/// plus quinn's buffer for pending connection attempts. Zero with QUIC off,
-/// because then no endpoint exists.
-///
-/// With QUIC on, the windows' floor alone makes this at least
-/// `2 * 200 * 128 KiB` (50 MiB) at the default 200 connections, and a 1 GiB
-/// host's declared caches had a margin of 2.6 MB under their half-of-memory
-/// limit when this was written, so the two do not fit together. That has to
-/// be settled before QUIC is offered to operators (#5940).
-// Read by the declared memory ceiling, which only tests evaluate.
-#[cfg_attr(not(test), allow(dead_code))]
-pub(crate) fn quic_endpoint_budget_for(
-    memory_limit: usize,
-    mode: QuicMode,
-    max_connections: usize,
-) -> usize {
-    match mode {
-        QuicMode::Off => 0,
-        QuicMode::Prefer => {
-            let window = connection_window_bytes(memory_limit, max_connections);
-            usize::try_from(window)
-                .unwrap_or(usize::MAX)
-                .saturating_mul(2 * max_connections.max(1))
-                .saturating_add(INCOMING_BUFFER_TOTAL_BYTES as usize)
-        }
-    }
-}
+/// [`connection_window_bytes`]'s upper bound: the UDP transport's
+/// per-connection reassembly allowance.
+const PER_CONNECTION_INBOUND_CAP: u64 =
+    crate::transport::peer_connection::streaming::MAX_INBOUND_STREAM_BYTES_PER_CONNECTION;
 
 /// Fill `out` from the OS entropy pool, for key material: the
 /// stateless-reset key, the handshake-token key and the connection-ID MAC
@@ -145,30 +141,29 @@ pub(crate) fn quic_endpoint_budget_for(
 /// and would make the keys predictable to anyone who reads the seed
 /// (`.claude/rules/code-style.md`, OsRng exception). They do not affect the
 /// order or timing of what the endpoint sends, so a seeded run still
-/// repeats its event trace.
-pub(crate) fn os_random(out: &mut [u8]) {
+/// repeats its event trace. ring's SystemRandom reads getrandom(2) (or the
+/// platform equivalent); a failure is returned, so the endpoint is not built
+/// and the node runs with QUIC off instead of panicking.
+pub(crate) fn os_random(out: &mut [u8]) -> std::io::Result<()> {
     use ring_crypto::rand::SecureRandom;
-    // ring's SystemRandom reads getrandom(2) (or the platform equivalent);
-    // it fails only if the OS has no entropy source at all, where nothing
-    // cryptographic can run.
     ring_crypto::rand::SystemRandom::new()
         .fill(out)
-        .unwrap_or_else(|_| panic!("the OS entropy source failed"));
+        .map_err(|_| std::io::Error::other("the OS entropy source failed"))
 }
 
 /// The endpoint configuration: version, payload size, greasing, the
 /// stateless-reset key, the connection-ID generator and quinn's RNG seed.
 /// Keys come from the OS ([`os_random`]); quinn's RNG seed comes from
 /// [`GlobalRng`], so a seeded run is repeatable.
-pub(crate) fn endpoint_config() -> EndpointConfig {
-    endpoint_config_with_cid_key(MacConnectionIdGenerator::new_key())
+pub(crate) fn endpoint_config() -> std::io::Result<EndpointConfig> {
+    endpoint_config_with_cid_key(MacConnectionIdGenerator::new_key()?)
 }
 
 /// [`endpoint_config`] with a given connection-ID MAC key, so a test can
 /// make IDs the endpoint accepts.
-pub(crate) fn endpoint_config_with_cid_key(cid_key: [u8; 32]) -> EndpointConfig {
+pub(crate) fn endpoint_config_with_cid_key(cid_key: [u8; 32]) -> std::io::Result<EndpointConfig> {
     let mut reset_key = [0u8; 64];
-    os_random(&mut reset_key);
+    os_random(&mut reset_key)?;
     let mut config = EndpointConfig::new(Arc::new(hmac::Key::new(hmac::HMAC_SHA256, &reset_key)));
     config.cid_generator(move || Box::new(MacConnectionIdGenerator::new(cid_key)));
     let mut seed = [0u8; 32];
@@ -184,7 +179,7 @@ pub(crate) fn endpoint_config_with_cid_key(cid_key: [u8; 32]) -> EndpointConfig 
         .grease_quic_bit(false)
         .min_reset_interval(Duration::from_millis(20))
         .rng_seed(Some(seed));
-    config
+    Ok(config)
 }
 
 /// The transport configuration shared by both directions of a connection.
@@ -240,9 +235,9 @@ pub(crate) fn server_config(
     crypto: Arc<dyn quinn::crypto::ServerConfig>,
     transport: Arc<TransportConfig>,
     clock: Arc<dyn quinn::TimeSource>,
-) -> ServerConfig {
+) -> std::io::Result<ServerConfig> {
     let mut master_key = [0u8; 64];
-    os_random(&mut master_key);
+    os_random(&mut master_key)?;
     let token_key = hkdf::Salt::new(hkdf::HKDF_SHA256, &[]).extract(&master_key);
     let mut tokens = ValidationTokenConfig::default();
     tokens.sent(0).log(Arc::new(NoneTokenLog));
@@ -260,7 +255,7 @@ pub(crate) fn server_config(
         .incoming_buffer_size(INCOMING_BUFFER_BYTES)
         .incoming_buffer_size_total(INCOMING_BUFFER_TOTAL_BYTES)
         .time_source(clock);
-    config
+    Ok(config)
 }
 
 /// A client configuration over `crypto`: version 1, no stored tokens, and
@@ -283,17 +278,14 @@ pub(crate) fn client_config(
 }
 
 /// The rustls settings both sides share: the ring provider, TLS 1.3 only.
-// The TLS builders below are called by tests until peers have QUIC
-// identities (#5940 step c3); the node builds no TLS configuration yet.
-#[cfg_attr(not(test), allow(dead_code))]
 fn provider() -> Arc<rustls::crypto::CryptoProvider> {
     Arc::new(rustls::crypto::ring::default_provider())
 }
 
 /// The TLS server configuration: TLS 1.3 only with the ring provider, the
 /// raw public key in `key`, peers checked by `verifier`, the fixed ALPN, and
-/// no session resumption, tickets or early data.
-#[cfg_attr(not(test), allow(dead_code))]
+/// no session resumption, tickets or early data. `identity` builds the key
+/// and the verifiers.
 pub(crate) fn tls_server_config(
     key: Arc<rustls::sign::CertifiedKey>,
     verifier: Arc<dyn rustls::server::danger::ClientCertVerifier>,
@@ -305,7 +297,6 @@ pub(crate) fn tls_server_config(
 }
 
 /// The rustls half of [`tls_server_config`].
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn rustls_server_config(
     key: Arc<rustls::sign::CertifiedKey>,
     verifier: Arc<dyn rustls::server::danger::ClientCertVerifier>,
@@ -327,8 +318,8 @@ pub(crate) fn rustls_server_config(
 
 /// The TLS client configuration: TLS 1.3 only with the ring provider, the
 /// raw public key in `key`, the server checked by `verifier`, the fixed
-/// ALPN, no SNI, and no session resumption or early data.
-#[cfg_attr(not(test), allow(dead_code))]
+/// ALPN, no SNI, and no session resumption or early data. `identity` builds
+/// the key and the verifier.
 pub(crate) fn tls_client_config(
     key: Arc<rustls::sign::CertifiedKey>,
     verifier: Arc<dyn rustls::client::danger::ServerCertVerifier>,
@@ -340,7 +331,6 @@ pub(crate) fn tls_client_config(
 }
 
 /// The rustls half of [`tls_client_config`].
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn rustls_client_config(
     key: Arc<rustls::sign::CertifiedKey>,
     verifier: Arc<dyn rustls::client::danger::ServerCertVerifier>,
@@ -363,7 +353,6 @@ pub(crate) fn rustls_client_config(
 
 /// A TLS configuration quinn or rustls rejected.
 #[derive(Debug, thiserror::Error)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) enum TlsConfigError {
     #[error(transparent)]
     Rustls(#[from] rustls::Error),

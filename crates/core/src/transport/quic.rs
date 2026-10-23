@@ -3,11 +3,15 @@
 //! The endpoint reads only the QUIC-class datagrams the [`DemuxSocket`] queues
 //! for it, and sends through the same socket, so it shares the port, the
 //! node-wide egress cap and the simulation socket with the UDP transport.
-//! Nothing in this step connects to anyone: with `transport-quic = "prefer"`
-//! the node builds the endpoint at bind with no server configuration and an
-//! empty allow-set, so no datagram reaches it and it sends nothing. Peer
-//! identity (step c3) and upgrading a UDP transport session to QUIC come
-//! later; until then only tests open QUIC connections.
+//! Nothing in the node connects to anyone yet: with `transport-quic =
+//! "prefer"` the node builds the endpoint at bind with an empty allow-set, so
+//! no datagram reaches it and it sends nothing. Upgrading a UDP transport
+//! session to QUIC comes later; until then only tests open QUIC connections.
+//!
+//! Every connection is authenticated by the transport keys the two nodes
+//! already have ([`identity`]): [`QuicEndpoint::connect`] takes the server's
+//! expected [`TransportPublicKey`], and [`QuicEndpoint::allow_peer`] the
+//! client's, and a handshake with any other key fails.
 //!
 //! The parts:
 //!
@@ -18,12 +22,16 @@
 //! - [`config`]: every quinn and rustls setting, pinned in one place.
 //! - [`cid`]: connection IDs that carry a keyed MAC, so quinn drops a short
 //!   header packet with a forged ID silently instead of answering it.
+//! - [`identity`]: the TLS raw public key, XEdDSA signer and pinned
+//!   verifiers made from the node's X25519 transport key.
 //!
 //! [`DemuxSocket`]: super::DemuxSocket
+//! [`TransportPublicKey`]: super::TransportPublicKey
 //! [`TimeSource`]: crate::simulation::TimeSource
 
 pub(crate) mod cid;
 pub(crate) mod config;
+pub(crate) mod identity;
 pub(crate) mod runtime;
 pub(crate) mod socket;
 
@@ -32,14 +40,19 @@ pub(crate) mod test_tls;
 #[cfg(test)]
 mod tests;
 
+use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use parking_lot::Mutex;
+
 use super::Socket;
+use super::crypto::{TransportKeypair, TransportPublicKey};
 use super::demux::{DemuxSocket, QuicSourcePermit};
 use crate::config::GlobalExecutor;
 use crate::simulation::TimeSource;
+use identity::{PeerKey, QuicIdentity};
 
 pub(crate) use config::QuicSettings;
 
@@ -49,8 +62,9 @@ pub enum QuicMode {
     /// No QUIC endpoint is built and no QUIC datagram is read. The default.
     #[default]
     Off,
-    /// The node builds a QUIC endpoint on its UDP port. In this release it
-    /// accepts nothing and connects to nobody. It still differs from `Off`
+    /// The node builds a QUIC endpoint on its UDP port. In this release
+    /// nothing in the node asks it to accept or open a connection. It still
+    /// differs from `Off`
     /// in three ways: the demux socket has a QUIC ingress, so a QUIC-class
     /// datagram is counted `quic_ingress_not_allowed` instead of
     /// `quic_ingress_no_ingress`; quinn's endpoint driver runs as a task
@@ -88,18 +102,139 @@ impl QuicMode {
 
 /// The node's QUIC endpoint. Built only when `transport-quic` is not `off`.
 ///
-/// Holds the quinn endpoint and a way to add peers to the demux socket's
-/// allow-set. Dropping it drops the quinn endpoint handle; quinn's driver
-/// task ends once no connection is left.
+/// Holds the quinn endpoint, the node's QUIC identity, and a way to add peers
+/// to the demux socket's allow-set. Clones share all of it. Dropping the last
+/// handle drops the quinn endpoint; quinn's driver task ends once no
+/// connection is left.
+#[derive(Clone)]
 pub(crate) struct QuicEndpoint {
     endpoint: quinn::Endpoint,
     sources: Arc<dyn QuicSources>,
     /// The transport settings of every connection (`config::transport_config`).
-    #[cfg_attr(not(test), allow(dead_code))]
     transport: Arc<quinn::TransportConfig>,
-    /// quinn's system clock on the endpoint's time source.
-    #[cfg_attr(not(test), allow(dead_code))]
-    clock: Arc<dyn quinn::TimeSource>,
+    /// The server settings every accepted connection starts from
+    /// (`config::server_config`), with TLS that refuses every client: each
+    /// accepted attempt replaces the TLS with one pinned to the client it
+    /// expects ([`QuicIncoming::establish`]).
+    server: Arc<quinn::ServerConfig>,
+    /// This node's raw public key and signer.
+    identity: Arc<QuicIdentity>,
+    /// The transport key each allowed client must present.
+    expected_clients: Arc<ExpectedClients>,
+}
+
+/// The key each allowed client address must present. An entry counts the
+/// [`QuicPeerPermit`]s that allow the address and, separately, the attempts
+/// and connections authenticated (or being authenticated) against that key
+/// ([`KeyHold`]). It leaves when both counts reach zero, so while an attempt
+/// or connection for a key is alive the address cannot be allowed for
+/// another key ([`QuicAllowError::KeyConflict`]). New attempts are accepted
+/// only while a permit is alive.
+#[derive(Default)]
+struct ExpectedClients {
+    by_addr: Mutex<HashMap<SocketAddr, ExpectedEntry>>,
+}
+
+struct ExpectedEntry {
+    key: PeerKey,
+    permits: usize,
+    holds: usize,
+}
+
+impl ExpectedClients {
+    /// The key `addr` was allowed with, if a permit for it is alive.
+    #[cfg(test)]
+    fn get(&self, addr: SocketAddr) -> Option<PeerKey> {
+        self.by_addr
+            .lock()
+            .get(&addr)
+            .filter(|entry| entry.permits > 0)
+            .map(|entry| entry.key.clone())
+    }
+
+    /// The key `addr` was allowed with and a hold on it, in one step, if a
+    /// permit for it is alive.
+    fn hold(self: &Arc<Self>, addr: SocketAddr) -> Option<(PeerKey, KeyHold)> {
+        let mut by_addr = self.by_addr.lock();
+        let entry = by_addr.get_mut(&addr).filter(|entry| entry.permits > 0)?;
+        entry.holds += 1;
+        Some((
+            entry.key.clone(),
+            KeyHold {
+                expected: self.clone(),
+                addr,
+            },
+        ))
+    }
+
+    /// Count one release of `addr`'s entry, a permit or a hold.
+    fn release(&self, addr: SocketAddr, permit: bool) {
+        let mut by_addr = self.by_addr.lock();
+        if let Some(entry) = by_addr.get_mut(&addr) {
+            if permit {
+                entry.permits = entry.permits.saturating_sub(1);
+            } else {
+                entry.holds = entry.holds.saturating_sub(1);
+            }
+            if entry.permits == 0 && entry.holds == 0 {
+                by_addr.remove(&addr);
+            }
+        }
+    }
+}
+
+/// Keeps an address bound to the key an attempt or connection from it is
+/// authenticated against, while alive.
+struct KeyHold {
+    expected: Arc<ExpectedClients>,
+    addr: SocketAddr,
+}
+
+impl Drop for KeyHold {
+    fn drop(&mut self) {
+        self.expected.release(self.addr, false);
+    }
+}
+
+/// Keeps a peer's address on the allow-set, and the key it must present
+/// when it connects, while alive. Returned by [`QuicEndpoint::allow_peer`].
+#[must_use = "the peer is allowed only while the permit is alive"]
+pub(crate) struct QuicPeerPermit {
+    expected: Arc<ExpectedClients>,
+    addr: SocketAddr,
+    // Declared last so it is dropped after the key entry: between the two,
+    // an attempt from the address finds no key and is ignored.
+    _source: QuicSourcePermit,
+}
+
+impl std::fmt::Debug for QuicPeerPermit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("QuicPeerPermit")
+            .field("addr", &self.addr)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for QuicPeerPermit {
+    fn drop(&mut self) {
+        self.expected.release(self.addr, true);
+    }
+}
+
+/// Why [`QuicEndpoint::allow_peer`] refused a peer.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum QuicAllowError {
+    /// The demux socket's allow-set is full.
+    #[error("the QUIC allow-set is full")]
+    AllowSetFull,
+    /// The address is already bound to another key: a permit for it, or an
+    /// attempt or connection authenticated against it, is alive. The earlier
+    /// key wins until all of those are gone, so an address cannot be moved to
+    /// a new key while anything for the old one is using it.
+    #[error("the address is already allowed for another key")]
+    KeyConflict,
+    #[error(transparent)]
+    UnusableKey(#[from] identity::UnusableKey),
 }
 
 /// The demux socket's QUIC allow-set, without its socket type.
@@ -134,6 +269,10 @@ pub(crate) enum QuicConnectError {
     #[error("the QUIC allow-set is full")]
     AllowSetFull,
     #[error(transparent)]
+    UnusableKey(#[from] identity::UnusableKey),
+    #[error(transparent)]
+    Tls(#[from] config::TlsConfigError),
+    #[error(transparent)]
     Connect(#[from] quinn::ConnectError),
     #[error(transparent)]
     Connection(#[from] quinn::ConnectionError),
@@ -142,7 +281,7 @@ pub(crate) enum QuicConnectError {
 impl QuicEndpoint {
     /// Build an endpoint over `socket`, which must be the socket the
     /// listener reads (it fills the QUIC ingress queue), bound at
-    /// `local_addr`.
+    /// `local_addr`, authenticating as the holder of `keypair`.
     ///
     /// `time` drives quinn's clock and timers. It must be the clock the
     /// socket's egress cap was built on, so the cap computes a waiting
@@ -150,23 +289,25 @@ impl QuicEndpoint {
     /// passes `RealTime` for both (`bind_udp_listener`), tests one
     /// `VirtualTime` for both.
     ///
-    /// Enables the socket's QUIC ingress with an empty allow-set and sets no
-    /// server configuration, so the endpoint accepts nothing until
-    /// [`Self::set_server_config`] and receives nothing until a peer is
-    /// allowed ([`Self::allow_peer`], or a connection this endpoint opens).
-    /// Fails if the socket's ingress was already enabled.
+    /// Enables the socket's QUIC ingress with an empty allow-set, so the
+    /// endpoint receives nothing until a peer is allowed
+    /// ([`Self::allow_peer`], or a connection this endpoint opens). Fails if
+    /// the socket's ingress was already enabled, or if the TLS
+    /// configuration cannot be built.
     pub(crate) fn bind<S: Socket, T: TimeSource>(
         socket: Arc<DemuxSocket<S>>,
         local_addr: SocketAddr,
         time: T,
         settings: &QuicSettings,
+        keypair: &TransportKeypair,
     ) -> io::Result<Self> {
         Self::bind_with(
             socket,
             local_addr,
             time,
             settings,
-            config::endpoint_config(),
+            keypair,
+            config::endpoint_config()?,
         )
     }
 
@@ -177,8 +318,9 @@ impl QuicEndpoint {
         local_addr: SocketAddr,
         time: T,
         settings: &QuicSettings,
+        keypair: &TransportKeypair,
     ) -> Option<Self> {
-        match Self::bind(socket, local_addr, time, settings) {
+        match Self::bind(socket, local_addr, time, settings, keypair) {
             Ok(endpoint) => Some(endpoint),
             Err(error) => {
                 tracing::warn!(
@@ -198,94 +340,152 @@ impl QuicEndpoint {
         local_addr: SocketAddr,
         time: T,
         settings: &QuicSettings,
+        keypair: &TransportKeypair,
         endpoint_config: quinn::EndpointConfig,
     ) -> io::Result<Self> {
-        let ingress = socket.enable_quic_ingress().ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                "the socket's QUIC ingress is already enabled",
-            )
-        })?;
+        let invalid = |error: &dyn std::fmt::Display| {
+            io::Error::new(io::ErrorKind::InvalidInput, error.to_string())
+        };
+        let identity = Arc::new(QuicIdentity::new(keypair).map_err(|e| invalid(&e))?);
+        let refusing = identity.refusing_server_tls().map_err(|e| invalid(&e))?;
         let sources: Arc<dyn QuicSources> = socket.clone();
-        let quic_socket = Arc::new(socket::QuicSocket::new(socket, ingress, local_addr));
         let transport = Arc::new(config::transport_config(settings, &time));
         let clock = config::system_clock(time.clone());
-        let runtime = Arc::new(runtime::QuicRuntime::new(time));
-        let endpoint =
-            quinn::Endpoint::new_with_abstract_socket(endpoint_config, None, quic_socket, runtime)?;
+        let server = Arc::new(config::server_config(
+            Arc::new(refusing),
+            transport.clone(),
+            clock,
+        )?);
+        // If quinn refuses the socket after the ingress is enabled, the
+        // ingress is disabled again, so the node is left as with QUIC off.
+        let endpoint = socket
+            .with_quic_ingress(|ingress| {
+                let quic_socket =
+                    Arc::new(socket::QuicSocket::new(socket.clone(), ingress, local_addr));
+                let runtime = Arc::new(runtime::QuicRuntime::new(time));
+                // The server configuration is set so quinn hands every
+                // Initial from an allowed source to `accept` (without one it
+                // answers with a stateless reset); its TLS refuses every
+                // client, and `accept` replaces it per attempt.
+                quinn::Endpoint::new_with_abstract_socket(
+                    endpoint_config,
+                    Some((*server).clone()),
+                    quic_socket,
+                    runtime,
+                )
+            })
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "the socket's QUIC ingress is already enabled",
+                )
+            })??;
         tracing::info!(
             %local_addr,
             window_bytes = settings.window_bytes(),
-            "QUIC endpoint built (transport-quic = prefer); it accepts no connections in this release"
+            "QUIC endpoint built (transport-quic = prefer); nothing opens connections on it in this release"
         );
         Ok(Self {
             endpoint,
             sources,
             transport,
-            clock,
+            server,
+            identity,
+            expected_clients: Arc::new(ExpectedClients::default()),
         })
     }
 
-    /// Let QUIC datagrams from `addr` reach the endpoint while the permit
-    /// is alive: a peer expected to connect to this endpoint. `None` if the
-    /// allow-set is full.
+    /// Let the holder of `expected` connect from `addr` while the permit is
+    /// alive: QUIC datagrams from `addr` reach the endpoint, and an attempt
+    /// from it completes only if the client presents `expected`.
     #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) fn allow_peer(&self, addr: SocketAddr) -> Option<QuicSourcePermit> {
-        self.sources.allow(addr)
-    }
-
-    /// A server configuration with this endpoint's settings over `crypto`
-    /// (`config::server_config`).
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) fn server_config(
+    pub(crate) fn allow_peer(
         &self,
-        crypto: Arc<dyn quinn::crypto::ServerConfig>,
-    ) -> quinn::ServerConfig {
-        config::server_config(crypto, self.transport.clone(), self.clock.clone())
+        addr: SocketAddr,
+        expected: &TransportPublicKey,
+    ) -> Result<QuicPeerPermit, QuicAllowError> {
+        let key = PeerKey::of(expected)?;
+        let source = self
+            .sources
+            .allow(addr)
+            .ok_or(QuicAllowError::AllowSetFull)?;
+        // The demux normalizes the address (an IPv4-mapped IPv6 address to
+        // IPv4); key the entry the same way so `accept` finds it.
+        let addr = source.addr();
+        {
+            let mut by_addr = self.expected_clients.by_addr.lock();
+            match by_addr.get_mut(&addr) {
+                Some(entry) if entry.key == key => entry.permits += 1,
+                Some(_) => return Err(QuicAllowError::KeyConflict),
+                None => {
+                    by_addr.insert(
+                        addr,
+                        ExpectedEntry {
+                            key,
+                            permits: 1,
+                            holds: 0,
+                        },
+                    );
+                }
+            }
+        }
+        Ok(QuicPeerPermit {
+            expected: self.expected_clients.clone(),
+            addr,
+            _source: source,
+        })
     }
 
     /// A client configuration with this endpoint's settings over `crypto`
     /// (`config::client_config`).
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) fn client_config(
-        &self,
-        crypto: Arc<dyn quinn::crypto::ClientConfig>,
-    ) -> quinn::ClientConfig {
+    fn client_config(&self, crypto: Arc<dyn quinn::crypto::ClientConfig>) -> quinn::ClientConfig {
         config::client_config(crypto, self.transport.clone())
     }
 
-    /// Accept incoming connections with `config`. Nothing calls this outside
-    /// tests until peers have QUIC identities (step c3).
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) fn set_server_config(&self, config: quinn::ServerConfig) {
-        self.endpoint.set_server_config(Some(config));
-    }
-
-    /// Connect to `addr` and wait for the handshake. The peer's address is
-    /// on the allow-set for the life of the connection.
+    /// Connect to `addr`, which must present the raw public key of
+    /// `expected` (the peer's transport key), and wait for the handshake.
+    /// The peer's address is on the allow-set for the life of the
+    /// connection.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) async fn connect(
         &self,
         addr: SocketAddr,
+        expected: &TransportPublicKey,
+    ) -> Result<QuicConnection, QuicConnectError> {
+        let peer = PeerKey::of(expected)?;
+        let tls = self.identity.client_tls(&peer)?;
+        let config = self.client_config(Arc::new(tls));
+        self.connect_with(addr, config, peer).await
+    }
+
+    /// [`Self::connect`] with a given client configuration, which must pin
+    /// the server to `peer`.
+    async fn connect_with(
+        &self,
+        addr: SocketAddr,
         config: quinn::ClientConfig,
+        peer: PeerKey,
     ) -> Result<QuicConnection, QuicConnectError> {
         let permit = self
-            .allow_peer(addr)
+            .sources
+            .allow(addr)
             .ok_or(QuicConnectError::AllowSetFull)?;
         let connecting = self
             .endpoint
             .connect_with(config, addr, config::SERVER_NAME)?;
         let connection = connecting.await?;
-        Ok(QuicConnection::new(connection, permit))
+        Ok(QuicConnection::new(connection, permit, None, peer))
     }
 
     /// The next incoming connection attempt from an allowed source, with its
     /// handshake NOT awaited: the caller drives it with
     /// [`QuicIncoming::establish`], so one stalled handshake does not hold
-    /// back the next attempt. An attempt from an address that is not on the
+    /// back the next attempt. The attempt is pinned to the key its address
+    /// was allowed with. An attempt from an address that is not on the
     /// allow-set (which the demux socket should not pass on; it can happen
-    /// when the permit was dropped after the datagram was queued) is ignored.
-    /// `None` once the endpoint is closed.
+    /// when the permit was dropped after the datagram was queued), or that
+    /// has no expected key (this endpoint's own outgoing connection to it is
+    /// what allowed it), is ignored. `None` once the endpoint is closed.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) async fn accept(&self) -> Option<QuicIncoming> {
         loop {
@@ -298,7 +498,28 @@ impl QuicEndpoint {
                 incoming.ignore();
                 continue;
             };
-            return Some(QuicIncoming { incoming, permit });
+            let Some((expected, hold)) = self.expected_clients.hold(permit.addr()) else {
+                tracing::debug!(%remote, "Ignoring a QUIC connection attempt from a source with no expected key");
+                incoming.ignore();
+                continue;
+            };
+            let tls = match self.identity.server_tls(&expected) {
+                Ok(tls) => tls,
+                Err(error) => {
+                    tracing::warn!(%remote, %error, "Could not build the TLS configuration for a QUIC connection attempt");
+                    incoming.ignore();
+                    continue;
+                }
+            };
+            let mut config = (*self.server).clone();
+            config.crypto = Arc::new(tls);
+            return Some(QuicIncoming {
+                incoming,
+                permit,
+                config: Arc::new(config),
+                peer: expected,
+                hold,
+            });
         }
     }
 }
@@ -308,14 +529,26 @@ impl QuicEndpoint {
 pub(crate) struct QuicIncoming {
     incoming: quinn::Incoming,
     permit: QuicSourcePermit,
+    /// The endpoint's server settings with TLS pinned to the key the
+    /// source was allowed with.
+    config: Arc<quinn::ServerConfig>,
+    /// That key, which the handshake must prove.
+    peer: PeerKey,
+    /// Keeps the address bound to `peer` while the attempt lives.
+    hold: KeyHold,
 }
 
 impl QuicIncoming {
     /// Complete the handshake. On failure the permit is dropped with it.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) async fn establish(self) -> Result<QuicConnection, quinn::ConnectionError> {
-        let connection = self.incoming.await?;
-        Ok(QuicConnection::new(connection, self.permit))
+        let connection = self.incoming.accept_with(self.config)?.await?;
+        Ok(QuicConnection::new(
+            connection,
+            self.permit,
+            Some(self.hold),
+            self.peer,
+        ))
     }
 }
 
@@ -324,6 +557,8 @@ impl QuicIncoming {
 /// timed out, failed, or dropped here (dropping closes it).
 pub(crate) struct QuicConnection {
     connection: quinn::Connection,
+    /// The key the peer proved in the handshake.
+    peer: PeerKey,
 }
 
 impl std::fmt::Debug for QuicConnection {
@@ -335,18 +570,33 @@ impl std::fmt::Debug for QuicConnection {
 }
 
 impl QuicConnection {
-    fn new(connection: quinn::Connection, permit: QuicSourcePermit) -> Self {
-        // The watcher holds the permit until quinn reports the connection
-        // closed, however it ends. Dropping this handle closes it explicitly
-        // (see Drop), because the watcher's clone keeps quinn from closing
-        // it implicitly.
+    fn new(
+        connection: quinn::Connection,
+        permit: QuicSourcePermit,
+        hold: Option<KeyHold>,
+        peer: PeerKey,
+    ) -> Self {
+        // The watcher holds the permit, and on the server side the hold
+        // binding the address to the client's key, until quinn reports the
+        // connection closed, however it ends. Dropping this handle closes it
+        // explicitly (see Drop), because the watcher's clone keeps quinn from
+        // closing it implicitly.
         let watched = connection.clone();
         GlobalExecutor::spawn(async move {
             let reason = watched.closed().await;
             tracing::debug!(%reason, remote = %watched.remote_address(), "QUIC connection ended");
+            drop(hold);
             drop(permit);
         });
-        Self { connection }
+        Self { connection, peer }
+    }
+
+    /// The key the peer proved in the handshake: as client, the server's
+    /// expected key; as server, the key the client's address was allowed
+    /// with. Attribute the connection to this key, not to its address.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn peer_key(&self) -> &PeerKey {
+        &self.peer
     }
 
     /// The quinn connection.

@@ -131,19 +131,26 @@ cap counts UDP payload, not IP/UDP headers.
 EgressCap::poll_admit is the poll form for a sender that is polled (the QUIC
 endpoint's UdpPoller, #5940): Ready exactly when try_take would succeed at
 that instant (one shared predicate, `admits`), else Pending with a timer on
-the cap's TimeSource at the refill time, kept in the caller's
-AdmissionWaiter. While Pending the cap also holds the caller's waker (at most
-MAX_ADMISSION_WAKERS; past it an entry is dropped WITHOUT waking, its waiter
-keeps its timer). Bytes given back (a take that sent less, or a failed send)
+the cap's TimeSource, kept in the caller's AdmissionWaiter. The timer is
+STAGGERED: deficit plus one WAKE_DATAGRAM_BYTES of refill per waiter queued
+ahead, so N waiters with one deficit wake one per datagram of refill, oldest
+first, not all N at once. While Pending the cap also holds the caller's
+waker (at most MAX_ADMISSION_WAKERS; past it an entry is dropped WITHOUT
+waking, its waiter keeps its timer); a waiter keeps its queue place across
+polls, and dropping an AdmissionWaiter removes its entry, so a closed
+connection cannot absorb a wake. Bytes given back (a take that sent less, or a failed send)
 wake one held waker per WAKE_DATAGRAM_BYTES (1200, the QUIC datagram) the
 bucket then holds, and none if it holds less, so legacy give-backs cost N
 waiting QUIC connections nothing until a datagram fits; wakers are woken
-after the lock is released, oldest registration first (a FIFO; a waiter
-that registers again moves to the back, and overflow drops the oldest).
-Remaining herd, to settle before c3 opens connections: waiters whose TIMERS
-expire together all wake (about N wakeups per datagram's worth of refill
-with N waiting connections); only give-backs are limited to one per
-datagram. It takes nothing; the QUIC socket takes with
+after the lock is released, oldest registration first (a FIFO; overflow
+drops the oldest). An admitted waiter took the slot reserved for it, so
+nobody behind it moves; a waiter dropped while queued wakes the next
+MAX_FOLLOWERS_WOKEN_PER_LEAVE (8) behind it so each re-polls to its new
+place (AdmissionQueue::leave), so N closes cost at most 8 N wakes. Waiters
+further back stay up to one datagram late per such drop until they next
+poll. An entry evicted at MAX_ADMISSION_WAKERS wakes nobody. No waiter wakes before
+the bucket can admit it. It takes
+nothing; the QUIC socket takes with
 try_take and sends with DemuxSocket::try_send_to_paced, so its datagram is
 charged once, by the take. Every take is at most one datagram, within the
 burst (QUIC: one segment per transmit, debug-asserted), so the bound above
@@ -660,8 +667,11 @@ connection closed, whatever closed it, and dropping its connection handle
 closes it; an address on the set is bounded by its connection's life, which
 inherits the #5922 gap for a connection held open indefinitely. Each
 QUIC-class datagram is counted as `quic_ingress_forwarded`, `_not_allowed`,
-`_queue_full`, `_source_full` or `_no_ingress` (no ingress enabled or its
-receiver gone; every node with `transport-quic` off).
+`_queue_full`, `_source_full` or `_no_ingress` (no ingress enabled, its
+receiver gone, or disabled; every node with `transport-quic` off). The QUIC
+endpoint enables the ingress through `with_quic_ingress`, which disables it
+again (allow-set emptied and closed) if the endpoint cannot be built, so a
+failed `prefer` bind leaves the socket as with QUIC off.
 
 Socket-health signal: the listener reads through `Socket::recv_classified`,
 which `DemuxSocket` answers with `Datagram` for a legacy datagram and
@@ -680,12 +690,12 @@ it must not wait unless it is a pacing point.
 `transport-quic` (config key, `off` by default, or `prefer`) decides whether
 `bind_udp_listener` builds a quinn endpoint over the DemuxSocket. Off: no
 endpoint, no QUIC ingress, nothing changes. Prefer: the endpoint is built
-with NO server configuration and an EMPTY allow-set, so nothing reaches it
-and it sends nothing; the listener holds it. Peer identity (c3) and
-upgrading a UDP session to QUIC come later, so only tests open QUIC
-connections. An unknown value is off with a warning, never an error: a
-crash-loop rollback reinstalls an older binary, which must start with a value
-a later release wrote, and keeps it in config.toml.
+with the node's QUIC identity (below) and an EMPTY allow-set, so nothing
+reaches it and it sends nothing; the listener holds it. Upgrading a UDP
+session to QUIC comes later, so only tests open QUIC connections. An unknown
+value is off with a warning, never an error: a crash-loop rollback
+reinstalls an older binary, which must start with a value a later release
+wrote, and keeps it in config.toml.
 
 ```
 QuicSocket (quic/socket.rs) is quinn's AsyncUdpSocket:
@@ -719,16 +729,32 @@ Connection IDs (quic/cid.rs) carry a keyed BLAKE3 MAC, so quinn drops a
   generator can be spoofed and would answer it with a stateless reset.
 ```
 
-The endpoint's memory (`quic_endpoint_budget_for`) is a term in
-`declared_cache_ceiling`, zero at the shipped default (off). The term is
-evaluated for the DEFAULT mode and connection limit, so it cannot reflect
-`prefer` or a raised `max-number-of-connections`. c3 (the first step that
-opens QUIC connections) must make it use the configured mode and
-max_connections. Nothing enforces that: the test
-`quic_endpoint_term_is_default_only_until_c3` fails only if the default
-flips. With QUIC on it
-is at least 50 MiB at the default connection count, which a 1 GiB host's
-declared caches have no room for; settle that before QUIC is offered.
+QUIC memory: the flow-control windows (connection receive, stream receive,
+send; all one value from `connection_window_bytes`) are clamped and capped
+at `MAX_INBOUND_STREAM_BYTES_PER_CONNECTION`; the stream window never
+exceeds the connection window. The cap does not bind today (2 MiB clamp);
+`windows_never_exceed_the_reassembly_allowance` only guards future constant
+changes. The windows are the same class of per-connection exception as
+inbound stream reassembly and are in `NOT_SUMMED` in
+`declared_cache_ceiling`, but they are NOT covered by it: they are in
+addition to reassembly, the send window is outbound, and quinn's own
+per-connection state (up to 256 uni streams, packet and ACK bookkeeping,
+assembler, crypto buffers) is not bounded by them. That memory, about twice
+the window per connection plus quinn state, is NOT accounted in the node
+aggregate and must be before QUIC is on by default (rollout gate). The fixed
+node-wide endpoint buffers are summed whatever `transport-quic` says:
+`INCOMING_BUFFER_TOTAL_BYTES` (quinn's pending attempts) and
+`QUIC_INGRESS_QUEUE_BYTES`.
+
+The cap's `poll_admit` and `give_back` publish through Release/Acquire
+atomics, not SeqCst, so a give-back racing a waiter's registration can miss
+its wake (the store-buffer pattern); the waiter's own timer bounds the delay
+to its deficit plus its stagger (one datagram's refill per waiter ahead of
+it). Known and accepted.
+
+The dual-stack test skips (printing SKIPPED) on a host without dual-stack
+IPv6; set REQUIRE_DUAL_STACK=1 to make that a failure. Nothing sets it in
+CI, so CI does not check that the test ran.
 
 Key material (stateless-reset key, token key, CID MAC key) comes from the OS
 entropy pool, never GlobalRng; quinn's rng_seed and the CID nonces stay on
@@ -741,8 +767,51 @@ back the next. QUIC integration tests run under a watchdog thread
 
 In tests, two endpoints on SimulationSocket with one VirtualTime and a
 seeded GlobalRng repeat the same event trace; the bytes differ, because
-rustls's key exchange uses ring's OS RNG. The TLS identities in
-`quic/test_tls.rs` accept ANY Ed25519 raw public key and are test-only.
+rustls's key exchange and the XEdDSA nonce use the OS RNG.
+`quic/test_tls.rs` holds only a plain Ed25519 identity for tests where a
+peer presents a key that is not its transport key.
+
+#### QUIC identity (`transport/quic/identity.rs`, #5940 step c3)
+
+```
+A node authenticates in the TLS 1.3 handshake with a raw public key
+(RFC 7250) made from its EXISTING X25519 transport key. No new key, no file,
+no extra message, no exporter proof.
+  → Signing: XEdDSA (Signal's spec, the `xeddsa` crate) with the X25519
+    secret, as Ed25519 (scheme 0x0807). Nonce randomness from the OS
+    (SysRng), NEVER GlobalRng (code-style.md OsRng exception). Debug of the
+    signing key, signer and identity shows the public key only.
+  → Presented key: the Edwards form of the X25519 public key with SIGN BIT 0,
+    in an Ed25519 SubjectPublicKeyInfo. Sign bit 0 is XEdDSA's convention:
+    the signer negates its scalar when its natural Edwards key has sign 1.
+    PeerKey::of refuses (UnusableKey) any key no node can hold: a
+    non-canonical encoding (bit 255 set or u >= p), a small-order Edwards
+    point (forgeable without a secret, since Ed25519 verification does not
+    check the key's order), a point with a torsion component (would let one
+    secret authenticate as up to 8 keys), and u = -1 (no Edwards form).
+  → Verification is PINNED to the key the caller expects: the presented
+    SPKI must equal the expected key's exactly (public bytes; ct_eq only
+    for uniformity; no chain), the scheme must be Ed25519, and the
+    signature is checked with ring against the EXPECTED key. Anything else fails the handshake.
+  → Client: connect(addr, &expected_server_key) builds TLS pinned to it.
+  → Server: allow_peer(addr, &expected_client_key) puts the address on the
+    allow-set AND records the key (QuicPeerPermit; a second key for an
+    address already held is KeyConflict). accept() looks the key up by the
+    attempt's (normalized) address and accepts with a per-attempt server
+    config whose TLS is pinned to it (Incoming::accept_with); an attempt
+    with no recorded key is ignored. The endpoint's own server config
+    (needed so quinn passes Initials to accept) refuses every client.
+  → When the SERVER refuses the client, the client may see connect()
+    succeed: TLS 1.3 lets it finish before the server's verdict, and the
+    server's CONNECTION_CLOSE ends the connection at once. The server never
+    gets a connection from an unexpected key.
+Tests: conversion vs curve25519-dalek 5 (random keys, bit 255 set, u = -1),
+signer key == verifier key over many keypairs with both natural sign bits,
+signatures verified by ed25519-dalek and refused with any bit flipped,
+nonce differs under one GlobalRng seed, handshakes in both directions, and
+refusal of a wrong server key, a wrong client key, a plain Ed25519 key on
+either side, and a man in the middle with its own key on either leg.
+```
 
 ### WHEN testing transport code
 

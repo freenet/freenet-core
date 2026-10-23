@@ -251,14 +251,16 @@ async fn bind_udp_listener<S: Socket>(
     // With `transport-quic` off nothing is built and no QUIC ingress is
     // enabled, so QUIC-class datagrams stay `quic_ingress_no_ingress`. With
     // it on the endpoint runs on the egress cap's clock (`RealTime`, see
-    // above), has no server configuration and an empty allow-set: nothing
-    // reaches it until an upgrade path allows a peer.
+    // above), authenticates with this node's transport key, and has an
+    // empty allow-set: nothing reaches it until an upgrade path allows a
+    // peer.
     let quic_endpoint = config.quic.as_ref().and_then(|settings| {
         super::quic::QuicEndpoint::bind_or_warn(
             socket.clone(),
             bind_addr,
             RealTime::new(),
             settings,
+            &keypair,
         )
     });
 
