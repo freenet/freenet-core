@@ -3931,6 +3931,179 @@ pub(crate) mod tests {
         assert_eq!(DOWNLOAD_WINDOW, std::time::Duration::from_secs(24 * 3600));
     }
 
+    /// A budget hold, record by record: a live record for the release keeps
+    /// the later retry time, its count and its error; an expired or
+    /// implausible one keeps its error and its still-live count but not its
+    /// retry time; another release's record is replaced and lends nothing.
+    /// The retry time is never more than the longest cooldown from now,
+    /// unless a live record already waits longer, and the failure time is
+    /// always now.
+    #[test]
+    fn a_budget_hold_record_by_record() {
+        let now = UNIX_EPOCH + std::time::Duration::from_secs(1_800_000_000);
+        let at = |offset_min: i64| {
+            let base = unix_secs(now);
+            if offset_min >= 0 {
+                base + offset_min.unsigned_abs() * 60
+            } else {
+                base - offset_min.unsigned_abs() * 60
+            }
+        };
+        let record = |version: &str, retry_min: i64| UpdateCooldownState {
+            version: version.to_string(),
+            failures: 2,
+            failed_at_unix: at(-60),
+            retry_at_unix: at(retry_min),
+            last_error: "boom".to_string(),
+            hold_reason: None,
+            provisional: true,
+        };
+        let (h, cap) = (60, 4 * 60);
+        // (case, record on file, `until`, expected retry, count, error)
+        for (case, prev, until, retry, failures, error) in [
+            ("no record, until below the cap", None, 2 * h, 2 * h, 0, ""),
+            ("no record, until above the cap", None, 10 * h, cap, 0, ""),
+            ("no record, until already past", None, -h, 0, 0, ""),
+            (
+                "live, its later retry kept",
+                Some(record("9.9.9", 3 * h)),
+                h,
+                3 * h,
+                2,
+                "boom",
+            ),
+            (
+                "live, the later until wins",
+                Some(record("9.9.9", h)),
+                2 * h,
+                2 * h,
+                2,
+                "boom",
+            ),
+            (
+                "live, until above the cap",
+                Some(record("9.9.9", 3 * h)),
+                10 * h,
+                cap,
+                2,
+                "boom",
+            ),
+            (
+                "live past the cap (jitter), kept",
+                Some(record("9.9.9", 270)),
+                10 * h,
+                270,
+                2,
+                "boom",
+            ),
+            (
+                "expired cooldown, failures still live",
+                Some(record("9.9.9", -h)),
+                2 * h,
+                2 * h,
+                2,
+                "boom",
+            ),
+            (
+                "expired cooldown, until above the cap",
+                Some(record("9.9.9", -h)),
+                10 * h,
+                cap,
+                2,
+                "boom",
+            ),
+            (
+                "failures expired too",
+                Some(record("9.9.9", -49 * h)),
+                2 * h,
+                2 * h,
+                0,
+                "boom",
+            ),
+            (
+                "implausible retry time, ignored",
+                Some(record("9.9.9", 10 * h)),
+                h,
+                h,
+                2,
+                "boom",
+            ),
+            (
+                "another release, live",
+                Some(record("9.9.10", 3 * h)),
+                h,
+                h,
+                0,
+                "",
+            ),
+            (
+                "another release, until above the cap",
+                Some(record("9.9.10", 3 * h)),
+                10 * h,
+                cap,
+                0,
+                "",
+            ),
+            (
+                "the unknown-release sentinel",
+                Some(record(UNKNOWN_RELEASE, 3 * h)),
+                h,
+                h,
+                0,
+                "",
+            ),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let dir = tmp.path();
+            if let Some(prev) = &prev {
+                assert!(store_update_cooldown_at(dir, prev), "{case}");
+            }
+            let until = UNIX_EPOCH + std::time::Duration::from_secs(at(until));
+            hold_update_until_at(dir, "9.9.9", "the budget is spent", until, now);
+            assert_eq!(
+                read_update_cooldown_at(dir),
+                Some(UpdateCooldownState {
+                    version: "9.9.9".to_string(),
+                    failures,
+                    failed_at_unix: unix_secs(now),
+                    retry_at_unix: at(retry),
+                    last_error: error.to_string(),
+                    hold_reason: Some("the budget is spent".to_string()),
+                    provisional: false,
+                }),
+                "{case}"
+            );
+        }
+    }
+
+    /// The release on record counts for a failed lookup only when it is
+    /// newer than the current version and not blocked (#4073). The sentinel
+    /// and an unparseable version count as newer.
+    #[test]
+    fn only_a_newer_unblocked_release_on_record_is_returned() {
+        let now = SystemTime::now();
+        let none = |_: &str| false;
+        let tmp = tempfile::tempdir().unwrap();
+        assert_eq!(recorded_newer_release_at(tmp.path(), "9.9.8", none), None);
+        for (recorded, blocked, found) in [
+            ("9.9.7", false, false),
+            ("9.9.8", false, false),
+            ("9.9.9", false, true),
+            ("9.9.9", true, false),
+            (UNKNOWN_RELEASE, false, true),
+            ("not-a-version", false, true),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let dir = tmp.path();
+            record_update_failure_at(dir, recorded, "x", now, 0.5);
+            assert_eq!(
+                recorded_newer_release_at(dir, "9.9.8", |v: &str| blocked && v == recorded),
+                found.then(|| recorded.to_string()),
+                "{recorded}, blocked: {blocked}"
+            );
+        }
+    }
+
     /// The download budget counts a node's bytes in a fixed window from the
     /// first byte charged, refunds never go below zero, and it fails open
     /// both ways: an unreadable record is nothing spent, an unwritable one
