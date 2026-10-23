@@ -127,8 +127,15 @@ while it waits, and is charged only at its send. Gaps that reach LONG_WAIT
 upstream stream for relayed streams, and the rest): egress_long_waits_<cause>, egress_streams_abandoned_<cause>.
 Each has its own rate-limited WARN with one line per cause seen since the last, each with its count and remedy; the
 per-stream abandonment line is at debug. The
-cap counts UDP payload, not IP/UDP headers. A quinn endpoint will need a poll-based admission (poll_ready
-+ try_admit over try_take's predicate); not built yet.
+cap counts UDP payload, not IP/UDP headers.
+EgressCap::poll_admit is the poll form for a sender that is polled (a quinn
+UdpPoller, #5940): Ready exactly when try_take would succeed at that instant
+(one shared predicate, `admits`), else Pending with a timer on the cap's
+TimeSource at the refill time, kept in the caller's AdmissionWaiter. It takes
+nothing; the sender is charged at its send (Socket::try_send_to charges like
+send_to). The cap is built on RealTime even in simulation, because the
+listener and its connections run on RealTime there: a VirtualTime cap would
+compute deficits on another clock than its waiters sleep and time out on.
 Tests assert on per-cap EgressCap::stats(), never the global counters.
 ```
 
@@ -279,7 +286,9 @@ TTL, and early evictions are counted in `stray_intro_failures_evicted`) and CONN
 joiner dial-queue waits (`dial_queue_wait_<label>`, coarse buckets around the
 3 s punch window) and inbound datagrams by first byte (`demux_<label>`, one per
 `DemuxClass`: `legacy` passes through, `quic` and `other` are counted and
-dropped; see "Socket Abstraction Rules") and outbound datagrams by how the
+dropped or, for `quic`, queued for the QUIC ingress; each `quic` one is also
+counted once by what happened to it, `quic_ingress_<label>`, one per
+`QuicIngressOutcome`; see "Socket Abstraction Rules") and outbound datagrams by how the
 node-wide egress cap paced them (`egress_<label>`, one per `EgressDecision`,
 plus `egress_bytes`, `egress_bytes_waited`, `egress_wait_us_sum` / `_max`,
 `egress_long_waits_<cause>`, `egress_streams_abandoned_<cause>`, `egress_debt_hwm_bytes`,
@@ -604,9 +613,29 @@ update this section.
 (the UDP transport's own type bytes) pass through unchanged, a byte with a
 `0xC0` bit set is QUIC-shaped, anything else (including an empty datagram) is
 other. QUIC-shaped and other datagrams are counted (`demux_<label>`) and
-dropped until a QUIC endpoint exists on the same port (#5940). The QUIC rule
-is exact only with QUIC bit greasing (RFC 9287) disabled. Tests that inject a
-hand-written socket straight into the listener bypass the wrapper.
+dropped. The QUIC rule is exact only with QUIC bit greasing (RFC 9287)
+disabled. Tests that inject a hand-written socket straight into the listener
+bypass the wrapper.
+
+For a QUIC endpoint on the same port (#5940), `enable_quic_ingress` gives the
+wrapper a bounded queue (`QUIC_INGRESS_QUEUE_DATAGRAMS`, a declared byte
+budget `QUIC_INGRESS_QUEUE_BYTES` in `declared_cache_ceiling`) of QUIC-class
+datagrams with their source. The listener stays the ONLY reader of the UDP
+socket and fills the queue with `try_reserve`, never a waiting send, so a slow
+endpoint costs dropped QUIC datagrams and never stalls the listener. Only
+sources on the allow-set (`allow_quic_source`, normalized addresses) are
+queued; the rest are dropped, so a prober gets no QUIC reply. Each QUIC-class
+datagram is counted as `quic_ingress_forwarded`, `_not_allowed`,
+`_queue_full` or `_no_ingress` (no ingress enabled or its receiver gone;
+every node today, since only tests enable it).
+
+Socket-health signal: the listener reads through `Socket::recv_classified`,
+which `DemuxSocket` answers with `Datagram` for a legacy datagram and
+`Diverted` for one it consumed. The listener calls
+`RecvErrorTracker::on_success` for both, so any datagram the socket delivered
+resets the unclassified-error run that would end the listener. Do not move the
+QUIC read onto a second reader of the socket; the ingress queue exists so
+there is one.
 
 The same wrapper charges outbound datagrams to the node-wide egress cap (see
 "Node-wide egress cap" above). A new send site needs nothing to be charged;

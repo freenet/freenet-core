@@ -90,9 +90,9 @@ pub(crate) fn classify(packet: &[u8]) -> DemuxClass {
 /// to construct it.
 ///
 /// It exists so a QUIC endpoint can use the same UDP port as the UDP
-/// transport (#5940). Until that endpoint exists, QUIC-shaped datagrams are
-/// dropped here and counted as `demux_quic`; datagrams that are neither are
-/// dropped and counted as `demux_other`. Legacy datagrams are returned
+/// transport (#5940). QUIC-shaped datagrams are counted as `demux_quic` and
+/// dropped, or queued for the QUIC ingress when one is enabled (see below);
+/// datagrams that are neither are dropped and counted as `demux_other`. Legacy datagrams are returned
 /// unchanged, and are counted as `demux_legacy` so the ratio is visible.
 ///
 /// It wraps the socket below the [`Socket`] trait, so every implementation of

@@ -149,8 +149,9 @@ labelled_counters! {
         /// `0x02`). Passed on to the listener unchanged.
         Legacy => "legacy",
         /// First byte has the QUIC fixed bit or long-header bit set (mask
-        /// `0xC0`) and is not a UDP transport type byte. Dropped until the
-        /// QUIC endpoint exists.
+        /// `0xC0`) and is not a UDP transport type byte. Dropped, or queued
+        /// for the QUIC ingress when one is enabled (see
+        /// [`QuicIngressOutcome`]).
         Quic => "quic",
         /// Anything else, including an empty datagram. Dropped.
         Other => "other",
