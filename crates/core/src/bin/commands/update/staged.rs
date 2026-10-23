@@ -871,14 +871,19 @@ where
         tracing::info!(version = %version, retry_in_min = left.as_secs().div_ceil(60), "Update is cooling down after failed attempts; staying on the current version (#5799)");
         return Err(Staging::CoolingDown);
     }
-    // A spent download budget holds before any request too, unless a release
-    // is already staged and could be installed without downloading it.
+    // A spent download budget holds before any request too, unless a
+    // complete release is already staged and could be installed without
+    // downloading it (a manifest alone, left by a partial download, is not).
     if let Some(dir) = root.parent() {
-        if super::super::rollback::download_bytes_at(dir, clock()) >= byte_budget
-            && staged_tag_at(root).is_none()
-        {
-            let version = lookup_failure_target(root, current_version, target, &blocked);
-            return Err(budget_spent(root, &version, clock()));
+        if super::super::rollback::download_bytes_at(dir, clock()) >= byte_budget {
+            let staged = match staged_tag_at(root) {
+                Some(tag) => freenet_archive_staged(root, &tag).await,
+                None => false,
+            };
+            if !staged {
+                let version = lookup_failure_target(root, current_version, target, &blocked);
+                return Err(budget_spent(root, &version, clock()));
+            }
         }
     }
     if !spend_poll_token(root, clock()) {
@@ -1069,6 +1074,15 @@ where
 /// signature before it installs anything; this decides only whether to skip
 /// the download budget and whether an fdev failure may still exit to install.)
 async fn freenet_archive_staged(root: &Path, tag: &str) -> bool {
+    let (root, tag) = (root.to_path_buf(), tag.to_string());
+    // Off the async runtime: hashing ~20 MB must not stall a serving node.
+    tokio::task::spawn_blocking(move || freenet_archive_staged_blocking(&root, &tag))
+        .await
+        .unwrap_or(false)
+}
+
+/// [`freenet_archive_staged`] on the calling thread.
+fn freenet_archive_staged_blocking(root: &Path, tag: &str) -> bool {
     let Ok(dir) = tag_dir(root, tag) else {
         return false;
     };
@@ -1080,8 +1094,18 @@ async fn freenet_archive_staged(root: &Path, tag: &str) -> bool {
     let Ok(expected) = super::required_checksum(Some(&checksums), &freenet) else {
         return false;
     };
-    let expected = expected.to_string();
-    verify_file(&dir.join(&freenet), &expected).await.is_ok()
+    super::verify_checksum(&dir.join(&freenet), expected).is_ok()
+}
+
+/// Whether the node's download budget in `state_dir` is spent and no complete
+/// staged release could be installed without downloading: whether an attempt
+/// now could only be refused. Lets a #3934 locked-out node keep its daily
+/// retry rather than spend it on such an attempt.
+pub(crate) fn download_budget_blocks_at(state_dir: &Path, now: SystemTime) -> bool {
+    let root = state_dir.join(CACHE_DIR);
+    super::super::rollback::download_bytes_at(state_dir, now)
+        >= super::super::rollback::DOWNLOAD_BYTES_PER_DAY
+        && !staged_tag_at(&root).is_some_and(|tag| freenet_archive_staged_blocking(&root, &tag))
 }
 
 /// Everything environmental [`stage_into`] depends on besides the cache root
@@ -3748,28 +3772,50 @@ mod tests {
         assert_eq!(runs.load(SeqCst), requests, "a held run makes no request");
     }
 
-    /// A staged copy that fails its checksum does not get past a spent
-    /// budget either: the run holds without counting, and makes no archive
-    /// request.
+    /// A staged manifest whose archive is incomplete (a partial download)
+    /// does not get past a spent budget: the run holds, without counting,
+    /// before the poll token and the lookup. A complete staged copy does.
     #[tokio::test]
-    async fn a_spent_budget_holds_when_the_staged_copy_is_damaged() {
+    async fn a_spent_budget_holds_when_the_staged_copy_is_incomplete() {
         let freenet = freenet_asset_name();
         let manifest = manifest_for(&[(&freenet, b"archive")]);
-        let server = serve_release(manifest.as_bytes(), None, &[]);
+        let server = Server::run(); // no expectations: no request at all
         let (_tmp, root) = test_root();
+        let dir = root.parent().unwrap().to_path_buf();
         write_staged(
             &root,
-            &[(MANIFEST, manifest.as_bytes()), (&freenet, b"damaged")],
+            &[(MANIFEST, manifest.as_bytes()), (&freenet, b"arch")],
         );
         let now = SystemTime::now();
-        super::super::super::rollback::charge_download_bytes_at(
-            root.parent().unwrap(),
-            u64::MAX,
-            now,
-        );
-        let outcome = stage_at(&root, &server.url_str("/"), now).await;
+        super::super::super::rollback::charge_download_bytes_at(&dir, u64::MAX, now);
+        assert!(download_budget_blocks_at(&dir, now));
+        let clock = move || now;
+        let prefix = server.url_str("/");
+        let env = StageEnv {
+            clock: &clock,
+            ..test_env(&prefix)
+        };
+        let outcome = stage_into(
+            &root,
+            "9.9.8",
+            || async { panic!("looked the tag up with the budget spent") },
+            Some("9.9.9"),
+            |_: &str| false,
+            &env,
+        )
+        .await;
         assert_eq!(outcome, Staging::Throttled);
         assert_eq!(cooldown(&root).unwrap().failures, 0);
+        assert!(
+            !dir.join("github_poll_bucket_node").exists(),
+            "no poll token was spent"
+        );
+        // Complete: the budget no longer blocks.
+        write_staged(
+            &root,
+            &[(MANIFEST, manifest.as_bytes()), (&freenet, b"archive")],
+        );
+        assert!(!download_budget_blocks_at(&dir, now));
     }
 
     /// A spent budget holds an install that stages nothing (a macOS app

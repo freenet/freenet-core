@@ -23,7 +23,9 @@ macro_rules! stderr_line {
 }
 
 mod staged;
-pub(crate) use staged::{discard_stale as discard_stale_staged, stage_latest_release};
+pub(crate) use staged::{
+    discard_stale as discard_stale_staged, download_budget_blocks_at, stage_latest_release,
+};
 
 #[cfg(target_os = "macos")]
 use super::service::generate_wrapper_script;

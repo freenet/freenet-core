@@ -1818,6 +1818,9 @@ pub enum ClaimRefused {
     /// Locked out, and the newer release is cooling down after failed
     /// attempts (#5799): spending the daily retry now would only fail again.
     ReleaseCoolingDown,
+    /// Locked out, and the node's daily download budget is spent (#5799):
+    /// the attempt could only be refused, so the retry waits for it.
+    DownloadBudgetSpent,
 }
 
 impl std::fmt::Display for ClaimRefused {
@@ -1836,6 +1839,10 @@ impl std::fmt::Display for ClaimRefused {
             Self::ReleaseCoolingDown => {
                 "auto-update is locked out (#3934) and the newer release is cooling down \
                  after failed attempts (#5799); the daily retry waits for the cooldown"
+            }
+            Self::DownloadBudgetSpent => {
+                "auto-update is locked out (#3934) and today's download budget is spent \
+                 (#5799); the daily retry waits for it to reset"
             }
         })
     }
@@ -1916,6 +1923,9 @@ fn claim_decision_at(
         && super::rollback::update_cooldown_pending_at(dir, current_version, now).is_some()
     {
         return Err(ClaimRefused::ReleaseCoolingDown);
+    }
+    if needs == ClaimNeeds::RecordedRetry && super::update::download_budget_blocks_at(dir, now) {
+        return Err(ClaimRefused::DownloadBudgetSpent);
     }
     Ok(needs)
 }
@@ -2951,6 +2961,34 @@ mod tests {
         assert!(claim_update_attempt_after_staging().is_ok());
         assert!(state.path().join(LOCKOUT_RETRY_FILE).exists());
         assert!(claim_update_attempt_after_staging().is_err(), "spent");
+    }
+
+    /// A locked-out node keeps its daily retry while the download budget is
+    /// spent: the attempt could only be refused. A node that is not locked
+    /// out spends nothing on a claim, so the budget does not matter to it.
+    #[test]
+    fn a_locked_out_node_keeps_its_retry_while_the_budget_is_spent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let fresh = tempfile::tempdir().unwrap();
+        let now = lock_out(dir) + UPDATE_LOCKOUT_COOLDOWN;
+        for d in [dir, fresh.path()] {
+            super::super::rollback::charge_download_bytes_at(
+                d,
+                super::super::rollback::DOWNLOAD_BYTES_PER_DAY,
+                now,
+            );
+        }
+        assert_eq!(
+            claim_update_attempt_unless_cooling_at(dir, "0.2.140", now).err(),
+            Some(ClaimRefused::DownloadBudgetSpent)
+        );
+        assert!(!update_attempt_claimable_at(dir, "0.2.140", now));
+        assert!(!dir.join(LOCKOUT_RETRY_FILE).exists(), "nothing spent");
+        assert!(claim_update_attempt_unless_cooling_at(fresh.path(), "0.2.140", now).is_ok());
+        // Once the window resets, the retry is there.
+        let later = now + Duration::from_secs(25 * 3600);
+        assert!(claim_update_attempt_unless_cooling_at(dir, "0.2.140", later).is_ok());
     }
 
     /// #5799: the check the version-less triggers make before staging
