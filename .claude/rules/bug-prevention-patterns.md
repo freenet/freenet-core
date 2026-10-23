@@ -275,7 +275,9 @@ assertions in a re-executed child), the `commands::rollback::tests::LockHelper`
 users (`the_record_lock_excludes_another_process`,
 `every_record_writer_waits_for_a_lock_another_process_holds`,
 `a_wedged_lock_holder_does_not_block_a_writer`) and
-`commands::update::staged::tests::cache_lock_excludes_another_process`.
+`commands::update::staged::tests::cache_lock_excludes_another_process`, and
+`commands::update::tests::the_spent_budget_exit_holds_the_release_being_installed`
+(the spent-budget exit ends the process, so it runs in a re-executed child).
 
 The symptom to recognise, so nobody bisects it:
 

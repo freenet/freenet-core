@@ -4669,6 +4669,101 @@ done
         );
     }
 
+    /// Turns [`spent_budget_exit_subprocess`] from a no-op test into the real
+    /// spent-budget exit, holding in the state directory this names.
+    const SPENT_BUDGET_EXIT_ENV: &str = "FREENET_TEST_SPENT_BUDGET_EXIT";
+
+    /// Not a test of its own: a no-op unless
+    /// [`the_spent_budget_exit_holds_the_release_being_installed`]
+    /// re-executes this binary filtered to it, since the exit ends the
+    /// process.
+    #[test]
+    fn spent_budget_exit_subprocess() {
+        let Some(dir) = std::env::var_os(SPENT_BUDGET_EXIT_ENV) else {
+            return;
+        };
+        super::super::auto_update::TestStateDir::point_this_thread_at(dir.into());
+        exit_for_spent_budget("9.9.9", "today's download budget is spent");
+    }
+
+    /// #5799: the real spent-budget exit, in a process of its own: it finds
+    /// the state directory itself, holds the release being installed there
+    /// until the budget resets (at most the longest cooldown) without
+    /// counting a failure, says so on stderr, and exits as "already up to
+    /// date". Both of `run_async`'s refusals pass that release, the one
+    /// whose asset list the run would fetch, never the current version.
+    #[test]
+    fn the_spent_budget_exit_holds_the_release_being_installed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let now = std::time::SystemTime::now();
+        let unix =
+            |t: std::time::SystemTime| t.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        let long_ago = now - std::time::Duration::from_secs(5 * 3600);
+        for _ in 0..2 {
+            rollback::record_update_failure_at(dir, "9.9.9", "earlier", long_ago, 0.5);
+        }
+        rollback::charge_download_bytes_at(dir, rollback::DOWNLOAD_BYTES_PER_DAY, now);
+        let before = unix(std::time::SystemTime::now());
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "commands::update::tests::spent_budget_exit_subprocess",
+                "--exact",
+                "--nocapture",
+                "--test-threads",
+                "1",
+            ])
+            .env(SPENT_BUDGET_EXIT_ENV, dir)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .expect("re-execute the test binary");
+        let after = unix(std::time::SystemTime::now());
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        // Also proves the child ran the helper: a renamed helper runs no
+        // test and exits 0 without this line.
+        assert!(
+            stderr.contains("Freenet update to 9.9.9 not downloaded")
+                && stderr.contains("freenet update --force"),
+            "{stderr}"
+        );
+        assert_eq!(out.status.code(), Some(EXIT_CODE_ALREADY_UP_TO_DATE));
+        let record = rollback::read_update_cooldown_at(dir).expect("held in the state directory");
+        assert_eq!(
+            (record.version.as_str(), record.failures),
+            ("9.9.9", 2),
+            "the release being installed, not counted"
+        );
+        assert_eq!(
+            record.hold_reason.as_deref(),
+            Some("today's download budget is spent")
+        );
+        let cap = rollback::UPDATE_COOLDOWN_MAX.as_secs();
+        assert!(
+            (before + cap..=after + cap).contains(&record.retry_at_unix),
+            "the budget resets in a day, so the hold runs to the cap: {record:?}"
+        );
+        // The release `run_async` holds at both refusals.
+        let src = include_str!("update.rs");
+        let production = src
+            .split_once(concat!("#[cfg(test)]\n", "mod tests {"))
+            .unwrap()
+            .0;
+        let run = &production[production.find("\n    async fn run_async(").unwrap()..];
+        let run: String = run[..run.find("\n    }\n").unwrap()]
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<String>()
+            .split_whitespace()
+            .collect();
+        assert_eq!(run.matches("exit_for_spent_budget(").count(), 2, "{run}");
+        for call in [
+            "None=>exit_for_spent_budget(latest_version,\"today'sdownloadbudgetisspent\"),};",
+            "InstallRecord::Hold(error)=>exit_for_spent_budget(latest_version,&error),",
+        ] {
+            assert!(run.contains(call), "run_async: `{call}`");
+        }
+    }
+
     /// Without a state directory nothing can be charged, and the meter must
     /// not refuse either: that would stop updates altogether.
     #[test]

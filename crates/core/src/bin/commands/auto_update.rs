@@ -1094,6 +1094,12 @@ impl TestStateDir {
     pub(crate) fn path(&self) -> &std::path::Path {
         self.0.path()
     }
+
+    /// Points [`state_dir`] at `dir` on this thread with no guard to undo
+    /// it: for a re-executed test binary whose test ends the process.
+    pub(crate) fn point_this_thread_at(dir: PathBuf) {
+        TEST_STATE_DIR.with(|d| *d.borrow_mut() = Some(dir));
+    }
 }
 
 #[cfg(test)]
