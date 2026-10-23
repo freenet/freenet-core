@@ -330,7 +330,7 @@ fn updater_meter_at(
 
 /// Whether this run's downloads are limited by the byte budget: a run the
 /// supervisor started after the node stopped (it passes the node's stop
-/// status), without `--force`.
+/// status variable, even empty), without `--force`.
 fn budget_limits(force: bool, supervised: bool) -> bool {
     supervised && !force
 }
@@ -682,7 +682,7 @@ impl UpdateCommand {
         // staged copy can be installed without downloading the archive.
         let meter = match updater_meter_at(
             super::auto_update::state_dir().as_deref(),
-            budget_limits(self.force, rollback::post_stop_status_from_env().is_some()),
+            budget_limits(self.force, rollback::post_stop_status_present()),
             std::time::SystemTime::now(),
         ) {
             Some(meter) => meter,
@@ -4874,7 +4874,7 @@ done
             // #5799: the shared byte budget is consulted before the asset
             // list is requested, and a staged copy still installs.
             "letmeter=matchupdater_meter_at(super::auto_update::state_dir().as_deref(),\
-             budget_limits(self.force,rollback::post_stop_status_from_env().is_some()),\
+             budget_limits(self.force,rollback::post_stop_status_present()),\
              std::time::SystemTime::now(),){Some(meter)=>meter,\
              Noneifstaged::is_staged(&latest_tag)=>staged::ByteMeter::new(0),\
              None=>exit_for_spent_budget(",

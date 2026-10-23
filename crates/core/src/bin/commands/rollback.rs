@@ -1628,13 +1628,27 @@ fn adjust_download_bytes_locked(dir: &Path, add: u64, remove: u64, now: SystemTi
 /// Read the raw post-stop status string the supervisor forwarded, if any. May
 /// be a numeric exit code or a signal name; classified by [`classify_stop`].
 pub fn post_stop_status_from_env() -> Option<String> {
-    let raw = std::env::var(POST_STOP_EXIT_CODE_ENV_VAR).ok()?;
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        None
-    } else {
-        Some(trimmed.to_string())
-    }
+    post_stop_status_from(std::env::var(POST_STOP_EXIT_CODE_ENV_VAR).ok().as_deref())
+}
+
+/// [`post_stop_status_from_env`] over the variable's raw value: an empty or
+/// blank status is no status, so it never reads as a crash (#4073).
+pub(crate) fn post_stop_status_from(raw: Option<&str>) -> Option<String> {
+    let trimmed = raw?.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
+/// Whether the supervisor passed the node's stop status at all, even an empty
+/// one: systemd forwards an empty `$EXIT_STATUS` after a start timeout or when
+/// there was no main process. Presence, not content, marks a `freenet update`
+/// the supervisor started (#5799); [`post_stop_status_from_env`] still reads
+/// an empty status as no crash.
+pub fn post_stop_status_present() -> bool {
+    post_stop_status_present_in(std::env::var_os(POST_STOP_EXIT_CODE_ENV_VAR).as_deref())
+}
+
+pub(crate) fn post_stop_status_present_in(raw: Option<&std::ffi::OsStr>) -> bool {
+    raw.is_some()
 }
 
 /// Classify a forwarded post-stop status as a crash or not. See the module-level
@@ -3295,6 +3309,21 @@ pub(crate) mod tests {
         assert!(!stale.exists());
         // Never so short that a write in progress elsewhere could be hit.
         assert!(STALE_TEMP_AGE >= std::time::Duration::from_secs(3600));
+    }
+
+    /// A supervisor that passes an empty stop status (systemd after a start
+    /// timeout, or with no main process) still marks the run as one it
+    /// started, while the empty status itself is no crash.
+    #[test]
+    fn an_empty_stop_status_is_supervised_but_not_a_crash() {
+        use std::ffi::OsStr;
+        assert!(post_stop_status_present_in(Some(OsStr::new(""))));
+        assert!(post_stop_status_present_in(Some(OsStr::new("1"))));
+        assert!(!post_stop_status_present_in(None));
+        assert_eq!(post_stop_status_from(Some("")), None);
+        assert_eq!(post_stop_status_from(Some("  ")), None);
+        assert_eq!(post_stop_status_from(None), None);
+        assert_eq!(post_stop_status_from(Some(" 9 ")).as_deref(), Some("9"));
     }
 
     /// Every failure writes a cooldown for the release that failed, whatever
