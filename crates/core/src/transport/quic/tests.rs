@@ -1043,8 +1043,8 @@ fn a_man_in_the_middle_with_its_own_key_fails_both_legs() {
 /// An address stays bound to the key an attempt or connection from it was
 /// authenticated against, even after the permit that allowed it is gone:
 /// while the attempt, then the connection, is alive, allowing the address
-/// for another key is a `KeyConflict`, and new attempts from it are not
-/// accepted (no permit). Once the connection has closed the address takes
+/// for another key is a `KeyConflict`, and a new attempt from it reaches
+/// the endpoint and is ignored by `accept` (no permit). Once the connection has closed the address takes
 /// a new key.
 #[test]
 fn a_live_attempt_or_connection_keeps_its_address_bound_to_its_key() {
@@ -1090,6 +1090,34 @@ fn a_live_attempt_or_connection_keeps_its_address_bound_to_its_key() {
             pair.b.allow_peer(pair.a_addr, other.public()),
             Err(QuicAllowError::KeyConflict)
         ));
+        // A second attempt from the address, while only the connection
+        // holds its key (no permit), reaches b's queue and is ignored by
+        // accept(), not accepted under the held key.
+        let forwarded_before = pair
+            .b_socket
+            .quic_outcome_count(crate::transport::metrics::QuicIngressOutcome::Forwarded);
+        let (a2, b_addr2, b_key2) = (pair.a.clone(), pair.b_addr, pair.b_key());
+        let second = tokio::spawn(async move { a2.connect(b_addr2, &b_key2).await.map(|_| ()) });
+        let (b2, time) = (pair.b.clone(), pair.time.clone());
+        let accepted = drive(&pair.time, Duration::from_secs(60), async move {
+            tokio::select! {
+                incoming = b2.accept() => incoming.map(|_| ()),
+                _ = time.sleep(Duration::from_secs(5)) => None,
+            }
+        })
+        .await;
+        assert!(
+            pair.b_socket
+                .quic_outcome_count(crate::transport::metrics::QuicIngressOutcome::Forwarded)
+                > forwarded_before,
+            "the second Initial reached b's ingress queue"
+        );
+        assert!(
+            accepted.is_none(),
+            "an attempt from an address with no permit is ignored"
+        );
+        second.abort();
+
         // The same key may be allowed again meanwhile.
         drop(pair.b.allow_peer(pair.a_addr, &pair.a_key()).unwrap());
 

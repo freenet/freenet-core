@@ -143,6 +143,14 @@ const NANOS_PER_SEC: u128 = 1_000_000_000;
 /// fewer than this.
 const MAX_ADMISSION_WAKERS: usize = 1024;
 
+/// How many waiters queued behind a dropped `poll_admit` waiter are woken to
+/// move up (`AdmissionQueue::leave`). The nearest ones matter: the k-th waiter
+/// behind waits about k datagrams, so one datagram of lateness costs the
+/// first few the most, relatively, and those are the ones that wake soonest.
+/// Eight covers the waiters within eight datagrams of the front and keeps a
+/// run of N closes at no more than 8 N wakes.
+const MAX_FOLLOWERS_WOKEN_PER_LEAVE: usize = 8;
+
 /// The datagram size a `poll_admit` waiter waits for: the QUIC endpoint's
 /// (`quic::config::MAX_UDP_PAYLOAD`, the same 1200 bytes as the UDP
 /// transport's packets). A give-back wakes one waiter per this many bytes the
@@ -311,12 +319,16 @@ impl AdmissionQueue {
     }
 
     /// Remove a waiter that is gone without taking its slot (its connection
-    /// closed) and wake every waiter queued behind it, so each re-polls and
-    /// moves its staggered timer one datagram earlier, to its new place.
-    /// Without this, each departure ahead would leave every follower one
-    /// datagram late, adding up with the number gone. At most
-    /// [`MAX_ADMISSION_WAKERS`] wakes, only when a queued waiter is dropped.
-    /// The wakers are woken after the lock is released.
+    /// closed) and wake the next [`MAX_FOLLOWERS_WOKEN_PER_LEAVE`] waiters
+    /// queued behind it, so each re-polls and moves its staggered timer one
+    /// datagram earlier, to its new place. Bounded so connections closing
+    /// one by one in a long queue cost a constant number of wakes each, not
+    /// one per follower.
+    ///
+    /// Residual: a waiter further back keeps its old deadline, at most one
+    /// datagram late per drop ahead of it since it last polled; it fixes
+    /// itself the next time it polls (its timer firing, or a give-back). It
+    /// is never woken early. The wakers are woken after the lock is released.
     fn leave(&self, id: u64) {
         if self.waiting.load(Ordering::Acquire) == 0 {
             return;
@@ -331,6 +343,7 @@ impl AdmissionQueue {
             wakers
                 .iter()
                 .skip(at)
+                .take(MAX_FOLLOWERS_WOKEN_PER_LEAVE)
                 .map(|(_, waker)| waker.clone())
                 .collect()
         };
@@ -601,8 +614,10 @@ impl EgressCap {
     /// oldest first, instead of all N. A waiter keeps its place in the queue
     /// across polls. An admitted waiter takes the slot the stagger reserved
     /// for it, so nobody behind it moves. A waiter dropped while queued
-    /// (its connection closed) wakes every waiter behind it, and each
-    /// re-polls and moves its timer to its new place. An entry evicted at
+    /// (its connection closed) wakes the next
+    /// [`MAX_FOLLOWERS_WOKEN_PER_LEAVE`] waiters behind it, which re-poll and
+    /// move their timers to their new places; waiters further back stay up
+    /// to one datagram late per such drop until they next poll. An entry evicted at
     /// [`MAX_ADMISSION_WAKERS`] wakes nobody, so the waiters behind it keep
     /// timers one datagram late per eviction. No waiter is woken before the
     /// bucket can admit it.

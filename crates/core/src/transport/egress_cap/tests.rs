@@ -1235,3 +1235,42 @@ fn dropping_queued_waiters_moves_the_followers_up() {
             .is_ready()
     );
 }
+
+/// Connections closing one by one in a long queue cost a bounded number of
+/// wakes: each drop wakes at most `MAX_FOLLOWERS_WOKEN_PER_LEAVE` waiters
+/// behind it, never the whole queue, so 64 drops from the front of 128
+/// queued waiters wake at most 8 per drop.
+#[test]
+fn a_run_of_drops_wakes_a_bounded_number_of_followers() {
+    const QUEUED: usize = 128;
+    const DROPS: usize = 64;
+    let (cap, _time) = cap_at(RATE);
+    cap.charge_unpaced(BURST as usize);
+    let mut waiters: std::collections::VecDeque<_> = (0..QUEUED)
+        .map(|_| {
+            let (waker, counter) = counting_waker();
+            (AdmissionWaiter::default(), waker, counter)
+        })
+        .collect();
+    for (waiter, waker, _) in waiters.iter_mut() {
+        let mut cx = Context::from_waker(waker);
+        assert!(cap.poll_admit(PACKET, waiter, &mut cx).is_pending());
+    }
+    let counters: Vec<_> = waiters.iter().map(|(_, _, c)| c.clone()).collect();
+    for drop_index in 0..DROPS {
+        let before: usize = counters.iter().map(|c| woken(c)).sum();
+        drop(waiters.pop_front());
+        let after: usize = counters.iter().map(|c| woken(c)).sum();
+        assert_eq!(
+            after - before,
+            MAX_FOLLOWERS_WOKEN_PER_LEAVE,
+            "drop {drop_index} woke {} waiters",
+            after - before
+        );
+    }
+    let total: usize = counters.iter().map(|c| woken(c)).sum();
+    assert!(total <= DROPS * MAX_FOLLOWERS_WOKEN_PER_LEAVE);
+    // The last waiter was never close enough to the front to be woken.
+    assert_eq!(woken(counters.last().unwrap()), 0);
+    assert_eq!(cap.admission_waker_count(), QUEUED - DROPS);
+}
