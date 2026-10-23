@@ -30,7 +30,7 @@ use tracing::{Instrument, span};
 use version_cmp::PROTOC_VERSION;
 
 use super::{
-    Socket, TransportError, UdpError, UdpErrorKind,
+    Socket, SocketRead, TransportError, UdpError, UdpErrorKind,
     congestion_control::{CongestionControl, CongestionControlConfig},
     crypto::{TransportKeypair, TransportPublicKey},
     demux::DemuxSocket,
@@ -229,6 +229,11 @@ async fn bind_udp_listener<S: Socket>(
     // set (which is when `global_bandwidth` is), so a node without it pays
     // nothing. The cap uses the same clock kind as the listener built below
     // (`RealTime`); waiters sleep on their own connection's time source.
+    // That holds in simulation too: the listener and its connections run on
+    // `RealTime` there, so a cap on the network's `VirtualTime` would compute
+    // deficits on one clock for stream senders that sleep and time out on
+    // another. A sender on `VirtualTime` (the QUIC endpoint, #5940) must use
+    // the cap only once the cap and its other waiters share that clock.
     let egress_cap = config.global_bandwidth.as_ref().and_then(|manager| {
         super::egress_cap::EgressCap::from_total_limit(manager.total_limit(), RealTime::new())
     });
@@ -1529,9 +1534,17 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
         'outer: loop {
             // DST: Use deterministic_select! for fair but deterministic branch ordering
             crate::deterministic_select! {
-                recv_result = self.socket_listener.recv_from(&mut buf) => {
+                recv_result = self.socket_listener.recv_classified(&mut buf) => {
                     match recv_result {
-                        Ok((size, remote_addr)) => {
+                        // The socket received a datagram that is not for this
+                        // listener (`DemuxSocket` counted it and dropped it or
+                        // queued it for the QUIC ingress). It is still a
+                        // successful read, so it is evidence the socket works.
+                        Ok(SocketRead::Diverted) => {
+                            recv_errors.on_success();
+                            continue;
+                        }
+                        Ok(SocketRead::Datagram(size, remote_addr)) => {
                             recv_errors.on_success();
                             if let Some(time_nanos) = outdated_peer.get(&remote_addr) {
                                 let now_nanos = self.time_source.now_nanos();
@@ -6323,6 +6336,16 @@ pub mod mock_transport {
         bool,
         OutboundConnectionHandler<ScriptedRecvSocket, VirtualTime>,
     ) {
+        run_scripted_listener_on(script, |socket| socket).await
+    }
+
+    /// [`run_scripted_listener`] over the scripted socket as wrapped by
+    /// `wrap`, e.g. in the `DemuxSocket` the transport binds.
+    #[cfg(test)]
+    async fn run_scripted_listener_on<S: Socket>(
+        script: Vec<RecvStep>,
+        wrap: impl FnOnce(ScriptedRecvSocket) -> S,
+    ) -> (bool, OutboundConnectionHandler<S, VirtualTime>) {
         let time = VirtualTime::new();
         let progress = Arc::new(ScriptProgress::default());
         let socket = ScriptedRecvSocket {
@@ -6333,7 +6356,7 @@ pub mod mock_transport {
         let addr: SocketAddr = (Ipv4Addr::LOCALHOST, 47_300).into();
         let (handler, _new_connections) =
             OutboundConnectionHandler::<_, VirtualTime>::config_listener_with_virtual_time(
-                Arc::new(socket),
+                Arc::new(wrap(socket)),
                 TransportKeypair::new(),
                 false,
                 addr,
@@ -6392,6 +6415,42 @@ pub mod mock_transport {
     async fn listener_exits_on_persistent_unclassified_recv_errors() {
         assert!(
             !listener_survives_script(unclassified_errors(1100).collect()).await,
+            "1100 unclassified errors over 110 s with no read must end the listener"
+        );
+    }
+
+    /// The socket-health signal counts every datagram the socket delivered,
+    /// not only those the listener handles: through the `DemuxSocket` the
+    /// transport binds, a QUIC-class datagram (dropped, since no QUIC
+    /// ingress is enabled) between two unclassified error runs resets the
+    /// run as a legacy datagram does. Without the reset the run holds 1000
+    /// errors over 100 s and the listener exits.
+    #[tokio::test]
+    async fn listener_quic_datagram_through_demux_resets_recv_error_run() {
+        let from: SocketAddr = (Ipv4Addr::LOCALHOST, 47_303).into();
+        let script = unclassified_errors(700)
+            .chain([RecvStep::Packet(from, vec![0xC3, 0, 0, 0])])
+            .chain(unclassified_errors(400))
+            .collect();
+        let (survived, _) =
+            run_scripted_listener_on(script, |socket| DemuxSocket::wrap(socket, None)).await;
+        assert!(
+            survived,
+            "the QUIC-class datagram between the two error runs must reset the run"
+        );
+    }
+
+    /// Control for the test above: through the same `DemuxSocket`, 1100
+    /// unclassified errors with no datagram between them still end the
+    /// listener.
+    #[tokio::test]
+    async fn listener_through_demux_exits_on_persistent_unclassified_recv_errors() {
+        let (survived, _) = run_scripted_listener_on(unclassified_errors(1100).collect(), |s| {
+            DemuxSocket::wrap(s, None)
+        })
+        .await;
+        assert!(
+            !survived,
             "1100 unclassified errors over 110 s with no read must end the listener"
         );
     }

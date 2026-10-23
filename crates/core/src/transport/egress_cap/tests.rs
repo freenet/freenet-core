@@ -804,3 +804,122 @@ fn a_warn_window_does_not_tear_under_concurrent_adds() {
     }
     assert_eq!(total, THREADS * EACH);
 }
+
+/// Counts how often it is woken.
+#[derive(Default)]
+struct CountingWaker(std::sync::atomic::AtomicUsize);
+
+impl std::task::Wake for CountingWaker {
+    fn wake(self: std::sync::Arc<Self>) {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+fn counting_waker() -> (std::task::Waker, std::sync::Arc<CountingWaker>) {
+    let counter = std::sync::Arc::new(CountingWaker::default());
+    (std::task::Waker::from(counter.clone()), counter)
+}
+
+fn woken(counter: &CountingWaker) -> usize {
+    counter.0.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// With the bucket empty, a datagram's admission is `Pending` until the
+/// rate has made up exactly its deficit: still `Pending` 1 ns before, with
+/// the waker not yet woken, and `Ready` at the deficit, after the cap's
+/// timer woke the waker. Polling takes nothing.
+#[test]
+fn poll_admit_is_pending_until_the_deficit_and_ready_at_it() {
+    let (cap, time) = cap_at(RATE);
+    cap.charge_unpaced(BURST as usize);
+    assert_eq!(cap.level_bytes(), 0);
+    // 1 200 bytes at 1 MB/s.
+    let deficit = Duration::from_micros(1_200);
+    assert_eq!(cap.try_take(PACKET, Duration::ZERO).unwrap_err(), deficit);
+
+    let (waker, counter) = counting_waker();
+    let mut cx = Context::from_waker(&waker);
+    let mut waiter = AdmissionWaiter::default();
+    assert!(cap.poll_admit(PACKET, &mut waiter, &mut cx).is_pending());
+    let start = time.now_nanos();
+    assert_eq!(waiter.wake_at_ns(), Some(start + deficit.as_nanos() as u64));
+
+    time.advance(deficit - Duration::from_nanos(1));
+    assert_eq!(
+        woken(&counter),
+        0,
+        "the timer must not fire before the deficit"
+    );
+    assert!(cap.poll_admit(PACKET, &mut waiter, &mut cx).is_pending());
+    assert_eq!(
+        waiter.wake_at_ns(),
+        Some(start + deficit.as_nanos() as u64),
+        "a poll that needs the same wakeup keeps the armed timer"
+    );
+
+    time.advance(Duration::from_nanos(1));
+    assert_eq!(woken(&counter), 1, "the timer fires at the deficit");
+    assert!(cap.poll_admit(PACKET, &mut waiter, &mut cx).is_ready());
+    assert_eq!(
+        waiter.wake_at_ns(),
+        None,
+        "a Ready poll leaves no timer armed"
+    );
+    assert_eq!(cap.level_bytes(), PACKET as i64, "polling took nothing");
+    cap.try_take(PACKET, Duration::ZERO)
+        .expect("try_take agrees with the Ready poll")
+        .sent(PACKET);
+}
+
+/// `poll_admit` and `try_take` decide alike at the same instant, over random
+/// sequences of unpaced charges, paced takes, refills and datagram sizes,
+/// and a `Pending` poll arms its wakeup exactly at `try_take`'s deficit.
+#[test]
+fn poll_admit_and_try_take_agree_at_the_same_instant() {
+    let (waker, _) = counting_waker();
+    let mut cx = Context::from_waker(&waker);
+    let (mut admitted, mut refused) = (0u32, 0u32);
+    for seed in 0..32u64 {
+        GlobalRng::scoped_seed(seed, || {
+            let (cap, time) = cap_at(RATE);
+            for _ in 0..500 {
+                match GlobalRng::random_range(0..4u32) {
+                    0 => cap.charge_unpaced(GlobalRng::random_range(1..4 * PACKET)),
+                    1 => {
+                        if let Ok(take) = cap.try_take(PACKET, Duration::ZERO) {
+                            take.sent(GlobalRng::random_range(1..=PACKET));
+                        }
+                    }
+                    _ => {
+                        time.advance(Duration::from_nanos(GlobalRng::random_range(0..3_000_000)));
+                    }
+                }
+                let bytes = GlobalRng::random_range(1..=2 * PACKET);
+                let mut waiter = AdmissionWaiter::default();
+                let polled = cap.poll_admit(bytes, &mut waiter, &mut cx);
+                let wake_at = waiter.wake_at_ns();
+                match cap.try_take(bytes, Duration::ZERO) {
+                    Ok(take) => {
+                        assert!(polled.is_ready(), "seed {seed}: try_take admitted {bytes}");
+                        admitted += 1;
+                        drop(take);
+                    }
+                    Err(deficit) => {
+                        assert!(polled.is_pending(), "seed {seed}: try_take refused {bytes}");
+                        assert_eq!(
+                            wake_at,
+                            Some(time.now_nanos() + deficit.as_nanos() as u64),
+                            "seed {seed}: the wakeup is at try_take's deficit"
+                        );
+                        refused += 1;
+                    }
+                }
+            }
+        });
+    }
+    // Both branches must have been exercised, or the agreement is vacuous.
+    assert!(
+        admitted > 1_000 && refused > 1_000,
+        "admitted {admitted}, refused {refused}"
+    );
+}

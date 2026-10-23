@@ -149,11 +149,29 @@ labelled_counters! {
         /// `0x02`). Passed on to the listener unchanged.
         Legacy => "legacy",
         /// First byte has the QUIC fixed bit or long-header bit set (mask
-        /// `0xC0`) and is not a UDP transport type byte. Dropped until the
-        /// QUIC endpoint exists.
+        /// `0xC0`) and is not a UDP transport type byte. Dropped, or queued
+        /// for the QUIC ingress when one is enabled (see
+        /// [`QuicIngressOutcome`]).
         Quic => "quic",
         /// Anything else, including an empty datagram. Dropped.
         Other => "other",
+    }
+}
+
+labelled_counters! {
+    /// What the demultiplexer did with a QUIC-class datagram
+    /// ([`DemuxClass::Quic`]). Exactly one per such datagram; exported per
+    /// period as `quic_ingress_<label>`. Every node counts `no_ingress` until
+    /// a QUIC endpoint is running (#5940).
+    pub(crate) enum QuicIngressOutcome {
+        /// Queued for the QUIC endpoint.
+        Forwarded => "forwarded",
+        /// Dropped: its source address is not in the ingress allow-set.
+        NotAllowed => "not_allowed",
+        /// Dropped: the ingress queue was full.
+        QueueFull => "queue_full",
+        /// Dropped: no QUIC ingress is enabled, or its receiver is gone.
+        NoIngress => "no_ingress",
     }
 }
 
@@ -386,6 +404,9 @@ pub struct TransportMetrics {
     /// every datagram the socket wrapper receives, legacy ones included, so
     /// the legacy share is visible.
     demux_packets: [AtomicU64; DemuxClass::COUNT],
+
+    /// QUIC-class datagrams by [`QuicIngressOutcome`] (reset each snapshot).
+    quic_ingress: [AtomicU64; QuicIngressOutcome::COUNT],
 
     /// Node-wide egress cap counters (reset each snapshot). Zero unless
     /// `total-bandwidth-limit` is set.
@@ -706,6 +727,7 @@ impl TransportMetrics {
             stray_intro_failures_evicted: AtomicU32::new(0),
             dial_queue_wait: Default::default(),
             demux_packets: Default::default(),
+            quic_ingress: Default::default(),
             egress: EgressCounters::default(),
         }
     }
@@ -1141,6 +1163,11 @@ impl TransportMetrics {
         self.demux_packets[class as usize].fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Record what the demultiplexer did with one QUIC-class datagram.
+    pub(crate) fn record_quic_ingress(&self, outcome: QuicIngressOutcome) {
+        self.quic_ingress[outcome as usize].fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Record one datagram charged to the node-wide egress cap, how it was
     /// paced, its size and how long it waited (microseconds).
     pub(crate) fn record_egress(&self, decision: EgressDecision, bytes: u64, wait_us: u64) {
@@ -1489,6 +1516,7 @@ impl TransportMetrics {
         let stray = &self.stray_intros;
         let wait = &self.dial_queue_wait;
         let demux = &self.demux_packets;
+        let quic = &self.quic_ingress;
         let egress = &self.egress;
         SnapshotExtras {
             packets_sent: get64(&l.packets_sent),
@@ -1567,6 +1595,10 @@ impl TransportMetrics {
             demux_legacy: get64(&demux[DemuxClass::Legacy as usize]),
             demux_quic: get64(&demux[DemuxClass::Quic as usize]),
             demux_other: get64(&demux[DemuxClass::Other as usize]),
+            quic_ingress_forwarded: get64(&quic[QuicIngressOutcome::Forwarded as usize]),
+            quic_ingress_not_allowed: get64(&quic[QuicIngressOutcome::NotAllowed as usize]),
+            quic_ingress_queue_full: get64(&quic[QuicIngressOutcome::QueueFull as usize]),
+            quic_ingress_no_ingress: get64(&quic[QuicIngressOutcome::NoIngress as usize]),
             egress_immediate: get64(&egress.packets[EgressDecision::Immediate as usize]),
             egress_waited: get64(&egress.packets[EgressDecision::Waited as usize]),
             egress_unpaced: get64(&egress.packets[EgressDecision::Unpaced as usize]),
@@ -1997,6 +2029,12 @@ pub struct TransportSnapshot {
     pub demux_legacy: u64,
     pub demux_quic: u64,
     pub demux_other: u64,
+    /// QUIC-class datagrams during the period by what the demultiplexer did
+    /// with them, by [`QuicIngressOutcome`]. They sum to `demux_quic`, up to a snapshot race.
+    pub quic_ingress_forwarded: u64,
+    pub quic_ingress_not_allowed: u64,
+    pub quic_ingress_queue_full: u64,
+    pub quic_ingress_no_ingress: u64,
     /// Datagrams sent during the period by how the node-wide egress cap
     /// paced them, by [`EgressDecision`], with their bytes, the bytes and
     /// total and longest wait (microseconds) of those that waited, the
@@ -2099,6 +2137,10 @@ impl TransportSnapshot {
             demux_legacy,
             demux_quic,
             demux_other,
+            quic_ingress_forwarded,
+            quic_ingress_not_allowed,
+            quic_ingress_queue_full,
+            quic_ingress_no_ingress,
             egress_immediate,
             egress_waited,
             egress_unpaced,
@@ -2170,6 +2212,10 @@ impl TransportSnapshot {
         self.demux_legacy = demux_legacy;
         self.demux_quic = demux_quic;
         self.demux_other = demux_other;
+        self.quic_ingress_forwarded = quic_ingress_forwarded;
+        self.quic_ingress_not_allowed = quic_ingress_not_allowed;
+        self.quic_ingress_queue_full = quic_ingress_queue_full;
+        self.quic_ingress_no_ingress = quic_ingress_no_ingress;
         self.egress_immediate = egress_immediate;
         self.egress_waited = egress_waited;
         self.egress_unpaced = egress_unpaced;
@@ -2307,6 +2353,12 @@ struct SnapshotExtras {
     pub demux_legacy: u64,
     pub demux_quic: u64,
     pub demux_other: u64,
+    /// QUIC-class datagrams during the period by what the demultiplexer did
+    /// with them, by [`QuicIngressOutcome`]. They sum to `demux_quic`, up to a snapshot race.
+    pub quic_ingress_forwarded: u64,
+    pub quic_ingress_not_allowed: u64,
+    pub quic_ingress_queue_full: u64,
+    pub quic_ingress_no_ingress: u64,
     /// Datagrams sent during the period by how the node-wide egress cap
     /// paced them, by [`EgressDecision`], with their bytes, the bytes and
     /// total and longest wait (microseconds) of those that waited, the
@@ -2378,6 +2430,10 @@ impl SnapshotExtras {
             || self.demux_legacy != 0
             || self.demux_quic != 0
             || self.demux_other != 0
+            || self.quic_ingress_forwarded != 0
+            || self.quic_ingress_not_allowed != 0
+            || self.quic_ingress_queue_full != 0
+            || self.quic_ingress_no_ingress != 0
             // The debt high-water mark alone is not activity: it is only set
             // by a charge, which also counts a packet.
             || self.egress_immediate != 0
@@ -3252,6 +3308,11 @@ mod tests {
         check(&StrayIntro::ALL, |v| v as usize, StrayIntro::label);
         check(&DialQueueWait::ALL, |v| v as usize, DialQueueWait::label);
         check(&DemuxClass::ALL, |v| v as usize, DemuxClass::label);
+        check(
+            &QuicIngressOutcome::ALL,
+            |v| v as usize,
+            QuicIngressOutcome::label,
+        );
         check(&EgressDecision::ALL, |v| v as usize, EgressDecision::label);
         check(&WaitCause::ALL, |v| v as usize, WaitCause::label);
     }
@@ -3292,6 +3353,16 @@ mod tests {
             DemuxClass::Legacy => snap.demux_legacy,
             DemuxClass::Quic => snap.demux_quic,
             DemuxClass::Other => snap.demux_other,
+        }
+    }
+
+    /// The snapshot field carrying a QUIC ingress outcome (exhaustive).
+    fn quic_ingress_count(snap: &TransportSnapshot, outcome: QuicIngressOutcome) -> u64 {
+        match outcome {
+            QuicIngressOutcome::Forwarded => snap.quic_ingress_forwarded,
+            QuicIngressOutcome::NotAllowed => snap.quic_ingress_not_allowed,
+            QuicIngressOutcome::QueueFull => snap.quic_ingress_queue_full,
+            QuicIngressOutcome::NoIngress => snap.quic_ingress_no_ingress,
         }
     }
 
@@ -3400,6 +3471,30 @@ mod tests {
             }
         }
         assert!(metrics.take_snapshot().is_none(), "demux counts must reset");
+    }
+
+    /// QUIC ingress outcomes reach the snapshot per outcome and reset with it.
+    #[test]
+    fn quic_ingress_counts_snapshot_and_reset() {
+        let metrics = TransportMetrics::new();
+        for (i, outcome) in QuicIngressOutcome::ALL.into_iter().enumerate() {
+            for _ in 0..=i {
+                metrics.record_quic_ingress(outcome);
+            }
+        }
+        let read = metrics.read_snapshot();
+        let snap = metrics
+            .take_snapshot()
+            .expect("quic ingress counts are activity");
+        for s in [&read, &snap] {
+            for (i, outcome) in QuicIngressOutcome::ALL.into_iter().enumerate() {
+                assert_eq!(quic_ingress_count(s, outcome), i as u64 + 1, "{outcome:?}");
+            }
+        }
+        assert!(
+            metrics.take_snapshot().is_none(),
+            "quic ingress counts must reset"
+        );
     }
 
     /// Egress cap counts reach the snapshot per decision, with bytes, waits,
@@ -3551,6 +3646,14 @@ mod tests {
                 .unwrap_or_else(|| panic!("{class:?} alone must be activity"));
             assert_eq!(demux_count(&snap, class), 1, "{class:?}");
         }
+        for outcome in QuicIngressOutcome::ALL {
+            let metrics = TransportMetrics::new();
+            metrics.record_quic_ingress(outcome);
+            let snap = metrics
+                .take_snapshot()
+                .unwrap_or_else(|| panic!("{outcome:?} alone must be activity"));
+            assert_eq!(quic_ingress_count(&snap, outcome), 1, "{outcome:?}");
+        }
         for bucket in DialQueueWait::ALL {
             let metrics = TransportMetrics::new();
             metrics.dial_queue_wait[bucket as usize].fetch_add(1, Ordering::Relaxed);
@@ -3575,6 +3678,9 @@ mod tests {
         }
         for class in DemuxClass::ALL {
             keys.push(format!("demux_{}", class.label()));
+        }
+        for outcome in QuicIngressOutcome::ALL {
+            keys.push(format!("quic_ingress_{}", outcome.label()));
         }
         for decision in EgressDecision::ALL {
             keys.push(format!("egress_{}", decision.label()));
@@ -3792,6 +3898,10 @@ mod tests {
             "demux_legacy",
             "demux_quic",
             "demux_other",
+            "quic_ingress_forwarded",
+            "quic_ingress_not_allowed",
+            "quic_ingress_queue_full",
+            "quic_ingress_no_ingress",
             "egress_immediate",
             "egress_waited",
             "egress_unpaced",

@@ -1663,6 +1663,9 @@ pub(crate) fn declared_cache_ceiling_terms(
     // `declared_caches_plus_hosting_budget_leave_room_for_the_runtime` in
     // `ring::hosting::cache`) never see.
     let parked = crate::contract::delegate_park::parked_budget_for(memory_limit);
+    // The transport's QUIC ingress queue (#5940): one per node, flat, since it
+    // holds at most a fixed number of datagrams of at most one MTU each.
+    let quic_ingress = crate::transport::demux::QUIC_INGRESS_QUEUE_BYTES;
 
     vec![
         // The pool multiplication IS #5268's defect 3.
@@ -1695,6 +1698,7 @@ pub(crate) fn declared_cache_ceiling_terms(
         // staleness.
         ("page_cache_size_for", page_cache),
         ("parked_budget_for", parked),
+        ("QUIC_INGRESS_QUEUE_BYTES", quic_ingress),
     ]
 }
 
@@ -2153,6 +2157,7 @@ mod tests {
             "interest_delta_budget_for",
             "page_cache_size_for",
             "parked_budget_for",
+            "QUIC_INGRESS_QUEUE_BYTES",
         ] {
             assert!(
                 labels.contains(&required),
@@ -2265,6 +2270,10 @@ mod tests {
             (
                 "parked_budget_for",
                 crate::contract::delegate_park::parked_budget_for(ONE_GIB),
+            ),
+            (
+                "QUIC_INGRESS_QUEUE_BYTES",
+                crate::transport::demux::QUIC_INGRESS_QUEUE_BYTES,
             ),
         ] {
             assert_eq!(

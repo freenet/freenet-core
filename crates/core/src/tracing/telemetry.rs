@@ -2883,6 +2883,22 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                 serde_json::json!(snapshot.demux_other),
             );
             m.insert(
+                "quic_ingress_forwarded".into(),
+                serde_json::json!(snapshot.quic_ingress_forwarded),
+            );
+            m.insert(
+                "quic_ingress_not_allowed".into(),
+                serde_json::json!(snapshot.quic_ingress_not_allowed),
+            );
+            m.insert(
+                "quic_ingress_queue_full".into(),
+                serde_json::json!(snapshot.quic_ingress_queue_full),
+            );
+            m.insert(
+                "quic_ingress_no_ingress".into(),
+                serde_json::json!(snapshot.quic_ingress_no_ingress),
+            );
+            m.insert(
                 "egress_immediate".into(),
                 serde_json::json!(snapshot.egress_immediate),
             );
@@ -6608,6 +6624,10 @@ mod tests {
             demux_legacy: 19,
             demux_quic: 20,
             demux_other: 21,
+            quic_ingress_forwarded: 46,
+            quic_ingress_not_allowed: 47,
+            quic_ingress_queue_full: 48,
+            quic_ingress_no_ingress: 49,
             egress_immediate: 22,
             egress_waited: 23,
             egress_unpaced: 25,
@@ -6649,6 +6669,10 @@ mod tests {
             ("demux_legacy", 19),
             ("demux_quic", 20),
             ("demux_other", 21),
+            ("quic_ingress_forwarded", 46),
+            ("quic_ingress_not_allowed", 47),
+            ("quic_ingress_queue_full", 48),
+            ("quic_ingress_no_ingress", 49),
             ("egress_immediate", 22),
             ("egress_waited", 23),
             ("egress_unpaced", 25),

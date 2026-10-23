@@ -504,6 +504,19 @@ impl<T: TimeSource> InMemorySocket<T> {
 
     /// Generic async send_to implementation using the time source.
     pub async fn send_to(&self, buf: &[u8], target: SocketAddr) -> io::Result<usize> {
+        self.send_now(buf, target)
+    }
+
+    /// Non-blocking send: the same fault-injection decision and delivery as
+    /// [`Self::send_to`], which never waits either. An in-memory socket has
+    /// no send buffer, so this never returns `WouldBlock`.
+    pub fn try_send_to(&self, buf: &[u8], target: SocketAddr) -> io::Result<usize> {
+        self.send_now(buf, target)
+    }
+
+    /// The body of [`Self::send_to`] and [`Self::try_send_to`]. A delayed
+    /// delivery is a spawned task on the time source, so nothing here waits.
+    fn send_now(&self, buf: &[u8], target: SocketAddr) -> io::Result<usize> {
         if buf.len() > MAX_PACKET_SIZE {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -591,6 +604,10 @@ impl Socket for InMemorySocket<RealTime> {
 
     fn send_to_blocking(&self, buf: &[u8], target: SocketAddr) -> io::Result<usize> {
         InMemorySocket::<RealTime>::send_to_blocking(self, buf, target)
+    }
+
+    fn try_send_to(&self, buf: &[u8], target: SocketAddr) -> io::Result<usize> {
+        InMemorySocket::<RealTime>::try_send_to(self, buf, target)
     }
 }
 
@@ -701,6 +718,10 @@ impl Socket for SimulationSocket {
 
     fn send_to_blocking(&self, buf: &[u8], target: SocketAddr) -> io::Result<usize> {
         self.0.send_to_blocking(buf, target)
+    }
+
+    fn try_send_to(&self, buf: &[u8], target: SocketAddr) -> io::Result<usize> {
+        self.0.try_send_to(buf, target)
     }
 }
 
@@ -867,5 +888,106 @@ mod tests {
 
         assert_eq!(&buf[..len], msg);
         assert_eq!(from, addr1);
+    }
+
+    /// `try_send_to` takes the fault-injection decision `send_to` takes, for
+    /// every kind of decision: one target per kind, each datagram sent once
+    /// through each method, and the two methods' outcomes compared at each
+    /// target. Delayed delivery runs on the network's `VirtualTime`, so the
+    /// test moves that clock rather than waiting.
+    #[tokio::test]
+    async fn simulation_socket_try_send_to_takes_the_same_fault_decision_as_send_to() {
+        use futures::FutureExt;
+
+        let network = "test-try-send-parity";
+        let time = VirtualTime::new();
+        register_network_time_source(network, time.clone());
+        let addr = |port: u16| -> SocketAddr { SocketAddr::from(([127, 0, 0, 1], port)) };
+        let (sender, drop_to, deliver_to, queue_to, delay_to) = (
+            addr(41001),
+            addr(41002),
+            addr(41003),
+            addr(41004),
+            addr(41005),
+        );
+        for a in [sender, drop_to, deliver_to, queue_to, delay_to] {
+            register_address_network(a, network);
+        }
+        const DEADLINE: u64 = 7_000;
+        const DELAY: Duration = Duration::from_millis(30);
+        set_packet_delivery_callback(
+            network,
+            Some(Arc::new(move |_, _, to| match to {
+                t if t == drop_to => PacketDeliveryDecision::Drop,
+                t if t == queue_to => PacketDeliveryDecision::QueuedDelivery { deadline: DEADLINE },
+                t if t == delay_to => PacketDeliveryDecision::DelayedDelivery(DELAY),
+                _ => PacketDeliveryDecision::Deliver,
+            })),
+        );
+        let queued = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = queued.clone();
+        set_queue_packet_callback(
+            network,
+            Some(Arc::new(move |_, deadline, data, from, to| {
+                log.lock().unwrap().push((deadline, data, from, to));
+            })),
+        );
+
+        let send = SimulationSocket::bind(sender).await.unwrap();
+        let mut receivers = Vec::new();
+        for a in [drop_to, deliver_to, queue_to, delay_to] {
+            receivers.push((a, SimulationSocket::bind(a).await.unwrap()));
+        }
+        let inbox = |socket: &SimulationSocket| -> Vec<Vec<u8>> {
+            let mut got = Vec::new();
+            let mut buf = [0u8; 64];
+            while let Some(Ok((len, _))) = socket.recv_from(&mut buf).now_or_never() {
+                got.push(buf[..len].to_vec());
+            }
+            got
+        };
+
+        for (target, _) in &receivers {
+            assert_eq!(Socket::send_to(&send, b"async", *target).await.unwrap(), 5);
+            assert_eq!(Socket::try_send_to(&send, b"try", *target).unwrap(), 3);
+        }
+        // Let the delayed deliveries' tasks register their sleeps, then move
+        // the clock past the delay and let them deliver.
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        let at_once: Vec<Vec<Vec<u8>>> = receivers.iter().map(|(_, s)| inbox(s)).collect();
+        time.advance(DELAY);
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        let after_delay: Vec<Vec<Vec<u8>>> = receivers.iter().map(|(_, s)| inbox(s)).collect();
+
+        let both = vec![b"async".to_vec(), b"try".to_vec()];
+        // Drop: neither arrives. Deliver: both at once. Queue: neither
+        // arrives here, both go to the queue callback. Delay: both, after
+        // the delay only.
+        assert_eq!(at_once, vec![vec![], both.clone(), vec![], vec![]]);
+        assert_eq!(after_delay, vec![vec![], vec![], vec![], both.clone()]);
+        assert_eq!(
+            *queued.lock().unwrap(),
+            vec![
+                (DEADLINE, b"async".to_vec(), sender, queue_to),
+                (DEADLINE, b"try".to_vec(), sender, queue_to),
+            ]
+        );
+
+        // The size limit is the same too.
+        let too_big = vec![0u8; MAX_PACKET_SIZE + 1];
+        let async_err = Socket::send_to(&send, &too_big, deliver_to)
+            .await
+            .unwrap_err();
+        let try_err = Socket::try_send_to(&send, &too_big, deliver_to).unwrap_err();
+        assert_eq!(async_err.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(try_err.kind(), io::ErrorKind::InvalidInput);
+
+        set_packet_delivery_callback(network, None);
+        set_queue_packet_callback(network, None);
+        unregister_network_time_source(network);
     }
 }

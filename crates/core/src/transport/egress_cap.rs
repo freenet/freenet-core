@@ -67,10 +67,13 @@
 //! [`TimeSource`] the cap was built with, with saturating operations.
 
 use std::fmt;
+use std::future::Future;
 use std::mem::ManuallyDrop;
+use std::pin::Pin;
 #[cfg(test)]
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicI64, Ordering};
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use super::Socket;
@@ -213,6 +216,10 @@ pub struct EgressCap {
     burst_ns: i64,
     debt_limit_ns: i64,
     clock: Box<dyn Fn() -> u64 + Send + Sync>,
+    /// `TimeSource::sleep_until` of the same time source as `clock`, for
+    /// [`Self::poll_admit`]'s wakeups.
+    #[cfg_attr(not(test), allow(dead_code))]
+    sleep_until: Box<dyn Fn(u64) -> SleepFuture + Send + Sync>,
     /// Time (ns, on `clock`) at which the bucket level is zero.
     empty_at_ns: AtomicI64,
     /// When the long-wait warning was last logged (ns, on `clock`).
@@ -233,6 +240,34 @@ impl fmt::Debug for EgressCap {
             .field("rate_bytes_per_sec", &self.rate_bytes_per_sec)
             .field("burst_bytes", &self.burst_bytes())
             .finish_non_exhaustive()
+    }
+}
+
+type SleepFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
+
+/// The wakeup a sender polling [`EgressCap::poll_admit`] keeps between
+/// polls: one timer on the cap's time source and the time it fires at.
+/// Owned by the sender, so the cap holds nothing per waiter.
+#[derive(Default)]
+// Used by the QUIC endpoint (#5940); only tests use it until then.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct AdmissionWaiter {
+    timer: Option<(u64, SleepFuture)>,
+}
+
+impl AdmissionWaiter {
+    /// When the armed timer fires (ns on the cap's clock), if one is armed.
+    #[cfg(test)]
+    pub(crate) fn wake_at_ns(&self) -> Option<u64> {
+        self.timer.as_ref().map(|(at, _)| *at)
+    }
+}
+
+impl fmt::Debug for AdmissionWaiter {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AdmissionWaiter")
+            .field("wake_at_ns", &self.timer.as_ref().map(|(at, _)| *at))
+            .finish()
     }
 }
 
@@ -259,6 +294,8 @@ impl EgressCap {
         let burst_bytes = burst_bytes.max(MIN_BURST_PACKETS * MAX_PACKET_SIZE as u64);
         let burst_ns = Self::nanos_for(rate, burst_bytes);
         let debt_limit_ns = i64::try_from(DEBT_LIMIT.as_nanos()).unwrap_or(i64::MAX);
+        let sleeper = time_source.clone();
+        let sleep_until = Box::new(move |deadline_ns| sleeper.sleep_until(deadline_ns));
         let clock = Box::new(move || time_source.now_nanos());
         let now = i64::try_from(clock()).unwrap_or(i64::MAX);
         Self {
@@ -266,6 +303,7 @@ impl EgressCap {
             burst_ns,
             debt_limit_ns,
             clock,
+            sleep_until,
             empty_at_ns: AtomicI64::new(now.saturating_sub(burst_ns)),
             last_long_wait_warn_ns: AtomicI64::new(i64::MIN),
             last_abandon_warn_ns: AtomicI64::new(i64::MIN),
@@ -323,6 +361,19 @@ impl EgressCap {
     /// burst.
     fn refilled(&self, empty_at: i64, now: i64) -> i64 {
         empty_at.max(now.saturating_sub(self.burst_ns))
+    }
+
+    /// The admission predicate shared by [`Self::try_take`] and
+    /// [`Self::poll_admit`]: a take of `cost` at `now` is admitted when the
+    /// bucket holds the whole amount. `Ok` is `empty_at_ns` after the take;
+    /// `Err` is the deficit in nanoseconds at the rate.
+    fn admits(&self, empty_at: i64, now: i64, cost: i64) -> Result<i64, i64> {
+        let after = self.refilled(empty_at, now).saturating_add(cost);
+        if after <= now {
+            Ok(after)
+        } else {
+            Err(after - now)
+        }
     }
 
     /// Apply `f(empty_at_ns, now)` atomically. `f` returns the new value, or
@@ -392,22 +443,64 @@ impl EgressCap {
         waited: Duration,
     ) -> Result<EgressTake<'_>, Duration> {
         let cost = self.cost_ns(bytes as u64);
-        let (old, _, now) = self.update(|empty_at, now| {
-            let after = self.refilled(empty_at, now).saturating_add(cost);
-            (after <= now).then_some(after)
-        });
+        let (old, _, now) = self.update(|empty_at, now| self.admits(empty_at, now, cost).ok());
         // The same predicate on the value the last attempt saw.
-        let after = self.refilled(old, now).saturating_add(cost);
-        if after > now {
+        if let Err(deficit) = self.admits(old, now, cost) {
             #[cfg(test)]
             self.stats.refusals.fetch_add(1, Ordering::Relaxed);
-            return Err(Duration::from_nanos((after - now) as u64));
+            return Err(Duration::from_nanos(deficit as u64));
         }
         Ok(EgressTake {
             cap: self,
             taken_bytes: bytes as u64,
             waited,
         })
+    }
+
+    /// Poll form of the admission check, for a sender that is polled rather
+    /// than one that can sleep and retry (a QUIC endpoint's
+    /// `UdpPoller::poll_writable`, #5940). `Ready` when [`Self::try_take`] of
+    /// `bytes` would succeed now (the same predicate at the same instant);
+    /// otherwise `Pending`, with `waiter` holding a timer on the cap's time
+    /// source that wakes `cx` when the rate has made up the deficit. Takes
+    /// nothing: the sender then takes or is charged as it sends, and another
+    /// sender may take the bytes first, in which case the next poll is
+    /// `Pending` again.
+    ///
+    /// The timer is replaced only when the bucket now needs an earlier
+    /// wakeup than the one armed; a later need (more debt arrived) keeps the
+    /// armed timer, which wakes early and re-checks. So repeated polls do not
+    /// register a new timer each.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn poll_admit(
+        &self,
+        bytes: usize,
+        waiter: &mut AdmissionWaiter,
+        cx: &mut Context<'_>,
+    ) -> Poll<()> {
+        let cost = self.cost_ns(bytes as u64);
+        loop {
+            let now = self.now();
+            let deficit = match self.admits(self.empty_at_ns.load(Ordering::Acquire), now, cost) {
+                Ok(_) => {
+                    waiter.timer = None;
+                    return Poll::Ready(());
+                }
+                Err(deficit) => deficit,
+            };
+            let wake_at = u64::try_from(now.saturating_add(deficit)).unwrap_or(u64::MAX);
+            if !matches!(&waiter.timer, Some((at, _)) if *at <= wake_at) {
+                waiter.timer = None;
+            }
+            let (_, timer) = waiter
+                .timer
+                .get_or_insert_with(|| (wake_at, (self.sleep_until)(wake_at)));
+            match timer.as_mut().poll(cx) {
+                Poll::Pending => return Poll::Pending,
+                // The timer fired: check the bucket again.
+                Poll::Ready(()) => waiter.timer = None,
+            }
+        }
     }
 
     /// Return `bytes` to the bucket, never above the burst.
