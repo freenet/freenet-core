@@ -2030,7 +2030,7 @@ pub struct TransportSnapshot {
     pub demux_quic: u64,
     pub demux_other: u64,
     /// QUIC-class datagrams during the period by what the demultiplexer did
-    /// with them, by [`QuicIngressOutcome`]. They sum to `demux_quic`.
+    /// with them, by [`QuicIngressOutcome`]. They sum to `demux_quic`, up to a snapshot race.
     pub quic_ingress_forwarded: u64,
     pub quic_ingress_not_allowed: u64,
     pub quic_ingress_queue_full: u64,
@@ -2354,7 +2354,7 @@ struct SnapshotExtras {
     pub demux_quic: u64,
     pub demux_other: u64,
     /// QUIC-class datagrams during the period by what the demultiplexer did
-    /// with them, by [`QuicIngressOutcome`]. They sum to `demux_quic`.
+    /// with them, by [`QuicIngressOutcome`]. They sum to `demux_quic`, up to a snapshot race.
     pub quic_ingress_forwarded: u64,
     pub quic_ingress_not_allowed: u64,
     pub quic_ingress_queue_full: u64,

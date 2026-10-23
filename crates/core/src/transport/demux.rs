@@ -51,8 +51,11 @@ pub(crate) const QUIC_INGRESS_QUEUE_DATAGRAMS: usize = 1024;
 /// The most memory the QUIC ingress queue can hold: every slot holding a
 /// datagram of the largest size the listener receives (its read buffer is
 /// `MAX_RECV_PACKET_SIZE`, so no read is longer), plus the slot itself.
-/// One queue per node, and only while a QUIC ingress is enabled. Declared in
-/// `contract::executor::declared_cache_ceiling`, which only tests read.
+/// The bound assumes that buffer: a caller reading into a larger one could
+/// queue longer datagrams. One queue per node, and only while a QUIC ingress
+/// is enabled. The allow-set is not counted here; its size is up to the
+/// caller. Declared in `contract::executor::declared_cache_ceiling`, which
+/// only tests read.
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const QUIC_INGRESS_QUEUE_BYTES: usize =
     QUIC_INGRESS_QUEUE_DATAGRAMS * (MAX_RECV_PACKET_SIZE + std::mem::size_of::<QuicDatagram>());
@@ -107,7 +110,7 @@ pub(crate) fn classify(packet: &[u8]) -> DemuxClass {
 ///
 /// [`Self::enable_quic_ingress`] gives the socket a bounded queue of
 /// QUIC-class datagrams for a QUIC endpoint. The listener stays the only
-/// reader of the UDP socket and fills the queue with `try_send`, so a slow
+/// reader of the UDP socket and fills the queue with `try_reserve`, so a slow
 /// or stopped endpoint costs dropped QUIC datagrams and never stalls the
 /// listener. A datagram is queued only if its source address is on the
 /// allow-set ([`Self::allow_quic_source`]); the rest are dropped as before,
@@ -257,8 +260,10 @@ impl<S: Socket> Socket for DemuxSocket<S> {
     /// read, and the read itself, and the rest is synchronous.
     async fn recv_classified(&self, buf: &mut [u8]) -> io::Result<SocketRead> {
         if self.diverted_in_a_row.load(Ordering::Relaxed) >= DROPS_BETWEEN_YIELDS {
-            self.diverted_in_a_row.store(0, Ordering::Relaxed);
             tokio::task::yield_now().await;
+            // Reset after the yield completes: if the future is dropped while
+            // the yield is pending, the next call yields again.
+            self.diverted_in_a_row.store(0, Ordering::Relaxed);
         }
         let (len, from) = self.inner.recv_from(buf).await?;
         let class = classify(&buf[..len]);
