@@ -128,14 +128,24 @@ upstream stream for relayed streams, and the rest): egress_long_waits_<cause>, e
 Each has its own rate-limited WARN with one line per cause seen since the last, each with its count and remedy; the
 per-stream abandonment line is at debug. The
 cap counts UDP payload, not IP/UDP headers.
-EgressCap::poll_admit is the poll form for a sender that is polled (a quinn
-UdpPoller, #5940): Ready exactly when try_take would succeed at that instant
-(one shared predicate, `admits`), else Pending with a timer on the cap's
-TimeSource at the refill time, kept in the caller's AdmissionWaiter. It takes
-nothing; the sender is charged at its send (Socket::try_send_to charges like
-send_to). The cap is built on RealTime even in simulation, because the
-listener and its connections run on RealTime there: a VirtualTime cap would
-compute deficits on another clock than its waiters sleep and time out on.
+EgressCap::poll_admit is the poll form for a sender that is polled (the QUIC
+endpoint's UdpPoller, #5940): Ready exactly when try_take would succeed at
+that instant (one shared predicate, `admits`), else Pending with a timer on
+the cap's TimeSource at the refill time, kept in the caller's
+AdmissionWaiter. While Pending the cap also holds the caller's waker (at most
+MAX_ADMISSION_WAKERS; a full map is woken and cleared before a new entry), and
+bytes given back (a take that sent less, or a failed send) wake every held
+waker, so a waiter is not left asleep to its old deficit. It takes nothing;
+the QUIC socket takes with try_take and sends with
+DemuxSocket::try_send_to_paced, so its datagram is charged once, by the take.
+A take larger than the burst (none today: QUIC sends one datagram per
+transmit) is admitted with a full bucket and leaves debt for the excess,
+instead of never being admitted.
+The cap is built on RealTime even in simulation, because the listener and
+its connections run on RealTime there: a VirtualTime cap would compute
+deficits on another clock than its waiters sleep and time out on. The QUIC
+endpoint runs on the cap's clock for the same reason (bind_udp_listener
+builds both on RealTime; tests build both on one VirtualTime).
 Tests assert on per-cap EgressCap::stats(), never the global counters.
 ```
 
@@ -624,10 +634,19 @@ datagrams with their source. The listener stays the ONLY reader of the UDP
 socket and fills the queue with `try_reserve`, never a waiting send, so a slow
 endpoint costs dropped QUIC datagrams and never stalls the listener. Only
 sources on the allow-set (`allow_quic_source`, normalized addresses) are
-queued; the rest are dropped, so a prober gets no QUIC reply. Each QUIC-class
-datagram is counted as `quic_ingress_forwarded`, `_not_allowed`,
-`_queue_full` or `_no_ingress` (no ingress enabled or its receiver gone;
-every node today, since only tests enable it).
+queued; the rest are dropped, so a prober gets no QUIC reply. One source
+holds at most QUIC_INGRESS_PER_SOURCE_DATAGRAMS (a quarter) of the queue, so
+one allowed or spoofed-allowed source cannot starve the other connections.
+`allow_quic_source` returns a QuicSourcePermit: the address stays allowed
+while a permit for it is alive, and the set holds at most
+QUIC_ALLOWED_SOURCES_MAX addresses (past it, `allow_quic_source` refuses).
+The QUIC endpoint holds one permit per connection until quinn reports the
+connection closed, whatever closed it, and dropping its connection handle
+closes it; an address on the set is bounded by its connection's life, which
+inherits the #5922 gap for a connection held open indefinitely. Each
+QUIC-class datagram is counted as `quic_ingress_forwarded`, `_not_allowed`,
+`_queue_full`, `_source_full` or `_no_ingress` (no ingress enabled or its
+receiver gone; every node with `transport-quic` off).
 
 Socket-health signal: the listener reads through `Socket::recv_classified`,
 which `DemuxSocket` answers with `Datagram` for a legacy datagram and
@@ -640,6 +659,58 @@ there is one.
 The same wrapper charges outbound datagrams to the node-wide egress cap (see
 "Node-wide egress cap" above). A new send site needs nothing to be charged;
 it must not wait unless it is a pacing point.
+
+#### QUIC endpoint (`transport/quic.rs`, #5940 step c2)
+
+`transport-quic` (config key, `off` by default, or `prefer`) decides whether
+`bind_udp_listener` builds a quinn endpoint over the DemuxSocket. Off: no
+endpoint, no QUIC ingress, nothing changes. Prefer: the endpoint is built
+with NO server configuration and an EMPTY allow-set, so nothing reaches it
+and it sends nothing; the listener holds it. Peer identity (c3) and
+upgrading a UDP session to QUIC come later, so only tests open QUIC
+connections. An unknown value is off with a warning, never an error: a
+crash-loop rollback reinstalls an older binary, which must start with a value
+a later release wrote, and keeps it in config.toml.
+
+```
+QuicSocket (quic/socket.rs) is quinn's AsyncUdpSocket:
+  → receive: reads the ingress queue only, one datagram per call, NEVER an
+    error (quinn's endpoint driver stops on one); an IPv4 source is given
+    as ::ffff:a.b.c.d on an IPv6 socket, the form quinn connects to there
+  → send: one datagram per transmit (max_transmit_segments 1, no GSO);
+    with a cap, try_take(len) first: short → WouldBlock, nothing charged;
+    socket WouldBlock → the take is returned; any other send error is
+    counted and reported as sent (quinn's connection driver stops on one)
+  → UdpPoller: Ready when the socket can send AND poll_admit(1200) is
+    Ready; its AdmissionWaiter sits in a Mutex only so the poller is Sync
+QuicRuntime (quic/runtime.rs): now/new_timer on the TimeSource, spawn on
+  GlobalExecutor. A timer reset to a later deadline keeps its armed sleep
+  (VirtualSleep has no Drop deregistration) and re-arms when it fires.
+config.rs pins every quinn and rustls value; tests pin each:
+  grease_quic_bit(false) (the demux rule depends on it), versions [1],
+  max_udp_payload / initial and min MTU 1200, no MTU discovery, no GSO,
+  keepalive 15 s (None when the TimeSource disables keepalive), idle = the
+  TimeSource's connection idle timeout, Cubic, 256 uni / 1 bidi streams,
+  stream / receive / send window = clamp(5% of memory / (2 x
+  max-number-of-connections), 128 KiB, 2 MiB), no unreliable datagrams, no
+  spin bit, migration off, max_incoming 64, incoming buffers 64 KiB / 1 MiB,
+  no validation tokens, rustls ring, TLS 1.3, fixed ALPN, no SNI, no
+  resumption, no early data. Keys and seeds (reset key, token key, CID key,
+  quinn's rng_seed, initial destination CIDs) come from GlobalRng.
+Connection IDs (quic/cid.rs) carry a keyed BLAKE3 MAC, so quinn drops a
+  short-header packet with a forged ID silently; quinn's own hashed
+  generator can be spoofed and would answer it with a stateless reset.
+```
+
+The endpoint's memory (`quic_endpoint_budget_for`) is a term in
+`declared_cache_ceiling`, zero at the shipped default (off). With QUIC on it
+is at least 50 MiB at the default connection count, which a 1 GiB host's
+declared caches have no room for; settle that before QUIC is offered.
+
+In tests, two endpoints on SimulationSocket with one VirtualTime and a
+seeded GlobalRng repeat the same event trace; the bytes differ, because
+rustls's key exchange uses ring's OS RNG. The TLS identities in
+`quic/test_tls.rs` accept ANY Ed25519 raw public key and are test-only.
 
 ### WHEN testing transport code
 

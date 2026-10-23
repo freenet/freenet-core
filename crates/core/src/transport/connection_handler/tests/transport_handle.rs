@@ -106,6 +106,7 @@ async fn listener_outlives_a_dropped_connector_while_a_clone_remains() {
         false,
         addr,
         UdpTransportConfig::default(),
+        None,
     )
     .map(|(o, rx, task)| {
         (
@@ -162,7 +163,9 @@ async fn udp_transport_config_reaches_the_listener_by_name() {
             ledbat_min_ssthresh: Some(2_222),
             congestion_config: None,
             ack_version_floor_override: Some((9, 8, 7)),
+            quic: None,
         },
+        None,
     );
     assert_eq!(listener.bandwidth_limit, Some(1_111));
     assert_eq!(listener.ledbat_min_ssthresh, Some(2_222));

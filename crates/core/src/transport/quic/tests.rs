@@ -1,0 +1,1297 @@
+//! Tests for the QUIC endpoint.
+//!
+//! Most run two endpoints over `SimulationSocket` on one `VirtualTime`, with
+//! `GlobalRng` seeded, on the test's single-threaded runtime: quinn's clock,
+//! timers, connection IDs and keys are then all under the test's control.
+//! The TLS identities are the TEST-ONLY accept-any raw public keys of
+//! `test_tls`.
+
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use super::config::{
+    self, ALPN, INCOMING_BUFFER_BYTES, INCOMING_BUFFER_TOTAL_BYTES, KEEPALIVE_INTERVAL,
+    MAX_BIDI_STREAMS, MAX_INCOMING, MAX_UDP_PAYLOAD, MAX_UNI_STREAMS, MAX_WINDOW_BYTES,
+    MIN_WINDOW_BYTES,
+};
+use super::test_tls::{AcceptAnyClientKey, AcceptAnyServerKey, TestIdentity};
+use super::*;
+use crate::config::GlobalRng;
+use crate::simulation::{RealTime, VirtualTime};
+use crate::transport::Socket;
+use crate::transport::demux::{DemuxSocket, classify};
+use crate::transport::egress_cap::EgressCap;
+use crate::transport::in_memory_socket::{
+    SimulationSocket, register_address_network, register_network_time_source,
+    unregister_network_time_source,
+};
+use crate::transport::metrics::DemuxClass;
+use crate::transport::packet_data::MAX_RECV_PACKET_SIZE;
+
+const SEED: u64 = 0x0059_40C2;
+
+/// One datagram as a test socket saw it leave.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Sent {
+    at_ns: u64,
+    from: SocketAddr,
+    to: SocketAddr,
+    bytes: Vec<u8>,
+}
+
+/// A socket that records every datagram sent through it, with the time on
+/// `time`, and otherwise passes everything to `inner`.
+struct Recording<S> {
+    inner: S,
+    addr: SocketAddr,
+    time: VirtualTime,
+    log: Arc<Mutex<Vec<Sent>>>,
+}
+
+impl<S: Socket> Recording<S> {
+    fn note(&self, buf: &[u8], to: SocketAddr) {
+        self.log.lock().unwrap().push(Sent {
+            at_ns: self.time.now_nanos(),
+            from: self.addr,
+            to,
+            bytes: buf.to_vec(),
+        });
+    }
+}
+
+impl<S: Socket> Socket for Recording<S> {
+    async fn bind(_addr: SocketAddr) -> std::io::Result<Self> {
+        unreachable!("built by wrapping a bound socket")
+    }
+
+    async fn recv_from(&self, buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
+        self.inner.recv_from(buf).await
+    }
+
+    async fn send_to(&self, buf: &[u8], target: SocketAddr) -> std::io::Result<usize> {
+        let sent = self.inner.send_to(buf, target).await?;
+        self.note(buf, target);
+        Ok(sent)
+    }
+
+    fn send_to_blocking(&self, buf: &[u8], target: SocketAddr) -> std::io::Result<usize> {
+        let sent = self.inner.send_to_blocking(buf, target)?;
+        self.note(buf, target);
+        Ok(sent)
+    }
+
+    fn try_send_to(&self, buf: &[u8], target: SocketAddr) -> std::io::Result<usize> {
+        let sent = self.inner.try_send_to(buf, target)?;
+        self.note(buf, target);
+        Ok(sent)
+    }
+}
+
+type SimDemux = DemuxSocket<Recording<SimulationSocket>>;
+
+/// The listener's part, for a socket with no listener: read it, so its
+/// QUIC ingress queue is filled.
+fn pump<S: Socket>(socket: Arc<DemuxSocket<S>>) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut buf = vec![0u8; MAX_RECV_PACKET_SIZE];
+        while socket.recv_classified(&mut buf).await.is_ok() {}
+    })
+}
+
+/// Run `fut` on the test runtime, letting every task run until nothing is
+/// ready and then moving `time` to its next wakeup. Fails if virtual time
+/// passes `limit` first.
+async fn drive<F>(time: &VirtualTime, limit: Duration, fut: F) -> F::Output
+where
+    F: std::future::Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    let task = tokio::spawn(fut);
+    let limit_ns = time.now_nanos() + limit.as_nanos() as u64;
+    loop {
+        // Enough turns for every runnable task to run until it waits.
+        for _ in 0..64 {
+            if task.is_finished() {
+                return task.await.expect("the driven future panicked");
+            }
+            tokio::task::yield_now().await;
+        }
+        if task.is_finished() {
+            return task.await.expect("the driven future panicked");
+        }
+        assert!(
+            time.advance_to_next_wakeup().is_some(),
+            "nothing is runnable and no timer is armed at {} ns: the transfer is stuck",
+            time.now_nanos()
+        );
+        assert!(
+            time.now_nanos() <= limit_ns,
+            "virtual time passed {limit:?} before the future finished"
+        );
+    }
+}
+
+/// Settings with windows of [`MAX_WINDOW_BYTES`], so a 1 MiB stream fits.
+fn settings() -> QuicSettings {
+    QuicSettings {
+        max_connections: 4,
+        memory_limit: 1024 * 1024 * 1024,
+    }
+}
+
+/// Two endpoints, `a` (client) and `b` (server), on one simulated network.
+struct Pair {
+    time: VirtualTime,
+    network: String,
+    a: QuicEndpoint,
+    b: QuicEndpoint,
+    a_addr: SocketAddr,
+    b_addr: SocketAddr,
+    a_identity: TestIdentity,
+    b_identity: TestIdentity,
+    a_socket: Arc<SimDemux>,
+    b_socket: Arc<SimDemux>,
+    log: Arc<Mutex<Vec<Sent>>>,
+    pumps: Vec<tokio::task::JoinHandle<()>>,
+}
+
+impl Drop for Pair {
+    fn drop(&mut self) {
+        for pump in &self.pumps {
+            pump.abort();
+        }
+        unregister_network_time_source(&self.network);
+    }
+}
+
+/// Build a pair on addresses `a_addr` and `b_addr` (unique per test, since
+/// the simulated network registry is keyed by address), with an egress cap
+/// of `a_cap` bytes per second on `a`'s socket, on the same `VirtualTime`
+/// as the endpoints. `b` accepts connections from `a`.
+async fn pair(network: &str, a_addr: SocketAddr, b_addr: SocketAddr, a_cap: Option<u64>) -> Pair {
+    let time = VirtualTime::new();
+    register_network_time_source(network, time.clone());
+    register_address_network(a_addr, network);
+    register_address_network(b_addr, network);
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let bind = |addr: SocketAddr, cap: Option<EgressCap>| {
+        let time = time.clone();
+        let log = log.clone();
+        async move {
+            let inner = SimulationSocket::bind(addr).await.expect("sim bind");
+            Arc::new(DemuxSocket::wrap(
+                Recording {
+                    inner,
+                    addr,
+                    time,
+                    log,
+                },
+                cap,
+            ))
+        }
+    };
+    let a_socket = bind(a_addr, a_cap.map(|rate| EgressCap::new(rate, time.clone()))).await;
+    let b_socket = bind(b_addr, None).await;
+    let a = QuicEndpoint::bind(a_socket.clone(), a_addr, time.clone(), &settings())
+        .expect("endpoint a");
+    let b = QuicEndpoint::bind(b_socket.clone(), b_addr, time.clone(), &settings())
+        .expect("endpoint b");
+    let a_identity = TestIdentity::generate();
+    let b_identity = TestIdentity::generate();
+    b.set_server_config(
+        b.server_config(Arc::new(
+            config::tls_server_config(b_identity.key.clone(), Arc::new(AcceptAnyClientKey))
+                .expect("server TLS"),
+        )),
+    );
+    let pumps = vec![pump(a_socket.clone()), pump(b_socket.clone())];
+    Pair {
+        time,
+        network: network.to_string(),
+        a,
+        b,
+        a_addr,
+        b_addr,
+        a_identity,
+        b_identity,
+        a_socket,
+        b_socket,
+        log,
+        pumps,
+    }
+}
+
+impl Pair {
+    fn client_config(&self) -> quinn::ClientConfig {
+        self.a.client_config(Arc::new(
+            config::tls_client_config(self.a_identity.key.clone(), Arc::new(AcceptAnyServerKey))
+                .expect("client TLS"),
+        ))
+    }
+
+    /// Connect `a` to `b`, send `payload` on one unidirectional stream from
+    /// `a`, and return what `b` read and both connections.
+    async fn transfer(
+        &self,
+        payload: Vec<u8>,
+        limit: Duration,
+    ) -> (Vec<u8>, QuicConnection, QuicConnection) {
+        let permit = self.b.allow_peer(self.a_addr).expect("allow-set has room");
+        let a = clone_endpoint(&self.a);
+        let b = clone_endpoint(&self.b);
+        let (b_addr, client_config) = (self.b_addr, self.client_config());
+        let result = drive(&self.time, limit, async move {
+            let (client, server) = tokio::join!(a.connect(b_addr, client_config), b.accept());
+            let client = client.expect("client handshake");
+            let server = server.expect("server accepted");
+            let mut send = client.inner().open_uni().await.expect("open stream");
+            let (_, received) = tokio::join!(
+                async {
+                    send.write_all(&payload).await.expect("write");
+                    send.finish().expect("finish");
+                },
+                async {
+                    let mut recv = server.inner().accept_uni().await.expect("accept stream");
+                    recv.read_to_end(4 * 1024 * 1024).await.expect("read")
+                }
+            );
+            (received, client, server)
+        })
+        .await;
+        drop(permit);
+        result
+    }
+
+    fn sent(&self) -> Vec<Sent> {
+        self.log.lock().unwrap().clone()
+    }
+}
+
+/// A second handle on an endpoint for a spawned task.
+fn clone_endpoint(endpoint: &QuicEndpoint) -> QuicEndpoint {
+    QuicEndpoint {
+        endpoint: endpoint.endpoint.clone(),
+        sources: endpoint.sources.clone(),
+        transport: endpoint.transport.clone(),
+        clock: endpoint.clock.clone(),
+    }
+}
+
+fn payload(len: usize) -> Vec<u8> {
+    (0..len).map(|i| (i % 251) as u8).collect()
+}
+
+const MIB: usize = 1024 * 1024;
+
+/// Two endpoints on the simulated network complete a TLS 1.3 handshake
+/// with Ed25519 raw public keys and move 1 MiB on a unidirectional stream,
+/// on virtual time. Each side sees the other's key, the fixed ALPN, and no
+/// server name (SNI is off). Every datagram either side sent is QUIC-class
+/// with the fixed bit set (greasing is off) and at most 1200 bytes.
+#[tokio::test]
+async fn handshake_and_one_mib_stream_on_virtual_time() {
+    let _seed = GlobalRng::seed_guard(SEED);
+    let pair = pair(
+        "quic-handshake",
+        "10.201.1.1:5000".parse().unwrap(),
+        "10.201.1.2:5000".parse().unwrap(),
+        None,
+    )
+    .await;
+    let data = payload(MIB);
+    let (received, client, server) = pair.transfer(data.clone(), Duration::from_secs(60)).await;
+    assert_eq!(received.len(), data.len());
+    assert!(received == data, "the stream arrived intact");
+
+    let peer_key = |conn: &QuicConnection| -> Vec<u8> {
+        let certs = conn
+            .inner()
+            .peer_identity()
+            .expect("a raw public key was presented")
+            .downcast::<Vec<rustls::pki_types::CertificateDer<'static>>>()
+            .expect("rustls identity");
+        certs[0].to_vec()
+    };
+    assert_eq!(
+        peer_key(&server),
+        pair.a_identity.spki,
+        "server saw a's key"
+    );
+    assert_eq!(
+        peer_key(&client),
+        pair.b_identity.spki,
+        "client saw b's key"
+    );
+    let handshake = server
+        .inner()
+        .handshake_data()
+        .expect("handshake data")
+        .downcast::<quinn::crypto::rustls::HandshakeData>()
+        .expect("rustls handshake data");
+    assert_eq!(handshake.protocol.as_deref(), Some(ALPN));
+    assert_eq!(handshake.server_name, None, "SNI is off");
+    for conn in [&client, &server] {
+        assert!(
+            conn.inner()
+                .congestion_state()
+                .into_any()
+                .downcast::<quinn::congestion::Cubic>()
+                .is_ok(),
+            "Cubic congestion control"
+        );
+    }
+
+    let sent = pair.sent();
+    assert!(
+        sent.len() > MIB / usize::from(MAX_UDP_PAYLOAD),
+        "the transfer was recorded"
+    );
+    for datagram in &sent {
+        assert!(
+            datagram.bytes.len() <= usize::from(MAX_UDP_PAYLOAD),
+            "a {} byte datagram",
+            datagram.bytes.len()
+        );
+        assert_eq!(classify(&datagram.bytes), DemuxClass::Quic);
+        assert_ne!(
+            datagram.bytes[0] & 0x40,
+            0,
+            "fixed bit cleared (greasing on?) in {:#04x}",
+            datagram.bytes[0]
+        );
+    }
+}
+
+/// A peer stays on the demux allow-set exactly as long as its QUIC
+/// connection: on both sides it is allowed while the connection is open and
+/// removed once the connection has ended, here by the client dropping its
+/// handle (which closes the connection) and the server seeing the close.
+#[tokio::test]
+async fn a_peer_leaves_the_allow_set_when_its_connection_ends() {
+    let _seed = GlobalRng::seed_guard(SEED);
+    let pair = pair(
+        "quic-allow-lifecycle",
+        "10.201.13.1:5000".parse().unwrap(),
+        "10.201.13.2:5000".parse().unwrap(),
+        None,
+    )
+    .await;
+    let (received, client, server) = pair.transfer(payload(1000), Duration::from_secs(60)).await;
+    assert_eq!(received.len(), 1000);
+    // `transfer` dropped its own permit; only the connections hold the
+    // addresses now.
+    assert!(
+        pair.a_socket.is_quic_source_allowed(pair.b_addr),
+        "client side"
+    );
+    assert!(
+        pair.b_socket.is_quic_source_allowed(pair.a_addr),
+        "server side"
+    );
+
+    drop(client);
+    let server_conn = server.inner().clone();
+    drive(&pair.time, Duration::from_secs(60), async move {
+        server_conn.closed().await;
+    })
+    .await;
+    // Let the watchers run after the close they waited for.
+    for _ in 0..64 {
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        !pair.a_socket.is_quic_source_allowed(pair.b_addr),
+        "client side released"
+    );
+    assert!(
+        !pair.b_socket.is_quic_source_allowed(pair.a_addr),
+        "server side released"
+    );
+    drop(server);
+}
+
+/// The handshake fails when the client offers another ALPN protocol.
+#[tokio::test]
+async fn a_client_with_another_alpn_is_refused() {
+    let _seed = GlobalRng::seed_guard(SEED);
+    let pair = pair(
+        "quic-alpn",
+        "10.201.2.1:5000".parse().unwrap(),
+        "10.201.2.2:5000".parse().unwrap(),
+        None,
+    )
+    .await;
+    let _permit = pair.b.allow_peer(pair.a_addr).expect("room");
+    let mut tls = rustls::ClientConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_protocol_versions(&[&rustls::version::TLS13])
+    .unwrap()
+    .dangerous()
+    .with_custom_certificate_verifier(Arc::new(AcceptAnyServerKey))
+    .with_client_cert_resolver(Arc::new(
+        rustls::client::AlwaysResolvesClientRawPublicKeys::new(pair.a_identity.key.clone()),
+    ));
+    tls.alpn_protocols = vec![b"something-else".to_vec()];
+    let client_config = pair.a.client_config(Arc::new(
+        quinn::crypto::rustls::QuicClientConfig::try_from(Arc::new(tls)).unwrap(),
+    ));
+    let a = clone_endpoint(&pair.a);
+    let b = clone_endpoint(&pair.b);
+    let b_addr = pair.b_addr;
+    let result = drive(&pair.time, Duration::from_secs(60), async move {
+        // The server only works on an attempt that is being accepted; this
+        // accept never returns, since the only attempt fails.
+        let accepting = tokio::spawn(async move { b.accept().await.map(|_| ()) });
+        let result = a.connect(b_addr, client_config).await.map(|_| ());
+        accepting.abort();
+        result
+    })
+    .await;
+    assert!(
+        matches!(result, Err(QuicConnectError::Connection(_))),
+        "{result:?}"
+    );
+}
+
+/// The same seed gives the same event-level trace: the same datagrams, in
+/// the same order, at the same virtual times, between the same endpoints,
+/// of the same lengths and header forms. The BYTES differ between runs:
+/// rustls draws its key exchange and handshake randoms from ring's OS RNG,
+/// which `GlobalRng` does not reach, so ciphertexts (and the
+/// header-protected bits of the first byte) are not repeatable.
+#[tokio::test]
+async fn the_same_seed_gives_the_same_event_trace() {
+    async fn run(subnet: u8) -> Vec<(u64, bool, usize, bool)> {
+        // Let tasks left over from an earlier run (connection drivers
+        // closing) finish before seeding, so they cannot draw from this
+        // run's seeded RNG.
+        for _ in 0..1_000 {
+            tokio::task::yield_now().await;
+        }
+        let _seed = GlobalRng::seed_guard(SEED);
+        let a_addr: SocketAddr = format!("10.201.{subnet}.1:5000").parse().unwrap();
+        let b_addr: SocketAddr = format!("10.201.{subnet}.2:5000").parse().unwrap();
+        let pair = pair(&format!("quic-determinism-{subnet}"), a_addr, b_addr, None).await;
+        let (received, _client, _server) = pair
+            .transfer(payload(256 * 1024), Duration::from_secs(60))
+            .await;
+        assert_eq!(received.len(), 256 * 1024);
+        pair.sent()
+            .into_iter()
+            .map(|d| {
+                (
+                    d.at_ns,
+                    d.from == a_addr,
+                    d.bytes.len(),
+                    // The header form bit is not header-protected.
+                    d.bytes[0] & 0x80 != 0,
+                )
+            })
+            .collect()
+    }
+    let first = run(3).await;
+    let second = run(4).await;
+    assert!(first.len() > 100, "a real transfer was traced");
+    assert_eq!(first, second, "the event trace must repeat under one seed");
+}
+
+/// A bulk QUIC transfer through a socket with an egress cap stays within the
+/// cap's bound: over every interval ending at a send, the bytes sent are at
+/// most `burst + rate * interval` (every datagram the endpoint sends is
+/// admitted by the cap; nothing is charged unpaced, so nothing is forgiven).
+/// Without the cap the same transfer breaks that bound, so the check is not
+/// one any transfer passes.
+#[tokio::test]
+async fn a_bulk_transfer_under_the_egress_cap_stays_within_its_bound() {
+    const RATE: u64 = 2_000_000;
+    let check = |sent: &[Sent], from: SocketAddr, burst: u64| -> Result<(), String> {
+        let sends: Vec<(u64, u64)> = sent
+            .iter()
+            .filter(|d| d.from == from)
+            .map(|d| (d.at_ns, d.bytes.len() as u64))
+            .collect();
+        for end in 0..sends.len() {
+            let mut bytes = 0u64;
+            for start in (0..=end).rev() {
+                bytes += sends[start].1;
+                let interval_ns = sends[end].0 - sends[start].0;
+                let allowed = burst + (RATE as u128 * interval_ns as u128 / 1_000_000_000) as u64;
+                if bytes > allowed {
+                    return Err(format!(
+                        "{bytes} bytes in {interval_ns} ns (sends {start}..={end}), allowed {allowed}"
+                    ));
+                }
+            }
+        }
+        Ok(())
+    };
+    let burst = EgressCap::new(RATE, VirtualTime::new()).burst_bytes();
+
+    let _seed = GlobalRng::seed_guard(SEED);
+    let capped = pair(
+        "quic-cap",
+        "10.201.5.1:5000".parse().unwrap(),
+        "10.201.5.2:5000".parse().unwrap(),
+        Some(RATE),
+    )
+    .await;
+    let (received, _c, _s) = capped
+        .transfer(payload(MIB), Duration::from_secs(120))
+        .await;
+    assert_eq!(received.len(), MIB);
+    let sent = capped.sent();
+    check(&sent, capped.a_addr, burst).expect("the capped transfer stays within the bound");
+    let stats = capped.a_socket.egress_cap().expect("a cap").stats();
+    let a_bytes: u64 = sent
+        .iter()
+        .filter(|d| d.from == capped.a_addr)
+        .map(|d| d.bytes.len() as u64)
+        .sum();
+    assert_eq!(stats.bytes, a_bytes, "every byte sent was charged, once");
+    assert_eq!(
+        stats.packets[crate::transport::metrics::EgressDecision::Unpaced as usize],
+        0,
+        "nothing went around the cap's admission"
+    );
+    let elapsed_ns = sent.last().unwrap().at_ns - sent.first().unwrap().at_ns;
+    assert!(
+        elapsed_ns as u128 * RATE as u128 / 1_000_000_000 >= (MIB as u128 * 9 / 10),
+        "1 MiB took {elapsed_ns} ns at {RATE} B/s"
+    );
+    drop(capped);
+
+    let uncapped = pair(
+        "quic-nocap",
+        "10.201.6.1:5000".parse().unwrap(),
+        "10.201.6.2:5000".parse().unwrap(),
+        None,
+    )
+    .await;
+    let (received, _c, _s) = uncapped
+        .transfer(payload(MIB), Duration::from_secs(120))
+        .await;
+    assert_eq!(received.len(), MIB);
+    assert!(
+        check(&uncapped.sent(), uncapped.a_addr, burst).is_err(),
+        "without the cap the same transfer must exceed the bound, or the check proves nothing"
+    );
+}
+
+/// A dual-stack endpoint (`[::]`) completes handshakes with an IPv4 peer in
+/// both directions, over real UDP sockets on loopback: it receives the
+/// peer's datagrams from a plain IPv4 address and sends to it on an IPv6
+/// socket.
+#[tokio::test]
+async fn a_dual_stack_endpoint_talks_to_an_ipv4_peer() {
+    use crate::transport::UdpTransportSocket;
+    let _seed = GlobalRng::seed_guard(SEED);
+    let v6_port = crate::test_utils::reserve_local_port().unwrap();
+    let v4_port = crate::test_utils::reserve_local_port().unwrap();
+    crate::test_utils::release_local_port(v6_port);
+    crate::test_utils::release_local_port(v4_port);
+    let v6_bind = SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), v6_port);
+    let v4_bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), v4_port);
+    let v6_socket = Arc::new(
+        DemuxSocket::<UdpTransportSocket>::bind(v6_bind)
+            .await
+            .unwrap(),
+    );
+    let v4_socket = Arc::new(
+        DemuxSocket::<UdpTransportSocket>::bind(v4_bind)
+            .await
+            .unwrap(),
+    );
+    let _pumps = [pump(v6_socket.clone()), pump(v4_socket.clone())];
+    let time = RealTime::new();
+    let dual = QuicEndpoint::bind(v6_socket, v6_bind, time.clone(), &settings()).unwrap();
+    let v4 = QuicEndpoint::bind(v4_socket, v4_bind, time, &settings()).unwrap();
+    let dual_id = TestIdentity::generate();
+    let v4_id = TestIdentity::generate();
+    for (endpoint, id) in [(&dual, &dual_id), (&v4, &v4_id)] {
+        endpoint.set_server_config(endpoint.server_config(Arc::new(
+            config::tls_server_config(id.key.clone(), Arc::new(AcceptAnyClientKey)).unwrap(),
+        )));
+    }
+    let client_config = |endpoint: &QuicEndpoint, id: &TestIdentity| {
+        endpoint.client_config(Arc::new(
+            config::tls_client_config(id.key.clone(), Arc::new(AcceptAnyServerKey)).unwrap(),
+        ))
+    };
+    let dual_at = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), v6_port);
+    async fn within<F: std::future::Future>(
+        f: F,
+    ) -> Result<F::Output, tokio::time::error::Elapsed> {
+        tokio::time::timeout(Duration::from_secs(20), f).await
+    }
+
+    // The IPv4 peer connects to the dual-stack endpoint.
+    let _permit = dual.allow_peer(v4_bind).unwrap();
+    let (client, server) = within(async {
+        tokio::join!(
+            v4.connect(dual_at, client_config(&v4, &v4_id)),
+            dual.accept()
+        )
+    })
+    .await
+    .expect("handshake within 20 s");
+    let client = client.expect("v4 -> dual handshake");
+    let server = server.expect("dual accepted");
+    assert_eq!(
+        server.inner().remote_address(),
+        SocketAddr::new(Ipv4Addr::LOCALHOST.to_ipv6_mapped().into(), v4_port),
+        "quinn sees an IPv4 peer of an IPv6 socket in mapped form"
+    );
+    drop((client, server));
+
+    // The dual-stack endpoint connects to the IPv4 peer.
+    let _permit = v4.allow_peer(dual_at).unwrap();
+    let (client, server) = within(async {
+        tokio::join!(
+            dual.connect(v4_bind, client_config(&dual, &dual_id)),
+            v4.accept()
+        )
+    })
+    .await
+    .expect("handshake within 20 s");
+    client.expect("dual -> v4 handshake");
+    server.expect("v4 accepted");
+}
+
+/// A short-header datagram for a connection the endpoint does not know gets
+/// no reply when its connection ID was not made with the endpoint's key,
+/// so a prober learns nothing; quinn's own generators would answer it with
+/// a stateless reset.
+#[test]
+fn connection_ids_validate_only_with_the_key_that_made_them() {
+    use super::cid::{CID_LEN, MacConnectionIdGenerator};
+    use quinn::ConnectionIdGenerator;
+    let _seed = GlobalRng::seed_guard(SEED);
+    let key = MacConnectionIdGenerator::new_key();
+    let mut generator = MacConnectionIdGenerator::new(key);
+    let other = MacConnectionIdGenerator::new(MacConnectionIdGenerator::new_key());
+    assert_eq!(generator.cid_len(), CID_LEN);
+    assert_eq!(generator.cid_lifetime(), None);
+    for _ in 0..100 {
+        let cid = generator.generate_cid();
+        assert_eq!(cid.len(), CID_LEN);
+        assert!(generator.validate(&cid).is_ok(), "its own ID");
+        assert!(
+            MacConnectionIdGenerator::new(key).validate(&cid).is_ok(),
+            "another generator with the same key (as quinn uses per connection)"
+        );
+        assert!(other.validate(&cid).is_err(), "a different key");
+        let mut forged = cid.to_vec();
+        forged[CID_LEN - 1] ^= 1;
+        assert!(
+            generator
+                .validate(&quinn::ConnectionId::new(&forged))
+                .is_err(),
+            "one flipped MAC bit"
+        );
+    }
+    assert!(
+        generator
+            .validate(&quinn::ConnectionId::new(&[0u8; 8]))
+            .is_err(),
+        "a wrong length"
+    );
+}
+
+/// Every endpoint setting pinned in `config::endpoint_config`.
+#[test]
+fn endpoint_config_pins_every_value() {
+    let _seed = GlobalRng::seed_guard(SEED);
+    let config = config::endpoint_config();
+    let debug = format!("{config:?}");
+    assert_eq!(
+        config.get_max_udp_payload_size(),
+        u64::from(MAX_UDP_PAYLOAD)
+    );
+    for expected in [
+        "grease_quic_bit: false",
+        "supported_versions: [1]",
+        "rng_seed: Some(",
+    ] {
+        assert!(debug.contains(expected), "{expected:?} in {debug}");
+    }
+    // The seed and the keys come from GlobalRng: the same seed, the same
+    // quinn seed.
+    let again = format!("{:?}", {
+        let _seed = GlobalRng::seed_guard(SEED);
+        config::endpoint_config()
+    });
+    assert_eq!(debug, again, "the rng seed follows GlobalRng");
+}
+
+/// Every transport setting pinned in `config::transport_config`, for the
+/// real clock (keepalive on, 120 s idle) and the virtual one (no keepalive,
+/// its long idle timeout).
+#[test]
+fn transport_config_pins_every_value() {
+    let window = settings().window_bytes();
+    assert_eq!(
+        window, MAX_WINDOW_BYTES,
+        "these settings reach the window cap"
+    );
+    let real = format!(
+        "{:?}",
+        config::transport_config(&settings(), &RealTime::new())
+    );
+    let virt = format!(
+        "{:?}",
+        config::transport_config(&settings(), &VirtualTime::new())
+    );
+    let common = [
+        format!("max_concurrent_bidi_streams: {MAX_BIDI_STREAMS}"),
+        format!("max_concurrent_uni_streams: {MAX_UNI_STREAMS}"),
+        format!("stream_receive_window: {window}"),
+        format!("receive_window: {window}"),
+        format!("send_window: {window}"),
+        "send_fairness: true".into(),
+        "packet_threshold: 3".into(),
+        "time_threshold: 1.125".into(),
+        "initial_rtt: 333ms".into(),
+        format!("initial_mtu: {MAX_UDP_PAYLOAD}"),
+        format!("min_mtu: {MAX_UDP_PAYLOAD}"),
+        "mtu_discovery_config: None".into(),
+        "pad_to_mtu: false".into(),
+        "ack_frequency_config: None".into(),
+        "persistent_congestion_threshold: 3".into(),
+        "crypto_buffer_size: 16384".into(),
+        "allow_spin: false".into(),
+        "datagram_receive_buffer_size: None".into(),
+        "datagram_send_buffer_size: 0".into(),
+        "enable_segmentation_offload: false".into(),
+    ];
+    for expected in &common {
+        assert!(real.contains(expected.as_str()), "{expected:?} in {real}");
+        assert!(virt.contains(expected.as_str()), "{expected:?} in {virt}");
+    }
+    assert!(
+        real.contains(&format!(
+            "keep_alive_interval: Some({KEEPALIVE_INTERVAL:?})"
+        )),
+        "{real}"
+    );
+    assert!(real.contains("max_idle_timeout: Some(120000)"), "{real}");
+    assert!(virt.contains("keep_alive_interval: None"), "{virt}");
+    let virt_idle_ms = VirtualTime::new().connection_idle_timeout().as_millis();
+    assert!(
+        virt.contains(&format!("max_idle_timeout: Some({virt_idle_ms})")),
+        "{virt}"
+    );
+}
+
+/// Every server setting pinned in `config::server_config`.
+#[test]
+fn server_config_pins_every_value() {
+    let _seed = GlobalRng::seed_guard(SEED);
+    let identity = TestIdentity::generate();
+    let crypto =
+        Arc::new(config::tls_server_config(identity.key, Arc::new(AcceptAnyClientKey)).unwrap());
+    let server = config::server_config(
+        crypto,
+        Arc::new(config::transport_config(&settings(), &VirtualTime::new())),
+        config::system_clock(VirtualTime::new()),
+    );
+    let debug = format!("{server:?}");
+    for expected in [
+        "migration: false".to_string(),
+        "retry_token_lifetime: 15s".into(),
+        format!("max_incoming: {MAX_INCOMING}"),
+        format!("incoming_buffer_size: {INCOMING_BUFFER_BYTES}"),
+        format!("incoming_buffer_size_total: {INCOMING_BUFFER_TOTAL_BYTES}"),
+        "sent: 0".into(),
+        "preferred_address_v4: None".into(),
+        "preferred_address_v6: None".into(),
+    ] {
+        assert!(debug.contains(expected.as_str()), "{expected:?} in {debug}");
+    }
+}
+
+/// The TLS settings both sides pin: TLS 1.3 only with the ring provider,
+/// the fixed ALPN, no SNI, no resumption, no early data, no tickets, no
+/// certificate compression.
+#[test]
+fn tls_configs_pin_every_value() {
+    let _seed = GlobalRng::seed_guard(SEED);
+    let identity = TestIdentity::generate();
+    let server =
+        config::rustls_server_config(identity.key.clone(), Arc::new(AcceptAnyClientKey)).unwrap();
+    let client =
+        config::rustls_client_config(identity.key.clone(), Arc::new(AcceptAnyServerKey)).unwrap();
+    // TLS 1.3 only: QUIC carries nothing else (RFC 9001 section 4.2),
+    // rustls's QUIC mode refuses other versions, and the builders are given
+    // only TLS13. The provider is ring's.
+    let ring = format!(
+        "{:?}",
+        rustls::crypto::ring::default_provider().cipher_suites
+    );
+    assert_eq!(
+        format!("{:?}", server.crypto_provider().cipher_suites),
+        ring
+    );
+    assert_eq!(
+        format!("{:?}", client.crypto_provider().cipher_suites),
+        ring
+    );
+    assert_eq!(server.alpn_protocols, vec![ALPN.to_vec()]);
+    assert_eq!(server.max_early_data_size, 0);
+    assert_eq!(server.send_tls13_tickets, 0);
+    assert!(!server.session_storage.can_cache(), "no session storage");
+    assert!(server.cert_compressors.is_empty());
+    assert!(server.cert_decompressors.is_empty());
+    assert_eq!(client.alpn_protocols, vec![ALPN.to_vec()]);
+    assert!(!client.enable_sni);
+    assert!(!client.enable_early_data);
+    assert_eq!(
+        format!("{:?}", client.resumption),
+        format!("{:?}", rustls::client::Resumption::disabled())
+    );
+    assert!(client.cert_compressors.is_empty());
+    assert!(client.cert_decompressors.is_empty());
+    // quinn accepts both (TLS 1.3 with its initial suite).
+    assert!(config::tls_server_config(identity.key.clone(), Arc::new(AcceptAnyClientKey)).is_ok());
+    assert!(config::tls_client_config(identity.key, Arc::new(AcceptAnyServerKey)).is_ok());
+}
+
+/// The window is 5% of memory split over every connection's receive and
+/// send windows, clamped to [128 KiB, 2 MiB].
+#[test]
+fn windows_are_a_clamped_share_of_memory() {
+    const GIB: usize = 1024 * 1024 * 1024;
+    let window = config::connection_window_bytes;
+    // 4 GiB / 20 / (2 * 200) = 536 870 bytes: inside the clamp.
+    assert_eq!(window(4 * GIB, 200), (4 * GIB / 20 / 400) as u64);
+    assert_eq!(window(256 * 1024 * 1024, 200), MIN_WINDOW_BYTES, "floor");
+    assert_eq!(window(64 * GIB, 4), MAX_WINDOW_BYTES, "ceiling");
+    assert_eq!(
+        window(GIB, 0),
+        MAX_WINDOW_BYTES,
+        "zero connections does not divide by zero"
+    );
+    assert_eq!(
+        config::quic_endpoint_budget_for(GIB, QuicMode::Off),
+        0,
+        "no endpoint, no memory"
+    );
+    let on = config::quic_endpoint_budget_for(GIB, QuicMode::Prefer);
+    let default_connections = crate::config::DEFAULT_MAX_CONNECTIONS;
+    assert_eq!(
+        on,
+        2 * default_connections * window(GIB, default_connections) as usize
+            + INCOMING_BUFFER_TOTAL_BYTES as usize
+    );
+}
+
+/// `transport-quic` values: unset and `off` are off, `prefer` (any case)
+/// is prefer, and anything else is off, never an error, so a value a later
+/// release adds cannot stop this binary from starting.
+#[test]
+fn transport_quic_values_and_unknown_ones() {
+    assert_eq!(QuicMode::from_config_value(None), QuicMode::Off);
+    assert_eq!(QuicMode::from_config_value(Some("off")), QuicMode::Off);
+    assert_eq!(
+        QuicMode::from_config_value(Some("prefer")),
+        QuicMode::Prefer
+    );
+    assert_eq!(
+        QuicMode::from_config_value(Some(" PREFER ")),
+        QuicMode::Prefer
+    );
+    assert_eq!(QuicMode::from_config_value(Some("force")), QuicMode::Off);
+    assert_eq!(QuicMode::from_config_value(Some("")), QuicMode::Off);
+    assert!(!QuicMode::is_non_default_value("off"));
+    assert!(!QuicMode::is_non_default_value(" OFF"));
+    assert!(QuicMode::is_non_default_value("prefer"));
+    assert!(
+        QuicMode::is_non_default_value("force"),
+        "an unknown value is kept, so a later binary still sees it"
+    );
+    assert_eq!(QuicMode::default(), QuicMode::Off);
+}
+
+/// The socket sends one datagram per transmit and receives one per call.
+#[test]
+fn the_socket_never_batches() {
+    // Checked on the trait methods quinn reads; a value above 1 would let
+    // quinn hand the cap a GSO batch larger than its burst.
+    let check = |socket: &dyn quinn::AsyncUdpSocket| {
+        assert_eq!(socket.max_transmit_segments(), 1);
+        assert_eq!(socket.max_receive_segments(), 1);
+        assert!(socket.may_fragment(), "so quinn never runs MTU discovery");
+    };
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let network = "quic-segments";
+        let addr: SocketAddr = "10.201.7.1:5000".parse().unwrap();
+        register_network_time_source(network, VirtualTime::new());
+        register_address_network(addr, network);
+        let demux = Arc::new(DemuxSocket::wrap(
+            SimulationSocket::bind(addr).await.unwrap(),
+            None,
+        ));
+        let ingress = demux.enable_quic_ingress().unwrap();
+        let socket = super::socket::QuicSocket::new(demux, ingress, addr);
+        check(&socket);
+        unregister_network_time_source(network);
+    });
+}
+
+/// The timer quinn arms follows the time source: it fires at its deadline
+/// on virtual time, a later `reset` moves it without arming another sleep,
+/// and an earlier one re-arms it.
+#[test]
+fn the_runtime_timer_follows_virtual_time() {
+    use quinn::Runtime;
+    use std::task::{Context, Poll};
+    let time = VirtualTime::new();
+    let runtime = super::runtime::QuicRuntime::new(time.clone());
+    let start = runtime.now();
+    let waker = futures::task::noop_waker();
+    let mut cx = Context::from_waker(&waker);
+    let mut timer = runtime.timer_at(start + Duration::from_millis(10));
+    assert_eq!(timer.as_mut().poll(&mut cx), Poll::Pending);
+    let armed = time.pending_wakeup_count();
+    timer.as_mut().reset(start + Duration::from_millis(30));
+    assert_eq!(timer.as_mut().poll(&mut cx), Poll::Pending);
+    assert_eq!(
+        time.pending_wakeup_count(),
+        armed,
+        "a later deadline keeps the armed sleep"
+    );
+    time.advance(Duration::from_millis(10));
+    assert_eq!(
+        timer.as_mut().poll(&mut cx),
+        Poll::Pending,
+        "not yet at 30 ms"
+    );
+    time.advance(Duration::from_millis(20));
+    assert_eq!(timer.as_mut().poll(&mut cx), Poll::Ready(()));
+    assert_eq!(
+        runtime.now() - start,
+        Duration::from_millis(30),
+        "quinn's clock is the time source"
+    );
+    timer
+        .as_mut()
+        .reset(runtime.now() + Duration::from_millis(50));
+    assert_eq!(timer.as_mut().poll(&mut cx), Poll::Pending);
+    timer
+        .as_mut()
+        .reset(runtime.now() + Duration::from_millis(5));
+    assert_eq!(timer.as_mut().poll(&mut cx), Poll::Pending);
+    time.advance(Duration::from_millis(5));
+    assert_eq!(
+        timer.as_mut().poll(&mut cx),
+        Poll::Ready(()),
+        "an earlier deadline re-armed the timer"
+    );
+}
+
+/// With `transport-quic` off the transport builds no endpoint, so a
+/// QUIC-class datagram to its port finds no ingress; with it on the ingress
+/// exists and its allow-set is empty, so the same datagram from a stranger
+/// is dropped as not allowed. Either way nothing answers it.
+#[tokio::test]
+async fn the_transport_builds_an_endpoint_only_with_the_key_on() {
+    use crate::transport::UdpTransportSocket;
+    use crate::transport::connection_handler::{UdpTransportConfig, open_udp_transport};
+    use crate::transport::metrics::{QuicIngressOutcome, TRANSPORT_METRICS};
+    for quic in [None, Some(settings())] {
+        let port = crate::test_utils::reserve_local_port().unwrap();
+        crate::test_utils::release_local_port(port);
+        let _transport = open_udp_transport::<UdpTransportSocket>(
+            crate::transport::TransportKeypair::new(),
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            port,
+            false,
+            UdpTransportConfig {
+                quic,
+                ..UdpTransportConfig::default()
+            },
+        )
+        .await
+        .unwrap();
+        let prober = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        prober.set_nonblocking(true).unwrap();
+        let from = prober.local_addr().unwrap();
+        TRANSPORT_METRICS.watch_quic_ingress(from);
+        // A QUIC Initial-shaped datagram (long header, version 1), padded.
+        let mut initial = vec![0xC0, 0, 0, 0, 1, 8];
+        initial.resize(1200, 0);
+        prober
+            .send_to(&initial, (Ipv4Addr::LOCALHOST, port))
+            .unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while TRANSPORT_METRICS.quic_ingress_from(from).is_empty() {
+            assert!(tokio::time::Instant::now() < deadline, "datagram not seen");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let expected = if quic.is_some() {
+            QuicIngressOutcome::NotAllowed
+        } else {
+            QuicIngressOutcome::NoIngress
+        };
+        assert_eq!(TRANSPORT_METRICS.quic_ingress_from(from), vec![expected]);
+        // Give a reply time to arrive, with the runtime free to run the
+        // listener (and the endpoint, when there is one).
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let mut buf = [0u8; 2048];
+        assert_eq!(
+            prober
+                .recv_from(&mut buf)
+                .map_err(|e| e.kind())
+                .unwrap_err(),
+            std::io::ErrorKind::WouldBlock,
+            "nothing answered the prober (quic = {})",
+            quic.is_some()
+        );
+    }
+}
+
+/// What [`ScriptedSocket::try_send_to`] does.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SendMode {
+    Send,
+    WouldBlock,
+    Fail,
+}
+
+/// An inner socket for the adapter's own paths: sends follow `mode`, and
+/// receives return the scripted datagrams, then wait.
+struct ScriptedSocket {
+    mode: Mutex<SendMode>,
+    sent: Mutex<Vec<(Vec<u8>, SocketAddr)>>,
+    inbox: Mutex<std::collections::VecDeque<(Vec<u8>, SocketAddr)>>,
+}
+
+impl ScriptedSocket {
+    fn new(mode: SendMode, inbox: Vec<(Vec<u8>, SocketAddr)>) -> Self {
+        Self {
+            mode: Mutex::new(mode),
+            sent: Mutex::new(Vec::new()),
+            inbox: Mutex::new(inbox.into()),
+        }
+    }
+}
+
+impl Socket for ScriptedSocket {
+    async fn bind(_addr: SocketAddr) -> std::io::Result<Self> {
+        unreachable!()
+    }
+
+    async fn recv_from(&self, buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
+        let next = self.inbox.lock().unwrap().pop_front();
+        match next {
+            Some((bytes, from)) => {
+                buf[..bytes.len()].copy_from_slice(&bytes);
+                Ok((bytes.len(), from))
+            }
+            None => std::future::pending().await,
+        }
+    }
+
+    async fn send_to(&self, buf: &[u8], target: SocketAddr) -> std::io::Result<usize> {
+        self.try_send_to(buf, target)
+    }
+
+    fn send_to_blocking(&self, buf: &[u8], target: SocketAddr) -> std::io::Result<usize> {
+        self.try_send_to(buf, target)
+    }
+
+    fn try_send_to(&self, buf: &[u8], target: SocketAddr) -> std::io::Result<usize> {
+        match *self.mode.lock().unwrap() {
+            SendMode::Send => {
+                self.sent.lock().unwrap().push((buf.to_vec(), target));
+                Ok(buf.len())
+            }
+            SendMode::WouldBlock => Err(std::io::ErrorKind::WouldBlock.into()),
+            SendMode::Fail => Err(std::io::ErrorKind::PermissionDenied.into()),
+        }
+    }
+}
+
+/// An adapter over a [`ScriptedSocket`], with an optional cap on `time`.
+fn scripted(
+    local: SocketAddr,
+    mode: SendMode,
+    inbox: Vec<(Vec<u8>, SocketAddr)>,
+    cap: Option<(u64, &VirtualTime)>,
+) -> (
+    Arc<super::socket::QuicSocket<ScriptedSocket>>,
+    Arc<DemuxSocket<ScriptedSocket>>,
+) {
+    let demux = Arc::new(DemuxSocket::wrap(
+        ScriptedSocket::new(mode, inbox),
+        cap.map(|(rate, time)| EgressCap::new(rate, time.clone())),
+    ));
+    let ingress = demux.enable_quic_ingress().unwrap();
+    (
+        Arc::new(super::socket::QuicSocket::new(
+            demux.clone(),
+            ingress,
+            local,
+        )),
+        demux,
+    )
+}
+
+fn transmit(contents: &[u8], destination: SocketAddr) -> quinn::udp::Transmit<'_> {
+    quinn::udp::Transmit {
+        destination,
+        ecn: None,
+        contents,
+        segment_size: None,
+        src_ip: None,
+    }
+}
+
+/// A sent datagram is charged to the cap exactly once, as an admitted
+/// (not unpaced) send, and an IPv4-mapped destination reaches the socket in
+/// plain form.
+#[test]
+fn a_sent_datagram_is_charged_once() {
+    use crate::transport::metrics::EgressDecision;
+    use quinn::AsyncUdpSocket;
+    let time = VirtualTime::new();
+    let local: SocketAddr = "10.201.8.1:5000".parse().unwrap();
+    let (socket, demux) = scripted(local, SendMode::Send, Vec::new(), Some((1_000_000, &time)));
+    let target_v4: SocketAddr = "10.201.8.2:5000".parse().unwrap();
+    let mapped = SocketAddr::new(Ipv4Addr::new(10, 201, 8, 2).to_ipv6_mapped().into(), 5000);
+    socket.try_send(&transmit(&[0xC0; 1000], mapped)).unwrap();
+    let stats = demux.egress_cap().unwrap().stats();
+    assert_eq!(stats.bytes, 1000);
+    assert_eq!(stats.packets[EgressDecision::Immediate as usize], 1);
+    assert_eq!(stats.packets[EgressDecision::Unpaced as usize], 0);
+    assert_eq!(
+        *demux.inner_for_test().sent.lock().unwrap(),
+        vec![(vec![0xC0; 1000], target_v4)]
+    );
+}
+
+/// With the cap short of the datagram the send is `WouldBlock`, nothing is
+/// sent and nothing is charged; quinn then waits in `poll_writable`, which is
+/// `Pending` until the cap has a full datagram and `Ready` once it does.
+#[test]
+fn a_cap_short_of_the_datagram_is_would_block() {
+    use quinn::AsyncUdpSocket;
+    use std::task::Context;
+    let time = VirtualTime::new();
+    let local: SocketAddr = "10.201.9.1:5000".parse().unwrap();
+    let (socket, demux) = scripted(local, SendMode::Send, Vec::new(), Some((1_000_000, &time)));
+    let cap = demux.egress_cap().unwrap();
+    cap.charge_unpaced(cap.burst_bytes() as usize);
+    let level = cap.level_bytes();
+    let target: SocketAddr = "10.201.9.2:5000".parse().unwrap();
+    let err = socket
+        .try_send(&transmit(&[0xC0; 1200], target))
+        .unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::WouldBlock);
+    assert!(demux.inner_for_test().sent.lock().unwrap().is_empty());
+    assert_eq!(cap.level_bytes(), level, "nothing was charged");
+
+    let mut poller = socket.clone().create_io_poller();
+    let waker = futures::task::noop_waker();
+    let mut cx = Context::from_waker(&waker);
+    assert!(poller.as_mut().poll_writable(&mut cx).is_pending());
+    time.advance(Duration::from_micros(1_200));
+    assert!(poller.as_mut().poll_writable(&mut cx).is_ready());
+    socket.try_send(&transmit(&[0xC0; 1200], target)).unwrap();
+}
+
+/// When the socket's own buffer is full the send is `WouldBlock` and the
+/// cap gets back everything it was charged for the attempt.
+#[test]
+fn a_full_socket_buffer_is_would_block_and_returns_the_take() {
+    use quinn::AsyncUdpSocket;
+    let time = VirtualTime::new();
+    let local: SocketAddr = "10.201.10.1:5000".parse().unwrap();
+    let (socket, demux) = scripted(
+        local,
+        SendMode::WouldBlock,
+        Vec::new(),
+        Some((1_000_000, &time)),
+    );
+    let cap = demux.egress_cap().unwrap();
+    let level = cap.level_bytes();
+    let err = socket
+        .try_send(&transmit(
+            &[0xC0; 1200],
+            "10.201.10.2:5000".parse().unwrap(),
+        ))
+        .unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::WouldBlock);
+    assert_eq!(cap.level_bytes(), level, "the take came back");
+    assert_eq!(cap.stats().bytes, 0);
+}
+
+/// A send that fails with any other error is reported to quinn as sent
+/// (quinn's connection driver would stop the connection on it), counted,
+/// and not charged; with no cap the same holds.
+#[test]
+fn a_failed_send_is_counted_and_swallowed() {
+    use quinn::AsyncUdpSocket;
+    let time = VirtualTime::new();
+    let target: SocketAddr = "10.201.11.2:5000".parse().unwrap();
+    for cap in [Some((1_000_000, &time)), None] {
+        let local: SocketAddr = "10.201.11.1:5000".parse().unwrap();
+        let (socket, demux) = scripted(local, SendMode::Fail, Vec::new(), cap);
+        socket.try_send(&transmit(&[0xC0; 900], target)).unwrap();
+        socket.try_send(&transmit(&[0xC0; 900], target)).unwrap();
+        assert_eq!(socket.send_errors(), 2);
+        if let Some(cap) = demux.egress_cap() {
+            assert_eq!(cap.stats().bytes, 0, "a failed send is not charged");
+            assert_eq!(cap.level_bytes(), cap.burst_bytes() as i64);
+        }
+    }
+}
+
+/// Received datagrams reach quinn with their source; on an IPv6 socket an
+/// IPv4 source is given in `::ffff:` form (the form quinn connects to there),
+/// on an IPv4 socket it is unchanged.
+#[tokio::test]
+async fn received_ipv4_sources_are_mapped_on_an_ipv6_socket() {
+    use quinn::AsyncUdpSocket;
+    use std::io::IoSliceMut;
+    use std::task::{Context, Poll};
+    let from: SocketAddr = "10.201.12.2:5000".parse().unwrap();
+    let datagram = vec![0xC1, 7, 7, 7];
+    for local in ["[::]:5000", "10.201.12.1:5000"] {
+        let local: SocketAddr = local.parse().unwrap();
+        let (socket, demux) = scripted(local, SendMode::Send, vec![(datagram.clone(), from)], None);
+        let _permit = demux.allow_quic_source(from).unwrap();
+        let mut buf = vec![0u8; MAX_RECV_PACKET_SIZE];
+        demux.recv_classified(&mut buf).await.unwrap();
+
+        let mut storage = vec![0u8; 2048];
+        let mut bufs = [IoSliceMut::new(&mut storage)];
+        let mut meta = [quinn::udp::RecvMeta::default()];
+        let waker = futures::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let Poll::Ready(Ok(1)) = socket.poll_recv(&mut cx, &mut bufs, &mut meta) else {
+            panic!("one datagram is ready");
+        };
+        let expected = if local.is_ipv6() {
+            SocketAddr::new(Ipv4Addr::new(10, 201, 12, 2).to_ipv6_mapped().into(), 5000)
+        } else {
+            from
+        };
+        assert_eq!(meta[0].addr, expected);
+        assert_eq!(
+            (meta[0].len, meta[0].stride),
+            (datagram.len(), datagram.len())
+        );
+        assert_eq!(&storage[..datagram.len()], datagram.as_slice());
+        let mut bufs = [IoSliceMut::new(&mut storage)];
+        assert!(
+            socket.poll_recv(&mut cx, &mut bufs, &mut meta).is_pending(),
+            "nothing else queued, and no error"
+        );
+    }
+}

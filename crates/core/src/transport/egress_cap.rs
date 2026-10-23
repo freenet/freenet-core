@@ -134,6 +134,15 @@ pub(crate) const PACED_TAKE_BYTES: usize = MAX_PACKET_SIZE;
 
 const NANOS_PER_SEC: u128 = 1_000_000_000;
 
+/// The most [`EgressCap::poll_admit`] wakers the cap holds. A waiter's entry
+/// is removed when it is woken or next admitted, and a waiter dropped while
+/// `Pending` leaves its entry until the next give-back; at this many entries
+/// every one is woken and the map cleared before a new one is added, so
+/// abandoned entries cannot accumulate. A spurious wake only costs the waiter
+/// one more poll. The QUIC endpoint has one waiter per connection that is
+/// short of bytes, far fewer than this.
+const MAX_ADMISSION_WAKERS: usize = 1024;
+
 /// The cap's own counters, so tests can assert on one cap without reading
 /// process-global state. Test-only: production records only the
 /// `TRANSPORT_METRICS` period counters (`egress_*`).
@@ -218,10 +227,16 @@ pub struct EgressCap {
     clock: Box<dyn Fn() -> u64 + Send + Sync>,
     /// `TimeSource::sleep_until` of the same time source as `clock`, for
     /// [`Self::poll_admit`]'s wakeups.
-    #[cfg_attr(not(test), allow(dead_code))]
     sleep_until: Box<dyn Fn(u64) -> SleepFuture + Send + Sync>,
     /// Time (ns, on `clock`) at which the bucket level is zero.
     empty_at_ns: AtomicI64,
+    /// Wakers of [`Self::poll_admit`] callers that are `Pending`, by
+    /// [`AdmissionWaiter`] id, woken when bytes are given back. At most
+    /// [`MAX_ADMISSION_WAKERS`]; see [`Self::register_waker`].
+    admission_wakers: parking_lot::Mutex<std::collections::HashMap<u64, std::task::Waker>>,
+    /// `admission_wakers.len()`, so [`Self::give_back`] skips the lock when
+    /// nobody waits (every node without a QUIC endpoint).
+    admission_waiting: std::sync::atomic::AtomicUsize,
     /// When the long-wait warning was last logged (ns, on `clock`).
     last_long_wait_warn_ns: AtomicI64,
     /// Long gaps recorded since the long-wait warning was last logged.
@@ -246,13 +261,23 @@ impl fmt::Debug for EgressCap {
 type SleepFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
 
 /// The wakeup a sender polling [`EgressCap::poll_admit`] keeps between
-/// polls: one timer on the cap's time source and the time it fires at.
-/// Owned by the sender, so the cap holds nothing per waiter.
-#[derive(Default)]
-// Used by the QUIC endpoint (#5940); only tests use it until then.
-#[cfg_attr(not(test), allow(dead_code))]
+/// polls: one timer on the cap's time source and the time it fires at, and
+/// the id under which the cap holds its waker while it waits (see
+/// [`EgressCap::poll_admit`]: bytes given back wake it before the timer).
+// Used by the QUIC endpoint (#5940).
 pub(crate) struct AdmissionWaiter {
+    id: u64,
     timer: Option<(u64, SleepFuture)>,
+}
+
+impl Default for AdmissionWaiter {
+    fn default() -> Self {
+        static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        Self {
+            id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
+            timer: None,
+        }
+    }
 }
 
 impl AdmissionWaiter {
@@ -305,6 +330,8 @@ impl EgressCap {
             clock,
             sleep_until,
             empty_at_ns: AtomicI64::new(now.saturating_sub(burst_ns)),
+            admission_wakers: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            admission_waiting: std::sync::atomic::AtomicUsize::new(0),
             last_long_wait_warn_ns: AtomicI64::new(i64::MIN),
             last_abandon_warn_ns: AtomicI64::new(i64::MIN),
             long_waits_since_warn: WarnWindow::default(),
@@ -364,15 +391,19 @@ impl EgressCap {
     }
 
     /// The admission predicate shared by [`Self::try_take`] and
-    /// [`Self::poll_admit`]: a take of `cost` at `now` is admitted when the
-    /// bucket holds the whole amount. `Ok` is `empty_at_ns` after the take;
-    /// `Err` is the deficit in nanoseconds at the rate.
-    fn admits(&self, empty_at: i64, now: i64, cost: i64) -> Result<i64, i64> {
-        let after = self.refilled(empty_at, now).saturating_add(cost);
-        if after <= now {
-            Ok(after)
+    /// [`Self::poll_admit`]: a take of `bytes` at `now` is admitted when the
+    /// bucket holds the whole amount, or the whole burst for a take larger
+    /// than the burst (which the bucket can never hold, so requiring all of
+    /// it would refuse such a take forever). `Ok` is `empty_at_ns` after
+    /// taking all of `bytes`; `Err` is the deficit in nanoseconds at the rate.
+    fn admits(&self, empty_at: i64, now: i64, bytes: u64) -> Result<i64, i64> {
+        let refilled = self.refilled(empty_at, now);
+        let need = self.cost_ns(bytes).min(self.burst_ns);
+        let ready_at = refilled.saturating_add(need);
+        if ready_at <= now {
+            Ok(refilled.saturating_add(self.cost_ns(bytes)))
         } else {
-            Err(after - now)
+            Err(ready_at - now)
         }
     }
 
@@ -436,16 +467,19 @@ impl EgressCap {
     /// Requiring the whole amount (rather than any positive level) keeps a
     /// paced send from ever putting the bucket into debt, so the bound in the
     /// module docs holds exactly. A take is at most one datagram, and the
-    /// burst holds at least four, so a take always succeeds eventually.
+    /// burst holds at least four, so a take always succeeds eventually. A
+    /// take larger than the burst (none today) is admitted with a full
+    /// bucket and puts it into debt by the excess, rather than never being
+    /// admitted.
     pub(crate) fn try_take(
         &self,
         bytes: usize,
         waited: Duration,
     ) -> Result<EgressTake<'_>, Duration> {
-        let cost = self.cost_ns(bytes as u64);
-        let (old, _, now) = self.update(|empty_at, now| self.admits(empty_at, now, cost).ok());
+        let bytes_u64 = bytes as u64;
+        let (old, _, now) = self.update(|empty_at, now| self.admits(empty_at, now, bytes_u64).ok());
         // The same predicate on the value the last attempt saw.
-        if let Err(deficit) = self.admits(old, now, cost) {
+        if let Err(deficit) = self.admits(old, now, bytes_u64) {
             #[cfg(test)]
             self.stats.refusals.fetch_add(1, Ordering::Relaxed);
             return Err(Duration::from_nanos(deficit as u64));
@@ -467,23 +501,28 @@ impl EgressCap {
     /// sender may take the bytes first, in which case the next poll is
     /// `Pending` again.
     ///
+    /// While `Pending`, the cap also holds `cx`'s waker, and bytes given back
+    /// to the bucket (a paced sender that used less than it took, or whose
+    /// send failed) wake it at once, so a waiter is not left asleep until its
+    /// original deficit after capacity returned early.
+    ///
     /// The timer is replaced only when the bucket now needs an earlier
     /// wakeup than the one armed; a later need (more debt arrived) keeps the
     /// armed timer, which wakes early and re-checks. So repeated polls do not
     /// register a new timer each.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn poll_admit(
         &self,
         bytes: usize,
         waiter: &mut AdmissionWaiter,
         cx: &mut Context<'_>,
     ) -> Poll<()> {
-        let cost = self.cost_ns(bytes as u64);
+        let bytes = bytes as u64;
         loop {
             let now = self.now();
-            let deficit = match self.admits(self.empty_at_ns.load(Ordering::Acquire), now, cost) {
+            let deficit = match self.admits(self.empty_at_ns.load(Ordering::Acquire), now, bytes) {
                 Ok(_) => {
                     waiter.timer = None;
+                    self.forget_waker(waiter.id);
                     return Poll::Ready(());
                 }
                 Err(deficit) => deficit,
@@ -496,11 +535,75 @@ impl EgressCap {
                 .timer
                 .get_or_insert_with(|| (wake_at, (self.sleep_until)(wake_at)));
             match timer.as_mut().poll(cx) {
-                Poll::Pending => return Poll::Pending,
+                Poll::Pending => {
+                    self.register_waker(waiter.id, cx.waker());
+                    // Bytes given back between the check above and the
+                    // registration woke nobody; check once more so they are
+                    // not missed.
+                    if self
+                        .admits(self.empty_at_ns.load(Ordering::Acquire), self.now(), bytes)
+                        .is_ok()
+                    {
+                        continue;
+                    }
+                    return Poll::Pending;
+                }
                 // The timer fired: check the bucket again.
                 Poll::Ready(()) => waiter.timer = None,
             }
         }
+    }
+
+    /// Hold `waker` under `id` until bytes are given back. At
+    /// [`MAX_ADMISSION_WAKERS`] entries, wake and drop all of them first.
+    fn register_waker(&self, id: u64, waker: &std::task::Waker) {
+        let mut wakers = self.admission_wakers.lock();
+        if wakers.len() >= MAX_ADMISSION_WAKERS && !wakers.contains_key(&id) {
+            for (_, stale) in wakers.drain() {
+                stale.wake();
+            }
+        }
+        match wakers.get_mut(&id) {
+            Some(held) if held.will_wake(waker) => {}
+            Some(held) => held.clone_from(waker),
+            None => {
+                wakers.insert(id, waker.clone());
+            }
+        }
+        self.admission_waiting
+            .store(wakers.len(), Ordering::Release);
+    }
+
+    fn forget_waker(&self, id: u64) {
+        if self.admission_waiting.load(Ordering::Acquire) == 0 {
+            return;
+        }
+        let mut wakers = self.admission_wakers.lock();
+        wakers.remove(&id);
+        self.admission_waiting
+            .store(wakers.len(), Ordering::Release);
+    }
+
+    /// Wake every `Pending` [`Self::poll_admit`] caller, after bytes came
+    /// back to the bucket.
+    fn wake_admission_waiters(&self) {
+        if self.admission_waiting.load(Ordering::Acquire) == 0 {
+            return;
+        }
+        let woken: Vec<std::task::Waker> = {
+            let mut wakers = self.admission_wakers.lock();
+            self.admission_waiting.store(0, Ordering::Release);
+            wakers.drain().map(|(_, waker)| waker).collect()
+        };
+        for waker in woken {
+            waker.wake();
+        }
+    }
+
+    /// How many `Pending` [`Self::poll_admit`] wakers the cap holds.
+    #[cfg(test)]
+    pub(crate) fn admission_waker_count(&self) -> usize {
+        self.admission_wakers.lock().len()
     }
 
     /// Return `bytes` to the bucket, never above the burst.
@@ -510,6 +613,7 @@ impl EgressCap {
         }
         let cost = self.cost_ns(bytes);
         self.update(|empty_at, now| Some(self.refilled(empty_at.saturating_sub(cost), now)));
+        self.wake_admission_waiters();
     }
 
     /// Record one sent datagram. Production writes only the

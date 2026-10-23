@@ -923,3 +923,112 @@ fn poll_admit_and_try_take_agree_at_the_same_instant() {
         "admitted {admitted}, refused {refused}"
     );
 }
+
+/// Bytes given back to the bucket wake a `Pending` `poll_admit` caller at
+/// once, before its timer: a paced sender that took a full datagram's worth
+/// and sent less returns the rest, and a waiter short by less than that is
+/// admitted then instead of sleeping to its original deficit.
+#[test]
+fn bytes_given_back_wake_a_pending_poll_admit_before_its_timer() {
+    let (cap, time) = cap_at(RATE);
+    // Leave exactly one paced take in the bucket.
+    cap.charge_unpaced(BURST as usize - PACKET);
+    let take = cap
+        .try_take(PACKET, Duration::ZERO)
+        .expect("one datagram fits");
+    assert_eq!(cap.level_bytes(), 0);
+
+    let (waker, counter) = counting_waker();
+    let mut cx = Context::from_waker(&waker);
+    let mut waiter = AdmissionWaiter::default();
+    assert!(
+        cap.poll_admit(PACKET / 2, &mut waiter, &mut cx)
+            .is_pending()
+    );
+    assert_eq!(cap.admission_waker_count(), 1);
+    let timer_at = waiter.wake_at_ns().expect("a timer is armed");
+
+    // The datagram used a third of the take; two thirds come back.
+    take.sent(PACKET / 3);
+    assert_eq!(woken(&counter), 1, "the give-back woke the waiter");
+    assert!(time.now_nanos() < timer_at, "before its timer would have");
+    assert_eq!(cap.admission_waker_count(), 0, "a woken waker is dropped");
+    assert!(cap.poll_admit(PACKET / 2, &mut waiter, &mut cx).is_ready());
+
+    // A dropped take (a failed send) gives everything back, and wakes too.
+    let (cap, _time) = cap_at(RATE);
+    cap.charge_unpaced(BURST as usize - PACKET);
+    let take = cap
+        .try_take(PACKET, Duration::ZERO)
+        .expect("one datagram fits");
+    let (waker, counter) = counting_waker();
+    let mut cx = Context::from_waker(&waker);
+    let mut waiter = AdmissionWaiter::default();
+    assert!(cap.poll_admit(PACKET, &mut waiter, &mut cx).is_pending());
+    drop(take);
+    assert_eq!(woken(&counter), 1, "a dropped take woke the waiter");
+    assert!(cap.poll_admit(PACKET, &mut waiter, &mut cx).is_ready());
+}
+
+/// The cap never holds more than `MAX_ADMISSION_WAKERS` wakers: waiters that
+/// went away while `Pending` are woken and dropped when the map is full,
+/// rather than kept forever.
+#[test]
+fn abandoned_admission_wakers_are_bounded() {
+    let (cap, _time) = cap_at(RATE);
+    cap.charge_unpaced(BURST as usize);
+    let (waker, counter) = counting_waker();
+    let mut cx = Context::from_waker(&waker);
+    for _ in 0..MAX_ADMISSION_WAKERS {
+        let mut waiter = AdmissionWaiter::default();
+        assert!(cap.poll_admit(PACKET, &mut waiter, &mut cx).is_pending());
+        // Dropped while Pending: its waker stays behind.
+    }
+    assert_eq!(cap.admission_waker_count(), MAX_ADMISSION_WAKERS);
+    assert_eq!(woken(&counter), 0);
+    let mut waiter = AdmissionWaiter::default();
+    assert!(cap.poll_admit(PACKET, &mut waiter, &mut cx).is_pending());
+    assert_eq!(
+        cap.admission_waker_count(),
+        1,
+        "the full map was cleared before the new waker was added"
+    );
+    assert_eq!(
+        woken(&counter),
+        MAX_ADMISSION_WAKERS,
+        "each cleared one was woken"
+    );
+    // The same waiter polling again holds one entry, not two.
+    assert!(cap.poll_admit(PACKET, &mut waiter, &mut cx).is_pending());
+    assert_eq!(cap.admission_waker_count(), 1);
+}
+
+/// A take larger than the burst is admitted once the bucket is full and
+/// puts it into debt by the excess, instead of staying refused forever (the
+/// bucket can never hold more than the burst). `poll_admit` agrees.
+#[test]
+fn a_take_larger_than_the_burst_is_admitted_with_a_full_bucket() {
+    let (cap, time) = cap_at(RATE);
+    let big = BURST as usize + 3 * PACKET;
+    cap.charge_unpaced(PACKET);
+    let (waker, _) = counting_waker();
+    let mut cx = Context::from_waker(&waker);
+    let mut waiter = AdmissionWaiter::default();
+    assert!(cap.poll_admit(big, &mut waiter, &mut cx).is_pending());
+    assert_eq!(
+        cap.try_take(big, Duration::ZERO).unwrap_err(),
+        Duration::from_micros(PACKET as u64),
+        "short by what the full burst is missing, not by the whole take"
+    );
+    time.advance(Duration::from_micros(PACKET as u64));
+    assert!(cap.poll_admit(big, &mut waiter, &mut cx).is_ready());
+    let take = cap
+        .try_take(big, Duration::ZERO)
+        .expect("a full bucket admits it");
+    take.sent(big);
+    assert_eq!(
+        cap.level_bytes(),
+        -(3 * PACKET as i64),
+        "in debt by the excess"
+    );
+}

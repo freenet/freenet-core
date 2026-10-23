@@ -33,6 +33,10 @@ pub use secret::*;
 
 /// Default maximum number of connections for the peer.
 pub const DEFAULT_MAX_CONNECTIONS: usize = crate::ring::Ring::DEFAULT_MAX_CONNECTIONS;
+
+/// Memory assumed for sizing the QUIC windows when the OS query fails: 1 GiB,
+/// the same fallback the caches use.
+const QUIC_FALLBACK_TOTAL_RAM: usize = 1024 * 1024 * 1024;
 /// Default minimum number of connections for the peer.
 pub const DEFAULT_MIN_CONNECTIONS: usize = crate::ring::Ring::DEFAULT_MIN_CONNECTIONS;
 /// Default threshold for randomizing potential peers for new connections.
@@ -327,6 +331,7 @@ impl Default for ConfigArgs {
                 ledbat_min_ssthresh: None, // Uses default from NetworkApiConfig
                 congestion_control: None,  // Default: fixedrate (set in NetworkApiConfig)
                 bbr_startup_rate: None,    // Uses default from BBR config
+                transport_quic: None,      // Default: off
             },
             ws_api: WebsocketApiArgs {
                 // `None`, NOT an explicit address: this is the "operator said
@@ -1009,6 +1014,20 @@ impl ConfigArgs {
             if self.network_api.bbr_startup_rate.is_none() {
                 self.network_api.bbr_startup_rate = cfg.network_api.bbr_startup_rate;
             }
+            // Merged only when the file holds something other than the
+            // default, like `congestion-control`. A value this binary does
+            // not know is kept (and treated as off when used), so a later
+            // release's setting survives a rollback's rewrite of the file.
+            if self.network_api.transport_quic.is_none() {
+                if let Some(value) = cfg
+                    .network_api
+                    .transport_quic
+                    .as_ref()
+                    .filter(|v| crate::transport::quic::QuicMode::is_non_default_value(v))
+                {
+                    self.network_api.transport_quic = Some(value.clone());
+                }
+            }
             if let Some(limit) = cfg.network_api.total_bandwidth_limit {
                 self.network_api.total_bandwidth_limit.get_or_insert(limit);
             }
@@ -1521,6 +1540,7 @@ impl ConfigArgs {
                     .clone()
                     .unwrap_or_else(default_congestion_control),
                 bbr_startup_rate: self.network_api.bbr_startup_rate,
+                transport_quic: self.network_api.transport_quic.clone(),
                 skip_load_from_network: self.network_api.skip_load_from_network,
                 dropped_persisted_loopback: dropped_persisted_network_loopback,
             },
@@ -2443,6 +2463,16 @@ pub struct NetworkArgs {
     #[arg(long, env = "FREENET_BBR_STARTUP_RATE")]
     #[serde(rename = "bbr-startup-rate", skip_serializing_if = "Option::is_none")]
     pub bbr_startup_rate: Option<u64>,
+
+    /// QUIC transport (#5940): `off` (default) or `prefer`.
+    ///
+    /// `prefer` builds a QUIC endpoint on the network port. In this release
+    /// the endpoint accepts no connections and opens none, so the node
+    /// behaves as with `off`. An unknown value is treated as `off`, with a
+    /// warning in the log.
+    #[arg(long, env = "FREENET_TRANSPORT_QUIC", value_name = "off|prefer")]
+    #[serde(rename = "transport-quic", skip_serializing_if = "Option::is_none")]
+    pub transport_quic: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2699,6 +2729,16 @@ pub struct NetworkApiConfig {
     )]
     pub bbr_startup_rate: Option<u64>,
 
+    /// QUIC transport (#5940): `off` (the default when unset) or `prefer`.
+    /// Kept as written, so a value from a later release round-trips; see
+    /// [`Self::quic_settings`] for how it is read.
+    #[serde(
+        default,
+        rename = "transport-quic",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub transport_quic: Option<String>,
+
     /// When true, this node is part of a local/test network and does not load
     /// gateways from the public remote index. Used to disable the relay-ready
     /// gate and other production-only features. The on-disk gateways.toml is
@@ -2723,6 +2763,22 @@ pub struct NetworkApiConfig {
 }
 
 impl NetworkApiConfig {
+    /// The QUIC endpoint settings when `transport-quic` turns QUIC on, or
+    /// `None` when it is off, unset or a value this binary does not know
+    /// (which logs a warning). Reads the node's memory limit, since the
+    /// endpoint's flow-control windows are sized from it.
+    pub(crate) fn quic_settings(&self) -> Option<crate::transport::quic::QuicSettings> {
+        use crate::transport::quic::QuicMode;
+        match QuicMode::from_config_value(self.transport_quic.as_deref()) {
+            QuicMode::Off => None,
+            QuicMode::Prefer => Some(crate::transport::quic::QuicSettings {
+                max_connections: self.max_connections,
+                memory_limit: crate::wasm_runtime::read_total_ram_bytes()
+                    .unwrap_or(QUIC_FALLBACK_TOTAL_RAM),
+            }),
+        }
+    }
+
     /// Build a `CongestionControlConfig` from the current network API configuration.
     ///
     /// This parses the `congestion_control` string to determine the algorithm
@@ -6132,6 +6188,48 @@ shutdown-drain-secs = 42
         assert_seeded_values_bound(&cfg);
     }
 
+    /// `transport-quic` (#5940) is read from `config.toml` in kebab-case, is
+    /// absent from a file that does not set it (so a release that predates
+    /// it sees nothing new), and survives a rewrite of the file even when
+    /// this binary does not know its value: a crash-loop rollback reinstalls
+    /// an older binary, which must neither refuse to start nor drop a value
+    /// a later release wrote. An unknown value turns QUIC off.
+    #[test]
+    fn transport_quic_round_trips_and_unknown_values_are_off() {
+        let unset: Config = toml::from_str(RELEASED_CONFIG_TOML).unwrap();
+        assert_eq!(unset.network_api.transport_quic, None);
+        assert!(unset.network_api.quic_settings().is_none());
+        assert!(
+            !toml::to_string(&unset).unwrap().contains("transport-quic"),
+            "an unset key is not written"
+        );
+
+        for (value, on) in [("prefer", true), ("off", false), ("a-later-mode", false)] {
+            let text = RELEASED_CONFIG_TOML.replacen(
+                "mode = \"network\"\n",
+                &format!("mode = \"network\"\ntransport-quic = \"{value}\"\n"),
+                1,
+            );
+            assert_ne!(text, RELEASED_CONFIG_TOML, "the key was inserted");
+            let cfg: Config = toml::from_str(&text)
+                .unwrap_or_else(|e| panic!("transport-quic = {value:?} must parse: {e}"));
+            assert_eq!(cfg.network_api.transport_quic.as_deref(), Some(value));
+            assert_eq!(
+                cfg.network_api.quic_settings().is_some(),
+                on,
+                "transport-quic = {value:?}"
+            );
+            if let Some(settings) = cfg.network_api.quic_settings() {
+                assert_eq!(settings.max_connections, cfg.network_api.max_connections);
+            }
+            let rewritten = toml::to_string(&cfg).unwrap();
+            assert!(
+                rewritten.contains(&format!("transport-quic = \"{value}\"")),
+                "written back as it was read: {rewritten}"
+            );
+        }
+    }
+
     /// The two spellings must be genuinely interchangeable, not merely both
     /// parseable. (Read with `assert_seeded_values_bound`, which is what stops
     /// this from passing on two identically-defaulted configs.)
@@ -8338,6 +8436,37 @@ shutdown-drain-secs = 42
         );
     }
 
+    /// `transport-quic` survives a bare restart through `build()`'s merge,
+    /// including a value this binary does not know (a rollback must keep a
+    /// later release's setting), and a value on the command line wins over
+    /// the file.
+    #[tokio::test]
+    async fn transport_quic_survives_a_bare_build_and_cli_overrides_it() {
+        for value in ["prefer", "a-later-mode"] {
+            let temp_dir = tempfile::tempdir().unwrap();
+            let mut first = local_args(temp_dir.path());
+            first.network_api.transport_quic = Some(value.to_string());
+            first.build().await.unwrap();
+
+            let cfg = local_args(temp_dir.path()).build().await.unwrap();
+            assert_eq!(
+                cfg.network_api.transport_quic.as_deref(),
+                Some(value),
+                "transport-quic = {value:?} must survive a bare build"
+            );
+
+            let mut cli = local_args(temp_dir.path());
+            cli.network_api.transport_quic = Some("off".to_string());
+            let cfg = cli.build().await.unwrap();
+            assert_eq!(
+                cfg.network_api.transport_quic.as_deref(),
+                Some("off"),
+                "the command line overrides the file"
+            );
+            assert!(cfg.network_api.quic_settings().is_none());
+        }
+    }
+
     #[tokio::test]
     async fn cli_total_bandwidth_limit_overrides_file_config() {
         // CLI args still take precedence over the file value: the new merge
@@ -8608,6 +8737,7 @@ shutdown-drain-secs = 42
                 ledbat_min_ssthresh: Some(200_000),
                 congestion_control: "bbr".to_string(),
                 bbr_startup_rate: Some(5_000),
+                transport_quic: Some("prefer".to_string()),
                 skip_load_from_network: true,
                 // serde-skip: a per-boot migration record, never persisted.
                 dropped_persisted_loopback: None,
@@ -8818,6 +8948,7 @@ shutdown-drain-secs = 42
             ledbat_min_ssthresh,
             congestion_control,
             bbr_startup_rate,
+            transport_quic,
             skip_load_from_network,
             dropped_persisted_loopback: _, // serde-skip: per-boot migration record
         } = network_api;
@@ -8879,6 +9010,10 @@ shutdown-drain-secs = 42
         assert_eq!(
             bbr_startup_rate, seed.network_api.bbr_startup_rate,
             "bbr_startup_rate"
+        );
+        assert_eq!(
+            transport_quic, seed.network_api.transport_quic,
+            "transport_quic"
         );
         assert_eq!(
             skip_load_from_network, seed.network_api.skip_load_from_network,
