@@ -866,7 +866,11 @@ Audit questions for any new byte budget:
 `MAX_INBOUND_STREAM_BYTES_PER_CONNECTION` are flat and sit outside the
 aggregate (listed in `NOT_SUMMED` with the reason). They bound one stream and
 one connection, not the node: reassembly memory across the node is at most the
-number of connections times the per-connection allowance. A node-wide share
+number of connections times the per-connection allowance. The QUIC
+flow-control windows (`quic::config::connection_window_bytes`, #5940) share
+this exception: each is capped at `MAX_INBOUND_STREAM_BYTES_PER_CONNECTION`,
+so turning QUIC on gives no connection more inbound memory than it could
+already hold, and they are in `NOT_SUMMED` for the same reason. A node-wide share
 and fairness between connections are deferred to the transport redesign. Do
 not copy this shape for memory the node holds on its own initiative.
 

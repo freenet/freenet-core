@@ -27,7 +27,6 @@ use quinn::{
 };
 use ring_crypto::{hkdf, hmac};
 
-use super::QuicMode;
 use super::cid::MacConnectionIdGenerator;
 use crate::config::GlobalRng;
 use crate::simulation::TimeSource;
@@ -99,42 +98,31 @@ impl QuicSettings {
 
 /// The flow-control window for one connection in one direction: 5% of the
 /// memory split over every connection's receive and send windows, clamped
-/// to [`MIN_WINDOW_BYTES`], [`MAX_WINDOW_BYTES`]. The same value is the
-/// connection receive window, the per-stream receive window and the send
-/// window, so a connection holds at most twice this.
+/// to [`MIN_WINDOW_BYTES`], [`MAX_WINDOW_BYTES`], and never more than
+/// [`MAX_INBOUND_STREAM_BYTES_PER_CONNECTION`], the most inbound reassembly
+/// state a UDP-transport connection may already hold. That last bound wins
+/// over the floor, so turning QUIC on never lets a connection hold more
+/// inbound memory than it could without QUIC. The same value is the
+/// connection receive window, the per-stream receive window (so a stream's
+/// window is never above its connection's) and the send window.
+///
+/// Like the reassembly allowance, the windows bound one connection, not the
+/// node, and are not summed in `contract::executor::declared_cache_ceiling`
+/// (its `NOT_SUMMED` table, and the "Recorded exception: inbound stream
+/// reassembly" note in `.claude/rules/bug-prevention-patterns.md`).
+///
+/// [`MAX_INBOUND_STREAM_BYTES_PER_CONNECTION`]: crate::transport::peer_connection::streaming::MAX_INBOUND_STREAM_BYTES_PER_CONNECTION
 pub(crate) fn connection_window_bytes(memory_limit: usize, max_connections: usize) -> u64 {
     let share = memory_limit / WINDOW_MEMORY_DIVISOR / (2 * max_connections.max(1));
-    (share as u64).clamp(MIN_WINDOW_BYTES, MAX_WINDOW_BYTES)
+    (share as u64)
+        .clamp(MIN_WINDOW_BYTES, MAX_WINDOW_BYTES)
+        .min(PER_CONNECTION_INBOUND_CAP)
 }
 
-/// The most memory the QUIC endpoint can hold on a node with `memory_limit`
-/// and `max_connections`: every connection's receive and send windows full,
-/// plus quinn's buffer for pending connection attempts. Zero with QUIC off,
-/// because then no endpoint exists.
-///
-/// With QUIC on, the windows' floor alone makes this at least
-/// `2 * 200 * 128 KiB` (50 MiB) at the default 200 connections, and a 1 GiB
-/// host's declared caches had a margin of 2.6 MB under their half-of-memory
-/// limit when this was written, so the two do not fit together. That has to
-/// be settled before QUIC is offered to operators (#5940).
-// Read by the declared memory ceiling, which only tests evaluate.
-#[cfg_attr(not(test), allow(dead_code))]
-pub(crate) fn quic_endpoint_budget_for(
-    memory_limit: usize,
-    mode: QuicMode,
-    max_connections: usize,
-) -> usize {
-    match mode {
-        QuicMode::Off => 0,
-        QuicMode::Prefer => {
-            let window = connection_window_bytes(memory_limit, max_connections);
-            usize::try_from(window)
-                .unwrap_or(usize::MAX)
-                .saturating_mul(2 * max_connections.max(1))
-                .saturating_add(INCOMING_BUFFER_TOTAL_BYTES as usize)
-        }
-    }
-}
+/// [`connection_window_bytes`]'s upper bound: the UDP transport's
+/// per-connection reassembly allowance.
+const PER_CONNECTION_INBOUND_CAP: u64 =
+    crate::transport::peer_connection::streaming::MAX_INBOUND_STREAM_BYTES_PER_CONNECTION;
 
 /// Fill `out` from the OS entropy pool, for key material: the
 /// stateless-reset key, the handshake-token key and the connection-ID MAC

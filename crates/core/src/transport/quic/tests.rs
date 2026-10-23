@@ -1127,6 +1127,19 @@ fn a_dual_stack_endpoint_talks_to_an_ipv4_peer() {
             })
             .is_ok();
         if !dual_stack_available {
+            // Set REQUIRE_DUAL_STACK=1 where the host is known to have
+            // dual-stack IPv6 (a CI runner, say), so a skip there fails
+            // instead of passing unseen.
+            assert!(
+                std::env::var("REQUIRE_DUAL_STACK").as_deref() != Ok("1"),
+                "REQUIRE_DUAL_STACK=1 but this host has no dual-stack IPv6: \
+                 a_dual_stack_endpoint_talks_to_an_ipv4_peer cannot run"
+            );
+            // stdout as well as stderr, so the skip shows in captured output.
+            println!(
+                "SKIPPED a_dual_stack_endpoint_talks_to_an_ipv4_peer: no dual-stack IPv6 here \
+                 (set REQUIRE_DUAL_STACK=1 to make this a failure)"
+            );
             eprintln!(
                 "SKIPPED a_dual_stack_endpoint_talks_to_an_ipv4_peer: no dual-stack IPv6 here"
             );
@@ -1476,17 +1489,45 @@ fn windows_are_a_clamped_share_of_memory() {
         MAX_WINDOW_BYTES,
         "zero connections does not divide by zero"
     );
-    assert_eq!(
-        config::quic_endpoint_budget_for(GIB, QuicMode::Off, 200),
-        0,
-        "no endpoint, no memory"
-    );
-    for connections in [200, 1000] {
-        assert_eq!(
-            config::quic_endpoint_budget_for(GIB, QuicMode::Prefer, connections),
-            2 * connections * window(GIB, connections) as usize
-                + INCOMING_BUFFER_TOTAL_BYTES as usize
-        );
+}
+
+/// A QUIC connection may never hold more inbound memory than a UDP
+/// transport connection already may: the connection receive window, the
+/// stream receive window and the send window are at most
+/// `MAX_INBOUND_STREAM_BYTES_PER_CONNECTION` (read from the constant, not
+/// copied) at every memory limit and connection count, the stream window is
+/// at most the connection window, and the transport configuration quinn is
+/// given carries exactly those values.
+#[test]
+fn windows_never_exceed_the_reassembly_allowance() {
+    use crate::transport::peer_connection::streaming::MAX_INBOUND_STREAM_BYTES_PER_CONNECTION as CAP;
+    const MIB: usize = 1024 * 1024;
+    let limits = [0, MIB, 256 * MIB, 1024 * MIB, 64 * 1024 * MIB, usize::MAX];
+    let connections = [0, 1, 4, 200, 10_000];
+    for &memory_limit in &limits {
+        for &max_connections in &connections {
+            let settings = QuicSettings {
+                max_connections,
+                memory_limit,
+            };
+            let window = settings.window_bytes();
+            assert!(
+                window <= CAP,
+                "{memory_limit} B / {max_connections} connections: window {window} > {CAP}"
+            );
+            let debug = format!(
+                "{:?}",
+                config::transport_config(&settings, &VirtualTime::new())
+            );
+            let field = |name: &str| debug_field(&debug, name).parse::<u64>().unwrap();
+            let (stream, connection, send) = (
+                field("stream_receive_window"),
+                field("receive_window"),
+                field("send_window"),
+            );
+            assert_eq!((stream, connection, send), (window, window, window));
+            assert!(stream <= connection && connection <= CAP && send <= CAP);
+        }
     }
 }
 

@@ -724,16 +724,25 @@ Connection IDs (quic/cid.rs) carry a keyed BLAKE3 MAC, so quinn drops a
   generator can be spoofed and would answer it with a stateless reset.
 ```
 
-The endpoint's memory (`quic_endpoint_budget_for`) is a term in
-`declared_cache_ceiling`, zero at the shipped default (off). The term is
-evaluated for the DEFAULT mode and connection limit, so it cannot reflect
-`prefer` or a raised `max-number-of-connections`. c3 (the first step that
-opens QUIC connections) must make it use the configured mode and
-max_connections. Nothing enforces that: the test
-`quic_endpoint_term_is_default_only_until_c3` fails only if the default
-flips. With QUIC on it
-is at least 50 MiB at the default connection count, which a 1 GiB host's
-declared caches have no room for; settle that before QUIC is offered.
+QUIC memory: the flow-control windows (connection receive, stream receive,
+send; all one value from `connection_window_bytes`) are capped at
+`MAX_INBOUND_STREAM_BYTES_PER_CONNECTION`, so a QUIC connection never holds
+more inbound memory than a UDP-transport connection already may, and the
+stream window never exceeds the connection window. Like inbound stream
+reassembly they bound one connection, not the node, and are listed in
+`NOT_SUMMED` in `declared_cache_ceiling` (the recorded reassembly exception
+in bug-prevention-patterns.md). The fixed node-wide endpoint buffers are
+summed whatever `transport-quic` says: `INCOMING_BUFFER_TOTAL_BYTES` (quinn's
+pending attempts) and `QUIC_INGRESS_QUEUE_BYTES`. Pinned by
+`windows_never_exceed_the_reassembly_allowance`.
+
+The cap's `poll_admit` and `give_back` publish through Release/Acquire
+atomics, not SeqCst, so a give-back racing a waiter's registration can miss
+its wake (the store-buffer pattern); the waiter's own timer bounds the delay
+to its deficit. Known and accepted.
+
+The dual-stack test skips (printing SKIPPED) on a host without dual-stack
+IPv6; set REQUIRE_DUAL_STACK=1 to make that a failure.
 
 Key material (stateless-reset key, token key, CID MAC key) comes from the OS
 entropy pool, never GlobalRng; quinn's rng_seed and the CID nonces stay on
