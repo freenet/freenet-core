@@ -942,6 +942,43 @@ mod tests {
     use crate::transport::received_packet_tracker::ReportResult;
     use crate::transport::sent_packet_tracker::ResendAction;
 
+    /// The production socket's non-blocking send: a fresh socket becomes
+    /// ready to send, the datagram goes out from `try_send_to` with no await, and
+    /// arrives. (Its `WouldBlock` path needs a full kernel send buffer,
+    /// which loopback cannot be made to produce reliably; `DemuxSocket`'s
+    /// tests cover passing `WouldBlock` through.)
+    #[tokio::test]
+    async fn udp_transport_socket_try_send_to_sends_without_waiting() {
+        let localhost: SocketAddr = (std::net::Ipv4Addr::LOCALHOST, 0).into();
+        let sender = <UdpTransportSocket as Socket>::bind(localhost)
+            .await
+            .unwrap();
+        let receiver = <UdpTransportSocket as Socket>::bind(localhost)
+            .await
+            .unwrap();
+        let to = receiver.local_addr().unwrap();
+        // Tokio reports writable once its reactor has seen it, so the first
+        // poll may be Pending; it must become Ready with the waker it armed.
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            std::future::poll_fn(|cx| sender.poll_send_ready(cx)),
+        )
+        .await
+        .expect("a fresh socket becomes writable")
+        .unwrap();
+        assert_eq!(Socket::try_send_to(&sender, &[0x01, 2, 3], to).unwrap(), 3);
+        let mut buf = [0u8; 16];
+        let (len, from) = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            Socket::recv_from(&receiver, &mut buf),
+        )
+        .await
+        .expect("the datagram arrives")
+        .unwrap();
+        assert_eq!(&buf[..len], &[0x01, 2, 3]);
+        assert_eq!(from, sender.local_addr().unwrap());
+    }
+
     /// Each UDP-only error displays exactly as the `TransportError` variant
     /// it replaced did, and classifies the same way.
     #[test]

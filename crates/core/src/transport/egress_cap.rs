@@ -255,6 +255,14 @@ pub(crate) struct AdmissionWaiter {
     timer: Option<(u64, SleepFuture)>,
 }
 
+impl AdmissionWaiter {
+    /// When the armed timer fires (ns on the cap's clock), if one is armed.
+    #[cfg(test)]
+    pub(crate) fn wake_at_ns(&self) -> Option<u64> {
+        self.timer.as_ref().map(|(at, _)| *at)
+    }
+}
+
 impl fmt::Debug for AdmissionWaiter {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("AdmissionWaiter")

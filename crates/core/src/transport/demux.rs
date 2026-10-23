@@ -383,6 +383,8 @@ mod tests {
     struct ScriptedSocket {
         script: Mutex<VecDeque<Step>>,
         sent: Mutex<Vec<(Vec<u8>, SocketAddr)>>,
+        /// `try_send_to` returns `WouldBlock` while this is set.
+        send_buffer_full: std::sync::atomic::AtomicBool,
     }
 
     impl ScriptedSocket {
@@ -390,6 +392,7 @@ mod tests {
             Self {
                 script: Mutex::new(script.into()),
                 sent: Mutex::new(Vec::new()),
+                send_buffer_full: std::sync::atomic::AtomicBool::new(false),
             }
         }
     }
@@ -417,6 +420,14 @@ mod tests {
         }
 
         fn send_to_blocking(&self, buf: &[u8], target: SocketAddr) -> io::Result<usize> {
+            self.sent.lock().unwrap().push((buf.to_vec(), target));
+            Ok(buf.len())
+        }
+
+        fn try_send_to(&self, buf: &[u8], target: SocketAddr) -> io::Result<usize> {
+            if self.send_buffer_full.load(Ordering::SeqCst) {
+                return Err(io::ErrorKind::WouldBlock.into());
+            }
             self.sent.lock().unwrap().push((buf.to_vec(), target));
             Ok(buf.len())
         }
@@ -525,6 +536,216 @@ mod tests {
             *socket.inner.sent.lock().unwrap(),
             vec![(vec![0xC0, 1], target), (vec![0x01], target)]
         );
+    }
+
+    fn quic(tag: u8) -> Vec<u8> {
+        vec![0xC3, tag, 0, 0]
+    }
+
+    fn outcomes(socket: &DemuxSocket<ScriptedSocket>) -> [u64; QuicIngressOutcome::COUNT] {
+        QuicIngressOutcome::ALL.map(|o| socket.quic_outcome_count(o))
+    }
+
+    /// Allowed QUIC-class datagrams reach the ingress queue in arrival order,
+    /// with their bytes and source, interleaved with a legacy datagram that
+    /// is still returned to the caller. Each QUIC one is reported to the
+    /// listener as `Diverted`.
+    #[tokio::test]
+    async fn quic_ingress_queues_allowed_datagrams_in_order() {
+        let from: SocketAddr = "10.254.2.1:4101".parse().unwrap();
+        let legacy = vec![PACKET_TYPE_SYMMETRIC, 1];
+        let socket = DemuxSocket::wrap(
+            ScriptedSocket::new(vec![
+                Step::Packet(from, quic(1)),
+                Step::Packet(from, legacy.clone()),
+                Step::Packet(from, quic(2)),
+                Step::Packet(from, quic(3)),
+            ]),
+            None,
+        );
+        let mut queue = socket.enable_quic_ingress().expect("first enable");
+        assert!(socket.allow_quic_source(from));
+
+        let mut buf = [0u8; 64];
+        let mut reads = Vec::new();
+        for _ in 0..4 {
+            reads.push(socket.recv_classified(&mut buf).await.unwrap());
+        }
+        assert_eq!(
+            reads,
+            vec![
+                SocketRead::Diverted,
+                SocketRead::Datagram(legacy.len(), from),
+                SocketRead::Diverted,
+                SocketRead::Diverted,
+            ]
+        );
+        for tag in 1..=3 {
+            assert_eq!(
+                queue.try_recv().unwrap(),
+                QuicDatagram {
+                    bytes: quic(tag),
+                    from
+                }
+            );
+        }
+        assert!(queue.try_recv().is_err(), "nothing else was queued");
+        assert_eq!(outcomes(&socket), [3, 0, 0, 0]);
+    }
+
+    /// With the queue full and nobody reading it, QUIC-class datagrams are
+    /// dropped and counted, and a legacy datagram behind them is still
+    /// returned at once. The test runs on a paused clock, so if the listener
+    /// waited for room in the queue the runtime would go idle, the clock
+    /// would jump to the 5 s timeout and the test would fail at once rather
+    /// than after 5 real seconds.
+    #[tokio::test(start_paused = true)]
+    async fn quic_ingress_queue_full_drops_and_counts_without_stalling_legacy() {
+        let from: SocketAddr = "10.254.2.2:4102".parse().unwrap();
+        let overflow = 5;
+        let mut script: Vec<Step> = (0..QUIC_INGRESS_QUEUE_DATAGRAMS + overflow)
+            .map(|i| Step::Packet(from, quic(i as u8)))
+            .collect();
+        script.push(Step::Packet(from, vec![PACKET_TYPE_INTRO, 7]));
+        let socket = DemuxSocket::wrap(ScriptedSocket::new(script), None);
+        let queue = socket.enable_quic_ingress().expect("first enable");
+        assert!(socket.allow_quic_source(from));
+
+        let mut buf = [0u8; 64];
+        let (len, got_from) = recv_within_timeout(&socket, &mut buf).await;
+        assert_eq!((&buf[..len], got_from), (&[PACKET_TYPE_INTRO, 7][..], from));
+        assert_eq!(
+            outcomes(&socket),
+            [QUIC_INGRESS_QUEUE_DATAGRAMS as u64, 0, overflow as u64, 0]
+        );
+        assert_eq!(queue.len(), QUIC_INGRESS_QUEUE_DATAGRAMS);
+    }
+
+    /// A QUIC-class datagram from a source not on the allow-set is dropped
+    /// and counted, including after its address was removed again. The
+    /// allow-set compares normalized addresses, as the UDP sockets report.
+    #[tokio::test]
+    async fn quic_ingress_drops_and_counts_sources_not_allowed() {
+        let allowed: SocketAddr = "10.254.2.3:4103".parse().unwrap();
+        let stranger: SocketAddr = "10.254.2.4:4104".parse().unwrap();
+        let socket = DemuxSocket::wrap(
+            ScriptedSocket::new(vec![
+                Step::Packet(stranger, quic(1)),
+                Step::Packet(allowed, quic(2)),
+                Step::Packet(allowed, quic(3)),
+            ]),
+            None,
+        );
+        let mut queue = socket.enable_quic_ingress().expect("first enable");
+        // Allowed in its IPv4-mapped IPv6 form.
+        assert!(socket.allow_quic_source("[::ffff:10.254.2.3]:4103".parse().unwrap()));
+        let mut buf = [0u8; 64];
+
+        assert_eq!(
+            socket.recv_classified(&mut buf).await.unwrap(),
+            SocketRead::Diverted
+        );
+        assert!(
+            queue.try_recv().is_err(),
+            "a stranger's datagram is not queued"
+        );
+        assert_eq!(outcomes(&socket), [0, 1, 0, 0]);
+
+        socket.recv_classified(&mut buf).await.unwrap();
+        assert_eq!(queue.try_recv().unwrap().bytes, quic(2));
+
+        assert!(socket.disallow_quic_source(allowed));
+        assert!(!socket.disallow_quic_source(allowed), "already removed");
+        socket.recv_classified(&mut buf).await.unwrap();
+        assert!(queue.try_recv().is_err(), "a removed source is not queued");
+        assert_eq!(outcomes(&socket), [1, 2, 0, 0]);
+    }
+
+    /// Without an ingress (every node until a QUIC endpoint runs) every
+    /// QUIC-class datagram counts as `no_ingress`, the allow-set cannot be
+    /// written, and a dropped receiver counts the same. Other datagrams are
+    /// not counted as QUIC at all.
+    #[tokio::test]
+    async fn quic_datagrams_without_an_ingress_count_as_no_ingress() {
+        let from: SocketAddr = "10.254.2.5:4105".parse().unwrap();
+        let socket = DemuxSocket::wrap(
+            ScriptedSocket::new(vec![
+                Step::Packet(from, quic(1)),
+                Step::Packet(from, vec![0x00]),
+                Step::Packet(from, quic(2)),
+            ]),
+            None,
+        );
+        assert!(!socket.allow_quic_source(from), "no ingress, no allow-set");
+        let mut buf = [0u8; 64];
+        socket.recv_classified(&mut buf).await.unwrap();
+        socket.recv_classified(&mut buf).await.unwrap();
+        assert_eq!(outcomes(&socket), [0, 0, 0, 1]);
+
+        let queue = socket.enable_quic_ingress().expect("first enable");
+        assert!(socket.enable_quic_ingress().is_none(), "enabled only once");
+        assert!(socket.allow_quic_source(from));
+        drop(queue);
+        socket.recv_classified(&mut buf).await.unwrap();
+        assert_eq!(
+            outcomes(&socket),
+            [0, 0, 0, 2],
+            "a closed queue is no ingress"
+        );
+    }
+
+    /// `try_send_to` returns the inner socket's `WouldBlock` unchanged and
+    /// charges nothing for it; a send that goes through is charged once,
+    /// unpaced, like `send_to`.
+    #[test]
+    fn try_send_to_passes_would_block_through_and_charges_only_sends() {
+        let target: SocketAddr = "10.254.2.6:4106".parse().unwrap();
+        let cap = EgressCap::new(1_000_000, crate::simulation::VirtualTime::new());
+        let socket = DemuxSocket::wrap(ScriptedSocket::new(Vec::new()), Some(cap));
+        socket.inner.send_buffer_full.store(true, Ordering::SeqCst);
+        let err = socket.try_send_to(&[0xC0; 100], target).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
+        let stats = socket.egress_cap().unwrap().stats();
+        assert_eq!(stats.bytes, 0, "a send that did not happen is not charged");
+        assert!(socket.inner.sent.lock().unwrap().is_empty());
+
+        socket.inner.send_buffer_full.store(false, Ordering::SeqCst);
+        assert_eq!(socket.try_send_to(&[0xC0; 100], target).unwrap(), 100);
+        let stats = socket.egress_cap().unwrap().stats();
+        assert_eq!(stats.bytes, 100);
+        assert_eq!(
+            stats.packets[crate::transport::metrics::EgressDecision::Unpaced as usize],
+            1
+        );
+        assert_eq!(
+            *socket.inner.sent.lock().unwrap(),
+            vec![(vec![0xC0; 100], target)]
+        );
+    }
+
+    /// The default `try_send_to` of a socket that does not implement it
+    /// says so instead of sending or blocking.
+    #[test]
+    fn default_try_send_to_is_unsupported() {
+        struct Minimal;
+        impl Socket for Minimal {
+            async fn bind(_addr: SocketAddr) -> io::Result<Self> {
+                Ok(Self)
+            }
+            async fn recv_from(&self, _buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+                std::future::pending().await
+            }
+            async fn send_to(&self, buf: &[u8], _target: SocketAddr) -> io::Result<usize> {
+                Ok(buf.len())
+            }
+            fn send_to_blocking(&self, buf: &[u8], _target: SocketAddr) -> io::Result<usize> {
+                Ok(buf.len())
+            }
+        }
+        let err = Minimal
+            .try_send_to(&[1], "10.254.2.7:4107".parse().unwrap())
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::Unsupported);
     }
 
     /// Through the real bind path of the transport: a QUIC-shaped datagram
