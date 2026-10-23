@@ -3,8 +3,9 @@
 //! Most run two endpoints over `SimulationSocket` on one `VirtualTime`, with
 //! `GlobalRng` seeded, on the test's single-threaded runtime: quinn's clock,
 //! timers, connection IDs and keys are then all under the test's control.
-//! The TLS identities are the TEST-ONLY accept-any raw public keys of
-//! `test_tls`.
+//! Each endpoint authenticates with a `TransportKeypair` drawn from the
+//! seeded `GlobalRng`, as a node does with its own (`identity`); tests where
+//! a peer presents a key of its own use `test_tls`.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
@@ -15,11 +16,13 @@ use super::config::{
     MAX_BIDI_STREAMS, MAX_INCOMING, MAX_UDP_PAYLOAD, MAX_UNI_STREAMS, MAX_WINDOW_BYTES,
     MIN_WINDOW_BYTES,
 };
-use super::test_tls::{AcceptAnyClientKey, AcceptAnyServerKey, TestIdentity};
+use super::identity::{PeerKey, PinnedClientKey, PinnedServerKey, QuicIdentity};
+use super::test_tls::TestIdentity;
 use super::*;
 use crate::config::GlobalRng;
 use crate::simulation::{RealTime, VirtualTime};
 use crate::transport::Socket;
+use crate::transport::crypto::{TransportKeypair, TransportPublicKey};
 use crate::transport::demux::{DemuxSocket, classify};
 use crate::transport::egress_cap::EgressCap;
 use crate::transport::in_memory_socket::{
@@ -208,8 +211,8 @@ struct Pair {
     b: QuicEndpoint,
     a_addr: SocketAddr,
     b_addr: SocketAddr,
-    a_identity: TestIdentity,
-    b_identity: TestIdentity,
+    a_keys: TransportKeypair,
+    b_keys: TransportKeypair,
     a_socket: Arc<SimDemux>,
     b_socket: Arc<SimDemux>,
     log: Arc<Mutex<Vec<Sent>>>,
@@ -253,18 +256,12 @@ async fn pair(network: &str, a_addr: SocketAddr, b_addr: SocketAddr, a_cap: Opti
     };
     let a_socket = bind(a_addr, a_cap.map(|rate| EgressCap::new(rate, time.clone()))).await;
     let b_socket = bind(b_addr, None).await;
-    let a = QuicEndpoint::bind(a_socket.clone(), a_addr, time.clone(), &settings())
+    let a_keys = TransportKeypair::new();
+    let b_keys = TransportKeypair::new();
+    let a = QuicEndpoint::bind(a_socket.clone(), a_addr, time.clone(), &settings(), &a_keys)
         .expect("endpoint a");
-    let b = QuicEndpoint::bind(b_socket.clone(), b_addr, time.clone(), &settings())
+    let b = QuicEndpoint::bind(b_socket.clone(), b_addr, time.clone(), &settings(), &b_keys)
         .expect("endpoint b");
-    let a_identity = TestIdentity::generate();
-    let b_identity = TestIdentity::generate();
-    b.set_server_config(
-        b.server_config(Arc::new(
-            config::tls_server_config(b_identity.key.clone(), Arc::new(AcceptAnyClientKey))
-                .expect("server TLS"),
-        )),
-    );
     let pumps = vec![pump(a_socket.clone()), pump(b_socket.clone())];
     Pair {
         time,
@@ -273,8 +270,8 @@ async fn pair(network: &str, a_addr: SocketAddr, b_addr: SocketAddr, a_cap: Opti
         b,
         a_addr,
         b_addr,
-        a_identity,
-        b_identity,
+        a_keys,
+        b_keys,
         a_socket,
         b_socket,
         log,
@@ -283,11 +280,12 @@ async fn pair(network: &str, a_addr: SocketAddr, b_addr: SocketAddr, a_cap: Opti
 }
 
 impl Pair {
-    fn client_config(&self) -> quinn::ClientConfig {
-        self.a.client_config(Arc::new(
-            config::tls_client_config(self.a_identity.key.clone(), Arc::new(AcceptAnyServerKey))
-                .expect("client TLS"),
-        ))
+    fn a_key(&self) -> TransportPublicKey {
+        self.a_keys.public().clone()
+    }
+
+    fn b_key(&self) -> TransportPublicKey {
+        self.b_keys.public().clone()
     }
 
     /// Connect `a` to `b`, send `payload` on one unidirectional stream from
@@ -297,12 +295,15 @@ impl Pair {
         payload: Vec<u8>,
         limit: Duration,
     ) -> (Vec<u8>, QuicConnection, QuicConnection) {
-        let permit = self.b.allow_peer(self.a_addr).expect("allow-set has room");
-        let a = clone_endpoint(&self.a);
-        let b = clone_endpoint(&self.b);
-        let (b_addr, client_config) = (self.b_addr, self.client_config());
+        let permit = self
+            .b
+            .allow_peer(self.a_addr, self.a_keys.public())
+            .expect("allow-set has room");
+        let a = self.a.clone();
+        let b = self.b.clone();
+        let (b_addr, b_key) = (self.b_addr, self.b_key());
         let result = drive(&self.time, limit, async move {
-            let (client, server) = tokio::join!(a.connect(b_addr, client_config), async {
+            let (client, server) = tokio::join!(a.connect(b_addr, &b_key), async {
                 b.accept()
                     .await
                     .expect("an incoming attempt")
@@ -334,14 +335,9 @@ impl Pair {
     }
 }
 
-/// A second handle on an endpoint for a spawned task.
-fn clone_endpoint(endpoint: &QuicEndpoint) -> QuicEndpoint {
-    QuicEndpoint {
-        endpoint: endpoint.endpoint.clone(),
-        sources: endpoint.sources.clone(),
-        transport: endpoint.transport.clone(),
-        clock: endpoint.clock.clone(),
-    }
+/// The raw public key the holder of `key` presents (its SPKI DER).
+fn spki_of(key: &TransportPublicKey) -> Vec<u8> {
+    PeerKey::of(key).expect("a usable key").spki().to_vec()
 }
 
 fn payload(len: usize) -> Vec<u8> {
@@ -382,12 +378,12 @@ fn handshake_and_one_mib_stream_on_virtual_time() {
         };
         assert_eq!(
             peer_key(&server),
-            pair.a_identity.spki,
+            spki_of(pair.a_keys.public()),
             "server saw a's key"
         );
         assert_eq!(
             peer_key(&client),
-            pair.b_identity.spki,
+            spki_of(pair.b_keys.public()),
             "client saw b's key"
         );
         let handshake = server
@@ -495,27 +491,23 @@ fn a_client_with_another_alpn_is_refused() {
             None,
         )
         .await;
-        let _permit = pair.b.allow_peer(pair.a_addr).expect("room");
-        let mut tls = rustls::ClientConfig::builder_with_provider(Arc::new(
-            rustls::crypto::ring::default_provider(),
-        ))
-        .with_protocol_versions(&[&rustls::version::TLS13])
-        .unwrap()
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(AcceptAnyServerKey))
-        .with_client_cert_resolver(Arc::new(
-            rustls::client::AlwaysResolvesClientRawPublicKeys::new(pair.a_identity.key.clone()),
-        ));
+        let _permit = pair.b.allow_peer(pair.a_addr, &pair.a_key()).expect("room");
+        let b_peer = PeerKey::of(pair.b_keys.public()).unwrap();
+        let mut tls = config::rustls_client_config(
+            pair.a.identity.certified_key(),
+            Arc::new(PinnedServerKey::new(&b_peer)),
+        )
+        .unwrap();
         tls.alpn_protocols = vec![b"something-else".to_vec()];
         let client_config = pair.a.client_config(Arc::new(
             quinn::crypto::rustls::QuicClientConfig::try_from(Arc::new(tls)).unwrap(),
         ));
-        let a = clone_endpoint(&pair.a);
-        let b = clone_endpoint(&pair.b);
+        let a = pair.a.clone();
+        let b = pair.b.clone();
         let b_addr = pair.b_addr;
         let (client, server) = drive(&pair.time, Duration::from_secs(60), async move {
             tokio::join!(
-                async { a.connect(b_addr, client_config).await.map(|_| ()) },
+                async { a.connect_with(b_addr, client_config).await.map(|_| ()) },
                 async {
                     b.accept()
                         .await
@@ -541,6 +533,442 @@ fn a_client_with_another_alpn_is_refused() {
         assert!(
             !pair.b_socket.is_quic_source_allowed(pair.a_addr),
             "server side"
+        );
+    })
+}
+
+/// What one handshake attempt ended with, on each side.
+type Outcome = (
+    Result<QuicConnection, QuicConnectError>,
+    Result<QuicConnection, quinn::ConnectionError>,
+);
+
+/// How the server side of [`attempt`] answers the attempt.
+enum ServerTls {
+    /// As the node does: TLS pinned to the key the source was allowed with.
+    Pinned,
+    /// With this rustls configuration instead (an impostor's).
+    Custom(Box<rustls::ServerConfig>),
+}
+
+/// `client` connects to `server` at `server_addr` with `client_config`,
+/// and `server` accepts the attempt, answering it as `server_tls` says. The
+/// caller has allowed the client's address on `server`.
+async fn attempt(
+    time: &VirtualTime,
+    client: &QuicEndpoint,
+    server: &QuicEndpoint,
+    server_addr: SocketAddr,
+    client_config: quinn::ClientConfig,
+    server_tls: ServerTls,
+) -> Outcome {
+    let (client, server) = (client.clone(), server.clone());
+    drive(time, Duration::from_secs(60), async move {
+        tokio::join!(client.connect_with(server_addr, client_config), async {
+            let incoming = server.accept().await.expect("an incoming attempt");
+            match server_tls {
+                ServerTls::Pinned => incoming.establish().await,
+                ServerTls::Custom(tls) => {
+                    let mut config = (*server.server).clone();
+                    config.crypto = Arc::new(
+                        quinn::crypto::rustls::QuicServerConfig::try_from(Arc::new(*tls)).unwrap(),
+                    );
+                    let connection = incoming.incoming.accept_with(Arc::new(config))?.await?;
+                    Ok(QuicConnection::new(connection, incoming.permit))
+                }
+            }
+        })
+    })
+    .await
+}
+
+/// The client configuration `endpoint` builds for a server expected to hold
+/// `server_key`, as `connect` does.
+fn pinned_client_config(
+    endpoint: &QuicEndpoint,
+    server_key: &TransportPublicKey,
+) -> quinn::ClientConfig {
+    let tls = endpoint
+        .identity
+        .client_tls(&PeerKey::of(server_key).unwrap())
+        .unwrap();
+    endpoint.client_config(Arc::new(tls))
+}
+
+/// A client configuration that presents `key` (any raw public key and
+/// signer) and expects the server to hold `server_key`.
+fn client_config_presenting(
+    endpoint: &QuicEndpoint,
+    key: Arc<rustls::sign::CertifiedKey>,
+    server_key: &TransportPublicKey,
+) -> quinn::ClientConfig {
+    let tls = config::tls_client_config(
+        key,
+        Arc::new(PinnedServerKey::new(&PeerKey::of(server_key).unwrap())),
+    )
+    .unwrap();
+    endpoint.client_config(Arc::new(tls))
+}
+
+/// A server configuration that presents `key` and expects the client to
+/// hold `client_key`.
+fn server_tls_presenting(
+    key: Arc<rustls::sign::CertifiedKey>,
+    client_key: &TransportPublicKey,
+) -> rustls::ServerConfig {
+    config::rustls_server_config(
+        key,
+        Arc::new(PinnedClientKey::new(&PeerKey::of(client_key).unwrap())),
+    )
+    .unwrap()
+}
+
+/// A raw public key of `claimed` signed by `signer`'s secret: an impostor
+/// claiming another node's key without holding it.
+fn claimed_key(
+    claimed: &TransportPublicKey,
+    signer: &TransportKeypair,
+) -> Arc<rustls::sign::CertifiedKey> {
+    Arc::new(rustls::sign::CertifiedKey::new(
+        vec![rustls::pki_types::CertificateDer::from(spki_of(claimed))],
+        Arc::new(super::identity::XeddsaSigningKey::new(signer).unwrap()),
+    ))
+}
+
+/// The handshake was refused. The server's side always fails. The client's
+/// fails too when it refused the server; when the SERVER refused the
+/// client, TLS 1.3 lets the client finish its side first (it sends its
+/// Finished without waiting for a verdict on its key), so `connect` may
+/// return a connection, which the server's CONNECTION_CLOSE then ends
+/// before any stream: the test drives it until it closes and requires that
+/// the peer closed it.
+/// `client_refused_server` says which side refused: when the client did,
+/// its side must fail outright.
+async fn assert_refused(
+    time: &VirtualTime,
+    outcome: Outcome,
+    client_refused_server: bool,
+    what: &str,
+) {
+    let (client, server) = outcome;
+    assert!(
+        server.is_err(),
+        "{what}: the server side completed: {server:?}"
+    );
+    match client {
+        Err(QuicConnectError::Connection(_)) => {}
+        Ok(_) if client_refused_server => {
+            panic!("{what}: the client accepted the server's key")
+        }
+        Err(other) => panic!("{what}: the client failed before the handshake: {other:?}"),
+        Ok(connection) => {
+            let inner = connection.inner().clone();
+            let reason = drive(time, Duration::from_secs(60), async move {
+                inner.closed().await
+            })
+            .await;
+            assert!(
+                matches!(reason, quinn::ConnectionError::ConnectionClosed(_)),
+                "{what}: the client's connection ended by {reason:?}, not by the server"
+            );
+        }
+    }
+}
+
+/// With the keys each side expects, the handshake completes in both
+/// directions over one pair of endpoints, and each side sees the other's
+/// converted transport key. Every refusal test below uses the same setup,
+/// so they fail because of the key and not the setup.
+#[test]
+fn handshakes_with_the_expected_keys_succeed_both_ways() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let pair = pair(
+            "quic-identity-ok",
+            "10.201.21.1:5000".parse().unwrap(),
+            "10.201.21.2:5000".parse().unwrap(),
+            None,
+        )
+        .await;
+        for (client, server, client_keys, server_keys, server_addr, client_addr) in [
+            (
+                &pair.a,
+                &pair.b,
+                &pair.a_keys,
+                &pair.b_keys,
+                pair.b_addr,
+                pair.a_addr,
+            ),
+            (
+                &pair.b,
+                &pair.a,
+                &pair.b_keys,
+                &pair.a_keys,
+                pair.a_addr,
+                pair.b_addr,
+            ),
+        ] {
+            let _permit = server
+                .allow_peer(client_addr, client_keys.public())
+                .unwrap();
+            let (client_conn, server_conn) = attempt(
+                &pair.time,
+                client,
+                server,
+                server_addr,
+                pinned_client_config(client, server_keys.public()),
+                ServerTls::Pinned,
+            )
+            .await;
+            let (client_conn, server_conn) = (client_conn.unwrap(), server_conn.unwrap());
+            let presented = |conn: &QuicConnection| {
+                conn.inner()
+                    .peer_identity()
+                    .unwrap()
+                    .downcast::<Vec<rustls::pki_types::CertificateDer<'static>>>()
+                    .unwrap()[0]
+                    .to_vec()
+            };
+            assert_eq!(presented(&client_conn), spki_of(server_keys.public()));
+            assert_eq!(presented(&server_conn), spki_of(client_keys.public()));
+        }
+    })
+}
+
+/// A client that expects another key than the server holds refuses the
+/// server, and the server's side fails too.
+#[test]
+fn a_server_without_the_expected_key_is_refused() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let pair = pair(
+            "quic-identity-wrong-server",
+            "10.201.22.1:5000".parse().unwrap(),
+            "10.201.22.2:5000".parse().unwrap(),
+            None,
+        )
+        .await;
+        let _permit = pair.b.allow_peer(pair.a_addr, &pair.a_key()).unwrap();
+        let someone_else = TransportKeypair::new();
+        let outcome = attempt(
+            &pair.time,
+            &pair.a,
+            &pair.b,
+            pair.b_addr,
+            pinned_client_config(&pair.a, someone_else.public()),
+            ServerTls::Pinned,
+        )
+        .await;
+        assert_refused(&pair.time, outcome, true, "wrong expected server key").await;
+        // `connect`, the node's path, refuses it the same way.
+        let (a, b, b_addr) = (pair.a.clone(), pair.b.clone(), pair.b_addr);
+        let key = someone_else.public().clone();
+        let outcome = drive(&pair.time, Duration::from_secs(60), async move {
+            tokio::join!(a.connect(b_addr, &key), async {
+                b.accept().await.expect("an attempt").establish().await
+            })
+        })
+        .await;
+        assert_refused(
+            &pair.time,
+            outcome,
+            true,
+            "connect with a wrong expected server key",
+        )
+        .await;
+    })
+}
+
+/// A server that was told to expect another key than the client holds
+/// refuses the client.
+#[test]
+fn a_client_without_the_expected_key_is_refused() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let pair = pair(
+            "quic-identity-wrong-client",
+            "10.201.23.1:5000".parse().unwrap(),
+            "10.201.23.2:5000".parse().unwrap(),
+            None,
+        )
+        .await;
+        let someone_else = TransportKeypair::new();
+        let _permit = pair
+            .b
+            .allow_peer(pair.a_addr, someone_else.public())
+            .unwrap();
+        let outcome = attempt(
+            &pair.time,
+            &pair.a,
+            &pair.b,
+            pair.b_addr,
+            pinned_client_config(&pair.a, pair.b_keys.public()),
+            ServerTls::Pinned,
+        )
+        .await;
+        assert_refused(&pair.time, outcome, false, "wrong client key").await;
+    })
+}
+
+/// A plain Ed25519 raw public key (one not converted from any transport
+/// key, signed by ring's own Ed25519) is refused on either side.
+#[test]
+fn a_foreign_ed25519_key_is_refused_on_either_side() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let pair = pair(
+            "quic-identity-foreign",
+            "10.201.24.1:5000".parse().unwrap(),
+            "10.201.24.2:5000".parse().unwrap(),
+            None,
+        )
+        .await;
+        let _permit = pair.b.allow_peer(pair.a_addr, &pair.a_key()).unwrap();
+        let foreign = TestIdentity::generate();
+        let outcome = attempt(
+            &pair.time,
+            &pair.a,
+            &pair.b,
+            pair.b_addr,
+            pinned_client_config(&pair.a, pair.b_keys.public()),
+            ServerTls::Custom(Box::new(server_tls_presenting(
+                foreign.key.clone(),
+                pair.a_keys.public(),
+            ))),
+        )
+        .await;
+        assert_refused(&pair.time, outcome, true, "server with a foreign key").await;
+        let outcome = attempt(
+            &pair.time,
+            &pair.a,
+            &pair.b,
+            pair.b_addr,
+            client_config_presenting(&pair.a, foreign.key.clone(), pair.b_keys.public()),
+            ServerTls::Pinned,
+        )
+        .await;
+        assert_refused(&pair.time, outcome, false, "client with a foreign key").await;
+    })
+}
+
+/// A man in the middle M, with its own transport key, between a and b,
+/// cannot complete either leg. Toward a (which expects b's key) it fails
+/// presenting its own key, and presenting b's key it cannot sign as b.
+/// Toward b (which expects a's key from the address M uses) it fails
+/// presenting its own key, and presenting a's key it cannot sign as a.
+#[test]
+fn a_man_in_the_middle_with_its_own_key_fails_both_legs() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let pair = pair(
+            "quic-identity-mitm",
+            "10.201.25.1:5000".parse().unwrap(),
+            "10.201.25.2:5000".parse().unwrap(),
+            None,
+        )
+        .await;
+        let m_addr: SocketAddr = "10.201.25.3:5000".parse().unwrap();
+        register_address_network(m_addr, &pair.network);
+        let m_socket = Arc::new(DemuxSocket::wrap(
+            SimulationSocket::bind(m_addr).await.unwrap(),
+            None,
+        ));
+        let _m_pump = pump(m_socket.clone());
+        let m_keys = TransportKeypair::new();
+        let m =
+            QuicEndpoint::bind(m_socket, m_addr, pair.time.clone(), &settings(), &m_keys).unwrap();
+
+        // Leg to a: a dials M believing it is b.
+        let _permit = m.allow_peer(pair.a_addr, &pair.a_key()).unwrap();
+        let outcome = attempt(
+            &pair.time,
+            &pair.a,
+            &m,
+            m_addr,
+            pinned_client_config(&pair.a, pair.b_keys.public()),
+            ServerTls::Pinned,
+        )
+        .await;
+        assert_refused(&pair.time, outcome, true, "M toward a with its own key").await;
+        let outcome = attempt(
+            &pair.time,
+            &pair.a,
+            &m,
+            m_addr,
+            pinned_client_config(&pair.a, pair.b_keys.public()),
+            ServerTls::Custom(Box::new(server_tls_presenting(
+                claimed_key(pair.b_keys.public(), &m_keys),
+                pair.a_keys.public(),
+            ))),
+        )
+        .await;
+        assert_refused(&pair.time, outcome, true, "M toward a claiming b's key").await;
+
+        // Leg to b: b expects a's key from M's address.
+        let _permit = pair.b.allow_peer(m_addr, &pair.a_key()).unwrap();
+        let outcome = attempt(
+            &pair.time,
+            &m,
+            &pair.b,
+            pair.b_addr,
+            pinned_client_config(&m, pair.b_keys.public()),
+            ServerTls::Pinned,
+        )
+        .await;
+        assert_refused(&pair.time, outcome, false, "M toward b with its own key").await;
+        let outcome = attempt(
+            &pair.time,
+            &m,
+            &pair.b,
+            pair.b_addr,
+            client_config_presenting(
+                &m,
+                claimed_key(pair.a_keys.public(), &m_keys),
+                pair.b_keys.public(),
+            ),
+            ServerTls::Pinned,
+        )
+        .await;
+        assert_refused(&pair.time, outcome, false, "M toward b claiming a's key").await;
+    })
+}
+
+/// `allow_peer` keeps one key per address: a second permit for the same
+/// key is fine, another key is refused while the first is held, and the
+/// address takes a new key once every permit is gone.
+#[test]
+fn an_allowed_address_keeps_its_key_until_released() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let pair = pair(
+            "quic-identity-permits",
+            "10.201.26.1:5000".parse().unwrap(),
+            "10.201.26.2:5000".parse().unwrap(),
+            None,
+        )
+        .await;
+        let other = TransportKeypair::new();
+        let first = pair.b.allow_peer(pair.a_addr, &pair.a_key()).unwrap();
+        let second = pair.b.allow_peer(pair.a_addr, &pair.a_key()).unwrap();
+        assert!(matches!(
+            pair.b.allow_peer(pair.a_addr, other.public()),
+            Err(QuicAllowError::KeyConflict)
+        ));
+        // The refused call left the address allowed with a's key.
+        assert_eq!(
+            pair.b.expected_clients.get(pair.a_addr),
+            Some(PeerKey::of(pair.a_keys.public()).unwrap())
+        );
+        drop(first);
+        assert!(pair.b_socket.is_quic_source_allowed(pair.a_addr));
+        assert!(pair.b.expected_clients.get(pair.a_addr).is_some());
+        drop(second);
+        assert!(!pair.b_socket.is_quic_source_allowed(pair.a_addr));
+        assert!(pair.b.expected_clients.get(pair.a_addr).is_none());
+        let _third = pair.b.allow_peer(pair.a_addr, other.public()).unwrap();
+        assert_eq!(
+            pair.b.expected_clients.get(pair.a_addr),
+            Some(PeerKey::of(other.public()).unwrap())
         );
     })
 }
@@ -724,20 +1152,11 @@ fn a_dual_stack_endpoint_talks_to_an_ipv4_peer() {
         let v4_bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), v4_port);
         let _pumps = [pump(v6_socket.clone()), pump(v4_socket.clone())];
         let time = RealTime::new();
-        let dual = QuicEndpoint::bind(v6_socket, v6_bind, time.clone(), &settings()).unwrap();
-        let v4 = QuicEndpoint::bind(v4_socket, v4_bind, time, &settings()).unwrap();
-        let dual_id = TestIdentity::generate();
-        let v4_id = TestIdentity::generate();
-        for (endpoint, id) in [(&dual, &dual_id), (&v4, &v4_id)] {
-            endpoint.set_server_config(endpoint.server_config(Arc::new(
-                config::tls_server_config(id.key.clone(), Arc::new(AcceptAnyClientKey)).unwrap(),
-            )));
-        }
-        let client_config = |endpoint: &QuicEndpoint, id: &TestIdentity| {
-            endpoint.client_config(Arc::new(
-                config::tls_client_config(id.key.clone(), Arc::new(AcceptAnyServerKey)).unwrap(),
-            ))
-        };
+        let dual_keys = TransportKeypair::new();
+        let v4_keys = TransportKeypair::new();
+        let dual =
+            QuicEndpoint::bind(v6_socket, v6_bind, time.clone(), &settings(), &dual_keys).unwrap();
+        let v4 = QuicEndpoint::bind(v4_socket, v4_bind, time, &settings(), &v4_keys).unwrap();
         let dual_at = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), v6_port);
         async fn within<F: std::future::Future>(
             f: F,
@@ -746,9 +1165,9 @@ fn a_dual_stack_endpoint_talks_to_an_ipv4_peer() {
         }
 
         // The IPv4 peer connects to the dual-stack endpoint.
-        let _permit = dual.allow_peer(v4_bind).unwrap();
+        let _permit = dual.allow_peer(v4_bind, v4_keys.public()).unwrap();
         let (client, server) = within(async {
-            tokio::join!(v4.connect(dual_at, client_config(&v4, &v4_id)), async {
+            tokio::join!(v4.connect(dual_at, dual_keys.public()), async {
                 dual.accept().await.expect("an attempt").establish().await
             })
         })
@@ -764,12 +1183,11 @@ fn a_dual_stack_endpoint_talks_to_an_ipv4_peer() {
         drop((client, server));
 
         // The dual-stack endpoint connects to the IPv4 peer.
-        let _permit = v4.allow_peer(dual_at).unwrap();
+        let _permit = v4.allow_peer(dual_at, dual_keys.public()).unwrap();
         let (client, server) = within(async {
-            tokio::join!(
-                dual.connect(v4_bind, client_config(&dual, &dual_id)),
-                async { v4.accept().await.expect("an attempt").establish().await }
-            )
+            tokio::join!(dual.connect(v4_bind, v4_keys.public()), async {
+                v4.accept().await.expect("an attempt").establish().await
+            })
         })
         .await
         .expect("handshake within 20 s");
@@ -919,9 +1337,13 @@ fn transport_config_pins_every_value() {
 #[test]
 fn client_config_pins_every_value() {
     let _seed = GlobalRng::seed_guard(SEED);
-    let identity = TestIdentity::generate();
-    let crypto =
-        Arc::new(config::tls_client_config(identity.key, Arc::new(AcceptAnyServerKey)).unwrap());
+    let keys = TransportKeypair::new();
+    let identity = QuicIdentity::new(&keys).unwrap();
+    let crypto = Arc::new(
+        identity
+            .client_tls(&PeerKey::of(TransportKeypair::new().public()).unwrap())
+            .unwrap(),
+    );
     let client = config::client_config(
         crypto,
         Arc::new(config::transport_config(&settings(), &VirtualTime::new())),
@@ -942,9 +1364,13 @@ fn client_config_pins_every_value() {
 #[test]
 fn server_config_pins_every_value() {
     let _seed = GlobalRng::seed_guard(SEED);
-    let identity = TestIdentity::generate();
-    let crypto =
-        Arc::new(config::tls_server_config(identity.key, Arc::new(AcceptAnyClientKey)).unwrap());
+    let keys = TransportKeypair::new();
+    let identity = QuicIdentity::new(&keys).unwrap();
+    let crypto = Arc::new(
+        identity
+            .server_tls(&PeerKey::of(TransportKeypair::new().public()).unwrap())
+            .unwrap(),
+    );
     let server = config::server_config(
         crypto,
         Arc::new(config::transport_config(&settings(), &VirtualTime::new())),
@@ -987,11 +1413,18 @@ fn server_config_pins_every_value() {
 #[test]
 fn tls_configs_pin_every_value() {
     let _seed = GlobalRng::seed_guard(SEED);
-    let identity = TestIdentity::generate();
-    let server =
-        config::rustls_server_config(identity.key.clone(), Arc::new(AcceptAnyClientKey)).unwrap();
-    let client =
-        config::rustls_client_config(identity.key.clone(), Arc::new(AcceptAnyServerKey)).unwrap();
+    let identity = QuicIdentity::new(&TransportKeypair::new()).unwrap();
+    let peer = PeerKey::of(TransportKeypair::new().public()).unwrap();
+    let server = config::rustls_server_config(
+        identity.certified_key(),
+        Arc::new(PinnedClientKey::new(&peer)),
+    )
+    .unwrap();
+    let client = config::rustls_client_config(
+        identity.certified_key(),
+        Arc::new(PinnedServerKey::new(&peer)),
+    )
+    .unwrap();
     // TLS 1.3 only: QUIC carries nothing else (RFC 9001 section 4.2),
     // rustls's QUIC mode refuses other versions, and the builders are given
     // only TLS13. The provider is ring's.
@@ -1023,8 +1456,9 @@ fn tls_configs_pin_every_value() {
     assert!(client.cert_compressors.is_empty());
     assert!(client.cert_decompressors.is_empty());
     // quinn accepts both (TLS 1.3 with its initial suite).
-    assert!(config::tls_server_config(identity.key.clone(), Arc::new(AcceptAnyClientKey)).is_ok());
-    assert!(config::tls_client_config(identity.key, Arc::new(AcceptAnyServerKey)).is_ok());
+    assert!(identity.server_tls(&peer).is_ok());
+    assert!(identity.client_tls(&peer).is_ok());
+    assert!(identity.refusing_server_tls().is_ok());
 }
 
 /// The window is 5% of memory split over every connection's receive and
@@ -1514,10 +1948,13 @@ fn a_short_header_packet_with_a_forged_id_gets_no_reply() {
                 endpoint_addr,
                 time.clone(),
                 &settings(),
+                &TransportKeypair::new(),
                 config::endpoint_config_with_cid_key(key),
             )
             .unwrap();
-            let _permit = endpoint.allow_peer(prober_addr).unwrap();
+            let _permit = endpoint
+                .allow_peer(prober_addr, TransportKeypair::new().public())
+                .unwrap();
             if forged {
                 let last = valid.len() - 1;
                 valid[last] ^= 1;
@@ -1635,7 +2072,7 @@ fn connect_with_a_full_allow_set_fails_and_leaks_nothing() {
                     .expect("room")
             })
             .collect();
-        let result = pair.a.connect(pair.b_addr, pair.client_config()).await;
+        let result = pair.a.connect(pair.b_addr, &pair.b_key()).await;
         assert!(
             matches!(result, Err(QuicConnectError::AllowSetFull)),
             "{result:?}"
@@ -1667,11 +2104,10 @@ fn accept_ignores_an_attempt_whose_source_was_released() {
             None,
         )
         .await;
-        let permit = pair.b.allow_peer(pair.a_addr).unwrap();
-        let a = clone_endpoint(&pair.a);
-        let (b_addr, client_config) = (pair.b_addr, pair.client_config());
-        let connecting =
-            tokio::spawn(async move { a.connect(b_addr, client_config).await.map(|_| ()) });
+        let permit = pair.b.allow_peer(pair.a_addr, &pair.a_key()).unwrap();
+        let a = pair.a.clone();
+        let (b_addr, b_key) = (pair.b_addr, pair.b_key());
+        let connecting = tokio::spawn(async move { a.connect(b_addr, &b_key).await.map(|_| ()) });
         // The client's Initial reaches b's queue, then the expectation ends.
         for _ in 0..64 {
             tokio::task::yield_now().await;
@@ -1683,7 +2119,7 @@ fn accept_ignores_an_attempt_whose_source_was_released() {
             "the client's Initial reached b's ingress queue before the permit was dropped"
         );
         drop(permit);
-        let b = clone_endpoint(&pair.b);
+        let b = pair.b.clone();
         let time = pair.time.clone();
         let accepted = drive(&pair.time, Duration::from_secs(60), async move {
             tokio::select! {
@@ -1719,10 +2155,13 @@ fn a_failed_bind_leaves_the_node_running_without_quic() {
             SimulationSocket::bind(addr).await.unwrap(),
             None,
         ));
-        let _first = QuicEndpoint::bind(socket.clone(), addr, time.clone(), &settings()).unwrap();
-        let err = QuicEndpoint::bind(socket.clone(), addr, time.clone(), &settings()).unwrap_err();
+        let keys = TransportKeypair::new();
+        let _first =
+            QuicEndpoint::bind(socket.clone(), addr, time.clone(), &settings(), &keys).unwrap();
+        let err =
+            QuicEndpoint::bind(socket.clone(), addr, time.clone(), &settings(), &keys).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
-        assert!(QuicEndpoint::bind_or_warn(socket, addr, time, &settings()).is_none());
+        assert!(QuicEndpoint::bind_or_warn(socket, addr, time, &settings(), &keys).is_none());
         unregister_network_time_source(network);
     });
 }

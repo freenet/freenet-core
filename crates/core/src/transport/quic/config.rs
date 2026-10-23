@@ -42,9 +42,6 @@ pub(crate) const QUIC_VERSION: u32 = 1;
 
 /// The ALPN protocol both sides must offer. A peer offering anything else
 /// fails the handshake.
-// The TLS builders that use it are called by tests until peers have QUIC
-// identities (#5940 step c3).
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const ALPN: &[u8] = b"freenet-quic/1";
 
 /// The server name quinn requires for a connection attempt. With SNI off it
@@ -283,17 +280,14 @@ pub(crate) fn client_config(
 }
 
 /// The rustls settings both sides share: the ring provider, TLS 1.3 only.
-// The TLS builders below are called by tests until peers have QUIC
-// identities (#5940 step c3); the node builds no TLS configuration yet.
-#[cfg_attr(not(test), allow(dead_code))]
 fn provider() -> Arc<rustls::crypto::CryptoProvider> {
     Arc::new(rustls::crypto::ring::default_provider())
 }
 
 /// The TLS server configuration: TLS 1.3 only with the ring provider, the
 /// raw public key in `key`, peers checked by `verifier`, the fixed ALPN, and
-/// no session resumption, tickets or early data.
-#[cfg_attr(not(test), allow(dead_code))]
+/// no session resumption, tickets or early data. `identity` builds the key
+/// and the verifiers.
 pub(crate) fn tls_server_config(
     key: Arc<rustls::sign::CertifiedKey>,
     verifier: Arc<dyn rustls::server::danger::ClientCertVerifier>,
@@ -305,7 +299,6 @@ pub(crate) fn tls_server_config(
 }
 
 /// The rustls half of [`tls_server_config`].
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn rustls_server_config(
     key: Arc<rustls::sign::CertifiedKey>,
     verifier: Arc<dyn rustls::server::danger::ClientCertVerifier>,
@@ -327,8 +320,8 @@ pub(crate) fn rustls_server_config(
 
 /// The TLS client configuration: TLS 1.3 only with the ring provider, the
 /// raw public key in `key`, the server checked by `verifier`, the fixed
-/// ALPN, no SNI, and no session resumption or early data.
-#[cfg_attr(not(test), allow(dead_code))]
+/// ALPN, no SNI, and no session resumption or early data. `identity` builds
+/// the key and the verifier.
 pub(crate) fn tls_client_config(
     key: Arc<rustls::sign::CertifiedKey>,
     verifier: Arc<dyn rustls::client::danger::ServerCertVerifier>,
@@ -340,7 +333,6 @@ pub(crate) fn tls_client_config(
 }
 
 /// The rustls half of [`tls_client_config`].
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn rustls_client_config(
     key: Arc<rustls::sign::CertifiedKey>,
     verifier: Arc<dyn rustls::client::danger::ServerCertVerifier>,
@@ -363,7 +355,6 @@ pub(crate) fn rustls_client_config(
 
 /// A TLS configuration quinn or rustls rejected.
 #[derive(Debug, thiserror::Error)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) enum TlsConfigError {
     #[error(transparent)]
     Rustls(#[from] rustls::Error),

@@ -680,12 +680,12 @@ it must not wait unless it is a pacing point.
 `transport-quic` (config key, `off` by default, or `prefer`) decides whether
 `bind_udp_listener` builds a quinn endpoint over the DemuxSocket. Off: no
 endpoint, no QUIC ingress, nothing changes. Prefer: the endpoint is built
-with NO server configuration and an EMPTY allow-set, so nothing reaches it
-and it sends nothing; the listener holds it. Peer identity (c3) and
-upgrading a UDP session to QUIC come later, so only tests open QUIC
-connections. An unknown value is off with a warning, never an error: a
-crash-loop rollback reinstalls an older binary, which must start with a value
-a later release wrote, and keeps it in config.toml.
+with the node's QUIC identity (below) and an EMPTY allow-set, so nothing
+reaches it and it sends nothing; the listener holds it. Upgrading a UDP
+session to QUIC comes later, so only tests open QUIC connections. An unknown
+value is off with a warning, never an error: a crash-loop rollback
+reinstalls an older binary, which must start with a value a later release
+wrote, and keeps it in config.toml.
 
 ```
 QuicSocket (quic/socket.rs) is quinn's AsyncUdpSocket:
@@ -741,8 +741,48 @@ back the next. QUIC integration tests run under a watchdog thread
 
 In tests, two endpoints on SimulationSocket with one VirtualTime and a
 seeded GlobalRng repeat the same event trace; the bytes differ, because
-rustls's key exchange uses ring's OS RNG. The TLS identities in
-`quic/test_tls.rs` accept ANY Ed25519 raw public key and are test-only.
+rustls's key exchange and the XEdDSA nonce use the OS RNG.
+`quic/test_tls.rs` holds only a plain Ed25519 identity for tests where a
+peer presents a key that is not its transport key.
+
+#### QUIC identity (`transport/quic/identity.rs`, #5940 step c3)
+
+```
+A node authenticates in the TLS 1.3 handshake with a raw public key
+(RFC 7250) made from its EXISTING X25519 transport key. No new key, no file,
+no extra message, no exporter proof.
+  → Signing: XEdDSA (Signal's spec, the `xeddsa` crate) with the X25519
+    secret, as Ed25519 (scheme 0x0807). Nonce randomness from the OS
+    (SysRng), NEVER GlobalRng (code-style.md OsRng exception). Debug of the
+    signing key, signer and identity shows the public key only.
+  → Presented key: the Edwards form of the X25519 public key with SIGN BIT 0,
+    in an Ed25519 SubjectPublicKeyInfo. Sign bit 0 is XEdDSA's convention:
+    the signer negates its scalar when its natural Edwards key has sign 1.
+    Bit 255 of the X25519 key is ignored (RFC 7748), u = -1 has no Edwards
+    form and is refused (UnusableKey).
+  → Verification is PINNED to the key the caller expects: the presented
+    SPKI must equal the expected key's exactly (constant-time compare, no
+    chain), the scheme must be Ed25519, and the signature is checked with
+    ring against the EXPECTED key. Anything else fails the handshake.
+  → Client: connect(addr, &expected_server_key) builds TLS pinned to it.
+  → Server: allow_peer(addr, &expected_client_key) puts the address on the
+    allow-set AND records the key (QuicPeerPermit; a second key for an
+    address already held is KeyConflict). accept() looks the key up by the
+    attempt's (normalized) address and accepts with a per-attempt server
+    config whose TLS is pinned to it (Incoming::accept_with); an attempt
+    with no recorded key is ignored. The endpoint's own server config
+    (needed so quinn passes Initials to accept) refuses every client.
+  → When the SERVER refuses the client, the client may see connect()
+    succeed: TLS 1.3 lets it finish before the server's verdict, and the
+    server's CONNECTION_CLOSE ends the connection at once. The server never
+    gets a connection from an unexpected key.
+Tests: conversion vs curve25519-dalek 5 (random keys, bit 255 set, u = -1),
+signer key == verifier key over many keypairs with both natural sign bits,
+signatures verified by ed25519-dalek and refused with any bit flipped,
+nonce differs under one GlobalRng seed, handshakes in both directions, and
+refusal of a wrong server key, a wrong client key, a plain Ed25519 key on
+either side, and a man in the middle with its own key on either leg.
+```
 
 ### WHEN testing transport code
 
