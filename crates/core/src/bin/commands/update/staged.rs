@@ -755,7 +755,9 @@ fn record_failure(root: &Path, version: &str, error: &str, now: SystemTime) -> O
 }
 
 /// Record a failure before an exit that leaves the download (or the install)
-/// to the updater, which systemd may kill before it records anything.
+/// to the updater, which systemd may kill before it records anything. The
+/// record is provisional: the updater's outcome for this attempt replaces it
+/// rather than counting the attempt twice.
 fn exit_after_recording(
     root: &Path,
     version: &str,
@@ -763,7 +765,10 @@ fn exit_after_recording(
     staging: Staging,
     now: SystemTime,
 ) -> Staging {
-    record_failure(root, version, reason, now);
+    if let Some(dir) = root.parent() {
+        let rand_unit = freenet::config::GlobalRng::random_range(0.0_f64..1.0);
+        super::super::rollback::record_provisional_failure_at(dir, version, reason, now, rand_unit);
+    }
     staging
 }
 
@@ -2487,8 +2492,28 @@ mod tests {
         assert!(outcome.preparation().should_exit());
         let release = release_listing(&[MANIFEST, &freenet]);
         assert!(load_at(root.as_path(), &release, &unsigned).await.is_some());
-        // Recorded before the exit; the install clears it.
-        assert_eq!(cooldown(&root).unwrap().last_error, INSTALL_PENDING);
+        // Recorded before the exit, provisionally; the install clears it.
+        let record = cooldown(&root).unwrap();
+        assert_eq!(
+            (record.last_error.as_str(), record.failures),
+            (INSTALL_PENDING, 1)
+        );
+        assert!(record.provisional);
+        // An updater that then fails this install replaces the record at the
+        // same count: one attempt, one failure.
+        let mut out = Vec::new();
+        super::super::note_install_failure_at(
+            root.parent(),
+            "9.9.9",
+            "the install failed",
+            SystemTime::now(),
+            &mut out,
+        );
+        let record = cooldown(&root).unwrap();
+        assert_eq!(
+            (record.last_error.as_str(), record.failures),
+            ("the install failed", 1)
+        );
     }
 
     #[tokio::test]

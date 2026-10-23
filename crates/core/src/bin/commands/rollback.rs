@@ -1104,6 +1104,11 @@ pub(crate) struct UpdateCooldownState {
     /// latest write was such a hold.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hold_reason: Option<String>,
+    /// Written by the node as it exits for the updater: the attempt is
+    /// counted in case the updater never reports, and the updater's own
+    /// outcome for the same attempt replaces it rather than counting again.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub provisional: bool,
 }
 
 /// The wait after the `failures`-th consecutive failure, given a uniform
@@ -1162,6 +1167,7 @@ fn write_update_cooldown_at(
                 .saturating_add(update_cooldown_delay(failures, rand_unit).as_secs()),
             last_error: bounded(error),
             hold_reason: hold_reason.map(bounded),
+            provisional: false,
         },
     )
 }
@@ -1190,6 +1196,10 @@ fn store_update_cooldown_at(dir: &Path, state: &UpdateCooldownState) -> bool {
 /// `None` when it could not be written. Callers then exit for the update (fail
 /// open): an unrecorded failure would never count toward the fallback, and the
 /// node could stay on its old binary for good.
+///
+/// A failure for the release of a provisional record (see
+/// [`record_provisional_failure_at`]) is that same attempt's outcome: it
+/// replaces the record at its count instead of counting again.
 pub(crate) fn record_update_failure_at(
     dir: &Path,
     version: &str,
@@ -1197,13 +1207,51 @@ pub(crate) fn record_update_failure_at(
     now: SystemTime,
     rand_unit: f64,
 ) -> Option<u32> {
+    record_failure_with(dir, version, error, (now, rand_unit), false)
+}
+
+/// [`record_update_failure_at`] for the node exiting for the updater: the
+/// attempt counts now, in case the updater is killed before it reports, and
+/// the record is marked provisional so the updater's outcome replaces it.
+pub(crate) fn record_provisional_failure_at(
+    dir: &Path,
+    version: &str,
+    error: &str,
+    now: SystemTime,
+    rand_unit: f64,
+) -> Option<u32> {
+    record_failure_with(dir, version, error, (now, rand_unit), true)
+}
+
+fn record_failure_with(
+    dir: &Path,
+    version: &str,
+    error: &str,
+    (now, rand_unit): (SystemTime, f64),
+    provisional: bool,
+) -> Option<u32> {
     with_record_lock(dir, || {
         let failures = match read_update_cooldown_at(dir) {
+            // The updater reporting on the attempt the node already counted.
+            Some(prev) if prev.version == version && prev.provisional && !provisional => {
+                live_failures(&prev, now).max(1)
+            }
             Some(prev) if prev.version == version => live_failures(&prev, now).saturating_add(1),
             _ => 1,
         };
-        write_update_cooldown_at(dir, version, failures, (error, None), now, rand_unit)
-            .then_some(failures)
+        let written =
+            write_update_cooldown_at(dir, version, failures, (error, None), now, rand_unit)
+                && (!provisional
+                    || read_update_cooldown_at(dir).is_some_and(|state| {
+                        store_update_cooldown_at(
+                            dir,
+                            &UpdateCooldownState {
+                                provisional: true,
+                                ..state
+                            },
+                        )
+                    }));
+        written.then_some(failures)
     })
 }
 
@@ -1376,6 +1424,7 @@ pub(crate) fn hold_update_until_at(
                         .take(UPDATE_COOLDOWN_ERROR_MAX_CHARS)
                         .collect(),
                 ),
+                provisional: false,
             },
         );
     });
@@ -3316,6 +3365,50 @@ pub(crate) mod tests {
         assert!(STALE_TEMP_AGE >= std::time::Duration::from_secs(3600));
     }
 
+    /// One attempt is one failure: the updater's outcome for an attempt the
+    /// node counted as it exited replaces that provisional record, while
+    /// separate attempts still add up toward the fallback.
+    #[test]
+    fn the_updater_s_outcome_replaces_the_node_s_provisional_count() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let now = SystemTime::now();
+        let failures = |dir: &Path| read_update_cooldown_at(dir).unwrap();
+        assert_eq!(
+            record_provisional_failure_at(dir, "0.2.141", "exited", now, 0.5),
+            Some(1)
+        );
+        assert!(failures(dir).provisional);
+        assert_eq!(
+            record_update_failure_at(dir, "0.2.141", "updater failed", now, 0.5),
+            Some(1),
+            "the same attempt"
+        );
+        let record = failures(dir);
+        assert!(!record.provisional);
+        assert_eq!(record.last_error, "updater failed");
+        // The next attempt counts.
+        assert_eq!(
+            record_provisional_failure_at(dir, "0.2.141", "exited", now, 0.5),
+            Some(2)
+        );
+        assert_eq!(
+            record_update_failure_at(dir, "0.2.141", "updater failed", now, 0.5),
+            Some(2)
+        );
+        // A failure with no provisional record before it counts as usual.
+        assert_eq!(
+            record_update_failure_at(dir, "0.2.141", "again", now, 0.5),
+            Some(3)
+        );
+        // A provisional record for another release is not this attempt.
+        record_provisional_failure_at(dir, "0.2.142", "exited", now, 0.5);
+        assert_eq!(
+            record_update_failure_at(dir, "0.2.141", "updater failed", now, 0.5),
+            Some(1)
+        );
+    }
+
     /// A cooldown for a release this node has blocked (#4073) holds no
     /// trigger, so a fixed release is found promptly.
     #[test]
@@ -3428,6 +3521,7 @@ pub(crate) mod tests {
             retry_at_unix: 0,
             last_error: "earlier".to_string(),
             hold_reason: None,
+            provisional: false,
         };
         let write = |record: &UpdateCooldownState| {
             std::fs::write(
