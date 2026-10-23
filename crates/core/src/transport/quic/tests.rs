@@ -154,7 +154,8 @@ where
             .expect("test runtime");
         let outcome =
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| runtime.block_on(test())));
-        let _ = done.send(outcome);
+        // The receiver is gone only if the watchdog already failed the test.
+        done.send(outcome).ok();
     });
     match finished.recv_timeout(WATCHDOG) {
         Ok(Ok(())) => {}

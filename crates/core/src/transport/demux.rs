@@ -325,6 +325,7 @@ impl<S> DemuxSocket<S> {
     }
 
     /// Whether QUIC-class datagrams from `addr` currently reach the ingress.
+    #[cfg(test)]
     pub(crate) fn is_quic_source_allowed(&self, addr: SocketAddr) -> bool {
         self.quic.get().is_some_and(|ingress| {
             ingress

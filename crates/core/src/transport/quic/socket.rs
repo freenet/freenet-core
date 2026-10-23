@@ -117,22 +117,22 @@ impl<S: Socket> AsyncUdpSocket for QuicSocket<S> {
         let target = normalize_mapped_addr(transmit.destination);
         let sent = match self.socket.egress_cap() {
             None => self.socket.try_send_to(transmit.contents, target),
-            Some(cap) => match {
-                // One datagram per transmit keeps every take within the burst
-                // (at least 4 datagrams), so the bucket's bound holds exactly
-                // and the take can always be admitted eventually.
+            Some(cap) => {
+                // One datagram per transmit keeps every take within the
+                // burst (at least 4 datagrams), so the bucket's bound holds
+                // exactly and the take can always be admitted eventually.
                 debug_assert!(
                     transmit.contents.len() as u64 <= cap.burst_bytes(),
                     "a {} byte transmit is larger than the egress burst",
                     transmit.contents.len()
                 );
-                cap.try_take(transmit.contents.len(), Duration::ZERO)
-            } {
-                Ok(take) => self
-                    .socket
-                    .try_send_to_paced(transmit.contents, target, take),
-                Err(_) => return Err(io::ErrorKind::WouldBlock.into()),
-            },
+                match cap.try_take(transmit.contents.len(), Duration::ZERO) {
+                    Ok(take) => self
+                        .socket
+                        .try_send_to_paced(transmit.contents, target, take),
+                    Err(_) => return Err(io::ErrorKind::WouldBlock.into()),
+                }
+            }
         };
         match sent {
             Ok(_) => Ok(()),
