@@ -3306,21 +3306,32 @@ pub(crate) mod tests {
     }
 
     /// A holder that never lets go does not block a writer for good: it
-    /// writes anyway (fail open) while the holder still holds the lock, and
-    /// gives up within half a second of real time.
+    /// gives up after RECORD_LOCK_WAIT's worth of polls (counted, not timed,
+    /// so CPU starvation cannot fail it) and writes anyway (fail open) while
+    /// the holder still holds the lock. The wall-clock bound is a generous
+    /// backstop against a wait that never ends.
     #[test]
     #[cfg(unix)]
     fn a_wedged_lock_holder_does_not_block_a_writer() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path();
-        let mut holder = LockHelper::hold(&dir.join(RECORD_LOCK_FILE), Some(5_000));
+        // Held until this test kills it.
+        let mut holder = LockHelper::hold(&dir.join(RECORD_LOCK_FILE), None);
+        let polls = std::rc::Rc::new(std::cell::Cell::new(0u32));
+        let counted = polls.clone();
+        ON_BUSY_RECORD_LOCK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || counted.set(counted.get() + 1)))
+        });
         let started = std::time::Instant::now();
-        assert!(lock_records(dir).is_none(), "the lock stayed busy");
-        let waited = started.elapsed();
-        assert!(
-            waited < std::time::Duration::from_millis(500),
-            "gave up after {waited:?}"
+        let gave_up = lock_records(dir).is_none();
+        ON_BUSY_RECORD_LOCK.with(|hook| *hook.borrow_mut() = None);
+        assert!(gave_up, "the lock stayed busy");
+        assert_eq!(
+            u128::from(polls.get()),
+            RECORD_LOCK_WAIT.as_millis() / 10,
+            "one poll per 10 ms of RECORD_LOCK_WAIT"
         );
+        assert!(started.elapsed() < std::time::Duration::from_secs(30));
         let now = SystemTime::now();
         let written = record_update_failure_at(dir, "0.2.141", "x", now, 0.5);
         assert_eq!(written, Some(1));

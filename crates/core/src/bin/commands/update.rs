@@ -314,20 +314,20 @@ fn install_record(result: &Result<InstallOutcome>) -> InstallRecord {
 /// `freenet update` and a tray "Check for Updates" are charged but never
 /// refused. Without a state directory nothing can be charged, and nothing is
 /// refused either: refusing there would stop updates altogether.
-fn updater_meter_at(
+fn updater_meter_at<'a>(
     dir: Option<&Path>,
     limited: bool,
-    now: std::time::SystemTime,
-) -> Option<staged::ByteMeter<'static>> {
+    clock: staged::Clock<'a>,
+) -> Option<staged::ByteMeter<'a>> {
     let Some(dir) = dir else {
         return Some(staged::ByteMeter::new(u64::MAX));
     };
     let left = if limited {
-        rollback::DOWNLOAD_BYTES_PER_DAY.saturating_sub(rollback::download_bytes_at(dir, now))
+        rollback::DOWNLOAD_BYTES_PER_DAY.saturating_sub(rollback::download_bytes_at(dir, clock()))
     } else {
         u64::MAX
     };
-    (left > 0).then(|| staged::ByteMeter::charged_to(left, dir, &std::time::SystemTime::now))
+    (left > 0).then(|| staged::ByteMeter::charged_to(left, dir, clock))
 }
 
 /// Whether this run's downloads are limited by the byte budget: a run the
@@ -685,7 +685,7 @@ impl UpdateCommand {
         let meter = match updater_meter_at(
             super::auto_update::state_dir().as_deref(),
             budget_limits(self.force, rollback::post_stop_status_present()),
-            std::time::SystemTime::now(),
+            &std::time::SystemTime::now,
         ) {
             Some(meter) => meter,
             None if staged::is_staged(&latest_tag) => staged::ByteMeter::new(0),
@@ -4442,6 +4442,17 @@ done
     /// behaviour rather than source. A verification failure goes to the #4073
     /// gate and never to the cooldown; every other failure cools the release
     /// down carrying its full error chain; an install clears.
+    /// The wall clock at a whole second, read once: tests that compare a
+    /// record's times with their own `now` drive the code with this, so no
+    /// second boundary can fall between two readings.
+    pub(crate) fn fixed_now() -> std::time::SystemTime {
+        let secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs)
+    }
+
     /// A local HTTP server for download tests, and how many requests it
     /// has received.
     pub(crate) struct PartialServer {
@@ -4541,15 +4552,17 @@ done
         use rollback::download_bytes_at;
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path();
-        let now = std::time::SystemTime::now();
+        let now = fixed_now();
+        let clock = move || now;
         let prefix = stalling_server(3_000_000, 100).await;
-        let meter = updater_meter_at(Some(dir), true, now).unwrap();
-        let abandoned = tokio::time::timeout(
-            std::time::Duration::from_millis(500),
+        let meter = updater_meter_at(Some(dir), true, &clock).unwrap();
+        // Killed once the charge lands (it must, before any body byte is
+        // counted); the download is dropped unfinished.
+        run_until(
             download_file(&format!("{prefix}dmg"), &dir.join("dmg"), true, &meter),
+            || download_bytes_at(dir, now) > 0,
         )
         .await;
-        assert!(abandoned.is_err(), "the download was still running");
         assert_eq!(download_bytes_at(dir, now), 3_000_000);
     }
 
@@ -4561,12 +4574,13 @@ done
         use rollback::{DOWNLOAD_BYTES_PER_DAY, charge_download_bytes_at};
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path();
-        let now = std::time::SystemTime::now();
-        assert!(updater_meter_at(Some(dir), true, now).is_some());
+        let now = fixed_now();
+        let clock = move || now;
+        assert!(updater_meter_at(Some(dir), true, &clock).is_some());
         charge_download_bytes_at(dir, DOWNLOAD_BYTES_PER_DAY, now);
-        assert!(updater_meter_at(Some(dir), true, now).is_none());
-        assert!(updater_meter_at(Some(dir), false, now).is_some());
-        assert!(updater_meter_at(None, true, now).is_some());
+        assert!(updater_meter_at(Some(dir), true, &clock).is_none());
+        assert!(updater_meter_at(Some(dir), false, &clock).is_some());
+        assert!(updater_meter_at(None, true, &clock).is_some());
         // Consulted before the asset list is requested.
         let src = include_str!("update.rs");
         let run = &src[src.find("\n    async fn run_async(").unwrap()..];
@@ -4587,10 +4601,11 @@ done
         assert!(!budget_limits(true, true), "--force");
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path();
-        let now = std::time::SystemTime::now();
+        let now = fixed_now();
+        let clock = move || now;
         charge_download_bytes_at(dir, DOWNLOAD_BYTES_PER_DAY, now);
-        assert!(updater_meter_at(Some(dir), budget_limits(false, true), now).is_none());
-        let meter = updater_meter_at(Some(dir), budget_limits(false, false), now)
+        assert!(updater_meter_at(Some(dir), budget_limits(false, true), &clock).is_none());
+        let meter = updater_meter_at(Some(dir), budget_limits(false, false), &clock)
             .expect("a manual run is not refused");
         let server = httptest::Server::run();
         server.expect(
@@ -4616,7 +4631,7 @@ done
     fn a_refused_updater_run_holds_and_says_how_to_override() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path();
-        let now = std::time::SystemTime::now();
+        let now = fixed_now();
         rollback::record_update_failure_at(
             dir,
             "9.9.9",
@@ -4658,7 +4673,7 @@ done
     /// not refuse either: that would stop updates altogether.
     #[test]
     fn no_state_dir_gives_an_unlimited_meter() {
-        let meter = updater_meter_at(None, true, std::time::SystemTime::now()).unwrap();
+        let meter = updater_meter_at(None, true, &std::time::SystemTime::now).unwrap();
         assert!(meter.check().is_ok());
         assert!(meter.spend(1 << 30).is_ok());
         assert!(meter.check().is_ok());
@@ -4725,16 +4740,17 @@ done
         );
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path();
-        let now = std::time::SystemTime::now();
+        let now = fixed_now();
+        let clock = move || now;
         let dest = dir.join("asset");
-        let meter = updater_meter_at(Some(dir), true, now).unwrap();
+        let meter = updater_meter_at(Some(dir), true, &clock).unwrap();
         download_file(&server.url_str("/asset"), &dest, true, &meter)
             .await
             .unwrap();
         assert_eq!(download_bytes_at(dir, now), 1000);
         // 500 bytes left: the download is stopped and the budget is spent.
         charge_download_bytes_at(dir, DOWNLOAD_BYTES_PER_DAY - 1500, now);
-        let meter = updater_meter_at(Some(dir), true, now).unwrap();
+        let meter = updater_meter_at(Some(dir), true, &clock).unwrap();
         let err = download_file(&server.url_str("/asset"), &dest, true, &meter)
             .await
             .unwrap_err();
@@ -4877,7 +4893,7 @@ done
             // list is requested, and a staged copy still installs.
             "letmeter=matchupdater_meter_at(super::auto_update::state_dir().as_deref(),\
              budget_limits(self.force,rollback::post_stop_status_present()),\
-             std::time::SystemTime::now(),){Some(meter)=>meter,\
+             &std::time::SystemTime::now,){Some(meter)=>meter,\
              Noneifstaged::is_staged(&latest_tag)=>staged::ByteMeter::new(0),\
              None=>exit_for_spent_budget(",
         ] {

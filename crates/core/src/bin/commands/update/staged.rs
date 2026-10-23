@@ -113,7 +113,7 @@ type ManifestVerifier<'a> = &'a (dyn Fn(&[u8], Option<&[u8]>) -> Result<()> + Sy
 /// The wall clock staging records against. Production passes
 /// `SystemTime::now`; tests pass a fixed time, so they can walk a whole day of
 /// cooldowns without waiting for it.
-type Clock<'a> = &'a (dyn Fn() -> SystemTime + Sync);
+pub(super) type Clock<'a> = &'a (dyn Fn() -> SystemTime + Sync);
 
 /// A failure to read or write the cache itself, not the network. Another
 /// attempt would fail the same way, so it is not retried.
@@ -3481,9 +3481,9 @@ mod tests {
     #[tokio::test]
     async fn a_download_is_charged_before_its_body_and_reconciled_after() {
         use super::super::super::rollback::download_bytes_at;
-        use super::super::tests::stalling_server;
+        use super::super::tests::{fixed_now, run_until, stalling_server};
         const MIB: u64 = 1024 * 1024;
-        let now = SystemTime::now();
+        let now = fixed_now();
         let clock = move || now;
         // Abandoned: the server sends 100 bytes of 5 MiB and stalls.
         let (_tmp, root) = test_root();
@@ -3492,12 +3492,11 @@ mod tests {
         let prefix = stalling_server(5 << 20, 100).await;
         let meter = ByteMeter::charged_to(u64::MAX, dir, &clock);
         let part = root.join("asset.part");
-        let abandoned = tokio::time::timeout(
-            Duration::from_millis(500),
+        run_until(
             download_resumable(&format!("{prefix}asset"), &part, &meter),
+            || download_bytes_at(dir, now) > 0,
         )
         .await;
-        assert!(abandoned.is_err(), "the download was still running");
         assert_eq!(download_bytes_at(dir, now), 5 * MIB, "charged up front");
         // Never more than the allowance left.
         let (_tmp, root) = test_root();
@@ -3505,13 +3504,11 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         let meter = ByteMeter::charged_to(MIB, dir, &clock);
         let part = root.join("asset.part");
-        drop(
-            tokio::time::timeout(
-                Duration::from_millis(500),
-                download_resumable(&format!("{prefix}asset"), &part, &meter),
-            )
-            .await,
-        );
+        run_until(
+            download_resumable(&format!("{prefix}asset"), &part, &meter),
+            || download_bytes_at(dir, now) > 0,
+        )
+        .await;
         assert_eq!(download_bytes_at(dir, now), MIB);
         // Ended: 40 MiB declared, 20 MiB sent, then the connection closes.
         let (prefix, _, _) = restarting_server(Vec::new(), 40 << 20, 20 << 20).await;
