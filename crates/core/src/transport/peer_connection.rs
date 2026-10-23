@@ -166,6 +166,7 @@ struct TelemetryTestCounts {
     standalone_ack_flushes: u32,
     outbound_streams_failed: u32,
     pongs_sent: u32,
+    upgrade_controls_ignored: u32,
 }
 
 /// See [`PeerConnection::congestion_probe`].
@@ -505,6 +506,9 @@ enum ReceiptPolicy {
 ///   be the trailing receipt carrier of a multi-packet message, sharing the
 ///   payload packet's id; the payload packet itself earns the receipt.
 /// - `ShortMessage` / `StreamFragment`: always, and re-acked on duplicate.
+/// - `Upgrade`: like `ShortMessage`. Its sender tracks it for retransmission,
+///   so it is acked, recorded for dedup (a retransmitted offer is not
+///   processed twice) and re-acked on duplicate.
 /// - `AckConnection*`: acked WITHOUT dedup recording. The handshake's
 ///   completion ack is TRACKED by its sender (`report_sent_packet` at
 ///   `FIRST_PACKET_ID` in `connection_handler.rs`) and retransmitted until a
@@ -527,7 +531,8 @@ fn receipt_policy(payload: &SymmetricMessagePayload, ack_remote_noops: bool) -> 
             }
         }
         SymmetricMessagePayload::ShortMessage { .. }
-        | SymmetricMessagePayload::StreamFragment { .. } => ReceiptPolicy::Ack {
+        | SymmetricMessagePayload::StreamFragment { .. }
+        | SymmetricMessagePayload::Upgrade(_) => ReceiptPolicy::Ack {
             reack_duplicate: true,
         },
         SymmetricMessagePayload::AckConnection { .. }
@@ -1470,7 +1475,7 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                                 }
                             }
                         }
-                        SymmetricMessagePayload::AckConnection { .. } | SymmetricMessagePayload::AckConnectionV2 { .. } | SymmetricMessagePayload::ShortMessage { .. } | SymmetricMessagePayload::StreamFragment { .. } => {}
+                        SymmetricMessagePayload::AckConnection { .. } | SymmetricMessagePayload::AckConnectionV2 { .. } | SymmetricMessagePayload::ShortMessage { .. } | SymmetricMessagePayload::StreamFragment { .. } | SymmetricMessagePayload::Upgrade(_) => {}
                     }
 
                     {
@@ -2567,6 +2572,27 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
             }
             AckConnection { result: Err(cause) } => {
                 Err(TransportError::ConnectionEstablishmentFailure { cause })
+            }
+            // QUIC upgrade control (#5940). Decode-only in this release:
+            // count it and ignore it. Never reply and never close: a newer
+            // peer may offer an upgrade this node does not perform, and the
+            // UDP session must carry on exactly as before. Reached only once
+            // per packet id, after dedup, so the count is of distinct messages.
+            // The global counter is checked by
+            // `upgrade_control_is_counted_and_ignored_without_reply` through
+            // the delta of its never-reset twin.
+            Upgrade(control) => {
+                super::TRANSPORT_METRICS.record_upgrade_control_received();
+                #[cfg(test)]
+                {
+                    self.telemetry_test_counts.upgrade_controls_ignored += 1;
+                }
+                tracing::debug!(
+                    peer_addr = %self.remote_conn.remote_addr,
+                    ?control,
+                    "Ignoring QUIC upgrade control message"
+                );
+                Ok(None)
             }
             // A duplicate success ack on an ESTABLISHED connection, in either
             // encoding (#5161): the remote did not see our completion ack, so

@@ -2778,6 +2778,10 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                 serde_json::json!(snapshot.inbound_queue_drops),
             );
             m.insert(
+                "upgrade_control_received".into(),
+                serde_json::json!(snapshot.upgrade_control_received),
+            );
+            m.insert(
                 "nat_fail_samples".into(),
                 serde_json::json!(snapshot.nat_fail_samples),
             );

@@ -110,8 +110,8 @@ use crate::transport::TRANSPORT_METRICS;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum OutboundClass {
     /// Keepalive / liveness / handshake control that flows regardless of
-    /// bulk transfer: `Ping`, `Pong`, `NoOp` (ACK carrier), and
-    /// `AckConnection`. Not rate-limited today.
+    /// bulk transfer: `Ping`, `Pong`, `NoOp` (ACK carrier), `AckConnection`,
+    /// and the QUIC `Upgrade` control message. Not rate-limited today.
     MustFlow,
     /// `ShortMessage` — a serialized `NetMessage`. Opaque at the transport
     /// layer: it may be a control op (Connect / Subscribe / routing) or a
@@ -140,7 +140,11 @@ pub(crate) fn classify(payload: &SymmetricMessagePayload) -> OutboundClass {
         | SymmetricMessagePayload::AckConnection { .. }
         | SymmetricMessagePayload::AckConnectionV2 { .. }
         | SymmetricMessagePayload::Ping { .. }
-        | SymmetricMessagePayload::Pong { .. } => OutboundClass::MustFlow,
+        | SymmetricMessagePayload::Pong { .. }
+        // A few bytes of transport control, sent at most a few times per
+        // connection and never metered by the token bucket: it must not wait
+        // behind bulk, so it belongs with the handshake acks.
+        | SymmetricMessagePayload::Upgrade(_) => OutboundClass::MustFlow,
     }
 }
 
@@ -570,6 +574,15 @@ mod tests {
             classify(&SymmetricMessagePayload::AckConnection {
                 result: Err(std::borrow::Cow::Borrowed("rejected")),
             }),
+            OutboundClass::MustFlow
+        );
+        assert_eq!(
+            classify(&SymmetricMessagePayload::Upgrade(
+                crate::transport::symmetric_message::UpgradeControl::Offer {
+                    attempt: 1,
+                    caps: 0,
+                }
+            )),
             OutboundClass::MustFlow
         );
     }

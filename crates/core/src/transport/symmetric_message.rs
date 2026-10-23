@@ -397,14 +397,100 @@ pub(crate) enum SymmetricMessagePayload {
     /// a joiner below `GATEWAY_ACK_VERSION_MIN_VERSION` still receives the
     /// byte-identical legacy `AckConnection`.
     ///
-    /// MUST stay last: appending keeps every existing variant's bincode index
-    /// unchanged, which is what makes the legacy encoding provably untouched.
+    /// Append only: a new variant goes after the last one, never before, so
+    /// every existing variant keeps its bincode index and its encoding stays
+    /// provably untouched (`pre_upgrade_variants_keep_their_wire_bytes`).
     /// The failure case has no V2 form — an incompatible peer is rejected with
     /// the legacy `AckConnection { result: Err(..) }` (`ack_error`), which is
     /// correct precisely because such a peer may not carry this index.
     AckConnectionV2 {
         connection: OutboundConnectionV2,
     },
+    /// Control message for upgrading this UDP session to QUIC in place
+    /// (#5940, step e). Bincode index 7.
+    ///
+    /// Decode-only for now: a node counts one on receipt and otherwise
+    /// ignores it, and nothing sends it. It ships in a release before any
+    /// sender does, because a peer at or below 0.2.147 panics on a payload it
+    /// cannot decode and 0.2.148 drops it. A sender must first pass
+    /// [`may_send_upgrade`] for the remote's version.
+    Upgrade(UpgradeControl),
+}
+
+/// The QUIC upgrade handshake carried by [`SymmetricMessagePayload::Upgrade`].
+///
+/// `attempt` identifies one upgrade attempt on a connection, so a reply can be
+/// matched to its offer and a late reply to an earlier attempt ignored.
+///
+/// # Compatibility
+///
+/// - Unknown `caps` bits are ignored by the receiver. A new capability is
+///   announced by a new bit.
+/// - Add an inner variant ONLY behind a `caps` bit that the receiver
+///   advertised, never bare. This enum is bincode too, so a node running the
+///   first release with it cannot decode a variant appended later: the whole
+///   packet fails to decode and is dropped. The new variant may be sent only
+///   to a peer that announced the bit saying it can decode it.
+/// - Existing variants and fields are never reordered or changed, and a
+///   field is never APPENDED to an existing variant. Bincode (1.3, as used
+///   here) accepts trailing bytes, and `payload` is the last field of
+///   [`SymmetricMessage`], so a decoder from this release reads the known
+///   fields and silently ignores the appended one rather than rejecting the
+///   packet. New data rides in a new caps-gated variant, or in an explicitly
+///   optional field that is itself caps-gated and documented as such.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UpgradeControl {
+    /// The QUIC server proposes the upgrade. `caps` is a bit set of optional
+    /// capabilities; no bit is defined yet.
+    Offer { attempt: u32, caps: u32 },
+    /// The client accepts the offer with the same `attempt`.
+    Accept { attempt: u32 },
+    /// The client declines the offer with the same `attempt`. `reason` is an
+    /// open code space: a receiver reads a value it does not know as a
+    /// decline with no stated reason.
+    Decline { attempt: u32, reason: u8 },
+}
+
+/// First release that decodes [`SymmetricMessagePayload::Upgrade`] (#5940 e1).
+///
+/// Below it a peer either panics on the unknown payload (0.2.147 and older,
+/// which `unwrap` the decode) or drops it (0.2.148, #5963). Sending is gated
+/// on [`may_send_upgrade`].
+///
+/// # Release-time check
+///
+/// Per the wire-gated-floor rule in `docs/RELEASING.md`, this MUST equal the
+/// release that first ships the decoder, then be frozen. Guarded by
+/// `upgrade_floor_tracks_the_shipping_release` via
+/// [`QUIC_UPGRADE_SHIPPED_IN`]. Bias HIGH: a floor at or below a release
+/// without the decoder lets a sender crash or confuse that peer, while a
+/// floor too high only delays the upgrade.
+pub(crate) const QUIC_UPGRADE_MIN_VERSION: (u8, u8, u16) = (0, 2, 149);
+
+/// Has the decoder for [`SymmetricMessagePayload::Upgrade`] shipped, and in
+/// which release?
+///
+/// `None`: not yet. The floor is a PREDICTION and must stay strictly ABOVE the
+/// crate version, so the release bump that lifts `Cargo.toml` to the floor
+/// turns `upgrade_floor_tracks_the_shipping_release` red until someone
+/// records that this release carries the decoder (`Some(floor)`) or raises
+/// the floor.
+///
+/// `Some(v)`: the decoder ships in `v`, which must EQUAL the floor. That is
+/// only correct if this code is in the `v` tag; no test can detect that slip
+/// once the marker says `Some`.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) const QUIC_UPGRADE_SHIPPED_IN: Option<(u8, u8, u16)> = None;
+
+/// May an [`SymmetricMessagePayload::Upgrade`] be sent to a remote of
+/// `remote_version`? Fails closed: an unknown version (`None`) or one below
+/// [`QUIC_UPGRADE_MIN_VERSION`] is `false`.
+///
+/// A reply (`Accept`, `Decline`) to a received `Offer` is safe without this
+/// check: the `Offer` proves the remote decodes the message.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn may_send_upgrade(remote_version: Option<(u8, u8, u16)>) -> bool {
+    remote_version.is_some_and(|v| v >= QUIC_UPGRADE_MIN_VERSION)
 }
 
 #[cfg(test)]
@@ -435,6 +521,7 @@ impl std::fmt::Display for SymmetricMessagePayload {
             SymmetricMessagePayload::AckConnectionV2 { .. } => {
                 write!(f, "AckConnectionV2")
             }
+            SymmetricMessagePayload::Upgrade(control) => write!(f, "Upgrade({control:?})"),
         }
     }
 }
@@ -642,7 +729,7 @@ mod test {
             )
         }
 
-        let expected: [(u32, SymmetricMessagePayload); 7] = [
+        let expected: [(u32, SymmetricMessagePayload); 8] = [
             (
                 0,
                 SymmetricMessagePayload::AckConnection {
@@ -678,6 +765,10 @@ mod test {
                     },
                 },
             ),
+            (
+                7,
+                SymmetricMessagePayload::Upgrade(UpgradeControl::Accept { attempt: 0 }),
+            ),
         ];
 
         for (index, payload) in expected {
@@ -685,9 +776,395 @@ mod test {
                 variant_index(payload),
                 index,
                 "SymmetricMessagePayload variant indices are wire-visible and MUST NOT move; \
-                 AckConnectionV2 has to stay appended at the end"
+                 new variants are appended at the end"
             );
         }
+    }
+
+    /// One fixed instance of every payload variant that shipped before the
+    /// upgrade control message (#5940 step e1), wrapped in a full
+    /// [`SymmetricMessage`] so the header layout is pinned too.
+    ///
+    /// Every value is a literal (the stream id is built directly, not taken
+    /// from the global counter), so the serialization is deterministic.
+    fn pre_upgrade_wire_samples() -> Vec<(&'static str, SymmetricMessage)> {
+        let wrap = |payload| SymmetricMessage {
+            packet_id: 0x0102_0304,
+            confirm_receipt: vec![5, 0xFFFF_FFFF],
+            payload,
+        };
+        let addr: SocketAddr = (Ipv4Addr::new(10, 1, 2, 3), 0xBEEF).into();
+        vec![
+            (
+                "AckConnection Ok",
+                wrap(SymmetricMessagePayload::AckConnection {
+                    result: Ok(OutboundConnection {
+                        key: [7; 16],
+                        remote_addr: addr,
+                    }),
+                }),
+            ),
+            (
+                "AckConnection Err",
+                wrap(SymmetricMessagePayload::AckConnection {
+                    result: Err(Cow::Borrowed("refused")),
+                }),
+            ),
+            (
+                "ShortMessage",
+                wrap(SymmetricMessagePayload::ShortMessage {
+                    payload: Bytes::from_static(b"short"),
+                }),
+            ),
+            (
+                "StreamFragment without metadata",
+                wrap(SymmetricMessagePayload::StreamFragment {
+                    stream_id: StreamId(0x8000_0011),
+                    total_length_bytes: 70_000,
+                    fragment_number: 3,
+                    payload: Bytes::from_static(b"frag"),
+                    metadata_bytes: None,
+                }),
+            ),
+            (
+                "StreamFragment with metadata",
+                wrap(SymmetricMessagePayload::StreamFragment {
+                    stream_id: StreamId(0x11),
+                    total_length_bytes: 70_000,
+                    fragment_number: 1,
+                    payload: Bytes::from_static(b"frag"),
+                    metadata_bytes: Some(Bytes::from_static(b"meta")),
+                }),
+            ),
+            ("NoOp", wrap(SymmetricMessagePayload::NoOp)),
+            (
+                "Ping",
+                wrap(SymmetricMessagePayload::Ping {
+                    sequence: 0x0102_0304_0506_0708,
+                }),
+            ),
+            (
+                "Pong",
+                wrap(SymmetricMessagePayload::Pong {
+                    sequence: 0x0102_0304_0506_0708,
+                }),
+            ),
+            (
+                "AckConnectionV2",
+                wrap(SymmetricMessagePayload::AckConnectionV2 {
+                    connection: OutboundConnectionV2 {
+                        key: [9; 16],
+                        remote_addr: addr,
+                        protoc_version: [0xFF, 0, 2, 0, 148, 0, 0, 0],
+                    },
+                }),
+            ),
+        ]
+    }
+
+    /// **Every pre-upgrade variant keeps its exact wire bytes** (#5940 e1).
+    ///
+    /// Peers at or below 0.2.148 cannot decode `Upgrade`, and every peer
+    /// decodes the variants below by their bincode index. If adding (or later
+    /// changing) a variant renumbered or reshaped any of them, every message
+    /// between a new and an old peer would change meaning.
+    ///
+    /// The expectations are BLAKE3 digests of the serialized bytes rather than
+    /// the bytes themselves, so no edit to the source text of a variant can
+    /// also rewrite its expectation (the "expectation stored as a copy" trap in
+    /// `bug-prevention-patterns.md`).
+    ///
+    /// **Provenance:** the digests were computed on origin/main at #5951,
+    /// BEFORE `Upgrade` was appended, and the test was then re-run unchanged
+    /// with `Upgrade` present. The NoOp, Ping and ShortMessage digests were
+    /// also cross-checked against bytes written out by hand from the bincode
+    /// fixint layout, hashed with an independent BLAKE3 tool. If this fails, do NOT recompute the digests from
+    /// what the code emits now: that turns the pin into a no-op. Find which
+    /// variant moved and restore its encoding; peers that cannot be upgraded
+    /// still decode the old one.
+    #[test]
+    fn pre_upgrade_variants_keep_their_wire_bytes() {
+        const FROZEN: &[(&str, &str)] = &[
+            (
+                "AckConnection Ok",
+                "cbaafbb33d04949c7925ddb1f21810f377faa0b1d1e494cb2e71958600d2cd19",
+            ),
+            (
+                "AckConnection Err",
+                "192382ed1c445123b39f0cd410112a01db03347fd74ed272c8acbe9fef7db7d2",
+            ),
+            (
+                "ShortMessage",
+                "3ad6107793e0cc023104007a9a06685e27fade2aabee2271484e1b30895984b1",
+            ),
+            (
+                "StreamFragment without metadata",
+                "db2e571d0f458f5621bd0c3cae6c78e080f8a80ad96547039ec7ed43c7de598e",
+            ),
+            (
+                "StreamFragment with metadata",
+                "9901e4075ddf57854eb0372cdff607d552508b027c1082678377b86d7cbb5639",
+            ),
+            (
+                "NoOp",
+                "8ac39dc43cace103fdf866c8e2dc7b584bbb7719c14a6d35b76fda1bdab988f3",
+            ),
+            (
+                "Ping",
+                "a7507d44ab4547c6e73826bd796962e24cb35516c5aa0267172a8f6164faa73c",
+            ),
+            (
+                "Pong",
+                "1c4f97438191390ae37033962fa2f9dbbcd3259c92f47fa57ca6a7bfd455469b",
+            ),
+            (
+                "AckConnectionV2",
+                "0b2351a92e9b05e18116281bdd914add1cc8f23783d891d7e7cdb660a54f6e54",
+            ),
+        ];
+        let samples = pre_upgrade_wire_samples();
+        assert_eq!(samples.len(), FROZEN.len());
+        for ((name, message), (frozen_name, frozen_digest)) in samples.iter().zip(FROZEN) {
+            assert_eq!(name, frozen_name);
+            let bytes = bincode::serialize(message).unwrap();
+            let digest = blake3::hash(&bytes).to_hex();
+            assert_eq!(
+                digest.as_str(),
+                *frozen_digest,
+                "the wire encoding of {name} MOVED. Peers that cannot be upgraded decode \
+                 the old bytes; see this test's rustdoc before touching the digest"
+            );
+        }
+    }
+
+    fn upgrade_samples() -> [(&'static str, UpgradeControl); 6] {
+        [
+            (
+                "Offer",
+                UpgradeControl::Offer {
+                    attempt: 0x0102_0304,
+                    caps: 0x8000_0001,
+                },
+            ),
+            (
+                "Offer max",
+                UpgradeControl::Offer {
+                    attempt: u32::MAX,
+                    caps: u32::MAX,
+                },
+            ),
+            (
+                "Accept",
+                UpgradeControl::Accept {
+                    attempt: 0x0102_0304,
+                },
+            ),
+            ("Accept zero", UpgradeControl::Accept { attempt: 0 }),
+            (
+                "Decline",
+                UpgradeControl::Decline {
+                    attempt: 0x0102_0304,
+                    reason: 2,
+                },
+            ),
+            (
+                "Decline max",
+                UpgradeControl::Decline {
+                    attempt: u32::MAX,
+                    reason: u8::MAX,
+                },
+            ),
+        ]
+    }
+
+    /// Every form of the upgrade control message survives the real
+    /// encrypt / decrypt / decode path unchanged.
+    #[test]
+    fn upgrade_control_round_trips() {
+        let key = gen_key();
+        for (name, control) in upgrade_samples() {
+            let payload = SymmetricMessagePayload::Upgrade(control);
+            assert_eq!(
+                serialization_round_trip(payload.clone(), &key),
+                payload,
+                "{name}"
+            );
+        }
+    }
+
+    /// The upgrade control message's own wire bytes, frozen once it is
+    /// decoded by a release (#5940 e1): a later sender talks to nodes running
+    /// this decoder, so its layout can no longer change.
+    ///
+    /// Digests, not bytes, for the reason given on
+    /// `pre_upgrade_variants_keep_their_wire_bytes`. Provenance: computed from
+    /// the first encoding, and cross-checked by hand for "Accept" and
+    /// "Decline" (header as
+    /// in `pre_upgrade_wire_samples`, then outer variant 7, inner variant 1,
+    /// attempt, all little-endian u32, then the reason byte for Decline) with
+    /// an independent BLAKE3 tool.
+    #[test]
+    fn upgrade_control_wire_bytes_are_frozen() {
+        const FROZEN: &[(&str, &str)] = &[
+            (
+                "Offer",
+                "3c6e8b13ef268ffdf38030597463eb12eec4e345ee14b9cf95240fdbb12d1fc5",
+            ),
+            (
+                "Offer max",
+                "d753bed50a79d7ce530a1abb35fbf18054c93daa80fa45412cba52872cbd2ba0",
+            ),
+            (
+                "Accept",
+                "abc526e43abba0e7878275d0f1ba49350fa70729b49c484a4b2f1f6c17b5fe20",
+            ),
+            (
+                "Accept zero",
+                "a67092f0fd19509b03c6a41b0666cfc214a99a0a162f782860b8e9b913be279b",
+            ),
+            (
+                "Decline",
+                "eb3b19f953f91d04b2e9c8097da122f453b5f9eb8192294ae37484f6fede5a54",
+            ),
+            (
+                "Decline max",
+                "0436c9bd3ad395f84edeb1e568a07287404014008e527e45fdc7eb104561af53",
+            ),
+        ];
+        let samples = upgrade_samples();
+        assert_eq!(samples.len(), FROZEN.len());
+        for ((name, control), (frozen_name, frozen_digest)) in samples.into_iter().zip(FROZEN) {
+            assert_eq!(name, *frozen_name);
+            let bytes = bincode::serialize(&SymmetricMessage {
+                packet_id: 0x0102_0304,
+                confirm_receipt: vec![5, 0xFFFF_FFFF],
+                payload: SymmetricMessagePayload::Upgrade(control),
+            })
+            .unwrap();
+            let digest = blake3::hash(&bytes).to_hex();
+            assert_eq!(
+                digest.as_str(),
+                *frozen_digest,
+                "the wire encoding of Upgrade {name} MOVED; nodes that already decode \
+                 it would misread it. Do not recompute the digest"
+            );
+        }
+    }
+
+    /// A decoder from this release meets a newer peer's upgrade message: an
+    /// inner variant it does not know, or a payload variant after `Upgrade`.
+    /// Both are a decode error (which the receive path drops), never a
+    /// panic and never a misread as a known variant. This is why a new inner
+    /// variant must be gated behind a `caps` bit.
+    #[test]
+    fn unknown_upgrade_variants_fail_to_decode() {
+        const OUTER: usize = 4 + 8;
+        const INNER: usize = OUTER + 4;
+        let known = bincode::serialize(&SymmetricMessage {
+            packet_id: 9,
+            confirm_receipt: vec![],
+            payload: SymmetricMessagePayload::Upgrade(UpgradeControl::Accept { attempt: 1 }),
+        })
+        .unwrap();
+        assert_eq!(known[OUTER..OUTER + 4], 7u32.to_le_bytes());
+        assert_eq!(known[INNER..INNER + 4], 1u32.to_le_bytes());
+        assert!(SymmetricMessage::deser(&known).is_ok());
+
+        for inner in [3u32, 4, u32::MAX] {
+            let mut bytes = known.clone();
+            bytes[INNER..INNER + 4].copy_from_slice(&inner.to_le_bytes());
+            assert!(
+                SymmetricMessage::deser(&bytes).is_err(),
+                "inner variant {inner} must not decode"
+            );
+        }
+        let mut bytes = known.clone();
+        bytes[OUTER..OUTER + 4].copy_from_slice(&8u32.to_le_bytes());
+        assert!(SymmetricMessage::deser(&bytes).is_err());
+        // Truncated inside the inner payload.
+        assert!(SymmetricMessage::deser(&known[..known.len() - 1]).is_err());
+
+        // The opposite hazard: bytes APPENDED after a known variant (a field
+        // a later release added to it) are not rejected. Bincode accepts
+        // trailing bytes, so this release reads the known fields and drops
+        // the rest. This is why fields are never appended to an existing
+        // variant (see `UpgradeControl`).
+        let mut extended = known.clone();
+        extended.extend_from_slice(&[0xAA; 5]);
+        assert_eq!(
+            SymmetricMessage::deser(&extended).unwrap().payload,
+            SymmetricMessagePayload::Upgrade(UpgradeControl::Accept { attempt: 1 })
+        );
+    }
+
+    /// The send gate fails closed: unknown and below-floor versions are
+    /// refused; the floor itself and anything above it are allowed.
+    #[test]
+    fn may_send_upgrade_fails_closed() {
+        let (major, minor, patch) = QUIC_UPGRADE_MIN_VERSION;
+        assert!(!may_send_upgrade(None), "unknown version = never send");
+        assert!(!may_send_upgrade(Some((0, 2, 147))), "0.2.147 panics on it");
+        assert!(
+            !may_send_upgrade(Some((0, 2, 148))),
+            "0.2.148 cannot decode it"
+        );
+        assert!(!may_send_upgrade(Some((major, minor, patch - 1))));
+        assert!(!may_send_upgrade(Some((0, 1, u16::MAX))));
+        assert!(!may_send_upgrade(Some((0, 0, 0))));
+        assert!(
+            may_send_upgrade(Some(QUIC_UPGRADE_MIN_VERSION)),
+            "inclusive at the floor"
+        );
+        assert!(may_send_upgrade(Some((major, minor, patch + 1))));
+        assert!(may_send_upgrade(Some((major, minor + 1, 0))));
+        assert!(may_send_upgrade(Some((major + 1, 0, 0))));
+    }
+
+    /// Mirrors `untracked_noop_floor_tracks_the_shipping_release`: the moment
+    /// a release bump lifts the crate to the floor, this fails until someone
+    /// records that the release carries the decoder (or raises the floor).
+    #[test]
+    fn upgrade_floor_tracks_the_shipping_release() {
+        let mut parts = env!("CARGO_PKG_VERSION")
+            .split(|c: char| !c.is_ascii_digit())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.parse::<u16>().expect("numeric version component"));
+        let crate_version = (
+            parts.next().expect("major") as u8,
+            parts.next().expect("minor") as u8,
+            parts.next().expect("patch"),
+        );
+        match QUIC_UPGRADE_SHIPPED_IN {
+            Some(shipped) => {
+                assert_eq!(
+                    shipped, QUIC_UPGRADE_MIN_VERSION,
+                    "the release that ships the Upgrade decoder must EQUAL the floor"
+                );
+                let next = (crate_version.0, crate_version.1, crate_version.2 + 1);
+                assert!(
+                    shipped <= next,
+                    "QUIC_UPGRADE_SHIPPED_IN {shipped:?} is beyond the next release {next:?}; \
+                     the marker records the release that carries the decoder"
+                );
+            }
+            None => assert!(
+                crate_version < QUIC_UPGRADE_MIN_VERSION,
+                "floor {QUIC_UPGRADE_MIN_VERSION:?} is a PREDICTION about the next release, \
+                 but the crate is already at {crate_version:?}: either set \
+                 QUIC_UPGRADE_SHIPPED_IN = Some(floor) (this release carries the decoder) or \
+                 raise the floor"
+            ),
+        }
+    }
+
+    /// Companion: the floor must never drop to a release without the decoder.
+    #[test]
+    fn upgrade_floor_stays_above_every_release_without_the_decoder() {
+        const LAST_RELEASE_WITHOUT_DECODER: (u8, u8, u16) = (0, 2, 148);
+        assert!(
+            QUIC_UPGRADE_MIN_VERSION > LAST_RELEASE_WITHOUT_DECODER,
+            "0.2.148 drops an Upgrade and 0.2.147 and older panic on it"
+        );
     }
 
     /// The version-carrying ack round-trips, and is a DIFFERENT encoding from

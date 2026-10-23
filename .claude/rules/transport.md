@@ -317,7 +317,8 @@ node-wide egress cap paced them (`egress_<label>`, one per `EgressDecision`,
 plus `egress_bytes`, `egress_bytes_waited`, `egress_wait_us_sum` / `_max`,
 `egress_long_waits_<cause>`, `egress_streams_abandoned_<cause>`, `egress_debt_hwm_bytes`,
 `egress_debt_forgiven_bytes`; all zero without
-`total-bandwidth-limit`). Each label set is declared once in a
+`total-bandwidth-limit`) and QUIC upgrade control messages received and
+ignored (`upgrade_control_received`). Each label set is declared once in a
 `labelled_counters!` list, so a new variant needs a snapshot field. Hot
 path writes are single relaxed atomics; `SentPacketTracker` keeps an
 `rto_expiries` count and a bounded per-stream final-ACK watch, both
@@ -368,7 +369,8 @@ by the 1Hz aggregator tasks:
   (the only class the token bucket meters, i.e. the only slowable
   traffic), `ShortMessage` is `Short` (opaque serialized `NetMessage`
   — small contract op or control plane, unsplittable at the transport
-  layer), and `Ping`/`Pong`/`NoOp`/`AckConnection` are `MustFlow`.
+  layer), and `Ping`/`Pong`/`NoOp`/`AckConnection`/`Upgrade` are
+  `MustFlow`.
   Tagged at `packet_sending` (covers `ShortMessage` /
   `StreamFragment`) plus the bypass sites `send_pong`, the
   keep-alive `Ping`, and the ack-only `NoOp` (`PeerConnection::noop`,
@@ -487,9 +489,10 @@ tracks for retransmission:
     would drop that packet as a duplicate. Answering a connection ack with
     `ack_ok` happens at most ONCE per connection: the reply is itself an
     AckConnection, so answering every one loops forever between two peers.
-  → ShortMessage / StreamFragment: acked within ACK_CHECK_INTERVAL
-    (100 ms), and RE-ACKED when a duplicate arrives (a duplicate means
-    our receipt was lost). A duplicate is never delivered twice.
+  → ShortMessage / StreamFragment / Upgrade: acked within
+    ACK_CHECK_INTERVAL (100 ms), and RE-ACKED when a duplicate arrives (a
+    duplicate means our receipt was lost). A duplicate is never delivered
+    (or, for Upgrade, processed) twice.
   → NoOp: acked only for a remote below UNTRACKED_ACK_NOOP_MIN_VERSION
     or of unknown version (old releases track their ack-only NoOps).
     From a remote at/above the floor it is fire-and-forget.
@@ -511,6 +514,41 @@ report_received_receipts must keep emitting ack-info ONLY for ids still
 in pending_receipts, so such receipts never touch flight size.
 NAT keepalive does NOT depend on any of this: the keepalive task's
 5 s Ping (and the remote's Pong) keeps every mapping open.
+```
+
+### QUIC upgrade control message (#5940 step e1)
+
+```
+SymmetricMessagePayload::Upgrade(UpgradeControl) is bincode index 7,
+appended after AckConnectionV2. UpgradeControl is Offer { attempt, caps },
+Accept { attempt } or Decline { attempt, reason }.
+
+Decode-only until step e5: nothing sends it. A node that receives one acks
+it like a ShortMessage, counts it (upgrade_control_received in
+transport_snapshot) and ignores it. It never replies and never closes the
+connection.
+
+Version gate: send it only when may_send_upgrade(remote_version) is true,
+i.e. the remote is at or above QUIC_UPGRADE_MIN_VERSION (0.2.149). None
+(unknown) fails closed. Peers at or below 0.2.147 panic on a payload they
+cannot decode and 0.2.148 drops it, so the decoder must ship in a release
+before any release sends the message. A reply to a received Offer needs no
+gate. The floor follows the wire-gated-floor rule in docs/RELEASING.md
+(QUIC_UPGRADE_SHIPPED_IN marker).
+
+Append only, at both levels: a new SymmetricMessagePayload variant goes
+after the last one, and existing variants keep their bytes
+(pre_upgrade_variants_keep_their_wire_bytes). A new UpgradeControl variant
+cannot be decoded by an e1 node, so it may be sent only behind a caps bit
+the receiver advertised; receivers ignore caps bits they do not know.
+Never append a field to an existing variant: bincode accepts trailing
+bytes, so an e1 decoder silently ignores it. New data goes in a new
+caps-gated variant.
+
+Not on the handshake path: in traverse_nat (connection_handler.rs) the
+joiner decodes with `?`, so an undecodable packet there still aborts the
+traversal. A sender must not send Upgrade, or any other new payload, before
+the connection is acknowledged (a constraint for e5).
 ```
 
 ### WHEN closing connections

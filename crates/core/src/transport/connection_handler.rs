@@ -2850,7 +2850,8 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                                         | SymmetricMessagePayload::StreamFragment { .. }
                                         | SymmetricMessagePayload::NoOp
                                         | SymmetricMessagePayload::Ping { .. }
-                                        | SymmetricMessagePayload::Pong { .. } => {
+                                        | SymmetricMessagePayload::Pong { .. }
+                                        | SymmetricMessagePayload::Upgrade(_) => {
                                             tracing::trace!(
                                                 peer_addr = %remote_addr,
                                                 direction = "outbound",
@@ -3327,7 +3328,8 @@ fn ack_ok_parts(
         | SymmetricMessagePayload::StreamFragment { .. }
         | SymmetricMessagePayload::NoOp
         | SymmetricMessagePayload::Ping { .. }
-        | SymmetricMessagePayload::Pong { .. } => None,
+        | SymmetricMessagePayload::Pong { .. }
+        | SymmetricMessagePayload::Upgrade(_) => None,
     }
 }
 
