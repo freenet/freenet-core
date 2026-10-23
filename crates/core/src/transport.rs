@@ -8,6 +8,7 @@
 
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::task::{Context, Poll};
 use std::{borrow::Cow, io, net::SocketAddr};
 
 use futures::Future;
@@ -596,6 +597,60 @@ pub trait Socket: Sized + Send + Sync + 'static {
         drop(take);
         self.send_to(buf, target)
     }
+
+    /// Send a datagram without waiting: when the socket cannot take it now,
+    /// return `WouldBlock` instead of sleeping or awaiting. For a sender that
+    /// must never block, such as a QUIC endpoint's driver (#5940). Charged
+    /// like [`Self::send_to`] once sent; a datagram that was not sent is not
+    /// charged.
+    ///
+    /// The default returns `Unsupported`; the UDP sockets, the in-memory
+    /// sockets and [`DemuxSocket`] implement it.
+    #[doc(hidden)]
+    fn try_send_to(&self, _buf: &[u8], _target: SocketAddr) -> io::Result<usize> {
+        Err(io::Error::from(io::ErrorKind::Unsupported))
+    }
+
+    /// Poll whether the socket can take a send now. `Ready` means a
+    /// [`Self::try_send_to`] may succeed (it can still return `WouldBlock`);
+    /// `Pending` arms `cx`'s waker for when the socket becomes writable.
+    ///
+    /// The default is always ready, which is right for sockets that never
+    /// return `WouldBlock`.
+    #[doc(hidden)]
+    fn poll_send_ready(&self, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    /// Read one datagram, saying whether it is for the caller
+    /// ([`SocketRead::Datagram`]) or was consumed by the socket
+    /// ([`SocketRead::Diverted`]: [`DemuxSocket`] counted it and dropped it
+    /// or passed it to its QUIC ingress). The listener reads through this so
+    /// it sees every datagram the socket received, of any class, for its
+    /// socket-health signal.
+    ///
+    /// Cancellation-safe when [`Self::recv_from`] is: the default is one
+    /// `recv_from`.
+    #[doc(hidden)]
+    fn recv_classified(
+        &self,
+        buf: &mut [u8],
+    ) -> impl Future<Output = io::Result<SocketRead>> + Send {
+        async move {
+            let (len, from) = self.recv_from(buf).await?;
+            Ok(SocketRead::Datagram(len, from))
+        }
+    }
+}
+
+/// What one [`Socket::recv_classified`] read produced.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SocketRead {
+    /// A datagram for the caller: its length in the buffer and its source.
+    Datagram(usize, SocketAddr),
+    /// The socket received a datagram and consumed it itself.
+    Diverted,
 }
 
 /// Normalize an IPv4-mapped IPv6 address (`::ffff:x.x.x.x`) to plain IPv4.
@@ -751,6 +806,28 @@ impl Socket for UdpSocket {
         let local_is_ipv6 = self.local_addr().map(|a| a.is_ipv6()).unwrap_or(false);
         send_to_blocking_mapped(self, buf, target, local_is_ipv6)
     }
+
+    fn try_send_to(&self, buf: &[u8], target: SocketAddr) -> io::Result<usize> {
+        let local_is_ipv6 = self.local_addr().map(|a| a.is_ipv6()).unwrap_or(false);
+        try_send_to_mapped(self, buf, target, local_is_ipv6)
+    }
+
+    fn poll_send_ready(&self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        UdpSocket::poll_send_ready(self, cx)
+    }
+}
+
+/// One non-blocking send, metered like `send_to` when it succeeds. Returns
+/// `WouldBlock` when the kernel send buffer is full.
+fn try_send_to_mapped(
+    sock: &UdpSocket,
+    buf: &[u8],
+    target: SocketAddr,
+    local_is_ipv6: bool,
+) -> io::Result<usize> {
+    let sent = sock.try_send_to(buf, map_addr_for_send(local_is_ipv6, target))?;
+    metrics::TRANSPORT_METRICS.record_packet_sent(target, sent as u64);
+    Ok(sent)
 }
 
 /// Blocking send shared by the `Socket` impls.
@@ -765,16 +842,12 @@ fn send_to_blocking_mapped(
     target: SocketAddr,
     local_is_ipv6: bool,
 ) -> io::Result<usize> {
-    let mapped_target = map_addr_for_send(local_is_ipv6, target);
     let mut backoff_us = 1u64; // Start at 1μs
     const MAX_BACKOFF_US: u64 = 1000; // Cap at 1ms
 
     loop {
-        match sock.try_send_to(buf, mapped_target) {
-            Ok(n) => {
-                metrics::TRANSPORT_METRICS.record_packet_sent(target, n as u64);
-                return Ok(n);
-            }
+        match try_send_to_mapped(sock, buf, target, local_is_ipv6) {
+            Ok(n) => return Ok(n),
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                 // Kernel buffer full - exponential backoff
                 std::thread::sleep(std::time::Duration::from_micros(backoff_us));
@@ -852,6 +925,14 @@ impl Socket for UdpTransportSocket {
     fn send_to_blocking(&self, buf: &[u8], target: SocketAddr) -> io::Result<usize> {
         // Same as the `UdpSocket` impl, minus the per-call getsockname.
         send_to_blocking_mapped(&self.sock, buf, target, self.is_ipv6)
+    }
+
+    fn try_send_to(&self, buf: &[u8], target: SocketAddr) -> io::Result<usize> {
+        try_send_to_mapped(&self.sock, buf, target, self.is_ipv6)
+    }
+
+    fn poll_send_ready(&self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.sock.poll_send_ready(cx)
     }
 }
 

@@ -6,14 +6,27 @@
 //! the fixed bit or the long-header bit set in its first byte. The two sets
 //! of first bytes do not overlap, so the first byte alone says which protocol
 //! a datagram belongs to.
+//!
+//! QUIC-class datagrams go to an optional QUIC ingress queue, which a QUIC
+//! endpoint reads (#5940), and only from source addresses on the ingress
+//! allow-set. Everything else that is not legacy is counted and dropped.
 
 use std::io;
 use std::net::SocketAddr;
+use std::sync::OnceLock;
+#[cfg(test)]
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::task::{Context, Poll};
 
-use super::Socket;
+use dashmap::DashSet;
+use tokio::sync::mpsc;
+
 use super::crypto::{PACKET_TYPE_INTRO, PACKET_TYPE_SYMMETRIC};
 use super::egress_cap::{EgressCap, EgressTake};
-use super::metrics::{DemuxClass, TRANSPORT_METRICS};
+use super::metrics::{DemuxClass, QuicIngressOutcome, TRANSPORT_METRICS};
+use super::packet_data::MAX_RECV_PACKET_SIZE;
+use super::{Socket, SocketRead, normalize_mapped_addr};
 
 /// Bits of a QUIC packet's first byte of which at least one is always set.
 ///
@@ -31,6 +44,33 @@ const QUIC_FIRST_BYTE_MASK: u8 = 0xC0;
 /// ready forever without yielding, such as the in-memory simulation socket
 /// with a deep inbox.
 const DROPS_BETWEEN_YIELDS: u32 = 64;
+
+/// How many datagrams the QUIC ingress queue holds before it drops.
+pub(crate) const QUIC_INGRESS_QUEUE_DATAGRAMS: usize = 1024;
+
+/// The most memory the QUIC ingress queue can hold: every slot holding a
+/// datagram of the largest size the listener receives (its read buffer is
+/// `MAX_RECV_PACKET_SIZE`, so no read is longer), plus the slot itself.
+/// One queue per node, and only while a QUIC ingress is enabled. Declared in
+/// `contract::executor::declared_cache_ceiling`, which only tests read.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) const QUIC_INGRESS_QUEUE_BYTES: usize =
+    QUIC_INGRESS_QUEUE_DATAGRAMS * (MAX_RECV_PACKET_SIZE + std::mem::size_of::<QuicDatagram>());
+
+/// A QUIC-class datagram passed to the QUIC ingress: its bytes and its source
+/// address (IPv4-mapped IPv6 addresses already normalized to IPv4).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct QuicDatagram {
+    pub bytes: Vec<u8>,
+    pub from: SocketAddr,
+}
+
+/// The QUIC ingress of one [`DemuxSocket`]: the queue's sending half and the
+/// source addresses allowed to reach it.
+struct QuicIngress {
+    queue: mpsc::Sender<QuicDatagram>,
+    allowed: DashSet<SocketAddr>,
+}
 
 /// Classify a datagram by its first byte. An empty datagram is
 /// [`DemuxClass::Other`].
@@ -63,13 +103,43 @@ pub(crate) fn classify(packet: &[u8]) -> DemuxClass {
 /// cap, when `total-bandwidth-limit` is set (see `transport::egress_cap`):
 /// every datagram the transport sends goes through this socket.
 ///
+/// # QUIC ingress
+///
+/// [`Self::enable_quic_ingress`] gives the socket a bounded queue of
+/// QUIC-class datagrams for a QUIC endpoint. The listener stays the only
+/// reader of the UDP socket and fills the queue with `try_send`, so a slow
+/// or stopped endpoint costs dropped QUIC datagrams and never stalls the
+/// listener. A datagram is queued only if its source address is on the
+/// allow-set ([`Self::allow_quic_source`]); the rest are dropped as before,
+/// so a prober sending QUIC Initials gets no answer that says the port
+/// speaks QUIC. Each QUIC-class datagram is counted once by what happened to
+/// it (`quic_ingress_<label>`, see [`QuicIngressOutcome`]). Without an
+/// ingress every one is `no_ingress`, which is every node today.
+///
 /// [`create_connection_handler`]: super::create_connection_handler
 pub struct DemuxSocket<S> {
     inner: S,
     egress: Option<EgressCap>,
+    quic: OnceLock<QuicIngress>,
+    /// Datagrams consumed here since the last legacy one, for the yield in
+    /// `recv_classified`. Only the listener reads, so relaxed is enough.
+    diverted_in_a_row: AtomicU32,
+    #[cfg(test)]
+    quic_outcomes: [AtomicU64; QuicIngressOutcome::COUNT],
 }
 
 impl<S> DemuxSocket<S> {
+    fn new(inner: S, egress: Option<EgressCap>) -> Self {
+        Self {
+            inner,
+            egress,
+            quic: OnceLock::new(),
+            diverted_in_a_row: AtomicU32::new(0),
+            #[cfg(test)]
+            quic_outcomes: Default::default(),
+        }
+    }
+
     /// Charge every datagram sent through this socket to `cap`.
     pub(crate) fn with_egress_cap(mut self, cap: Option<EgressCap>) -> Self {
         self.egress = cap;
@@ -80,7 +150,77 @@ impl<S> DemuxSocket<S> {
     /// [`Socket::bind`].
     #[cfg(test)]
     pub(crate) fn wrap(inner: S, egress: Option<EgressCap>) -> Self {
-        Self { inner, egress }
+        Self::new(inner, egress)
+    }
+
+    /// Start passing allowed QUIC-class datagrams to a queue of
+    /// [`QUIC_INGRESS_QUEUE_DATAGRAMS`], and return its receiving half.
+    /// The allow-set starts empty. `None` if an ingress was already enabled.
+    // Called by the QUIC endpoint (#5940); only tests call it until then.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn enable_quic_ingress(&self) -> Option<mpsc::Receiver<QuicDatagram>> {
+        let (queue, receiver) = mpsc::channel(QUIC_INGRESS_QUEUE_DATAGRAMS);
+        self.quic
+            .set(QuicIngress {
+                queue,
+                allowed: DashSet::new(),
+            })
+            .ok()?;
+        Some(receiver)
+    }
+
+    /// Let QUIC-class datagrams from `addr` reach the ingress queue. `false`
+    /// if no ingress is enabled. The caller owns the set's size: it adds an
+    /// address for each QUIC connection it expects and removes it after.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn allow_quic_source(&self, addr: SocketAddr) -> bool {
+        let Some(ingress) = self.quic.get() else {
+            return false;
+        };
+        ingress.allowed.insert(normalize_mapped_addr(addr));
+        true
+    }
+
+    /// Stop QUIC-class datagrams from `addr` reaching the ingress queue.
+    /// `false` if the address was not allowed.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn disallow_quic_source(&self, addr: SocketAddr) -> bool {
+        self.quic.get().is_some_and(|ingress| {
+            ingress
+                .allowed
+                .remove(&normalize_mapped_addr(addr))
+                .is_some()
+        })
+    }
+
+    /// Queue a QUIC-class datagram if an ingress is enabled, its source is
+    /// allowed and the queue has room; count what happened to it. Never
+    /// waits, and copies the bytes only when they are queued.
+    fn divert_quic(&self, datagram: &[u8], from: SocketAddr) {
+        let outcome = match self.quic.get() {
+            None => QuicIngressOutcome::NoIngress,
+            Some(ingress) if !ingress.allowed.contains(&from) => QuicIngressOutcome::NotAllowed,
+            Some(ingress) => match ingress.queue.try_reserve() {
+                Ok(permit) => {
+                    permit.send(QuicDatagram {
+                        bytes: datagram.to_vec(),
+                        from,
+                    });
+                    QuicIngressOutcome::Forwarded
+                }
+                Err(mpsc::error::TrySendError::Full(())) => QuicIngressOutcome::QueueFull,
+                Err(mpsc::error::TrySendError::Closed(())) => QuicIngressOutcome::NoIngress,
+            },
+        };
+        TRANSPORT_METRICS.record_quic_ingress(outcome);
+        #[cfg(test)]
+        self.quic_outcomes[outcome as usize].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// This socket's count of QUIC-class datagrams with `outcome`.
+    #[cfg(test)]
+    pub(crate) fn quic_outcome_count(&self, outcome: QuicIngressOutcome) -> u64 {
+        self.quic_outcomes[outcome as usize].load(Ordering::Relaxed)
     }
 
     #[cfg(test)]
@@ -91,33 +231,48 @@ impl<S> DemuxSocket<S> {
 
 impl<S: Socket> Socket for DemuxSocket<S> {
     async fn bind(addr: SocketAddr) -> io::Result<Self> {
-        Ok(Self {
-            inner: S::bind(addr).await?,
-            egress: None,
-        })
+        Ok(Self::new(S::bind(addr).await?, None))
     }
 
-    /// Errors from the inner socket are returned unchanged, because the
-    /// listener's receive error tracking depends on them.
-    ///
-    /// This returns only on a legacy datagram or an error. A dropped
-    /// datagram is therefore not seen by the listener at all, and no longer
-    /// counts as a successful read for its `RecvErrorTracker`.
+    /// Returns only on a legacy datagram or an error; see
+    /// [`Self::recv_classified`], which the listener uses instead.
     async fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
-        let mut dropped_in_a_row: u32 = 0;
         loop {
-            let (len, from) = self.inner.recv_from(buf).await?;
-            let class = classify(&buf[..len]);
-            TRANSPORT_METRICS.record_demux(from, class);
-            if class == DemuxClass::Legacy {
+            if let SocketRead::Datagram(len, from) = self.recv_classified(buf).await? {
                 return Ok((len, from));
             }
-            dropped_in_a_row += 1;
-            if dropped_in_a_row == DROPS_BETWEEN_YIELDS {
-                dropped_in_a_row = 0;
-                tokio::task::yield_now().await;
-            }
         }
+    }
+
+    /// One read of the inner socket. A legacy datagram is returned as
+    /// [`SocketRead::Datagram`]; any other is counted, queued for the QUIC
+    /// ingress or dropped, and returned as [`SocketRead::Diverted`], so the
+    /// listener sees that the socket delivered something. Errors from the
+    /// inner socket are returned unchanged, because the listener's receive
+    /// error tracking depends on them.
+    ///
+    /// After [`DROPS_BETWEEN_YIELDS`] diverted datagrams in a row it yields
+    /// to the runtime once before the next read. Cancellation-safe when the
+    /// inner `recv_from` is: the only await points are the yield, before the
+    /// read, and the read itself, and the rest is synchronous.
+    async fn recv_classified(&self, buf: &mut [u8]) -> io::Result<SocketRead> {
+        if self.diverted_in_a_row.load(Ordering::Relaxed) >= DROPS_BETWEEN_YIELDS {
+            self.diverted_in_a_row.store(0, Ordering::Relaxed);
+            tokio::task::yield_now().await;
+        }
+        let (len, from) = self.inner.recv_from(buf).await?;
+        let class = classify(&buf[..len]);
+        TRANSPORT_METRICS.record_demux(from, class);
+        match class {
+            DemuxClass::Legacy => {
+                self.diverted_in_a_row.store(0, Ordering::Relaxed);
+                return Ok(SocketRead::Datagram(len, from));
+            }
+            DemuxClass::Quic => self.divert_quic(&buf[..len], from),
+            DemuxClass::Other => {}
+        }
+        self.diverted_in_a_row.fetch_add(1, Ordering::Relaxed);
+        Ok(SocketRead::Diverted)
     }
 
     /// Sends the datagram at once and, when it was sent, charges the bytes
@@ -138,6 +293,21 @@ impl<S: Socket> Socket for DemuxSocket<S> {
             cap.charge_unpaced(sent);
         }
         Ok(sent)
+    }
+
+    /// Sends without waiting and, when it was sent, charges it like
+    /// [`Self::send_to`]. `WouldBlock` and other errors are returned
+    /// unchanged and not charged.
+    fn try_send_to(&self, buf: &[u8], target: SocketAddr) -> io::Result<usize> {
+        let sent = self.inner.try_send_to(buf, target)?;
+        if let Some(cap) = &self.egress {
+            cap.charge_unpaced(sent);
+        }
+        Ok(sent)
+    }
+
+    fn poll_send_ready(&self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.inner.poll_send_ready(cx)
     }
 
     fn egress_cap(&self) -> Option<&EgressCap> {
@@ -269,15 +439,15 @@ mod tests {
         let from: SocketAddr = "10.254.1.1:4001".parse().unwrap();
         TRANSPORT_METRICS.watch_demux(from);
         let legacy = vec![PACKET_TYPE_SYMMETRIC, 9, 8, 7];
-        let socket = DemuxSocket {
-            egress: None,
-            inner: ScriptedSocket::new(vec![
+        let socket = DemuxSocket::wrap(
+            ScriptedSocket::new(vec![
                 Step::Packet(from, vec![0xC3, 1, 2, 3]),
                 Step::Packet(from, vec![0x00, 1, 2, 3]),
                 Step::Packet(from, Vec::new()),
                 Step::Packet(from, legacy.clone()),
             ]),
-        };
+            None,
+        );
         let mut buf = [0u8; 64];
         let (len, got_from) = recv_within_timeout(&socket, &mut buf).await;
         assert_eq!(got_from, from);
@@ -306,10 +476,7 @@ mod tests {
             .map(|_| Step::Packet(from, vec![0x40, 0]))
             .collect();
         script.push(Step::Packet(from, vec![PACKET_TYPE_INTRO]));
-        let socket = DemuxSocket {
-            egress: None,
-            inner: ScriptedSocket::new(script),
-        };
+        let socket = DemuxSocket::wrap(ScriptedSocket::new(script), None);
         let turns = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let counter = turns.clone();
         let other_task = tokio::spawn(async move {
@@ -338,10 +505,10 @@ mod tests {
 
     #[tokio::test]
     async fn recv_returns_inner_errors_unchanged() {
-        let socket = DemuxSocket {
-            egress: None,
-            inner: ScriptedSocket::new(vec![Step::Error(io::ErrorKind::ConnectionReset)]),
-        };
+        let socket = DemuxSocket::wrap(
+            ScriptedSocket::new(vec![Step::Error(io::ErrorKind::ConnectionReset)]),
+            None,
+        );
         let mut buf = [0u8; 8];
         let err = socket.recv_from(&mut buf).await.unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::ConnectionReset);
@@ -351,10 +518,7 @@ mod tests {
     #[tokio::test]
     async fn send_passes_through() {
         let target: SocketAddr = "10.254.1.3:4003".parse().unwrap();
-        let socket = DemuxSocket {
-            egress: None,
-            inner: ScriptedSocket::new(Vec::new()),
-        };
+        let socket = DemuxSocket::wrap(ScriptedSocket::new(Vec::new()), None);
         assert_eq!(socket.send_to(&[0xC0, 1], target).await.unwrap(), 2);
         assert_eq!(socket.send_to_blocking(&[0x01], target).unwrap(), 1);
         assert_eq!(

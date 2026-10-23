@@ -30,7 +30,7 @@ use tracing::{Instrument, span};
 use version_cmp::PROTOC_VERSION;
 
 use super::{
-    Socket, TransportError, UdpError, UdpErrorKind,
+    Socket, SocketRead, TransportError, UdpError, UdpErrorKind,
     congestion_control::{CongestionControl, CongestionControlConfig},
     crypto::{TransportKeypair, TransportPublicKey},
     demux::DemuxSocket,
@@ -229,6 +229,11 @@ async fn bind_udp_listener<S: Socket>(
     // set (which is when `global_bandwidth` is), so a node without it pays
     // nothing. The cap uses the same clock kind as the listener built below
     // (`RealTime`); waiters sleep on their own connection's time source.
+    // That holds in simulation too: the listener and its connections run on
+    // `RealTime` there, so a cap on the network's `VirtualTime` would compute
+    // deficits on one clock for stream senders that sleep and time out on
+    // another. A sender on `VirtualTime` (the QUIC endpoint, #5940) must use
+    // the cap only once the cap and its other waiters share that clock.
     let egress_cap = config.global_bandwidth.as_ref().and_then(|manager| {
         super::egress_cap::EgressCap::from_total_limit(manager.total_limit(), RealTime::new())
     });
@@ -1529,9 +1534,17 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
         'outer: loop {
             // DST: Use deterministic_select! for fair but deterministic branch ordering
             crate::deterministic_select! {
-                recv_result = self.socket_listener.recv_from(&mut buf) => {
+                recv_result = self.socket_listener.recv_classified(&mut buf) => {
                     match recv_result {
-                        Ok((size, remote_addr)) => {
+                        // The socket received a datagram that is not for this
+                        // listener (`DemuxSocket` counted it and dropped it or
+                        // queued it for the QUIC ingress). It is still a
+                        // successful read, so it is evidence the socket works.
+                        Ok(SocketRead::Diverted) => {
+                            recv_errors.on_success();
+                            continue;
+                        }
+                        Ok(SocketRead::Datagram(size, remote_addr)) => {
                             recv_errors.on_success();
                             if let Some(time_nanos) = outdated_peer.get(&remote_addr) {
                                 let now_nanos = self.time_source.now_nanos();

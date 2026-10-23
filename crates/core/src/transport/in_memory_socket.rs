@@ -504,6 +504,19 @@ impl<T: TimeSource> InMemorySocket<T> {
 
     /// Generic async send_to implementation using the time source.
     pub async fn send_to(&self, buf: &[u8], target: SocketAddr) -> io::Result<usize> {
+        self.send_now(buf, target)
+    }
+
+    /// Non-blocking send: the same fault-injection decision and delivery as
+    /// [`Self::send_to`], which never waits either. An in-memory socket has
+    /// no send buffer, so this never returns `WouldBlock`.
+    pub fn try_send_to(&self, buf: &[u8], target: SocketAddr) -> io::Result<usize> {
+        self.send_now(buf, target)
+    }
+
+    /// The body of [`Self::send_to`] and [`Self::try_send_to`]. A delayed
+    /// delivery is a spawned task on the time source, so nothing here waits.
+    fn send_now(&self, buf: &[u8], target: SocketAddr) -> io::Result<usize> {
         if buf.len() > MAX_PACKET_SIZE {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -591,6 +604,10 @@ impl Socket for InMemorySocket<RealTime> {
 
     fn send_to_blocking(&self, buf: &[u8], target: SocketAddr) -> io::Result<usize> {
         InMemorySocket::<RealTime>::send_to_blocking(self, buf, target)
+    }
+
+    fn try_send_to(&self, buf: &[u8], target: SocketAddr) -> io::Result<usize> {
+        InMemorySocket::<RealTime>::try_send_to(self, buf, target)
     }
 }
 
@@ -701,6 +718,10 @@ impl Socket for SimulationSocket {
 
     fn send_to_blocking(&self, buf: &[u8], target: SocketAddr) -> io::Result<usize> {
         self.0.send_to_blocking(buf, target)
+    }
+
+    fn try_send_to(&self, buf: &[u8], target: SocketAddr) -> io::Result<usize> {
+        self.0.try_send_to(buf, target)
     }
 }
 
