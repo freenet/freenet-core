@@ -99,17 +99,28 @@ impl QuicSettings {
 /// The flow-control window for one connection in one direction: 5% of the
 /// memory split over every connection's receive and send windows, clamped
 /// to [`MIN_WINDOW_BYTES`], [`MAX_WINDOW_BYTES`], and never more than
-/// [`MAX_INBOUND_STREAM_BYTES_PER_CONNECTION`], the most inbound reassembly
-/// state a UDP-transport connection may already hold. That last bound wins
-/// over the floor, so turning QUIC on never lets a connection hold more
-/// inbound memory than it could without QUIC. The same value is the
-/// connection receive window, the per-stream receive window (so a stream's
-/// window is never above its connection's) and the send window.
+/// [`MAX_INBOUND_STREAM_BYTES_PER_CONNECTION`] (that cap wins over the
+/// floor). The same value is the connection receive window, the per-stream
+/// receive window (so a stream's window is never above its connection's)
+/// and the send window.
 ///
-/// Like the reassembly allowance, the windows bound one connection, not the
-/// node, and are not summed in `contract::executor::declared_cache_ceiling`
-/// (its `NOT_SUMMED` table, and the "Recorded exception: inbound stream
-/// reassembly" note in `.claude/rules/bug-prevention-patterns.md`).
+/// The cap does not bind today (the 2 MiB clamp is far below it); it only
+/// stops a future constant change from raising the windows past it. It does
+/// NOT mean a QUIC connection holds no more memory than a UDP-transport one:
+/// QUIC windows come on top of whatever the application reassembles, the
+/// send window is outbound memory the reassembly exception never covered,
+/// and quinn keeps per-connection state the windows do not bound (up to 256
+/// unidirectional streams, sent-packet and ACK bookkeeping, the assembler,
+/// crypto buffers).
+///
+/// The windows are the same class of per-connection exception as inbound
+/// stream reassembly and are in the `NOT_SUMMED` table of
+/// `contract::executor::declared_cache_ceiling` (see the "Recorded
+/// exception: inbound stream reassembly" note in
+/// `.claude/rules/bug-prevention-patterns.md`). That memory, roughly twice
+/// the window per connection plus quinn's own state, is NOT accounted in the
+/// node aggregate, and must be before QUIC is on by default (the rollout
+/// plan records that gate).
 ///
 /// [`MAX_INBOUND_STREAM_BYTES_PER_CONNECTION`]: crate::transport::peer_connection::streaming::MAX_INBOUND_STREAM_BYTES_PER_CONNECTION
 pub(crate) fn connection_window_bytes(memory_limit: usize, max_connections: usize) -> u64 {

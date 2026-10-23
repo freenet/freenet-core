@@ -1668,10 +1668,10 @@ pub(crate) fn declared_cache_ceiling_terms(
     let quic_ingress = crate::transport::demux::QUIC_INGRESS_QUEUE_BYTES;
     // quinn's buffer for pending QUIC connection attempts (#5940): one
     // endpoint per node, and fixed. Summed whatever `transport-quic` says, as
-    // the ingress queue is, so the aggregate holds with QUIC on. The QUIC
-    // flow-control windows are NOT summed: like inbound stream reassembly
-    // they bound one connection, never above its reassembly allowance
-    // (`quic::config::connection_window_bytes`); see `NOT_SUMMED`.
+    // the ingress queue is. The QUIC flow-control windows and quinn's
+    // per-connection state are NOT summed, so this aggregate does not
+    // account a node's QUIC connections; see `NOT_SUMMED` and
+    // `quic::config::connection_window_bytes`.
     let quic_incoming = crate::transport::quic::config::INCOMING_BUFFER_TOTAL_BYTES as usize;
 
     vec![
@@ -2748,18 +2748,19 @@ mod tests {
                 "WAKE_DATAGRAM_BYTES",
                 "egress-cap wake threshold for a QUIC datagram (a rate quantity), not memory",
             ),
-            // The QUIC flow-control windows share the inbound stream
-            // reassembly exception (see the MAX_STREAM_TOTAL_BYTES row): they
-            // bound one connection, never above
-            // MAX_INBOUND_STREAM_BYTES_PER_CONNECTION, so turning QUIC on
-            // lets no connection hold more inbound memory than it already
-            // could. Node-wide they are at most the connection count times
-            // twice the window.
+            // The QUIC flow-control windows are the same class of
+            // per-connection exception as inbound stream reassembly (see the
+            // MAX_STREAM_TOTAL_BYTES row). This memory, about twice the window
+            // per connection plus quinn's own per-connection state, is NOT
+            // accounted in this aggregate, and must be before QUIC is on by
+            // default (a gate in the #5940 rollout plan). The windows are in
+            // addition to reassembly, not covered by it.
             (
                 "connection_window_bytes",
-                "one QUIC connection's flow-control window, capped at the \
-                 per-connection reassembly allowance; per connection, not a node \
-                 budget (same exception as MAX_STREAM_TOTAL_BYTES)",
+                "one QUIC connection's flow-control window: a per-connection \
+                 exception like MAX_STREAM_TOTAL_BYTES; this memory (about 2 x \
+                 window per connection plus quinn state) is not accounted here, \
+                 and must be before QUIC is on by default",
             ),
             (
                 "MIN_WINDOW_BYTES",

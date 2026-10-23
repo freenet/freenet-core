@@ -1305,9 +1305,9 @@ fn a_dual_stack_endpoint_talks_to_an_ipv4_peer() {
             })
             .is_ok();
         if !dual_stack_available {
-            // Set REQUIRE_DUAL_STACK=1 where the host is known to have
-            // dual-stack IPv6 (a CI runner, say), so a skip there fails
-            // instead of passing unseen.
+            // REQUIRE_DUAL_STACK=1 turns this skip into a failure on a host
+            // known to have dual-stack IPv6. Nothing sets it in CI today, so
+            // there the skip is only the printed line below.
             assert!(
                 std::env::var("REQUIRE_DUAL_STACK").as_deref() != Ok("1"),
                 "REQUIRE_DUAL_STACK=1 but this host has no dual-stack IPv6: \
@@ -1670,13 +1670,14 @@ fn windows_are_a_clamped_share_of_memory() {
     );
 }
 
-/// A QUIC connection may never hold more inbound memory than a UDP
-/// transport connection already may: the connection receive window, the
-/// stream receive window and the send window are at most
-/// `MAX_INBOUND_STREAM_BYTES_PER_CONNECTION` (read from the constant, not
-/// copied) at every memory limit and connection count, the stream window is
-/// at most the connection window, and the transport configuration quinn is
-/// given carries exactly those values.
+/// The connection receive window, the stream receive window and the send
+/// window are at most `MAX_INBOUND_STREAM_BYTES_PER_CONNECTION` (read from
+/// the constant, not copied) at every memory limit and connection count, the
+/// stream window is at most the connection window, and the transport
+/// configuration quinn is given carries exactly those values. The cap does
+/// not bind with today's 2 MiB clamp, so this guards only a future change of
+/// the window constants. It says nothing about a connection's total memory,
+/// which is not accounted (see `config::connection_window_bytes`).
 #[test]
 fn windows_never_exceed_the_reassembly_allowance() {
     use crate::transport::peer_connection::streaming::MAX_INBOUND_STREAM_BYTES_PER_CONNECTION as CAP;

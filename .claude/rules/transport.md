@@ -728,16 +728,21 @@ Connection IDs (quic/cid.rs) carry a keyed BLAKE3 MAC, so quinn drops a
 ```
 
 QUIC memory: the flow-control windows (connection receive, stream receive,
-send; all one value from `connection_window_bytes`) are capped at
-`MAX_INBOUND_STREAM_BYTES_PER_CONNECTION`, so a QUIC connection never holds
-more inbound memory than a UDP-transport connection already may, and the
-stream window never exceeds the connection window. Like inbound stream
-reassembly they bound one connection, not the node, and are listed in
-`NOT_SUMMED` in `declared_cache_ceiling` (the recorded reassembly exception
-in bug-prevention-patterns.md). The fixed node-wide endpoint buffers are
-summed whatever `transport-quic` says: `INCOMING_BUFFER_TOTAL_BYTES` (quinn's
-pending attempts) and `QUIC_INGRESS_QUEUE_BYTES`. Pinned by
-`windows_never_exceed_the_reassembly_allowance`.
+send; all one value from `connection_window_bytes`) are clamped and capped
+at `MAX_INBOUND_STREAM_BYTES_PER_CONNECTION`; the stream window never
+exceeds the connection window. The cap does not bind today (2 MiB clamp);
+`windows_never_exceed_the_reassembly_allowance` only guards future constant
+changes. The windows are the same class of per-connection exception as
+inbound stream reassembly and are in `NOT_SUMMED` in
+`declared_cache_ceiling`, but they are NOT covered by it: they are in
+addition to reassembly, the send window is outbound, and quinn's own
+per-connection state (up to 256 uni streams, packet and ACK bookkeeping,
+assembler, crypto buffers) is not bounded by them. That memory, about twice
+the window per connection plus quinn state, is NOT accounted in the node
+aggregate and must be before QUIC is on by default (rollout gate). The fixed
+node-wide endpoint buffers are summed whatever `transport-quic` says:
+`INCOMING_BUFFER_TOTAL_BYTES` (quinn's pending attempts) and
+`QUIC_INGRESS_QUEUE_BYTES`.
 
 The cap's `poll_admit` and `give_back` publish through Release/Acquire
 atomics, not SeqCst, so a give-back racing a waiter's registration can miss
@@ -746,7 +751,8 @@ to its deficit plus its stagger (one datagram's refill per waiter ahead of
 it). Known and accepted.
 
 The dual-stack test skips (printing SKIPPED) on a host without dual-stack
-IPv6; set REQUIRE_DUAL_STACK=1 to make that a failure.
+IPv6; set REQUIRE_DUAL_STACK=1 to make that a failure. Nothing sets it in
+CI, so CI does not check that the test ran.
 
 Key material (stateless-reset key, token key, CID MAC key) comes from the OS
 entropy pool, never GlobalRng; quinn's rng_seed and the CID nonces stay on
