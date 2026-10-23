@@ -1651,7 +1651,11 @@ fn connect_with_a_full_allow_set_fails_and_leaks_nothing() {
 
 /// A connection attempt whose source left the allow-set after its first
 /// datagram was queued is ignored by `accept`, not resurrected: `accept`
-/// takes a permit only for an address that is still allowed.
+/// takes a permit only for an address that is still allowed. The test first
+/// checks the Initial really was queued, so it cannot pass because the demux
+/// dropped the datagram. (The concurrent race `allow_existing_quic_source`
+/// closes, a permit dropped between a check and a grant, is covered by the
+/// demux unit test `quic_allow_set_bound_holds_under_concurrent_callers`.)
 #[test]
 fn accept_ignores_an_attempt_whose_source_was_released() {
     bounded(|| async move {
@@ -1672,6 +1676,12 @@ fn accept_ignores_an_attempt_whose_source_was_released() {
         for _ in 0..64 {
             tokio::task::yield_now().await;
         }
+        assert!(
+            pair.b_socket
+                .quic_outcome_count(crate::transport::metrics::QuicIngressOutcome::Forwarded)
+                > 0,
+            "the client's Initial reached b's ingress queue before the permit was dropped"
+        );
         drop(permit);
         let b = clone_endpoint(&pair.b);
         let time = pair.time.clone();

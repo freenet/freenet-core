@@ -979,6 +979,53 @@ fn a_give_back_wakes_one_waiter_per_datagram_that_fits() {
     assert_eq!(cap.admission_waker_count(), 4);
 }
 
+/// Waiters are woken in the order they registered: with more waiters than
+/// datagrams given back, the first to register is woken first, and a waiter
+/// that registers again moves to the back. On overflow the oldest entry is
+/// the one dropped.
+#[test]
+fn give_backs_wake_waiters_oldest_first() {
+    let (cap, _time) = cap_at(RATE);
+    cap.charge_unpaced(BURST as usize - 2 * PACKET);
+    let first_take = cap.try_take(PACKET, Duration::ZERO).expect("fits");
+    let second_take = cap.try_take(PACKET, Duration::ZERO).expect("fits");
+    let mut waiters: Vec<_> = (0..3)
+        .map(|_| {
+            let (waker, counter) = counting_waker();
+            (AdmissionWaiter::default(), waker, counter)
+        })
+        .collect();
+    for (waiter, waker, _) in waiters.iter_mut() {
+        let mut cx = Context::from_waker(waker);
+        assert!(cap.poll_admit(PACKET, waiter, &mut cx).is_pending());
+    }
+    // Waiter 0 polls again: it moves behind 1 and 2.
+    {
+        let (waiter, waker, _) = &mut waiters[0];
+        let mut cx = Context::from_waker(waker);
+        assert!(cap.poll_admit(PACKET, waiter, &mut cx).is_pending());
+    }
+    drop(first_take);
+    let woken_now = |w: &[(
+        AdmissionWaiter,
+        std::task::Waker,
+        std::sync::Arc<CountingWaker>,
+    )]| { w.iter().map(|(_, _, c)| woken(c)).collect::<Vec<_>>() };
+    assert_eq!(
+        woken_now(&waiters),
+        vec![0, 1, 0],
+        "the oldest registration first"
+    );
+    // Waiter 1 took nothing, so the bucket now holds two datagrams' worth:
+    // the two remaining waiters, 2 then 0.
+    drop(second_take);
+    assert_eq!(
+        woken_now(&waiters),
+        vec![1, 1, 1],
+        "two datagrams, two wakes"
+    );
+}
+
 /// The cap never holds more than `MAX_ADMISSION_WAKERS` wakers: past it an
 /// entry is dropped WITHOUT being woken (its waiter still has its timer).
 #[test]
@@ -987,14 +1034,26 @@ fn abandoned_admission_wakers_are_bounded_without_waking() {
     cap.charge_unpaced(BURST as usize);
     let (waker, counter) = counting_waker();
     let mut cx = Context::from_waker(&waker);
+    let mut first_id = None;
     for _ in 0..MAX_ADMISSION_WAKERS {
         let mut waiter = AdmissionWaiter::default();
+        first_id.get_or_insert(waiter.id);
         assert!(cap.poll_admit(PACKET, &mut waiter, &mut cx).is_pending());
     }
+    let first_id = first_id.unwrap();
+    assert_eq!(
+        cap.admission_wakers.lock().front().map(|(id, _)| *id),
+        Some(first_id)
+    );
     assert_eq!(cap.admission_waker_count(), MAX_ADMISSION_WAKERS);
     let mut waiter = AdmissionWaiter::default();
     assert!(cap.poll_admit(PACKET, &mut waiter, &mut cx).is_pending());
     assert_eq!(cap.admission_waker_count(), MAX_ADMISSION_WAKERS, "bounded");
+    assert_ne!(
+        cap.admission_wakers.lock().front().map(|(id, _)| *id),
+        Some(first_id),
+        "the oldest entry was the one dropped"
+    );
     assert_eq!(woken(&counter), 0, "an evicted entry is not woken");
     // The same waiter polling again holds one entry, not two.
     assert!(cap.poll_admit(PACKET, &mut waiter, &mut cx).is_pending());

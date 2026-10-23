@@ -136,8 +136,8 @@ const NANOS_PER_SEC: u128 = 1_000_000_000;
 
 /// The most [`EgressCap::poll_admit`] wakers the cap holds. A waiter's entry
 /// is removed when it is woken or next admitted; a waiter dropped while
-/// `Pending` leaves its entry behind. At this many entries one is dropped,
-/// without waking it, before a new one is added, so abandoned entries cannot
+/// `Pending` leaves its entry behind. At this many entries the oldest is
+/// dropped, without waking it, before a new one is added, so abandoned entries cannot
 /// accumulate; a live waiter whose entry was dropped still has its timer. The
 /// QUIC endpoint has one waiter per connection that is short of bytes, far
 /// fewer than this.
@@ -239,7 +239,7 @@ pub struct EgressCap {
     /// Wakers of [`Self::poll_admit`] callers that are `Pending`, by
     /// [`AdmissionWaiter`] id, woken when bytes are given back. At most
     /// [`MAX_ADMISSION_WAKERS`]; see [`Self::register_waker`].
-    admission_wakers: parking_lot::Mutex<std::collections::HashMap<u64, std::task::Waker>>,
+    admission_wakers: parking_lot::Mutex<std::collections::VecDeque<(u64, std::task::Waker)>>,
     /// `admission_wakers.len()`, so [`Self::give_back`] skips the lock when
     /// nobody waits (every node without a QUIC endpoint).
     admission_waiting: std::sync::atomic::AtomicUsize,
@@ -336,7 +336,7 @@ impl EgressCap {
             clock,
             sleep_until,
             empty_at_ns: AtomicI64::new(now.saturating_sub(burst_ns)),
-            admission_wakers: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            admission_wakers: parking_lot::Mutex::new(std::collections::VecDeque::new()),
             admission_waiting: std::sync::atomic::AtomicUsize::new(0),
             last_long_wait_warn_ns: AtomicI64::new(i64::MIN),
             last_abandon_warn_ns: AtomicI64::new(i64::MIN),
@@ -560,23 +560,19 @@ impl EgressCap {
         }
     }
 
-    /// Hold `waker` under `id` until bytes are given back. At
-    /// [`MAX_ADMISSION_WAKERS`] entries another entry is dropped WITHOUT
-    /// being woken: its waiter still has its timer.
+    /// Hold `waker` under `id` until bytes are given back, at the back of
+    /// the queue (a waiter that registers again moves to the back). At
+    /// [`MAX_ADMISSION_WAKERS`] entries the OLDEST is dropped WITHOUT being
+    /// woken: its waiter still has its timer. A linear scan, over at most
+    /// that many entries, only while someone is short of bytes.
     fn register_waker(&self, id: u64, waker: &std::task::Waker) {
         let mut wakers = self.admission_wakers.lock();
-        if wakers.len() >= MAX_ADMISSION_WAKERS && !wakers.contains_key(&id) {
-            if let Some(&evicted) = wakers.keys().next() {
-                wakers.remove(&evicted);
-            }
+        if let Some(at) = wakers.iter().position(|(held, _)| *held == id) {
+            wakers.remove(at);
+        } else if wakers.len() >= MAX_ADMISSION_WAKERS {
+            wakers.pop_front();
         }
-        match wakers.get_mut(&id) {
-            Some(held) if held.will_wake(waker) => {}
-            Some(held) => held.clone_from(waker),
-            None => {
-                wakers.insert(id, waker.clone());
-            }
-        }
+        wakers.push_back((id, waker.clone()));
         self.admission_waiting
             .store(wakers.len(), Ordering::Release);
     }
@@ -586,16 +582,19 @@ impl EgressCap {
             return;
         }
         let mut wakers = self.admission_wakers.lock();
-        wakers.remove(&id);
+        if let Some(at) = wakers.iter().position(|(held, _)| *held == id) {
+            wakers.remove(at);
+        }
         self.admission_waiting
             .store(wakers.len(), Ordering::Release);
     }
 
     /// After bytes came back to the bucket: wake one `Pending`
     /// [`Self::poll_admit`] caller per [`WAKE_DATAGRAM_BYTES`] the bucket now
-    /// holds, and none if it holds less. Costs one atomic load when nobody
-    /// waits, which is every give-back on a node without a QUIC endpoint.
-    /// The wakers are woken after the lock is released.
+    /// holds, and none if it holds less, oldest registration first. Costs one
+    /// atomic load when nobody waits, which is every give-back on a node
+    /// without a QUIC endpoint. The wakers are woken after the lock is
+    /// released.
     fn wake_admission_waiters(&self) {
         if self.admission_waiting.load(Ordering::Acquire) == 0 {
             return;
@@ -609,8 +608,8 @@ impl EgressCap {
         }
         let woken: Vec<std::task::Waker> = {
             let mut wakers = self.admission_wakers.lock();
-            let ids: Vec<u64> = wakers.keys().take(datagrams).copied().collect();
-            let woken = ids.iter().filter_map(|id| wakers.remove(id)).collect();
+            let take = datagrams.min(wakers.len());
+            let woken = wakers.drain(..take).map(|(_, waker)| waker).collect();
             self.admission_waiting
                 .store(wakers.len(), Ordering::Release);
             woken

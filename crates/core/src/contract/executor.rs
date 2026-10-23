@@ -1674,9 +1674,10 @@ pub(crate) fn declared_cache_ceiling_terms(
     // DEFAULT connection limit, so it cannot reflect `prefer` or a raised
     // `max-number-of-connections`. Before c3 (the first step in which a QUIC
     // connection can exist) merges, it must use the configured mode and
-    // max_connections; `quic_endpoint_term_is_default_only_until_c3` fails to
-    // remind whoever changes the default. With QUIC on the term does not fit
-    // a 1 GiB host (see `quic_endpoint_budget_for`).
+    // max_connections. `quic_endpoint_term_is_default_only_until_c3` fails
+    // only if the default flips; it does not check that c3 did this. With
+    // QUIC on the term does not fit a 1 GiB host (see
+    // `quic_endpoint_budget_for`).
     let quic_endpoint = crate::transport::quic::config::quic_endpoint_budget_for(
         memory_limit,
         crate::transport::quic::QuicMode::default(),
@@ -2313,13 +2314,12 @@ mod tests {
         }
     }
 
-    /// TODO(#5940 c3) guard. The QUIC endpoint term is evaluated for the
-    /// default `transport-quic` mode, which is off, so it is zero and the
-    /// aggregate never sees QUIC memory. That is true only while no QUIC
-    /// connection can exist. This fails when the default changes, and c3 (the
-    /// first step that opens QUIC connections) must replace the term with one
-    /// computed from the configured mode and `max-number-of-connections`,
-    /// and replace this test with one that checks it.
+    /// Catches a change of the `transport-quic` default, nothing more. The
+    /// QUIC endpoint term is evaluated for the default mode (off), so it is
+    /// zero and the aggregate never sees QUIC memory. This test does NOT
+    /// gate c3: c3 (#5940, the first step that opens QUIC connections) must
+    /// itself make the term use the configured mode and
+    /// `max-number-of-connections`, and nothing here fails if it does not.
     #[test]
     fn quic_endpoint_term_is_default_only_until_c3() {
         const ONE_GIB: usize = 1024 * 1024 * 1024;

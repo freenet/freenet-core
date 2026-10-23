@@ -138,7 +138,12 @@ keeps its timer). Bytes given back (a take that sent less, or a failed send)
 wake one held waker per WAKE_DATAGRAM_BYTES (1200, the QUIC datagram) the
 bucket then holds, and none if it holds less, so legacy give-backs cost N
 waiting QUIC connections nothing until a datagram fits; wakers are woken
-after the lock is released. It takes nothing; the QUIC socket takes with
+after the lock is released, oldest registration first (a FIFO; a waiter
+that registers again moves to the back, and overflow drops the oldest).
+Remaining herd, to settle before c3 opens connections: waiters whose TIMERS
+expire together all wake (about N wakeups per datagram's worth of refill
+with N waiting connections); only give-backs are limited to one per
+datagram. It takes nothing; the QUIC socket takes with
 try_take and sends with DemuxSocket::try_send_to_paced, so its datagram is
 charged once, by the take. Every take is at most one datagram, within the
 burst (QUIC: one segment per transmit, debug-asserted), so the bound above
@@ -717,9 +722,11 @@ Connection IDs (quic/cid.rs) carry a keyed BLAKE3 MAC, so quinn drops a
 The endpoint's memory (`quic_endpoint_budget_for`) is a term in
 `declared_cache_ceiling`, zero at the shipped default (off). The term is
 evaluated for the DEFAULT mode and connection limit, so it cannot reflect
-`prefer` or a raised `max-number-of-connections`: before c3 (the first step
-that opens QUIC connections) merges, it must use the configured values
-(TODO guard: `quic_endpoint_term_is_default_only_until_c3`). With QUIC on it
+`prefer` or a raised `max-number-of-connections`. c3 (the first step that
+opens QUIC connections) must make it use the configured mode and
+max_connections. Nothing enforces that: the test
+`quic_endpoint_term_is_default_only_until_c3` fails only if the default
+flips. With QUIC on it
 is at least 50 MiB at the default connection count, which a 1 GiB host's
 declared caches have no room for; settle that before QUIC is offered.
 
