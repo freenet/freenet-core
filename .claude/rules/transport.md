@@ -144,9 +144,11 @@ bucket then holds, and none if it holds less, so legacy give-backs cost N
 waiting QUIC connections nothing until a datagram fits; wakers are woken
 after the lock is released, oldest registration first (a FIFO; overflow
 drops the oldest). An admitted waiter took the slot reserved for it, so
-nobody behind it moves; a waiter dropped while queued wakes every waiter
-behind it so each re-polls to its new place (AdmissionQueue::leave). An
-entry evicted at MAX_ADMISSION_WAKERS wakes nobody. No waiter wakes before
+nobody behind it moves; a waiter dropped while queued wakes the next
+MAX_FOLLOWERS_WOKEN_PER_LEAVE (8) behind it so each re-polls to its new
+place (AdmissionQueue::leave), so N closes cost at most 8 N wakes. Waiters
+further back stay up to one datagram late per such drop until they next
+poll. An entry evicted at MAX_ADMISSION_WAKERS wakes nobody. No waiter wakes before
 the bucket can admit it. It takes
 nothing; the QUIC socket takes with
 try_take and sends with DemuxSocket::try_send_to_paced, so its datagram is
@@ -782,12 +784,15 @@ no extra message, no exporter proof.
   → Presented key: the Edwards form of the X25519 public key with SIGN BIT 0,
     in an Ed25519 SubjectPublicKeyInfo. Sign bit 0 is XEdDSA's convention:
     the signer negates its scalar when its natural Edwards key has sign 1.
-    Bit 255 of the X25519 key is ignored (RFC 7748), u = -1 has no Edwards
-    form and is refused (UnusableKey).
+    PeerKey::of refuses (UnusableKey) any key no node can hold: a
+    non-canonical encoding (bit 255 set or u >= p), a small-order Edwards
+    point (forgeable without a secret, since Ed25519 verification does not
+    check the key's order), a point with a torsion component (would let one
+    secret authenticate as up to 8 keys), and u = -1 (no Edwards form).
   → Verification is PINNED to the key the caller expects: the presented
-    SPKI must equal the expected key's exactly (constant-time compare, no
-    chain), the scheme must be Ed25519, and the signature is checked with
-    ring against the EXPECTED key. Anything else fails the handshake.
+    SPKI must equal the expected key's exactly (public bytes; ct_eq only
+    for uniformity; no chain), the scheme must be Ed25519, and the
+    signature is checked with ring against the EXPECTED key. Anything else fails the handshake.
   → Client: connect(addr, &expected_server_key) builds TLS pinned to it.
   → Server: allow_peer(addr, &expected_client_key) puts the address on the
     allow-set AND records the key (QuicPeerPermit; a second key for an

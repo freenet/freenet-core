@@ -442,12 +442,20 @@ fn small_order_and_non_canonical_keys_are_refused() {
 }
 
 /// A signature draws exactly the 64 random bytes taken from the OS before
-/// signing: `DrawnRandom` panics if `xeddsa` asks for more, so this pins the
-/// assumption that bytes are never repeated or invented.
+/// signing: all of them are consumed (so none is wasted and the nonce gets
+/// the full 64), and `DrawnRandom` panics if `xeddsa` asks for more, so
+/// bytes are never repeated or invented.
 #[test]
 fn a_signature_draws_exactly_the_drawn_randomness() {
     let _seed = GlobalRng::seed_guard(SEED);
     let keys = TransportKeypair::new();
+    let mut drawn = super::DrawnRandom::new([3u8; super::XEDDSA_RANDOM_BYTES]);
+    super::sign_with(&keys.auth_token_signer(), b"transcript", &mut drawn);
+    assert_eq!(
+        drawn.used,
+        super::XEDDSA_RANDOM_BYTES,
+        "one signature consumes exactly the drawn bytes"
+    );
     let signature = super::xeddsa_sign(&keys.auth_token_signer(), b"transcript").unwrap();
     let peer = PeerKey::of(keys.public()).unwrap();
     assert!(
@@ -480,4 +488,34 @@ fn a_peer_key_prints_as_its_transport_key() {
     let peer = PeerKey::of(keys.public()).unwrap();
     assert_eq!(format!("{peer:?}"), format!("PeerKey({})", keys.public()));
     assert_eq!(peer.transport_key(), keys.public());
+}
+
+/// A key with a torsion component (the holder's key plus a point of order
+/// 8, or of order 2) is refused: its holder's signatures would verify under
+/// it for some nonces, so one secret could authenticate as several keys.
+/// The torsioned key is built in Edwards form and mapped back to its
+/// Montgomery u, which is what a peer would claim.
+#[test]
+fn a_key_with_a_torsion_component_is_refused() {
+    use curve25519_dalek::constants::EIGHT_TORSION;
+    use curve25519_dalek::edwards::CompressedEdwardsY;
+    let _seed = GlobalRng::seed_guard(SEED);
+    let mut refused = 0;
+    for _ in 0..16 {
+        let keys = TransportKeypair::new();
+        let honest = PeerKey::of(keys.public()).unwrap();
+        let a = CompressedEdwardsY(*honest.ed25519()).decompress().unwrap();
+        // EIGHT_TORSION[1] has order 8, [4] order 2.
+        for t in [EIGHT_TORSION[1], EIGHT_TORSION[4]] {
+            let mixed = a + t;
+            assert!(!mixed.is_small_order() && !mixed.is_torsion_free());
+            let u = mixed.to_montgomery().to_bytes();
+            assert!(
+                PeerKey::of(&TransportPublicKey::from_bytes(u)).is_err(),
+                "a key with a torsion component was accepted"
+            );
+            refused += 1;
+        }
+    }
+    assert_eq!(refused, 32);
 }

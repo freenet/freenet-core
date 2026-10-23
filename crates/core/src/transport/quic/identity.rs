@@ -65,10 +65,16 @@ const XEDDSA_SIGN_BIT: u8 = 0;
 ///   two order-8 points). Ed25519 verification (ring's included) does not
 ///   check the order of the public key, so for such a key a CertificateVerify
 ///   can be forged without any secret;
+/// - a key whose Edwards form has a torsion component (A + T, T of small
+///   order). Its holder's signatures under A also verify under A + T for
+///   about one nonce in eight, so one secret could authenticate as up to
+///   eight keys;
 /// - u = -1, which has no Edwards form.
 ///
-/// A key made from a secret by x25519-dalek is canonical and of prime order,
-/// so only a key a peer claims can be any of these.
+/// A key made from a secret by x25519-dalek is canonical and in the
+/// prime-order subgroup, so only a key a peer claims can be any of these.
+/// With these refused, one secret authenticates as exactly one transport
+/// key.
 #[derive(Debug, thiserror::Error)]
 #[error(
     "the transport public key is not a usable identity (non-canonical, small-order, or no Ed25519 form)"
@@ -149,8 +155,10 @@ impl PeerKey {
             return Err(UnusableKey);
         }
         let ed25519 = ed25519_public_key(key)?;
-        let point = ed25519_dalek::VerifyingKey::from_bytes(&ed25519).map_err(|_| UnusableKey)?;
-        if point.is_weak() {
+        let point = curve25519_dalek_v4::edwards::CompressedEdwardsY(ed25519)
+            .decompress()
+            .ok_or(UnusableKey)?;
+        if point.is_small_order() || !point.is_torsion_free() {
             return Err(UnusableKey);
         }
         Ok(Self {
@@ -371,12 +379,26 @@ impl Signer for XeddsaSigner {
 /// panic. Signing happens once per handshake, never in a per-packet path.
 fn xeddsa_sign(secret: &xeddsa::xed25519::PrivateKey, message: &[u8]) -> Result<[u8; 64], Error> {
     use ring_crypto::rand::SecureRandom;
-    use xeddsa::xeddsa::Sign;
+    use zeroize::Zeroize;
     let mut random = [0u8; XEDDSA_RANDOM_BYTES];
     ring_crypto::rand::SystemRandom::new()
         .fill(&mut random)
         .map_err(|_| Error::General("the OS entropy source failed".into()))?;
-    Ok(secret.sign(message, DrawnRandom::new(random)))
+    // `random` is Copy: the bytes are copied into `drawn`, and both copies
+    // are zeroized (this one here, `drawn`'s on drop).
+    let mut drawn = DrawnRandom::new(random);
+    random.zeroize();
+    Ok(sign_with(secret, message, &mut drawn))
+}
+
+/// XEdDSA-sign `message` with randomness from `drawn`.
+fn sign_with(
+    secret: &xeddsa::xed25519::PrivateKey,
+    message: &[u8],
+    drawn: &mut DrawnRandom,
+) -> [u8; 64] {
+    use xeddsa::xeddsa::Sign;
+    secret.sign(message, drawn)
 }
 
 /// The randomness XEdDSA draws per signature (its Z, 64 bytes).
@@ -389,6 +411,8 @@ const XEDDSA_RANDOM_BYTES: usize = 64;
 /// randomness (`a_signature_draws_exactly_the_drawn_randomness` pins it).
 struct DrawnRandom {
     bytes: [u8; XEDDSA_RANDOM_BYTES],
+    /// Bytes yielded so far; a signature must use all of them
+    /// (`a_signature_draws_exactly_the_drawn_randomness`).
     used: usize,
 }
 
