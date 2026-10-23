@@ -3766,6 +3766,202 @@ mod tests {
         (prefix, runs, bytes)
     }
 
+    /// One route of [`routed_server`]: a body declaring `declared` bytes
+    /// (chunked, with no size, when `None`) of which `body` is sent, then the
+    /// connection is held open (`stall`) or the body ends and it is closed.
+    struct Route {
+        suffix: String,
+        declared: Option<usize>,
+        body: Vec<u8>,
+        stall: bool,
+    }
+
+    impl Route {
+        /// The whole of `body` under its Content-Length.
+        fn whole(suffix: &str, body: Vec<u8>) -> Self {
+            Self {
+                suffix: suffix.to_string(),
+                declared: Some(body.len()),
+                body,
+                stall: false,
+            }
+        }
+    }
+
+    /// A server answering each request with the first route whose suffix
+    /// ends the request path, and a 404 for any other path. Returns its URL
+    /// prefix.
+    async fn routed_server(routes: Vec<Route>) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let prefix = format!("http://{}/", listener.local_addr().unwrap());
+        let routes = std::sync::Arc::new(routes);
+        tokio::spawn(async move {
+            while let Ok((mut conn, _)) = listener.accept().await {
+                let routes = routes.clone();
+                tokio::spawn(async move {
+                    let mut request = Vec::new();
+                    let mut buf = [0u8; 1024];
+                    while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match conn.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => request.extend_from_slice(&buf[..n]),
+                        }
+                    }
+                    let line = String::from_utf8_lossy(&request);
+                    let path = line.split_whitespace().nth(1).unwrap_or("").to_string();
+                    let Some(route) = routes.iter().find(|r| path.ends_with(&r.suffix)) else {
+                        let _sent = conn
+                            .write_all(
+                                b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                            )
+                            .await;
+                        return;
+                    };
+                    let mut reply = match route.declared {
+                        Some(n) => format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {n}\r\nConnection: close\r\n\r\n"
+                        )
+                        .into_bytes(),
+                        None => b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec(),
+                    };
+                    if route.declared.is_none() {
+                        reply.extend(format!("{:x}\r\n", route.body.len()).into_bytes());
+                        reply.extend(&route.body);
+                        reply.extend(b"\r\n");
+                        if !route.stall {
+                            reply.extend(b"0\r\n\r\n");
+                        }
+                    } else {
+                        reply.extend(&route.body);
+                    }
+                    let _sent = conn.write_all(&reply).await;
+                    if route.stall {
+                        tokio::time::sleep(Duration::from_secs(3600)).await;
+                    } else {
+                        let _done = conn.shutdown().await;
+                    }
+                });
+            }
+        });
+        prefix
+    }
+
+    /// #5799: a staging attempt that runs out its deadline is dropped
+    /// mid-download, so the download's own reconcile never runs and its
+    /// pre-charge (the whole Content-Length) is left on the ledger. The
+    /// flush in `stage_into` after the deadline reconciles it to the bytes
+    /// that arrived. The clock is paused and advanced past the deadline only
+    /// once the pre-charge and the bytes are in; until then the second
+    /// branch keeps the runtime busy, so the paused clock cannot jump ahead.
+    #[tokio::test(start_paused = true)]
+    async fn a_timed_out_attempt_is_reconciled_by_stage_into() {
+        use super::super::super::rollback::download_bytes_at;
+        use super::super::tests::fixed_now;
+        const MIB: u64 = 1024 * 1024;
+        let freenet = freenet_asset_name();
+        let manifest = manifest_for(&[(&freenet, b"the real archive")]);
+        let prefix = routed_server(vec![
+            Route::whole(MANIFEST, manifest.into_bytes()),
+            Route {
+                suffix: freenet.clone(),
+                declared: Some(5 << 20),
+                body: vec![b'x'; 100],
+                stall: true,
+            },
+        ])
+        .await;
+        let (_tmp, root) = test_root();
+        let dir = root.parent().unwrap();
+        let now = fixed_now();
+        let clock = move || now;
+        let deadline = Duration::from_secs(10);
+        let env = StageEnv {
+            deadline,
+            clock: &clock,
+            ..test_env(&prefix)
+        };
+        let part = root.join(TAG).join(format!("{freenet}.part"));
+        let run = stage_into(
+            &root,
+            "9.9.8",
+            || async { Ok(TAG.to_string()) },
+            Some("9.9.9"),
+            |_: &str| false,
+            &env,
+        );
+        let arrived = async {
+            let cap = std::time::Instant::now();
+            while download_bytes_at(dir, now) == 0
+                || fs::metadata(&part).map_or(0, |m| m.len()) < 100
+            {
+                assert!(
+                    cap.elapsed() < Duration::from_secs(60),
+                    "the download never got going"
+                );
+                tokio::task::yield_now().await;
+            }
+            assert_eq!(download_bytes_at(dir, now), 5 * MIB, "pre-charged");
+            tokio::time::advance(deadline).await;
+        };
+        let (outcome, ()) = tokio::join!(run, arrived);
+        assert_eq!(outcome, Staging::Deferred);
+        assert_eq!(download_bytes_at(dir, now), 100, "reconciled");
+        let error = cooldown(&root).unwrap().last_error;
+        assert!(error.contains("did not finish"), "{error}");
+    }
+
+    /// #5799: two downloads on one meter, the freenet archive (of unknown
+    /// size) then fdev, with the run killed during fdev. The ledger then
+    /// holds the archive's actual bytes plus fdev's pre-charge: a pre-charge
+    /// adds to the bytes already received rather than replacing them, and
+    /// is the download's own size, not all the allowance left.
+    #[tokio::test]
+    async fn a_run_killed_in_its_second_download_keeps_both_charges() {
+        use super::super::super::rollback::download_bytes_at;
+        use super::super::tests::{fixed_now, run_until};
+        const MIB: u64 = 1024 * 1024;
+        let freenet = freenet_asset_name();
+        let fdev = fdev_asset_name();
+        let archive = vec![b'a'; 1000];
+        let manifest = manifest_for(&[(&freenet, &archive), (&fdev, b"the real fdev")]);
+        let prefix = routed_server(vec![
+            Route::whole(MANIFEST, manifest.into_bytes()),
+            Route {
+                suffix: freenet.clone(),
+                declared: None,
+                body: archive,
+                stall: false,
+            },
+            Route {
+                suffix: fdev.clone(),
+                declared: Some(5 << 20),
+                body: vec![b'f'; 100],
+                stall: true,
+            },
+        ])
+        .await;
+        let (_tmp, root) = test_root();
+        let dir = root.parent().unwrap();
+        fs::create_dir_all(&root).unwrap();
+        let now = fixed_now();
+        let clock = move || now;
+        let meter = ByteMeter::charged_to(50 * MIB, dir, &clock);
+        let fdev_part = root.join(TAG).join(format!("{fdev}.part"));
+        // Killed once fdev's pre-charge has moved the ledger off the
+        // archive's reconciled 1000 bytes.
+        run_until(
+            stage_release_at(&root, &prefix, TAG, &unsigned, &meter),
+            || fdev_part.exists() && download_bytes_at(dir, now) != 1000,
+        )
+        .await;
+        assert!(
+            root.join(TAG).join(&freenet).exists(),
+            "the archive completed"
+        );
+        assert_eq!(download_bytes_at(dir, now), 1000 + 5 * MIB);
+    }
+
     /// #5799: the byte budget binds when downloads keep starting over, and
     /// stops the run that reaches it mid-download. From then on the node
     /// holds, without counting a failure and without a request, until the

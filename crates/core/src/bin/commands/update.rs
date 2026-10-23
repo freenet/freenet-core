@@ -4566,6 +4566,29 @@ done
         assert_eq!(download_bytes_at(dir, now), 3_000_000);
     }
 
+    /// #5799: an updater download whose body the server ends short of its
+    /// Content-Length fails, and is still reconciled: the ledger ends at
+    /// the bytes that arrived, not at the pre-charge.
+    #[tokio::test]
+    async fn a_short_updater_download_is_reconciled_to_what_arrived() {
+        use rollback::download_bytes_at;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let now = fixed_now();
+        let clock = move || now;
+        let server = partial_server(Some(3_000_000), 1_000_000, false).await;
+        let meter = updater_meter_at(Some(dir), true, &clock).unwrap();
+        let result = download_file(
+            &format!("{}asset", server.prefix),
+            &dir.join("asset"),
+            true,
+            &meter,
+        )
+        .await;
+        assert!(result.is_err(), "the body ends short");
+        assert_eq!(download_bytes_at(dir, now), 1_000_000);
+    }
+
     /// #5799: the updater draws on the byte budget staging uses, per node
     /// per day. A spent budget refuses an updater run before it requests the
     /// asset list; `--force` is never refused.
