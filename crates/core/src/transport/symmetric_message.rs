@@ -480,7 +480,7 @@ pub(crate) const QUIC_UPGRADE_MIN_VERSION: (u8, u8, u16) = (0, 2, 149);
 /// only correct if this code is in the `v` tag; no test can detect that slip
 /// once the marker says `Some`.
 #[cfg_attr(not(test), allow(dead_code))]
-pub(crate) const QUIC_UPGRADE_SHIPPED_IN: Option<(u8, u8, u16)> = None;
+pub(crate) const QUIC_UPGRADE_SHIPPED_IN: Option<(u8, u8, u16)> = Some((0, 2, 149));
 
 /// May an [`SymmetricMessagePayload::Upgrade`] be sent to a remote of
 /// `remote_version`? Fails closed: an unknown version (`None`) or one below

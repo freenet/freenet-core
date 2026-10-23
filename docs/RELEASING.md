@@ -436,11 +436,12 @@ Current wire-gated floors:
   Set to **`(0, 2, 149)`**, the release intended to first ship the decoder.
   Nothing sends the message yet; a later step sends it only to peers that pass
   `may_send_upgrade`, which reads this floor. Guarded by
-  `QUIC_UPGRADE_SHIPPED_IN`, now `None`, checked by
-  `symmetric_message.rs::upgrade_floor_tracks_the_shipping_release`: the bump
-  PR that lifts the crate to 0.2.149 goes red until the releaser either sets
-  `QUIC_UPGRADE_SHIPPED_IN = Some(QUIC_UPGRADE_MIN_VERSION)` (the decoder is in
-  that tag) or raises the floor (it is not). Bias HIGH: a peer at or below
+  `QUIC_UPGRADE_SHIPPED_IN`, checked by
+  `symmetric_message.rs::upgrade_floor_tracks_the_shipping_release`. It is set
+  to `Some((0, 2, 149))` ahead of the 0.2.149 cut, because the decoder (#5970)
+  is on `main` and therefore in every tag from 0.2.149 on. If 0.2.149 is cut
+  from a tree without #5970, that claim is false and the floor must be raised
+  instead; nothing can detect that slip once the marker says `Some`. Bias HIGH: a peer at or below
   0.2.147 panics on a payload it cannot decode and 0.2.148 drops it, so a floor
   set too low lets a later sender crash old peers. The decoder MUST ship in a
   release before any release that sends the message.
