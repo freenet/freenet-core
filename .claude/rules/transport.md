@@ -362,7 +362,9 @@ plus `egress_bytes`, `egress_bytes_waited`, `egress_wait_us_sum` / `_max`,
 `total-bandwidth-limit`), QUIC upgrade control messages received and
 ignored (`upgrade_control_received`) and hole-punch handshake packets dropped,
 one count per packet, because they were not encrypted under the attempt's
-inbound session key (`handshake_unauthenticated_dropped`). Each label set is declared once in a
+inbound session key (`handshake_unauthenticated_dropped`), QUIC endpoint deaths
+(`quic_endpoint_down`) and QUIC connections this node closed, by close code
+(`quic_close_sent_<label>`, one per `QuicCloseCode`). Each label set is declared once in a
 `labelled_counters!` list, so a new variant needs a snapshot field. Hot
 path writes are single relaxed atomics; `SentPacketTracker` keeps an
 `rto_expiries` count and a bounded per-stream final-ACK watch, both
@@ -965,7 +967,8 @@ Sending (QuicPath::send_short / send_stream / send_stream_chunks /
   to a quinn SendStream without that race.
 Receiving: one task per connection reads every stream (FuturesUnordered,
   no task per stream) and only uses try_send. If that task panics it is
-  counted (receive_task_panicked) and the connection is closed. Short
+  counted (receive_task_panicked) and the connection is closed with
+  close code DOWNGRADE (the peer falls back to UDP). Short
   and Control go to bounded channels (full: dropped and counted); Stream
   goes through the INBOUND ADAPTER (path/inbound.rs).
 Inbound adapter: a Stream's payload goes into an ordinary StreamHandle,
@@ -1023,6 +1026,84 @@ Not here: dedup (e5: is_duplicate_dispatch, completed_inbound_streams),
   resolves it (QUIC memory gate). Short-message budget keys are picked by
   the path and could equal a UDP transport-internal id: do not share the
   budget without separating the keys.
+```
+
+#### QUIC errors, close codes and liveness (`quic/error.rs`, `quic/liveness.rs`, #5940 step e4)
+
+Dead code in production while QUIC carries no traffic: with `transport-quic`
+off no endpoint is built and the transport reports `Disabled`.
+
+```
+Errors: TransportError::Quic(QuicError), beside TransportError::Udp and
+  opaque like it (classify with scope()). quic/error.rs maps every quinn
+  ConnectionError / ConnectError / WriteError / ReadError and the e3
+  QuicSendError / HeaderError / QuicConnectError / QuicAllowError to one
+  QuicErrorKind, with exhaustive matches (a new quinn variant does not
+  compile until it has a kind). Do not match quinn errors elsewhere to
+  decide what to do; convert and match the kind.
+  → Stream scope: Reset{code} (the peer reset a stream we read, or we
+    reset our own send whose source failed, SENDER_ABORTED),
+    Stopped{code} (the peer sent STOP_SENDING), InvalidFrame (the header
+    would be refused; fails the same way every time), StreamClosed (a
+    local misuse of quinn's stream API).
+  → Connection scope: ConnectionLost (peer closed with NODE_DROPPED_PEER
+    or an unknown code, closed here, peer stack closed with NO_ERROR,
+    stateless reset), TimedOut, EndpointDown, Protocol{code} (a QUIC
+    transport error that is not a TLS alert), Refused{reason}: Handshake
+    (a TLS alert, codes 0x100 to 0x1ff), Version, Downgrade and
+    IdentityMismatch (the peer's close codes), AllowSetFull, KeyConflict,
+    UnusableKey, Local.
+  → A connection-scope QUIC error ends the QUIC path only. e5 handles it
+    inside the transport (fallback to the UDP session, which stays up)
+    and never surfaces it to operations.
+Application error codes, one range per QUIC frame type, checked at
+  compile time in quic/error.rs, all one-byte varints:
+    0x00..=0x0f CONNECTION_CLOSE: close_code::NODE_DROPPED_PEER 0,
+                DOWNGRADE 1 (fall back to UDP), IDENTITY_MISMATCH 2
+    0x10..=0x1f STOP_SENDING: path::stop_code (receiver refusals)
+    0x20..=0x2f RESET_STREAM: path::reset_code (sender gave up)
+  The close codes are wire values a peer on another release reads: never
+  renumber them; add a new code at the next free value. A code the peer
+  does not know reads as ConnectionLost. Every close the QUIC code sends
+  goes through quic::close_connection (QuicConnection::close and Drop,
+  which sends NODE_DROPPED_PEER): it closes and counts only a connection
+  that is still open, so a second close neither replaces the peer's
+  reason nor counts again. Never call quinn's close with a bare number.
+Liveness: quinn spawns its endpoint driver itself and keeps no handle.
+  QuicRuntime wraps the FIRST task quinn spawns, which is the endpoint
+  driver (Endpoint::new_with_abstract_socket spawns it before returning;
+  later spawns are connection drivers). When that driver ends or panics
+  while the node holds the endpoint (an I/O error quinn cannot get past),
+  the endpoint's QuicAvailability turns Down for good, once, with a WARN
+  and quic_endpoint_down. Its connections end, accept() returns None and
+  connect() fails as EndpointDown. The UDP transport is untouched.
+  → NEVER feed endpoint death to ListenerExit: that exits the node.
+  → The driver ending after the node dropped its last handle is the
+    normal shutdown (QuicEndpoint's owner field is declared before the
+    quinn endpoint so it marks the endpoint released first), and is not
+    reported. A driver task dropped unfinished (runtime shutdown) is not
+    reported either.
+  → QuicAvailabilityWatch (QuicEndpoint::availability, and
+    OutboundConnectionHandler::quic_availability, which is Disabled with
+    no endpoint): get() any time, not_up() to wait. e5 reads it before
+    an upgrade and moves every path back to UDP when it turns Down.
+  → QuicEndpoint::spawn_accept_loop registers the accept loop with
+    BackgroundTaskMonitor as quic_accept_loop. The monitor treats any end
+    of a task as a node failure, so the loop drops its endpoint handle
+    and PARKS when accept() returns None. It hands attempts on with
+    try_send and ignores an attempt when the queue is full.
+  → run_node drains the monitor (wait_for_any_exit) BEFORE the event
+    listener opens the transport, so a task registered from the
+    transport's open path is not monitored. register() now logs that at
+    ERROR. e5 must register the accept loop through a monitor that is
+    still live (not yet waited on) at that point.
+Tests: one row per quinn variant in quic/error/tests.rs; each close code
+  sent by either side and seen by the peer as that code and kind; the
+  receive-task panic seen as DOWNGRADE; a driver killed by an injected
+  receive error (socket::ReceiveFault, test only) turns Down, counts
+  once, leaves the accept loop parked and the UDP side working; dropping
+  the endpoint is not a death; the transport reports Disabled with the
+  key off, and Down with its listener still running after a death.
 ```
 
 ### WHEN testing transport code
