@@ -12,36 +12,39 @@
 > successful update.
 
 
-The release pipeline is fully automated. Any maintainer with workflow-run access
-can cut a release by triggering one workflow; everything else cascades:
-crates.io publish, GitHub release with binaries, gateway updates, and the
-Matrix/River announcements.
+The release pipeline is fully automated: one workflow trigger cascades into
+the crates.io publish, the GitHub release with binaries, gateway updates, and
+the Matrix/River announcements.
 
-This doc covers the developer-facing happy path and the few places things can
-go wrong.
+> **Cut releases only via the `freenet:release` skill.** Its mandatory
+> preconditions come first: the auto-update canaries, a 30-minute real-NAT
+> soak of the exact SHA, and a telemetry baseline. CI exercises neither a real
+> NATed peer nor the shipping binary's own updater. The trigger commands below
+> are the step that skill runs after its gates pass; they are not a standalone
+> procedure. A `dry_run=true` dispatch is safe only from a ref that contains
+> #5939. From an older ref it still pushes, opens and auto-merges the
+> version-bump PR (#5936), so it needs the same gates there.
+
+This doc covers how the pipeline works once triggered, and the few places
+things can go wrong.
 
 ## Quickstart
 
-For a routine patch release, just run the workflow with no input — it
-auto-bumps the patch from the latest crates.io version:
-
-```bash
-gh workflow run release.yml --repo freenet/freenet-core
-```
-
-For a minor or major bump (or to pin a specific version), pass `version`:
+Only after the `freenet:release` preconditions have passed (see above), the
+skill triggers the workflow, always with an explicit version:
 
 ```bash
 gh workflow run release.yml \
     --repo freenet/freenet-core \
-    --field version=0.3.0
+    --field version=X.Y.Z
 ```
 
-That's it. Watch progress at <https://github.com/freenet/freenet-core/actions/workflows/release.yml>.
+Watch progress at <https://github.com/freenet/freenet-core/actions/workflows/release.yml>.
 
-The auto-bump reads `https://crates.io/api/v1/crates/freenet` to find the
-highest released version and increments the patch. So after `0.2.59` ships,
-the next bare run cuts `0.2.60`. Minor / major bumps are intentionally
+Do not leave `version` blank. A blank input auto-bumps instead: it reads
+`https://crates.io/api/v1/crates/freenet` to find the highest released
+version and increments the patch, ignoring `Cargo.toml`. So after `0.2.59`
+ships, the next bare run cuts `0.2.60`. Minor / major bumps are intentionally
 explicit — they're not auto-decidable from commit history.
 
 Within ~30–60 minutes you should see:
@@ -799,11 +802,9 @@ Before raising it:
 ## Rollback
 
 The release-agent refuses downgrades by design (`X.Y.Z < installed` returns
-403). To recover from a botched release, cut a new patch with the fix:
-
-```bash
-gh workflow run release.yml --field version=X.Y.Z+1
-```
+403). To recover from a botched release, cut a new patch with the fix,
+through the `freenet:release` skill. Its preconditions still apply to a
+fix-forward release.
 
 For a serious regression that needs immediate rollback, the operator path
 is `ssh ian@<host> 'sudo gateway-auto-update.sh --force --target-version
