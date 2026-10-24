@@ -88,15 +88,19 @@ exact deficit, no jitter), as the uncapped path does: PER-CONNECTION
 ADMISSION IS IN ORDER. A reservation whose wait would reach the stream's
 deadline is not made (TokenBucket::reserve_within, one lock) and the
 stream fails at once, blamed like a deadline failure with the would-be
-wait counted as connection time: a doomed reservation must never hold a
-place that delays the fragments behind it (otherwise above
+wait counted as connection time: a refused reservation takes no place, so
+it cannot delay the fragments behind it (otherwise above
 ~5 x rate / 1200 streams on a connection nearly every stream fails).
 Refusals are counted apart, egress_streams_refused_<cause> (connection or
 other; never cap, nothing has slept for the cap before a reservation), with
 gap + would-be wait as the gap, and their own WARN;
 egress_streams_abandoned_<cause> means only streams that died at the
-deadline. A newcomer CAN delay streams already in progress (as uncapped
-and in 0.2.147); a per-connection scheduler is future work. Only the
+deadline. A reservation that is made and later refunded (cancel, a later
+failure) does NOT move its followers up: queued waits are not recomputed.
+An admitted newcomer CAN delay streams already in progress (as uncapped
+and in 0.2.147); a per-connection scheduler is future work for both.
+egress_long_waits_<cause> does not count refusals; read it together with
+egress_streams_refused_<cause>. Only the
 connection wait is checked: a
 fragment can still fail on the node cap at the deadline. Otherwise the
 fragment keeps the payment (ConnectionPayment) through every later wait,

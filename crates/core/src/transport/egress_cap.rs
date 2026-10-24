@@ -17,7 +17,11 @@
 //! each waits for the reservations ahead of it. A reservation whose wait
 //! would reach the stream's [`PACED_WAIT_DEADLINE`] is not made
 //! (`TokenBucket::reserve_within`, one lock) and the stream fails at once,
-//! so a doomed fragment never holds a place that delays the ones behind it;
+//! so a refused fragment takes no place in the connection's queue; (a
+//! reservation that was made and is later given back, when its stream is
+//! cancelled or fails on a later wait, does not move its followers up:
+//! their waits were computed when they reserved and are not recomputed.
+//! A per-connection scheduler would be needed for that);
 //! it is counted as refused (`egress_streams_refused_<cause>`), apart from
 //! the streams that die at the deadline. A newcomer can still delay streams
 //! already in progress, as on the uncapped path and in 0.2.147; a
@@ -155,7 +159,9 @@ pub(crate) const LONG_WAIT: Duration =
 /// to `STREAM_CLAIM_TIMEOUT` (60 s). The sender's limit applies there on
 /// purpose, as admission control: a stream that cannot get one slot within
 /// 5 s fails fast and the operation retries, instead of waiting behind (and
-/// delaying) the streams already in progress.
+/// delaying) the streams already in progress. A newcomer that IS admitted
+/// can still delay them: it takes a place in the connection's order ahead
+/// of their next fragments.
 pub(crate) const PACED_WAIT_DEADLINE: Duration = STREAM_INACTIVITY_TIMEOUT;
 
 /// The long-wait warning is logged at most once per this interval.
@@ -874,7 +880,7 @@ impl EgressCap {
                     longest_gap_ms,
                     cause = cause.label(),
                     total_bandwidth_limit = self.rate_bytes_per_sec,
-                    remedy = remedy(cause),
+                    remedy = refusal_remedy(cause),
                     "Outbound streams refused: a fragment's turn on its connection \
                      would have come after the egress deadline, so the stream \
                      failed at once"
@@ -1003,6 +1009,22 @@ fn remedy(cause: WaitCause) -> &'static str {
         WaitCause::Other => {
             "the time went to the congestion window (slow ACKs), to the upstream \
              stream (for relayed streams) or elsewhere, not to the egress limits"
+        }
+    }
+}
+
+/// The remedy logged with a refusal: for `connection` the same as for a
+/// deadline failure; for `other` it says the earlier wait (cwnd, the
+/// upstream stream) used most of the gap and the connection's turn then
+/// came too late, instead of saying the egress limits were not involved.
+fn refusal_remedy(cause: WaitCause) -> &'static str {
+    match cause {
+        WaitCause::Cap | WaitCause::Connection => remedy(cause),
+        WaitCause::Other => {
+            "most of the gap went to the congestion window (slow ACKs) or to the \
+             upstream stream, and the connection's queue then left no turn before \
+             the deadline: look at the path first; raising \
+             min-bandwidth-per-connection or total-bandwidth-limit shortens the queue"
         }
     }
 }

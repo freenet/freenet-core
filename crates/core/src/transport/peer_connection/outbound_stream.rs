@@ -177,7 +177,10 @@ enum CappedAttempt<'a> {
 /// what took most of the gap with the would-be wait counted as connection
 /// time, and counted as refused (`egress_streams_refused_*`), apart from
 /// deadline deaths: waiting would fail it anyway, and its place would delay
-/// every fragment behind it. A newcomer can still delay streams already in
+/// every fragment behind it, so a refused reservation takes no place. (A
+/// reservation made and later refunded, on cancel or a later failure, does
+/// not move its followers up: their waits are not recomputed.) A newcomer
+/// that is admitted can still delay streams already in
 /// progress, as on the uncapped path and in 0.2.147. Only the connection
 /// wait is checked: a fragment can still fail on the node cap at the
 /// deadline. If it had to sleep, the attempt ends (`Retry`),
@@ -4558,8 +4561,8 @@ mod egress_cap_tests {
     /// A fragment whose connection reservation would only be due at or
     /// after `PACED_WAIT_DEADLINE` fails its stream at once, first fragment
     /// included (admission control: the operation retries elsewhere), and
-    /// gives the reservation back, so it does not delay the fragments
-    /// queued behind it. Here the connection's bucket owes 8 s of earlier
+    /// makes no reservation, so the fragments that reserve after it do not
+    /// wait for it. Here the connection's bucket owes 8 s of earlier
     /// reservations.
     async fn a_doomed_reservation_fails_fast_and_holds_no_debt(sender: Sender) {
         const RATE: usize = 100_000;
@@ -4632,7 +4635,8 @@ mod egress_cap_tests {
     /// streams beyond the round fail fast and the rest complete. The
     /// connection's rate fits 20 fragments in `PACED_WAIT_DEADLINE`; 30
     /// streams start at once. Every doomed reservation is given back at
-    /// once, so it never delays the fragments behind it: at least
+    /// once and takes no place in the queue, so it never delays the
+    /// fragments behind it: at least
     /// `MIN_SURVIVORS` streams complete and the connection stays busy (the
     /// completed streams' goodput is at least 90% of its rate). If doomed reservations kept
     /// their place until the deadline instead, each one would push every
@@ -4643,10 +4647,11 @@ mod egress_cap_tests {
         // A round holds ROUND_LIMIT reservations, so at most about
         // ROUND_LIMIT streams can keep a reservation within the deadline at
         // once; streams admitted past that are refused at a later fragment.
-        // Half the round is the bound asserted, well clear of where
-        // admission order at the start decides the exact number (measured:
-        // 20 of 30, send and pipe).
-        const MIN_SURVIVORS: usize = ROUND_LIMIT / 2;
+        // Measured: 20 of 30, send and pipe. The run draws no randomness
+        // (the node cap never refuses, so no jittered sleep happens; checked
+        // below), so the count does not vary with the seed. The floor leaves
+        // 4 streams for rounding at the round boundary.
+        const MIN_SURVIVORS: usize = ROUND_LIMIT - 4;
         const FRAGMENTS: usize = 8;
         let _seed = GlobalRng::seed_guard(24);
         let time = VirtualTime::new();
@@ -4684,6 +4689,7 @@ mod egress_cap_tests {
             "{survivors} of {STREAMS} streams completed, expected at least {MIN_SURVIVORS}"
         );
         let stats = socket.egress_cap().expect("cap").stats();
+        assert_eq!(stats.refusals, 0, "premise: the node-wide cap never binds");
         assert!(
             stats.streams_refused[1] > 0,
             "premise: the connection was overloaded"
@@ -4799,8 +4805,8 @@ mod egress_cap_tests {
             RecordingSocket::new(&time, None),
             Some(cap),
         ));
-        // 1 000 B/s (so a first fragment's slot fits in the deadline),
-        // starting at 1 500 tokens, far below the capacity.
+        // 1 000 B/s, starting at 1 500 tokens, far below the capacity, so
+        // the capacity clamp cannot hide the refund.
         let bucket = Arc::new(TokenBucket::new_with_time_source(
             100_000,
             1_000,
@@ -4860,8 +4866,8 @@ mod egress_cap_tests {
                 Err::<TransferStats, _>(TransportError::ChannelClosed)
             })
         };
-        // 1 000 B/s (so a first fragment's slot fits in the deadline),
-        // starting at 1 500 tokens, far below the capacity.
+        // 1 000 B/s, starting at 1 500 tokens, far below the capacity, so
+        // the capacity clamp cannot hide the refund.
         let bucket = Arc::new(TokenBucket::new_with_time_source(
             100_000,
             1_000,
@@ -4968,7 +4974,8 @@ mod egress_cap_tests {
 
     /// A stream aborted while it sleeps for its connection reservation
     /// (wait > 0) gives the reservation back: the debt it added to the
-    /// connection's bucket is gone, so it delays nobody behind it.
+    /// connection's bucket is gone, so it delays nobody who reserves after
+    /// it. (Fragments that reserved behind it keep their computed waits.)
     #[tokio::test(flavor = "current_thread")]
     async fn a_stream_dropped_while_waiting_for_its_connection_refunds_it() {
         const RATE: usize = 100_000;
@@ -5019,9 +5026,13 @@ mod egress_cap_tests {
     /// some fail at a later fragment (measured, send and pipe: 21 of 80
     /// complete, 29 are refused at their first fragment and 30 at a later
     /// one); a per-connection scheduler that protects them is future work.
+    /// The completion floor, `MIN_COMPLETED`, is 16 (the measured 21 less
+    /// 5 for rounding at the round boundary): a collapse in which streams
+    /// in progress are refused much more often falls below it.
     async fn arrivals_beyond_a_round_are_refused_not_left_to_time_out(sender: Sender) {
         const ROUND_LIMIT: usize = 20;
         const ARRIVALS: usize = 80;
+        const MIN_COMPLETED: usize = 16;
         const FRAGMENTS: usize = 6;
         let _seed = GlobalRng::seed_guard(29);
         let time = VirtualTime::new();
@@ -5057,7 +5068,19 @@ mod egress_cap_tests {
         let results = drive_results(&time, tasks).await;
         let failed = results.iter().filter(|r| r.is_err()).count() as u64;
         let stats = socket.egress_cap().expect("cap").stats();
+        assert_eq!(stats.refusals, 0, "premise: the node-wide cap never binds");
         assert!(failed > 0, "premise: the connection was overloaded");
+        let completed: std::collections::HashSet<u16> = results
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| r.is_ok())
+            .map(|(i, _)| 20_000 + i as u16)
+            .collect();
+        assert!(
+            completed.len() >= MIN_COMPLETED,
+            "{} of {ARRIVALS} streams completed, expected at least {MIN_COMPLETED}",
+            completed.len()
+        );
         assert_eq!(
             stats.streams_abandoned,
             [0, 0, 0],
@@ -5068,12 +5091,19 @@ mod egress_cap_tests {
             failed,
             "a failure was not a refusal"
         );
-        let sends = sent(&socket);
+        let sends: Vec<_> = sent(&socket)
+            .into_iter()
+            .filter(|d| completed.contains(&d.2))
+            .collect();
         let span = (sends.last().unwrap().0 - sends[0].0) as f64 / 1e9;
-        let goodput = ((sends.len() * payload) as f64 - PER_CONNECTION_BURST as f64) / span;
+        let goodput = (sends.len() * payload) as f64 / span;
+        // The completed streams alone use about 82% of the connection's
+        // rate (measured); the rest went to streams refused at a later
+        // fragment. 70% leaves room for rounding and still fails if the
+        // completed streams starve.
         assert!(
-            goodput >= 0.9 * rate as f64,
-            "goodput {goodput:.0} B/s of the connection's {rate} B/s"
+            goodput >= 0.7 * rate as f64,
+            "completed streams' goodput {goodput:.0} B/s of the connection's {rate} B/s"
         );
     }
 

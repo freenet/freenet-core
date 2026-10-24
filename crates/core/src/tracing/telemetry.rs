@@ -6662,9 +6662,9 @@ mod tests {
             egress_streams_abandoned_cap: 43,
             egress_streams_abandoned_connection: 44,
             egress_streams_abandoned_other: 45,
-            egress_streams_refused_cap: 46,
-            egress_streams_refused_connection: 47,
-            egress_streams_refused_other: 48,
+            egress_streams_refused_cap: 117,
+            egress_streams_refused_connection: 118,
+            egress_streams_refused_other: 119,
             egress_debt_hwm_bytes: 30,
             egress_debt_forgiven_bytes: 31,
             ..Default::default()
@@ -6711,6 +6711,9 @@ mod tests {
             ("egress_streams_abandoned_cap", 43),
             ("egress_streams_abandoned_connection", 44),
             ("egress_streams_abandoned_other", 45),
+            ("egress_streams_refused_cap", 117),
+            ("egress_streams_refused_connection", 118),
+            ("egress_streams_refused_other", 119),
             ("egress_debt_hwm_bytes", 30),
             ("egress_debt_forgiven_bytes", 31),
         ] {
