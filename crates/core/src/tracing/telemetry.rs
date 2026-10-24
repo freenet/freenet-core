@@ -2982,6 +2982,62 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                 "egress_debt_forgiven_bytes".into(),
                 serde_json::json!(snapshot.egress_debt_forgiven_bytes),
             );
+            m.insert(
+                "conn_identity_set_dialed".into(),
+                serde_json::json!(snapshot.conn_identity_set_dialed),
+            );
+            m.insert(
+                "conn_identity_set_expected_inbound".into(),
+                serde_json::json!(snapshot.conn_identity_set_expected_inbound),
+            );
+            m.insert(
+                "conn_identity_set_connect_request".into(),
+                serde_json::json!(snapshot.conn_identity_set_connect_request),
+            );
+            m.insert(
+                "conn_identity_same_connect_request".into(),
+                serde_json::json!(snapshot.conn_identity_same_connect_request),
+            );
+            m.insert(
+                "conn_identity_changed_connect_request".into(),
+                serde_json::json!(snapshot.conn_identity_changed_connect_request),
+            );
+            m.insert(
+                "conn_identity_connect_request_known_addr".into(),
+                serde_json::json!(snapshot.conn_identity_connect_request_known_addr),
+            );
+            m.insert(
+                "conn_identity_set_connect_peer".into(),
+                serde_json::json!(snapshot.conn_identity_set_connect_peer),
+            );
+            m.insert(
+                "conn_identity_same_connect_peer".into(),
+                serde_json::json!(snapshot.conn_identity_same_connect_peer),
+            );
+            m.insert(
+                "conn_identity_changed_connect_peer".into(),
+                serde_json::json!(snapshot.conn_identity_changed_connect_peer),
+            );
+            m.insert(
+                "conn_identity_changed_ring_promotion".into(),
+                serde_json::json!(snapshot.conn_identity_changed_ring_promotion),
+            );
+            m.insert(
+                "conn_identity_own_key".into(),
+                serde_json::json!(snapshot.conn_identity_own_key),
+            );
+            m.insert(
+                "conn_identity_duplicate_key".into(),
+                serde_json::json!(snapshot.conn_identity_duplicate_key),
+            );
+            m.insert(
+                "conn_identity_teardown_key_elsewhere".into(),
+                serde_json::json!(snapshot.conn_identity_teardown_key_elsewhere),
+            );
+            m.insert(
+                "conn_identity_teardown_unidentified".into(),
+                serde_json::json!(snapshot.conn_identity_teardown_unidentified),
+            );
             serde_json::Value::Object(m)
         }
         EventKind::InterestSync(interest_sync_event) => {
@@ -6768,5 +6824,51 @@ mod tests {
             snapshot,
         )));
         assert_eq!(json["handshake_unauthenticated_dropped"], 7);
+    }
+
+    /// The event-log JSON carries each connection identity count under its
+    /// own key (distinct non-zero values, so a swapped key is caught).
+    #[test]
+    fn transport_snapshot_json_carries_conn_identity_values() {
+        let snapshot = crate::transport::metrics::TransportSnapshot {
+            conn_identity_set_dialed: 61,
+            conn_identity_set_expected_inbound: 62,
+            conn_identity_set_connect_request: 63,
+            conn_identity_same_connect_request: 64,
+            conn_identity_changed_connect_request: 65,
+            conn_identity_connect_request_known_addr: 66,
+            conn_identity_set_connect_peer: 67,
+            conn_identity_same_connect_peer: 68,
+            conn_identity_changed_connect_peer: 69,
+            conn_identity_changed_ring_promotion: 70,
+            conn_identity_own_key: 71,
+            conn_identity_duplicate_key: 72,
+            conn_identity_teardown_key_elsewhere: 73,
+            conn_identity_teardown_unidentified: 74,
+            ..Default::default()
+        };
+        let reference = serde_json::to_value(&snapshot).unwrap();
+        let json = event_kind_to_json(&super::super::EventKind::TransportSnapshot(Box::new(
+            snapshot,
+        )));
+        for (key, expected) in [
+            ("conn_identity_set_dialed", 61),
+            ("conn_identity_set_expected_inbound", 62),
+            ("conn_identity_set_connect_request", 63),
+            ("conn_identity_same_connect_request", 64),
+            ("conn_identity_changed_connect_request", 65),
+            ("conn_identity_connect_request_known_addr", 66),
+            ("conn_identity_set_connect_peer", 67),
+            ("conn_identity_same_connect_peer", 68),
+            ("conn_identity_changed_connect_peer", 69),
+            ("conn_identity_changed_ring_promotion", 70),
+            ("conn_identity_own_key", 71),
+            ("conn_identity_duplicate_key", 72),
+            ("conn_identity_teardown_key_elsewhere", 73),
+            ("conn_identity_teardown_unidentified", 74),
+        ] {
+            assert_eq!(json[key], expected, "event-log value for {key}");
+            assert_eq!(json[key], reference[key], "serde value for {key}");
+        }
     }
 }

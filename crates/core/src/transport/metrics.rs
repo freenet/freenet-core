@@ -70,6 +70,58 @@ macro_rules! labelled_counters {
 }
 
 labelled_counters! {
+    /// A decision about the peer identity (public key) the node records for
+    /// a connection, counted where the node makes it, to measure how often a
+    /// connection's peer identity is set or changed after establishment.
+    /// Exported per period as `conn_identity_<label>`. Each `set_*`,
+    /// `same_*` and `changed_*` kind is one per decision on its path;
+    /// `connect_request_known_addr`, `own_key` and `duplicate_key` are
+    /// counted in addition to the kind of the decision they qualify.
+    pub(crate) enum ConnIdentity {
+        /// An outbound connection was established and recorded under the key
+        /// it was dialled with.
+        SetDialed => "set_dialed",
+        /// An inbound connection matched an expected-inbound registration and
+        /// was recorded under the key that registration carried.
+        SetExpectedInbound => "set_expected_inbound",
+        /// A ConnectRequest gave the joiner key of a connection that had none.
+        SetConnectRequest => "set_connect_request",
+        /// A ConnectRequest named the key the connection already had.
+        SameConnectRequest => "same_connect_request",
+        /// A ConnectRequest named a key other than the one the connection had,
+        /// and the connection's key was replaced with it.
+        ChangedConnectRequest => "changed_connect_request",
+        /// The ConnectRequest counted by one of the three kinds above gave the
+        /// joiner a known address equal to the connection's remote address,
+        /// rather than an unknown one.
+        ConnectRequestKnownAddr => "connect_request_known_addr",
+        /// A ConnectPeer for an existing connection gave the key of a
+        /// connection that had none.
+        SetConnectPeer => "set_connect_peer",
+        /// A ConnectPeer for an existing connection named the key it had.
+        SameConnectPeer => "same_connect_peer",
+        /// A ConnectPeer for an existing connection named a key other than the
+        /// one it had; the connection kept its key.
+        ChangedConnectPeer => "changed_connect_peer",
+        /// A ConnectPeer promoted an existing connection into the ring under a
+        /// key other than the one recorded for the connection.
+        ChangedRingPromotion => "changed_ring_promotion",
+        /// A connection was recorded under this node's own key, on any path.
+        OwnKey => "own_key",
+        /// A key was recorded for a connection while it was still recorded
+        /// for another open connection (the newer one replaces it in the
+        /// key-to-address map).
+        DuplicateKey => "duplicate_key",
+        /// Disconnect cleanup ran for a connection whose key is recorded for
+        /// another connection.
+        TeardownKeyElsewhere => "teardown_key_elsewhere",
+        /// Disconnect cleanup ran for a connection with no recorded key, so
+        /// its ring cleanup was keyed by this node's own key.
+        TeardownUnidentified => "teardown_unidentified",
+    }
+}
+
+labelled_counters! {
     /// Why an inbound stream was refused or evicted. Each has its own
     /// counter because each has a different remedy.
     pub(crate) enum InboundStreamOutcome {
@@ -395,6 +447,10 @@ pub struct TransportMetrics {
     /// pending, so a later packet under that key still completes it.
     handshake_unauthenticated_dropped: AtomicU64,
 
+    /// Connection identity decisions this period, by [`ConnIdentity`]
+    /// (reset each snapshot).
+    conn_identity: [AtomicU32; ConnIdentity::COUNT],
+
     /// Inbound streams refused or evicted this period, by reason (reset each
     /// snapshot). The never-reset twin is `cumulative_inbound_stream_outcomes`,
     /// which is what the OTel instrument observes.
@@ -538,6 +594,11 @@ struct NatDetailCounters {
     /// not being under the attempt's inbound key (bounded), one per packet.
     #[cfg(test)]
     handshake_unauthenticated_by_remote: parking_lot::Mutex<std::collections::VecDeque<SocketAddr>>,
+    /// Test-only record of connection identity decisions, kept only for the
+    /// remotes a test registered with `watch_conn_identity`; same rules as
+    /// `demux_watched`.
+    #[cfg(test)]
+    conn_identity_watched: DashMap<SocketAddr, Vec<ConnIdentity>>,
     /// Test-only log of observed-address reporters (bounded).
     #[cfg(test)]
     observed_reporters: parking_lot::Mutex<std::collections::VecDeque<SocketAddr>>,
@@ -752,6 +813,7 @@ impl TransportMetrics {
             upgrade_control_received: AtomicU64::new(0),
             cumulative_upgrade_control_received: AtomicU64::new(0),
             handshake_unauthenticated_dropped: AtomicU64::new(0),
+            conn_identity: Default::default(),
             inbound_stream_outcomes: Default::default(),
             nat_attempts_by_origin: Default::default(),
             nat_established_by_origin: Default::default(),
@@ -1076,6 +1138,39 @@ impl TransportMetrics {
             .iter()
             .filter(|addr| **addr == remote)
             .count()
+    }
+
+    /// Record a connection identity decision for the connection at `remote`
+    /// (`remote` is never exported).
+    pub(crate) fn record_conn_identity(&self, remote: SocketAddr, kind: ConnIdentity) {
+        #[cfg(test)]
+        if let Some(mut watched) = self.nat_detail.conn_identity_watched.get_mut(&remote) {
+            watched.push(kind);
+        }
+        #[cfg(not(test))]
+        let _ = remote;
+        self.conn_identity[kind as usize].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Test-only: start recording the connection identity decisions for the
+    /// connection at `remote`. Call before driving them. Same rules as
+    /// [`Self::watch_demux`].
+    #[cfg(test)]
+    pub(crate) fn watch_conn_identity(&self, remote: SocketAddr) {
+        self.nat_detail
+            .conn_identity_watched
+            .insert(remote, Vec::new());
+    }
+
+    /// Test-only: the connection identity decisions recorded, in order, for
+    /// the connection at `remote` since `watch_conn_identity`.
+    #[cfg(test)]
+    pub(crate) fn conn_identity_from(&self, remote: SocketAddr) -> Vec<ConnIdentity> {
+        self.nat_detail
+            .conn_identity_watched
+            .get(&remote)
+            .map(|kinds| kinds.clone())
+            .unwrap_or_default()
     }
 
     /// QUIC upgrade control messages received since process start, never
@@ -1626,6 +1721,7 @@ impl TransportMetrics {
         let demux = &self.demux_packets;
         let quic = &self.quic_ingress;
         let egress = &self.egress;
+        let identity = &self.conn_identity;
         SnapshotExtras {
             packets_sent: get64(&l.packets_sent),
             packets_retransmitted: get64(&l.packets_retransmitted),
@@ -1734,6 +1830,40 @@ impl TransportMetrics {
             egress_streams_refused_other: get64(&egress.streams_refused[WaitCause::Other as usize]),
             egress_debt_hwm_bytes: get64(&egress.debt_hwm_bytes),
             egress_debt_forgiven_bytes: get64(&egress.debt_forgiven_bytes),
+            conn_identity_set_dialed: get32(&identity[ConnIdentity::SetDialed as usize]),
+            conn_identity_set_expected_inbound: get32(
+                &identity[ConnIdentity::SetExpectedInbound as usize],
+            ),
+            conn_identity_set_connect_request: get32(
+                &identity[ConnIdentity::SetConnectRequest as usize],
+            ),
+            conn_identity_same_connect_request: get32(
+                &identity[ConnIdentity::SameConnectRequest as usize],
+            ),
+            conn_identity_changed_connect_request: get32(
+                &identity[ConnIdentity::ChangedConnectRequest as usize],
+            ),
+            conn_identity_connect_request_known_addr: get32(
+                &identity[ConnIdentity::ConnectRequestKnownAddr as usize],
+            ),
+            conn_identity_set_connect_peer: get32(&identity[ConnIdentity::SetConnectPeer as usize]),
+            conn_identity_same_connect_peer: get32(
+                &identity[ConnIdentity::SameConnectPeer as usize],
+            ),
+            conn_identity_changed_connect_peer: get32(
+                &identity[ConnIdentity::ChangedConnectPeer as usize],
+            ),
+            conn_identity_changed_ring_promotion: get32(
+                &identity[ConnIdentity::ChangedRingPromotion as usize],
+            ),
+            conn_identity_own_key: get32(&identity[ConnIdentity::OwnKey as usize]),
+            conn_identity_duplicate_key: get32(&identity[ConnIdentity::DuplicateKey as usize]),
+            conn_identity_teardown_key_elsewhere: get32(
+                &identity[ConnIdentity::TeardownKeyElsewhere as usize],
+            ),
+            conn_identity_teardown_unidentified: get32(
+                &identity[ConnIdentity::TeardownUnidentified as usize],
+            ),
         }
     }
 
@@ -2184,6 +2314,23 @@ pub struct TransportSnapshot {
     pub egress_streams_refused_other: u64,
     pub egress_debt_hwm_bytes: u64,
     pub egress_debt_forgiven_bytes: u64,
+    /// Connection identity decisions during the period, by
+    /// [`ConnIdentity`] (the field suffix is its label). Counts only, no
+    /// addresses or keys.
+    pub conn_identity_set_dialed: u32,
+    pub conn_identity_set_expected_inbound: u32,
+    pub conn_identity_set_connect_request: u32,
+    pub conn_identity_same_connect_request: u32,
+    pub conn_identity_changed_connect_request: u32,
+    pub conn_identity_connect_request_known_addr: u32,
+    pub conn_identity_set_connect_peer: u32,
+    pub conn_identity_same_connect_peer: u32,
+    pub conn_identity_changed_connect_peer: u32,
+    pub conn_identity_changed_ring_promotion: u32,
+    pub conn_identity_own_key: u32,
+    pub conn_identity_duplicate_key: u32,
+    pub conn_identity_teardown_key_elsewhere: u32,
+    pub conn_identity_teardown_unidentified: u32,
 }
 
 /// Per-connection RTT distribution fields of [`TransportSnapshot`]; see the
@@ -2287,6 +2434,20 @@ impl TransportSnapshot {
             egress_streams_refused_other,
             egress_debt_hwm_bytes,
             egress_debt_forgiven_bytes,
+            conn_identity_set_dialed,
+            conn_identity_set_expected_inbound,
+            conn_identity_set_connect_request,
+            conn_identity_same_connect_request,
+            conn_identity_changed_connect_request,
+            conn_identity_connect_request_known_addr,
+            conn_identity_set_connect_peer,
+            conn_identity_same_connect_peer,
+            conn_identity_changed_connect_peer,
+            conn_identity_changed_ring_promotion,
+            conn_identity_own_key,
+            conn_identity_duplicate_key,
+            conn_identity_teardown_key_elsewhere,
+            conn_identity_teardown_unidentified,
         } = extras;
         self.conn_rtt_connections = conn_rtt_connections;
         self.conn_srtt_p50_us = conn_srtt_p50_us;
@@ -2368,6 +2529,20 @@ impl TransportSnapshot {
         self.egress_streams_refused_other = egress_streams_refused_other;
         self.egress_debt_hwm_bytes = egress_debt_hwm_bytes;
         self.egress_debt_forgiven_bytes = egress_debt_forgiven_bytes;
+        self.conn_identity_set_dialed = conn_identity_set_dialed;
+        self.conn_identity_set_expected_inbound = conn_identity_set_expected_inbound;
+        self.conn_identity_set_connect_request = conn_identity_set_connect_request;
+        self.conn_identity_same_connect_request = conn_identity_same_connect_request;
+        self.conn_identity_changed_connect_request = conn_identity_changed_connect_request;
+        self.conn_identity_connect_request_known_addr = conn_identity_connect_request_known_addr;
+        self.conn_identity_set_connect_peer = conn_identity_set_connect_peer;
+        self.conn_identity_same_connect_peer = conn_identity_same_connect_peer;
+        self.conn_identity_changed_connect_peer = conn_identity_changed_connect_peer;
+        self.conn_identity_changed_ring_promotion = conn_identity_changed_ring_promotion;
+        self.conn_identity_own_key = conn_identity_own_key;
+        self.conn_identity_duplicate_key = conn_identity_duplicate_key;
+        self.conn_identity_teardown_key_elsewhere = conn_identity_teardown_key_elsewhere;
+        self.conn_identity_teardown_unidentified = conn_identity_teardown_unidentified;
         self
     }
 }
@@ -2529,6 +2704,23 @@ struct SnapshotExtras {
     pub egress_streams_refused_other: u64,
     pub egress_debt_hwm_bytes: u64,
     pub egress_debt_forgiven_bytes: u64,
+    /// Connection identity decisions during the period, by
+    /// [`ConnIdentity`] (the field suffix is its label). Counts only, no
+    /// addresses or keys.
+    pub conn_identity_set_dialed: u32,
+    pub conn_identity_set_expected_inbound: u32,
+    pub conn_identity_set_connect_request: u32,
+    pub conn_identity_same_connect_request: u32,
+    pub conn_identity_changed_connect_request: u32,
+    pub conn_identity_connect_request_known_addr: u32,
+    pub conn_identity_set_connect_peer: u32,
+    pub conn_identity_same_connect_peer: u32,
+    pub conn_identity_changed_connect_peer: u32,
+    pub conn_identity_changed_ring_promotion: u32,
+    pub conn_identity_own_key: u32,
+    pub conn_identity_duplicate_key: u32,
+    pub conn_identity_teardown_key_elsewhere: u32,
+    pub conn_identity_teardown_unidentified: u32,
 }
 
 impl SnapshotExtras {
@@ -2598,6 +2790,20 @@ impl SnapshotExtras {
             || self.egress_streams_refused_connection != 0
             || self.egress_streams_refused_other != 0
             || self.egress_debt_forgiven_bytes != 0
+            || self.conn_identity_set_dialed != 0
+            || self.conn_identity_set_expected_inbound != 0
+            || self.conn_identity_set_connect_request != 0
+            || self.conn_identity_same_connect_request != 0
+            || self.conn_identity_changed_connect_request != 0
+            || self.conn_identity_connect_request_known_addr != 0
+            || self.conn_identity_set_connect_peer != 0
+            || self.conn_identity_same_connect_peer != 0
+            || self.conn_identity_changed_connect_peer != 0
+            || self.conn_identity_changed_ring_promotion != 0
+            || self.conn_identity_own_key != 0
+            || self.conn_identity_duplicate_key != 0
+            || self.conn_identity_teardown_key_elsewhere != 0
+            || self.conn_identity_teardown_unidentified != 0
     }
 }
 
@@ -3512,6 +3718,7 @@ mod tests {
         );
         check(&EgressDecision::ALL, |v| v as usize, EgressDecision::label);
         check(&WaitCause::ALL, |v| v as usize, WaitCause::label);
+        check(&ConnIdentity::ALL, |v| v as usize, ConnIdentity::label);
     }
 
     /// The snapshot fields carrying an origin's period attempts and
@@ -3533,6 +3740,86 @@ mod tests {
                 snap.nat_established_ring_peer_no_transport,
             ),
         }
+    }
+
+    /// The snapshot field carrying a connection identity kind (exhaustive, as
+    /// above).
+    fn conn_identity_count(snap: &TransportSnapshot, kind: ConnIdentity) -> u32 {
+        match kind {
+            ConnIdentity::SetDialed => snap.conn_identity_set_dialed,
+            ConnIdentity::SetExpectedInbound => snap.conn_identity_set_expected_inbound,
+            ConnIdentity::SetConnectRequest => snap.conn_identity_set_connect_request,
+            ConnIdentity::SameConnectRequest => snap.conn_identity_same_connect_request,
+            ConnIdentity::ChangedConnectRequest => snap.conn_identity_changed_connect_request,
+            ConnIdentity::ConnectRequestKnownAddr => snap.conn_identity_connect_request_known_addr,
+            ConnIdentity::SetConnectPeer => snap.conn_identity_set_connect_peer,
+            ConnIdentity::SameConnectPeer => snap.conn_identity_same_connect_peer,
+            ConnIdentity::ChangedConnectPeer => snap.conn_identity_changed_connect_peer,
+            ConnIdentity::ChangedRingPromotion => snap.conn_identity_changed_ring_promotion,
+            ConnIdentity::OwnKey => snap.conn_identity_own_key,
+            ConnIdentity::DuplicateKey => snap.conn_identity_duplicate_key,
+            ConnIdentity::TeardownKeyElsewhere => snap.conn_identity_teardown_key_elsewhere,
+            ConnIdentity::TeardownUnidentified => snap.conn_identity_teardown_unidentified,
+        }
+    }
+
+    /// Connection identity decisions reach the snapshot and its JSON per
+    /// kind, each kind alone is activity, and they reset.
+    #[test]
+    fn conn_identity_counts_snapshot_json_and_reset() {
+        let metrics = TransportMetrics::new();
+        assert!(
+            metrics.take_snapshot().is_none(),
+            "a fresh instance is idle"
+        );
+        for (i, kind) in ConnIdentity::ALL.into_iter().enumerate() {
+            for _ in 0..=i {
+                metrics.record_conn_identity(TEST_REMOTE, kind);
+            }
+        }
+        let read = metrics.read_snapshot();
+        let snap = metrics
+            .take_snapshot()
+            .expect("connection identity decisions are activity");
+        let json = serde_json::to_value(&snap).unwrap();
+        for s in [&read, &snap] {
+            for (i, kind) in ConnIdentity::ALL.into_iter().enumerate() {
+                assert_eq!(conn_identity_count(s, kind), i as u32 + 1, "{kind:?}");
+            }
+        }
+        for (i, kind) in ConnIdentity::ALL.into_iter().enumerate() {
+            let key = format!("conn_identity_{}", kind.label());
+            assert_eq!(json[key.as_str()], i as u64 + 1, "JSON key {key}");
+        }
+        assert!(
+            metrics.take_snapshot().is_none(),
+            "connection identity counts must reset"
+        );
+        for kind in ConnIdentity::ALL {
+            let metrics = TransportMetrics::new();
+            metrics.record_conn_identity(TEST_REMOTE, kind);
+            let snap = metrics
+                .take_snapshot()
+                .unwrap_or_else(|| panic!("{kind:?} alone must be activity"));
+            assert_eq!(conn_identity_count(&snap, kind), 1, "{kind:?}");
+        }
+    }
+
+    /// The test record holds only watched remotes, in order.
+    #[test]
+    fn conn_identity_test_record_is_per_watched_remote() {
+        let metrics = TransportMetrics::new();
+        let watched: SocketAddr = "10.255.9.2:7".parse().unwrap();
+        let other: SocketAddr = "10.255.9.3:7".parse().unwrap();
+        metrics.watch_conn_identity(watched);
+        metrics.record_conn_identity(watched, ConnIdentity::SetDialed);
+        metrics.record_conn_identity(other, ConnIdentity::OwnKey);
+        metrics.record_conn_identity(watched, ConnIdentity::SameConnectRequest);
+        assert_eq!(
+            metrics.conn_identity_from(watched),
+            vec![ConnIdentity::SetDialed, ConnIdentity::SameConnectRequest]
+        );
+        assert!(metrics.conn_identity_from(other).is_empty());
     }
 
     /// The snapshot field carrying a stray-intro kind (exhaustive, as above).
@@ -4126,6 +4413,20 @@ mod tests {
             "egress_streams_refused_other",
             "egress_debt_hwm_bytes",
             "egress_debt_forgiven_bytes",
+            "conn_identity_set_dialed",
+            "conn_identity_set_expected_inbound",
+            "conn_identity_set_connect_request",
+            "conn_identity_same_connect_request",
+            "conn_identity_changed_connect_request",
+            "conn_identity_connect_request_known_addr",
+            "conn_identity_set_connect_peer",
+            "conn_identity_same_connect_peer",
+            "conn_identity_changed_connect_peer",
+            "conn_identity_changed_ring_promotion",
+            "conn_identity_own_key",
+            "conn_identity_duplicate_key",
+            "conn_identity_teardown_key_elsewhere",
+            "conn_identity_teardown_unidentified",
         ] {
             assert!(obj.contains_key(key), "missing key {key}");
         }
