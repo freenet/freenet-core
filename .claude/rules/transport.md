@@ -81,23 +81,61 @@ DemuxSocket owns one EgressCap (token bucket, allowed to go into debt) when
 total-bandwidth-limit is set, and charges EVERY datagram it sends. No setting
 → no cap → one Option check per send.
 
-Only stream fragment tasks WAIT for the bucket (send_stream, pipe_stream).
-With a cap, each admission attempt is: cwnd check, per-connection
-TokenBucket::try_take, node-wide egress_cap::try_take, back to back with no
-await before the send; if either bucket is short, take nothing (give the
-per-connection bytes back), sleep through StreamPacing (deficit x
-U[1.0, 1.4) + U[0, 2 ms)), and start again from the cwnd check. Nothing is
-held while waiting; the order among waiters is random, so connections share
-the cap by their number of waiting streams (no isolation between
-connections). StreamPacing (one per stream, only with a cap) measures the
-gap since the stream's previous fragment was sent, the gap the receiver's
-STREAM_INACTIVITY_TIMEOUT times, and is checked BEFORE every take and after
-every sleep, and on every poll of the cwnd wait: at PACED_WAIT_DEADLINE (5 s)
-the stream fails, stream-scoped, with its flight released, and the fragment is
-not sent. The deadline also applies to the first fragment, which the receiver
-does not time (its 5 s timer starts when fragment #1 arrives; before that it
-waits up to STREAM_CLAIM_TIMEOUT, 60 s). That is deliberate admission control:
-a stream that cannot get one slot in 5 s fails fast and the operation retries.
+Only stream fragment tasks WAIT for the bucket (send_stream, pipe_stream;
+outbound_stream.rs::capped_attempt). With a cap, a fragment pays its
+connection's bucket ONCE with TokenBucket::reserve (debt, then sleep the
+exact deficit, no jitter), as the uncapped path does: PER-CONNECTION
+ADMISSION IS IN ORDER. A reservation whose wait would reach the stream's
+deadline is not made (TokenBucket::reserve_within, one lock) and the
+stream fails at once, blamed like a deadline failure with the would-be
+wait counted as connection time: a refused reservation takes no place, so
+it cannot delay the fragments behind it (otherwise above
+~5 x rate / 1200 streams on a connection nearly every stream fails).
+Refusals are counted apart, egress_streams_refused_<cause> (connection or
+other; never cap, nothing has slept for the cap before a reservation), with
+gap + would-be wait as the gap, and their own WARN;
+egress_streams_abandoned_<cause> means only streams that died at the
+deadline. A reservation that is made and later refunded (cancel, a later
+failure) does NOT move its followers up: queued waits are not recomputed.
+An admitted newcomer CAN delay streams already in progress (as uncapped
+and in 0.2.147); a per-connection scheduler is future work for both.
+egress_long_waits_<cause> does not count refusals; read it together with
+egress_streams_refused_<cause>. Only the
+connection wait is checked: a
+fragment can still fail on the node cap at the deadline. Otherwise the
+fragment keeps the payment (ConnectionPayment) through every later wait,
+on cwnd and on the cap; if the fragment is not sent it is given back,
+clamped to capacity (a late refund credits at most one datagram the
+refill also covered: capacity moves between connections, the node cap
+holds; so no timer-slack margin is needed), and a send error after the
+take does not refund it (as uncapped). Rate updates every RTT can
+reorder waiters slightly, as on the uncapped reserve path; order is not
+a correctness property of the cap. Then each attempt is:
+cwnd check, node-wide egress_cap::try_take, back to back with no await
+before the send; if the cap is short, sleep through StreamPacing (deficit x
+U[1.0, 1.4) + U[0, 2 ms)) and start again from the cwnd check. NODE-CAP
+ADMISSION IS A RACE: nothing is held on the cap while waiting, the order
+among waiters is random, so connections share the cap by their number of
+waiting streams (no isolation between connections). The kept connection
+payment can be stale after a cwnd or cap wait (the bucket refills under
+it): a connection may then exceed its bucket by one datagram per waiting
+stream. That moves capacity between connections only; the node cap is
+unaffected.
+NEVER put a reservation on the NODE cap (earlier reservation/hold models
+there leaked capacity). 0.2.148 used try_take + jittered retry on
+the per-connection bucket too; the race starved streams on busy connections
+past 5 s (every abandonment on capped peers was `connection`, failures
+doubled on the busiest capped peer). StreamPacing (one per stream, only with
+a cap) measures the gap since the stream's previous fragment was sent, the
+gap the receiver's STREAM_INACTIVITY_TIMEOUT times, and is checked BEFORE
+every take and after every sleep, and on every poll of the cwnd wait: at
+PACED_WAIT_DEADLINE (5 s) the stream fails, stream-scoped, with its flight
+released, and the fragment is not sent. The deadline also applies to the
+first fragment, which the receiver does not time (its 5 s timer starts when
+fragment #1 arrives; before that it waits up to STREAM_CLAIM_TIMEOUT, 60 s).
+That is deliberate admission control: a stream that cannot get one slot in
+5 s fails fast and the operation retries elsewhere. The overload drop-off
+has the same shape as 0.2.147 (the receiver's timeout) but fails fast.
 In pipe_stream the first gap starts when the first upstream chunk arrives
 (pipe_stream's own 5 s upstream inactivity select bounds that wait), and
 from fragment #2 on, time waiting on the upstream stream counts toward the
@@ -120,13 +158,16 @@ before it sends (answered_connection_ack, receipts taken before the NoOp).
 Unpaced debt is capped at DEBT_LIMIT (1 s at the cap); the rest is forgiven
 (sent uncharged) and counted. Over any interval ending at a paced send the
 node sends at most burst + rate x interval + bytes forgiven in the
-interval. Invariant: nothing is reserved; a paced sender holds no capacity
-while it waits, and is charged only at its send. Gaps that reach LONG_WAIT
+interval. Invariant: nothing is reserved on the NODE cap; a paced sender
+holds no node-wide capacity while it waits, and is charged there only at
+its send (it does hold its per-connection reservation, see above). Gaps
+that reach LONG_WAIT
 (2.5 s) and abandoned streams are counted by what took most of the gap
 (WaitCause: cap, connection = the connection's own bucket, other = cwnd, the
-upstream stream for relayed streams, and the rest): egress_long_waits_<cause>, egress_streams_abandoned_<cause>.
-Each has its own rate-limited WARN with one line per cause seen since the last, each with its count and remedy; the
-per-stream abandonment line is at debug. The
+upstream stream for relayed streams, and the rest): egress_long_waits_<cause>,
+egress_streams_abandoned_<cause>, egress_streams_refused_<cause>. Each has
+its own rate-limited WARN with one line per cause seen since the last, each
+with its count and remedy; the per-stream abandonment line is at debug. The
 cap counts UDP payload, not IP/UDP headers.
 EgressCap::poll_admit is the poll form for a sender that is polled (the QUIC
 endpoint's UdpPoller, #5940): Ready exactly when try_take would succeed at
@@ -315,7 +356,8 @@ counted once by what happened to it, `quic_ingress_<label>`, one per
 `QuicIngressOutcome`; see "Socket Abstraction Rules") and outbound datagrams by how the
 node-wide egress cap paced them (`egress_<label>`, one per `EgressDecision`,
 plus `egress_bytes`, `egress_bytes_waited`, `egress_wait_us_sum` / `_max`,
-`egress_long_waits_<cause>`, `egress_streams_abandoned_<cause>`, `egress_debt_hwm_bytes`,
+`egress_long_waits_<cause>`, `egress_streams_abandoned_<cause>`,
+`egress_streams_refused_<cause>`, `egress_debt_hwm_bytes`,
 `egress_debt_forgiven_bytes`; all zero without
 `total-bandwidth-limit`) and QUIC upgrade control messages received and
 ignored (`upgrade_control_received`). Each label set is declared once in a
@@ -586,9 +628,9 @@ Token reservation:
   → Reserve BEFORE sending
   → Block if insufficient tokens
   → RTT-adaptive update interval
-  → With the node-wide egress cap, capped stream senders use
-    TokenBucket::try_take instead (take only if enough, else take nothing
-    and sleep), next to the node-wide take; see "Node-wide egress cap"
+  → With the node-wide egress cap, capped stream senders also reserve (in
+    order) and keep the reservation until the node-wide take succeeds,
+    giving it back if the fragment is not sent; see "Node-wide egress cap"
 ```
 
 ## Backoff, Jitter, and Recovery Rules

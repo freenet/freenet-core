@@ -189,7 +189,7 @@ Only one kind of send waits for the bucket:
 
 | Send | Behaviour when the bucket is empty |
 |------|------------------------------------|
-| Stream fragments (`send_stream`, `pipe_stream`) | After cwnd admission, take the datagram from the per-connection bucket and the node-wide bucket at the same moment, and send at once. If either is short, take nothing, sleep for the deficit times 1.0 to 1.4 plus 0 to 2 ms (random), and start again from the cwnd check. Nothing is held while waiting, and the order among waiting streams is random. A stream whose next fragment has not been sent 5 s after its previous one (the gap the receiver times, whatever the wait was for) fails. |
+| Stream fragments (`send_stream`, `pipe_stream`) | First reserve the datagram on the per-connection bucket and sleep until it is due, so a connection serves its streams in order; a reservation whose wait would reach the stream's 5 s deadline is not made, so it takes no place in the connection's order, and the stream fails at once (counted as refused, `egress_streams_refused_*`). A reservation that was made and is later given back (the stream is cancelled or fails on a later wait) does not move the fragments behind it up; their waits are not recomputed. An admitted new stream can still delay streams already in progress on the connection, as without a cap; a per-connection scheduler is future work. This looks only at the connection's wait, so a fragment can still fail on the node-wide bucket at the deadline. The fragment keeps that reservation through later waits. Then, right after a cwnd check, take the datagram from the node-wide bucket and send at once. If it is short, take nothing from it, sleep for the deficit times 1.0 to 1.4 plus 0 to 2 ms (random), and start again from the cwnd check. Nothing is held on the node-wide bucket while waiting, and the order among streams waiting for it is random. A stream whose next fragment has not been sent 5 s after its previous one (or after the stream started; the gap the receiver times, whatever the wait was for) fails. |
 | Everything else (handshakes, short messages, ACKs, receipts, keepalives, Pongs, retransmissions) | Sent at once and charged once sent. The bucket goes into debt, and the next stream fragments wait longer to pay it. |
 
 The sends that never wait are sent from places that must not block: the receive path
@@ -229,7 +229,10 @@ The `transport_snapshot` telemetry event carries, per period: `egress_immediate`
 `egress_bytes`, `egress_bytes_waited`, `egress_wait_us_sum`, `egress_wait_us_max`,
 `egress_long_waits_<cause>` (gaps of at least 2.5 s between one stream's fragments,
 half the receiver's 5 s stream inactivity timeout), `egress_streams_abandoned_<cause>`
-(streams failed at a 5 s gap), `egress_debt_hwm_bytes` (the largest control-traffic
+(streams failed at a 5 s gap), `egress_streams_refused_<cause>` (streams failed at
+once because their turn on the connection would have come after the 5 s deadline;
+`connection` or `other`; `egress_long_waits_*` does not count these, so read the two
+together), `egress_debt_hwm_bytes` (the largest control-traffic
 debt) and `egress_debt_forgiven_bytes`. `<cause>` is what took most of the gap: `cap`
 (sleeping for the node-wide cap), `connection` (sleeping for the connection's own
 bucket) or `other` (mostly waiting for the congestion window, or for the upstream stream when the stream is relayed). `egress_waited` and the
@@ -474,9 +477,15 @@ Two limits can cause it, and the counters and WARN lines say which:
 - `cap`: too many streams for the node-wide cap. Raise `total-bandwidth-limit`.
 - `connection`: too many streams on one connection for that connection's own bucket,
   which runs at `total-bandwidth-limit / active connections` (at least
-  `min-bandwidth-per-connection`). This is often the tighter limit: at 1 MB/s with 50
-  connections, a connection gets 20 KB/s, and 30 streams on it fail far more often than
-  the node-wide numbers suggest. Raise `min-bandwidth-per-connection` (or the total).
+  `min-bandwidth-per-connection`). A connection serves its streams' fragments in order,
+  so each stream gets one fragment per round of the connection's waiting streams: `N`
+  streams on a connection of `C` bytes/s wait about `N * 1200 / C` seconds between
+  fragments. Up to about `5 * C / 1200` streams fit in a 5 s round (at 20 KB/s, about
+  80); a stream whose turn would come later fails at once (`egress_streams_refused_*`)
+  and its operation retries. A new stream can still push one already in progress
+  past its turn, as without a cap. That is the same drop-off as before
+  the cap existed (when the receiver's 5 s timeout caught those streams), but it fails
+  fast. Raise `min-bandwidth-per-connection` (or the total).
 - `other`: the time went to the congestion window (slow ACKs), to the upstream stream
   (for relayed streams, from the second fragment on) or elsewhere; the egress settings
   are not the cause.
@@ -488,18 +497,22 @@ cwnd-abort counter (`stream_send_abort_cwnd` in `network_status`). A stream that
 also rises with congestion-window waits of 2.5 s or more, whatever the egress limits do.
 
 The 5 s limit also applies to a stream's first fragment, measured from when the stream
-started sending (for a relayed stream, from when its first upstream chunk arrived). The receiver only starts its 5 s timer after the first fragment arrives
-(before that it waits up to 60 s for the stream to be claimed), so for the first fragment
-the sender's limit is stricter than the receiver's. This is deliberate admission control:
-a stream that cannot get one slot within 5 s fails at once and the operation retries,
-instead of holding a stream open on a saturated cap.
+started sending (for a relayed stream, from when its first upstream chunk arrived). The
+receiver only starts its 5 s timer after the first fragment arrives (before that it waits
+up to 60 s for the stream to be claimed), so for the first fragment the sender's limit is
+stricter than the receiver's. This is deliberate admission control: a stream that cannot
+get a turn within 5 s fails at once and the operation retries, instead of waiting behind
+(and delaying) the streams already in progress. A new stream that does get a turn can
+still delay the streams already in progress, since it takes a place in the connection's
+order ahead of their next fragments.
 
-The risk is per fragment. With `N` streams waiting on a limit of `C` bytes/s, each
+The node-wide cap is shared by a race, so its risk is per fragment. With `N` streams
+waiting on the cap of `C` bytes/s, each
 wins a 1200-byte slot with probability about `1/N`, so a gap of more than 5 s has
 probability about `p = exp(-5 * C / (1200 * N))` per fragment, and a stream of `k`
-fragments fails with probability about `1 - exp(-k * p)`. For the node-wide cap, `C`
-is `total-bandwidth-limit` and `N` all waiting streams; for one connection, `C` is that
-connection's rate and `N` its waiting streams.
+fragments fails with probability about `1 - exp(-k * p)`. Here `C` is
+`total-bandwidth-limit` and `N` all waiting streams. (A connection's own bucket is not
+a race; see `connection` above.)
 
 | `C / N` (bytes/s per waiting stream) | `p` per fragment | 1 000 fragments (1.2 MB) | 10 000 (12 MB) | 47 000 (56 MB) |
 |---|---|---|---|---|

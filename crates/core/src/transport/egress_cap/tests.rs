@@ -240,8 +240,7 @@ async fn a_fragment_fails_its_stream_at_the_wait_deadline() {
                 match cap.try_take(PACKET, pacing.slept()) {
                     Ok(_) => panic!("admitted"),
                     Err(deficit) => {
-                        if let Err(gap) = pacing.sleep(&time, &cap, PacedBucket::Cap, deficit).await
-                        {
+                        if let Err(gap) = pacing.sleep(&time, &cap, deficit).await {
                             break gap;
                         }
                     }
@@ -268,33 +267,60 @@ async fn a_fragment_fails_its_stream_at_the_wait_deadline() {
 
 /// A gap that keeps growing past `LONG_WAIT` is reported once per fragment,
 /// not once per sleep, and blamed on the limit that took the time (here the
-/// connection's bucket).
+/// connection's bucket, whose waits are cut at `LONG_WAIT` and resumed).
 #[tokio::test(flavor = "current_thread")]
 async fn a_long_gap_is_reported_once_per_fragment() {
     let time = VirtualTime::new();
     let cap = std::sync::Arc::new(EgressCap::new(RATE, time.clone()));
-    {
+    let gap = {
         let (cap, time) = (cap.clone(), time.clone());
         drive_virtual(&time.clone(), async move {
             let mut pacing = StreamPacing::new(&time);
-            // 200 ms deficits for 4 s: about seven sleeps past LONG_WAIT.
+            pacing.sent(&time);
+            // 200 ms waits for 4 s: about seven past LONG_WAIT.
             while pacing.gap(&time) < Duration::from_secs(4) {
                 assert!(time.now_nanos() < 10_000_000_000, "gaps are not measured");
                 pacing
-                    .sleep(
-                        &time,
-                        &cap,
-                        PacedBucket::Connection,
-                        Duration::from_millis(200),
-                    )
+                    .wait_for_connection(&time, &cap, Duration::from_millis(200))
                     .await
                     .unwrap();
             }
+            // One wait across LONG_WAIT on the next fragment: reported once,
+            // and the wait still lasts its whole length.
+            pacing.sent(&time);
+            pacing
+                .wait_for_connection(&time, &cap, Duration::from_secs(4))
+                .await
+                .unwrap();
+            pacing.gap(&time)
         })
-        .await;
-    }
-    assert_eq!(cap.stats().long_waits, [0, 1, 0]);
+        .await
+    };
+    assert_eq!(gap, Duration::from_secs(4), "the wait was not cut short");
+    assert_eq!(cap.stats().long_waits, [0, 2, 0]);
     assert_eq!(cap.stats().streams_abandoned, [0, 0, 0]);
+}
+
+/// A connection wait longer than the deadline fails the stream AT the
+/// deadline, blamed on the connection.
+#[tokio::test(flavor = "current_thread")]
+async fn a_connection_wait_fails_its_stream_at_the_deadline() {
+    let time = VirtualTime::new();
+    let cap = std::sync::Arc::new(EgressCap::new(RATE, time.clone()));
+    let result = {
+        let (cap, time) = (cap.clone(), time.clone());
+        drive_virtual(&time.clone(), async move {
+            let mut pacing = StreamPacing::new(&time);
+            pacing.sent(&time);
+            pacing
+                .wait_for_connection(&time, &cap, Duration::from_secs(9))
+                .await
+        })
+        .await
+    };
+    assert_eq!(result, Err(PACED_WAIT_DEADLINE));
+    assert_eq!(time.now_nanos(), PACED_WAIT_DEADLINE.as_nanos() as u64);
+    assert_eq!(cap.stats().streams_abandoned, [0, 1, 0]);
 }
 
 /// The gap is the time since the stream's previous fragment was sent, as
@@ -324,14 +350,9 @@ async fn a_wait_on_the_connection_bucket_alone_counts_as_waited() {
         let (cap, time) = (cap.clone(), time.clone());
         drive_virtual(&time.clone(), async move {
             let mut pacing = StreamPacing::new(&time);
-            // The connection's bucket refused, with a 5 ms deficit.
+            // The connection's bucket reserved with a 5 ms deficit.
             pacing
-                .sleep(
-                    &time,
-                    &cap,
-                    PacedBucket::Connection,
-                    Duration::from_millis(5),
-                )
+                .wait_for_connection(&time, &cap, Duration::from_millis(5))
                 .await
                 .unwrap();
             let slept = pacing.slept();

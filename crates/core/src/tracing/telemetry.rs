@@ -2959,6 +2959,18 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                 serde_json::json!(snapshot.egress_streams_abandoned_other),
             );
             m.insert(
+                "egress_streams_refused_cap".into(),
+                serde_json::json!(snapshot.egress_streams_refused_cap),
+            );
+            m.insert(
+                "egress_streams_refused_connection".into(),
+                serde_json::json!(snapshot.egress_streams_refused_connection),
+            );
+            m.insert(
+                "egress_streams_refused_other".into(),
+                serde_json::json!(snapshot.egress_streams_refused_other),
+            );
+            m.insert(
                 "egress_debt_hwm_bytes".into(),
                 serde_json::json!(snapshot.egress_debt_hwm_bytes),
             );
@@ -6650,6 +6662,9 @@ mod tests {
             egress_streams_abandoned_cap: 43,
             egress_streams_abandoned_connection: 44,
             egress_streams_abandoned_other: 45,
+            egress_streams_refused_cap: 117,
+            egress_streams_refused_connection: 118,
+            egress_streams_refused_other: 119,
             egress_debt_hwm_bytes: 30,
             egress_debt_forgiven_bytes: 31,
             ..Default::default()
@@ -6696,6 +6711,9 @@ mod tests {
             ("egress_streams_abandoned_cap", 43),
             ("egress_streams_abandoned_connection", 44),
             ("egress_streams_abandoned_other", 45),
+            ("egress_streams_refused_cap", 117),
+            ("egress_streams_refused_connection", 118),
+            ("egress_streams_refused_other", 119),
             ("egress_debt_hwm_bytes", 30),
             ("egress_debt_forgiven_bytes", 31),
         ] {

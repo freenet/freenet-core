@@ -109,11 +109,36 @@ impl<T: TimeSource> TokenBucket<T> {
     pub fn reserve(&self, bytes: usize) -> Duration {
         let mut state = self.state.lock();
         self.refill_state(&mut state);
+        let wait_time = Self::wait_for(&state, bytes);
 
+        // Deduct tokens - may go negative to track "debt" from concurrent reservations.
+        // This ensures subsequent reservations see the accumulated deficit and wait longer.
+        state.tokens -= bytes as isize;
+
+        wait_time
+    }
+
+    /// [`Self::reserve`] only if its wait would be shorter than `limit`:
+    /// `Ok(wait)` with the tokens deducted, or `Err(wait)`, the wait it
+    /// would have had, with the bucket unchanged. One lock, so no other
+    /// reservation can see a debt that is then withdrawn. Used with the
+    /// node-wide egress cap, whose streams fail at a deadline (see
+    /// `transport::egress_cap`).
+    pub fn reserve_within(&self, bytes: usize, limit: Duration) -> Result<Duration, Duration> {
+        let mut state = self.state.lock();
+        self.refill_state(&mut state);
+        let wait_time = Self::wait_for(&state, bytes);
+        if wait_time >= limit {
+            return Err(wait_time);
+        }
+        state.tokens -= bytes as isize;
+        Ok(wait_time)
+    }
+
+    /// The wait [`Self::reserve`] returns for `bytes` in `state`.
+    fn wait_for(state: &BucketState, bytes: usize) -> Duration {
         let bytes_isize = bytes as isize;
-
-        // Calculate wait time BEFORE deducting
-        let wait_time = if state.tokens >= bytes_isize {
+        if state.tokens >= bytes_isize {
             // Sufficient tokens available
             Duration::ZERO
         } else if state.rate == 0 {
@@ -125,34 +150,15 @@ impl<T: TimeSource> TokenBucket<T> {
             let deficit = bytes_isize - state.tokens;
             let wait_secs = deficit as f64 / state.rate as f64;
             Duration::from_secs_f64(wait_secs)
-        };
-
-        // Deduct tokens - may go negative to track "debt" from concurrent reservations.
-        // This ensures subsequent reservations see the accumulated deficit and wait longer.
-        state.tokens -= bytes_isize;
-
-        wait_time
-    }
-
-    /// Take `bytes` only if the bucket holds that many now; otherwise take
-    /// nothing and say how long the rate needs to make up the deficit. Used
-    /// with the node-wide egress cap, so that the per-connection payment and
-    /// the node-wide take are made at the same moment for the same datagram
-    /// (see `transport::egress_cap`).
-    pub fn try_take(&self, bytes: usize) -> Result<(), Duration> {
-        let mut state = self.state.lock();
-        self.refill_state(&mut state);
-        let bytes_isize = bytes as isize;
-        if state.tokens >= bytes_isize || state.rate == 0 {
-            state.tokens -= bytes_isize;
-            return Ok(());
         }
-        let deficit = bytes_isize - state.tokens;
-        Err(Duration::from_secs_f64(deficit as f64 / state.rate as f64))
     }
 
-    /// Return `bytes` taken by [`Self::try_take`] for a datagram that will
-    /// not be sent now, never above the capacity.
+    /// Return `bytes` reserved with [`Self::reserve`] or
+    /// [`Self::reserve_within`] for a datagram that will not be sent, never
+    /// above the capacity. A late return, after the refill has already
+    /// passed the reservation's slot, can credit at most those bytes that
+    /// the refill also covered: with the node-wide egress cap that only
+    /// moves capacity between connections, and the node cap still holds.
     pub fn give_back(&self, bytes: usize) {
         let mut state = self.state.lock();
         let capacity = state.capacity as isize;
@@ -224,6 +230,28 @@ mod tests {
     use super::*;
     use crate::simulation::VirtualTime;
     use std::time::Duration;
+
+    /// `reserve_within` reserves only when the wait is shorter than the
+    /// limit; at or above it the bucket is left exactly as it was.
+    #[test]
+    fn reserve_within_reserves_only_below_the_limit() {
+        let time = VirtualTime::new();
+        let bucket = TokenBucket::new_with_time_source(1_000, 1_000, time.clone());
+        // Owes 2 s: the next 1 000 bytes wait 3 s.
+        bucket.reserve(3_000);
+        let three = Duration::from_secs(3);
+        assert_eq!(bucket.reserve_within(1_000, three), Err(three));
+        assert_eq!(
+            bucket.reserve_within(1_000, three),
+            Err(three),
+            "a refused reservation changed the bucket"
+        );
+        assert_eq!(
+            bucket.reserve_within(1_000, three + Duration::from_nanos(1)),
+            Ok(three)
+        );
+        assert_eq!(bucket.reserve(0), Duration::from_secs(3), "it was deducted");
+    }
 
     #[test]
     fn test_token_bucket_creation() {
