@@ -11,16 +11,28 @@
 //! # Who waits and who does not
 //!
 //! Only stream fragment tasks (`send_stream`, `pipe_stream`) wait for the
-//! bucket. After cwnd admission and the per-connection bucket they call
-//! [`try_take`]: if the bucket holds a datagram's worth, the bytes are taken
-//! and the fragment is sent at once; otherwise the task sleeps for the
-//! deficit at the cap rate (see [`jittered`]) and starts admission again from
-//! the cwnd check. Nothing is reserved while it sleeps, so a waiting stream
-//! holds no capacity. The order among waiting streams is random: whichever
-//! wakes when the bucket has enough takes it. So connections share the cap
-//! in proportion to their number of waiting streams; there is no isolation
+//! bucket. A fragment first pays its connection's own bucket with
+//! `TokenBucket::reserve` (into debt, then sleep for the deficit), as it does
+//! without a cap, so the fragments of one connection are admitted IN ORDER:
+//! each waits for the reservations ahead of it. It keeps that payment until
+//! it is sent (it is given back if the fragment is not sent). Then, right
+//! after a cwnd check, it calls [`try_take`]: if the bucket holds a
+//! datagram's worth, the bytes are taken and the fragment is sent at once;
+//! otherwise the task sleeps for the deficit at the cap rate (see
+//! [`jittered`]) and starts again from the cwnd check, keeping its
+//! connection payment and so its place on the connection. Nothing is
+//! reserved on THIS bucket while it sleeps, so a waiting stream holds no
+//! node-wide capacity. Node-wide admission is a race: whichever waiter wakes
+//! when the bucket has enough takes it. So connections share the cap in
+//! proportion to their number of waiting streams; there is no isolation
 //! between connections, and a peer driving many streams gets a
 //! proportional share.
+//!
+//! The connection payment kept across a node-wide wait can be stale: the
+//! connection's bucket refills meanwhile, so after a wait on the cap a
+//! connection may send up to one datagram per waiting stream beyond its
+//! bucket's bound. That only moves capacity between connections; the node
+//! cap is unaffected, since every datagram still takes from it at its send.
 //!
 //! Every other send is sent at once and charged after it is sent, even when
 //! the bucket is empty, which puts the bucket into debt. Paced senders then
@@ -41,15 +53,18 @@
 //! not yet paid off, at most [`DEBT_LIMIT`] of the rate; an unpaced send
 //! beyond that is sent but not charged (forgiven, and counted).
 //!
-//! A waiting stream gets a datagram when it wakes and finds enough in the
-//! bucket, with probability about `1/n` among `n` waiting streams, so each
-//! gets one every `n * 1200 / r` seconds on average at a cap of `r` bytes per
-//! second, and longer gaps have a geometric tail. A stream whose next
-//! fragment has not been sent [`PACED_WAIT_DEADLINE`] (the receiver's 5 s
-//! stream inactivity timeout) after its previous one fails, measured as the
-//! receiver measures it ([`StreamPacing`]), except for the first fragment,
-//! where the receiver waits longer and the limit is deliberate admission
-//! control. Gaps that reach [`LONG_WAIT`] and failed streams are counted by
+//! When the cap binds, a waiting stream gets a datagram when it wakes and
+//! finds enough in the bucket, with probability about `1/n` among `n`
+//! waiting streams, so each gets one every `n * 1200 / r` seconds on average
+//! at a cap of `r` bytes per second, and longer gaps have a geometric tail.
+//! (When only a connection's own bucket binds, its streams are served in
+//! order and a stream's gap is about one round of that connection's
+//! waiting streams.) A stream whose next fragment has not been sent
+//! [`PACED_WAIT_DEADLINE`] (the receiver's 5 s stream inactivity timeout)
+//! after its previous one fails, measured as the receiver measures it
+//! ([`StreamPacing`]). Before a stream's FIRST fragment the receiver has no
+//! 5 s timer (it waits up to `STREAM_CLAIM_TIMEOUT`, 60 s), so the first
+//! fragment is bounded by [`FIRST_FRAGMENT_DEADLINE`] instead. Gaps that reach [`LONG_WAIT`] and failed streams are counted by
 //! what took most of the gap: the cap, the connection's own bucket (whose
 //! rate is the cap divided among the connections), or something else such
 //! as cwnd or, from a relayed stream's second fragment on, the upstream stream
@@ -104,20 +119,35 @@ pub(crate) const LONG_WAIT: Duration =
     Duration::from_millis(STREAM_INACTIVITY_TIMEOUT.as_millis() as u64 / 2);
 
 /// With a cap, a stream whose next fragment has not been sent this long
-/// after its previous one (or after the stream started; for a relayed stream, after its first upstream chunk arrived) fails: the receiver
-/// gives up a stream after the same gap between fragments and is never told
-/// the sender is still trying, so waiting longer only spends the shared cap
-/// on a stream nobody will finish. The gap counts every wait (the cap, the
-/// connection's bucket, cwnd, and for a relayed stream, from its second
-/// fragment on, the upstream stream),
-/// as the receiver's does.
-///
-/// For a stream's first fragment this is stricter than the receiver: it
-/// starts its 5 s timer after fragment #1 arrives and before that waits up
-/// to `STREAM_CLAIM_TIMEOUT` (60 s). The sender's limit applies there on
-/// purpose, as admission control: a stream that cannot get one slot within
-/// 5 s fails fast and the operation retries.
+/// after its previous one fails: the receiver gives up a stream after the
+/// same gap between fragments and is never told the sender is still trying,
+/// so waiting longer only spends the shared cap on a stream nobody will
+/// finish. The gap counts every wait (the cap, the connection's bucket,
+/// cwnd, and for a relayed stream the upstream stream), as the receiver's
+/// does. It does not apply to a stream's first fragment; see
+/// [`FIRST_FRAGMENT_DEADLINE`].
 pub(crate) const PACED_WAIT_DEADLINE: Duration = STREAM_INACTIVITY_TIMEOUT;
+
+/// With a cap, a stream whose FIRST fragment has not been sent this long
+/// after the stream started (for a relayed stream, after its first upstream
+/// chunk arrived) fails. The receiver starts its 5 s inactivity timer only
+/// when fragment #1 arrives; before that it waits for the stream up to
+/// `STREAM_CLAIM_TIMEOUT` (60 s), counted from when it learnt of the stream,
+/// which can be before the sender's stream task starts. So the 5 s
+/// [`PACED_WAIT_DEADLINE`] would fail first fragments the receiver would
+/// still have taken (0.2.148 field data: 11-15% of the streams failed there
+/// had not sent fragment #1). Half the claim timeout leaves the other half
+/// for the delay before the stream task started and for the rest of the
+/// stream, which the operation's own 60 s budget (`OPERATION_TTL`) must
+/// also cover.
+pub(crate) const FIRST_FRAGMENT_DEADLINE: Duration = Duration::from_secs(30);
+
+const _: () = assert!(
+    FIRST_FRAGMENT_DEADLINE.as_secs() * 2
+        <= crate::operations::orphan_streams::STREAM_CLAIM_TIMEOUT.as_secs()
+        && FIRST_FRAGMENT_DEADLINE.as_secs() > PACED_WAIT_DEADLINE.as_secs(),
+    "FIRST_FRAGMENT_DEADLINE must be above PACED_WAIT_DEADLINE and at most half STREAM_CLAIM_TIMEOUT"
+);
 
 /// The long-wait warning is logged at most once per this interval.
 const LONG_WAIT_WARN_INTERVAL: Duration = Duration::from_secs(60);
@@ -925,17 +955,6 @@ fn remedy(cause: WaitCause) -> &'static str {
     }
 }
 
-/// The bucket a paced stream slept for. Only these two are sleeps for the
-/// egress limits; [`WaitCause::Other`] is whatever else fills a gap, so it
-/// cannot be credited to a sleep.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum PacedBucket {
-    /// The node-wide cap.
-    Cap,
-    /// The connection's own bucket.
-    Connection,
-}
-
 /// One paced stream's gaps: the time since its previous fragment was sent
 /// (or since it started, before its first), which is the gap the receiver's
 /// `STREAM_INACTIVITY_TIMEOUT` measures, and how much of the current gap was
@@ -946,15 +965,41 @@ pub(crate) struct StreamPacing {
     cap_slept: Duration,
     connection_slept: Duration,
     long_reported: bool,
+    /// No fragment of the stream has been sent yet.
+    first: bool,
 }
 
 impl StreamPacing {
+    /// A stream that has sent nothing yet: its first gap runs from now.
     pub(crate) fn new<T: TimeSource>(time_source: &T) -> Self {
         Self {
             gap_start_ns: time_source.now_nanos(),
             cap_slept: Duration::ZERO,
             connection_slept: Duration::ZERO,
             long_reported: false,
+            first: true,
+        }
+    }
+
+    /// When the current gap fails the stream: [`FIRST_FRAGMENT_DEADLINE`]
+    /// before the first fragment, [`PACED_WAIT_DEADLINE`] after it.
+    pub(crate) fn deadline(&self) -> Duration {
+        if self.first {
+            FIRST_FRAGMENT_DEADLINE
+        } else {
+            PACED_WAIT_DEADLINE
+        }
+    }
+
+    /// How long the next sleep may last: to the deadline, and the first time
+    /// to [`LONG_WAIT`], so both are reported when they happen.
+    fn sleep_limit<T: TimeSource>(&self, time_source: &T) -> Duration {
+        let gap = self.gap(time_source);
+        let left = self.deadline().saturating_sub(gap);
+        if !self.long_reported && gap < LONG_WAIT {
+            left.min(LONG_WAIT - gap)
+        } else {
+            left
         }
     }
 
@@ -982,7 +1027,7 @@ impl StreamPacing {
     }
 
     /// Check the current gap: report it once when it reaches [`LONG_WAIT`],
-    /// and return `Err(gap)` when it reaches [`PACED_WAIT_DEADLINE`]: the
+    /// and return `Err(gap)` when it reaches [`Self::deadline`]: the
     /// caller must not send the fragment and fails the stream. Called before
     /// every attempt to take, and after every sleep.
     pub(crate) fn check<T: TimeSource>(
@@ -998,43 +1043,65 @@ impl StreamPacing {
             self.long_reported = true;
             cap.record_long_wait(self.cause(time_source), gap);
         }
-        if gap >= PACED_WAIT_DEADLINE {
+        if gap >= self.deadline() {
             cap.record_abandoned(self.cause(time_source), gap);
             return Err(gap);
         }
         Ok(())
     }
 
-    /// Sleep for a refused take's `deficit` (jittered) on the caller's
-    /// `TimeSource`, crediting the time to `bucket` (the cap or the
-    /// connection's bucket), then [`Self::check`]. The sleep stops at
-    /// [`LONG_WAIT`] the first time and at the deadline, so both are reported
-    /// when they happen.
+    /// Sleep for a take the node-wide cap refused with `deficit` (jittered)
+    /// on the caller's `TimeSource`, crediting the time to the cap, then
+    /// [`Self::check`]. The sleep stops at [`LONG_WAIT`] the first time and
+    /// at the deadline, so both are reported when they happen.
     pub(crate) async fn sleep<T: TimeSource>(
         &mut self,
         time_source: &T,
         cap: &EgressCap,
-        bucket: PacedBucket,
         deficit: Duration,
     ) -> Result<(), Duration> {
-        let gap = self.gap(time_source);
-        let mut left = PACED_WAIT_DEADLINE.saturating_sub(gap);
-        if !self.long_reported && gap < LONG_WAIT {
-            left = left.min(LONG_WAIT - gap);
-        }
+        let left = self.sleep_limit(time_source);
         let before = time_source.now_nanos();
         time_source.sleep(jittered(deficit).min(left)).await;
-        let slept = Duration::from_nanos(time_source.now_nanos().saturating_sub(before));
-        match bucket {
-            PacedBucket::Connection => self.connection_slept += slept,
-            PacedBucket::Cap => self.cap_slept += slept,
-        }
+        self.cap_slept += Duration::from_nanos(time_source.now_nanos().saturating_sub(before));
         self.check(time_source, cap)
     }
 
-    /// The fragment was sent: the next gap starts now.
+    /// Wait `wait`, the deficit `TokenBucket::reserve` returned for this
+    /// fragment's payment on its connection's bucket, without jitter, so the
+    /// connection's waiters wake in the order they reserved. The time is
+    /// credited to the connection. The sleep is cut at [`LONG_WAIT`] and at
+    /// the deadline as in [`Self::sleep`], then continues to the end of the
+    /// wait; `Err(gap)` at the deadline.
+    pub(crate) async fn wait_for_connection<T: TimeSource>(
+        &mut self,
+        time_source: &T,
+        cap: &EgressCap,
+        wait: Duration,
+    ) -> Result<(), Duration> {
+        let ready_at = time_source
+            .now_nanos()
+            .saturating_add(u64::try_from(wait.as_nanos()).unwrap_or(u64::MAX));
+        loop {
+            let now = time_source.now_nanos();
+            if now >= ready_at {
+                return Ok(());
+            }
+            let step = Duration::from_nanos(ready_at - now).min(self.sleep_limit(time_source));
+            time_source.sleep(step).await;
+            self.connection_slept +=
+                Duration::from_nanos(time_source.now_nanos().saturating_sub(now));
+            self.check(time_source, cap)?;
+        }
+    }
+
+    /// The fragment was sent: the next gap starts now, under
+    /// [`PACED_WAIT_DEADLINE`].
     pub(crate) fn sent<T: TimeSource>(&mut self, time_source: &T) {
-        *self = Self::new(time_source);
+        *self = Self {
+            first: false,
+            ..Self::new(time_source)
+        };
     }
 }
 

@@ -81,24 +81,36 @@ DemuxSocket owns one EgressCap (token bucket, allowed to go into debt) when
 total-bandwidth-limit is set, and charges EVERY datagram it sends. No setting
 → no cap → one Option check per send.
 
-Only stream fragment tasks WAIT for the bucket (send_stream, pipe_stream).
-With a cap, each admission attempt is: cwnd check, per-connection
-TokenBucket::try_take, node-wide egress_cap::try_take, back to back with no
-await before the send; if either bucket is short, take nothing (give the
-per-connection bytes back), sleep through StreamPacing (deficit x
-U[1.0, 1.4) + U[0, 2 ms)), and start again from the cwnd check. Nothing is
-held while waiting; the order among waiters is random, so connections share
-the cap by their number of waiting streams (no isolation between
-connections). StreamPacing (one per stream, only with a cap) measures the
-gap since the stream's previous fragment was sent, the gap the receiver's
-STREAM_INACTIVITY_TIMEOUT times, and is checked BEFORE every take and after
-every sleep, and on every poll of the cwnd wait: at PACED_WAIT_DEADLINE (5 s)
-the stream fails, stream-scoped, with its flight released, and the fragment is
-not sent. The deadline also applies to the first fragment, which the receiver
-does not time (its 5 s timer starts when fragment #1 arrives; before that it
-waits up to STREAM_CLAIM_TIMEOUT, 60 s). That is deliberate admission control:
-a stream that cannot get one slot in 5 s fails fast and the operation retries.
-In pipe_stream the first gap starts when the first upstream chunk arrives
+Only stream fragment tasks WAIT for the bucket (send_stream, pipe_stream;
+outbound_stream.rs::capped_attempt). With a cap, a fragment pays its
+connection's bucket ONCE with TokenBucket::reserve (debt, then sleep the
+exact deficit, no jitter), as the uncapped path does: PER-CONNECTION
+ADMISSION IS IN ORDER. It keeps that payment (ConnectionPayment, given back
+if the fragment is not sent) across every later wait. Then each attempt is:
+cwnd check, node-wide egress_cap::try_take, back to back with no await
+before the send; if the cap is short, sleep through StreamPacing (deficit x
+U[1.0, 1.4) + U[0, 2 ms)) and start again from the cwnd check. NODE-CAP
+ADMISSION IS A RACE: nothing is held on the cap while waiting, the order
+among waiters is random, so connections share the cap by their number of
+waiting streams (no isolation between connections). The kept connection
+payment can be stale after a cap wait (the bucket refills under it): a
+connection may then exceed its bucket by one datagram per waiting stream.
+That moves capacity between connections only; the node cap is unaffected.
+NEVER put a reservation on the NODE cap (earlier reservation/hold models
+there leaked capacity). 0.2.148 used try_take + jittered retry on
+the per-connection bucket too; the race starved streams on busy connections
+past 5 s (every abandonment on capped peers was `connection`, failures
+doubled on the busiest capped peer). StreamPacing (one per stream, only with
+a cap) measures the gap since the stream's previous fragment was sent, the
+gap the receiver's STREAM_INACTIVITY_TIMEOUT times, and is checked BEFORE
+every take and after every sleep, and on every poll of the cwnd wait: at
+PACED_WAIT_DEADLINE (5 s) the stream fails, stream-scoped, with its flight
+released, and the fragment is not sent. The deadline applies AFTER the first
+fragment only: the receiver does not time fragment #1 (its 5 s timer starts
+when fragment #1 arrives; before that it waits up to STREAM_CLAIM_TIMEOUT,
+60 s), so the first gap is bounded by FIRST_FRAGMENT_DEADLINE (30 s, half
+the claim timeout; const-asserted). In pipe_stream the first gap starts when
+the first upstream chunk arrives
 (pipe_stream's own 5 s upstream inactivity select bounds that wait), and
 from fragment #2 on, time waiting on the upstream stream counts toward the
 gap and is attributed to `other`. On capped nodes a stream that hits the
@@ -586,9 +598,9 @@ Token reservation:
   → Reserve BEFORE sending
   → Block if insufficient tokens
   → RTT-adaptive update interval
-  → With the node-wide egress cap, capped stream senders use
-    TokenBucket::try_take instead (take only if enough, else take nothing
-    and sleep), next to the node-wide take; see "Node-wide egress cap"
+  → With the node-wide egress cap, capped stream senders also reserve (in
+    order) and keep the reservation until the node-wide take succeeds,
+    giving it back if the fragment is not sent; see "Node-wide egress cap"
 ```
 
 ## Backoff, Jitter, and Recovery Rules
