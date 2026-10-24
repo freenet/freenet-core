@@ -2982,62 +2982,13 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                 "egress_debt_forgiven_bytes".into(),
                 serde_json::json!(snapshot.egress_debt_forgiven_bytes),
             );
-            m.insert(
-                "conn_identity_set_dialed".into(),
-                serde_json::json!(snapshot.conn_identity_set_dialed),
-            );
-            m.insert(
-                "conn_identity_set_expected_inbound".into(),
-                serde_json::json!(snapshot.conn_identity_set_expected_inbound),
-            );
-            m.insert(
-                "conn_identity_set_connect_request".into(),
-                serde_json::json!(snapshot.conn_identity_set_connect_request),
-            );
-            m.insert(
-                "conn_identity_same_connect_request".into(),
-                serde_json::json!(snapshot.conn_identity_same_connect_request),
-            );
-            m.insert(
-                "conn_identity_changed_connect_request".into(),
-                serde_json::json!(snapshot.conn_identity_changed_connect_request),
-            );
-            m.insert(
-                "conn_identity_connect_request_known_addr".into(),
-                serde_json::json!(snapshot.conn_identity_connect_request_known_addr),
-            );
-            m.insert(
-                "conn_identity_set_connect_peer".into(),
-                serde_json::json!(snapshot.conn_identity_set_connect_peer),
-            );
-            m.insert(
-                "conn_identity_same_connect_peer".into(),
-                serde_json::json!(snapshot.conn_identity_same_connect_peer),
-            );
-            m.insert(
-                "conn_identity_changed_connect_peer".into(),
-                serde_json::json!(snapshot.conn_identity_changed_connect_peer),
-            );
-            m.insert(
-                "conn_identity_changed_ring_promotion".into(),
-                serde_json::json!(snapshot.conn_identity_changed_ring_promotion),
-            );
-            m.insert(
-                "conn_identity_own_key".into(),
-                serde_json::json!(snapshot.conn_identity_own_key),
-            );
-            m.insert(
-                "conn_identity_duplicate_key".into(),
-                serde_json::json!(snapshot.conn_identity_duplicate_key),
-            );
-            m.insert(
-                "conn_identity_teardown_key_elsewhere".into(),
-                serde_json::json!(snapshot.conn_identity_teardown_key_elsewhere),
-            );
-            m.insert(
-                "conn_identity_teardown_unidentified".into(),
-                serde_json::json!(snapshot.conn_identity_teardown_unidentified),
-            );
+            // Connection identity counts are zero on almost every node in
+            // almost every period, so only non-zero ones are sent.
+            for (label, count) in snapshot.conn_identity_counts() {
+                if count != 0 {
+                    m.insert(format!("conn_identity_{label}"), serde_json::json!(count));
+                }
+            }
             serde_json::Value::Object(m)
         }
         EventKind::InterestSync(interest_sync_event) => {
@@ -6661,11 +6612,14 @@ mod tests {
     #[test]
     fn transport_snapshot_json_lists_every_field() {
         let snapshot = crate::transport::metrics::TransportSnapshot::default();
+        // The connection identity keys are sent only when non-zero, so a
+        // default snapshot carries none of them (see the test below).
         let mut expected: std::collections::BTreeSet<String> = serde_json::to_value(&snapshot)
             .unwrap()
             .as_object()
             .unwrap()
             .keys()
+            .filter(|key| !key.starts_with("conn_identity_"))
             .cloned()
             .collect();
         expected.insert("type".to_string());
@@ -6845,6 +6799,7 @@ mod tests {
             conn_identity_duplicate_key: 72,
             conn_identity_teardown_key_elsewhere: 73,
             conn_identity_teardown_unidentified: 74,
+            conn_identity_set_from_placeholder: 75,
             ..Default::default()
         };
         let reference = serde_json::to_value(&snapshot).unwrap();
@@ -6866,9 +6821,53 @@ mod tests {
             ("conn_identity_duplicate_key", 72),
             ("conn_identity_teardown_key_elsewhere", 73),
             ("conn_identity_teardown_unidentified", 74),
+            ("conn_identity_set_from_placeholder", 75),
         ] {
             assert_eq!(json[key], expected, "event-log value for {key}");
             assert_eq!(json[key], reference[key], "serde value for {key}");
+        }
+    }
+
+    /// Each connection identity key is in the event-log JSON exactly when its
+    /// count is non-zero, and every serde `conn_identity_*` field is covered.
+    #[test]
+    fn transport_snapshot_json_sends_conn_identity_keys_only_when_nonzero() {
+        let to_json = |snapshot: crate::transport::metrics::TransportSnapshot| {
+            event_kind_to_json(&super::super::EventKind::TransportSnapshot(Box::new(
+                snapshot,
+            )))
+        };
+        let identity_keys = |json: &serde_json::Value| -> Vec<String> {
+            json.as_object()
+                .unwrap()
+                .keys()
+                .filter(|key| key.starts_with("conn_identity_"))
+                .cloned()
+                .collect()
+        };
+        let zero = crate::transport::metrics::TransportSnapshot::default();
+        assert!(identity_keys(&to_json(zero.clone())).is_empty());
+
+        let serde_keys = identity_keys(&serde_json::to_value(&zero).unwrap());
+        assert_eq!(
+            serde_keys.len(),
+            crate::transport::ConnIdentity::COUNT,
+            "one serde field per kind"
+        );
+        for kind in crate::transport::ConnIdentity::ALL {
+            let key = format!("conn_identity_{}", kind.label());
+            assert!(serde_keys.contains(&key), "serde field {key}");
+            let mut snapshot = zero.clone();
+            let mut serde_value = serde_json::to_value(&snapshot).unwrap();
+            serde_value[key.as_str()] = serde_json::json!(5);
+            snapshot = serde_json::from_value(serde_value).unwrap();
+            let json = to_json(snapshot);
+            assert_eq!(
+                identity_keys(&json),
+                vec![key.clone()],
+                "only {key} is sent"
+            );
+            assert_eq!(json[key.as_str()], 5, "value for {key}");
         }
     }
 }

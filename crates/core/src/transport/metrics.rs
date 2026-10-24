@@ -73,10 +73,19 @@ labelled_counters! {
     /// A decision about the peer identity (public key) the node records for
     /// a connection, counted where the node makes it, to measure how often a
     /// connection's peer identity is set or changed after establishment.
-    /// Exported per period as `conn_identity_<label>`. Each `set_*`,
-    /// `same_*` and `changed_*` kind is one per decision on its path;
-    /// `connect_request_known_addr`, `own_key` and `duplicate_key` are
-    /// counted in addition to the kind of the decision they qualify.
+    /// Exported per period as `conn_identity_<label>`, each key only when its
+    /// count is non-zero. Each `set_*`, `same_*` and `changed_*` kind is one
+    /// per decision on its path; `connect_request_known_addr`, `own_key`,
+    /// `duplicate_key` and `changed_ring_promotion` (which accompanies a
+    /// `changed_connect_peer` or `set_connect_peer` on the same ConnectPeer)
+    /// are counted in addition to the kind of the decision they qualify.
+    ///
+    /// The event loop registers an expected inbound connection under this
+    /// node's own key until the connect op names the peer. Such a
+    /// connection counts `own_key` when recorded, `set_from_placeholder`
+    /// when a ConnectRequest or ConnectPeer names the peer, and never
+    /// `duplicate_key` or `teardown_key_elsewhere`, since several
+    /// connections can hold that key at once in ordinary operation.
     pub(crate) enum ConnIdentity {
         /// An outbound connection was established and recorded under the key
         /// it was dialled with.
@@ -103,21 +112,29 @@ labelled_counters! {
         /// A ConnectPeer for an existing connection named a key other than the
         /// one it had; the connection kept its key.
         ChangedConnectPeer => "changed_connect_peer",
-        /// A ConnectPeer promoted an existing connection into the ring under a
-        /// key other than the one recorded for the connection.
+        /// A ConnectPeer promoted an existing connection into the ring, and
+        /// the ring took it, under a key other than the one recorded for the
+        /// connection (not counted for the expected-inbound placeholder).
         ChangedRingPromotion => "changed_ring_promotion",
         /// A connection was recorded under this node's own key, on any path.
         OwnKey => "own_key",
-        /// A key was recorded for a connection while it was still recorded
-        /// for another open connection (the newer one replaces it in the
-        /// key-to-address map).
+        /// A key other than this node's own was recorded for a connection
+        /// while the key-to-address map held it for another open connection
+        /// that still has that key (the newer one replaces it in the map).
         DuplicateKey => "duplicate_key",
-        /// Disconnect cleanup ran for a connection whose key is recorded for
-        /// another connection.
+        /// Cleanup ran for a connection whose key, other than this node's
+        /// own, is recorded for another connection. Counted on transport
+        /// close, on an explicit drop, on the unpromoted-connection sweep and
+        /// when a new connection at the same address replaces the entry; not
+        /// on the cleanup when the event loop shuts down.
         TeardownKeyElsewhere => "teardown_key_elsewhere",
-        /// Disconnect cleanup ran for a connection with no recorded key, so
-        /// its ring cleanup was keyed by this node's own key.
+        /// Cleanup, on the same paths, ran for a connection with no recorded
+        /// key, so its ring cleanup was keyed by this node's own key.
         TeardownUnidentified => "teardown_unidentified",
+        /// A ConnectRequest or ConnectPeer named the peer of a connection
+        /// recorded under the expected-inbound placeholder (this node's own
+        /// key): the expected first identity, not a change.
+        SetFromPlaceholder => "set_from_placeholder",
     }
 }
 
@@ -1864,6 +1881,9 @@ impl TransportMetrics {
             conn_identity_teardown_unidentified: get32(
                 &identity[ConnIdentity::TeardownUnidentified as usize],
             ),
+            conn_identity_set_from_placeholder: get32(
+                &identity[ConnIdentity::SetFromPlaceholder as usize],
+            ),
         }
     }
 
@@ -2331,6 +2351,7 @@ pub struct TransportSnapshot {
     pub conn_identity_duplicate_key: u32,
     pub conn_identity_teardown_key_elsewhere: u32,
     pub conn_identity_teardown_unidentified: u32,
+    pub conn_identity_set_from_placeholder: u32,
 }
 
 /// Per-connection RTT distribution fields of [`TransportSnapshot`]; see the
@@ -2348,6 +2369,36 @@ struct ConnRttSnapshot {
 }
 
 impl TransportSnapshot {
+    /// The field carrying a connection identity kind's period count.
+    /// Exhaustive on purpose: a new `ConnIdentity` fails to compile here
+    /// until it has a field.
+    pub(crate) fn conn_identity(&self, kind: ConnIdentity) -> u32 {
+        match kind {
+            ConnIdentity::SetDialed => self.conn_identity_set_dialed,
+            ConnIdentity::SetExpectedInbound => self.conn_identity_set_expected_inbound,
+            ConnIdentity::SetConnectRequest => self.conn_identity_set_connect_request,
+            ConnIdentity::SameConnectRequest => self.conn_identity_same_connect_request,
+            ConnIdentity::ChangedConnectRequest => self.conn_identity_changed_connect_request,
+            ConnIdentity::ConnectRequestKnownAddr => self.conn_identity_connect_request_known_addr,
+            ConnIdentity::SetConnectPeer => self.conn_identity_set_connect_peer,
+            ConnIdentity::SameConnectPeer => self.conn_identity_same_connect_peer,
+            ConnIdentity::ChangedConnectPeer => self.conn_identity_changed_connect_peer,
+            ConnIdentity::ChangedRingPromotion => self.conn_identity_changed_ring_promotion,
+            ConnIdentity::OwnKey => self.conn_identity_own_key,
+            ConnIdentity::DuplicateKey => self.conn_identity_duplicate_key,
+            ConnIdentity::TeardownKeyElsewhere => self.conn_identity_teardown_key_elsewhere,
+            ConnIdentity::TeardownUnidentified => self.conn_identity_teardown_unidentified,
+            ConnIdentity::SetFromPlaceholder => self.conn_identity_set_from_placeholder,
+        }
+    }
+
+    /// Every connection identity kind's label and period count.
+    pub(crate) fn conn_identity_counts(&self) -> impl Iterator<Item = (&'static str, u32)> + '_ {
+        ConnIdentity::ALL
+            .into_iter()
+            .map(|kind| (kind.label(), self.conn_identity(kind)))
+    }
+
     /// Copy the per-connection RTT distribution and the redesign-baseline
     /// period counters into this snapshot.
     fn with_extras(mut self, conn_rtt: ConnRttSnapshot, extras: SnapshotExtras) -> Self {
@@ -2448,6 +2499,7 @@ impl TransportSnapshot {
             conn_identity_duplicate_key,
             conn_identity_teardown_key_elsewhere,
             conn_identity_teardown_unidentified,
+            conn_identity_set_from_placeholder,
         } = extras;
         self.conn_rtt_connections = conn_rtt_connections;
         self.conn_srtt_p50_us = conn_srtt_p50_us;
@@ -2543,6 +2595,7 @@ impl TransportSnapshot {
         self.conn_identity_duplicate_key = conn_identity_duplicate_key;
         self.conn_identity_teardown_key_elsewhere = conn_identity_teardown_key_elsewhere;
         self.conn_identity_teardown_unidentified = conn_identity_teardown_unidentified;
+        self.conn_identity_set_from_placeholder = conn_identity_set_from_placeholder;
         self
     }
 }
@@ -2721,6 +2774,7 @@ struct SnapshotExtras {
     pub conn_identity_duplicate_key: u32,
     pub conn_identity_teardown_key_elsewhere: u32,
     pub conn_identity_teardown_unidentified: u32,
+    pub conn_identity_set_from_placeholder: u32,
 }
 
 impl SnapshotExtras {
@@ -2804,6 +2858,7 @@ impl SnapshotExtras {
             || self.conn_identity_duplicate_key != 0
             || self.conn_identity_teardown_key_elsewhere != 0
             || self.conn_identity_teardown_unidentified != 0
+            || self.conn_identity_set_from_placeholder != 0
     }
 }
 
@@ -3742,25 +3797,8 @@ mod tests {
         }
     }
 
-    /// The snapshot field carrying a connection identity kind (exhaustive, as
-    /// above).
     fn conn_identity_count(snap: &TransportSnapshot, kind: ConnIdentity) -> u32 {
-        match kind {
-            ConnIdentity::SetDialed => snap.conn_identity_set_dialed,
-            ConnIdentity::SetExpectedInbound => snap.conn_identity_set_expected_inbound,
-            ConnIdentity::SetConnectRequest => snap.conn_identity_set_connect_request,
-            ConnIdentity::SameConnectRequest => snap.conn_identity_same_connect_request,
-            ConnIdentity::ChangedConnectRequest => snap.conn_identity_changed_connect_request,
-            ConnIdentity::ConnectRequestKnownAddr => snap.conn_identity_connect_request_known_addr,
-            ConnIdentity::SetConnectPeer => snap.conn_identity_set_connect_peer,
-            ConnIdentity::SameConnectPeer => snap.conn_identity_same_connect_peer,
-            ConnIdentity::ChangedConnectPeer => snap.conn_identity_changed_connect_peer,
-            ConnIdentity::ChangedRingPromotion => snap.conn_identity_changed_ring_promotion,
-            ConnIdentity::OwnKey => snap.conn_identity_own_key,
-            ConnIdentity::DuplicateKey => snap.conn_identity_duplicate_key,
-            ConnIdentity::TeardownKeyElsewhere => snap.conn_identity_teardown_key_elsewhere,
-            ConnIdentity::TeardownUnidentified => snap.conn_identity_teardown_unidentified,
-        }
+        snap.conn_identity(kind)
     }
 
     /// Connection identity decisions reach the snapshot and its JSON per
@@ -4427,6 +4465,7 @@ mod tests {
             "conn_identity_duplicate_key",
             "conn_identity_teardown_key_elsewhere",
             "conn_identity_teardown_unidentified",
+            "conn_identity_set_from_placeholder",
         ] {
             assert!(obj.contains_key(key), "missing key {key}");
         }

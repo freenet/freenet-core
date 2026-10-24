@@ -80,6 +80,11 @@ struct Harness {
 
 impl Harness {
     async fn new(id: &str) -> Self {
+        Self::with_max_connections(id, None).await
+    }
+
+    /// As [`Self::new`], with the ring's connection cap set to `max`.
+    async fn with_max_connections(id: &str, max: Option<usize>) -> Self {
         let config_args = crate::config::ConfigArgs {
             id: Some(id.to_string()),
             mode: Some(crate::contract::OperationMode::Local),
@@ -92,6 +97,10 @@ impl Harness {
         // A gateway needs no configured remote gateway to build, and accepts
         // unidentified inbound connections, which is the path under test.
         node_config.is_gateway = true;
+        if let Some(max) = max {
+            node_config.min_number_conn = Some(1);
+            node_config.max_number_conn = Some(max);
+        }
         let (_notification_rx, notification_tx) = crate::node::event_loop_notification_channel();
         let (ops_ch_channel, _ch_channel, _wait_for_event) =
             crate::contract::contract_handler_channel();
@@ -207,6 +216,14 @@ impl Harness {
 
     /// A ConnectPeer (connect op accepted `peer`) for an existing connection.
     async fn connect_peer(&mut self, peer: PeerKeyLocation) {
+        assert!(
+            self.try_connect_peer(peer).await,
+            "the existing connection must be reused"
+        );
+    }
+
+    /// As [`Self::connect_peer`], returning whether the callback got `Ok`.
+    async fn try_connect_peer(&mut self, peer: PeerKeyLocation) -> bool {
         let (callback, mut result_rx) = mpsc::channel::<Result<(SocketAddr, Option<usize>), ()>>(1);
         self.mgr
             .handle_connect_peer(
@@ -220,10 +237,21 @@ impl Harness {
             )
             .await
             .expect("handle_connect_peer");
-        assert!(
-            matches!(result_rx.try_recv(), Ok(Ok(_))),
-            "the existing connection must be reused"
-        );
+        matches!(result_rx.try_recv(), Ok(Ok(_)))
+    }
+
+    /// An inbound connection matched to an expected-inbound registration,
+    /// which the event loop makes under this node's own key
+    /// (`NodeEvent::ExpectPeerConnection`).
+    async fn accept_expected(&mut self, addr: SocketAddr) {
+        let registration = PeerKeyLocation::new(self.own_key(), addr);
+        self.establish(
+            addr,
+            Some(registration),
+            false,
+            ConnIdentity::SetExpectedInbound,
+        )
+        .await;
     }
 
     async fn transport_closed(&mut self, addr: SocketAddr) {
@@ -266,7 +294,8 @@ fn is_set(kind: ConnIdentity) -> bool {
         | ConnIdentity::SetConnectRequest
         | ConnIdentity::SetConnectPeer
         | ConnIdentity::SameConnectRequest
-        | ConnIdentity::SameConnectPeer => true,
+        | ConnIdentity::SameConnectPeer
+        | ConnIdentity::SetFromPlaceholder => true,
         ConnIdentity::ChangedConnectRequest
         | ConnIdentity::ConnectRequestKnownAddr
         | ConnIdentity::ChangedConnectPeer
@@ -465,16 +494,7 @@ async fn expected_inbound_under_own_key_counts_own_key() {
     let mut h = Harness::new("conn-identity-own-key").await;
     let remote: SocketAddr = "203.0.113.60:4601".parse().unwrap();
     watch(&[remote]);
-    // As `NodeEvent::ExpectPeerConnection` builds its registration.
-    let registration = PeerKeyLocation::new(h.own_key(), remote);
-
-    h.establish(
-        remote,
-        Some(registration),
-        false,
-        ConnIdentity::SetExpectedInbound,
-    )
-    .await;
+    h.accept_expected(remote).await;
 
     assert_eq!(
         seen(remote),
@@ -539,4 +559,136 @@ async fn dropping_an_unidentified_connection_counts_teardown_unidentified() {
     );
 
     assert_eq!(seen(remote), vec![ConnIdentity::TeardownUnidentified]);
+}
+
+/// The NAT path of a connect op registers an expected inbound connection
+/// (under this node's own key) and then sends ConnectPeer with the peer's
+/// key; the peer may also send a ConnectRequest. Several such connections
+/// can be open at once. This is the expected first identity: it counts
+/// `own_key` and `set_from_placeholder`, never `changed_*`,
+/// `duplicate_key` or `teardown_key_elsewhere`.
+#[tokio::test]
+async fn expected_inbound_then_named_peer_counts_set_from_placeholder() {
+    let mut h = Harness::new("conn-identity-placeholder").await;
+    let by_connect_peer: SocketAddr = "203.0.113.90:4901".parse().unwrap();
+    let by_request: SocketAddr = "203.0.113.91:4902".parse().unwrap();
+    watch(&[by_connect_peer, by_request]);
+    let (first, second) = (key(), key());
+
+    h.accept_expected(by_connect_peer).await;
+    h.accept_expected(by_request).await;
+    h.connect_peer(PeerKeyLocation::new(first.clone(), by_connect_peer))
+        .await;
+    h.connect_request(
+        by_request,
+        PeerKeyLocation::with_unknown_addr(second.clone()),
+    )
+    .await;
+    h.connect_peer(PeerKeyLocation::new(second, by_request))
+        .await;
+
+    assert_eq!(
+        seen(by_connect_peer),
+        vec![
+            ConnIdentity::SetExpectedInbound,
+            ConnIdentity::OwnKey,
+            ConnIdentity::SetFromPlaceholder,
+        ]
+    );
+    assert_eq!(
+        seen(by_request),
+        vec![
+            ConnIdentity::SetExpectedInbound,
+            ConnIdentity::OwnKey,
+            ConnIdentity::SetFromPlaceholder,
+            ConnIdentity::SameConnectPeer,
+        ]
+    );
+
+    // The connection still recorded under the placeholder closes while the
+    // map holds this node's key for another connection: not counted.
+    h.accept_expected("203.0.113.92:4903".parse().unwrap())
+        .await;
+    h.transport_closed(by_connect_peer).await;
+    assert_eq!(
+        seen(by_connect_peer).len(),
+        3,
+        "{:?}",
+        seen(by_connect_peer)
+    );
+    for addr in [by_connect_peer, by_request] {
+        let kinds = seen(addr);
+        assert!(
+            kinds
+                .iter()
+                .all(|k| is_set(*k) || *k == ConnIdentity::OwnKey),
+            "the expected-inbound path at {addr} counted {kinds:?}"
+        );
+    }
+}
+
+/// A ConnectRequest naming this node's own key counts `own_key` too.
+#[tokio::test]
+async fn connect_request_naming_own_key_counts_own_key() {
+    let mut h = Harness::new("conn-identity-own-key-request").await;
+    let remote: SocketAddr = "203.0.113.100:5001".parse().unwrap();
+    watch(&[remote]);
+
+    h.accept(remote).await;
+    let own = h.own_key();
+    h.connect_request(remote, PeerKeyLocation::with_unknown_addr(own))
+        .await;
+
+    assert_eq!(
+        seen(remote),
+        vec![ConnIdentity::SetConnectRequest, ConnIdentity::OwnKey]
+    );
+}
+
+/// A ConnectPeer naming this node's own key counts `own_key` too.
+#[tokio::test]
+async fn connect_peer_naming_own_key_counts_own_key() {
+    let mut h = Harness::new("conn-identity-own-key-connect-peer").await;
+    let remote: SocketAddr = "203.0.113.110:5101".parse().unwrap();
+    watch(&[remote]);
+
+    h.accept(remote).await;
+    let own = h.own_key();
+    h.connect_peer(PeerKeyLocation::new(own, remote)).await;
+
+    assert_eq!(
+        seen(remote),
+        vec![ConnIdentity::SetConnectPeer, ConnIdentity::OwnKey]
+    );
+}
+
+/// A ConnectPeer whose promotion the ring refuses (here at its connection
+/// cap) counts nothing, whatever key it names.
+#[tokio::test]
+async fn refused_ring_promotion_counts_nothing() {
+    let mut h = Harness::with_max_connections("conn-identity-refused-promotion", Some(1)).await;
+    let filler: SocketAddr = "203.0.113.120:5201".parse().unwrap();
+    let remote: SocketAddr = "203.0.113.121:5202".parse().unwrap();
+    watch(&[remote]);
+
+    h.dial(filler, &key()).await;
+    assert!(
+        h.mgr
+            .bridge
+            .op_manager
+            .ring
+            .connection_manager
+            .is_in_ring(filler),
+        "the ring is full"
+    );
+    h.accept(remote).await;
+    h.connect_request(remote, PeerKeyLocation::with_unknown_addr(key()))
+        .await;
+    assert!(
+        !h.try_connect_peer(PeerKeyLocation::new(key(), remote))
+            .await,
+        "the promotion is refused"
+    );
+
+    assert_eq!(seen(remote), vec![ConnIdentity::SetConnectRequest]);
 }

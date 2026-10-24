@@ -15,13 +15,43 @@ fn insert_addr_by_pub_key(
     key: TransportPublicKey,
     addr: SocketAddr,
 ) {
-    if key == *own_key {
+    // An expected inbound connection is recorded under this node's own key
+    // until the connect op names the peer, so several connections can hold
+    // it at once in ordinary operation. `own_key` counts those; they are
+    // not counted as `duplicate_key`.
+    let is_own = key == *own_key;
+    if is_own {
         TRANSPORT_METRICS.record_conn_identity(addr, ConnIdentity::OwnKey);
     }
-    if let Some(previous) = addr_by_pub_key.insert(key, addr) {
-        if previous != addr && connections.contains_key(&previous) {
-            TRANSPORT_METRICS.record_conn_identity(addr, ConnIdentity::DuplicateKey);
-        }
+    let duplicate = |previous: SocketAddr, key: &TransportPublicKey| {
+        previous != addr
+            && connections
+                .get(&previous)
+                .is_some_and(|entry| entry.pub_key.as_ref() == Some(key))
+    };
+    let previous = addr_by_pub_key.get(&key).copied();
+    if !is_own && previous.is_some_and(|previous| duplicate(previous, &key)) {
+        TRANSPORT_METRICS.record_conn_identity(addr, ConnIdentity::DuplicateKey);
+    }
+    addr_by_pub_key.insert(key, addr);
+}
+
+/// The identity kind for a connection whose recorded key is `recorded`
+/// when a ConnectRequest or ConnectPeer names `claimed`: one of the path's
+/// `set`, `same` or `changed` kinds, or `set_from_placeholder` when the
+/// recorded key is this node's own key (the expected-inbound placeholder)
+/// and the claim names another.
+fn classify_identity_claim(
+    recorded: Option<&TransportPublicKey>,
+    claimed: &TransportPublicKey,
+    own_key: &TransportPublicKey,
+    [set, same, changed]: [ConnIdentity; 3],
+) -> ConnIdentity {
+    match recorded {
+        None => set,
+        Some(recorded) if recorded == claimed => same,
+        Some(recorded) if recorded == own_key => ConnIdentity::SetFromPlaceholder,
+        Some(_) => changed,
     }
 }
 
@@ -29,9 +59,9 @@ impl P2pConnManager {
     /// Record `key` as the identity of the connection at `addr` in
     /// `addr_by_pub_key`, counting the identity telemetry that depends on
     /// what the map held: `own_key` when `key` is this node's own key, and
-    /// `duplicate_key` when the key was recorded for another connection
-    /// that is still open. Every insert into `addr_by_pub_key` goes through
-    /// here.
+    /// otherwise `duplicate_key` when the map held the key for another open
+    /// connection that still has that key. Every insert into
+    /// `addr_by_pub_key` goes through here.
     fn record_addr_by_pub_key(&mut self, key: TransportPublicKey, addr: SocketAddr) {
         insert_addr_by_pub_key(
             &mut self.addr_by_pub_key,
@@ -46,14 +76,18 @@ impl P2pConnManager {
     /// key is `pub_key`, when the cleanup is not keyed by a key recorded for
     /// this connection: either it has none (`teardown_unidentified`) or
     /// `addr_by_pub_key` maps its key to another connection
-    /// (`teardown_key_elsewhere`). Call before `addr_by_pub_key` is changed.
+    /// (`teardown_key_elsewhere`). A connection recorded under this node's
+    /// own key (the expected-inbound placeholder) is not counted: several
+    /// can hold it at once in ordinary operation. Call before
+    /// `addr_by_pub_key` is changed.
     fn record_identity_teardown(&self, addr: SocketAddr, pub_key: Option<&TransportPublicKey>) {
         match pub_key {
             None => {
                 TRANSPORT_METRICS.record_conn_identity(addr, ConnIdentity::TeardownUnidentified)
             }
             Some(key) => {
-                if self.addr_by_pub_key.get(key) != Some(&addr) {
+                let is_own = *key == *self.bridge.op_manager.ring.connection_manager.pub_key;
+                if !is_own && self.addr_by_pub_key.get(key) != Some(&addr) {
                     TRANSPORT_METRICS
                         .record_conn_identity(addr, ConnIdentity::TeardownKeyElsewhere);
                 }
@@ -413,15 +447,15 @@ impl P2pConnManager {
                         .ok();
                     return Ok(());
                 }
-                let recorded_key_differs = self
+                // Promoting under a key other than the connection's own,
+                // unless the connection holds the expected-inbound
+                // placeholder (counted as `set_from_placeholder` below).
+                let own_key = &connection_manager.pub_key;
+                let promotes_under_other_key = self
                     .connections
                     .get(&peer_addr)
                     .and_then(|entry| entry.pub_key.as_ref())
-                    .is_some_and(|recorded| recorded != peer.pub_key());
-                if recorded_key_differs {
-                    TRANSPORT_METRICS
-                        .record_conn_identity(peer_addr, ConnIdentity::ChangedRingPromotion);
-                }
+                    .is_some_and(|recorded| recorded != peer.pub_key() && recorded != &**own_key);
                 // #4787 instrumentation: count the promotion only if the ring
                 // actually took the connection. `add_connection`'s own `bool`
                 // reports the readiness-threshold crossing, NOT acceptance, so
@@ -441,6 +475,10 @@ impl P2pConnManager {
                     .await;
                 if outcome.added {
                     crate::node::network_status::record_bootstrap_promoted_to_ring();
+                    if promotes_under_other_key {
+                        TRANSPORT_METRICS
+                            .record_conn_identity(peer_addr, ConnIdentity::ChangedRingPromotion);
+                    }
                 }
                 let just_became_ready = outcome.just_became_ready;
                 tracing::info!(
@@ -509,11 +547,16 @@ impl P2pConnManager {
                         "connect_peer: updated transport entry with peer identity"
                     );
                 } else {
-                    let kind = if entry.pub_key.as_ref() == Some(peer.pub_key()) {
-                        ConnIdentity::SameConnectPeer
-                    } else {
-                        ConnIdentity::ChangedConnectPeer
-                    };
+                    let kind = classify_identity_claim(
+                        entry.pub_key.as_ref(),
+                        peer.pub_key(),
+                        &self.bridge.op_manager.ring.connection_manager.pub_key,
+                        [
+                            ConnIdentity::SetConnectPeer,
+                            ConnIdentity::SameConnectPeer,
+                            ConnIdentity::ChangedConnectPeer,
+                        ],
+                    );
                     TRANSPORT_METRICS.record_conn_identity(peer_addr, kind);
                     tracing::info!(
                         tx = %tx,
@@ -1535,13 +1578,16 @@ impl P2pConnManager {
                             // Check if we have a connection but with a different pub_key
                             if let Some(entry) = self.connections.get(&remote_addr) {
                                 // If we don't have the pub_key stored yet or it differs from the new one, update it
-                                let identity = match &entry.pub_key {
-                                    None => ConnIdentity::SetConnectRequest,
-                                    Some(old_pub_key) if old_pub_key == new_peer_id.pub_key() => {
-                                        ConnIdentity::SameConnectRequest
-                                    }
-                                    Some(_) => ConnIdentity::ChangedConnectRequest,
-                                };
+                                let identity = classify_identity_claim(
+                                    entry.pub_key.as_ref(),
+                                    new_peer_id.pub_key(),
+                                    &self.bridge.op_manager.ring.connection_manager.pub_key,
+                                    [
+                                        ConnIdentity::SetConnectRequest,
+                                        ConnIdentity::SameConnectRequest,
+                                        ConnIdentity::ChangedConnectRequest,
+                                    ],
+                                );
                                 TRANSPORT_METRICS.record_conn_identity(remote_addr, identity);
                                 if sender_addr == Some(remote_addr) {
                                     TRANSPORT_METRICS.record_conn_identity(
