@@ -2782,6 +2782,10 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                 serde_json::json!(snapshot.upgrade_control_received),
             );
             m.insert(
+                "handshake_unauthenticated_dropped".into(),
+                serde_json::json!(snapshot.handshake_unauthenticated_dropped),
+            );
+            m.insert(
                 "nat_fail_samples".into(),
                 serde_json::json!(snapshot.nat_fail_samples),
             );
@@ -6751,5 +6755,18 @@ mod tests {
             assert_eq!(json[key], expected, "event-log value for {key}");
             assert_eq!(json[key], reference[key], "serde value for {key}");
         }
+    }
+
+    /// The event-log JSON carries the dropped-handshake-packet count.
+    #[test]
+    fn transport_snapshot_json_carries_handshake_unauthenticated_dropped() {
+        let snapshot = crate::transport::metrics::TransportSnapshot {
+            handshake_unauthenticated_dropped: 7,
+            ..Default::default()
+        };
+        let json = event_kind_to_json(&super::super::EventKind::TransportSnapshot(Box::new(
+            snapshot,
+        )));
+        assert_eq!(json["handshake_unauthenticated_dropped"], 7);
     }
 }

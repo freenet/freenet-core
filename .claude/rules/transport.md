@@ -359,8 +359,10 @@ plus `egress_bytes`, `egress_bytes_waited`, `egress_wait_us_sum` / `_max`,
 `egress_long_waits_<cause>`, `egress_streams_abandoned_<cause>`,
 `egress_streams_refused_<cause>`, `egress_debt_hwm_bytes`,
 `egress_debt_forgiven_bytes`; all zero without
-`total-bandwidth-limit`) and QUIC upgrade control messages received and
-ignored (`upgrade_control_received`). Each label set is declared once in a
+`total-bandwidth-limit`), QUIC upgrade control messages received and
+ignored (`upgrade_control_received`) and hole-punch handshake packets dropped,
+one count per packet, because they were not encrypted under the attempt's
+inbound session key (`handshake_unauthenticated_dropped`). Each label set is declared once in a
 `labelled_counters!` list, so a new variant needs a snapshot field. Hot
 path writes are single relaxed atomics; `SentPacketTracker` keeps an
 `rto_expiries` count and a bounded per-stream final-ACK watch, both
@@ -493,6 +495,25 @@ Handshake send failures (#5871):
     via `SendFailed` at once. The best-effort version-mismatch ack only
     logs, so the peer is still recorded as outdated.
   → Never map a send error to `ChannelClosed`.
+
+Hole-punch completion (traverse_nat's RemoteInbound arm, the side that
+answered the remote's intro):
+  → Completes only on a packet encrypted under this attempt's inbound
+    session key. The success ack is unchanged here; a follow-up changes it.
+  → Any other packet is dropped and counted once per packet
+    (`handshake_unauthenticated_dropped`). The attempt goes back to
+    receiving without sending, within the current receive window, so
+    dropped packets cause no extra acks and do not delay the paced ones.
+    It stays pending until a packet under the key arrives or the
+    deadline passes.
+  → Every release encrypts the packets that complete this arm under that
+    key, so the check needs no version gate and no wire change. Tests run
+    a peer with the earlier rule (complete on any non-intro packet)
+    through LEGACY_HANDSHAKE_COMPLETION to check interop both ways, and
+    REMOTE_INBOUND_COMPLETIONS records which peer completed in this arm.
+  → Its logs, like every traverse_nat log, carry direction = "outbound"
+    even though this side is answering; the drop log adds
+    arm = "remote_inbound".
 
 Restart detection (all peers, not just gateways):
   → If an intro packet arrives on an established connection, attempt
