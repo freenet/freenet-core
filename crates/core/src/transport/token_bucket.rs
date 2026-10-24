@@ -134,11 +134,31 @@ impl<T: TimeSource> TokenBucket<T> {
         wait_time
     }
 
-    /// Return `bytes` reserved with [`Self::reserve`] for a datagram that
-    /// will not be sent, never above the capacity. Used with the node-wide
-    /// egress cap, where a fragment's reservation is kept across its waits
-    /// on cwnd and on the cap and given back if the stream fails (see
+    /// [`Self::reserve`], also returning when the reservation is due: the
+    /// time on this bucket's clock (ns) at which the wait ends.
+    pub fn reserve_due(&self, bytes: usize) -> (Duration, u64) {
+        let wait = self.reserve(bytes);
+        let due_at_ns = self
+            .time_source
+            .now_nanos()
+            .saturating_add(u64::try_from(wait.as_nanos()).unwrap_or(u64::MAX));
+        (wait, due_at_ns)
+    }
+
+    /// Return a reservation made with [`Self::reserve_due`] for a datagram
+    /// that will not be sent, but only while it is not yet past due
+    /// (`now <= due_at_ns`). Once it is past due the refill has covered its
+    /// slot, and returning it would credit the same tokens twice, so nothing
+    /// is returned. Used with the node-wide egress cap (see
     /// `transport::egress_cap`).
+    pub fn give_back_unless_past_due(&self, bytes: usize, due_at_ns: u64) {
+        if self.time_source.now_nanos() <= due_at_ns {
+            self.give_back(bytes);
+        }
+    }
+
+    /// Return `bytes` reserved with [`Self::reserve`] for a datagram that
+    /// will not be sent, never above the capacity.
     pub fn give_back(&self, bytes: usize) {
         let mut state = self.state.lock();
         let capacity = state.capacity as isize;
@@ -210,6 +230,35 @@ mod tests {
     use super::*;
     use crate::simulation::VirtualTime;
     use std::time::Duration;
+
+    /// A reservation given back while it is not yet past due restores the
+    /// bucket; one past due is not given back, because the refill already
+    /// covered its slot (a refund would credit the same tokens twice).
+    #[test]
+    fn a_reservation_is_given_back_only_until_it_is_due() {
+        let time = VirtualTime::new();
+        let bucket = TokenBucket::new_with_time_source(1_000, 1_000, time.clone());
+        // Empties the bucket; the next reservation is due at 1 s.
+        bucket.reserve(1_000);
+        let (wait, due) = bucket.reserve_due(1_000);
+        assert_eq!(wait, Duration::from_secs(1));
+        assert_eq!(due, 1_000_000_000);
+        time.advance(Duration::from_millis(500));
+        bucket.give_back_unless_past_due(1_000, due);
+        // As if the second reservation never happened: 500 refilled. Not
+        // refunded, the bucket would still owe 500.
+        assert_eq!(bucket.available_tokens(), 500);
+
+        let (_, due) = bucket.reserve_due(500);
+        assert_eq!(due, time.now_nanos(), "premise: due at once");
+        time.advance(Duration::from_millis(100));
+        bucket.give_back_unless_past_due(500, due);
+        assert_eq!(
+            bucket.available_tokens(),
+            100,
+            "a past-due payment was refunded"
+        );
+    }
 
     #[test]
     fn test_token_bucket_creation() {

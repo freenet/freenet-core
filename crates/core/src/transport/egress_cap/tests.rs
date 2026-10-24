@@ -229,8 +229,6 @@ async fn a_fragment_fails_its_stream_at_the_wait_deadline() {
         let (cap, time) = (cap.clone(), time.clone());
         drive_virtual(&time.clone(), async move {
             let mut pacing = StreamPacing::new(&time);
-            // A fragment after the first.
-            pacing.sent(&time);
             loop {
                 assert!(
                     time.now_nanos() < 2 * PACED_WAIT_DEADLINE.as_nanos() as u64,
@@ -323,50 +321,6 @@ async fn a_connection_wait_fails_its_stream_at_the_deadline() {
     assert_eq!(result, Err(PACED_WAIT_DEADLINE));
     assert_eq!(time.now_nanos(), PACED_WAIT_DEADLINE.as_nanos() as u64);
     assert_eq!(cap.stats().streams_abandoned, [0, 1, 0]);
-}
-
-/// Before a stream's first fragment the deadline is
-/// `FIRST_FRAGMENT_DEADLINE`, not `PACED_WAIT_DEADLINE`: the receiver does
-/// not time the first fragment against its 5 s inactivity timeout. At 30 B/s
-/// with the bucket drained a datagram needs 40 s, so the first fragment
-/// waits past 5 s and fails at `FIRST_FRAGMENT_DEADLINE`; once a fragment
-/// was sent, the same wait fails at `PACED_WAIT_DEADLINE`.
-#[tokio::test(flavor = "current_thread")]
-async fn the_first_fragment_has_its_own_deadline() {
-    for (first, deadline) in [
-        (true, FIRST_FRAGMENT_DEADLINE),
-        (false, PACED_WAIT_DEADLINE),
-    ] {
-        let time = VirtualTime::new();
-        let cap = std::sync::Arc::new(EgressCap::new(30, time.clone()));
-        cap.charge_unpaced(cap.burst_bytes() as usize);
-        let gap = {
-            let (cap, time) = (cap.clone(), time.clone());
-            drive_virtual(&time.clone(), async move {
-                let mut pacing = StreamPacing::new(&time);
-                if !first {
-                    pacing.sent(&time);
-                }
-                loop {
-                    if let Err(gap) = pacing.check(&time, &cap) {
-                        break gap;
-                    }
-                    match cap.try_take(PACKET, pacing.slept()) {
-                        Ok(_) => panic!("admitted"),
-                        Err(deficit) => {
-                            if let Err(gap) = pacing.sleep(&time, &cap, deficit).await {
-                                break gap;
-                            }
-                        }
-                    }
-                }
-            })
-            .await
-        };
-        assert_eq!(gap, deadline, "first fragment: {first}");
-        assert_eq!(time.now_nanos(), deadline.as_nanos() as u64);
-        assert_eq!(cap.stats().streams_abandoned, [1, 0, 0]);
-    }
 }
 
 /// The gap is the time since the stream's previous fragment was sent, as
@@ -766,7 +720,6 @@ fn no_stream_starves() {
 fn a_jump_straight_to_the_deadline_records_the_long_gap() {
     let (cap, time) = cap_at(RATE);
     let mut pacing = StreamPacing::new(&time);
-    pacing.sent(&time);
     time.advance(Duration::from_secs(1));
     assert_eq!(pacing.check(&time, &cap), Ok(()));
     assert_eq!(
