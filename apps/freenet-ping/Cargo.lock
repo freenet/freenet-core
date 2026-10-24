@@ -1715,7 +1715,7 @@ dependencies = [
 
 [[package]]
 name = "freenet"
-version = "0.2.148"
+version = "0.2.149"
 dependencies = [
  "aes-gcm",
  "ahash",
@@ -1735,6 +1735,7 @@ dependencies = [
  "clap",
  "cookie",
  "ctrlc",
+ "curve25519-dalek 4.1.3",
  "dashmap",
  "delegate",
  "directories",
@@ -1767,11 +1768,14 @@ dependencies = [
  "parking_lot",
  "pav_regression",
  "pin-project",
+ "quinn",
+ "quinn-proto",
  "rand 0.10.1",
  "rand 0.9.3",
  "rand_core 0.10.1",
  "redb",
  "reqwest",
+ "ring",
  "rpassword",
  "rustls",
  "rustls-native-certs",
@@ -1781,6 +1785,7 @@ dependencies = [
  "serde_with",
  "sha2 0.11.0",
  "socket2",
+ "subtle",
  "tao",
  "tar",
  "tempfile",
@@ -4438,9 +4443,9 @@ dependencies = [
 
 [[package]]
 name = "quinn"
-version = "0.11.9"
+version = "0.11.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b9e20a958963c291dc322d98411f541009df2ced7b5a4f2bd52337638cfccf20"
+checksum = "4051e23e9185c255a7e33ef59cdbca87a22d359052eecd22fc6b901fb37d9d11"
 dependencies = [
  "bytes",
  "cfg_aliases",
@@ -4458,9 +4463,9 @@ dependencies = [
 
 [[package]]
 name = "quinn-proto"
-version = "0.11.16"
+version = "0.11.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2f4bfc015262b9df63c8845072ce59068853ff5872180c2ce2f13038b970e560"
+checksum = "0e750cca55fe4f0439a15d0bb529da9651e79993e8e72c61a899a36d462befbe"
 dependencies = [
  "bytes",
  "getrandom 0.4.2",
