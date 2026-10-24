@@ -173,6 +173,7 @@ enum CappedAttempt<'a> {
 /// back. Then it takes from the node-wide cap with `try_take`: on a refusal
 /// it sleeps for the jittered deficit and retries, keeping the connection
 /// payment. Nothing is reserved on the node-wide cap.
+#[allow(clippy::too_many_arguments)]
 async fn capped_attempt<'a, S: super::super::Socket, T: TimeSource>(
     socket: &'a S,
     cap: &'a super::super::egress_cap::EgressCap,
