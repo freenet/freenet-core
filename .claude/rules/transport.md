@@ -863,7 +863,9 @@ payload, then the stream's end.
 FrameHeader::decode refuses, never panics: unknown version or kind;
   total_len 0 or > MAX_STREAM_TOTAL_BYTES (check_declared_stream_length)
   for Short and Stream; Control 0 or > MAX_CONTROL_BYTES (4 KiB);
-  metadata_len > MAX_METADATA_BYTES (64 KiB); metadata or a nonzero
+  metadata_len > MAX_METADATA_BYTES (what UDP embeds in fragment #1,
+  FRAGMENT_PAYLOAD_SIZE - 10; larger metadata goes as a separate short
+  message, as on UDP); metadata or a nonzero
   stream_id on Short or Control; a Stream id that is not caller-named;
   fewer than 18 bytes. The sender builds headers through the same
   checks. A new kind or field needs a new version, sent only to a peer
@@ -882,7 +884,14 @@ Sending (QuicPath::send_short / send_stream / send_stream_chunks /
   against a peer that does not cooperate. e5 callers MUST bound every
   send with a timeout. Dropping a send future resets its stream (Drop on
   Outgoing; quinn's own drop would FINISH it, which the receiver reads as
-  a stream that ended early).
+  a stream that ended early). A send dropped while waiting for acks after
+  finish is not reset and may still be delivered: a timeout there means
+  "maybe delivered".
+  Each locally reset stream leaves one Arc<Notify> in quinn's per-
+  connection `stopped` map until the connection closes (quinn 0.11.12:
+  stopped() registers it, and a local reset produces neither the Finished
+  nor the Stopped event that removes it). Bounded by the sends aborted on
+  the connection; e5 must bound that or recycle the connection.
   Every write, and the wait for a source's next chunk, races the
   stream's stopped() future and resets on a stop:
   quinn-proto 0.11.19 does not report STOP_SENDING to a writer blocked on
@@ -918,14 +927,20 @@ Inbound adapter: a Stream's payload goes into an ordinary StreamHandle,
     remembered).
   → No chunk is kept: quinn's chunks are slices of the ~1200-byte
     datagram, so header, metadata, short and control reads copy into one
-    buffer of the declared length. Stream payload goes into fragments;
-    only a chunk of a whole fragment or more is kept as a slice. Streams
+    buffer that grows as data arrives (from 64 KiB, never past the
+    declared length, exact at the end; a declared length is not allocated
+    up front). Stream payload goes into fragments, each a fresh buffer of
+    exactly its length; only a chunk of a whole fragment or more is kept
+    as a slice (const assert: MAX_UDP_PAYLOAD <= 1.2 x fragment). Streams
     with no charge (header phase, control frames) have an age limit too
     (inbound_stream_age_limit(0)).
   → Idle and age eviction: streaming_handle_idle_timeout and
     inbound_stream_age_limit, counted EvictedIdle / EvictedAge, checked by
     one timer per stream on the path's clock (not the timeout_check
     tick). Every QUIC chunk is new bytes, so every chunk is progress.
+    In simulation each stream's last armed timer stays in VirtualTime's
+    pending wakeups until its deadline (VirtualSleep has no drop
+    deregistration); the timer is replaced only when it fires.
   → Refused ids are NOT remembered: a stopped QUIC stream cannot deliver
     more bytes, and a new QUIC stream with that id carries the whole
     stream. A Stream id already held on the path is refused

@@ -51,11 +51,17 @@
 //! Memory: quinn hands out stream data as slices of the datagram it arrived
 //! in, so keeping a 1-byte chunk keeps its whole ~1200-byte datagram. The
 //! header, metadata, short and control reads therefore copy each chunk into
-//! one buffer of the declared length (at most the charged length for short
-//! messages, a small bound for the rest) and keep no chunk. The payload of
-//! a `Stream` is copied into fragments by the `Rechunker`, except a chunk
-//! of at least a whole fragment, which is kept as a slice: it pins at most
-//! one datagram (1200 bytes) per fragment of `FRAGMENT_PAYLOAD_SIZE`.
+//! one buffer that grows as data arrives and ends exactly the declared
+//! length (`ReadBuffer`), and keep no chunk. The payload of a `Stream` is
+//! copied into fragments by the `Rechunker`, each in a fresh buffer of
+//! exactly its length, except a chunk of at least a whole fragment, which
+//! is kept as a slice: it pins at most one datagram (1200 bytes) per
+//! fragment of `FRAGMENT_PAYLOAD_SIZE` (pinned by a const assertion).
+//!
+//! Simulation: `VirtualSleep` has no deregistration on drop, so each
+//! stream's last armed timer stays in `VirtualTime`'s pending wakeups until
+//! its deadline passes (one per ended stream; the timer is not replaced on
+//! progress, only when it fires).
 //! Streams with no budget charge (in the header phase, and control frames)
 //! get an age limit too ([`uncharged_age_limit`]), so a peer cannot hold
 //! one of its 256 stream slots by trickling bytes.
@@ -144,6 +150,9 @@ pub(in crate::transport::quic) struct Receiver<T> {
     controls: mpsc::Sender<Bytes>,
     /// Source of the budget keys short messages are charged under.
     next_short_key: AtomicU32,
+    /// Panic on the next stream, to test the supervisor.
+    #[cfg(test)]
+    pub(in crate::transport::quic) panic_on_stream: bool,
 }
 
 impl<T: TimeSource> Receiver<T> {
@@ -163,6 +172,8 @@ impl<T: TimeSource> Receiver<T> {
             streams,
             controls,
             next_short_key: AtomicU32::new(1),
+            #[cfg(test)]
+            panic_on_stream: false,
         }
     }
 }
@@ -243,6 +254,8 @@ struct BodyReader<T: TimeSource> {
     age_deadline: u64,
     last_progress: u64,
     timer: Pin<Box<dyn Future<Output = ()> + Send>>,
+    /// The deadline `timer` is armed for.
+    timer_at: u64,
 }
 
 impl<T: TimeSource> BodyReader<T> {
@@ -253,7 +266,8 @@ impl<T: TimeSource> BodyReader<T> {
         let now = time.now_nanos();
         let idle_nanos = nanos(idle);
         let age_deadline = now.saturating_add(nanos(uncharged_age_limit()));
-        let timer = time.sleep_until(now.saturating_add(idle_nanos).min(age_deadline));
+        let timer_at = now.saturating_add(idle_nanos).min(age_deadline);
+        let timer = time.sleep_until(timer_at);
         Self {
             recv,
             time,
@@ -261,6 +275,7 @@ impl<T: TimeSource> BodyReader<T> {
             age_deadline,
             last_progress: now,
             timer,
+            timer_at,
         }
     }
 
@@ -270,10 +285,20 @@ impl<T: TimeSource> BodyReader<T> {
             .min(self.age_deadline)
     }
 
-    /// Start the age limit, from now.
+    /// Start the age limit, from now. The armed timer is kept when it
+    /// fires no later than the new deadline (it re-arms when it fires), so
+    /// no extra sleep is left behind (`VirtualSleep` has no deregistration
+    /// on drop, the same reason `QuicRuntime` keeps its armed sleep).
     fn set_age_limit(&mut self, limit: Duration) {
         self.age_deadline = self.time.now_nanos().saturating_add(nanos(limit));
-        self.timer = self.time.sleep_until(self.deadline());
+        self.rearm_if_later_than(self.deadline());
+    }
+
+    fn rearm_if_later_than(&mut self, deadline: u64) {
+        if self.timer_at > deadline {
+            self.timer_at = deadline;
+            self.timer = self.time.sleep_until(deadline);
+        }
     }
 
     /// The next chunk of at most `max` bytes (at least 1), or `None` at the
@@ -300,16 +325,17 @@ impl<T: TimeSource> BodyReader<T> {
                     if now >= self.age_deadline {
                         return Err(ReadFailure::Age);
                     }
-                    self.timer = self.time.sleep_until(self.deadline());
+                    self.timer_at = self.deadline();
+                    self.timer = self.time.sleep_until(self.timer_at);
                 }
             }
         }
     }
 
-    /// Exactly `len` bytes (`len` > 0), copied into one buffer of `len`
-    /// bytes allocated up front, so no chunk (and no datagram it is a slice
-    /// of) is kept. Callers pass a declared length that is either small
-    /// (header, metadata, control) or already charged (short message).
+    /// Exactly `len` bytes (`len` > 0), copied into one buffer
+    /// ([`ReadBuffer`]) that grows as data arrives and ends exactly `len`
+    /// bytes long, so no chunk (and no datagram it is a slice of) is kept and
+    /// nothing is allocated for bytes that have not arrived.
     async fn read_exact(&mut self, len: usize) -> Result<Bytes, ReadFailure> {
         self.read_exact_with(len, |_| {}).await
     }
@@ -321,17 +347,17 @@ impl<T: TimeSource> BodyReader<T> {
         len: usize,
         mut progress: impl FnMut(usize),
     ) -> Result<Bytes, ReadFailure> {
-        let mut out = BytesMut::with_capacity(len);
+        let mut out = ReadBuffer::new(len);
         while out.len() < len {
             match self.next_chunk(len - out.len()).await? {
                 Some(chunk) => {
-                    out.extend_from_slice(&chunk);
+                    out.extend(&chunk);
                     progress(out.len());
                 }
                 None => return Err(ReadFailure::Truncated(out.len())),
             }
         }
-        Ok(out.freeze())
+        Ok(out.finish())
     }
 
     /// The end of the stream, with nothing more before it.
@@ -349,6 +375,49 @@ impl<T: TimeSource> BodyReader<T> {
     }
 }
 
+/// What a [`ReadBuffer`] allocates before any data: a declared length is
+/// not memory until the bytes arrive (a short message may declare tens of
+/// MiB in an 18-byte header).
+const READ_START_BYTES: usize = 64 * 1024;
+
+/// The bytes of one read of a declared length: starts at
+/// `min(len, READ_START_BYTES)`, grows by doubling but never past `len`, so
+/// it holds at most twice what has arrived and ends exactly `len` bytes
+/// long (one allocation, owned by the result).
+struct ReadBuffer {
+    buf: Vec<u8>,
+    len: usize,
+}
+
+impl ReadBuffer {
+    fn new(len: usize) -> Self {
+        Self {
+            buf: Vec::with_capacity(len.min(READ_START_BYTES)),
+            len,
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.buf.len()
+    }
+
+    fn extend(&mut self, chunk: &[u8]) {
+        let needed = self.buf.len() + chunk.len();
+        if needed > self.buf.capacity() {
+            let target = (self.buf.capacity() * 2)
+                .max(needed)
+                .min(self.len.max(needed));
+            self.buf.reserve_exact(target - self.buf.len());
+        }
+        self.buf.extend_from_slice(chunk);
+    }
+
+    fn finish(mut self) -> Bytes {
+        self.buf.shrink_to_fit();
+        Bytes::from(self.buf)
+    }
+}
+
 fn nanos(duration: Duration) -> u64 {
     u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
 }
@@ -363,6 +432,15 @@ fn uncharged_age_limit() -> Duration {
 
 /// Numbered fragments, in order.
 type Fragments = Vec<(u32, Bytes)>;
+
+// The Rechunker keeps a payload chunk of at least a whole fragment as a
+// slice of its datagram, so a held fragment pins at most one datagram. That
+// is at most 1.2 x the fragment while a datagram is at most MAX_UDP_PAYLOAD;
+// raising MAX_UDP_PAYLOAD past that must revisit the zero-copy path.
+const _: () = assert!(
+    super::super::config::MAX_UDP_PAYLOAD as usize * 10 <= FRAGMENT_PAYLOAD_SIZE * 12,
+    "a kept datagram slice would pin more than 1.2 x a fragment"
+);
 
 /// Cuts a byte stream of `total` bytes into fragments of the UDP stream
 /// shape: fragment `i` holds bytes `[(i-1)F, iF)` with
@@ -415,10 +493,17 @@ impl Rechunker {
                 out.push(self.emit(chunk.split_to(full)));
                 continue;
             }
+            if self.pending.is_empty() {
+                // A fresh buffer of exactly this fragment's length, so it
+                // never grows (a grown buffer would be kept, up to twice the
+                // fragment) and never shares an allocation with the next one.
+                let this_fragment = (self.total - self.emitted).min(full as u64) as usize;
+                self.pending = BytesMut::with_capacity(this_fragment);
+            }
             let take = (full - self.pending.len()).min(chunk.len());
             self.pending.extend_from_slice(&chunk.split_to(take));
             if self.pending.len() == full && can_emit {
-                let fragment = self.pending.split().freeze();
+                let fragment = std::mem::take(&mut self.pending).freeze();
                 out.push(self.emit(fragment));
             }
         }
@@ -439,7 +524,7 @@ impl Rechunker {
         if self.received < self.total {
             return Err(ReadFailure::Truncated(self.received as usize));
         }
-        let last = self.pending.split().freeze();
+        let last = std::mem::take(&mut self.pending).freeze();
         debug_assert!(!last.is_empty(), "a stream of {} bytes", self.total);
         Ok(self.emit(last))
     }
@@ -480,6 +565,10 @@ impl Drop for StreamGuard {
 
 /// Read one stream: its header, then by kind.
 async fn read_one<T: TimeSource>(recv: quinn::RecvStream, receiver: Arc<Receiver<T>>) {
+    #[cfg(test)]
+    if receiver.panic_on_stream {
+        panic!("test: the receive task panics");
+    }
     let mut reader = BodyReader::new(recv, receiver.time.clone(), streaming_handle_idle_timeout());
     let header = match reader.read_exact(HEADER_LEN).await {
         Ok(bytes) => FrameHeader::decode(&bytes),
@@ -878,6 +967,35 @@ mod tests {
             }
             assert_eq!(handle.try_assemble().unwrap(), bytes(total, 3).to_vec());
         }
+    }
+
+    /// A read buffer allocates nothing for bytes that have not arrived: it
+    /// starts at `READ_START_BYTES` whatever the declared length, grows by
+    /// doubling but never past that length, and ends exactly that long.
+    #[test]
+    fn a_read_buffer_grows_with_the_data_and_ends_exact() {
+        let declared = 40 * 1024 * 1024;
+        let mut buffer = ReadBuffer::new(declared);
+        buffer.extend(&[7]);
+        assert!(
+            buffer.buf.capacity() <= READ_START_BYTES,
+            "{}",
+            buffer.buf.capacity()
+        );
+        let mut small = ReadBuffer::new(10);
+        small.extend(&[1; 4]);
+        assert!(small.buf.capacity() <= 10);
+        small.extend(&[2; 6]);
+        let bytes = small.finish();
+        assert_eq!(&bytes[..], &[1, 1, 1, 1, 2, 2, 2, 2, 2, 2]);
+        assert_eq!(bytes.try_into_mut().unwrap().capacity(), 10);
+        let len = 3 * READ_START_BYTES + 5;
+        let mut grown = ReadBuffer::new(len);
+        for _ in 0..len {
+            grown.extend(&[0]);
+            assert!(grown.buf.capacity() <= len);
+        }
+        assert_eq!(grown.finish().try_into_mut().unwrap().capacity(), len);
     }
 
     /// Completion is by bytes: a stream one byte short is truncated at

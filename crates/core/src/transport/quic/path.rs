@@ -35,7 +35,23 @@
 //! stream ([`reset_code::SENDER_ABORTED`]), so the receiver sees
 //! `ResetByPeer` and cancels its handle; it never sees a stream that ends
 //! early as if it were complete or truncated. A dropped short message or
-//! control frame is lost.
+//! control frame is lost. A send future dropped while it waits for
+//! acknowledgement (after `finish` was issued) is NOT reset: every byte
+//! was already written, so the message may still be delivered. For e5, a
+//! timeout that fires during that wait means "maybe delivered", not
+//! "failed".
+//!
+//! Known quinn cost (quinn 0.11.12): `SendStream::stopped()` registers an
+//! `Arc<Notify>` in the connection's `stopped` map, removed only when quinn
+//! reports the stream Finished or Stopped. A stream this side resets gets
+//! neither event (`reset_acked` emits none), so each locally reset stream
+//! leaves one entry until the connection closes. Every send registers
+//! (its writes race `stopped()`), so the entries are bounded by the sends
+//! aborted on the connection over its lifetime (a source that failed, a
+//! cancelled send, a stop answered with a reset). e5 constraint: a
+//! connection that aborts sends without limit grows without limit, so it
+//! must be recycled or the abort rate bounded. Worth an upstream quinn
+//! issue (not filed).
 //!
 //! Receiving: one task per connection accepts every uni stream and reads all
 //! of them concurrently (no task per stream), parsing the header and then:
@@ -136,6 +152,9 @@ pub(crate) struct QuicPathLimits {
     pub(crate) short_capacity: usize,
     pub(crate) stream_capacity: usize,
     pub(crate) control_capacity: usize,
+    /// The receive task panics on its first stream (supervisor test).
+    #[cfg(test)]
+    pub(crate) panic_in_receive: bool,
 }
 
 impl QuicPathLimits {
@@ -147,6 +166,8 @@ impl QuicPathLimits {
         short_capacity: SHORT_CHANNEL_CAPACITY,
         stream_capacity: STREAM_CHANNEL_CAPACITY,
         control_capacity: CONTROL_CHANNEL_CAPACITY,
+        #[cfg(test)]
+        panic_in_receive: false,
     };
 }
 
@@ -382,7 +403,8 @@ impl QuicPath {
             limits.max_streams,
             limits.max_bytes,
         )));
-        let receiver = inbound::Receiver::new(
+        #[cfg_attr(not(test), allow(unused_mut))]
+        let mut receiver = inbound::Receiver::new(
             time,
             budget.clone(),
             stats.clone(),
@@ -390,6 +412,10 @@ impl QuicPath {
             streams_tx,
             controls_tx,
         );
+        #[cfg(test)]
+        {
+            receiver.panic_on_stream = limits.panic_in_receive;
+        }
         let receive = GlobalExecutor::spawn(supervise_receive(
             connection.inner().clone(),
             Arc::new(receiver),
@@ -464,7 +490,8 @@ impl QuicPath {
     }
 
     /// Send stream `stream_id` (caller-named) with `payload`, announced by
-    /// `metadata`.
+    /// `metadata` (at most `MAX_METADATA_BYTES`; `Some(&[])` is sent as no
+    /// metadata and arrives as `None`).
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) async fn send_stream(
         &self,
@@ -566,7 +593,11 @@ async fn supervise_receive<T: TimeSource>(
             "QUIC path: the receive task panicked; closing the connection"
         );
     }
-    connection.close(0u32.into(), b"receive task ended");
+    // Only if still open: closing an ended connection again would replace
+    // the reason quinn reports (the peer's close) with LocallyClosed.
+    if connection.close_reason().is_none() {
+        connection.close(0u32.into(), b"receive task ended");
+    }
 }
 
 /// A uni stream being written that sees the peer stop it even while a

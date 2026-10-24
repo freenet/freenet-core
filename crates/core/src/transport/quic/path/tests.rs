@@ -511,6 +511,13 @@ fn truncated_and_overlong_streams_fail_and_are_counted() {
             p.drive(raw_stream(conn, bytes)).await;
             assert_eq!(p.b.stats().count(outcome), before + 1);
         }
+        // An overlong stream left unfinished: the stop reaches the sender.
+        let mut bytes = header(1, 1, StreamId::next().0, 100, 0);
+        bytes.extend_from_slice(&payload(101));
+        let conn = p.a_raw();
+        let code = p.drive(raw_unfinished(conn, bytes)).await;
+        assert_eq!(code, Some(u64::from(stop_code::OVERLONG)));
+        drop(p.b_in.streams.try_recv().expect("announced"));
         assert!(
             p.b_in.shorts.try_recv().is_err(),
             "no short message delivered"
@@ -1051,6 +1058,192 @@ fn reads_keep_no_slice_of_a_datagram() {
         let trickled = p.b_in.controls.try_recv().unwrap();
         assert!(trickled == payload(200));
         exact(trickled, "trickled control");
+    })
+}
+
+/// Payload fragments hold at most one datagram each: a fragment built from
+/// small chunks is a fresh buffer of exactly its length (a grown buffer
+/// would keep up to twice it), and a fragment kept as a slice of a
+/// datagram keeps at most `MAX_UDP_PAYLOAD`. Sent as alternating
+/// 1129-byte and 1-byte frames, one per datagram.
+#[test]
+fn payload_fragments_hold_at_most_one_datagram() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let mut p = paths("quic-path-frag-mem", 18, QuicPathLimits::DEFAULT).await;
+        let total = 4 * FRAGMENT_PAYLOAD_SIZE;
+        let data = payload(total);
+        let (conn, time) = (p.a_raw(), p.time());
+        let sent = data.clone();
+        p.drive(async move {
+            let mut send = conn.open_uni().await.unwrap();
+            send.write_all(&header(1, 1, StreamId::next().0, total as u64, 0))
+                .await
+                .unwrap();
+            let mut at = 0;
+            for size in [1129usize, 1].iter().cycle() {
+                if at == total {
+                    break;
+                }
+                let end = (at + size).min(total);
+                send.write_all(&sent[at..end]).await.unwrap();
+                at = end;
+                time.sleep(Duration::from_millis(5)).await;
+            }
+            send.finish().unwrap();
+            send.stopped().await.unwrap();
+        })
+        .await;
+        let arrival = p.b_in.streams.try_recv().expect("announced");
+        assert!(arrival.handle.is_complete());
+        let mut reader = arrival.handle.stream_with_reclaim();
+        drop(arrival);
+        let fragments = p
+            .drive(async move {
+                let mut fragments = Vec::new();
+                while let Some(fragment) = futures::StreamExt::next(&mut reader).await {
+                    fragments.push(fragment.expect("fragment"));
+                }
+                fragments
+            })
+            .await;
+        let joined: Vec<u8> = fragments.iter().flat_map(|f| f.iter().copied()).collect();
+        assert!(joined == data, "the payload arrived intact");
+        let max = usize::from(super::super::config::MAX_UDP_PAYLOAD);
+        for (i, fragment) in fragments.into_iter().enumerate() {
+            let len = fragment.len();
+            let owned = fragment
+                .try_into_mut()
+                .unwrap_or_else(|_| panic!("fragment {i}: shared with another owner"));
+            assert!(
+                owned.capacity() <= max,
+                "fragment {i} ({len} bytes) keeps {} bytes",
+                owned.capacity()
+            );
+        }
+    })
+}
+
+/// More short messages in flight than quinn's stream limit, with a consumer
+/// that drains them, all arrive and none is dropped.
+#[test]
+fn more_messages_than_the_stream_limit_all_arrive_when_drained() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let mut p = paths("quic-path-drained", 19, QuicPathLimits::DEFAULT).await;
+        let count = 2 * super::super::config::MAX_UNI_STREAMS as usize + 10;
+        let a = p.a.clone();
+        let mut shorts = std::mem::replace(&mut p.b_in.shorts, tokio::sync::mpsc::channel(1).1);
+        let received = p
+            .drive(async move {
+                let sends = futures::future::join_all((0..count).map(|i| {
+                    let a = a.clone();
+                    async move { a.send_short(&(i as u32).to_be_bytes()).await }
+                }));
+                let receive = async {
+                    let mut got = Vec::new();
+                    while got.len() < count {
+                        let message = shorts.recv().await.expect("open");
+                        let bytes: [u8; 4] = message.payload()[..].try_into().unwrap();
+                        got.push(u32::from_be_bytes(bytes));
+                    }
+                    got
+                };
+                let (results, got) = tokio::join!(sends, receive);
+                assert!(results.iter().all(Result::is_ok));
+                got
+            })
+            .await;
+        let mut sorted = received;
+        sorted.sort_unstable();
+        assert_eq!(sorted, (0..count as u32).collect::<Vec<_>>());
+        assert_eq!(p.b.stats().count(QuicInboundOutcome::ShortDroppedFull), 0);
+    })
+}
+
+/// A stream that sends part of its header and then nothing is evicted at
+/// the idle timeout, stopped with `EVICTED` and counted as idle uncharged.
+#[test]
+fn a_silent_header_is_evicted_when_idle() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let p = paths("quic-path-idle-header", 20, QuicPathLimits::DEFAULT).await;
+        let conn = p.a_raw();
+        let code = p
+            .drive(raw_unfinished(conn, header(1, 0, 0, 10, 0)[..5].to_vec()))
+            .await;
+        assert_eq!(code, Some(u64::from(stop_code::EVICTED)));
+        assert_eq!(p.b.stats().count(QuicInboundOutcome::IdleUncharged), 1);
+        assert_eq!(p.b.stats().count(QuicInboundOutcome::AgedUncharged), 0);
+    })
+}
+
+/// A stream whose handle the receiving side cancels mid-transfer stops
+/// being read: the next fragment is refused by the cancelled handle, the
+/// stream is stopped with `CANCELLED`, and it is counted.
+#[test]
+fn a_locally_cancelled_stream_is_stopped() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let mut p = paths("quic-path-local-cancel", 21, QuicPathLimits::DEFAULT).await;
+        let total = 20 * FRAGMENT_PAYLOAD_SIZE;
+        let (conn, a) = (p.a_raw(), p.a.clone());
+        let id = StreamId::next().0;
+        let mut send = p
+            .drive(async move {
+                let mut send = conn.open_uni().await.unwrap();
+                let mut bytes = header(1, 1, id, total as u64, 0);
+                bytes.extend_from_slice(&payload(10));
+                send.write_all(&bytes).await.unwrap();
+                a.send_short(b"sync").await.unwrap();
+                send
+            })
+            .await;
+        let arrival = p.b_in.streams.try_recv().expect("announced");
+        arrival.handle.cancel();
+        let code = p
+            .drive(async move {
+                if let Err(quinn::WriteError::Stopped(code)) =
+                    send.write_all(&payload(total - 10)).await
+                {
+                    return Some(code.into_inner());
+                }
+                send.stopped().await.unwrap().map(|c| c.into_inner())
+            })
+            .await;
+        assert_eq!(code, Some(u64::from(stop_code::CANCELLED)));
+        assert_eq!(p.b.stats().count(QuicInboundOutcome::CancelledLocally), 1);
+        assert_eq!(p.b.stats().count(QuicInboundOutcome::CompletedStream), 0);
+    })
+}
+
+/// A panic in the receive task is counted and closes the connection, so
+/// the peer does not keep sending to a path nothing reads any more.
+#[test]
+fn a_panicking_receive_task_closes_the_connection() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let limits = QuicPathLimits {
+            panic_in_receive: true,
+            ..QuicPathLimits::DEFAULT
+        };
+        let p = paths("quic-path-panic", 22, limits).await;
+        let (a, conn) = (p.a.clone(), p.a_raw());
+        let closed = p
+            .drive(async move {
+                // The send itself may fail when the connection closes.
+                a.send_short(b"boom").await.ok();
+                conn.closed().await
+            })
+            .await;
+        let quinn::ConnectionError::ApplicationClosed(close) = closed else {
+            panic!("closed by {closed:?}");
+        };
+        assert_eq!(close.error_code.into_inner(), 0);
+        assert_eq!(
+            p.b.stats().count(QuicInboundOutcome::ReceiveTaskPanicked),
+            1
+        );
     })
 }
 
