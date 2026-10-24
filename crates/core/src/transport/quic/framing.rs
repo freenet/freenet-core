@@ -444,10 +444,7 @@ mod tests {
                 }
             }
         }
-        assert!(
-            accepted > 500 && refused > 500,
-            "{accepted} / {refused}"
-        );
+        assert!(accepted > 500 && refused > 500, "{accepted} / {refused}");
 
         for _ in 0..10_000 {
             let len = GlobalRng::random_range(0usize..=HEADER_LEN + 4);
