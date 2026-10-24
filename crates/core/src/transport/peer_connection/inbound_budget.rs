@@ -37,7 +37,7 @@ use super::streaming_buffer::LockFreeStreamBuffer;
 /// holds (its progress) and its state: active, then either complete or
 /// cancelled, whichever is set first (the other then fails).
 #[derive(Debug, Default)]
-pub(super) struct LegacyStreamToken {
+pub(in crate::transport) struct LegacyStreamToken {
     received_bytes: AtomicU64,
     state: AtomicU8,
 }
@@ -47,12 +47,12 @@ const COMPLETE: u8 = 1;
 const CANCELLED: u8 = 2;
 
 impl LegacyStreamToken {
-    pub(super) fn new() -> Arc<Self> {
+    pub(in crate::transport) fn new() -> Arc<Self> {
         Arc::new(Self::default())
     }
 
     /// Report the stream's received payload bytes.
-    pub(super) fn report(&self, received: u64) {
+    pub(in crate::transport) fn report(&self, received: u64) {
         self.received_bytes.store(received, Ordering::Release);
     }
 
@@ -64,7 +64,7 @@ impl LegacyStreamToken {
 
     /// Record that the stream has every byte, contiguously. Returns false if
     /// it was cancelled first; it must then not be delivered.
-    pub(super) fn mark_complete(&self) -> bool {
+    pub(in crate::transport) fn mark_complete(&self) -> bool {
         self.transition(COMPLETE)
     }
 
@@ -80,7 +80,7 @@ impl LegacyStreamToken {
 }
 
 /// What keeps a charged stream's reassembly state alive.
-pub(super) enum Liveness {
+pub(in crate::transport) enum Liveness {
     /// An operations stream: alive while any clone of its buffer exists.
     Buffer(Weak<LockFreeStreamBuffer>),
     /// A legacy stream: alive while its token is held (see
@@ -134,7 +134,7 @@ struct Charge {
 
 /// Why a new stream could not be charged.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum BudgetRejection {
+pub(in crate::transport) enum BudgetRejection {
     /// The connection already has the maximum number of charged streams.
     Streams { open: usize },
     /// The stream's length does not fit in the connection's byte allowance.
@@ -152,7 +152,7 @@ pub(super) enum EvictionReason {
 
 /// Memory a stream costs beyond its payload bytes, charged with them.
 #[derive(Debug, Clone, Copy)]
-pub(super) struct ChargeOverhead {
+pub(in crate::transport) struct ChargeOverhead {
     /// Per stream: its buffer or reassembly task, handle, registry and map
     /// entries, channel, and first slot chunk.
     pub(super) per_stream: u64,
@@ -194,7 +194,7 @@ impl ChargeOverhead {
     /// alone is 2 KiB, a legacy stream's 64-entry channel about 2.5 KiB, plus
     /// its task, handle and map entries); see [`PER_FRAGMENT_OVERHEAD`] for a
     /// held fragment.
-    pub(super) const DEFAULT: Self = Self {
+    pub(in crate::transport) const DEFAULT: Self = Self {
         per_stream: 8 * 1024,
         per_fragment: PER_FRAGMENT_OVERHEAD,
     };
@@ -209,7 +209,7 @@ impl ChargeOverhead {
     /// Bytes charged for a stream declaring `declared` payload bytes: the
     /// payload, the fixed overhead, and the per-fragment overhead for every
     /// fragment number it may use (one per full fragment, plus one).
-    pub(super) const fn cost(self, declared: u64) -> u64 {
+    pub(in crate::transport) const fn cost(self, declared: u64) -> u64 {
         let fragments = declared.div_ceil(super::MAX_DATA_SIZE as u64) + 1;
         declared
             .saturating_add(self.per_stream)
@@ -217,7 +217,7 @@ impl ChargeOverhead {
     }
 }
 
-pub(super) struct InboundStreamBudget {
+pub(in crate::transport) struct InboundStreamBudget {
     streams: HashMap<StreamId, Charge>,
     charged_bytes: u64,
     max_streams: usize,
@@ -226,7 +226,7 @@ pub(super) struct InboundStreamBudget {
 }
 
 impl InboundStreamBudget {
-    pub(super) fn new(max_streams: usize, max_bytes: u64) -> Self {
+    pub(in crate::transport) fn new(max_streams: usize, max_bytes: u64) -> Self {
         Self::with_overhead(max_streams, max_bytes, ChargeOverhead::DEFAULT)
     }
 
@@ -245,7 +245,7 @@ impl InboundStreamBudget {
     }
 
     /// Whether `stream_id` holds a charge (live, or evicted but not yet gone).
-    pub(super) fn contains(&self, stream_id: StreamId) -> bool {
+    pub(in crate::transport) fn contains(&self, stream_id: StreamId) -> bool {
         self.streams.contains_key(&stream_id)
     }
 
@@ -261,11 +261,11 @@ impl InboundStreamBudget {
             })
     }
 
-    pub(super) fn stream_count(&self) -> usize {
+    pub(in crate::transport) fn stream_count(&self) -> usize {
         self.streams.len()
     }
 
-    pub(super) fn charged_bytes(&self) -> u64 {
+    pub(in crate::transport) fn charged_bytes(&self) -> u64 {
         self.charged_bytes
     }
 
@@ -286,7 +286,7 @@ impl InboundStreamBudget {
     /// Whether a new stream declaring `declared` bytes fits this connection's
     /// limits (with its overhead; see [`ChargeOverhead`]). Releases the
     /// charges of streams whose state is already gone before refusing.
-    pub(super) fn check(&mut self, declared: u64) -> Result<(), BudgetRejection> {
+    pub(in crate::transport) fn check(&mut self, declared: u64) -> Result<(), BudgetRejection> {
         let bytes = self.overhead.cost(declared);
         if self.fits(bytes).is_ok() {
             return Ok(());
@@ -297,7 +297,7 @@ impl InboundStreamBudget {
 
     /// Charge a newly admitted stream declaring `declared` bytes (plus its
     /// overhead). Call only after `check` succeeded.
-    pub(super) fn charge(
+    pub(in crate::transport) fn charge(
         &mut self,
         stream_id: StreamId,
         declared: u64,
@@ -326,7 +326,7 @@ impl InboundStreamBudget {
     }
 
     /// Record that `stream_id` received new data.
-    pub(super) fn note_progress(&mut self, stream_id: StreamId, now_nanos: u64) {
+    pub(in crate::transport) fn note_progress(&mut self, stream_id: StreamId, now_nanos: u64) {
         if let Some(charge) = self.streams.get_mut(&stream_id) {
             charge.last_progress_nanos = now_nanos;
         }
@@ -334,7 +334,7 @@ impl InboundStreamBudget {
 
     /// Release `stream_id`'s charge if its state is gone. Returns whether it
     /// was released.
-    pub(super) fn release_if_gone(&mut self, stream_id: StreamId) -> bool {
+    pub(in crate::transport) fn release_if_gone(&mut self, stream_id: StreamId) -> bool {
         let gone = self
             .streams
             .get(&stream_id)
@@ -348,7 +348,7 @@ impl InboundStreamBudget {
     }
 
     /// Release every charge whose state is gone. Returns how many.
-    pub(super) fn release_gone(&mut self) -> usize {
+    pub(in crate::transport) fn release_gone(&mut self) -> usize {
         let mut released = 0;
         let mut freed = 0;
         self.streams.retain(|_, charge| {

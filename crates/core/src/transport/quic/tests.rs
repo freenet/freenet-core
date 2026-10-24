@@ -32,7 +32,7 @@ use crate::transport::in_memory_socket::{
 use crate::transport::metrics::DemuxClass;
 use crate::transport::packet_data::MAX_RECV_PACKET_SIZE;
 
-const SEED: u64 = 0x0059_40C2;
+pub(super) const SEED: u64 = 0x0059_40C2;
 
 /// One datagram as a test socket saw it leave.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -105,7 +105,7 @@ fn pump<S: Socket>(socket: Arc<DemuxSocket<S>>) -> tokio::task::JoinHandle<()> {
 /// Run `fut` on the test runtime, letting every task run until nothing is
 /// ready and then moving `time` to its next wakeup. Fails if virtual time
 /// passes `limit` first.
-async fn drive<F>(time: &VirtualTime, limit: Duration, fut: F) -> F::Output
+pub(super) async fn drive<F>(time: &VirtualTime, limit: Duration, fut: F) -> F::Output
 where
     F: std::future::Future + Send + 'static,
     F::Output: Send + 'static,
@@ -144,7 +144,7 @@ const WATCHDOG: Duration = Duration::from_secs(120);
 /// so a test on the test's own runtime would hang `cargo test` forever
 /// instead of failing; the spinning thread is left behind and dies with the
 /// test process.
-fn bounded<F, Fut>(test: F)
+pub(super) fn bounded<F, Fut>(test: F)
 where
     F: FnOnce() -> Fut + Send + 'static,
     Fut: std::future::Future<Output = ()>,
@@ -204,15 +204,15 @@ fn settings() -> QuicSettings {
 }
 
 /// Two endpoints, `a` (client) and `b` (server), on one simulated network.
-struct Pair {
-    time: VirtualTime,
+pub(super) struct Pair {
+    pub(super) time: VirtualTime,
     network: String,
-    a: QuicEndpoint,
-    b: QuicEndpoint,
-    a_addr: SocketAddr,
-    b_addr: SocketAddr,
-    a_keys: TransportKeypair,
-    b_keys: TransportKeypair,
+    pub(super) a: QuicEndpoint,
+    pub(super) b: QuicEndpoint,
+    pub(super) a_addr: SocketAddr,
+    pub(super) b_addr: SocketAddr,
+    pub(super) a_keys: TransportKeypair,
+    pub(super) b_keys: TransportKeypair,
     a_socket: Arc<SimDemux>,
     b_socket: Arc<SimDemux>,
     log: Arc<Mutex<Vec<Sent>>>,
@@ -232,7 +232,12 @@ impl Drop for Pair {
 /// the simulated network registry is keyed by address), with an egress cap
 /// of `a_cap` bytes per second on `a`'s socket, on the same `VirtualTime`
 /// as the endpoints. `b` accepts connections from `a`.
-async fn pair(network: &str, a_addr: SocketAddr, b_addr: SocketAddr, a_cap: Option<u64>) -> Pair {
+pub(super) async fn pair(
+    network: &str,
+    a_addr: SocketAddr,
+    b_addr: SocketAddr,
+    a_cap: Option<u64>,
+) -> Pair {
     let time = VirtualTime::new();
     register_network_time_source(network, time.clone());
     register_address_network(a_addr, network);
@@ -340,11 +345,11 @@ fn spki_of(key: &TransportPublicKey) -> Vec<u8> {
     PeerKey::of(key).expect("a usable key").spki().to_vec()
 }
 
-fn payload(len: usize) -> Vec<u8> {
+pub(super) fn payload(len: usize) -> Vec<u8> {
     (0..len).map(|i| (i % 251) as u8).collect()
 }
 
-const MIB: usize = 1024 * 1024;
+pub(super) const MIB: usize = 1024 * 1024;
 
 /// Two endpoints on the simulated network complete a TLS 1.3 handshake
 /// with Ed25519 raw public keys and move 1 MiB on a unidirectional stream,

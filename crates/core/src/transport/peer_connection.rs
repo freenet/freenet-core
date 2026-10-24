@@ -22,9 +22,10 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tracing::{Instrument, span};
 
-mod inbound_budget;
+pub(super) mod inbound_budget;
 mod inbound_stream;
 mod outbound_stream;
+pub(super) use outbound_stream::embeds_metadata;
 pub(crate) mod piped_stream;
 pub(crate) mod streaming;
 
@@ -714,7 +715,7 @@ struct RefusalLog {
 /// ([`streaming::max_inbound_stream_age`]). Under the simulation idle-timeout
 /// accommodation it is at least the (long) simulation idle threshold, for the
 /// same reason that threshold exists.
-fn inbound_stream_age_limit(total_bytes: u64) -> Duration {
+pub(super) fn inbound_stream_age_limit(total_bytes: u64) -> Duration {
     let limit = streaming::max_inbound_stream_age(total_bytes);
     if crate::config::SimulationIdleTimeout::is_enabled() {
         limit.max(STREAMING_HANDLE_IDLE_TIMEOUT_SIM)
@@ -779,7 +780,7 @@ const STREAMING_HANDLE_IDLE_TIMEOUT_SIM: Duration = Duration::from_secs(86_400);
 /// Returns the active idle threshold for sweeping `streaming_handles` entries,
 /// switching between the production and simulation values based on the same
 /// `SimulationIdleTimeout` flag that gates `connection_idle_timeout()`.
-fn streaming_handle_idle_timeout() -> Duration {
+pub(super) fn streaming_handle_idle_timeout() -> Duration {
     if crate::config::SimulationIdleTimeout::is_enabled() {
         STREAMING_HANDLE_IDLE_TIMEOUT_SIM
     } else {

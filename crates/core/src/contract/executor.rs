@@ -2776,6 +2776,18 @@ mod tests {
                  INCOMING_BUFFER_TOTAL_BYTES",
             ),
             (
+                "READ_START_BYTES",
+                "initial allocation of ONE QUIC stream read (quic::path::inbound), \
+                 at most the stream's declared length, which is charged to the \
+                 per-connection inbound budget or held to a small per-message \
+                 bound; not a node budget",
+            ),
+            (
+                "MAX_CONTROL_BYTES",
+                "length limit on ONE QUIC path control frame (quic::framing), a \
+                 per-message bound inside a per-connection channel, not a node budget",
+            ),
+            (
                 "XEDDSA_RANDOM_BYTES",
                 "the 64 random bytes one QUIC handshake signature draws, on the stack, \
                  not memory the node holds",

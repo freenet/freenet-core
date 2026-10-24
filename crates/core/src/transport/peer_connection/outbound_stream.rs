@@ -260,6 +260,15 @@ pub(crate) type SerializedStream = Bytes;
 /// The extra byte vs. the original 40 comes from the Option discriminant of `metadata_bytes`.
 const MAX_DATA_SIZE: usize = packet_data::MAX_DATA_SIZE - 41;
 
+/// Whether `send_stream` embeds metadata of `len` bytes in fragment #1:
+/// fragment #1 must still carry at least one payload byte beside the
+/// metadata's `Option` tag and length prefix. Larger metadata travels only
+/// in the separate short message the caller sends. The QUIC path applies
+/// the same rule to its `Stream` frames.
+pub(in crate::transport) fn embeds_metadata(len: usize) -> bool {
+    1 + 8 + len < MAX_DATA_SIZE
+}
+
 /// A congestion window as reported in transfer telemetry: `None` when the
 /// controller has no bounded window. FixedRate outside a loss pause reports
 /// `usize::MAX / 2`, which used to surface as `u32::MAX` after truncation.
@@ -386,7 +395,7 @@ pub(super) async fn send_stream<S: super::super::Socket, T: TimeSource>(
     let total_length_bytes = bytes_to_send;
     // Fragment #1 must carry at least one payload byte; metadata too large to
     // leave room for one is not embedded (it is also sent separately).
-    let metadata = metadata.filter(|meta| 1 + 8 + meta.len() < MAX_DATA_SIZE);
+    let metadata = metadata.filter(|meta| embeds_metadata(meta.len()));
     // Calculate total_packets accounting for fragment #1's reduced payload when
     // metadata is embedded. Without this adjustment, the loop terminates too early
     // and the final bytes of the stream are never sent.
