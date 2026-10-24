@@ -82,6 +82,7 @@ fn release_aborted_stream_flightsize<T: TimeSource>(
 /// connection stays up, and the stream's in-flight bytes are released
 /// (#4345). The receiver gives the stream up after the same gap, so waiting
 /// longer would only spend the shared cap on a stream nobody will finish.
+#[allow(clippy::too_many_arguments)]
 fn abandon_for_egress_wait<T: TimeSource>(
     stream_id: StreamId,
     destination_addr: SocketAddr,
