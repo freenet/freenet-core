@@ -4567,4 +4567,70 @@ mod egress_cap_tests {
     async fn pipe_stream_first_fragment_may_wait_past_the_paced_deadline() {
         a_first_fragment_may_wait_past_the_paced_deadline(Sender::Pipe).await;
     }
+
+    /// As `streams_released_together_by_one_ack_batch`, but the binding
+    /// limit is the connection's own bucket (30 KB/s), not the node-wide cap:
+    /// a fragment that slept for its connection payment checks cwnd again
+    /// before its node-wide take, so flight size never exceeds the window at
+    /// a send although the window changed while it slept.
+    async fn connection_waits_recheck_the_window(sender: Sender) {
+        let _seed = GlobalRng::seed_guard(23);
+        let time = VirtualTime::new();
+        let payload = sender.fragment_payload();
+        let congestion = window(5 * payload, &time);
+        let socket = Arc::new(DemuxSocket::wrap(
+            RecordingSocket::new(
+                &time,
+                Some(Acks {
+                    congestion: congestion.clone(),
+                    per_fragment: payload,
+                    timing: AckTiming::Batched(Duration::from_millis(300)),
+                    ports: 20_000..21_000,
+                }),
+            ),
+            Some(EgressCap::new(100_000_000, time.clone())),
+        ));
+        let bucket = Arc::new(TokenBucket::new_with_time_source(
+            2 * payload,
+            30_000,
+            time.clone(),
+        ));
+        let tasks = (0..8)
+            .map(|i| {
+                spawn_stream(
+                    StreamSpec {
+                        sender,
+                        fragments: 4,
+                        port: 20_000 + i,
+                        congestion: congestion.clone(),
+                        bucket: bucket.clone(),
+                    },
+                    &socket,
+                    &time,
+                )
+            })
+            .collect();
+        drive(&time, tasks).await;
+        let worst = *socket.inner_for_test().worst_flight_over_cwnd.lock();
+        assert!(
+            worst <= 0,
+            "flight size exceeded cwnd by {worst} bytes at a send"
+        );
+        let stats = socket.egress_cap().expect("cap").stats();
+        assert_eq!(stats.refusals, 0, "premise: the node-wide cap never binds");
+        assert!(
+            stats.packets[EgressDecision::Waited as usize] > 0,
+            "premise: fragments waited for their connection"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn send_stream_rechecks_the_window_after_a_connection_wait() {
+        connection_waits_recheck_the_window(Sender::Send).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn pipe_stream_rechecks_the_window_after_a_connection_wait() {
+        connection_waits_recheck_the_window(Sender::Pipe).await;
+    }
 }
