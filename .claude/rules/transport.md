@@ -317,8 +317,9 @@ node-wide egress cap paced them (`egress_<label>`, one per `EgressDecision`,
 plus `egress_bytes`, `egress_bytes_waited`, `egress_wait_us_sum` / `_max`,
 `egress_long_waits_<cause>`, `egress_streams_abandoned_<cause>`, `egress_debt_hwm_bytes`,
 `egress_debt_forgiven_bytes`; all zero without
-`total-bandwidth-limit`) and QUIC upgrade control messages received and
-ignored (`upgrade_control_received`). Each label set is declared once in a
+`total-bandwidth-limit`), QUIC upgrade control messages received and
+ignored (`upgrade_control_received`) and hole-punch handshake packets dropped
+because they did not authenticate (`handshake_unauthenticated_dropped`). Each label set is declared once in a
 `labelled_counters!` list, so a new variant needs a snapshot field. Hot
 path writes are single relaxed atomics; `SentPacketTracker` keeps an
 `rto_expiries` count and a bounded per-stream final-ACK watch, both
@@ -451,6 +452,17 @@ Handshake send failures (#5871):
     via `SendFailed` at once. The best-effort version-mismatch ack only
     logs, so the peer is still recorded as outdated.
   → Never map a send error to `ChannelClosed`.
+
+Hole-punch completion (traverse_nat's RemoteInbound arm, the side that
+answered the remote's intro):
+  → Completes only on a packet that decrypts under this attempt's own
+    inbound session key. Anything else is dropped, counted
+    (`handshake_unauthenticated_dropped`), and the attempt stays pending
+    until an authenticated packet arrives or the deadline passes.
+  → Every release encrypts its completing packets under that key, so the
+    check needs no version gate and no wire change. Tests run a peer with
+    the earlier rule (complete on any non-intro packet) through
+    LEGACY_HANDSHAKE_COMPLETION to check interop both ways.
 
 Restart detection (all peers, not just gateways):
   → If an intro packet arrives on an established connection, attempt

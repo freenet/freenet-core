@@ -2782,6 +2782,10 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                 serde_json::json!(snapshot.upgrade_control_received),
             );
             m.insert(
+                "handshake_unauthenticated_dropped".into(),
+                serde_json::json!(snapshot.handshake_unauthenticated_dropped),
+            );
+            m.insert(
                 "nat_fail_samples".into(),
                 serde_json::json!(snapshot.nat_fail_samples),
             );
