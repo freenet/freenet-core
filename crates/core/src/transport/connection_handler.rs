@@ -2911,15 +2911,10 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                                     continue;
                                 }
                                 // Complete only on a packet encrypted under
-                                // this attempt's inbound session key. Before
-                                // this check, any non-intro packet from the
-                                // remote's address completed the handshake.
-                                // The check does not establish who the remote
-                                // is: our success ack (above) still carries
-                                // this key, encrypted under the key from the
-                                // remote's intro, and changing that needs a
-                                // new message. Every release encrypts the
-                                // packets that complete this arm under this
+                                // this attempt's inbound session key. The
+                                // success ack sent above is unchanged here; a
+                                // follow-up changes it. Every release encrypts
+                                // the packets that complete this arm under this
                                 // key, so the check needs no version gate.
                                 // Any other packet is dropped and counted (once
                                 // per packet), and the attempt goes back to
@@ -7168,11 +7163,28 @@ pub mod mock_transport {
             [u8; 16],
             [u8; 16],
         )> {
+            peer_waiting_for_completion_at(remote, channels, VirtualTime::new()).await
+        }
+
+        /// [`peer_waiting_for_completion`] on a caller-owned clock.
+        async fn peer_waiting_for_completion_at(
+            remote: &mut ScriptedRemote,
+            channels: &Channels,
+            vt: VirtualTime,
+        ) -> anyhow::Result<(
+            tokio::task::JoinHandle<
+                Result<PeerConnection<MockSocket, VirtualTime>, TransportError>,
+            >,
+            SocketAddr,
+            OutboundConnectionHandler<MockSocket, VirtualTime>,
+            [u8; 16],
+            [u8; 16],
+        )> {
             let (peer_pub, mut peer, peer_addr) = create_mock_peer_with_virtual_time(
                 PacketDropPolicy::ReceiveAll,
                 PacketDelayPolicy::NoDelay,
                 channels.clone(),
-                VirtualTime::new(),
+                vt,
             )
             .await?;
             let conn = peer
@@ -7354,6 +7366,59 @@ pub mod mock_transport {
             Ok(())
         }
 
+        /// A steady trickle of dropped packets, each arriving before the
+        /// current 200 ms receive window ends, does not postpone the paced
+        /// acks: they still go out at the baseline interval (window plus
+        /// `INITIAL_INTERVAL`, about 250 ms). A drop must not restart the
+        /// window.
+        #[tokio::test]
+        async fn dropped_packet_trickle_does_not_postpone_paced_acks() -> anyhow::Result<()> {
+            const STEP: Duration = Duration::from_millis(50);
+            const STEPS: usize = 12; // 600 ms of virtual time
+            let vt = VirtualTime::new();
+            let channels: Channels = Arc::new(DashMap::new());
+            let mut remote = ScriptedRemote::new(&channels);
+            let (conn, peer_addr, _peer, peer_key, remote_key) =
+                peer_waiting_for_completion_at(&mut remote, &channels, vt.clone()).await?;
+
+            let mut acks_at_ms = Vec::new();
+            for step in 0..STEPS {
+                let mut junk = vec![0u8; 64];
+                GlobalRng::fill_bytes(&mut junk);
+                junk[0] = crate::transport::crypto::PACKET_TYPE_SYMMETRIC;
+                remote.send(peer_addr, &junk);
+                // Let the peer take the packet before time moves.
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                vt.advance(STEP);
+                // Let any send that is now due happen.
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                while let Ok(packet) = remote.inbound.try_recv() {
+                    let packet = PacketData::<_, MAX_PACKET_SIZE>::from_buf(packet.data);
+                    if !packet.is_intro_packet()
+                        && packet.try_decrypt_sym(&cipher(remote_key)).is_ok()
+                    {
+                        acks_at_ms.push((step + 1) * STEP.as_millis() as usize);
+                    }
+                }
+            }
+            wait_for_drops(remote.addr, STEPS).await;
+            // Paced acks are due at about 250 ms and 500 ms after the first.
+            assert!(
+                acks_at_ms.len() >= 2,
+                "dropped packets every {STEP:?} postponed the paced acks; acks at {acks_at_ms:?} ms"
+            );
+            assert!(
+                acks_at_ms[0] <= 300 && acks_at_ms[1] <= 550,
+                "paced acks were late: {acks_at_ms:?} ms"
+            );
+            assert!(!conn.is_finished());
+
+            let ack = SymmetricMessage::ack_ok(&cipher(peer_key), remote_key, peer_addr)?;
+            remote.send(peer_addr, ack.data());
+            let _conn = established(conn).await;
+            Ok(())
+        }
+
         /// Marks `addr` as using the earlier completion rule (complete on any
         /// non-intro packet) until dropped.
         struct LegacyCompletion(SocketAddr);
@@ -7394,9 +7459,6 @@ pub mod mock_transport {
             Ok(())
         }
 
-        /// Connects a peer with the check to a peer with the earlier rule,
-        /// each dialing the other, under the given drop policies. Both must
-        /// connect.
         /// Which peer must complete in the `RemoteInbound` arm.
         #[derive(Clone, Copy)]
         enum InRemoteInbound {
@@ -7405,6 +7467,10 @@ pub mod mock_transport {
             Either,
         }
 
+        /// Connects a peer with the check to a peer with the earlier rule,
+        /// each dialing the other, under the given drop policies. Both must
+        /// connect, and `expect` names the peer that must complete in the
+        /// `RemoteInbound` arm.
         async fn checked_and_legacy_peers_connect(
             checked_policy: PacketDropPolicy,
             legacy_policy: PacketDropPolicy,

@@ -457,9 +457,7 @@ Handshake send failures (#5871):
 Hole-punch completion (traverse_nat's RemoteInbound arm, the side that
 answered the remote's intro):
   → Completes only on a packet encrypted under this attempt's inbound
-    session key. This does not establish who the remote is: the success
-    ack this side sends still carries that key, encrypted under the key
-    from the remote's intro (unchanged; changing it needs a new message).
+    session key. The success ack is unchanged here; a follow-up changes it.
   → Any other packet is dropped and counted once per packet
     (`handshake_unauthenticated_dropped`). The attempt goes back to
     receiving without sending, within the current receive window, so
