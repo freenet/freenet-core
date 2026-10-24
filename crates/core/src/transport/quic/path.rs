@@ -20,6 +20,22 @@
 //! the receiver reads its header, and its refusal then reads as success at
 //! the sender, as a refused stream does on the UDP transport (refusals do
 //! not change its ACKs). The receiver counts every refusal either way.
+//! The same holds for a message the receiver drops because its channel is
+//! full: it was acknowledged, so the sender sees `Ok`. A successful send
+//! means the bytes reached the peer's QUIC stack, never that the peer
+//! delivered them (e5: sent is not delivered).
+//!
+//! Sends can wait without limit against a peer that does not cooperate:
+//! `open_uni` waits for a stream credit, a write waits for flow-control
+//! credit, and the final wait for acknowledgement has no deadline of its
+//! own (only quinn's connection idle timeout ends it, and keepalives keep a
+//! connection alive). e5 callers MUST bound every send with a timeout.
+//!
+//! Cancel safety: dropping a send future before it returns resets the
+//! stream ([`reset_code::SENDER_ABORTED`]), so the receiver sees
+//! `ResetByPeer` and cancels its handle; it never sees a stream that ends
+//! early as if it were complete or truncated. A dropped short message or
+//! control frame is lost.
 //!
 //! Receiving: one task per connection accepts every uni stream and reads all
 //! of them concurrently (no task per stream), parsing the header and then:
@@ -207,6 +223,8 @@ quic_outcomes! {
         CancelledLocally => "cancelled_locally",
         /// Any other read error.
         ReadFailed => "read_failed",
+        /// The receive task panicked; the connection was closed.
+        ReceiveTaskPanicked => "receive_task_panicked",
     }
 }
 
@@ -370,9 +388,10 @@ impl QuicPath {
             streams_tx,
             controls_tx,
         );
-        let receive = GlobalExecutor::spawn(inbound::receive(
+        let receive = GlobalExecutor::spawn(supervise_receive(
             connection.inner().clone(),
             Arc::new(receiver),
+            stats.clone(),
         ));
         (
             Self {
@@ -409,6 +428,13 @@ impl QuicPath {
         let mut budget = self.budget.lock();
         budget.release_gone();
         (budget.stream_count(), budget.charged_bytes())
+    }
+
+    /// Streams charged right now, WITHOUT releasing gone charges first: what
+    /// the receive side itself released.
+    #[cfg(test)]
+    pub(crate) fn charged_streams_now(&self) -> usize {
+        self.budget.lock().stream_count()
     }
 
     /// The connection, for tests that write raw streams.
@@ -472,7 +498,7 @@ impl QuicPath {
         let mut send = self.open(&header, metadata).await?;
         let mut delivered: u64 = 0;
         let failure = loop {
-            match chunks.next().await {
+            match send.race(chunks.next()).await? {
                 None if delivered == total_len => break None,
                 None => {
                     break Some(QuicSendError::LengthMismatch {
@@ -516,6 +542,31 @@ impl QuicPath {
     }
 }
 
+/// Run the receive task, and close the connection if it ends while the
+/// connection is still open. It ends on its own only when the connection
+/// has ended; any other end (a panic) leaves a connection on which nothing
+/// would be read again, so it is counted and the connection is closed with
+/// code 0 (e4 assigns the close codes). Dropping the path aborts this task,
+/// which is not counted.
+async fn supervise_receive<T: TimeSource>(
+    connection: quinn::Connection,
+    receiver: Arc<inbound::Receiver<T>>,
+    stats: Arc<QuicPathStats>,
+) {
+    use futures::FutureExt;
+    let ended = std::panic::AssertUnwindSafe(inbound::receive(connection.clone(), receiver))
+        .catch_unwind()
+        .await;
+    if ended.is_err() {
+        stats.record(QuicInboundOutcome::ReceiveTaskPanicked);
+        tracing::error!(
+            remote = %connection.remote_address(),
+            "QUIC path: the receive task panicked; closing the connection"
+        );
+    }
+    connection.close(0u32.into(), b"receive task ended");
+}
+
 /// A uni stream being written that sees the peer stop it even while a
 /// write is blocked.
 ///
@@ -530,6 +581,8 @@ impl QuicPath {
 struct Outgoing {
     send: quinn::SendStream,
     stopped: Pin<Box<dyn Future<Output = StoppedResult> + Send + Sync>>,
+    /// Finished or reset: dropping it then sends nothing more.
+    closed: bool,
 }
 
 type StoppedResult = Result<Option<quinn::VarInt>, quinn::StoppedError>;
@@ -537,26 +590,47 @@ type StoppedResult = Result<Option<quinn::VarInt>, quinn::StoppedError>;
 impl Outgoing {
     fn new(send: quinn::SendStream) -> Self {
         let stopped = Box::pin(send.stopped());
-        Self { send, stopped }
+        Self {
+            send,
+            stopped,
+            closed: false,
+        }
+    }
+
+    /// Run `fut` unless the peer stops the stream first. Everything that
+    /// waits while the stream is open goes through here: the writes, and
+    /// waiting for the next chunk of a source, so a stopped stream is reset
+    /// at once instead of holding its uni-stream credit (and, for a blocked
+    /// write, the connection's flow-control credit).
+    async fn race<F: Future>(&mut self, fut: F) -> Result<F::Output, QuicSendError> {
+        tokio::select! {
+            out = fut => Ok(out),
+            stopped = &mut self.stopped => Err(self.stopped_early(stopped)),
+        }
     }
 
     async fn write_all(&mut self, buf: &[u8]) -> Result<(), QuicSendError> {
-        tokio::select! {
-            written = self.send.write_all(buf) => written.map_err(Into::into),
-            stopped = &mut self.stopped => Err(self.stopped_early(stopped)),
-        }
+        let Self { send, stopped, .. } = self;
+        let written = tokio::select! {
+            written = send.write_all(buf) => written,
+            result = stopped => return Err(self.stopped_early(result)),
+        };
+        written.map_err(Into::into)
     }
 
     async fn write_chunk(&mut self, chunk: Bytes) -> Result<(), QuicSendError> {
-        tokio::select! {
-            written = self.send.write_chunk(chunk) => written.map_err(Into::into),
-            stopped = &mut self.stopped => Err(self.stopped_early(stopped)),
-        }
+        let Self { send, stopped, .. } = self;
+        let written = tokio::select! {
+            written = send.write_chunk(chunk) => written,
+            result = stopped => return Err(self.stopped_early(result)),
+        };
+        written.map_err(Into::into)
     }
 
     /// The peer stopped the stream (or the connection ended) mid-write:
     /// reset it so its connection-level credit comes back.
     fn stopped_early(&mut self, stopped: StoppedResult) -> QuicSendError {
+        self.closed = true;
         match stopped {
             Ok(Some(code)) => {
                 self.send.reset(code).ok();
@@ -569,18 +643,24 @@ impl Outgoing {
         }
     }
 
-    /// Abandon the stream ([`reset_code::SENDER_ABORTED`]). Without the
-    /// reset, dropping it would finish it and the receiver would see a
-    /// stream that ended early.
+    /// Abandon the stream ([`reset_code::SENDER_ABORTED`]).
     fn abort(mut self) {
-        self.send.reset(reset_code::SENDER_ABORTED.into()).ok();
+        self.reset();
+    }
+
+    fn reset(&mut self) {
+        if !self.closed {
+            self.closed = true;
+            self.send.reset(reset_code::SENDER_ABORTED.into()).ok();
+        }
     }
 
     /// End the stream and wait until the peer has acknowledged every byte or
     /// stopped it.
     async fn finish(mut self) -> Result<(), QuicSendError> {
+        self.closed = true;
         self.send.finish().map_err(|_| QuicSendError::Closed)?;
-        match self.stopped.await {
+        match (&mut self.stopped).await {
             Ok(None) => Ok(()),
             Ok(Some(code)) => Err(QuicSendError::Stopped(code.into_inner())),
             Err(quinn::StoppedError::ConnectionLost(error)) => {
@@ -588,5 +668,15 @@ impl Outgoing {
             }
             Err(quinn::StoppedError::ZeroRttRejected) => Err(QuicSendError::Closed),
         }
+    }
+}
+
+impl Drop for Outgoing {
+    /// A stream dropped before it was finished (a send future cancelled
+    /// mid-message, or an error return) is reset. quinn's own drop would
+    /// FINISH it, and the receiver would take a cut-short message for one
+    /// that simply ended early.
+    fn drop(&mut self) {
+        self.reset();
     }
 }

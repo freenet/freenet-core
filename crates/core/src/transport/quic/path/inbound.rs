@@ -44,7 +44,28 @@
 //!   (`StreamIdInUse`). Completed ids are not remembered: that dedup is e5's,
 //!   where it sees both transports (`completed_inbound_streams`).
 //! - Header refusals, truncation, overlong streams, resets and full channels
-//!   are counted in the path's own `QuicInboundOutcome` counters only.
+//!   are counted in the path's own `QuicInboundOutcome` counters. A refused
+//!   header with an invalid declared length is also counted as
+//!   `InboundStreamOutcome::RefusedInvalidLength`, as the UDP path counts it.
+//!
+//! Memory: quinn hands out stream data as slices of the datagram it arrived
+//! in, so keeping a 1-byte chunk keeps its whole ~1200-byte datagram. The
+//! header, metadata, short and control reads therefore copy each chunk into
+//! one buffer of the declared length (at most the charged length for short
+//! messages, a small bound for the rest) and keep no chunk. The payload of
+//! a `Stream` is copied into fragments by the `Rechunker`, except a chunk
+//! of at least a whole fragment, which is kept as a slice: it pins at most
+//! one datagram (1200 bytes) per fragment of `FRAGMENT_PAYLOAD_SIZE`.
+//! Streams with no budget charge (in the header phase, and control frames)
+//! get an age limit too ([`uncharged_age_limit`]), so a peer cannot hold
+//! one of its 256 stream slots by trickling bytes.
+//!
+//! Stream id lifetime: a `Stream` id is held on the path from admission
+//! until all of its state is gone (the reader is done and every handle
+//! clone dropped). The charge is released when the reader ends if it held
+//! the last clone, and otherwise checked again whenever a stream with the
+//! same id arrives, before it is refused as `StreamIdInUse`. Completed ids
+//! are not remembered, so once released an id can be used again.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -101,6 +122,9 @@ impl InboundShort {
 /// A stream from the peer, announced once its header and metadata have
 /// arrived and before its payload. Its bytes arrive in `handle` as they are
 /// received; the handle is cancelled if the stream fails.
+///
+/// `handle` is the transport-internal `StreamHandle`; e5 must wrap it in a
+/// `boundary::IncomingStream` before anything above the transport sees it.
 #[derive(Debug)]
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct InboundStreamArrival {
@@ -215,22 +239,26 @@ struct BodyReader<T: TimeSource> {
     recv: quinn::RecvStream,
     time: T,
     idle_nanos: u64,
-    /// Admission time plus the age limit; `u64::MAX` until admitted.
+    /// Start time plus the age limit (the uncharged one until admitted).
     age_deadline: u64,
     last_progress: u64,
     timer: Pin<Box<dyn Future<Output = ()> + Send>>,
 }
 
 impl<T: TimeSource> BodyReader<T> {
+    /// A reader with the idle timeout and an age limit of
+    /// [`uncharged_age_limit`]; admission replaces the age limit with the
+    /// stream's own ([`Self::set_age_limit`]).
     fn new(recv: quinn::RecvStream, time: T, idle: Duration) -> Self {
         let now = time.now_nanos();
         let idle_nanos = nanos(idle);
-        let timer = time.sleep_until(now.saturating_add(idle_nanos));
+        let age_deadline = now.saturating_add(nanos(uncharged_age_limit()));
+        let timer = time.sleep_until(now.saturating_add(idle_nanos).min(age_deadline));
         Self {
             recv,
             time,
             idle_nanos,
-            age_deadline: u64::MAX,
+            age_deadline,
             last_progress: now,
             timer,
         }
@@ -278,20 +306,32 @@ impl<T: TimeSource> BodyReader<T> {
         }
     }
 
-    /// Exactly `len` bytes (`len` > 0).
+    /// Exactly `len` bytes (`len` > 0), copied into one buffer of `len`
+    /// bytes allocated up front, so no chunk (and no datagram it is a slice
+    /// of) is kept. Callers pass a declared length that is either small
+    /// (header, metadata, control) or already charged (short message).
     async fn read_exact(&mut self, len: usize) -> Result<Bytes, ReadFailure> {
-        let mut parts: Vec<Bytes> = Vec::new();
-        let mut got = 0;
-        while got < len {
-            match self.next_chunk(len - got).await? {
+        self.read_exact_with(len, |_| {}).await
+    }
+
+    /// [`Self::read_exact`], calling `progress` with the bytes held so far
+    /// after each chunk.
+    async fn read_exact_with(
+        &mut self,
+        len: usize,
+        mut progress: impl FnMut(usize),
+    ) -> Result<Bytes, ReadFailure> {
+        let mut out = BytesMut::with_capacity(len);
+        while out.len() < len {
+            match self.next_chunk(len - out.len()).await? {
                 Some(chunk) => {
-                    got += chunk.len();
-                    parts.push(chunk);
+                    out.extend_from_slice(&chunk);
+                    progress(out.len());
                 }
-                None => return Err(ReadFailure::Truncated(got)),
+                None => return Err(ReadFailure::Truncated(out.len())),
             }
         }
-        Ok(concat(parts, len))
+        Ok(out.freeze())
     }
 
     /// The end of the stream, with nothing more before it.
@@ -313,17 +353,16 @@ fn nanos(duration: Duration) -> u64 {
     u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
 }
 
-/// `parts` (`len` bytes in all) as one `Bytes`, without a copy for one part.
-fn concat(mut parts: Vec<Bytes>, len: usize) -> Bytes {
-    if parts.len() == 1 {
-        return parts.pop().unwrap_or_default();
-    }
-    let mut out = BytesMut::with_capacity(len);
-    for part in parts {
-        out.extend_from_slice(&part);
-    }
-    out.freeze()
+/// Age limit of a stream with no budget charge: one still in its header
+/// phase, or a control frame. The smallest age limit a charged stream gets
+/// (`inbound_stream_age_limit` of a tiny stream: `MIN_INBOUND_STREAM_AGE`,
+/// or the simulation idle threshold under that accommodation).
+fn uncharged_age_limit() -> Duration {
+    inbound_stream_age_limit(0)
 }
+
+/// Numbered fragments, in order.
+type Fragments = Vec<(u32, Bytes)>;
 
 /// Cuts a byte stream of `total` bytes into fragments of the UDP stream
 /// shape: fragment `i` holds bytes `[(i-1)F, iF)` with
@@ -335,9 +374,6 @@ fn concat(mut parts: Vec<Bytes>, len: usize) -> Bytes {
 /// [`Self::finish`], which the caller calls only at the end of the stream,
 /// so the buffer never reports a stream complete that then turns out to be
 /// longer than declared.
-/// Numbered fragments, in order.
-type Fragments = Vec<(u32, Bytes)>;
-
 struct Rechunker {
     total: u64,
     received: u64,
@@ -409,14 +445,25 @@ impl Rechunker {
     }
 }
 
-/// Releases a stream's budget charge if its state is gone once the reader is
-/// done with it, and cancels its handle if it did not complete.
+/// Owns the reader's handle (or token) of a charged stream: on drop it
+/// cancels the handle if the stream did not complete, drops it, and then
+/// releases the charge if no other clone is left. The reader keeps no
+/// clone of its own, so the guard's is the last one the reader holds.
 struct StreamGuard {
     budget: Arc<Mutex<InboundStreamBudget>>,
     key: StreamId,
     handle: Option<StreamHandle>,
     token: Option<Arc<LegacyStreamToken>>,
     complete: bool,
+}
+
+impl StreamGuard {
+    fn handle(&self) -> &StreamHandle {
+        // Set for every Stream guard at construction, and taken only in drop.
+        self.handle
+            .as_ref()
+            .expect("a Stream guard holds its handle until dropped")
+    }
 }
 
 impl Drop for StreamGuard {
@@ -538,42 +585,44 @@ impl<T: TimeSource> Receiver<T> {
             );
             key
         };
+        // The guard holds the reader's only reference to the token.
         let mut guard = StreamGuard {
             budget: self.budget.clone(),
             key,
             handle: None,
-            token: Some(token.clone()),
+            token: Some(token),
             complete: false,
         };
         reader.set_age_limit(inbound_stream_age_limit(total));
-        // Collected as received and joined once, as the UDP legacy path does.
-        let mut parts = Vec::new();
-        let mut received: u64 = 0;
-        while received < total {
-            match reader.next_chunk(clamp(total - received)).await {
-                Ok(Some(chunk)) => {
-                    received += chunk.len() as u64;
-                    token.report(received);
-                    parts.push(chunk);
-                }
-                Ok(None) => {
-                    self.fail(&mut reader, ReadFailure::Truncated(0), Charged::Yes);
-                    return;
-                }
-                Err(failure) => {
-                    self.fail(&mut reader, failure, Charged::Yes);
-                    return;
-                }
+        // One buffer of the charged length (see `read_exact`).
+        let read = {
+            let token = guard.token.as_ref();
+            reader
+                .read_exact_with(clamp(total), |held| {
+                    if let Some(token) = token {
+                        token.report(held as u64);
+                    }
+                })
+                .await
+        };
+        let payload = match read {
+            Ok(payload) => payload,
+            Err(failure) => {
+                self.fail(&mut reader, failure, Charged::Yes);
+                return;
             }
-        }
+        };
         if let Err(failure) = reader.expect_end().await {
             self.fail(&mut reader, failure, Charged::Yes);
             return;
         }
+        let Some(token) = guard.token.clone() else {
+            return;
+        };
         token.mark_complete();
         guard.complete = true;
         let message = InboundShort {
-            payload: concat(parts, clamp(total)),
+            payload,
             _charge: token,
         };
         match self.shorts.try_send(message) {
@@ -590,6 +639,10 @@ impl<T: TimeSource> Receiver<T> {
         let total = header.total_len();
         let handle = {
             let mut budget = self.budget.lock();
+            // A charge for this id whose state is already gone (an earlier
+            // stream whose last handle was dropped after its reader ended)
+            // must not refuse the id: nothing would release it otherwise.
+            budget.release_if_gone(stream_id);
             if budget.contains(stream_id) {
                 drop(budget);
                 self.stats.record(QuicInboundOutcome::StreamIdInUse);
@@ -613,10 +666,12 @@ impl<T: TimeSource> Receiver<T> {
             );
             handle
         };
+        // The guard holds the reader's only clone of the handle, so when it
+        // drops it can release the charge if no consumer holds one.
         let mut guard = StreamGuard {
             budget: self.budget.clone(),
             key: stream_id,
-            handle: Some(handle.clone()),
+            handle: Some(handle),
             token: None,
             complete: false,
         };
@@ -634,7 +689,7 @@ impl<T: TimeSource> Receiver<T> {
         let arrival = InboundStreamArrival {
             stream_id,
             metadata,
-            handle: handle.clone(),
+            handle: guard.handle().clone(),
         };
         if self.streams.try_send(arrival).is_err() {
             self.stats.record(QuicInboundOutcome::StreamDroppedFull);
@@ -661,7 +716,7 @@ impl<T: TimeSource> Receiver<T> {
                 }
             };
             for (number, fragment) in fragments {
-                if !self.push(&mut reader, &handle, number, fragment) {
+                if !self.push(&mut reader, guard.handle(), number, fragment) {
                     return;
                 }
             }
@@ -677,10 +732,10 @@ impl<T: TimeSource> Receiver<T> {
                 return;
             }
         };
-        if !self.push(&mut reader, &handle, number, last) {
+        if !self.push(&mut reader, guard.handle(), number, last) {
             return;
         }
-        debug_assert_eq!(handle.received_bytes(), total);
+        debug_assert_eq!(guard.handle().received_bytes(), total);
         guard.complete = true;
         self.stats.record(QuicInboundOutcome::CompletedStream);
     }

@@ -872,18 +872,28 @@ Sending (QuicPath::send_short / send_stream / send_stream_chunks /
   send_control): returns when the peer's QUIC stack acked every byte, or
   Stopped(code). A message that fits in the flow window can be acked
   before the receiver reads its header, so a refusal may read as success
-  at the sender, as on UDP. send_stream_chunks resets the stream if the
+  at the sender, as on UDP, and so may one dropped for a full channel:
+  sent is NOT delivered. send_stream_chunks resets the stream if the
   source fails or delivers a different length. quinn's 256 uni streams
-  are the back-pressure (open_uni waits).
-  Every write races the stream's stopped() future and resets on a stop:
+  are the back-pressure (open_uni waits; quinn returns credit only after
+  more than 32 streams are freed).
+  Sends have no deadline of their own: open_uni, a flow-blocked write
+  and the final wait for acks can wait as long as the connection lives
+  against a peer that does not cooperate. e5 callers MUST bound every
+  send with a timeout. Dropping a send future resets its stream (Drop on
+  Outgoing; quinn's own drop would FINISH it, which the receiver reads as
+  a stream that ended early).
+  Every write, and the wait for a source's next chunk, races the
+  stream's stopped() future and resets on a stop:
   quinn-proto 0.11.19 does not report STOP_SENDING to a writer blocked on
   CONNECTION flow control, so without the race a stopped stream keeps the
   connection's window and blocks every other stream on it. Do not write
   to a quinn SendStream without that race.
 Receiving: one task per connection reads every stream (FuturesUnordered,
-  no task per stream) and only uses try_send. Short and Control go to
-  bounded channels (full: dropped and counted); Stream goes through the
-  INBOUND ADAPTER (path/inbound.rs).
+  no task per stream) and only uses try_send. If that task panics it is
+  counted (receive_task_panicked) and the connection is closed. Short
+  and Control go to bounded channels (full: dropped and counted); Stream
+  goes through the INBOUND ADAPTER (path/inbound.rs).
 Inbound adapter: a Stream's payload goes into an ordinary StreamHandle,
   re-chunked to the UDP fragment shape (fragment i = bytes
   [(i-1)F, iF), F = FRAGMENT_PAYLOAD_SIZE), so fork / assemble / pipe /
@@ -898,7 +908,20 @@ Inbound adapter: a Stream's payload goes into an ordinary StreamHandle,
     fragment that completes the buffer is held until the end is seen.
     Ends early (Truncated), more bytes (Overlong), reset by the sender:
     the handle is cancelled (consumers get Cancelled) and it is counted.
-  → Charge released only when all state is gone (Weak), as on UDP.
+  → Charge released only when all state is gone (Weak), as on UDP. The
+    reader's guard owns its only clone, so the charge goes when the
+    reader ends if no consumer holds one; a consumer that drops later is
+    not observed, and the charge goes at the next check() that needs
+    room or when a stream with the same id arrives (release_if_gone
+    before the StreamIdInUse test). An id is held from admission until
+    then, and is free again afterwards (completed ids are not
+    remembered).
+  → No chunk is kept: quinn's chunks are slices of the ~1200-byte
+    datagram, so header, metadata, short and control reads copy into one
+    buffer of the declared length. Stream payload goes into fragments;
+    only a chunk of a whole fragment or more is kept as a slice. Streams
+    with no charge (header phase, control frames) have an age limit too
+    (inbound_stream_age_limit(0)).
   → Idle and age eviction: streaming_handle_idle_timeout and
     inbound_stream_age_limit, counted EvictedIdle / EvictedAge, checked by
     one timer per stream on the path's clock (not the timeout_check

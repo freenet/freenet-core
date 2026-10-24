@@ -376,18 +376,83 @@ mod tests {
         assert!(FrameHeader::stream(caller_named(1), 10, usize::MAX).is_err());
     }
 
-    /// Arbitrary bytes never panic the decoder.
+    /// Headers built from each field's valid and edge values: the decoder
+    /// accepts exactly those an independent statement of the rules accepts,
+    /// round-trips every accepted one, and never panics. Arbitrary bytes
+    /// never panic it either.
     #[test]
-    fn decode_never_panics_on_arbitrary_bytes() {
-        let _seed = crate::config::GlobalRng::seed_guard(0x0059_40E3);
-        for _ in 0..10_000 {
-            let len = crate::config::GlobalRng::random_range(0usize..=HEADER_LEN + 4);
-            let mut bytes = vec![0u8; len];
-            crate::config::GlobalRng::fill_bytes(&mut bytes);
-            // Bias towards the known version so later checks are reached.
-            if len > 0 && crate::config::GlobalRng::random_bool(0.5) {
-                bytes[0] = HEADER_VERSION;
+    fn decode_matches_the_rules_and_never_panics() {
+        use crate::config::GlobalRng;
+        let _seed = GlobalRng::seed_guard(0x0059_40E3);
+        let pick = |choices: &[u64]| choices[GlobalRng::random_range(0..choices.len())];
+        let mut accepted = 0;
+        let mut refused = 0;
+        for _ in 0..20_000 {
+            let version = pick(&[1, 1, 1, 0, 2]) as u8;
+            let kind = pick(&[0, 1, 2, 3]) as u8;
+            let stream_id = pick(&[
+                0,
+                0x8000_0000 | GlobalRng::random_range(0..0x7FFF_FFFFu64),
+                GlobalRng::random_range(1..0x8000_0000u64),
+            ]) as u32;
+            let total_len = pick(&[
+                0,
+                1,
+                GlobalRng::random_range(1..=MAX_CONTROL_BYTES + 1),
+                GlobalRng::random_range(1..=MAX_STREAM_TOTAL_BYTES),
+                MAX_STREAM_TOTAL_BYTES,
+                MAX_STREAM_TOTAL_BYTES + 1,
+                u64::MAX,
+            ]);
+            let metadata_len = pick(&[
+                0,
+                0,
+                GlobalRng::random_range(1..=u64::from(MAX_METADATA_BYTES)),
+                u64::from(MAX_METADATA_BYTES),
+                u64::from(MAX_METADATA_BYTES) + 1,
+                u64::from(u32::MAX),
+            ]) as u32;
+            let valid = version == 1
+                && match kind {
+                    0 => {
+                        stream_id == 0
+                            && metadata_len == 0
+                            && (1..=MAX_STREAM_TOTAL_BYTES).contains(&total_len)
+                    }
+                    1 => {
+                        stream_id & 0x8000_0000 != 0
+                            && metadata_len <= MAX_METADATA_BYTES
+                            && (1..=MAX_STREAM_TOTAL_BYTES).contains(&total_len)
+                    }
+                    2 => {
+                        stream_id == 0
+                            && metadata_len == 0
+                            && (1..=MAX_CONTROL_BYTES).contains(&total_len)
+                    }
+                    _ => false,
+                };
+            let bytes = raw(version, kind, stream_id, total_len, metadata_len);
+            match FrameHeader::decode(&bytes) {
+                Ok(header) => {
+                    assert!(valid, "accepted {bytes:?}");
+                    assert_eq!(header.encode().to_vec(), bytes);
+                    accepted += 1;
+                }
+                Err(_) => {
+                    assert!(!valid, "refused a valid header {bytes:?}");
+                    refused += 1;
+                }
             }
+        }
+        assert!(
+            accepted > 500 && refused > 500,
+            "{accepted} / {refused}"
+        );
+
+        for _ in 0..10_000 {
+            let len = GlobalRng::random_range(0usize..=HEADER_LEN + 4);
+            let mut bytes = vec![0u8; len];
+            GlobalRng::fill_bytes(&mut bytes);
             if let Ok(header) = FrameHeader::decode(&bytes) {
                 assert_eq!(FrameHeader::decode(&header.encode()), Ok(header));
             }

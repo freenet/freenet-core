@@ -497,12 +497,15 @@ fn truncated_and_overlong_streams_fail_and_are_counted() {
             );
             assert_eq!(p.b.stats().count(outcome), before + 1, "case {n}");
         }
-        for (total, sent, outcome) in [
-            (10, 9, QuicInboundOutcome::Truncated),
-            (10, 11, QuicInboundOutcome::Overlong),
+        // Short (kind 0) and control (kind 2) frames, one byte short and over.
+        for (kind, total, sent, outcome) in [
+            (0, 10, 9, QuicInboundOutcome::Truncated),
+            (0, 10, 11, QuicInboundOutcome::Overlong),
+            (2, 10, 9, QuicInboundOutcome::Truncated),
+            (2, 10, 11, QuicInboundOutcome::Overlong),
         ] {
             let before = p.b.stats().count(outcome);
-            let mut bytes = header(1, 0, 0, total, 0);
+            let mut bytes = header(1, kind, 0, total, 0);
             bytes.extend_from_slice(&payload(sent));
             let conn = p.a_raw();
             p.drive(raw_stream(conn, bytes)).await;
@@ -511,6 +514,10 @@ fn truncated_and_overlong_streams_fail_and_are_counted() {
         assert!(
             p.b_in.shorts.try_recv().is_err(),
             "no short message delivered"
+        );
+        assert!(
+            p.b_in.controls.try_recv().is_err(),
+            "no control frame delivered"
         );
         assert_eq!(p.b.stats().count(QuicInboundOutcome::CompletedStream), 0);
         assert_eq!(
@@ -728,40 +735,280 @@ fn full_channels_and_reused_ids_are_refused_without_waiting() {
     })
 }
 
-/// More messages in flight than quinn's uni stream limit (256) wait for
-/// stream credit instead of failing, and all arrive.
+/// quinn's uni stream limit is back-pressure: with every one of the 256
+/// stream credits held by streams the receiver is still reading, the next
+/// send waits in `open_uni`. quinn returns credit in batches: it announces
+/// new credit only once more than 1/8 of the limit (33 streams) has been
+/// freed, so one finished stream is not enough and 33 are.
 #[test]
 fn the_stream_limit_is_back_pressure() {
     bounded(|| async move {
         let _seed = GlobalRng::seed_guard(SEED);
-        let mut p = paths("quic-path-many", 10, QuicPathLimits::DEFAULT).await;
-        let count = 2 * super::super::config::MAX_UNI_STREAMS as usize + 10;
-        let a = p.a.clone();
-        let mut shorts = std::mem::replace(&mut p.b_in.shorts, tokio::sync::mpsc::channel(1).1);
-        let received = p
+        let p = paths("quic-path-many", 10, QuicPathLimits::DEFAULT).await;
+        let limit = super::super::config::MAX_UNI_STREAMS as usize;
+        let batch = limit / 8 + 1;
+        let (conn, a, time) = (p.a_raw(), p.a.clone(), p.time());
+        let held = p
             .drive(async move {
-                let sends = futures::future::join_all((0..count).map(|i| {
-                    let a = a.clone();
-                    async move { a.send_short(&(i as u32).to_be_bytes()).await }
-                }));
-                let receive = async {
-                    let mut got = Vec::new();
-                    while got.len() < count {
-                        let message = shorts.recv().await.expect("open");
-                        let bytes: [u8; 4] = message.payload()[..].try_into().unwrap();
-                        got.push(u32::from_be_bytes(bytes));
+                // Each holds a credit: two header bytes, never finished.
+                let mut held = Vec::new();
+                for _ in 0..limit {
+                    let mut send = conn.open_uni().await.unwrap();
+                    send.write_all(&[1, 0]).await.unwrap();
+                    held.push(send);
+                    time.sleep(Duration::from_millis(2)).await;
+                }
+                let send = a.send_short(b"waits");
+                tokio::pin!(send);
+                let mut finished = 0;
+                for target in [1, batch] {
+                    tokio::select! {
+                        result = &mut send => {
+                            panic!("sent with {finished} streams finished: {result:?}")
+                        }
+                        () = time.sleep(Duration::from_secs(5)) => {}
                     }
-                    got
-                };
-                let (results, got) = tokio::join!(sends, receive);
-                assert!(results.iter().all(Result::is_ok));
-                got
+                    // Complete held streams as valid short messages.
+                    while finished < target {
+                        let mut stream = held.remove(0);
+                        let mut rest = header(1, 0, 0, 3, 0);
+                        rest.drain(..2);
+                        rest.extend_from_slice(b"abc");
+                        stream.write_all(&rest).await.unwrap();
+                        stream.finish().unwrap();
+                        finished += 1;
+                    }
+                }
+                send.await.expect("sent once credit came back");
+                held
             })
             .await;
-        let mut sorted = received;
-        sorted.sort_unstable();
-        assert_eq!(sorted, (0..count as u32).collect::<Vec<_>>());
-        assert_eq!(p.b.stats().count(QuicInboundOutcome::ShortDroppedFull), 0);
+        assert_eq!(
+            p.b.stats().count(QuicInboundOutcome::DeliveredShort) as usize,
+            batch + 1
+        );
+        drop(held);
+    })
+}
+
+/// A receiver that never drains its channel loses what does not fit and
+/// counts it, while every send reports success: the bytes were acknowledged
+/// (a successful send is not a delivery).
+#[test]
+fn a_flood_into_an_undrained_receiver_is_dropped_and_counted() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let p = paths("quic-path-flood", 12, QuicPathLimits::DEFAULT).await;
+        let count = SHORT_CHANNEL_CAPACITY + 44;
+        let a = p.a.clone();
+        let results = p
+            .drive(async move {
+                futures::future::join_all((0..count).map(|i| {
+                    let a = a.clone();
+                    async move { a.send_short(&(i as u32).to_be_bytes()).await }
+                }))
+                .await
+            })
+            .await;
+        assert!(
+            results.iter().all(Result::is_ok),
+            "every send reads as success"
+        );
+        let stats = p.b.stats();
+        assert_eq!(
+            stats.count(QuicInboundOutcome::DeliveredShort) as usize,
+            SHORT_CHANNEL_CAPACITY
+        );
+        assert_eq!(stats.count(QuicInboundOutcome::ShortDroppedFull), 44);
+    })
+}
+
+/// Once a stream's state is gone its id can be used again: after a stream
+/// completes or fails and its last handle is dropped, a new stream with the
+/// same id is admitted (not refused as `StreamIdInUse`). The receive side
+/// releases the charge itself: these checks never call `charged()`, whose
+/// `release_gone` would hide a charge left behind. A stream that fails
+/// before it is announced (cut-short or reset metadata) is released by its
+/// reader at once.
+#[test]
+fn a_stream_id_is_free_again_once_its_state_is_gone() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let mut p = paths("quic-path-reuse", 13, QuicPathLimits::DEFAULT).await;
+        let id = StreamId::next();
+        for round in 0..3 {
+            let a = p.a.clone();
+            p.drive(async move {
+                a.send_stream(id, None, Bytes::from_static(b"first"))
+                    .await
+                    .expect("admitted")
+            })
+            .await;
+            let arrival = p.b_in.streams.try_recv().expect("announced");
+            assert!(arrival.handle.is_complete(), "round {round}");
+            drop(arrival);
+        }
+        // A failed stream, then the same id again.
+        let mut bytes = header(1, 1, id.0, 100, 0);
+        bytes.extend_from_slice(&payload(10));
+        let conn = p.a_raw();
+        p.drive(raw_stream(conn, bytes)).await;
+        drop(p.b_in.streams.try_recv().expect("announced"));
+        let a = p.a.clone();
+        p.drive(async move {
+            a.send_stream(id, None, Bytes::from_static(b"again"))
+                .await
+                .expect("admitted after a failure")
+        })
+        .await;
+        drop(p.b_in.streams.try_recv().expect("announced"));
+        assert_eq!(p.b.stats().count(QuicInboundOutcome::StreamIdInUse), 0);
+        assert_eq!(p.b.stats().count(QuicInboundOutcome::CompletedStream), 4);
+
+        // Metadata cut short, and metadata reset by the sender: never
+        // announced, and the reader's guard released the charge itself.
+        // (The last stream's charge may still be counted: its handle was
+        // dropped after its reader ended, which releases nothing until the
+        // id is used again or the budget needs room.)
+        let before = p.b.charged_streams_now();
+        let mut cut = header(1, 1, StreamId::next().0, 100, 50);
+        cut.extend_from_slice(&payload(20));
+        let conn = p.a_raw();
+        p.drive(raw_stream(conn, cut)).await;
+        let conn = p.a_raw();
+        let reset_id = StreamId::next().0;
+        p.drive(async move {
+            let mut send = conn.open_uni().await.unwrap();
+            let mut bytes = header(1, 1, reset_id, 100, 50);
+            bytes.extend_from_slice(&payload(20));
+            send.write_all(&bytes).await.unwrap();
+            send.reset(9u32.into()).unwrap();
+        })
+        .await;
+        let a = p.a.clone();
+        p.drive(async move { a.send_short(b"sync").await.unwrap() })
+            .await;
+        assert!(p.b_in.streams.try_recv().is_err(), "neither was announced");
+        assert_eq!(p.b.stats().count(QuicInboundOutcome::Truncated), 2);
+        assert_eq!(p.b.stats().count(QuicInboundOutcome::ResetByPeer), 1);
+        assert_eq!(
+            p.b.charged_streams_now(),
+            before + 1,
+            "only the queued sync message was added"
+        );
+    })
+}
+
+/// A sender whose chunk source never yields still sees the receiver's stop:
+/// waiting for the next chunk races the stop, and the stream is reset.
+#[test]
+fn a_stalled_source_still_sees_the_stop() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let limits = QuicPathLimits {
+            max_bytes: ChargeOverhead::DEFAULT.cost(10_000),
+            ..QuicPathLimits::DEFAULT
+        };
+        let p = paths("quic-path-stall", 14, limits).await;
+        let a = p.a.clone();
+        let result = p
+            .drive(async move {
+                a.send_stream_chunks(
+                    StreamId::next(),
+                    1_000_000,
+                    None,
+                    futures::stream::pending::<Result<Bytes, StreamError>>(),
+                )
+                .await
+            })
+            .await;
+        assert_stopped(result, stop_code::BUDGET_REFUSED);
+    })
+}
+
+/// Dropping a send future mid-payload resets the stream: the receiver sees
+/// `ResetByPeer` and cancels the handle, never a stream that just ended.
+#[test]
+fn a_cancelled_send_resets_the_stream() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let mut p = paths("quic-path-cancel", 15, QuicPathLimits::DEFAULT).await;
+        let a = p.a.clone();
+        let mut streams = std::mem::replace(&mut p.b_in.streams, tokio::sync::mpsc::channel(1).1);
+        let time = p.time();
+        let arrival = p
+            .drive(async move {
+                let arrival = tokio::select! {
+                    result = a.send_stream(StreamId::next(), None, over_window()) => {
+                        panic!("finished before it was announced: {result:?}")
+                    }
+                    arrival = streams.recv() => arrival.expect("announced"),
+                };
+                // The send future is dropped here, mid-payload.
+                for _ in 0..1000 {
+                    if arrival.handle.is_cancelled() {
+                        break;
+                    }
+                    time.sleep(Duration::from_millis(10)).await;
+                }
+                arrival
+            })
+            .await;
+        assert!(arrival.handle.is_cancelled());
+        assert!(!arrival.handle.is_complete());
+        assert_eq!(p.b.stats().count(QuicInboundOutcome::ResetByPeer), 1);
+        assert_eq!(p.b.stats().count(QuicInboundOutcome::Truncated), 0);
+    })
+}
+
+/// The header, metadata, short and control reads keep no slice of quinn's
+/// datagram buffers: each result is its own allocation of exactly its
+/// length (`try_into_mut` succeeds only for the sole owner, and its
+/// capacity is the allocation behind the bytes). A slice of a datagram
+/// would keep the whole datagram, about 1200 bytes, for a few bytes of
+/// data. Also with a control frame trickled one byte per datagram.
+#[test]
+fn reads_keep_no_slice_of_a_datagram() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let mut p = paths("quic-path-copy", 16, QuicPathLimits::DEFAULT).await;
+        let (a, conn, time) = (p.a.clone(), p.a_raw(), p.time());
+        p.drive(async move {
+            a.send_stream(
+                StreamId::next(),
+                Some(b"0123456789"),
+                Bytes::from_static(b"body"),
+            )
+            .await
+            .unwrap();
+            a.send_short(b"short").await.unwrap();
+            a.send_control(b"control").await.unwrap();
+            let mut send = conn.open_uni().await.unwrap();
+            send.write_all(&header(1, 2, 0, 200, 0)).await.unwrap();
+            for byte in payload(200) {
+                send.write_all(&[byte]).await.unwrap();
+                time.sleep(Duration::from_millis(5)).await;
+            }
+            send.finish().unwrap();
+            send.stopped().await.unwrap();
+        })
+        .await;
+        let exact = |bytes: Bytes, what: &str| {
+            let len = bytes.len();
+            let owned = bytes
+                .try_into_mut()
+                .unwrap_or_else(|_| panic!("{what}: shared with another owner"));
+            assert_eq!(owned.capacity(), len, "{what}: allocation is its length");
+        };
+        let arrival = p.b_in.streams.try_recv().unwrap();
+        let mut arrival = arrival;
+        exact(arrival.metadata.take().unwrap(), "metadata");
+        drop(arrival);
+        exact(p.b_in.shorts.try_recv().unwrap().into_payload(), "short");
+        exact(p.b_in.controls.try_recv().unwrap(), "control");
+        let trickled = p.b_in.controls.try_recv().unwrap();
+        assert!(trickled == payload(200));
+        exact(trickled, "trickled control");
     })
 }
 
@@ -774,16 +1021,14 @@ fn dropping_the_path_cancels_streams_in_progress() {
         let conn = p.a_raw();
         let mut bytes = header(1, 1, StreamId::next().0, 10_000, 0);
         bytes.extend_from_slice(&payload(100));
-        p.drive(async move {
-            let mut send = conn.open_uni().await.unwrap();
-            send.write_all(&bytes).await.unwrap();
-            // Keep the stream open: leak it into a task that never ends it.
-            tokio::spawn(async move {
-                let _send = send;
-                std::future::pending::<()>().await;
-            });
-        })
-        .await;
+        // Kept open (unfinished) by holding it until the end of the test.
+        let open = p
+            .drive(async move {
+                let mut send = conn.open_uni().await.unwrap();
+                send.write_all(&bytes).await.unwrap();
+                send
+            })
+            .await;
         // Let the header and metadata reach the receiver.
         let a = p.a.clone();
         p.drive(async move { a.send_short(b"sync").await.unwrap() })
@@ -796,5 +1041,6 @@ fn dropping_the_path_cancels_streams_in_progress() {
         // The receive task is aborted on its next poll.
         p.drive(async { tokio::task::yield_now().await }).await;
         assert!(arrival.handle.is_cancelled());
+        drop(open);
     })
 }
