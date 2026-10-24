@@ -33,6 +33,31 @@ pub(crate) struct QuicSocket<S> {
     send_errors: AtomicU64,
     /// Whether the ingress queue's sending side is gone has been logged.
     ingress_closed_logged: AtomicBool,
+    /// Test hook: make the next receive fail, which ends quinn's endpoint
+    /// driver.
+    #[cfg(test)]
+    receive_fault: Arc<ReceiveFault>,
+}
+
+/// Test hook: a socket error quinn's endpoint driver cannot get past, the
+/// way a socket that fails for good would end it.
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct ReceiveFault {
+    tripped: AtomicBool,
+    waker: parking_lot::Mutex<Option<std::task::Waker>>,
+}
+
+#[cfg(test)]
+impl ReceiveFault {
+    /// Fail the endpoint's next receive, and wake the driver so it makes
+    /// one.
+    pub(crate) fn trip(&self) {
+        self.tripped.store(true, Ordering::Release);
+        if let Some(waker) = self.waker.lock().take() {
+            waker.wake();
+        }
+    }
 }
 
 impl<S> fmt::Debug for QuicSocket<S> {
@@ -56,7 +81,15 @@ impl<S: Socket> QuicSocket<S> {
             local_addr,
             send_errors: AtomicU64::new(0),
             ingress_closed_logged: AtomicBool::new(false),
+            #[cfg(test)]
+            receive_fault: Arc::default(),
         }
+    }
+
+    /// The hook that fails this socket's receives (tests).
+    #[cfg(test)]
+    pub(crate) fn receive_fault(&self) -> Arc<ReceiveFault> {
+        self.receive_fault.clone()
     }
 
     /// Sends that failed with an error other than `WouldBlock`.
@@ -158,6 +191,13 @@ impl<S: Socket> AsyncUdpSocket for QuicSocket<S> {
         let (Some(buf), Some(slot)) = (bufs.first_mut(), meta.first_mut()) else {
             return Poll::Ready(Ok(0));
         };
+        #[cfg(test)]
+        {
+            if self.receive_fault.tripped.load(Ordering::Acquire) {
+                return Poll::Ready(Err(io::Error::other("injected receive failure")));
+            }
+            *self.receive_fault.waker.lock() = Some(cx.waker().clone());
+        }
         let datagram = match self.ingress.lock().poll_recv(cx) {
             Poll::Pending => return Poll::Pending,
             Poll::Ready(Some(datagram)) => datagram,

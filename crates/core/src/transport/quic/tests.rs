@@ -1802,7 +1802,10 @@ fn the_runtime_timer_follows_virtual_time() {
     use quinn::Runtime;
     use std::task::{Context, Poll};
     let time = VirtualTime::new();
-    let runtime = super::runtime::QuicRuntime::new(time.clone());
+    let runtime = super::runtime::QuicRuntime::new(
+        time.clone(),
+        super::liveness::EndpointHealth::new("127.0.0.1:1".parse().unwrap()),
+    );
     let start = runtime.now();
     let waker = futures::task::noop_waker();
     let mut cx = Context::from_waker(&waker);
@@ -2284,7 +2287,9 @@ fn closing_an_endpoint_releases_the_allow_set() {
         )
         .await;
         let (_, client, server) = pair.transfer(payload(1000), Duration::from_secs(60)).await;
-        pair.a.endpoint.close(0u32.into(), b"test");
+        pair.a
+            .endpoint
+            .close(error::close_code::NODE_DROPPED_PEER.into(), b"test");
         let s = server.inner().clone();
         drive(&pair.time, Duration::from_secs(60), async move {
             s.closed().await;
@@ -2428,4 +2433,287 @@ fn the_cap_wakes_waiters_per_quic_datagram() {
         crate::transport::egress_cap::WAKE_DATAGRAM_BYTES,
         usize::from(MAX_UDP_PAYLOAD)
     );
+}
+
+/// Each close code reaches the peer as that code, and the peer maps it to
+/// the kind its handling depends on: `Downgrade` and `IdentityMismatch` are
+/// refusals, `NodeDroppedPeer` (also what dropping a connection sends) is a
+/// lost connection. Either side can close. Each close is counted once, by
+/// code; a second close of an ended connection sends and counts nothing.
+#[test]
+fn close_codes_reach_the_peer() {
+    bounded(|| async move {
+        use crate::transport::metrics::{QuicCloseCode, TRANSPORT_METRICS};
+        use crate::transport::{QuicErrorKind, QuicRefusal};
+        let _seed = GlobalRng::seed_guard(SEED);
+        let pair = pair(
+            "quic-close-codes",
+            "10.201.30.1:5000".parse().unwrap(),
+            "10.201.30.2:5000".parse().unwrap(),
+            None,
+        )
+        .await;
+        let expected = |code: QuicCloseCode| match code {
+            QuicCloseCode::NodeDroppedPeer => QuicErrorKind::ConnectionLost,
+            QuicCloseCode::Downgrade => QuicErrorKind::Refused {
+                reason: QuicRefusal::Downgrade,
+            },
+            QuicCloseCode::IdentityMismatch => QuicErrorKind::Refused {
+                reason: QuicRefusal::IdentityMismatch,
+            },
+        };
+        let mut sent_by_a = Vec::new();
+        let mut sent_by_b = Vec::new();
+        for code in QuicCloseCode::ALL {
+            for a_closes in [true, false] {
+                let (_, client, server) =
+                    pair.transfer(payload(100), Duration::from_secs(60)).await;
+                let (closer, peer) = if a_closes {
+                    sent_by_a.push(code);
+                    (client, server)
+                } else {
+                    sent_by_b.push(code);
+                    (server, client)
+                };
+                closer.close(code);
+                // Closing again sends and counts nothing.
+                closer.close(QuicCloseCode::Downgrade);
+                let seen = peer.inner().clone();
+                let error = drive(&pair.time, Duration::from_secs(60), async move {
+                    seen.closed().await
+                })
+                .await;
+                let quinn::ConnectionError::ApplicationClosed(close) = &error else {
+                    panic!("{code:?}: the peer saw {error:?}");
+                };
+                assert_eq!(
+                    close.error_code.into_inner(),
+                    u64::from(code.code()),
+                    "{code:?}"
+                );
+                assert_eq!(QuicErrorKind::from(error), expected(code), "{code:?}");
+                // Dropping both ends after the close counts nothing more.
+                drop((closer, peer));
+            }
+        }
+        assert_eq!(TRANSPORT_METRICS.quic_close_sent_to(pair.b_addr), sent_by_a);
+        assert_eq!(TRANSPORT_METRICS.quic_close_sent_to(pair.a_addr), sent_by_b);
+
+        // Dropping an open connection closes it with NodeDroppedPeer.
+        let (_, client, server) = pair.transfer(payload(100), Duration::from_secs(60)).await;
+        drop(client);
+        let seen = server.inner().clone();
+        let error = drive(&pair.time, Duration::from_secs(60), async move {
+            seen.closed().await
+        })
+        .await;
+        let quinn::ConnectionError::ApplicationClosed(close) = &error else {
+            panic!("the peer saw {error:?}");
+        };
+        assert_eq!(
+            close.error_code.into_inner(),
+            u64::from(error::close_code::NODE_DROPPED_PEER)
+        );
+        sent_by_a.push(QuicCloseCode::NodeDroppedPeer);
+        assert_eq!(TRANSPORT_METRICS.quic_close_sent_to(pair.b_addr), sent_by_a);
+        drop(server);
+        assert_eq!(
+            TRANSPORT_METRICS.quic_close_sent_to(pair.a_addr),
+            sent_by_b,
+            "the peer's handle, dropped after the close, sent nothing"
+        );
+    });
+}
+
+/// When the endpoint driver dies while the node holds the endpoint (here a
+/// receive error, as from a socket that fails for good), the endpoint's
+/// availability turns `Down` and the death is counted once. Nothing stops:
+/// the accept loop parks instead of ending (its monitor does not fire), and
+/// the socket keeps passing UDP-transport datagrams. Its connections end
+/// and new ones fail as `EndpointDown`.
+#[test]
+fn endpoint_death_turns_quic_off_without_stopping_the_node() {
+    bounded(|| async move {
+        use crate::node::background_task_monitor::BackgroundTaskMonitor;
+        use crate::transport::QuicErrorKind;
+        use crate::transport::metrics::TRANSPORT_METRICS;
+        let _seed = GlobalRng::seed_guard(SEED);
+        let pair = pair(
+            "quic-endpoint-death",
+            "10.201.31.1:5000".parse().unwrap(),
+            "10.201.31.2:5000".parse().unwrap(),
+            None,
+        )
+        .await;
+        let (_, client, _server) = pair.transfer(payload(100), Duration::from_secs(60)).await;
+        let mut availability = pair.a.availability();
+        assert_eq!(availability.get(), QuicAvailability::Up);
+
+        let monitor = BackgroundTaskMonitor::new();
+        let (attempts, _attempts_rx) = tokio::sync::mpsc::channel(4);
+        pair.a.spawn_accept_loop(&monitor, attempts);
+        let monitor_fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let wait = {
+            let fired = monitor_fired.clone();
+            let wait = monitor.wait_for_any_exit();
+            tokio::spawn(async move {
+                let _ = wait.await;
+                fired.store(true, std::sync::atomic::Ordering::SeqCst);
+            })
+        };
+
+        pair.a.fail_driver();
+        let seen = drive(&pair.time, Duration::from_secs(60), async move {
+            availability.not_up().await
+        })
+        .await;
+        assert_eq!(seen, QuicAvailability::Down);
+        assert_eq!(pair.a.availability().get(), QuicAvailability::Down);
+        assert_eq!(TRANSPORT_METRICS.quic_endpoint_down_at(pair.a_addr), 1);
+
+        // The endpoint's connection ends, and a new one cannot start.
+        let c = client.inner().clone();
+        drive(&pair.time, Duration::from_secs(60), async move {
+            c.closed().await;
+        })
+        .await;
+        let refused = pair
+            .a
+            .connect(pair.b_addr, &pair.b_key())
+            .await
+            .expect_err("the endpoint is down");
+        assert_eq!(QuicErrorKind::from(refused), QuicErrorKind::EndpointDown);
+
+        // Let everything run a while: the accept loop has seen `None` and
+        // parked, so the monitor never fires.
+        let time = pair.time.clone();
+        drive(&pair.time, Duration::from_secs(60), async move {
+            time.sleep(Duration::from_secs(30)).await;
+        })
+        .await;
+        assert!(
+            !monitor_fired.load(std::sync::atomic::Ordering::SeqCst),
+            "the accept loop's end would stop the node"
+        );
+        assert!(!wait.is_finished());
+
+        // The UDP side of the socket still works: a legacy-class datagram
+        // sent to `a` is read as one (by this test, in the listener's
+        // place).
+        pair.pumps[0].abort();
+        pair.b_socket
+            .send_to(&[0x01, 0, 0, 0], pair.a_addr)
+            .await
+            .unwrap();
+        let socket = pair.a_socket.clone();
+        let (len, from) = drive(&pair.time, Duration::from_secs(10), async move {
+            let mut buf = vec![0u8; MAX_RECV_PACKET_SIZE];
+            loop {
+                match socket.recv_classified(&mut buf).await.unwrap() {
+                    crate::transport::SocketRead::Datagram(len, from) => break (len, from),
+                    crate::transport::SocketRead::Diverted => {}
+                }
+            }
+        })
+        .await;
+        assert_eq!((len, from), (4, pair.b_addr));
+
+        // Dropping every handle afterwards counts nothing more.
+        drop(client);
+        drop(pair);
+        assert_eq!(
+            TRANSPORT_METRICS.quic_endpoint_down_at("10.201.31.1:5000".parse().unwrap()),
+            1
+        );
+        wait.abort();
+    });
+}
+
+/// Dropping the last handle is not a death: quinn's driver ends normally,
+/// nothing is counted, and the availability is never `Down`.
+#[test]
+fn dropping_the_endpoint_is_not_a_death() {
+    bounded(|| async move {
+        use crate::transport::metrics::TRANSPORT_METRICS;
+        let network = "quic-endpoint-drop";
+        let addr: SocketAddr = "10.201.32.1:5000".parse().unwrap();
+        let time = VirtualTime::new();
+        register_network_time_source(network, time.clone());
+        register_address_network(addr, network);
+        let socket = Arc::new(DemuxSocket::wrap(
+            SimulationSocket::bind(addr).await.unwrap(),
+            None,
+        ));
+        let endpoint = QuicEndpoint::bind(
+            socket,
+            addr,
+            time.clone(),
+            &settings(),
+            &TransportKeypair::new(),
+        )
+        .unwrap();
+        let mut availability = endpoint.availability();
+        let clone = endpoint.clone();
+        drop(endpoint);
+        assert_eq!(availability.get(), QuicAvailability::Up, "a handle is left");
+        drop(clone);
+        // `not_up` returns once the driver ended and dropped the last
+        // sender, with the value it left.
+        let seen = drive(&time, Duration::from_secs(10), async move {
+            availability.not_up().await
+        })
+        .await;
+        assert_eq!(seen, QuicAvailability::Up);
+        assert_eq!(TRANSPORT_METRICS.quic_endpoint_down_at(addr), 0);
+        unregister_network_time_source(network);
+    });
+}
+
+/// With `transport-quic` off the transport builds no endpoint and reports
+/// `Disabled`; with it on, `Up`. When that endpoint's driver dies, the
+/// transport reports `Down` and its listener keeps running: endpoint death
+/// never reaches `ListenerExit`, which would exit the node.
+#[test]
+fn the_transport_reports_quic_availability() {
+    bounded(|| async move {
+        use crate::transport::UdpTransportSocket;
+        use crate::transport::connection_handler::{UdpTransportConfig, bind_udp_listener};
+        use crate::transport::metrics::TRANSPORT_METRICS;
+        for quic in [None, Some(settings())] {
+            let port = crate::test_utils::reserve_local_port().unwrap();
+            crate::test_utils::release_local_port(port);
+            let (outbound, _inbound, listener) = bind_udp_listener::<UdpTransportSocket>(
+                crate::transport::TransportKeypair::new(),
+                IpAddr::V4(Ipv4Addr::LOCALHOST),
+                port,
+                false,
+                UdpTransportConfig {
+                    quic,
+                    ..UdpTransportConfig::default()
+                },
+            )
+            .await
+            .unwrap();
+            let mut availability = outbound.quic_availability();
+            let Some(endpoint) = outbound.quic_endpoint() else {
+                assert!(quic.is_none(), "an endpoint is built with the key on");
+                assert_eq!(availability.get(), QuicAvailability::Disabled);
+                assert_eq!(availability.not_up().await, QuicAvailability::Disabled);
+                listener.abort();
+                continue;
+            };
+            assert!(quic.is_some(), "no endpoint is built with the key off");
+            assert_eq!(availability.get(), QuicAvailability::Up);
+            endpoint.fail_driver();
+            let seen = tokio::time::timeout(Duration::from_secs(10), availability.not_up())
+                .await
+                .expect("the driver's death is reported");
+            assert_eq!(seen, QuicAvailability::Down);
+            let local = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
+            assert_eq!(TRANSPORT_METRICS.quic_endpoint_down_at(local), 1);
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            assert!(!listener.is_finished(), "the listener keeps running");
+            listener.abort();
+        }
+    })
 }

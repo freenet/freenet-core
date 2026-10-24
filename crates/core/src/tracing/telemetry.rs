@@ -2786,6 +2786,22 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                 serde_json::json!(snapshot.handshake_unauthenticated_dropped),
             );
             m.insert(
+                "quic_endpoint_down".into(),
+                serde_json::json!(snapshot.quic_endpoint_down),
+            );
+            m.insert(
+                "quic_close_sent_node_dropped_peer".into(),
+                serde_json::json!(snapshot.quic_close_sent_node_dropped_peer),
+            );
+            m.insert(
+                "quic_close_sent_downgrade".into(),
+                serde_json::json!(snapshot.quic_close_sent_downgrade),
+            );
+            m.insert(
+                "quic_close_sent_identity_mismatch".into(),
+                serde_json::json!(snapshot.quic_close_sent_identity_mismatch),
+            );
+            m.insert(
                 "nat_fail_samples".into(),
                 serde_json::json!(snapshot.nat_fail_samples),
             );
@@ -6850,6 +6866,32 @@ mod tests {
             ("conn_identity_set_from_placeholder_unchecked", 77),
             ("conn_identity_connect_peer_on_placeholder", 78),
             ("conn_identity_teardown_key_unmapped", 79),
+        ] {
+            assert_eq!(json[key], expected, "event-log value for {key}");
+            assert_eq!(json[key], reference[key], "serde value for {key}");
+        }
+    }
+
+    /// The event-log JSON carries the QUIC endpoint-down and close-code
+    /// counts, with the same values serde gives.
+    #[test]
+    fn transport_snapshot_json_carries_quic_endpoint_and_close_counts() {
+        let snapshot = crate::transport::metrics::TransportSnapshot {
+            quic_endpoint_down: 1,
+            quic_close_sent_node_dropped_peer: 2,
+            quic_close_sent_downgrade: 3,
+            quic_close_sent_identity_mismatch: 4,
+            ..Default::default()
+        };
+        let reference = serde_json::to_value(&snapshot).unwrap();
+        let json = event_kind_to_json(&super::super::EventKind::TransportSnapshot(Box::new(
+            snapshot,
+        )));
+        for (key, expected) in [
+            ("quic_endpoint_down", 1),
+            ("quic_close_sent_node_dropped_peer", 2),
+            ("quic_close_sent_downgrade", 3),
+            ("quic_close_sent_identity_mismatch", 4),
         ] {
             assert_eq!(json[key], expected, "event-log value for {key}");
             assert_eq!(json[key], reference[key], "serde value for {key}");

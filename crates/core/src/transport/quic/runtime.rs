@@ -5,6 +5,11 @@
 //! as an argument everywhere, so routing those two calls through a
 //! [`TimeSource`] puts the whole endpoint on that clock: `VirtualTime` in
 //! tests, `RealTime` on a node. Tasks are spawned with [`GlobalExecutor`].
+//!
+//! The first task quinn spawns is the endpoint driver
+//! (`Endpoint::new_with_abstract_socket` spawns it before returning; every
+//! later spawn is a connection driver). The runtime wraps that one so its end
+//! is reported to the endpoint's [`EndpointHealth`] (see `liveness`).
 
 use std::fmt;
 use std::future::Future;
@@ -16,6 +21,7 @@ use std::time::{Duration, Instant};
 
 use quinn::{AsyncTimer, AsyncUdpSocket, Runtime};
 
+use super::liveness::{EndpointHealth, watch_endpoint_driver};
 use crate::config::GlobalExecutor;
 use crate::simulation::TimeSource;
 
@@ -63,12 +69,17 @@ impl<T: TimeSource> Clock<T> {
 /// The QUIC endpoint's runtime: quinn's clock and timers on `T`.
 pub(crate) struct QuicRuntime<T> {
     clock: Arc<Clock<T>>,
+    /// Taken by the first spawn, quinn's endpoint driver.
+    endpoint_driver: parking_lot::Mutex<Option<Arc<EndpointHealth>>>,
 }
 
 impl<T: TimeSource> QuicRuntime<T> {
-    pub(crate) fn new(time: T) -> Self {
+    /// A runtime on `time` whose first spawned task, the endpoint driver,
+    /// reports its end to `health`.
+    pub(crate) fn new(time: T, health: Arc<EndpointHealth>) -> Self {
         Self {
             clock: Arc::new(Clock::new(time)),
+            endpoint_driver: parking_lot::Mutex::new(Some(health)),
         }
     }
 }
@@ -89,9 +100,19 @@ impl<T: TimeSource> Runtime for QuicRuntime<T> {
     }
 
     fn spawn(&self, future: Pin<Box<dyn Future<Output = ()> + Send>>) {
-        // quinn spawns its endpoint driver and one driver per connection;
-        // each ends when its endpoint or connection does.
-        GlobalExecutor::spawn(future);
+        // quinn spawns its endpoint driver first, then one driver per
+        // connection; each ends when its endpoint or connection does. None
+        // is registered with BackgroundTaskMonitor: their end must not stop
+        // the node. The endpoint driver's end is reported instead.
+        let endpoint_driver = self.endpoint_driver.lock().take();
+        match endpoint_driver {
+            Some(health) => {
+                GlobalExecutor::spawn(watch_endpoint_driver(future, health));
+            }
+            None => {
+                GlobalExecutor::spawn(future);
+            }
+        }
     }
 
     /// Never used: the endpoint is built over its own socket

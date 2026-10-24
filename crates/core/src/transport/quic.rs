@@ -24,6 +24,11 @@
 //!   header packet with a forged ID silently instead of answering it.
 //! - [`identity`]: the TLS raw public key, XEdDSA signer and pinned
 //!   verifiers made from the node's X25519 transport key.
+//! - [`error`]: quinn's and the framing's errors mapped to
+//!   [`QuicError`](super::QuicError) kinds, and the application error
+//!   codes (connection close, stream stop and reset), one range each.
+//! - [`liveness`]: whether the endpoint is alive ([`QuicAvailability`]);
+//!   endpoint death turns QUIC off for the node and never stops it.
 //!
 //! [`DemuxSocket`]: super::DemuxSocket
 //! [`TransportPublicKey`]: super::TransportPublicKey
@@ -31,8 +36,10 @@
 
 pub(crate) mod cid;
 pub(crate) mod config;
+pub(crate) mod error;
 pub(crate) mod framing;
 pub(crate) mod identity;
+pub(crate) mod liveness;
 pub(crate) mod path;
 pub(crate) mod runtime;
 pub(crate) mod socket;
@@ -48,15 +55,22 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use parking_lot::Mutex;
+use tokio::sync::mpsc;
 
 use super::Socket;
 use super::crypto::{TransportKeypair, TransportPublicKey};
 use super::demux::{DemuxSocket, QuicSourcePermit};
+use super::metrics::{QuicCloseCode, TRANSPORT_METRICS};
 use crate::config::GlobalExecutor;
+use crate::node::background_task_monitor::BackgroundTaskMonitor;
 use crate::simulation::TimeSource;
 use identity::{PeerKey, QuicIdentity};
+use liveness::EndpointHealth;
 
 pub(crate) use config::QuicSettings;
+#[cfg(test)]
+pub(crate) use liveness::QuicAvailability;
+pub(crate) use liveness::QuicAvailabilityWatch;
 
 /// Whether the node may use QUIC: the `transport-quic` config key.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -110,6 +124,10 @@ impl QuicMode {
 /// connection is left.
 #[derive(Clone)]
 pub(crate) struct QuicEndpoint {
+    // Declared first so it is dropped before `endpoint`: the last handle
+    // marks the endpoint released before quinn's driver can see no handle
+    // left and end, so that end is not taken for a death.
+    owner: Arc<EndpointOwner>,
     endpoint: quinn::Endpoint,
     sources: Arc<dyn QuicSources>,
     /// The transport settings of every connection (`config::transport_config`).
@@ -123,6 +141,21 @@ pub(crate) struct QuicEndpoint {
     identity: Arc<QuicIdentity>,
     /// The transport key each allowed client must present.
     expected_clients: Arc<ExpectedClients>,
+    /// Test hook that ends quinn's endpoint driver.
+    #[cfg(test)]
+    receive_fault: Arc<socket::ReceiveFault>,
+}
+
+/// Shared by every handle to one endpoint; the last one dropped marks the
+/// endpoint released ([`EndpointHealth::release`]).
+struct EndpointOwner {
+    health: Arc<EndpointHealth>,
+}
+
+impl Drop for EndpointOwner {
+    fn drop(&mut self) {
+        self.health.release();
+    }
 }
 
 /// The key each allowed client address must present. An entry counts the
@@ -358,13 +391,20 @@ impl QuicEndpoint {
             transport.clone(),
             clock,
         )?);
+        let health = EndpointHealth::new(local_addr);
+        #[cfg(test)]
+        let mut receive_fault = None;
         // If quinn refuses the socket after the ingress is enabled, the
         // ingress is disabled again, so the node is left as with QUIC off.
         let endpoint = socket
             .with_quic_ingress(|ingress| {
                 let quic_socket =
                     Arc::new(socket::QuicSocket::new(socket.clone(), ingress, local_addr));
-                let runtime = Arc::new(runtime::QuicRuntime::new(time));
+                #[cfg(test)]
+                {
+                    receive_fault = Some(quic_socket.receive_fault());
+                }
+                let runtime = Arc::new(runtime::QuicRuntime::new(time, health.clone()));
                 // The server configuration is set so quinn hands every
                 // Initial from an allowed source to `accept` (without one it
                 // answers with a stateless reset); its TLS refuses every
@@ -388,13 +428,79 @@ impl QuicEndpoint {
             "QUIC endpoint built (transport-quic = prefer); nothing opens connections on it in this release"
         );
         Ok(Self {
+            owner: Arc::new(EndpointOwner { health }),
             endpoint,
             sources,
             transport,
             server,
             identity,
             expected_clients: Arc::new(ExpectedClients::default()),
+            #[cfg(test)]
+            receive_fault: receive_fault.unwrap_or_default(),
         })
+    }
+
+    /// Whether this endpoint is alive: `Up` until its driver dies, then
+    /// `Down` for good (see [`liveness`]).
+    pub(crate) fn availability(&self) -> QuicAvailabilityWatch {
+        self.owner.health.watch()
+    }
+
+    /// Fail the endpoint's next receive, which ends quinn's endpoint driver
+    /// as a socket that fails for good would (tests).
+    #[cfg(test)]
+    pub(crate) fn fail_driver(&self) {
+        self.receive_fault.trip();
+    }
+
+    /// Accept connection attempts in a task registered with `monitor` as
+    /// `quic_accept_loop`, handing each to `attempts` without waiting: when
+    /// `attempts` is full the attempt is ignored (the client retransmits
+    /// its Initial, as after a lost datagram). The task holds a handle to
+    /// the endpoint while it accepts.
+    ///
+    /// When `accept` returns `None` (the endpoint was closed, or its driver
+    /// died) or `attempts` is closed, the task drops its handle and parks
+    /// instead of returning, because the monitor reads any end of a
+    /// registered task as a node failure and an endpoint's end must not
+    /// stop the node. Endpoint death is reported by the driver's watcher
+    /// ([`Self::availability`]), not by this task. A panic here is still
+    /// a node failure, as for every monitored task.
+    ///
+    /// `monitor` must not have started waiting yet
+    /// ([`BackgroundTaskMonitor::wait_for_any_exit`] drains it, and a task
+    /// registered after that is not monitored). In `run_node` that happens
+    /// before the event listener opens the transport, so e5 must register
+    /// this task through a monitor that is still live at that point.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn spawn_accept_loop(
+        &self,
+        monitor: &BackgroundTaskMonitor,
+        attempts: mpsc::Sender<QuicIncoming>,
+    ) {
+        let endpoint = self.clone();
+        let handle = GlobalExecutor::spawn(async move {
+            while let Some(incoming) = endpoint.accept().await {
+                match attempts.try_send(incoming) {
+                    Ok(()) => {}
+                    Err(mpsc::error::TrySendError::Full(incoming)) => {
+                        tracing::debug!(
+                            remote = %incoming.incoming.remote_address(),
+                            "QUIC accept queue full; ignoring the attempt"
+                        );
+                        incoming.incoming.ignore();
+                    }
+                    Err(mpsc::error::TrySendError::Closed(incoming)) => {
+                        incoming.incoming.ignore();
+                        break;
+                    }
+                }
+            }
+            tracing::debug!("QUIC accept loop stopped; parking");
+            drop(endpoint);
+            std::future::pending::<()>().await;
+        });
+        monitor.register("quic_accept_loop", handle);
     }
 
     /// Let the holder of `expected` connect from `addr` while the permit is
@@ -608,8 +714,30 @@ impl QuicConnection {
     }
 }
 
+impl QuicConnection {
+    /// Close the connection with `code`, which the peer reads in its
+    /// connection error. Counted once, by code, if the connection was still
+    /// open.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn close(&self, code: QuicCloseCode) {
+        close_connection(&self.connection, code);
+    }
+}
+
 impl Drop for QuicConnection {
     fn drop(&mut self) {
-        self.connection.close(0u32.into(), b"closed");
+        close_connection(&self.connection, QuicCloseCode::NodeDroppedPeer);
+    }
+}
+
+/// Close `connection` with `code` if it is still open, and count it. Only
+/// if still open: closing an ended connection again would count a close
+/// that sent nothing, and replace the reason quinn reports (the peer's
+/// close) with LocallyClosed. Not atomic: a peer close landing between the
+/// check and `close` is reported as LocallyClosed and still counted.
+pub(crate) fn close_connection(connection: &quinn::Connection, code: QuicCloseCode) {
+    if connection.close_reason().is_none() {
+        TRANSPORT_METRICS.record_quic_close_sent(code, connection.remote_address());
+        connection.close(code.code().into(), code.reason());
     }
 }

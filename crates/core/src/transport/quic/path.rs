@@ -99,7 +99,7 @@ use super::identity::PeerKey;
 use crate::config::GlobalExecutor;
 use crate::simulation::TimeSource;
 use crate::transport::StreamId;
-use crate::transport::metrics::InboundStreamOutcome;
+use crate::transport::metrics::{InboundStreamOutcome, QuicCloseCode};
 use crate::transport::peer_connection::embeds_metadata;
 use crate::transport::peer_connection::inbound_budget::InboundStreamBudget;
 use crate::transport::peer_connection::streaming::{
@@ -109,29 +109,31 @@ use crate::transport::peer_connection::streaming::{
 pub(crate) use inbound::{InboundShort, InboundStreamArrival};
 
 /// Application error codes a receiver stops a stream with (STOP_SENDING),
-/// and the sender sees as [`QuicSendError::Stopped`].
+/// and the sender sees as [`QuicSendError::Stopped`]. Range `0x10..=0x1f`,
+/// apart from the close and reset codes (see `super::error`).
 pub(crate) mod stop_code {
     /// The header was refused (`HeaderError`).
-    pub(crate) const HEADER_REFUSED: u32 = 1;
+    pub(crate) const HEADER_REFUSED: u32 = 0x11;
     /// The stream did not fit the connection's inbound budget.
-    pub(crate) const BUDGET_REFUSED: u32 = 2;
+    pub(crate) const BUDGET_REFUSED: u32 = 0x12;
     /// A stream with this id is already held on this path.
-    pub(crate) const STREAM_ID_IN_USE: u32 = 3;
+    pub(crate) const STREAM_ID_IN_USE: u32 = 0x13;
     /// The channel the message goes to was full.
-    pub(crate) const CHANNEL_FULL: u32 = 4;
+    pub(crate) const CHANNEL_FULL: u32 = 0x14;
     /// More bytes arrived than the header declared.
-    pub(crate) const OVERLONG: u32 = 5;
+    pub(crate) const OVERLONG: u32 = 0x15;
     /// Evicted: idle too long, or older than its age limit.
-    pub(crate) const EVICTED: u32 = 6;
+    pub(crate) const EVICTED: u32 = 0x16;
     /// The stream's handle was cancelled on the receiving side.
-    pub(crate) const CANCELLED: u32 = 7;
+    pub(crate) const CANCELLED: u32 = 0x17;
 }
 
 /// Application error codes a sender resets a stream with (RESET_STREAM).
+/// Range `0x20..=0x2f` (see `super::error`).
 pub(crate) mod reset_code {
     /// The sender gave up: its chunk source failed or did not deliver the
     /// declared length.
-    pub(crate) const SENDER_ABORTED: u32 = 1;
+    pub(crate) const SENDER_ABORTED: u32 = 0x21;
 }
 
 /// Capacity of [`QuicInbound::shorts`]. Each queued message still holds its
@@ -592,8 +594,9 @@ fn frame_metadata(metadata: Option<&[u8]>) -> &[u8] {
 /// connection is still open. It ends on its own only when the connection
 /// has ended; any other end (a panic) leaves a connection on which nothing
 /// would be read again, so it is counted and the connection is closed with
-/// code 0 (e4 assigns the close codes). Dropping the path aborts this task,
-/// which is not counted.
+/// `close_code::DOWNGRADE`: the QUIC path is broken on this side, and the
+/// peer should fall back to the UDP session. Dropping the path aborts this
+/// task, which is not counted.
 async fn supervise_receive<T: TimeSource>(
     connection: quinn::Connection,
     receiver: Arc<inbound::Receiver<T>>,
@@ -610,14 +613,8 @@ async fn supervise_receive<T: TimeSource>(
             "QUIC path: the receive task panicked; closing the connection"
         );
     }
-    // Only if still open: closing an ended connection again would replace
-    // the reason quinn reports (the peer's close) with LocallyClosed. Not
-    // atomic: a peer close landing between the check and close() is then
-    // reported as LocallyClosed. Harmless; the connection is closed either
-    // way.
-    if connection.close_reason().is_none() {
-        connection.close(0u32.into(), b"receive task ended");
-    }
+    // Only if still open (close_connection checks): see there.
+    super::close_connection(&connection, QuicCloseCode::Downgrade);
 }
 
 /// A uni stream being written that sees the peer stop it even while a

@@ -401,6 +401,13 @@ pub enum TransportError {
     /// Opaque above the transport: classify it with [`Self::scope`].
     #[error(transparent)]
     Udp(UdpError),
+    /// An error only the QUIC path produces (#5940): a quinn connection,
+    /// stream or endpoint error, or a framing error, mapped to a stable
+    /// kind. Opaque above the transport like [`Self::Udp`]: classify it with
+    /// [`Self::scope`]. Nothing produces one while `transport-quic` carries
+    /// no traffic.
+    #[error(transparent)]
+    Quic(QuicError),
 }
 
 /// An error only the UDP transport produces, inside [`TransportError::Udp`].
@@ -432,6 +439,115 @@ pub(in crate::transport) enum UdpErrorKind {
     PubKeyDecryptionError(crypto::DecryptionError),
     #[error(transparent)]
     Serialization(bincode::Error),
+}
+
+/// An error only the QUIC path produces, inside [`TransportError::Quic`].
+/// Its kind is private to the transport; `quic::error` maps quinn's and the
+/// framing's errors to it.
+#[derive(Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error(transparent)]
+pub struct QuicError(pub(in crate::transport) QuicErrorKind);
+
+impl std::fmt::Debug for QuicError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(&self.0, f)
+    }
+}
+
+/// What went wrong in a [`QuicError`]. A small, stable set: quinn has many
+/// more error variants, and `quic::error` decides which kind each is.
+///
+/// Scope (see [`TransportError::scope`]): `Reset`, `Stopped`,
+/// `InvalidFrame` and `StreamClosed` end one stream; the rest end the QUIC
+/// connection (or the attempt to make one). A connection-scope kind ends
+/// the QUIC path only: the peer's UDP session stays up, and e5 falls back
+/// to it inside the transport, so a connection-scope QUIC error is never
+/// surfaced to the operations above it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub(in crate::transport) enum QuicErrorKind {
+    /// The connection ended: the peer closed it with
+    /// `close_code::NODE_DROPPED_PEER` or a code this node does not know,
+    /// this node closed it, the peer's QUIC stack closed it without an
+    /// error, or the peer answered with a stateless reset (it lost the
+    /// connection, usually by restarting). Connection scope; handled inside
+    /// the transport (fallback to UDP), never surfaced to operations.
+    #[error("QUIC connection lost")]
+    ConnectionLost,
+    /// The stream was reset with this code: by the peer while this node was
+    /// reading it, or by this node, which abandoned a send whose source
+    /// failed (`reset_code::SENDER_ABORTED`). Stream scope.
+    #[error("QUIC stream reset with code {code}")]
+    Reset { code: u64 },
+    /// The peer stopped the stream (STOP_SENDING) with this code
+    /// (`stop_code`). Stream scope.
+    #[error("QUIC stream stopped by the peer with code {code}")]
+    Stopped { code: u64 },
+    /// The connection was refused, or ended by a refusal. Connection scope.
+    #[error("QUIC connection refused: {reason}")]
+    Refused { reason: QuicRefusal },
+    /// Nothing was heard from the peer for the idle timeout. Connection
+    /// scope.
+    #[error("QUIC connection timed out")]
+    TimedOut,
+    /// The node's QUIC endpoint is gone: its driver ended, or it was
+    /// closed. Connection scope, and process-wide: every QUIC path ends,
+    /// and `QuicAvailability` reports it.
+    #[error("the QUIC endpoint is down")]
+    EndpointDown,
+    /// The peer broke the QUIC protocol (a QUIC transport error code other
+    /// than a TLS alert, sent by the peer or detected here). Connection
+    /// scope.
+    #[error("QUIC protocol error {code:#x}")]
+    Protocol { code: u64 },
+    /// A message could not be framed: its header would be refused
+    /// (`framing::HeaderError`). Stream scope, and the same message fails
+    /// the same way on every attempt.
+    #[error("QUIC frame refused before sending")]
+    InvalidFrame,
+    /// The stream was already closed on this side (a misuse of quinn's
+    /// stream API; not expected). Stream scope.
+    #[error("QUIC stream already closed")]
+    StreamClosed,
+}
+
+/// Why a QUIC connection was refused ([`QuicErrorKind::Refused`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub(in crate::transport) enum QuicRefusal {
+    /// The TLS handshake failed (a TLS alert, QUIC crypto error 0x100 to
+    /// 0x1ff, either side): a key other than the expected one, a foreign
+    /// key type, another ALPN.
+    #[error("the TLS handshake failed")]
+    Handshake,
+    /// The peer does not speak QUIC version 1.
+    #[error("no common QUIC version")]
+    Version,
+    /// The peer closed with `close_code::DOWNGRADE`: fall back to UDP.
+    #[error("the peer asked to fall back to UDP")]
+    Downgrade,
+    /// The peer closed with `close_code::IDENTITY_MISMATCH`: the key this
+    /// node proved is not the one the peer has on record for it.
+    #[error("the peer reported an identity mismatch")]
+    IdentityMismatch,
+    /// The demux socket's allow-set is full.
+    #[error("the QUIC allow-set is full")]
+    AllowSetFull,
+    /// The address is already allowed for another key.
+    #[error("the address is already allowed for another key")]
+    KeyConflict,
+    /// The peer's transport key cannot be a QUIC identity.
+    #[error("the peer's key is not usable for QUIC")]
+    UnusableKey,
+    /// This node could not start the connection: its TLS or quinn
+    /// configuration refused it (an invalid address, no connection IDs
+    /// left).
+    #[error("this node could not start the connection")]
+    Local,
+}
+
+impl From<QuicErrorKind> for TransportError {
+    fn from(kind: QuicErrorKind) -> Self {
+        TransportError::Quic(QuicError(kind))
+    }
 }
 
 impl From<UdpErrorKind> for TransportError {
@@ -494,7 +610,20 @@ impl TransportError {
         match self {
             TransportError::OutboundStreamFailed(..)
             | TransportError::Udp(UdpError(UdpErrorKind::SendFailed(..))) => ErrorScope::Transient,
-            TransportError::OutboundStreamInvalidLength(..) => ErrorScope::Stream,
+            TransportError::OutboundStreamInvalidLength(..)
+            | TransportError::Quic(QuicError(
+                QuicErrorKind::Reset { .. }
+                | QuicErrorKind::Stopped { .. }
+                | QuicErrorKind::InvalidFrame
+                | QuicErrorKind::StreamClosed,
+            )) => ErrorScope::Stream,
+            TransportError::Quic(QuicError(
+                QuicErrorKind::ConnectionLost
+                | QuicErrorKind::Refused { .. }
+                | QuicErrorKind::TimedOut
+                | QuicErrorKind::EndpointDown
+                | QuicErrorKind::Protocol { .. },
+            )) => ErrorScope::Connection,
             TransportError::ChannelClosed
             | TransportError::ConnectionClosed(_)
             | TransportError::ConnectionEstablishmentFailure { .. }
@@ -1049,6 +1178,17 @@ mod tests {
                 TransportError::Udp(UdpError(UdpErrorKind::Serialization(_))) => {
                     (ErrorScope::Connection, false, true)
                 }
+                TransportError::Quic(QuicError(kind)) => match kind {
+                    QuicErrorKind::Reset { .. }
+                    | QuicErrorKind::Stopped { .. }
+                    | QuicErrorKind::InvalidFrame
+                    | QuicErrorKind::StreamClosed => (ErrorScope::Stream, false, false),
+                    QuicErrorKind::ConnectionLost
+                    | QuicErrorKind::Refused { .. }
+                    | QuicErrorKind::TimedOut
+                    | QuicErrorKind::EndpointDown
+                    | QuicErrorKind::Protocol { .. } => (ErrorScope::Connection, false, true),
+                },
             }
         }
 
@@ -1068,6 +1208,17 @@ mod tests {
             TransportError::Other(anyhow::anyhow!("x")),
             TransportError::from(crypto::DecryptionError::DecryptionFailed),
             TransportError::from(bincode::deserialize::<u64>(&[]).unwrap_err()),
+            TransportError::from(QuicErrorKind::ConnectionLost),
+            TransportError::from(QuicErrorKind::Reset { code: 0x21 }),
+            TransportError::from(QuicErrorKind::Stopped { code: 0x12 }),
+            TransportError::from(QuicErrorKind::Refused {
+                reason: QuicRefusal::Downgrade,
+            }),
+            TransportError::from(QuicErrorKind::TimedOut),
+            TransportError::from(QuicErrorKind::EndpointDown),
+            TransportError::from(QuicErrorKind::Protocol { code: 0xa }),
+            TransportError::from(QuicErrorKind::InvalidFrame),
+            TransportError::from(QuicErrorKind::StreamClosed),
         ];
         for err in &cases {
             let (scope, old_transient, closes) = expected(err);
