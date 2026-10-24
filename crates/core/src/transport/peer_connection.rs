@@ -25,6 +25,7 @@ use tracing::{Instrument, span};
 pub(super) mod inbound_budget;
 mod inbound_stream;
 mod outbound_stream;
+pub(super) use outbound_stream::embeds_metadata;
 pub(crate) mod piped_stream;
 pub(crate) mod streaming;
 

@@ -100,6 +100,7 @@ use crate::config::GlobalExecutor;
 use crate::simulation::TimeSource;
 use crate::transport::StreamId;
 use crate::transport::metrics::InboundStreamOutcome;
+use crate::transport::peer_connection::embeds_metadata;
 use crate::transport::peer_connection::inbound_budget::InboundStreamBudget;
 use crate::transport::peer_connection::streaming::{
     MAX_INBOUND_STREAM_BYTES_PER_CONNECTION, MAX_INBOUND_STREAMS_PER_CONNECTION, StreamError,
@@ -490,8 +491,7 @@ impl QuicPath {
     }
 
     /// Send stream `stream_id` (caller-named) with `payload`, announced by
-    /// `metadata` (at most `MAX_METADATA_BYTES`; `Some(&[])` is sent as no
-    /// metadata and arrives as `None`).
+    /// `metadata` ([`frame_metadata`] says what goes in the frame).
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) async fn send_stream(
         &self,
@@ -499,7 +499,7 @@ impl QuicPath {
         metadata: Option<&[u8]>,
         payload: Bytes,
     ) -> Result<(), QuicSendError> {
-        let metadata = metadata.unwrap_or_default();
+        let metadata = frame_metadata(metadata);
         let header = FrameHeader::stream(stream_id, payload.len() as u64, metadata.len())?;
         let mut send = self.open(&header, metadata).await?;
         send.write_chunk(payload).await?;
@@ -507,7 +507,8 @@ impl QuicPath {
     }
 
     /// Send stream `stream_id` (caller-named) of `total_len` bytes from
-    /// `chunks`, announced by `metadata`. If the source fails, or delivers
+    /// `chunks`, announced by `metadata` ([`frame_metadata`] says what goes
+    /// in the frame). If the source fails, or delivers
     /// more or fewer than `total_len` bytes, the stream is reset
     /// ([`reset_code::SENDER_ABORTED`]) and the receiver cancels its handle.
     /// No byte past `total_len` is written.
@@ -522,7 +523,7 @@ impl QuicPath {
     where
         S: Stream<Item = Result<Bytes, StreamError>> + Unpin,
     {
-        let metadata = metadata.unwrap_or_default();
+        let metadata = frame_metadata(metadata);
         let header = FrameHeader::stream(stream_id, total_len, metadata.len())?;
         let mut send = self.open(&header, metadata).await?;
         let mut delivered: u64 = 0;
@@ -571,6 +572,22 @@ impl QuicPath {
     }
 }
 
+/// The metadata a `Stream` frame carries: `metadata` if the UDP transport
+/// would embed it in fragment #1 ([`embeds_metadata`], at most
+/// `MAX_METADATA_BYTES` = 1120 bytes), else none, as `send_stream` does on
+/// UDP. As there, the caller sends the announcing message separately as a
+/// short message too, and that copy carries any length.
+///
+/// Empty metadata is sent as none (`metadata_len` 0) and arrives as
+/// `None`, deliberately: the header has no other way to mark "present but
+/// empty", and an empty announcing message carries nothing to dispatch.
+/// (UDP would deliver `Some` of zero bytes.)
+fn frame_metadata(metadata: Option<&[u8]>) -> &[u8] {
+    metadata
+        .filter(|metadata| embeds_metadata(metadata.len()))
+        .unwrap_or_default()
+}
+
 /// Run the receive task, and close the connection if it ends while the
 /// connection is still open. It ends on its own only when the connection
 /// has ended; any other end (a panic) leaves a connection on which nothing
@@ -594,7 +611,10 @@ async fn supervise_receive<T: TimeSource>(
         );
     }
     // Only if still open: closing an ended connection again would replace
-    // the reason quinn reports (the peer's close) with LocallyClosed.
+    // the reason quinn reports (the peer's close) with LocallyClosed. Not
+    // atomic: a peer close landing between the check and close() is then
+    // reported as LocallyClosed. Harmless; the connection is closed either
+    // way.
     if connection.close_reason().is_none() {
         connection.close(0u32.into(), b"receive task ended");
     }

@@ -21,9 +21,12 @@
 //! - `Stream`: a caller-named stream ([`StreamId::next`]); its payload is fed
 //!   into an ordinary `StreamHandle` by the inbound adapter. The metadata is
 //!   the message that announces the stream (the UDP transport embeds it in
-//!   fragment #1), at most [`MAX_METADATA_BYTES`] (what fits in fragment
-//!   #1 on UDP). An empty metadata is sent as none (`metadata_len` 0) and
-//!   arrives as `None`.
+//!   fragment #1), at most [`MAX_METADATA_BYTES`] (1120, what fits in
+//!   fragment #1 on UDP). The sender leaves out metadata that does not fit,
+//!   as UDP does; the caller sends the announcing message separately as a
+//!   short message as well, as on UDP. Empty metadata is sent as none
+//!   (`metadata_len` 0) and arrives as `None`, deliberately (see
+//!   `path::frame_metadata`).
 //! - `Control`: a QUIC path control frame, at most [`MAX_CONTROL_BYTES`].
 //!
 //! [`FrameHeader::decode`] refuses anything else, and never panics: an
@@ -49,17 +52,16 @@ pub(crate) const HEADER_VERSION: u8 = 1;
 /// Length of the header in bytes.
 pub(crate) const HEADER_LEN: usize = 18;
 
-/// Most metadata bytes a `Stream` header may declare: the most the UDP
-/// transport embeds in fragment #1 (`outbound_stream.rs` embeds metadata
-/// only when `1 + 8 + len < MAX_DATA_SIZE`, which is
-/// `FRAGMENT_PAYLOAD_SIZE`). The metadata is the message announcing the
+/// Most metadata bytes a `Stream` header may declare: 1120, the most the
+/// UDP transport embeds in fragment #1 (`embeds_metadata`: `1 + 8 + len <
+/// FRAGMENT_PAYLOAD_SIZE`). The metadata is the message announcing the
 /// stream (a GET response or PUT header naming the contract, its size and a
-/// few flags). The UDP transport also sends it as a separate short message,
-/// which carries any length; e5 does the same over QUIC, so this field only
-/// needs the copy that fits beside the stream. It is read into memory
-/// before the payload and is not charged to the inbound budget, so it is
-/// held to one fragment's worth: at most 256 streams x about 1 KiB per
-/// connection.
+/// few flags). As on UDP, the CALLER also sends that message separately as
+/// a short message, which carries any length; `QuicPath` leaves out of the
+/// `Stream` frame any metadata that does not fit, as `send_stream` does on
+/// UDP. It is read into memory before the payload and is not charged to
+/// the inbound budget, so it is held to one fragment's worth: at most 256
+/// streams x 1120 bytes per connection.
 pub(crate) const MAX_METADATA_BYTES: u32 = (FRAGMENT_PAYLOAD_SIZE - 1 - 8 - 1) as u32;
 
 /// Most payload bytes a `Control` frame may declare. Control frames are a
@@ -380,9 +382,10 @@ mod tests {
     /// of uncharged memory per stream.
     #[test]
     fn the_metadata_bound_is_what_udp_embeds_in_fragment_one() {
-        let fits = |len: usize| 1 + 8 + len < FRAGMENT_PAYLOAD_SIZE;
-        assert!(fits(MAX_METADATA_BYTES as usize));
-        assert!(!fits(MAX_METADATA_BYTES as usize + 1));
+        use crate::transport::peer_connection::embeds_metadata;
+        assert!(embeds_metadata(MAX_METADATA_BYTES as usize));
+        assert!(!embeds_metadata(MAX_METADATA_BYTES as usize + 1));
+        assert_eq!(MAX_METADATA_BYTES, 1120);
     }
 
     /// The sender's constructors refuse what the receiver would.

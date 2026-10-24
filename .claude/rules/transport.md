@@ -863,9 +863,11 @@ payload, then the stream's end.
 FrameHeader::decode refuses, never panics: unknown version or kind;
   total_len 0 or > MAX_STREAM_TOTAL_BYTES (check_declared_stream_length)
   for Short and Stream; Control 0 or > MAX_CONTROL_BYTES (4 KiB);
-  metadata_len > MAX_METADATA_BYTES (what UDP embeds in fragment #1,
-  FRAGMENT_PAYLOAD_SIZE - 10; larger metadata goes as a separate short
-  message, as on UDP); metadata or a nonzero
+  metadata_len > MAX_METADATA_BYTES (1120, what UDP embeds in fragment
+  #1, the shared embeds_metadata predicate; the sender leaves larger
+  metadata out of the frame, and the caller sends the announcing message
+  separately as a short message, as on UDP; empty metadata arrives as
+  None, deliberately); metadata or a nonzero
   stream_id on Short or Control; a Stream id that is not caller-named;
   fewer than 18 bytes. The sender builds headers through the same
   checks. A new kind or field needs a new version, sent only to a peer
@@ -931,7 +933,13 @@ Inbound adapter: a Stream's payload goes into an ordinary StreamHandle,
     declared length, exact at the end; a declared length is not allocated
     up front). Stream payload goes into fragments, each a fresh buffer of
     exactly its length; only a chunk of a whole fragment or more is kept
-    as a slice (const assert: MAX_UDP_PAYLOAD <= 1.2 x fragment). Streams
+    as a slice (const assert: MAX_UDP_PAYLOAD <= 1.2 x fragment), except
+    after quinn-proto's peer-triggerable Assembler::defragment merges data
+    into one allocation of up to the stream window, which such slices then
+    share (inside the charge while the inbound state lives). e5: a
+    fragment Bytes from an inbound StreamHandle must not outlive the
+    inbound charge (e.g. in an outbound pipe's retransmit state) without
+    being copied. Streams
     with no charge (header phase, control frames) have an age limit too
     (inbound_stream_age_limit(0)).
   → Idle and age eviction: streaming_handle_idle_timeout and

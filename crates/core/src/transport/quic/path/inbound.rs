@@ -58,6 +58,16 @@
 //! is kept as a slice: it pins at most one datagram (1200 bytes) per
 //! fragment of `FRAGMENT_PAYLOAD_SIZE` (pinned by a const assertion).
 //!
+//! One exception: quinn-proto's `Assembler::defragment`, which the peer can
+//! trigger (by sending data out of order or in many small frames), merges
+//! buffered stream data into one allocation of up to the stream window,
+//! and whole-fragment slices taken from that chunk then share it. That
+//! memory is inside the stream's charge while its inbound state lives,
+//! but a slice keeps the whole allocation alive. e5 constraint: a fragment
+//! `Bytes` taken from an inbound `StreamHandle` must not outlive the
+//! inbound charge (for example, kept in an outbound pipe's retransmit
+//! state) without being copied.
+//!
 //! Simulation: `VirtualSleep` has no deregistration on drop, so each
 //! stream's last armed timer stays in `VirtualTime`'s pending wakeups until
 //! its deadline passes (one per ended stream; the timer is not replaced on
@@ -382,8 +392,10 @@ const READ_START_BYTES: usize = 64 * 1024;
 
 /// The bytes of one read of a declared length: starts at
 /// `min(len, READ_START_BYTES)`, grows by doubling but never past `len`, so
-/// it holds at most twice what has arrived and ends exactly `len` bytes
-/// long (one allocation, owned by the result).
+/// in steady state it holds at most twice what has arrived, and it ends
+/// exactly `len` bytes long (one allocation, owned by the result). During a
+/// reallocation the old and new buffers both exist for a moment, up to
+/// about twice `len`; each stream reads into one `ReadBuffer` at a time.
 struct ReadBuffer {
     buf: Vec<u8>,
     len: usize,
@@ -434,7 +446,8 @@ fn uncharged_age_limit() -> Duration {
 type Fragments = Vec<(u32, Bytes)>;
 
 // The Rechunker keeps a payload chunk of at least a whole fragment as a
-// slice of its datagram, so a held fragment pins at most one datagram. That
+// slice of its datagram, so a held fragment pins at most one datagram
+// (except after quinn defragments, see the module doc). That
 // is at most 1.2 x the fragment while a datagram is at most MAX_UDP_PAYLOAD;
 // raising MAX_UDP_PAYLOAD past that must revisit the zero-copy path.
 const _: () = assert!(

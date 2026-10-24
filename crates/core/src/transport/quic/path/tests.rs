@@ -313,6 +313,42 @@ fn metadata_and_control_frames_are_dispatched() {
     })
 }
 
+/// Metadata the UDP transport would not embed in fragment #1 (longer than
+/// `MAX_METADATA_BYTES`) is left out of the frame, as on UDP: the stream is
+/// delivered with no metadata, from bytes and from chunks. Empty metadata
+/// arrives as `None` too.
+#[test]
+fn oversized_or_empty_metadata_is_left_out() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let mut p = paths("quic-path-meta-big", 23, QuicPathLimits::DEFAULT).await;
+        let big = payload(MAX_METADATA_BYTES as usize + 1);
+        let a = p.a.clone();
+        p.drive(async move {
+            a.send_stream(StreamId::next(), Some(&big), Bytes::from_static(b"one"))
+                .await
+                .expect("delivered without the metadata");
+            let chunks = futures::stream::iter(vec![Ok(Bytes::from_static(b"two"))]);
+            a.send_stream_chunks(StreamId::next(), 3, Some(&big), chunks)
+                .await
+                .expect("delivered without the metadata");
+            a.send_stream(StreamId::next(), Some(&[]), Bytes::from_static(b"three"))
+                .await
+                .expect("delivered");
+        })
+        .await;
+        for body in [&b"one"[..], b"two", b"three"] {
+            let arrival = p.b_in.streams.try_recv().expect("announced");
+            assert_eq!(arrival.metadata, None);
+            assert_eq!(arrival.handle.try_assemble().unwrap(), body);
+        }
+        assert_eq!(
+            p.b.stats().count(QuicInboundOutcome::HeaderMetadataTooLong),
+            0
+        );
+    })
+}
+
 /// Every header the receiver must refuse is stopped with `HEADER_REFUSED`
 /// and counted under its own reason; an invalid declared length is also
 /// counted as the UDP transport counts it. A header cut short is counted
