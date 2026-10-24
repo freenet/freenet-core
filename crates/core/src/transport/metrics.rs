@@ -182,8 +182,8 @@ labelled_counters! {
 labelled_counters! {
     /// What took most of a paced stream's gap between fragments, for a gap
     /// that reached the egress cap's long-wait threshold or its deadline.
-    /// Exported per period as `egress_long_waits_<label>` and
-    /// `egress_streams_abandoned_<label>`.
+    /// Exported per period as `egress_long_waits_<label>`,
+    /// `egress_streams_abandoned_<label>` and `egress_streams_refused_<label>`.
     pub(crate) enum WaitCause {
         /// Sleeping for the node-wide cap.
         Cap => "cap",
@@ -440,6 +440,9 @@ struct EgressCounters {
     long_waits: [AtomicU64; WaitCause::COUNT],
     /// Streams failed at `egress_cap::PACED_WAIT_DEADLINE`, by [`WaitCause`].
     streams_abandoned: [AtomicU64; WaitCause::COUNT],
+    /// Streams failed at once because a connection reservation would have
+    /// reached the deadline, by [`WaitCause`] (never `cap`).
+    streams_refused: [AtomicU64; WaitCause::COUNT],
     /// Largest unpaced debt after a charge, in bytes.
     debt_hwm_bytes: AtomicU64,
     /// Unpaced bytes forgiven because the debt reached the debt limit.
@@ -1254,6 +1257,12 @@ impl TransportMetrics {
         self.egress.streams_abandoned[cause as usize].fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Record a stream failed at once because its connection reservation
+    /// would have reached `egress_cap::PACED_WAIT_DEADLINE`.
+    pub(crate) fn record_egress_stream_refused(&self, cause: WaitCause) {
+        self.egress.streams_refused[cause as usize].fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Record the egress cap's unpaced debt after a charge, in bytes.
     pub(crate) fn record_egress_debt(&self, debt_bytes: u64) {
         self.egress
@@ -1681,6 +1690,11 @@ impl TransportMetrics {
             egress_streams_abandoned_other: get64(
                 &egress.streams_abandoned[WaitCause::Other as usize],
             ),
+            egress_streams_refused_cap: get64(&egress.streams_refused[WaitCause::Cap as usize]),
+            egress_streams_refused_connection: get64(
+                &egress.streams_refused[WaitCause::Connection as usize],
+            ),
+            egress_streams_refused_other: get64(&egress.streams_refused[WaitCause::Other as usize]),
             egress_debt_hwm_bytes: get64(&egress.debt_hwm_bytes),
             egress_debt_forgiven_bytes: get64(&egress.debt_forgiven_bytes),
         }
@@ -2125,6 +2139,9 @@ pub struct TransportSnapshot {
     pub egress_streams_abandoned_cap: u64,
     pub egress_streams_abandoned_connection: u64,
     pub egress_streams_abandoned_other: u64,
+    pub egress_streams_refused_cap: u64,
+    pub egress_streams_refused_connection: u64,
+    pub egress_streams_refused_other: u64,
     pub egress_debt_hwm_bytes: u64,
     pub egress_debt_forgiven_bytes: u64,
 }
@@ -2224,6 +2241,9 @@ impl TransportSnapshot {
             egress_streams_abandoned_cap,
             egress_streams_abandoned_connection,
             egress_streams_abandoned_other,
+            egress_streams_refused_cap,
+            egress_streams_refused_connection,
+            egress_streams_refused_other,
             egress_debt_hwm_bytes,
             egress_debt_forgiven_bytes,
         } = extras;
@@ -2301,6 +2321,9 @@ impl TransportSnapshot {
         self.egress_streams_abandoned_cap = egress_streams_abandoned_cap;
         self.egress_streams_abandoned_connection = egress_streams_abandoned_connection;
         self.egress_streams_abandoned_other = egress_streams_abandoned_other;
+        self.egress_streams_refused_cap = egress_streams_refused_cap;
+        self.egress_streams_refused_connection = egress_streams_refused_connection;
+        self.egress_streams_refused_other = egress_streams_refused_other;
         self.egress_debt_hwm_bytes = egress_debt_hwm_bytes;
         self.egress_debt_forgiven_bytes = egress_debt_forgiven_bytes;
         self
@@ -2456,6 +2479,9 @@ struct SnapshotExtras {
     pub egress_streams_abandoned_cap: u64,
     pub egress_streams_abandoned_connection: u64,
     pub egress_streams_abandoned_other: u64,
+    pub egress_streams_refused_cap: u64,
+    pub egress_streams_refused_connection: u64,
+    pub egress_streams_refused_other: u64,
     pub egress_debt_hwm_bytes: u64,
     pub egress_debt_forgiven_bytes: u64,
 }
@@ -2522,6 +2548,9 @@ impl SnapshotExtras {
             || self.egress_streams_abandoned_cap != 0
             || self.egress_streams_abandoned_connection != 0
             || self.egress_streams_abandoned_other != 0
+            || self.egress_streams_refused_cap != 0
+            || self.egress_streams_refused_connection != 0
+            || self.egress_streams_refused_other != 0
             || self.egress_debt_forgiven_bytes != 0
     }
 }
@@ -3616,6 +3645,7 @@ mod tests {
         metrics.record_egress_stream_abandoned(WaitCause::Cap);
         metrics.record_egress_stream_abandoned(WaitCause::Cap);
         metrics.record_egress_stream_abandoned(WaitCause::Other);
+        metrics.record_egress_stream_refused(WaitCause::Connection);
         metrics.record_egress_debt(5_000);
         metrics.record_egress_debt(2_000);
         metrics.record_egress_forgiven(7);
@@ -3636,6 +3666,9 @@ mod tests {
             assert_eq!(s.egress_streams_abandoned_cap, 2);
             assert_eq!(s.egress_streams_abandoned_connection, 0);
             assert_eq!(s.egress_streams_abandoned_other, 1);
+            assert_eq!(s.egress_streams_refused_cap, 0);
+            assert_eq!(s.egress_streams_refused_connection, 1);
+            assert_eq!(s.egress_streams_refused_other, 0);
             assert_eq!(s.egress_debt_hwm_bytes, 5_000);
             assert_eq!(s.egress_debt_forgiven_bytes, 7);
         }
@@ -3788,6 +3821,7 @@ mod tests {
         for cause in WaitCause::ALL {
             keys.push(format!("egress_long_waits_{}", cause.label()));
             keys.push(format!("egress_streams_abandoned_{}", cause.label()));
+            keys.push(format!("egress_streams_refused_{}", cause.label()));
         }
         for bucket in DialQueueWait::ALL {
             keys.push(format!("dial_queue_wait_{}", bucket.label()));
@@ -4017,6 +4051,9 @@ mod tests {
             "egress_streams_abandoned_cap",
             "egress_streams_abandoned_connection",
             "egress_streams_abandoned_other",
+            "egress_streams_refused_cap",
+            "egress_streams_refused_connection",
+            "egress_streams_refused_other",
             "egress_debt_hwm_bytes",
             "egress_debt_forgiven_bytes",
         ] {

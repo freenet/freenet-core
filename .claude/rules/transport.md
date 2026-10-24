@@ -90,10 +90,14 @@ deadline is not made (TokenBucket::reserve_within, one lock) and the
 stream fails at once, blamed like a deadline failure with the would-be
 wait counted as connection time: a doomed reservation must never hold a
 place that delays the fragments behind it (otherwise above
-~5 x rate / 1200 streams on a connection nearly every stream fails). A
-stream's FIRST fragment must also leave one more slot (packet / rate)
-before the deadline, so a newcomer cannot push an in-progress stream's
-next fragment past its deadline. Only the connection wait is checked: a
+~5 x rate / 1200 streams on a connection nearly every stream fails).
+Refusals are counted apart, egress_streams_refused_<cause> (connection or
+other; never cap, nothing has slept for the cap before a reservation), with
+gap + would-be wait as the gap, and their own WARN;
+egress_streams_abandoned_<cause> means only streams that died at the
+deadline. A newcomer CAN delay streams already in progress (as uncapped
+and in 0.2.147); a per-connection scheduler is future work. Only the
+connection wait is checked: a
 fragment can still fail on the node cap at the deadline. Otherwise the
 fragment keeps the payment (ConnectionPayment) through every later wait,
 on cwnd and on the cap; if the fragment is not sent it is given back,
@@ -156,9 +160,10 @@ its send (it does hold its per-connection reservation, see above). Gaps
 that reach LONG_WAIT
 (2.5 s) and abandoned streams are counted by what took most of the gap
 (WaitCause: cap, connection = the connection's own bucket, other = cwnd, the
-upstream stream for relayed streams, and the rest): egress_long_waits_<cause>, egress_streams_abandoned_<cause>.
-Each has its own rate-limited WARN with one line per cause seen since the last, each with its count and remedy; the
-per-stream abandonment line is at debug. The
+upstream stream for relayed streams, and the rest): egress_long_waits_<cause>,
+egress_streams_abandoned_<cause>, egress_streams_refused_<cause>. Each has
+its own rate-limited WARN with one line per cause seen since the last, each
+with its count and remedy; the per-stream abandonment line is at debug. The
 cap counts UDP payload, not IP/UDP headers.
 EgressCap::poll_admit is the poll form for a sender that is polled (the QUIC
 endpoint's UdpPoller, #5940): Ready exactly when try_take would succeed at
@@ -347,7 +352,8 @@ counted once by what happened to it, `quic_ingress_<label>`, one per
 `QuicIngressOutcome`; see "Socket Abstraction Rules") and outbound datagrams by how the
 node-wide egress cap paced them (`egress_<label>`, one per `EgressDecision`,
 plus `egress_bytes`, `egress_bytes_waited`, `egress_wait_us_sum` / `_max`,
-`egress_long_waits_<cause>`, `egress_streams_abandoned_<cause>`, `egress_debt_hwm_bytes`,
+`egress_long_waits_<cause>`, `egress_streams_abandoned_<cause>`,
+`egress_streams_refused_<cause>`, `egress_debt_hwm_bytes`,
 `egress_debt_forgiven_bytes`; all zero without
 `total-bandwidth-limit`) and QUIC upgrade control messages received and
 ignored (`upgrade_control_received`). Each label set is declared once in a
@@ -620,8 +626,7 @@ Token reservation:
   → RTT-adaptive update interval
   → With the node-wide egress cap, capped stream senders also reserve (in
     order) and keep the reservation until the node-wide take succeeds,
-    giving it back if the fragment is not sent and the reservation is not
-    yet past due; see "Node-wide egress cap"
+    giving it back if the fragment is not sent; see "Node-wide egress cap"
 ```
 
 ## Backoff, Jitter, and Recovery Rules

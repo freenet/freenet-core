@@ -17,10 +17,12 @@
 //! each waits for the reservations ahead of it. A reservation whose wait
 //! would reach the stream's [`PACED_WAIT_DEADLINE`] is not made
 //! (`TokenBucket::reserve_within`, one lock) and the stream fails at once,
-//! so a doomed fragment never holds a place that delays the ones behind it.
-//! A stream's first fragment must also leave one more slot before the
-//! deadline, so a newcomer does not push an in-progress stream's next
-//! fragment past it. This looks only at the connection wait: a fragment
+//! so a doomed fragment never holds a place that delays the ones behind it;
+//! it is counted as refused (`egress_streams_refused_<cause>`), apart from
+//! the streams that die at the deadline. A newcomer can still delay streams
+//! already in progress, as on the uncapped path and in 0.2.147; a
+//! per-connection scheduler that protects them is future work. This looks
+//! only at the connection wait: a fragment
 //! can still fail on the node cap at the deadline. Otherwise the fragment
 //! keeps its payment until it is sent, through its waits on cwnd and on the
 //! cap. Then, right after a cwnd check, it calls [`try_take`]: if the
@@ -88,8 +90,9 @@
 //! what took most of the gap: the cap, the connection's own bucket (whose
 //! rate is the cap divided among the connections), or something else such
 //! as cwnd or, from a relayed stream's second fragment on, the upstream stream
-//! (`egress_long_waits_<cause>`, `egress_streams_abandoned_<cause>`), and
-//! each kind is logged at WARN with its remedy, at most once per
+//! (`egress_long_waits_<cause>`, `egress_streams_abandoned_<cause>`, and for
+//! the fail-fast refusals `egress_streams_refused_<cause>`), and each kind
+//! is logged at WARN with its remedy, at most once per
 //! [`LONG_WAIT_WARN_INTERVAL`].
 //!
 //! # The bucket
@@ -213,6 +216,9 @@ pub(crate) struct EgressStats {
     pub long_waits: [u64; WaitCause::COUNT],
     /// Streams failed at [`PACED_WAIT_DEADLINE`], by [`WaitCause`].
     pub streams_abandoned: [u64; WaitCause::COUNT],
+    /// Streams failed at once because a connection reservation would have
+    /// reached the deadline, by [`WaitCause`].
+    pub streams_refused: [u64; WaitCause::COUNT],
     /// Takes refused because the bucket was short.
     pub refusals: u64,
     /// Largest unpaced debt seen after a charge, in bytes.
@@ -231,6 +237,7 @@ struct StatCounters {
     wait_us_max: AtomicU64,
     long_waits: [AtomicU64; WaitCause::COUNT],
     streams_abandoned: [AtomicU64; WaitCause::COUNT],
+    streams_refused: [AtomicU64; WaitCause::COUNT],
     refusals: AtomicU64,
     debt_hwm_bytes: AtomicU64,
     forgiven_bytes: AtomicU64,
@@ -292,6 +299,10 @@ pub struct EgressCap {
     last_abandon_warn_ns: AtomicI64,
     /// Streams abandoned since then.
     abandoned_since_warn: WarnWindow,
+    /// When the refused-stream warning was last logged.
+    last_refuse_warn_ns: AtomicI64,
+    /// Streams refused since then.
+    refused_since_warn: WarnWindow,
     #[cfg(test)]
     stats: StatCounters,
 }
@@ -477,6 +488,8 @@ impl EgressCap {
             last_abandon_warn_ns: AtomicI64::new(i64::MIN),
             long_waits_since_warn: WarnWindow::default(),
             abandoned_since_warn: WarnWindow::default(),
+            last_refuse_warn_ns: AtomicI64::new(i64::MIN),
+            refused_since_warn: WarnWindow::default(),
             #[cfg(test)]
             stats: StatCounters::default(),
         }
@@ -838,6 +851,38 @@ impl EgressCap {
         }
     }
 
+    /// Count a stream failed at once because its connection reservation
+    /// would have reached the deadline (`gap` includes the would-be wait),
+    /// by `cause`, and log the number since the last WARN, one line per
+    /// cause, at most once per [`LONG_WAIT_WARN_INTERVAL`]. Kept apart from
+    /// [`Self::record_abandoned`], which counts streams that died waiting.
+    fn record_refused(&self, cause: WaitCause, gap: Duration) {
+        TRANSPORT_METRICS.record_egress_stream_refused(cause);
+        #[cfg(test)]
+        self.stats.streams_refused[cause as usize].fetch_add(1, Ordering::Relaxed);
+        self.refused_since_warn.add(cause, gap);
+        if self.warn_due(&self.last_refuse_warn_ns) {
+            for (cause, (streams_refused, longest_gap_ms)) in WaitCause::ALL
+                .into_iter()
+                .zip(self.refused_since_warn.drain())
+            {
+                if streams_refused == 0 {
+                    continue;
+                }
+                tracing::warn!(
+                    streams_refused,
+                    longest_gap_ms,
+                    cause = cause.label(),
+                    total_bandwidth_limit = self.rate_bytes_per_sec,
+                    remedy = remedy(cause),
+                    "Outbound streams refused: a fragment's turn on its connection \
+                     would have come after the egress deadline, so the stream \
+                     failed at once"
+                );
+            }
+        }
+    }
+
     /// Whether a rate-limited WARN whose last time is in `last` may be
     /// logged now; if so, records now as its last time.
     fn warn_due(&self, last: &AtomicI64) -> bool {
@@ -873,6 +918,7 @@ impl EgressCap {
             wait_us_max: load(&s.wait_us_max),
             long_waits: std::array::from_fn(|i| load(&s.long_waits[i])),
             streams_abandoned: std::array::from_fn(|i| load(&s.streams_abandoned[i])),
+            streams_refused: std::array::from_fn(|i| load(&s.streams_refused[i])),
             refusals: load(&s.refusals),
             debt_hwm_bytes: load(&s.debt_hwm_bytes),
             forgiven_bytes: load(&s.forgiven_bytes),
@@ -989,17 +1035,19 @@ impl StreamPacing {
     }
 
     /// Fail the stream now because its connection reservation would wait
-    /// `wait` and reach the deadline: count it as abandoned, blamed as at
-    /// the deadline with `wait` counted as connection time, and return the
-    /// gap so far.
-    pub(crate) fn abandon_for_connection<T: TimeSource>(
+    /// `wait` and reach the deadline: count it as refused, blamed as at the
+    /// deadline with `wait` counted as connection time, and return the gap
+    /// it would have had (the gap so far plus `wait`). Only `connection` and
+    /// `other` can occur: nothing has slept for the cap before a fragment's
+    /// reservation.
+    pub(crate) fn refuse_for_connection<T: TimeSource>(
         &mut self,
         time_source: &T,
         cap: &EgressCap,
         wait: Duration,
     ) -> Duration {
-        let gap = self.gap(time_source);
-        cap.record_abandoned(self.cause_with(time_source, wait), gap);
+        let gap = self.gap(time_source).saturating_add(wait);
+        cap.record_refused(self.cause_with(time_source, wait), gap);
         gap
     }
 

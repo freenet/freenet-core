@@ -120,9 +120,10 @@ impl<T: TimeSource> TokenBucket<T> {
 
     /// [`Self::reserve`] only if its wait would be shorter than `limit`:
     /// `Ok(wait)` with the tokens deducted, or `Err(wait)`, the wait it
-    /// would have had, with the bucket unchanged. One lock, so no other reservation can see a debt that is
-    /// then withdrawn. Used with the node-wide egress cap, whose streams
-    /// fail at a deadline (see `transport::egress_cap`).
+    /// would have had, with the bucket unchanged. One lock, so no other
+    /// reservation can see a debt that is then withdrawn. Used with the
+    /// node-wide egress cap, whose streams fail at a deadline (see
+    /// `transport::egress_cap`).
     pub fn reserve_within(&self, bytes: usize, limit: Duration) -> Result<Duration, Duration> {
         let mut state = self.state.lock();
         self.refill_state(&mut state);
@@ -132,15 +133,6 @@ impl<T: TimeSource> TokenBucket<T> {
         }
         state.tokens -= bytes as isize;
         Ok(wait_time)
-    }
-
-    /// How long the rate takes to refill `bytes` (zero while the rate is 0).
-    pub fn time_for(&self, bytes: usize) -> Duration {
-        let rate = self.state.lock().rate;
-        if rate == 0 {
-            return Duration::ZERO;
-        }
-        Duration::from_secs_f64(bytes as f64 / rate as f64)
     }
 
     /// The wait [`Self::reserve`] returns for `bytes` in `state`.
@@ -259,7 +251,6 @@ mod tests {
             Ok(three)
         );
         assert_eq!(bucket.reserve(0), Duration::from_secs(3), "it was deducted");
-        assert_eq!(bucket.time_for(500), Duration::from_millis(500));
     }
 
     #[test]
