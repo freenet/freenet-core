@@ -1,0 +1,592 @@
+//! A QUIC connection used as a transport path to one peer (#5940, step e3).
+//!
+//! Dead code in this release: nothing in the node builds a [`QuicPath`] yet.
+//! Step e5 moves a peer's traffic onto one once the connection is
+//! established, and keeps the UDP session as the fallback.
+//!
+//! Each message gets its own QUIC unidirectional stream in the format of
+//! [`super::framing`]. quinn allows the peer [`MAX_UNI_STREAMS`] streams at a
+//! time, so a sender with more messages in flight waits in `open_uni` until
+//! the receiver has read one to its end: that limit is the path's
+//! back-pressure.
+//!
+//! Sending: [`QuicPath::send_short`], [`QuicPath::send_stream`] (from bytes),
+//! [`QuicPath::send_stream_chunks`] (from a stream of chunks, such as an
+//! inbound stream being piped onward) and [`QuicPath::send_control`]. Each
+//! returns once the peer's QUIC stack has acknowledged every byte, or with
+//! the code the peer stopped the stream with ([`QuicSendError::Stopped`]).
+//! A stop is seen only if it arrives before every byte is acknowledged: a
+//! message that fits in the flow-control window can be acknowledged before
+//! the receiver reads its header, and its refusal then reads as success at
+//! the sender, as a refused stream does on the UDP transport (refusals do
+//! not change its ACKs). The receiver counts every refusal either way.
+//!
+//! Receiving: one task per connection accepts every uni stream and reads all
+//! of them concurrently (no task per stream), parsing the header and then:
+//! - `Short` → [`QuicInbound::shorts`], a bounded channel;
+//! - `Stream` → the inbound adapter ([`inbound`]), which feeds the payload
+//!   into an ordinary [`StreamHandle`] and announces it on
+//!   [`QuicInbound::streams`];
+//! - `Control` → [`QuicInbound::controls`], a bounded channel.
+//!
+//! The task only ever uses `try_send`: a full channel drops the message and
+//! counts it (`QuicInboundOutcome`), it never waits, so a slow consumer
+//! cannot stall the other streams of the connection.
+//!
+//! Not done here, on purpose:
+//! - Dedup. The same message sent twice (once on UDP, once on QUIC after a
+//!   fallback) is delivered twice. e5 dedups short messages with
+//!   `PeerConnection::is_duplicate_dispatch` and streams with
+//!   `completed_inbound_streams`, where both transports meet.
+//! - Exporting the QUIC-specific counters. They are per path
+//!   ([`QuicPath::stats`]); the refusals and evictions the UDP transport also
+//!   has are counted in `TRANSPORT_METRICS` as well, under the same
+//!   `InboundStreamOutcome` labels. Telemetry for the rest is e2/e5.
+//!
+//! [`MAX_UNI_STREAMS`]: super::config::MAX_UNI_STREAMS
+//! [`StreamHandle`]: crate::transport::peer_connection::streaming::StreamHandle
+
+pub(crate) mod inbound;
+
+#[cfg(test)]
+mod tests;
+
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use bytes::Bytes;
+use futures::{Stream, StreamExt};
+use parking_lot::Mutex;
+use tokio::sync::mpsc;
+
+use super::QuicConnection;
+use super::framing::{FrameHeader, HeaderError};
+use super::identity::PeerKey;
+use crate::config::GlobalExecutor;
+use crate::simulation::TimeSource;
+use crate::transport::StreamId;
+use crate::transport::metrics::InboundStreamOutcome;
+use crate::transport::peer_connection::inbound_budget::InboundStreamBudget;
+use crate::transport::peer_connection::streaming::{
+    MAX_INBOUND_STREAM_BYTES_PER_CONNECTION, MAX_INBOUND_STREAMS_PER_CONNECTION, StreamError,
+};
+
+pub(crate) use inbound::{InboundShort, InboundStreamArrival};
+
+/// Application error codes a receiver stops a stream with (STOP_SENDING),
+/// and the sender sees as [`QuicSendError::Stopped`].
+pub(crate) mod stop_code {
+    /// The header was refused (`HeaderError`).
+    pub(crate) const HEADER_REFUSED: u32 = 1;
+    /// The stream did not fit the connection's inbound budget.
+    pub(crate) const BUDGET_REFUSED: u32 = 2;
+    /// A stream with this id is already held on this path.
+    pub(crate) const STREAM_ID_IN_USE: u32 = 3;
+    /// The channel the message goes to was full.
+    pub(crate) const CHANNEL_FULL: u32 = 4;
+    /// More bytes arrived than the header declared.
+    pub(crate) const OVERLONG: u32 = 5;
+    /// Evicted: idle too long, or older than its age limit.
+    pub(crate) const EVICTED: u32 = 6;
+    /// The stream's handle was cancelled on the receiving side.
+    pub(crate) const CANCELLED: u32 = 7;
+}
+
+/// Application error codes a sender resets a stream with (RESET_STREAM).
+pub(crate) mod reset_code {
+    /// The sender gave up: its chunk source failed or did not deliver the
+    /// declared length.
+    pub(crate) const SENDER_ABORTED: u32 = 1;
+}
+
+/// Capacity of [`QuicInbound::shorts`]. Each queued message still holds its
+/// inbound budget charge, so the budget bounds the bytes queued.
+pub(crate) const SHORT_CHANNEL_CAPACITY: usize = 256;
+/// Capacity of [`QuicInbound::streams`]. Each queued stream holds its charge.
+pub(crate) const STREAM_CHANNEL_CAPACITY: usize = 256;
+/// Capacity of [`QuicInbound::controls`]; control frames are at most
+/// `MAX_CONTROL_BYTES` each.
+pub(crate) const CONTROL_CHANNEL_CAPACITY: usize = 16;
+
+/// The receive-side limits of a path.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct QuicPathLimits {
+    /// Inbound streams (Short and Stream) holding a budget charge at once.
+    pub(crate) max_streams: usize,
+    /// Bytes of inbound budget charges at once.
+    pub(crate) max_bytes: u64,
+    pub(crate) short_capacity: usize,
+    pub(crate) stream_capacity: usize,
+    pub(crate) control_capacity: usize,
+}
+
+impl QuicPathLimits {
+    /// The UDP transport's per-connection inbound limits and the channel
+    /// capacities above.
+    pub(crate) const DEFAULT: Self = Self {
+        max_streams: MAX_INBOUND_STREAMS_PER_CONNECTION,
+        max_bytes: MAX_INBOUND_STREAM_BYTES_PER_CONNECTION,
+        short_capacity: SHORT_CHANNEL_CAPACITY,
+        stream_capacity: STREAM_CHANNEL_CAPACITY,
+        control_capacity: CONTROL_CHANNEL_CAPACITY,
+    };
+}
+
+/// Declares the path's outcome enum with `COUNT`, `ALL` and `label` from one
+/// list, so the counter array cannot fall out of step with the variants.
+macro_rules! quic_outcomes {
+    ($(#[$emeta:meta])* enum $name:ident { $($(#[$meta:meta])* $variant:ident => $label:literal,)+ }) => {
+        $(#[$emeta])*
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        pub(crate) enum $name { $($(#[$meta])* $variant,)+ }
+
+        #[allow(dead_code)]
+        impl $name {
+            pub(crate) const ALL: [Self; [$(Self::$variant),+].len()] = [$(Self::$variant),+];
+            pub(crate) const COUNT: usize = Self::ALL.len();
+            pub(crate) fn label(self) -> &'static str {
+                match self { $(Self::$variant => $label,)+ }
+            }
+        }
+    };
+}
+
+quic_outcomes! {
+    /// What became of an inbound QUIC stream, beyond the refusals and
+    /// evictions it shares with the UDP transport (`InboundStreamOutcome`).
+    enum QuicInboundOutcome {
+        /// A short message was queued on `shorts`.
+        DeliveredShort => "delivered_short",
+        /// A stream was announced on `streams` (it may still fail later).
+        AnnouncedStream => "announced_stream",
+        /// A stream received every declared byte and its end.
+        CompletedStream => "completed_stream",
+        /// A control frame was queued on `controls`.
+        DeliveredControl => "delivered_control",
+        /// The stream ended inside the header.
+        HeaderTruncated => "header_truncated",
+        /// Header refused: unknown version.
+        HeaderUnknownVersion => "header_unknown_version",
+        /// Header refused: unknown kind.
+        HeaderUnknownKind => "header_unknown_kind",
+        /// Header refused: declared length 0 or above `MAX_STREAM_TOTAL_BYTES`
+        /// (also counted as `InboundStreamOutcome::RefusedInvalidLength`).
+        HeaderInvalidLength => "header_invalid_length",
+        /// Header refused: control frame length 0 or above the limit.
+        HeaderInvalidControlLength => "header_invalid_control_length",
+        /// Header refused: metadata above `MAX_METADATA_BYTES`.
+        HeaderMetadataTooLong => "header_metadata_too_long",
+        /// Header refused: metadata on a Short or Control frame.
+        HeaderUnexpectedMetadata => "header_unexpected_metadata",
+        /// Header refused: a stream id on a Short or Control frame.
+        HeaderUnexpectedStreamId => "header_unexpected_stream_id",
+        /// Header refused: a Stream id that is not caller-named.
+        HeaderNotCallerNamed => "header_not_caller_named",
+        /// A stream with no budget charge (still in its header, or a
+        /// control frame) idle past the idle timeout.
+        IdleUncharged => "idle_uncharged",
+        /// A Stream whose id is already held on this path.
+        StreamIdInUse => "stream_id_in_use",
+        /// `shorts` was full; the message was dropped.
+        ShortDroppedFull => "short_dropped_full",
+        /// `streams` was full; the stream was refused.
+        StreamDroppedFull => "stream_dropped_full",
+        /// `controls` was full; the frame was dropped.
+        ControlDroppedFull => "control_dropped_full",
+        /// The stream ended before its declared length.
+        Truncated => "truncated",
+        /// The stream carried more than its declared length.
+        Overlong => "overlong",
+        /// The sender reset the stream.
+        ResetByPeer => "reset_by_peer",
+        /// The connection was lost with the stream unfinished.
+        ConnectionLost => "connection_lost",
+        /// Its handle was cancelled on this side while it was being received.
+        CancelledLocally => "cancelled_locally",
+        /// Any other read error.
+        ReadFailed => "read_failed",
+    }
+}
+
+impl QuicInboundOutcome {
+    fn of_header_error(error: &HeaderError) -> Self {
+        match error {
+            HeaderError::Truncated(_) => Self::HeaderTruncated,
+            HeaderError::UnknownVersion(_) => Self::HeaderUnknownVersion,
+            HeaderError::UnknownKind(_) => Self::HeaderUnknownKind,
+            HeaderError::InvalidLength(_) => Self::HeaderInvalidLength,
+            HeaderError::InvalidControlLength(_) => Self::HeaderInvalidControlLength,
+            HeaderError::MetadataTooLong(_) => Self::HeaderMetadataTooLong,
+            HeaderError::UnexpectedMetadata => Self::HeaderUnexpectedMetadata,
+            HeaderError::UnexpectedStreamId => Self::HeaderUnexpectedStreamId,
+            HeaderError::NotCallerNamed(_) => Self::HeaderNotCallerNamed,
+        }
+    }
+}
+
+/// Per-path counters. Tests read these, never the process-wide ones, which
+/// every test in the process writes.
+pub(crate) struct QuicPathStats {
+    quic: [AtomicU64; QuicInboundOutcome::COUNT],
+    shared: [AtomicU64; InboundStreamOutcome::COUNT],
+}
+
+impl QuicPathStats {
+    fn new() -> Self {
+        Self {
+            quic: std::array::from_fn(|_| AtomicU64::new(0)),
+            shared: std::array::from_fn(|_| AtomicU64::new(0)),
+        }
+    }
+
+    fn record(&self, outcome: QuicInboundOutcome) {
+        self.quic[outcome as usize].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Count an outcome the UDP transport also has: here and process-wide.
+    fn record_shared(&self, outcome: InboundStreamOutcome) {
+        crate::transport::TRANSPORT_METRICS.record_inbound_stream_outcome(outcome);
+        self.shared[outcome as usize].fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn count(&self, outcome: QuicInboundOutcome) -> u64 {
+        self.quic[outcome as usize].load(Ordering::Relaxed)
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn shared_count(&self, outcome: InboundStreamOutcome) -> u64 {
+        self.shared[outcome as usize].load(Ordering::Relaxed)
+    }
+}
+
+/// The receiving ends of a path. Dropping one makes its messages count as
+/// dropped (`*DroppedFull`), as a full channel does.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct QuicInbound {
+    pub(crate) shorts: mpsc::Receiver<InboundShort>,
+    pub(crate) streams: mpsc::Receiver<InboundStreamArrival>,
+    pub(crate) controls: mpsc::Receiver<Bytes>,
+}
+
+/// Why a send failed. All are scoped to the one message: the connection
+/// may still carry others, except after `ConnectionLost`.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum QuicSendError {
+    /// The header would be refused by the receiver (a length of 0 or above
+    /// the limit, metadata too long, a stream id that is not caller-named).
+    /// Not transient.
+    #[error("invalid frame: {0}")]
+    InvalidFrame(#[from] HeaderError),
+    /// The chunk source delivered a different number of bytes than declared.
+    /// The stream was reset.
+    #[error("declared {declared} bytes, the source delivered {delivered}")]
+    LengthMismatch { declared: u64, delivered: u64 },
+    /// The chunk source failed. The stream was reset.
+    #[error("the chunk source failed: {0}")]
+    Source(StreamError),
+    /// The receiver stopped the stream with this code ([`stop_code`]).
+    #[error("the peer stopped the stream with code {0}")]
+    Stopped(u64),
+    #[error(transparent)]
+    ConnectionLost(#[from] quinn::ConnectionError),
+    /// The stream was closed locally (not expected).
+    #[error("the stream was closed")]
+    Closed,
+}
+
+impl From<quinn::WriteError> for QuicSendError {
+    fn from(error: quinn::WriteError) -> Self {
+        match error {
+            quinn::WriteError::Stopped(code) => Self::Stopped(code.into_inner()),
+            quinn::WriteError::ConnectionLost(error) => Self::ConnectionLost(error),
+            quinn::WriteError::ClosedStream | quinn::WriteError::ZeroRttRejected => Self::Closed,
+        }
+    }
+}
+
+/// A QUIC connection to one peer, with the framing on top. Dropping it
+/// closes the connection (through [`QuicConnection`]) and ends the receive
+/// task; streams still being received are then cancelled.
+pub(crate) struct QuicPath {
+    connection: QuicConnection,
+    stats: Arc<QuicPathStats>,
+    receive: tokio::task::JoinHandle<()>,
+    #[cfg(test)]
+    budget: Arc<Mutex<InboundStreamBudget>>,
+}
+
+impl std::fmt::Debug for QuicPath {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("QuicPath")
+            .field("connection", &self.connection)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for QuicPath {
+    fn drop(&mut self) {
+        self.receive.abort();
+    }
+}
+
+impl QuicPath {
+    /// A path over `connection` with the default limits. `time` drives the
+    /// idle and age limits of inbound streams; use the clock quinn runs on.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn new<T: TimeSource>(connection: QuicConnection, time: T) -> (Self, QuicInbound) {
+        Self::with_limits(connection, time, QuicPathLimits::DEFAULT)
+    }
+
+    /// [`Self::new`] with given limits.
+    ///
+    /// The path has its own inbound budget, sized like the UDP transport's
+    /// per-connection one. A peer with both a UDP session and a QUIC path
+    /// may therefore hold up to twice the per-connection allowance; e5 must
+    /// resolve that before QUIC carries traffic (the QUIC memory gate). Do
+    /// not hand this budget's keys to the UDP side as they are: short
+    /// messages are charged under ids this path picks (see `inbound`),
+    /// which could equal a UDP transport-internal id.
+    pub(crate) fn with_limits<T: TimeSource>(
+        connection: QuicConnection,
+        time: T,
+        limits: QuicPathLimits,
+    ) -> (Self, QuicInbound) {
+        let stats = Arc::new(QuicPathStats::new());
+        let (shorts_tx, shorts) = mpsc::channel(limits.short_capacity);
+        let (streams_tx, streams) = mpsc::channel(limits.stream_capacity);
+        let (controls_tx, controls) = mpsc::channel(limits.control_capacity);
+        let budget = Arc::new(Mutex::new(InboundStreamBudget::new(
+            limits.max_streams,
+            limits.max_bytes,
+        )));
+        let receiver = inbound::Receiver::new(
+            time,
+            budget.clone(),
+            stats.clone(),
+            shorts_tx,
+            streams_tx,
+            controls_tx,
+        );
+        let receive = GlobalExecutor::spawn(inbound::receive(
+            connection.inner().clone(),
+            Arc::new(receiver),
+        ));
+        (
+            Self {
+                connection,
+                stats,
+                receive,
+                #[cfg(test)]
+                budget,
+            },
+            QuicInbound {
+                shorts,
+                streams,
+                controls,
+            },
+        )
+    }
+
+    /// The key the peer proved in the handshake.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn peer_key(&self) -> &PeerKey {
+        self.connection.peer_key()
+    }
+
+    /// The receive side's counters.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn stats(&self) -> &QuicPathStats {
+        &self.stats
+    }
+
+    /// Streams and bytes charged to the inbound budget, after releasing the
+    /// charges of streams whose state is gone.
+    #[cfg(test)]
+    pub(crate) fn charged(&self) -> (usize, u64) {
+        let mut budget = self.budget.lock();
+        budget.release_gone();
+        (budget.stream_count(), budget.charged_bytes())
+    }
+
+    /// The connection, for tests that write raw streams.
+    #[cfg(test)]
+    pub(crate) fn connection(&self) -> &QuicConnection {
+        &self.connection
+    }
+
+    /// Send one serialized message.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) async fn send_short(&self, payload: &[u8]) -> Result<(), QuicSendError> {
+        let header = FrameHeader::short(payload.len() as u64)?;
+        let mut send = self.open(&header, &[]).await?;
+        send.write_all(payload).await?;
+        send.finish().await
+    }
+
+    /// Send one control frame.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) async fn send_control(&self, payload: &[u8]) -> Result<(), QuicSendError> {
+        let header = FrameHeader::control(payload.len() as u64)?;
+        let mut send = self.open(&header, &[]).await?;
+        send.write_all(payload).await?;
+        send.finish().await
+    }
+
+    /// Send stream `stream_id` (caller-named) with `payload`, announced by
+    /// `metadata`.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) async fn send_stream(
+        &self,
+        stream_id: StreamId,
+        metadata: Option<&[u8]>,
+        payload: Bytes,
+    ) -> Result<(), QuicSendError> {
+        let metadata = metadata.unwrap_or_default();
+        let header = FrameHeader::stream(stream_id, payload.len() as u64, metadata.len())?;
+        let mut send = self.open(&header, metadata).await?;
+        send.write_chunk(payload).await?;
+        send.finish().await
+    }
+
+    /// Send stream `stream_id` (caller-named) of `total_len` bytes from
+    /// `chunks`, announced by `metadata`. If the source fails, or delivers
+    /// more or fewer than `total_len` bytes, the stream is reset
+    /// ([`reset_code::SENDER_ABORTED`]) and the receiver cancels its handle.
+    /// No byte past `total_len` is written.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) async fn send_stream_chunks<S>(
+        &self,
+        stream_id: StreamId,
+        total_len: u64,
+        metadata: Option<&[u8]>,
+        mut chunks: S,
+    ) -> Result<(), QuicSendError>
+    where
+        S: Stream<Item = Result<Bytes, StreamError>> + Unpin,
+    {
+        let metadata = metadata.unwrap_or_default();
+        let header = FrameHeader::stream(stream_id, total_len, metadata.len())?;
+        let mut send = self.open(&header, metadata).await?;
+        let mut delivered: u64 = 0;
+        let failure = loop {
+            match chunks.next().await {
+                None if delivered == total_len => break None,
+                None => {
+                    break Some(QuicSendError::LengthMismatch {
+                        declared: total_len,
+                        delivered,
+                    });
+                }
+                Some(Err(error)) => break Some(QuicSendError::Source(error)),
+                Some(Ok(chunk)) => {
+                    let len = chunk.len() as u64;
+                    if delivered.saturating_add(len) > total_len {
+                        break Some(QuicSendError::LengthMismatch {
+                            declared: total_len,
+                            delivered: delivered.saturating_add(len),
+                        });
+                    }
+                    delivered += len;
+                    send.write_chunk(chunk).await?;
+                }
+            }
+        };
+        match failure {
+            None => send.finish().await,
+            Some(error) => {
+                send.abort();
+                Err(error)
+            }
+        }
+    }
+
+    /// Open a uni stream and write the header and metadata. Waits for a
+    /// stream credit when the peer's [`super::config::MAX_UNI_STREAMS`] are
+    /// in use.
+    async fn open(&self, header: &FrameHeader, metadata: &[u8]) -> Result<Outgoing, QuicSendError> {
+        let mut send = Outgoing::new(self.connection.inner().open_uni().await?);
+        send.write_all(&header.encode()).await?;
+        if !metadata.is_empty() {
+            send.write_all(metadata).await?;
+        }
+        Ok(send)
+    }
+}
+
+/// A uni stream being written that sees the peer stop it even while a
+/// write is blocked.
+///
+/// quinn (quinn-proto 0.11.19) reports STOP_SENDING to a blocked writer
+/// only when the block is the stream's own flow control: a write blocked on
+/// the CONNECTION's flow control returns `Blocked` before the stopped state
+/// is checked, so it waits forever. The stream is then never reset, the
+/// receiver never learns its final size, and the connection-level credit
+/// its bytes hold is never returned, which blocks every other stream on the
+/// connection. So every write races the stream's `stopped()` future and a
+/// stop resets the stream at once.
+struct Outgoing {
+    send: quinn::SendStream,
+    stopped: Pin<Box<dyn Future<Output = StoppedResult> + Send + Sync>>,
+}
+
+type StoppedResult = Result<Option<quinn::VarInt>, quinn::StoppedError>;
+
+impl Outgoing {
+    fn new(send: quinn::SendStream) -> Self {
+        let stopped = Box::pin(send.stopped());
+        Self { send, stopped }
+    }
+
+    async fn write_all(&mut self, buf: &[u8]) -> Result<(), QuicSendError> {
+        tokio::select! {
+            written = self.send.write_all(buf) => written.map_err(Into::into),
+            stopped = &mut self.stopped => Err(self.stopped_early(stopped)),
+        }
+    }
+
+    async fn write_chunk(&mut self, chunk: Bytes) -> Result<(), QuicSendError> {
+        tokio::select! {
+            written = self.send.write_chunk(chunk) => written.map_err(Into::into),
+            stopped = &mut self.stopped => Err(self.stopped_early(stopped)),
+        }
+    }
+
+    /// The peer stopped the stream (or the connection ended) mid-write:
+    /// reset it so its connection-level credit comes back.
+    fn stopped_early(&mut self, stopped: StoppedResult) -> QuicSendError {
+        match stopped {
+            Ok(Some(code)) => {
+                self.send.reset(code).ok();
+                QuicSendError::Stopped(code.into_inner())
+            }
+            // Only after a finish, which has not happened.
+            Ok(None) => QuicSendError::Closed,
+            Err(quinn::StoppedError::ConnectionLost(error)) => QuicSendError::ConnectionLost(error),
+            Err(quinn::StoppedError::ZeroRttRejected) => QuicSendError::Closed,
+        }
+    }
+
+    /// Abandon the stream ([`reset_code::SENDER_ABORTED`]). Without the
+    /// reset, dropping it would finish it and the receiver would see a
+    /// stream that ended early.
+    fn abort(mut self) {
+        self.send.reset(reset_code::SENDER_ABORTED.into()).ok();
+    }
+
+    /// End the stream and wait until the peer has acknowledged every byte or
+    /// stopped it.
+    async fn finish(mut self) -> Result<(), QuicSendError> {
+        self.send.finish().map_err(|_| QuicSendError::Closed)?;
+        match self.stopped.await {
+            Ok(None) => Ok(()),
+            Ok(Some(code)) => Err(QuicSendError::Stopped(code.into_inner())),
+            Err(quinn::StoppedError::ConnectionLost(error)) => {
+                Err(QuicSendError::ConnectionLost(error))
+            }
+            Err(quinn::StoppedError::ZeroRttRejected) => Err(QuicSendError::Closed),
+        }
+    }
+}

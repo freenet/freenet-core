@@ -31,7 +31,9 @@
 
 pub(crate) mod cid;
 pub(crate) mod config;
+pub(crate) mod framing;
 pub(crate) mod identity;
+pub(crate) mod path;
 pub(crate) mod runtime;
 pub(crate) mod socket;
 
