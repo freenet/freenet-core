@@ -389,10 +389,10 @@ pub struct TransportMetrics {
     cumulative_upgrade_control_received: AtomicU64,
 
     /// Packets that would have completed a hole-punch handshake on the
-    /// side that answered the remote's intro, dropped because they did not
-    /// authenticate under that handshake's own inbound session key (reset
-    /// each snapshot). The handshake stays pending, so a later packet that
-    /// does authenticate still completes it.
+    /// side that answered the remote's intro, dropped because they were not
+    /// encrypted under that attempt's inbound session key; one count per
+    /// packet, not per attempt (reset each snapshot). The handshake stays
+    /// pending, so a later packet under that key still completes it.
     handshake_unauthenticated_dropped: AtomicU64,
 
     /// Inbound streams refused or evicted this period, by reason (reset each
@@ -531,8 +531,8 @@ struct NatDetailCounters {
     #[cfg(test)]
     stray_intros_by_remote:
         parking_lot::Mutex<std::collections::VecDeque<(SocketAddr, StrayIntro)>>,
-    /// Test-only log of the remotes whose unauthenticated handshake packets
-    /// were dropped (bounded), one entry per packet.
+    /// Test-only log of the remotes whose handshake packets were dropped for
+    /// not being under the attempt's inbound key (bounded), one per packet.
     #[cfg(test)]
     handshake_unauthenticated_by_remote: parking_lot::Mutex<std::collections::VecDeque<SocketAddr>>,
     /// Test-only log of observed-address reporters (bounded).
@@ -1052,8 +1052,8 @@ impl TransportMetrics {
     }
 
     /// A packet from `remote` that would have completed a hole-punch
-    /// handshake was dropped because it did not authenticate under the
-    /// handshake's inbound session key (`remote` is never exported).
+    /// handshake was dropped because it was not encrypted under the
+    /// attempt's inbound session key (`remote` is never exported).
     pub(crate) fn record_handshake_unauthenticated_dropped(&self, remote: SocketAddr) {
         #[cfg(test)]
         push_test_log(&self.nat_detail.handshake_unauthenticated_by_remote, remote);
@@ -1063,8 +1063,8 @@ impl TransportMetrics {
             .fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Test-only: how many unauthenticated handshake packets from `remote`
-    /// were dropped.
+    /// Test-only: how many handshake packets from `remote` were dropped for
+    /// not being under the attempt's inbound key.
     #[cfg(test)]
     pub(crate) fn handshake_unauthenticated_dropped_from(&self, remote: SocketAddr) -> usize {
         self.nat_detail
@@ -2078,8 +2078,8 @@ pub struct TransportSnapshot {
     pub inbound_queue_drops: u64,
     /// QUIC upgrade control messages received and ignored (#5940 e1).
     pub upgrade_control_received: u64,
-    /// Hole-punch handshake packets dropped because they did not
-    /// authenticate under the handshake's inbound session key.
+    /// Hole-punch handshake packets dropped because they were not
+    /// encrypted under the attempt's inbound session key (per packet).
     pub handshake_unauthenticated_dropped: u64,
     /// Per-attempt records of the FIRST 8 failed outbound NAT traversals in
     /// the period (not a representative sample of a busy period);
@@ -2414,8 +2414,8 @@ struct SnapshotExtras {
     pub inbound_queue_drops: u64,
     /// QUIC upgrade control messages received and ignored (#5940 e1).
     pub upgrade_control_received: u64,
-    /// Hole-punch handshake packets dropped because they did not
-    /// authenticate under the handshake's inbound session key.
+    /// Hole-punch handshake packets dropped because they were not
+    /// encrypted under the attempt's inbound session key (per packet).
     pub handshake_unauthenticated_dropped: u64,
     /// Per-attempt records of the FIRST 8 failed outbound NAT traversals in
     /// the period (not a representative sample of a busy period);
@@ -2525,6 +2525,7 @@ impl SnapshotExtras {
             || self.transfers_acked != 0
             || self.inbound_queue_drops != 0
             || self.upgrade_control_received != 0
+            || self.handshake_unauthenticated_dropped != 0
             || !self.nat_fail_samples.is_empty()
             || self.inbound_stream_refused_invalid_length != 0
             || self.inbound_stream_refused_connection_bytes != 0
@@ -3343,6 +3344,29 @@ mod tests {
         );
     }
 
+    /// Dropped handshake packets reach the snapshot and its JSON, count as
+    /// activity on their own, and reset.
+    #[test]
+    fn handshake_unauthenticated_dropped_reaches_snapshot_and_resets() {
+        let metrics = TransportMetrics::new();
+        let remote: SocketAddr = "10.255.9.1:7".parse().unwrap();
+        assert!(
+            metrics.take_snapshot().is_none(),
+            "a fresh instance is idle"
+        );
+        metrics.record_handshake_unauthenticated_dropped(remote);
+        metrics.record_handshake_unauthenticated_dropped(remote);
+        metrics.record_handshake_unauthenticated_dropped(remote);
+        let snap = metrics
+            .take_snapshot()
+            .expect("dropped handshake packets alone are activity");
+        assert_eq!(snap.handshake_unauthenticated_dropped, 3);
+        let json = serde_json::to_value(&snap).unwrap();
+        assert_eq!(json["handshake_unauthenticated_dropped"], 3);
+        assert!(metrics.take_snapshot().is_none(), "the counter must reset");
+        assert_eq!(metrics.handshake_unauthenticated_dropped_from(remote), 3);
+    }
+
     /// The snapshot field that carries `outcome`'s period count. Exhaustive
     /// on purpose: a new `InboundStreamOutcome` fails to compile here until it
     /// is given a `TransportSnapshot` field.
@@ -4017,6 +4041,7 @@ mod tests {
             "inbound_queue_depth_hwm",
             "inbound_queue_drops",
             "upgrade_control_received",
+            "handshake_unauthenticated_dropped",
             "nat_fail_samples",
             "nat_fail_samples_dropped",
             "inbound_stream_refused_invalid_length",

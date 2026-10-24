@@ -2545,11 +2545,24 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
             // NAT traversal: keep sending packets throughout the deadline to maintain NAT bindings.
             // The acceptor may start hole-punching well before the joiner, so we must keep
             // sending until the deadline expires, not just until we've sent MAX_ATTEMPTS packets.
+            // End of the current receive window. A pass that may send opens
+            // a new 200 ms window. A pass after a dropped packet
+            // (`resume_receive`) skips the send and waits out what is left
+            // of the window, so dropped packets neither cause extra sends
+            // nor postpone the next paced one.
+            let mut recv_window_end_nanos = 0u64;
+            let mut resume_receive = false;
             while time_source.now_nanos().saturating_sub(start_time_nanos)
                 < overall_deadline.as_nanos() as u64
             {
+                let skip_send = std::mem::take(&mut resume_receive);
+                if !skip_send {
+                    recv_window_end_nanos = time_source
+                        .now_nanos()
+                        .saturating_add(Duration::from_millis(200).as_nanos() as u64);
+                }
                 // Send a packet if we haven't exceeded the max attempts
-                if attempts < NAT_TRAVERSAL_MAX_ATTEMPTS {
+                if !skip_send && attempts < NAT_TRAVERSAL_MAX_ATTEMPTS {
                     match state {
                         HandshakePhase::StartOutbound => {
                             tracing::trace!(
@@ -2605,7 +2618,9 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                 }
                 let next_inbound_result = crate::deterministic_select! {
                     result = next_inbound.recv() => Some(result),
-                    _ = time_source.sleep(Duration::from_millis(200)) => None,
+                    _ = time_source.sleep(Duration::from_nanos(
+                        recv_window_end_nanos.saturating_sub(time_source.now_nanos()),
+                    )) => None,
                 };
                 match next_inbound_result {
                     Some(Some(packet)) => {
@@ -2895,31 +2910,41 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                                     );
                                     continue;
                                 }
-                                // Complete only on a packet that authenticates
-                                // under OUR inbound session key. The remote's
-                                // intro (which moved us here) is encrypted to
-                                // our public key but carries no proof of who
-                                // sent it, so arriving from the remote's
-                                // address is not enough on its own. Every
-                                // packet a peer sends after reading our intro
-                                // or our ack is encrypted under this key, so a
-                                // peer running any release passes this check.
-                                // Anything else is dropped and counted, and the
-                                // handshake stays pending until a packet that
-                                // does authenticate arrives or the deadline
-                                // passes.
+                                // Complete only on a packet encrypted under
+                                // this attempt's inbound session key. Before
+                                // this check, any non-intro packet from the
+                                // remote's address completed the handshake.
+                                // The check does not establish who the remote
+                                // is: our success ack (above) still carries
+                                // this key, encrypted under the key from the
+                                // remote's intro, and changing that needs a
+                                // new message. Every release encrypts the
+                                // packets that complete this arm under this
+                                // key, so the check needs no version gate.
+                                // Any other packet is dropped and counted (once
+                                // per packet), and the attempt goes back to
+                                // receiving without sending, so the next ack
+                                // keeps its normal pacing.
                                 if !completes_on_any_packet(this_addr)
                                     && packet.try_decrypt_sym(&inbound_sym_key).is_err()
                                 {
                                     crate::transport::TRANSPORT_METRICS
                                         .record_handshake_unauthenticated_dropped(remote_addr);
+                                    // `direction` is "outbound" for every log in
+                                    // traverse_nat, including this arm, where we
+                                    // are answering the remote's intro.
                                     tracing::debug!(
                                         peer_addr = %remote_addr,
                                         direction = "outbound",
-                                        "Dropped a handshake packet that did not authenticate"
+                                        arm = "remote_inbound",
+                                        "Dropped a handshake packet not encrypted under \
+                                         this attempt's inbound key"
                                     );
+                                    resume_receive = true;
                                     continue;
                                 }
+                                #[cfg(test)]
+                                record_remote_inbound_completion(this_addr, remote_addr);
                                 let (inbound_sender, inbound_recv) =
                                     mpsc::channel(INBOUND_CHANNEL_CAPACITY);
 
@@ -3064,6 +3089,29 @@ fn completes_on_any_packet(_this_addr: SocketAddr) -> bool {
 #[cfg(test)]
 fn completes_on_any_packet(this_addr: SocketAddr) -> bool {
     LEGACY_HANDSHAKE_COMPLETION.contains(&this_addr)
+}
+
+/// Test-only: `(this_addr, remote_addr)` of every handshake completed in
+/// `traverse_nat`'s `RemoteInbound` arm, so tests can check which arm ran.
+#[cfg(test)]
+static REMOTE_INBOUND_COMPLETIONS: std::sync::LazyLock<
+    parking_lot::Mutex<Vec<(SocketAddr, SocketAddr)>>,
+> = std::sync::LazyLock::new(Default::default);
+
+#[cfg(test)]
+fn record_remote_inbound_completion(this_addr: SocketAddr, remote_addr: SocketAddr) {
+    REMOTE_INBOUND_COMPLETIONS
+        .lock()
+        .push((this_addr, remote_addr));
+}
+
+/// Test-only: whether `this_addr` completed a handshake with `remote_addr`
+/// in the `RemoteInbound` arm.
+#[cfg(test)]
+fn completed_in_remote_inbound(this_addr: SocketAddr, remote_addr: SocketAddr) -> bool {
+    REMOTE_INBOUND_COMPLETIONS
+        .lock()
+        .contains(&(this_addr, remote_addr))
 }
 
 /// Test-only: listener addresses that use the earlier completion rule. Keyed
@@ -7031,8 +7079,8 @@ pub mod mock_transport {
 
     /// Completion of a hole-punch handshake on the side that answers the
     /// remote's intro (`traverse_nat`'s `RemoteInbound` arm): it completes
-    /// only on a packet that authenticates under that side's own inbound
-    /// session key, and still interoperates with peers that complete on any
+    /// only on a packet encrypted under that attempt's inbound session key,
+    /// and still interoperates with peers that complete on any
     /// non-intro packet.
     #[cfg(test)]
     mod handshake_completion_tests {
@@ -7210,6 +7258,7 @@ pub mod mock_transport {
 
             let conn = established(conn).await;
             assert_eq!(conn.remote_addr(), remote.addr);
+            assert!(completed_in_remote_inbound(peer_addr, remote.addr));
             assert_eq!(
                 crate::transport::TRANSPORT_METRICS
                     .handshake_unauthenticated_dropped_from(remote.addr),
@@ -7218,10 +7267,10 @@ pub mod mock_transport {
             Ok(())
         }
 
-        /// Packets that do not authenticate under the peer's inbound key
-        /// (one under another key, one of arbitrary bytes) do not complete
-        /// the handshake: each is dropped and counted, the attempt stays
-        /// pending, and a later authenticated ack still completes it.
+        /// Packets not encrypted under the peer's inbound key (one under
+        /// another key, one of arbitrary bytes) do not complete the
+        /// handshake: each is dropped and counted, the attempt stays pending,
+        /// and a later ack under the right key still completes it.
         #[tokio::test]
         async fn unauthenticated_packet_does_not_complete_the_handshake() -> anyhow::Result<()> {
             let channels: Channels = Arc::new(DashMap::new());
@@ -7255,12 +7304,53 @@ pub mod mock_transport {
             remote.send(peer_addr, ack.data());
             let conn = established(conn).await;
             assert_eq!(conn.remote_addr(), remote.addr);
+            assert!(completed_in_remote_inbound(peer_addr, remote.addr));
             assert_eq!(
                 crate::transport::TRANSPORT_METRICS
                     .handshake_unauthenticated_dropped_from(remote.addr),
                 2,
-                "the authenticated ack is not counted as dropped"
+                "the ack under the right key is not counted as dropped"
             );
+            Ok(())
+        }
+
+        /// Dropped packets do not cause sends: after each one the attempt
+        /// goes back to receiving, so a burst of them neither uses up the
+        /// attempt's send budget nor sends acks outside the normal pacing.
+        /// A later packet under the right key still completes it.
+        #[tokio::test]
+        async fn dropped_packets_do_not_cause_extra_sends() -> anyhow::Result<()> {
+            const JUNK: usize = 20;
+            let channels: Channels = Arc::new(DashMap::new());
+            let mut remote = ScriptedRemote::new(&channels);
+            let (conn, peer_addr, _peer, peer_key, remote_key) =
+                peer_waiting_for_completion(&mut remote, &channels).await?;
+
+            for i in 0..JUNK {
+                let mut junk = vec![0u8; 64];
+                GlobalRng::fill_bytes(&mut junk);
+                junk[0] = crate::transport::crypto::PACKET_TYPE_SYMMETRIC;
+                remote.send(peer_addr, &junk);
+                wait_for_drops(remote.addr, i + 1).await;
+            }
+            // Give a send that followed the last drop time to arrive. Virtual
+            // time does not move, so no paced send is due.
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let mut sent_after_drops = 0;
+            while remote.inbound.try_recv().is_ok() {
+                sent_after_drops += 1;
+            }
+            assert_eq!(
+                sent_after_drops, 0,
+                "{JUNK} dropped packets caused {sent_after_drops} sends"
+            );
+            assert!(!conn.is_finished());
+
+            let ack = SymmetricMessage::ack_ok(&cipher(peer_key), remote_key, peer_addr)?;
+            remote.send(peer_addr, ack.data());
+            let conn = established(conn).await;
+            assert_eq!(conn.remote_addr(), remote.addr);
+            assert!(completed_in_remote_inbound(peer_addr, remote.addr));
             Ok(())
         }
 
@@ -7307,9 +7397,18 @@ pub mod mock_transport {
         /// Connects a peer with the check to a peer with the earlier rule,
         /// each dialing the other, under the given drop policies. Both must
         /// connect.
+        /// Which peer must complete in the `RemoteInbound` arm.
+        #[derive(Clone, Copy)]
+        enum InRemoteInbound {
+            Checked,
+            Legacy,
+            Either,
+        }
+
         async fn checked_and_legacy_peers_connect(
             checked_policy: PacketDropPolicy,
             legacy_policy: PacketDropPolicy,
+            expect: InRemoteInbound,
         ) -> anyhow::Result<()> {
             let channels = Arc::new(DashMap::new());
             let (checked_pub, mut checked, checked_addr) =
@@ -7331,11 +7430,24 @@ pub mod mock_transport {
             let (a, b) = tokio::try_join!(to_legacy, to_checked)?;
             assert_eq!(a?, legacy_addr);
             assert_eq!(b?, checked_addr);
+            let checked_arm = completed_in_remote_inbound(checked_addr, legacy_addr);
+            let legacy_arm = completed_in_remote_inbound(legacy_addr, checked_addr);
+            match expect {
+                InRemoteInbound::Checked => assert!(
+                    checked_arm,
+                    "the checked peer must complete in the RemoteInbound arm"
+                ),
+                InRemoteInbound::Legacy => assert!(
+                    legacy_arm,
+                    "the legacy peer must complete in the RemoteInbound arm"
+                ),
+                InRemoteInbound::Either => {}
+            }
             assert_eq!(
                 crate::transport::TRANSPORT_METRICS
                     .handshake_unauthenticated_dropped_from(legacy_addr),
                 0,
-                "every completing packet a legacy peer sends authenticates"
+                "every completing packet a legacy peer sends is under the right key"
             );
             Ok(())
         }
@@ -7352,6 +7464,7 @@ pub mod mock_transport {
             checked_and_legacy_peers_connect(
                 PacketDropPolicy::Ranges(vec![0..1]),
                 PacketDropPolicy::ReceiveAll,
+                InRemoteInbound::Checked,
             )
             .await
         }
@@ -7367,6 +7480,7 @@ pub mod mock_transport {
             checked_and_legacy_peers_connect(
                 PacketDropPolicy::ReceiveAll,
                 PacketDropPolicy::Ranges(vec![0..1]),
+                InRemoteInbound::Legacy,
             )
             .await
         }
@@ -7378,6 +7492,7 @@ pub mod mock_transport {
             checked_and_legacy_peers_connect(
                 PacketDropPolicy::ReceiveAll,
                 PacketDropPolicy::ReceiveAll,
+                InRemoteInbound::Either,
             )
             .await
         }
