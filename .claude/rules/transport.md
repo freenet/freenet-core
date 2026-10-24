@@ -86,17 +86,23 @@ outbound_stream.rs::capped_attempt). With a cap, a fragment pays its
 connection's bucket ONCE with TokenBucket::reserve (debt, then sleep the
 exact deficit, no jitter), as the uncapped path does: PER-CONNECTION
 ADMISSION IS IN ORDER. A reservation whose wait would reach the stream's
-deadline is given back at once and the stream fails at once (cause
-`connection`): a doomed reservation must never hold a place that delays
-the fragments behind it (otherwise above ~5 x rate / 1200 streams on a
-connection nearly every stream fails). Otherwise the fragment keeps the
-payment (ConnectionPayment) through every later wait, on cwnd and on the
-cap; if the fragment is not sent it is given back only while not yet past
-due (TokenBucket::give_back_unless_past_due: after that the refill covered
-it and a refund would double-credit), and a send error after the take
-does not refund it (as uncapped). Rate updates every RTT can reorder
-waiters slightly, as on the uncapped reserve path; order is not a
-correctness property of the cap. Then each attempt is:
+deadline is not made (TokenBucket::reserve_within, one lock) and the
+stream fails at once, blamed like a deadline failure with the would-be
+wait counted as connection time: a doomed reservation must never hold a
+place that delays the fragments behind it (otherwise above
+~5 x rate / 1200 streams on a connection nearly every stream fails). A
+stream's FIRST fragment must also leave one more slot (packet / rate)
+before the deadline, so a newcomer cannot push an in-progress stream's
+next fragment past its deadline. Only the connection wait is checked: a
+fragment can still fail on the node cap at the deadline. Otherwise the
+fragment keeps the payment (ConnectionPayment) through every later wait,
+on cwnd and on the cap; if the fragment is not sent it is given back,
+clamped to capacity (a late refund credits at most one datagram the
+refill also covered: capacity moves between connections, the node cap
+holds; so no timer-slack margin is needed), and a send error after the
+take does not refund it (as uncapped). Rate updates every RTT can
+reorder waiters slightly, as on the uncapped reserve path; order is not
+a correctness property of the cap. Then each attempt is:
 cwnd check, node-wide egress_cap::try_take, back to back with no await
 before the send; if the cap is short, sleep through StreamPacing (deficit x
 U[1.0, 1.4) + U[0, 2 ms)) and start again from the cwnd check. NODE-CAP
@@ -105,8 +111,8 @@ among waiters is random, so connections share the cap by their number of
 waiting streams (no isolation between connections). The kept connection
 payment can be stale after a cwnd or cap wait (the bucket refills under
 it): a connection may then exceed its bucket by one datagram per waiting
-stream.
-That moves capacity between connections only; the node cap is unaffected.
+stream. That moves capacity between connections only; the node cap is
+unaffected.
 NEVER put a reservation on the NODE cap (earlier reservation/hold models
 there leaked capacity). 0.2.148 used try_take + jittered retry on
 the per-connection bucket too; the race starved streams on busy connections
@@ -121,8 +127,8 @@ first fragment, which the receiver does not time (its 5 s timer starts when
 fragment #1 arrives; before that it waits up to STREAM_CLAIM_TIMEOUT, 60 s).
 That is deliberate admission control: a stream that cannot get one slot in
 5 s fails fast and the operation retries elsewhere. The overload drop-off
-has the same shape as 0.2.147 (the receiver's timeout) but fails fast. In pipe_stream the first gap starts when
-the first upstream chunk arrives
+has the same shape as 0.2.147 (the receiver's timeout) but fails fast.
+In pipe_stream the first gap starts when the first upstream chunk arrives
 (pipe_stream's own 5 s upstream inactivity select bounds that wait), and
 from fragment #2 on, time waiting on the upstream stream counts toward the
 gap and is attributed to `other`. On capped nodes a stream that hits the
@@ -146,7 +152,8 @@ Unpaced debt is capped at DEBT_LIMIT (1 s at the cap); the rest is forgiven
 node sends at most burst + rate x interval + bytes forgiven in the
 interval. Invariant: nothing is reserved on the NODE cap; a paced sender
 holds no node-wide capacity while it waits, and is charged there only at
-its send (it does hold its per-connection reservation, see above). Gaps that reach LONG_WAIT
+its send (it does hold its per-connection reservation, see above). Gaps
+that reach LONG_WAIT
 (2.5 s) and abandoned streams are counted by what took most of the gap
 (WaitCause: cap, connection = the connection's own bucket, other = cwnd, the
 upstream stream for relayed streams, and the rest): egress_long_waits_<cause>, egress_streams_abandoned_<cause>.

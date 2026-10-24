@@ -15,31 +15,37 @@
 //! `TokenBucket::reserve` (into debt, then sleep for the deficit), as it does
 //! without a cap, so the fragments of one connection are admitted IN ORDER:
 //! each waits for the reservations ahead of it. A reservation whose wait
-//! would already pass the stream's [`PACED_WAIT_DEADLINE`] is given back at
-//! once and the stream fails at once (cause `connection`), so a doomed
-//! fragment never holds a place that delays the ones behind it. Otherwise
-//! the fragment keeps its payment until it is sent, through its waits on
-//! cwnd and on the cap. Then, right after a cwnd check, it calls
-//! [`try_take`]: if the node-wide bucket holds a datagram's worth, the
-//! bytes are taken and the fragment is sent at once; otherwise the task
-//! sleeps for the deficit at the cap rate (see [`jittered`]) and starts
-//! again from the cwnd check, keeping its connection payment and so its
-//! place on the connection. Nothing is reserved on the node-wide bucket
-//! while it sleeps, so a waiting stream holds no node-wide capacity. Node-wide admission is a race: whichever waiter wakes
-//! when the bucket has enough takes it. So connections share the cap in
-//! proportion to their number of waiting streams; there is no isolation
-//! between connections, and a peer driving many streams gets a
-//! proportional share.
+//! would reach the stream's [`PACED_WAIT_DEADLINE`] is not made
+//! (`TokenBucket::reserve_within`, one lock) and the stream fails at once,
+//! so a doomed fragment never holds a place that delays the ones behind it.
+//! A stream's first fragment must also leave one more slot before the
+//! deadline, so a newcomer does not push an in-progress stream's next
+//! fragment past it. This looks only at the connection wait: a fragment
+//! can still fail on the node cap at the deadline. Otherwise the fragment
+//! keeps its payment until it is sent, through its waits on cwnd and on the
+//! cap. Then, right after a cwnd check, it calls [`try_take`]: if the
+//! node-wide bucket holds a datagram's worth, the bytes are taken and the
+//! fragment is sent at once; otherwise the task sleeps for the deficit at
+//! the cap rate (see [`jittered`]) and starts again from the cwnd check,
+//! keeping its connection payment and so its place on the connection.
+//! Nothing is reserved on the node-wide bucket while it sleeps, so a
+//! waiting stream holds no node-wide capacity. Node-wide admission is a
+//! race: whichever waiter wakes when the bucket has enough takes it. So
+//! connections share the cap in proportion to their number of waiting
+//! streams; there is no isolation between connections, and a peer driving
+//! many streams gets a proportional share.
 //!
 //! The connection payment kept across a wait on cwnd or on the cap can be
 //! stale: the connection's bucket refills meanwhile, so after such a wait a
 //! connection may send up to one datagram per waiting stream beyond its
 //! bucket's bound. That only moves capacity between connections; the node
 //! cap is unaffected, since every datagram still takes from it at its send.
-//! A fragment that is not sent gives its payment back only while its slot
-//! is still ahead (now <= the time the reservation was due); after that the
-//! refill has already covered it and a refund would credit tokens twice, so
-//! nothing is given back. Rate updates (`TokenBucket::set_rate`, every RTT)
+//! A fragment that is not sent gives its payment back, clamped to the
+//! bucket's capacity. A late refund, after the refill already passed its
+//! slot, can credit at most that one datagram twice; that too only moves
+//! capacity between connections, and the node cap still holds. It is also
+//! why no margin for timer slack is needed: a timer that fires late costs
+//! at most one refunded slot. Rate updates (`TokenBucket::set_rate`, every RTT)
 //! change the deficit of later reservations and can reorder waiters
 //! slightly, exactly as on the uncapped reserve path; the order is not a
 //! correctness property of the cap.
@@ -982,16 +988,18 @@ impl StreamPacing {
         PACED_WAIT_DEADLINE.saturating_sub(self.gap(time_source))
     }
 
-    /// Fail the stream now because its connection reservation would only be
-    /// due at or after the deadline: count it as abandoned for the
-    /// connection, and return the gap so far.
+    /// Fail the stream now because its connection reservation would wait
+    /// `wait` and reach the deadline: count it as abandoned, blamed as at
+    /// the deadline with `wait` counted as connection time, and return the
+    /// gap so far.
     pub(crate) fn abandon_for_connection<T: TimeSource>(
         &mut self,
         time_source: &T,
         cap: &EgressCap,
+        wait: Duration,
     ) -> Duration {
         let gap = self.gap(time_source);
-        cap.record_abandoned(WaitCause::Connection, gap);
+        cap.record_abandoned(self.cause_with(time_source, wait), gap);
         gap
     }
 
@@ -1020,10 +1028,16 @@ impl StreamPacing {
 
     /// The limit that took most of the current gap.
     fn cause<T: TimeSource>(&self, time_source: &T) -> WaitCause {
+        self.cause_with(time_source, Duration::ZERO)
+    }
+
+    /// [`Self::cause`] with `extra` more time on the connection's bucket.
+    fn cause_with<T: TimeSource>(&self, time_source: &T, extra: Duration) -> WaitCause {
         let other = self.gap(time_source).saturating_sub(self.slept());
-        if self.cap_slept >= self.connection_slept && self.cap_slept >= other {
+        let connection = self.connection_slept.saturating_add(extra);
+        if self.cap_slept >= connection && self.cap_slept >= other {
             WaitCause::Cap
-        } else if self.connection_slept >= other {
+        } else if connection >= other {
             WaitCause::Connection
         } else {
             WaitCause::Other
