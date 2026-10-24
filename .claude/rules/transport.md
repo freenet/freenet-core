@@ -851,6 +851,71 @@ refusal of a wrong server key, a wrong client key, a plain Ed25519 key on
 either side, and a man in the middle with its own key on either leg.
 ```
 
+#### QUIC framing and path (`quic/framing.rs`, `quic/path.rs`, #5940 step e3)
+
+Dead code until e5: nothing in the node builds a `QuicPath`.
+
+```
+One message per QUIC uni stream: an 18-byte header, then metadata, then
+payload, then the stream's end.
+  version u8 (1) | kind u8 (0 Short, 1 Stream, 2 Control) |
+  stream_id u32 BE | total_len u64 BE (payload) | metadata_len u32 BE
+FrameHeader::decode refuses, never panics: unknown version or kind;
+  total_len 0 or > MAX_STREAM_TOTAL_BYTES (check_declared_stream_length)
+  for Short and Stream; Control 0 or > MAX_CONTROL_BYTES (4 KiB);
+  metadata_len > MAX_METADATA_BYTES (64 KiB); metadata or a nonzero
+  stream_id on Short or Control; a Stream id that is not caller-named;
+  fewer than 18 bytes. The sender builds headers through the same
+  checks. A new kind or field needs a new version, sent only to a peer
+  that said it reads it.
+Sending (QuicPath::send_short / send_stream / send_stream_chunks /
+  send_control): returns when the peer's QUIC stack acked every byte, or
+  Stopped(code). A message that fits in the flow window can be acked
+  before the receiver reads its header, so a refusal may read as success
+  at the sender, as on UDP. send_stream_chunks resets the stream if the
+  source fails or delivers a different length. quinn's 256 uni streams
+  are the back-pressure (open_uni waits).
+  Every write races the stream's stopped() future and resets on a stop:
+  quinn-proto 0.11.19 does not report STOP_SENDING to a writer blocked on
+  CONNECTION flow control, so without the race a stopped stream keeps the
+  connection's window and blocks every other stream on it. Do not write
+  to a quinn SendStream without that race.
+Receiving: one task per connection reads every stream (FuturesUnordered,
+  no task per stream) and only uses try_send. Short and Control go to
+  bounded channels (full: dropped and counted); Stream goes through the
+  INBOUND ADAPTER (path/inbound.rs).
+Inbound adapter: a Stream's payload goes into an ordinary StreamHandle,
+  re-chunked to the UDP fragment shape (fragment i = bytes
+  [(i-1)F, iF), F = FRAGMENT_PAYLOAD_SIZE), so fork / assemble / pipe /
+  StreamIdentity / registry are unchanged. The handle is announced
+  (InboundStreamArrival, with the metadata) before the payload.
+  → Before allocating: header checks, then the path's
+    InboundStreamBudget check and charge (same cost and limits as UDP).
+    Short messages are charged too (a token rides with the message until
+    its payload is taken). Refusal: STOP_SENDING (stop_code), counted in
+    the shared InboundStreamOutcome counters, path and process-wide.
+  → Completion by BYTES: exactly total_len, then the stream's end. The
+    fragment that completes the buffer is held until the end is seen.
+    Ends early (Truncated), more bytes (Overlong), reset by the sender:
+    the handle is cancelled (consumers get Cancelled) and it is counted.
+  → Charge released only when all state is gone (Weak), as on UDP.
+  → Idle and age eviction: streaming_handle_idle_timeout and
+    inbound_stream_age_limit, counted EvictedIdle / EvictedAge, checked by
+    one timer per stream on the path's clock (not the timeout_check
+    tick). Every QUIC chunk is new bytes, so every chunk is progress.
+  → Refused ids are NOT remembered: a stopped QUIC stream cannot deliver
+    more bytes, and a new QUIC stream with that id carries the whole
+    stream. A Stream id already held on the path is refused
+    (StreamIdInUse). Dropping the path cancels streams in progress.
+Not here: dedup (e5: is_duplicate_dispatch, completed_inbound_streams),
+  export of the QUIC-only counters (per path, QuicPath::stats), and one
+  budget shared with the UDP session. The path has its own budget, so a
+  peer with both may hold twice the per-connection allowance until e5
+  resolves it (QUIC memory gate). Short-message budget keys are picked by
+  the path and could equal a UDP transport-internal id: do not share the
+  budget without separating the keys.
+```
+
 ### WHEN testing transport code
 
 ```
