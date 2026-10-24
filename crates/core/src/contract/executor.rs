@@ -2776,6 +2776,11 @@ mod tests {
                  INCOMING_BUFFER_TOTAL_BYTES",
             ),
             (
+                "MAX_CONTROL_BYTES",
+                "length limit on ONE QUIC path control frame (quic::framing), a \
+                 per-message bound inside a per-connection channel, not a node budget",
+            ),
+            (
                 "XEDDSA_RANDOM_BYTES",
                 "the 64 random bytes one QUIC handshake signature draws, on the stack, \
                  not memory the node holds",
