@@ -690,6 +690,48 @@ fn idle_and_old_streams_are_evicted() {
     })
 }
 
+/// A stream that trickles its header (or a control frame) never goes idle
+/// but holds one of the peer's stream slots while it does; it has no budget
+/// charge, so it gets the smallest age limit and is evicted at it.
+#[test]
+fn an_uncharged_stream_is_evicted_at_its_age_limit() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let p = paths("quic-path-uncharged-age", 17, QuicPathLimits::DEFAULT).await;
+        let idle = streaming_handle_idle_timeout();
+        let age = max_inbound_stream_age(0);
+        let (conn, time) = (p.a_raw(), p.time());
+        let started = time.now_nanos();
+        let code = p
+            .drive(async move {
+                let mut send = conn.open_uni().await.unwrap();
+                // Far more trickle time than the age limit: the header would
+                // complete only after HEADER_LEN periods of 0.9 x idle.
+                for byte in header(1, 0, 0, 10, 0) {
+                    if let Err(quinn::WriteError::Stopped(code)) = send.write_all(&[byte]).await {
+                        return Some(code.into_inner());
+                    }
+                    tokio::select! {
+                        () = time.sleep(idle * 9 / 10) => {}
+                        stopped = send.stopped() => {
+                            return stopped.unwrap().map(|c| c.into_inner())
+                        }
+                    }
+                }
+                None
+            })
+            .await;
+        assert_eq!(code, Some(u64::from(stop_code::EVICTED)));
+        let waited = Duration::from_nanos(p.time().now_nanos() - started);
+        assert!(
+            waited >= age && waited < age + idle,
+            "evicted after {waited:?}"
+        );
+        assert_eq!(p.b.stats().count(QuicInboundOutcome::AgedUncharged), 1);
+        assert_eq!(p.b.stats().count(QuicInboundOutcome::IdleUncharged), 0);
+    })
+}
+
 /// A full channel never makes the receiver wait: a short message or control
 /// frame is dropped and counted, a stream is stopped with `CHANNEL_FULL`
 /// and its charge released. A second stream with an id the path already

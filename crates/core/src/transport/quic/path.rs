@@ -203,6 +203,8 @@ quic_outcomes! {
         /// A stream with no budget charge (still in its header, or a
         /// control frame) idle past the idle timeout.
         IdleUncharged => "idle_uncharged",
+        /// A stream with no budget charge past `uncharged_age_limit`.
+        AgedUncharged => "aged_uncharged",
         /// A Stream whose id is already held on this path.
         StreamIdInUse => "stream_id_in_use",
         /// `shorts` was full; the message was dropped.

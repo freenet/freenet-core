@@ -222,8 +222,8 @@ impl From<quinn::ReadError> for ReadFailure {
     }
 }
 
-/// Whether a stream holds a budget charge, which decides how an idle
-/// timeout is counted.
+/// Whether a stream holds a budget charge, which decides how an idle or
+/// age eviction is counted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Charged {
     No,
@@ -531,7 +531,10 @@ impl<T: TimeSource> Receiver<T> {
                 reader.stop(stop_code::EVICTED);
             }
             ReadFailure::Age => {
-                stats.record_shared(InboundStreamOutcome::EvictedAge);
+                match charged {
+                    Charged::Yes => stats.record_shared(InboundStreamOutcome::EvictedAge),
+                    Charged::No => stats.record(QuicInboundOutcome::AgedUncharged),
+                }
                 reader.stop(stop_code::EVICTED);
             }
             ReadFailure::Reset => stats.record(QuicInboundOutcome::ResetByPeer),
