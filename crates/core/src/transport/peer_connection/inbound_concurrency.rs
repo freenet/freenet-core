@@ -10,22 +10,43 @@
 //! at each inbound message the estimate is
 //!
 //! ```text
-//! open inbound streams + short messages received within (srtt + 25 ms)
+//! open inbound streams + packets still queued for the connection
+//!     + short messages that arrived within (srtt + 25 ms)
 //! ```
 //!
-//! The open streams are `InboundStreamBudget::stream_count`. That
-//! overestimates what QUIC would hold: a charge here lasts until the
-//! stream's consumers drop its buffer, while a QUIC slot frees when the
-//! stream has been read to its end. So the estimate is an upper bound on
-//! what ordinary traffic needs, and can justify lowering the limit, never
-//! raising it. It is also capped by the per-connection stream budget
-//! (1024): streams the budget refuses are not counted. It says nothing
-//! about what a peer opening streams on purpose could hold.
+//! It is built to err high, not a strict upper bound. The terms that run
+//! high:
+//! - open streams are `InboundStreamBudget::stream_count`, whose charge
+//!   lasts until the stream's consumers drop its buffer, while a QUIC slot
+//!   frees when the stream has been read to its end;
+//! - the queued packets (`inbound_packet_recv`, not yet read) would hold
+//!   their slots unread on QUIC, but the count also includes ACK-only
+//!   packets and fragments of streams already counted;
+//! - packets a gateway handshake buffered share one stamp, so a new gateway
+//!   connection's first messages count as arriving together.
 //!
-//! A stream that arrives whole in one fragment differs by path: on the
-//! legacy path it is never charged and is counted as a short message; on
-//! the operations path it is charged until its consumers let go and is
-//! counted as an open stream. Both overestimate.
+//! Known undercounts:
+//! - a sample skipped at a snapshot boundary (see
+//!   `TransportMetrics::record_inbound_concurrency`);
+//! - short messages older than [`HORIZON`] are forgotten, so a window
+//!   longer than that (an RTT near 2 s) counts only the last [`HORIZON`];
+//! - at most [`MAX_TRACKED_SHORTS`] short messages are remembered;
+//! - streams the per-connection budget (1024) refuses are not counted;
+//! - a stream that arrives whole in one fragment is counted as a short
+//!   message on the legacy path (never charged) but as an open stream on
+//!   the operations path (charged until its consumers let go).
+//!
+//! So it can support LOWERING `MAX_UNI_STREAMS`, never raising it. A limit
+//! that is too low costs only back-pressure on the sender (it waits for a
+//! stream credit); QUIC shadow mode (e5a) is expected to confirm the value
+//! on real QUIC before any default changes. It says nothing about what a
+//! peer opening streams on purpose could hold.
+//!
+//! Arrival times are when the listener queued each packet
+//! (`InboundPacket::queued_nanos`), which never decrease on one connection,
+//! so the remembered times stay sorted and the window is counted with a
+//! binary search. The memory is at most [`MAX_TRACKED_SHORTS`] u64s (8 KiB)
+//! per connection; it is not shrunk after a burst.
 
 use std::collections::VecDeque;
 use std::time::Duration;
@@ -43,48 +64,54 @@ pub(super) const ACK_DELAY_ALLOWANCE: Duration = Duration::from_millis(25);
 /// keep-alive sample yet).
 pub(super) const FALLBACK_RTT: Duration = Duration::from_millis(100);
 
+/// How long a short message's arrival is remembered, whatever the current
+/// window. Fixed, so that when the smoothed RTT grows the window can take in
+/// arrivals a shorter window had already passed.
+pub(super) const HORIZON: Duration = Duration::from_secs(2);
+
 /// Most short-message arrival times kept. At the cap the oldest is dropped,
-/// so the estimate stops growing at this many short messages plus the open
-/// streams, which is above the largest reported threshold (256).
+/// so the short-message term stops growing at this many, which is above the
+/// largest reported threshold (256).
 pub(super) const MAX_TRACKED_SHORTS: usize = 1024;
 
-/// The arrival times of the short messages that may still hold a stream
-/// slot. Owned by the connection's recv loop.
+/// The arrival times of recent short messages. Owned by the connection's
+/// recv loop.
 #[derive(Debug, Default)]
 pub(super) struct InboundConcurrency {
     /// Arrival times (nanoseconds from the connection's time source),
-    /// oldest first.
+    /// oldest first, never older than [`HORIZON`] at the latest push.
     shorts: VecDeque<u64>,
 }
 
 impl InboundConcurrency {
     /// Record a short message arriving at `now_nanos` and return the
-    /// estimate, counting it. `open_streams` is the connection's count of
-    /// inbound streams holding state.
+    /// estimate, counting it. `outstanding` is the connection's open
+    /// inbound streams plus the packets still queued for it.
     pub(super) fn on_short_message(
         &mut self,
         now_nanos: u64,
         srtt: Option<Duration>,
-        open_streams: usize,
+        outstanding: usize,
     ) -> u32 {
-        self.prune(now_nanos, srtt);
+        self.prune(now_nanos);
         if self.shorts.len() >= MAX_TRACKED_SHORTS {
             self.shorts.pop_front();
         }
         self.shorts.push_back(now_nanos);
-        self.estimate(open_streams)
+        self.estimate(now_nanos, srtt, outstanding)
     }
 
     /// Return the estimate at `now_nanos`, when a new inbound stream has
-    /// been admitted. `open_streams` must already count it.
+    /// been admitted. `outstanding` (open inbound streams plus queued
+    /// packets) must already count the stream.
     pub(super) fn on_stream_admitted(
         &mut self,
         now_nanos: u64,
         srtt: Option<Duration>,
-        open_streams: usize,
+        outstanding: usize,
     ) -> u32 {
-        self.prune(now_nanos, srtt);
-        self.estimate(open_streams)
+        self.prune(now_nanos);
+        self.estimate(now_nanos, srtt, outstanding)
     }
 
     /// How long a short message counts after it arrives.
@@ -93,19 +120,30 @@ impl InboundConcurrency {
             .saturating_add(ACK_DELAY_ALLOWANCE)
     }
 
-    /// Drop the short messages that arrived more than one window before
+    /// Forget the short messages that arrived more than [`HORIZON`] before
     /// `now_nanos`.
-    fn prune(&mut self, now_nanos: u64, srtt: Option<Duration>) {
-        let window = u64::try_from(Self::window(srtt).as_nanos()).unwrap_or(u64::MAX);
-        let cutoff = now_nanos.saturating_sub(window);
+    fn prune(&mut self, now_nanos: u64) {
+        let cutoff = now_nanos.saturating_sub(nanos(HORIZON));
         while self.shorts.front().is_some_and(|&at| at < cutoff) {
             self.shorts.pop_front();
         }
     }
 
-    fn estimate(&self, open_streams: usize) -> u32 {
-        u32::try_from(open_streams.saturating_add(self.shorts.len())).unwrap_or(u32::MAX)
+    /// The remembered short messages that arrived within one window of
+    /// `now_nanos`: a suffix, since the times are sorted.
+    fn shorts_in_window(&self, now_nanos: u64, srtt: Option<Duration>) -> usize {
+        let cutoff = now_nanos.saturating_sub(nanos(Self::window(srtt)));
+        self.shorts.len() - self.shorts.partition_point(|&at| at < cutoff)
     }
+
+    fn estimate(&self, now_nanos: u64, srtt: Option<Duration>, outstanding: usize) -> u32 {
+        let total = outstanding.saturating_add(self.shorts_in_window(now_nanos, srtt));
+        u32::try_from(total).unwrap_or(u32::MAX)
+    }
+}
+
+fn nanos(duration: Duration) -> u64 {
+    u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
 }
 
 #[cfg(test)]
@@ -127,7 +165,36 @@ mod tests {
         assert_eq!(c.on_short_message(1_076 * MS, srtt, 0), 3);
         // Long after all of them: only the new one counts.
         assert_eq!(c.on_short_message(2_000 * MS, srtt, 0), 1);
-        assert_eq!(c.shorts.len(), 1, "pruned entries are not kept");
+    }
+
+    /// Arrivals are forgotten only after HORIZON, whatever the window.
+    #[test]
+    fn arrivals_are_remembered_for_the_horizon() {
+        let srtt = Some(Duration::from_millis(10));
+        let mut c = InboundConcurrency::default();
+        c.on_short_message(1_000 * MS, srtt, 0);
+        c.on_short_message(1_500 * MS, srtt, 0);
+        assert_eq!(c.shorts.len(), 2, "outside the window, inside the horizon");
+        c.on_short_message(1_000 * MS + nanos(HORIZON), srtt, 0);
+        assert_eq!(c.shorts.len(), 3, "exactly HORIZON old is still kept");
+        c.on_short_message(1_000 * MS + nanos(HORIZON) + 1, srtt, 0);
+        assert_eq!(c.shorts.len(), 3, "older than HORIZON is forgotten");
+        assert_eq!(c.shorts.front(), Some(&(1_500 * MS)));
+    }
+
+    /// When the smoothed RTT grows, arrivals a shorter window had passed
+    /// count again: at 10 ms (window 35 ms) the arrival at 0 has left by
+    /// 50 ms, and at 100 ms (window 125 ms) all three count.
+    #[test]
+    fn a_growing_srtt_counts_earlier_arrivals_again() {
+        let short = Some(Duration::from_millis(10));
+        let long = Some(Duration::from_millis(100));
+        let mut c = InboundConcurrency::default();
+        let t0 = 1_000 * MS;
+        assert_eq!(c.on_short_message(t0, short, 0), 1);
+        assert_eq!(c.on_short_message(t0 + 40 * MS, short, 0), 1);
+        assert_eq!(c.on_short_message(t0 + 50 * MS, short, 0), 2);
+        assert_eq!(c.on_stream_admitted(t0 + 50 * MS, long, 0), 3);
     }
 
     #[test]

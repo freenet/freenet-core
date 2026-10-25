@@ -373,21 +373,28 @@ observation only.
 Per-connection inbound concurrency (`inbound_concurrency_*`,
 `peer_connection/inbound_concurrency.rs`) estimates, at each inbound short
 message and each newly admitted inbound stream, the QUIC uni streams the
-connection would hold: open inbound streams plus short messages received
-within SRTT + 25 ms. A short message is timed from when the listener queued
-it (`InboundPacket::queued_nanos`, stamped in `try_send_established` on the
-listener's clock, which its connections share), not from when the connection
-task took it, so a burst that waited in the channel still counts as one.
-Per snapshot window (`transport_snapshot_interval_secs`,
-default 30 s) it reports the connections sampled, how many peaked at 8 / 16 /
-32 / 64 / 128 / 256 or more, and the largest estimate; keys are uploaded only
-when non-zero, and `conns_sampled` is the only activity term. It is an upper
-bound on ordinary UDP demand: `ge_T / conns_sampled` can justify LOWERING
-`MAX_UNI_STREAMS` (`quic/config.rs`), never raising it, and it says nothing
-about the memory a peer opening streams on purpose can hold (the per-path
-ceiling's job). `inbound_concurrency_max` is diagnostic only (one peer can
-drive it to the cap with a burst or an inflated RTT). The open-stream term
-stops at the 1024-stream budget, so refused connections are understated. The
+connection would hold: open inbound streams plus packets still queued for it
+plus short messages that arrived within SRTT + 25 ms. Arrival is when the
+listener queued the packet (`InboundPacket::queued_nanos`, on the listener's
+clock, which its connections share), stamped at two sites:
+`try_send_established`, and `forward_handshake_buffered` for packets a gateway
+handshake buffered (those share one stamp, which raises the estimate for a new
+gateway connection). Arrivals are remembered for a fixed 2 s horizon (at most
+1024), so a growing SRTT can count earlier ones again. Per snapshot window
+(`transport_snapshot_interval_secs`, default 30 s) it reports the connections
+sampled (only those that received a short message or had a stream admitted in
+the window), how many peaked at 8 / 16 / 32 / 64 / 128 / 256 or more, and the
+largest estimate; keys are uploaded only when non-zero, and `conns_sampled` is
+the only activity term. It is an estimate built to err high, not a strict
+upper bound; the known undercounts (a sample skipped at a window boundary,
+arrivals older than the horizon or past the 1024 cap, streams the 1024-stream
+budget refused) are listed in the module doc. So `ge_T / conns_sampled` can
+support LOWERING `MAX_UNI_STREAMS` (`quic/config.rs`), never raising it; a
+limit that is too low costs only sender back-pressure, and QUIC shadow mode
+(e5a) is expected to confirm the value on real QUIC before any default
+changes. It says nothing about the memory a peer opening streams on purpose
+can hold (the per-path ceiling's job). `inbound_concurrency_max` is diagnostic
+only (one peer can drive it to the cap with a burst or an inflated RTT). The
 counts sit under one mutex taken only on a connection's first sample of a
 window or a new peak, and by the snapshot, which advances the window and
 drains them together; do not split them back into separate atomics, which

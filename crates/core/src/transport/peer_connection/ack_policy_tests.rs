@@ -3143,24 +3143,25 @@ async fn a_refused_inbound_stream_is_not_sampled() {
 }
 
 /// Short messages are timed from when the listener queued them, not from
-/// when the connection task got to them: three that arrived within one
-/// window and then waited in the channel while the task was busy count as
-/// together, although the task takes them a second apart.
+/// when the connection task got to them. The first arrives at 0 and is
+/// taken at once; the second and third arrive at 50 and 100 ms while the
+/// task is busy and are taken a second apart. By arrival all three fall in
+/// one no-RTT window (125 ms), so the third counts 3; timed by when they
+/// were taken, no sample would reach more than 2 (one short plus one still
+/// queued).
 #[tokio::test(start_paused = true)]
 async fn queued_short_messages_count_from_their_arrival() {
     let mut e = single(CAPABLE);
     let metrics = private_concurrency_metrics(&mut e);
-    // Arrivals 0, 50 and 100 ms: inside one no-RTT window (125 ms).
-    for id in 1..=3u32 {
-        if id > 1 {
-            tokio::time::advance(Duration::from_millis(50)).await;
-        }
+    e.deliver(1, short(b"q"), vec![]).await;
+    assert!(e.pump(Duration::from_millis(1)).await.is_some());
+    for id in 2..=3u32 {
+        tokio::time::advance(Duration::from_millis(50)).await;
         e.deliver(id, short(b"q"), vec![]).await;
     }
-    // The task takes them one at a time, a second apart.
-    for _ in 0..3 {
-        assert!(e.pump(Duration::from_millis(1)).await.is_some());
+    for _ in 0..2 {
         tokio::time::advance(Duration::from_secs(1)).await;
+        assert!(e.pump(Duration::from_millis(1)).await.is_some());
     }
     assert_eq!(e.conn.telemetry_test_counts.inbound_concurrency_samples, 3);
     assert_eq!(
@@ -3168,4 +3169,23 @@ async fn queued_short_messages_count_from_their_arrival() {
         3,
         "the three arrived within one window"
     );
+}
+
+/// Packets still queued for the connection count: five short messages
+/// queued while the task is busy, and the first one taken already counts
+/// all five (itself plus four waiting).
+#[tokio::test(start_paused = true)]
+async fn queued_packets_count_toward_the_estimate() {
+    let mut e = single(CAPABLE);
+    let metrics = private_concurrency_metrics(&mut e);
+    for id in 1..=5u32 {
+        e.deliver(id, short(b"w"), vec![]).await;
+    }
+    assert!(e.pump(Duration::from_millis(1)).await.is_some());
+    assert_eq!(e.conn.telemetry_test_counts.inbound_concurrency_samples, 1);
+    assert_eq!(
+        e.conn.telemetry_test_counts.inbound_concurrency_max, 5,
+        "one short message plus four queued packets"
+    );
+    assert_eq!(metrics.read_snapshot().inbound_concurrency_max, 5);
 }

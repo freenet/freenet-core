@@ -2607,15 +2607,24 @@ pub struct TransportSnapshot {
     /// (`inbound_concurrency_max`). Sent in the uploaded JSON only when
     /// non-zero.
     ///
-    /// What it can decide: it is an upper bound on the demand of ordinary
-    /// UDP traffic, so `ge_T / conns_sampled` can justify LOWERING
-    /// `quic::config::MAX_UNI_STREAMS` to T, never raising it. It says
-    /// nothing about the memory a peer opening streams on purpose can
-    /// hold; bounding that is the per-path ceiling's job.
+    /// What it can decide: it is an estimate built to err high (it also
+    /// counts packets still queued for the connection), not a strict upper
+    /// bound; `peer_connection::inbound_concurrency` lists the known
+    /// undercounts (a sample skipped at a period boundary, arrivals older
+    /// than its 2 s horizon, at most 1024 remembered short messages,
+    /// streams the per-connection budget refused). So `ge_T /
+    /// conns_sampled` can support LOWERING `quic::config::MAX_UNI_STREAMS`
+    /// to T, never raising it; a limit that is too low costs only sender
+    /// back-pressure, and QUIC shadow mode (e5a) is expected to confirm
+    /// the value on real QUIC before any default changes. It says nothing
+    /// about the memory a peer opening streams on purpose can hold;
+    /// bounding that is the per-path ceiling's job.
     /// `inbound_concurrency_max` is diagnostic only: one peer can drive it
-    /// to the cap with a burst or an inflated RTT. The open-stream term
-    /// stops at the per-connection budget (1024 streams), so a connection
-    /// whose streams the budget refused is understated.
+    /// to the cap with a burst or an inflated RTT. `conns_sampled` counts
+    /// only connections that received a short message or had a stream
+    /// admitted in the window, not every open connection. Packets a gateway
+    /// handshake buffered share one arrival stamp, which raises the
+    /// estimate for a new gateway connection.
     pub inbound_concurrency_conns_sampled: u32,
     pub inbound_concurrency_conns_ge_8: u32,
     pub inbound_concurrency_conns_ge_16: u32,
@@ -4401,6 +4410,9 @@ mod tests {
         let mut attempts = 0;
         while periods < PERIODS && attempts < MAX_ATTEMPTS && failure.is_none() {
             attempts += 1;
+            // Four spinning samplers must not starve this loop on a small
+            // runner.
+            std::thread::yield_now();
             if let Some(snap) = metrics.take_snapshot() {
                 periods += 1;
                 failure = check(&snap).err();
@@ -4426,6 +4438,9 @@ mod tests {
     /// any two thresholds or fields changes one of these values.
     #[test]
     fn inbound_concurrency_thresholds_map_to_their_fields() {
+        // The tests below iterate the list, so a changed list would pass
+        // them; pin its value here.
+        assert_eq!(INBOUND_CONCURRENCY_THRESHOLDS, [8, 16, 32, 64, 128, 256]);
         let metrics = TransportMetrics::new();
         for peak in INBOUND_CONCURRENCY_THRESHOLDS {
             metrics.record_inbound_concurrency(&mut InboundConcurrencyPeak::default(), peak);

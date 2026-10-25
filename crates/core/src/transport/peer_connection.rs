@@ -104,6 +104,13 @@ const SIMULATION_RESEND_YIELD_DELAY: Duration = Duration::from_millis(10);
 /// Telemetry uses `queued_nanos` as the packet's arrival time, so packets
 /// that wait in the channel while the connection task is busy still count
 /// as arriving together (see `inbound_concurrency`).
+///
+/// Stamped at two sites: `try_send_established` in the listener, and
+/// `forward_handshake_buffered` for packets a gateway handshake buffered.
+/// Stamps on one connection's channel never decrease (one producer at a
+/// time, the forwarded packets first); `inbound_concurrency` keeps its
+/// arrival times sorted on that basis and counts its window by binary
+/// search.
 pub(crate) struct InboundPacket {
     pub(crate) packet: PacketData<UnknownEncryption>,
     pub(crate) queued_nanos: u64,
@@ -2611,13 +2618,19 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
     fn sample_inbound_concurrency(&mut self, short: bool, queued_nanos: u64) {
         let now_nanos = queued_nanos;
         let srtt = self.remote_conn.rolling_rtt_stats.srtt();
-        let open_streams = self.inbound_budget.stream_count();
+        // Packets still waiting in the channel would hold their QUIC slots
+        // unread. The count also includes ACK-only packets and fragments of
+        // streams already counted, so it errs high.
+        let outstanding = self
+            .inbound_budget
+            .stream_count()
+            .saturating_add(self.remote_conn.inbound_packet_recv.len());
         let estimate = if short {
             self.inbound_concurrency
-                .on_short_message(now_nanos, srtt, open_streams)
+                .on_short_message(now_nanos, srtt, outstanding)
         } else {
             self.inbound_concurrency
-                .on_stream_admitted(now_nanos, srtt, open_streams)
+                .on_stream_admitted(now_nanos, srtt, outstanding)
         };
         self.inbound_concurrency_metrics
             .record_inbound_concurrency(&mut self.inbound_concurrency_peak, estimate);
