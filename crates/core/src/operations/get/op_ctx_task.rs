@@ -9747,14 +9747,15 @@ mod route_attempt_driver_tests {
         );
 
         let conn_manager = crate::operations::test_utils::MockNetworkBridge::new();
+        let incoming_tx = tx_without_bloom_false_positive(&op_manager, addr(&upstream));
         let result = drive_relay_get_inner(
             &op_manager,
             &conn_manager,
-            Transaction::new::<GetMsg>(),
+            incoming_tx,
             instance_id,
             3,
             addr(&upstream),
-            VisitedPeers::new(&Transaction::new::<GetMsg>()),
+            VisitedPeers::new(&incoming_tx),
             false,
             false,
         )
@@ -10789,16 +10790,52 @@ mod route_attempt_driver_tests {
         (op_manager, rx, store, upstream, greedy, host, guards)
     }
 
+    /// A GET transaction whose visited bloom, after the relay marks its own
+    /// address and `upstream_addr`, reports no other ring connection as
+    /// visited. The bloom's hash keys come from the transaction id, so with a
+    /// random id roughly 1 in 20,000 draws makes `probably_visited` a false
+    /// positive for a candidate the test expects the relay to pick; the relay
+    /// then routes elsewhere and the test's scripted replies never run
+    /// (CI run 40224533131). The relay's selection is otherwise deterministic,
+    /// so the test must not leave the draw to chance.
+    fn tx_without_bloom_false_positive(
+        op_manager: &OpManager,
+        upstream_addr: SocketAddr,
+    ) -> Transaction {
+        let own = op_manager.ring.connection_manager.get_own_addr();
+        let candidates: Vec<SocketAddr> = op_manager
+            .ring
+            .connection_manager
+            .get_connections_by_location()
+            .values()
+            .flatten()
+            .filter_map(|conn| conn.location.socket_addr())
+            .filter(|a| *a != upstream_addr && Some(*a) != own)
+            .collect();
+        loop {
+            let tx = Transaction::new::<GetMsg>();
+            let mut visited = VisitedPeers::new(&tx);
+            if let Some(own) = own {
+                visited.mark_visited(own);
+            }
+            visited.mark_visited(upstream_addr);
+            if !candidates.iter().any(|a| visited.probably_visited(*a)) {
+                return tx;
+            }
+        }
+    }
+
     async fn run_relay(op_manager: &Arc<OpManager>, upstream: &PeerKeyLocation) {
         let conn_manager = crate::operations::test_utils::MockNetworkBridge::new();
+        let incoming_tx = tx_without_bloom_false_positive(op_manager, addr(upstream));
         let result = drive_relay_get_inner(
             op_manager,
             &conn_manager,
-            Transaction::new::<GetMsg>(),
+            incoming_tx,
             ContractInstanceId::new([53u8; 32]),
             3,
             addr(upstream),
-            VisitedPeers::new(&Transaction::new::<GetMsg>()),
+            VisitedPeers::new(&incoming_tx),
             false,
             false,
         )
@@ -11291,7 +11328,7 @@ mod route_attempt_driver_tests {
                 .into_iter()
                 .next()
                 .unwrap();
-            let tx = Transaction::new::<GetMsg>();
+            let tx = tx_without_bloom_false_positive(&op_manager, own);
             let exclusions = if exclude { vec![addr(&best)] } else { vec![] };
             let _slot = op_manager
                 .attempt_hop_registry()
@@ -11393,7 +11430,7 @@ mod route_attempt_driver_tests {
                         .try_register_transient(addr(&second), None)
                 ),
             }
-            let tx = Transaction::new::<GetMsg>();
+            let tx = tx_without_bloom_false_positive(&op_manager, own);
             let _slot = op_manager.attempt_hop_registry().register_excluding(
                 tx,
                 Vec::new(),
