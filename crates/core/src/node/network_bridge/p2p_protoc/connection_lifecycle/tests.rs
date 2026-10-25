@@ -724,3 +724,33 @@ async fn expected_inbound_connect_peer_then_requests_counts_one_first_identity()
         ]
     );
 }
+
+/// A connection that did not come from an expected-inbound registration is
+/// not a placeholder, even when its first claim names this node's own key:
+/// that counts `own_key`, and a later claim of another key is a change.
+#[tokio::test]
+async fn own_key_claim_on_an_unexpected_connection_is_not_a_placeholder() {
+    let mut h = Harness::new("conn-identity-own-key-not-placeholder").await;
+    let remote: SocketAddr = "203.0.113.140:5401".parse().unwrap();
+    let placeholder: SocketAddr = "203.0.113.141:5402".parse().unwrap();
+    watch(&[remote]);
+
+    // A real placeholder holds this node's key in the map first.
+    h.accept_expected(placeholder).await;
+    h.accept(remote).await;
+    let own = h.own_key();
+    h.connect_request(remote, PeerKeyLocation::with_unknown_addr(own))
+        .await;
+    h.connect_request(remote, PeerKeyLocation::with_unknown_addr(key()))
+        .await;
+
+    assert_eq!(
+        seen(remote),
+        vec![
+            ConnIdentity::SetConnectRequest,
+            ConnIdentity::OwnKey,
+            ConnIdentity::DuplicateKey,
+            ConnIdentity::ChangedConnectRequest,
+        ]
+    );
+}

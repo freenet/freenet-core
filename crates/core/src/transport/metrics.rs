@@ -81,7 +81,10 @@ labelled_counters! {
     /// addition to the kind of the decision they qualify.
     ///
     /// The event loop registers an expected inbound connection under this
-    /// node's own key until the connect op names the peer. Such a
+    /// node's own key until the connect op names the peer (the placeholder,
+    /// tracked per connection from the registration, not inferred from the
+    /// key: any other connection recorded under this node's key is counted
+    /// like any other key, as well as `own_key`). Such a
     /// connection counts `own_key` when recorded,
     /// `connect_peer_on_placeholder` for each ConnectPeer while it still
     /// holds that key (ConnectPeer does not replace it), one
@@ -142,10 +145,12 @@ labelled_counters! {
         SetFromPlaceholderOther => "set_from_placeholder_other",
         /// A ConnectRequest replaced the placeholder before any ConnectPeer
         /// named a peer for the connection, so there was no expected key to
-        /// compare the claim with.
+        /// compare the claim with. This includes a ConnectPeer refused at
+        /// the ring's connection cap, which returns before naming the peer.
         SetFromPlaceholderUnchecked => "set_from_placeholder_unchecked",
         /// A ConnectPeer named a peer for a connection still recorded under
-        /// the placeholder. The connection keeps the placeholder.
+        /// the placeholder. The connection keeps the placeholder. Counted
+        /// whether or not the ring took the connection.
         ConnectPeerOnPlaceholder => "connect_peer_on_placeholder",
         /// Cleanup, on the same paths, ran for a connection whose key, other
         /// than this node's own, is not mapped to any connection (for
@@ -3920,6 +3925,26 @@ mod tests {
                 .unwrap_or_else(|| panic!("{kind:?} alone must be activity"));
             assert_eq!(conn_identity_count(&snap, kind), 1, "{kind:?}");
         }
+    }
+
+    /// Every `conn_identity_*` snapshot field is a `ConnIdentity` label, so
+    /// `upload_json`, which rebuilds those keys from the labels, cannot drop
+    /// a field added without one.
+    #[test]
+    fn every_conn_identity_field_has_a_label() {
+        let json = serde_json::to_value(TransportSnapshot::default()).unwrap();
+        let fields: std::collections::BTreeSet<String> = json
+            .as_object()
+            .unwrap()
+            .keys()
+            .filter(|key| key.starts_with("conn_identity_"))
+            .cloned()
+            .collect();
+        let labels: std::collections::BTreeSet<String> = ConnIdentity::ALL
+            .into_iter()
+            .map(|kind| format!("conn_identity_{}", kind.label()))
+            .collect();
+        assert_eq!(fields, labels);
     }
 
     /// The test record holds only watched remotes, in order.
