@@ -76,12 +76,17 @@ struct Harness {
     mgr: P2pConnManager,
     state: EventListenerState,
     handshake: HandshakeCommandSender,
-    _handshake_rx: mpsc::Receiver<HandshakeCommand>,
+    handshake_rx: mpsc::Receiver<HandshakeCommand>,
     _conn_events_rx: mpsc::Receiver<ConnEvent>,
 }
 
 impl Harness {
     async fn new(id: &str) -> Self {
+        Self::with_config(id, |_| {}).await
+    }
+
+    /// As [`Self::new`], with `adjust` applied to the node config first.
+    async fn with_config(id: &str, adjust: impl FnOnce(&mut crate::node::NodeConfig)) -> Self {
         let config_args = crate::config::ConfigArgs {
             id: Some(id.to_string()),
             mode: Some(crate::contract::OperationMode::Local),
@@ -94,6 +99,7 @@ impl Harness {
         // A gateway needs no configured remote gateway to build, and accepts
         // unidentified inbound connections, which is the path under test.
         node_config.is_gateway = true;
+        adjust(&mut node_config);
         let (_notification_rx, notification_tx) = crate::node::event_loop_notification_channel();
         let (ops_ch_channel, _ch_channel, _wait_for_event) =
             crate::contract::contract_handler_channel();
@@ -127,7 +133,7 @@ impl Harness {
             mgr,
             state: EventListenerState::new(Arc::new(ExpectedInboundTracker::empty_for_test())),
             handshake: HandshakeCommandSender::for_test(handshake_tx),
-            _handshake_rx: handshake_rx,
+            handshake_rx,
             _conn_events_rx: conn_events_rx,
         }
     }
@@ -241,20 +247,22 @@ impl Harness {
     }
 
     async fn accept_matched(&mut self, addr: SocketAddr, matched: HandshakeInboundMatch) {
+        self.handshake_event(HandshakeEvent::InboundConnection {
+            transaction: None,
+            matched,
+            connection: Box::new(IdleConnection { addr }),
+            transient: false,
+        })
+        .await;
+        assert!(self.mgr.connections.contains_key(&addr), "connection kept");
+    }
+
+    /// A handshake event, handled by the event loop's handler.
+    async fn handshake_event(&mut self, event: HandshakeEvent) {
         self.mgr
-            .handle_handshake_action(
-                HandshakeEvent::InboundConnection {
-                    transaction: None,
-                    matched,
-                    connection: Box::new(IdleConnection { addr }),
-                    transient: false,
-                },
-                &mut self.state,
-                &self.handshake,
-            )
+            .handle_handshake_action(event, &mut self.state, &self.handshake)
             .await
             .expect("handle_handshake_action");
-        assert!(self.mgr.connections.contains_key(&addr), "connection kept");
     }
 
     /// Nothing this node holds is keyed by its own key: not the
@@ -827,18 +835,22 @@ fn h_count(h: &Harness) -> usize {
         .connection_count()
 }
 
-/// An open expected-inbound connection holds no key, so it does not make a
-/// later claim of this node's own key on another connection a duplicate:
-/// that claim counts `own_key` alone, and a later claim of another key is a
-/// change.
+/// Expected-inbound connections, bound to a dialled key or not, put
+/// nothing under this node's key into the key-to-address map, so they do not
+/// make a later claim of this node's own key on another connection a
+/// duplicate: that claim counts `own_key` alone, and a later claim of another
+/// key is a change.
 #[tokio::test]
-async fn own_key_claim_beside_an_expected_inbound_connection_is_not_a_duplicate() {
+async fn own_key_claim_beside_expected_inbound_connections_is_not_a_duplicate() {
     let mut h = Harness::new("conn-identity-own-key-beside-expected").await;
     let remote: SocketAddr = "203.0.113.140:5401".parse().unwrap();
-    let expected: SocketAddr = "203.0.113.141:5402".parse().unwrap();
+    let keyed: SocketAddr = "203.0.113.141:5402".parse().unwrap();
+    let unkeyed: SocketAddr = "203.0.113.142:5403".parse().unwrap();
     watch(&[remote]);
 
-    h.accept_expected(expected, &key()).await;
+    h.accept_expected(keyed, &key()).await;
+    h.accept_expected_unkeyed(unkeyed).await;
+    h.assert_own_key_absent();
     h.accept(remote).await;
     let own = h.own_key();
     h.connect_request(remote, PeerKeyLocation::with_unknown_addr(own))
@@ -854,6 +866,106 @@ async fn own_key_claim_beside_an_expected_inbound_connection_is_not_a_duplicate(
             ConnIdentity::ChangedConnectRequest,
         ]
     );
+}
+
+/// A ConnectPeer for the peer, as the event loop handles it, with no
+/// connection at the address yet: it waits for the dial. Returns the
+/// callback's receiver.
+async fn pending_connect_peer(
+    h: &mut Harness,
+    peer: PeerKeyLocation,
+) -> mpsc::Receiver<Result<(SocketAddr, Option<usize>), ()>> {
+    let (callback, result_rx) = mpsc::channel(1);
+    let handshake = h.handshake.clone();
+    h.mgr
+        .handle_connect_peer(
+            peer,
+            Box::new(callback),
+            Transaction::new::<ConnectMsg>(),
+            &handshake,
+            &mut h.state,
+            false,
+            crate::transport::NatAttemptOrigin::ConnectAcceptor,
+        )
+        .await
+        .expect("handle_connect_peer");
+    result_rx
+}
+
+/// A ConnectPeer whose dial is still pending is answered `Ok` by the matched
+/// inbound connection from its address, as by the dial: the connection is
+/// the one it asked for, under its key.
+#[tokio::test]
+async fn pending_connect_peer_is_answered_by_the_matched_inbound_connection() {
+    let mut h = Harness::new("conn-identity-expected-answers-pending").await;
+    let remote: SocketAddr = "203.0.113.160:5601".parse().unwrap();
+    watch(&[remote]);
+    let peer = key();
+
+    let mut result = pending_connect_peer(&mut h, PeerKeyLocation::new(peer.clone(), remote)).await;
+    assert!(result.try_recv().is_err(), "premise: the dial is pending");
+    h.accept_expected(remote, &peer).await;
+
+    assert_eq!(result.try_recv(), Ok(Ok((remote, None))));
+    assert!(
+        !h.state.awaiting_connection.contains_key(&remote),
+        "the pending ConnectPeer is cleared"
+    );
+    assert_eq!(h.ring_key_at(remote).as_ref(), Some(&peer));
+    assert_eq!(seen(remote), vec![ConnIdentity::ExpectedInboundBound]);
+}
+
+/// At the ring's connection cap a matched inbound connection is refused as a
+/// successful dial would be: a pending ConnectPeer gets the same answer, and
+/// the connection is dropped with nothing left under its key in the
+/// connection map, the key-to-address map or the ring.
+#[tokio::test]
+async fn matched_inbound_at_the_cap_is_refused_like_a_dial() {
+    let mut h = Harness::with_config("conn-identity-expected-at-cap", |config| {
+        config.min_number_conn = Some(1);
+        config.max_number_conn = Some(2);
+    })
+    .await;
+    for port in [5701, 5702] {
+        let addr: SocketAddr = format!("203.0.113.170:{port}").parse().unwrap();
+        h.dial(addr, &key()).await;
+    }
+    assert_eq!(h_count(&h), 2, "premise: at the cap");
+
+    let mut answers = Vec::new();
+    for (port, matched) in [(5703, true), (5704, false)] {
+        let addr: SocketAddr = format!("203.0.113.171:{port}").parse().unwrap();
+        let peer = key();
+        let mut result =
+            pending_connect_peer(&mut h, PeerKeyLocation::new(peer.clone(), addr)).await;
+        let connection = Box::new(IdleConnection { addr });
+        h.handshake_event(if matched {
+            HandshakeEvent::InboundConnection {
+                transaction: None,
+                matched: HandshakeInboundMatch::Expected(Some(peer.clone())),
+                connection,
+                transient: false,
+            }
+        } else {
+            HandshakeEvent::OutboundEstablished {
+                transaction: Transaction::new::<ConnectMsg>(),
+                peer: PeerKeyLocation::new(peer.clone(), addr),
+                connection,
+                transient: false,
+            }
+        })
+        .await;
+        answers.push(result.try_recv());
+        assert!(!h.mgr.connections.contains_key(&addr), "dropped");
+        assert!(!h.mgr.addr_by_pub_key.contains_key(&peer));
+        assert_eq!(h.ring_key_at(addr), None, "not in the ring");
+        assert_eq!(h_count(&h), 2);
+    }
+    assert_eq!(
+        answers[0], answers[1],
+        "the matched inbound is answered as the dial"
+    );
+    h.assert_own_key_absent();
 }
 
 /// The mock gateway transport's accepted connections, offered to the
@@ -890,6 +1002,10 @@ struct DriverRig {
 
 impl DriverRig {
     async fn new(h: &Harness) -> Self {
+        Self::with_clock(h, Arc::new(crate::util::time_source::InstantTimeSrc::new())).await
+    }
+
+    async fn with_clock(h: &Harness, clock: crate::util::time_source::DynTimeSource) -> Self {
         use crate::transport::mock_transport::{
             PacketDropPolicy, create_mock_gateway, create_mock_peer,
         };
@@ -910,6 +1026,7 @@ impl DriverRig {
             None,
             true,
             None,
+            clock,
         );
         Self {
             driver,
@@ -1091,6 +1208,10 @@ async fn expected_inbound_after_a_failed_dial_is_promoted_under_the_dialled_key(
         "the ConnectPeer callback reports the failed dial"
     );
     assert!(!h.mgr.connections.contains_key(&peer_addr));
+    assert!(
+        failed_addrs(&h).contains(&peer_addr),
+        "premise: the failed dial is recorded for CONNECT routing"
+    );
 
     // The peer comes back and dials us; the expectation still holds.
     rig.channels.insert(peer_addr, peer_socket);
@@ -1108,8 +1229,74 @@ async fn expected_inbound_after_a_failed_dial_is_promoted_under_the_dialled_key(
         Some(&rig.peer_key),
         "linked in the ring under the dialled key"
     );
+    assert!(
+        !failed_addrs(&h).contains(&peer_addr),
+        "a connected peer is no longer avoided, as after a successful dial"
+    );
     assert_eq!(h_count(&h), 1);
     h.assert_own_key_absent();
+}
+
+fn failed_addrs(h: &Harness) -> Vec<SocketAddr> {
+    h.mgr
+        .bridge
+        .op_manager
+        .ring
+        .connection_manager
+        .recently_failed_addrs()
+}
+
+/// A handshake from the expected address that arrives after
+/// `EXPECTED_INBOUND_WINDOW` is not the connection the connect op asked for
+/// (the address may since be someone else's): it is matched, counted as
+/// `expected_inbound_unbound`, starts without a key and is not promoted.
+#[tokio::test]
+async fn expected_inbound_after_the_window_is_not_bound_to_the_key() {
+    let mut h = Harness::new("conn-identity-expected-window").await;
+    let clock = crate::util::time_source::SharedMockTimeSource::new();
+    let mut rig = DriverRig::with_clock(&h, Arc::new(clock.clone())).await;
+    watch(&[rig.peer_addr]);
+    let peer_addr = rig.peer_addr;
+
+    rig.expect_peer(&h).await;
+    clock.advance_time(
+        crate::node::network_bridge::handshake::EXPECTED_INBOUND_WINDOW + Duration::from_secs(1),
+    );
+    let dial = rig.peer_dials();
+    assert_eq!(rig.handle_next_event(&mut h).await, "inbound");
+    assert!(dial.await.expect("dial task"), "the peer's dial completes");
+
+    assert_eq!(seen(peer_addr), vec![ConnIdentity::ExpectedInboundUnbound]);
+    assert_eq!(h.mgr.connections[&peer_addr].pub_key, None);
+    assert!(!h.mgr.addr_by_pub_key.contains_key(&rig.peer_key));
+    assert_eq!(h.ring_key_at(peer_addr), None, "not promoted");
+    h.assert_own_key_absent();
+}
+
+/// A successful dial to an address drops that address's expectation, so a
+/// later inbound connection from it is not bound to the dialled key.
+#[tokio::test]
+async fn successful_dial_drops_the_expectation_for_its_address() {
+    let mut h = Harness::new("conn-identity-dial-drops-expectation").await;
+    let addr: SocketAddr = "203.0.113.180:5801".parse().unwrap();
+    while h.handshake_rx.try_recv().is_ok() {}
+    h.handshake_event(HandshakeEvent::OutboundEstablished {
+        transaction: Transaction::new::<ConnectMsg>(),
+        peer: PeerKeyLocation::new(key(), addr),
+        connection: Box::new(IdleConnection { addr }),
+        transient: false,
+    })
+    .await;
+    let mut dropped = false;
+    while let Ok(command) = h.handshake_rx.try_recv() {
+        if matches!(command, HandshakeCommand::DropConnection { addr: a } if a == addr) {
+            dropped = true;
+        }
+    }
+    assert!(
+        dropped,
+        "the driver is told to drop the expectation for {addr}"
+    );
 }
 
 /// A contract hosting entry for `peer`, as a neighbour's announcement

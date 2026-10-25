@@ -905,7 +905,7 @@ enum CollectionEnd {
 /// How long a CONNECT that has stopped collecting keeps finishing the dials
 /// of acceptors it already took: ten hole-punch deadlines, room for the
 /// queued acceptors of a peer that dials one at a time.
-const DIAL_DRAIN_LIMIT: std::time::Duration = std::time::Duration::from_secs(
+pub(crate) const DIAL_DRAIN_LIMIT: std::time::Duration = std::time::Duration::from_secs(
     10 * crate::transport::connection_handler::NAT_TRAVERSAL_DEADLINE.as_secs(),
 );
 

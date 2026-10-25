@@ -23,6 +23,7 @@ use crate::router::Router;
 use std::collections::HashMap;
 
 use crate::transport::{InboundAcceptor, OutboundConnector, PeerConnectionApi, TransportPublicKey};
+use crate::util::time_source::{DynTimeSource, TimeSource};
 
 /// Events emitted by the handshake driver.
 ///
@@ -180,12 +181,13 @@ impl HandshakeHandler {
         _this_location: Option<Location>,
         _is_gateway: bool,
         peer_ready: Option<Arc<std::sync::atomic::AtomicBool>>,
+        clock: DynTimeSource,
     ) -> (Self, CommandSender) {
         let (cmd_tx, cmd_rx) = mpsc::channel(128);
         let (event_tx, event_rx) = mpsc::channel(128);
 
         GlobalExecutor::spawn(async move {
-            run_driver(inbound, outbound, cmd_rx, event_tx, peer_ready).await;
+            run_driver(inbound, outbound, cmd_rx, event_tx, peer_ready, clock).await;
         });
 
         (
@@ -205,9 +207,22 @@ impl Stream for HandshakeHandler {
     }
 }
 
+/// How long after its registration an expected-inbound registration's key
+/// is honoured. The connect op that registers it dials the peer at the same
+/// time, and the peer, also dialling, keeps finishing its acceptor dials for
+/// up to `DIAL_DRAIN_LIMIT` after it stops collecting, each of which may take
+/// up to `OUTBOUND_CONNECT_TIMEOUT`. A connection from that address after
+/// this window is not the one the connect op asked for (the address may since
+/// belong to someone else), so it is not bound to the registration's key.
+pub(crate) const EXPECTED_INBOUND_WINDOW: Duration =
+    crate::operations::connect::op_ctx_task::DIAL_DRAIN_LIMIT
+        .saturating_add(OUTBOUND_CONNECT_TIMEOUT);
+
 #[derive(Debug)]
 struct ExpectedInbound {
     peer_key: Option<TransportPublicKey>,
+    /// When it was registered, for [`EXPECTED_INBOUND_WINDOW`].
+    registered_at: tokio::time::Instant,
     transaction: Option<Transaction>,
     transient: bool, // TODO: rename to transient in protocol once we migrate terminology
 }
@@ -215,12 +230,42 @@ struct ExpectedInbound {
 /// Matches accepted connections to the connect operations that expect them,
 /// by socket address. Node-side bookkeeping, distinct from the transport's
 /// expected-IP set (`InboundExpectations`).
-#[derive(Default)]
+///
+/// Bounded by time: a registration older than [`EXPECTED_INBOUND_WINDOW`]
+/// is swept on the next registration or match, and a match against one that
+/// has expired but not yet been swept is reported without its key. The map
+/// therefore holds at most the registrations of the last window, plus
+/// entries that wait for the next registration or match to be swept.
 struct InboundMatcher {
     entries: HashMap<SocketAddr, ExpectedInbound>,
+    clock: DynTimeSource,
 }
 
 impl InboundMatcher {
+    fn new(clock: DynTimeSource) -> Self {
+        Self {
+            entries: HashMap::new(),
+            clock,
+        }
+    }
+
+    fn expired(&self, entry: &ExpectedInbound, now: tokio::time::Instant) -> bool {
+        now.saturating_duration_since(entry.registered_at) > EXPECTED_INBOUND_WINDOW
+    }
+
+    /// Remove every registration older than the window.
+    fn sweep(&mut self) {
+        let now = self.clock.now();
+        let before = self.entries.len();
+        self.entries.retain(|_, entry| {
+            now.saturating_duration_since(entry.registered_at) <= EXPECTED_INBOUND_WINDOW
+        });
+        let swept = before - self.entries.len();
+        if swept > 0 {
+            tracing::debug!(swept, "ExpectInbound: swept expired expectations");
+        }
+    }
+
     fn register(
         &mut self,
         addr: SocketAddr,
@@ -228,6 +273,7 @@ impl InboundMatcher {
         transaction: Option<Transaction>,
         transient: bool,
     ) {
+        self.sweep();
         tracing::debug!(
             remote = %addr,
             transient,
@@ -239,6 +285,7 @@ impl InboundMatcher {
             addr,
             ExpectedInbound {
                 peer_key,
+                registered_at: self.clock.now(),
                 transaction,
                 transient,
             },
@@ -249,8 +296,21 @@ impl InboundMatcher {
         self.entries.remove(&addr);
     }
 
+    /// Take the registration for `addr`. One older than the window is
+    /// returned without its key: the connection is not the one it asked for.
     fn consume(&mut self, addr: SocketAddr) -> Option<ExpectedInbound> {
-        let entry = self.entries.remove(&addr);
+        let mut entry = self.entries.remove(&addr);
+        let now = self.clock.now();
+        if let Some(found) = entry.as_mut() {
+            if found.peer_key.is_some() && self.expired(found, now) {
+                tracing::debug!(
+                    remote = %addr,
+                    "ExpectInbound: expectation outlived its window; not binding its key"
+                );
+                found.peer_key = None;
+            }
+        }
+        self.sweep();
         if let Some(entry) = &entry {
             tracing::debug!(
                 remote = %addr,
@@ -279,10 +339,11 @@ async fn run_driver(
     mut commands_rx: mpsc::Receiver<Command>,
     events_tx: mpsc::Sender<Event>,
     peer_ready: Option<Arc<std::sync::atomic::AtomicBool>>,
+    clock: DynTimeSource,
 ) {
     use tokio::select;
 
-    let mut expected_inbound = InboundMatcher::default();
+    let mut expected_inbound = InboundMatcher::new(clock);
 
     loop {
         select! {
@@ -487,6 +548,10 @@ mod tests {
     use crate::transport::{TransportError, TransportKeypair};
     use std::net::{IpAddr, Ipv4Addr};
 
+    fn matcher() -> InboundMatcher {
+        InboundMatcher::new(Arc::new(crate::util::time_source::InstantTimeSrc::new()))
+    }
+
     fn make_peer(port: u16) -> PeerKeyLocation {
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
         let keypair = TransportKeypair::new();
@@ -580,6 +645,7 @@ mod tests {
             cmd_rx,
             event_tx,
             None,
+            Arc::new(crate::util::time_source::InstantTimeSrc::new()),
         ));
         cmd_tx
             .send(Command::Connect {
@@ -621,6 +687,7 @@ mod tests {
             cmd_rx,
             event_tx,
             Some(ready.clone()),
+            Arc::new(crate::util::time_source::InstantTimeSrc::new()),
         ));
 
         let expected_addr: SocketAddr = "127.0.0.1:4300".parse().unwrap();
@@ -874,7 +941,7 @@ mod tests {
 
     #[test]
     fn tracker_returns_registered_entry_exactly_once() {
-        let mut tracker = InboundMatcher::default();
+        let mut tracker = matcher();
         let addr = make_peer(4100).socket_addr().unwrap();
         let tx = Transaction::new::<ConnectMsg>();
         tracker.register(addr, None, Some(tx), true);
@@ -887,9 +954,64 @@ mod tests {
         assert!(tracker.consume(addr).is_none());
     }
 
+    fn key() -> TransportPublicKey {
+        TransportKeypair::new().public().clone()
+    }
+
+    /// Inside the window a match carries the registration's key; at the
+    /// window's end it still does.
+    #[test]
+    fn a_match_inside_the_window_carries_the_key() {
+        let clock = crate::util::time_source::SharedMockTimeSource::new();
+        let mut tracker = InboundMatcher::new(Arc::new(clock.clone()));
+        let addr = make_peer(4110).socket_addr().unwrap();
+        let peer_key = key();
+        tracker.register(addr, Some(peer_key.clone()), None, false);
+        clock.advance_time(EXPECTED_INBOUND_WINDOW);
+        let entry = tracker.consume(addr).expect("registered");
+        assert_eq!(entry.peer_key, Some(peer_key));
+    }
+
+    /// A match against a registration that has outlived the window is still
+    /// a match, but without the key: the address may now be someone else's.
+    #[test]
+    fn a_match_after_the_window_carries_no_key() {
+        let clock = crate::util::time_source::SharedMockTimeSource::new();
+        let mut tracker = InboundMatcher::new(Arc::new(clock.clone()));
+        let addr = make_peer(4120).socket_addr().unwrap();
+        tracker.register(addr, Some(key()), None, false);
+        clock.advance_time(EXPECTED_INBOUND_WINDOW + Duration::from_millis(1));
+        let entry = tracker.consume(addr).expect("still matched");
+        assert_eq!(entry.peer_key, None);
+        assert!(tracker.consume(addr).is_none(), "consumed once");
+    }
+
+    /// Expired registrations are swept on the next registration and on the
+    /// next match, so the map does not keep them.
+    #[test]
+    fn expired_registrations_are_swept() {
+        let clock = crate::util::time_source::SharedMockTimeSource::new();
+        let mut tracker = InboundMatcher::new(Arc::new(clock.clone()));
+        let (old, recent, other) = (
+            make_peer(4130).socket_addr().unwrap(),
+            make_peer(4131).socket_addr().unwrap(),
+            make_peer(4132).socket_addr().unwrap(),
+        );
+        tracker.register(old, Some(key()), None, false);
+        clock.advance_time(EXPECTED_INBOUND_WINDOW + Duration::from_millis(1));
+        tracker.register(recent, Some(key()), None, false);
+        assert!(!tracker.contains(old), "swept on registration");
+        assert!(tracker.contains(recent));
+
+        clock.advance_time(EXPECTED_INBOUND_WINDOW + Duration::from_millis(1));
+        assert!(tracker.consume(other).is_none());
+        assert!(!tracker.contains(recent), "swept on a match");
+        assert!(tracker.entries.is_empty());
+    }
+
     #[test]
     fn tracker_drop_removes_entry() {
-        let mut tracker = InboundMatcher::default();
+        let mut tracker = matcher();
         let addr = make_peer(4200).socket_addr().unwrap();
         tracker.register(addr, None, None, false);
         assert!(tracker.contains(addr));
@@ -901,7 +1023,7 @@ mod tests {
 
     #[test]
     fn tracker_overwrites_existing_expectation() {
-        let mut tracker = InboundMatcher::default();
+        let mut tracker = matcher();
         let addr = make_peer(4300).socket_addr().unwrap();
         tracker.register(addr, None, None, false);
         let new_tx = Transaction::new::<ConnectMsg>();
@@ -918,7 +1040,7 @@ mod tests {
 
     #[test]
     fn tracker_keeps_peers_separate_on_same_ip() {
-        let mut tracker = InboundMatcher::default();
+        let mut tracker = matcher();
         let addr_a = make_peer(4400).socket_addr().unwrap();
         let addr_b = make_peer(4401).socket_addr().unwrap();
 

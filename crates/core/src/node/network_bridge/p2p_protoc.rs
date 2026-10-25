@@ -1472,6 +1472,7 @@ impl P2pConnManager {
             this_location,
             is_gateway,
             peer_ready,
+            Arc::new(InstantTimeSrc::new()),
         );
 
         let select_stream = priority_select::ProductionPrioritySelectStream::new(
@@ -2333,13 +2334,10 @@ impl P2pConnManager {
                                         // cleanup: the connection has already been removed from
                                         // ctx.connections / addr_by_pub_key and pruned from the
                                         // ring above. The only residue is the handshake driver's
-                                        // InboundMatcher entry (if any). That tracker is
-                                        // a per-SocketAddr HashMap with no TTL sweep, but the
-                                        // entry is benign and bounded: it is overwritten on the
-                                        // next register() for the same addr and consumed when a
-                                        // matching inbound arrives, so a missed DropConnection
-                                        // leaves at most one stale per-addr expectation, not an
-                                        // unbounded leak.
+                                        // InboundMatcher entry (if any) for the address, which
+                                        // the driver sweeps once it outlives
+                                        // EXPECTED_INBOUND_WINDOW and whose key it does not
+                                        // honour after that.
                                         if !handshake_cmd_sender.try_send(
                                             HandshakeCommand::DropConnection { addr: peer_addr },
                                         ) {

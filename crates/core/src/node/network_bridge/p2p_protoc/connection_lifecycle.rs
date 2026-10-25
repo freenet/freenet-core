@@ -180,8 +180,9 @@ impl P2pConnManager {
         // redundant teardown — we remove the connection from ctx.connections /
         // addr_by_pub_key and prune the ring below regardless. A missed
         // DropConnection leaves at most one stale per-SocketAddr
-        // InboundMatcher entry (no TTL sweep, but overwritten on the
-        // next register() and consumed on a matching inbound — bounded, benign).
+        // InboundMatcher entry for the address, which the driver sweeps once
+        // it outlives EXPECTED_INBOUND_WINDOW and whose key it does not honour
+        // after that.
         if !handshake_cmd_sender.try_send(HandshakeCommand::DropConnection { addr: peer_addr }) {
             tracing::warn!(
                 peer_addr = %peer_addr,
@@ -840,6 +841,13 @@ impl P2pConnManager {
                 // ConnectRequest.
                 let peer = match matched {
                     HandshakeInboundMatch::Expected(Some(peer_key)) => {
+                        // As for a successful dial: CONNECT routing stops
+                        // avoiding an address that is now connected.
+                        self.bridge
+                            .op_manager
+                            .ring
+                            .connection_manager
+                            .clear_failed_addr(remote_addr);
                         Some(PeerKeyLocation::new(peer_key, remote_addr))
                     }
                     HandshakeInboundMatch::Expected(None) => {
@@ -924,6 +932,18 @@ impl P2pConnManager {
                         .ring
                         .connection_manager
                         .clear_failed_addr(peer_addr);
+                }
+                // The dial the expectation for this address waited on has
+                // succeeded, so a later inbound connection from the address is
+                // not that peer's. Non-blocking (#4145); a missed drop leaves
+                // the entry to the driver's window sweep.
+                if !handshake_commands
+                    .try_send(HandshakeCommand::DropConnection { addr: peer_addr })
+                {
+                    tracing::debug!(
+                        remote = %peer_addr,
+                        "Handshake command channel full/closed; expectation left to its window"
+                    );
                 }
 
                 // For outbound connections, respect the transient flag from the handshake.
@@ -1204,9 +1224,10 @@ impl P2pConnManager {
                 // connection is redundant cleanup — we've already pruned the old
                 // peer from the ring above and are about to install the new
                 // connection entry. A missed DropConnection leaves at most one
-                // stale per-SocketAddr InboundMatcher entry (no TTL sweep,
-                // but overwritten on the next register() and consumed on a
-                // matching inbound — bounded, benign).
+                // stale per-SocketAddr InboundMatcher entry for the address,
+                // which the driver sweeps once it outlives
+                // EXPECTED_INBOUND_WINDOW and whose key it does not honour
+                // after that.
                 if !handshake_commands
                     .try_send(HandshakeCommand::DropConnection { addr: peer_addr })
                 {
@@ -1774,9 +1795,9 @@ impl P2pConnManager {
                     // The DropConnection is redundant teardown — the connection is
                     // already removed from ctx.connections and pruned from the ring
                     // above. A missed DropConnection leaves at most one stale
-                    // per-SocketAddr InboundMatcher entry (no TTL sweep, but
-                    // overwritten on the next register() and consumed on a matching
-                    // inbound — bounded, benign).
+                    // per-SocketAddr InboundMatcher entry for the address, which
+                    // the driver sweeps once it outlives EXPECTED_INBOUND_WINDOW
+                    // and whose key it does not honour after that.
                     if !handshake_commands
                         .try_send(HandshakeCommand::DropConnection { addr: remote_addr })
                     {
