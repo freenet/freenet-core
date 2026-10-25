@@ -526,29 +526,15 @@ impl NetworkBridge for P2pBridge {
 type PeerConnChannelSender = Sender<Either<NetMessage, ConnEvent>>;
 type PeerConnChannelRecv = Receiver<Either<NetMessage, ConnEvent>>;
 
-/// Telemetry state of a connection that holds the expected-inbound
-/// placeholder (see `ConnectionEntry::placeholder`).
-#[derive(Debug, Default)]
-struct IdentityPlaceholder {
-    /// The key the latest ConnectPeer named for the connection, compared
-    /// with the key the ConnectRequest that replaces the placeholder gives
-    /// (`conn_identity_set_from_placeholder_*`).
-    connect_peer_key: Option<TransportPublicKey>,
-}
-
 /// Entry in the connections HashMap, keyed by SocketAddr.
 /// The pub_key is learned from the first message received on this connection.
 #[derive(Debug)]
 struct ConnectionEntry {
     sender: PeerConnChannelSender,
-    /// The peer's public key, learned from the first message.
-    /// None for transient connections before identity is established.
+    /// The peer's public key: the key dialled for an outbound connection.
+    /// `None` for an inbound connection, expected or not, until a
+    /// ConnectPeer or the peer's ConnectRequest names the peer.
     pub_key: Option<TransportPublicKey>,
-    /// Telemetry only, never read for any decision: `Some` while `pub_key`
-    /// is the expected-inbound placeholder (this node's own key, set by the
-    /// registration), `None` on every other connection and once a
-    /// ConnectRequest replaces the placeholder.
-    placeholder: Option<IdentityPlaceholder>,
     /// Unique ID for this connection entry. Used to distinguish stale
     /// TransportClosed events from replaced connections (e.g., after identity change).
     connection_id: u64,
@@ -2291,28 +2277,16 @@ impl P2pConnManager {
                                             "Cleaning up connection due to channel closure"
                                         );
 
-                                        // Clean up ring state - construct PeerKeyLocation with pub_key if available
-                                        let peer = if let Some(pub_key) = pub_key_opt.clone() {
-                                            PeerKeyLocation::new(pub_key, peer_addr)
-                                        } else {
-                                            // Use our own pub_key as placeholder if we don't know the peer's
-                                            PeerKeyLocation::new(
-                                                (*ctx
-                                                    .bridge
-                                                    .op_manager
-                                                    .ring
-                                                    .connection_manager
-                                                    .pub_key)
-                                                    .clone(),
-                                                peer_addr,
-                                            )
-                                        };
+                                        // Clean up ring state
                                         let prune_result = ctx
                                             .bridge
                                             .op_manager
                                             .ring
                                             .prune_connection(
-                                                PeerId::new(peer.pub_key().clone(), peer_addr),
+                                                ctx.teardown_peer_id(
+                                                    peer_addr,
+                                                    pub_key_opt.as_ref(),
+                                                ),
                                                 crate::tracing::DisconnectReason::Explicit(
                                                     "shutdown".into(),
                                                 ),
@@ -2366,10 +2340,10 @@ impl P2pConnManager {
                                         // leaves at most one stale per-addr expectation, not an
                                         // unbounded leak.
                                         if !handshake_cmd_sender.try_send(
-                                            HandshakeCommand::DropConnection { peer: peer.clone() },
+                                            HandshakeCommand::DropConnection { addr: peer_addr },
                                         ) {
                                             tracing::warn!(
-                                                peer = %peer,
+                                                peer_addr = %peer_addr,
                                                 phase = "cleanup",
                                                 "Handshake command channel full/closed during \
                                                  cleanup; skipping redundant drop notification"
@@ -2530,46 +2504,11 @@ impl P2pConnManager {
                                 .await?;
                             }
                             NodeEvent::ExpectPeerConnection { addr } => {
-                                tracing::debug!(
-                                    peer_addr = %addr,
-                                    direction = "inbound",
-                                    phase = "connect",
-                                    "Expecting peer connection - registering with handshake handler"
-                                );
-                                state.expected_inbound.expect_incoming(addr);
-                                // We don't know the peer's public key yet for expected inbound connections,
-                                // so use our own pub_key as a placeholder. The handshake will update it.
-                                let peer_placeholder = PeerKeyLocation::new(
-                                    (*ctx.bridge.op_manager.ring.connection_manager.pub_key)
-                                        .clone(),
+                                P2pConnManager::handle_expect_peer_connection(
                                     addr,
+                                    &state,
+                                    &handshake_cmd_sender,
                                 );
-                                // Non-blocking (#4145): this ExpectPeerConnection
-                                // handler runs on the event-loop task, so a
-                                // `.send().await` that back-pressures on the
-                                // handshake command channel (cap 128) would stall the
-                                // loop. Dropping the ExpectInbound registration is
-                                // recoverable: when the inbound connection actually
-                                // arrives without a matching expectation it is still
-                                // accepted provisionally (see handle_handshake_action,
-                                // "accepting provisionally"), and the originating
-                                // connect op retries if its handshake does not
-                                // complete. We `warn!` because a dropped expectation
-                                // makes admission less reliable under load.
-                                if !handshake_cmd_sender.try_send(HandshakeCommand::ExpectInbound {
-                                    peer: peer_placeholder,
-                                    transaction: None,
-                                    transient: false,
-                                }) {
-                                    tracing::warn!(
-                                        peer_addr = %addr,
-                                        phase = "connect",
-                                        "Handshake command channel full/closed; dropped \
-                                         ExpectInbound registration. Inbound connection will \
-                                         be accepted provisionally; connect op retries if the \
-                                         handshake does not complete."
-                                    );
-                                }
                             }
                             NodeEvent::QueryConnections { callback } => {
                                 // Reconstruct PeerKeyLocations from stored connections
@@ -5076,7 +5015,6 @@ pub(crate) mod tests {
             super::ConnectionEntry {
                 sender: tx1,
                 pub_key: None,
-                placeholder: None,
                 connection_id: 10,
                 created_at: Instant::now(),
                 link_use: super::zombie_sweep::LinkUseStamp::new(Instant::now()),
@@ -5089,7 +5027,6 @@ pub(crate) mod tests {
             super::ConnectionEntry {
                 sender: tx2,
                 pub_key: None,
-                placeholder: None,
                 connection_id: 20,
                 created_at: Instant::now(),
                 link_use: super::zombie_sweep::LinkUseStamp::new(Instant::now()),

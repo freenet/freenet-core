@@ -6822,7 +6822,7 @@ mod tests {
     fn transport_snapshot_json_carries_conn_identity_values() {
         let snapshot = crate::transport::metrics::TransportSnapshot {
             conn_identity_set_dialed: 61,
-            conn_identity_set_expected_inbound: 62,
+            conn_identity_expected_inbound: 62,
             conn_identity_set_connect_request: 63,
             conn_identity_same_connect_request: 64,
             conn_identity_changed_connect_request: 65,
@@ -6835,10 +6835,6 @@ mod tests {
             conn_identity_duplicate_key: 72,
             conn_identity_teardown_key_elsewhere: 73,
             conn_identity_teardown_unidentified: 74,
-            conn_identity_set_from_placeholder_expected: 75,
-            conn_identity_set_from_placeholder_other: 76,
-            conn_identity_set_from_placeholder_unchecked: 77,
-            conn_identity_connect_peer_on_placeholder: 78,
             conn_identity_teardown_key_unmapped: 79,
             ..Default::default()
         };
@@ -6848,7 +6844,7 @@ mod tests {
         )));
         for (key, expected) in [
             ("conn_identity_set_dialed", 61),
-            ("conn_identity_set_expected_inbound", 62),
+            ("conn_identity_expected_inbound", 62),
             ("conn_identity_set_connect_request", 63),
             ("conn_identity_same_connect_request", 64),
             ("conn_identity_changed_connect_request", 65),
@@ -6861,10 +6857,6 @@ mod tests {
             ("conn_identity_duplicate_key", 72),
             ("conn_identity_teardown_key_elsewhere", 73),
             ("conn_identity_teardown_unidentified", 74),
-            ("conn_identity_set_from_placeholder_expected", 75),
-            ("conn_identity_set_from_placeholder_other", 76),
-            ("conn_identity_set_from_placeholder_unchecked", 77),
-            ("conn_identity_connect_peer_on_placeholder", 78),
             ("conn_identity_teardown_key_unmapped", 79),
         ] {
             assert_eq!(json[key], expected, "event-log value for {key}");
