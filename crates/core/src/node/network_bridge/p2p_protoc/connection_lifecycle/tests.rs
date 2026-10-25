@@ -998,6 +998,13 @@ struct DriverRig {
     peer_outbound: crate::transport::connection_handler::OutboundConnectionHandler<
         crate::transport::mock_transport::MockSocket,
     >,
+    /// For a peer run as a gateway: its accepted connections, kept open so
+    /// its listener keeps running.
+    _peer_accepted: Option<
+        mpsc::Receiver<
+            crate::transport::PeerConnection<crate::transport::mock_transport::MockSocket>,
+        >,
+    >,
 }
 
 impl DriverRig {
@@ -1006,6 +1013,25 @@ impl DriverRig {
     }
 
     async fn with_clock(h: &Harness, clock: crate::util::time_source::DynTimeSource) -> Self {
+        Self::build(h, clock, false).await
+    }
+
+    /// The remote peer runs as a gateway, so a dial to it succeeds without
+    /// it dialling back.
+    async fn with_gateway_peer(h: &Harness) -> Self {
+        Self::build(
+            h,
+            Arc::new(crate::util::time_source::InstantTimeSrc::new()),
+            true,
+        )
+        .await
+    }
+
+    async fn build(
+        h: &Harness,
+        clock: crate::util::time_source::DynTimeSource,
+        peer_is_gateway: bool,
+    ) -> Self {
         use crate::transport::mock_transport::{
             PacketDropPolicy, create_mock_gateway, create_mock_peer,
         };
@@ -1014,10 +1040,19 @@ impl DriverRig {
             create_mock_gateway(PacketDropPolicy::ReceiveAll, channels.clone())
                 .await
                 .expect("mock gateway");
-        let (peer_key, peer_outbound, peer_addr) =
-            create_mock_peer(PacketDropPolicy::ReceiveAll, channels.clone())
-                .await
-                .expect("mock peer");
+        let (peer_key, peer_outbound, peer_addr, peer_accepted) = if peer_is_gateway {
+            let (key, (outbound, accepted), addr) =
+                create_mock_gateway(PacketDropPolicy::ReceiveAll, channels.clone())
+                    .await
+                    .expect("mock peer gateway");
+            (key, outbound, addr, Some(accepted))
+        } else {
+            let (key, outbound, addr) =
+                create_mock_peer(PacketDropPolicy::ReceiveAll, channels.clone())
+                    .await
+                    .expect("mock peer");
+            (key, outbound, addr, None)
+        };
         let (driver, commands) = HandshakeHandler::new(
             Box::new(MockAcceptor(gw_accepted)),
             Arc::new(gw_outbound),
@@ -1037,7 +1072,17 @@ impl DriverRig {
             peer_key,
             peer_addr,
             peer_outbound,
+            _peer_accepted: peer_accepted,
         }
+    }
+
+    /// The next handshake event, not yet handled.
+    async fn next_event(&mut self) -> HandshakeEvent {
+        use futures::StreamExt;
+        tokio::time::timeout(Duration::from_secs(20), self.driver.next())
+            .await
+            .expect("the driver reports an event")
+            .expect("the driver is running")
     }
 
     /// The connect op expects the peer, through the event loop's handler,
@@ -1271,6 +1316,39 @@ async fn expected_inbound_after_the_window_is_not_bound_to_the_key() {
     assert!(!h.mgr.addr_by_pub_key.contains_key(&rig.peer_key));
     assert_eq!(h.ring_key_at(peer_addr), None, "not promoted");
     h.assert_own_key_absent();
+}
+
+/// End to end: once our dial to the expected peer succeeds, its expectation
+/// is gone, so a later inbound connection from the same address (here the
+/// peer reconnecting) reaches the driver as unexpected and is not bound to
+/// the dialled key.
+#[tokio::test]
+async fn inbound_after_a_successful_dial_is_unexpected() {
+    let mut h = Harness::new("conn-identity-dial-then-inbound").await;
+    let mut rig = DriverRig::with_gateway_peer(&h).await;
+    let peer_addr = rig.peer_addr;
+
+    rig.expect_peer(&h).await;
+    let mut result = rig.connect_peer(&mut h).await;
+    assert_eq!(rig.handle_next_event(&mut h).await, "outbound_established");
+    assert!(matches!(result.try_recv(), Ok(Ok(_))), "the dial succeeded");
+    // The drop the dial sent reaches the driver before what follows.
+    let (done, processed) = tokio::sync::oneshot::channel();
+    assert!(rig.commands.try_send(HandshakeCommand::Barrier(done)));
+    processed.await.expect("the driver is running");
+
+    let dial = rig.peer_dials();
+    let event = rig.next_event().await;
+    let HandshakeEvent::InboundConnection { matched, .. } = &event else {
+        panic!("expected the peer's inbound connection, got {event:?}");
+    };
+    assert_eq!(
+        *matched,
+        HandshakeInboundMatch::Unexpected,
+        "the expectation for {peer_addr} was dropped"
+    );
+    drop(event);
+    assert!(dial.await.expect("dial task"), "the peer's dial completes");
 }
 
 /// A successful dial to an address drops that address's expectation, so a

@@ -208,15 +208,34 @@ impl Stream for HandshakeHandler {
 }
 
 /// How long after its registration an expected-inbound registration's key
-/// is honoured. The connect op that registers it dials the peer at the same
-/// time, and the peer, also dialling, keeps finishing its acceptor dials for
-/// up to `DIAL_DRAIN_LIMIT` after it stops collecting, each of which may take
-/// up to `OUTBOUND_CONNECT_TIMEOUT`. A connection from that address after
-/// this window is not the one the connect op asked for (the address may since
-/// belong to someone else), so it is not bound to the registration's key.
-pub(crate) const EXPECTED_INBOUND_WINDOW: Duration =
-    crate::operations::connect::op_ctx_task::DIAL_DRAIN_LIMIT
-        .saturating_add(OUTBOUND_CONNECT_TIMEOUT);
+/// is honoured. An acceptor registers when it accepts a joiner; the joiner
+/// may still be collecting acceptors for up to `OPERATION_TTL` before it
+/// dials them, keeps finishing those dials for up to `DIAL_DRAIN_LIMIT` after
+/// it stops collecting, and each dial's handshake may take up to
+/// `OUTBOUND_CONNECT_TIMEOUT`. A connection from that address after this
+/// window is not bound to the registration's key (the address may since
+/// belong to someone else).
+///
+/// No fixed window covers every honest case: the first stage of a dial
+/// (handing it to the transport) is not bounded (#5947). An inbound
+/// connection that arrives after the window starts without a key, as one
+/// did before matched connections were bound: a later ConnectRequest or
+/// ConnectPeer names it, or the unpromoted-connection sweep removes it.
+pub(crate) const EXPECTED_INBOUND_WINDOW: Duration = Duration::from_secs(100);
+
+// The window covers the joiner's collection, dial drain and one handshake.
+const _: () = assert!(
+    EXPECTED_INBOUND_WINDOW.as_secs()
+        >= crate::config::OPERATION_TTL.as_secs()
+            + crate::operations::connect::op_ctx_task::DIAL_DRAIN_LIMIT.as_secs()
+            + OUTBOUND_CONNECT_TIMEOUT.as_secs()
+);
+
+/// How often the handshake driver sweeps expired expectations when no
+/// registration or match does it.
+const EXPECTED_INBOUND_SWEEP_INTERVAL: Duration = Duration::from_secs(50);
+const _: () =
+    assert!(EXPECTED_INBOUND_SWEEP_INTERVAL.as_secs() * 2 <= EXPECTED_INBOUND_WINDOW.as_secs());
 
 #[derive(Debug)]
 struct ExpectedInbound {
@@ -232,10 +251,10 @@ struct ExpectedInbound {
 /// expected-IP set (`InboundExpectations`).
 ///
 /// Bounded by time: a registration older than [`EXPECTED_INBOUND_WINDOW`]
-/// is swept on the next registration or match, and a match against one that
-/// has expired but not yet been swept is reported without its key. The map
-/// therefore holds at most the registrations of the last window, plus
-/// entries that wait for the next registration or match to be swept.
+/// is swept on the next registration or match, and at the latest by the
+/// driver's periodic sweep ([`EXPECTED_INBOUND_SWEEP_INTERVAL`]), so no
+/// entry outlives the window by more than one interval. A match against one
+/// that has expired but not yet been swept is reported without its key.
 struct InboundMatcher {
     entries: HashMap<SocketAddr, ExpectedInbound>,
     clock: DynTimeSource,
@@ -344,9 +363,19 @@ async fn run_driver(
     use tokio::select;
 
     let mut expected_inbound = InboundMatcher::new(clock);
+    // Guarantees expiry when no registration or match sweeps. Paced by
+    // tokio time; what is expired is decided by the injected clock. The
+    // first tick is one interval out: `interval` would fire at once, and a
+    // sweep then has nothing to remove.
+    let mut sweep_timer = tokio::time::interval_at(
+        tokio::time::Instant::now() + EXPECTED_INBOUND_SWEEP_INTERVAL,
+        EXPECTED_INBOUND_SWEEP_INTERVAL,
+    );
+    sweep_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     loop {
         select! {
+            _ = sweep_timer.tick() => expected_inbound.sweep(),
             command = commands_rx.recv() => match command {
                 Some(Command::Connect { peer, transaction, transient, origin }) => {
                     spawn_outbound(outbound.clone(), events_tx.clone(), peer, transaction, transient, origin, peer_ready.clone());
@@ -984,6 +1013,61 @@ mod tests {
         let entry = tracker.consume(addr).expect("still matched");
         assert_eq!(entry.peer_key, None);
         assert!(tracker.consume(addr).is_none(), "consumed once");
+    }
+
+    /// With no further registration or match, the driver's periodic sweep
+    /// still removes an expired registration: a connection from its address
+    /// afterwards is unexpected rather than matched.
+    #[tokio::test(start_paused = true)]
+    async fn the_driver_sweeps_expired_registrations_without_traffic() {
+        let clock = crate::util::time_source::SharedMockTimeSource::new();
+        let (conn_tx, conn_rx) = mpsc::channel(4);
+        let (cmd_tx, cmd_rx) = mpsc::channel(4);
+        let (event_tx, mut event_rx) = mpsc::channel(4);
+        let driver = GlobalExecutor::spawn(run_driver(
+            Box::new(ChannelAcceptor(conn_rx)),
+            Arc::new(ScriptedConnector {
+                enqueue: Duration::ZERO,
+                handshake: Handshake::Hangs,
+                origins: Default::default(),
+            }),
+            cmd_rx,
+            event_tx,
+            None,
+            Arc::new(clock.clone()),
+        ));
+        let addr: SocketAddr = "127.0.0.1:4140".parse().unwrap();
+        cmd_tx
+            .send(Command::ExpectInbound {
+                addr,
+                peer_key: Some(key()),
+                transaction: None,
+                transient: false,
+            })
+            .await
+            .unwrap();
+        let (done, processed) = tokio::sync::oneshot::channel();
+        cmd_tx.send(Command::Barrier(done)).await.unwrap();
+        processed.await.unwrap();
+
+        // The registration expires; only the timer can sweep it now.
+        clock.advance_time(EXPECTED_INBOUND_WINDOW + Duration::from_secs(1));
+        tokio::time::sleep(EXPECTED_INBOUND_SWEEP_INTERVAL + Duration::from_secs(1)).await;
+
+        conn_tx
+            .send(Box::new(NullConnection(addr)))
+            .await
+            .ok()
+            .unwrap();
+        let Some(Event::InboundConnection { matched, .. }) = event_rx.recv().await else {
+            panic!("expected an InboundConnection");
+        };
+        assert_eq!(
+            matched,
+            InboundMatch::Unexpected,
+            "the expired entry was swept"
+        );
+        driver.abort();
     }
 
     /// Expired registrations are swept on the next registration and on the
