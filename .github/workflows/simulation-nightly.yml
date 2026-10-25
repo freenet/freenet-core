@@ -279,8 +279,6 @@ jobs:
         run: |
           # Allowed per-seed reasons. A stream that aborts before the spiked
           # ACKs return also leaves no evidence the spike drove its timers.
-          slow='^(did not complete within |goodput never reached )'
-          abort='^(did not complete within |goodput never reached |sender gave up on the stream )'
           abort_early='^(did not complete within |goodput never reached |sender gave up on the stream |no evidence the spike drove)'
           status=0
           check() {
@@ -310,8 +308,11 @@ jobs:
           }
           check r1_spike_recovery_bbr "$abort_early"
           check r1_spike_recovery_ledbat "$abort_early"
-          # At the shorter stall BBR has never aborted; an abort would be new.
-          check r1b_spike_recovery_bbr "$slow"
+          # BBR also aborts at the shorter stall when the one ACK batch for its
+          # initial window is lost: no ACK returns until an RTO (1 s) plus the
+          # spike, past the 3 s cwnd-wait timeout (seeds 7228, 7299). Seen on
+          # 2 of 160 nightly seeds; seeds 1-20 had none.
+          check r1b_spike_recovery_bbr "$abort_early"
           check r1b_spike_recovery_ledbat "$abort_early"
           exit "$status"
 

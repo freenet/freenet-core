@@ -42,6 +42,7 @@
 
 use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
+use std::future::Future;
 use std::hash::{Hash, Hasher};
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -53,9 +54,11 @@ use super::{Delivery, HostLink, LinkEvent, LinkModel, Loss, Offer};
 use crate::config::GlobalRng;
 use crate::simulation::{TimeSource, VirtualTime};
 use crate::transport::congestion_control::{CongestionControlAlgorithm, CongestionControlConfig};
-use crate::transport::mock_transport::{Channels, create_mock_peer_with_link_model};
+use crate::transport::connection_handler::OutboundConnectionHandler;
+use crate::transport::mock_transport::{Channels, MockSocket, create_mock_peer_with_link_model};
 use crate::transport::packet_data::MAX_PACKET_SIZE;
-use crate::transport::peer_connection::CongestionProbe;
+use crate::transport::peer_connection::{CongestionProbe, PeerConnection};
+use crate::transport::{Socket, TransportError};
 
 // ---------------------------------------------------------------------------
 // Scenarios
@@ -407,6 +410,12 @@ async fn drive_virtual_time(vt: VirtualTime) {
 }
 
 fn run(sc: &'static Scenario, algorithm: CongestionControlAlgorithm, seed: u64) -> Report {
+    block_on_seeded(seed, run_inner(sc, algorithm, seed))
+}
+
+/// Runs `f` to completion on a paused current-thread runtime with
+/// `GlobalRng` seeded from `seed`.
+fn block_on_seeded<F: Future>(seed: u64, f: F) -> F::Output {
     // `GlobalRng` is thread-local, and a current-thread runtime polls every
     // task on this thread, so this seeds every draw the transport makes.
     // `seed_guard` also pins the thread index, so concurrent tests on other
@@ -417,7 +426,7 @@ fn run(sc: &'static Scenario, algorithm: CongestionControlAlgorithm, seed: u64) 
         .start_paused(true)
         .build()
         .expect("runtime");
-    rt.block_on(run_inner(sc, algorithm, seed))
+    rt.block_on(f)
 }
 
 fn trace_hash(link: &LinkModel, a: SocketAddr, b: SocketAddr) -> u64 {
@@ -486,19 +495,66 @@ fn reoffered_share(deliveries: &[Delivery], offers: &[Offer], from: u64, to: u64
         / sent.len() as f64
 }
 
-async fn run_inner(
-    sc: &'static Scenario,
-    algorithm: CongestionControlAlgorithm,
-    seed: u64,
-) -> Report {
-    // Asserted directly because outcomes alone do not show it: with this
-    // scenario, unseeded runs happened to match too (3 of 3 on 2026-10-18).
-    assert!(
-        GlobalRng::is_seeded(),
-        "GlobalRng must be seeded on the thread that polls the transport"
-    );
-    let vt = VirtualTime::new();
-    let driver = tokio::spawn(drive_virtual_time(vt.clone()));
+/// Waits for both ends of a hole punch, driving each connection's receive
+/// loop from the moment its own handshake completes, as a node does
+/// (`peer_connection_listener` is spawned when the connection is
+/// established).
+///
+/// That loop is part of the handshake. When one side's completion ack is
+/// lost, the other side keeps resending its own ack, and completes only when
+/// the established connection answers it (`ack_ok` and a receipt, from
+/// `PeerConnection::recv`). Awaiting both `connect`s without polling the first
+/// connection to finish left the other side to run out its 3 s deadline:
+/// at 1% loss, about one seed in 30 failed with "max connection attempts
+/// reached" before the transfer began.
+async fn connect_pair<S: Socket>(
+    a: impl Future<Output = Result<PeerConnection<S, VirtualTime>, TransportError>>,
+    b: impl Future<Output = Result<PeerConnection<S, VirtualTime>, TransportError>>,
+) -> (
+    Result<PeerConnection<S, VirtualTime>, TransportError>,
+    Result<PeerConnection<S, VirtualTime>, TransportError>,
+) {
+    /// The connection's receive loop, or never if it is not established.
+    async fn serve<S: Socket>(
+        conn: &mut Option<Result<PeerConnection<S, VirtualTime>, TransportError>>,
+    ) -> Result<Vec<u8>, TransportError> {
+        match conn {
+            Some(Ok(c)) => c.recv().await,
+            _ => std::future::pending().await,
+        }
+    }
+
+    let mut a = std::pin::pin!(a);
+    let mut b = std::pin::pin!(b);
+    let mut conn_a = None;
+    let mut conn_b = None;
+    while conn_a.is_none() || conn_b.is_none() {
+        // Deliberately `biased`, for the same reason as the transfer loop.
+        tokio::select! {
+            biased;
+            r = &mut a, if conn_a.is_none() => conn_a = Some(r),
+            r = &mut b, if conn_b.is_none() => conn_b = Some(r),
+            r = serve(&mut conn_a) => panic!("a received {r:?} before the transfer began"),
+            r = serve(&mut conn_b) => panic!("b received {r:?} before the transfer began"),
+        }
+    }
+    (conn_a.expect("set above"), conn_b.expect("set above"))
+}
+
+/// Two peers on the scenario's link, and the outcome of connecting them.
+struct Pair {
+    link: Arc<LinkModel>,
+    addr_a: SocketAddr,
+    addr_b: SocketAddr,
+    conn_a: Result<PeerConnection<MockSocket, VirtualTime>, TransportError>,
+    conn_b: Result<PeerConnection<MockSocket, VirtualTime>, TransportError>,
+    /// Owns each peer's listener; dropping it would end the connections.
+    _peers: [OutboundConnectionHandler<MockSocket, VirtualTime>; 2],
+}
+
+/// Builds the scenario's link for `seed` and hole-punches a connection
+/// across it, both peers dialling at once.
+async fn open_pair(seed: u64, algorithm: CongestionControlAlgorithm, vt: &VirtualTime) -> Pair {
     let link = Arc::new(LinkModel::new(
         HostLink {
             uplink_bps: BOTTLENECK_BPS,
@@ -522,13 +578,37 @@ async fn run_inner(
         create_mock_peer_with_link_model(link.clone(), channels.clone(), vt.clone(), config)
             .await
             .expect("peer b");
-    assert_eq!(link.base_rtt(addr_a, addr_b), base_rtt());
-
     let (conn_a, conn_b) =
         futures::join!(peer_a.connect(pub_b, addr_b), peer_b.connect(pub_a, addr_a));
-    let (conn_a, conn_b) = futures::join!(conn_a, conn_b);
-    let mut conn_a = conn_a.expect("connect a");
-    let mut conn_b = conn_b.expect("connect b");
+    let (conn_a, conn_b) = connect_pair(conn_a, conn_b).await;
+    Pair {
+        link,
+        addr_a,
+        addr_b,
+        conn_a,
+        conn_b,
+        _peers: [peer_a, peer_b],
+    }
+}
+
+async fn run_inner(
+    sc: &'static Scenario,
+    algorithm: CongestionControlAlgorithm,
+    seed: u64,
+) -> Report {
+    // Asserted directly because outcomes alone do not show it: with this
+    // scenario, unseeded runs happened to match too (3 of 3 on 2026-10-18).
+    assert!(
+        GlobalRng::is_seeded(),
+        "GlobalRng must be seeded on the thread that polls the transport"
+    );
+    let vt = VirtualTime::new();
+    let driver = tokio::spawn(drive_virtual_time(vt.clone()));
+    let pair = open_pair(seed, algorithm, &vt).await;
+    let (link, addr_a, addr_b) = (pair.link.clone(), pair.addr_a, pair.addr_b);
+    assert_eq!(link.base_rtt(addr_a, addr_b), base_rtt());
+    let mut conn_a = pair.conn_a.expect("connect a");
+    let mut conn_b = pair.conn_b.expect("connect b");
 
     let start = vt.now_nanos();
     let spike_start = Duration::from_nanos(start) + SPIKE_AFTER_START;
@@ -742,6 +822,48 @@ fn r1_runs_are_reproducible_from_the_seed() {
     );
 }
 
+/// Seeds on which the link drops one side's handshake completion ack, so the
+/// other side completes only if the first side's established connection
+/// answers its repeated ack. Each failed every nightly test before
+/// `connect_pair` drove the connections during the handshake.
+const LOST_HANDSHAKE_ACK_SEEDS: [u64; 2] = [7244, 7342];
+
+#[test]
+fn hole_punch_completes_when_one_side_loses_its_completion_ack() {
+    for seed in LOST_HANDSHAKE_ACK_SEEDS {
+        block_on_seeded(seed, async {
+            let vt = VirtualTime::new();
+            let driver = tokio::spawn(drive_virtual_time(vt.clone()));
+            let pair = open_pair(seed, CongestionControlAlgorithm::FixedRate, &vt).await;
+            driver.abort();
+            // The scenario happened: the link dropped B's second packet, its
+            // completion ack, and B completed on A's ack. A can then complete
+            // only on a packet B's established connection sends in answer to
+            // A's repeated ack.
+            let b_offers = pair.link.offers(pair.addr_b, pair.addr_a);
+            let b_delivered = pair.link.deliveries(pair.addr_b, pair.addr_a);
+            assert!(
+                b_offers.len() >= 2
+                    && !b_delivered
+                        .iter()
+                        .any(|d| d.content_hash == b_offers[1].content_hash),
+                "seed {seed}: the link did not drop B's completion ack, so this seed no longer \
+                 exercises the lost-ack handshake"
+            );
+            assert!(
+                pair.conn_a.is_ok(),
+                "seed {seed}: connect a: {:?}",
+                pair.conn_a.err()
+            );
+            assert!(
+                pair.conn_b.is_ok(),
+                "seed {seed}: connect b: {:?}",
+                pair.conn_b.err()
+            );
+        });
+    }
+}
+
 #[test]
 fn r1_spike_recovery_fixed_rate() {
     gate(&R1, CongestionControlAlgorithm::FixedRate);
@@ -777,6 +899,9 @@ fn r1b_spike_recovery_fixed_rate() {
 // shorter stall on every seed (no cwnd-wait abort), yet no seed finishes
 // within 3x ideal and goodput after the path clears averages ~1.2 Mbit/s of
 // 8. So the R1 failure is not only the stream timeout: BBR does not recover.
+// It can still abort here (2 of nightly seeds 7220-7379, e.g. 7228): when the
+// ACK batch for its initial window is lost, nothing is acknowledged until an
+// RTO plus the spike, which outlasts the cwnd-wait timeout.
 #[test]
 #[ignore = "known failure: BBR survives a 2.4 s RTT spike but never recovers to the bottleneck rate (~1.2 of 8 Mbit/s after it); #5929"]
 fn r1b_spike_recovery_bbr() {
