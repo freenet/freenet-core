@@ -70,6 +70,46 @@ pub(crate) const INCOMING_BUFFER_BYTES: u64 = 64 * 1024;
 /// Bytes quinn buffers for all connection attempts together.
 pub(crate) const INCOMING_BUFFER_TOTAL_BYTES: u64 = 1024 * 1024;
 
+/// The heap one idle QUIC connection holds on one side, with the
+/// `QuicPath` a node keeps on it: quinn's connection and driver task,
+/// rustls's state and keys, the packet spaces, congestion and connection-ID
+/// state, the connection watcher and the path's receive task and channels.
+/// Not included: anything that grows with traffic (stream data, the
+/// assembler, sent-packet and ACK bookkeeping), which the windows and
+/// stream limits bound separately.
+///
+/// Measured (`quic::memory_tests`): two endpoints with the settings of a
+/// 2 GiB node on `SimulationSocket` and one `VirtualTime`, on one
+/// current-thread runtime, counting live bytes on that thread with the lib
+/// test binary's counting allocator (`util::alloc_count`). After a warm-up
+/// connection, N connections are opened and settled, the network is cut,
+/// and each side is closed and drained in turn; what each side frees is its
+/// cost, and what both leave behind (endpoint tables grown for N) is charged
+/// to the larger side. Per connection, quinn 0.11.12 / quinn-proto 0.11.19:
+///
+/// | N  | client   | server   | retained | per connection |
+/// |----|----------|----------|----------|----------------|
+/// | 1  | 48,305 B | 48,320 B | 232 B    | 48,552 B       |
+/// | 10 | 48,277 B | 48,062 B | 1,967 B  | 50,245 B       |
+/// | 50 | 48,248 B | 48,144 B | 1,746 B  | 49,995 B       |
+///
+/// The count is the bytes requested from the allocator; jemalloc's size
+/// classes round small allocations up (by at most 25%), which the margin
+/// covers. Set to the largest measurement, 50,245 B, plus 30%, rounded up to
+/// 64 KiB. The `memory_tests` pin fails if a re-measurement exceeds it, and
+/// [`QUIC_MEMORY_MEASURED_WITH`] fails on a quinn or quinn-proto bump until
+/// someone re-measures.
+///
+/// Not yet in `declared_cache_ceiling` (memory gate step M4).
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) const QUIC_CONNECTION_FIXED_BYTES: usize = 64 * 1024;
+
+/// The quinn and quinn-proto versions [`QUIC_CONNECTION_FIXED_BYTES`] was
+/// measured with, checked against `Cargo.lock` by `quic::memory_tests`.
+#[cfg(test)]
+pub(crate) const QUIC_MEMORY_MEASURED_WITH: [(&str, &str); 2] =
+    [("quinn", "0.11.12"), ("quinn-proto", "0.11.19")];
+
 /// The smallest flow-control window per connection and direction.
 pub(crate) const MIN_WINDOW_BYTES: u64 = 128 * 1024;
 

@@ -1,3 +1,6 @@
+/// The lib test binary's counting global allocator.
+#[cfg(test)]
+pub(crate) mod alloc_count;
 pub(crate) mod backoff;
 pub(crate) mod byte_bounded_lru;
 pub mod deterministic_select;

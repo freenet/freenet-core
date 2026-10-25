@@ -2946,6 +2946,11 @@ mod tests {
                  INCOMING_BUFFER_TOTAL_BYTES",
             ),
             (
+                "QUIC_CONNECTION_FIXED_BYTES",
+                "measured per-connection term; summed once a QUIC path cap exists \
+                 (memory gate M4)",
+            ),
+            (
                 "READ_START_BYTES",
                 "initial allocation of ONE QUIC stream read (quic::path::inbound), \
                  at most the stream's declared length, which is charged to the \
