@@ -224,18 +224,19 @@ impl Stream for HandshakeHandler {
 pub(crate) const EXPECTED_INBOUND_WINDOW: Duration = Duration::from_secs(100);
 
 // The window covers the joiner's collection, dial drain and one handshake.
+// Compared in milliseconds so a sub-second part is not truncated away.
 const _: () = assert!(
-    EXPECTED_INBOUND_WINDOW.as_secs()
-        >= crate::config::OPERATION_TTL.as_secs()
-            + crate::operations::connect::op_ctx_task::DIAL_DRAIN_LIMIT.as_secs()
-            + OUTBOUND_CONNECT_TIMEOUT.as_secs()
+    EXPECTED_INBOUND_WINDOW.as_millis()
+        >= crate::config::OPERATION_TTL.as_millis()
+            + crate::operations::connect::op_ctx_task::DIAL_DRAIN_LIMIT.as_millis()
+            + OUTBOUND_CONNECT_TIMEOUT.as_millis()
 );
 
 /// How often the handshake driver sweeps expired expectations when no
 /// registration or match does it.
 const EXPECTED_INBOUND_SWEEP_INTERVAL: Duration = Duration::from_secs(50);
 const _: () =
-    assert!(EXPECTED_INBOUND_SWEEP_INTERVAL.as_secs() * 2 <= EXPECTED_INBOUND_WINDOW.as_secs());
+    assert!(EXPECTED_INBOUND_SWEEP_INTERVAL.as_millis() * 2 <= EXPECTED_INBOUND_WINDOW.as_millis());
 
 #[derive(Debug)]
 struct ExpectedInbound {
