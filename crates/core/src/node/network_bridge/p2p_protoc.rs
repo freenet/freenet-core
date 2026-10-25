@@ -534,6 +534,11 @@ struct ConnectionEntry {
     /// The peer's public key, learned from the first message.
     /// None for transient connections before identity is established.
     pub_key: Option<TransportPublicKey>,
+    /// Telemetry only, never read for any decision: the key the latest
+    /// ConnectPeer named while `pub_key` was the expected-inbound
+    /// placeholder (this node's own key), compared with the key a later
+    /// ConnectRequest gives (`conn_identity_set_from_placeholder_*`).
+    placeholder_peer_key: Option<TransportPublicKey>,
     /// Unique ID for this connection entry. Used to distinguish stale
     /// TransportClosed events from replaced connections (e.g., after identity change).
     connection_id: u64,
@@ -5061,6 +5066,7 @@ pub(crate) mod tests {
             super::ConnectionEntry {
                 sender: tx1,
                 pub_key: None,
+                placeholder_peer_key: None,
                 connection_id: 10,
                 created_at: Instant::now(),
                 link_use: super::zombie_sweep::LinkUseStamp::new(Instant::now()),
@@ -5073,6 +5079,7 @@ pub(crate) mod tests {
             super::ConnectionEntry {
                 sender: tx2,
                 pub_key: None,
+                placeholder_peer_key: None,
                 connection_id: 20,
                 created_at: Instant::now(),
                 link_use: super::zombie_sweep::LinkUseStamp::new(Instant::now()),

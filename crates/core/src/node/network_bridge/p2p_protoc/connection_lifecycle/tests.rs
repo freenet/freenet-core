@@ -80,11 +80,6 @@ struct Harness {
 
 impl Harness {
     async fn new(id: &str) -> Self {
-        Self::with_max_connections(id, None).await
-    }
-
-    /// As [`Self::new`], with the ring's connection cap set to `max`.
-    async fn with_max_connections(id: &str, max: Option<usize>) -> Self {
         let config_args = crate::config::ConfigArgs {
             id: Some(id.to_string()),
             mode: Some(crate::contract::OperationMode::Local),
@@ -97,10 +92,6 @@ impl Harness {
         // A gateway needs no configured remote gateway to build, and accepts
         // unidentified inbound connections, which is the path under test.
         node_config.is_gateway = true;
-        if let Some(max) = max {
-            node_config.min_number_conn = Some(1);
-            node_config.max_number_conn = Some(max);
-        }
         let (_notification_rx, notification_tx) = crate::node::event_loop_notification_channel();
         let (ops_ch_channel, _ch_channel, _wait_for_event) =
             crate::contract::contract_handler_channel();
@@ -295,7 +286,9 @@ fn is_set(kind: ConnIdentity) -> bool {
         | ConnIdentity::SetConnectPeer
         | ConnIdentity::SameConnectRequest
         | ConnIdentity::SameConnectPeer
-        | ConnIdentity::SetFromPlaceholder => true,
+        | ConnIdentity::SetFromPlaceholderExpected
+        | ConnIdentity::SetFromPlaceholderUnchecked
+        | ConnIdentity::ConnectPeerOnPlaceholder => true,
         ConnIdentity::ChangedConnectRequest
         | ConnIdentity::ConnectRequestKnownAddr
         | ConnIdentity::ChangedConnectPeer
@@ -303,7 +296,9 @@ fn is_set(kind: ConnIdentity) -> bool {
         | ConnIdentity::OwnKey
         | ConnIdentity::DuplicateKey
         | ConnIdentity::TeardownKeyElsewhere
-        | ConnIdentity::TeardownUnidentified => false,
+        | ConnIdentity::TeardownUnidentified
+        | ConnIdentity::TeardownKeyUnmapped
+        | ConnIdentity::SetFromPlaceholderOther => false,
     }
 }
 
@@ -505,9 +500,10 @@ async fn expected_inbound_under_own_key_counts_own_key() {
 /// A peer that reappears at another address while its first connection is
 /// still open gets a second live connection for its key (`duplicate_key`).
 /// When the first connection later closes, its cleanup is for a key now
-/// recorded for the second (`teardown_key_elsewhere`).
+/// recorded for the second (`teardown_key_elsewhere`), and that removes the
+/// mapping, so the second's later close counts `teardown_key_unmapped`.
 #[tokio::test]
-async fn second_connection_for_a_key_counts_duplicate_then_teardown_elsewhere() {
+async fn second_connection_for_a_key_counts_duplicate_then_both_teardowns() {
     let mut h = Harness::new("conn-identity-duplicate").await;
     let old: SocketAddr = "203.0.113.70:4701".parse().unwrap();
     let new: SocketAddr = "203.0.113.70:4702".parse().unwrap();
@@ -527,6 +523,19 @@ async fn second_connection_for_a_key_counts_duplicate_then_teardown_elsewhere() 
     assert_eq!(
         seen(old),
         vec![ConnIdentity::SetDialed, ConnIdentity::TeardownKeyElsewhere]
+    );
+
+    // The older connection's cleanup removed the key's mapping, so the
+    // newer one's close finds it unmapped: a different kind, not a second
+    // `teardown_key_elsewhere`.
+    h.transport_closed(new).await;
+    assert_eq!(
+        seen(new),
+        vec![
+            ConnIdentity::SetConnectRequest,
+            ConnIdentity::DuplicateKey,
+            ConnIdentity::TeardownKeyUnmapped,
+        ]
     );
 
     // Closing the connection that does hold the mapping counts nothing.
@@ -565,10 +574,11 @@ async fn dropping_an_unidentified_connection_counts_teardown_unidentified() {
 /// (under this node's own key) and then sends ConnectPeer with the peer's
 /// key; the peer may also send a ConnectRequest. Several such connections
 /// can be open at once. This is the expected first identity: it counts
-/// `own_key` and `set_from_placeholder`, never `changed_*`,
-/// `duplicate_key` or `teardown_key_elsewhere`.
+/// `own_key`, `connect_peer_on_placeholder` and
+/// `set_from_placeholder_unchecked` (the request came before any
+/// ConnectPeer), never `changed_*`, `duplicate_key` or a teardown kind.
 #[tokio::test]
-async fn expected_inbound_then_named_peer_counts_set_from_placeholder() {
+async fn expected_inbound_then_named_peer_counts_placeholder_kinds() {
     let mut h = Harness::new("conn-identity-placeholder").await;
     let by_connect_peer: SocketAddr = "203.0.113.90:4901".parse().unwrap();
     let by_request: SocketAddr = "203.0.113.91:4902".parse().unwrap();
@@ -592,7 +602,7 @@ async fn expected_inbound_then_named_peer_counts_set_from_placeholder() {
         vec![
             ConnIdentity::SetExpectedInbound,
             ConnIdentity::OwnKey,
-            ConnIdentity::SetFromPlaceholder,
+            ConnIdentity::ConnectPeerOnPlaceholder,
         ]
     );
     assert_eq!(
@@ -600,7 +610,7 @@ async fn expected_inbound_then_named_peer_counts_set_from_placeholder() {
         vec![
             ConnIdentity::SetExpectedInbound,
             ConnIdentity::OwnKey,
-            ConnIdentity::SetFromPlaceholder,
+            ConnIdentity::SetFromPlaceholderUnchecked,
             ConnIdentity::SameConnectPeer,
         ]
     );
@@ -662,33 +672,55 @@ async fn connect_peer_naming_own_key_counts_own_key() {
     );
 }
 
-/// A ConnectPeer whose promotion the ring refuses (here at its connection
-/// cap) counts nothing, whatever key it names.
+/// The realistic NAT order: expected inbound, ConnectPeer naming the peer,
+/// then the peer's own ConnectRequest. That is exactly one first-identity
+/// count (`set_from_placeholder_expected`); a later relayed request naming
+/// another peer is a change, counted as one. If the relayed request comes
+/// first, it lands in `set_from_placeholder_other`.
 #[tokio::test]
-async fn refused_ring_promotion_counts_nothing() {
-    let mut h = Harness::with_max_connections("conn-identity-refused-promotion", Some(1)).await;
-    let filler: SocketAddr = "203.0.113.120:5201".parse().unwrap();
-    let remote: SocketAddr = "203.0.113.121:5202".parse().unwrap();
-    watch(&[remote]);
+async fn expected_inbound_connect_peer_then_requests_counts_one_first_identity() {
+    let mut h = Harness::new("conn-identity-placeholder-order").await;
+    let in_order: SocketAddr = "203.0.113.130:5301".parse().unwrap();
+    let relayed_first: SocketAddr = "203.0.113.131:5302".parse().unwrap();
+    watch(&[in_order, relayed_first]);
+    let (peer, other_peer, third_party, another_party) = (key(), key(), key(), key());
 
-    h.dial(filler, &key()).await;
-    assert!(
-        h.mgr
-            .bridge
-            .op_manager
-            .ring
-            .connection_manager
-            .is_in_ring(filler),
-        "the ring is full"
-    );
-    h.accept(remote).await;
-    h.connect_request(remote, PeerKeyLocation::with_unknown_addr(key()))
+    h.accept_expected(in_order).await;
+    h.connect_peer(PeerKeyLocation::new(peer.clone(), in_order))
         .await;
-    assert!(
-        !h.try_connect_peer(PeerKeyLocation::new(key(), remote))
-            .await,
-        "the promotion is refused"
+    h.connect_request(in_order, PeerKeyLocation::with_unknown_addr(peer.clone()))
+        .await;
+    h.connect_request(
+        in_order,
+        PeerKeyLocation::with_unknown_addr(third_party.clone()),
+    )
+    .await;
+    assert_eq!(
+        seen(in_order),
+        vec![
+            ConnIdentity::SetExpectedInbound,
+            ConnIdentity::OwnKey,
+            ConnIdentity::ConnectPeerOnPlaceholder,
+            ConnIdentity::SetFromPlaceholderExpected,
+            ConnIdentity::ChangedConnectRequest,
+        ]
     );
 
-    assert_eq!(seen(remote), vec![ConnIdentity::SetConnectRequest]);
+    h.accept_expected(relayed_first).await;
+    h.connect_peer(PeerKeyLocation::new(other_peer, relayed_first))
+        .await;
+    h.connect_request(
+        relayed_first,
+        PeerKeyLocation::with_unknown_addr(another_party),
+    )
+    .await;
+    assert_eq!(
+        seen(relayed_first),
+        vec![
+            ConnIdentity::SetExpectedInbound,
+            ConnIdentity::OwnKey,
+            ConnIdentity::ConnectPeerOnPlaceholder,
+            ConnIdentity::SetFromPlaceholderOther,
+        ]
+    );
 }

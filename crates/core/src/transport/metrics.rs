@@ -77,15 +77,17 @@ labelled_counters! {
     /// count is non-zero. Each `set_*`, `same_*` and `changed_*` kind is one
     /// per decision on its path; `connect_request_known_addr`, `own_key`,
     /// `duplicate_key` and `changed_ring_promotion` (which accompanies a
-    /// `changed_connect_peer` or `set_connect_peer` on the same ConnectPeer)
-    /// are counted in addition to the kind of the decision they qualify.
+    /// `changed_connect_peer` on the same ConnectPeer) are counted in
+    /// addition to the kind of the decision they qualify.
     ///
     /// The event loop registers an expected inbound connection under this
     /// node's own key until the connect op names the peer. Such a
-    /// connection counts `own_key` when recorded, `set_from_placeholder`
-    /// when a ConnectRequest or ConnectPeer names the peer, and never
-    /// `duplicate_key` or `teardown_key_elsewhere`, since several
-    /// connections can hold that key at once in ordinary operation.
+    /// connection counts `own_key` when recorded,
+    /// `connect_peer_on_placeholder` for each ConnectPeer while it still
+    /// holds that key (ConnectPeer does not replace it), one
+    /// `set_from_placeholder_*` when a ConnectRequest replaces it, and never
+    /// `duplicate_key` or a teardown kind, since several connections can
+    /// hold that key at once in ordinary operation.
     pub(crate) enum ConnIdentity {
         /// An outbound connection was established and recorded under the key
         /// it was dialled with.
@@ -123,7 +125,7 @@ labelled_counters! {
         /// that still has that key (the newer one replaces it in the map).
         DuplicateKey => "duplicate_key",
         /// Cleanup ran for a connection whose key, other than this node's
-        /// own, is recorded for another connection. Counted on transport
+        /// own, is mapped to a different connection. Counted on transport
         /// close, on an explicit drop, on the unpromoted-connection sweep and
         /// when a new connection at the same address replaces the entry; not
         /// on the cleanup when the event loop shuts down.
@@ -131,10 +133,25 @@ labelled_counters! {
         /// Cleanup, on the same paths, ran for a connection with no recorded
         /// key, so its ring cleanup was keyed by this node's own key.
         TeardownUnidentified => "teardown_unidentified",
-        /// A ConnectRequest or ConnectPeer named the peer of a connection
-        /// recorded under the expected-inbound placeholder (this node's own
-        /// key): the expected first identity, not a change.
-        SetFromPlaceholder => "set_from_placeholder",
+        /// A ConnectRequest replaced the expected-inbound placeholder (this
+        /// node's own key) with the key the latest ConnectPeer for the
+        /// connection named: the expected first identity.
+        SetFromPlaceholderExpected => "set_from_placeholder_expected",
+        /// A ConnectRequest replaced the placeholder with a key other than
+        /// the one the latest ConnectPeer for the connection named.
+        SetFromPlaceholderOther => "set_from_placeholder_other",
+        /// A ConnectRequest replaced the placeholder before any ConnectPeer
+        /// named a peer for the connection, so there was no expected key to
+        /// compare the claim with.
+        SetFromPlaceholderUnchecked => "set_from_placeholder_unchecked",
+        /// A ConnectPeer named a peer for a connection still recorded under
+        /// the placeholder. The connection keeps the placeholder.
+        ConnectPeerOnPlaceholder => "connect_peer_on_placeholder",
+        /// Cleanup, on the same paths, ran for a connection whose key, other
+        /// than this node's own, is not mapped to any connection (for
+        /// example, an earlier cleanup of another connection with the same
+        /// key removed the mapping).
+        TeardownKeyUnmapped => "teardown_key_unmapped",
     }
 }
 
@@ -1881,8 +1898,20 @@ impl TransportMetrics {
             conn_identity_teardown_unidentified: get32(
                 &identity[ConnIdentity::TeardownUnidentified as usize],
             ),
-            conn_identity_set_from_placeholder: get32(
-                &identity[ConnIdentity::SetFromPlaceholder as usize],
+            conn_identity_set_from_placeholder_expected: get32(
+                &identity[ConnIdentity::SetFromPlaceholderExpected as usize],
+            ),
+            conn_identity_set_from_placeholder_other: get32(
+                &identity[ConnIdentity::SetFromPlaceholderOther as usize],
+            ),
+            conn_identity_set_from_placeholder_unchecked: get32(
+                &identity[ConnIdentity::SetFromPlaceholderUnchecked as usize],
+            ),
+            conn_identity_connect_peer_on_placeholder: get32(
+                &identity[ConnIdentity::ConnectPeerOnPlaceholder as usize],
+            ),
+            conn_identity_teardown_key_unmapped: get32(
+                &identity[ConnIdentity::TeardownKeyUnmapped as usize],
             ),
         }
     }
@@ -2351,7 +2380,11 @@ pub struct TransportSnapshot {
     pub conn_identity_duplicate_key: u32,
     pub conn_identity_teardown_key_elsewhere: u32,
     pub conn_identity_teardown_unidentified: u32,
-    pub conn_identity_set_from_placeholder: u32,
+    pub conn_identity_set_from_placeholder_expected: u32,
+    pub conn_identity_set_from_placeholder_other: u32,
+    pub conn_identity_set_from_placeholder_unchecked: u32,
+    pub conn_identity_connect_peer_on_placeholder: u32,
+    pub conn_identity_teardown_key_unmapped: u32,
 }
 
 /// Per-connection RTT distribution fields of [`TransportSnapshot`]; see the
@@ -2388,15 +2421,43 @@ impl TransportSnapshot {
             ConnIdentity::DuplicateKey => self.conn_identity_duplicate_key,
             ConnIdentity::TeardownKeyElsewhere => self.conn_identity_teardown_key_elsewhere,
             ConnIdentity::TeardownUnidentified => self.conn_identity_teardown_unidentified,
-            ConnIdentity::SetFromPlaceholder => self.conn_identity_set_from_placeholder,
+            ConnIdentity::SetFromPlaceholderExpected => {
+                self.conn_identity_set_from_placeholder_expected
+            }
+            ConnIdentity::SetFromPlaceholderOther => self.conn_identity_set_from_placeholder_other,
+            ConnIdentity::SetFromPlaceholderUnchecked => {
+                self.conn_identity_set_from_placeholder_unchecked
+            }
+            ConnIdentity::ConnectPeerOnPlaceholder => {
+                self.conn_identity_connect_peer_on_placeholder
+            }
+            ConnIdentity::TeardownKeyUnmapped => self.conn_identity_teardown_key_unmapped,
         }
     }
 
-    /// Every connection identity kind's label and period count.
-    pub(crate) fn conn_identity_counts(&self) -> impl Iterator<Item = (&'static str, u32)> + '_ {
-        ConnIdentity::ALL
-            .into_iter()
-            .map(|kind| (kind.label(), self.conn_identity(kind)))
+    /// The `conn_identity_<label>` JSON keys and counts of the kinds with a
+    /// non-zero period count. They are zero on almost every node in almost
+    /// every period, so the uploaded JSON carries only these.
+    pub(crate) fn nonzero_conn_identity(&self) -> impl Iterator<Item = (String, u32)> + '_ {
+        ConnIdentity::ALL.into_iter().filter_map(|kind| {
+            let count = self.conn_identity(kind);
+            (count != 0).then(|| (format!("conn_identity_{}", kind.label()), count))
+        })
+    }
+
+    /// The JSON uploaded for this snapshot: its serde form with only the
+    /// non-zero `conn_identity_*` keys. Only the JSON is sparse; the
+    /// struct's serde (and so its bincode layout in the event log) is
+    /// unchanged.
+    pub(crate) fn upload_json(&self) -> serde_json::Result<serde_json::Value> {
+        let mut json = serde_json::to_value(self)?;
+        if let Some(map) = json.as_object_mut() {
+            map.retain(|key, _| !key.starts_with("conn_identity_"));
+            for (key, count) in self.nonzero_conn_identity() {
+                map.insert(key, serde_json::json!(count));
+            }
+        }
+        Ok(json)
     }
 
     /// Copy the per-connection RTT distribution and the redesign-baseline
@@ -2499,7 +2560,11 @@ impl TransportSnapshot {
             conn_identity_duplicate_key,
             conn_identity_teardown_key_elsewhere,
             conn_identity_teardown_unidentified,
-            conn_identity_set_from_placeholder,
+            conn_identity_set_from_placeholder_expected,
+            conn_identity_set_from_placeholder_other,
+            conn_identity_set_from_placeholder_unchecked,
+            conn_identity_connect_peer_on_placeholder,
+            conn_identity_teardown_key_unmapped,
         } = extras;
         self.conn_rtt_connections = conn_rtt_connections;
         self.conn_srtt_p50_us = conn_srtt_p50_us;
@@ -2595,7 +2660,13 @@ impl TransportSnapshot {
         self.conn_identity_duplicate_key = conn_identity_duplicate_key;
         self.conn_identity_teardown_key_elsewhere = conn_identity_teardown_key_elsewhere;
         self.conn_identity_teardown_unidentified = conn_identity_teardown_unidentified;
-        self.conn_identity_set_from_placeholder = conn_identity_set_from_placeholder;
+        self.conn_identity_set_from_placeholder_expected =
+            conn_identity_set_from_placeholder_expected;
+        self.conn_identity_set_from_placeholder_other = conn_identity_set_from_placeholder_other;
+        self.conn_identity_set_from_placeholder_unchecked =
+            conn_identity_set_from_placeholder_unchecked;
+        self.conn_identity_connect_peer_on_placeholder = conn_identity_connect_peer_on_placeholder;
+        self.conn_identity_teardown_key_unmapped = conn_identity_teardown_key_unmapped;
         self
     }
 }
@@ -2774,7 +2845,11 @@ struct SnapshotExtras {
     pub conn_identity_duplicate_key: u32,
     pub conn_identity_teardown_key_elsewhere: u32,
     pub conn_identity_teardown_unidentified: u32,
-    pub conn_identity_set_from_placeholder: u32,
+    pub conn_identity_set_from_placeholder_expected: u32,
+    pub conn_identity_set_from_placeholder_other: u32,
+    pub conn_identity_set_from_placeholder_unchecked: u32,
+    pub conn_identity_connect_peer_on_placeholder: u32,
+    pub conn_identity_teardown_key_unmapped: u32,
 }
 
 impl SnapshotExtras {
@@ -2858,7 +2933,11 @@ impl SnapshotExtras {
             || self.conn_identity_duplicate_key != 0
             || self.conn_identity_teardown_key_elsewhere != 0
             || self.conn_identity_teardown_unidentified != 0
-            || self.conn_identity_set_from_placeholder != 0
+            || self.conn_identity_set_from_placeholder_expected != 0
+            || self.conn_identity_set_from_placeholder_other != 0
+            || self.conn_identity_set_from_placeholder_unchecked != 0
+            || self.conn_identity_connect_peer_on_placeholder != 0
+            || self.conn_identity_teardown_key_unmapped != 0
     }
 }
 
@@ -4465,7 +4544,11 @@ mod tests {
             "conn_identity_duplicate_key",
             "conn_identity_teardown_key_elsewhere",
             "conn_identity_teardown_unidentified",
-            "conn_identity_set_from_placeholder",
+            "conn_identity_set_from_placeholder_expected",
+            "conn_identity_set_from_placeholder_other",
+            "conn_identity_set_from_placeholder_unchecked",
+            "conn_identity_connect_peer_on_placeholder",
+            "conn_identity_teardown_key_unmapped",
         ] {
             assert!(obj.contains_key(key), "missing key {key}");
         }

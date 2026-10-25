@@ -996,7 +996,7 @@ impl TelemetryWorker {
             peer_id: self.local_peer_id.clone(),
             transaction_id: String::new(), // Not tied to a transaction
             event_type: "transport_snapshot".to_string(),
-            event_data: serde_json::to_value(snapshot).unwrap_or_else(|error| {
+            event_data: snapshot.upload_json().unwrap_or_else(|error| {
                 tracing::warn!(%error, "Failed to serialize transport snapshot");
                 serde_json::Value::Null
             }),
@@ -2982,12 +2982,8 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                 "egress_debt_forgiven_bytes".into(),
                 serde_json::json!(snapshot.egress_debt_forgiven_bytes),
             );
-            // Connection identity counts are zero on almost every node in
-            // almost every period, so only non-zero ones are sent.
-            for (label, count) in snapshot.conn_identity_counts() {
-                if count != 0 {
-                    m.insert(format!("conn_identity_{label}"), serde_json::json!(count));
-                }
+            for (key, count) in snapshot.nonzero_conn_identity() {
+                m.insert(key, serde_json::json!(count));
             }
             serde_json::Value::Object(m)
         }
@@ -5401,6 +5397,30 @@ mod tests {
         let snapshot = crate::transport::metrics::TransportSnapshot::default();
         let event = worker.snapshot_to_telemetry(&snapshot);
         assert_eq!(event.event_type, "transport_snapshot");
+        let sent_identity_keys: Vec<&String> = event
+            .event_data
+            .as_object()
+            .expect("snapshot JSON object")
+            .keys()
+            .filter(|key| key.starts_with("conn_identity_"))
+            .collect();
+        assert!(
+            sent_identity_keys.is_empty(),
+            "zero connection identity counts are not uploaded: {sent_identity_keys:?}"
+        );
+        let event = worker.snapshot_to_telemetry(&crate::transport::metrics::TransportSnapshot {
+            conn_identity_duplicate_key: 3,
+            ..Default::default()
+        });
+        let sent_identity_keys: Vec<&String> = event
+            .event_data
+            .as_object()
+            .expect("snapshot JSON object")
+            .keys()
+            .filter(|key| key.starts_with("conn_identity_"))
+            .collect();
+        assert_eq!(sent_identity_keys, vec!["conn_identity_duplicate_key"]);
+        assert_eq!(event.event_data["conn_identity_duplicate_key"], 3);
         assert_eq!(
             event.peer_id, "snapshot-peer-id",
             "transport snapshots must be attributed to the emitting \
@@ -6799,7 +6819,11 @@ mod tests {
             conn_identity_duplicate_key: 72,
             conn_identity_teardown_key_elsewhere: 73,
             conn_identity_teardown_unidentified: 74,
-            conn_identity_set_from_placeholder: 75,
+            conn_identity_set_from_placeholder_expected: 75,
+            conn_identity_set_from_placeholder_other: 76,
+            conn_identity_set_from_placeholder_unchecked: 77,
+            conn_identity_connect_peer_on_placeholder: 78,
+            conn_identity_teardown_key_unmapped: 79,
             ..Default::default()
         };
         let reference = serde_json::to_value(&snapshot).unwrap();
@@ -6821,7 +6845,11 @@ mod tests {
             ("conn_identity_duplicate_key", 72),
             ("conn_identity_teardown_key_elsewhere", 73),
             ("conn_identity_teardown_unidentified", 74),
-            ("conn_identity_set_from_placeholder", 75),
+            ("conn_identity_set_from_placeholder_expected", 75),
+            ("conn_identity_set_from_placeholder_other", 76),
+            ("conn_identity_set_from_placeholder_unchecked", 77),
+            ("conn_identity_connect_peer_on_placeholder", 78),
+            ("conn_identity_teardown_key_unmapped", 79),
         ] {
             assert_eq!(json[key], expected, "event-log value for {key}");
             assert_eq!(json[key], reference[key], "serde value for {key}");
