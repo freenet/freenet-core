@@ -232,6 +232,22 @@ process-global slot that every `SimNetwork::Drop` cleared. So under plain
 other one. Harness state belongs in a registry keyed by the network that
 owns it, and teardown removes only its own entry.
 
+The same class crosses PROCESS boundaries through the filesystem. Many
+`cargo test` processes on one machine (other worktrees, other agents) share
+`/tmp`. `ConfigPathsArgs::default_dirs` maps a test id to a fixed
+`freenet-{id}` dir and deletes it if it exists, so before the fix a second
+process running the same test deleted the first one's live data dir
+(`build Config: No such file or directory`; 6-10 concurrent
+`ring::cost_pressure_seam_tests` processes failed most runs). In unit-test
+builds (`cfg(test)`) those dirs now live under a per-process root,
+`$TMPDIR/freenet-test-<pid>`, owned by an `flock` and swept once its owner
+has exited (`config::test_temp_root`). `flock` liveness needs a local
+`TMPDIR` (not NFS with `nolock`/`local_lock`). Do not put a test's data under a fixed
+path in the shared temp dir; use `tempfile::tempdir()` or `default_dirs`.
+**Integration tests in `crates/core/tests/` are not covered**: they link the
+library without `cfg(test)`, so they still use `/tmp/freenet-{id}` and can
+still collide across processes.
+
 The fix shape for the `tracing` instance is non-obvious enough to record:
 keep **two** permanently-registered dispatchers alive (`tracing_core`'s
 `has_just_one` fast path triggers at `live <= 1`, so one is not enough),
