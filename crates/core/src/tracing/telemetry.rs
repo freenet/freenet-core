@@ -996,7 +996,7 @@ impl TelemetryWorker {
             peer_id: self.local_peer_id.clone(),
             transaction_id: String::new(), // Not tied to a transaction
             event_type: "transport_snapshot".to_string(),
-            event_data: serde_json::to_value(snapshot).unwrap_or_else(|error| {
+            event_data: snapshot.upload_json().unwrap_or_else(|error| {
                 tracing::warn!(%error, "Failed to serialize transport snapshot");
                 serde_json::Value::Null
             }),
@@ -2982,6 +2982,9 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                 "egress_debt_forgiven_bytes".into(),
                 serde_json::json!(snapshot.egress_debt_forgiven_bytes),
             );
+            for (key, count) in snapshot.nonzero_conn_identity() {
+                m.insert(key, serde_json::json!(count));
+            }
             serde_json::Value::Object(m)
         }
         EventKind::InterestSync(interest_sync_event) => {
@@ -5394,6 +5397,30 @@ mod tests {
         let snapshot = crate::transport::metrics::TransportSnapshot::default();
         let event = worker.snapshot_to_telemetry(&snapshot);
         assert_eq!(event.event_type, "transport_snapshot");
+        let sent_identity_keys: Vec<&String> = event
+            .event_data
+            .as_object()
+            .expect("snapshot JSON object")
+            .keys()
+            .filter(|key| key.starts_with("conn_identity_"))
+            .collect();
+        assert!(
+            sent_identity_keys.is_empty(),
+            "zero connection identity counts are not uploaded: {sent_identity_keys:?}"
+        );
+        let event = worker.snapshot_to_telemetry(&crate::transport::metrics::TransportSnapshot {
+            conn_identity_duplicate_key: 3,
+            ..Default::default()
+        });
+        let sent_identity_keys: Vec<&String> = event
+            .event_data
+            .as_object()
+            .expect("snapshot JSON object")
+            .keys()
+            .filter(|key| key.starts_with("conn_identity_"))
+            .collect();
+        assert_eq!(sent_identity_keys, vec!["conn_identity_duplicate_key"]);
+        assert_eq!(event.event_data["conn_identity_duplicate_key"], 3);
         assert_eq!(
             event.peer_id, "snapshot-peer-id",
             "transport snapshots must be attributed to the emitting \
@@ -6605,11 +6632,14 @@ mod tests {
     #[test]
     fn transport_snapshot_json_lists_every_field() {
         let snapshot = crate::transport::metrics::TransportSnapshot::default();
+        // The connection identity keys are sent only when non-zero, so a
+        // default snapshot carries none of them (see the test below).
         let mut expected: std::collections::BTreeSet<String> = serde_json::to_value(&snapshot)
             .unwrap()
             .as_object()
             .unwrap()
             .keys()
+            .filter(|key| !key.starts_with("conn_identity_"))
             .cloned()
             .collect();
         expected.insert("type".to_string());
@@ -6768,5 +6798,104 @@ mod tests {
             snapshot,
         )));
         assert_eq!(json["handshake_unauthenticated_dropped"], 7);
+    }
+
+    /// The event-log JSON carries each connection identity count under its
+    /// own key (distinct non-zero values, so a swapped key is caught).
+    #[test]
+    fn transport_snapshot_json_carries_conn_identity_values() {
+        let snapshot = crate::transport::metrics::TransportSnapshot {
+            conn_identity_set_dialed: 61,
+            conn_identity_set_expected_inbound: 62,
+            conn_identity_set_connect_request: 63,
+            conn_identity_same_connect_request: 64,
+            conn_identity_changed_connect_request: 65,
+            conn_identity_connect_request_known_addr: 66,
+            conn_identity_set_connect_peer: 67,
+            conn_identity_same_connect_peer: 68,
+            conn_identity_changed_connect_peer: 69,
+            conn_identity_changed_ring_promotion: 70,
+            conn_identity_own_key: 71,
+            conn_identity_duplicate_key: 72,
+            conn_identity_teardown_key_elsewhere: 73,
+            conn_identity_teardown_unidentified: 74,
+            conn_identity_set_from_placeholder_expected: 75,
+            conn_identity_set_from_placeholder_other: 76,
+            conn_identity_set_from_placeholder_unchecked: 77,
+            conn_identity_connect_peer_on_placeholder: 78,
+            conn_identity_teardown_key_unmapped: 79,
+            ..Default::default()
+        };
+        let reference = serde_json::to_value(&snapshot).unwrap();
+        let json = event_kind_to_json(&super::super::EventKind::TransportSnapshot(Box::new(
+            snapshot,
+        )));
+        for (key, expected) in [
+            ("conn_identity_set_dialed", 61),
+            ("conn_identity_set_expected_inbound", 62),
+            ("conn_identity_set_connect_request", 63),
+            ("conn_identity_same_connect_request", 64),
+            ("conn_identity_changed_connect_request", 65),
+            ("conn_identity_connect_request_known_addr", 66),
+            ("conn_identity_set_connect_peer", 67),
+            ("conn_identity_same_connect_peer", 68),
+            ("conn_identity_changed_connect_peer", 69),
+            ("conn_identity_changed_ring_promotion", 70),
+            ("conn_identity_own_key", 71),
+            ("conn_identity_duplicate_key", 72),
+            ("conn_identity_teardown_key_elsewhere", 73),
+            ("conn_identity_teardown_unidentified", 74),
+            ("conn_identity_set_from_placeholder_expected", 75),
+            ("conn_identity_set_from_placeholder_other", 76),
+            ("conn_identity_set_from_placeholder_unchecked", 77),
+            ("conn_identity_connect_peer_on_placeholder", 78),
+            ("conn_identity_teardown_key_unmapped", 79),
+        ] {
+            assert_eq!(json[key], expected, "event-log value for {key}");
+            assert_eq!(json[key], reference[key], "serde value for {key}");
+        }
+    }
+
+    /// Each connection identity key is in the event-log JSON exactly when its
+    /// count is non-zero, and every serde `conn_identity_*` field is covered.
+    #[test]
+    fn transport_snapshot_json_sends_conn_identity_keys_only_when_nonzero() {
+        let to_json = |snapshot: crate::transport::metrics::TransportSnapshot| {
+            event_kind_to_json(&super::super::EventKind::TransportSnapshot(Box::new(
+                snapshot,
+            )))
+        };
+        let identity_keys = |json: &serde_json::Value| -> Vec<String> {
+            json.as_object()
+                .unwrap()
+                .keys()
+                .filter(|key| key.starts_with("conn_identity_"))
+                .cloned()
+                .collect()
+        };
+        let zero = crate::transport::metrics::TransportSnapshot::default();
+        assert!(identity_keys(&to_json(zero.clone())).is_empty());
+
+        let serde_keys = identity_keys(&serde_json::to_value(&zero).unwrap());
+        assert_eq!(
+            serde_keys.len(),
+            crate::transport::ConnIdentity::COUNT,
+            "one serde field per kind"
+        );
+        for kind in crate::transport::ConnIdentity::ALL {
+            let key = format!("conn_identity_{}", kind.label());
+            assert!(serde_keys.contains(&key), "serde field {key}");
+            let mut snapshot = zero.clone();
+            let mut serde_value = serde_json::to_value(&snapshot).unwrap();
+            serde_value[key.as_str()] = serde_json::json!(5);
+            snapshot = serde_json::from_value(serde_value).unwrap();
+            let json = to_json(snapshot);
+            assert_eq!(
+                identity_keys(&json),
+                vec![key.clone()],
+                "only {key} is sent"
+            );
+            assert_eq!(json[key.as_str()], 5, "value for {key}");
+        }
     }
 }

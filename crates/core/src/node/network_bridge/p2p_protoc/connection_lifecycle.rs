@@ -4,8 +4,104 @@
 //! Behavior-preserving extraction from `p2p_protoc.rs`.
 
 use super::*;
+use crate::transport::{ConnIdentity, TRANSPORT_METRICS};
+
+/// [`P2pConnManager::record_addr_by_pub_key`] on the fields it touches, for
+/// callers that hold a borrow of another field.
+fn insert_addr_by_pub_key(
+    addr_by_pub_key: &mut BTreeMap<TransportPublicKey, SocketAddr>,
+    connections: &BTreeMap<SocketAddr, ConnectionEntry>,
+    own_key: &TransportPublicKey,
+    key: TransportPublicKey,
+    addr: SocketAddr,
+) {
+    if key == *own_key {
+        TRANSPORT_METRICS.record_conn_identity(addr, ConnIdentity::OwnKey);
+    }
+    // An expected inbound connection holds the placeholder (this node's own
+    // key) until the connect op names the peer, so several can hold it at
+    // once in ordinary operation; recording it is not counted as
+    // `duplicate_key`. Any other connection recorded under this node's key
+    // is counted normally.
+    let is_placeholder = connections
+        .get(&addr)
+        .is_some_and(|entry| entry.placeholder.is_some());
+    let duplicate = |previous: SocketAddr, key: &TransportPublicKey| {
+        previous != addr
+            && connections
+                .get(&previous)
+                .is_some_and(|entry| entry.pub_key.as_ref() == Some(key))
+    };
+    let previous = addr_by_pub_key.get(&key).copied();
+    if !is_placeholder && previous.is_some_and(|previous| duplicate(previous, &key)) {
+        TRANSPORT_METRICS.record_conn_identity(addr, ConnIdentity::DuplicateKey);
+    }
+    addr_by_pub_key.insert(key, addr);
+}
+
+/// The identity kind for a connection whose recorded key is `recorded`
+/// when a ConnectRequest or ConnectPeer names `claimed`: one of the path's
+/// `set`, `same` or `changed` kinds, or `on_placeholder()` when the
+/// connection holds the expected-inbound placeholder and the claim names
+/// another key.
+fn classify_identity_claim(
+    recorded: Option<&TransportPublicKey>,
+    claimed: &TransportPublicKey,
+    is_placeholder: bool,
+    [set, same, changed]: [ConnIdentity; 3],
+    on_placeholder: impl FnOnce() -> ConnIdentity,
+) -> ConnIdentity {
+    match recorded {
+        None => set,
+        Some(recorded) if recorded == claimed => same,
+        Some(_) if is_placeholder => on_placeholder(),
+        Some(_) => changed,
+    }
+}
 
 impl P2pConnManager {
+    /// Record `key` as the identity of the connection at `addr` in
+    /// `addr_by_pub_key`, counting the identity telemetry that depends on
+    /// what the map held: `own_key` when `key` is this node's own key, and
+    /// otherwise `duplicate_key` when the map held the key for another open
+    /// connection that still has that key. Every insert into
+    /// `addr_by_pub_key` goes through here.
+    fn record_addr_by_pub_key(&mut self, key: TransportPublicKey, addr: SocketAddr) {
+        insert_addr_by_pub_key(
+            &mut self.addr_by_pub_key,
+            &self.connections,
+            &self.bridge.op_manager.ring.connection_manager.pub_key,
+            key,
+            addr,
+        );
+    }
+
+    /// Count disconnect cleanup of the connection `entry` at `addr`, when the
+    /// cleanup is not keyed by a key recorded for
+    /// this connection: either it has none (`teardown_unidentified`) or
+    /// `addr_by_pub_key` maps its key to another connection
+    /// (`teardown_key_elsewhere`) or to none (`teardown_key_unmapped`). A
+    /// connection still holding the expected-inbound placeholder is not
+    /// counted: several can hold it at once in ordinary operation. Call
+    /// before `addr_by_pub_key` is changed.
+    fn record_identity_teardown(&self, addr: SocketAddr, entry: &ConnectionEntry) {
+        match &entry.pub_key {
+            None => {
+                TRANSPORT_METRICS.record_conn_identity(addr, ConnIdentity::TeardownUnidentified)
+            }
+            Some(_) if entry.placeholder.is_some() => {}
+            Some(key) => {
+                match self.addr_by_pub_key.get(key) {
+                    Some(mapped) if *mapped == addr => {}
+                    Some(_) => TRANSPORT_METRICS
+                        .record_conn_identity(addr, ConnIdentity::TeardownKeyElsewhere),
+                    None => TRANSPORT_METRICS
+                        .record_conn_identity(addr, ConnIdentity::TeardownKeyUnmapped),
+                }
+            }
+        }
+    }
+
     /// Drop a single connection by socket address: notifies the handshake handler,
     /// prunes topology, handles orphaned transactions, cleans up subscriptions,
     /// and forwards a DropConnection event to the per-peer listener.
@@ -30,6 +126,7 @@ impl P2pConnManager {
             )
         };
         let pub_key_to_remove = entry.pub_key.clone();
+        self.record_identity_teardown(peer_addr, entry);
 
         tracing::trace!(
             peer_addr = %peer_addr,
@@ -143,6 +240,7 @@ impl P2pConnManager {
             )
         };
         let pub_key_to_remove = entry.pub_key.clone();
+        self.record_identity_teardown(peer_addr, entry);
 
         // Non-blocking send to handshake driver to avoid deadlock (#3519).
         // For zombie transports (already established connections), the expected_inbound
@@ -356,6 +454,18 @@ impl P2pConnManager {
                         .ok();
                     return Ok(());
                 }
+                // Promoting under a key other than the connection's own,
+                // unless the connection holds the expected-inbound
+                // placeholder (counted as `connect_peer_on_placeholder`
+                // below).
+                let promotes_under_other_key =
+                    self.connections.get(&peer_addr).is_some_and(|entry| {
+                        entry.placeholder.is_none()
+                            && entry
+                                .pub_key
+                                .as_ref()
+                                .is_some_and(|recorded| recorded != peer.pub_key())
+                    });
                 // #4787 instrumentation: count the promotion only if the ring
                 // actually took the connection. `add_connection`'s own `bool`
                 // reports the readiness-threshold crossing, NOT acceptance, so
@@ -375,6 +485,13 @@ impl P2pConnManager {
                     .await;
                 if outcome.added {
                     crate::node::network_status::record_bootstrap_promoted_to_ring();
+                    // Gated on `added`. No test reaches a refusal here: the
+                    // cap check above refuses first, and `add_connection`
+                    // refuses after it only under a concurrent add.
+                    if promotes_under_other_key {
+                        TRANSPORT_METRICS
+                            .record_conn_identity(peer_addr, ConnIdentity::ChangedRingPromotion);
+                    }
                 }
                 let just_became_ready = outcome.just_became_ready;
                 tracing::info!(
@@ -434,8 +551,8 @@ impl P2pConnManager {
             if let Some(entry) = self.connections.get_mut(&peer_addr) {
                 if entry.pub_key.is_none() {
                     entry.pub_key = Some(peer.pub_key().clone());
-                    self.addr_by_pub_key
-                        .insert(peer.pub_key().clone(), peer_addr);
+                    TRANSPORT_METRICS.record_conn_identity(peer_addr, ConnIdentity::SetConnectPeer);
+                    self.record_addr_by_pub_key(peer.pub_key().clone(), peer_addr);
                     tracing::info!(
                         tx = %tx,
                         %peer_addr,
@@ -443,6 +560,23 @@ impl P2pConnManager {
                         "connect_peer: updated transport entry with peer identity"
                     );
                 } else {
+                    let kind = classify_identity_claim(
+                        entry.pub_key.as_ref(),
+                        peer.pub_key(),
+                        entry.placeholder.is_some(),
+                        [
+                            // Not reachable: this branch has a recorded key.
+                            ConnIdentity::SetConnectPeer,
+                            ConnIdentity::SameConnectPeer,
+                            ConnIdentity::ChangedConnectPeer,
+                        ],
+                        // ConnectPeer leaves the placeholder in place.
+                        || ConnIdentity::ConnectPeerOnPlaceholder,
+                    );
+                    TRANSPORT_METRICS.record_conn_identity(peer_addr, kind);
+                    if let Some(placeholder) = &mut entry.placeholder {
+                        placeholder.connect_peer_key = Some(peer.pub_key().clone());
+                    }
                     tracing::info!(
                         tx = %tx,
                         %peer_addr,
@@ -710,6 +844,7 @@ impl P2pConnManager {
                     None,
                     is_transient,
                     handshake_commands,
+                    ConnIdentity::SetExpectedInbound,
                 )
                 .await?;
             }
@@ -760,6 +895,7 @@ impl P2pConnManager {
                     None,
                     transient,
                     handshake_commands,
+                    ConnIdentity::SetDialed,
                 )
                 .await?;
             }
@@ -926,6 +1062,11 @@ impl P2pConnManager {
         Ok(())
     }
 
+    /// `identity_source` is the identity telemetry kind counted when
+    /// `peer_id` is known and the connection is recorded under its key.
+    // `identity_source` is telemetry carried alongside the connection, as
+    // `origin` is on `handle_connect_peer`.
+    #[allow(clippy::too_many_arguments)]
     async fn handle_successful_connection(
         &mut self,
         peer_id: Option<PeerKeyLocation>,
@@ -934,6 +1075,7 @@ impl P2pConnManager {
         remaining_checks: Option<usize>,
         is_transient: bool,
         handshake_commands: &HandshakeCommandSender,
+        identity_source: ConnIdentity,
     ) -> anyhow::Result<()> {
         let mut broadcast_ready: Option<bool> = None;
         let connection_manager = &self.bridge.op_manager.ring.connection_manager;
@@ -971,6 +1113,7 @@ impl P2pConnManager {
         // peer_connection_listener to fire TransportClosed; the connection_id mechanism
         // ensures that stale event won't remove the new entry.
         if let Some(old) = self.connections.remove(&peer_addr) {
+            self.record_identity_teardown(peer_addr, &old);
             if let Some(ref old_pub_key) = old.pub_key {
                 self.addr_by_pub_key.remove(old_pub_key);
             }
@@ -1083,6 +1226,11 @@ impl P2pConnManager {
                 // For transient connections, we don't know the pub_key yet - it will be learned
                 // when the peer sends its first message (e.g., ConnectRequest)
                 pub_key: peer_id.as_ref().map(|p| p.pub_key().clone()),
+                // Telemetry only: every expected-inbound registration
+                // carries the placeholder (`NodeEvent::ExpectPeerConnection`).
+                placeholder: (peer_id.is_some()
+                    && identity_source == ConnIdentity::SetExpectedInbound)
+                    .then(IdentityPlaceholder::default),
                 connection_id: conn_id,
                 created_at: now,
                 link_use: link_use.clone(),
@@ -1109,8 +1257,14 @@ impl P2pConnManager {
         // Only add to reverse lookup if we know the pub_key
         // For transient connections, this will be populated when identity is learned
         if let Some(ref peer) = peer_id {
-            self.addr_by_pub_key
-                .insert(peer.pub_key().clone(), peer_addr);
+            TRANSPORT_METRICS.record_conn_identity(peer_addr, identity_source);
+            insert_addr_by_pub_key(
+                &mut self.addr_by_pub_key,
+                &self.connections,
+                &connection_manager.pub_key,
+                peer.pub_key().clone(),
+                peer_addr,
+            );
         }
         let Some(conn_events) = self.conn_event_tx.as_ref().cloned() else {
             anyhow::bail!("Connection event channel not initialized");
@@ -1448,10 +1602,35 @@ impl P2pConnManager {
                             // Check if we have a connection but with a different pub_key
                             if let Some(entry) = self.connections.get(&remote_addr) {
                                 // If we don't have the pub_key stored yet or it differs from the new one, update it
-                                let should_update = match &entry.pub_key {
-                                    None => true,
-                                    Some(old_pub_key) => old_pub_key != new_peer_id.pub_key(),
-                                };
+                                let identity = classify_identity_claim(
+                                    entry.pub_key.as_ref(),
+                                    new_peer_id.pub_key(),
+                                    entry.placeholder.is_some(),
+                                    [
+                                        ConnIdentity::SetConnectRequest,
+                                        ConnIdentity::SameConnectRequest,
+                                        ConnIdentity::ChangedConnectRequest,
+                                    ],
+                                    // This request replaces the placeholder.
+                                    || match entry.placeholder.as_ref().and_then(|placeholder| {
+                                        placeholder.connect_peer_key.as_ref()
+                                    }) {
+                                        Some(expected) if expected == new_peer_id.pub_key() => {
+                                            ConnIdentity::SetFromPlaceholderExpected
+                                        }
+                                        Some(_) => ConnIdentity::SetFromPlaceholderOther,
+                                        None => ConnIdentity::SetFromPlaceholderUnchecked,
+                                    },
+                                );
+                                TRANSPORT_METRICS.record_conn_identity(remote_addr, identity);
+                                if sender_addr == Some(remote_addr) {
+                                    TRANSPORT_METRICS.record_conn_identity(
+                                        remote_addr,
+                                        ConnIdentity::ConnectRequestKnownAddr,
+                                    );
+                                }
+                                let should_update =
+                                    entry.pub_key.as_ref() != Some(new_peer_id.pub_key());
                                 if should_update {
                                     let old_pub_key = entry.pub_key.clone();
                                     let is_first_identity = old_pub_key.is_none();
@@ -1475,10 +1654,14 @@ impl P2pConnManager {
                                     // Update the entry's pub_key
                                     if let Some(entry) = self.connections.get_mut(&remote_addr) {
                                         entry.pub_key = Some(new_peer_id.pub_key().clone());
+                                        // Telemetry only: the placeholder is replaced.
+                                        entry.placeholder = None;
                                     }
                                     // Add new reverse lookup
-                                    self.addr_by_pub_key
-                                        .insert(new_peer_id.pub_key().clone(), remote_addr);
+                                    self.record_addr_by_pub_key(
+                                        new_peer_id.pub_key().clone(),
+                                        remote_addr,
+                                    );
                                     // Note: We do NOT automatically promote to ring here.
                                     // Transient connections are promoted only when the Connect
                                     // operation explicitly accepts via NodeEvent::ConnectPeer,
@@ -1527,6 +1710,7 @@ impl P2pConnManager {
                 }
                 // Look up the connection directly by address
                 if let Some(entry) = self.connections.remove(&remote_addr) {
+                    self.record_identity_teardown(remote_addr, &entry);
                     // Construct PeerKeyLocation for prune_connection and DropConnection
                     let peer = if let Some(ref pub_key) = entry.pub_key {
                         PeerKeyLocation::new(pub_key.clone(), remote_addr)
@@ -1624,6 +1808,9 @@ fn dial_origin(
         origin
     }
 }
+
+#[cfg(test)]
+mod tests;
 
 #[cfg(test)]
 mod dial_origin_tests {

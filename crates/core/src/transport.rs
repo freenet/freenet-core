@@ -242,7 +242,7 @@ pub use congestion_control::{
     CongestionControlStats, CongestionController,
 };
 // Re-export transport metrics for periodic telemetry snapshots
-pub(crate) use metrics::NatAttemptOrigin;
+pub(crate) use metrics::{ConnIdentity, NatAttemptOrigin};
 pub use metrics::{TRANSPORT_METRICS, TransportMetrics, TransportSnapshot};
 // Re-export reset functions for deterministic simulation testing
 pub use self::boundary::StreamId;

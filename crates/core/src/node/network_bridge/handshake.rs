@@ -121,6 +121,13 @@ pub(crate) enum Command {
 pub(crate) struct CommandSender(mpsc::Sender<Command>);
 
 impl CommandSender {
+    /// A sender onto `tx`, for tests that drive the event-loop handlers
+    /// without a handshake driver.
+    #[cfg(test)]
+    pub(crate) fn for_test(tx: mpsc::Sender<Command>) -> Self {
+        Self(tx)
+    }
+
     /// Non-blocking send that returns false if the channel is full or closed.
     ///
     /// This is the ONLY way to enqueue a handshake command. Every caller runs

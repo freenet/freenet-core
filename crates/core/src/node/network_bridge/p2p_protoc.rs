@@ -526,6 +526,16 @@ impl NetworkBridge for P2pBridge {
 type PeerConnChannelSender = Sender<Either<NetMessage, ConnEvent>>;
 type PeerConnChannelRecv = Receiver<Either<NetMessage, ConnEvent>>;
 
+/// Telemetry state of a connection that holds the expected-inbound
+/// placeholder (see `ConnectionEntry::placeholder`).
+#[derive(Debug, Default)]
+struct IdentityPlaceholder {
+    /// The key the latest ConnectPeer named for the connection, compared
+    /// with the key the ConnectRequest that replaces the placeholder gives
+    /// (`conn_identity_set_from_placeholder_*`).
+    connect_peer_key: Option<TransportPublicKey>,
+}
+
 /// Entry in the connections HashMap, keyed by SocketAddr.
 /// The pub_key is learned from the first message received on this connection.
 #[derive(Debug)]
@@ -534,6 +544,11 @@ struct ConnectionEntry {
     /// The peer's public key, learned from the first message.
     /// None for transient connections before identity is established.
     pub_key: Option<TransportPublicKey>,
+    /// Telemetry only, never read for any decision: `Some` while `pub_key`
+    /// is the expected-inbound placeholder (this node's own key, set by the
+    /// registration), `None` on every other connection and once a
+    /// ConnectRequest replaces the placeholder.
+    placeholder: Option<IdentityPlaceholder>,
     /// Unique ID for this connection entry. Used to distinguish stale
     /// TransportClosed events from replaced connections (e.g., after identity change).
     connection_id: u64,
@@ -5061,6 +5076,7 @@ pub(crate) mod tests {
             super::ConnectionEntry {
                 sender: tx1,
                 pub_key: None,
+                placeholder: None,
                 connection_id: 10,
                 created_at: Instant::now(),
                 link_use: super::zombie_sweep::LinkUseStamp::new(Instant::now()),
@@ -5073,6 +5089,7 @@ pub(crate) mod tests {
             super::ConnectionEntry {
                 sender: tx2,
                 pub_key: None,
+                placeholder: None,
                 connection_id: 20,
                 created_at: Instant::now(),
                 link_use: super::zombie_sweep::LinkUseStamp::new(Instant::now()),
