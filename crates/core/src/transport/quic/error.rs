@@ -204,7 +204,17 @@ pub(in crate::transport) fn attribute(
         | QuicErrorKind::InvalidFrame
         | QuicErrorKind::StreamClosed => kind,
         QuicErrorKind::ConnectionLost
-        | QuicErrorKind::Refused { .. }
+        | QuicErrorKind::Refused {
+            reason:
+                QuicRefusal::Handshake
+                | QuicRefusal::Version
+                | QuicRefusal::ConnectionRefused
+                | QuicRefusal::Downgrade
+                | QuicRefusal::AllowSetFull
+                | QuicRefusal::KeyConflict
+                | QuicRefusal::UnusableKey
+                | QuicRefusal::Local,
+        }
         | QuicErrorKind::TimedOut
         | QuicErrorKind::EndpointDown
         | QuicErrorKind::Protocol { .. } => {
@@ -369,7 +379,9 @@ impl From<QuicAllowError> for QuicErrorKind {
 }
 
 impl QuicError {
-    /// Any error the QUIC code produces, mapped to its kind.
+    /// Any error the QUIC code produces, mapped to its kind. Without the
+    /// endpoint's availability: for a connection-scope error use
+    /// `QuicEndpoint::error_kind`, which attributes it to a down endpoint.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(in crate::transport) fn of(error: impl Into<QuicErrorKind>) -> Self {
         QuicError(error.into())
@@ -382,7 +394,9 @@ impl QuicError {
     }
 }
 
-/// Any error the QUIC code produces, as a [`TransportError::Quic`].
+/// Any error the QUIC code produces, as a [`TransportError::Quic`]. Like
+/// `QuicError::of`, unattributed: build connection-scope errors from
+/// `QuicEndpoint::error_kind`.
 #[cfg_attr(not(test), allow(dead_code))]
 pub(in crate::transport) fn transport_error(error: impl Into<QuicErrorKind>) -> TransportError {
     TransportError::from(error.into())

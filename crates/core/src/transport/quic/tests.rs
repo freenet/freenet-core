@@ -2571,22 +2571,17 @@ fn endpoint_death_turns_quic_off_without_stopping_the_node() {
         assert_eq!(pair.a.availability().get(), QuicAvailability::Down);
         assert_eq!(TRANSPORT_METRICS.quic_endpoint_down_at(pair.a_addr), 1);
 
-        // The endpoint's connection ends, blamed on this endpoint, not on
-        // the peer, and a new one cannot start. quinn reports a local
-        // INTERNAL_ERROR or, once the connection's driver closed it,
-        // LocallyClosed; neither may read as the peer's fault.
+        // The endpoint's connection ends, and with the availability Down it
+        // is blamed on this endpoint, not on the peer, whichever error quinn
+        // reports (a local INTERNAL_ERROR, or LocallyClosed once the
+        // connection's driver closed it; which one depends on scheduling,
+        // so only the attributed kind is asserted). A new one cannot start.
         let c = client.inner().clone();
         let ended = drive(&pair.time, Duration::from_secs(60), async move {
             c.closed().await
         })
         .await;
-        assert!(
-            matches!(
-                QuicErrorKind::from(ended.clone()),
-                QuicErrorKind::EndpointDown | QuicErrorKind::ConnectionLost
-            ),
-            "{ended:?}"
-        );
+        assert_eq!(pair.a.availability().get(), QuicAvailability::Down);
         assert_eq!(
             pair.a.error_kind(ended.clone()),
             QuicErrorKind::EndpointDown,

@@ -1073,6 +1073,12 @@ Errors: TransportError::Quic(QuicError), beside TransportError::Udp and
     with the endpoint's availability: use it, not the bare mapping, to
     decide what to do (after endpoint death quinn reports an
     INTERNAL_ERROR or, once its implicit close ran, LocallyClosed).
+    Window: quinn's EndpointDriver::drop ends the connections before the
+    watcher records Down, so on a multi-thread runtime a connection can
+    end as Protocol{0x1} while the availability still reads Up. e5 must
+    not take an irreversible per-peer action on Protocol{0x1} without
+    re-checking after a short timeout on availability().not_up() (which
+    never returns while the endpoint is healthy).
   → A connection-scope QUIC error ends the QUIC path only. e5 handles it
     inside the transport (fallback to the UDP session, which stays up)
     and never surfaces it to operations.

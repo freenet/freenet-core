@@ -519,6 +519,7 @@ impl QuicEndpoint {
     /// consumers. A second call logs a WARN, starts nothing and returns
     /// `false`.
     #[cfg_attr(not(test), allow(dead_code))]
+    #[must_use = "false means no accept loop was started"]
     pub(crate) fn spawn_accept_loop(
         &self,
         monitor: &BackgroundTaskMonitor,
@@ -579,6 +580,16 @@ impl QuicEndpoint {
     /// read or write error, a path send error, a connect error), attributed
     /// to the endpoint when it is `Down` (see [`error::attribute`]). Use
     /// this, not the bare mapping, to decide what to do about an error.
+    ///
+    /// There is a short window where the attribution is not yet possible:
+    /// quinn's `EndpointDriver::drop` ends the endpoint's connections (local
+    /// INTERNAL_ERROR) before the driver's watcher records `Down`, so on a
+    /// multi-thread runtime a connection can end as `Protocol { code: 0x1 }`
+    /// while the availability still reads `Up`. e5 must not take an
+    /// irreversible per-peer action (a ban, a long backoff) on
+    /// `Protocol { code: 0x1 }` without re-checking: wait on
+    /// `availability().not_up()` with a short timeout (it never returns
+    /// while the endpoint is healthy), then call this again.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(in crate::transport) fn error_kind(
         &self,
