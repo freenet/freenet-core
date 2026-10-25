@@ -2814,3 +2814,65 @@ fn the_transport_reports_quic_availability() {
         unregister_network_time_source(network);
     })
 }
+
+/// Closers racing on one connection (the receive supervisor and the
+/// path's owner on two threads) record exactly one close. The guard is
+/// also checked deterministically: a closer that finds a close already in
+/// progress sends and counts nothing, so the connection stays open.
+#[test]
+fn concurrent_closers_close_and_count_once() {
+    bounded(|| async move {
+        use crate::transport::metrics::{QuicCloseCode, TRANSPORT_METRICS};
+        let _seed = GlobalRng::seed_guard(SEED);
+        let pair = pair(
+            "quic-close-once",
+            "10.201.36.1:5000".parse().unwrap(),
+            "10.201.36.2:5000".parse().unwrap(),
+            None,
+        )
+        .await;
+
+        // Deterministic: a close already in progress wins.
+        let (_, client, _server) = pair.transfer(payload(100), Duration::from_secs(60)).await;
+        let closer = client.closer();
+        closer.mark_closing();
+        assert!(!client.closer().close(QuicCloseCode::Downgrade));
+        assert!(
+            client.inner().close_reason().is_none(),
+            "the second closer did not close"
+        );
+        assert!(TRANSPORT_METRICS.quic_close_sent_to(pair.b_addr).is_empty());
+        drop((client, _server));
+        assert!(
+            TRANSPORT_METRICS.quic_close_sent_to(pair.b_addr).is_empty(),
+            "dropping the handle is a closer too"
+        );
+
+        // Racing: many threads, released at once.
+        let (_, client, _server) = pair.transfer(payload(100), Duration::from_secs(60)).await;
+        let threads = 8;
+        let barrier = Arc::new(std::sync::Barrier::new(threads));
+        let closed: usize = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..threads)
+                .map(|i| {
+                    let closer = client.closer();
+                    let barrier = barrier.clone();
+                    scope.spawn(move || {
+                        barrier.wait();
+                        let code = if i % 2 == 0 {
+                            QuicCloseCode::Downgrade
+                        } else {
+                            QuicCloseCode::NodeDroppedPeer
+                        };
+                        usize::from(closer.close(code))
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).sum()
+        });
+        assert_eq!(closed, 1, "exactly one closer closed");
+        assert_eq!(TRANSPORT_METRICS.quic_close_sent_to(pair.b_addr).len(), 1);
+        drop((client, _server));
+        assert_eq!(TRANSPORT_METRICS.quic_close_sent_to(pair.b_addr).len(), 1);
+    });
+}

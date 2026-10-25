@@ -403,8 +403,9 @@ fn stream_kinds_keep_the_connection_and_the_rest_end_it() {
         (QuicErrorKind::InvalidFrame, ErrorScope::Stream),
         (QuicErrorKind::StreamClosed, ErrorScope::Stream),
     ];
-    // (code, retryable), every stop and reset code plus unknown ones.
-    let codes = [
+    // (stop code, retryable): every stop code, unknown ones, and the
+    // deterministic RESET value, which is a retryable stop.
+    let stops = [
         (stop_code::HEADER_REFUSED, false),
         (stop_code::BUDGET_REFUSED, true),
         (stop_code::STREAM_ID_IN_USE, true),
@@ -413,25 +414,45 @@ fn stream_kinds_keep_the_connection_and_the_rest_end_it() {
         (stop_code::EVICTED, true),
         (stop_code::CANCELLED, true),
         (stop_code::FRAGMENT_REFUSED, false),
-        (reset_code::SENDER_ABORTED, true),
-        (reset_code::LENGTH_MISMATCH, false),
+        (reset_code::LENGTH_MISMATCH, true),
         (0x1f, true),
         (9, true),
     ];
+    // (reset code, retryable): every reset code, unknown ones, and the
+    // deterministic STOP values, which are retryable resets.
+    let resets = [
+        (reset_code::SENDER_ABORTED, true),
+        (reset_code::LENGTH_MISMATCH, false),
+        (stop_code::HEADER_REFUSED, true),
+        (stop_code::OVERLONG, true),
+        (stop_code::FRAGMENT_REFUSED, true),
+        (0x2f, true),
+        (9, true),
+    ];
     assert_eq!(
-        codes.len(),
-        stop_code::ALL.len() + reset_code::ALL.len() + 2,
-        "every code has a row"
+        stops.len(),
+        stop_code::ALL.len() + 3,
+        "every stop code has a row"
     );
-    for (code, retryable) in codes {
-        let scope = if retryable {
+    assert_eq!(
+        resets.len(),
+        reset_code::ALL.len() + 5,
+        "every reset code has a row"
+    );
+    let scope = |retryable: bool| {
+        if retryable {
             ErrorScope::Transient
         } else {
             ErrorScope::Stream
-        };
+        }
+    };
+    for (code, retryable) in stops {
         let code = u64::from(code);
-        cases.push((QuicErrorKind::Stopped { code }, scope));
-        cases.push((QuicErrorKind::Reset { code }, scope));
+        cases.push((QuicErrorKind::Stopped { code }, scope(retryable)));
+    }
+    for (code, retryable) in resets {
+        let code = u64::from(code);
+        cases.push((QuicErrorKind::Reset { code }, scope(retryable)));
     }
     for (kind, scope) in cases {
         let error = transport_error(kind);

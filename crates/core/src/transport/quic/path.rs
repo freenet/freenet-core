@@ -443,6 +443,7 @@ impl QuicPath {
         }
         let receive = GlobalExecutor::spawn(supervise_receive(
             connection.inner().clone(),
+            connection.closer(),
             Arc::new(receiver),
             stats.clone(),
         ));
@@ -630,6 +631,7 @@ fn frame_metadata(metadata: Option<&[u8]>) -> &[u8] {
 /// task, which is not counted.
 async fn supervise_receive<T: TimeSource>(
     connection: quinn::Connection,
+    closer: super::QuicCloser,
     receiver: Arc<inbound::Receiver<T>>,
     stats: Arc<QuicPathStats>,
 ) {
@@ -644,8 +646,8 @@ async fn supervise_receive<T: TimeSource>(
             "QUIC path: the receive task panicked; closing the connection"
         );
     }
-    // Only if still open (close_connection checks): see there.
-    super::close_connection(&connection, QuicCloseCode::Downgrade);
+    // Only if still open and not already being closed (QuicCloser).
+    closer.close(QuicCloseCode::Downgrade);
 }
 
 /// A uni stream being written that sees the peer stop it even while a

@@ -1049,7 +1049,9 @@ Errors: TransportError::Quic(QuicError), beside TransportError::Udp and
     the codes that refuse the message itself: HEADER_REFUSED, OVERLONG,
     FRAGMENT_REFUSED (the receiver's buffer refused a fragment; distinct
     from CANCELLED, which means the consumer is gone) and LENGTH_MISMATCH
-    (stream_code_is_retryable).
+    (stop_is_retryable, reset_is_retryable: classified per namespace, so
+    a reset carrying a deterministic stop value, or a stop carrying
+    LENGTH_MISMATCH's value, is retryable).
   → Stream scope (fails the same way again): those codes, InvalidFrame,
     StreamClosed (a local misuse of quinn's stream API).
   → Connection scope: ConnectionLost (peer closed with NODE_DROPPED_PEER
@@ -1095,10 +1097,13 @@ Application error codes, one range per QUIC frame type, all one-byte
   The close codes are wire values a peer on another release reads: never
   renumber them; add a new code at the next free value. A code the peer
   does not know reads as ConnectionLost. Every close the QUIC code sends
-  goes through quic::close_connection (QuicConnection::close and Drop,
-  which sends NODE_DROPPED_PEER): it closes and counts only a connection
-  that is still open, so a second close neither replaces the peer's
-  reason nor counts again. Never call quinn's close with a bare number.
+  goes through the connection's QuicCloser (QuicConnection::close and
+  Drop, which sends NODE_DROPPED_PEER, and the path's receive
+  supervisor, which shares the closer): a flag swapped once per
+  connection lets exactly one caller, on any thread, close it, and only
+  if it is still open, so a second or concurrent close neither replaces
+  the peer's reason nor counts again. Never call quinn's close with a
+  bare number.
 Liveness ("alive" = the endpoint driver has not ENDED; it does not mean
   the endpoint is making progress): quinn spawns its endpoint driver
   itself and keeps no handle. QuicRuntime wraps the FIRST task quinn

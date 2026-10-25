@@ -770,6 +770,9 @@ impl QuicIncoming {
 /// timed out, failed, or dropped here (dropping closes it).
 pub(crate) struct QuicConnection {
     connection: quinn::Connection,
+    /// Closes the connection at most once, shared with the path's receive
+    /// supervisor.
+    closer: QuicCloser,
     /// The key the peer proved in the handshake.
     peer: PeerKey,
 }
@@ -801,7 +804,12 @@ impl QuicConnection {
             drop(hold);
             drop(permit);
         });
-        Self { connection, peer }
+        let closer = QuicCloser::new(connection.clone());
+        Self {
+            connection,
+            closer,
+            peer,
+        }
     }
 
     /// The key the peer proved in the handshake: as client, the server's
@@ -825,24 +833,64 @@ impl QuicConnection {
     /// open.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn close(&self, code: QuicCloseCode) {
-        close_connection(&self.connection, code);
+        self.closer.close(code);
+    }
+
+    /// The connection's closer, for another task that may close it (the
+    /// path's receive supervisor).
+    pub(crate) fn closer(&self) -> QuicCloser {
+        self.closer.clone()
     }
 }
 
 impl Drop for QuicConnection {
     fn drop(&mut self) {
-        close_connection(&self.connection, QuicCloseCode::NodeDroppedPeer);
+        self.closer.close(QuicCloseCode::NodeDroppedPeer);
     }
 }
 
-/// Close `connection` with `code` if it is still open, and count it. Only
-/// if still open: closing an ended connection again would count a close
-/// that sent nothing, and replace the reason quinn reports (the peer's
-/// close) with LocallyClosed. Not atomic: a peer close landing between the
-/// check and `close` is reported as LocallyClosed and still counted.
-pub(crate) fn close_connection(connection: &quinn::Connection, code: QuicCloseCode) {
-    if connection.close_reason().is_none() {
-        TRANSPORT_METRICS.record_quic_close_sent(code, connection.remote_address());
-        connection.close(code.code().into(), code.reason());
+/// Closes one QUIC connection at most once, from any number of clones.
+/// Every close the QUIC code sends goes through here.
+#[derive(Clone)]
+pub(crate) struct QuicCloser {
+    connection: quinn::Connection,
+    /// Set by the first close attempt, in one step: a second caller, on
+    /// any thread, sends and counts nothing.
+    closing: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl QuicCloser {
+    fn new(connection: quinn::Connection) -> Self {
+        Self {
+            connection,
+            closing: Arc::default(),
+        }
+    }
+
+    /// Close the connection with `code` and count it, if no close was
+    /// attempted before and the connection is still open. Returns whether
+    /// this call closed it. Only if still open: closing an ended connection
+    /// would count a close that sent nothing and replace the reason quinn
+    /// reports (the peer's close) with LocallyClosed. A peer close landing
+    /// between the check and `close` is still reported as LocallyClosed and
+    /// counted; two local closers can no longer both count.
+    pub(crate) fn close(&self, code: QuicCloseCode) -> bool {
+        if self.closing.swap(true, std::sync::atomic::Ordering::AcqRel) {
+            return false;
+        }
+        if self.connection.close_reason().is_some() {
+            return false;
+        }
+        TRANSPORT_METRICS.record_quic_close_sent(code, self.connection.remote_address());
+        self.connection.close(code.code().into(), code.reason());
+        true
+    }
+
+    /// Mark a close as in progress without closing (tests: a second
+    /// closer arriving while the first has not closed yet).
+    #[cfg(test)]
+    pub(crate) fn mark_closing(&self) {
+        self.closing
+            .store(true, std::sync::atomic::Ordering::Release);
     }
 }

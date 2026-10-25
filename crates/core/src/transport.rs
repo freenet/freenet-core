@@ -477,11 +477,12 @@ pub(in crate::transport) enum QuicErrorKind {
     /// The stream was reset with this code: by the peer while this node was
     /// reading it, or by this node, which abandoned a send whose source
     /// failed (`reset_code::SENDER_ABORTED`). Transient or stream scope by
-    /// code (`quic::error::stream_code_is_retryable`).
+    /// code (`quic::error::reset_is_retryable`).
     #[error("QUIC stream reset with code {code}")]
     Reset { code: u64 },
     /// The peer stopped the stream (STOP_SENDING) with this code
-    /// (`stop_code`). Transient or stream scope by code, as for `Reset`.
+    /// (`stop_code`). Transient or stream scope by code
+    /// (`quic::error::stop_is_retryable`).
     #[error("QUIC stream stopped by the peer with code {code}")]
     Stopped { code: u64 },
     /// The connection was refused, or ended by a refusal. Connection scope.
@@ -616,9 +617,16 @@ impl TransportError {
         match self {
             TransportError::OutboundStreamFailed(..)
             | TransportError::Udp(UdpError(UdpErrorKind::SendFailed(..))) => ErrorScope::Transient,
-            TransportError::Quic(QuicError(
-                QuicErrorKind::Reset { code } | QuicErrorKind::Stopped { code },
-            )) if quic::error::stream_code_is_retryable(*code) => ErrorScope::Transient,
+            TransportError::Quic(QuicError(QuicErrorKind::Stopped { code }))
+                if quic::error::stop_is_retryable(*code) =>
+            {
+                ErrorScope::Transient
+            }
+            TransportError::Quic(QuicError(QuicErrorKind::Reset { code }))
+                if quic::error::reset_is_retryable(*code) =>
+            {
+                ErrorScope::Transient
+            }
             TransportError::OutboundStreamInvalidLength(..)
             | TransportError::Quic(QuicError(
                 QuicErrorKind::Reset { .. }
@@ -1188,13 +1196,15 @@ mod tests {
                     (ErrorScope::Connection, false, true)
                 }
                 TransportError::Quic(QuicError(kind)) => match kind {
-                    // Codes that refuse the message itself, written out:
-                    // 0x11 HEADER_REFUSED, 0x15 OVERLONG, 0x18
-                    // FRAGMENT_REFUSED, 0x22 LENGTH_MISMATCH. Every other
-                    // code, known or not, is retryable.
-                    QuicErrorKind::Reset { code } | QuicErrorKind::Stopped { code }
-                        if ![0x11, 0x15, 0x18, 0x22].contains(code) =>
-                    {
+                    // Codes that refuse the message itself, written out per
+                    // namespace: stops 0x11 HEADER_REFUSED, 0x15 OVERLONG,
+                    // 0x18 FRAGMENT_REFUSED; resets 0x22 LENGTH_MISMATCH.
+                    // Every other code in each namespace, known or not, is
+                    // retryable.
+                    QuicErrorKind::Stopped { code } if ![0x11, 0x15, 0x18].contains(code) => {
+                        (ErrorScope::Transient, true, false)
+                    }
+                    QuicErrorKind::Reset { code } if *code != 0x22 => {
                         (ErrorScope::Transient, true, false)
                     }
                     QuicErrorKind::Reset { .. }
@@ -1238,6 +1248,11 @@ mod tests {
             TransportError::from(QuicErrorKind::Stopped { code: 0x18 }),
             TransportError::from(QuicErrorKind::Reset { code: 0x22 }),
             TransportError::from(QuicErrorKind::Stopped { code: 0x1f }),
+            // Cross-namespace values: a reset carrying a deterministic stop
+            // value, and a stop carrying the deterministic reset value.
+            TransportError::from(QuicErrorKind::Reset { code: 0x11 }),
+            TransportError::from(QuicErrorKind::Reset { code: 0x18 }),
+            TransportError::from(QuicErrorKind::Stopped { code: 0x22 }),
             TransportError::from(QuicErrorKind::Refused {
                 reason: QuicRefusal::Downgrade,
             }),
