@@ -32,6 +32,11 @@
 //!   longer than that (an RTT near 2 s) counts only the last [`HORIZON`];
 //! - at most [`MAX_TRACKED_SHORTS`] short messages are remembered;
 //! - streams the per-connection budget (1024) refuses are not counted;
+//! - open streams and the queue length are read when the connection
+//!   processes the message, not when it arrived, so a stream that ended
+//!   while the message waited in the queue is missed;
+//! - packets the listener dropped because the queue was full are not
+//!   counted until they are retransmitted, and then at the later time;
 //! - a stream that arrives whole in one fragment is counted as a short
 //!   message on the legacy path (never charged) but as an open stream on
 //!   the operations path (charged until its consumers let go).

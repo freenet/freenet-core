@@ -2597,22 +2597,20 @@ pub struct TransportSnapshot {
     pub conn_identity_teardown_key_unmapped: u32,
     /// Inbound concurrency per connection during the period (one snapshot
     /// window, `transport_snapshot_interval_secs`, default 30 s): an
-    /// estimate, at each inbound message, of the inbound QUIC streams the
-    /// connection would hold open (open inbound streams plus short messages
-    /// received within one smoothed RTT + 25 ms; see
-    /// `peer_connection::inbound_concurrency`). Of the connections with at
-    /// least one inbound message (`inbound_concurrency_conns_sampled`), how
+    /// estimate, at each inbound short message or admitted stream, of the
+    /// inbound QUIC streams the connection would hold open (open inbound
+    /// streams, plus short messages that arrived within one smoothed RTT +
+    /// 25 ms, plus packets still queued for the connection; see
+    /// `peer_connection::inbound_concurrency`). Of the connections sampled
+    /// in the window (`inbound_concurrency_conns_sampled`), how
     /// many had a peak of at least T (`inbound_concurrency_conns_ge_<T>`,
     /// cumulative), and the largest estimate on any of them
     /// (`inbound_concurrency_max`). Sent in the uploaded JSON only when
     /// non-zero.
     ///
-    /// What it can decide: it is an estimate built to err high (it also
-    /// counts packets still queued for the connection), not a strict upper
-    /// bound; `peer_connection::inbound_concurrency` lists the known
-    /// undercounts (a sample skipped at a period boundary, arrivals older
-    /// than its 2 s horizon, at most 1024 remembered short messages,
-    /// streams the per-connection budget refused). So `ge_T /
+    /// What it can decide: it is an estimate built to err high, not a
+    /// strict upper bound; `peer_connection::inbound_concurrency` lists the
+    /// known undercounts. So `ge_T /
     /// conns_sampled` can support LOWERING `quic::config::MAX_UNI_STREAMS`
     /// to T, never raising it; a limit that is too low costs only sender
     /// back-pressure, and QUIC shadow mode (e5a) is expected to confirm

@@ -1203,4 +1203,24 @@ fn handshake_buffered_packets_are_stamped_when_forwarded() {
         assert_eq!(packet.queued_nanos, forwarded_at);
     }
     assert!(forwarded_at > 0);
+
+    // A full connection channel stops the drain: only what fit is counted,
+    // and the packet that did not fit is dropped, not left in the buffer.
+    for byte in [3u8, 4, 5] {
+        buffer_tx
+            .try_send(PacketData::from_buf([byte; 32]))
+            .expect("buffer");
+    }
+    let (small_tx, mut small_rx) = mpsc::channel(1);
+    assert_eq!(
+        super::forward_handshake_buffered(&mut buffer_rx, &small_tx, &time, addr),
+        1
+    );
+    assert_eq!(small_rx.try_recv().expect("forwarded").packet.data()[0], 3);
+    assert!(small_rx.try_recv().is_err());
+    assert_eq!(
+        buffer_rx.try_recv().expect("left in the buffer").data()[0],
+        5,
+        "the packet that did not fit is dropped"
+    );
 }
