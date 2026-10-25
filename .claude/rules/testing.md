@@ -241,7 +241,8 @@ process running the same test deleted the first one's live data dir
 `ring::cost_pressure_seam_tests` processes failed most runs). In unit-test
 builds (`cfg(test)`) those dirs now live under a per-process root,
 `$TMPDIR/freenet-test-<pid>`, owned by an `flock` and swept once its owner
-has exited (`config::test_temp_root`). Do not put a test's data under a fixed
+has exited (`config::test_temp_root`). `flock` liveness needs a local
+`TMPDIR` (not NFS with `nolock`/`local_lock`). Do not put a test's data under a fixed
 path in the shared temp dir; use `tempfile::tempdir()` or `default_dirs`.
 **Integration tests in `crates/core/tests/` are not covered**: they link the
 library without `cfg(test)`, so they still use `/tmp/freenet-{id}` and can

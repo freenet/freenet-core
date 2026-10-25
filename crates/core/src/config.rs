@@ -3900,29 +3900,60 @@ fn default_temp_root() -> PathBuf {
 /// `flock` on `<root>/.owner.lock`, held for the life of the process and
 /// released by the kernel when it exits. Liveness is decided by that lock
 /// alone, never by the pid in the name: pid reuse, pid namespaces and other
-/// users' processes all make a pid check unreliable.
+/// users' processes all make a pid check unreliable. `flock` is only
+/// reliable on a local filesystem; on NFS mounted with `nolock` or
+/// `local_lock` a live root can look unlocked to another host, so `TMPDIR`
+/// must be local.
 ///
 /// On first use, roots whose lock nobody holds are removed. A root is only
 /// removed when it is a real directory (not a symlink), owned by this user,
 /// has a lock file, the lock was acquired, and the locked file is still the
-/// one at that path, so a sweeper holding a lock on an already-deleted root
-/// cannot remove a newer root created under the same name. A root with no
-/// lock file is left alone, because its owner may be between `mkdir` and
-/// `flock`. Non-unix builds get a pid-named root and no sweep.
+/// one at that path. While still holding the lock, the sweeper renames the
+/// root to a tombstone (`.freenet-test-reap-…`, a name no claimer uses) and
+/// only then deletes it, so a process claiming the same name meanwhile finds
+/// no directory and creates a fresh one instead of having its new lock
+/// deleted by the sweeper's `remove_dir_all`.
+///
+/// Known leaks (disk only, never a live root deleted): a root with no lock
+/// file is never swept, because its owner may be between `mkdir` and
+/// `flock`, so a process that died in that window, or a partially removed
+/// root that lost its lock file, stays until removed by hand. Non-unix
+/// builds get a pid-named root (pids are not shared across namespaces
+/// there) and are never swept.
 #[cfg(test)]
 mod test_temp_root {
     use std::fs;
     use std::path::{Path, PathBuf};
 
     pub(super) const PREFIX: &str = "freenet-test-";
+    #[cfg(unix)]
     pub(super) const LOCK: &str = ".owner.lock";
+    #[cfg(unix)]
+    pub(super) const TOMBSTONE_PREFIX: &str = ".freenet-test-reap-";
+    /// Sequential names tried before falling back to random suffixes.
+    #[cfg(unix)]
+    pub(super) const SEQUENTIAL_NAMES: u32 = 64;
+
+    /// A fresh random value from the std hasher's per-instance keys, so no
+    /// RNG dependency is needed in this test-only code.
+    pub(super) fn random_u64() -> u64 {
+        use std::hash::{BuildHasher, Hasher};
+        let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+        h.write_u128(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0),
+        );
+        h.finish()
+    }
 
     pub(super) fn claim(tmp: &Path) -> PathBuf {
         let pid = std::process::id();
         #[cfg(unix)]
         {
             sweep(tmp);
-            for n in 0..64u32 {
+            for n in 0..SEQUENTIAL_NAMES {
                 let root = if n == 0 {
                     tmp.join(format!("{PREFIX}{pid}"))
                 } else {
@@ -3932,10 +3963,29 @@ mod test_temp_root {
                     return root;
                 }
             }
+            // Never fall back to an unlocked or shared root.
+            for _ in 0..16 {
+                let root = tmp.join(format!("{PREFIX}{pid}-{}", random_u64()));
+                if unix::try_own(&root) {
+                    return root;
+                }
+            }
+            panic!("could not claim a private, locked test temp root under {tmp:?}");
         }
-        let root = tmp.join(format!("{PREFIX}{pid}"));
-        let _created = fs::create_dir_all(&root);
-        root
+        #[cfg(not(unix))]
+        {
+            let root = tmp.join(format!("{PREFIX}{pid}"));
+            let _created = fs::create_dir_all(&root);
+            root
+        }
+    }
+
+    /// Whether `name` is one `claim` can produce: `PREFIX` then digits and
+    /// dashes.
+    #[cfg(unix)]
+    pub(super) fn is_root_name(name: &str) -> bool {
+        name.strip_prefix(PREFIX)
+            .is_some_and(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit() || b == b'-'))
     }
 
     #[cfg(unix)]
@@ -3945,26 +3995,48 @@ mod test_temp_root {
         };
         for entry in entries.flatten() {
             let name = entry.file_name();
-            let Some(suffix) = name.to_str().and_then(|n| n.strip_prefix(PREFIX)) else {
+            let Some(name) = name.to_str() else {
                 continue;
             };
-            if suffix.is_empty() || !suffix.bytes().all(|b| b.is_ascii_digit() || b == b'-') {
-                continue;
-            }
             // `DirEntry::file_type` does not follow symlinks.
             if !entry.file_type().is_ok_and(|t| t.is_dir()) {
                 continue;
             }
-            let root = entry.path();
-            if !unix::owned_by_me(&root) {
+            let path = entry.path();
+            if !unix::owned_by_me(&path) {
                 continue;
             }
-            let Some(lock) = unix::try_lock_existing(&root) else {
+            if name.starts_with(TOMBSTONE_PREFIX) {
+                // Left by a sweeper that died mid-removal. A tombstone is
+                // never a live root, so removing it again is harmless.
+                let _stale = fs::remove_dir_all(&path);
+                continue;
+            }
+            if !is_root_name(name) {
+                continue;
+            }
+            let Some(lock) = unix::try_lock_existing(&path) else {
                 continue;
             };
-            let _stale = fs::remove_dir_all(&root);
-            drop(lock);
+            let _reaped = reap(tmp, &path, lock, || {});
         }
+    }
+
+    /// Remove a root whose lock `_lock` holds (until this returns): rename it
+    /// to a tombstone, run `between` (a test hook standing in for a
+    /// concurrent claimer), then delete the tombstone.
+    #[cfg(unix)]
+    pub(super) fn reap(
+        tmp: &Path,
+        root: &Path,
+        _lock: fs::File,
+        between: impl FnOnce(),
+    ) -> std::io::Result<()> {
+        let pid = std::process::id();
+        let tombstone = tmp.join(format!("{TOMBSTONE_PREFIX}{pid}-{}", random_u64()));
+        fs::rename(root, &tombstone)?;
+        between();
+        fs::remove_dir_all(&tombstone)
     }
 
     #[cfg(unix)]
@@ -3975,6 +4047,7 @@ mod test_temp_root {
         use std::os::unix::io::AsRawFd;
         use std::path::Path;
 
+        /// A real directory (not a symlink) owned by this effective user.
         pub(in super::super) fn owned_by_me(path: &Path) -> bool {
             // SAFETY: geteuid has no preconditions and cannot fail.
             let me = unsafe { libc::geteuid() };
@@ -3987,8 +4060,8 @@ mod test_temp_root {
             unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) == 0 }
         }
 
-        /// The locked file is still the one at `<root>/LOCK`, i.e. no sweeper
-        /// removed the root between our open and our flock.
+        /// The locked file is still the one at `<root>/LOCK`, i.e. nobody
+        /// removed or replaced it between our open and our flock.
         fn still_at_path(root: &Path, file: &File) -> bool {
             match (fs::symlink_metadata(root.join(LOCK)), file.metadata()) {
                 (Ok(on_disk), Ok(held)) => {
@@ -4008,11 +4081,15 @@ mod test_temp_root {
                 .ok()
         }
 
+        /// Lock `file` and confirm it is still `<root>/LOCK`.
+        pub(in super::super) fn lock_if_current(root: &Path, file: File) -> Option<File> {
+            (flock_exclusive(&file) && still_at_path(root, &file)).then_some(file)
+        }
+
         /// Lock an existing root's lock file; `None` if it has none, its
         /// owner is alive, or it changed under us.
         pub(in super::super) fn try_lock_existing(root: &Path) -> Option<File> {
-            let file = open_lock(root, false)?;
-            (flock_exclusive(&file) && still_at_path(root, &file)).then_some(file)
+            lock_if_current(root, open_lock(root, false)?)
         }
 
         /// Create (or adopt a dead owner's) root and hold its lock for the
@@ -4021,12 +4098,9 @@ mod test_temp_root {
             if fs::create_dir_all(root).is_err() || !owned_by_me(root) {
                 return false;
             }
-            let Some(file) = open_lock(root, true) else {
+            let Some(file) = open_lock(root, true).and_then(|f| lock_if_current(root, f)) else {
                 return false;
             };
-            if !(flock_exclusive(&file) && still_at_path(root, &file)) {
-                return false;
-            }
             // A dead owner's leftovers (same pid, reused): start empty.
             if let Ok(entries) = fs::read_dir(root) {
                 for entry in entries.flatten() {
@@ -6110,12 +6184,16 @@ mod tests {
     /// name, so a dir in a root shared with other processes was deleted by
     /// any other process running the same test, failing this one with
     /// `build Config: No such file or directory`. The dir another process
-    /// holds at the old shared location must survive. The id carries the pid
-    /// so that concurrent runs of this test do not share `shared` either.
+    /// holds at the old shared location must survive. The id is unique
+    /// beyond the pid, so concurrent runs of this test (including ones with
+    /// the same pid in another pid namespace) do not share `shared` either.
     #[test]
     fn default_temp_dir_is_private_to_the_process() {
         let pid = std::process::id();
-        let id = format!("default-dir-isolation-{pid}");
+        let id = format!(
+            "default-dir-isolation-{pid}-{}",
+            test_temp_root::random_u64()
+        );
         let shared = std::env::temp_dir().join(format!("freenet-{id}"));
         fs::create_dir_all(shared.join("db")).unwrap();
 
@@ -6141,11 +6219,11 @@ mod tests {
 
     /// The sweep removes only a root whose owner lock nobody holds. A live
     /// owner, a root still being created (no lock file yet), a symlink and an
-    /// unrelated name must all survive.
+    /// unrelated name must all survive; a dead sweeper's tombstone is removed.
     #[cfg(unix)]
     #[test]
     fn stale_test_root_sweep_spares_live_and_foreign_entries() {
-        use test_temp_root::{LOCK, PREFIX, sweep, unix};
+        use test_temp_root::{LOCK, PREFIX, TOMBSTONE_PREFIX, sweep, unix};
 
         let tmp = tempfile::tempdir().unwrap();
         let mk = |name: &str, lock: bool| {
@@ -6160,6 +6238,7 @@ mod tests {
         let live = mk(&format!("{PREFIX}4000000002-1"), true);
         let creating = mk(&format!("{PREFIX}4000000003"), false);
         let unrelated = mk(&format!("{PREFIX}abc"), true);
+        let tombstone = mk(&format!("{TOMBSTONE_PREFIX}1-2"), false);
         let target = mk("not-a-test-root", true);
         let link = tmp.path().join(format!("{PREFIX}4000000004"));
         std::os::unix::fs::symlink(&target, &link).unwrap();
@@ -6168,27 +6247,156 @@ mod tests {
         sweep(tmp.path());
 
         assert!(!stale.exists(), "unlocked root was not swept");
+        assert!(!tombstone.exists(), "leftover tombstone was not removed");
         assert!(live.join("freenet-x/db").exists(), "live root was swept");
         assert!(
             creating.join("freenet-x/db").exists(),
             "lockless root was swept"
         );
         assert!(unrelated.exists(), "non-matching name was swept");
-        assert!(link.exists(), "symlink was removed");
-        assert!(target.join("freenet-x/db").exists(), "symlink was followed");
+        assert!(link.symlink_metadata().is_ok(), "symlink was removed");
+        let leftovers: Vec<_> = fs::read_dir(tmp.path())
+            .unwrap()
+            .flatten()
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with(TOMBSTONE_PREFIX)
+            })
+            .collect();
+        assert!(leftovers.is_empty(), "reap left a tombstone: {leftovers:?}");
+    }
+
+    /// The type and owner checks the sweep relies on: a symlink to a dir
+    /// this user owns, a regular file, and a dir owned by another user are
+    /// all rejected.
+    #[cfg(unix)]
+    #[test]
+    fn sweep_owner_check_rejects_symlinks_files_and_foreign_dirs() {
+        use test_temp_root::unix::owned_by_me;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("d");
+        fs::create_dir(&dir).unwrap();
+        let link = tmp.path().join("l");
+        std::os::unix::fs::symlink(&dir, &link).unwrap();
+        let file = tmp.path().join("f");
+        fs::write(&file, b"").unwrap();
+
+        assert!(owned_by_me(&dir));
+        assert!(!owned_by_me(&link), "symlink accepted");
+        assert!(!owned_by_me(&file), "regular file accepted");
+        // SAFETY: geteuid has no preconditions.
+        if unsafe { libc::geteuid() } != 0 {
+            assert!(!owned_by_me(Path::new("/")), "root-owned dir accepted");
+        }
+    }
+
+    /// A lock file replaced after it was opened must not count as held:
+    /// otherwise a sweeper could lock a stale inode and delete a root a new
+    /// owner holds through the replacement.
+    #[cfg(unix)]
+    #[test]
+    fn lock_on_a_replaced_lock_file_is_rejected() {
+        use test_temp_root::{LOCK, unix};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("r");
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join(LOCK), b"").unwrap();
+        let stale = unix::open_lock(&root, false).unwrap();
+        fs::remove_file(root.join(LOCK)).unwrap();
+        fs::write(root.join(LOCK), b"").unwrap();
+
+        assert!(unix::lock_if_current(&root, stale).is_none());
+        assert!(unix::try_lock_existing(&root).is_some());
+    }
+
+    /// While a sweeper reaps a dead root, a process claiming the same name
+    /// must end up with a fresh, intact, locked root: the sweeper renames
+    /// the root away before deleting anything.
+    #[cfg(unix)]
+    #[test]
+    fn reap_renames_before_removing_so_a_concurrent_claim_survives() {
+        use test_temp_root::{LOCK, reap, unix};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("freenet-test-4000000005");
+        fs::create_dir_all(root.join("old")).unwrap();
+        fs::write(root.join(LOCK), b"").unwrap();
+        let lock = unix::try_lock_existing(&root).unwrap();
+
+        let mut claimed = false;
+        reap(tmp.path(), &root, lock, || {
+            claimed = unix::try_own(&root);
+            fs::create_dir_all(root.join("new")).unwrap();
+        })
+        .unwrap();
+
+        assert!(claimed, "claimer could not take the name during the reap");
+        assert!(
+            root.join("new").exists(),
+            "the new owner's data was deleted"
+        );
+        assert!(!root.join("old").exists());
+        assert!(root.join(LOCK).exists(), "the new owner's lock was deleted");
+        assert!(
+            unix::try_lock_existing(&root).is_none(),
+            "the new owner's root is not locked"
+        );
+    }
+
+    /// A root adopted from a dead owner with the same name starts empty,
+    /// apart from its lock file.
+    #[cfg(unix)]
+    #[test]
+    fn adopted_root_is_emptied_before_reuse() {
+        use test_temp_root::{LOCK, unix};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("r");
+        fs::create_dir_all(root.join("freenet-old/db")).unwrap();
+        fs::write(root.join("stray"), b"x").unwrap();
+        fs::write(root.join(LOCK), b"").unwrap();
+
+        assert!(unix::try_own(&root));
+        let left: Vec<_> = fs::read_dir(&root)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name())
+            .collect();
+        assert_eq!(left, vec![std::ffi::OsString::from(LOCK)]);
     }
 
     /// A root whose name is already held by a live process is not shared:
-    /// `claim` moves on to a suffixed name, and each claimed root is locked.
+    /// `claim` moves on to another name, each claimed root is locked, and
+    /// once the sequential names are exhausted the random fallback is still
+    /// a locked root the sweep recognises.
     #[cfg(unix)]
     #[test]
     fn claim_never_shares_a_held_root() {
+        use test_temp_root::{SEQUENTIAL_NAMES, claim, is_root_name, unix};
+
         let tmp = tempfile::tempdir().unwrap();
-        let first = test_temp_root::claim(tmp.path());
-        let second = test_temp_root::claim(tmp.path());
-        assert_ne!(first, second);
-        assert!(test_temp_root::unix::try_lock_existing(&first).is_none());
-        assert!(test_temp_root::unix::try_lock_existing(&second).is_none());
+        let roots: Vec<_> = (0..=SEQUENTIAL_NAMES).map(|_| claim(tmp.path())).collect();
+        let distinct: std::collections::HashSet<_> = roots.iter().collect();
+        assert_eq!(distinct.len(), roots.len(), "a root was handed out twice");
+        for root in &roots {
+            assert!(
+                unix::try_lock_existing(root).is_none(),
+                "{root:?} is not locked"
+            );
+            let name = root.file_name().and_then(|n| n.to_str()).unwrap();
+            assert!(is_root_name(name), "{name} would never be swept");
+        }
+        let pid = std::process::id();
+        let fallback = roots.last().unwrap();
+        assert_ne!(
+            fallback,
+            &tmp.path()
+                .join(format!("freenet-test-{pid}-{SEQUENTIAL_NAMES}")),
+            "expected the random fallback after the sequential names"
+        );
     }
 
     /// The pool size is the multiplier in every per-worker memory budget
