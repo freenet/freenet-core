@@ -1253,8 +1253,10 @@ fn a_locally_cancelled_stream_is_stopped() {
     })
 }
 
-/// A panic in the receive task is counted and closes the connection, so
-/// the peer does not keep sending to a path nothing reads any more.
+/// A panic in the receive task is counted and closes the connection with
+/// `close_code::DOWNGRADE`, so the peer does not keep sending to a path
+/// nothing reads any more, and falls back to UDP rather than reading it as
+/// this node dropping it.
 #[test]
 fn a_panicking_receive_task_closes_the_connection() {
     bounded(|| async move {
@@ -1275,7 +1277,10 @@ fn a_panicking_receive_task_closes_the_connection() {
         let quinn::ConnectionError::ApplicationClosed(close) = closed else {
             panic!("closed by {closed:?}");
         };
-        assert_eq!(close.error_code.into_inner(), 0);
+        assert_eq!(
+            close.error_code.into_inner(),
+            u64::from(super::super::error::close_code::DOWNGRADE)
+        );
         assert_eq!(
             p.b.stats().count(QuicInboundOutcome::ReceiveTaskPanicked),
             1

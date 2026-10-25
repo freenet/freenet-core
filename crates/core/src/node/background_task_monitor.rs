@@ -13,6 +13,7 @@
 //! See issue #3121 and the incident described in #3120 for motivation.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use parking_lot::Mutex;
 use tokio::task::JoinHandle;
@@ -36,12 +37,16 @@ struct TrackedTask {
 #[derive(Clone)]
 pub(crate) struct BackgroundTaskMonitor {
     inner: Arc<Mutex<Vec<TrackedTask>>>,
+    /// Set by `wait_for_any_exit`, after which a registration is not
+    /// monitored.
+    drained: Arc<AtomicBool>,
 }
 
 impl BackgroundTaskMonitor {
     pub fn new() -> Self {
         Self {
             inner: Arc::new(Mutex::new(Vec::new())),
+            drained: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -50,8 +55,29 @@ impl BackgroundTaskMonitor {
     /// The `name` is used in error messages when the task exits. It should be
     /// a short, human-readable identifier (e.g. "connection_maintenance",
     /// "garbage_cleanup").
+    ///
+    /// Only before [`Self::wait_for_any_exit`]: a task registered after it
+    /// is not watched by anything, so it is logged at ERROR (the task keeps
+    /// running, unmonitored) instead of failing silently.
     pub fn register(&self, name: &'static str, handle: JoinHandle<()>) {
-        self.inner.lock().push(TrackedTask { name, handle });
+        let mut inner = self.inner.lock();
+        // Read under the lock `wait_for_any_exit` drains under, so a
+        // registration is either drained or reported, never lost unseen.
+        if self.drained.load(Ordering::Acquire) {
+            tracing::error!(
+                task = name,
+                "Background task registered after the monitor started waiting; it is NOT monitored"
+            );
+            return;
+        }
+        inner.push(TrackedTask { name, handle });
+    }
+
+    /// Whether `wait_for_any_exit` has drained this monitor, so a new
+    /// registration would not be monitored.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn is_drained(&self) -> bool {
+        self.drained.load(Ordering::Acquire)
     }
 
     /// Consume the monitor and return a future that resolves with an error
@@ -62,6 +88,7 @@ impl BackgroundTaskMonitor {
     pub fn wait_for_any_exit(self) -> impl std::future::Future<Output = anyhow::Error> + Send {
         let tasks: Vec<TrackedTask> = {
             let mut inner = self.inner.lock();
+            self.drained.store(true, Ordering::Release);
             std::mem::take(&mut *inner)
         };
 
@@ -209,5 +236,32 @@ mod tests {
             msg.contains("fast_exit"),
             "Expected 'fast_exit' to be detected first, got: {msg}"
         );
+    }
+
+    /// A task registered after `wait_for_any_exit` drained the monitor is
+    /// not monitored, and the monitor says so: its exit does not resolve
+    /// the wait (nothing could), and `is_drained` reports the state a
+    /// late caller must check.
+    #[tokio::test]
+    async fn registration_after_wait_is_not_monitored() {
+        let monitor = BackgroundTaskMonitor::new();
+        let sleeper = tokio::spawn(async {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        });
+        monitor.register("sleeper", sleeper);
+        assert!(!monitor.is_drained());
+        let wait = monitor.clone().wait_for_any_exit();
+        assert!(monitor.is_drained());
+        let (logs, guard) = crate::util::test_log_capture::install();
+        monitor.register("late_exit", tokio::spawn(async {}));
+        drop(guard);
+        let logs = logs.lock().unwrap().clone();
+        assert!(
+            logs.iter()
+                .any(|line| line.starts_with("ERROR") && line.contains("late_exit")),
+            "the late registration is logged at ERROR: {logs:?}"
+        );
+        let fired = tokio::time::timeout(Duration::from_millis(100), wait).await;
+        assert!(fired.is_err(), "a late registration is not watched");
     }
 }

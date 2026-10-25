@@ -203,7 +203,7 @@ pub(crate) struct UdpTransportConfig {
     pub(crate) quic: Option<super::quic::QuicSettings>,
 }
 
-type UdpListenerParts<S> = (
+pub(super) type UdpListenerParts<S> = (
     OutboundConnectionHandler<S>,
     InboundConnectionHandler<S>,
     tokio::task::JoinHandle<TransportError>,
@@ -215,7 +215,7 @@ type UdpListenerParts<S> = (
 /// sockets and `SimulationSocket` alike, so it is where the socket is wrapped
 /// in [`DemuxSocket`]: everything the listener receives has passed through the
 /// first-byte split.
-async fn bind_udp_listener<S: Socket>(
+pub(super) async fn bind_udp_listener<S: Socket>(
     keypair: TransportKeypair,
     listen_host: IpAddr,
     listen_port: u16,
@@ -379,6 +379,12 @@ impl<S: Socket> super::InboundAcceptor for InboundConnectionHandler<S> {
 pub struct OutboundConnectionHandler<S = UdpSocket, TS: TimeSource = RealTime> {
     send_queue: mpsc::Sender<(SocketAddr, ConnectionEvent<S, TS>)>,
     expected_non_gateway: Arc<DashSet<IpAddr>>,
+    /// Whether this transport's QUIC endpoint is alive; `Disabled` when it
+    /// has none (`transport-quic` off).
+    quic_availability: super::quic::QuicAvailabilityWatch,
+    /// The listener's QUIC endpoint, so tests can fail its driver.
+    #[cfg(test)]
+    quic_endpoint: Option<super::quic::QuicEndpoint>,
 }
 
 impl<S, TS: TimeSource> Clone for OutboundConnectionHandler<S, TS> {
@@ -386,7 +392,26 @@ impl<S, TS: TimeSource> Clone for OutboundConnectionHandler<S, TS> {
         Self {
             send_queue: self.send_queue.clone(),
             expected_non_gateway: self.expected_non_gateway.clone(),
+            quic_availability: self.quic_availability.clone(),
+            #[cfg(test)]
+            quic_endpoint: self.quic_endpoint.clone(),
         }
+    }
+}
+
+impl<S, TS: TimeSource> OutboundConnectionHandler<S, TS> {
+    /// Whether this transport can use QUIC: `Disabled` with
+    /// `transport-quic` off (no endpoint is built), else whether its
+    /// endpoint is alive. e5 reads it before upgrading a connection.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn quic_availability(&self) -> super::quic::QuicAvailabilityWatch {
+        self.quic_availability.clone()
+    }
+
+    /// The listener's QUIC endpoint, if it has one (tests).
+    #[cfg(test)]
+    pub(crate) fn quic_endpoint(&self) -> Option<&super::quic::QuicEndpoint> {
+        self.quic_endpoint.as_ref()
     }
 }
 
@@ -458,6 +483,12 @@ impl<S: Socket> OutboundConnectionHandler<S> {
         let (conn_handler_sender, conn_handler_receiver) = mpsc::channel(100);
         let (new_connection_sender, new_connection_notifier) = mpsc::channel(10);
         let expected_non_gateway = Arc::new(DashSet::new());
+        let quic_availability = quic_endpoint.as_ref().map_or_else(
+            super::quic::QuicAvailabilityWatch::disabled,
+            super::quic::QuicEndpoint::availability,
+        );
+        #[cfg(test)]
+        let test_quic_endpoint = quic_endpoint.clone();
 
         let time_source = RealTime::new();
         let transport = UdpPacketsListener {
@@ -493,6 +524,9 @@ impl<S: Socket> OutboundConnectionHandler<S> {
         let connection_handler = OutboundConnectionHandler {
             send_queue: conn_handler_sender,
             expected_non_gateway,
+            quic_availability,
+            #[cfg(test)]
+            quic_endpoint: test_quic_endpoint,
         };
         (transport, connection_handler, new_connection_notifier)
     }
@@ -744,6 +778,9 @@ impl<S: Socket> OutboundConnectionHandler<S, crate::simulation::VirtualTime> {
         let connection_handler = OutboundConnectionHandler {
             send_queue: conn_handler_sender,
             expected_non_gateway,
+            quic_availability: super::quic::QuicAvailabilityWatch::disabled(),
+            #[cfg(test)]
+            quic_endpoint: None,
         };
 
         // Packets are now sent directly to socket from each connection,
@@ -2042,7 +2079,7 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                                     crate::transport::TRANSPORT_METRICS
                                         .record_nat_traversal_failed_version();
                                 }
-                                TransportError::ChannelClosed | TransportError::ConnectionClosed(_) | TransportError::ConnectionEstablishmentFailure { .. } | TransportError::Udp(UdpError(UdpErrorKind::SendFailed(..))) | TransportError::OutboundStreamFailed(_) | TransportError::OutboundStreamInvalidLength(..) | TransportError::Udp(UdpError(UdpErrorKind::IO(_))) | TransportError::Other(_) | TransportError::Udp(UdpError(UdpErrorKind::PubKeyDecryptionError(_))) | TransportError::Udp(UdpError(UdpErrorKind::Serialization(_))) => {
+                                TransportError::ChannelClosed | TransportError::ConnectionClosed(_) | TransportError::ConnectionEstablishmentFailure { .. } | TransportError::Udp(UdpError(UdpErrorKind::SendFailed(..))) | TransportError::OutboundStreamFailed(_) | TransportError::OutboundStreamInvalidLength(..) | TransportError::Udp(UdpError(UdpErrorKind::IO(_))) | TransportError::Other(_) | TransportError::Udp(UdpError(UdpErrorKind::PubKeyDecryptionError(_))) | TransportError::Udp(UdpError(UdpErrorKind::Serialization(_))) | TransportError::Quic(_) => {
                                     tracing::error!(error = %error, peer_addr = %remote_addr, "Failed NAT traversal");
                                     crate::transport::TRANSPORT_METRICS
                                         .record_nat_traversal_failed_error();
@@ -3163,7 +3200,9 @@ fn classify_nat_failure(
         | TransportError::Udp(UdpError(UdpErrorKind::IO(_)))
         | TransportError::Other(_)
         | TransportError::Udp(UdpError(UdpErrorKind::PubKeyDecryptionError(_)))
-        | TransportError::Udp(UdpError(UdpErrorKind::Serialization(_))) => {
+        | TransportError::Udp(UdpError(UdpErrorKind::Serialization(_)))
+        // The UDP handshake never produces a QUIC error.
+        | TransportError::Quic(_) => {
             if flags & O::DEADLINE == 0 {
                 NatFailureKind::Other
             } else if flags & O::RECEIVED == 0 {
@@ -3580,7 +3619,8 @@ pub mod mock_transport {
             | TransportError::Udp(UdpError(UdpErrorKind::IO(_)))
             | TransportError::Other(_)
             | TransportError::Udp(UdpError(UdpErrorKind::PubKeyDecryptionError(_)))
-            | TransportError::Udp(UdpError(UdpErrorKind::Serialization(_))) => {
+            | TransportError::Udp(UdpError(UdpErrorKind::Serialization(_)))
+            | TransportError::Quic(_) => {
                 panic!("Expected ProtocolVersionMismatch error")
             }
         }
@@ -3599,7 +3639,8 @@ pub mod mock_transport {
             | TransportError::Udp(UdpError(UdpErrorKind::IO(_)))
             | TransportError::Other(_)
             | TransportError::Udp(UdpError(UdpErrorKind::PubKeyDecryptionError(_)))
-            | TransportError::Udp(UdpError(UdpErrorKind::Serialization(_))) => {
+            | TransportError::Udp(UdpError(UdpErrorKind::Serialization(_)))
+            | TransportError::Quic(_) => {
                 panic!("Expected ConnectionEstablishmentFailure error")
             }
         }

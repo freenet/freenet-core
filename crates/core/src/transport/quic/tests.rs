@@ -1802,7 +1802,10 @@ fn the_runtime_timer_follows_virtual_time() {
     use quinn::Runtime;
     use std::task::{Context, Poll};
     let time = VirtualTime::new();
-    let runtime = super::runtime::QuicRuntime::new(time.clone());
+    let runtime = super::runtime::QuicRuntime::new(
+        time.clone(),
+        super::liveness::EndpointHealth::new("127.0.0.1:1".parse().unwrap()),
+    );
     let start = runtime.now();
     let waker = futures::task::noop_waker();
     let mut cx = Context::from_waker(&waker);
@@ -2284,7 +2287,9 @@ fn closing_an_endpoint_releases_the_allow_set() {
         )
         .await;
         let (_, client, server) = pair.transfer(payload(1000), Duration::from_secs(60)).await;
-        pair.a.endpoint.close(0u32.into(), b"test");
+        pair.a
+            .endpoint
+            .close(error::close_code::NODE_DROPPED_PEER.into(), b"test");
         let s = server.inner().clone();
         drive(&pair.time, Duration::from_secs(60), async move {
             s.closed().await;
@@ -2428,4 +2433,446 @@ fn the_cap_wakes_waiters_per_quic_datagram() {
         crate::transport::egress_cap::WAKE_DATAGRAM_BYTES,
         usize::from(MAX_UDP_PAYLOAD)
     );
+}
+
+/// Each close code reaches the peer as that code, and the peer maps it to
+/// the kind its handling depends on: `Downgrade` and `IdentityMismatch` are
+/// refusals, `NodeDroppedPeer` (also what dropping a connection sends) is a
+/// lost connection. Either side can close. Each close is counted once, by
+/// code; a second close of an ended connection sends and counts nothing.
+#[test]
+fn close_codes_reach_the_peer() {
+    bounded(|| async move {
+        use crate::transport::metrics::{QuicCloseCode, TRANSPORT_METRICS};
+        use crate::transport::{QuicErrorKind, QuicRefusal};
+        let _seed = GlobalRng::seed_guard(SEED);
+        let pair = pair(
+            "quic-close-codes",
+            "10.201.30.1:5000".parse().unwrap(),
+            "10.201.30.2:5000".parse().unwrap(),
+            None,
+        )
+        .await;
+        let expected = |code: QuicCloseCode| match code {
+            QuicCloseCode::NodeDroppedPeer => QuicErrorKind::ConnectionLost,
+            QuicCloseCode::Downgrade => QuicErrorKind::Refused {
+                reason: QuicRefusal::Downgrade,
+            },
+            QuicCloseCode::IdentityMismatch => QuicErrorKind::Refused {
+                reason: QuicRefusal::IdentityMismatch,
+            },
+        };
+        let mut sent_by_a = Vec::new();
+        let mut sent_by_b = Vec::new();
+        for code in QuicCloseCode::ALL {
+            for a_closes in [true, false] {
+                let (_, client, server) =
+                    pair.transfer(payload(100), Duration::from_secs(60)).await;
+                let (closer, peer) = if a_closes {
+                    sent_by_a.push(code);
+                    (client, server)
+                } else {
+                    sent_by_b.push(code);
+                    (server, client)
+                };
+                closer.close(code);
+                // Closing again sends and counts nothing.
+                closer.close(QuicCloseCode::Downgrade);
+                let seen = peer.inner().clone();
+                let error = drive(&pair.time, Duration::from_secs(60), async move {
+                    seen.closed().await
+                })
+                .await;
+                let quinn::ConnectionError::ApplicationClosed(close) = &error else {
+                    panic!("{code:?}: the peer saw {error:?}");
+                };
+                assert_eq!(
+                    close.error_code.into_inner(),
+                    u64::from(code.code()),
+                    "{code:?}"
+                );
+                assert_eq!(QuicErrorKind::from(error), expected(code), "{code:?}");
+                // Dropping both ends after the close counts nothing more.
+                drop((closer, peer));
+            }
+        }
+        assert_eq!(TRANSPORT_METRICS.quic_close_sent_to(pair.b_addr), sent_by_a);
+        assert_eq!(TRANSPORT_METRICS.quic_close_sent_to(pair.a_addr), sent_by_b);
+
+        // Dropping an open connection closes it with NodeDroppedPeer.
+        let (_, client, server) = pair.transfer(payload(100), Duration::from_secs(60)).await;
+        drop(client);
+        let seen = server.inner().clone();
+        let error = drive(&pair.time, Duration::from_secs(60), async move {
+            seen.closed().await
+        })
+        .await;
+        let quinn::ConnectionError::ApplicationClosed(close) = &error else {
+            panic!("the peer saw {error:?}");
+        };
+        assert_eq!(
+            close.error_code.into_inner(),
+            u64::from(error::close_code::NODE_DROPPED_PEER)
+        );
+        sent_by_a.push(QuicCloseCode::NodeDroppedPeer);
+        assert_eq!(TRANSPORT_METRICS.quic_close_sent_to(pair.b_addr), sent_by_a);
+        drop(server);
+        assert_eq!(
+            TRANSPORT_METRICS.quic_close_sent_to(pair.a_addr),
+            sent_by_b,
+            "the peer's handle, dropped after the close, sent nothing"
+        );
+    });
+}
+
+/// When the endpoint driver dies while the node holds the endpoint (here a
+/// receive error, as from a socket that fails for good), the endpoint's
+/// availability turns `Down` and the death is counted once. Nothing stops:
+/// the accept loop parks instead of ending (its monitor does not fire), and
+/// the socket keeps passing UDP-transport datagrams. Its connections end
+/// and new ones fail as `EndpointDown`.
+#[test]
+fn endpoint_death_turns_quic_off_without_stopping_the_node() {
+    bounded(|| async move {
+        use crate::node::background_task_monitor::BackgroundTaskMonitor;
+        use crate::transport::QuicErrorKind;
+        use crate::transport::metrics::TRANSPORT_METRICS;
+        let _seed = GlobalRng::seed_guard(SEED);
+        let pair = pair(
+            "quic-endpoint-death",
+            "10.201.31.1:5000".parse().unwrap(),
+            "10.201.31.2:5000".parse().unwrap(),
+            None,
+        )
+        .await;
+        let (_, client, _server) = pair.transfer(payload(100), Duration::from_secs(60)).await;
+        let mut availability = pair.a.availability();
+        assert_eq!(availability.get(), QuicAvailability::Up);
+
+        let monitor = BackgroundTaskMonitor::new();
+        let (attempts, _attempts_rx) = tokio::sync::mpsc::channel(4);
+        assert!(pair.a.spawn_accept_loop(&monitor, attempts));
+        let monitor_fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let wait = {
+            let fired = monitor_fired.clone();
+            let wait = monitor.wait_for_any_exit();
+            tokio::spawn(async move {
+                let _ = wait.await;
+                fired.store(true, std::sync::atomic::Ordering::SeqCst);
+            })
+        };
+
+        pair.a.fail_driver();
+        let seen = drive(&pair.time, Duration::from_secs(60), async move {
+            availability.not_up().await
+        })
+        .await;
+        assert_eq!(seen, QuicAvailability::Down);
+        assert_eq!(pair.a.availability().get(), QuicAvailability::Down);
+        assert_eq!(TRANSPORT_METRICS.quic_endpoint_down_at(pair.a_addr), 1);
+
+        // The endpoint's connection ends, and with the availability Down it
+        // is blamed on this endpoint, not on the peer, whichever error quinn
+        // reports (a local INTERNAL_ERROR, or LocallyClosed once the
+        // connection's driver closed it; which one depends on scheduling,
+        // so only the attributed kind is asserted). A new one cannot start.
+        let c = client.inner().clone();
+        let ended = drive(&pair.time, Duration::from_secs(60), async move {
+            c.closed().await
+        })
+        .await;
+        assert_eq!(pair.a.availability().get(), QuicAvailability::Down);
+        assert_eq!(
+            pair.a.error_kind(ended.clone()),
+            QuicErrorKind::EndpointDown,
+            "{ended:?}"
+        );
+        let refused = pair
+            .a
+            .connect(pair.b_addr, &pair.b_key())
+            .await
+            .expect_err("the endpoint is down");
+        assert_eq!(QuicErrorKind::from(refused), QuicErrorKind::EndpointDown);
+
+        // Let everything run a while: the accept loop has seen `None` and
+        // parked, so the monitor never fires.
+        let time = pair.time.clone();
+        drive(&pair.time, Duration::from_secs(60), async move {
+            time.sleep(Duration::from_secs(30)).await;
+        })
+        .await;
+        assert!(
+            !monitor_fired.load(std::sync::atomic::Ordering::SeqCst),
+            "the accept loop's end would stop the node"
+        );
+        assert!(!wait.is_finished());
+
+        // The UDP side of the socket still works: a legacy-class datagram
+        // sent to `a` is read as one (by this test, in the listener's
+        // place).
+        pair.pumps[0].abort();
+        pair.b_socket
+            .send_to(&[0x01, 0, 0, 0], pair.a_addr)
+            .await
+            .unwrap();
+        let socket = pair.a_socket.clone();
+        let (len, from) = drive(&pair.time, Duration::from_secs(10), async move {
+            let mut buf = vec![0u8; MAX_RECV_PACKET_SIZE];
+            loop {
+                match socket.recv_classified(&mut buf).await.unwrap() {
+                    crate::transport::SocketRead::Datagram(len, from) => break (len, from),
+                    crate::transport::SocketRead::Diverted => {}
+                }
+            }
+        })
+        .await;
+        assert_eq!((len, from), (4, pair.b_addr));
+
+        // Dropping every handle afterwards counts nothing more.
+        drop(client);
+        drop(pair);
+        assert_eq!(
+            TRANSPORT_METRICS.quic_endpoint_down_at("10.201.31.1:5000".parse().unwrap()),
+            1
+        );
+        wait.abort();
+    });
+}
+
+/// Dropping the last handle is not a death, even with the accept loop
+/// running: the loop does not keep the endpoint owned, so it stops and
+/// drops its handle, quinn's driver ends, the socket is let go, the
+/// availability becomes `Released` and nothing is counted. Waiting on a
+/// final availability returns that value at once, every time, so a loop
+/// around `not_up` cannot spin on a stale `Up`.
+#[test]
+fn dropping_the_endpoint_is_not_a_death() {
+    bounded(|| async move {
+        use crate::node::background_task_monitor::BackgroundTaskMonitor;
+        use crate::transport::metrics::TRANSPORT_METRICS;
+        let network = "quic-endpoint-drop";
+        let addr: SocketAddr = "10.201.32.1:5000".parse().unwrap();
+        let time = VirtualTime::new();
+        register_network_time_source(network, time.clone());
+        register_address_network(addr, network);
+        let socket = Arc::new(DemuxSocket::wrap(
+            SimulationSocket::bind(addr).await.unwrap(),
+            None,
+        ));
+        let endpoint = QuicEndpoint::bind(
+            socket.clone(),
+            addr,
+            time.clone(),
+            &settings(),
+            &TransportKeypair::new(),
+        )
+        .unwrap();
+        let monitor = BackgroundTaskMonitor::new();
+        let (attempts, mut attempts_rx) = tokio::sync::mpsc::channel(4);
+        assert!(endpoint.spawn_accept_loop(&monitor, attempts));
+        let (second, _second_rx) = tokio::sync::mpsc::channel(4);
+        assert!(
+            !endpoint.spawn_accept_loop(&monitor, second),
+            "one accept loop per endpoint"
+        );
+        let mut availability = endpoint.availability();
+        let clone = endpoint.clone();
+        drop(endpoint);
+        assert_eq!(availability.get(), QuicAvailability::Up, "a handle is left");
+        assert!(
+            Arc::strong_count(&socket) > 1,
+            "the endpoint holds the socket"
+        );
+        drop(clone);
+        let socket_in = socket.clone();
+        let seen = drive(&time, Duration::from_secs(10), async move {
+            let seen = availability.not_up().await;
+            // The loop let go of its handle, so quinn's driver ends and
+            // drops the endpoint's socket (this task holds one more).
+            while Arc::strong_count(&socket_in) > 2 {
+                tokio::task::yield_now().await;
+            }
+            for _ in 0..3 {
+                assert_eq!(availability.not_up().await, seen, "final and immediate");
+            }
+            seen
+        })
+        .await;
+        assert_eq!(seen, QuicAvailability::Released);
+        assert!(
+            attempts_rx.recv().await.is_none(),
+            "the stopped loop dropped its sender"
+        );
+        assert_eq!(Arc::strong_count(&socket), 1, "the socket was let go");
+        assert_eq!(TRANSPORT_METRICS.quic_endpoint_down_at(addr), 0);
+        let mut disabled = QuicAvailabilityWatch::disabled();
+        for _ in 0..3 {
+            assert_eq!(disabled.not_up().await, QuicAvailability::Disabled);
+        }
+        drop(monitor);
+        unregister_network_time_source(network);
+    });
+}
+
+/// An attempt that finds the accept queue full is ignored and counted.
+#[test]
+fn a_full_accept_queue_ignores_and_counts_the_attempt() {
+    bounded(|| async move {
+        use crate::node::background_task_monitor::BackgroundTaskMonitor;
+        let _seed = GlobalRng::seed_guard(SEED);
+        let pair = pair(
+            "quic-accept-full",
+            "10.201.33.1:5000".parse().unwrap(),
+            "10.201.33.2:5000".parse().unwrap(),
+            None,
+        )
+        .await;
+        let _permit = pair.b.allow_peer(pair.a_addr, &pair.a_key()).unwrap();
+        let monitor = BackgroundTaskMonitor::new();
+        // Room for one attempt, never taken.
+        let (attempts, _attempts_rx) = tokio::sync::mpsc::channel(1);
+        assert!(pair.b.spawn_accept_loop(&monitor, attempts));
+        let clients: Vec<_> = (0..2)
+            .map(|_| {
+                let (a, b_addr, b_key) = (pair.a.clone(), pair.b_addr, pair.b_key());
+                tokio::spawn(async move { a.connect(b_addr, &b_key).await.map(|_| ()) })
+            })
+            .collect();
+        let b = pair.b.clone();
+        drive(&pair.time, Duration::from_secs(10), async move {
+            while b.accept_queue_full() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        assert_eq!(pair.b.accept_queue_full(), 1);
+        for client in clients {
+            client.abort();
+        }
+    });
+}
+
+/// With `transport-quic` off the transport builds no endpoint and reports
+/// `Disabled`; with it on, `Up`. When that endpoint's driver dies, the
+/// transport reports `Down` and its listener keeps running: endpoint death
+/// never reaches `ListenerExit`, which would exit the node. On simulation
+/// sockets (no real port, no port reuse). The endpoint inside the
+/// transport runs on `RealTime`, but nothing here waits on time: the
+/// injected failure wakes the driver at once.
+#[test]
+fn the_transport_reports_quic_availability() {
+    bounded(|| async move {
+        use crate::transport::connection_handler::{UdpTransportConfig, bind_udp_listener};
+        use crate::transport::metrics::TRANSPORT_METRICS;
+        let network = "quic-transport-availability";
+        let time = VirtualTime::new();
+        register_network_time_source(network, time.clone());
+        for (port, quic) in [(5000, None), (5001, Some(settings()))] {
+            let local = SocketAddr::from(([10, 201, 34, 1], port));
+            register_address_network(local, network);
+            let (outbound, _inbound, listener) = bind_udp_listener::<SimulationSocket>(
+                crate::transport::TransportKeypair::new(),
+                local.ip(),
+                port,
+                false,
+                UdpTransportConfig {
+                    quic,
+                    ..UdpTransportConfig::default()
+                },
+            )
+            .await
+            .unwrap();
+            let mut availability = outbound.quic_availability();
+            let Some(endpoint) = outbound.quic_endpoint() else {
+                assert!(quic.is_none(), "an endpoint is built with the key on");
+                assert_eq!(availability.get(), QuicAvailability::Disabled);
+                assert_eq!(availability.not_up().await, QuicAvailability::Disabled);
+                listener.abort();
+                continue;
+            };
+            assert!(quic.is_some(), "no endpoint is built with the key off");
+            assert_eq!(availability.get(), QuicAvailability::Up);
+            endpoint.fail_driver();
+            // A bound only: the wake is immediate.
+            let seen = tokio::time::timeout(Duration::from_secs(30), availability.not_up())
+                .await
+                .expect("the driver's death is reported");
+            assert_eq!(seen, QuicAvailability::Down);
+            assert_eq!(TRANSPORT_METRICS.quic_endpoint_down_at(local), 1);
+            for _ in 0..64 {
+                tokio::task::yield_now().await;
+            }
+            assert!(!listener.is_finished(), "the listener keeps running");
+            listener.abort();
+        }
+        for port in [5000, 5001] {
+            crate::transport::in_memory_socket::unregister_address_network(&SocketAddr::from((
+                [10, 201, 34, 1],
+                port,
+            )));
+        }
+        unregister_network_time_source(network);
+    })
+}
+
+/// Closers racing on one connection (the receive supervisor and the
+/// path's owner on two threads) record exactly one close. The guard is
+/// also checked deterministically: a closer that finds a close already in
+/// progress sends and counts nothing, so the connection stays open.
+#[test]
+fn concurrent_closers_close_and_count_once() {
+    bounded(|| async move {
+        use crate::transport::metrics::{QuicCloseCode, TRANSPORT_METRICS};
+        let _seed = GlobalRng::seed_guard(SEED);
+        let pair = pair(
+            "quic-close-once",
+            "10.201.36.1:5000".parse().unwrap(),
+            "10.201.36.2:5000".parse().unwrap(),
+            None,
+        )
+        .await;
+
+        // Deterministic: a close already in progress wins.
+        let (_, client, _server) = pair.transfer(payload(100), Duration::from_secs(60)).await;
+        let closer = client.closer();
+        closer.mark_closing();
+        assert!(!client.closer().close(QuicCloseCode::Downgrade));
+        assert!(
+            client.inner().close_reason().is_none(),
+            "the second closer did not close"
+        );
+        assert!(TRANSPORT_METRICS.quic_close_sent_to(pair.b_addr).is_empty());
+        drop((client, _server));
+        assert!(
+            TRANSPORT_METRICS.quic_close_sent_to(pair.b_addr).is_empty(),
+            "dropping the handle is a closer too"
+        );
+
+        // Racing: many threads, released at once.
+        let (_, client, _server) = pair.transfer(payload(100), Duration::from_secs(60)).await;
+        let threads = 8;
+        let barrier = Arc::new(std::sync::Barrier::new(threads));
+        let closed: usize = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..threads)
+                .map(|i| {
+                    let closer = client.closer();
+                    let barrier = barrier.clone();
+                    scope.spawn(move || {
+                        barrier.wait();
+                        let code = if i % 2 == 0 {
+                            QuicCloseCode::Downgrade
+                        } else {
+                            QuicCloseCode::NodeDroppedPeer
+                        };
+                        usize::from(closer.close(code))
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).sum()
+        });
+        assert_eq!(closed, 1, "exactly one closer closed");
+        assert_eq!(TRANSPORT_METRICS.quic_close_sent_to(pair.b_addr).len(), 1);
+        drop((client, _server));
+        assert_eq!(TRANSPORT_METRICS.quic_close_sent_to(pair.b_addr).len(), 1);
+    });
 }

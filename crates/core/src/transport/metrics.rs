@@ -271,6 +271,21 @@ labelled_counters! {
 }
 
 labelled_counters! {
+    /// The application error code this node closed a QUIC connection with
+    /// (`quic::error::close_code`, which also maps each to its wire value).
+    /// Exactly one per connection this node closed; exported per period as
+    /// `quic_close_sent_<label>`. Zero while QUIC carries no traffic.
+    pub(crate) enum QuicCloseCode {
+        /// The node dropped the peer (or the connection's handle).
+        NodeDroppedPeer => "node_dropped_peer",
+        /// Downgrade: the peer should fall back to UDP.
+        Downgrade => "downgrade",
+        /// The peer proved a key this node does not have on record for it.
+        IdentityMismatch => "identity_mismatch",
+    }
+}
+
+labelled_counters! {
     /// What took most of a paced stream's gap between fragments, for a gap
     /// that reached the egress cap's long-wait threshold or its deadline.
     /// Exported per period as `egress_long_waits_<label>`,
@@ -490,6 +505,14 @@ pub struct TransportMetrics {
     /// (reset each snapshot).
     conn_identity: [AtomicU32; ConnIdentity::COUNT],
 
+    /// Times the QUIC endpoint went down while the node still held it (its
+    /// driver future returned), after which the node runs with QUIC off
+    /// (reset each snapshot). At most one per endpoint.
+    quic_endpoint_down: AtomicU64,
+    /// QUIC connections this node closed, by [`QuicCloseCode`] (reset each
+    /// snapshot).
+    quic_close_sent: [AtomicU64; QuicCloseCode::COUNT],
+
     /// Inbound streams refused or evicted this period, by reason (reset each
     /// snapshot). The never-reset twin is `cumulative_inbound_stream_outcomes`,
     /// which is what the OTel instrument observes.
@@ -638,6 +661,14 @@ struct NatDetailCounters {
     /// `demux_watched`.
     #[cfg(test)]
     conn_identity_watched: DashMap<SocketAddr, Vec<ConnIdentity>>,
+    /// Test-only log of the local addresses of QUIC endpoints that went
+    /// down (bounded), one per `record_quic_endpoint_down`.
+    #[cfg(test)]
+    quic_endpoint_down_at: parking_lot::Mutex<std::collections::VecDeque<SocketAddr>>,
+    /// Test-only log of QUIC closes this node sent, with the remote
+    /// (bounded).
+    #[cfg(test)]
+    quic_close_sent_to: parking_lot::Mutex<std::collections::VecDeque<(SocketAddr, QuicCloseCode)>>,
     /// Test-only log of observed-address reporters (bounded).
     #[cfg(test)]
     observed_reporters: parking_lot::Mutex<std::collections::VecDeque<SocketAddr>>,
@@ -853,6 +884,8 @@ impl TransportMetrics {
             cumulative_upgrade_control_received: AtomicU64::new(0),
             handshake_unauthenticated_dropped: AtomicU64::new(0),
             conn_identity: Default::default(),
+            quic_endpoint_down: AtomicU64::new(0),
+            quic_close_sent: Default::default(),
             inbound_stream_outcomes: Default::default(),
             nat_attempts_by_origin: Default::default(),
             nat_established_by_origin: Default::default(),
@@ -1210,6 +1243,51 @@ impl TransportMetrics {
             .get(&remote)
             .map(|kinds| kinds.clone())
             .unwrap_or_default()
+    }
+
+    /// The QUIC endpoint bound at `local` went down while the node held it
+    /// (`local` is never exported).
+    pub(crate) fn record_quic_endpoint_down(&self, local: SocketAddr) {
+        #[cfg(test)]
+        push_test_log(&self.nat_detail.quic_endpoint_down_at, local);
+        #[cfg(not(test))]
+        let _ = local;
+        self.quic_endpoint_down.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Test-only: how many times the QUIC endpoint bound at `local` went
+    /// down.
+    #[cfg(test)]
+    pub(crate) fn quic_endpoint_down_at(&self, local: SocketAddr) -> usize {
+        self.nat_detail
+            .quic_endpoint_down_at
+            .lock()
+            .iter()
+            .filter(|addr| **addr == local)
+            .count()
+    }
+
+    /// This node closed a QUIC connection to `remote` with `code`
+    /// (`remote` is never exported).
+    pub(crate) fn record_quic_close_sent(&self, code: QuicCloseCode, remote: SocketAddr) {
+        #[cfg(test)]
+        push_test_log(&self.nat_detail.quic_close_sent_to, (remote, code));
+        #[cfg(not(test))]
+        let _ = remote;
+        self.quic_close_sent[code as usize].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Test-only: the codes this node closed QUIC connections to `remote`
+    /// with, in order.
+    #[cfg(test)]
+    pub(crate) fn quic_close_sent_to(&self, remote: SocketAddr) -> Vec<QuicCloseCode> {
+        self.nat_detail
+            .quic_close_sent_to
+            .lock()
+            .iter()
+            .filter(|(addr, _)| *addr == remote)
+            .map(|(_, code)| *code)
+            .collect()
     }
 
     /// QUIC upgrade control messages received since process start, never
@@ -1785,6 +1863,16 @@ impl TransportMetrics {
             inbound_queue_drops: get64(&self.inbound_queue_drops),
             upgrade_control_received: get64(&self.upgrade_control_received),
             handshake_unauthenticated_dropped: get64(&self.handshake_unauthenticated_dropped),
+            quic_endpoint_down: get64(&self.quic_endpoint_down),
+            quic_close_sent_node_dropped_peer: get64(
+                &self.quic_close_sent[QuicCloseCode::NodeDroppedPeer as usize],
+            ),
+            quic_close_sent_downgrade: get64(
+                &self.quic_close_sent[QuicCloseCode::Downgrade as usize],
+            ),
+            quic_close_sent_identity_mismatch: get64(
+                &self.quic_close_sent[QuicCloseCode::IdentityMismatch as usize],
+            ),
             nat_fail_samples: if reset {
                 std::mem::take(&mut *d.samples.lock())
             } else {
@@ -2279,6 +2367,14 @@ pub struct TransportSnapshot {
     /// Hole-punch handshake packets dropped because they were not
     /// encrypted under the attempt's inbound session key (per packet).
     pub handshake_unauthenticated_dropped: u64,
+    /// Times the QUIC endpoint went down while the node held it; the node
+    /// then runs with QUIC off (#5940 e4).
+    pub quic_endpoint_down: u64,
+    /// QUIC connections this node closed, by close code
+    /// ([`QuicCloseCode`]).
+    pub quic_close_sent_node_dropped_peer: u64,
+    pub quic_close_sent_downgrade: u64,
+    pub quic_close_sent_identity_mismatch: u64,
     /// Per-attempt records of the FIRST 8 failed outbound NAT traversals in
     /// the period (not a representative sample of a busy period);
     /// `nat_fail_samples_dropped` counts the rest. Read with the same
@@ -2501,6 +2597,10 @@ impl TransportSnapshot {
             inbound_queue_drops,
             upgrade_control_received,
             handshake_unauthenticated_dropped,
+            quic_endpoint_down,
+            quic_close_sent_node_dropped_peer,
+            quic_close_sent_downgrade,
+            quic_close_sent_identity_mismatch,
             nat_fail_samples,
             nat_fail_samples_dropped,
             inbound_stream_refused_invalid_length,
@@ -2601,6 +2701,10 @@ impl TransportSnapshot {
         self.inbound_queue_drops = inbound_queue_drops;
         self.upgrade_control_received = upgrade_control_received;
         self.handshake_unauthenticated_dropped = handshake_unauthenticated_dropped;
+        self.quic_endpoint_down = quic_endpoint_down;
+        self.quic_close_sent_node_dropped_peer = quic_close_sent_node_dropped_peer;
+        self.quic_close_sent_downgrade = quic_close_sent_downgrade;
+        self.quic_close_sent_identity_mismatch = quic_close_sent_identity_mismatch;
         self.nat_fail_samples = nat_fail_samples;
         self.nat_fail_samples_dropped = nat_fail_samples_dropped;
         self.inbound_stream_refused_invalid_length = inbound_stream_refused_invalid_length;
@@ -2744,6 +2848,14 @@ struct SnapshotExtras {
     /// Hole-punch handshake packets dropped because they were not
     /// encrypted under the attempt's inbound session key (per packet).
     pub handshake_unauthenticated_dropped: u64,
+    /// Times the QUIC endpoint went down while the node held it; the node
+    /// then runs with QUIC off (#5940 e4).
+    pub quic_endpoint_down: u64,
+    /// QUIC connections this node closed, by close code
+    /// ([`QuicCloseCode`]).
+    pub quic_close_sent_node_dropped_peer: u64,
+    pub quic_close_sent_downgrade: u64,
+    pub quic_close_sent_identity_mismatch: u64,
     /// Per-attempt records of the FIRST 8 failed outbound NAT traversals in
     /// the period (not a representative sample of a busy period);
     /// `nat_fail_samples_dropped` counts the rest. Read with the same
@@ -2878,6 +2990,10 @@ impl SnapshotExtras {
             || self.inbound_queue_drops != 0
             || self.upgrade_control_received != 0
             || self.handshake_unauthenticated_dropped != 0
+            || self.quic_endpoint_down != 0
+            || self.quic_close_sent_node_dropped_peer != 0
+            || self.quic_close_sent_downgrade != 0
+            || self.quic_close_sent_identity_mismatch != 0
             || !self.nat_fail_samples.is_empty()
             || self.inbound_stream_refused_invalid_length != 0
             || self.inbound_stream_refused_connection_bytes != 0
@@ -3741,6 +3857,66 @@ mod tests {
         assert_eq!(metrics.handshake_unauthenticated_dropped_from(remote), 3);
     }
 
+    /// QUIC endpoint deaths reach the snapshot and its JSON, count as
+    /// activity on their own, and reset.
+    #[test]
+    fn quic_endpoint_down_reaches_snapshot_and_resets() {
+        let metrics = TransportMetrics::new();
+        let local: SocketAddr = "10.255.10.1:7".parse().unwrap();
+        assert!(
+            metrics.take_snapshot().is_none(),
+            "a fresh instance is idle"
+        );
+        metrics.record_quic_endpoint_down(local);
+        let snap = metrics
+            .take_snapshot()
+            .expect("an endpoint death alone is activity");
+        assert_eq!(snap.quic_endpoint_down, 1);
+        let json = serde_json::to_value(&snap).unwrap();
+        assert_eq!(json["quic_endpoint_down"], 1);
+        assert!(metrics.take_snapshot().is_none(), "the counter must reset");
+        assert_eq!(metrics.quic_endpoint_down_at(local), 1);
+    }
+
+    /// The snapshot field that carries the period count of closes sent
+    /// with `code`. Exhaustive on purpose: a new `QuicCloseCode` fails to
+    /// compile here until it is given a `TransportSnapshot` field.
+    fn quic_close_sent_count(snap: &TransportSnapshot, code: QuicCloseCode) -> u64 {
+        match code {
+            QuicCloseCode::NodeDroppedPeer => snap.quic_close_sent_node_dropped_peer,
+            QuicCloseCode::Downgrade => snap.quic_close_sent_downgrade,
+            QuicCloseCode::IdentityMismatch => snap.quic_close_sent_identity_mismatch,
+        }
+    }
+
+    /// Each close code is counted in its own snapshot field and JSON key
+    /// (`quic_close_sent_<label>`), alone counts as activity, and resets.
+    #[test]
+    fn quic_close_sent_counts_snapshot_and_reset() {
+        let remote: SocketAddr = "10.255.10.2:7".parse().unwrap();
+        for (i, code) in QuicCloseCode::ALL.into_iter().enumerate() {
+            let metrics = TransportMetrics::new();
+            for _ in 0..=i {
+                metrics.record_quic_close_sent(code, remote);
+            }
+            let snap = metrics
+                .take_snapshot()
+                .expect("a sent close alone is activity");
+            let json = serde_json::to_value(&snap).unwrap();
+            for other in QuicCloseCode::ALL {
+                let expected = if other == code { i as u64 + 1 } else { 0 };
+                assert_eq!(quic_close_sent_count(&snap, other), expected, "{other:?}");
+                assert_eq!(
+                    json[format!("quic_close_sent_{}", other.label())],
+                    expected,
+                    "{other:?}"
+                );
+            }
+            assert!(metrics.take_snapshot().is_none(), "the counter must reset");
+            assert_eq!(metrics.quic_close_sent_to(remote), vec![code; i + 1]);
+        }
+    }
+
     /// The snapshot field that carries `outcome`'s period count. Exhaustive
     /// on purpose: a new `InboundStreamOutcome` fails to compile here until it
     /// is given a `TransportSnapshot` field.
@@ -4505,6 +4681,10 @@ mod tests {
             "inbound_queue_drops",
             "upgrade_control_received",
             "handshake_unauthenticated_dropped",
+            "quic_endpoint_down",
+            "quic_close_sent_node_dropped_peer",
+            "quic_close_sent_downgrade",
+            "quic_close_sent_identity_mismatch",
             "nat_fail_samples",
             "nat_fail_samples_dropped",
             "inbound_stream_refused_invalid_length",

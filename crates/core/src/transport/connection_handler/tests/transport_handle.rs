@@ -46,6 +46,8 @@ async fn udp_handle_shares_one_expected_ip_set_and_reports_the_listener() {
     let outbound = OutboundConnectionHandler::<MockSocket> {
         send_queue,
         expected_non_gateway: expected.clone(),
+        quic_availability: crate::transport::quic::QuicAvailabilityWatch::disabled(),
+        quic_endpoint: None,
     };
     let (inbound_tx, inbound_rx) = mpsc::channel(1);
     let inbound = InboundConnectionHandler {

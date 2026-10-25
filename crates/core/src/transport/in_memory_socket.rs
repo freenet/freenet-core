@@ -71,7 +71,7 @@ pub fn register_address_network(addr: SocketAddr, network_name: &str) {
 }
 
 /// Unregisters a socket address from the network mapping.
-fn unregister_address_network(addr: &SocketAddr) {
+pub(crate) fn unregister_address_network(addr: &SocketAddr) {
     ADDRESS_NETWORKS.remove(addr);
 }
 
