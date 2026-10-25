@@ -3922,7 +3922,11 @@ fn default_temp_root() -> PathBuf {
 /// [`test_temp_root::LOCKLESS_ROOT_MAX_AGE`]; it is then reaped the same way,
 /// after the sweeper creates and takes its lock (so a claimer racing for the
 /// name loses the `flock` and moves on). This covers a process that died in
-/// that window and a partially removed root that lost its lock file.
+/// that window and a partially removed root that lost its lock file. It also
+/// means a LIVE owner's root is reaped if something else deletes its
+/// `.owner.lock` (a manual `rm`, a `/tmp` cleaner) and the root's own entries
+/// then go unchanged for that long, because nothing distinguishes it from a
+/// dead owner's.
 ///
 /// Non-unix builds have no `flock` here: they get a pid-named root (pids are
 /// not shared across namespaces there), and the sweep removes other roots of
@@ -3985,10 +3989,9 @@ mod test_temp_root {
                 }
             }
             panic!(
-                "could not claim a test temp root under TMPDIR={tmp:?}: taking an flock on \
-                 `{}` failed for every candidate name (last: {last_failure}). TMPDIR must be \
-                 a local filesystem where flock works (not NFS with nolock/local_lock).",
-                LOCK
+                "every candidate test temp root name was refused under TMPDIR={tmp:?} \
+                 (last: {last_failure}). TMPDIR must be a writable local filesystem where \
+                 flock works (not NFS with nolock/local_lock)."
             );
         }
         #[cfg(not(unix))]
