@@ -3905,27 +3905,41 @@ fn default_temp_root() -> PathBuf {
 /// `local_lock` a live root can look unlocked to another host, so `TMPDIR`
 /// must be local.
 ///
-/// On first use, roots whose lock nobody holds are removed. A root is only
-/// removed when it is a real directory (not a symlink), owned by this user,
-/// has a lock file, the lock was acquired, and the locked file is still the
-/// one at that path. While still holding the lock, the sweeper renames the
-/// root to a tombstone (`.freenet-test-reap-…`, a name no claimer uses) and
-/// only then deletes it, so a process claiming the same name meanwhile finds
-/// no directory and creates a fresh one instead of having its new lock
-/// deleted by the sweeper's `remove_dir_all`.
+/// On first use the sweep removes stale roots. It only touches an entry
+/// whose name matches exactly what `claim` produces (`freenet-test-<digits>`
+/// or `freenet-test-<digits>-<digits>`) or a tombstone
+/// (`.freenet-test-reap-<digits>-<digits>`), that is a real directory (not a
+/// symlink) and that is owned by this user. A root is stale when this
+/// process acquires its lock and the locked file is still the one at that
+/// path. While still holding the lock, the sweeper renames the root to a
+/// tombstone, a name no claimer uses, and only then deletes it, so a process
+/// claiming the same name meanwhile finds no directory and creates a fresh
+/// one instead of having its new lock deleted by the sweeper's
+/// `remove_dir_all`.
 ///
-/// Known leaks (disk only, never a live root deleted): a root with no lock
-/// file is never swept, because its owner may be between `mkdir` and
-/// `flock`, so a process that died in that window, or a partially removed
-/// root that lost its lock file, stays until removed by hand. Non-unix
-/// builds get a pid-named root (pids are not shared across namespaces
-/// there) and are never swept.
+/// A root with NO lock file may belong to a process between `mkdir` and
+/// `flock`, so it is left alone until its mtime is older than
+/// [`test_temp_root::LOCKLESS_ROOT_MAX_AGE`]; it is then reaped the same way,
+/// after the sweeper creates and takes its lock (so a claimer racing for the
+/// name loses the `flock` and moves on). This covers a process that died in
+/// that window and a partially removed root that lost its lock file.
+///
+/// Non-unix builds have no `flock` here: they get a pid-named root (pids are
+/// not shared across namespaces there), and the sweep removes other roots of
+/// the right name only by the same age rule, skipping this process's own.
+/// A live test process older than that age can therefore lose its root on
+/// non-unix.
 #[cfg(test)]
 mod test_temp_root {
     use std::fs;
     use std::path::{Path, PathBuf};
+    use std::time::{Duration, SystemTime};
 
     pub(super) const PREFIX: &str = "freenet-test-";
+    /// A root with no lock file is reaped once its mtime is older than this.
+    /// Its owner can only legitimately lack a lock between `mkdir` and
+    /// `flock`, which takes microseconds, so a day leaves a wide margin.
+    pub(super) const LOCKLESS_ROOT_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
     #[cfg(unix)]
     pub(super) const LOCK: &str = ".owner.lock";
     #[cfg(unix)]
@@ -3940,7 +3954,7 @@ mod test_temp_root {
         use std::hash::{BuildHasher, Hasher};
         let mut h = std::collections::hash_map::RandomState::new().build_hasher();
         h.write_u128(
-            std::time::SystemTime::now()
+            SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_nanos())
                 .unwrap_or(0),
@@ -3952,44 +3966,98 @@ mod test_temp_root {
         let pid = std::process::id();
         #[cfg(unix)]
         {
-            sweep(tmp);
-            for n in 0..SEQUENTIAL_NAMES {
-                let root = if n == 0 {
-                    tmp.join(format!("{PREFIX}{pid}"))
+            sweep(tmp, SystemTime::now());
+            let mut last_failure = String::new();
+            let sequential = (0..SEQUENTIAL_NAMES).map(|n| {
+                if n == 0 {
+                    format!("{PREFIX}{pid}")
                 } else {
-                    tmp.join(format!("{PREFIX}{pid}-{n}"))
-                };
-                if unix::try_own(&root) {
-                    return root;
+                    format!("{PREFIX}{pid}-{n}")
                 }
-            }
+            });
             // Never fall back to an unlocked or shared root.
-            for _ in 0..16 {
-                let root = tmp.join(format!("{PREFIX}{pid}-{}", random_u64()));
-                if unix::try_own(&root) {
-                    return root;
+            let random = (0..16).map(|_| format!("{PREFIX}{pid}-{}", random_u64()));
+            for name in sequential.chain(random) {
+                let root = tmp.join(name);
+                match unix::try_own(&root) {
+                    Ok(()) => return root,
+                    Err(why) => last_failure = format!("{root:?}: {why}"),
                 }
             }
-            panic!("could not claim a private, locked test temp root under {tmp:?}");
+            panic!(
+                "could not claim a test temp root under TMPDIR={tmp:?}: taking an flock on \
+                 `{}` failed for every candidate name (last: {last_failure}). TMPDIR must be \
+                 a local filesystem where flock works (not NFS with nolock/local_lock).",
+                LOCK
+            );
         }
         #[cfg(not(unix))]
         {
             let root = tmp.join(format!("{PREFIX}{pid}"));
+            sweep_aged_roots(tmp, &root, SystemTime::now());
             let _created = fs::create_dir_all(&root);
             root
         }
     }
 
-    /// Whether `name` is one `claim` can produce: `PREFIX` then digits and
-    /// dashes.
-    #[cfg(unix)]
+    /// `s` is `min..=max` dash-separated segments, each one or more ASCII
+    /// digits.
+    fn digit_segments(s: &str, min: usize, max: usize) -> bool {
+        let mut count = 0;
+        for segment in s.split('-') {
+            if segment.is_empty() || !segment.bytes().all(|b| b.is_ascii_digit()) {
+                return false;
+            }
+            count += 1;
+        }
+        (min..=max).contains(&count)
+    }
+
+    /// Exactly the names `claim` produces: `freenet-test-<digits>` or
+    /// `freenet-test-<digits>-<digits>`.
     pub(super) fn is_root_name(name: &str) -> bool {
         name.strip_prefix(PREFIX)
-            .is_some_and(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit() || b == b'-'))
+            .is_some_and(|s| digit_segments(s, 1, 2))
+    }
+
+    /// Exactly the names `reap` produces: `.freenet-test-reap-<digits>-<digits>`.
+    #[cfg(unix)]
+    pub(super) fn is_tombstone_name(name: &str) -> bool {
+        name.strip_prefix(TOMBSTONE_PREFIX)
+            .is_some_and(|s| digit_segments(s, 2, 2))
+    }
+
+    /// The entry's mtime is more than [`LOCKLESS_ROOT_MAX_AGE`] before `now`.
+    /// An unreadable or future mtime is not aged.
+    pub(super) fn is_aged(meta: &fs::Metadata, now: SystemTime) -> bool {
+        meta.modified()
+            .ok()
+            .and_then(|mtime| now.duration_since(mtime).ok())
+            .is_some_and(|age| age > LOCKLESS_ROOT_MAX_AGE)
+    }
+
+    /// The non-unix sweep (no `flock` there): remove root-named real
+    /// directories other than `own` whose mtime is older than
+    /// [`LOCKLESS_ROOT_MAX_AGE`]. Compiled everywhere so unix tests cover it.
+    pub(super) fn sweep_aged_roots(tmp: &Path, own: &Path, now: SystemTime) {
+        let Ok(entries) = fs::read_dir(tmp) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path == own
+                || !entry.file_name().to_str().is_some_and(is_root_name)
+                || !entry.file_type().is_ok_and(|t| t.is_dir())
+                || !fs::symlink_metadata(&path).is_ok_and(|m| is_aged(&m, now))
+            {
+                continue;
+            }
+            let _stale = fs::remove_dir_all(&path);
+        }
     }
 
     #[cfg(unix)]
-    pub(super) fn sweep(tmp: &Path) {
+    pub(super) fn sweep(tmp: &Path, now: SystemTime) {
         let Ok(entries) = fs::read_dir(tmp) else {
             return;
         };
@@ -4006,7 +4074,7 @@ mod test_temp_root {
             if !unix::owned_by_me(&path) {
                 continue;
             }
-            if name.starts_with(TOMBSTONE_PREFIX) {
+            if is_tombstone_name(name) {
                 // Left by a sweeper that died mid-removal. A tombstone is
                 // never a live root, so removing it again is harmless.
                 let _stale = fs::remove_dir_all(&path);
@@ -4015,8 +4083,21 @@ mod test_temp_root {
             if !is_root_name(name) {
                 continue;
             }
-            let Some(lock) = unix::try_lock_existing(&path) else {
-                continue;
+            let lock = match unix::try_lock_existing(&path) {
+                Some(lock) => lock,
+                None if fs::symlink_metadata(&path).is_ok_and(|m| is_aged(&m, now)) => {
+                    // No lock we could take, but old enough to be dead if
+                    // lockless. Create and take the lock ourselves: if it
+                    // exists and is held (a live owner), or a claimer racing
+                    // for this name took it first, the flock fails and the
+                    // root is kept.
+                    match unix::open_lock(&path, true).and_then(|f| unix::lock_if_current(&path, f))
+                    {
+                        Some(lock) => lock,
+                        None => continue,
+                    }
+                }
+                None => continue,
             };
             let _reaped = reap(tmp, &path, lock, || {});
         }
@@ -4093,14 +4174,15 @@ mod test_temp_root {
         }
 
         /// Create (or adopt a dead owner's) root and hold its lock for the
-        /// rest of the process.
-        pub(in super::super) fn try_own(root: &Path) -> bool {
-            if fs::create_dir_all(root).is_err() || !owned_by_me(root) {
-                return false;
+        /// rest of the process. `Err` says why the name could not be taken.
+        pub(in super::super) fn try_own(root: &Path) -> Result<(), String> {
+            fs::create_dir_all(root).map_err(|e| format!("create_dir_all failed: {e}"))?;
+            if !owned_by_me(root) {
+                return Err("not a real directory owned by this user".into());
             }
-            let Some(file) = open_lock(root, true).and_then(|f| lock_if_current(root, f)) else {
-                return false;
-            };
+            let file = open_lock(root, true).ok_or("could not open the lock file")?;
+            let file = lock_if_current(root, file)
+                .ok_or("flock failed (held by a live process) or the lock file was replaced")?;
             // A dead owner's leftovers (same pid, reused): start empty.
             if let Ok(entries) = fs::read_dir(root) {
                 for entry in entries.flatten() {
@@ -4117,7 +4199,7 @@ mod test_temp_root {
             }
             // Held until the process exits; the kernel releases it then.
             std::mem::forget(file);
-            true
+            Ok(())
         }
     }
 }
@@ -6239,12 +6321,14 @@ mod tests {
         let creating = mk(&format!("{PREFIX}4000000003"), false);
         let unrelated = mk(&format!("{PREFIX}abc"), true);
         let tombstone = mk(&format!("{TOMBSTONE_PREFIX}1-2"), false);
+        let odd_tombstone = mk(&format!("{TOMBSTONE_PREFIX}1-2-3"), false);
+        let odd_root = mk(&format!("{PREFIX}1--2"), true);
         let target = mk("not-a-test-root", true);
         let link = tmp.path().join(format!("{PREFIX}4000000004"));
         std::os::unix::fs::symlink(&target, &link).unwrap();
 
         let _held = unix::try_lock_existing(&live).expect("lock the live root");
-        sweep(tmp.path());
+        sweep(tmp.path(), std::time::SystemTime::now());
 
         assert!(!stale.exists(), "unlocked root was not swept");
         assert!(!tombstone.exists(), "leftover tombstone was not removed");
@@ -6254,15 +6338,13 @@ mod tests {
             "lockless root was swept"
         );
         assert!(unrelated.exists(), "non-matching name was swept");
+        assert!(odd_tombstone.exists(), "malformed tombstone name was swept");
+        assert!(odd_root.exists(), "malformed root name was swept");
         assert!(link.symlink_metadata().is_ok(), "symlink was removed");
         let leftovers: Vec<_> = fs::read_dir(tmp.path())
             .unwrap()
             .flatten()
-            .filter(|e| {
-                e.file_name()
-                    .to_string_lossy()
-                    .starts_with(TOMBSTONE_PREFIX)
-            })
+            .filter(|e| test_temp_root::is_tombstone_name(&e.file_name().to_string_lossy()))
             .collect();
         assert!(leftovers.is_empty(), "reap left a tombstone: {leftovers:?}");
     }
@@ -6328,7 +6410,7 @@ mod tests {
 
         let mut claimed = false;
         reap(tmp.path(), &root, lock, || {
-            claimed = unix::try_own(&root);
+            claimed = unix::try_own(&root).is_ok();
             fs::create_dir_all(root.join("new")).unwrap();
         })
         .unwrap();
@@ -6359,7 +6441,7 @@ mod tests {
         fs::write(root.join("stray"), b"x").unwrap();
         fs::write(root.join(LOCK), b"").unwrap();
 
-        assert!(unix::try_own(&root));
+        assert!(unix::try_own(&root).is_ok());
         let left: Vec<_> = fs::read_dir(&root)
             .unwrap()
             .flatten()
@@ -6389,14 +6471,129 @@ mod tests {
             let name = root.file_name().and_then(|n| n.to_str()).unwrap();
             assert!(is_root_name(name), "{name} would never be swept");
         }
+        // The 65th root must come from the random fallback, not a
+        // sequential name. A random u64 is <= SEQUENTIAL_NAMES with
+        // probability ~65/2^64.
         let pid = std::process::id();
-        let fallback = roots.last().unwrap();
-        assert_ne!(
-            fallback,
-            &tmp.path()
-                .join(format!("freenet-test-{pid}-{SEQUENTIAL_NAMES}")),
-            "expected the random fallback after the sequential names"
+        let last = roots.last().unwrap().file_name().unwrap().to_str().unwrap();
+        let suffix: u64 = last
+            .strip_prefix(&format!("freenet-test-{pid}-"))
+            .and_then(|s| s.parse().ok())
+            .unwrap_or_else(|| panic!("unexpected fallback name {last}"));
+        assert!(
+            suffix > u64::from(SEQUENTIAL_NAMES),
+            "fallback {last} is a sequential name"
         );
+    }
+
+    /// The sweep only deletes names `claim` and `reap` can produce.
+    #[test]
+    fn test_temp_root_name_grammar() {
+        use test_temp_root::is_root_name;
+        for ok in ["freenet-test-1", "freenet-test-123", "freenet-test-123-4"] {
+            assert!(is_root_name(ok), "{ok} rejected");
+        }
+        for bad in [
+            "freenet-test-",
+            "freenet-test--1",
+            "freenet-test-1-",
+            "freenet-test-1--2",
+            "freenet-test-1-2-3",
+            "freenet-test-1a",
+            "freenet-test-abc",
+            "freenet-test-run-20261025-101010",
+            "freenet-1",
+            "xfreenet-test-1",
+        ] {
+            assert!(!is_root_name(bad), "{bad} accepted");
+        }
+        #[cfg(unix)]
+        {
+            use test_temp_root::is_tombstone_name;
+            assert!(is_tombstone_name(".freenet-test-reap-12-34"));
+            for bad in [
+                ".freenet-test-reap-12",
+                ".freenet-test-reap-12-",
+                ".freenet-test-reap-12--34",
+                ".freenet-test-reap-1-2-3",
+                ".freenet-test-reap-1-x",
+                "freenet-test-reap-1-2",
+            ] {
+                assert!(!is_tombstone_name(bad), "{bad} accepted");
+            }
+        }
+    }
+
+    /// Backdate a directory's mtime by `age`.
+    fn set_age(dir: &Path, age: std::time::Duration) {
+        let mtime = std::time::SystemTime::now() - age;
+        File::open(dir).unwrap().set_modified(mtime).unwrap();
+    }
+
+    /// A lockless root (its owner died between mkdir and flock, or a partial
+    /// removal took its lock file) is reaped once older than
+    /// LOCKLESS_ROOT_MAX_AGE; a fresh lockless root and an aged root whose
+    /// lock is held are kept.
+    #[cfg(unix)]
+    #[test]
+    fn aged_lockless_test_root_is_reaped() {
+        use test_temp_root::{LOCK, LOCKLESS_ROOT_MAX_AGE, PREFIX, sweep, unix};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let old = LOCKLESS_ROOT_MAX_AGE + std::time::Duration::from_secs(3600);
+        let mk = |name: &str| {
+            let root = tmp.path().join(name);
+            fs::create_dir_all(root.join("freenet-x/db")).unwrap();
+            root
+        };
+        let aged = mk(&format!("{PREFIX}4000000011"));
+        let fresh = mk(&format!("{PREFIX}4000000012"));
+        let held = mk(&format!("{PREFIX}4000000013"));
+        fs::write(held.join(LOCK), b"").unwrap();
+        let _held_lock = unix::try_lock_existing(&held).expect("lock the live root");
+        set_age(&aged, old);
+        set_age(&held, old);
+
+        sweep(tmp.path(), std::time::SystemTime::now());
+
+        assert!(!aged.exists(), "aged lockless root was not reaped");
+        assert!(
+            fresh.join("freenet-x/db").exists(),
+            "fresh lockless root was reaped"
+        );
+        assert!(
+            held.join("freenet-x/db").exists(),
+            "aged root with a held lock was reaped"
+        );
+    }
+
+    /// The non-unix sweep: aged roots of the right name are removed; this
+    /// process's own root, fresh roots and other names are kept.
+    #[test]
+    fn non_unix_age_sweep_spares_own_fresh_and_foreign_roots() {
+        use test_temp_root::{LOCKLESS_ROOT_MAX_AGE, PREFIX, sweep_aged_roots};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let old = LOCKLESS_ROOT_MAX_AGE + std::time::Duration::from_secs(3600);
+        let mk = |name: &str, aged: bool| {
+            let root = tmp.path().join(name);
+            fs::create_dir_all(root.join("db")).unwrap();
+            if aged {
+                set_age(&root, old);
+            }
+            root
+        };
+        let stale = mk(&format!("{PREFIX}4000000021"), true);
+        let own = mk(&format!("{PREFIX}4000000022"), true);
+        let fresh = mk(&format!("{PREFIX}4000000023"), false);
+        let foreign = mk(&format!("{PREFIX}run-1"), true);
+
+        sweep_aged_roots(tmp.path(), &own, std::time::SystemTime::now());
+
+        assert!(!stale.exists(), "aged root was not removed");
+        assert!(own.join("db").exists(), "own root was removed");
+        assert!(fresh.join("db").exists(), "fresh root was removed");
+        assert!(foreign.join("db").exists(), "non-matching name was removed");
     }
 
     /// The pool size is the multiplier in every per-worker memory budget
