@@ -16,8 +16,16 @@
 //! The open streams are `InboundStreamBudget::stream_count`. That
 //! overestimates what QUIC would hold: a charge here lasts until the
 //! stream's consumers drop its buffer, while a QUIC slot frees when the
-//! stream has been read to its end. An overestimate argues for a larger
-//! limit, which is the safe direction for choosing one.
+//! stream has been read to its end. So the estimate is an upper bound on
+//! what ordinary traffic needs, and can justify lowering the limit, never
+//! raising it. It is also capped by the per-connection stream budget
+//! (1024): streams the budget refuses are not counted. It says nothing
+//! about what a peer opening streams on purpose could hold.
+//!
+//! A stream that arrives whole in one fragment differs by path: on the
+//! legacy path it is never charged and is counted as a short message; on
+//! the operations path it is charged until its consumers let go and is
+//! counted as an open stream. Both overestimate.
 
 use std::collections::VecDeque;
 use std::time::Duration;
@@ -26,7 +34,9 @@ use std::time::Duration;
 /// stream slot: the sender gets the credit back once the receiver has read
 /// the stream and acknowledged it, and the receiver may delay that
 /// acknowledgement by up to its `max_ack_delay`. 25 ms is the QUIC default
-/// (RFC 9000 section 18.2), which our QUIC configuration does not change.
+/// (RFC 9000 section 18.2) and quinn's: `quic::config` does not set
+/// `max_ack_delay`, so this mirrors quinn's default rather than a value of
+/// ours. If that config ever sets it, use the same value here.
 pub(super) const ACK_DELAY_ALLOWANCE: Duration = Duration::from_millis(25);
 
 /// The RTT used before the connection has a smoothed RTT (no data ACK or

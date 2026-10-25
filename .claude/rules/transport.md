@@ -364,17 +364,30 @@ ignored (`upgrade_control_received`) and hole-punch handshake packets dropped,
 one count per packet, because they were not encrypted under the attempt's
 inbound session key (`handshake_unauthenticated_dropped`), QUIC endpoint deaths
 (`quic_endpoint_down`) and QUIC connections this node closed, by close code
-(`quic_close_sent_<label>`, one per `QuicCloseCode`), and per-connection inbound
-concurrency (`inbound_concurrency_*`: at each inbound short message and new
-inbound stream, open inbound streams plus short messages received within
-SRTT + 25 ms, an overestimate of the QUIC streams the connection would hold;
-connections sampled, connections whose period peak reached 8 / 16 / 32 / 64 /
-128 / 256, and the largest estimate; uploaded only when non-zero; it exists
-to choose `MAX_UNI_STREAMS`). Each label set is declared once in a
+(`quic_close_sent_<label>`, one per `QuicCloseCode`). Each label set is declared once in a
 `labelled_counters!` list, so a new variant needs a snapshot field. Hot
 path writes are single relaxed atomics; `SentPacketTracker` keeps an
 `rto_expiries` count and a bounded per-stream final-ACK watch, both
 observation only.
+
+Per-connection inbound concurrency (`inbound_concurrency_*`,
+`peer_connection/inbound_concurrency.rs`) estimates, at each inbound short
+message and each newly admitted inbound stream, the QUIC uni streams the
+connection would hold: open inbound streams plus short messages received
+within SRTT + 25 ms. Per snapshot window (`transport_snapshot_interval_secs`,
+default 30 s) it reports the connections sampled, how many peaked at 8 / 16 /
+32 / 64 / 128 / 256 or more, and the largest estimate; keys are uploaded only
+when non-zero, and `conns_sampled` is the only activity term. It is an upper
+bound on ordinary UDP demand: `ge_T / conns_sampled` can justify LOWERING
+`MAX_UNI_STREAMS` (`quic/config.rs`), never raising it, and it says nothing
+about the memory a peer opening streams on purpose can hold (the per-path
+ceiling's job). `inbound_concurrency_max` is diagnostic only (one peer can
+drive it to the cap with a burst or an inflated RTT). The open-stream term
+stops at the 1024-stream budget, so refused connections are understated. The
+counts sit under one mutex taken only on a connection's first sample of a
+window or a new peak, and by the snapshot, which advances the window and
+drains them together; do not split them back into separate atomics, which
+let a sample racing the snapshot produce rows with `ge_T > conns_sampled`.
 
 `CONN_RTT_REGISTRY` (`rolling_rtt_stats.rs`) holds one `ConnRttGauge` per live
 connection (owned by `RollingRttStatsHandle`) for the snapshot's

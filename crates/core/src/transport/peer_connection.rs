@@ -340,6 +340,10 @@ pub struct PeerConnection<S = super::UdpSocket, T: TimeSource = RealTime> {
     /// current snapshot period (see `sample_inbound_concurrency`).
     inbound_concurrency: inbound_concurrency::InboundConcurrency,
     inbound_concurrency_peak: super::metrics::InboundConcurrencyPeak,
+    /// Where the inbound concurrency samples are recorded: always
+    /// `TRANSPORT_METRICS`, except in tests that need a private instance
+    /// (the global one is drained by whichever test snapshots it).
+    inbound_concurrency_metrics: &'static super::metrics::TransportMetrics,
 }
 
 impl<S, T: TimeSource> std::fmt::Debug for PeerConnection<S, T> {
@@ -1085,6 +1089,7 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
             ),
             inbound_concurrency: inbound_concurrency::InboundConcurrency::default(),
             inbound_concurrency_peak: super::metrics::InboundConcurrencyPeak::default(),
+            inbound_concurrency_metrics: &super::TRANSPORT_METRICS,
         }
     }
 
@@ -2429,7 +2434,6 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
             inbound_stream_age_limit(total_length_bytes),
             inbound_budget::Liveness::Buffer(streaming_handle.buffer_weak()),
         );
-        self.sample_inbound_concurrency(false);
         match streaming_handle.push_fragment(fragment_number, payload) {
             Err(streaming::StreamError::Cancelled) => {
                 // Stream was already cancelled, don't register it
@@ -2456,6 +2460,8 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
             }
             Ok(_) => {}
         }
+        // After the push, so a stream found already cancelled is not counted.
+        self.sample_inbound_concurrency(false);
         // Phase 4: Register with orphan stream registry for race condition handling.
         // This allows operations layer to claim the stream when metadata arrives,
         // even if the stream fragments arrived first.
@@ -2585,7 +2591,7 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
             self.inbound_concurrency
                 .on_stream_admitted(now_nanos, srtt, open_streams)
         };
-        super::TRANSPORT_METRICS
+        self.inbound_concurrency_metrics
             .record_inbound_concurrency(&mut self.inbound_concurrency_peak, estimate);
         #[cfg(test)]
         {

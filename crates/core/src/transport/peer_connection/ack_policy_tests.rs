@@ -3012,3 +3012,103 @@ async fn an_admitted_inbound_stream_is_sampled_once() {
         );
     }
 }
+
+/// Point `e`'s inbound concurrency samples at a private metrics instance,
+/// so other tests snapshotting `TRANSPORT_METRICS` cannot disturb them.
+fn private_concurrency_metrics(
+    e: &mut End,
+) -> &'static crate::transport::metrics::TransportMetrics {
+    let metrics = Box::leak(Box::new(crate::transport::metrics::TransportMetrics::new()));
+    e.conn.inbound_concurrency_metrics = metrics;
+    metrics
+}
+
+/// The connection's samples reach `TransportMetrics`: its peak is the
+/// period's maximum and is counted at each threshold it reached, once per
+/// period.
+#[tokio::test(start_paused = true)]
+async fn inbound_concurrency_peak_reaches_transport_metrics() {
+    let mut e = single(CAPABLE);
+    let metrics = private_concurrency_metrics(&mut e);
+    for id in 1..=9u32 {
+        e.deliver(id, short(b"s"), vec![]).await;
+        assert!(e.pump(Duration::from_millis(1)).await.is_some());
+    }
+    let snap = metrics.take_snapshot().expect("samples are activity");
+    assert_eq!(snap.inbound_concurrency_conns_sampled, 1);
+    assert_eq!(snap.inbound_concurrency_max, 9);
+    assert_eq!(snap.inbound_concurrency_conns_ge_8, 1);
+    assert_eq!(snap.inbound_concurrency_conns_ge_16, 0);
+
+    // The next period counts the connection again, from its own estimate.
+    tokio::time::advance(Duration::from_secs(1)).await;
+    e.deliver(10, short(b"t"), vec![]).await;
+    assert!(e.pump(Duration::from_millis(1)).await.is_some());
+    let snap = metrics.take_snapshot().expect("samples are activity");
+    assert_eq!(snap.inbound_concurrency_conns_sampled, 1);
+    assert_eq!(snap.inbound_concurrency_max, 1);
+    assert_eq!(snap.inbound_concurrency_conns_ge_8, 0);
+}
+
+/// With a smoothed RTT published, the window is that RTT + 25 ms, not the
+/// 125 ms fallback: two short messages 40 ms apart overlap without an RTT
+/// and do not overlap at a 10 ms RTT.
+#[tokio::test(start_paused = true)]
+async fn a_published_srtt_sets_the_inbound_concurrency_window() {
+    for (srtt, expected) in [(None, 2), (Some(Duration::from_millis(10)), 1)] {
+        let mut e = single(CAPABLE);
+        let metrics = private_concurrency_metrics(&mut e);
+        if let Some(srtt) = srtt {
+            e.conn.remote_conn.rolling_rtt_stats.publish_srtt(srtt);
+        }
+        assert_eq!(e.conn.remote_conn.rolling_rtt_stats.srtt(), srtt);
+        e.deliver(1, short(b"a"), vec![]).await;
+        assert!(e.pump(Duration::from_millis(1)).await.is_some());
+        tokio::time::advance(Duration::from_millis(40)).await;
+        e.deliver(2, short(b"b"), vec![]).await;
+        assert!(e.pump(Duration::from_millis(1)).await.is_some());
+        assert_eq!(
+            metrics.read_snapshot().inbound_concurrency_max,
+            expected,
+            "srtt {srtt:?}"
+        );
+    }
+}
+
+/// A legacy stream that arrives whole in one fragment is never charged and
+/// is counted as a short message: it stays in the window afterwards, and
+/// holds no open stream.
+#[tokio::test(start_paused = true)]
+async fn a_single_fragment_legacy_stream_is_sampled_as_a_short_message() {
+    let mut e = single(CAPABLE);
+    let stream_id = StreamId::next_transport_internal();
+    let delivered = feed(&mut e, fragment(stream_id, b"fragment".len() as u64, 1)).await;
+    assert!(
+        delivered.is_some(),
+        "a one-fragment stream completes at once"
+    );
+    assert_eq!(e.conn.inbound_budget.stream_count(), 0);
+    assert_eq!(e.conn.telemetry_test_counts.inbound_concurrency_samples, 1);
+    assert_eq!(e.conn.telemetry_test_counts.inbound_concurrency_max, 1);
+    assert_eq!(
+        e.conn
+            .inbound_concurrency
+            .on_stream_admitted(e.conn.time_source.now_nanos(), None, 0),
+        1,
+        "it is in the short-message window"
+    );
+}
+
+/// A stream refused at admission takes no sample, on either path.
+#[tokio::test(start_paused = true)]
+async fn a_refused_inbound_stream_is_not_sampled() {
+    for stream_id in [StreamId::next(), StreamId::next_transport_internal()] {
+        let mut e = single(CAPABLE);
+        assert!(feed(&mut e, fragment(stream_id, 0, 1)).await.is_none());
+        assert!(holds_no_state(&e, stream_id));
+        assert_eq!(
+            e.conn.telemetry_test_counts.inbound_concurrency_samples, 0,
+            "{stream_id:?}"
+        );
+    }
+}
