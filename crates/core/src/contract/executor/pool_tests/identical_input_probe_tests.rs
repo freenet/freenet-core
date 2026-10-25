@@ -44,7 +44,7 @@ use super::super::mock_runtime::test::create_test_contract as test_contract;
 
 /// Build a real `OpManager` backed by a temp-dir `Config`, mirroring the
 /// wiring in `disk_budget_gate_tests.rs::build_op_manager`.
-async fn build_op_manager(id: &str) -> (Arc<OpManager>, Box<dyn std::any::Any>) {
+pub(super) async fn build_op_manager(id: &str) -> (Arc<OpManager>, Box<dyn std::any::Any>) {
     let config_args = ConfigArgs {
         id: Some(id.to_string()),
         mode: Some(OperationMode::Local),
@@ -92,7 +92,7 @@ fn distinct_bytes_state() -> WrappedState {
     WrappedState::new((1u8..=32).collect::<Vec<u8>>())
 }
 
-async fn build_executor(
+pub(super) async fn build_executor(
     op_manager: &Arc<OpManager>,
 ) -> Executor<crate::contract::executor::mock_wasm_runtime::MockWasmRuntime, MockStateStorage> {
     Executor::new_mock_wasm("t", MockStateStorage::new(), None, Some(op_manager.clone()))
@@ -133,6 +133,8 @@ async fn identical_input_reapply_flags_non_idempotent_contract_on_first_apply() 
         "no flag before any identical re-apply — the install path proves nothing"
     );
 
+    crate::ring::EMITTED_FLAG_EVENTS.with(|events| events.borrow_mut().clear());
+
     // FIRST identical re-apply: the probe re-merges S into itself, the
     // fixture mutates (different byte multiset) → flagged. Deterministic:
     // this assertion would only pass ~1/32 of runs under the sampled probe.
@@ -154,6 +156,9 @@ async fn identical_input_reapply_flags_non_idempotent_contract_on_first_apply() 
         "identity probe must flag the non-idempotent contract on the FIRST \
          identical apply (no 1/32 sampling)"
     );
+    let events = crate::ring::EMITTED_FLAG_EVENTS.with(|events| events.borrow().clone());
+    assert_eq!(events.len(), 1, "the flag must reach telemetry: {events:?}");
+    assert_eq!(events[0]["detector"], "identical_input");
 }
 
 /// Healthy baseline: a correctly-idempotent contract (default mock merge)

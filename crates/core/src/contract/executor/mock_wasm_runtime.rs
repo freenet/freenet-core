@@ -19,6 +19,8 @@ pub(crate) enum ValidateOverride {
     Invalid,
     /// Return `RequestRelated` with an empty vec (malformed request).
     EmptyRequestRelated,
+    /// `Valid` exactly when the predicate holds for the state bytes.
+    ValidWhen(fn(&[u8]) -> bool),
 }
 
 /// Configurable `update_state` behavior for testing related contract flows.
@@ -68,6 +70,22 @@ pub(crate) enum UpdateOverride {
     /// merge canonicalizes, every later one is a fixpoint. The
     /// identical-input probe must NOT flag this shape.
     CanonicalizeOnce,
+    /// A full-state merge given as a pure function `merge(current, incoming)`,
+    /// folded over every `State` entry in the batch. Lets a test run the
+    /// executor's probes against a merge with known algebraic properties.
+    MergeWith(fn(&[u8], &[u8]) -> Vec<u8>),
+    /// [`Self::MergeWith`] for a merge that can refuse: `None` is returned as a
+    /// contract error (`InvalidUpdateWithInfo`).
+    TryMergeWith(fn(&[u8], &[u8]) -> Option<Vec<u8>>),
+    /// [`Self::MergeWith`], except that when the batch carries no
+    /// `RelatedState` entry and `needs(current)` holds, it returns
+    /// `requires(related)`. Models a contract that needs related state only
+    /// for some stored states.
+    RequiresRelatedWhen {
+        related: ContractInstanceId,
+        needs: fn(&[u8]) -> bool,
+        merge: fn(&[u8], &[u8]) -> Vec<u8>,
+    },
 }
 
 /// A lightweight mock runtime at the `ContractRuntimeInterface` level that lets
@@ -249,6 +267,13 @@ impl ContractRuntimeInterface for MockWasmRuntime {
                 ValidateOverride::AlwaysRequestRelated(ids) => ValidateResult::RequestRelated(ids),
                 ValidateOverride::Invalid => ValidateResult::Invalid,
                 ValidateOverride::EmptyRequestRelated => ValidateResult::RequestRelated(vec![]),
+                ValidateOverride::ValidWhen(valid) => {
+                    if valid(_state.as_ref()) {
+                        ValidateResult::Valid
+                    } else {
+                        ValidateResult::Invalid
+                    }
+                }
             });
         }
         Ok(ValidateResult::Valid)
@@ -390,6 +415,57 @@ impl ContractRuntimeInterface for MockWasmRuntime {
                         .position(|b| *b != 0xFF)
                         .unwrap_or(logical.len());
                     let out = logical[canonical_start..].to_vec();
+                    return Ok(UpdateModification::valid(out.into()));
+                }
+                UpdateOverride::TryMergeWith(merge) => {
+                    let mut out = _state.as_ref().to_vec();
+                    for update in update_data {
+                        if let UpdateData::State(incoming) = update {
+                            let Some(next) = merge(&out, incoming.as_ref()) else {
+                                use crate::wasm_runtime::ContractExecError;
+                                use freenet_stdlib::prelude::ContractError as StdlibContractError;
+                                let inner_err = StdlibContractError::InvalidUpdateWithInfo {
+                                    reason: "merge refused".into(),
+                                };
+                                return Err(crate::wasm_runtime::ContractError::from(
+                                    ContractExecError::ContractError(inner_err),
+                                ));
+                            };
+                            out = next;
+                        }
+                    }
+                    return Ok(UpdateModification::valid(out.into()));
+                }
+                UpdateOverride::RequiresRelatedWhen {
+                    related,
+                    needs,
+                    merge,
+                } => {
+                    let has_related = update_data
+                        .iter()
+                        .any(|u| matches!(u, UpdateData::RelatedState { .. }));
+                    if !has_related && needs(_state.as_ref()) {
+                        return Ok(UpdateModification::requires(vec![RelatedContract {
+                            contract_instance_id: related,
+                            mode: RelatedMode::StateOnce,
+                        }])
+                        .map_err(|e| anyhow::anyhow!("{e}"))?);
+                    }
+                    let mut out = _state.as_ref().to_vec();
+                    for update in update_data {
+                        if let UpdateData::State(incoming) = update {
+                            out = merge(&out, incoming.as_ref());
+                        }
+                    }
+                    return Ok(UpdateModification::valid(out.into()));
+                }
+                UpdateOverride::MergeWith(merge) => {
+                    let mut out = _state.as_ref().to_vec();
+                    for update in update_data {
+                        if let UpdateData::State(incoming) = update {
+                            out = merge(&out, incoming.as_ref());
+                        }
+                    }
                     return Ok(UpdateModification::valid(out.into()));
                 }
             }
