@@ -2381,25 +2381,12 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
             // after its side of the handshake completes, but before our handshake finishes.
             // These packets are buffered in `next_inbound` but only the ACK packet is read above.
             // Forward any remaining packets to the new connection channel so they're not lost.
-            let mut forwarded_count = 0;
-            // Stamped as they are forwarded: they arrived during the handshake,
-            // before anything else on this channel, so a common later stamp
-            // keeps them together and ahead of every later packet.
-            let forwarded_nanos = time_source.now_nanos();
-            while let Ok(packet) = next_inbound.try_recv() {
-                let packet = InboundPacket {
-                    packet,
-                    queued_nanos: forwarded_nanos,
-                };
-                if inbound_packet_tx.try_send(packet).is_err() {
-                    tracing::warn!(
-                        peer_addr = %remote_addr,
-                        "Failed to forward handshake-buffered packet to connection channel (channel full)"
-                    );
-                    break;
-                }
-                forwarded_count += 1;
-            }
+            let forwarded_count = forward_handshake_buffered(
+                &mut next_inbound,
+                &inbound_packet_tx,
+                &time_source,
+                remote_addr,
+            );
             if forwarded_count > 0 {
                 tracing::debug!(
                     peer_addr = %remote_addr,
@@ -3572,6 +3559,41 @@ pub(crate) enum ConnectionEvent<S = UdpSocket, TS: TimeSource = RealTime> {
     },
 }
 
+/// Move the packets a gateway handshake buffered after its ACK into the new
+/// connection's channel, stamped as the listener stamps packets
+/// (`InboundPacket`). Returns how many were forwarded; stops at the first
+/// that does not fit.
+///
+/// They all get the one stamp of the moment they are forwarded: they arrived
+/// during the handshake, before anything else on the new channel, so the
+/// stamps on that channel still never decrease. The shared stamp counts
+/// them as arriving together, which can raise the inbound concurrency
+/// estimate of a new gateway connection.
+fn forward_handshake_buffered<T: TimeSource>(
+    next_inbound: &mut mpsc::Receiver<PacketData<UnknownEncryption>>,
+    inbound_packet_tx: &mpsc::Sender<InboundPacket>,
+    time_source: &T,
+    remote_addr: SocketAddr,
+) -> usize {
+    let mut forwarded_count = 0;
+    let queued_nanos = time_source.now_nanos();
+    while let Ok(packet) = next_inbound.try_recv() {
+        let packet = InboundPacket {
+            packet,
+            queued_nanos,
+        };
+        if inbound_packet_tx.try_send(packet).is_err() {
+            tracing::warn!(
+                peer_addr = %remote_addr,
+                "Failed to forward handshake-buffered packet to connection channel (channel full)"
+            );
+            break;
+        }
+        forwarded_count += 1;
+    }
+    forwarded_count
+}
+
 struct InboundRemoteConnection {
     inbound_packet_sender: mpsc::Sender<InboundPacket>,
 }
@@ -3659,10 +3681,10 @@ pub mod mock_transport {
     }
 
     /// Channel mapping for mock socket communication between peers.
-    pub type Channels = Arc<DashMap<SocketAddr, mpsc::UnboundedSender<InboundPacket>>>;
+    pub type Channels = Arc<DashMap<SocketAddr, mpsc::UnboundedSender<MockDatagram>>>;
 
     /// A datagram on its way to a `MockSocket`.
-    pub struct InboundPacket {
+    pub struct MockDatagram {
         from: SocketAddr,
         data: Vec<u8>,
         /// VirtualTime at which the packet becomes available (0 = immediate).
@@ -3712,7 +3734,7 @@ pub mod mock_transport {
     /// Mock socket implementation for testing transport without real network I/O.
     pub struct MockSocket {
         /// Inbound packets: (source_addr, data, available_at_nanos)
-        inbound: Mutex<mpsc::UnboundedReceiver<InboundPacket>>,
+        inbound: Mutex<mpsc::UnboundedReceiver<MockDatagram>>,
         this: SocketAddr,
         packet_drop_policy: PacketDropPolicy,
         packet_delay_policy: PacketDelayPolicy,
@@ -3914,7 +3936,7 @@ pub mod mock_transport {
                 .unwrap_or_else(|e| e.into_inner())
         }
 
-        fn park_inbound(&self, packet: InboundPacket) {
+        fn park_inbound(&self, packet: MockDatagram) {
             let mut pending = self.pending();
             let last = pending.last_arrival_from.entry(packet.from).or_insert(0);
             let at = packet.available_at_nanos.max(*last);
@@ -3964,7 +3986,7 @@ pub mod mock_transport {
             };
             for arrival in link.on_send(vt.now_nanos(), self.this, target, buf) {
                 sender
-                    .send(InboundPacket {
+                    .send(MockDatagram {
                         from: self.this,
                         data: buf.to_vec(),
                         available_at_nanos: arrival.at_nanos,
@@ -4033,7 +4055,7 @@ pub mod mock_transport {
                 return Ok(0);
             };
             sender
-                .send(InboundPacket {
+                .send(MockDatagram {
                     from: self.this,
                     data: buf.to_vec(),
                     available_at_nanos,
@@ -4578,7 +4600,7 @@ pub mod mock_transport {
             let c_addr: SocketAddr = (Ipv4Addr::LOCALHOST, 1).into();
             let tx = channels.get(&b_addr).unwrap().value().clone();
             for (from, data, order) in [(c_addr, b"second", 8), (a_addr, b"first!", 7)] {
-                tx.send(InboundPacket {
+                tx.send(MockDatagram {
                     from,
                     data: data.to_vec(),
                     available_at_nanos: 100,
@@ -5188,7 +5210,7 @@ pub mod mock_transport {
             channels
                 .get(&peer_addr)
                 .expect("the peer's inbound channel")
-                .send(InboundPacket {
+                .send(MockDatagram {
                     from,
                     data,
                     available_at_nanos: 0,
@@ -7142,7 +7164,7 @@ pub mod mock_transport {
         struct ScriptedRemote {
             keypair: TransportKeypair,
             addr: SocketAddr,
-            inbound: mpsc::UnboundedReceiver<InboundPacket>,
+            inbound: mpsc::UnboundedReceiver<MockDatagram>,
             channels: Channels,
         }
 
@@ -7164,7 +7186,7 @@ pub mod mock_transport {
                 self.channels
                     .get(&to)
                     .expect("the peer under test is listening")
-                    .send(InboundPacket {
+                    .send(MockDatagram {
                         from: self.addr,
                         data: data.to_vec(),
                         available_at_nanos: 0,

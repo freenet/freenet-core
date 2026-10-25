@@ -1128,3 +1128,79 @@ fn test_gateway_rate_limiter_admission_clock_is_max_of_real_and_virtual() {
         );
     });
 }
+
+/// The listener stamps each packet it hands to an established connection
+/// with its own clock at the moment it queues it, and the stamps increase
+/// with that clock (`InboundPacket::queued_nanos`, read by the inbound
+/// concurrency estimate as the packet's arrival time).
+#[test]
+fn established_packets_are_stamped_when_queued() {
+    use super::ConnectionStateManager;
+    use crate::simulation::{TimeSource, VirtualTime};
+    use crate::transport::packet_data::{PacketData, UnknownEncryption};
+    use std::net::SocketAddr;
+    use std::time::Duration;
+    use tokio::net::UdpSocket;
+    use tokio::sync::mpsc;
+
+    let time = VirtualTime::new();
+    let mut manager: ConnectionStateManager<UdpSocket, VirtualTime> =
+        ConnectionStateManager::new(time.clone());
+    let addr: SocketAddr = "127.0.0.1:8003".parse().unwrap();
+    let (handshake_tx, _handshake_rx) = mpsc::channel::<PacketData<UnknownEncryption>>(4);
+    assert!(manager.start_gateway_handshake(addr, handshake_tx));
+    let (tx, mut rx) = mpsc::channel(4);
+    assert!(manager.complete_gateway_handshake(addr, tx));
+
+    time.advance(Duration::from_millis(3));
+    let first_at = time.now_nanos();
+    assert_eq!(
+        manager.try_send_established(&addr, PacketData::from_buf([1u8; 32])),
+        Ok(true)
+    );
+    time.advance(Duration::from_millis(7));
+    let second_at = time.now_nanos();
+    assert_eq!(
+        manager.try_send_established(&addr, PacketData::from_buf([2u8; 32])),
+        Ok(true)
+    );
+
+    let first = rx.try_recv().expect("first packet");
+    let second = rx.try_recv().expect("second packet");
+    assert_eq!(first.queued_nanos, first_at);
+    assert_eq!(second.queued_nanos, second_at);
+    assert!(first.queued_nanos > 0 && second.queued_nanos > first.queued_nanos);
+}
+
+/// Packets a gateway handshake buffered are forwarded in order, each
+/// stamped with the clock at the moment they are forwarded.
+#[test]
+fn handshake_buffered_packets_are_stamped_when_forwarded() {
+    use crate::simulation::{TimeSource, VirtualTime};
+    use crate::transport::packet_data::{PacketData, UnknownEncryption};
+    use std::net::SocketAddr;
+    use std::time::Duration;
+    use tokio::sync::mpsc;
+
+    let time = VirtualTime::new();
+    let addr: SocketAddr = "127.0.0.1:8004".parse().unwrap();
+    let (buffer_tx, mut buffer_rx) = mpsc::channel::<PacketData<UnknownEncryption>>(4);
+    for byte in [1u8, 2] {
+        buffer_tx
+            .try_send(PacketData::from_buf([byte; 32]))
+            .expect("buffer");
+    }
+    let (tx, mut rx) = mpsc::channel(4);
+    time.advance(Duration::from_millis(5));
+    let forwarded_at = time.now_nanos();
+    assert_eq!(
+        super::forward_handshake_buffered(&mut buffer_rx, &tx, &time, addr),
+        2
+    );
+    for byte in [1u8, 2] {
+        let packet = rx.try_recv().expect("forwarded packet");
+        assert_eq!(packet.packet.data()[0], byte, "forwarded in order");
+        assert_eq!(packet.queued_nanos, forwarded_at);
+    }
+    assert!(forwarded_at > 0);
+}
