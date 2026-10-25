@@ -374,7 +374,11 @@ Per-connection inbound concurrency (`inbound_concurrency_*`,
 `peer_connection/inbound_concurrency.rs`) estimates, at each inbound short
 message and each newly admitted inbound stream, the QUIC uni streams the
 connection would hold: open inbound streams plus short messages received
-within SRTT + 25 ms. Per snapshot window (`transport_snapshot_interval_secs`,
+within SRTT + 25 ms. A short message is timed from when the listener queued
+it (`InboundPacket::queued_nanos`, stamped in `try_send_established` on the
+listener's clock, which its connections share), not from when the connection
+task took it, so a burst that waited in the channel still counts as one.
+Per snapshot window (`transport_snapshot_interval_secs`,
 default 30 s) it reports the connections sampled, how many peaked at 8 / 16 /
 32 / 64 / 128 / 256 or more, and the largest estimate; keys are uploaded only
 when non-zero, and `conns_sampled` is the only activity term. It is an upper

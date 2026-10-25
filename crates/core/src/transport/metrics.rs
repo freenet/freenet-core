@@ -373,8 +373,14 @@ pub(crate) struct InboundConcurrencyPeak {
 
 /// Accumulates transport metrics for periodic reporting.
 ///
-/// All operations are lock-free using atomics. Metrics are accumulated
-/// until `take_snapshot()` is called, which resets the counters.
+/// Most counters are relaxed atomics, written without a lock. A few rare
+/// records take a small `parking_lot::Mutex`: the NAT detail state
+/// (observed addresses, failure samples) and the inbound concurrency
+/// counts, whose common case (no new peak) is a lock-free fast path and
+/// whose rare case (a connection's first sample of a period, or a new peak)
+/// locks so the snapshot drains a consistent set (see
+/// [`Self::record_inbound_concurrency`]). Metrics are accumulated until
+/// `take_snapshot()` is called, which resets the counters.
 ///
 /// # Thread Safety
 ///
@@ -2718,9 +2724,12 @@ impl TransportSnapshot {
     /// The JSON uploaded for this snapshot: its serde form with only the
     /// non-zero `conn_identity_*` and `inbound_concurrency_*` keys. Only
     /// the uploaded JSON is sparse: the struct's serde, and so its bincode
-    /// form in the local event log, still carries every field, zero or not
-    /// (adding fields does change that bincode layout; older records are
-    /// skipped).
+    /// form in the local event log, still carries every field, zero or not.
+    /// Adding fields changes that bincode layout: the event log reader
+    /// (`tracing::aof::LogFile::read_all_events`) decodes each record on its
+    /// own, so a transport snapshot written by an older release fails to
+    /// decode, is logged at WARN and dropped, and the other records are
+    /// still read.
     pub(crate) fn upload_json(&self) -> serde_json::Result<serde_json::Value> {
         let mut json = serde_json::to_value(self)?;
         if let Some(map) = json.as_object_mut() {
@@ -3148,27 +3157,8 @@ struct SnapshotExtras {
     pub conn_identity_teardown_key_elsewhere: u32,
     pub conn_identity_teardown_unidentified: u32,
     pub conn_identity_teardown_key_unmapped: u32,
-    /// Inbound concurrency per connection during the period (one snapshot
-    /// window, `transport_snapshot_interval_secs`, default 30 s): an
-    /// estimate, at each inbound message, of the inbound QUIC streams the
-    /// connection would hold open (open inbound streams plus short messages
-    /// received within one smoothed RTT + 25 ms; see
-    /// `peer_connection::inbound_concurrency`). Of the connections with at
-    /// least one inbound message (`inbound_concurrency_conns_sampled`), how
-    /// many had a peak of at least T (`inbound_concurrency_conns_ge_<T>`,
-    /// cumulative), and the largest estimate on any of them
-    /// (`inbound_concurrency_max`). Sent in the uploaded JSON only when
-    /// non-zero.
-    ///
-    /// What it can decide: it is an upper bound on the demand of ordinary
-    /// UDP traffic, so `ge_T / conns_sampled` can justify LOWERING
-    /// `quic::config::MAX_UNI_STREAMS` to T, never raising it. It says
-    /// nothing about the memory a peer opening streams on purpose can
-    /// hold; bounding that is the per-path ceiling's job.
-    /// `inbound_concurrency_max` is diagnostic only: one peer can drive it
-    /// to the cap with a burst or an inflated RTT. The open-stream term
-    /// stops at the per-connection budget (1024 streams), so a connection
-    /// whose streams the budget refused is understated.
+    /// Inbound concurrency per connection during the period; see the
+    /// `inbound_concurrency_*` fields of [`TransportSnapshot`].
     pub inbound_concurrency_conns_sampled: u32,
     pub inbound_concurrency_conns_ge_8: u32,
     pub inbound_concurrency_conns_ge_16: u32,
@@ -4400,10 +4390,17 @@ mod tests {
             }
             Ok(())
         };
+        // A fixed number of periods with samples in them, not a duration, so
+        // a slow runner checks as many rows as a fast one. The attempt cap
+        // only stops a hang (samplers that never run); it is far above what
+        // PERIODS needs while the samplers are running.
+        const PERIODS: usize = 200;
+        const MAX_ATTEMPTS: usize = 50_000_000;
         let mut failure = None;
         let mut periods = 0;
-        let deadline = std::time::Instant::now() + Duration::from_millis(500);
-        while std::time::Instant::now() < deadline && failure.is_none() {
+        let mut attempts = 0;
+        while periods < PERIODS && attempts < MAX_ATTEMPTS && failure.is_none() {
+            attempts += 1;
             if let Some(snap) = metrics.take_snapshot() {
                 periods += 1;
                 failure = check(&snap).err();
@@ -4416,7 +4413,44 @@ mod tests {
         if let Some(failure) = failure {
             panic!("after {periods} periods: {failure}");
         }
-        assert!(periods > 100, "only {periods} periods were checked");
+        assert_eq!(
+            periods, PERIODS,
+            "the samplers produced only {periods} periods in {attempts} snapshots"
+        );
+    }
+
+    /// Each threshold lands in its own field: six connections peaking at
+    /// exactly 8, 16, 32, 64, 128 and 256 give ge_8..ge_256 = 6, 5, 4, 3,
+    /// 2, 1, through the extras-to-snapshot copy (`take_snapshot` and
+    /// `read_snapshot`), the serde JSON and the uploaded JSON. A swap of
+    /// any two thresholds or fields changes one of these values.
+    #[test]
+    fn inbound_concurrency_thresholds_map_to_their_fields() {
+        let metrics = TransportMetrics::new();
+        for peak in INBOUND_CONCURRENCY_THRESHOLDS {
+            metrics.record_inbound_concurrency(&mut InboundConcurrencyPeak::default(), peak);
+        }
+        let expected = [
+            ("inbound_concurrency_conns_ge_8", 6),
+            ("inbound_concurrency_conns_ge_16", 5),
+            ("inbound_concurrency_conns_ge_32", 4),
+            ("inbound_concurrency_conns_ge_64", 3),
+            ("inbound_concurrency_conns_ge_128", 2),
+            ("inbound_concurrency_conns_ge_256", 1),
+        ];
+        let read = metrics.read_snapshot();
+        let taken = metrics.take_snapshot().expect("activity");
+        for snap in [&read, &taken] {
+            assert_eq!(concurrency_ge(snap), [6, 5, 4, 3, 2, 1]);
+            assert_eq!(snap.inbound_concurrency_conns_sampled, 6);
+            assert_eq!(snap.inbound_concurrency_max, 256);
+        }
+        let serde = serde_json::to_value(&taken).unwrap();
+        let upload = taken.upload_json().unwrap();
+        for (key, value) in expected {
+            assert_eq!(serde[key], value, "serde value for {key}");
+            assert_eq!(upload[key], value, "uploaded value for {key}");
+        }
     }
 
     /// A connection's peak counts each threshold it reaches once per
