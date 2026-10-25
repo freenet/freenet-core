@@ -346,6 +346,20 @@ const _: () = {
     assert!(t[0] == 8 && t[1] == 16 && t[2] == 32 && t[3] == 64 && t[4] == 128 && t[5] == 256);
 };
 
+/// The inbound concurrency counts of one snapshot period. Guarded as a
+/// whole by `TransportMetrics::inbound_concurrency`, so a snapshot drains a
+/// consistent set (see [`TransportMetrics::record_inbound_concurrency`]).
+#[derive(Debug, Default, Clone, Copy)]
+struct InboundConcurrencyCounts {
+    /// Connections with at least one sample this period.
+    conns_sampled: u32,
+    /// Connections whose peak this period reached each
+    /// [`INBOUND_CONCURRENCY_THRESHOLDS`] entry, in that order.
+    conns_ge: [u32; INBOUND_CONCURRENCY_THRESHOLDS.len()],
+    /// Largest estimate on any connection this period.
+    max: u32,
+}
+
 /// One connection's highest inbound concurrency estimate in the current
 /// snapshot period. Owned by the connection's recv loop; see
 /// [`TransportMetrics::record_inbound_concurrency`].
@@ -524,16 +538,12 @@ pub struct TransportMetrics {
 
     /// The current snapshot period, starting at 1 and advanced by each
     /// `take_snapshot`. A connection's [`InboundConcurrencyPeak`] from an
-    /// earlier period is reset on its next sample.
+    /// earlier period is reset on its next sample. Written only while
+    /// `inbound_concurrency` is locked; read without the lock only by the
+    /// fast path of `record_inbound_concurrency`.
     inbound_concurrency_epoch: AtomicU64,
-    /// Connections with at least one inbound concurrency sample this period
-    /// (reset each snapshot).
-    inbound_concurrency_conns_sampled: AtomicU32,
-    /// Connections whose peak estimate this period reached each
-    /// [`INBOUND_CONCURRENCY_THRESHOLDS`] entry (reset each snapshot).
-    inbound_concurrency_conns_ge: [AtomicU32; INBOUND_CONCURRENCY_THRESHOLDS.len()],
-    /// Largest estimate on any connection this period (reset each snapshot).
-    inbound_concurrency_max: AtomicU32,
+    /// This period's inbound concurrency counts (reset each snapshot).
+    inbound_concurrency: parking_lot::Mutex<InboundConcurrencyCounts>,
 
     /// Inbound streams refused or evicted this period, by reason (reset each
     /// snapshot). The never-reset twin is `cumulative_inbound_stream_outcomes`,
@@ -909,9 +919,7 @@ impl TransportMetrics {
             quic_endpoint_down: AtomicU64::new(0),
             quic_close_sent: Default::default(),
             inbound_concurrency_epoch: AtomicU64::new(1),
-            inbound_concurrency_conns_sampled: AtomicU32::new(0),
-            inbound_concurrency_conns_ge: Default::default(),
-            inbound_concurrency_max: AtomicU32::new(0),
+            inbound_concurrency: Default::default(),
             inbound_stream_outcomes: Default::default(),
             nat_attempts_by_origin: Default::default(),
             nat_established_by_origin: Default::default(),
@@ -1245,36 +1253,53 @@ impl TransportMetrics {
     /// are cumulative: a connection at 40 counts in `ge_8`, `ge_16` and
     /// `ge_32`.
     ///
-    /// The period is read without a lock, so a sample racing
-    /// `take_snapshot` may be counted in the adjacent period, and a
-    /// connection may then be counted in two periods for one peak.
+    /// Most samples take the fast path: the connection was already counted
+    /// this period and the estimate is not a new peak, which one relaxed
+    /// load of the period decides, with no lock and no write. Anything else
+    /// locks `inbound_concurrency`, re-reads the period under the lock and
+    /// updates the counts and the connection's state together; a snapshot
+    /// advances the period and drains the counts under the same lock. So a
+    /// snapshot never sees part of an update, and every row it reports
+    /// holds `ge_256 <= ... <= ge_8 <= conns_sampled`, with a non-zero
+    /// maximum only when a connection was sampled. The one effect of the
+    /// unlocked read: a sample that reads the period just before a
+    /// snapshot advances it may take the fast path and be skipped. It is
+    /// counted when the connection's next sample finds the new period. Until
+    /// then the new period lacks it, so the period understates the
+    /// connection only if that sample was its highest there, or its only
+    /// one.
     pub(crate) fn record_inbound_concurrency(
         &self,
         conn: &mut InboundConcurrencyPeak,
         estimate: u32,
     ) {
+        if conn.epoch == self.inbound_concurrency_epoch.load(Ordering::Relaxed)
+            && estimate <= conn.peak
+        {
+            return;
+        }
+        let mut counts = self.inbound_concurrency.lock();
+        // The period only changes under this lock, so this read is current.
         let epoch = self.inbound_concurrency_epoch.load(Ordering::Relaxed);
         if conn.epoch != epoch {
             conn.epoch = epoch;
             conn.peak = 0;
-            self.inbound_concurrency_conns_sampled
-                .fetch_add(1, Ordering::Relaxed);
+            counts.conns_sampled += 1;
         }
         if estimate <= conn.peak {
             return;
         }
-        for (counter, &threshold) in self
-            .inbound_concurrency_conns_ge
-            .iter()
+        for (count, &threshold) in counts
+            .conns_ge
+            .iter_mut()
             .zip(&INBOUND_CONCURRENCY_THRESHOLDS)
         {
             if conn.peak < threshold && threshold <= estimate {
-                counter.fetch_add(1, Ordering::Relaxed);
+                *count += 1;
             }
         }
         conn.peak = estimate;
-        self.inbound_concurrency_max
-            .fetch_max(estimate, Ordering::Relaxed);
+        counts.max = counts.max.max(estimate);
     }
 
     /// Record a connection identity decision for the connection at `remote`
@@ -1904,15 +1929,23 @@ impl TransportMetrics {
         let quic = &self.quic_ingress;
         let egress = &self.egress;
         let identity = &self.conn_identity;
-        // A new period starts here, so each connection's next sample resets
-        // its peak and is counted again.
-        if reset {
-            self.inbound_concurrency_epoch
-                .fetch_add(1, Ordering::Relaxed);
-        }
+        // On reset a new period starts: under the lock, so the drained
+        // counts are exactly the old period's (see
+        // `record_inbound_concurrency`). Each connection's next sample then
+        // resets its peak and is counted again.
+        let concurrency = {
+            let mut counts = self.inbound_concurrency.lock();
+            if reset {
+                self.inbound_concurrency_epoch
+                    .fetch_add(1, Ordering::Relaxed);
+                std::mem::take(&mut *counts)
+            } else {
+                *counts
+            }
+        };
         // Indexed by position in INBOUND_CONCURRENCY_THRESHOLDS; the const
         // assertion next to that list pins the order these fields assume.
-        let concurrency_ge = &self.inbound_concurrency_conns_ge;
+        let concurrency_ge = concurrency.conns_ge;
         SnapshotExtras {
             packets_sent: get64(&l.packets_sent),
             packets_retransmitted: get64(&l.packets_retransmitted),
@@ -2071,14 +2104,14 @@ impl TransportMetrics {
             conn_identity_teardown_key_unmapped: get32(
                 &identity[ConnIdentity::TeardownKeyUnmapped as usize],
             ),
-            inbound_concurrency_conns_sampled: get32(&self.inbound_concurrency_conns_sampled),
-            inbound_concurrency_conns_ge_8: get32(&concurrency_ge[0]),
-            inbound_concurrency_conns_ge_16: get32(&concurrency_ge[1]),
-            inbound_concurrency_conns_ge_32: get32(&concurrency_ge[2]),
-            inbound_concurrency_conns_ge_64: get32(&concurrency_ge[3]),
-            inbound_concurrency_conns_ge_128: get32(&concurrency_ge[4]),
-            inbound_concurrency_conns_ge_256: get32(&concurrency_ge[5]),
-            inbound_concurrency_max: get32(&self.inbound_concurrency_max),
+            inbound_concurrency_conns_sampled: concurrency.conns_sampled,
+            inbound_concurrency_conns_ge_8: concurrency_ge[0],
+            inbound_concurrency_conns_ge_16: concurrency_ge[1],
+            inbound_concurrency_conns_ge_32: concurrency_ge[2],
+            inbound_concurrency_conns_ge_64: concurrency_ge[3],
+            inbound_concurrency_conns_ge_128: concurrency_ge[4],
+            inbound_concurrency_conns_ge_256: concurrency_ge[5],
+            inbound_concurrency_max: concurrency.max,
         }
     }
 
@@ -2556,16 +2589,27 @@ pub struct TransportSnapshot {
     pub conn_identity_teardown_key_elsewhere: u32,
     pub conn_identity_teardown_unidentified: u32,
     pub conn_identity_teardown_key_unmapped: u32,
-    /// Inbound concurrency per connection during the period: an estimate,
-    /// at each inbound message, of the inbound QUIC streams the connection
-    /// would hold open (open inbound streams plus short messages received
-    /// within one smoothed RTT + 25 ms; see
-    /// `peer_connection::inbound_concurrency`, which overestimates). Of the
-    /// connections with at least one inbound message
-    /// (`inbound_concurrency_conns_sampled`), how many had a peak of at
-    /// least T (`inbound_concurrency_conns_ge_<T>`, cumulative), and the
-    /// largest estimate on any of them (`inbound_concurrency_max`). Sent in
-    /// the uploaded JSON only when non-zero.
+    /// Inbound concurrency per connection during the period (one snapshot
+    /// window, `transport_snapshot_interval_secs`, default 30 s): an
+    /// estimate, at each inbound message, of the inbound QUIC streams the
+    /// connection would hold open (open inbound streams plus short messages
+    /// received within one smoothed RTT + 25 ms; see
+    /// `peer_connection::inbound_concurrency`). Of the connections with at
+    /// least one inbound message (`inbound_concurrency_conns_sampled`), how
+    /// many had a peak of at least T (`inbound_concurrency_conns_ge_<T>`,
+    /// cumulative), and the largest estimate on any of them
+    /// (`inbound_concurrency_max`). Sent in the uploaded JSON only when
+    /// non-zero.
+    ///
+    /// What it can decide: it is an upper bound on the demand of ordinary
+    /// UDP traffic, so `ge_T / conns_sampled` can justify LOWERING
+    /// `quic::config::MAX_UNI_STREAMS` to T, never raising it. It says
+    /// nothing about the memory a peer opening streams on purpose can
+    /// hold; bounding that is the per-path ceiling's job.
+    /// `inbound_concurrency_max` is diagnostic only: one peer can drive it
+    /// to the cap with a burst or an inflated RTT. The open-stream term
+    /// stops at the per-connection budget (1024 streams), so a connection
+    /// whose streams the budget refused is understated.
     pub inbound_concurrency_conns_sampled: u32,
     pub inbound_concurrency_conns_ge_8: u32,
     pub inbound_concurrency_conns_ge_16: u32,
@@ -2673,8 +2717,10 @@ impl TransportSnapshot {
 
     /// The JSON uploaded for this snapshot: its serde form with only the
     /// non-zero `conn_identity_*` and `inbound_concurrency_*` keys. Only
-    /// the JSON is sparse; the struct's serde (and so its bincode layout in
-    /// the event log) is unchanged.
+    /// the uploaded JSON is sparse: the struct's serde, and so its bincode
+    /// form in the local event log, still carries every field, zero or not
+    /// (adding fields does change that bincode layout; older records are
+    /// skipped).
     pub(crate) fn upload_json(&self) -> serde_json::Result<serde_json::Value> {
         let mut json = serde_json::to_value(self)?;
         if let Some(map) = json.as_object_mut() {
@@ -3102,16 +3148,27 @@ struct SnapshotExtras {
     pub conn_identity_teardown_key_elsewhere: u32,
     pub conn_identity_teardown_unidentified: u32,
     pub conn_identity_teardown_key_unmapped: u32,
-    /// Inbound concurrency per connection during the period: an estimate,
-    /// at each inbound message, of the inbound QUIC streams the connection
-    /// would hold open (open inbound streams plus short messages received
-    /// within one smoothed RTT + 25 ms; see
-    /// `peer_connection::inbound_concurrency`, which overestimates). Of the
-    /// connections with at least one inbound message
-    /// (`inbound_concurrency_conns_sampled`), how many had a peak of at
-    /// least T (`inbound_concurrency_conns_ge_<T>`, cumulative), and the
-    /// largest estimate on any of them (`inbound_concurrency_max`). Sent in
-    /// the uploaded JSON only when non-zero.
+    /// Inbound concurrency per connection during the period (one snapshot
+    /// window, `transport_snapshot_interval_secs`, default 30 s): an
+    /// estimate, at each inbound message, of the inbound QUIC streams the
+    /// connection would hold open (open inbound streams plus short messages
+    /// received within one smoothed RTT + 25 ms; see
+    /// `peer_connection::inbound_concurrency`). Of the connections with at
+    /// least one inbound message (`inbound_concurrency_conns_sampled`), how
+    /// many had a peak of at least T (`inbound_concurrency_conns_ge_<T>`,
+    /// cumulative), and the largest estimate on any of them
+    /// (`inbound_concurrency_max`). Sent in the uploaded JSON only when
+    /// non-zero.
+    ///
+    /// What it can decide: it is an upper bound on the demand of ordinary
+    /// UDP traffic, so `ge_T / conns_sampled` can justify LOWERING
+    /// `quic::config::MAX_UNI_STREAMS` to T, never raising it. It says
+    /// nothing about the memory a peer opening streams on purpose can
+    /// hold; bounding that is the per-path ceiling's job.
+    /// `inbound_concurrency_max` is diagnostic only: one peer can drive it
+    /// to the cap with a burst or an inflated RTT. The open-stream term
+    /// stops at the per-connection budget (1024 streams), so a connection
+    /// whose streams the budget refused is understated.
     pub inbound_concurrency_conns_sampled: u32,
     pub inbound_concurrency_conns_ge_8: u32,
     pub inbound_concurrency_conns_ge_16: u32,
@@ -3209,15 +3266,10 @@ impl SnapshotExtras {
             || self.conn_identity_teardown_key_elsewhere != 0
             || self.conn_identity_teardown_unidentified != 0
             || self.conn_identity_teardown_key_unmapped != 0
-            // The maximum alone is not activity: it is only set by a sample,
-            // which also counts its connection.
+            // The thresholds and the maximum are set only with a sampled
+            // connection in the same period (`record_inbound_concurrency`
+            // updates them under one lock), so `conns_sampled` alone decides.
             || self.inbound_concurrency_conns_sampled != 0
-            || self.inbound_concurrency_conns_ge_8 != 0
-            || self.inbound_concurrency_conns_ge_16 != 0
-            || self.inbound_concurrency_conns_ge_32 != 0
-            || self.inbound_concurrency_conns_ge_64 != 0
-            || self.inbound_concurrency_conns_ge_128 != 0
-            || self.inbound_concurrency_conns_ge_256 != 0
     }
 }
 
@@ -4295,6 +4347,78 @@ mod tests {
         ]
     }
 
+    /// Samples racing snapshots never produce an impossible row: in every
+    /// period, ge_256 <= ... <= ge_8 <= conns_sampled, a non-zero maximum
+    /// has a sampled connection, and a non-zero ge_T has a maximum of at
+    /// least T. Each thread is one connection whose estimates climb to 300
+    /// and start again, so it keeps crossing every threshold and the start
+    /// of new periods.
+    #[test]
+    fn inbound_concurrency_rows_stay_consistent_under_concurrent_snapshots() {
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicBool;
+
+        const THREADS: usize = 4;
+        let metrics = Arc::new(TransportMetrics::new());
+        let stop = Arc::new(AtomicBool::new(false));
+        let samplers: Vec<_> = (0..THREADS)
+            .map(|_| {
+                let metrics = Arc::clone(&metrics);
+                let stop = Arc::clone(&stop);
+                std::thread::spawn(move || {
+                    let mut conn = InboundConcurrencyPeak::default();
+                    let mut estimate = 0u32;
+                    while !stop.load(Ordering::Relaxed) {
+                        estimate = if estimate >= 300 { 1 } else { estimate + 1 };
+                        metrics.record_inbound_concurrency(&mut conn, estimate);
+                    }
+                })
+            })
+            .collect();
+
+        let check = |snap: &TransportSnapshot| -> Result<(), String> {
+            let ge = concurrency_ge(snap);
+            let sampled = snap.inbound_concurrency_conns_sampled;
+            let max = snap.inbound_concurrency_max;
+            let row = format!("sampled {sampled}, ge {ge:?}, max {max}");
+            if ge[0] > sampled {
+                return Err(format!("ge_8 above conns_sampled: {row}"));
+            }
+            if ge.windows(2).any(|pair| pair[1] > pair[0]) {
+                return Err(format!("thresholds out of order: {row}"));
+            }
+            if max > 0 && sampled == 0 {
+                return Err(format!("maximum with no sampled connection: {row}"));
+            }
+            for (count, threshold) in ge.iter().zip(INBOUND_CONCURRENCY_THRESHOLDS) {
+                if *count > 0 && max < threshold {
+                    return Err(format!("ge_{threshold} above the maximum: {row}"));
+                }
+            }
+            if sampled as usize > THREADS {
+                return Err(format!("more connections than samplers: {row}"));
+            }
+            Ok(())
+        };
+        let mut failure = None;
+        let mut periods = 0;
+        let deadline = std::time::Instant::now() + Duration::from_millis(500);
+        while std::time::Instant::now() < deadline && failure.is_none() {
+            if let Some(snap) = metrics.take_snapshot() {
+                periods += 1;
+                failure = check(&snap).err();
+            }
+        }
+        stop.store(true, Ordering::Relaxed);
+        for sampler in samplers {
+            sampler.join().expect("sampler thread");
+        }
+        if let Some(failure) = failure {
+            panic!("after {periods} periods: {failure}");
+        }
+        assert!(periods > 100, "only {periods} periods were checked");
+    }
+
     /// A connection's peak counts each threshold it reaches once per
     /// period, and the connection itself once per period.
     #[test]
@@ -4793,6 +4917,36 @@ mod tests {
                 .take_snapshot()
                 .unwrap_or_else(|| panic!("{bucket:?} alone must be activity"));
             assert_eq!(wait_count(&snap, bucket), 1, "{bucket:?}");
+        }
+        {
+            // The connections sampled are the inbound concurrency activity
+            // term, and the only one: the thresholds and the maximum never
+            // appear without it.
+            let sampled = SnapshotExtras {
+                inbound_concurrency_conns_sampled: 1,
+                ..Default::default()
+            };
+            assert!(sampled.has_activity(), "conns_sampled alone is activity");
+            let rest = SnapshotExtras {
+                inbound_concurrency_conns_ge_8: 1,
+                inbound_concurrency_conns_ge_16: 1,
+                inbound_concurrency_conns_ge_32: 1,
+                inbound_concurrency_conns_ge_64: 1,
+                inbound_concurrency_conns_ge_128: 1,
+                inbound_concurrency_conns_ge_256: 1,
+                inbound_concurrency_max: 1,
+                ..Default::default()
+            };
+            assert!(
+                !rest.has_activity(),
+                "thresholds and maximum are not activity terms"
+            );
+            let metrics = TransportMetrics::new();
+            metrics.record_inbound_concurrency(&mut InboundConcurrencyPeak::default(), 1);
+            let snap = metrics
+                .take_snapshot()
+                .expect("one inbound concurrency sample alone is activity");
+            assert_eq!(snap.inbound_concurrency_conns_sampled, 1);
         }
     }
 
