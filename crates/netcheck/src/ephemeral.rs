@@ -103,7 +103,11 @@ pub async fn spawn_ephemeral(
             cmd.args(["--gateway", spec]);
         }
     }
-    cmd.stdout(Stdio::from(log.try_clone()?))
+    // Without this the node logs to the user's default log dir
+    // (~/.local/state/freenet on Linux), shared with every other node that
+    // user runs, and node.log, the file `log_tail` reads, stays empty.
+    cmd.env("FREENET_LOG_TO_STDERR", "1")
+        .stdout(Stdio::from(log.try_clone()?))
         .stderr(Stdio::from(log))
         .kill_on_drop(true);
 
@@ -184,4 +188,39 @@ pub async fn run_local_gateway(args: LocalGatewayArgs) -> Result<()> {
     tokio::time::sleep(Duration::from_millis(100)).await;
     anyhow::ensure!(status.success(), "local gateway exited with {status}");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::unix::fs::PermissionsExt;
+
+    use super::*;
+
+    /// The node's logs must land in node.log, which is all `log_tail` reads.
+    /// Without `FREENET_LOG_TO_STDERR` a real node writes them to the user's
+    /// default log dir instead, and every failed nightly printed an empty
+    /// "ephemeral node log tail". A stand-in binary reports what it inherited.
+    #[tokio::test]
+    async fn the_node_log_tail_captures_what_the_node_logs() {
+        let bin_dir = tempfile::tempdir().unwrap();
+        let fake = bin_dir.path().join("freenet");
+        std::fs::write(
+            &fake,
+            "#!/bin/sh\necho \"FREENET_LOG_TO_STDERR=${FREENET_LOG_TO_STDERR:-unset}\" >&2\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut node = spawn_ephemeral(&fake, 31999, 7999, &[], None)
+            .await
+            .unwrap();
+        let status = node.child.wait().await.unwrap();
+        assert!(status.success(), "stand-in node exited with {status}");
+
+        let tail = node.log_tail();
+        assert!(
+            tail.contains("FREENET_LOG_TO_STDERR=1"),
+            "node was not told to log to stderr; log tail: {tail:?}"
+        );
+    }
 }
