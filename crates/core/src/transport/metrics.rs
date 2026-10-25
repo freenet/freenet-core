@@ -334,6 +334,29 @@ impl DialQueueWait {
     }
 }
 
+/// The inbound concurrency levels counted per period, in ascending order
+/// (see [`TransportMetrics::record_inbound_concurrency`]). The top one is
+/// `quic::config::MAX_UNI_STREAMS`.
+pub(crate) const INBOUND_CONCURRENCY_THRESHOLDS: [u32; 6] = [8, 16, 32, 64, 128, 256];
+
+// The `inbound_concurrency_conns_ge_<T>` snapshot fields are read by
+// position in the list above; reordering it would mislabel them.
+const _: () = {
+    let t = INBOUND_CONCURRENCY_THRESHOLDS;
+    assert!(t[0] == 8 && t[1] == 16 && t[2] == 32 && t[3] == 64 && t[4] == 128 && t[5] == 256);
+};
+
+/// One connection's highest inbound concurrency estimate in the current
+/// snapshot period. Owned by the connection's recv loop; see
+/// [`TransportMetrics::record_inbound_concurrency`].
+#[derive(Debug, Default)]
+pub(crate) struct InboundConcurrencyPeak {
+    /// The period (`TransportMetrics::inbound_concurrency_epoch`) `peak`
+    /// belongs to; 0 before the first sample, which no period has.
+    epoch: u64,
+    peak: u32,
+}
+
 /// Accumulates transport metrics for periodic reporting.
 ///
 /// All operations are lock-free using atomics. Metrics are accumulated
@@ -498,6 +521,19 @@ pub struct TransportMetrics {
     /// QUIC connections this node closed, by [`QuicCloseCode`] (reset each
     /// snapshot).
     quic_close_sent: [AtomicU64; QuicCloseCode::COUNT],
+
+    /// The current snapshot period, starting at 1 and advanced by each
+    /// `take_snapshot`. A connection's [`InboundConcurrencyPeak`] from an
+    /// earlier period is reset on its next sample.
+    inbound_concurrency_epoch: AtomicU64,
+    /// Connections with at least one inbound concurrency sample this period
+    /// (reset each snapshot).
+    inbound_concurrency_conns_sampled: AtomicU32,
+    /// Connections whose peak estimate this period reached each
+    /// [`INBOUND_CONCURRENCY_THRESHOLDS`] entry (reset each snapshot).
+    inbound_concurrency_conns_ge: [AtomicU32; INBOUND_CONCURRENCY_THRESHOLDS.len()],
+    /// Largest estimate on any connection this period (reset each snapshot).
+    inbound_concurrency_max: AtomicU32,
 
     /// Inbound streams refused or evicted this period, by reason (reset each
     /// snapshot). The never-reset twin is `cumulative_inbound_stream_outcomes`,
@@ -872,6 +908,10 @@ impl TransportMetrics {
             conn_identity: Default::default(),
             quic_endpoint_down: AtomicU64::new(0),
             quic_close_sent: Default::default(),
+            inbound_concurrency_epoch: AtomicU64::new(1),
+            inbound_concurrency_conns_sampled: AtomicU32::new(0),
+            inbound_concurrency_conns_ge: Default::default(),
+            inbound_concurrency_max: AtomicU32::new(0),
             inbound_stream_outcomes: Default::default(),
             nat_attempts_by_origin: Default::default(),
             nat_established_by_origin: Default::default(),
@@ -1196,6 +1236,45 @@ impl TransportMetrics {
             .iter()
             .filter(|addr| **addr == remote)
             .count()
+    }
+
+    /// Record one connection's inbound concurrency estimate (see
+    /// `peer_connection::inbound_concurrency`). Per period, each connection
+    /// is counted once in `inbound_concurrency_conns_sampled` and once in
+    /// each `inbound_concurrency_conns_ge_<T>` its peak reaches, so those
+    /// are cumulative: a connection at 40 counts in `ge_8`, `ge_16` and
+    /// `ge_32`.
+    ///
+    /// The period is read without a lock, so a sample racing
+    /// `take_snapshot` may be counted in the adjacent period, and a
+    /// connection may then be counted in two periods for one peak.
+    pub(crate) fn record_inbound_concurrency(
+        &self,
+        conn: &mut InboundConcurrencyPeak,
+        estimate: u32,
+    ) {
+        let epoch = self.inbound_concurrency_epoch.load(Ordering::Relaxed);
+        if conn.epoch != epoch {
+            conn.epoch = epoch;
+            conn.peak = 0;
+            self.inbound_concurrency_conns_sampled
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        if estimate <= conn.peak {
+            return;
+        }
+        for (counter, &threshold) in self
+            .inbound_concurrency_conns_ge
+            .iter()
+            .zip(&INBOUND_CONCURRENCY_THRESHOLDS)
+        {
+            if conn.peak < threshold && threshold <= estimate {
+                counter.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        conn.peak = estimate;
+        self.inbound_concurrency_max
+            .fetch_max(estimate, Ordering::Relaxed);
     }
 
     /// Record a connection identity decision for the connection at `remote`
@@ -1825,6 +1904,15 @@ impl TransportMetrics {
         let quic = &self.quic_ingress;
         let egress = &self.egress;
         let identity = &self.conn_identity;
+        // A new period starts here, so each connection's next sample resets
+        // its peak and is counted again.
+        if reset {
+            self.inbound_concurrency_epoch
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        // Indexed by position in INBOUND_CONCURRENCY_THRESHOLDS; the const
+        // assertion next to that list pins the order these fields assume.
+        let concurrency_ge = &self.inbound_concurrency_conns_ge;
         SnapshotExtras {
             packets_sent: get64(&l.packets_sent),
             packets_retransmitted: get64(&l.packets_retransmitted),
@@ -1983,6 +2071,14 @@ impl TransportMetrics {
             conn_identity_teardown_key_unmapped: get32(
                 &identity[ConnIdentity::TeardownKeyUnmapped as usize],
             ),
+            inbound_concurrency_conns_sampled: get32(&self.inbound_concurrency_conns_sampled),
+            inbound_concurrency_conns_ge_8: get32(&concurrency_ge[0]),
+            inbound_concurrency_conns_ge_16: get32(&concurrency_ge[1]),
+            inbound_concurrency_conns_ge_32: get32(&concurrency_ge[2]),
+            inbound_concurrency_conns_ge_64: get32(&concurrency_ge[3]),
+            inbound_concurrency_conns_ge_128: get32(&concurrency_ge[4]),
+            inbound_concurrency_conns_ge_256: get32(&concurrency_ge[5]),
+            inbound_concurrency_max: get32(&self.inbound_concurrency_max),
         }
     }
 
@@ -2460,6 +2556,24 @@ pub struct TransportSnapshot {
     pub conn_identity_teardown_key_elsewhere: u32,
     pub conn_identity_teardown_unidentified: u32,
     pub conn_identity_teardown_key_unmapped: u32,
+    /// Inbound concurrency per connection during the period: an estimate,
+    /// at each inbound message, of the inbound QUIC streams the connection
+    /// would hold open (open inbound streams plus short messages received
+    /// within one smoothed RTT + 25 ms; see
+    /// `peer_connection::inbound_concurrency`, which overestimates). Of the
+    /// connections with at least one inbound message
+    /// (`inbound_concurrency_conns_sampled`), how many had a peak of at
+    /// least T (`inbound_concurrency_conns_ge_<T>`, cumulative), and the
+    /// largest estimate on any of them (`inbound_concurrency_max`). Sent in
+    /// the uploaded JSON only when non-zero.
+    pub inbound_concurrency_conns_sampled: u32,
+    pub inbound_concurrency_conns_ge_8: u32,
+    pub inbound_concurrency_conns_ge_16: u32,
+    pub inbound_concurrency_conns_ge_32: u32,
+    pub inbound_concurrency_conns_ge_64: u32,
+    pub inbound_concurrency_conns_ge_128: u32,
+    pub inbound_concurrency_conns_ge_256: u32,
+    pub inbound_concurrency_max: u32,
 }
 
 /// Per-connection RTT distribution fields of [`TransportSnapshot`]; see the
@@ -2511,16 +2625,67 @@ impl TransportSnapshot {
         })
     }
 
+    /// The `inbound_concurrency_*` JSON keys and values, in field order.
+    fn inbound_concurrency_fields(&self) -> [(&'static str, u32); 8] {
+        [
+            (
+                "inbound_concurrency_conns_sampled",
+                self.inbound_concurrency_conns_sampled,
+            ),
+            (
+                "inbound_concurrency_conns_ge_8",
+                self.inbound_concurrency_conns_ge_8,
+            ),
+            (
+                "inbound_concurrency_conns_ge_16",
+                self.inbound_concurrency_conns_ge_16,
+            ),
+            (
+                "inbound_concurrency_conns_ge_32",
+                self.inbound_concurrency_conns_ge_32,
+            ),
+            (
+                "inbound_concurrency_conns_ge_64",
+                self.inbound_concurrency_conns_ge_64,
+            ),
+            (
+                "inbound_concurrency_conns_ge_128",
+                self.inbound_concurrency_conns_ge_128,
+            ),
+            (
+                "inbound_concurrency_conns_ge_256",
+                self.inbound_concurrency_conns_ge_256,
+            ),
+            ("inbound_concurrency_max", self.inbound_concurrency_max),
+        ]
+    }
+
+    /// The `inbound_concurrency_*` JSON keys and values that are non-zero.
+    /// A node that received nothing in the period has none, so its
+    /// uploaded JSON carries only these.
+    pub(crate) fn nonzero_inbound_concurrency(
+        &self,
+    ) -> impl Iterator<Item = (&'static str, u32)> + use<> {
+        self.inbound_concurrency_fields()
+            .into_iter()
+            .filter(|&(_, value)| value != 0)
+    }
+
     /// The JSON uploaded for this snapshot: its serde form with only the
-    /// non-zero `conn_identity_*` keys. Only the JSON is sparse; the
-    /// struct's serde (and so its bincode layout in the event log) is
-    /// unchanged.
+    /// non-zero `conn_identity_*` and `inbound_concurrency_*` keys. Only
+    /// the JSON is sparse; the struct's serde (and so its bincode layout in
+    /// the event log) is unchanged.
     pub(crate) fn upload_json(&self) -> serde_json::Result<serde_json::Value> {
         let mut json = serde_json::to_value(self)?;
         if let Some(map) = json.as_object_mut() {
-            map.retain(|key, _| !key.starts_with("conn_identity_"));
+            map.retain(|key, _| {
+                !key.starts_with("conn_identity_") && !key.starts_with("inbound_concurrency_")
+            });
             for (key, count) in self.nonzero_conn_identity() {
                 map.insert(key, serde_json::json!(count));
+            }
+            for (key, value) in self.nonzero_inbound_concurrency() {
+                map.insert(key.to_string(), serde_json::json!(value));
             }
         }
         Ok(json)
@@ -2632,6 +2797,14 @@ impl TransportSnapshot {
             conn_identity_teardown_key_elsewhere,
             conn_identity_teardown_unidentified,
             conn_identity_teardown_key_unmapped,
+            inbound_concurrency_conns_sampled,
+            inbound_concurrency_conns_ge_8,
+            inbound_concurrency_conns_ge_16,
+            inbound_concurrency_conns_ge_32,
+            inbound_concurrency_conns_ge_64,
+            inbound_concurrency_conns_ge_128,
+            inbound_concurrency_conns_ge_256,
+            inbound_concurrency_max,
         } = extras;
         self.conn_rtt_connections = conn_rtt_connections;
         self.conn_srtt_p50_us = conn_srtt_p50_us;
@@ -2733,6 +2906,14 @@ impl TransportSnapshot {
         self.conn_identity_teardown_key_elsewhere = conn_identity_teardown_key_elsewhere;
         self.conn_identity_teardown_unidentified = conn_identity_teardown_unidentified;
         self.conn_identity_teardown_key_unmapped = conn_identity_teardown_key_unmapped;
+        self.inbound_concurrency_conns_sampled = inbound_concurrency_conns_sampled;
+        self.inbound_concurrency_conns_ge_8 = inbound_concurrency_conns_ge_8;
+        self.inbound_concurrency_conns_ge_16 = inbound_concurrency_conns_ge_16;
+        self.inbound_concurrency_conns_ge_32 = inbound_concurrency_conns_ge_32;
+        self.inbound_concurrency_conns_ge_64 = inbound_concurrency_conns_ge_64;
+        self.inbound_concurrency_conns_ge_128 = inbound_concurrency_conns_ge_128;
+        self.inbound_concurrency_conns_ge_256 = inbound_concurrency_conns_ge_256;
+        self.inbound_concurrency_max = inbound_concurrency_max;
         self
     }
 }
@@ -2921,6 +3102,24 @@ struct SnapshotExtras {
     pub conn_identity_teardown_key_elsewhere: u32,
     pub conn_identity_teardown_unidentified: u32,
     pub conn_identity_teardown_key_unmapped: u32,
+    /// Inbound concurrency per connection during the period: an estimate,
+    /// at each inbound message, of the inbound QUIC streams the connection
+    /// would hold open (open inbound streams plus short messages received
+    /// within one smoothed RTT + 25 ms; see
+    /// `peer_connection::inbound_concurrency`, which overestimates). Of the
+    /// connections with at least one inbound message
+    /// (`inbound_concurrency_conns_sampled`), how many had a peak of at
+    /// least T (`inbound_concurrency_conns_ge_<T>`, cumulative), and the
+    /// largest estimate on any of them (`inbound_concurrency_max`). Sent in
+    /// the uploaded JSON only when non-zero.
+    pub inbound_concurrency_conns_sampled: u32,
+    pub inbound_concurrency_conns_ge_8: u32,
+    pub inbound_concurrency_conns_ge_16: u32,
+    pub inbound_concurrency_conns_ge_32: u32,
+    pub inbound_concurrency_conns_ge_64: u32,
+    pub inbound_concurrency_conns_ge_128: u32,
+    pub inbound_concurrency_conns_ge_256: u32,
+    pub inbound_concurrency_max: u32,
 }
 
 impl SnapshotExtras {
@@ -3010,6 +3209,15 @@ impl SnapshotExtras {
             || self.conn_identity_teardown_key_elsewhere != 0
             || self.conn_identity_teardown_unidentified != 0
             || self.conn_identity_teardown_key_unmapped != 0
+            // The maximum alone is not activity: it is only set by a sample,
+            // which also counts its connection.
+            || self.inbound_concurrency_conns_sampled != 0
+            || self.inbound_concurrency_conns_ge_8 != 0
+            || self.inbound_concurrency_conns_ge_16 != 0
+            || self.inbound_concurrency_conns_ge_32 != 0
+            || self.inbound_concurrency_conns_ge_64 != 0
+            || self.inbound_concurrency_conns_ge_128 != 0
+            || self.inbound_concurrency_conns_ge_256 != 0
     }
 }
 
@@ -4074,6 +4282,172 @@ mod tests {
         assert_eq!(fields, labels);
     }
 
+    /// The `inbound_concurrency_conns_ge_<T>` field for each threshold, in
+    /// threshold order.
+    fn concurrency_ge(snap: &TransportSnapshot) -> [u32; 6] {
+        [
+            snap.inbound_concurrency_conns_ge_8,
+            snap.inbound_concurrency_conns_ge_16,
+            snap.inbound_concurrency_conns_ge_32,
+            snap.inbound_concurrency_conns_ge_64,
+            snap.inbound_concurrency_conns_ge_128,
+            snap.inbound_concurrency_conns_ge_256,
+        ]
+    }
+
+    /// A connection's peak counts each threshold it reaches once per
+    /// period, and the connection itself once per period.
+    #[test]
+    fn inbound_concurrency_counts_each_threshold_once_per_period() {
+        let metrics = TransportMetrics::new();
+        let mut conn = InboundConcurrencyPeak::default();
+        metrics.record_inbound_concurrency(&mut conn, 40);
+        let snap = metrics.read_snapshot();
+        assert_eq!(snap.inbound_concurrency_conns_sampled, 1);
+        assert_eq!(concurrency_ge(&snap), [1, 1, 1, 0, 0, 0]);
+        assert_eq!(snap.inbound_concurrency_max, 40);
+
+        // The same and lower estimates in the same period add nothing.
+        metrics.record_inbound_concurrency(&mut conn, 40);
+        metrics.record_inbound_concurrency(&mut conn, 3);
+        let snap = metrics.read_snapshot();
+        assert_eq!(snap.inbound_concurrency_conns_sampled, 1);
+        assert_eq!(concurrency_ge(&snap), [1, 1, 1, 0, 0, 0]);
+
+        // A higher one counts only the thresholds it newly reaches.
+        metrics.record_inbound_concurrency(&mut conn, 300);
+        let snap = metrics
+            .take_snapshot()
+            .expect("inbound concurrency samples are activity");
+        assert_eq!(snap.inbound_concurrency_conns_sampled, 1);
+        assert_eq!(concurrency_ge(&snap), [1, 1, 1, 1, 1, 1]);
+        assert_eq!(snap.inbound_concurrency_max, 300);
+
+        // A new period: the same connection counts again from zero.
+        metrics.record_inbound_concurrency(&mut conn, 40);
+        let snap = metrics.read_snapshot();
+        assert_eq!(snap.inbound_concurrency_conns_sampled, 1);
+        assert_eq!(concurrency_ge(&snap), [1, 1, 1, 0, 0, 0]);
+        assert_eq!(snap.inbound_concurrency_max, 40);
+
+        // A second connection is counted beside it; the maximum is the
+        // larger of the two.
+        let mut other = InboundConcurrencyPeak::default();
+        metrics.record_inbound_concurrency(&mut other, 8);
+        metrics.record_inbound_concurrency(&mut other, 7);
+        let snap = metrics.read_snapshot();
+        assert_eq!(snap.inbound_concurrency_conns_sampled, 2);
+        assert_eq!(concurrency_ge(&snap), [2, 1, 1, 0, 0, 0]);
+        assert_eq!(snap.inbound_concurrency_max, 40);
+
+        // A threshold is reached at exactly T, not below it.
+        let metrics = TransportMetrics::new();
+        let mut conn = InboundConcurrencyPeak::default();
+        metrics.record_inbound_concurrency(&mut conn, 255);
+        assert_eq!(concurrency_ge(&metrics.read_snapshot()), [1, 1, 1, 1, 1, 0]);
+        metrics.record_inbound_concurrency(&mut conn, 256);
+        assert_eq!(concurrency_ge(&metrics.read_snapshot()), [1, 1, 1, 1, 1, 1]);
+    }
+
+    /// Inbound concurrency reaches the snapshot and its JSON, a sample is
+    /// activity on its own, the counts reset, and the uploaded JSON carries
+    /// the keys only when non-zero.
+    #[test]
+    fn inbound_concurrency_snapshot_json_and_reset() {
+        let metrics = TransportMetrics::new();
+        assert!(
+            metrics.take_snapshot().is_none(),
+            "a fresh instance is idle"
+        );
+        let mut conn = InboundConcurrencyPeak::default();
+        metrics.record_inbound_concurrency(&mut conn, 1);
+        let snap = metrics
+            .take_snapshot()
+            .expect("one sample alone is activity");
+        assert_eq!(snap.inbound_concurrency_conns_sampled, 1);
+        assert_eq!(snap.inbound_concurrency_max, 1);
+
+        let mut conn = InboundConcurrencyPeak::default();
+        metrics.record_inbound_concurrency(&mut conn, 70);
+        let snap = metrics.take_snapshot().expect("activity");
+        let json = serde_json::to_value(&snap).unwrap();
+        let upload = snap.upload_json().unwrap();
+        for (key, expected) in [
+            ("inbound_concurrency_conns_sampled", 1),
+            ("inbound_concurrency_conns_ge_8", 1),
+            ("inbound_concurrency_conns_ge_16", 1),
+            ("inbound_concurrency_conns_ge_32", 1),
+            ("inbound_concurrency_conns_ge_64", 1),
+            ("inbound_concurrency_max", 70),
+        ] {
+            assert_eq!(json[key], expected, "serde value for {key}");
+            assert_eq!(upload[key], expected, "uploaded value for {key}");
+        }
+        let uploaded: Vec<&String> = upload
+            .as_object()
+            .unwrap()
+            .keys()
+            .filter(|key| key.starts_with("inbound_concurrency_"))
+            .collect();
+        assert_eq!(
+            uploaded.len(),
+            6,
+            "the zero ge_128 and ge_256 are not uploaded: {uploaded:?}"
+        );
+
+        assert!(
+            metrics.take_snapshot().is_none(),
+            "inbound concurrency counts must reset"
+        );
+        let idle = metrics.read_snapshot();
+        assert_eq!(idle.inbound_concurrency_conns_sampled, 0);
+        assert_eq!(idle.inbound_concurrency_max, 0);
+        let upload = idle.upload_json().unwrap();
+        assert!(
+            !upload
+                .as_object()
+                .unwrap()
+                .keys()
+                .any(|key| key.starts_with("inbound_concurrency_")),
+            "a period with no samples uploads no inbound concurrency key"
+        );
+    }
+
+    /// Every `inbound_concurrency_*` snapshot field is in
+    /// `inbound_concurrency_fields`, so `upload_json`, which rebuilds those
+    /// keys from it, cannot drop one, and each carries its own field.
+    #[test]
+    fn every_inbound_concurrency_field_is_listed() {
+        let snap = TransportSnapshot {
+            inbound_concurrency_conns_sampled: 1,
+            inbound_concurrency_conns_ge_8: 2,
+            inbound_concurrency_conns_ge_16: 3,
+            inbound_concurrency_conns_ge_32: 4,
+            inbound_concurrency_conns_ge_64: 5,
+            inbound_concurrency_conns_ge_128: 6,
+            inbound_concurrency_conns_ge_256: 7,
+            inbound_concurrency_max: 8,
+            ..Default::default()
+        };
+        let json = serde_json::to_value(&snap).unwrap();
+        let fields: std::collections::BTreeSet<String> = json
+            .as_object()
+            .unwrap()
+            .keys()
+            .filter(|key| key.starts_with("inbound_concurrency_"))
+            .cloned()
+            .collect();
+        let listed: std::collections::BTreeSet<String> = snap
+            .inbound_concurrency_fields()
+            .iter()
+            .map(|(key, _)| key.to_string())
+            .collect();
+        assert_eq!(fields, listed);
+        for (key, value) in snap.inbound_concurrency_fields() {
+            assert_eq!(json[key], value, "{key} carries its own field");
+        }
+    }
+
     /// The test record holds only watched remotes, in order.
     #[test]
     fn conn_identity_test_record_is_per_watched_remote() {
@@ -4702,6 +5076,14 @@ mod tests {
             "conn_identity_teardown_key_elsewhere",
             "conn_identity_teardown_unidentified",
             "conn_identity_teardown_key_unmapped",
+            "inbound_concurrency_conns_sampled",
+            "inbound_concurrency_conns_ge_8",
+            "inbound_concurrency_conns_ge_16",
+            "inbound_concurrency_conns_ge_32",
+            "inbound_concurrency_conns_ge_64",
+            "inbound_concurrency_conns_ge_128",
+            "inbound_concurrency_conns_ge_256",
+            "inbound_concurrency_max",
         ] {
             assert!(obj.contains_key(key), "missing key {key}");
         }

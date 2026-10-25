@@ -23,6 +23,7 @@ use tokio::task::JoinHandle;
 use tracing::{Instrument, span};
 
 pub(super) mod inbound_budget;
+mod inbound_concurrency;
 mod inbound_stream;
 mod outbound_stream;
 pub(super) use outbound_stream::embeds_metadata;
@@ -168,6 +169,9 @@ struct TelemetryTestCounts {
     outbound_streams_failed: u32,
     pongs_sent: u32,
     upgrade_controls_ignored: u32,
+    /// Inbound concurrency estimates recorded, and the largest.
+    inbound_concurrency_samples: u32,
+    inbound_concurrency_max: u32,
 }
 
 /// See [`PeerConnection::congestion_probe`].
@@ -331,6 +335,11 @@ pub struct PeerConnection<S = super::UdpSocket, T: TimeSource = RealTime> {
     /// Charges for every inbound stream holding reassembly state on this
     /// connection, released when that state is gone.
     inbound_budget: inbound_budget::InboundStreamBudget,
+    /// Telemetry only: recent short-message arrivals for the inbound
+    /// concurrency estimate, and this connection's peak estimate in the
+    /// current snapshot period (see `sample_inbound_concurrency`).
+    inbound_concurrency: inbound_concurrency::InboundConcurrency,
+    inbound_concurrency_peak: super::metrics::InboundConcurrencyPeak,
 }
 
 impl<S, T: TimeSource> std::fmt::Debug for PeerConnection<S, T> {
@@ -1074,6 +1083,8 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                 streaming::MAX_INBOUND_STREAMS_PER_CONNECTION,
                 streaming::MAX_INBOUND_STREAM_BYTES_PER_CONNECTION,
             ),
+            inbound_concurrency: inbound_concurrency::InboundConcurrency::default(),
+            inbound_concurrency_peak: super::metrics::InboundConcurrencyPeak::default(),
         }
     }
 
@@ -2418,6 +2429,7 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
             inbound_stream_age_limit(total_length_bytes),
             inbound_budget::Liveness::Buffer(streaming_handle.buffer_weak()),
         );
+        self.sample_inbound_concurrency(false);
         match streaming_handle.push_fragment(fragment_number, payload) {
             Err(streaming::StreamError::Cancelled) => {
                 // Stream was already cancelled, don't register it
@@ -2556,6 +2568,33 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
         }
     }
 
+    /// Record this connection's inbound concurrency estimate (telemetry
+    /// only; see `inbound_concurrency`) on a short message's arrival
+    /// (`short`) or a new inbound stream's admission. Never on a later
+    /// fragment of a stream. The window uses the connection's published
+    /// smoothed RTT (data-ACK or keep-alive, whichever is newer), read
+    /// without taking the sent tracker's lock.
+    fn sample_inbound_concurrency(&mut self, short: bool) {
+        let now_nanos = self.time_source.now_nanos();
+        let srtt = self.remote_conn.rolling_rtt_stats.srtt();
+        let open_streams = self.inbound_budget.stream_count();
+        let estimate = if short {
+            self.inbound_concurrency
+                .on_short_message(now_nanos, srtt, open_streams)
+        } else {
+            self.inbound_concurrency
+                .on_stream_admitted(now_nanos, srtt, open_streams)
+        };
+        super::TRANSPORT_METRICS
+            .record_inbound_concurrency(&mut self.inbound_concurrency_peak, estimate);
+        #[cfg(test)]
+        {
+            let counts = &mut self.telemetry_test_counts;
+            counts.inbound_concurrency_samples += 1;
+            counts.inbound_concurrency_max = counts.inbound_concurrency_max.max(estimate);
+        }
+    }
+
     async fn process_inbound(
         &mut self,
         payload: SymmetricMessagePayload,
@@ -2569,6 +2608,7 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                 // We always dispatch ShortMessages — dedup only suppresses the
                 // redundant embedded-metadata copy, never the ShortMessage itself.
                 self.dispatched_msg_hashes.put(Self::msg_hash(&bytes), ());
+                self.sample_inbound_concurrency(true);
                 Ok(Some(bytes))
             }
             AckConnection { result: Err(cause) } => {
@@ -2770,6 +2810,9 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                         "Stream finished"
                     );
                     self.completed_inbound_streams.put(stream_id, ());
+                    // Whole on arrival and never charged: on QUIC it would
+                    // hold its stream about as long as a short message.
+                    self.sample_inbound_concurrency(true);
                     return Ok(Some(msg));
                 }
                 self.inbound_budget.charge(
@@ -2779,6 +2822,7 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                     inbound_stream_age_limit(total_length_bytes),
                     inbound_budget::Liveness::Task(Arc::downgrade(&token)),
                 );
+                self.sample_inbound_concurrency(false);
                 let (sender, receiver) = mpsc::channel(64);
                 self.inbound_streams.insert(stream_id, sender);
                 self.legacy_tokens.insert(stream_id, Arc::clone(&token));

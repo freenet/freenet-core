@@ -364,7 +364,13 @@ ignored (`upgrade_control_received`) and hole-punch handshake packets dropped,
 one count per packet, because they were not encrypted under the attempt's
 inbound session key (`handshake_unauthenticated_dropped`), QUIC endpoint deaths
 (`quic_endpoint_down`) and QUIC connections this node closed, by close code
-(`quic_close_sent_<label>`, one per `QuicCloseCode`). Each label set is declared once in a
+(`quic_close_sent_<label>`, one per `QuicCloseCode`), and per-connection inbound
+concurrency (`inbound_concurrency_*`: at each inbound short message and new
+inbound stream, open inbound streams plus short messages received within
+SRTT + 25 ms, an overestimate of the QUIC streams the connection would hold;
+connections sampled, connections whose period peak reached 8 / 16 / 32 / 64 /
+128 / 256, and the largest estimate; uploaded only when non-zero; it exists
+to choose `MAX_UNI_STREAMS`). Each label set is declared once in a
 `labelled_counters!` list, so a new variant needs a snapshot field. Hot
 path writes are single relaxed atomics; `SentPacketTracker` keeps an
 `rto_expiries` count and a bounded per-stream final-ACK watch, both

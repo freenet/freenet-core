@@ -2944,3 +2944,71 @@ async fn upgrade_control_with_unknown_inner_variant_is_dropped() {
         "an undecodable packet earns no receipt"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Inbound concurrency estimate (telemetry only)
+// ---------------------------------------------------------------------------
+
+/// Short messages received through `recv()` drive the estimate: each
+/// distinct one is one sample counting the short messages still inside the
+/// window, a duplicate is not sampled again, and one arriving after the
+/// window has passed counts alone.
+#[tokio::test(start_paused = true)]
+async fn received_short_messages_drive_the_inbound_concurrency_estimate() {
+    let mut e = single(CAPABLE);
+    assert_eq!(e.conn.remote_conn.rolling_rtt_stats.srtt(), None);
+    let messages: [(u32, &'static [u8]); 3] = [(1, b"a"), (2, b"b"), (3, b"c")];
+    for (id, msg) in messages {
+        e.deliver(id, short(msg), vec![]).await;
+        assert_eq!(e.pump(Duration::from_millis(1)).await.as_deref(), Some(msg));
+    }
+    // A retransmission of message 2 is re-acked, not delivered or sampled.
+    e.deliver(2, short(b"b"), vec![]).await;
+    assert!(e.pump(Duration::from_millis(1)).await.is_none());
+    let counts = &e.conn.telemetry_test_counts;
+    assert_eq!(counts.inbound_concurrency_samples, 3);
+    assert_eq!(
+        counts.inbound_concurrency_max, 3,
+        "three short messages inside one window"
+    );
+
+    // Past the no-RTT window (100 ms + 25 ms): only the new one counts.
+    tokio::time::advance(Duration::from_secs(1)).await;
+    e.deliver(4, short(b"d"), vec![]).await;
+    assert_eq!(
+        e.pump(Duration::from_millis(1)).await.as_deref(),
+        Some(&b"d"[..])
+    );
+    assert_eq!(e.conn.telemetry_test_counts.inbound_concurrency_samples, 4);
+    assert_eq!(
+        e.conn
+            .inbound_concurrency
+            .on_stream_admitted(e.conn.time_source.now_nanos(), None, 0),
+        1,
+        "the earlier three have left the window"
+    );
+}
+
+/// A new inbound stream is sampled once, on admission, counting itself; its
+/// later fragments are not sampled. Both reassembly paths.
+#[tokio::test(start_paused = true)]
+async fn an_admitted_inbound_stream_is_sampled_once() {
+    let length = 3 * super::streaming_buffer::FRAGMENT_PAYLOAD_SIZE as u64;
+    for stream_id in [StreamId::next(), StreamId::next_transport_internal()] {
+        let mut e = single(CAPABLE);
+        feed(&mut e, short(b"m")).await;
+        feed(&mut e, fragment(stream_id, length, 1)).await;
+        let counts = &e.conn.telemetry_test_counts;
+        assert_eq!(counts.inbound_concurrency_samples, 2, "{stream_id:?}");
+        assert_eq!(
+            counts.inbound_concurrency_max, 2,
+            "{stream_id:?}: the open stream plus the short message"
+        );
+        feed(&mut e, fragment(stream_id, length, 2)).await;
+        settle().await;
+        assert_eq!(
+            e.conn.telemetry_test_counts.inbound_concurrency_samples, 2,
+            "{stream_id:?}: a later fragment is not sampled"
+        );
+    }
+}
