@@ -2571,12 +2571,27 @@ fn endpoint_death_turns_quic_off_without_stopping_the_node() {
         assert_eq!(pair.a.availability().get(), QuicAvailability::Down);
         assert_eq!(TRANSPORT_METRICS.quic_endpoint_down_at(pair.a_addr), 1);
 
-        // The endpoint's connection ends, and a new one cannot start.
+        // The endpoint's connection ends, blamed on this endpoint, not on
+        // the peer, and a new one cannot start. quinn reports a local
+        // INTERNAL_ERROR or, once the connection's driver closed it,
+        // LocallyClosed; neither may read as the peer's fault.
         let c = client.inner().clone();
-        drive(&pair.time, Duration::from_secs(60), async move {
-            c.closed().await;
+        let ended = drive(&pair.time, Duration::from_secs(60), async move {
+            c.closed().await
         })
         .await;
+        assert!(
+            matches!(
+                QuicErrorKind::from(ended.clone()),
+                QuicErrorKind::EndpointDown | QuicErrorKind::ConnectionLost
+            ),
+            "{ended:?}"
+        );
+        assert_eq!(
+            pair.a.connection_error_kind(ended.clone()),
+            QuicErrorKind::EndpointDown,
+            "{ended:?}"
+        );
         let refused = pair
             .a
             .connect(pair.b_addr, &pair.b_key())
@@ -2629,11 +2644,16 @@ fn endpoint_death_turns_quic_off_without_stopping_the_node() {
     });
 }
 
-/// Dropping the last handle is not a death: quinn's driver ends normally,
-/// nothing is counted, and the availability is never `Down`.
+/// Dropping the last handle is not a death, even with the accept loop
+/// running: the loop does not keep the endpoint owned, so it stops and
+/// drops its handle, quinn's driver ends, the socket is let go, the
+/// availability becomes `Released` and nothing is counted. Waiting on a
+/// final availability returns that value at once, every time, so a loop
+/// around `not_up` cannot spin on a stale `Up`.
 #[test]
 fn dropping_the_endpoint_is_not_a_death() {
     bounded(|| async move {
+        use crate::node::background_task_monitor::BackgroundTaskMonitor;
         use crate::transport::metrics::TRANSPORT_METRICS;
         let network = "quic-endpoint-drop";
         let addr: SocketAddr = "10.201.32.1:5000".parse().unwrap();
@@ -2645,46 +2665,110 @@ fn dropping_the_endpoint_is_not_a_death() {
             None,
         ));
         let endpoint = QuicEndpoint::bind(
-            socket,
+            socket.clone(),
             addr,
             time.clone(),
             &settings(),
             &TransportKeypair::new(),
         )
         .unwrap();
+        let monitor = BackgroundTaskMonitor::new();
+        let (attempts, _attempts_rx) = tokio::sync::mpsc::channel(4);
+        endpoint.spawn_accept_loop(&monitor, attempts);
         let mut availability = endpoint.availability();
         let clone = endpoint.clone();
         drop(endpoint);
         assert_eq!(availability.get(), QuicAvailability::Up, "a handle is left");
+        assert!(
+            Arc::strong_count(&socket) > 1,
+            "the endpoint holds the socket"
+        );
         drop(clone);
-        // `not_up` returns once the driver ended and dropped the last
-        // sender, with the value it left.
+        let socket_in = socket.clone();
         let seen = drive(&time, Duration::from_secs(10), async move {
-            availability.not_up().await
+            let seen = availability.not_up().await;
+            // The loop let go of its handle, so quinn's driver ends and
+            // drops the endpoint's socket (this task holds one more).
+            while Arc::strong_count(&socket_in) > 2 {
+                tokio::task::yield_now().await;
+            }
+            for _ in 0..3 {
+                assert_eq!(availability.not_up().await, seen, "final and immediate");
+            }
+            seen
         })
         .await;
-        assert_eq!(seen, QuicAvailability::Up);
+        assert_eq!(seen, QuicAvailability::Released);
+        assert_eq!(Arc::strong_count(&socket), 1, "the socket was let go");
         assert_eq!(TRANSPORT_METRICS.quic_endpoint_down_at(addr), 0);
+        let mut disabled = QuicAvailabilityWatch::disabled();
+        for _ in 0..3 {
+            assert_eq!(disabled.not_up().await, QuicAvailability::Disabled);
+        }
+        drop(monitor);
         unregister_network_time_source(network);
+    });
+}
+
+/// An attempt that finds the accept queue full is ignored and counted.
+#[test]
+fn a_full_accept_queue_ignores_and_counts_the_attempt() {
+    bounded(|| async move {
+        use crate::node::background_task_monitor::BackgroundTaskMonitor;
+        let _seed = GlobalRng::seed_guard(SEED);
+        let pair = pair(
+            "quic-accept-full",
+            "10.201.33.1:5000".parse().unwrap(),
+            "10.201.33.2:5000".parse().unwrap(),
+            None,
+        )
+        .await;
+        let _permit = pair.b.allow_peer(pair.a_addr, &pair.a_key()).unwrap();
+        let monitor = BackgroundTaskMonitor::new();
+        // Room for one attempt, never taken.
+        let (attempts, _attempts_rx) = tokio::sync::mpsc::channel(1);
+        pair.b.spawn_accept_loop(&monitor, attempts);
+        let clients: Vec<_> = (0..2)
+            .map(|_| {
+                let (a, b_addr, b_key) = (pair.a.clone(), pair.b_addr, pair.b_key());
+                tokio::spawn(async move { a.connect(b_addr, &b_key).await.map(|_| ()) })
+            })
+            .collect();
+        let b = pair.b.clone();
+        drive(&pair.time, Duration::from_secs(10), async move {
+            while b.accept_queue_full() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        assert_eq!(pair.b.accept_queue_full(), 1);
+        for client in clients {
+            client.abort();
+        }
     });
 }
 
 /// With `transport-quic` off the transport builds no endpoint and reports
 /// `Disabled`; with it on, `Up`. When that endpoint's driver dies, the
 /// transport reports `Down` and its listener keeps running: endpoint death
-/// never reaches `ListenerExit`, which would exit the node.
+/// never reaches `ListenerExit`, which would exit the node. On simulation
+/// sockets (no real port, no port reuse). The endpoint inside the
+/// transport runs on `RealTime`, but nothing here waits on time: the
+/// injected failure wakes the driver at once.
 #[test]
 fn the_transport_reports_quic_availability() {
     bounded(|| async move {
-        use crate::transport::UdpTransportSocket;
         use crate::transport::connection_handler::{UdpTransportConfig, bind_udp_listener};
         use crate::transport::metrics::TRANSPORT_METRICS;
-        for quic in [None, Some(settings())] {
-            let port = crate::test_utils::reserve_local_port().unwrap();
-            crate::test_utils::release_local_port(port);
-            let (outbound, _inbound, listener) = bind_udp_listener::<UdpTransportSocket>(
+        let network = "quic-transport-availability";
+        let time = VirtualTime::new();
+        register_network_time_source(network, time.clone());
+        for (port, quic) in [(5000, None), (5001, Some(settings()))] {
+            let local = SocketAddr::from(([10, 201, 34, 1], port));
+            register_address_network(local, network);
+            let (outbound, _inbound, listener) = bind_udp_listener::<SimulationSocket>(
                 crate::transport::TransportKeypair::new(),
-                IpAddr::V4(Ipv4Addr::LOCALHOST),
+                local.ip(),
                 port,
                 false,
                 UdpTransportConfig {
@@ -2705,15 +2789,18 @@ fn the_transport_reports_quic_availability() {
             assert!(quic.is_some(), "no endpoint is built with the key off");
             assert_eq!(availability.get(), QuicAvailability::Up);
             endpoint.fail_driver();
-            let seen = tokio::time::timeout(Duration::from_secs(10), availability.not_up())
+            // A bound only: the wake is immediate.
+            let seen = tokio::time::timeout(Duration::from_secs(30), availability.not_up())
                 .await
                 .expect("the driver's death is reported");
             assert_eq!(seen, QuicAvailability::Down);
-            let local = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
             assert_eq!(TRANSPORT_METRICS.quic_endpoint_down_at(local), 1);
-            tokio::time::sleep(Duration::from_millis(300)).await;
+            for _ in 0..64 {
+                tokio::task::yield_now().await;
+            }
             assert!(!listener.is_finished(), "the listener keeps running");
             listener.abort();
         }
+        unregister_network_time_source(network);
     })
 }

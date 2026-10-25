@@ -41,11 +41,14 @@ pub(crate) mod close_code {
     pub(crate) const NODE_DROPPED_PEER: u32 = 0x00;
     /// Downgrade: stop using QUIC with this node and fall back to the UDP
     /// session, which stays up. Sent when the QUIC path is broken on this
-    /// side (its receive task ended) and by the kill switch.
+    /// side (its receive task ended); also reserved for e5's fallback.
     pub(crate) const DOWNGRADE: u32 = 0x01;
     /// The key the peer proved is not the one this node has on record for
     /// it (identity binding, e5).
     pub(crate) const IDENTITY_MISMATCH: u32 = 0x02;
+    /// Every close code, for the range and duplicate checks. A source-scrape
+    /// test checks that each `const` in this module is listed.
+    pub(crate) const ALL: [u32; 3] = [NODE_DROPPED_PEER, DOWNGRADE, IDENTITY_MISMATCH];
 }
 
 /// The first code above each namespace's range.
@@ -54,21 +57,41 @@ const STOP_CODE_END: u32 = 0x20;
 const RESET_CODE_END: u32 = 0x30;
 
 const _: () = {
-    let close = [
-        close_code::NODE_DROPPED_PEER,
-        close_code::DOWNGRADE,
-        close_code::IDENTITY_MISMATCH,
-    ];
-    let stop = [
-        stop_code::HEADER_REFUSED,
-        stop_code::BUDGET_REFUSED,
-        stop_code::STREAM_ID_IN_USE,
-        stop_code::CHANNEL_FULL,
-        stop_code::OVERLONG,
-        stop_code::EVICTED,
-        stop_code::CANCELLED,
-    ];
-    let reset = [reset_code::SENDER_ABORTED];
+    let close = close_code::ALL;
+    let stop = stop_code::ALL;
+    let reset = reset_code::ALL;
+    // No code is used twice, within or across the namespaces.
+    let all_len = close.len() + stop.len() + reset.len();
+    let mut all = [0u32; 3 + 7 + 1];
+    assert!(all.len() == all_len, "update the combined length");
+    let mut n = 0;
+    let mut i = 0;
+    while i < close.len() {
+        all[n] = close[i];
+        n += 1;
+        i += 1;
+    }
+    let mut i = 0;
+    while i < stop.len() {
+        all[n] = stop[i];
+        n += 1;
+        i += 1;
+    }
+    let mut i = 0;
+    while i < reset.len() {
+        all[n] = reset[i];
+        n += 1;
+        i += 1;
+    }
+    let mut i = 0;
+    while i < all.len() {
+        let mut j = i + 1;
+        while j < all.len() {
+            assert!(all[i] != all[j], "an application error code is used twice");
+            j += 1;
+        }
+        i += 1;
+    }
     let mut i = 0;
     while i < close.len() {
         assert!(close[i] < CLOSE_CODE_END, "close codes are 0x00..=0x0f");
@@ -125,19 +148,52 @@ fn is_tls_alert(code: u64) -> bool {
     (0x100..0x200).contains(&code)
 }
 
-/// A QUIC transport error code (sent by the peer in CONNECTION_CLOSE, or
-/// detected here): a TLS alert is a refused handshake, `NO_ERROR` an
-/// ordinary close, anything else a protocol violation.
-fn of_transport_code(code: u64) -> QuicErrorKind {
+/// QUIC transport error codes (RFC 9000 section 20.1) this module tells
+/// apart.
+const NO_ERROR: u64 = 0x0;
+const INTERNAL_ERROR: u64 = 0x1;
+const CONNECTION_REFUSED: u64 = 0x2;
+
+/// Where a QUIC transport error code came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CodeFrom {
+    /// The peer sent it in CONNECTION_CLOSE.
+    Peer,
+    /// quinn raised it here.
+    Local,
+}
+
+/// A QUIC transport error code: a TLS alert is a refused handshake,
+/// `NO_ERROR` an ordinary close, `CONNECTION_REFUSED` a refusal by the
+/// peer's stack. A LOCAL `INTERNAL_ERROR` is this endpoint failing, not
+/// the peer: quinn ends every connection of an endpoint whose driver
+/// future was dropped with exactly that (quinn 0.11.12 connection.rs
+/// line 1112, "endpoint driver future was dropped"), so it is
+/// `EndpointDown`. Anything else is a protocol violation.
+fn of_transport_code(code: u64, from: CodeFrom) -> QuicErrorKind {
     if is_tls_alert(code) {
-        QuicErrorKind::Refused {
+        return QuicErrorKind::Refused {
             reason: QuicRefusal::Handshake,
-        }
-    } else if code == 0 {
-        QuicErrorKind::ConnectionLost
-    } else {
-        QuicErrorKind::Protocol { code }
+        };
     }
+    match (code, from) {
+        (NO_ERROR, CodeFrom::Peer | CodeFrom::Local) => QuicErrorKind::ConnectionLost,
+        (CONNECTION_REFUSED, CodeFrom::Peer | CodeFrom::Local) => QuicErrorKind::Refused {
+            reason: QuicRefusal::ConnectionRefused,
+        },
+        (INTERNAL_ERROR, CodeFrom::Local) => QuicErrorKind::EndpointDown,
+        (code, CodeFrom::Peer | CodeFrom::Local) => QuicErrorKind::Protocol { code },
+    }
+}
+
+/// Whether a stream that was stopped or reset with `code` may succeed on a
+/// retry (a new stream): every code except the two that refuse the
+/// message itself, `HEADER_REFUSED` and `OVERLONG`, which fail the same
+/// way every time. Budget, channel-full, eviction, id-in-use,
+/// cancellation, our own `SENDER_ABORTED` and codes this node does not
+/// know are retryable, like the UDP transport's `OutboundStreamFailed`.
+pub(in crate::transport) fn stream_code_is_retryable(code: u64) -> bool {
+    !(code == u64::from(stop_code::HEADER_REFUSED) || code == u64::from(stop_code::OVERLONG))
 }
 
 impl From<quinn::ConnectionError> for QuicErrorKind {
@@ -147,10 +203,10 @@ impl From<quinn::ConnectionError> for QuicErrorKind {
                 reason: QuicRefusal::Version,
             },
             quinn::ConnectionError::TransportError(error) => {
-                of_transport_code(u64::from(error.code))
+                of_transport_code(u64::from(error.code), CodeFrom::Local)
             }
             quinn::ConnectionError::ConnectionClosed(close) => {
-                of_transport_code(u64::from(close.error_code))
+                of_transport_code(u64::from(close.error_code), CodeFrom::Peer)
             }
             quinn::ConnectionError::ApplicationClosed(close) => {
                 match QuicCloseCode::from_code(close.error_code.into_inner()) {

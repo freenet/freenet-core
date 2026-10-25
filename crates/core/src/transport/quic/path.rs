@@ -126,6 +126,18 @@ pub(crate) mod stop_code {
     pub(crate) const EVICTED: u32 = 0x16;
     /// The stream's handle was cancelled on the receiving side.
     pub(crate) const CANCELLED: u32 = 0x17;
+    /// Every stop code, for the range and duplicate checks in
+    /// `super::error`. A source-scrape test checks that each `const` in this
+    /// module is listed.
+    pub(crate) const ALL: [u32; 7] = [
+        HEADER_REFUSED,
+        BUDGET_REFUSED,
+        STREAM_ID_IN_USE,
+        CHANNEL_FULL,
+        OVERLONG,
+        EVICTED,
+        CANCELLED,
+    ];
 }
 
 /// Application error codes a sender resets a stream with (RESET_STREAM).
@@ -134,6 +146,8 @@ pub(crate) mod reset_code {
     /// The sender gave up: its chunk source failed or did not deliver the
     /// declared length.
     pub(crate) const SENDER_ABORTED: u32 = 0x21;
+    /// Every reset code (see `stop_code::ALL`).
+    pub(crate) const ALL: [u32; 1] = [SENDER_ABORTED];
 }
 
 /// Capacity of [`QuicInbound::shorts`]. Each queued message still holds its

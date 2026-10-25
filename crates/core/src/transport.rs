@@ -457,9 +457,10 @@ impl std::fmt::Debug for QuicError {
 /// What went wrong in a [`QuicError`]. A small, stable set: quinn has many
 /// more error variants, and `quic::error` decides which kind each is.
 ///
-/// Scope (see [`TransportError::scope`]): `Reset`, `Stopped`,
-/// `InvalidFrame` and `StreamClosed` end one stream; the rest end the QUIC
-/// connection (or the attempt to make one). A connection-scope kind ends
+/// Scope (see [`TransportError::scope`]): `Reset` and `Stopped` are
+/// transient (a retry may succeed) unless their code refuses the message
+/// itself, then stream scope like `InvalidFrame` and `StreamClosed`; the
+/// rest end the QUIC connection (or the attempt to make one). A connection-scope kind ends
 /// the QUIC path only: the peer's UDP session stays up, and e5 falls back
 /// to it inside the transport, so a connection-scope QUIC error is never
 /// surfaced to the operations above it.
@@ -475,11 +476,12 @@ pub(in crate::transport) enum QuicErrorKind {
     ConnectionLost,
     /// The stream was reset with this code: by the peer while this node was
     /// reading it, or by this node, which abandoned a send whose source
-    /// failed (`reset_code::SENDER_ABORTED`). Stream scope.
+    /// failed (`reset_code::SENDER_ABORTED`). Transient or stream scope by
+    /// code (`quic::error::stream_code_is_retryable`).
     #[error("QUIC stream reset with code {code}")]
     Reset { code: u64 },
     /// The peer stopped the stream (STOP_SENDING) with this code
-    /// (`stop_code`). Stream scope.
+    /// (`stop_code`). Transient or stream scope by code, as for `Reset`.
     #[error("QUIC stream stopped by the peer with code {code}")]
     Stopped { code: u64 },
     /// The connection was refused, or ended by a refusal. Connection scope.
@@ -490,8 +492,8 @@ pub(in crate::transport) enum QuicErrorKind {
     #[error("QUIC connection timed out")]
     TimedOut,
     /// The node's QUIC endpoint is gone: its driver ended, or it was
-    /// closed. Connection scope, and process-wide: every QUIC path ends,
-    /// and `QuicAvailability` reports it.
+    /// closed. Connection scope, for every connection of that endpoint
+    /// (one per node), whose `QuicAvailability` reports it.
     #[error("the QUIC endpoint is down")]
     EndpointDown,
     /// The peer broke the QUIC protocol (a QUIC transport error code other
@@ -521,6 +523,10 @@ pub(in crate::transport) enum QuicRefusal {
     /// The peer does not speak QUIC version 1.
     #[error("no common QUIC version")]
     Version,
+    /// The peer's QUIC stack refused the connection (transport error
+    /// CONNECTION_REFUSED), for example because it was not accepting.
+    #[error("the peer's QUIC stack refused the connection")]
+    ConnectionRefused,
     /// The peer closed with `close_code::DOWNGRADE`: fall back to UDP.
     #[error("the peer asked to fall back to UDP")]
     Downgrade,
@@ -610,6 +616,9 @@ impl TransportError {
         match self {
             TransportError::OutboundStreamFailed(..)
             | TransportError::Udp(UdpError(UdpErrorKind::SendFailed(..))) => ErrorScope::Transient,
+            TransportError::Quic(QuicError(
+                QuicErrorKind::Reset { code } | QuicErrorKind::Stopped { code },
+            )) if quic::error::stream_code_is_retryable(*code) => ErrorScope::Transient,
             TransportError::OutboundStreamInvalidLength(..)
             | TransportError::Quic(QuicError(
                 QuicErrorKind::Reset { .. }
@@ -1179,6 +1188,13 @@ mod tests {
                     (ErrorScope::Connection, false, true)
                 }
                 TransportError::Quic(QuicError(kind)) => match kind {
+                    // Retryable codes, written out: 0x12 BUDGET_REFUSED,
+                    // 0x14 CHANNEL_FULL, 0x16 EVICTED, 0x21 SENDER_ABORTED.
+                    QuicErrorKind::Reset { code } | QuicErrorKind::Stopped { code }
+                        if [0x12, 0x14, 0x16, 0x21].contains(code) =>
+                    {
+                        (ErrorScope::Transient, true, false)
+                    }
                     QuicErrorKind::Reset { .. }
                     | QuicErrorKind::Stopped { .. }
                     | QuicErrorKind::InvalidFrame
@@ -1211,6 +1227,10 @@ mod tests {
             TransportError::from(QuicErrorKind::ConnectionLost),
             TransportError::from(QuicErrorKind::Reset { code: 0x21 }),
             TransportError::from(QuicErrorKind::Stopped { code: 0x12 }),
+            TransportError::from(QuicErrorKind::Stopped { code: 0x14 }),
+            TransportError::from(QuicErrorKind::Stopped { code: 0x16 }),
+            TransportError::from(QuicErrorKind::Stopped { code: 0x11 }),
+            TransportError::from(QuicErrorKind::Reset { code: 0x15 }),
             TransportError::from(QuicErrorKind::Refused {
                 reason: QuicRefusal::Downgrade,
             }),

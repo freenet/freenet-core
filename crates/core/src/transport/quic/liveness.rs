@@ -1,36 +1,53 @@
 //! Whether the node's QUIC endpoint is alive (#5940, step e4).
 //!
-//! quinn spawns its endpoint driver itself, through the runtime, and keeps
-//! no handle to it: if the driver ends (a socket error it cannot get past)
-//! or panics, every connection on the endpoint ends and `accept` returns
-//! `None`, and nothing else says so. [`QuicRuntime`] wraps that driver, so
-//! its end is observed here:
+//! "Alive" here means quinn's endpoint driver has not ENDED. It says nothing
+//! about whether the endpoint is making progress: a driver that is stuck but
+//! still pending reads as `Up`.
 //!
-//! - while the node still holds the endpoint, the end is a death: the
+//! quinn spawns its endpoint driver itself, through the runtime, and keeps no
+//! handle to it. [`QuicRuntime`] wraps that driver, so the moment its future
+//! returns is observed here:
+//!
+//! - while the node still holds the endpoint, the return is a death: the
 //!   endpoint's [`QuicAvailability`] becomes `Down` (once), with a WARN and
-//!   the `quic_endpoint_down` counter. The UDP transport is untouched and
-//!   the node keeps running: endpoint death NEVER feeds `ListenerExit`,
-//!   which exits the node. e5 watches the availability and moves every QUIC
-//!   path back to UDP.
-//! - after the node dropped the endpoint, the driver ending is the normal
+//!   the `quic_endpoint_down` counter. The UDP transport is untouched and the
+//!   node keeps running: endpoint death NEVER feeds `ListenerExit`, which
+//!   exits the node. e5 watches the availability and moves every QUIC path
+//!   back to UDP.
+//! - after the node dropped its last handle, the return is the normal
 //!   shutdown (quinn's driver ends once no handle and no connection is
-//!   left), and nothing is reported.
-//! - if the driver task is dropped without finishing (the runtime shutting
-//!   down), nothing is reported either: the process is ending.
+//!   left): the availability becomes `Released` and nothing is counted.
+//! - a driver task dropped without finishing (the runtime shutting down) is
+//!   not reported: the process is ending.
+//!
+//! What this does NOT cover: a PANIC in the driver. quinn's driver returns
+//! only on an I/O error from `drive_recv`, and [`QuicSocket`] never returns
+//! one, so in production today the driver cannot return at all; the only
+//! way it ends is a panic, and a panic is not contained. quinn 0.11.12 polls
+//! the driver while holding its endpoint state mutex
+//! (`EndpointDriver::poll`, `endpoint.rs` line 370: `state.lock().unwrap()`),
+//! so a panic there poisons it, and every later lock of it panics too:
+//! `EndpointDriver::drop` (line 403), `Accept::poll` (line 651, inside
+//! `quic_accept_loop`), `connect` (line 214) and the connection drivers. Where
+//! one of those runs while the first panic is still unwinding, the process
+//! aborts. So this circuit only reports a driver that RETURNED (tests inject
+//! that with a receive error, `socket::ReceiveFault`). Containing a quinn
+//! panic (catch the unwind, leak the driver instead of dropping it, guard
+//! the accept loop against the poisoned lock) is a separate prerequisite
+//! before QUIC is on by default.
 //!
 //! With `transport-quic = "off"` no endpoint exists, and the transport
 //! reports [`QuicAvailability::Disabled`].
 //!
 //! [`QuicRuntime`]: super::runtime::QuicRuntime
+//! [`QuicSocket`]: super::socket::QuicSocket
 
 use std::future::Future;
 use std::net::SocketAddr;
-use std::panic::AssertUnwindSafe;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use futures::FutureExt;
 use tokio::sync::watch;
 
 use crate::transport::metrics::TRANSPORT_METRICS;
@@ -41,11 +58,14 @@ pub(crate) enum QuicAvailability {
     /// No endpoint: `transport-quic` is off, or the endpoint could not be
     /// built.
     Disabled,
-    /// The endpoint is running.
+    /// The endpoint's driver has not ended.
     Up,
-    /// The endpoint died while the node held it. Final: nothing restarts
-    /// it, and the node runs with QUIC off until it restarts.
+    /// The endpoint's driver returned while the node held it. Final:
+    /// nothing restarts it, and the node runs with QUIC off until it
+    /// restarts.
     Down,
+    /// The node dropped its last handle to the endpoint. Final.
+    Released,
 }
 
 /// A view of a [`QuicAvailability`] that can be read at any time and
@@ -56,8 +76,7 @@ pub(crate) struct QuicAvailabilityWatch(watch::Receiver<QuicAvailability>);
 impl QuicAvailabilityWatch {
     /// A watch that always reports [`QuicAvailability::Disabled`].
     pub(crate) fn disabled() -> Self {
-        // The sender is dropped at once: the value never changes, and a
-        // waiter in `down` sees the channel closed and returns.
+        // The sender is dropped at once: the value never changes.
         let (_, receiver) = watch::channel(QuicAvailability::Disabled);
         Self(receiver)
     }
@@ -67,9 +86,9 @@ impl QuicAvailabilityWatch {
         *self.0.borrow()
     }
 
-    /// Wait until the endpoint is no longer `Up`: `Down`, or `Disabled`
-    /// from the start. Also returns once the endpoint is dropped (its
-    /// value is then no longer updated). Cancel-safe.
+    /// Wait until the availability is not `Up`, and return it. Every value
+    /// other than `Up` is final, so a caller that loops on this gets the
+    /// same value back at once and never waits again. Cancel-safe.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) async fn not_up(&mut self) -> QuicAvailability {
         let seen = self
@@ -77,11 +96,23 @@ impl QuicAvailabilityWatch {
             .wait_for(|availability| *availability != QuicAvailability::Up)
             .await
             .map(|availability| *availability);
-        seen.unwrap_or_else(|_| self.get())
+        match seen {
+            Ok(availability) => availability,
+            // The sender is dropped only with the endpoint's health, after
+            // the owner released it (which stores `Released` first); if it
+            // somehow left `Up`, report the endpoint as released, never `Up`.
+            Err(_) => match self.get() {
+                QuicAvailability::Up => QuicAvailability::Released,
+                other @ (QuicAvailability::Disabled
+                | QuicAvailability::Down
+                | QuicAvailability::Released) => other,
+            },
+        }
     }
 }
 
-/// The liveness state one endpoint shares with its driver's watcher.
+/// The liveness state one endpoint shares with its driver's watcher and
+/// its accept loop.
 pub(crate) struct EndpointHealth {
     availability: watch::Sender<QuicAvailability>,
     /// Set when the node dropped its last handle to the endpoint; the
@@ -105,13 +136,34 @@ impl EndpointHealth {
     }
 
     /// The node dropped its last handle to the endpoint.
+    ///
+    /// Ordering: `released` is stored before the node's last quinn
+    /// `Endpoint` handle is dropped (the owner field is declared first). The
+    /// driver can return only after quinn sees no handle left; quinn's
+    /// handle count is `Relaxed`, but the last handle's drop then takes the
+    /// endpoint state mutex to wake the driver, and the driver takes the
+    /// same mutex before it returns, so the store happens before the
+    /// driver's return, and the watcher's Acquire load after it sees it.
     pub(crate) fn release(&self) {
         self.released.store(true, Ordering::Release);
+        self.availability.send_if_modified(|availability| {
+            if *availability == QuicAvailability::Up {
+                *availability = QuicAvailability::Released;
+                true
+            } else {
+                false
+            }
+        });
     }
 
-    /// The endpoint driver's future finished (`panicked`: by panicking).
-    fn driver_ended(&self, panicked: bool) {
-        if self.released.load(Ordering::Acquire) && !panicked {
+    /// Whether the node dropped its last handle (see [`Self::release`]).
+    pub(crate) fn is_released(&self) -> bool {
+        self.released.load(Ordering::Acquire)
+    }
+
+    /// The endpoint driver's future returned.
+    fn driver_ended(&self) {
+        if self.is_released() {
             tracing::debug!(local_addr = %self.local_addr, "QUIC endpoint driver ended after the endpoint was dropped");
             return;
         }
@@ -121,7 +173,6 @@ impl EndpointHealth {
             TRANSPORT_METRICS.record_quic_endpoint_down(self.local_addr);
             tracing::warn!(
                 local_addr = %self.local_addr,
-                panicked,
                 "QUIC endpoint is down: its driver ended while the node held it. \
                  The node keeps running on the UDP transport, with QUIC off until it restarts"
             );
@@ -129,35 +180,17 @@ impl EndpointHealth {
     }
 }
 
-/// Run quinn's endpoint driver and report how it ended to `health`.
+/// Run quinn's endpoint driver and report to `health` when it returns.
+///
+/// No panic handling: a panic in quinn's driver is not contained here (see
+/// the module docs) and is never reported as `Down`.
 pub(crate) async fn watch_endpoint_driver(
     driver: Pin<Box<dyn Future<Output = ()> + Send>>,
     health: Arc<EndpointHealth>,
 ) {
-    let mut guard = DriverGuard {
-        health: Some(health),
-    };
-    // quinn's spawned future logs and swallows the driver's I/O error, so
-    // an error end and a normal end look alike here; `released` tells them
-    // apart. A panic is caught so it is reported too.
-    let ended = AssertUnwindSafe(driver).catch_unwind().await;
-    if let Some(health) = guard.health.take() {
-        health.driver_ended(ended.is_err());
-    }
-}
-
-/// Notes a driver task dropped before it finished.
-struct DriverGuard {
-    health: Option<Arc<EndpointHealth>>,
-}
-
-impl Drop for DriverGuard {
-    fn drop(&mut self) {
-        if let Some(health) = self.health.take() {
-            tracing::debug!(
-                local_addr = %health.local_addr,
-                "QUIC endpoint driver task dropped before it finished (runtime shutting down)"
-            );
-        }
-    }
+    // quinn's spawned future logs and swallows the driver's I/O error, so an
+    // error return and a normal return look alike here; `released` tells
+    // them apart.
+    driver.await;
+    health.driver_ended();
 }

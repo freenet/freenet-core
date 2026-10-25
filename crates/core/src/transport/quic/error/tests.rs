@@ -65,6 +65,26 @@ fn connection_errors_map_to_their_kinds() {
             },
         ),
         (
+            "this endpoint's driver was dropped (local INTERNAL_ERROR)",
+            local_error(TransportErrorCode::INTERNAL_ERROR),
+            QuicErrorKind::EndpointDown,
+        ),
+        (
+            "peer reports its own internal error",
+            peer_abort(TransportErrorCode::INTERNAL_ERROR),
+            QuicErrorKind::Protocol { code: 0x1 },
+        ),
+        (
+            "peer stack refused the connection",
+            peer_abort(TransportErrorCode::CONNECTION_REFUSED),
+            refused(QuicRefusal::ConnectionRefused),
+        ),
+        (
+            "connection refused, raised here",
+            local_error(TransportErrorCode::CONNECTION_REFUSED),
+            refused(QuicRefusal::ConnectionRefused),
+        ),
+        (
             "peer TLS alert (decrypt error)",
             peer_abort(TransportErrorCode::crypto(51)),
             refused(QuicRefusal::Handshake),
@@ -148,7 +168,16 @@ fn only_the_tls_alert_range_is_a_refused_handshake() {
         } else {
             QuicErrorKind::Protocol { code }
         };
-        assert_eq!(of_transport_code(code), expected, "{code:#x}");
+        assert_eq!(
+            of_transport_code(code, CodeFrom::Peer),
+            expected,
+            "{code:#x}"
+        );
+        assert_eq!(
+            of_transport_code(code, CodeFrom::Local),
+            expected,
+            "{code:#x}"
+        );
     }
 }
 
@@ -362,14 +391,14 @@ fn endpoint_errors_map_to_their_kinds() {
     }
 }
 
-/// Stream kinds keep the connection; the rest end it. Written out per kind,
-/// independently of `TransportError::scope`.
+/// A stop or reset is transient (a retry may succeed) unless its code
+/// refuses the message itself; the other stream kinds keep the connection
+/// but fail the same way again; the rest end it. Written out per kind and
+/// code, independently of `TransportError::scope`.
 #[test]
 fn stream_kinds_keep_the_connection_and_the_rest_end_it() {
-    let cases = [
+    let mut cases = vec![
         (QuicErrorKind::ConnectionLost, ErrorScope::Connection),
-        (QuicErrorKind::Reset { code: 0x21 }, ErrorScope::Stream),
-        (QuicErrorKind::Stopped { code: 0x12 }, ErrorScope::Stream),
         (refused(QuicRefusal::Downgrade), ErrorScope::Connection),
         (QuicErrorKind::TimedOut, ErrorScope::Connection),
         (QuicErrorKind::EndpointDown, ErrorScope::Connection),
@@ -380,11 +409,73 @@ fn stream_kinds_keep_the_connection_and_the_rest_end_it() {
         (QuicErrorKind::InvalidFrame, ErrorScope::Stream),
         (QuicErrorKind::StreamClosed, ErrorScope::Stream),
     ];
+    // (code, retryable), every stop and reset code plus unknown ones.
+    let codes = [
+        (stop_code::HEADER_REFUSED, false),
+        (stop_code::BUDGET_REFUSED, true),
+        (stop_code::STREAM_ID_IN_USE, true),
+        (stop_code::CHANNEL_FULL, true),
+        (stop_code::OVERLONG, false),
+        (stop_code::EVICTED, true),
+        (stop_code::CANCELLED, true),
+        (reset_code::SENDER_ABORTED, true),
+        (0x1f, true),
+        (9, true),
+    ];
+    assert_eq!(
+        codes.len(),
+        stop_code::ALL.len() + reset_code::ALL.len() + 2,
+        "every code has a row"
+    );
+    for (code, retryable) in codes {
+        let scope = if retryable {
+            ErrorScope::Transient
+        } else {
+            ErrorScope::Stream
+        };
+        let code = u64::from(code);
+        cases.push((QuicErrorKind::Stopped { code }, scope));
+        cases.push((QuicErrorKind::Reset { code }, scope));
+    }
     for (kind, scope) in cases {
         let error = transport_error(kind);
         assert_eq!(error.scope(), scope, "{kind:?}");
+        assert!(!error.closes_connection() || scope == ErrorScope::Connection);
         assert!(matches!(error, TransportError::Quic(e) if e.kind() == kind));
         assert_eq!(QuicError::of(kind).kind(), kind);
+    }
+}
+
+/// The body of `pub(crate) mod <name> {` in `source`, to its closing brace
+/// at the start of a line; panics if the module is missing.
+fn module_body<'a>(source: &'a str, name: &str) -> &'a str {
+    let start = source
+        .find(&format!("\npub(crate) mod {name} {{\n"))
+        .unwrap_or_else(|| panic!("module {name} not found"));
+    let rest = &source[start + 1..];
+    let end = rest.find("\n}\n").expect("module end");
+    &rest[..end]
+}
+
+/// Every code constant in the three code modules is in that module's
+/// `ALL`, so the compile-time range and duplicate checks see it.
+#[test]
+fn every_code_constant_is_in_its_all_list() {
+    let error_rs = include_str!("../error.rs");
+    let path_rs = include_str!("../path.rs");
+    for (source, name, all) in [
+        (error_rs, "close_code", close_code::ALL.len()),
+        (path_rs, "stop_code", stop_code::ALL.len()),
+        (path_rs, "reset_code", reset_code::ALL.len()),
+    ] {
+        let body = module_body(source, name);
+        let consts = body
+            .lines()
+            .filter(|line| {
+                line.trim_start().starts_with("pub(crate) const ") && line.contains(": u32 =")
+            })
+            .count();
+        assert_eq!(consts, all, "{name}: a code constant is missing from ALL");
     }
 }
 

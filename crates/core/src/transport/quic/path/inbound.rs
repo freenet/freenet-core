@@ -232,13 +232,21 @@ enum ReadFailure {
 }
 
 impl From<quinn::ReadError> for ReadFailure {
+    /// Through the one quinn error mapping (`quic::error`), so a read
+    /// failure is classified the same way here and in a `QuicError`.
     fn from(error: quinn::ReadError) -> Self {
-        match error {
-            quinn::ReadError::Reset(_) => Self::Reset,
-            quinn::ReadError::ConnectionLost(_) => Self::ConnectionLost,
-            quinn::ReadError::ClosedStream
-            | quinn::ReadError::IllegalOrderedRead
-            | quinn::ReadError::ZeroRttRejected => Self::Other,
+        use crate::transport::QuicErrorKind;
+        match QuicErrorKind::from(error) {
+            QuicErrorKind::Reset { .. } => Self::Reset,
+            QuicErrorKind::ConnectionLost
+            | QuicErrorKind::Refused { .. }
+            | QuicErrorKind::TimedOut
+            | QuicErrorKind::EndpointDown
+            | QuicErrorKind::Protocol { .. } => Self::ConnectionLost,
+            // A read never maps to Stopped or InvalidFrame.
+            QuicErrorKind::StreamClosed
+            | QuicErrorKind::Stopped { .. }
+            | QuicErrorKind::InvalidFrame => Self::Other,
         }
     }
 }
