@@ -3869,6 +3869,185 @@ pub struct ConfigPathsArgs {
     pub log_dir: Option<PathBuf>,
 }
 
+/// Directory under which `ConfigPathsArgs::default_dirs` places the
+/// `freenet-{id}` temp data dirs.
+///
+/// Outside unit tests this is the OS temp dir, unchanged. In a unit-test
+/// build it is a directory private to this process
+/// (`$TMPDIR/freenet-test-<pid>`, see [`test_temp_root`]). `default_dirs`
+/// deletes any existing `freenet-{id}` dir before reusing the name, and the
+/// ids are fixed strings in the tests, so with a shared root a second test
+/// process (another worktree's `cargo test` on the same machine, or a second
+/// binary run in parallel) deleted this process's live data dirs mid-test and
+/// the test failed with `build Config: No such file or directory`.
+#[cfg(not(test))]
+fn default_temp_root() -> PathBuf {
+    std::env::temp_dir()
+}
+
+#[cfg(test)]
+fn default_temp_root() -> PathBuf {
+    static ROOT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    ROOT.get_or_init(|| test_temp_root::claim(&std::env::temp_dir()))
+        .clone()
+}
+
+/// Per-process temp roots for unit-test builds.
+///
+/// A root is `freenet-test-<pid>`, or `freenet-test-<pid>-<n>` if that name
+/// is held by another live process (for example one with the same pid in
+/// another pid namespace that shares `/tmp`). Ownership is an exclusive
+/// `flock` on `<root>/.owner.lock`, held for the life of the process and
+/// released by the kernel when it exits. Liveness is decided by that lock
+/// alone, never by the pid in the name: pid reuse, pid namespaces and other
+/// users' processes all make a pid check unreliable.
+///
+/// On first use, roots whose lock nobody holds are removed. A root is only
+/// removed when it is a real directory (not a symlink), owned by this user,
+/// has a lock file, the lock was acquired, and the locked file is still the
+/// one at that path, so a sweeper holding a lock on an already-deleted root
+/// cannot remove a newer root created under the same name. A root with no
+/// lock file is left alone, because its owner may be between `mkdir` and
+/// `flock`. Non-unix builds get a pid-named root and no sweep.
+#[cfg(test)]
+mod test_temp_root {
+    use std::fs;
+    use std::path::{Path, PathBuf};
+
+    pub(super) const PREFIX: &str = "freenet-test-";
+    pub(super) const LOCK: &str = ".owner.lock";
+
+    pub(super) fn claim(tmp: &Path) -> PathBuf {
+        let pid = std::process::id();
+        #[cfg(unix)]
+        {
+            sweep(tmp);
+            for n in 0..64u32 {
+                let root = if n == 0 {
+                    tmp.join(format!("{PREFIX}{pid}"))
+                } else {
+                    tmp.join(format!("{PREFIX}{pid}-{n}"))
+                };
+                if unix::try_own(&root) {
+                    return root;
+                }
+            }
+        }
+        let root = tmp.join(format!("{PREFIX}{pid}"));
+        let _created = fs::create_dir_all(&root);
+        root
+    }
+
+    #[cfg(unix)]
+    pub(super) fn sweep(tmp: &Path) {
+        let Ok(entries) = fs::read_dir(tmp) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(suffix) = name.to_str().and_then(|n| n.strip_prefix(PREFIX)) else {
+                continue;
+            };
+            if suffix.is_empty() || !suffix.bytes().all(|b| b.is_ascii_digit() || b == b'-') {
+                continue;
+            }
+            // `DirEntry::file_type` does not follow symlinks.
+            if !entry.file_type().is_ok_and(|t| t.is_dir()) {
+                continue;
+            }
+            let root = entry.path();
+            if !unix::owned_by_me(&root) {
+                continue;
+            }
+            let Some(lock) = unix::try_lock_existing(&root) else {
+                continue;
+            };
+            let _stale = fs::remove_dir_all(&root);
+            drop(lock);
+        }
+    }
+
+    #[cfg(unix)]
+    pub(super) mod unix {
+        use super::LOCK;
+        use std::fs::{self, File, OpenOptions};
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+        use std::os::unix::io::AsRawFd;
+        use std::path::Path;
+
+        pub(in super::super) fn owned_by_me(path: &Path) -> bool {
+            // SAFETY: geteuid has no preconditions and cannot fail.
+            let me = unsafe { libc::geteuid() };
+            fs::symlink_metadata(path).is_ok_and(|m| m.is_dir() && m.uid() == me)
+        }
+
+        /// Exclusive non-blocking `flock`; `true` when acquired.
+        fn flock_exclusive(file: &File) -> bool {
+            // SAFETY: the fd is valid for the lifetime of `file`.
+            unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) == 0 }
+        }
+
+        /// The locked file is still the one at `<root>/LOCK`, i.e. no sweeper
+        /// removed the root between our open and our flock.
+        fn still_at_path(root: &Path, file: &File) -> bool {
+            match (fs::symlink_metadata(root.join(LOCK)), file.metadata()) {
+                (Ok(on_disk), Ok(held)) => {
+                    on_disk.dev() == held.dev() && on_disk.ino() == held.ino()
+                }
+                _ => false,
+            }
+        }
+
+        pub(in super::super) fn open_lock(root: &Path, create: bool) -> Option<File> {
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(create)
+                .custom_flags(libc::O_NOFOLLOW)
+                .open(root.join(LOCK))
+                .ok()
+        }
+
+        /// Lock an existing root's lock file; `None` if it has none, its
+        /// owner is alive, or it changed under us.
+        pub(in super::super) fn try_lock_existing(root: &Path) -> Option<File> {
+            let file = open_lock(root, false)?;
+            (flock_exclusive(&file) && still_at_path(root, &file)).then_some(file)
+        }
+
+        /// Create (or adopt a dead owner's) root and hold its lock for the
+        /// rest of the process.
+        pub(in super::super) fn try_own(root: &Path) -> bool {
+            if fs::create_dir_all(root).is_err() || !owned_by_me(root) {
+                return false;
+            }
+            let Some(file) = open_lock(root, true) else {
+                return false;
+            };
+            if !(flock_exclusive(&file) && still_at_path(root, &file)) {
+                return false;
+            }
+            // A dead owner's leftovers (same pid, reused): start empty.
+            if let Ok(entries) = fs::read_dir(root) {
+                for entry in entries.flatten() {
+                    if entry.file_name() == LOCK {
+                        continue;
+                    }
+                    let path = entry.path();
+                    let _leftover = if entry.file_type().is_ok_and(|t| t.is_dir()) {
+                        fs::remove_dir_all(&path)
+                    } else {
+                        fs::remove_file(&path)
+                    };
+                }
+            }
+            // Held until the process exits; the kernel releases it then.
+            std::mem::forget(file);
+            true
+        }
+    }
+}
+
 impl ConfigPathsArgs {
     fn merge(&mut self, other: ConfigPaths) {
         self.config_dir.get_or_insert(other.config_dir);
@@ -3884,7 +4063,7 @@ impl ConfigPathsArgs {
             } else {
                 "freenet".into()
             };
-            let temp_path = std::env::temp_dir().join(&base_name);
+            let temp_path = default_temp_root().join(&base_name);
 
             // Clean up stale temp directories from previous test runs that may have
             // different permissions (common on shared CI runners). If we can't remove
@@ -3892,7 +4071,7 @@ impl ConfigPathsArgs {
             // fallback path with process ID to avoid conflicts.
             if temp_path.exists() && fs::remove_dir_all(&temp_path).is_err() {
                 let unique_path =
-                    std::env::temp_dir().join(format!("{}-{}", base_name, std::process::id()));
+                    default_temp_root().join(format!("{}-{}", base_name, std::process::id()));
                 // Clean up any stale unique path too (unlikely but possible)
                 let _cleanup = fs::remove_dir_all(&unique_path);
                 return Ok(Either::Right(unique_path));
@@ -5925,6 +6104,92 @@ mod tests {
     use crate::transport::TransportKeypair;
 
     use super::*;
+
+    /// A test's `freenet-{id}` data dir is private to this process. The ids
+    /// are fixed strings and `default_dirs` deletes an existing dir of that
+    /// name, so a dir in a root shared with other processes was deleted by
+    /// any other process running the same test, failing this one with
+    /// `build Config: No such file or directory`. The dir another process
+    /// holds at the old shared location must survive. The id carries the pid
+    /// so that concurrent runs of this test do not share `shared` either.
+    #[test]
+    fn default_temp_dir_is_private_to_the_process() {
+        let pid = std::process::id();
+        let id = format!("default-dir-isolation-{pid}");
+        let shared = std::env::temp_dir().join(format!("freenet-{id}"));
+        fs::create_dir_all(shared.join("db")).unwrap();
+
+        let Either::Right(dir) = ConfigPathsArgs::default_dirs(Some(&id)).unwrap() else {
+            panic!("an id must resolve to a temp dir");
+        };
+
+        let survived = shared.join("db").exists();
+        let _cleanup = fs::remove_dir_all(&shared);
+        assert!(
+            survived,
+            "another process's dir at the shared path was deleted"
+        );
+        let root = dir.parent().expect("data dir has a parent");
+        assert_eq!(root.parent(), Some(std::env::temp_dir().as_path()));
+        let name = root.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        let own = format!("freenet-test-{pid}");
+        assert!(
+            name == own || name.starts_with(&format!("{own}-")),
+            "data dir root {root:?} is not private to pid {pid}"
+        );
+    }
+
+    /// The sweep removes only a root whose owner lock nobody holds. A live
+    /// owner, a root still being created (no lock file yet), a symlink and an
+    /// unrelated name must all survive.
+    #[cfg(unix)]
+    #[test]
+    fn stale_test_root_sweep_spares_live_and_foreign_entries() {
+        use test_temp_root::{LOCK, PREFIX, sweep, unix};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mk = |name: &str, lock: bool| {
+            let root = tmp.path().join(name);
+            fs::create_dir_all(root.join("freenet-x/db")).unwrap();
+            if lock {
+                fs::write(root.join(LOCK), b"").unwrap();
+            }
+            root
+        };
+        let stale = mk(&format!("{PREFIX}4000000001"), true);
+        let live = mk(&format!("{PREFIX}4000000002-1"), true);
+        let creating = mk(&format!("{PREFIX}4000000003"), false);
+        let unrelated = mk(&format!("{PREFIX}abc"), true);
+        let target = mk("not-a-test-root", true);
+        let link = tmp.path().join(format!("{PREFIX}4000000004"));
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let _held = unix::try_lock_existing(&live).expect("lock the live root");
+        sweep(tmp.path());
+
+        assert!(!stale.exists(), "unlocked root was not swept");
+        assert!(live.join("freenet-x/db").exists(), "live root was swept");
+        assert!(
+            creating.join("freenet-x/db").exists(),
+            "lockless root was swept"
+        );
+        assert!(unrelated.exists(), "non-matching name was swept");
+        assert!(link.exists(), "symlink was removed");
+        assert!(target.join("freenet-x/db").exists(), "symlink was followed");
+    }
+
+    /// A root whose name is already held by a live process is not shared:
+    /// `claim` moves on to a suffixed name, and each claimed root is locked.
+    #[cfg(unix)]
+    #[test]
+    fn claim_never_shares_a_held_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let first = test_temp_root::claim(tmp.path());
+        let second = test_temp_root::claim(tmp.path());
+        assert_ne!(first, second);
+        assert!(test_temp_root::unix::try_lock_existing(&first).is_none());
+        assert!(test_temp_root::unix::try_lock_existing(&second).is_none());
+    }
 
     /// The pool size is the multiplier in every per-worker memory budget
     /// (#5268 defect 3), so its clamp boundaries are load-bearing, not cosmetic:
