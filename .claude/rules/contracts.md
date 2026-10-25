@@ -97,11 +97,38 @@ brief: "gate on the #5730 Background grant"); an app granted under the older
 card text gets periodic runs without a new prompt. Revoking stops them at the
 next fire.
 
+Hosted nodes: every delegate run belongs to a user, and the node runs no
+delegate on its own. A client request runs under its connection's user; an
+inter-delegate hop runs its target under the originating user (secrets and
+context, via execute_delegate_hop's user_context), so a delegate that calls
+another makes the target run as the same user, as on a normal node. The node
+runs no contract notification and no lifecycle or wake-up run (no
+capabilities). A delegate's SubscribeContractRequest still succeeds: the
+subscription keeps the contract current on the node for the user's reads, but
+the delegate is not run for its changes. Two guards: the executor builds and
+sends no DelegateNotification on a hosted node
+(send_delegate_contract_notifications), and handle_delegate_notification
+returns after the registry sweep if one arrives. Routing a run's output to
+its own user (route_to_apps_for + Recipients::User, nobody when it has no
+user) is a backstop on a hosted node, not a live path: no hosted run delivers
+to apps today. The executor refuses an ApplicationMessages run
+with no user on a hosted node (is_hosted_run_without_user, logged at warn
+once per process, then debug: no client can send one, so it means a node path
+forgot the user). NEVER give
+a run on a hosted node the node-local secrets, and NEVER start a node-owned
+delegate run there; on a node that is not hosted nothing changes. The push
+registry stores a user's id, never the user's secret.
+
 Old delegate versions: a re-keyed delegate's OLD key keeps its record, and so
 its wake-ups, while any app stays bound to it. Only an unregister by a bound
 app from a local connection removes a binding (the record goes with the last
-one); a CLI or remote unregister does not. An app that re-keys should
-unregister the old key from its own tab once its migration is done.
+one); a CLI unregister does not. Only a local client may unregister a
+delegate at all. On a hosted node a user's unregister removes only that
+user's push registrations, a client without a user token is refused, and no
+client can remove the delegate itself: an operator does that by running the
+node without hosted mode. Secrets are never removed by an unregister. An app
+that re-keys should unregister the old key from its own tab once its
+migration is done.
 ```
 
 ### WASM Call Modes

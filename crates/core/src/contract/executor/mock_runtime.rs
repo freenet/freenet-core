@@ -753,6 +753,39 @@ where
         )))
     }
 
+    async fn execute_delegate_hop(
+        &mut self,
+        _req: DelegateRequest<'_>,
+        _caller_delegate: &DelegateKey,
+        _connection_scope: crate::client_events::ConnectionScope,
+        _user_context: Option<&UserSecretContext>,
+    ) -> Response {
+        Err(ExecutorError::other(anyhow::anyhow!(
+            "not supported in mock runtime"
+        )))
+    }
+
+    fn hosted_mode(&self) -> bool {
+        self.hosted_mode
+    }
+
+    // This executor runs no delegates, so it holds no delegate context.
+    fn take_delegate_context(
+        &mut self,
+        _delegate: &DelegateKey,
+        _user: Option<&crate::wasm_runtime::UserId>,
+    ) -> Option<Vec<u8>> {
+        None
+    }
+
+    fn restore_delegate_context(
+        &mut self,
+        _delegate: &DelegateKey,
+        _user: Option<&crate::wasm_runtime::UserId>,
+        _context: Vec<u8>,
+    ) {
+    }
+
     fn get_subscription_info(&self) -> Vec<crate::message::SubscriptionInfo> {
         vec![] // Mock implementation returns empty list
     }

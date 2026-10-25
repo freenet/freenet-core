@@ -13,9 +13,9 @@
 //! 1. ISOLATION — two hosted connections presenting DISTINCT `userToken`s store
 //!    a secret under the SAME delegate+key and each reads back its OWN value.
 //!    The per-user namespace (P1 `SecretScope::User`) keeps them apart.
-//! 2. NO-TOKEN = LOCAL — a hosted connection with no `userToken` operates on the
-//!    `SecretScope::Local` namespace, invisible to (and not seeing) the per-user
-//!    secrets above.
+//! 2. NO TOKEN, NO CLIENT API: a hosted connection with no `userToken` is
+//!    refused at the WS upgrade with 403. Every client-API request on a hosted
+//!    node runs under the presenting user's namespace.
 //! 3. GATE ENFORCEMENT — a hosted connection presenting a `userToken` but WITHOUT
 //!    `X-Forwarded-Proto: https` is rejected at the WS upgrade with 403
 //!    (the refuse-plaintext-token invariant).
@@ -232,8 +232,8 @@ impl TestNode {
     }
 }
 
-/// Poll the plain WS endpoint (no token) until it accepts a connection or the
-/// deadline passes. Used only as a readiness probe, then dropped.
+/// Poll the plain WS endpoint (no token) until the node answers (a hosted node
+/// refuses it with 403) or the deadline passes. Used only as a readiness probe.
 async fn wait_ws_ready(port: u16, within: Duration) -> anyhow::Result<()> {
     let url = format!("ws://127.0.0.1:{port}/v1/contract/command?encodingProtocol=native");
     let deadline = Instant::now() + within;
@@ -241,6 +241,18 @@ async fn wait_ws_ready(port: u16, within: Duration) -> anyhow::Result<()> {
         match connect_async(&url).await {
             Ok((stream, _)) => {
                 drop(stream);
+                return Ok(());
+            }
+            // A hosted node refuses a client-API connection without a user
+            // token; that refusal is the node answering, so the API is up.
+            // Only that refusal counts: any other 403 keeps waiting.
+            Err(tokio_tungstenite::tungstenite::Error::Http(response))
+                if response.status()
+                    == tokio_tungstenite::tungstenite::http::StatusCode::FORBIDDEN
+                    && response.body().as_deref().is_some_and(|b| {
+                        String::from_utf8_lossy(b).contains("requires a user token")
+                    }) =>
+            {
                 return Ok(());
             }
             Err(e) => {
@@ -389,12 +401,12 @@ async fn get_secret(
     }
 }
 
-/// Headline test: per-user isolation + no-token=Local, all through the live
-/// WS stack against a real executor.
+/// Headline test: per-user isolation, and no client API without a token, all
+/// through the live WS stack against a real executor.
 ///
-/// Token A stores VA, token B stores VB, the no-token (Local) connection stores
-/// VL — all under the SAME delegate and SAME secret key. Then each reads back
-/// and must see only its own value, and never another scope's value.
+/// Token A stores VA and token B stores VB under the SAME delegate and SAME
+/// secret key; each reads back only its own value. A connection without a
+/// token is refused.
 #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn hosted_mode_per_user_secret_isolation() -> anyhow::Result<()> {
     let node = TestNode::start(/* hosted_mode */ true).await?;
@@ -408,50 +420,59 @@ async fn hosted_mode_per_user_secret_isolation() -> anyhow::Result<()> {
     const SECRET_KEY: &[u8] = b"shared-secret-key";
     const VALUE_A: &[u8] = b"value-belonging-to-user-A";
     const VALUE_B: &[u8] = b"value-belonging-to-user-B";
-    const VALUE_LOCAL: &[u8] = b"value-on-the-local-namespace";
 
-    // --- Three connections: user A, user B, and a no-token (Local) one. ---
+    // --- A connection without a token is refused at the upgrade. ---
+    let mut tokenless =
+        format!("ws://127.0.0.1:{port}/v1/contract/command?encodingProtocol=native")
+            .into_client_request()?;
+    tokenless
+        .headers_mut()
+        .insert("x-forwarded-proto", "https".parse()?);
+    match connect_async(tokenless).await {
+        Err(tokio_tungstenite::tungstenite::Error::Http(response)) => {
+            let body = String::from_utf8_lossy(response.body().as_deref().unwrap_or_default())
+                .into_owned();
+            assert_eq!(response.status().as_u16(), 403, "body: {body}");
+            assert!(
+                body.contains("requires a user token"),
+                "refused by the user-token rule; got: {body}"
+            );
+        }
+        Err(e) => anyhow::bail!("unexpected error from a tokenless hosted connection: {e}"),
+        Ok(_) => anyhow::bail!("a hosted node must refuse a client-API connection without a token"),
+    }
+
+    // --- Two connections: user A and user B. ---
     let mut conn_a = connect_hosted(port, Some(TOKEN_A), true).await?;
     let mut conn_b = connect_hosted(port, Some(TOKEN_B), true).await?;
-    let mut conn_local = connect_hosted(port, None, true).await?;
 
     // RegisterDelegate is keyed by delegate (not by connection) and is
     // idempotent server-side, so registering on each connection is fine.
     register_delegate(&mut conn_a, &delegate, &delegate_key).await?;
     register_delegate(&mut conn_b, &delegate, &delegate_key).await?;
-    register_delegate(&mut conn_local, &delegate, &delegate_key).await?;
 
     // --- Each scope writes a DIFFERENT value under the SAME (delegate, key). ---
     store_secret(&mut conn_a, &delegate_key, SECRET_KEY, VALUE_A).await?;
     store_secret(&mut conn_b, &delegate_key, SECRET_KEY, VALUE_B).await?;
-    store_secret(&mut conn_local, &delegate_key, SECRET_KEY, VALUE_LOCAL).await?;
 
     // --- Each scope reads back its OWN value (isolation). ---
     let read_a = get_secret(&mut conn_a, &delegate_key, SECRET_KEY).await?;
     let read_b = get_secret(&mut conn_b, &delegate_key, SECRET_KEY).await?;
-    let read_local = get_secret(&mut conn_local, &delegate_key, SECRET_KEY).await?;
 
     assert_eq!(
         read_a.as_deref(),
         Some(VALUE_A),
-        "user A must read back A's value, not B's or Local's"
+        "user A must read back A's value, not B's"
     );
     assert_eq!(
         read_b.as_deref(),
         Some(VALUE_B),
-        "user B must read back B's value, not A's or Local's"
-    );
-    assert_eq!(
-        read_local.as_deref(),
-        Some(VALUE_LOCAL),
-        "the no-token (Local) connection must read back the Local value"
+        "user B must read back B's value, not A's"
     );
 
-    // Cross-checks: the three values are genuinely distinct, so the equalities
+    // Cross-check: the two values are genuinely distinct, so the equalities
     // above prove non-overlap rather than coincidental agreement.
     assert_ne!(read_a, read_b, "A and B must not share a namespace");
-    assert_ne!(read_a, read_local, "A and Local must not share a namespace");
-    assert_ne!(read_b, read_local, "B and Local must not share a namespace");
 
     // A fresh connection re-presenting TOKEN_A must see A's value — the per-user
     // namespace is durable across connections, keyed only by the token.
@@ -464,7 +485,7 @@ async fn hosted_mode_per_user_secret_isolation() -> anyhow::Result<()> {
         "reconnecting with TOKEN_A must see A's durable per-user secret"
     );
 
-    drop((conn_a, conn_b, conn_local, conn_a2));
+    drop((conn_a, conn_b, conn_a2));
     node.shutdown().await;
     Ok(())
 }

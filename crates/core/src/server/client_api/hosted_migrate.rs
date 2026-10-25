@@ -577,6 +577,10 @@ struct PullImportRequest {
 /// SAME loopback + trusted-origin gate as the live import, so only the node's
 /// own confirmation page can drive it.
 async fn pull_import_handler(req: axum::extract::Request) -> Response {
+    // The pull-import writes the node-local scope, like the live import.
+    if let Some(refused) = super::hosted_import::refuse_on_hosted_node(req.extensions()) {
+        return refused;
+    }
     let (parts, body) = req.into_parts();
     let headers = &parts.headers;
 

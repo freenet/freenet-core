@@ -66,6 +66,7 @@ impl UserInputPrompter for AllowAll {
         _request: &UserInputRequest<'static>,
         _delegate_key: &str,
         _caller: CallerIdentity,
+        _owner: Option<crate::wasm_runtime::UserId>,
     ) -> Option<(usize, ClientResponse<'static>)> {
         None
     }

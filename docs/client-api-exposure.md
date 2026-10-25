@@ -88,8 +88,9 @@ Three messages, all after the logger is up:
 - **The bind was re-derived and widened.** Your config named a loopback address,
   and `--allowed-source-cidrs` widened past it. Said loudly because the socket
   ended up more exposed than the file it replaced.
-- **Exposure warning.** The API is reachable from beyond this machine while
-  every connection that presents no per-user token shares one namespace. Fires
+- **Exposure warning.** The API is reachable from beyond this machine, on a
+  node where connections share one namespace (hosted mode off, or a bind that
+  hosted mode does not expect). Fires
   for a non-loopback bind, and for `--allowed-host` on a loopback bind with
   hosted mode off — a proxy terminates the connection itself, so every visitor
   arrives looking local and the source-IP filters cannot tell them apart.
@@ -105,13 +106,42 @@ to the invocation if you need it back.
 ## Hosted mode
 
 `--hosted-mode` gives each connection presenting a `userToken` its own
-delegate-secret namespace. It adds isolation for well-behaved clients; it does
-not remove the shared namespace. A connection that simply omits the token still
-lands in the node's single-user context. So hosted mode does not make a
-non-loopback bind safe, and the exposure warning fires for one regardless.
+delegate-secret namespace. A hosted node serves its client API only to a
+connection that presents a user token: a WebSocket upgrade without one is
+refused with 403. A hosted node also refuses the live import and the migration
+pull-import, which are for a user's own node. A token is honoured only from a
+loopback source carrying
+`X-Forwarded-Proto: https`, so a hosted node belongs behind a same-host TLS
+proxy on a loopback bind. A non-loopback bind is not what hosted mode expects,
+and the exposure warning fires for one regardless.
 
-**Known gap:** on a loopback bind with hosted mode on, **no warning fires** —
-including when a reverse proxy is in front of the node. Treat that silence as
-"not yet reported", not as "checked and safe". If you run a hosted node behind a
-public proxy, keep an eye on the shared namespace yourself; making the warning
-conditional on what is actually in it is tracked separately.
+A hosted node also requires the user token on the permission-prompt routes and
+shows each user only their own prompts. `/permission/pending`,
+`/permission/{nonce}/respond` and the permission WebSocket
+`/permission/events/ws` take the token in the `X-Freenet-User-Token` header (the
+WebSocket also accepts `?userToken=`, since a browser cannot set a header on a
+WebSocket handshake), under the same loopback and `X-Forwarded-Proto: https`
+rule; without it they answer 403. A prompt belongs to the user whose delegate
+run raised it: another user's prompt is not listed, not sent, and answers 404
+like an unknown one. On a hosted node every delegate run belongs to a user (a
+client request runs under its connection's user, an inter-delegate message
+under the originating user, and the node runs no delegate on its own), so a
+prompt with no user is refused rather than shown to anyone. One user token holds
+at most 8 pending prompts; the node-wide limit of 32 is shared by all tokens.
+The legacy `/permission/events` stream, the standalone
+`/permission/{nonce}` page and the capability-grant routes
+(`/permission/grants`, `/permission/grants/revoke`, `/permission/apps`) are not
+served on a hosted node. The 64 permission-socket slots are node-wide and
+shared by all users; a tab that gets no slot falls back to polling
+`/permission/pending`. On a node that is not hosted these routes take no
+token and behave as before.
+
+The token travels in the URL query on the two WebSockets (the app socket and
+the permission socket), since a browser cannot set a header on a WebSocket
+handshake. The node records full request URIs only at debug level, which
+release builds compile out; configure the reverse proxy's access log to omit
+query strings.
+
+On a loopback bind with hosted mode on, no exposure warning fires, including
+when a reverse proxy is in front of the node: every client-API connection
+there presents its own user token.

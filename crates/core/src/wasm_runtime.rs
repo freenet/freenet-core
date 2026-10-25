@@ -66,7 +66,10 @@ impl SharedStores {
     }
 }
 pub(crate) use engine::BackendEngine;
-pub(crate) use error::{ContractError, DELEGATE_PARAMS_MISMATCH, RuntimeInnerError, RuntimeResult};
+pub(crate) use error::{
+    ContractError, DELEGATE_HOSTED_RUN_WITHOUT_USER, DELEGATE_PARAMS_MISMATCH,
+    DELEGATE_UNREGISTER_HOSTED, DELEGATE_UNREGISTER_NOT_LOCAL, RuntimeInnerError, RuntimeResult,
+};
 pub use mock_state_storage::MockStateStorage;
 #[cfg(test)]
 pub(crate) use module_cache::combine_ram_limits;
@@ -106,6 +109,12 @@ pub(crate) use native_api::time::override_contract_clock;
 // naming the type, so gate the re-export to avoid an unused-import warning.
 #[cfg(test)]
 pub(crate) use native_api::InheritedOriginsEntry;
+// Built directly only by tests that seed the delegate context store.
+#[cfg(test)]
+pub(crate) use native_api::DelegateContextEntry;
+// Read only by the test-only `declared_cache_ceiling_terms` aggregate.
+#[cfg(test)]
+pub(crate) use native_api::delegate_context_budget_for;
 pub use runtime::{ContractExecError, Runtime};
 pub(crate) use runtime::{
     RuntimeConfig, SharedModuleCache, default_wasmtime_cache_size_bytes_for_dir,

@@ -145,6 +145,26 @@ pub(super) fn routes(version: ApiVersion) -> Router {
         .layer(DefaultBodyLimit::max(MAX_IMPORT_BUNDLE_BYTES))
 }
 
+/// A hosted node takes no import into its node-local scope: an import is for a
+/// user's own node, and a hosted node's visitors each have their own user scope
+/// (its client API is served only with a user token). Returns the refusal for a
+/// request on a hosted node, `None` otherwise. A missing `HostedMode` extension (a standalone composition) is
+/// a node that is not hosted, as for the export and mint routes. Shared by
+/// `POST /v{1,2}/import` and the migration pull-import, which writes the same
+/// scope.
+pub(crate) fn refuse_on_hosted_node(extensions: &axum::http::Extensions) -> Option<Response> {
+    let hosted = extensions
+        .get::<crate::server::HostedMode>()
+        .is_some_and(|hm| hm.0);
+    hosted.then(|| {
+        (
+            StatusCode::FORBIDDEN,
+            "a hosted Freenet node does not import into its node-local scope",
+        )
+            .into_response()
+    })
+}
+
 /// Apply the live-import gate. Pure + unit-testable: takes the request's headers,
 /// the kernel-set source IP, the host/CIDR allowlists, the (raw) query string,
 /// and the origin-contract map, and decides whether the request may import.
@@ -328,6 +348,9 @@ fn parse_key_kind(headers: &HeaderMap) -> Result<BundleKeyKind, (StatusCode, &'s
 /// extractor feature. The body is read AFTER the gate + readiness checks so an
 /// unauthorized or not-ready request never makes the node buffer a large bundle.
 async fn import_handler(req: axum::extract::Request) -> Response {
+    if let Some(refused) = refuse_on_hosted_node(req.extensions()) {
+        return refused;
+    }
     let (parts, body) = req.into_parts();
     let headers = &parts.headers;
 
@@ -512,6 +535,66 @@ mod tests {
     use super::*;
     use axum::http::HeaderValue;
     use std::net::{Ipv4Addr, Ipv6Addr};
+
+    /// On a hosted node the live import and the migration pull-import are
+    /// refused, from a request that would otherwise pass their gate (loopback
+    /// source, localhost origin). On a node that is not hosted the same
+    /// request is not refused by this rule.
+    ///
+    /// FALSIFY by removing the `refuse_on_hosted_node` call from either
+    /// handler: that route answers with something else.
+    #[tokio::test]
+    async fn a_hosted_node_refuses_imports_into_its_local_scope() {
+        use axum::body::Body;
+        use tower::ServiceExt;
+
+        let request = |path: &str| {
+            axum::http::Request::post(path)
+                .header("origin", "http://localhost")
+                .extension(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 40000))))
+                .body(Body::empty())
+                .unwrap()
+        };
+        for hosted in [true, false] {
+            for (path, router) in [
+                ("/v1/import", routes(ApiVersion::V1)),
+                ("/v2/import", routes(ApiVersion::V2)),
+                (
+                    "/v1/hosted/pull-import",
+                    super::super::hosted_migrate::routes(ApiVersion::V1),
+                ),
+                (
+                    "/v2/hosted/pull-import",
+                    super::super::hosted_migrate::routes(ApiVersion::V2),
+                ),
+            ] {
+                let response = router
+                    .layer(axum::Extension(crate::server::HostedMode(hosted)))
+                    .oneshot(request(path))
+                    .await
+                    .unwrap();
+                let status = response.status();
+                let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                let refused_by_rule = String::from_utf8_lossy(&body)
+                    .contains("does not import into its node-local scope");
+                if hosted {
+                    assert_eq!(status, StatusCode::FORBIDDEN, "{path}");
+                    assert!(refused_by_rule, "{path}: refused by the hosted rule");
+                } else {
+                    assert!(
+                        !refused_by_rule,
+                        "{path}: a node that is not hosted keeps its import"
+                    );
+                    // The route exists and the request passed its gate: it fails
+                    // later (no node behind this router), not as an unknown path.
+                    assert_ne!(status, StatusCode::NOT_FOUND, "{path}");
+                    assert_ne!(status, StatusCode::FORBIDDEN, "{path}");
+                }
+            }
+        }
+    }
 
     const LOOPBACK: Option<IpAddr> = Some(IpAddr::V4(Ipv4Addr::LOCALHOST));
     const LOCAL_ORIGIN: &str = "http://127.0.0.1:50509";

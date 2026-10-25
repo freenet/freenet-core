@@ -445,11 +445,38 @@ untrusted web users, each getting their own per-user delegate-secret
 namespace derived from a durable `userToken` they present on the
 WebSocket upgrade. When hosted mode is OFF, `userToken` is ignored and
 every connection is single-user — byte-for-byte the pre-#4381 behavior.
+With hosted mode ON, a node serves its client API only to a connection
+that presents a user token: an upgrade without one is refused with 403.
 
 The `userToken` is a durable, node-independent, high-value credential:
 it names a per-user secret namespace and is valid against any hosted
 node. So the node honors it ONLY over a connection it can prove is
 secure.
+
+### Every delegate run belongs to a user
+
+On a hosted node the node-local secret namespace belongs to no client, so
+no delegate run uses it. Every run has a user:
+
+- A client request runs under the user of the connection that sent it.
+- An inter-delegate message (one delegate sending to another) runs its
+  target under the user whose request led to it: that user's secrets and
+  delegate context for the target. The user comes from the connection,
+  never from the message. So a delegate that calls another delegate makes
+  that target run as the same user, as on a normal node, where both run
+  under the node-local secrets. The target sees the calling delegate as
+  the message's attested origin and decides what to allow it.
+- The node runs no delegate on its own: no contract notifications, and no
+  lifecycle or wake-up runs. A delegate may still subscribe to a contract:
+  the subscription keeps the contract current on the node, so the user's
+  reads of it stay fresh, but the delegate is not run when the contract
+  changes. Its app reads the state it needs when the user's connection
+  asks.
+
+The node refuses a delegate run without a user on a hosted node before
+the delegate runs, and no run on a hosted node reads the node-local
+namespace. On a node that is not hosted none of this applies: every run
+uses the node-local namespace.
 
 ### The gate
 

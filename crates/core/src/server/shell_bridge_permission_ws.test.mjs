@@ -44,11 +44,17 @@ function extractFrom(begin, end, needle) {
   return region.slice(fnStart);
 }
 
-const { permSocketUrl, nextPermReconnectDelay, permReconnectJitter, permEventAction } =
-  new Function(
-    `${extractFrom('perm-ws-decisions:BEGIN', 'perm-ws-decisions:END', 'function permSocketUrl(')}\n` +
-      'return { permSocketUrl, nextPermReconnectDelay, permReconnectJitter, permEventAction };',
-  )();
+const {
+  permSocketUrl,
+  permTokenFor,
+  permAuthHeaders,
+  nextPermReconnectDelay,
+  permReconnectJitter,
+  permEventAction,
+} = new Function(
+  `${extractFrom('perm-ws-decisions:BEGIN', 'perm-ws-decisions:END', 'function permSocketUrl(')}\n` +
+    'return { permSocketUrl, permTokenFor, permAuthHeaders, nextPermReconnectDelay, permReconnectJitter, permEventAction };',
+)();
 
 let failures = 0;
 function check(name, cond) {
@@ -93,6 +99,39 @@ function check(name, cond) {
     'host carries the port through',
     permSocketUrl({ protocol: 'http:', host: 'localhost:1234' }).includes('localhost:1234'),
   );
+}
+
+// 2b. The hosted user's token on the permission routes. A hosted node requires
+//     it on /permission/pending, /permission/{nonce}/respond and the
+//     permission WebSocket, and shows each user only their own prompts. It may
+//     travel only from a page served over https; on a node that is not hosted
+//     there is no token and every request must be exactly as before.
+{
+  const https = { protocol: 'https:', host: 'node.example:443' };
+  const http = { protocol: 'http:', host: '127.0.0.1:7509' };
+  check('permTokenFor: https page with a token -> the token', permTokenFor('tok-1', https) === 'tok-1');
+  check('permTokenFor: http page with a token -> null', permTokenFor('tok-1', http) === null);
+  check('permTokenFor: no token -> null', permTokenFor(undefined, https) === null);
+  check('permTokenFor: empty token -> null', permTokenFor('', https) === null);
+
+  check(
+    'permSocketUrl carries the token in the query, encoded',
+    permSocketUrl(https, 'a b&c') ===
+      'wss://node.example:443/permission/events/ws?userToken=' + encodeURIComponent('a b&c'),
+  );
+  check(
+    'permSocketUrl never puts a token on a ws:// URL',
+    permSocketUrl(http, 'tok-1') === 'ws://127.0.0.1:7509/permission/events/ws',
+  );
+  check(
+    'permSocketUrl with no token is unchanged',
+    permSocketUrl(https, null) === 'wss://node.example:443/permission/events/ws',
+  );
+
+  const withToken = permAuthHeaders('tok-2');
+  check('permAuthHeaders(token) sets the user-token header', withToken['X-Freenet-User-Token'] === 'tok-2');
+  check('permAuthHeaders(null) sets nothing', Object.keys(permAuthHeaders(null)).length === 0);
+  check('permAuthHeaders returns a fresh object each call', permAuthHeaders('t') !== permAuthHeaders('t'));
 }
 
 // 3. Backoff curve: doubles, then pins at the ceiling. Without the ceiling a
@@ -174,7 +213,7 @@ function check(name, cond) {
 //    The region is run against stubbed `WebSocket`, timers and `fetch`, so no
 //    real IO happens and time is advanced by hand.
 {
-  function buildMachine() {
+  function buildMachine(opts = {}) {
     const calls = {
       polls: 0,
       stops: 0,
@@ -267,6 +306,7 @@ function check(name, cond) {
       'console',
       'calls',
       'overlayCards',
+      'permUserToken',
       `
       function reconcileFromPending() { calls.reconciles++; }
       function showCard(nonce) { calls.shown.push(nonce); overlayCards[nonce] = {}; }
@@ -297,10 +337,11 @@ function check(name, cond) {
       setIntervalStub,
       clearIntervalStub,
       mathStub,
-      { protocol: 'http:', host: '127.0.0.1:7509' },
+      opts.location || { protocol: 'http:', host: '127.0.0.1:7509' },
       { warn: (...a) => calls.warnings.push(a.join(' ')) },
       calls,
       overlayCards,
+      opts.permUserToken === undefined ? null : opts.permUserToken,
     );
     return { machine, calls, advance, timers, overlayCards, liveIntervals };
   }
@@ -316,6 +357,20 @@ function check(name, cond) {
     check(
       'the socket URL is the ws endpoint',
       calls.sockets[0].url === 'ws://127.0.0.1:7509/permission/events/ws',
+    );
+  }
+
+  // 6a'. A hosted shell opens the permission socket with its token, so the
+  //      node can tell which user's prompts to send.
+  {
+    const { machine, calls } = buildMachine({
+      location: { protocol: 'https:', host: 'node.example' },
+      permUserToken: 'tok-ws',
+    });
+    machine.openPermSocket();
+    check(
+      'a hosted shell puts its token on the permission socket URL',
+      calls.sockets[0].url === 'wss://node.example/permission/events/ws?userToken=tok-ws',
     );
   }
 
@@ -743,6 +798,8 @@ function check(name, cond) {
     'createCard',
     'hideCard',
     'ctl',
+    'permAuthHeaders',
+    'permUserToken',
     // The REAL removal-memory block, extracted and run — not a harness copy.
     // A duplicate here is how four mutations to the shipped guard (delete it,
     // never stamp, prune instantly, revert the in-flight fix wholesale) all
@@ -799,6 +856,8 @@ function check(name, cond) {
         createCard,
         hideCard,
         ctl,
+        permAuthHeaders,
+        null,
       ),
       // `elapsed` ADVANCES THE CLOCK before the response lands. Without it the
       // fixture froze time across the fetch, so `permNow()` at response time
@@ -854,6 +913,8 @@ function check(name, cond) {
         createCard,
         hideCard,
         ctl,
+        permAuthHeaders,
+        null,
       ),
       settle: async () => {
         release();
@@ -1174,6 +1235,110 @@ function check(name, cond) {
       body.includes('_fnShownAt = permNow()'),
     );
   }
+}
+
+// 8. The pending fetch and the answer POST carry the hosted user's token, and
+//    on a node that is not hosted they carry no token header at all.
+{
+  const reconcileSrc = extractFrom(
+    'perm-reconcile:BEGIN',
+    'perm-reconcile:END',
+    'function reconcileFromPending(',
+  );
+  const removalMemorySrc = extractFrom(
+    'perm-removal-memory:BEGIN',
+    'perm-removal-memory:END',
+    'var REMOVAL_MEMORY_MS',
+  );
+  const makeReconcileT = new Function(
+    'permNow',
+    'fetch',
+    'overlayCards',
+    'showCard',
+    'createCard',
+    'hideCard',
+    'permAuthHeaders',
+    'permUserToken',
+    `${removalMemorySrc}\n${reconcileSrc}\nreturn reconcileFromPending;`,
+  );
+  function pendingFetchInit(token) {
+    let seen = null;
+    const fetchStub = (url, init) => {
+      seen = { url, init };
+      return new Promise(() => {});
+    };
+    makeReconcileT(
+      () => 0,
+      fetchStub,
+      {},
+      () => {},
+      () => ({}),
+      () => {},
+      permAuthHeaders,
+      token,
+    )();
+    return seen;
+  }
+  const hosted = pendingFetchInit('tok-pending');
+  check('the pending fetch goes to /permission/pending', hosted && hosted.url === '/permission/pending');
+  check(
+    'a hosted shell sends its token on the pending fetch',
+    !!(hosted && hosted.init && hosted.init.headers &&
+      hosted.init.headers['X-Freenet-User-Token'] === 'tok-pending'),
+  );
+  const plain = pendingFetchInit(null);
+  check(
+    'a shell with no token sends no token header on the pending fetch',
+    !!plain && !(plain.init && plain.init.headers && 'X-Freenet-User-Token' in plain.init.headers),
+  );
+
+  const respondSrc = extractFrom('perm-respond:BEGIN', 'perm-respond:END', 'function respondToPrompt(');
+  const makeRespond = new Function(
+    'fetch',
+    'hideCard',
+    'permAuthHeaders',
+    'permUserToken',
+    `${respondSrc}\nreturn respondToPrompt;`,
+  );
+  function respondInit(token) {
+    let seen = null;
+    const fetchStub = (url, init) => {
+      seen = { url, init };
+      return new Promise(() => {});
+    };
+    const card = { querySelectorAll: () => [] };
+    makeRespond(fetchStub, () => {}, permAuthHeaders, token)('n-1', 0, card);
+    return seen;
+  }
+  const answer = respondInit('tok-respond');
+  check('the answer POSTs to the nonce route', !!answer && answer.url === '/permission/n-1/respond');
+  check(
+    'a hosted shell sends its token with an answer',
+    !!answer && answer.init.headers['X-Freenet-User-Token'] === 'tok-respond',
+  );
+  check(
+    'the answer is still JSON',
+    !!answer && answer.init.headers['Content-Type'] === 'application/json',
+  );
+  const plainAnswer = respondInit(null);
+  check(
+    'a shell with no token sends no token header with an answer',
+    !!plainAnswer && !('X-Freenet-User-Token' in plainAnswer.init.headers),
+  );
+
+  // The shell takes its permission token from permTokenFor, the https-only
+  // helper tested above, and from nothing else: exactly one assignment to
+  // permUserToken in code (comment lines excluded), and it is that one.
+  const codeLines = src
+    .split('\n')
+    .map((l) => l.trim())
+    .filter((l) => !l.startsWith('//') && !l.startsWith('*') && !l.startsWith('/*'));
+  const assignments = codeLines.filter((l) => /\bpermUserToken\s*=[^=]/.test(l));
+  check(
+    'permUserToken is assigned once, through permTokenFor',
+    assignments.length === 1 &&
+      assignments[0] === 'var permUserToken = permTokenFor(userToken, location);',
+  );
 }
 
 if (failures > 0) {

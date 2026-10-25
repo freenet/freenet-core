@@ -99,8 +99,15 @@ pub(super) const RABBIT_SVG_PATH: &str = concat!(
 );
 
 /// Handler for `GET /` — returns a self-contained HTML dashboard.
-pub(super) async fn homepage() -> impl IntoResponse {
-    Html(homepage_html())
+///
+/// The hosted-mode flag is read tolerantly: a composition without it is not a
+/// hosted node, and the flag only decides whether the "Apps and permissions"
+/// card is shown.
+pub(super) async fn homepage(
+    hosted_mode: Option<axum::Extension<crate::server::HostedMode>>,
+) -> impl IntoResponse {
+    let hosted = hosted_mode.is_some_and(|axum::Extension(h)| h.0);
+    Html(homepage_html_for(network_status::get_snapshot(), hosted))
 }
 
 /// Handler for `GET /peer/{address}` — returns a detail page for a single peer.
@@ -120,8 +127,22 @@ pub(super) async fn contract_detail(Path(key): Path<String>) -> impl IntoRespons
     Html(contract_detail_html(&key))
 }
 
+#[cfg(test)]
 fn homepage_html() -> String {
-    homepage_html_for(network_status::get_snapshot())
+    homepage_html_for(network_status::get_snapshot(), false)
+}
+
+/// The "Apps and permissions" card. Empty on a hosted node, which does not
+/// serve `/permission/apps`.
+fn apps_card(hosted: bool) -> &'static str {
+    if hosted {
+        ""
+    } else {
+        r#"<div class="card">
+            <h2>Apps and permissions</h2>
+            <p class="note">Permissions you have given apps, such as running in the background. <a href="/permission/apps">Review or revoke</a>.</p>
+        </div>"#
+    }
 }
 
 /// Renders the homepage from an explicit snapshot rather than reading the
@@ -138,7 +159,7 @@ fn homepage_html() -> String {
 /// snapshot, the rendered title silently changes — an order/timing
 /// dependency `homepage_html()`'s old single-source-of-truth read could not
 /// be isolated from.
-fn homepage_html_for(snap: Option<network_status::NetworkStatusSnapshot>) -> String {
+fn homepage_html_for(snap: Option<network_status::NetworkStatusSnapshot>, hosted: bool) -> String {
     let (version, uptime) = match &snap {
         Some(s) => (s.version.as_str(), format_duration(s.elapsed_secs)),
         None => ("?", "0s".to_string()),
@@ -213,12 +234,31 @@ fn homepage_html_for(snap: Option<network_status::NetworkStatusSnapshot>) -> Str
         ban_list_card = ban_list_card,
         contracts_card = contracts_card,
         ops_card = ops_card,
+        apps_card = apps_card(hosted),
     )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A hosted node does not serve `/permission/apps`, so its home page does
+    /// not link to it; a node that is not hosted keeps the link.
+    ///
+    /// FALSIFY: make `homepage` ignore its hosted flag (pass `false`).
+    #[tokio::test]
+    async fn the_hosted_home_page_does_not_link_to_the_apps_page() {
+        use axum::body::to_bytes;
+        async fn body(hosted: Option<bool>) -> String {
+            let resp = homepage(hosted.map(|h| axum::Extension(crate::server::HostedMode(h))))
+                .await
+                .into_response();
+            String::from_utf8(to_bytes(resp.into_body(), 1 << 22).await.unwrap().to_vec()).unwrap()
+        }
+        assert!(!body(Some(true)).await.contains("/permission/apps"));
+        assert!(body(Some(false)).await.contains("/permission/apps"));
+        assert!(body(None).await.contains("/permission/apps"));
+    }
     // Explicit imports from submodules (not re-exported from root).
     use super::assets::JS;
     use super::cards::{
@@ -1216,7 +1256,7 @@ mod tests {
         // (which reads the process-global `network_status` snapshot) — see
         // `homepage_html_for`'s doc comment for why that global made this
         // test order/timing-dependent (#5732).
-        let html = homepage_html_for(None);
+        let html = homepage_html_for(None, false);
         assert!(
             html.contains("<title>\u{26A1} Dashboard</title>"),
             "with no snapshot, the homepage must render the 'trying to \

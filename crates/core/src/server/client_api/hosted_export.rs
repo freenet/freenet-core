@@ -27,8 +27,8 @@
 //! ([`decide_user_token`], [`is_loopback_source`], [`derive_user_context`]) are
 //! shared verbatim with the WS middleware — this module only adds the
 //! export-specific twist that a no-token / `Local` outcome is REJECTED (an
-//! export of "no user scope" is meaningless here), whereas the WS path lets a
-//! tokenless connection fall through to `Local`.
+//! export of "no user scope" is meaningless here). The WS path likewise refuses
+//! a tokenless connection on a hosted node.
 //!
 //! ## Threat model: the token is the entire secret
 //!
@@ -153,8 +153,8 @@ pub(super) fn routes(version: ApiVersion) -> Router {
 /// the WebSocket `userToken` honor IDENTICAL security rules. The one
 /// difference, intrinsic to export: `Local` (no/empty token) is REJECTED here,
 /// because exporting "no user scope" is meaningless — the user must present
-/// their token. The WS path instead lets `Local` through (a tokenless
-/// connection legitimately uses the single-user namespace).
+/// their token. The WS path likewise refuses a tokenless connection on a
+/// hosted node (`websocket_commands`).
 ///
 /// On rejection returns `(StatusCode::FORBIDDEN, reason)`; the reason is a
 /// fixed, non-secret string (never echoes the token).

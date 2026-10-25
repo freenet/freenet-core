@@ -24,6 +24,17 @@ lifecycle. It:
 3. waits until the shell route serves over HTTP, then
 4. runs this Playwright project with the shell URL in `FREENET_SHELL_URL`.
 
+Specs tagged `@hosted` (in `tests/permission-user-token.spec.ts`) need a
+hosted node behind TLS, so they run in a second harness test,
+`hosted_shell_permission_token_via_playwright`. It publishes the fixture on a
+standalone node that is not hosted, restarts the same data directory in hosted
+mode, puts `hosted-tls-proxy.mjs` in front of it (https with the test
+certificate in `crates/core/tests/data/tls_native_roots/`, adding
+`X-Forwarded-Proto: https` as a same-host TLS proxy does), and runs
+`npx playwright test --grep @hosted`. The first harness test runs every other
+spec with `--grep-invert @hosted`. Without `FREENET_PLAYWRIGHT=1` the hosted
+test returns before booting any node.
+
 The Playwright step is opt-in: the harness only launches the browser when
 `FREENET_PLAYWRIGHT=1`. A plain `cargo test`/`cargo nextest` run publishes the
 fixture, confirms the shell serves, and returns early — so a checkout without

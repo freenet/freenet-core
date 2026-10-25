@@ -2486,6 +2486,14 @@ where
     /// Delegates that require guaranteed delivery should poll contract state
     /// periodically as a fallback.
     fn send_delegate_contract_notifications(&self, key: &ContractKey, new_state: &WrappedState) {
+        // On a hosted node every delegate run belongs to a user, and the node
+        // runs no delegate on its own, so no notification is built or sent.
+        // A delegate's subscription still keeps the contract current on the
+        // node; the delegate is not run for its changes. The contract loop
+        // checks again before running one (`handle_delegate_notification`).
+        if self.hosted_mode {
+            return;
+        }
         let tx = match &self.delegate_notification_tx {
             Some(tx) => tx,
             None => return,

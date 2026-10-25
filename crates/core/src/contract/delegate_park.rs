@@ -5,9 +5,13 @@
 //!
 //! A delegate round-trip is already a two-invocation protocol at the runtime
 //! level: `RequestUserInput` breaks out of `process_outbound`, the WASM
-//! `process()` call returns, and the delegate's continuation lives in the
+//! `process()` call returns, and the delegate's continuation is the context it
+//! wrote to the
 //! [`DelegateContextCache`](crate::wasm_runtime::native_api::DelegateContextCache)
-//! until the executor re-enters with the matching `UserResponse`.
+//! until the executor re-enters with the matching `UserResponse`. While the
+//! run is parked, the park holds that context ([`Continuation::context`]) and
+//! puts it back in the cache when the run resumes, so the cache's byte budget
+//! cannot drop it during the wait.
 //!
 //! What made that round-trip look atomic was that
 //! `handle_delegate_with_contract_requests` awaited the slow half INLINE, on
@@ -22,8 +26,8 @@
 //!
 //! # Why this needs per-delegate exclusion
 //!
-//! The context cache is keyed by `DelegateKey` alone and is last-write-wins.
-//! It is only sound while at most ONE `process()` per delegate is in flight,
+//! The context cache has one entry per delegate and hosted user, and each entry
+//! is last-write-wins. It is only sound while at most ONE `process()` per delegate is in flight,
 //! and — see that type's rustdoc, corrected in this same change — that
 //! property is supplied ENTIRELY by the serial loop, not by the runtime. There
 //! is no per-delegate lock in `prepare_delegate_call`, no per-delegate
@@ -31,9 +35,10 @@
 //! in `wasm_runtime::delegate`.
 //!
 //! So the moment a round-trip spans two loop iterations, that protection is
-//! gone: a second request for the same delegate would run `process()`, write
-//! the shared context, and the parked continuation would resume reading
-//! someone else's bytes. Silent state corruption, not a crash.
+//! gone: a second request for the same delegate would run `process()` in the
+//! middle of the round-trip, reading no context and writing one that is
+//! overwritten when the parked run's context is put back. Silent state
+//! corruption, not a crash.
 //!
 //! [`DelegateParkCtx`] therefore keeps its own per-delegate exclusion: while a
 //! delegate is parked, further requests for it are QUEUED rather than run, and
@@ -66,7 +71,8 @@
 //! Why the global property still holds after #5544, by construction rather than
 //! by convention:
 //!
-//! 1. `execute_delegate_request` is reached ONLY through
+//! 1. `execute_delegate_request` and `execute_delegate_hop` (the
+//!    inter-delegate hop) are reached ONLY through
 //!    `handle_delegate_with_contract_requests`.
 //! 2. Every route into that function is awaited, directly or one hop removed,
 //!    from `contract_handling` — a single task per node:
@@ -80,7 +86,8 @@
 //!                                  └─► run_queued_notification ────────┘
 //!                                                                      │
 //!                          handle_delegate_with_contract_requests ◄─────┘
-//!                                      └─► execute_delegate_request
+//!                                      ├─► execute_delegate_request
+//!                                      └─► execute_delegate_hop
 //!    ```
 //!
 //!    Stated as the PROPERTY — every route is awaited from the one loop — and
@@ -416,6 +423,8 @@ pub(super) fn continuation_bytes(continuation: &Continuation) -> ByteCount {
         // `params` is delegate-supplied and retained for the life of the park.
         // Omitting it was one of three ways this "byte bound" failed to bound.
         + ByteCount::new(continuation.params.as_ref().len())
+        // The parked run's delegate context, held here while it waits.
+        + ByteCount::new(continuation.context.as_ref().map_or(0, Vec::len))
 }
 
 /// Approximate bytes an off-loop task retains for one park: the prompts it is
@@ -1125,6 +1134,13 @@ pub(super) struct Continuation {
     /// Charge this run's resumed legs to the node duty bucket too (lifecycle
     /// and wake-up runs); see `ParkingCtx::node_wide_duty`.
     pub node_wide_duty: bool,
+    /// The delegate context the run left when it parked, taken out of the
+    /// context cache and put back when the run resumes. The cache drops its
+    /// oldest entries when it is over budget, and a parked run's entry is
+    /// older than anything written while it waits, so it is held here rather
+    /// than left there. Counted by [`continuation_bytes`], so the park byte
+    /// budget bounds it.
+    pub context: Option<Vec<u8>>,
 }
 
 /// One parked delegate.
@@ -1708,6 +1724,14 @@ pub(super) enum QueueOutcome {
     Rejected(Box<PendingRun>),
 }
 
+/// Client runs queued behind a park, per delegate, for tests that must wait
+/// until a request is actually queued rather than sleep and hope. Keyed by
+/// delegate so tests running in parallel in one process do not see each
+/// other's counts.
+#[cfg(test)]
+pub(super) static QUEUED_CLIENT_RUNS: std::sync::LazyLock<dashmap::DashMap<DelegateKey, usize>> =
+    std::sync::LazyLock::new(dashmap::DashMap::default);
+
 /// Loop-owned per-delegate park state.
 pub(super) struct DelegateParkCtx {
     parked: HashMap<DelegateKey, ParkEntry>,
@@ -1998,6 +2022,11 @@ impl DelegateParkCtx {
                 entry.pending_bytes = entry.pending_bytes.saturating_add(bytes);
                 self.parked_bytes = self.parked_bytes.saturating_add(bytes);
                 entry.pending_clients.push_back(client);
+                #[cfg(test)]
+                QUEUED_CLIENT_RUNS
+                    .entry(key.clone())
+                    .and_modify(|n| *n += 1)
+                    .or_insert(1);
                 QueueOutcome::Queued
             }
         }
@@ -3117,6 +3146,7 @@ mod tests {
             delivery: Delivery::Client,
             node_wide_duty: false,
             iterations: 0,
+            context: None,
         }
     }
 
@@ -3953,6 +3983,23 @@ mod tests {
             continuation_bytes(&cont) >= 200 * 1024,
             "a message's context must be charged; payload was 8 bytes and the \
              context 200 KiB, and only the context makes this a real cost"
+        );
+    }
+
+    /// The delegate context a parked run holds is charged against the park
+    /// byte budget, since the park holds it for the whole wait.
+    ///
+    /// FALSIFY by dropping the `continuation.context` term from
+    /// `continuation_bytes`.
+    #[test]
+    fn a_parked_runs_held_context_is_charged() {
+        let empty = continuation_bytes(&continuation());
+        let mut cont = continuation();
+        cont.context = Some(vec![0u8; 300 * 1024]);
+        assert_eq!(
+            continuation_bytes(&cont),
+            empty + 300 * 1024,
+            "the context the park holds must be charged byte for byte"
         );
     }
 

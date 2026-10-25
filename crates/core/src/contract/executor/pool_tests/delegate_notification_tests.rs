@@ -124,6 +124,52 @@ impl Drop for SubscriptionGuard {
     }
 }
 
+/// On a hosted node every delegate run belongs to a user and the node runs no
+/// delegate on its own, so a contract change builds and sends no delegate
+/// notification, while the delegate's subscription stays registered (it keeps
+/// the contract current on the node). A node that is not hosted sends it
+/// (`initial_state_install_notifies_subscribed_delegates`).
+///
+/// FALSIFY by removing the hosted check from
+/// `send_delegate_contract_notifications`: the notification arrives.
+#[tokio::test(flavor = "current_thread")]
+async fn a_hosted_node_sends_no_delegate_notification() {
+    let (op_manager, _notifications, _guards) = build_op_manager("delegate-notify-hosted").await;
+    let contract = test_contract(b"delegate_notify_hosted_contract");
+    let key = contract.key();
+    let state = WrappedState::new((1u8..=32).collect::<Vec<u8>>());
+
+    let delegate = test_delegate_key(0x6D);
+    let _subscription = SubscriptionGuard::register(*key.id(), delegate.clone());
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+    let mut executor = build_executor(&op_manager).await;
+    executor.hosted_mode = true;
+    executor.set_delegate_notification_tx(tx);
+
+    executor
+        .upsert_contract_state(
+            key,
+            Either::Left(state),
+            RelatedContracts::default(),
+            Some(contract),
+        )
+        .await
+        .expect("initial install");
+
+    assert!(
+        matches!(
+            rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ),
+        "a hosted node must not send a delegate notification"
+    );
+    assert!(
+        crate::wasm_runtime::delegate_subscriptions::subscribers_of(key.id()).contains(&delegate),
+        "the delegate's subscription stays registered on a hosted node"
+    );
+}
+
 fn test_delegate_key(seed: u8) -> DelegateKey {
     DelegateKey::new([seed; 32], CodeHash::new([seed; 32]))
 }

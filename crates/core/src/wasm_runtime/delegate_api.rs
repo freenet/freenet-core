@@ -759,12 +759,10 @@ mod tests {
     /// assertion below. The keys still collide; the maps no longer do.
     #[tokio::test]
     async fn test_create_delegate_non_attested_still_counts_toward_node_limit() {
-        use std::sync::atomic::Ordering;
-
         let mut env_holder = TestEnv::new().await;
         let counter = env_holder.created_delegates_count.clone();
         let origins = env_holder.inherited_origins.clone();
-        assert_eq!(counter.load(Ordering::Relaxed), 0, "fresh env starts at 0");
+        assert_eq!(counter.count(), 0, "fresh env starts at 0");
 
         // SAFETY: env_holder is alive for the duration of this test
         let env = unsafe { env_holder.make_env() }; // no attestations
@@ -786,12 +784,101 @@ mod tests {
         // assertable now that the counter is this env's own; the old
         // `after > before` was a workaround for a count anything could move.
         assert_eq!(
-            counter.load(Ordering::Relaxed),
+            counter.count(),
             1,
             "creation by a non-attested parent must still count toward the node limit"
         );
+        assert!(
+            counter.contains(&child_key),
+            "the slot is held by the child"
+        );
 
         // No cleanup: both live in `env_holder` and die with it.
+    }
+
+    /// The node-wide created-delegate cap refuses at the limit and frees a slot
+    /// on release.
+    ///
+    /// Pins the keyed-set behaviour of `MAX_CREATED_DELEGATES_PER_NODE`: with
+    /// the set full, `create_delegate_sync` returns `NodeLimitExceeded` and
+    /// leaves the count alone; releasing ONE held key reopens exactly one slot,
+    /// which the next create takes; and creating the same child again holds
+    /// no second slot, because the record is keyed by delegate key rather than
+    /// a bare counter.
+    ///
+    /// FALSIFY by changing `>=` to `>` in `create_delegate_sync`'s cap check:
+    /// step 2 succeeds, so the create is not refused at the limit.
+    #[tokio::test]
+    async fn test_created_delegate_cap_refuses_at_the_limit_and_frees_on_release() {
+        use super::super::native_api::{DelegateCreateError, release_created_delegate_slot};
+        use crate::contract::MAX_CREATED_DELEGATES_PER_NODE;
+
+        let mut env_holder = TestEnv::new().await;
+        let counter = env_holder.created_delegates_count.clone();
+        assert_eq!(counter.count(), 0, "fresh env starts at 0");
+
+        // 1. Fill the set with distinct synthetic keys.
+        let synthetic: Vec<DelegateKey> = (0..MAX_CREATED_DELEGATES_PER_NODE)
+            .map(|i| {
+                let mut bytes = [0u8; 32];
+                bytes[..8].copy_from_slice(&(i as u64).to_le_bytes());
+                DelegateKey::new(bytes, CodeHash::new([0u8; 32]))
+            })
+            .collect();
+        for key in &synthetic {
+            counter.record(key.clone());
+        }
+        assert_eq!(counter.count(), MAX_CREATED_DELEGATES_PER_NODE);
+
+        // SAFETY: env_holder is alive for the duration of this test
+        let env = unsafe { env_holder.make_env() };
+        let wasm = minimal_delegate_wasm();
+        let cipher = [0u8; 32];
+        let nonce = [0u8; 24];
+
+        // 2. At the limit the create is refused and the count is unchanged.
+        let refused = env.create_delegate_sync(&wasm, &[1], cipher, nonce);
+        assert!(
+            matches!(refused, Err(DelegateCreateError::NodeLimitExceeded)),
+            "a create at the node limit must be refused, got {refused:?}"
+        );
+        assert_eq!(
+            counter.count(),
+            MAX_CREATED_DELEGATES_PER_NODE,
+            "a refused create must not change the count"
+        );
+
+        // 3. Releasing one held key frees exactly one slot, which the create takes.
+        assert!(
+            release_created_delegate_slot(&counter, &synthetic[0]),
+            "the synthetic key held a slot"
+        );
+        assert_eq!(counter.count(), MAX_CREATED_DELEGATES_PER_NODE - 1);
+        let child_key = env
+            .create_delegate_sync(&wasm, &[1], cipher, nonce)
+            .expect("a create after a release must succeed");
+        assert_eq!(
+            counter.count(),
+            MAX_CREATED_DELEGATES_PER_NODE,
+            "the child takes the freed slot"
+        );
+        assert!(
+            counter.contains(&child_key),
+            "the slot is held by the child"
+        );
+
+        // 4. Creating the same child again holds no second slot. Release another
+        // synthetic key first so the cap itself does not refuse the create.
+        assert!(release_created_delegate_slot(&counter, &synthetic[1]));
+        let again = env
+            .create_delegate_sync(&wasm, &[1], cipher, nonce)
+            .expect("re-creating the same child must succeed under the cap");
+        assert_eq!(again, child_key, "same code and params derive the same key");
+        assert_eq!(
+            counter.count(),
+            MAX_CREATED_DELEGATES_PER_NODE - 1,
+            "the same child must not take a second slot"
+        );
     }
 
     /// A node's delegate state is per node, not per process (#4813).
@@ -814,8 +901,6 @@ mod tests {
     /// suite — which is exactly the flake in #4813.
     #[tokio::test]
     async fn test_delegate_node_state_is_per_node_not_per_process() {
-        use std::sync::atomic::Ordering;
-
         // Two envs stand in for two nodes in one process.
         let mut node_a = TestEnv::new().await;
         let mut node_b = TestEnv::new().await;
@@ -846,12 +931,12 @@ mod tests {
         );
 
         assert_eq!(
-            a_counter.load(Ordering::Relaxed),
+            a_counter.count(),
             1,
             "the creating node counts its own delegate"
         );
         assert_eq!(
-            b_counter.load(Ordering::Relaxed),
+            b_counter.count(),
             1,
             "node B counts only its own creation, not node A's"
         );
@@ -863,63 +948,59 @@ mod tests {
         );
     }
 
-    /// Releasing a slot saturates at zero rather than wrapping.
+    /// A slot is released only for a key that holds one.
     ///
-    /// A delegate registered directly by an app was never counted, so an
-    /// unregister can legitimately arrive with the count already at zero.
+    /// A delegate registered directly by an app, or a key that was never
+    /// registered, was never counted, so unregistering it must not free a slot
+    /// some created delegate is using.
     #[test]
-    fn test_release_created_delegate_slot_saturates_at_zero() {
+    fn test_release_created_delegate_slot_only_for_a_counted_key() {
         use super::super::native_api::{new_delegate_counter, release_created_delegate_slot};
-        use std::sync::atomic::Ordering;
+        use freenet_stdlib::prelude::{CodeHash, DelegateKey};
 
+        let counted = DelegateKey::new([1u8; 32], CodeHash::new([0u8; 32]));
+        let other = DelegateKey::new([2u8; 32], CodeHash::new([0u8; 32]));
         let counter = new_delegate_counter();
         assert!(
-            !release_created_delegate_slot(&counter),
-            "releasing an already-empty count releases nothing"
-        );
-        assert_eq!(
-            counter.load(Ordering::Relaxed),
-            0,
-            "releasing an already-empty count must stay at 0, not wrap to usize::MAX"
+            !release_created_delegate_slot(&counter, &counted),
+            "an empty record releases nothing"
         );
 
-        counter.fetch_add(1, Ordering::Relaxed);
+        counter.record(counted.clone());
         assert!(
-            release_created_delegate_slot(&counter),
-            "the one occupied slot is released"
+            !release_created_delegate_slot(&counter, &other),
+            "a key that was never counted releases nothing"
+        );
+        assert_eq!(counter.count(), 1, "the counted key keeps its slot");
+        assert!(
+            release_created_delegate_slot(&counter, &counted),
+            "the counted key's slot is released"
         );
         assert!(
-            !release_created_delegate_slot(&counter),
-            "a second release finds nothing left"
+            !release_created_delegate_slot(&counter, &counted),
+            "a second release of the same key finds nothing left"
         );
-        assert_eq!(counter.load(Ordering::Relaxed), 0, "one release per slot");
+        assert_eq!(counter.count(), 0, "one release per slot");
     }
 
-    /// Concurrent releases at count == 1 cannot wrap the count.
+    /// Concurrent releases of one counted key release its slot once.
     ///
-    /// Pool executors share one node's counter, so two unregisters can land
-    /// together. A `load`-then-`fetch_sub` pair (what this replaced) would let
-    /// both observe `1` and both subtract, wrapping to `usize::MAX` —
-    /// permanently above `MAX_CREATED_DELEGATES_PER_NODE`, which would wedge the
-    /// node into rejecting every later delegate creation.
-    /// A barrier lines the racers up on the same slot, and the round repeats,
-    /// because a wrap is a race and one round proves little. Verified to have
-    /// teeth rather than assumed: against the `load`-then-`fetch_sub` this
-    /// replaced it fails immediately on every run (6/6 at this round count),
-    /// with more than one racer claiming the slot and the count wrapping past
-    /// zero. 200 rounds is deliberate — it is the smallest count still verified
-    /// to catch that, since this suite does not need 16k more OS threads.
+    /// Pool executors share one node's record, so two unregisters of the same
+    /// key can land together. A barrier lines the racers up on the same slot,
+    /// and the round repeats, because a double release is a race and one round
+    /// proves little.
     #[test]
-    fn test_release_created_delegate_slot_concurrent_releases_do_not_wrap() {
+    fn test_release_created_delegate_slot_concurrent_releases_release_once() {
         use super::super::native_api::{new_delegate_counter, release_created_delegate_slot};
-        use std::sync::atomic::Ordering;
+        use freenet_stdlib::prelude::{CodeHash, DelegateKey};
         use std::sync::{Arc, Barrier};
 
         const RACERS: usize = 8;
+        let key = DelegateKey::new([3u8; 32], CodeHash::new([0u8; 32]));
 
         for _ in 0..200 {
             let counter = new_delegate_counter();
-            counter.store(1, Ordering::Relaxed);
+            counter.record(key.clone());
             // Release the racers together, so they contend for the ONE occupied
             // slot rather than arriving spread out and finding it already empty.
             let barrier = Arc::new(Barrier::new(RACERS));
@@ -928,9 +1009,10 @@ mod tests {
                 .map(|_| {
                     let counter = counter.clone();
                     let barrier = barrier.clone();
+                    let key = key.clone();
                     std::thread::spawn(move || {
                         barrier.wait();
-                        release_created_delegate_slot(&counter)
+                        release_created_delegate_slot(&counter, &key)
                     })
                 })
                 .collect();
@@ -940,11 +1022,7 @@ mod tests {
                 .filter(|&released| released)
                 .count();
 
-            assert_eq!(
-                counter.load(Ordering::Relaxed),
-                0,
-                "concurrent releases must saturate at 0, never wrap"
-            );
+            assert_eq!(counter.count(), 0, "the slot is released");
             assert_eq!(
                 released, 1,
                 "exactly one racer may claim the single occupied slot"

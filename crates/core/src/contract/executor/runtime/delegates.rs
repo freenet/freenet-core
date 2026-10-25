@@ -184,6 +184,29 @@ impl Executor<Runtime> {
         connection_scope: crate::client_events::ConnectionScope,
         user_context: Option<&UserSecretContext>,
     ) -> Response {
+        let context_user = user_context.map(|u| *u.user_id());
+        self.delegate_request_as(
+            req,
+            origin_contract,
+            caller_delegate,
+            connection_scope,
+            user_context,
+            context_user,
+        )
+    }
+
+    /// [`Self::delegate_request`], with the user whose delegate context the
+    /// run uses given apart from `user_context`, which scopes its secrets.
+    /// See `DelegateRuntimeInterface::inbound_app_message_as`.
+    pub(crate) fn delegate_request_as(
+        &mut self,
+        req: DelegateRequest<'_>,
+        origin_contract: Option<&ContractInstanceId>,
+        caller_delegate: Option<&DelegateKey>,
+        connection_scope: crate::client_events::ConnectionScope,
+        user_context: Option<&UserSecretContext>,
+        context_user: Option<crate::wasm_runtime::UserId>,
+    ) -> Response {
         // Mutual exclusion invariant: a single inbound delegate request is
         // either dispatched on behalf of a contract-backed web app
         // (`origin_contract = Some`) or on behalf of another delegate
@@ -281,6 +304,66 @@ impl Executor<Runtime> {
                 Err(err) => Err(err),
             },
             DelegateRequest::UnregisterDelegate(key) => {
+                // Only a local client may unregister a delegate. Unregistering
+                // deletes the delegate's stored code, its persisted context and
+                // its persisted subscriptions, so it is a node-administrative
+                // operation like the attested registration origin above. Every
+                // path to the executor passes through here, and the check comes
+                // before anything is removed. The client-API layer clears the
+                // delegate's push registrations only after this arm answers
+                // `Ok` (`process_open_request`), so a refusal leaves those too.
+                // Logged at debug, as the layers above log the other refusals.
+                if !connection_scope.is_local() {
+                    tracing::debug!(
+                        delegate_key = %key,
+                        ?connection_scope,
+                        "UnregisterDelegate refused: the connection is not local"
+                    );
+                    return Err(ExecutorError::unregister_not_local(key));
+                }
+                // On a hosted node a delegate is shared by all of the node's
+                // users, so a user's unregister removes only that user's own
+                // push registrations, which `process_open_request` does after
+                // this arm answers `Ok`. Nothing is removed here: the delegate
+                // and its state are shared, and the user's secrets stay, as an
+                // unregister on any node leaves secrets. A hosted client
+                // without a user token is refused: an unregister on a hosted
+                // node acts only for the user who sends it. The client API
+                // already refuses a tokenless connection on a hosted node, so
+                // this refusal is a second check for any other entry point.
+                //
+                // Keyed on `user_context` as well as the node flag, so this
+                // arm and `process_open_request` (which sees only the user
+                // context) take the per-user path for exactly the same
+                // requests.
+                if user_context.is_some() {
+                    return Ok(HostResponse::Ok);
+                }
+                if self.hosted_mode {
+                    tracing::debug!(
+                        delegate_key = %key,
+                        "UnregisterDelegate refused: a hosted node's client without a user token"
+                    );
+                    return Err(ExecutorError::unregister_hosted(key));
+                }
+
+                // Remove the stored delegate FIRST. If that fails the delegate
+                // may still be registered and runnable, so nothing else about
+                // it is removed and the client is told it failed. An unknown
+                // key is not a failure: the store answers `Ok` for it.
+                if let Err(err) = self.runtime.unregister_delegate(&key) {
+                    tracing::warn!(
+                        delegate_key = %key,
+                        error = %err,
+                        phase = "unregister_failed",
+                        "Failed to unregister delegate"
+                    );
+                    return Err(ExecutorError::execution(
+                        err,
+                        Some(InnerOpError::Delegate(key)),
+                    ));
+                }
+
                 self.delegate_origin_ids.remove(&key);
 
                 // Remove delegate from all contract subscription entries. Goes
@@ -308,30 +391,58 @@ impl Executor<Runtime> {
                 self.runtime.inherited_origins.remove(&key);
 
                 // Release this node's created-delegate slot so it can be reused.
-                // Saturates at zero: delegates registered directly by apps were
-                // never counted. See `release_created_delegate_slot`.
+                // Only a delegate created through `create_delegate` holds one;
+                // for any other key this releases nothing. See
+                // `release_created_delegate_slot`.
                 crate::wasm_runtime::release_created_delegate_slot(
                     &self.runtime.created_delegates_count,
+                    &key,
                 );
 
-                match self.runtime.unregister_delegate(&key) {
-                    Ok(_) => Ok(HostResponse::Ok),
-                    Err(err) => {
-                        tracing::warn!(
-                            delegate_key = %key,
-                            error = %err,
-                            phase = "unregister_failed",
-                            "Failed to unregister delegate"
-                        );
-                        Ok(HostResponse::Ok)
-                    }
-                }
+                Ok(HostResponse::Ok)
             }
             DelegateRequest::ApplicationMessages {
                 key,
                 inbound,
                 params,
             } => {
+                // ON A HOSTED NODE EVERY DELEGATE RUN BELONGS TO A USER.
+                //
+                // A hosted node's delegates are shared by all of its users, and
+                // a run with no user would use the node-local secrets, which no
+                // client of a hosted node owns. Every path that runs a delegate
+                // on a hosted node supplies the run's user: a client request
+                // its connection's, a hop the originating user's. The node runs
+                // no delegate on its own there (no contract notifications, no
+                // lifecycle runs). No client can reach this without a user (a
+                // hosted node refuses a connection with no user token), so a
+                // run without one means a node path did not supply it. It is
+                // refused here, before the delegate runs, and logged at warn
+                // once per process so that a path which forgets the user shows
+                // in release builds without a line per run; later ones are at
+                // debug with a running count.
+                if self.hosted_mode && user_context.is_none() {
+                    static REFUSED: std::sync::atomic::AtomicU64 =
+                        std::sync::atomic::AtomicU64::new(0);
+                    let total = REFUSED
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                        .saturating_add(1);
+                    if total == 1 {
+                        tracing::warn!(
+                            delegate_key = %key,
+                            "Delegate run refused: a hosted node runs a delegate only on \
+                             behalf of a user. Logged once at warn; later ones at debug"
+                        );
+                    } else {
+                        tracing::debug!(
+                            delegate_key = %key,
+                            total,
+                            "Delegate run refused: a hosted node runs a delegate only on \
+                             behalf of a user"
+                        );
+                    }
+                    return Err(ExecutorError::hosted_run_without_user(key));
+                }
                 let origin = resolve_message_origin(
                     &self.runtime.inherited_origins,
                     caller_delegate,
@@ -369,7 +480,7 @@ impl Executor<Runtime> {
                          from a non-local connection (GHSA-824h-7x5x-wfmf)"
                     );
                 }
-                match self.runtime.inbound_app_message(
+                match self.runtime.inbound_app_message_as(
                     &key,
                     &params,
                     origin.as_ref(),
@@ -379,6 +490,9 @@ impl Executor<Runtime> {
                     // so neither WASM nor any delegate-message content can set or
                     // change which user's namespace a secret op touches.
                     user_context,
+                    // The user whose delegate context the run uses. Derived
+                    // from the same connection token, by the caller.
+                    context_user,
                     inbound
                         .into_iter()
                         .map(InboundDelegateMsg::into_owned)

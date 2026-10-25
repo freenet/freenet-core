@@ -45,6 +45,7 @@ impl UserInputPrompter for CapabilityPrompter {
         request: &UserInputRequest<'static>,
         _delegate_key: &str,
         _caller: CallerIdentity,
+        _owner: Option<crate::wasm_runtime::UserId>,
     ) -> Option<(usize, ClientResponse<'static>)> {
         request
             .responses
@@ -909,6 +910,7 @@ async fn a_parked_delegate_defers_its_lifecycle_run() {
             _request: &UserInputRequest<'static>,
             _delegate_key: &str,
             _caller: CallerIdentity,
+            _owner: Option<crate::wasm_runtime::UserId>,
         ) -> Option<(usize, ClientResponse<'static>)> {
             std::future::pending().await
         }
@@ -1019,7 +1021,11 @@ async fn a_run_that_never_starts_is_dropped_and_counted() {
 }
 
 /// Only the bound app's own local unregister drops a delegate's capability
-/// record; a remote one, another app's, or one with no app does not.
+/// record; a remote one, a hosted user's, another app's, or one with no app
+/// does not.
+///
+/// FALSIFY by dropping `!hosted_user` from `capability_hook`: the hosted
+/// user's unregister drops the record.
 #[tokio::test]
 async fn a_remote_unregister_keeps_the_record() {
     let caps = DelegateCapabilities::in_memory();
@@ -1027,7 +1033,7 @@ async fn a_remote_unregister_keeps_the_record() {
     let lp = start(
         "cap_unregister",
         caps.clone(),
-        vec![ScriptedRun::default(); 4],
+        vec![ScriptedRun::default(); 5],
         CapabilityPrompter::answering(None),
     )
     .await;
@@ -1062,6 +1068,26 @@ async fn a_remote_unregister_keeps_the_record() {
     assert!(
         caps.is_budgeted(&key),
         "a remote unregister must not drop the record"
+    );
+    // A hosted user's unregister removes only that user's own state, so even
+    // from a local connection and the bound app it must not drop the record.
+    let hosted_user = answer(
+        lp.send
+            .send_to_handler(ContractHandlerEvent::DelegateRequest {
+                req: DelegateRequest::UnregisterDelegate(key.clone()),
+                origin_contract: Some(app(24)),
+                connection_scope: crate::client_events::ConnectionScope::Local,
+                user_context: Some(crate::wasm_runtime::UserSecretContext::from_token(
+                    b"capability-record-hosted-user",
+                )),
+            })
+            .await
+            .unwrap(),
+    );
+    assert!(hosted_user.is_ok(), "{hosted_user:?}");
+    assert!(
+        caps.is_budgeted(&key),
+        "a hosted user's unregister must not drop the shared record"
     );
     let local = answer(
         lp.send
@@ -1527,6 +1553,7 @@ async fn the_resumed_leg_of_a_parked_background_run_is_charged() {
             request: &UserInputRequest<'static>,
             _delegate_key: &str,
             _caller: CallerIdentity,
+            _owner: Option<crate::wasm_runtime::UserId>,
         ) -> Option<(usize, ClientResponse<'static>)> {
             self.0.acquire().await.expect("gate").forget();
             request

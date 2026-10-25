@@ -962,13 +962,7 @@ impl NodeP2P {
                 tracing::info!("Contract executor task starting");
                 let result = contract::contract_handling(
                     contract_handler,
-                    crate::contract::user_input::DashboardPrompter::new(
-                        crate::contract::user_input::pending_prompts(),
-                        std::net::SocketAddr::new(
-                            config.config.ws_api.address,
-                            config.config.ws_api.port,
-                        ),
-                    ),
+                    crate::contract::user_input::dashboard_prompter_for(&config.config.ws_api),
                 )
                 .await;
                 match &result {

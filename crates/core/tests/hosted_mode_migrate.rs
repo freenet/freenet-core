@@ -1,6 +1,8 @@
 //! Live end-to-end integration test for the zero-friction "magic-link" secrets
 //! MIGRATION (#4592) — the hosted `mint` + public `pull` endpoints plus the
-//! local confirmation PAGE, all on ONE running node.
+//! local confirmation PAGE. The hosted side (mint, pull) runs on a hosted node
+//! and the importing side (`POST /v1/import`, the readback) on a node that is
+//! not hosted, because a hosted node takes no import into its node-local scope.
 //!
 //! The migration turns the hosted → self-host handoff into a link the user
 //! clicks on their own peer. The three cooperating HTTP surfaces exercised here
@@ -19,8 +21,8 @@
 //!   * `GET /hosted/import` — the LOCAL confirmation page. HTML with an explicit
 //!     import button; it never imports by itself (defeats drive-by / CSRF).
 //!
-//! The headline test walks the whole round-trip on a single hosted node and
-//! proves the load-bearing properties:
+//! The headline test walks the whole round-trip, hosted node to a node that is
+//! not hosted, and proves the load-bearing properties:
 //!
 //!   1. The durable token authenticates the mint but is NOT the bundle key — the
 //!      pulled bundle rides a fresh EPHEMERAL key, and that exact key round-trips
@@ -205,6 +207,18 @@ async fn wait_ws_ready(port: u16, within: Duration) -> anyhow::Result<()> {
                 drop(stream);
                 return Ok(());
             }
+            // A hosted node refuses a client-API connection without a user
+            // token; that refusal is the node answering, so the API is up.
+            // Only that refusal counts: any other 403 keeps waiting.
+            Err(tokio_tungstenite::tungstenite::Error::Http(response))
+                if response.status()
+                    == tokio_tungstenite::tungstenite::http::StatusCode::FORBIDDEN
+                    && response.body().as_deref().is_some_and(|b| {
+                        String::from_utf8_lossy(b).contains("requires a user token")
+                    }) =>
+            {
+                return Ok(());
+            }
             Err(e) => {
                 if Instant::now() >= deadline {
                     anyhow::bail!("WS API on port {port} did not come up within {within:?}: {e}");
@@ -238,8 +252,8 @@ async fn connect_hosted(
     Ok(WebApi::start(stream))
 }
 
-/// Plain WS connection (no user token). On a hosted node this maps to
-/// `SecretScope::Local` — the scope `POST /v1/import` writes into — so it is how
+/// Plain WS connection (no user token), to a node that is not hosted: it uses
+/// `SecretScope::Local`, the scope `POST /v1/import` writes into, so it is how
 /// we read the migrated secret back.
 async fn connect_plain(port: u16) -> anyhow::Result<WebApi> {
     let url = format!("ws://127.0.0.1:{port}/v1/contract/command?encodingProtocol=native");
@@ -468,8 +482,8 @@ struct ImportResponseBody {
 ///  * The pull token is SINGLE-USE: the first pull consumes it; a replay and an
 ///    unknown token are both a uniform 404.
 ///  * The migrated secret decrypts to user A's ORIGINAL plaintext when read back
-///    through the live delegate stack (the import lands in the node-local scope,
-///    which a no-token connection reads).
+///    through the live delegate stack on the user's own (not hosted) node, where
+///    the import lands in the node-local scope.
 #[serial_test::serial]
 #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn migrate_magic_link_round_trip() -> anyhow::Result<()> {
@@ -571,9 +585,15 @@ async fn migrate_magic_link_round_trip() -> anyhow::Result<()> {
     // (5) IMPORT: feed the pulled bundle into POST /v1/import with the EPHEMERAL
     // key the pull handed back (this is exactly what the local pull-import would
     // forward). This proves the ephemeral key round-trips to a real import.
-    let origin = format!("http://127.0.0.1:{port}");
+    //
+    // The import target is the user's own node, which is not hosted, as in a
+    // real migration: a hosted node serves no client API without a user token,
+    // so the node-local scope the import writes is read back there.
+    let local_node = TestNode::start(/* hosted_mode */ false).await?;
+    let local_port = local_node.ws_port;
+    let origin = format!("http://127.0.0.1:{local_port}");
     let resp = http_import(
-        port,
+        local_port,
         bundle,
         Some(&bundle_key),
         Some(&key_kind),
@@ -591,9 +611,9 @@ async fn migrate_magic_link_round_trip() -> anyhow::Result<()> {
     assert!(report.skipped.is_empty());
 
     // (6) READBACK through the live stack: POST /v1/import targets the node-local
-    // scope, which a NO-TOKEN connection reads. Confirm the migrated secret
-    // decrypts to user A's ORIGINAL plaintext while the node stays up.
-    let mut conn_local = connect_plain(port).await?;
+    // scope, which a NO-TOKEN connection to that node reads. Confirm the migrated
+    // secret decrypts to user A's ORIGINAL plaintext while the node stays up.
+    let mut conn_local = connect_plain(local_port).await?;
     register_delegate(&mut conn_local, &delegate, &delegate_key).await?;
     let read = get_secret_via_delegate(&mut conn_local, &delegate_key, SECRET_KEY).await?;
     assert_eq!(
@@ -608,6 +628,7 @@ async fn migrate_magic_link_round_trip() -> anyhow::Result<()> {
 
     drop(conn_a);
     drop(conn_local);
+    local_node.shutdown().await;
     node.shutdown().await;
     Ok(())
 }

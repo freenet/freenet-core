@@ -510,6 +510,12 @@ impl DelegateStore {
             .key_to_code_part
             .iter()
             .any(|entry| *entry.value() == code_hash);
+        // Best effort from here on. The delegate is already unregistered (its
+        // record and both indexes are gone), so failing now would tell the
+        // caller it is still registered and stop it cleaning up the rest of
+        // the delegate's state, and a retry would fail the same way forever.
+        // A leftover blob holds no delegate state, only the code its hash
+        // names, which a later registration of that code reuses.
         if !other_delegates_use_code {
             let wasm_path = self
                 .delegates_dir
@@ -517,7 +523,12 @@ impl DelegateStore {
                 .with_extension("wasm");
             if let Err(err) = std::fs::remove_file(&wasm_path) {
                 if err.kind() != std::io::ErrorKind::NotFound {
-                    return Err(err.into());
+                    tracing::warn!(
+                        delegate_key = %key,
+                        path = %wasm_path.display(),
+                        error = %err,
+                        "Delegate unregistered but its code file could not be removed"
+                    );
                 }
             }
         }

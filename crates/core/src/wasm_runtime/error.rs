@@ -52,6 +52,27 @@ impl_err!(engine::WasmError);
 pub(crate) const DELEGATE_PARAMS_MISMATCH: &str =
     "delegate request parameters do not match the delegate key";
 
+/// The text a refused `UnregisterDelegate` reports, followed by a space and
+/// the delegate key (`RuntimeInnerError::DelegateUnregisterNotLocal`). Clients
+/// receive it inside `DelegateError::ExecutionError`.
+pub(crate) const DELEGATE_UNREGISTER_NOT_LOCAL: &str =
+    "only a local client may unregister a delegate";
+
+/// The text a refused `UnregisterDelegate` reports on a node running in hosted
+/// mode when the client presented no user token, followed by a space and the
+/// delegate key
+/// (`RuntimeInnerError::DelegateUnregisterHosted`). Clients receive it inside
+/// `DelegateError::ExecutionError`.
+pub(crate) const DELEGATE_UNREGISTER_HOSTED: &str =
+    "a hosted node unregisters a delegate only for a client with a user token";
+
+/// The text a delegate run refused on a hosted node reports when the run has
+/// no user, followed by a space and the delegate key
+/// (`RuntimeInnerError::DelegateHostedRunWithoutUser`). Clients receive it
+/// inside `DelegateError::ExecutionError`.
+pub(crate) const DELEGATE_HOSTED_RUN_WITHOUT_USER: &str =
+    "a hosted node runs a delegate only on behalf of a user";
+
 #[derive(thiserror::Error, Debug)]
 pub(crate) enum RuntimeInnerError {
     #[error(transparent)]
@@ -78,6 +99,25 @@ pub(crate) enum RuntimeInnerError {
     /// delegate runs; see `Runtime::prepare_delegate_call`.
     #[error("{msg} {0}", msg = DELEGATE_PARAMS_MISMATCH)]
     DelegateParamsMismatch(DelegateKey),
+
+    /// An `UnregisterDelegate` from a connection that is not local. Refused
+    /// before anything is removed; see the `UnregisterDelegate` arm of
+    /// `Executor::delegate_request`.
+    #[error("{msg} {0}", msg = DELEGATE_UNREGISTER_NOT_LOCAL)]
+    DelegateUnregisterNotLocal(DelegateKey),
+
+    /// An `UnregisterDelegate` from a client of a node running in hosted mode
+    /// that presented no user token. Refused before anything is removed; see
+    /// the `UnregisterDelegate` arm of `Executor::delegate_request`.
+    #[error("{msg} {0}", msg = DELEGATE_UNREGISTER_HOSTED)]
+    DelegateUnregisterHosted(DelegateKey),
+
+    /// An `ApplicationMessages` run with no user on a node running in hosted
+    /// mode. On a hosted node every delegate run belongs to a user, so a run
+    /// without one is refused before the delegate runs; see the
+    /// `ApplicationMessages` arm of `Executor::delegate_request_as`.
+    #[error("{msg} {0}", msg = DELEGATE_HOSTED_RUN_WITHOUT_USER)]
+    DelegateHostedRunWithoutUser(DelegateKey),
 
     /// A delegate offered for storage carries a key that is not derived from
     /// its own code and parameters, so the node cannot store it under an

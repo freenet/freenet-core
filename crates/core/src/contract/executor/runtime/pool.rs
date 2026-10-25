@@ -177,7 +177,8 @@ pub struct RuntimePool {
     /// Shared compiled delegate module cache, keyed by CODE hash for the same
     /// reason the contract one is (#5268).
     shared_delegate_modules: SharedModuleCache<CodeHash>,
-    /// Shared per-delegate `ctx.write()` cache (see `DelegateContextCache`).
+    /// Shared `ctx.write()` cache, one entry per delegate and hosted user (see
+    /// `DelegateContextCache`).
     shared_delegate_contexts: crate::wasm_runtime::DelegateContextCache,
     /// This node's created-delegate count, shared by every executor so
     /// `MAX_CREATED_DELEGATES_PER_NODE` is enforced per node rather than per
@@ -225,7 +226,8 @@ pub struct RuntimePool {
     /// Not used for enforcement since the event loop is sequential.
     /// Tracked via RAII `InFlightGuard` in: `fetch_contract`, `upsert_contract_state`,
     /// `summarize_contract_state`, `get_contract_state_delta`.
-    /// Intentionally NOT tracked in: `execute_delegate_request` (no contract key),
+    /// Intentionally NOT tracked in: `execute_delegate_request` and
+    /// `execute_delegate_hop` (no contract key),
     /// `register_contract_notifier` (synchronous, no executor checkout),
     /// `lookup_key`, `get_subscription_info`, `remove_client`
     /// (read-only / no executor checkout).
@@ -1411,6 +1413,52 @@ impl ContractExecutor for RuntimePool {
         result
     }
 
+    async fn execute_delegate_hop(
+        &mut self,
+        req: DelegateRequest<'_>,
+        caller_delegate: &DelegateKey,
+        connection_scope: crate::client_events::ConnectionScope,
+        user_context: Option<&UserSecretContext>,
+    ) -> Response {
+        let mut executor = self.pop_executor().await;
+        // The hop's target runs under the originating user: that user's
+        // secrets and context (`None` on a node that is not hosted).
+        let result = executor.delegate_request(
+            req,
+            None,
+            Some(caller_delegate),
+            connection_scope,
+            user_context,
+        );
+        self.return_checked(executor, "execute_delegate_hop").await;
+        result
+    }
+
+    fn hosted_mode(&self) -> bool {
+        self.config.ws_api.hosted_mode
+    }
+
+    fn take_delegate_context(
+        &mut self,
+        delegate: &DelegateKey,
+        user: Option<&crate::wasm_runtime::UserId>,
+    ) -> Option<Vec<u8>> {
+        // The pool's one cache, shared by every executor (and by any executor
+        // checked out right now), so no executor needs to be popped.
+        self.shared_delegate_contexts.take(delegate, user)
+    }
+
+    fn restore_delegate_context(
+        &mut self,
+        delegate: &DelegateKey,
+        user: Option<&crate::wasm_runtime::UserId>,
+        context: Vec<u8>,
+    ) {
+        // Logs if an entry is already there; see `DelegateContextStore::restore`.
+        self.shared_delegate_contexts
+            .restore(delegate, user, context);
+    }
+
     fn try_begin_export(
         &mut self,
         user_context: &UserSecretContext,
@@ -1868,6 +1916,89 @@ mod tests {
         assert_eq!(
             pool.delegate_code(&DelegateKey::new([1; 32], CodeHash::new([1; 32]))),
             None
+        );
+    }
+
+    /// The pool's `take_delegate_context` and `restore_delegate_context` act on
+    /// the one context cache every pooled executor's runs use, so a context
+    /// put back through the pool is what a run on any executor reads, and a
+    /// context a run wrote on any executor is what the pool takes.
+    ///
+    /// FALSIFY by giving either method a cache of its own (for example
+    /// `crate::wasm_runtime::new_delegate_context_cache()` in place of
+    /// `self.shared_delegate_contexts`): the matching assertion fails.
+    #[cfg(feature = "wasmtime-backend")]
+    #[tokio::test]
+    async fn pool_take_and_restore_use_the_cache_pooled_runs_use() {
+        let config_args = ConfigArgs {
+            id: Some("pool-shared-delegate-contexts".to_string()),
+            mode: Some(OperationMode::Local),
+            ..Default::default()
+        };
+        let node_config =
+            crate::node::NodeConfig::new(config_args.build().await.expect("build Config"))
+                .await
+                .expect("build NodeConfig");
+        let config = node_config.config.clone();
+        let (_notification_rx, notification_tx) = crate::node::event_loop_notification_channel();
+        let (ops_ch_channel, _ch_channel, _wait_for_event) =
+            crate::contract::contract_handler_channel();
+        let connection_manager = crate::ring::ConnectionManager::new(&node_config);
+        let (result_router_tx, _result_router_rx) = tokio::sync::mpsc::channel(100);
+        let task_monitor = crate::node::background_task_monitor::BackgroundTaskMonitor::new();
+        let op_manager = Arc::new(
+            OpManager::new(
+                notification_tx,
+                ops_ch_channel,
+                &node_config,
+                crate::tracing::DynamicRegister::new(vec![]),
+                connection_manager,
+                result_router_tx,
+                &task_monitor,
+            )
+            .expect("build OpManager"),
+        );
+        let mut pool = RuntimePool::new(
+            config,
+            op_manager,
+            NonZeroUsize::new(2).expect("nonzero pool size"),
+        )
+        .await
+        .expect("build RuntimePool");
+
+        let key = DelegateKey::new([0x6f; 32], CodeHash::new([0x6f; 32]));
+        let user = crate::wasm_runtime::UserId::new([0x6f; 32]);
+
+        pool.restore_delegate_context(&key, Some(&user), b"restored".to_vec());
+        for (n, slot) in pool.runtimes.iter().enumerate() {
+            let executor = slot.as_ref().expect("pool executor present");
+            assert_eq!(
+                executor.runtime.delegate_contexts().get(&key, Some(&user)),
+                Some(b"restored".to_vec()),
+                "pooled executor {n} must read the context restored through the pool"
+            );
+        }
+
+        pool.runtimes[1]
+            .as_ref()
+            .expect("pool executor present")
+            .runtime
+            .delegate_contexts()
+            .store(&key, Some(&user), b"written-by-a-run".to_vec());
+        assert_eq!(
+            pool.take_delegate_context(&key, Some(&user)),
+            Some(b"written-by-a-run".to_vec()),
+            "the pool must take the context a pooled run wrote"
+        );
+        assert_eq!(
+            pool.runtimes[0]
+                .as_ref()
+                .expect("pool executor present")
+                .runtime
+                .delegate_contexts()
+                .get(&key, Some(&user)),
+            None,
+            "taking through the pool removes it from the cache every run uses"
         );
     }
 

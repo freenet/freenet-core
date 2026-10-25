@@ -1680,6 +1680,13 @@ function freenetBridge(authToken, userToken, hostedMode) {
   // message-notification code (showAppNotification) sits far above BEGIN, so it
   // is outside this region and unaffected.
   var overlayRoot = null;
+  // The hosted user's token for the permission routes. A hosted node requires
+  // it on `/permission/pending`, `/permission/{nonce}/respond` and the
+  // permission WebSocket, and shows each user only their own prompts. It is
+  // sent only from a page served over https (the same rule as the app
+  // WebSocket above); on a node that is not hosted `userToken` is undefined,
+  // so nothing is sent and the requests are exactly as before.
+  var permUserToken = permTokenFor(userToken, location);
   // Null-prototype for the same reason as removalObservedAt: a key spelled
   // `__proto__` must be an ordinary own key, not a prototype assignment that
   // makes the card unhideable and leaks into every other lookup.
@@ -2123,15 +2130,19 @@ function freenetBridge(authToken, userToken, hostedMode) {
       overlayRoot.style.display = 'none';
     }
   }
+  // perm-respond:BEGIN
+  // Extracted verbatim by shell_bridge_permission_ws.test.mjs. Keep the markers.
   function respondToPrompt(nonce, index, card) {
     var btns = card.querySelectorAll('button');
     btns.forEach(function (b) {
       b.disabled = true;
       b.style.opacity = '0.5';
     });
+    var respondHeaders = permAuthHeaders(permUserToken);
+    respondHeaders['Content-Type'] = 'application/json';
     fetch('/permission/' + encodeURIComponent(nonce) + '/respond', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: respondHeaders,
       body: JSON.stringify({ index: index }),
     })
       .then(function (r) {
@@ -2153,6 +2164,7 @@ function freenetBridge(authToken, userToken, hostedMode) {
         });
       });
   }
+  // perm-respond:END
   // Snapshot the current pending list and reconcile against the open overlay
   // cards. Used for initial bootstrap, on `resync` events when a subscriber
   // lagged, and as a fallback while the socket is down or reconnecting.
@@ -2182,7 +2194,9 @@ function freenetBridge(authToken, userToken, hostedMode) {
     var issuedAt = permNow();
     var pending;
     try {
-      pending = fetch('/permission/pending');
+      pending = fetch('/permission/pending', {
+        headers: permAuthHeaders(permUserToken),
+      });
     } catch (err) {
       // A SYNCHRONOUS throw must not leave a registration behind. Registering
       // before the call meant such a throw skipped the deregistering `.then`
@@ -2317,11 +2331,31 @@ function freenetBridge(authToken, userToken, hostedMode) {
   // vacuously, which is the self-match class AGENTS.md says has shipped
   // twice.) It fails loudly, but the message points at the guard
   // rather than at the move, so this note is the signpost.
-  function permSocketUrl(loc) {
+  function permSocketUrl(loc, token) {
     // Derive the scheme from the page so a TLS-served shell upgrades to wss
     // rather than tripping the browser's mixed-content block.
     var scheme = loc.protocol === 'https:' ? 'wss://' : 'ws://';
-    return scheme + loc.host + '/permission/events/ws';
+    var url = scheme + loc.host + '/permission/events/ws';
+    // The hosted user's token rides in the query, since a browser cannot set
+    // a header on a WebSocket handshake. Never on a ws:// URL.
+    if (token && loc.protocol === 'https:') {
+      url += '?userToken=' + encodeURIComponent(token);
+    }
+    return url;
+  }
+
+  // The token the shell may present on the permission routes: the hosted
+  // user's token, and only on a page served over https.
+  function permTokenFor(token, loc) {
+    return token && loc.protocol === 'https:' ? token : null;
+  }
+
+  // Headers for a permission-route fetch: the hosted user's token when there
+  // is one. A fresh object each call, so a caller may add to it.
+  function permAuthHeaders(token) {
+    var headers = {};
+    if (token) headers['X-Freenet-User-Token'] = token;
+    return headers;
   }
 
   // Exponential backoff with a ceiling. Separate from the jitter below so the
@@ -2453,7 +2487,7 @@ function freenetBridge(authToken, userToken, hostedMode) {
     }
     var sock;
     try {
-      sock = new WebSocket(permSocketUrl(location));
+      sock = new WebSocket(permSocketUrl(location, permUserToken));
     } catch (err) {
       // Constructor throws on a malformed URL or a blocked scheme. Treat it
       // exactly like a dropped socket: the poll is already running, so just
