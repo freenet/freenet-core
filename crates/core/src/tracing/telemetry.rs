@@ -3001,6 +3001,9 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
             for (key, count) in snapshot.nonzero_conn_identity() {
                 m.insert(key, serde_json::json!(count));
             }
+            for (key, value) in snapshot.nonzero_inbound_concurrency() {
+                m.insert(key.into(), serde_json::json!(value));
+            }
             serde_json::Value::Object(m)
         }
         EventKind::InterestSync(interest_sync_event) => {
@@ -5437,6 +5440,34 @@ mod tests {
             .collect();
         assert_eq!(sent_identity_keys, vec!["conn_identity_duplicate_key"]);
         assert_eq!(event.event_data["conn_identity_duplicate_key"], 3);
+        let concurrency_keys = |event: &TelemetryEvent| -> Vec<String> {
+            event
+                .event_data
+                .as_object()
+                .expect("snapshot JSON object")
+                .keys()
+                .filter(|key| key.starts_with("inbound_concurrency_"))
+                .cloned()
+                .collect()
+        };
+        assert!(
+            concurrency_keys(&event).is_empty(),
+            "zero inbound concurrency values are not uploaded"
+        );
+        let event = worker.snapshot_to_telemetry(&crate::transport::metrics::TransportSnapshot {
+            inbound_concurrency_conns_sampled: 4,
+            inbound_concurrency_max: 5,
+            ..Default::default()
+        });
+        assert_eq!(
+            concurrency_keys(&event),
+            vec![
+                "inbound_concurrency_conns_sampled",
+                "inbound_concurrency_max"
+            ]
+        );
+        assert_eq!(event.event_data["inbound_concurrency_conns_sampled"], 4);
+        assert_eq!(event.event_data["inbound_concurrency_max"], 5);
         assert_eq!(
             event.peer_id, "snapshot-peer-id",
             "transport snapshots must be attributed to the emitting \
@@ -6648,14 +6679,17 @@ mod tests {
     #[test]
     fn transport_snapshot_json_lists_every_field() {
         let snapshot = crate::transport::metrics::TransportSnapshot::default();
-        // The connection identity keys are sent only when non-zero, so a
-        // default snapshot carries none of them (see the test below).
+        // The connection identity and inbound concurrency keys are sent only
+        // when non-zero, so a default snapshot carries none of them (see the
+        // tests below).
         let mut expected: std::collections::BTreeSet<String> = serde_json::to_value(&snapshot)
             .unwrap()
             .as_object()
             .unwrap()
             .keys()
-            .filter(|key| !key.starts_with("conn_identity_"))
+            .filter(|key| {
+                !key.starts_with("conn_identity_") && !key.starts_with("inbound_concurrency_")
+            })
             .cloned()
             .collect();
         expected.insert("type".to_string());
@@ -6928,6 +6962,78 @@ mod tests {
             let json = to_json(snapshot);
             assert_eq!(
                 identity_keys(&json),
+                vec![key.clone()],
+                "only {key} is sent"
+            );
+            assert_eq!(json[key.as_str()], 5, "value for {key}");
+        }
+    }
+
+    /// The event-log JSON carries each inbound concurrency value under its
+    /// own key (distinct non-zero values, so a swapped key is caught), with
+    /// the value serde gives.
+    #[test]
+    fn transport_snapshot_json_carries_inbound_concurrency_values() {
+        let snapshot = crate::transport::metrics::TransportSnapshot {
+            inbound_concurrency_conns_sampled: 81,
+            inbound_concurrency_conns_ge_8: 82,
+            inbound_concurrency_conns_ge_16: 83,
+            inbound_concurrency_conns_ge_32: 84,
+            inbound_concurrency_conns_ge_64: 85,
+            inbound_concurrency_conns_ge_128: 86,
+            inbound_concurrency_conns_ge_256: 87,
+            inbound_concurrency_max: 88,
+            ..Default::default()
+        };
+        let reference = serde_json::to_value(&snapshot).unwrap();
+        let json = event_kind_to_json(&super::super::EventKind::TransportSnapshot(Box::new(
+            snapshot,
+        )));
+        for (key, expected) in [
+            ("inbound_concurrency_conns_sampled", 81),
+            ("inbound_concurrency_conns_ge_8", 82),
+            ("inbound_concurrency_conns_ge_16", 83),
+            ("inbound_concurrency_conns_ge_32", 84),
+            ("inbound_concurrency_conns_ge_64", 85),
+            ("inbound_concurrency_conns_ge_128", 86),
+            ("inbound_concurrency_conns_ge_256", 87),
+            ("inbound_concurrency_max", 88),
+        ] {
+            assert_eq!(json[key], expected, "event-log value for {key}");
+            assert_eq!(json[key], reference[key], "serde value for {key}");
+        }
+    }
+
+    /// Each inbound concurrency key is in the event-log JSON exactly when
+    /// its value is non-zero, and every serde `inbound_concurrency_*` field
+    /// is covered.
+    #[test]
+    fn transport_snapshot_json_sends_inbound_concurrency_keys_only_when_nonzero() {
+        let to_json = |snapshot: crate::transport::metrics::TransportSnapshot| {
+            event_kind_to_json(&super::super::EventKind::TransportSnapshot(Box::new(
+                snapshot,
+            )))
+        };
+        let concurrency_keys = |json: &serde_json::Value| -> Vec<String> {
+            json.as_object()
+                .unwrap()
+                .keys()
+                .filter(|key| key.starts_with("inbound_concurrency_"))
+                .cloned()
+                .collect()
+        };
+        let zero = crate::transport::metrics::TransportSnapshot::default();
+        assert!(concurrency_keys(&to_json(zero.clone())).is_empty());
+
+        let serde_keys = concurrency_keys(&serde_json::to_value(&zero).unwrap());
+        assert_eq!(serde_keys.len(), 8, "one serde field per value");
+        for key in serde_keys {
+            let mut serde_value = serde_json::to_value(&zero).unwrap();
+            serde_value[key.as_str()] = serde_json::json!(5);
+            let snapshot = serde_json::from_value(serde_value).unwrap();
+            let json = to_json(snapshot);
+            assert_eq!(
+                concurrency_keys(&json),
                 vec![key.clone()],
                 "only {key} is sent"
             );

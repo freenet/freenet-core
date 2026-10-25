@@ -636,7 +636,8 @@ fn test_atomic_handshake_completion_no_packet_loss() {
     );
 
     // Create channel for established connection
-    let (established_tx, _established_rx) = mpsc::channel::<PacketData<UnknownEncryption>>(16);
+    let (established_tx, _established_rx) =
+        mpsc::channel::<crate::transport::peer_connection::InboundPacket>(16);
 
     // Complete the handshake atomically
     let completed = manager.complete_gateway_handshake(addr, established_tx);
@@ -675,7 +676,8 @@ fn test_recently_closed_prevents_asymmetric_decryption() {
     // Create an established connection
     let (tx, _rx) = mpsc::channel::<PacketData<UnknownEncryption>>(16);
     manager.start_gateway_handshake(addr, tx);
-    let (established_tx, _established_rx) = mpsc::channel::<PacketData<UnknownEncryption>>(16);
+    let (established_tx, _established_rx) =
+        mpsc::channel::<crate::transport::peer_connection::InboundPacket>(16);
     manager.complete_gateway_handshake(addr, established_tx);
     assert!(manager.is_established(&addr));
 
@@ -826,9 +828,10 @@ async fn test_try_send_established_never_blocks_when_full() {
     let addr: SocketAddr = "127.0.0.1:8002".parse().unwrap();
 
     // Establish a connection with a tiny channel and no consumer ever reading from it.
-    let (tx, _rx) = mpsc::channel::<PacketData<UnknownEncryption>>(CAPACITY);
-    let started = manager.start_gateway_handshake(addr, tx.clone());
+    let (handshake_tx, _handshake_rx) = mpsc::channel::<PacketData<UnknownEncryption>>(CAPACITY);
+    let started = manager.start_gateway_handshake(addr, handshake_tx);
     assert!(started, "Should start gateway handshake");
+    let (tx, _rx) = mpsc::channel::<crate::transport::peer_connection::InboundPacket>(CAPACITY);
     let completed = manager.complete_gateway_handshake(addr, tx);
     assert!(completed, "Should complete gateway handshake");
 
@@ -1124,4 +1127,100 @@ fn test_gateway_rate_limiter_admission_clock_is_max_of_real_and_virtual() {
             "effective elapsed is max(20s, 20s) = 20s (phase 1), not the 40s sum"
         );
     });
+}
+
+/// The listener stamps each packet it hands to an established connection
+/// with its own clock at the moment it queues it, and the stamps increase
+/// with that clock (`InboundPacket::queued_nanos`, read by the inbound
+/// concurrency estimate as the packet's arrival time).
+#[test]
+fn established_packets_are_stamped_when_queued() {
+    use super::ConnectionStateManager;
+    use crate::simulation::{TimeSource, VirtualTime};
+    use crate::transport::packet_data::{PacketData, UnknownEncryption};
+    use std::net::SocketAddr;
+    use std::time::Duration;
+    use tokio::net::UdpSocket;
+    use tokio::sync::mpsc;
+
+    let time = VirtualTime::new();
+    let mut manager: ConnectionStateManager<UdpSocket, VirtualTime> =
+        ConnectionStateManager::new(time.clone());
+    let addr: SocketAddr = "127.0.0.1:8003".parse().unwrap();
+    let (handshake_tx, _handshake_rx) = mpsc::channel::<PacketData<UnknownEncryption>>(4);
+    assert!(manager.start_gateway_handshake(addr, handshake_tx));
+    let (tx, mut rx) = mpsc::channel(4);
+    assert!(manager.complete_gateway_handshake(addr, tx));
+
+    time.advance(Duration::from_millis(3));
+    let first_at = time.now_nanos();
+    assert_eq!(
+        manager.try_send_established(&addr, PacketData::from_buf([1u8; 32])),
+        Ok(true)
+    );
+    time.advance(Duration::from_millis(7));
+    let second_at = time.now_nanos();
+    assert_eq!(
+        manager.try_send_established(&addr, PacketData::from_buf([2u8; 32])),
+        Ok(true)
+    );
+
+    let first = rx.try_recv().expect("first packet");
+    let second = rx.try_recv().expect("second packet");
+    assert_eq!(first.queued_nanos, first_at);
+    assert_eq!(second.queued_nanos, second_at);
+    assert!(first.queued_nanos > 0 && second.queued_nanos > first.queued_nanos);
+}
+
+/// Packets a gateway handshake buffered are forwarded in order, each
+/// stamped with the clock at the moment they are forwarded.
+#[test]
+fn handshake_buffered_packets_are_stamped_when_forwarded() {
+    use crate::simulation::{TimeSource, VirtualTime};
+    use crate::transport::packet_data::{PacketData, UnknownEncryption};
+    use std::net::SocketAddr;
+    use std::time::Duration;
+    use tokio::sync::mpsc;
+
+    let time = VirtualTime::new();
+    let addr: SocketAddr = "127.0.0.1:8004".parse().unwrap();
+    let (buffer_tx, mut buffer_rx) = mpsc::channel::<PacketData<UnknownEncryption>>(4);
+    for byte in [1u8, 2] {
+        buffer_tx
+            .try_send(PacketData::from_buf([byte; 32]))
+            .expect("buffer");
+    }
+    let (tx, mut rx) = mpsc::channel(4);
+    time.advance(Duration::from_millis(5));
+    let forwarded_at = time.now_nanos();
+    assert_eq!(
+        super::forward_handshake_buffered(&mut buffer_rx, &tx, &time, addr),
+        2
+    );
+    for byte in [1u8, 2] {
+        let packet = rx.try_recv().expect("forwarded packet");
+        assert_eq!(packet.packet.data()[0], byte, "forwarded in order");
+        assert_eq!(packet.queued_nanos, forwarded_at);
+    }
+    assert!(forwarded_at > 0);
+
+    // A full connection channel stops the drain: only what fit is counted,
+    // and the packet that did not fit is dropped, not left in the buffer.
+    for byte in [3u8, 4, 5] {
+        buffer_tx
+            .try_send(PacketData::from_buf([byte; 32]))
+            .expect("buffer");
+    }
+    let (small_tx, mut small_rx) = mpsc::channel(1);
+    assert_eq!(
+        super::forward_handshake_buffered(&mut buffer_rx, &small_tx, &time, addr),
+        1
+    );
+    assert_eq!(small_rx.try_recv().expect("forwarded").packet.data()[0], 3);
+    assert!(small_rx.try_recv().is_err());
+    assert_eq!(
+        buffer_rx.try_recv().expect("left in the buffer").data()[0],
+        5,
+        "the packet that did not fit is dropped"
+    );
 }

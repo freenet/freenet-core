@@ -262,6 +262,13 @@ impl<T: TimeSource> RollingRttStatsHandle<T> {
         self.gauge.record_keepalive(rtt);
     }
 
+    /// The connection's smoothed RTT as published to its gauge (the
+    /// data-ACK or keep-alive SRTT, whichever was updated last), or `None`
+    /// before the first sample. Telemetry only.
+    pub(crate) fn srtt(&self) -> Option<Duration> {
+        self.gauge.read().0.map(Duration::from_micros)
+    }
+
     /// This connection's per-connection RTT gauge (tests only).
     #[cfg(test)]
     pub(crate) fn gauge(&self) -> &ConnRttGauge {

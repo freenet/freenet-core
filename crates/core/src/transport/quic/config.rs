@@ -192,6 +192,10 @@ pub(crate) fn transport_config<T: TimeSource>(
 ) -> TransportConfig {
     let window = settings.window_bytes();
     let mut config = TransportConfig::default();
+    // No `max_ack_delay` is set, so quinn's default (25 ms) applies; the
+    // UDP-side inbound concurrency gauge assumes it
+    // (`peer_connection::inbound_concurrency::ACK_DELAY_ALLOWANCE`). If it
+    // is ever set here, change that constant to match.
     config
         .max_concurrent_uni_streams(VarInt::from_u32(MAX_UNI_STREAMS))
         .max_concurrent_bidi_streams(VarInt::from_u32(MAX_BIDI_STREAMS))
