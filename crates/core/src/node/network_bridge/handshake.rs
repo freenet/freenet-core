@@ -22,7 +22,8 @@ use crate::ring::{ConnectionManager, PeerKeyLocation};
 use crate::router::Router;
 use std::collections::HashMap;
 
-use crate::transport::{InboundAcceptor, OutboundConnector, PeerConnectionApi};
+use crate::transport::{InboundAcceptor, OutboundConnector, PeerConnectionApi, TransportPublicKey};
+use crate::util::time_source::{DynTimeSource, TimeSource};
 
 /// Events emitted by the handshake driver.
 ///
@@ -30,10 +31,12 @@ use crate::transport::{InboundAcceptor, OutboundConnector, PeerConnectionApi};
 /// allowing the same event loop code to work with both production (UdpTransportSocket) and
 /// testing (InMemorySocket) transports.
 pub(crate) enum Event {
-    /// A remote peer initiated or completed a connection to us.
+    /// A remote peer initiated or completed a connection to us. `matched`
+    /// says whether it matched an expected-inbound registration and, if so,
+    /// the key the connect op dialled.
     InboundConnection {
         transaction: Option<Transaction>,
-        peer: Option<PeerKeyLocation>,
+        matched: InboundMatch,
         connection: Box<dyn PeerConnectionApi>,
         transient: bool,
     },
@@ -58,13 +61,13 @@ impl std::fmt::Debug for Event {
         match self {
             Event::InboundConnection {
                 transaction,
-                peer,
+                matched,
                 connection,
                 transient,
             } => f
                 .debug_struct("InboundConnection")
                 .field("transaction", transaction)
-                .field("peer", peer)
+                .field("matched", matched)
                 .field("remote_addr", &connection.remote_addr())
                 .field("transient", transient)
                 .finish(),
@@ -96,6 +99,16 @@ impl std::fmt::Debug for Event {
     }
 }
 
+/// Whether an inbound connection matched an expected-inbound registration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum InboundMatch {
+    /// No registration for its address.
+    Unexpected,
+    /// A registration for its address, with the key the connect op is
+    /// dialling at that address, when the registration carried one.
+    Expected(Option<TransportPublicKey>),
+}
+
 /// Commands delivered from the event loop into the handshake driver.
 #[derive(Debug)]
 pub(crate) enum Command {
@@ -107,14 +120,20 @@ pub(crate) enum Command {
         /// Why this dial is made (telemetry only).
         origin: crate::transport::NatAttemptOrigin,
     },
-    /// Register expectation for an inbound connection from `peer`.
+    /// Register expectation for an inbound connection from `addr`, which the
+    /// connect op is dialling under `peer_key`. A matched connection is
+    /// recorded under that key, as a successful dial to it would be.
     ExpectInbound {
-        peer: PeerKeyLocation,
+        addr: SocketAddr,
+        peer_key: Option<TransportPublicKey>,
         transaction: Option<Transaction>,
         transient: bool,
     },
-    /// Remove state associated with `peer`.
-    DropConnection { peer: PeerKeyLocation },
+    /// Remove state associated with the connection at `addr`.
+    DropConnection { addr: SocketAddr },
+    /// Test only: answered once every command sent before it is processed.
+    #[cfg(test)]
+    Barrier(tokio::sync::oneshot::Sender<()>),
 }
 
 #[derive(Clone)]
@@ -162,12 +181,13 @@ impl HandshakeHandler {
         _this_location: Option<Location>,
         _is_gateway: bool,
         peer_ready: Option<Arc<std::sync::atomic::AtomicBool>>,
+        clock: DynTimeSource,
     ) -> (Self, CommandSender) {
         let (cmd_tx, cmd_rx) = mpsc::channel(128);
         let (event_tx, event_rx) = mpsc::channel(128);
 
         GlobalExecutor::spawn(async move {
-            run_driver(inbound, outbound, cmd_rx, event_tx, peer_ready).await;
+            run_driver(inbound, outbound, cmd_rx, event_tx, peer_ready, clock).await;
         });
 
         (
@@ -187,9 +207,42 @@ impl Stream for HandshakeHandler {
     }
 }
 
+/// How long after its registration an expected-inbound registration's key
+/// is honoured. An acceptor registers when it accepts a joiner; the joiner
+/// may still be collecting acceptors for up to `OPERATION_TTL` before it
+/// dials them, keeps finishing those dials for up to `DIAL_DRAIN_LIMIT` after
+/// it stops collecting, and each dial's handshake may take up to
+/// `OUTBOUND_CONNECT_TIMEOUT`. A connection from that address after this
+/// window is not bound to the registration's key (the address may since
+/// belong to someone else).
+///
+/// No fixed window covers every honest case: the first stage of a dial
+/// (handing it to the transport) is not bounded (#5947). An inbound
+/// connection that arrives after the window starts without a key, as one
+/// did before matched connections were bound: a later ConnectRequest or
+/// ConnectPeer names it, or the unpromoted-connection sweep removes it.
+pub(crate) const EXPECTED_INBOUND_WINDOW: Duration = Duration::from_secs(100);
+
+// The window covers the joiner's collection, dial drain and one handshake.
+// Compared in milliseconds so a sub-second part is not truncated away.
+const _: () = assert!(
+    EXPECTED_INBOUND_WINDOW.as_millis()
+        >= crate::config::OPERATION_TTL.as_millis()
+            + crate::operations::connect::op_ctx_task::DIAL_DRAIN_LIMIT.as_millis()
+            + OUTBOUND_CONNECT_TIMEOUT.as_millis()
+);
+
+/// How often the handshake driver sweeps expired expectations when no
+/// registration or match does it.
+const EXPECTED_INBOUND_SWEEP_INTERVAL: Duration = Duration::from_secs(50);
+const _: () =
+    assert!(EXPECTED_INBOUND_SWEEP_INTERVAL.as_millis() * 2 <= EXPECTED_INBOUND_WINDOW.as_millis());
+
 #[derive(Debug)]
 struct ExpectedInbound {
-    peer: PeerKeyLocation,
+    peer_key: Option<TransportPublicKey>,
+    /// When it was registered, for [`EXPECTED_INBOUND_WINDOW`].
+    registered_at: tokio::time::Instant,
     transaction: Option<Transaction>,
     transient: bool, // TODO: rename to transient in protocol once we migrate terminology
 }
@@ -197,21 +250,50 @@ struct ExpectedInbound {
 /// Matches accepted connections to the connect operations that expect them,
 /// by socket address. Node-side bookkeeping, distinct from the transport's
 /// expected-IP set (`InboundExpectations`).
-#[derive(Default)]
+///
+/// Bounded by time: a registration older than [`EXPECTED_INBOUND_WINDOW`]
+/// is swept on the next registration or match, and at the latest by the
+/// driver's periodic sweep ([`EXPECTED_INBOUND_SWEEP_INTERVAL`]), so no
+/// entry outlives the window by more than one interval. A match against one
+/// that has expired but not yet been swept is reported without its key.
 struct InboundMatcher {
     entries: HashMap<SocketAddr, ExpectedInbound>,
+    clock: DynTimeSource,
 }
 
 impl InboundMatcher {
+    fn new(clock: DynTimeSource) -> Self {
+        Self {
+            entries: HashMap::new(),
+            clock,
+        }
+    }
+
+    fn expired(&self, entry: &ExpectedInbound, now: tokio::time::Instant) -> bool {
+        now.saturating_duration_since(entry.registered_at) > EXPECTED_INBOUND_WINDOW
+    }
+
+    /// Remove every registration older than the window.
+    fn sweep(&mut self) {
+        let now = self.clock.now();
+        let before = self.entries.len();
+        self.entries.retain(|_, entry| {
+            now.saturating_duration_since(entry.registered_at) <= EXPECTED_INBOUND_WINDOW
+        });
+        let swept = before - self.entries.len();
+        if swept > 0 {
+            tracing::debug!(swept, "ExpectInbound: swept expired expectations");
+        }
+    }
+
     fn register(
         &mut self,
-        peer: PeerKeyLocation,
+        addr: SocketAddr,
+        peer_key: Option<TransportPublicKey>,
         transaction: Option<Transaction>,
         transient: bool,
     ) {
-        let addr = peer
-            .socket_addr()
-            .expect("ExpectInbound requires known peer address");
+        self.sweep();
         tracing::debug!(
             remote = %addr,
             transient,
@@ -222,25 +304,36 @@ impl InboundMatcher {
         self.entries.insert(
             addr,
             ExpectedInbound {
-                peer,
+                peer_key,
+                registered_at: self.clock.now(),
                 transaction,
                 transient,
             },
         );
     }
 
-    fn drop_peer(&mut self, peer: &PeerKeyLocation) {
-        if let Some(addr) = peer.socket_addr() {
-            self.entries.remove(&addr);
-        }
+    fn drop_addr(&mut self, addr: SocketAddr) {
+        self.entries.remove(&addr);
     }
 
+    /// Take the registration for `addr`. One older than the window is
+    /// returned without its key: the connection is not the one it asked for.
     fn consume(&mut self, addr: SocketAddr) -> Option<ExpectedInbound> {
-        let entry = self.entries.remove(&addr);
+        let mut entry = self.entries.remove(&addr);
+        let now = self.clock.now();
+        if let Some(found) = entry.as_mut() {
+            if found.peer_key.is_some() && self.expired(found, now) {
+                tracing::debug!(
+                    remote = %addr,
+                    "ExpectInbound: expectation outlived its window; not binding its key"
+                );
+                found.peer_key = None;
+            }
+        }
+        self.sweep();
         if let Some(entry) = &entry {
             tracing::debug!(
                 remote = %addr,
-                peer = %entry.peer,
                 transient = entry.transient,
                 tx = ?entry.transaction,
                 "ExpectInbound: matched by socket address"
@@ -266,22 +359,39 @@ async fn run_driver(
     mut commands_rx: mpsc::Receiver<Command>,
     events_tx: mpsc::Sender<Event>,
     peer_ready: Option<Arc<std::sync::atomic::AtomicBool>>,
+    clock: DynTimeSource,
 ) {
     use tokio::select;
 
-    let mut expected_inbound = InboundMatcher::default();
+    let mut expected_inbound = InboundMatcher::new(clock);
+    // Guarantees expiry when no registration or match sweeps. Paced by
+    // tokio time; what is expired is decided by the injected clock. The
+    // first tick is one interval out: `interval` would fire at once, and a
+    // sweep then has nothing to remove.
+    let mut sweep_timer = tokio::time::interval_at(
+        tokio::time::Instant::now() + EXPECTED_INBOUND_SWEEP_INTERVAL,
+        EXPECTED_INBOUND_SWEEP_INTERVAL,
+    );
+    sweep_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     loop {
         select! {
+            _ = sweep_timer.tick() => expected_inbound.sweep(),
             command = commands_rx.recv() => match command {
                 Some(Command::Connect { peer, transaction, transient, origin }) => {
                     spawn_outbound(outbound.clone(), events_tx.clone(), peer, transaction, transient, origin, peer_ready.clone());
                 }
-            Some(Command::ExpectInbound { peer, transaction, transient }) => {
-                    expected_inbound.register(peer, transaction, transient /* transient */);
-            }
-                Some(Command::DropConnection { peer }) => {
-                    expected_inbound.drop_peer(&peer);
+                Some(Command::ExpectInbound { addr, peer_key, transaction, transient }) => {
+                    expected_inbound.register(addr, peer_key, transaction, transient);
+                }
+                Some(Command::DropConnection { addr }) => {
+                    expected_inbound.drop_addr(addr);
+                }
+                #[cfg(test)]
+                Some(Command::Barrier(done)) => {
+                    // The test may have stopped waiting.
+                    #[allow(clippy::let_underscore_must_use)]
+                    let _ = done.send(());
                 }
                 None => break,
             },
@@ -294,14 +404,14 @@ async fn run_driver(
 
                         let remote_addr = conn.remote_addr();
                         let entry = expected_inbound.consume(remote_addr);
-                        let (peer, transaction, transient) = if let Some(entry) = entry {
-                            (Some(entry.peer), entry.transaction, entry.transient)
+                        let (matched, transaction, transient) = if let Some(entry) = entry {
+                            (InboundMatch::Expected(entry.peer_key), entry.transaction, entry.transient)
                         } else {
                             tracing::debug!(
                                 remote = %remote_addr,
                                 "Received unexpected inbound connection (no matching expectation)"
                             );
-                            (None, None, false)
+                            (InboundMatch::Unexpected, None, false)
                         };
 
                         // Bounded send (#4145), NOT an unconditional drop.
@@ -347,7 +457,7 @@ async fn run_driver(
                             .send_timeout(
                                 Event::InboundConnection {
                                     transaction,
-                                    peer,
+                                    matched,
                                     connection: conn,
                                     transient,
                                 },
@@ -468,6 +578,10 @@ mod tests {
     use crate::transport::{TransportError, TransportKeypair};
     use std::net::{IpAddr, Ipv4Addr};
 
+    fn matcher() -> InboundMatcher {
+        InboundMatcher::new(Arc::new(crate::util::time_source::InstantTimeSrc::new()))
+    }
+
     fn make_peer(port: u16) -> PeerKeyLocation {
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
         let keypair = TransportKeypair::new();
@@ -561,6 +675,7 @@ mod tests {
             cmd_rx,
             event_tx,
             None,
+            Arc::new(crate::util::time_source::InstantTimeSrc::new()),
         ));
         cmd_tx
             .send(Command::Connect {
@@ -582,8 +697,9 @@ mod tests {
     }
 
     /// The accept loop, driven through `Box<dyn InboundAcceptor>`: an
-    /// expected connection is reported with its peer, transaction and
-    /// transient flag; an unexpected one with none of them; each accept marks
+    /// expected connection is reported as matched, with the key, transaction
+    /// and transient flag its registration carried; an unexpected one with
+    /// none of them; each accept marks
     /// the peer ready; and the driver stops when the acceptor yields `None`.
     #[tokio::test(start_paused = true)]
     async fn run_driver_reports_accepted_connections_and_stops_with_the_acceptor() {
@@ -601,14 +717,16 @@ mod tests {
             cmd_rx,
             event_tx,
             Some(ready.clone()),
+            Arc::new(crate::util::time_source::InstantTimeSrc::new()),
         ));
 
-        let expected = make_peer(4300);
-        let expected_addr = expected.socket_addr().unwrap();
+        let expected_addr: SocketAddr = "127.0.0.1:4300".parse().unwrap();
+        let expected_key = TransportKeypair::new().public().clone();
         let tx = Transaction::new::<ConnectMsg>();
         cmd_tx
             .send(Command::ExpectInbound {
-                peer: expected.clone(),
+                addr: expected_addr,
+                peer_key: Some(expected_key.clone()),
                 transaction: Some(tx),
                 transient: true,
             })
@@ -624,14 +742,14 @@ mod tests {
             .unwrap();
         let Some(Event::InboundConnection {
             transaction,
-            peer,
+            matched,
             connection,
             transient,
         }) = event_rx.recv().await
         else {
             panic!("expected an InboundConnection");
         };
-        assert_eq!(peer, Some(expected));
+        assert_eq!(matched, InboundMatch::Expected(Some(expected_key)));
         assert_eq!(transaction, Some(tx));
         assert!(transient);
         assert_eq!(connection.remote_addr(), expected_addr);
@@ -645,14 +763,14 @@ mod tests {
             .unwrap();
         let Some(Event::InboundConnection {
             transaction,
-            peer,
+            matched,
             connection,
             transient,
         }) = event_rx.recv().await
         else {
             panic!("expected an InboundConnection");
         };
-        assert_eq!(peer, None);
+        assert_eq!(matched, InboundMatch::Unexpected);
         assert_eq!(transaction, None);
         assert!(!transient);
         assert_eq!(connection.remote_addr(), stranger);
@@ -853,42 +971,148 @@ mod tests {
 
     #[test]
     fn tracker_returns_registered_entry_exactly_once() {
-        let mut tracker = InboundMatcher::default();
-        let peer = make_peer(4100);
-        let addr = peer.socket_addr().unwrap();
+        let mut tracker = matcher();
+        let addr = make_peer(4100).socket_addr().unwrap();
         let tx = Transaction::new::<ConnectMsg>();
-        tracker.register(peer.clone(), Some(tx), true);
+        tracker.register(addr, None, Some(tx), true);
 
         let entry = tracker
             .consume(addr)
             .expect("expected registered inbound entry");
-        assert_eq!(entry.peer, peer);
         assert_eq!(entry.transaction, Some(tx));
         assert!(entry.transient);
         assert!(tracker.consume(addr).is_none());
     }
 
+    fn key() -> TransportPublicKey {
+        TransportKeypair::new().public().clone()
+    }
+
+    /// Inside the window a match carries the registration's key; at the
+    /// window's end it still does.
+    #[test]
+    fn a_match_inside_the_window_carries_the_key() {
+        let clock = crate::util::time_source::SharedMockTimeSource::new();
+        let mut tracker = InboundMatcher::new(Arc::new(clock.clone()));
+        let addr = make_peer(4110).socket_addr().unwrap();
+        let peer_key = key();
+        tracker.register(addr, Some(peer_key.clone()), None, false);
+        clock.advance_time(EXPECTED_INBOUND_WINDOW);
+        let entry = tracker.consume(addr).expect("registered");
+        assert_eq!(entry.peer_key, Some(peer_key));
+    }
+
+    /// A match against a registration that has outlived the window is still
+    /// a match, but without the key: the address may now be someone else's.
+    #[test]
+    fn a_match_after_the_window_carries_no_key() {
+        let clock = crate::util::time_source::SharedMockTimeSource::new();
+        let mut tracker = InboundMatcher::new(Arc::new(clock.clone()));
+        let addr = make_peer(4120).socket_addr().unwrap();
+        tracker.register(addr, Some(key()), None, false);
+        clock.advance_time(EXPECTED_INBOUND_WINDOW + Duration::from_millis(1));
+        let entry = tracker.consume(addr).expect("still matched");
+        assert_eq!(entry.peer_key, None);
+        assert!(tracker.consume(addr).is_none(), "consumed once");
+    }
+
+    /// With no further registration or match, the driver's periodic sweep
+    /// still removes an expired registration: a connection from its address
+    /// afterwards is unexpected rather than matched.
+    #[tokio::test(start_paused = true)]
+    async fn the_driver_sweeps_expired_registrations_without_traffic() {
+        let clock = crate::util::time_source::SharedMockTimeSource::new();
+        let (conn_tx, conn_rx) = mpsc::channel(4);
+        let (cmd_tx, cmd_rx) = mpsc::channel(4);
+        let (event_tx, mut event_rx) = mpsc::channel(4);
+        let driver = GlobalExecutor::spawn(run_driver(
+            Box::new(ChannelAcceptor(conn_rx)),
+            Arc::new(ScriptedConnector {
+                enqueue: Duration::ZERO,
+                handshake: Handshake::Hangs,
+                origins: Default::default(),
+            }),
+            cmd_rx,
+            event_tx,
+            None,
+            Arc::new(clock.clone()),
+        ));
+        let addr: SocketAddr = "127.0.0.1:4140".parse().unwrap();
+        cmd_tx
+            .send(Command::ExpectInbound {
+                addr,
+                peer_key: Some(key()),
+                transaction: None,
+                transient: false,
+            })
+            .await
+            .unwrap();
+        let (done, processed) = tokio::sync::oneshot::channel();
+        cmd_tx.send(Command::Barrier(done)).await.unwrap();
+        processed.await.unwrap();
+
+        // The registration expires; only the timer can sweep it now.
+        clock.advance_time(EXPECTED_INBOUND_WINDOW + Duration::from_secs(1));
+        tokio::time::sleep(EXPECTED_INBOUND_SWEEP_INTERVAL + Duration::from_secs(1)).await;
+
+        conn_tx
+            .send(Box::new(NullConnection(addr)))
+            .await
+            .ok()
+            .unwrap();
+        let Some(Event::InboundConnection { matched, .. }) = event_rx.recv().await else {
+            panic!("expected an InboundConnection");
+        };
+        assert_eq!(
+            matched,
+            InboundMatch::Unexpected,
+            "the expired entry was swept"
+        );
+        driver.abort();
+    }
+
+    /// Expired registrations are swept on the next registration and on the
+    /// next match, so the map does not keep them.
+    #[test]
+    fn expired_registrations_are_swept() {
+        let clock = crate::util::time_source::SharedMockTimeSource::new();
+        let mut tracker = InboundMatcher::new(Arc::new(clock.clone()));
+        let (old, recent, other) = (
+            make_peer(4130).socket_addr().unwrap(),
+            make_peer(4131).socket_addr().unwrap(),
+            make_peer(4132).socket_addr().unwrap(),
+        );
+        tracker.register(old, Some(key()), None, false);
+        clock.advance_time(EXPECTED_INBOUND_WINDOW + Duration::from_millis(1));
+        tracker.register(recent, Some(key()), None, false);
+        assert!(!tracker.contains(old), "swept on registration");
+        assert!(tracker.contains(recent));
+
+        clock.advance_time(EXPECTED_INBOUND_WINDOW + Duration::from_millis(1));
+        assert!(tracker.consume(other).is_none());
+        assert!(!tracker.contains(recent), "swept on a match");
+        assert!(tracker.entries.is_empty());
+    }
+
     #[test]
     fn tracker_drop_removes_entry() {
-        let mut tracker = InboundMatcher::default();
-        let peer = make_peer(4200);
-        let addr = peer.socket_addr().unwrap();
-        tracker.register(peer.clone(), None, false);
+        let mut tracker = matcher();
+        let addr = make_peer(4200).socket_addr().unwrap();
+        tracker.register(addr, None, None, false);
         assert!(tracker.contains(addr));
 
-        tracker.drop_peer(&peer);
+        tracker.drop_addr(addr);
         assert!(!tracker.contains(addr));
         assert!(tracker.consume(addr).is_none());
     }
 
     #[test]
     fn tracker_overwrites_existing_expectation() {
-        let mut tracker = InboundMatcher::default();
-        let peer = make_peer(4300);
-        let addr = peer.socket_addr().unwrap();
-        tracker.register(peer.clone(), None, false);
+        let mut tracker = matcher();
+        let addr = make_peer(4300).socket_addr().unwrap();
+        tracker.register(addr, None, None, false);
         let new_tx = Transaction::new::<ConnectMsg>();
-        tracker.register(peer.clone(), Some(new_tx), true);
+        tracker.register(addr, None, Some(new_tx), true);
         let transactions = tracker.transactions_for(addr).expect("entry should exist");
         assert_eq!(transactions, vec![Some(new_tx)]);
 
@@ -901,25 +1125,21 @@ mod tests {
 
     #[test]
     fn tracker_keeps_peers_separate_on_same_ip() {
-        let mut tracker = InboundMatcher::default();
-        let peer_a = make_peer(4400);
-        let peer_b = make_peer(4401);
-        let addr_a = peer_a.socket_addr().unwrap();
-        let addr_b = peer_b.socket_addr().unwrap();
+        let mut tracker = matcher();
+        let addr_a = make_peer(4400).socket_addr().unwrap();
+        let addr_b = make_peer(4401).socket_addr().unwrap();
 
-        tracker.register(peer_a.clone(), None, false);
-        tracker.register(peer_b.clone(), None, true);
+        tracker.register(addr_a, None, None, false);
+        tracker.register(addr_b, None, None, true);
 
         let first = tracker
             .consume(addr_a)
             .expect("first peer should be matched by exact socket");
-        assert_eq!(first.peer, peer_a);
         assert!(!first.transient);
 
         let second = tracker
             .consume(addr_b)
             .expect("second peer should still be tracked independently");
-        assert_eq!(second.peer, peer_b);
         assert!(second.transient);
     }
 
@@ -928,22 +1148,22 @@ mod tests {
         // Channel capacity 1 — fill it, then verify try_send returns false
         let (tx, _rx) = mpsc::channel(1);
         let sender = CommandSender(tx);
-        let peer = make_peer(4500);
+        let addr = make_peer(4500).socket_addr().unwrap();
 
         // First send should succeed
-        assert!(sender.try_send(Command::DropConnection { peer: peer.clone() }));
+        assert!(sender.try_send(Command::DropConnection { addr }));
         // Channel is now full — second send should return false, not block
-        assert!(!sender.try_send(Command::DropConnection { peer }));
+        assert!(!sender.try_send(Command::DropConnection { addr }));
     }
 
     #[test]
     fn command_sender_try_send_returns_false_when_closed() {
         let (tx, rx) = mpsc::channel(16);
         let sender = CommandSender(tx);
-        let peer = make_peer(4600);
+        let addr = make_peer(4600).socket_addr().unwrap();
         drop(rx); // Close the channel
 
-        assert!(!sender.try_send(Command::DropConnection { peer }));
+        assert!(!sender.try_send(Command::DropConnection { addr }));
     }
 
     /// SITE 8 source-scrape pin (#4145): the run_driver inbound-accept arm must

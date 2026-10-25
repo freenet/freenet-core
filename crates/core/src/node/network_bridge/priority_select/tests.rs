@@ -2883,7 +2883,7 @@ impl Stream for MockHandshakeReceiverStream {
 fn dummy_handshake_event() -> crate::node::network_bridge::handshake::Event {
     crate::node::network_bridge::handshake::Event::InboundConnection {
         transaction: None,
-        peer: None,
+        matched: crate::node::network_bridge::handshake::InboundMatch::Unexpected,
         connection: Box::new(MockPeerConnection {
             addr: "127.0.0.1:9999".parse().unwrap(),
         }),

@@ -923,9 +923,11 @@ pub(crate) enum NodeEvent {
         /// Whether this was a node-internal subscription renewal (no client waiting).
         is_renewal: bool,
     },
-    /// Register expectation for an inbound connection from the given peer.
+    /// Register expectation for an inbound connection from the peer at
+    /// `addr`, which the connect op is dialling under `peer_key`.
     ExpectPeerConnection {
         addr: SocketAddr,
+        peer_key: crate::transport::TransportPublicKey,
     },
     /// Broadcast a proximity cache message to all connected peers.
     BroadcastHostingUpdate {
@@ -1084,7 +1086,7 @@ impl Display for NodeEvent {
                     "Local subscribe complete (tx: {tx}, key: {key}, subscribed: {subscribed})"
                 )
             }
-            NodeEvent::ExpectPeerConnection { addr } => {
+            NodeEvent::ExpectPeerConnection { addr, .. } => {
                 write!(f, "ExpectPeerConnection (from {addr})")
             }
             NodeEvent::BroadcastHostingUpdate { message } => {

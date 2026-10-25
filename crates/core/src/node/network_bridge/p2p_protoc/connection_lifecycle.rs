@@ -18,14 +18,6 @@ fn insert_addr_by_pub_key(
     if key == *own_key {
         TRANSPORT_METRICS.record_conn_identity(addr, ConnIdentity::OwnKey);
     }
-    // An expected inbound connection holds the placeholder (this node's own
-    // key) until the connect op names the peer, so several can hold it at
-    // once in ordinary operation; recording it is not counted as
-    // `duplicate_key`. Any other connection recorded under this node's key
-    // is counted normally.
-    let is_placeholder = connections
-        .get(&addr)
-        .is_some_and(|entry| entry.placeholder.is_some());
     let duplicate = |previous: SocketAddr, key: &TransportPublicKey| {
         previous != addr
             && connections
@@ -33,7 +25,7 @@ fn insert_addr_by_pub_key(
                 .is_some_and(|entry| entry.pub_key.as_ref() == Some(key))
     };
     let previous = addr_by_pub_key.get(&key).copied();
-    if !is_placeholder && previous.is_some_and(|previous| duplicate(previous, &key)) {
+    if previous.is_some_and(|previous| duplicate(previous, &key)) {
         TRANSPORT_METRICS.record_conn_identity(addr, ConnIdentity::DuplicateKey);
     }
     addr_by_pub_key.insert(key, addr);
@@ -41,20 +33,15 @@ fn insert_addr_by_pub_key(
 
 /// The identity kind for a connection whose recorded key is `recorded`
 /// when a ConnectRequest or ConnectPeer names `claimed`: one of the path's
-/// `set`, `same` or `changed` kinds, or `on_placeholder()` when the
-/// connection holds the expected-inbound placeholder and the claim names
-/// another key.
+/// `set`, `same` or `changed` kinds.
 fn classify_identity_claim(
     recorded: Option<&TransportPublicKey>,
     claimed: &TransportPublicKey,
-    is_placeholder: bool,
     [set, same, changed]: [ConnIdentity; 3],
-    on_placeholder: impl FnOnce() -> ConnIdentity,
 ) -> ConnIdentity {
     match recorded {
         None => set,
         Some(recorded) if recorded == claimed => same,
-        Some(_) if is_placeholder => on_placeholder(),
         Some(_) => changed,
     }
 }
@@ -80,16 +67,13 @@ impl P2pConnManager {
     /// cleanup is not keyed by a key recorded for
     /// this connection: either it has none (`teardown_unidentified`) or
     /// `addr_by_pub_key` maps its key to another connection
-    /// (`teardown_key_elsewhere`) or to none (`teardown_key_unmapped`). A
-    /// connection still holding the expected-inbound placeholder is not
-    /// counted: several can hold it at once in ordinary operation. Call
+    /// (`teardown_key_elsewhere`) or to none (`teardown_key_unmapped`). Call
     /// before `addr_by_pub_key` is changed.
     fn record_identity_teardown(&self, addr: SocketAddr, entry: &ConnectionEntry) {
         match &entry.pub_key {
             None => {
                 TRANSPORT_METRICS.record_conn_identity(addr, ConnIdentity::TeardownUnidentified)
             }
-            Some(_) if entry.placeholder.is_some() => {}
             Some(key) => {
                 match self.addr_by_pub_key.get(key) {
                     Some(mapped) if *mapped == addr => {}
@@ -99,6 +83,69 @@ impl P2pConnManager {
                         .record_conn_identity(addr, ConnIdentity::TeardownKeyUnmapped),
                 }
             }
+        }
+    }
+
+    /// The peer that disconnect cleanup of the connection at `addr` passes to
+    /// `Ring::prune_connection`: the key recorded for the connection, or,
+    /// for a connection that never named one, this node's own key. That
+    /// fallback reaches nothing keyed by peer: `prune_connection` prunes by
+    /// address and uses the key only in its log line and in the disconnect
+    /// event it emits for a ring connection, and every ring connection has a
+    /// recorded key. Callers must not pass the fallback key to anything else
+    /// (`on_ring_connection_lost` runs only for a recorded key).
+    pub(super) fn teardown_peer_id(
+        &self,
+        addr: SocketAddr,
+        recorded: Option<&TransportPublicKey>,
+    ) -> PeerId {
+        let key = recorded
+            .cloned()
+            .unwrap_or_else(|| (*self.bridge.op_manager.ring.connection_manager.pub_key).clone());
+        PeerId::new(key, addr)
+    }
+
+    /// `NodeEvent::ExpectPeerConnection`: a connect op expects a connection
+    /// from `addr` and is dialling it under `peer_key`. Registers the address
+    /// with the transport and, with the key, with the handshake driver, so a
+    /// matched inbound connection is recorded and promoted under the key the
+    /// connect op dialled, as the dial itself would be if it succeeded.
+    pub(super) fn handle_expect_peer_connection(
+        addr: SocketAddr,
+        peer_key: TransportPublicKey,
+        state: &EventListenerState,
+        handshake_cmd_sender: &HandshakeCommandSender,
+    ) {
+        tracing::debug!(
+            peer_addr = %addr,
+            direction = "inbound",
+            phase = "connect",
+            "Expecting peer connection - registering with handshake handler"
+        );
+        state.expected_inbound.expect_incoming(addr);
+        // Non-blocking (#4145): this runs on the event-loop task, so a
+        // `.send().await` that back-pressures on the handshake command channel
+        // (cap 128) would stall the loop. Dropping the ExpectInbound
+        // registration is recoverable: when the inbound connection actually
+        // arrives without a matching expectation it is still accepted
+        // provisionally (see handle_handshake_action, "accepting
+        // provisionally"), and the originating connect op retries if its
+        // handshake does not complete. We `warn!` because a dropped
+        // expectation makes admission less reliable under load.
+        if !handshake_cmd_sender.try_send(HandshakeCommand::ExpectInbound {
+            addr,
+            peer_key: Some(peer_key),
+            transaction: None,
+            transient: false,
+        }) {
+            tracing::warn!(
+                peer_addr = %addr,
+                phase = "connect",
+                "Handshake command channel full/closed; dropped \
+                 ExpectInbound registration. Inbound connection will \
+                 be accepted provisionally; connect op retries if the \
+                 handshake does not complete."
+            );
         }
     }
 
@@ -117,14 +164,6 @@ impl P2pConnManager {
             return false;
         };
 
-        let peer = if let Some(ref pub_key) = entry.pub_key {
-            PeerKeyLocation::new(pub_key.clone(), peer_addr)
-        } else {
-            PeerKeyLocation::new(
-                (*self.bridge.op_manager.ring.connection_manager.pub_key).clone(),
-                peer_addr,
-            )
-        };
         let pub_key_to_remove = entry.pub_key.clone();
         self.record_identity_teardown(peer_addr, entry);
 
@@ -141,11 +180,12 @@ impl P2pConnManager {
         // redundant teardown — we remove the connection from ctx.connections /
         // addr_by_pub_key and prune the ring below regardless. A missed
         // DropConnection leaves at most one stale per-SocketAddr
-        // InboundMatcher entry (no TTL sweep, but overwritten on the
-        // next register() and consumed on a matching inbound — bounded, benign).
-        if !handshake_cmd_sender.try_send(HandshakeCommand::DropConnection { peer: peer.clone() }) {
+        // InboundMatcher entry for the address, which the driver sweeps once
+        // it outlives EXPECTED_INBOUND_WINDOW and whose key it does not honour
+        // after that.
+        if !handshake_cmd_sender.try_send(HandshakeCommand::DropConnection { addr: peer_addr }) {
             tracing::warn!(
-                peer = %peer,
+                peer_addr = %peer_addr,
                 phase = "disconnect",
                 "Handshake command channel full/closed; skipping redundant drop notification"
             );
@@ -157,7 +197,7 @@ impl P2pConnManager {
             .op_manager
             .ring
             .prune_connection(
-                PeerId::new(peer.pub_key().clone(), peer_addr),
+                self.teardown_peer_id(peer_addr, pub_key_to_remove.as_ref()),
                 reason.clone(),
             )
             .await;
@@ -172,10 +212,11 @@ impl P2pConnManager {
             self.handle_broadcast_ready_state(false).await;
         }
 
-        // Forget this peer's subscriptions and cached contract state
-        self.bridge
-            .op_manager
-            .on_ring_connection_lost(peer.pub_key());
+        // Forget this peer's subscriptions and cached contract state. A
+        // connection that never named a peer has none.
+        if let Some(pub_key) = &pub_key_to_remove {
+            self.bridge.op_manager.on_ring_connection_lost(pub_key);
+        }
 
         if let Some(conn) = self.connections.remove(&peer_addr) {
             if let Some(pub_key) = pub_key_to_remove {
@@ -231,14 +272,6 @@ impl P2pConnManager {
             return;
         };
 
-        let peer = if let Some(ref pub_key) = entry.pub_key {
-            PeerKeyLocation::new(pub_key.clone(), peer_addr)
-        } else {
-            PeerKeyLocation::new(
-                (*self.bridge.op_manager.ring.connection_manager.pub_key).clone(),
-                peer_addr,
-            )
-        };
         let pub_key_to_remove = entry.pub_key.clone();
         self.record_identity_teardown(peer_addr, entry);
 
@@ -246,9 +279,9 @@ impl P2pConnManager {
         // For zombie transports (already established connections), the expected_inbound
         // entry was already consumed when the inbound connection arrived, so the
         // DropConnection command is effectively a no-op.
-        if !handshake_cmd_sender.try_send(HandshakeCommand::DropConnection { peer: peer.clone() }) {
+        if !handshake_cmd_sender.try_send(HandshakeCommand::DropConnection { addr: peer_addr }) {
             tracing::debug!(
-                peer = %peer,
+                peer_addr = %peer_addr,
                 "Handshake channel full during zombie cleanup, skipping handshake notification"
             );
         }
@@ -259,7 +292,7 @@ impl P2pConnManager {
             .op_manager
             .ring
             .prune_connection(
-                PeerId::new(peer.pub_key().clone(), peer_addr),
+                self.teardown_peer_id(peer_addr, pub_key_to_remove.as_ref()),
                 crate::tracing::DisconnectReason::Explicit("unpromoted_transport".into()),
             )
             .await;
@@ -273,10 +306,11 @@ impl P2pConnManager {
             self.handle_broadcast_ready_state(false).await;
         }
 
-        // Forget subscriptions and cached contract state
-        self.bridge
-            .op_manager
-            .on_ring_connection_lost(peer.pub_key());
+        // Forget subscriptions and cached contract state. A connection that
+        // never named a peer has none.
+        if let Some(pub_key) = &pub_key_to_remove {
+            self.bridge.op_manager.on_ring_connection_lost(pub_key);
+        }
 
         // Remove from transport tracking and notify the per-connection task
         if let Some(conn) = self.connections.remove(&peer_addr) {
@@ -454,17 +488,13 @@ impl P2pConnManager {
                         .ok();
                     return Ok(());
                 }
-                // Promoting under a key other than the connection's own,
-                // unless the connection holds the expected-inbound
-                // placeholder (counted as `connect_peer_on_placeholder`
-                // below).
+                // Promoting under a key other than the connection's own.
                 let promotes_under_other_key =
                     self.connections.get(&peer_addr).is_some_and(|entry| {
-                        entry.placeholder.is_none()
-                            && entry
-                                .pub_key
-                                .as_ref()
-                                .is_some_and(|recorded| recorded != peer.pub_key())
+                        entry
+                            .pub_key
+                            .as_ref()
+                            .is_some_and(|recorded| recorded != peer.pub_key())
                     });
                 // #4787 instrumentation: count the promotion only if the ring
                 // actually took the connection. `add_connection`'s own `bool`
@@ -563,20 +593,14 @@ impl P2pConnManager {
                     let kind = classify_identity_claim(
                         entry.pub_key.as_ref(),
                         peer.pub_key(),
-                        entry.placeholder.is_some(),
                         [
                             // Not reachable: this branch has a recorded key.
                             ConnIdentity::SetConnectPeer,
                             ConnIdentity::SameConnectPeer,
                             ConnIdentity::ChangedConnectPeer,
                         ],
-                        // ConnectPeer leaves the placeholder in place.
-                        || ConnIdentity::ConnectPeerOnPlaceholder,
                     );
                     TRANSPORT_METRICS.record_conn_identity(peer_addr, kind);
-                    if let Some(placeholder) = &mut entry.placeholder {
-                        placeholder.connect_peer_key = Some(peer.pub_key().clone());
-                    }
                     tracing::info!(
                         tx = %tx,
                         %peer_addr,
@@ -787,11 +811,11 @@ impl P2pConnManager {
         match event {
             HandshakeEvent::InboundConnection {
                 transaction,
-                peer,
+                matched,
                 connection,
                 transient,
             } => {
-                tracing::info!(provided = ?peer, transient, tx = ?transaction, "InboundConnection event");
+                tracing::info!(?matched, transient, tx = ?transaction, "InboundConnection event");
                 let _conn_manager = &self.bridge.op_manager.ring.connection_manager;
                 let remote_addr = connection.remote_addr();
 
@@ -807,17 +831,42 @@ impl P2pConnManager {
                     }
                 }
 
-                // For transient inbound connections, peer may be None - we don't know the
-                // peer's identity yet. The identity will be learned when the peer sends
-                // its first message (e.g., ConnectRequest).
-                if peer.is_none() {
-                    tracing::info!(
-                        remote = %remote_addr,
-                        transient,
-                        transaction = ?transaction,
-                        "Inbound connection arrived without matching expectation; accepting provisionally"
-                    );
-                }
+                // A connection matched to an expectation is the one the connect
+                // op is dialling: it is recorded and promoted under the key the
+                // op dialled, exactly as the dial would be, so a peer that
+                // reaches us before (or instead of) our dial is still linked.
+                // Any other inbound connection starts without a peer identity
+                // and gets one when the connect op names the peer in a
+                // ConnectPeer, or when the peer names itself in a
+                // ConnectRequest.
+                let peer = match matched {
+                    HandshakeInboundMatch::Expected(Some(peer_key)) => {
+                        // As for a successful dial: CONNECT routing stops
+                        // avoiding an address that is now connected.
+                        self.bridge
+                            .op_manager
+                            .ring
+                            .connection_manager
+                            .clear_failed_addr(remote_addr);
+                        Some(PeerKeyLocation::new(peer_key, remote_addr))
+                    }
+                    HandshakeInboundMatch::Expected(None) => {
+                        TRANSPORT_METRICS.record_conn_identity(
+                            remote_addr,
+                            ConnIdentity::ExpectedInboundUnbound,
+                        );
+                        None
+                    }
+                    HandshakeInboundMatch::Unexpected => {
+                        tracing::info!(
+                            remote = %remote_addr,
+                            transient,
+                            transaction = ?transaction,
+                            "Inbound connection arrived without matching expectation; accepting provisionally"
+                        );
+                        None
+                    }
+                };
 
                 tracing::info!(
                     remote = %remote_addr,
@@ -836,7 +885,6 @@ impl P2pConnManager {
                 // gateway bootstrap from peers) should be promoted into the ring once established.
                 let is_transient = transient;
 
-                // Pass peer directly - it may be None for transient connections
                 self.handle_successful_connection(
                     peer,
                     connection,
@@ -844,7 +892,7 @@ impl P2pConnManager {
                     None,
                     is_transient,
                     handshake_commands,
-                    ConnIdentity::SetExpectedInbound,
+                    ConnIdentity::ExpectedInboundBound,
                 )
                 .await?;
             }
@@ -884,6 +932,18 @@ impl P2pConnManager {
                         .ring
                         .connection_manager
                         .clear_failed_addr(peer_addr);
+                }
+                // The dial the expectation for this address waited on has
+                // succeeded, so a later inbound connection from the address is
+                // not that peer's. Non-blocking (#4145); a missed drop leaves
+                // the entry to the driver's window sweep.
+                if !handshake_commands
+                    .try_send(HandshakeCommand::DropConnection { addr: peer_addr })
+                {
+                    tracing::debug!(
+                        remote = %peer_addr,
+                        "Handshake command channel full/closed; expectation left to its window"
+                    );
                 }
 
                 // For outbound connections, respect the transient flag from the handshake.
@@ -1062,8 +1122,12 @@ impl P2pConnManager {
         Ok(())
     }
 
-    /// `identity_source` is the identity telemetry kind counted when
-    /// `peer_id` is known and the connection is recorded under its key.
+    /// `peer_id` is the peer the connect op dialled, recorded as the
+    /// connection's identity: the dialled peer of an outbound connection, or
+    /// the key an expected-inbound registration carried for a matched inbound
+    /// one. `None` for any other inbound connection, which starts without an
+    /// identity. `identity_source` is the identity telemetry kind counted
+    /// when `peer_id` is known.
     // `identity_source` is telemetry carried alongside the connection, as
     // `origin` is on `handle_connect_peer`.
     #[allow(clippy::too_many_arguments)]
@@ -1132,20 +1196,12 @@ impl P2pConnManager {
 
             if !was_transient {
                 // Old connection was ring-promoted — mirror TransportClosed cleanup
-                let old_peer = if let Some(ref pub_key) = old.pub_key {
-                    PeerKeyLocation::new(pub_key.clone(), peer_addr)
-                } else {
-                    PeerKeyLocation::new(
-                        (*self.bridge.op_manager.ring.connection_manager.pub_key).clone(),
-                        peer_addr,
-                    )
-                };
                 let prune_result = self
                     .bridge
                     .op_manager
                     .ring
                     .prune_connection(
-                        PeerId::new(old_peer.pub_key().clone(), peer_addr),
+                        self.teardown_peer_id(peer_addr, old.pub_key.as_ref()),
                         crate::tracing::DisconnectReason::Explicit(
                             "replaced_by_new_connection".into(),
                         ),
@@ -1158,9 +1214,9 @@ impl P2pConnManager {
                     // Deferred: broadcast after connection_manager borrow ends
                     broadcast_ready = Some(false);
                 }
-                self.bridge
-                    .op_manager
-                    .on_ring_connection_lost(old_peer.pub_key());
+                if let Some(old_pub_key) = &old.pub_key {
+                    self.bridge.op_manager.on_ring_connection_lost(old_pub_key);
+                }
                 // Non-blocking (#4145): this runs on the event-loop task while
                 // handling an inbound handshake event, so a `.send().await` that
                 // back-pressures on the handshake command channel (cap 128) would
@@ -1168,12 +1224,13 @@ impl P2pConnManager {
                 // connection is redundant cleanup — we've already pruned the old
                 // peer from the ring above and are about to install the new
                 // connection entry. A missed DropConnection leaves at most one
-                // stale per-SocketAddr InboundMatcher entry (no TTL sweep,
-                // but overwritten on the next register() and consumed on a
-                // matching inbound — bounded, benign).
-                if !handshake_commands.try_send(HandshakeCommand::DropConnection {
-                    peer: old_peer.clone(),
-                }) {
+                // stale per-SocketAddr InboundMatcher entry for the address,
+                // which the driver sweeps once it outlives
+                // EXPECTED_INBOUND_WINDOW and whose key it does not honour
+                // after that.
+                if !handshake_commands
+                    .try_send(HandshakeCommand::DropConnection { addr: peer_addr })
+                {
                     tracing::warn!(
                         remote = %peer_addr,
                         "Handshake command channel full/closed; skipping redundant \
@@ -1223,14 +1280,9 @@ impl P2pConnManager {
             peer_addr,
             ConnectionEntry {
                 sender: tx,
-                // For transient connections, we don't know the pub_key yet - it will be learned
-                // when the peer sends its first message (e.g., ConnectRequest)
+                // An unexpected inbound connection has no pub_key yet: it is
+                // learned from a ConnectPeer or the peer's first ConnectRequest.
                 pub_key: peer_id.as_ref().map(|p| p.pub_key().clone()),
-                // Telemetry only: every expected-inbound registration
-                // carries the placeholder (`NodeEvent::ExpectPeerConnection`).
-                placeholder: (peer_id.is_some()
-                    && identity_source == ConnIdentity::SetExpectedInbound)
-                    .then(IdentityPlaceholder::default),
                 connection_id: conn_id,
                 created_at: now,
                 link_use: link_use.clone(),
@@ -1605,22 +1657,11 @@ impl P2pConnManager {
                                 let identity = classify_identity_claim(
                                     entry.pub_key.as_ref(),
                                     new_peer_id.pub_key(),
-                                    entry.placeholder.is_some(),
                                     [
                                         ConnIdentity::SetConnectRequest,
                                         ConnIdentity::SameConnectRequest,
                                         ConnIdentity::ChangedConnectRequest,
                                     ],
-                                    // This request replaces the placeholder.
-                                    || match entry.placeholder.as_ref().and_then(|placeholder| {
-                                        placeholder.connect_peer_key.as_ref()
-                                    }) {
-                                        Some(expected) if expected == new_peer_id.pub_key() => {
-                                            ConnIdentity::SetFromPlaceholderExpected
-                                        }
-                                        Some(_) => ConnIdentity::SetFromPlaceholderOther,
-                                        None => ConnIdentity::SetFromPlaceholderUnchecked,
-                                    },
                                 );
                                 TRANSPORT_METRICS.record_conn_identity(remote_addr, identity);
                                 if sender_addr == Some(remote_addr) {
@@ -1654,8 +1695,6 @@ impl P2pConnManager {
                                     // Update the entry's pub_key
                                     if let Some(entry) = self.connections.get_mut(&remote_addr) {
                                         entry.pub_key = Some(new_peer_id.pub_key().clone());
-                                        // Telemetry only: the placeholder is replaced.
-                                        entry.placeholder = None;
                                     }
                                     // Add new reverse lookup
                                     self.record_addr_by_pub_key(
@@ -1711,25 +1750,19 @@ impl P2pConnManager {
                 // Look up the connection directly by address
                 if let Some(entry) = self.connections.remove(&remote_addr) {
                     self.record_identity_teardown(remote_addr, &entry);
-                    // Construct PeerKeyLocation for prune_connection and DropConnection
-                    let peer = if let Some(ref pub_key) = entry.pub_key {
-                        PeerKeyLocation::new(pub_key.clone(), remote_addr)
-                    } else {
-                        PeerKeyLocation::new(
-                            (*self.bridge.op_manager.ring.connection_manager.pub_key).clone(),
-                            remote_addr,
-                        )
-                    };
                     // Remove from reverse lookup
-                    if let Some(pub_key) = entry.pub_key {
-                        self.addr_by_pub_key.remove(&pub_key);
+                    if let Some(pub_key) = &entry.pub_key {
+                        self.addr_by_pub_key.remove(pub_key);
                     }
-                    tracing::debug!(self_peer = %self.bridge.op_manager.ring.connection_manager.pub_key, %peer, socket_addr = %remote_addr, conn_map_size = self.connections.len(), "[CONN_TRACK] REMOVE: TransportClosed - removing from connections HashMap");
+                    tracing::debug!(self_peer = %self.bridge.op_manager.ring.connection_manager.pub_key, peer = ?entry.pub_key, socket_addr = %remote_addr, conn_map_size = self.connections.len(), "[CONN_TRACK] REMOVE: TransportClosed - removing from connections HashMap");
                     let prune_result = self
                         .bridge
                         .op_manager
                         .ring
-                        .prune_connection(PeerId::new(peer.pub_key().clone(), remote_addr), reason)
+                        .prune_connection(
+                            self.teardown_peer_id(remote_addr, entry.pub_key.as_ref()),
+                            reason,
+                        )
                         .await;
 
                     // Handle orphaned transactions immediately (retry via alternate routes)
@@ -1744,10 +1777,11 @@ impl P2pConnManager {
                         self.handle_broadcast_ready_state(false).await;
                     }
 
-                    // forget this peer's subscriptions and cached contract state
-                    self.bridge
-                        .op_manager
-                        .on_ring_connection_lost(peer.pub_key());
+                    // forget this peer's subscriptions and cached contract state;
+                    // a connection that never named a peer has none
+                    if let Some(pub_key) = &entry.pub_key {
+                        self.bridge.op_manager.on_ring_connection_lost(pub_key);
+                    }
 
                     // Backoff prevents reconnect-timeout-reconnect cycles to dead peers (#3252).
                     if !remote_addr.ip().is_unspecified() {
@@ -1761,11 +1795,11 @@ impl P2pConnManager {
                     // The DropConnection is redundant teardown — the connection is
                     // already removed from ctx.connections and pruned from the ring
                     // above. A missed DropConnection leaves at most one stale
-                    // per-SocketAddr InboundMatcher entry (no TTL sweep, but
-                    // overwritten on the next register() and consumed on a matching
-                    // inbound — bounded, benign).
+                    // per-SocketAddr InboundMatcher entry for the address, which
+                    // the driver sweeps once it outlives EXPECTED_INBOUND_WINDOW
+                    // and whose key it does not honour after that.
                     if !handshake_commands
-                        .try_send(HandshakeCommand::DropConnection { peer: peer.clone() })
+                        .try_send(HandshakeCommand::DropConnection { addr: remote_addr })
                     {
                         tracing::warn!(
                             remote = %remote_addr,

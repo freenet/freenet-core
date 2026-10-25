@@ -1636,7 +1636,6 @@ mod tests {
                 ConnectionEntry {
                     sender,
                     pub_key: None,
-                    placeholder: None,
                     connection_id: 1,
                     created_at: created,
                     link_use: LinkUseStamp::new(created),
@@ -1704,7 +1703,6 @@ mod tests {
         ConnectionEntry {
             sender,
             pub_key: None,
-            placeholder: None,
             connection_id: 1,
             created_at,
             link_use,
@@ -2494,7 +2492,6 @@ mod tests {
             ConnectionEntry {
                 sender,
                 pub_key: None,
-                placeholder: None,
                 connection_id: 7,
                 created_at: created,
                 link_use: link_use.clone(),

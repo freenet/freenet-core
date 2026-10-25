@@ -15267,7 +15267,7 @@ struct MeshObservation {
 /// Shared driver for the subscription-mesh collapse proof.
 ///
 /// Builds a moderately-connected ring, PUTs + announces a contract on the
-/// gateway, and has `subscriber_ids` nodes subscribe — forming a connected mesh
+/// gateway, and has `subscriber_ids` nodes GET it with subscribe — forming a connected mesh
 /// of subscribed hosts toward the key. When `collapse` is set it then ends ALL
 /// client interest (disconnect the PUT originator AND every subscriber) and
 /// jumps the hosting clock 20 minutes past the 8-minute lease, so interest-gated
@@ -15312,10 +15312,19 @@ fn run_subscription_mesh(
             subscribe: true,
         },
     )];
+    // GET-with-subscribe, not a plain Subscribe: the client API rejects a
+    // Subscribe on a node that does not already hold the contract WASM, so a
+    // plain Subscribe succeeded only on subscribers the gateway's PUT happened
+    // to reach first, and the mesh size followed the scheduling of that PUT
+    // (seed 0x4642_D203 formed 7 or 2 depending on an unrelated extra message).
     for id in subscriber_ids {
         ops.push(ScheduledOperation::new(
             NodeLabel::node(network, *id),
-            SimOperation::Subscribe { contract_id },
+            SimOperation::Get {
+                contract_id,
+                return_contract_code: true,
+                subscribe: true,
+            },
         ));
     }
 
@@ -15420,7 +15429,9 @@ const MESH_SUBSCRIBERS: [usize; 8] = [1, 3, 5, 7, 9, 11, 13, 15];
 fn test_subscription_chain_collapses_on_client_leave() {
     const SEEDS: [u64; 3] = [0x4642_D201, 0x4642_D202, 0x4642_D203];
     // The mesh must be non-trivial for a collapse-to-zero to be meaningful.
-    const MIN_MESH: usize = 3;
+    // Formation is 9-13 peers across the seeds measured with GET-with-subscribe,
+    // so 6 leaves margin while still catching a formation regression.
+    const MIN_MESH: usize = 6;
 
     for seed in SEEDS {
         // Phase A — formation baseline (no disconnect / no clock jump).

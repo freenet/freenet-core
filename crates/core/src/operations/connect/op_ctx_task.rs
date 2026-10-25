@@ -905,7 +905,7 @@ enum CollectionEnd {
 /// How long a CONNECT that has stopped collecting keeps finishing the dials
 /// of acceptors it already took: ten hole-punch deadlines, room for the
 /// queued acceptors of a peer that dials one at a time.
-const DIAL_DRAIN_LIMIT: std::time::Duration = std::time::Duration::from_secs(
+pub(crate) const DIAL_DRAIN_LIMIT: std::time::Duration = std::time::Duration::from_secs(
     10 * crate::transport::connection_handler::NAT_TRAVERSAL_DEADLINE.as_secs(),
 );
 
@@ -943,6 +943,7 @@ async fn begin_acceptor_dial(
     op_manager
         .notify_node_event(NodeEvent::ExpectPeerConnection {
             addr: acceptor_addr,
+            peer_key: acceptor.pub_key().clone(),
         })
         .await?;
 
@@ -2997,7 +2998,7 @@ mod driver_timing_tests {
             let mut expected = false;
             while let Some(event) = events.recv().await {
                 match event {
-                    Either::Right(NodeEvent::ExpectPeerConnection { addr })
+                    Either::Right(NodeEvent::ExpectPeerConnection { addr, .. })
                         if addr == half_addr =>
                     {
                         expected = true;
