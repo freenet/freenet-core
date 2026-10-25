@@ -54,6 +54,13 @@ pub const MAX_CANONICALIZATION_APPLIES: usize = 3;
 /// cost coverage, never accuse anyone, because running out is inconclusive; too
 /// large a bound costs work, and only on a triple that has already failed the
 /// strict check: at most `2 + 10 * MAX_HEAL_PASSES` extra merges.
+///
+/// NODE BEHAVIOUR DEPENDS ON THIS. The executor's sampled re-apply probe
+/// (`contract::executor::runtime::reapply_probe`) runs [`associativity_heals`] on
+/// the merge path and flags contracts on its verdict, so changing this bound,
+/// [`associativity_heals`] or [`Heal`] changes what a node suppresses and what a
+/// sampled merge costs. Review such a change as a node change, and keep
+/// `reapply_verdict_matches_verifier_on_s_x_x` passing.
 pub const MAX_HEAL_PASSES: usize = 4;
 
 /// One property plus the exact inputs to check it with.
@@ -822,7 +829,10 @@ fn run<O: ConformanceOracle + ?Sized>(
 }
 
 /// How the heal step for [`ConformanceProperty::StateAssociativity`] ended.
-enum Heal {
+///
+/// Also read by the executor's sampled re-apply probe; see [`MAX_HEAL_PASSES`].
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Heal {
     /// The groupings converge and the state they converge to is a fixpoint.
     Healed,
     /// `merge(L, R) != merge(R, L)`: one exchange does not even agree.
@@ -887,7 +897,9 @@ enum Heal {
 /// Each moving step costs two merges, so the heal step is at most
 /// `2 + 10 * MAX_HEAL_PASSES` merges, spent only on a triple that already failed the
 /// strict check.
-fn associativity_heals<O: ConformanceOracle + ?Sized>(
+///
+/// Also called by the executor's sampled re-apply probe; see [`MAX_HEAL_PASSES`].
+pub(crate) fn associativity_heals<O: ConformanceOracle + ?Sized>(
     oracle: &mut O,
     left: &[u8],
     right: &[u8],
@@ -1212,7 +1224,7 @@ fn require_valid<O: ConformanceOracle + ?Sized>(
 /// There is no separate `merge` entry point in the contract interface; a full-state
 /// update *is* the merge, which is why a contract that "rejects" an incoming state by
 /// returning its own state unchanged shows up as an ordinary commutativity failure.
-fn merge<O: ConformanceOracle + ?Sized>(
+pub(crate) fn merge<O: ConformanceOracle + ?Sized>(
     oracle: &mut O,
     base: &[u8],
     other: &[u8],

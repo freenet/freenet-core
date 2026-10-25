@@ -53,7 +53,9 @@
 //! # Relationship to the existing probe
 //!
 //! `contract::executor::runtime::executor_impl::maybe_probe_idempotency` already
-//! samples one merge in 32 and checks re-apply idempotence. Two differences matter.
+//! samples one merge in 32 and checks that re-applying the incoming state settles,
+//! deciding a content change with this module's own [`verifier`] heal step (see
+//! `contract::executor::runtime::reapply_probe`). Two differences matter.
 //!
 //! It compares with `byte_multiset_eq` rather than byte equality, because states
 //! were not guaranteed to have a canonical encoding, so a strict comparison would
@@ -61,9 +63,10 @@
 //! canonical serialization an explicit platform requirement, which is what lets this
 //! module compare exact bytes and therefore say something much stronger.
 //!
-//! It also checks exactly one law. Commutativity, associativity and reconciliation
-//! are where the measured production damage actually came from (#5153), and a
-//! re-apply probe cannot see any of them.
+//! It also checks one input shape, the triple `(S, X, X)`. Commutativity,
+//! associativity over distinct inputs and reconciliation are where the measured
+//! production damage actually came from (#5153), and a re-apply probe cannot see
+//! them.
 //!
 //! This module does not replace or disable that probe. The node can run this verifier
 //! in an opt-in shadow mode: set `FREENET_CONFORMANCE_CAPTURE_DIR` (see [`capture`] and

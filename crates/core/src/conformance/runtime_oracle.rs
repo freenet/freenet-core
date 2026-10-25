@@ -199,6 +199,73 @@ impl ConformanceOracle for RuntimeOracle {
     }
 }
 
+/// An oracle over a runtime someone else owns, for one contract.
+///
+/// The executor's sampled re-apply probe uses this to run the verifier's heal step
+/// ([`super::verifier::associativity_heals`]) on the runtime that just performed the
+/// merge, so the probe's verdict comes from the same law the verifier checks rather
+/// than from a second copy of it.
+pub(crate) struct BorrowedRuntimeOracle<'a, 'p, R: ?Sized> {
+    runtime: &'a mut R,
+    key: &'a ContractKey,
+    parameters: &'a Parameters<'p>,
+}
+
+impl<'a, 'p, R: ContractRuntimeInterface + ?Sized> BorrowedRuntimeOracle<'a, 'p, R> {
+    pub(crate) fn new(
+        runtime: &'a mut R,
+        key: &'a ContractKey,
+        parameters: &'a Parameters<'p>,
+    ) -> Self {
+        Self {
+            runtime,
+            key,
+            parameters,
+        }
+    }
+}
+
+impl<R: ContractRuntimeInterface + ?Sized> ConformanceOracle for BorrowedRuntimeOracle<'_, '_, R> {
+    fn validate_state(
+        &mut self,
+        state: &[u8],
+        related: &RelatedContracts<'_>,
+    ) -> Result<ValidateResult, OracleError> {
+        let state = WrappedState::new(state.to_vec());
+        self.runtime
+            .validate_state(self.key, self.parameters, &state, related)
+            .map_err(classify)
+    }
+
+    fn update_state(
+        &mut self,
+        state: &[u8],
+        updates: &[UpdateData<'_>],
+    ) -> Result<UpdateModification<'static>, OracleError> {
+        let state = WrappedState::new(state.to_vec());
+        self.runtime
+            .update_state(self.key, self.parameters, &state, updates)
+            .map_err(classify)
+    }
+
+    fn summarize_state(&mut self, state: &[u8]) -> Result<Vec<u8>, OracleError> {
+        let state = WrappedState::new(state.to_vec());
+        self.runtime
+            .summarize_state(self.key, self.parameters, &state)
+            .map(StateSummary::into_bytes)
+            .map_err(classify)
+    }
+
+    fn get_state_delta(&mut self, state: &[u8], summary: &[u8]) -> Result<Vec<u8>, OracleError> {
+        let state = WrappedState::new(state.to_vec());
+        let summary = StateSummary::from(summary.to_vec());
+        self.runtime
+            .get_state_delta(self.key, self.parameters, &state, &summary)
+            .map(|delta| delta.into_bytes())
+            .map_err(classify)
+    }
+}
+
 /// Classify a runtime failure by its *typed* provenance.
 ///
 /// Not by message text. A contract can return a rejection whose text mentions gas or

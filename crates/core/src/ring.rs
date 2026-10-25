@@ -105,7 +105,11 @@ pub(crate) use connection_manager::nn_lattice_active_for;
 pub use connection_manager::{set_nn_lattice_enabled, set_nn_lattice_force_active};
 mod connection;
 mod hosting;
-pub(crate) use broken_invariants::{BrokenInvariant, BrokenInvariantsTracker};
+#[cfg(test)]
+pub(crate) use broken_invariants::{BROKEN_INVARIANT_TTL, EMITTED_FLAG_EVENTS};
+pub(crate) use broken_invariants::{
+    BrokenInvariant, BrokenInvariantDetector, BrokenInvariantsTracker,
+};
 /// Pre-write admission-gate rejection type (#4683, PR 3). Surfaced to the
 /// executor chokepoints so a write that would overflow the aggregate disk
 /// budget is refused before any bytes land.
@@ -5540,9 +5544,25 @@ impl Ring {
     }
 
     /// Mark `contract` as broken with `kind`. Idempotent. See
-    /// [`broken_invariants`] module docs.
-    pub(crate) fn record_broken_invariant(&self, contract: ContractKey, kind: BrokenInvariant) {
-        self.broken_invariants.record(*contract.id(), kind);
+    /// [`broken_invariants`] module docs. A detection that starts, restarts or
+    /// escalates suppression is also exported to telemetry, so flags are
+    /// visible fleet-wide and not only in this node's log.
+    pub(crate) fn record_broken_invariant(
+        &self,
+        contract: ContractKey,
+        kind: BrokenInvariant,
+        detector: BrokenInvariantDetector,
+        verdict: &'static str,
+    ) {
+        let outcome = self.broken_invariants.record(*contract.id(), kind);
+        if let Some(data) =
+            broken_invariants::flag_telemetry(contract.id(), kind, detector, verdict, outcome)
+        {
+            broken_invariants::emit_flag_telemetry(
+                &self.connection_manager.own_location().to_string(),
+                data,
+            );
+        }
     }
 
     /// Claim a slot for the deterministic identical-input idempotency probe

@@ -979,6 +979,9 @@ where
         }
 
         let mut recovery_performed = false;
+        // Set when the merge needed related state fetched in a second attempt;
+        // its result then depends on inputs the probe's re-apply would not have.
+        let mut related_retry_performed = false;
         let updated_state = match self
             .attempt_state_update(&params, &current_state, &key, &updates)
             .await
@@ -1154,6 +1157,7 @@ where
                         }));
                     }
                 }
+                related_retry_performed = true;
                 match self
                     .attempt_state_update(&params, &current_state, &key, &fetched_updates)
                     .await
@@ -1297,19 +1301,33 @@ where
         if updated_state.as_ref() == current_state.as_ref() {
             Ok(UpsertResult::NoChange)
         } else {
-            // CRDT-invariant idempotency probe. With low probability, re-run
-            // `update_state` with `updated_state` as the current state and
-            // the same `updates`. A correct CRDT must satisfy
-            // `update_state(update_state(S, U), U) == update_state(S, U)` —
-            // a violation indicates a contract bug (timestamp/RNG/position-
-            // dependent signing/etc.) that produces an infinite broadcast
-            // storm in the network. See `crate::ring::broken_invariants`.
+            // Sampled re-apply probe. With low probability, re-apply the
+            // incoming full state to `updated_state`. A re-apply that changes
+            // the content is a strict associativity failure on (S, X, X); the
+            // contract is flagged only when the conformance verifier's heal
+            // step shows the merge does not settle (a mutate-on-every-apply or
+            // cycling contract, which storms the network), not when it changes
+            // once and reconciles. See `reapply_probe` and
+            // `crate::ring::broken_invariants`.
             //
             // `RelatedState` inputs are skipped: re-applying a cross-
             // contract state hint isn't required to be a no-op by the
             // contract ABI, so probing it can produce false positives.
-            self.maybe_probe_idempotency(&key, &params, &updated_state, &updates)
+            // Not after a corrupted-state recovery: there `updated_state` is the
+            // incoming state rather than a merge with the stored one, so the
+            // probe's premise does not hold. Not after a related-state retry
+            // either: there `updated_state` was computed with fetched
+            // `RelatedState` entries that the probe's re-apply would lack.
+            if !recovery_performed && !related_retry_performed {
+                self.maybe_probe_idempotency(
+                    &key,
+                    &params,
+                    &current_state,
+                    &updated_state,
+                    &updates,
+                )
                 .await;
+            }
 
             if self
                 .op_manager
@@ -1941,33 +1959,43 @@ where
         Ok(Either::Left(new_state))
     }
 
-    /// Probe-sampled idempotency check. Re-runs `update_state` with the just-
-    /// produced state as the current state and the same updates; flags the
-    /// contract as broken if the re-applied state's byte MULTISET differs from
-    /// the original (a genuine content change), but NOT if it is merely a
-    /// reordering of the same bytes (benign serialization nondeterminism such
-    /// as `HashMap` key order — the #4295 false-positive case). See
-    /// [`byte_multiset_eq`].
+    /// Probe-sampled re-apply check. With probability
+    /// [`IDEMPOTENCY_PROBE_PROBABILITY`] (currently 1/32), re-applies the
+    /// incoming state to the merge result and flags the contract only when
+    /// the merge is shown not to settle. The rule is
+    /// [`super::reapply_probe::reapply_verdict`]: a byte-identical or
+    /// reordered re-apply ends the probe (the #4295 reorder class, see
+    /// [`byte_multiset_eq`]); a content change is a strict associativity
+    /// failure on `(S, X, X)`, decided by the conformance verifier's heal step,
+    /// and flags only when the groupings do not converge, a re-delivered input
+    /// keeps moving the state, or reconciliation revisits a state. Budget
+    /// exhaustion, heal-step refusals and runtime errors are inconclusive and
+    /// never flag.
     ///
-    /// Costs one extra WASM invocation per sampled merge. With the
-    /// configured probability [`IDEMPOTENCY_PROBE_PROBABILITY`] (currently
-    /// 1/32) this is a few percent overhead on active contracts and
-    /// effectively zero on quiet ones. Sample selection uses `GlobalRng`
-    /// so simulation builds remain deterministic under a fixed seed.
+    /// Cost: one extra contract call when the re-apply leaves the state
+    /// unchanged or reordered (none when the merge result is the incoming state
+    /// itself). When it changes the content (a bounded-retention contract that
+    /// changes once and settles included), up to
+    /// [`super::reapply_probe::REAPPLY_PROBE_MAX_CALLS`] calls: the untimed
+    /// re-apply, then heal-step calls until
+    /// [`super::reapply_probe::REAPPLY_PROBE_TIME_BUDGET`] is spent, the last of
+    /// which may run past it by up to the per-call execution limit. See the
+    /// `reapply_probe` module doc. Sample selection uses
+    /// `GlobalRng` so simulation builds remain deterministic under a fixed
+    /// seed.
     ///
-    /// Only probes update batches whose every entry is
-    /// `UpdateData::State(_)`. `Delta`/`StateAndDelta` are exempted
-    /// because operation-based CRDTs (counters, append-logs) legitimately
-    /// violate the byte-equality property on re-apply; `RelatedState` is
-    /// exempted because it's a cross-contract hint, not a CRDT op over
-    /// this contract's state. Probe traps (timeout, OOG, panic) are
-    /// logged but not treated as positive signals — distinguishing
-    /// "buggy on re-apply" from "buggy in some other way" requires a
-    /// separate detector. See `crate::ring::broken_invariants`.
-    async fn maybe_probe_idempotency(
+    /// Only a batch of exactly one `UpdateData::State(_)` is probed, which is
+    /// the only shape the merge path builds for a full-state upsert (one
+    /// `State` entry, to which `RelatedState` entries may be appended; those
+    /// batches are exempt). `Delta`/`StateAndDelta` are exempt because
+    /// operation-based CRDTs (counters, append-logs) legitimately change on
+    /// re-apply; `RelatedState` because it is a cross-contract hint, not a
+    /// CRDT op over this contract's state. See `crate::ring::broken_invariants`.
+    pub(in crate::contract::executor) async fn maybe_probe_idempotency(
         &mut self,
         key: &ContractKey,
         parameters: &Parameters<'_>,
+        pre_merge_state: &WrappedState,
         post_merge_state: &WrappedState,
         updates: &[UpdateData<'_>],
     ) {
@@ -1978,57 +2006,29 @@ where
             }
         }
 
-        // Probe ONLY when every input is `UpdateData::State(...)`. Three
-        // reasons for this conservative gating:
-        //
-        // 1. `Delta` inputs are NOT contractually required to be
-        //    idempotent. An "increment by 1" delta produces S+1 then S+2
-        //    on re-apply — that's a CmRDT-shaped contract, perfectly
-        //    valid, but `update_state(update_state(S, U), U) != update_state(S, U)`
-        //    in the exact byte sense the probe checks. Probing Delta
-        //    inputs would mass-flag legitimate counter / append-log
-        //    contracts. Skip them entirely.
-        //
-        // 2. `StateAndDelta` carries a delta too, with the same risk.
-        //
-        // 3. `RelatedState` is a cross-contract hint, not a CRDT op
-        //    over this contract's state — re-applying isn't required
-        //    to be a no-op even for a correct contract.
-        //
-        // State-only batches are the unambiguous case: receiving the
-        // same full state twice MUST produce the same merged result by
-        // CvRDT lattice-join semantics. That's the invariant the probe
-        // tests.
-        let all_state =
-            !updates.is_empty() && updates.iter().all(|u| matches!(u, UpdateData::State(_)));
-        if !all_state {
+        let [UpdateData::State(incoming)] = updates else {
+            return;
+        };
+
+        if !idempotency_probe_sampled() {
             return;
         }
 
-        // Sampling. `GlobalRng` honors a fixed seed in simulation tests
-        // (see `crate::config::GlobalRng`), so determinism is preserved
-        // under the existing test harness — but the call ordering would
-        // shift if existing tests don't expect a new RNG consumer on the
-        // merge path. The probe runs only on pure-State batches (above),
-        // which the simulation harness drives explicitly and rarely, so
-        // the RNG stream perturbation is bounded.
-        if !crate::config::GlobalRng::random_bool(IDEMPOTENCY_PROBE_PROBABILITY) {
-            return;
-        }
-
-        // Cost telemetry (cost-aware eviction, #4861): the probe is a full
-        // extra WASM `update_state` invocation, and it fires precisely on the
-        // storm-relevant class (frequently-merging contracts — including
-        // non-idempotent ones). Attribute its elapsed on the same
-        // `ExecCpuMicros` axis as the main apply in `attempt_state_update`.
+        // Cost telemetry (cost-aware eviction, #4861): attribute the probe's
+        // elapsed, heal step included, on the same `ExecCpuMicros` axis as the
+        // main apply in `attempt_state_update`.
         let probe_clock = self
             .op_manager
             .as_ref()
             .map(|op_manager| op_manager.ring.time_source.clone());
         let probe_started = probe_clock.as_ref().map(|clock| clock.now());
-        let probe_result = self
-            .runtime
-            .update_state(key, parameters, post_merge_state, updates);
+        let verdict = self.reapply_probe_verdict(
+            key,
+            parameters,
+            pre_merge_state,
+            incoming.as_ref(),
+            post_merge_state,
+        );
         if let (Some(op_manager), Some(clock), Some(started)) = (
             self.op_manager.as_ref(),
             probe_clock.as_ref(),
@@ -2041,80 +2041,97 @@ where
                 elapsed.as_micros() as f64,
             );
         }
-        let probe_outcome = match probe_result {
-            Ok(modification) => modification,
-            Err(err) => {
-                // The probe failing (timeout, trap, etc.) is not a positive
-                // signal — the contract is exercising some other failure
-                // mode that doesn't necessarily imply non-idempotency.
-                // Log at DEBUG and bail without flagging.
-                tracing::debug!(
-                    contract = %key,
-                    error = %err,
-                    event = "idempotency_probe_error",
-                    "Idempotency probe failed to execute; skipping detection"
-                );
-                return;
-            }
-        };
-        let UpdateModification {
-            new_state: probe_state,
-            ..
-        } = probe_outcome;
-        let Some(probe_state) = probe_state else {
-            // No state output from probe (e.g. contract returned only
-            // `requires(...)`). Inconclusive — bail.
+
+        let Some(non_settling) = verdict else {
             return;
         };
-        let probe_state = WrappedState::new(probe_state.into_bytes());
-
-        // Byte-identical re-application: definitively idempotent. Fast path
-        // for contracts with canonical serialization.
-        if probe_state.as_ref() == post_merge_state.as_ref() {
-            return;
-        }
-
-        // Bytes differ — but byte inequality alone does NOT prove a CRDT
-        // violation. A correct, logically-idempotent merge can still emit
-        // byte-different output for the SAME logical state when the contract's
-        // serialization is non-canonical (HashMap/HashSet iteration order):
-        // the re-serialized state is a REORDERING of the same bytes. Flagging
-        // on that byte flutter false-positives correct contracts and — because
-        // the broken-invariant flag gates ALL propagation — silently bricks
-        // them. That was the root cause of #4295: the ping contract's
-        // `HashMap`-backed state re-serialized in non-deterministic key order.
-        //
-        // Distinguish a benign reordering from a genuine content change by
-        // comparing the byte MULTISET (not the bytes, not just the size).
-        // Reordering preserves the multiset; a real non-idempotent merge
-        // changes content (a counter, timestamp, signature, added/removed
-        // entry), which changes the multiset — INCLUDING the fixed-size
-        // byte-churn shape of the #4251/#4279 production violator that a
-        // size-only check would miss.
-        if byte_multiset_eq(post_merge_state.as_ref(), probe_state.as_ref()) {
-            tracing::debug!(
-                contract = %key,
-                size = post_merge_state.size(),
-                event = "idempotency_probe_byte_flutter_ignored",
-                "Idempotency probe saw byte-different but same-multiset re-application \
-                 (serialization reordering); treating as benign, not a violation"
-            );
-            return;
-        }
-
         if let Some(op_manager) = &self.op_manager {
             tracing::warn!(
                 contract = %key,
                 post_merge_size = post_merge_state.size(),
-                probe_size = probe_state.size(),
+                verdict = non_settling.as_str(),
                 event = "non_idempotent_merge_detected",
-                "Contract violates update_state idempotency: re-application changes \
-                 state content (different byte multiset, not a reordering). \
-                 Flagging contract; outbound BroadcastStateChange will be suppressed."
+                "Contract merge does not settle on re-applying the same incoming \
+                 state. Flagging contract; commit, broadcast, and full-state \
+                 egress will be suppressed."
             );
-            op_manager
-                .ring
-                .record_broken_invariant(*key, crate::ring::BrokenInvariant::NonIdempotent);
+            op_manager.ring.record_broken_invariant(
+                *key,
+                crate::ring::BrokenInvariant::NonIdempotent,
+                crate::ring::BrokenInvariantDetector::SampledReapply,
+                non_settling.as_str(),
+            );
+        }
+    }
+
+    /// The unsampled body of [`Self::maybe_probe_idempotency`]: runs
+    /// [`super::reapply_probe::reapply_verdict`] on this executor's runtime and
+    /// logs the outcome. `Some` only when the merge is shown not to settle.
+    pub(in crate::contract::executor) fn reapply_probe_verdict(
+        &mut self,
+        key: &ContractKey,
+        parameters: &Parameters<'_>,
+        stored: &WrappedState,
+        incoming: &[u8],
+        merged: &WrappedState,
+    ) -> Option<super::reapply_probe::NonSettling> {
+        use super::reapply_probe::{ReapplyVerdict, reapply_verdict};
+
+        let clock = self
+            .op_manager
+            .as_ref()
+            .map(|op_manager| op_manager.ring.time_source.clone());
+        let mut oracle = crate::conformance::runtime_oracle::BorrowedRuntimeOracle::new(
+            &mut self.runtime,
+            key,
+            parameters,
+        );
+        let verdict = reapply_verdict(
+            &mut oracle,
+            clock
+                .as_deref()
+                .map(|c| c as &dyn crate::util::time_source::TimeSource),
+            stored.as_ref(),
+            incoming,
+            merged.as_ref(),
+        );
+        match verdict {
+            ReapplyVerdict::NonSettling(non_settling) => Some(non_settling),
+            ReapplyVerdict::Unchanged => None,
+            ReapplyVerdict::Reordered => {
+                tracing::debug!(
+                    contract = %key,
+                    size = merged.size(),
+                    event = "idempotency_probe_byte_flutter_ignored",
+                    "Idempotency probe saw byte-different but same-multiset re-application \
+                     (serialization reordering); treating as benign, not a violation"
+                );
+                None
+            }
+            ReapplyVerdict::Settles => {
+                tracing::debug!(
+                    contract = %key,
+                    event = "idempotency_probe_settled",
+                    "Re-applying the incoming state changed the content, and the results \
+                     settle on reconciliation; benign, not a violation"
+                );
+                None
+            }
+            // DEBUG, budget exhaustion included: a contract slow on every
+            // sampled probe would log on each one, and its cost is already
+            // charged on the ExecCpuMicros axis (see `reapply_probe`'s
+            // residual notes). Release builds compile this out and nothing
+            // counts these outcomes, so how often the probe cannot decide is
+            // not visible in production.
+            ReapplyVerdict::Inconclusive(reason) => {
+                tracing::debug!(
+                    contract = %key,
+                    reason = ?reason,
+                    event = "idempotency_probe_inconclusive",
+                    "Idempotency probe could not decide; not flagging"
+                );
+                None
+            }
         }
     }
 
@@ -2254,9 +2271,12 @@ where
              sampling. Flagging contract; commit, broadcast, and full-state \
              egress will be suppressed."
         );
-        op_manager
-            .ring
-            .record_broken_invariant(*key, crate::ring::BrokenInvariant::NonIdempotent);
+        op_manager.ring.record_broken_invariant(
+            *key,
+            crate::ring::BrokenInvariant::NonIdempotent,
+            crate::ring::BrokenInvariantDetector::IdenticalInput,
+            "never_settled",
+        );
     }
 
     /// Persist an updated contract state via `state_store.update`.
@@ -3667,16 +3687,27 @@ mod conformance_capture_pins {
     /// function's. A missing anchor panics rather than silently widening the region
     /// to the rest of the file, which is how a source pin quietly stops testing
     /// anything (see the `include_str!` note in
-    /// `.claude/rules/bug-prevention-patterns.md`).
+    /// `.claude/rules/bug-prevention-patterns.md`). An anchor that no longer
+    /// matches the production signature still matches its own string literal
+    /// below, so the region must also end before the first test module.
     fn attempt_state_update_body() -> &'static str {
         let src = include_str!("executor_impl.rs");
+        let tests_start = src
+            .find("\n#[cfg(test)]\nmod ")
+            .expect("executor_impl.rs has no test module");
         let start = src
             .find("    pub(super) async fn attempt_state_update(")
             .expect("attempt_state_update not found");
         let after = &src[start..];
         let end = after
-            .find("    async fn maybe_probe_idempotency(")
+            .find("    pub(in crate::contract::executor) async fn maybe_probe_idempotency(")
             .expect("maybe_probe_idempotency no longer follows attempt_state_update");
+        assert!(
+            start + end < tests_start,
+            "the attempt_state_update region runs into the test module, so an \
+             anchor matched a pin's string literal instead of the production \
+             signature"
+        );
         &after[..end]
     }
 
