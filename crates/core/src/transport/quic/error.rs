@@ -27,6 +27,7 @@
 mod tests;
 
 use super::framing::HeaderError;
+use super::liveness::QuicAvailability;
 use super::path::{QuicSendError, reset_code, stop_code};
 use super::{QuicAllowError, QuicConnectError};
 use crate::transport::metrics::QuicCloseCode;
@@ -62,7 +63,7 @@ const _: () = {
     let reset = reset_code::ALL;
     // No code is used twice, within or across the namespaces.
     let all_len = close.len() + stop.len() + reset.len();
-    let mut all = [0u32; 3 + 7 + 1];
+    let mut all = [0u32; 3 + 8 + 2];
     assert!(all.len() == all_len, "update the combined length");
     let mut n = 0;
     let mut i = 0;
@@ -151,49 +152,89 @@ fn is_tls_alert(code: u64) -> bool {
 /// QUIC transport error codes (RFC 9000 section 20.1) this module tells
 /// apart.
 const NO_ERROR: u64 = 0x0;
-const INTERNAL_ERROR: u64 = 0x1;
 const CONNECTION_REFUSED: u64 = 0x2;
 
-/// Where a QUIC transport error code came from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CodeFrom {
-    /// The peer sent it in CONNECTION_CLOSE.
-    Peer,
-    /// quinn raised it here.
-    Local,
-}
-
-/// A QUIC transport error code: a TLS alert is a refused handshake,
-/// `NO_ERROR` an ordinary close, `CONNECTION_REFUSED` a refusal by the
-/// peer's stack. A LOCAL `INTERNAL_ERROR` is this endpoint failing, not
-/// the peer: quinn ends every connection of an endpoint whose driver
-/// future was dropped with exactly that (quinn 0.11.12 connection.rs
-/// line 1112, "endpoint driver future was dropped"), so it is
-/// `EndpointDown`. Anything else is a protocol violation.
-fn of_transport_code(code: u64, from: CodeFrom) -> QuicErrorKind {
+/// A QUIC transport error code, sent by the peer or raised here: a TLS
+/// alert is a refused handshake, `NO_ERROR` an ordinary close,
+/// `CONNECTION_REFUSED` a refusal by the peer's stack, anything else a
+/// protocol error. That includes a LOCAL `INTERNAL_ERROR`: quinn raises it
+/// for an endpoint whose driver was dropped (quinn 0.11.12 connection.rs
+/// line 1112), but quinn-proto 0.11.19 also raises it on a healthy
+/// endpoint for a peer that leaves too many gaps in a stream or crypto
+/// buffer (connection/streams/recv.rs line 83, connection/mod.rs line
+/// 2134). Only the endpoint's availability tells the two apart, so the
+/// endpoint case is attributed by [`attribute`], not here.
+fn of_transport_code(code: u64) -> QuicErrorKind {
     if is_tls_alert(code) {
         return QuicErrorKind::Refused {
             reason: QuicRefusal::Handshake,
         };
     }
-    match (code, from) {
-        (NO_ERROR, CodeFrom::Peer | CodeFrom::Local) => QuicErrorKind::ConnectionLost,
-        (CONNECTION_REFUSED, CodeFrom::Peer | CodeFrom::Local) => QuicErrorKind::Refused {
+    match code {
+        NO_ERROR => QuicErrorKind::ConnectionLost,
+        CONNECTION_REFUSED => QuicErrorKind::Refused {
             reason: QuicRefusal::ConnectionRefused,
         },
-        (INTERNAL_ERROR, CodeFrom::Local) => QuicErrorKind::EndpointDown,
-        (code, CodeFrom::Peer | CodeFrom::Local) => QuicErrorKind::Protocol { code },
+        code => QuicErrorKind::Protocol { code },
+    }
+}
+
+/// `kind`, attributed to the endpoint when its availability is `Down`:
+/// every connection-scope kind then becomes `EndpointDown`, whichever quinn
+/// or path error it came from (quinn ends an endpoint's connections with a
+/// local INTERNAL_ERROR or, after its implicit close, LocallyClosed, and
+/// either can surface through a read, a write or a send). Two kinds keep
+/// their meaning: stream-scope kinds (they end one stream, not the
+/// connection) and `Refused { IdentityMismatch }`, a security signal that
+/// must stay visible. With any other availability `kind` is unchanged.
+pub(in crate::transport) fn attribute(
+    availability: QuicAvailability,
+    kind: QuicErrorKind,
+) -> QuicErrorKind {
+    let down = match availability {
+        QuicAvailability::Down => true,
+        QuicAvailability::Disabled | QuicAvailability::Up | QuicAvailability::Released => false,
+    };
+    match kind {
+        QuicErrorKind::Refused {
+            reason: QuicRefusal::IdentityMismatch,
+        }
+        | QuicErrorKind::Reset { .. }
+        | QuicErrorKind::Stopped { .. }
+        | QuicErrorKind::InvalidFrame
+        | QuicErrorKind::StreamClosed => kind,
+        QuicErrorKind::ConnectionLost
+        | QuicErrorKind::Refused { .. }
+        | QuicErrorKind::TimedOut
+        | QuicErrorKind::EndpointDown
+        | QuicErrorKind::Protocol { .. } => {
+            if down {
+                QuicErrorKind::EndpointDown
+            } else {
+                kind
+            }
+        }
     }
 }
 
 /// Whether a stream that was stopped or reset with `code` may succeed on a
-/// retry (a new stream): every code except the two that refuse the
-/// message itself, `HEADER_REFUSED` and `OVERLONG`, which fail the same
-/// way every time. Budget, channel-full, eviction, id-in-use,
-/// cancellation, our own `SENDER_ABORTED` and codes this node does not
-/// know are retryable, like the UDP transport's `OutboundStreamFailed`.
+/// retry (a new stream), like the UDP transport's `OutboundStreamFailed`.
+/// Not retryable, because the same message fails the same way every time:
+/// `HEADER_REFUSED`, `OVERLONG`, `FRAGMENT_REFUSED` (the receiver's buffer
+/// refused a fragment of this shape) and `LENGTH_MISMATCH` (the source
+/// delivered a different length than declared). Everything else is
+/// retryable: budget, channel-full, eviction, id-in-use, cancellation by
+/// the consumer, `SENDER_ABORTED` (the source failed) and codes this node
+/// does not know.
 pub(in crate::transport) fn stream_code_is_retryable(code: u64) -> bool {
-    !(code == u64::from(stop_code::HEADER_REFUSED) || code == u64::from(stop_code::OVERLONG))
+    ![
+        stop_code::HEADER_REFUSED,
+        stop_code::OVERLONG,
+        stop_code::FRAGMENT_REFUSED,
+        reset_code::LENGTH_MISMATCH,
+    ]
+    .into_iter()
+    .any(|deterministic| u64::from(deterministic) == code)
 }
 
 impl From<quinn::ConnectionError> for QuicErrorKind {
@@ -203,10 +244,10 @@ impl From<quinn::ConnectionError> for QuicErrorKind {
                 reason: QuicRefusal::Version,
             },
             quinn::ConnectionError::TransportError(error) => {
-                of_transport_code(u64::from(error.code), CodeFrom::Local)
+                of_transport_code(u64::from(error.code))
             }
             quinn::ConnectionError::ConnectionClosed(close) => {
-                of_transport_code(u64::from(close.error_code), CodeFrom::Peer)
+                of_transport_code(u64::from(close.error_code))
             }
             quinn::ConnectionError::ApplicationClosed(close) => {
                 match QuicCloseCode::from_code(close.error_code.into_inner()) {
@@ -284,8 +325,11 @@ impl From<QuicSendError> for QuicErrorKind {
     fn from(error: QuicSendError) -> Self {
         match error {
             QuicSendError::InvalidFrame(error) => error.into(),
-            // The path reset the stream when its source failed.
-            QuicSendError::LengthMismatch { .. } | QuicSendError::Source(_) => Self::Reset {
+            // The path reset the stream with these codes.
+            QuicSendError::LengthMismatch { .. } => Self::Reset {
+                code: u64::from(reset_code::LENGTH_MISMATCH),
+            },
+            QuicSendError::Source(_) => Self::Reset {
                 code: u64::from(reset_code::SENDER_ABORTED),
             },
             QuicSendError::Stopped(code) => Self::Stopped { code },

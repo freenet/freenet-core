@@ -252,7 +252,15 @@ mod tests {
         assert!(!monitor.is_drained());
         let wait = monitor.clone().wait_for_any_exit();
         assert!(monitor.is_drained());
+        let (logs, guard) = crate::util::test_log_capture::install();
         monitor.register("late_exit", tokio::spawn(async {}));
+        drop(guard);
+        let logs = logs.lock().unwrap().clone();
+        assert!(
+            logs.iter()
+                .any(|line| line.starts_with("ERROR") && line.contains("late_exit")),
+            "the late registration is logged at ERROR: {logs:?}"
+        );
         let fired = tokio::time::timeout(Duration::from_millis(100), wait).await;
         assert!(fired.is_err(), "a late registration is not watched");
     }

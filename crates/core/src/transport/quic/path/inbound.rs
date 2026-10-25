@@ -874,7 +874,7 @@ impl<T: TimeSource> Receiver<T> {
                 debug_assert!(false, "fragment {number} refused: {error}");
                 tracing::warn!(%error, number, "QUIC path: fragment refused by the stream buffer");
                 self.stats.record(QuicInboundOutcome::ReadFailed);
-                reader.stop(stop_code::CANCELLED);
+                reader.stop(stop_code::FRAGMENT_REFUSED);
                 false
             }
         }

@@ -506,7 +506,7 @@ pub struct TransportMetrics {
     conn_identity: [AtomicU32; ConnIdentity::COUNT],
 
     /// Times the QUIC endpoint went down while the node still held it (its
-    /// driver ended or panicked), after which the node runs with QUIC off
+    /// driver future returned), after which the node runs with QUIC off
     /// (reset each snapshot). At most one per endpoint.
     quic_endpoint_down: AtomicU64,
     /// QUIC connections this node closed, by [`QuicCloseCode`] (reset each

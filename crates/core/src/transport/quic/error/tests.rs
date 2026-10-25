@@ -65,9 +65,10 @@ fn connection_errors_map_to_their_kinds() {
             },
         ),
         (
-            "this endpoint's driver was dropped (local INTERNAL_ERROR)",
+            "local INTERNAL_ERROR (a dropped endpoint driver, or a peer leaving \
+             too many gaps in a buffer; only availability tells them apart)",
             local_error(TransportErrorCode::INTERNAL_ERROR),
-            QuicErrorKind::EndpointDown,
+            QuicErrorKind::Protocol { code: 0x1 },
         ),
         (
             "peer reports its own internal error",
@@ -168,16 +169,7 @@ fn only_the_tls_alert_range_is_a_refused_handshake() {
         } else {
             QuicErrorKind::Protocol { code }
         };
-        assert_eq!(
-            of_transport_code(code, CodeFrom::Peer),
-            expected,
-            "{code:#x}"
-        );
-        assert_eq!(
-            of_transport_code(code, CodeFrom::Local),
-            expected,
-            "{code:#x}"
-        );
+        assert_eq!(of_transport_code(code), expected, "{code:#x}");
     }
 }
 
@@ -304,7 +296,9 @@ fn path_and_framing_errors_map_to_their_kinds() {
                 declared: 2,
                 delivered: 1,
             },
-            aborted,
+            QuicErrorKind::Reset {
+                code: u64::from(reset_code::LENGTH_MISMATCH),
+            },
         ),
         (
             "source failed",
@@ -418,7 +412,9 @@ fn stream_kinds_keep_the_connection_and_the_rest_end_it() {
         (stop_code::OVERLONG, false),
         (stop_code::EVICTED, true),
         (stop_code::CANCELLED, true),
+        (stop_code::FRAGMENT_REFUSED, false),
         (reset_code::SENDER_ABORTED, true),
+        (reset_code::LENGTH_MISMATCH, false),
         (0x1f, true),
         (9, true),
     ];
@@ -457,25 +453,120 @@ fn module_body<'a>(source: &'a str, name: &str) -> &'a str {
     &rest[..end]
 }
 
-/// Every code constant in the three code modules is in that module's
-/// `ALL`, so the compile-time range and duplicate checks see it.
+/// The names of the `const` items in a module body, of any visibility,
+/// except `ALL` itself.
+fn const_names(body: &str) -> Vec<String> {
+    body.lines()
+        .filter_map(|line| {
+            let line = line.trim_start();
+            let rest = line
+                .strip_prefix("pub(crate) const ")
+                .or_else(|| line.strip_prefix("pub(super) const "))
+                .or_else(|| line.strip_prefix("pub const "))
+                .or_else(|| line.strip_prefix("const "))?;
+            let name = rest.split(':').next()?.trim().to_string();
+            (name != "ALL").then_some(name)
+        })
+        .collect()
+}
+
+/// Every code constant in the three code modules is named in that
+/// module's `ALL`, so the compile-time range and duplicate checks see it.
+/// Checked by name: a constant missing from `ALL` fails even if another
+/// one is listed twice.
 #[test]
 fn every_code_constant_is_in_its_all_list() {
     let error_rs = include_str!("../error.rs");
     let path_rs = include_str!("../path.rs");
-    for (source, name, all) in [
+    for (source, name, len) in [
         (error_rs, "close_code", close_code::ALL.len()),
         (path_rs, "stop_code", stop_code::ALL.len()),
         (path_rs, "reset_code", reset_code::ALL.len()),
     ] {
         let body = module_body(source, name);
-        let consts = body
-            .lines()
-            .filter(|line| {
-                line.trim_start().starts_with("pub(crate) const ") && line.contains(": u32 =")
-            })
-            .count();
-        assert_eq!(consts, all, "{name}: a code constant is missing from ALL");
+        let all_start = body.find("const ALL").expect("an ALL list");
+        let all = &body[all_start..];
+        let all = &all[..all.find("];").expect("ALL ends")];
+        let names = const_names(body);
+        assert_eq!(names.len(), len, "{name}: {names:?}");
+        for constant in &names {
+            assert!(
+                all.split(|c: char| !c.is_alphanumeric() && c != '_')
+                    .any(|word| word == constant),
+                "{name}::{constant} is not in {name}::ALL"
+            );
+        }
+    }
+    // The close codes are exactly the QuicCloseCode variants' values.
+    let mut variants: Vec<u32> = QuicCloseCode::ALL.iter().map(|code| code.code()).collect();
+    let mut listed = close_code::ALL.to_vec();
+    variants.sort_unstable();
+    listed.sort_unstable();
+    assert_eq!(variants, listed);
+}
+
+/// With the endpoint `Down`, every connection-scope kind is the
+/// endpoint's fault except an identity mismatch, which stays visible;
+/// stream-scope kinds keep their meaning. With any other availability
+/// nothing changes. Expectations written out per kind.
+#[test]
+fn a_down_endpoint_takes_the_blame_for_connection_errors() {
+    use super::super::liveness::QuicAvailability;
+    let identity = refused(QuicRefusal::IdentityMismatch);
+    let rows = [
+        (QuicErrorKind::ConnectionLost, QuicErrorKind::EndpointDown),
+        (QuicErrorKind::TimedOut, QuicErrorKind::EndpointDown),
+        (QuicErrorKind::EndpointDown, QuicErrorKind::EndpointDown),
+        (
+            QuicErrorKind::Protocol { code: 0x1 },
+            QuicErrorKind::EndpointDown,
+        ),
+        (refused(QuicRefusal::Handshake), QuicErrorKind::EndpointDown),
+        (refused(QuicRefusal::Downgrade), QuicErrorKind::EndpointDown),
+        (
+            refused(QuicRefusal::ConnectionRefused),
+            QuicErrorKind::EndpointDown,
+        ),
+        (refused(QuicRefusal::Local), QuicErrorKind::EndpointDown),
+        (identity, identity),
+        (
+            QuicErrorKind::Reset { code: 0x21 },
+            QuicErrorKind::Reset { code: 0x21 },
+        ),
+        (
+            QuicErrorKind::Stopped { code: 0x12 },
+            QuicErrorKind::Stopped { code: 0x12 },
+        ),
+        (QuicErrorKind::InvalidFrame, QuicErrorKind::InvalidFrame),
+        (QuicErrorKind::StreamClosed, QuicErrorKind::StreamClosed),
+    ];
+    for (kind, when_down) in rows {
+        assert_eq!(
+            attribute(QuicAvailability::Down, kind),
+            when_down,
+            "{kind:?}"
+        );
+        for other in [
+            QuicAvailability::Up,
+            QuicAvailability::Disabled,
+            QuicAvailability::Released,
+        ] {
+            assert_eq!(attribute(other, kind), kind, "{other:?} {kind:?}");
+        }
+    }
+    // The same attribution reaches errors that carry a connection error.
+    let lost = || app_close(0);
+    let carriers: [QuicErrorKind; 4] = [
+        quinn::WriteError::ConnectionLost(lost()).into(),
+        quinn::ReadError::ConnectionLost(lost()).into(),
+        QuicSendError::ConnectionLost(lost()).into(),
+        QuicConnectError::Connection(lost()).into(),
+    ];
+    for kind in carriers {
+        assert_eq!(
+            attribute(QuicAvailability::Down, kind),
+            QuicErrorKind::EndpointDown
+        );
     }
 }
 

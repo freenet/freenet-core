@@ -1188,10 +1188,12 @@ mod tests {
                     (ErrorScope::Connection, false, true)
                 }
                 TransportError::Quic(QuicError(kind)) => match kind {
-                    // Retryable codes, written out: 0x12 BUDGET_REFUSED,
-                    // 0x14 CHANNEL_FULL, 0x16 EVICTED, 0x21 SENDER_ABORTED.
+                    // Codes that refuse the message itself, written out:
+                    // 0x11 HEADER_REFUSED, 0x15 OVERLONG, 0x18
+                    // FRAGMENT_REFUSED, 0x22 LENGTH_MISMATCH. Every other
+                    // code, known or not, is retryable.
                     QuicErrorKind::Reset { code } | QuicErrorKind::Stopped { code }
-                        if [0x12, 0x14, 0x16, 0x21].contains(code) =>
+                        if ![0x11, 0x15, 0x18, 0x22].contains(code) =>
                     {
                         (ErrorScope::Transient, true, false)
                     }
@@ -1231,6 +1233,11 @@ mod tests {
             TransportError::from(QuicErrorKind::Stopped { code: 0x16 }),
             TransportError::from(QuicErrorKind::Stopped { code: 0x11 }),
             TransportError::from(QuicErrorKind::Reset { code: 0x15 }),
+            TransportError::from(QuicErrorKind::Stopped { code: 0x13 }),
+            TransportError::from(QuicErrorKind::Stopped { code: 0x17 }),
+            TransportError::from(QuicErrorKind::Stopped { code: 0x18 }),
+            TransportError::from(QuicErrorKind::Reset { code: 0x22 }),
+            TransportError::from(QuicErrorKind::Stopped { code: 0x1f }),
             TransportError::from(QuicErrorKind::Refused {
                 reason: QuicRefusal::Downgrade,
             }),

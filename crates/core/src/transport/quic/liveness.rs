@@ -167,9 +167,19 @@ impl EndpointHealth {
             tracing::debug!(local_addr = %self.local_addr, "QUIC endpoint driver ended after the endpoint was dropped");
             return;
         }
-        // send_replace returns the previous value, so a second report (none
-        // is expected: the driver ends once) changes and counts nothing.
-        if self.availability.send_replace(QuicAvailability::Down) != QuicAvailability::Down {
+        // Only from Up, in one step under the watch's lock: a release that
+        // won the race (stored Released first) is not overwritten, and a
+        // second report (none is expected: the driver ends once) changes
+        // and counts nothing.
+        let went_down = self.availability.send_if_modified(|availability| {
+            if *availability == QuicAvailability::Up {
+                *availability = QuicAvailability::Down;
+                true
+            } else {
+                false
+            }
+        });
+        if went_down {
             TRANSPORT_METRICS.record_quic_endpoint_down(self.local_addr);
             tracing::warn!(
                 local_addr = %self.local_addr,
@@ -193,4 +203,32 @@ pub(crate) async fn watch_endpoint_driver(
     // them apart.
     driver.await;
     health.driver_ended();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The driver's return and the release race. Whichever stores first
+    /// wins: a release already stored is not turned into `Down` (and
+    /// nothing is counted), and a `Down` already stored is not turned into
+    /// `Released`. The first case models a release that stored `Released`
+    /// after the driver's watcher read `released` as false.
+    #[test]
+    fn the_first_final_state_wins() {
+        let addr: SocketAddr = "10.201.35.1:1".parse().unwrap();
+        let health = EndpointHealth::new(addr);
+        health.availability.send_replace(QuicAvailability::Released);
+        health.driver_ended();
+        assert_eq!(health.watch().get(), QuicAvailability::Released);
+        assert_eq!(TRANSPORT_METRICS.quic_endpoint_down_at(addr), 0);
+
+        let addr: SocketAddr = "10.201.35.2:1".parse().unwrap();
+        let health = EndpointHealth::new(addr);
+        health.driver_ended();
+        health.release();
+        assert_eq!(health.watch().get(), QuicAvailability::Down);
+        health.driver_ended();
+        assert_eq!(TRANSPORT_METRICS.quic_endpoint_down_at(addr), 1);
+    }
 }

@@ -124,12 +124,16 @@ pub(crate) mod stop_code {
     pub(crate) const OVERLONG: u32 = 0x15;
     /// Evicted: idle too long, or older than its age limit.
     pub(crate) const EVICTED: u32 = 0x16;
-    /// The stream's handle was cancelled on the receiving side.
+    /// The stream's handle was cancelled on the receiving side (its
+    /// consumer is gone).
     pub(crate) const CANCELLED: u32 = 0x17;
+    /// The receiver's stream buffer refused a fragment (a shape it cannot
+    /// hold; not expected). The same message fails the same way again.
+    pub(crate) const FRAGMENT_REFUSED: u32 = 0x18;
     /// Every stop code, for the range and duplicate checks in
     /// `super::error`. A source-scrape test checks that each `const` in this
     /// module is listed.
-    pub(crate) const ALL: [u32; 7] = [
+    pub(crate) const ALL: [u32; 8] = [
         HEADER_REFUSED,
         BUDGET_REFUSED,
         STREAM_ID_IN_USE,
@@ -137,17 +141,21 @@ pub(crate) mod stop_code {
         OVERLONG,
         EVICTED,
         CANCELLED,
+        FRAGMENT_REFUSED,
     ];
 }
 
 /// Application error codes a sender resets a stream with (RESET_STREAM).
 /// Range `0x20..=0x2f` (see `super::error`).
 pub(crate) mod reset_code {
-    /// The sender gave up: its chunk source failed or did not deliver the
-    /// declared length.
+    /// The sender gave up: its chunk source failed, or the send was
+    /// dropped.
     pub(crate) const SENDER_ABORTED: u32 = 0x21;
+    /// The chunk source delivered a different number of bytes than the
+    /// frame declared. The same message fails the same way again.
+    pub(crate) const LENGTH_MISMATCH: u32 = 0x22;
     /// Every reset code (see `stop_code::ALL`).
-    pub(crate) const ALL: [u32; 1] = [SENDER_ABORTED];
+    pub(crate) const ALL: [u32; 2] = [SENDER_ABORTED, LENGTH_MISMATCH];
 }
 
 /// Capacity of [`QuicInbound::shorts`]. Each queued message still holds its
@@ -526,7 +534,8 @@ impl QuicPath {
     /// `chunks`, announced by `metadata` ([`frame_metadata`] says what goes
     /// in the frame). If the source fails, or delivers
     /// more or fewer than `total_len` bytes, the stream is reset
-    /// ([`reset_code::SENDER_ABORTED`]) and the receiver cancels its handle.
+    /// ([`reset_code::SENDER_ABORTED`], or [`reset_code::LENGTH_MISMATCH`]
+    /// for a wrong length) and the receiver cancels its handle.
     /// No byte past `total_len` is written.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) async fn send_stream_chunks<S>(
@@ -569,7 +578,15 @@ impl QuicPath {
         match failure {
             None => send.finish().await,
             Some(error) => {
-                send.abort();
+                let code = match &error {
+                    QuicSendError::LengthMismatch { .. } => reset_code::LENGTH_MISMATCH,
+                    QuicSendError::InvalidFrame(_)
+                    | QuicSendError::Source(_)
+                    | QuicSendError::Stopped(_)
+                    | QuicSendError::ConnectionLost(_)
+                    | QuicSendError::Closed => reset_code::SENDER_ABORTED,
+                };
+                send.abort(code);
                 Err(error)
             }
         }
@@ -707,15 +724,15 @@ impl Outgoing {
         }
     }
 
-    /// Abandon the stream ([`reset_code::SENDER_ABORTED`]).
-    fn abort(mut self) {
-        self.reset();
+    /// Abandon the stream with `code` (a [`reset_code`]).
+    fn abort(mut self, code: u32) {
+        self.reset(code);
     }
 
-    fn reset(&mut self) {
+    fn reset(&mut self, code: u32) {
         if !self.closed {
             self.closed = true;
-            self.send.reset(reset_code::SENDER_ABORTED.into()).ok();
+            self.send.reset(code.into()).ok();
         }
     }
 
@@ -741,6 +758,6 @@ impl Drop for Outgoing {
     /// FINISH it, and the receiver would take a cut-short message for one
     /// that simply ended early.
     fn drop(&mut self) {
-        self.reset();
+        self.reset(reset_code::SENDER_ABORTED);
     }
 }

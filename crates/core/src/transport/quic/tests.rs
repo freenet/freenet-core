@@ -2551,7 +2551,7 @@ fn endpoint_death_turns_quic_off_without_stopping_the_node() {
 
         let monitor = BackgroundTaskMonitor::new();
         let (attempts, _attempts_rx) = tokio::sync::mpsc::channel(4);
-        pair.a.spawn_accept_loop(&monitor, attempts);
+        assert!(pair.a.spawn_accept_loop(&monitor, attempts));
         let monitor_fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let wait = {
             let fired = monitor_fired.clone();
@@ -2588,7 +2588,7 @@ fn endpoint_death_turns_quic_off_without_stopping_the_node() {
             "{ended:?}"
         );
         assert_eq!(
-            pair.a.connection_error_kind(ended.clone()),
+            pair.a.error_kind(ended.clone()),
             QuicErrorKind::EndpointDown,
             "{ended:?}"
         );
@@ -2673,8 +2673,13 @@ fn dropping_the_endpoint_is_not_a_death() {
         )
         .unwrap();
         let monitor = BackgroundTaskMonitor::new();
-        let (attempts, _attempts_rx) = tokio::sync::mpsc::channel(4);
-        endpoint.spawn_accept_loop(&monitor, attempts);
+        let (attempts, mut attempts_rx) = tokio::sync::mpsc::channel(4);
+        assert!(endpoint.spawn_accept_loop(&monitor, attempts));
+        let (second, _second_rx) = tokio::sync::mpsc::channel(4);
+        assert!(
+            !endpoint.spawn_accept_loop(&monitor, second),
+            "one accept loop per endpoint"
+        );
         let mut availability = endpoint.availability();
         let clone = endpoint.clone();
         drop(endpoint);
@@ -2699,6 +2704,10 @@ fn dropping_the_endpoint_is_not_a_death() {
         })
         .await;
         assert_eq!(seen, QuicAvailability::Released);
+        assert!(
+            attempts_rx.recv().await.is_none(),
+            "the stopped loop dropped its sender"
+        );
         assert_eq!(Arc::strong_count(&socket), 1, "the socket was let go");
         assert_eq!(TRANSPORT_METRICS.quic_endpoint_down_at(addr), 0);
         let mut disabled = QuicAvailabilityWatch::disabled();
@@ -2727,7 +2736,7 @@ fn a_full_accept_queue_ignores_and_counts_the_attempt() {
         let monitor = BackgroundTaskMonitor::new();
         // Room for one attempt, never taken.
         let (attempts, _attempts_rx) = tokio::sync::mpsc::channel(1);
-        pair.b.spawn_accept_loop(&monitor, attempts);
+        assert!(pair.b.spawn_accept_loop(&monitor, attempts));
         let clients: Vec<_> = (0..2)
             .map(|_| {
                 let (a, b_addr, b_key) = (pair.a.clone(), pair.b_addr, pair.b_key());
@@ -2800,6 +2809,12 @@ fn the_transport_reports_quic_availability() {
             }
             assert!(!listener.is_finished(), "the listener keeps running");
             listener.abort();
+        }
+        for port in [5000, 5001] {
+            crate::transport::in_memory_socket::unregister_address_network(&SocketAddr::from((
+                [10, 201, 34, 1],
+                port,
+            )));
         }
         unregister_network_time_source(network);
     })
