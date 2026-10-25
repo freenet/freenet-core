@@ -38,7 +38,7 @@ use super::{
     packet_data::{
         MAX_PACKET_SIZE, MAX_RECV_PACKET_SIZE as RECV_BUF_SIZE, PacketData, SymmetricAES,
     },
-    peer_connection::{PeerConnection, RemoteConnection},
+    peer_connection::{InboundPacket, PeerConnection, RemoteConnection},
     sent_packet_tracker::SentPacketTracker,
     symmetric_message::{SymmetricMessage, SymmetricMessagePayload},
     token_bucket::TokenBucket,
@@ -1003,7 +1003,7 @@ enum ConnectionState<S, T: TimeSource> {
     },
     /// Connection fully established with symmetric encryption.
     Established {
-        inbound_packet_sender: mpsc::Sender<PacketData<UnknownEncryption>>,
+        inbound_packet_sender: mpsc::Sender<InboundPacket>,
     },
     /// Connection recently closed - drains in-flight packets.
     /// Allows new intro packets for reconnection.
@@ -1099,6 +1099,13 @@ impl<S, T: TimeSource> ConnectionStateManager<S, T> {
             inbound_packet_sender,
         }) = self.states.get(addr)
         {
+            // Stamped with the listener's clock, which its connections share,
+            // so telemetry can tell when the packet arrived even if the
+            // connection task takes it later (`InboundPacket`).
+            let packet = InboundPacket {
+                packet,
+                queued_nanos: self.time_source.now_nanos(),
+            };
             match inbound_packet_sender.try_send(packet) {
                 Ok(()) => {
                     // Queue gauge (telemetry): two relaxed atomic reads on
@@ -1215,7 +1222,7 @@ impl<S, T: TimeSource> ConnectionStateManager<S, T> {
     fn complete_gateway_handshake(
         &mut self,
         addr: SocketAddr,
-        inbound_packet_sender: mpsc::Sender<PacketData<UnknownEncryption>>,
+        inbound_packet_sender: mpsc::Sender<InboundPacket>,
     ) -> bool {
         use std::collections::btree_map::Entry;
 
@@ -1317,7 +1324,7 @@ impl<S, T: TimeSource> ConnectionStateManager<S, T> {
     fn complete_nat_traversal(
         &mut self,
         addr: SocketAddr,
-        inbound_packet_sender: mpsc::Sender<PacketData<UnknownEncryption>>,
+        inbound_packet_sender: mpsc::Sender<InboundPacket>,
     ) -> Option<oneshot::Sender<Result<RemoteConnection<S, T>, TransportError>>> {
         use std::collections::btree_map::Entry;
 
@@ -1380,10 +1387,7 @@ impl<S, T: TimeSource> ConnectionStateManager<S, T> {
     }
 
     /// Remove established connection and return the packet sender (for detection purposes).
-    fn remove_established(
-        &mut self,
-        addr: &SocketAddr,
-    ) -> Option<mpsc::Sender<PacketData<UnknownEncryption>>> {
+    fn remove_established(&mut self, addr: &SocketAddr) -> Option<mpsc::Sender<InboundPacket>> {
         if matches!(
             self.states.get(addr),
             Some(ConnectionState::Established { .. })
@@ -2378,7 +2382,15 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
             // These packets are buffered in `next_inbound` but only the ACK packet is read above.
             // Forward any remaining packets to the new connection channel so they're not lost.
             let mut forwarded_count = 0;
+            // Stamped as they are forwarded: they arrived during the handshake,
+            // before anything else on this channel, so a common later stamp
+            // keeps them together and ahead of every later packet.
+            let forwarded_nanos = time_source.now_nanos();
             while let Ok(packet) = next_inbound.try_recv() {
+                let packet = InboundPacket {
+                    packet,
+                    queued_nanos: forwarded_nanos,
+                };
                 if inbound_packet_tx.try_send(packet).is_err() {
                     tracing::warn!(
                         peer_addr = %remote_addr,
@@ -3561,7 +3573,7 @@ pub(crate) enum ConnectionEvent<S = UdpSocket, TS: TimeSource = RealTime> {
 }
 
 struct InboundRemoteConnection {
-    inbound_packet_sender: mpsc::Sender<PacketData<UnknownEncryption>>,
+    inbound_packet_sender: mpsc::Sender<InboundPacket>,
 }
 
 mod recv_errors;

@@ -98,13 +98,36 @@ const SIMULATION_ACK_CHECK_INTERVAL: Duration = Duration::from_millis(500);
 const SIMULATION_RESEND_CHECK_INTERVAL: Duration = Duration::from_millis(50);
 const SIMULATION_RESEND_YIELD_DELAY: Duration = Duration::from_millis(10);
 
+/// An inbound packet as the listener hands it to an established connection,
+/// with the time the listener queued it (nanoseconds from the listener's
+/// `TimeSource`, the same clock the connection's `time_source` reads).
+/// Telemetry uses `queued_nanos` as the packet's arrival time, so packets
+/// that wait in the channel while the connection task is busy still count
+/// as arriving together (see `inbound_concurrency`).
+pub(crate) struct InboundPacket {
+    pub(crate) packet: PacketData<UnknownEncryption>,
+    pub(crate) queued_nanos: u64,
+}
+
+#[cfg(test)]
+impl InboundPacket {
+    /// A packet stamped at time 0, for tests that do not look at the
+    /// inbound concurrency estimate.
+    pub(crate) fn unstamped(packet: PacketData<UnknownEncryption>) -> Self {
+        Self {
+            packet,
+            queued_nanos: 0,
+        }
+    }
+}
+
 #[must_use]
 pub(crate) struct RemoteConnection<S = super::UdpSocket, T: TimeSource = RealTime> {
     pub(super) outbound_symmetric_key: Aes128Gcm,
     pub(super) remote_addr: SocketAddr,
     pub(super) sent_tracker: Arc<parking_lot::Mutex<SentPacketTracker<T>>>,
     pub(super) last_packet_id: Arc<AtomicU32>,
-    pub(super) inbound_packet_recv: mpsc::Receiver<PacketData<UnknownEncryption>>,
+    pub(super) inbound_packet_recv: mpsc::Receiver<InboundPacket>,
     pub(super) inbound_symmetric_key: Aes128Gcm,
     pub(super) inbound_symmetric_key_bytes: [u8; 16],
     #[allow(dead_code)]
@@ -1229,7 +1252,8 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
             // DST: Use deterministic_select! for fair but deterministic branch ordering
             crate::deterministic_select! {
                 inbound = self.remote_conn.inbound_packet_recv.recv() => {
-                    let packet_data = inbound.ok_or_else(|| TransportError::ConnectionClosed(self.remote_addr()))?;
+                    let InboundPacket { packet: packet_data, queued_nanos } =
+                        inbound.ok_or_else(|| TransportError::ConnectionClosed(self.remote_addr()))?;
                     self.last_received_nanos = self.time_source.now_nanos();
 
                     // Debug logging for intro packets
@@ -1641,7 +1665,7 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                     if flush_receipts {
                         self.receipts_flush_due = true;
                     }
-                    if let Some(msg) = self.process_inbound(payload).await.map_err(|error| {
+                    if let Some(msg) = self.process_inbound(payload, queued_nanos).await.map_err(|error| {
                         tracing::error!(
                             error = %error,
                             packet_id,
@@ -2354,6 +2378,7 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
         fragment_number: u32,
         payload: bytes::Bytes,
         now_nanos: u64,
+        queued_nanos: u64,
     ) -> bool {
         if let Some((streaming_handle, last_activity_nanos)) =
             self.streaming_handles.get_mut(&stream_id)
@@ -2461,7 +2486,7 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
             Ok(_) => {}
         }
         // After the push, so a stream found already cancelled is not counted.
-        self.sample_inbound_concurrency(false);
+        self.sample_inbound_concurrency(false, queued_nanos);
         // Phase 4: Register with orphan stream registry for race condition handling.
         // This allows operations layer to claim the stream when metadata arrives,
         // even if the stream fragments arrived first.
@@ -2577,11 +2602,14 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
     /// Record this connection's inbound concurrency estimate (telemetry
     /// only; see `inbound_concurrency`) on a short message's arrival
     /// (`short`) or a new inbound stream's admission. Never on a later
-    /// fragment of a stream. The window uses the connection's published
-    /// smoothed RTT (data-ACK or keep-alive, whichever is newer), read
-    /// without taking the sent tracker's lock.
-    fn sample_inbound_concurrency(&mut self, short: bool) {
-        let now_nanos = self.time_source.now_nanos();
+    /// fragment of a stream. `queued_nanos` is when the listener queued the
+    /// packet ([`InboundPacket`]), not when this task got to it: a burst
+    /// that waited in the channel is counted as arriving together, not
+    /// spread over the time it took to drain. The window uses the
+    /// connection's published smoothed RTT (data-ACK or keep-alive,
+    /// whichever is newer), read without taking the sent tracker's lock.
+    fn sample_inbound_concurrency(&mut self, short: bool, queued_nanos: u64) {
+        let now_nanos = queued_nanos;
         let srtt = self.remote_conn.rolling_rtt_stats.srtt();
         let open_streams = self.inbound_budget.stream_count();
         let estimate = if short {
@@ -2601,9 +2629,12 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
         }
     }
 
+    /// `queued_nanos` is when the listener queued the packet carrying
+    /// `payload` (see [`InboundPacket`]), used only by telemetry.
     async fn process_inbound(
         &mut self,
         payload: SymmetricMessagePayload,
+        queued_nanos: u64,
     ) -> Result<Option<Vec<u8>>> {
         use SymmetricMessagePayload::*;
         match payload {
@@ -2614,7 +2645,7 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                 // We always dispatch ShortMessages — dedup only suppresses the
                 // redundant embedded-metadata copy, never the ShortMessage itself.
                 self.dispatched_msg_hashes.put(Self::msg_hash(&bytes), ());
-                self.sample_inbound_concurrency(true);
+                self.sample_inbound_concurrency(true, queued_nanos);
                 Ok(Some(bytes))
             }
             AckConnection { result: Err(cause) } => {
@@ -2694,6 +2725,7 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                         fragment_number,
                         payload,
                         now_nanos,
+                        queued_nanos,
                     );
                     // A refused or dropped fragment carries no metadata worth
                     // dispatching: its stream holds no state to claim.
@@ -2818,7 +2850,7 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                     self.completed_inbound_streams.put(stream_id, ());
                     // Whole on arrival and never charged: on QUIC it would
                     // hold its stream about as long as a short message.
-                    self.sample_inbound_concurrency(true);
+                    self.sample_inbound_concurrency(true, queued_nanos);
                     return Ok(Some(msg));
                 }
                 self.inbound_budget.charge(
@@ -2828,7 +2860,7 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                     inbound_stream_age_limit(total_length_bytes),
                     inbound_budget::Liveness::Task(Arc::downgrade(&token)),
                 );
-                self.sample_inbound_concurrency(false);
+                self.sample_inbound_concurrency(false, queued_nanos);
                 let (sender, receiver) = mpsc::channel(64);
                 self.inbound_streams.insert(stream_id, sender);
                 self.legacy_tokens.insert(stream_id, Arc::clone(&token));
@@ -5236,9 +5268,9 @@ mod tests {
         )
         .expect("encode v2 ack");
         inbound_tx
-            .send(
-                PacketData::<crate::transport::packet_data::UnknownEncryption>::from_buf(v2.data()),
-            )
+            .send(InboundPacket::unstamped(PacketData::<
+                crate::transport::packet_data::UnknownEncryption,
+            >::from_buf(v2.data())))
             .await
             .expect("send v2 ack");
 
@@ -5253,11 +5285,11 @@ mod tests {
         )
         .expect("encode short message");
         inbound_tx
-            .send(
-                PacketData::<crate::transport::packet_data::UnknownEncryption>::from_buf(
-                    follow_up.data(),
-                ),
-            )
+            .send(InboundPacket::unstamped(PacketData::<
+                crate::transport::packet_data::UnknownEncryption,
+            >::from_buf(
+                follow_up.data()
+            )))
             .await
             .expect("send short message");
 
@@ -5473,7 +5505,10 @@ mod tests {
         let packet = PacketData::<crate::transport::packet_data::UnknownEncryption>::from_buf(
             &encrypted_bytes,
         );
-        inbound_tx.send(packet).await.expect("send");
+        inbound_tx
+            .send(InboundPacket::unstamped(packet))
+            .await
+            .expect("send");
 
         let metrics_before_recv = crate::transport::TRANSPORT_METRICS
             .per_peer_snapshot()
@@ -5699,7 +5734,7 @@ mod tests {
         remote_addr: SocketAddr,
     ) -> (
         PeerConnection<TestSocket, crate::simulation::RealTime>,
-        mpsc::Sender<PacketData<UnknownEncryption>>,
+        mpsc::Sender<InboundPacket>,
     ) {
         use crate::simulation::RealTime;
         use crate::transport::crypto::TransportKeypair;
@@ -6007,8 +6042,14 @@ mod tests {
         conn.pending_pings.write().insert(pong_seq, send_nanos);
         time_source.advance_time(Duration::from_millis(50));
 
-        inbound_tx.send(pong_packet).await.expect("send pong");
-        inbound_tx.send(short_packet).await.expect("send short");
+        inbound_tx
+            .send(InboundPacket::unstamped(pong_packet))
+            .await
+            .expect("send pong");
+        inbound_tx
+            .send(InboundPacket::unstamped(short_packet))
+            .await
+            .expect("send short");
 
         let _msg = conn.recv().await.expect("recv");
 

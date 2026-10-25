@@ -636,7 +636,8 @@ fn test_atomic_handshake_completion_no_packet_loss() {
     );
 
     // Create channel for established connection
-    let (established_tx, _established_rx) = mpsc::channel::<PacketData<UnknownEncryption>>(16);
+    let (established_tx, _established_rx) =
+        mpsc::channel::<crate::transport::peer_connection::InboundPacket>(16);
 
     // Complete the handshake atomically
     let completed = manager.complete_gateway_handshake(addr, established_tx);
@@ -675,7 +676,8 @@ fn test_recently_closed_prevents_asymmetric_decryption() {
     // Create an established connection
     let (tx, _rx) = mpsc::channel::<PacketData<UnknownEncryption>>(16);
     manager.start_gateway_handshake(addr, tx);
-    let (established_tx, _established_rx) = mpsc::channel::<PacketData<UnknownEncryption>>(16);
+    let (established_tx, _established_rx) =
+        mpsc::channel::<crate::transport::peer_connection::InboundPacket>(16);
     manager.complete_gateway_handshake(addr, established_tx);
     assert!(manager.is_established(&addr));
 
@@ -826,9 +828,10 @@ async fn test_try_send_established_never_blocks_when_full() {
     let addr: SocketAddr = "127.0.0.1:8002".parse().unwrap();
 
     // Establish a connection with a tiny channel and no consumer ever reading from it.
-    let (tx, _rx) = mpsc::channel::<PacketData<UnknownEncryption>>(CAPACITY);
-    let started = manager.start_gateway_handshake(addr, tx.clone());
+    let (handshake_tx, _handshake_rx) = mpsc::channel::<PacketData<UnknownEncryption>>(CAPACITY);
+    let started = manager.start_gateway_handshake(addr, handshake_tx);
     assert!(started, "Should start gateway handshake");
+    let (tx, _rx) = mpsc::channel::<crate::transport::peer_connection::InboundPacket>(CAPACITY);
     let completed = manager.complete_gateway_handshake(addr, tx);
     assert!(completed, "Should complete gateway handshake");
 

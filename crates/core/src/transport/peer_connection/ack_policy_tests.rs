@@ -61,7 +61,9 @@ fn random_key() -> ([u8; 16], Aes128Gcm) {
 struct End {
     conn: PeerConnection<ChanSocket, RealTime>,
     /// Feed packets INTO this end (as if from the remote).
-    inbound: mpsc::Sender<PacketData<UnknownEncryption>>,
+    inbound: mpsc::Sender<InboundPacket>,
+    /// The connection's clock, to stamp fed packets as the listener does.
+    clock: RealTime,
     /// Datagrams this end SENT.
     wire: WireRx,
     /// Key this end encrypts with; decrypts what it sent.
@@ -92,6 +94,7 @@ fn end_with_wire_capacity(
 ) -> End {
     let _ = addr;
     let time_source = RealTime::new();
+    let clock = time_source.clone();
     let (inbound_tx, inbound_rx) = mpsc::channel(4096);
     let (wire_tx, wire_rx) = mpsc::channel(wire_capacity);
     let fail_sends = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -130,6 +133,7 @@ fn end_with_wire_capacity(
     End {
         conn: PeerConnection::new(remote_conn),
         inbound: inbound_tx,
+        clock,
         wire: wire_rx,
         outbound_key: outbound.1,
         inbound_key: inbound.1,
@@ -150,6 +154,15 @@ const CAPABLE: Option<(u8, u8, u16)> = Some(UNTRACKED_ACK_NOOP_MIN_VERSION);
 const OLD: Option<(u8, u8, u16)> = Some((0, 2, 141));
 
 impl End {
+    /// Queue `packet` for this end, stamped with its clock as the listener
+    /// stamps it.
+    fn queued(&self, packet: PacketData<UnknownEncryption>) -> InboundPacket {
+        InboundPacket {
+            packet,
+            queued_nanos: self.clock.now_nanos(),
+        }
+    }
+
     /// Forge a packet from the remote and deliver it to this end.
     async fn deliver(&self, packet_id: u32, payload: SymmetricMessagePayload, receipts: Vec<u32>) {
         let packet = SymmetricMessage::serialize_msg_to_packet_data(
@@ -160,7 +173,10 @@ impl End {
         )
         .expect("encrypt");
         self.inbound
-            .send(PacketData::<UnknownEncryption>::from_buf(packet.data()))
+            .send(InboundPacket {
+                packet: PacketData::<UnknownEncryption>::from_buf(packet.data()),
+                queued_nanos: self.clock.now_nanos(),
+            })
             .await
             .expect("deliver");
     }
@@ -554,6 +570,7 @@ fn start(
 ) -> Running {
     let a_inbound = a.inbound.clone();
     let b_inbound = b.inbound.clone();
+    let (a_clock, b_clock) = (a.clock.clone(), b.clock.clone());
     let mut a_wire = std::mem::replace(&mut a.wire, mpsc::channel(1).1);
     let mut b_wire = std::mem::replace(&mut b.wire, mpsc::channel(1).1);
     let a_key = a.outbound_key.clone();
@@ -569,6 +586,10 @@ fn start(
             let m = SymmetricMessage::deser(p.try_decrypt_sym(&a_key).unwrap().data()).unwrap();
             let dropped = drop_a_to_b(&m);
             la.lock().push((tokio::time::Instant::now(), m));
+            let p = InboundPacket {
+                packet: p,
+                queued_nanos: b_clock.now_nanos(),
+            };
             if !dropped && b_inbound.send(p).await.is_err() {
                 return;
             }
@@ -580,6 +601,10 @@ fn start(
             let m = SymmetricMessage::deser(p.try_decrypt_sym(&b_key).unwrap().data()).unwrap();
             let dropped = drop_b_to_a(&m);
             lb.lock().push((tokio::time::Instant::now(), m));
+            let p = InboundPacket {
+                packet: p,
+                queued_nanos: a_clock.now_nanos(),
+            };
             if !dropped && a_inbound.send(p).await.is_err() {
                 return;
             }
@@ -1076,7 +1101,7 @@ async fn connection_ack_does_not_shadow_the_first_data_packet() {
     let mut e = single(CAPABLE);
     let ack = SymmetricMessage::ack_ok(&e.inbound_key, [0u8; 16], addr(2)).expect("ack");
     e.inbound
-        .send(PacketData::<UnknownEncryption>::from_buf(ack.data()))
+        .send(e.queued(PacketData::<UnknownEncryption>::from_buf(ack.data())))
         .await
         .expect("deliver ack");
     e.deliver(SymmetricMessage::FIRST_PACKET_ID, short(b"first"), vec![])
@@ -1135,7 +1160,7 @@ async fn connection_ack_exchange_is_bounded_and_clears_the_handshake_ack() {
         .lock()
         .report_sent_packet(SymmetricMessage::FIRST_PACKET_ID, a_ack.data().into());
     b.inbound
-        .send(PacketData::<UnknownEncryption>::from_buf(a_ack.data()))
+        .send(b.queued(PacketData::<UnknownEncryption>::from_buf(a_ack.data())))
         .await
         .expect("deliver");
     let a_tracker = a.conn.remote_conn.sent_tracker.clone();
@@ -1416,8 +1441,11 @@ async fn legacy_fragment_survives_cancellation_during_a_blocked_handoff() {
     };
     // The hand-off blocks on the full channel; cancel it (as the listener's
     // select does when an outbound message wins).
-    let blocked =
-        tokio::time::timeout(Duration::from_millis(10), e.conn.process_inbound(fragment)).await;
+    let blocked = tokio::time::timeout(
+        Duration::from_millis(10),
+        e.conn.process_inbound(fragment, 0),
+    )
+    .await;
     assert!(
         blocked.is_err(),
         "premise: the hand-off was blocked and cancelled"
@@ -1757,8 +1785,9 @@ fn holds_no_state(e: &End, stream_id: StreamId) -> bool {
 }
 
 async fn feed(e: &mut End, payload: SymmetricMessagePayload) -> Option<Vec<u8>> {
+    let queued_nanos = e.clock.now_nanos();
     e.conn
-        .process_inbound(payload)
+        .process_inbound(payload, queued_nanos)
         .await
         .expect("an inbound stream fragment must not fail the connection")
 }
@@ -2580,7 +2609,7 @@ async fn a_refusal_that_cannot_be_remembered_closes_the_connection() {
 
     let result = e
         .conn
-        .process_inbound(fragment(StreamId::next_transport_internal(), 0, 1))
+        .process_inbound(fragment(StreamId::next_transport_internal(), 0, 1), 0)
         .await;
     assert!(
         matches!(result, Err(TransportError::ConnectionClosed(_))),
@@ -2774,9 +2803,9 @@ async fn undecodable_authenticated_packet_is_dropped_not_fatal() {
         .encrypt_symmetric(&e.inbound_key);
     assert!(SymmetricMessage::deser(&[0xFF, 0xFF, 0xFF]).is_err());
     e.inbound
-        .send(PacketData::<UnknownEncryption>::from_buf(
+        .send(e.queued(PacketData::<UnknownEncryption>::from_buf(
             undecodable.data(),
-        ))
+        )))
         .await
         .expect("deliver");
     e.deliver(0, short(b"after"), vec![]).await;
@@ -2923,7 +2952,7 @@ async fn upgrade_control_with_unknown_inner_variant_is_dropped() {
         PacketData::<_, { crate::transport::packet_data::MAX_PACKET_SIZE }>::from_buf_plain(&bytes)
             .encrypt_symmetric(&e.inbound_key);
     e.inbound
-        .send(PacketData::<UnknownEncryption>::from_buf(packet.data()))
+        .send(e.queued(PacketData::<UnknownEncryption>::from_buf(packet.data())))
         .await
         .expect("deliver");
     e.deliver(4, short(b"after"), vec![]).await;
@@ -3111,4 +3140,32 @@ async fn a_refused_inbound_stream_is_not_sampled() {
             "{stream_id:?}"
         );
     }
+}
+
+/// Short messages are timed from when the listener queued them, not from
+/// when the connection task got to them: three that arrived within one
+/// window and then waited in the channel while the task was busy count as
+/// together, although the task takes them a second apart.
+#[tokio::test(start_paused = true)]
+async fn queued_short_messages_count_from_their_arrival() {
+    let mut e = single(CAPABLE);
+    let metrics = private_concurrency_metrics(&mut e);
+    // Arrivals 0, 50 and 100 ms: inside one no-RTT window (125 ms).
+    for id in 1..=3u32 {
+        if id > 1 {
+            tokio::time::advance(Duration::from_millis(50)).await;
+        }
+        e.deliver(id, short(b"q"), vec![]).await;
+    }
+    // The task takes them one at a time, a second apart.
+    for _ in 0..3 {
+        assert!(e.pump(Duration::from_millis(1)).await.is_some());
+        tokio::time::advance(Duration::from_secs(1)).await;
+    }
+    assert_eq!(e.conn.telemetry_test_counts.inbound_concurrency_samples, 3);
+    assert_eq!(
+        metrics.read_snapshot().inbound_concurrency_max,
+        3,
+        "the three arrived within one window"
+    );
 }
