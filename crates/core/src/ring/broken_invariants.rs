@@ -6,7 +6,9 @@
 //! byte-different state, which propagates, which every peer re-merges.
 //!
 //! Two detectors in `Executor` feed this tracker: the sampled re-apply
-//! probe (`maybe_probe_idempotency`, 1/32 of pure-`State` merges) and the
+//! probe (`maybe_probe_idempotency`, 1/32 of pure-`State` merges; a content
+//! change on re-apply flags only when the conformance verifier's heal step
+//! shows the merge does not settle) and the
 //! deterministic identical-input probe
 //! (`probe_identical_input_idempotency`): when an incoming full-`State`
 //! payload is byte-identical to the stored state, `update_state(S, State(S))`
@@ -23,6 +25,9 @@
 //! 2. Persists the flag to the executor's ReDb storage so the detection
 //!    survives node restarts (a known-broken contract should not re-engage
 //!    the storm just because the process bounced).
+//!
+//! A detection that starts, restarts or escalates suppression is also sent to
+//! telemetry as a [`FLAG_TELEMETRY_EVENT`] event (`Ring::record_broken_invariant`).
 //!
 //! Reads (via [`BrokenInvariantsTracker::is_broken`]) gate the executor's
 //! commit + broadcast-emission paths AND the full-state egress paths
@@ -150,9 +155,95 @@ pub(crate) const IDENTITY_PROBE_COOLDOWN: Duration = Duration::from_secs(60);
 /// or non-determinism detection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BrokenInvariant {
-    /// `update_state(update_state(S, U), U) != update_state(S, U)` was observed
-    /// for at least one sampled (state, update) pair.
+    /// Re-applying the same full state was shown not to settle: the sampled
+    /// probe's heal check failed, or the identical-input probe found no fixpoint.
     NonIdempotent,
+}
+
+/// Which detector recorded a flag. Reported in the flag telemetry event so the
+/// fleet-wide rate of each can be read separately.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BrokenInvariantDetector {
+    /// The sampled re-apply probe (`Executor::maybe_probe_idempotency`).
+    SampledReapply,
+    /// The deterministic identical-input probe
+    /// (`Executor::probe_identical_input_idempotency`).
+    IdenticalInput,
+}
+
+impl BrokenInvariantDetector {
+    fn as_str(self) -> &'static str {
+        match self {
+            BrokenInvariantDetector::SampledReapply => "sampled_reapply",
+            BrokenInvariantDetector::IdenticalInput => "identical_input",
+        }
+    }
+}
+
+/// What [`BrokenInvariantsTracker::record`] did with a detection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FlagOutcome {
+    /// First detection for this contract: suppression starts at the baseline TTL.
+    New,
+    /// Re-detected after a full quiet window: suppression starts again at the
+    /// baseline TTL.
+    Restarted,
+    /// Re-detected after the suppression expired but inside the re-flag window:
+    /// suppression starts again at the escalated TTL.
+    Escalated(Duration),
+    /// Re-detected while still suppressed: the same detection cycle.
+    Refreshed,
+}
+
+/// OTLP event type for a flag that starts (or restarts) suppression.
+pub(crate) const FLAG_TELEMETRY_EVENT: &str = "broken_invariant_flagged";
+
+/// The telemetry body for a detection, or `None` when the detection did not
+/// change what the node suppresses (a refresh inside an active cycle, which a
+/// busy flagged contract can produce on every probe).
+pub(crate) fn flag_telemetry(
+    id: &ContractInstanceId,
+    kind: BrokenInvariant,
+    detector: BrokenInvariantDetector,
+    verdict: &'static str,
+    outcome: FlagOutcome,
+) -> Option<serde_json::Value> {
+    let (outcome, ttl) = match outcome {
+        FlagOutcome::New => ("new", BROKEN_INVARIANT_TTL),
+        FlagOutcome::Restarted => ("restarted", BROKEN_INVARIANT_TTL),
+        FlagOutcome::Escalated(ttl) => ("escalated", ttl),
+        FlagOutcome::Refreshed => return None,
+    };
+    let invariant = match kind {
+        BrokenInvariant::NonIdempotent => "non_idempotent",
+    };
+    Some(serde_json::json!({
+        "contract": id.to_string(),
+        "invariant": invariant,
+        "detector": detector.as_str(),
+        "verdict": verdict,
+        "outcome": outcome,
+        "suppression_ttl_secs": ttl.as_secs(),
+    }))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only record of every flag event handed to telemetry on this thread,
+    /// so a test can assert the emission without a telemetry backend.
+    pub(crate) static EMITTED_FLAG_EVENTS: std::cell::RefCell<Vec<serde_json::Value>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Hand a flag event to the node's telemetry exporter.
+pub(crate) fn emit_flag_telemetry(peer_id: &str, data: serde_json::Value) {
+    #[cfg(test)]
+    EMITTED_FLAG_EVENTS.with(|events| events.borrow_mut().push(data.clone()));
+    crate::tracing::telemetry::send_standalone_event_with_peer_id(
+        FLAG_TELEMETRY_EVENT,
+        peer_id,
+        data,
+    );
 }
 
 impl BrokenInvariant {
@@ -302,7 +393,7 @@ impl BrokenInvariantsTracker {
     /// suppress the storm than crash on a database hiccup). The escalation level
     /// is in-memory only — the persisted row records just the flag kind, so a
     /// restart re-hydrates at the baseline TTL.
-    pub fn record(&self, id: ContractInstanceId, kind: BrokenInvariant) {
+    pub fn record(&self, id: ContractInstanceId, kind: BrokenInvariant) -> FlagOutcome {
         use dashmap::mapref::entry::Entry;
         let now = self.time_source.now();
 
@@ -312,6 +403,7 @@ impl BrokenInvariantsTracker {
         enum Outcome {
             New,
             Escalated(Duration),
+            Reset,
             Refreshed,
         }
         let outcome = match self.flags.entry(id) {
@@ -321,7 +413,7 @@ impl BrokenInvariantsTracker {
                 let reflag_window = ttl * REFLAG_WINDOW_MULT;
                 let (new_ttl, outcome) = if elapsed >= reflag_window {
                     // Quiet for an escalated TTL plus a full window → reset.
-                    (BROKEN_INVARIANT_TTL, Outcome::Refreshed)
+                    (BROKEN_INVARIANT_TTL, Outcome::Reset)
                 } else if elapsed >= ttl {
                     // Re-detected after expiry, within the re-flag window →
                     // escalate (double, capped).
@@ -380,7 +472,13 @@ impl BrokenInvariantsTracker {
                     "Re-detected broken contract — escalating suppression TTL (#4902 egress oscillation)"
                 );
             }
-            Outcome::Refreshed => {}
+            Outcome::Reset | Outcome::Refreshed => {}
+        }
+        match outcome {
+            Outcome::New => FlagOutcome::New,
+            Outcome::Escalated(ttl) => FlagOutcome::Escalated(ttl),
+            Outcome::Reset => FlagOutcome::Restarted,
+            Outcome::Refreshed => FlagOutcome::Refreshed,
         }
     }
 
@@ -553,6 +651,101 @@ mod tests {
     fn mk_tracker() -> (BrokenInvariantsTracker, SharedMockTimeSource) {
         let ts = SharedMockTimeSource::new();
         (BrokenInvariantsTracker::new(Arc::new(ts.clone())), ts)
+    }
+
+    /// Each detection outcome maps to the telemetry body it should produce: a
+    /// first detection, a re-detection after the suppression expired (escalated
+    /// TTL) and a re-detection after a full quiet window (baseline TTL) are
+    /// reported; a re-detection while still suppressed is not.
+    #[test]
+    fn record_outcomes_map_to_flag_telemetry() {
+        let (t, ts) = mk_tracker();
+        let id = fake_id(40);
+        let body = |outcome| {
+            flag_telemetry(
+                &id,
+                BrokenInvariant::NonIdempotent,
+                BrokenInvariantDetector::SampledReapply,
+                "reconciliation_cycles",
+                outcome,
+            )
+        };
+
+        let first = t.record(id, BrokenInvariant::NonIdempotent);
+        assert_eq!(first, FlagOutcome::New);
+        let event = body(first).expect("a new flag is reported");
+        assert_eq!(event["outcome"], "new");
+        assert_eq!(event["verdict"], "reconciliation_cycles");
+        assert_eq!(event["detector"], "sampled_reapply");
+        assert_eq!(event["invariant"], "non_idempotent");
+        assert_eq!(event["contract"], id.to_string());
+        assert_eq!(
+            event["suppression_ttl_secs"],
+            BROKEN_INVARIANT_TTL.as_secs()
+        );
+
+        // Still suppressed: same cycle, not reported.
+        ts.advance_time(BROKEN_INVARIANT_TTL / 2);
+        let refreshed = t.record(id, BrokenInvariant::NonIdempotent);
+        assert_eq!(refreshed, FlagOutcome::Refreshed);
+        assert!(body(refreshed).is_none(), "a refresh must not be reported");
+
+        // Expired, inside the re-flag window: escalated TTL, reported.
+        ts.advance_time(BROKEN_INVARIANT_TTL);
+        let escalated = t.record(id, BrokenInvariant::NonIdempotent);
+        assert_eq!(escalated, FlagOutcome::Escalated(BROKEN_INVARIANT_TTL * 2));
+        let event = body(escalated).expect("an escalation is reported");
+        assert_eq!(event["outcome"], "escalated");
+        assert_eq!(
+            event["suppression_ttl_secs"],
+            (BROKEN_INVARIANT_TTL * 2).as_secs()
+        );
+
+        // A full quiet window later: suppression restarts at baseline, reported.
+        ts.advance_time(BROKEN_INVARIANT_TTL * 2 * REFLAG_WINDOW_MULT);
+        let restarted = t.record(id, BrokenInvariant::NonIdempotent);
+        assert_eq!(restarted, FlagOutcome::Restarted);
+        assert!(t.is_broken(&id), "a restarted flag suppresses again");
+        let event = body(restarted).expect("a restart is reported");
+        assert_eq!(event["outcome"], "restarted");
+        assert_eq!(
+            event["suppression_ttl_secs"],
+            BROKEN_INVARIANT_TTL.as_secs()
+        );
+    }
+
+    /// A flag survives a restart: a tracker wired to the reopened store starts
+    /// suppressing at once, and a re-detection in that window is a refresh,
+    /// so the restart does not produce a second flag event.
+    #[cfg(feature = "redb")]
+    #[tokio::test]
+    async fn a_persisted_flag_is_rehydrated_and_not_reported_again() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let id = fake_id(41);
+        {
+            let storage = crate::contract::storages::ReDb::new(dir.path())
+                .await
+                .unwrap();
+            let (t, _ts) = mk_tracker();
+            t.set_storage(storage);
+            assert_eq!(
+                t.record(id, BrokenInvariant::NonIdempotent),
+                FlagOutcome::New
+            );
+        }
+
+        let storage = crate::contract::storages::ReDb::new(dir.path())
+            .await
+            .unwrap();
+        let (t, _ts) = mk_tracker();
+        assert!(!t.is_broken(&id));
+        t.set_storage(storage);
+        assert!(t.is_broken(&id), "the persisted flag must be rehydrated");
+        assert_eq!(t.current_ttl(&id), Some(BROKEN_INVARIANT_TTL));
+        assert_eq!(
+            t.record(id, BrokenInvariant::NonIdempotent),
+            FlagOutcome::Refreshed
+        );
     }
 
     #[test]

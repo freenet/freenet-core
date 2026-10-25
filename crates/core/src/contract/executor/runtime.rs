@@ -2,6 +2,7 @@ mod contract_ops;
 mod delegates;
 mod executor_impl;
 mod pool;
+mod reapply_probe;
 mod subscriptions;
 
 use super::*;
@@ -13,6 +14,8 @@ use crate::wasm_runtime::default_wasmtime_cache_size_bytes_for_dir;
 pub(crate) use contract_ops::ReclaimOutcome;
 pub use pool::RuntimePool;
 pub(crate) use pool::{ExportAdmission, ExportDone, MAX_CONCURRENT_EXPORTS};
+#[cfg(test)]
+pub(crate) use reapply_probe::{IdenticalIsNoOp, REAPPLY_PROBE_TIME_BUDGET};
 
 /// Maximum number of related contracts a single validation can request.
 /// Bounds worst-case first-time cost: N GETs of up to 50MB each.
@@ -31,6 +34,24 @@ const RELATED_FETCH_TIMEOUT: Duration = Duration::from_secs(10);
 /// Sample selection uses `GlobalRng` (deterministic under a fixed seed
 /// for simulation tests). See `Executor::maybe_probe_idempotency`.
 const IDEMPOTENCY_PROBE_PROBABILITY: f64 = 1.0 / 32.0;
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only: sample every eligible merge, so a test can drive the sampled
+    /// probe through the real merge path. Thread-local, so it only reaches the
+    /// `current_thread` test that sets it.
+    pub(crate) static IDEMPOTENCY_PROBE_ALWAYS: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+/// Whether this merge is one of the [`IDEMPOTENCY_PROBE_PROBABILITY`] sample.
+fn idempotency_probe_sampled() -> bool {
+    #[cfg(test)]
+    if IDEMPOTENCY_PROBE_ALWAYS.with(std::cell::Cell::get) {
+        return true;
+    }
+    crate::config::GlobalRng::random_bool(IDEMPOTENCY_PROBE_PROBABILITY)
+}
 
 /// Maximum successive re-applies the deterministic identical-input probe
 /// (`Executor::probe_identical_input_idempotency`) runs while looking for a

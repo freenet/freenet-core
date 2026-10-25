@@ -12,6 +12,7 @@ mod non_idempotent_detector_tests;
 mod params_integrity_wasm_tests;
 mod related_contract_tests;
 mod runtime_pool_tests;
+mod sampled_probe_tests;
 mod subscriber_limit_tests;
 mod subscriber_stress_tests;
 mod summarize_delta_cache_tests;
