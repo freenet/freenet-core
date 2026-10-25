@@ -106,12 +106,13 @@ impl P2pConnManager {
     }
 
     /// `NodeEvent::ExpectPeerConnection`: a connect op expects a connection
-    /// from `addr`. Registers the address with the transport and with the
-    /// handshake driver. The registration names only the address, so a
-    /// matched connection starts without a peer identity, like an unexpected
-    /// one, until a ConnectPeer or ConnectRequest names the peer.
+    /// from `addr` and is dialling it under `peer_key`. Registers the address
+    /// with the transport and, with the key, with the handshake driver, so a
+    /// matched inbound connection is recorded and promoted under the key the
+    /// connect op dialled, as the dial itself would be if it succeeded.
     pub(super) fn handle_expect_peer_connection(
         addr: SocketAddr,
+        peer_key: TransportPublicKey,
         state: &EventListenerState,
         handshake_cmd_sender: &HandshakeCommandSender,
     ) {
@@ -133,6 +134,7 @@ impl P2pConnManager {
         // expectation makes admission less reliable under load.
         if !handshake_cmd_sender.try_send(HandshakeCommand::ExpectInbound {
             addr,
+            peer_key: Some(peer_key),
             transaction: None,
             transient: false,
         }) {
@@ -808,11 +810,11 @@ impl P2pConnManager {
         match event {
             HandshakeEvent::InboundConnection {
                 transaction,
-                expected,
+                matched,
                 connection,
                 transient,
             } => {
-                tracing::info!(expected, transient, tx = ?transaction, "InboundConnection event");
+                tracing::info!(?matched, transient, tx = ?transaction, "InboundConnection event");
                 let _conn_manager = &self.bridge.op_manager.ring.connection_manager;
                 let remote_addr = connection.remote_addr();
 
@@ -828,24 +830,39 @@ impl P2pConnManager {
                     }
                 }
 
-                // An inbound connection, expected or not, starts without a peer
-                // identity. It gets one when the connect op names the peer in a
-                // ConnectPeer, or when the peer names itself in a ConnectRequest.
-                if expected {
-                    TRANSPORT_METRICS
-                        .record_conn_identity(remote_addr, ConnIdentity::ExpectedInbound);
-                } else {
-                    tracing::info!(
-                        remote = %remote_addr,
-                        transient,
-                        transaction = ?transaction,
-                        "Inbound connection arrived without matching expectation; accepting provisionally"
-                    );
-                }
+                // A connection matched to an expectation is the one the connect
+                // op is dialling: it is recorded and promoted under the key the
+                // op dialled, exactly as the dial would be, so a peer that
+                // reaches us before (or instead of) our dial is still linked.
+                // Any other inbound connection starts without a peer identity
+                // and gets one when the connect op names the peer in a
+                // ConnectPeer, or when the peer names itself in a
+                // ConnectRequest.
+                let peer = match matched {
+                    HandshakeInboundMatch::Expected(Some(peer_key)) => {
+                        Some(PeerKeyLocation::new(peer_key, remote_addr))
+                    }
+                    HandshakeInboundMatch::Expected(None) => {
+                        TRANSPORT_METRICS.record_conn_identity(
+                            remote_addr,
+                            ConnIdentity::ExpectedInboundUnbound,
+                        );
+                        None
+                    }
+                    HandshakeInboundMatch::Unexpected => {
+                        tracing::info!(
+                            remote = %remote_addr,
+                            transient,
+                            transaction = ?transaction,
+                            "Inbound connection arrived without matching expectation; accepting provisionally"
+                        );
+                        None
+                    }
+                };
 
                 tracing::info!(
                     remote = %remote_addr,
-                    expected,
+                    peer_known = peer.is_some(),
                     transient,
                     transaction = ?transaction,
                     "Inbound connection established"
@@ -861,12 +878,13 @@ impl P2pConnManager {
                 let is_transient = transient;
 
                 self.handle_successful_connection(
-                    None,
+                    peer,
                     connection,
                     state,
                     None,
                     is_transient,
                     handshake_commands,
+                    ConnIdentity::ExpectedInboundBound,
                 )
                 .await?;
             }
@@ -917,6 +935,7 @@ impl P2pConnManager {
                     None,
                     transient,
                     handshake_commands,
+                    ConnIdentity::SetDialed,
                 )
                 .await?;
             }
@@ -1083,9 +1102,15 @@ impl P2pConnManager {
         Ok(())
     }
 
-    /// `peer_id` is the peer an outbound connection was dialled to, recorded
-    /// as the connection's identity, and `None` for an inbound connection,
-    /// which starts without one.
+    /// `peer_id` is the peer the connect op dialled, recorded as the
+    /// connection's identity: the dialled peer of an outbound connection, or
+    /// the key an expected-inbound registration carried for a matched inbound
+    /// one. `None` for any other inbound connection, which starts without an
+    /// identity. `identity_source` is the identity telemetry kind counted
+    /// when `peer_id` is known.
+    // `identity_source` is telemetry carried alongside the connection, as
+    // `origin` is on `handle_connect_peer`.
+    #[allow(clippy::too_many_arguments)]
     async fn handle_successful_connection(
         &mut self,
         peer_id: Option<PeerKeyLocation>,
@@ -1094,6 +1119,7 @@ impl P2pConnManager {
         remaining_checks: Option<usize>,
         is_transient: bool,
         handshake_commands: &HandshakeCommandSender,
+        identity_source: ConnIdentity,
     ) -> anyhow::Result<()> {
         let mut broadcast_ready: Option<bool> = None;
         let connection_manager = &self.bridge.op_manager.ring.connection_manager;
@@ -1233,8 +1259,8 @@ impl P2pConnManager {
             peer_addr,
             ConnectionEntry {
                 sender: tx,
-                // An inbound connection has no pub_key yet: it is learned from
-                // a ConnectPeer or the peer's first ConnectRequest.
+                // An unexpected inbound connection has no pub_key yet: it is
+                // learned from a ConnectPeer or the peer's first ConnectRequest.
                 pub_key: peer_id.as_ref().map(|p| p.pub_key().clone()),
                 connection_id: conn_id,
                 created_at: now,
@@ -1262,7 +1288,7 @@ impl P2pConnManager {
         // Only add to reverse lookup if we know the pub_key
         // For transient connections, this will be populated when identity is learned
         if let Some(ref peer) = peer_id {
-            TRANSPORT_METRICS.record_conn_identity(peer_addr, ConnIdentity::SetDialed);
+            TRANSPORT_METRICS.record_conn_identity(peer_addr, identity_source);
             insert_addr_by_pub_key(
                 &mut self.addr_by_pub_key,
                 &self.connections,

@@ -22,7 +22,7 @@ use crate::contract::{ContractHandlerEvent, WaitingTransaction};
 use crate::message::{NetMessageV1, QueryResult};
 use crate::node::network_bridge::handshake::{
     Command as HandshakeCommand, CommandSender as HandshakeCommandSender, Event as HandshakeEvent,
-    HandshakeHandler,
+    HandshakeHandler, InboundMatch as HandshakeInboundMatch,
 };
 use crate::node::network_bridge::priority_select;
 use crate::operations::connect::ConnectMsg;
@@ -531,9 +531,10 @@ type PeerConnChannelRecv = Receiver<Either<NetMessage, ConnEvent>>;
 #[derive(Debug)]
 struct ConnectionEntry {
     sender: PeerConnChannelSender,
-    /// The peer's public key: the key dialled for an outbound connection.
-    /// `None` for an inbound connection, expected or not, until a
-    /// ConnectPeer or the peer's ConnectRequest names the peer.
+    /// The peer's public key: the key dialled for an outbound connection, or
+    /// for an inbound one matched to an expected-inbound registration.
+    /// `None` for any other inbound connection until a ConnectPeer or the
+    /// peer's ConnectRequest names the peer.
     pub_key: Option<TransportPublicKey>,
     /// Unique ID for this connection entry. Used to distinguish stale
     /// TransportClosed events from replaced connections (e.g., after identity change).
@@ -2503,9 +2504,10 @@ impl P2pConnManager {
                                 )
                                 .await?;
                             }
-                            NodeEvent::ExpectPeerConnection { addr } => {
+                            NodeEvent::ExpectPeerConnection { addr, peer_key } => {
                                 P2pConnManager::handle_expect_peer_connection(
                                     addr,
+                                    peer_key,
                                     &state,
                                     &handshake_cmd_sender,
                                 );

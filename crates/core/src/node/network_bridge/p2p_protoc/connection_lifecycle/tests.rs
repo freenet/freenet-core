@@ -13,6 +13,7 @@ use crate::message::Transaction;
 use crate::operations::VisitedPeers;
 use crate::operations::connect::ConnectRequest;
 use crate::transport::{ExpectedInboundTracker, StreamId, TransportKeypair};
+use freenet_stdlib::prelude::ContractInstanceId;
 
 /// A connection that never delivers anything and accepts every send.
 struct IdleConnection {
@@ -151,6 +152,7 @@ impl Harness {
                 None,
                 transient,
                 &self.handshake,
+                ConnIdentity::SetDialed,
             )
             .await
             .expect("handle_successful_connection");
@@ -225,14 +227,25 @@ impl Harness {
     }
 
     /// An inbound connection matched to an expected-inbound registration
-    /// (`NodeEvent::ExpectPeerConnection`), as the handshake driver reports
-    /// it: not transient, and with no peer identity.
-    async fn accept_expected(&mut self, addr: SocketAddr) {
+    /// (`NodeEvent::ExpectPeerConnection`) for the peer the connect op dialled
+    /// under `dialled`, as the handshake driver reports it: not transient.
+    async fn accept_expected(&mut self, addr: SocketAddr, dialled: &TransportPublicKey) {
+        self.accept_matched(addr, HandshakeInboundMatch::Expected(Some(dialled.clone())))
+            .await;
+    }
+
+    /// As [`Self::accept_expected`], for a registration that carried no key.
+    async fn accept_expected_unkeyed(&mut self, addr: SocketAddr) {
+        self.accept_matched(addr, HandshakeInboundMatch::Expected(None))
+            .await;
+    }
+
+    async fn accept_matched(&mut self, addr: SocketAddr, matched: HandshakeInboundMatch) {
         self.mgr
             .handle_handshake_action(
                 HandshakeEvent::InboundConnection {
                     transaction: None,
-                    expected: true,
+                    matched,
                     connection: Box::new(IdleConnection { addr }),
                     transient: false,
                 },
@@ -317,7 +330,8 @@ fn seen(addr: SocketAddr) -> Vec<ConnIdentity> {
 fn is_set(kind: ConnIdentity) -> bool {
     match kind {
         ConnIdentity::SetDialed
-        | ConnIdentity::ExpectedInbound
+        | ConnIdentity::ExpectedInboundBound
+        | ConnIdentity::ExpectedInboundUnbound
         | ConnIdentity::SetConnectRequest
         | ConnIdentity::SetConnectPeer
         | ConnIdentity::SameConnectRequest
@@ -512,18 +526,18 @@ async fn connect_peer_naming_another_key_counts_changed_and_ring_promotion() {
     );
 }
 
-/// An inbound connection matched to an expected-inbound registration starts
-/// without a peer identity, exactly like an unexpected one: no key on the
-/// connection, nothing in the key-to-address map, nothing in the ring. Only
-/// the match is counted.
+/// An inbound connection matched to an expected-inbound registration that
+/// carried no key starts without a peer identity, exactly like an unexpected
+/// one: no key on the connection, nothing in the key-to-address map, nothing
+/// in the ring. Only the match is counted.
 #[tokio::test]
-async fn expected_inbound_starts_without_a_peer_identity() {
+async fn expected_inbound_without_a_key_starts_without_a_peer_identity() {
     let mut h = Harness::new("conn-identity-expected-no-key").await;
     let remote: SocketAddr = "203.0.113.60:4601".parse().unwrap();
     watch(&[remote]);
-    h.accept_expected(remote).await;
+    h.accept_expected_unkeyed(remote).await;
 
-    assert_eq!(seen(remote), vec![ConnIdentity::ExpectedInbound]);
+    assert_eq!(seen(remote), vec![ConnIdentity::ExpectedInboundUnbound]);
     assert_eq!(h.mgr.connections[&remote].pub_key, None);
     assert!(h.mgr.addr_by_pub_key.is_empty(), "nothing is mapped");
     assert_eq!(h.ring_key_at(remote), None, "not in the ring");
@@ -534,7 +548,7 @@ async fn expected_inbound_starts_without_a_peer_identity() {
     assert_eq!(
         seen(remote),
         vec![
-            ConnIdentity::ExpectedInbound,
+            ConnIdentity::ExpectedInboundUnbound,
             ConnIdentity::TeardownUnidentified
         ]
     );
@@ -613,22 +627,21 @@ async fn dropping_an_unidentified_connection_counts_teardown_unidentified() {
     assert_eq!(seen(remote), vec![ConnIdentity::TeardownUnidentified]);
 }
 
-/// The NAT path of a connect op registers an expected inbound connection
-/// and then sends ConnectPeer with the peer's key; the peer may also send a
-/// ConnectRequest, before or after. Whichever names the peer first gives
-/// the connection its identity, the ConnectPeer promotes it into the ring
-/// under the peer's key, and at no point is anything recorded or promoted
-/// under this node's own key. Several such connections can be open at once.
+/// A matched inbound connection whose registration carried no key is named
+/// by the ConnectPeer for its address or by the peer's ConnectRequest,
+/// whichever comes first; the ConnectPeer promotes it into the ring under
+/// the peer's key, and at no point is anything recorded or promoted under
+/// this node's own key. Several such connections can be open at once.
 #[tokio::test]
-async fn expected_inbound_then_named_peer_is_identified_by_the_peer_key() {
+async fn expected_inbound_without_a_key_is_identified_by_the_named_peer() {
     let mut h = Harness::new("conn-identity-expected-named").await;
     let by_connect_peer: SocketAddr = "203.0.113.90:4901".parse().unwrap();
     let by_request: SocketAddr = "203.0.113.91:4902".parse().unwrap();
     watch(&[by_connect_peer, by_request]);
     let (first, second) = (key(), key());
 
-    h.accept_expected(by_connect_peer).await;
-    h.accept_expected(by_request).await;
+    h.accept_expected_unkeyed(by_connect_peer).await;
+    h.accept_expected_unkeyed(by_request).await;
     h.assert_own_key_absent();
 
     // ConnectPeer first: it records the key and promotes under it.
@@ -643,7 +656,7 @@ async fn expected_inbound_then_named_peer_is_identified_by_the_peer_key() {
     assert_eq!(
         seen(by_connect_peer),
         vec![
-            ConnIdentity::ExpectedInbound,
+            ConnIdentity::ExpectedInboundUnbound,
             ConnIdentity::SetConnectPeer,
             ConnIdentity::SameConnectRequest,
         ]
@@ -666,7 +679,7 @@ async fn expected_inbound_then_named_peer_is_identified_by_the_peer_key() {
     assert_eq!(
         seen(by_request),
         vec![
-            ConnIdentity::ExpectedInbound,
+            ConnIdentity::ExpectedInboundUnbound,
             ConnIdentity::SetConnectRequest,
             ConnIdentity::SameConnectPeer,
         ]
@@ -734,21 +747,37 @@ async fn connect_peer_naming_own_key_counts_own_key() {
     );
 }
 
-/// The realistic NAT order: expected inbound, ConnectPeer naming the peer,
-/// then the peer's own ConnectRequest. That is one first identity
-/// (`set_connect_peer`) and one confirmation (`same_connect_request`); a
-/// later relayed request naming another peer is a change, counted as one,
-/// exactly as on any other connection.
+/// A matched inbound connection is recorded and promoted under the key the
+/// connect op dialled, as the dial would be. The ConnectPeer that follows
+/// (the order when the inbound connection completes first) finds it already
+/// in the ring and promotes nothing again; the peer's own ConnectRequest
+/// confirms the key, and a later relayed request naming another peer is a
+/// change, counted as one, exactly as on any other connection.
 #[tokio::test]
-async fn expected_inbound_connect_peer_then_requests_counts_one_first_identity() {
-    let mut h = Harness::new("conn-identity-expected-order").await;
+async fn expected_inbound_is_promoted_under_the_dialled_key_once() {
+    let mut h = Harness::new("conn-identity-expected-keyed").await;
     let in_order: SocketAddr = "203.0.113.130:5301".parse().unwrap();
     watch(&[in_order]);
     let (peer, third_party) = (key(), key());
 
-    h.accept_expected(in_order).await;
+    h.accept_expected(in_order, &peer).await;
+    assert_eq!(h.mgr.connections[&in_order].pub_key.as_ref(), Some(&peer));
+    assert_eq!(h.mgr.addr_by_pub_key.get(&peer), Some(&in_order));
+    assert_eq!(
+        h.ring_key_at(in_order).as_ref(),
+        Some(&peer),
+        "promoted on arrival"
+    );
+    assert_eq!(h_count(&h), 1);
+    let age = aged_ring_entry(&h, in_order).await;
+
     h.connect_peer(PeerKeyLocation::new(peer.clone(), in_order))
         .await;
+    assert_eq!(h_count(&h), 1, "the ConnectPeer does not add it again");
+    assert!(
+        ring_age_ms(&h, in_order) >= age,
+        "the ConnectPeer added the connection again (its age restarted)"
+    );
     h.connect_request(in_order, PeerKeyLocation::with_unknown_addr(peer.clone()))
         .await;
     h.connect_request(
@@ -759,13 +788,43 @@ async fn expected_inbound_connect_peer_then_requests_counts_one_first_identity()
     assert_eq!(
         seen(in_order),
         vec![
-            ConnIdentity::ExpectedInbound,
-            ConnIdentity::SetConnectPeer,
+            ConnIdentity::ExpectedInboundBound,
+            ConnIdentity::SameConnectPeer,
             ConnIdentity::SameConnectRequest,
             ConnIdentity::ChangedConnectRequest,
         ]
     );
     h.assert_own_key_absent();
+}
+
+/// How long the ring has held its connection at `addr`. The ring
+/// deduplicates by address, so adding a connection again leaves the count
+/// unchanged and is visible only as a fresh entry whose age restarts.
+fn ring_age_ms(h: &Harness, addr: SocketAddr) -> u64 {
+    h.mgr
+        .bridge
+        .op_manager
+        .ring
+        .connection_manager
+        .get_connection_duration_ms(addr)
+        .expect("a ring connection")
+}
+
+/// Lets the ring connection at `addr` age, and returns its age.
+async fn aged_ring_entry(h: &Harness, addr: SocketAddr) -> u64 {
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let age = ring_age_ms(h, addr);
+    assert!(age >= 50, "premise: the entry has aged ({age} ms)");
+    age
+}
+
+fn h_count(h: &Harness) -> usize {
+    h.mgr
+        .bridge
+        .op_manager
+        .ring
+        .connection_manager
+        .connection_count()
 }
 
 /// An open expected-inbound connection holds no key, so it does not make a
@@ -779,7 +838,7 @@ async fn own_key_claim_beside_an_expected_inbound_connection_is_not_a_duplicate(
     let expected: SocketAddr = "203.0.113.141:5402".parse().unwrap();
     watch(&[remote]);
 
-    h.accept_expected(expected).await;
+    h.accept_expected(expected, &key()).await;
     h.accept(remote).await;
     let own = h.own_key();
     h.connect_request(remote, PeerKeyLocation::with_unknown_addr(own))
@@ -814,107 +873,349 @@ impl crate::transport::InboundAcceptor for MockAcceptor {
     }
 }
 
-/// End to end through the real handshake driver and a real (mock-socket)
-/// transport: this node, a gateway, is told by a connect op to expect a
-/// peer at its address; the peer's handshake reaches us before we dial it,
-/// so the transport accepts it as an inbound connection and the driver
-/// matches it to the expectation; then the connect op's ConnectPeer names
-/// the peer. The connection must start with no identity, end with the
-/// peer's real key in the connection entry, the key-to-address map and the
-/// ring, and never hold this node's key.
-///
-/// The simulation never takes this path (its hole punches complete on the
-/// dialling side), so this is the test that covers it. The watched
-/// `expected_inbound` record is counted only when the driver reported the
-/// connection as matched, so it proves the matched path ran.
-#[tokio::test]
-async fn expected_inbound_matched_by_the_handshake_driver_gets_the_peer_key() {
-    use crate::transport::mock_transport::{
-        PacketDropPolicy, create_mock_gateway, create_mock_peer,
-    };
-    use futures::StreamExt;
+/// This node as a gateway on a mock-socket transport, run through the real
+/// handshake driver, and one remote peer on the same mock network.
+struct DriverRig {
+    driver: HandshakeHandler,
+    commands: HandshakeCommandSender,
+    channels: crate::transport::mock_transport::Channels,
+    gw_key: TransportPublicKey,
+    gw_addr: SocketAddr,
+    peer_key: TransportPublicKey,
+    peer_addr: SocketAddr,
+    peer_outbound: crate::transport::connection_handler::OutboundConnectionHandler<
+        crate::transport::mock_transport::MockSocket,
+    >,
+}
 
-    let mut h = Harness::new("conn-identity-expected-driver").await;
-    let channels: crate::transport::mock_transport::Channels = Default::default();
-    let (gw_key, (gw_outbound, gw_accepted), gw_addr) =
-        create_mock_gateway(PacketDropPolicy::ReceiveAll, channels.clone())
-            .await
-            .expect("mock gateway");
-    let (peer_key, peer_outbound, peer_addr) =
-        create_mock_peer(PacketDropPolicy::ReceiveAll, channels)
-            .await
-            .expect("mock peer");
-    watch(&[peer_addr]);
-
-    let (mut driver, commands) = HandshakeHandler::new(
-        Box::new(MockAcceptor(gw_accepted)),
-        Arc::new(gw_outbound),
-        h.mgr.bridge.op_manager.ring.connection_manager.clone(),
-        h.mgr.bridge.op_manager.ring.router.clone(),
-        None,
-        true,
-        None,
-    );
-
-    // The connect op expects the peer, through the event loop's handler.
-    P2pConnManager::handle_expect_peer_connection(peer_addr, &h.state, &commands);
-    // Let the driver take the registration before the peer's handshake.
-    for _ in 0..10 {
-        tokio::task::yield_now().await;
-    }
-
-    // The peer dials us; we have not dialled it, so we accept it inbound.
-    let dial = tokio::spawn(async move {
-        let pending = OutboundConnector::connect(
-            &peer_outbound,
+impl DriverRig {
+    async fn new(h: &Harness) -> Self {
+        use crate::transport::mock_transport::{
+            PacketDropPolicy, create_mock_gateway, create_mock_peer,
+        };
+        let channels: crate::transport::mock_transport::Channels = Default::default();
+        let (gw_key, (gw_outbound, gw_accepted), gw_addr) =
+            create_mock_gateway(PacketDropPolicy::ReceiveAll, channels.clone())
+                .await
+                .expect("mock gateway");
+        let (peer_key, peer_outbound, peer_addr) =
+            create_mock_peer(PacketDropPolicy::ReceiveAll, channels.clone())
+                .await
+                .expect("mock peer");
+        let (driver, commands) = HandshakeHandler::new(
+            Box::new(MockAcceptor(gw_accepted)),
+            Arc::new(gw_outbound),
+            h.mgr.bridge.op_manager.ring.connection_manager.clone(),
+            h.mgr.bridge.op_manager.ring.router.clone(),
+            None,
+            true,
+            None,
+        );
+        Self {
+            driver,
+            commands,
+            channels,
             gw_key,
             gw_addr,
-            crate::transport::NatAttemptOrigin::ConnectJoiner,
-        )
-        .await;
-        tokio::time::timeout(Duration::from_secs(10), pending).await
-    });
-    let event = tokio::time::timeout(Duration::from_secs(10), driver.next())
-        .await
-        .expect("the driver reports the connection")
-        .expect("the driver is running");
-    h.mgr
-        .handle_handshake_action(event, &mut h.state, &commands)
-        .await
-        .expect("handle_handshake_action");
-    assert!(
-        dial.await.expect("dial task").is_ok(),
-        "the peer's dial completes"
-    );
+            peer_key,
+            peer_addr,
+            peer_outbound,
+        }
+    }
 
+    /// The connect op expects the peer, through the event loop's handler,
+    /// and the driver has processed the registration when this returns.
+    async fn expect_peer(&self, h: &Harness) {
+        P2pConnManager::handle_expect_peer_connection(
+            self.peer_addr,
+            self.peer_key.clone(),
+            &h.state,
+            &self.commands,
+        );
+        let (done, processed) = tokio::sync::oneshot::channel();
+        assert!(self.commands.try_send(HandshakeCommand::Barrier(done)));
+        tokio::time::timeout(Duration::from_secs(5), processed)
+            .await
+            .expect("the driver processes commands")
+            .expect("the driver is running");
+    }
+
+    /// The peer dials this node; returns the dial, which completes once the
+    /// transport handshake does.
+    fn peer_dials(&self) -> tokio::task::JoinHandle<bool> {
+        let outbound = self.peer_outbound.clone();
+        let (gw_key, gw_addr) = (self.gw_key.clone(), self.gw_addr);
+        tokio::spawn(async move {
+            let pending = OutboundConnector::connect(
+                &outbound,
+                gw_key,
+                gw_addr,
+                crate::transport::NatAttemptOrigin::ConnectJoiner,
+            )
+            .await;
+            matches!(
+                tokio::time::timeout(Duration::from_secs(10), pending).await,
+                Ok(Ok(_))
+            )
+        })
+    }
+
+    /// The next handshake event, handled by the event loop's handler.
+    async fn handle_next_event(&mut self, h: &mut Harness) -> &'static str {
+        use futures::StreamExt;
+        let event = tokio::time::timeout(Duration::from_secs(20), self.driver.next())
+            .await
+            .expect("the driver reports an event")
+            .expect("the driver is running");
+        let kind = match &event {
+            HandshakeEvent::InboundConnection { .. } => "inbound",
+            HandshakeEvent::OutboundEstablished { .. } => "outbound_established",
+            HandshakeEvent::OutboundFailed { .. } => "outbound_failed",
+        };
+        h.mgr
+            .handle_handshake_action(event, &mut h.state, &self.commands)
+            .await
+            .expect("handle_handshake_action");
+        kind
+    }
+
+    /// The connect op's ConnectPeer for the peer, as the event loop handles
+    /// it; returns the callback's receiver.
+    async fn connect_peer(
+        &self,
+        h: &mut Harness,
+    ) -> mpsc::Receiver<Result<(SocketAddr, Option<usize>), ()>> {
+        let (callback, result_rx) = mpsc::channel(1);
+        h.mgr
+            .handle_connect_peer(
+                PeerKeyLocation::new(self.peer_key.clone(), self.peer_addr),
+                Box::new(callback),
+                Transaction::new::<ConnectMsg>(),
+                &self.commands,
+                &mut h.state,
+                false,
+                crate::transport::NatAttemptOrigin::ConnectAcceptor,
+            )
+            .await
+            .expect("handle_connect_peer");
+        result_rx
+    }
+}
+
+/// End to end through the real handshake driver and a mock-socket
+/// transport, in the order where the peer's handshake reaches us before we
+/// dial it: the transport accepts it as an inbound connection, the driver
+/// matches it to the expectation, and it is recorded and promoted under the
+/// key the connect op dialled. The ConnectPeer that follows reuses it and
+/// promotes nothing again. This node's key is never stored or promoted.
+///
+/// The simulation never takes the matched path (its hole punches complete on
+/// the dialling side), so this is the test that covers it. The watched
+/// `expected_inbound_bound` record is counted only when the driver reported
+/// the connection as matched with a key, so it proves the matched path ran.
+#[tokio::test]
+async fn expected_inbound_matched_by_the_handshake_driver_gets_the_peer_key() {
+    let mut h = Harness::new("conn-identity-expected-driver").await;
+    let mut rig = DriverRig::new(&h).await;
+    watch(&[rig.peer_addr]);
+
+    rig.expect_peer(&h).await;
+    let dial = rig.peer_dials();
+    assert_eq!(rig.handle_next_event(&mut h).await, "inbound");
+    assert!(dial.await.expect("dial task"), "the peer's dial completes");
+
+    let peer_addr = rig.peer_addr;
     assert_eq!(
         seen(peer_addr),
-        vec![ConnIdentity::ExpectedInbound],
+        vec![ConnIdentity::ExpectedInboundBound],
         "the driver matched the connection to the expectation"
-    );
-    assert_eq!(h.mgr.connections[&peer_addr].pub_key, None);
-    assert_eq!(h.ring_key_at(peer_addr), None, "not in the ring yet");
-    h.assert_own_key_absent();
-
-    // The connect op names the peer.
-    assert!(
-        h.try_connect_peer(PeerKeyLocation::new(peer_key.clone(), peer_addr))
-            .await,
-        "ConnectPeer reuses the inbound connection"
-    );
-    assert_eq!(
-        seen(peer_addr),
-        vec![ConnIdentity::ExpectedInbound, ConnIdentity::SetConnectPeer]
     );
     assert_eq!(
         h.mgr.connections[&peer_addr].pub_key.as_ref(),
-        Some(&peer_key)
+        Some(&rig.peer_key)
     );
-    assert_eq!(h.mgr.addr_by_pub_key.get(&peer_key), Some(&peer_addr));
+    assert_eq!(h.mgr.addr_by_pub_key.get(&rig.peer_key), Some(&peer_addr));
     assert_eq!(
         h.ring_key_at(peer_addr).as_ref(),
-        Some(&peer_key),
-        "promoted under the peer's key"
+        Some(&rig.peer_key),
+        "promoted under the dialled key"
+    );
+    assert_eq!(h_count(&h), 1);
+    h.assert_own_key_absent();
+    let age = aged_ring_entry(&h, peer_addr).await;
+
+    let mut result = rig.connect_peer(&mut h).await;
+    assert!(
+        matches!(result.try_recv(), Ok(Ok(_))),
+        "ConnectPeer reuses the inbound connection"
+    );
+    assert_eq!(h_count(&h), 1, "the ConnectPeer does not add it again");
+    assert!(
+        ring_age_ms(&h, peer_addr) >= age,
+        "the ConnectPeer added the connection again (its age restarted)"
+    );
+    assert_eq!(
+        seen(peer_addr),
+        vec![
+            ConnIdentity::ExpectedInboundBound,
+            ConnIdentity::SameConnectPeer
+        ]
     );
     h.assert_own_key_absent();
+}
+
+/// The order the connect op normally produces: the expectation, then the
+/// ConnectPeer, whose dial is handled first. Here that dial fails (the peer
+/// is unreachable until after the NAT deadline), and then the peer's own
+/// handshake reaches us. The matched inbound connection must still be linked
+/// in the ring under the key the connect op dialled; the ConnectPeer's
+/// callback has already reported the failed dial, as before.
+#[tokio::test]
+async fn expected_inbound_after_a_failed_dial_is_promoted_under_the_dialled_key() {
+    let mut h = Harness::new("conn-identity-expected-failed-dial").await;
+    let mut rig = DriverRig::new(&h).await;
+    watch(&[rig.peer_addr]);
+    let peer_addr = rig.peer_addr;
+
+    // Our dial cannot reach the peer: its socket is off the mock network.
+    let (_, peer_socket) = rig
+        .channels
+        .remove(&peer_addr)
+        .expect("the peer is on the mock network");
+
+    rig.expect_peer(&h).await;
+    let mut result = rig.connect_peer(&mut h).await;
+    assert_eq!(rig.handle_next_event(&mut h).await, "outbound_failed");
+    assert!(
+        matches!(result.try_recv(), Ok(Err(()))),
+        "the ConnectPeer callback reports the failed dial"
+    );
+    assert!(!h.mgr.connections.contains_key(&peer_addr));
+
+    // The peer comes back and dials us; the expectation still holds.
+    rig.channels.insert(peer_addr, peer_socket);
+    let dial = rig.peer_dials();
+    assert_eq!(rig.handle_next_event(&mut h).await, "inbound");
+    assert!(dial.await.expect("dial task"), "the peer's dial completes");
+
+    assert_eq!(seen(peer_addr), vec![ConnIdentity::ExpectedInboundBound]);
+    assert_eq!(
+        h.mgr.connections[&peer_addr].pub_key.as_ref(),
+        Some(&rig.peer_key)
+    );
+    assert_eq!(
+        h.ring_key_at(peer_addr).as_ref(),
+        Some(&rig.peer_key),
+        "linked in the ring under the dialled key"
+    );
+    assert_eq!(h_count(&h), 1);
+    h.assert_own_key_absent();
+}
+
+/// A contract hosting entry for `peer`, as a neighbour's announcement
+/// records it, so teardown's per-peer cleanup is observable.
+fn seed_neighbour_hosting(h: &Harness, peer: &TransportPublicKey) -> ContractInstanceId {
+    let id = ContractInstanceId::new([7u8; 32]);
+    h.mgr.bridge.op_manager.neighbor_hosting.handle_message(
+        peer,
+        crate::message::NeighborHostingMessage::HostingAnnounce {
+            added: vec![id],
+            removed: vec![],
+            is_response: true,
+        },
+    );
+    assert!(
+        neighbour_hosts(h, peer, &id),
+        "premise: the entry is recorded"
+    );
+    id
+}
+
+fn neighbour_hosts(h: &Harness, peer: &TransportPublicKey, id: &ContractInstanceId) -> bool {
+    h.mgr
+        .bridge
+        .op_manager
+        .neighbor_hosting
+        .contracts_for_peer(peer)
+        .contains(id)
+}
+
+/// The teardown paths of a connection, so one test can drive each.
+#[derive(Debug, Clone, Copy)]
+enum Teardown {
+    TransportClosed,
+    ExplicitDrop,
+    UnpromotedSweep,
+    Replacement,
+}
+
+impl Teardown {
+    const ALL: [Self; 4] = [
+        Self::TransportClosed,
+        Self::ExplicitDrop,
+        Self::UnpromotedSweep,
+        Self::Replacement,
+    ];
+
+    async fn run(self, h: &mut Harness, addr: SocketAddr) {
+        let handshake = h.handshake.clone();
+        match self {
+            Self::TransportClosed => h.transport_closed(addr).await,
+            Self::ExplicitDrop => {
+                assert!(
+                    h.mgr
+                        .drop_connection_by_addr(
+                            addr,
+                            &handshake,
+                            crate::tracing::DisconnectReason::Pruned,
+                        )
+                        .await
+                );
+            }
+            Self::UnpromotedSweep => h.mgr.drop_zombie_connection(addr, &handshake).await,
+            Self::Replacement => {
+                // A transient connection's replacement only releases its
+                // slot; the per-peer cleanup runs for one that is not (an
+                // expired transient, or a ring connection). A dial replaces
+                // it: an inbound replacement registers a transient slot for
+                // the address first.
+                h.mgr
+                    .bridge
+                    .op_manager
+                    .ring
+                    .connection_manager
+                    .drop_transient(addr);
+                h.dial(addr, &key()).await;
+            }
+        }
+    }
+}
+
+/// Teardown of a connection with no key runs no per-peer cleanup, so state
+/// held under this node's own key survives it on every path; teardown of a
+/// keyed connection still clears that peer's state.
+#[tokio::test]
+async fn teardown_of_an_unkeyed_connection_runs_no_per_peer_cleanup() {
+    let mut h = Harness::new("conn-identity-teardown-own-key").await;
+    let own = h.own_key();
+    for (i, path) in Teardown::ALL.into_iter().enumerate() {
+        let unkeyed: SocketAddr = format!("203.0.113.150:{}", 5500 + i).parse().unwrap();
+        let id = seed_neighbour_hosting(&h, &own);
+        h.accept(unkeyed).await;
+        path.run(&mut h, unkeyed).await;
+        assert!(
+            neighbour_hosts(&h, &own, &id),
+            "{path:?} of an unkeyed connection cleared state held under this node's key"
+        );
+
+        let keyed: SocketAddr = format!("203.0.113.151:{}", 5500 + i).parse().unwrap();
+        let peer = key();
+        h.dial(keyed, &peer).await;
+        let id = seed_neighbour_hosting(&h, &peer);
+        path.run(&mut h, keyed).await;
+        assert!(
+            !neighbour_hosts(&h, &peer, &id),
+            "{path:?} of a keyed connection must clear that peer's state"
+        );
+    }
 }

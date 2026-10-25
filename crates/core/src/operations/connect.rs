@@ -1449,7 +1449,10 @@ pub(super) async fn dispatch_expect_connection_from(
     );
 
     op_manager
-        .notify_node_event(NodeEvent::ExpectPeerConnection { addr })
+        .notify_node_event(NodeEvent::ExpectPeerConnection {
+            addr,
+            peer_key: peer.pub_key().clone(),
+        })
         .await?;
 
     let (callback, mut rx) = mpsc::channel(1);

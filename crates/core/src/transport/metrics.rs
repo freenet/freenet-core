@@ -80,21 +80,27 @@ labelled_counters! {
     /// `changed_connect_peer` on the same ConnectPeer) are counted in
     /// addition to the kind of the decision they qualify.
     ///
-    /// An inbound connection, expected or not, starts with no key, so its
-    /// first key is counted as `set_connect_peer` or `set_connect_request`,
-    /// whichever names the peer first; a matched expected-inbound
-    /// registration is counted once as `expected_inbound`. A connection is
-    /// recorded under this node's own key only when a dial, ConnectRequest
-    /// or ConnectPeer names that key, so `own_key` is expected to stay at
-    /// zero.
+    /// An inbound connection that matched an expected-inbound registration
+    /// is recorded under the key the connect op dialled
+    /// (`expected_inbound_bound`), or, when the registration carried no key,
+    /// starts with none (`expected_inbound_unbound`). Any other inbound
+    /// connection starts with no key, so its first key is counted as
+    /// `set_connect_peer` or `set_connect_request`, whichever names the peer
+    /// first. A connection is recorded under this node's own key only when a
+    /// dial, a registration, a ConnectRequest or a ConnectPeer names that
+    /// key, so `own_key` is expected to stay at zero.
     pub(crate) enum ConnIdentity {
         /// An outbound connection was established and recorded under the key
         /// it was dialled with.
         SetDialed => "set_dialed",
-        /// An inbound connection matched an expected-inbound registration. It
-        /// starts with no key, like an unexpected one; this counts the match,
-        /// not an identity.
-        ExpectedInbound => "expected_inbound",
+        /// An inbound connection matched an expected-inbound registration and
+        /// was recorded under the key the connect op dialled, which the
+        /// registration carried.
+        ExpectedInboundBound => "expected_inbound_bound",
+        /// An inbound connection matched an expected-inbound registration
+        /// that carried no key, so it starts with none, like an unexpected
+        /// one.
+        ExpectedInboundUnbound => "expected_inbound_unbound",
         /// A ConnectRequest gave the joiner key of a connection that had none.
         SetConnectRequest => "set_connect_request",
         /// A ConnectRequest named the key the connection already had.
@@ -1938,8 +1944,11 @@ impl TransportMetrics {
             egress_debt_hwm_bytes: get64(&egress.debt_hwm_bytes),
             egress_debt_forgiven_bytes: get64(&egress.debt_forgiven_bytes),
             conn_identity_set_dialed: get32(&identity[ConnIdentity::SetDialed as usize]),
-            conn_identity_expected_inbound: get32(
-                &identity[ConnIdentity::ExpectedInbound as usize],
+            conn_identity_expected_inbound_bound: get32(
+                &identity[ConnIdentity::ExpectedInboundBound as usize],
+            ),
+            conn_identity_expected_inbound_unbound: get32(
+                &identity[ConnIdentity::ExpectedInboundUnbound as usize],
             ),
             conn_identity_set_connect_request: get32(
                 &identity[ConnIdentity::SetConnectRequest as usize],
@@ -2436,7 +2445,8 @@ pub struct TransportSnapshot {
     /// [`ConnIdentity`] (the field suffix is its label). Counts only, no
     /// addresses or keys.
     pub conn_identity_set_dialed: u32,
-    pub conn_identity_expected_inbound: u32,
+    pub conn_identity_expected_inbound_bound: u32,
+    pub conn_identity_expected_inbound_unbound: u32,
     pub conn_identity_set_connect_request: u32,
     pub conn_identity_same_connect_request: u32,
     pub conn_identity_changed_connect_request: u32,
@@ -2473,7 +2483,8 @@ impl TransportSnapshot {
     pub(crate) fn conn_identity(&self, kind: ConnIdentity) -> u32 {
         match kind {
             ConnIdentity::SetDialed => self.conn_identity_set_dialed,
-            ConnIdentity::ExpectedInbound => self.conn_identity_expected_inbound,
+            ConnIdentity::ExpectedInboundBound => self.conn_identity_expected_inbound_bound,
+            ConnIdentity::ExpectedInboundUnbound => self.conn_identity_expected_inbound_unbound,
             ConnIdentity::SetConnectRequest => self.conn_identity_set_connect_request,
             ConnIdentity::SameConnectRequest => self.conn_identity_same_connect_request,
             ConnIdentity::ChangedConnectRequest => self.conn_identity_changed_connect_request,
@@ -2606,7 +2617,8 @@ impl TransportSnapshot {
             egress_debt_hwm_bytes,
             egress_debt_forgiven_bytes,
             conn_identity_set_dialed,
-            conn_identity_expected_inbound,
+            conn_identity_expected_inbound_bound,
+            conn_identity_expected_inbound_unbound,
             conn_identity_set_connect_request,
             conn_identity_same_connect_request,
             conn_identity_changed_connect_request,
@@ -2706,7 +2718,8 @@ impl TransportSnapshot {
         self.egress_debt_hwm_bytes = egress_debt_hwm_bytes;
         self.egress_debt_forgiven_bytes = egress_debt_forgiven_bytes;
         self.conn_identity_set_dialed = conn_identity_set_dialed;
-        self.conn_identity_expected_inbound = conn_identity_expected_inbound;
+        self.conn_identity_expected_inbound_bound = conn_identity_expected_inbound_bound;
+        self.conn_identity_expected_inbound_unbound = conn_identity_expected_inbound_unbound;
         self.conn_identity_set_connect_request = conn_identity_set_connect_request;
         self.conn_identity_same_connect_request = conn_identity_same_connect_request;
         self.conn_identity_changed_connect_request = conn_identity_changed_connect_request;
@@ -2893,7 +2906,8 @@ struct SnapshotExtras {
     /// [`ConnIdentity`] (the field suffix is its label). Counts only, no
     /// addresses or keys.
     pub conn_identity_set_dialed: u32,
-    pub conn_identity_expected_inbound: u32,
+    pub conn_identity_expected_inbound_bound: u32,
+    pub conn_identity_expected_inbound_unbound: u32,
     pub conn_identity_set_connect_request: u32,
     pub conn_identity_same_connect_request: u32,
     pub conn_identity_changed_connect_request: u32,
@@ -2981,7 +2995,8 @@ impl SnapshotExtras {
             || self.egress_streams_refused_other != 0
             || self.egress_debt_forgiven_bytes != 0
             || self.conn_identity_set_dialed != 0
-            || self.conn_identity_expected_inbound != 0
+            || self.conn_identity_expected_inbound_bound != 0
+            || self.conn_identity_expected_inbound_unbound != 0
             || self.conn_identity_set_connect_request != 0
             || self.conn_identity_same_connect_request != 0
             || self.conn_identity_changed_connect_request != 0
@@ -4672,7 +4687,8 @@ mod tests {
             "egress_debt_hwm_bytes",
             "egress_debt_forgiven_bytes",
             "conn_identity_set_dialed",
-            "conn_identity_expected_inbound",
+            "conn_identity_expected_inbound_bound",
+            "conn_identity_expected_inbound_unbound",
             "conn_identity_set_connect_request",
             "conn_identity_same_connect_request",
             "conn_identity_changed_connect_request",

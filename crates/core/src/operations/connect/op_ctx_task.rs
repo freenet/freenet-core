@@ -943,6 +943,7 @@ async fn begin_acceptor_dial(
     op_manager
         .notify_node_event(NodeEvent::ExpectPeerConnection {
             addr: acceptor_addr,
+            peer_key: acceptor.pub_key().clone(),
         })
         .await?;
 
@@ -2997,7 +2998,7 @@ mod driver_timing_tests {
             let mut expected = false;
             while let Some(event) = events.recv().await {
                 match event {
-                    Either::Right(NodeEvent::ExpectPeerConnection { addr })
+                    Either::Right(NodeEvent::ExpectPeerConnection { addr, .. })
                         if addr == half_addr =>
                     {
                         expected = true;

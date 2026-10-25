@@ -22,7 +22,7 @@ use crate::ring::{ConnectionManager, PeerKeyLocation};
 use crate::router::Router;
 use std::collections::HashMap;
 
-use crate::transport::{InboundAcceptor, OutboundConnector, PeerConnectionApi};
+use crate::transport::{InboundAcceptor, OutboundConnector, PeerConnectionApi, TransportPublicKey};
 
 /// Events emitted by the handshake driver.
 ///
@@ -30,13 +30,12 @@ use crate::transport::{InboundAcceptor, OutboundConnector, PeerConnectionApi};
 /// allowing the same event loop code to work with both production (UdpTransportSocket) and
 /// testing (InMemorySocket) transports.
 pub(crate) enum Event {
-    /// A remote peer initiated or completed a connection to us. It carries
-    /// no peer identity: the peer names itself later, in a ConnectRequest,
-    /// or a connect op names it in a ConnectPeer. `expected` is whether the
-    /// connection matched an expected-inbound registration (telemetry only).
+    /// A remote peer initiated or completed a connection to us. `matched`
+    /// says whether it matched an expected-inbound registration and, if so,
+    /// the key the connect op dialled.
     InboundConnection {
         transaction: Option<Transaction>,
-        expected: bool,
+        matched: InboundMatch,
         connection: Box<dyn PeerConnectionApi>,
         transient: bool,
     },
@@ -61,13 +60,13 @@ impl std::fmt::Debug for Event {
         match self {
             Event::InboundConnection {
                 transaction,
-                expected,
+                matched,
                 connection,
                 transient,
             } => f
                 .debug_struct("InboundConnection")
                 .field("transaction", transaction)
-                .field("expected", expected)
+                .field("matched", matched)
                 .field("remote_addr", &connection.remote_addr())
                 .field("transient", transient)
                 .finish(),
@@ -99,6 +98,16 @@ impl std::fmt::Debug for Event {
     }
 }
 
+/// Whether an inbound connection matched an expected-inbound registration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum InboundMatch {
+    /// No registration for its address.
+    Unexpected,
+    /// A registration for its address, with the key the connect op is
+    /// dialling at that address, when the registration carried one.
+    Expected(Option<TransportPublicKey>),
+}
+
 /// Commands delivered from the event loop into the handshake driver.
 #[derive(Debug)]
 pub(crate) enum Command {
@@ -110,16 +119,20 @@ pub(crate) enum Command {
         /// Why this dial is made (telemetry only).
         origin: crate::transport::NatAttemptOrigin,
     },
-    /// Register expectation for an inbound connection from `addr`. It names
-    /// no peer: a matched connection starts without a peer identity, like an
-    /// unexpected one.
+    /// Register expectation for an inbound connection from `addr`, which the
+    /// connect op is dialling under `peer_key`. A matched connection is
+    /// recorded under that key, as a successful dial to it would be.
     ExpectInbound {
         addr: SocketAddr,
+        peer_key: Option<TransportPublicKey>,
         transaction: Option<Transaction>,
         transient: bool,
     },
     /// Remove state associated with the connection at `addr`.
     DropConnection { addr: SocketAddr },
+    /// Test only: answered once every command sent before it is processed.
+    #[cfg(test)]
+    Barrier(tokio::sync::oneshot::Sender<()>),
 }
 
 #[derive(Clone)]
@@ -194,6 +207,7 @@ impl Stream for HandshakeHandler {
 
 #[derive(Debug)]
 struct ExpectedInbound {
+    peer_key: Option<TransportPublicKey>,
     transaction: Option<Transaction>,
     transient: bool, // TODO: rename to transient in protocol once we migrate terminology
 }
@@ -207,7 +221,13 @@ struct InboundMatcher {
 }
 
 impl InboundMatcher {
-    fn register(&mut self, addr: SocketAddr, transaction: Option<Transaction>, transient: bool) {
+    fn register(
+        &mut self,
+        addr: SocketAddr,
+        peer_key: Option<TransportPublicKey>,
+        transaction: Option<Transaction>,
+        transient: bool,
+    ) {
         tracing::debug!(
             remote = %addr,
             transient,
@@ -218,6 +238,7 @@ impl InboundMatcher {
         self.entries.insert(
             addr,
             ExpectedInbound {
+                peer_key,
                 transaction,
                 transient,
             },
@@ -269,11 +290,17 @@ async fn run_driver(
                 Some(Command::Connect { peer, transaction, transient, origin }) => {
                     spawn_outbound(outbound.clone(), events_tx.clone(), peer, transaction, transient, origin, peer_ready.clone());
                 }
-                Some(Command::ExpectInbound { addr, transaction, transient }) => {
-                    expected_inbound.register(addr, transaction, transient);
+                Some(Command::ExpectInbound { addr, peer_key, transaction, transient }) => {
+                    expected_inbound.register(addr, peer_key, transaction, transient);
                 }
                 Some(Command::DropConnection { addr }) => {
                     expected_inbound.drop_addr(addr);
+                }
+                #[cfg(test)]
+                Some(Command::Barrier(done)) => {
+                    // The test may have stopped waiting.
+                    #[allow(clippy::let_underscore_must_use)]
+                    let _ = done.send(());
                 }
                 None => break,
             },
@@ -286,14 +313,14 @@ async fn run_driver(
 
                         let remote_addr = conn.remote_addr();
                         let entry = expected_inbound.consume(remote_addr);
-                        let (expected, transaction, transient) = if let Some(entry) = entry {
-                            (true, entry.transaction, entry.transient)
+                        let (matched, transaction, transient) = if let Some(entry) = entry {
+                            (InboundMatch::Expected(entry.peer_key), entry.transaction, entry.transient)
                         } else {
                             tracing::debug!(
                                 remote = %remote_addr,
                                 "Received unexpected inbound connection (no matching expectation)"
                             );
-                            (false, None, false)
+                            (InboundMatch::Unexpected, None, false)
                         };
 
                         // Bounded send (#4145), NOT an unconditional drop.
@@ -339,7 +366,7 @@ async fn run_driver(
                             .send_timeout(
                                 Event::InboundConnection {
                                     transaction,
-                                    expected,
+                                    matched,
                                     connection: conn,
                                     transient,
                                 },
@@ -574,9 +601,9 @@ mod tests {
     }
 
     /// The accept loop, driven through `Box<dyn InboundAcceptor>`: an
-    /// expected connection is reported as expected, with its transaction and
-    /// transient flag, and with no peer identity; an unexpected one with none
-    /// of them; each accept marks
+    /// expected connection is reported as matched, with the key, transaction
+    /// and transient flag its registration carried; an unexpected one with
+    /// none of them; each accept marks
     /// the peer ready; and the driver stops when the acceptor yields `None`.
     #[tokio::test(start_paused = true)]
     async fn run_driver_reports_accepted_connections_and_stops_with_the_acceptor() {
@@ -597,10 +624,12 @@ mod tests {
         ));
 
         let expected_addr: SocketAddr = "127.0.0.1:4300".parse().unwrap();
+        let expected_key = TransportKeypair::new().public().clone();
         let tx = Transaction::new::<ConnectMsg>();
         cmd_tx
             .send(Command::ExpectInbound {
                 addr: expected_addr,
+                peer_key: Some(expected_key.clone()),
                 transaction: Some(tx),
                 transient: true,
             })
@@ -616,14 +645,14 @@ mod tests {
             .unwrap();
         let Some(Event::InboundConnection {
             transaction,
-            expected,
+            matched,
             connection,
             transient,
         }) = event_rx.recv().await
         else {
             panic!("expected an InboundConnection");
         };
-        assert!(expected);
+        assert_eq!(matched, InboundMatch::Expected(Some(expected_key)));
         assert_eq!(transaction, Some(tx));
         assert!(transient);
         assert_eq!(connection.remote_addr(), expected_addr);
@@ -637,14 +666,14 @@ mod tests {
             .unwrap();
         let Some(Event::InboundConnection {
             transaction,
-            expected,
+            matched,
             connection,
             transient,
         }) = event_rx.recv().await
         else {
             panic!("expected an InboundConnection");
         };
-        assert!(!expected);
+        assert_eq!(matched, InboundMatch::Unexpected);
         assert_eq!(transaction, None);
         assert!(!transient);
         assert_eq!(connection.remote_addr(), stranger);
@@ -848,7 +877,7 @@ mod tests {
         let mut tracker = InboundMatcher::default();
         let addr = make_peer(4100).socket_addr().unwrap();
         let tx = Transaction::new::<ConnectMsg>();
-        tracker.register(addr, Some(tx), true);
+        tracker.register(addr, None, Some(tx), true);
 
         let entry = tracker
             .consume(addr)
@@ -862,7 +891,7 @@ mod tests {
     fn tracker_drop_removes_entry() {
         let mut tracker = InboundMatcher::default();
         let addr = make_peer(4200).socket_addr().unwrap();
-        tracker.register(addr, None, false);
+        tracker.register(addr, None, None, false);
         assert!(tracker.contains(addr));
 
         tracker.drop_addr(addr);
@@ -874,9 +903,9 @@ mod tests {
     fn tracker_overwrites_existing_expectation() {
         let mut tracker = InboundMatcher::default();
         let addr = make_peer(4300).socket_addr().unwrap();
-        tracker.register(addr, None, false);
+        tracker.register(addr, None, None, false);
         let new_tx = Transaction::new::<ConnectMsg>();
-        tracker.register(addr, Some(new_tx), true);
+        tracker.register(addr, None, Some(new_tx), true);
         let transactions = tracker.transactions_for(addr).expect("entry should exist");
         assert_eq!(transactions, vec![Some(new_tx)]);
 
@@ -893,8 +922,8 @@ mod tests {
         let addr_a = make_peer(4400).socket_addr().unwrap();
         let addr_b = make_peer(4401).socket_addr().unwrap();
 
-        tracker.register(addr_a, None, false);
-        tracker.register(addr_b, None, true);
+        tracker.register(addr_a, None, None, false);
+        tracker.register(addr_b, None, None, true);
 
         let first = tracker
             .consume(addr_a)
