@@ -176,6 +176,31 @@ fn get_default_ouput_dir(cwd: &Path) -> std::io::Result<PathBuf> {
     Ok(output)
 }
 
+/// Write `bytes` to `path` so a concurrent reader sees either the old
+/// complete file or the new complete file, never a truncated one.
+/// `File::create` truncates before writing, so a reader that opens the
+/// artifact in between (e.g. another process running `fdev build` in the
+/// same crate, as parallel test processes do) reads 0 bytes.
+fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    // Unique per write, not only per process: two writers in one process
+    // must not share a temp file.
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(format!(".tmp.{}.{n}", std::process::id()));
+    let tmp = PathBuf::from(tmp);
+    let result = (|| {
+        let mut f = File::create(&tmp)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+        fs::rename(&tmp, path)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    result
+}
+
 mod contract {
     use freenet_stdlib::prelude::ContractCode;
 
@@ -455,12 +480,11 @@ mod contract {
 
     fn output_artifact(output: &Option<PathBuf>, packed: &[u8], cwd: &Path) -> anyhow::Result<()> {
         if let Some(path) = output {
-            File::create(path)?.write_all(packed)?;
+            write_atomic(path, packed)?;
         } else {
             let default_out_dir = get_default_ouput_dir(cwd)?;
             fs::create_dir_all(&default_out_dir)?;
-            let mut f = File::create(default_out_dir.join(DEFAULT_OUTPUT_NAME))?;
-            f.write_all(packed)?;
+            write_atomic(&default_out_dir.join(DEFAULT_OUTPUT_NAME), packed)?;
         }
         Ok(())
     }
@@ -501,8 +525,7 @@ mod contract {
                     get_default_ouput_dir(cwd)?.join(package_name)
                 };
                 let output = get_versioned_contract(&output_lib, cli_config)?;
-                let mut file = File::create(&out_file)?;
-                file.write_all(output.as_slice())?;
+                write_atomic(&out_file, output.as_slice())?;
                 let size = output.len();
                 let human_size = ByteSize(size as u64).to_string();
 
@@ -781,8 +804,7 @@ mod delegate {
         }
         let out_file = get_default_ouput_dir(cwd)?.join(package_name);
         let output = get_versioned_contract(&output_lib, &cli_config)?;
-        let mut file = File::create(&out_file)?;
-        file.write_all(output.as_slice())?;
+        write_atomic(&out_file, output.as_slice())?;
 
         // Warn about large delegate sizes
         let size = output.len();
@@ -837,5 +859,36 @@ mod delegate {
             )
             .map_err(anyhow::Error::msg)?;
         Ok(output)
+    }
+}
+
+#[cfg(test)]
+mod write_atomic_tests {
+    use super::write_atomic;
+
+    /// A reader polling while another thread rewrites the file must never see
+    /// a truncated or partial file (regression: `File::create` truncates first).
+    #[test]
+    fn concurrent_reader_never_sees_partial_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("artifact");
+        let payload = vec![7u8; 256 * 1024];
+        write_atomic(&path, &payload).unwrap();
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let writer = {
+            let (path, payload, stop) = (path.clone(), payload.clone(), stop.clone());
+            std::thread::spawn(move || {
+                for _ in 0..300 {
+                    write_atomic(&path, &payload).unwrap();
+                }
+                stop.store(true, std::sync::atomic::Ordering::SeqCst);
+            })
+        };
+        // Also stop if the writer thread ends early (a panic), so the test
+        // fails at join() instead of looping forever.
+        while !stop.load(std::sync::atomic::Ordering::SeqCst) && !writer.is_finished() {
+            assert_eq!(std::fs::read(&path).unwrap().len(), payload.len());
+        }
+        writer.join().unwrap();
     }
 }
