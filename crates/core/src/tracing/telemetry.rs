@@ -6772,31 +6772,63 @@ mod tests {
         // uncapped burst.
         const RING: &str = include_str!("../ring.rs");
         const INTEREST: &str = include_str!("../ring/interest.rs");
-        for (src, signature, guard, event) in [
+        // Comments are stripped and each guard must be the condition of an
+        // `if` at statement position, so a commented-out or moved guard fails.
+        // `interest_heartbeat` skips the rest of the loop when the guard says
+        // no; `sweep_task` sends inside the guarded branch.
+        for (src, signature, guard_if, event, guarded_send) in [
             (
                 RING,
                 "async fn interest_heartbeat(",
-                "cycle_event_guard.should_emit(",
+                "if !cycle_event_guard.should_emit(",
                 "\"interest_heartbeat_cycle\"",
+                false,
             ),
             (
                 INTEREST,
                 "async fn sweep_task(",
-                "health_event_guard.should_emit(",
+                "if health_event_guard.should_emit(",
                 "\"subscription_health_snapshot\"",
+                true,
             ),
         ] {
-            let body = method_body(src, signature);
+            let body =
+                crate::contract::source_pin_util::strip_comments(method_body(src, signature));
             let checked = body
-                .find(guard)
-                .unwrap_or_else(|| panic!("`{signature}` no longer calls `{guard}`"));
-            let emitted = body
-                .find(event)
+                .lines()
+                .position(|line| line.trim_start().starts_with(guard_if))
+                .unwrap_or_else(|| panic!("`{signature}` no longer opens with `{guard_if}`"));
+            let lines: Vec<&str> = body.lines().collect();
+            let emitted = lines
+                .iter()
+                .position(|line| line.contains(event))
                 .unwrap_or_else(|| panic!("`{signature}` no longer emits {event}"));
             assert!(
                 checked < emitted,
-                "`{signature}` must check `{guard}` before emitting {event}"
+                "`{signature}` must check `{guard_if}` before emitting {event}"
             );
+            let guard_indent = lines[checked].len() - lines[checked].trim_start().len();
+            let block_end = lines[checked + 1..]
+                .iter()
+                .position(|line| {
+                    line.trim_start().starts_with('}')
+                        && line.len() - line.trim_start().len() == guard_indent
+                })
+                .map(|offset| checked + 1 + offset)
+                .unwrap_or_else(|| panic!("`{signature}`: end of the guard's block"));
+            if guarded_send {
+                assert!(
+                    emitted < block_end,
+                    "`{signature}` must send {event} inside the `{guard_if}` branch"
+                );
+            } else {
+                assert!(
+                    lines[checked + 1..block_end]
+                        .iter()
+                        .any(|line| line.trim() == "continue;"),
+                    "`{signature}` must skip the event when `{guard_if}` says no"
+                );
+            }
             assert!(
                 body.contains("PeriodicEmissionGuard::half_of("),
                 "`{signature}` must build its guard from its period"
