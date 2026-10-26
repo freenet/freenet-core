@@ -182,8 +182,12 @@ fn get_default_ouput_dir(cwd: &Path) -> std::io::Result<PathBuf> {
 /// artifact in between (e.g. another process running `fdev build` in the
 /// same crate, as parallel test processes do) reads 0 bytes.
 fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    // Unique per write, not only per process: two writers in one process
+    // must not share a temp file.
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let mut tmp = path.as_os_str().to_owned();
-    tmp.push(format!(".tmp.{}", std::process::id()));
+    tmp.push(format!(".tmp.{}.{n}", std::process::id()));
     let tmp = PathBuf::from(tmp);
     let result = (|| {
         let mut f = File::create(&tmp)?;
@@ -880,7 +884,9 @@ mod write_atomic_tests {
                 stop.store(true, std::sync::atomic::Ordering::SeqCst);
             })
         };
-        while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+        // Also stop if the writer thread ends early (a panic), so the test
+        // fails at join() instead of looping forever.
+        while !stop.load(std::sync::atomic::Ordering::SeqCst) && !writer.is_finished() {
             assert_eq!(std::fs::read(&path).unwrap().len(), payload.len());
         }
         writer.join().unwrap();
