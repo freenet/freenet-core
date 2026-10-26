@@ -1201,9 +1201,9 @@ mod tests {
         // written must not cost the night its GETs.
         let src = include_str!("put_get.rs");
         let put = fn_body(src, "pub async fn run_put(");
-        let (_, after) = split_at_call(put, "put.handoff.save(&args.handoff)?;");
+        let (before, after) = split_at_call(put, "put.handoff.save(&args.handoff)?;");
         assert!(
-            after.contains("put.record(&args.put.manifest)"),
+            after.contains("put.record(&args.put.manifest)") && !before.contains(".record("),
             "`put` must record the run in the manifest, and only after writing the handoff"
         );
         let get = fn_body(src, "async fn get_phase(");
@@ -1270,10 +1270,11 @@ mod tests {
         assert!(ops.iter().all(|o| o.vantage.as_deref() == Some("nova")));
 
         let put = fn_body(include_str!("put_get.rs"), "pub async fn run_put(");
-        let (_, after) = split_at_call(put, "stamp_vantage(&mut put.handoff.put_ops, vantage);");
+        let (before, after) =
+            split_at_call(put, "stamp_vantage(&mut put.handoff.put_ops, vantage);");
         assert!(
-            after.contains("put.handoff.save(&args.handoff)?;"),
-            "the PUT records must be stamped before the handoff is written"
+            after.contains("put.handoff.save(&args.handoff)?;") && !before.contains(".save("),
+            "the PUT records must be stamped before the handoff is first written"
         );
     }
 }
