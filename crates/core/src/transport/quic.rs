@@ -45,6 +45,8 @@ pub(crate) mod runtime;
 pub(crate) mod socket;
 
 #[cfg(test)]
+mod memory_tests;
+#[cfg(test)]
 pub(crate) mod test_tls;
 #[cfg(test)]
 mod tests;

@@ -170,51 +170,7 @@ impl InboundStream {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::alloc::{GlobalAlloc, Layout, System};
-    use std::cell::Cell;
-
-    thread_local! {
-        /// Bytes allocated on this thread (never decremented).
-        static ALLOCATED: Cell<usize> = const { Cell::new(0) };
-    }
-
-    /// The system allocator, counting what each thread allocates, so a test
-    /// can see an allocation it did not expect. Tests on other threads are
-    /// unaffected.
-    struct CountingAllocator;
-
-    fn count(bytes: usize) {
-        // Unavailable only while the thread is being torn down.
-        if ALLOCATED.try_with(|n| n.set(n.get() + bytes)).is_err() {}
-    }
-
-    // SAFETY: delegates every call to `System` unchanged.
-    unsafe impl GlobalAlloc for CountingAllocator {
-        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-            count(layout.size());
-            // SAFETY: the caller upholds `GlobalAlloc::alloc`'s contract.
-            unsafe { System.alloc(layout) }
-        }
-        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-            // SAFETY: `ptr` was allocated by `System` with `layout`.
-            unsafe { System.dealloc(ptr, layout) }
-        }
-        unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-            count(new_size);
-            // SAFETY: `ptr` was allocated by `System` with `layout`.
-            unsafe { System.realloc(ptr, layout, new_size) }
-        }
-    }
-
-    #[global_allocator]
-    static ALLOCATOR: CountingAllocator = CountingAllocator;
-
-    /// Bytes allocated on this thread while running `f`.
-    fn allocated_by<R>(f: impl FnOnce() -> R) -> (R, usize) {
-        let before = ALLOCATED.with(Cell::get);
-        let result = f();
-        (result, ALLOCATED.with(Cell::get) - before)
-    }
+    use crate::util::alloc_count::allocated_by;
 
     /// A full fragment payload, matching what `send_stream` actually emits.
     ///

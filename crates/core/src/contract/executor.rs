@@ -2920,17 +2920,19 @@ mod tests {
             ),
             // The QUIC flow-control windows are the same class of
             // per-connection exception as inbound stream reassembly (see the
-            // MAX_STREAM_TOTAL_BYTES row). This memory, about twice the window
-            // per connection plus quinn's own per-connection state, is NOT
-            // accounted in this aggregate, and must be before QUIC is on by
-            // default (a gate in the #5940 rollout plan). The windows are in
-            // addition to reassembly, not covered by it.
+            // MAX_STREAM_TOTAL_BYTES row). The memory one QUIC connection
+            // holds (some of its terms are measured in quic::config) is NOT
+            // accounted in this aggregate,
+            // and must be before QUIC is on by default (a gate in the #5940
+            // rollout plan). It is in addition to reassembly, not covered by
+            // it.
             (
                 "connection_window_bytes",
-                "one QUIC connection's flow-control window: a per-connection \
-                 exception like MAX_STREAM_TOTAL_BYTES; this memory (about 2 x \
-                 window per connection plus quinn state) is not accounted here, \
-                 and must be before QUIC is on by default",
+                "one QUIC connection's flow-control window W: a per-connection \
+                 exception like MAX_STREAM_TOTAL_BYTES; quinn holds received data \
+                 beyond W and state W does not limit (measured terms in \
+                 quic::config); not accounted here, and must be before QUIC is on \
+                 by default",
             ),
             (
                 "MIN_WINDOW_BYTES",
@@ -2944,6 +2946,37 @@ mod tests {
                 "INCOMING_BUFFER_BYTES",
                 "quinn's buffer for ONE pending QUIC connection attempt, inside \
                  INCOMING_BUFFER_TOTAL_BYTES",
+            ),
+            // Measurements of QUIC connection terms (quic::config), inputs to
+            // the per-path ceiling (memory gate M2, #5940), not ceilings
+            // themselves. The quic::config module doc lists what was not
+            // measured.
+            (
+                "QUIC_CONNECTION_FIXED_BYTES",
+                "a measurement of one QUIC connection term (idle connection state, \
+                 jemalloc-rounded on linux-gnu), not a ceiling; an input to the \
+                 per-path ceiling (memory gate M2, #5940), plus the unmeasured terms \
+                 in the quic::config module doc; summed once a QUIC path cap exists \
+                 (M4, #5940)",
+            ),
+            // QUIC_ASSEMBLER_HOLD_WINDOW_MULTIPLE (a multiple of the window,
+            // so not a `_BYTES` name the discovery scan finds) is the other
+            // half of this term: streams x this + that multiple x W.
+            (
+                "QUIC_ASSEMBLER_HOLD_PER_STREAM_BYTES",
+                "a measurement of one QUIC connection term (received data per uni \
+                 stream, 1200-byte datagrams; with QUIC_ASSEMBLER_HOLD_WINDOW_MULTIPLE \
+                 x W), not a ceiling; an input to the per-path ceiling (memory gate \
+                 M2, #5940), plus the unmeasured terms in the quic::config module \
+                 doc; summed once a QUIC path cap exists (M4, #5940)",
+            ),
+            (
+                "QUIC_ACK_TAIL_BYTES",
+                "a measurement of one QUIC connection term (ACK-only records after \
+                 the last ack-eliciting send), not a ceiling; the per-path ceiling \
+                 (memory gate M2, #5940) must re-check it against quinn-proto's \
+                 behaviour, plus the unmeasured terms in the quic::config module \
+                 doc; summed once a QUIC path cap exists (M4, #5940)",
             ),
             (
                 "READ_START_BYTES",
