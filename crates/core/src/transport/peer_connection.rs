@@ -2287,20 +2287,8 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
         streaming::check_declared_stream_length(total_length_bytes)
             .map_err(InboundStreamRejection::Length)?;
         budget
-            .check(total_length_bytes)
+            .check(total_length_bytes, inbound_budget::Releaser::Udp)
             .map_err(InboundStreamRejection::Budget)
-    }
-
-    /// [`Self::admit_inbound_stream_locked`] with the budget locked here.
-    #[cfg(test)]
-    fn admit_inbound_stream(
-        &mut self,
-        stream_id: StreamId,
-        total_length_bytes: u64,
-    ) -> std::result::Result<(), InboundStreamRejection> {
-        let shared_budget = self.inbound_budget.clone();
-        let mut budget = shared_budget.lock();
-        self.admit_inbound_stream_locked(&mut budget, stream_id, total_length_bytes)
     }
 
     /// What `process_inbound` returns for a dropped stream fragment: nothing,
@@ -2381,6 +2369,7 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
             .last_warn_nanos
             .is_none_or(|last| now_nanos.saturating_sub(last) >= interval_nanos);
         if due {
+            // Peer-wide: includes a QUIC path's charges once shared.
             let (open_streams, charged_bytes) = {
                 let budget = self.inbound_budget.lock();
                 (budget.stream_count(), budget.charged_bytes())
@@ -2637,7 +2626,10 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                 "Evicted stale inbound streams"
             );
         }
-        self.inbound_budget.lock().release_gone();
+        // Gone QUIC charges too (see `inbound_budget::Releaser::Udp`).
+        self.inbound_budget
+            .lock()
+            .release_gone(inbound_budget::Releaser::Udp);
         self.flush_refusal_log(now_nanos);
     }
 
@@ -2672,8 +2664,9 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
     fn sample_inbound_concurrency(&mut self, short: bool, queued_nanos: u64) {
         let now_nanos = queued_nanos;
         let srtt = self.remote_conn.rolling_rtt_stats.srtt();
-        // Packets still waiting in the channel would hold their QUIC slots
-        // unread. The count also includes ACK-only packets and fragments of
+        // The budget's count is peer-wide: it includes a QUIC path's streams
+        // once the budget is shared. Packets still waiting in the channel
+        // would hold their QUIC slots unread. The count also includes ACK-only packets and fragments of
         // streams already counted, so it errs high.
         let outstanding = self
             .inbound_budget

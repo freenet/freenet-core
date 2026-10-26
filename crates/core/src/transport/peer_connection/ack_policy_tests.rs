@@ -1770,6 +1770,64 @@ fn fragment_with(
     }
 }
 
+impl<S: crate::transport::Socket, T: TimeSource> PeerConnection<S, T> {
+    /// [`Self::admit_inbound_stream_locked`] with the budget locked here.
+    fn admit_inbound_stream(
+        &mut self,
+        stream_id: StreamId,
+        total_length_bytes: u64,
+    ) -> std::result::Result<(), InboundStreamRejection> {
+        let shared_budget = self.inbound_budget.clone();
+        let mut budget = shared_budget.lock();
+        self.admit_inbound_stream_locked(&mut budget, stream_id, total_length_bytes)
+    }
+}
+
+/// Pin: both UDP admission paths (operations and legacy) hold ONE guard on
+/// the shared budget from the `contains` test through `check` to `charge`.
+/// The admission tests call the wrapper above, so they would still pass if
+/// a path dropped the guard and locked again between check and charge,
+/// which lets a QUIC path sharing the budget take the room in between.
+#[test]
+fn udp_admission_holds_one_budget_lock_from_check_to_charge() {
+    let source = include_str!("../peer_connection.rs");
+    let lock = "let mut budget = shared_budget.lock();";
+    let admit = "self.admit_inbound_stream_locked(&mut budget,";
+    let charge = "budget.charge(";
+    assert_eq!(
+        source.matches(admit).count(),
+        2,
+        "expected the operations and legacy admission paths, and no other caller"
+    );
+    for (i, (at, _)) in source.match_indices(admit).enumerate() {
+        let start = source[..at]
+            .rfind(lock)
+            .expect("the guard is taken before admission");
+        let before = &source[start + lock.len()..at];
+        let end = at
+            + source[at..]
+                .find(charge)
+                .expect("admission reaches a charge");
+        let after = &source[at..end];
+        for (segment, part) in [(before, "lock to check"), (after, "check to charge")] {
+            assert!(
+                !segment.contains(".lock()") && !segment.contains("shared_budget"),
+                "admission path {i}: the budget is locked again between {part}"
+            );
+        }
+        assert!(
+            before.contains("budget.contains(InboundKey::Udp(stream_id))"),
+            "admission path {i}: the already-held test must be under the same guard"
+        );
+        assert!(
+            source[end + charge.len()..]
+                .trim_start()
+                .starts_with("InboundKey::Udp(stream_id),"),
+            "admission path {i}: the charge must be the UDP stream's, on the held guard"
+        );
+    }
+}
+
 /// What the connection's budget charges a stream declaring `declared` bytes.
 fn cost(declared: u64) -> u64 {
     super::inbound_budget::ChargeOverhead::DEFAULT.cost(declared)
@@ -2062,7 +2120,10 @@ async fn a_quic_charge_on_the_shared_budget_refuses_a_udp_stream() {
     let quic_token = LegacyStreamToken::new();
     {
         let mut budget = shared.lock();
-        assert_eq!(budget.check(1_000), Ok(()));
+        assert_eq!(
+            budget.check(1_000, super::inbound_budget::Releaser::Udp),
+            Ok(())
+        );
         budget.charge(
             InboundKey::Quic(id),
             1_000,

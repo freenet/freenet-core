@@ -103,7 +103,7 @@ use crate::simulation::TimeSource;
 use crate::transport::StreamId;
 use crate::transport::metrics::InboundStreamOutcome;
 use crate::transport::peer_connection::inbound_budget::{
-    BudgetRejection, InboundKey, InboundStreamBudget, LegacyStreamToken, Liveness,
+    BudgetRejection, InboundKey, InboundStreamBudget, LegacyStreamToken, Liveness, Releaser,
     SharedInboundBudget,
 };
 use crate::transport::peer_connection::streaming::{StreamError, StreamHandle};
@@ -686,7 +686,7 @@ impl<T: TimeSource> Receiver<T> {
         let token = LegacyStreamToken::new();
         let key = {
             let mut budget = self.budget.lock();
-            if let Err(rejection) = budget.check(total) {
+            if let Err(rejection) = budget.check(total, Releaser::Quic) {
                 drop(budget);
                 self.refuse(&mut reader, rejection, total);
                 return;
@@ -766,7 +766,7 @@ impl<T: TimeSource> Receiver<T> {
                 reader.stop(stop_code::STREAM_ID_IN_USE);
                 return;
             }
-            if let Err(rejection) = budget.check(total) {
+            if let Err(rejection) = budget.check(total, Releaser::Quic) {
                 drop(budget);
                 self.refuse(&mut reader, rejection, total);
                 return;

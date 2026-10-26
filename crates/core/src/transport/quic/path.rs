@@ -101,8 +101,10 @@ use crate::transport::StreamId;
 use crate::transport::metrics::{InboundStreamOutcome, QuicCloseCode};
 use crate::transport::peer_connection::embeds_metadata;
 use crate::transport::peer_connection::inbound_budget::SharedInboundBudget;
+use crate::transport::peer_connection::streaming::StreamError;
+#[cfg(test)]
 use crate::transport::peer_connection::streaming::{
-    MAX_INBOUND_STREAM_BYTES_PER_CONNECTION, MAX_INBOUND_STREAMS_PER_CONNECTION, StreamError,
+    MAX_INBOUND_STREAM_BYTES_PER_CONNECTION, MAX_INBOUND_STREAMS_PER_CONNECTION,
 };
 
 pub(crate) use inbound::{InboundShort, InboundStreamArrival};
@@ -159,21 +161,27 @@ pub(crate) mod reset_code {
 
 /// Capacity of [`QuicInbound::shorts`]. Each queued message still holds its
 /// inbound budget charge, so the budget bounds the bytes queued.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const SHORT_CHANNEL_CAPACITY: usize = 256;
 /// Capacity of [`QuicInbound::streams`]. Each queued stream holds its charge.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const STREAM_CHANNEL_CAPACITY: usize = 256;
 /// Capacity of [`QuicInbound::controls`]; control frames are at most
 /// `MAX_CONTROL_BYTES` each.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const CONTROL_CHANNEL_CAPACITY: usize = 16;
 
 /// The receive-side limits of a path.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct QuicPathLimits {
-    /// Inbound streams (Short and Stream) holding a budget charge at once.
-    /// Used only when the path has its own budget ([`QuicPath::with_limits`]).
+    /// Inbound streams (Short and Stream) holding a budget charge at once,
+    /// for the test-only [`QuicPath::with_limits`], which gives the path a
+    /// budget of its own. A node path ([`QuicPath::with_budget`]) takes its
+    /// limits from the budget, so this field does not exist outside tests.
+    #[cfg(test)]
     pub(crate) max_streams: usize,
-    /// Bytes of inbound budget charges at once. Used only when the path has
-    /// its own budget ([`QuicPath::with_limits`]).
+    /// Bytes of inbound budget charges at once; see `max_streams`.
+    #[cfg(test)]
     pub(crate) max_bytes: u64,
     pub(crate) short_capacity: usize,
     pub(crate) stream_capacity: usize,
@@ -184,10 +192,16 @@ pub(crate) struct QuicPathLimits {
 }
 
 impl QuicPathLimits {
-    /// The UDP transport's per-connection inbound limits and the channel
-    /// capacities above.
+    /// The channel capacities above, and for a test path with a budget of
+    /// its own, inbound limits equal to one peer's UDP allowance
+    /// (`MAX_INBOUND_STREAMS_PER_CONNECTION`,
+    /// `MAX_INBOUND_STREAM_BYTES_PER_CONNECTION`). A node path built with
+    /// [`QuicPath::with_budget`] takes its inbound limits from the budget.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) const DEFAULT: Self = Self {
+        #[cfg(test)]
         max_streams: MAX_INBOUND_STREAMS_PER_CONNECTION,
+        #[cfg(test)]
         max_bytes: MAX_INBOUND_STREAM_BYTES_PER_CONNECTION,
         short_capacity: SHORT_CHANNEL_CAPACITY,
         stream_capacity: STREAM_CHANNEL_CAPACITY,
@@ -400,19 +414,21 @@ impl Drop for QuicPath {
 }
 
 impl QuicPath {
-    /// A path over `connection` with the default limits. `time` drives the
-    /// idle and age limits of inbound streams; use the clock quinn runs on.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// A path over `connection` with the default limits and a budget of its
+    /// own. Tests only; nodes must use [`Self::with_budget`]. `time` drives
+    /// the idle and age limits of inbound streams; use the clock quinn runs
+    /// on.
+    #[cfg(test)]
     pub(crate) fn new<T: TimeSource>(connection: QuicConnection, time: T) -> (Self, QuicInbound) {
         Self::with_limits(connection, time, QuicPathLimits::DEFAULT)
     }
 
     /// [`Self::new`] with given limits.
     ///
-    /// The path has its own inbound budget of `limits.max_streams` and
-    /// `limits.max_bytes`, so a peer that also has a UDP session would hold
-    /// two allowances. For tests; a node builds its paths with
-    /// [`Self::with_budget`].
+    /// Tests only; nodes must use [`Self::with_budget`]. The path has its
+    /// own inbound budget of `limits.max_streams` and `limits.max_bytes`, so
+    /// a peer that also had a UDP session would hold two allowances.
+    #[cfg(test)]
     pub(crate) fn with_limits<T: TimeSource>(
         connection: QuicConnection,
         time: T,
@@ -428,10 +444,32 @@ impl QuicPath {
     /// allowance across both paths (the QUIC memory gate). `budget` brings
     /// its own limits; `limits.max_streams` and `limits.max_bytes` are not
     /// used. The path's charges are keyed `InboundKey::Quic` and
-    /// `InboundKey::QuicShort`, so they never meet or release a UDP charge.
-    /// Two QUIC paths on one budget at once (a replacement built before the
-    /// old one is gone) share the `Quic` namespace: a stream id held by one
-    /// is refused on the other as `StreamIdInUse`.
+    /// `InboundKey::QuicShort`, so they never meet or release a UDP charge
+    /// (its admission releases gone QUIC charges only; see
+    /// `inbound_budget::Releaser`).
+    ///
+    /// For e5, the effects of sharing across the two paths' lifetimes:
+    /// - Two QUIC paths on one budget at once (a replacement built before
+    ///   the old one is gone) share the `Quic` namespace: a stream id held
+    ///   by one is refused on the other as `StreamIdInUse`.
+    /// - If the UDP `PeerConnection` is replaced (reconnect or fallback)
+    ///   while this path lives, the new connection gets a fresh budget and
+    ///   the peer has two allowances again. Hand the path the new handle or
+    ///   rebuild it on the new connection's budget.
+    /// - A UDP stream refused because this path filled the budget is
+    ///   remembered as refused (`RefusedStreams`), and
+    ///   `MAX_REMEMBERED_REFUSALS` outstanding refusals close the UDP
+    ///   connection. That is UDP's own overload behaviour, but now the other
+    ///   path can cause it.
+    /// - A QUIC charge whose consumer never lets go blocks UDP admissions
+    ///   too: the UDP sweep evicts only UDP streams, and the QUIC path's own
+    ///   eviction cannot end a charge a consumer still holds.
+    /// - The shared `Arc` outlives either owner: this path keeps the UDP
+    ///   connection's charges (and their room) after the `PeerConnection`
+    ///   drops, and gone UDP charges are then released by nobody, since a
+    ///   QUIC path never releases a UDP charge. Do not keep a path on the
+    ///   handle of a connection that has gone.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(in crate::transport) fn with_budget<T: TimeSource>(
         connection: QuicConnection,
         time: T,
@@ -489,17 +527,18 @@ impl QuicPath {
         &self.stats
     }
 
-    /// Streams and bytes charged to the inbound budget, after releasing the
-    /// charges of streams whose state is gone.
+    /// Streams and bytes charged to the inbound budget (peer-wide when the
+    /// budget is shared), after releasing the gone QUIC charges.
     #[cfg(test)]
     pub(crate) fn charged(&self) -> (usize, u64) {
         let mut budget = self.budget.lock();
-        budget.release_gone();
+        budget.release_gone(crate::transport::peer_connection::inbound_budget::Releaser::Quic);
         (budget.stream_count(), budget.charged_bytes())
     }
 
-    /// Streams charged right now, WITHOUT releasing gone charges first: what
-    /// the receive side itself released.
+    /// Streams charged right now (peer-wide when the budget is shared),
+    /// WITHOUT releasing gone charges first: what the receive side itself
+    /// released.
     #[cfg(test)]
     pub(crate) fn charged_streams_now(&self) -> usize {
         self.budget.lock().stream_count()

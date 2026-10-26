@@ -1078,16 +1078,42 @@ One budget per peer (QUIC memory gate M3): QuicPath::with_budget charges
   the SharedInboundBudget of the peer's UDP connection
   (PeerConnection::inbound_budget), so a peer with both paths has ONE
   allowance; with_limits gives a path its own budget and is for tests.
-  e5 MUST build node paths with with_budget. Charges are keyed by
-  InboundKey: Udp(StreamId), Quic(StreamId), QuicShort(u32). The same
-  numeric id on both paths is two charges; never charge, test or release
-  one path's stream under another path's variant. UDP's take_expired and
-  live_buffer_streams see only Udp keys (QUIC evicts by its own timers);
-  release_gone releases any path's gone charges, which is safe because a
-  charge goes only once its state is gone. The lock is parking_lot, never
-  held across .await, and not reentrant (do not call the handle's
-  stream_count/charged_bytes while holding lock()). UDP admission holds
-  it from check to charge, so a QUIC charge cannot take the room between.
+  QuicPath::new and with_limits are #[cfg(test)]; with_budget ignores
+  limits.max_streams/max_bytes. Charges are keyed by InboundKey:
+  Udp(StreamId), Quic(StreamId), QuicShort(u32). The same numeric id on
+  both paths is two charges; never charge, test or release one path's
+  stream under another path's variant. UDP's take_expired and
+  live_buffer_streams see only Udp keys (QUIC evicts by its own timers).
+  A gone UDP charge is released ONLY by UDP code (its check and sweep,
+  Releaser::Udp), as before sharing: UDP reads a held charge as "already
+  started". A QUIC admission (Releaser::Quic) releases gone QUIC charges
+  only. UDP's check and sweep also release gone QUIC charges, since QUIC
+  reads its own gone charge as free; otherwise one would hold UDP's room
+  until the path next needed room, or for good once the path is gone.
+  Pinned by a_quic_admission_never_releases_a_udp_charge and
+  a_quic_guard_releases_only_its_own_charge. The lock is parking_lot,
+  never held across .await, and not reentrant (do not call the handle's
+  stream_count/charged_bytes while holding lock()); it may be held while
+  taking the StreamRegistry (DashMap) locks, never the reverse. UDP
+  admission holds it from check to charge, so a QUIC charge cannot take
+  the room between (pinned by
+  udp_admission_holds_one_budget_lock_from_check_to_charge).
+  e5 MUST build node paths with with_budget, and MUST handle:
+  → If the UDP PeerConnection is replaced (reconnect or fallback) while a
+    QUIC path lives, the new connection gets a fresh budget and the peer
+    has two allowances again: hand the path the new handle or rebuild it.
+  → A UDP stream refused because QUIC filled the budget is remembered as
+    refused (sticky), and MAX_REMEMBERED_REFUSALS (4096) outstanding
+    refusals close the UDP connection. Same as UDP's own overload, but the
+    other path can now cause it.
+  → A QUIC charge whose consumer never releases it blocks UDP admissions
+    too: the UDP sweep does not evict QUIC streams.
+  → The shared Arc can keep UDP charges (and their room) alive after the
+    PeerConnection drops, and no QUIC code releases them: do not keep a
+    path on a gone connection's handle.
+  Telemetry and logs that read the budget (sample_inbound_concurrency's
+  outstanding count, the refusal warning's open_streams/charged_bytes)
+  are peer-wide once shared and include QUIC charges.
   With one allowance, a large UDP stream still draining can make a QUIC
   stream refuse (BUDGET_REFUSED) where two allowances admitted it; that
   is the intended semantics, retried like any transfer failure.

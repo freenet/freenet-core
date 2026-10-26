@@ -27,6 +27,12 @@
 //! reassembly memory is at most the number of peers times
 //! `MAX_INBOUND_STREAM_BYTES_PER_CONNECTION`. There is no node-wide
 //! allowance; fairness between peers is left to the transport redesign.
+//!
+//! A gone UDP charge is released only by UDP code, at the points it was
+//! released before the budget could be shared, because the UDP connection
+//! reads a held charge as "this stream was started; do not start it again".
+//! A QUIC path reads a gone charge of its own as free, so the UDP side may
+//! release those too (see [`Releaser`]).
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
@@ -236,11 +242,36 @@ pub(in crate::transport) enum InboundKey {
     QuicShort(u32),
 }
 
+/// Who is releasing gone charges, which decides which ones it may release
+/// ([`InboundStreamBudget::release_gone`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::transport) enum Releaser {
+    /// The UDP connection: every gone charge. Its own, because it chooses
+    /// when; a QUIC path's too, because the path treats a gone charge of
+    /// its own as free (it releases one before testing an id), and without
+    /// this a gone QUIC charge would hold room from the UDP side until the
+    /// path next needed room, or for good once the path is gone.
+    Udp,
+    /// A QUIC path: only QUIC charges. A gone UDP charge stays until UDP
+    /// code releases it.
+    Quic,
+}
+
+impl Releaser {
+    fn may_release(self, key: &InboundKey) -> bool {
+        match self {
+            Self::Udp => true,
+            Self::Quic => matches!(key, InboundKey::Quic(_) | InboundKey::QuicShort(_)),
+        }
+    }
+}
+
 /// One peer's [`InboundStreamBudget`], shared by its UDP connection and any
 /// QUIC path built on it. The lock is taken only in synchronous sections,
 /// never across an `.await`, and is not reentrant: do not call
 /// [`Self::stream_count`] or [`Self::charged_bytes`] while holding
-/// [`Self::lock`].
+/// [`Self::lock`]. Lock order: the budget lock may be held while taking the
+/// connection's `StreamRegistry` (DashMap shard) locks, never the reverse.
 #[derive(Clone)]
 pub(in crate::transport) struct SharedInboundBudget(Arc<Mutex<InboundStreamBudget>>);
 
@@ -337,13 +368,17 @@ impl InboundStreamBudget {
 
     /// Whether a new stream declaring `declared` bytes fits this peer's
     /// limits (with its overhead; see [`ChargeOverhead`]). Releases the
-    /// charges of streams whose state is already gone before refusing.
-    pub(in crate::transport) fn check(&mut self, declared: u64) -> Result<(), BudgetRejection> {
+    /// charges `by` may release whose state is already gone before refusing.
+    pub(in crate::transport) fn check(
+        &mut self,
+        declared: u64,
+        by: Releaser,
+    ) -> Result<(), BudgetRejection> {
         let bytes = self.overhead.cost(declared);
         if self.fits(bytes).is_ok() {
             return Ok(());
         }
-        self.release_gone();
+        self.release_gone(by);
         self.fits(bytes)
     }
 
@@ -400,13 +435,13 @@ impl InboundStreamBudget {
         gone
     }
 
-    /// Release every charge whose state is gone, whichever path charged it.
-    /// Returns how many.
-    pub(in crate::transport) fn release_gone(&mut self) -> usize {
+    /// Release every charge `by` may release whose state is gone (see
+    /// [`Releaser`]). Returns how many.
+    pub(in crate::transport) fn release_gone(&mut self, by: Releaser) -> usize {
         let mut released = 0;
         let mut freed = 0;
-        self.streams.retain(|_, charge| {
-            let alive = charge.liveness.is_alive();
+        self.streams.retain(|key, charge| {
+            let alive = !by.may_release(key) || charge.liveness.is_alive();
             if !alive {
                 released += 1;
                 freed += charge.bytes;
@@ -592,20 +627,20 @@ mod tests {
         let mut budget = budget(4, 1_000);
         let id = InboundKey::Udp(StreamId::next_transport_internal());
         let (token, liveness) = task();
-        budget.check(600).unwrap();
+        budget.check(600, Releaser::Udp).unwrap();
         budget.charge(id, 600, 0, AGE, liveness);
         assert_eq!(budget.charged_bytes(), 600);
 
         assert!(!budget.release_if_gone(id), "state still alive");
-        assert_eq!(budget.release_gone(), 0);
+        assert_eq!(budget.release_gone(Releaser::Udp), 0);
         assert_eq!(
-            budget.check(500),
+            budget.check(500, Releaser::Udp),
             Err(BudgetRejection::Bytes { charged: 600 })
         );
 
         drop(token);
         // `check` releases gone charges before refusing.
-        assert_eq!(budget.check(500), Ok(()));
+        assert_eq!(budget.check(500, Releaser::Udp), Ok(()));
         assert_eq!(budget.charged_bytes(), 0);
         assert!(!budget.contains(id));
     }
@@ -630,7 +665,7 @@ mod tests {
         let mut tokens = Vec::new();
         for _ in 0..2 {
             let (token, liveness) = task();
-            budget.check(1).unwrap();
+            budget.check(1, Releaser::Udp).unwrap();
             budget.charge(
                 InboundKey::Udp(StreamId::next_transport_internal()),
                 1,
@@ -640,9 +675,12 @@ mod tests {
             );
             tokens.push(token);
         }
-        assert_eq!(budget.check(1), Err(BudgetRejection::Streams { open: 2 }));
+        assert_eq!(
+            budget.check(1, Releaser::Udp),
+            Err(BudgetRejection::Streams { open: 2 })
+        );
         tokens.pop();
-        assert_eq!(budget.check(1), Ok(()));
+        assert_eq!(budget.check(1, Releaser::Udp), Ok(()));
         assert_eq!(budget.stream_count(), 1);
     }
 
@@ -746,6 +784,40 @@ mod tests {
         assert_eq!(budget.charged_bytes(), 300);
     }
 
+    /// A QUIC path's admission releases only gone QUIC charges: a gone UDP
+    /// charge stays until UDP code releases it, at the points it always
+    /// did. The UDP side releases gone charges of both, so a gone QUIC
+    /// charge never holds UDP's room once the path stops needing room.
+    #[test]
+    fn a_quic_admission_never_releases_a_udp_charge() {
+        let mut budget = budget(4, 200);
+        let id = StreamId::next();
+        let (udp_token, udp) = task();
+        let (quic_token, quic) = task();
+        budget.charge(InboundKey::Udp(id), 100, 0, AGE, udp);
+        budget.charge(InboundKey::Quic(id), 100, 0, AGE, quic);
+        drop(udp_token);
+        drop(quic_token);
+
+        assert_eq!(budget.check(1, Releaser::Quic), Ok(()));
+        assert!(
+            !budget.contains(InboundKey::Quic(id)),
+            "its own gone charge"
+        );
+        assert!(budget.contains(InboundKey::Udp(id)), "not the UDP one");
+        assert_eq!(
+            budget.check(150, Releaser::Quic),
+            Err(BudgetRejection::Bytes { charged: 100 })
+        );
+        assert_eq!(budget.release_gone(Releaser::Quic), 0);
+
+        let (quic_token, quic) = task();
+        budget.charge(InboundKey::QuicShort(1), 50, 0, AGE, quic);
+        drop(quic_token);
+        assert_eq!(budget.check(150, Releaser::Udp), Ok(()));
+        assert_eq!(budget.stream_count(), 0, "the UDP side released both");
+    }
+
     /// Admission counts the overhead: a stream whose payload fits the
     /// allowance but whose payload plus overhead does not is refused.
     #[test]
@@ -755,11 +827,11 @@ mod tests {
         assert!(cost > declared, "premise");
         let mut budget = InboundStreamBudget::new(4, cost - 1);
         assert_eq!(
-            budget.check(declared),
+            budget.check(declared, Releaser::Udp),
             Err(BudgetRejection::Bytes { charged: 0 })
         );
         let mut budget = InboundStreamBudget::new(4, cost);
-        assert_eq!(budget.check(declared), Ok(()));
+        assert_eq!(budget.check(declared, Releaser::Udp), Ok(()));
     }
 
     /// The per-fragment overhead covers the allocator's rounding of every
