@@ -1,45 +1,154 @@
 //! The nightly scenario: PUT via one gateway, GET everything back via a
 //! fresh ephemeral peer joined through another, including previous runs'
 //! contracts (retention).
+//!
+//! The two phases can run in one process (`put-get`) or on two hosts (`put`,
+//! then `get`), joined by a [`Handoff`] file. The nightly uses two hosts: the
+//! PUTs need the gateway's loopback WebSocket API, but a getter on the gateway
+//! host shares the gateways' /24, so its ring location (address-derived, host
+//! bits masked) is theirs, and the peers there will not accept a candidate at
+//! their own location. The getter then measures that collision, not the
+//! network.
 
 use std::path::Path;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use freenet_stdlib::prelude::*;
+use serde::{Deserialize, Serialize};
 
 use crate::manifest::{ContractRecord, Manifest, RunRecord};
 use crate::report::{OpReport, Report, RunMeta};
-use crate::{PutGetArgs, client, contracts, ephemeral};
+use crate::{GetArgs, GetCmd, PutArgs, PutCmd, PutGetArgs, client, contracts, ephemeral};
 
 /// Name this scenario publishes under. A new check is a new value here,
 /// never a new event type.
 pub const SCENARIO: &str = "put_get";
 
+/// Everything the GET phase needs from the PUT phase.
+///
+/// Self-contained on purpose: the retention targets are resolved against the
+/// manifest on the PUT host and travel in here, so the manifest never has to
+/// leave that host and the GET host needs no state of its own.
+#[derive(Serialize, Deserialize)]
+pub struct Handoff {
+    pub run_id: String,
+    /// The gateway the PUTs went through, for the report's run line.
+    pub gateway_ws: String,
+    pub put_duration_ms: u128,
+    /// This run's PUT records, in the order they ran. The GET phase replays
+    /// them into its report so the published report covers the whole run.
+    pub put_ops: Vec<OpReport>,
+    /// What to GET, in build order; the GET phase shuffles it.
+    pub targets: Vec<GetTarget>,
+}
+
+impl Handoff {
+    pub fn load(path: &Path) -> Result<Self> {
+        let bytes =
+            std::fs::read(path).with_context(|| format!("reading handoff {}", path.display()))?;
+        serde_json::from_slice(&bytes)
+            .with_context(|| format!("parsing handoff {}", path.display()))
+    }
+
+    /// Temp file and rename, as for the manifest: a truncated handoff would
+    /// fail the GET phase for a reason that has nothing to do with the network.
+    pub fn save(&self, path: &Path) -> Result<()> {
+        let tmp = path.with_extension("tmp");
+        std::fs::write(&tmp, serde_json::to_vec_pretty(self)?)
+            .with_context(|| format!("writing {}", tmp.display()))?;
+        std::fs::rename(&tmp, path).with_context(|| format!("writing {}", path.display()))?;
+        Ok(())
+    }
+}
+
+/// One contract the GET phase must fetch, and what it must come back as.
+#[derive(Serialize, Deserialize, Debug, PartialEq)]
+pub struct GetTarget {
+    /// "0h" for this run's own contracts, otherwise the retention window.
+    pub age: String,
+    pub label: String,
+    pub id: ContractInstanceId,
+    pub size: usize,
+    /// blake3 of the state that was PUT.
+    pub state_hash: String,
+}
+
+/// Both phases in one process, from one host. For local testing against
+/// `local-gateway`; the nightly runs `put` and `get` on different hosts.
 pub async fn run(args: PutGetArgs) -> Result<bool> {
-    let started = std::time::Instant::now();
+    let started = Instant::now();
+    let op_timeout = Duration::from_secs(args.op_timeout_secs);
+    let mut report = Report::default();
+    let mut handoff = put_phase(&args.put, op_timeout, &mut report).await?;
+
+    eprintln!(
+        "settling {}s before booting the ephemeral getter...",
+        args.settle_secs
+    );
+    tokio::time::sleep(Duration::from_secs(args.settle_secs)).await;
+    handoff.put_duration_ms = started.elapsed().as_millis();
+
+    get_phase(&handoff, &args.get, op_timeout, report).await
+}
+
+/// The PUT half. Succeeds once the handoff is written, whether or not every
+/// PUT did: a failed PUT is in the handoff, and the GET phase's verdict
+/// covers it. Failing here instead would skip the GETs, and with them the
+/// retention windows the night was still able to measure.
+pub async fn run_put(args: PutCmd) -> Result<bool> {
+    let mut report = Report::default();
+    let handoff = put_phase(
+        &args.put,
+        Duration::from_secs(args.op_timeout_secs),
+        &mut report,
+    )
+    .await?;
+    handoff.save(&args.handoff)?;
+    eprintln!(
+        "handoff written to {} ({} GET targets)",
+        args.handoff.display(),
+        handoff.targets.len()
+    );
+    Ok(true)
+}
+
+/// The GET half. Prints the whole run's report, PUTs included, so its output
+/// is what gets published.
+pub async fn run_get(args: GetCmd) -> Result<bool> {
+    let handoff = Handoff::load(&args.handoff)?;
+    let report = replay_puts(&handoff);
+    get_phase(
+        &handoff,
+        &args.get,
+        Duration::from_secs(args.op_timeout_secs),
+        report,
+    )
+    .await
+}
+
+/// A report holding the handoff's PUT records, printed again as they are
+/// added: the `put` host's stdout is not the published report, so without
+/// this the PUTs would be missing from it, and a failed PUT from the verdict.
+fn replay_puts(handoff: &Handoff) -> Report {
+    let mut report = Report::default();
+    for op in &handoff.put_ops {
+        report.push(op.clone());
+    }
+    report
+}
+
+/// PUT this run's contracts through the gateway, record the successful ones
+/// in the manifest, and resolve what the GET phase must fetch.
+async fn put_phase(args: &PutArgs, op_timeout: Duration, report: &mut Report) -> Result<Handoff> {
+    let started = Instant::now();
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .context("system clock before epoch")?
         .as_secs();
     let run_id = chrono::Utc::now().format("%Y%m%d-%H%M%S").to_string();
-    let op_timeout = Duration::from_secs(args.op_timeout_secs);
 
-    eprintln!("netcheck put-get: run {run_id}");
-    let mut meta = RunMeta::new(
-        SCENARIO,
-        run_id.clone(),
-        args.gateway_ws.clone(),
-        ephemeral::binary_version(&args.freenet_bin).await,
-        args.gateway_spec.clone(),
-    );
-    if args.gateway_spec.is_empty() {
-        eprintln!(
-            "WARNING: no --gateway-spec given; the ephemeral peer will bootstrap from the \
-             public index and may join through the same gateway the PUTs go through, which \
-             weakens the check to a transfer test. See `ephemeral_peers` in the run report."
-        );
-    }
+    eprintln!("netcheck put: run {run_id}");
     let wasm = contracts::compile_contract_wasm(&args.contract_dir)?;
     let run_contracts = contracts::build_run_contracts(&wasm, &run_id, args.small_contracts)?;
     let mut manifest = Manifest::load(&args.manifest)?;
@@ -51,13 +160,8 @@ pub async fn run(args: PutGetArgs) -> Result<bool> {
             .map(|(w, r)| (*w, r.run_id.as_str()))
             .collect::<Vec<_>>()
     );
-
-    let mut report = Report::default();
     let seed = interleave_seed(&run_id);
-    meta.order_seed = Some(seed);
 
-    // ---- PUT phase, via the existing gateway ----
-    //
     // Shuffled for the same reason the GET phase is. `build_run_contracts`
     // appends `large-1MB` after the smalls, so issuing them in vector order
     // put the only large contract last every single night: "the 1 MB PUT
@@ -91,7 +195,7 @@ pub async fn run(args: PutGetArgs) -> Result<bool> {
         .await;
         let ok = attempt.outcome.is_ok();
         push_put_report(
-            &mut report,
+            report,
             &c.label,
             key.to_string(),
             c.state.as_ref().len(),
@@ -102,24 +206,80 @@ pub async fn run(args: PutGetArgs) -> Result<bool> {
         }
     }
     client::disconnect(&mut gw).await;
+    eprintln!("{}/{} PUTs ok", put_ok.len(), run_contracts.len());
 
-    eprintln!(
-        "{}/{} PUTs ok; settling {}s before booting the ephemeral getter...",
-        put_ok.len(),
-        run_contracts.len(),
-        args.settle_secs
-    );
-    tokio::time::sleep(Duration::from_secs(args.settle_secs)).await;
+    let targets = get_targets(&put_ok, &retention);
+    // Recorded as soon as the PUTs have happened, whatever the GETs later
+    // find: a later night's retention window needs them either way.
+    record_puts(&mut manifest, &args.manifest, run_id.clone(), now, &put_ok)?;
 
-    // ---- GET phase, via a fresh ephemeral peer ----
-    // From here on the PUTs have happened whether or not the getter can run:
-    // every early return keeps them for later runs' retention windows, and
-    // never lets a manifest error replace the error that ended the run.
-    let keep_puts = |manifest: &mut Manifest, run_id: String| {
-        if let Err(e) = record_puts(manifest, &args.manifest, run_id, now, &put_ok) {
-            eprintln!("WARNING: could not record this run's PUTs in the manifest: {e:#}");
+    Ok(Handoff {
+        run_id,
+        gateway_ws: args.gateway_ws.clone(),
+        put_duration_ms: started.elapsed().as_millis(),
+        put_ops: report.ops().to_vec(),
+        targets,
+    })
+}
+
+/// This run's own contracts, then each retention window's, in build order.
+fn get_targets(
+    put_ok: &[&contracts::RunContract],
+    retention: &[(&'static str, &RunRecord)],
+) -> Vec<GetTarget> {
+    let mut targets = Vec::new();
+    for c in put_ok {
+        targets.push(GetTarget {
+            age: "0h".to_string(),
+            label: c.label.clone(),
+            id: *c.contract.key().id(),
+            size: c.state.as_ref().len(),
+            state_hash: blake3::hash(c.state.as_ref()).to_hex().to_string(),
+        });
+    }
+    for (window, run) in retention {
+        for rec in &run.contracts {
+            targets.push(GetTarget {
+                age: window.to_string(),
+                label: format!("{}/{}", run.run_id, rec.label),
+                id: rec.id,
+                size: rec.size,
+                state_hash: rec.state_hash.clone(),
+            });
         }
-    };
+    }
+    targets
+}
+
+/// Boot the ephemeral getter, wait for it to join the ring, and GET every
+/// target. `report` already holds this run's PUTs; the verdict covers both.
+async fn get_phase(
+    handoff: &Handoff,
+    args: &GetArgs,
+    op_timeout: Duration,
+    mut report: Report,
+) -> Result<bool> {
+    let started = Instant::now();
+    let run_id = &handoff.run_id;
+    eprintln!("netcheck get: run {run_id}");
+    let mut meta = RunMeta::new(
+        SCENARIO,
+        run_id.clone(),
+        handoff.gateway_ws.clone(),
+        ephemeral::binary_version(&args.freenet_bin).await,
+        args.gateway_spec.clone(),
+    );
+    let seed = interleave_seed(run_id);
+    meta.order_seed = Some(seed);
+    let duration = |started: Instant| handoff.put_duration_ms + started.elapsed().as_millis();
+    if args.gateway_spec.is_empty() {
+        eprintln!(
+            "WARNING: no --gateway-spec given; the ephemeral peer will bootstrap from the \
+             public index and may join through the same gateway the PUTs go through, which \
+             weakens the check to a transfer test. See `ephemeral_peers` in the run report."
+        );
+    }
+
     let node = match ephemeral::spawn_ephemeral(
         &args.freenet_bin,
         args.ephemeral_network_port,
@@ -131,10 +291,9 @@ pub async fn run(args: PutGetArgs) -> Result<bool> {
     {
         Ok(node) => node,
         Err(e) => {
-            meta.duration_ms = started.elapsed().as_millis();
+            meta.duration_ms = duration(started);
             meta.print();
             report.print_summary();
-            keep_puts(&mut manifest, run_id);
             return Err(e.context("booting the ephemeral getter"));
         }
     };
@@ -144,11 +303,10 @@ pub async fn run(args: PutGetArgs) -> Result<bool> {
         Ok(p) => p,
         Err(e) => {
             eprintln!("ephemeral node log tail:\n{}", node.log_tail());
-            meta.duration_ms = started.elapsed().as_millis();
+            meta.duration_ms = duration(started);
             meta.print();
             report.print_summary();
             node.shutdown().await;
-            keep_puts(&mut manifest, run_id);
             return Err(e.context("connecting to ephemeral node ws api"));
         }
     };
@@ -156,11 +314,10 @@ pub async fn run(args: PutGetArgs) -> Result<bool> {
         Ok(peers) => meta.ephemeral_peers = peers,
         Err(e) => {
             eprintln!("ephemeral node log tail:\n{}", node.log_tail());
-            meta.duration_ms = started.elapsed().as_millis();
+            meta.duration_ms = duration(started);
             meta.print();
             report.print_summary();
             node.shutdown().await;
-            keep_puts(&mut manifest, run_id);
             return Err(e);
         }
     }
@@ -168,67 +325,25 @@ pub async fn run(args: PutGetArgs) -> Result<bool> {
     // One sequence covering this run's own contracts and every retention
     // window, interleaved so age is not the same variable as position in the
     // run (see `interleave`).
-    let mut ops: Vec<GetOp> = Vec::new();
-    for c in &put_ok {
-        let key = c.contract.key();
-        ops.push(GetOp {
-            age: "0h",
-            label: c.label.clone(),
-            id: *key.id(),
-            key: key.to_string(),
-            size: c.state.as_ref().len(),
-            verify: Verify::Identity(c),
-        });
-    }
-    for (window, run) in &retention {
-        for rec in &run.contracts {
-            ops.push(GetOp {
-                age: window,
-                label: format!("{}/{}", run.run_id, rec.label),
-                id: rec.id,
-                key: rec.id.to_string(),
-                size: rec.size,
-                verify: Verify::Hash(&rec.state_hash),
-            });
-        }
+    let mut ops: Vec<&GetTarget> = Vec::new();
+    for t in &handoff.targets {
+        ops.push(t);
     }
     interleave(&mut ops, seed);
     eprintln!(
         "GET order for this run (interleave seed {seed}, derived from run id {run_id}): {:?}",
-        ops.iter().map(|o| o.age).collect::<Vec<_>>()
+        ops.iter().map(|o| o.age.as_str()).collect::<Vec<_>>()
     );
 
     for op in &ops {
         let attempt = client::get(&mut peer, op.id, &op.label, op_timeout)
             .await
-            .and_then(|(contract, state)| match op.verify {
-                Verify::Identity(c) => {
-                    anyhow::ensure!(
-                        contract == c.contract,
-                        "returned contract differs from what was PUT"
-                    );
-                    anyhow::ensure!(
-                        state == c.state,
-                        "returned state differs (got {} bytes, want {})",
-                        state.as_ref().len(),
-                        c.state.as_ref().len()
-                    );
-                    Ok(())
-                }
-                Verify::Hash(want) => {
-                    let hash = blake3::hash(state.as_ref()).to_hex().to_string();
-                    anyhow::ensure!(
-                        hash == want,
-                        "state hash mismatch (got {hash}, want {want})"
-                    );
-                    Ok(())
-                }
-            });
+            .and_then(|(contract, state)| verify_get(op, &contract, &state));
         push_get_report(
             &mut report,
-            op.age,
+            &op.age,
             &op.label,
-            op.key.clone(),
+            op.id.to_string(),
             op.size,
             attempt,
         );
@@ -237,12 +352,35 @@ pub async fn run(args: PutGetArgs) -> Result<bool> {
     client::disconnect(&mut peer).await;
     node.shutdown().await;
 
-    record_puts(&mut manifest, &args.manifest, run_id, now, &put_ok)?;
-
-    meta.duration_ms = started.elapsed().as_millis();
+    meta.duration_ms = duration(started);
     meta.print();
     report.print_summary();
     Ok(report.all_ok())
+}
+
+/// A GET counts only if it returned the contract asked for, with the state
+/// that was PUT. The contract's instance id is a hash of its code and
+/// parameters, and the state is compared by blake3, so this is as strict as
+/// comparing the bytes while needing only what the handoff carries.
+fn verify_get(
+    target: &GetTarget,
+    contract: &ContractContainer,
+    state: &WrappedState,
+) -> Result<()> {
+    let got = *contract.key().id();
+    anyhow::ensure!(
+        got == target.id,
+        "returned contract {got} is not the one requested ({})",
+        target.id
+    );
+    let hash = blake3::hash(state.as_ref()).to_hex().to_string();
+    anyhow::ensure!(
+        hash == target.state_hash,
+        "state hash mismatch (got {hash} for {} bytes, want {})",
+        state.as_ref().len(),
+        target.state_hash
+    );
+    Ok(())
 }
 
 /// Record only successfully-PUT contracts so retention runs never chase
@@ -274,23 +412,6 @@ fn record_puts(
         now,
     );
     manifest.save(path)
-}
-
-/// One GET the run will perform, and how to check what comes back.
-struct GetOp<'a> {
-    age: &'static str,
-    label: String,
-    id: ContractInstanceId,
-    key: String,
-    size: usize,
-    verify: Verify<'a>,
-}
-
-enum Verify<'a> {
-    /// This run's own contract: must come back byte-identical to what was PUT.
-    Identity(&'a contracts::RunContract),
-    /// A previous run's contract: checked against the recorded blake3.
-    Hash(&'a str),
 }
 
 /// Seed for this run's GET ordering, derived from the run id.
@@ -366,7 +487,7 @@ fn interleave<T>(ops: &mut [T], seed: u64) {
 /// function can synthesize one.
 fn push_get_report(
     report: &mut Report,
-    age: &'static str,
+    age: &str,
     label: &str,
     key: String,
     size: usize,
@@ -665,20 +786,14 @@ mod tests {
         // vector, which says nothing about the call site. Moving the call three
         // lines up — above the retention loop — restores the exact confound
         // this change removes, every night, with tests and clippy green.
-        let body = fn_body(
-            include_str!("put_get.rs"),
-            "pub async fn run(args: PutGetArgs) -> Result<bool> {",
-        );
+        let body = fn_body(include_str!("put_get.rs"), "async fn get_phase(");
         let (before, after) = split_at_call(body, "interleave(&mut ops, seed);");
 
         assert!(
-            before.contains("for c in &put_ok {"),
-            "the shuffle must come after this run's own contracts are added, or they are not in it"
-        );
-        assert!(
-            before.contains("for (window, run) in &retention {"),
-            "the shuffle must come after the retention windows are added, or the oldest contracts \
-             are back at the end of every run — the confound this exists to remove"
+            before.contains("for t in &handoff.targets {"),
+            "the shuffle must come after every target (this run's own contracts AND the \
+             retention windows, see `get_targets`) is added, or the oldest contracts are back at \
+             the end of every run — the confound this exists to remove"
         );
         assert!(
             after.contains("for op in &ops {"),
@@ -691,10 +806,7 @@ mod tests {
     /// unit test says nothing about what `run` actually issues.
     #[test]
     fn the_run_shuffles_the_puts_so_the_large_contract_is_not_always_last() {
-        let body = fn_body(
-            include_str!("put_get.rs"),
-            "pub async fn run(args: PutGetArgs) -> Result<bool> {",
-        );
+        let body = fn_body(include_str!("put_get.rs"), "async fn put_phase(");
         let (before, after) = split_at_call(body, "interleave(&mut put_order, seed);");
 
         assert!(
@@ -723,6 +835,188 @@ mod tests {
         assert!(
             last.len() > 1,
             "the last PUT of a run was always {last:?}; size is still confounded with position"
+        );
+    }
+
+    fn two_contracts(run_id: &str) -> Vec<contracts::RunContract> {
+        contracts::build_run_contracts(b"not wasm, only hashed", run_id, 1).expect("contracts")
+    }
+
+    fn retention_run(run_id: &str, labels: &[&str]) -> RunRecord {
+        RunRecord {
+            run_id: run_id.to_string(),
+            timestamp: 0,
+            contracts: two_contracts(run_id)
+                .iter()
+                .zip(labels)
+                .map(|(c, label)| ContractRecord {
+                    id: *c.contract.key().id(),
+                    label: label.to_string(),
+                    size: c.state.as_ref().len(),
+                    state_hash: blake3::hash(c.state.as_ref()).to_hex().to_string(),
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn the_handoff_names_this_runs_contracts_and_every_retention_window() {
+        // The GET host has no manifest: whatever the handoff omits is never
+        // fetched, and a missing retention window would look like a quiet night.
+        let own = two_contracts("20261026-040000");
+        let put_ok: Vec<&contracts::RunContract> = own.iter().collect();
+        let d1 = retention_run("20261025-040000", &["small-0", "large-1MB"]);
+        let d7 = retention_run("20261019-040000", &["small-0"]);
+        let targets = get_targets(&put_ok, &[("24h", &d1), ("7d", &d7)]);
+
+        let got: Vec<(&str, &str)> = targets
+            .iter()
+            .map(|t| (t.age.as_str(), t.label.as_str()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("0h", "small-0"),
+                ("0h", "large-1MB"),
+                ("24h", "20261025-040000/small-0"),
+                ("24h", "20261025-040000/large-1MB"),
+                ("7d", "20261019-040000/small-0"),
+            ]
+        );
+        assert_eq!(targets[0].id, *own[0].contract.key().id());
+        assert_eq!(
+            targets[1].state_hash,
+            blake3::hash(own[1].state.as_ref()).to_hex().to_string(),
+            "a 0h target must carry the hash of the state that was PUT"
+        );
+        assert_eq!(targets[4].state_hash, d7.contracts[0].state_hash);
+    }
+
+    #[test]
+    fn a_get_passes_only_with_the_requested_contract_and_the_put_state() {
+        let own = two_contracts("20261026-040000");
+        let put_ok: Vec<&contracts::RunContract> = own.iter().collect();
+        let targets = get_targets(&put_ok, &[]);
+        let (small, large) = (&own[0], &own[1]);
+
+        verify_get(&targets[0], &small.contract, &small.state).expect("the PUT itself verifies");
+        let wrong_state = verify_get(&targets[0], &small.contract, &large.state)
+            .expect_err("another state must not verify");
+        assert!(
+            wrong_state.to_string().contains("state hash mismatch"),
+            "{wrong_state}"
+        );
+        let wrong_contract = verify_get(&targets[0], &large.contract, &small.state)
+            .expect_err("another contract must not verify, even with the right state");
+        assert!(
+            wrong_contract
+                .to_string()
+                .contains("is not the one requested"),
+            "{wrong_contract}"
+        );
+    }
+
+    #[test]
+    fn the_handoff_survives_the_trip_between_hosts() {
+        let own = two_contracts("20261026-040000");
+        let put_ok: Vec<&contracts::RunContract> = own.iter().collect();
+        let d1 = retention_run("20261025-040000", &["small-0"]);
+        let mut report = Report::default();
+        push_put_report(
+            &mut report,
+            "small-0",
+            own[0].contract.key().to_string(),
+            own[0].state.as_ref().len(),
+            client::Attempt {
+                outcome: Err(anyhow::anyhow!("put timed out")),
+                latency: Duration::from_millis(7),
+                errors_ignored: 0,
+            },
+        );
+        let handoff = Handoff {
+            run_id: "20261026-040000".to_string(),
+            gateway_ws: "ws://127.0.0.1:7509".to_string(),
+            put_duration_ms: 1234,
+            put_ops: report.ops().to_vec(),
+            targets: get_targets(&put_ok, &[("24h", &d1)]),
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("handoff.json");
+        handoff.save(&path).expect("save");
+        let back = Handoff::load(&path).expect("load");
+
+        assert_eq!(back.run_id, handoff.run_id);
+        assert_eq!(back.gateway_ws, handoff.gateway_ws);
+        assert_eq!(back.put_duration_ms, 1234);
+        assert_eq!(back.targets, handoff.targets);
+        assert_eq!(
+            serde_json::to_string(&back.put_ops).expect("json"),
+            serde_json::to_string(&handoff.put_ops).expect("json")
+        );
+    }
+
+    #[test]
+    fn the_get_report_includes_the_puts_so_a_failed_put_fails_the_run() {
+        // `put` exits 0 with a failed PUT on purpose (the GETs still run), so
+        // the only place that failure can reach the verdict is here.
+        let mut put_report = Report::default();
+        for (label, ok) in [("small-0", true), ("large-1MB", false)] {
+            push_put_report(
+                &mut put_report,
+                label,
+                "some-key".to_string(),
+                1,
+                client::Attempt {
+                    outcome: if ok {
+                        Ok(())
+                    } else {
+                        Err(anyhow::anyhow!("put failed"))
+                    },
+                    latency: Duration::from_millis(1),
+                    errors_ignored: 0,
+                },
+            );
+        }
+        let handoff = Handoff {
+            run_id: "r".to_string(),
+            gateway_ws: String::new(),
+            put_duration_ms: 0,
+            put_ops: put_report.ops().to_vec(),
+            targets: Vec::new(),
+        };
+        let replayed = replay_puts(&handoff);
+        assert_eq!(
+            replayed
+                .ops()
+                .iter()
+                .map(|o| (o.seq, o.op.as_str(), o.label.as_str(), o.ok))
+                .collect::<Vec<_>>(),
+            vec![(0, "put", "small-0", true), (1, "put", "large-1MB", false)]
+        );
+        assert!(!replayed.all_ok(), "a failed PUT must fail the run");
+
+        // And `get` must actually start from it.
+        let get = fn_body(include_str!("put_get.rs"), "pub async fn run_get(");
+        let (_, after) = split_at_call(get, "let report = replay_puts(&handoff);");
+        assert!(
+            after.contains("report,"),
+            "the replayed report must be the one the GET phase records into"
+        );
+    }
+
+    #[test]
+    fn retention_state_is_written_on_the_put_host_only() {
+        // The manifest lives on the PUT host (the GET host is a fresh runner
+        // every night). Recording the PUTs anywhere but the PUT phase would
+        // write it on a machine that throws it away, and the 24h/48h/7d
+        // windows would silently stop having anything to fetch.
+        let src = include_str!("put_get.rs");
+        let put = fn_body(src, "async fn put_phase(");
+        split_at_call(put, "record_puts(");
+        let get = fn_body(src, "async fn get_phase(");
+        assert!(
+            !get.contains("manifest") && !get.contains("record_puts"),
+            "the GET phase must not touch the manifest"
         );
     }
 }

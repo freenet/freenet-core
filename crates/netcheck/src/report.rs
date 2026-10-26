@@ -66,7 +66,7 @@ impl RunMeta {
     }
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct OpReport {
     /// 0-based position in the order the run actually executed.
     ///
@@ -163,9 +163,8 @@ impl Report {
         self.ops.push(op);
     }
 
-    /// The operations recorded so far, in the order they ran. Exists so a test
-    /// can read back what was recorded; the run itself only ever writes.
-    #[cfg(test)]
+    /// The operations recorded so far, in the order they ran. The PUT phase
+    /// hands its records to the GET phase through this.
     pub fn ops(&self) -> &[OpReport] {
         &self.ops
     }

@@ -12,8 +12,9 @@ Each `put-get` run:
 2. Boots an **ephemeral peer** (`freenet network` child process with an
    empty data dir) that joins the network **through a different gateway**.
    Having no replicas of its own, it cannot answer any of its own GETs.
-3. GETs this run's contracts through that peer (verifying byte-identity)
-   together with contracts published by previous runs (24 h / 48 h / 7 d
+3. GETs this run's contracts through that peer (verifying the contract's
+   instance id, a hash of its code and parameters, and the blake3 of its
+   state) together with contracts published by previous runs (24 h / 48 h / 7 d
    windows, tracked in a persistent JSON manifest, verified against their
    blake3 state hashes). The two are issued as **one interleaved
    sequence**: with a fixed 0 h → 24 h → 48 h → 7 d order, "how old the
@@ -28,6 +29,12 @@ Each `put-get` run:
 4. Prints one JSON line per operation on stdout and exits non-zero if
    anything failed. No retries by design: an operation that only succeeds
    on retry is the regression netcheck exists to surface.
+
+`put-get` runs both phases in one process. `put` and `get` run them
+separately, on different hosts, joined by a handoff file that carries the
+run's PUT records and every GET target (this run's contracts and the
+retention windows' contracts, resolved against the manifest on the PUT
+host). The nightly uses the split form; see "Production use" below.
 
 Scenarios are subcommands sharing the same infrastructure (client,
 ephemeral node, manifest, report); future ones (update propagation,
@@ -114,29 +121,52 @@ the ingest drops them without erroring. Read run order and skipped-error
 counts from the jsonl artifact until that table gains the columns
 (freenet/freenet-telemetry-dashboard#21).
 
-## Production use (nova)
+## Production use (nova + a GitHub-hosted runner)
 
 nova runs BOTH gateways: `freenet-gateway` on network port **31337** and
 `freenet-gateway-2` on **31338**. The AWS gateway that used to be the second
 host was retired in September 2026.
 
-The ephemeral peer must be pinned to a gateway OTHER than the one the PUTs go
-through, or a GET can be answered by the node that just stored the data — which
-proves transfer, not findability. `scripts/netcheck-nightly.sh` PUTs through
-`ws://127.0.0.1:7509` (gw1) and therefore pins the getter to **gw2**:
+The nightly (`.github/workflows/netcheck-nightly.yml`, logic in
+`scripts/netcheck-nightly.sh`) runs in three jobs:
+
+1. **put**, on nova: `netcheck put` PUTs through gw1's loopback WS API
+   (`ws://127.0.0.1:7509`), records the PUTs in the manifest at
+   `~/netcheck/manifest.json` (which never leaves nova, so retention keeps
+   working across nights), and writes `~/netcheck/handoff.json`, uploaded as
+   the `netcheck-handoff` artifact.
+2. **get**, on `ubuntu-latest`: downloads the handoff and the latest
+   released `freenet` binary, and runs `netcheck get` with the getter pinned
+   to **gw2**. Its stdout, the whole run's report including the PUTs, is the
+   `netcheck-report` artifact.
+3. **publish**, on nova: `netcheck emit` sends that report to the collector
+   on nova's loopback, with vantage `github-hosted`.
+
+**Why the getter is not on nova.** A node's ring location is derived from
+its address with the host bits masked (a whole IPv4 /24 shares one
+location), so a getter on nova sits at exactly the gateways' location, and
+at that of every other node running there. A peer will not accept a joiner
+at its own location (`should_accept` treats it as on neither side), and
+routing toward that location ends among those same co-located nodes. From
+2026-10-16, with several other nodes running on nova, the getter failed to
+join within 120 s on most nights: the check was measuring nova's /24, not
+the network.
+
+**Why gw2.** The ephemeral peer must be pinned to a gateway OTHER than the
+one the PUTs go through, or a GET can be answered by the node that just
+stored the data, which proves transfer, not findability:
 
 ```bash
 GW2_IP=$(getent hosts gw2.freenet.org | awk '{print $1}' | head -1)
 GW2_KEY=$(curl -fsS https://freenet.org/keys/public.gw2.pem)
-netcheck --gateway-ws ws://127.0.0.1:7509 \
-         --gateway-spec "${GW2_IP}:31338,${GW2_KEY}"
+netcheck get --handoff handoff.json \
+             --gateway-spec "${GW2_IP}:31338,${GW2_KEY}"
 ```
 
-Note this is weaker than the previous arrangement: gw1 and gw2 are separate
-processes but the SAME host, where the retired gateway was a separate machine
-on a different network. The invariant still holds — the GET is answered by a
-different node than the PUT — but it no longer crosses a host or a link. If an
-off-host gateway exists again, prefer it here.
+gw1 and gw2 are separate processes on the SAME host, so the GET is answered
+by a different node than the PUT, but the PUT side no longer crosses a host
+the way it did with the retired gateway. If an off-host gateway exists
+again, prefer it here.
 
 
 ## Local testing, fully isolated
