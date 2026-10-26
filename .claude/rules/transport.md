@@ -1085,13 +1085,20 @@ One budget per peer (QUIC memory gate M3): QuicPath::with_budget charges
   stream under another path's variant. UDP's take_expired and
   live_buffer_streams see only Udp keys (QUIC evicts by its own timers).
   A gone UDP charge is released ONLY by UDP code (its check and sweep,
-  Releaser::Udp), as before sharing: UDP reads a held charge as "already
-  started". A QUIC admission (Releaser::Quic) releases gone QUIC charges
-  only. UDP's check and sweep also release gone QUIC charges, since QUIC
-  reads its own gone charge as free; otherwise one would hold UDP's room
-  until the path next needed room, or for good once the path is gone.
-  Pinned by a_quic_admission_never_releases_a_udp_charge and
-  a_quic_guard_releases_only_its_own_charge. The lock is parking_lot,
+  Releaser::Udp), so UDP's release timing is exactly main's; a UDP-only
+  node releases as before. (The dedup against restarting a stream is
+  completed_inbound_streams, not the held charge.) A QUIC admission
+  (Releaser::Quic) releases gone QUIC charges only. UDP's check and sweep
+  also release gone QUIC charges, since QUIC reads its own gone charge as
+  free; otherwise one would hold UDP's room until the path next needed
+  room, or for good once the path is gone. Pinned at the call sites by
+  udp_and_quic_paths_share_one_inbound_allowance (read_stream and
+  read_short refused on room a gone UDP charge holds),
+  a_quic_guard_releases_only_its_own_charge,
+  udp_admission_releases_its_own_gone_charges_for_room,
+  the_udp_sweep_releases_a_gone_quic_charge and
+  quic_admission_holds_one_budget_lock_from_check_to_charge (which also
+  pins Releaser::Quic in both QUIC checks). The lock is parking_lot,
   never held across .await, and not reentrant (do not call the handle's
   stream_count/charged_bytes while holding lock()); it may be held while
   taking the StreamRegistry (DashMap) locks, never the reverse. UDP
@@ -1108,6 +1115,9 @@ One budget per peer (QUIC memory gate M3): QuicPath::with_budget charges
     other path can now cause it.
   → A QUIC charge whose consumer never releases it blocks UDP admissions
     too: the UDP sweep does not evict QUIC streams.
+  → A gone UDP charge holds room against QUIC until UDP's next 5 s
+    timeout_check sweep (or UDP's own admission under pressure), so QUIC
+    can see BUDGET_REFUSED for up to about 5 s on room that is free.
   → The shared Arc can keep UDP charges (and their room) alive after the
     PeerConnection drops, and no QUIC code releases them: do not keep a
     path on a gone connection's handle.

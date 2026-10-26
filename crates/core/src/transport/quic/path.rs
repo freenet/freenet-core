@@ -464,6 +464,10 @@ impl QuicPath {
     /// - A QUIC charge whose consumer never lets go blocks UDP admissions
     ///   too: the UDP sweep evicts only UDP streams, and the QUIC path's own
     ///   eviction cannot end a charge a consumer still holds.
+    /// - A gone UDP charge holds room against this path until the UDP
+    ///   connection's next 5 s `timeout_check` sweep (or its own admission
+    ///   under pressure), so this path can refuse with `BUDGET_REFUSED` for
+    ///   up to about 5 s on room that is free.
     /// - The shared `Arc` outlives either owner: this path keeps the UDP
     ///   connection's charges (and their room) after the `PeerConnection`
     ///   drops, and gone UDP charges are then released by nobody, since a

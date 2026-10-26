@@ -1398,6 +1398,17 @@ fn udp_and_quic_paths_share_one_inbound_allowance() {
         let conn = p.a_raw();
         let code = p.drive(raw_unfinished(conn, bytes)).await;
         assert_eq!(code, Some(u64::from(stop_code::BUDGET_REFUSED)));
+        // A short message too (kind 0): `read_short` releases QUIC charges only.
+        let mut bytes = header(1, 0, 0, small, 0);
+        bytes.extend_from_slice(&payload(100));
+        let conn = p.a_raw();
+        let code = p.drive(raw_unfinished(conn, bytes)).await;
+        assert_eq!(code, Some(u64::from(stop_code::BUDGET_REFUSED)));
+        assert_eq!(
+            p.b.stats()
+                .shared_count(InboundStreamOutcome::RefusedConnectionBytes),
+            3
+        );
         assert!(shared.lock().contains(InboundKey::Udp(udp_id)));
 
         // Released as the UDP connection releases it: the QUIC stream fits.
@@ -1545,4 +1556,42 @@ fn a_quic_guard_releases_only_its_own_charge() {
             "the UDP charge and the sync message"
         );
     })
+}
+
+/// Pin: both QUIC admissions (`read_short`, `read_stream`) hold ONE guard
+/// on the budget from its first use through `check` to `charge`, as the UDP
+/// side does (`udp_admission_holds_one_budget_lock_from_check_to_charge`),
+/// so a UDP admission sharing the budget cannot take the room in between.
+/// Also pins their keys and that they release only QUIC charges.
+#[test]
+fn quic_admission_holds_one_budget_lock_from_check_to_charge() {
+    use crate::transport::peer_connection::inbound_budget::pin;
+    let source = include_str!("inbound.rs");
+    let lock = "let mut budget = self.budget.lock();";
+    let check = "if let Err(rejection) = budget.check(total, Releaser::Quic)";
+    let body = pin::fn_body(source, "async fn read_short(");
+    pin::assert_one_guard(
+        body,
+        "read_short",
+        lock,
+        &[check, "let key = self.short_key(&budget);"],
+        "budget.charge(",
+    );
+    let body = pin::fn_body(source, "async fn read_stream(");
+    let after = pin::assert_one_guard(
+        body,
+        "read_stream",
+        lock,
+        &[
+            "let key = InboundKey::Quic(stream_id);",
+            "budget.release_if_gone(key);",
+            "if budget.contains(key)",
+            check,
+        ],
+        "budget.charge(",
+    );
+    assert!(
+        after.trim_start().starts_with("key,"),
+        "read_stream: the charge must be under the stream's `Quic` key"
+    );
 }

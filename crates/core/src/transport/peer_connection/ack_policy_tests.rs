@@ -1790,40 +1790,28 @@ impl<S: crate::transport::Socket, T: TimeSource> PeerConnection<S, T> {
 /// which lets a QUIC path sharing the budget take the room in between.
 #[test]
 fn udp_admission_holds_one_budget_lock_from_check_to_charge() {
+    use super::inbound_budget::pin;
     let source = include_str!("../peer_connection.rs");
-    let lock = "let mut budget = shared_budget.lock();";
-    let admit = "self.admit_inbound_stream_locked(&mut budget,";
-    let charge = "budget.charge(";
-    assert_eq!(
-        source.matches(admit).count(),
-        2,
-        "expected the operations and legacy admission paths, and no other caller"
-    );
-    for (i, (at, _)) in source.match_indices(admit).enumerate() {
-        let start = source[..at]
-            .rfind(lock)
-            .expect("the guard is taken before admission");
-        let before = &source[start + lock.len()..at];
-        let end = at
-            + source[at..]
-                .find(charge)
-                .expect("admission reaches a charge");
-        let after = &source[at..end];
-        for (segment, part) in [(before, "lock to check"), (after, "check to charge")] {
-            assert!(
-                !segment.contains(".lock()") && !segment.contains("shared_budget"),
-                "admission path {i}: the budget is locked again between {part}"
-            );
-        }
-        assert!(
-            before.contains("budget.contains(InboundKey::Udp(stream_id))"),
-            "admission path {i}: the already-held test must be under the same guard"
+    for (signature, what) in [
+        ("fn process_operations_fragment(", "operations admission"),
+        ("async fn process_inbound(", "legacy admission"),
+    ] {
+        let body = pin::fn_body(source, signature);
+        let after = pin::assert_one_guard(
+            body,
+            what,
+            "let mut budget = shared_budget.lock();",
+            &[
+                "if budget.contains(InboundKey::Udp(stream_id))",
+                "self.admit_inbound_stream_locked(&mut budget, stream_id, total_length_bytes)",
+            ],
+            "budget.charge(",
         );
         assert!(
-            source[end + charge.len()..]
+            after
                 .trim_start()
                 .starts_with("InboundKey::Udp(stream_id),"),
-            "admission path {i}: the charge must be the UDP stream's, on the held guard"
+            "{what}: the charge must be the UDP stream's"
         );
     }
 }
@@ -2143,6 +2131,59 @@ async fn a_quic_charge_on_the_shared_budget_refuses_a_udp_stream() {
     feed(&mut e, fragment(id, MAX_STREAM_TOTAL_BYTES, 2)).await;
     let (handle, _) = e.conn.streaming_handles.get(&id).unwrap();
     assert_eq!(handle.received_fragments(), 2, "the UDP stream carries on");
+}
+
+/// UDP admission under pressure releases the gone charges it needs room
+/// from, its own included (`Releaser::Udp` at the admission check): a gone
+/// UDP charge that no sweep has released yet does not refuse a new stream.
+#[tokio::test(start_paused = true)]
+async fn udp_admission_releases_its_own_gone_charges_for_room() {
+    use super::inbound_budget::{LegacyStreamToken, Liveness};
+    use super::streaming::MAX_STREAM_TOTAL_BYTES;
+    let mut e = single(CAPABLE);
+    let shared = e.conn.inbound_budget();
+    let gone = StreamId::next();
+    let token = LegacyStreamToken::new();
+    shared.lock().charge(
+        InboundKey::Udp(gone),
+        MAX_STREAM_TOTAL_BYTES,
+        0,
+        Duration::from_secs(3600),
+        Liveness::Task(Arc::downgrade(&token)),
+    );
+    drop(token);
+    let id = StreamId::next();
+    feed(&mut e, fragment(id, MAX_STREAM_TOTAL_BYTES, 1)).await;
+    assert!(e.conn.streaming_handles.contains_key(&id), "admitted");
+    assert!(!shared.lock().contains(InboundKey::Udp(gone)), "released");
+}
+
+/// The UDP sweep releases a gone QUIC charge on its own, with no later
+/// admission on either path: otherwise a QUIC path that stopped needing
+/// room (or is gone) would hold UDP's room until the next refusal.
+#[tokio::test(start_paused = true)]
+async fn the_udp_sweep_releases_a_gone_quic_charge() {
+    use super::inbound_budget::{LegacyStreamToken, Liveness};
+    let mut e = single(CAPABLE);
+    let shared = e.conn.inbound_budget();
+    let id = StreamId::next();
+    let token = LegacyStreamToken::new();
+    shared.lock().charge(
+        InboundKey::Quic(id),
+        1_000,
+        0,
+        Duration::from_secs(3600),
+        Liveness::Task(Arc::downgrade(&token)),
+    );
+    e.conn.sweep_inbound_streams();
+    assert!(shared.lock().contains(InboundKey::Quic(id)), "still held");
+    drop(token);
+    e.conn.sweep_inbound_streams();
+    assert_eq!(
+        e.conn.inbound_budget.stream_count(),
+        0,
+        "released by the sweep"
+    );
 }
 
 /// A stream that keeps receiving data is still evicted at the absolute age

@@ -29,10 +29,10 @@
 //! allowance; fairness between peers is left to the transport redesign.
 //!
 //! A gone UDP charge is released only by UDP code, at the points it was
-//! released before the budget could be shared, because the UDP connection
-//! reads a held charge as "this stream was started; do not start it again".
-//! A QUIC path reads a gone charge of its own as free, so the UDP side may
-//! release those too (see [`Releaser`]).
+//! released before the budget could be shared, so UDP's release timing is
+//! exactly what it was (a UDP-only node releases as before). A QUIC path
+//! reads a gone charge of its own as free, so the UDP side may release
+//! those too (see [`Releaser`]).
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
@@ -246,14 +246,19 @@ pub(in crate::transport) enum InboundKey {
 /// ([`InboundStreamBudget::release_gone`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::transport) enum Releaser {
-    /// The UDP connection: every gone charge. Its own, because it chooses
-    /// when; a QUIC path's too, because the path treats a gone charge of
-    /// its own as free (it releases one before testing an id), and without
-    /// this a gone QUIC charge would hold room from the UDP side until the
-    /// path next needed room, or for good once the path is gone.
+    /// The UDP connection: every gone charge. Its own, so its release
+    /// timing stays what it was before the budget could be shared (the
+    /// dedup against restarting a stream is `completed_inbound_streams`,
+    /// not the held charge); a QUIC path's too, because the path treats a
+    /// gone charge of its own as free (it releases one before testing an
+    /// id), and without this a gone QUIC charge would hold room from the
+    /// UDP side until the path next needed room, or for good once the path
+    /// is gone.
     Udp,
     /// A QUIC path: only QUIC charges. A gone UDP charge stays until UDP
-    /// code releases it.
+    /// code releases it: at its next `timeout_check` sweep (every 5 s) or
+    /// its own admission under pressure. Until then the QUIC path can be
+    /// refused for room that is free.
     Quic,
 }
 
@@ -581,6 +586,97 @@ fn nanos(duration: Duration) -> u64 {
     u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
 }
 
+/// Source-scrape helpers for the pins that one guard on a shared budget
+/// spans an admission, on either path (AGENTS.md, "WHEN writing a
+/// source-scrape pin test"). Each pin scrapes ANOTHER file, so its own
+/// literals cannot satisfy it.
+#[cfg(test)]
+pub(in crate::transport) mod pin {
+    /// The body of the function whose definition starts with `signature`,
+    /// by brace matching from its first `{`, so methods work too. The
+    /// signature must occur exactly once in `src`: a second occurrence
+    /// could be matched instead and scope the scan to the wrong function.
+    pub(in crate::transport) fn fn_body<'a>(src: &'a str, signature: &str) -> &'a str {
+        assert_eq!(
+            src.matches(signature).count(),
+            1,
+            "`{signature}` must occur exactly once in the scraped source"
+        );
+        let start = src.find(signature).expect("counted above");
+        let open = start
+            + src[start..]
+                .find('{')
+                .unwrap_or_else(|| panic!("`{signature}` has no body"));
+        let mut depth = 0usize;
+        for (i, byte) in src.bytes().enumerate().skip(open) {
+            match byte {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return &src[open + 1..i];
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("unbalanced braces in `{signature}`");
+    }
+
+    /// Where `needle` occurs at statement position in `body` (preceded on
+    /// its line by whitespace only, so a commented-out call does not
+    /// count). It must occur so exactly once.
+    pub(in crate::transport) fn statement_at(body: &str, needle: &str, what: &str) -> usize {
+        let at: Vec<usize> = body
+            .match_indices(needle)
+            .map(|(i, _)| i)
+            .filter(|i| {
+                let line_start = body[..*i].rfind('\n').map_or(0, |n| n + 1);
+                body[line_start..*i].trim().is_empty()
+            })
+            .collect();
+        assert_eq!(
+            at.len(),
+            1,
+            "{what}: `{needle}` must be called exactly once at statement position"
+        );
+        at[0]
+    }
+
+    /// In `body`: `lock`, then each of `steps`, then `charge`, each once at
+    /// statement position and in that order, with nothing between the lock
+    /// and the charge that locks again (any `lock(`, including
+    /// `SharedInboundBudget::lock(&..)`) or gives the guard up for a while
+    /// (`unlocked`). Returns the text after the charge call.
+    pub(in crate::transport) fn assert_one_guard<'a>(
+        body: &'a str,
+        what: &str,
+        lock: &str,
+        steps: &[&str],
+        charge: &str,
+    ) -> &'a str {
+        let locked = statement_at(body, lock, what) + lock.len();
+        let mut at = locked;
+        for step in steps.iter().chain([&charge]) {
+            let next = statement_at(body, step, what);
+            assert!(
+                next > at,
+                "{what}: `{step}` must come after the lock and the steps before it"
+            );
+            at = next;
+        }
+        let held = &body[locked..at];
+        for forbidden in ["lock(", "unlocked"] {
+            assert!(
+                !held.contains(forbidden),
+                "{what}: `{forbidden}` between taking the guard and the charge; the budget \
+                 must stay locked from the check to the charge"
+            );
+        }
+        &body[at + charge.len()..]
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -794,15 +890,22 @@ mod tests {
         let id = StreamId::next();
         let (udp_token, udp) = task();
         let (quic_token, quic) = task();
+        let (short_token, short) = task();
         budget.charge(InboundKey::Udp(id), 100, 0, AGE, udp);
-        budget.charge(InboundKey::Quic(id), 100, 0, AGE, quic);
+        budget.charge(InboundKey::Quic(id), 50, 0, AGE, quic);
+        budget.charge(InboundKey::QuicShort(id.0), 50, 0, AGE, short);
         drop(udp_token);
         drop(quic_token);
+        drop(short_token);
 
         assert_eq!(budget.check(1, Releaser::Quic), Ok(()));
         assert!(
             !budget.contains(InboundKey::Quic(id)),
             "its own gone charge"
+        );
+        assert!(
+            !budget.contains(InboundKey::QuicShort(id.0)),
+            "its own gone short-message charge"
         );
         assert!(budget.contains(InboundKey::Udp(id)), "not the UDP one");
         assert_eq!(
