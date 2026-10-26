@@ -882,8 +882,9 @@ Audit questions for any new byte budget:
 **Recorded exception: inbound stream reassembly.** `MAX_STREAM_TOTAL_BYTES` and
 `MAX_INBOUND_STREAM_BYTES_PER_CONNECTION` are flat and sit outside the
 aggregate (listed in `NOT_SUMMED` with the reason). They bound one stream and
-one connection, not the node: reassembly memory across the node is at most the
-number of connections times the per-connection allowance. The QUIC
+one peer, not the node: reassembly memory across the node is at most the
+number of peers times the per-peer allowance (one budget, shared by a peer's
+UDP connection and QUIC path). The QUIC
 flow-control windows (`quic::config::connection_window_bytes`, #5940) are
 the same class of per-connection exception and are in `NOT_SUMMED`. They are
 NOT covered by the reassembly allowance: they come on top of it, the send

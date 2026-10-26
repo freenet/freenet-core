@@ -14,7 +14,9 @@ use super::*;
 use crate::config::GlobalRng;
 use crate::simulation::{TimeSource, VirtualTime};
 use crate::transport::IncomingStream;
-use crate::transport::peer_connection::inbound_budget::ChargeOverhead;
+use crate::transport::peer_connection::inbound_budget::{
+    BudgetRejection, ChargeOverhead, InboundKey, LegacyStreamToken, Liveness, Releaser,
+};
 use crate::transport::peer_connection::streaming::{
     MAX_STREAM_TOTAL_BYTES, StreamError, max_inbound_stream_age,
 };
@@ -56,6 +58,17 @@ impl Paths {
 
 /// Build the pair on `10.203.<subnet>.1` and `.2` and connect it.
 async fn paths(network: &str, subnet: u8, b_limits: QuicPathLimits) -> Paths {
+    paths_with(network, subnet, b_limits, None).await
+}
+
+/// [`paths`], with `b`'s path charging `b_budget` if given
+/// ([`QuicPath::with_budget`]) instead of a budget of its own.
+async fn paths_with(
+    network: &str,
+    subnet: u8,
+    b_limits: QuicPathLimits,
+    b_budget: Option<SharedInboundBudget>,
+) -> Paths {
     let a_addr: SocketAddr = format!("10.203.{subnet}.1:5000").parse().unwrap();
     let b_addr: SocketAddr = format!("10.203.{subnet}.2:5000").parse().unwrap();
     let pair = pair(network, a_addr, b_addr, None).await;
@@ -82,7 +95,10 @@ async fn paths(network: &str, subnet: u8, b_limits: QuicPathLimits) -> Paths {
     .await;
     drop(permit);
     let (a, a_in) = QuicPath::new(client, pair.time.clone());
-    let (b, b_in) = QuicPath::with_limits(server, pair.time.clone(), b_limits);
+    let (b, b_in) = match b_budget {
+        Some(budget) => QuicPath::with_budget(server, pair.time.clone(), b_limits, budget),
+        None => QuicPath::with_limits(server, pair.time.clone(), b_limits),
+    };
     Paths {
         pair,
         a: Arc::new(a),
@@ -1320,4 +1336,262 @@ fn dropping_the_path_cancels_streams_in_progress() {
         assert!(arrival.handle.is_cancelled());
         drop(open);
     })
+}
+
+/// One peer's UDP connection and QUIC path charge one allowance when the
+/// path is built on the connection's budget (`QuicPath::with_budget`). The
+/// UDP side is the budget handle, charged as `PeerConnection` charges it
+/// (`a_quic_charge_on_the_shared_budget_refuses_a_udp_stream` drives the
+/// real UDP admission against a QUIC charge).
+///
+/// A UDP stream that fills the allowance makes a QUIC stream that fits on
+/// its own be stopped with `BUDGET_REFUSED`. Once the UDP stream's state is
+/// gone and the UDP side has released its charge (not before: a QUIC
+/// admission never releases a UDP charge), the QUIC stream is admitted, and
+/// while that one is held the UDP side is refused in turn.
+#[test]
+fn udp_and_quic_paths_share_one_inbound_allowance() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let small = 10_000u64;
+        // Room for one small stream, from either path.
+        let shared = SharedInboundBudget::new(4, ChargeOverhead::DEFAULT.cost(small));
+        let mut p = paths_with(
+            "quic-path-shared",
+            24,
+            QuicPathLimits::DEFAULT,
+            Some(shared.clone()),
+        )
+        .await;
+
+        let udp_token = LegacyStreamToken::new();
+        let udp_id = StreamId::next();
+        {
+            let mut budget = shared.lock();
+            assert_eq!(budget.check(small, Releaser::Udp), Ok(()));
+            budget.charge(
+                InboundKey::Udp(udp_id),
+                small,
+                0,
+                Duration::from_secs(3600),
+                Liveness::Task(Arc::downgrade(&udp_token)),
+            );
+        }
+        // Unfinished, so the stop always reaches the sender.
+        let mut bytes = header(1, 1, StreamId::next().0, small, 0);
+        bytes.extend_from_slice(&payload(100));
+        let conn = p.a_raw();
+        let code = p.drive(raw_unfinished(conn, bytes)).await;
+        assert_eq!(code, Some(u64::from(stop_code::BUDGET_REFUSED)));
+        assert_eq!(
+            p.b.stats()
+                .shared_count(InboundStreamOutcome::RefusedConnectionBytes),
+            1
+        );
+        assert!(p.b_in.streams.try_recv().is_err(), "nothing was announced");
+
+        // The UDP stream's state is gone, but its charge is UDP code's to
+        // release: until then the QUIC side is still refused.
+        drop(udp_token);
+        let mut bytes = header(1, 1, StreamId::next().0, small, 0);
+        bytes.extend_from_slice(&payload(100));
+        let conn = p.a_raw();
+        let code = p.drive(raw_unfinished(conn, bytes)).await;
+        assert_eq!(code, Some(u64::from(stop_code::BUDGET_REFUSED)));
+        // A short message too (kind 0): `read_short` releases QUIC charges only.
+        let mut bytes = header(1, 0, 0, small, 0);
+        bytes.extend_from_slice(&payload(100));
+        let conn = p.a_raw();
+        let code = p.drive(raw_unfinished(conn, bytes)).await;
+        assert_eq!(code, Some(u64::from(stop_code::BUDGET_REFUSED)));
+        assert_eq!(
+            p.b.stats()
+                .shared_count(InboundStreamOutcome::RefusedConnectionBytes),
+            3
+        );
+        assert!(shared.lock().contains(InboundKey::Udp(udp_id)));
+
+        // Released as the UDP connection releases it: the QUIC stream fits.
+        assert!(shared.lock().release_if_gone(InboundKey::Udp(udp_id)));
+        let a = p.a.clone();
+        p.drive(async move {
+            a.send_stream(StreamId::next(), None, Bytes::from(payload(small as usize)))
+                .await
+                .expect("admitted once the UDP charge is released")
+        })
+        .await;
+        let arrival = p.b_in.streams.try_recv().expect("announced");
+        assert!(arrival.handle.is_complete());
+
+        // While a consumer holds it, the UDP side is refused.
+        assert!(matches!(
+            shared.lock().check(small, Releaser::Udp),
+            Err(BudgetRejection::Bytes { .. })
+        ));
+        drop(arrival);
+        assert_eq!(shared.lock().check(small, Releaser::Udp), Ok(()));
+    })
+}
+
+/// The same numeric id held by the UDP connection and by the QUIC path is
+/// two charges: a `Stream` with a UDP stream's id is admitted (not
+/// `StreamIdInUse`), a short message is charged beside a UDP
+/// transport-internal id, and the QUIC charges go without touching the UDP
+/// one.
+#[test]
+fn quic_keys_never_collide_with_udp_ids() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let shared = SharedInboundBudget::new(16, u64::MAX);
+        let mut p = paths_with(
+            "quic-path-keys",
+            25,
+            QuicPathLimits::DEFAULT,
+            Some(shared.clone()),
+        )
+        .await;
+        let id = StreamId::next();
+        let udp_tokens: Vec<_> = (0..2).map(|_| LegacyStreamToken::new()).collect();
+        // A UDP operations stream with `id`, and a transport-internal one with
+        // the number the path's first short-message key gets.
+        for (key, token) in [InboundKey::Udp(id), InboundKey::Udp(StreamId(1))]
+            .into_iter()
+            .zip(&udp_tokens)
+        {
+            shared.lock().charge(
+                key,
+                100,
+                0,
+                Duration::from_secs(3600),
+                Liveness::Task(Arc::downgrade(token)),
+            );
+        }
+
+        let a = p.a.clone();
+        p.drive(async move {
+            a.send_stream(id, None, Bytes::from_static(b"same id"))
+                .await
+                .expect("admitted beside the UDP charge");
+            a.send_short(b"short").await.expect("short");
+        })
+        .await;
+        let arrival = p.b_in.streams.try_recv().expect("announced");
+        let short = p.b_in.shorts.try_recv().expect("delivered");
+        assert_eq!(p.b.stats().count(QuicInboundOutcome::StreamIdInUse), 0);
+        {
+            let budget = shared.lock();
+            assert_eq!(
+                budget.stream_count(),
+                4,
+                "two UDP charges and two QUIC ones"
+            );
+            assert!(budget.contains(InboundKey::Quic(id)));
+            assert!(budget.contains(InboundKey::QuicShort(1)));
+        }
+
+        drop(arrival);
+        drop(short);
+        let mut budget = shared.lock();
+        assert!(budget.release_if_gone(InboundKey::Quic(id)));
+        assert!(budget.release_if_gone(InboundKey::QuicShort(1)));
+        assert!(!budget.release_if_gone(InboundKey::Udp(id)), "still held");
+        assert_eq!(budget.release_gone(Releaser::Udp), 0);
+        assert_eq!(budget.stream_count(), 2, "the UDP charges remain");
+        drop(budget);
+        drop(udp_tokens);
+    })
+}
+
+/// A QUIC stream's guard releases only its own charge on a shared budget.
+/// A stream that fails before it is announced is released by its reader's
+/// guard at once; a UDP charge with the same numeric id, whose state is
+/// also gone, stays until UDP code releases it. Checked without
+/// `release_gone`, which would hide which side released what.
+#[test]
+fn a_quic_guard_releases_only_its_own_charge() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let shared = SharedInboundBudget::new(16, u64::MAX);
+        let mut p = paths_with(
+            "quic-path-guard",
+            26,
+            QuicPathLimits::DEFAULT,
+            Some(shared.clone()),
+        )
+        .await;
+        let id = StreamId::next();
+        let udp_token = LegacyStreamToken::new();
+        shared.lock().charge(
+            InboundKey::Udp(id),
+            100,
+            0,
+            Duration::from_secs(3600),
+            Liveness::Task(Arc::downgrade(&udp_token)),
+        );
+        drop(udp_token);
+
+        // Metadata cut short: admitted and charged, never announced.
+        let mut cut = header(1, 1, id.0, 100, 50);
+        cut.extend_from_slice(&payload(20));
+        let conn = p.a_raw();
+        p.drive(raw_stream(conn, cut)).await;
+        let a = p.a.clone();
+        p.drive(async move { a.send_short(b"sync").await.unwrap() })
+            .await;
+        assert!(p.b_in.streams.try_recv().is_err(), "not announced");
+        assert_eq!(p.b.stats().count(QuicInboundOutcome::Truncated), 1);
+
+        let budget = shared.lock();
+        assert!(
+            !budget.contains(InboundKey::Quic(id)),
+            "the guard released it"
+        );
+        assert!(
+            budget.contains(InboundKey::Udp(id)),
+            "the same-numbered UDP charge is UDP code's to release"
+        );
+        assert_eq!(
+            budget.stream_count(),
+            2,
+            "the UDP charge and the sync message"
+        );
+    })
+}
+
+/// Pin: both QUIC admissions (`read_short`, `read_stream`) hold ONE guard
+/// on the budget from its first use through `check` to `charge`, as the UDP
+/// side does (`udp_admission_holds_one_budget_lock_from_check_to_charge`),
+/// so a UDP admission sharing the budget cannot take the room in between.
+/// Also pins their keys and that they release only QUIC charges.
+#[test]
+fn quic_admission_holds_one_budget_lock_from_check_to_charge() {
+    use crate::transport::peer_connection::inbound_budget::pin;
+    let source = include_str!("inbound.rs");
+    let lock = "let mut budget = self.budget.lock();";
+    let check = "if let Err(rejection) = budget.check(total, Releaser::Quic)";
+    let body = pin::fn_body(source, "async fn read_short(");
+    pin::assert_one_guard(
+        &body,
+        "read_short",
+        lock,
+        &[check, "let key = self.short_key(&budget);"],
+        "budget.charge(",
+    );
+    let body = pin::fn_body(source, "async fn read_stream(");
+    let after = pin::assert_one_guard(
+        &body,
+        "read_stream",
+        lock,
+        &[
+            "let key = InboundKey::Quic(stream_id);",
+            "budget.release_if_gone(key);",
+            "if budget.contains(key)",
+            check,
+        ],
+        "budget.charge(",
+    );
+    assert!(
+        after.trim_start().starts_with("key,"),
+        "read_stream: the charge must be under the stream's `Quic` key"
+    );
 }
