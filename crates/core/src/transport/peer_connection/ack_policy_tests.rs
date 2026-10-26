@@ -1094,8 +1094,8 @@ async fn lost_pongs_do_not_stretch_the_ping_interval_on_a_live_link() {
 }
 
 /// The handshake's connection ack always carries packet id 0, the same id as
-/// the remote's first data packet. Recording it for dedup made that data
-/// packet look like a duplicate and silently dropped it.
+/// the first data packet of a remote on an earlier release. Recording it for
+/// dedup made that data packet look like a duplicate and silently dropped it.
 #[tokio::test(start_paused = true)]
 async fn connection_ack_does_not_shadow_the_first_data_packet() {
     let mut e = single(CAPABLE);
@@ -1151,8 +1151,8 @@ fn is_connection_ack(m: &SymmetricMessage) -> bool {
 #[tokio::test(start_paused = true)]
 async fn connection_ack_exchange_is_bounded_and_clears_the_handshake_ack() {
     let (a, b) = pair(CAPABLE, CAPABLE);
-    // Production seed: A's completion ack, tracked at id 0 like
-    // `connection_handler` does, and delivered to B.
+    // A's completion ack, tracked at id 0 as a gateway on an earlier release
+    // does, and delivered to B.
     let a_ack = SymmetricMessage::ack_ok(&a.outbound_key, [0u8; 16], addr(2)).expect("ack");
     a.conn
         .remote_conn

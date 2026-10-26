@@ -583,9 +583,15 @@ peer_connection.rs. A receipt is only useful for a packet the SENDER
 tracks for retransmission:
   → Ping / Pong: never acked (every release sends them untracked).
   → AckConnection*: acked on every arrival but NOT recorded for dedup.
-    The handshake's completion ack is tracked at packet id 0 and must be
-    acked; id 0 is also the remote's first data packet, so recording it
-    would drop that packet as a duplicate. Answering a connection ack with
+    Earlier releases track a gateway's success ack at packet id 0 and need
+    the receipt; they also give their first data packet id 0, so recording
+    it would drop that packet as a duplicate. Our own data starts at
+    FIRST_DATA_PACKET_ID (1) on every path and no handshake ack is tracked
+    on a connection, because a receipt for id 0 (sent for every connection
+    ack, including a handshake ack resent across our completion) would
+    otherwise be credited to our first data packet: a false RTT sample and
+    a lost packet never retransmitted. DO NOT start data at 0 again.
+    Answering a connection ack with
     `ack_ok` happens at most ONCE per connection: the reply is itself an
     AckConnection, so answering every one loops forever between two peers.
   → ShortMessage / StreamFragment / Upgrade: acked within

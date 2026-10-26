@@ -534,8 +534,8 @@ enum ReceiptPolicy {
     /// a retransmission, i.e. our receipt was lost, so ack it again.
     Ack { reack_duplicate: bool },
     /// Ack it (every time it arrives) but do NOT record its id for dedup.
-    /// For connection acks, whose id 0 is shared with the remote's first data
-    /// packet.
+    /// For connection acks, whose id 0 an older remote also gives its first
+    /// data packet.
     AckWithoutDedup,
 }
 
@@ -553,12 +553,14 @@ enum ReceiptPolicy {
 /// - `Upgrade`: like `ShortMessage`. Its sender tracks it for retransmission,
 ///   so it is acked, recorded for dedup (a retransmitted offer is not
 ///   processed twice) and re-acked on duplicate.
-/// - `AckConnection*`: acked WITHOUT dedup recording. The handshake's
-///   completion ack is TRACKED by its sender (`report_sent_packet` at
-///   `FIRST_PACKET_ID` in `connection_handler.rs`) and retransmitted until a
-///   receipt for id 0 arrives, so it must be acked. But id 0 is also the id of
-///   the remote's first data packet, so recording it for dedup would make that
-///   packet look like a duplicate and drop it. Replying to a connection ack is
+/// - `AckConnection*`: acked WITHOUT dedup recording. A gateway on an
+///   earlier release TRACKS its success ack at `FIRST_PACKET_ID` on the
+///   connection and retransmits it until a receipt for id 0 arrives, so it
+///   must be acked. Such a remote also gives its first data packet id 0, so
+///   recording the ack for dedup would make that packet look like a duplicate
+///   and drop it. (This release tracks no handshake ack on a connection and
+///   starts data at `FIRST_DATA_PACKET_ID`, 1, so the receipts this sends for
+///   id 0 cannot be credited to its own data.) Replying to a connection ack is
 ///   separately limited to once per connection (`answered_connection_ack`).
 fn receipt_policy(payload: &SymmetricMessagePayload, ack_remote_noops: bool) -> ReceiptPolicy {
     match payload {
