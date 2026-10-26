@@ -301,10 +301,16 @@ pub(crate) struct NetworkEfficiencyV1 {
     /// every hosted contract and then restricted to eviction-eligible ones.
     pub cost_ba: [[u64; STATE_SIZE_BUCKET_COUNT]; 3],
     pub cost_be: [[u64; STATE_SIZE_BUCKET_COUNT]; 3],
-    /// Local telemetry pipeline totals in the order documented where populated.
-    /// Grew from 15 to 16 entries in #6001 (periodic admitted, appended last)
-    /// while the schema stayed `v: 1`; positions 5, 7 and 8 read 0 from then
-    /// on, because the shadow sub-budget they counted was removed.
+    /// Local telemetry pipeline totals, in the order of
+    /// `TelemetryLocalMetricsSnapshot::network_efficiency_rows`. Grew from 15
+    /// to 16 entries in #6001 (periodic admitted, appended last) while the
+    /// schema stayed `v: 1`, because no consumer reading these positions was
+    /// found. From #6001 on, positions 5, 7 and 8 read 0 (the shadow
+    /// sub-budget they counted was removed), and position 4 (operational
+    /// admitted) no longer includes `transport_snapshot`,
+    /// `resource_utilization`, `router_snapshot`, `interest_heartbeat_cycle`
+    /// or `subscription_health_snapshot`, which moved to position 15. Read
+    /// pre- and post-#6001 series separately.
     pub tel: [u64; 16],
     /// Per known shadow rollup: generated/enqueue attempts, enqueue full,
     /// enqueue closed, rate-limit admitted, aggregate-limit drop,
@@ -319,7 +325,11 @@ pub(crate) struct NetworkEfficiencyV1 {
     /// Per event type, lifetime `[admitted, dropped]` at the node's
     /// per-second telemetry rate limiter, in
     /// `tracing::telemetry::KNOWN_EVENT_TYPES` order (#6001). Exactly that
-    /// many rows; the last is `other`, which should stay 0. A `Vec` only
+    /// many rows; the last is `other`, which should stay 0. Counts only
+    /// events that reached the worker: channel-full drops before it are
+    /// `tel[2]`, not per type. The admitted column does not reconcile with
+    /// `tel[4] + tel[15]` alone: the `router_snapshot` row also counts the
+    /// snapshots carrying this block, whose admissions are `eff[3]`. A `Vec` only
     /// because serde does not implement arrays longer than 32. Added so the
     /// mix of event types a node offers, and which ones the cap drops, can be
     /// measured instead of inferred from the aggregate `tel` counts.

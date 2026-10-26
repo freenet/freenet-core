@@ -2003,6 +2003,10 @@ impl Ring {
     async fn emit_router_snapshot_telemetry(ring: Arc<Self>, interval_duration: Duration) {
         let shutdown = ring.shutdown_token();
         let mut interval = tokio::time::interval(interval_duration);
+        // `Delay`, not tokio's default `Burst`: `router_snapshot` bypasses the
+        // telemetry rate limit (#6001), so a stall must not release a burst of
+        // catch-up ticks.
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         // Skip the first immediate tick
         interval.tick().await;
 
@@ -2607,9 +2611,11 @@ impl Ring {
                 let lifecycle = op_manager.interest_manager.interest_lifecycle_snapshot();
                 // SHADOW MODE: futile-repair evidence (#nc-merge). Rides the
                 // same fixed-cardinality block for the same reason the rest of
-                // it does — `network_efficiency_v1` is the only family that
-                // bypasses both the node rate limiter and the collector's 5%
-                // sampler, so a rare-but-decisive counter is not sampled away.
+                // it does: `network_efficiency_v1` has a reserved channel and
+                // buffer slot and bypasses both the node rate limiter and the
+                // collector's 5% sampler, so a rare-but-decisive counter is not
+                // sampled away. (Since #6001 the periodic event types also
+                // bypass the node rate limiter, but without the reserved path.)
                 let futile_repair = op_manager.interest_manager.futile_repair_snapshot();
                 let receiver = op_manager.payload_mix.receiver_apply_stats();
                 let queue = crate::node::BROADCAST_QUEUE_EFFICIENCY_METRICS.snapshot();
@@ -2652,45 +2658,10 @@ impl Ring {
                     })
                 });
 
-                // Positions 5, 7 and 8 were the shadow sub-budget's admitted,
-                // aggregate-drop and sub-budget-drop counts. #6001 replaced
-                // that priority with the periodic bypass, so they stay 0 to
-                // keep every later position where readers expect it, and the
-                // periodic admitted count is appended at 15.
-                let tel = [
-                    telemetry.enqueue_attempts_total,
-                    telemetry.enqueue_succeeded_total,
-                    telemetry.enqueue_dropped_full_total,
-                    telemetry.enqueue_dropped_closed_total,
-                    telemetry.rate_limit_admitted_operational_total,
-                    0,
-                    telemetry.dropped_aggregate_limit_operational_total,
-                    0,
-                    0,
-                    telemetry.dropped_backoff_buffer_full_total,
-                    telemetry.batch_send_attempts_total,
-                    telemetry.batch_send_successes_total,
-                    telemetry.batch_send_failures_total,
-                    telemetry.batch_events_sent_total,
-                    telemetry.batch_retry_truncated_events_total,
-                    telemetry.rate_limit_admitted_periodic_total,
-                ];
-                // Columns 4 and 5 (aggregate-limit and shadow-subbudget
-                // drops) are 0 since #6001 for the same reason.
-                let shadow = std::array::from_fn(|index| {
-                    let stream = telemetry.known_shadow_rollups[index];
-                    [
-                        stream.enqueue_attempts_total,
-                        stream.enqueue_dropped_full_total,
-                        stream.enqueue_dropped_closed_total,
-                        stream.rate_limit_admitted_total,
-                        0,
-                        0,
-                        stream.dropped_backoff_buffer_full_total,
-                        stream.retry_truncated_total,
-                        stream.sent_total,
-                    ]
-                });
+                // Position layout, including the slots #6001 retired and the
+                // `tel[4]` meaning shift, is documented on
+                // `TelemetryLocalMetricsSnapshot::network_efficiency_rows`.
+                let telemetry_rows = telemetry.network_efficiency_rows();
 
                 snapshot.network_efficiency_v1 = Some(crate::router::NetworkEfficiencyV1 {
                     v: 1,
@@ -2749,10 +2720,10 @@ impl Ring {
                     cost,
                     cost_ba: cost_bucket_any,
                     cost_be: cost_bucket_eligible,
-                    tel,
-                    shadow,
-                    eff: telemetry.network_efficiency_delivery,
-                    tel_t: telemetry.event_type_admissions,
+                    tel: telemetry_rows.tel,
+                    shadow: telemetry_rows.shadow,
+                    eff: telemetry_rows.eff,
+                    tel_t: telemetry_rows.tel_t,
                     // Hosting observability (#4642): WHY this peer began hosting
                     // each contract, and the two demand-signal gauges the
                     // eviction ranking is built on. `hosting` is the same
@@ -11059,6 +11030,12 @@ mod hosting_observability_wiring_pin {
             ("host_begin", "hosting.hosting_begins"),
             ("host_reads", "hosting.read_count_hist"),
             ("host_recency", "hosting.genuine_access_recency"),
+            // #6001: the telemetry rows, built and position-tested by
+            // `TelemetryLocalMetricsSnapshot::network_efficiency_rows`.
+            ("tel", "telemetry_rows.tel"),
+            ("shadow", "telemetry_rows.shadow"),
+            ("eff", "telemetry_rows.eff"),
+            ("tel_t", "telemetry_rows.tel_t"),
         ] {
             let needle = format!("{field}: {source_expr},");
             assert!(

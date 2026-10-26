@@ -159,7 +159,74 @@ pub(crate) struct TelemetryLocalMetricsSnapshot {
     /// Per event type, in [`KNOWN_EVENT_TYPES`] order: `[admitted, dropped]`
     /// at the per-second rate limiter. Always exactly
     /// `KNOWN_EVENT_TYPES.len()` rows, so the exported cardinality is fixed.
+    /// Counts only events that reached the worker; channel-full drops before
+    /// it are in `enqueue_dropped_full_total`, not per type.
     pub event_type_admissions: Vec<[u64; 2]>,
+}
+
+/// The telemetry rows of `network_efficiency_v1` (`tel`, `shadow`, `eff`,
+/// `tel_t`), built in one place so the positions are unit-testable.
+pub(crate) struct NetworkEfficiencyTelemetryRows {
+    pub tel: [u64; 16],
+    pub shadow: [[u64; 9]; KnownShadowRollup::ALL.len()],
+    pub eff: [u64; 8],
+    pub tel_t: Vec<[u64; 2]>,
+}
+
+impl TelemetryLocalMetricsSnapshot {
+    /// Lay these totals out as the `network_efficiency_v1` rows.
+    ///
+    /// `tel` positions 5, 7 and 8 were the shadow sub-budget's admitted,
+    /// aggregate-drop and sub-budget-drop counts, and `shadow` columns 4 and 5
+    /// its aggregate-limit and sub-budget drops. #6001 replaced that priority
+    /// with the periodic bypass, so they are always 0, kept so every later
+    /// position stays where readers expect it. The periodic admitted count is
+    /// appended as `tel` position 15.
+    ///
+    /// `tel` position 4 (operational admitted) also changed meaning at #6001:
+    /// before it, it included `transport_snapshot`, `resource_utilization`,
+    /// `router_snapshot` (without the diagnostic block),
+    /// `interest_heartbeat_cycle` and `subscription_health_snapshot`, which now
+    /// count in position 15. Read pre- and post-#6001 series separately. The
+    /// schema stays `v: 1`: no consumer reading these positions was found when
+    /// this changed.
+    pub(crate) fn network_efficiency_rows(self) -> NetworkEfficiencyTelemetryRows {
+        NetworkEfficiencyTelemetryRows {
+            tel: [
+                self.enqueue_attempts_total,
+                self.enqueue_succeeded_total,
+                self.enqueue_dropped_full_total,
+                self.enqueue_dropped_closed_total,
+                self.rate_limit_admitted_operational_total,
+                0,
+                self.dropped_aggregate_limit_operational_total,
+                0,
+                0,
+                self.dropped_backoff_buffer_full_total,
+                self.batch_send_attempts_total,
+                self.batch_send_successes_total,
+                self.batch_send_failures_total,
+                self.batch_events_sent_total,
+                self.batch_retry_truncated_events_total,
+                self.rate_limit_admitted_periodic_total,
+            ],
+            shadow: self.known_shadow_rollups.map(|stream| {
+                [
+                    stream.enqueue_attempts_total,
+                    stream.enqueue_dropped_full_total,
+                    stream.enqueue_dropped_closed_total,
+                    stream.rate_limit_admitted_total,
+                    0,
+                    0,
+                    stream.dropped_backoff_buffer_full_total,
+                    stream.retry_truncated_total,
+                    stream.sent_total,
+                ]
+            }),
+            eff: self.network_efficiency_delivery,
+            tel_t: self.event_type_admissions,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -360,6 +427,12 @@ pub enum EventPriority {
     /// only by [`TelemetryReporter::send_event`], never exposed to standalone
     /// event producers.
     NetworkEfficiency,
+    /// Replaced by [`Self::Periodic`] in #6001, which removed the shadow
+    /// sub-budget. Kept so code naming it still compiles. The limiter treats
+    /// it exactly like `Periodic`: it bypasses the cap only for a type listed
+    /// in [`PERIODIC_EVENT_TYPES`], and is operational otherwise.
+    #[deprecated(note = "the shadow sub-budget was removed in #6001; use `Periodic`")]
+    Shadow,
 }
 
 /// Event types emitted once per tick of a fixed node-level timer, which
@@ -381,11 +454,12 @@ pub enum EventPriority {
 /// - `subscription_health_snapshot`: one per `INTEREST_SWEEP_INTERVAL`
 ///   (1 min) pass of the interest sweep.
 ///
-/// Together that is about 0.4 events/s per node. Do NOT add an event emitted
-/// per operation, per peer, per contract or per subscription: only a fixed
-/// timer makes bypassing the cap safe. `subscription_state`, for example, is
-/// on a timer but emits one event per active subscription, so it stays
-/// operational.
+/// Together that is about 0.27 events/s per node at the default 30 s
+/// transport-snapshot interval with both opt-in shadow streams on, and about
+/// 0.34 at the 10 s minimum. Do NOT add an event emitted per operation, per
+/// peer, per contract or per subscription: only a fixed timer makes bypassing
+/// the cap safe. `interest_expired`, for example, is emitted from the 1-minute
+/// interest sweep but once per expired interest, so it stays operational.
 pub(crate) const PERIODIC_EVENT_TYPES: [&str; 12] = [
     "transport_snapshot",
     "resource_utilization",
@@ -547,17 +621,42 @@ pub fn send_standalone_event_with_peer_id(
     send_standalone_event_inner(event_type, peer_id, event_data);
 }
 
+/// Send a standalone telemetry event tagged with the local node's peer id.
+///
+/// Before #6001 this admitted the event under the shadow sub-budget. That
+/// budget is gone: the priority now follows from the event type, exactly as
+/// in [`send_standalone_event_with_peer_id`], which this forwards to.
+#[deprecated(note = "use `send_standalone_event_with_peer_id`; the priority \
+                     now follows from the event type (#6001)")]
+pub fn send_standalone_shadow_event_with_peer_id(
+    event_type: &str,
+    peer_id: &str,
+    event_data: serde_json::Value,
+) {
+    send_standalone_event_with_peer_id(event_type, peer_id, event_data);
+}
+
 fn send_standalone_event_inner(event_type: &str, peer_id: &str, event_data: serde_json::Value) {
     if let Some(channel) = TELEMETRY_SENDER.get() {
-        let event = TelemetryEvent {
-            timestamp: current_timestamp_ms(),
-            peer_id: peer_id.to_string(),
-            transaction_id: String::new(),
-            event_type: event_type.to_string(),
-            event_data,
-            priority: priority_for_event_type(event_type),
-        };
+        let event = standalone_event(event_type, peer_id, event_data);
         try_enqueue_event(&channel.sender, &channel.metrics, event);
+    }
+}
+
+/// Build a standalone event. Separate from the global-sender lookup so the
+/// priority it assigns is testable without initializing process-global state.
+fn standalone_event(
+    event_type: &str,
+    peer_id: &str,
+    event_data: serde_json::Value,
+) -> TelemetryEvent {
+    TelemetryEvent {
+        timestamp: current_timestamp_ms(),
+        peer_id: peer_id.to_string(),
+        transaction_id: String::new(),
+        event_type: event_type.to_string(),
+        event_data,
+        priority: priority_for_event_type(event_type),
     }
 }
 
@@ -1193,6 +1292,10 @@ impl TelemetryWorker {
 
     async fn run(mut self) {
         let mut batch_interval = tokio::time::interval(Duration::from_secs(BATCH_INTERVAL_SECS));
+        // `Delay`, not tokio's default `Burst`: after a stall, Burst fires
+        // every missed tick at once, and the ticks emit periodic events,
+        // which bypass the rate limit (#6001).
+        batch_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
         // Transport snapshots are optional (disabled if interval is 0)
         // Clamp to minimum to prevent spamming telemetry server
@@ -1211,6 +1314,9 @@ impl TelemetryWorker {
         };
         let mut transport_snapshot_interval =
             tokio::time::interval(Duration::from_secs(snapshot_interval_secs));
+        // Same reason as `batch_interval`.
+        transport_snapshot_interval
+            .set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
         loop {
             crate::deterministic_select! {
@@ -1318,14 +1424,18 @@ impl TelemetryWorker {
             self.events_this_second = 0;
         }
 
-        let bypasses_cap = match priority {
-            EventPriority::NetworkEfficiency => true,
-            EventPriority::Periodic => is_periodic_event_type(event_type),
-            EventPriority::Operational => false,
+        #[allow(deprecated)] // `Shadow` is handled as `Periodic`.
+        let (bypasses_cap, is_periodic) = match priority {
+            EventPriority::NetworkEfficiency => (true, false),
+            EventPriority::Periodic | EventPriority::Shadow => {
+                let listed = is_periodic_event_type(event_type);
+                (listed, listed)
+            }
+            EventPriority::Operational => (false, false),
         };
 
         if bypasses_cap {
-            if priority == EventPriority::Periodic {
+            if is_periodic {
                 self.metrics
                     .rate_limit_admitted_periodic_total
                     .fetch_add(1, Ordering::Relaxed);
@@ -4452,9 +4562,9 @@ mod tests {
     /// The hosting-observability rows must survive SERIALIZATION into the
     /// `router_snapshot` body, not merely exist as struct fields.
     ///
-    /// `network_efficiency_v1` is the only telemetry family that bypasses both
-    /// the node-side rate limiter (which drops ~69-77% of operational events,
-    /// load-proportionally) and the collector's 5% sampler, so a field that
+    /// `network_efficiency_v1` is the only telemetry family with a reserved
+    /// channel and buffer slot that also bypasses the node-side rate limiter
+    /// and the collector's 5% sampler, so a field that
     /// silently fails to serialize is not "degraded" — it is absent, with no
     /// second path to notice by. Each row is given a DISTINCT value so a
     /// transposed assignment (`host_reads` fed from `host_recency`, say) fails
@@ -6419,6 +6529,162 @@ mod tests {
         );
     }
 
+    /// Drive the real `register_events` -> `send_event` path and return the
+    /// event it queued on the ordinary channel.
+    async fn queued_by_register_events(kind: EventKind) -> TelemetryEvent {
+        let (sender, mut receiver) = mpsc::channel(4);
+        let (network_efficiency_sender, _network_efficiency_receiver) = mpsc::channel(1);
+        let reporter = TelemetryReporter {
+            sender,
+            network_efficiency_sender,
+            metrics: Arc::new(TelemetryLocalMetrics::default()),
+            local_peer_id: "test-peer".to_string(),
+        };
+        reporter
+            .register_events(Either::Left(NetEventLog {
+                tx: Transaction::NULL,
+                peer_id: crate::node::PeerId::random(),
+                kind,
+            }))
+            .await;
+        let Ok(TelemetryCommand::Event(event)) = receiver.try_recv() else {
+            panic!("register_events must queue the event on the ordinary channel");
+        };
+        event
+    }
+
+    #[tokio::test]
+    async fn test_register_events_queues_router_snapshot_as_periodic() {
+        // #6001: `register_events` is how `router_snapshot` reaches the
+        // worker. Building it as Operational is the regression this PR fixes.
+        use arbitrary::Arbitrary;
+        let mut u = arbitrary::Unstructured::new(&[0_u8; 32_768]);
+        let mut info = crate::router::RouterSnapshotInfo::arbitrary(&mut u)
+            .expect("construct RouterSnapshotInfo for test");
+        info.network_efficiency_v1 = None;
+        let event = queued_by_register_events(EventKind::RouterSnapshot(Box::new(info))).await;
+        assert_eq!(event.event_type, "router_snapshot");
+        assert_eq!(event.priority, EventPriority::Periodic);
+
+        // And an operation event from the same path stays under the cap.
+        let event = queued_by_register_events(EventKind::Ignored).await;
+        assert_eq!(event.event_type, "ignored");
+        assert_eq!(event.priority, EventPriority::Operational);
+    }
+
+    #[test]
+    fn test_standalone_events_get_their_priority_from_the_type() {
+        // `send_standalone_event*` is how the shadow rollups, the message
+        // mixes, `interest_heartbeat_cycle` and `subscription_health_snapshot`
+        // reach the worker.
+        for event_type in EXPECTED_PERIODIC_EVENT_TYPES {
+            let event = standalone_event(event_type, "peer", serde_json::json!({}));
+            assert_eq!(
+                event.priority,
+                EventPriority::Periodic,
+                "standalone `{event_type}`"
+            );
+        }
+        for event_type in ["interest_expired", "stranded_recovery"] {
+            let event = standalone_event(event_type, "peer", serde_json::json!({}));
+            assert_eq!(
+                event.priority,
+                EventPriority::Operational,
+                "standalone `{event_type}`"
+            );
+        }
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn test_deprecated_shadow_priority_behaves_like_periodic() {
+        // Kept for API compatibility (#6001): listed types bypass the cap,
+        // anything else is operational.
+        let mut worker = rate_limit_test_worker();
+        let now = Instant::now();
+        saturate_with_operational(&mut worker, now);
+        assert!(worker.admit_event(EventPriority::Shadow, "shadow_rtt_aggregate", now));
+        assert!(!worker.admit_event(EventPriority::Shadow, "get_request", now));
+        assert_eq!(
+            worker.metrics.snapshot().rate_limit_admitted_periodic_total,
+            1
+        );
+    }
+
+    #[test]
+    fn test_network_efficiency_rows_place_every_counter_and_zero_the_retired_slots() {
+        // Distinct non-zero values everywhere, so a counter in the wrong
+        // position, a dropped one, or a retired slot that stops being 0 fails.
+        let metrics = TelemetryLocalMetricsSnapshot {
+            enqueue_attempts_total: 1,
+            enqueue_succeeded_total: 2,
+            enqueue_dropped_full_total: 3,
+            enqueue_dropped_closed_total: 4,
+            rate_limit_admitted_operational_total: 5,
+            rate_limit_admitted_periodic_total: 6,
+            dropped_aggregate_limit_operational_total: 7,
+            dropped_backoff_buffer_full_total: 8,
+            batch_send_attempts_total: 9,
+            batch_send_successes_total: 10,
+            batch_send_failures_total: 11,
+            batch_events_sent_total: 12,
+            batch_retry_truncated_events_total: 13,
+            known_shadow_rollups: std::array::from_fn(|stream| {
+                let base = 100 * (stream as u64 + 1);
+                KnownShadowRollupMetricsSnapshot {
+                    event_type: KnownShadowRollup::ALL[stream].as_str(),
+                    enqueue_attempts_total: base + 1,
+                    enqueue_dropped_full_total: base + 2,
+                    enqueue_dropped_closed_total: base + 3,
+                    rate_limit_admitted_total: base + 4,
+                    dropped_backoff_buffer_full_total: base + 5,
+                    retry_truncated_total: base + 6,
+                    sent_total: base + 7,
+                }
+            }),
+            network_efficiency_delivery: [21, 22, 23, 24, 25, 26, 27, 28],
+            event_type_admissions: (0..KNOWN_EVENT_TYPES.len() as u64)
+                .map(|row| [1_000 + row, 2_000 + row])
+                .collect(),
+        };
+
+        let rows = metrics.network_efficiency_rows();
+        assert_eq!(
+            rows.tel,
+            [1, 2, 3, 4, 5, 0, 7, 0, 0, 8, 9, 10, 11, 12, 13, 6],
+            "tel positions; 5, 7 and 8 are retired and must stay 0, the \
+             periodic admitted count is position 15"
+        );
+        for (stream, row) in rows.shadow.iter().enumerate() {
+            let base = 100 * (stream as u64 + 1);
+            assert_eq!(
+                *row,
+                [
+                    base + 1,
+                    base + 2,
+                    base + 3,
+                    base + 4,
+                    0,
+                    0,
+                    base + 5,
+                    base + 6,
+                    base + 7
+                ],
+                "shadow row {stream}; columns 4 and 5 are retired and must stay 0"
+            );
+        }
+        assert_eq!(rows.eff, [21, 22, 23, 24, 25, 26, 27, 28]);
+        assert_eq!(rows.tel_t.len(), KNOWN_EVENT_TYPES.len());
+        assert_eq!(rows.tel_t[0], [1_000, 2_000]);
+        assert_eq!(
+            rows.tel_t[OTHER_EVENT_TYPE_INDEX],
+            [
+                1_000 + OTHER_EVENT_TYPE_INDEX as u64,
+                2_000 + OTHER_EVENT_TYPE_INDEX as u64
+            ]
+        );
+    }
+
     #[test]
     fn test_periodic_priority_on_an_unlisted_type_is_capped() {
         // The bypass is bounded by the fixed list, not by whoever sets the
@@ -6550,9 +6816,15 @@ mod tests {
                 Some(&chunk[chunk.rfind('"')? + 1..])
             })
             .collect();
-        assert!(
-            names.len() >= 50,
-            "found only {} names; the scrape no longer matches the function",
+        // Exact, so a scrape that silently stops matching some arms fails
+        // here. Adding or removing an `event_kind_to_string` arm changes this
+        // count: bump it deliberately, together with `KNOWN_EVENT_TYPES`.
+        const EXPECTED_NET_EVENT_NAMES: usize = 57;
+        assert_eq!(
+            names.len(),
+            EXPECTED_NET_EVENT_NAMES,
+            "event_kind_to_string scrape found {} names; if you added or removed \
+             an arm, bump EXPECTED_NET_EVENT_NAMES and KNOWN_EVENT_TYPES",
             names.len()
         );
         for name in names {
@@ -6607,6 +6879,11 @@ mod tests {
                             .chars()
                             .take_while(|c| c.is_alphanumeric() || *c == '_')
                             .collect();
+                        // This file's own forwarding wrappers pass the caller's
+                        // `event_type` through.
+                        if file.ends_with("tracing/telemetry.rs") && ident == "event_type" {
+                            continue;
+                        }
                         assert_eq!(
                             ident,
                             "FLAG_TELEMETRY_EVENT",
@@ -6618,9 +6895,15 @@ mod tests {
                 }
             }
         }
-        assert!(
-            literal_names.len() >= 10,
-            "found only {} producers; the scan no longer matches",
+        // Exact count of call sites with a literal event type (production and
+        // test). A new producer changes it: bump it deliberately after giving
+        // the event its own `KNOWN_EVENT_TYPES` row.
+        const EXPECTED_LITERAL_STANDALONE_CALLS: usize = 16;
+        assert_eq!(
+            literal_names.len(),
+            EXPECTED_LITERAL_STANDALONE_CALLS,
+            "found {} literal send_standalone_event* calls; if you added or \
+             removed one, bump EXPECTED_LITERAL_STANDALONE_CALLS",
             literal_names.len()
         );
         for (file, name) in literal_names {
