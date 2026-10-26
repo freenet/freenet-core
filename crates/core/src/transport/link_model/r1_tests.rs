@@ -745,8 +745,20 @@ fn describe(p: &CongestionProbe) -> String {
 }
 
 fn gate(sc: &'static Scenario, algorithm: CongestionControlAlgorithm) {
-    let reports: Vec<Report> = seeds().into_iter().map(|s| run(sc, algorithm, s)).collect();
+    let mut reports = Vec::new();
     let mut failed = Vec::new();
+    for seed in seeds() {
+        // A panic (a connect that fails, a corrupted payload) fails its seed
+        // by name and the other seeds still run, instead of ending the test
+        // before its verdict with no seed to rerun.
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(sc, algorithm, seed))) {
+            Ok(report) => reports.push(report),
+            Err(payload) => failed.push(format!(
+                "seed {seed:#x}: panicked: {}",
+                panic_message(payload.as_ref())
+            )),
+        }
+    }
     for r in &reports {
         let margin = r
             .ratio(sc)
@@ -804,6 +816,14 @@ fn gate(sc: &'static Scenario, algorithm: CongestionControlAlgorithm) {
         sc.name,
         failed.join("\n  ")
     );
+}
+
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    payload
+        .downcast_ref::<String>()
+        .cloned()
+        .or_else(|| payload.downcast_ref::<&str>().map(|s| s.to_string()))
+        .unwrap_or_else(|| "(not a string)".into())
 }
 
 /// Same seed, same run: compares every field of the report, including a hash
