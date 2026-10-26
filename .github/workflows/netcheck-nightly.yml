@@ -11,16 +11,18 @@ name: Netcheck (Nightly)
 #   publish (self-hosted) sends the report to the collector on the gateway
 #           host's loopback.
 #
-# Why the getter is not on the gateway host: a node's ring location is derived
-# from its address with the host bits masked, so a getter there shares the
-# gateways' location (and that of every other node on that /24), and those
-# peers will not accept a joiner at their own location. From 2026-10-16 that
-# made the getter fail to join on most nights, which measured the host, not
-# the network.
+# Why the getter is not on the gateway host: see "Production use" in
+# crates/netcheck/README.md.
 #
 # The job bodies are deliberately thin. All the logic is in
-# scripts/netcheck-nightly.sh, whose phases can be run by hand; a workflow file
-# cannot be tested before it reaches the default branch.
+# scripts/netcheck-nightly.sh, whose phases can be run by hand. A change to
+# this file can be run from its branch before merging, since the workflow is
+# on the default branch with workflow_dispatch:
+#   gh workflow run netcheck-nightly.yml --ref <branch>
+#
+# Every step that can hang has its own timeout below its job's. A step that
+# times out concludes `failure`, which notifies; a job that times out
+# concludes `cancelled`, which the notify jobs skip.
 
 on:
   schedule:
@@ -34,40 +36,46 @@ concurrency:
   group: netcheck-nightly
   cancel-in-progress: false
 
+# Read-only: `get` runs a live network peer on a hosted runner, and nothing
+# here writes to the repository.
+permissions:
+  contents: read
+
 jobs:
   put:
     name: PUT through the gateway
     runs-on: self-hosted
-    # Contract build plus four PUTs at up to 120s each. If it ever trips,
-    # something is genuinely stuck: investigate rather than raise it.
-    timeout-minutes: 30
+    timeout-minutes: 35
     outputs:
       handoff: ${{ steps.put.outputs.handoff }}
 
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       - name: Ensure the wasm target is present
         # netcheck compiles the probe contract at startup. Idempotent.
+        timeout-minutes: 5
         run: rustup target add wasm32-unknown-unknown
 
       - name: PUT this run's contracts
         id: put
-        # The script skips the night, successfully and without a handoff,
-        # when the shared disk is short. Then there is nothing to GET.
-        run: |
-          bash scripts/netcheck-nightly.sh put
-          if [ -f ~/netcheck/handoff.json ]; then
-            echo "handoff=yes" >> "$GITHUB_OUTPUT"
-          fi
+        # Contract build plus four PUTs at up to 120s each. The script reports
+        # the handoff it wrote, if any, as this step's `handoff` and
+        # `handoff_path` outputs. It writes none, successfully, when it skips
+        # the night for lack of disk; then there is nothing to GET.
+        timeout-minutes: 25
+        run: bash scripts/netcheck-nightly.sh put
 
       - name: Hand the run to the getter
         if: steps.put.outputs.handoff == 'yes'
         uses: actions/upload-artifact@v7
         with:
           name: netcheck-handoff
-          path: ~/netcheck/handoff.json
+          path: ${{ steps.put.outputs.handoff_path }}
           if-no-files-found: error
+          overwrite: true
           retention-days: 30
 
   get:
@@ -76,12 +84,12 @@ jobs:
     if: needs.put.outputs.handoff == 'yes'
     # Deliberately NOT the gateway host; see the comment at the top.
     runs-on: ubuntu-latest
-    # Build from a cold or warm cache, joining the ring, then up to ~20 GETs
-    # at 120s each in the worst case.
-    timeout-minutes: 60
+    timeout-minutes: 75
 
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -96,8 +104,9 @@ jobs:
       - name: Install the released freenet binary
         # The getter runs what the network runs: the latest release, as the
         # nova node it replaces did through auto-update.
+        timeout-minutes: 10
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ github.token }} # coalesce-exempt: read-only release download, emits no event
         run: |
           dir="$RUNNER_TEMP/freenet-release"
           mkdir -p "$dir"
@@ -112,9 +121,14 @@ jobs:
           echo "NETCHECK_FREENET_BIN=$dir/freenet" >> "$GITHUB_ENV"
 
       - name: GET through an ephemeral peer
+        # A cold build, joining the ring, then up to ~20 GETs at 120s each in
+        # the worst case.
+        timeout-minutes: 60
         env:
           # Where the handoff was downloaded to; the report lands beside it.
           NETCHECK_STATE_DIR: ${{ runner.temp }}/netcheck
+          # Keep the node's directory so its log can be uploaded below.
+          NETCHECK_KEEP_RUN_DIR: "1"
         run: bash scripts/netcheck-nightly.sh get
 
       - name: Upload the run report
@@ -126,24 +140,43 @@ jobs:
             ${{ runner.temp }}/netcheck/last-run.jsonl
             ${{ runner.temp }}/netcheck/exit-code
           if-no-files-found: warn
+          overwrite: true
+          retention-days: 30
+
+      - name: Upload the getter node's log
+        # The run report prints only the last 40 lines, and only when the
+        # join fails; a failed GET needs the whole log. Only the log: the
+        # node's directory also holds its keys.
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: netcheck-node-log
+          path: ${{ runner.temp }}/netcheck/run/node.log
+          if-no-files-found: warn
+          overwrite: true
           retention-days: 30
 
   publish:
     name: Publish the report
     needs: [put, get]
-    # Whatever the GETs found, as long as the get job ran at all. Its result
-    # does not feed the notifications: a collector that is down is not a
-    # network regression.
-    if: always() && needs.put.result == 'success' && needs.get.result != 'skipped'
+    # Whatever the GETs found, and also when the PUT phase failed, which then
+    # publishes the run it left as one that could not complete. Not on a
+    # manual cancel. Its result does not feed the notifications: a collector
+    # that is down is not a network regression.
+    if: ${{ !cancelled() }}
     runs-on: self-hosted
     timeout-minutes: 20
 
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       - name: Fetch the report
-        # A get job that died before writing one leaves nothing to publish;
-        # the script says so instead of failing here.
+        # Absent when the get job did not run or died before writing one; the
+        # script then falls back to the PUT phase's report, or says there is
+        # nothing to publish.
+        if: needs.get.result != 'skipped'
         continue-on-error: true
         uses: actions/download-artifact@v8
         with:
@@ -151,13 +184,16 @@ jobs:
           path: ${{ runner.temp }}/netcheck-report
 
       - name: Publish to the collector
+        timeout-minutes: 15
         env:
           NETCHECK_STATE_DIR: ${{ runner.temp }}/netcheck-report
           NETCHECK_OTLP_ENDPOINT: http://127.0.0.1:4318
           # Where the GETs, the measured half, ran from. Was `nova` while the
           # getter ran there, so the change of vantage shows in the series.
+          # The PUT records carry the gateway host's own name.
           NETCHECK_VANTAGE: github-hosted
-        run: bash scripts/netcheck-nightly.sh publish
+        # The PUT phase's report sits on this host, where `put` left it.
+        run: NETCHECK_PUT_REPORT="$HOME/netcheck/put-report.jsonl" bash scripts/netcheck-nightly.sh publish
 
   # Same transport as the simulation nightly: riverctl against the Freenet
   # gateway with the shared RIVER_SIGNING_KEY, so there is one set of
@@ -215,6 +251,8 @@ jobs:
     continue-on-error: true
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       - uses: ./.github/actions/river-dev-notify
         with:
           message: "🚨 Nightly netcheck failed against the live network, ${{ github.repository }}, ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"

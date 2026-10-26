@@ -140,7 +140,22 @@ The nightly (`.github/workflows/netcheck-nightly.yml`, logic in
    to **gw2**. Its stdout, the whole run's report including the PUTs, is the
    `netcheck-report` artifact.
 3. **publish**, on nova: `netcheck emit` sends that report to the collector
-   on nova's loopback, with vantage `github-hosted`.
+   on nova's loopback, with vantage `github-hosted`. The PUT records carry
+   their own vantage (nova's host name), since they ran there. When the PUT
+   phase failed, or the get job left no report, it publishes what the PUT
+   phase left instead, as a run that could not complete.
+
+What the split changes for anyone reading the series:
+
+- A "0h" GET now runs minutes after its PUT (the job handoff, a build, a
+  release download), not about 10 s after. The run line's `put_get_gap_ms`
+  says how long; `duration_ms` covers only the time spent in either phase.
+- The getter's address, and so its ring location, changes every night. The
+  run line records both (`ephemeral_addr`, `ephemeral_location`).
+- The PUTs are recorded in the manifest before the GETs run, whatever they
+  find, and a manifest that cannot be written no longer ends the night early:
+  the GETs still run, and the run fails afterwards so the gap in later
+  retention windows is not reported as a clean night.
 
 **Why the getter is not on nova.** A node's ring location is derived from
 its address with the host bits masked (a whole IPv4 /24 shares one
@@ -172,8 +187,8 @@ again, prefer it here.
 ## Local testing, fully isolated
 
 Nothing needs the live network to exercise the code path. Two local
-gateways reproduce the nova/vega topology on one machine: PUT through A,
-join the ephemeral peer through B.
+gateways reproduce the production topology (gw1 and gw2) on one machine:
+PUT through A, join the ephemeral peer through B.
 
 Terminal A, gateway that receives the PUTs:
 
