@@ -602,10 +602,9 @@ fn sample_aggregate() -> Option<RttSample> {
 /// the third-largest contributor to the #4251 / #4272 log-volume regression
 /// (~3,600 lines/hour per node), and `release_max_level_info` compiles DEBUG
 /// out of release builds entirely. The OTLP path below
-/// (`send_standalone_shadow_event_with_peer_id`) is independent of the tracing
+/// (`send_standalone_event_with_peer_id`) is independent of the tracing
 /// level, so the central-collector feed survives regardless; `local_peer_id`
-/// rides as an OTLP attribute so the collector can disaggregate per node, and
-/// the shadow variant tags the event low-priority (#4380).
+/// rides as an OTLP attribute so the collector can disaggregate per node.
 fn emit_aggregate_rollup(local_peer_id: &str, window: &RttWindow) {
     if window.samples == 0 {
         return;
@@ -630,7 +629,7 @@ fn emit_aggregate_rollup(local_peer_id: &str, window: &RttWindow) {
     // call surfaces the same numbers in the freenet telemetry
     // dashboard so the 2-4 week observation horizon is queryable
     // without manual log scraping.
-    crate::tracing::telemetry::send_standalone_shadow_event_with_peer_id(
+    crate::tracing::telemetry::send_standalone_event_with_peer_id(
         "shadow_rtt_aggregate",
         local_peer_id,
         payload,

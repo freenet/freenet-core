@@ -1563,7 +1563,7 @@ pub(crate) fn emit_payload_mix_rollup(
         &window.applies(),
         window_secs,
     );
-    crate::tracing::telemetry::send_standalone_shadow_event_with_peer_id(
+    crate::tracing::telemetry::send_standalone_event_with_peer_id(
         "broadcast_payload_mix",
         local_peer_id,
         payload.clone(),

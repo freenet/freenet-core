@@ -3465,6 +3465,12 @@ impl<T: TimeSource + Sync> InterestManager<T> {
 
         let mut interval = tokio::time::interval(INTEREST_SWEEP_INTERVAL);
         interval.tick().await; // Skip first immediate tick
+        // The sweep keeps tokio's default `Burst` (reconciliation is written
+        // around it, #5782), so passes can run back to back after a stall.
+        // `subscription_health_snapshot` bypasses the telemetry rate limit
+        // (#6001), so only its emission is bounded; every pass still sweeps.
+        let mut health_event_guard =
+            crate::tracing::telemetry::PeriodicEmissionGuard::half_of(INTEREST_SWEEP_INTERVAL);
 
         loop {
             interval.tick().await;
@@ -3495,14 +3501,16 @@ impl<T: TimeSource + Sync> InterestManager<T> {
             }
 
             // Emit periodic health snapshot
-            crate::tracing::telemetry::send_standalone_event(
-                "subscription_health_snapshot",
-                serde_json::json!({
-                    "contracts_with_interests": stats.total_contracts,
-                    "total_interest_entries": stats.total_peer_interests,
-                    "expired_this_sweep": expired.len(),
-                }),
-            );
+            if health_event_guard.should_emit(tokio::time::Instant::now()) {
+                crate::tracing::telemetry::send_standalone_event(
+                    "subscription_health_snapshot",
+                    serde_json::json!({
+                        "contracts_with_interests": stats.total_contracts,
+                        "total_interest_entries": stats.total_peer_interests,
+                        "expired_this_sweep": expired.len(),
+                    }),
+                );
+            }
         }
     }
 
