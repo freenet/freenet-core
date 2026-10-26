@@ -1737,6 +1737,11 @@ impl Ring {
 
         let mut interval = tokio::time::interval(INTEREST_HEARTBEAT_INTERVAL);
         interval.tick().await; // Skip first immediate tick
+        // The interval keeps tokio's default `Burst`, so after a stall cycles
+        // can run back to back. `interest_heartbeat_cycle` bypasses the
+        // telemetry rate limit (#6001), so its emission is bounded here.
+        let mut cycle_event_guard =
+            crate::tracing::telemetry::PeriodicEmissionGuard::half_of(INTEREST_HEARTBEAT_INTERVAL);
 
         loop {
             if sleep_or_shutdown(&shutdown, async {
@@ -1880,6 +1885,9 @@ impl Ring {
             // it the event reports fleet-wide distributions only, which is why
             // the InterestSync cost hypothesis could not be confirmed by
             // correlation and had to stay an estimate.
+            if !cycle_event_guard.should_emit(tokio::time::Instant::now()) {
+                continue;
+            }
             crate::tracing::telemetry::send_standalone_event_with_peer_id(
                 "interest_heartbeat_cycle",
                 &op_manager

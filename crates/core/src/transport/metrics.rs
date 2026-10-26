@@ -2130,7 +2130,8 @@ impl TransportMetrics {
     /// **Telemetry interaction**: `transfers_completed`, `transfers_failed`,
     /// `peak_throughput_bps`, `avg_cwnd_bytes`, `avg_rtt_us`, and
     /// `slowdowns_triggered` are period accumulators that `take_snapshot`
-    /// resets every `transport_snapshot_interval_secs` (default 30s).  Between
+    /// resets every `transport_snapshot_interval_secs` (default 30s; longer
+    /// when a slow collector delays the worker, see `take_snapshot`).  Between
     /// resets these reflect recent activity; the dashboard sees the current
     /// window, not a lifetime aggregate.
     /// `cumulative_bytes_sent/received` are never reset and reflect totals.
@@ -2218,6 +2219,13 @@ impl TransportMetrics {
     /// Take a snapshot and reset all counters.
     ///
     /// Returns `None` if there was no activity during the period.
+    ///
+    /// The period is the time since the previous call, which is NOT always
+    /// `transport_snapshot_interval_secs`. The telemetry worker's snapshot
+    /// interval uses `MissedTickBehavior::Delay` (#6001), and the same loop
+    /// awaits `flush()`, which can block on an HTTP send for up to its 30 s
+    /// timeout. A slow collector therefore stretches a window, and it is
+    /// never made up by a catch-up tick.
     pub fn take_snapshot(&self) -> Option<TransportSnapshot> {
         // Read and reset counters
         let transfers_completed = self.transfers_completed.swap(0, Ordering::Relaxed);

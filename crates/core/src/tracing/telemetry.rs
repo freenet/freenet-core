@@ -449,10 +449,19 @@ pub enum EventPriority {
 ///   aggregator task each (`shadow_reference_ping` probes a single target).
 /// - `broadcast_payload_mix`, `outbound_message_mix`: one per 60 s
 ///   `ROLLUP_WINDOW` from one aggregator task each.
-/// - `interest_heartbeat_cycle`: one per `INTEREST_HEARTBEAT_INTERVAL`
-///   (5 min) cycle of `Ring::interest_heartbeat`.
-/// - `subscription_health_snapshot`: one per `INTEREST_SWEEP_INTERVAL`
-///   (1 min) pass of the interest sweep.
+/// - `interest_heartbeat_cycle`: at most one per half
+///   `INTEREST_HEARTBEAT_INTERVAL` (2.5 min), from `Ring::interest_heartbeat`.
+/// - `subscription_health_snapshot`: at most one per half
+///   `INTEREST_SWEEP_INTERVAL` (30 s), from the interest sweep.
+///
+/// The router-snapshot interval and the worker's two intervals use
+/// `MissedTickBehavior::Delay`, so their timer is the bound even after a
+/// stall. The last two loops keep tokio's default `Burst`, which the interest
+/// sweep's reconciliation is written around (#5782), so a stall can run
+/// several passes back to back. For those two the bound is a
+/// [`PeriodicEmissionGuard`] at the producer, which skips the event when less
+/// than half its period has passed since the last one. The shadow and
+/// message-mix aggregators use `Delay` as well.
 ///
 /// Together that is about 0.27 events/s per node at the default 30 s
 /// transport-snapshot interval with both opt-in shadow streams on, and about
@@ -474,6 +483,39 @@ pub(crate) const PERIODIC_EVENT_TYPES: [&str; 12] = [
     "interest_heartbeat_cycle",
     "subscription_health_snapshot",
 ];
+
+/// Rate bound for a periodic event whose producer loop runs on a burst-mode
+/// timer (see [`PERIODIC_EVENT_TYPES`]). The loop itself keeps every tick; only
+/// the telemetry event is skipped when it would follow the previous one by
+/// less than `min_gap`.
+#[derive(Debug)]
+pub(crate) struct PeriodicEmissionGuard {
+    min_gap: Duration,
+    last_emitted: Option<Instant>,
+}
+
+impl PeriodicEmissionGuard {
+    /// `period` is the producer's timer period; events are at least half of
+    /// it apart.
+    pub(crate) fn half_of(period: Duration) -> Self {
+        Self {
+            min_gap: period / 2,
+            last_emitted: None,
+        }
+    }
+
+    /// Whether to emit at `now`. Records the emission when it returns `true`.
+    pub(crate) fn should_emit(&mut self, now: Instant) -> bool {
+        if self
+            .last_emitted
+            .is_some_and(|last| now.saturating_duration_since(last) < self.min_gap)
+        {
+            return false;
+        }
+        self.last_emitted = Some(now);
+        true
+    }
+}
 
 fn is_periodic_event_type(event_type: &str) -> bool {
     PERIODIC_EVENT_TYPES.contains(&event_type)
@@ -6686,6 +6728,83 @@ mod tests {
     }
 
     #[test]
+    fn test_periodic_emission_guard_emits_once_for_back_to_back_passes() {
+        // A burst-mode timer that fell behind runs its passes milliseconds
+        // apart. Only the first may emit; the next emission needs half the
+        // period to have passed (#6001 review).
+        let period = Duration::from_secs(60);
+        let mut guard = PeriodicEmissionGuard::half_of(period);
+        let t0 = Instant::now();
+
+        let emitted = [0, 1, 2, 5]
+            .into_iter()
+            .filter(|ms| guard.should_emit(t0 + Duration::from_millis(*ms)))
+            .count();
+        assert_eq!(emitted, 1, "back-to-back passes must emit one event");
+
+        assert!(!guard.should_emit(t0 + period / 2 - Duration::from_millis(1)));
+        assert!(
+            guard.should_emit(t0 + period / 2),
+            "half a period later emits"
+        );
+        assert!(
+            guard.should_emit(t0 + period / 2 + period),
+            "a normal tick emits"
+        );
+    }
+
+    /// Body of the `fn` whose signature starts with `signature`, from an
+    /// indented method declaration to its closing brace at the same indent.
+    fn method_body<'a>(src: &'a str, signature: &str) -> &'a str {
+        let start = src
+            .find(&format!("\n    {signature}"))
+            .unwrap_or_else(|| panic!("`{signature}` not found at method indent"));
+        let len = src[start..]
+            .find("\n    }\n")
+            .expect("method end at the same indent");
+        &src[start..start + len]
+    }
+
+    #[test]
+    fn test_burst_timer_periodic_producers_use_the_emission_guard() {
+        // The two periodic producers whose loops keep `MissedTickBehavior::Burst`
+        // must check their guard before sending, or a stall releases an
+        // uncapped burst.
+        const RING: &str = include_str!("../ring.rs");
+        const INTEREST: &str = include_str!("../ring/interest.rs");
+        for (src, signature, guard, event) in [
+            (
+                RING,
+                "async fn interest_heartbeat(",
+                "cycle_event_guard.should_emit(",
+                "\"interest_heartbeat_cycle\"",
+            ),
+            (
+                INTEREST,
+                "async fn sweep_task(",
+                "health_event_guard.should_emit(",
+                "\"subscription_health_snapshot\"",
+            ),
+        ] {
+            let body = method_body(src, signature);
+            let checked = body
+                .find(guard)
+                .unwrap_or_else(|| panic!("`{signature}` no longer calls `{guard}`"));
+            let emitted = body
+                .find(event)
+                .unwrap_or_else(|| panic!("`{signature}` no longer emits {event}"));
+            assert!(
+                checked < emitted,
+                "`{signature}` must check `{guard}` before emitting {event}"
+            );
+            assert!(
+                body.contains("PeriodicEmissionGuard::half_of("),
+                "`{signature}` must build its guard from its period"
+            );
+        }
+    }
+
+    #[test]
     fn test_periodic_priority_on_an_unlisted_type_is_capped() {
         // The bypass is bounded by the fixed list, not by whoever sets the
         // priority: anything else marked Periodic is treated as operational.
@@ -6862,6 +6981,7 @@ mod tests {
             for needle in [
                 "send_standalone_event(",
                 "send_standalone_event_with_peer_id(",
+                "send_standalone_shadow_event_with_peer_id(",
             ] {
                 for (at, _) in src.match_indices(needle) {
                     let before = &src[..at];
