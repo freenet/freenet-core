@@ -1571,7 +1571,7 @@ fn quic_admission_holds_one_budget_lock_from_check_to_charge() {
     let check = "if let Err(rejection) = budget.check(total, Releaser::Quic)";
     let body = pin::fn_body(source, "async fn read_short(");
     pin::assert_one_guard(
-        body,
+        &body,
         "read_short",
         lock,
         &[check, "let key = self.short_key(&budget);"],
@@ -1579,7 +1579,7 @@ fn quic_admission_holds_one_budget_lock_from_check_to_charge() {
     );
     let body = pin::fn_body(source, "async fn read_stream(");
     let after = pin::assert_one_guard(
-        body,
+        &body,
         "read_stream",
         lock,
         &[

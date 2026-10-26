@@ -1798,7 +1798,7 @@ fn udp_admission_holds_one_budget_lock_from_check_to_charge() {
     ] {
         let body = pin::fn_body(source, signature);
         let after = pin::assert_one_guard(
-            body,
+            &body,
             what,
             "let mut budget = shared_budget.lock();",
             &[

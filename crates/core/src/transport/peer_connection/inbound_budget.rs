@@ -593,10 +593,11 @@ fn nanos(duration: Duration) -> u64 {
 #[cfg(test)]
 pub(in crate::transport) mod pin {
     /// The body of the function whose definition starts with `signature`,
-    /// by brace matching from its first `{`, so methods work too. The
-    /// signature must occur exactly once in `src`: a second occurrence
+    /// by brace matching from its first `{`, so methods work too, with
+    /// comments stripped so a call inside a `/* .. */` block does not count.
+    /// The signature must occur exactly once in `src`: a second occurrence
     /// could be matched instead and scope the scan to the wrong function.
-    pub(in crate::transport) fn fn_body<'a>(src: &'a str, signature: &str) -> &'a str {
+    pub(in crate::transport) fn fn_body(src: &str, signature: &str) -> String {
         assert_eq!(
             src.matches(signature).count(),
             1,
@@ -614,7 +615,7 @@ pub(in crate::transport) mod pin {
                 b'}' => {
                     depth -= 1;
                     if depth == 0 {
-                        return &src[open + 1..i];
+                        return crate::contract::source_pin_util::strip_comments(&src[open + 1..i]);
                     }
                 }
                 _ => {}
