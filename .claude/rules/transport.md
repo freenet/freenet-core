@@ -1031,7 +1031,8 @@ Inbound adapter: a Stream's payload goes into an ordinary StreamHandle,
   StreamIdentity / registry are unchanged. The handle is announced
   (InboundStreamArrival, with the metadata) before the payload.
   → Before allocating: header checks, then the path's
-    InboundStreamBudget check and charge (same cost and limits as UDP).
+    InboundStreamBudget check and charge (same cost and limits as UDP;
+    one lock from check to charge).
     Short messages are charged too (a token rides with the message until
     its payload is taken). Refusal: STOP_SENDING (stop_code), counted in
     the shared InboundStreamOutcome counters, path and process-wide.
@@ -1073,13 +1074,25 @@ Inbound adapter: a Stream's payload goes into an ordinary StreamHandle,
     more bytes, and a new QUIC stream with that id carries the whole
     stream. A Stream id already held on the path is refused
     (StreamIdInUse). Dropping the path cancels streams in progress.
-Not here: dedup (e5: is_duplicate_dispatch, completed_inbound_streams),
-  export of the QUIC-only counters (per path, QuicPath::stats), and one
-  budget shared with the UDP session. The path has its own budget, so a
-  peer with both may hold twice the per-connection allowance until e5
-  resolves it (QUIC memory gate). Short-message budget keys are picked by
-  the path and could equal a UDP transport-internal id: do not share the
-  budget without separating the keys.
+One budget per peer (QUIC memory gate M3): QuicPath::with_budget charges
+  the SharedInboundBudget of the peer's UDP connection
+  (PeerConnection::inbound_budget), so a peer with both paths has ONE
+  allowance; with_limits gives a path its own budget and is for tests.
+  e5 MUST build node paths with with_budget. Charges are keyed by
+  InboundKey: Udp(StreamId), Quic(StreamId), QuicShort(u32). The same
+  numeric id on both paths is two charges; never charge, test or release
+  one path's stream under another path's variant. UDP's take_expired and
+  live_buffer_streams see only Udp keys (QUIC evicts by its own timers);
+  release_gone releases any path's gone charges, which is safe because a
+  charge goes only once its state is gone. The lock is parking_lot, never
+  held across .await, and not reentrant (do not call the handle's
+  stream_count/charged_bytes while holding lock()). UDP admission holds
+  it from check to charge, so a QUIC charge cannot take the room between.
+  With one allowance, a large UDP stream still draining can make a QUIC
+  stream refuse (BUDGET_REFUSED) where two allowances admitted it; that
+  is the intended semantics, retried like any transfer failure.
+Not here: dedup (e5: is_duplicate_dispatch, completed_inbound_streams) and
+  export of the QUIC-only counters (per path, QuicPath::stats).
 ```
 
 #### QUIC errors, close codes and liveness (`quic/error.rs`, `quic/liveness.rs`, #5940 step e4)
@@ -1303,7 +1316,7 @@ Stream length limits (streaming.rs):
   check_declared_stream_length(): 0 and > MAX_STREAM_TOTAL_BYTES are invalid
 
 Receiver: every new stream passes check_declared_stream_length() and the
-per-connection InboundStreamBudget (inbound_budget.rs) BEFORE any state is
+per-peer InboundStreamBudget (inbound_budget.rs) BEFORE any state is
 created from its declared length.
   - Limits: MAX_INBOUND_STREAMS_PER_CONNECTION streams and
     MAX_INBOUND_STREAM_BYTES_PER_CONNECTION bytes (one maximum-size
@@ -1313,8 +1326,10 @@ created from its declared length.
     its length allows. Admission (check) and the charge use the same cost.
   - Both reassembly paths hold fragments as received and assemble once on
     completion: the memory held is the fragments received.
-  - The bound is per connection; node-wide fairness is deferred to the
-    transport redesign (exception recorded in bug-prevention-patterns.md;
+  - The bound is per peer: the UDP connection's budget, shared with a QUIC
+    path to the same peer (SharedInboundBudget, keyed by InboundKey).
+    Node-wide fairness is deferred to the transport redesign (exception
+    recorded in bug-prevention-patterns.md;
     the flat constants are in executor.rs NOT_SUMMED).
   - A refused stream id is remembered (inbound_budget::RefusedStreams) until
     the age limit for its length, and its later fragments are dropped

@@ -54,6 +54,7 @@ use super::{
     token_bucket::TokenBucket,
 };
 use crate::util::time_source::InstantTimeSrc;
+use inbound_budget::InboundKey;
 
 type Result<T = (), E = TransportError> = std::result::Result<T, E>;
 
@@ -363,8 +364,10 @@ pub struct PeerConnection<S = super::UdpSocket, T: TimeSource = RealTime> {
     /// `InboundStreamOutcome` (also counted node-wide in `TRANSPORT_METRICS`).
     inbound_outcomes: [u64; super::metrics::InboundStreamOutcome::COUNT],
     /// Charges for every inbound stream holding reassembly state on this
-    /// connection, released when that state is gone.
-    inbound_budget: inbound_budget::InboundStreamBudget,
+    /// connection, released when that state is gone. Shareable with a QUIC
+    /// path to the same peer (see [`Self::inbound_budget`]), so the peer has
+    /// one allowance; this connection's charges are keyed `InboundKey::Udp`.
+    inbound_budget: inbound_budget::SharedInboundBudget,
     /// Telemetry only: recent short-message arrivals for the inbound
     /// concurrency estimate, and this connection's peak estimate in the
     /// current snapshot period (see `sample_inbound_concurrency`).
@@ -398,11 +401,13 @@ impl<S, T: TimeSource> Drop for PeerConnection<S, T> {
         // retired, too) would otherwise wait out the orphan timeout with
         // nothing accounting for them.
         if let Some(registry) = &self.inbound_stream_registry {
+            // Collected first, so the shared budget is not locked while the
+            // registry runs.
+            let live: Vec<_> = self.inbound_budget.lock().live_buffer_streams().collect();
             registry.cancel_unclaimed_streams(
                 self.remote_conn.remote_addr,
-                &mut self
-                    .inbound_budget
-                    .live_buffer_streams()
+                &mut live
+                    .into_iter()
                     .map(|(id, buffer)| (id, super::StreamIdentity::from_udp_buffer(buffer))),
             );
         }
@@ -1113,7 +1118,7 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
             completed_inbound_streams: lru::LruCache::new(COMPLETED_STREAM_MEMORY),
             legacy_tokens: HashMap::new(),
             inbound_outcomes: [0; super::metrics::InboundStreamOutcome::COUNT],
-            inbound_budget: inbound_budget::InboundStreamBudget::new(
+            inbound_budget: inbound_budget::SharedInboundBudget::new(
                 streaming::MAX_INBOUND_STREAMS_PER_CONNECTION,
                 streaming::MAX_INBOUND_STREAM_BYTES_PER_CONNECTION,
             ),
@@ -1709,7 +1714,9 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                             // dropped (eviction). Its state is gone with it.
                             self.inbound_streams.remove(&stream_id);
                             self.legacy_tokens.remove(&stream_id);
-                            self.inbound_budget.release_if_gone(stream_id);
+                            self.inbound_budget
+                                .lock()
+                                .release_if_gone(InboundKey::Udp(stream_id));
                             tracing::debug!(
                                 peer_addr = %self.remote_conn.remote_addr,
                                 stream_id = %stream_id,
@@ -1720,7 +1727,9 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                     };
                     self.inbound_streams.remove(&stream_id);
                     self.legacy_tokens.remove(&stream_id);
-                    self.inbound_budget.release_if_gone(stream_id);
+                    self.inbound_budget
+                        .lock()
+                        .release_if_gone(InboundKey::Udp(stream_id));
                     self.completed_inbound_streams.put(stream_id, ());
                     // Record inbound bytes for dashboard metrics
                     let bytes_received = msg.len() as u64;
@@ -2244,11 +2253,22 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
         Arc::clone(&self.streaming_registry)
     }
 
+    /// This connection's inbound budget, to build a QUIC path to the same
+    /// peer on (`QuicPath::with_budget`), so the peer has one reassembly
+    /// allowance across both.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(super) fn inbound_budget(&self) -> inbound_budget::SharedInboundBudget {
+        self.inbound_budget.clone()
+    }
+
     /// Decide whether a new inbound stream declaring `total_length_bytes` may
     /// get reassembly state on this connection. Runs before anything is
-    /// created for it.
-    fn admit_inbound_stream(
+    /// created for it. `budget` is this connection's budget, locked by the
+    /// caller until the stream is charged (or found not to need a charge),
+    /// so a QUIC path sharing it cannot take the room in between.
+    fn admit_inbound_stream_locked(
         &mut self,
+        budget: &mut inbound_budget::InboundStreamBudget,
         stream_id: StreamId,
         total_length_bytes: u64,
     ) -> std::result::Result<(), InboundStreamRejection> {
@@ -2266,9 +2286,21 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
         }
         streaming::check_declared_stream_length(total_length_bytes)
             .map_err(InboundStreamRejection::Length)?;
-        self.inbound_budget
+        budget
             .check(total_length_bytes)
             .map_err(InboundStreamRejection::Budget)
+    }
+
+    /// [`Self::admit_inbound_stream_locked`] with the budget locked here.
+    #[cfg(test)]
+    fn admit_inbound_stream(
+        &mut self,
+        stream_id: StreamId,
+        total_length_bytes: u64,
+    ) -> std::result::Result<(), InboundStreamRejection> {
+        let shared_budget = self.inbound_budget.clone();
+        let mut budget = shared_budget.lock();
+        self.admit_inbound_stream_locked(&mut budget, stream_id, total_length_bytes)
     }
 
     /// What `process_inbound` returns for a dropped stream fragment: nothing,
@@ -2349,13 +2381,17 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
             .last_warn_nanos
             .is_none_or(|last| now_nanos.saturating_sub(last) >= interval_nanos);
         if due {
+            let (open_streams, charged_bytes) = {
+                let budget = self.inbound_budget.lock();
+                (budget.stream_count(), budget.charged_bytes())
+            };
             tracing::warn!(
                 peer_addr = %self.remote_conn.remote_addr,
                 stream_id = %stream_id,
                 total_length_bytes,
                 ?rejection,
-                open_streams = self.inbound_budget.stream_count(),
-                charged_bytes = self.inbound_budget.charged_bytes(),
+                open_streams,
+                charged_bytes,
                 refusals_since_last_warning = self.refusal_log.suppressed,
                 "Refusing inbound stream"
             );
@@ -2402,7 +2438,9 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
             // exemption must not be refreshable by no-progress traffic.
             if matches!(push_result, Ok(true)) {
                 *last_activity_nanos = now_nanos;
-                self.inbound_budget.note_progress(stream_id, now_nanos);
+                self.inbound_budget
+                    .lock()
+                    .note_progress(InboundKey::Udp(stream_id), now_nanos);
             }
             return match push_result {
                 Ok(inserted) => {
@@ -2416,7 +2454,9 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                     // to stop processing further fragments for this stream.
                     self.streaming_handles.remove(&stream_id);
                     self.streaming_registry.remove(stream_id);
-                    self.inbound_budget.release_if_gone(stream_id);
+                    self.inbound_budget
+                        .lock()
+                        .release_if_gone(InboundKey::Udp(stream_id));
                     tracing::debug!(
                         peer_addr = %self.remote_conn.remote_addr,
                         stream_id = %stream_id,
@@ -2438,7 +2478,12 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
             };
         }
 
-        if self.inbound_budget.contains(stream_id) {
+        // Locked from the check to the charge (see
+        // `admit_inbound_stream_locked`).
+        let shared_budget = self.inbound_budget.clone();
+        let mut budget = shared_budget.lock();
+        if budget.contains(InboundKey::Udp(stream_id)) {
+            drop(budget);
             // Its handle was released (cancelled, swept or evicted) while a
             // consumer still holds the buffer; do not start it again.
             tracing::debug!(
@@ -2449,7 +2494,10 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
             );
             return false;
         }
-        if let Err(rejection) = self.admit_inbound_stream(stream_id, total_length_bytes) {
+        if let Err(rejection) =
+            self.admit_inbound_stream_locked(&mut budget, stream_id, total_length_bytes)
+        {
+            drop(budget);
             // The caller checks `closed_by_stream_refusals`.
             self.note_refused_stream(stream_id, total_length_bytes, rejection, now_nanos);
             return false;
@@ -2459,13 +2507,14 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
         let streaming_handle = self
             .streaming_registry
             .register(stream_id, total_length_bytes);
-        self.inbound_budget.charge(
-            stream_id,
+        budget.charge(
+            InboundKey::Udp(stream_id),
             total_length_bytes,
             now_nanos,
             inbound_stream_age_limit(total_length_bytes),
             inbound_budget::Liveness::Buffer(streaming_handle.buffer_weak()),
         );
+        drop(budget);
         match streaming_handle.push_fragment(fragment_number, payload) {
             Err(streaming::StreamError::Cancelled) => {
                 // Stream was already cancelled, don't register it
@@ -2477,7 +2526,9 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                 );
                 self.streaming_registry.remove(stream_id);
                 drop(streaming_handle);
-                self.inbound_budget.release_if_gone(stream_id);
+                self.inbound_budget
+                    .lock()
+                    .release_if_gone(InboundKey::Udp(stream_id));
                 return false;
             }
             Err(e) => {
@@ -2537,7 +2588,9 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
         if complete {
             self.streaming_handles.remove(&stream_id);
             self.streaming_registry.remove(stream_id);
-            self.inbound_budget.release_if_gone(stream_id);
+            self.inbound_budget
+                .lock()
+                .release_if_gone(InboundKey::Udp(stream_id));
             self.completed_inbound_streams.put(stream_id, ());
         }
     }
@@ -2549,6 +2602,7 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
         let now_nanos = self.time_source.now_nanos();
         let expired = self
             .inbound_budget
+            .lock()
             .take_expired(now_nanos, streaming_handle_idle_timeout());
         let mut evicted = Vec::with_capacity(expired.len());
         for (stream_id, reason) in &expired {
@@ -2583,7 +2637,7 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                 "Evicted stale inbound streams"
             );
         }
-        self.inbound_budget.release_gone();
+        self.inbound_budget.lock().release_gone();
         self.flush_refusal_log(now_nanos);
     }
 
@@ -2825,7 +2879,12 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                     );
                     return Ok(None);
                 }
-                if self.inbound_budget.contains(stream_id) {
+                // Locked from the check to the charge (see
+                // `admit_inbound_stream_locked`).
+                let shared_budget = self.inbound_budget.clone();
+                let mut budget = shared_budget.lock();
+                if budget.contains(InboundKey::Udp(stream_id)) {
+                    drop(budget);
                     // Its reassembly state was evicted and is still winding
                     // down; do not start it again.
                     tracing::debug!(
@@ -2836,7 +2895,10 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                     );
                     return Ok(None);
                 }
-                if let Err(rejection) = self.admit_inbound_stream(stream_id, total_length_bytes) {
+                if let Err(rejection) =
+                    self.admit_inbound_stream_locked(&mut budget, stream_id, total_length_bytes)
+                {
+                    drop(budget);
                     self.note_refused_stream(stream_id, total_length_bytes, rejection, now_nanos);
                     return self.inbound_refusal_result();
                 }
@@ -2854,6 +2916,7 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                 let mut stream = inbound_stream::InboundStream::new(total_length_bytes)
                     .with_token(Arc::clone(&token));
                 if let Some(msg) = stream.push_fragment(fragment_number, payload) {
+                    drop(budget);
                     tracing::trace!(
                         peer_addr = %self.remote_conn.remote_addr,
                         stream_id = %stream_id,
@@ -2866,13 +2929,14 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                     self.sample_inbound_concurrency(true, queued_nanos);
                     return Ok(Some(msg));
                 }
-                self.inbound_budget.charge(
-                    stream_id,
+                budget.charge(
+                    InboundKey::Udp(stream_id),
                     total_length_bytes,
                     now_nanos,
                     inbound_stream_age_limit(total_length_bytes),
                     inbound_budget::Liveness::Task(Arc::downgrade(&token)),
                 );
+                drop(budget);
                 self.sample_inbound_concurrency(false, queued_nanos);
                 let (sender, receiver) = mpsc::channel(64);
                 self.inbound_streams.insert(stream_id, sender);

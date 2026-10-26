@@ -90,7 +90,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
-use parking_lot::Mutex;
 use tokio::sync::mpsc;
 
 use super::QuicConnection;
@@ -101,7 +100,7 @@ use crate::simulation::TimeSource;
 use crate::transport::StreamId;
 use crate::transport::metrics::{InboundStreamOutcome, QuicCloseCode};
 use crate::transport::peer_connection::embeds_metadata;
-use crate::transport::peer_connection::inbound_budget::InboundStreamBudget;
+use crate::transport::peer_connection::inbound_budget::SharedInboundBudget;
 use crate::transport::peer_connection::streaming::{
     MAX_INBOUND_STREAM_BYTES_PER_CONNECTION, MAX_INBOUND_STREAMS_PER_CONNECTION, StreamError,
 };
@@ -171,8 +170,10 @@ pub(crate) const CONTROL_CHANNEL_CAPACITY: usize = 16;
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct QuicPathLimits {
     /// Inbound streams (Short and Stream) holding a budget charge at once.
+    /// Used only when the path has its own budget ([`QuicPath::with_limits`]).
     pub(crate) max_streams: usize,
-    /// Bytes of inbound budget charges at once.
+    /// Bytes of inbound budget charges at once. Used only when the path has
+    /// its own budget ([`QuicPath::with_limits`]).
     pub(crate) max_bytes: u64,
     pub(crate) short_capacity: usize,
     pub(crate) stream_capacity: usize,
@@ -381,7 +382,7 @@ pub(crate) struct QuicPath {
     stats: Arc<QuicPathStats>,
     receive: tokio::task::JoinHandle<()>,
     #[cfg(test)]
-    budget: Arc<Mutex<InboundStreamBudget>>,
+    budget: SharedInboundBudget,
 }
 
 impl std::fmt::Debug for QuicPath {
@@ -408,26 +409,39 @@ impl QuicPath {
 
     /// [`Self::new`] with given limits.
     ///
-    /// The path has its own inbound budget, sized like the UDP transport's
-    /// per-connection one. A peer with both a UDP session and a QUIC path
-    /// may therefore hold up to twice the per-connection allowance; e5 must
-    /// resolve that before QUIC carries traffic (the QUIC memory gate). Do
-    /// not hand this budget's keys to the UDP side as they are: short
-    /// messages are charged under ids this path picks (see `inbound`),
-    /// which could equal a UDP transport-internal id.
+    /// The path has its own inbound budget of `limits.max_streams` and
+    /// `limits.max_bytes`, so a peer that also has a UDP session would hold
+    /// two allowances. For tests; a node builds its paths with
+    /// [`Self::with_budget`].
     pub(crate) fn with_limits<T: TimeSource>(
         connection: QuicConnection,
         time: T,
         limits: QuicPathLimits,
     ) -> (Self, QuicInbound) {
+        let budget = SharedInboundBudget::new(limits.max_streams, limits.max_bytes);
+        Self::with_budget(connection, time, limits, budget)
+    }
+
+    /// [`Self::with_limits`], charging inbound streams to `budget` instead
+    /// of a budget of its own: pass the peer's UDP connection's
+    /// (`PeerConnection::inbound_budget`), so the peer has one reassembly
+    /// allowance across both paths (the QUIC memory gate). `budget` brings
+    /// its own limits; `limits.max_streams` and `limits.max_bytes` are not
+    /// used. The path's charges are keyed `InboundKey::Quic` and
+    /// `InboundKey::QuicShort`, so they never meet or release a UDP charge.
+    /// Two QUIC paths on one budget at once (a replacement built before the
+    /// old one is gone) share the `Quic` namespace: a stream id held by one
+    /// is refused on the other as `StreamIdInUse`.
+    pub(in crate::transport) fn with_budget<T: TimeSource>(
+        connection: QuicConnection,
+        time: T,
+        limits: QuicPathLimits,
+        budget: SharedInboundBudget,
+    ) -> (Self, QuicInbound) {
         let stats = Arc::new(QuicPathStats::new());
         let (shorts_tx, shorts) = mpsc::channel(limits.short_capacity);
         let (streams_tx, streams) = mpsc::channel(limits.stream_capacity);
         let (controls_tx, controls) = mpsc::channel(limits.control_capacity);
-        let budget = Arc::new(Mutex::new(InboundStreamBudget::new(
-            limits.max_streams,
-            limits.max_bytes,
-        )));
         #[cfg_attr(not(test), allow(unused_mut))]
         let mut receiver = inbound::Receiver::new(
             time,

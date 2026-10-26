@@ -13,7 +13,10 @@
 //!   passed `check_declared_stream_length` (in `FrameHeader::decode`) and
 //!   the stream has been charged to the path's `InboundStreamBudget`, with
 //!   the same cost (`ChargeOverhead`). Short messages are charged too: they
-//!   carry what the UDP transport sends as transport-internal streams.
+//!   carry what the UDP transport sends as transport-internal streams. The
+//!   budget may be the peer's UDP connection's own (`QuicPath::with_budget`);
+//!   charges here are keyed `InboundKey::Quic` and `InboundKey::QuicShort`,
+//!   so they never meet the UDP side's `InboundKey::Udp` ones.
 //! - A refusal is counted by reason in the shared `InboundStreamOutcome`
 //!   counters (path and process-wide) and the stream is stopped
 //!   (STOP_SENDING, [`stop_code`]), which tells the sender and discards
@@ -92,7 +95,6 @@ use std::time::Duration;
 use bytes::{Bytes, BytesMut};
 use futures::StreamExt;
 use futures::stream::FuturesUnordered;
-use parking_lot::Mutex;
 use tokio::sync::mpsc;
 
 use super::super::framing::{FrameHeader, FrameKind, HEADER_LEN, HeaderError};
@@ -101,7 +103,8 @@ use crate::simulation::TimeSource;
 use crate::transport::StreamId;
 use crate::transport::metrics::InboundStreamOutcome;
 use crate::transport::peer_connection::inbound_budget::{
-    BudgetRejection, InboundStreamBudget, LegacyStreamToken, Liveness,
+    BudgetRejection, InboundKey, InboundStreamBudget, LegacyStreamToken, Liveness,
+    SharedInboundBudget,
 };
 use crate::transport::peer_connection::streaming::{StreamError, StreamHandle};
 use crate::transport::peer_connection::streaming_buffer::FRAGMENT_PAYLOAD_SIZE;
@@ -153,7 +156,7 @@ pub(crate) struct InboundStreamArrival {
 /// Everything the receive task needs, shared by all its stream readers.
 pub(in crate::transport::quic) struct Receiver<T> {
     time: T,
-    budget: Arc<Mutex<InboundStreamBudget>>,
+    budget: SharedInboundBudget,
     stats: Arc<QuicPathStats>,
     shorts: mpsc::Sender<InboundShort>,
     streams: mpsc::Sender<InboundStreamArrival>,
@@ -168,7 +171,7 @@ pub(in crate::transport::quic) struct Receiver<T> {
 impl<T: TimeSource> Receiver<T> {
     pub(in crate::transport::quic) fn new(
         time: T,
-        budget: Arc<Mutex<InboundStreamBudget>>,
+        budget: SharedInboundBudget,
         stats: Arc<QuicPathStats>,
         shorts: mpsc::Sender<InboundShort>,
         streams: mpsc::Sender<InboundStreamArrival>,
@@ -556,8 +559,8 @@ impl Rechunker {
 /// releases the charge if no other clone is left. The reader keeps no
 /// clone of its own, so the guard's is the last one the reader holds.
 struct StreamGuard {
-    budget: Arc<Mutex<InboundStreamBudget>>,
-    key: StreamId,
+    budget: SharedInboundBudget,
+    key: InboundKey,
     handle: Option<StreamHandle>,
     token: Option<Arc<LegacyStreamToken>>,
     complete: bool,
@@ -666,13 +669,13 @@ impl<T: TimeSource> Receiver<T> {
     }
 
     /// A key for a short message's charge that no held charge uses. Short
-    /// keys have the caller-named bit clear, so they never meet a `Stream`
-    /// id (which has it set) in this path's budget.
-    fn short_key(&self, budget: &InboundStreamBudget) -> StreamId {
+    /// keys are `InboundKey::QuicShort`, so they never meet a `Stream` id of
+    /// this path or a stream id of the UDP connection sharing the budget.
+    fn short_key(&self, budget: &InboundStreamBudget) -> InboundKey {
         loop {
-            let n = self.next_short_key.fetch_add(1, Ordering::Relaxed) & 0x7FFF_FFFF;
-            let key = StreamId(n);
-            if n != 0 && !budget.contains(key) {
+            let n = self.next_short_key.fetch_add(1, Ordering::Relaxed);
+            let key = InboundKey::QuicShort(n);
+            if !budget.contains(key) {
                 return key;
             }
         }
@@ -755,8 +758,9 @@ impl<T: TimeSource> Receiver<T> {
             // A charge for this id whose state is already gone (an earlier
             // stream whose last handle was dropped after its reader ended)
             // must not refuse the id: nothing would release it otherwise.
-            budget.release_if_gone(stream_id);
-            if budget.contains(stream_id) {
+            let key = InboundKey::Quic(stream_id);
+            budget.release_if_gone(key);
+            if budget.contains(key) {
                 drop(budget);
                 self.stats.record(QuicInboundOutcome::StreamIdInUse);
                 reader.stop(stop_code::STREAM_ID_IN_USE);
@@ -771,7 +775,7 @@ impl<T: TimeSource> Receiver<T> {
             // `LockFreeStreamBuffer`); slots come as fragments arrive.
             let handle = StreamHandle::new(stream_id, total);
             budget.charge(
-                stream_id,
+                key,
                 total,
                 self.time.now_nanos(),
                 inbound_stream_age_limit(total),
@@ -783,7 +787,7 @@ impl<T: TimeSource> Receiver<T> {
         // drops it can release the charge if no consumer holds one.
         let mut guard = StreamGuard {
             budget: self.budget.clone(),
-            key: stream_id,
+            key: InboundKey::Quic(stream_id),
             handle: Some(handle),
             token: None,
             complete: false,

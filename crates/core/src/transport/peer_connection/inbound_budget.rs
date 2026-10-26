@@ -19,15 +19,21 @@
 //! charge plus its length; the charge itself lasts until the message is
 //! handed on (legacy) or its consumers let go (operations).
 //!
-//! The bound is per connection: node reassembly memory is at most the number
-//! of connections times `MAX_INBOUND_STREAM_BYTES_PER_CONNECTION`. There is
-//! no node-wide allowance; fairness between connections is left to the
-//! transport redesign.
+//! The bound is per peer: a UDP connection holds its budget through a
+//! [`SharedInboundBudget`] handle, and a QUIC path to the same peer can be
+//! built on that handle (`QuicPath::with_budget`), so both charge one
+//! allowance. Charges are keyed by [`InboundKey`], which names the path, so
+//! the same numeric stream id on both holds two separate charges. Node
+//! reassembly memory is at most the number of peers times
+//! `MAX_INBOUND_STREAM_BYTES_PER_CONNECTION`. There is no node-wide
+//! allowance; fairness between peers is left to the transport redesign.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
+
+use parking_lot::{Mutex, MutexGuard};
 
 use super::StreamId;
 use super::streaming_buffer::LockFreeStreamBuffer;
@@ -217,8 +223,51 @@ impl ChargeOverhead {
     }
 }
 
+/// What a charge is held under. The variant names the path that charged
+/// it, so charges from a UDP connection and a QUIC path sharing one budget
+/// never meet, whatever their numeric ids.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(in crate::transport) enum InboundKey {
+    /// A stream of the UDP connection, by its stream id.
+    Udp(StreamId),
+    /// A `Stream` frame of a QUIC path, by the id in its header.
+    Quic(StreamId),
+    /// A `Short` frame of a QUIC path, by a key the path picks.
+    QuicShort(u32),
+}
+
+/// One peer's [`InboundStreamBudget`], shared by its UDP connection and any
+/// QUIC path built on it. The lock is taken only in synchronous sections,
+/// never across an `.await`, and is not reentrant: do not call
+/// [`Self::stream_count`] or [`Self::charged_bytes`] while holding
+/// [`Self::lock`].
+#[derive(Clone)]
+pub(in crate::transport) struct SharedInboundBudget(Arc<Mutex<InboundStreamBudget>>);
+
+impl SharedInboundBudget {
+    pub(in crate::transport) fn new(max_streams: usize, max_bytes: u64) -> Self {
+        Self(Arc::new(Mutex::new(InboundStreamBudget::new(
+            max_streams,
+            max_bytes,
+        ))))
+    }
+
+    pub(in crate::transport) fn lock(&self) -> MutexGuard<'_, InboundStreamBudget> {
+        self.0.lock()
+    }
+
+    pub(in crate::transport) fn stream_count(&self) -> usize {
+        self.lock().stream_count()
+    }
+
+    #[cfg(test)]
+    pub(in crate::transport) fn charged_bytes(&self) -> u64 {
+        self.lock().charged_bytes()
+    }
+}
+
 pub(in crate::transport) struct InboundStreamBudget {
-    streams: HashMap<StreamId, Charge>,
+    streams: HashMap<InboundKey, Charge>,
     charged_bytes: u64,
     max_streams: usize,
     max_bytes: u64,
@@ -244,20 +293,23 @@ impl InboundStreamBudget {
         }
     }
 
-    /// Whether `stream_id` holds a charge (live, or evicted but not yet gone).
-    pub(in crate::transport) fn contains(&self, stream_id: StreamId) -> bool {
-        self.streams.contains_key(&stream_id)
+    /// Whether `key` holds a charge (live, or evicted but not yet gone).
+    pub(in crate::transport) fn contains(&self, key: InboundKey) -> bool {
+        self.streams.contains_key(&key)
     }
 
-    /// Operations streams whose buffers are still held somewhere.
+    /// The UDP connection's operations streams whose buffers are still held
+    /// somewhere.
     pub(super) fn live_buffer_streams(
         &self,
     ) -> impl Iterator<Item = (StreamId, Weak<LockFreeStreamBuffer>)> + '_ {
         self.streams
             .iter()
-            .filter_map(|(id, charge)| match &charge.liveness {
-                Liveness::Buffer(weak) if weak.strong_count() > 0 => Some((*id, weak.clone())),
-                Liveness::Buffer(_) | Liveness::Task(_) => None,
+            .filter_map(|(key, charge)| match (key, &charge.liveness) {
+                (InboundKey::Udp(id), Liveness::Buffer(weak)) if weak.strong_count() > 0 => {
+                    Some((*id, weak.clone()))
+                }
+                _ => None,
             })
     }
 
@@ -283,7 +335,7 @@ impl InboundStreamBudget {
         Ok(())
     }
 
-    /// Whether a new stream declaring `declared` bytes fits this connection's
+    /// Whether a new stream declaring `declared` bytes fits this peer's
     /// limits (with its overhead; see [`ChargeOverhead`]). Releases the
     /// charges of streams whose state is already gone before refusing.
     pub(in crate::transport) fn check(&mut self, declared: u64) -> Result<(), BudgetRejection> {
@@ -296,19 +348,20 @@ impl InboundStreamBudget {
     }
 
     /// Charge a newly admitted stream declaring `declared` bytes (plus its
-    /// overhead). Call only after `check` succeeded.
+    /// overhead). Call only after `check` succeeded, under the same lock
+    /// when the budget is shared (another path could take the room between).
     pub(in crate::transport) fn charge(
         &mut self,
-        stream_id: StreamId,
+        key: InboundKey,
         declared: u64,
         now_nanos: u64,
         max_age: Duration,
         liveness: Liveness,
     ) {
-        debug_assert!(!self.streams.contains_key(&stream_id));
+        debug_assert!(!self.streams.contains_key(&key));
         let bytes = self.overhead.cost(declared);
         let previous = self.streams.insert(
-            stream_id,
+            key,
             Charge {
                 bytes,
                 admitted_nanos: now_nanos,
@@ -325,29 +378,30 @@ impl InboundStreamBudget {
         self.charged_bytes += bytes;
     }
 
-    /// Record that `stream_id` received new data.
-    pub(in crate::transport) fn note_progress(&mut self, stream_id: StreamId, now_nanos: u64) {
-        if let Some(charge) = self.streams.get_mut(&stream_id) {
+    /// Record that `key` received new data.
+    pub(in crate::transport) fn note_progress(&mut self, key: InboundKey, now_nanos: u64) {
+        if let Some(charge) = self.streams.get_mut(&key) {
             charge.last_progress_nanos = now_nanos;
         }
     }
 
-    /// Release `stream_id`'s charge if its state is gone. Returns whether it
-    /// was released.
-    pub(in crate::transport) fn release_if_gone(&mut self, stream_id: StreamId) -> bool {
+    /// Release `key`'s charge if its state is gone. Returns whether it was
+    /// released.
+    pub(in crate::transport) fn release_if_gone(&mut self, key: InboundKey) -> bool {
         let gone = self
             .streams
-            .get(&stream_id)
+            .get(&key)
             .is_some_and(|charge| !charge.liveness.is_alive());
         if gone {
-            if let Some(charge) = self.streams.remove(&stream_id) {
+            if let Some(charge) = self.streams.remove(&key) {
                 self.charged_bytes -= charge.bytes;
             }
         }
         gone
     }
 
-    /// Release every charge whose state is gone. Returns how many.
+    /// Release every charge whose state is gone, whichever path charged it.
+    /// Returns how many.
     pub(in crate::transport) fn release_gone(&mut self) -> usize {
         let mut released = 0;
         let mut freed = 0;
@@ -363,10 +417,12 @@ impl InboundStreamBudget {
         released
     }
 
-    /// Streams to evict, with the reason: incomplete streams idle (no new
-    /// data) for longer than `idle`, or admitted longer ago than their own
-    /// age limit, whatever their traffic. Complete streams are never evicted
-    /// (only their consumers still hold them).
+    /// The UDP connection's streams to evict, with the reason: incomplete
+    /// streams idle (no new data) for longer than `idle`, or admitted longer
+    /// ago than their own age limit, whatever their traffic. Complete streams
+    /// are never evicted (only their consumers still hold them). Charges of
+    /// a QUIC path are left alone: the path evicts its own streams by a timer
+    /// per stream.
     ///
     /// A legacy stream whose task reports holding more bytes than ever before
     /// has made progress as of `now_nanos` (its task, not the connection,
@@ -382,7 +438,10 @@ impl InboundStreamBudget {
     ) -> Vec<(StreamId, EvictionReason)> {
         let idle_nanos = nanos(idle);
         let mut expired = Vec::new();
-        for (stream_id, charge) in self.streams.iter_mut() {
+        for (key, charge) in self.streams.iter_mut() {
+            let InboundKey::Udp(stream_id) = key else {
+                continue;
+            };
             if charge.evicted {
                 continue;
             }
@@ -519,7 +578,7 @@ mod tests {
         let mut budget = InboundStreamBudget::new(4, u64::MAX);
         let (_token, liveness) = task();
         budget.charge(
-            StreamId::next_transport_internal(),
+            InboundKey::Udp(StreamId::next_transport_internal()),
             10 * f,
             0,
             AGE,
@@ -531,7 +590,7 @@ mod tests {
     #[test]
     fn charges_are_held_until_the_state_is_gone() {
         let mut budget = budget(4, 1_000);
-        let id = StreamId::next_transport_internal();
+        let id = InboundKey::Udp(StreamId::next_transport_internal());
         let (token, liveness) = task();
         budget.check(600).unwrap();
         budget.charge(id, 600, 0, AGE, liveness);
@@ -554,7 +613,7 @@ mod tests {
     #[test]
     fn a_buffer_charge_lasts_while_any_clone_of_the_buffer_does() {
         let mut budget = budget(4, 1_000);
-        let id = StreamId::next();
+        let id = InboundKey::Udp(StreamId::next());
         let buffer = Arc::new(LockFreeStreamBuffer::new(100));
         let consumer_clone = Arc::clone(&buffer);
         budget.charge(id, 100, 0, AGE, Liveness::Buffer(Arc::downgrade(&buffer)));
@@ -572,7 +631,13 @@ mod tests {
         for _ in 0..2 {
             let (token, liveness) = task();
             budget.check(1).unwrap();
-            budget.charge(StreamId::next_transport_internal(), 1, 0, AGE, liveness);
+            budget.charge(
+                InboundKey::Udp(StreamId::next_transport_internal()),
+                1,
+                0,
+                AGE,
+                liveness,
+            );
             tokens.push(token);
         }
         assert_eq!(budget.check(1), Err(BudgetRejection::Streams { open: 2 }));
@@ -590,15 +655,15 @@ mod tests {
         let (_t2, l2) = task();
         let quiet = StreamId::next_transport_internal();
         let busy = StreamId::next_transport_internal();
-        budget.charge(quiet, 1, 0, max_age, l1);
-        budget.charge(busy, 1, 0, max_age, l2);
+        budget.charge(InboundKey::Udp(quiet), 1, 0, max_age, l1);
+        budget.charge(InboundKey::Udp(busy), 1, 0, max_age, l2);
 
         // Progress keeps `busy` from idling out, but not past the age limit.
         let mut now = 0;
         let mut expired = Vec::new();
         while now <= 601 * SECS {
             now += 10 * SECS;
-            budget.note_progress(busy, now);
+            budget.note_progress(InboundKey::Udp(busy), now);
             expired.extend(
                 budget
                     .take_expired(now, idle)
@@ -625,7 +690,13 @@ mod tests {
         let mut budget = budget(8, u64::MAX);
         let done = StreamId::next_transport_internal();
         let (token, liveness) = task();
-        budget.charge(done, 10, 0, Duration::from_secs(60), liveness);
+        budget.charge(
+            InboundKey::Udp(done),
+            10,
+            0,
+            Duration::from_secs(60),
+            liveness,
+        );
         token.report(10);
         token.mark_complete();
         assert_eq!(
@@ -634,6 +705,45 @@ mod tests {
             "neither idle nor past its age limit counts for a complete stream"
         );
         assert_eq!(budget.stream_count(), 1, "charged until its state is gone");
+    }
+
+    /// The UDP connection's eviction sweep and its unclaimed-buffer cleanup
+    /// see only its own charges on a budget shared with a QUIC path, which
+    /// evicts its own streams: a QUIC charge with the same numeric id is
+    /// neither returned nor marked evicted, and it still counts.
+    #[test]
+    fn udp_sweeps_see_only_udp_charges() {
+        let mut budget = budget(8, u64::MAX);
+        let id = StreamId::next();
+        let buffer = Arc::new(LockFreeStreamBuffer::new(100));
+        let quic_buffer = Arc::new(LockFreeStreamBuffer::new(100));
+        let (_quic_token, quic_task) = task();
+        budget.charge(
+            InboundKey::Udp(id),
+            100,
+            0,
+            AGE,
+            Liveness::Buffer(Arc::downgrade(&buffer)),
+        );
+        budget.charge(
+            InboundKey::Quic(id),
+            100,
+            0,
+            AGE,
+            Liveness::Buffer(Arc::downgrade(&quic_buffer)),
+        );
+        budget.charge(InboundKey::QuicShort(id.0), 100, 0, AGE, quic_task);
+
+        let live: Vec<_> = budget.live_buffer_streams().map(|(id, _)| id).collect();
+        assert_eq!(live, vec![id], "only the UDP buffer");
+        assert_eq!(
+            budget.take_expired(3600 * SECS, IDLE),
+            vec![(id, EvictionReason::Idle)],
+            "only the UDP stream"
+        );
+        assert_eq!(budget.take_expired(3600 * SECS, IDLE), vec![]);
+        assert_eq!(budget.stream_count(), 3);
+        assert_eq!(budget.charged_bytes(), 300);
     }
 
     /// Admission counts the overhead: a stream whose payload fits the
