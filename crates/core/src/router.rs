@@ -302,14 +302,28 @@ pub(crate) struct NetworkEfficiencyV1 {
     pub cost_ba: [[u64; STATE_SIZE_BUCKET_COUNT]; 3],
     pub cost_be: [[u64; STATE_SIZE_BUCKET_COUNT]; 3],
     /// Local telemetry pipeline totals in the order documented where populated.
-    pub tel: [u64; 15],
+    /// Grew from 15 to 16 entries in #6001 (periodic admitted, appended last)
+    /// while the schema stayed `v: 1`; positions 5, 7 and 8 read 0 from then
+    /// on, because the shadow sub-budget they counted was removed.
+    pub tel: [u64; 16],
     /// Per known shadow rollup: generated/enqueue attempts, enqueue full,
     /// enqueue closed, rate-limit admitted, aggregate-limit drop,
     /// shadow-subbudget drop, backoff-buffer drop, retry truncation, final sent.
+    /// The two rate-limit drop columns (aggregate-limit and shadow-subbudget)
+    /// are always 0 since #6001: these rollups are periodic events, which
+    /// bypass the per-second cap, and the shadow sub-budget no longer exists.
     pub shadow: [[u64; 9]; 7],
     /// Delivery path for this diagnostic block itself; order is documented in
     /// `TelemetryLocalMetricsSnapshot::network_efficiency_delivery`.
     pub eff: [u64; 8],
+    /// Per event type, lifetime `[admitted, dropped]` at the node's
+    /// per-second telemetry rate limiter, in
+    /// `tracing::telemetry::KNOWN_EVENT_TYPES` order (#6001). Exactly that
+    /// many rows; the last is `other`, which should stay 0. A `Vec` only
+    /// because serde does not implement arrays longer than 32. Added so the
+    /// mix of event types a node offers, and which ones the cap drops, can be
+    /// measured instead of inferred from the aggregate `tel` counts.
+    pub tel_t: Vec<[u64; 2]>,
     /// Monotonic hosting-BEGIN counts by CAUSE; row order is
     /// `ring::hosting::HostingCause::ALL`: client GET, transit GET, sub-op GET,
     /// client PUT, transit PUT, startup restore, unattributed.

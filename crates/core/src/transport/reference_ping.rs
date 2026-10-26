@@ -316,7 +316,7 @@ fn emit_reference_ping_rollup(local_peer_id: &str, target: SocketAddr, window: &
         window_secs = SHADOW_ROLLUP_WINDOW_SECS,
         "shadow_reference_ping"
     );
-    crate::tracing::telemetry::send_standalone_shadow_event_with_peer_id(
+    crate::tracing::telemetry::send_standalone_event_with_peer_id(
         "shadow_reference_ping",
         local_peer_id,
         reference_ping_rollup_json(target, window),

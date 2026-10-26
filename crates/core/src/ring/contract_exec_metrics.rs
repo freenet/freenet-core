@@ -123,9 +123,8 @@
 //! Note the deliberate choice of an EXISTING telemetry stream: `router_snapshot`
 //! already carries this class of per-node monotonic counter
 //! (`contract_module_cache_evictions_total`, `broadcast_stream_*_total`), so
-//! these fields cost no shadow-rollup budget slot (`MAX_SHADOW_EVENTS_PER_SECOND`
-//! is 6 with one slot of headroom) and land in a `tracing::info!` line that
-//! survives `release_max_level_info` for local `journalctl` reading.
+//! these fields add no new event stream and land in a `tracing::info!` line
+//! that survives `release_max_level_info` for local `journalctl` reading.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};

@@ -108,7 +108,7 @@ mod hosting;
 #[cfg(test)]
 pub(crate) use broken_invariants::{BROKEN_INVARIANT_TTL, EMITTED_FLAG_EVENTS};
 pub(crate) use broken_invariants::{
-    BrokenInvariant, BrokenInvariantDetector, BrokenInvariantsTracker,
+    BrokenInvariant, BrokenInvariantDetector, BrokenInvariantsTracker, FLAG_TELEMETRY_EVENT,
 };
 /// Pre-write admission-gate rejection type (#4683, PR 3). Surfaced to the
 /// executor chokepoints so a write that would overflow the aggregate disk
@@ -2652,23 +2652,31 @@ impl Ring {
                     })
                 });
 
+                // Positions 5, 7 and 8 were the shadow sub-budget's admitted,
+                // aggregate-drop and sub-budget-drop counts. #6001 replaced
+                // that priority with the periodic bypass, so they stay 0 to
+                // keep every later position where readers expect it, and the
+                // periodic admitted count is appended at 15.
                 let tel = [
                     telemetry.enqueue_attempts_total,
                     telemetry.enqueue_succeeded_total,
                     telemetry.enqueue_dropped_full_total,
                     telemetry.enqueue_dropped_closed_total,
                     telemetry.rate_limit_admitted_operational_total,
-                    telemetry.rate_limit_admitted_shadow_total,
+                    0,
                     telemetry.dropped_aggregate_limit_operational_total,
-                    telemetry.dropped_aggregate_limit_shadow_total,
-                    telemetry.dropped_shadow_limit_total,
+                    0,
+                    0,
                     telemetry.dropped_backoff_buffer_full_total,
                     telemetry.batch_send_attempts_total,
                     telemetry.batch_send_successes_total,
                     telemetry.batch_send_failures_total,
                     telemetry.batch_events_sent_total,
                     telemetry.batch_retry_truncated_events_total,
+                    telemetry.rate_limit_admitted_periodic_total,
                 ];
+                // Columns 4 and 5 (aggregate-limit and shadow-subbudget
+                // drops) are 0 since #6001 for the same reason.
                 let shadow = std::array::from_fn(|index| {
                     let stream = telemetry.known_shadow_rollups[index];
                     [
@@ -2676,8 +2684,8 @@ impl Ring {
                         stream.enqueue_dropped_full_total,
                         stream.enqueue_dropped_closed_total,
                         stream.rate_limit_admitted_total,
-                        stream.dropped_aggregate_limit_total,
-                        stream.dropped_shadow_limit_total,
+                        0,
+                        0,
                         stream.dropped_backoff_buffer_full_total,
                         stream.retry_truncated_total,
                         stream.sent_total,
@@ -2744,6 +2752,7 @@ impl Ring {
                     tel,
                     shadow,
                     eff: telemetry.network_efficiency_delivery,
+                    tel_t: telemetry.event_type_admissions,
                     // Hosting observability (#4642): WHY this peer began hosting
                     // each contract, and the two demand-signal gauges the
                     // eviction ranking is built on. `hosting` is the same

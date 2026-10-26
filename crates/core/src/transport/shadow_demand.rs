@@ -73,9 +73,9 @@
 //! distribution while cutting the central-collector record count by that
 //! factor. Every production peer reports to the central collector by default,
 //! so the raw 1 Hz stream was ~56% of all central telemetry volume — the
-//! rollup is what reclaims it. Shadow events are also admitted under the
-//! low-priority sub-budget (#4380) so they yield to operational telemetry
-//! under load (`tracing/telemetry.rs`).
+//! rollup is what reclaims it. The rollups are fixed-cadence periodic events,
+//! so the telemetry rate limiter admits them without consuming the
+//! operational budget (#6001, `tracing/telemetry.rs`).
 //!
 //! ## Process-wide, single-node-per-process
 //!
@@ -375,9 +375,9 @@ pub(crate) fn spawn_demand_aggregator(local_peer_id: String, monitor: &Backgroun
 /// Emit one `shadow_rate_demand` rollup. See the module-level rustdoc for
 /// why the OTLP send is independent of the `tracing::debug!` level: the
 /// local mirror is at DEBUG (compiled out of release builds via
-/// `release_max_level_info`), while `send_standalone_shadow_event_with_peer_id`
-/// reaches the collector regardless of log level (tagged low-priority so it
-/// yields to operational telemetry under the rate-limiter sub-budget, #4380).
+/// `release_max_level_info`), while `send_standalone_event_with_peer_id`
+/// reaches the collector regardless of log level (as a periodic event that
+/// bypasses the rate limiter's operational cap, #6001).
 ///
 /// Each original field name carries the window **mean** in its original unit
 /// (a per-second rate stays a per-second rate — the mean of the one-second
@@ -399,7 +399,7 @@ fn emit_demand_rollup(local_peer_id: &str, window: &DemandWindow) {
         window_secs = SHADOW_ROLLUP_WINDOW_SECS,
         "shadow_rate_demand"
     );
-    crate::tracing::telemetry::send_standalone_shadow_event_with_peer_id(
+    crate::tracing::telemetry::send_standalone_event_with_peer_id(
         "shadow_rate_demand",
         local_peer_id,
         payload,
@@ -506,7 +506,7 @@ fn emit_class_rollup(local_peer_id: &str, window: &ClassWindow) {
         window_secs = SHADOW_ROLLUP_WINDOW_SECS,
         "shadow_outbound_class"
     );
-    crate::tracing::telemetry::send_standalone_shadow_event_with_peer_id(
+    crate::tracing::telemetry::send_standalone_event_with_peer_id(
         "shadow_outbound_class",
         local_peer_id,
         payload,

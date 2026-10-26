@@ -267,7 +267,7 @@ fn emit_iface_rollup(local_peer_id: &str, window: &IfaceWindow) {
         window_secs = SHADOW_ROLLUP_WINDOW_SECS,
         "shadow_iface_tx"
     );
-    crate::tracing::telemetry::send_standalone_shadow_event_with_peer_id(
+    crate::tracing::telemetry::send_standalone_event_with_peer_id(
         "shadow_iface_tx",
         local_peer_id,
         iface_rollup_json(window),

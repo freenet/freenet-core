@@ -994,9 +994,8 @@ impl OutboundMix {
     /// Lives on the outbound rollup despite being a RECEIVE-side observation,
     /// for two reasons: it belongs in the same node-minute record as the
     /// `interest_sync_summaries_bytes` it explains (joinable without
-    /// interpolation), and the telemetry budget has room for exactly one more
-    /// aligned rollup stream (`telemetry.rs`, `MAX_SHADOW_EVENTS_PER_SECOND`),
-    /// which this measurement does not deserve to consume.
+    /// interpolation), and a separate stream would be one more periodic event per
+    /// node-minute, which this measurement does not deserve.
     ///
     /// # The `single_entry` split (R4b instrument, #5153)
     ///
@@ -1507,9 +1506,9 @@ fn outbound_mix_json(w: &Window, window_secs: u64) -> serde_json::Value {
 
 fn emit_outbound_mix_rollup(mix: &OutboundMix, local_peer_id: &str, window_secs: u64) {
     let w = mix.take_window();
-    // Shadow priority, matching the payload mix: one event per node-minute is
-    // negligible volume, but it is observation rather than operational signal.
-    crate::tracing::telemetry::send_standalone_shadow_event_with_peer_id(
+    // A periodic event (`telemetry::PERIODIC_EVENT_TYPES`): one per
+    // node-minute from this one task, so its timer bounds it.
+    crate::tracing::telemetry::send_standalone_event_with_peer_id(
         "outbound_message_mix",
         local_peer_id,
         outbound_mix_json(&w, window_secs),
