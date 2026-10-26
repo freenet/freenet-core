@@ -626,8 +626,8 @@ fn one_byte_frames_measure_within_the_per_stream_pin() {
 /// at 470 B (highest between packets, 3.05 W), both also at the smallest
 /// and largest windows, and at 50 B (thousands of short frames, compacted
 /// again and again); 64 streams sharing the window; and
-/// `MAX_UNI_STREAMS - 1` one-byte streams beside one that fills the rest. All datagrams are padded to
-/// 1200 B; other sizes are not measured.
+/// `MAX_UNI_STREAMS - 1` one-byte streams beside one that fills the rest.
+/// All datagrams are padded to 1200 B; other sizes are not measured.
 #[test]
 fn frames_filling_the_window_measure_within_the_window_multiple() {
     let w = window();

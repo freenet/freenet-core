@@ -72,7 +72,17 @@ pub(crate) const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
 /// one message per stream, so this bounds the messages in flight from one
 /// peer. When all are in use, the sender waits in `open_uni` until the
 /// receiver returns a credit: the cost of a limit that is too low is
-/// sender back-pressure.
+/// sender back-pressure. quinn returns credit in batches (only once more
+/// than an eighth of the limit has been freed), so a sender can wait with
+/// as few as seven eighths of the limit open at the receiver.
+///
+/// e5 constraint: short messages and control frames take slots from the
+/// same pool as streamed messages, and a streamed message holds its slot
+/// for its whole transfer. Since every send must be bounded by a timeout
+/// (`path` module doc), a short or control message queued behind long
+/// transfers can time out. e5 must keep slots for them (cap concurrent
+/// outbound streamed messages below this value) or carry control frames on
+/// the bidirectional stream reserved for it ([`MAX_BIDI_STREAMS`]).
 ///
 /// Set from the `inbound_concurrency` gauge (#5993), which estimates on
 /// the UDP transport how many inbound streams each connection would hold
@@ -86,6 +96,13 @@ pub(crate) const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
 /// | >= 64   | 0.133%           |
 /// | >= 128  | 0.019%           |
 /// | >= 256  | 0.0036%          |
+///
+/// With the credit batching above, a connection starts to wait somewhere
+/// between the 32 and 64 rows, so on this proxy in 0.13% to 0.66% of
+/// windows; these are shares of windows reaching a level on the UDP
+/// transport, not measured stalls. Per peer the share is uneven: the
+/// median peer reached 64 in 0.04% of its windows, the top 1% of peers in
+/// 2.6% or more.
 ///
 /// The estimate is built to err high (see
 /// `peer_connection::inbound_concurrency`), so it can justify lowering

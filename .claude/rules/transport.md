@@ -994,9 +994,12 @@ Sending (QuicPath::send_short / send_stream / send_stream_chunks /
   before the receiver reads its header, so a refusal may read as success
   at the sender, as on UDP, and so may one dropped for a full channel:
   sent is NOT delivered. send_stream_chunks resets the stream if the
-  source fails or delivers a different length. quinn's 64 uni streams
-  (MAX_UNI_STREAMS) are the back-pressure (open_uni waits; quinn returns
-  credit only after more than 8 streams are freed).
+  source fails or delivers a different length. quinn's MAX_UNI_STREAMS (64)
+  uni streams are the back-pressure (open_uni waits; quinn returns
+  credit only after more than an eighth of the limit is freed). Short and
+  control messages share those slots with streamed messages, so e5 must
+  keep slots for them or carry control on the reserved bidi stream (see
+  the MAX_UNI_STREAMS doc).
   Sends have no deadline of their own: open_uni, a flow-blocked write
   and the final wait for acks can wait as long as the connection lives
   against a peer that does not cooperate. e5 callers MUST bound every
