@@ -89,12 +89,11 @@ pub(crate) const INCOMING_BUFFER_TOTAL_BYTES: u64 = 1024 * 1024;
 // linux-gnu build allocates them (`util::alloc_count`). Each constant is a
 // measurement of one named term under the conditions its doc states, plus
 // a stated margin, and its test fails if a re-measurement exceeds it. They
-// are NOT a ceiling on what a connection can hold: the conditions below
-// were not measured, and some quinn terms depend on traffic rate and time
-// rather than on configuration. The per-path ceiling (memory gate M2) must
-// account for those separately; none of these is in
-// `declared_cache_ceiling` yet (memory gate M4). What was not measured is
-// listed in this module's doc.
+// are NOT a ceiling on what a connection can hold: the conditions listed
+// in this module's doc were not measured, and some quinn terms depend on
+// traffic rate and time rather than on configuration. The per-path ceiling
+// (memory gate M2) must account for those separately; none of these is in
+// `declared_cache_ceiling` yet (memory gate M4).
 //
 // A bump of quinn, quinn-proto or rustls fails `QUIC_MEMORY_MEASURED_WITH`'s
 // test until someone re-measures.
