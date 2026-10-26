@@ -820,11 +820,12 @@ fn full_channels_and_reused_ids_are_refused_without_waiting() {
     })
 }
 
-/// quinn's uni stream limit is back-pressure: with every one of the 256
-/// stream credits held by streams the receiver is still reading, the next
-/// send waits in `open_uni`. quinn returns credit in batches: it announces
-/// new credit only once more than 1/8 of the limit (33 streams) has been
-/// freed, so one finished stream is not enough and 33 are.
+/// quinn's uni stream limit is back-pressure: with every one of the
+/// `MAX_UNI_STREAMS` stream credits held by streams the receiver is still
+/// reading, the next send waits in `open_uni`. quinn returns credit in
+/// batches: it announces new credit only once more than 1/8 of the limit
+/// (`MAX_UNI_STREAMS / 8 + 1` streams) has been freed, so one finished
+/// stream is not enough and that many are.
 #[test]
 fn the_stream_limit_is_back_pressure() {
     bounded(|| async move {

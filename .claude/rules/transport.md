@@ -384,7 +384,10 @@ gateway connection). Arrivals are remembered for a fixed 2 s horizon (at most
 (`transport_snapshot_interval_secs`, default 30 s) it reports the connections
 sampled (only those that received a short message or had a stream admitted in
 the window), how many peaked at 8 / 16 / 32 / 64 / 128 / 256 or more, and the
-largest estimate; keys are uploaded only when non-zero, and `conns_sampled` is
+largest estimate (the levels are fixed so the series stays comparable across
+releases; `MAX_UNI_STREAMS` is 64 since 2026-10-26, so `ge_64` counts the
+connections that would reach it, and `ge_128` / `ge_256` are kept for
+continuity); keys are uploaded only when non-zero, and `conns_sampled` is
 the only activity term. It is an estimate built to err high, not a strict
 upper bound; the known undercounts (a sample skipped at a window boundary,
 arrivals older than the horizon or past the 1024 cap, streams the 1024-stream
@@ -849,7 +852,7 @@ exposes (its module doc lists the few it does not):
   grease_quic_bit(false) (the demux rule depends on it), versions [1],
   max_udp_payload / initial and min MTU 1200, no MTU discovery, no GSO,
   keepalive 15 s (None when the TimeSource disables keepalive), idle = the
-  TimeSource's connection idle timeout, Cubic, 256 uni / 1 bidi streams,
+  TimeSource's connection idle timeout, Cubic, 64 uni / 1 bidi streams,
   stream / receive / send window = clamp(5% of memory / (2 x
   max-number-of-connections), 128 KiB, 2 MiB), no unreliable datagrams, no
   spin bit, migration off, max_incoming 64, incoming buffers 64 KiB / 1 MiB,
@@ -991,9 +994,12 @@ Sending (QuicPath::send_short / send_stream / send_stream_chunks /
   before the receiver reads its header, so a refusal may read as success
   at the sender, as on UDP, and so may one dropped for a full channel:
   sent is NOT delivered. send_stream_chunks resets the stream if the
-  source fails or delivers a different length. quinn's 256 uni streams
-  are the back-pressure (open_uni waits; quinn returns credit only after
-  more than 32 streams are freed).
+  source fails or delivers a different length. quinn's MAX_UNI_STREAMS (64)
+  uni streams are the back-pressure (open_uni waits; quinn returns
+  credit only after more than an eighth of the limit is freed). Short and
+  control messages share those slots with streamed messages, so e5 must
+  keep slots for them or carry control on the reserved bidi stream (see
+  the MAX_UNI_STREAMS doc).
   Sends have no deadline of their own: open_uni, a flow-blocked write
   and the final wait for acks can wait as long as the connection lives
   against a peer that does not cooperate. e5 callers MUST bound every

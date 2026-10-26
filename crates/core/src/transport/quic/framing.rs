@@ -60,8 +60,8 @@ pub(crate) const HEADER_LEN: usize = 18;
 /// a short message, which carries any length; `QuicPath` leaves out of the
 /// `Stream` frame any metadata that does not fit, as `send_stream` does on
 /// UDP. It is read into memory before the payload and is not charged to
-/// the inbound budget, so it is held to one fragment's worth: at most 256
-/// streams x 1120 bytes per connection.
+/// the inbound budget, so it is held to one fragment's worth: at most
+/// `MAX_UNI_STREAMS` streams x 1120 bytes per connection.
 pub(crate) const MAX_METADATA_BYTES: u32 = (FRAGMENT_PAYLOAD_SIZE - 1 - 8 - 1) as u32;
 
 /// Most payload bytes a `Control` frame may declare. Control frames are a

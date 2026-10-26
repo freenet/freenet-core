@@ -76,7 +76,7 @@ pub(super) const HORIZON: Duration = Duration::from_secs(2);
 
 /// Most short-message arrival times kept. At the cap the oldest is dropped,
 /// so the short-message term stops growing at this many, which is above the
-/// largest reported threshold (256).
+/// largest reported threshold (256, above `MAX_UNI_STREAMS`).
 pub(super) const MAX_TRACKED_SHORTS: usize = 1024;
 
 /// The arrival times of recent short messages. Owned by the connection's

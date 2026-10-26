@@ -74,7 +74,7 @@
 //! progress, only when it fires).
 //! Streams with no budget charge (in the header phase, and control frames)
 //! get an age limit too ([`uncharged_age_limit`]), so a peer cannot hold
-//! one of its 256 stream slots by trickling bytes.
+//! one of its `MAX_UNI_STREAMS` stream slots by trickling bytes.
 //!
 //! Stream id lifetime: a `Stream` id is held on the path from admission
 //! until all of its state is gone (the reader is done and every handle
