@@ -186,12 +186,15 @@ async fn measure(network: &str, subnet: u8, n: usize) -> Cost {
     settle(&time).await;
     set_packet_delivery_callback(network, Some(cut));
     let open = live_bytes();
-    drop(clients);
+    // `clear`, not `drop`: the vectors' buffers were allocated before the
+    // baseline, so they stay until the last sample.
+    clients.clear();
     settle(&time).await;
     let servers_only = live_bytes();
-    drop(servers);
+    servers.clear();
     settle(&time).await;
     let closed = live_bytes();
+    drop((clients, servers));
     let cost = Cost {
         n,
         client: open - servers_only,
