@@ -335,8 +335,11 @@ impl DialQueueWait {
 }
 
 /// The inbound concurrency levels counted per period, in ascending order
-/// (see [`TransportMetrics::record_inbound_concurrency`]). The top one is
-/// `quic::config::MAX_UNI_STREAMS`.
+/// (see [`TransportMetrics::record_inbound_concurrency`]). Fixed so the
+/// series stays comparable across releases, and independent of
+/// `quic::config::MAX_UNI_STREAMS`: 256 was the limit when the gauge was
+/// added and stays as the top level; with the limit at 64, `ge_64` counts
+/// the connections that would have reached it.
 pub(crate) const INBOUND_CONCURRENCY_THRESHOLDS: [u32; 6] = [8, 16, 32, 64, 128, 256];
 
 // The `inbound_concurrency_conns_ge_<T>` snapshot fields are read by

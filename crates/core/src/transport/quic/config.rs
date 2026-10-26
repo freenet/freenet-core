@@ -70,8 +70,28 @@ pub(crate) const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
 
 /// Concurrent unidirectional streams a peer may open. The transport sends
 /// one message per stream, so this bounds the messages in flight from one
-/// peer.
-pub(crate) const MAX_UNI_STREAMS: u32 = 256;
+/// peer. When all are in use, the sender waits in `open_uni` until the
+/// receiver returns a credit: the cost of a limit that is too low is
+/// sender back-pressure.
+///
+/// Set from the `inbound_concurrency` gauge (#5993), which estimates on
+/// the UDP transport how many inbound streams each connection would hold
+/// open on QUIC. Release 0.2.150 at steady state, 2026-10-26
+/// 05:00-17:25Z, 1,432 peers and 30.6M connection-windows; the share of
+/// windows whose peak reached each level:
+///
+/// | streams | share of windows |
+/// |---------|------------------|
+/// | >= 32   | 0.66%            |
+/// | >= 64   | 0.133%           |
+/// | >= 128  | 0.019%           |
+/// | >= 256  | 0.0036%          |
+///
+/// The estimate is built to err high (see
+/// `peer_connection::inbound_concurrency`), so it can justify lowering
+/// this value, never raising it. QUIC shadow-mode data (e5a, #5940) on
+/// real QUIC connections may justify raising it.
+pub(crate) const MAX_UNI_STREAMS: u32 = 64;
 
 /// Concurrent bidirectional streams a peer may open: one, kept for a control
 /// stream; messages use unidirectional streams.
@@ -151,8 +171,9 @@ pub(crate) const QUIC_CONNECTION_FIXED_BYTES: usize = 64 * 1024;
 /// `max(32768, 1.5 x buffered)`, or the stream holds more than
 /// `COMPACT_THRESHOLD` (2048) chunks. With
 /// one-byte frames one stream peaked at 39,408 B (28 frames, then
-/// compaction), and 256 such streams held 10,020,960 B (39,144 B each).
-/// Set to that peak plus 14%, 44 KiB.
+/// compaction); 256 such streams held 10,020,960 B (39,144 B each), and
+/// `MAX_UNI_STREAMS` (64), the count the test runs, held 2,511,968 B
+/// (about 39,250 B each). Set to that peak plus 14%, 44 KiB.
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const QUIC_ASSEMBLER_HOLD_PER_STREAM_BYTES: usize = 44 * 1024;
 

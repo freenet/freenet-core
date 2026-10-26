@@ -625,13 +625,14 @@ fn one_byte_frames_measure_within_the_per_stream_pin() {
 /// filling the window at 444 B (highest at any instant at 2 GiB, 4.115 W),
 /// at 470 B (highest between packets, 3.05 W), both also at the smallest
 /// and largest windows, and at 50 B (thousands of short frames, compacted
-/// again and again); 64 streams sharing the window; and 255 one-byte
-/// streams beside one that fills the rest. All datagrams are padded to
+/// again and again); 64 streams sharing the window; and
+/// `MAX_UNI_STREAMS - 1` one-byte streams beside one that fills the rest. All datagrams are padded to
 /// 1200 B; other sizes are not measured.
 #[test]
 fn frames_filling_the_window_measure_within_the_window_multiple() {
     let w = window();
-    let mut mixed = vec![Shape::one_byte(28); super::config::MAX_UNI_STREAMS as usize - 1];
+    let one_byte_streams = super::config::MAX_UNI_STREAMS as usize - 1;
+    let mut mixed = vec![Shape::one_byte(28); one_byte_streams];
     let used: usize = mixed.iter().map(Shape::credit).sum();
     mixed.push(Shape::filling(444, w - used));
     let cases: Vec<(&str, Vec<Shape>)> = vec![
@@ -642,7 +643,7 @@ fn frames_filling_the_window_measure_within_the_window_multiple() {
             "64 streams of 460 B frames",
             vec![Shape::filling(460, w / 64); 64],
         ),
-        ("255 one-byte streams and one of 444 B frames", mixed),
+        ("one-byte streams and one of 444 B frames", mixed),
     ];
     for (name, shapes) in cases {
         let hold = measure_gap_hold(&shapes);
@@ -666,9 +667,9 @@ fn frames_filling_the_window_measure_within_the_window_multiple() {
                 hold.transient
             );
         }
-        if name.starts_with("255") {
+        if name.starts_with("one-byte") {
             assert!(
-                hold.held.rounded >= 255 * 32 * 1024,
+                hold.held.rounded >= one_byte_streams as isize * 32 * 1024,
                 "premise: the one-byte streams held their datagrams: {hold:?}"
             );
         }
