@@ -877,17 +877,20 @@ received data and per-connection state the windows do not limit.
 a connection can hold: `QUIC_CONNECTION_FIXED_BYTES` (64 KiB, an idle
 connection with its path), `QUIC_ASSEMBLER_HOLD_PER_STREAM_BYTES` (44 KiB per
 uni stream) and `QUIC_ASSEMBLER_HOLD_WINDOW_MULTIPLE` (5 x W) for received
-data in datagrams padded to 1200 B, frames of 50 to 470 B (quinn keeps a
-whole datagram per STREAM frame until its assembler compacts), and
-`QUIC_ACK_TAIL_BYTES` (240 KiB, the acknowledgement-only packets tracked
-after the last ack-eliciting send, up to quinn-proto's cap of 1000; M2 must
-re-check this term against quinn-proto's behaviour). Not measured: datagram
-sizes other than 1200 B, quinn's endpoint-to-connection datagram queue,
-send-side packet records and the buffers behind sent data, allocators other
-than jemalloc, and the bidirectional control stream (`MAX_BIDI_STREAMS`).
-Some quinn terms depend on traffic rate and time rather than configuration,
-as the UDP transport's dedup window and sent-packet tracker do, so the
-per-path ceiling (M2) cannot be the sum of these measurements alone. This
+data in datagrams padded to 1200 B, frames of 50 to 470 B above a single
+gap at offset 0 of each stream (quinn keeps a whole datagram per STREAM
+frame until its assembler compacts), and `QUIC_ACK_TAIL_BYTES` (240 KiB, the
+acknowledgement-only packets tracked after the last ack-eliciting send, up
+to quinn-proto's cap of 1000; M2 must re-check this term against
+quinn-proto's behaviour). Not measured: datagram sizes other than 1200 B,
+quinn's endpoint-to-connection datagram queue, send-side packet records and
+the buffers behind sent data, allocators other than jemalloc, the
+bidirectional control stream (`MAX_BIDI_STREAMS`), CRYPTO-frame reassembly
+(quinn-proto's second assembler, `crypto_buffer_size` 16 KiB), and arrival
+orders other than a single gap at offset 0. Some quinn terms depend on
+traffic rate and time rather than configuration, as the UDP transport's
+dedup window and sent-packet tracker do, so the per-path ceiling (memory
+gate M2, #5940) cannot be the sum of these measurements alone. This
 memory is NOT accounted in the node aggregate and must be before QUIC is on
 by default (rollout gate). The fixed
 node-wide endpoint buffers are summed whatever `transport-quic` says:

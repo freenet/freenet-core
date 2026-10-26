@@ -1,4 +1,5 @@
-//! Heap measurements of the QUIC endpoint (the QUIC memory gate, step M1b).
+//! Heap measurements of the QUIC endpoint (the QUIC memory gate, step M1b,
+//! #5940).
 //!
 //! Each measurement counts the bytes left allocated on the test's thread
 //! (`util::alloc_count`), rounded to jemalloc's size classes, so everything
@@ -68,16 +69,17 @@ struct Cost {
     client: Live,
     /// Freed when the server side is then closed and drained.
     server: Live,
-    /// Still allocated after both sides closed, against the baseline: what
-    /// the endpoints keep (tables grown for `n` connections).
+    /// Still allocated after both sides closed, against the baseline:
+    /// capacity kept once `n` connections have existed (see
+    /// `QUIC_CONNECTION_FIXED_BYTES`'s doc).
     retained: Live,
     /// The change across one settle just before the baseline.
     settle_drift: Live,
 }
 
 impl Cost {
-    /// The most one node holds per connection, in jemalloc-rounded bytes:
-    /// the larger side, plus the retained growth charged to that side alone.
+    /// The measured cost per connection, in jemalloc-rounded bytes: the
+    /// larger side, plus what was retained, charged to that side alone.
     fn per_connection(&self) -> usize {
         let side = self.client.rounded.max(self.server.rounded) + self.retained.rounded.max(0);
         (side.max(0) as usize).div_ceil(self.n)
@@ -96,7 +98,8 @@ async fn settle(time: &VirtualTime) {
 /// One connection is opened and closed first so that what the first
 /// connection initialises once per process (lazily built statics, metric
 /// entries, tables at their first size) is not counted, then one settle is
-/// checked to leave the count where it was. The baseline is taken after
+/// checked to move the count by at most [`SETTLE_DRIFT_BYTES`]. The
+/// baseline is taken after
 /// that; then the `n` connections are opened and settled, the network is
 /// cut so neither side hears the other close, the client side is dropped
 /// and drained, then the server side.
@@ -672,13 +675,20 @@ fn frames_filling_the_window_measure_within_the_window_multiple() {
     }
 
     // The same two lengths at the smallest window (MIN_WINDOW_BYTES, a
-    // 512 MiB node) and the largest (MAX_WINDOW_BYTES, a 64 GiB node).
-    for memory_limit in [512usize << 20, 64usize << 30] {
+    // 512 MiB node) and the largest (MAX_WINDOW_BYTES, a 64 GiB node). At
+    // the largest, these lengths make over 2048 chunks, so the chunk-count
+    // trigger compacts them; the premise is only that the stream held more
+    // than the window.
+    for (memory_limit, expected) in [
+        (512usize << 20, super::config::MIN_WINDOW_BYTES),
+        (64usize << 30, super::config::MAX_WINDOW_BYTES),
+    ] {
         let settings = QuicSettings {
             max_connections: 200,
             memory_limit,
         };
         let w = settings.window_bytes() as usize;
+        assert_eq!(w, expected as usize, "premise: the window at its extreme");
         for len in [444, 470] {
             let hold = measure_gap_hold_at(&settings, &[Shape::filling(len, w)]);
             assert!(
@@ -689,7 +699,7 @@ fn frames_filling_the_window_measure_within_the_window_multiple() {
             );
             assert!(
                 hold.peak as f64 >= 1.5 * w as f64,
-                "premise: a datagram held per frame at W = {w}: {} B",
+                "premise: the stream held more than the window at W = {w}: {} B",
                 hold.peak
             );
         }

@@ -2948,27 +2948,35 @@ mod tests {
                  INCOMING_BUFFER_TOTAL_BYTES",
             ),
             // Measurements of QUIC connection terms (quic::config), inputs to
-            // the per-path ceiling (memory gate M2), not ceilings themselves.
+            // the per-path ceiling (memory gate M2, #5940), not ceilings
+            // themselves. The quic::config module doc lists what was not
+            // measured.
             (
                 "QUIC_CONNECTION_FIXED_BYTES",
                 "a measurement of one QUIC connection term (idle connection state, \
                  jemalloc-rounded on linux-gnu), not a ceiling; an input to the \
-                 per-path ceiling (memory gate M2), summed once a QUIC path cap \
-                 exists (M4)",
+                 per-path ceiling (memory gate M2, #5940), plus the unmeasured terms \
+                 in the quic::config module doc; summed once a QUIC path cap exists \
+                 (M4, #5940)",
             ),
+            // QUIC_ASSEMBLER_HOLD_WINDOW_MULTIPLE (a multiple of the window,
+            // so not a `_BYTES` name the discovery scan finds) is the other
+            // half of this term: streams x this + that multiple x W.
             (
                 "QUIC_ASSEMBLER_HOLD_PER_STREAM_BYTES",
                 "a measurement of one QUIC connection term (received data per uni \
-                 stream, 1200-byte datagrams), not a ceiling; an input to the \
-                 per-path ceiling (memory gate M2), summed once a QUIC path cap \
-                 exists (M4)",
+                 stream, 1200-byte datagrams; with QUIC_ASSEMBLER_HOLD_WINDOW_MULTIPLE \
+                 x W), not a ceiling; an input to the per-path ceiling (memory gate \
+                 M2, #5940), plus the unmeasured terms in the quic::config module \
+                 doc; summed once a QUIC path cap exists (M4, #5940)",
             ),
             (
                 "QUIC_ACK_TAIL_BYTES",
                 "a measurement of one QUIC connection term (ACK-only records after \
-                 the last ack-eliciting send), not a ceiling; M2 must re-check it \
-                 against quinn-proto's behaviour; summed once a QUIC path cap exists \
-                 (M4)",
+                 the last ack-eliciting send), not a ceiling; the per-path ceiling \
+                 (memory gate M2, #5940) must re-check it against quinn-proto's \
+                 behaviour, plus the unmeasured terms in the quic::config module \
+                 doc; summed once a QUIC path cap exists (M4, #5940)",
             ),
             (
                 "READ_START_BYTES",
