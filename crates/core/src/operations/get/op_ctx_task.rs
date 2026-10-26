@@ -10790,20 +10790,10 @@ mod route_attempt_driver_tests {
         (op_manager, rx, store, upstream, greedy, host, guards)
     }
 
-    /// A GET transaction whose visited bloom, after the relay marks its own
-    /// address and `upstream_addr`, reports no other ring connection as
-    /// visited. The bloom's hash keys come from the transaction id, so with a
-    /// random id roughly 1 in 20,000 draws makes `probably_visited` a false
-    /// positive for a candidate the test expects the relay to pick; the relay
-    /// then routes elsewhere and the test's scripted replies never run
-    /// (CI run 40224533131). The relay's selection is otherwise deterministic,
-    /// so the test must not leave the draw to chance.
-    fn tx_without_bloom_false_positive(
-        op_manager: &OpManager,
-        upstream_addr: SocketAddr,
-    ) -> Transaction {
+    /// The ring connections a relay at `upstream_addr` may pick among.
+    fn relay_candidates(op_manager: &OpManager, upstream_addr: SocketAddr) -> Vec<SocketAddr> {
         let own = op_manager.ring.connection_manager.get_own_addr();
-        let candidates: Vec<SocketAddr> = op_manager
+        op_manager
             .ring
             .connection_manager
             .get_connections_by_location()
@@ -10811,18 +10801,91 @@ mod route_attempt_driver_tests {
             .flatten()
             .filter_map(|conn| conn.location.socket_addr())
             .filter(|a| *a != upstream_addr && Some(*a) != own)
-            .collect();
+            .collect()
+    }
+
+    /// True if `tx`'s visited bloom would make the relay skip a candidate it
+    /// should be able to pick: either right after marking its own and the
+    /// upstream address, or after one candidate has also been marked (the
+    /// greedy peer answered NotFound or failed, so the relay moves to the
+    /// next one, e.g. the advertised-host consult).
+    fn bloom_skips_a_candidate(
+        tx: &Transaction,
+        own: Option<SocketAddr>,
+        upstream_addr: SocketAddr,
+        candidates: &[SocketAddr],
+    ) -> bool {
+        let mut base = VisitedPeers::new(tx);
+        if let Some(own) = own {
+            base.mark_visited(own);
+        }
+        base.mark_visited(upstream_addr);
+        if candidates.iter().any(|a| base.probably_visited(*a)) {
+            return true;
+        }
+        candidates.iter().any(|failed| {
+            let mut after = base.clone();
+            after.mark_visited(*failed);
+            candidates
+                .iter()
+                .any(|other| other != failed && after.probably_visited(*other))
+        })
+    }
+
+    /// A GET transaction whose visited bloom does not skip any ring
+    /// connection by false positive, neither after the relay marks its own and
+    /// `upstream_addr` nor after one further candidate is marked. The bloom's
+    /// hash keys come from the transaction id, so with a random id an
+    /// occasional draw makes `probably_visited` a false positive for a
+    /// candidate the test expects the relay to pick (or pick next); the relay
+    /// then routes elsewhere and the test's scripted replies never run (CI run
+    /// 40224533131). A 2M-draw probe saw a false positive on one of two
+    /// candidates in about 1 draw in 12,000; that is a single measurement, not
+    /// an established rate. With false positives excluded for these paths, the
+    /// relay's selection in these tests is deterministic.
+    fn tx_without_bloom_false_positive(
+        op_manager: &OpManager,
+        upstream_addr: SocketAddr,
+    ) -> Transaction {
+        let own = op_manager.ring.connection_manager.get_own_addr();
+        let candidates = relay_candidates(op_manager, upstream_addr);
         loop {
             let tx = Transaction::new::<GetMsg>();
-            let mut visited = VisitedPeers::new(&tx);
-            if let Some(own) = own {
-                visited.mark_visited(own);
-            }
-            visited.mark_visited(upstream_addr);
-            if !candidates.iter().any(|a| visited.probably_visited(*a)) {
+            if !bloom_skips_a_candidate(&tx, own, upstream_addr, &candidates) {
                 return tx;
             }
         }
+    }
+
+    /// The helper rejects a transaction that is clean after the first hop but
+    /// whose bloom, once one candidate is marked, false-positives on another.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn bloom_helper_rejects_a_second_hop_false_positive() {
+        let (op_manager, _rx, _store, upstream, _greedy, _host, _guards) =
+            relay_fixture("get-relay-bloom-helper", true).await;
+        let own = op_manager.ring.connection_manager.get_own_addr();
+        let up = addr(&upstream);
+        let candidates = relay_candidates(&op_manager, up);
+        let first_hop_clean = |tx: &Transaction| {
+            let mut base = VisitedPeers::new(tx);
+            if let Some(own) = own {
+                base.mark_visited(own);
+            }
+            base.mark_visited(up);
+            !candidates.iter().any(|a| base.probably_visited(*a))
+        };
+        let mut draws = 0u32;
+        let bad = loop {
+            draws += 1;
+            assert!(draws < 20_000_000, "no second-hop false positive found");
+            let tx = Transaction::new::<GetMsg>();
+            if first_hop_clean(&tx) && bloom_skips_a_candidate(&tx, own, up, &candidates) {
+                break tx;
+            }
+        };
+        assert!(bloom_skips_a_candidate(&bad, own, up, &candidates));
+        let good = tx_without_bloom_false_positive(&op_manager, up);
+        assert!(!bloom_skips_a_candidate(&good, own, up, &candidates));
     }
 
     async fn run_relay(op_manager: &Arc<OpManager>, upstream: &PeerKeyLocation) {
