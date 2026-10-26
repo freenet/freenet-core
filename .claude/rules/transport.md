@@ -871,18 +871,25 @@ changes. The windows are the same class of per-connection exception as
 inbound stream reassembly and are in `NOT_SUMMED` in
 `declared_cache_ceiling`, but they are NOT covered by it: they are in
 addition to reassembly, the send window is outbound, and quinn holds
-received data and per-connection state the windows do not bound. Measured
-(`quic::memory_tests`, jemalloc-rounded, pinned in `quic/config.rs`), one
-connection may hold, per side: `QUIC_ASSEMBLER_HOLD_WINDOW_MULTIPLE` (5) x W
-+ streams x `QUIC_ASSEMBLER_HOLD_PER_STREAM_BYTES` (44 KiB) received (quinn
-keeps a whole datagram per STREAM frame until its assembler compacts, and
-copies while the old chunks are alive), W sent, `QUIC_CONNECTION_FIXED_BYTES`
-(64 KiB idle state) and `QUIC_ACK_TAIL_BYTES` (240 KiB, the
-acknowledgement-only packets tracked after the last ack-eliciting send, up
-to quinn-proto's cap of 1000). At 2 GiB and 256 streams that is about
-12.8 MiB.
-That memory is NOT accounted in the node aggregate and must be before QUIC
-is on by default (rollout gate; the per-path ceiling sums these terms). The fixed
+received data and per-connection state the windows do not limit.
+`quic/config.rs` pins MEASUREMENTS of named terms under stated conditions
+(`quic::memory_tests`, jemalloc-rounded on linux-gnu), not a ceiling on what
+a connection can hold: `QUIC_CONNECTION_FIXED_BYTES` (64 KiB, an idle
+connection with its path), `QUIC_ASSEMBLER_HOLD_PER_STREAM_BYTES` (44 KiB per
+uni stream) and `QUIC_ASSEMBLER_HOLD_WINDOW_MULTIPLE` (5 x W) for received
+data in datagrams padded to 1200 B, frames of 50 to 470 B (quinn keeps a
+whole datagram per STREAM frame until its assembler compacts), and
+`QUIC_ACK_TAIL_BYTES` (240 KiB, the acknowledgement-only packets tracked
+after the last ack-eliciting send, up to quinn-proto's cap of 1000; M2 must
+re-check this term against quinn-proto's behaviour). Not measured: datagram
+sizes other than 1200 B, quinn's endpoint-to-connection datagram queue,
+send-side packet records and the buffers behind sent data, allocators other
+than jemalloc, and the bidirectional control stream (`MAX_BIDI_STREAMS`).
+Some quinn terms depend on traffic rate and time rather than configuration,
+as the UDP transport's dedup window and sent-packet tracker do, so the
+per-path ceiling (M2) cannot be the sum of these measurements alone. This
+memory is NOT accounted in the node aggregate and must be before QUIC is on
+by default (rollout gate). The fixed
 node-wide endpoint buffers are summed whatever `transport-quic` says:
 `INCOMING_BUFFER_TOTAL_BYTES` (quinn's pending attempts) and
 `QUIC_INGRESS_QUEUE_BYTES`.

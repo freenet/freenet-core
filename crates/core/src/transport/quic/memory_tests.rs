@@ -210,13 +210,13 @@ async fn measure(network: &str, subnet: u8, n: usize) -> Cost {
     cost
 }
 
-/// An idle QUIC connection, with the `QuicPath` a node keeps on it, holds no
-/// more heap on either side than [`QUIC_CONNECTION_FIXED_BYTES`], in
+/// An idle QUIC connection, with the `QuicPath` a node keeps on it,
+/// measures within [`QUIC_CONNECTION_FIXED_BYTES`] on either side, in
 /// jemalloc-rounded bytes. Measured with 16 connections between two
 /// endpoints, so the endpoints' tables have grown with them and a one-off
 /// allocation is spread thin.
 #[test]
-fn an_idle_connection_holds_at_most_the_declared_fixed_bytes() {
+fn an_idle_connection_measures_within_the_fixed_pin() {
     bounded(|| async move {
         let cost = measure("quic-memory-fixed", 1, 16).await;
         assert!(
@@ -378,7 +378,7 @@ struct GapHold {
 ///
 /// The sender pads every datagram to the MTU and has a 1 GiB congestion
 /// window, so neither its window nor its pacer delays a frame.
-fn connected_pair() -> (ProtoPeer, ProtoPeer, Instant) {
+fn connected_pair(settings: &QuicSettings) -> (ProtoPeer, ProtoPeer, Instant) {
     use crate::simulation::RealTime;
 
     let (a_keys, b_keys) = (TransportKeypair::new(), TransportKeypair::new());
@@ -388,7 +388,7 @@ fn connected_pair() -> (ProtoPeer, ProtoPeer, Instant) {
     let b_peer = super::identity::PeerKey::of(b_keys.public()).expect("b's key");
     let real = RealTime::new();
 
-    let receiver_transport = Arc::new(super::config::transport_config(&settings(), &real));
+    let receiver_transport = Arc::new(super::config::transport_config(settings, &real));
     let server = super::config::server_config(
         Arc::new(b_identity.server_tls(&a_peer).expect("server tls")),
         receiver_transport,
@@ -406,7 +406,7 @@ fn connected_pair() -> (ProtoPeer, ProtoPeer, Instant) {
         conn: None,
     };
 
-    let mut sender_transport = super::config::transport_config(&settings(), &real);
+    let mut sender_transport = super::config::transport_config(settings, &real);
     let mut cubic = quinn::congestion::CubicConfig::default();
     cubic.initial_window(1 << 30);
     sender_transport
@@ -476,11 +476,16 @@ fn connected_pair() -> (ProtoPeer, ProtoPeer, Instant) {
 /// receiver's heap is counted: every receiver call runs inside
 /// [`live_delta`].
 fn measure_gap_hold(shapes: &[Shape]) -> GapHold {
+    measure_gap_hold_at(&settings(), shapes)
+}
+
+/// [`measure_gap_hold`] with the window `settings` give.
+fn measure_gap_hold_at(settings: &QuicSettings, shapes: &[Shape]) -> GapHold {
     use quinn_proto::Dir;
 
     let _seed = GlobalRng::seed_guard(SEED);
-    let (mut receiver, mut sender, mut now) = connected_pair();
-    let window = settings().window_bytes() as usize;
+    let (mut receiver, mut sender, mut now) = connected_pair(settings);
+    let window = settings.window_bytes() as usize;
     let credit: usize = shapes.iter().map(Shape::credit).sum();
     assert!(credit <= window, "{credit} B of streams exceed the window");
     let sent_before = receiver.conn().stats().path.sent_packets;
@@ -551,29 +556,29 @@ fn measure_gap_hold(shapes: &[Shape]) -> GapHold {
     }
 }
 
-/// The node's flow-control window at 2 GiB, the most stream data a peer can
-/// have in flight on a connection.
+/// The node's flow-control window at 2 GiB.
 fn window() -> usize {
     settings().window_bytes() as usize
 }
 
-/// The per-connection assembler bound for `streams` streams:
+/// What the assembler pins allow for `streams` uni streams at window `w`:
 /// `streams x QUIC_ASSEMBLER_HOLD_PER_STREAM_BYTES` plus
-/// `QUIC_ASSEMBLER_HOLD_WINDOW_MULTIPLE x W`.
-fn assembler_bound(streams: usize) -> isize {
-    (streams * QUIC_ASSEMBLER_HOLD_PER_STREAM_BYTES
-        + QUIC_ASSEMBLER_HOLD_WINDOW_MULTIPLE * window()) as isize
+/// `QUIC_ASSEMBLER_HOLD_WINDOW_MULTIPLE x w`.
+fn assembler_pin(streams: usize, w: usize) -> isize {
+    (streams * QUIC_ASSEMBLER_HOLD_PER_STREAM_BYTES + QUIC_ASSEMBLER_HOLD_WINDOW_MULTIPLE * w)
+        as isize
 }
 
-/// One-byte frames above a gap hold about one datagram per frame until the
-/// assembler's waste estimate passes 32 KiB and it compacts: one stream
-/// peaks under [`QUIC_ASSEMBLER_HOLD_PER_STREAM_BYTES`] and drops after
-/// compaction, and [`MAX_UNI_STREAMS`] such streams, which use almost none
-/// of the window, hold less than that many times the bound.
+/// With one-byte frames above a gap, each in a padded datagram, a stream
+/// held about one datagram per frame until the assembler's waste estimate
+/// passed 32 KiB and it compacted: one stream's peak is within
+/// [`QUIC_ASSEMBLER_HOLD_PER_STREAM_BYTES`], and [`MAX_UNI_STREAMS`] such
+/// streams, which use almost none of the window, are within that many
+/// times the pin.
 ///
 /// [`MAX_UNI_STREAMS`]: super::config::MAX_UNI_STREAMS
 #[test]
-fn one_byte_frames_hold_at_most_the_per_stream_bound() {
+fn one_byte_frames_measure_within_the_per_stream_pin() {
     let single = measure_gap_hold(&[Shape::one_byte(64)]);
     let curve = &single.first_stream_curve;
     let peak = *curve.iter().max().expect("frames");
@@ -582,17 +587,21 @@ fn one_byte_frames_hold_at_most_the_per_stream_bound() {
         peak <= QUIC_ASSEMBLER_HOLD_PER_STREAM_BYTES as isize,
         "one stream peaked at {peak} B: {single:?}"
     );
+    let after = *curve
+        .get(at + 1)
+        .unwrap_or_else(|| panic!("premise: the stream compacted within the frames: {curve:?}"));
     assert!(
-        peak >= 32 * 1024 && curve[at + 1] < 8 * 1024,
+        peak >= 32 * 1024 && after < 8 * 1024,
         "premise: datagrams were held until compaction, then copied out: {curve:?}"
     );
 
     let streams = super::config::MAX_UNI_STREAMS as usize;
     let many = measure_gap_hold(&vec![Shape::one_byte(at + 1); streams]);
-    let bound = (streams * QUIC_ASSEMBLER_HOLD_PER_STREAM_BYTES) as isize;
+    let pinned = (streams * QUIC_ASSEMBLER_HOLD_PER_STREAM_BYTES) as isize;
     assert!(
-        many.transient <= bound,
-        "{streams} streams of {} one-byte frames held {} B, over {bound} B: {many:?}",
+        many.transient <= pinned,
+        "{streams} streams of {} one-byte frames held {} B, over the pinned {pinned} B: \
+         {many:?}",
         at + 1,
         many.transient
     );
@@ -602,18 +611,19 @@ fn one_byte_frames_hold_at_most_the_per_stream_bound() {
     );
 }
 
-/// Frames long enough that the proportional compaction threshold governs
-/// make a stream hold a datagram per frame up to the window, and compaction
-/// copies while the old chunks are alive; whatever the shape, the hold at
-/// any instant stays under the assembler bound ([`assembler_bound`]). The
-/// shapes are the worst a sweep of frame lengths found (see the constants'
-/// docs) and the ways to combine them: one stream filling the window at
-/// 444 B (highest at any instant, 4.115 W), at 470 B (highest between
-/// packets, 3.05 W) and at 50 B (thousands of short frames, compacted again
-/// and again); 64 streams sharing it; and 255 one-byte streams beside one
-/// that fills the rest.
+/// With frames long enough that the proportional compaction threshold
+/// governs, a stream held a datagram per frame up to the window, and
+/// compaction copied while the old chunks were alive. The hold at any
+/// instant is within [`assembler_pin`] for the shapes the manual sweep in
+/// the constants' docs found worst and the ways to combine them: one stream
+/// filling the window at 444 B (highest at any instant at 2 GiB, 4.115 W),
+/// at 470 B (highest between packets, 3.05 W), both also at the smallest
+/// and largest windows, and at 50 B (thousands of short frames, compacted
+/// again and again); 64 streams sharing the window; and 255 one-byte
+/// streams beside one that fills the rest. All datagrams are padded to
+/// 1200 B; other sizes are not measured.
 #[test]
-fn frames_filling_the_window_hold_at_most_the_assembler_bound() {
+fn frames_filling_the_window_measure_within_the_window_multiple() {
     let w = window();
     let mut mixed = vec![Shape::one_byte(28); super::config::MAX_UNI_STREAMS as usize - 1];
     let used: usize = mixed.iter().map(Shape::credit).sum();
@@ -630,10 +640,10 @@ fn frames_filling_the_window_hold_at_most_the_assembler_bound() {
     ];
     for (name, shapes) in cases {
         let hold = measure_gap_hold(&shapes);
-        let bound = assembler_bound(shapes.len());
+        let pinned = assembler_pin(shapes.len(), w);
         assert!(
-            hold.transient <= bound,
-            "{name}: held {} B at most, over the bound {bound} B: {hold:?}",
+            hold.transient <= pinned,
+            "{name}: held {} B at its highest, over the pinned {pinned} B: {hold:?}",
             hold.transient
         );
         if name == "470 B frames" {
@@ -646,18 +656,50 @@ fn frames_filling_the_window_hold_at_most_the_assembler_bound() {
         if name == "444 B frames" {
             assert!(
                 hold.transient as f64 >= 3.5 * w as f64,
-                "premise: the worst shape held more than 3.5 x W: {} B",
+                "premise: the copy overlapped the old chunks, over 3.5 x W: {} B",
                 hold.transient
+            );
+        }
+        if name.starts_with("255") {
+            assert!(
+                hold.held.rounded >= 255 * 32 * 1024,
+                "premise: the one-byte streams held their datagrams: {hold:?}"
+            );
+        }
+    }
+
+    // The same two lengths at the smallest window (MIN_WINDOW_BYTES, a
+    // 512 MiB node) and the largest (MAX_WINDOW_BYTES, a 64 GiB node).
+    for memory_limit in [512usize << 20, 64usize << 30] {
+        let settings = QuicSettings {
+            max_connections: 200,
+            memory_limit,
+        };
+        let w = settings.window_bytes() as usize;
+        for len in [444, 470] {
+            let hold = measure_gap_hold_at(&settings, &[Shape::filling(len, w)]);
+            assert!(
+                hold.transient <= assembler_pin(1, w),
+                "{len} B frames at W = {w}: held {} B at its highest, over the pinned {} B",
+                hold.transient,
+                assembler_pin(1, w)
+            );
+            assert!(
+                hold.peak as f64 >= 1.5 * w as f64,
+                "premise: a datagram held per frame at W = {w}: {} B",
+                hold.peak
             );
         }
     }
 }
 
-/// The receiver tracks the acknowledgement-only packets it sends after its
+/// The receiver tracked the acknowledgement-only packets it sent after its
 /// last ack-eliciting send up to quinn-proto's cap of 1000; with none of
-/// them acknowledged, they stay under [`QUIC_ACK_TAIL_BYTES`].
+/// them acknowledged, they measured within [`QUIC_ACK_TAIL_BYTES`], and the
+/// same after twice as many frames.
 #[test]
-fn unacknowledged_acks_stop_at_the_tail_bound() {
+fn the_ack_tail_measures_within_its_pin() {
+    let mut tails = Vec::new();
     for frames in [4000, 8000] {
         let hold = measure_gap_hold(&[Shape::one_byte(frames)]);
         assert!(
@@ -674,7 +716,12 @@ fn unacknowledged_acks_stop_at_the_tail_bound() {
              QUIC_ACK_TAIL_BYTES ({QUIC_ACK_TAIL_BYTES} B)",
             hold.acks_tracked.rounded
         );
+        tails.push(hold.acks_tracked.rounded);
     }
+    assert!(
+        tails[1] <= tails[0] + 16 * 1024,
+        "the tail kept rising from 4000 to 8000 frames: {tails:?}"
+    );
 }
 
 /// The figures in `quic::config` were measured with the quinn, quinn-proto
@@ -683,13 +730,13 @@ fn unacknowledged_acks_stop_at_the_tail_bound() {
 /// in the constants' docs, and moves the pin.
 #[test]
 fn quic_memory_figures_match_the_locked_versions() {
-    const LOCK: &str = include_str!("../../../../../Cargo.lock");
+    let lock = include_str!("../../../../../Cargo.lock").replace("\r\n", "\n");
     for (name, measured) in QUIC_MEMORY_MEASURED_WITH {
         let header = format!("[[package]]\nname = \"{name}\"\nversion = \"");
-        let locked: Vec<&str> = LOCK
+        let locked: Vec<&str> = lock
             .match_indices(&header)
             .map(|(at, _)| {
-                let rest = &LOCK[at + header.len()..];
+                let rest = &lock[at + header.len()..];
                 &rest[..rest.find('"').expect("closing quote")]
             })
             .collect();
