@@ -1141,8 +1141,22 @@ mod log_destination_tests {
         assert_eq!(LOG_TO_STDERR_ENV_VAR, "FREENET_LOG_TO_STDERR");
         assert_eq!(LOG_FORMAT_ENV_VAR, "FREENET_LOG_FORMAT");
 
-        let ephemeral: String = include_str!("../../../netcheck/src/ephemeral.rs")
-            .split_whitespace()
+        // Bounded to the function that spawns the node, with comment lines
+        // dropped, so a commented-out call or a mention elsewhere in the file
+        // cannot satisfy this.
+        let src = include_str!("../../../netcheck/src/ephemeral.rs");
+        let sig = "pub async fn spawn_ephemeral(";
+        let at = src
+            .find(sig)
+            .expect("spawn_ephemeral not found in crates/netcheck/src/ephemeral.rs");
+        let body = src[at..]
+            .split_once("\n}\n")
+            .expect("could not locate the end of spawn_ephemeral")
+            .0;
+        let ephemeral: String = body
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .flat_map(|l| l.split_whitespace())
             .collect();
         for call in [
             format!(".env(\"{LOG_TO_STDERR_ENV_VAR}\","),
@@ -1150,8 +1164,8 @@ mod log_destination_tests {
         ] {
             assert!(
                 ephemeral.contains(&call),
-                "crates/netcheck/src/ephemeral.rs no longer calls `{call}` on its node; \
-                 rename both sides together"
+                "spawn_ephemeral in crates/netcheck/src/ephemeral.rs no longer calls \
+                 `{call}` on its node; rename both sides together"
             );
         }
     }

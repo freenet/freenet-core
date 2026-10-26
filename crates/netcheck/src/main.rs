@@ -160,6 +160,11 @@ pub struct PutCmd {
     /// Where to write the handoff file `get` reads.
     #[arg(long)]
     pub handoff: PathBuf,
+
+    /// Name of the host the PUTs run on, recorded on each PUT record. The
+    /// published report comes from the `get` host, under its vantage.
+    #[arg(long)]
+    pub vantage: Option<String>,
 }
 
 #[derive(clap::Args, Debug)]
@@ -277,11 +282,14 @@ mod tests {
             "m.json",
             "--handoff",
             "h.json",
+            "--vantage",
+            "nova",
         ])
         .expect("put parses") else {
             panic!("parsed as another subcommand")
         };
         assert_eq!(put.handoff, PathBuf::from("h.json"));
+        assert_eq!(put.vantage.as_deref(), Some("nova"));
 
         let Cli::Get(get) = Cli::try_parse_from([
             "netcheck",
@@ -297,10 +305,24 @@ mod tests {
         assert_eq!(get.get.gateway_spec.len(), 1);
 
         // The manifest belongs to the PUT host; a GET that accepted it would
-        // invite running the phase that cannot keep it.
-        assert!(
-            Cli::try_parse_from(["netcheck", "get", "--handoff", "h", "--manifest", "m"]).is_err()
-        );
-        assert!(Cli::try_parse_from(["netcheck", "put", "--manifest", "m"]).is_err());
+        // invite running the phase that cannot keep it. Each call is
+        // otherwise complete, so the only possible error is the stray flag.
+        for (args, stray) in [
+            (
+                ["netcheck", "get", "--handoff", "h", "--manifest", "m"],
+                "--manifest",
+            ),
+            (
+                ["netcheck", "put", "--handoff", "h", "--gateway-spec", "g"],
+                "--gateway-spec",
+            ),
+        ] {
+            let err = Cli::try_parse_from(args).expect_err("a flag of the other phase");
+            assert_eq!(
+                err.kind(),
+                clap::error::ErrorKind::UnknownArgument,
+                "{args:?} must be refused for {stray}, not for something else: {err}"
+            );
+        }
     }
 }
