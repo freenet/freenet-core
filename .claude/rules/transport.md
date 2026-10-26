@@ -870,11 +870,19 @@ exceeds the connection window. The cap does not bind today (2 MiB clamp);
 changes. The windows are the same class of per-connection exception as
 inbound stream reassembly and are in `NOT_SUMMED` in
 `declared_cache_ceiling`, but they are NOT covered by it: they are in
-addition to reassembly, the send window is outbound, and quinn's own
-per-connection state (up to 256 uni streams, packet and ACK bookkeeping,
-assembler, crypto buffers) is not bounded by them. That memory, about twice
-the window per connection plus quinn state, is NOT accounted in the node
-aggregate and must be before QUIC is on by default (rollout gate). The fixed
+addition to reassembly, the send window is outbound, and quinn holds
+received data and per-connection state the windows do not bound. Measured
+(`quic::memory_tests`, jemalloc-rounded, pinned in `quic/config.rs`), one
+connection may hold, per side: `QUIC_ASSEMBLER_HOLD_WINDOW_MULTIPLE` (5) x W
++ streams x `QUIC_ASSEMBLER_HOLD_PER_STREAM_BYTES` (44 KiB) received (quinn
+keeps a whole datagram per STREAM frame until its assembler compacts, and
+copies while the old chunks are alive), W sent, `QUIC_CONNECTION_FIXED_BYTES`
+(64 KiB idle state) and `QUIC_ACK_TAIL_BYTES` (240 KiB, the
+acknowledgement-only packets tracked after the last ack-eliciting send, up
+to quinn-proto's cap of 1000). At 2 GiB and 256 streams that is about
+12.8 MiB.
+That memory is NOT accounted in the node aggregate and must be before QUIC
+is on by default (rollout gate; the per-path ceiling sums these terms). The fixed
 node-wide endpoint buffers are summed whatever `transport-quic` says:
 `INCOMING_BUFFER_TOTAL_BYTES` (quinn's pending attempts) and
 `QUIC_INGRESS_QUEUE_BYTES`.

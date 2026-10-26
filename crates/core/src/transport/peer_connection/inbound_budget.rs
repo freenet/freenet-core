@@ -657,19 +657,9 @@ mod tests {
     /// per doubling).
     #[test]
     fn the_size_class_slack_covers_every_fragment_size() {
-        fn jemalloc_class(n: u64) -> u64 {
-            if n <= 8 {
-                return 8;
-            }
-            if n <= 16 {
-                return 16;
-            }
-            let k = 63 - (n - 1).leading_zeros() as u64; // 2^k < n <= 2^(k+1)
-            let step = 1u64 << (k - 2).max(4);
-            n.div_ceil(step) * step
-        }
+        use crate::util::alloc_count::jemalloc_class;
         let worst = (1..=super::super::MAX_DATA_SIZE as u64)
-            .map(|n| jemalloc_class(n) - n)
+            .map(|n| jemalloc_class(n as usize) as u64 - n)
             .max()
             .unwrap();
         assert!(worst <= PAYLOAD_SIZE_CLASS_SLACK, "worst slack {worst}");

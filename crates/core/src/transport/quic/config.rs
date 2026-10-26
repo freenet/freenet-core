@@ -70,45 +70,112 @@ pub(crate) const INCOMING_BUFFER_BYTES: u64 = 64 * 1024;
 /// Bytes quinn buffers for all connection attempts together.
 pub(crate) const INCOMING_BUFFER_TOTAL_BYTES: u64 = 1024 * 1024;
 
+// What one QUIC connection may hold, per side, measured by
+// `quic::memory_tests` with quinn 0.11.12 / quinn-proto 0.11.19 at the
+// settings of a 2 GiB node (window W = 268,435 B), in bytes rounded up to
+// jemalloc's size classes (`util::alloc_count`), the allocator the node
+// runs on. The terms, which the per-path ceiling (memory gate M2) sums:
+//
+//   QUIC_CONNECTION_FIXED_BYTES                         idle state
+//   + streams x QUIC_ASSEMBLER_HOLD_PER_STREAM_BYTES    } received stream
+//   + QUIC_ASSEMBLER_HOLD_WINDOW_MULTIPLE x W           } data, held by quinn
+//   + W                                                 sent, unacknowledged
+//   + QUIC_ACK_TAIL_BYTES                               ACK records
+//
+// plus the path's own inbound reassembly allowance. Each constant is the
+// largest measurement plus a stated margin; the tests fail if a
+// re-measurement exceeds it, and on a quinn, quinn-proto or rustls bump
+// ([`QUIC_MEMORY_MEASURED_WITH`]) until someone re-measures. None is in
+// `declared_cache_ceiling` yet (memory gate M4).
+
 /// The heap one idle QUIC connection holds on one side, with the
 /// `QuicPath` a node keeps on it: quinn's connection and driver task,
 /// rustls's state and keys, the packet spaces, congestion and connection-ID
 /// state, the connection watcher and the path's receive task and channels.
-/// Not included: anything that grows with traffic (stream data, the
-/// assembler, sent-packet and ACK bookkeeping), which the windows and
-/// stream limits bound separately.
+/// Not included: what grows with traffic (received stream data and the
+/// assembler, sent data, sent-packet and ACK bookkeeping), which the other
+/// terms above cover; per-peer allow-set and demux entries; keep-alive
+/// PINGs and their sent-packet records (off under `VirtualTime`); and
+/// socket buffers, which are per endpoint.
 ///
-/// Measured (`quic::memory_tests`): two endpoints with the settings of a
-/// 2 GiB node on `SimulationSocket` and one `VirtualTime`, on one
-/// current-thread runtime, counting live bytes on that thread with the lib
-/// test binary's counting allocator (`util::alloc_count`). After a warm-up
-/// connection, N connections are opened and settled, the network is cut,
-/// and each side is closed and drained in turn; what each side frees is its
-/// cost, and what both leave behind (endpoint tables grown for N) is charged
-/// to the larger side. Per connection, quinn 0.11.12 / quinn-proto 0.11.19:
+/// Measured: two endpoints on `SimulationSocket` and one `VirtualTime`, on
+/// one current-thread runtime, counting live bytes on that thread. After a
+/// warm-up connection and a settle that must leave the count unchanged, N
+/// connections are opened and settled, the network is cut, and each side
+/// is closed and drained in turn; what each side frees is its cost, and
+/// what both leave behind (endpoint tables grown for N) is charged to the
+/// larger side. Per connection, rounded (requested in brackets):
 ///
-/// | N  | client   | server   | retained | per connection |
-/// |----|----------|----------|----------|----------------|
-/// | 1  | 48,305 B | 48,320 B | 232 B    | 48,552 B       |
-/// | 10 | 48,277 B | 48,062 B | 1,967 B  | 50,245 B       |
-/// | 50 | 48,248 B | 48,144 B | 1,746 B  | 49,995 B       |
+/// | N  | client            | server            | retained        | per connection |
+/// |----|-------------------|-------------------|-----------------|----------------|
+/// | 1  | 52,568 (48,449) B | 52,440 (48,320) B | 96 (88) B       | 52,664 B       |
+/// | 10 | 52,453 (48,335) B | 52,101 (48,005) B | 2,176 (1,968) B | 54,629 B       |
+/// | 16 | 52,404 (48,301) B | 52,370 (48,256) B | 1,980 (1,769) B | 54,384 B       |
+/// | 50 | 52,359 (48,248) B | 52,260 (48,144) B | 1,957 (1,747) B | 54,316 B       |
 ///
-/// The count is the bytes requested from the allocator; jemalloc's size
-/// classes round small allocations up (by at most 25%), which the margin
-/// covers. Set to the largest measurement, 50,245 B, plus 30%, rounded up to
-/// 64 KiB. The `memory_tests` pin fails if a re-measurement exceeds it, and
-/// [`QUIC_MEMORY_MEASURED_WITH`] fails on a quinn or quinn-proto bump until
-/// someone re-measures.
-///
-/// Not yet in `declared_cache_ceiling` (memory gate step M4).
+/// The test runs N = 16. Set to the largest, 54,629 B, plus 20%, rounded
+/// up to 64 KiB.
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const QUIC_CONNECTION_FIXED_BYTES: usize = 64 * 1024;
 
-/// The quinn and quinn-proto versions [`QUIC_CONNECTION_FIXED_BYTES`] was
+/// The receive-side hold per open uni stream, in the per-connection
+/// assembler bound `streams x QUIC_ASSEMBLER_HOLD_PER_STREAM_BYTES +
+/// QUIC_ASSEMBLER_HOLD_WINDOW_MULTIPLE x W`.
+///
+/// quinn keeps every STREAM frame as a slice of the datagram it arrived in
+/// (`quinn/src/endpoint.rs`, one buffer per datagram), so a frame of any
+/// length keeps a 1200-byte datagram (1280 B in jemalloc) alive until the
+/// stream is read or quinn-proto's assembler copies it out. The assembler
+/// copies only when its estimate of the waste passes
+/// `max(32768, 1.5 x buffered)` per stream (quinn-proto
+/// `connection/assembler.rs`, `Assembler::insert`), and nothing past a gap
+/// at the start of a stream can be read. So each stream can hold about
+/// 32 KiB of datagrams for a few bytes of flow-control credit: the
+/// one-byte-frame shape, which peaks at 39,408 B per stream (28 frames,
+/// then compaction; 256 such streams held 10,020,960 B, 39,144 B each).
+/// Set to that peak plus 14%, 44 KiB.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) const QUIC_ASSEMBLER_HOLD_PER_STREAM_BYTES: usize = 44 * 1024;
+
+/// The window-proportional part of the per-connection assembler bound (see
+/// [`QUIC_ASSEMBLER_HOLD_PER_STREAM_BYTES`]).
+///
+/// Past about 22 KB buffered on a stream the proportional threshold
+/// governs, and frames of more than about 460 B never trigger compaction:
+/// the stream then holds a whole datagram for every frame, up to the
+/// window. Frames a little shorter do trigger it, and then the copy is made
+/// while the chunks it copies are still alive. Measured on one stream
+/// filling the window, sweeping every frame length from 160 to 1100 B and
+/// every third below: the highest hold between packets is 3.05 W (470 B
+/// frames), the highest at any instant 4.115 W (444 B frames, 1,104,656 B,
+/// during compaction). Many streams sharing the window hold less (64
+/// streams of 460 B frames: 3.12 W). Set to 5, 22% over 4.115.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) const QUIC_ASSEMBLER_HOLD_WINDOW_MULTIPLE: usize = 5;
+
+/// The acknowledgement-only packets one connection tracks after its last
+/// ack-eliciting send, up to quinn-proto's cap of 1000.
+///
+/// quinn-proto keeps a record of every packet it sends until the peer
+/// acknowledges it or it is declared lost, and it sends an ACK for about
+/// every second packet it receives. It keeps at most 1000
+/// acknowledgement-only records after its last ack-eliciting packet
+/// (`connection/spaces.rs`, `MAX_UNACKED_NON_ACK_ELICTING_TAIL`). Measured
+/// with none of them acknowledged: 212,480 B after 2003 such packets,
+/// 209,920 B after 4003. Set to 212,480 B plus 15%, 240 KiB. The per-path
+/// ceiling (memory gate M2) must re-check this term against quinn-proto's
+/// behaviour.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) const QUIC_ACK_TAIL_BYTES: usize = 240 * 1024;
+
+/// The quinn, quinn-proto and rustls versions the figures above were
 /// measured with, checked against `Cargo.lock` by `quic::memory_tests`.
 #[cfg(test)]
-pub(crate) const QUIC_MEMORY_MEASURED_WITH: [(&str, &str); 2] =
-    [("quinn", "0.11.12"), ("quinn-proto", "0.11.19")];
+pub(crate) const QUIC_MEMORY_MEASURED_WITH: [(&str, &str); 3] = [
+    ("quinn", "0.11.12"),
+    ("quinn-proto", "0.11.19"),
+    ("rustls", "0.23.45"),
+];
 
 /// The smallest flow-control window per connection and direction.
 pub(crate) const MIN_WINDOW_BYTES: u64 = 128 * 1024;
@@ -149,18 +216,19 @@ impl QuicSettings {
 /// NOT mean a QUIC connection holds no more memory than a UDP-transport one:
 /// QUIC windows come on top of whatever the application reassembles, the
 /// send window is outbound memory the reassembly exception never covered,
-/// and quinn keeps per-connection state the windows do not bound (up to 256
-/// unidirectional streams, sent-packet and ACK bookkeeping, the assembler,
-/// crypto buffers).
+/// and quinn holds received data well beyond the window (its assembler keeps
+/// whole datagrams for small frames) and per-connection state the windows do
+/// not bound. The measured terms are listed above
+/// [`QUIC_CONNECTION_FIXED_BYTES`]: about 5 x W received plus 44 KiB per
+/// open stream, W sent, 64 KiB fixed, and the acknowledgement tail.
 ///
 /// The windows are the same class of per-connection exception as inbound
 /// stream reassembly and are in the `NOT_SUMMED` table of
 /// `contract::executor::declared_cache_ceiling` (see the "Recorded
 /// exception: inbound stream reassembly" note in
-/// `.claude/rules/bug-prevention-patterns.md`). That memory, roughly twice
-/// the window per connection plus quinn's own state, is NOT accounted in the
-/// node aggregate, and must be before QUIC is on by default (the rollout
-/// plan records that gate).
+/// `.claude/rules/bug-prevention-patterns.md`). That memory is NOT
+/// accounted in the node aggregate, and must be before QUIC is on by
+/// default (the rollout plan records that gate).
 ///
 /// [`MAX_INBOUND_STREAM_BYTES_PER_CONNECTION`]: crate::transport::peer_connection::streaming::MAX_INBOUND_STREAM_BYTES_PER_CONNECTION
 pub(crate) fn connection_window_bytes(memory_limit: usize, max_connections: usize) -> u64 {

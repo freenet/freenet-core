@@ -888,9 +888,10 @@ flow-control windows (`quic::config::connection_window_bytes`, #5940) are
 the same class of per-connection exception and are in `NOT_SUMMED`. They are
 NOT covered by the reassembly allowance: they come on top of it, the send
 window is outbound, and quinn's own per-connection state is unbounded by
-the windows. That memory (about twice the window per connection plus quinn
-state) is not accounted in the aggregate and must be before QUIC is on by
-default. A node-wide share
+the windows. That memory (measured terms in `quic/config.rs`, about 5 x
+window plus 44 KiB per open stream received, plus the send window, fixed
+state and ACK records) is not accounted in the aggregate and must be before
+QUIC is on by default. A node-wide share
 and fairness between connections are deferred to the transport redesign. Do
 not copy this shape for memory the node holds on its own initiative.
 

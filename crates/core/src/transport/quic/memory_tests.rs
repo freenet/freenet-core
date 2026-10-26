@@ -1,16 +1,21 @@
 //! Heap measurements of the QUIC endpoint (the QUIC memory gate, step M1b).
 //!
 //! Each measurement counts the bytes left allocated on the test's thread
-//! (`util::alloc_count`), so everything measured must allocate and free on
-//! that thread: both endpoints, quinn's drivers and the paths' receive tasks
-//! run on the test's current-thread runtime, over `SimulationSocket` on one
-//! `VirtualTime`, with `GlobalRng` seeded, so a run is repeatable.
+//! (`util::alloc_count`), rounded to jemalloc's size classes, so everything
+//! measured must allocate and free on that thread. The idle-connection
+//! measurement runs both endpoints, quinn's drivers and the paths' receive
+//! tasks on the test's current-thread runtime, over `SimulationSocket` on
+//! one `VirtualTime`, with `GlobalRng` seeded, so a run is repeatable. The
+//! stream measurements drive quinn-proto directly, with no runtime at all.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use super::config::{QUIC_CONNECTION_FIXED_BYTES, QUIC_MEMORY_MEASURED_WITH, QuicSettings};
+use super::config::{
+    QUIC_ACK_TAIL_BYTES, QUIC_ASSEMBLER_HOLD_PER_STREAM_BYTES, QUIC_ASSEMBLER_HOLD_WINDOW_MULTIPLE,
+    QUIC_CONNECTION_FIXED_BYTES, QUIC_MEMORY_MEASURED_WITH, QuicSettings,
+};
 use super::path::{QuicInbound, QuicPath};
 use super::tests::{SEED, bounded, drive};
 use super::{QuicConnection, QuicEndpoint};
@@ -24,7 +29,7 @@ use crate::transport::in_memory_socket::{
     register_network_time_source, set_packet_delivery_callback, unregister_network_time_source,
 };
 use crate::transport::packet_data::MAX_RECV_PACKET_SIZE;
-use crate::util::alloc_count::live_bytes;
+use crate::util::alloc_count::{Live, live_bytes, live_delta, peak_delta};
 
 /// How long, in virtual time, a step may take.
 const LIMIT: Duration = Duration::from_secs(600);
@@ -33,6 +38,11 @@ const LIMIT: Duration = Duration::from_secs(600);
 /// timer and connection-ID exchange after a handshake to finish, and for a
 /// closed connection to drain (three PTOs): about 1 s each here.
 const SETTLE: Duration = Duration::from_secs(30);
+
+/// How far the live count may move across a settle with no connection
+/// change, before the baseline: anything more means traffic or timers were
+/// still running, and the baseline would not be one.
+const SETTLE_DRIFT_BYTES: isize = 1024;
 
 /// The settings of a node with 2 GiB of memory (the shipped `MemoryMax`) and
 /// the default 200 connections: a window of 268,435 bytes.
@@ -55,19 +65,21 @@ struct Held {
 struct Cost {
     n: usize,
     /// Freed when the client side of every connection is closed and drained.
-    client: isize,
+    client: Live,
     /// Freed when the server side is then closed and drained.
-    server: isize,
+    server: Live,
     /// Still allocated after both sides closed, against the baseline: what
     /// the endpoints keep (tables grown for `n` connections).
-    retained: isize,
+    retained: Live,
+    /// The change across one settle just before the baseline.
+    settle_drift: Live,
 }
 
 impl Cost {
-    /// The most one node holds per connection: the larger side, plus the
-    /// retained growth charged to that side alone.
+    /// The most one node holds per connection, in jemalloc-rounded bytes:
+    /// the larger side, plus the retained growth charged to that side alone.
     fn per_connection(&self) -> usize {
-        let side = self.client.max(self.server) + self.retained.max(0);
+        let side = self.client.rounded.max(self.server.rounded) + self.retained.rounded.max(0);
         (side.max(0) as usize).div_ceil(self.n)
     }
 }
@@ -83,10 +95,22 @@ async fn settle(time: &VirtualTime) {
 ///
 /// One connection is opened and closed first so that what the first
 /// connection initialises once per process (lazily built statics, metric
-/// entries, tables at their first size) is not counted. The baseline is
-/// taken after it; then the `n` connections are opened and settled, the
-/// network is cut so neither side hears the other close, the client side is
-/// dropped and drained, then the server side.
+/// entries, tables at their first size) is not counted, then one settle is
+/// checked to leave the count where it was. The baseline is taken after
+/// that; then the `n` connections are opened and settled, the network is
+/// cut so neither side hears the other close, the client side is dropped
+/// and drained, then the server side.
+///
+/// Not counted:
+/// - per-peer state set up before the baseline. Every connection here
+///   comes from one client address, so the server's allow-set permit, its
+///   expected-key entry and the demux socket's allow-set entry exist once,
+///   before the baseline; a node pays them once per peer.
+/// - keep-alives. `VirtualTime` turns them off (`supports_keepalive`), so
+///   the 15 s PING and the sent-packet record each one leaves until it is
+///   acknowledged are not here.
+/// - socket buffers. `SimulationSocket` has none; a real UDP socket's
+///   kernel buffers are per endpoint, not per connection.
 async fn measure(network: &str, subnet: u8, n: usize) -> Cost {
     let _seed = GlobalRng::seed_guard(SEED);
     let a_addr: SocketAddr = format!("10.204.{subnet}.1:5000").parse().unwrap();
@@ -150,6 +174,8 @@ async fn measure(network: &str, subnet: u8, n: usize) -> Cost {
     let mut servers = Vec::with_capacity(n);
     let cut: crate::transport::in_memory_socket::PacketDeliveryCallback =
         Arc::new(|_, _, _| PacketDeliveryDecision::Drop);
+    let before_drift = live_bytes();
+    settle(&time).await;
     let baseline = live_bytes();
     for _ in 0..n {
         let (client, server) =
@@ -158,7 +184,6 @@ async fn measure(network: &str, subnet: u8, n: usize) -> Cost {
         servers.push(hold(server, &time));
     }
     settle(&time).await;
-    let before_cut = live_bytes();
     set_packet_delivery_callback(network, Some(cut));
     let open = live_bytes();
     drop(clients);
@@ -172,12 +197,9 @@ async fn measure(network: &str, subnet: u8, n: usize) -> Cost {
         client: open - servers_only,
         server: servers_only - closed,
         retained: closed - baseline,
+        settle_drift: baseline - before_drift,
     };
-    tracing::info!(
-        ?cost,
-        held = before_cut - baseline,
-        "idle QUIC connections measured"
-    );
+    tracing::info!(?cost, "idle QUIC connections measured");
 
     set_packet_delivery_callback(network, None);
     drop(permit);
@@ -189,15 +211,20 @@ async fn measure(network: &str, subnet: u8, n: usize) -> Cost {
 }
 
 /// An idle QUIC connection, with the `QuicPath` a node keeps on it, holds no
-/// more heap on either side than [`QUIC_CONNECTION_FIXED_BYTES`]. Measured
-/// with 16 connections between two endpoints, so the endpoints' tables have
-/// grown with them and a one-off allocation is spread thin.
+/// more heap on either side than [`QUIC_CONNECTION_FIXED_BYTES`], in
+/// jemalloc-rounded bytes. Measured with 16 connections between two
+/// endpoints, so the endpoints' tables have grown with them and a one-off
+/// allocation is spread thin.
 #[test]
 fn an_idle_connection_holds_at_most_the_declared_fixed_bytes() {
     bounded(|| async move {
         let cost = measure("quic-memory-fixed", 1, 16).await;
         assert!(
-            cost.client > 0 && cost.server > 0,
+            cost.settle_drift.rounded.abs() <= SETTLE_DRIFT_BYTES,
+            "premise: nothing was running before the baseline: {cost:?}"
+        );
+        assert!(
+            cost.client.rounded > 0 && cost.server.rounded > 0,
             "premise: closing each side freed memory: {cost:?}"
         );
         assert!(
@@ -289,48 +316,71 @@ impl ProtoPeer {
     }
 }
 
-/// What a receiver with the node's settings holds for `streams` uni
-/// streams, each sent by a peer as a byte at offset 0 that never arrives
-/// followed by `frames` one-byte STREAM frames at offsets 1..=frames, one
-/// frame per datagram, each datagram padded to 1200 bytes.
+/// One uni stream as a peer sends it: a byte at offset 0 whose datagram
+/// never arrives, then `frames` STREAM frames of `frame_len` bytes at the
+/// offsets after it, one frame per datagram, every datagram padded to the
+/// 1200-byte MTU. Nothing is readable past the gap, so nothing is read.
+#[derive(Debug, Clone, Copy)]
+struct Shape {
+    frame_len: usize,
+    frames: usize,
+}
+
+impl Shape {
+    /// `frames` one-byte frames.
+    fn one_byte(frames: usize) -> Self {
+        Self {
+            frame_len: 1,
+            frames,
+        }
+    }
+
+    /// As many `frame_len`-byte frames as `credit` bytes of flow-control
+    /// credit allow, the byte at offset 0 included.
+    fn filling(frame_len: usize, credit: usize) -> Self {
+        Self {
+            frame_len,
+            frames: (credit - 1) / frame_len,
+        }
+    }
+
+    /// The flow-control credit the stream uses.
+    fn credit(&self) -> usize {
+        1 + self.frame_len * self.frames
+    }
+}
+
+/// What the receiver held while a peer fed it [`Shape`]s.
 #[derive(Debug, Clone)]
 struct GapHold {
-    streams: usize,
-    frames: usize,
-    /// Heap the receiver's packet processing holds after the last frame,
-    /// net of what it held once connected: the streams' received data.
-    held: isize,
-    /// Heap the receiver's sending holds after the last frame: the
-    /// acknowledgements it sent, which it tracks until they are
-    /// acknowledged in turn (never, here). A per-connection term, capped by
-    /// quinn-proto at 1000 such packets after its last ack-eliciting one
-    /// (`connection/spaces.rs`, `MAX_UNACKED_NON_ACK_ELICTING_TAIL`).
-    acks_tracked: isize,
-    /// [`Self::held`] after each frame of the FIRST stream, net of what was
-    /// held before that stream's first frame.
+    /// The receiver's packet processing, net, after the last frame: stream
+    /// state and the data its assembler holds.
+    held: Live,
+    /// The largest rounded [`Self::held`] after any frame.
+    peak: isize,
+    /// The largest rounded hold at any instant, inside a receive call
+    /// included: compaction allocates the copy while the chunks it copies
+    /// are still alive.
+    transient: isize,
+    /// The receiver's sending, net: the acknowledgement-only packets it
+    /// tracks after its last ack-eliciting send (none is acknowledged here).
+    acks_tracked: Live,
+    /// Packets the receiver sent while being fed.
+    receiver_sent: u64,
+    /// Rounded [`Self::held`] after each frame of the first stream.
     first_stream_curve: Vec<isize>,
 }
 
-/// Drive two quinn-proto endpoints by hand: a receiver built with the
-/// node's own endpoint, transport, server and TLS configuration (window
-/// for a 2 GiB node), and a sender whose datagrams the test delivers,
-/// reorders or withholds.
+/// A receiver built with the node's own endpoint, transport, server and TLS
+/// configuration (window for a 2 GiB node) and a sender whose datagrams the
+/// test delivers or withholds, both quinn-proto endpoints driven by hand and
+/// connected; and the time.
 ///
-/// quinn's public API writes a stream in order and retransmits what is
-/// lost, so the gap is made by withholding a datagram: the sender writes
-/// one byte, its datagram is dropped, then each further byte goes out in a
-/// datagram of its own. The sender never receives an acknowledgement, and
-/// its RTT estimate (10 s) keeps its loss timer far past the test's virtual
-/// span, so it never resends the missing byte; its congestion window (1
-/// GiB) and padding to the MTU make every datagram a full 1200 bytes. Only
-/// the receiver's heap is counted: every receiver call runs inside
-/// [`crate::util::alloc_count::live_delta`].
-fn measure_gap_hold(streams: usize, frames: usize) -> GapHold {
+/// The sender pads every datagram to the MTU and has a 1 GiB congestion
+/// window, so neither its window nor its pacer delays a frame.
+fn connected_pair() -> (ProtoPeer, ProtoPeer, Instant) {
     use crate::simulation::RealTime;
-    use crate::util::alloc_count::live_delta;
-    use quinn_proto::Dir;
 
-    let _seed = GlobalRng::seed_guard(SEED);
     let (a_keys, b_keys) = (TransportKeypair::new(), TransportKeypair::new());
     let a_identity = super::identity::QuicIdentity::new(&a_keys).expect("a's identity");
     let b_identity = super::identity::QuicIdentity::new(&b_keys).expect("b's identity");
@@ -361,8 +411,6 @@ fn measure_gap_hold(streams: usize, frames: usize) -> GapHold {
     cubic.initial_window(1 << 30);
     sender_transport
         .pad_to_mtu(true)
-        .initial_rtt(Duration::from_secs(10))
-        .max_idle_timeout(None)
         .congestion_controller_factory(Arc::new(cubic));
     let client = super::config::client_config(
         Arc::new(a_identity.client_tls(&b_peer).expect("client tls")),
@@ -378,8 +426,7 @@ fn measure_gap_hold(streams: usize, frames: usize) -> GapHold {
         ),
         conn: None,
     };
-    let start = Instant::now();
-    let mut now = start;
+    let mut now = Instant::now();
     sender.conn = Some(
         sender
             .endpoint
@@ -411,51 +458,80 @@ fn measure_gap_hold(streams: usize, frames: usize) -> GapHold {
         !sender.conn().is_handshaking() && !receiver.conn().is_handshaking(),
         "the handshake completed"
     );
+    (receiver, sender, now)
+}
 
-    let mut held = 0isize;
-    let mut acks_tracked = 0isize;
-    let mut first_stream_curve = Vec::with_capacity(frames);
+/// Feed a receiver ([`connected_pair`]) one uni stream per [`Shape`], in
+/// order, and measure what it holds.
+///
+/// quinn's public API writes a stream in order and resends what is lost,
+/// so the gap is made by withholding a datagram: the sender writes the byte
+/// at offset 0, its datagram is dropped, then each frame goes out in a
+/// datagram of its own. The test drops every datagram the receiver sends, so
+/// the sender learns nothing of the lost byte from acknowledgements; and it would resend
+/// it only on a PTO, which counts from its last ack-eliciting send (about
+/// 26 ms here, from the handshake's RTT). Sends 100 us apart keep that
+/// timer, and every other sender timer, from falling due; that is asserted
+/// before every send, and that nothing was resent at the end. Only the
+/// receiver's heap is counted: every receiver call runs inside
+/// [`live_delta`].
+fn measure_gap_hold(shapes: &[Shape]) -> GapHold {
+    use quinn_proto::Dir;
+
+    let _seed = GlobalRng::seed_guard(SEED);
+    let (mut receiver, mut sender, mut now) = connected_pair();
+    let window = settings().window_bytes() as usize;
+    let credit: usize = shapes.iter().map(Shape::credit).sum();
+    assert!(credit <= window, "{credit} B of streams exceed the window");
+    let sent_before = receiver.conn().stats().path.sent_packets;
+
     let step = Duration::from_micros(100);
-    for stream in 0..streams {
+    let send = |sender: &mut ProtoPeer, now: Instant, id, payload: &[u8]| {
+        assert!(
+            sender.conn().poll_timeout().is_none_or(|at| at > now),
+            "a sender timer fell due, so it may resend the withheld byte"
+        );
+        let written = sender.conn().send_stream(id).write(payload).expect("write");
+        assert_eq!(written, payload.len(), "flow control took the whole frame");
+        let datagrams = sender.transmit(now);
+        assert_eq!(datagrams.len(), 1, "one frame per datagram");
+        datagrams.into_iter().next().expect("one datagram")
+    };
+    let mut held = Live::default();
+    let mut acks_tracked = Live::default();
+    let mut peak = 0isize;
+    let mut transient = 0isize;
+    let mut first_stream_curve = Vec::new();
+    for (index, shape) in shapes.iter().enumerate() {
         let id = sender
             .conn()
             .streams()
             .open(Dir::Uni)
             .expect("the receiver allows another uni stream");
         // Offset 0: sent, and withheld.
-        sender.conn().send_stream(id).write(&[0]).expect("write");
-        let withheld = sender.transmit(now);
-        assert_eq!(withheld.len(), 1, "offset 0 went out in one datagram");
-        let mut stream_held = 0isize;
-        for offset in 1..=frames {
+        now += step;
+        drop(send(&mut sender, now, id, &[0]));
+        let frame = vec![0x5a; shape.frame_len];
+        for _ in 0..shape.frames {
             now += step;
-            sender
-                .conn()
-                .send_stream(id)
-                .write(&[offset as u8])
-                .expect("write");
-            let datagrams = sender.transmit(now);
-            assert_eq!(datagrams.len(), 1, "one frame per datagram");
+            let datagram = send(&mut sender, now, id, &frame);
             assert_eq!(
-                datagrams[0].len(),
+                datagram.len(),
                 usize::from(super::config::MAX_UDP_PAYLOAD),
                 "padded to the MTU"
             );
-            let (_, delta) = live_delta(|| receiver.receive(now, sender.addr, &datagrams[0]));
+            let (_, delta, inside) = peak_delta(|| receiver.receive(now, sender.addr, &datagram));
+            transient = transient.max(held.rounded + inside);
             // The receiver's acknowledgements are dropped.
             let (_, acks) = live_delta(|| drop(receiver.transmit(now)));
             held += delta;
             acks_tracked += acks;
-            stream_held += delta;
-            if stream == 0 {
-                first_stream_curve.push(stream_held);
+            peak = peak.max(held.rounded);
+            if index == 0 {
+                first_stream_curve.push(held.rounded);
             }
         }
     }
-    assert!(
-        now - start < Duration::from_secs(5),
-        "the sender's loss timer cannot have fired"
-    );
     assert!(
         !receiver.conn().is_closed(),
         "the receiver kept the connection open"
@@ -463,91 +539,150 @@ fn measure_gap_hold(streams: usize, frames: usize) -> GapHold {
     assert_eq!(
         sender.conn().stats().path.lost_packets,
         0,
-        "the sender resent nothing"
+        "the sender declared nothing lost"
     );
     GapHold {
-        streams,
-        frames,
         held,
+        peak,
+        transient,
         acks_tracked,
+        receiver_sent: receiver.conn().stats().path.sent_packets - sent_before,
         first_stream_curve,
     }
 }
 
-/// The most a receiver holds for one uni stream whose offset 0 has not
-/// arrived. quinn-proto 0.11.19's assembler (`connection/assembler.rs`,
-/// `Assembler::insert`) copies a stream's chunks out only once their
-/// estimated over-allocation passes `32768.max(buffered * 3 / 2)`, and it
-/// estimates each frame's allocation as its packet's payload (about 1150 B
-/// of a 1200 B datagram, after header and AEAD tag). The real allocation is
-/// the whole datagram plus a `Bytes` header and a heap entry, about 1240 B,
-/// so about 28 one-byte frames (34.7 KB) are held before it compacts, plus
-/// the stream's own state. Derived from the source; the measurement it was
-/// checked against (36,794 B peak, at 28 frames) is in the test below.
-const ASSEMBLER_HOLD_PER_STREAM_BOUND: isize = 40 * 1024;
+/// The node's flow-control window at 2 GiB, the most stream data a peer can
+/// have in flight on a connection.
+fn window() -> usize {
+    settings().window_bytes() as usize
+}
 
-/// A peer that sends one-byte frames above a gap at offset 0, one per
-/// padded datagram, makes the receiver hold about one datagram per frame
-/// until the assembler's estimated over-allocation passes 32 KiB and it
-/// copies the bytes out. Per stream that stays under
-/// [`ASSEMBLER_HOLD_PER_STREAM_BOUND`] whatever the number of frames, and
-/// comes within a few KiB of it at the peak, so the bound is not loose.
+/// The per-connection assembler bound for `streams` streams:
+/// `streams x QUIC_ASSEMBLER_HOLD_PER_STREAM_BYTES` plus
+/// `QUIC_ASSEMBLER_HOLD_WINDOW_MULTIPLE x W`.
+fn assembler_bound(streams: usize) -> isize {
+    (streams * QUIC_ASSEMBLER_HOLD_PER_STREAM_BYTES
+        + QUIC_ASSEMBLER_HOLD_WINDOW_MULTIPLE * window()) as isize
+}
+
+/// One-byte frames above a gap hold about one datagram per frame until the
+/// assembler's waste estimate passes 32 KiB and it compacts: one stream
+/// peaks under [`QUIC_ASSEMBLER_HOLD_PER_STREAM_BYTES`] and drops after
+/// compaction, and [`MAX_UNI_STREAMS`] such streams, which use almost none
+/// of the window, hold less than that many times the bound.
 ///
-/// Measured with quinn-proto 0.11.19 at a 2 GiB node's window: one stream
-/// rises about 1240 B per frame to 36,794 B at 28 frames, falls to about
-/// 1.9 KB when the 29th frame triggers compaction, and peaks at the same
-/// value in every later cycle; 256 streams of 28 frames held 9,384,032 B
-/// (36,656 B per stream). The acknowledgements the receiver sends, which
-/// such a peer never acknowledges, are counted apart (`acks_tracked`):
-/// about 191 KB per connection once quinn-proto's 1000-packet cap is
-/// reached.
+/// [`MAX_UNI_STREAMS`]: super::config::MAX_UNI_STREAMS
 #[test]
-fn a_gapped_stream_holds_at_most_the_assembler_bound() {
-    let single = measure_gap_hold(1, 64);
-    let peak = *single.first_stream_curve.iter().max().expect("frames");
+fn one_byte_frames_hold_at_most_the_per_stream_bound() {
+    let single = measure_gap_hold(&[Shape::one_byte(64)]);
+    let curve = &single.first_stream_curve;
+    let peak = *curve.iter().max().expect("frames");
+    let at = curve.iter().position(|held| *held == peak).expect("peak");
     assert!(
-        peak <= ASSEMBLER_HOLD_PER_STREAM_BOUND,
+        peak <= QUIC_ASSEMBLER_HOLD_PER_STREAM_BYTES as isize,
         "one stream peaked at {peak} B: {single:?}"
     );
     assert!(
-        peak >= 28 * 1024,
-        "premise: the datagrams were held until compaction: peak {peak} B, {single:?}"
-    );
-    let peak_frames = 1 + single
-        .first_stream_curve
-        .iter()
-        .position(|held| *held == peak)
-        .expect("peak");
-    let many = measure_gap_hold(16, peak_frames);
-    let per_stream = many.held / many.streams as isize;
-    assert!(
-        per_stream <= ASSEMBLER_HOLD_PER_STREAM_BOUND,
-        "{per_stream} B per stream with {} streams of {} frames",
-        many.streams,
-        many.frames
-    );
-    assert!(
-        per_stream >= 28 * 1024,
-        "premise: every stream held its datagrams: {per_stream} B per stream"
+        peak >= 32 * 1024 && curve[at + 1] < 8 * 1024,
+        "premise: datagrams were held until compaction, then copied out: {curve:?}"
     );
 
-    // The unacknowledged acknowledgements stop growing at quinn-proto's
-    // 1000-packet cap: 3000 and 6000 frames leave the same tail.
-    let (half, full) = (measure_gap_hold(1, 3000), measure_gap_hold(1, 6000));
+    let streams = super::config::MAX_UNI_STREAMS as usize;
+    let many = measure_gap_hold(&vec![Shape::one_byte(at + 1); streams]);
+    let bound = (streams * QUIC_ASSEMBLER_HOLD_PER_STREAM_BYTES) as isize;
     assert!(
-        full.acks_tracked <= 256 * 1024 && full.acks_tracked - half.acks_tracked < 8 * 1024,
-        "the acknowledgement tail grew past the cap: {} B after 3000 frames, {} B after 6000",
-        half.acks_tracked,
-        full.acks_tracked
+        many.transient <= bound,
+        "{streams} streams of {} one-byte frames held {} B, over {bound} B: {many:?}",
+        at + 1,
+        many.transient
+    );
+    assert!(
+        many.held.rounded >= streams as isize * 32 * 1024,
+        "premise: every stream held its datagrams: {many:?}"
     );
 }
 
-/// [`QUIC_CONNECTION_FIXED_BYTES`] and the assembler bound were measured
-/// with the quinn and quinn-proto versions in [`QUIC_MEMORY_MEASURED_WITH`].
-/// A bump of either fails here until someone re-runs the measurements
-/// above, updates the figures in the constants' docs, and moves the pin.
+/// Frames long enough that the proportional compaction threshold governs
+/// make a stream hold a datagram per frame up to the window, and compaction
+/// copies while the old chunks are alive; whatever the shape, the hold at
+/// any instant stays under the assembler bound ([`assembler_bound`]). The
+/// shapes are the worst a sweep of frame lengths found (see the constants'
+/// docs) and the ways to combine them: one stream filling the window at
+/// 444 B (highest at any instant, 4.115 W), at 470 B (highest between
+/// packets, 3.05 W) and at 50 B (thousands of short frames, compacted again
+/// and again); 64 streams sharing it; and 255 one-byte streams beside one
+/// that fills the rest.
 #[test]
-fn quic_memory_figures_match_the_locked_quinn_versions() {
+fn frames_filling_the_window_hold_at_most_the_assembler_bound() {
+    let w = window();
+    let mut mixed = vec![Shape::one_byte(28); super::config::MAX_UNI_STREAMS as usize - 1];
+    let used: usize = mixed.iter().map(Shape::credit).sum();
+    mixed.push(Shape::filling(444, w - used));
+    let cases: Vec<(&str, Vec<Shape>)> = vec![
+        ("444 B frames", vec![Shape::filling(444, w)]),
+        ("470 B frames", vec![Shape::filling(470, w)]),
+        ("50 B frames", vec![Shape::filling(50, w)]),
+        (
+            "64 streams of 460 B frames",
+            vec![Shape::filling(460, w / 64); 64],
+        ),
+        ("255 one-byte streams and one of 444 B frames", mixed),
+    ];
+    for (name, shapes) in cases {
+        let hold = measure_gap_hold(&shapes);
+        let bound = assembler_bound(shapes.len());
+        assert!(
+            hold.transient <= bound,
+            "{name}: held {} B at most, over the bound {bound} B: {hold:?}",
+            hold.transient
+        );
+        if name == "470 B frames" {
+            assert!(
+                hold.peak as f64 >= 2.8 * w as f64,
+                "premise: no compaction, a datagram held per frame: {} B",
+                hold.peak
+            );
+        }
+        if name == "444 B frames" {
+            assert!(
+                hold.transient as f64 >= 3.5 * w as f64,
+                "premise: the worst shape held more than 3.5 x W: {} B",
+                hold.transient
+            );
+        }
+    }
+}
+
+/// The receiver tracks the acknowledgement-only packets it sends after its
+/// last ack-eliciting send up to quinn-proto's cap of 1000; with none of
+/// them acknowledged, they stay under [`QUIC_ACK_TAIL_BYTES`].
+#[test]
+fn unacknowledged_acks_stop_at_the_tail_bound() {
+    for frames in [4000, 8000] {
+        let hold = measure_gap_hold(&[Shape::one_byte(frames)]);
+        assert!(
+            hold.receiver_sent >= 2000,
+            "premise: twice quinn-proto's cap of acknowledgements were sent: {hold:?}"
+        );
+        assert!(
+            hold.acks_tracked.rounded >= 100 * 1024,
+            "premise: the acknowledgements were tracked: {hold:?}"
+        );
+        assert!(
+            hold.acks_tracked.rounded <= QUIC_ACK_TAIL_BYTES as isize,
+            "{} B of acknowledgement records after {frames} frames, over \
+             QUIC_ACK_TAIL_BYTES ({QUIC_ACK_TAIL_BYTES} B)",
+            hold.acks_tracked.rounded
+        );
+    }
+}
+
+/// The figures in `quic::config` were measured with the quinn, quinn-proto
+/// and rustls versions in [`QUIC_MEMORY_MEASURED_WITH`]. A bump of any fails
+/// here until someone re-runs the measurements above, updates the figures
+/// in the constants' docs, and moves the pin.
+#[test]
+fn quic_memory_figures_match_the_locked_versions() {
     const LOCK: &str = include_str!("../../../../../Cargo.lock");
     for (name, measured) in QUIC_MEMORY_MEASURED_WITH {
         let header = format!("[[package]]\nname = \"{name}\"\nversion = \"");

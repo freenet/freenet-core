@@ -2920,17 +2920,20 @@ mod tests {
             ),
             // The QUIC flow-control windows are the same class of
             // per-connection exception as inbound stream reassembly (see the
-            // MAX_STREAM_TOTAL_BYTES row). This memory, about twice the window
-            // per connection plus quinn's own per-connection state, is NOT
-            // accounted in this aggregate, and must be before QUIC is on by
-            // default (a gate in the #5940 rollout plan). The windows are in
-            // addition to reassembly, not covered by it.
+            // MAX_STREAM_TOTAL_BYTES row). The memory one QUIC connection may
+            // hold (measured terms in quic::config, above
+            // QUIC_CONNECTION_FIXED_BYTES) is NOT accounted in this aggregate,
+            // and must be before QUIC is on by default (a gate in the #5940
+            // rollout plan). It is in addition to reassembly, not covered by
+            // it.
             (
                 "connection_window_bytes",
-                "one QUIC connection's flow-control window: a per-connection \
-                 exception like MAX_STREAM_TOTAL_BYTES; this memory (about 2 x \
-                 window per connection plus quinn state) is not accounted here, \
-                 and must be before QUIC is on by default",
+                "one QUIC connection's flow-control window W: a per-connection \
+                 exception like MAX_STREAM_TOTAL_BYTES; a connection may hold \
+                 QUIC_ASSEMBLER_HOLD_WINDOW_MULTIPLE x W + streams x \
+                 QUIC_ASSEMBLER_HOLD_PER_STREAM_BYTES received, W sent, \
+                 QUIC_CONNECTION_FIXED_BYTES and QUIC_ACK_TAIL_BYTES; not \
+                 accounted here, and must be before QUIC is on by default",
             ),
             (
                 "MIN_WINDOW_BYTES",
@@ -2945,10 +2948,26 @@ mod tests {
                 "quinn's buffer for ONE pending QUIC connection attempt, inside \
                  INCOMING_BUFFER_TOTAL_BYTES",
             ),
+            // Measured terms of the per-QUIC-path ceiling, beside the windows
+            // above: summed, through that ceiling, once a QUIC path cap exists
+            // (memory gate M4).
             (
                 "QUIC_CONNECTION_FIXED_BYTES",
-                "measured per-connection term; summed once a QUIC path cap exists \
-                 (memory gate M4)",
+                "one term of the per-path ceiling (idle connection state), with the \
+                 windows, the assembler hold and the ack tail; summed once a QUIC \
+                 path cap exists (memory gate M4)",
+            ),
+            (
+                "QUIC_ASSEMBLER_HOLD_PER_STREAM_BYTES",
+                "one term of the per-path ceiling (received data held per stream), \
+                 with the windows, the fixed state and the ack tail; summed once a \
+                 QUIC path cap exists (memory gate M4)",
+            ),
+            (
+                "QUIC_ACK_TAIL_BYTES",
+                "one term of the per-path ceiling (unacknowledged ACK records), with \
+                 the windows, the fixed state and the assembler hold; summed once a \
+                 QUIC path cap exists (memory gate M4)",
             ),
             (
                 "READ_START_BYTES",
