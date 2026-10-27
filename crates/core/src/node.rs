@@ -69,6 +69,8 @@ pub(crate) use network_bridge::p2p_protoc::{
     SUMMARY_FIRST_PUT_MIN_VERSION, version_supports_broadcast_target_list,
     version_supports_hash_first_summaries, version_supports_summary_first_put,
 };
+// The visited-peers bloom gates its index check on the handshake floor (#5994).
+pub(crate) use network_bridge::p2p_protoc::parse_crate_version;
 // Test-only: the release-timing marker has no runtime reader by design (see
 // its rustdoc), so re-exporting it unconditionally is an unused import in the
 // non-test build.
