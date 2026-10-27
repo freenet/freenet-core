@@ -4399,42 +4399,54 @@ async fn a_node_without_the_contract(
     // must be the farthest of all listed nodes. A descending chain only visits
     // strictly closer nodes, so it never reaches the probe.
     //
-    // This is a heuristic. It rests on a snapshot of node-a's connections (read
-    // from its diagnostics) taken before the PUT, and the code does not check that
-    // the network is fully connected or that routing picks the closest peer: the
-    // router also tries peers with no routing history first while it has few
-    // routing events. Earlier, without the snapshot, node-a's first hop was a
-    // farther node in 1 of 116 PUTs because it was not connected to the gateway at
-    // that moment. If the premise fails (connections change, or the router picks
-    // an untried farther peer), the local-presence probe after the PUT fails the
-    // test loudly instead of letting it pass vacuously. There are no retries.
+    // The guard has a precondition the argument above depends on: a relay can
+    // only tell that the chain descended to reach it if its UPSTREAM is one of
+    // its own ring connections (`put_routing_should_terminate` resolves the
+    // upstream's location through the relay's connection table, and treats an
+    // unresolvable upstream as "keep forwarding"). Ring membership is not always
+    // symmetric: while a CONNECT completes, the acceptor can hold the joiner in
+    // its ring before the joiner holds the acceptor. A relay reached from such
+    // an upstream is unguarded and forwards to any peer it has, farther or not.
+    // That is how this helper failed on 2026-10-27: the gateway had node-d in its
+    // ring, node-d did not yet have the gateway, so the descending chain
+    // node-a -> gateway -> node-d did not stop at node-d (the closest node to the
+    // key) but went on to node-c and then to the probe, node-b.
+    //
+    // So the key is chosen against a model of every route the PUT could take on
+    // the ring as each node reports it (`put_may_reach`), and that report is read
+    // until two consecutive readings agree, so the model is not built from a
+    // topology that is changing under it.
+    //
+    // This is still a model, not a guarantee. It assumes node-a's first hop is
+    // its closest connected peer, while the router also tries peers with no
+    // routing history first when it has few routing events (earlier, before
+    // node-a's connections were read at all, its first hop was a farther node in
+    // 1 of 116 PUTs). And connections can still change between the reading and
+    // the PUT. If the premise fails, the local-presence probe after the PUT fails
+    // the test loudly instead of letting it pass vacuously. There are no retries.
     //
     assert!(
         !tag.is_empty(),
         "tag must be non-empty and unique per calling test"
     );
-    // Read the real ring positions and node-a's connections, search salts (pure
-    // computation, no network, no sleeping) for a key that satisfies the above,
+    // Read the real ring positions and every node's ring connections, search
+    // salts (pure computation, no network) for a key that satisfies the above,
     // PUT it once, and probe that the chosen node does not hold it.
     let publisher_name = "node-a";
-    let mut ring_positions: Vec<(String, f64)> = Vec::new();
-    // (address, ring position) of each peer node-a was connected to at snapshot time.
-    let mut publisher_peers: Vec<(String, f64)> = Vec::new();
-    for name in ["gateway", publisher_name].iter().chain(candidates.iter()) {
-        let node = ctx.node(name)?;
-        let (stream, _) = connect_async(&node.ws_url()).await?;
-        let mut client = WebApi::start(stream);
-        let (own, peers) = node_ring_location(&mut client).await?;
-        if *name == publisher_name {
-            publisher_peers = peers;
-        }
-        ring_positions.push((name.to_string(), own));
-    }
+    let names: Vec<&str> = ["gateway", publisher_name]
+        .into_iter()
+        .chain(candidates.iter().copied())
+        .collect();
+    let views = settled_ring_views(ctx, &names).await?;
+    let ring_positions: Vec<(String, f64)> = views
+        .iter()
+        .map(|view| (view.name.clone(), view.position))
+        .collect();
     let position_of = |name: &str| {
-        ring_positions
+        views
             .iter()
-            .find(|(n, _)| n == name)
-            .map(|(_, loc)| freenet::dev_tool::Location::new(*loc))
+            .find(|view| view.name == name)
+            .map(|view| freenet::dev_tool::Location::new(view.position))
             .expect("position recorded for every node")
     };
 
@@ -4447,31 +4459,18 @@ async fn a_node_without_the_contract(
         let contract = load_contract(contract_name, Parameters::from(raw))?;
         let key_location = freenet::dev_tool::Location::from(&contract.key());
         let distance = |name: &str| position_of(name).distance(key_location).as_f64();
-        const MARGIN: f64 = 1e-6;
-        // The publisher's first hop must descend: its closest CONNECTED peer
-        // (as reported by its diagnostics just now) must be strictly closer to the
-        // key than the publisher itself.
-        let closest_peer = publisher_peers
-            .iter()
-            .map(|(_, loc)| {
-                freenet::dev_tool::Location::new(*loc)
-                    .distance(key_location)
-                    .as_f64()
-            })
-            .fold(f64::INFINITY, f64::min);
-        if closest_peer + MARGIN >= distance(publisher_name) {
-            continue;
-        }
         for probe in candidates {
             let probe_distance = distance(probe);
             // Strictly farther than every other node, with a margin so a
-            // rounding difference cannot flip the order.
+            // rounding difference cannot flip the order. This is what keeps a
+            // guarded, descending chain away from the probe even if symmetric
+            // connections are added after the reading.
             let farthest = ring_positions
                 .iter()
                 .map(|(n, _)| n.as_str())
                 .filter(|n| n != probe)
-                .all(|n| distance(n) + MARGIN < probe_distance);
-            if farthest {
+                .all(|n| distance(n) + RING_DISTANCE_MARGIN < probe_distance);
+            if farthest && !put_may_reach(&views, publisher_name, probe, key_location) {
                 chosen = Some((contract, probe));
                 break 'keys;
             }
@@ -4479,10 +4478,9 @@ async fn a_node_without_the_contract(
     }
     let Some((contract, probe)) = chosen else {
         bail!(
-            "no key among 256 salts of one tag gives {publisher_name} a connected peer closer to the key \
-             than itself with a candidate farthest of all; positions: {ring_positions:?}, \
-             {publisher_name} peers (address, position): {publisher_peers:?}. Failing rather than \
-             passing vacuously."
+            "no key among 256 salts of one tag puts a candidate farthest of all from the key \
+             AND out of reach of every route a PUT from {publisher_name} could take; ring as \
+             reported: {views:?}. Failing rather than passing vacuously."
         );
     };
     let contract_key = contract.key();
@@ -4501,6 +4499,7 @@ async fn a_node_without_the_contract(
     );
     tracing::info!(
         ?ring_positions,
+        ?views,
         probe,
         "#5627: ring layout and chosen probe node"
     );
@@ -4518,16 +4517,250 @@ async fn a_node_without_the_contract(
     ensure!(
         !holds,
         "{probe} holds the contract although the ring layout {ring_positions:?} should have kept \
-         the PUT away from it. Failing rather than passing vacuously: a delegate operation on \
-         {probe} would be answered from the local store and this run could not observe #5542 at \
-         all. The routing model described in this helper (#5627) no longer holds; re-derive it."
+         the PUT away from it (ring connections as read before the PUT: {views:?}). Failing \
+         rather than passing vacuously: a delegate operation on {probe} would be answered from \
+         the local store and this run could not observe #5542 at all. The routing model described \
+         in this helper (#5627) no longer holds; re-derive it."
     );
     Ok((client, contract))
 }
 
+/// Margin for comparing ring distances, so a rounding difference cannot flip an
+/// order the helper relies on.
+const RING_DISTANCE_MARGIN: f64 = 1e-6;
+
+/// One node's part of the ring as PUT routing sees it.
+#[derive(Debug, Clone, PartialEq)]
+struct RingView {
+    name: String,
+    /// The node's own address, as its peers know it.
+    addr: String,
+    /// Address-derived ring position (what PUT routing compares).
+    position: f64,
+    /// Addresses of the node's RING connections, sorted. These are the only
+    /// peers it routes to, and the only upstreams whose location the PUT
+    /// terminus guard can resolve.
+    peers: Vec<String>,
+}
+
+/// Read every node's [`RingView`], repeating until two consecutive readings
+/// agree, so the routing model is not built from a topology that is changing
+/// while it is read (connection maintenance can be mid-CONNECT when a test
+/// starts). Fails if the ring does not settle within 60 s, or if a node reports
+/// a ring peer that is not one of `names`.
+async fn settled_ring_views(
+    ctx: &mut TestContext,
+    names: &[&str],
+) -> anyhow::Result<Vec<RingView>> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    let mut previous: Option<Vec<RingView>> = None;
+    loop {
+        let mut views = Vec::with_capacity(names.len());
+        for name in names {
+            let node = ctx.node(name)?;
+            let (stream, _) = connect_async(&node.ws_url()).await?;
+            let mut client = WebApi::start(stream);
+            let (addr, position, mut peers) = node_ring_view(&mut client).await?;
+            peers.sort();
+            views.push(RingView {
+                name: name.to_string(),
+                addr,
+                position,
+                peers,
+            });
+        }
+        for view in &views {
+            for peer in &view.peers {
+                ensure!(
+                    views.iter().any(|other| &other.addr == peer),
+                    "{} reports a ring peer {peer} that is not one of {names:?}: {views:?}",
+                    view.name
+                );
+            }
+        }
+        if previous.as_ref() == Some(&views) {
+            return Ok(views);
+        }
+        ensure!(
+            std::time::Instant::now() < deadline,
+            "the ring did not settle within 60s; last two readings: {previous:?} and {views:?}"
+        );
+        previous = Some(views);
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+}
+
+/// Whether a PUT published by `publisher` for a key at `key` could reach
+/// `probe`, over every route PUT relay routing allows on the ring in `views`.
+///
+/// The model, per hop, mirrors `put_routing_should_terminate` in
+/// `crates/core/src/operations/put/op_ctx_task.rs`:
+/// - The publisher forwards to its closest ring peer. If that peer is not
+///   strictly closer to the key than the publisher, the descending argument
+///   does not apply and this returns `true` (reject the key).
+/// - A relay is GUARDED when its upstream is one of its own ring connections
+///   AND it is strictly closer to the key than that upstream. A guarded relay
+///   forwards only to a peer strictly closer than itself; otherwise it stops.
+/// - An unguarded relay may forward to ANY ring peer the PUT has not visited.
+///   The upstream-not-in-my-ring case is the one that defeated the old model.
+///
+/// Distances use [`RING_DISTANCE_MARGIN`] in the direction that admits more
+/// routes, so a rounding difference can only make the model more pessimistic.
+fn put_may_reach(
+    views: &[RingView],
+    publisher: &str,
+    probe: &str,
+    key: freenet::dev_tool::Location,
+) -> bool {
+    let index_of_name = |name: &str| {
+        views
+            .iter()
+            .position(|view| view.name == name)
+            .expect("every named node has a view")
+    };
+    let dist: Vec<f64> = views
+        .iter()
+        .map(|view| {
+            freenet::dev_tool::Location::new(view.position)
+                .distance(key)
+                .as_f64()
+        })
+        .collect();
+    let peers: Vec<Vec<usize>> = views
+        .iter()
+        .map(|view| {
+            view.peers
+                .iter()
+                .filter_map(|addr| views.iter().position(|other| &other.addr == addr))
+                .collect()
+        })
+        .collect();
+    let publisher = index_of_name(publisher);
+    let probe = index_of_name(probe);
+
+    let Some(first) = peers[publisher].iter().copied().min_by(|a, b| {
+        dist[*a]
+            .partial_cmp(&dist[*b])
+            .expect("ring distances are not NaN")
+    }) else {
+        return true;
+    };
+    if dist[first] + RING_DISTANCE_MARGIN >= dist[publisher] {
+        return true;
+    }
+
+    // Depth-first over simple paths: (node holding the PUT, its upstream,
+    // nodes already on the path). The real skip list contains at least the
+    // path, so treating only the path as visited admits more routes, never fewer.
+    let mut stack = vec![(first, publisher, (1u64 << publisher) | (1u64 << first))];
+    while let Some((here, upstream, visited)) = stack.pop() {
+        if here == probe {
+            return true;
+        }
+        let guarded =
+            peers[here].contains(&upstream) && dist[here] + RING_DISTANCE_MARGIN < dist[upstream];
+        for &next in &peers[here] {
+            if visited & (1u64 << next) != 0 {
+                continue;
+            }
+            if guarded && dist[next] >= dist[here] + RING_DISTANCE_MARGIN {
+                continue;
+            }
+            stack.push((next, here, visited | (1u64 << next)));
+        }
+    }
+    false
+}
+
+/// The ring connections from the failing run of 2026-10-27, read from its log:
+/// `(name, address, ring position, ring peers by name)`.
+fn ring_of_2026_10_27(node_d_has_gateway: bool) -> Vec<RingView> {
+    let nodes: [(&str, &str, f64, &[&str]); 5] = [
+        (
+            "gateway",
+            "127.162.75.1:49402",
+            0.21972066104683402,
+            &["node-a", "node-b", "node-c", "node-d"],
+        ),
+        (
+            "node-a",
+            "127.162.76.1:46034",
+            0.6999106339873574,
+            &["gateway", "node-b"],
+        ),
+        (
+            "node-b",
+            "127.162.77.1:43812",
+            0.12925405100227003,
+            &["gateway", "node-c", "node-a"],
+        ),
+        (
+            "node-c",
+            "127.162.78.1:53776",
+            0.21855092344577773,
+            &["gateway", "node-d", "node-b"],
+        ),
+        (
+            "node-d",
+            "127.162.79.1:40821",
+            0.25703084314563757,
+            if node_d_has_gateway {
+                &["node-c", "gateway"]
+            } else {
+                &["node-c"]
+            },
+        ),
+    ];
+    let addr_of = |name: &str| {
+        nodes
+            .iter()
+            .find(|(n, ..)| *n == name)
+            .map(|(_, addr, ..)| addr.to_string())
+            .expect("known node")
+    };
+    nodes
+        .iter()
+        .map(|(name, addr, position, peers)| {
+            let mut peers: Vec<String> = peers.iter().map(|p| addr_of(p)).collect();
+            peers.sort();
+            RingView {
+                name: name.to_string(),
+                addr: addr.to_string(),
+                position: *position,
+                peers,
+            }
+        })
+        .collect()
+}
+
+/// The 2026-10-27 failure, replayed through the model. The key's location is
+/// that of the contract the run chose (`8XMe18ntoY3gEmbKxXdi1B5T2MkNaCUViN1iSnXix7HZ`).
+/// Its PUT went node-a -> gateway -> node-d -> node-c -> node-b: node-d had not
+/// yet added the gateway to its ring, so it could not tell it had descended and
+/// forwarded past the local minimum. The model must reject that key, and must
+/// accept it once node-d's ring holds the gateway (the guard then stops the
+/// PUT at node-d, as the old model assumed).
+#[test]
+fn put_route_model_rejects_the_2026_10_27_layout() {
+    let key = freenet::dev_tool::Location::new(0.43665417762580117);
+    // The old premise held: node-b is farthest of all from the key, and
+    // node-a's closest peer (the gateway) is closer to the key than node-a.
+    let views = ring_of_2026_10_27(false);
+    assert!(
+        put_may_reach(&views, "node-a", "node-b", key),
+        "node-d is unguarded (its upstream, the gateway, is not in its ring), so the PUT \
+         can continue past it to node-c and node-b"
+    );
+    let views = ring_of_2026_10_27(true);
+    assert!(
+        !put_may_reach(&views, "node-a", "node-b", key),
+        "with symmetric rings the PUT stops at node-d, the closest node to the key"
+    );
+}
+
 /// The ring position PUT routing uses for `client`'s node (derived from its
-/// address), and the ring positions of the peers it is connected to right now.
-async fn node_ring_location(client: &mut WebApi) -> anyhow::Result<(f64, Vec<(String, f64)>)> {
+/// address), its address, and the addresses of its ring connections right now.
+async fn node_ring_view(client: &mut WebApi) -> anyhow::Result<(String, f64, Vec<String>)> {
     let config = freenet_stdlib::client_api::NodeDiagnosticsConfig {
         include_node_info: true,
         include_network_info: false,
@@ -4553,19 +4786,23 @@ async fn node_ring_location(client: &mut WebApi) -> anyhow::Result<(f64, Vec<(St
                 // PUT routing compares address-derived positions
                 // (`ConnectionManager::own_location`), NOT the position in
                 // `NodeInfo::location`, which the harness assigns at random.
-                let own = freenet::dev_tool::Location::from_address(&addr.parse()?).as_f64();
+                let addr: std::net::SocketAddr = addr
+                    .parse()
+                    .with_context(|| format!("bad node address {addr}"))?;
+                let own = freenet::dev_tool::Location::from_address(&addr).as_f64();
+                // `connected_peers_detailed` lists ring connections only
+                // (`connections_by_location`), not transient transports.
+                // Addresses are normalised through `SocketAddr` so they compare
+                // equal to the peers' own `listening_address`.
                 let mut peers = Vec::new();
                 for peer in &response.connected_peers_detailed {
-                    let addr = peer
+                    let peer_addr: std::net::SocketAddr = peer
                         .address
                         .parse()
                         .with_context(|| format!("bad peer address {}", peer.address))?;
-                    peers.push((
-                        peer.address.clone(),
-                        freenet::dev_tool::Location::from_address(&addr).as_f64(),
-                    ));
+                    peers.push(peer_addr.to_string());
                 }
-                return Ok((own, peers));
+                return Ok((addr.to_string(), own, peers));
             }
             Ok(Ok(other)) => tracing::debug!(?other, "ignoring while awaiting diagnostics"),
             Ok(Err(e)) => bail!("websocket error awaiting diagnostics: {e}"),
