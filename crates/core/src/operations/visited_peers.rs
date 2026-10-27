@@ -45,7 +45,7 @@ pub(crate) const REPAIRED_INDICES_MIN_VERSION: (u8, u8, u16) = (0, 2, 151);
 /// and must stay strictly above the crate version. Checked by
 /// `repaired_indices_floor_tracks_the_shipping_release`, mirroring
 /// `ACK_VERSION_SHIPPED_IN`.
-pub(crate) const REPAIRED_INDICES_SHIPPED_IN: Option<(u8, u8, u16)> = None;
+pub(crate) const REPAIRED_INDICES_SHIPPED_IN: Option<(u8, u8, u16)> = Some((0, 2, 151));
 
 /// Whether [`VisitedPeers::probably_visited`] tests the repaired indices.
 ///
