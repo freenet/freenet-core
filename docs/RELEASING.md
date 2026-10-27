@@ -391,8 +391,8 @@ Current wire-gated floors:
   (`min-compatible-version`) reaches it, because a filter mixes bits from every
   release on the path.
 
-  Set to **`(0, 2, 151)`** and guarded by `REPAIRED_INDICES_SHIPPED_IN`
-  (currently `None`), checked by
+  Set to **`(0, 2, 151)`** and guarded by `REPAIRED_INDICES_SHIPPED_IN`,
+  now `Some((0, 2, 151))` (the repaired marking shipped in 0.2.151), checked by
   `visited_peers::tests::repaired_indices_floor_tracks_the_shipping_release`.
   When the 0.2.151 bump fails that test, set the marker to
   `Some(REPAIRED_INDICES_MIN_VERSION)` if the release carries #5994's fix,
