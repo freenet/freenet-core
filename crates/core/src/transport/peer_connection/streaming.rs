@@ -107,10 +107,12 @@ pub(crate) const MAX_STREAM_TOTAL_BYTES: u64 = (crate::wasm_runtime::MAX_STATE_S
 /// stream arriving while one is held may be refused; its operation fails
 /// and is retried like any other transfer failure.
 ///
-/// Per connection: a node with many connections can hold this much for each.
-/// Charges are dropped with the connection, but an unclaimed buffer can be
-/// kept by the orphan stream registry for up to its 60 s GC interval after
-/// the connection has gone.
+/// Per peer: the UDP connection's budget, which a QUIC path to the same peer
+/// shares (`inbound_budget::SharedInboundBudget`), so a node with many peers
+/// can hold this much for each. Charges last as long as whoever holds the
+/// shared handle (the connection, or a QUIC path built on it), and an
+/// unclaimed buffer can be kept by the orphan stream registry for up to its
+/// 60 s GC interval after the connection has gone.
 ///
 /// A stream is charged when admitted and keeps the charge
 /// until all of its reassembly state has been released (see
