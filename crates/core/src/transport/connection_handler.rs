@@ -1598,10 +1598,10 @@ pub(crate) const NAT_TRAVERSAL_DEADLINE: Duration = Duration::from_secs(3);
 /// since untracked packets also take ids, so a peer on any release reads a
 /// connection that starts at 1. A remote that still starts at 0 is
 /// unaffected on our side: we ack its packets as before.
-const FIRST_DATA_PACKET_ID: super::PacketId = SymmetricMessage::FIRST_PACKET_ID + 1;
+pub(super) const FIRST_DATA_PACKET_ID: super::PacketId = SymmetricMessage::FIRST_PACKET_ID + 1;
 
 /// The id counter for a new connection's data packets.
-fn data_packet_ids() -> Arc<AtomicU32> {
+pub(super) fn data_packet_ids() -> Arc<AtomicU32> {
     Arc::new(AtomicU32::new(FIRST_DATA_PACKET_ID))
 }
 
@@ -1982,13 +1982,12 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                         }
                     };
                     match task_result {
-                        // Successful gateway connection
-                        // The success ack is not tracked on the connection:
-                        // the handshake completed on a packet under our
-                        // inbound key, which only a joiner holding the ack
-                        // can send, so the ack was delivered. Tracking it at
-                        // id 0 made it collide with the first data packet
-                        // (see `FIRST_DATA_PACKET_ID`).
+                        // Successful gateway connection. The success ack is
+                        // not kept pending on the connection: our inbound key
+                        // is per remote address, so completing under it shows
+                        // the joiner holds that address's current key.
+                        // Tracking the ack at id 0 made it collide with the
+                        // first data packet (see `FIRST_DATA_PACKET_ID`).
                         Ok((outbound_remote_conn, inbound_remote_connection)) => {
                             let remote_addr = outbound_remote_conn.remote_addr;
 
@@ -2193,7 +2192,6 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
             .unwrap_or(version_cmp::GATEWAY_ACK_VERSION_MIN_VERSION)
     }
 
-    #[allow(clippy::type_complexity)]
     fn gateway_connection(
         &mut self,
         remote_intro_packet: PacketData<UnknownEncryption>,
@@ -2308,7 +2306,7 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
             );
 
             socket
-                .send_to(&outbound_ack_packet.clone().prepared_send(), remote_addr)
+                .send_to(&outbound_ack_packet.prepared_send(), remote_addr)
                 .await
                 .map_err(|err| handshake_send_failed(remote_addr, "inbound", err))?;
 
@@ -2573,8 +2571,6 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                 PacketData::<_, MAX_PACKET_SIZE>::encrypt_with_pubkey(&data, &remote_public_key)
             };
 
-            let mut sent_tracker = SentPacketTracker::new_with_time_source(time_source.clone());
-
             // A failed send is handled like a datagram lost on the wire: the
             // loop sends again on its next pass, so an error that clears (a
             // network coming back) does not end the attempt. The error itself
@@ -2640,20 +2636,11 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                                 remote_protoc_version,
                                 ack_version_floor,
                             )?;
-                            // Bookkeeping hygiene only: this tracker is not
-                            // consumed after RemoteInbound (a successful
-                            // completion builds a fresh one), so skipping an
-                            // unsent packet changes no accounting.
-                            if send_failures.record(
+                            send_failures.record(
                                 socket.send_to(our_inbound.data(), remote_addr).await,
                                 remote_addr,
                                 "ack",
-                            ) {
-                                sent_tracker.report_sent_packet(
-                                    SymmetricMessage::FIRST_PACKET_ID,
-                                    our_inbound.data().into(),
-                                );
-                            }
+                            );
                             attempts += 1;
                         }
                     }
@@ -2840,7 +2827,11 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                                                     outbound_symmetric_key: outbound_sym_key,
                                                     remote_addr,
                                                     sent_tracker: Arc::new(
-                                                        parking_lot::Mutex::new(sent_tracker),
+                                                        parking_lot::Mutex::new(
+                                                            SentPacketTracker::new_with_time_source(
+                                                                time_source.clone(),
+                                                            ),
+                                                        ),
                                                     ),
                                                     last_packet_id: data_packet_ids(),
                                                     inbound_packet_recv: inbound_recv,

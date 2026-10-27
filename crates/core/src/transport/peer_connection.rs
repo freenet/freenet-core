@@ -2747,8 +2747,9 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                 // the dedup window stopped that by accident (every connection
                 // ack has id 0, so the second one was dropped as a duplicate);
                 // connection acks are no longer recorded for dedup, so the
-                // limit is explicit. The remote's tracked handshake ack is
-                // still acked by receipt on every arrival (`receipt_policy`).
+                // limit is explicit. An earlier-release remote's tracked
+                // handshake ack is still acked by receipt on every arrival
+                // (`receipt_policy`).
                 if self.answered_connection_ack {
                     return Ok(None);
                 }
@@ -5315,7 +5316,7 @@ mod tests {
             outbound_symmetric_key: cipher.clone(),
             remote_addr,
             sent_tracker,
-            last_packet_id: Arc::new(AtomicU32::new(0)),
+            last_packet_id: crate::transport::connection_handler::data_packet_ids(),
             inbound_packet_recv: inbound_rx,
             inbound_symmetric_key: cipher.clone(),
             inbound_symmetric_key_bytes: key,
@@ -5445,7 +5446,7 @@ mod tests {
             outbound_symmetric_key: cipher.clone(),
             remote_addr,
             sent_tracker,
-            last_packet_id: Arc::new(AtomicU32::new(0)),
+            last_packet_id: crate::transport::connection_handler::data_packet_ids(),
             inbound_packet_recv: inbound_rx,
             inbound_symmetric_key: cipher,
             inbound_symmetric_key_bytes: key,
@@ -5538,7 +5539,7 @@ mod tests {
             outbound_symmetric_key: cipher.clone(),
             remote_addr,
             sent_tracker,
-            last_packet_id: Arc::new(AtomicU32::new(0)),
+            last_packet_id: crate::transport::connection_handler::data_packet_ids(),
             inbound_packet_recv: inbound_rx,
             inbound_symmetric_key: cipher.clone(),
             inbound_symmetric_key_bytes: key,
@@ -5710,7 +5711,7 @@ mod tests {
             outbound_symmetric_key: cipher.clone(),
             remote_addr,
             sent_tracker,
-            last_packet_id: Arc::new(AtomicU32::new(0)),
+            last_packet_id: crate::transport::connection_handler::data_packet_ids(),
             inbound_packet_recv: inbound_rx,
             inbound_symmetric_key: cipher,
             inbound_symmetric_key_bytes: key,
@@ -5842,7 +5843,7 @@ mod tests {
             outbound_symmetric_key: cipher.clone(),
             remote_addr,
             sent_tracker,
-            last_packet_id: Arc::new(AtomicU32::new(0)),
+            last_packet_id: crate::transport::connection_handler::data_packet_ids(),
             inbound_packet_recv: inbound_rx,
             inbound_symmetric_key: cipher,
             inbound_symmetric_key_bytes: key,
@@ -6059,7 +6060,7 @@ mod tests {
             outbound_symmetric_key: cipher.clone(),
             remote_addr,
             sent_tracker,
-            last_packet_id: Arc::new(AtomicU32::new(0)),
+            last_packet_id: crate::transport::connection_handler::data_packet_ids(),
             inbound_packet_recv: inbound_rx,
             inbound_symmetric_key: cipher.clone(),
             inbound_symmetric_key_bytes: key,

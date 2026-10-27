@@ -591,9 +591,9 @@ tracks for retransmission:
     ack, including a handshake ack resent across our completion) would
     otherwise be credited to our first data packet: a false RTT sample and
     a lost packet never retransmitted. DO NOT start data at 0 again.
-    Answering a connection ack with
-    `ack_ok` happens at most ONCE per connection: the reply is itself an
-    AckConnection, so answering every one loops forever between two peers.
+    Answering a connection ack with `ack_ok` happens at most ONCE per
+    connection: the reply is itself an AckConnection, so answering every
+    one loops forever between two peers.
   → ShortMessage / StreamFragment / Upgrade: acked within
     ACK_CHECK_INTERVAL (100 ms), and RE-ACKED when a duplicate arrives (a
     duplicate means our receipt was lost). A duplicate is never delivered

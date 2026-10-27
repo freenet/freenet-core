@@ -425,6 +425,10 @@ impl<T: TimeSource> SentPacketTracker<T> {
 }
 
 impl<T: TimeSource> SentPacketTracker<T> {
+    /// Test shorthand: production sends register through
+    /// [`Self::report_sent_packet_with_token_and_size`] or
+    /// [`Self::report_sent_stream_packet_with_size`].
+    #[cfg(test)]
     pub(super) fn report_sent_packet(&mut self, packet_id: PacketId, payload: Box<[u8]>) {
         let packet_size = payload.len();
         self.report_sent_packet_with_token_and_size(packet_id, payload, None, packet_size);

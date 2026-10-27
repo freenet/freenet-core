@@ -104,7 +104,7 @@ fn end_with_wire_capacity(
         sent_tracker: Arc::new(parking_lot::Mutex::new(
             SentPacketTracker::new_with_time_source(time_source.clone()),
         )),
-        last_packet_id: Arc::new(AtomicU32::new(0)),
+        last_packet_id: crate::transport::connection_handler::data_packet_ids(),
         inbound_packet_recv: inbound_rx,
         inbound_symmetric_key: inbound.1.clone(),
         inbound_symmetric_key_bytes: inbound.0,
@@ -281,7 +281,7 @@ fn receipt_policy_table() {
         assert_eq!(
             receipt_policy(&ack, ack_noops),
             AckWithoutDedup,
-            "the handshake ack is tracked at id 0: ack it, never dedup id 0"
+            "an earlier-release gateway tracks its handshake ack at id 0: ack it, never dedup id 0"
         );
         assert_eq!(receipt_policy(&ack_v2, ack_noops), AckWithoutDedup);
         assert_eq!(
@@ -955,11 +955,12 @@ async fn split_message_lost_ack_is_recovered_by_retransmitting_the_message() {
     let tracker = a.conn.remote_conn.sent_tracker.clone();
     a.conn.send(payload.clone()).await.expect("send");
 
-    // The message is the first packet A sends, so it has id 0. Drop B's first
-    // ack for it.
+    // The message is the first packet A sends, so it has the connection's
+    // first data id. Drop B's first ack for it.
+    const FIRST: u32 = crate::transport::connection_handler::FIRST_DATA_PACKET_ID;
     let mut dropped = false;
     let drop_first_ack: DropFilter = Box::new(move |m| {
-        if !dropped && m.confirm_receipt.contains(&0) {
+        if !dropped && m.confirm_receipt.contains(&FIRST) {
             dropped = true;
             return true;
         }
@@ -972,29 +973,33 @@ async fn split_message_lost_ack_is_recovered_by_retransmitting_the_message() {
 
     let first = &link.a_to_b[0].1;
     assert!(
-        first.packet_id == 0
+        first.packet_id == FIRST
             && matches!(first.payload, SymmetricMessagePayload::ShortMessage { .. }),
-        "premise: the message is A's first packet, id 0: {first:?}"
+        "premise: the message is A's first packet, id {FIRST}: {first:?}"
     );
     assert!(
         link.a_to_b
             .iter()
-            .filter(|(_, m)| m.packet_id != 0)
+            .filter(|(_, m)| m.packet_id != FIRST)
             .any(|(_, m)| m.confirm_receipt.contains(&10_000)),
         "premise: the receipts went in a separate packet with a fresh id"
     );
-    for (_, m) in link.a_to_b.iter().filter(|(_, m)| m.packet_id == 0) {
+    for (_, m) in link.a_to_b.iter().filter(|(_, m)| m.packet_id == FIRST) {
         assert!(
             matches!(m.payload, SymmetricMessagePayload::ShortMessage { .. }),
             "every packet sent under the message's id must be the message: {m:?}"
         );
     }
     assert!(
-        link.a_to_b.iter().filter(|(_, m)| m.packet_id == 0).count() >= 2,
+        link.a_to_b
+            .iter()
+            .filter(|(_, m)| m.packet_id == FIRST)
+            .count()
+            >= 2,
         "premise: the lost ack must have caused a retransmission"
     );
     assert!(
-        !tracker.lock().contains_packet(0),
+        !tracker.lock().contains_packet(FIRST),
         "the retransmitted message must be re-acked, clearing it from the tracker"
     );
     let expected = bincode::serialize(&payload).unwrap();
@@ -1143,9 +1148,9 @@ fn is_connection_ack(m: &SymmetricMessage) -> bool {
     )
 }
 
-/// The handshake leaves each side's completion ack TRACKED at packet id 0,
-/// and our reply to a connection ack is itself a connection ack. Between two
-/// peers that both answered every one, a single ack bounced forever. Each
+/// A gateway on an earlier release keeps its completion ack TRACKED at packet
+/// id 0, and our reply to a connection ack is itself a connection ack. Between
+/// two peers that both answered every one, a single ack bounced forever. Each
 /// side answers at most once, and the tracked handshake ack still gets its
 /// receipt, so it stops being retransmitted.
 #[tokio::test(start_paused = true)]

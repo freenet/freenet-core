@@ -750,7 +750,9 @@ fn gate(sc: &'static Scenario, algorithm: CongestionControlAlgorithm) {
     for seed in seeds() {
         // A panic (a connect that fails, a corrupted payload) fails its seed
         // by name and the other seeds still run, instead of ending the test
-        // before its verdict with no seed to rerun.
+        // before its verdict with no seed to rerun. The nightly classifier
+        // (scripts/wan-bench-classify.sh) parses these `seed 0x..: ` lines;
+        // its test pins both format strings.
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(sc, algorithm, seed))) {
             Ok(report) => reports.push(report),
             Err(payload) => failed.push(format!(
@@ -923,7 +925,7 @@ fn r1b_spike_recovery_fixed_rate() {
 // ACK batch for its initial window is lost, nothing is acknowledged until an
 // RTO plus the spike, which outlasts the cwnd-wait timeout.
 #[test]
-#[ignore = "known failure: BBR survives a 2.4 s RTT spike but never recovers to the bottleneck rate (~1.2 of 8 Mbit/s after it); #5929"]
+#[ignore = "known failure: BBR never recovers to the bottleneck rate after a 2.4 s RTT spike (~1.2 of 8 Mbit/s after it), and rarely aborts the stream during it; #5929"]
 fn r1b_spike_recovery_bbr() {
     gate(&R1B, CongestionControlAlgorithm::Bbr);
 }
