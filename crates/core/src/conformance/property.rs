@@ -135,23 +135,34 @@ pub enum ConformanceProperty {
     /// notice: the partition pin asserts the classification the code states rather
     /// than deriving it from the generator, and
     /// `no_shippable_removal_eligible_property_consumes_unvalidated_bytes` only
-    /// fires on a SEVERITY change, which such a refinement does not make.
+    /// fires on a severity or removal-tier change, which such a refinement does not
+    /// make.
     ///
-    /// What keeps the unvalidated bytes harmless is the [`Severity::Diagnostic`]
-    /// tier, which `policy::decide` never maps to a removal: a fabricated delta buys
-    /// an attacker a report and nothing else. That coupling is NOT incidental. This
-    /// is the only property that both travels as evidence and consumes delta bytes,
-    /// so promoting it to [`Severity::Violation`] — which the contested empirical
-    /// question above may one day justify — must revisit this classification in the
-    /// same change. `no_shippable_removal_eligible_property_consumes_unvalidated_bytes`
+    /// What keeps the unvalidated bytes harmless is that it is
+    /// [`Severity::Diagnostic`] and report-only (`policy::property_tier`), which
+    /// `policy::decide` never maps to a removal: a fabricated delta buys an attacker
+    /// a report and nothing else. That coupling is NOT incidental. This is the only
+    /// property that both travels as evidence and consumes delta bytes, so making it
+    /// removal-eligible (a `Violation` with a `RemovalEligible` tier) — which the
+    /// contested empirical question above may one day justify — must revisit this
+    /// classification in the same change. `no_shippable_removal_eligible_property_consumes_unvalidated_bytes`
     /// is the test that forces it to.
     DeltaIdempotence,
-    /// Deltas applied in any order reach the same canonical state.
+    /// Concurrent, independent deltas applied in either order reach the same
+    /// canonical state.
     ///
-    /// The published `ContractInterface` requirement carries no independence
-    /// qualifier — "the order in which these updates are applied should not affect
-    /// the final state" — so order-dependence is a defect whether or not the deltas
-    /// are causally related, and this checks exactly that.
+    /// The law covers concurrent, independent deltas only (decided 2026-10-22,
+    /// #5906). Two deltas where one was computed from a state that already
+    /// contained the other's effect are not covered: the protocol never asks a
+    /// contract to apply them in the reverse order.
+    ///
+    /// # Report-only
+    ///
+    /// Findings here are [`RemovalTier::ReportOnly`]: never `WouldRemove` or
+    /// `Remove`, in any mode. The same-base pairing below is necessary for
+    /// concurrency and not sufficient, so capture cannot yet prove that a pair it
+    /// found was concurrent. Until it can, a finding may be about a pair the law
+    /// does not cover.
     ///
     /// The generator only pairs deltas observed against the SAME base state, which is
     /// what makes a finding here mean something. A delta is computed as
@@ -159,18 +170,19 @@ pub enum ConformanceProperty {
     /// against different bases can be causally sequenced — the later one computed from
     /// a state that already contains the earlier one's effect — and permuting those
     /// asks what happens in a situation the protocol never produces. Same-base pairs
-    /// are the genuine concurrent-independent-updates case. Deltas with no recorded
-    /// base are not paired at all.
+    /// are the closest the corpus gets to the concurrent-independent-updates case:
+    /// two deltas recorded against one base can still be causally sequenced if the
+    /// second sender had already seen the first's effect by another route. Deltas
+    /// with no recorded base are not paired at all.
     ///
-    /// So a finding here still reads as "this delta encoding carries sequence", and
-    /// that is a real defect on this network rather than an artifact: delivery is
-    /// out-of-order, so a delta that assumes a base will be applied out of order in
-    /// production too.
+    /// So a finding here reads as "this delta encoding may carry sequence", which
+    /// is worth telling the author: delivery is out-of-order, so a delta that
+    /// assumes a base can be applied out of order in production too.
     ///
     /// Re-delivery is deliberately not checked here; that is
     /// [`ConformanceProperty::DeltaIdempotence`], which is contested and reports at
     /// a lower severity. Folding it in would accuse a counter-style contract under
-    /// this property's name and severity regardless of that.
+    /// this property's name regardless of that.
     ///
     /// # Local provenance only: this property is NOT self-verifying
     ///
@@ -187,9 +199,10 @@ pub enum ConformanceProperty {
     /// seen — sound in production, because a delta is always
     /// `get_state_delta(sender, recipient_summary)`. Hand it the causally-sequenced
     /// pair `D1 = add A^t`, `D2 = remove t`: the two orders diverge, and every
-    /// recipient independently confirms a removal-eligible violation against a
-    /// correct contract. That contract's own same-base pairs are concurrent and
-    /// permute fine, so nothing observed locally ever fires.
+    /// recipient independently confirms a violation against a correct contract
+    /// (removal-eligible, before this property became report-only). That
+    /// contract's own same-base pairs are concurrent and permute fine, so nothing
+    /// observed locally ever fires.
     ///
     /// Marking it [`PremiseSource::LocalProvenance`] costs nothing today — no gossip
     /// receive path exists — and keeps its full value where provenance is observed
@@ -198,6 +211,7 @@ pub enum ConformanceProperty {
     /// it would break the property, for the reason the paragraph above gives.
     ///
     /// [`ConformanceEvidence`]: super::evidence::ConformanceEvidence
+    /// [`RemovalTier::ReportOnly`]: super::policy::RemovalTier::ReportOnly
     DeltaPermutationInvariance,
     /// A delta against an exact summary of the same state should be empty (#5072).
     SelfDeltaEmpty,
@@ -216,14 +230,17 @@ pub enum ConformanceProperty {
     /// peer's state (fixed), and the full-state fallback may fire where production
     /// would not, which would HIDE a real divergence rather than invent one.
     ///
-    /// It is nevertheless `Severity::Violation`, i.e. removal-eligible, because a
-    /// genuine reconciliation loop is exactly the #5153 shape this whole effort
+    /// It is nevertheless `Severity::Violation` with a removal-eligible tier
+    /// (`policy::property_tier`), because a genuine reconciliation loop is exactly the #5153 shape this whole effort
     /// exists to catch.
     ///
     /// Ian's call (2026-08-17) was to leave it removal-eligible and settle the
     /// question when the active-but-not-enforcing phase is wired, with real shadow
     /// telemetry rather than a five-contract sample. Do not quietly downgrade it
     /// before then, and do not let Enforce become reachable without revisiting it.
+    /// Reaffirmed 2026-10-22 (#5906) when [`ConformanceProperty::PathAgreement`]
+    /// became report-only: this is the sync-loop check, and it stays
+    /// removal-eligible.
     ///
     /// What would settle it, in either direction:
     ///
@@ -263,6 +280,16 @@ pub enum ConformanceProperty {
     /// delta  = get_state_delta(other, summarize(base))   // what the sender ships
     /// apply(base, delta)  ==  update_state(base, State(other))
     /// ```
+    ///
+    /// # Report-only
+    ///
+    /// Findings here are reported in every mode and never proposed for removal
+    /// (`policy::removal_tier`, decided 2026-10-22, #5906). The severity argument
+    /// below still says why a finding is a real break worth telling the author
+    /// about. It is not enough for removal: it rests on a model of which path the
+    /// protocol takes, and its "a delta can only move `base` toward `base ⊔ other`"
+    /// step assumes a semilattice join, which heal-guarded associativity (#5915) no
+    /// longer implies.
     ///
     /// # Why this is `Severity::Violation` and not a false-positive generator
     ///
@@ -304,11 +331,12 @@ pub enum ConformanceProperty {
     /// `ReconciliationCycle` this is a single step with no schedule to get wrong,
     /// which is the narrower assumption of the two.
     ///
-    /// Shadow-mode counts are what should settle whether the severity is right:
-    /// contracts flagged by THIS property and by no other removal-eligible one. If
-    /// that number stays at zero the property earns nothing at this severity; if it
-    /// is the sole finding for real contracts, it is carrying signal the algebraic
-    /// checks miss.
+    /// Shadow-mode counts are what should settle whether it should ever become
+    /// removal-eligible again. Its findings are in the shadow `reported` count, not
+    /// `would_remove`; the number to read is contracts flagged by THIS property and
+    /// by no removal-eligible one. If that number stays at zero the property adds
+    /// nothing a removal could rest on; if it is the sole finding for real
+    /// contracts, it is carrying signal the algebraic checks miss.
     ///
     /// # Two measured limits, both of them misses rather than false accusations
     ///
@@ -373,6 +401,14 @@ pub enum ConformanceProperty {
     /// `--state` files carry no provenance and produce no cases for this property at
     /// all, which is not a clean run but an absence of evidence; `fdev --transition
     /// BASE RESULT` is how a developer supplies it by hand.
+    ///
+    /// # Report-only
+    ///
+    /// Findings here are reported in every mode and never proposed for removal
+    /// (`policy::removal_tier`, decided 2026-10-22, #5906). Its premise is
+    /// provenance the observing peer cannot prove to anyone else (see the last
+    /// section), and since #5915 the argument below rests partly on measurement.
+    /// The argument still says why a finding is a real break for the author.
     ///
     /// # Why this is `Severity::Violation`
     ///
@@ -483,9 +519,10 @@ pub enum ConformanceProperty {
     /// So a fabricated pair from a perfectly conforming grow-only contract — any two
     /// valid states with `base ⊄ result` — is structurally indistinguishable from a
     /// genuine information-losing update, and every receiving peer would
-    /// independently confirm a removal-eligible violation against a correct
-    /// contract. `check_bounds` therefore REFUSES evidence carrying this property
-    /// outright rather than merely deprioritising it.
+    /// independently confirm a violation against a correct contract (and, before
+    /// this property was report-only, a removal-eligible one). `check_bounds`
+    /// therefore REFUSES evidence carrying this property outright rather than
+    /// merely deprioritising it.
     ///
     /// The property keeps its full value where it runs today — shadow mode and
     /// `fdev`, both of which observe provenance directly. Evidence gossip (#5377,
@@ -528,13 +565,17 @@ pub enum PremiseSource {
 /// How seriously a failed property should be taken.
 ///
 /// The split matters because only [`Severity::Violation`] is ever allowed to become
-/// removal evidence. The RFC is explicit that size alone is not a merge-law proof:
+/// removal evidence. That is necessary and not sufficient: a `Violation` of a
+/// report-only law is reported and never removed (`policy::removal_tier`). The RFC
+/// is explicit that size alone is not a merge-law proof:
 /// a contract whose self-delta is the whole state is wasteful, not unsound, and
 /// deleting it would be deleting a working application over an efficiency
 /// complaint.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Severity {
-    /// Breaks a merge law. Eligible (after independent verification) to justify removal.
+    /// Breaks a merge law. Necessary for removal and not sufficient: only a
+    /// violation whose `policy::removal_tier` is `RemovalEligible` can justify one,
+    /// and only after independent verification. Every `Violation` fails `fdev`.
     Violation,
     /// Wasteful or suspicious, but not a proof of non-convergence. Report only.
     Diagnostic,
@@ -579,8 +620,9 @@ impl ConformanceProperty {
             // `LocalProvenance`, this is the only property that both ships as
             // evidence and consumes delta bytes — which `verify_case` never
             // validates, there being no `require_valid` for a delta. Promoting it to
-            // `Violation` without revisiting `premise_source` in the same change
-            // would make attacker-chosen delta bytes removal-eligible. The test
+            // `Violation` with a `RemovalEligible` tier without revisiting
+            // `premise_source` in the same change would make attacker-chosen delta
+            // bytes removal-eligible. The test
             // `no_shippable_removal_eligible_property_consumes_unvalidated_bytes`
             // fails if that happens.
             ConformanceProperty::DeltaIdempotence => Severity::Diagnostic,
@@ -653,8 +695,7 @@ impl ConformanceProperty {
             // last-write-wins for an arbitrary pair, and a law only because the
             // corpus witnessed that `result` was reached FROM `base`. A fabricated
             // pair from a conforming grow-only contract would have every recipient
-            // independently confirm a removal-eligible violation against a correct
-            // contract.
+            // independently confirm a violation against a correct contract.
             //
             // `DeltaPermutationInvariance`: the generator pairs only deltas observed
             // against the SAME base, because deltas observed against different bases
@@ -800,6 +841,10 @@ pub struct Violation {
 /// behaviour choose the severity would repeat the move that produced the defect
 /// this replaced: bending the *classification* to soften an *enforcement*
 /// consequence (#5462).
+///
+/// The enforcement consequence is decided separately, by `policy::removal_tier`:
+/// [`IdempotenceSettling::SettledAfter`] is report-only, and every other class
+/// keeps the property's removal-eligible tier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum IdempotenceSettling {
@@ -812,11 +857,20 @@ pub enum IdempotenceSettling {
     /// delivered the same updates hold different bytes until unrelated traffic
     /// arrives — but the harm is phantom anti-entropy rather than divergence.
     /// Canonicalising at install removes this class entirely.
+    ///
+    /// Report-only in every mode (`policy::removal_tier`): the contract converges
+    /// after a bounded cost, and anyone who can PUT can produce one.
     SettledAfter(u32),
     /// No fixpoint within the budget: the state changes on every re-apply, so
-    /// redelivery of the same state keeps mutating it. Unambiguously
-    /// non-convergent, and the case an enforcement policy can act on without
-    /// waiting for the install path to be fixed.
+    /// redelivery of the same state keeps mutating it, at least for as long as the
+    /// budget looked. Keeps the property's removal-eligible tier. A bounded budget
+    /// running out is not a proof that the state never settles; replacing it with
+    /// one (a repeated state, or a re-delivery failure) is tracked in #5906.
+    ///
+    /// **Known gap, to close before Enforce can become reachable:** a contract
+    /// that settles after more rewrites than the budget lands here and is
+    /// removal-eligible. Pinned as current behaviour by
+    /// `policy::tests::known_gap_idempotence_not_shown_to_settle_stays_removal_eligible`.
     NeverSettled,
     /// Classification could not complete, so whether the state settles is unknown.
     ///
@@ -844,6 +898,14 @@ pub enum IdempotenceSettling {
     /// asserting it without evidence is exactly the sin this issue is about) nor
     /// into `settling: None` (ambiguous with "this property carries no settling
     /// data at all").
+    ///
+    /// **Known gap, to close before Enforce can become reachable:** this class
+    /// keeps the property's removal-eligible tier, yet it can come from a fuel trap
+    /// or a resource ceiling on the follow-up merges, which a PUT of an unusual or
+    /// large state can reach. Removal must rest on proof that the state never
+    /// settles, not on classification failing. That proof is the next #5906 item;
+    /// until then this is pinned as current behaviour by
+    /// `policy::tests::known_gap_idempotence_not_shown_to_settle_stays_removal_eligible`.
     Indeterminate,
 }
 
@@ -999,9 +1061,12 @@ impl PropertyOutcome {
         matches!(self, PropertyOutcome::Violated(_))
     }
 
-    /// A violation severe enough to be eligible as removal evidence.
+    /// A [`Severity::Violation`] finding: the contract broke a merge law.
     ///
-    /// Diagnostics are excluded here on purpose; see [`Severity`].
+    /// Diagnostics are excluded here on purpose; see [`Severity`]. This is what
+    /// fails `fdev`, so an author hears about every broken law. It is NOT the
+    /// removal decision: a violation of a report-only law is true here and never
+    /// removed. Use `policy::decide` / `policy::removal_tier` for that.
     pub fn is_enforceable_violation(&self) -> bool {
         // Derive the severity from the PROPERTY rather than reading the field the
         // `Violation` carries. `Violation` is `Deserialize` with public fields and

@@ -46,7 +46,7 @@ use super::capture::RecordOutcome;
 use super::focus::{FocusSelector, FocusSlot};
 use super::generator::{GeneratorConfig, generate_cases};
 use super::policy::{ConformanceAction, EnforcementMode, decide};
-use super::property::{ConformanceProperty, PropertyOutcome};
+use super::property::{ConformanceProperty, PropertyOutcome, Severity};
 use super::runtime_oracle::RuntimeOracle;
 use super::verifier::verify_case;
 
@@ -136,43 +136,30 @@ pub struct ShadowReport {
     /// Violations that would have caused a removal, had enforcement been on. The
     /// number the RFC's Phase 5 gate is judged on.
     ///
-    /// Read it together with `would_remove_settled`. Since #5462 this total includes
-    /// contracts that DO converge — a canonicalizing contract breaks idempotence by
-    /// rewriting a non-canonical stored state once, and is reported honestly rather
-    /// than suppressed. Comparing this number across that change, or against a
-    /// future where the PUT install path canonicalizes, compares different
-    /// populations.
+    /// Only removal-eligible findings reach it (`policy::removal_tier`). A
+    /// report-only finding is counted in `reported` instead, in Shadow as in every
+    /// other mode, so findings anyone can produce on demand cannot move this number.
+    /// That includes a `state_idempotence` finding whose state settled after a
+    /// rewrite: before the report-only tier this total included that converging
+    /// class, so comparing it across that change compares different populations.
+    ///
+    /// `Indeterminate` idempotence findings are still in it. That is the
+    /// conservative default (an unknown class must not be counted benign), and
+    /// `Indeterminate` is adversarially reachable (see its rustdoc), so this total
+    /// can still include findings that a proof of non-settling would clear.
     pub would_remove: usize,
-    /// The subset of `would_remove` whose finding says the state SETTLED.
+    /// Findings that never propose removal in any mode: diagnostics, and
+    /// violations of a report-only tier (`policy::RemovalTier::ReportOnly`).
     ///
-    /// Carried as its own counter because `would_remove` is a bare `usize` with
-    /// nowhere to record that a finding is benign, and this is the number Phase 5
-    /// is judged on. Leaving the distinction out would pre-filter the corpus by
-    /// omission — the same move as the fixpoint gate #5462 removed, one layer up:
-    /// the population would look uniformly removal-worthy when a large and
-    /// knowable part of it is waiting on an install-path fix instead.
-    ///
-    /// Deliberately additive rather than subtracted from `would_remove`: the
-    /// finding IS removal-eligible, and netting it off would be the severity fork
-    /// the #5462 decision rejected, hidden in a metric.
-    ///
-    /// Read it as a CASE count, not a contract count, and do not read the ratio
-    /// against `would_remove` as "the benign fraction of contracts". Idempotence
-    /// draws a fixed handful of cases per probe while a contract breaking several
-    /// properties feeds the total from each, so the multiplier is not equal across
-    /// the two populations and the ratio systematically misstates the fraction. It
-    /// tells you the class is present and roughly how loud, which is what it is
-    /// for.
-    ///
-    /// `Indeterminate` findings are in `would_remove` and in NEITHER subset. That
-    /// is the conservative default — an unknown class must not be counted benign —
-    /// but it means a residual exists that this pair of numbers cannot show, and
-    /// `Indeterminate` is adversarially reachable (see its rustdoc), so a nonzero
-    /// gap between the total and the sum of what you can classify is itself worth
-    /// looking at.
-    pub would_remove_settled: usize,
-    /// Diagnostic-severity findings, which never propose removal in any mode.
+    /// The population changed with the report-only tier. Before it, this counted
+    /// diagnostics only; it now also holds every report-only `Violation`,
+    /// including the settled idempotence class that used to be in
+    /// `would_remove`. `report_only_violations` is that second part on its own,
+    /// so `reported - report_only_violations` is the old series.
     pub reported: usize,
+    /// The subset of `reported` that are `Severity::Violation`s of a report-only
+    /// tier: real law breaks the network does not act on.
+    pub report_only_violations: usize,
     /// Probes cut short by [`PROBE_TIME_BUDGET`].
     pub timed_out: usize,
     /// Focus contracts that reached a verdict: at least one case came back `Holds` or
@@ -593,11 +580,11 @@ pub struct ShadowRunner {
     ticks: u32,
     /// Capture directory, so a rotation can persist the new epoch beside the salt.
     dir: PathBuf,
-    /// `(contract, property)` pairs already logged this epoch, so a contract that
-    /// fails the same law in forty cases produces one line rather than forty. Cleared
-    /// on rotation, which is also what makes the log a per-epoch summary rather than
-    /// an ever-growing set.
-    logged: HashSet<(ContractInstanceId, ConformanceProperty)>,
+    /// `(contract, property)` pairs already logged this epoch, and the most serious
+    /// finding logged for each, so a contract that fails the same law in forty
+    /// cases produces one line rather than forty. Cleared on rotation, which is also
+    /// what makes the log a per-epoch summary rather than an ever-growing set.
+    logged: HashMap<(ContractInstanceId, ConformanceProperty), LoggedSeverity>,
     /// State-changing merges observed per contract, decayed once per period and
     /// read CURRENT at every draw (#5913, #5914 review D1).
     ///
@@ -654,7 +641,7 @@ impl ShadowRunner {
             selector: FocusSelector::resuming_at(salt, MAX_FOCUS_CONTRACTS, epoch),
             ticks,
             dir: dir.to_path_buf(),
-            logged: HashSet::new(),
+            logged: HashMap::new(),
             activity: MergeActivity::new(super::activity::MAX_TRACKED_ACTIVITY, salt),
             period,
             period_complete,
@@ -962,13 +949,7 @@ impl ShadowRunner {
     /// not need `&mut self` to do its work.
     pub(crate) fn record(&mut self, findings: &[Finding]) {
         for finding in findings {
-            // One line per (contract, property) per epoch: a contract that fails the
-            // same law in forty cases is one finding reported forty times, and a log
-            // that says so forty times is harder to read, not more informative.
-            if !self
-                .logged
-                .insert((finding.contract, finding.violation.property))
-            {
+            if !self.should_log(finding) {
                 continue;
             }
             tracing::info!(
@@ -979,6 +960,55 @@ impl ShadowRunner {
                 detail = %finding.violation.detail,
                 "conformance shadow finding"
             );
+        }
+    }
+
+    /// Whether `finding` gets a log line, recording it if so.
+    ///
+    /// One line per (contract, property) per epoch: a contract that fails the same
+    /// law in forty cases is one finding reported forty times, and a log that says
+    /// so forty times is harder to read, not more informative. The exception is a
+    /// MORE serious finding for a key already logged. A `state_idempotence` finding
+    /// that settled (report-only) and one that did not (removal-eligible) share a
+    /// key, so keeping only the first arrival would log `would_remove=false` for a
+    /// contract the tick's `would_remove` count includes. Same rule as
+    /// `status::CheckedContract::note_finding`.
+    fn should_log(&mut self, finding: &Finding) -> bool {
+        let seen = LoggedSeverity::of(finding);
+        match self
+            .logged
+            .entry((finding.contract, finding.violation.property))
+        {
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                slot.insert(seen);
+                true
+            }
+            std::collections::hash_map::Entry::Occupied(mut slot) => {
+                if seen > *slot.get() {
+                    slot.insert(seen);
+                    true
+                } else {
+                    false
+                }
+            }
+        }
+    }
+}
+
+/// How serious a logged finding was, ordered so a larger value is the one a reader
+/// most needs to see: a would-remove finding outranks a report, then the settling
+/// class orders findings with the same decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct LoggedSeverity {
+    would_remove: bool,
+    settling_rank: u8,
+}
+
+impl LoggedSeverity {
+    fn of(finding: &Finding) -> Self {
+        Self {
+            would_remove: finding.would_remove,
+            settling_rank: super::status::settling_rank(finding.violation.settling),
         }
     }
 }
@@ -1048,21 +1078,13 @@ pub(crate) async fn probe_with_budget(
     (report, findings)
 }
 
-/// Count a removal-proposing decision, and whether its finding is the class that
-/// converges.
+/// Count a removal-proposing decision.
 ///
 /// One function for BOTH `WouldRemove` and `Remove` deliberately. The comment
 /// between those two arms says they are handled together precisely so shadow and
-/// enforcement cannot drift — counting the settled subset in only one of them
-/// would have introduced that drift while the comment claimed otherwise.
-fn count_would_remove(report: &mut ShadowReport, violation: &super::property::Violation) {
+/// enforcement cannot drift, and one counter is the shape in which they cannot.
+fn count_would_remove(report: &mut ShadowReport) {
     report.would_remove += 1;
-    if matches!(
-        violation.settling,
-        Some(crate::conformance::IdempotenceSettling::SettledAfter(_))
-    ) {
-        report.would_remove_settled += 1;
-    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1201,21 +1223,39 @@ async fn probe_one(
         report.without_verdict += 1;
     }
 
-    for action in outcome.decisions {
+    tally_decisions(report, findings, instance_copy, outcome.decisions);
+}
+
+/// Fold one probe's decisions into the tick's counters and findings.
+///
+/// Split out of [`probe_one`] so the mapping from [`ConformanceAction`] to counters
+/// can be tested without running WASM: it is where a report-only finding has to land
+/// in `reported` rather than `would_remove`.
+fn tally_decisions(
+    report: &mut ShadowReport,
+    findings: &mut Vec<Finding>,
+    contract: ContractInstanceId,
+    decisions: Vec<ConformanceAction>,
+) {
+    for action in decisions {
         match action {
             ConformanceAction::Nothing => {}
             ConformanceAction::Report(violation) => {
                 report.reported += 1;
+                // Severity from the property, as `decide` reads it.
+                if violation.property.severity() == Severity::Violation {
+                    report.report_only_violations += 1;
+                }
                 findings.push(Finding {
-                    contract: instance_copy,
+                    contract,
                     violation,
                     would_remove: false,
                 });
             }
             ConformanceAction::WouldRemove(violation) => {
-                count_would_remove(report, &violation);
+                count_would_remove(report);
                 findings.push(Finding {
-                    contract: instance_copy,
+                    contract,
                     violation,
                     would_remove: true,
                 });
@@ -1226,9 +1266,9 @@ async fn probe_one(
             // removal as a would-remove keeps this honest if a future caller reaches
             // it before the removal path exists.
             ConformanceAction::Remove(violation) => {
-                count_would_remove(report, &violation);
+                count_would_remove(report);
                 findings.push(Finding {
-                    contract: instance_copy,
+                    contract,
                     violation,
                     would_remove: true,
                 });
@@ -1562,92 +1602,232 @@ pub(crate) async fn probe_fixture_contract(
 mod settled_counter_tests {
     use super::*;
     use crate::conformance::{
-        ConformanceProperty, IdempotenceSettling, OutputDigest, Severity, Violation,
+        ConformanceProperty, IdempotenceSettling, OutputDigest, PropertyOutcome, Violation, decide,
     };
 
-    fn violation_with(settling: Option<IdempotenceSettling>) -> Violation {
-        Violation {
-            property: ConformanceProperty::StateIdempotence,
-            severity: Severity::Violation,
+    fn violation_of(
+        property: ConformanceProperty,
+        settling: Option<IdempotenceSettling>,
+    ) -> PropertyOutcome {
+        PropertyOutcome::Violated(Violation {
+            property,
+            severity: property.severity(),
             left: OutputDigest::of(&[1u8]),
             right: OutputDigest::of(&[2u8]),
             detail: "test".to_string(),
             settling,
+        })
+    }
+
+    /// A violation of `property` whose carried severity field says `severity`.
+    fn forged(property: ConformanceProperty, severity: Severity) -> PropertyOutcome {
+        let PropertyOutcome::Violated(violation) = violation_of(property, None) else {
+            unreachable!("violation_of builds a violation")
+        };
+        PropertyOutcome::Violated(Violation {
+            severity,
+            ..violation
+        })
+    }
+
+    fn tally(outcomes: &[PropertyOutcome]) -> (ShadowReport, Vec<Finding>) {
+        let mut report = ShadowReport::default();
+        let mut findings = Vec::new();
+        let decisions = outcomes
+            .iter()
+            .map(|o| decide(EnforcementMode::Shadow, o))
+            .collect();
+        tally_decisions(
+            &mut report,
+            &mut findings,
+            ContractInstanceId::new([9u8; 32]),
+            decisions,
+        );
+        (report, findings)
+    }
+
+    /// Report-only findings land in `reported` and never in `would_remove`, through
+    /// the same `decide` and tally the probe uses. `would_remove` is the number the
+    /// enforcement gate is judged on, so this is the property the tier exists for.
+    #[test]
+    fn report_only_findings_never_reach_would_remove_in_shadow() {
+        let report_only = [
+            violation_of(
+                ConformanceProperty::StateIdempotence,
+                Some(IdempotenceSettling::SettledAfter(1)),
+            ),
+            violation_of(ConformanceProperty::TransitionPathAgreement, None),
+            violation_of(ConformanceProperty::DeltaPermutationInvariance, None),
+            violation_of(ConformanceProperty::PathAgreement, None),
+            violation_of(ConformanceProperty::DeltaIdempotence, None),
+            violation_of(ConformanceProperty::SelfDeltaEmpty, None),
+            violation_of(ConformanceProperty::WholeStateSelfDelta, None),
+        ];
+        let (report, findings) = tally(&report_only);
+        assert_eq!(report.would_remove, 0, "{findings:?}");
+        assert_eq!(report.reported, report_only.len());
+        // The first four are law breaks of a report-only tier, the last three
+        // diagnostics: only the four are report-only violations.
+        assert_eq!(report.report_only_violations, 4, "{findings:?}");
+
+        // Forged severity fields, each direction tallied ON ITS OWN (together,
+        // reading the field would lose one and gain one, and the total would not
+        // move). `report_only_violations` reads severity from the property, as
+        // `decide` does.
+        let (report, _) = tally(&[forged(
+            ConformanceProperty::PathAgreement,
+            Severity::Diagnostic,
+        )]);
+        assert_eq!(
+            report.report_only_violations, 1,
+            "a law break whose field says Diagnostic"
+        );
+        let (report, _) = tally(&[forged(
+            ConformanceProperty::DeltaIdempotence,
+            Severity::Violation,
+        )]);
+        assert_eq!(
+            report.report_only_violations, 0,
+            "a diagnostic whose field says Violation"
+        );
+        assert!(findings.iter().all(|f| !f.would_remove));
+    }
+
+    /// The counterpart: removal-eligible findings still reach `would_remove`, an
+    /// idempotence finding not shown to settle included. Without it, a tally that
+    /// counted everything as reported would pass the test above.
+    #[test]
+    fn removal_eligible_findings_still_reach_would_remove_in_shadow() {
+        let eligible = [
+            violation_of(
+                ConformanceProperty::StateIdempotence,
+                Some(IdempotenceSettling::NeverSettled),
+            ),
+            violation_of(
+                ConformanceProperty::StateIdempotence,
+                Some(IdempotenceSettling::Indeterminate),
+            ),
+            violation_of(ConformanceProperty::StateCommutativity, None),
+        ];
+        let (report, findings) = tally(&eligible);
+        assert_eq!(report.would_remove, eligible.len(), "{findings:?}");
+        assert_eq!(report.reported, 0);
+        assert_eq!(report.report_only_violations, 0);
+        assert!(findings.iter().all(|f| f.would_remove));
+    }
+
+    fn finding(settling: IdempotenceSettling, would_remove: bool) -> Finding {
+        let PropertyOutcome::Violated(violation) =
+            violation_of(ConformanceProperty::StateIdempotence, Some(settling))
+        else {
+            unreachable!("violation_of builds a violation")
+        };
+        Finding {
+            contract: ContractInstanceId::new([9u8; 32]),
+            violation,
+            would_remove,
         }
     }
 
-    /// The settled subset is counted, and is ADDITIVE rather than netted off.
-    ///
-    /// `would_remove` is documented as the number Phase 5 is judged on, and since
-    /// #5462 it includes contracts that converge. Subtracting the settled ones
-    /// would be the severity fork the decision rejected, hidden in a metric; the
-    /// finding really is removal-eligible. So the total must stay whole and the
-    /// subset must be reported beside it.
+    /// The finding log keeps one line per (contract, property) per epoch, but a
+    /// later, more serious finding for the same key is logged too. Otherwise a
+    /// settled (report-only) finding arriving first hides a non-settling
+    /// (removal-eligible) one, and the log says `would_remove=false` for a contract
+    /// the tick's `would_remove` count includes. With the decision equal, the
+    /// higher settling rank wins, as in `status::CheckedContract::note_finding`.
     #[test]
-    fn settled_findings_are_counted_beside_the_total_not_deducted_from_it() {
-        let mut report = ShadowReport::default();
+    fn the_finding_log_does_not_let_a_report_only_finding_hide_a_removal() {
+        let settled = finding(IdempotenceSettling::SettledAfter(1), false);
+        let never = finding(IdempotenceSettling::NeverSettled, true);
 
-        count_would_remove(
-            &mut report,
-            &violation_with(Some(IdempotenceSettling::SettledAfter(1))),
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let mut runner = ShadowRunner::new(dir.path(), EnforcementMode::Shadow);
+        assert!(runner.should_log(&settled), "first finding for the key");
+        assert!(
+            runner.should_log(&never),
+            "a removal-eligible finding after a report-only one must be logged"
         );
-        count_would_remove(
-            &mut report,
-            &violation_with(Some(IdempotenceSettling::NeverSettled)),
+        assert!(!runner.should_log(&never), "a repeat is not logged again");
+        assert!(
+            !runner.should_log(&settled),
+            "a less serious finding after a more serious one is not logged"
         );
-        count_would_remove(
-            &mut report,
-            &violation_with(Some(IdempotenceSettling::Indeterminate)),
-        );
-        count_would_remove(&mut report, &violation_with(None));
 
-        assert_eq!(
-            report.would_remove, 4,
-            "every removal-proposing decision counts toward the total exactly ONCE, \
-             including the settled ones: they are removal-eligible findings"
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let mut runner = ShadowRunner::new(dir.path(), EnforcementMode::Shadow);
+        assert!(runner.should_log(&never));
+        assert!(
+            !runner.should_log(&settled),
+            "arriving second, the settled finding adds nothing to the log"
         );
-        assert_eq!(
-            report.would_remove_settled, 1,
-            "only the SETTLED class is in the subset. `Indeterminate` must not be: \
-             it is an unknown class, and counting an unknown as benign asserts the \
-             very thing that variant exists to refuse. `NeverSettled` and the \
-             properties carrying no settling data are excluded too"
+
+        // Same decision, higher settling rank: an `Indeterminate` line must not
+        // hide a later `NeverSettled` one, the class enforcement can act on.
+        let indeterminate = finding(IdempotenceSettling::Indeterminate, true);
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let mut runner = ShadowRunner::new(dir.path(), EnforcementMode::Shadow);
+        assert!(runner.should_log(&indeterminate));
+        assert!(
+            runner.should_log(&never),
+            "a higher settling rank with the same decision must be logged"
         );
+        assert!(!runner.should_log(&indeterminate));
+    }
+
+    /// The same rule through the shipping entry point, `record`, read off the log
+    /// lines it emits: a test of `should_log` alone passes if `record` stops
+    /// consulting it.
+    #[test]
+    fn record_logs_a_later_removal_after_a_report_only_finding() {
+        let settled = finding(IdempotenceSettling::SettledAfter(1), false);
+        let never = finding(IdempotenceSettling::NeverSettled, true);
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let mut runner = ShadowRunner::new(dir.path(), EnforcementMode::Shadow);
+
+        let (logs, guard) = crate::util::test_log_capture::install();
+        runner.record(&[settled.clone(), never.clone(), never, settled]);
+        drop(guard);
+        let logs = logs.lock().unwrap().clone();
+        let lines: Vec<&String> = logs
+            .iter()
+            .filter(|l| l.contains("conformance shadow finding"))
+            .collect();
+        assert_eq!(lines.len(), 2, "one line per first-seen severity: {logs:?}");
+        assert!(lines[0].contains("would_remove=false"), "{lines:?}");
+        assert!(lines[1].contains("would_remove=true"), "{lines:?}");
     }
 
     /// Each decision increments the total exactly once.
     ///
     /// Added after mutation: incrementing `would_remove` again alongside the shared
-    /// helper survived, because the test above asserted a total that happened to
-    /// match the doubled count. A drifting total is the specific thing the shared
-    /// helper exists to prevent.
+    /// helper survived an earlier version of these tests. A drifting total is the
+    /// specific thing the shared helper exists to prevent.
     #[test]
     fn a_single_decision_increments_the_total_exactly_once() {
         let mut report = ShadowReport::default();
-        count_would_remove(&mut report, &violation_with(None));
+        count_would_remove(&mut report);
         assert_eq!(report.would_remove, 1);
-        assert_eq!(report.would_remove_settled, 0);
     }
 
     /// Pin: BOTH removal-proposing arms route through the one counter.
     ///
     /// The comment between them says they are handled together so shadow and
     /// enforcement cannot drift. A test of `count_would_remove` alone cannot see an
-    /// arm that stopped calling it, which is exactly how the settled subset would
-    /// silently start under-counting the moment enforcement became reachable.
+    /// arm that stopped calling it, which is how the total would silently start
+    /// under-counting the moment enforcement became reachable.
     #[test]
     fn both_removal_arms_route_through_the_counter() {
-        // Bounded by brace-counting to `probe_one`'s OWN body, not by splitting on
+        // Bounded by brace-counting to `tally_decisions`'s OWN body, not by splitting on
         // its signature and reading to end-of-file. An unbounded region silently
         // widens to swallow unrelated code — including this test module — and then
         // passes for the wrong reason. That is the trap the repo documents on its
         // other scrapes, and my first version of this pin walked into it.
         let src = include_str!("shadow.rs");
         let start = src
-            .find("async fn probe_one(")
-            .expect("probe_one not found");
+            .find("\nfn tally_decisions(")
+            .expect("tally_decisions not found");
         let after = &src[start..];
-        let open = after.find('{').expect("probe_one has no body");
+        let open = after.find('{').expect("tally_decisions has no body");
         let mut depth = 0usize;
         let mut end = open;
         for (i, c) in after[open..].char_indices() {
@@ -1663,7 +1843,7 @@ mod settled_counter_tests {
                 _ => {}
             }
         }
-        assert!(end > open, "could not bound probe_one's body");
+        assert!(end > open, "could not bound tally_decisions's body");
         let body = &after[open..end];
 
         for arm in [
@@ -1707,6 +1887,15 @@ mod tests {
         samplers: &HashMap<ContractInstanceId, TrackedContract>,
         store: Option<&Path>,
     ) -> ShadowReport {
+        tick_with_findings(runner, samplers, store).await.0
+    }
+
+    /// [`tick`], also returning the findings the probe handed to `record`.
+    async fn tick_with_findings(
+        runner: &mut ShadowRunner,
+        samplers: &HashMap<ContractInstanceId, TrackedContract>,
+        store: Option<&Path>,
+    ) -> (ShadowReport, Vec<Finding>) {
         runner.advance();
         // No hosted-contract source is registered in unit tests, so focus falls back
         // to the sampler keys - which is exactly the fallback path production reports
@@ -1719,7 +1908,7 @@ mod tests {
         // it: a report that skipped it is one no live peer publishes.
         count_awaiting_samples(&mut report, awaiting);
         runner.record(&findings);
-        report
+        (report, findings)
     }
 
     /// The warm-up fold has to reach all three counters.
@@ -3557,6 +3746,70 @@ mod tests {
             "a conforming contract produced a prospective removal, which is the false \
              positive the whole deployment plan is gated on not happening: {honest:?}"
         );
+        Ok(())
+    }
+
+    /// The real-WASM counterpart of the tier tests: a contract whose ONLY defect is
+    /// a report-only law produces findings, every one of them reported, and no
+    /// prospective removal.
+    ///
+    /// Mode 8 of the shared fixture takes the last write on a key collision on its
+    /// delta path and the first on its merge path. Every other law holds on these
+    /// states (pinned in `wasm_tests`), so the only finding available is
+    /// `path_agreement`, which is report-only.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_report_only_defect_is_reported_and_never_would_remove()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use freenet_stdlib::prelude::{
+            ContractCode, ContractContainer, ContractWasmAPIVersion, Parameters, WrappedContract,
+        };
+        use std::sync::Arc;
+
+        // Keep in sync with `tests/test-contract-conformance/src/lib.rs`.
+        const PATH_DISAGREEMENT: u8 = 8;
+
+        let wasm = crate::wasm_runtime::tests::get_test_module("test_contract_conformance")?;
+        let code_hash = *blake3::hash(&wasm).as_bytes();
+        let store_dir = crate::util::tests::get_temp_dir();
+        std::fs::create_dir_all(store_dir.path())?;
+        let db = crate::contract::storages::Storage::new(store_dir.path()).await?;
+        let mut store =
+            crate::wasm_runtime::ContractStore::new(store_dir.path().into(), 10_000_000, db)?;
+
+        let parameters: Parameters<'static> = Parameters::from(vec![PATH_DISAGREEMENT]);
+        let contract = WrappedContract::new(Arc::new(ContractCode::from(wasm)), parameters.clone());
+        let id = *contract.key().id();
+        store.store_contract(ContractContainer::Wasm(ContractWasmAPIVersion::V1(
+            contract,
+        )))?;
+
+        // Two writes to key 5 with different values, each reached from the same
+        // base: the collision the two paths resolve differently.
+        let states = vec![
+            (vec![0x10u8], vec![0x10u8, 0x51]),
+            (vec![0x10u8], vec![0x10u8, 0x52]),
+        ];
+        let samplers = samplers_for(id, vec![PATH_DISAGREEMENT], code_hash, &states);
+
+        let dir = tempfile::TempDir::new()?;
+        let mut runner = ShadowRunner::new(dir.path(), EnforcementMode::Shadow);
+        let (report, findings) =
+            tick_with_findings(&mut runner, &samplers, Some(store_dir.path())).await;
+
+        assert_eq!(report.probed, 1, "the contract was not probed: {report:?}");
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.violation.property == ConformanceProperty::PathAgreement),
+            "the path disagreement produced no path_agreement finding, so the zero \
+             below proves nothing: {findings:?}"
+        );
+        assert!(report.report_only_violations > 0, "{report:?}");
+        assert_eq!(
+            report.would_remove, 0,
+            "a report-only finding reached would_remove in shadow: {report:?}"
+        );
+        assert!(findings.iter().all(|f| !f.would_remove), "{findings:?}");
         Ok(())
     }
 
