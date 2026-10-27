@@ -283,7 +283,9 @@ impl ConformanceEvidence {
         // pair permutes to two different states on contracts that are perfectly
         // sound, because production would never apply them in the other order.
         // Either way, every peer receiving the fabrication would independently reach
-        // a removal-eligible verdict against a correct contract.
+        // a violation verdict against a correct contract. Both properties are also
+        // report-only (`policy::removal_tier`), which is the second guard, not a
+        // reason to drop this one.
         //
         // Refused rather than deprioritised: a lower rank still lets it in, and the
         // whole point of the front door is that unsound input never reaches the

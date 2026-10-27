@@ -953,14 +953,14 @@ async fn run_writer(
                     probed = report.probed,
                     cases = report.cases,
                     inconclusive = report.inconclusive,
+                    // Removal-eligible findings only; report-only ones, the
+                    // idempotence class that settles after a rewrite included,
+                    // are in `reported`.
                     would_remove = report.would_remove,
-                    // Emitted beside the total, never instead of it. The
-                    // subset that CONVERGES is the part of `would_remove` an
-                    // enforcement gate must not read as removal-worthy, and a
-                    // counter that never leaves the process cannot inform the
-                    // decision it was collected for.
-                    would_remove_settled = report.would_remove_settled,
                     reported = report.reported,
+                    // The report-only violations inside `reported`; the rest of
+                    // it is diagnostics.
+                    report_only_violations = report.report_only_violations,
                     skipped_no_code = report.skipped_no_code,
                     skipped_no_samples = report.skipped_no_samples,
                     timed_out = report.timed_out,
