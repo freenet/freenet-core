@@ -7654,8 +7654,81 @@ pub mod mock_transport {
         /// delivered, so it was never retransmitted if lost.
         mod first_data_packet {
             use super::*;
-            use crate::simulation::{RealTime, TimeSource};
+            use crate::simulation::TimeSource;
             use bytes::Bytes;
+
+            /// Bounds every wait on the remote, so a regression fails with a
+            /// message instead of hanging the test.
+            const WAIT: Duration = Duration::from_secs(10);
+
+            fn open(packet: Vec<u8>, from_peer: [u8; 16]) -> Option<SymmetricMessage> {
+                let packet = PacketData::<_, MAX_PACKET_SIZE>::from_buf(packet);
+                let plain = packet.try_decrypt_sym(&cipher(from_peer)).ok()?;
+                SymmetricMessage::deser(plain.data()).ok()
+            }
+
+            /// Sends one message on `conn` and returns its packet id, read off
+            /// the wire at `remote`.
+            async fn send_first_message<T: TimeSource>(
+                conn: &mut PeerConnection<MockSocket, T>,
+                remote: &mut ScriptedRemote,
+                from_peer: [u8; 16],
+            ) -> anyhow::Result<u32> {
+                conn.send(b"first data".to_vec()).await?;
+                let data_id = tokio::time::timeout(WAIT, async {
+                    loop {
+                        if let Some(msg) = open(remote.recv().await, from_peer) {
+                            if matches!(msg.payload, SymmetricMessagePayload::ShortMessage { .. }) {
+                                break msg.packet_id;
+                            }
+                        }
+                    }
+                })
+                .await
+                .expect("the message reaches the remote");
+                assert_ne!(
+                    data_id,
+                    SymmetricMessage::FIRST_PACKET_ID,
+                    "the first data packet must not share the handshake ack's id"
+                );
+                assert!(
+                    conn.congestion_probe().flightsize > 0,
+                    "premise: the message is in flight"
+                );
+                Ok(data_id)
+            }
+
+            /// `remote` sends `receipts` in a NoOp, then a marker message on
+            /// the same in-order channel. Returns once `conn` delivers the
+            /// marker, so the receipts have been processed.
+            async fn deliver_receipts<T: TimeSource>(
+                conn: &mut PeerConnection<MockSocket, T>,
+                remote: &ScriptedRemote,
+                peer_addr: SocketAddr,
+                to_peer: [u8; 16],
+                receipts: Vec<u32>,
+                first_id: u32,
+            ) -> anyhow::Result<()> {
+                let noop = SymmetricMessage::serialize_msg_to_packet_data(
+                    first_id,
+                    SymmetricMessagePayload::NoOp,
+                    &cipher(to_peer),
+                    receipts,
+                )?;
+                remote.send(peer_addr, noop.data());
+                let marker = SymmetricMessage::serialize_msg_to_packet_data(
+                    first_id + 1,
+                    SymmetricMessagePayload::ShortMessage {
+                        payload: Bytes::from_static(b"marker"),
+                    },
+                    &cipher(to_peer),
+                    vec![],
+                )?;
+                remote.send(peer_addr, marker.data());
+                let got = tokio::time::timeout(WAIT, conn.recv()).await??;
+                assert_eq!(got, b"marker");
+                Ok(())
+            }
 
             /// Sends one message on `conn` and has `remote` answer with a
             /// receipt for packet id 0, as for a handshake ack. The receipt
@@ -7671,43 +7744,16 @@ pub mod mock_transport {
                 to_peer: [u8; 16],
                 from_peer: [u8; 16],
             ) -> anyhow::Result<u32> {
-                conn.send(b"first data".to_vec()).await?;
-                let data_id = loop {
-                    let packet = PacketData::<_, MAX_PACKET_SIZE>::from_buf(remote.recv().await);
-                    let Ok(plain) = packet.try_decrypt_sym(&cipher(from_peer)) else {
-                        continue;
-                    };
-                    let msg = SymmetricMessage::deser(plain.data())?;
-                    if matches!(msg.payload, SymmetricMessagePayload::ShortMessage { .. }) {
-                        break msg.packet_id;
-                    }
-                };
-                assert!(
-                    conn.congestion_probe().flightsize > 0,
-                    "premise: the message is in flight"
-                );
-
-                let receipt = SymmetricMessage::serialize_msg_to_packet_data(
-                    1_000,
-                    SymmetricMessagePayload::NoOp,
-                    &cipher(to_peer),
+                let data_id = send_first_message(conn, remote, from_peer).await?;
+                deliver_receipts(
+                    conn,
+                    remote,
+                    peer_addr,
+                    to_peer,
                     vec![SymmetricMessage::FIRST_PACKET_ID],
-                )?;
-                remote.send(peer_addr, receipt.data());
-                // Sent after the receipt on the same in-order channel: once
-                // `recv` returns it, the receipt has been processed.
-                let marker = SymmetricMessage::serialize_msg_to_packet_data(
-                    1_001,
-                    SymmetricMessagePayload::ShortMessage {
-                        payload: Bytes::from_static(b"marker"),
-                    },
-                    &cipher(to_peer),
-                    vec![],
-                )?;
-                remote.send(peer_addr, marker.data());
-                let got = tokio::time::timeout(Duration::from_secs(10), conn.recv()).await??;
-                assert_eq!(got, b"marker");
-
+                    1_000,
+                )
+                .await?;
                 let probe = conn.congestion_probe();
                 assert_eq!(
                     probe.min_rtt_sample, None,
@@ -7718,6 +7764,116 @@ pub mod mock_transport {
                     "a receipt for id 0 released the message (packet id {data_id}) as delivered"
                 );
                 Ok(data_id)
+            }
+
+            /// The positive control: the message's own receipt is credited,
+            /// so the check above is not passing because receipts are ignored.
+            /// `rtt_sample`: whether that receipt yields an RTT sample (not for
+            /// a retransmitted message, by Karn's rule).
+            async fn receipt_for_the_message_is_credited<T: TimeSource>(
+                conn: &mut PeerConnection<MockSocket, T>,
+                remote: &ScriptedRemote,
+                peer_addr: SocketAddr,
+                to_peer: [u8; 16],
+                data_id: u32,
+                rtt_sample: bool,
+            ) -> anyhow::Result<()> {
+                deliver_receipts(conn, remote, peer_addr, to_peer, vec![data_id], 2_000).await?;
+                let probe = conn.congestion_probe();
+                assert_eq!(
+                    probe.flightsize, 0,
+                    "the message's own receipt must release it"
+                );
+                assert_eq!(
+                    probe.min_rtt_sample.is_some(),
+                    rtt_sample,
+                    "RTT sample from the message's own receipt: {:?}",
+                    probe.min_rtt_sample
+                );
+                Ok(())
+            }
+
+            /// Advances `vt` by up to `span` in 100 ms steps, polling `conn` at
+            /// each step so its timers run, and returns what `remote` received,
+            /// stopping early at the first message `stop` accepts.
+            async fn drive<T: TimeSource>(
+                vt: &VirtualTime,
+                conn: &mut PeerConnection<MockSocket, T>,
+                remote: &mut ScriptedRemote,
+                from_peer: [u8; 16],
+                span: Duration,
+                stop: impl Fn(&SymmetricMessage) -> bool,
+            ) -> Vec<SymmetricMessage> {
+                let step = Duration::from_millis(100);
+                let mut seen = Vec::new();
+                for _ in 0..(span.as_millis() / step.as_millis()) {
+                    vt.advance(step);
+                    if let Ok(r) =
+                        tokio::time::timeout(Duration::from_millis(10), conn.recv()).await
+                    {
+                        panic!("nothing was sent to the connection, got {r:?}");
+                    }
+                    while let Ok(packet) = remote.inbound.try_recv() {
+                        if let Some(msg) = open(packet.data, from_peer) {
+                            let done = stop(&msg);
+                            seen.push(msg);
+                            if done {
+                                return seen;
+                            }
+                        }
+                    }
+                }
+                seen
+            }
+
+            /// A gateway on a clock the test drives, with a scripted joiner
+            /// that has completed the handshake. Returns the gateway's side of
+            /// the connection, its address and the two session keys
+            /// (gateway's inbound, joiner's inbound).
+            async fn gateway_connection(
+                remote: &mut ScriptedRemote,
+                channels: &Channels,
+                vt: VirtualTime,
+            ) -> anyhow::Result<(
+                PeerConnection<MockSocket, VirtualTime>,
+                SocketAddr,
+                OutboundConnectionHandler<MockSocket, VirtualTime>,
+                [u8; 16],
+                [u8; 16],
+            )> {
+                let (gw_pub, (gw, mut gw_conns), gw_addr) = create_mock_peer_internal_vt(
+                    PacketDropPolicy::ReceiveAll,
+                    PacketDelayPolicy::NoDelay,
+                    true,
+                    channels.clone(),
+                    None,
+                    Some(vt),
+                )
+                .await?;
+                let mut joiner_key = [0u8; 16];
+                GlobalRng::fill_bytes(&mut joiner_key);
+                let mut payload = PROTOC_VERSION.to_vec();
+                payload.extend_from_slice(&joiner_key);
+                let intro =
+                    PacketData::<_, MAX_PACKET_SIZE>::encrypt_with_pubkey(&payload, &gw_pub);
+                remote.send(gw_addr, intro.data());
+                let gw_key = tokio::time::timeout(WAIT, async {
+                    loop {
+                        if let Some(msg) = open(remote.recv().await, joiner_key) {
+                            let (key, _, _) = ack_ok_parts(&msg.payload)
+                                .expect("the gateway answers with a success ack");
+                            break key;
+                        }
+                    }
+                })
+                .await
+                .expect("the gateway answers the intro");
+                let ack = SymmetricMessage::ack_ok(&cipher(gw_key), joiner_key, gw_addr)?;
+                remote.send(gw_addr, ack.data());
+                let conn = tokio::time::timeout(WAIT, gw_conns.recv())
+                    .await?
+                    .expect("the gateway hands over the connection");
+                Ok((conn, gw_addr, gw, gw_key, joiner_key))
             }
 
             /// Hole punch, the side that answered the remote's intro
@@ -7732,7 +7888,7 @@ pub mod mock_transport {
                 remote.send(peer_addr, ack.data());
                 let mut conn = established(conn).await;
                 assert!(completed_in_remote_inbound(peer_addr, remote.addr));
-                receipt_for_id_0_is_not_credited(
+                let data_id = receipt_for_id_0_is_not_credited(
                     &mut conn,
                     &mut remote,
                     peer_addr,
@@ -7740,7 +7896,10 @@ pub mod mock_transport {
                     remote_key,
                 )
                 .await?;
-                Ok(())
+                receipt_for_the_message_is_credited(
+                    &mut conn, &remote, peer_addr, peer_key, data_id, true,
+                )
+                .await
             }
 
             /// Hole punch, the side that completed on the remote's ack (the
@@ -7774,7 +7933,7 @@ pub mod mock_transport {
                 remote.send(peer_addr, ack.data());
                 let mut conn = established(conn).await;
                 assert!(!completed_in_remote_inbound(peer_addr, remote.addr));
-                receipt_for_id_0_is_not_credited(
+                let data_id = receipt_for_id_0_is_not_credited(
                     &mut conn,
                     &mut remote,
                     peer_addr,
@@ -7782,7 +7941,10 @@ pub mod mock_transport {
                     remote_key,
                 )
                 .await?;
-                Ok(())
+                receipt_for_the_message_is_credited(
+                    &mut conn, &remote, peer_addr, peer_key, data_id, true,
+                )
+                .await
             }
 
             /// Gateway side: its success ack goes out at id 0. The message
@@ -7792,33 +7954,9 @@ pub mod mock_transport {
             async fn gateway() -> anyhow::Result<()> {
                 let channels: Channels = Arc::new(DashMap::new());
                 let mut remote = ScriptedRemote::new(&channels);
-                let (gw_pub, (_gw, mut gw_conns), gw_addr) =
-                    create_mock_gateway(PacketDropPolicy::ReceiveAll, channels.clone()).await?;
-
-                let mut joiner_key = [0u8; 16];
-                GlobalRng::fill_bytes(&mut joiner_key);
-                let mut payload = PROTOC_VERSION.to_vec();
-                payload.extend_from_slice(&joiner_key);
-                let intro =
-                    PacketData::<_, MAX_PACKET_SIZE>::encrypt_with_pubkey(&payload, &gw_pub);
-                remote.send(gw_addr, intro.data());
-                let gw_key = loop {
-                    let packet = PacketData::<_, MAX_PACKET_SIZE>::from_buf(remote.recv().await);
-                    let Ok(plain) = packet.try_decrypt_sym(&cipher(joiner_key)) else {
-                        continue;
-                    };
-                    let msg = SymmetricMessage::deser(plain.data())?;
-                    let (key, _, _) =
-                        ack_ok_parts(&msg.payload).expect("the gateway answers with a success ack");
-                    break key;
-                };
-                let ack = SymmetricMessage::ack_ok(&cipher(gw_key), joiner_key, gw_addr)?;
-                remote.send(gw_addr, ack.data());
-                let mut conn: PeerConnection<MockSocket, RealTime> =
-                    tokio::time::timeout(Duration::from_secs(10), gw_conns.recv())
-                        .await?
-                        .expect("the gateway hands over the connection");
-
+                let vt = VirtualTime::new();
+                let (mut conn, gw_addr, _gw, gw_key, joiner_key) =
+                    gateway_connection(&mut remote, &channels, vt.clone()).await?;
                 let data_id = receipt_for_id_0_is_not_credited(
                     &mut conn,
                     &mut remote,
@@ -7827,24 +7965,72 @@ pub mod mock_transport {
                     joiner_key,
                 )
                 .await?;
-                // No receipt for the message ever comes, so it is resent.
-                loop {
-                    tokio::select! {
-                        r = conn.recv() => panic!("unexpected delivery: {r:?}"),
-                        data = remote.recv() => {
-                            let packet = PacketData::<_, MAX_PACKET_SIZE>::from_buf(data);
-                            let Ok(plain) = packet.try_decrypt_sym(&cipher(joiner_key)) else {
-                                continue;
-                            };
-                            let msg = SymmetricMessage::deser(plain.data())?;
-                            if msg.packet_id == data_id
-                                && matches!(msg.payload, SymmetricMessagePayload::ShortMessage { .. })
-                            {
-                                break;
-                            }
-                        }
-                    }
-                }
+                let is_message = |m: &SymmetricMessage| {
+                    m.packet_id == data_id
+                        && matches!(m.payload, SymmetricMessagePayload::ShortMessage { .. })
+                };
+                let seen = drive(
+                    &vt,
+                    &mut conn,
+                    &mut remote,
+                    joiner_key,
+                    Duration::from_secs(10),
+                    is_message,
+                )
+                .await;
+                assert!(
+                    seen.iter().any(is_message),
+                    "the message was never retransmitted (packet id {data_id})"
+                );
+                receipt_for_the_message_is_credited(
+                    &mut conn, &remote, gw_addr, gw_key, data_id, false,
+                )
+                .await
+            }
+
+            /// The gateway knows its success ack was delivered when the
+            /// handshake completes, so it does not keep it pending on the
+            /// connection or resend it.
+            #[tokio::test]
+            async fn gateway_does_not_resend_its_handshake_ack() -> anyhow::Result<()> {
+                let channels: Channels = Arc::new(DashMap::new());
+                let mut remote = ScriptedRemote::new(&channels);
+                let vt = VirtualTime::new();
+                let (mut conn, _gw_addr, _gw, _gw_key, joiner_key) =
+                    gateway_connection(&mut remote, &channels, vt.clone()).await?;
+                assert_eq!(conn.congestion_probe().flightsize, 0);
+                // Several RTOs, with no receipt for anything.
+                let seen = drive(
+                    &vt,
+                    &mut conn,
+                    &mut remote,
+                    joiner_key,
+                    Duration::from_secs(10),
+                    |_| false,
+                )
+                .await;
+                let acks = seen
+                    .iter()
+                    .filter(|m| ack_ok_parts(&m.payload).is_some())
+                    .count();
+                assert_eq!(acks, 0, "the gateway resent its handshake ack: {seen:?}");
+
+                // Premise: driving the clock this way does make the
+                // connection resend an unacknowledged packet.
+                let data_id = send_first_message(&mut conn, &mut remote, joiner_key).await?;
+                let seen = drive(
+                    &vt,
+                    &mut conn,
+                    &mut remote,
+                    joiner_key,
+                    Duration::from_secs(10),
+                    |m| m.packet_id == data_id,
+                )
+                .await;
+                assert!(
+                    seen.iter().any(|m| m.packet_id == data_id),
+                    "premise: an unacknowledged message is resent within the same span"
+                );
                 Ok(())
             }
         }
