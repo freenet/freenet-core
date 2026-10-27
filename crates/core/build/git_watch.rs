@@ -438,6 +438,9 @@ mod tests {
             "crates/core/tests/data/share-link-vectors.json",
             // Throwaway TLS fixture, read only by the `util::os_trust` tests.
             "crates/core/tests/data/tls_native_roots/leaf.der",
+            // netcheck's getter spawn, read only by the `tracing::tracer`
+            // tests that pin the log env var names it sets.
+            "crates/netcheck/src/ephemeral.rs",
         ];
         let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
         let src = manifest_dir.join("src").canonicalize().unwrap();
