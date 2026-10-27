@@ -1500,9 +1500,10 @@ pub(super) async fn dispatch_expect_connection_from(
 /// Bloom filter saturation note: `VisitedPeers` uses a 512-bit filter
 /// with k=4 hash functions. Pre-loading N entries raises the false-positive
 /// rate; at typical network sizes (≤ 20 connections in current deployments)
-/// the FP rate is negligible (~0.01%). At DEFAULT_MAX_CONNECTIONS (200),
-/// the rate reaches ~39%, which would cause routing to occasionally skip
-/// reachable peers. This is an accepted trade-off for current network sizes.
+/// it stays below about 0.1% (measured rates are in the `VisitedPeers` docs).
+/// At DEFAULT_MAX_CONNECTIONS (200), the rate reaches ~39%, which would cause
+/// routing to occasionally skip reachable peers. This is an accepted trade-off
+/// for current network sizes.
 pub(crate) fn prepare_join_request(
     tx: Transaction,
     own: &PeerKeyLocation,

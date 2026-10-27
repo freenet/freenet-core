@@ -865,7 +865,7 @@ pub(crate) const fn own_crate_version() -> (u8, u8, u16) {
 ///
 /// Mirrors `connection_handler::parse_semver` (kept local so this gate does not
 /// reach into the transport module). Pre-release suffixes are ignored.
-const fn parse_crate_version(version: &str) -> (u8, u8, u16) {
+pub(crate) const fn parse_crate_version(version: &str) -> (u8, u8, u16) {
     let bytes = version.as_bytes();
     let mut major = 0u8;
     let mut minor = 0u8;
