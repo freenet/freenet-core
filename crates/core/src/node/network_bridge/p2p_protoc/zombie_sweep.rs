@@ -1948,11 +1948,12 @@ mod tests {
         const BACKLOG: &str = "} else if zombie_sweep_state.slice_due(Instant::now(), false) {";
 
         // The wake, then the event binding, then the sweep check, then dispatch.
-        let wake = find_unique(
-            SRC,
-            "zombie_sweep::next_wake(&mut select_stream, zombie_sweep_state.backlog_deadline())",
-        );
+        let wake = find_unique(SRC, "wake = zombie_sweep::next_wake(");
         let bind = find_unique(SRC, "let event = if let Some(result) = result {");
+        assert!(
+            SRC[wake..bind].contains("zombie_sweep_state.backlog_deadline()"),
+            "the loop's timer wake-up must include the backlog deadline"
+        );
         let (_, then_close) = block_span(SRC, bind);
         let after_then = &SRC[then_close + 1..];
         assert!(
