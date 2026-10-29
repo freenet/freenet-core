@@ -457,34 +457,7 @@ impl P2pConnManager {
             self.release_identity(peer_addr, pub_key, true).await;
         }
         if let Some(conn) = removed {
-            // TODO: review: this could potentially leave garbage tasks in the background with peer listener
-            match timeout(
-                Duration::from_secs(1),
-                conn.sender
-                    .send(Right(ConnEvent::NodeAction(NodeEvent::DropConnection(
-                        peer_addr, reason,
-                    )))),
-            )
-            .await
-            {
-                Ok(Ok(())) => {}
-                Ok(Err(send_error)) => {
-                    tracing::error!(
-                        peer_addr = %peer_addr,
-                        error = ?send_error,
-                        phase = "error",
-                        "Failed to send drop connection message to peer"
-                    );
-                }
-                Err(elapsed) => {
-                    tracing::error!(
-                        peer_addr = %peer_addr,
-                        error = ?elapsed,
-                        phase = "timeout",
-                        "Timeout while sending drop connection message"
-                    );
-                }
-            }
+            notify_connection_dropped(conn.sender, peer_addr, reason);
         }
 
         true
@@ -2182,6 +2155,42 @@ impl P2pConnManager {
                 tracing::error!("All peer connection event channels closed");
                 Ok(EventResult::Continue)
             }
+        }
+    }
+}
+
+/// Tell the per-connection task of a dropped connection to close, without
+/// blocking the caller, which runs on the event loop: a full per-peer
+/// channel must not stall it (`.claude/rules/channel-safety.md`). When the
+/// channel is full, the send is moved to a short task that waits up to 1 s,
+/// as the inline send used to.
+fn notify_connection_dropped(
+    sender: PeerConnChannelSender,
+    peer_addr: SocketAddr,
+    reason: crate::tracing::DisconnectReason,
+) {
+    let event = Right(ConnEvent::NodeAction(NodeEvent::DropConnection(
+        peer_addr, reason,
+    )));
+    match sender.try_send(event) {
+        Ok(()) => {}
+        Err(tokio::sync::mpsc::error::TrySendError::Full(event)) => {
+            GlobalExecutor::spawn(async move {
+                match timeout(Duration::from_secs(1), sender.send(event)).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(_)) => tracing::debug!(
+                        %peer_addr,
+                        "Connection task gone before the drop notice was delivered"
+                    ),
+                    Err(_) => tracing::warn!(
+                        %peer_addr,
+                        "Timeout while sending drop connection message"
+                    ),
+                }
+            });
+        }
+        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+            tracing::debug!(%peer_addr, "Connection task gone before the drop notice");
         }
     }
 }

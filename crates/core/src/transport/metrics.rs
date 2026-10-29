@@ -154,6 +154,12 @@ labelled_counters! {
         /// one it is bound to or waiting for. The connection keeps its key and
         /// is not promoted; the connect op is told the connection failed.
         ChangedConnectPeer => "changed_connect_peer",
+        /// A ConnectPeer promoted a connection under a key other than the one
+        /// recorded for it. No longer recorded: a connection's key is bound
+        /// once and a ConnectPeer naming another is refused
+        /// (`changed_connect_peer`). Kept, always zero, so readers of the
+        /// snapshot that expect the field still parse it.
+        ChangedRingPromotion => "changed_ring_promotion",
         /// An attempt to bind a key to a connection (a dial, an
         /// expected-inbound match or a ConnectRequest) was refused because
         /// another open connection, heard from within the last 30 s, is bound
@@ -185,11 +191,11 @@ labelled_counters! {
         /// A key was bound to a connection while another open connection was
         /// still bound to it. No longer recorded: a key is bound to one
         /// connection at a time, and a second one waits (`claim_held`). Kept,
-        /// reading zero, because releases before the rule recorded it in the
-        /// hundreds per version, so the drop to zero is the before-and-after
-        /// comparison for the rule. `changed_ring_promotion`, removed with
-        /// the same rule, read zero in every release, so it had nothing to
-        /// compare and is gone.
+        /// reading zero, so readers of the snapshot that expect the field
+        /// still parse it; releases before the rule recorded it in the
+        /// hundreds per version, so its drop to zero is also the
+        /// before-and-after comparison for the rule. `changed_ring_promotion`
+        /// is kept, always zero, for the same reason.
         DuplicateKey => "duplicate_key",
         /// Cleanup ran for a connection whose key is mapped to a different
         /// connection. That connection keeps the mapping and the peer's
@@ -2185,6 +2191,9 @@ impl TransportMetrics {
             conn_identity_changed_connect_peer: get32(
                 &identity[ConnIdentity::ChangedConnectPeer as usize],
             ),
+            conn_identity_changed_ring_promotion: get32(
+                &identity[ConnIdentity::ChangedRingPromotion as usize],
+            ),
             conn_identity_claim_held: get32(&identity[ConnIdentity::ClaimHeld as usize]),
             conn_identity_pending_claim_bound: get32(
                 &identity[ConnIdentity::PendingClaimBound as usize],
@@ -2693,6 +2702,7 @@ pub struct TransportSnapshot {
     pub conn_identity_set_connect_peer: u32,
     pub conn_identity_same_connect_peer: u32,
     pub conn_identity_changed_connect_peer: u32,
+    pub conn_identity_changed_ring_promotion: u32,
     pub conn_identity_claim_held: u32,
     pub conn_identity_pending_claim_bound: u32,
     pub conn_identity_quiet_holder_replaced: u32,
@@ -2770,6 +2780,7 @@ impl TransportSnapshot {
             ConnIdentity::SetConnectPeer => self.conn_identity_set_connect_peer,
             ConnIdentity::SameConnectPeer => self.conn_identity_same_connect_peer,
             ConnIdentity::ChangedConnectPeer => self.conn_identity_changed_connect_peer,
+            ConnIdentity::ChangedRingPromotion => self.conn_identity_changed_ring_promotion,
             ConnIdentity::ClaimHeld => self.conn_identity_claim_held,
             ConnIdentity::PendingClaimBound => self.conn_identity_pending_claim_bound,
             ConnIdentity::QuietHolderReplaced => self.conn_identity_quiet_holder_replaced,
@@ -2965,6 +2976,7 @@ impl TransportSnapshot {
             conn_identity_set_connect_peer,
             conn_identity_same_connect_peer,
             conn_identity_changed_connect_peer,
+            conn_identity_changed_ring_promotion,
             conn_identity_claim_held,
             conn_identity_pending_claim_bound,
             conn_identity_quiet_holder_replaced,
@@ -3079,6 +3091,7 @@ impl TransportSnapshot {
         self.conn_identity_set_connect_peer = conn_identity_set_connect_peer;
         self.conn_identity_same_connect_peer = conn_identity_same_connect_peer;
         self.conn_identity_changed_connect_peer = conn_identity_changed_connect_peer;
+        self.conn_identity_changed_ring_promotion = conn_identity_changed_ring_promotion;
         self.conn_identity_claim_held = conn_identity_claim_held;
         self.conn_identity_pending_claim_bound = conn_identity_pending_claim_bound;
         self.conn_identity_quiet_holder_replaced = conn_identity_quiet_holder_replaced;
@@ -3280,6 +3293,7 @@ struct SnapshotExtras {
     pub conn_identity_set_connect_peer: u32,
     pub conn_identity_same_connect_peer: u32,
     pub conn_identity_changed_connect_peer: u32,
+    pub conn_identity_changed_ring_promotion: u32,
     pub conn_identity_claim_held: u32,
     pub conn_identity_pending_claim_bound: u32,
     pub conn_identity_quiet_holder_replaced: u32,
@@ -3384,6 +3398,7 @@ impl SnapshotExtras {
             || self.conn_identity_set_connect_peer != 0
             || self.conn_identity_same_connect_peer != 0
             || self.conn_identity_changed_connect_peer != 0
+            || self.conn_identity_changed_ring_promotion != 0
             || self.conn_identity_claim_held != 0
             || self.conn_identity_pending_claim_bound != 0
             || self.conn_identity_quiet_holder_replaced != 0
@@ -5405,6 +5420,7 @@ mod tests {
             "conn_identity_set_connect_peer",
             "conn_identity_same_connect_peer",
             "conn_identity_changed_connect_peer",
+            "conn_identity_changed_ring_promotion",
             "conn_identity_claim_held",
             "conn_identity_pending_claim_bound",
             "conn_identity_quiet_holder_replaced",

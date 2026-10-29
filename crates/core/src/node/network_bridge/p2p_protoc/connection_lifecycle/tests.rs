@@ -456,6 +456,7 @@ fn is_set(kind: ConnIdentity) -> bool {
         | ConnIdentity::ClaimHeldLong
         | ConnIdentity::OwnKey
         | ConnIdentity::DuplicateKey
+        | ConnIdentity::ChangedRingPromotion
         | ConnIdentity::TeardownKeyElsewhere
         | ConnIdentity::TeardownUnidentified
         | ConnIdentity::TeardownKeyUnmapped => false,
@@ -3112,4 +3113,60 @@ fn a_connection_promoted_on_arrival_keeps_its_recorded_location() {
                 "key kept"
             );
         });
+}
+
+/// The drop notice to a connection's task does not wait on a full channel:
+/// it returns at once, and the notice is delivered once there is room.
+#[tokio::test(start_paused = true)]
+async fn a_drop_notice_to_a_full_channel_does_not_wait() {
+    let (sender, mut receiver) = mpsc::channel(1);
+    let addr: SocketAddr = "198.51.100.47:6231".parse().unwrap();
+    let filler = Right(ConnEvent::NodeAction(NodeEvent::DropConnection(
+        addr,
+        crate::tracing::DisconnectReason::Explicit("filler".into()),
+    )));
+    sender.try_send(filler).expect("room for one");
+
+    super::notify_connection_dropped(
+        sender,
+        addr,
+        crate::tracing::DisconnectReason::Explicit("dropped".into()),
+    );
+    // Returned with the channel still full; now make room.
+    assert!(receiver.recv().await.is_some(), "the filler");
+    let delivered = tokio::time::timeout(Duration::from_millis(500), receiver.recv())
+        .await
+        .expect("delivered once there is room");
+    assert!(matches!(
+        delivered,
+        Some(Right(ConnEvent::NodeAction(NodeEvent::DropConnection(at, _)))) if at == addr
+    ));
+}
+
+/// Every explicit drop goes through the nonblocking notice: the event loop's
+/// `drop_connection_by_addr` calls `notify_connection_dropped` and sends
+/// nothing to the connection's task itself.
+#[test]
+fn drop_connection_by_addr_notifies_without_waiting() {
+    let source = include_str!("../connection_lifecycle.rs");
+    let start = source
+        .find("    pub(super) async fn drop_connection_by_addr(")
+        .expect("the function");
+    let tests_at = source.find("#[cfg(test)]").unwrap_or(source.len());
+    assert!(start < tests_at, "the signature is outside the test module");
+    let end = start
+        + source[start..]
+            .find("\n    }\n")
+            .expect("end of the function");
+    let body = &source[start..end];
+    assert!(
+        body.lines().any(|line| line
+            .trim()
+            .starts_with("notify_connection_dropped(conn.sender")),
+        "the drop notice must be sent through notify_connection_dropped"
+    );
+    assert!(
+        !body.contains("conn.sender\n") && !body.contains("conn.sender.send("),
+        "no send to the connection's task inside drop_connection_by_addr"
+    );
 }
