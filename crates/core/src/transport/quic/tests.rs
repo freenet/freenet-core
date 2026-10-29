@@ -2807,10 +2807,10 @@ fn the_transport_reports_quic_availability() {
             listener.abort();
         }
         for port in [5000, 5001] {
-            crate::transport::in_memory_socket::unregister_address_network(&SocketAddr::from((
-                [10, 201, 34, 1],
-                port,
-            )));
+            crate::transport::in_memory_socket::unregister_address_network(
+                &SocketAddr::from(([10, 201, 34, 1], port)),
+                network,
+            );
         }
         unregister_network_time_source(network);
     })

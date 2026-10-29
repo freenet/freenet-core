@@ -23,7 +23,8 @@ use crate::config::GlobalExecutor;
 
 use dashmap::DashMap;
 use std::{
-    collections::{BTreeMap, VecDeque},
+    cell::RefCell,
+    collections::{BTreeMap, HashMap, VecDeque},
     io,
     net::SocketAddr,
     sync::{Arc, LazyLock, RwLock},
@@ -36,14 +37,34 @@ use crate::simulation::{RealTime, TimeSource, VirtualTime};
 /// Maximum packet size for in-memory transport (matches typical UDP MTU)
 const MAX_PACKET_SIZE: usize = 65535;
 
-/// Global registry mapping socket addresses to their network names.
+/// Global registry mapping each socket address to the networks that registered it.
 /// This is used during `InMemorySocket::bind()` to determine which network
-/// a socket belongs to. The mapping is thread-safe and works across async tasks.
+/// a socket belongs to.
+///
+/// An address can have several owners. Simulations derive node addresses from
+/// their seed and node locations, so two simulations running concurrently in
+/// one process (plain `cargo test`) often register the same address. When this
+/// held one network per address, the last registration won, so a socket could
+/// bind into the OTHER simulation's network and exchange packets with its
+/// nodes, and one network's socket teardown removed the other's registration
+/// (#5676). [`resolve_address_network`] picks the owner.
 ///
 /// Uses DashMap instead of RwLock<HashMap> for lock-free concurrent access.
 /// This eliminates coarse-grained lock contention when multiple sockets
 /// are being registered/looked up simultaneously during test startup.
-static ADDRESS_NETWORKS: LazyLock<DashMap<SocketAddr, String>> = LazyLock::new(DashMap::new);
+static ADDRESS_NETWORKS: LazyLock<DashMap<SocketAddr, Vec<String>>> = LazyLock::new(DashMap::new);
+
+thread_local! {
+    /// The network each address was last registered for by THIS thread.
+    ///
+    /// A simulation registers its node addresses and binds their sockets on
+    /// the thread that runs it (the direct and Turmoil runners both drive
+    /// every node from one thread), so when an address has several owners in
+    /// [`ADDRESS_NETWORKS`], the one this thread registered is the binding
+    /// node's network.
+    static THREAD_ADDRESS_NETWORKS: RefCell<HashMap<SocketAddr, String>> =
+        RefCell::new(HashMap::new());
+}
 
 /// Global registry mapping network names to their VirtualTime instances.
 /// This enables SimulationSocket to use network-scoped VirtualTime for
@@ -67,17 +88,88 @@ static NETWORK_TIME_SOURCES: LazyLock<DashMap<String, VirtualTime>> = LazyLock::
 /// let socket = InMemorySocket::bind(addr).await?;
 /// ```
 pub fn register_address_network(addr: SocketAddr, network_name: &str) {
-    ADDRESS_NETWORKS.insert(addr, network_name.to_string());
+    {
+        let mut owners = ADDRESS_NETWORKS.entry(addr).or_default();
+        if !owners.iter().any(|n| n == network_name) {
+            owners.push(network_name.to_string());
+        }
+    }
+    THREAD_ADDRESS_NETWORKS.with(|m| {
+        m.borrow_mut().insert(addr, network_name.to_string());
+    });
 }
 
-/// Unregisters a socket address from the network mapping.
-pub(crate) fn unregister_address_network(addr: &SocketAddr) {
-    ADDRESS_NETWORKS.remove(addr);
+/// Removes `network_name`'s registration of `addr`, leaving any other
+/// network's registration of the same address in place.
+pub(crate) fn unregister_address_network(addr: &SocketAddr, network_name: &str) {
+    if let dashmap::Entry::Occupied(mut entry) = ADDRESS_NETWORKS.entry(*addr) {
+        entry.get_mut().retain(|n| n != network_name);
+        if entry.get().is_empty() {
+            entry.remove();
+        }
+    }
+    THREAD_ADDRESS_NETWORKS.with(|m| {
+        let mut m = m.borrow_mut();
+        if m.get(addr).is_some_and(|n| n == network_name) {
+            m.remove(addr);
+        }
+    });
 }
 
-/// Gets the network name for an address, if registered.
-fn get_address_network(addr: &SocketAddr) -> Option<String> {
-    ADDRESS_NETWORKS.get(addr).map(|r| r.value().clone())
+/// Why an address could not be resolved to one network.
+#[derive(Debug, PartialEq, Eq)]
+enum ResolveError {
+    /// No network has registered the address.
+    Unregistered,
+    /// Several networks registered it, and none of them from this thread.
+    Ambiguous(Vec<String>),
+}
+
+/// Resolves the network a socket binding `addr` on this thread belongs to.
+///
+/// With one owner, that owner. With several (concurrent simulations that
+/// picked the same address, #5676), the one this thread registered. Several
+/// owners and no registration from this thread is an error rather than a
+/// guess, since a wrong guess silently connects the node to another
+/// simulation.
+///
+/// A registration made on one thread and bound on another (a multi-thread
+/// runtime) is resolved correctly only while no other network has
+/// registered the same address.
+fn resolve_address_network(addr: &SocketAddr) -> Result<String, ResolveError> {
+    let owners = match ADDRESS_NETWORKS.get(addr) {
+        Some(owners) if !owners.is_empty() => owners.value().clone(),
+        _ => return Err(ResolveError::Unregistered),
+    };
+    let registered_here = THREAD_ADDRESS_NETWORKS.with(|m| m.borrow().get(addr).cloned());
+    if let Some(name) = registered_here.filter(|n| owners.contains(n)) {
+        return Ok(name);
+    }
+    match <[String; 1]>::try_from(owners) {
+        Ok([only]) => Ok(only),
+        Err(owners) => Err(ResolveError::Ambiguous(owners)),
+    }
+}
+
+/// The `io::Error` a bind returns when `addr` cannot be resolved.
+fn resolve_error(addr: &SocketAddr, kind: io::ErrorKind, err: ResolveError) -> io::Error {
+    match err {
+        ResolveError::Unregistered => io::Error::new(
+            kind,
+            format!(
+                "No network registered for address {addr}. \
+                 Call register_address_network() before binding."
+            ),
+        ),
+        ResolveError::Ambiguous(owners) => io::Error::new(
+            kind,
+            format!(
+                "Address {addr} is registered by several networks ({owners:?}) and by none \
+                 of them from this thread, so the socket's network is ambiguous. \
+                 Call register_address_network() on the thread that binds."
+            ),
+        ),
+    }
 }
 
 /// Clears all address-network mappings, for EVERY network in the process.
@@ -87,12 +179,18 @@ fn get_address_network(addr: &SocketAddr) -> Option<String> {
 )]
 pub fn clear_all_address_networks() {
     ADDRESS_NETWORKS.clear();
+    THREAD_ADDRESS_NETWORKS.with(|m| m.borrow_mut().clear());
 }
 
 /// Clears address-network mappings for a specific network.
-/// Retains mappings for other networks.
+/// Retains mappings for other networks, including other networks'
+/// registrations of the same addresses.
 pub fn clear_network_address_mappings(network_name: &str) {
-    ADDRESS_NETWORKS.retain(|_, v| v != network_name);
+    ADDRESS_NETWORKS.retain(|_, owners| {
+        owners.retain(|n| n != network_name);
+        !owners.is_empty()
+    });
+    THREAD_ADDRESS_NETWORKS.with(|m| m.borrow_mut().retain(|_, n| n != network_name));
 }
 
 /// Clears all network time sources, for EVERY network in the process.
@@ -136,7 +234,7 @@ fn get_network_time_source(network_name: &str) -> Option<VirtualTime> {
 /// otherwise built with a `RealTime` source). Returns `None` outside simulation
 /// (no address/network registered), where real time is the correct clock.
 pub(crate) fn get_socket_virtual_time(addr: &SocketAddr) -> Option<VirtualTime> {
-    let network_name = get_address_network(addr)?;
+    let network_name = resolve_address_network(addr).ok()?;
     get_network_time_source(&network_name)
 }
 
@@ -463,12 +561,8 @@ impl<T: TimeSource> InMemorySocket<T> {
     ///
     /// This is the generic constructor for testing with virtual time.
     pub async fn bind_with_time_source(addr: SocketAddr, time_source: T) -> io::Result<Self> {
-        let network_name = get_address_network(&addr).ok_or_else(|| {
-            io::Error::other(format!(
-                "No network registered for address {}. Call register_address_network() before binding InMemorySocket.",
-                addr
-            ))
-        })?;
+        let network_name = resolve_address_network(&addr)
+            .map_err(|e| resolve_error(&addr, io::ErrorKind::Other, e))?;
 
         let registry = get_or_create_registry(&network_name);
         let inbox = registry.write().unwrap().register(addr);
@@ -614,7 +708,7 @@ impl Socket for InMemorySocket<RealTime> {
 impl<T: TimeSource> Drop for InMemorySocket<T> {
     fn drop(&mut self) {
         unregister_socket(&self.network_name, &self.addr);
-        unregister_address_network(&self.addr);
+        unregister_address_network(&self.addr, &self.network_name);
         tracing::debug!(
             network = %self.network_name,
             addr = %self.addr,
@@ -674,16 +768,8 @@ impl std::fmt::Debug for SimulationSocket {
 impl Socket for SimulationSocket {
     async fn bind(addr: SocketAddr) -> io::Result<Self> {
         // Look up the network name for this address to verify it's registered
-        let network_name = get_address_network(&addr).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::NotFound,
-                format!(
-                    "No network registered for address {}. \
-                     Call register_address_network() before binding SimulationSocket.",
-                    addr
-                ),
-            )
-        })?;
+        let network_name = resolve_address_network(&addr)
+            .map_err(|e| resolve_error(&addr, io::ErrorKind::NotFound, e))?;
 
         // Get the VirtualTime for this network (required for simulation)
         let virtual_time = get_network_time_source(&network_name).ok_or_else(|| {
@@ -843,9 +929,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_bind_without_registration_fails() {
-        // Use a fresh address that's not registered
+        // No test registers this address.
         let addr: SocketAddr = "127.0.0.1:30001".parse().unwrap();
-        unregister_address_network(&addr); // Ensure it's not registered
 
         let result = InMemorySocket::bind(addr).await;
 
@@ -989,5 +1074,198 @@ mod tests {
         set_packet_delivery_callback(network, None);
         set_queue_packet_callback(network, None);
         unregister_network_time_source(network);
+    }
+
+    /// Two simulations that register the SAME address, each on its own
+    /// thread, each bind a socket in their own network (#5676).
+    ///
+    /// Simulations derive node addresses from their seed and node locations,
+    /// so concurrent simulations in one `cargo test` process collide on
+    /// addresses. With one network per address, the last registration won:
+    /// network A's node bound into network B, exchanged packets with B's
+    /// nodes, read B's clock for its gateway rate limiter, and B's socket
+    /// teardown removed A's registration.
+    ///
+    /// The interleaving that loses is forced with barriers rather than left
+    /// to the scheduler: A registers, then B registers, then both bind. Both
+    /// simulations are built by this test, so it fails the same way under
+    /// nextest and plain `cargo test`.
+    #[test]
+    fn concurrent_networks_sharing_an_address_each_bind_their_own() {
+        use futures::FutureExt;
+        use std::sync::Barrier;
+
+        const NET_A: &str = "addr-collision-5676-a";
+        const NET_B: &str = "addr-collision-5676-b";
+        // The address both networks register, and a second node in A only.
+        let shared: SocketAddr = "[::1]:47676".parse().unwrap();
+        let a_sender: SocketAddr = "[::1]:47677".parse().unwrap();
+        // A's clock is set ahead of B's, so a lookup of the wrong network's
+        // clock is visible.
+        const A_CLOCK_AHEAD: Duration = Duration::from_secs(5);
+
+        #[derive(Debug, PartialEq)]
+        struct Seen {
+            /// Network the shared address's socket was bound into.
+            bound_into: Result<String, String>,
+            /// Clock reading of the VirtualTime resolved for the shared address.
+            clock_nanos: Option<u64>,
+            /// Packets the shared socket received from A's other node.
+            received: Vec<Vec<u8>>,
+            /// Whether the shared address still resolves for this thread after
+            /// the OTHER network's socket at the same address was dropped.
+            resolves_after_other_dropped: Option<u64>,
+        }
+
+        let after_register_a = Arc::new(Barrier::new(2));
+        let after_register_b = Arc::new(Barrier::new(2));
+        let after_send = Arc::new(Barrier::new(2));
+        let after_b_dropped = Arc::new(Barrier::new(2));
+
+        let run = |name: &'static str,
+                   is_a: bool,
+                   barriers: [Arc<Barrier>; 4]|
+         -> std::thread::JoinHandle<Seen> {
+            std::thread::spawn(move || {
+                let [
+                    after_register_a,
+                    after_register_b,
+                    after_send,
+                    after_b_dropped,
+                ] = barriers;
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                rt.block_on(async move {
+                    let time = VirtualTime::new();
+                    if is_a {
+                        time.advance(A_CLOCK_AHEAD);
+                    }
+                    register_network_time_source(name, time);
+
+                    if is_a {
+                        register_address_network(shared, name);
+                        register_address_network(a_sender, name);
+                    }
+                    after_register_a.wait();
+                    if !is_a {
+                        register_address_network(shared, name);
+                    }
+                    after_register_b.wait();
+
+                    let socket = SimulationSocket::bind(shared).await;
+                    let bound_into = socket
+                        .as_ref()
+                        .map(|s| s.0.network_name.clone())
+                        .map_err(|e| e.to_string());
+                    let clock_nanos = get_socket_virtual_time(&shared).map(|t| t.now_nanos());
+
+                    if is_a {
+                        let sender = SimulationSocket::bind(a_sender).await.unwrap();
+                        sender.send_to(b"to-a", shared).await.unwrap();
+                    }
+                    after_send.wait();
+
+                    let mut received = Vec::new();
+                    if let Ok(socket) = &socket {
+                        let mut buf = [0u8; 64];
+                        while let Some(Ok((len, _))) = socket.recv_from(&mut buf).now_or_never() {
+                            received.push(buf[..len].to_vec());
+                        }
+                    }
+
+                    // B tears its socket down first; A then checks its own
+                    // registration survived.
+                    if !is_a {
+                        drop(socket);
+                        after_b_dropped.wait();
+                        clear_network_address_mappings(name);
+                        unregister_network_time_source(name);
+                        return Seen {
+                            bound_into,
+                            clock_nanos,
+                            received,
+                            resolves_after_other_dropped: None,
+                        };
+                    }
+                    after_b_dropped.wait();
+                    let resolves_after_other_dropped =
+                        get_socket_virtual_time(&shared).map(|t| t.now_nanos());
+                    drop(socket);
+                    clear_network_address_mappings(name);
+                    unregister_network_time_source(name);
+                    Seen {
+                        bound_into,
+                        clock_nanos,
+                        received,
+                        resolves_after_other_dropped,
+                    }
+                })
+            })
+        };
+        let barriers = || {
+            [
+                after_register_a.clone(),
+                after_register_b.clone(),
+                after_send.clone(),
+                after_b_dropped.clone(),
+            ]
+        };
+        let a = run(NET_A, true, barriers());
+        let b = run(NET_B, false, barriers());
+        let a = a.join().expect("network A's thread panicked");
+        let b = b.join().expect("network B's thread panicked");
+
+        let a_clock = A_CLOCK_AHEAD.as_nanos() as u64;
+        assert_eq!(
+            a,
+            Seen {
+                bound_into: Ok(NET_A.to_string()),
+                clock_nanos: Some(a_clock),
+                received: vec![b"to-a".to_vec()],
+                resolves_after_other_dropped: Some(a_clock),
+            },
+            "network A's node must bind into A, read A's clock, receive A's \
+             packet, and keep its registration when B's socket is dropped"
+        );
+        assert_eq!(
+            b,
+            Seen {
+                bound_into: Ok(NET_B.to_string()),
+                clock_nanos: Some(0),
+                received: vec![],
+                resolves_after_other_dropped: None,
+            },
+            "network B's node must bind into B, read B's clock, and see none \
+             of A's packets"
+        );
+    }
+
+    /// An address registered by two networks, neither from the binding
+    /// thread, is refused rather than bound into either (#5676).
+    #[tokio::test]
+    async fn bind_refuses_an_address_ambiguous_to_this_thread() {
+        let addr: SocketAddr = "[::1]:47678".parse().unwrap();
+        let (net_a, net_b) = ("ambiguous-5676-a", "ambiguous-5676-b");
+        std::thread::spawn(move || {
+            register_address_network(addr, net_a);
+            register_address_network(addr, net_b);
+        })
+        .join()
+        .unwrap();
+
+        let err = InMemorySocket::bind(addr).await.unwrap_err();
+        assert!(
+            err.to_string().contains("ambiguous"),
+            "unexpected error: {err}"
+        );
+
+        // With one owner left, a bind from any thread resolves to it.
+        clear_network_address_mappings(net_a);
+        let socket = InMemorySocket::bind(addr).await.unwrap();
+        assert_eq!(socket.network_name, net_b);
+        drop(socket);
+        clear_network_address_mappings(net_b);
     }
 }
