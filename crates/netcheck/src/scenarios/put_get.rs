@@ -147,6 +147,9 @@ pub async fn run_put(args: PutCmd) -> Result<bool> {
         Ok(put) => put,
         Err(e) => return Err(report_put_failure(e, run_id, &args.put, &report)),
     };
+    // Before anything below can fail: this host's report is what gets
+    // published when the GET side leaves none.
+    print_put_run_line(run_id, &args.put, put.handoff.put_duration_ms);
     if let Some(vantage) = &args.vantage {
         stamp_vantage(&mut put.handoff.put_ops, vantage);
     }
@@ -160,7 +163,6 @@ pub async fn run_put(args: PutCmd) -> Result<bool> {
         // Best effort: the handoff already on disk lacks only the note.
         put.handoff.save(&args.handoff)?;
     }
-    print_put_run_line(run_id, &args.put);
     Ok(true)
 }
 
@@ -209,7 +211,7 @@ fn report_put_failure(
     args: &PutArgs,
     report: &Report,
 ) -> anyhow::Error {
-    print_put_run_line(run_id, args);
+    print_put_run_line(run_id, args, 0);
     report.print_summary();
     e
 }
@@ -217,14 +219,19 @@ fn report_put_failure(
 /// The `put` host's report is published only when the GET side left none, as
 /// a run that could not complete. Without its own run line that record would
 /// carry no run id, so it could not be matched to the night's handoff.
-fn print_put_run_line(run_id: String, args: &PutArgs) {
-    RunMeta::new(
-        SCENARIO,
-        run_id,
-        args.gateway_ws.clone(),
-        String::new(),
-        Vec::new(),
-    )
+fn print_put_run_line(run_id: String, args: &PutArgs, duration_ms: u128) {
+    let order_seed = Some(interleave_seed(&run_id));
+    RunMeta {
+        duration_ms,
+        order_seed,
+        ..RunMeta::new(
+            SCENARIO,
+            run_id,
+            args.gateway_ws.clone(),
+            String::new(),
+            Vec::new(),
+        )
+    }
     .print();
 }
 
@@ -1274,12 +1281,14 @@ mod tests {
     #[test]
     fn a_successful_put_phase_prints_its_run_line() {
         // The `put` report is published when the GET side leaves none. Without
-        // a run line, emit files it under run id "unknown".
+        // a run line, emit files it under run id "unknown". The line goes out
+        // before the handoff is saved, so a failed save still leaves one.
+        // `split_at_call` panics unless the call is at statement position.
         let put = fn_body(include_str!("put_get.rs"), "pub async fn run_put(");
-        let (_, after) = split_at_call(put, "put.handoff.save(&args.handoff)?;");
-        assert!(
-            after.contains("print_put_run_line(run_id, &args.put);"),
-            "`put` must print its run line once the handoff is written"
+        let (before, _) = split_at_call(put, "put.handoff.save(&args.handoff)?;");
+        split_at_call(
+            before,
+            "print_put_run_line(run_id, &args.put, put.handoff.put_duration_ms);",
         );
     }
 

@@ -164,7 +164,9 @@ jobs:
     # manual cancel. Its result does not feed the notifications: a collector
     # that is down is not a network regression. Re-running a failed `get`
     # re-runs this too, so the night is published again under the same run
-    # id, with its "0h" GETs read hours late (`put_get_gap_ms` shows it).
+    # id, PUT records included, with its "0h" GETs read hours late
+    # (`put_get_gap_ms` shows it). The first attempt's record, an `error`
+    # verdict when `get` left no report, is not withdrawn.
     if: ${{ !cancelled() }}
     runs-on: self-hosted
     timeout-minutes: 20
