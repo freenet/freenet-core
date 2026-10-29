@@ -399,12 +399,14 @@ fn handshake_and_one_mib_stream_on_virtual_time() {
         assert_eq!(handshake.protocol.as_deref(), Some(ALPN));
         assert_eq!(handshake.server_name, None, "SNI is off");
         for conn in [&client, &server] {
+            let controller = conn
+                .inner()
+                .congestion_state()
+                .into_any()
+                .downcast::<super::recycle::AckCounting>()
+                .expect("the acknowledgement-counting controller");
             assert!(
-                conn.inner()
-                    .congestion_state()
-                    .into_any()
-                    .downcast::<quinn::congestion::Cubic>()
-                    .is_ok(),
+                controller.wraps::<quinn::congestion::Cubic>(),
                 "Cubic congestion control"
             );
         }
@@ -2437,8 +2439,9 @@ fn the_cap_wakes_waiters_per_quic_datagram() {
 }
 
 /// Each close code reaches the peer as that code, and the peer maps it to
-/// the kind its handling depends on: `Downgrade` and `IdentityMismatch` are
-/// refusals, `NodeDroppedPeer` (also what dropping a connection sends) is a
+/// the kind its handling depends on: `Downgrade` (and the two recycle
+/// codes, which also ask the peer to fall back to UDP) and
+/// `IdentityMismatch` are refusals, `NodeDroppedPeer` (also what dropping a connection sends) is a
 /// lost connection. Either side can close. Each close is counted once, by
 /// code; a second close of an ended connection sends and counts nothing.
 #[test]
@@ -2456,7 +2459,9 @@ fn close_codes_reach_the_peer() {
         .await;
         let expected = |code: QuicCloseCode| match code {
             QuicCloseCode::NodeDroppedPeer => QuicErrorKind::ConnectionLost,
-            QuicCloseCode::Downgrade => QuicErrorKind::Refused {
+            QuicCloseCode::Downgrade
+            | QuicCloseCode::SendAbortLimit
+            | QuicCloseCode::PeerNotAcknowledging => QuicErrorKind::Refused {
                 reason: QuicRefusal::Downgrade,
             },
             QuicCloseCode::IdentityMismatch => QuicErrorKind::Refused {

@@ -47,11 +47,19 @@
 //! neither event (`reset_acked` emits none), so each locally reset stream
 //! leaves one entry until the connection closes. Every send registers
 //! (its writes race `stopped()`), so the entries are bounded by the sends
-//! aborted on the connection over its lifetime (a source that failed, a
-//! cancelled send, a stop answered with a reset). e5 constraint: a
-//! connection that aborts sends without limit grows without limit, so it
-//! must be recycled or the abort rate bounded. Worth an upstream quinn
-//! issue (not filed).
+//! this side reset on the connection over its lifetime (a source that
+//! failed, a cancelled send). A stop the peer sent is reported as Stopped
+//! and removes its entry, so answering it with a reset adds none. The path
+//! counts its resets and closes the connection past
+//! [`recycle::SEND_ABORT_LIMIT`] (`close_code::SEND_ABORT_LIMIT`), so the
+//! peer falls back to UDP and a new connection starts with an empty map.
+//! Worth an upstream quinn issue (not filed).
+//!
+//! The receive task also runs the path's acknowledgement watch
+//! ([`recycle::watch_acknowledgements`]): a peer that keeps sending but
+//! acknowledges none of our packets is not a conforming QUIC peer (RFC 9000
+//! 13.2.1 requires acknowledging ack-eliciting packets within
+//! max_ack_delay), so the path is closed (`close_code::PEER_NOT_ACKNOWLEDGING`).
 //!
 //! Receiving: one task per connection accepts every uni stream and reads all
 //! of them concurrently (no task per stream), parsing the header and then:
@@ -95,6 +103,7 @@ use tokio::sync::mpsc;
 use super::QuicConnection;
 use super::framing::{FrameHeader, HeaderError};
 use super::identity::PeerKey;
+use super::recycle::{self, SendAborts};
 use crate::config::GlobalExecutor;
 use crate::simulation::TimeSource;
 use crate::transport::StreamId;
@@ -186,6 +195,9 @@ pub(crate) struct QuicPathLimits {
     pub(crate) short_capacity: usize,
     pub(crate) stream_capacity: usize,
     pub(crate) control_capacity: usize,
+    /// Sends this side may reset before the path is closed
+    /// ([`recycle::SEND_ABORT_LIMIT`]).
+    pub(crate) max_send_aborts: u64,
     /// The receive task panics on its first stream (supervisor test).
     #[cfg(test)]
     pub(crate) panic_in_receive: bool,
@@ -206,6 +218,7 @@ impl QuicPathLimits {
         short_capacity: SHORT_CHANNEL_CAPACITY,
         stream_capacity: STREAM_CHANNEL_CAPACITY,
         control_capacity: CONTROL_CHANNEL_CAPACITY,
+        max_send_aborts: recycle::SEND_ABORT_LIMIT,
         #[cfg(test)]
         panic_in_receive: false,
     };
@@ -395,6 +408,8 @@ pub(crate) struct QuicPath {
     connection: QuicConnection,
     stats: Arc<QuicPathStats>,
     receive: tokio::task::JoinHandle<()>,
+    /// Sends this side reset; closes the connection past the limit.
+    aborts: Arc<SendAborts>,
     #[cfg(test)]
     budget: SharedInboundBudget,
 }
@@ -486,7 +501,7 @@ impl QuicPath {
         let (controls_tx, controls) = mpsc::channel(limits.control_capacity);
         #[cfg_attr(not(test), allow(unused_mut))]
         let mut receiver = inbound::Receiver::new(
-            time,
+            time.clone(),
             budget.clone(),
             stats.clone(),
             shorts_tx,
@@ -497,17 +512,20 @@ impl QuicPath {
         {
             receiver.panic_on_stream = limits.panic_in_receive;
         }
+        let aborts = Arc::new(SendAborts::new(limits.max_send_aborts, connection.closer()));
         let receive = GlobalExecutor::spawn(supervise_receive(
             connection.inner().clone(),
             connection.closer(),
             Arc::new(receiver),
             stats.clone(),
+            time,
         ));
         (
             Self {
                 connection,
                 stats,
                 receive,
+                aborts,
                 #[cfg(test)]
                 budget,
             },
@@ -529,6 +547,12 @@ impl QuicPath {
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn stats(&self) -> &QuicPathStats {
         &self.stats
+    }
+
+    /// Sends this side reset on this path so far.
+    #[cfg(test)]
+    pub(crate) fn send_aborts(&self) -> u64 {
+        self.aborts.count()
     }
 
     /// Streams and bytes charged to the inbound budget (peer-wide when the
@@ -654,7 +678,10 @@ impl QuicPath {
     /// stream credit when the peer's [`super::config::MAX_UNI_STREAMS`] are
     /// in use.
     async fn open(&self, header: &FrameHeader, metadata: &[u8]) -> Result<Outgoing, QuicSendError> {
-        let mut send = Outgoing::new(self.connection.inner().open_uni().await?);
+        let mut send = Outgoing::new(
+            self.connection.inner().open_uni().await?,
+            self.aborts.clone(),
+        );
         send.write_all(&header.encode()).await?;
         if !metadata.is_empty() {
             send.write_all(metadata).await?;
@@ -686,16 +713,27 @@ fn frame_metadata(metadata: Option<&[u8]>) -> &[u8] {
 /// `close_code::DOWNGRADE`: the QUIC path is broken on this side, and the
 /// peer should fall back to the UDP session. Dropping the path aborts this
 /// task, which is not counted.
+///
+/// The path's acknowledgement watch ([`recycle::watch_acknowledgements`])
+/// runs beside it in this task. When the watch closes the connection, the
+/// receive task then ends as the connection does.
 async fn supervise_receive<T: TimeSource>(
     connection: quinn::Connection,
     closer: super::QuicCloser,
     receiver: Arc<inbound::Receiver<T>>,
     stats: Arc<QuicPathStats>,
+    time: T,
 ) {
     use futures::FutureExt;
-    let ended = std::panic::AssertUnwindSafe(inbound::receive(connection.clone(), receiver))
-        .catch_unwind()
-        .await;
+    let mut receive = std::pin::pin!(
+        std::panic::AssertUnwindSafe(inbound::receive(connection.clone(), receiver)).catch_unwind()
+    );
+    let ended = tokio::select! {
+        ended = &mut receive => ended,
+        () = recycle::watch_acknowledgements(connection.clone(), closer.clone(), time) => {
+            receive.await
+        }
+    };
     if ended.is_err() {
         stats.record(QuicInboundOutcome::ReceiveTaskPanicked);
         tracing::error!(
@@ -723,17 +761,20 @@ struct Outgoing {
     stopped: Pin<Box<dyn Future<Output = StoppedResult> + Send + Sync>>,
     /// Finished or reset: dropping it then sends nothing more.
     closed: bool,
+    /// The path's count of sends reset on this side.
+    aborts: Arc<SendAborts>,
 }
 
 type StoppedResult = Result<Option<quinn::VarInt>, quinn::StoppedError>;
 
 impl Outgoing {
-    fn new(send: quinn::SendStream) -> Self {
+    fn new(send: quinn::SendStream, aborts: Arc<SendAborts>) -> Self {
         let stopped = Box::pin(send.stopped());
         Self {
             send,
             stopped,
             closed: false,
+            aborts,
         }
     }
 
@@ -788,10 +829,16 @@ impl Outgoing {
         self.reset(code);
     }
 
+    /// Reset the stream on this side, and count it ([`SendAborts`]) if the
+    /// reset was sent. Not used for a stop the peer sent
+    /// ([`Self::stopped_early`]): quinn reports that stream as Stopped, so
+    /// it leaves nothing in quinn's `stopped` map.
     fn reset(&mut self, code: u32) {
         if !self.closed {
             self.closed = true;
-            self.send.reset(code.into()).ok();
+            if self.send.reset(code.into()).is_ok() {
+                self.aborts.record();
+            }
         }
     }
 

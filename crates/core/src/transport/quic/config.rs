@@ -39,7 +39,7 @@ use std::time::{Duration, SystemTime};
 
 use quinn::{
     ClientConfig, EndpointConfig, IdleTimeout, MtuDiscoveryConfig, NoneTokenLog, NoneTokenStore,
-    ServerConfig, TransportConfig, ValidationTokenConfig, VarInt, congestion,
+    ServerConfig, TransportConfig, ValidationTokenConfig, VarInt,
 };
 use ring_crypto::{hkdf, hmac};
 
@@ -385,7 +385,9 @@ pub(crate) fn transport_config<T: TimeSource>(
         .mtu_discovery_config(None::<MtuDiscoveryConfig>)
         .pad_to_mtu(false)
         .enable_segmentation_offload(false)
-        .congestion_controller_factory(Arc::new(congestion::CubicConfig::default()))
+        // Cubic, wrapped to count the packets the peer acknowledges (the
+        // path's acknowledgement watch, `recycle`).
+        .congestion_controller_factory(Arc::new(super::recycle::AckCountingFactory::default()))
         .initial_rtt(Duration::from_millis(333))
         .packet_threshold(3)
         .time_threshold(9.0 / 8.0)

@@ -41,6 +41,7 @@ pub(crate) mod framing;
 pub(crate) mod identity;
 pub(crate) mod liveness;
 pub(crate) mod path;
+pub(crate) mod recycle;
 pub(crate) mod runtime;
 pub(crate) mod socket;
 
@@ -886,6 +887,11 @@ impl QuicCloser {
         TRANSPORT_METRICS.record_quic_close_sent(code, self.connection.remote_address());
         self.connection.close(code.code().into(), code.reason());
         true
+    }
+
+    /// The connection's remote address (for logs).
+    pub(crate) fn remote_address(&self) -> SocketAddr {
+        self.connection.remote_address()
     }
 
     /// Mark a close as in progress without closing (tests: a second
