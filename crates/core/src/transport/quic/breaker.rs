@@ -1144,18 +1144,53 @@ mod tests {
     /// tests; `the_marker_is_read_again_after_the_wait` tests the re-read.)
     #[test]
     fn gate_reads_the_marker_again_after_the_wait() {
-        let src = include_str!("breaker.rs");
-        let start = src
-            .find("pub(crate) async fn gate<T>(")
-            .expect("gate not found");
-        let end = start + src[start..].find("\n}\n").expect("end of gate");
-        let flat: String = src[start..end].split_whitespace().collect();
+        let flat: String =
+            production_fn_body(include_str!("breaker.rs"), "pub(crate) async fn gate<T>(")
+                .split_whitespace()
+                .collect();
         let wait = flat.find("wait_for_exit(holder,").expect("the wait");
         let after = wait + flat[wait..].find(".await;").expect("awaited") + ".await;".len();
         assert!(
             flat[after..].starts_with("(previous,armed_pid_alive)=reread_after_wait(&path,"),
             "gate must re-read the marker right after waiting for its holder"
         );
+    }
+
+    /// The body of the production function whose definition starts with
+    /// `signature` in this file's source. Only the part before the test
+    /// module is searched, so this test's own literals cannot match, and the
+    /// signature must occur there exactly once (AGENTS.md, source-scrape
+    /// pins). The test module is the one line that is exactly `mod tests {`,
+    /// which holds with CRLF line endings too.
+    fn production_fn_body<'a>(src: &'a str, signature: &str) -> &'a str {
+        let module_starts: Vec<usize> = src
+            .match_indices("mod tests {")
+            .map(|(i, _)| i)
+            .filter(|&i| i == 0 || src.as_bytes()[i - 1] == b'\n')
+            .collect();
+        assert_eq!(module_starts.len(), 1, "expected one test module");
+        let production = &src[..module_starts[0]];
+        assert_eq!(
+            production.matches(signature).count(),
+            1,
+            "`{signature}` must occur exactly once before the test module"
+        );
+        let start = production.find(signature).expect("counted above");
+        let open = start + production[start..].find('{').expect("a body");
+        let mut depth = 0usize;
+        for (i, byte) in production.bytes().enumerate().skip(open) {
+            match byte {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return &production[open..=i];
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("unbalanced braces in `{signature}`");
     }
 
     /// The wait loop: it returns as soon as the holder is gone, and gives up
