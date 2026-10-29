@@ -453,7 +453,7 @@ fn is_set(kind: ConnIdentity) -> bool {
         | ConnIdentity::ChangedConnectPeer
         | ConnIdentity::ClaimHeld
         | ConnIdentity::QuietHolderReplaced
-        | ConnIdentity::CrossedClaimClosed
+        | ConnIdentity::ClaimHeldLong
         | ConnIdentity::OwnKey
         | ConnIdentity::DuplicateKey
         | ConnIdentity::TeardownKeyElsewhere
@@ -2843,18 +2843,6 @@ fn shutdown_cleanup_uses_the_shared_gating() {
     assert!(!block.contains("on_ring_connection_lost("));
 }
 
-/// A key generated so that it orders above (`above`) or below this node's
-/// own key.
-fn key_ordered(h: &Harness, above: bool) -> TransportPublicKey {
-    let own = h.own_key();
-    loop {
-        let candidate = key();
-        if (candidate > own) == above {
-            return candidate;
-        }
-    }
-}
-
 /// A connection waiting for a key keeps that key: a ConnectRequest on it
 /// naming another key is a mismatch and closes it, as for a bound one.
 #[tokio::test]
@@ -3019,382 +3007,66 @@ async fn connect_request_replacing_a_quiet_holder_counts_known_addr() {
     assert!(seen(new).contains(&ConnIdentity::ConnectRequestKnownAddr));
 }
 
-impl Harness {
-    /// As [`Self::accept_expected`], with a transport that reports receipt
-    /// on the returned clock.
-    async fn accept_expected_with_receipt(
-        &mut self,
-        addr: SocketAddr,
-        dialled: &TransportPublicKey,
-    ) -> ReceiptClock {
-        let clock = ReceiptClock::default();
-        self.handshake_event(HandshakeEvent::InboundConnection {
-            transaction: None,
-            matched: HandshakeInboundMatch::Expected(Some(dialled.clone())),
-            connection: Box::new(IdleConnection {
-                addr,
-                receipt: Some(clock.stamp()),
-            }),
-            transient: false,
-        })
-        .await;
-        assert!(self.mgr.connections.contains_key(&addr), "connection kept");
-        clock
-    }
-
-    async fn retry(&mut self) -> bool {
-        let handshake = self.handshake.clone();
-        self.mgr.retry_pending_claims(&handshake).await
-    }
-
-    async fn sweep(&mut self) {
-        let handshake = self.handshake.clone();
-        let mut state = zombie_sweep::ZombieSweepState::new(Instant::now());
-        self.mgr
-            .sweep_zombie_transports(&handshake, &mut state, true)
-            .await;
-    }
-
-    /// Whether the connection holding `key` is `addr`, heard from.
-    fn holds_live(&self, key: &TransportPublicKey, addr: SocketAddr) -> bool {
-        identity::key_holder(&self.mgr.connections, None, key) == Some((addr, true))
-    }
-}
-
-/// How a crossed pair is set up: which session the higher node holds, and
-/// how the lower node's waiting session made its claim.
-#[derive(Clone, Copy, Debug)]
-enum CrossedSetup {
-    /// Each node holds the session it dialled; the other arrives as an
-    /// expected inbound connection.
-    HoldOwnDials,
-    /// As `HoldOwnDials`, but at the lower node the higher node's session
-    /// arrives unexpected and claims the key with a ConnectRequest, which
-    /// does not promote.
-    LowerClaimsByRequest,
-    /// Each node holds the session the other dialled, which arrived first;
-    /// its own dial waits.
-    HoldInbound,
-}
-
-/// Two nodes with two sessions between them, established together and
-/// crossed: each holds the one the other keeps waiting. Built so that
-/// `higher`'s key orders above `lower`'s, whichever was generated first.
-struct CrossedPair {
-    higher: Harness,
-    lower: Harness,
-    /// The session both nodes should end on, at each node.
-    kept_at_higher: SocketAddr,
-    kept_at_lower: SocketAddr,
-    /// The other session, at each node: waiting at `higher`, holding at
-    /// `lower`.
-    closed_at_higher: SocketAddr,
-    closed_at_lower: SocketAddr,
-    /// Receipt clocks of the sessions at `lower`; the first is the closed
-    /// session's.
-    lower_clocks: Vec<ReceiptClock>,
-    _higher_clocks: Vec<ReceiptClock>,
-}
-
-impl CrossedPair {
-    async fn new(name: &str, net: u8, setup: CrossedSetup) -> Self {
-        let first = Harness::new(&format!("{name}-1")).await;
-        let second = Harness::new(&format!("{name}-2")).await;
-        let (mut higher, mut lower) = if first.own_key() > second.own_key() {
-            (first, second)
-        } else {
-            (second, first)
-        };
-        let (key_h, key_l) = (higher.own_key(), lower.own_key());
-        assert!(key_h > key_l, "premise: forced key order");
-        // Session D is the one `higher` dialled, E the one `lower` dialled.
-        let d_at_h: SocketAddr = format!("192.0.2.{net}:7001").parse().unwrap();
-        let e_at_h: SocketAddr = format!("192.0.2.{net}:7002").parse().unwrap();
-        let d_at_l: SocketAddr = format!("192.0.2.{}:7001", net + 1).parse().unwrap();
-        let e_at_l: SocketAddr = format!("192.0.2.{}:7002", net + 1).parse().unwrap();
-        higher.watch(&[d_at_h, e_at_h]);
-        lower.watch(&[d_at_l, e_at_l]);
-        let (mut higher_clocks, mut lower_clocks) = (Vec::new(), Vec::new());
-        match setup {
-            CrossedSetup::HoldOwnDials | CrossedSetup::LowerClaimsByRequest => {
-                higher_clocks.push(higher.dial_with_receipt(d_at_h, &key_l).await);
-                lower_clocks.push(lower.dial_with_receipt(e_at_l, &key_h).await);
-                higher_clocks.push(higher.accept_expected_with_receipt(e_at_h, &key_l).await);
-                if matches!(setup, CrossedSetup::LowerClaimsByRequest) {
-                    lower_clocks.push(lower.accept_with_receipt(d_at_l).await);
-                    lower
-                        .refused_connect_request(
-                            d_at_l,
-                            PeerKeyLocation::with_unknown_addr(key_h.clone()),
-                        )
-                        .await;
-                    assert_eq!(lower.pending_on(d_at_l), Some(false), "premise: no promote");
-                } else {
-                    lower_clocks.push(lower.accept_expected_with_receipt(d_at_l, &key_h).await);
-                }
-                Self {
-                    higher,
-                    lower,
-                    kept_at_higher: d_at_h,
-                    kept_at_lower: d_at_l,
-                    closed_at_higher: e_at_h,
-                    closed_at_lower: e_at_l,
-                    lower_clocks,
-                    _higher_clocks: higher_clocks,
-                }
-            }
-            CrossedSetup::HoldInbound => {
-                higher_clocks.push(higher.accept_expected_with_receipt(e_at_h, &key_l).await);
-                lower_clocks.push(lower.accept_expected_with_receipt(d_at_l, &key_h).await);
-                higher_clocks.push(higher.dial_with_receipt(d_at_h, &key_l).await);
-                lower_clocks.push(lower.dial_with_receipt(e_at_l, &key_h).await);
-                Self {
-                    higher,
-                    lower,
-                    kept_at_higher: e_at_h,
-                    kept_at_lower: e_at_l,
-                    closed_at_higher: d_at_h,
-                    closed_at_lower: d_at_l,
-                    lower_clocks,
-                    _higher_clocks: higher_clocks,
-                }
-            }
-        }
-    }
-
-    fn assert_crossed(&self) {
-        let (key_h, key_l) = (self.higher.own_key(), self.lower.own_key());
-        assert_eq!(self.higher.ring_addr_of(&key_l), Some(self.kept_at_higher));
-        assert!(
-            self.higher.mgr.connections[&self.closed_at_higher]
-                .identity
-                .pending()
-                .is_some()
-        );
-        assert_eq!(self.lower.ring_addr_of(&key_h), Some(self.closed_at_lower));
-        assert!(
-            self.lower.mgr.connections[&self.kept_at_lower]
-                .identity
-                .pending()
-                .is_some()
-        );
-    }
-
-    /// The session `higher` closed goes quiet at `lower`, whose next retry
-    /// replaces it.
-    async fn lower_sees_quiet(&mut self) {
-        let key_h = self.higher.own_key();
-        assert!(
-            self.lower.holds_live(&key_h, self.closed_at_lower),
-            "premise: heard from until it goes quiet"
-        );
-        // The first clock is the closed session's at `lower`, in every setup.
-        self.lower_clocks[0].go_quiet(identity::HOLD_WINDOW + Duration::from_secs(1));
-        assert!(!self.lower.holds_live(&key_h, self.closed_at_lower));
-        self.lower.retry().await;
-    }
-
-    fn assert_converged(&self, label: &str) {
-        let (key_h, key_l) = (self.higher.own_key(), self.lower.own_key());
-        assert_eq!(
-            self.higher.ring_addr_of(&key_l),
-            Some(self.kept_at_higher),
-            "{label}: higher"
-        );
-        assert_eq!(
-            self.lower.ring_addr_of(&key_h),
-            Some(self.kept_at_lower),
-            "{label}: lower"
-        );
-        assert_eq!(
-            self.higher.mgr.connections[&self.kept_at_higher].pub_key(),
-            Some(&key_l),
-            "{label}"
-        );
-        assert_eq!(
-            self.lower.mgr.connections[&self.kept_at_lower].pub_key(),
-            Some(&key_h),
-            "{label}"
-        );
-        assert_eq!(
-            self.higher.mgr.connections.len(),
-            1,
-            "{label}: one session at higher"
-        );
-        assert_eq!(
-            self.lower.mgr.connections.len(),
-            1,
-            "{label}: one session at lower"
-        );
-    }
-}
-
-/// Crossed sessions between two nodes end on one session at both, with
-/// each node in the other's ring, in every setup and both ways the lower
-/// node learns of the close: the transport's close notice (`closed`, which
-/// a QUIC session delivers and a UDP session does not), or the session going
-/// quiet there. The higher node closes only its waiting session, and only
-/// once its claim has waited; the lower node never closes either.
+/// A claim waiting behind a holder that is heard from is counted as a long
+/// wait once it has waited `LONG_CLAIM_WAIT`, once only, and keeps waiting:
+/// the holder is not touched.
 #[tokio::test(start_paused = true)]
-async fn crossed_sessions_converge_on_one_session_at_both_nodes() {
-    let setups = [
-        CrossedSetup::HoldOwnDials,
-        CrossedSetup::LowerClaimsByRequest,
-        CrossedSetup::HoldInbound,
-    ];
-    let mut net = 10;
-    for setup in setups {
-        for closed in [true, false] {
-            let label = format!("{setup:?}, closed: {closed}");
-            let mut pair = CrossedPair::new(&format!("conn-identity-pair-{net}"), net, setup).await;
-            net += 2;
-            pair.assert_crossed();
-
-            pair.higher.retry().await;
-            pair.lower.retry().await;
-            pair.assert_crossed();
-
-            tokio::time::advance(identity::CROSSED_CLAIM_WAIT).await;
-            pair.lower.retry().await;
-            assert!(
-                pair.lower.mgr.connections.contains_key(&pair.kept_at_lower)
-                    && pair
-                        .lower
-                        .mgr
-                        .connections
-                        .contains_key(&pair.closed_at_lower),
-                "{label}: the lower node never closes either"
-            );
-            pair.higher.retry().await;
-            assert!(
-                !pair
-                    .higher
-                    .mgr
-                    .connections
-                    .contains_key(&pair.closed_at_higher),
-                "{label}"
-            );
-            assert!(seen(pair.closed_at_higher).contains(&ConnIdentity::CrossedClaimClosed));
-
-            if closed {
-                let at = pair.closed_at_lower;
-                pair.lower.transport_closed(at).await;
-            } else {
-                pair.lower_sees_quiet().await;
-            }
-            pair.assert_converged(&label);
-        }
-    }
-}
-
-/// An idle crossed pair, no requests on either session, through the real
-/// zombie sweep. At 115 s both waiting sessions are past the sweep's 90 s
-/// idle limit for a connection outside the ring, and the claims are past the
-/// crossed wait: the sweep leaves both alone, the higher node closes its
-/// waiting session, and once that session goes quiet at the lower node both
-/// end on one session. (Advancing paused time much further lets the
-/// harness's own ring maintenance, which has no live peers, prune its ring
-/// connections, so the window's end is covered by the unit test of
-/// `identity::sweep_spares_claim` instead.)
-#[tokio::test(start_paused = true)]
-async fn an_idle_crossed_pair_converges_through_the_sweep() {
-    let mut pair =
-        CrossedPair::new("conn-identity-pair-idle", 40, CrossedSetup::HoldOwnDials).await;
-    pair.assert_crossed();
-    tokio::time::advance(identity::CROSSED_CLAIM_WAIT + Duration::from_secs(25)).await;
-    pair.higher.sweep().await;
-    pair.lower.sweep().await;
-    pair.assert_crossed();
-
-    pair.lower.retry().await;
-    pair.higher.retry().await;
-    assert!(
-        !pair
-            .higher
-            .mgr
-            .connections
-            .contains_key(&pair.closed_at_higher)
-    );
-    pair.lower_sees_quiet().await;
-    pair.assert_converged("idle");
-    pair.higher.sweep().await;
-    pair.lower.sweep().await;
-    pair.assert_converged("idle, after another sweep");
-}
-
-/// Crossed closes count toward the retry's per-pass limit: a pass closes at
-/// most `MAX_PENDING_CLAIM_WORK_PER_PASS`, reports work left, and the next
-/// pass closes the rest. The holders are all kept.
-#[tokio::test(start_paused = true)]
-async fn crossed_closes_count_toward_the_per_pass_limit() {
-    let mut h = Harness::new("conn-identity-crossed-limit").await;
-    let total = MAX_PENDING_CLAIM_WORK_PER_PASS + 3;
-    let mut pairs = Vec::new();
-    let mut clocks = Vec::new();
-    for i in 0..total {
-        let holder: SocketAddr = format!("198.51.100.44:{}", 7100 + 2 * i).parse().unwrap();
-        let claimant: SocketAddr = format!("198.51.100.44:{}", 7101 + 2 * i).parse().unwrap();
-        let peer = key_ordered(&h, false);
-        clocks.push(h.dial_with_receipt(holder, &peer).await);
-        h.accept_expected(claimant, &peer).await;
-        pairs.push((holder, claimant, peer));
-    }
-    tokio::time::advance(identity::CROSSED_CLAIM_WAIT).await;
-    let closed = |h: &Harness| {
-        pairs
-            .iter()
-            .filter(|(_, claimant, _)| !h.mgr.connections.contains_key(claimant))
-            .count()
-    };
-
-    assert!(h.retry().await, "work is left");
-    assert_eq!(closed(&h), MAX_PENDING_CLAIM_WORK_PER_PASS);
-    assert_eq!(
-        closed(&h)
-            + pairs
-                .iter()
-                .filter(|(_, c, _)| {
-                    h.mgr
-                        .connections
-                        .get(c)
-                        .is_some_and(|entry| entry.identity.pending().is_some())
-                })
-                .count(),
-        total
-    );
-    assert!(!h.retry().await);
-    assert_eq!(closed(&h), total);
-    for (holder, _, peer) in &pairs {
-        assert_eq!(h.ring_addr_of(peer), Some(*holder));
-    }
-}
-
-/// The per-pass limit also holds within one key: more crossed waiting
-/// connections for one key than the limit are closed over two passes.
-#[tokio::test(start_paused = true)]
-async fn crossed_closes_for_one_key_respect_the_per_pass_limit() {
-    let mut h = Harness::new("conn-identity-crossed-limit-one-key").await;
-    let total = MAX_PENDING_CLAIM_WORK_PER_PASS + 3;
-    let holder: SocketAddr = "198.51.100.43:7300".parse().unwrap();
-    let peer = key_ordered(&h, false);
+async fn a_claim_held_long_by_a_live_holder_is_counted_once() {
+    let mut h = Harness::new("conn-identity-claim-held-long").await;
+    let holder: SocketAddr = "198.51.100.47:6201".parse().unwrap();
+    let waiting: SocketAddr = "198.51.100.47:6202".parse().unwrap();
+    h.watch(&[holder, waiting]);
+    let peer = key();
     let _clock = h.dial_with_receipt(holder, &peer).await;
-    let claimants: Vec<SocketAddr> = (0..total)
-        .map(|i| format!("198.51.100.43:{}", 7301 + i).parse().unwrap())
-        .collect();
-    for claimant in &claimants {
-        h.accept_expected(*claimant, &peer).await;
-    }
-    tokio::time::advance(identity::CROSSED_CLAIM_WAIT).await;
-    let open = |h: &Harness| {
-        claimants
-            .iter()
-            .filter(|c| h.mgr.connections.contains_key(c))
+    h.accept_expected(waiting, &peer).await;
+    let handshake = h.handshake.clone();
+    let counted = |addr| {
+        seen(addr)
+            .into_iter()
+            .filter(|kind| *kind == ConnIdentity::ClaimHeldLong)
             .count()
     };
 
-    assert!(h.retry().await, "work is left");
-    assert_eq!(open(&h), total - MAX_PENDING_CLAIM_WORK_PER_PASS);
-    assert!(!h.retry().await);
-    assert_eq!(open(&h), 0);
-    assert_eq!(h.ring_addr_of(&peer), Some(holder));
+    tokio::time::advance(identity::LONG_CLAIM_WAIT - Duration::from_secs(1)).await;
+    h.mgr.retry_pending_claims(&handshake).await;
+    assert_eq!(counted(waiting), 0, "not before the wait");
+
+    tokio::time::advance(Duration::from_secs(1)).await;
+    h.mgr.retry_pending_claims(&handshake).await;
+    assert_eq!(counted(waiting), 1);
+    tokio::time::advance(Duration::from_secs(5)).await;
+    h.mgr.retry_pending_claims(&handshake).await;
+    assert_eq!(counted(waiting), 1, "once per claim");
+
+    // The holder is checked on the bridge, not the ring: with paused time
+    // moved this far, the harness's own ring maintenance (no live peers)
+    // prunes its ring connections.
+    assert_eq!(counted(holder), 0);
+    assert_eq!(
+        h.mgr.connections[&holder].pub_key(),
+        Some(&peer),
+        "the holder is kept"
+    );
+    assert_eq!(h.mgr.addr_by_pub_key.get(&peer), Some(&holder));
+    assert_eq!(h.pending_on(waiting), Some(true), "the claim keeps waiting");
+}
+
+/// A claim whose holder has gone quiet is not counted as a long wait: the
+/// holder is replaced instead.
+#[tokio::test(start_paused = true)]
+async fn a_claim_whose_holder_went_quiet_is_not_counted_as_long() {
+    let mut h = Harness::new("conn-identity-claim-quiet-not-long").await;
+    let holder: SocketAddr = "198.51.100.47:6211".parse().unwrap();
+    let waiting: SocketAddr = "198.51.100.47:6212".parse().unwrap();
+    h.watch(&[waiting]);
+    let peer = key();
+    let clock = h.dial_with_receipt(holder, &peer).await;
+    h.accept_expected(waiting, &peer).await;
+    clock.go_quiet(identity::HOLD_WINDOW + Duration::from_secs(1));
+    tokio::time::advance(identity::LONG_CLAIM_WAIT).await;
+    let handshake = h.handshake.clone();
+    h.mgr.retry_pending_claims(&handshake).await;
+
+    assert!(!seen(waiting).contains(&ConnIdentity::ClaimHeldLong));
+    assert_eq!(h.ring_addr_of(&peer), Some(waiting));
 }

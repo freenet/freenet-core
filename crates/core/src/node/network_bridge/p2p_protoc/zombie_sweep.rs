@@ -587,20 +587,13 @@ pub(super) fn plan_sweep(
             let is_gateway = gateways.iter().any(|gw| gw.socket_addr() == Some(*addr));
             let age = now.saturating_duration_since(entry.created_at);
             let idle = now.saturating_duration_since(entry.link_use.last_use());
-            // A connection that may be one of two crossed sessions is left
-            // for the crossed-session rule, for a bounded time (see
-            // `identity::sweep_spares_claim`).
-            let verdict = if super::identity::sweep_spares_claim(connections, *addr, now) {
-                ZombieVerdict::Keep
-            } else {
-                zombie_verdict(
-                    TransportActivity { age, idle },
-                    connection_manager.is_in_ring(*addr),
-                    connection_manager.has_connection_or_pending(*addr),
-                    is_gateway,
-                    transient_ttl,
-                )
-            };
+            let verdict = zombie_verdict(
+                TransportActivity { age, idle },
+                connection_manager.is_in_ring(*addr),
+                connection_manager.has_connection_or_pending(*addr),
+                is_gateway,
+                transient_ttl,
+            );
             SweepCandidate {
                 addr: *addr,
                 age,

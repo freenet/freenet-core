@@ -163,23 +163,17 @@ impl P2pConnManager {
     /// The connection at `addr`, bound to `key`, has been removed from
     /// `connections`. Updates the index; binds the newest pending claim of
     /// `key`, if no other connection holds the key now, promoting its
-    /// connection when the claim would have or when the closed connection
-    /// was in the ring (`was_in_ring`, read before the ring was pruned), so
-    /// the claim takes its place there; then (only with `forget_peer_state`)
-    /// forgets the peer's state unless a connection bound to `key` is still
-    /// in the ring.
+    /// connection when the claim would have; then (only with
+    /// `forget_peer_state`) forgets the peer's state unless a connection
+    /// bound to `key` is still in the ring.
     pub(super) async fn release_identity(
         &mut self,
         addr: SocketAddr,
         key: &TransportPublicKey,
-        was_in_ring: bool,
         forget_peer_state: bool,
     ) {
         debug_assert!(!self.connections.contains_key(&addr));
         self.unbind_identity(addr, key);
-        if was_in_ring {
-            identity::promote_newest_claim(&mut self.connections, key);
-        }
         if let Some((claimant, claim)) =
             identity::pending_claimant(&self.connections, Some(addr), key)
         {
@@ -230,6 +224,15 @@ impl P2pConnManager {
         handshake_commands: &HandshakeCommandSender,
     ) {
         TRANSPORT_METRICS.record_conn_identity(quiet, ConnIdentity::QuietHolderReplaced);
+        if self
+            .bridge
+            .op_manager
+            .ring
+            .connection_manager
+            .is_in_ring(quiet)
+        {
+            identity::promote_newest_claim(&mut self.connections, key);
+        }
         tracing::info!(
             %quiet,
             pub_key = %key,
@@ -246,9 +249,9 @@ impl P2pConnManager {
     /// For each key with a pending claim: when the connection holding the
     /// key has gone quiet, replace it, and its release binds the newest claim
     /// of the key; when no connection holds the key, bind the newest claim.
-    /// Claims held by a live connection keep waiting, except that a waiting
-    /// connection `identity::closes_crossed_claim` picks is closed (see
-    /// [`Self::close_crossed_claims`]). Run from the event
+    /// Claims held by a live connection keep waiting; one that has waited
+    /// `identity::LONG_CLAIM_WAIT` is counted once (`claim_held_long`, see
+    /// the known limit in `identity`). Run from the event
     /// loop's timer (see [`PendingClaimRetry`]), so a peer that reconnected
     /// from another address is linked within about `identity::HOLD_WINDOW` of
     /// its old session going quiet.
@@ -256,8 +259,8 @@ impl P2pConnManager {
     /// Each replacement or bind awaits pruning, promotion and sends on the
     /// event loop, so one pass does at most
     /// [`MAX_PENDING_CLAIM_WORK_PER_PASS`] of them. Returns whether it
-    /// may have stopped with work left (it reached the limit), in which case
-    /// the loop runs the next pass as soon as no event is waiting.
+    /// stopped with work left, in which case the loop runs the next pass as
+    /// soon as no event is waiting.
     pub(super) async fn retry_pending_claims(
         &mut self,
         handshake_commands: &HandshakeCommandSender,
@@ -268,15 +271,13 @@ impl P2pConnManager {
                 return true;
             }
             match identity::key_holder(&self.connections, None, &key) {
-                Some((holder, true)) => {
-                    work += self
-                        .close_crossed_claims(
-                            holder,
-                            &key,
-                            MAX_PENDING_CLAIM_WORK_PER_PASS - work,
-                            handshake_commands,
-                        )
-                        .await;
+                Some((_, true)) => {
+                    for waiting in
+                        identity::mark_long_waits(&mut self.connections, &key, Instant::now())
+                    {
+                        TRANSPORT_METRICS
+                            .record_conn_identity(waiting, ConnIdentity::ClaimHeldLong);
+                    }
                 }
                 Some((quiet, false)) => {
                     work += 1;
@@ -294,66 +295,7 @@ impl P2pConnManager {
             }
         }
         identity::clear_pending_hint(&self.connections, &mut self.addr_by_pub_key);
-        // A pass that used its whole budget on its last key may have left
-        // work for that key (crossed closes stop at the limit); the next pass
-        // finds out, at the cost of at most one pass with nothing to do.
-        work == MAX_PENDING_CLAIM_WORK_PER_PASS
-    }
-
-    /// Close up to `limit` connections waiting for `key` behind the live
-    /// `holder` that `identity::closes_crossed_claim` picks, and return how
-    /// many were closed. The holder is never closed here. In two crossed
-    /// sessions the closed one is the other side's holder, so its close, or
-    /// its going quiet there, lets the other side's retry bind the session
-    /// kept here, and both ends finish on one session.
-    async fn close_crossed_claims(
-        &mut self,
-        holder: SocketAddr,
-        key: &TransportPublicKey,
-        limit: usize,
-        handshake_commands: &HandshakeCommandSender,
-    ) -> usize {
-        let own_key = self
-            .bridge
-            .op_manager
-            .ring
-            .connection_manager
-            .pub_key
-            .clone();
-        let now = Instant::now();
-        let crossed: Vec<SocketAddr> = self
-            .connections
-            .keys()
-            .copied()
-            .filter(|claimant| {
-                identity::closes_crossed_claim(
-                    &self.connections,
-                    holder,
-                    *claimant,
-                    &own_key,
-                    key,
-                    now,
-                )
-            })
-            .take(limit)
-            .collect();
-        for claimant in &crossed {
-            TRANSPORT_METRICS.record_conn_identity(*claimant, ConnIdentity::CrossedClaimClosed);
-            tracing::info!(
-                %claimant,
-                %holder,
-                pub_key = %key,
-                "Closing a connection that has waited for a key held by a session \
-                 established at the same time"
-            );
-            self.drop_connection_by_addr(
-                *claimant,
-                handshake_commands,
-                crate::tracing::DisconnectReason::Explicit("crossed_claim_closed".into()),
-            )
-            .await;
-        }
-        crossed.len()
+        false
     }
 
     /// Count disconnect cleanup of the connection `entry` at `addr`, when the
@@ -461,12 +403,6 @@ impl P2pConnManager {
 
         let pub_key_to_remove = entry.pub_key().cloned();
         self.record_identity_teardown(peer_addr, entry);
-        let was_in_ring = self
-            .bridge
-            .op_manager
-            .ring
-            .connection_manager
-            .is_in_ring(peer_addr);
 
         tracing::trace!(
             peer_addr = %peer_addr,
@@ -518,8 +454,7 @@ impl P2pConnManager {
         // that never named a peer has none.
         let removed = self.connections.remove(&peer_addr);
         if let Some(pub_key) = &pub_key_to_remove {
-            self.release_identity(peer_addr, pub_key, was_in_ring, true)
-                .await;
+            self.release_identity(peer_addr, pub_key, true).await;
         }
         if let Some(conn) = removed {
             // TODO: review: this could potentially leave garbage tasks in the background with peer listener
@@ -574,12 +509,6 @@ impl P2pConnManager {
 
         let pub_key_to_remove = entry.pub_key().cloned();
         self.record_identity_teardown(peer_addr, entry);
-        let was_in_ring = self
-            .bridge
-            .op_manager
-            .ring
-            .connection_manager
-            .is_in_ring(peer_addr);
 
         // Non-blocking send to handshake driver to avoid deadlock (#3519).
         // For zombie transports (already established connections), the expected_inbound
@@ -618,8 +547,7 @@ impl P2pConnManager {
         // connection that never named a peer has none).
         let removed = self.connections.remove(&peer_addr);
         if let Some(pub_key) = &pub_key_to_remove {
-            self.release_identity(peer_addr, pub_key, was_in_ring, true)
-                .await;
+            self.release_identity(peer_addr, pub_key, true).await;
         }
         if let Some(conn) = removed {
             // Short timeout — zombie connections may already be dead
@@ -1517,12 +1445,6 @@ impl P2pConnManager {
             // If transient, drop_transient releases the budget slot.
             // If ring-promoted, prune_connection cleans up topology, orphaned txs,
             // subscriptions, and notifies the handshake driver.
-            let was_in_ring = self
-                .bridge
-                .op_manager
-                .ring
-                .connection_manager
-                .is_in_ring(peer_addr);
             let was_transient = self
                 .bridge
                 .op_manager
@@ -1576,7 +1498,7 @@ impl P2pConnManager {
             // Per-peer state is forgotten for a connection that was in the
             // ring, and only when no other open connection is bound to its key.
             if let Some(old_pub_key) = old.pub_key() {
-                self.release_identity(peer_addr, old_pub_key, was_in_ring, !was_transient)
+                self.release_identity(peer_addr, old_pub_key, !was_transient)
                     .await;
             }
             tracing::info!(
@@ -2190,12 +2112,6 @@ impl P2pConnManager {
                 // Look up the connection directly by address
                 if let Some(entry) = self.connections.remove(&remote_addr) {
                     self.record_identity_teardown(remote_addr, &entry);
-                    let was_in_ring = self
-                        .bridge
-                        .op_manager
-                        .ring
-                        .connection_manager
-                        .is_in_ring(remote_addr);
                     tracing::debug!(self_peer = %self.bridge.op_manager.ring.connection_manager.pub_key, peer = ?entry.pub_key(), socket_addr = %remote_addr, conn_map_size = self.connections.len(), "[CONN_TRACK] REMOVE: TransportClosed - removing from connections HashMap");
                     let prune_result = self
                         .bridge
@@ -2223,8 +2139,7 @@ impl P2pConnManager {
                     // state, only when no other open connection is bound to
                     // its key; a connection that never named a peer has none.
                     if let Some(pub_key) = entry.pub_key() {
-                        self.release_identity(remote_addr, pub_key, was_in_ring, true)
-                            .await;
+                        self.release_identity(remote_addr, pub_key, true).await;
                     }
 
                     // Backoff prevents reconnect-timeout-reconnect cycles to dead peers (#3252).

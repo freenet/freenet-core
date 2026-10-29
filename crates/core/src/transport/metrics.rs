@@ -172,13 +172,13 @@ labelled_counters! {
         /// been heard from within 30 s, and was closed so the claim could be
         /// bound. Counted on the closed connection.
         QuietHolderReplaced => "quiet_holder_replaced",
-        /// A connection waiting for a key, held by another connection that is
-        /// still heard from, was closed: the two connections were established
-        /// within `identity::HOLD_WINDOW` of each other, the claim had waited
-        /// `identity::CROSSED_CLAIM_WAIT` since it was made, and this node's
-        /// key orders above the peer's, so only one side of the pair does
-        /// this. The holder is kept. Counted on the closed connection.
-        CrossedClaimClosed => "crossed_claim_closed",
+        /// A claim held back by `claim_held` had waited more than three
+        /// times the 30 s hold window behind a holder that is still heard
+        /// from. Counted once per claim, on the waiting connection. Two
+        /// sessions with one peer established at the same time can stay
+        /// crossed this way (each side binds the one the other keeps
+        /// waiting); this shows how often a claim waits that long.
+        ClaimHeldLong => "claim_held_long",
         /// A connection was bound to this node's own key, on any path.
         OwnKey => "own_key",
         /// A key was bound to a connection while another open connection was
@@ -2187,9 +2187,7 @@ impl TransportMetrics {
             conn_identity_quiet_holder_replaced: get32(
                 &identity[ConnIdentity::QuietHolderReplaced as usize],
             ),
-            conn_identity_crossed_claim_closed: get32(
-                &identity[ConnIdentity::CrossedClaimClosed as usize],
-            ),
+            conn_identity_claim_held_long: get32(&identity[ConnIdentity::ClaimHeldLong as usize]),
             conn_identity_own_key: get32(&identity[ConnIdentity::OwnKey as usize]),
             conn_identity_duplicate_key: get32(&identity[ConnIdentity::DuplicateKey as usize]),
             conn_identity_teardown_key_elsewhere: get32(
@@ -2693,7 +2691,7 @@ pub struct TransportSnapshot {
     pub conn_identity_claim_held: u32,
     pub conn_identity_pending_claim_bound: u32,
     pub conn_identity_quiet_holder_replaced: u32,
-    pub conn_identity_crossed_claim_closed: u32,
+    pub conn_identity_claim_held_long: u32,
     pub conn_identity_own_key: u32,
     pub conn_identity_duplicate_key: u32,
     pub conn_identity_teardown_key_elsewhere: u32,
@@ -2770,7 +2768,7 @@ impl TransportSnapshot {
             ConnIdentity::ClaimHeld => self.conn_identity_claim_held,
             ConnIdentity::PendingClaimBound => self.conn_identity_pending_claim_bound,
             ConnIdentity::QuietHolderReplaced => self.conn_identity_quiet_holder_replaced,
-            ConnIdentity::CrossedClaimClosed => self.conn_identity_crossed_claim_closed,
+            ConnIdentity::ClaimHeldLong => self.conn_identity_claim_held_long,
             ConnIdentity::OwnKey => self.conn_identity_own_key,
             ConnIdentity::DuplicateKey => self.conn_identity_duplicate_key,
             ConnIdentity::TeardownKeyElsewhere => self.conn_identity_teardown_key_elsewhere,
@@ -2965,7 +2963,7 @@ impl TransportSnapshot {
             conn_identity_claim_held,
             conn_identity_pending_claim_bound,
             conn_identity_quiet_holder_replaced,
-            conn_identity_crossed_claim_closed,
+            conn_identity_claim_held_long,
             conn_identity_own_key,
             conn_identity_duplicate_key,
             conn_identity_teardown_key_elsewhere,
@@ -3079,7 +3077,7 @@ impl TransportSnapshot {
         self.conn_identity_claim_held = conn_identity_claim_held;
         self.conn_identity_pending_claim_bound = conn_identity_pending_claim_bound;
         self.conn_identity_quiet_holder_replaced = conn_identity_quiet_holder_replaced;
-        self.conn_identity_crossed_claim_closed = conn_identity_crossed_claim_closed;
+        self.conn_identity_claim_held_long = conn_identity_claim_held_long;
         self.conn_identity_own_key = conn_identity_own_key;
         self.conn_identity_duplicate_key = conn_identity_duplicate_key;
         self.conn_identity_teardown_key_elsewhere = conn_identity_teardown_key_elsewhere;
@@ -3280,7 +3278,7 @@ struct SnapshotExtras {
     pub conn_identity_claim_held: u32,
     pub conn_identity_pending_claim_bound: u32,
     pub conn_identity_quiet_holder_replaced: u32,
-    pub conn_identity_crossed_claim_closed: u32,
+    pub conn_identity_claim_held_long: u32,
     pub conn_identity_own_key: u32,
     pub conn_identity_duplicate_key: u32,
     pub conn_identity_teardown_key_elsewhere: u32,
@@ -3384,7 +3382,7 @@ impl SnapshotExtras {
             || self.conn_identity_claim_held != 0
             || self.conn_identity_pending_claim_bound != 0
             || self.conn_identity_quiet_holder_replaced != 0
-            || self.conn_identity_crossed_claim_closed != 0
+            || self.conn_identity_claim_held_long != 0
             || self.conn_identity_own_key != 0
             || self.conn_identity_duplicate_key != 0
             || self.conn_identity_teardown_key_elsewhere != 0
@@ -5405,7 +5403,7 @@ mod tests {
             "conn_identity_claim_held",
             "conn_identity_pending_claim_bound",
             "conn_identity_quiet_holder_replaced",
-            "conn_identity_crossed_claim_closed",
+            "conn_identity_claim_held_long",
             "conn_identity_own_key",
             "conn_identity_duplicate_key",
             "conn_identity_teardown_key_elsewhere",
