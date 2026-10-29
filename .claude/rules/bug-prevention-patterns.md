@@ -242,8 +242,14 @@ and every `SimNetwork::Drop` cleared it. Under plain `cargo test` the first
 simulation to finish turned crash enforcement off for every other one, so
 crash tests could pass without the crash ever happening. The fix was to key
 the state by the network that owns it, as every other harness registry
-already was. The same family still has one open member: `ADDRESS_NETWORKS`
-is keyed by bare `SocketAddr`, and simulations share one port range (#5676).
+already was. A third member was a global keyed by something two simulations
+can share. `ADDRESS_NETWORKS` mapped each socket address to one network, last
+registration wins, and simulations derive addresses from seed and node
+locations, so concurrent simulations registered identical addresses and a node
+could bind into the other simulation's network (#5676). Keying by owner is not
+enough when the key itself collides: the address now records every network
+that registered it, and a bind resolves to the one registered from its own
+thread.
 
 Audit question for any new or changed test: *could this interact with other
 tests through global state* (a static cache, `set_global_default`, an env var,

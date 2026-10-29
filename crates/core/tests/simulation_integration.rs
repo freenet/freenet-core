@@ -12289,11 +12289,11 @@ fn test_serve_during_demandless_copy_served_locally_never_dark() {
 /// `a_holder_that_timed_out_once_keeps_its_second_chance_over_an_unasked_peer`
 /// on a small ring where they do.
 ///
-/// Plain `cargo test` runs the sims in one process. The process-global crash
-/// callback that used to make this fail its precondition there (#5673) is
-/// fixed by #5677, but simulated networks that share node addresses still
-/// collide in multi-threaded runs (#5676), so only single-threaded or nextest
-/// results count as evidence.
+/// Plain `cargo test` runs the sims in one process. Two kinds of shared state
+/// once made concurrent sims interfere there: the process-global crash
+/// callback (#5673) and the address-to-network map, which let sims that share
+/// node addresses bind into each other's networks (#5676). Both are now keyed
+/// per network.
 #[test_log::test]
 fn test_get_retry_reaches_single_host_after_one_timeout() {
     use freenet::dev_tool::{Location, NodeLabel, ScheduledOperation, SimNetwork, SimOperation};
@@ -12722,9 +12722,9 @@ struct StrandedRun {
 ///
 /// The six-peer cluster sits on the first contract's key; further contracts
 /// (the storm test) have keys within 0.03 of it. Peer addresses follow peer
-/// locations, which follow that key, so each test passes its own
-/// `contract_seed`: two runs with the same one would share addresses and
-/// cross-wire when they run concurrently in one process (#5676).
+/// locations, which follow that key. Each test passes its own
+/// `contract_seed`; tests that share one also share addresses, which is safe
+/// in one process since #5676.
 ///
 /// Placement migration is pinned OFF: it is the holding-driven push the
 /// hosting invariants forbid, and it would place the contract on its own.
@@ -13040,8 +13040,7 @@ fn test_stranded_holder_recovers_a_large_streamed_state() {
 }
 
 /// Negative control (#5846): a holder with NO demand does not trigger the
-/// recovery. Same topology as the positive test (its own seed, so the two can
-/// run concurrently in one process without colliding ports, #5676), but the
+/// recovery. Same topology as the positive test (with its own seed), but the
 /// holder's client never subscribes, so nothing sends a subscribe toward the key and
 /// no peer pulls the contract. Holding a copy is not demand
 /// (hosting-invariants, anti-pattern "holding-driven placement push").

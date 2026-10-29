@@ -7178,7 +7178,9 @@ mod tests {
     /// Scope: this checks the per-network callback map, calling
     /// `check_packet_delivery` with B's name exactly as B's sockets do. It does
     /// not cover how a socket learns its network name from its address at bind
-    /// time (`ADDRESS_NETWORKS`), which has its own cross-network hazard: #5676.
+    /// time (`ADDRESS_NETWORKS`); `in_memory_socket`'s
+    /// `concurrent_networks_sharing_an_address_each_bind_their_own` covers that
+    /// (#5676).
     #[test]
     fn dropping_one_network_keeps_crash_enforcement_of_another() {
         use crate::node::network_bridge::get_fault_injector;
