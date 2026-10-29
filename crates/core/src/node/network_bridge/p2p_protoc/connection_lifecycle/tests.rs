@@ -2589,6 +2589,14 @@ fn the_retry_is_due_once_per_interval() {
     );
     assert_eq!(retry.deadline(true), Some(start + interval * 2));
     assert!(retry.take_due(start + interval * 2));
+
+    // A pass that stopped with work left makes the next one due at once,
+    // and the one after that a full interval later.
+    let now = start + interval * 2 + Duration::from_millis(1);
+    retry.run_again_now(now);
+    assert_eq!(retry.deadline(true), Some(now));
+    assert!(retry.take_due(now));
+    assert_eq!(retry.deadline(true), Some(now + interval));
 }
 
 /// `next_wake` returns at the earlier deadline when no event arrives, which
@@ -2629,9 +2637,17 @@ fn the_event_loop_wakes_for_the_pending_claim_retry() {
         source.contains("pending_claim_retry.take_due(Instant::now())"),
         "the loop must check the retry on every pass"
     );
+    // The retry runs in the condition, and its result gates an immediate
+    // rerun at statement position inside the branch.
+    let call = "&& ctx.retry_pending_claims(&handshake_cmd_sender).await\n";
+    let at = source.find(call).expect("the loop must run the retry");
+    let branch = &source[at..];
+    let branch = &branch[..branch.find("\n            }\n").expect("end of the branch")];
     assert!(
-        source.contains("ctx.retry_pending_claims(&handshake_cmd_sender).await"),
-        "the loop must run the retry"
+        branch.lines().any(|line| line
+            .trim()
+            .starts_with("pending_claim_retry.run_again_now(Instant::now());")),
+        "a pass with work left must make the next one due at once: {branch}"
     );
 }
 
