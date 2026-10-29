@@ -22,9 +22,110 @@ use crate::transport::demux::{DemuxSocket, QuicIngressReceiver};
 use crate::transport::egress_cap::AdmissionWaiter;
 use crate::transport::{Socket, normalize_mapped_addr};
 
+/// QUIC transmits the egress cap is holding, node-wide: quinn has built
+/// them (their frames are counted in its stats) but they have not been
+/// sent. The path's acknowledgement watch (`recycle`) runs no window while
+/// one is held, since a send it counted may not have left yet.
+///
+/// A hold is a poller whose `poll_writable` the cap answered `Pending`.
+/// Waiting for the kernel's send buffer (`poll_send_ready` pending, no cap
+/// involved) is not counted: quinn's frames are counted the same way then,
+/// but such a wait lasts as long as the socket stays full, which also holds
+/// up every other send, the peer's acknowledgements of earlier packets
+/// included, and it does not outlast a working socket.
+///
+/// A poller of a connection that has ended stays held until quinn drops it
+/// with the connection's last handle, and is never polled again. So
+/// [`Self::read`] reports how long a hold may stay valid
+/// ([`cap_hold_validity`]), and every poll that still waits counts as a new
+/// hold event (`holds`); the watch ignores a hold that has gone that long
+/// with no new event.
+#[derive(Debug, Default)]
+pub(crate) struct CapHolds {
+    /// Pollers the cap holds right now.
+    held_now: AtomicU64,
+    /// Polls the cap answered `Pending`, ever: a poller starting to wait,
+    /// and every later poll while it still waits.
+    holds: AtomicU64,
+    /// [`cap_hold_validity`] of the cap's rate; zero without a cap.
+    validity: Duration,
+}
+
+/// What [`CapHolds::read`] returns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CapHoldReading {
+    pub(crate) holds: u64,
+    pub(crate) held_now: bool,
+    pub(crate) validity: Duration,
+}
+
+/// The margin [`cap_hold_validity`] puts on the longest wait the cap can
+/// give one QUIC transmit, for the time from a waiter's timer to its poll.
+pub(crate) const CAP_HOLD_VALIDITY_MARGIN: u32 = 2;
+
+/// How long a hold stays valid with no new hold event, for a cap of
+/// `rate_bytes_per_sec`: [`CAP_HOLD_VALIDITY_MARGIN`] times the longest the
+/// cap makes one waiting transmit wait before its poller is polled again.
+/// That is the cap's debt limit (unpaced sends may run the bucket that far
+/// into debt) plus one datagram's refill for every waiter that can be queued
+/// ahead of it (`MAX_ADMISSION_WAKERS`) and for its own. A held poller of a
+/// live connection is polled again within that, at its timer; one that is
+/// not was left behind by a connection that ended.
+///
+/// The tail is long at low rates: about 4 min at 10 KB/s, 27 s at
+/// 100 KB/s, under 5 s at 1 MB/s. For that long a left-behind hold still
+/// pauses guard 2. The bound is in the cap's time, and the watch measures
+/// the hold's age on the path's clock, so the two must be one clock;
+/// `connection_handler` already requires a QUIC endpoint to share the cap's
+/// clock before it uses the cap.
+pub(crate) fn cap_hold_validity(rate_bytes_per_sec: u64) -> Duration {
+    use crate::transport::egress_cap::{DEBT_LIMIT, MAX_ADMISSION_WAKERS, WAKE_DATAGRAM_BYTES};
+    let queued = (MAX_ADMISSION_WAKERS as u64 + 1) * WAKE_DATAGRAM_BYTES as u64;
+    let refill = Duration::from_secs_f64(queued as f64 / rate_bytes_per_sec.max(1) as f64);
+    (DEBT_LIMIT + refill).saturating_mul(CAP_HOLD_VALIDITY_MARGIN)
+}
+
+impl CapHolds {
+    /// Records for an egress cap of `cap_rate` bytes per second, or for no
+    /// cap.
+    pub(crate) fn new(cap_rate: Option<u64>) -> Self {
+        Self {
+            validity: cap_rate.map(cap_hold_validity).unwrap_or_default(),
+            ..Self::default()
+        }
+    }
+
+    /// The cap answered a poll `Pending`; `already_held` if the poller was
+    /// already waiting.
+    fn waiting(&self, already_held: bool) {
+        if !already_held {
+            self.held_now.fetch_add(1, Ordering::AcqRel);
+        }
+        // A count read only for change: no ordering needed.
+        self.holds.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn release(&self) {
+        self.held_now.fetch_sub(1, Ordering::AcqRel);
+    }
+
+    /// The hold events so far, whether a poller is held now, and how long a
+    /// hold stays valid with no new event.
+    pub(crate) fn read(&self) -> CapHoldReading {
+        let holds = self.holds.load(Ordering::Relaxed);
+        CapHoldReading {
+            holds,
+            held_now: self.held_now.load(Ordering::Acquire) > 0,
+            validity: self.validity,
+        }
+    }
+}
+
 /// The QUIC endpoint's socket. See the module docs.
 pub(crate) struct QuicSocket<S> {
     socket: Arc<DemuxSocket<S>>,
+    /// Transmits the egress cap holds, shared with every connection's path.
+    cap_holds: Arc<CapHolds>,
     /// Only quinn's endpoint driver receives, one call at a time; the lock
     /// is never contended.
     ingress: parking_lot::Mutex<QuicIngressReceiver>,
@@ -70,13 +171,22 @@ impl<S> fmt::Debug for QuicSocket<S> {
 }
 
 impl<S: Socket> QuicSocket<S> {
+    /// The transmits the egress cap holds, for the paths' watches.
+    pub(crate) fn cap_holds(&self) -> Arc<CapHolds> {
+        self.cap_holds.clone()
+    }
+
     pub(crate) fn new(
         socket: Arc<DemuxSocket<S>>,
         ingress: QuicIngressReceiver,
         local_addr: SocketAddr,
     ) -> Self {
+        let cap_holds = Arc::new(CapHolds::new(
+            socket.egress_cap().map(|cap| cap.rate_bytes_per_sec()),
+        ));
         Self {
             socket,
+            cap_holds,
             ingress: parking_lot::Mutex::new(ingress),
             local_addr,
             send_errors: AtomicU64::new(0),
@@ -131,6 +241,7 @@ impl<S: Socket> AsyncUdpSocket for QuicSocket<S> {
         Box::pin(QuicPoller {
             socket: self,
             waiter: std::sync::Mutex::new(AdmissionWaiter::default()),
+            held: false,
         })
     }
 
@@ -254,6 +365,28 @@ struct QuicPoller<S> {
     /// `poll_writable` has `&mut self` and uses `get_mut`, so it is never
     /// locked.
     waiter: std::sync::Mutex<AdmissionWaiter>,
+    /// The cap is holding this poller's transmit ([`CapHolds`]).
+    held: bool,
+}
+
+impl<S> QuicPoller<S> {
+    /// Record the cap's answer to this poll ([`CapHolds`]).
+    fn record_admission(&mut self, waiting: bool) {
+        if waiting {
+            self.socket.cap_holds.waiting(self.held);
+        } else if self.held {
+            self.socket.cap_holds.release();
+        }
+        self.held = waiting;
+    }
+}
+
+impl<S> Drop for QuicPoller<S> {
+    fn drop(&mut self) {
+        if self.held {
+            self.socket.cap_holds.release();
+        }
+    }
 }
 
 impl<S> fmt::Debug for QuicPoller<S> {
@@ -281,7 +414,8 @@ impl<S: Socket> UdpPoller for QuicPoller<S> {
             Ok(waiter) => waiter,
             Err(poisoned) => poisoned.into_inner(),
         };
-        cap.poll_admit(usize::from(MAX_UDP_PAYLOAD), waiter, cx)
-            .map(Ok)
+        let admitted = cap.poll_admit(usize::from(MAX_UDP_PAYLOAD), waiter, cx);
+        this.record_admission(admitted.is_pending());
+        admitted.map(Ok)
     }
 }

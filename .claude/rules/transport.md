@@ -1039,7 +1039,10 @@ Sending (QuicPath::send_short / send_stream / send_stream_chunks /
   connection `stopped` map until the connection closes (quinn 0.11.12:
   stopped() registers it, and a local reset produces neither the Finished
   nor the Stopped event that removes it). Bounded by the sends aborted on
-  the connection; e5 must bound that or recycle the connection.
+  the connection: the path counts its own resets (a stop the peer sent,
+  surfaced through a write or through stopped(), is not one; nor is a reset
+  on a closed connection) and closes the connection past
+  recycle::SEND_ABORT_LIMIT (4096) with close code SEND_ABORT_LIMIT (M6).
   Every write, and the wait for a source's next chunk, races the
   stream's stopped() future and resets on a stop:
   quinn-proto 0.11.19 does not report STOP_SENDING to a writer blocked on
@@ -1154,6 +1157,30 @@ One budget per peer (QUIC memory gate M3): QuicPath::with_budget charges
   With one allowance, a large UDP stream still draining can make a QUIC
   stream refuse (BUDGET_REFUSED) where two allowances admitted it; that
   is the intended semantics, retried like any transfer failure.
+Path recycling (quic/recycle.rs, #5940 step M6): besides the send-reset
+  limit above, the path's receive task samples the connection every
+  ACK_WATCH_TICK (2 s) and closes it with PEER_NOT_ACKNOWLEDGING when, for
+  ACK_WATCH_WINDOW (10 s), this side had ack-eliciting packets outstanding,
+  the peer acknowledged none of them, and the peer kept sending (no two
+  samples in a row without anything from it). A peer that keeps sending but acknowledges none of our packets is
+  not a conforming QUIC peer (RFC 9000 13.2.1). Newly acknowledged packets
+  are counted by AckCounting, which wraps Cubic in transport_config;
+  ConnectionStats has no such counter. Two samples in a row with nothing
+  from the peer end the window, and so does a sample with nothing
+  outstanding (in flight after the latest acknowledgements, minus losses,
+  or a send since), so recovery from an outage does not close the path.
+  quinn counts a transmit's frames, and its bytes in flight, when it builds
+  it, before the egress cap admits it. Guard 2 is therefore inactive while
+  the egress cap holds QUIC transmits: while the cap holds any (or held one
+  since the previous sample; socket::CapHolds, node-wide) no window runs on
+  any path, so on a node whose cap binds most of the time guard 2 is off
+  most of the time. Do not narrow this to the sends counted since the hold:
+  a held transmit is also in quinn's bytes in flight. A hold whose poller
+  is not polled again within socket::cap_hold_validity of the cap's rate
+  (a poller left by an ended connection) stops counting.
+  e5 constraint: SEND_ABORT_LIMIT and PEER_NOT_ACKNOWLEDGING ask the peer to
+  fall back to UDP for THIS connection only. They are not a permanent
+  downgrade: e5 must allow a new upgrade after its normal backoff.
 Not here: dedup (e5: is_duplicate_dispatch, completed_inbound_streams) and
   export of the QUIC-only counters (per path, QuicPath::stats).
 ```
@@ -1219,7 +1246,9 @@ Application error codes, one range per QUIC frame type, all one-byte
   quic/error.rs refuses an out-of-range or duplicated code, and a
   source-scrape test refuses a code constant missing from ALL:
     0x00..=0x0f CONNECTION_CLOSE: close_code::NODE_DROPPED_PEER 0,
-                DOWNGRADE 1 (fall back to UDP), IDENTITY_MISMATCH 2
+                DOWNGRADE 1 (fall back to UDP), IDENTITY_MISMATCH 2,
+                SEND_ABORT_LIMIT 3 and PEER_NOT_ACKNOWLEDGING 4 (path
+                recycling, M6; the peer reads both as Downgrade)
     0x10..=0x1f STOP_SENDING: path::stop_code (receiver refusals)
     0x20..=0x2f RESET_STREAM: path::reset_code (sender gave up)
   The scrape test checks every constant by name against ALL, and

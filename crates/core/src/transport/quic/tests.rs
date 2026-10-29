@@ -400,12 +400,14 @@ fn handshake_and_one_mib_stream_on_virtual_time() {
         assert_eq!(handshake.protocol.as_deref(), Some(ALPN));
         assert_eq!(handshake.server_name, None, "SNI is off");
         for conn in [&client, &server] {
+            let controller = conn
+                .inner()
+                .congestion_state()
+                .into_any()
+                .downcast::<super::recycle::AckCounting>()
+                .expect("the acknowledgement-counting controller");
             assert!(
-                conn.inner()
-                    .congestion_state()
-                    .into_any()
-                    .downcast::<quinn::congestion::Cubic>()
-                    .is_ok(),
+                controller.wraps::<quinn::congestion::Cubic>(),
                 "Cubic congestion control"
             );
         }
@@ -591,6 +593,7 @@ async fn attempt(
                             incoming.permit,
                             Some(incoming.hold),
                             incoming.peer,
+                            incoming.cap_holds,
                         ))
                     }
                 }
@@ -2048,6 +2051,104 @@ fn a_sent_datagram_is_charged_once() {
     );
 }
 
+/// #5940 step M6: a connection that ends while the egress cap holds its
+/// transmit leaves its poller held, because quinn keeps the poller until
+/// the connection's last handle goes and never polls it again. Such a hold
+/// stops pausing the acknowledgement watch once it has gone
+/// `cap_hold_validity` of the cap's rate with no new hold event, and the
+/// watch then runs and closes as usual.
+#[test]
+fn a_hold_left_by_an_ended_connection_stops_pausing_the_ack_watch() {
+    use super::recycle::{ACK_WATCH_TICK, ACK_WATCH_WINDOW, AckSample, AckWatch};
+    use quinn::AsyncUdpSocket;
+    use std::task::Context;
+    let time = VirtualTime::new();
+    let local: SocketAddr = "10.201.40.1:5000".parse().unwrap();
+    let rate = 1_000_000;
+    let (socket, demux) = scripted(local, SendMode::Send, Vec::new(), Some((rate, &time)));
+    let cap = demux.egress_cap().unwrap();
+    cap.charge_unpaced(cap.burst_bytes() as usize);
+    let holds = socket.cap_holds();
+    // The connection's poller waits for the cap, then the connection ends
+    // and nothing polls the poller again, but a handle keeps it.
+    let mut poller = socket.clone().create_io_poller();
+    let waker = futures::task::noop_waker();
+    let mut cx = Context::from_waker(&waker);
+    assert!(poller.as_mut().poll_writable(&mut cx).is_pending());
+    let held = holds.read();
+    assert!(held.held_now);
+    assert_eq!(held.validity, super::socket::cap_hold_validity(rate));
+
+    // Another path's watch: a send every tick, the peer sending every tick
+    // and acknowledging nothing.
+    let record = Arc::default();
+    let tick = ACK_WATCH_TICK.as_secs();
+    let sample = |t: u64| AckSample::synthetic(&record, 5, 5, 0, 10 + t, 100 + t, holds.read());
+    let mut watch = AckWatch::new(ACK_WATCH_WINDOW, sample(0));
+    let closed = (1..=200u64)
+        .find(|t| watch.observe(t * tick * 1_000_000_000, sample(*t)))
+        .map(|t| Duration::from_secs(t * tick));
+    let closed = closed.expect("the watch resumed and closed");
+    // First seen held at tick 1; stale once more than the validity after it,
+    // then a window from the next sample.
+    assert!(
+        closed > held.validity + ACK_WATCH_WINDOW,
+        "closed at {closed:?}, validity {:?}",
+        held.validity
+    );
+    assert!(
+        closed <= held.validity + ACK_WATCH_WINDOW + 3 * ACK_WATCH_TICK,
+        "closed at {closed:?}, validity {:?}",
+        held.validity
+    );
+    drop(poller);
+    assert!(
+        !holds.read().held_now,
+        "dropping the poller releases its hold"
+    );
+}
+
+/// #5940 step M6: `socket::cap_hold_validity`, without its margin, bounds
+/// the longest wait the real cap gives a QUIC transmit before its poller is
+/// polled again: with the cap at its deepest debt (`DEBT_LIMIT`) and the
+/// most waiters it queues (`MAX_ADMISSION_WAKERS`), the last waiter's timer
+/// is no later than that.
+#[test]
+fn cap_hold_validity_bounds_the_longest_admission_wait() {
+    use super::socket::{CAP_HOLD_VALIDITY_MARGIN, cap_hold_validity};
+    use crate::transport::egress_cap::{AdmissionWaiter, DEBT_LIMIT, MAX_ADMISSION_WAKERS};
+    use std::task::Context;
+    let waker = futures::task::noop_waker();
+    let mut cx = Context::from_waker(&waker);
+    for rate in [10_000u64, 1_000_000, 100_000_000] {
+        let time = VirtualTime::new();
+        let cap = EgressCap::new(rate, time.clone());
+        // Past the debt limit: the rest is forgiven.
+        let deepest = cap.burst_bytes() + 2 * rate * DEBT_LIMIT.as_secs();
+        cap.charge_unpaced(deepest as usize);
+        let mut waiters: Vec<AdmissionWaiter> = (0..MAX_ADMISSION_WAKERS)
+            .map(|_| AdmissionWaiter::default())
+            .collect();
+        for waiter in &mut waiters {
+            assert!(
+                cap.poll_admit(usize::from(MAX_UDP_PAYLOAD), waiter, &mut cx)
+                    .is_pending()
+            );
+        }
+        let last = waiters
+            .last()
+            .and_then(AdmissionWaiter::wake_at_ns)
+            .expect("the last waiter has a timer");
+        let wait = Duration::from_nanos(last - time.now_nanos());
+        let bound = cap_hold_validity(rate) / CAP_HOLD_VALIDITY_MARGIN;
+        assert!(wait > DEBT_LIMIT, "premise: the cap is in debt ({wait:?})");
+        assert!(
+            wait <= bound,
+            "rate {rate}: waited {wait:?}, bound {bound:?}"
+        );
+    }
+}
+
 /// With the cap short of the datagram the send is `WouldBlock`, nothing is
 /// sent and nothing is charged; quinn then waits in `poll_writable`, which is
 /// `Pending` until the cap has a full datagram and `Ready` once it does.
@@ -2453,8 +2554,9 @@ fn the_cap_wakes_waiters_per_quic_datagram() {
 }
 
 /// Each close code reaches the peer as that code, and the peer maps it to
-/// the kind its handling depends on: `Downgrade` and `IdentityMismatch` are
-/// refusals, `NodeDroppedPeer` (also what dropping a connection sends) is a
+/// the kind its handling depends on: `Downgrade` (and the two recycle
+/// codes, which also ask the peer to fall back to UDP) and
+/// `IdentityMismatch` are refusals, `NodeDroppedPeer` (also what dropping a connection sends) is a
 /// lost connection. Either side can close. Each close is counted once, by
 /// code; a second close of an ended connection sends and counts nothing.
 #[test]
@@ -2472,7 +2574,9 @@ fn close_codes_reach_the_peer() {
         .await;
         let expected = |code: QuicCloseCode| match code {
             QuicCloseCode::NodeDroppedPeer => QuicErrorKind::ConnectionLost,
-            QuicCloseCode::Downgrade => QuicErrorKind::Refused {
+            QuicCloseCode::Downgrade
+            | QuicCloseCode::SendAbortLimit
+            | QuicCloseCode::PeerNotAcknowledging => QuicErrorKind::Refused {
                 reason: QuicRefusal::Downgrade,
             },
             QuicCloseCode::IdentityMismatch => QuicErrorKind::Refused {

@@ -268,6 +268,12 @@ labelled_counters! {
         Downgrade => "downgrade",
         /// The peer proved a key this node does not have on record for it.
         IdentityMismatch => "identity_mismatch",
+        /// This side reset too many sends on the connection
+        /// (`quic::recycle::SEND_ABORT_LIMIT`).
+        SendAbortLimit => "send_abort_limit",
+        /// The peer kept sending but acknowledged none of this side's
+        /// packets for `quic::recycle::ACK_WATCH_WINDOW`.
+        PeerNotAcknowledging => "peer_not_acknowledging",
     }
 }
 
@@ -1997,6 +2003,12 @@ impl TransportMetrics {
             quic_close_sent_identity_mismatch: get64(
                 &self.quic_close_sent[QuicCloseCode::IdentityMismatch as usize],
             ),
+            quic_close_sent_send_abort_limit: get64(
+                &self.quic_close_sent[QuicCloseCode::SendAbortLimit as usize],
+            ),
+            quic_close_sent_peer_not_acknowledging: get64(
+                &self.quic_close_sent[QuicCloseCode::PeerNotAcknowledging as usize],
+            ),
             nat_fail_samples: if reset {
                 std::mem::take(&mut *d.samples.lock())
             } else {
@@ -2506,6 +2518,8 @@ pub struct TransportSnapshot {
     pub quic_close_sent_node_dropped_peer: u64,
     pub quic_close_sent_downgrade: u64,
     pub quic_close_sent_identity_mismatch: u64,
+    pub quic_close_sent_send_abort_limit: u64,
+    pub quic_close_sent_peer_not_acknowledging: u64,
     /// Per-attempt records of the FIRST 8 failed outbound NAT traversals in
     /// the period (not a representative sample of a busy period);
     /// `nat_fail_samples_dropped` counts the rest. Read with the same
@@ -2812,6 +2826,8 @@ impl TransportSnapshot {
             quic_close_sent_node_dropped_peer,
             quic_close_sent_downgrade,
             quic_close_sent_identity_mismatch,
+            quic_close_sent_send_abort_limit,
+            quic_close_sent_peer_not_acknowledging,
             nat_fail_samples,
             nat_fail_samples_dropped,
             inbound_stream_refused_invalid_length,
@@ -2921,6 +2937,8 @@ impl TransportSnapshot {
         self.quic_close_sent_node_dropped_peer = quic_close_sent_node_dropped_peer;
         self.quic_close_sent_downgrade = quic_close_sent_downgrade;
         self.quic_close_sent_identity_mismatch = quic_close_sent_identity_mismatch;
+        self.quic_close_sent_send_abort_limit = quic_close_sent_send_abort_limit;
+        self.quic_close_sent_peer_not_acknowledging = quic_close_sent_peer_not_acknowledging;
         self.nat_fail_samples = nat_fail_samples;
         self.nat_fail_samples_dropped = nat_fail_samples_dropped;
         self.inbound_stream_refused_invalid_length = inbound_stream_refused_invalid_length;
@@ -3075,6 +3093,8 @@ struct SnapshotExtras {
     pub quic_close_sent_node_dropped_peer: u64,
     pub quic_close_sent_downgrade: u64,
     pub quic_close_sent_identity_mismatch: u64,
+    pub quic_close_sent_send_abort_limit: u64,
+    pub quic_close_sent_peer_not_acknowledging: u64,
     /// Per-attempt records of the FIRST 8 failed outbound NAT traversals in
     /// the period (not a representative sample of a busy period);
     /// `nat_fail_samples_dropped` counts the rest. Read with the same
@@ -3220,6 +3240,8 @@ impl SnapshotExtras {
             || self.quic_close_sent_node_dropped_peer != 0
             || self.quic_close_sent_downgrade != 0
             || self.quic_close_sent_identity_mismatch != 0
+            || self.quic_close_sent_send_abort_limit != 0
+            || self.quic_close_sent_peer_not_acknowledging != 0
             || !self.nat_fail_samples.is_empty()
             || self.inbound_stream_refused_invalid_length != 0
             || self.inbound_stream_refused_connection_bytes != 0
@@ -4113,6 +4135,8 @@ mod tests {
             QuicCloseCode::NodeDroppedPeer => snap.quic_close_sent_node_dropped_peer,
             QuicCloseCode::Downgrade => snap.quic_close_sent_downgrade,
             QuicCloseCode::IdentityMismatch => snap.quic_close_sent_identity_mismatch,
+            QuicCloseCode::SendAbortLimit => snap.quic_close_sent_send_abort_limit,
+            QuicCloseCode::PeerNotAcknowledging => snap.quic_close_sent_peer_not_acknowledging,
         }
     }
 
@@ -5230,6 +5254,8 @@ mod tests {
             "quic_close_sent_node_dropped_peer",
             "quic_close_sent_downgrade",
             "quic_close_sent_identity_mismatch",
+            "quic_close_sent_send_abort_limit",
+            "quic_close_sent_peer_not_acknowledging",
             "nat_fail_samples",
             "nat_fail_samples_dropped",
             "inbound_stream_refused_invalid_length",

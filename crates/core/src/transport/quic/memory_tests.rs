@@ -245,14 +245,14 @@ fn an_idle_connection_measures_within_the_fixed_pin() {
 }
 
 /// One quinn-proto endpoint with at most one connection, driven by hand.
-struct ProtoPeer {
-    addr: SocketAddr,
-    endpoint: quinn_proto::Endpoint,
-    conn: Option<(quinn_proto::ConnectionHandle, quinn_proto::Connection)>,
+pub(super) struct ProtoPeer {
+    pub(super) addr: SocketAddr,
+    pub(super) endpoint: quinn_proto::Endpoint,
+    pub(super) conn: Option<(quinn_proto::ConnectionHandle, quinn_proto::Connection)>,
 }
 
 impl ProtoPeer {
-    fn conn(&mut self) -> &mut quinn_proto::Connection {
+    pub(super) fn conn(&mut self) -> &mut quinn_proto::Connection {
         &mut self.conn.as_mut().expect("connected").1
     }
 
@@ -261,7 +261,12 @@ impl ProtoPeer {
     /// (`quinn/src/endpoint.rs`, `buf[0..meta.len].into()`), so a frame
     /// kept from it keeps that allocation alive. Returns any datagram the
     /// endpoint answers with directly.
-    fn receive(&mut self, now: Instant, from: SocketAddr, datagram: &[u8]) -> Vec<Vec<u8>> {
+    pub(super) fn receive(
+        &mut self,
+        now: Instant,
+        from: SocketAddr,
+        datagram: &[u8],
+    ) -> Vec<Vec<u8>> {
         let mut buf = Vec::new();
         let mut out = Vec::new();
         match self.endpoint.handle(
@@ -292,7 +297,7 @@ impl ProtoPeer {
     }
 
     /// Run due timers and pass endpoint events both ways.
-    fn pump(&mut self, now: Instant) {
+    pub(super) fn pump(&mut self, now: Instant) {
         let Some((handle, conn)) = self.conn.as_mut() else {
             return;
         };
@@ -308,7 +313,7 @@ impl ProtoPeer {
     }
 
     /// Every datagram the connection wants to send now.
-    fn transmit(&mut self, now: Instant) -> Vec<Vec<u8>> {
+    pub(super) fn transmit(&mut self, now: Instant) -> Vec<Vec<u8>> {
         self.pump(now);
         let Some((_, conn)) = self.conn.as_mut() else {
             return Vec::new();
@@ -386,6 +391,77 @@ struct GapHold {
 /// The sender pads every datagram to the MTU and has a 1 GiB congestion
 /// window, so neither its window nor its pacer delays a frame.
 fn connected_pair(settings: &QuicSettings) -> (ProtoPeer, ProtoPeer, Instant) {
+    let mut cubic = quinn::congestion::CubicConfig::default();
+    cubic.initial_window(1 << 30);
+    connected_pair_with_factory(settings, Arc::new(cubic))
+}
+
+/// [`connected_pair`] at this module's settings, with the sender's
+/// congestion controllers built by `sender_controller`.
+pub(super) fn connected_pair_with(
+    sender_controller: Arc<dyn quinn::congestion::ControllerFactory + Send + Sync>,
+) -> (ProtoPeer, ProtoPeer, Instant) {
+    connected_pair_with_factory(&settings(), sender_controller)
+}
+
+/// Send one uni stream of `len` bytes from `sender` to `receiver` (a
+/// [`connected_pair`]), the receiver reading everything, and run both for
+/// two seconds of their time so every acknowledgement is delivered.
+pub(super) fn transfer_one_stream(
+    receiver: &mut ProtoPeer,
+    sender: &mut ProtoPeer,
+    mut now: Instant,
+    len: usize,
+) -> Instant {
+    let id = sender
+        .conn()
+        .streams()
+        .open(quinn_proto::Dir::Uni)
+        .expect("a stream credit");
+    let data = vec![7u8; len];
+    let mut written = 0;
+    let mut accepted = Vec::new();
+    for _ in 0..2000 {
+        if written < len {
+            if let Ok(n) = sender.conn().send_stream(id).write(&data[written..]) {
+                written += n;
+            }
+            if written == len {
+                sender.conn().send_stream(id).finish().expect("finish");
+            }
+        }
+        for datagram in sender.transmit(now) {
+            for reply in receiver.receive(now, sender.addr, &datagram) {
+                sender.receive(now, receiver.addr, &reply);
+            }
+        }
+        while let Some(stream) = receiver.conn().streams().accept(quinn_proto::Dir::Uni) {
+            accepted.push(stream);
+        }
+        for stream in &accepted {
+            let mut recv = receiver.conn().recv_stream(*stream);
+            if let Ok(mut chunks) = recv.read(true) {
+                while let Ok(Some(_)) = chunks.next(usize::MAX) {}
+                let _transmit = chunks.finalize();
+            }
+        }
+        for datagram in receiver.transmit(now) {
+            for reply in sender.receive(now, receiver.addr, &datagram) {
+                receiver.receive(now, sender.addr, &reply);
+            }
+        }
+        now += Duration::from_millis(1);
+    }
+    assert_eq!(written, len, "the stream was written");
+    now
+}
+
+/// [`connected_pair`] with the sender's congestion controllers built by
+/// `sender_controller`.
+fn connected_pair_with_factory(
+    settings: &QuicSettings,
+    sender_controller: Arc<dyn quinn::congestion::ControllerFactory + Send + Sync>,
+) -> (ProtoPeer, ProtoPeer, Instant) {
     use crate::simulation::RealTime;
 
     let (a_keys, b_keys) = (TransportKeypair::new(), TransportKeypair::new());
@@ -414,11 +490,9 @@ fn connected_pair(settings: &QuicSettings) -> (ProtoPeer, ProtoPeer, Instant) {
     };
 
     let mut sender_transport = super::config::transport_config(settings, &real);
-    let mut cubic = quinn::congestion::CubicConfig::default();
-    cubic.initial_window(1 << 30);
     sender_transport
         .pad_to_mtu(true)
-        .congestion_controller_factory(Arc::new(cubic));
+        .congestion_controller_factory(sender_controller);
     let client = super::config::client_config(
         Arc::new(a_identity.client_tls(&b_peer).expect("client tls")),
         Arc::new(sender_transport),

@@ -41,6 +41,7 @@ pub(crate) mod framing;
 pub(crate) mod identity;
 pub(crate) mod liveness;
 pub(crate) mod path;
+pub(crate) mod recycle;
 pub(crate) mod runtime;
 pub(crate) mod socket;
 
@@ -164,6 +165,8 @@ pub(crate) struct EndpointCore {
     identity: Arc<QuicIdentity>,
     /// The transport key each allowed client must present.
     expected_clients: Arc<ExpectedClients>,
+    /// The QUIC transmits the egress cap holds (`socket::CapHolds`).
+    cap_holds: Arc<socket::CapHolds>,
     /// Test hook that ends quinn's endpoint driver.
     #[cfg(test)]
     receive_fault: Arc<socket::ReceiveFault>,
@@ -424,12 +427,14 @@ impl QuicEndpoint {
         let health = EndpointHealth::new(local_addr);
         #[cfg(test)]
         let mut receive_fault = None;
+        let mut cap_holds = None;
         // If quinn refuses the socket after the ingress is enabled, the
         // ingress is disabled again, so the node is left as with QUIC off.
         let endpoint = socket
             .with_quic_ingress(|ingress| {
                 let quic_socket =
                     Arc::new(socket::QuicSocket::new(socket.clone(), ingress, local_addr));
+                cap_holds = Some(quic_socket.cap_holds());
                 #[cfg(test)]
                 {
                     receive_fault = Some(quic_socket.receive_fault());
@@ -470,6 +475,8 @@ impl QuicEndpoint {
                 server,
                 identity,
                 expected_clients: Arc::new(ExpectedClients::default()),
+                // Set by the closure, which ran: `endpoint` is built.
+                cap_holds: cap_holds.expect("the QUIC socket's cap holds"),
                 #[cfg(test)]
                 receive_fault: receive_fault.unwrap_or_default(),
                 #[cfg(any(test, feature = "testing"))]
@@ -698,7 +705,13 @@ impl QuicEndpoint {
             .endpoint
             .connect_with(config, addr, config::SERVER_NAME)?;
         let connection = connecting.await?;
-        Ok(QuicConnection::new(connection, permit, None, peer))
+        Ok(QuicConnection::new(
+            connection,
+            permit,
+            None,
+            peer,
+            self.cap_holds.clone(),
+        ))
     }
 }
 
@@ -745,6 +758,7 @@ impl EndpointCore {
                 config: Arc::new(config),
                 peer: expected,
                 hold,
+                cap_holds: self.cap_holds.clone(),
             });
         }
     }
@@ -762,6 +776,8 @@ pub(crate) struct QuicIncoming {
     peer: PeerKey,
     /// Keeps the address bound to `peer` while the attempt lives.
     hold: KeyHold,
+    /// The endpoint's record of cap-held transmits.
+    cap_holds: Arc<socket::CapHolds>,
 }
 
 impl QuicIncoming {
@@ -774,6 +790,7 @@ impl QuicIncoming {
             self.permit,
             Some(self.hold),
             self.peer,
+            self.cap_holds,
         ))
     }
 }
@@ -788,6 +805,8 @@ pub(crate) struct QuicConnection {
     closer: QuicCloser,
     /// The key the peer proved in the handshake.
     peer: PeerKey,
+    /// The endpoint's record of cap-held transmits, for the path's watch.
+    cap_holds: Arc<socket::CapHolds>,
 }
 
 impl std::fmt::Debug for QuicConnection {
@@ -804,6 +823,7 @@ impl QuicConnection {
         permit: QuicSourcePermit,
         hold: Option<KeyHold>,
         peer: PeerKey,
+        cap_holds: Arc<socket::CapHolds>,
     ) -> Self {
         // The watcher holds the permit, and on the server side the hold
         // binding the address to the client's key, until quinn reports the
@@ -822,6 +842,7 @@ impl QuicConnection {
             connection,
             closer,
             peer,
+            cap_holds,
         }
     }
 
@@ -847,6 +868,11 @@ impl QuicConnection {
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn close(&self, code: QuicCloseCode) {
         self.closer.close(code);
+    }
+
+    /// The endpoint's record of the QUIC transmits its egress cap holds.
+    pub(crate) fn cap_holds(&self) -> Arc<socket::CapHolds> {
+        self.cap_holds.clone()
     }
 
     /// The connection's closer, for another task that may close it (the
@@ -897,6 +923,16 @@ impl QuicCloser {
         TRANSPORT_METRICS.record_quic_close_sent(code, self.connection.remote_address());
         self.connection.close(code.code().into(), code.reason());
         true
+    }
+
+    /// Whether the connection is still open (quinn has no close reason).
+    pub(crate) fn is_open(&self) -> bool {
+        self.connection.close_reason().is_none()
+    }
+
+    /// The connection's remote address (for logs).
+    pub(crate) fn remote_address(&self) -> SocketAddr {
+        self.connection.remote_address()
     }
 
     /// Mark a close as in progress without closing (tests: a second

@@ -56,7 +56,10 @@ impl Paths {
     }
 }
 
-/// Build the pair on `10.203.<subnet>.1` and `.2` and connect it.
+/// Build the pair on `10.203.<subnet>.1` and `.2` and connect it. Every
+/// test needs a subnet of its own: the simulated network maps each address
+/// to one network for the whole process, so two tests on one subnet send
+/// each other's packets into the wrong network.
 async fn paths(network: &str, subnet: u8, b_limits: QuicPathLimits) -> Paths {
     paths_with(network, subnet, b_limits, None).await
 }
@@ -1594,4 +1597,851 @@ fn quic_admission_holds_one_budget_lock_from_check_to_charge() {
         after.trim_start().starts_with("key,"),
         "read_stream: the charge must be under the stream's `Quic` key"
     );
+}
+
+// #5940 step M6: the path recycle guards (`super::recycle`).
+
+/// `count` sends from `path` whose chunk source fails at once, so each is
+/// reset on this side ([`reset_code::SENDER_ABORTED`]).
+async fn abort_sends(path: Arc<QuicPath>, count: u64) {
+    for _ in 0..count {
+        let failed = path
+            .send_stream_chunks(
+                StreamId::next(),
+                20_000,
+                None,
+                futures::stream::iter(vec![Err(StreamError::InactivityTimeout)]),
+            )
+            .await;
+        assert!(
+            matches!(failed, Err(QuicSendError::Source(_))),
+            "{failed:?}"
+        );
+    }
+}
+
+/// The recycle close codes this node sent to `remote`. The record is
+/// process-wide and keyed by address, so every test that reads it needs
+/// addresses of its own (its own subnet), or it sees another test's closes.
+fn recycle_closes_to(remote: SocketAddr) -> Vec<QuicCloseCode> {
+    crate::transport::metrics::TRANSPORT_METRICS
+        .quic_close_sent_to(remote)
+        .into_iter()
+        .filter(|code| {
+            matches!(
+                code,
+                QuicCloseCode::SendAbortLimit | QuicCloseCode::PeerNotAcknowledging
+            )
+        })
+        .collect()
+}
+
+/// #5940 step M6, guard 1: a path that has reset its limit of sends stays
+/// open (checked at the limit minus one and at the limit), and the next
+/// reset closes it with `close_code::SEND_ABORT_LIMIT`, counted once; the
+/// peer reads it as a request to fall back to UDP.
+#[test]
+fn a_path_closes_once_its_reset_sends_pass_the_limit() {
+    bounded(|| async move {
+        use crate::transport::{QuicErrorKind, QuicRefusal};
+        let _seed = GlobalRng::seed_guard(SEED);
+        const ABORT_LIMIT: u64 = 8;
+        let limits = QuicPathLimits {
+            max_send_aborts: ABORT_LIMIT,
+            ..QuicPathLimits::DEFAULT
+        };
+        let p = paths("quic-path-abort-limit", 40, limits).await;
+        let a_addr = p.pair.a_addr;
+        for (aborts, total) in [(ABORT_LIMIT - 1, ABORT_LIMIT - 1), (1, ABORT_LIMIT)] {
+            let b = p.b.clone();
+            p.drive(async move {
+                abort_sends(b.clone(), aborts).await;
+                b.send_short(b"still open")
+                    .await
+                    .expect("the path is still open");
+            })
+            .await;
+            assert_eq!(p.b.send_aborts(), total);
+            assert!(p.b.connection().inner().close_reason().is_none());
+            assert!(recycle_closes_to(a_addr).is_empty());
+        }
+
+        let b = p.b.clone();
+        p.drive(abort_sends(b, 1)).await;
+        assert_eq!(p.b.send_aborts(), ABORT_LIMIT + 1);
+        assert!(p.b.connection().inner().close_reason().is_some());
+        assert_eq!(
+            recycle_closes_to(a_addr),
+            vec![QuicCloseCode::SendAbortLimit]
+        );
+        let seen = p.a.connection().inner().clone();
+        let error = p.drive(async move { seen.closed().await }).await;
+        let quinn::ConnectionError::ApplicationClosed(close) = &error else {
+            panic!("the peer saw {error:?}");
+        };
+        assert_eq!(
+            close.error_code.into_inner(),
+            u64::from(super::super::error::close_code::SEND_ABORT_LIMIT)
+        );
+        assert_eq!(
+            QuicErrorKind::from(error),
+            QuicErrorKind::Refused {
+                reason: QuicRefusal::Downgrade
+            }
+        );
+    })
+}
+
+/// #5940 step M6, guard 1: a send dropped while it waits for its source
+/// (a caller's timeout) is reset by `Outgoing`'s `Drop` and counted; past
+/// the limit the path closes.
+#[test]
+fn a_dropped_send_counts_as_a_reset() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        const ABORT_LIMIT: u64 = 2;
+        let limits = QuicPathLimits {
+            max_send_aborts: ABORT_LIMIT,
+            ..QuicPathLimits::DEFAULT
+        };
+        let p = paths("quic-path-abort-dropped", 41, limits).await;
+        let a_addr = p.pair.a_addr;
+        let drop_sends = |count: u64| {
+            let (b, time) = (p.b.clone(), p.time());
+            async move {
+                for _ in 0..count {
+                    tokio::select! {
+                        sent = b.send_stream_chunks(
+                            StreamId::next(),
+                            20_000,
+                            None,
+                            futures::stream::pending(),
+                        ) => panic!("a send from a pending source ended: {sent:?}"),
+                        () = time.sleep(Duration::from_secs(1)) => {}
+                    }
+                }
+            }
+        };
+        p.drive(drop_sends(ABORT_LIMIT)).await;
+        assert_eq!(p.b.send_aborts(), ABORT_LIMIT);
+        assert!(p.b.connection().inner().close_reason().is_none());
+        p.drive(drop_sends(1)).await;
+        assert_eq!(p.b.send_aborts(), ABORT_LIMIT + 1);
+        assert!(p.b.connection().inner().close_reason().is_some());
+        assert_eq!(
+            recycle_closes_to(a_addr),
+            vec![QuicCloseCode::SendAbortLimit]
+        );
+    })
+}
+
+/// #5940 step M6, guard 1: a stop reported through the write
+/// (`WriteError::Stopped`, handled by `Outgoing::written`) ends the stream
+/// as the peer's stop. `Drop` then sends no reset, and nothing is counted.
+#[test]
+fn a_stop_reported_by_the_write_is_not_counted() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let p = paths("quic-path-written-stopped", 42, QuicPathLimits::DEFAULT).await;
+        let a = p.a.clone();
+        let (written, aborts) = p
+            .drive(async move {
+                let header = FrameHeader::short(10).expect("a short header");
+                let mut send = a.open(&header, &[]).await.expect("open");
+                let written = send.written(Err(quinn::WriteError::Stopped(
+                    stop_code::BUDGET_REFUSED.into(),
+                )));
+                drop(send);
+                (written, a.send_aborts())
+            })
+            .await;
+        assert!(
+            matches!(written, Err(QuicSendError::Stopped(code)) if code == u64::from(stop_code::BUDGET_REFUSED)),
+            "{written:?}"
+        );
+        assert_eq!(aborts, 0);
+        assert!(p.a.connection().inner().close_reason().is_none());
+    })
+}
+
+/// #5940 step M6, guard 1 counts only this side's resets: streams the
+/// peer stops (here refused by its budget) are not counted, and the path
+/// stays open. The source yields to the runtime between small chunks, so
+/// the stop often lands while the next write has room: quinn then reports
+/// it through the write (`WriteError::Stopped`) as well as through the
+/// `stopped` future, and `select!` picks either (about one stream in ten
+/// here, so 128 streams take the write path many times). A write blocked on
+/// connection flow control never reports it, so a large single write would
+/// only ever see the `stopped` future.
+#[test]
+fn a_stop_from_the_peer_is_not_counted_as_a_reset() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let b_limits = QuicPathLimits {
+            max_bytes: ChargeOverhead::DEFAULT.cost(1000),
+            ..QuicPathLimits::DEFAULT
+        };
+        let p = paths("quic-path-abort-stops", 43, b_limits).await;
+        let b_addr = p.pair.b_addr;
+        let a = p.a.clone();
+        let stops = p
+            .drive(async move {
+                let mut stops = 0;
+                for _ in 0..128 {
+                    let chunks = Box::pin(futures::stream::unfold((), |()| async {
+                        tokio::task::yield_now().await;
+                        Some((Ok(Bytes::from(vec![0u8; 1000])), ()))
+                    }));
+                    match a
+                        .send_stream_chunks(StreamId::next(), 1024 * 1024, None, chunks)
+                        .await
+                    {
+                        Err(QuicSendError::Stopped(code))
+                            if code == u64::from(stop_code::BUDGET_REFUSED) =>
+                        {
+                            stops += 1;
+                        }
+                        other => panic!("expected a stop, got {other:?}"),
+                    }
+                }
+                stops
+            })
+            .await;
+        assert_eq!(stops, 128);
+        assert_eq!(p.a.send_aborts(), 0);
+        assert!(p.a.connection().inner().close_reason().is_none());
+        assert!(recycle_closes_to(b_addr).is_empty());
+    })
+}
+
+/// Drops every datagram sent from the listed addresses on `network` while
+/// it lives.
+struct DropFrom(String);
+
+impl DropFrom {
+    fn new(network: &str, from: &[SocketAddr]) -> Self {
+        use crate::transport::in_memory_socket::{
+            PacketDeliveryDecision, set_packet_delivery_callback,
+        };
+        let from = from.to_vec();
+        set_packet_delivery_callback(
+            network,
+            Some(Arc::new(move |_, sender, _, _| {
+                if from.contains(&sender) {
+                    PacketDeliveryDecision::Drop
+                } else {
+                    PacketDeliveryDecision::Deliver
+                }
+            })),
+        );
+        Self(network.to_string())
+    }
+}
+
+impl Drop for DropFrom {
+    fn drop(&mut self) {
+        crate::transport::in_memory_socket::set_packet_delivery_callback(&self.0, None);
+    }
+}
+
+/// How often the scripted peer runs (receives, sends, writes).
+const PEER_STEP: Duration = Duration::from_millis(20);
+
+/// A real `QuicPath` (`a`, the client) connected to a peer `b` that is a
+/// quinn-proto endpoint driven by hand on the simulated network, so a test
+/// decides when `b` sends. `b` acknowledges what reaches it like any QUIC
+/// stack; with `keep_sending` set it writes 64 bytes every [`PEER_STEP`] on
+/// one `Stream` frame of 1 MiB (opening a new one when a write fails), so
+/// it sends all the time whatever `a` does: its congestion window is
+/// 1 GiB and `a` admits the stream.
+struct Scripted {
+    time: VirtualTime,
+    network: String,
+    a: Arc<QuicPath>,
+    _a_in: QuicInbound,
+    _a_endpoint: super::super::QuicEndpoint,
+    a_addr: SocketAddr,
+    b_addr: SocketAddr,
+    keep_sending: Arc<std::sync::atomic::AtomicBool>,
+    tasks: Vec<tokio::task::JoinHandle<()>>,
+}
+
+impl Drop for Scripted {
+    fn drop(&mut self) {
+        for task in &self.tasks {
+            task.abort();
+        }
+        crate::transport::in_memory_socket::set_packet_delivery_callback(&self.network, None);
+        crate::transport::in_memory_socket::unregister_network_time_source(&self.network);
+    }
+}
+
+impl Scripted {
+    async fn connect(network: &str, subnet: u8) -> Self {
+        Self::connect_capped(network, subnet, None).await
+    }
+
+    /// [`Self::connect`] with a node-wide egress cap of `a_cap` bytes per
+    /// second on `a`'s socket.
+    async fn connect_capped(network: &str, subnet: u8, a_cap: Option<u64>) -> Self {
+        use super::super::config::{self, QuicSettings};
+        use super::super::identity::{PeerKey, QuicIdentity};
+        use crate::transport::Socket;
+        use crate::transport::crypto::TransportKeypair;
+        use crate::transport::demux::DemuxSocket;
+        use crate::transport::in_memory_socket::{
+            SimulationSocket, register_address_network, register_network_time_source,
+        };
+        use crate::transport::packet_data::MAX_RECV_PACKET_SIZE;
+        use std::collections::VecDeque;
+        use std::time::Instant;
+
+        let a_addr: SocketAddr = format!("10.206.{subnet}.1:5000").parse().unwrap();
+        let b_addr: SocketAddr = format!("10.206.{subnet}.2:5000").parse().unwrap();
+        let time = VirtualTime::new();
+        register_network_time_source(network, time.clone());
+        register_address_network(a_addr, network);
+        register_address_network(b_addr, network);
+        let settings = QuicSettings {
+            max_connections: 4,
+            memory_limit: 1024 * 1024 * 1024,
+            idle_timeout: None,
+        };
+        let (a_keys, b_keys) = (TransportKeypair::new(), TransportKeypair::new());
+        let mut tasks = Vec::new();
+
+        let a_socket = Arc::new(DemuxSocket::wrap(
+            SimulationSocket::bind(a_addr).await.expect("sim bind"),
+            a_cap.map(|rate| crate::transport::egress_cap::EgressCap::new(rate, time.clone())),
+        ));
+        let a_endpoint = super::super::QuicEndpoint::bind(
+            a_socket.clone(),
+            a_addr,
+            time.clone(),
+            &settings,
+            &a_keys,
+        )
+        .expect("endpoint a");
+        tasks.push(tokio::spawn(async move {
+            let mut buf = vec![0u8; MAX_RECV_PACKET_SIZE];
+            while a_socket.recv_classified(&mut buf).await.is_ok() {}
+        }));
+
+        let b_identity = QuicIdentity::new(&b_keys).expect("b's identity");
+        let a_peer = PeerKey::of(a_keys.public()).expect("a's key");
+        let mut transport = config::transport_config(&settings, &time);
+        let mut cubic = quinn::congestion::CubicConfig::default();
+        cubic.initial_window(1 << 30);
+        transport.congestion_controller_factory(Arc::new(cubic));
+        let server = config::server_config(
+            Arc::new(b_identity.server_tls(&a_peer).expect("server tls")),
+            Arc::new(transport),
+            config::system_clock(time.clone()),
+        )
+        .expect("server config");
+        let mut b = super::super::memory_tests::ProtoPeer {
+            addr: b_addr,
+            endpoint: quinn_proto::Endpoint::new(
+                Arc::new(config::endpoint_config().expect("endpoint config")),
+                Some(Arc::new(server)),
+                false,
+                None,
+            ),
+            conn: None,
+        };
+        let b_socket = Arc::new(SimulationSocket::bind(b_addr).await.expect("sim bind"));
+        type Inbox = std::sync::Mutex<VecDeque<(Vec<u8>, SocketAddr)>>;
+        let inbox: Arc<Inbox> = Arc::default();
+        let (socket, queue) = (b_socket.clone(), inbox.clone());
+        tasks.push(tokio::spawn(async move {
+            let mut buf = vec![0u8; MAX_RECV_PACKET_SIZE];
+            while let Ok((len, from)) = socket.recv_from(&mut buf).await {
+                queue.lock().unwrap().push_back((buf[..len].to_vec(), from));
+            }
+        }));
+        let keep_sending = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (peer_time, sending) = (time.clone(), keep_sending.clone());
+        // quinn-proto takes `Instant`s; this one is only the epoch they
+        // are counted from. Every elapsed time comes from `peer_time`
+        // (virtual), as in `memory_tests::connected_pair`.
+        let base = Instant::now();
+        tasks.push(tokio::spawn(async move {
+            let mut last_stream = None;
+            loop {
+                peer_time.sleep(PEER_STEP).await;
+                let now = base + Duration::from_nanos(peer_time.now_nanos());
+                let arrived: Vec<_> = inbox.lock().unwrap().drain(..).collect();
+                for (datagram, from) in arrived {
+                    for reply in b.receive(now, from, &datagram) {
+                        b_socket.send_to(&reply, from).await.ok();
+                    }
+                }
+                b.pump(now);
+                let ready = b.conn.as_ref().is_some_and(|(_, c)| !c.is_handshaking());
+                if ready && sending.load(std::sync::atomic::Ordering::Relaxed) {
+                    let conn = b.conn();
+                    let written = last_stream
+                        .map(|id| conn.send_stream(id).write(&[0xEE; 64]).is_ok())
+                        .unwrap_or(false);
+                    if !written {
+                        if let Some(id) = conn.streams().open(quinn_proto::Dir::Uni) {
+                            let mut first = header(1, 1, StreamId::next().0, 1024 * 1024, 0);
+                            first.extend_from_slice(&[0xEE; 64]);
+                            conn.send_stream(id).write(&first).ok();
+                            last_stream = Some(id);
+                        }
+                    }
+                }
+                for datagram in b.transmit(now) {
+                    b_socket.send_to(&datagram, a_addr).await.ok();
+                }
+            }
+        }));
+
+        let (endpoint, b_key) = (a_endpoint.clone(), b_keys.public().clone());
+        let conn = drive(&time, LIMIT, async move {
+            endpoint.connect(b_addr, &b_key).await.expect("connect")
+        })
+        .await;
+        let (a, a_in) = QuicPath::new(conn, time.clone());
+        Self {
+            time,
+            network: network.to_string(),
+            a: Arc::new(a),
+            _a_in: a_in,
+            _a_endpoint: a_endpoint,
+            a_addr,
+            b_addr,
+            keep_sending,
+            tasks,
+        }
+    }
+
+    /// A sample of `a`'s connection, as the acknowledgement watch takes it.
+    fn sample(&self) -> recycle::AckSample {
+        recycle::AckSample::of(
+            self.a.connection().inner(),
+            &self.a.connection().cap_holds(),
+        )
+        .expect("an AckCounting controller")
+    }
+
+    fn keep_sending(&self) {
+        self.keep_sending
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Let `duration` of virtual time pass.
+    async fn wait(&self, duration: Duration) {
+        let time = self.time.clone();
+        drive(&self.time, LIMIT, async move { time.sleep(duration).await }).await;
+    }
+
+    /// Send `len` bytes from `a` to `b` in the background.
+    fn a_sends(&mut self, len: usize) {
+        let a = self.a.clone();
+        self.tasks.push(tokio::spawn(async move {
+            a.send_stream(StreamId::next(), None, Bytes::from(payload(len)))
+                .await
+                .ok();
+        }));
+    }
+
+    /// Wait until `a`'s connection closes (at most [`LIMIT`]); how long
+    /// after `from` (virtual nanoseconds) it closed.
+    async fn closed_after(&self, from: u64) -> Duration {
+        let (conn, time) = (self.a.connection().inner().clone(), self.time.clone());
+        let at = drive(&self.time, LIMIT, async move {
+            conn.closed().await;
+            time.now_nanos()
+        })
+        .await;
+        Duration::from_nanos(at - from)
+    }
+}
+
+/// #5940 step M6, guard 2: `a`'s packets stop reaching `b` while `b`
+/// keeps sending (it never hears from `a` again, so it acknowledges
+/// nothing). `a` closes the path with `close_code::PEER_NOT_ACKNOWLEDGING`
+/// no earlier than `ACK_WATCH_WINDOW` after the cut and within two ticks
+/// after that.
+#[test]
+fn a_peer_that_keeps_sending_but_acknowledges_nothing_is_closed() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let network = "quic-path-ack-watch";
+        let mut s = Scripted::connect(network, 1).await;
+        s.keep_sending();
+        s.wait(Duration::from_secs(3)).await;
+        assert!(s.a.connection().inner().close_reason().is_none());
+        let _cut = DropFrom::new(network, &[s.a_addr]);
+        let cut_at = s.time.now_nanos();
+        s.a_sends(20_000);
+        let waited = s.closed_after(cut_at).await;
+        assert!(
+            waited >= recycle::ACK_WATCH_WINDOW,
+            "closed {waited:?} after the cut, before the window"
+        );
+        assert!(
+            waited <= recycle::ACK_WATCH_WINDOW + 2 * recycle::ACK_WATCH_TICK,
+            "closed {waited:?} after the cut"
+        );
+        assert_eq!(
+            recycle_closes_to(s.b_addr),
+            vec![QuicCloseCode::PeerNotAcknowledging]
+        );
+    })
+}
+
+/// #5940 step M6, guard 2: `a` is in the middle of a transfer that `b` has
+/// been acknowledging when `a`'s packets stop reaching `b`. `b` keeps
+/// sending. The test checks on the real connection that `b`'s last
+/// acknowledgements left bytes outstanding, and that `a` closes within the
+/// window of the cut. It does not tell which rule started the window: in
+/// simulation `a`'s probe timer is short, so a new send starts one as soon
+/// as an acknowledgement would. The unit test
+/// `packets_left_outstanding_by_an_acknowledgement_close_after_the_window`
+/// pins the acknowledgement rule on its own.
+#[test]
+fn packets_left_outstanding_when_the_peer_stops_acknowledging_close_the_path() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let network = "quic-path-ack-watch-partial";
+        let mut s = Scripted::connect(network, 2).await;
+        s.keep_sending();
+        s.a_sends(1024 * 1024);
+        s.wait(Duration::from_millis(100)).await;
+        let _cut = DropFrom::new(network, &[s.a_addr]);
+        let cut_at = s.time.now_nanos();
+        // `b` acknowledges what it already holds at its next step; that last
+        // batch leaves part of the transfer in flight.
+        s.wait(Duration::from_millis(200)).await;
+        assert!(s.sample().outstanding_after_acks() > 0);
+        let waited = s.closed_after(cut_at).await;
+        assert!(
+            waited >= recycle::ACK_WATCH_WINDOW - recycle::ACK_WATCH_TICK,
+            "closed {waited:?} after the cut"
+        );
+        assert!(
+            waited <= recycle::ACK_WATCH_WINDOW + 2 * recycle::ACK_WATCH_TICK,
+            "closed {waited:?} after the cut"
+        );
+        assert_eq!(
+            recycle_closes_to(s.b_addr),
+            vec![QuicCloseCode::PeerNotAcknowledging]
+        );
+    })
+}
+
+/// #5940 step M6, guard 2 (review finding 2): an outage of 30 s in both
+/// directions in the middle of a transfer, then recovery. `b` sends all the
+/// time once it is back, but has nothing new to acknowledge, while `a`'s
+/// data waits for its backed-off probe timer; `b` acknowledges the probe
+/// when it comes. `b` is a conforming peer: `a` must not close.
+#[test]
+fn recovery_from_an_outage_in_both_directions_does_not_close() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let network = "quic-path-ack-watch-outage";
+        let mut s = Scripted::connect(network, 3).await;
+        s.keep_sending();
+        s.a_sends(1024 * 1024);
+        s.wait(Duration::from_millis(100)).await;
+        // `a`'s packets are lost first, so after the outage `b` has nothing
+        // new to acknowledge and `a`'s data waits for its probe timer.
+        let cut = DropFrom::new(network, &[s.a_addr]);
+        s.wait(Duration::from_millis(100)).await;
+        // `b`'s last acknowledgements, sent at its step after the cut, left
+        // `a` with data outstanding.
+        assert!(s.sample().outstanding_after_acks() > 0);
+        drop(cut);
+        let outage = DropFrom::new(network, &[s.a_addr, s.b_addr]);
+        s.wait(Duration::from_secs(30)).await;
+        drop(outage);
+        let at_recovery = s.sample().received();
+        s.wait(Duration::from_secs(60)).await;
+        // `b` sent all through the minute after the outage (one write every
+        // PEER_STEP, 3000 steps), so the result is not an idle peer's.
+        assert!(
+            s.sample().received() > at_recovery + 1000,
+            "b sent too little after recovery"
+        );
+        assert!(
+            s.a.connection().inner().close_reason().is_none(),
+            "{:?}",
+            s.a.connection().inner().close_reason()
+        );
+        assert!(recycle_closes_to(s.b_addr).is_empty());
+    })
+}
+
+/// #5940 step M6, guard 2 (review finding, fourth round): `a` has a
+/// node-wide egress cap of 50 B/s, so each transmit waits about 24 s for
+/// its 1200-byte admission, longer than the window, while `b` keeps
+/// sending. quinn counts the frames of a transmit when it builds it, so
+/// without the cap rule `a` would latch a send that has not left and close.
+/// `b` is conforming: `a` must not close.
+#[test]
+fn a_send_held_by_the_egress_cap_does_not_close_the_path() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let network = "quic-path-ack-watch-capped";
+        let mut s = Scripted::connect_capped(network, 4, Some(50)).await;
+        s.keep_sending();
+        s.wait(Duration::from_secs(5)).await;
+        let cap_holds = s.a.connection().cap_holds();
+        let (holds_before, received_before) = (cap_holds.read().holds, s.sample().received());
+        s.a_sends(20_000);
+        s.wait(Duration::from_secs(60)).await;
+        assert!(
+            cap_holds.read().holds > holds_before,
+            "the cap held no transmit"
+        );
+        assert!(
+            s.sample().received() > received_before + 1000,
+            "b sent too little"
+        );
+        assert!(
+            s.a.connection().inner().close_reason().is_none(),
+            "{:?}",
+            s.a.connection().inner().close_reason()
+        );
+        assert!(recycle_closes_to(s.b_addr).is_empty());
+        // Nor did `b` send a close.
+        assert_eq!(
+            s.a.connection().inner().stats().frame_rx.connection_close,
+            0
+        );
+    })
+}
+
+/// #5940 step M6, guard 2 must not fire on a slow but conforming peer: a
+/// 5 s round trip (2.5 s each way, from before the handshake), with
+/// messages both ways for a while and then an idle minute. Neither side
+/// closes, and nothing is counted.
+#[test]
+fn a_slow_conforming_peer_is_not_closed() {
+    bounded(|| async move {
+        use crate::transport::in_memory_socket::{
+            PacketDeliveryDecision, set_packet_delivery_callback,
+        };
+        let _seed = GlobalRng::seed_guard(SEED);
+        let network = "quic-path-ack-watch-slow";
+        let one_way = Duration::from_millis(2500);
+        set_packet_delivery_callback(
+            network,
+            Some(Arc::new(move |_, _, _, _| {
+                PacketDeliveryDecision::DelayedDelivery(one_way)
+            })),
+        );
+        let p = paths(network, 45, QuicPathLimits::DEFAULT).await;
+        let (a_addr, b_addr) = (p.pair.a_addr, p.pair.b_addr);
+        let (a, b) = (p.a.clone(), p.b.clone());
+        let time = p.time();
+        p.drive(async move {
+            for _ in 0..6 {
+                let (to_b, to_a) = tokio::join!(
+                    a.send_stream(StreamId::next(), None, Bytes::from(payload(50_000))),
+                    b.send_stream(StreamId::next(), None, Bytes::from(payload(50_000))),
+                );
+                to_b.expect("a to b");
+                to_a.expect("b to a");
+            }
+            time.sleep(Duration::from_secs(60)).await;
+            a.send_short(b"after the idle minute")
+                .await
+                .expect("a open");
+            b.send_short(b"after the idle minute")
+                .await
+                .expect("b open");
+        })
+        .await;
+        set_packet_delivery_callback(network, None);
+        assert!(p.a.connection().inner().close_reason().is_none());
+        assert!(p.b.connection().inner().close_reason().is_none());
+        assert!(recycle_closes_to(a_addr).is_empty());
+        assert!(recycle_closes_to(b_addr).is_empty());
+    })
+}
+
+/// Datagrams a [`seeded_loss`] saw and dropped.
+#[derive(Default)]
+struct LossCount {
+    seen: std::sync::atomic::AtomicU64,
+    dropped: std::sync::atomic::AtomicU64,
+}
+
+/// A seeded loss of `percent` of datagrams in both directions on `network`;
+/// the counts of what it saw and dropped.
+fn seeded_loss(network: &str, percent: u64) -> Arc<LossCount> {
+    use crate::transport::in_memory_socket::{
+        PacketDeliveryDecision, set_packet_delivery_callback,
+    };
+    use std::sync::atomic::Ordering::Relaxed;
+    let state = Arc::new(std::sync::atomic::AtomicU64::new(0x5940_0006));
+    let count = Arc::new(LossCount::default());
+    let counted = count.clone();
+    set_packet_delivery_callback(
+        network,
+        Some(Arc::new(move |_, _, _, _| {
+            counted.seen.fetch_add(1, Relaxed);
+            // A fixed linear congruential sequence, one draw per datagram.
+            let next = state
+                .fetch_update(
+                    std::sync::atomic::Ordering::Relaxed,
+                    std::sync::atomic::Ordering::Relaxed,
+                    |x| Some(x.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1)),
+                )
+                .unwrap_or_default();
+            if (next >> 33) % 100 < percent {
+                counted.dropped.fetch_add(1, Relaxed);
+                PacketDeliveryDecision::Drop
+            } else {
+                PacketDeliveryDecision::Deliver
+            }
+        })),
+    );
+    count
+}
+
+/// Sample `paths`' connections every 500 ms until `end` (virtual nanos);
+/// the largest `outstanding_after_acks` seen on either.
+async fn max_outstanding(paths: [Arc<QuicPath>; 2], time: VirtualTime, end: u64) -> u64 {
+    let mut max = 0;
+    while time.now_nanos() < end {
+        for path in &paths {
+            if let Some(sample) =
+                recycle::AckSample::of(path.connection().inner(), &path.connection().cap_holds())
+            {
+                max = max.max(sample.outstanding_after_acks());
+            }
+        }
+        time.sleep(Duration::from_millis(500)).await;
+    }
+    max
+}
+
+/// #5940 step M6, guard 2 must not fire on a conforming peer over a lossy
+/// path: 25% of datagrams lost in both directions (seeded), a 2 MiB
+/// transfer each way plus a short message each way every 500 ms, for three
+/// virtual minutes.
+#[test]
+fn a_lossy_path_is_not_closed() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let network = "quic-path-ack-watch-lossy";
+        let loss = seeded_loss(network, 25);
+        let p = paths(network, 46, QuicPathLimits::DEFAULT).await;
+        let (a_addr, b_addr) = (p.pair.a_addr, p.pair.b_addr);
+        let (a, b, time) = (p.a.clone(), p.b.clone(), p.time());
+        let (bulk_ab, bulk_ba, trickles) = p
+            .drive(async move {
+                let end = time.now_nanos() + Duration::from_secs(180).as_nanos() as u64;
+                let trickle = |from: Arc<QuicPath>, time: VirtualTime| async move {
+                    let mut sent = 0u32;
+                    while time.now_nanos() < end {
+                        from.send_short(b"trickle").await.expect("trickle");
+                        sent += 1;
+                        time.sleep(Duration::from_millis(500)).await;
+                    }
+                    sent
+                };
+                let (bulk_ab, bulk_ba, t_a, t_b, max) = tokio::join!(
+                    a.send_stream(StreamId::next(), None, Bytes::from(payload(2 * MIB))),
+                    b.send_stream(StreamId::next(), None, Bytes::from(payload(2 * MIB))),
+                    trickle(a.clone(), time.clone()),
+                    trickle(b.clone(), time.clone()),
+                    max_outstanding([a.clone(), b.clone()], time.clone(), end),
+                );
+                (bulk_ab, bulk_ba, (t_a.min(t_b), max))
+            })
+            .await;
+        let (trickles, max_outstanding) = trickles;
+        // The loss really happened, and the watch really had packets
+        // outstanding to judge, so "no close" is not vacuous.
+        let (seen, dropped) = (
+            loss.seen.load(std::sync::atomic::Ordering::Relaxed),
+            loss.dropped.load(std::sync::atomic::Ordering::Relaxed),
+        );
+        assert!(seen > 2000, "{seen} datagrams");
+        assert!(dropped * 100 >= seen * 20, "{dropped} of {seen} dropped");
+        assert!(max_outstanding > 0, "nothing was ever outstanding");
+        crate::transport::in_memory_socket::set_packet_delivery_callback(network, None);
+        bulk_ab.expect("a to b");
+        bulk_ba.expect("b to a");
+        assert!(trickles > 50, "{trickles} trickle messages");
+        assert!(p.a.connection().inner().close_reason().is_none());
+        assert!(p.b.connection().inner().close_reason().is_none());
+        assert!(recycle_closes_to(a_addr).is_empty());
+        assert!(recycle_closes_to(b_addr).is_empty());
+    })
+}
+
+/// #5940 step M6, guard 2 must not fire on a multi-megabyte transfer over a
+/// 1.5 s round trip (750 ms each way, from before the handshake): 8 MiB
+/// each way at once.
+#[test]
+fn a_bulk_transfer_at_a_long_round_trip_is_not_closed() {
+    bounded(|| async move {
+        use crate::transport::in_memory_socket::{
+            PacketDeliveryDecision, set_packet_delivery_callback,
+        };
+        let _seed = GlobalRng::seed_guard(SEED);
+        let network = "quic-path-ack-watch-bulk-rtt";
+        let one_way = Duration::from_millis(750);
+        set_packet_delivery_callback(
+            network,
+            Some(Arc::new(move |_, _, _, _| {
+                PacketDeliveryDecision::DelayedDelivery(one_way)
+            })),
+        );
+        let p = paths(network, 47, QuicPathLimits::DEFAULT).await;
+        let (a_addr, b_addr) = (p.pair.a_addr, p.pair.b_addr);
+        let (a, b, time) = (p.a.clone(), p.b.clone(), p.time());
+        let (to_b, to_a, max) = p
+            .drive(async move {
+                let end = time.now_nanos() + Duration::from_secs(20).as_nanos() as u64;
+                tokio::join!(
+                    a.send_stream(StreamId::next(), None, Bytes::from(payload(8 * MIB))),
+                    b.send_stream(StreamId::next(), None, Bytes::from(payload(8 * MIB))),
+                    max_outstanding([a.clone(), b.clone()], time.clone(), end),
+                )
+            })
+            .await;
+        // A full round trip of data in flight: tens of kilobytes at least.
+        assert!(max > 64 * 1024, "at most {max} bytes outstanding");
+        set_packet_delivery_callback(network, None);
+        to_b.expect("a to b");
+        to_a.expect("b to a");
+        assert!(p.a.connection().inner().close_reason().is_none());
+        assert!(p.b.connection().inner().close_reason().is_none());
+        assert!(recycle_closes_to(a_addr).is_empty());
+        assert!(recycle_closes_to(b_addr).is_empty());
+    })
+}
+
+/// #5940 step M6, guard 2 must not fire on an idle path: two minutes with
+/// nothing to send after an exchange, then the path still carries a message.
+/// Keepalive is off under `VirtualTime`, so nothing at all is sent while
+/// idle here; an idle path with keepalive PINGs is covered only by the
+/// unit test `recycle::tests::a_slow_conforming_peer_is_never_closed`.
+#[test]
+fn an_idle_path_is_not_closed() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let p = paths("quic-path-ack-watch-idle", 44, QuicPathLimits::DEFAULT).await;
+        let (a_addr, b_addr) = (p.pair.a_addr, p.pair.b_addr);
+        let (a, b) = (p.a.clone(), p.b.clone());
+        let time = p.time();
+        p.drive(async move {
+            a.send_short(b"hello").await.expect("a to b");
+            time.sleep(Duration::from_secs(120)).await;
+            b.send_short(b"still here").await.expect("b to a");
+        })
+        .await;
+        assert!(p.a.connection().inner().close_reason().is_none());
+        assert!(p.b.connection().inner().close_reason().is_none());
+        assert!(recycle_closes_to(a_addr).is_empty());
+        assert!(recycle_closes_to(b_addr).is_empty());
+    })
 }

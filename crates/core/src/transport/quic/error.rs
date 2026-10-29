@@ -47,9 +47,22 @@ pub(crate) mod close_code {
     /// The key the peer proved is not the one this node has on record for
     /// it (identity binding, e5).
     pub(crate) const IDENTITY_MISMATCH: u32 = 0x02;
+    /// This side reset more sends on the connection than
+    /// `recycle::SEND_ABORT_LIMIT`; fall back to the UDP session.
+    pub(crate) const SEND_ABORT_LIMIT: u32 = 0x03;
+    /// The peer kept sending but acknowledged none of this side's
+    /// ack-eliciting packets for `recycle::ACK_WATCH_WINDOW`; fall back to
+    /// the UDP session.
+    pub(crate) const PEER_NOT_ACKNOWLEDGING: u32 = 0x04;
     /// Every close code, for the range and duplicate checks. A source-scrape
     /// test checks that each `const` in this module is listed.
-    pub(crate) const ALL: [u32; 3] = [NODE_DROPPED_PEER, DOWNGRADE, IDENTITY_MISMATCH];
+    pub(crate) const ALL: [u32; 5] = [
+        NODE_DROPPED_PEER,
+        DOWNGRADE,
+        IDENTITY_MISMATCH,
+        SEND_ABORT_LIMIT,
+        PEER_NOT_ACKNOWLEDGING,
+    ];
 }
 
 /// The first code above each namespace's range.
@@ -63,7 +76,7 @@ const _: () = {
     let reset = reset_code::ALL;
     // No code is used twice, within or across the namespaces.
     let all_len = close.len() + stop.len() + reset.len();
-    let mut all = [0u32; 3 + 8 + 2];
+    let mut all = [0u32; 5 + 8 + 2];
     assert!(all.len() == all_len, "update the combined length");
     let mut n = 0;
     let mut i = 0;
@@ -123,6 +136,8 @@ impl QuicCloseCode {
             Self::NodeDroppedPeer => close_code::NODE_DROPPED_PEER,
             Self::Downgrade => close_code::DOWNGRADE,
             Self::IdentityMismatch => close_code::IDENTITY_MISMATCH,
+            Self::SendAbortLimit => close_code::SEND_ABORT_LIMIT,
+            Self::PeerNotAcknowledging => close_code::PEER_NOT_ACKNOWLEDGING,
         }
     }
 
@@ -139,6 +154,8 @@ impl QuicCloseCode {
             Self::NodeDroppedPeer => b"node dropped peer",
             Self::Downgrade => b"downgrade to udp",
             Self::IdentityMismatch => b"identity mismatch",
+            Self::SendAbortLimit => b"send abort limit",
+            Self::PeerNotAcknowledging => b"peer not acknowledging",
         }
     }
 }
@@ -268,7 +285,13 @@ impl From<quinn::ConnectionError> for QuicErrorKind {
             }
             quinn::ConnectionError::ApplicationClosed(close) => {
                 match QuicCloseCode::from_code(close.error_code.into_inner()) {
-                    Some(QuicCloseCode::Downgrade) => Self::Refused {
+                    // Both recycle codes ask the peer to fall back to UDP,
+                    // as a downgrade does.
+                    Some(
+                        QuicCloseCode::Downgrade
+                        | QuicCloseCode::SendAbortLimit
+                        | QuicCloseCode::PeerNotAcknowledging,
+                    ) => Self::Refused {
                         reason: QuicRefusal::Downgrade,
                     },
                     Some(QuicCloseCode::IdentityMismatch) => Self::Refused {
