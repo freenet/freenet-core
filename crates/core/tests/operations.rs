@@ -4042,10 +4042,14 @@ async fn test_delegate_contract_put_and_update(ctx: &mut TestContext) -> TestRes
 /// the contract loop takes the receiver and runs the delegate for each
 /// (`handle_delegate_notification`). An executor built without the sender
 /// returns from the fan-out silently, so losing any one of those wiring sites
-/// turns the whole path into a no-op that reports no error anywhere.
+/// turns the path into a no-op on the executors it built, with no error
+/// anywhere. This test guards only the first of the three: `pop_executor` hands
+/// out the first free slot, so a sequential single-node run always lands on
+/// slot 0. The loop-built and replacement sites are pinned by
+/// `pool_executors_share_fast_path_caches_and_notification_sender` in `pool.rs`.
 /// `test_delegate_subscribe_reaches_the_network_for_an_unseen_contract` covers
-/// the subscribe being accepted, and says — correctly — that it does not cover
-/// notifications then flowing. This is that second half.
+/// the subscribe being accepted, not notifications then flowing. This is that
+/// second half.
 ///
 /// **Why the notification is observable on this socket.** A notification-driven
 /// delegate run has no originating client request to answer, so
@@ -4054,7 +4058,9 @@ async fn test_delegate_contract_put_and_update(ctx: &mut TestContext) -> TestRes
 /// registry: an app registers by talking to a delegate over a connection that
 /// carries a notification channel, which any `ApplicationMessages` request
 /// does (`client_events.rs`), so the `SubscribeContract` command in step 3 both
-/// creates the subscription and registers the socket that observes it. What
+/// creates the subscription and registers the socket that observes it. Only a
+/// local (loopback) registration receives delegate output, which the test
+/// harness's connection is. What
 /// arrives is a `DelegateResponse` holding exactly one value, because
 /// `route_notification_outbound` builds one response per `ApplicationMessage`.
 ///
@@ -4066,7 +4072,7 @@ async fn test_delegate_contract_put_and_update(ctx: &mut TestContext) -> TestRes
 /// delegate parameters that no other test uses, which makes its instance id and
 /// its delegate key its own: nothing else here can update the contract it
 /// subscribed to, and its notification cannot land on another test's delegate
-/// socket. Step 4 still matches on the notification's `contract_id` rather than
+/// socket. Step 5 still matches on the notification's `contract_id` rather than
 /// accepting the first one to arrive, because that check is free and does not
 /// depend on the paragraph above staying true.
 ///
@@ -4074,7 +4080,8 @@ async fn test_delegate_contract_put_and_update(ctx: &mut TestContext) -> TestRes
 /// subscription was never created, so steps 4 and 5 would be vacuous. Step 5
 /// timing out after step 3 passed and the `UpdateResponse` arrived means the
 /// commit happened and the notification did not: that is the path this test
-/// exists to watch, and it is the shape a lost `pool.rs` wiring site produces.
+/// exists to watch, and it is the shape a lost first-executor wiring site in
+/// `pool.rs` produces.
 #[freenet_test(
     health_check_readiness = true,
     nodes = ["gateway"],
@@ -4237,7 +4244,8 @@ async fn test_delegate_is_notified_when_a_subscribed_contract_updates(
                  confirmed in step 3, an acknowledged update and no notification \
                  means the commit did not reach the delegate: the executor's \
                  notification sender is unwired, the fan-out found no subscriber, \
-                 or the contract loop never ran the delegate"
+                 the contract loop never ran the delegate, or its output was not \
+                 routed to this socket through the app registry"
             ),
         };
         match next {
@@ -4953,13 +4961,16 @@ async fn test_delegate_get_reaches_the_network_for_an_unseen_contract(
 /// **What this establishes, and what it does not.** It establishes that the
 /// gate is open and the subscribe is reported successful. It does NOT establish
 /// that notifications subsequently flow: that needs an update on another peer
-/// observed arriving at this delegate, and a notification-driven delegate run
-/// routes its output through the app registry rather than back to this client,
-/// so it is not observable on this socket. That second half is exactly why
-/// `run_executor_subscribe` is the right entry point — it bootstraps the body,
-/// registers demand AND establishes the network subscription, where the old arm
-/// did none of the three — and it deserves its own test rather than an
-/// assertion this one cannot make. Said plainly, because "subscribe returned
+/// observed arriving at this delegate, which this test does not make. That
+/// cross-peer half is exactly why `run_executor_subscribe` is the right entry
+/// point — it bootstraps the body, registers demand AND establishes the network
+/// subscription, where the old arm did none of the three — and it deserves its
+/// own test rather than an assertion this one cannot make. (The delegate's
+/// output would reach this socket: a notification-driven run is delivered
+/// through the app registry, which this client joined by sending
+/// `ApplicationMessages`. The single-node case is covered by
+/// `test_delegate_is_notified_when_a_subscribed_contract_updates`.) Said
+/// plainly, because "subscribe returned
 /// Ok" reading as "the delegate will now hear about changes" is precisely the
 /// silent failure #5467 describes.
 #[freenet_test(

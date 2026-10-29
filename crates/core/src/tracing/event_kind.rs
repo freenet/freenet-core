@@ -528,6 +528,19 @@ impl EventKind {
         }
     }
 
+    /// The two peers' addresses, `(this, connected)`, if this is a
+    /// `ConnectEvent::Connected` event with both known; `None` otherwise.
+    /// Lets a simulation test compare the mesh two runs formed.
+    #[allow(clippy::wildcard_enum_match_arm)]
+    pub fn connect_connected_addrs(&self) -> Option<(std::net::SocketAddr, std::net::SocketAddr)> {
+        match self {
+            EventKind::Connect(ConnectEvent::Connected {
+                this, connected, ..
+            }) => Some((this.socket_addr()?, connected.socket_addr()?)),
+            _ => None,
+        }
+    }
+
     /// Returns the contract instance id if this is an UnsubscribeReceived event.
     #[allow(clippy::wildcard_enum_match_arm)]
     pub fn unsubscribe_received_instance_id(&self) -> Option<&ContractInstanceId> {

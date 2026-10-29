@@ -2078,6 +2078,12 @@ where
         &self.delta_cache
     }
 
+    /// The delegate notification sender, if one was installed (test introspection).
+    #[cfg(test)]
+    pub(crate) fn delegate_notification_tx_handle(&self) -> Option<&DelegateNotificationSender> {
+        self.delegate_notification_tx.as_ref()
+    }
+
     /// Set the delegate notification sender for pool-based operation.
     /// When set, `commit_state_update()` will send notifications to subscribed delegates.
     pub(crate) fn set_delegate_notification_tx(&mut self, tx: DelegateNotificationSender) {

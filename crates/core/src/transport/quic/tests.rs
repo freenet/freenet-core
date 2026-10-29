@@ -199,6 +199,7 @@ fn settings() -> QuicSettings {
     QuicSettings {
         max_connections: 4,
         memory_limit: 1024 * 1024 * 1024,
+        idle_timeout: None,
     }
 }
 
@@ -399,12 +400,14 @@ fn handshake_and_one_mib_stream_on_virtual_time() {
         assert_eq!(handshake.protocol.as_deref(), Some(ALPN));
         assert_eq!(handshake.server_name, None, "SNI is off");
         for conn in [&client, &server] {
+            let controller = conn
+                .inner()
+                .congestion_state()
+                .into_any()
+                .downcast::<super::recycle::AckCounting>()
+                .expect("the acknowledgement-counting controller");
             assert!(
-                conn.inner()
-                    .congestion_state()
-                    .into_any()
-                    .downcast::<quinn::congestion::Cubic>()
-                    .is_ok(),
+                controller.wraps::<quinn::congestion::Cubic>(),
                 "Cubic congestion control"
             );
         }
@@ -590,6 +593,7 @@ async fn attempt(
                             incoming.permit,
                             Some(incoming.hold),
                             incoming.peer,
+                            incoming.cap_holds,
                         ))
                     }
                 }
@@ -1553,6 +1557,20 @@ fn transport_config_pins_every_value() {
         debug_field(&virt, "max_idle_timeout"),
         format!("Some({virt_idle_ms})")
     );
+    // A simulation's short idle timeout replaces the clock's, on either clock.
+    let short = QuicSettings {
+        idle_timeout: Some(Duration::from_secs(7)),
+        ..settings()
+    };
+    for shown in [
+        format!(
+            "{:?}",
+            config::transport_config(&short, &VirtualTime::new())
+        ),
+        format!("{:?}", config::transport_config(&short, &RealTime::new())),
+    ] {
+        assert_eq!(debug_field(&shown, "max_idle_timeout"), "Some(7000)");
+    }
 }
 
 /// Every client setting `config::client_config` pins that quinn's `Debug`
@@ -1723,6 +1741,7 @@ fn windows_never_exceed_the_reassembly_allowance() {
             let settings = QuicSettings {
                 max_connections,
                 memory_limit,
+                idle_timeout: None,
             };
             let window = settings.window_bytes();
             assert!(
@@ -2030,6 +2049,104 @@ fn a_sent_datagram_is_charged_once() {
         *demux.inner_for_test().sent.lock().unwrap(),
         vec![(vec![0xC0; 1000], target_v4)]
     );
+}
+
+/// #5940 step M6: a connection that ends while the egress cap holds its
+/// transmit leaves its poller held, because quinn keeps the poller until
+/// the connection's last handle goes and never polls it again. Such a hold
+/// stops pausing the acknowledgement watch once it has gone
+/// `cap_hold_validity` of the cap's rate with no new hold event, and the
+/// watch then runs and closes as usual.
+#[test]
+fn a_hold_left_by_an_ended_connection_stops_pausing_the_ack_watch() {
+    use super::recycle::{ACK_WATCH_TICK, ACK_WATCH_WINDOW, AckSample, AckWatch};
+    use quinn::AsyncUdpSocket;
+    use std::task::Context;
+    let time = VirtualTime::new();
+    let local: SocketAddr = "10.201.40.1:5000".parse().unwrap();
+    let rate = 1_000_000;
+    let (socket, demux) = scripted(local, SendMode::Send, Vec::new(), Some((rate, &time)));
+    let cap = demux.egress_cap().unwrap();
+    cap.charge_unpaced(cap.burst_bytes() as usize);
+    let holds = socket.cap_holds();
+    // The connection's poller waits for the cap, then the connection ends
+    // and nothing polls the poller again, but a handle keeps it.
+    let mut poller = socket.clone().create_io_poller();
+    let waker = futures::task::noop_waker();
+    let mut cx = Context::from_waker(&waker);
+    assert!(poller.as_mut().poll_writable(&mut cx).is_pending());
+    let held = holds.read();
+    assert!(held.held_now);
+    assert_eq!(held.validity, super::socket::cap_hold_validity(rate));
+
+    // Another path's watch: a send every tick, the peer sending every tick
+    // and acknowledging nothing.
+    let record = Arc::default();
+    let tick = ACK_WATCH_TICK.as_secs();
+    let sample = |t: u64| AckSample::synthetic(&record, 5, 5, 0, 10 + t, 100 + t, holds.read());
+    let mut watch = AckWatch::new(ACK_WATCH_WINDOW, sample(0));
+    let closed = (1..=200u64)
+        .find(|t| watch.observe(t * tick * 1_000_000_000, sample(*t)))
+        .map(|t| Duration::from_secs(t * tick));
+    let closed = closed.expect("the watch resumed and closed");
+    // First seen held at tick 1; stale once more than the validity after it,
+    // then a window from the next sample.
+    assert!(
+        closed > held.validity + ACK_WATCH_WINDOW,
+        "closed at {closed:?}, validity {:?}",
+        held.validity
+    );
+    assert!(
+        closed <= held.validity + ACK_WATCH_WINDOW + 3 * ACK_WATCH_TICK,
+        "closed at {closed:?}, validity {:?}",
+        held.validity
+    );
+    drop(poller);
+    assert!(
+        !holds.read().held_now,
+        "dropping the poller releases its hold"
+    );
+}
+
+/// #5940 step M6: `socket::cap_hold_validity`, without its margin, bounds
+/// the longest wait the real cap gives a QUIC transmit before its poller is
+/// polled again: with the cap at its deepest debt (`DEBT_LIMIT`) and the
+/// most waiters it queues (`MAX_ADMISSION_WAKERS`), the last waiter's timer
+/// is no later than that.
+#[test]
+fn cap_hold_validity_bounds_the_longest_admission_wait() {
+    use super::socket::{CAP_HOLD_VALIDITY_MARGIN, cap_hold_validity};
+    use crate::transport::egress_cap::{AdmissionWaiter, DEBT_LIMIT, MAX_ADMISSION_WAKERS};
+    use std::task::Context;
+    let waker = futures::task::noop_waker();
+    let mut cx = Context::from_waker(&waker);
+    for rate in [10_000u64, 1_000_000, 100_000_000] {
+        let time = VirtualTime::new();
+        let cap = EgressCap::new(rate, time.clone());
+        // Past the debt limit: the rest is forgiven.
+        let deepest = cap.burst_bytes() + 2 * rate * DEBT_LIMIT.as_secs();
+        cap.charge_unpaced(deepest as usize);
+        let mut waiters: Vec<AdmissionWaiter> = (0..MAX_ADMISSION_WAKERS)
+            .map(|_| AdmissionWaiter::default())
+            .collect();
+        for waiter in &mut waiters {
+            assert!(
+                cap.poll_admit(usize::from(MAX_UDP_PAYLOAD), waiter, &mut cx)
+                    .is_pending()
+            );
+        }
+        let last = waiters
+            .last()
+            .and_then(AdmissionWaiter::wake_at_ns)
+            .expect("the last waiter has a timer");
+        let wait = Duration::from_nanos(last - time.now_nanos());
+        let bound = cap_hold_validity(rate) / CAP_HOLD_VALIDITY_MARGIN;
+        assert!(wait > DEBT_LIMIT, "premise: the cap is in debt ({wait:?})");
+        assert!(
+            wait <= bound,
+            "rate {rate}: waited {wait:?}, bound {bound:?}"
+        );
+    }
 }
 
 /// With the cap short of the datagram the send is `WouldBlock`, nothing is
@@ -2437,8 +2554,9 @@ fn the_cap_wakes_waiters_per_quic_datagram() {
 }
 
 /// Each close code reaches the peer as that code, and the peer maps it to
-/// the kind its handling depends on: `Downgrade` and `IdentityMismatch` are
-/// refusals, `NodeDroppedPeer` (also what dropping a connection sends) is a
+/// the kind its handling depends on: `Downgrade` (and the two recycle
+/// codes, which also ask the peer to fall back to UDP) and
+/// `IdentityMismatch` are refusals, `NodeDroppedPeer` (also what dropping a connection sends) is a
 /// lost connection. Either side can close. Each close is counted once, by
 /// code; a second close of an ended connection sends and counts nothing.
 #[test]
@@ -2456,7 +2574,9 @@ fn close_codes_reach_the_peer() {
         .await;
         let expected = |code: QuicCloseCode| match code {
             QuicCloseCode::NodeDroppedPeer => QuicErrorKind::ConnectionLost,
-            QuicCloseCode::Downgrade => QuicErrorKind::Refused {
+            QuicCloseCode::Downgrade
+            | QuicCloseCode::SendAbortLimit
+            | QuicCloseCode::PeerNotAcknowledging => QuicErrorKind::Refused {
                 reason: QuicRefusal::Downgrade,
             },
             QuicCloseCode::IdentityMismatch => QuicErrorKind::Refused {
@@ -2758,8 +2878,8 @@ fn a_full_accept_queue_ignores_and_counts_the_attempt() {
 /// transport reports `Down` and its listener keeps running: endpoint death
 /// never reaches `ListenerExit`, which would exit the node. On simulation
 /// sockets (no real port, no port reuse). The endpoint inside the
-/// transport runs on `RealTime`, but nothing here waits on time: the
-/// injected failure wakes the driver at once.
+/// transport runs on the network's `VirtualTime`, but nothing here waits on
+/// time: the injected failure wakes the driver at once.
 #[test]
 fn the_transport_reports_quic_availability() {
     bounded(|| async move {
@@ -2807,12 +2927,172 @@ fn the_transport_reports_quic_availability() {
             listener.abort();
         }
         for port in [5000, 5001] {
-            crate::transport::in_memory_socket::unregister_address_network(&SocketAddr::from((
-                [10, 201, 34, 1],
-                port,
-            )));
+            crate::transport::in_memory_socket::unregister_address_network(
+                &SocketAddr::from(([10, 201, 34, 1], port)),
+                network,
+            );
         }
         unregister_network_time_source(network);
+    })
+}
+
+/// A simulation registration (an address's network, or a network's
+/// clock) undone on drop, so a failing assertion leaves none behind for the
+/// next test in the process.
+enum Registration {
+    Address(SocketAddr, String),
+    TimeSource(&'static str),
+}
+
+impl Registration {
+    fn address(addr: SocketAddr, network: &str) -> Self {
+        register_address_network(addr, network);
+        Self::Address(addr, network.to_string())
+    }
+
+    fn time_source(network: &'static str, time: VirtualTime) -> Self {
+        register_network_time_source(network, time);
+        Self::TimeSource(network)
+    }
+}
+
+impl Drop for Registration {
+    fn drop(&mut self) {
+        match self {
+            Self::Address(addr, network) => {
+                crate::transport::in_memory_socket::unregister_address_network(addr, network)
+            }
+            Self::TimeSource(network) => unregister_network_time_source(network),
+        }
+    }
+}
+
+/// The clock the transport's endpoint runs on: `RealTime` on a real socket
+/// (production) and on a socket whose network has no `VirtualTime`, the
+/// network's `VirtualTime` in a simulation.
+#[test]
+fn the_transport_endpoint_runs_on_virtual_time_only_in_simulation() {
+    bounded(|| async move {
+        use crate::transport::UdpTransportSocket;
+        use crate::transport::connection_handler::{UdpTransportConfig, bind_udp_listener};
+        use crate::transport::in_memory_socket::InMemorySocket;
+        let config = || UdpTransportConfig {
+            quic: Some(settings()),
+            ..UdpTransportConfig::default()
+        };
+        let real_clock = std::any::type_name::<RealTime>();
+        let virtual_clock = std::any::type_name::<VirtualTime>();
+
+        // Production: a real UDP socket.
+        let port = crate::test_utils::reserve_local_port().unwrap();
+        crate::test_utils::release_local_port(port);
+        let (outbound, _inbound, listener) = bind_udp_listener::<UdpTransportSocket>(
+            crate::transport::TransportKeypair::new(),
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            port,
+            false,
+            config(),
+        )
+        .await
+        .unwrap();
+        let endpoint = outbound.quic_endpoint().expect("an endpoint");
+        assert_eq!(
+            endpoint.clock_type(),
+            real_clock,
+            "production runs on RealTime"
+        );
+        listener.abort();
+
+        // An in-memory socket whose network has no VirtualTime.
+        let network = "quic-clock-no-virtual-time";
+        let local = SocketAddr::from(([10, 201, 37, 1], 5000));
+        let _registered = Registration::address(local, network);
+        let (outbound, _inbound, listener) = bind_udp_listener::<InMemorySocket>(
+            crate::transport::TransportKeypair::new(),
+            local.ip(),
+            local.port(),
+            false,
+            config(),
+        )
+        .await
+        .unwrap();
+        let endpoint = outbound.quic_endpoint().expect("an endpoint");
+        assert_eq!(endpoint.clock_type(), real_clock);
+        listener.abort();
+
+        // A simulation: the network registered a VirtualTime.
+        let network = "quic-clock-simulation";
+        let time = VirtualTime::new();
+        let _clock = Registration::time_source(network, time.clone());
+        let local = SocketAddr::from(([10, 201, 37, 2], 5000));
+        let _registered = Registration::address(local, network);
+        let (outbound, _inbound, listener) = bind_udp_listener::<SimulationSocket>(
+            crate::transport::TransportKeypair::new(),
+            local.ip(),
+            local.port(),
+            false,
+            config(),
+        )
+        .await
+        .unwrap();
+        let endpoint = outbound.quic_endpoint().expect("an endpoint");
+        assert_eq!(
+            endpoint.clock_type(),
+            virtual_clock,
+            "a simulation runs on VirtualTime"
+        );
+        listener.abort();
+    })
+}
+
+/// A simulated node with both `transport-quic` and an egress cap is
+/// refused: the cap runs on `RealTime` and the simulated endpoint on
+/// `VirtualTime`. Either one alone binds, and so does QUIC with
+/// `total-bandwidth-limit = 0`, which builds no cap.
+#[test]
+fn a_simulated_node_with_quic_and_an_egress_cap_is_refused() {
+    bounded(|| async move {
+        use crate::transport::connection_handler::{UdpTransportConfig, bind_udp_listener};
+        use crate::transport::global_bandwidth::GlobalBandwidthManager;
+        let network = "quic-sim-egress-cap";
+        let time = VirtualTime::new();
+        let _clock = Registration::time_source(network, time.clone());
+        let cap = |limit| Some(Arc::new(GlobalBandwidthManager::new(limit, None)));
+        for (port, quic, global_bandwidth, refused) in [
+            (5000, Some(settings()), cap(1_000_000), true),
+            (5001, Some(settings()), None, false),
+            (5002, None, cap(1_000_000), false),
+            (5003, Some(settings()), cap(0), false),
+        ] {
+            let local = SocketAddr::from(([10, 201, 38, 1], port));
+            let _registered = Registration::address(local, network);
+            let bound = bind_udp_listener::<SimulationSocket>(
+                crate::transport::TransportKeypair::new(),
+                local.ip(),
+                port,
+                false,
+                UdpTransportConfig {
+                    quic,
+                    global_bandwidth,
+                    ..UdpTransportConfig::default()
+                },
+            )
+            .await;
+            match bound {
+                Ok((_, _, listener)) => {
+                    assert!(!refused, "port {port}: QUIC plus a cap must be refused");
+                    listener.abort();
+                }
+                Err(error) => {
+                    assert!(refused, "port {port}: refused: {error}");
+                    let text = error.to_string();
+                    assert!(
+                        text.contains("transport-quic") && text.contains("total-bandwidth-limit"),
+                        "the error names both settings: {text}"
+                    );
+                }
+            }
+        }
     })
 }
 

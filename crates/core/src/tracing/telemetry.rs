@@ -3048,6 +3048,14 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                 serde_json::json!(snapshot.quic_close_sent_identity_mismatch),
             );
             m.insert(
+                "quic_close_sent_send_abort_limit".into(),
+                serde_json::json!(snapshot.quic_close_sent_send_abort_limit),
+            );
+            m.insert(
+                "quic_close_sent_peer_not_acknowledging".into(),
+                serde_json::json!(snapshot.quic_close_sent_peer_not_acknowledging),
+            );
+            m.insert(
                 "nat_fail_samples".into(),
                 serde_json::json!(snapshot.nat_fail_samples),
             );
@@ -7734,6 +7742,8 @@ mod tests {
             quic_close_sent_node_dropped_peer: 2,
             quic_close_sent_downgrade: 3,
             quic_close_sent_identity_mismatch: 4,
+            quic_close_sent_send_abort_limit: 5,
+            quic_close_sent_peer_not_acknowledging: 6,
             ..Default::default()
         };
         let reference = serde_json::to_value(&snapshot).unwrap();
@@ -7745,6 +7755,8 @@ mod tests {
             ("quic_close_sent_node_dropped_peer", 2),
             ("quic_close_sent_downgrade", 3),
             ("quic_close_sent_identity_mismatch", 4),
+            ("quic_close_sent_send_abort_limit", 5),
+            ("quic_close_sent_peer_not_acknowledging", 6),
         ] {
             assert_eq!(json[key], expected, "event-log value for {key}");
             assert_eq!(json[key], reference[key], "serde value for {key}");

@@ -186,7 +186,7 @@ const NANOS_PER_SEC: u128 = 1_000_000_000;
 /// added; a live waiter whose entry was dropped still has its timer. The
 /// QUIC endpoint has one waiter per connection that is short of bytes, far
 /// fewer than this.
-const MAX_ADMISSION_WAKERS: usize = 1024;
+pub(crate) const MAX_ADMISSION_WAKERS: usize = 1024;
 
 /// How many waiters queued behind a dropped `poll_admit` waiter are woken to
 /// move up (`AdmissionQueue::leave`). The nearest ones matter: the k-th waiter
@@ -515,6 +515,11 @@ impl EgressCap {
             return None;
         }
         Some(Self::new(total_bytes_per_sec as u64, time_source))
+    }
+
+    /// The cap's rate, in bytes per second.
+    pub(crate) fn rate_bytes_per_sec(&self) -> u64 {
+        self.rate_bytes_per_sec
     }
 
     pub(crate) fn burst_bytes(&self) -> u64 {

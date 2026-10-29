@@ -2091,8 +2091,15 @@ mod tests {
     /// the SAME summary and delta cache (#5795), sized to `pool_size ×` the
     /// per-executor budget, and the exported budget gauge equals that aggregate
     /// (the executors' discarded private caches withdrew their contribution).
+    ///
+    /// Every executor also holds the pool's delegate notification sender
+    /// (#5488). An executor without it returns from the post-commit fan-out
+    /// silently, and the E2E test
+    /// `test_delegate_is_notified_when_a_subscribed_contract_updates` only ever
+    /// runs on the first slot, so the loop-built and replacement wiring sites
+    /// are pinned here.
     #[tokio::test]
-    async fn pool_executors_share_one_fast_path_cache_pair() {
+    async fn pool_executors_share_fast_path_caches_and_notification_sender() {
         let config_args = ConfigArgs {
             id: Some("pool-shared-fast-path-caches".to_string()),
             mode: Some(OperationMode::Local),
@@ -2140,6 +2147,12 @@ mod tests {
                 executor.delta_cache_handle(),
                 &pool.shared_delta_cache
             ));
+            assert!(
+                executor
+                    .delegate_notification_tx_handle()
+                    .is_some_and(|tx| tx.same_channel(&pool.delegate_notification_tx)),
+                "pool executor lacks the pool's delegate notification sender"
+            );
         }
         let replacement = pool
             .create_replacement_executor()
@@ -2153,6 +2166,12 @@ mod tests {
             replacement.delta_cache_handle(),
             &pool.shared_delta_cache
         ));
+        assert!(
+            replacement
+                .delegate_notification_tx_handle()
+                .is_some_and(|tx| tx.same_channel(&pool.delegate_notification_tx)),
+            "replacement executor lacks the pool's delegate notification sender"
+        );
         drop(replacement);
 
         let summary_budget =

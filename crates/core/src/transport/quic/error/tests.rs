@@ -118,6 +118,16 @@ fn connection_errors_map_to_their_kinds() {
             refused(QuicRefusal::IdentityMismatch),
         ),
         (
+            "peer recycles the path after too many reset sends (close code 3)",
+            app_close(3),
+            refused(QuicRefusal::Downgrade),
+        ),
+        (
+            "peer recycles the path when this side acknowledges nothing (close code 4)",
+            app_close(4),
+            refused(QuicRefusal::Downgrade),
+        ),
+        (
             "unknown close code from a newer peer",
             app_close(0x0f),
             QuicErrorKind::ConnectionLost,
@@ -600,6 +610,8 @@ fn close_codes_have_fixed_distinct_wire_values() {
         (QuicCloseCode::NodeDroppedPeer, 0),
         (QuicCloseCode::Downgrade, 1),
         (QuicCloseCode::IdentityMismatch, 2),
+        (QuicCloseCode::SendAbortLimit, 3),
+        (QuicCloseCode::PeerNotAcknowledging, 4),
     ];
     assert_eq!(expected.len(), QuicCloseCode::COUNT);
     for (code, wire) in expected {
@@ -607,7 +619,7 @@ fn close_codes_have_fixed_distinct_wire_values() {
         assert_eq!(QuicCloseCode::from_code(u64::from(wire)), Some(code));
         assert!(!code.reason().is_empty());
     }
-    for unknown in [3_u64, 0x0f, 0x11, 0x21, u64::from(u32::MAX)] {
+    for unknown in [5_u64, 0x0f, 0x11, 0x21, u64::from(u32::MAX)] {
         assert_eq!(QuicCloseCode::from_code(unknown), None, "{unknown:#x}");
     }
 }
