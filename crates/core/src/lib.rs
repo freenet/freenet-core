@@ -142,6 +142,11 @@ pub mod dev_tool {
     #[cfg(any(test, feature = "testing"))]
     pub use ring::{set_nn_lattice_enabled, set_nn_lattice_force_active};
 
+    // Test hook: connection identity decisions since process start, by kind
+    // (labels as in the `conn_identity_*` telemetry). Never reset.
+    #[cfg(any(test, feature = "testing"))]
+    pub use crate::transport::conn_identity_totals;
+
     // Test-only findability measurement harness (NOT for ship): scatter/cache
     // disable hook (guarantees a single copy) + per-op terminus tracing (rank /
     // HTL / hop / stop-reason / connectivity-gap-vs-give-up). See

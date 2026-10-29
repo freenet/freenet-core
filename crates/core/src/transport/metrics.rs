@@ -35,6 +35,29 @@ use crate::tracing::{TransferDirection, TransferEvent};
 /// metrics for periodic telemetry snapshots.
 pub static TRANSPORT_METRICS: LazyLock<TransportMetrics> = LazyLock::new(TransportMetrics::new);
 
+/// Test hook: connection identity decisions since the process started, by
+/// [`ConnIdentity`]. Unlike the period counters, never reset by
+/// `take_snapshot`, so a simulation can read its totals at the end.
+#[cfg(any(test, feature = "testing"))]
+static CONN_IDENTITY_TOTAL: [AtomicU64; ConnIdentity::COUNT] =
+    [const { AtomicU64::new(0) }; ConnIdentity::COUNT];
+
+/// Test hook: [`CONN_IDENTITY_TOTAL`] as `(label, count)` pairs, every kind
+/// included. Process-wide: under plain `cargo test` it also counts other
+/// tests running in the same process.
+#[cfg(any(test, feature = "testing"))]
+pub fn conn_identity_totals() -> Vec<(&'static str, u64)> {
+    ConnIdentity::ALL
+        .iter()
+        .map(|kind| {
+            (
+                kind.label(),
+                CONN_IDENTITY_TOTAL[*kind as usize].load(Ordering::Relaxed),
+            )
+        })
+        .collect()
+}
+
 /// Declares a telemetry label enum with `COUNT`, `ALL` and `label` generated
 /// from the one variant list, so a variant cannot be added without growing the
 /// per-variant counter arrays (indexed by `variant as usize`). Each enum's
@@ -1340,6 +1363,8 @@ impl TransportMetrics {
         #[cfg(not(test))]
         let _ = remote;
         self.conn_identity[kind as usize].fetch_add(1, Ordering::Relaxed);
+        #[cfg(any(test, feature = "testing"))]
+        CONN_IDENTITY_TOTAL[kind as usize].fetch_add(1, Ordering::Relaxed);
     }
 
     /// Test-only: start recording the connection identity decisions for the

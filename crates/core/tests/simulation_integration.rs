@@ -8837,6 +8837,22 @@ async fn test_connection_growth_stall_regression() {
         nodes_isolated,
         NODES
     );
+
+    // Connection identity: through formation and 20% message loss, no
+    // connection is closed or refused for naming a key other than the one it
+    // is bound to, and none is bound to a node's own key. Process-wide
+    // totals: under nextest this process runs only this test.
+    let totals: std::collections::BTreeMap<_, _> = freenet::dev_tool::conn_identity_totals()
+        .into_iter()
+        .collect();
+    tracing::info!(?totals, "connection identity totals");
+    assert!(
+        totals["set_dialed"] > 0,
+        "premise: identity decisions were counted ({totals:?})"
+    );
+    for kind in ["changed_connect_request", "changed_connect_peer", "own_key"] {
+        assert_eq!(totals[kind], 0, "{kind} in {totals:?}");
+    }
 }
 
 // =============================================================================

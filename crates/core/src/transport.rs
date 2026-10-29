@@ -242,6 +242,8 @@ pub use congestion_control::{
     CongestionControlStats, CongestionController,
 };
 // Re-export transport metrics for periodic telemetry snapshots
+#[cfg(any(test, feature = "testing"))]
+pub use metrics::conn_identity_totals;
 pub(crate) use metrics::{ConnIdentity, NatAttemptOrigin};
 pub use metrics::{TRANSPORT_METRICS, TransportMetrics, TransportSnapshot};
 // Re-export reset functions for deterministic simulation testing
