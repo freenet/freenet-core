@@ -98,14 +98,6 @@ impl IdentitySlot {
             State::Unbound | State::Bound { .. } => None,
         }
     }
-
-    /// Move the time the pending claim was first made back by `by`.
-    #[cfg(test)]
-    pub(super) fn backdate_claim(&mut self, by: std::time::Duration) {
-        if let State::Pending(claim) = &mut self.0 {
-            claim.since = claim.since.checked_sub(by).expect("uptime covers the test");
-        }
-    }
 }
 
 /// Peer key to the address of the open connection bound to it, and whether
@@ -339,6 +331,45 @@ pub(super) fn pending_claimant(
 /// [`closes_crossed_claim`] can close it.
 pub(super) const CROSSED_CLAIM_WAIT: std::time::Duration =
     std::time::Duration::from_secs(3 * HOLD_WINDOW.as_secs());
+
+/// How long after its claim was made a waiting connection is left alone by
+/// the zombie sweep while [`sweep_spares_claim`] holds: the crossed wait, then
+/// one window for the other side's holder of that session to go quiet once
+/// it is closed here or there, then one more for the retry and for claims
+/// made a little apart on the two sides.
+pub(super) const CROSSED_SWEEP_GRACE: std::time::Duration =
+    std::time::Duration::from_secs(CROSSED_CLAIM_WAIT.as_secs() + 2 * HOLD_WINDOW.as_secs());
+
+/// Whether the zombie sweep should leave the connection at `addr` alone: it
+/// waits for a key that another open connection holds, the two were
+/// established within [`HOLD_WINDOW`] of each other (so they may be crossed
+/// sessions that [`closes_crossed_claim`] resolves), and its claim was made
+/// less than [`CROSSED_SWEEP_GRACE`] ago. A waiting connection is never in
+/// the ring, so without this an idle crossed pair would be reaped on both
+/// sides before the crossed wait ends. Bounded by the claim's first time, so
+/// it cannot be extended.
+pub(super) fn sweep_spares_claim(
+    connections: &BTreeMap<SocketAddr, ConnectionEntry>,
+    addr: SocketAddr,
+    now: tokio::time::Instant,
+) -> bool {
+    let Some(waiting) = connections.get(&addr) else {
+        return false;
+    };
+    let Some(claim) = waiting.identity.pending() else {
+        return false;
+    };
+    let Some((holder, _)) = key_holder(connections, Some(addr), &claim.key) else {
+        return false;
+    };
+    let held = &connections[&holder];
+    let apart = if held.created_at > waiting.created_at {
+        held.created_at - waiting.created_at
+    } else {
+        waiting.created_at - held.created_at
+    };
+    apart <= HOLD_WINDOW && now.saturating_duration_since(claim.since) < CROSSED_SWEEP_GRACE
+}
 
 /// Whether the waiting connection at `claimant`, with a pending claim of
 /// `peer_key` held back by the connection at `holder`, should be closed.
@@ -620,21 +651,25 @@ mod tests {
     /// A waiting connection is closed for a crossed claim only when the two
     /// connections were established within one window of each other, the
     /// claim has waited `CROSSED_CLAIM_WAIT` since it was first made, and
-    /// this node's key orders above the peer's.
+    /// this node's key orders above the peer's. The side whose key orders
+    /// below the peer's never closes it.
     #[test]
     fn a_crossed_claim_is_closed_only_on_one_side_after_its_wait() {
         let (a, b) = (key(), key());
         let (low, high) = if a < b { (a, b) } else { (b, a) };
+        // Peer `low`, seen from a node whose own key is `high`, and peer
+        // `high`, seen from a node whose own key is `low`.
         let mut t = Table::new();
         t.open(addr(1), None);
         t.bind(addr(1), &low, IdentitySource::Dialled, None);
         t.open(addr(2), None);
         t.bind(addr(2), &low, IdentitySource::Claimed, Some(true));
+        t.open(addr(3), None);
+        t.bind(addr(3), &high, IdentitySource::Dialled, None);
+        t.open(addr(4), None);
+        t.bind(addr(4), &high, IdentitySource::Claimed, Some(true));
         let since = t.connections[&addr(2)].identity.pending().unwrap().since;
         let start = t.connections[&addr(1)].created_at;
-        let set_created = |t: &mut Table, at, at_time| {
-            t.connections.get_mut(&at).unwrap().created_at = at_time;
-        };
         let closes = |t: &Table, own: &TransportPublicKey, now| {
             closes_crossed_claim(&t.connections, addr(1), addr(2), own, &low, now)
         };
@@ -648,30 +683,39 @@ mod tests {
             !closes(&t, &high, due - std::time::Duration::from_millis(1)),
             "not before the claim has waited"
         );
-        // The wait runs from the claim, not from the connection: a connection
-        // established long ago that claims now has not waited.
-        set_created(&mut t, addr(1), start - CROSSED_CLAIM_WAIT * 2);
-        set_created(&mut t, addr(2), start - CROSSED_CLAIM_WAIT * 2);
-        assert!(!closes(
-            &t,
-            &high,
-            since + std::time::Duration::from_secs(1)
-        ));
+        for later in [due, due + CROSSED_CLAIM_WAIT * 10] {
+            assert!(
+                !closes_crossed_claim(&t.connections, addr(3), addr(4), &low, &high, later),
+                "the side whose key orders below the peer's never closes"
+            );
+        }
+        // The wait runs from the claim, not from the connection: a claim made
+        // long after its connection was established has not waited.
+        let late = start + CROSSED_CLAIM_WAIT * 2;
+        if let State::Pending(claim) = &mut t.connections.get_mut(&addr(2)).unwrap().identity.0 {
+            claim.since = late;
+        }
+        assert!(!closes(&t, &high, late + std::time::Duration::from_secs(1)));
+        assert!(closes(&t, &high, late + CROSSED_CLAIM_WAIT));
         // Established more than a window apart, in either order: not crossed.
-        set_created(&mut t, addr(1), start);
+        let due = late + CROSSED_CLAIM_WAIT;
+        let set_created = |t: &mut Table, at, at_time| {
+            t.connections.get_mut(&at).unwrap().created_at = at_time;
+        };
         set_created(
             &mut t,
             addr(2),
             start + HOLD_WINDOW + std::time::Duration::from_millis(1),
         );
         assert!(!closes(&t, &high, due));
+        set_created(&mut t, addr(2), start);
         set_created(
             &mut t,
-            addr(2),
-            start - HOLD_WINDOW - std::time::Duration::from_millis(1),
+            addr(1),
+            start + HOLD_WINDOW + std::time::Duration::from_millis(1),
         );
         assert!(!closes(&t, &high, due));
-        set_created(&mut t, addr(2), start - HOLD_WINDOW);
+        set_created(&mut t, addr(1), start + HOLD_WINDOW);
         assert!(closes(&t, &high, due));
         // Only a connection waiting for this key, and only open ones.
         assert!(!closes_crossed_claim(
@@ -700,6 +744,51 @@ mod tests {
         ));
     }
 
+    /// The sweep leaves a waiting connection alone while a connection
+    /// established within one window of it holds its key, until the grace
+    /// after its claim ends; not one established further apart, not one with
+    /// no holder, and not one with no claim.
+    #[test]
+    fn the_sweep_spares_a_possibly_crossed_claim_for_its_grace() {
+        let mut t = Table::new();
+        let k = key();
+        t.open(addr(1), None);
+        t.bind(addr(1), &k, IdentitySource::Dialled, None);
+        t.open(addr(2), None);
+        t.bind(addr(2), &k, IdentitySource::Claimed, Some(true));
+        t.open(addr(3), None);
+        let since = t.connections[&addr(2)].identity.pending().unwrap().since;
+        let start = t.connections[&addr(1)].created_at;
+        let last = since + CROSSED_SWEEP_GRACE - std::time::Duration::from_millis(1);
+        assert!(sweep_spares_claim(&t.connections, addr(2), since));
+        assert!(sweep_spares_claim(&t.connections, addr(2), last));
+        assert!(!sweep_spares_claim(
+            &t.connections,
+            addr(2),
+            since + CROSSED_SWEEP_GRACE
+        ));
+        assert!(
+            !sweep_spares_claim(&t.connections, addr(1), since),
+            "a holder"
+        );
+        assert!(
+            !sweep_spares_claim(&t.connections, addr(3), since),
+            "no claim"
+        );
+        t.connections.get_mut(&addr(2)).unwrap().created_at =
+            start + HOLD_WINDOW + std::time::Duration::from_millis(1);
+        assert!(
+            !sweep_spares_claim(&t.connections, addr(2), since),
+            "established apart"
+        );
+        t.connections.get_mut(&addr(2)).unwrap().created_at = start;
+        t.close(addr(1), &k);
+        assert!(
+            !sweep_spares_claim(&t.connections, addr(2), since),
+            "no holder"
+        );
+    }
+
     /// A claim keeps the time it was first made when a later attempt for the
     /// same key is merged into it.
     #[test]
@@ -710,12 +799,12 @@ mod tests {
         t.bind(addr(1), &k, IdentitySource::Dialled, None);
         t.open(addr(2), None);
         t.bind(addr(2), &k, IdentitySource::Claimed, Some(false));
-        t.connections
-            .get_mut(&addr(2))
-            .unwrap()
-            .identity
-            .backdate_claim(std::time::Duration::from_secs(10));
-        let first = t.connections[&addr(2)].identity.pending().unwrap().since;
+        // A time distinct from now, so a merge that took now would differ.
+        let first = t.connections[&addr(2)].identity.pending().unwrap().since
+            + std::time::Duration::from_secs(10);
+        if let State::Pending(claim) = &mut t.connections.get_mut(&addr(2)).unwrap().identity.0 {
+            claim.since = first;
+        }
         t.bind(addr(2), &k, IdentitySource::Claimed, Some(true));
         assert_eq!(
             t.connections[&addr(2)].identity.pending().unwrap().since,

@@ -163,17 +163,23 @@ impl P2pConnManager {
     /// The connection at `addr`, bound to `key`, has been removed from
     /// `connections`. Updates the index; binds the newest pending claim of
     /// `key`, if no other connection holds the key now, promoting its
-    /// connection when the claim would have; then (only with
-    /// `forget_peer_state`) forgets the peer's state unless a connection
-    /// bound to `key` is still in the ring.
+    /// connection when the claim would have or when the closed connection
+    /// was in the ring (`was_in_ring`, read before the ring was pruned), so
+    /// the claim takes its place there; then (only with `forget_peer_state`)
+    /// forgets the peer's state unless a connection bound to `key` is still
+    /// in the ring.
     pub(super) async fn release_identity(
         &mut self,
         addr: SocketAddr,
         key: &TransportPublicKey,
+        was_in_ring: bool,
         forget_peer_state: bool,
     ) {
         debug_assert!(!self.connections.contains_key(&addr));
         self.unbind_identity(addr, key);
+        if was_in_ring {
+            identity::promote_newest_claim(&mut self.connections, key);
+        }
         if let Some((claimant, claim)) =
             identity::pending_claimant(&self.connections, Some(addr), key)
         {
@@ -224,15 +230,6 @@ impl P2pConnManager {
         handshake_commands: &HandshakeCommandSender,
     ) {
         TRANSPORT_METRICS.record_conn_identity(quiet, ConnIdentity::QuietHolderReplaced);
-        if self
-            .bridge
-            .op_manager
-            .ring
-            .connection_manager
-            .is_in_ring(quiet)
-        {
-            identity::promote_newest_claim(&mut self.connections, key);
-        }
         tracing::info!(
             %quiet,
             pub_key = %key,
@@ -461,6 +458,12 @@ impl P2pConnManager {
 
         let pub_key_to_remove = entry.pub_key().cloned();
         self.record_identity_teardown(peer_addr, entry);
+        let was_in_ring = self
+            .bridge
+            .op_manager
+            .ring
+            .connection_manager
+            .is_in_ring(peer_addr);
 
         tracing::trace!(
             peer_addr = %peer_addr,
@@ -512,7 +515,8 @@ impl P2pConnManager {
         // that never named a peer has none.
         let removed = self.connections.remove(&peer_addr);
         if let Some(pub_key) = &pub_key_to_remove {
-            self.release_identity(peer_addr, pub_key, true).await;
+            self.release_identity(peer_addr, pub_key, was_in_ring, true)
+                .await;
         }
         if let Some(conn) = removed {
             // TODO: review: this could potentially leave garbage tasks in the background with peer listener
@@ -567,6 +571,12 @@ impl P2pConnManager {
 
         let pub_key_to_remove = entry.pub_key().cloned();
         self.record_identity_teardown(peer_addr, entry);
+        let was_in_ring = self
+            .bridge
+            .op_manager
+            .ring
+            .connection_manager
+            .is_in_ring(peer_addr);
 
         // Non-blocking send to handshake driver to avoid deadlock (#3519).
         // For zombie transports (already established connections), the expected_inbound
@@ -605,7 +615,8 @@ impl P2pConnManager {
         // connection that never named a peer has none).
         let removed = self.connections.remove(&peer_addr);
         if let Some(pub_key) = &pub_key_to_remove {
-            self.release_identity(peer_addr, pub_key, true).await;
+            self.release_identity(peer_addr, pub_key, was_in_ring, true)
+                .await;
         }
         if let Some(conn) = removed {
             // Short timeout — zombie connections may already be dead
@@ -1503,6 +1514,12 @@ impl P2pConnManager {
             // If transient, drop_transient releases the budget slot.
             // If ring-promoted, prune_connection cleans up topology, orphaned txs,
             // subscriptions, and notifies the handshake driver.
+            let was_in_ring = self
+                .bridge
+                .op_manager
+                .ring
+                .connection_manager
+                .is_in_ring(peer_addr);
             let was_transient = self
                 .bridge
                 .op_manager
@@ -1556,7 +1573,7 @@ impl P2pConnManager {
             // Per-peer state is forgotten for a connection that was in the
             // ring, and only when no other open connection is bound to its key.
             if let Some(old_pub_key) = old.pub_key() {
-                self.release_identity(peer_addr, old_pub_key, !was_transient)
+                self.release_identity(peer_addr, old_pub_key, was_in_ring, !was_transient)
                     .await;
             }
             tracing::info!(
@@ -2170,6 +2187,12 @@ impl P2pConnManager {
                 // Look up the connection directly by address
                 if let Some(entry) = self.connections.remove(&remote_addr) {
                     self.record_identity_teardown(remote_addr, &entry);
+                    let was_in_ring = self
+                        .bridge
+                        .op_manager
+                        .ring
+                        .connection_manager
+                        .is_in_ring(remote_addr);
                     tracing::debug!(self_peer = %self.bridge.op_manager.ring.connection_manager.pub_key, peer = ?entry.pub_key(), socket_addr = %remote_addr, conn_map_size = self.connections.len(), "[CONN_TRACK] REMOVE: TransportClosed - removing from connections HashMap");
                     let prune_result = self
                         .bridge
@@ -2197,7 +2220,8 @@ impl P2pConnManager {
                     // state, only when no other open connection is bound to
                     // its key; a connection that never named a peer has none.
                     if let Some(pub_key) = entry.pub_key() {
-                        self.release_identity(remote_addr, pub_key, true).await;
+                        self.release_identity(remote_addr, pub_key, was_in_ring, true)
+                            .await;
                     }
 
                     // Backoff prevents reconnect-timeout-reconnect cycles to dead peers (#3252).
