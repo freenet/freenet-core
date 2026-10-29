@@ -166,6 +166,7 @@ async fn udp_transport_config_reaches_the_listener_by_name() {
             congestion_config: None,
             ack_version_floor_override: Some((9, 8, 7)),
             quic: None,
+            advertised_version_override: Some((0, 2, 148)),
         },
         None,
     );
@@ -179,6 +180,10 @@ async fn udp_transport_config_reaches_the_listener_by_name() {
         &global
     ));
     assert_eq!(listener.ack_version_floor_override, Some((9, 8, 7)));
+    assert_eq!(
+        version_cmp::parse_version_bytes(&listener.advertised_version).version,
+        (0, 2, 148)
+    );
     assert!(
         listener.congestion_config.is_some(),
         "an unset congestion config defaults, as before"
