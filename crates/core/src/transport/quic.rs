@@ -472,7 +472,8 @@ impl QuicEndpoint {
                 server,
                 identity,
                 expected_clients: Arc::new(ExpectedClients::default()),
-                cap_holds: cap_holds.unwrap_or_default(),
+                // Set by the closure, which ran: `endpoint` is built.
+                cap_holds: cap_holds.expect("the QUIC socket's cap holds"),
                 #[cfg(test)]
                 receive_fault: receive_fault.unwrap_or_default(),
             },

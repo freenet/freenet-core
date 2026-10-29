@@ -68,11 +68,18 @@
 //! - a peer that went silent: quinn's idle timeout ends the connection
 //!   instead;
 //! - a send the node's egress cap (`total-bandwidth-limit`) holds: quinn
-//!   counts a transmit's frames when it builds it, and the cap may hold it
-//!   longer than the window, so while the cap holds any QUIC transmit (or
-//!   held one since the previous sample) no window runs. The cap is
-//!   node-wide and quinn does not say which connection a held transmit
-//!   belongs to, so this pauses the watch on every path.
+//!   counts a transmit's frames, and its bytes in flight, when it builds
+//!   it, and the cap may hold it longer than the window.
+//!
+//! **Guard 2 is inactive while the egress cap holds QUIC transmits.** While
+//! the cap holds any QUIC transmit, or held one since the previous sample,
+//! no window runs, on any path: the cap is node-wide and quinn does not say
+//! which connection a held transmit belongs to. On a node whose cap binds
+//! most of the time, guard 2 is then off most of the time. Narrowing the
+//! pause to the sends counted since the hold would not be enough, because a
+//! held transmit is also counted in quinn's bytes in flight. A hold left
+//! behind by a connection that ended stops counting after its validity
+//! (`socket::cap_hold_validity`).
 //!
 //! It can also fire when this side's packets stop reaching a peer whose
 //! packets still arrive (a path broken in one direction): from this side
@@ -113,7 +120,7 @@ use quinn::congestion::{Controller, ControllerFactory, ControllerMetrics};
 use super::QuicCloser;
 #[cfg(doc)]
 use super::error::close_code;
-use super::socket::CapHolds;
+use super::socket::{CapHoldReading, CapHolds};
 use crate::simulation::TimeSource;
 use crate::transport::metrics::QuicCloseCode;
 
@@ -391,21 +398,22 @@ pub(crate) struct AckSample {
     sent: u64,
     /// Frames received from the peer.
     received: u64,
-    /// Times the egress cap started holding a QUIC transmit, node-wide.
-    cap_holds: u64,
-    /// The egress cap holds a QUIC transmit now.
-    cap_held_now: bool,
+    /// The QUIC transmits the egress cap holds, node-wide.
+    cap: CapHoldReading,
 }
 
 impl AckSample {
     /// The connection's counts now, or `None` if its controller is not an
     /// [`AckCounting`] (a config that does not install it).
     ///
-    /// Read in this order: the record, then the stats, then `cap_holds`. A
-    /// send that lands between two reads then shows up in a later read, so
-    /// it is seen after the record it may follow and is not taken as a send
-    /// before a batch; and a transmit quinn built (counted in the stats) and
-    /// the cap then held is seen as held.
+    /// Read in this order: the record, then the stats, then `cap_holds`.
+    /// The controller callbacks that write the record, the frame counts in
+    /// the stats, and quinn's `poll_writable` (where a hold is recorded) all
+    /// run under quinn's per-connection `State` lock, which
+    /// `congestion_state()` and `stats()` also take; so a send counted in
+    /// the stats was built after the record's state that this sample holds,
+    /// and a transmit counted there that the cap then held is already
+    /// recorded as held when `cap_holds` is read.
     pub(crate) fn of(connection: &quinn::Connection, cap_holds: &CapHolds) -> Option<Self> {
         let record = connection
             .congestion_state()
@@ -415,14 +423,13 @@ impl AckSample {
             .state;
         let state = *record.lock();
         let stats = connection.stats();
-        let (cap_holds, cap_held_now) = cap_holds.read();
+        let cap = cap_holds.read();
         Some(Self {
             record,
             state,
             sent: ack_eliciting_frames(&stats.frame_tx),
             received: frames_received(&stats.frame_rx),
-            cap_holds,
-            cap_held_now,
+            cap,
         })
     }
 
@@ -441,7 +448,6 @@ impl AckSample {
     /// A sample with these counts; `batches` counts every batch of
     /// acknowledgements, those with an `on_ack` and those without.
     #[cfg(test)]
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn synthetic(
         record: &Arc<Mutex<AckState>>,
         acked: u64,
@@ -449,8 +455,7 @@ impl AckSample {
         outstanding_after_acks: u64,
         sent: u64,
         received: u64,
-        cap_holds: u64,
-        cap_held_now: bool,
+        cap: CapHoldReading,
     ) -> Self {
         Self {
             record: record.clone(),
@@ -462,8 +467,7 @@ impl AckSample {
             },
             sent,
             received,
-            cap_holds,
-            cap_held_now,
+            cap,
         }
     }
 }
@@ -525,12 +529,36 @@ pub(crate) struct AckWatch {
     sent_after_acks: bool,
     /// Samples in a row with nothing from the peer.
     quiet_samples: u32,
+    /// Since when a cap hold has been reported with no new hold event.
+    hold_unchanged_since: Option<u64>,
 }
 
 /// Samples in a row with nothing from the peer that end a window.
 const QUIET_SAMPLES_END_WINDOW: u32 = 2;
 
 impl AckWatch {
+    /// Whether the egress cap holds, or held since the previous sample, a
+    /// QUIC transmit. A hold reported for longer than its validity with no
+    /// new hold event is a poller left behind by an ended connection and
+    /// does not count ([`CapHolds`]).
+    fn cap_held(
+        &mut self,
+        now_nanos: u64,
+        cap: &CapHoldReading,
+        previous: &CapHoldReading,
+    ) -> bool {
+        let new_event = cap.holds != previous.holds;
+        if new_event || !cap.held_now {
+            self.hold_unchanged_since = None;
+        }
+        let live_hold = cap.held_now && {
+            let since = *self.hold_unchanged_since.get_or_insert(now_nanos);
+            let validity = u64::try_from(cap.validity.as_nanos()).unwrap_or(u64::MAX);
+            now_nanos.saturating_sub(since) <= validity
+        };
+        new_event || live_hold
+    }
+
     pub(crate) fn new(window: Duration, first: AckSample) -> Self {
         Self {
             window_nanos: u64::try_from(window.as_nanos()).unwrap_or(u64::MAX),
@@ -538,6 +566,7 @@ impl AckWatch {
             since: None,
             sent_after_acks: false,
             quiet_samples: 0,
+            hold_unchanged_since: None,
         }
     }
 
@@ -551,7 +580,8 @@ impl AckWatch {
         let peer_sent = same_controller && sample.received != self.previous.received;
         let sent_new = same_controller && sample.sent != self.previous.sent;
         let outstanding_after_acks = same_controller && sample.state.outstanding_after_acks() > 0;
-        let cap_held = sample.cap_held_now || sample.cap_holds != self.previous.cap_holds;
+        let previous_cap = self.previous.cap;
+        let cap_held = self.cap_held(now_nanos, &sample.cap, &previous_cap);
         self.previous = sample;
         if new_batch {
             self.sent_after_acks = false;

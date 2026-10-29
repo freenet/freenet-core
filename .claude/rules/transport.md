@@ -1143,9 +1143,15 @@ Path recycling (quic/recycle.rs, #5940 step M6): besides the send-reset
   from the peer end the window, and so does a sample with nothing
   outstanding (in flight after the latest acknowledgements, minus losses,
   or a send since), so recovery from an outage does not close the path.
-  quinn counts a transmit's frames when it builds it, before the egress cap
-  admits it, so while the cap holds any QUIC transmit (socket::CapHolds,
-  node-wide) no window runs on any path.
+  quinn counts a transmit's frames, and its bytes in flight, when it builds
+  it, before the egress cap admits it. Guard 2 is therefore inactive while
+  the egress cap holds QUIC transmits: while the cap holds any (or held one
+  since the previous sample; socket::CapHolds, node-wide) no window runs on
+  any path, so on a node whose cap binds most of the time guard 2 is off
+  most of the time. Do not narrow this to the sends counted since the hold:
+  a held transmit is also in quinn's bytes in flight. A hold whose poller
+  is not polled again within socket::cap_hold_validity of the cap's rate
+  (a poller left by an ended connection) stops counting.
   e5 constraint: SEND_ABORT_LIMIT and PEER_NOT_ACKNOWLEDGING ask the peer to
   fall back to UDP for THIS connection only. They are not a permanent
   downgrade: e5 must allow a new upgrade after its normal backoff.

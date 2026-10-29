@@ -5,6 +5,13 @@ use super::*;
 
 const SEC: u64 = 1_000_000_000;
 
+/// A reading of [`CapHolds`] with no cap.
+const NO_CAP: CapHoldReading = CapHoldReading {
+    holds: 0,
+    held_now: false,
+    validity: Duration::ZERO,
+};
+
 /// The ticks of the window (`window / tick`), and the tick a window
 /// started at tick `start` closes at.
 fn closes_at(start: u64) -> u64 {
@@ -21,10 +28,12 @@ struct Reading {
     outstanding: u64,
     sent: u64,
     received: u64,
-    /// Times the egress cap started holding a QUIC transmit, and whether it
-    /// holds one now; [`Reading::cap_held`] sets them.
+    /// Hold events of the egress cap and whether it holds a QUIC transmit
+    /// now ([`Reading::cap_held`]); a hold stays valid for `cap_validity`
+    /// with no new event (an hour unless a test sets it).
     cap_holds: u64,
     cap_held_now: bool,
+    cap_validity: Duration,
 }
 
 const fn reading(acked: u64, outstanding: u64, sent: u64, received: u64) -> Reading {
@@ -33,6 +42,7 @@ const fn reading(acked: u64, outstanding: u64, sent: u64, received: u64) -> Read
         batches: acked,
         cap_holds: 0,
         cap_held_now: false,
+        cap_validity: Duration::from_secs(3600),
         outstanding,
         sent,
         received,
@@ -51,6 +61,23 @@ impl Reading {
         Self {
             cap_holds: holds,
             cap_held_now: true,
+            ..self
+        }
+    }
+
+    /// The same reading with holds valid for `validity` with no new event.
+    const fn cap_validity(self, validity: Duration) -> Self {
+        Self {
+            cap_validity: validity,
+            ..self
+        }
+    }
+
+    /// The same reading with `holds` hold events so far and none held now.
+    const fn cap_events(self, holds: u64) -> Self {
+        Self {
+            cap_holds: holds,
+            cap_held_now: false,
             ..self
         }
     }
@@ -76,8 +103,11 @@ fn run(ticks: u64, mut at: impl FnMut(u64) -> Reading) -> Option<u64> {
             r.outstanding,
             r.sent,
             r.received,
-            r.cap_holds,
-            r.cap_held_now,
+            CapHoldReading {
+                holds: r.cap_holds,
+                held_now: r.cap_held_now,
+                validity: r.cap_validity,
+            },
         )
     };
     let mut watch = AckWatch::new(ACK_WATCH_WINDOW, sample(at(0)));
@@ -212,6 +242,35 @@ fn a_send_held_by_the_egress_cap_starts_no_window() {
     assert_eq!(closed, None);
 }
 
+/// A hold that starts and ends between two samples is seen through the
+/// hold events (`holds` goes from 0 to 1 while `held_now` stays false): the
+/// send latched at tick 1 may be the transmit that waited, so the window
+/// and the latch end, and with nothing sent since there is no close.
+#[test]
+fn a_hold_between_two_samples_ends_the_window() {
+    let closed = run(40, |t| {
+        let r = reading(5, 0, 10 + t.min(1), 100 + t);
+        if t >= 3 { r.cap_events(1) } else { r }
+    });
+    assert_eq!(closed, None);
+}
+
+/// A hold reported with no new event for longer than its validity was left
+/// by a connection that ended (its poller is never polled again), and stops
+/// pausing the watch: a send after that starts a window that closes.
+#[test]
+fn a_hold_past_its_validity_no_longer_pauses_the_watch() {
+    let closed = run(40, |t| {
+        // Held from the start with one event, valid for 4 s; first seen at
+        // tick 1 (2 s), so live through tick 3 (6 s) and stale from tick 4.
+        // Sends from tick 5 on, the peer sending every tick.
+        reading(5, 0, 10 + t.saturating_sub(4), 100 + t)
+            .cap_held(1)
+            .cap_validity(Duration::from_secs(4))
+    });
+    assert_eq!(closed, Some(closes_at(5)));
+}
+
 /// Recovery from an outage in both directions. Before it, sends with
 /// nothing from the peer (probes); after it, packets still outstanding but
 /// nothing new sent and nothing acknowledged (the probe timer is backed
@@ -284,8 +343,7 @@ fn a_busy_conforming_peer_is_never_closed() {
 fn a_new_controller_restarts_the_window() {
     let first: Arc<Mutex<AckState>> = Arc::default();
     let second: Arc<Mutex<AckState>> = Arc::default();
-    let s =
-        |record, sent, received| AckSample::synthetic(record, 0, 0, 0, sent, received, 0, false);
+    let s = |record, sent, received| AckSample::synthetic(record, 0, 0, 0, sent, received, NO_CAP);
     let mut watch = AckWatch::new(ACK_WATCH_WINDOW, s(&first, 0, 0));
     assert!(!watch.observe(2 * SEC, s(&first, 1, 1)));
     assert!(!watch.observe(4 * SEC, s(&second, 2, 2)));

@@ -2185,11 +2185,11 @@ fn a_send_held_by_the_egress_cap_does_not_close_the_path() {
         s.keep_sending();
         s.wait(Duration::from_secs(5)).await;
         let cap_holds = s.a.connection().cap_holds();
-        let (holds_before, received_before) = (cap_holds.read().0, s.sample().received());
+        let (holds_before, received_before) = (cap_holds.read().holds, s.sample().received());
         s.a_sends(20_000);
         s.wait(Duration::from_secs(60)).await;
         assert!(
-            cap_holds.read().0 > holds_before,
+            cap_holds.read().holds > holds_before,
             "the cap held no transmit"
         );
         assert!(
@@ -2202,6 +2202,11 @@ fn a_send_held_by_the_egress_cap_does_not_close_the_path() {
             s.a.connection().inner().close_reason()
         );
         assert!(recycle_closes_to(s.b_addr).is_empty());
+        // Nor did `b` send a close.
+        assert_eq!(
+            s.a.connection().inner().stats().frame_rx.connection_close,
+            0
+        );
     })
 }
 

@@ -2038,6 +2038,63 @@ fn a_sent_datagram_is_charged_once() {
 /// With the cap short of the datagram the send is `WouldBlock`, nothing is
 /// sent and nothing is charged; quinn then waits in `poll_writable`, which is
 /// `Pending` until the cap has a full datagram and `Ready` once it does.
+/// #5940 step M6: a connection that ends while the egress cap holds its
+/// transmit leaves its poller held, because quinn keeps the poller until
+/// the connection's last handle goes and never polls it again. Such a hold
+/// stops pausing the acknowledgement watch once it has gone
+/// `cap_hold_validity` of the cap's rate with no new hold event, and the
+/// watch then runs and closes as usual.
+#[test]
+fn a_hold_left_by_an_ended_connection_stops_pausing_the_ack_watch() {
+    use super::recycle::{ACK_WATCH_TICK, ACK_WATCH_WINDOW, AckSample, AckWatch};
+    use quinn::AsyncUdpSocket;
+    use std::task::Context;
+    let time = VirtualTime::new();
+    let local: SocketAddr = "10.201.40.1:5000".parse().unwrap();
+    let rate = 1_000_000;
+    let (socket, demux) = scripted(local, SendMode::Send, Vec::new(), Some((rate, &time)));
+    let cap = demux.egress_cap().unwrap();
+    cap.charge_unpaced(cap.burst_bytes() as usize);
+    let holds = socket.cap_holds();
+    // The connection's poller waits for the cap, then the connection ends
+    // and nothing polls the poller again, but a handle keeps it.
+    let mut poller = socket.clone().create_io_poller();
+    let waker = futures::task::noop_waker();
+    let mut cx = Context::from_waker(&waker);
+    assert!(poller.as_mut().poll_writable(&mut cx).is_pending());
+    let held = holds.read();
+    assert!(held.held_now);
+    assert_eq!(held.validity, super::socket::cap_hold_validity(rate));
+
+    // Another path's watch: a send every tick, the peer sending every tick
+    // and acknowledging nothing.
+    let record = Arc::default();
+    let tick = ACK_WATCH_TICK.as_secs();
+    let sample = |t: u64| AckSample::synthetic(&record, 5, 5, 0, 10 + t, 100 + t, holds.read());
+    let mut watch = AckWatch::new(ACK_WATCH_WINDOW, sample(0));
+    let closed = (1..=200u64)
+        .find(|t| watch.observe(t * tick * 1_000_000_000, sample(*t)))
+        .map(|t| Duration::from_secs(t * tick));
+    let closed = closed.expect("the watch resumed and closed");
+    // First seen held at tick 1; stale once more than the validity after it,
+    // then a window from the next sample.
+    assert!(
+        closed > held.validity + ACK_WATCH_WINDOW,
+        "closed at {closed:?}, validity {:?}",
+        held.validity
+    );
+    assert!(
+        closed <= held.validity + ACK_WATCH_WINDOW + 3 * ACK_WATCH_TICK,
+        "closed at {closed:?}, validity {:?}",
+        held.validity
+    );
+    drop(poller);
+    assert!(
+        !holds.read().held_now,
+        "dropping the poller releases its hold"
+    );
+}
+
 #[test]
 fn a_cap_short_of_the_datagram_is_would_block() {
     use quinn::AsyncUdpSocket;
