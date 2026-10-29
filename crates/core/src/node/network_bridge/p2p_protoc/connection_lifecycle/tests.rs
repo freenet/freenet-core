@@ -1499,3 +1499,234 @@ async fn teardown_of_an_unkeyed_connection_runs_no_per_peer_cleanup() {
         );
     }
 }
+
+/// The source a connection's identity was bound from, if it has one.
+fn bound_source(h: &Harness, addr: SocketAddr) -> Option<IdentitySource> {
+    h.mgr.connections[&addr]
+        .identity
+        .as_ref()
+        .map(|identity| identity.source)
+}
+
+/// A connection the node dialled keeps the dialled key: the remote's
+/// ConnectRequest naming another key is dropped and the connection closed,
+/// and nothing is recorded or promoted under the named key.
+#[tokio::test]
+async fn dialled_connection_is_closed_when_its_peer_names_another_key() {
+    let mut h = Harness::new("conn-identity-dialled-renamed").await;
+    let remote: SocketAddr = "203.0.113.150:5501".parse().unwrap();
+    watch(&[remote]);
+    let (dialled, named) = (key(), key());
+
+    h.dial(remote, &dialled).await;
+    assert_eq!(bound_source(&h, remote), Some(IdentitySource::Dialled));
+    assert_eq!(h.ring_key_at(remote).as_ref(), Some(&dialled));
+    h.refused_connect_request(remote, PeerKeyLocation::with_unknown_addr(named.clone()))
+        .await;
+
+    assert_eq!(
+        seen(remote),
+        vec![ConnIdentity::SetDialed, ConnIdentity::ChangedConnectRequest]
+    );
+    assert!(!h.mgr.connections.contains_key(&remote), "closed");
+    assert!(!h.mgr.addr_by_pub_key.contains_key(&named));
+    assert!(!h.mgr.addr_by_pub_key.contains_key(&dialled));
+    assert_eq!(h.ring_key_at(remote), None, "pruned from the ring");
+    assert!(
+        h.mgr
+            .bridge
+            .op_manager
+            .ring
+            .connection_manager
+            .get_peer_by_pub_key(&named)
+            .is_none()
+    );
+}
+
+/// A matched expected-inbound binding is a claim: the address matched, and
+/// the key is the one the connect op dialled, not one the remote named. When
+/// the remote then names another key in its own ConnectRequest (another
+/// peer reached us from the address inside the expectation window), the
+/// connection is closed, and nothing stays recorded or promoted under either
+/// key.
+#[tokio::test]
+async fn matched_claim_is_closed_when_the_peer_names_another_key() {
+    let mut h = Harness::new("conn-identity-matched-renamed").await;
+    let remote: SocketAddr = "203.0.113.160:5601".parse().unwrap();
+    watch(&[remote]);
+    let (expected, named) = (key(), key());
+
+    h.accept_expected(remote, &expected).await;
+    assert_eq!(bound_source(&h, remote), Some(IdentitySource::Claimed));
+    assert_eq!(h.ring_key_at(remote).as_ref(), Some(&expected));
+    h.refused_connect_request(remote, PeerKeyLocation::with_unknown_addr(named.clone()))
+        .await;
+
+    assert_eq!(
+        seen(remote),
+        vec![
+            ConnIdentity::ExpectedInboundBound,
+            ConnIdentity::ChangedConnectRequest
+        ]
+    );
+    assert!(!h.mgr.connections.contains_key(&remote), "closed");
+    assert!(!h.mgr.addr_by_pub_key.contains_key(&expected));
+    assert!(!h.mgr.addr_by_pub_key.contains_key(&named));
+    assert_eq!(h.ring_key_at(remote), None);
+    h.assert_own_key_absent();
+}
+
+/// The same two claims in the other order, on an unmatched connection: the
+/// remote names itself first, then the connect op's ConnectPeer names the key
+/// it dialled for the address. The connection keeps the remote's key, the
+/// ConnectPeer is refused, and nothing is promoted.
+#[tokio::test]
+async fn self_named_connection_refuses_a_connect_peer_for_another_key() {
+    let mut h = Harness::new("conn-identity-named-then-connect-peer").await;
+    let remote: SocketAddr = "203.0.113.170:5701".parse().unwrap();
+    watch(&[remote]);
+    let (named, dialled) = (key(), key());
+
+    h.accept(remote).await;
+    h.connect_request(remote, PeerKeyLocation::with_unknown_addr(named.clone()))
+        .await;
+    assert!(
+        !h.try_connect_peer(PeerKeyLocation::new(dialled.clone(), remote))
+            .await
+    );
+
+    assert_eq!(
+        seen(remote),
+        vec![
+            ConnIdentity::SetConnectRequest,
+            ConnIdentity::ChangedConnectPeer
+        ]
+    );
+    assert_eq!(h.mgr.connections[&remote].pub_key(), Some(&named));
+    assert_eq!(h.ring_key_at(remote), None);
+    assert!(!h.mgr.addr_by_pub_key.contains_key(&dialled));
+}
+
+/// A matched expected-inbound claim for a key that a dialled connection at
+/// another address still holds is not bound: the new connection continues
+/// unidentified and unpromoted, and the dialled connection keeps the key's
+/// address. Once the dialled connection closes, the same claim binds.
+#[tokio::test]
+async fn matched_claim_of_a_key_held_by_a_dial_is_not_bound() {
+    let mut h = Harness::new("conn-identity-matched-held").await;
+    let dialled_at: SocketAddr = "203.0.113.180:5801".parse().unwrap();
+    let claimed_at: SocketAddr = "203.0.113.181:5802".parse().unwrap();
+    let later_at: SocketAddr = "203.0.113.182:5803".parse().unwrap();
+    watch(&[claimed_at, later_at]);
+    let peer = key();
+
+    h.dial(dialled_at, &peer).await;
+    h.accept_expected(claimed_at, &peer).await;
+
+    assert_eq!(seen(claimed_at), vec![ConnIdentity::ClaimHeldByDial]);
+    assert_eq!(h.mgr.connections[&claimed_at].pub_key(), None);
+    assert_eq!(h.ring_key_at(claimed_at), None, "not promoted");
+    assert_eq!(h.mgr.addr_by_pub_key.get(&peer), Some(&dialled_at));
+    assert_eq!(h.ring_key_at(dialled_at).as_ref(), Some(&peer));
+
+    h.transport_closed(dialled_at).await;
+    h.accept_expected(later_at, &peer).await;
+    assert_eq!(seen(later_at), vec![ConnIdentity::ExpectedInboundBound]);
+    assert_eq!(h.mgr.addr_by_pub_key.get(&peer), Some(&later_at));
+}
+
+/// A ConnectRequest naming a key that a dialled connection at another address
+/// holds is dropped and leaves the requesting connection unidentified; the
+/// dialled connection keeps the key's address.
+#[tokio::test]
+async fn connect_request_claim_of_a_key_held_by_a_dial_is_dropped() {
+    let mut h = Harness::new("conn-identity-request-held").await;
+    let dialled_at: SocketAddr = "203.0.113.190:5901".parse().unwrap();
+    let claimed_at: SocketAddr = "203.0.113.191:5902".parse().unwrap();
+    watch(&[claimed_at]);
+    let peer = key();
+
+    h.dial(dialled_at, &peer).await;
+    h.accept(claimed_at).await;
+    h.refused_connect_request(claimed_at, PeerKeyLocation::with_unknown_addr(peer.clone()))
+        .await;
+
+    assert_eq!(seen(claimed_at), vec![ConnIdentity::ClaimHeldByDial]);
+    assert!(h.mgr.connections.contains_key(&claimed_at), "left open");
+    assert_eq!(h.mgr.connections[&claimed_at].pub_key(), None);
+    assert_eq!(h.mgr.addr_by_pub_key.get(&peer), Some(&dialled_at));
+}
+
+/// The other order: a dial of a key that a claimed connection holds still
+/// binds, and the key's address moves to the dialled connection
+/// (`duplicate_key`). The claimed connection keeps its own binding.
+#[tokio::test]
+async fn dial_of_a_key_held_by_a_claim_binds() {
+    let mut h = Harness::new("conn-identity-dial-after-claim").await;
+    let claimed_at: SocketAddr = "203.0.113.200:6001".parse().unwrap();
+    let dialled_at: SocketAddr = "203.0.113.201:6002".parse().unwrap();
+    watch(&[claimed_at, dialled_at]);
+    let peer = key();
+
+    h.accept_expected(claimed_at, &peer).await;
+    h.dial(dialled_at, &peer).await;
+
+    assert_eq!(seen(claimed_at), vec![ConnIdentity::ExpectedInboundBound]);
+    assert_eq!(
+        seen(dialled_at),
+        vec![ConnIdentity::DuplicateKey, ConnIdentity::SetDialed]
+    );
+    assert_eq!(h.mgr.addr_by_pub_key.get(&peer), Some(&dialled_at));
+    assert_eq!(h.mgr.connections[&claimed_at].pub_key(), Some(&peer));
+    assert_eq!(bound_source(&h, dialled_at), Some(IdentitySource::Dialled));
+}
+
+/// Every write of a connection's identity and every insert into
+/// `addr_by_pub_key` is inside `bind_identity`: a new write elsewhere would
+/// let a connection's key change after establishment. Anchored on the field
+/// and map names, so renaming either fails here rather than passing.
+#[test]
+fn identity_is_written_only_by_bind_identity() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/node/network_bridge");
+    let mut files = Vec::new();
+    let mut dirs = vec![root];
+    while let Some(dir) = dirs.pop() {
+        for entry in std::fs::read_dir(&dir).expect("read source dir") {
+            let path = entry.expect("dir entry").path();
+            if path.is_dir() {
+                dirs.push(path);
+            } else if path.extension().is_some_and(|e| e == "rs")
+                && path.file_name().is_some_and(|n| n != "tests.rs")
+            {
+                files.push(path);
+            }
+        }
+    }
+    assert!(files.len() > 5, "premise: the bridge sources were found");
+    let writes = [".identity = ", "identity: Some(", "addr_by_pub_key.insert("];
+    let mut found = Vec::new();
+    for path in &files {
+        let source = std::fs::read_to_string(path).expect("read source");
+        for pattern in writes {
+            for (at, _) in source.match_indices(pattern) {
+                let before = &source[..at];
+                let in_bind = before
+                    .rfind("    pub(super) fn bind_identity(")
+                    .is_some_and(|start| !before[start..].contains("\n    }\n"));
+                found.push((path.display().to_string(), pattern, in_bind));
+            }
+        }
+    }
+    let outside: Vec<_> = found.iter().filter(|(_, _, in_bind)| !in_bind).collect();
+    assert!(
+        outside.is_empty(),
+        "identity written outside bind_identity: {outside:?}"
+    );
+    for pattern in [".identity = ", "addr_by_pub_key.insert("] {
+        assert_eq!(
+            found.iter().filter(|(_, p, _)| *p == pattern).count(),
+            1,
+            "premise: bind_identity writes {pattern}"
+        );
+    }
+}

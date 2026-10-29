@@ -4202,6 +4202,33 @@ pub mod mock_transport {
         .await
     }
 
+    /// A mock node, a gateway or not, at a caller-chosen `addr` with a
+    /// caller-chosen `keypair`, so a test can stop a node and start another
+    /// at the same address with the same or a different key. Returns its
+    /// outbound handler and its accepted inbound connections.
+    pub async fn create_mock_node_at_addr(
+        gateway: bool,
+        addr: SocketAddr,
+        keypair: TransportKeypair,
+        channels: Channels,
+    ) -> anyhow::Result<(
+        OutboundConnectionHandler<MockSocket>,
+        mpsc::Receiver<PeerConnection<MockSocket>>,
+    )> {
+        let socket = Arc::new(
+            MockSocket::new(
+                PacketDropPolicy::ReceiveAll,
+                PacketDelayPolicy::NoDelay,
+                addr,
+                channels,
+            )
+            .await,
+        );
+        Ok(OutboundConnectionHandler::new_test(
+            addr, socket, keypair, gateway,
+        )?)
+    }
+
     /// Create a mock (non-gateway) peer whose version-carrying-ack floor (#5161)
     /// is overridden, with a caller-chosen packet-drop policy.
     ///
