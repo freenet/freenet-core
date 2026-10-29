@@ -1236,10 +1236,12 @@ Liveness ("alive" = the endpoint driver has not ENDED; it does not mean
     the endpoint driver so it ends promptly. try_send and poll_writable do
     NOT short-circuit on the flag: healthy connections still send their
     CONNECTION_CLOSE, and a lasting send fault is hit once per live
-    connection. connect and QuicIncoming::establish race the handshake
-    against Down (an adapter panic mid-handshake ends the driver without
-    ending the connection) and drop the attempt and its permit; connect is
-    also refused while Down. On EVERY Down (a returned driver too) each
+    connection. An adapter panic mid-handshake ends the driver with an
+    error (skipping quinn's terminate), but dropping the driver drops the
+    second-to-last connection reference and quinn's ConnectionRef::drop
+    closes it, so connect/establish return an error and release the permit
+    (pinned by the a_panic_during_*_ends_the_handshake_* tests; no race
+    needed, a mutation that removed one left them green). On EVERY Down (a returned driver too) each
     connection's watcher closes it with DOWNGRADE, uncounted in
     quic_close_sent_* because its driver may be gone; that is what fails
     calls waiting on a driver that ended. Released closes nothing, and a

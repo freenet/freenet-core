@@ -677,8 +677,9 @@ impl QuicEndpoint {
     /// Connect to `addr`, which must present the raw public key of
     /// `expected` (the peer's transport key), and wait for the handshake.
     /// The peer's address is on the allow-set for the life of the
-    /// connection. Fails as `EndpointDown` if the endpoint is Down, or goes
-    /// Down during the handshake (the attempt is then dropped).
+    /// connection. Fails as `EndpointDown` (read through
+    /// [`Self::error_kind`]) if the endpoint is Down, or goes Down during the
+    /// handshake.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) async fn connect(
         &self,
@@ -699,15 +700,6 @@ impl QuicEndpoint {
         config: quinn::ClientConfig,
         peer: PeerKey,
     ) -> Result<QuicConnection, QuicConnectError> {
-        // Refused while the endpoint is down. After a death by a driver
-        // return quinn refuses it anyway; after a panic the socket adapter
-        // caught, quinn's endpoint driver may not have ended yet (it ends at
-        // its next receive).
-        if self.availability().get() == QuicAvailability::Down {
-            return Err(QuicConnectError::Connect(
-                quinn::ConnectError::EndpointStopping,
-            ));
-        }
         let permit = self
             .sources
             .allow(addr)
@@ -715,7 +707,7 @@ impl QuicEndpoint {
         let connecting = self
             .endpoint
             .connect_with(config, addr, config::SERVER_NAME)?;
-        let connection = until_down(connecting, self.availability()).await??;
+        let connection = connecting.await?;
         Ok(QuicConnection::new(
             connection,
             permit,
@@ -793,15 +785,19 @@ pub(crate) struct QuicIncoming {
 
 impl QuicIncoming {
     /// Complete the handshake. On failure the permit is dropped with it.
-    /// If the endpoint goes Down first, the attempt is dropped and this
-    /// returns `LocallyClosed`, which `QuicEndpoint::error_kind` reads as
-    /// `EndpointDown`.
+    ///
+    /// A socket-adapter panic during the handshake ends the connection's
+    /// driver with an error, which skips quinn's own terminate. The
+    /// handshake still ends: dropping the driver drops the second-to-last
+    /// reference to the connection, and quinn's `ConnectionRef::drop`
+    /// (quinn 0.11.12, `connection.rs:946`) then closes it implicitly, so
+    /// this returns `LocallyClosed` (read as `EndpointDown` through
+    /// `QuicEndpoint::error_kind`) and the permit goes with it. Pinned by
+    /// the `a_panic_during_*_ends_the_handshake_*` tests. `connect` ends the
+    /// same way.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) async fn establish(self) -> Result<QuicConnection, quinn::ConnectionError> {
-        let connecting = self.incoming.accept_with(self.config)?;
-        let connection = until_down(connecting, self.availability.clone())
-            .await
-            .map_err(|_| quinn::ConnectionError::LocallyClosed)??;
+        let connection = self.incoming.accept_with(self.config)?.await?;
         Ok(QuicConnection::new(
             connection,
             self.permit,
@@ -809,38 +805,6 @@ impl QuicIncoming {
             self.peer,
             self.availability,
         ))
-    }
-}
-
-/// The endpoint went Down while a handshake was in progress.
-#[derive(Debug)]
-struct HandshakeAbandoned;
-
-impl From<HandshakeAbandoned> for QuicConnectError {
-    fn from(_: HandshakeAbandoned) -> Self {
-        Self::Connect(quinn::ConnectError::EndpointStopping)
-    }
-}
-
-/// Await a handshake (`quinn::Connecting`) unless the endpoint goes Down
-/// first, which drops it (closing the attempt) and returns
-/// [`HandshakeAbandoned`]. A socket-adapter panic during the handshake ends
-/// the connection's driver without ending the connection, so without this
-/// the handshake would wait forever and keep its allow-set permit.
-async fn until_down<F: std::future::Future>(
-    handshake: F,
-    mut availability: QuicAvailabilityWatch,
-) -> Result<F::Output, HandshakeAbandoned> {
-    tokio::pin!(handshake);
-    tokio::select! {
-        done = &mut handshake => Ok(done),
-        seen = availability.not_up() => match seen {
-            QuicAvailability::Down => Err(HandshakeAbandoned),
-            // Released or Disabled: not a death, so finish the handshake.
-            QuicAvailability::Up | QuicAvailability::Released | QuicAvailability::Disabled => {
-                Ok(handshake.await)
-            }
-        },
     }
 }
 

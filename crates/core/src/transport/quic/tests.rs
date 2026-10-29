@@ -3125,9 +3125,12 @@ enum ConnectionFault {
 /// quinn CONNECTION driver makes (holding that connection's state lock):
 /// caught, the endpoint goes `Down`, and the panic is counted once. The
 /// adapter returns an I/O error, which ends the driver, so the fault is hit
-/// once and does not repeat on every transmit (returning `Ready(Ok)` from
-/// `poll_writable`, or `Ok` from `try_send`, would). Bounded by a count of
-/// adapter calls over 30 s of virtual time, not by the wall clock. The
+/// once. For write readiness the sends also return `WouldBlock`, the case
+/// where `Ready(Ok)` would loop: quinn then retries the transmit at once,
+/// polls write readiness again, and spins inside one poll while holding the
+/// connection's lock (the hook stops panicking after
+/// `WRITABLE_PANIC_LIMIT`, so the loop ends and the count shows it).
+/// Bounded by a count of adapter calls, not by the wall clock. The
 /// path's send fails as `EndpointDown` (the connection's watcher closes it
 /// on `Down`, which fails a call waiting on a driver that has ended).
 fn connection_driver_fault_is_caught_once(
@@ -3155,7 +3158,10 @@ fn connection_driver_fault_is_caught_once(
         };
         match fault {
             ConnectionFault::Send => pair.a.faults().panic_every_send(),
-            ConnectionFault::WriteReadiness => pair.a.faults().panic_every_writable(),
+            ConnectionFault::WriteReadiness => {
+                pair.a.faults().block_every_send();
+                pair.a.faults().panic_every_writable();
+            }
         }
         let path = Arc::new(path);
         let p = path.clone();
@@ -3269,56 +3275,52 @@ fn a_panic_unwinding_through_the_endpoint_driver_still_aborts() {
     );
 }
 
-/// The connect guard: once a socket-adapter panic turned the endpoint Down,
-/// connect is refused before quinn is asked, even though quinn's endpoint
-/// driver has not ended yet (it ends at its next receive). Nothing is sent:
-/// no new attempt reaches the wire.
+/// Once a socket-adapter panic turned the endpoint Down, a connect made at
+/// once (before the test lets virtual time pass) fails as `EndpointDown`
+/// and puts nothing on the wire: the adapter woke quinn's endpoint driver,
+/// which ended, so quinn refuses the attempt.
 #[test]
-fn connect_is_refused_while_down_before_the_endpoint_driver_ends() {
-    in_child(
-        "connect_is_refused_while_down_before_the_endpoint_driver_ends",
-        || {
-            bounded(|| async move {
-                use super::path::QuicPath;
-                use crate::transport::QuicErrorKind;
-                let _seed = GlobalRng::seed_guard(SEED);
-                let pair = pair(
-                    "quic-panic-connect-guard",
-                    "10.201.41.1:5000".parse().unwrap(),
-                    "10.201.41.2:5000".parse().unwrap(),
-                    None,
-                )
-                .await;
-                let (_, client, _server) =
-                    pair.transfer(payload(100), Duration::from_secs(60)).await;
-                let (path, _inbound) = QuicPath::new(client, pair.time.clone());
-                // One panic, in the existing connection's driver.
-                pair.a.faults().panic_next_writable();
-                let send = tokio::spawn(async move { path.send_short(b"boom").await });
-                while pair.a.availability().get() != QuicAvailability::Down {
-                    tokio::task::yield_now().await;
-                }
-                let sent_before = pair.sent().iter().filter(|d| d.from == pair.a_addr).count();
-                let refused = pair
-                    .a
-                    .connect(pair.b_addr, &pair.b_key())
-                    .await
-                    .expect_err("the endpoint is down");
-                assert_eq!(QuicErrorKind::from(refused), QuicErrorKind::EndpointDown);
-                let time = pair.time.clone();
-                drive(&pair.time, Duration::from_secs(10), async move {
-                    time.sleep(Duration::from_secs(5)).await;
-                })
-                .await;
-                let sent_after = pair.sent().iter().filter(|d| d.from == pair.a_addr).count();
-                assert_eq!(
-                    sent_after, sent_before,
-                    "the refused connect sent a datagram"
-                );
-                send.abort();
-            });
-        },
-    );
+fn connect_right_after_an_adapter_panic_is_refused() {
+    in_child("connect_right_after_an_adapter_panic_is_refused", || {
+        bounded(|| async move {
+            use super::path::QuicPath;
+            use crate::transport::QuicErrorKind;
+            let _seed = GlobalRng::seed_guard(SEED);
+            let pair = pair(
+                "quic-panic-connect-guard",
+                "10.201.41.1:5000".parse().unwrap(),
+                "10.201.41.2:5000".parse().unwrap(),
+                None,
+            )
+            .await;
+            let (_, client, _server) = pair.transfer(payload(100), Duration::from_secs(60)).await;
+            let (path, _inbound) = QuicPath::new(client, pair.time.clone());
+            // One panic, in the existing connection's driver.
+            pair.a.faults().panic_next_writable();
+            let send = tokio::spawn(async move { path.send_short(b"boom").await });
+            while pair.a.availability().get() != QuicAvailability::Down {
+                tokio::task::yield_now().await;
+            }
+            let sent_before = pair.sent().iter().filter(|d| d.from == pair.a_addr).count();
+            let refused = pair
+                .a
+                .connect(pair.b_addr, &pair.b_key())
+                .await
+                .expect_err("the endpoint is down");
+            assert_eq!(pair.a.error_kind(refused), QuicErrorKind::EndpointDown);
+            let time = pair.time.clone();
+            drive(&pair.time, Duration::from_secs(10), async move {
+                time.sleep(Duration::from_secs(5)).await;
+            })
+            .await;
+            let sent_after = pair.sent().iter().filter(|d| d.from == pair.a_addr).count();
+            assert_eq!(
+                sent_after, sent_before,
+                "the refused connect sent a datagram"
+            );
+            send.abort();
+        });
+    });
 }
 
 /// A socket-adapter panic during the CLIENT's handshake ends the new

@@ -79,6 +79,9 @@ pub(crate) struct SocketFaults {
     writable_panics: AtomicU64,
     /// Every send panics in the adapter's own code.
     panic_sends: AtomicBool,
+    /// Every send returns `WouldBlock`, as when the socket's buffer or the
+    /// egress cap is short.
+    block_sends: AtomicBool,
     /// Sends that reached the adapter's panicking hook.
     send_panics: AtomicU64,
 }
@@ -99,6 +102,10 @@ const WRITABLE_PANIC: u8 = 1;
 /// The next write-readiness poll panics in the adapter's own code, once.
 #[cfg(test)]
 const WRITABLE_PANIC_ONCE: u8 = 2;
+/// Panics of a lasting write-readiness fault after which its hook reports
+/// `Pending` instead (tests only; see `QuicPoller::poll_ready`).
+#[cfg(test)]
+const WRITABLE_PANIC_LIMIT: u64 = 1000;
 
 #[cfg(test)]
 impl SocketFaults {
@@ -147,6 +154,11 @@ impl SocketFaults {
     /// Panic in EVERY send from now on, in the adapter's own code.
     pub(crate) fn panic_every_send(&self) {
         self.panic_sends.store(true, Ordering::Release);
+    }
+
+    /// Make every send return `WouldBlock` from now on.
+    pub(crate) fn block_every_send(&self) {
+        self.block_sends.store(true, Ordering::Release);
     }
 
     /// Sends that panicked.
@@ -337,6 +349,10 @@ impl<S: Socket> QuicSocket<S> {
             self.faults.send_panics.fetch_add(1, Ordering::AcqRel);
             panic!("injected panic in the QUIC socket adapter (send)");
         }
+        #[cfg(test)]
+        if self.faults.block_sends.load(Ordering::Acquire) {
+            return Err(io::ErrorKind::WouldBlock.into());
+        }
         debug_assert!(
             transmit.segment_size.is_none(),
             "max_transmit_segments is 1, so quinn sends one datagram per transmit"
@@ -466,6 +482,13 @@ impl<S: Socket> QuicPoller<S> {
         let fault = self.socket.faults.writable.load(Ordering::Acquire);
         if fault == WRITABLE_PANIC_ONCE {
             self.socket.faults.writable.store(0, Ordering::Release);
+        }
+        // Past this many panics the hook reports Pending instead, so a test
+        // of a driver that loops on the fault ends and can count the loops.
+        if fault == WRITABLE_PANIC
+            && self.socket.faults.writable_panics.load(Ordering::Acquire) >= WRITABLE_PANIC_LIMIT
+        {
+            return Poll::Pending;
         }
         if fault == WRITABLE_PANIC || fault == WRITABLE_PANIC_ONCE {
             self.socket
