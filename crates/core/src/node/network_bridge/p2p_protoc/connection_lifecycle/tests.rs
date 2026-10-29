@@ -114,6 +114,21 @@ impl Harness {
 
     /// As [`Self::new`], with `adjust` applied to the node config first.
     async fn with_config(id: &str, adjust: impl FnOnce(&mut crate::node::NodeConfig)) -> Self {
+        Self::build(id, adjust, true).await
+    }
+
+    /// As [`Self::new`], with a ring that is not a gateway's, so a transient
+    /// connection is not promoted. The bridge is still built as a gateway's,
+    /// since it needs no configured remote gateway that way.
+    async fn with_non_gateway_ring(id: &str) -> Self {
+        Self::build(id, |_| {}, false).await
+    }
+
+    async fn build(
+        id: &str,
+        adjust: impl FnOnce(&mut crate::node::NodeConfig),
+        ring_is_gateway: bool,
+    ) -> Self {
         let config_args = crate::config::ConfigArgs {
             id: Some(id.to_string()),
             mode: Some(crate::contract::OperationMode::Local),
@@ -130,7 +145,9 @@ impl Harness {
         let (_notification_rx, notification_tx) = crate::node::event_loop_notification_channel();
         let (ops_ch_channel, _ch_channel, _wait_for_event) =
             crate::contract::contract_handler_channel();
+        node_config.is_gateway = ring_is_gateway;
         let connection_manager = crate::ring::ConnectionManager::new(&node_config);
+        node_config.is_gateway = true;
         let (result_router_tx, _result_router_rx) = mpsc::channel(100);
         let task_monitor = crate::node::background_task_monitor::BackgroundTaskMonitor::new();
         let op_manager = Arc::new(
@@ -436,6 +453,7 @@ fn is_set(kind: ConnIdentity) -> bool {
         | ConnIdentity::ChangedConnectPeer
         | ConnIdentity::ClaimHeld
         | ConnIdentity::QuietHolderReplaced
+        | ConnIdentity::CrossedHolderReplaced
         | ConnIdentity::OwnKey
         | ConnIdentity::DuplicateKey
         | ConnIdentity::TeardownKeyElsewhere
@@ -1851,7 +1869,7 @@ async fn connect_request_claim_of_a_key_held_by_a_dial_is_dropped() {
 /// One connection per key applies to dials too. An outbound dial for a key
 /// that a live claimed connection holds in the ring waits: it is not bound
 /// or promoted, so the ring keeps the key at one address. When the holder
-/// closes, the dial is bound as a dial and promoted.
+/// closes, the dial is bound (as a key bound after waiting) and promoted.
 #[tokio::test]
 async fn a_dial_waits_for_a_live_holder_of_its_key() {
     let mut h = Harness::new("conn-identity-dial-after-claim").await;
@@ -1877,7 +1895,7 @@ async fn a_dial_waits_for_a_live_holder_of_its_key() {
 
     h.transport_closed(claimed_at).await;
     assert_eq!(h.mgr.connections[&dialled_at].pub_key(), Some(&peer));
-    assert_eq!(bound_source(&h, dialled_at), Some(IdentitySource::Dialled));
+    assert_eq!(bound_source(&h, dialled_at), Some(IdentitySource::Claimed));
     assert_eq!(h.ring_addr_of(&peer), Some(dialled_at));
 }
 
@@ -2816,4 +2834,299 @@ fn shutdown_cleanup_uses_the_shared_gating() {
     let block = &source[at..at + 6000.min(source.len() - at)];
     assert!(block.contains("ctx.forget_peer_state_unless_in_ring("));
     assert!(!block.contains("on_ring_connection_lost("));
+}
+
+/// A key generated so that it orders above (`above`) or below this node's
+/// own key.
+fn key_ordered(h: &Harness, above: bool) -> TransportPublicKey {
+    let own = h.own_key();
+    loop {
+        let candidate = key();
+        if (candidate > own) == above {
+            return candidate;
+        }
+    }
+}
+
+/// Move the time the connection at `addr` was established to `ago` before
+/// now.
+fn established_ago(h: &mut Harness, addr: SocketAddr, ago: Duration) {
+    h.mgr.connections.get_mut(&addr).unwrap().created_at = Instant::now()
+        .checked_sub(ago)
+        .expect("uptime covers the test");
+}
+
+/// A connection waiting for a key keeps that key: a ConnectRequest on it
+/// naming another key is a mismatch and closes it, as for a bound one.
+#[tokio::test]
+async fn a_waiting_connection_keeps_its_key_against_a_connect_request() {
+    let mut h = Harness::new("conn-identity-waiting-request").await;
+    let holder: SocketAddr = "198.51.100.40:6001".parse().unwrap();
+    let waiting: SocketAddr = "198.51.100.40:6002".parse().unwrap();
+    h.watch(&[waiting]);
+    let (peer, other) = (key(), key());
+
+    h.dial(holder, &peer).await;
+    h.accept_expected(waiting, &peer).await;
+    assert_eq!(h.pending_on(waiting), Some(true));
+    h.refused_connect_request(waiting, PeerKeyLocation::with_unknown_addr(other.clone()))
+        .await;
+
+    assert!(!h.mgr.connections.contains_key(&waiting), "closed");
+    assert!(seen(waiting).contains(&ConnIdentity::ChangedConnectRequest));
+    assert!(!h.mgr.addr_by_pub_key.contains_key(&other));
+    assert_eq!(h.mgr.addr_by_pub_key.get(&peer), Some(&holder));
+}
+
+/// A connection waiting for a key keeps that key: a ConnectPeer naming
+/// another key for it is refused and promotes nothing.
+#[tokio::test]
+async fn a_waiting_connection_keeps_its_key_against_a_connect_peer() {
+    let mut h = Harness::new("conn-identity-waiting-peer").await;
+    let holder: SocketAddr = "198.51.100.41:6001".parse().unwrap();
+    let waiting: SocketAddr = "198.51.100.41:6002".parse().unwrap();
+    h.watch(&[waiting]);
+    let (peer, other) = (key(), key());
+
+    h.dial(holder, &peer).await;
+    h.accept_expected(waiting, &peer).await;
+    let ring_before = h_count(&h);
+    assert!(
+        !h.try_connect_peer(PeerKeyLocation::new(other.clone(), waiting))
+            .await,
+        "refused"
+    );
+
+    assert_eq!(h.ring_key_at(waiting), None);
+    assert_eq!(h_count(&h), ring_before);
+    assert_eq!(
+        h.pending_on(waiting),
+        Some(true),
+        "still waiting for its key"
+    );
+    assert_eq!(h.mgr.connections[&waiting].pub_key(), None);
+    assert!(seen(waiting).contains(&ConnIdentity::ChangedConnectPeer));
+    assert_eq!(h.ring_addr_of(&other), None);
+}
+
+/// A dial held back by a live holder releases the reservation the connect op
+/// made for it.
+#[tokio::test]
+async fn a_held_dial_releases_its_reservation() {
+    let mut h = Harness::new("conn-identity-held-dial-reservation").await;
+    let holder: SocketAddr = "198.51.100.42:6001".parse().unwrap();
+    let dialled: SocketAddr = "198.51.100.42:6002".parse().unwrap();
+    let peer = key();
+
+    h.dial(holder, &peer).await;
+    let connection_manager = &h.mgr.bridge.op_manager.ring.connection_manager;
+    assert!(connection_manager.should_accept(Location::from_address(&dialled), dialled));
+    assert_eq!(
+        connection_manager.get_reserved_connections(),
+        1,
+        "premise: reserved"
+    );
+    h.dial(dialled, &peer).await;
+
+    assert_eq!(h.pending_on(dialled), Some(true));
+    assert_eq!(
+        h.mgr
+            .bridge
+            .op_manager
+            .ring
+            .connection_manager
+            .get_reserved_connections(),
+        0
+    );
+}
+
+/// A dial whose key is held by a quiet connection replaces it and is promoted
+/// in its place, which takes up the reservation.
+#[tokio::test]
+async fn a_dial_replacing_a_quiet_holder_leaves_no_reservation() {
+    let mut h = Harness::new("conn-identity-quiet-dial-reservation").await;
+    let holder: SocketAddr = "198.51.100.43:6001".parse().unwrap();
+    let dialled: SocketAddr = "198.51.100.43:6002".parse().unwrap();
+    let peer = key();
+
+    let clock = h.dial_with_receipt(holder, &peer).await;
+    clock.go_quiet(identity::HOLD_WINDOW + Duration::from_secs(1));
+    let connection_manager = &h.mgr.bridge.op_manager.ring.connection_manager;
+    assert!(connection_manager.should_accept(Location::from_address(&dialled), dialled));
+    h.dial(dialled, &peer).await;
+
+    assert!(!h.mgr.connections.contains_key(&holder), "replaced");
+    assert_eq!(h.ring_addr_of(&peer), Some(dialled));
+    assert_eq!(
+        h.mgr
+            .bridge
+            .op_manager
+            .ring
+            .connection_manager
+            .get_reserved_connections(),
+        0
+    );
+}
+
+/// A transient dial left out of the ring for being transient, with no other
+/// connection holding its key, keeps its reservation.
+#[tokio::test]
+async fn a_transient_dial_keeps_its_reservation() {
+    // Not a gateway: a gateway promotes a transient connection anyway.
+    let mut h = Harness::with_non_gateway_ring("conn-identity-transient-reservation").await;
+    let dialled: SocketAddr = "198.51.100.44:6001".parse().unwrap();
+    let peer = key();
+
+    let connection_manager = &h.mgr.bridge.op_manager.ring.connection_manager;
+    assert!(connection_manager.should_accept(Location::from_address(&dialled), dialled));
+    h.establish(
+        dialled,
+        Some(PeerKeyLocation::new(peer.clone(), dialled)),
+        true,
+    )
+    .await;
+
+    assert_eq!(h.mgr.connections[&dialled].pub_key(), Some(&peer));
+    assert_eq!(h.ring_key_at(dialled), None, "premise: not promoted");
+    assert_eq!(
+        h.mgr
+            .bridge
+            .op_manager
+            .ring
+            .connection_manager
+            .get_reserved_connections(),
+        1
+    );
+}
+
+/// Two sessions with one peer established at nearly the same time, the
+/// second waiting on the first, both heard from. On the side whose key
+/// orders above the peer's, the retry replaces the holder once the claim has
+/// waited `CROSSED_CLAIM_WAIT`, and the claim takes its ring place. Checked
+/// with the holder established first and with the claimant established
+/// first.
+#[tokio::test]
+async fn a_crossed_claim_replaces_the_live_holder_on_one_side() {
+    for (round, claimant_first) in [false, true].into_iter().enumerate() {
+        let mut h = Harness::new(&format!("conn-identity-crossed-{round}")).await;
+        let holder: SocketAddr = format!("198.51.100.45:{}", 6001 + 10 * round)
+            .parse()
+            .unwrap();
+        let claimant: SocketAddr = format!("198.51.100.45:{}", 6002 + 10 * round)
+            .parse()
+            .unwrap();
+        h.watch(&[holder, claimant]);
+        let peer = key_ordered(&h, false);
+
+        if claimant_first {
+            h.accept(claimant).await;
+            let _clock = h.dial_with_receipt(holder, &peer).await;
+            h.refused_connect_request(claimant, PeerKeyLocation::with_unknown_addr(peer.clone()))
+                .await;
+            // The ConnectRequest does not promote; a ConnectPeer would.
+            assert_eq!(h.pending_on(claimant), Some(false));
+        } else {
+            let _clock = h.dial_with_receipt(holder, &peer).await;
+            h.accept_expected(claimant, &peer).await;
+            assert_eq!(h.pending_on(claimant), Some(true));
+        }
+        let waited = identity::CROSSED_CLAIM_WAIT + Duration::from_secs(1);
+        let (first, second) = if claimant_first {
+            (claimant, holder)
+        } else {
+            (holder, claimant)
+        };
+        established_ago(&mut h, first, waited + Duration::from_secs(2));
+        established_ago(&mut h, second, waited);
+        let handshake = h.handshake.clone();
+
+        h.mgr.retry_pending_claims(&handshake).await;
+        assert!(
+            !h.mgr.connections.contains_key(&holder),
+            "round {round}: replaced"
+        );
+        assert!(seen(holder).contains(&ConnIdentity::CrossedHolderReplaced));
+        assert_eq!(h.mgr.connections[&claimant].pub_key(), Some(&peer));
+        assert_eq!(
+            h.ring_addr_of(&peer),
+            Some(claimant),
+            "round {round}: takes the ring place"
+        );
+    }
+}
+
+/// The side whose key orders below the peer's never replaces a live holder,
+/// however long the claim waits: the other side does.
+#[tokio::test]
+async fn a_crossed_claim_waits_on_the_other_side() {
+    let mut h = Harness::new("conn-identity-crossed-other-side").await;
+    let holder: SocketAddr = "198.51.100.46:6001".parse().unwrap();
+    let claimant: SocketAddr = "198.51.100.46:6002".parse().unwrap();
+    h.watch(&[holder]);
+    let peer = key_ordered(&h, true);
+
+    let _clock = h.dial_with_receipt(holder, &peer).await;
+    h.accept_expected(claimant, &peer).await;
+    let waited = identity::CROSSED_CLAIM_WAIT * 4;
+    established_ago(&mut h, holder, waited);
+    established_ago(&mut h, claimant, waited);
+    let handshake = h.handshake.clone();
+    h.mgr.retry_pending_claims(&handshake).await;
+
+    assert_eq!(h.ring_addr_of(&peer), Some(holder));
+    assert_eq!(h.pending_on(claimant), Some(true));
+    assert!(!seen(holder).contains(&ConnIdentity::CrossedHolderReplaced));
+}
+
+/// After a crossed replacement, the peer's session reconnecting is not
+/// established near the new holder, so it waits and never replaces it: the
+/// replacement happens at most once per racing pair.
+#[tokio::test]
+async fn a_reconnect_after_a_crossed_replacement_does_not_replace_again() {
+    let mut h = Harness::new("conn-identity-crossed-no-flap").await;
+    let holder: SocketAddr = "198.51.100.47:6001".parse().unwrap();
+    let claimant: SocketAddr = "198.51.100.47:6002".parse().unwrap();
+    let reconnect: SocketAddr = "198.51.100.47:6003".parse().unwrap();
+    h.watch(&[claimant]);
+    let peer = key_ordered(&h, false);
+
+    let _clock = h.dial_with_receipt(holder, &peer).await;
+    h.accept_expected(claimant, &peer).await;
+    let cap = identity::CROSSED_CLAIM_WAIT;
+    established_ago(&mut h, holder, cap * 3);
+    established_ago(&mut h, claimant, cap * 3);
+    let handshake = h.handshake.clone();
+    h.mgr.retry_pending_claims(&handshake).await;
+    assert_eq!(h.ring_addr_of(&peer), Some(claimant), "premise: replaced");
+
+    // The old session reconnects after the replacement and waits as long as
+    // it likes.
+    h.accept_expected(reconnect, &peer).await;
+    established_ago(&mut h, reconnect, cap * 2);
+    h.mgr.retry_pending_claims(&handshake).await;
+
+    assert_eq!(h.ring_addr_of(&peer), Some(claimant));
+    assert_eq!(h.pending_on(reconnect), Some(true));
+    assert!(!seen(claimant).contains(&ConnIdentity::CrossedHolderReplaced));
+}
+
+/// A ConnectRequest giving the connection's own address counts
+/// `connect_request_known_addr` when it replaces a quiet holder, as on every
+/// other outcome.
+#[tokio::test]
+async fn connect_request_replacing_a_quiet_holder_counts_known_addr() {
+    let mut h = Harness::new("conn-identity-request-quiet-known").await;
+    let old: SocketAddr = "198.51.100.48:6001".parse().unwrap();
+    let new: SocketAddr = "198.51.100.48:6002".parse().unwrap();
+    h.watch(&[new]);
+    let peer = key();
+
+    let clock = h.dial_with_receipt(old, &peer).await;
+    h.accept(new).await;
+    clock.go_quiet(identity::HOLD_WINDOW + Duration::from_secs(1));
+    h.connect_request(new, PeerKeyLocation::new(peer.clone(), new))
+        .await;
+
+    assert!(!h.mgr.connections.contains_key(&old), "premise: replaced");
+    assert!(seen(new).contains(&ConnIdentity::ConnectRequestKnownAddr));
 }

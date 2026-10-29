@@ -138,12 +138,12 @@ labelled_counters! {
         /// A ConnectRequest named the key the connection already had.
         SameConnectRequest => "same_connect_request",
         /// A ConnectRequest named a key other than the one the connection is
-        /// bound to. The connection keeps its key: the request is dropped
-        /// and the connection closed.
+        /// bound to or waiting for. The connection keeps its key: the request
+        /// is dropped and the connection closed.
         ChangedConnectRequest => "changed_connect_request",
-        /// A ConnectRequest counted by one of the three kinds above, or by
-        /// `claim_held`, gave the joiner a known address equal to the
-        /// connection's remote address, rather than an unknown one.
+        /// A ConnectRequest on an open connection gave the joiner a known
+        /// address equal to the connection's remote address, rather than an
+        /// unknown one, whatever the binding outcome.
         ConnectRequestKnownAddr => "connect_request_known_addr",
         /// A ConnectPeer for an existing connection gave the key of a
         /// connection that had none.
@@ -151,8 +151,8 @@ labelled_counters! {
         /// A ConnectPeer for an existing connection named the key it had.
         SameConnectPeer => "same_connect_peer",
         /// A ConnectPeer for an existing connection named a key other than the
-        /// one it is bound to. The connection keeps its key and is not
-        /// promoted; the connect op is told the connection failed.
+        /// one it is bound to or waiting for. The connection keeps its key and
+        /// is not promoted; the connect op is told the connection failed.
         ChangedConnectPeer => "changed_connect_peer",
         /// An attempt to bind a key to a connection (a dial, an
         /// expected-inbound match or a ConnectRequest) was refused because
@@ -166,12 +166,20 @@ labelled_counters! {
         ClaimHeld => "claim_held",
         /// A claim held back by `claim_held` was bound later, on the
         /// connection that made it, after the connection holding its key
-        /// closed (on its own, or replaced: `quiet_holder_replaced`).
+        /// closed (on its own, or replaced: `quiet_holder_replaced`,
+        /// `crossed_holder_replaced`).
         PendingClaimBound => "pending_claim_bound",
         /// A connection bound to a key that a newer connection claimed had not
         /// been heard from within 30 s, and was closed so the claim could be
         /// bound. Counted on the closed connection.
         QuietHolderReplaced => "quiet_holder_replaced",
+        /// A connection bound to a key, and still heard from, was closed so
+        /// that a claim of the key waiting on another connection could be
+        /// bound: the two connections were established within
+        /// `identity::HOLD_WINDOW` of each other, the claim had waited
+        /// `identity::CROSSED_CLAIM_WAIT`, and this node's key orders above
+        /// the peer's, so only one side of the pair does this.
+        CrossedHolderReplaced => "crossed_holder_replaced",
         /// A connection was bound to this node's own key, on any path.
         OwnKey => "own_key",
         /// A key was bound to a connection while another open connection was
@@ -184,15 +192,16 @@ labelled_counters! {
         /// state. Counted on transport close, on an explicit drop, on the
         /// unpromoted-connection sweep and when a new connection at the same
         /// address replaces the entry; not on the cleanup when the event loop
-        /// shuts down.
+        /// shuts down. Not expected to be recorded: a key is bound to one
+        /// connection at a time, and the map points at it.
         TeardownKeyElsewhere => "teardown_key_elsewhere",
         /// Cleanup, on the same paths, ran for a connection with no bound
         /// key, so no per-peer cleanup ran for it.
         TeardownUnidentified => "teardown_unidentified",
         /// Cleanup, on the same paths, ran for a connection whose key is not
-        /// mapped to any connection. Expected to stay at zero, since the map
-        /// holds every bound key; the cleanup then moves the key to another
-        /// connection bound to it, or, with none, runs the per-peer cleanup.
+        /// mapped to any connection. Not expected to be recorded, since the
+        /// map holds every bound key; the cleanup then runs the per-peer
+        /// cleanup unless the key is in the ring at another address.
         TeardownKeyUnmapped => "teardown_key_unmapped",
     }
 }
@@ -2179,6 +2188,9 @@ impl TransportMetrics {
             conn_identity_quiet_holder_replaced: get32(
                 &identity[ConnIdentity::QuietHolderReplaced as usize],
             ),
+            conn_identity_crossed_holder_replaced: get32(
+                &identity[ConnIdentity::CrossedHolderReplaced as usize],
+            ),
             conn_identity_own_key: get32(&identity[ConnIdentity::OwnKey as usize]),
             conn_identity_duplicate_key: get32(&identity[ConnIdentity::DuplicateKey as usize]),
             conn_identity_teardown_key_elsewhere: get32(
@@ -2682,6 +2694,7 @@ pub struct TransportSnapshot {
     pub conn_identity_claim_held: u32,
     pub conn_identity_pending_claim_bound: u32,
     pub conn_identity_quiet_holder_replaced: u32,
+    pub conn_identity_crossed_holder_replaced: u32,
     pub conn_identity_own_key: u32,
     pub conn_identity_duplicate_key: u32,
     pub conn_identity_teardown_key_elsewhere: u32,
@@ -2758,6 +2771,7 @@ impl TransportSnapshot {
             ConnIdentity::ClaimHeld => self.conn_identity_claim_held,
             ConnIdentity::PendingClaimBound => self.conn_identity_pending_claim_bound,
             ConnIdentity::QuietHolderReplaced => self.conn_identity_quiet_holder_replaced,
+            ConnIdentity::CrossedHolderReplaced => self.conn_identity_crossed_holder_replaced,
             ConnIdentity::OwnKey => self.conn_identity_own_key,
             ConnIdentity::DuplicateKey => self.conn_identity_duplicate_key,
             ConnIdentity::TeardownKeyElsewhere => self.conn_identity_teardown_key_elsewhere,
@@ -2952,6 +2966,7 @@ impl TransportSnapshot {
             conn_identity_claim_held,
             conn_identity_pending_claim_bound,
             conn_identity_quiet_holder_replaced,
+            conn_identity_crossed_holder_replaced,
             conn_identity_own_key,
             conn_identity_duplicate_key,
             conn_identity_teardown_key_elsewhere,
@@ -3065,6 +3080,7 @@ impl TransportSnapshot {
         self.conn_identity_claim_held = conn_identity_claim_held;
         self.conn_identity_pending_claim_bound = conn_identity_pending_claim_bound;
         self.conn_identity_quiet_holder_replaced = conn_identity_quiet_holder_replaced;
+        self.conn_identity_crossed_holder_replaced = conn_identity_crossed_holder_replaced;
         self.conn_identity_own_key = conn_identity_own_key;
         self.conn_identity_duplicate_key = conn_identity_duplicate_key;
         self.conn_identity_teardown_key_elsewhere = conn_identity_teardown_key_elsewhere;
@@ -3265,6 +3281,7 @@ struct SnapshotExtras {
     pub conn_identity_claim_held: u32,
     pub conn_identity_pending_claim_bound: u32,
     pub conn_identity_quiet_holder_replaced: u32,
+    pub conn_identity_crossed_holder_replaced: u32,
     pub conn_identity_own_key: u32,
     pub conn_identity_duplicate_key: u32,
     pub conn_identity_teardown_key_elsewhere: u32,
@@ -3368,6 +3385,7 @@ impl SnapshotExtras {
             || self.conn_identity_claim_held != 0
             || self.conn_identity_pending_claim_bound != 0
             || self.conn_identity_quiet_holder_replaced != 0
+            || self.conn_identity_crossed_holder_replaced != 0
             || self.conn_identity_own_key != 0
             || self.conn_identity_duplicate_key != 0
             || self.conn_identity_teardown_key_elsewhere != 0
@@ -5388,6 +5406,7 @@ mod tests {
             "conn_identity_claim_held",
             "conn_identity_pending_claim_bound",
             "conn_identity_quiet_holder_replaced",
+            "conn_identity_crossed_holder_replaced",
             "conn_identity_own_key",
             "conn_identity_duplicate_key",
             "conn_identity_teardown_key_elsewhere",

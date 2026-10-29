@@ -8640,6 +8640,14 @@ async fn test_connection_growth_stall_regression() {
     use freenet::dev_tool::NodeLabel;
     use freenet::simulation::FaultConfig;
 
+    // The identity totals asserted at the end are process-wide, and under
+    // plain `cargo test` the other simulations in this binary would run in
+    // the same process and add to them. Run this one alone in a child
+    // process, so the totals are its own.
+    if run_alone_in_child_process("test_connection_growth_stall_regression") {
+        return;
+    }
+
     const SEED: u64 = 0x3408_3398_0001;
     const NETWORK_NAME: &str = "connection-growth-stall";
     let identity_before: std::collections::BTreeMap<_, _> =
@@ -8844,16 +8852,13 @@ async fn test_connection_growth_stall_regression() {
 
     // Connection identity tripwire: through formation and 20% message loss,
     // no connection is closed or refused for naming a key other than the one
-    // it is bound to, and none is bound to a node's own key. A delta over
-    // this test's run of process-wide totals: under plain `cargo test` the
-    // other simulations in this binary run in the same process and add to
-    // them. So only kinds that no simulation produces are held at zero; kinds
-    // that crash, restart and churn simulations can produce
-    // (`duplicate_key`, `claim_held`, `quiet_holder_replaced`; keepalive
-    // is off under virtual time, so idle dials there look quiet) are not
-    // asserted here. This guards against a regression in ordinary formation;
-    // it is not evidence that the refusals work, which the lifecycle unit
-    // tests cover.
+    // it is bound to or waiting for, and none is bound to a node's own key.
+    // The totals are this simulation's alone, since it runs in a child
+    // process (see the top of the test). `claim_held` and the replacement
+    // kinds are not asserted: keepalive is off under virtual time, so idle
+    // connections there look quiet. This guards against a regression in
+    // ordinary formation; it is not evidence that the refusals work, which
+    // the lifecycle unit tests cover.
     let after: std::collections::BTreeMap<_, _> = freenet::dev_tool::conn_identity_totals()
         .into_iter()
         .collect();
@@ -8870,6 +8875,36 @@ async fn test_connection_growth_stall_regression() {
             "{kind}: before {identity_before:?}, after {after:?}"
         );
     }
+}
+
+/// Run the test `name` alone in a child process of this test binary, and
+/// return `true` in the parent once the child has passed it. Returns `false`
+/// in the child, which then runs the test body. Fails if the child did not
+/// run exactly that one test, so a rename cannot turn the test into a pass
+/// that runs nothing.
+///
+/// Like any test that re-runs `current_exe()`, it fails with `NotFound` if a
+/// concurrent `cargo` build replaces the test binary while it runs.
+fn run_alone_in_child_process(name: &str) -> bool {
+    const IN_CHILD: &str = "FREENET_SIM_TEST_IN_CHILD";
+    if std::env::var_os(IN_CHILD).is_some() {
+        return false;
+    }
+    let exe = std::env::current_exe().expect("the test binary");
+    let output = std::process::Command::new(exe)
+        .args(["--exact", name, "--nocapture", "--test-threads=1"])
+        .env(IN_CHILD, "1")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("spawn the test binary");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success() && stdout.contains("test result: ok. 1 passed"),
+        "the child run of {name} failed or did not run it ({}):\n--- stdout\n{stdout}\n--- stderr\n{stderr}",
+        output.status
+    );
+    true
 }
 
 // =============================================================================

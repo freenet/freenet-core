@@ -539,8 +539,8 @@ struct ConnectionEntry {
     /// (through `P2pConnManager::bind_identity`).
     identity: identity::IdentitySlot,
     /// When the transport last received an authenticated packet on this
-    /// connection, if it reports it. A dialled identity holds its key
-    /// against a claim only while this is recent (`identity::HOLD_WINDOW`).
+    /// connection, if it reports it. A bound connection holds its key against
+    /// a newer connection only while this is recent (`identity::HOLD_WINDOW`).
     receipt: Option<crate::transport::ReceiptStamp>,
     /// Unique ID for this connection entry. Used to distinguish stale
     /// TransportClosed events from replaced connections (e.g., a new

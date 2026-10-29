@@ -13,10 +13,13 @@
 //! - One connection per key. A key is not bound to a connection while
 //!   another open connection is bound to it, whether the new one was dialled
 //!   or claimed and however the holder was bound. The new connection can be
-//!   kept waiting, as a pending claim. A holder that has not been heard from
-//!   within [`HOLD_WINDOW`] is closed by the caller
-//!   ([`BindOutcome::HeldByQuiet`]); when the holder closes, the newest
-//!   pending claim of the key is bound.
+//!   kept waiting, as a pending claim, and keeps the key it waits for: a
+//!   later attempt to bind another key to it is a mismatch. A holder that
+//!   has not been heard from within [`HOLD_WINDOW`] is closed by the caller
+//!   ([`BindOutcome::HeldByQuiet`]), and so is a holder that a claim has
+//!   waited on for [`CROSSED_CLAIM_WAIT`] when [`gives_way_to_claim`] says
+//!   so; when the holder closes, the newest pending claim of the key is
+//!   bound.
 //! - The index maps each bound key to the one connection bound to it.
 
 use std::collections::BTreeMap;
@@ -36,7 +39,8 @@ pub(super) enum IdentitySource {
     /// expected-inbound registration carried for an inbound connection
     /// matched to it by address, the joiner key of the peer's own first
     /// ConnectRequest, or the key a ConnectPeer named for a connection that
-    /// had none.
+    /// had none. Also any key bound after waiting for another connection to
+    /// release it, whatever started the wait.
     Claimed,
 }
 
@@ -50,8 +54,6 @@ pub(super) struct PendingClaim {
     /// ring (a dial, an expected-inbound match, or a ConnectPeer; a
     /// ConnectRequest does not promote).
     pub(super) promote: bool,
-    /// How the key will be bound: dialled if any attempt was a dial.
-    pub(super) source: IdentitySource,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -132,8 +134,8 @@ pub(super) enum BindOutcome {
     Bound,
     /// The connection was already bound to the key. Nothing changed.
     Same,
-    /// The connection is bound to another key, which it keeps. Nothing
-    /// changed.
+    /// The connection is bound to another key, or waiting for another key,
+    /// which it keeps. Nothing changed.
     Mismatch(TransportPublicKey),
     /// The key is bound to a connection at another address that was heard
     /// from within [`HOLD_WINDOW`]. The connection stays without an identity
@@ -208,6 +210,12 @@ pub(super) fn check(
             BindOutcome::Mismatch(bound.clone())
         };
     }
+    // A waiting connection keeps the key it waits for.
+    if let Some(claim) = entry.identity.pending() {
+        if claim.key != *key {
+            return BindOutcome::Mismatch(claim.key.clone());
+        }
+    }
     match key_holder(connections, Some(addr), key) {
         Some((holder, true)) => BindOutcome::Held(holder),
         Some((holder, false)) => BindOutcome::HeldByQuiet(holder),
@@ -219,8 +227,8 @@ pub(super) fn check(
 /// decides. On [`BindOutcome::Held`] or [`BindOutcome::HeldByQuiet`],
 /// `pending` decides whether the connection is kept waiting for the key:
 /// `Some(promote)` keeps it (see [`PendingClaim::promote`]; a claim already
-/// pending for the same key keeps `promote` if either says so, and becomes a
-/// dial if either was one), `None` leaves the connection as it was.
+/// pending for the same key keeps `promote` if either says so), `None`
+/// leaves the connection as it was.
 pub(super) fn bind(
     connections: &mut BTreeMap<SocketAddr, ConnectionEntry>,
     index: &mut KeyIndex,
@@ -243,18 +251,13 @@ pub(super) fn bind(
         }
         BindOutcome::Held(_) | BindOutcome::HeldByQuiet(_) => {
             if let Some(promote) = pending {
-                let earlier = entry.identity.pending().filter(|claim| claim.key == *key);
-                let promote = promote || earlier.is_some_and(|claim| claim.promote);
-                let source = if earlier.is_some_and(|claim| claim.source == IdentitySource::Dialled)
-                {
-                    IdentitySource::Dialled
-                } else {
-                    source
-                };
+                // `check` returned no mismatch, so any earlier claim is of
+                // this key.
+                let promote =
+                    promote || entry.identity.pending().is_some_and(|claim| claim.promote);
                 entry.identity.0 = State::Pending(PendingClaim {
                     key: key.clone(),
                     promote,
-                    source,
                 });
                 index.1 = true;
             }
@@ -318,6 +321,47 @@ pub(super) fn pending_claimant(
         })
         .max_by_key(|(id, _, _)| *id)
         .map(|(_, addr, claim)| (addr, claim))
+}
+
+/// How long a claim waits on a holder that is still heard from before
+/// [`gives_way_to_claim`] can let it replace the holder.
+pub(super) const CROSSED_CLAIM_WAIT: std::time::Duration =
+    std::time::Duration::from_secs(3 * HOLD_WINDOW.as_secs());
+
+/// Whether the live `holder` of `peer_key` should be closed so that the
+/// pending claim on `claimant` can be bound in its place.
+///
+/// Two sessions with one peer that are established at nearly the same time
+/// can end up crossed: each side binds the one the other keeps waiting, so
+/// neither side's peer state follows the session the other uses, and both
+/// sessions stay heard from, so neither is replaced as quiet. This resolves
+/// that case and only that one. It holds when:
+/// - the two connections were established within [`HOLD_WINDOW`] of each
+///   other, which a later reconnect never is, so a peer whose second session
+///   is replaced this way and that reconnects is not replaced again;
+/// - the claim has waited [`CROSSED_CLAIM_WAIT`] since its connection was
+///   established;
+/// - `own_key` orders above `peer_key`, so only one side of the pair gives
+///   way, and both end on the session the other side bound.
+pub(super) fn gives_way_to_claim(
+    connections: &BTreeMap<SocketAddr, ConnectionEntry>,
+    holder: SocketAddr,
+    claimant: SocketAddr,
+    own_key: &TransportPublicKey,
+    peer_key: &TransportPublicKey,
+    now: tokio::time::Instant,
+) -> bool {
+    let (Some(held), Some(waiting)) = (connections.get(&holder), connections.get(&claimant)) else {
+        return false;
+    };
+    let apart = if held.created_at > waiting.created_at {
+        held.created_at - waiting.created_at
+    } else {
+        waiting.created_at - held.created_at
+    };
+    own_key > peer_key
+        && apart <= HOLD_WINDOW
+        && now.saturating_duration_since(waiting.created_at) >= CROSSED_CLAIM_WAIT
 }
 
 /// Mark the newest pending claim of `key` as promoting: it takes the ring
@@ -511,7 +555,6 @@ mod tests {
                     Some(&PendingClaim {
                         key: k.clone(),
                         promote: false,
-                        source: new_source,
                     })
                 );
                 assert_eq!(t.index.get(&k), Some(&addr(1)));
@@ -520,7 +563,7 @@ mod tests {
     }
 
     #[test]
-    fn a_pending_claim_keeps_promote_and_a_dial_if_either_attempt_had_it() {
+    fn a_pending_claim_keeps_promote_if_either_attempt_had_it() {
         let mut t = Table::new();
         let k = key();
         t.open(addr(1), None);
@@ -528,9 +571,102 @@ mod tests {
         t.open(addr(2), None);
         t.bind(addr(2), &k, IdentitySource::Dialled, Some(true));
         t.bind(addr(2), &k, IdentitySource::Claimed, Some(false));
-        let claim = t.connections[&addr(2)].identity.pending().unwrap();
-        assert!(claim.promote);
-        assert_eq!(claim.source, IdentitySource::Dialled);
+        assert!(t.connections[&addr(2)].identity.pending().unwrap().promote);
+    }
+
+    /// A waiting connection keeps the key it waits for: binding another key
+    /// to it is a mismatch, kept or not, and leaves the claim as it was.
+    #[test]
+    fn a_waiting_connection_keeps_the_key_it_waits_for() {
+        let mut t = Table::new();
+        let (k, other) = (key(), key());
+        t.open(addr(1), None);
+        t.bind(addr(1), &k, IdentitySource::Dialled, None);
+        t.open(addr(2), None);
+        t.bind(addr(2), &k, IdentitySource::Claimed, Some(true));
+        for pending in [None, Some(false), Some(true)] {
+            for source in [IdentitySource::Dialled, IdentitySource::Claimed] {
+                assert_eq!(
+                    t.bind(addr(2), &other, source, pending),
+                    BindOutcome::Mismatch(k.clone())
+                );
+            }
+        }
+        assert_eq!(
+            check(&t.connections, addr(2), &other),
+            BindOutcome::Mismatch(k.clone())
+        );
+        assert_eq!(
+            t.connections[&addr(2)].identity.pending(),
+            Some(&PendingClaim {
+                key: k.clone(),
+                promote: true
+            })
+        );
+        assert_eq!(t.connections[&addr(2)].identity.key(), None);
+        assert!(!t.index.contains_key(&other));
+    }
+
+    /// A live holder gives way to a waiting claim only when the two
+    /// connections were established within one window of each other, the
+    /// claim has waited `CROSSED_CLAIM_WAIT`, and this node's key orders
+    /// above the peer's.
+    #[test]
+    fn a_live_holder_gives_way_only_to_a_crossed_claim_on_one_side() {
+        let (a, b) = (key(), key());
+        let (low, high) = if a < b { (a, b) } else { (b, a) };
+        let mut t = Table::new();
+        t.open(addr(1), None);
+        t.open(addr(2), None);
+        let start = t.connections[&addr(1)].created_at;
+        let set_created = |t: &mut Table, at, offset| {
+            t.connections.get_mut(&at).unwrap().created_at = start + offset;
+        };
+        let gives_way = |t: &Table, own: &TransportPublicKey, peer: &TransportPublicKey, now| {
+            gives_way_to_claim(&t.connections, addr(1), addr(2), own, peer, now)
+        };
+        let window = HOLD_WINDOW;
+        set_created(&mut t, addr(2), window);
+        let due = start + window + CROSSED_CLAIM_WAIT;
+        assert!(gives_way(&t, &high, &low, due), "this side gives way");
+        assert!(
+            !gives_way(&t, &low, &high, due),
+            "the other side never does"
+        );
+        assert!(!gives_way(&t, &high, &high, due), "not to its own key");
+        assert!(
+            !gives_way(&t, &high, &low, due - std::time::Duration::from_millis(1)),
+            "not before the claim has waited"
+        );
+        // The holder established later than the claimant counts the same.
+        set_created(&mut t, addr(1), window * 2);
+        set_created(&mut t, addr(2), window);
+        assert!(gives_way(&t, &high, &low, due));
+        // A claimant established more than a window after the holder (a
+        // later reconnect) never replaces it.
+        set_created(&mut t, addr(1), std::time::Duration::ZERO);
+        set_created(
+            &mut t,
+            addr(2),
+            window + std::time::Duration::from_millis(1),
+        );
+        assert!(!gives_way(&t, &high, &low, due + CROSSED_CLAIM_WAIT * 10));
+        assert!(!gives_way_to_claim(
+            &t.connections,
+            addr(1),
+            addr(9),
+            &high,
+            &low,
+            due
+        ));
+        assert!(!gives_way_to_claim(
+            &t.connections,
+            addr(9),
+            addr(2),
+            &high,
+            &low,
+            due
+        ));
     }
 
     #[test]
