@@ -29,23 +29,36 @@
 //!   connection state lock: CONTAINED. The adapter catches it before it
 //!   unwinds into quinn, so no lock is poisoned, and reports it through
 //!   [`EndpointHealth::adapter_panicked`]: the endpoint is `Down` (counted
-//!   in `quic_endpoint_down` and `quic_task_panicked`, logged once at
+//!   in `quic_endpoint_down` and `quic_adapter_panicked`, logged once at
 //!   ERROR), and the adapter returns an I/O error, which ends the quinn
 //!   driver that called it cleanly. QUIC then stays off until the node
-//!   restarts: the endpoint driver ends at its next receive, and each
-//!   connection is closed by its watcher (`QuicConnection::new`), so callers
-//!   get an error instead of waiting on a driver that has stopped.
+//!   restarts: the endpoint driver ends at its next receive, a handshake in
+//!   progress is abandoned, connect is refused, and each connection is
+//!   closed by its watcher (`QuicConnection::new`), so callers get an error
+//!   instead of waiting on a driver that has stopped. A panic after the node
+//!   released the endpoint leaves it `Released` and closes nothing (see the
+//!   watcher in `QuicConnection::new`).
 //! - In the node's own per-connection tasks (the path's receive task, see
 //!   `path::supervise_receive`): contained per connection, which is closed
-//!   with DOWNGRADE.
+//!   with DOWNGRADE, and not counted in `quic_adapter_panicked`.
 //! - In quinn's own code inside its endpoint or connection driver: NOT
 //!   contained, and it can abort the process. quinn 0.11.12 polls each
 //!   driver holding a `std::sync::Mutex` it locks with `.lock().unwrap()`,
 //!   so the panic poisons it, and quinn's destructors unwrap the poisoned
-//!   lock: `EndpointDriver::drop` runs inside quinn's own task while the
-//!   panic unwinds (an abort every time), and `SendStream`, `RecvStream` and
-//!   the last `Connection` handle lock in their `Drop` too. The fix belongs
-//!   in quinn (tolerate a poisoned lock in those destructors);
+//!   lock. For the endpoint driver that happens on every such panic: quinn
+//!   spawns it inside its own `async` block, and the unwind out of that
+//!   block drops the driver right there (the backtrace shows
+//!   `drop_in_place::<EndpointDriver>` called from quinn's
+//!   `Instrumented::poll`, before any catch around the spawned future, and
+//!   tokio's own panic guard would drop it the same way).
+//!   `EndpointDriver::drop` (`endpoint.rs:403`) and then `EndpointRef::drop`
+//!   (`endpoint.rs:724`) lock the poisoned mutex during the unwind, and the
+//!   process aborts. For a connection driver, `SendStream`, `RecvStream` and
+//!   the last `Connection` handle lock in their `Drop`, so dropping one
+//!   afterwards panics in whatever task drops it, and aborts the process if
+//!   that drop runs during an unwind. The fix belongs in quinn: those
+//!   destructors must tolerate a poisoned lock (both `endpoint.rs:403` and
+//!   `:724` for the endpoint driver);
 //!   `a_panic_unwinding_through_the_endpoint_driver_still_aborts` pins the
 //!   current behaviour.
 //!
@@ -185,7 +198,7 @@ impl EndpointHealth {
 
     /// The socket adapter caught a panic in `call`, before it unwound into
     /// quinn. The first one turns the endpoint `Down` (unless the node
-    /// already released it), counts `quic_task_panicked` and logs at ERROR;
+    /// already released it), counts `quic_adapter_panicked` and logs at ERROR;
     /// a later one only logs at DEBUG, so a fault that repeats is counted
     /// once per endpoint.
     pub(crate) fn adapter_panicked(
@@ -198,7 +211,7 @@ impl EndpointHealth {
             tracing::debug!(local_addr = %self.local_addr, call, panic = message, "QUIC socket adapter panicked again");
             return;
         }
-        TRANSPORT_METRICS.record_quic_task_panicked(self.local_addr);
+        TRANSPORT_METRICS.record_quic_adapter_panicked(self.local_addr);
         tracing::error!(
             local_addr = %self.local_addr,
             call,

@@ -677,7 +677,8 @@ impl QuicEndpoint {
     /// Connect to `addr`, which must present the raw public key of
     /// `expected` (the peer's transport key), and wait for the handshake.
     /// The peer's address is on the allow-set for the life of the
-    /// connection.
+    /// connection. Fails as `EndpointDown` if the endpoint is Down, or goes
+    /// Down during the handshake (the attempt is then dropped).
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) async fn connect(
         &self,
@@ -714,7 +715,7 @@ impl QuicEndpoint {
         let connecting = self
             .endpoint
             .connect_with(config, addr, config::SERVER_NAME)?;
-        let connection = connecting.await?;
+        let connection = until_down(connecting, self.availability()).await??;
         Ok(QuicConnection::new(
             connection,
             permit,
@@ -792,9 +793,15 @@ pub(crate) struct QuicIncoming {
 
 impl QuicIncoming {
     /// Complete the handshake. On failure the permit is dropped with it.
+    /// If the endpoint goes Down first, the attempt is dropped and this
+    /// returns `LocallyClosed`, which `QuicEndpoint::error_kind` reads as
+    /// `EndpointDown`.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) async fn establish(self) -> Result<QuicConnection, quinn::ConnectionError> {
-        let connection = self.incoming.accept_with(self.config)?.await?;
+        let connecting = self.incoming.accept_with(self.config)?;
+        let connection = until_down(connecting, self.availability.clone())
+            .await
+            .map_err(|_| quinn::ConnectionError::LocallyClosed)??;
         Ok(QuicConnection::new(
             connection,
             self.permit,
@@ -802,6 +809,38 @@ impl QuicIncoming {
             self.peer,
             self.availability,
         ))
+    }
+}
+
+/// The endpoint went Down while a handshake was in progress.
+#[derive(Debug)]
+struct HandshakeAbandoned;
+
+impl From<HandshakeAbandoned> for QuicConnectError {
+    fn from(_: HandshakeAbandoned) -> Self {
+        Self::Connect(quinn::ConnectError::EndpointStopping)
+    }
+}
+
+/// Await a handshake (`quinn::Connecting`) unless the endpoint goes Down
+/// first, which drops it (closing the attempt) and returns
+/// [`HandshakeAbandoned`]. A socket-adapter panic during the handshake ends
+/// the connection's driver without ending the connection, so without this
+/// the handshake would wait forever and keep its allow-set permit.
+async fn until_down<F: std::future::Future>(
+    handshake: F,
+    mut availability: QuicAvailabilityWatch,
+) -> Result<F::Output, HandshakeAbandoned> {
+    tokio::pin!(handshake);
+    tokio::select! {
+        done = &mut handshake => Ok(done),
+        seen = availability.not_up() => match seen {
+            QuicAvailability::Down => Err(HandshakeAbandoned),
+            // Released or Disabled: not a death, so finish the handshake.
+            QuicAvailability::Up | QuicAvailability::Released | QuicAvailability::Disabled => {
+                Ok(handshake.await)
+            }
+        },
     }
 }
 
@@ -838,11 +877,19 @@ impl QuicConnection {
         // binding the address to the client's key, until quinn reports the
         // connection closed, however it ends. Dropping this handle closes it
         // explicitly (see Drop), because the watcher's clone keeps quinn from
-        // closing it implicitly. When the endpoint goes Down the watcher
-        // closes the connection with DOWNGRADE: after a panic the socket
-        // adapter caught, this connection's driver may have ended without
-        // closing it, and a local close is what makes calls waiting on it
-        // return an error (quinn's close fails them at once, driver or not).
+        // closing it implicitly. On EVERY Down (a driver that returned, as
+        // well as a panic the socket adapter caught) the watcher closes the
+        // connection with DOWNGRADE, uncounted (`QuicCloser::close_uncounted`):
+        // after an adapter panic this connection's driver may have ended
+        // without closing it, and a local close is what makes calls waiting
+        // on it return an error (quinn's close fails them at once, driver or
+        // not). After a driver return quinn has usually ended the connection
+        // already, and the close does nothing. Released (the node dropped the
+        // endpoint) closes nothing: the connections stay with their owners. A
+        // socket-adapter panic after Released leaves the availability
+        // Released, so it closes nothing either, and a call on a connection
+        // whose driver that panic ended can wait until the connection is
+        // dropped.
         let watched = connection.clone();
         let down_closer = closer.clone();
         GlobalExecutor::spawn(async move {
@@ -850,7 +897,7 @@ impl QuicConnection {
                 _ = watched.closed() => {}
                 seen = availability.not_up() => {
                     if seen == QuicAvailability::Down {
-                        down_closer.close(QuicCloseCode::Downgrade);
+                        down_closer.close_uncounted(QuicCloseCode::Downgrade);
                     }
                 }
             }
@@ -929,13 +976,28 @@ impl QuicCloser {
     /// between the check and `close` is still reported as LocallyClosed and
     /// counted; two local closers can no longer both count.
     pub(crate) fn close(&self, code: QuicCloseCode) -> bool {
+        self.close_inner(code, true)
+    }
+
+    /// [`Self::close`] without counting it: for the close the connection's
+    /// watcher makes when the endpoint goes Down. Its driver may have ended
+    /// by then (after a socket-adapter panic), so nothing may be sent to the
+    /// peer, and the node cannot tell; `quic_close_sent_*` counts closes
+    /// sent, so this one is left out.
+    fn close_uncounted(&self, code: QuicCloseCode) -> bool {
+        self.close_inner(code, false)
+    }
+
+    fn close_inner(&self, code: QuicCloseCode, count: bool) -> bool {
         if self.closing.swap(true, std::sync::atomic::Ordering::AcqRel) {
             return false;
         }
         if self.connection.close_reason().is_some() {
             return false;
         }
-        TRANSPORT_METRICS.record_quic_close_sent(code, self.connection.remote_address());
+        if count {
+            TRANSPORT_METRICS.record_quic_close_sent(code, self.connection.remote_address());
+        }
         self.connection.close(code.code().into(), code.reason());
         true
     }

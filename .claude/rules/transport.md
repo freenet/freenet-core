@@ -365,7 +365,7 @@ ignored (`upgrade_control_received`) and hole-punch handshake packets dropped,
 one count per packet, because they were not encrypted under the attempt's
 inbound session key (`handshake_unauthenticated_dropped`), QUIC endpoint deaths
 (`quic_endpoint_down`), panics the QUIC socket adapter caught
-(`quic_task_panicked`, once per endpoint) and QUIC connections this node closed, by close code
+(`quic_adapter_panicked`, once per endpoint) and QUIC connections this node closed, by close code
 (`quic_close_sent_<label>`, one per `QuicCloseCode`). Each label set is declared once in a
 `labelled_counters!` list, so a new variant needs a snapshot field. Hot
 path writes are single relaxed atomics; `SentPacketTracker` keeps an
@@ -1229,7 +1229,7 @@ Liveness ("alive" = the endpoint driver has not ENDED; it does not mean
     endpoint or connection state lock. The adapter catches it before it
     unwinds into quinn (no lock poisoned), and
     EndpointHealth::adapter_panicked turns the endpoint Down, counts
-    quic_task_panicked once per endpoint and logs ERROR once. The call
+    quic_adapter_panicked once per endpoint and logs ERROR once. The call
     returns an io error (never Ready(Ok)/Ok, which would make a lasting
     fault repeat on every transmit), ending that driver; every later
     receive returns one too (one AtomicBool load), so the endpoint driver

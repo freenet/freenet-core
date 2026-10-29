@@ -2922,11 +2922,76 @@ fn run_child(name: &str) -> (String, std::process::Output) {
         std::env::current_exe().expect("test binary path")
     };
     let test = format!("transport::quic::tests::{name}");
-    let output = std::process::Command::new(exe)
+    let mut command = std::process::Command::new(exe);
+    // Core dumps off in the child: one that aborts (the pinned test does, by
+    // design) must not leave a core file on the host.
+    #[cfg(unix)]
+    // SAFETY: setrlimit(2) is async-signal-safe, and the struct it reads is
+    // owned by the closure.
+    unsafe {
+        use std::os::unix::process::CommandExt;
+        command.pre_exec(|| {
+            let none = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            if libc::setrlimit(libc::RLIMIT_CORE, &none) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut child = command
         .args(["--exact", "--test-threads=1", "--nocapture", &test])
         .env(PANIC_CHILD_ENV, "1")
-        .output()
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
         .expect("re-run the test binary");
+    // Read the pipes on threads, so a child writing more than a pipe holds
+    // cannot block on them while this waits for it.
+    let read = |pipe: Option<Box<dyn std::io::Read + Send>>| {
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            if let Some(mut pipe) = pipe {
+                std::io::Read::read_to_end(&mut pipe, &mut bytes).ok();
+            }
+            bytes
+        })
+    };
+    let stdout = read(
+        child
+            .stdout
+            .take()
+            .map(|p| Box::new(p) as Box<dyn std::io::Read + Send>),
+    );
+    let stderr = read(
+        child
+            .stderr
+            .take()
+            .map(|p| Box::new(p) as Box<dyn std::io::Read + Send>),
+    );
+    // A hang guard on the wall clock; the tests inside run on virtual time
+    // under `bounded`'s own watchdog, so only a wedged child gets here.
+    let deadline = std::time::Instant::now() + 2 * WATCHDOG;
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("wait for the child") {
+            break status;
+        }
+        if std::time::Instant::now() > deadline {
+            child.kill().ok();
+            panic!(
+                "the child running {test} did not finish within {:?}",
+                2 * WATCHDOG
+            );
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let output = std::process::Output {
+        status,
+        stdout: stdout.join().expect("stdout reader"),
+        stderr: stderr.join().expect("stderr reader"),
+    };
     (test, output)
 }
 
@@ -2985,7 +3050,7 @@ fn a_panic_in_the_socket_adapter_turns_quic_off_and_the_node_keeps_running() {
                 .await;
                 assert_eq!(seen, QuicAvailability::Down);
                 assert_eq!(TRANSPORT_METRICS.quic_endpoint_down_at(pair.a_addr), 1);
-                assert_eq!(TRANSPORT_METRICS.quic_task_panicked_at(pair.a_addr), 1);
+                assert_eq!(TRANSPORT_METRICS.quic_adapter_panicked_at(pair.a_addr), 1);
 
                 // Callers see an error, never a hang.
                 let path = Arc::new(path);
@@ -3042,7 +3107,7 @@ fn a_panic_in_the_socket_adapter_turns_quic_off_and_the_node_keeps_running() {
                     tokio::task::yield_now().await;
                 }
                 assert_eq!(TRANSPORT_METRICS.quic_endpoint_down_at(a_addr), 1);
-                assert_eq!(TRANSPORT_METRICS.quic_task_panicked_at(a_addr), 1);
+                assert_eq!(TRANSPORT_METRICS.quic_adapter_panicked_at(a_addr), 1);
                 wait.abort();
             });
         },
@@ -3114,8 +3179,19 @@ fn connection_driver_fault_is_caught_once(
         })
         .await;
         assert_eq!(hits(), 1, "the adapter was called again after the panic");
-        assert_eq!(TRANSPORT_METRICS.quic_task_panicked_at(pair.a_addr), 1);
+        assert_eq!(TRANSPORT_METRICS.quic_adapter_panicked_at(pair.a_addr), 1);
         assert_eq!(TRANSPORT_METRICS.quic_endpoint_down_at(pair.a_addr), 1);
+
+        // quinn's endpoint driver ended: the adapter woke it and its receive
+        // returned the error, so quinn reports the endpoint gone (its accept
+        // returns None at once, which it does only after the driver is
+        // dropped).
+        let a = pair.a.clone();
+        let accepted = drive(&pair.time, Duration::from_secs(1), async move {
+            a.accept().await.is_some()
+        })
+        .await;
+        assert!(!accepted, "quinn's endpoint driver is still running");
         drop(path);
         drop(pair);
     });
@@ -3147,10 +3223,13 @@ fn a_persistent_panic_in_socket_send_is_caught_once_and_does_not_loop() {
 
 /// NOT contained, pinned so it is not forgotten: a panic that unwinds
 /// through quinn's ENDPOINT driver (as one in quinn's own code would)
-/// aborts the process. quinn's own spawned task holds the driver as a
-/// local, so the unwind drops it inside quinn, and `EndpointDriver::drop`
-/// (quinn 0.11.12) unwraps the lock the panic poisoned. The fix belongs in
-/// quinn.
+/// aborts the process. quinn spawns the driver inside its own `async`
+/// block, and the unwind out of that block drops it during the unwind (no
+/// catch around the spawned future, ours or tokio's, runs first); then
+/// `EndpointDriver::drop` (`endpoint.rs:403`) and `EndpointRef::drop`
+/// (`endpoint.rs:724`) unwrap the lock the panic poisoned (quinn 0.11.12).
+/// The fix belongs in quinn: both destructors must tolerate a poisoned
+/// lock.
 #[test]
 fn a_panic_unwinding_through_the_endpoint_driver_still_aborts() {
     const NAME: &str = "a_panic_unwinding_through_the_endpoint_driver_still_aborts";
@@ -3187,5 +3266,146 @@ fn a_panic_unwinding_through_the_endpoint_driver_still_aborts() {
         "{test} no longer aborts ({}): quinn may be fixed. Remove this pin and update the \
          transport docs (quic/liveness.rs, .claude/rules/transport.md).\nstderr:\n{stderr}",
         output.status
+    );
+}
+
+/// The connect guard: once a socket-adapter panic turned the endpoint Down,
+/// connect is refused before quinn is asked, even though quinn's endpoint
+/// driver has not ended yet (it ends at its next receive). Nothing is sent:
+/// no new attempt reaches the wire.
+#[test]
+fn connect_is_refused_while_down_before_the_endpoint_driver_ends() {
+    in_child(
+        "connect_is_refused_while_down_before_the_endpoint_driver_ends",
+        || {
+            bounded(|| async move {
+                use super::path::QuicPath;
+                use crate::transport::QuicErrorKind;
+                let _seed = GlobalRng::seed_guard(SEED);
+                let pair = pair(
+                    "quic-panic-connect-guard",
+                    "10.201.41.1:5000".parse().unwrap(),
+                    "10.201.41.2:5000".parse().unwrap(),
+                    None,
+                )
+                .await;
+                let (_, client, _server) =
+                    pair.transfer(payload(100), Duration::from_secs(60)).await;
+                let (path, _inbound) = QuicPath::new(client, pair.time.clone());
+                // One panic, in the existing connection's driver.
+                pair.a.faults().panic_next_writable();
+                let send = tokio::spawn(async move { path.send_short(b"boom").await });
+                while pair.a.availability().get() != QuicAvailability::Down {
+                    tokio::task::yield_now().await;
+                }
+                let sent_before = pair.sent().iter().filter(|d| d.from == pair.a_addr).count();
+                let refused = pair
+                    .a
+                    .connect(pair.b_addr, &pair.b_key())
+                    .await
+                    .expect_err("the endpoint is down");
+                assert_eq!(QuicErrorKind::from(refused), QuicErrorKind::EndpointDown);
+                let time = pair.time.clone();
+                drive(&pair.time, Duration::from_secs(10), async move {
+                    time.sleep(Duration::from_secs(5)).await;
+                })
+                .await;
+                let sent_after = pair.sent().iter().filter(|d| d.from == pair.a_addr).count();
+                assert_eq!(
+                    sent_after, sent_before,
+                    "the refused connect sent a datagram"
+                );
+                send.abort();
+            });
+        },
+    );
+}
+
+/// A socket-adapter panic during the CLIENT's handshake ends the new
+/// connection's driver without ending the connection; connect must still
+/// return `EndpointDown` (bounded, on virtual time) and release the
+/// allow-set permit it held for the server.
+#[test]
+fn a_panic_during_connect_ends_the_handshake_and_releases_its_permit() {
+    in_child(
+        "a_panic_during_connect_ends_the_handshake_and_releases_its_permit",
+        || {
+            bounded(|| async move {
+                use crate::transport::QuicErrorKind;
+                let _seed = GlobalRng::seed_guard(SEED);
+                let pair = pair(
+                    "quic-panic-connect",
+                    "10.201.42.1:5000".parse().unwrap(),
+                    "10.201.42.2:5000".parse().unwrap(),
+                    None,
+                )
+                .await;
+                let _permit = pair.b.allow_peer(pair.a_addr, &pair.a_key()).unwrap();
+                pair.a.faults().panic_every_writable();
+                let (a, b_addr, b_key) = (pair.a.clone(), pair.b_addr, pair.b_key());
+                let refused = drive(&pair.time, Duration::from_secs(5), async move {
+                    a.connect(b_addr, &b_key).await.map(|_| ())
+                })
+                .await
+                .expect_err("the endpoint went down during the handshake");
+                assert_eq!(pair.a.availability().get(), QuicAvailability::Down);
+                assert_eq!(pair.a.error_kind(refused), QuicErrorKind::EndpointDown);
+                assert!(
+                    pair.a_socket
+                        .allow_existing_quic_source(pair.b_addr)
+                        .is_none(),
+                    "the handshake's permit for the server was not released"
+                );
+            });
+        },
+    );
+}
+
+/// A socket-adapter panic during the SERVER's handshake: establish must
+/// return an error that reads as `EndpointDown` (bounded, on virtual time)
+/// and release the attempt's permit.
+#[test]
+fn a_panic_during_establish_ends_the_handshake_and_releases_its_permit() {
+    in_child(
+        "a_panic_during_establish_ends_the_handshake_and_releases_its_permit",
+        || {
+            bounded(|| async move {
+                use crate::transport::QuicErrorKind;
+                let _seed = GlobalRng::seed_guard(SEED);
+                let pair = pair(
+                    "quic-panic-establish",
+                    "10.201.43.1:5000".parse().unwrap(),
+                    "10.201.43.2:5000".parse().unwrap(),
+                    None,
+                )
+                .await;
+                let permit = pair.b.allow_peer(pair.a_addr, &pair.a_key()).unwrap();
+                let (a, b_addr, b_key) = (pair.a.clone(), pair.b_addr, pair.b_key());
+                let client =
+                    tokio::spawn(async move { a.connect(b_addr, &b_key).await.map(|_| ()) });
+                let b = pair.b.clone();
+                let incoming = drive(&pair.time, Duration::from_secs(5), async move {
+                    b.accept().await.expect("an incoming attempt")
+                })
+                .await;
+                // Only the attempt's own permit keeps the client allowed now.
+                drop(permit);
+                pair.b.faults().panic_every_writable();
+                let failed = drive(&pair.time, Duration::from_secs(5), async move {
+                    incoming.establish().await.map(|_| ())
+                })
+                .await
+                .expect_err("the endpoint went down during the handshake");
+                assert_eq!(pair.b.availability().get(), QuicAvailability::Down);
+                assert_eq!(pair.b.error_kind(failed), QuicErrorKind::EndpointDown);
+                assert!(
+                    pair.b_socket
+                        .allow_existing_quic_source(pair.a_addr)
+                        .is_none(),
+                    "the attempt's permit was not released"
+                );
+                client.abort();
+            });
+        },
     );
 }
