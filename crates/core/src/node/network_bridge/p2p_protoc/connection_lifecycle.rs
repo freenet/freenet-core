@@ -206,43 +206,40 @@ impl P2pConnManager {
         );
     }
 
-    /// Close the connection at `holder`, bound to `key`, so that a claim of
-    /// `key` can be bound: its release binds the newest pending claim (see
-    /// [`Self::release_identity`]). When the holder is in the ring, that claim
-    /// takes its place there: it is promoted, and the peer's state is kept.
-    /// `reason` is the counter for why the holder is replaced: it has gone
-    /// quiet (`identity::HOLD_WINDOW`), or it is the crossed session
-    /// `identity::gives_way_to_claim` gives up.
+    /// Close the connection at `quiet`, bound to `key` but not heard from
+    /// within `identity::HOLD_WINDOW`, so that a claim of `key` can be bound:
+    /// its release binds the newest pending claim (see
+    /// [`Self::release_identity`]). When the quiet connection is in the ring,
+    /// that claim takes its place there: it is promoted, and the peer's state
+    /// is kept.
     ///
     /// When this node sits exactly at its readiness threshold, the close can
     /// broadcast "not ready" before the claim's promotion broadcasts "ready"
     /// again: a short flap, the same as for any connection closed and
     /// replaced at that threshold.
-    async fn replace_holder(
+    async fn replace_quiet_holder(
         &mut self,
-        holder: SocketAddr,
+        quiet: SocketAddr,
         key: &TransportPublicKey,
-        reason: ConnIdentity,
         handshake_commands: &HandshakeCommandSender,
     ) {
-        TRANSPORT_METRICS.record_conn_identity(holder, reason);
+        TRANSPORT_METRICS.record_conn_identity(quiet, ConnIdentity::QuietHolderReplaced);
         if self
             .bridge
             .op_manager
             .ring
             .connection_manager
-            .is_in_ring(holder)
+            .is_in_ring(quiet)
         {
             identity::promote_newest_claim(&mut self.connections, key);
         }
         tracing::info!(
-            %holder,
+            %quiet,
             pub_key = %key,
-            ?reason,
-            "Closing the connection holding a key so that a waiting connection can take it"
+            "Closing a connection that has gone quiet; a newer connection claims its key"
         );
         self.drop_connection_by_addr(
-            holder,
+            quiet,
             handshake_commands,
             crate::tracing::DisconnectReason::Explicit("replaced_by_same_key".into()),
         )
@@ -250,11 +247,11 @@ impl P2pConnManager {
     }
 
     /// For each key with a pending claim: when the connection holding the
-    /// key has gone quiet, or is the crossed session
-    /// `identity::gives_way_to_claim` gives up, replace it, and its release
-    /// binds the newest claim of the key; when no connection holds the key,
-    /// bind the newest claim. Other claims held by a live connection keep
-    /// waiting. Run from the event
+    /// key has gone quiet, replace it, and its release binds the newest claim
+    /// of the key; when no connection holds the key, bind the newest claim.
+    /// Claims held by a live connection keep waiting, except that a waiting
+    /// connection `identity::closes_crossed_claim` picks is closed (see
+    /// [`Self::close_crossed_claims`]). Run from the event
     /// loop's timer (see [`PendingClaimRetry`]), so a peer that reconnected
     /// from another address is linked within about `identity::HOLD_WINDOW` of
     /// its old session going quiet.
@@ -275,44 +272,19 @@ impl P2pConnManager {
             }
             match identity::key_holder(&self.connections, None, &key) {
                 Some((holder, true)) => {
-                    let own_key = self
-                        .bridge
-                        .op_manager
-                        .ring
-                        .connection_manager
-                        .pub_key
-                        .clone();
-                    let gives_way = identity::pending_claimant(&self.connections, None, &key)
-                        .is_some_and(|(claimant, _)| {
-                            identity::gives_way_to_claim(
-                                &self.connections,
-                                holder,
-                                claimant,
-                                &own_key,
-                                &key,
-                                Instant::now(),
-                            )
-                        });
-                    if gives_way {
-                        work += 1;
-                        self.replace_holder(
+                    work += self
+                        .close_crossed_claims(
                             holder,
                             &key,
-                            ConnIdentity::CrossedHolderReplaced,
+                            MAX_PENDING_CLAIM_WORK_PER_PASS - work,
                             handshake_commands,
                         )
-                        .await
-                    }
+                        .await;
                 }
                 Some((quiet, false)) => {
                     work += 1;
-                    self.replace_holder(
-                        quiet,
-                        &key,
-                        ConnIdentity::QuietHolderReplaced,
-                        handshake_commands,
-                    )
-                    .await
+                    self.replace_quiet_holder(quiet, &key, handshake_commands)
+                        .await
                 }
                 None => {
                     if let Some((claimant, claim)) =
@@ -326,6 +298,62 @@ impl P2pConnManager {
         }
         identity::clear_pending_hint(&self.connections, &mut self.addr_by_pub_key);
         false
+    }
+
+    /// Close up to `limit` connections waiting for `key` behind the live
+    /// `holder` that `identity::closes_crossed_claim` picks, and return how
+    /// many were closed. The holder is never closed here. In two crossed
+    /// sessions the closed one is the other side's holder, so its close, or
+    /// its going quiet there, lets the other side's retry bind the session
+    /// kept here, and both ends finish on one session.
+    async fn close_crossed_claims(
+        &mut self,
+        holder: SocketAddr,
+        key: &TransportPublicKey,
+        limit: usize,
+        handshake_commands: &HandshakeCommandSender,
+    ) -> usize {
+        let own_key = self
+            .bridge
+            .op_manager
+            .ring
+            .connection_manager
+            .pub_key
+            .clone();
+        let now = Instant::now();
+        let crossed: Vec<SocketAddr> = self
+            .connections
+            .keys()
+            .copied()
+            .filter(|claimant| {
+                identity::closes_crossed_claim(
+                    &self.connections,
+                    holder,
+                    *claimant,
+                    &own_key,
+                    key,
+                    now,
+                )
+            })
+            .take(limit)
+            .collect();
+        for claimant in &crossed {
+            TRANSPORT_METRICS.record_conn_identity(*claimant, ConnIdentity::CrossedClaimClosed);
+            tracing::info!(
+                %claimant,
+                %holder,
+                pub_key = %key,
+                "Closing a connection that has waited for a key held by a session \
+                 established at the same time"
+            );
+            self.drop_connection_by_addr(
+                *claimant,
+                handshake_commands,
+                crate::tracing::DisconnectReason::Explicit("crossed_claim_closed".into()),
+            )
+            .await;
+        }
+        crossed.len()
     }
 
     /// Count disconnect cleanup of the connection `entry` at `addr`, when the
@@ -1645,13 +1673,8 @@ impl P2pConnManager {
                     // it, so nothing is left to promote here.
                     BindOutcome::HeldByQuiet(quiet) => {
                         held_back = true;
-                        self.replace_holder(
-                            quiet,
-                            peer.pub_key(),
-                            ConnIdentity::QuietHolderReplaced,
-                            handshake_commands,
-                        )
-                        .await;
+                        self.replace_quiet_holder(quiet, peer.pub_key(), handshake_commands)
+                            .await;
                         None
                     }
                     // The entry was inserted above without an identity.
@@ -2089,10 +2112,9 @@ impl P2pConnManager {
                                     // binds the newest pending claim of the
                                     // key. The request is passed on if that
                                     // was this connection.
-                                    self.replace_holder(
+                                    self.replace_quiet_holder(
                                         quiet,
                                         sender_peer.pub_key(),
-                                        ConnIdentity::QuietHolderReplaced,
                                         handshake_commands,
                                     )
                                     .await;

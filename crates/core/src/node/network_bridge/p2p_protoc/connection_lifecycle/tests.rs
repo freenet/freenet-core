@@ -453,7 +453,7 @@ fn is_set(kind: ConnIdentity) -> bool {
         | ConnIdentity::ChangedConnectPeer
         | ConnIdentity::ClaimHeld
         | ConnIdentity::QuietHolderReplaced
-        | ConnIdentity::CrossedHolderReplaced
+        | ConnIdentity::CrossedClaimClosed
         | ConnIdentity::OwnKey
         | ConnIdentity::DuplicateKey
         | ConnIdentity::TeardownKeyElsewhere
@@ -2848,14 +2848,6 @@ fn key_ordered(h: &Harness, above: bool) -> TransportPublicKey {
     }
 }
 
-/// Move the time the connection at `addr` was established to `ago` before
-/// now.
-fn established_ago(h: &mut Harness, addr: SocketAddr, ago: Duration) {
-    h.mgr.connections.get_mut(&addr).unwrap().created_at = Instant::now()
-        .checked_sub(ago)
-        .expect("uptime covers the test");
-}
-
 /// A connection waiting for a key keeps that key: a ConnectRequest on it
 /// naming another key is a mismatch and closes it, as for a bound one.
 #[tokio::test]
@@ -2999,117 +2991,6 @@ async fn a_transient_dial_keeps_its_reservation() {
     );
 }
 
-/// Two sessions with one peer established at nearly the same time, the
-/// second waiting on the first, both heard from. On the side whose key
-/// orders above the peer's, the retry replaces the holder once the claim has
-/// waited `CROSSED_CLAIM_WAIT`, and the claim takes its ring place. Checked
-/// with the holder established first and with the claimant established
-/// first.
-#[tokio::test]
-async fn a_crossed_claim_replaces_the_live_holder_on_one_side() {
-    for (round, claimant_first) in [false, true].into_iter().enumerate() {
-        let mut h = Harness::new(&format!("conn-identity-crossed-{round}")).await;
-        let holder: SocketAddr = format!("198.51.100.45:{}", 6001 + 10 * round)
-            .parse()
-            .unwrap();
-        let claimant: SocketAddr = format!("198.51.100.45:{}", 6002 + 10 * round)
-            .parse()
-            .unwrap();
-        h.watch(&[holder, claimant]);
-        let peer = key_ordered(&h, false);
-
-        if claimant_first {
-            h.accept(claimant).await;
-            let _clock = h.dial_with_receipt(holder, &peer).await;
-            h.refused_connect_request(claimant, PeerKeyLocation::with_unknown_addr(peer.clone()))
-                .await;
-            // The ConnectRequest does not promote; a ConnectPeer would.
-            assert_eq!(h.pending_on(claimant), Some(false));
-        } else {
-            let _clock = h.dial_with_receipt(holder, &peer).await;
-            h.accept_expected(claimant, &peer).await;
-            assert_eq!(h.pending_on(claimant), Some(true));
-        }
-        let waited = identity::CROSSED_CLAIM_WAIT + Duration::from_secs(1);
-        let (first, second) = if claimant_first {
-            (claimant, holder)
-        } else {
-            (holder, claimant)
-        };
-        established_ago(&mut h, first, waited + Duration::from_secs(2));
-        established_ago(&mut h, second, waited);
-        let handshake = h.handshake.clone();
-
-        h.mgr.retry_pending_claims(&handshake).await;
-        assert!(
-            !h.mgr.connections.contains_key(&holder),
-            "round {round}: replaced"
-        );
-        assert!(seen(holder).contains(&ConnIdentity::CrossedHolderReplaced));
-        assert_eq!(h.mgr.connections[&claimant].pub_key(), Some(&peer));
-        assert_eq!(
-            h.ring_addr_of(&peer),
-            Some(claimant),
-            "round {round}: takes the ring place"
-        );
-    }
-}
-
-/// The side whose key orders below the peer's never replaces a live holder,
-/// however long the claim waits: the other side does.
-#[tokio::test]
-async fn a_crossed_claim_waits_on_the_other_side() {
-    let mut h = Harness::new("conn-identity-crossed-other-side").await;
-    let holder: SocketAddr = "198.51.100.46:6001".parse().unwrap();
-    let claimant: SocketAddr = "198.51.100.46:6002".parse().unwrap();
-    h.watch(&[holder]);
-    let peer = key_ordered(&h, true);
-
-    let _clock = h.dial_with_receipt(holder, &peer).await;
-    h.accept_expected(claimant, &peer).await;
-    let waited = identity::CROSSED_CLAIM_WAIT * 4;
-    established_ago(&mut h, holder, waited);
-    established_ago(&mut h, claimant, waited);
-    let handshake = h.handshake.clone();
-    h.mgr.retry_pending_claims(&handshake).await;
-
-    assert_eq!(h.ring_addr_of(&peer), Some(holder));
-    assert_eq!(h.pending_on(claimant), Some(true));
-    assert!(!seen(holder).contains(&ConnIdentity::CrossedHolderReplaced));
-}
-
-/// After a crossed replacement, the peer's session reconnecting is not
-/// established near the new holder, so it waits and never replaces it: the
-/// replacement happens at most once per racing pair.
-#[tokio::test]
-async fn a_reconnect_after_a_crossed_replacement_does_not_replace_again() {
-    let mut h = Harness::new("conn-identity-crossed-no-flap").await;
-    let holder: SocketAddr = "198.51.100.47:6001".parse().unwrap();
-    let claimant: SocketAddr = "198.51.100.47:6002".parse().unwrap();
-    let reconnect: SocketAddr = "198.51.100.47:6003".parse().unwrap();
-    h.watch(&[claimant]);
-    let peer = key_ordered(&h, false);
-
-    let _clock = h.dial_with_receipt(holder, &peer).await;
-    h.accept_expected(claimant, &peer).await;
-    let cap = identity::CROSSED_CLAIM_WAIT;
-    established_ago(&mut h, holder, cap * 3);
-    established_ago(&mut h, claimant, cap * 3);
-    let handshake = h.handshake.clone();
-    h.mgr.retry_pending_claims(&handshake).await;
-    assert_eq!(h.ring_addr_of(&peer), Some(claimant), "premise: replaced");
-
-    // The old session reconnects after the replacement and waits as long as
-    // it likes.
-    h.accept_expected(reconnect, &peer).await;
-    established_ago(&mut h, reconnect, cap * 2);
-    h.mgr.retry_pending_claims(&handshake).await;
-
-    assert_eq!(h.ring_addr_of(&peer), Some(claimant));
-    assert_eq!(h.pending_on(reconnect), Some(true));
-    assert!(!seen(claimant).contains(&ConnIdentity::CrossedHolderReplaced));
-}
-
 /// A ConnectRequest giving the connection's own address counts
 /// `connect_request_known_addr` when it replaces a quiet holder, as on every
 /// other outcome.
@@ -3129,4 +3010,176 @@ async fn connect_request_replacing_a_quiet_holder_counts_known_addr() {
 
     assert!(!h.mgr.connections.contains_key(&old), "premise: replaced");
     assert!(seen(new).contains(&ConnIdentity::ConnectRequestKnownAddr));
+}
+
+/// Move the time the pending claim on the connection at `addr` was first
+/// made to `ago` before now.
+fn claim_made_ago(h: &mut Harness, addr: SocketAddr, ago: Duration) {
+    h.mgr
+        .connections
+        .get_mut(&addr)
+        .unwrap()
+        .identity
+        .backdate_claim(ago);
+}
+
+/// Two sessions with one peer established at nearly the same time, the
+/// second waiting on the first, both heard from. On the side whose key
+/// orders above the peer's, the retry closes the waiting connection once its
+/// claim has waited `CROSSED_CLAIM_WAIT`, and keeps the holder and its ring
+/// place. Checked with the holder established first and with the waiting
+/// connection established first.
+#[tokio::test]
+async fn a_crossed_claim_is_closed_on_the_higher_side_and_the_holder_kept() {
+    for (round, claimant_first) in [false, true].into_iter().enumerate() {
+        let mut h = Harness::new(&format!("conn-identity-crossed-close-{round}")).await;
+        let holder: SocketAddr = format!("198.51.100.45:{}", 6101 + 10 * round)
+            .parse()
+            .unwrap();
+        let claimant: SocketAddr = format!("198.51.100.45:{}", 6102 + 10 * round)
+            .parse()
+            .unwrap();
+        h.watch(&[holder, claimant]);
+        let peer = key_ordered(&h, false);
+
+        let _clock = if claimant_first {
+            h.accept(claimant).await;
+            let clock = h.dial_with_receipt(holder, &peer).await;
+            h.refused_connect_request(claimant, PeerKeyLocation::with_unknown_addr(peer.clone()))
+                .await;
+            clock
+        } else {
+            let clock = h.dial_with_receipt(holder, &peer).await;
+            h.accept_expected(claimant, &peer).await;
+            clock
+        };
+        let handshake = h.handshake.clone();
+        h.mgr.retry_pending_claims(&handshake).await;
+        assert!(
+            h.mgr.connections.contains_key(&claimant),
+            "round {round}: not before the claim has waited"
+        );
+
+        claim_made_ago(&mut h, claimant, identity::CROSSED_CLAIM_WAIT);
+        h.mgr.retry_pending_claims(&handshake).await;
+        assert!(
+            !h.mgr.connections.contains_key(&claimant),
+            "round {round}: closed"
+        );
+        assert!(seen(claimant).contains(&ConnIdentity::CrossedClaimClosed));
+        assert_eq!(h.mgr.connections[&holder].pub_key(), Some(&peer));
+        assert_eq!(
+            h.ring_addr_of(&peer),
+            Some(holder),
+            "round {round}: holder kept"
+        );
+        assert!(!seen(holder).contains(&ConnIdentity::CrossedClaimClosed));
+    }
+}
+
+/// The side whose key orders below the peer's never closes either
+/// connection, however long the claim waits: the other side does.
+#[tokio::test]
+async fn a_crossed_claim_waits_on_the_lower_side() {
+    let mut h = Harness::new("conn-identity-crossed-lower-side").await;
+    let holder: SocketAddr = "198.51.100.46:6101".parse().unwrap();
+    let claimant: SocketAddr = "198.51.100.46:6102".parse().unwrap();
+    h.watch(&[holder, claimant]);
+    let peer = key_ordered(&h, true);
+
+    let _clock = h.dial_with_receipt(holder, &peer).await;
+    h.accept_expected(claimant, &peer).await;
+    claim_made_ago(&mut h, claimant, identity::CROSSED_CLAIM_WAIT * 4);
+    let handshake = h.handshake.clone();
+    h.mgr.retry_pending_claims(&handshake).await;
+
+    assert_eq!(h.ring_addr_of(&peer), Some(holder));
+    assert_eq!(h.pending_on(claimant), Some(true));
+    assert!(!seen(claimant).contains(&ConnIdentity::CrossedClaimClosed));
+}
+
+/// Two nodes with two sessions between them, established at the same time
+/// and crossed: each node holds the session the other keeps waiting. The
+/// node whose key orders higher closes its waiting session; on the other
+/// node that session is the holder, and once it closes there (`closed`) or,
+/// with no close arriving, goes quiet there, that node's retry binds the
+/// remaining session. Both nodes end bound to the same session, with each
+/// other in the ring.
+#[tokio::test]
+async fn crossed_sessions_converge_on_one_session_at_both_nodes() {
+    for (round, closed) in [true, false].into_iter().enumerate() {
+        let mut a = Harness::new(&format!("conn-identity-pair-a-{round}")).await;
+        let mut b = Harness::new(&format!("conn-identity-pair-b-{round}")).await;
+        let (key_a, key_b) = (a.own_key(), b.own_key());
+        // Each session's address as seen at A, and as seen at B.
+        let port = 7001 + 10 * round as u16;
+        let s1_at_a: SocketAddr = format!("198.51.100.49:{port}").parse().unwrap();
+        let s2_at_a: SocketAddr = format!("198.51.100.49:{}", port + 1).parse().unwrap();
+        let s1_at_b: SocketAddr = format!("198.51.100.50:{port}").parse().unwrap();
+        let s2_at_b: SocketAddr = format!("198.51.100.50:{}", port + 1).parse().unwrap();
+
+        // A dialled B (S1) while B dialled A (S2); each dial lands at the
+        // other node as an expected inbound connection.
+        let clock_a = a.dial_with_receipt(s1_at_a, &key_b).await;
+        let clock_b = b.dial_with_receipt(s2_at_b, &key_a).await;
+        a.accept_expected(s2_at_a, &key_b).await;
+        b.accept_expected(s1_at_b, &key_a).await;
+        assert_eq!(a.ring_addr_of(&key_b), Some(s1_at_a), "premise: A holds S1");
+        assert_eq!(b.ring_addr_of(&key_a), Some(s2_at_b), "premise: B holds S2");
+        claim_made_ago(&mut a, s2_at_a, identity::CROSSED_CLAIM_WAIT);
+        claim_made_ago(&mut b, s1_at_b, identity::CROSSED_CLAIM_WAIT);
+
+        let a_is_higher = key_a > key_b;
+        let (higher, lower) = if a_is_higher {
+            (&mut a, &mut b)
+        } else {
+            (&mut b, &mut a)
+        };
+        // The session the higher node waits on, at each node.
+        let (waiting_at_higher, same_at_lower) = if a_is_higher {
+            (s2_at_a, s2_at_b)
+        } else {
+            (s1_at_b, s1_at_a)
+        };
+        let lower_clock = if a_is_higher { &clock_b } else { &clock_a };
+
+        let handshake = lower.handshake.clone();
+        lower.mgr.retry_pending_claims(&handshake).await;
+        let handshake = higher.handshake.clone();
+        higher.mgr.retry_pending_claims(&handshake).await;
+        assert!(!higher.mgr.connections.contains_key(&waiting_at_higher));
+        assert!(
+            lower.mgr.connections.contains_key(&same_at_lower),
+            "nothing closed here yet"
+        );
+
+        if closed {
+            lower.transport_closed(same_at_lower).await;
+        } else {
+            lower_clock.go_quiet(identity::HOLD_WINDOW + Duration::from_secs(1));
+            let handshake = lower.handshake.clone();
+            lower.mgr.retry_pending_claims(&handshake).await;
+            assert!(!lower.mgr.connections.contains_key(&same_at_lower));
+        }
+
+        let (kept_at_a, kept_at_b) = if a_is_higher {
+            (s1_at_a, s1_at_b)
+        } else {
+            (s2_at_a, s2_at_b)
+        };
+        assert_eq!(a.ring_addr_of(&key_b), Some(kept_at_a), "round {round}: A");
+        assert_eq!(b.ring_addr_of(&key_a), Some(kept_at_b), "round {round}: B");
+        assert_eq!(a.mgr.connections[&kept_at_a].pub_key(), Some(&key_b));
+        assert_eq!(b.mgr.connections[&kept_at_b].pub_key(), Some(&key_a));
+        assert_eq!(
+            a.mgr.connections.len(),
+            1,
+            "round {round}: one session at A"
+        );
+        assert_eq!(
+            b.mgr.connections.len(),
+            1,
+            "round {round}: one session at B"
+        );
+    }
 }
