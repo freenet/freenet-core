@@ -1190,6 +1190,7 @@ impl P2pConnManager {
     /// registration carried for an inbound connection matched to it
     /// ([`IdentitySource::Claimed`]). `None` for any other inbound
     /// connection, which starts without an identity.
+    #[allow(clippy::too_many_arguments)]
     async fn handle_successful_connection(
         &mut self,
         peer_id: Option<PeerKeyLocation>,
