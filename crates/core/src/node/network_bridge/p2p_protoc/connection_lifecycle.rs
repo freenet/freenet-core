@@ -256,8 +256,8 @@ impl P2pConnManager {
     /// Each replacement or bind awaits pruning, promotion and sends on the
     /// event loop, so one pass does at most
     /// [`MAX_PENDING_CLAIM_WORK_PER_PASS`] of them. Returns whether it
-    /// stopped with work left, in which case the loop runs the next pass as
-    /// soon as no event is waiting.
+    /// may have stopped with work left (it reached the limit), in which case
+    /// the loop runs the next pass as soon as no event is waiting.
     pub(super) async fn retry_pending_claims(
         &mut self,
         handshake_commands: &HandshakeCommandSender,
@@ -294,7 +294,10 @@ impl P2pConnManager {
             }
         }
         identity::clear_pending_hint(&self.connections, &mut self.addr_by_pub_key);
-        false
+        // A pass that used its whole budget on its last key may have left
+        // work for that key (crossed closes stop at the limit); the next pass
+        // finds out, at the cost of at most one pass with nothing to do.
+        work == MAX_PENDING_CLAIM_WORK_PER_PASS
     }
 
     /// Close up to `limit` connections waiting for `key` behind the live

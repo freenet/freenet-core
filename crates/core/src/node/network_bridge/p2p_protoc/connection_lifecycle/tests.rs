@@ -3368,3 +3368,33 @@ async fn crossed_closes_count_toward_the_per_pass_limit() {
         assert_eq!(h.ring_addr_of(peer), Some(*holder));
     }
 }
+
+/// The per-pass limit also holds within one key: more crossed waiting
+/// connections for one key than the limit are closed over two passes.
+#[tokio::test(start_paused = true)]
+async fn crossed_closes_for_one_key_respect_the_per_pass_limit() {
+    let mut h = Harness::new("conn-identity-crossed-limit-one-key").await;
+    let total = MAX_PENDING_CLAIM_WORK_PER_PASS + 3;
+    let holder: SocketAddr = "198.51.100.43:7300".parse().unwrap();
+    let peer = key_ordered(&h, false);
+    let _clock = h.dial_with_receipt(holder, &peer).await;
+    let claimants: Vec<SocketAddr> = (0..total)
+        .map(|i| format!("198.51.100.43:{}", 7301 + i).parse().unwrap())
+        .collect();
+    for claimant in &claimants {
+        h.accept_expected(*claimant, &peer).await;
+    }
+    tokio::time::advance(identity::CROSSED_CLAIM_WAIT).await;
+    let open = |h: &Harness| {
+        claimants
+            .iter()
+            .filter(|c| h.mgr.connections.contains_key(c))
+            .count()
+    };
+
+    assert!(h.retry().await, "work is left");
+    assert_eq!(open(&h), total - MAX_PENDING_CLAIM_WORK_PER_PASS);
+    assert!(!h.retry().await);
+    assert_eq!(open(&h), 0);
+    assert_eq!(h.ring_addr_of(&peer), Some(holder));
+}
