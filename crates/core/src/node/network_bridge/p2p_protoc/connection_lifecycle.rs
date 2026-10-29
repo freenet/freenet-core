@@ -30,9 +30,9 @@ fn identity_kind(
         BindOutcome::Bound => Some(set),
         BindOutcome::Same => Some(same),
         BindOutcome::Mismatch(_) => Some(changed),
-        BindOutcome::HeldByDial(_) => Some(ConnIdentity::ClaimHeldByDial),
-        // Counted as `quiet_dial_replaced` when the quiet dial is replaced.
-        BindOutcome::HeldByQuietDial(_) => None,
+        BindOutcome::Held(_) => Some(ConnIdentity::ClaimHeld),
+        // Counted as `quiet_holder_replaced` when the quiet dial is replaced.
+        BindOutcome::HeldByQuiet(_) => None,
         BindOutcome::NoConnection => None,
     }
 }
@@ -86,7 +86,7 @@ pub(super) enum Promotion {
 impl P2pConnManager {
     /// Bind `key`, from `source`, as the peer identity of the open connection
     /// at `addr` (see `identity::bind` for the rules). On
-    /// [`BindOutcome::HeldByDial`] or [`BindOutcome::HeldByQuietDial`],
+    /// [`BindOutcome::Held`] or [`BindOutcome::HeldByQuiet`],
     /// `pending` decides whether the claim is kept to be bound later:
     /// `Some(promote)` keeps it, with whether binding it should promote the
     /// connection; `None` drops it.
@@ -166,10 +166,10 @@ impl P2pConnManager {
 
     /// The connection at `addr`, bound to `key`, has been removed from
     /// `connections`. Updates the index; binds the newest pending claim of
-    /// `key`, if no dial holds the key any more, promoting its connection
-    /// when the claim would have and no other connection keeps the key in
-    /// the ring; then (only with `forget_peer_state`) forgets the peer's
-    /// state unless a connection bound to `key` is still in the ring.
+    /// `key`, if no other connection holds the key now, promoting its
+    /// connection when the claim would have; then (only with
+    /// `forget_peer_state`) forgets the peer's state unless a connection
+    /// bound to `key` is still in the ring.
     pub(super) async fn release_identity(
         &mut self,
         addr: SocketAddr,
@@ -181,7 +181,6 @@ impl P2pConnManager {
         if let Some((claimant, promote)) =
             identity::pending_claimant(&self.connections, Some(addr), key)
         {
-            let promote = promote && !self.key_in_ring(key, Some(addr));
             self.bind_pending_claim(claimant, key, promote).await;
         }
         if forget_peer_state {
@@ -215,26 +214,37 @@ impl P2pConnManager {
         );
     }
 
-    /// Close the dialled connection at `quiet`, bound to `key` but not heard
-    /// from within `identity::HOLD_WINDOW`, so that a claim of `key` can be
-    /// bound: its release binds the newest pending claim (see
-    /// [`Self::release_identity`]).
+    /// Close the connection at `quiet`, bound to `key` but not heard from
+    /// within `identity::HOLD_WINDOW`, so that a claim of `key` can be bound:
+    /// its release binds the newest pending claim (see
+    /// [`Self::release_identity`]). When the quiet connection is in the ring,
+    /// that claim takes its place there: it is promoted, and the peer's state
+    /// is kept.
     ///
     /// When this node sits exactly at its readiness threshold, the close can
     /// broadcast "not ready" before the claim's promotion broadcasts "ready"
     /// again: a short flap, the same as for any connection closed and
     /// replaced at that threshold.
-    async fn replace_quiet_dial(
+    async fn replace_quiet_holder(
         &mut self,
         quiet: SocketAddr,
         key: &TransportPublicKey,
         handshake_commands: &HandshakeCommandSender,
     ) {
-        TRANSPORT_METRICS.record_conn_identity(quiet, ConnIdentity::QuietDialReplaced);
+        TRANSPORT_METRICS.record_conn_identity(quiet, ConnIdentity::QuietHolderReplaced);
+        if self
+            .bridge
+            .op_manager
+            .ring
+            .connection_manager
+            .is_in_ring(quiet)
+        {
+            identity::promote_newest_claim(&mut self.connections, key);
+        }
         tracing::info!(
             %quiet,
             pub_key = %key,
-            "Closing a dialled connection that has gone quiet; a newer connection claims its key"
+            "Closing a connection that has gone quiet; a newer connection claims its key"
         );
         self.drop_connection_by_addr(
             quiet,
@@ -244,31 +254,28 @@ impl P2pConnManager {
         .await;
     }
 
-    /// For each key with a pending claim: when the dial holding it has gone
-    /// quiet, replace that dial, whose release binds the newest claim of the
-    /// key; when no dial holds the key, bind the newest claim, promoting it
-    /// only if no other connection keeps the key in the ring. At most one
-    /// claim per key is bound per pass; claims held by a live dial keep
-    /// waiting. Run from the event
-    /// loop's timer (see [`PendingClaimRetry`]), so a peer
-    /// that reconnected from another address is linked within about
-    /// `identity::HOLD_WINDOW` of its old session going quiet.
+    /// For each key with a pending claim: when the connection holding the
+    /// key has gone quiet, replace it, and its release binds the newest claim
+    /// of the key; when no connection holds the key, bind the newest claim.
+    /// Claims held by a live connection keep waiting. Run from the event
+    /// loop's timer (see [`PendingClaimRetry`]), so a peer that reconnected
+    /// from another address is linked within about `identity::HOLD_WINDOW` of
+    /// its old session going quiet.
     pub(super) async fn retry_pending_claims(
         &mut self,
         handshake_commands: &HandshakeCommandSender,
     ) {
         for key in identity::pending_keys(&self.connections) {
-            match identity::dial_holder(&self.connections, None, &key) {
+            match identity::key_holder(&self.connections, None, &key) {
                 Some((_, true)) => {}
                 Some((quiet, false)) => {
-                    self.replace_quiet_dial(quiet, &key, handshake_commands)
+                    self.replace_quiet_holder(quiet, &key, handshake_commands)
                         .await
                 }
                 None => {
                     if let Some((claimant, promote)) =
                         identity::pending_claimant(&self.connections, None, &key)
                     {
-                        let promote = promote && !self.key_in_ring(&key, None);
                         self.bind_pending_claim(claimant, &key, promote).await;
                     }
                 }
@@ -797,10 +804,7 @@ impl P2pConnManager {
             // is the holder. If it were reached, nothing is kept pending, since
             // the connect op is told it failed.
             debug_assert!(
-                !matches!(
-                    check,
-                    BindOutcome::HeldByDial(_) | BindOutcome::HeldByQuietDial(_)
-                ),
+                !matches!(check, BindOutcome::Held(_) | BindOutcome::HeldByQuiet(_)),
                 "a ConnectPeer for a key held by a dial resolves to the holder"
             );
             let refused = match &check {
@@ -825,8 +829,8 @@ impl P2pConnManager {
                     }
                 }
                 BindOutcome::Mismatch(_)
-                | BindOutcome::HeldByDial(_)
-                | BindOutcome::HeldByQuietDial(_)
+                | BindOutcome::Held(_)
+                | BindOutcome::HeldByQuiet(_)
                 | BindOutcome::NoConnection => {
                     if let Some(kind) = identity_kind(&check, CONNECT_PEER_KINDS) {
                         TRANSPORT_METRICS.record_conn_identity(peer_addr, kind);
@@ -1559,6 +1563,7 @@ impl P2pConnManager {
         // been promoted now).
         let promote_on_bind =
             !is_transient || self.bridge.op_manager.ring.connection_manager.is_gateway();
+        let established_with_claim = source == IdentitySource::Claimed && peer_id.is_some();
         let peer_id = match peer_id {
             Some(peer) => {
                 let outcome =
@@ -1572,9 +1577,8 @@ impl P2pConnManager {
                         TRANSPORT_METRICS.record_conn_identity(peer_addr, kind);
                         Some(peer)
                     }
-                    BindOutcome::HeldByDial(holder) => {
-                        TRANSPORT_METRICS
-                            .record_conn_identity(peer_addr, ConnIdentity::ClaimHeldByDial);
+                    BindOutcome::Held(holder) => {
+                        TRANSPORT_METRICS.record_conn_identity(peer_addr, ConnIdentity::ClaimHeld);
                         tracing::info!(
                             %peer_addr,
                             %holder,
@@ -1587,8 +1591,8 @@ impl P2pConnManager {
                     // The quiet dial is replaced; its release binds the newest
                     // pending claim of the key (normally this one) and promotes
                     // it, so nothing is left to promote here.
-                    BindOutcome::HeldByQuietDial(quiet) => {
-                        self.replace_quiet_dial(quiet, peer.pub_key(), handshake_commands)
+                    BindOutcome::HeldByQuiet(quiet) => {
+                        self.replace_quiet_holder(quiet, peer.pub_key(), handshake_commands)
                             .await;
                         None
                     }
@@ -1696,15 +1700,22 @@ impl P2pConnManager {
         // Only promote to ring if we know the peer's identity.
         // For transient connections without known identity, we keep them as transport-only
         // until the peer identifies itself (e.g., via ConnectRequest).
-        // A claim is not promoted while another connection keeps its key in
-        // the ring: the key would be in the ring at two addresses.
-        let claim_of_key_in_ring = source == IdentitySource::Claimed
-            && peer_id
-                .as_ref()
-                .is_some_and(|peer| self.key_in_ring(peer.pub_key(), Some(peer_addr)));
-        let promote_to_ring = peer_id.is_some()
-            && (!is_transient || connection_manager.is_gateway())
-            && !claim_of_key_in_ring;
+        // A claim is bound only when no other connection holds its key, so it
+        // never puts its key in the ring at a second address. A dial is
+        // promoted as the connect op asked, even if another connection holds
+        // its key.
+        let promote_to_ring =
+            peer_id.is_some() && (!is_transient || connection_manager.is_gateway());
+        // A claim that is not promoted here (held by another connection)
+        // releases the reservation the connect op made for it, which would
+        // otherwise wait for its expiry.
+        if established_with_claim
+            && !promote_to_ring
+            && !connection_manager.is_in_ring(peer_addr)
+            && connection_manager.has_connection_or_pending(peer_addr)
+        {
+            connection_manager.prune_in_transit_connection(peer_addr);
+        }
 
         if newly_inserted {
             tracing::info!(peer_id = ?peer_id, %peer_addr, is_transient, "handle_successful_connection: inserted new connection entry");
@@ -1994,7 +2005,7 @@ impl P2pConnManager {
                                     .await;
                                     return Ok(EventResult::Continue);
                                 }
-                                BindOutcome::HeldByDial(holder) => {
+                                BindOutcome::Held(holder) => {
                                     // The key is bound to a dialled connection
                                     // that is still open. The request is
                                     // dropped and the claim kept pending on
@@ -2013,13 +2024,13 @@ impl P2pConnManager {
                                     );
                                     return Ok(EventResult::Continue);
                                 }
-                                BindOutcome::HeldByQuietDial(quiet) => {
+                                BindOutcome::HeldByQuiet(quiet) => {
                                     // The dial holding the key has gone quiet:
                                     // it is replaced, and its release binds the
                                     // newest pending claim of the key. The
                                     // request is passed on if that was this
                                     // connection.
-                                    self.replace_quiet_dial(
+                                    self.replace_quiet_holder(
                                         quiet,
                                         sender_peer.pub_key(),
                                         handshake_commands,

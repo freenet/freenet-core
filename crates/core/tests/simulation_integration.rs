@@ -8849,7 +8849,7 @@ async fn test_connection_growth_stall_regression() {
     // other simulations in this binary run in the same process and add to
     // them. So only kinds that no simulation produces are held at zero; kinds
     // that crash, restart and churn simulations can produce
-    // (`duplicate_key`, `claim_held_by_dial`, `quiet_dial_replaced`; keepalive
+    // (`duplicate_key`, `claim_held`, `quiet_holder_replaced`; keepalive
     // is off under virtual time, so idle dials there look quiet) are not
     // asserted here. This guards against a regression in ordinary formation;
     // it is not evidence that the refusals work, which the lifecycle unit

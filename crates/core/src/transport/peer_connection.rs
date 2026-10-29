@@ -5642,7 +5642,8 @@ mod tests {
     /// a packet that authenticates: a packet that fails decryption leaves it
     /// where it was, and an authenticated one moves it to now.
     // Two worker threads: `recv` runs in its own task, and while it has
-    // nothing to return it does not yield to a timer in the same task.
+    // nothing to return it does not yield to the runtime (measured: on a
+    // `current_thread` runtime the test's own task never runs again).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn receipt_stamp_advances_only_on_an_authenticated_packet() {
         use crate::transport::crypto::TransportKeypair;

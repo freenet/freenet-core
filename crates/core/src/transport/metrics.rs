@@ -127,7 +127,7 @@ labelled_counters! {
         /// An inbound connection matched an expected-inbound registration and
         /// was bound to the key the connect op dialled, which the
         /// registration carried. The match is by address only, so this
-        /// binding is a claim (see `claim_held_by_dial`).
+        /// binding is a claim (see `claim_held`).
         ExpectedInboundBound => "expected_inbound_bound",
         /// An inbound connection matched an expected-inbound registration
         /// that carried no key, so it starts with none, like an unexpected
@@ -142,7 +142,7 @@ labelled_counters! {
         /// and the connection closed.
         ChangedConnectRequest => "changed_connect_request",
         /// A ConnectRequest counted by one of the three kinds above, or by
-        /// `claim_held_by_dial`, gave the joiner a known address equal to the
+        /// `claim_held`, gave the joiner a known address equal to the
         /// connection's remote address, rather than an unknown one.
         ConnectRequestKnownAddr => "connect_request_known_addr",
         /// A ConnectPeer for an existing connection gave the key of a
@@ -155,28 +155,28 @@ labelled_counters! {
         /// promoted; the connect op is told the connection failed.
         ChangedConnectPeer => "changed_connect_peer",
         /// An attempt to bind a claimed key (an expected-inbound match or a
-        /// ConnectRequest) was refused because another open connection is
-        /// bound to it from a dial that was heard from within the last 30 s.
-        /// Counted per attempt, so a connection whose peer repeats its
-        /// ConnectRequest counts once per request. The claiming connection
-        /// stays without an identity, with the claim kept pending until the
-        /// dial closes or goes quiet (`pending_claim_bound`); a ConnectRequest
-        /// carrying the claim is dropped.
-        ClaimHeldByDial => "claim_held_by_dial",
-        /// A claim held back by `claim_held_by_dial` was bound later, on the
-        /// connection that made it, after the dialled connection holding its
-        /// key closed (on its own, or replaced: `quiet_dial_replaced`).
+        /// ConnectRequest) was refused because another open connection, heard
+        /// from within the last 30 s, is bound to it. Counted per attempt, so
+        /// a connection whose peer repeats its ConnectRequest counts once per
+        /// request. The claiming connection stays without an identity, with
+        /// the claim kept pending until the holder closes or goes quiet
+        /// (`pending_claim_bound`); a ConnectRequest carrying the claim is
+        /// dropped.
+        ClaimHeld => "claim_held",
+        /// A claim held back by `claim_held` was bound later, on the
+        /// connection that made it, after the connection holding its key
+        /// closed (on its own, or replaced: `quiet_holder_replaced`).
         PendingClaimBound => "pending_claim_bound",
-        /// A dialled connection bound to a key that a newer connection
-        /// claimed had not been heard from within 30 s, and was closed so the
-        /// claim could be bound. Counted on the closed connection.
-        QuietDialReplaced => "quiet_dial_replaced",
+        /// A connection bound to a key that a newer connection claimed had not
+        /// been heard from within 30 s, and was closed so the claim could be
+        /// bound. Counted on the closed connection.
+        QuietHolderReplaced => "quiet_holder_replaced",
         /// A connection was bound to this node's own key, on any path.
         OwnKey => "own_key",
         /// A key was bound to a connection while the key-to-address map held
         /// it for another open connection still bound to that key (the newer
         /// one replaces it in the map). Not counted when the binding is
-        /// refused (`claim_held_by_dial`).
+        /// refused (`claim_held`).
         DuplicateKey => "duplicate_key",
         /// Cleanup ran for a connection whose key is mapped to a different
         /// connection. That connection keeps the mapping and the peer's
@@ -2151,14 +2151,12 @@ impl TransportMetrics {
             conn_identity_changed_connect_peer: get32(
                 &identity[ConnIdentity::ChangedConnectPeer as usize],
             ),
-            conn_identity_claim_held_by_dial: get32(
-                &identity[ConnIdentity::ClaimHeldByDial as usize],
-            ),
+            conn_identity_claim_held: get32(&identity[ConnIdentity::ClaimHeld as usize]),
             conn_identity_pending_claim_bound: get32(
                 &identity[ConnIdentity::PendingClaimBound as usize],
             ),
-            conn_identity_quiet_dial_replaced: get32(
-                &identity[ConnIdentity::QuietDialReplaced as usize],
+            conn_identity_quiet_holder_replaced: get32(
+                &identity[ConnIdentity::QuietHolderReplaced as usize],
             ),
             conn_identity_own_key: get32(&identity[ConnIdentity::OwnKey as usize]),
             conn_identity_duplicate_key: get32(&identity[ConnIdentity::DuplicateKey as usize]),
@@ -2658,9 +2656,9 @@ pub struct TransportSnapshot {
     pub conn_identity_set_connect_peer: u32,
     pub conn_identity_same_connect_peer: u32,
     pub conn_identity_changed_connect_peer: u32,
-    pub conn_identity_claim_held_by_dial: u32,
+    pub conn_identity_claim_held: u32,
     pub conn_identity_pending_claim_bound: u32,
-    pub conn_identity_quiet_dial_replaced: u32,
+    pub conn_identity_quiet_holder_replaced: u32,
     pub conn_identity_own_key: u32,
     pub conn_identity_duplicate_key: u32,
     pub conn_identity_teardown_key_elsewhere: u32,
@@ -2734,9 +2732,9 @@ impl TransportSnapshot {
             ConnIdentity::SetConnectPeer => self.conn_identity_set_connect_peer,
             ConnIdentity::SameConnectPeer => self.conn_identity_same_connect_peer,
             ConnIdentity::ChangedConnectPeer => self.conn_identity_changed_connect_peer,
-            ConnIdentity::ClaimHeldByDial => self.conn_identity_claim_held_by_dial,
+            ConnIdentity::ClaimHeld => self.conn_identity_claim_held,
             ConnIdentity::PendingClaimBound => self.conn_identity_pending_claim_bound,
-            ConnIdentity::QuietDialReplaced => self.conn_identity_quiet_dial_replaced,
+            ConnIdentity::QuietHolderReplaced => self.conn_identity_quiet_holder_replaced,
             ConnIdentity::OwnKey => self.conn_identity_own_key,
             ConnIdentity::DuplicateKey => self.conn_identity_duplicate_key,
             ConnIdentity::TeardownKeyElsewhere => self.conn_identity_teardown_key_elsewhere,
@@ -2926,9 +2924,9 @@ impl TransportSnapshot {
             conn_identity_set_connect_peer,
             conn_identity_same_connect_peer,
             conn_identity_changed_connect_peer,
-            conn_identity_claim_held_by_dial,
+            conn_identity_claim_held,
             conn_identity_pending_claim_bound,
-            conn_identity_quiet_dial_replaced,
+            conn_identity_quiet_holder_replaced,
             conn_identity_own_key,
             conn_identity_duplicate_key,
             conn_identity_teardown_key_elsewhere,
@@ -3037,9 +3035,9 @@ impl TransportSnapshot {
         self.conn_identity_set_connect_peer = conn_identity_set_connect_peer;
         self.conn_identity_same_connect_peer = conn_identity_same_connect_peer;
         self.conn_identity_changed_connect_peer = conn_identity_changed_connect_peer;
-        self.conn_identity_claim_held_by_dial = conn_identity_claim_held_by_dial;
+        self.conn_identity_claim_held = conn_identity_claim_held;
         self.conn_identity_pending_claim_bound = conn_identity_pending_claim_bound;
-        self.conn_identity_quiet_dial_replaced = conn_identity_quiet_dial_replaced;
+        self.conn_identity_quiet_holder_replaced = conn_identity_quiet_holder_replaced;
         self.conn_identity_own_key = conn_identity_own_key;
         self.conn_identity_duplicate_key = conn_identity_duplicate_key;
         self.conn_identity_teardown_key_elsewhere = conn_identity_teardown_key_elsewhere;
@@ -3235,9 +3233,9 @@ struct SnapshotExtras {
     pub conn_identity_set_connect_peer: u32,
     pub conn_identity_same_connect_peer: u32,
     pub conn_identity_changed_connect_peer: u32,
-    pub conn_identity_claim_held_by_dial: u32,
+    pub conn_identity_claim_held: u32,
     pub conn_identity_pending_claim_bound: u32,
-    pub conn_identity_quiet_dial_replaced: u32,
+    pub conn_identity_quiet_holder_replaced: u32,
     pub conn_identity_own_key: u32,
     pub conn_identity_duplicate_key: u32,
     pub conn_identity_teardown_key_elsewhere: u32,
@@ -3336,9 +3334,9 @@ impl SnapshotExtras {
             || self.conn_identity_set_connect_peer != 0
             || self.conn_identity_same_connect_peer != 0
             || self.conn_identity_changed_connect_peer != 0
-            || self.conn_identity_claim_held_by_dial != 0
+            || self.conn_identity_claim_held != 0
             || self.conn_identity_pending_claim_bound != 0
-            || self.conn_identity_quiet_dial_replaced != 0
+            || self.conn_identity_quiet_holder_replaced != 0
             || self.conn_identity_own_key != 0
             || self.conn_identity_duplicate_key != 0
             || self.conn_identity_teardown_key_elsewhere != 0
@@ -5352,9 +5350,9 @@ mod tests {
             "conn_identity_set_connect_peer",
             "conn_identity_same_connect_peer",
             "conn_identity_changed_connect_peer",
-            "conn_identity_claim_held_by_dial",
+            "conn_identity_claim_held",
             "conn_identity_pending_claim_bound",
-            "conn_identity_quiet_dial_replaced",
+            "conn_identity_quiet_holder_replaced",
             "conn_identity_own_key",
             "conn_identity_duplicate_key",
             "conn_identity_teardown_key_elsewhere",
