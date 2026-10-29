@@ -170,6 +170,9 @@ pub(crate) struct EndpointCore {
     /// Test hook that ends quinn's endpoint driver.
     #[cfg(test)]
     receive_fault: Arc<socket::ReceiveFault>,
+    /// The type name of the clock quinn runs on (tests).
+    #[cfg(any(test, feature = "testing"))]
+    clock: &'static str,
 }
 
 /// Shared by every handle to one endpoint; the last one dropped marks the
@@ -476,6 +479,8 @@ impl QuicEndpoint {
                 cap_holds: cap_holds.expect("the QUIC socket's cap holds"),
                 #[cfg(test)]
                 receive_fault: receive_fault.unwrap_or_default(),
+                #[cfg(any(test, feature = "testing"))]
+                clock: std::any::type_name::<T>(),
             },
         })
     }
@@ -491,6 +496,12 @@ impl QuicEndpoint {
     #[cfg(test)]
     pub(crate) fn fail_driver(&self) {
         self.receive_fault.trip();
+    }
+
+    /// The type name of the clock quinn runs on (tests).
+    #[cfg(any(test, feature = "testing"))]
+    pub(crate) fn clock_type(&self) -> &'static str {
+        self.clock
     }
 
     /// Accept connection attempts in a task registered with `monitor` as

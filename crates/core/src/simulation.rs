@@ -55,7 +55,7 @@ mod fault;
 mod rng;
 mod time;
 
-pub use fault::{FaultConfig, FaultConfigBuilder, Partition};
+pub use fault::{FaultConfig, FaultConfigBuilder, Partition, QuicDatagramDrop};
 pub use rng::SimulationRng;
 pub use time::Wakeup;
 pub use time::{BoxedSleep, RealTime, TimeSource, TimeSourceInterval, VirtualTime, WakeupId};

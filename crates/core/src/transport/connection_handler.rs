@@ -179,6 +179,7 @@ pub async fn create_connection_handler<S: Socket>(
             // `create_connection_handler` is the test and tool entry point;
             // the node opens the transport through `open_udp_transport`.
             quic: None,
+            advertised_version_override: None,
         },
     )
     .await
@@ -201,6 +202,13 @@ pub(crate) struct UdpTransportConfig {
     /// QUIC endpoint settings when `transport-quic` is on, `None` (no
     /// endpoint, no QUIC ingress) when it is off. See `transport::quic`.
     pub(crate) quic: Option<super::quic::QuicSettings>,
+    /// Simulation-only: the version this node advertises in its handshakes
+    /// (the intro packet and `AckConnectionV2`), so a simulation can emulate
+    /// an older peer. Only what the node TELLS its peers changes; the node
+    /// still checks compatibility with its real version and still decodes
+    /// everything the real binary decodes. `None` (the real version) in
+    /// production.
+    pub(crate) advertised_version_override: Option<(u8, u8, u16)>,
 }
 
 pub(super) type UdpListenerParts<S> = (
@@ -231,18 +239,36 @@ pub(super) async fn bind_udp_listener<S: Socket>(
         "Binding UDP socket"
     );
 
+    // In simulation the QUIC endpoint runs on the network's `VirtualTime`,
+    // so quinn's timers (handshake, loss detection, idle) follow the
+    // simulated clock and a seeded run repeats. `None` outside simulation,
+    // where it runs on `RealTime`.
+    let quic_virtual_time = config
+        .quic
+        .as_ref()
+        .and_then(|_| get_socket_virtual_time(&bind_addr));
     // The node-wide egress cap exists only when `total-bandwidth-limit` is
-    // set (which is when `global_bandwidth` is), so a node without it pays
-    // nothing. The cap uses the same clock kind as the listener built below
-    // (`RealTime`); waiters sleep on their own connection's time source.
-    // That holds in simulation too: the listener and its connections run on
-    // `RealTime` there, so a cap on the network's `VirtualTime` would compute
-    // deficits on one clock for stream senders that sleep and time out on
-    // another. A sender on `VirtualTime` (the QUIC endpoint, #5940) must use
-    // the cap only once the cap and its other waiters share that clock.
+    // set and not 0 (`global_bandwidth` is set, and `from_total_limit`
+    // builds no cap for 0), so a node without it pays nothing. The cap runs
+    // on `RealTime`, as the listener built below does, in production and in
+    // simulation alike; waiters sleep on their own connection's time
+    // source. A cap on the network's `VirtualTime` would compute deficits on
+    // one clock for stream senders that sleep and time out on another.
+    //
+    // The QUIC endpoint must run on the cap's clock (see
+    // `QuicEndpoint::bind`), and in simulation it runs on `VirtualTime`, so
+    // a simulated node that has both a cap and QUIC is refused rather than
+    // run on two clocks.
     let egress_cap = config.global_bandwidth.as_ref().and_then(|manager| {
         super::egress_cap::EgressCap::from_total_limit(manager.total_limit(), RealTime::new())
     });
+    if quic_virtual_time.is_some() && egress_cap.is_some() {
+        return Err(TransportError::Other(anyhow::anyhow!(
+            "simulated node at {bind_addr} sets both transport-quic and \
+             total-bandwidth-limit: the egress cap runs on RealTime and the \
+             simulated QUIC endpoint on VirtualTime, so they cannot share a clock"
+        )));
+    }
     let socket = Arc::new(
         bind_socket_with_retry::<DemuxSocket<S>>(bind_addr, SOCKET_BIND_MAX_RETRIES)
             .await?
@@ -251,19 +277,36 @@ pub(super) async fn bind_udp_listener<S: Socket>(
     // With `transport-quic` off nothing is built and no QUIC ingress is
     // enabled, so QUIC-class datagrams stay `quic_ingress_no_ingress`. With
     // it on the endpoint runs on the egress cap's clock (`RealTime`, see
-    // above), authenticates with this node's transport key, and has an
-    // empty allow-set: nothing reaches it until an upgrade path allows a
-    // peer.
+    // above; the simulation's `VirtualTime` in a simulation, which has no
+    // cap), authenticates with this node's transport key, and has an empty
+    // allow-set: nothing reaches it until an upgrade path allows a peer.
     let quic_endpoint = config.quic.as_ref().and_then(|settings| {
-        super::quic::QuicEndpoint::bind_or_warn(
-            socket.clone(),
-            bind_addr,
-            RealTime::new(),
-            settings,
-            &keypair,
-        )
+        let socket = socket.clone();
+        match quic_virtual_time {
+            // Building the endpoint draws quinn's RNG seed from `GlobalRng`.
+            // A side stream (named by the bind address) keeps that draw out
+            // of the run's main stream, so an endpoint that is bound and idle
+            // does not change any later random choice of the run. Once it
+            // opens connections, quinn's connection-ID draws (the
+            // `initial_dst_cid_provider` in `quic::config` and the CID
+            // generator) take from the main stream inside quinn's tasks.
+            Some(time) => GlobalRng::with_side_stream(side_stream_of(bind_addr), || {
+                super::quic::QuicEndpoint::bind_or_warn(socket, bind_addr, time, settings, &keypair)
+            }),
+            None => super::quic::QuicEndpoint::bind_or_warn(
+                socket,
+                bind_addr,
+                RealTime::new(),
+                settings,
+                &keypair,
+            ),
+        }
     });
 
+    #[cfg(any(test, feature = "testing"))]
+    if let Some(endpoint) = &quic_endpoint {
+        super::in_memory_socket::record_quic_endpoint_clock(bind_addr, endpoint.clock_type());
+    }
     tracing::info!(
         target: "freenet_core::transport::send_debug",
         bind_addr = %bind_addr,
@@ -285,6 +328,16 @@ pub(super) async fn bind_udp_listener<S: Socket>(
         },
         listen_handle,
     ))
+}
+
+/// A `GlobalRng` side-stream id for `addr`: the same address gives the same
+/// id in every run (FNV-1a over its text form).
+fn side_stream_of(addr: SocketAddr) -> u64 {
+    addr.to_string()
+        .bytes()
+        .fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
+            (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
+        })
 }
 
 /// Open the UDP transport and return it as the node's [`TransportHandle`]
@@ -479,6 +532,7 @@ impl<S: Socket> OutboundConnectionHandler<S> {
             ack_version_floor_override,
             // Used by `bind_udp_listener`, which built `quic_endpoint` from it.
             quic: _,
+            advertised_version_override,
         } = config;
         let (conn_handler_sender, conn_handler_receiver) = mpsc::channel(100);
         let (new_connection_sender, new_connection_notifier) = mpsc::channel(10);
@@ -519,6 +573,8 @@ impl<S: Socket> OutboundConnectionHandler<S> {
             time_source,
             congestion_config: Some(congestion_config.unwrap_or_default()),
             ack_version_floor_override,
+            advertised_version: advertised_version_override
+                .map_or(PROTOC_VERSION, version_cmp::encode_version),
             _quic_endpoint: quic_endpoint,
         };
         let connection_handler = OutboundConnectionHandler {
@@ -774,6 +830,7 @@ impl<S: Socket> OutboundConnectionHandler<S, crate::simulation::VirtualTime> {
             // Benchmarks measure throughput, not handshake encoding; the real
             // floor applies here exactly as in production.
             ack_version_floor_override: None,
+            advertised_version: PROTOC_VERSION,
         };
         let connection_handler = OutboundConnectionHandler {
             send_queue: conn_handler_sender,
@@ -950,6 +1007,11 @@ struct UdpPacketsListener<S = UdpSocket, T: TimeSource = RealTime> {
     /// itself, where a red sim could not be attributed between the feature and
     /// the version bump.
     ack_version_floor_override: Option<(u8, u8, u16)>,
+    /// The version this node advertises in its intro packets and
+    /// `AckConnectionV2`: `PROTOC_VERSION`, or a simulation's older version
+    /// (`UdpTransportConfig::advertised_version_override`). Compatibility
+    /// checks still use `PROTOC_VERSION`.
+    advertised_version: [u8; 8],
     /// The QUIC endpoint on this listener's socket, when `transport-quic`
     /// is on. Held here so it lives as long as the listener reading the
     /// socket that feeds it. Nothing uses it yet (#5940): it accepts no
@@ -2205,6 +2267,7 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
         let time_source = self.time_source.clone();
         let congestion_config = self.congestion_config.clone();
         let ack_version_floor = self.ack_version_floor();
+        let advertised_version = self.advertised_version;
 
         let (inbound_from_remote, mut next_inbound) =
             mpsc::channel::<PacketData<UnknownEncryption>>(100);
@@ -2292,6 +2355,7 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                 remote_addr,
                 remote_protoc_version,
                 ack_version_floor,
+                advertised_version,
             )?;
 
             tracing::trace!(
@@ -2539,6 +2603,7 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
             mpsc::channel::<PacketData<UnknownEncryption>>(100);
         let this_addr = self.this_addr;
         let ack_version_floor = self.ack_version_floor();
+        let advertised_version = self.advertised_version;
         let f = async move {
             tracing::info!(
                 peer_addr = %remote_addr,
@@ -2562,7 +2627,7 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
             let mut remote_protoc_version: Option<(u8, u8, u16)> = None;
             let outbound_intro_packet = {
                 let mut data = [0u8; { 16 + PROTOC_VERSION.len() }];
-                data[..PROTOC_VERSION.len()].copy_from_slice(&PROTOC_VERSION);
+                data[..PROTOC_VERSION.len()].copy_from_slice(&advertised_version);
                 data[PROTOC_VERSION.len()..].copy_from_slice(&inbound_sym_key_bytes);
                 PacketData::<_, MAX_PACKET_SIZE>::encrypt_with_pubkey(&data, &remote_public_key)
             };
@@ -2633,6 +2698,7 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                                 remote_addr,
                                 remote_protoc_version,
                                 ack_version_floor,
+                                advertised_version,
                             )?;
                             // Bookkeeping hygiene only: this tracker is not
                             // consumed after RemoteInbound (a successful
@@ -3407,13 +3473,14 @@ fn build_success_ack(
     remote_addr: SocketAddr,
     remote_protoc_version: Option<(u8, u8, u16)>,
     ack_version_floor: (u8, u8, u16),
+    advertised_version: [u8; 8],
 ) -> Result<PacketData<SymmetricAES>, bincode::Error> {
     if version_cmp::version_supports_ack_version(remote_protoc_version, ack_version_floor) {
         SymmetricMessage::ack_ok_with_version(
             outbound_sym_key,
             our_inbound_key,
             remote_addr,
-            PROTOC_VERSION,
+            advertised_version,
         )
     } else {
         SymmetricMessage::ack_ok(outbound_sym_key, our_inbound_key, remote_addr)

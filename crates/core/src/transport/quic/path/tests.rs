@@ -1826,7 +1826,7 @@ impl DropFrom {
         let from = from.to_vec();
         set_packet_delivery_callback(
             network,
-            Some(Arc::new(move |_, sender, _| {
+            Some(Arc::new(move |_, sender, _, _| {
                 if from.contains(&sender) {
                     PacketDeliveryDecision::Drop
                 } else {
@@ -1905,6 +1905,7 @@ impl Scripted {
         let settings = QuicSettings {
             max_connections: 4,
             memory_limit: 1024 * 1024 * 1024,
+            idle_timeout: None,
         };
         let (a_keys, b_keys) = (TransportKeypair::new(), TransportKeypair::new());
         let mut tasks = Vec::new();
@@ -2229,7 +2230,7 @@ fn a_slow_conforming_peer_is_not_closed() {
         let one_way = Duration::from_millis(2500);
         set_packet_delivery_callback(
             network,
-            Some(Arc::new(move |_, _, _| {
+            Some(Arc::new(move |_, _, _, _| {
                 PacketDeliveryDecision::DelayedDelivery(one_way)
             })),
         );
@@ -2282,7 +2283,7 @@ fn seeded_loss(network: &str, percent: u64) -> Arc<LossCount> {
     let counted = count.clone();
     set_packet_delivery_callback(
         network,
-        Some(Arc::new(move |_, _, _| {
+        Some(Arc::new(move |_, _, _, _| {
             counted.seen.fetch_add(1, Relaxed);
             // A fixed linear congruential sequence, one draw per datagram.
             let next = state
@@ -2390,7 +2391,7 @@ fn a_bulk_transfer_at_a_long_round_trip_is_not_closed() {
         let one_way = Duration::from_millis(750);
         set_packet_delivery_callback(
             network,
-            Some(Arc::new(move |_, _, _| {
+            Some(Arc::new(move |_, _, _, _| {
                 PacketDeliveryDecision::DelayedDelivery(one_way)
             })),
         );

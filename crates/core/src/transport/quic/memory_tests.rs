@@ -51,6 +51,7 @@ fn settings() -> QuicSettings {
     QuicSettings {
         max_connections: 200,
         memory_limit: 2 * 1024 * 1024 * 1024,
+        idle_timeout: None,
     }
 }
 
@@ -176,7 +177,7 @@ async fn measure(network: &str, subnet: u8, n: usize) -> Cost {
     let mut clients = Vec::with_capacity(n);
     let mut servers = Vec::with_capacity(n);
     let cut: crate::transport::in_memory_socket::PacketDeliveryCallback =
-        Arc::new(|_, _, _| PacketDeliveryDecision::Drop);
+        Arc::new(|_, _, _, _| PacketDeliveryDecision::Drop);
     let before_drift = live_bytes();
     settle(&time).await;
     let baseline = live_bytes();
@@ -761,6 +762,7 @@ fn frames_filling_the_window_measure_within_the_window_multiple() {
         let settings = QuicSettings {
             max_connections: 200,
             memory_limit,
+            idle_timeout: None,
         };
         let w = settings.window_bytes() as usize;
         assert_eq!(w, expected as usize, "premise: the window at its extreme");

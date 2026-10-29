@@ -199,6 +199,7 @@ fn settings() -> QuicSettings {
     QuicSettings {
         max_connections: 4,
         memory_limit: 1024 * 1024 * 1024,
+        idle_timeout: None,
     }
 }
 
@@ -1556,6 +1557,20 @@ fn transport_config_pins_every_value() {
         debug_field(&virt, "max_idle_timeout"),
         format!("Some({virt_idle_ms})")
     );
+    // A simulation's short idle timeout replaces the clock's, on either clock.
+    let short = QuicSettings {
+        idle_timeout: Some(Duration::from_secs(7)),
+        ..settings()
+    };
+    for shown in [
+        format!(
+            "{:?}",
+            config::transport_config(&short, &VirtualTime::new())
+        ),
+        format!("{:?}", config::transport_config(&short, &RealTime::new())),
+    ] {
+        assert_eq!(debug_field(&shown, "max_idle_timeout"), "Some(7000)");
+    }
 }
 
 /// Every client setting `config::client_config` pins that quinn's `Debug`
@@ -1726,6 +1741,7 @@ fn windows_never_exceed_the_reassembly_allowance() {
             let settings = QuicSettings {
                 max_connections,
                 memory_limit,
+                idle_timeout: None,
             };
             let window = settings.window_bytes();
             assert!(
@@ -2862,8 +2878,8 @@ fn a_full_accept_queue_ignores_and_counts_the_attempt() {
 /// transport reports `Down` and its listener keeps running: endpoint death
 /// never reaches `ListenerExit`, which would exit the node. On simulation
 /// sockets (no real port, no port reuse). The endpoint inside the
-/// transport runs on `RealTime`, but nothing here waits on time: the
-/// injected failure wakes the driver at once.
+/// transport runs on the network's `VirtualTime`, but nothing here waits on
+/// time: the injected failure wakes the driver at once.
 #[test]
 fn the_transport_reports_quic_availability() {
     bounded(|| async move {
@@ -2917,6 +2933,166 @@ fn the_transport_reports_quic_availability() {
             )));
         }
         unregister_network_time_source(network);
+    })
+}
+
+/// A simulation registration (an address's network, or a network's
+/// clock) undone on drop, so a failing assertion leaves none behind for the
+/// next test in the process.
+enum Registration {
+    Address(SocketAddr),
+    TimeSource(&'static str),
+}
+
+impl Registration {
+    fn address(addr: SocketAddr, network: &str) -> Self {
+        register_address_network(addr, network);
+        Self::Address(addr)
+    }
+
+    fn time_source(network: &'static str, time: VirtualTime) -> Self {
+        register_network_time_source(network, time);
+        Self::TimeSource(network)
+    }
+}
+
+impl Drop for Registration {
+    fn drop(&mut self) {
+        match self {
+            Self::Address(addr) => {
+                crate::transport::in_memory_socket::unregister_address_network(addr)
+            }
+            Self::TimeSource(network) => unregister_network_time_source(network),
+        }
+    }
+}
+
+/// The clock the transport's endpoint runs on: `RealTime` on a real socket
+/// (production) and on a socket whose network has no `VirtualTime`, the
+/// network's `VirtualTime` in a simulation.
+#[test]
+fn the_transport_endpoint_runs_on_virtual_time_only_in_simulation() {
+    bounded(|| async move {
+        use crate::transport::UdpTransportSocket;
+        use crate::transport::connection_handler::{UdpTransportConfig, bind_udp_listener};
+        use crate::transport::in_memory_socket::InMemorySocket;
+        let config = || UdpTransportConfig {
+            quic: Some(settings()),
+            ..UdpTransportConfig::default()
+        };
+        let real_clock = std::any::type_name::<RealTime>();
+        let virtual_clock = std::any::type_name::<VirtualTime>();
+
+        // Production: a real UDP socket.
+        let port = crate::test_utils::reserve_local_port().unwrap();
+        crate::test_utils::release_local_port(port);
+        let (outbound, _inbound, listener) = bind_udp_listener::<UdpTransportSocket>(
+            crate::transport::TransportKeypair::new(),
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            port,
+            false,
+            config(),
+        )
+        .await
+        .unwrap();
+        let endpoint = outbound.quic_endpoint().expect("an endpoint");
+        assert_eq!(
+            endpoint.clock_type(),
+            real_clock,
+            "production runs on RealTime"
+        );
+        listener.abort();
+
+        // An in-memory socket whose network has no VirtualTime.
+        let network = "quic-clock-no-virtual-time";
+        let local = SocketAddr::from(([10, 201, 37, 1], 5000));
+        let _registered = Registration::address(local, network);
+        let (outbound, _inbound, listener) = bind_udp_listener::<InMemorySocket>(
+            crate::transport::TransportKeypair::new(),
+            local.ip(),
+            local.port(),
+            false,
+            config(),
+        )
+        .await
+        .unwrap();
+        let endpoint = outbound.quic_endpoint().expect("an endpoint");
+        assert_eq!(endpoint.clock_type(), real_clock);
+        listener.abort();
+
+        // A simulation: the network registered a VirtualTime.
+        let network = "quic-clock-simulation";
+        let time = VirtualTime::new();
+        let _clock = Registration::time_source(network, time.clone());
+        let local = SocketAddr::from(([10, 201, 37, 2], 5000));
+        let _registered = Registration::address(local, network);
+        let (outbound, _inbound, listener) = bind_udp_listener::<SimulationSocket>(
+            crate::transport::TransportKeypair::new(),
+            local.ip(),
+            local.port(),
+            false,
+            config(),
+        )
+        .await
+        .unwrap();
+        let endpoint = outbound.quic_endpoint().expect("an endpoint");
+        assert_eq!(
+            endpoint.clock_type(),
+            virtual_clock,
+            "a simulation runs on VirtualTime"
+        );
+        listener.abort();
+    })
+}
+
+/// A simulated node with both `transport-quic` and an egress cap is
+/// refused: the cap runs on `RealTime` and the simulated endpoint on
+/// `VirtualTime`. Either one alone binds, and so does QUIC with
+/// `total-bandwidth-limit = 0`, which builds no cap.
+#[test]
+fn a_simulated_node_with_quic_and_an_egress_cap_is_refused() {
+    bounded(|| async move {
+        use crate::transport::connection_handler::{UdpTransportConfig, bind_udp_listener};
+        use crate::transport::global_bandwidth::GlobalBandwidthManager;
+        let network = "quic-sim-egress-cap";
+        let time = VirtualTime::new();
+        let _clock = Registration::time_source(network, time.clone());
+        let cap = |limit| Some(Arc::new(GlobalBandwidthManager::new(limit, None)));
+        for (port, quic, global_bandwidth, refused) in [
+            (5000, Some(settings()), cap(1_000_000), true),
+            (5001, Some(settings()), None, false),
+            (5002, None, cap(1_000_000), false),
+            (5003, Some(settings()), cap(0), false),
+        ] {
+            let local = SocketAddr::from(([10, 201, 38, 1], port));
+            let _registered = Registration::address(local, network);
+            let bound = bind_udp_listener::<SimulationSocket>(
+                crate::transport::TransportKeypair::new(),
+                local.ip(),
+                port,
+                false,
+                UdpTransportConfig {
+                    quic,
+                    global_bandwidth,
+                    ..UdpTransportConfig::default()
+                },
+            )
+            .await;
+            match bound {
+                Ok((_, _, listener)) => {
+                    assert!(!refused, "port {port}: QUIC plus a cap must be refused");
+                    listener.abort();
+                }
+                Err(error) => {
+                    assert!(refused, "port {port}: refused: {error}");
+                    let text = error.to_string();
+                    assert!(
+                        text.contains("transport-quic") && text.contains("total-bandwidth-limit"),
+                        "the error names both settings: {text}"
+                    );
+                }
+            }
+        }
     })
 }
 
