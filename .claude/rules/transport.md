@@ -367,7 +367,11 @@ plus `egress_bytes`, `egress_bytes_waited`, `egress_wait_us_sum` / `_max`,
 ignored (`upgrade_control_received`) and hole-punch handshake packets dropped,
 one count per packet, because they were not encrypted under the attempt's
 inbound session key (`handshake_unauthenticated_dropped`), QUIC endpoint deaths
-(`quic_endpoint_down`) and QUIC connections this node closed, by close code
+(`quic_endpoint_down`), QUIC crash-loop breaker trips at startup
+(`quic_breaker_trips`, counted for any abnormal end of a QUIC-enabled run, not
+only a QUIC fault; see `quic/breaker.rs`) and whether the breaker keeps QUIC
+off in this process (`quic_breaker_suppressed`, a state that is never reset and
+is not activity by itself) and QUIC connections this node closed, by close code
 (`quic_close_sent_<label>`, one per `QuicCloseCode`). Each label set is declared once in a
 `labelled_counters!` list, so a new variant needs a snapshot field. Hot
 path writes are single relaxed atomics; `SentPacketTracker` keeps an

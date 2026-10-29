@@ -3036,6 +3036,14 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                 serde_json::json!(snapshot.quic_endpoint_down),
             );
             m.insert(
+                "quic_breaker_trips".into(),
+                serde_json::json!(snapshot.quic_breaker_trips),
+            );
+            m.insert(
+                "quic_breaker_suppressed".into(),
+                serde_json::json!(snapshot.quic_breaker_suppressed),
+            );
+            m.insert(
                 "quic_close_sent_node_dropped_peer".into(),
                 serde_json::json!(snapshot.quic_close_sent_node_dropped_peer),
             );
@@ -7740,6 +7748,8 @@ mod tests {
             quic_close_sent_identity_mismatch: 4,
             quic_close_sent_send_abort_limit: 5,
             quic_close_sent_peer_not_acknowledging: 6,
+            quic_breaker_trips: 7,
+            quic_breaker_suppressed: true,
             ..Default::default()
         };
         let reference = serde_json::to_value(&snapshot).unwrap();
@@ -7753,10 +7763,16 @@ mod tests {
             ("quic_close_sent_identity_mismatch", 4),
             ("quic_close_sent_send_abort_limit", 5),
             ("quic_close_sent_peer_not_acknowledging", 6),
+            ("quic_breaker_trips", 7),
         ] {
             assert_eq!(json[key], expected, "event-log value for {key}");
             assert_eq!(json[key], reference[key], "serde value for {key}");
         }
+        assert_eq!(json["quic_breaker_suppressed"], true);
+        assert_eq!(
+            json["quic_breaker_suppressed"],
+            reference["quic_breaker_suppressed"]
+        );
     }
 
     /// Each connection identity key is in the event-log JSON exactly when its

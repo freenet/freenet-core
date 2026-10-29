@@ -34,6 +34,7 @@
 //! [`TransportPublicKey`]: super::TransportPublicKey
 //! [`TimeSource`]: crate::simulation::TimeSource
 
+pub(crate) mod breaker;
 pub(crate) mod cid;
 pub(crate) mod config;
 pub(crate) mod error;

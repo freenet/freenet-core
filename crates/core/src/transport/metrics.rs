@@ -24,7 +24,7 @@
 use dashmap::DashMap;
 use std::net::SocketAddr;
 use std::sync::LazyLock;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use tokio::sync::mpsc;
 
 use crate::tracing::{TransferDirection, TransferEvent};
@@ -547,6 +547,12 @@ pub struct TransportMetrics {
     /// driver future returned), after which the node runs with QUIC off
     /// (reset each snapshot). At most one per endpoint.
     quic_endpoint_down: AtomicU64,
+    /// Times the QUIC crash-loop breaker tripped at startup (reset each
+    /// snapshot; at most one per process).
+    quic_breaker_trips: AtomicU64,
+    /// Whether the crash-loop breaker keeps QUIC off in this process (a
+    /// state, never reset).
+    quic_breaker_suppressed: AtomicBool,
     /// QUIC connections this node closed, by [`QuicCloseCode`] (reset each
     /// snapshot).
     quic_close_sent: [AtomicU64; QuicCloseCode::COUNT],
@@ -934,6 +940,8 @@ impl TransportMetrics {
             handshake_unauthenticated_dropped: AtomicU64::new(0),
             conn_identity: Default::default(),
             quic_endpoint_down: AtomicU64::new(0),
+            quic_breaker_trips: AtomicU64::new(0),
+            quic_breaker_suppressed: AtomicBool::new(false),
             quic_close_sent: Default::default(),
             inbound_concurrency_epoch: AtomicU64::new(1),
             inbound_concurrency: Default::default(),
@@ -1366,6 +1374,18 @@ impl TransportMetrics {
         #[cfg(not(test))]
         let _ = local;
         self.quic_endpoint_down.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The QUIC crash-loop breaker tripped at startup
+    /// (`quic::breaker`).
+    pub(crate) fn record_quic_breaker_trip(&self) {
+        self.quic_breaker_trips.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Whether the crash-loop breaker keeps QUIC off in this process.
+    pub(crate) fn set_quic_breaker_suppressed(&self, suppressed: bool) {
+        self.quic_breaker_suppressed
+            .store(suppressed, Ordering::Relaxed);
     }
 
     /// Test-only: how many times the QUIC endpoint bound at `local` went
@@ -1994,6 +2014,8 @@ impl TransportMetrics {
             upgrade_control_received: get64(&self.upgrade_control_received),
             handshake_unauthenticated_dropped: get64(&self.handshake_unauthenticated_dropped),
             quic_endpoint_down: get64(&self.quic_endpoint_down),
+            quic_breaker_trips: get64(&self.quic_breaker_trips),
+            quic_breaker_suppressed: self.quic_breaker_suppressed.load(Ordering::Relaxed),
             quic_close_sent_node_dropped_peer: get64(
                 &self.quic_close_sent[QuicCloseCode::NodeDroppedPeer as usize],
             ),
@@ -2513,6 +2535,11 @@ pub struct TransportSnapshot {
     /// Times the QUIC endpoint went down while the node held it; the node
     /// then runs with QUIC off (#5940 e4).
     pub quic_endpoint_down: u64,
+    /// Times the QUIC crash-loop breaker tripped: a run with QUIC enabled
+    /// ended abnormally, so this one started with QUIC off (#5940).
+    pub quic_breaker_trips: u64,
+    /// Whether the crash-loop breaker keeps QUIC off in this process.
+    pub quic_breaker_suppressed: bool,
     /// QUIC connections this node closed, by close code
     /// ([`QuicCloseCode`]).
     pub quic_close_sent_node_dropped_peer: u64,
@@ -2823,6 +2850,8 @@ impl TransportSnapshot {
             upgrade_control_received,
             handshake_unauthenticated_dropped,
             quic_endpoint_down,
+            quic_breaker_trips,
+            quic_breaker_suppressed,
             quic_close_sent_node_dropped_peer,
             quic_close_sent_downgrade,
             quic_close_sent_identity_mismatch,
@@ -2934,6 +2963,8 @@ impl TransportSnapshot {
         self.upgrade_control_received = upgrade_control_received;
         self.handshake_unauthenticated_dropped = handshake_unauthenticated_dropped;
         self.quic_endpoint_down = quic_endpoint_down;
+        self.quic_breaker_trips = quic_breaker_trips;
+        self.quic_breaker_suppressed = quic_breaker_suppressed;
         self.quic_close_sent_node_dropped_peer = quic_close_sent_node_dropped_peer;
         self.quic_close_sent_downgrade = quic_close_sent_downgrade;
         self.quic_close_sent_identity_mismatch = quic_close_sent_identity_mismatch;
@@ -3088,6 +3119,11 @@ struct SnapshotExtras {
     /// Times the QUIC endpoint went down while the node held it; the node
     /// then runs with QUIC off (#5940 e4).
     pub quic_endpoint_down: u64,
+    /// Times the QUIC crash-loop breaker tripped: a run with QUIC enabled
+    /// ended abnormally, so this one started with QUIC off (#5940).
+    pub quic_breaker_trips: u64,
+    /// Whether the crash-loop breaker keeps QUIC off in this process.
+    pub quic_breaker_suppressed: bool,
     /// QUIC connections this node closed, by close code
     /// ([`QuicCloseCode`]).
     pub quic_close_sent_node_dropped_peer: u64,
@@ -3237,6 +3273,7 @@ impl SnapshotExtras {
             || self.upgrade_control_received != 0
             || self.handshake_unauthenticated_dropped != 0
             || self.quic_endpoint_down != 0
+            || self.quic_breaker_trips != 0
             || self.quic_close_sent_node_dropped_peer != 0
             || self.quic_close_sent_downgrade != 0
             || self.quic_close_sent_identity_mismatch != 0
@@ -4125,6 +4162,40 @@ mod tests {
         assert_eq!(json["quic_endpoint_down"], 1);
         assert!(metrics.take_snapshot().is_none(), "the counter must reset");
         assert_eq!(metrics.quic_endpoint_down_at(local), 1);
+    }
+
+    /// A breaker trip reaches the snapshot and its JSON, counts as activity
+    /// on its own, and resets; the suppressed state is carried while it
+    /// holds and is not activity by itself.
+    #[test]
+    fn quic_breaker_reaches_snapshot_and_trips_reset() {
+        let metrics = TransportMetrics::new();
+        assert!(
+            metrics.take_snapshot().is_none(),
+            "a fresh instance is idle"
+        );
+        metrics.set_quic_breaker_suppressed(true);
+        assert!(
+            metrics.take_snapshot().is_none(),
+            "a suppressed state alone is not activity"
+        );
+        metrics.record_quic_breaker_trip();
+        let snap = metrics
+            .take_snapshot()
+            .expect("a breaker trip alone is activity");
+        assert_eq!(snap.quic_breaker_trips, 1);
+        assert!(snap.quic_breaker_suppressed);
+        let json = serde_json::to_value(&snap).unwrap();
+        assert_eq!(json["quic_breaker_trips"], 1);
+        assert_eq!(json["quic_breaker_suppressed"], true);
+        assert!(
+            metrics.take_snapshot().is_none(),
+            "the trip count must reset"
+        );
+        metrics.record_upgrade_control_received();
+        let snap = metrics.take_snapshot().expect("activity");
+        assert_eq!(snap.quic_breaker_trips, 0);
+        assert!(snap.quic_breaker_suppressed, "the state is not reset");
     }
 
     /// The snapshot field that carries the period count of closes sent
@@ -5251,6 +5322,8 @@ mod tests {
             "upgrade_control_received",
             "handshake_unauthenticated_dropped",
             "quic_endpoint_down",
+            "quic_breaker_trips",
+            "quic_breaker_suppressed",
             "quic_close_sent_node_dropped_peer",
             "quic_close_sent_downgrade",
             "quic_close_sent_identity_mismatch",

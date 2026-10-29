@@ -352,6 +352,11 @@ pub(crate) async fn open_udp_transport<S: Socket>(
 ) -> Result<super::TransportHandle, TransportError> {
     let (outbound, inbound, listen_task) =
         bind_udp_listener::<S>(keypair, listen_host, listen_port, is_gateway, config).await?;
+    // The QUIC crash-loop breaker (#5940) arms only now, with the socket
+    // bound and the endpoint built, so a failed start leaves no marker.
+    super::quic::breaker::arm_if_quic_up(
+        outbound.quic_availability().get() == super::quic::liveness::QuicAvailability::Up,
+    );
     Ok(udp_transport_handle(outbound, inbound, listen_task))
 }
 
